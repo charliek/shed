@@ -698,6 +698,9 @@ pub struct EmbeddedHostAgent {
     /// The SSH mode the backend resolved to at spawn (env-dependent for `ssh.mode: ""`);
     /// surfaced in `broker.status`.
     resolved_ssh_mode: Mutex<Option<String>>,
+    /// Where the broker's lines go (the bus, the supervisor, the backends, the
+    /// Responder's drop path) — the embedder's own log, injected at [`new`](Self::new).
+    log: Arc<dyn bus::BusLog>,
 }
 
 impl EmbeddedHostAgent {
@@ -705,7 +708,15 @@ impl EmbeddedHostAgent {
     /// the control-token minter. The token minter + Responder are usable immediately;
     /// the bus is not started until [`spawn`](Self::spawn). Returns the agent plus the
     /// event receiver to hand to [`Coordinator::spawn`](crate::coordinator::Coordinator::spawn).
-    pub fn new(cfg: HostAgentConfig) -> (Self, mpsc::UnboundedReceiver<HostAgentEvent>) {
+    ///
+    /// `log` receives every line the broker says — the Responder's (accepted) drop path
+    /// and, once [`spawn`](Self::spawn)ed, the bus, the supervisor and the backends. The
+    /// desktop passes its own log file's sink; a test passes `bus::FileBusLog::new("")`
+    /// (stderr), which is what this used to hard-code.
+    pub fn new(
+        cfg: HostAgentConfig,
+        log: Arc<dyn bus::BusLog>,
+    ) -> (Self, mpsc::UnboundedReceiver<HostAgentEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (respond_tx, respond_rx) = mpsc::channel(RESPOND_QUEUE_CAP);
         let clock = system_clock();
@@ -742,15 +753,12 @@ impl EmbeddedHostAgent {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let gate_namespaces = cfg.gate_namespaces();
 
-        // The Responder's loud-log sink for the (accepted) decision-drop path — stderr,
-        // the same `bus::FileBusLog` idiom `spawn` uses for its broker-startup warnings.
-        let responder_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(""));
-
         let agent = EmbeddedHostAgent {
             inner,
+            // The Responder's loud-log sink for the (accepted) decision-drop path.
             responder: Arc::new(BridgeResponder {
                 tx: respond_tx,
-                log: responder_log,
+                log: log.clone(),
             }),
             token_minter,
             minter,
@@ -761,6 +769,7 @@ impl EmbeddedHostAgent {
             spawned: AtomicBool::new(false),
             supervisor: Mutex::new(None),
             resolved_ssh_mode: Mutex::new(None),
+            log,
         };
         (agent, event_rx)
     }
@@ -822,7 +831,7 @@ impl EmbeddedHostAgent {
         }
 
         let cfg = &self.cfg;
-        let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(""));
+        let bus_log = self.log.clone();
 
         // Resolve the SSH backend UNCONDITIONALLY (parity with the daemon's startup) —
         // a resolve error fails the broker closed WITHOUT taking the app down. Run it on
@@ -1388,7 +1397,7 @@ mod tests {
         );
         let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
 
-        let (agent, mut events) = EmbeddedHostAgent::new(cfg);
+        let (agent, mut events) = EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
         agent
             .spawn()
             .await
@@ -1425,7 +1434,7 @@ mod tests {
         );
         let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
 
-        let (agent, mut events) = EmbeddedHostAgent::new(cfg);
+        let (agent, mut events) = EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
         // First spawn succeeds and emits exactly one Connected.
         agent.spawn().await.expect("first spawn ok");
         let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())

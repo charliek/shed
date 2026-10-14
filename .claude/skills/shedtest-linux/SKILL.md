@@ -496,32 +496,18 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
   `rc.list` shows `localhost` absent, that is the first thing to check — an unconnectable
   socket is indistinguishable from "no session" by design.
 
-### `tauri-test-linux` does not lint — CI does, on a Mac
+### `tauri-test-linux` lints the Linux cfg; `tauri-mac` lints the mac one
 
-`make tauri-test-linux` runs the Tauri crate's `cargo test`; it does **not** run
-`cargo clippy`. CI's clippy for that crate lives in the **`tauri-mac`** job
-(`make tauri-lint`), so a platform-independent lint — `type_complexity` on a test
-helper, say — passes every Linux gate here and fails CI on macOS. Plan 014 lost a
-round trip to exactly that.
+`make tauri-test-linux` runs `cargo clippy --locked --all-targets -- -D warnings` in its
+container before the crate's `cargo test` (plan 030, FU3), and `make -C desktop tauri-lint` is
+clean on Linux too — the three Linux-only findings that used to sit in `src/tray.rs` and the
+`zbus::proxy` macro in `src/approval.rs` are fixed. So a Linux lint is a real failure now: it
+fails CI's `tauri-linux` job before a test runs, and there is no baseline to discount.
 
-Linux clippy on this crate cannot stand in for it: `src/tray.rs` and the
-`zbus::proxy` macro in `src/approval.rs` carry three pre-existing Linux-only
-findings, so `-D warnings` is red there before you change anything. Use it as a
-*filter* rather than a gate — run it and check your own file is absent from the
-output:
-
-```bash
-docker run --rm -v "$PWD:/repo:ro" \
-  -v shed-tauri-linux-cargo:/usr/local/cargo/registry \
-  -v shed-tauri-linux-cargo-git:/usr/local/cargo/git \
-  -v shed-tauri-linux-target:/target -w /repo -e CARGO_TARGET_DIR=/target \
-  shed-tauri-linux:latest bash -lc 'set -e; mkdir -p /work; \
-    tar -C /repo --exclude=.git --exclude=target --exclude=node_modules \
-      -cf - crates desktop/tauri desktop/tools desktop/Resources \
-      desktop/pyproject.toml desktop/uv.lock | tar -C /work -xf -; \
-    cd /work/desktop/tauri/src-tauri && cargo clippy --locked --all-targets 2>&1 \
-      | grep -E "^ *--> " '
-```
+What Linux clippy still cannot see is code under `#[cfg(target_os = "macos")]`, which only the
+**`tauri-mac`** job's `make tauri-lint` compiles. A platform-independent lint in shared code —
+`type_complexity` on a test helper, say — is caught on both legs; a mac-only one only on the
+Mac. Plan 014 lost a round trip to that, before Linux linted at all.
 
 ### The definitive check runs on a Mac, and its baseline is CLEAN
 

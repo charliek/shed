@@ -88,7 +88,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::Value;
-use shed_core::lane::backoff::{jittered, next_backoff};
+use shed_core::lane::backoff::next_backoff;
 use shed_core::lane::ring::MessageRing;
 use shed_core::lane::{
     LaneApproval, LaneCapabilities, LaneEvent, LanePublisher, LaneSession, LaneSettings,
@@ -362,7 +362,7 @@ impl Watcher {
                 plan = Plan::Reseed("lagged".to_string());
                 backoff = next_backoff(backoff, false, t.backoff_base, t.backoff_max);
             }
-            tokio::time::sleep(jittered(backoff)).await;
+            tokio::time::sleep(t.spread(backoff)).await;
         }
     }
 
@@ -451,6 +451,11 @@ impl Watcher {
             // The client drops its catalog with the capability: say it again
             // should the capability come back.
             self.last_slash = None;
+        }
+        if !caps.settings {
+            // The client drops its settings with the capability: say them
+            // again should the capability come back.
+            self.last_settings = None;
         }
         if self.last_caps.as_ref() == Some(&caps) {
             return Ok(());
@@ -755,7 +760,7 @@ impl Watcher {
                         // A gate refusal (not ready yet, busy, closing): the
                         // same attach again, counted.
                         Some(code::UNAVAILABLE | code::IN_PROGRESS) => {
-                            tokio::time::sleep(jittered(t.backoff_base)).await;
+                            tokio::time::sleep(t.spread(t.backoff_base)).await;
                             continue;
                         }
                         _ => {

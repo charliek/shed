@@ -22,8 +22,8 @@
 //!   and hands it out as [`crate::lane_view::LaneViewSnapshot::slash_menu`];
 //!   a client never calls it itself.
 //! * [`filter`]`(menu, draft, caret, working)` → [`SlashFilter`]: whether the
-//!   menu panel is up for this draft and caret, and its rows in order, each
-//!   marked `dimmed` while a turn runs.
+//!   menu panel is up for this draft and caret, its rows in order, each
+//!   marked `dimmed` while a turn runs, and the row a highlight starts on.
 //! * [`dispatch`]`(menu, draft, working)` → [`SlashDispatch`]: what sending
 //!   the draft does — the command grammar (P6) and its guard (P5). Send and
 //!   Enter-with-the-menu-closed both go through it.
@@ -108,7 +108,11 @@
 //! then `qualified` contains it. A bare `/` lists every row. While a turn runs
 //! every row stays listed, and the ones that would be refused for it come back
 //! `dimmed` (X7/P29 — dimmed, not hidden: the gate is temporal, not a
-//! capability).
+//! capability). [`SlashFilter::start`] names the first row that is not dimmed
+//! (0 when every row is, or none matches): where a client's highlight starts
+//! whenever it resets, so Enter on a menu opened mid-turn runs or completes a
+//! row instead of being refused (plan 030 §3.4). The arrows still visit
+//! dimmed rows — Tab readies one for after the turn.
 //!
 //! **Carets are UTF-16 code units**, in and out — what a browser's
 //! `selectionStart` and Flutter's `TextSelection` both report — so neither
@@ -143,7 +147,9 @@
 //! [`SlashDispatch`]: `{"kind":"not_command"}`, `{"kind":"prompt","text":…}`,
 //! `{"kind":"run","action":{…},"arg":…}`, `{"kind":"refuse","reason":…}`.
 //! [`SlashAccept`]: `{"kind":"complete","draft":…,"caret":…}` or
-//! `{"kind":"dispatch","dispatch":{…}}`. Every field is an owned
+//! `{"kind":"dispatch","dispatch":{…}}`. [`SlashFilter`]:
+//! `{"open":true,"token":"/re","rows":[{"row":{…},"dimmed":false}],"start":0}`
+//! (`rows` and `start` default when absent). Every field is an owned
 //! `String`/`Option`/`Vec`/scalar or a plain or fielded enum (the FRB-mirror
 //! rule, `shed_core::lane`'s module doc): the phone mirrors all of them.
 
@@ -279,6 +285,13 @@ pub struct SlashFilter {
     /// The matching rows, in bucket order; empty when closed.
     #[serde(default)]
     pub rows: Vec<SlashFilterRow>,
+    /// The row the highlight starts on: the first row that is not dimmed,
+    /// else 0 (0 when closed). A client puts the highlight here wherever it
+    /// resets it — a new token, new rows, a new catalog (P9) — so a menu
+    /// opened mid-turn starts on a row Enter acts on rather than refuses; a
+    /// working flip alone moves no highlight (plan 030 §3.4).
+    #[serde(default)]
+    pub start: u32,
 }
 
 /// What sending a draft does ([`dispatch`]).
@@ -463,9 +476,11 @@ pub fn filter(menu: &SlashMenu, draft: &str, caret: u32, working: bool) -> Slash
             row: row.clone(),
         })
         .collect();
+    let start = rows.iter().position(|r| !r.dimmed).unwrap_or(0);
     SlashFilter {
         open: !rows.is_empty(),
         token,
+        start: u32::try_from(start).unwrap_or(0),
         rows,
     }
 }

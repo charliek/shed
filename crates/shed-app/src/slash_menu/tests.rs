@@ -881,6 +881,126 @@ fn rows_that_wait_for_the_turn_are_dimmed_while_working() {
     assert!(dimmed(false).iter().all(|(_, d)| !d), "idle dims nothing");
 }
 
+/// Where a filter's highlight starts (plan 030 FU8, §3.4): its index, its
+/// row's name, and whether that row is dimmed.
+type Started<'a> = (u32, Option<&'a str>, Option<bool>);
+
+/// [`Started`] for `f`.
+fn started(f: &SlashFilter) -> Started<'_> {
+    let row = f.rows.get(f.start as usize);
+    (
+        f.start,
+        row.map(|r| r.row.name.as_str()),
+        row.map(|r| r.dimmed),
+    )
+}
+
+/// **The highlight starts on the first row that is not dimmed** (plan 030
+/// FU8, §3.4): idle that is the first row; while working it is the first
+/// row the turn does not refuse, WHATEVER its action — a `while_working`
+/// row (`rename`, `exit`) counts as much as a prompt row, which queues.
+#[test]
+fn the_highlight_starts_on_the_first_row_that_is_not_dimmed() {
+    let menu = resolve(&fixture_30(), &all_caps());
+    // Idle: nothing is dimmed, so the first row, `model`.
+    assert_eq!(
+        started(&filter(&menu, "/", 1, false)),
+        (0, Some("model"), Some(false))
+    );
+    // Working: `model` (a picker) is dimmed above `rename` (a while-working
+    // SetTitle) — the case the desktop's first live row is.
+    let f = filter(&menu, "/", 1, true);
+    assert!(f.rows[0].dimmed, "the first row is dimmed: not vacuous");
+    assert_eq!(started(&f), (1, Some("rename"), Some(false)));
+
+    // Further down, and each kind of live row.
+    let catalog = |rows: Vec<LaneSlashRow>| resolve(&LaneSlashCatalog { rows }, &all_caps());
+    let cases: [(&str, Vec<LaneSlashRow>, Started); 3] = [
+        (
+            "a prompt row, which queues",
+            vec![
+                mode("plan"),
+                mode("agent"),
+                model(),
+                prompt("research", LaneSlashSource::Agent),
+                rename(),
+            ],
+            (3, Some("research"), Some(false)),
+        ),
+        (
+            "a while-working Stop",
+            vec![mode("plan"), exit(), rename()],
+            (1, Some("exit"), Some(false)),
+        ),
+        (
+            "a while-working SetTitle",
+            vec![model(), mode("plan"), mode("agent"), rename()],
+            (3, Some("rename"), Some(false)),
+        ),
+    ];
+    for (what, rows, want) in cases {
+        let menu = catalog(rows);
+        assert_eq!(started(&filter(&menu, "/", 1, true)), want, "{what}");
+        assert_eq!(started(&filter(&menu, "/", 1, false)).0, 0, "{what}, idle");
+    }
+    // The filter's own order decides, not the catalog's: `/re` lists
+    // `rename` before `research` (both live).
+    let f = filter(&menu, "/re", 3, true);
+    assert_eq!(filtered(&f), ["rename", "research", "review"]);
+    assert_eq!(started(&f), (0, Some("rename"), Some(false)));
+}
+
+/// **Every row dimmed → 0**: there is no live row to start on, so the
+/// highlight starts where it always did — and Enter there is refused, as
+/// it would be on any of them.
+#[test]
+fn every_row_dimmed_starts_on_the_first() {
+    let menu = resolve(
+        &LaneSlashCatalog {
+            rows: vec![model(), mode("plan"), mode("agent")],
+        },
+        &all_caps(),
+    );
+    let f = filter(&menu, "/", 1, true);
+    assert!(f.open);
+    assert!(f.rows.iter().all(|r| r.dimmed), "every row dimmed");
+    assert_eq!(started(&f), (0, Some("model"), Some(true)));
+}
+
+/// **A closed menu, or no command at all, starts at 0**: no rows, nothing to
+/// highlight.
+#[test]
+fn a_closed_filter_starts_at_zero() {
+    let menu = resolve(&fixture_30(), &all_caps());
+    for (draft, caret) in [
+        ("/zzz", 4),    // no match
+        ("/re foo", 7), // the caret past the token
+        ("hello", 5),   // not a command
+        ("/re\nmore", 2),
+        ("", 0),
+    ] {
+        let f = filter(&menu, draft, caret, true);
+        assert!(!f.open, "{draft:?}");
+        assert_eq!(f.start, 0, "{draft:?}");
+    }
+    assert_eq!(SlashFilter::default().start, 0);
+}
+
+/// **`start` survives the JSON** the desktop reads (`lane_slash_filter`),
+/// and a filter written before it existed reads as 0.
+#[test]
+fn the_start_survives_serde() {
+    let menu = resolve(&fixture_30(), &all_caps());
+    let f = filter(&menu, "/", 1, true);
+    assert_eq!(f.start, 1);
+    let v = serde_json::to_value(&f).unwrap();
+    assert_eq!(v["start"], json!(1));
+    assert_eq!(serde_json::from_value::<SlashFilter>(v).unwrap(), f);
+    let old: SlashFilter =
+        serde_json::from_value(json!({"open": false, "token": "/zzz", "rows": []})).unwrap();
+    assert_eq!(old.start, 0);
+}
+
 /// **Carets are UTF-16 code units**: a non-BMP character in the token counts
 /// two.
 #[test]

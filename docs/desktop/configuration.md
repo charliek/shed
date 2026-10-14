@@ -77,6 +77,11 @@ Normal use needs none of these. They exist for the test harness, packaging, and 
 The Tauri (Linux) client mirrors these with a `SHED_TAURI_*` prefix
 (`SHED_TAURI_TEST_MODE`, `SHED_TAURI_MOCK_BASE_URL`, `SHED_TAURI_SHED_CONFIG`,
 `SHED_TAURI_SOCKET`); its default IPC socket is `$XDG_RUNTIME_DIR/shed-tauri.sock`.
+`SHED_TAURI_LOG_FILE` moves its log file and `SHED_TAURI_LOG=debug` raises the shed crates'
+lines in it to DEBUG and adds roost-ipc's (see the log row in
+[Architecture](architecture.md#state-storage)). The file is private (`0600`, under your own
+directories) and holds host names, paths and diagnostic text; `SHED_TAURI_LOG=debug` adds
+roost's ssh diagnostics, which can include ssh's own stderr.
 
 ### Build / release (read by `scripts/` + the release workflow)
 

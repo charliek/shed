@@ -7,6 +7,10 @@
 //! async runtime before the window paints — so a harness `identify` right after
 //! launch succeeds.
 
+// First, so its `app_info!`/`app_warn!`/`app_error!` macros are in scope in every
+// module below (#414: the app's lines go to stderr AND its log file).
+#[macro_use]
+mod applog;
 mod approval;
 mod broker;
 mod craze;
@@ -1336,17 +1340,39 @@ pub fn run() {
     let _instance = match single_instance::acquire(&lock_path) {
         Ok(lock) => Some(lock),
         Err(AcquireError::AlreadyHeld(pid)) => {
-            eprintln!("shed-desktop-tauri: already running (pid {pid}); activating it");
+            // Before the log file opens, so a launch that only raises the running
+            // app never touches it (the line waits in the pre-sink buffer and goes
+            // with this process).
+            app_info!("shed-desktop-tauri: already running (pid {pid}); activating it");
             let _ = single_instance::activate_running_instance(&env.socket_path);
             return;
         }
         Err(AcquireError::Io(e)) => {
             // Can't determine instance state — proceed rather than block the user
             // (the flock is best-effort robustness, not a correctness gate).
-            eprintln!("shed-desktop-tauri: single-instance check failed ({e}); continuing");
+            app_warn!("shed-desktop-tauri: single-instance check failed ({e}); continuing");
             None
         }
     };
+
+    // The log file (#414): opened only now that this process IS the running
+    // instance; whatever was said before it (the env refusals above) is written
+    // first. Installs the `tracing` subscriber too. Without the lock (the check
+    // failed above and the app carries on) the file stays shut — another
+    // instance may be writing it — so this run logs to stderr only, says why
+    // once, and `identify.log_path` is null.
+    applog::init(env.log_file.as_deref(), _instance.is_some(), env.log_debug);
+    app_info!(
+        "shed-desktop-tauri: starting: version {}, platform {}-{}, pid {}, log {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::process::id(),
+        applog::active_path().map_or_else(
+            || "off (stderr only)".to_string(),
+            |p| p.display().to_string()
+        )
+    );
 
     // Shared with the IPC handler so `ui.current_pane` / `ui.computed_style` /
     // `dashboard.dump` read what the frontend reported.
@@ -1545,6 +1571,9 @@ pub fn run() {
                         build_clock,
                         build_modes,
                     );
+                    // The mode the app resolved, and why (#414) — otherwise only
+                    // `broker.status` ever says it.
+                    app_info!("shed-desktop-tauri: {}", spine.runtime.describe());
                     // Hermetic in test mode (every host → the mock); the minter is the
                     // resolved mode's (external UDS credential.get, or the embedded
                     // provider). `backend_modes` is seeded from the config's
@@ -1717,7 +1746,7 @@ pub fn run() {
             // show it, so a failure logs and the app keeps running (the window is
             // always reachable).
             if let Err(e) = tray::build(app.handle()) {
-                eprintln!("shed-desktop-tauri: tray unavailable ({e}); window-only");
+                app_warn!("shed-desktop-tauri: tray unavailable ({e}); window-only");
             }
 
             // The mac menu-bar popover (B1b): a 2nd, opaque webview mirroring the
@@ -1754,7 +1783,7 @@ pub fn run() {
                 .focused(false)
                 .build()
                 {
-                    eprintln!("shed-desktop-tauri: popover window unavailable ({e})");
+                    app_warn!("shed-desktop-tauri: popover window unavailable ({e})");
                 }
                 // Menu-bar-first in PRODUCTION: hide the dashboard at launch + become
                 // an accessory (no Dock icon), matching the Swift app. "Open dashboard"
@@ -1851,7 +1880,7 @@ fn await_orderly_shutdown(app: &tauri::AppHandle) {
             .await
             .is_err()
         {
-            eprintln!(
+            app_warn!(
                 "shed-desktop-tauri: shutdown: not finished within {}s; exiting anyway",
                 shutdown::ESCAPE.as_secs()
             );
@@ -1888,7 +1917,7 @@ fn spawn_signal_thread(app: tauri::AppHandle, orderly: Arc<shutdown::Shutdown>) 
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    eprintln!(
+                    app_error!(
                         "shed-desktop-tauri: no signal runtime ({e}); signals end the app at once"
                     );
                     return;
@@ -1897,7 +1926,7 @@ fn spawn_signal_thread(app: tauri::AppHandle, orderly: Arc<shutdown::Shutdown>) 
             rt.block_on(listen_for_signals(app, orderly));
         });
     if let Err(e) = spawned {
-        eprintln!("shed-desktop-tauri: no signal thread ({e}); signals end the app at once");
+        app_error!("shed-desktop-tauri: no signal thread ({e}); signals end the app at once");
     }
 }
 
@@ -1909,7 +1938,7 @@ async fn listen_for_signals(app: tauri::AppHandle, orderly: Arc<shutdown::Shutdo
         signal(SignalKind::interrupt()),
         signal(SignalKind::hangup()),
     ) else {
-        eprintln!("shed-desktop-tauri: could not install the signal handlers");
+        app_error!("shed-desktop-tauri: could not install the signal handlers");
         return;
     };
     // Two signals that arrive before this first `recv` consumes the pending
@@ -1921,7 +1950,7 @@ async fn listen_for_signals(app: tauri::AppHandle, orderly: Arc<shutdown::Shutdo
         _ = int.recv() => libc::SIGINT,
         _ = hup.recv() => libc::SIGHUP,
     };
-    eprintln!("shed-desktop-tauri: signal {first}: shutting down");
+    app_info!("shed-desktop-tauri: signal {first}: shutting down");
     let mut done = orderly.start();
     let escape = tokio::time::sleep(shutdown::ESCAPE);
     tokio::pin!(escape);
@@ -1941,7 +1970,8 @@ async fn listen_for_signals(app: tauri::AppHandle, orderly: Arc<shutdown::Shutdo
             _ = hup.recv() => libc::SIGHUP,
             () = &mut escape => first,
         };
-        eprintln!("shed-desktop-tauri: exiting now (signal {again})");
+        // Written and flushed before the exit: the sink appends per line.
+        app_warn!("shed-desktop-tauri: exiting now (signal {again})");
         std::process::exit(128 + again);
     }
 }

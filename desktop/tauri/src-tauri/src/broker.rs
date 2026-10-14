@@ -103,6 +103,12 @@ impl BrokerRuntime {
         }
         if let Some(agent) = &self.agent {
             if let Err(e) = agent.spawn().await {
+                // Logged as well as stored (#414): `broker.status` reports it only
+                // to whoever asks.
+                app_error!(
+                    "shed-desktop-tauri: broker: the embedded broker did not start ({e}); \
+                     approvals are unavailable, token minting still works"
+                );
                 *self.error.lock().unwrap() = Some(e.to_string());
             }
         }
@@ -138,6 +144,26 @@ impl BrokerRuntime {
     /// the pref back to the launch value clears it.
     pub fn restart_required(&self) -> bool {
         self.persisted_pref() != self.launch_pref
+    }
+
+    /// The startup log line (#414): the mode the app resolved, from which pref and
+    /// probe, and where the embedded broker's config came from — `n/a` in external
+    /// mode, which loads none.
+    pub fn describe(&self) -> String {
+        let config = match &self.config_source {
+            ConfigSource::NotApplicable => "n/a".to_string(),
+            ConfigSource::Loaded => "loaded".to_string(),
+            ConfigSource::Synthesized => "synthesized".to_string(),
+            ConfigSource::Error(m) => format!("error: {m}"),
+        };
+        format!(
+            "broker: mode={} pref={} probe{{desktop_socket_live={}, status_socket_live={}}} \
+             config={config}",
+            self.effective_mode_str(),
+            mode_pref_str(self.launch_pref),
+            self.probe.desktop_socket_live,
+            self.probe.status_socket_live,
+        )
     }
 
     /// The `identify.broker_mode` fragment (`{effective, pref, restart_required}`).
@@ -283,7 +309,12 @@ fn build_embedded(
                 BrokerConfig::Loaded(_) => ConfigSource::Loaded,
                 BrokerConfig::Synthesized(_) => ConfigSource::Synthesized,
             };
-            let (agent, agent_rx) = EmbeddedHostAgent::new(cfg.into_config());
+            // The broker's own lines (bus connects, drops, 409s, handler warnings) go
+            // to the app's log file, not just stderr (#414).
+            let (agent, agent_rx) = EmbeddedHostAgent::new(
+                cfg.into_config(),
+                Arc::new(crate::applog::BrokerLog),
+            );
             let agent = Arc::new(agent);
             let minter = Some(agent.token_minter());
             let (event_rx, responder) = if spawn {
@@ -462,6 +493,11 @@ mod tests {
             rt.identify_fragment(),
             json!({"effective": "external", "pref": "auto", "restart_required": false})
         );
+        assert_eq!(
+            rt.describe(),
+            "broker: mode=external pref=auto probe{desktop_socket_live=true, \
+             status_socket_live=false} config=n/a"
+        );
     }
 
     #[test]
@@ -481,6 +517,11 @@ mod tests {
         assert_eq!(v["config"]["source"], "error");
         assert_eq!(v["config"]["message"], "bad policy");
         assert_eq!(v["broker_error"], "bad policy");
+        assert_eq!(
+            rt.describe(),
+            "broker: mode=embedded pref=embedded probe{desktop_socket_live=false, \
+             status_socket_live=false} config=error: bad policy"
+        );
     }
 
     #[test]

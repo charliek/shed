@@ -411,10 +411,12 @@ the panel only renders and handles keys.
   plugin spelling, then substrings). It scrolls; a catalog has no row cap.
 - **Keys.** Enter accepts the highlighted row — it runs when the token already
   spells the row, and otherwise selects it; Tab completes; ↑/↓ move the
-  highlight, which starts on the first row again whenever the typed filter or
-  the catalog changes; Esc closes the menu until the token changes (a catalog
-  update does not reopen it). With no menu up, Enter sends. Shift+Enter is a
-  newline, and no key acts while an input method is composing.
+  highlight, which starts over whenever the typed filter or the catalog
+  changes — on the first row, or, while a turn runs, on the first row that is
+  not dimmed (a turn starting or ending alone leaves it where it is); Esc
+  closes the menu until the token changes (a catalog update does not reopen
+  it). With no menu up, Enter sends. Shift+Enter is a newline, and no key
+  acts while an input method is composing.
 - **What a row does.** A prompt row (the agent's own commands) is sent as
   `/<name> <argument>` and queues during a turn like any prompt. `/rename
   <title>` renames the session (`lane.set_title`); the header changes when

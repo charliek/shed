@@ -30,22 +30,34 @@
 //!
 //! ## `invalidate` is not a probe
 //!
-//! [`RoostReach::invalidate`] is called after **any** request error, and the
-//! next [`RoostReach::ensure`] rebuilds rather than trusting a liveness check.
-//! That is deliberate: an SSH bridge socket is a local `UnixListener` that goes
-//! on accepting connections perfectly happily after the `ssh` master behind it
-//! has died — the failure only surfaces when the far side never answers. "Can I
-//! connect to it" is therefore not the question worth asking, and a reach that
-//! asked it would hand back a socket that accepts and then hangs.
+//! [`RoostReach::invalidate`] is called after a request fails **on the wire**,
+//! and the next [`RoostReach::ensure`] rebuilds rather than trusting a liveness
+//! check. That is deliberate: an SSH bridge socket is a local `UnixListener`
+//! that goes on accepting connections perfectly happily after the `ssh` master
+//! behind it has died — the failure only surfaces when the far side never
+//! answers. "Can I connect to it" is therefore not the question worth asking,
+//! and a reach that asked it would hand back a socket that accepts and then
+//! hangs.
+//!
+//! "On the wire" is [`is_transport_error`]'s answer, and every one-shot, a
+//! [`RoostPeek`] and the [`BootstrapRunner`] ask it: a connection that went
+//! quiet, a frame that would not decode or a lost revision invalidates; a
+//! refusal the session minted (`not-found` for a closed tab) and the gate's two
+//! (`ProtocolMismatch`, `NotASession`) do not (plan 030, #407). They describe
+//! the peer, not the pipe — a rebuilt tunnel reaches the same one — and the
+//! reach is SHARED: a host's watcher and its lanes ride the one `ssh` master an
+//! invalidate tears down. A failed `ensure` always invalidates, and so does the
+//! watcher after any cycle it reports as `Down`.
 //!
 //! ## Why a failure is typed, and why it arrives late (plan 019 §3.6)
 //!
-//! The same fact that makes `invalidate` unconditional makes a failure's
-//! *reason* hard to come by: the loop only ever sees its end of a local socket
-//! going quiet. The `ssh` exec behind that socket is what failed, and its stderr
-//! is classified onto the tunnel **after** it dies — after roost's warm-up has
-//! already run `true` and succeeded, so `ensure` reported nothing wrong. So
-//! there are two paths a reason can take and they are not interchangeable:
+//! The same fact that makes `invalidate` a rebuild rather than a probe makes a
+//! failure's *reason* hard to come by: the loop only ever sees its end of a
+//! local socket going quiet. The `ssh` exec behind that socket is what failed,
+//! and its stderr is classified onto the tunnel **after** it dies — after
+//! roost's warm-up has already run `true` and succeeded, so `ensure` reported
+//! nothing wrong. So there are two paths a reason can take and they are not
+//! interchangeable:
 //!
 //! * [`RoostReach::ensure`] fails, and answers with a typed [`ReachError`];
 //! * `ensure` succeeded and a *request* failed, and the classification has to be
@@ -56,7 +68,9 @@
 //! Both end up as [`RoostUpdate::Down`]'s `kind`, which is what lets a client
 //! offer an install for a host with no `roost-session` and a start for one with
 //! no session running — decisions that were previously only expressible by
-//! grepping a sentence.
+//! grepping a sentence. A one-shot reads the same record, under a watermark of
+//! its own taken before it dials, and returns its sentence as the error text
+//! (plan 030, #351).
 //!
 //! ## Two ssh stacks per host, for the length of a bootstrap
 //!
@@ -2050,8 +2064,26 @@ async fn observe_once(
 // one-shots
 // ---------------------------------------------------------------------------
 
-/// Dial through a reach, invalidating it if the dial fails.
-async fn dial(reach: &dyn RoostReach) -> Result<Conn, String> {
+/// The watermark a one-shot reads the transport's record against
+/// ([`finish`]): the generation the reach had ALREADY recorded before this call
+/// dialed, or 0.
+///
+/// Per call and taken before the dial, so a record this call's own `ssh` exec
+/// leaves is news and one an earlier failure left — another call's, the
+/// watcher's — is not. Without it, a host that once had no session would have
+/// every later dropped wire blamed on that, for as long as the tunnel lives
+/// ([`overlay_reach_reason`] says why the record is never cleared).
+async fn watermark(reach: &dyn RoostReach) -> u64 {
+    reach
+        .last_error()
+        .await
+        .map_or(0, |recorded| recorded.generation)
+}
+
+/// Dial through a reach. A failed `ensure` invalidates it — nothing usable was
+/// built — and a failed connect is a request failure like any other
+/// ([`finish`]), `seen` being the call's [`watermark`].
+async fn dial(reach: &dyn RoostReach, seen: &mut u64) -> Result<Conn, String> {
     let endpoint = match reach.ensure().await {
         Ok(endpoint) => endpoint,
         Err(e) => {
@@ -2059,17 +2091,45 @@ async fn dial(reach: &dyn RoostReach) -> Result<Conn, String> {
             return Err(e.to_string());
         }
     };
-    finish(reach, Conn::endpoint(&endpoint).await).await
+    finish(reach, seen, Conn::endpoint(&endpoint).await).await
 }
 
-/// A request's outcome, with the reach invalidated when it failed — after ANY
-/// error, unconditionally, for the reason in the module doc.
-async fn finish<T>(reach: &dyn RoostReach, result: Result<T, RoostError>) -> Result<T, String> {
+/// A one-shot request's outcome, as the one-shot reports it.
+///
+/// **Only a wire failure invalidates the reach** ([`is_transport_error`], plan
+/// 030 #407). The reach is SHARED — a host's watcher and its lanes ride the same
+/// tunnel — so a refusal the session minted (`not-found` for a tab somebody
+/// closed) or the gate's two, which describe the peer and not the pipe, must not
+/// cost all of them a re-establish.
+///
+/// **A wire failure says why when the transport knows** (#351): the text is the
+/// reach's recorded classification when it is newer than `seen` (the call's
+/// [`watermark`]; [`overlay_reach_reason`], the watcher's rule), else the
+/// failure's own. This end of a bridge socket only saw the connection close;
+/// the `ssh` exec behind it may have said `client-bridge: no session`. Read
+/// BEFORE the invalidate: after it, a concurrent `ensure` can replace the tunnel
+/// and its record with it — the order [`BootstrapRunner`] keeps too.
+///
+/// Two limits, both no worse than the generic text this replaced. The record is
+/// the reach's CURRENT tunnel's, not necessarily the one this call dialed: a
+/// replacement by another caller between the failure and this read yields the
+/// fallback, or that tunnel's own newer reason. And roost keeps a classified
+/// family sticky over a later generic `Transport` on the same tunnel while still
+/// advancing `generation` (`RecordedFailure`, whose `family_generation` is
+/// crate-private), so such a tunnel's old reason can be shown for a newer
+/// generic failure — the watcher's overlay reads it the same way.
+async fn finish<T>(
+    reach: &dyn RoostReach,
+    seen: &mut u64,
+    result: Result<T, RoostError>,
+) -> Result<T, String> {
     match result {
         Ok(value) => Ok(value),
+        Err(e) if !is_transport_error(&e) => Err(e.to_string()),
         Err(e) => {
+            let reason = overlay_reach_reason(reach, seen, reach_other(&e)).await;
             reach.invalidate().await;
-            Err(e.to_string())
+            Err(reason.message)
         }
     }
 }
@@ -2077,13 +2137,12 @@ async fn finish<T>(reach: &dyn RoostReach, result: Result<T, RoostError>) -> Res
 /// Whether a failed request means **the wire** is suspect, rather than the
 /// request.
 ///
-/// A one-shot routed through [`finish`] does not ask — it dials per call and
-/// invalidates after any error. A held connection does: it is the caller most
-/// often told "that tab is gone" by a transport that is working perfectly, and
-/// tearing the transport down for that would make every stale tab id cost an
-/// `ssh` re-establish. [`tab_set_title`] asks too, for the same reason: its
-/// natural refusal (the tab closed between the open and the rename) arrives
-/// over a working, shared tunnel.
+/// Every caller that invalidates a reach after a BUILT connection failed asks:
+/// the one-shots through [`finish`], [`RoostPeek::dump`] and
+/// [`BootstrapRunner`]. The common "no" is a session saying "that tab is gone"
+/// over a transport that is working perfectly, and tearing the transport down
+/// for that would make every stale tab id cost an `ssh` re-establish — for the
+/// host's watcher and lanes too, which share it.
 ///
 /// Matched exhaustively on purpose: a new [`RoostError`] variant should fail to
 /// compile here rather than default into either answer.
@@ -2109,8 +2168,9 @@ fn is_transport_error(error: &RoostError) -> bool {
 /// which is the honest cost of a one-shot and is why the *watcher* holds one
 /// connection instead.
 pub async fn tab_open(reach: &dyn RoostReach, params: TabOpenParams) -> Result<Tab, String> {
-    let mut conn = dial(reach).await?;
-    finish(reach, conn.tab_open(params).await).await
+    let mut seen = watermark(reach).await;
+    let mut conn = dial(reach, &mut seen).await?;
+    finish(reach, &mut seen, conn.tab_open(params).await).await
 }
 
 /// `tab.set_title` — give a tab a sticky name.
@@ -2121,23 +2181,14 @@ pub async fn tab_open(reach: &dyn RoostReach, params: TabOpenParams) -> Result<T
 /// than the open's connection, because the open is answered by then and a
 /// failed title must not cost the caller the tab it already has.
 ///
-/// **Only a transport-shaped failure invalidates the reach**
-/// ([`is_transport_error`]), unlike the other one-shots' [`finish`]. A refusal
-/// roost minted — `not-found` for a tab closed between the open and the rename —
-/// is the session answering over a working wire, and the reach is SHARED: the
-/// host's watcher and its lanes ride the same tunnel, so tearing it down on the
-/// next `ensure` would cost all of them a re-establish over a rename.
+/// Its natural refusal — `not-found` for a tab closed between the open and the
+/// rename — is the session answering over a working wire, and [`finish`] keeps
+/// the reach for it: the host's watcher and its lanes ride the same tunnel, so
+/// tearing it down would cost all of them a re-establish over a rename.
 pub async fn tab_set_title(reach: &dyn RoostReach, tab_id: i64, title: &str) -> Result<(), String> {
-    let mut conn = dial(reach).await?;
-    match conn.tab_set_title(tab_id, title).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            if is_transport_error(&e) {
-                reach.invalidate().await;
-            }
-            Err(e.to_string())
-        }
-    }
+    let mut seen = watermark(reach).await;
+    let mut conn = dial(reach, &mut seen).await?;
+    finish(reach, &mut seen, conn.tab_set_title(tab_id, title).await).await
 }
 
 /// Where a client is in ONE roost daemon's history: a revision, and the
@@ -2163,9 +2214,13 @@ impl TabFence {
 /// A fence on `conn`: `session.identify` (the incarnation) and `tab.list` (a
 /// revision) on one connection, so both are the same daemon's. `Err` from a UI
 /// socket, which publishes no revision.
-async fn read_fence(reach: &dyn RoostReach, conn: &mut Conn) -> Result<TabFence, String> {
-    let identify = finish(reach, conn.session_identify().await).await?;
-    let list = finish(reach, conn.tab_list().await).await?;
+async fn read_fence(
+    reach: &dyn RoostReach,
+    seen: &mut u64,
+    conn: &mut Conn,
+) -> Result<TabFence, String> {
+    let identify = finish(reach, seen, conn.session_identify().await).await?;
+    let list = finish(reach, seen, conn.tab_list().await).await?;
     let revision = list
         .revision
         .ok_or_else(|| "this roost socket publishes no revision".to_string())?;
@@ -2207,13 +2262,16 @@ pub async fn tab_open_fenced(
     reach: &dyn RoostReach,
     params: TabOpenParams,
 ) -> Result<(Tab, Option<TabFence>), String> {
-    let mut conn = dial(reach).await?;
-    let tab = finish(reach, conn.tab_open(params).await).await?;
-    let first = read_fence(reach, &mut conn).await;
+    let mut seen = watermark(reach).await;
+    let mut conn = dial(reach, &mut seen).await?;
+    let tab = finish(reach, &mut seen, conn.tab_open(params).await).await?;
+    let first = read_fence(reach, &mut seen, &mut conn).await;
     drop(conn);
-    let fence = fence_or_retry(first, || async {
-        let mut conn = dial(reach).await?;
-        read_fence(reach, &mut conn).await
+    // The retry is the same call, so it reads against the same watermark.
+    let seen = &mut seen;
+    let fence = fence_or_retry(first, || async move {
+        let mut conn = dial(reach, seen).await?;
+        read_fence(reach, seen, &mut conn).await
     })
     .await;
     Ok((tab, fence))
@@ -2221,15 +2279,17 @@ pub async fn tab_open_fenced(
 
 /// `tab.close` — end a tab. It leaves `tab.list` entirely.
 pub async fn tab_close(reach: &dyn RoostReach, tab_id: i64) -> Result<(), String> {
-    let mut conn = dial(reach).await?;
-    finish(reach, conn.tab_close(tab_id).await).await
+    let mut seen = watermark(reach).await;
+    let mut conn = dial(reach, &mut seen).await?;
+    finish(reach, &mut seen, conn.tab_close(tab_id).await).await
 }
 
 /// `tab.dump` — one tab's viewport as text. For a repeated peek use
 /// [`RoostPeek`], which holds the connection.
 pub async fn tab_dump(reach: &dyn RoostReach, tab_id: i64) -> Result<TabDumpResult, String> {
-    let mut conn = dial(reach).await?;
-    finish(reach, conn.tab_dump(tab_id).await).await
+    let mut seen = watermark(reach).await;
+    let mut conn = dial(reach, &mut seen).await?;
+    finish(reach, &mut seen, conn.tab_dump(tab_id).await).await
 }
 
 // There is no `tab_write` one-shot here, and it is not because the wire forbids
@@ -2254,12 +2314,12 @@ pub async fn tab_dump(reach: &dyn RoostReach, tab_id: i64) -> Result<TabDumpResu
 ///
 /// A peek is the one thing in this module that survives across requests, so it
 /// is the one thing that has to invalidate the reach itself. Every other caller
-/// routes through [`finish`], which invalidates after any error; a peek that
-/// held only its `Conn` would leave the reach believing its transport was fine.
-/// Over an [`SshBridge`] that is a concrete bug: the `ssh` master dies, `dump`
-/// returns [`RoostError::Unavailable`], the caller re-opens the peek, and
-/// [`RoostReach::ensure`] hands back the same dead `bridge.sock` — which accepts
-/// connections happily and answers nothing — forever.
+/// routes through [`finish`], which invalidates after a wire failure; a peek
+/// that held only its `Conn` would leave the reach believing its transport was
+/// fine. Over an [`SshBridge`] that is a concrete bug: the `ssh` master dies,
+/// `dump` returns [`RoostError::Unavailable`], the caller re-opens the peek,
+/// and [`RoostReach::ensure`] hands back the same dead `bridge.sock` — which
+/// accepts connections happily and answers nothing — forever.
 ///
 /// It invalidates on a **transport-shaped** error only ([`is_transport_error`]):
 /// a `not-found` for a tab somebody closed is the session working, not the wire
@@ -2281,7 +2341,8 @@ impl RoostPeek {
     /// frame fails on the wire. A caller holding a bare reach wraps it —
     /// `RoostPeek::open(Arc::new(FixedPort(port)), tab_id)`.
     pub async fn open(reach: Arc<dyn RoostReach>, tab_id: i64) -> Result<RoostPeek, String> {
-        let conn = dial(reach.as_ref()).await?;
+        let mut seen = watermark(reach.as_ref()).await;
+        let conn = dial(reach.as_ref(), &mut seen).await?;
         Ok(RoostPeek {
             reach,
             conn,
@@ -4957,13 +5018,7 @@ mod tests {
         // A socket that takes the request and hangs up without an answer.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("hangup.sock");
-        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
-        let hangup = tokio::spawn(async move {
-            use tokio::io::AsyncBufReadExt as _;
-            let (stream, _) = listener.accept().await.expect("accept");
-            let mut lines = tokio::io::BufReader::new(stream).lines();
-            let _ = lines.next_line().await;
-        });
+        let hangup = hang_up_on(&path, 1);
         let dead = FlakyReach::new(RoostEndpoint::Unix(path), 0);
         let lost = tab_set_title(dead.as_ref(), TAB, "x")
             .await
@@ -5002,15 +5057,161 @@ mod tests {
         assert!(gone.contains("not-found"), "{gone}");
     }
 
-    /// A failing one-shot invalidates the reach so the next call rebuilds it.
+    /// A socket that takes each of `connections` requests and hangs up without
+    /// an answer: a dead wire as a connection sees one, with no transport behind
+    /// it to record why.
+    fn hang_up_on(path: &Path, connections: usize) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(path).expect("bind");
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt as _;
+            for _ in 0..connections {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut lines = tokio::io::BufReader::new(stream).lines();
+                let _ = lines.next_line().await;
+            }
+        })
+    }
+
+    /// **A one-shot the session refused keeps the reach** (plan 030, #407).
+    /// The reach is shared with the host's watcher and its lanes, so a refusal
+    /// roost minted — proof the wire works — must not cost them an `ssh`
+    /// re-establish.
     #[tokio::test]
-    async fn a_failed_one_shot_invalidates_the_reach() {
+    async fn a_one_shot_the_session_refused_keeps_the_reach() {
         let fake = FakeRoost::start().await;
         let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 0);
-        tab_dump(reach.as_ref(), 999_999)
+
+        let gone = tab_dump(reach.as_ref(), 999_999)
             .await
             .expect_err("no such tab");
-        assert_eq!(reach.invalidations.load(Ordering::SeqCst), 1);
+        assert!(gone.contains("not-found"), "{gone}");
+        let gone = tab_close(reach.as_ref(), 999_999)
+            .await
+            .expect_err("no such tab");
+        assert!(gone.contains("not-found"), "{gone}");
+        fake.refuse_next_tab_open("internal", "the pty pool is wedged");
+        let refused = tab_open(reach.as_ref(), TabOpenParams::default())
+            .await
+            .expect_err("the seeded refusal");
+        assert!(refused.contains("the pty pool is wedged"), "{refused}");
+        assert_eq!(
+            reach.invalidations.load(Ordering::SeqCst),
+            0,
+            "a refusal roost minted is the wire working"
+        );
+    }
+
+    /// **Nor does a one-shot the gate refused** (plan 030, #407): a daemon of
+    /// another protocol and a roost UI socket describe the peer, not the pipe,
+    /// and a rebuilt tunnel would meet the same one. Met by the fence read
+    /// after an open that worked; the read is retried once, so two refusals
+    /// each — neither got as far as the `tab.list` behind the gate.
+    #[tokio::test]
+    async fn a_one_shot_the_gate_refused_keeps_the_reach() {
+        let mismatched = FakeRoost::start().await;
+        mismatched.set_session_protocol(2);
+        let ui = FakeRoost::start().await;
+        ui.serve_as_ui_socket(true);
+        for (gate, fake) in [("ProtocolMismatch", &mismatched), ("NotASession", &ui)] {
+            let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 0);
+            let (tab, fence) = tab_open_fenced(reach.as_ref(), TabOpenParams::default())
+                .await
+                .expect("the open itself is not gated");
+            assert!(fake.tab_ids().contains(&tab.id), "{gate}: the tab opened");
+            assert_eq!(fence, None, "{gate}: no fence read past the gate");
+            assert_eq!(fake.tab_list_calls(), 0, "{gate}: refused at the gate");
+            assert_eq!(
+                reach.invalidations.load(Ordering::SeqCst),
+                0,
+                "{gate} describes the peer, not the pipe"
+            );
+        }
+    }
+
+    /// **A one-shot on a dead wire invalidates the reach**, through each door:
+    /// a request the connection dropped (the case `invalidate` exists for) —
+    /// answered with the drop's own text, since this reach records nothing — a
+    /// connect to nothing, and an `ensure` that failed.
+    #[tokio::test]
+    async fn a_one_shot_on_a_dead_wire_invalidates_the_reach() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hangup.sock");
+        let hangup = hang_up_on(&path, 2);
+        let dead = FlakyReach::new(RoostEndpoint::Unix(path), 0);
+        let lost = tab_dump(dead.as_ref(), TAB)
+            .await
+            .expect_err("the connection dropped");
+        assert!(lost.contains("closed before the reply"), "{lost}");
+        assert_eq!(dead.invalidations.load(Ordering::SeqCst), 1, "{lost}");
+        let lost = tab_open(dead.as_ref(), TabOpenParams::default())
+            .await
+            .expect_err("the connection dropped");
+        assert!(lost.contains("closed before the reply"), "{lost}");
+        assert_eq!(dead.invalidations.load(Ordering::SeqCst), 2, "{lost}");
+        hangup.await.expect("the hang-ups ran");
+
+        let nothing = dir.path().join("nothing.sock");
+        let unbound = FlakyReach::new(RoostEndpoint::Unix(nothing.clone()), 0);
+        let refused = tab_close(unbound.as_ref(), TAB)
+            .await
+            .expect_err("nothing is listening");
+        assert_eq!(unbound.invalidations.load(Ordering::SeqCst), 1, "{refused}");
+
+        let asleep = FlakyReach::new(RoostEndpoint::Unix(nothing), 1);
+        let unbuilt = tab_dump(asleep.as_ref(), TAB)
+            .await
+            .expect_err("the reach could not be built");
+        assert_eq!(unbuilt, "the machine is asleep");
+        assert_eq!(asleep.invalidations.load(Ordering::SeqCst), 1);
+    }
+
+    /// A reach whose record is gone the moment it is invalidated — what a
+    /// concurrent `ensure` replacing the tunnel looks like to a reader that
+    /// asks too late (plan 030 PC1). Its `ensure` leaves the record this call's
+    /// own exec would, so it is newer than the watermark taken before the dial.
+    struct ReplacedOnInvalidate {
+        endpoint: RoostEndpoint,
+        recorded: std::sync::Mutex<Option<RecordedReach>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RoostReach for ReplacedOnInvalidate {
+        fn label(&self) -> &str {
+            "replaced"
+        }
+
+        async fn ensure(&self) -> Result<RoostEndpoint, ReachError> {
+            *self.recorded.lock().expect("the record") = Some(RecordedReach {
+                generation: 1,
+                error: ReachError::new(ReachKind::NoSession, "mini9 has no roost session running"),
+            });
+            Ok(self.endpoint.clone())
+        }
+
+        async fn invalidate(&self) {
+            *self.recorded.lock().expect("the record") = None;
+        }
+
+        async fn last_error(&self) -> Option<RecordedReach> {
+            self.recorded.lock().expect("the record").clone()
+        }
+    }
+
+    /// **The classification is read before the invalidate** (plan 030 PC1):
+    /// after it, the tunnel — and its record — may already be another one.
+    #[tokio::test]
+    async fn a_one_shot_reads_the_record_before_it_invalidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hangup.sock");
+        let hangup = hang_up_on(&path, 1);
+        let reach = ReplacedOnInvalidate {
+            endpoint: RoostEndpoint::Unix(path),
+            recorded: std::sync::Mutex::new(None),
+        };
+        let lost = tab_dump(&reach, TAB).await.expect_err("the wire dropped");
+        hangup.await.expect("the hang-up ran");
+        assert_eq!(lost, "mini9 has no roost session running");
+        assert_eq!(reach.last_error().await, None, "and it did invalidate");
     }
 
     /// **A peek is the one holder of a connection, so it is the one thing that
@@ -6072,6 +6273,95 @@ except Exception:
             ran(&log)
         );
         watcher.stop();
+    }
+
+    /// **A one-shot to a host with no session says so** (plan 030, #351),
+    /// through a real [`SshTunnel`] whose far side refuses every connection the
+    /// way a host with `roost-session` installed and not running does. The
+    /// one-shot's own end of the bridge socket only sees it close; roost's
+    /// sentence comes off the tunnel, as the watcher's `Down` does above.
+    /// Twice: the first call's invalidate replaces the tunnel, so the second
+    /// call's record is a new tunnel's, numbered past everything the first
+    /// reported.
+    #[tokio::test]
+    async fn a_one_shot_to_a_host_with_no_session_returns_roosts_sentence() {
+        let fake = FakeRoost::start().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("ssh.log");
+        let ssh = write_fake_ssh(dir.path(), fake.socket_path(), &log);
+        // The warm-up still succeeds: only the per-connection execs refuse.
+        std::fs::write(no_session_marker(dir.path()), "").expect("the marker");
+        let bridge = faked_bridge(&format!("mini-oneshot-{}", std::process::id()), ssh);
+
+        let open = tab_open(&bridge, TabOpenParams::default())
+            .await
+            .expect_err("there is no session to open a tab in");
+        let close = tab_close(&bridge, TAB)
+            .await
+            .expect_err("there is no session to close a tab in");
+        for (op, error) in [("tab_open", open), ("tab_close", close)] {
+            assert!(
+                error.contains("has no roost session running"),
+                "{op}: the transport's classification was not used: {error}"
+            );
+            assert!(!error.contains("closed before the reply"), "{op}: {error}");
+        }
+        let refused = ran(&log)
+            .iter()
+            .filter(|line| *line == "no-session")
+            .count();
+        assert_eq!(refused, 2, "one refused exec per call: {:?}", ran(&log));
+    }
+
+    /// **A record the reach already held is not this call's reason** (plan 030
+    /// §3.7). The bridge's tunnel recorded `no-session` before the call began —
+    /// another call's failure, or the watcher's — and then this call's wire
+    /// drops with nothing new recorded: the answer is the drop's own text, not
+    /// a stale "start a session" for a host whose session may well be up now.
+    #[tokio::test]
+    async fn a_one_shot_does_not_reuse_a_record_the_reach_held_before_it_dialed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("bridge.sock");
+        let hangup = hang_up_on(&socket, 1);
+        let opener = ScriptedOpener::new(
+            socket,
+            [Some(RecordedReach {
+                generation: 3,
+                error: ReachError::from_ssh_failure(
+                    &roost_ipc::ssh::SshFailure::NoSession,
+                    "ssh://mini9",
+                ),
+            })],
+        );
+        let bridge = SshBridge::new(
+            &entry("mini9"),
+            SshBridgeOptions {
+                opener,
+                config_paths: Some(SshConfigPaths {
+                    user: None,
+                    system: None,
+                }),
+                ..SshBridgeOptions::default()
+            },
+        )
+        .expect("bridge");
+        bridge.ensure().await.expect("the tunnel");
+        let held = bridge
+            .last_error()
+            .await
+            .expect("a record held before the call");
+        assert!(
+            held.error.message.contains("has no roost session running"),
+            "{held:?}"
+        );
+
+        let lost = tab_dump(&bridge, TAB).await.expect_err("the wire dropped");
+        hangup.await.expect("the hang-up ran");
+        assert!(
+            !lost.contains("has no roost session running"),
+            "a record from before the call was reused: {lost}"
+        );
+        assert!(lost.contains("closed before the reply"), "{lost}");
     }
 
     // ---- the exec runner ----

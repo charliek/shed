@@ -294,8 +294,8 @@ run had not reached by then are left to their own protocols (an ssh master's
   attachable, after the app quits.
 
 The worst case is about 16 seconds and the usual case is well under 3. Each step's time is
-logged to stderr (`shed-desktop-tauri: shutdown: phase N …`), with anything it gave up on at
-its bound: work that could not finish in time is abandoned with the spawn gate still closed, so
+logged to stderr and to the app's log file (`shed-desktop-tauri: shutdown: phase N …`; the
+file's location is under State + storage below), with anything it gave up on at its bound: work that could not finish in time is abandoned with the spawn gate still closed, so
 nothing it starts later survives its registration. A second signal, or a
 shutdown still running 20 seconds after the first signal, exits at once (status 128 + the
 signal number). A crash or a `kill -9` runs none of this; an ssh master left behind then
@@ -308,7 +308,7 @@ exits on its own once its 60-second `ControlPersist` lapses.
 | Audit log | `<stateDir>/audit.jsonl` | append-only JSONL; `stateDir` = `~/Library/Application Support/ShedDesktop/`, override `SHED_DESKTOP_STATE_DIR`. Reachable over IPC via `activity.log_path`. |
 | Preferences | `UserDefaults` (`ai.stridelabs.ShedDesktop`) | three keys: `terminalTemplate`, `defaultApprovalMode`, `policyRules` (JSON). See [Configuration](configuration.md). |
 | Control socket + lock | `~/Library/Caches/ShedDesktop/shed-desktop.{sock,lock}` | **not** moved by `SHED_DESKTOP_STATE_DIR` (so harness + dev session agree). |
-| Log | `~/Library/Logs/ShedDesktop/shed-desktop.log` | |
+| Log | macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`; Linux `${XDG_STATE_HOME:-~/.local/state}/ai.stridelabs.shed-desktop/shed-desktop.log` | The Tauri app's own lines, the shed crates' `tracing` events (INFO and up) and the embedded broker's lines (bus connects, drops and `409` rejections, each naming its `server=`), every line stamped `<RFC 3339 UTC> <LEVEL>` and also written to stderr. `SHED_TAURI_LOG=debug` raises the shed crates to DEBUG and adds roost-ipc's events, which are off without it. Rotates at 5 MiB, keeping `.log.1`–`.log.3`. The file is private (`0600`, under your own directories; those the app creates are `0700`) and holds host names, paths and diagnostic text; `SHED_TAURI_LOG=debug` adds roost's ssh diagnostics, which can include ssh's own stderr. `SHED_TAURI_LOG_FILE` overrides the path, which must name a regular file: a symlink there is refused, never followed, as is a FIFO or a device. `identify.log_path` reports the file in use (`null` when file logging is off — a destination that cannot be opened, or a failed write, falls back to stderr only, said once). Opened only once the single-instance lock is held, so a second launch that raises the running app never writes it; a launch whose lock check fails carries on with stderr only. A dev build run beside the installed app (a different `SHED_TAURI_SOCKET`) shares this default path; set `SHED_TAURI_LOG_FILE` to keep them apart. |
 
 ## Security model
 

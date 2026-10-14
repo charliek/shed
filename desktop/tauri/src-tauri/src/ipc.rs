@@ -638,7 +638,7 @@ fn system_terminate(app: &AppHandle) -> Result<(), (String, String)> {
         use objc2::{msg_send, sel, MainThreadMarker};
         use objc2_app_kit::NSApplication;
         let Some(mtm) = MainThreadMarker::new() else {
-            eprintln!("shed-desktop-tauri: app.terminate: not on the main thread; nothing sent");
+            app_warn!("shed-desktop-tauri: app.terminate: not on the main thread; nothing sent");
             return;
         };
         let ns_app = NSApplication::sharedApplication(mtm);
@@ -786,7 +786,7 @@ pub fn show_preferences_window(app: &AppHandle) {
         .center()
         .build()
         {
-            eprintln!("shed-desktop-tauri: preferences window unavailable ({e})");
+            app_warn!("shed-desktop-tauri: preferences window unavailable ({e})");
             return;
         }
         set_activation_policy_prod(&handle, true);
@@ -814,8 +814,9 @@ pub fn set_activation_policy_prod<R: tauri::Runtime>(app: &AppHandle<R>, regular
 pub fn set_activation_policy_prod<R: tauri::Runtime>(_app: &AppHandle<R>, _regular: bool) {}
 
 /// The `identify` payload. A free fn (not a method) so it's unit-testable without
-/// a running Tauri app / `AppHandle`.
-fn identify_payload(env: &Env, pid: u32) -> Value {
+/// a running Tauri app / `AppHandle`. `log_path` is the log file the app is
+/// writing (#414) — `null` when file logging is off.
+fn identify_payload(env: &Env, pid: u32, log_path: Option<&std::path::Path>) -> Value {
     json!({
         "socket_path": env.socket_path.to_string_lossy(),
         "pid": pid,
@@ -823,6 +824,7 @@ fn identify_payload(env: &Env, pid: u32) -> Value {
         "platform": "tauri",
         "test_mode": env.test_mode,
         "mock_base_url": env.mock_base_url,
+        "log_path": log_path.map(|p| p.to_string_lossy()),
     })
 }
 
@@ -910,7 +912,8 @@ impl Handler {
                 // Augment the base payload with the resolved broker mode (leg 3a.2) —
                 // read from managed state, so `identify_payload` stays a pure, testable
                 // free fn of `Env`.
-                let mut v = identify_payload(&self.env, self.pid);
+                let mut v =
+                    identify_payload(&self.env, self.pid, crate::applog::active_path().as_deref());
                 if let Some(rt) = self.app.try_state::<crate::broker::BrokerRuntime>() {
                     v["broker_mode"] = rt.identify_fragment();
                 }
@@ -2614,7 +2617,7 @@ impl IpcServer {
                     tokio::spawn(async move { serve_conn(stream, handler).await });
                 }
                 Err(e) => {
-                    eprintln!("shed-desktop-tauri: ipc accept error: {e}");
+                    app_error!("shed-desktop-tauri: ipc accept error: {e}");
                     break;
                 }
             }
@@ -2928,6 +2931,8 @@ mod tests {
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),
             broker_extensions_path: PathBuf::from("/run/user/0/shed/extensions.yaml"),
+            log_file: None,
+            log_debug: false,
         }
     }
 
@@ -2989,7 +2994,7 @@ mod tests {
 
     #[test]
     fn identify_reports_tauri_core_and_hermeticity() {
-        let v = identify_payload(&env(Some("http://mock")), 4242);
+        let v = identify_payload(&env(Some("http://mock")), 4242, None);
         assert_eq!(v["platform"], "tauri");
         assert_eq!(v["core"], "rust");
         assert_eq!(v["test_mode"], true);
@@ -3003,8 +3008,19 @@ mod tests {
 
     #[test]
     fn identify_null_mock_when_unset() {
-        let v = identify_payload(&env(None), 1);
+        let v = identify_payload(&env(None), 1, None);
         assert!(v["mock_base_url"].is_null());
+    }
+
+    /// `identify.log_path` is the ACTIVE log file, or `null` when file logging is
+    /// off (#414).
+    #[test]
+    fn identify_reports_the_active_log_file_or_null() {
+        let v = identify_payload(&env(None), 1, None);
+        assert!(v["log_path"].is_null(), "{v}");
+        let path = std::path::Path::new("/home/u/.local/state/x/shed-desktop.log");
+        let v = identify_payload(&env(None), 1, Some(path));
+        assert_eq!(v["log_path"], "/home/u/.local/state/x/shed-desktop.log");
     }
 
     #[tokio::test]

@@ -583,8 +583,8 @@ mod linux {
         default_service = "org.freedesktop.Notifications",
         default_path = "/org/freedesktop/Notifications"
     )]
-    #[allow(clippy::too_many_arguments)]
     trait Notifications {
+        #[allow(clippy::too_many_arguments)]
         fn notify(
             &self,
             app_name: &str,

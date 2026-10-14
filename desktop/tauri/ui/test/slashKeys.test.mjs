@@ -107,28 +107,69 @@ test("the highlight wraps at either end", () => {
   assert.equal(moveHighlight(4, 1, 0), 0, "no rows: the first");
 });
 
-test("CONTROL: the highlight resets on EVERY filter change — the token as well as the rows", () => {
+/** Two catalogs (a menu's JSON) listing the SAME rows in the same order, with
+ *  another action behind `plan` — plan 030 FU7's swap. */
+const CATALOG = JSON.stringify({ rows: [{ name: "plan", action: { kind: "set_mode", change: { kind: "mode", id: "plan" } } }] });
+const SWAPPED = JSON.stringify({ rows: [{ name: "plan", action: { kind: "set_mode", change: { kind: "mode", id: "plan-2" } } }] });
+
+test("CONTROL: the highlight resets on EVERY filter change — the catalog and the token as well as the rows", () => {
   const rows = ["rename", "research"];
-  assert.equal(highlightKey("/r", rows), highlightKey("/r", [...rows]), "the same answer: the highlight stays");
+  assert.equal(highlightKey(CATALOG, "/r", rows), highlightKey(CATALOG, "/r", [...rows]),
+    "the same answer: the highlight stays");
   // `/r` → `/re` lists the very same rows: still a new filter (P9).
-  assert.notEqual(highlightKey("/r", rows), highlightKey("/re", rows), "a new token, the same rows");
-  assert.notEqual(highlightKey("/r", rows), highlightKey("/r", ["research", "rename"]), "reordered rows");
-  assert.notEqual(highlightKey("/r", ["rename"]), highlightKey("/r", rows), "new rows (a new catalog)");
-  // No token can be mistaken for a row (or the other way round).
-  assert.notEqual(highlightKey("/a", ["b"]), highlightKey("/a\nb", []));
+  assert.notEqual(highlightKey(CATALOG, "/r", rows), highlightKey(CATALOG, "/re", rows), "a new token, the same rows");
+  assert.notEqual(highlightKey(CATALOG, "/r", rows), highlightKey(CATALOG, "/r", ["research", "rename"]),
+    "reordered rows");
+  assert.notEqual(highlightKey(CATALOG, "/r", ["rename"]), highlightKey(CATALOG, "/r", rows), "new rows");
+  // A new catalog under the same names in the same order (plan 030 FU7).
+  assert.notEqual(highlightKey(CATALOG, "/r", rows), highlightKey(SWAPPED, "/r", rows),
+    "a new catalog, the same token and rows");
+  // No token can be mistaken for a row, nor a catalog for a token (or the other way round).
+  assert.notEqual(highlightKey(CATALOG, "/a", ["b"]), highlightKey(CATALOG, "/a\nb", []));
+  assert.notEqual(highlightKey("x", "/a", []), highlightKey("", "x/a", []));
 });
 
 test("Enter accepts the highlighted row only when the fresh answer IS the one on screen", () => {
   const rows = ["rename", "research"];
-  const shown = { key: highlightKey("/r", rows), index: 1 }; // ↓ to research
-  assert.equal(rowOnEnter({ token: "/r", names: rows }, shown), "research", "the highlight on screen");
+  const shown = { key: highlightKey(CATALOG, "/r", rows), index: 1 }; // ↓ to research
+  const fresh = { catalog: CATALOG, token: "/r", names: rows, start: 0 };
+  assert.equal(rowOnEnter(fresh, shown), "research", "the highlight on screen");
   // An Enter on `/re` before its answer was on screen: the same rows, a new
   // filter — whose highlight starts on its first row.
-  assert.equal(rowOnEnter({ token: "/re", names: rows }, shown), "rename");
-  assert.equal(rowOnEnter({ token: "/r", names: ["research"] }, shown), "research", "new rows: the first");
-  assert.equal(rowOnEnter({ token: "/zz", names: [] }, shown), undefined, "no rows: nothing to accept");
-  assert.equal(rowOnEnter({ token: "/r", names: rows }, { key: shown.key, index: 9 }), "rename",
-    "an index past the rows: the first");
+  assert.equal(rowOnEnter({ ...fresh, token: "/re" }, shown), "rename");
+  assert.equal(rowOnEnter({ ...fresh, names: ["research"] }, shown), "research", "new rows: where it starts");
+  assert.equal(rowOnEnter({ ...fresh, token: "/zz", names: [] }, shown), undefined, "no rows: nothing to accept");
+  assert.equal(rowOnEnter(fresh, { key: shown.key, index: 9 }), "rename", "an index past the rows: where it starts");
+});
+
+test("a fresh answer that is not the one on screen falls back to its `start`, not its first row (plan 030 FU8)", () => {
+  // Mid-turn: `model` (dimmed) above `rename` — the fresh answer starts on
+  // `rename`, its first live row.
+  const rows = ["model", "rename", "plan"];
+  const working = { catalog: CATALOG, token: "/", names: rows, start: 1 };
+  // A `/` Enter pressed before its answer was on screen (nothing shown yet).
+  assert.equal(rowOnEnter(working, { key: "", index: 0 }), "rename", "no answer on screen: the fresh start");
+  // Another token on screen.
+  assert.equal(rowOnEnter(working, { key: highlightKey(CATALOG, "/r", ["rename"]), index: 0 }), "rename",
+    "another answer on screen: the fresh start");
+  // A CATALOG swap between the answer on screen and the fresh one — the same
+  // token, the same names in the same order: the highlight on screen was an
+  // index into the other catalog, so the fresh answer's start wins (§3.5).
+  const onSwapped = { key: highlightKey(SWAPPED, "/", rows), index: 2 }; // ↓↓ to plan
+  assert.equal(rowOnEnter(working, onSwapped), "rename", "a catalog-only difference: the fresh start");
+  assert.equal(rowOnEnter({ ...working, catalog: SWAPPED }, onSwapped), "plan", "the same catalog: the index shown");
+  // A start past the rows (never answered) still lands on a row.
+  assert.equal(rowOnEnter({ ...working, start: 7 }, { key: "", index: 0 }), "model");
+});
+
+test("CONTROL: a working flip alone moves no highlight — the key reads no `dimmed`, nor `start` (plan 030 §3.4)", () => {
+  // Opened idle, ↓↓ to `plan`; the turn starts: the fresh answer has the
+  // same catalog, token and rows — only its dimming, and so its `start`,
+  // moved. Enter stays on `plan` (and the shared rule refuses it).
+  const rows = ["model", "rename", "plan"];
+  const shown = { key: highlightKey(CATALOG, "/", rows), index: 2 };
+  assert.equal(rowOnEnter({ catalog: CATALOG, token: "/", names: rows, start: 0 }, shown), "plan", "idle");
+  assert.equal(rowOnEnter({ catalog: CATALOG, token: "/", names: rows, start: 1 }, shown), "plan", "working");
 });
 
 test("CONTROL: the draft lifecycle is §3.5's table, row for row", () => {
@@ -246,6 +287,7 @@ function composer() {
     filters: [],
     sends: 0,
     accepts: [],
+    catalogs: [],
     steps() {
       return {
         filter: () => {
@@ -258,8 +300,9 @@ function composer() {
         send: async () => {
           c.sends += 1;
         },
-        accept: async (name) => {
+        accept: async (name, catalog) => {
           c.accepts.push(name);
+          c.catalogs.push(catalog);
         },
       };
     },
@@ -273,7 +316,7 @@ const SHOWN = { key: "", index: 0 };
 const SEQ = { timeout: 5000 };
 /** `/research test` with the caret at its end: past the first token, so the
  *  menu is CLOSED (P28) and Enter sends. */
-const CLOSED = { open: false, token: "/research", names: [] };
+const CLOSED = { open: false, token: "/research", names: [], start: 0, catalog: CATALOG };
 
 test("CONTROL: two rapid Enters on one draft send it ONCE — the guard is taken before the filter (finding 4)", SEQ, async () => {
   const g = { held: false };
@@ -377,16 +420,24 @@ test("Enter or Tab on the fresh filter: a closed menu sends on Enter only; an op
     const k = pressKey({ held: false }, key, shown, c.steps());
     c.filters[0].resolve(filter);
     await k;
-    return { sends: c.sends, accepts: c.accepts };
+    return { sends: c.sends, accepts: c.accepts, catalogs: c.catalogs };
   };
-  assert.deepEqual(await run("enter", null, null), { sends: 1, accepts: [] }, "no menu: Enter sends");
-  assert.deepEqual(await run("tab", null, null), { sends: 0, accepts: [] }, "no menu: Tab does nothing");
-  assert.deepEqual(await run("enter", CLOSED, null), { sends: 1, accepts: [] });
-  const open = { open: true, token: "/re", names: ["/rename", "/research"] };
-  const onScreen = { key: highlightKey("/re", ["/rename", "/research"]), index: 1 };
-  assert.deepEqual(await run("enter", open, null, onScreen), { sends: 0, accepts: ["/research"] },
-    "the highlighted row, when the fresh answer is the one on screen");
-  assert.deepEqual(await run("tab", open, null), { sends: 0, accepts: ["/rename"] }, "else the first row");
-  assert.deepEqual(await run("enter", open, "/re"), { sends: 1, accepts: [] },
+  const none = { accepts: [], catalogs: [] };
+  assert.deepEqual(await run("enter", null, null), { sends: 1, ...none }, "no menu: Enter sends");
+  assert.deepEqual(await run("tab", null, null), { sends: 0, ...none }, "no menu: Tab does nothing");
+  assert.deepEqual(await run("enter", CLOSED, null), { sends: 1, ...none });
+  const names = ["/rename", "/research"];
+  const open = { open: true, token: "/re", names, start: 0, catalog: CATALOG };
+  const onScreen = { key: highlightKey(CATALOG, "/re", names), index: 1 };
+  assert.deepEqual(await run("enter", open, null, onScreen), { sends: 0, accepts: ["/research"], catalogs: [CATALOG] },
+    "the highlighted row, when the fresh answer is the one on screen — against the catalog it answered for");
+  assert.deepEqual(await run("tab", open, null), { sends: 0, accepts: ["/rename"], catalogs: [CATALOG] },
+    "else the row it starts on");
+  assert.deepEqual(await run("tab", { ...open, start: 1 }, null), { sends: 0, accepts: ["/research"], catalogs: [CATALOG] },
+    "…which is its `start`, not its first row");
+  assert.deepEqual(await run("enter", { ...open, catalog: SWAPPED, start: 1 }, null, onScreen),
+    { sends: 0, accepts: ["/research"], catalogs: [SWAPPED] },
+    "a catalog swapped under the screen: the fresh answer's start, accepted against ITS catalog (plan 030 §3.5)");
+  assert.deepEqual(await run("enter", open, "/re"), { sends: 1, ...none },
     "a menu dismissed for this token is not up: Enter sends");
 });

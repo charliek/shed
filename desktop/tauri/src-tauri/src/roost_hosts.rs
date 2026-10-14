@@ -1613,10 +1613,15 @@ impl RoostHosts {
                     "applied".to_string()
                 }
                 Err(e) => {
-                    eprintln!(
-                        "shed-desktop-tauri: {id}: tab {} opened, but its title was not set: {e}",
+                    // The reason goes back to the caller, and to the file only
+                    // under `SHED_TAURI_LOG=debug`: a transport failure's
+                    // sentence can carry ssh's own stderr (#351), which the log
+                    // keeps out by default (#414).
+                    app_warn!(
+                        "shed-desktop-tauri: {id}: tab {} opened, but its title was not set",
                         tab.id
                     );
+                    tracing::debug!(tab = tab.id, error = %e, "{id}: the tab title failed");
                     format!("failed: {e}")
                 }
             }),
@@ -2841,7 +2846,7 @@ impl RoostHosts {
             .collect();
         for (id, stop) in stops {
             if !stop.await.unwrap_or(false) {
-                eprintln!(
+                app_warn!(
                     "shed-desktop-tauri: {id}'s craze source had not stopped {}s after it was \
                      removed (a lane verb still in flight holds it); its last holder releases it",
                     CRAZE_STOP_WAIT.as_secs()
@@ -3018,6 +3023,9 @@ impl RoostHosts {
             // host, and so is overlaid here rather than folded into `Plan`.
             "actionable": plan.actionable() && (!plan.needs_source() || source.available()),
             "client_label": CLIENT_LABEL,
+            // The agents the host session wires hooks into — the consent card names
+            // exactly these (#362), so its copy cannot drift from what is raised.
+            "wired_agents": bootstrap::ROOST_WIRED_AGENTS,
         }))
     }
 
@@ -3467,7 +3475,7 @@ impl RoostHosts {
         let (watchers_left, (probes_aborted, probes_left), (cancelled, one_shots_left)) =
             tokio::join!(watchers_join, probes_join, admitted_join);
         if watchers_left + probes_left + one_shots_left > 0 {
-            eprintln!(
+            app_warn!(
                 "shed-desktop-tauri: shutdown: roost clients still running at the bound — \
                  watchers {watchers_left}, probes {probes_left}, one-shots {one_shots_left}; \
                  each was aborted or cancelled and is abandoned (the gate stays closed)"
@@ -3500,7 +3508,7 @@ impl RoostHosts {
         for (id, stop) in stops {
             if !stop.await.unwrap_or(false) {
                 late += 1;
-                eprintln!(
+                app_warn!(
                     "shed-desktop-tauri: shutdown: {id}'s craze source had not stopped within {}s \
                      (a lane verb still holds its dial); the registry's drain ends its children",
                     CRAZE_STOP_WAIT.as_secs()
@@ -3589,7 +3597,7 @@ impl RoostHosts {
                 async move {
                     if !exec.shutdown().await {
                         unconfirmed.fetch_add(1, Ordering::SeqCst);
-                        eprintln!(
+                        app_warn!(
                             "shed-desktop-tauri: shutdown: {}'s ssh master could not be confirmed \
                              ended after a retried -O exit; abandoned",
                             exec.label()

@@ -152,7 +152,7 @@ _SESSION_IDENTIFY = vector("session.identify.response.v6.json")["result"]
 #: Python assertion about the number moves with it for free.
 SESSION_PROTOCOL = _SESSION_IDENTIFY["session_protocol"]
 
-#: `shed_core::roost::bootstrap::ROOST_WIRED_AGENTS`, hand-carried — roost's
+#: `shed_core::roost::bootstrap::ROOST_WIRED_AGENTS`, read from the golden — roost's
 #: five wireable adapters (`crates/roost-agent/src/lib.rs` `ALL_AGENTS`), which
 #: is what every shed client's `session.set_agent_hooks` raise carries.
 #:
@@ -161,7 +161,9 @@ SESSION_PROTOCOL = _SESSION_IDENTIFY["session_protocol"]
 #: diff worth seeing. Lives here rather than in either test module so the two
 #: Python copies cannot drift apart — the Rust twin is the pin that matters,
 #: and one Python echo of it is enough.
-ROOST_WIRED_AGENTS = ["claude", "codex", "cursor", "grok", "opencode"]
+ROOST_WIRED_AGENTS = json.loads(
+    (VECTORS / "wired-agents.json").read_text(encoding="utf-8")
+)["agents"]
 _IDENTIFY = vector("identify.response.json")["result"]
 _TAB_LIST = vector("tab.list.session.response.json")["result"]
 _TAB_OPEN = vector("tab.open.response.json")["result"]["tab"]

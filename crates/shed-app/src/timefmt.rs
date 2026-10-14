@@ -43,6 +43,12 @@ pub fn format_iso8601(unix: i64) -> String {
         .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// Format an instant as RFC 3339 UTC with millisecond precision
+/// (`2026-10-14T09:30:00.123Z`) — the desktop app's log-line stamp.
+pub fn format_rfc3339_millis(t: std::time::SystemTime) -> String {
+    DateTime::<Utc>::from(t).to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +98,18 @@ mod tests {
         let s = "2026-07-03T12:34:56Z";
         let u = parse_unix(s).unwrap();
         assert_eq!(format_iso8601(u), s);
+    }
+
+    #[test]
+    fn formats_millis() {
+        use std::time::{Duration, UNIX_EPOCH};
+        for (ms, want) in [
+            (7, "1970-01-01T00:00:00.007Z"),
+            (951_782_400_123, "2000-02-29T00:00:00.123Z"),
+            (4_102_444_799_999, "2099-12-31T23:59:59.999Z"),
+        ] {
+            let t = UNIX_EPOCH + Duration::from_millis(ms);
+            assert_eq!(format_rfc3339_millis(t), want, "{ms}");
+        }
     }
 }

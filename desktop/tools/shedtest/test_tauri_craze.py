@@ -123,7 +123,11 @@ HELLO = {"protocols": [1], "client": {"kind": "test", "name": "shedtest"}}
 #: carried a snapshot, and that snapshot's `settings.title`) to
 #: `attaches.log` — each written as it comes DOWN the wire, before it is
 #: relayed, so it is on record by the time the client has read it: what a
-#: client was first told, which no poll of its state can prove (P26).
+#: client was first told, which no poll of its state can prove (P26). While
+#: `swap-plan` exists (plan 030 FU7), every slash catalog coming DOWN has the
+#: mode id behind its `plan` row rewritten (`-swapped` appended): the same
+#: rows in the same order, another action behind one of them — a catalog swap
+#: no fake agent directive can make.
 BRIDGE_PROXY = r"""
 import json, os, subprocess, sys, threading, time
 root = os.path.dirname(os.path.abspath(__file__))
@@ -187,12 +191,44 @@ def hold(gate):
             time.sleep(0.02)
     finally:
         os.close(fd)
+def swapped(line):
+    # While `swap-plan` exists, a slash section coming down names another mode
+    # behind its `plan` row; any other line is relayed byte for byte.
+    if b'"slash"' not in line or not os.path.exists(os.path.join(root, "swap-plan")):
+        return line
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return line
+    hits = []
+    # Only a catalog: a snapshot's `settings.slash` or a meta update's
+    # `state.slash` — never a `slash` that some other payload happens to hold.
+    def walk(v, parent=None):
+        if isinstance(v, list):
+            for x in v:
+                walk(x)
+        if not isinstance(v, dict):
+            return
+        for k, x in v.items():
+            if (k == "slash" and parent in ("settings", "state") and isinstance(x, dict)
+                    and isinstance(x.get("items"), list)):
+                for it in x["items"]:
+                    run = it.get("run") if isinstance(it, dict) else None
+                    setting = run.get("setting") if isinstance(run, dict) else None
+                    if (it.get("name") == "plan" and isinstance(setting, dict)
+                            and isinstance(setting.get("value"), str)):
+                        setting["value"] += "-swapped"
+                        hits.append(it)
+            else:
+                walk(x, k)
+    walk(msg)
+    return (json.dumps(msg) + "\n").encode() if hits else line
 def down():
     for line in child.stdout:
         answered(line)
         if cut.is_set():
             continue
-        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.write(swapped(line))
         sys.stdout.buffer.flush()
     os._exit(0)
 threading.Thread(target=down, daemon=True).start()
@@ -442,7 +478,8 @@ class CrazeEnv:
 
     def switch(self, name: str, on: bool) -> None:
         """Turn one of the wrapper's switches (`outage`, `proxy`,
-        `drop-creates`, `drop-sets`, `refuse-dials`) on or off."""
+        `drop-creates`, `drop-sets`, `refuse-dials`, `swap-plan`) on or
+        off."""
         flag = self.root / name
         if on:
             flag.touch()
@@ -2271,7 +2308,12 @@ def test_while_a_turn_runs_rows_dim_and_a_prompt_row_queues(app, rig, held):
     queues: `/research deep dive` + Enter goes out as one queued
     `session.prompt` of the row's own spelling, the draft clears, and the
     agent does not read it while the turn holds; released, the agent reads
-    the queued text and answers it."""
+    the queued text and answers it.
+
+    **The highlight starts on the first live row** (plan 030 FU8, §3.4): a
+    `/` opened mid-turn highlights `rename` — the first row the turn does
+    not refuse — under a dimmed `model`, and Enter right away COMPLETES
+    `/rename ` (it takes a title): no refusal, nothing sent."""
     host = held["host"]
     _menu_ready(app, host)
     _lane(app, "lane.send", host, text="hold this turn")
@@ -2279,6 +2321,26 @@ def test_while_a_turn_runs_rows_dim_and_a_prompt_row_queues(app, rig, held):
                    what="the held turn running")
     app.wait_until(lambda: _agent_read(held["prompts"], "hold this turn"), timeout=WAIT,
                    what="the agent holding the turn")
+    # The PANEL's own view working (what the menu's first answer for `/` is
+    # filtered with) — the lane's alone could still be ahead of it.
+    app.wait_until(lambda: (_dump(app) or {}).get("activity") == "working", timeout=20,
+                   what="the panel showing the turn")
+    titles, prompts, sets = len(rig.verbs("session.setTitle")), len(rig.verbs("session.prompt")), len(rig.sets())
+    _type(app, "/")
+    m = _wait_menu(app, "/")
+    assert _names(m) == MENU_ROWS, _names(m)
+    assert m["rows"][0]["name"] == "model" and m["rows"][0]["dimmed"] is True, \
+        f"the first row is dimmed (not vacuous): {m['rows']}"
+    assert _highlighted(m) == "rename", f"the highlight starts on the first live row: {m['rows']}"
+    _key(app, "Enter")
+    app.wait_until(lambda: _draft(app) == "/rename ", timeout=20, what="Enter to complete /rename")
+    m = _menu(app)
+    assert m["refusal"] is None and m["warning"] is None, m
+    _settle(0.5)
+    assert (len(rig.verbs("session.setTitle")), len(rig.verbs("session.prompt")), len(rig.sets())) \
+        == (titles, prompts, sets), "completing sends nothing"
+    _type(app, "")
+
     _type(app, "/")
     app.wait_until(lambda: any(r["dimmed"] for r in (_menu(app) or {}).get("rows", [])), timeout=20,
                    what="the waiting rows dimmed")
@@ -2315,6 +2377,123 @@ def test_while_a_turn_runs_rows_dim_and_a_prompt_row_queues(app, rig, held):
                    timeout=WAIT, what="the agent's answer to the queued prompt")
     app.wait_until(lambda: _messages(app, host)["activity"] != "working", timeout=WAIT,
                    what="the session idle again")
+    _type(app, "")
+
+
+def _plan_mode(app: TauriClient, host: str) -> str | None:
+    """The mode id behind the resolved menu's `plan` row (`lane.messages`)."""
+    for r in (_messages(app, host).get("slash_menu") or {}).get("rows", []):
+        if r["name"] == "plan":
+            return ((r.get("action") or {}).get("change") or {}).get("id")
+    return None
+
+
+def _idle(app: TauriClient, host: str) -> None:
+    """The session idle — on the lane, and in the panel's own view."""
+    app.wait_until(lambda: _messages(app, host)["activity"] == "idle", timeout=WAIT,
+                   what="the session idle")
+    app.wait_until(lambda: (_dump(app) or {}).get("activity") == "idle", timeout=20,
+                   what="the panel showing it idle")
+
+
+def test_a_working_flip_keeps_an_arrowed_to_row(app, rig, held):
+    """**A working flip alone moves no highlight** (plan 030 §3.4): `/`
+    opened idle and ↓↓ to `plan` (a row that waits for the turn); a turn
+    starts under the open menu (`lane.send` never touches the composer) and
+    `plan` dims — the highlight STAYS on it: Enter is refused "runs after
+    this turn", nothing sent, and Tab still completes `/plan ` for after
+    the turn (X7)."""
+    host = held["host"]
+    _menu_ready(app, host)
+    _idle(app, host)
+    _type(app, "/")
+    m = _wait_menu(app, "/")
+    assert _names(m) == MENU_ROWS and not any(r["dimmed"] for r in m["rows"]), m["rows"]
+    assert _highlighted(m) == "model", m["rows"]
+    _key(app, "ArrowDown")
+    _key(app, "ArrowDown")
+    app.wait_until(lambda: _highlighted(_menu(app)) == "plan", timeout=20, what="↓↓ to plan")
+
+    sets, prompts = len(rig.sets()), len(rig.verbs("session.prompt"))
+    _lane(app, "lane.send", host, text="hold the flip")
+    app.wait_until(lambda: _agent_read(held["prompts"], "hold the flip"), timeout=WAIT,
+                   what="the agent holding the turn")
+    app.wait_until(lambda: {r["name"] for r in (_menu(app) or {}).get("rows", []) if r["dimmed"]} == WAITING_ROWS,
+                   timeout=20, what="the waiting rows dimmed under the open menu")
+    m = _menu(app)
+    assert _highlighted(m) == "plan", f"the working flip moved the highlight: {m['rows']}"
+    _key(app, "Enter")
+    app.wait_until(lambda: (_menu(app) or {}).get("refusal") == "/plan: runs after this turn",
+                   timeout=20, what="Enter on the dimmed row refused")
+    assert _draft(app) == "/", "the draft kept"
+    _key(app, "Tab")
+    app.wait_until(lambda: _draft(app) == "/plan ", timeout=20, what="Tab to complete /plan")
+    _settle(0.5)
+    assert len(rig.sets()) == sets, f"no mode was sent: {rig.sets()[sets:]}"
+    assert [v["params"]["text"] for v in rig.verbs("session.prompt")[prompts:]] == ["hold the flip"], \
+        "nothing but the held turn's own prompt"
+
+    held["gate"].release()
+    _idle(app, host)
+    _type(app, "")
+
+
+def test_a_catalog_swap_under_the_same_names_resets_the_highlight(app, rig, held):
+    """**A new catalog resets the highlight, even under the same names**
+    (plan 029 P9; plan 030 FU7, §3.5): with `/` open and the highlight
+    arrowed off the first row to `plan`, the session's catalog is replaced by
+    one with the SAME rows in the same order and another action behind
+    `plan` (another mode id) — and the highlight goes back to where a new
+    filter starts, its `start`. The swap: the agent re-advertises
+    `research,help` — `help` is craze's own builtin, so the catalog comes out
+    the same, and craze restates it anyway because the commands moved — and
+    the proxy's `swap-plan` rewrites `plan`'s mode id in that section as it
+    comes down. That prompt is a held turn, so the new catalog is filtered
+    WORKING: its `start` is `rename`, the first row the turn does not refuse.
+
+    Red-first on the base (71914ad, `start` not yet there, so "the first
+    row"): GREEN — FU7 does not reproduce on the screen. The panel replaces
+    its menu only on a value change, and a filter answered for the replaced
+    menu is no longer shown (by identity), so the render between them
+    re-keys the highlight. Kept as the regression pin; the highlight's key
+    now names the catalog outright."""
+    host = held["host"]
+    _menu_ready(app, host)
+    _idle(app, host)
+    before = _plan_mode(app, host)
+    assert before, "the plan row sets a mode"
+    swapped = f"{before}-swapped"
+    _type(app, "/")
+    m = _wait_menu(app, "/")
+    assert _names(m) == MENU_ROWS and not any(r["dimmed"] for r in m["rows"]), m["rows"]
+    _key(app, "ArrowDown")
+    _key(app, "ArrowDown")
+    app.wait_until(lambda: _highlighted(_menu(app)) == "plan", timeout=20, what="↓↓ to plan")
+
+    rig.switch("swap-plan", True)
+    try:
+        _lane(app, "lane.send", host, text="SET-COMMANDS research,help")
+        app.wait_until(lambda: _plan_mode(app, host) == swapped, timeout=WAIT,
+                       what="the swapped catalog on the lane")
+    finally:
+        rig.switch("swap-plan", False)
+    assert _catalog(app, host) == MENU_ROWS, "the same rows, in the same order"
+    app.wait_until(lambda: _highlighted(_menu(app)) == "rename", timeout=20,
+                   what="the highlight back where the new filter starts (its first live row)")
+    m = _menu(app)
+    assert _names(m) == MENU_ROWS and m["open"] is True and _draft(app) == "/", m
+    assert m["rows"][0]["dimmed"] is True, f"filtered working: `model` dimmed above `rename`: {m['rows']}"
+
+    # The turn ends; the agent's catalog goes back to `research` alone (the
+    # commands moved again, so craze restates the section, unswapped).
+    app.wait_until(lambda: _agent_read(held["prompts"], "SET-COMMANDS research,help"), timeout=WAIT,
+                   what="the agent holding the swap's turn")
+    held["gate"].release()
+    _idle(app, host)
+    _lane(app, "lane.send", host, text="SET-COMMANDS research")
+    app.wait_until(lambda: _plan_mode(app, host) == before, timeout=WAIT, what="the catalog restored")
+    held["gate"].release()
+    _idle(app, host)
     _type(app, "")
 
 

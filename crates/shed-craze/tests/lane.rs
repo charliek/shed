@@ -1245,6 +1245,77 @@ async fn capabilities_and_settings_follow_ready_and_meta() {
     );
 }
 
+/// **Settings come back with their capability.** A session whose final info
+/// document empties its catalogs loses the `settings` capability (the client
+/// drops its settings with it); when a later document restores the same
+/// catalogs the capability returns and the SAME settings are said again,
+/// right after it — not swallowed by the dedupe.
+#[tokio::test]
+async fn settings_are_said_again_when_the_capability_comes_back() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    // A snapshot with no settings section: only the catalogs make the
+    // capability, so an emptied catalog takes it away.
+    let mut hub = next_conn(&mut conns).await;
+    hub.splice(HOST).await;
+    hub.listed(row()).await;
+    hub.attached(attach_result(
+        SUB,
+        &info(false),
+        (INC, 1),
+        Some(json!({"version": 1, "incarnation": INC, "seq": 1, "main": {}})),
+        None,
+    ))
+    .await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    let said = seed
+        .iter()
+        .find_map(|e| match e {
+            LaneEvent::Settings { settings } => Some(settings.clone()),
+            _ => None,
+        })
+        .expect("the seed carries the settings");
+    assert!(seed
+        .iter()
+        .any(|e| matches!(e, LaneEvent::Capabilities { capabilities } if capabilities.settings)));
+
+    let mut bare = info(false);
+    bare["catalogs"] = json!({"models": [], "modes": []});
+    hub.notify(
+        "ready",
+        json!({"subscription": SUB, "session": bare, "startFailed": false}),
+    )
+    .await;
+    let f = drive(
+        &mut rx,
+        &mut checker,
+        "the capability goes",
+        |e| matches!(e, LaneEvent::Capabilities { capabilities } if !capabilities.settings),
+    )
+    .await;
+    assert!(!f.iter().any(|e| matches!(e, LaneEvent::Settings { .. })));
+
+    hub.notify(
+        "ready",
+        json!({"subscription": SUB, "session": info(false), "startFailed": false}),
+    )
+    .await;
+    let f = drive(&mut rx, &mut checker, "the settings return", |e| {
+        matches!(e, LaneEvent::Settings { .. })
+    })
+    .await;
+    let caps_at = f
+        .iter()
+        .position(
+            |e| matches!(e, LaneEvent::Capabilities { capabilities } if capabilities.settings),
+        )
+        .expect("the capability came back first");
+    assert_eq!(caps_at + 1, f.len() - 1, "Settings right after it: {f:#?}");
+    assert!(matches!(f.last(), Some(LaneEvent::Settings { settings }) if *settings == said));
+}
+
 // ---- the review's edges (C7+C8 review: the dial deadline, synchronized, the
 // spliced host's identity, the seeded reads' owner) ----
 

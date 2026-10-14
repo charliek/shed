@@ -32,8 +32,30 @@ All notable changes to this project will be documented in this file.
 > Read the [v0.9.0 to v0.9.1 upgrade guide](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.9.1/)
 > before upgrading.
 
+### Added
+
+- **Desktop: a log file.** The desktop app now writes its own lines, its embedded credential
+  broker's and its `shed_*` diagnostics to `~/Library/Logs/ShedDesktop/shed-desktop.log`
+  (macOS) or `~/.local/state/ai.stridelabs.shed-desktop/shed-desktop.log` (Linux,
+  `$XDG_STATE_HOME` honoured), rotated at 5 MiB with three kept. `SHED_TAURI_LOG_FILE` moves
+  it, `SHED_TAURI_LOG=debug` adds debug detail, and `identify` reports the path. The
+  broker's connect, drop and rejection lines now name their server, in `shed-host-agent`'s
+  log too. (#414)
+
 ### Fixed
 
+- **Desktop: while the agent is working, the `/` menu opens on the first command you can run
+  now**, not on one that has to wait for the turn, so Enter right after `/` no longer refuses.
+  The phone gets the same rule from the shared core in its next release.
+- **Desktop: opening, closing or reading a tab on a machine no longer tears down that machine's
+  shared SSH connection when roost refuses the request** (for example, a tab that was already
+  closed), and when the connection itself failed because no roost session is running there,
+  the error now says so and how to start one, instead of "the roost connection closed before
+  the reply". (#407, #351)
+- **Desktop: the roost-session consent card names the agents roost wires hooks into from the
+  same list the app sends**, in the right order. (#362)
+- **Desktop (craze): a session's model and mode settings come back when its settings support
+  drops out and returns**, instead of the settings sheet staying empty until a reconnect.
 - **macOS (VZ): VZ sheds no longer stop on `brew services restart shed`.** vfkit now runs in
   its own process group, so launchd no longer kills it with the server. The restart that
   applies 0.9.1 still stops running sheds once. The brew service now waits up to 35 s for a

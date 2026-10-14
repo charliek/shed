@@ -93,27 +93,38 @@ export function moveHighlight(index: number, delta: 1 | -1, count: number): numb
 }
 
 /** The identity of a filter answer — what the highlight is reset by: it goes
- *  back to the first row on EVERY filter change (P9), so the key is the
- *  token as well as the rows — `/r` → `/re` listing the same rows is a new
- *  filter, and its first row is highlighted — and a new catalog (new rows)
- *  likewise. An activity change (the same token and rows, other rows dimmed)
- *  is neither, and keeps the highlight. */
-export function highlightKey(token: string, names: string[]): string {
-  return JSON.stringify([token, ...names]);
+ *  back to where a new filter starts (the answer's `start`) on EVERY filter
+ *  change (P9), so the key is the catalog the answer was filtered from (the
+ *  menu's JSON), the token and the rows — `/r` → `/re` listing the same rows
+ *  is a new filter, a new catalog is one even when it lists the same names
+ *  in the same order (another action behind a row, plan 030 FU7), and new
+ *  rows likewise. An activity change (the same catalog, token and rows,
+ *  other rows dimmed) is none of these, and keeps the highlight where it is
+ *  — on a row that became dimmed too (plan 030 §3.4). */
+export function highlightKey(catalog: string, token: string, names: string[]): string {
+  return JSON.stringify([catalog, token, ...names]);
 }
+
+/** A filter answer as an Enter or Tab reads it: whether the menu is open,
+ *  its token, its rows' names, the row its highlight starts on (`start`),
+ *  and the catalog it was filtered from (the menu's JSON). */
+export type KeyFilter = { open: boolean; token: string; names: string[]; start: number; catalog: string };
 
 /** The row an Enter or Tab accepts, from the filter answer for the draft it
  *  was pressed on (`fresh`): the row highlighted on screen when that answer
- *  IS the one on screen (`shown`: its [`highlightKey`] and the highlight's
- *  index), else the fresh answer's first row — the highlight a new filter
- *  starts on (P9). `undefined` with no rows. */
+ *  IS the one on screen (`shown`: its [`highlightKey`] — catalog, token and
+ *  rows — and the highlight's index), else the row the fresh answer's
+ *  highlight starts on (its `start`: the first row a turn does not refuse) —
+ *  where a new filter's highlight starts (P9). An answer for another catalog
+ *  than the one on screen is never the one on screen, however alike their
+ *  names (plan 030 §3.5). `undefined` with no rows. */
 export function rowOnEnter(
-  fresh: { token: string; names: string[] },
+  fresh: Pick<KeyFilter, "catalog" | "token" | "names" | "start">,
   shown: { key: string; index: number },
 ): string | undefined {
   if (fresh.names.length === 0) return undefined;
-  const same = highlightKey(fresh.token, fresh.names) === shown.key;
-  return (same ? fresh.names[shown.index] : undefined) ?? fresh.names[0];
+  const same = highlightKey(fresh.catalog, fresh.token, fresh.names) === shown.key;
+  return (same ? fresh.names[shown.index] : undefined) ?? fresh.names[fresh.start] ?? fresh.names[0];
 }
 
 // ---- who owns the draft ----------------------------------------------------
@@ -166,31 +177,32 @@ export async function oneAtATime(guard: Guard, op: () => Promise<void>): Promise
   }
 }
 
-/** A filter answer as an Enter or Tab reads it. */
-export type KeyFilter = { open: boolean; token: string; names: string[] };
-
 /** The round-trips an Enter or Tab makes, for the draft it claimed:
  *
  *  - `filter` — that draft's filter (the one on screen when it answered
- *    these very inputs, else a fresh one); `null` with no menu;
+ *    these very inputs, else a fresh one), with the catalog it answered for;
+ *    `null` with no menu;
  *  - `owned` — whether the claim still owns the draft ([`owns`]), read after
  *    the filter answered;
  *  - `dismissed` — the Esc dismissal as it is once the filter answered;
  *  - `send` — the draft sent (the shared dispatch, or text);
- *  - `accept` — the row accepted with this key. */
+ *  - `accept` — the row accepted with this key, against the catalog the
+ *    filter answered for (`catalog`): when that is no longer the session's
+ *    menu, nothing runs — the menu moved under the key, and its own
+ *    re-filter shows where (plan 030 §3.5). */
 export type KeySteps = {
   filter: () => Promise<KeyFilter | null>;
   owned: () => boolean;
   dismissed: () => string | null;
   send: () => Promise<void>;
-  accept: (name: string) => Promise<void>;
+  accept: (name: string, catalog: string) => Promise<void>;
 };
 
 /** **An Enter or Tab, start to finish** (P9, E15), inside the guard
  *  ([`oneAtATime`]) for the WHOLE operation: the claimed draft's filter; a
  *  key whose draft moved on meanwhile is dropped; with no menu up an Enter
  *  sends and a Tab does nothing; with the menu up the row [`rowOnEnter`]
- *  names is accepted. */
+ *  names is accepted, against the catalog that filter answered for. */
 export function pressKey(guard: Guard, key: "enter" | "tab", shown: { key: string; index: number }, s: KeySteps): Promise<void> {
   return oneAtATime(guard, async () => {
     const f = await s.filter();
@@ -200,7 +212,7 @@ export function pressKey(guard: Guard, key: "enter" | "tab", shown: { key: strin
       return;
     }
     const name = rowOnEnter(f, shown);
-    if (name) await s.accept(name);
+    if (name) await s.accept(name, f.catalog);
   });
 }
 

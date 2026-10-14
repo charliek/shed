@@ -294,9 +294,22 @@ async fn a_lag_resets_the_reattach_bound() {
 /// Two lags running: each abandoned generation has no `Ready`, the last
 /// `Ready` a staging client shows is still generation 1's until the third
 /// completes — and the BACKOFF climbs between them (paused clock).
+///
+/// Jitter is off (`LaneTimings::jitter`), so the schedule is deterministic:
+/// the lag path doubles the backoff before it sleeps, so the first lag sleeps
+/// 2 x 200 ms = 400 ms and the second 800 ms. On a paused clock extra virtual
+/// time (a few ms of leak, the seed handshake) only ADDS to a gap, so each gap
+/// is asserted as a band from its exact step up to the next step's floor:
+/// `gap1` in [400, 600) and `gap2` in [800, 1200). An un-climbed backoff would
+/// leave `gap2` near 400 ms and fail. With jitter on, `[d/2, d]` is inclusive
+/// and the old `gap1 <= 400ms` ceiling flaked at 404/405 ms (#408), and its
+/// `gap2 >= 400ms` floor could not tell a climbed backoff from an un-climbed one.
 #[tokio::test(start_paused = true)]
 async fn consecutive_lags_keep_the_bracket_and_climb_the_backoff() {
-    let (_dial, mut conns, lane) = scripted(shed_craze::LaneTimings::default());
+    let (_dial, mut conns, lane) = scripted(shed_craze::LaneTimings {
+        jitter: false,
+        ..shed_craze::LaneTimings::default()
+    });
     let (mut rx, _stop) = subscribed(&lane).await;
     let (mut hub, _) = seed_conn(&mut conns, SUB, 1, json!({})).await;
     hub.synchronized(SUB, 1).await;
@@ -334,12 +347,12 @@ async fn consecutive_lags_keep_the_bracket_and_climb_the_backoff() {
     let f = drive(&mut rx, &mut checker, "the third generation", is_ready).await;
     assert_eq!(resets(&f), [("lagged".to_string(), 3)]);
     assert!(
-        gap1 <= Duration::from_millis(400),
-        "the first lag's backoff: {gap1:?}"
+        gap1 >= Duration::from_millis(400) && gap1 < Duration::from_millis(600),
+        "the first lag sleeps one doubled base (400 ms): {gap1:?}"
     );
     assert!(
-        gap2 >= Duration::from_millis(400),
-        "the second climbed: {gap2:?}"
+        gap2 >= Duration::from_millis(800) && gap2 < Duration::from_millis(1200),
+        "the second climbed to 800 ms: {gap2:?}"
     );
 }
 

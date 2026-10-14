@@ -353,10 +353,11 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 craze_runtime_dir: object | None = None) -> dict[str, str]:
     """The launch env for a subprocess UI — the single source of the subprocess
     env-var contract, shared by the session launcher and a self-managed instance
-    (down-host). HOME/XDG_RUNTIME_DIR/XDG_CONFIG_HOME are redirected to the
-    throwaway `runtime_dir` (never the dev's ~/.shed, real runtime socket, or real
-    prefs), config is pinned to the fixture, test mode + mock are set, and
-    `<PREFIX>_SOCKET` is cleared so the XDG default (under runtime_dir) is used.
+    (down-host). HOME/XDG_RUNTIME_DIR/XDG_CONFIG_HOME/XDG_STATE_HOME are
+    redirected to the throwaway `runtime_dir` (never the dev's ~/.shed, real
+    runtime socket, real prefs, or real log file — see `app_log_path`), config is
+    pinned to the fixture, test mode + mock are set, and `<PREFIX>_SOCKET` and
+    `<PREFIX>_LOG_FILE` are cleared so the defaults (under runtime_dir) are used.
 
     `craze_path` is the craze seam (`<PREFIX>_CRAZE_PATH`, plan 025 §3.6.1,
     test-mode and debug-build only): the directory this machine's craze source
@@ -372,6 +373,9 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     env["HOME"] = str(runtime_dir)
     env["XDG_RUNTIME_DIR"] = str(runtime_dir)
     env["XDG_CONFIG_HOME"] = str(runtime_dir / "config")
+    # The app's log file (#414) lands under here on Linux (macOS: under HOME's
+    # ~/Library/Logs) — never in the developer's own ~/.local/state.
+    env["XDG_STATE_HOME"] = str(runtime_dir / "state")
     env[f"{cfg.env_prefix}_TEST_MODE"] = "1"
     env[f"{cfg.env_prefix}_MOCK_BASE_URL"] = mock_base_url
     env[f"{cfg.env_prefix}_SHED_CONFIG"] = str(config_path)
@@ -398,6 +402,10 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     #    the developer's own /usr/bin/roost-session.
     #  * SOCKET — cleared unconditionally so the XDG default (under
     #    runtime_dir) is used.
+    #  * LOG_FILE — cleared unconditionally, like SOCKET (#414): an inherited
+    #    one would send a hermetic run's log into the developer's file (or
+    #    theirs into this run's), and `app_log_path` would no longer say where
+    #    it is.
     #
     # NOTE: there is no roost poll knob to set. Since plan 014 the watcher
     # observes roost's push feed (`events.subscribe`) instead of polling
@@ -414,6 +422,7 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
         "ROOST_JAIL": "1" if roost_jail else None,
         "CRAZE_PATH": str(craze_path) if craze_path else None,
         "SOCKET": None,
+        "LOG_FILE": None,
     }
     for suffix, value in managed.items():
         key = f"{cfg.env_prefix}_{suffix}"
@@ -437,6 +446,15 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
         else:
             env.pop(key, None)
     return env
+
+
+def app_log_path(runtime_dir: Path) -> Path:
+    """Where a subprocess UI launched with `subproc_env(runtime_dir=...)` writes
+    its log file (#414) — the app's own platform default under the redirected
+    HOME / XDG_STATE_HOME, since `<PREFIX>_LOG_FILE` is cleared."""
+    if platform.system() == "Darwin":
+        return runtime_dir / "Library" / "Logs" / "ShedDesktop" / "shed-desktop.log"
+    return runtime_dir / "state" / "ai.stridelabs.shed-desktop" / "shed-desktop.log"
 
 
 def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
