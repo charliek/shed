@@ -110,7 +110,8 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   or the capabilities change. `slash_menu.rs` (plan 029 §3.4, ungated, pure) is the `/`
   menu's one rule set — `resolve` (which rows show, each with its `SlashAction`, and the
   hidden builtin names a typed command is refused for), `filter` (the open rule, craze's
-  four match buckets, UTF-16 carets, `dimmed` while working), `dispatch` (the
+  four match buckets, UTF-16 carets, `dimmed` while working, and `start` — the first
+  row not dimmed, where a client's highlight resets to, plan 030), `dispatch` (the
   single-line grammar and its guard), `accept` (Enter/Tab/pick) and `is_working` — which
   the desktop calls through Tauri commands and the phone through FRB, so neither client
   re-derives a rule.

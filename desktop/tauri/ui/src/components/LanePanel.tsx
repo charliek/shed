@@ -279,8 +279,14 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
   // ---- the composer's `/` menu (plan 029 §3.5) ---------------------------
   /** The session's resolved menu, as the view last carried it — replaced
    *  only when it CHANGES (compared by value), so a streaming turn's reads do
-   *  not re-filter on every frame. `null`: no menu. */
-  const [menu, setMenu] = useState<SlashMenu | null>(null);
+   *  not re-filter on every frame — and the JSON it was compared by, kept
+   *  WITH it: the catalog's identity, which a key compares across a swap
+   *  (`highlightKey`, plan 030 §3.5). Read from this state, never from
+   *  `menuJson` (which a read moves before the render that shows its menu),
+   *  so a render's catalog is always its menu's. `null`: no menu. */
+  const [shownMenu, setShownMenu] = useState<{ menu: SlashMenu; json: string } | null>(null);
+  const menu = shownMenu?.menu ?? null;
+  const catalog = shownMenu?.json ?? "null";
   const menuJson = useRef("null");
   /** The caret, in UTF-16 code units (`selectionStart`) — what the shared
    *  filter's open rule reads (P28). */
@@ -290,7 +296,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
   const caretNow = useRef(0);
   const [filtered, setFiltered] = useState<Filtered | null>(null);
   /** The highlighted row's index, and the filter answer it is an index into
-   *  (`highlightKey`: its token and rows). */
+   *  (`highlightKey`: its catalog, token and rows). */
   const [hl, setHl] = useState({ key: "", index: 0 });
   /** The token the menu was dismissed for with Esc, until the token changes. */
   const [dismissed, setDismissed] = useState<string | null>(null);
@@ -337,7 +343,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
           const json = JSON.stringify(v.slash_menu ?? null);
           if (json !== menuJson.current) {
             menuJson.current = json;
-            setMenu(v.slash_menu ?? null);
+            setShownMenu(v.slash_menu ? { menu: v.slash_menu, json } : null);
           }
           setView(v);
           setApprovals(a);
@@ -533,17 +539,20 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
   // while a replaced catalog awaits its filter (`null`: no news).
   const answered = filter ? filter.token : null;
   useEffect(() => setDismissed((d) => dismissalAfter(d, answered)), [answered]);
-  // The highlight goes back to the first row on every filter change — a new
-  // token or new rows, a new catalog included (P9) — adjusted WHILE
-  // rendering, so no render (and no report) shows the new filter under the
-  // old highlight.
-  const hlKey = useMemo(() => highlightKey(token, menuRows.map((r) => r.row.name)), [filter]);
-  if (hl.key !== hlKey) setHl({ key: hlKey, index: 0 });
-  const highlight = hl.key === hlKey ? hl.index : 0;
+  // The highlight goes back to where the answer says a highlight starts —
+  // its first row a turn does not refuse (`start`, plan 030 §3.4) — on every
+  // filter change: a new token, new rows, a new catalog even under the same
+  // names (P9). Adjusted WHILE rendering, so no render (and no report) shows
+  // the new filter under the old highlight. A working flip alone changes
+  // none of the key, and moves nothing.
+  const hlKey = useMemo(() => highlightKey(catalog, token, menuRows.map((r) => r.row.name)), [filter, catalog]);
+  const start = filter?.start ?? 0;
+  if (hl.key !== hlKey) setHl({ key: hlKey, index: start });
+  const highlight = hl.key === hlKey ? hl.index : start;
   /** What the latest render knows, for the async continuations and the doors
    *  (a door's listener is registered once). */
-  const rendered = { prompt, caret, menu, activity, filtered, filter, highlight, dismissed, interjecting, busy,
-                     confirming: confirmStop };
+  const rendered = { prompt, caret, menu, catalog, activity, filtered, filter, highlight, dismissed, interjecting,
+                     busy, confirming: confirmStop };
   const live = useRef(rendered);
   live.current = rendered;
   // A programmatic draft (a completion, the type door) puts the caret where
@@ -575,16 +584,18 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
   /** The filter for the draft a key was pressed on: the last answer when it
    *  answered these very inputs, else a fresh one — so a key pressed before
    *  the last keystroke's answer arrived decides by the draft it was pressed
-   *  on. */
-  const freshFilter = async (at: Claim): Promise<SlashFilter | null> => {
+   *  on — with the catalog it answered for (the menu's JSON): the catalog
+   *  can be swapped while a fresh answer is out, and the key then accepts
+   *  against the one its answer is for, or nothing (plan 030 §3.5). */
+  const freshFilter = async (at: Claim): Promise<{ f: SlashFilter; catalog: string } | null> => {
     const now = live.current;
     if (!now.menu) return null;
     const f = now.filtered;
     if (f && f.menu === now.menu && f.draft === at.draft && f.caret === at.caret && f.activity === now.activity) {
-      return f.f;
+      return { f: f.f, catalog: now.catalog };
     }
     try {
-      return await laneSlashFilter(now.menu, at.draft, at.caret, now.activity);
+      return { f: await laneSlashFilter(now.menu, at.draft, at.caret, now.activity), catalog: now.catalog };
     } catch {
       return null;
     }
@@ -693,11 +704,16 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
 
   /** Accept the row `name` with `key` on the draft `at` claimed — the shared
    *  rule decides whether that completes the draft, runs the row, or refuses
-   *  it. An answer for a draft that has since moved on is dropped: no
+   *  it — against the catalog the row was chosen from (`catalog`, the menu's
+   *  JSON). A catalog swapped since — before the answer is asked for or while
+   *  it is out — is a menu that moved under the key: nothing completes or
+   *  runs, and its own re-filter shows where the rows are now — so a
+   *  key never runs one catalog's row from a highlight on another's (plan
+   *  030 §3.5). An answer for a draft that has since moved on is dropped: no
    *  completion overwrites the newer text, and nothing runs. */
-  const acceptAt = async (name: string, key: SlashAcceptKey, at: Claim) => {
+  const acceptAt = async (name: string, key: SlashAcceptKey, at: Claim, catalog: string) => {
     const now = live.current;
-    if (!now.menu || now.busy) return;
+    if (!now.menu || now.busy || now.catalog !== catalog) return;
     let a;
     try {
       a = await laneSlashAccept(now.menu, at.draft, name, key, now.activity);
@@ -706,7 +722,10 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
       return;
     }
     // No answer: the menu moved under the highlight (the re-filter shows it).
-    if (!a || !ownsDraft(at.rev)) return;
+    // A catalog swapped while the answer was out is the same news: the
+    // answer is for a row that is no longer there, so it neither completes
+    // nor runs.
+    if (!a || !ownsDraft(at.rev) || live.current.catalog !== catalog) return;
     if (a.kind === "complete") {
       putDraft(a.draft, a.caret);
       return;
@@ -722,21 +741,29 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
 
   /** Enter or Tab — decided by the draft it was pressed on (`at`) and THAT
    *  draft's filter (`slashKeys.ts`' `pressKey`): the row highlighted on
-   *  screen when the fresh answer is the one on screen (`shown`), else its
-   *  first; a plain Send when the fresh menu turned out closed. The guard is
-   *  taken at the press, BEFORE the filter is asked for: a second key while
-   *  this one's round-trips are out is dropped, never queued behind it. A
-   *  key whose draft moved on while its filter was out is dropped too. */
+   *  screen when the fresh answer is the one on screen (`shown`: the same
+   *  catalog, token and rows), else the row its highlight starts on (its
+   *  `start`); a plain Send when the fresh menu turned out closed. The row is
+   *  accepted against the catalog that answer is for. The guard is taken at
+   *  the press, BEFORE the filter is asked for: a second key while this one's
+   *  round-trips are out is dropped, never queued behind it. A key whose
+   *  draft moved on while its filter was out is dropped too. */
   const keyedAccept = (key: "enter" | "tab", at: Claim, shown: { key: string; index: number }) =>
     pressKey(keyGuard.current, key, shown, {
       filter: async () => {
-        const f = await freshFilter(at);
-        return f && { open: f.open, token: f.token, names: f.rows.map((r) => r.row.name) };
+        const a = await freshFilter(at);
+        return a && {
+          open: a.f.open,
+          token: a.f.token,
+          names: a.f.rows.map((r) => r.row.name),
+          start: a.f.start,
+          catalog: a.catalog,
+        };
       },
       owned: () => ownsDraft(at.rev),
       dismissed: () => live.current.dismissed,
       send: () => submitAt(at),
-      accept: (name) => acceptAt(name, key, at),
+      accept: (name, catalog) => acceptAt(name, key, at, catalog),
     });
 
   /** The composer's keys (`slashKeys.ts`'s table, P9). */
@@ -771,9 +798,9 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  menu on screen lists takes it, on the draft as it is when picked. */
   const pickRow = (name: string) => {
     const at = claim();
-    const { filter: f, dismissed: d } = live.current;
+    const { filter: f, dismissed: d, catalog: c } = live.current;
     if (!menuUp(f, d) || !f?.rows.some((r) => r.row.name === name)) return;
-    void oneAtATime(keyGuard.current, () => acceptAt(name, "pick", at));
+    void oneAtATime(keyGuard.current, () => acceptAt(name, "pick", at, c));
   };
 
   // The composer's driver doors (`ui.type_lane_composer`,

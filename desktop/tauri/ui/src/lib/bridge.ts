@@ -1659,8 +1659,10 @@ export type SlashFilterRow = { row: SlashMenuRow; dimmed: boolean };
 
 /** What the menu panel shows for a draft and caret (`SlashFilter`). `open`
  *  is exactly "at least one row"; `token` is the draft's first token, what an
- *  Esc dismissal is keyed by. */
-export type SlashFilter = { open: boolean; token: string; rows: SlashFilterRow[] };
+ *  Esc dismissal is keyed by; `start` is the row the highlight starts on —
+ *  the first row that is not dimmed, else 0 (0 when closed) — wherever the
+ *  panel resets it (plan 030 §3.4). */
+export type SlashFilter = { open: boolean; token: string; rows: SlashFilterRow[]; start: number };
 
 /** What sending a draft does (`SlashDispatch`). */
 export type SlashDispatch =
