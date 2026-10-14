@@ -14,7 +14,9 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 #[cfg(target_os = "macos")]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager};
+#[cfg(target_os = "macos")]
+use tauri::Manager;
+use tauri::{AppHandle, Emitter};
 
 /// The tray icon id (so later milestones can fetch + update it — e.g. the count badge).
 pub const TRAY_ID: &str = "shed-tray";
@@ -132,8 +134,6 @@ pub fn update_running_count(app: &AppHandle, running: usize) {
         let _ = tray.set_title(Some(title));
     }
 }
-#[cfg(not(target_os = "macos"))]
-pub fn update_running_count(_app: &AppHandle, _running: usize) {}
 
 /// Show + focus the main dashboard window via the single `present_main_window` path
 /// (which also flips macOS back to `Regular` in production — a visible dashboard

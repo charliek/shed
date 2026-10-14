@@ -209,6 +209,8 @@ tauri-build-linux: tauri-ui-build  ## Render gate: Tauri e2e on ubuntu:24.04 + W
 # AuthGate + libnotify Notifier are compiled): asserts the gate is fail-closed
 # (never Approved without a real polkit auth; biometrics-only → Unavailable). Uses
 # the same image as the render gate; no display needed. Joins the tauri CI leg.
+# It lints that cfg first (`cargo clippy -D warnings`) — `tauri-lint` only runs on
+# the Mac leg, so nothing else would catch a Linux-only lint.
 tauri-test-linux: tauri-ui-build  ## Tauri crate cargo test on ubuntu:24.04 (Linux-only approval-seam tests)
 	# tauri-ui-build first: `cargo test` compiles the crate, whose generate_context!
 	# fails closed without the frontendDist bundle (tarred into the container below).
@@ -225,7 +227,8 @@ tauri-test-linux: tauri-ui-build  ## Tauri crate cargo test on ubuntu:24.04 (Lin
 	  bash -lc 'set -e; mkdir -p /work; \
 	    tar -C /repo $(TAR_EXCLUDES) \
 	      -cf - crates desktop/tauri desktop/tools desktop/Resources desktop/pyproject.toml desktop/uv.lock | tar -C /work -xf -; \
-	    cd /work/desktop/tauri/src-tauri && cargo test --locked'
+	    cd /work/desktop/tauri/src-tauri && \
+	    cargo clippy --locked --all-targets -- -D warnings && cargo test --locked'
 
 core-linux:  ## Build+test shed-core on Linux in Docker (ubuntu:24.04; ring needs build-essential)
 	docker build -t shed-core-linux:latest - < Dockerfile.linux

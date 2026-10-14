@@ -222,6 +222,20 @@ pub struct LaneTimings {
     pub reattaches: u32,
     /// [`CONNECT_REFUSALS`].
     pub connect_refusals: u32,
+    /// Spread each backoff over `[d/2, d]` ([`shed_core::lane::backoff::jittered`]);
+    /// `false` sleeps exactly the backoff — for tests that measure the schedule.
+    pub jitter: bool,
+}
+
+impl LaneTimings {
+    /// One backoff step's sleep: the backoff, jittered unless `jitter` is off.
+    pub(crate) fn spread(&self, backoff: Duration) -> Duration {
+        if self.jitter {
+            shed_core::lane::backoff::jittered(backoff)
+        } else {
+            backoff
+        }
+    }
 }
 
 impl Default for LaneTimings {
@@ -238,6 +252,7 @@ impl Default for LaneTimings {
             flush_after: crate::segment::FLUSH_AFTER,
             reattaches: REATTACHES_PER_EPISODE,
             connect_refusals: CONNECT_REFUSALS,
+            jitter: true,
         }
     }
 }
