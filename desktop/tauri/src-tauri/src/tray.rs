@@ -102,7 +102,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     match tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template@2x.png")) {
         Ok(icon) => builder = builder.icon(icon).icon_as_template(true),
         Err(e) => {
-            eprintln!("shed-desktop-tauri: tray template icon failed to decode ({e}); using app icon");
+            app_warn!("shed-desktop-tauri: tray template icon failed to decode ({e}); using app icon");
             if let Some(icon) = app.default_window_icon().cloned() {
                 builder = builder.icon(icon);
             }

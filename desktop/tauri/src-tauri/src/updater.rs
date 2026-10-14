@@ -173,10 +173,10 @@ pub fn configure<R: Runtime>(app: &AppHandle<R>, version: &str) {
     use tauri_plugin_sparkle_updater::SparkleUpdaterExt;
     if let Some(updater) = app.sparkle_updater() {
         if let Err(e) = updater.set_automatically_checks_for_updates(false) {
-            eprintln!("shed-desktop-tauri: sparkle set_automatically_checks_for_updates failed: {e}");
+            app_warn!("shed-desktop-tauri: sparkle set_automatically_checks_for_updates failed: {e}");
         }
         if let Err(e) = updater.set_allowed_channels(allowed_channels(version)) {
-            eprintln!("shed-desktop-tauri: sparkle set_allowed_channels failed: {e}");
+            app_warn!("shed-desktop-tauri: sparkle set_allowed_channels failed: {e}");
         }
     }
 }
@@ -194,7 +194,7 @@ fn present_check<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         activate_frontmost();
         if let Some(updater) = handle.sparkle_updater() {
             if let Err(e) = updater.check_for_updates() {
-                eprintln!("shed-desktop-tauri: sparkle check_for_updates failed: {e}");
+                app_warn!("shed-desktop-tauri: sparkle check_for_updates failed: {e}");
             }
         }
     })

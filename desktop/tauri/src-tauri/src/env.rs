@@ -111,6 +111,16 @@ pub struct Env {
     /// headless-coexist mode; external mode never touches it. The harness overrides it to
     /// keep an embedded-mode run hermetic.
     pub broker_extensions_path: PathBuf,
+    /// The app's log file (#414, [`crate::applog`]): `SHED_TAURI_LOG_FILE`, else the
+    /// platform default — macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`, Linux
+    /// `${XDG_STATE_HOME:-~/.local/state}/ai.stridelabs.shed-desktop/shed-desktop.log`.
+    /// `None` when nothing resolves one (file logging off). Not a test seam: it only
+    /// moves where this process writes its own log.
+    pub log_file: Option<PathBuf>,
+    /// `SHED_TAURI_LOG=debug`: DEBUG for the shed crates' `tracing` events and the
+    /// embedded broker's quiet tier, and roost-ipc's events at all — off without it,
+    /// since they carry ssh's own stderr (everything else stays at INFO).
+    pub log_debug: bool,
 }
 
 impl Env {
@@ -187,11 +197,13 @@ impl Env {
             "SHED_TAURI_CRAZE_PATH",
             var("SHED_TAURI_CRAZE_PATH"),
         );
+        // Said before the log file opens (it opens once the single-instance lock is
+        // held), so these wait in its pre-sink buffer.
         for refusal in [ssh_refusal, jail_refusal, craze_refusal]
             .into_iter()
             .flatten()
         {
-            eprintln!("{refusal}");
+            app_warn!("{refusal}");
         }
         // Only beside the seam: the jailed dial is the one consumer, and a
         // production run passes the whole environment through anyway.
@@ -222,6 +234,13 @@ impl Env {
             broker_extensions_path: var("SHED_TAURI_EXTENSIONS_CONFIG")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_extensions_path),
+            log_file: crate::applog::resolve_path(
+                crate::applog::MAC,
+                var("SHED_TAURI_LOG_FILE").as_deref(),
+                var("XDG_STATE_HOME").as_deref(),
+                var("HOME").as_deref(),
+            ),
+            log_debug: var("SHED_TAURI_LOG").is_some_and(|v| v.eq_ignore_ascii_case("debug")),
         }
     }
 }

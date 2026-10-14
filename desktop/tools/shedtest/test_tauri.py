@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -224,8 +225,17 @@ def test_second_launch_hands_off(tauri):
     # A second shed-desktop-tauri against the same runtime must detect the running
     # instance (the single-instance plugin), hand off by raising it, and exit —
     # never bind a second socket or leave a process behind.
+    #
+    # Nor touch the log file (#414): it opens only once the single-instance lock is
+    # held, so the second launch's "already running" line goes to its stderr alone.
+    # The session instance's log is where the harness put it.
+    env = ui.launch_env("tauri")
+    log_path = tauri.identify()["log_path"]
+    assert log_path == str(ui.app_log_path(Path(env["HOME"]))), log_path
+    before = Path(log_path).read_text(errors="replace")
+    assert "shed-desktop-tauri: starting: version " in before, before
     proc = subprocess.Popen(
-        [str(ui.TAURI_BIN)], env=ui.launch_env("tauri"),
+        [str(ui.TAURI_BIN)], env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
@@ -240,6 +250,9 @@ def test_second_launch_hands_off(tauri):
     assert tauri.identify()["platform"] == "tauri"
     # ...and app.activate (the op the hand-off invoked) still succeeds.
     tauri.call("app.activate")
+    after = Path(log_path).read_text(errors="replace")
+    assert "already running" not in after, "the second launch wrote the log file"
+    assert after.count("shed-desktop-tauri: starting: version ") == 1, after
 
 
 _GiB = 1024 ** 3

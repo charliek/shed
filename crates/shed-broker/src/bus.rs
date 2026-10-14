@@ -424,6 +424,10 @@ enum StreamEnd {
 pub struct BusClient {
     /// Base URL with any trailing slash trimmed (`WithServerURL` semantics).
     server_url: String,
+    /// The server's config name, for the log lines ([`Self::server_label`]); empty
+    /// until [`Self::with_server_name`] sets one (the single unnamed target keeps it
+    /// empty, and is named by its URL instead).
+    server_name: String,
     http: reqwest::Client,
     /// Static open-mode token (Go's `WithToken`); used only when there is no
     /// `token_provider`. Empty → unauthenticated.
@@ -464,6 +468,7 @@ impl BusClient {
         let http = build_http_client(pin.as_deref(), client_certs)?;
         Ok(Self {
             server_url,
+            server_name: String::new(),
             http,
             static_token,
             token_provider,
@@ -471,6 +476,25 @@ impl BusClient {
             initial_backoff: INITIAL_BACKOFF,
             max_backoff: MAX_BACKOFF,
         })
+    }
+
+    /// Name the server this client talks to, for its log lines — the supervisor's
+    /// `target.name`. A process that brokers several servers (the daemon, the desktop's
+    /// embedded broker) writes one log for all of them, and a connect, a drop or a 409
+    /// that does not say which server it was is ambiguous there.
+    pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = name.into();
+        self
+    }
+
+    /// The `server=` field of this client's log lines: its config name, or — for the
+    /// unnamed single-server target, which has none — its base URL.
+    fn server_label(&self) -> &str {
+        if self.server_name.is_empty() {
+            &self.server_url
+        } else {
+            &self.server_name
+        }
     }
 
     /// Subscribe to `namespace`'s SSE stream. Spawns the reconnecting loop and
@@ -527,7 +551,8 @@ impl BusClient {
                     // Terminal: a second broker must be observably rejected, not
                     // silently retry forever (hostclient.go's errSubscribeConflict).
                     self.log.error(&format!(
-                        "SSE subscription rejected; another listener owns namespace {namespace} — not retrying: {reason}"
+                        "SSE subscription rejected; another listener owns namespace {namespace} server={} — not retrying: {reason}",
+                        self.server_label()
                     ));
                     terminal_state = ConnState::Rejected;
                     terminal_cause = Some(reason);
@@ -575,14 +600,15 @@ impl BusClient {
     /// `hostclient.go`): a persistently-unreachable server logs the WARN once, then
     /// drops to DEBUG (suppressed) — no per-cycle flood.
     fn log_down(&self, namespace: &str, reason: &str, backoff: Duration, down_logged: &mut bool) {
+        let server = self.server_label();
         if !*down_logged {
             self.log.warn(&format!(
-                "SSE connection lost, reconnecting namespace={namespace} backoff={backoff:?} error={reason}"
+                "SSE connection lost, reconnecting namespace={namespace} server={server} backoff={backoff:?} error={reason}"
             ));
             *down_logged = true;
         } else {
             self.log.debug(&format!(
-                "SSE still down, retrying namespace={namespace} backoff={backoff:?} error={reason}"
+                "SSE still down, retrying namespace={namespace} server={server} backoff={backoff:?} error={reason}"
             ));
         }
     }
@@ -658,8 +684,10 @@ impl BusClient {
         // Connected: reset the down-log, record the state, and stream envelopes.
         connected.store(true, Ordering::SeqCst);
         set_state(status, ConnState::Connected, None);
-        self.log
-            .info(&format!("SSE connected namespace={namespace}"));
+        self.log.info(&format!(
+            "SSE connected namespace={namespace} server={}",
+            self.server_label()
+        ));
 
         let mut stream = resp.bytes_stream();
         // Cap a single SSE event at 1 MiB (Go's bufio.Scanner cap): an oversized /
@@ -1125,7 +1153,7 @@ pub fn spawn_server_group(
         bus_certs,
         log.clone(),
     ) {
-        Ok(c) => c,
+        Ok(c) => c.with_server_name(target.name.clone()),
         Err(e) => {
             log.error(&format!(
                 "message bus disabled server={} url={}: {e}",
@@ -2313,23 +2341,38 @@ mod tests {
     }
 
     /// A collecting log that counts messages per level, so the loud-then-quiet
-    /// reconnect logging can be asserted (mirrors Go's TestReconnectLogDedup).
+    /// reconnect logging can be asserted (mirrors Go's TestReconnectLogDedup), and
+    /// keeps every line (`"LEVEL msg"`) so its text can be.
     #[derive(Default)]
     struct CountingLog {
         warns: AtomicUsize,
         debugs: AtomicUsize,
         errors: AtomicUsize,
+        lines: Mutex<Vec<String>>,
+    }
+    impl CountingLog {
+        fn keep(&self, level: &str, msg: &str) {
+            self.lines.lock().unwrap().push(format!("{level} {msg}"));
+        }
+        fn lines(&self) -> Vec<String> {
+            self.lines.lock().unwrap().clone()
+        }
     }
     impl BusLog for CountingLog {
-        fn info(&self, _: &str) {}
-        fn warn(&self, _: &str) {
+        fn info(&self, msg: &str) {
+            self.keep("INFO", msg);
+        }
+        fn warn(&self, msg: &str) {
             self.warns.fetch_add(1, Ordering::SeqCst);
+            self.keep("WARN", msg);
         }
-        fn debug(&self, _: &str) {
+        fn debug(&self, msg: &str) {
             self.debugs.fetch_add(1, Ordering::SeqCst);
+            self.keep("DEBUG", msg);
         }
-        fn error(&self, _: &str) {
+        fn error(&self, msg: &str) {
             self.errors.fetch_add(1, Ordering::SeqCst);
+            self.keep("ERROR", msg);
         }
     }
 
@@ -2362,15 +2405,11 @@ mod tests {
     }
 
     fn open_client(base_url: &str) -> BusClient {
-        BusClient::new(
-            base_url.to_string(),
-            String::new(),
-            None,
-            None,
-            None,
-            silent_log(),
-        )
-        .unwrap()
+        open_client_with(base_url, silent_log())
+    }
+
+    fn open_client_with(base_url: &str, log: Arc<dyn BusLog>) -> BusClient {
+        BusClient::new(base_url.to_string(), String::new(), None, None, None, log).unwrap()
     }
 
     fn shutdown_pair() -> (watch::Sender<bool>, watch::Receiver<bool>) {
@@ -3108,8 +3147,10 @@ mod tests {
                     .body("namespace \"ns1\" is already registered");
             })
             .await;
+        let log = Arc::new(CountingLog::default());
+        let client = open_client_with(&server.base_url(), log.clone()).with_server_name("mini2");
         let (_tx, rx) = shutdown_pair();
-        let mut sub = open_client(&server.base_url()).subscribe("ns1", rx);
+        let mut sub = client.subscribe("ns1", rx);
         // The channel must close on its own (no envelope, terminal).
         let closed = tokio::time::timeout(Duration::from_secs(3), sub.rx.recv())
             .await
@@ -3122,6 +3163,48 @@ mod tests {
         assert_eq!(sub.status().state, ConnState::Rejected);
         assert!(!sub.status().last_error.is_empty());
         m.assert_hits_async(1).await;
+        // The one ERROR line names the namespace AND the server (#414: a log that
+        // brokers several servers must say which one refused).
+        let errors: Vec<String> = log
+            .lines()
+            .into_iter()
+            .filter(|l| l.starts_with("ERROR "))
+            .collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("SSE subscription rejected")
+                && errors[0].contains("namespace ns1 server=mini2 "),
+            "{errors:?}"
+        );
+    }
+
+    /// The connect line names its server: the config name when the supervisor gave
+    /// one, else (the unnamed single-server target) the base URL.
+    #[tokio::test]
+    async fn the_connect_line_names_its_server() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/plugins/listeners/ssh-agent/messages");
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body("data: {\"id\":\"e1\",\"namespace\":\"ssh-agent\",\"type\":\"request\",\"final\":true,\"timestamp\":\"t\",\"payload\":{}}\n\n");
+            })
+            .await;
+        for (name, want) in [("mini2", "mini2".to_string()), ("", server.base_url())] {
+            let log = Arc::new(CountingLog::default());
+            let client = open_client_with(&server.base_url(), log.clone()).with_server_name(name);
+            let (tx, rx) = shutdown_pair();
+            let mut sub = client.subscribe("ssh-agent", rx);
+            tokio::time::timeout(Duration::from_secs(5), sub.rx.recv())
+                .await
+                .expect("an envelope")
+                .unwrap();
+            let _ = tx.send(true);
+            let want = format!("INFO SSE connected namespace=ssh-agent server={want}");
+            assert!(log.lines().contains(&want), "{want:?} in {:?}", log.lines());
+        }
     }
 
     #[tokio::test]
@@ -3211,16 +3294,8 @@ mod tests {
             })
             .await;
         let log = Arc::new(CountingLog::default());
-        let client = BusClient::new(
-            server.base_url(),
-            String::new(),
-            None,
-            None,
-            None,
-            log.clone(),
-        )
-        .unwrap()
-        .with_test_backoff(Duration::from_millis(5), Duration::from_millis(10));
+        let client = open_client_with(&server.base_url(), log.clone())
+            .with_test_backoff(Duration::from_millis(5), Duration::from_millis(10));
         let (tx, rx) = shutdown_pair();
         let sub = client.subscribe("ssh-agent", rx);
         // Poll (bounded) until the quiet DEBUG tier has engaged — ≥1 DEBUG retry
@@ -3253,6 +3328,17 @@ mod tests {
             log.debugs.load(Ordering::SeqCst) >= 1,
             "subsequent retries drop to the quiet DEBUG tier"
         );
+        // Both tiers name the server — here the unnamed client's base URL.
+        let server_field = format!(" server={} ", server.base_url());
+        let lines = log.lines();
+        let warn = lines.iter().find(|l| l.starts_with("WARN ")).unwrap();
+        assert!(
+            warn.contains("SSE connection lost, reconnecting namespace=ssh-agent")
+                && warn.contains(&server_field),
+            "{warn}"
+        );
+        let debug = lines.iter().find(|l| l.starts_with("DEBUG ")).unwrap();
+        assert!(debug.contains(&server_field), "{debug}");
     }
 
     #[tokio::test]

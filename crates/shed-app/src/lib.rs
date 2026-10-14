@@ -78,6 +78,10 @@ pub use roost::{
     RoostWatcherOptions, SshBridge, SshBridgeOptions, SshExec, SystemSshTunnels, TeardownSink,
     Tunnel, TunnelOpener, UnreachableReach,
 };
+/// The embedded broker's log seam ([`EmbeddedHostAgent::new`] takes one), so a
+/// client implements it without depending on `shed-broker` itself.
+#[cfg(feature = "broker")]
+pub use shed_broker::bus::BusLog;
 pub use slash_menu::{
     SlashAccept, SlashAcceptKey, SlashAction, SlashDispatch, SlashFilter, SlashFilterRow,
     SlashHidden, SlashMenu, SlashMenuRow,

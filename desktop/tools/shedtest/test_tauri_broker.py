@@ -30,6 +30,7 @@ import base64
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -39,7 +40,7 @@ from urllib.parse import urlsplit
 import pytest
 
 import ui
-from client import TauriClient
+from client import TauriClient, scaled_timeout
 from fake_host_agent import FakeHostAgent
 from mockserver import MockShedServer
 
@@ -101,7 +102,7 @@ def _broker_app(
 ):
     """Launch a self-managed tauri instance with a PRIVATE mock shed-server, yield
     `(client, mock, info)`, and tear both down. `info` carries `ssh_blob`, `audit_path`,
-    and `runtime_dir`.
+    `runtime_dir` and `proc` (the app's process, for a cell that quits it itself).
 
     * `host_agent_socket` — the app's configured Surface-A socket; the three-way probe
       keys off it (`shed_app::probe_sockets_at`). `None` ⇒ neither daemon socket exists
@@ -192,6 +193,7 @@ def _broker_app(
         log_fh = open(log, "wb")
         proc = subprocess.Popen(
             [str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT)
+        info["proc"] = proc
         try:
             ui.await_hermetic("tauri", sock=sock, mock_base_url=mock.base_url,
                               proc=proc, log=log)
@@ -424,7 +426,7 @@ def test_split_namespace_409_surfaced_in_status():
     """A namespace already owned by a competing listener answers 409
     NAMESPACE_ALREADY_REGISTERED — terminal `rejected` (no retry) — while the others
     connect. The startup-race split state is safe (no double prompts) and surfaced."""
-    with _broker_app(discovery_mock=True, conflict_namespaces=("ssh-agent",)) as (client, mock, _info):
+    with _broker_app(discovery_mock=True, conflict_namespaces=("ssh-agent",)) as (client, mock, info):
         client.wait_until(
             lambda: _server_ns_states(client.broker_status()).get("ssh-agent") == "rejected"
             and _server_ns_states(client.broker_status()).get("docker-credentials") == "connected",
@@ -435,6 +437,68 @@ def test_split_namespace_409_surfaced_in_status():
         # 409 NAMESPACE_ALREADY_REGISTERED is terminal client-side: the bus must not
         # hot-retry a rejected namespace — exactly one subscribe attempt.
         assert mock.subscribe_count("ssh-agent") == 1, mock.subscribe_count("ssh-agent")
+        # And the app's log file says which server refused it (#414).
+        log = ui.app_log_path(info["runtime_dir"])
+        client.wait_until(
+            lambda: any("SSE subscription rejected" in line and "namespace ssh-agent server=mock " in line
+                        for line in _log_lines(log)),
+            timeout=10, what="the 409's line, naming its server, in the app's log file")
+
+
+# ---------------------------------------------------------------------------
+# Cell (d2) — the app's log file (#414): where it is, and what it records
+# ---------------------------------------------------------------------------
+
+def _log_lines(path) -> list[str]:
+    try:
+        return path.read_text(errors="replace").splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def test_log_file_records_startup_broker_bus_and_shutdown():
+    """The app writes a log file (#414) and says where: `identify.log_path` is the
+    platform default under the harness's redirected HOME / `XDG_STATE_HOME`, created
+    0600 in 0700 directories the app made. It holds the startup line (version,
+    platform, log path), the resolved broker mode with its pref, probe and config
+    provenance, and the EMBEDDED bus's connect line naming the server it connected to
+    — and, after an orderly quit, every shutdown phase and the closing line, which
+    an app launched from Finder or a desktop launcher (stderr discarded) used to
+    lose."""
+    with _broker_app(discovery_mock=True) as (client, mock, info):
+        log = ui.app_log_path(info["runtime_dir"])
+        assert client.identify()["log_path"] == str(log)
+        mock.wait_for_subscribe("ssh-agent")
+        client.wait_until(
+            lambda: any("SSE connected namespace=ssh-agent server=mock" in line
+                        for line in _log_lines(log)),
+            timeout=20, what="the embedded bus's connect line, naming its server, in the log")
+        lines = _log_lines(log)
+        starting = [line for line in lines if "shed-desktop-tauri: starting: version " in line]
+        assert len(starting) == 1, lines
+        assert starting[0].endswith(f"log {log}"), starting
+        broker = ("shed-desktop-tauri: broker: mode=embedded pref=auto "
+                  "probe{desktop_socket_live=false, status_socket_live=false} config=synthesized")
+        assert any(line.endswith(broker) for line in lines), lines
+        # Every line is stamped `<RFC 3339 UTC> <LEVEL> …`.
+        for line in lines:
+            ts, _, rest = line.partition(" ")
+            assert ts.endswith("Z") and "T" in ts, line
+            assert rest.lstrip().split(" ", 1)[0] in {"ERROR", "WARN", "INFO", "DEBUG"}, line
+        assert stat.S_IMODE(log.stat().st_mode) == 0o600
+        assert stat.S_IMODE(log.parent.stat().st_mode) == 0o700
+
+        # An orderly quit (the tray's Quit, through the test-mode door): the
+        # shutdown's phases land in the file before the process exits.
+        client.call("app.quit")
+        code = info["proc"].wait(timeout=scaled_timeout(20))
+        assert code == 0, f"an orderly quit exits 0, not {code}"
+        lines = _log_lines(log)
+        for n in range(5):
+            assert any(f"shed-desktop-tauri: shutdown: phase {n} (" in line for line in lines), \
+                f"phase {n} missing: {[l for l in lines if 'shutdown' in l]}"
+        assert any("shed-desktop-tauri: shutdown: done in " in line for line in lines), lines
+        print(f"\n{log}:\n" + "\n".join(lines))
 
 
 # ---------------------------------------------------------------------------

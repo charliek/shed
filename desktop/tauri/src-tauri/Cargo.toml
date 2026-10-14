@@ -81,6 +81,17 @@ tauri-plugin-autostart = "2"
 # click forwarded to cache the tray rect (the hermetic `tray.show` falls back to a
 # fixed position). Cross-platform crate; the popover itself is macOS-only.
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
+# The app's log file (#414, `applog.rs`): shed-app's `tracing` events (and
+# roost-ipc's, only with SHED_TAURI_LOG=debug) are written by a `fmt` layer into
+# the same rotating file as the app's own lines. `tracing` is already in the
+# lock (the facade shed-app and roost-ipc use); naming it here is what lets this
+# crate build the subscriber. Default features off: no ANSI colours, no `log`
+# bridge, no env-filter regex — `fmt` (which brings `registry`) and `std` are
+# all the layer and its `Targets` filter need. The subscriber lives HERE, never
+# in ../../../crates (crates/CLAUDE.md's workspace boundary: that workspace stays
+# subscriber-free).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 # The Linux notifier posts + withdraws approval banners over the session bus
 # directly (freedesktop Notifications), so a resolved request's --urgency=critical

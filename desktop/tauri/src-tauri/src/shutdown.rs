@@ -291,7 +291,7 @@ pub async fn shutdown_children(
     report.late_killed = late_now.killed;
     report.late_unseen = late_now.unseen.len();
     report.elapsed = started.elapsed();
-    eprintln!(
+    app_info!(
         "shed-desktop-tauri: shutdown: done in {} ms (late registrations so far: killed={}, \
          exit unseen={:?}; the gate stays closed)",
         report.elapsed.as_millis(),
@@ -320,14 +320,14 @@ async fn lanes_phase(lanes: Arc<Lanes>, gate: SpawnGate) -> (LanesClosed, SlotsC
             let _ = tx.send(closed);
         });
     if let Err(e) = spawned {
-        eprintln!("shed-desktop-tauri: shutdown: could not start the lanes thread ({e})");
+        app_warn!("shed-desktop-tauri: shutdown: could not start the lanes thread ({e})");
         return Default::default();
     }
     rx.await.unwrap_or_default()
 }
 
 fn log(n: u8, what: &str, since: Instant, detail: std::fmt::Arguments<'_>) {
-    eprintln!(
+    app_info!(
         "shed-desktop-tauri: shutdown: phase {n} ({what}) took {} ms: {detail}",
         since.elapsed().as_millis()
     );

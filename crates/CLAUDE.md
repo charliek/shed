@@ -455,8 +455,9 @@ resulting set. The workspace `rust-version` is **1.97**, which is roost-ipc's MS
 `shed-app` also takes the **`tracing` facade** directly (plan 014): the roost observer loop has
 two things worth saying that are neither an error nor an update — a resync, and somebody else
 taking the interactive lease. It adds no crate to the lock (roost-ipc already brings the same
-facade into that graph), there is still **no subscriber** anywhere in this workspace, and a
-client that installs none pays nothing.
+facade into that graph), there is still **no subscriber** anywhere in this workspace (the
+Tauri app installs one in its OWN workspace — `desktop/tauri/src-tauri/src/applog.rs`, #414),
+and a client that installs none pays nothing.
 
 **Android.** `cargo check -p shed-core --target aarch64-linux-android` is the early gate for
 mobile (`roost-ipc` compiles for it cleanly — its `peer.rs` has a fail-closed non-linux/macOS
