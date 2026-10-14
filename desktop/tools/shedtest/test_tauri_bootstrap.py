@@ -762,6 +762,7 @@ def test_a_cold_shed_reads_missing_and_offers_an_install(boot, rig):
     assert preview["actionable"] is True
     assert preview["source"]["rung"] == "override"
     assert preview["client_label"] == "shed-desktop"
+    assert preview["wired_agents"] == ROOST_WIRED_AGENTS, preview
     assert "ROOST_SESSION_INSTALL_BIN" in preview["source"]["sentence"], preview
 
 
@@ -1798,7 +1799,7 @@ def test_the_consent_dialog_names_what_where_from_and_the_hook_wiring(boot, rig)
         ), card["from"]
         assert card["hooks"] == (
             "roost-session will also wire its hooks into the agents already configured "
-            "there — claude, codex, cursor, opencode, grok — and nothing else."
+            f"there — {', '.join(ROOST_WIRED_AGENTS)} — and nothing else."
         ), "the hook-wiring sentence is pinned copy (plan 019 §3.4)"
         assert card["backup"] is None, "nothing to back up on a plain install"
         # Every one of those lines is in the card's own DOM, so this is a test of

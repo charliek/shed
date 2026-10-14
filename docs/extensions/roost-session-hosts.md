@@ -182,8 +182,8 @@ does not mean roost sees it as installed yet.
 wire call; `roost-session` on the target is the process that writes into the configuration
 files of whichever of those five agents it finds already configured there, and nothing else.
 The consent copy shown before Install/Update/Start names this plainly: "roost-session will also
-wire its hooks into the agents already configured there — claude, codex, cursor, opencode,
-grok — and nothing else."
+wire its hooks into the agents already configured there — claude, codex, cursor, grok,
+opencode — and nothing else."
 
 **When it recurs:** the raise only wires an agent whose configuration directory exists *at that
 moment*. An agent set up later is not retroactively wired by this one call — it gets wired the

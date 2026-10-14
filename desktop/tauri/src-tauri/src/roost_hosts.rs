@@ -3018,6 +3018,9 @@ impl RoostHosts {
             // host, and so is overlaid here rather than folded into `Plan`.
             "actionable": plan.actionable() && (!plan.needs_source() || source.available()),
             "client_label": CLIENT_LABEL,
+            // The agents the host session wires hooks into — the consent card names
+            // exactly these (#362), so its copy cannot drift from what is raised.
+            "wired_agents": bootstrap::ROOST_WIRED_AGENTS,
         }))
     }
 

@@ -97,6 +97,9 @@ export type RoostPreview = {
    *  some). A card offers a button iff this is true. */
   actionable: boolean;
   client_label: string;
+  /** The agents roost-session wires hooks into on the host — the consent card
+   *  names these, in this order (`ROOST_WIRED_AGENTS`). */
+  wired_agents: string[];
 };
 
 export type RoostHooksSkip = { agent: string; reason: string };
@@ -255,7 +258,7 @@ export function roostConsentCopy(preview: RoostPreview): {
   hooks: string;
   backup: string | null;
 } {
-  const { plan, probe, source, target } = preview;
+  const { plan, probe, source, target, wired_agents } = preview;
   const dest =
     plan.kind === "install" || plan.kind === "update"
       ? plan.dest ?? probe.dest ?? "~/.local/bin/roost-session"
@@ -276,7 +279,7 @@ export function roostConsentCopy(preview: RoostPreview): {
     from: source.sentence,
     hooks:
       "roost-session will also wire its hooks into the agents already configured there — " +
-      "claude, codex, cursor, opencode, grok — and nothing else.",
+      `${wired_agents.join(", ")} — and nothing else.`,
     backup: plan.kind === "update" ? `The file currently at ${dest} will be backed up before it's replaced.` : null,
   };
 }
