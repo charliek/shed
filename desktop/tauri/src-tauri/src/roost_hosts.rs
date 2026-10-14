@@ -1613,10 +1613,15 @@ impl RoostHosts {
                     "applied".to_string()
                 }
                 Err(e) => {
+                    // The reason goes back to the caller, and to the file only
+                    // under `SHED_TAURI_LOG=debug`: a transport failure's
+                    // sentence can carry ssh's own stderr (#351), which the log
+                    // keeps out by default (#414).
                     app_warn!(
-                        "shed-desktop-tauri: {id}: tab {} opened, but its title was not set: {e}",
+                        "shed-desktop-tauri: {id}: tab {} opened, but its title was not set",
                         tab.id
                     );
+                    tracing::debug!(tab = tab.id, error = %e, "{id}: the tab title failed");
                     format!("failed: {e}")
                 }
             }),
