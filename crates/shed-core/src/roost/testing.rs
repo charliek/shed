@@ -243,6 +243,9 @@ struct FakeState {
     /// assert a key is **absent** from a launch — `activate` is
     /// `skip_serializing_if`, so a struct literal says nothing about the bytes.
     tab_open_calls: Vec<Value>,
+    /// What the next `tab.open` is refused with. See
+    /// [`FakeRoost::refuse_next_tab_open`].
+    tab_open_refusal: Option<Refusal>,
     /// Every `tab.set_title` this fake has served, params verbatim — a refused
     /// one included, so a test can tell "never asked" from "asked and refused".
     set_title_calls: Vec<Value>,
@@ -309,6 +312,7 @@ impl FakeState {
             writes: BTreeMap::new(),
             agent_hooks_calls: Vec::new(),
             tab_open_calls: Vec::new(),
+            tab_open_refusal: None,
             set_title_calls: Vec::new(),
             set_title_refusal: None,
             agent_hooks_result: None,
@@ -825,7 +829,8 @@ impl FakeRoost {
         self.lock().agent_hooks_calls.clone()
     }
 
-    /// Every `tab.open` this fake has served, params verbatim.
+    /// Every `tab.open` this fake has served, params verbatim — a refused one
+    /// included ([`Self::refuse_next_tab_open`]).
     ///
     /// The one way to assert a key is **absent** from a launch. `TabOpenParams`
     /// declares `activate` `skip_serializing_if = "Option::is_none"`, so the
@@ -834,6 +839,17 @@ impl FakeRoost {
     /// decoded params object, cannot tell them apart.
     pub fn tab_open_calls(&self) -> Vec<Value> {
         self.lock().tab_open_calls.clone()
+    }
+
+    /// Refuse the next `tab.open` with this `code` and `message`, once.
+    ///
+    /// The twin of [`Self::refuse_next_set_title`]: the params are recorded
+    /// first and nothing is opened — no tab, no id spent, no commit — which is
+    /// what a real daemon's refusal leaves behind. A well-formed open has no
+    /// other way to fail on this fake, and a client has to be tested against a
+    /// refusal the session MINTED (proof the wire works) as well as a dead one.
+    pub fn refuse_next_tab_open(&self, code: &str, message: &str) {
+        self.lock().tab_open_refusal = Some(refuse(code, message));
     }
 
     /// Every `tab.set_title` this fake has served, params verbatim, in order —
@@ -1258,6 +1274,9 @@ fn dispatch(state: &Mutex<FakeState>, op: &str, params: &Value) -> Result<Value,
         }
         "tab.open" => {
             state.tab_open_calls.push(params.clone());
+            if let Some(refusal) = state.tab_open_refusal.take() {
+                return Err(refusal);
+            }
             let id = state.next_tab_id;
             state.next_tab_id += 1;
             let project_id = params
@@ -1808,6 +1827,31 @@ mod tests {
             ],
             "the string-int64 id and the title, verbatim, refused calls included"
         );
+    }
+
+    /// **A seeded `tab.open` refusal is served once, recorded, and opens
+    /// nothing**: no tab, no revision bump — and the next open works.
+    #[tokio::test]
+    async fn a_refused_open_is_recorded_once_and_opens_nothing() {
+        let fake = FakeRoost::start().await;
+        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
+        let (tabs, revision) = (fake.tab_ids(), fake.revision());
+
+        fake.refuse_next_tab_open("internal", "the pty pool is wedged");
+        let refused = conn
+            .tab_open(roost_ipc::messages::TabOpenParams::default())
+            .await
+            .expect_err("the seeded refusal");
+        assert_eq!(refused.server_code(), Some(ServerCode::Internal));
+        assert_eq!(fake.tab_ids(), tabs, "a refused open opens no tab");
+        assert_eq!(fake.revision(), revision, "and commits nothing");
+
+        let opened = conn
+            .tab_open(roost_ipc::messages::TabOpenParams::default())
+            .await
+            .expect("a refusal is served once");
+        assert!(fake.tab_ids().contains(&opened.id));
+        assert_eq!(fake.tab_open_calls().len(), 2, "the refused call included");
     }
 
     /// `session.set_agent_hooks` is **open to every connection** at generation 5
