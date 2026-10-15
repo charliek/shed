@@ -42,6 +42,15 @@ All notable changes to this project will be documented in this file.
   broker's connect, drop and rejection lines now name their server, in `shed-host-agent`'s
   log too. (#414)
 
+### Changed
+
+- **Images: the `extensions` and `full` images bake craze 0.2.0** (0.9.0 baked 0.1.0), and
+  shed's CI tests against it. The desktop works as it did: craze's new `/effort` command is
+  not in its `/` menu yet, and typing it says "not available here yet". See
+  [craze's changelog](https://github.com/charliek/craze/blob/main/CHANGELOG.md) for what changed
+  in craze itself, including that a model switch on a native session now lands on the effort
+  last used on that model.
+
 ### Fixed
 
 - **Desktop: while the agent is working, the `/` menu opens on the first command you can run
