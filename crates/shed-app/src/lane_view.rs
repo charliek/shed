@@ -336,7 +336,12 @@ impl LaneView {
                 // the current model has an effort option, which a model switch
                 // changes with no new catalog (plan 032 PC7). So re-resolve on
                 // a change, and only on one, exactly as for `Capabilities`.
-                if target.settings.as_ref() != Some(settings) {
+                // Dropped under capabilities that do not say `settings`, as an
+                // off-capability catalog is: a frame sent against the
+                // contract must not resurface when the flag comes back.
+                if target.capabilities.as_ref().is_some_and(|c| c.settings)
+                    && target.settings.as_ref() != Some(settings)
+                {
                     target.settings = Some(settings.clone());
                     target.resolve_slash_menu();
                 }
@@ -1401,8 +1406,9 @@ mod tests {
 
     /// **Settings a reader is not shown decide nothing**: under capabilities
     /// that drop `settings` the effort picker hides and the effort option goes
-    /// — and a `Settings` sent anyway (against the contract) brings back
-    /// neither.
+    /// — and a `Settings` sent anyway (against the contract) is dropped, so
+    /// it brings back neither, not even when the capability returns: only a
+    /// fresh `Settings` does.
     #[test]
     fn effort_follows_only_the_settings_a_reader_is_shown() {
         let mut view = LaneView::default();
@@ -1426,8 +1432,17 @@ mod tests {
         });
         assert_eq!(
             menu(&view),
+            some(&["a"]),
+            "the capability back: the rogue frame was dropped, nothing resurfaces"
+        );
+        assert_eq!(view.snapshot(None).effort_option, None);
+        view.apply(&LaneEvent::Settings {
+            settings: slash_rows::grok_46(),
+        });
+        assert_eq!(
+            menu(&view),
             some(&["effort", "a"]),
-            "the capability back: the settings now shown decide"
+            "a fresh Settings under the capability decides"
         );
     }
 
