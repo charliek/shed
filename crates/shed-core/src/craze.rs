@@ -6,14 +6,20 @@
 //! loopback port on the phone, roost's `tab.open` for Open in terminal — and
 //! each runs exactly the argv this module hands it (plan 025 §3.4, P9).
 //!
-//! **Three forms, one ladder.** [`bridge_hub_argv`] (`… bridge --hub`, every
-//! connection to a machine's hub), [`providers_hub_argv`] (`… providers --hub
-//! --json`, the desktop's find-only probe for a remote machine — it answers
-//! `craze providers: no hub is running`, exit 1, and never starts a hub, where
-//! `bridge --hub` always does) and [`attach_argv`] (`… attach --session
-//! '<hostId>'`, Open in terminal). Each is `["sh", "-c", <script>]`: one argv
-//! element, so the far side never has to source a login shell (and its stdout
-//! pollution, shed#231) just to find the binary.
+//! **Four forms, one ladder.** [`bridge_hub_argv`] (`… bridge --hub`, a
+//! connection to a machine's hub that starts one when none runs — this
+//! machine's own, and a remote machine's on a user's explicit action),
+//! [`bridge_hub_no_start_argv`] (`… bridge --hub --no-start`, craze 0.2.0+:
+//! the same connection to a hub that is ALREADY running, and never a hub
+//! started — none running is exit 3, `craze bridge: no hub is running`; the
+//! desktop's background dial to a remote machine, plan 032 §3.5),
+//! [`providers_hub_argv`] (`… providers --hub --json`, the desktop's find-only
+//! probe for a remote machine — it answers `craze providers: no hub is
+//! running`, exit 1, and never starts a hub, where `bridge --hub` always does)
+//! and [`attach_argv`] (`… attach --session '<hostId>'`, Open in terminal).
+//! Each is `["sh", "-c", <script>]`: one argv element, so the far side never
+//! has to source a login shell (and its stdout pollution, shed#231) just to
+//! find the binary.
 //!
 //! **The script is craze's published ladder, verbatim** — craze's
 //! `docs/reference/protocol.md`, "SSH exec: what a client may assume", published
@@ -78,8 +84,9 @@
 //! leg proves ours through a real sshd.) An escape sequence of either kind never
 //! appears in the raw argv.
 //!
-//! Pinned by `tests/machine-transport`: the `craze-bridge-hub` and
-//! `craze-providers-hub` scenarios' argv EQUAL [`bridge_hub_argv`] and
+//! Pinned by `tests/machine-transport`: the `craze-bridge-hub`,
+//! `craze-bridge-hub-no-start` and `craze-providers-hub` scenarios' argv EQUAL
+//! [`bridge_hub_argv`], [`bridge_hub_no_start_argv`] and
 //! [`providers_hub_argv`] (asserted by the Rust leg), and both goldens record
 //! them — `wire.json` byte for byte, `received.json` through a real sshd.
 
@@ -187,6 +194,9 @@ pub const JAILED_LADDER: Ladder<'static> = Ladder {
 
 /// The arguments every form passes; the host id is the only interpolated value.
 const BRIDGE_HUB_ARGS: &str = "bridge --hub";
+/// craze 0.2.0's find-only bridge (craze `docs/reference/cli.md`, "craze
+/// bridge"): attaches to a running hub, else exit 3 — never a hub started.
+const BRIDGE_HUB_NO_START_ARGS: &str = "bridge --hub --no-start";
 const PROVIDERS_HUB_ARGS: &str = "providers --hub --json";
 
 /// A host id [`attach_argv`] refused: not twelve lowercase hex digits.
@@ -198,6 +208,11 @@ impl Ladder<'_> {
     /// `["sh", "-c", <ladder exec'ing `craze bridge --hub`>]`.
     pub fn bridge_hub_argv(&self) -> Vec<String> {
         self.argv(BRIDGE_HUB_ARGS)
+    }
+
+    /// `["sh", "-c", <ladder exec'ing `craze bridge --hub --no-start`>]`.
+    pub fn bridge_hub_no_start_argv(&self) -> Vec<String> {
+        self.argv(BRIDGE_HUB_NO_START_ARGS)
     }
 
     /// `["sh", "-c", <ladder exec'ing `craze providers --hub --json`>]`.
@@ -320,8 +335,9 @@ fn assert_plain(s: &str) {
     );
 }
 
-/// `["sh", "-c", <ladder>]` running `craze bridge --hub` — every connection to
-/// a machine's hub, local or remote. Always starts a hub if none runs.
+/// `["sh", "-c", <ladder>]` running `craze bridge --hub` — a connection to a
+/// machine's hub, local or remote. Always starts a hub if none runs; a remote
+/// dial that must not runs [`bridge_hub_no_start_argv`] instead.
 pub fn bridge_hub_argv() -> Vec<String> {
     LADDER.bridge_hub_argv()
 }
@@ -330,6 +346,22 @@ pub fn bridge_hub_argv() -> Vec<String> {
 /// [`display_line`], the same composer every machine transport shares.
 pub fn bridge_hub_command() -> String {
     display_line(&bridge_hub_argv())
+}
+
+/// `["sh", "-c", <ladder>]` running `craze bridge --hub --no-start` — a
+/// connection to a machine's hub only if one is ALREADY running (craze 0.2.0+):
+/// with none, `craze bridge: no hub is running` and exit 3, and no hub started.
+/// A craze older than 0.2.0 refuses the flag (`craze bridge: unknown or
+/// malformed flag; see craze bridge --help`, exit 1), and a client falls back
+/// to [`bridge_hub_argv`] behind its find-only probe (plan 032 §3.5).
+pub fn bridge_hub_no_start_argv() -> Vec<String> {
+    LADDER.bridge_hub_no_start_argv()
+}
+
+/// [`bridge_hub_no_start_argv`] as the ONE command string an ssh transport
+/// sends ([`display_line`], as [`bridge_hub_command`]).
+pub fn bridge_hub_no_start_command() -> String {
+    display_line(&bridge_hub_no_start_argv())
 }
 
 /// `["sh", "-c", <ladder>]` running `craze providers --hub --json` — the
@@ -348,6 +380,11 @@ pub fn attach_argv(host_id: &str) -> Result<Vec<String>, BadHostId> {
 /// [`bridge_hub_argv`] on the [`JAILED_LADDER`] — test mode only.
 pub fn bridge_hub_argv_jailed() -> Vec<String> {
     JAILED_LADDER.bridge_hub_argv()
+}
+
+/// [`bridge_hub_no_start_argv`] on the [`JAILED_LADDER`] — test mode only.
+pub fn bridge_hub_no_start_argv_jailed() -> Vec<String> {
+    JAILED_LADDER.bridge_hub_no_start_argv()
 }
 
 /// [`providers_hub_argv`] on the [`JAILED_LADDER`] — test mode only.
@@ -380,6 +417,7 @@ mod tests {
     fn the_production_script_is_crazes_published_ladder_plus_the_exec_path() {
         for (args, script) in [
             ("bridge --hub", &bridge_hub_argv()[2]),
+            ("bridge --hub --no-start", &bridge_hub_no_start_argv()[2]),
             ("providers --hub --json", &providers_hub_argv()[2]),
             (
                 "attach --session '0123456789ab'",
@@ -432,8 +470,14 @@ mod tests {
                 r#"case "${HOME:-}" in /*) p="$HOME/.local/bin/craze"; [ -f "$p" ] && [ -x "$p" ] && exec "$p" bridge --hub;; esac; p=$(command -v craze 2>/dev/null) || p=; case "$p" in /*) [ -f "$p" ] && [ -x "$p" ] && exec "$p" bridge --hub;; esac; printf '%s\n' 'craze: command not found' >&2; exit 127"#,
             ]
         );
+        assert_eq!(
+            bridge_hub_no_start_argv_jailed()[2],
+            bridge_hub_argv_jailed()[2].replace("bridge --hub", "bridge --hub --no-start"),
+            "the jailed no-start form is the jailed bridge with the flag, and nothing else"
+        );
         for argv in [
             bridge_hub_argv_jailed(),
+            bridge_hub_no_start_argv_jailed(),
             providers_hub_argv_jailed(),
             attach_argv_jailed("0123456789ab").unwrap(),
         ] {
@@ -455,6 +499,29 @@ mod tests {
     fn bridge_hub_command_is_the_display_line_of_the_argv() {
         assert_eq!(bridge_hub_command(), display_line(&bridge_hub_argv()));
         assert!(bridge_hub_command().starts_with("'sh' '-c' 'unset cz_path; cz_path=; "));
+        assert_eq!(
+            bridge_hub_no_start_command(),
+            display_line(&bridge_hub_no_start_argv())
+        );
+    }
+
+    /// **The no-start form differs from the bridge in its flag alone**: the
+    /// same ladder, the same exec PATH, every rung's `bridge --hub` followed by
+    /// `--no-start` (plan 032 §3.5) — so anything the bridge can find, the
+    /// find-only bridge can too.
+    #[test]
+    fn the_no_start_bridge_is_the_bridge_plus_its_flag() {
+        let bridge = &bridge_hub_argv()[2];
+        let no_start = &bridge_hub_no_start_argv()[2];
+        assert_eq!(
+            *no_start,
+            bridge.replace("bridge --hub", "bridge --hub --no-start")
+        );
+        assert_eq!(
+            no_start.matches("bridge --hub --no-start").count(),
+            RUNGS.len()
+        );
+        assert_eq!(no_start.matches("bridge --hub").count(), RUNGS.len());
     }
 
     /// The raw argv carries the id in ONE ordinary pair of single quotes; an

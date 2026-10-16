@@ -73,15 +73,18 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   plus a tolerant `Deserialize` delegating to their existing `from_map` reader.
   `craze.rs` (plan 025 C5) is the **craze remote command**, pure like `machine.rs`: the
   `sh -c '<ladder>'` argv every client runs to reach `craze` on a host —
-  `bridge_hub_argv`/`bridge_hub_command` (every hub connection), `providers_hub_argv` (the
+  `bridge_hub_argv`/`bridge_hub_command` (a hub connection that starts a hub when none runs),
+  `bridge_hub_no_start_argv`/`bridge_hub_no_start_command` (plan 032 §3.5: craze 0.2.0's
+  `bridge --hub --no-start`, which attaches only to a running hub — none is exit 3 — the
+  desktop's background remote dial), `providers_hub_argv` (the
   find-only probe, which never starts a hub) and `attach_argv(host_id)` (Open in terminal;
   the id must be twelve lowercase hex digits). The script is craze's published
   binary-finding ladder verbatim plus one change, an enhanced PATH applied only at the
   `exec`, composed over two tables (`Ladder { rungs, exec_path }`) so tests can re-root
   them; the `*_argv_jailed()` variants keep rungs 1–2 and no PATH change, for test mode
-  only. `tests/machine-transport`'s `craze-bridge-hub`/`craze-providers-hub` scenarios
-  EQUAL the composers' output (the Rust leg asserts it), and `tests/craze_ladder.rs` runs
-  the ladder for real under every local `sh`.
+  only. `tests/machine-transport`'s `craze-bridge-hub`/`craze-bridge-hub-no-start`/
+  `craze-providers-hub` scenarios EQUAL the composers' output (the Rust leg asserts it), and
+  `tests/craze_ladder.rs` runs the ladder for real under every local `sh`.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
   embedded broker bridge (`broker_bridge.rs`, behind the non-default
   `broker = ["dep:shed-broker"]` feature — leg 3a.2), which since plan 022 is its ONLY
@@ -132,7 +135,8 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   The desktop applies it in `roost_hosts.rs`; the phone (CM3) links the same function.
   `SshExec::spawn_duplex(command)` (C9) is the long-lived sibling of `SshExec::run` — the
   same pinned config and private ControlMaster, all three bands piped, killed on drop —
-  that the desktop's remote craze dial runs `craze bridge --hub` through.
+  that the desktop's remote craze dial runs `craze bridge --hub` (`--no-start`, plan 032)
+  through.
   `spawn_gate.rs` (plan 026 §3.3, ungated) is the desktop's orderly-shutdown barrier: a
   `SpawnGate` whose sections every spawn site takes across check → spawn → registration
   (`SshExec`, `SshForward`'s slot and `SshBridge`'s establishment, each through an optional
@@ -216,11 +220,23 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   -lc` login profile — kept for the error; after it, any non-JSON line, a blank one
   included, is a fault), and the hub `hello` (protocol 1, **codecs event 1 and snapshot
   1**, `rosterSubscribe` + `connect`). `dial.rs` classifies a dial that never reached a hub, in
-  plan 025 §3.3.2's precedence (exit 127 → `NotInstalled`; `unknown flag: --hub` on stderr
-  — v0.0.1 — or a hub `hello` short of the rule → `TooOld`; anything else before `hello` →
-  `Unreachable` with the stderr tail; a refused `hello` → `Failed`, `protocol_version` →
-  `TooOld`) and classifies the find-only probe (`providers --hub --json`, which never
-  starts a hub) by its stderr TEXT, never its exit code. `errors.rs` is craze's published
+  plan 025 §3.3.2's precedence as plan 032 §3.5 (PC12) extends it — pinned row by row by a
+  table cell (exit 127 → `NotInstalled`; `unknown flag: --hub` on stderr — v0.0.1 — or a hub
+  `hello` short of the rule → `TooOld`; exit 1 with craze 0.1.x's `craze bridge: unknown or
+  malformed flag` → `NoStartUnsupported`, which only a `--no-start` dial can draw; exit 3
+  with `no hub is running` or an empty stderr → `NoHub`, `SourceOffline::NoHub`, a lane's
+  `Unavailable("no craze hub is running")`; anything else before `hello` → `Unreachable`
+  with the stderr tail; a refused `hello` → `Failed`, `protocol_version` → `TooOld`) and
+  classifies the find-only probe (`providers --hub --json`, which never starts a hub) by
+  its stderr TEXT, never its exit code. **The `NoHub` row is the documented exception** to
+  that rule (PC14e): it reads exit code 3, because craze documents exit 3 as `--no-start`'s
+  contract (`cli.md`, "craze bridge") and every other bridge failure exits 1 — and it still
+  requires craze's words or none, so an unrelated exit 3 stays `Unreachable`. **The
+  fallback:** `CrazeDial::fall_back(&err)` (default `false`; a wrapping dial MUST forward
+  it) is asked on a `NoStartUnsupported` once `connect_hub` has closed the failed
+  connection, and on `true` `connect_hub` dials ONCE more; one it does not take reads as
+  `Unreachable` (the desktop's `SshCrazeDial` takes it once per source, swapping to its
+  probe-then-`bridge --hub` legacy). `errors.rs` is craze's published
   code → `LaneError` table **verbatim, keyed on `data.code` only**, with P14's one
   deviation (a create refused `not_accepting/start_failed` → `Failed(data.cause)`) — and a
   reopen's own `LaneReopenError` map, whose reason-keyed `not_accepting` row is a documented

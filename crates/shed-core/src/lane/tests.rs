@@ -1891,6 +1891,7 @@ fn the_tolerant_enums_are_bare_strings_and_keep_an_unknown_word() {
         (SourceOffline::TooOld, "too_old"),
         (SourceOffline::Unreachable, "unreachable"),
         (SourceOffline::Failed, "failed"),
+        (SourceOffline::NoHub, "no_hub"),
     ] {
         assert_eq!(round_trip(&v), json!(wire));
         assert_eq!(SourceOffline::from_wire(wire), v);

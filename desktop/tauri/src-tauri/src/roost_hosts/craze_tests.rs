@@ -1140,6 +1140,81 @@ async fn a_dormant_sources_lane_ends_hub_gone() {
     assert_eq!(reason(&lanes, &address, HOST_A), "hub_gone");
 }
 
+/// **The hub gone between the probe and the roster's dial** (plan 032 §3.5,
+/// W5): the probe still saw a hub, but the roster's own dial — the find-only
+/// `bridge --hub --no-start` — finds none (`DialError::NoHub`, so the source
+/// says `Offline{NoHub}`). That is the source going DORMANT, not offline: every
+/// row leaves WITH the hub (a lane on one ends `hub_gone`), the subscription is
+/// dropped, and nothing redials — the next thing the source does is probe.
+#[tokio::test]
+async fn a_roster_that_finds_no_hub_sends_the_source_dormant() {
+    let craze = Scripted::attach_only();
+    let id = HostId::Machine("mini3".to_string());
+    let hosts = Arc::new(start_scripted(
+        &config_with(&["mini3"]),
+        &test_options(&[]),
+        vec![(id.clone(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_over(&hosts);
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::Hub);
+    let roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("live", || {
+        (status_of(&hosts, "mini3").unwrap()["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let address = id.address();
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+    // The lane has dialled its own connection (left unanswered), so the next
+    // dial is the roster's.
+    wait_for("the lane's dial", || {
+        (craze.hook.dials() == 2).then_some(())
+    })
+    .await;
+
+    // The roster ends; the probe still finds a hub; it is gone by the redial.
+    craze
+        .dial
+        .fail_next(DialError::NoHub("craze bridge: no hub is running".into()));
+    roster.close().await;
+    probe.answer(Probe::Hub);
+    wait_for("the source to go dormant", || {
+        (status_of(&hosts, "mini3").unwrap()["craze"]["state"] == "dormant").then_some(())
+    })
+    .await;
+    let status = status_of(&hosts, "mini3").unwrap();
+    assert_eq!(
+        status["craze"]["cause"],
+        Value::Null,
+        "dormant, not offline: {status}"
+    );
+    assert!(
+        craze_rows(&hosts).is_empty(),
+        "nothing is listed from craze"
+    );
+    assert_eq!(craze.hook.dials(), 3, "the roster's one find-only dial");
+    wait_for("the grace to end the lane", || {
+        (lane_state(&lanes, &address, HOST_A) == Some("finished")).then_some(())
+    })
+    .await;
+    assert_eq!(reason(&lanes, &address, HOST_A), "hub_gone");
+
+    // Dormant: the next thing is a probe, and it dials nothing.
+    probe.answer(Probe::NoHub);
+    wait_for("a dormant probe to take its answer", || {
+        lock(&probe.answers).is_empty().then_some(())
+    })
+    .await;
+    assert_eq!(craze.hook.dials(), 3, "a dormant source never redials");
+    assert_eq!(
+        status_of(&hosts, "mini3").unwrap()["craze"]["state"],
+        "dormant"
+    );
+}
+
 /// **A re-registered host never adopts a departing lane** (plan 032 §3.1.1
 /// item 12, W1 cell 14): the lane departs (the roster removed its row), the
 /// host is removed — the lane ends `host_removed` at once, no grace — and is

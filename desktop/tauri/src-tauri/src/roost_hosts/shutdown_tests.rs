@@ -180,6 +180,10 @@ impl CrazeDial for CountingDial {
             Ok(stream)
         })
     }
+
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
+    }
 }
 
 /// Writes `script` to `<dir>/<name>`, executable, under a staging name renamed

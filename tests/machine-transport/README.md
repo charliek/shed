@@ -134,12 +134,13 @@ The corpus's live production composer is **`shed_core::craze`** (plan 025
 C5): the `sh -c '<ladder>'` command every client sends to reach a machine's
 craze hub — craze's published binary-finding ladder (craze's
 `docs/reference/protocol.md`, "SSH exec"), verbatim, plus one change, an
-enhanced PATH applied only at the `exec`. Two scenarios carry it, and they are
-the command itself, not look-alikes:
+enhanced PATH applied only at the `exec`. Three scenarios carry it, and they
+are the command itself, not look-alikes:
 
 | scenario | composer | what it runs |
 |---|---|---|
-| `craze-bridge-hub` | `shed_core::craze::bridge_hub_argv()` | `craze bridge --hub` — every hub connection (it starts a hub if none runs) |
+| `craze-bridge-hub` | `shed_core::craze::bridge_hub_argv()` | `craze bridge --hub` — a hub connection that starts a hub if none runs (this machine's; a remote one's only on an explicit action, or for a craze older than 0.2.0) |
+| `craze-bridge-hub-no-start` | `shed_core::craze::bridge_hub_no_start_argv()` | `craze bridge --hub --no-start` — craze 0.2.0's find-only bridge: a remote machine's background connection, which attaches only to a running hub and never starts one (none is exit 3; plan 032 C6) |
 | `craze-providers-hub` | `shed_core::craze::providers_hub_argv()` | `craze providers --hub --json` — the find-only probe (it never starts one) |
 
 The Rust leg asserts each scenario's argv **equals** its composer's output
@@ -274,7 +275,8 @@ is certainly the developer's, so the recipe needs no uid passed in.
 1. Edit `scenarios.json`. **Bump its `version`** when an existing scenario's
    argv changes, or the contract's shape does. ADDING a scenario is not a
    version change (C5 added `craze-bridge-hub` and `craze-providers-hub` at
-   version 3): a scenario with no golden already fails both legs on its own.
+   version 3, and plan 032 C6 `craze-bridge-hub-no-start`): a scenario with no
+   golden already fails both legs on its own.
 2. Re-record both goldens (`UPDATE_GOLDEN=1`).
 3. On a version bump, update the pinned version in
    `crates/shed-core/tests/machine_transport_contract.rs`.

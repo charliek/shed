@@ -21,7 +21,10 @@ use shed_core::lane::{
 };
 use shed_core::rc::RcActivity;
 use shed_craze::testing::{bins, saved_index_row, HookDial, PathKind, Recipe, RECIPE_WAIT};
-use shed_craze::{is_outcome_unknown, new_request_id, CrazeDial, Probe};
+use shed_craze::{
+    connect_hub, is_outcome_unknown, new_request_id, CrazeDial, DialError, EnvPolicy, Probe,
+    ProcessDial,
+};
 use tokio::sync::mpsc::Receiver;
 
 const FAKE: &str = "0a0a0a0a0a0a";
@@ -711,6 +714,86 @@ async fn too_old_is_offline_too_old_in_both_forms() {
         "{probe:?}"
     );
     recipe.teardown().await.unwrap();
+}
+
+/// `craze bridge --hub --no-start` through the jailed ladder, under exactly
+/// the recipe's variables (plan 032 §3.5).
+fn no_start_dial(recipe: &Recipe) -> ProcessDial {
+    ProcessDial::new(
+        shed_core::craze::bridge_hub_no_start_argv_jailed(),
+        EnvPolicy::Exactly(recipe.env()),
+    )
+    .with_cwd(recipe.root().to_path_buf())
+}
+
+async fn connect_no_start(recipe: &Recipe) -> Result<shed_craze::conn::HubHello, DialError> {
+    let client = shed_craze::wire::ClientInfo::shed("shed-craze-recipe");
+    connect_hub(
+        &no_start_dial(recipe),
+        &client,
+        shed_craze::dial::DIAL_DEADLINE,
+        shed_craze::conn::HELLO_DEADLINE,
+    )
+    .await
+    .map(|(_conn, _notes, hello)| hello)
+}
+
+/// **The find-only bridge against the REAL craze 0.2.0** (plan 032 §3.5):
+/// `bridge --hub --no-start` with no hub running exits 3 with craze's own
+/// line — `DialError::NoHub`, a source's `Offline{NoHub}` — and starts NO
+/// hub; once a hub runs (the plain bridge births one), the same dial attaches
+/// to it. The real v0.0.1 still reads too old through it: its `--hub`
+/// refusal comes first (the classification's precedence).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_no_start_bridge_attaches_only_to_a_running_hub() {
+    let Some(bins) = bins("a_no_start_bridge_attaches_only_to_a_running_hub") else {
+        return;
+    };
+    let recipe = Recipe::start(&bins);
+    let err = connect_no_start(&recipe).await.expect_err("no hub runs");
+    assert!(
+        matches!(&err, DialError::NoHub(m) if m.contains("no hub is running")),
+        "{err:?}"
+    );
+    assert!(
+        recipe.hub_pids().is_empty(),
+        "the find-only bridge started no hub"
+    );
+    {
+        let (mut rx, _stop) = recipe
+            .source_on(Arc::new(no_start_dial(&recipe)))
+            .subscribe()
+            .await
+            .unwrap()
+            .into_parts();
+        let mut checker = SourceChecker::new();
+        let first = drive(&mut rx, &mut checker, "the Offline", |_| true).await;
+        assert!(
+            matches!(
+                &first.frames[0],
+                SourceEvent::Offline {
+                    cause: SourceOffline::NoHub,
+                    ..
+                }
+            ),
+            "{:?}",
+            first.frames
+        );
+    }
+    assert!(recipe.hub_pids().is_empty(), "nor did a source on it");
+
+    // A hub, born by the plain bridge: the find-only one reaches it.
+    recipe.source().create_options().await.unwrap();
+    let hello = connect_no_start(&recipe)
+        .await
+        .expect("a running hub is attached");
+    assert!(hello.capabilities.reopen, "craze 0.2.0's hub");
+    recipe.teardown().await.unwrap();
+
+    let old = Recipe::start_with(&bins, PathKind::TooOld);
+    let err = connect_no_start(&old).await.expect_err("v0.0.1");
+    assert!(matches!(err, DialError::TooOld(_)), "{err:?}");
+    old.teardown().await.unwrap();
 }
 
 /// A teardown cut short — its caller's timeout cancels it mid-way — leaves the

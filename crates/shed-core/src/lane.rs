@@ -188,7 +188,9 @@
 //! [`SourceEvent::Offline`] is **non-terminal**: the source keeps trying, the
 //! client keeps the last `Ready` view and marks it stale with the `cause`
 //! ([`SourceOffline`]; the UI decides what a cause means — `NotInstalled` is
-//! quiet, `TooOld` says "update craze on this machine"), and the next
+//! quiet, `TooOld` says "update craze on this machine", `NoHub` — plan 032 —
+//! is nothing running there to attach to, which the desktop reads as
+//! dormant), and the next
 //! `Reset … Ready` restores it. It is named `Offline`, not `Down`, because
 //! [`LaneEvent::Down`] means "this subscription ENDED" and a source's never does:
 //! a source subscription ends only when its subscriber drops or stops it.
@@ -342,6 +344,15 @@
 //! | `bad_request` | `Lane(BadRequest)` |
 //! | anything else (`not_accepting` with another reason included) | `Lane(Failed)` (craze's message) |
 //! | no answer: the connection ended or the 200 s passed, twice (the first loss is sent again once), or a success shed cannot read | `Unavailable("the reopen's answer was lost; the session may already be running — Retry is safe …")` |
+//!
+//! A dial that never reached a hub has no `data.code` and is not in these
+//! tables: `shed_craze::dial` classifies it from the bridge's exit and stderr.
+//! Its one row keyed on an EXIT CODE is a documented exception of its own, to
+//! that module's "stderr text, never an exit code" rule (plan 032 §3.5,
+//! PC14e): craze's `bridge --hub --no-start` exits 3 when no hub is running —
+//! craze's documented contract for that flag — which is
+//! [`SourceOffline::NoHub`] to a source and `Unavailable("no craze hub is
+//! running")` to a call.
 //!
 //! # The corrections (gx forced, plan 017; gx retired, plan 025)
 //!
@@ -1564,6 +1575,12 @@ pub enum SourceOffline {
     Unreachable,
     /// It answered, and refused.
     Failed,
+    /// It is installed, and nothing is running there to attach to: a dial
+    /// that attaches only to a running agent found none (plan 032 §3.5 —
+    /// craze's `bridge --hub --no-start`, exit 3). Not an outage: a client
+    /// that dials that way reads it as "dormant" (the desktop drops the
+    /// subscription and probes again later), never as "unreachable".
+    NoHub,
     /// An unrecognized cause, its raw wire string preserved.
     Other(String),
 }
@@ -1575,6 +1592,7 @@ impl SourceOffline {
             SourceOffline::TooOld => "too_old",
             SourceOffline::Unreachable => "unreachable",
             SourceOffline::Failed => "failed",
+            SourceOffline::NoHub => "no_hub",
             SourceOffline::Other(s) => s,
         }
     }
@@ -1588,6 +1606,7 @@ impl SourceOffline {
             "too_old" => SourceOffline::TooOld,
             "unreachable" => SourceOffline::Unreachable,
             "failed" => SourceOffline::Failed,
+            "no_hub" => SourceOffline::NoHub,
             other => SourceOffline::Other(other.to_string()),
         }
     }

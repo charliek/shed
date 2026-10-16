@@ -24,30 +24,37 @@
 //!   | phase | how it got here | what runs | leaves on |
 //!   |---|---|---|---|
 //!   | (absent) | started; nothing answered yet | the find-only probe | its first answer |
-//!   | **Dormant** | the probe said `no hub is running` | the probe again in [`DORMANT_PROBE`] | a probe that finds a hub |
-//!   | **Live** | the probe found a hub, then the roster seeded | ONE `bridge --hub` roster connection | the roster's `Offline` (EOF, `hub_closing`, an error) |
+//!   | **Dormant** | the probe said `no hub is running` — or the roster's own `--no-start` dial found none (`Offline{NoHub}`, plan 032 §3.5) | the probe again in [`DORMANT_PROBE`] | a probe that finds a hub |
+//!   | **Live** | the probe found a hub, then the roster seeded | ONE `bridge --hub --no-start` roster connection (`bridge --hub` behind a probe for a craze older than 0.2.0) | the roster's `Offline` (EOF, `hub_closing`, an error) |
 //!   | **Offline** | the roster dropped, or the probe could not ask (unreachable; not installed and too old are offline causes too) | the probe again: after about a second once a live cycle ends (jittered [`PROBE_BACKOFF_BASE`]), on a backoff while unreachable, every [`DORMANT_PROBE`] while not installed or too old | the probe's next answer |
 //!
 //!   After a live cycle ends the probe runs again before anything redials: a
 //!   hub that is gone sends the source back to Dormant (its rows dropped and
 //!   its lanes evicted — the hub is gone, so nothing is listed), and a hub that
-//!   is still there is re-joined.
+//!   is still there is re-joined. The probe stays even where every dial is
+//!   find-only: it is what tells not installed, too old and dormant apart for
+//!   the status line, and what a dormant source waits on.
 //!
-//! * **Every remote `bridge --hub` is probe-gated** ([`SshCrazeDial`]): the
-//!   dialer itself runs the find-only probe on the same ControlMaster before it
-//!   spawns the bridge, and answers `Unreachable` instead when no hub is
-//!   running. That covers the roster's dials AND every lane's background
-//!   reconnects (a lane keeps `Stale`, within its own 10-minute bound, rather
-//!   than birthing a hub), and no caller can bypass it because the rule is in
-//!   the dial. A lane's FIRST open runs the probe too — harmless, its row came
-//!   from a live roster.
-//! * **One race is ACCEPTED, not closed** (plan 025 §3.6.1, recorded again by
-//!   the C9 review): the probe sees a hub that exits before the `bridge --hub`
-//!   behind it joins, and the bridge — which always Ensures a hub — births one,
-//!   ssh-born, with no user action. The probe-then-bridge pair cannot be made
-//!   atomic from this side; craze SF-152 (a find-only `bridge --hub`, reserved
-//!   2026-10-04) removes the race and the probe both. Until then the window is
-//!   the gap between two execs on one ControlMaster.
+//! * **No background remote dial can start a hub** ([`SshCrazeDial`], plan 032
+//!   §3.5). Every remote connection but a user's explicit action — the
+//!   roster's, and every lane's, background reconnects included — is craze
+//!   0.2.0's find-only `bridge --hub --no-start`: it attaches to a running hub,
+//!   or exits 3 (`no hub is running`) and starts nothing. A roster that draws
+//!   that is the source going DORMANT ([`attach_only`]); a lane keeps `Stale`,
+//!   within its own 10-minute bound. There is no probe per dial: the dial
+//!   itself cannot start a hub, so there is nothing to gate, and no caller can
+//!   bypass the rule because it is in the dial.
+//! * **A craze older than 0.2.0 falls back, once per source** ([`DialMode`]):
+//!   it refuses the flag (`craze bridge: unknown or malformed flag`, exit 1),
+//!   and the dial — ONE per host, shared by the roster and every lane — swaps
+//!   for good to the older way: the find-only probe on the same ControlMaster
+//!   first, then `bridge --hub`, `Unreachable` when no hub is running. On that
+//!   legacy path **one race remains, ACCEPTED** (plan 025 §3.6.1): the probe
+//!   sees a hub that exits before the `bridge --hub` behind it joins, and the
+//!   bridge — which always Ensures a hub — births one, ssh-born, with no user
+//!   action. The pair cannot be made atomic from this side; craze 0.2.0's
+//!   `--no-start` is what closes it. A new source (a host registered again, a
+//!   restart) builds a new dial, back on `--no-start`.
 //! * **A hub is born remotely only by an explicit user action** (plan 025
 //!   §3.6.1, C10): opening the create sheet (its `create_options`) and the
 //!   create itself run through the host's UNGATED dial,
@@ -86,6 +93,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,7 +136,9 @@ pub trait CrazeProbe: Send + Sync {
 pub struct CrazeReach {
     pub dial: Arc<dyn CrazeDial>,
     /// `None`: EAGER (this machine). `Some`: ATTACH-ONLY (a remote machine or
-    /// a shed) — and its dial is probe-gated too.
+    /// a shed) — and its dial reaches only a running hub too (`bridge --hub
+    /// --no-start`, or probe-gated for a craze older than 0.2.0:
+    /// [`SshCrazeDial`]).
     pub probe: Option<Arc<dyn CrazeProbe>>,
     /// The dial a user's EXPLICIT action runs through — the create sheet's
     /// `create_options` and the create (the module doc): an attach-only host's
@@ -157,7 +167,7 @@ impl Default for CrazeTimings {
 }
 
 // ---------------------------------------------------------------------------
-// the ssh probe and the probe-gated ssh dial
+// the ssh probe and the attach-only ssh dial
 // ---------------------------------------------------------------------------
 
 /// The find-only probe over a host's `SshExec` — a one-shot `run` on the
@@ -213,19 +223,45 @@ impl CrazeProbe for SshCrazeProbe {
     }
 }
 
-/// A remote host's dial: **probe-gated** `craze bridge --hub` over
-/// [`SshExec::spawn_duplex`] (the module doc). Every connection — the roster's
-/// and every lane's — asks the find-only probe first, and a host with no hub
-/// running is `Unreachable`, never a hub this app births in the background.
+/// How an attach-only [`SshCrazeDial`] reaches its hub (plan 032 §3.5) — ONE
+/// mode per dial, and one dial per source, shared by its roster and every lane
+/// it opens (`crate::machines::build_ssh_craze`), so the first refusal moves
+/// them all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DialMode {
+    /// craze 0.2.0+: `bridge --hub --no-start`, no probe in front — it
+    /// attaches to a running hub or exits 3, and never starts one.
+    NoStart = 0,
+    /// Fallen back for a craze older than 0.2.0: the find-only probe, then
+    /// `bridge --hub` (the module doc's accepted race).
+    Legacy = 1,
+}
+
+/// A remote host's dial over [`SshExec::spawn_duplex`] (the module doc): every
+/// connection — the roster's and every lane's — reaches only a hub that is
+/// already running, and a host with none is never given one by a background
+/// dial. In [`DialMode::NoStart`] that is craze's own `bridge --hub
+/// --no-start`; in [`DialMode::Legacy`] the find-only probe gates a `bridge
+/// --hub`, and a host with no hub is `Unreachable`.
 ///
 /// The one UNGATED instance ([`Self::ungated`]) is the host's
-/// [`CrazeReach::ensure`]: only a user's explicit action dials it.
+/// [`CrazeReach::ensure`]: only a user's explicit action dials it, and it runs
+/// `bridge --hub`, which may start a hub.
 pub struct SshCrazeDial {
     exec: Arc<SshExec>,
-    /// `display_line` of the bridge form (production, or jailed in test mode).
+    /// `display_line` of the bridge form (production, or jailed in test mode):
+    /// what [`Self::ungated`] and [`DialMode::Legacy`] run.
     bridge: String,
+    /// `display_line` of the `--no-start` form — what [`DialMode::NoStart`]
+    /// runs. `None` only for [`Self::ungated`].
+    no_start: Option<String>,
+    /// The find-only probe [`DialMode::Legacy`] runs in front of the bridge.
     /// `None` only for [`Self::ungated`].
     probe: Option<Arc<dyn CrazeProbe>>,
+    /// A [`DialMode`] (`as u8`): `NoStart` until a refusal of the flag moves
+    /// it to `Legacy` ([`CrazeDial::fall_back`]), for good.
+    mode: AtomicU8,
     /// The app's spawn gate (plan 026 §3.3). This dial takes its section
     /// around the `spawn_duplex` and the child's registration ALONE — not
     /// around the find-only probe in front of them, which can take
@@ -235,24 +271,36 @@ pub struct SshCrazeDial {
 }
 
 impl SshCrazeDial {
-    pub fn new(exec: Arc<SshExec>, bridge: String, probe: Arc<dyn CrazeProbe>) -> Self {
+    /// An attach-only dial: `no_start` first, falling back to `probe` +
+    /// `bridge` for a craze older than 0.2.0.
+    pub fn new(
+        exec: Arc<SshExec>,
+        bridge: String,
+        no_start: String,
+        probe: Arc<dyn CrazeProbe>,
+    ) -> Self {
         Self {
             exec,
             bridge,
+            no_start: Some(no_start),
             probe: Some(probe),
+            mode: AtomicU8::new(DialMode::NoStart as u8),
             gate: None,
         }
     }
 
-    /// The same bridge with NO probe in front: it Ensures a hub on the far side
-    /// whether or not one runs. For [`CrazeReach::ensure`] only — the create
-    /// sheet's `create_options` and the create, a user's explicit action.
+    /// The bridge with NO probe in front and no `--no-start`: it Ensures a hub
+    /// on the far side whether or not one runs. For [`CrazeReach::ensure`]
+    /// only — the create sheet's `create_options` and the create, a user's
+    /// explicit action. It never falls back: it has nothing to fall back from.
     /// ("Ungated" names the PROBE gate; the spawn gate is [`Self::with_spawn_gate`].)
     pub fn ungated(exec: Arc<SshExec>, bridge: String) -> Self {
         Self {
             exec,
             bridge,
+            no_start: None,
             probe: None,
+            mode: AtomicU8::new(DialMode::Legacy as u8),
             gate: None,
         }
     }
@@ -261,6 +309,15 @@ impl SshCrazeDial {
     pub fn with_spawn_gate(mut self, gate: Option<SpawnGate>) -> Self {
         self.gate = gate;
         self
+    }
+
+    /// The mode the next dial runs in.
+    pub fn mode(&self) -> DialMode {
+        if self.mode.load(Ordering::Acquire) == DialMode::NoStart as u8 {
+            DialMode::NoStart
+        } else {
+            DialMode::Legacy
+        }
     }
 }
 
@@ -274,13 +331,18 @@ pub fn no_hub(label: &str) -> DialError {
 impl CrazeDial for SshCrazeDial {
     fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
         let exec = Arc::clone(&self.exec);
-        let bridge = self.bridge.clone();
         let gate = self.gate.clone();
         // A closed gate refuses before the probe, too: a clean early answer.
         if gate.as_ref().is_some_and(SpawnGate::is_closed) {
             return Box::pin(async { Err(shutting_down_dial()) });
         }
-        let probe = self.probe.as_ref().map(|p| p.probe());
+        // NoStart: the find-only bridge, with NO probe in front — it cannot
+        // start a hub, so there is nothing to gate. Legacy (and the ungated
+        // dial, which has no probe): the bridge, behind the probe if any.
+        let (bridge, probe) = match (&self.no_start, self.mode()) {
+            (Some(no_start), DialMode::NoStart) => (no_start.clone(), None),
+            _ => (self.bridge.clone(), self.probe.as_ref().map(|p| p.probe())),
+        };
         Box::pin(async move {
             match probe {
                 None => {}
@@ -314,6 +376,37 @@ impl CrazeDial for SshCrazeDial {
                 _ => Ok(stream),
             }
         })
+    }
+
+    /// **The `--no-start` fallback** (plan 032 PC12): craze refused the flag,
+    /// so it is older than 0.2.0 — swap this dial (the roster's and every
+    /// lane's: one dial per source) to [`DialMode::Legacy`] and answer `true`,
+    /// so `connect_hub` dials once more, the older way. ONCE: a dial already
+    /// `Legacy` — another dial's refusal won the swap, or this is the ungated
+    /// one — answers `false`, and the refusal it was offered stands (it reads
+    /// as `Unreachable`; the source or lane redials on its own clock, legacy
+    /// from then on).
+    fn fall_back(&self, err: &DialError) -> bool {
+        if !matches!(err, DialError::NoStartUnsupported(_)) || self.no_start.is_none() {
+            return false;
+        }
+        let swapped = self
+            .mode
+            .compare_exchange(
+                DialMode::NoStart as u8,
+                DialMode::Legacy as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if swapped {
+            app_info!(
+                "shed-desktop-tauri: craze on {} does not know `bridge --hub --no-start` \
+                 (older than 0.2.0): its dials probe before `bridge --hub` from now on ({err})",
+                self.exec.label()
+            );
+        }
+        swapped
     }
 }
 
@@ -388,6 +481,11 @@ impl CrazeDial for GatedDial {
                 .await
                 .map_err(|_| shutting_down_dial())
         })
+    }
+
+    /// A wrapper forwards the fallback it wraps (`CrazeDial::fall_back`).
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
     }
 }
 
@@ -505,6 +603,12 @@ impl CrazeDial for TrackedDial {
     fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
         self.inner.dial()
     }
+
+    /// Forwarded: the source's roster and lanes dial through THIS wrapper, so
+    /// a host's `--no-start` fallback (plan 032 §3.5) is only reached here.
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
+    }
 }
 
 /// `inner`, tracked: the dial to build a source on, and a receiver that
@@ -528,6 +632,12 @@ struct Tethered {
 impl CrazeDial for Tethered {
     fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
         self.inner.dial()
+    }
+
+    /// Forwarded, as every wrapper does (the ungated dial inside never
+    /// sends `--no-start`, so it never takes one).
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
     }
 }
 
@@ -1115,10 +1225,23 @@ async fn attach_only(
                 };
                 let (mut rx, stop) = subscription.into_parts();
                 let mut reached = false;
+                let mut no_hub = false;
                 loop {
                     let Some(event) = rx.recv().await else {
                         return;
                     };
+                    // **The hub went between the probe and the roster's dial**
+                    // (plan 032 §3.5): its `--no-start` found none, and started
+                    // none. That is no outage — nothing runs there — so the
+                    // source is DORMANT, not offline.
+                    if let SourceEvent::Offline {
+                        cause: SourceOffline::NoHub,
+                        ..
+                    } = &event
+                    {
+                        no_hub = true;
+                        break;
+                    }
                     let offline = matches!(event, SourceEvent::Offline { .. });
                     reached |= matches!(event, SourceEvent::Ready { .. });
                     if !sink.event(event) {
@@ -1132,6 +1255,16 @@ async fn attach_only(
                 // probe say whether there is still a hub to re-join.
                 drop(stop);
                 drop(rx);
+                if no_hub {
+                    // As a probe's `NoHub` below: dormant, and the next probe on
+                    // the dormant clock.
+                    if !sink.dormant() {
+                        return;
+                    }
+                    backoff = t.backoff_base;
+                    wait(t.dormant, &wake).await;
+                    continue;
+                }
                 backoff = next_backoff(backoff, reached, t.backoff_base, t.backoff_max);
                 wait(
                     jittered(if reached { t.backoff_base } else { backoff }),
@@ -1345,39 +1478,68 @@ mod tests {
         assert_eq!(s.status()["state"], "dormant");
     }
 
-    /// A probe with one fixed answer.
-    struct FixedProbe(Probe);
+    /// A probe with one fixed answer, counting the times it is asked.
+    struct FixedProbe(Probe, Arc<std::sync::atomic::AtomicUsize>);
+
+    impl FixedProbe {
+        fn counted(answer: Probe) -> (Arc<dyn CrazeProbe>, Arc<std::sync::atomic::AtomicUsize>) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (Arc::new(FixedProbe(answer, Arc::clone(&calls))), calls)
+        }
+    }
 
     impl CrazeProbe for FixedProbe {
         fn probe(&self) -> BoxFut<Probe> {
+            self.1.fetch_add(1, Ordering::SeqCst);
             let answer = self.0.clone();
             Box::pin(async move { answer })
         }
     }
 
-    /// **A remote dial is probe-gated** (plan 025 §3.6.1): with no hub running
-    /// it answers `Unreachable` and never spawns `bridge --hub` over ssh — so
-    /// no caller (the roster's redial, a lane's background reconnect) can birth
-    /// a remote hub through it; not installed and too old keep their causes; a
-    /// hub that is there gets its duplex.
-    #[tokio::test]
-    async fn a_remote_dial_spawns_no_bridge_unless_the_probe_found_a_hub() {
+    /// A fake `ssh` under `dir`: records each remote command (its last
+    /// argument, one line each) to `<dir>/ssh.log`, ignores `-O` control
+    /// commands, and then answers it by its text:
+    ///
+    /// * `*--no-start*` — runs `<dir>/no-start.sh` when it exists (a case's
+    ///   own ending: 0.1.x's refusal, exit 3, …), else a duplex (`cat`);
+    /// * `*providers*` — a hub's `createOptions` answer, exit 0 (the probe
+    ///   finds a hub);
+    /// * anything else — a HUB: it answers the client's first line (a hub
+    ///   `hello`, id `"1"`) with `hello`, then drains its stdin.
+    ///
+    /// Written under a staging name and renamed into place (a script still
+    /// open for writing while a sibling test forks answers `execve` with
+    /// ETXTBSY).
+    fn fake_ssh(dir: &std::path::Path) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let log = dir.path().join("ssh.log");
-        let ssh = dir.path().join("ssh");
-        // A fake ssh: records its remote command (the last argument), then
-        // runs as a duplex (`cat`) until its stdin closes.
-        std::fs::write(
-            &ssh,
-            format!(
-                "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '%s\\n' \"$last\" >> '{}'\nexec cat\n",
-                log.display()
-            ),
-        )
-        .expect("write");
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let hello = json!({"jsonrpc": "2.0", "id": "1",
+                           "result": shed_craze::testing::hub_hello_result(
+                               "0a1b2c3d4e5f", shed_craze::testing::reopen_hub_capabilities())});
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do [ \"$a\" = -O ] && exit 0; last=\"$a\"; done\n\
+             printf '%s\\n' \"$last\" >> '{log}'\n\
+             case \"$last\" in\n\
+             *--no-start*) if [ -e '{ns}' ]; then exec /bin/sh '{ns}'; fi; exec cat ;;\n\
+             *providers*) printf '%s\\n' '{{\"providers\":[],\"recentDirs\":[]}}'; exit 0 ;;\n\
+             esac\n\
+             IFS= read -r line\n\
+             printf '%s\\n' '{hello}'\n\
+             exec cat >/dev/null\n",
+            log = dir.join("ssh.log").display(),
+            ns = dir.join("no-start.sh").display(),
+        );
+        let staged = dir.join("ssh.staging");
+        let ssh = dir.join("ssh");
+        std::fs::write(&staged, script).expect("write");
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::rename(&staged, &ssh).expect("rename");
+        ssh
+    }
+
+    /// An `SshExec` for "mini3" through the fake `ssh` under `dir`.
+    fn fake_exec(dir: &std::path::Path) -> Arc<SshExec> {
         let entry = shed_core::config::MachineEntry {
             name: "mini3".to_string(),
             host: "mini3".to_string(),
@@ -1385,19 +1547,63 @@ mod tests {
             ..Default::default()
         };
         let options = shed_app::roost::SshBridgeOptions {
-            ssh_bin: Some(ssh),
+            ssh_bin: Some(fake_ssh(dir)),
             ..Default::default()
         };
-        let exec = Arc::new(SshExec::new(&entry, &options).expect("exec"));
-        let dial = |probe: Probe| {
-            SshCrazeDial::new(
-                Arc::clone(&exec),
-                "BRIDGE-HUB".to_string(),
-                Arc::new(FixedProbe(probe)),
-            )
-        };
+        Arc::new(SshExec::new(&entry, &options).expect("exec"))
+    }
 
-        let err = dial(Probe::NoHub).dial().await.err().expect("no hub");
+    /// The remote commands the fake `ssh` under `dir` recorded, in order —
+    /// once `want` of them have landed (a spawned child records a moment
+    /// after the dial answers).
+    async fn recorded(dir: &std::path::Path, want: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for _ in 0..500 {
+            lines = std::fs::read_to_string(dir.join("ssh.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            if lines.len() >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        lines
+    }
+
+    /// `connect_hub` through `dial`, as the source and the lanes run it.
+    async fn connect(
+        dial: &dyn CrazeDial,
+    ) -> Result<(shed_craze::conn::Conn, shed_craze::conn::Notifications), DialError> {
+        let client = shed_craze::wire::ClientInfo::shed("t");
+        shed_craze::connect_hub(
+            dial,
+            &client,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .await
+        .map(|(conn, notes, _hello)| (conn, notes))
+    }
+
+    /// The probe's verdicts a LEGACY dial turns into errors without spawning
+    /// anything: no hub is `Unreachable` in this app's words, and not
+    /// installed / too old / unreachable keep their causes.
+    async fn assert_legacy_gate(exec: &Arc<SshExec>, dir: &std::path::Path) {
+        let legacy = |probe: Probe| {
+            let (probe, _) = FixedProbe::counted(probe);
+            let dial = SshCrazeDial::new(
+                Arc::clone(exec),
+                "BRIDGE-HUB".to_string(),
+                "NO-START-HUB --no-start".to_string(),
+                probe,
+            );
+            assert!(dial.fall_back(&DialError::NoStartUnsupported("x".into())));
+            dial
+        };
+        let before = recorded(dir, 0).await.len();
+        let err = legacy(Probe::NoHub).dial().await.err().expect("no hub");
         assert!(
             matches!(&err, DialError::Unreachable(m) if m.contains("no craze hub is running")),
             "{err:?}"
@@ -1407,7 +1613,7 @@ mod tests {
             (SourceOffline::TooOld, "TooOld"),
             (SourceOffline::Unreachable, "Unreachable"),
         ] {
-            let err = dial(Probe::Offline {
+            let err = legacy(Probe::Offline {
                 cause,
                 reason: "said".to_string(),
             })
@@ -1417,45 +1623,222 @@ mod tests {
             .expect("offline");
             assert!(format!("{err:?}").starts_with(want), "{err:?}");
         }
-        assert!(
-            !log.exists(),
+        assert_eq!(
+            recorded(dir, 0).await.len(),
+            before,
             "no ssh ran while the probe said there was nothing to join"
         );
+    }
 
-        let stream = dial(Probe::Hub).dial().await.expect("a hub: its duplex");
-        // The child is spawned when the dial answers; it records a moment later.
-        let mut recorded = String::new();
-        for _ in 0..500 {
-            recorded = std::fs::read_to_string(&log).unwrap_or_default();
-            if !recorded.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(recorded.trim(), "BRIDGE-HUB", "the bridge ran over ssh");
+    /// **A remote dial reaches only a hub that is already running** (plan 032
+    /// §3.5; plan 025 §3.6.1 before it). In `NoStart` it spawns the find-only
+    /// `bridge --hub --no-start` and asks NO probe — it cannot start a hub, so
+    /// there is nothing to gate. Fallen back to `Legacy`, it is probe-gated:
+    /// with no hub running it answers `Unreachable` and never spawns `bridge
+    /// --hub` over ssh, not installed and too old keep their causes, and a
+    /// hub that is there gets its duplex. The UNGATED instance —
+    /// `CrazeReach::ensure`, a user's explicit action — asks no probe and runs
+    /// the plain bridge, and has no fallback to take.
+    #[tokio::test]
+    async fn a_remote_dial_reaches_only_a_running_hub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exec = fake_exec(dir.path());
+
+        // NoStart: the find-only bridge, no probe.
+        let (probe, asked) = FixedProbe::counted(Probe::NoHub);
+        let dial = SshCrazeDial::new(
+            Arc::clone(&exec),
+            "BRIDGE-HUB".to_string(),
+            "NO-START-HUB --no-start".to_string(),
+            probe,
+        );
+        assert_eq!(dial.mode(), DialMode::NoStart);
+        let stream = dial
+            .dial()
+            .await
+            .expect("a no-start dial spawns its bridge");
+        assert_eq!(recorded(dir.path(), 1).await, ["NO-START-HUB --no-start"]);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "no probe per dial");
         drop(stream);
 
-        // The UNGATED instance — a user's explicit action, `CrazeReach::ensure`
-        // — asks no probe: it runs the bridge, which Ensures a hub.
-        std::fs::remove_file(&log).expect("rm log");
-        let stream = SshCrazeDial::ungated(Arc::clone(&exec), "ENSURE-HUB".to_string())
+        // Only a no-start refusal is taken, and only once.
+        for unrelated in [
+            DialError::Unreachable("craze bridge: no hub: x".into()),
+            DialError::TooOld("unknown flag: --hub".into()),
+            DialError::NotInstalled("exit 127".into()),
+            DialError::NoHub("exit 3".into()),
+        ] {
+            assert!(!dial.fall_back(&unrelated), "{unrelated:?}");
+            assert_eq!(dial.mode(), DialMode::NoStart, "{unrelated:?}");
+        }
+        let refused =
+            DialError::NoStartUnsupported("craze bridge: unknown or malformed flag".into());
+        assert!(dial.fall_back(&refused), "the first refusal swaps the mode");
+        assert_eq!(dial.mode(), DialMode::Legacy);
+        assert!(
+            !dial.fall_back(&refused),
+            "once: Legacy has nothing to fall back to"
+        );
+
+        // Legacy: probe-gated.
+        assert_legacy_gate(&exec, dir.path()).await;
+        let (probe, asked) = FixedProbe::counted(Probe::Hub);
+        let legacy = SshCrazeDial::new(
+            Arc::clone(&exec),
+            "BRIDGE-HUB".to_string(),
+            "NO-START-HUB --no-start".to_string(),
+            probe,
+        );
+        assert!(legacy.fall_back(&refused));
+        let stream = legacy.dial().await.expect("a hub: its duplex");
+        assert_eq!(
+            recorded(dir.path(), 2).await,
+            ["NO-START-HUB --no-start", "BRIDGE-HUB"],
+            "the probe found a hub, then the plain bridge ran over ssh"
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        drop(stream);
+
+        // The UNGATED instance asks no probe, runs the plain bridge, and never
+        // falls back.
+        let ungated = SshCrazeDial::ungated(Arc::clone(&exec), "ENSURE-HUB".to_string());
+        let stream = ungated
             .dial()
             .await
             .expect("an ungated dial always spawns its bridge");
-        let mut recorded = String::new();
-        for _ in 0..500 {
-            recorded = std::fs::read_to_string(&log).unwrap_or_default();
-            if !recorded.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         assert_eq!(
-            recorded.trim(),
-            "ENSURE-HUB",
+            recorded(dir.path(), 3).await.last().map(String::as_str),
+            Some("ENSURE-HUB"),
             "no probe, straight to the bridge"
         );
+        assert!(!ungated.fall_back(&refused));
         drop(stream);
+    }
+
+    /// **A refusal of `--no-start` falls back ONCE for the whole source**
+    /// (plan 032 PC12): the roster and a lane dial concurrently through the
+    /// source's ONE dial — the reach `build_ssh_craze` builds, tracked as
+    /// `RoostHosts::start_craze` tracks it, so the wrapper's forwarding is
+    /// under test too — both draw the 0.1.x refusal, the mode swaps once, and
+    /// the dial that won the swap redials the older way (the probe, then
+    /// `bridge --hub`) and goes live. The other's refusal stands, and reads as
+    /// `Unreachable`; its retry, and every dial after, is legacy — no
+    /// `--no-start` is ever sent again by this source. A NEW source — the
+    /// host registered again — builds a new dial, back on `--no-start`.
+    #[tokio::test]
+    async fn a_refused_no_start_falls_back_once_for_every_dial_of_the_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exec = fake_exec(dir.path());
+        // 0.1.x: a moment, then the refusal — so both dials spawn before either
+        // is classified.
+        std::fs::write(
+            dir.path().join("no-start.sh"),
+            "sleep 0.3\nprintf '%s\\n' 'craze bridge: unknown or malformed flag; see craze bridge --help' >&2\nexit 1\n",
+        )
+        .expect("write");
+        let options = crate::machines::ReachOptions::default();
+        let reach = crate::machines::build_ssh_craze(Arc::clone(&exec), &options)
+            .expect("a production remote reach");
+        let (dial, _gone) = tracked(Arc::clone(&reach.dial));
+        let no_starts = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|l| l.contains("bridge --hub --no-start"))
+                .count()
+        };
+
+        let (roster, lane) = tokio::join!(connect(dial.as_ref()), connect(dial.as_ref()));
+        let (won, lost) = match (roster, lane) {
+            (Ok(won), Err(lost)) | (Err(lost), Ok(won)) => (won, lost),
+            (r, l) => panic!(
+                "exactly one dial wins the swap: roster {:?}, lane {:?}",
+                r.err(),
+                l.err()
+            ),
+        };
+        assert!(matches!(lost, DialError::NoStartUnsupported(_)), "{lost:?}");
+        assert_eq!(
+            lost.cause(),
+            SourceOffline::Unreachable,
+            "unconsumed: as Unreachable"
+        );
+        let lines = recorded(dir.path(), 4).await;
+        assert_eq!(no_starts(&lines), 2, "{lines:#?}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("providers --hub --json"))
+                .count(),
+            1,
+            "the ONE fallback probed once: {lines:#?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("bridge --hub") && !l.contains("--no-start"))
+                .count(),
+            1,
+            "and dialled the plain bridge once: {lines:#?}"
+        );
+        drop(won);
+
+        // The loser's retry — and every dial after — is legacy.
+        let (_conn, _notes) = connect(dial.as_ref()).await.expect("legacy: live");
+        let lines = recorded(dir.path(), 6).await;
+        assert_eq!(
+            no_starts(&lines),
+            2,
+            "no --no-start after the swap: {lines:#?}"
+        );
+
+        // A new source generation: a new dial, back on --no-start.
+        std::fs::remove_file(dir.path().join("no-start.sh")).expect("rm");
+        let again = crate::machines::build_ssh_craze(Arc::clone(&exec), &options)
+            .expect("the host registered again");
+        let (dial, _gone) = tracked(Arc::clone(&again.dial));
+        let stream = dial.dial().await.expect("a duplex");
+        let lines = recorded(dir.path(), 7).await;
+        assert_eq!(
+            no_starts(&lines),
+            3,
+            "the new source dials --no-start: {lines:#?}"
+        );
+        drop(stream);
+    }
+
+    /// **Precedence holds through the real dial** (plan 032 PC12): a
+    /// `--no-start` that exits 127, says v0.0.1's `unknown flag: --hub`, fails
+    /// with an unrelated exit 1, or finds no hub (exit 3) is classified as
+    /// such — and none of them moves the mode or redials.
+    #[tokio::test]
+    async fn only_a_refusal_of_the_flag_falls_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exec = fake_exec(dir.path());
+        let options = crate::machines::ReachOptions::default();
+        let reach = crate::machines::build_ssh_craze(Arc::clone(&exec), &options).expect("reach");
+        let (dial, _gone) = tracked(Arc::clone(&reach.dial));
+        let cases: [(&str, &str); 4] = [
+            ("printf '%s\\n' 'sh: 1: craze: not found' >&2; exit 127\n", "NotInstalled"),
+            ("printf '%s\\n' 'Error: unknown flag: --hub' >&2; exit 1\n", "TooOld"),
+            (
+                "printf '%s\\n' 'craze bridge: no hub: the runtime dir is group-writable' >&2; exit 1\n",
+                "Unreachable",
+            ),
+            ("printf '%s\\n' 'craze bridge: no hub is running' >&2; exit 3\n", "NoHub"),
+        ];
+        for (i, (ending, want)) in cases.iter().enumerate() {
+            std::fs::write(dir.path().join("no-start.sh"), ending).expect("write");
+            let err = connect(dial.as_ref()).await.err().expect("no hub here");
+            assert!(format!("{err:?}").starts_with(want), "{want}: {err:?}");
+            let lines = recorded(dir.path(), i + 1).await;
+            assert_eq!(lines.len(), i + 1, "one dial, no fallback: {lines:#?}");
+            assert!(
+                lines.iter().all(|l| l.contains("bridge --hub --no-start")),
+                "still --no-start: {lines:#?}"
+            );
+        }
+        let no_hub = connect(dial.as_ref()).await.err().expect("no hub");
+        assert_eq!(no_hub.cause(), SourceOffline::NoHub);
     }
 
     /// **A roster-listed row is folded ahead of its frame** (plan 025

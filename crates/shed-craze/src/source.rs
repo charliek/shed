@@ -43,6 +43,12 @@
 //!   retry (the ceiling), so installing craze lights the machine up without a
 //!   restart. An `Offline` is said once per distinct cause and reason, not per
 //!   attempt.
+//! - A dial that attaches only to a running hub (the desktop's remote `bridge
+//!   --hub --no-start`, plan 032 §3.5) and finds none is `Offline{NoHub}`
+//!   ([`crate::dial::DialError::NoHub`]) — not an outage, nothing to attach
+//!   to. The source redials on its ordinary backoff like any `Offline`; the
+//!   desktop, whose attach-only loop drops a subscription at its first
+//!   `Offline`, reads this one as DORMANT and probes again on its slow clock.
 //! - The channel's overflow (module doc correction 13) ends the cycle with
 //!   the connection dropped, waits for the client to drain holding nothing,
 //!   backs off, and reseeds as `Reset{lagged} … Ready`.

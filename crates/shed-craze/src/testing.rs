@@ -874,6 +874,11 @@ impl CrazeDial for HookDial {
             Ok(CrazeStream::from_parts(r, w, tail, exit))
         })
     }
+
+    /// A wrapper forwards the fallback it wraps (the trait's rule).
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
+    }
 }
 
 /// A write half that holds its connection's reads, and says so, the moment a
@@ -1540,6 +1545,11 @@ impl CrazeDial for TeeDial {
             });
             Ok(CrazeStream::from_parts(r, w, tail, exit))
         })
+    }
+
+    /// A wrapper forwards the fallback it wraps (the trait's rule).
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
     }
 }
 

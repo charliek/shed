@@ -10,7 +10,7 @@ and `craze-0.0.1` (the real v0.0.1, for the too-old cell). They come from
 `SHED_CRAZE_REQUIRE=1` (CI) it FAILS instead, so a run can never go green on
 skipped craze cells.
 
-Four independent app instances (`test_tauri_lane.py`'s fixture shape — each
+Five independent app instances (`test_tauri_lane.py`'s fixture shape — each
 its own throwaway HOME/XDG_RUNTIME_DIR, so its own socket and single-instance
 lock, the session app untouched):
 
@@ -44,6 +44,11 @@ lock, the session app untouched):
   through the same fake `ssh` in a jail of its own (a shed's ssh user is its
   name) and none running a roost-session — the running sheds a dormant craze
   is offered on without listing them.
+* `app_no_start` (plan 032 §3.5, W5) — no local craze; two remote machines
+  through the same fake `ssh`, each with a hub running before launch and a
+  switch set before the app's first dial: one whose roster dial is held so
+  its hub can end between the probe and the `--no-start` bridge, and one
+  emulating a craze older than 0.2.0 (`--no-start` refused).
 
 **Every craze process is torn down** at module end by its program path (each
 rig's private copies, never this host's own craze), checked just before each
@@ -3094,11 +3099,17 @@ def _fake_ssh(root: Path) -> str:
       becomes the craze process itself: its recorded pid (`pids/<record>`) is
       the bridge, and signalling it ends the connection the way a dropped ssh
       would (plan 026 §3.2).
-    * Two switches in the JAIL's root (plan 026 §3.2): `probe-127` makes the
+    * Switches in the JAIL's root (plan 026 §3.2): `probe-127` makes the
       find-only probe exit 127 (the ladder's not-found) before running
       anything; `hold-roster` (its content a number N) holds the (N+1)-th
-      `bridge --hub` of that jail — recording its record's name in `held` —
-      until the switch is removed, and lets every other one through.
+      `bridge --hub` of that jail — `--no-start` or not — recording its
+      record's name in `held`, until the switch is removed, and lets every
+      other one through.
+    * **`bridge --hub --no-start`** (plan 032 §3.5) is matched BEFORE the
+      plain bridge: it runs the REAL 0.2.0 bridge with the flag (attach to a
+      running hub, else exit 3 and start none) — unless the jail's `craze-0.1`
+      switch exists, which emulates a craze older than 0.2.0: the flag
+      refused with 0.1.x's own line, exit 1, nothing run.
     """
     return f"""#!/bin/sh
 set -u
@@ -3165,6 +3176,14 @@ if [ ! -d "$jail" ]; then
     printf '%s\\n' "ssh: Could not resolve hostname $dest" >&2
     exit 255
 fi
+case "$cmd" in
+  *"bridge --hub --no-start"*)
+    if [ -e "$jail/craze-0.1" ]; then
+        printf '%s\\n' 'craze bridge: unknown or malformed flag; see craze bridge --help' >&2
+        exit 1
+    fi
+    ;;
+esac
 case "$cmd" in
   *"providers --hub --json"*)
     if [ -e "$jail/probe-127" ]; then
@@ -3303,6 +3322,62 @@ def test_a_remote_hub_is_attached_over_ssh(app_remote):
     assert row["origin"] == "machine:craze-live" and row["source"] == "craze", row
 
 
+def _craze_records(rig: "Remote", user: str) -> list["Record"]:
+    """`user`'s craze commands (roost's own bootstrap steps left out), in
+    order."""
+    return [r for r in rig.records(user) if "craze" in r.text]
+
+
+def _is_probe(text: str) -> bool:
+    return "providers --hub --json" in text
+
+
+def _is_no_start(text: str) -> bool:
+    return "bridge --hub --no-start" in text
+
+
+def _is_plain_bridge(text: str) -> bool:
+    return "bridge --hub" in text and "--no-start" not in text
+
+
+def _live_hubs(env: "CrazeEnv") -> list[int]:
+    """The hubs of `env`'s namespace still running ITS private craze — a
+    record whose pid is gone (a hub stopped by signal) is not one."""
+    return [pid for pid in env.hub_pids() if _program_args(pid).startswith(str(env.real))]
+
+
+def test_a_live_remote_roster_dials_no_start_and_probes_once(app_remote, remote):
+    """**A remote roster attaches with `--no-start`** (plan 032 §3.5): the
+    live machine was probed ONCE, then its roster dialled craze 0.2.0's
+    find-only `bridge --hub --no-start` — no second probe in front of it, and
+    never a plain `bridge --hub`. A lane opened on its row dials the same way
+    with no probe of its own: nothing a background dial runs can start a hub."""
+    machine = "craze-live"
+    app_remote.wait_until(lambda: _craze_state(app_remote, machine).get("state") == "live",
+                          timeout=WAIT, what="the live remote's craze attached")
+    recs = _craze_records(remote, machine)
+    first = next((i for i, r in enumerate(recs) if _is_no_start(r.text)), None)
+    assert first is not None, f"the roster dialled --no-start: {recs}"
+    assert [_is_probe(r.text) for r in recs[:first]] == [True], \
+        f"exactly one probe, then the roster's --no-start: {recs}"
+    assert not any(_is_plain_bridge(r.text) for r in recs), f"a plain bridge --hub ran: {recs}"
+
+    probes = sum(_is_probe(r.text) for r in recs)
+    no_starts = sum(_is_no_start(r.text) for r in recs)
+    args = {"machine": machine, "kind": KIND, "session_id": "0d0d0d0d0d0d"}
+    app_remote.call("lane.open", args)
+    try:
+        app_remote.wait_until(lambda: app_remote.call("lane.messages", args)["generation"] >= 1,
+                              timeout=WAIT, what="the seeded remote craze lane")
+        recs = _craze_records(remote, machine)
+        assert sum(_is_no_start(r.text) for r in recs) > no_starts, \
+            f"the lane dialled --no-start: {recs}"
+        assert sum(_is_probe(r.text) for r in recs) == probes, f"the lane asked no probe: {recs}"
+        assert not any(_is_plain_bridge(r.text) for r in recs), recs
+    finally:
+        app_remote.call("lane.close", args)
+
+
 def test_no_remote_hub_is_born_while_dormant(app_remote, remote):
     """**Attach-only** (plan 025 §3.6.1): a remote machine with craze and NO hub
     stays dormant — the fake ssh recorded the find-only probe and never a
@@ -3399,6 +3474,159 @@ def test_the_sheet_on_a_dormant_machine_starts_its_hub_and_attaches(app_remote, 
     assert "Name" in _sheet(app_remote)["values"], _sheet(app_remote)["values"]
     _shot(app_remote, "craze-create-dormant.png")
     _close_sheet(app_remote)
+
+
+# ---------------------------------------------------------------------------
+# (5b) `--no-start` (plan 032 §3.5, W5): the race closed, and the fallback
+# ---------------------------------------------------------------------------
+
+#: Two remote machines, each with a hub running BEFORE launch (the harness's
+#: own bridge holds it) and its switch set before the app's first dial:
+#: `craze-race`'s roster dial is HELD (`hold-roster` 0) so the cell can end
+#: its hub between the probe and the bridge; `craze-legacy` emulates a craze
+#: older than 0.2.0 (`craze-0.1`: `--no-start` refused).
+RACE_MACHINE = "craze-race"
+LEGACY_MACHINE = "craze-legacy"
+LEGACY_FAKE_HOST = "0b0b0b0b0b0b"
+NO_START_JAILS = ((RACE_MACHINE, "recipe"), (LEGACY_MACHINE, "recipe"))
+NO_START_CONFIG = f"""servers:
+    mock:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: mock
+sheds: {{}}
+machines:
+    {RACE_MACHINE}:
+        host: craze-host
+        user: {RACE_MACHINE}
+    {LEGACY_MACHINE}:
+        host: craze-host
+        user: {LEGACY_MACHINE}
+"""
+#: The app's log line when a host's dial falls back (`SshCrazeDial::fall_back`).
+FELL_BACK = "does not know `bridge --hub --no-start`"
+
+
+@pytest.fixture(scope="module")
+def no_start_rig(bins):
+    """The fake ssh, the two jails, their hubs and their switches."""
+    r = Remote(bins, jails=NO_START_JAILS, prefix="shcn-")
+    holders: dict[str, Bridge] = {}
+    try:
+        r.jails[LEGACY_MACHINE].fake_host(LEGACY_FAKE_HOST, "craze-legacy-fake")
+        for name, _ in NO_START_JAILS:
+            holders[name] = r.jails[name].bridge()
+            assert holders[name].call("hello", HELLO)["endpoint"]["kind"] == "hub"
+        (r.jails[RACE_MACHINE].root / "hold-roster").write_text("0")
+        (r.jails[LEGACY_MACHINE].root / "craze-0.1").touch()
+        r.holders = holders  # type: ignore[attr-defined]
+        yield r
+    finally:
+        for env in r.jails.values():
+            for switch in ("hold-roster", "craze-0.1"):
+                (env.root / switch).unlink(missing_ok=True)
+        for holder in holders.values():
+            holder.close()
+        left = r.teardown()
+        assert not left, f"craze processes left behind: {left}"
+
+
+@pytest.fixture(scope="module")
+def app_no_start(no_start_rig, mock):
+    """No local craze; the two W5 machines through the fake ssh."""
+    runtime_dir = Path(tempfile.mkdtemp(prefix="shns-", dir="/tmp")).resolve()
+    config = no_start_rig.root / "config.yaml"
+    config.write_text(NO_START_CONFIG)
+    started = _launch(mock, runtime_dir=runtime_dir, craze=None, roost=None,
+                      ssh_bin=no_start_rig.ssh, config=config)
+    client = started[0]
+    client.log_path = runtime_dir / "craze-ui.log"  # type: ignore[attr-defined]
+    try:
+        yield client
+    finally:
+        _stop(*started)
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+def test_a_hub_gone_between_the_probe_and_the_bridge_leaves_the_source_dormant(
+        app_no_start, no_start_rig):
+    """**The race is closed** (plan 032 §3.5): the probe finds the hub, the
+    roster's dial is held, and the hub is ended before that dial runs. The
+    dial is `bridge --hub --no-start`, so it finds no hub and starts none
+    (exit 3): the source goes DORMANT — no row listed — and NO hub is born
+    (the jail's hub count stays 0). Its next craze command is a probe, on the
+    30 s dormant clock, not a redial."""
+    app = app_no_start
+    jail = no_start_rig.jails[RACE_MACHINE]
+    app.wait_until(lambda: (jail.root / "held").exists(), timeout=WAIT,
+                   what="the roster's dial to be held behind the probe")
+    recs = _craze_records(no_start_rig, RACE_MACHINE)
+    held = (jail.root / "held").read_text().strip()
+    assert [r.name for r in recs if not _is_probe(r.text)] == [held], recs
+    assert _is_no_start(recs[-1].text) and _is_probe(recs[0].text), recs
+    assert _craze_state(app, RACE_MACHINE).get("state") != "live"
+
+    # The hub goes, between the probe that saw it and the bridge behind it.
+    no_start_rig.holders[RACE_MACHINE].close()
+    jail.sigterm_hub()
+    deadline = time.monotonic() + scaled_timeout(WAIT)
+    while _live_hubs(jail) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not _live_hubs(jail), "the hub did not stop"
+
+    (jail.root / "hold-roster").unlink()
+    released = time.monotonic()
+    app.wait_until(lambda: _craze_state(app, RACE_MACHINE).get("state") == "dormant",
+                   timeout=WAIT, what="the source to go dormant on the bridge's exit 3")
+    assert not _rows(app, RACE_MACHINE), "dormant: nothing listed"
+    assert not _live_hubs(jail), "the find-only bridge started a hub"
+
+    seen = len(_craze_records(no_start_rig, RACE_MACHINE))
+    app.wait_until(lambda: len(_craze_records(no_start_rig, RACE_MACHINE)) > seen,
+                   timeout=45, what="the dormant source's next craze command")
+    after = _craze_records(no_start_rig, RACE_MACHINE)[seen:]
+    assert all(_is_probe(r.text) for r in after), f"dormant: only the probe: {after}"
+    assert time.monotonic() - released >= 20, "the dormant clock, not a redial's backoff"
+    assert not _live_hubs(jail), "still no hub"
+    assert not any(_is_plain_bridge(r.text)
+                   for r in _craze_records(no_start_rig, RACE_MACHINE)), "a plain bridge ran"
+    _shot(app, "craze-no-start-race.png")
+
+
+def test_a_craze_older_than_0_2_falls_back_once_and_goes_live(app_no_start, no_start_rig):
+    """**A craze older than 0.2.0 falls back, once** (plan 032 PC12): its
+    roster's `--no-start` is refused (0.1.x's own line, exit 1), the host's
+    ONE dial swaps to the older way — the probe, then `bridge --hub` — and
+    the roster goes live with its row. A lane opened on that row dials the
+    older way too: `--no-start` was sent exactly once, and the app said so
+    once."""
+    app = app_no_start
+    machine = LEGACY_MACHINE
+    app.wait_until(lambda: _craze_state(app, machine).get("state") == "live",
+                   timeout=WAIT, what="the 0.1.x machine live through the fallback")
+    app.wait_until(lambda: _row(app, LEGACY_FAKE_HOST, machine=machine), timeout=WAIT,
+                   what="its fake host's row")
+    recs = _craze_records(no_start_rig, machine)
+    kinds = ["probe" if _is_probe(r.text) else "no-start" if _is_no_start(r.text)
+             else "bridge" if _is_plain_bridge(r.text) else r.text for r in recs]
+    assert kinds[:4] == ["probe", "no-start", "probe", "bridge"], kinds
+
+    args = {"machine": machine, "kind": KIND, "session_id": LEGACY_FAKE_HOST}
+    app.call("lane.open", args)
+    try:
+        app.wait_until(lambda: app.call("lane.messages", args)["generation"] >= 1,
+                       timeout=WAIT, what="the seeded lane on the 0.1.x machine")
+        recs = _craze_records(no_start_rig, machine)
+        assert sum(_is_no_start(r.text) for r in recs) == 1, f"--no-start once: {recs}"
+        assert sum(_is_plain_bridge(r.text) for r in recs) == 2, \
+            f"the roster's and the lane's plain bridge: {recs}"
+        assert _is_probe(recs[-2].text) and _is_plain_bridge(recs[-1].text), \
+            f"the lane's dial probed first: {recs}"
+    finally:
+        app.call("lane.close", args)
+    log = app.log_path.read_text(errors="replace")
+    assert log.count(FELL_BACK) == 1, f"the fallback is logged once: {log.count(FELL_BACK)}"
 
 
 # ---------------------------------------------------------------------------
@@ -3581,8 +3809,8 @@ def test_a_dormant_shed_offers_craze_on_its_row(app_shed, shed_rig):
         assert all(d["note"] is None for d in seen), \
             f"the sheet read the unlisted shed as without craze: {[d['note'] for d in seen]}"
         # The first bridge --hub is the sheet's: none ran before the click, no
-        # hub ran (a probe-gated roster dial cannot run one without a hub), and
-        # the second — the one held — is the roster's.
+        # hub ran (a roster dial — `--no-start`, plan 032 — never starts one),
+        # and the second — the one held — is the roster's.
         bridges = [r for r in shed_rig.records(name) if "bridge --hub" in r.text]
         held = (jail.root / "held").read_text().strip()
         assert len(bridges) >= 2 and bridges[0].name != held and bridges[1].name == held, \

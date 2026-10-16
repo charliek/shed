@@ -554,8 +554,13 @@ pub enum HelloError {
     NoAnswer(String),
 }
 
-/// How long the first answer may take: a `bridge --hub` that finds no hub
-/// starts one first (craze's own recipe allows the same 30 s).
+/// How long the first answer may take: a plain `bridge --hub` that finds no
+/// hub starts one first (craze's own recipe allows the same 30 s) — this
+/// machine's dial, a remote machine's explicit-action (`ensure`) dial, and a
+/// remote dial fallen back for a craze older than 0.2.0. A `bridge --hub
+/// --no-start` (plan 032 §3.5) never starts one: it attaches to a running hub
+/// or exits 3 at once, so on it this bound only covers a hub that is slow to
+/// answer.
 pub const HELLO_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Say `hello` to a hub and judge the answer.

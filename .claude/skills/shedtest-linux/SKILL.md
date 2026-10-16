@@ -220,7 +220,10 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
   command is `sh -c '…'`.
 - **Remote is attach-only, so a dormant machine never sees `bridge --hub`.** To test a LIVE
   remote, start its hub BEFORE the app launches (the rig's own `craze bridge --hub`, held open):
-  the dormant re-probe is 30 s, so a hub started later is only seen half a minute on.
+  the dormant re-probe is 30 s, so a hub started later is only seen half a minute on. A live
+  remote's roster and lanes dial `bridge --hub --no-start` (plan 032 §3.5) with no probe of
+  their own; only the sheet's `create_options`/create dial a plain `bridge --hub`. Match the
+  two apart with `--no-start` in the text — `*"bridge --hub"*` matches both.
 - **The sentinels.** The main instance's seam holds a RECORDING `craze` wrapper (it logs the
   `PATH` and argv it ran with, then execs a private copy) — every dial must have run with `PATH`
   exactly the seam dir. The empty-seam instance and the dormant remote jail each carry a craze
@@ -300,11 +303,17 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
   jails=SHED_JAILS)`). None runs roost (the fake answers `client-bridge` `command not found`),
   so only craze can list one; until then it is `rc.list`'s `shed_craze`, read on screen through
   `shed_roost.dump`'s `craze_create`/`craze_note` and `launch.dump`'s rendered "Where".
-- **Two switches in a JAIL's root**: `probe-127` makes the find-only probe exit 127 (not
-  installed); `hold-roster` (content N) holds the (N+1)-th `bridge --hub` of that jail until
-  the switch goes, recording the held record's name in `held` — `1` holds the roster's bridge
-  behind the sheet's, so the sheet can be asserted while the shed is still unlisted. A held
-  bridge's `hello` times out at 30 s: assert inside that.
+- **Three switches in a JAIL's root**: `probe-127` makes the find-only probe exit 127 (not
+  installed); `hold-roster` (content N) holds the (N+1)-th `bridge --hub` of that jail —
+  `--no-start` ones counted — until the switch goes, recording the held record's name in
+  `held` — `1` holds the roster's bridge behind the sheet's, so the sheet can be asserted while
+  the shed is still unlisted; `0` holds the roster's first dial, which is how the W5 race cell
+  ends the hub between the probe and the bridge. A held bridge's `hello` times out at 30 s:
+  assert inside that. `craze-0.1` (plan 032) emulates a craze older than 0.2.0: every `bridge
+  --hub --no-start` exits 1 with 0.1.x's `craze bridge: unknown or malformed flag` line (the
+  real 0.2.0 bridge never runs), so the host's dial falls back to probe + plain `bridge --hub`.
+  The W5 cells run in an instance of their own (`app_no_start`, config written by the fixture),
+  because both switches must be set BEFORE the app's first dial.
 - **The recorded pid is the bridge** (`Remote.records(user)` / `live_bridges(user)`, pids under
   `<root>/pids/`): the fake EXECs a craze command, because dash does NOT exec the last
   command of `sh -c` — without it the pid is an outer `/bin/sh` whose death leaves the craze

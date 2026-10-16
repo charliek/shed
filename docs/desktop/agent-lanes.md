@@ -132,7 +132,8 @@ says so on its row. A shed without craze says nothing.
 - **Every other host is attach-only.** The desktop never starts a hub on
   another machine in the background. While a host has no hub, its source runs
   only a find-only probe, `craze providers --hub --json`, which never starts
-  one; the roster connection opens once the probe finds a hub.
+  one; the roster connection opens once the probe finds a hub, and it too is
+  find-only (`craze bridge --hub --no-start`, below).
 
 A remote host's source cycles through these states (this machine's is live,
 offline or absent, and retries its roster connection rather than probing —
@@ -140,29 +141,42 @@ every 30 s while craze is not installed or too old):
 
 | State | Meaning | What runs |
 |---|---|---|
-| `live` | Attached to the hub's roster | One `craze bridge --hub` roster connection |
-| `dormant` | craze is there, no hub is running; nothing is listed from craze (a dormant shed is offered New craze session without being listed) | The probe again every 30 s |
+| `live` | Attached to the hub's roster | One roster connection: `craze bridge --hub --no-start` (craze 0.2.0 and later), or the probe and then `craze bridge --hub` for an older craze |
+| `dormant` | craze is there, no hub is running — the probe said so, or the roster's own `--no-start` connection found none; nothing is listed from craze (a dormant shed is offered New craze session without being listed) | The probe again every 30 s |
 | `offline` | The roster dropped, the probe could not ask (`cause: unreachable`), or craze is too old (`cause: too_old`) | The probe: about a second after a live roster ends, on a backoff (1 s → 30 s) while the host is unreachable, every 30 s while craze is too old |
 | `absent` | Never reached, or craze is not installed (`cause: not_installed`) | The probe; every 30 s while craze is not installed |
 
-**Every remote `bridge --hub` is probe-gated.** The dial itself runs the probe
-on the same SSH ControlMaster before it starts the bridge, and gives up when
-no hub is running — so neither the roster's redials nor a lane's background
-reconnects can start a hub. Only two explicit actions start one on a remote
-host: opening the create sheet (its provider list) and creating a session.
-After either, the host's source probes at once and attaches to the new hub.
-(Open in terminal runs `craze attach`, which joins the session over the
-session's own control socket and starts nothing.)
+**No background connection can start a remote hub.** Every remote connection
+the desktop makes on its own — the roster's, its redials, and every lane's
+background reconnects — runs craze 0.2.0's `craze bridge --hub --no-start`,
+which attaches to a hub that is already running and otherwise exits 3
+(`craze bridge: no hub is running`) without starting one. When the roster's
+connection gets that answer, the source goes `dormant` (its rows leave with
+the hub) and probes again 30 s later; a lane stays stale and retries within
+its own bound. There is no probe in front of each connection: the connection
+itself cannot start a hub. Only two explicit actions start one on a remote
+host, and only they run plain `craze bridge --hub`: opening the create sheet
+(its provider list) and creating a session. After either, the host's source
+probes at once and attaches to the new hub. (Open in terminal runs `craze
+attach`, which joins the session over the session's own control socket and
+starts nothing.)
 
-One race is accepted rather than closed: the probe sees a hub that exits
-before the bridge behind it joins, and the bridge starts a new one. craze
-SF-152 (a find-only `bridge --hub`) removes the race and the probe both.
+**An older craze falls back.** A craze older than 0.2.0 refuses the flag
+(`craze bridge: unknown or malformed flag`). The host's connections then fall
+back together, once, for as long as the desktop keeps that host's source
+(until the host is removed and added again, or the app restarts): each runs
+the probe on the same SSH ControlMaster first and starts `craze bridge --hub`
+only when a hub is running. On that path one race remains, accepted rather
+than closed: the probe sees a hub that exits before the bridge behind it
+joins, and the bridge starts a new one. craze 0.2.0's `--no-start` is what
+closes it — update craze on that host.
 
 ### Reaching craze: the remote command
 
-Every connection to a hub runs `craze bridge --hub` through one composed
-`sh -c` line (`shed_core::craze`): craze's published binary-finding ladder,
-verbatim, which tries, in order:
+Every connection to a hub runs `craze bridge --hub` — or, for a remote
+host's background connections, `craze bridge --hub --no-start` (above) —
+through one composed `sh -c` line (`shed_core::craze`): craze's published
+binary-finding ladder, verbatim, which tries, in order:
 
 1. `$HOME/.local/bin/craze` (only when `HOME` is absolute)
 2. `craze` on the PATH (`command -v`, absolute results only)
@@ -614,8 +628,9 @@ SF-126).
   SSH-born hub (every session runs on), then `craze ps` in a terminal on the
   Mac starts one in the GUI session.
 
-A GUI-session hub reachable over SSH (craze SF-130) and a find-only
-`bridge --hub` (SF-152) are open craze follow-ups.
+A GUI-session hub reachable over SSH (craze SF-130) is an open craze
+follow-up. The find-only `bridge --hub --no-start` (SF-152) shipped in craze
+0.2.0, and every background remote connection runs it.
 
 ## opencode
 

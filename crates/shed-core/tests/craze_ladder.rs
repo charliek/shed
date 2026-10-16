@@ -45,8 +45,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use shed_core::craze::{
-    attach_argv, bridge_hub_argv_jailed, providers_hub_argv, Dir, Ladder, Rung, JAILED_LADDER,
-    LADDER,
+    attach_argv, bridge_hub_argv_jailed, bridge_hub_no_start_argv, bridge_hub_no_start_argv_jailed,
+    providers_hub_argv, Dir, Ladder, Rung, JAILED_LADDER, LADDER,
 };
 use shed_core::machine::display_line;
 
@@ -393,10 +393,14 @@ fn rerooted(ladder: &Ladder<'static>, root: &str) -> Ladder<'static> {
     }
 }
 
-/// The three forms on `ladder`, each with the argv craze must receive.
+/// The four forms on `ladder`, each with the argv craze must receive.
 fn forms(ladder: &Ladder<'_>) -> Vec<(Vec<String>, Vec<&'static str>)> {
     vec![
         (ladder.bridge_hub_argv(), vec!["bridge", "--hub"]),
+        (
+            ladder.bridge_hub_no_start_argv(),
+            vec!["bridge", "--hub", "--no-start"],
+        ),
         (
             ladder.providers_hub_argv(),
             vec!["providers", "--hub", "--json"],
@@ -693,6 +697,10 @@ fn the_jailed_variant_never_reaches_an_absolute_rung_and_passes_path_through() {
         // re-rooting could move, so it holds no absolute rung at all.
         assert_eq!(jailed, JAILED_LADDER);
         assert_eq!(bridge_hub_argv_jailed(), jailed.bridge_hub_argv());
+        assert_eq!(
+            bridge_hub_no_start_argv_jailed(),
+            jailed.bridge_hub_no_start_argv()
+        );
     }
 }
 
@@ -724,6 +732,10 @@ fn the_production_forms_take_rung_one_with_the_production_exec_path() {
             );
         }
         assert_eq!(providers_hub_argv(), LADDER.providers_hub_argv());
+        assert_eq!(
+            bridge_hub_no_start_argv(),
+            LADDER.bridge_hub_no_start_argv()
+        );
     }
 }
 
