@@ -1000,13 +1000,12 @@ jobs:
         run: |
           # Kept byte-identical to ci.yml's release-snapshot step (see the note
           # there): explicit rustfmt+clippy (rust-toolchain.toml declares them),
-          # and cargo-zigbuild pinned to the validated version. zig is brew-current;
-          # a zig bump is a loud failure caught by release-snapshot pre-tag.
+          # and zig + cargo-zigbuild pinned (zig through scripts/release/install-zig.sh).
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
           rustup target add aarch64-apple-darwin x86_64-apple-darwin \
                             aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
-          brew install zig
+          scripts/release/install-zig.sh
           cargo install --locked --version 0.23.0 cargo-zigbuild
 
       - name: Run GoReleaser (host-agent)

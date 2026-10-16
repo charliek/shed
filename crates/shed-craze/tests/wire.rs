@@ -1,4 +1,4 @@
-//! shed-craze against craze's own wire fixtures — `fixtures/wire/`, WIRE/01–32
+//! shed-craze against craze's own wire fixtures — `fixtures/wire/`, WIRE/01–33
 //! vendored verbatim at the pin `fixtures/wire.PIN` names (plan 025 §3.3.1),
 //! and diffed against craze's tree by CI's `craze-binaries` action.
 //!
@@ -92,7 +92,7 @@ fn fixture(prefix: &str) -> Vec<Value> {
 #[test]
 fn the_fixtures_are_vendored_whole_at_the_pin() {
     let all = fixtures();
-    assert_eq!(all.len(), 32, "WIRE/01–32");
+    assert_eq!(all.len(), 33, "WIRE/01–33");
     for (i, (name, _)) in all.iter().enumerate() {
         assert!(name.starts_with(&format!("{:02}-", i + 1)), "{name}");
     }
@@ -719,7 +719,7 @@ fn wire_30_folds_into_crazes_catalog() {
         slash_names(&seeded.rows),
         [
             "help", "model", "clear", "tasks", "theme", "rename", "plan", "ask", "agent", "btw",
-            "exit", "research"
+            "exit", "effort", "research"
         ]
     );
     let row = |name: &str| seeded.rows.iter().find(|r| r.name == name).unwrap().clone();
@@ -760,6 +760,17 @@ fn wire_30_folds_into_crazes_catalog() {
     let exit = row("exit");
     assert_eq!(exit.requires, Some(LaneSlashRequires::Stop));
     assert_eq!(exit.run.method, Some(LaneSlashMethod::Stop));
+    // craze 0.2.0's `/effort`: a picker shed has no verb for yet, kept as
+    // craze wrote it.
+    let effort = row("effort");
+    assert_eq!(
+        (&effort.requires, &effort.run.kind, &effort.run.picker),
+        (
+            &Some(LaneSlashRequires::Other("effort".into())),
+            &LaneSlashKind::Picker,
+            &Some(LaneSlashPicker::Other("effort".into()))
+        )
+    );
     let research = row("research");
     assert_eq!(
         (&research.source, &research.run.kind, research.while_working),
@@ -772,7 +783,7 @@ fn wire_30_folds_into_crazes_catalog() {
     fold.apply(&delta.event);
     assert!(fold.take_slash_changed());
     let rows = &fold.slash().unwrap().rows;
-    assert_eq!(rows.len(), 14);
+    assert_eq!(rows.len(), 15);
     let btws: Vec<&LaneSlashRow> = rows.iter().filter(|r| r.name == "btw").collect();
     assert_eq!(btws.len(), 2, "the agent's /btw beside the builtin");
     assert_eq!(
@@ -791,7 +802,7 @@ fn wire_30_folds_into_crazes_catalog() {
     );
     fold.apply(&skills.event);
     let rows = &fold.slash().unwrap().rows;
-    assert_eq!(rows.len(), 15);
+    assert_eq!(rows.len(), 16);
     let last = rows.last().unwrap();
     assert_eq!(
         (last.name.as_str(), &last.source),

@@ -715,9 +715,9 @@ release:
 # Mirrors what ci.yml's release-snapshot job runs.
 #
 # goreleaser comes from .mise.toml pinned to CI's exact version (a local
-# snapshot that predicts CI has to run CI's goreleaser); zig is there too, but
-# NOT version-matched — CI does a bare `brew install zig`. Setup is `mise
-# install` plus two cargo-side prerequisites for the Rust components:
+# snapshot that predicts CI has to run CI's goreleaser), and so is zig, matched
+# to scripts/release/install-zig.sh. Setup is `mise install` plus two
+# cargo-side prerequisites for the Rust components:
 #
 #   cargo install --locked --version 0.23.0 cargo-zigbuild
 #   rustup target add x86_64-apple-darwin \
