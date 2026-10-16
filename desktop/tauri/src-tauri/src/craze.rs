@@ -83,7 +83,7 @@
 //! ladder — so neither path can reach a craze installed on the host running
 //! the tests (`crate::machines::build_local_craze`/`build_ssh_craze`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -594,14 +594,45 @@ pub struct CrazeState {
     pub caps: Option<SourceCapabilities>,
     pub truncated: bool,
     staged: Option<Staged>,
+    /// The hostIds [`Self::listed_now`] folded in AHEAD of their own roster
+    /// frame (plan 032 §3.1.1 item 3, C1 review): the fold that lands that
+    /// frame — a `Session` upsert, or the swap of the seed it was folded into
+    /// — still reports each as newly [`Applied::listed`], though the row is
+    /// already held, so its return is published by the fold, in order with
+    /// the fold's own departures. Emptied by the swap, a `Removed` and a
+    /// `Dormant`.
+    ahead: BTreeSet<String>,
+    /// The last craze news sequence number [`Self::mint_news`] handed out —
+    /// `0` before the first.
+    news: u64,
 }
 
 /// What one fold changed, for the caller to act on outside the lock.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Applied {
-    /// Rows that left the swapped-in set — their lanes go (`Removed`, or a
-    /// `Ready` swap that dropped them: an epoch reseed produces no `Removed`).
+    /// Rows that left the swapped-in set — their lanes DEPART (`Removed`, or a
+    /// `Ready` swap that dropped them: an epoch reseed produces no `Removed`;
+    /// plan 032 §3.1.1 item 2).
     pub departed: Vec<String>,
+    /// Rows newly IN the swapped-in set — a `Session` upsert of a hostId not
+    /// held, or a `Ready` swap that lists one the old set did not — whose
+    /// departing lanes (if any) are live again (plan 032 §3.1.1 item 3, PC2).
+    /// A row already held is never in it, but for one [`CrazeState::listed_now`]
+    /// folded in ahead of the frame this fold lands, which is reported HERE
+    /// rather than by `listed_now` (its own answer's is always empty).
+    ///
+    /// **Only a source's fold publishes it** (C1 review): the fold runs on the
+    /// source's one task, so a return it publishes is ordered with every
+    /// departure it publishes. A create's fold-ahead runs on another task and
+    /// publishes after releasing the state lock — its return could land after
+    /// a departure the fold published in between and cancel it, leaving a lane
+    /// live on a row that is gone. (A departure from ANOTHER task — an End
+    /// tab's — is ordered with the fold's returns by the news sequence,
+    /// [`CrazeState::mint_news`].)
+    ///
+    /// Disjoint from [`Self::departed`] — a fold lists or departs a row, never
+    /// both — so the two share the fold's one news number.
+    pub listed: Vec<String>,
     /// A seed swapped in: the host is listed from now on.
     pub ready: bool,
     /// Something a reader can see changed.
@@ -615,6 +646,28 @@ impl CrazeState {
             gen,
             ..Self::default()
         }
+    }
+
+    /// **The next craze news sequence number** (C1 re-review): what one piece
+    /// of this source's news about its lanes carries
+    /// ([`crate::lane::CrazeNews`]) — a fresh number per call, strictly
+    /// increasing for the life of the source (a new source, a new
+    /// generation, starts again, and the generation fence keeps the two
+    /// apart). Never 0.
+    ///
+    /// **Minted under the roost-host layer's state lock, at the moment the
+    /// news is computed** — by the source's fold and the host's removal
+    /// ([`crate::roost_hosts::OnCrazeNews`]). Each publishes AFTER
+    /// that lock is released, from its own task, so news can REACH the lane
+    /// layer in another order than it happened in; the number is the order it
+    /// happened in, and the lane layer applies a piece to a lane only if it is
+    /// newer than every piece that lane already took
+    /// ([`crate::lane::Lanes::craze_news`]).
+    pub fn mint_news(&mut self) -> u64 {
+        // A u64 is never exhausted here: one piece of news a microsecond, for
+        // the life of one source, would take over 500,000 years to wrap.
+        self.news += 1;
+        self.news
     }
 
     /// Whether the hub feed is live — the one condition the row merge absorbs
@@ -643,7 +696,12 @@ impl CrazeState {
                     staged.rows.insert(session.id.clone(), session);
                 }
                 None => {
-                    self.rows.insert(session.id.clone(), session);
+                    let id = session.id.clone();
+                    // New here, or the frame of a row folded in ahead of it.
+                    let fresh = self.rows.insert(id.clone(), session).is_none();
+                    if self.ahead.remove(&id) || fresh {
+                        out.listed.push(id);
+                    }
                     out.visible = true;
                 }
             },
@@ -652,6 +710,7 @@ impl CrazeState {
                     staged.rows.remove(&session_id);
                 }
                 None => {
+                    self.ahead.remove(&session_id);
                     if self.rows.remove(&session_id).is_some() {
                         out.departed.push(session_id);
                         out.visible = true;
@@ -679,6 +738,13 @@ impl CrazeState {
                             .filter(|id| !staged.rows.contains_key(*id))
                             .cloned()
                             .collect();
+                        out.listed = staged
+                            .rows
+                            .keys()
+                            .filter(|id| !self.rows.contains_key(*id) || self.ahead.contains(*id))
+                            .cloned()
+                            .collect();
+                        self.ahead.clear();
                         self.rows = staged.rows;
                         if staged.caps.is_some() {
                             self.caps = staged.caps;
@@ -710,6 +776,7 @@ impl CrazeState {
         let departed = self.held();
         let visible = !departed.is_empty() || self.phase != Some(CrazePhase::Dormant);
         self.rows.clear();
+        self.ahead.clear();
         self.staged = None;
         self.caps = None;
         self.truncated = false;
@@ -717,6 +784,7 @@ impl CrazeState {
         self.offline = None;
         Applied {
             departed,
+            listed: Vec::new(),
             ready: false,
             visible,
         }
@@ -731,6 +799,7 @@ impl CrazeState {
         self.offline = said;
         Applied {
             departed: Vec::new(),
+            listed: Vec::new(),
             ready: false,
             visible,
         }
@@ -748,6 +817,12 @@ impl CrazeState {
     ///
     /// Into a seed in progress too, so that seed's swap cannot depart it (and
     /// its lane) before its frame lands. Never over a row already held.
+    ///
+    /// **It reports no return** (plan 032 §3.1.1 item 3, C1 review): its
+    /// answer's [`Applied::listed`] is always empty, and a row it newly holds
+    /// is marked `ahead` instead, so the fold that lands its frame reports it
+    /// — the source's fold is the one publisher of returns, in order with its
+    /// departures.
     pub fn listed_now(&mut self, session: LaneSession) -> Applied {
         if let Some(staged) = self.staged.as_mut() {
             staged
@@ -756,9 +831,14 @@ impl CrazeState {
                 .or_insert_with(|| session.clone());
         }
         let visible = !self.rows.contains_key(&session.id);
+        if visible {
+            // Its return is the frame's to report, from the fold (`ahead`).
+            self.ahead.insert(session.id.clone());
+        }
         self.rows.entry(session.id.clone()).or_insert(session);
         Applied {
             departed: Vec::new(),
+            listed: Vec::new(),
             ready: false,
             visible,
         }
@@ -1164,6 +1244,85 @@ mod tests {
             session_id: "b".into(),
         });
         assert_eq!(removed.departed, ["b"]);
+    }
+
+    /// **A fold says which rows it newly LISTS** (plan 032 §3.1.1 item 3):
+    /// the return signal a departing lane is waiting for — a `Ready` swap's
+    /// rows the old set did not hold, and a live `Session` upsert of a hostId
+    /// not held — and never a row already held, nor anything staged.
+    #[test]
+    fn a_fold_reports_the_rows_it_newly_lists() {
+        let mut s = CrazeState::new(1);
+        assert_eq!(seed(&mut s, 1, &["a", "b"]).listed, ["a", "b"]);
+        let swapped = seed(&mut s, 2, &["b", "c"]);
+        assert_eq!(
+            (swapped.departed, swapped.listed),
+            (vec!["a".to_string()], vec!["c".to_string()])
+        );
+        let held = s.apply(SourceEvent::Session { session: row("b") });
+        assert!(
+            held.listed.is_empty(),
+            "an upsert of a held row is no return"
+        );
+        let new = s.apply(SourceEvent::Session { session: row("d") });
+        assert_eq!(new.listed, ["d"]);
+        s.apply(SourceEvent::Reset {
+            reason: "connect".into(),
+            generation: 3,
+        });
+        let staged = s.apply(SourceEvent::Session { session: row("e") });
+        assert!(staged.listed.is_empty(), "staged rows wait for their Ready");
+        // The hub gone, then back: every row it lists is a return.
+        s.dormant();
+        assert_eq!(seed(&mut s, 4, &["a"]).listed, ["a"]);
+    }
+
+    /// **A row folded in ahead of its frame is returned by the FOLD, not by
+    /// the fold-ahead** (plan 032 §3.1.1 item 3, C1 review): `listed_now`
+    /// reports no return — a create publishes it from another task, unordered
+    /// with the fold's departures — and the frame that follows reports it,
+    /// though the row is already held: a live upsert, or the swap of the seed
+    /// it was folded into. Reported once; a `Removed` or a `Dormant` before
+    /// its frame forgets it.
+    #[test]
+    fn a_row_folded_ahead_is_returned_by_its_frame() {
+        let mut s = CrazeState::new(1);
+        seed(&mut s, 1, &["a"]);
+        let ahead = s.listed_now(row("n"));
+        assert!(ahead.visible && ahead.listed.is_empty(), "{ahead:?}");
+        assert_eq!(s.held(), ["a", "n"]);
+        let framed = s.apply(SourceEvent::Session { session: row("n") });
+        assert_eq!(framed.listed, ["n"], "the frame reports the return");
+        let again = s.apply(SourceEvent::Session { session: row("n") });
+        assert!(again.listed.is_empty(), "once");
+
+        // Folded into a seed in progress: its swap reports it.
+        s.apply(SourceEvent::Reset {
+            reason: "connect".into(),
+            generation: 2,
+        });
+        s.apply(SourceEvent::Session { session: row("a") });
+        s.apply(SourceEvent::Session { session: row("n") });
+        assert!(s.listed_now(row("m")).listed.is_empty());
+        let swapped = s.apply(SourceEvent::Ready {
+            generation: 2,
+            truncated: false,
+        });
+        assert_eq!(swapped.listed, ["m"], "{swapped:?}");
+        let held = s.apply(SourceEvent::Session { session: row("m") });
+        assert!(held.listed.is_empty(), "the swap's report was the one");
+
+        // Removed before its frame: the mark goes with it.
+        s.listed_now(row("p"));
+        s.apply(SourceEvent::Removed {
+            session_id: "p".into(),
+        });
+        let relisted = s.apply(SourceEvent::Session { session: row("p") });
+        assert_eq!(relisted.listed, ["p"], "a fresh listing, reported once");
+        // The hub gone before its frame: so does the mark.
+        s.listed_now(row("q"));
+        s.dormant();
+        assert_eq!(seed(&mut s, 3, &["a"]).listed, ["a"]);
     }
 
     /// Retained across an `Offline`, dropped by a `Dormant`.

@@ -77,8 +77,23 @@ two facts apart:
 
 A lane that ended with `unknown_session`, `session_closed` or
 `start_failed:<cause>` is never reopened: the session is gone, closed or never
-started. Any other `Down` (the agent restarted, a reconnect bound ran out) is
-reopened with a short backoff.
+started. Neither is one the desktop ended itself — `session_gone`, `hub_gone`
+or `host_removed` (see [A lane outlives its row](#a-lane-outlives-its-row)).
+Any other `Down` (the agent restarted, a reconnect bound ran out) is reopened
+with a short backoff.
+
+The desktop keeps a third fact apart from both, **finished**: the lane is
+over for good — one of those final reasons arrived, and nothing will reopen
+it. `lane.messages` answers it as `finished`. A finished lane stays on screen
+and readable (its transcript, approvals and last settings) but holds no
+connection, however it finished — the session's own final event included: its
+subscription, its adapter and its share of any SSH forward are released (the
+last share out tears the forward down). Every verb on it is refused
+`lane_ended` ("the session has ended") at once — a verb already under way when
+the lane finished runs its course — and the panel disables its composer, Send,
+Interject and Cancel. `ended` alone is not
+enough to key that on: a retryable `Down` sets it too, and the desktop is
+already resubscribing behind it.
 
 A source streams the same way: `Reset` … `Session`* … `Capabilities` …
 `Ready`, then upserts and removals. Its outage is the non-terminal `Offline`
@@ -374,8 +389,8 @@ the craze session id every later call uses), then `session.attach`.
   The panel keeps a Send's text after `outcome_unknown` and says to check the
   transcript before sending again.
 - **Stop** ends the session, not just the transcript, behind an inline
-  confirm. craze answers with a receipt; the lane ends with `session_closed`
-  and the row leaves.
+  confirm. craze answers with a receipt; the row leaves, and the lane ends
+  with `session_closed` — usually just after the row, see below.
 - **End tab and Stop are different on a row hosted in a TUI.** **End tab**
   closes only that roost tab; the session keeps running in craze's hub, and its
   row stays (without the tab). **Stop** is what ends the session.
@@ -395,6 +410,49 @@ on its own), a cancelled turn, errors and "restored" after a replay draw rows
 in craze's own wording. A snapshot whose window was cut opens with one "earlier transcript
 omitted" row. Only the main agent draws rows: a sub-agent's events and
 transcript are not shown.
+
+### A lane outlives its row
+
+craze 0.2.0 marks a stopping session's host `stopping` before its engine
+closes, and the hub drops the row on its next roster round (once a second) —
+usually **before** the session's last events and its `session_closed` reach
+the lane on its own connection. craze promises that connection runs on to the
+session's end, and nothing orders the two connections. So the desktop does
+not end a craze lane when its row leaves; the lane **departs**:
+
+- **The grace.** The lane keeps its own connection for **10 seconds**. A
+  final `Down` inside it — the normal Stop: the closing rows, then
+  `session_closed` — ends the lane exactly as a normal end does, with every
+  last row on screen.
+- **A return.** A row listed again inside the grace (a reseed that briefly
+  dropped it, a hub that came back) cancels the departure: the lane never let
+  its connection go. A row that leaves again later gets a fresh grace; a
+  repeated removal during one absence never extends it. Departures and
+  returns apply in the order they happened, however late one reaches the
+  lane: a return reported before a departure never revives the lane that
+  departure departed, and a departure from before a return never departs the
+  lane again. **End tab** departs no lane: the session runs on in its host
+  after its tab closes, and a session that does end leaves the roster on the
+  hub's next round.
+- **The end.** Otherwise the grace's end ends the lane itself, with a final
+  reason the banner shows (`ended · <reason> — showing the last known
+  transcript`): **`session_gone`** when the roster removed the row (a
+  `Removed`, or a reseed without it), or
+  **`hub_gone`** when the row left with the hub (the source went dormant).
+  10 s only bounds the worst case: a host that died without a final event
+  answers the lane's redial with `unknown_session` well before it.
+- **Host removed.** A machine removed from the config, or a shed that
+  stopped, ends every lane of its craze source at once with
+  **`host_removed`** — no grace: the source that could list the row again is
+  gone.
+
+An ended lane releases its connection (and on a remote host its ssh exec),
+whatever ended it, but stays readable until its panel closes. `lane.open` on it answers the ended
+lane while its row stays gone, and opens a fresh lane once the row is listed
+again (the old one is replaced only when the new open succeeds). Closing the
+panel removes it. The app's orderly shutdown counts these finished lanes too
+(its lanes phase line reads `lanes=<n> (finished=<n>) … graces=<n>`, the
+grace timers joined alongside the subscriptions).
 
 ### The `/` menu
 
@@ -751,25 +809,27 @@ namespaces.
 
 | Op | Does |
 |---|---|
-| `lane.open` | Ensures a subscription (idempotent — a second call for an already-open lane re-answers from the existing entry) and answers the session row as the source listed it at the open. |
-| `lane.messages` | The staged transcript: up to the last 500 rows, current activity, the live session row (`session`, `null` until the first seed), generation, a `stale` reason when the lane is not live, `ended` once its subscription is over, and the session's `capabilities` and `settings` — the only place the panel reads what the session can do. The panel's header reads the live row too: `lane.open`'s is re-answered unchanged while the lane stays open, and for a session opened the moment its create answered it is the create's own, with no permission mode. |
+| `lane.open` | Ensures a subscription (idempotent — a second call for an already-open lane re-answers from the existing entry) and answers the session row as the source listed it at the open. A craze lane whose row has left (departing, or finished) is answered as it is; a finished one whose row is listed again is replaced by a fresh lane once that open succeeds. |
+| `lane.messages` | The staged transcript: up to the last 500 rows, current activity, the live session row (`session`, `null` until the first seed), generation, a `stale` reason when the lane is not live, `ended` once its subscription is over, `finished` once the lane is over for good (every verb then answers `lane_ended`), and the session's `capabilities` and `settings` — the only place the panel reads what the session can do. The panel's header reads the live row too: `lane.open`'s is re-answered unchanged while the lane stays open, and for a session opened the moment its create answered it is the create's own, with no permission mode. |
 | `lane.approvals` | Pending approvals, oldest first (`created_at`, then `id`): for opencode the root session's and its children's, for craze every open ask in the session's registry, a sub-agent's included. |
 | `lane.send` | Queues a prompt (`mode: queue`), or preempts the turn in flight (`mode: interject`) when the lane advertises `interject` — the panel shows the toggle only then, and only enables it while the turn is `Working`. |
 | `lane.cancel` | Aborts the turn in flight. The panel offers Cancel only when the session's streamed `capabilities.cancel` is true, and enables it only while the session is `Working`. |
 | `lane.answer` | Answers one approval. Four forms, exactly one per answer and nothing beside it (any other key — say an `option_id` next to `permission` — is `bad_request`, so an answer can never execute as something other than what it reads as): `{choice: "<id>"}` — the exact option id the approval offered, which is what the panel always sends (see [the ambiguity refusal](#an-ambiguous-decision-is-refused-never-guessed)); the scripted `{permission: "allow-once" \| "allow-always" \| "reject"}`, which resolves by semantic kind and refuses an ambiguous one; `{question: [[…]]}`, optionally with `custom_text` beside it (see [Free-text answers](#free-text-answers)); and `{reject: true}`. |
 | `lane.stop` | Ends the SESSION (craze's `session.stop`), not just the transcript: answered on craze's receipt, after which the lane ends and the row leaves. The panel offers Stop only when the session's `capabilities.stop` is true, behind an inline confirm. |
-| `lane.settings` | The session's settings, read now — the model and models in craze's order, the mode and modes, the current model's own options and the usage. The panel renders the stream's copy, `lane.messages`' `settings`. |
+| `lane.settings` | The session's settings, read now — the model and models in craze's order, the mode and modes, the current model's own options and the usage. The panel renders the stream's copy, `lane.messages`' `settings`. A finished lane answers the last settings it stated, with no call to the agent. |
 | `lane.set` | Changes one setting: `{kind: "model"\|"mode", id}` or `{kind: "config", id, value, for_model?}` (craze's `session.set`; `for_model` is the model the client displayed, else the lane's folded one). The new value arrives on the stream; craze's `stale_model` is `not_accepting`, and an answer lost to a drop is `outcome_unknown` — never resent. |
 | `lane.set_title` | Renames the SESSION (craze's `session.setTitle`; the composer's `/rename`): the title trimmed, a blank one refused unsent. The new title arrives on the stream; `{warning}` is a rename craze made but could not record. Refused by a session whose `capabilities.set_title` is false. |
-| `lane.close` | Ends the subscription; the last close on a shared SSH forward tears it down. |
+| `lane.close` | Ends the subscription and removes the lane, whether it is live, departing or finished; the last close on a shared SSH forward tears it down. |
 
 A failure comes back as `{code, message}` with the contract's own snake_case
 codes (`unauthorized`, `unknown_session`, `unknown_approval`,
 `already_submitted`, `already_resolved`, `not_accepting`, `unavailable`,
 `failed`), plus `no_lane` for a row with no `agent_lane` stamp at all,
 `unsupported_lane` for a row whose `agent_lane.kind` names no adapter this
-build has, and `outcome_unknown` for a craze verb whose answer was lost with its
-connection (it may have run, and it is never resent).
+build has, `outcome_unknown` for a craze verb whose answer was lost with its
+connection (it may have run, and it is never resent), and `lane_ended` for a
+verb (`lane.send`, `lane.cancel`, `lane.answer`, `lane.set`, `lane.set_title`,
+`lane.stop`) on a finished lane — refused at once, never sent.
 
 The craze ops — `craze.create_options`, `craze.create`, `craze.open_terminal`
 — the UI-truth dumps (`lane.dump`, `lane_settings.dump`, `craze_create.dump`)

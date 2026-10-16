@@ -613,12 +613,25 @@ async fn a_host_removed_at_each_await_of_a_start_leaks_nothing() {
     assert!(rows_of(&hosts).is_empty(), "{:?}", rows_of(&hosts));
 }
 
-/// The lanes over a craze roster, wired the way `lib.rs` wires them.
+/// The departure grace these cells' lanes run with (plan 032 §3.1's seam).
+const GRACE: Duration = Duration::from_millis(300);
+
+/// The lanes over a craze roster, wired the way `lib.rs` wires them, with a
+/// [`GRACE`] departure grace.
 fn lanes_over(hosts: &Arc<RoostHosts>) -> Arc<Lanes> {
-    let lanes = Arc::new(Lanes::for_test(
-        tokio::runtime::Handle::current(),
-        Arc::clone(hosts) as Arc<dyn crate::lane::LaneMachines>,
-    ));
+    lanes_holding(hosts, GRACE, Arc::new(NewsHold::default()))
+}
+
+/// [`lanes_over`], with a `grace` departure grace and its craze news passed
+/// through `hold` — which holds back nothing until a cell says what.
+fn lanes_holding(hosts: &Arc<RoostHosts>, grace: Duration, hold: Arc<NewsHold>) -> Arc<Lanes> {
+    let lanes = Arc::new(
+        Lanes::for_test(
+            tokio::runtime::Handle::current(),
+            Arc::clone(hosts) as Arc<dyn crate::lane::LaneMachines>,
+        )
+        .with_depart_grace(grace),
+    );
     let weak = Arc::downgrade(&lanes);
     hosts.set_lane_observer(Arc::new(move |m: &str, open: &_| {
         if let Some(l) = weak.upgrade() {
@@ -626,18 +639,123 @@ fn lanes_over(hosts: &Arc<RoostHosts>) -> Arc<Lanes> {
         }
     }));
     let weak = Arc::downgrade(&lanes);
-    hosts.set_craze_observer(Arc::new(move |m: &str, gen: u64, gone: &[String]| {
+    hosts.set_craze_observer(Arc::new(move |m: &str, gen: u64, news: CrazeNews<'_>| {
+        if hold.holds(m, gen, &news) {
+            return;
+        }
         if let Some(l) = weak.upgrade() {
-            l.evict_craze(m, gen, gone);
+            l.craze_news(m, gen, news);
         }
     }));
     lanes
 }
 
+/// **A hand on the craze news hook** (C1 re-review): while it holds, every
+/// RETURN is held back instead of applied — the fold that minted it under the
+/// state lock paused before publishing it, the window every publisher has —
+/// until [`Self::release`] delivers it, after news minted LATER.
+#[derive(Default)]
+struct NewsHold {
+    holding: std::sync::atomic::AtomicBool,
+    held: std::sync::Mutex<Vec<HeldReturn>>,
+    /// The number of every return published, held or not, in order.
+    returns: std::sync::Mutex<Vec<u64>>,
+}
+
+/// A return a [`NewsHold`] held back, owned.
+struct HeldReturn {
+    machine: String,
+    gen: u64,
+    host_ids: Vec<String>,
+    seq: u64,
+}
+
+impl NewsHold {
+    fn hold_returns(&self, hold: bool) {
+        self.holding.store(hold, Ordering::SeqCst);
+    }
+
+    /// Note `news`, and hold it back if it is a return and this holds —
+    /// answering whether it did.
+    fn holds(&self, machine: &str, gen: u64, news: &CrazeNews<'_>) -> bool {
+        let CrazeNews::Returned { host_ids, seq } = *news else {
+            return false;
+        };
+        lock(&self.returns).push(seq);
+        if !self.holding.load(Ordering::SeqCst) {
+            return false;
+        }
+        lock(&self.held).push(HeldReturn {
+            machine: machine.to_string(),
+            gen,
+            host_ids: host_ids.to_vec(),
+            seq,
+        });
+        true
+    }
+
+    /// The number of the first return held back, once one is.
+    fn held_seq(&self) -> Option<u64> {
+        lock(&self.held).first().map(|held| held.seq)
+    }
+
+    /// The number of the last return published.
+    fn last_return(&self) -> Option<u64> {
+        lock(&self.returns).last().copied()
+    }
+
+    /// Deliver every return held back to `lanes`, in the order it was held.
+    fn release(&self, lanes: &Lanes) {
+        let held = std::mem::take(&mut *lock(&self.held));
+        for piece in &held {
+            let news = CrazeNews::Returned {
+                host_ids: &piece.host_ids,
+                seq: piece.seq,
+            };
+            lanes.craze_news(&piece.machine, piece.gen, news);
+        }
+    }
+}
+
+/// A departure of host A (`Removed`) minted under the state lock with the
+/// generation it is judged by — answering that number — to be published
+/// later, from another task: the news fence's general case. No publisher but
+/// the fold departs a lane today (plan 032 E6: End tab publishes nothing),
+/// so the cells play one, both halves apart, to pin that the lane layer
+/// orders news by its number and not by when it lands.
+fn departure_minted(hosts: &RoostHosts, id: &HostId) -> (u64, u64) {
+    let mut state = lock(&hosts.state);
+    let m = state.get_mut(id).expect("the host's state");
+    (m.craze.gen, m.craze.mint_news())
+}
+
+/// …and published, as a publisher would.
+fn departure_published(hosts: &RoostHosts, id: &HostId, (gen, seq): (u64, u64)) {
+    let ended = [HOST_A.to_string()];
+    publish_craze_gone(&hosts.on_craze, id, gen, seq, &ended, Departure::Removed);
+}
+
+/// The craze lane on `host_id`'s state on `machine` — `live`, `departing`,
+/// `finished` — or `None` with no entry.
+fn lane_state(lanes: &Lanes, machine: &str, host_id: &str) -> Option<&'static str> {
+    lanes.lane_state(machine, "craze", host_id)
+}
+
+/// `lane.messages`' `stale` for the craze lane on `host_id` — a finished
+/// lane's final reason.
+fn reason(lanes: &Lanes, machine: &str, host_id: &str) -> Value {
+    lanes
+        .messages(machine, "craze", host_id)
+        .expect("a craze lane stays readable")["stale"]
+        .clone()
+}
+
 /// **A roost snapshot does not evict a craze lane, and a `Ready` swap that
 /// drops its row does** (plan 025 §3.6.4): `reconcile` judges only the
-/// roost-stamped lanes, and the craze source's own reseed is what retires a
-/// craze one — an epoch reseed carries no `Removed`.
+/// roost-stamped lanes, and the craze source's own reseed is what ends a
+/// craze one — an epoch reseed carries no `Removed`. Since plan 032 the swap
+/// starts the lane's DEPARTURE, and the grace ends it `session_gone`: it stays
+/// registered and readable, finished — never removed, never `no_lane`.
 #[tokio::test]
 async fn a_craze_lane_outlives_roost_snapshots_and_leaves_with_its_row() {
     let fake = FakeRoost::start().await;
@@ -682,7 +800,8 @@ async fn a_craze_lane_outlives_roost_snapshots_and_leaves_with_its_row() {
         "a roost snapshot does not evict a craze lane"
     );
 
-    // The hub reseeds (a roster reset) WITHOUT host A: its lane goes.
+    // The hub reseeds (a roster reset) WITHOUT host A: its lane departs, and
+    // ends with the grace.
     roster.reset("sub-1", "omitted").await;
     let resub = roster.expect("sessions.subscribe").await;
     roster
@@ -692,10 +811,15 @@ async fn a_craze_lane_outlives_roost_snapshots_and_leaves_with_its_row() {
                    "sessions": [row(HOST_B, "ses-b")]}),
         )
         .await;
-    wait_for("the swap dropped A's lane", || {
-        (!lanes.is_open(LOCALHOST, "craze", HOST_A)).then_some(())
+    wait_for("the swap to depart A's lane", || {
+        (lane_state(&lanes, LOCALHOST, HOST_A) == Some("departing")).then_some(())
     })
     .await;
+    wait_for("the grace to end A's lane", || {
+        (lane_state(&lanes, LOCALHOST, HOST_A) == Some("finished")).then_some(())
+    })
+    .await;
+    assert_eq!(reason(&lanes, LOCALHOST, HOST_A), "session_gone");
     assert_eq!(craze_rows(&hosts).len(), 1);
 }
 
@@ -834,11 +958,12 @@ async fn a_remove_racing_a_reregistration_leaves_the_new_registration_whole() {
 }
 
 /// **A stale source's eviction never ends a newer generation's lane** (C9
-/// review): the shed's craze lane on hostId A is open; the shed is removed and
-/// registered again, and a lane on the SAME hostId opens through the new
-/// source. The old source's news — published, as its sink does, after its
-/// fence was passed — then arrives, and the new lane stays; the new
-/// generation's own news does end it.
+/// review): the shed's craze lane on hostId A is open; the shed is removed
+/// (the lane ends `host_removed` at once, and stays readable) and registered
+/// again, and a lane on the SAME hostId opens through the new source,
+/// REPLACING the finished one. The old source's news — published, as its sink
+/// does, after its fence was passed — then arrives, and the new lane stays
+/// live; the new generation's own news starts its departure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_sources_eviction_never_ends_a_new_generations_lane() {
     let (id, config) = srv_shed("s1");
@@ -861,10 +986,12 @@ async fn a_stale_sources_eviction_never_ends_a_new_generations_lane() {
     let old_gen = lock(&hosts.state).get(&id).expect("state").craze.gen;
 
     refresh(&hosts, &[]).await;
-    assert!(
-        !lanes.is_open(&address, "craze", HOST_A),
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("finished"),
         "removing the host ended its lane"
     );
+    assert_eq!(reason(&lanes, &address, HOST_A), "host_removed");
     refresh(&hosts, &["s1"]).await;
     new.probe.as_ref().unwrap().answer(Probe::Hub);
     let _new_end = new.roster(json!([row(HOST_A, "ses-a")])).await;
@@ -879,15 +1006,352 @@ async fn a_stale_sources_eviction_never_ends_a_new_generations_lane() {
     let new_gen = lock(&hosts.state).get(&id).expect("state").craze.gen;
     assert_ne!(old_gen, new_gen);
 
-    // The OLD source's news, late.
-    publish_craze_gone(&hosts.on_craze, &id, old_gen, &[HOST_A.to_string()]);
-    assert!(
-        lanes.is_open(&address, "craze", HOST_A),
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("live"),
+        "the new generation's lane replaced the finished one"
+    );
+
+    // The OLD source's news, late — numbered past anything of the new one's,
+    // which no other generation's number ever outranks (C1 re-review).
+    let gone = [HOST_A.to_string()];
+    publish_craze_gone(
+        &hosts.on_craze,
+        &id,
+        old_gen,
+        u64::MAX,
+        &gone,
+        Departure::Removed,
+    );
+    publish_craze(
+        &hosts.on_craze,
+        &id,
+        old_gen,
+        CrazeNews::HostRemoved { seq: u64::MAX },
+    );
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("live"),
         "a stale source's eviction never ends a newer generation's lane"
     );
     // The current generation's does.
-    publish_craze_gone(&hosts.on_craze, &id, new_gen, &[HOST_A.to_string()]);
-    assert!(!lanes.is_open(&address, "craze", HOST_A));
+    let seq = mint_news(&hosts, &id);
+    publish_craze_gone(
+        &hosts.on_craze,
+        &id,
+        new_gen,
+        seq,
+        &gone,
+        Departure::Removed,
+    );
+    assert_eq!(lane_state(&lanes, &address, HOST_A), Some("departing"));
+}
+
+/// `id`'s craze source's next news number, minted under the state lock as
+/// every publisher mints its own ([`crate::craze::CrazeState::mint_news`]).
+fn mint_news(hosts: &RoostHosts, id: &HostId) -> u64 {
+    lock(&hosts.state)
+        .get_mut(id)
+        .expect("the host's state")
+        .craze
+        .mint_news()
+}
+
+/// **A row listed again within the grace keeps its lane** (plan 032 §3.1.1
+/// item 3, W1 cell 2 through the real fold): the roster removes A — its lane
+/// departs — and lists it again before the grace ends; `HostCrazeSink::fold`
+/// publishes the return, and the lane stays live past the grace.
+#[tokio::test]
+async fn a_row_listed_again_within_the_grace_keeps_its_lane() {
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_over(&hosts);
+    let mut roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the row", || (craze_rows(&hosts).len() == 1).then_some(())).await;
+    lanes
+        .open(LOCALHOST, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+
+    roster
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_A]))
+        .await;
+    wait_for("the removal to depart the lane", || {
+        (lane_state(&lanes, LOCALHOST, HOST_A) == Some("departing")).then_some(())
+    })
+    .await;
+    roster
+        .roster("sub-1", EPOCH, json!([row(HOST_A, "ses-a")]), json!([]))
+        .await;
+    wait_for("the return to keep the lane", || {
+        (lane_state(&lanes, LOCALHOST, HOST_A) == Some("live")).then_some(())
+    })
+    .await;
+    tokio::time::sleep(GRACE * 2).await;
+    assert_eq!(
+        lane_state(&lanes, LOCALHOST, HOST_A),
+        Some("live"),
+        "the cancelled grace ended nothing"
+    );
+}
+
+/// **A Dormant departure expires `hub_gone`** (plan 032 PC14g, W1 cell 16
+/// through the real source): the remote hub's roster ends, the find-only
+/// probe finds no hub, the source goes Dormant — every row leaves WITH the
+/// hub — and the lane's grace ends it `hub_gone`, not `session_gone`.
+#[tokio::test]
+async fn a_dormant_sources_lane_ends_hub_gone() {
+    let craze = Scripted::attach_only();
+    let id = HostId::Machine("mini3".to_string());
+    let hosts = Arc::new(start_scripted(
+        &config_with(&["mini3"]),
+        &test_options(&[]),
+        vec![(id.clone(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_over(&hosts);
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::Hub);
+    let roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("live", || {
+        (status_of(&hosts, "mini3").unwrap()["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let address = id.address();
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+
+    // The hub goes: its roster connection ends, and the probe finds none.
+    roster.close().await;
+    probe.answer(Probe::NoHub);
+    wait_for("the source to go dormant", || {
+        (status_of(&hosts, "mini3").unwrap()["craze"]["state"] == "dormant").then_some(())
+    })
+    .await;
+    wait_for("the grace to end the lane", || {
+        (lane_state(&lanes, &address, HOST_A) == Some("finished")).then_some(())
+    })
+    .await;
+    assert_eq!(reason(&lanes, &address, HOST_A), "hub_gone");
+}
+
+/// **A re-registered host never adopts a departing lane** (plan 032 §3.1.1
+/// item 12, W1 cell 14): the lane departs (the roster removed its row), the
+/// host is removed — the lane ends `host_removed` at once, no grace — and is
+/// registered again, its NEW source listing the same hostId. That return is
+/// another generation's: the old lane stays finished. And `open` does not
+/// adopt it either — a fresh lane opens through the new source, filed under
+/// its generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reregistered_host_never_adopts_a_departing_lane() {
+    let (id, config) = srv_shed("s1");
+    let address = id.address();
+    let old = Scripted::attach_only();
+    let new = Scripted::attach_only();
+    let hosts = start_queued(&config, &id, vec![Arc::clone(&old), Arc::clone(&new)]);
+    let lanes = lanes_over(&hosts);
+    refresh(&hosts, &["s1"]).await;
+    old.probe.as_ref().unwrap().answer(Probe::Hub);
+    let mut old_end = old.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the old row", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("the old generation's lane");
+    let old_gen = lock(&hosts.state).get(&id).expect("state").craze.gen;
+    old_end
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_A]))
+        .await;
+    wait_for("the lane to depart", || {
+        (lane_state(&lanes, &address, HOST_A) == Some("departing")).then_some(())
+    })
+    .await;
+    // Another generation's return, while it departs: nothing.
+    publish_craze(
+        &hosts.on_craze,
+        &id,
+        old_gen + 1_000,
+        CrazeNews::Returned {
+            host_ids: &[HOST_A.to_string()],
+            seq: u64::MAX,
+        },
+    );
+    assert_eq!(lane_state(&lanes, &address, HOST_A), Some("departing"));
+
+    refresh(&hosts, &[]).await;
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("finished"),
+        "the host's removal swept its departing lane at once"
+    );
+    assert_eq!(reason(&lanes, &address, HOST_A), "host_removed");
+    refresh(&hosts, &["s1"]).await;
+    new.probe.as_ref().unwrap().answer(Probe::Hub);
+    let _new_end = new.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the new row", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    let new_gen = lock(&hosts.state).get(&id).expect("state").craze.gen;
+    assert_ne!(old_gen, new_gen);
+    tokio::time::sleep(GRACE).await;
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("finished"),
+        "the new source's listing revived nothing"
+    );
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("a fresh lane through the new source");
+    assert_eq!(lane_state(&lanes, &address, HOST_A), Some("live"));
+    assert_eq!(
+        lanes.messages(&address, "craze", HOST_A).expect("readable")["finished"],
+        false
+    );
+}
+
+/// The departure grace of the cells that order craze news: long enough that
+/// a cell's steps between a departure and its late news never outlast it.
+const ORDER_GRACE: Duration = Duration::from_secs(2);
+
+/// `localhost`'s craze roster listing host A, and a lane open on A — over an
+/// [`ORDER_GRACE`], with `hold` on the lanes' news. Answers the roster's
+/// connection, and the scripted craze it rides (kept alive by the cell).
+async fn lane_on_a(hold: &Arc<NewsHold>) -> (Arc<RoostHosts>, Arc<Lanes>, HubEnd, Arc<Scripted>) {
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_holding(&hosts, ORDER_GRACE, Arc::clone(hold));
+    let roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the row", || (craze_rows(&hosts).len() == 1).then_some(())).await;
+    lanes
+        .open(LOCALHOST, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+    (hosts, lanes, roster, craze)
+}
+
+/// Until A's lane is `state`.
+async fn lane_becomes(lanes: &Lanes, state: &'static str) {
+    wait_for(state, || {
+        (lane_state(lanes, LOCALHOST, HOST_A) == Some(state)).then_some(())
+    })
+    .await;
+}
+
+/// **A delayed return never cancels a newer departure** (C1
+/// re-review — the reported interleaving): the roster drops A, and its lane
+/// departs; a reseed restores the row, and its fold (the real one) mints the
+/// return and pauses before publishing it; a departure of the restored row
+/// completes, its departure minted AFTER the return, and publishes it — a
+/// duplicate for the departing lane, but newer news; THEN the return lands.
+/// The lane does not take it: it stays departing, and its grace still ends
+/// it `session_gone`, on time — at the first departure's deadline. Unfenced,
+/// the return revived the lane and cancelled its grace, and with no final
+/// event the 10 s end was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_return_never_cancels_a_newer_departure() {
+    let hold = Arc::new(NewsHold::default());
+    let (hosts, lanes, mut roster, _craze) = lane_on_a(&hold).await;
+
+    // The roster drops A: the lane departs, its grace from here.
+    let departed = std::time::Instant::now();
+    roster
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_A]))
+        .await;
+    lane_becomes(&lanes, "departing").await;
+
+    // A reseed restores A — and its fold pauses, the return minted.
+    hold.hold_returns(true);
+    roster.reset("sub-1", "omitted").await;
+    let resub = roster.expect("sessions.subscribe").await;
+    roster
+        .reply(
+            &resub,
+            json!({"subscription": "sub-2", "epoch": EPOCH, "cursor": 3,
+                   "sessions": [row(HOST_A, "ses-a")]}),
+        )
+        .await;
+    let back = wait_for("the reseed's return, held", || hold.held_seq()).await;
+    hold.hold_returns(false);
+
+    // a departure of the restored row: its departure, minted after the
+    // return, lands first.
+    let departure = departure_minted(&hosts, &local());
+    assert!(
+        back < departure.1,
+        "the return ({back}) was minted before the departure ({})",
+        departure.1
+    );
+    departure_published(&hosts, &local(), departure);
+    assert_eq!(lane_state(&lanes, LOCALHOST, HOST_A), Some("departing"));
+
+    // The delayed return lands.
+    hold.release(&lanes);
+    assert_eq!(
+        lane_state(&lanes, LOCALHOST, HOST_A),
+        Some("departing"),
+        "a return minted before the departure never revives the lane"
+    );
+    lane_becomes(&lanes, "finished").await;
+    let took = departed.elapsed();
+    assert!(
+        took >= ORDER_GRACE && took < ORDER_GRACE + Duration::from_secs(1),
+        "ended {took:?} after the row left (grace {ORDER_GRACE:?})"
+    );
+    assert_eq!(reason(&lanes, LOCALHOST, HOST_A), "session_gone");
+}
+
+/// **A stale departure never departs a lane a newer return kept**
+/// (C1 re-review — the reverse interleaving): a departure of A is minted and
+/// its task pauses before publishing it; meanwhile the roster drops A and
+/// lists it again — a departure and a return, minted by the real fold after
+/// it, and applied; THEN the departure lands. The lane already took
+/// newer news, so it stays live — no departure, no grace, no `session_gone` in
+/// 10 s for a row that is listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_departure_never_departs_a_returned_lane() {
+    let hold = Arc::new(NewsHold::default());
+    let (hosts, lanes, mut roster, _craze) = lane_on_a(&hold).await;
+
+    // A departure minted — and its task paused before publishing.
+    let departure = departure_minted(&hosts, &local());
+
+    // The roster drops A and lists it again, both after the departure.
+    roster
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_A]))
+        .await;
+    lane_becomes(&lanes, "departing").await;
+    roster
+        .roster("sub-1", EPOCH, json!([row(HOST_A, "ses-a")]), json!([]))
+        .await;
+    lane_becomes(&lanes, "live").await;
+    let back = hold.last_return().expect("the roster's return");
+    assert!(
+        departure.1 < back,
+        "the departure ({}) was minted before the return ({back})",
+        departure.1
+    );
+
+    // The stale departure lands.
+    departure_published(&hosts, &local(), departure);
+    assert_eq!(
+        lane_state(&lanes, LOCALHOST, HOST_A),
+        Some("live"),
+        "a departure minted before the return never departs the lane again"
+    );
 }
 
 /// **A craze tab the merge HIDES is still killable** (C9 review): with the
@@ -2169,6 +2633,20 @@ async fn a_created_session_stopped_before_any_roster_lists_it_leaves_the_listing
         json!(1),
         "the machine's count agrees"
     );
+    // `lane.open` on it answers the readable ENDED lane (plan 032 §3.1.1 item
+    // 9) — never a fresh one: its row is gone. And once the panel closes,
+    // nothing opens on it at all.
+    lanes
+        .open(LOCALHOST, "craze", HOST_NEW)
+        .await
+        .expect("the ended lane, readable");
+    assert_eq!(
+        lanes
+            .messages(LOCALHOST, "craze", HOST_NEW)
+            .expect("readable")["finished"],
+        true
+    );
+    lanes.close(LOCALHOST, "craze", HOST_NEW);
     let refused = lanes.open(LOCALHOST, "craze", HOST_NEW).await;
     assert!(refused.is_err(), "no lane opens on it: {refused:?}");
 }

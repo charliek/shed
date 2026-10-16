@@ -1896,9 +1896,10 @@ impl Handler {
     }
 
     /// `lane.messages {machine, kind, session_id}` → `{messages, activity,
-    /// generation, stale, ended, capabilities, settings, slash_menu}` — the
-    /// staged-then-swapped view, never a half-seeded one, and the one place a
-    /// client reads what the session can do (its `/` menu included, resolved).
+    /// generation, stale, ended, finished, capabilities, settings,
+    /// slash_menu}` — the staged-then-swapped view, never a half-seeded one,
+    /// and the one place a client reads what the session can do (its `/` menu
+    /// included, resolved); `finished` is the lane over for good (plan 032).
     fn lane_messages(&self, params: &Value) -> Result<Value, (String, String)> {
         let (machine, kind, session_id) = lane_target(params)?;
         self.lanes

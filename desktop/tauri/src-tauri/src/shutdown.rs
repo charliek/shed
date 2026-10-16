@@ -223,15 +223,21 @@ pub async fn shutdown_children(
         1,
         "lanes",
         phase,
+        // `lanes` counts every registered entry, the finished ones a craze
+        // lane keeps readable included (plan 032 §3.1.1 item 11); `graces`
+        // are the departure grace tasks joined alongside the pumps.
         format_args!(
-            "lanes={} forwards={} pumps={} slots={}; abandoned: forward reaps={} pumps={} \
-             slot reaps={}",
+            "lanes={} (finished={}) forwards={} pumps={} graces={} slots={}; abandoned: \
+             forward reaps={} pumps={} graces={} slot reaps={}",
             lanes_closed.lanes,
+            lanes_closed.finished,
             lanes_closed.forwards,
             lanes_closed.pumps,
+            lanes_closed.graces,
             slots.closed,
             lanes_closed.forwards_unsettled,
             lanes_closed.pumps_unjoined,
+            lanes_closed.graces_unjoined,
             slots.unsettled
         ),
     );

@@ -54,3 +54,21 @@ test("CONTROL: a Send whose answer was lost says to check the transcript before 
   assert.equal(sendFailureText({ code: "not_accepting", message: "the session is not accepting that right now" }),
                "the session is not accepting that right now");
 });
+
+test("REGRESSION (plan 032): a FINISHED lane disables the composer, Send, Cancel and Interject", () => {
+  // Working and offering both verbs — exactly when every one would be live —
+  // but the lane is over: its session's final Down, or the backend ended it.
+  const verbs = laneVerbs(caps(true, true), "working", true);
+  assert.deepEqual(verbs.cancel, { shown: true, enabled: false }, "Cancel stays, disabled");
+  assert.deepEqual(verbs.interject, { shown: true, enabled: false });
+  assert.deepEqual(verbs.composer, { enabled: false });
+  // A capability the session never offered is still no button at all.
+  assert.deepEqual(laneVerbs(caps(false, false), "working", true).cancel, { shown: false, enabled: false });
+});
+
+test("CONTROL: a live lane's composer is enabled, finished absent or false", () => {
+  assert.deepEqual(laneVerbs(caps(true, false), "idle").composer, { enabled: true });
+  assert.deepEqual(laneVerbs(caps(true, false), "working", false).composer, { enabled: true });
+  assert.deepEqual(laneVerbs(null, "unknown", false).composer, { enabled: true }, "before the first seed");
+  assert.deepEqual(laneVerbs(caps(true, false), "working", false).cancel, { shown: true, enabled: true });
+});

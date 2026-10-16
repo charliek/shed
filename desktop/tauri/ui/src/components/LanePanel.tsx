@@ -42,6 +42,14 @@
 
    `lane.open` on mount, `lane.close` on unmount, and no polling anywhere.
 
+   **A finished lane stays on screen, read-only** (plan 032 §3.1.1 item 13):
+   a craze lane outlives its row by a grace and then ends visibly, so the
+   panel keeps its transcript and its `ended · <reason>` banner, and once
+   `lane.messages` says `finished` the composer, Send, Interject and Cancel
+   are disabled (`laneVerbs`' gate) — keyed on `finished`, never on `ended`,
+   which a retryable `Down` sets too. A verb that races the end is refused
+   `lane_ended`, shown in the action-error line like any refusal.
+
    **The lane's kind is part of its address** (plan 025 §3.6.4): the panel is
    opened with the row's `agent_lane.kind`, and every `lane.*` call carries it —
    a craze hostId and an opencode session id are different namespaces. For a
@@ -434,7 +442,11 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  lane has no Interject; a session whose capabilities say `cancel: false`
    *  has no Cancel), and an offered verb is enabled only while it is Working. */
   const capabilities = view?.capabilities ?? null;
-  const verbs = laneVerbs(capabilities, view?.activity ?? "");
+  /** The lane is over for good — the backend's `finished`, not `ended`. */
+  const finished = view?.finished ?? false;
+  const verbs = laneVerbs(capabilities, view?.activity ?? "", finished);
+  /** The composer takes no draft, Send or key once the lane is finished. */
+  const composerOff = !verbs.composer.enabled;
   const canInterject = verbs.interject.shown;
   /** …and the state half: armed only while the agent would accept one. */
   const interjecting = verbs.interject.enabled && interject;
@@ -552,7 +564,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
   /** What the latest render knows, for the async continuations and the doors
    *  (a door's listener is registered once). */
   const rendered = { prompt, caret, menu, catalog, activity, filtered, filter, highlight, dismissed, interjecting,
-                     busy, confirming: confirmStop };
+                     busy, confirming: confirmStop, composerOff };
   const live = useRef(rendered);
   live.current = rendered;
   // A programmatic draft (a completion, the type door) puts the caret where
@@ -689,7 +701,9 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  was for a draft that no longer exists: dropped, silently, nothing sent. */
   const submitAt = async (at: Claim) => {
     const now = live.current;
-    if (now.busy || !at.draft.trim()) return;
+    // A finished lane sends nothing (its Send is disabled; Enter and the
+    // doors land here too).
+    if (now.busy || now.composerOff || !at.draft.trim()) return;
     if (!now.menu) return sendText(at.draft.trim(), at.rev);
     let d: SlashDispatch;
     try {
@@ -713,7 +727,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  completion overwrites the newer text, and nothing runs. */
   const acceptAt = async (name: string, key: SlashAcceptKey, at: Claim, catalog: string) => {
     const now = live.current;
-    if (!now.menu || now.busy || now.catalog !== catalog) return;
+    if (!now.menu || now.busy || now.composerOff || now.catalog !== catalog) return;
     let a;
     try {
       a = await laneSlashAccept(now.menu, at.draft, name, key, now.activity);
@@ -1020,6 +1034,8 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
     generation: view?.generation ?? 0,
     stale: view?.stale ?? null,
     ended: view?.ended ?? false,
+    finished,
+    composer_disabled: composerOff,
     rows,
     approvals: cards,
     can_cancel: verbs.cancel.enabled,
@@ -1442,8 +1458,15 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
           onSelect={(e) => placeCaret(e.currentTarget.selectionStart ?? 0)}
           onKeyDown={onComposerKey}
           rows={2}
-          placeholder={menu ? "Send a prompt, or / for commands…" : "Send a prompt…"}
-          className="min-w-0 flex-1 resize-none rounded-[9px] border border-shed-border bg-shed-inset px-3 py-2 text-[13px] text-shed-text outline-none focus:border-shed-accent"
+          disabled={composerOff}
+          placeholder={
+            composerOff
+              ? "This session has ended"
+              : menu
+                ? "Send a prompt, or / for commands…"
+                : "Send a prompt…"
+          }
+          className="min-w-0 flex-1 resize-none rounded-[9px] border border-shed-border bg-shed-inset px-3 py-2 text-[13px] text-shed-text outline-none focus:border-shed-accent disabled:opacity-50"
         />
         <div className="flex flex-none flex-col gap-2">
           {/* Present only when the adapter says it can interject, enabled only
@@ -1477,14 +1500,14 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
           )}
           <button
             onClick={() => void submit()}
-            disabled={busy || !prompt.trim()}
-            title={interjecting ? "Send (interject)" : "Send"}
+            disabled={busy || composerOff || !prompt.trim()}
+            title={composerOff ? "The session has ended" : interjecting ? "Send (interject)" : "Send"}
             className="hbtn inline-flex h-9 w-9 items-center justify-center rounded-[9px]"
             style={{
               background: "var(--shed-accent)",
               color: "var(--shed-accent-fg)",
               border: "none",
-              opacity: busy || !prompt.trim() ? 0.5 : 1,
+              opacity: busy || composerOff || !prompt.trim() ? 0.5 : 1,
             }}
           >
             <Send size={15} />

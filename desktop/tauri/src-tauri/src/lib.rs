@@ -1677,14 +1677,16 @@ pub fn run() {
                 }
             }));
             // The craze half (plan 025 §3.6.4): a craze lane's row is its
-            // machine's craze source's, so its eviction rides that source —
-            // a `Removed`, a reseed that dropped the row, the hub gone, the
-            // host removed, its tab ended — not a roost snapshot.
+            // machine's craze source's, so its lifecycle rides that source's
+            // news, not a roost snapshot (plan 032 §3.1.1): a row that left
+            // (a `Removed`, a reseed that dropped it, the hub gone, its tab
+            // ended) starts its lane's departure grace, a row listed again
+            // ends one, and the host's removal ends its whole generation.
             let craze_hook = Arc::downgrade(&lanes);
             machines.set_craze_observer(Arc::new(
-                move |machine: &str, gen: u64, gone: &[String]| {
+                move |machine: &str, gen: u64, news: lane::CrazeNews<'_>| {
                     if let Some(lanes) = craze_hook.upgrade() {
-                        lanes.evict_craze(machine, gen, gone);
+                        lanes.craze_news(machine, gen, news);
                     }
                 },
             ));

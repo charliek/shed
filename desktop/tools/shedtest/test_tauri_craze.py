@@ -91,6 +91,10 @@ KIND = "craze"
 #: The fake host's registry identity (twelve hex digits, as craze mints them).
 FAKE_HOST = "0c0c0c0c0c0c"
 FAKE_SESSION = "craze-desk-fake"
+#: A second fake host, the one the stop-race cell stops (plan 032 §3.1): the
+#: module's `FAKE_HOST` serves the cells after it.
+RACE_HOST = "0f0f0f0f0f0f"
+RACE_SESSION = "craze-desk-race"
 #: The roost tab a craze TUI would run in, for the row merge.
 CRAZE_TAB = 7
 #: Every craze wait is bounded by this, scaled like every other harness wait.
@@ -944,15 +948,80 @@ def test_cancel_ends_a_running_turn(app, rig):
 
 
 def test_stop_ends_the_session_and_its_row(app, created):
-    """`lane.stop` ends the SESSION: the lane ends (`ended`) and the row leaves
-    the roster — and its lane is evicted with it."""
+    """`lane.stop` ends the SESSION: the row leaves the roster, and the lane —
+    which outlives its row by a grace (plan 032 §3.1) — ends with the
+    session's own `session_closed`: `ended` and `finished`, still readable
+    (never `no_lane`), and a verb after it is refused `lane_ended`. (A 0.2.0
+    host drops its row ahead of its last events; plan 025's desktop retired
+    the lane with the row and the panel froze.)"""
     host = created["slug"]
     _ready(app, host)
     _lane(app, "lane.stop", host)
     app.wait_until(lambda: _row(app, host) is None, timeout=WAIT,
                    what="the stopped session's row to leave")
-    gone = _error(lambda: _messages(app, host))
-    assert gone.code == "no_lane", gone
+    app.wait_until(lambda: _messages(app, host)["finished"], timeout=WAIT,
+                   what="the stopped session's lane to end")
+    view = _messages(app, host)
+    assert view["ended"] is True and view["stale"] == "session_closed", view
+    refused = _error(lambda: _lane(app, "lane.send", host, text="after the end"))
+    assert refused.code == "lane_ended", refused
+
+
+def test_a_lane_outlives_its_stopping_row_and_ends_visibly(app, rig):
+    """**A craze lane outlives its row by a grace, then ends VISIBLY** (plan 032
+    §3.1, the Stop freeze; §7 W1 e2e 1). A fake host's turn is running, and
+    `mark_stopping` makes the hub drop its row on its next round — ahead of
+    the session's last events, exactly as a 0.2.0 host's stop does. The lane
+    keeps its own connection: the late text and the turn's end still land on
+    it, the host then quits, and the lane ENDS — `finished`, with a final
+    reason — instead of freezing on its last frame. No read fails `no_lane`
+    at any point, a send is refused `lane_ended`, and the panel shows the
+    ended banner with its composer disabled.
+
+    The fake host's `quit` sends no `session_closed` (PC14a), so the final
+    reason is the lane's redial finding no such session (`unknown_session`)
+    or the grace running out (`session_gone`); `session_closed` itself is
+    `test_stop_ends_the_session_and_its_row`'s, through a real `craze serve`."""
+    host = rig.fake_host(RACE_HOST, RACE_SESSION)
+    app.wait_until(lambda: _row(app, RACE_HOST) is not None, timeout=WAIT,
+                   what="the racing fake host's row")
+    _ready(app, RACE_HOST)
+    _panel(app, RACE_HOST)
+    rig.op(host, {"name": "hang_next"})
+    _lane(app, "lane.send", RACE_HOST, text="the last turn")
+    app.wait_until(lambda: _messages(app, RACE_HOST)["activity"] == "working", timeout=WAIT,
+                   what="the last turn to be running")
+
+    rig.op(host, {"name": "mark_stopping"})
+    app.wait_until(lambda: _row(app, RACE_HOST) is None, timeout=WAIT,
+                   what="the stopping host's row to leave the roster")
+    view = _messages(app, RACE_HOST)
+    assert view["finished"] is False, f"a departing lane is not over yet: {view}"
+    late = "late words after the row left"
+    rig.op(host, {"name": "text", "text": late})
+    rig.op(host, {"name": "end"})
+    app.wait_until(lambda: any(late in t for t in _texts(app, RACE_HOST)),
+                   timeout=WAIT, what="the late text to land on the departing lane")
+    rig.op(host, {"name": "quit"})
+    host.wait(timeout=10)
+
+    app.wait_until(lambda: _messages(app, RACE_HOST)["finished"], timeout=WAIT,
+                   what="the lane to end with a final reason")
+    view = _messages(app, RACE_HOST)
+    assert view["ended"] is True, view
+    assert view["stale"] in ("unknown_session", "session_gone"), view
+    assert any(late in t for t in _texts(app, RACE_HOST)), "the transcript stays"
+    assert _lane(app, "lane.approvals", RACE_HOST)["approvals"] == []
+    refused = _error(lambda: _lane(app, "lane.send", RACE_HOST, text="anyone there?"))
+    assert refused.code == "lane_ended", refused
+    app.wait_until(lambda: bool((d := _dump(app)) and d["finished"]), timeout=20,
+                   what="the panel to render the ended lane")
+    panel = _dump(app)
+    assert panel["ended"] is True and panel["composer_disabled"] is True, panel
+    assert panel["can_cancel"] is False, panel
+    assert panel["stale"] == view["stale"], panel
+    _shot(app, "craze-lane-ended.png")
+    _unmount(app)
 
 
 # ---------------------------------------------------------------------------

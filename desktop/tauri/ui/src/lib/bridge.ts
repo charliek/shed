@@ -1515,6 +1515,13 @@ export type LaneView = {
   generation: number;
   stale: string | null;
   ended: boolean;
+  /** The lane is over for good (plan 032 §3.1.1, PC14b) — the ENTRY's
+   *  lifecycle, not `ended`: its session's final `Down` arrived, or the
+   *  backend ended it (`session_gone`/`hub_gone` after its row left and the
+   *  grace ran out, `host_removed`). Every verb is then refused `lane_ended`,
+   *  and the panel disables its composer, Send and Cancel. `ended` alone may
+   *  be a retryable `Down` the backend is already resubscribing after. */
+  finished: boolean;
   capabilities: LaneCapabilities | null;
   settings: LaneSettings | null;
   /** The session's `/` menu, RESOLVED by the shared core (plan 029 §3.4):
@@ -1995,6 +2002,12 @@ export type LaneReport = {
   stale: string | null;
   /** The subscription ENDED (a `Down`) — not merely stale. */
   ended: boolean;
+  /** The lane is over for good (`lane.messages`' `finished`, plan 032): what
+   *  `composer_disabled` follows. */
+  finished: boolean;
+  /** The composer — its text box, Send, Interject and Cancel — is disabled
+   *  because the lane is FINISHED (`laneVerbs`' `composer`). */
+  composer_disabled: boolean;
   rows: LaneRow[];
   approvals: LaneApprovalCard[];
   /** The Cancel button exists AND is enabled: the session's streamed
