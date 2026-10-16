@@ -355,6 +355,45 @@ export function settleResume(
   return { ...r, rows: { ...rows, [id]: { phase, refusal } } };
 }
 
+/** The shell's open transcript, structurally `App.tsx`'s `lane` state: the
+ *  lane's address (what keys the panel), whether its settings sheet is asked
+ *  for, and `opens` — how many times the shell asked the panel on screen to
+ *  open its lane AGAIN in place ([`laneOnResume`]). */
+export type LaneTarget = {
+  machine: string;
+  kind: string;
+  sessionId: string;
+  settings?: boolean;
+  opens?: number;
+};
+
+/** The transcript a resume that lands `open` ([`reopenLanding`]) shows: the
+ *  resumed session's, at `target`.
+ *
+ *  Usually not the panel on screen, if any: a panel is keyed by its lane's
+ *  address, so another session's mounts fresh and opens its lane. But a
+ *  resume can land on the session the panel ALREADY shows — a finished lane
+ *  (`hub_gone`, say) whose host outlived its hub, rejoined `joined: true`
+ *  under the same hostId (branch review). Its address, so its key and its
+ *  open, would not change, and it would go on showing the ended transcript,
+ *  composer disabled, on a session that runs. So the same address moves
+ *  `opens` instead, and the panel opens the lane again where it stands —
+ *  `lane.open` with no `lane.close` first, which the backend answers by
+ *  replacing a FINISHED lane with a fresh one once that open commits (a
+ *  failed open leaves the ended one readable) and a live one by re-answering
+ *  it. Everything else about the panel (its settings sheet) stays. */
+export function laneOnResume(
+  current: LaneTarget | null,
+  target: { machine: string; kind: string; sessionId: string },
+): LaneTarget {
+  const same =
+    current !== null &&
+    current.machine === target.machine &&
+    current.kind === target.kind &&
+    current.sessionId === target.sessionId;
+  return same ? { ...current, opens: (current.opens ?? 0) + 1 } : { ...target };
+}
+
 /** A row's button label: Resume; Resuming… while its reopen runs; Retry
  *  after `unavailable`. */
 export function resumeLabel(state: SavedRowState): string {

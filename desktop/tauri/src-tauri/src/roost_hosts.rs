@@ -90,7 +90,9 @@ use shed_core::lane::{
 };
 use shed_craze::CrazeSource;
 
-use crate::craze::{CrazeFailure, CrazePhase, CrazeReach, CrazeSink, CrazeState, CrazeTimings};
+use crate::craze::{
+    CrazeFailure, CrazePhase, CrazeReach, CrazeSink, CrazeState, CrazeTimings, Dormancy,
+};
 use crate::lane::{CrazeNews, Departure};
 use crate::machines::{
     build_local_craze, build_local_reach, build_ssh_craze, build_ssh_reach, reject_reserved_name,
@@ -304,15 +306,16 @@ pub type OnLanes = Arc<dyn Fn(&str, &BTreeMap<String, AgentLaneStamp>) + Send + 
 /// ([`crate::lane::CrazeNews`], plan 032 §3.1.1):
 ///
 /// * **`Departed`** — craze rows (hostIds) that left the source: a roster
-///   `Removed`, a `Ready` swap that no longer lists them (an epoch reseed
-///   sends no `Removed`) or the tab of a TUI-hosted session ended (cause
-///   `Removed`), or the hub gone, the source Dormant (cause `HubGone`). Their
-///   lanes depart, for a grace (plan 025 §3.6.4 retired them at once).
+///   `Removed` or a `Ready` swap that no longer lists them (an epoch reseed
+///   sends no `Removed`; cause `Removed`), or the hub gone, the source
+///   Dormant (cause `HubGone`) — its roster rows and the source's created
+///   rows alike ([`CrazeState::dormant`]). Their lanes depart, for a grace
+///   (plan 025 §3.6.4 retired them at once).
 /// * **`Returned`** — craze rows the source newly lists (a `Session` upsert of
-///   a hostId it did not hold, a `Ready` that lists one): a departing lane on
-///   one is live again. Published by the source's FOLD alone
-///   ([`HostCrazeSink::fold`]). A create's fold-ahead publishes none — the
-///   fold landing that row's frame does.
+///   a hostId it did not hold, a `Ready` that lists one), or the row a create
+///   or a reopen answered with and lists at once
+///   ([`RoostHosts::list_answered_row`]): a departing lane on one is live
+///   again.
 /// * **`HostRemoved`** — the host's removal: EVERY lane of the generation
 ///   ends now, whatever rows the source last held (PC3).
 ///
@@ -321,12 +324,14 @@ pub type OnLanes = Arc<dyn Fn(&str, &BTreeMap<String, AgentLaneStamp>) + Send + 
 /// roost-stamped lanes.
 ///
 /// **Every piece is published AFTER the state lock that computed it is
-/// released**, by one of two publishers, each on its own task: the source's
-/// fold ([`HostCrazeSink::fold`] — departures and returns, on the source's
-/// task) and the host's removal ([`RoostHosts::remove`]). End tab publishes
+/// released**, by one of three publishers, each on its own task: the
+/// source's fold ([`HostCrazeSink::fold`] — departures and returns, on the
+/// source's task), a create's or a reopen's listing of the row it answered
+/// with ([`RoostHosts::list_answered_row`] — a return, on the IPC op's
+/// task), and the host's removal ([`RoostHosts::remove`]). End tab publishes
 /// nothing (plan 032 E6: a craze session outlives the tab it was shown in, so
-/// departures are the roster's news alone). Two fences make that safe, and the
-/// lane layer judges every piece by both:
+/// a departure is the roster's or the hub's news alone). Two fences make that
+/// safe, and the lane layer judges every piece by both:
 ///
 /// * **The generation** (C9 review): by the time a piece lands, the host may
 ///   have been removed, registered again, and had a lane opened on the same
@@ -335,7 +340,8 @@ pub type OnLanes = Arc<dyn Fn(&str, &BTreeMap<String, AgentLaneStamp>) + Send + 
 ///   or revive — a current lane.
 /// * **The news sequence** (C1 re-review): within one generation, the
 ///   publishers' pieces can still land in another order than they happened
-///   in — a return whose publication paused, landing after a departure
+///   in — a return whose publication paused (a create's, say, while the fold
+///   departs the same row a moment later), landing after a departure
 ///   computed later, would revive the departing lane and lose its grace's
 ///   end. So each piece carries a number every publisher
 ///   mints under the state lock at the moment it computes the piece
@@ -344,6 +350,15 @@ pub type OnLanes = Arc<dyn Fn(&str, &BTreeMap<String, AgentLaneStamp>) + Send + 
 ///   news never undoes newer news, either way. The removal's number is
 ///   minted in the critical section that takes the host's state out, so it
 ///   is its generation's last.
+///
+/// The fences order news by when it was MINTED; neither can tell whether
+/// the evidence it was minted on is older than other news. So a Dormant's
+/// departure is judged fresh BEFORE it is minted, under the state lock (C8
+/// review): only if no create or reopen listed a row since its probe started
+/// ([`crate::craze::CrazeState::dormant`] — that probe may have looked
+/// before the hub the session runs on started). A listing's return is never
+/// held back so: it sides with the session craze just said runs
+/// ([`RoostHosts::list_answered_row`] says what that accepts).
 pub type OnCrazeNews = Arc<dyn Fn(&str, u64, CrazeNews<'_>) + Send + Sync>;
 
 /// The fence every craze task's writes are checked against (see
@@ -1937,25 +1952,20 @@ impl RoostHosts {
     /// keeps its id only then ([`CrazeFailure`]).
     ///
     /// **The created session is listed at once** (§3.6.4), with the SOURCE
-    /// the one authority on it (C10 confirmation): a row only the create's
-    /// answer carries is the source's ([`CrazeSource::created_rows`], read at
-    /// every listing — never copied here, so it expires, is bounded and is
-    /// refused after its session ended exactly as the source rules); a row the
-    /// source's roster already lists is folded ahead of its own frame
+    /// the one authority on it (C10 confirmation) — by
+    /// [`Self::list_answered_row`], the one listing a create and a reopen
+    /// share, rule for rule: a row only the create's answer carries is the
+    /// source's ([`CrazeSource::created_rows`], read at every listing — never
+    /// copied here, so it expires, is bounded and is refused after its
+    /// session ended exactly as the source rules); a row the source's roster
+    /// already lists is folded ahead of its own frame
     /// ([`CrazeState::listed_now`]). Either way the transcript the sheet opens
-    /// next finds it. A replayed answer for a session that has already ENDED
-    /// (craze replays a create for ten minutes) is in neither: it is answered
-    /// `ended: true`, and nothing is listed. Like [`Self::craze_create_options`]
-    /// it is an explicit action that may birth a hub, and it wakes the host's
-    /// source.
-    ///
-    /// **The source's rows are read UNDER this layer's state lock** (live leg
-    /// 1's ghost-row review): the roster pump updates the source's rows BEFORE
-    /// it emits the frame the host's sink then applies under that lock, so a
-    /// roster row read there is never one whose `Removed` this state has
-    /// already applied — read before the lock, a session the roster listed
-    /// and let go in between would be folded back by `listed_now`, a row no
-    /// later frame removes.
+    /// next finds it, and a lane departing on its hostId is live again (the
+    /// listing's return). A replayed answer for a session that has
+    /// already ENDED (craze replays a create for ten minutes) is in neither:
+    /// it is answered `ended: true`, and nothing is listed. Like
+    /// [`Self::craze_create_options`] it is an explicit action that may birth
+    /// a hub, and it wakes the host's source.
     ///
     /// **`held`: the request REPLAYS a kept id** (plan 026 §3.1) — the sheet
     /// re-sending the id it held from an unknown outcome. Then only craze's
@@ -2012,45 +2022,12 @@ impl RoostHosts {
         let host_id = created.session.id.clone();
         #[cfg(test)]
         at_gap(&self.create_gap).await;
-        let (row, ended) = {
-            let mut guard = lock(&self.state);
-            let roster_row = ask.roster_row(&host_id);
-            let ended = ask.listed(&host_id).is_none();
-            let shown = roster_row
-                .clone()
-                .unwrap_or_else(|| created.session.clone());
-            let row = match guard.get_mut(&id).filter(|m| m.craze.gen == gen) {
-                Some(m) => {
-                    // Folded ahead of its frame, and NO return published from
-                    // here (plan 032 §3.1.1 item 3, C1 review): this task's
-                    // publication, made after the lock below is released,
-                    // would be unordered with the source's fold — a delayed
-                    // return could cancel a departure the fold published in
-                    // between, a lane left live on a row that is gone. The
-                    // fold that lands this row's frame reports it instead
-                    // (`CrazeState::listed_now`), in order with its own
-                    // departures.
-                    if let Some(listed) = roster_row {
-                        m.craze.listed_now(listed);
-                    }
-                    // A create craze answered is craze answering here — the
-                    // condition a host is listed on (§3.6.2).
-                    m.listed = true;
-                    let created_now = created_rows(&lock(&self.reg), &id, m);
-                    let tab = m.fold_plan(&created_now).tab_of(&host_id);
-                    craze_row(&id, &shown, !m.craze.live() || ended, tab)
-                }
-                // Removed (or restarted) meanwhile: the session exists all the
-                // same, and its row says so — as the last known.
-                None => craze_row(&id, &shown, true, None),
-            };
-            (row, ended)
-        };
+        let answered = self.list_answered_row(&id, gen, &ask, &created.session);
         (self.on_change)();
         Ok(json!({
-            "session": row,
+            "session": answered.row,
             "host_id": host_id,
-            "ended": ended,
+            "ended": answered.ended,
             "prompt": created.prompt.as_str(),
             "prompt_error": created.prompt_error,
             "request_id": request_id,
@@ -2208,8 +2185,9 @@ impl RoostHosts {
     /// **The path mirrors [`Self::craze_create`]'s** (PC11): admitted — or
     /// refused — under the registry lock, the host's explicit-action dial
     /// (which may birth a hub), the host's source woken on any answer, and the
-    /// answered row listed at once under the source's generation
-    /// ([`Self::list_answered_row`]). The source keeps that row as a created
+    /// answered row listed at once under the source's generation by the same
+    /// listing ([`Self::list_answered_row`]) — a lane departing on its hostId
+    /// live again with it. The source keeps that row as a created
     /// row that is FRESH — it lifts a tombstone for its hostId rather than
     /// being refused by one (PC14f) — so `lane.open {kind: "craze",
     /// session_id: host_id}` works before any roster lists it. `ended`: the
@@ -2261,20 +2239,63 @@ impl RoostHosts {
         }))
     }
 
-    /// A reopen's answered row, folded into `id`'s state at once under the
-    /// source generation `gen` — the row as listed (or, the host removed or
-    /// restarted meanwhile, as the last known: [`AnsweredRow::superseded`])
-    /// and whether the source no longer lists it.
+    /// **The row a create or a reopen answered with, listed at once** under
+    /// the source generation `gen` — the ONE listing [`Self::craze_create`]
+    /// and [`Self::craze_reopen`] share, so the two can never treat the row
+    /// they open a transcript on differently: the row as listed (or, the host
+    /// removed or restarted meanwhile, as the last known:
+    /// [`AnsweredRow::superseded`]) and whether the source no longer lists it.
     ///
-    /// **[`Self::craze_create`]'s created-row integration, rule for rule** —
-    /// a change to one is a change to both: the source's rows read UNDER this
-    /// layer's state lock (live leg 1's ghost-row review: the roster pump
-    /// updates them before the sink applies its frame under this lock); a
-    /// roster row folded ahead of its own frame, with NO return published
-    /// from here (plan 032 §3.1.1 item 3 — the fold that lands the frame
-    /// reports it, in order with its own departures); the host listed,
-    /// because craze answered there; the row read through the source's
-    /// created rows, never a copy of this layer's.
+    /// * **The source's rows are read UNDER this layer's state lock** (live
+    ///   leg 1's ghost-row review): the roster pump updates them BEFORE it
+    ///   emits the frame the host's sink then applies under that lock, so a
+    ///   roster row read here is never one whose `Removed` this state has
+    ///   already applied — read before the lock, a session the roster listed
+    ///   and let go in between would be folded back by `listed_now`, a row no
+    ///   later frame removes.
+    /// * **A row the source's roster lists is folded ahead of its own frame**
+    ///   ([`CrazeState::listed_now`]); a row only the answer carries is the
+    ///   source's created row, read through [`created_rows`] — never a copy
+    ///   of this layer's (C10 confirmation). Either way the row OPENS — always,
+    ///   whatever this state's last Dormant dropped (c8b review finding 1).
+    /// * **The host is listed** — craze answered there (§3.6.2).
+    /// * **The row's lane lifecycle news: a RETURN** (plan 032 §3.1.1 item 3,
+    ///   branch review). A row the source lists now is a row listed again
+    ///   for a lane departing on its hostId — a reopen that rejoined a host
+    ///   that outlived its hub (the lane departing `hub_gone`), a create
+    ///   whose row the roster had not reached — so its departure ends here,
+    ///   exactly as the fold's return ends one: otherwise its grace could end
+    ///   the lane on a session that runs, before any roster catches up. The
+    ///   news number is minted HERE, under the state lock, at the moment the
+    ///   row is read as listed ([`CrazeState::answer_listed`]), and published
+    ///   after the lock is released: the news fence ([`OnCrazeNews`]) orders
+    ///   it with the fold's own news, so a departure computed after it —
+    ///   published before it or not — still wins, and it never revives a lane
+    ///   a later departure departed. A row the source no longer lists
+    ///   (`ended`) returns nothing, and an answer that outlived its
+    ///   generation (`superseded`) touches no lane. Every other answer
+    ///   returns its row, a Dormant folded while its request was in flight or
+    ///   not (C8 review): that Dormant may rest on a probe that looked before
+    ///   the hub this create or reopen started, and a departure it left
+    ///   standing would end a successfully resumed session's panel once its
+    ///   grace ran out (c8b review finding 2).
+    /// * **The accepted limitation** (C8 review): an answer that lands AFTER
+    ///   a genuine hub death — a Dormant folded while the request was in
+    ///   flight, and the hub gone for good — still revives that lane, since
+    ///   the shared source RETAINS the row after its hub goes (a created row,
+    ///   or the roster row it last listed). Later evidence ends it instead:
+    ///   the next probe that started after this listing finds no hub and its
+    ///   Dormant departs the row again (`hub_gone` a grace later), and a host
+    ///   that cannot be reached at all leaves it to the lane's own watcher's
+    ///   give-up bound (shed-craze's 10-minute `GIVE_UP_AFTER`,
+    ///   `Down{unreachable}`) rather than `hub_gone` after the first 10 s
+    ///   grace — a deliberate bias toward never ending a running session's
+    ///   panel.
+    /// * **The listing epoch moves** (C8 review finding 2) for every row
+    ///   listed here: a no-hub answer whose probe started before now no
+    ///   longer folds ([`CrazeState::dormant`]), so it cannot depart a lane
+    ///   opened on this session on evidence from before the hub the create or
+    ///   reopen may have started.
     fn list_answered_row(
         &self,
         id: &HostId,
@@ -2283,27 +2304,46 @@ impl RoostHosts {
         answered: &LaneSession,
     ) -> AnsweredRow {
         let host_id = &answered.id;
-        let mut guard = lock(&self.state);
-        let roster_row = ask.roster_row(host_id);
-        let ended = ask.listed(host_id).is_none();
-        let shown = roster_row.clone().unwrap_or_else(|| answered.clone());
-        let (row, superseded) = match guard.get_mut(id).filter(|m| m.craze.gen == gen) {
-            Some(m) => {
-                if let Some(listed) = roster_row {
-                    m.craze.listed_now(listed);
+        let (listing, returned) = {
+            let mut guard = lock(&self.state);
+            let roster_row = ask.roster_row(host_id);
+            let ended = ask.listed(host_id).is_none();
+            let shown = roster_row.clone().unwrap_or_else(|| answered.clone());
+            match guard.get_mut(id).filter(|m| m.craze.gen == gen) {
+                Some(m) => {
+                    if let Some(listed) = roster_row {
+                        m.craze.listed_now(listed);
+                    }
+                    m.listed = true;
+                    let returned = (!ended).then(|| m.craze.answer_listed());
+                    let created_now = created_rows(&lock(&self.reg), id, m);
+                    let tab = m.fold_plan(&created_now).tab_of(host_id);
+                    let row = craze_row(id, &shown, !m.craze.live() || ended, tab);
+                    (
+                        AnsweredRow {
+                            row,
+                            ended,
+                            superseded: false,
+                        },
+                        returned,
+                    )
                 }
-                m.listed = true;
-                let created_now = created_rows(&lock(&self.reg), id, m);
-                let tab = m.fold_plan(&created_now).tab_of(host_id);
-                (craze_row(id, &shown, !m.craze.live() || ended, tab), false)
+                // Removed (or restarted) meanwhile: the session exists all
+                // the same, and its row says so — as the last known.
+                None => (
+                    AnsweredRow {
+                        row: craze_row(id, &shown, true, None),
+                        ended,
+                        superseded: true,
+                    },
+                    None,
+                ),
             }
-            None => (craze_row(id, &shown, true, None), true),
         };
-        AnsweredRow {
-            row,
-            ended,
-            superseded,
+        if let Some(seq) = returned {
+            publish_craze_returned(&self.on_craze, id, gen, seq, std::slice::from_ref(host_id));
         }
+        listing
     }
 
     /// `id`'s home directory as this app KNOWS it — what the resume sheet
@@ -2572,6 +2612,7 @@ impl RoostHosts {
                         id: id.clone(),
                         gen,
                         state: Arc::clone(&self.state),
+                        reg: Arc::clone(&self.reg),
                         on_change: self.on_change.clone(),
                         on_craze: Arc::clone(&self.on_craze),
                     });
@@ -3144,9 +3185,10 @@ impl RoostHosts {
             }
             drop(execs);
             // The removal's news number, minted in the section that takes the
-            // state out (C1 re-review): no fold or End tab can mint another
-            // for this generation after it, so it is the generation's last
-            // news, and newer than any a lane of it took (`OnCrazeNews`).
+            // state out (C1 re-review): no fold, create or reopen can mint
+            // another for this generation after it (each mints under this
+            // lock, on the state this takes out), so it is the generation's
+            // last news, and newer than any a lane of it took (`OnCrazeNews`).
             let mut removed = state.remove(id);
             let seq = removed.as_mut().map(|m| m.craze.mint_news());
             (removed.zip(seq), craze, (watcher, reach, exec))
@@ -4066,6 +4108,10 @@ struct HostCrazeSink {
     id: HostId,
     gen: u64,
     state: Arc<Mutex<BTreeMap<HostId, HostState>>>,
+    /// The registry, for the source's created rows a Dormant departs
+    /// ([`created_rows`]) — taken under `state`, the one order the two are
+    /// held in.
+    reg: Arc<Mutex<Registry>>,
     on_change: OnChange,
     on_craze: Arc<Mutex<Option<OnCrazeNews>>>,
 }
@@ -4076,18 +4122,16 @@ impl HostCrazeSink {
     /// `cause`) and the newly listed rows' departing lanes return first, then
     /// the UI is told to re-read when a reader can see the change.
     ///
-    /// **The one publisher of returns** (plan 032 §3.1.1 item 3, C1 review):
-    /// every fold of one source runs on its one task, so a return published
-    /// here can never land after a departure a LATER fold published, and
-    /// cancel it.
-    ///
-    /// **Not the one publisher of departures** (C1 re-review): an End tab
-    /// publishes one from its own task ([`RoostHosts::kill`]), and this fold
-    /// may be paused between its lock and its publication while that one
-    /// lands. So the fold's news number is minted under the lock, with the
-    /// fold ([`CrazeState::mint_news`]) — one number for its departures and
+    /// **One of the three publishers of craze news** ([`OnCrazeNews`]): a
+    /// create's or a reopen's listing publishes a return from its own task
+    /// ([`RoostHosts::list_answered_row`]), and the host's removal its sweep
+    /// ([`RoostHosts::remove`]), so this fold may be paused between its lock
+    /// and its publication while either lands — or land between theirs. So
+    /// the fold's news number is minted under the lock, with the fold
+    /// ([`CrazeState::mint_news`]) — one number for its departures and
     /// returns, which never share a row — and the lane layer applies a piece
-    /// only if it is newer than what the lane took ([`OnCrazeNews`]).
+    /// only if it is newer than what the lane took ([`OnCrazeNews`]). (End
+    /// tab publishes nothing, plan 032 E6.)
     ///
     /// **Who can see it** (plan 026 §3.2): a LISTED host's visible change, as
     /// always — and an UNLISTED host's change of craze phase or cause
@@ -4095,21 +4139,29 @@ impl HostCrazeSink {
     /// within `rc.list`'s `shed_craze` (dormant ↔ too old ↔ not installed).
     /// A repeated probe that says the same thing changes neither, so the 30 s
     /// dormant probe repaints nothing.
+    ///
+    /// Answers what it made of the report ([`Dormancy`]): `Gone` once this
+    /// task's fence no longer holds, `Stale` when `f` answers `None` — a
+    /// report too stale to fold (a no-hub answer older than a create's or
+    /// reopen's listing, [`CrazeState::dormant`]), with nothing minted,
+    /// published or repainted — and `Folded` otherwise.
     fn fold(
         &self,
         cause: Departure,
-        f: impl FnOnce(&mut CrazeState) -> crate::craze::Applied,
-    ) -> bool {
+        f: impl FnOnce(&mut HostState) -> Option<crate::craze::Applied>,
+    ) -> Dormancy {
         let (applied, seq, listed, moved) = {
             let mut guard = lock(&self.state);
             let Some(m) = guard.get_mut(&self.id) else {
-                return false;
+                return Dormancy::Gone;
             };
             if m.craze.gen != self.gen {
-                return false;
+                return Dormancy::Gone;
             }
             let before = m.craze.standing();
-            let applied = f(&mut m.craze);
+            let Some(applied) = f(m) else {
+                return Dormancy::Stale;
+            };
             if applied.ready {
                 // A craze `Ready` is an answer — this host is real and listed
                 // from now on, roost or no roost (plan 025 §3.6.2).
@@ -4121,8 +4173,9 @@ impl HostCrazeSink {
         // With THIS source's generation: by the time it lands, the host may
         // be registered again under another, and only this one's lanes are
         // this source's to end — or to keep (plan 032 §3.1.1 item 3). And
-        // with the number minted above: by the time it lands, an End tab's
-        // departure minted after it may have landed first (C1 re-review).
+        // with the number minted above: by the time it lands, a create's or
+        // reopen's return minted after it may have landed first (C1
+        // re-review, branch review).
         publish_craze_gone(
             &self.on_craze,
             &self.id,
@@ -4135,24 +4188,43 @@ impl HostCrazeSink {
         if applied.visible && (listed || moved) {
             (self.on_change)();
         }
-        true
+        Dormancy::Folded
     }
 }
 
 impl CrazeSink for HostCrazeSink {
     /// A roster frame: a `Removed` or a swap departs a row as `Removed`.
     fn event(&self, event: SourceEvent) -> bool {
-        self.fold(Departure::Removed, |c| c.apply(event))
+        self.fold(Departure::Removed, |m| Some(m.craze.apply(event))) != Dormancy::Gone
     }
 
-    /// The hub is gone: every row departs as `HubGone` (plan 032 PC14g).
-    fn dormant(&self) -> bool {
-        self.fold(Departure::HubGone, CrazeState::dormant)
+    /// The listing epoch, under the state lock and this task's fence (C8
+    /// review finding 2).
+    fn listings(&self) -> u64 {
+        lock(&self.state)
+            .get(&self.id)
+            .filter(|m| m.craze.gen == self.gen)
+            .map_or(0, |m| m.craze.listings())
+    }
+
+    /// The hub is gone: every row departs as `HubGone` (plan 032 PC14g) —
+    /// the roster's, and the source's created rows read now (a session a
+    /// create or a reopen answered with that no roster listed yet: branch
+    /// review), so a hub gone before its first seed still ends a lane opened
+    /// on one. **Unless the answer is stale** (C8 review finding 2): a
+    /// create or a reopen listed a session since its probe started at
+    /// listing epoch `probed_at` — judged in the fold's own critical
+    /// section, so no listing can land between the check and the fold.
+    fn dormant(&self, probed_at: u64) -> Dormancy {
+        self.fold(Departure::HubGone, |m| {
+            let created = created_rows(&lock(&self.reg), &self.id, m);
+            m.craze.dormant(&created, probed_at)
+        })
     }
 
     /// Retained rows stay: nothing departs.
     fn offline(&self, cause: SourceOffline, reason: String) -> bool {
-        self.fold(Departure::Removed, |c| c.offline(cause, reason))
+        self.fold(Departure::Removed, |m| Some(m.craze.offline(cause, reason))) != Dormancy::Gone
     }
 }
 
@@ -4538,18 +4610,19 @@ impl CrazeNeed {
     }
 }
 
-/// A reopen's answered row as [`RoostHosts::list_answered_row`] folded it
-/// (plan 032 §3.4).
+/// A create's or a reopen's answered row as [`RoostHosts::list_answered_row`]
+/// listed it (plan 025 §3.6.4, plan 032 §3.4).
 struct AnsweredRow {
     /// The row as listed — or, superseded, as the last known (stale).
     row: Value,
-    /// The source no longer lists the session: it ended again before its row
-    /// was folded, and nothing is listed.
+    /// The source no longer lists the session: it ended (again) before its
+    /// row was folded — or, a create's, a replay of an ended session's answer
+    /// — and nothing is listed.
     ended: bool,
-    /// The host's state no longer holds the generation the reopen went
+    /// The host's state no longer holds the generation the call went
     /// through — removed, or removed and registered again (a new incarnation)
     /// — so nothing was folded, and nothing can open on the row here (C5
-    /// review).
+    /// review). Only a reopen's answer reports it.
     superseded: bool,
 }
 

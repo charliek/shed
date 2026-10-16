@@ -55,8 +55,9 @@
 //! entries against a roost snapshot — a craze lane is not in it and must not
 //! be torn down by it — and the craze source's own news governs the craze
 //! entries ([`Lanes::craze_news`]): a row that left it (a `Removed`, a reseed
-//! that dropped it, the hub gone, its tab ended) starts the lane's DEPARTURE
-//! ([`Lanes::evict_craze`], below), a row listed again ends one
+//! that dropped it, the hub gone) starts the lane's DEPARTURE
+//! ([`Lanes::evict_craze`], below), a row listed again (by the roster, or by
+//! the create or reopen that answered with it) ends one
 //! ([`Lanes::craze_returned`]), and the host's removal ends every lane of its
 //! generation at once ([`Lanes::evict_craze_generation`]). A craze entry is
 //! filed under the GENERATION of the source it was opened through, and every
@@ -94,13 +95,19 @@
 //!   and a removal after a return starts a fresh grace with a new token.
 //! * **News is applied in the order it HAPPENED, not the order it arrives**
 //!   ([`NewsMark`], C1 re-review). Departures, returns and the host's removal
-//!   come from three publishers on their own tasks — the source's fold, an End
-//!   tab, the removal — each publishing after it released the roost-host
-//!   lock its news was computed under. So each piece carries a number minted
-//!   under that lock ([`CrazeNews`]'s `seq`), and a lane (or an open in
-//!   flight) takes only news newer than the last it took: a return delayed
-//!   past an End tab's departure cannot revive the lane and lose its grace's
-//!   end, and a departure delayed past a return cannot depart it again.
+//!   come from three publishers on their own tasks — the source's fold
+//!   (departures and returns), a create's or reopen's listing of the row it
+//!   answered with (a return), the removal — each publishing after it
+//!   released the roost-host lock its news was computed under. So each piece
+//!   carries a number minted under that lock ([`CrazeNews`]'s `seq`), and a
+//!   lane (or an open in flight) takes only news newer than the last it took:
+//!   a return delayed past a departure computed after it cannot revive the
+//!   lane and lose its grace's end, and a departure delayed past a return
+//!   cannot depart it again. The registry keeps each row's newest number too
+//!   ([`CrazeMarks`], C8 review), whether or not a lane was there to take it,
+//!   and an open starts its fence there — so news that landed while no panel
+//!   was open still fences the lane opened after it. (End tab publishes
+//!   nothing, plan 032 E6.)
 //! * **Atomic, under one lock per entry.** Every transition, AND every frame
 //!   the pump applies and emits, happens under the entry's `state` lock
 //!   ([`LaneCore`]), and nothing is applied once the entry is `Finished` (or
@@ -314,8 +321,8 @@ const DOWN_UNKNOWN_SESSION: &str = "unknown_session";
 pub const CRAZE_DEPART_GRACE: Duration = Duration::from_secs(10);
 
 /// The `Down` reason THIS layer ends a departing lane with when its grace
-/// runs out and its row left the roster (`Removed`, a reseed that dropped it,
-/// its tab ended) — the session is gone and no final event said so.
+/// runs out and its row left the roster (`Removed`, a reseed that dropped it)
+/// — the session is gone and no final event said so.
 pub const DOWN_SESSION_GONE: &str = "session_gone";
 /// …and when the row left with the hub itself (the source went Dormant).
 pub const DOWN_HUB_GONE: &str = "hub_gone";
@@ -349,12 +356,13 @@ fn down_is_final(reason: &str) -> bool {
 /// (plan 032 PC14g).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Departure {
-    /// The roster let the row go: a `Removed`, a `Ready` swap that no longer
-    /// lists it, or the tab of a TUI-hosted session ended. Expires as
-    /// [`DOWN_SESSION_GONE`].
+    /// The roster let the row go: a `Removed`, or a `Ready` swap that no
+    /// longer lists it. Expires as [`DOWN_SESSION_GONE`]. (End tab is not
+    /// one, plan 032 E6: the session runs on after its tab closes.)
     Removed,
     /// The hub went (the find-only probe found none: the source is Dormant),
-    /// taking every row with it. Expires as [`DOWN_HUB_GONE`].
+    /// taking every row with it — the roster's, and a create's or reopen's
+    /// row no roster listed yet. Expires as [`DOWN_HUB_GONE`].
     HubGone,
 }
 
@@ -798,7 +806,9 @@ struct Pending {
     /// than a return it already took does not cancel it, and the entry it
     /// commits starts its own fence HERE ([`Life::news`]) — so news that
     /// reached the open is never undone, after the commit, by older news
-    /// delivered late.
+    /// delivered late. It STARTS at the registry's mark for its row
+    /// ([`CrazeMarks`], C8 review) — the news that landed before the open
+    /// existed — not at zero.
     news: NewsMark,
 }
 
@@ -889,7 +899,8 @@ struct Life {
     /// Never cleared.
     closing: bool,
     /// The newest craze news this entry took ([`NewsMark`], C1 re-review) —
-    /// started from its open's ([`Pending::news`]) at the commit. Read and
+    /// started from its open's ([`Pending::news`]) at the commit, and never
+    /// below the registry's mark for its row then ([`CrazeMarks`]). Read and
     /// advanced only under this lock, by [`Lanes::craze_news`]'s handlers,
     /// which hold the registry's first (the lock order).
     news: NewsMark,
@@ -900,14 +911,15 @@ struct Life {
 /// ([`Life::news`]) or an open in flight ([`Pending::news`]) — has TAKEN.
 ///
 /// **Why there is one.** Craze news has three publishers on three kinds of
-/// task — the source's fold (departures and returns), an End tab (a
-/// departure, from the IPC op's task) and the host's removal — and each
-/// publishes after releasing the state lock its news was computed under, so
-/// a piece can reach this layer AFTER a piece computed later. Unfenced, a
-/// reseed's return delayed past an End tab's departure revived the departing
-/// lane and cancelled its grace — its 10 s end lost when no final event
-/// followed — and a departure delayed past a return started a departure the
-/// row's return had already answered.
+/// task — the source's fold (departures and returns, on the source's task),
+/// a create's or reopen's listing of the row it answered with (a return,
+/// from the IPC op's task) and the host's removal — and each publishes after
+/// releasing the state lock its news was computed under, so a piece can
+/// reach this layer AFTER a piece computed later. Unfenced, a return delayed
+/// past a departure computed after it revived the departing lane and
+/// cancelled its grace — its 10 s end lost when no final event followed —
+/// and a departure delayed past a return started a departure the row's
+/// return had already answered. (End tab publishes nothing, plan 032 E6.)
 ///
 /// **The rule.** A piece is minted a number, strictly increasing per source,
 /// at the moment it is computed, under that lock
@@ -918,7 +930,17 @@ struct Life {
 /// newer news, in either direction. It is judged AFTER the generation fence:
 /// another source's numbers are another sequence, and its news never reaches
 /// this mark at all.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// **A lane's mark does not start at zero** (C8 review). The registry keeps
+/// the same high-water mark per row of each machine's newest source
+/// generation ([`CrazeMarks`]), advanced by EVERY piece that names the row,
+/// whether or not a lane or an open was there to take it; an open declares
+/// itself with its row's mark ([`Pending::news`]) and its entry commits with
+/// it. Without that, news landing while no panel was open was forgotten, and
+/// a lane opened afterwards took any OLDER piece delivered after it — a
+/// stale probe's Dormant departure, published late past a Resume's newer
+/// return, started a `hub_gone` grace on a running session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct NewsMark(u64);
 
 impl NewsMark {
@@ -1266,9 +1288,121 @@ struct Inner {
     /// The last departure token handed out ([`EntryState::Departing`]) —
     /// minted under this lock, so two departures never share one.
     departures: u64,
+    /// The craze news fence's high-water marks, by machine ([`CrazeMarks`],
+    /// C8 review): advanced by every piece [`Lanes::craze_news`] receives,
+    /// in the same acquisition that applies it, and read by every craze
+    /// open's declaration and commit. Under this lock and no other, so the
+    /// lock order (`inner` → `state` → `view`) is unchanged.
+    craze_marks: HashMap<String, CrazeMarks>,
+}
+
+/// The most hostIds one machine's [`CrazeMarks`] keeps (the oldest news goes
+/// first past it) — the same order of backstop shed-craze's own created-row
+/// tombstones keep.
+const CRAZE_MARKS_CAP: usize = 4096;
+
+/// One machine's craze news marks ([`Inner::craze_marks`]): the news fence's
+/// high-water mark ([`NewsMark`]) for each row (hostId) of ONE source
+/// generation — the newest whose news reached this layer.
+///
+/// **Why the registry keeps them** (C8 review): a lane's own mark
+/// ([`Life::news`], [`Pending::news`]) lives only as long as the lane, so news
+/// that landed while no entry and no open existed for its row used to be
+/// forgotten, and a lane opened afterwards started its fence at zero. The
+/// ordering that bit: a probe's no-hub answer folds Dormant and mints the
+/// row's departure, whose publication stalls; a Resume lists the row and
+/// publishes its NEWER return while no panel exists; the panel opens; the
+/// stale departure lands, passes the empty fence, and starts a `hub_gone`
+/// grace on a session that is running. Every piece is recorded here, so the
+/// open starts where the return left the row and the stale departure is
+/// dropped like any other old news.
+///
+/// **Bounded.** One record per machine, holding one generation's marks:
+/// news of a NEWER generation (generations only grow, process-wide) replaces
+/// them, and the generation's `HostRemoved` — its last news by construction
+/// ([`Lanes::evict_craze_generation`]) — empties them for good
+/// ([`Self::removed`]), so a piece of it delivered after its removal records
+/// nothing. Within a generation it holds one mark per hostId the source's
+/// news has named — sessions that source actually listed — up to
+/// [`CRAZE_MARKS_CAP`].
+#[derive(Debug, Default)]
+struct CrazeMarks {
+    /// The source generation these marks are for.
+    gen: u64,
+    /// Set by the generation's `HostRemoved`: `hosts` is empty and stays so.
+    removed: bool,
+    /// hostId → the newest piece of news that named it.
+    hosts: HashMap<String, NewsMark>,
 }
 
 impl Inner {
+    /// Record craze news `seq` of `machine`'s source generation `gen`, naming
+    /// `host_ids` ([`CrazeMarks`]) — called by every handler of
+    /// [`Lanes::craze_news`] in the acquisition that applies the piece, so no
+    /// open can declare between the two. A newer generation's news first
+    /// drops the older one's marks; an older (or a removed) generation's news
+    /// records nothing — no open of it can commit any more (`open`'s
+    /// post-declaration generation re-check refuses it).
+    fn note_craze_news(&mut self, machine: &str, gen: u64, seq: u64, host_ids: &[String]) {
+        let marks = self.craze_marks.entry(machine.to_string()).or_default();
+        if gen > marks.gen {
+            *marks = CrazeMarks {
+                gen,
+                ..CrazeMarks::default()
+            };
+        }
+        if gen < marks.gen || marks.removed {
+            return;
+        }
+        for host_id in host_ids {
+            marks.hosts.entry(host_id.clone()).or_default().take(seq);
+        }
+        // A memory backstop, not a policy (C8 closing review): a machine that
+        // stays registered for weeks names a new hostId with every session it
+        // ever starts. Past the cap the mark with the OLDEST news goes — a row
+        // that quiet is long gone, and only a lane opened on it later, racing
+        // news older still, could ever have read it.
+        while marks.hosts.len() > CRAZE_MARKS_CAP {
+            let oldest = marks
+                .hosts
+                .iter()
+                .min_by_key(|(_, mark)| mark.0)
+                .map(|(host_id, _)| host_id.clone());
+            match oldest {
+                Some(host_id) => {
+                    marks.hosts.remove(&host_id);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// `machine`'s source generation `gen` was removed: its marks are dropped
+    /// for good ([`CrazeMarks::removed`]) — unless a newer generation's news
+    /// already replaced them, which stay.
+    fn note_craze_removed(&mut self, machine: &str, gen: u64) {
+        let marks = self.craze_marks.entry(machine.to_string()).or_default();
+        if gen >= marks.gen {
+            *marks = CrazeMarks {
+                gen,
+                removed: true,
+                hosts: HashMap::new(),
+            };
+        }
+    }
+
+    /// Where a lane on `machine`'s row `host_id`, opened through source
+    /// generation `gen`, starts its news fence: the newest piece of that
+    /// generation's news that named the row — zero if none did, or if the
+    /// marks held are another generation's (another sequence).
+    fn craze_mark(&self, machine: &str, gen: u64, host_id: &str) -> NewsMark {
+        self.craze_marks
+            .get(machine)
+            .filter(|marks| marks.gen == gen)
+            .and_then(|marks| marks.hosts.get(host_id).copied())
+            .unwrap_or_default()
+    }
+
     /// **The shutdown's start: fence first, flag second** (plan 032 §3.1.1
     /// items 4 and 11; C1 review). Every registered entry is marked closing
     /// ([`LaneEntry::detach`]) under its own `state` lock, and only THEN is
@@ -1642,7 +1776,14 @@ impl Lanes {
         // re-review): the craze news that reached the open is never undone
         // by older news delivered after the commit. Under the registry lock,
         // which every piece of news is applied under first, so none lands
-        // between this and the insert.
+        // between this and the insert. Re-read against the registry's mark
+        // for the row ([`CrazeMarks`], C8 review), as the declaration read
+        // it: the open's mark already covers it — every piece is recorded
+        // there and taken by the open in one acquisition — and the later of
+        // the two is what the entry must never fall below.
+        let news = craze_gen.map_or(news, |gen| {
+            news.max(inner.craze_mark(machine, gen, session_id))
+        });
         lock(&core.state).news = news;
         let pump = self.spawn_pump(key.clone(), client, Arc::clone(&core), forward_weak);
         let entry = Arc::new(LaneEntry {
@@ -2032,15 +2173,23 @@ impl Lanes {
     /// 2. **The news sequence** (C1 re-review, [`NewsMark`]): the lane takes
     ///    the piece only if its `seq` is newer than every piece it already
     ///    took, so news delivered out of the order it happened in — its three
-    ///    publishers (the source's fold, an End tab, the host's removal) each
-    ///    publish from their own task after releasing the lock their news was
-    ///    minted under — never undoes newer news: a return delayed past an
-    ///    End tab's departure does not revive the lane (its grace runs on and
-    ///    ends it on time), and a departure delayed past a return does not
-    ///    depart it again.
+    ///    publishers (the source's fold, a create's or reopen's listing, the
+    ///    host's removal) each publish from their own task after releasing
+    ///    the lock their news was minted under — never undoes newer news: a
+    ///    return delayed past a departure computed after it does not revive
+    ///    the lane (its grace runs on and ends it on time), and a departure
+    ///    delayed past a return does not depart it again.
     ///
     /// The generation fence comes first so that another generation's numbers
     /// — another sequence — never advance a lane's mark.
+    ///
+    /// **Every piece is also RECORDED** (C8 review, [`CrazeMarks`]), in the
+    /// same acquisition, whether or not a lane or an open is there to take
+    /// it: the registry's per-row mark for `(machine, gen)`, which a craze
+    /// open declares itself with and its entry commits with — so news that
+    /// landed while no panel was open still fences the lane opened after it.
+    /// A newer generation's news, or this generation's `HostRemoved`, drops
+    /// the older marks.
     pub fn craze_news(&self, machine: &str, gen: u64, news: CrazeNews<'_>) {
         match news {
             CrazeNews::Departed {
@@ -2055,13 +2204,13 @@ impl Lanes {
         }
     }
 
-    /// **A craze lane's row left its source** (plan 032 §3.1.1 item 2) — a
-    /// roster `Removed`, a `Ready` swap that no longer lists it, its tab
-    /// ended (`cause` [`Departure::Removed`]), or the hub gone, the source
-    /// Dormant ([`Departure::HubGone`]) — so the lane DEPARTS: it keeps its
-    /// own connection for [`Self::depart_grace`] and ends at its session's
-    /// final `Down`, a return, or the grace's end. Any open of the row still in
-    /// flight is cancelled, as before plan 032.
+    /// **A craze lane's row left its source** (plan 032 §3.1.1 item 2, E6) —
+    /// a roster `Removed` or a `Ready` swap that no longer lists it (`cause`
+    /// [`Departure::Removed`]), or the hub gone, the source Dormant, taking
+    /// a created-only row with the roster's ([`Departure::HubGone`]) — so the
+    /// lane DEPARTS: it keeps its own connection for [`Self::depart_grace`]
+    /// and ends at its session's final `Down`, a return, or the grace's end.
+    /// Any open of the row still in flight is cancelled, as before plan 032.
     ///
     /// Per entry of generation `gen`, under the registry lock and then the
     /// entry's `state` (the lock order), and only if it takes news `seq`
@@ -2095,6 +2244,7 @@ impl Lanes {
         cause: Departure,
     ) {
         let mut inner = lock(&self.inner);
+        inner.note_craze_news(machine, gen, seq, host_ids);
         for host_id in host_ids {
             let key = key(machine, CRAZE, host_id);
             if let Some(pending) = inner.pending.get_mut(&key) {
@@ -2137,8 +2287,10 @@ impl Lanes {
 
     /// **A departing craze lane's row is listed again** (plan 032 §3.1.1
     /// item 3, PC2): the row came back within the grace — a reseed that
-    /// briefly dropped it, a source that went Dormant and found the hub again
-    /// — so the lane is LIVE again, its connection never having been let go.
+    /// briefly dropped it, a source that went Dormant and found the hub again,
+    /// a create or a reopen that answered with it (a reopen that rejoined a
+    /// host which outlived its hub) — so the lane is LIVE again, its
+    /// connection never having been let go.
     /// Its grace task is aborted (and would find its token gone if it were
     /// already past its wait); a later removal starts a fresh grace under a
     /// new token. Only a `Departing` entry of generation `gen` that takes news
@@ -2154,6 +2306,7 @@ impl Lanes {
     /// as `close` makes it fail, and its panel's retry opens the listed row.)
     pub fn craze_returned(&self, machine: &str, gen: u64, seq: u64, host_ids: &[String]) {
         let mut inner = lock(&self.inner);
+        inner.note_craze_news(machine, gen, seq, host_ids);
         for host_id in host_ids {
             let key = key(machine, CRAZE, host_id);
             if let Some(pending) = inner.pending.get_mut(&key) {
@@ -2185,7 +2338,8 @@ impl Lanes {
     /// `Down{host_removed}` is applied and emitted and it becomes `Finished`;
     /// then its grace task is cancelled and it is retired at once (its client
     /// released, PC4). The entries STAY, readable — `lane.messages` still
-    /// answers. Every pending open of `gen` is cancelled.
+    /// answers. Every pending open of `gen` is cancelled, and the registry's
+    /// news marks of `gen` are dropped for good ([`CrazeMarks`]).
     ///
     /// Through the news fence like any news ([`Self::craze_news`]), which it
     /// always passes: `seq` is minted in the critical section that takes the
@@ -2198,6 +2352,8 @@ impl Lanes {
     pub fn evict_craze_generation(&self, machine: &str, gen: u64, seq: u64) {
         let ended: Vec<Arc<LaneEntry>> = {
             let mut inner = lock(&self.inner);
+            // The generation's last news: its marks go with it.
+            inner.note_craze_removed(machine, gen);
             for (key, pending) in inner.pending.iter_mut() {
                 if key.0 == machine
                     && key.1 == CRAZE
@@ -2237,13 +2393,20 @@ impl Lanes {
         if inner.closing {
             return Err(LaneFailure::ShuttingDown);
         }
+        // A craze open's fence starts where the news its row already had
+        // left it ([`CrazeMarks`], C8 review) — under this lock, which every
+        // piece is recorded under, so none falls between the read and the
+        // declaration.
+        let news = craze_gen.map_or_else(NewsMark::default, |gen| {
+            inner.craze_mark(&key.0, gen, &key.2)
+        });
         inner.pending.insert(
             key.clone(),
             Pending {
                 stamp: stamp.clone(),
                 cancelled: false,
                 craze_gen,
-                news: NewsMark::default(),
+                news,
             },
         );
         Ok(PendingGuard {
@@ -5414,6 +5577,154 @@ mod tests {
         );
         rig.depart(Departure::Removed);
         assert_eq!(rig.state(), Some("departing"), "a newer one does");
+    }
+
+    /// **News that landed while no lane was open still fences the lane
+    /// opened after it** (C8 review, [`CrazeMarks`]) — the reported
+    /// ordering: a stale probe's no-hub answer folds Dormant and mints the
+    /// row's departure, whose publication stalls; a Resume lists the row and
+    /// publishes its NEWER return while no panel exists; the panel opens; only
+    /// then does the stale departure land. It must not start a `hub_gone`
+    /// grace on the running session — the lane's fence starts where the
+    /// return left the row. A departure minted after the return still
+    /// departs it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn news_that_landed_before_the_open_fences_the_lane() {
+        let mut rig = CrazeRig::start().await;
+        let (stale, back) = (rig.seq(), rig.seq());
+        rig.returned_as(back);
+        assert_eq!(rig.state(), None, "no lane was open for the return");
+        let _conn = rig.open_seeded().await;
+        rig.depart_as(Departure::HubGone, stale);
+        assert_eq!(
+            rig.state(),
+            Some("live"),
+            "a departure older than a return that landed before the open does not depart it"
+        );
+        assert!(lock(&rig.entry().grace).is_none(), "no grace started");
+        rig.depart(Departure::HubGone);
+        assert_eq!(rig.state(), Some("departing"), "a newer one does");
+        rig.finished("the newer departure's grace to end").await;
+        assert_eq!(rig.events.downs(), [DOWN_HUB_GONE]);
+    }
+
+    /// [`news_that_landed_before_the_open_fences_the_lane`]'s ordering with
+    /// the stale departure landing on the open IN FLIGHT (C8 review): the
+    /// open declared itself with the row's mark, so the departure does not
+    /// cancel it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn news_that_landed_before_the_open_fences_the_open_in_flight() {
+        let rig = CrazeRig::start().await;
+        let (stale, back) = (rig.seq(), rig.seq());
+        rig.returned_as(back);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        *lock(&rig.lanes.commit_gap) = Some((Arc::clone(&reached), Arc::clone(&proceed)));
+        let opening = {
+            let lanes = Arc::clone(&rig.lanes);
+            tokio::spawn(async move { lanes.open(MACHINE, CRAZE, GHOST).await })
+        };
+        reached.notified().await;
+        rig.depart_as(Departure::HubGone, stale);
+        proceed.notify_one();
+        opening.await.expect("the open task").expect(
+            "a departure older than a return that landed before the open does not cancel it",
+        );
+        assert_eq!(rig.state(), Some("live"));
+    }
+
+    /// **The registry's news marks hold one generation per machine** (C8
+    /// review, [`CrazeMarks`]): every piece of news records its rows' marks,
+    /// lane or no lane; a newer generation's news drops the older one's; an
+    /// older generation's news delivered late records nothing; and the
+    /// generation's `HostRemoved` empties them for good — an older
+    /// generation's removal leaves a newer one's be.
+    /// **The marks table is capped** (C8 closing review): past
+    /// [`CRAZE_MARKS_CAP`] hostIds on one machine, the mark with the oldest
+    /// news is dropped first, and the newest are kept.
+    #[tokio::test]
+    async fn the_registrys_news_marks_are_capped_oldest_first() {
+        let (lanes, _log, _events) = lanes_on(REMOTE_PORT, BTreeMap::new());
+        for n in 0..(CRAZE_MARKS_CAP + 10) {
+            let ids = [format!("{n:012x}")];
+            lanes.craze_news(
+                MACHINE,
+                1,
+                CrazeNews::Returned {
+                    host_ids: &ids,
+                    seq: n as u64 + 1,
+                },
+            );
+        }
+        let inner = lock(&lanes.inner);
+        assert_eq!(inner.craze_marks[MACHINE].hosts.len(), CRAZE_MARKS_CAP);
+        assert_eq!(
+            inner.craze_mark(MACHINE, 1, &format!("{:012x}", 0)),
+            NewsMark(0),
+            "the oldest went"
+        );
+        let newest = CRAZE_MARKS_CAP + 9;
+        assert_eq!(
+            inner.craze_mark(MACHINE, 1, &format!("{newest:012x}")),
+            NewsMark(newest as u64 + 1),
+            "the newest stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_registrys_news_marks_hold_one_generation_per_machine() {
+        let (lanes, _log, _events) = lanes_on(REMOTE_PORT, BTreeMap::new());
+        let (a, b, c) = ("a".to_string(), "b".to_string(), "c".to_string());
+        let mark = |gen: u64, host: &str| lock(&lanes.inner).craze_mark(MACHINE, gen, host);
+        let hosts = || lock(&lanes.inner).craze_marks[MACHINE].hosts.len();
+        let returned = |gen: u64, seq: u64, ids: &[String]| {
+            lanes.craze_news(MACHINE, gen, CrazeNews::Returned { host_ids: ids, seq });
+        };
+
+        returned(1, 5, &[a.clone(), b.clone()]);
+        lanes.craze_news(
+            MACHINE,
+            1,
+            CrazeNews::Departed {
+                host_ids: std::slice::from_ref(&a),
+                cause: Departure::Removed,
+                seq: 3,
+            },
+        );
+        assert_eq!(mark(1, "a"), NewsMark(5), "older news never lowers a mark");
+        assert_eq!(mark(1, "b"), NewsMark(5));
+        assert_eq!(
+            mark(2, "a"),
+            NewsMark(0),
+            "another generation, another sequence"
+        );
+
+        // A newer generation's news drops the older one's marks.
+        returned(2, 1, std::slice::from_ref(&c));
+        assert_eq!(mark(1, "a"), NewsMark(0));
+        assert_eq!(mark(2, "c"), NewsMark(1));
+        assert_eq!(hosts(), 1);
+        // An older generation's news, delivered late, records nothing.
+        returned(1, 9, std::slice::from_ref(&a));
+        assert_eq!(mark(1, "a"), NewsMark(0));
+        assert_eq!(hosts(), 1);
+        // An older generation's removal leaves the newer one's marks.
+        lanes.craze_news(MACHINE, 1, CrazeNews::HostRemoved { seq: 10 });
+        assert_eq!(mark(2, "c"), NewsMark(1));
+        // Its own removal empties them — for good.
+        lanes.craze_news(MACHINE, 2, CrazeNews::HostRemoved { seq: 2 });
+        assert_eq!(hosts(), 0);
+        returned(2, 1, std::slice::from_ref(&c));
+        assert_eq!(
+            hosts(),
+            0,
+            "a removed generation's late news records nothing"
+        );
+        assert_eq!(
+            lock(&lanes.inner).craze_marks.len(),
+            1,
+            "one record per machine"
+        );
     }
 
     /// **W1 cell 7 — the session's final `Down` racing the expiry: whichever

@@ -40,7 +40,10 @@
      assert the panel, not just the backend behind it. `null` on unmount, because
      "no panel" is the question a caller is actually asking.
 
-   `lane.open` on mount, `lane.close` on unmount, and no polling anywhere.
+   `lane.open` on mount, `lane.close` on unmount, and no polling anywhere —
+   plus `lane.open` AGAIN, in place, when the shell moves `opens`: a resume
+   that landed on the session this panel shows (a finished lane whose host it
+   rejoined), whose address — so whose key — did not change.
 
    **A finished lane stays on screen, read-only** (plan 032 §3.1.1 item 13):
    a craze lane outlives its row by a grace and then ends visibly, so the
@@ -225,11 +228,16 @@ function roleColor(role: string): string {
   return "var(--shed-text-secondary)";
 }
 
-export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOpen, onClose }: {
+export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSettingsOpen, onClose }: {
   machine: string;
   /** The row's `agent_lane.kind` — half of the lane's address. */
   kind: string;
   sessionId: string;
+  /** How many times the shell asked this panel to open its lane AGAIN where
+   *  it stands (`crazeResume.ts`'s `laneOnResume`: a resume that landed on
+   *  the session this panel shows). A move re-runs the open, never the
+   *  mount. */
+  opens: number;
   /** The settings sheet is ASKED for (the chip, or `ui.show_lane_settings`);
    *  it shows only while the session's capabilities say `settings`. */
   settingsOpen: boolean;
@@ -329,6 +337,12 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  transcript that yanks itself down while you are reading history is worse
    *  than one that does not follow. */
   const atBottom = useRef(true);
+  /** The lane's open — `lane.open`, then one read — as the mount's effect
+   *  runs it, kept so an ask to open AGAIN in place (`opens` moving) runs the
+   *  very same step; `null` until that effect's listeners are attached. */
+  const openLane = useRef<(() => Promise<void>) | null>(null);
+  /** The `opens` this panel has acted on (its mount's open covers the first). */
+  const opensSeen = useRef(opens);
 
   // One live subscription for as long as the panel is mounted. Everything —
   // the listener, the batch, the open — belongs to this one effect so the
@@ -410,21 +424,29 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
         return;
       }
       unlisten.push(unHold);
-      try {
-        const o = await laneOpen(machine, kind, sessionId);
-        if (cancelled) return;
-        setOpened(o);
-      } catch (e) {
-        if (!cancelled) setReadError(laneFailure(e).message);
-        return;
-      }
-      // The seed may have completed before the first frame-event was scheduled
-      // (an already-open lane re-answers instantly), so read once outright.
-      await pull();
+      const open = async () => {
+        try {
+          const o = await laneOpen(machine, kind, sessionId);
+          if (cancelled) return;
+          setOpened(o);
+        } catch (e) {
+          if (!cancelled) setReadError(laneFailure(e).message);
+          return;
+        }
+        // The seed may have completed before the first frame-event was scheduled
+        // (an already-open lane re-answers instantly), so read once outright.
+        await pull();
+      };
+      // Kept BEFORE the first open is asked: an ask to open again that comes
+      // sooner finds nothing here — and loses nothing, because this open has
+      // not been sent yet and will find the session as it is by then.
+      openLane.current = open;
+      await open();
     })();
 
     return () => {
       cancelled = true;
+      openLane.current = null;
       reads.cancel();
       if (frame !== null) cancelAnimationFrame(frame);
       if (timer !== null) clearTimeout(timer);
@@ -432,6 +454,21 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
       void laneClose(machine, kind, sessionId);
     };
   }, [machine, kind, sessionId]);
+
+  // **Asked to open the lane AGAIN where it stands** (`opens` moved: a resume
+  // landed on this very session — branch review). The mount's own open, with
+  // NO `lane.close` before it: on a FINISHED lane whose session runs again,
+  // the backend opens a fresh lane and replaces the finished one only once
+  // that open commits (a failed open leaves the ended transcript readable);
+  // a live lane is re-answered as it is. A remount would close first, and
+  // its close would race its own open on the same key. The last refusal was
+  // about the lane that ended, so it goes.
+  useEffect(() => {
+    if (opens === opensSeen.current) return;
+    opensSeen.current = opens;
+    setActionError(null);
+    void openLane.current?.();
+  }, [opens]);
 
   const messages = view?.messages ?? [];
   useEffect(() => {

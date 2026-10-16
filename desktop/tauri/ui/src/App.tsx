@@ -28,9 +28,9 @@ import {
   type CrazeDraft, type CrazeStatusLike,
 } from "@/lib/crazeCreate";
 import {
-  EMPTY_RESUME, SUPERSEDED_NOTE, beginList, beginResume, canResume, chooseMode, listNeeded, observeSource,
-  observeSources, onSheetOpen, reopenLanding, settleList, settleResume,
-  type CrazeResume, type CrazeSheetMode,
+  EMPTY_RESUME, SUPERSEDED_NOTE, beginList, beginResume, canResume, chooseMode, laneOnResume, listNeeded,
+  observeSource, observeSources, onSheetOpen, reopenLanding, settleList, settleResume,
+  type CrazeResume, type CrazeSheetMode, type LaneTarget,
 } from "@/lib/crazeResume";
 import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
 import {
@@ -1996,7 +1996,9 @@ export default function App() {
   // `settings` is whether its settings sheet is asked for (the header chip, or
   // `ui.show_lane_settings`); the panel shows it only on a session whose
   // capabilities say `settings`. Opening a lane any other way asks for none.
-  const [lane, setLane] = useState<{ machine: string; kind: string; sessionId: string; settings?: boolean } | null>(null);
+  // `opens` moves when a resume lands on the session the panel already shows
+  // (`laneOnResume`): the panel opens its lane again in place.
+  const [lane, setLane] = useState<LaneTarget | null>(null);
 
   // -- roost bootstrap (plan 019 §3.6, C8) ---------------------------------
   // The open consent card, if any — one at a time, App-level like `lane`
@@ -2219,7 +2221,10 @@ export default function App() {
       if (closesOntoTranscript(onScreen, machine)) {
         setModal(null);
         setPane("agents");
-        setLane({ machine, kind: "craze", sessionId: reopened.host_id });
+        // The session's transcript — opened AGAIN in place when it is the
+        // panel already on screen (a finished lane whose host the resume
+        // rejoined): its address, and so its key, would not change.
+        setLane((l) => laneOnResume(l, { machine, kind: "craze", sessionId: reopened.host_id }));
       }
     } catch (e) {
       const f = laneFailure(e);
@@ -2618,6 +2623,7 @@ export default function App() {
           machine={lane.machine}
           kind={lane.kind}
           sessionId={lane.sessionId}
+          opens={lane.opens ?? 0}
           settingsOpen={!!lane.settings}
           onSettingsOpen={(open) => setLane((l) => (l ? { ...l, settings: open } : l))}
           onClose={() => setLane(null)}

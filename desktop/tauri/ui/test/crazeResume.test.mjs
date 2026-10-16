@@ -12,7 +12,9 @@
  * dropped whole), a `superseded` answer never opened — and the re-review's:
  * every STATUS names the incarnation, so a new one resets the state with no
  * create-options read at all, and a failed options read offers its Retry in
- * the Resume half too. */
+ * the Resume half too — and the branch review's: a resume that lands on the
+ * panel already showing its session (a finished lane whose host it rejoined)
+ * opens that panel's lane again in place, its address unchanged. */
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -26,6 +28,7 @@ import {
   beginResume,
   canResume,
   chooseMode,
+  laneOnResume,
   listNeeded,
   modeLocked,
   observeSource,
@@ -339,6 +342,34 @@ test("CONTROL: a current answer opens its transcript — or says it ended", () =
   assert.equal(reopenLanding(running, A.id, 1, { ended: true }), "ended");
   const ended = settleResume(running, A.id, 1, { ok: true, answer: { ended: true } });
   assert.deepEqual(ended.load.sessions.map((s) => s.id), [B.id], "as any success: its row leaves the list");
+});
+
+test("CONTROL (branch review): a resume onto the panel already showing its session opens it AGAIN in place", () => {
+  const target = { machine: "mini3", kind: "craze", sessionId: "aaaaaaaaaaaa" };
+  // The finished lane's panel on screen, its settings sheet asked for.
+  const shown = { ...target, settings: true };
+  const again = laneOnResume(shown, target);
+  assert.deepEqual(
+    [again.machine, again.kind, again.sessionId],
+    [target.machine, target.kind, target.sessionId],
+    "the same address — the same key, so no remount",
+  );
+  assert.equal(again.opens, 1, "the open moves");
+  assert.equal(again.settings, true, "the rest of the panel stays");
+  assert.equal(laneOnResume(again, target).opens, 2, "every resume onto it moves it again");
+  assert.equal(shown.opens, undefined, "the shell's state is never mutated");
+});
+
+test("a resume onto another session — or no panel — mounts a fresh one, which opens on mount", () => {
+  const target = { machine: "mini3", kind: "craze", sessionId: "aaaaaaaaaaaa" };
+  assert.deepEqual(laneOnResume(null, target), target);
+  for (const other of [
+    { machine: "mini3", kind: "craze", sessionId: "bbbbbbbbbbbb", opens: 4 },
+    { machine: "localhost", kind: "craze", sessionId: "aaaaaaaaaaaa", opens: 4 },
+    { machine: "mini3", kind: "opencode", sessionId: "aaaaaaaaaaaa", opens: 4 },
+  ]) {
+    assert.deepEqual(laneOnResume({ ...other, settings: true }, target), target, JSON.stringify(other));
+  }
 });
 
 test("the title, or Untitled", () => {

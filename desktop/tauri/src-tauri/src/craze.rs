@@ -33,7 +33,10 @@
 //!   its lanes evicted — the hub is gone, so nothing is listed), and a hub that
 //!   is still there is re-joined. The probe stays even where every dial is
 //!   find-only: it is what tells not installed, too old and dormant apart for
-//!   the status line, and what a dormant source waits on.
+//!   the status line, and what a dormant source waits on. A no-hub answer
+//!   from a probe (or roster dial) that started before a create or a reopen
+//!   listed a session is stale, and is not folded: the probe asks again at
+//!   once ([`attach_only`]).
 //!
 //! * **No background remote dial can start a hub** ([`SshCrazeDial`], plan 032
 //!   §3.5). Every remote connection but a user's explicit action — the
@@ -90,7 +93,7 @@
 //! ladder — so neither path can reach a craze installed on the host running
 //! the tests (`crate::machines::build_local_craze`/`build_ssh_craze`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -704,17 +707,13 @@ pub struct CrazeState {
     pub caps: Option<SourceCapabilities>,
     pub truncated: bool,
     staged: Option<Staged>,
-    /// The hostIds [`Self::listed_now`] folded in AHEAD of their own roster
-    /// frame (plan 032 §3.1.1 item 3, C1 review): the fold that lands that
-    /// frame — a `Session` upsert, or the swap of the seed it was folded into
-    /// — still reports each as newly [`Applied::listed`], though the row is
-    /// already held, so its return is published by the fold, in order with
-    /// the fold's own departures. Emptied by the swap, a `Removed` and a
-    /// `Dormant`.
-    ahead: BTreeSet<String>,
     /// The last craze news sequence number [`Self::mint_news`] handed out —
     /// `0` before the first.
     news: u64,
+    /// **The listing epoch** ([`Self::listings`]): how many rows a create or
+    /// a reopen answered with this source has listed
+    /// ([`Self::answer_listed`]).
+    listings: u64,
 }
 
 /// What one fold changed, for the caller to act on outside the lock.
@@ -727,18 +726,18 @@ pub struct Applied {
     /// Rows newly IN the swapped-in set — a `Session` upsert of a hostId not
     /// held, or a `Ready` swap that lists one the old set did not — whose
     /// departing lanes (if any) are live again (plan 032 §3.1.1 item 3, PC2).
-    /// A row already held is never in it, but for one [`CrazeState::listed_now`]
-    /// folded in ahead of the frame this fold lands, which is reported HERE
-    /// rather than by `listed_now` (its own answer's is always empty).
+    /// A row already held is never in it — one [`CrazeState::listed_now`]
+    /// folded in ahead of its frame included: the create or reopen that
+    /// listed it published its return itself
+    /// ([`crate::roost_hosts::RoostHosts`]'s `list_answered_row`, branch
+    /// review), and `listed_now`'s own answer's is always empty.
     ///
-    /// **Only a source's fold publishes it** (C1 review): the fold runs on the
-    /// source's one task, so a return it publishes is ordered with every
-    /// departure it publishes. A create's fold-ahead runs on another task and
-    /// publishes after releasing the state lock — its return could land after
-    /// a departure the fold published in between and cancel it, leaving a lane
-    /// live on a row that is gone. (A departure from ANOTHER task — an End
-    /// tab's — is ordered with the fold's returns by the news sequence,
-    /// [`CrazeState::mint_news`].)
+    /// The fold publishes it after releasing the state lock, as every
+    /// publisher of craze news does, each from its own task — this fold, a
+    /// create's or reopen's listing, the host's removal — so a return can
+    /// reach a lane after a departure computed later. The news sequence
+    /// ([`CrazeState::mint_news`]) orders them: a lane never takes news
+    /// older than what it already took.
     ///
     /// Disjoint from [`Self::departed`] — a fold lists or departs a row, never
     /// both — so the two share the fold's one news number.
@@ -766,7 +765,8 @@ impl CrazeState {
     /// apart). Never 0.
     ///
     /// **Minted under the roost-host layer's state lock, at the moment the
-    /// news is computed** — by the source's fold and the host's removal
+    /// news is computed** — by the source's fold, a create's or reopen's
+    /// listing of the row it answered with, and the host's removal
     /// ([`crate::roost_hosts::OnCrazeNews`]). Each publishes AFTER
     /// that lock is released, from its own task, so news can REACH the lane
     /// layer in another order than it happened in; the number is the order it
@@ -778,6 +778,36 @@ impl CrazeState {
         // the life of one source, would take over 500,000 years to wrap.
         self.news += 1;
         self.news
+    }
+
+    /// **The listing epoch** (plan 032 §3.1.1 item 2, C8 review finding 2):
+    /// how many rows a create or a reopen answered with this source has
+    /// listed ([`Self::answer_listed`]). Read under the roost-host layer's
+    /// state lock as a find-only probe — or a roster's `--no-start` dial —
+    /// STARTS ([`CrazeSink::listings`]), and handed to [`Self::dormant`] when
+    /// that probe's no-hub answer lands: an answer older than a listing is
+    /// not folded.
+    pub fn listings(&self) -> u64 {
+        self.listings
+    }
+
+    /// **A create's or reopen's answered row was just listed** (plan 032
+    /// §3.1.1 item 3, C8 review): the listing epoch moves — a no-hub answer
+    /// whose probe started before now is stale ([`Self::dormant`]) — and the
+    /// row's RETURN gets its news number, minted here, under the same lock
+    /// ([`Self::mint_news`]).
+    ///
+    /// **Always, a Dormant folded while the request was in flight or not**
+    /// (C8 review): this layer cannot tell a Dormant that rests on a probe
+    /// that looked before the create or reopen started its hub from one that
+    /// saw the hub die after craze answered, so it sides with the session
+    /// craze just said runs — a successful create's or reopen's row always
+    /// stays openable, and its return always ends a departure minted before
+    /// it. What that accepts — a hub that really died meanwhile — is
+    /// [`crate::roost_hosts::RoostHosts`]'s `list_answered_row`'s to say.
+    pub fn answer_listed(&mut self) -> u64 {
+        self.listings += 1;
+        self.mint_news()
     }
 
     /// Whether the hub feed is live — the one condition the row merge absorbs
@@ -807,9 +837,7 @@ impl CrazeState {
                 }
                 None => {
                     let id = session.id.clone();
-                    // New here, or the frame of a row folded in ahead of it.
-                    let fresh = self.rows.insert(id.clone(), session).is_none();
-                    if self.ahead.remove(&id) || fresh {
+                    if self.rows.insert(id.clone(), session).is_none() {
                         out.listed.push(id);
                     }
                     out.visible = true;
@@ -820,7 +848,6 @@ impl CrazeState {
                     staged.rows.remove(&session_id);
                 }
                 None => {
-                    self.ahead.remove(&session_id);
                     if self.rows.remove(&session_id).is_some() {
                         out.departed.push(session_id);
                         out.visible = true;
@@ -851,10 +878,9 @@ impl CrazeState {
                         out.listed = staged
                             .rows
                             .keys()
-                            .filter(|id| !self.rows.contains_key(*id) || self.ahead.contains(*id))
+                            .filter(|id| !self.rows.contains_key(*id))
                             .cloned()
                             .collect();
-                        self.ahead.clear();
                         self.rows = staged.rows;
                         if staged.caps.is_some() {
                             self.caps = staged.caps;
@@ -882,22 +908,53 @@ impl CrazeState {
 
     /// The probe found no hub: nothing is listed, and every row (and its lane)
     /// goes.
-    pub fn dormant(&mut self) -> Applied {
-        let departed = self.held();
-        let visible = !departed.is_empty() || self.phase != Some(CrazePhase::Dormant);
+    ///
+    /// **`created` departs too** (plan 032 PC14g, branch review): the
+    /// source's created rows read now ([`shed_craze::CrazeSource::created_rows`],
+    /// less the rows held here) — sessions a create or a reopen answered with
+    /// that no roster has listed yet. Their lanes ride the hub as much as a
+    /// roster row's do, so a hub gone before the first seed departs them
+    /// `hub_gone` as well; otherwise nothing would ever end such a lane on
+    /// screen. They are the source's to drop, not this state's (they stay
+    /// listed until the source lets them go), so they change nothing a reader
+    /// sees here: a repeated dormant probe repaints nothing, and only departs
+    /// such a lane again if a listing brought it back meanwhile.
+    ///
+    /// **Only if no create or reopen listed a row since the answer's probe
+    /// started** (C8 review finding 2): `probed_at` is the listing epoch
+    /// ([`Self::listings`]) read as the probe — or the roster's `--no-start`
+    /// dial — that found no hub STARTED. A listing since then answered with
+    /// a session the probe may have looked too early to see: the create or
+    /// reopen may have started the hub it runs on after the probe looked. So
+    /// that answer is STALE and folds nothing — `None`, nothing changed,
+    /// nothing minted — and the source probes again at once
+    /// ([`attach_only`]); folded, it would depart the new session's lane
+    /// with news newer than the listing's return, and its grace would end a
+    /// running session's panel `hub_gone`.
+    pub fn dormant(&mut self, created: &[LaneSession], probed_at: u64) -> Option<Applied> {
+        if self.listings != probed_at {
+            return None;
+        }
+        let held = self.held();
+        let visible = !held.is_empty() || self.phase != Some(CrazePhase::Dormant);
+        let mut departed = held;
+        for row in created {
+            if !departed.contains(&row.id) {
+                departed.push(row.id.clone());
+            }
+        }
         self.rows.clear();
-        self.ahead.clear();
         self.staged = None;
         self.caps = None;
         self.truncated = false;
         self.phase = Some(CrazePhase::Dormant);
         self.offline = None;
-        Applied {
+        Some(Applied {
             departed,
             listed: Vec::new(),
             ready: false,
             visible,
-        }
+        })
     }
 
     /// The probe could not ask: retained rows stay, stale.
@@ -928,11 +985,14 @@ impl CrazeState {
     /// Into a seed in progress too, so that seed's swap cannot depart it (and
     /// its lane) before its frame lands. Never over a row already held.
     ///
-    /// **It reports no return** (plan 032 §3.1.1 item 3, C1 review): its
-    /// answer's [`Applied::listed`] is always empty, and a row it newly holds
-    /// is marked `ahead` instead, so the fold that lands its frame reports it
-    /// — the source's fold is the one publisher of returns, in order with its
-    /// departures.
+    /// **It reports no return** (plan 032 §3.1.1 item 3): its answer's
+    /// [`Applied::listed`] is always empty, and the frame that lands next
+    /// reports none either — the row is already held. The caller lists the
+    /// row and publishes its return itself, a created-only row's too, under a
+    /// news number it mints under the same lock
+    /// ([`crate::roost_hosts::RoostHosts`]'s `list_answered_row`, branch
+    /// review): the news sequence, not the publishing task, orders it with
+    /// the fold's departures.
     pub fn listed_now(&mut self, session: LaneSession) -> Applied {
         if let Some(staged) = self.staged.as_mut() {
             staged
@@ -941,10 +1001,6 @@ impl CrazeState {
                 .or_insert_with(|| session.clone());
         }
         let visible = !self.rows.contains_key(&session.id);
-        if visible {
-            // Its return is the frame's to report, from the fold (`ahead`).
-            self.ahead.insert(session.id.clone());
-        }
         self.rows.entry(session.id.clone()).or_insert(session);
         Applied {
             departed: Vec::new(),
@@ -1214,12 +1270,34 @@ pub fn reopen_id(id: Option<&str>) -> Result<String, CrazeFailure> {
 
 /// Where a host's [`run`] task reports — implemented by the roost-host layer,
 /// which owns the lock the state lives under. Every method answers `false`
-/// once the host this task was started for is gone (removed, or re-registered
-/// under a newer fence): the task then ends.
+/// (or [`Dormancy::Gone`]) once the host this task was started for is gone
+/// (removed, or re-registered under a newer fence): the task then ends.
 pub trait CrazeSink: Send + Sync {
     fn event(&self, event: SourceEvent) -> bool;
-    fn dormant(&self) -> bool;
+    /// The host's listing epoch now ([`CrazeState::listings`]), read under
+    /// the state lock — what a find-only probe, or a roster's `--no-start`
+    /// dial, records as it STARTS, for the [`Self::dormant`] its no-hub
+    /// answer may become (C8 review finding 2). `0` once the host is gone:
+    /// the next call says so.
+    fn listings(&self) -> u64;
+    /// The hub is gone, by an answer whose probe (or roster dial) started at
+    /// listing epoch `probed_at` ([`CrazeState::dormant`]).
+    fn dormant(&self, probed_at: u64) -> Dormancy;
     fn offline(&self, cause: SourceOffline, reason: String) -> bool;
+}
+
+/// What [`CrazeSink::dormant`] made of a no-hub answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dormancy {
+    /// Folded: the source is Dormant, its rows — and their lanes — gone.
+    Folded,
+    /// Not folded — STALE (C8 review finding 2): a create or a reopen listed
+    /// a session since the answer's probe started, and may have started the
+    /// hub it runs on after the probe looked. Nothing changed; the source
+    /// probes again at once, and that answer decides.
+    Stale,
+    /// The host this task was started for is gone: the task ends.
+    Gone,
 }
 
 /// One host's craze source, for as long as the host is registered (the module
@@ -1270,6 +1348,15 @@ async fn eager(source: CrazeSource, sink: Arc<dyn CrazeSink>) {
 
 /// A remote host: probe, attach only to a hub that is there, and probe again
 /// whenever the roster drops (the module doc's table).
+///
+/// **A no-hub answer is judged against the listings since it was asked**
+/// (C8 review finding 2): the probe — and the roster's own `--no-start`
+/// dial, the other way this loop learns the hub is gone — records the
+/// listing epoch ([`CrazeSink::listings`]) as it STARTS, and a create or a
+/// reopen that listed a session before its answer lands makes that answer
+/// stale ([`Dormancy::Stale`]): it is not folded, and the loop probes again
+/// at once, rather than departing a just-started session's lane on evidence
+/// from before its hub existed.
 async fn attach_only(
     source: CrazeSource,
     probe: Arc<dyn CrazeProbe>,
@@ -1280,8 +1367,13 @@ async fn attach_only(
     use shed_core::lane::AgentSource as _;
     let mut backoff = t.backoff_base;
     loop {
+        let probed_at = sink.listings();
         match probe.probe().await {
             Probe::Hub => {
+                // The roster's dial starts with the subscription (and the
+                // loop drops it at its first `Offline`, so a `NoHub` is its
+                // first dial's).
+                let dialled_at = sink.listings();
                 let Ok(subscription) = source.subscribe().await else {
                     return;
                 };
@@ -1319,9 +1411,11 @@ async fn attach_only(
                 drop(rx);
                 if no_hub {
                     // As a probe's `NoHub` below: dormant, and the next probe on
-                    // the dormant clock.
-                    if !sink.dormant() {
-                        return;
+                    // the dormant clock — or, stale, the next probe now.
+                    match sink.dormant(dialled_at) {
+                        Dormancy::Gone => return,
+                        Dormancy::Stale => continue,
+                        Dormancy::Folded => {}
                     }
                     backoff = t.backoff_base;
                     wait(t.dormant, &wake).await;
@@ -1335,8 +1429,10 @@ async fn attach_only(
                 .await;
             }
             Probe::NoHub => {
-                if !sink.dormant() {
-                    return;
+                match sink.dormant(probed_at) {
+                    Dormancy::Gone => return,
+                    Dormancy::Stale => continue,
+                    Dormancy::Folded => {}
                 }
                 backoff = t.backoff_base;
                 wait(t.dormant, &wake).await;
@@ -1397,6 +1493,13 @@ mod tests {
             generation,
             truncated: false,
         })
+    }
+
+    /// A no-hub answer whose probe started just now — no listing since — so
+    /// it folds.
+    fn dormant(state: &mut CrazeState, created: &[LaneSession]) -> Applied {
+        let probed_at = state.listings();
+        state.dormant(created, probed_at).expect("no listing since")
     }
 
     #[test]
@@ -1469,30 +1572,29 @@ mod tests {
         let staged = s.apply(SourceEvent::Session { session: row("e") });
         assert!(staged.listed.is_empty(), "staged rows wait for their Ready");
         // The hub gone, then back: every row it lists is a return.
-        s.dormant();
+        dormant(&mut s, &[]);
         assert_eq!(seed(&mut s, 4, &["a"]).listed, ["a"]);
     }
 
-    /// **A row folded in ahead of its frame is returned by the FOLD, not by
-    /// the fold-ahead** (plan 032 §3.1.1 item 3, C1 review): `listed_now`
-    /// reports no return — a create publishes it from another task, unordered
-    /// with the fold's departures — and the frame that follows reports it,
-    /// though the row is already held: a live upsert, or the swap of the seed
-    /// it was folded into. Reported once; a `Removed` or a `Dormant` before
-    /// its frame forgets it.
+    /// **A row folded in ahead of its frame reports no return, and neither
+    /// does its frame** (plan 032 §3.1.1 item 3, branch review): the create
+    /// or reopen that listed it published the return itself, minted under the
+    /// state lock (`RoostHosts::list_answered_row`), so the fold never says
+    /// it again — not the live upsert of its frame, nor the swap of the seed
+    /// it was folded into. From then on the roster's frames govern it as any
+    /// row: a `Removed` before its frame departs it, and a later listing is a
+    /// fresh return.
     #[test]
-    fn a_row_folded_ahead_is_returned_by_its_frame() {
+    fn a_row_folded_ahead_reports_no_return_of_its_own() {
         let mut s = CrazeState::new(1);
         seed(&mut s, 1, &["a"]);
         let ahead = s.listed_now(row("n"));
         assert!(ahead.visible && ahead.listed.is_empty(), "{ahead:?}");
         assert_eq!(s.held(), ["a", "n"]);
         let framed = s.apply(SourceEvent::Session { session: row("n") });
-        assert_eq!(framed.listed, ["n"], "the frame reports the return");
-        let again = s.apply(SourceEvent::Session { session: row("n") });
-        assert!(again.listed.is_empty(), "once");
+        assert!(framed.listed.is_empty(), "its listing said it: {framed:?}");
 
-        // Folded into a seed in progress: its swap reports it.
+        // Folded into a seed in progress: its swap keeps it, and says nothing.
         s.apply(SourceEvent::Reset {
             reason: "connect".into(),
             generation: 2,
@@ -1504,21 +1606,20 @@ mod tests {
             generation: 2,
             truncated: false,
         });
-        assert_eq!(swapped.listed, ["m"], "{swapped:?}");
-        let held = s.apply(SourceEvent::Session { session: row("m") });
-        assert!(held.listed.is_empty(), "the swap's report was the one");
+        assert!(
+            swapped.departed.is_empty() && swapped.listed.is_empty(),
+            "{swapped:?}"
+        );
+        assert_eq!(s.held(), ["a", "m", "n"]);
 
-        // Removed before its frame: the mark goes with it.
+        // Removed before its frame: it departs, and a later listing returns.
         s.listed_now(row("p"));
-        s.apply(SourceEvent::Removed {
+        let removed = s.apply(SourceEvent::Removed {
             session_id: "p".into(),
         });
+        assert_eq!(removed.departed, ["p"]);
         let relisted = s.apply(SourceEvent::Session { session: row("p") });
-        assert_eq!(relisted.listed, ["p"], "a fresh listing, reported once");
-        // The hub gone before its frame: so does the mark.
-        s.listed_now(row("q"));
-        s.dormant();
-        assert_eq!(seed(&mut s, 3, &["a"]).listed, ["a"]);
+        assert_eq!(relisted.listed, ["p"], "a fresh listing");
     }
 
     /// Retained across an `Offline`, dropped by a `Dormant`.
@@ -1534,10 +1635,77 @@ mod tests {
         assert!(!s.live(), "but not live: the merge absorbs nothing");
         assert_eq!(s.status()["state"], "offline");
         assert_eq!(s.status()["cause"], "unreachable");
-        let dormant = s.dormant();
-        assert_eq!(dormant.departed, ["a"]);
+        let gone = dormant(&mut s, &[]);
+        assert_eq!(gone.departed, ["a"]);
         assert!(s.rows.is_empty());
         assert_eq!(s.status()["state"], "dormant");
+    }
+
+    /// **A Dormant departs the source's created rows too** (plan 032 PC14g,
+    /// branch review): a lane opened on a session only a create or a reopen
+    /// answered with rides the hub as much as a roster row's, so the hub gone
+    /// before any seed listed it departs it with the rest. They are the
+    /// source's rows, not this state's — nothing a reader sees changes for
+    /// them, so a repeated dormant probe still repaints nothing — and a row
+    /// both held and created departs once.
+    #[test]
+    fn a_dormant_departs_the_created_rows_too() {
+        let mut s = CrazeState::new(1);
+        seed(&mut s, 1, &["a"]);
+        let first = dormant(&mut s, &[row("c"), row("a")]);
+        assert_eq!(first.departed, ["a", "c"], "{first:?}");
+        assert!(first.visible && first.listed.is_empty());
+        let again = dormant(&mut s, &[row("c")]);
+        assert_eq!(again.departed, ["c"], "still listed by the source");
+        assert!(!again.visible, "a repeated probe repaints nothing");
+    }
+
+    /// **A no-hub answer older than a listing folds nothing** (plan 032
+    /// §3.1.1 item 2, C8 review finding 2): once a create or a reopen listed
+    /// a row, the listing epoch read as an earlier probe STARTED is behind —
+    /// the session may run on a hub that probe looked too early to see — so
+    /// that probe's `dormant` is `None`: no row dropped, nothing departed and
+    /// no news number minted. A probe started after the listing folds as
+    /// ever.
+    #[test]
+    fn a_no_hub_answer_older_than_a_listing_folds_nothing() {
+        let mut s = CrazeState::new(1);
+        seed(&mut s, 1, &["a"]);
+        let probed_at = s.listings();
+        let returned = s.answer_listed();
+        assert!(s.dormant(&[row("c")], probed_at).is_none(), "stale");
+        assert_eq!(s.held(), ["a"], "nothing dropped");
+        assert!(s.live());
+        assert_eq!(s.mint_news(), returned + 1, "no news minted");
+        let gone = dormant(&mut s, &[row("c")]);
+        assert_eq!(gone.departed, ["a", "c"], "a probe from after it folds");
+    }
+
+    /// **A listing returns its row even after a Dormant folded while its
+    /// request was in flight** (plan 032 §3.1.1 item 3, C8 review): craze's
+    /// answer says the session runs, so its return is minted all the same —
+    /// in the news sequence, newer than that Dormant's departure (minted as
+    /// the fold mints it, after folding), so it ends that departure — the
+    /// listing epoch moves, and the roster's row, folded ahead, is held
+    /// again (openable). If the hub really stayed gone, a probe started
+    /// after the listing finds none and departs the row again.
+    #[test]
+    fn a_listing_after_a_dormant_still_returns_its_row() {
+        let mut s = CrazeState::new(1);
+        seed(&mut s, 1, &["a"]);
+        // The request goes out, and the hub goes before its row is listed.
+        let gone = dormant(&mut s, &[]);
+        assert_eq!(gone.departed, ["a"]);
+        let departed = s.mint_news();
+        let listings = s.listings();
+        let returned = s.answer_listed();
+        assert!(returned > departed, "newer than the departure it ends");
+        assert_eq!(s.listings(), listings + 1, "and it was listed");
+        s.listed_now(row("a"));
+        assert_eq!(s.held(), ["a"], "held again: openable");
+        // The hub stayed gone: a probe from after the listing departs it.
+        let again = dormant(&mut s, &[]);
+        assert_eq!(again.departed, ["a"]);
     }
 
     /// A probe with one fixed answer, counting the times it is asked.
@@ -2098,7 +2266,7 @@ mod tests {
         );
         let mut s = CrazeState::new(4);
         assert!(!s.proven_unattached(), "never probed");
-        s.dormant();
+        dormant(&mut s, &[]);
         assert!(s.proven_unattached(), "dormant");
         s.offline(SourceOffline::TooOld, "unknown flag: --hub".into());
         assert!(s.proven_unattached(), "too old");
@@ -2154,7 +2322,7 @@ mod tests {
         );
         let mut s = CrazeState::new(7);
         assert_eq!(s.status()["source_gen"], 7, "never reached");
-        s.dormant();
+        dormant(&mut s, &[]);
         assert_eq!(s.status()["source_gen"], 7, "dormant");
         s.offline(SourceOffline::Unreachable, "no route".into());
         assert_eq!(s.status()["source_gen"], 7, "offline");

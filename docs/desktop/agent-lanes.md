@@ -158,7 +158,10 @@ itself cannot start a hub. Only the create sheet's explicit actions start one
 on a remote host, and only they run plain `craze bridge --hub`: opening it
 (its provider list), creating a session, and its Resume half (listing saved
 sessions, resuming one). After any of them, the host's source probes at once
-and attaches to the new hub. (Open in terminal runs `craze
+and attaches to the new hub. A "no hub" answer from a probe or roster
+connection that started before a create or resume listed its session is not
+believed: it may predate the hub that action started, so the source asks
+again at once instead of going `dormant`. (Open in terminal runs `craze
 attach`, which joins the session over the session's own control socket and
 starts nothing.)
 
@@ -405,7 +408,7 @@ whichever half shows, Resume included. The Retry works while a reopen runs.
 
 | Outcome | What the sheet does |
 |---|---|
-| Resumed | The sheet closes and the session's transcript opens at once. The row is listed before any roster frame names it, the same way a created session's is. |
+| Resumed | The sheet closes and the session's transcript opens at once. The row is listed before any roster frame names it, the same way a created session's is. A lane already open on that session that was departing is live again. If that session's transcript is already on screen, ended (a host that outlived its hub, rejoined), it opens again in place on a fresh lane. |
 | Resumed, but the machine was removed (or removed and added again) meanwhile | Nothing opens: the answer came through the machine's old connection, which the transcript cannot open through. The row stays and says so ("Resume again to open it"); resuming again joins the running session. A sheet not on screen says it in a toast. If a status has already named the new incarnation, the state has started afresh and the answer is dropped instead, as described above. |
 | `gone` | The session cannot run here any more (no such session, or its directory is gone). The row is dropped, and the sheet says why where it was. |
 | `start_failed` | The session was found and failed to start. craze's cause shows inline, verbatim, and the row stays. |
@@ -499,20 +502,28 @@ not end a craze lane when its row leaves; the lane **departs**:
   `session_closed` — ends the lane exactly as a normal end does, with every
   last row on screen.
 - **A return.** A row listed again inside the grace (a reseed that briefly
-  dropped it, a hub that came back) cancels the departure: the lane never let
-  its connection go. A row that leaves again later gets a fresh grace; a
-  repeated removal during one absence never extends it. Departures and
-  returns apply in the order they happened, however late one reaches the
-  lane: a return reported before a departure never revives the lane that
-  departure departed, and a departure from before a return never departs the
-  lane again. **End tab** departs no lane: the session runs on in its host
-  after its tab closes, and a session that does end leaves the roster on the
-  hub's next round.
+  dropped it, a hub that came back, or a create or resume that answers with
+  it, such as a resume that rejoins a host which outlived its hub) cancels the
+  departure: the lane never let its connection go. That holds even for an
+  answer that arrives after the hub really went (the source went dormant
+  while the create or resume ran), a deliberate bias toward never ending a
+  running session's panel: if that hub stays gone, the lane ends `hub_gone` a
+  grace after the next probe finds no hub, or, with the machine unreachable,
+  when its dials give up 10 minutes in. A row that leaves again later gets a
+  fresh grace; a repeated removal during one absence never extends it.
+  Departures and returns apply in the order they happened, however late one
+  reaches the lane: a return reported before a departure never revives the
+  lane that departure departed, and a departure from before a return never
+  departs the lane again. **End tab** departs no lane: the session runs on in
+  its host after its tab closes, and a session that does end leaves the roster
+  on the hub's next round.
 - **The end.** Otherwise the grace's end ends the lane itself, with a final
   reason the banner shows (`ended · <reason> — showing the last known
   transcript`): **`session_gone`** when the roster removed the row (a
   `Removed`, or a reseed without it), or
   **`hub_gone`** when the row left with the hub (the source went dormant).
+  That includes a just-created or just-resumed session's row that no roster
+  had listed yet.
   10 s only bounds the worst case: a host that died without a final event
   answers the lane's redial with `unknown_session` well before it.
 - **Host removed.** A machine removed from the config, or a shed that

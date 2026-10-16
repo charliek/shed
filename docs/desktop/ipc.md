@@ -319,7 +319,7 @@ woken.
 | op | params | result |
 |----|--------|--------|
 | `craze.saved` | `machine` | `{machine, saved: {sessions, more}, home, source_gen}` — craze's saved sessions, newest first, at most 50 (`more` is `true` when craze left some out), each `{id, provider, workspace, title?, updated_unix_ms, created_unix_ms?}`. `id` is opaque: craze's session id, or `<provider>:<providerSessionId>` for a session recorded before craze ids. `workspace` is absolute and not checked to exist. `title` is absent when the session has none; `created_unix_ms` is absent when craze recorded no time. `home` is the host's home directory where the app knows it (this machine's `HOME`, a shed's `/home/shed`), else `null`; the sheet shortens a workspace under it to `~`. `source_gen` is the incarnation the list came through, as `craze.create_options` reports it. Read afresh on every call |
-| `craze.reopen` | `machine`, `id` | `{session, host_id, ended, superseded, joined, id, source_gen}` — the saved session `id` running again: craze **joins** a host already serving it (`joined: true`) or starts one that loads it (`joined: false`). `session` is its row, **already in the machine's listing** (the source keeps it as a created row, even for a hostId whose earlier session ended), so `lane.open {kind: "craze", session_id: host_id}` works at once — unless `ended` is `true`: the session was gone again by the time its row was folded, and nothing is listed; or `superseded` is `true`: the machine was removed, or removed and added again, while the reopen ran, so its answer came through a craze source the machine no longer has (`source_gen`, the incarnation the reopen went through). Nothing is listed then, `session` is the last known row (`stale`), and there is nothing to open on it: a `lane.open` goes through the machine's current source. The row's own `stale` is not that test — a reopen on a dormant machine answers `stale: true` too (its hub just started, its source not yet attached) and opens at once. `id` must be a non-blank string (`bad_request`). It can take minutes: the app allows craze 200 s per answer and sends a lost answer again once; a caller that stops waiting abandons the wait, never the reopen |
+| `craze.reopen` | `machine`, `id` | `{session, host_id, ended, superseded, joined, id, source_gen}` — the saved session `id` running again: craze **joins** a host already serving it (`joined: true`) or starts one that loads it (`joined: false`). `session` is its row, **already in the machine's listing** (the source keeps it as a created row, even for a hostId whose earlier session ended), so `lane.open {kind: "craze", session_id: host_id}` works at once, and a lane on that hostId that was departing is live again (a joined host that outlived its hub, say); `lane.open` on a FINISHED lane there opens a fresh one — unless `ended` is `true`: the session was gone again by the time its row was folded, and nothing is listed; or `superseded` is `true`: the machine was removed, or removed and added again, while the reopen ran, so its answer came through a craze source the machine no longer has (`source_gen`, the incarnation the reopen went through). Nothing is listed then, `session` is the last known row (`stale`), and there is nothing to open on it: a `lane.open` goes through the machine's current source. The row's own `stale` is not that test — a reopen on a dormant machine answers `stale: true` too (its hub just started, its source not yet attached) and opens at once. `id` must be a non-blank string (`bad_request`). It can take minutes: the app allows craze 200 s per answer and sends a lost answer again once; a caller that stops waiting abandons the wait, never the reopen |
 
 A reopen's refusal keeps its kind as the code, so a caller branches on the code and never on
 the words:
@@ -359,13 +359,16 @@ failure codes — is [Agent lanes](agent-lanes.md).
 
 Every frame reaches the frontend as the `lane-event` Tauri event, `{machine, kind, session_id,
 event}`. A roost snapshot never evicts a craze lane; its row's craze source governs it. When the
-row leaves (removed, a reseed that no longer lists it, its tab ended, the hub gone) the lane
+row leaves (removed, a reseed that no longer lists it, or the hub gone, which takes a session a
+`craze.create` or `craze.reopen` answered with along too, before any roster listed it) the lane
 **departs**: it keeps its own connection for a 10 s grace, in which the session's final `Down`
-(`session_closed` after a Stop) ends it as usual and a row listed again keeps it live; at the
-grace's end the desktop ends it itself — `Down{session_gone}` for a removed row,
-`Down{hub_gone}` for a hub that went. The host's removal ends every lane of its source at once,
-`Down{host_removed}`. All three are final reasons, like `unknown_session`, `session_closed` and
-`start_failed:<cause>` (see [Agent lanes](agent-lanes.md#a-lane-outlives-its-row)).
+(`session_closed` after a Stop) ends it as usual and a row listed again keeps it live, whether
+the roster lists it or a `craze.create` or `craze.reopen` answers with it; at the grace's end the
+desktop ends it itself — `Down{session_gone}` for a removed row, `Down{hub_gone}` for a hub that
+went. Ending a craze row's tab (`machine.kill`) departs no lane: the session runs on in its host.
+The host's removal ends every lane of its source at once, `Down{host_removed}`. All three are
+final reasons, like `unknown_session`, `session_closed` and `start_failed:<cause>` (see
+[Agent lanes](agent-lanes.md#a-lane-outlives-its-row)).
 
 **A finished lane** — ended by any final reason — stays registered and readable
 (`lane.messages`, `lane.approvals`, `lane.settings` from its view) until `lane.close`, with its
