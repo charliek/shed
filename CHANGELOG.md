@@ -41,18 +41,41 @@ All notable changes to this project will be documented in this file.
   it, `SHED_TAURI_LOG=debug` adds debug detail, and `identify` reports the path. The
   broker's connect, drop and rejection lines now name their server, in `shed-host-agent`'s
   log too. (#414)
+- **Desktop (craze): `/effort` in the `/` menu.** On a session whose model has an effort
+  setting, a bare `/effort` opens the settings sheet and `/effort <level>` sets the effort
+  directly (`/effort default` picks the model's default where craze says what it is). The row
+  hides on a model without one. The phone gets it in its next release.
+- **Desktop (craze): the settings sheet shows where a model switch lands.** On a native
+  session, each other model in the list shows a dim `effort → <level>`: the effort a switch to
+  it lands on. craze 0.2.0 now switches to the effort last used on that model.
+- **Desktop (craze): resume a saved session.** The New craze session sheet gains a Resume
+  half that lists the host's saved, not-running sessions, newest first. Resume reopens one
+  and opens its transcript. It needs craze 0.2.0 or later on the host. A reopen can take a
+  few minutes; a session craze can no longer reopen leaves the list with craze's reason.
 
 ### Changed
 
 - **Images: the `extensions` and `full` images bake craze 0.2.0** (0.9.0 baked 0.1.0), and
-  shed's CI tests against it. The desktop works as it did: craze's new `/effort` command is
-  not in its `/` menu yet, and typing it says "not available here yet". See
+  shed's CI tests against it. See
   [craze's changelog](https://github.com/charliek/craze/blob/main/CHANGELOG.md) for what changed
   in craze itself, including that a model switch on a native session now lands on the effort
   last used on that model.
+- **Desktop (craze): a remote host's hub is reached with `craze bridge --hub --no-start`.**
+  The connections the desktop makes on its own attach only to a hub that is already running,
+  so they can never start a hub on a remote shed, and the race this leaves behind is gone.
+  A host with craze older than 0.2.0 falls back to the earlier probe-then-bridge path, race
+  included, until craze is updated there.
 
 ### Fixed
 
+- **Desktop (craze): stopping a session no longer freezes its transcript panel.** craze 0.2.0
+  removes a stopping session from its list before the session's last events arrive. The
+  desktop used to close the lane at once, leaving a panel with no "ended" banner, a live
+  composer, and a `no_lane` error on the next action. A lane now keeps its own connection for
+  up to 10 s after its row leaves. Its last events land, and then it ends with its reason
+  (`session_closed`, or `session_gone` / `hub_gone` when nothing final arrived). The ended
+  panel stays readable, and its composer is disabled. Closing a craze session's tab no longer
+  ends its transcript: the session runs on in its host.
 - **Desktop: while the agent is working, the `/` menu opens on the first command you can run
   now**, not on one that has to wait for the turn, so Enter right after `/` no longer refuses.
   The phone gets the same rule from the shared core in its next release.
