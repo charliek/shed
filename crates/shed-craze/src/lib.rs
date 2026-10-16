@@ -10,7 +10,7 @@
 //! [`CrazeSource`] is one machine's hub.
 //!
 //! ```text
-//! CrazeSource  — AgentSource: the live roster, createOptions, create, open
+//! CrazeSource  — AgentSource: the live roster, createOptions, create, saved, reopen, open
 //! CrazeLane    — AgentLane: one session, by its row's hostId
 //!   ├─ watcher.rs  — the subscription's pump: seed, silent resume, reseed, Down
 //!   ├─ fold.rs     — craze's events and snapshots → append-only rows, activity,
@@ -24,7 +24,8 @@
 //!   ├─ conn.rs   — one NDJSON connection: framing at craze's limits from the client's
 //!   │              side, id demux, notifications, the bounded preamble, both hellos
 //!   ├─ wire.rs   — protocol 1's envelope and the params/results this crate composes
-//!   └─ errors.rs — craze's published code → LaneError table, verbatim (+ P14's one row)
+//!   └─ errors.rs — craze's published code → LaneError table, verbatim (+ P14's one row),
+//!                  and a reopen's own LaneReopenError map (plan 032)
 //! ```
 //!
 //! **The transport is the client's** (P8): a dial runs `craze bridge --hub`
@@ -33,8 +34,9 @@
 //! port on the phone — and this crate speaks protocol 1 over whatever duplex it
 //! is handed. The ladder itself is `shed_core::craze`'s (craze's published one,
 //! verbatim, plus an exec-only PATH; plan 025 §3.4). Every connection is its own
-//! dial: the roster's, every `createOptions`, every create, and every open
-//! lane's (one per lane, which its verbs share).
+//! dial: the roster's, every `createOptions`, every create, every saved list
+//! and every reopen (plan 032), and every open lane's (one per lane, which its
+//! verbs share).
 //!
 //! **The lane** ([`CrazeLane`], plan 025 §3.3.4–3.3.6, C8) is opened by hostId
 //! (P11) and reaches its host through the hub's splice; its watcher seeds from
@@ -68,8 +70,12 @@ pub use dial::{
     classify_pre_hello, classify_probe, connect_hub, probe_process, CrazeDial, CrazeStream,
     DialError, EnvPolicy, ExitWatch, Probe, ProcessDial, StderrTail, TcpDial,
 };
-pub use errors::{index_write_cause, is_outcome_unknown, lane_error};
+pub use errors::{
+    index_write_cause, is_outcome_unknown, is_reopen_lost, lane_error, reopen_error,
+    reopen_unsupported, reopen_unsupported_by, REOPEN_LOST,
+};
 pub use lane::{answer_body, lane_capabilities, setting_for, CrazeLane, LaneTimings};
 pub use source::{
-    lane_session, new_request_id, source_capabilities, valid_request_id, CrazeSource, Timings, KIND,
+    lane_session, new_request_id, source_capabilities, valid_request_id, CrazeSource, Timings,
+    KIND, REOPEN_DEADLINE, SAVED_LIMIT,
 };

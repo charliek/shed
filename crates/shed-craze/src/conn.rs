@@ -672,7 +672,8 @@ pub fn check_protocol_and_codecs(hello: &HelloResult) -> Result<(), HelloError> 
     }
 }
 
-fn version_or_unknown(v: &str) -> &str {
+/// A craze version as said, or `version unknown` for none.
+pub(crate) fn version_or_unknown(v: &str) -> &str {
     if v.is_empty() {
         "version unknown"
     } else {
@@ -1154,6 +1155,20 @@ mod tests {
         .unwrap();
         assert_eq!(ok.epoch, "0a1b2c3d4e5f");
         assert!(ok.capabilities.session_create && ok.capabilities.create_options);
+        // Plan 032: `reopen` is read where a 0.2.0 hub says it, and an older
+        // hub's `hello` (0.1.1's, above) does not — nor is it required.
+        assert!(!ok.capabilities.reopen);
+        let reopens = judge_hub_hello(&hub_hello(
+            crate::testing::reopen_hub_capabilities(),
+            json!({"event": 1, "snapshot": 1}),
+        ))
+        .unwrap();
+        assert!(reopens.capabilities.reopen);
+        assert_eq!(
+            (reopens.craze_version.as_str(), reopens.pid),
+            ("test", Some(5150)),
+            "what the older-hub words read"
+        );
         for codecs in [
             json!({"event": 2, "snapshot": 1}),
             json!({"event": 1, "snapshot": 2}),

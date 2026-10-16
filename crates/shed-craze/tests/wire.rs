@@ -1202,6 +1202,9 @@ fn the_capabilities_of_wire_19_and_26() {
     // Plan 029: WIRE/32's hub takes a title.
     let titled = source_capabilities(&hello_of(&fixture("32-")).capabilities);
     assert!(titled.create && titled.create_title);
+    // Plan 032: every vendored hub `hello` is from before `reopen` (craze
+    // 0.2.0's capability; no fixture carries it yet, §4.1), so none offers it.
+    assert!(!old.reopen && !new.reopen && !titled.reopen);
 }
 
 /// **WIRE/32 through the source** (plan 029 D8): a titled create is the

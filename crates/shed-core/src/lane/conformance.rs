@@ -1067,6 +1067,7 @@ mod tests {
                 create: true,
                 create_options: true,
                 create_title: false,
+                reopen: false,
             },
         }
     }

@@ -975,6 +975,20 @@ fn both_traits_are_object_safe_and_the_lane_is_session_scoped() {
         rt.block_on(source.create(request)).unwrap_err(),
         "the default create_held answers what create does"
     );
+    // `saved`/`reopen` are additive too (plan 032 §3.4): a source that never
+    // wrote them says it cannot reopen saved sessions, naming its kind.
+    assert_send(&source.saved());
+    assert_send(&source.reopen("saved-1"));
+    assert_eq!(
+        rt.block_on(source.saved()).unwrap_err(),
+        LaneError::Failed("this nothing source cannot reopen saved sessions".into())
+    );
+    assert_eq!(
+        rt.block_on(source.reopen("saved-1")).unwrap_err(),
+        LaneReopenError::Lane(LaneError::Failed(
+            "this nothing source cannot reopen saved sessions".into()
+        ))
+    );
     let lane: Arc<dyn AgentLane> = Arc::new(NoLane("ses_1".into()));
     assert_eq!(lane.session_id(), "ses_1", "the id is bound, not passed");
     assert_send(&lane.send("hi", SendMode::Queue));
@@ -1823,11 +1837,12 @@ fn source_event_is_tagged_on_kind_in_snake_case() {
                 create: true,
                 create_options: true,
                 create_title: false,
+                reopen: false,
             }
         }),
         json!({"kind": "capabilities",
                "capabilities": {"kind": "opencode", "create": true, "create_options": true,
-                                "create_title": false}})
+                                "create_title": false, "reopen": false}})
     );
     assert_eq!(
         round_trip(&SourceEvent::Ready {
@@ -2060,6 +2075,7 @@ fn create_options_created_and_settings_round_trip_and_tolerate() {
         ],
         default_provider: Some("grok".into()),
         recent_dirs: vec!["/home/me/lumen".into()],
+        reopen: true,
     };
     let encoded = round_trip(&options);
     assert_eq!(encoded["providers"][0]["state"], "unavailable");
@@ -2742,4 +2758,132 @@ fn the_effort_option_is_crazes_rule() {
             "{what}"
         );
     }
+}
+
+// ---- plan 032 §3.4: saved sessions, reopened ----
+
+/// The saved list and a reopen's answer round-trip, and decode TOLERANTLY: an
+/// unknown field is ignored, an absent list is empty and an absent `more` or
+/// `joined` false; a session with no title and no creation time omits both.
+#[test]
+fn saved_sessions_and_a_reopen_round_trip_and_tolerate() {
+    let saved = LaneSavedSessions {
+        sessions: vec![
+            LaneSavedSession {
+                id: "0190ab12-cd34-7ef0-8123-456789abcdef".into(),
+                provider: "cursor".into(),
+                workspace: "/home/me/projects/lumen".into(),
+                title: Some("fix the flaky test".into()),
+                updated_unix_ms: 1_791_799_200_000,
+                created_unix_ms: Some(1_791_795_600_000),
+            },
+            LaneSavedSession {
+                id: "grok:4f1e2d3c".into(),
+                provider: "grok".into(),
+                workspace: "/home/me/projects/lumen".into(),
+                title: None,
+                updated_unix_ms: 1_791_712_800_000,
+                created_unix_ms: None,
+            },
+        ],
+        more: true,
+    };
+    let encoded = round_trip(&saved);
+    assert_eq!(
+        encoded["sessions"][0],
+        json!({"id": "0190ab12-cd34-7ef0-8123-456789abcdef", "provider": "cursor",
+               "workspace": "/home/me/projects/lumen", "title": "fix the flaky test",
+               "updated_unix_ms": 1_791_799_200_000_i64, "created_unix_ms": 1_791_795_600_000_i64})
+    );
+    assert_eq!(
+        encoded["sessions"][1],
+        json!({"id": "grok:4f1e2d3c", "provider": "grok", "workspace": "/home/me/projects/lumen",
+               "updated_unix_ms": 1_791_712_800_000_i64}),
+        "no title and no creation time: both omitted"
+    );
+    assert_eq!(encoded["more"], true);
+    let sparse: LaneSavedSessions =
+        serde_json::from_value(json!({"cursor": 3})).expect("tolerated");
+    assert_eq!(sparse, LaneSavedSessions::default());
+
+    let reopened = LaneReopened {
+        session: sample_session(),
+        joined: true,
+    };
+    let encoded = round_trip(&reopened);
+    assert_eq!(encoded["joined"], true);
+    assert_eq!(encoded["session"]["id"], "ses_1");
+    let unjoined: LaneReopened = serde_json::from_value(json!({
+        "session": round_trip(&sample_session()), "epoch": "e"
+    }))
+    .expect("an absent joined and an unknown field are tolerated");
+    assert!(!unjoined.joined);
+}
+
+/// **[`LaneReopenError`] crosses in both of [`LaneError`]'s shapes** — its own
+/// payload variants as one-key objects, and its `lane` variant wrapping a
+/// `LaneError` that is itself a bare string or a one-key object (the FRB
+/// mirror decodes all of them). Strict: a kind it does not know is refused.
+/// Each says its text as itself.
+#[test]
+fn every_reopen_error_round_trips_in_both_wire_shapes() {
+    for (e, wire) in [
+        (
+            LaneReopenError::Gone("no session 0190ab12".into()),
+            json!({"gone": "no session 0190ab12"}),
+        ),
+        (
+            LaneReopenError::StartFailed("could not start: keychain locked".into()),
+            json!({"start_failed": "could not start: keychain locked"}),
+        ),
+        (
+            LaneReopenError::Unavailable("the hub is busy".into()),
+            json!({"unavailable": "the hub is busy"}),
+        ),
+        (
+            LaneReopenError::Lane(LaneError::UnknownSession),
+            json!({"lane": "unknown_session"}),
+        ),
+        (
+            LaneReopenError::Lane(LaneError::BadRequest("bad id".into())),
+            json!({"lane": {"bad_request": "bad id"}}),
+        ),
+    ] {
+        assert_eq!(round_trip(&e), wire, "{e:?}");
+    }
+    assert_eq!(
+        LaneReopenError::StartFailed("could not start: x".into()).to_string(),
+        "could not start: x"
+    );
+    assert_eq!(
+        LaneReopenError::Lane(LaneError::UnknownSession).to_string(),
+        "no such session"
+    );
+    for bad in [json!({"lost": "x"}), json!("gone"), json!({"lane": "nope"})] {
+        assert!(
+            serde_json::from_value::<LaneReopenError>(bad.clone()).is_err(),
+            "{bad} must be refused"
+        );
+    }
+}
+
+/// **A pre-032 producer still decodes** (plan 032 §3.4, PC11): source
+/// capabilities and create options without `reopen` read `false` — the
+/// reading that offers no resume entry.
+#[test]
+fn a_pre_032_producer_decodes_with_reopen_false() {
+    let caps: SourceCapabilities = serde_json::from_value(json!({
+        "kind": "craze", "create": true, "create_options": true, "create_title": true
+    }))
+    .expect("a pre-032 source capabilities object decodes");
+    assert!(!caps.reopen);
+    let options: LaneCreateOptions =
+        serde_json::from_value(json!({"providers": [], "recent_dirs": ["/w"]}))
+            .expect("pre-032 create options decode");
+    assert!(!options.reopen);
+    let options = LaneCreateOptions {
+        reopen: true,
+        ..LaneCreateOptions::default()
+    };
+    assert_eq!(round_trip(&options)["reopen"], true);
 }

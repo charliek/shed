@@ -1183,6 +1183,7 @@ mod tests {
             create: true,
             create_options: true,
             create_title: true,
+            reopen: false,
         }
     }
 

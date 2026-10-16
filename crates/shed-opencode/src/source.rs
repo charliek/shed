@@ -67,13 +67,15 @@ const PROVIDER: &str = KIND;
 
 /// What an opencode source can do, as it rides every seed: it creates, and it
 /// answers create options (trivially) — but names no session at create
-/// (plan 029 X4).
+/// (plan 029 X4), and reopens no saved session (plan 032 §3.4: the contract's
+/// defaults answer for it).
 pub fn opencode_source_capabilities() -> SourceCapabilities {
     SourceCapabilities {
         kind: KIND.to_string(),
         create: true,
         create_options: true,
         create_title: false,
+        reopen: false,
     }
 }
 
@@ -161,6 +163,7 @@ impl AgentSource for OpencodeSource {
             }],
             default_provider: None,
             recent_dirs: Vec::new(),
+            reopen: false,
         })
     }
 

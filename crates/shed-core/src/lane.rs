@@ -41,7 +41,12 @@
 //! [`AgentSource::create_options`] says what a create can start,
 //! [`AgentSource::create`] starts one, and [`AgentSource::open`] hands back the
 //! session-scoped [`AgentLane`] for one row's id. A lane is bound to that id for
-//! its whole life, so none of its verbs takes one.
+//! its whole life, so none of its verbs takes one. Since plan 032 a source may
+//! also list the **saved** sessions nothing runs now ([`AgentSource::saved`])
+//! and run one again ([`AgentSource::reopen`], whose answer is a row
+//! [`AgentSource::open`] takes), where [`SourceCapabilities::reopen`] says so;
+//! both default to "this source cannot", so an adapter without them writes
+//! nothing.
 //!
 //! Three things left the lane trait when it split, each for a reason:
 //!
@@ -126,10 +131,11 @@
 //! derived serde would encode `Other("x")` as an object); [`LaneEvent`] and
 //! [`SourceEvent`], whose `Unknown` absorbs a `kind` this build has never heard
 //! of; and the result DTOs ([`LaneCreateOptions`], [`LaneCreated`],
-//! [`LaneSettings`], [`LaneSlashCatalog`] and their parts), which ignore an
-//! unknown field and default an absent list. It leaves [`LaneDecision`],
-//! [`SendMode`], [`LaneAnswer`], [`LaneError`], [`LaneCreateRequest`] and
-//! [`LaneSettingChange`] strict — the last two `deny_unknown_fields`.
+//! [`LaneSettings`], [`LaneSlashCatalog`], [`LaneSavedSessions`],
+//! [`LaneReopened`] and their parts), which ignore an unknown field and
+//! default an absent list. It leaves [`LaneDecision`], [`SendMode`],
+//! [`LaneAnswer`], [`LaneError`], [`LaneReopenError`], [`LaneCreateRequest`]
+//! and [`LaneSettingChange`] strict — the last two `deny_unknown_fields`.
 //!
 //! **Tolerance is about VALUES, not types.** A known field whose value has the
 //! wrong JSON TYPE (an object where a string belongs, a number past its width)
@@ -278,6 +284,8 @@
 //! | source `subscribe` | `GET /session` (every root on that server, the global store) plus one `GET /session/status?directory=` per distinct directory, polled every 5 s and diffed into `Session`/`Removed`; activity `busy\|retry → Working`, `idle → Idle`; a failed poll is `Offline{unreachable}` alone, and the next good one reseeds | `sessions.subscribe` on its own roster connection, after a hub `hello` that must offer `rosterSubscribe` and `connect`: the reply's rows seed `Reset … Ready`, each `roster` notification's `upserts`/`removes` become `Session`/`Removed` keyed by `hostId`; a roster `reset` resubscribes, EOF or `hub_closing` is `Offline{unreachable}` and a redial |
 //! | source `create_options` | one implicit `opencode` provider, `ready`; no default, no recent directories | `sessions.createOptions`, on its own connection, where the hub's `hello` says `createOptions` |
 //! | source `create` | `POST /session?directory=<cwd>`, then `prompt_async` when a prompt is given; `request_id` accepted and unused; a `title` is [`LaneError::Failed`] before the first POST ([`SourceCapabilities::create_title`] false) | `session.create{cwd, provider?, prompt?, requestId, title?}`, on its own connection; an unknown outcome retries once under the same `requestId`; a `title` goes only to a hub whose `hello` says `createTitle` — a fresh create to one that does not is `Failed`, nothing sent, and a retry or a held replay there is outcome unknown, the id and the title kept |
+//! | source `saved` | the default — [`LaneError::Failed`] (`"this opencode source cannot reopen saved sessions"`); [`SourceCapabilities::reopen`] false | `sessions.saved{limit: 50}` on its own connection, where the hub's `hello` says `reopen` — else [`LaneError::Unavailable`] naming the hub's craze version, nothing sent; newest first, `more` when craze left some out |
+//! | source `reopen` | the default — [`LaneReopenError::Lane`] of the same `Failed` | `session.reopen{id}` on its own connection, gated as `saved` is, allowing 200 s per answer; a lost answer (the connection ended, the deadline passed) is sent again ONCE on a fresh connection, and a second loss — or a success shed cannot read — is [`LaneReopenError::Unavailable`] ("Retry is safe"); the answer's row is kept as a create's is (openable at once by its `hostId`), a tombstone for that hostId notwithstanding |
 //! | source `open` | binds the session id; no I/O | binds the `hostId` (and the roster row's craze `sessionId` when the source holds it); no I/O |
 //! | `session` | `GET /session/{sessionID}` plus its `/session/status` and approval lists | the roster row the lane was opened with, refreshed by the watcher (attach's info document, the fold's activity and title); never dials |
 //! | `history` | `GET /session/{sessionID}/message` through a fresh fold (seq from 1); `cursor` ignored, `truncated` from the page cap | `session.snapshot` folded into rows; `cursor` ignored (craze has no paging); `truncated` when the snapshot was windowed or dropped, or its omitted ledger is non-empty |
@@ -314,6 +322,26 @@
 //! | `unsupported`, `queue_full`, `text_too_long`, `prompt_in_flight`, `prompt_cancelled`, `unknown_row`, `unknown_command`, `unknown_subagent`, `aborted`, `failed`, `index_write` | [`LaneError::Failed`] (the code's own text) |
 //! | *(unused — protocol 1 has no authentication)* | [`LaneError::Unauthorized`] |
 //! | a verb in flight when the connection drops, or past its deadline (craze's client-side `resume_lost`/`disconnected`/`no_answer`) | [`LaneError::Failed`] (`"outcome unknown: …"`) — never resent |
+//!
+//! **A reopen has its own error, [`LaneReopenError`]** (plan 032 §3.4,
+//! PC10), mapped beside the create's — and its one row keyed on `data.reason`
+//! is the second documented exception to "keyed on `data.code` only"
+//! (PC14e): craze's own reopen table (PM "`session.reopen`", "Refusals")
+//! gives `not_accepting`'s two reasons OPPOSITE client actions — drop the row,
+//! or show the cause and keep it — and [`LaneError::NotAccepting`] is a unit
+//! variant that could carry neither. Only `session.reopen`'s `not_accepting`
+//! is split; every other method keeps the table above.
+//!
+//! | craze's answer to `session.reopen` | [`LaneReopenError`] |
+//! |---|---|
+//! | `unknown_session` | `Gone` (craze's message) — drop the row |
+//! | `not_accepting`, reason `not_resumable` | `Gone` (craze's message) — drop the row |
+//! | `not_accepting`, reason `start_failed` | `StartFailed("could not start: <data.cause, else the message>")` — keep the row |
+//! | `unavailable`, any reason | `Unavailable` (craze's message) — offer Retry |
+//! | `unsupported` (reason `unsupported`, or `unknown_method`: a hub from before the method), or a bare `-32601` | `Unavailable`, in the older-hub words a hub `hello` without `reopen` gets before anything is sent |
+//! | `bad_request` | `Lane(BadRequest)` |
+//! | anything else (`not_accepting` with another reason included) | `Lane(Failed)` (craze's message) |
+//! | no answer: the connection ended or the 200 s passed, twice (the first loss is sent again once), or a success shed cannot read | `Unavailable("the reopen's answer was lost; the session may already be running — Retry is safe …")` |
 //!
 //! # The corrections (gx forced, plan 017; gx retired, plan 025)
 //!
@@ -1507,6 +1535,12 @@ pub struct SourceCapabilities {
     /// decodes to `false` — a producer from before the field offers none.
     #[serde(default)]
     pub create_title: bool,
+    /// [`AgentSource::saved`] and [`AgentSource::reopen`] will be honoured
+    /// (plan 032 §3.4): a client offers its resume entry only where this is
+    /// true. Absent decodes to `false` — a producer from before the field
+    /// reopens nothing.
+    #[serde(default)]
+    pub reopen: bool,
 }
 
 /// Why a source is [`SourceEvent::Offline`].
@@ -2030,6 +2064,14 @@ pub struct LaneCreateOptions {
     /// The directories sessions ran in, newest first.
     #[serde(default)]
     pub recent_dirs: Vec<String>,
+    /// The source can list saved sessions and reopen one
+    /// ([`SourceCapabilities::reopen`], plan 032 §3.4 PC11) — read from the
+    /// SAME answer these options came from (craze: the same hub `hello`), so
+    /// a create dialog opened on a source with no live roster (a dormant host
+    /// whose hub the dialog itself started) still knows whether to offer its
+    /// resume mode. Absent decodes to `false`.
+    #[serde(default)]
+    pub reopen: bool,
 }
 
 /// One provider a create can name.
@@ -2216,6 +2258,109 @@ impl<'de> Deserialize<'de> for LanePromptOutcome {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(LanePromptOutcome::from_wire(&tolerant_word(d)?))
     }
+}
+
+// ---- saved sessions, reopened (the source's half; plan 032 §3.4) ----
+
+/// One saved session: a session the machine remembers that nothing runs now,
+/// which [`AgentSource::reopen`] can run again (craze's `sessions.saved` row).
+///
+/// **Inbound, tolerant**: an unknown field is ignored, an absent optional one
+/// decodes `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LaneSavedSession {
+    /// What [`AgentSource::reopen`] takes — OPAQUE to a client (craze: the
+    /// session's craze id, or `<provider>:<providerSessionId>` for a session
+    /// recorded before craze ids). Never the row id a reopen answers with.
+    pub id: String,
+    /// The provider it ran under (`cursor`, `grok`, `native`, …).
+    pub provider: String,
+    /// The directory it ran in, absolute, as the machine recorded it — not
+    /// checked to exist still (a reopen of one that does not is
+    /// [`LaneReopenError::Gone`]).
+    pub workspace: String,
+    /// Its title; `None` when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// When it was last active, Unix epoch milliseconds.
+    pub updated_unix_ms: i64,
+    /// When it was created; `None` when the machine recorded no time (craze
+    /// writes Go's zero time for that).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_unix_ms: Option<i64>,
+}
+
+/// [`AgentSource::saved`]'s answer: the saved sessions, newest first, and
+/// whether the source left some out (craze lists at most 50).
+///
+/// **Inbound, tolerant**: an absent list is empty, an absent `more` false.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LaneSavedSessions {
+    #[serde(default)]
+    pub sessions: Vec<LaneSavedSession>,
+    /// Sessions were left out: a client says it shows only the most recent.
+    #[serde(default)]
+    pub more: bool,
+}
+
+/// [`AgentSource::reopen`]'s answer: the running session's row and whether
+/// the source joined a session that was already running (`true`) or started
+/// one to load it (`false`).
+///
+/// The row is openable at once through [`AgentSource::open`] by its `id` —
+/// for craze its hostId, which is where the session is reached, never the
+/// saved id the reopen was asked for. Across a retry `joined` (and, if the
+/// first try's host went meanwhile, the row) may differ.
+///
+/// **Inbound, tolerant**, as [`LaneCreated`] is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneReopened {
+    pub session: LaneSession,
+    #[serde(default)]
+    pub joined: bool,
+}
+
+/// What [`AgentSource::reopen`] can go wrong with — split by what a client
+/// DOES next, so it never string-matches (plan 032 PC10; the module doc's
+/// reopen table says which craze answer lands where):
+///
+/// - [`Self::Gone`]: the saved session cannot run here any more (no such id,
+///   its directory gone, a provider this machine cannot resume). Drop the row.
+/// - [`Self::StartFailed`]: it was found and its start failed; the text says
+///   why. Show it, keep the row.
+/// - [`Self::Unavailable`]: transient — busy, closing, unreachable, a source
+///   that cannot reopen yet — **and a lost answer**: a reopen is idempotent
+///   (it means "ensure this session is running"), so an answer that never came
+///   is retried safely, never a separate "outcome unknown" (PC14d). Offer
+///   Retry.
+/// - [`Self::Lane`]: anything else, in the contract's own error. Keep the row.
+///
+/// **Wire shape** is [`LaneError`]'s, for the same forced reason: externally
+/// tagged, snake_case — `{"gone":"…"}`, `{"start_failed":"…"}`,
+/// `{"unavailable":"…"}`, and `{"lane":<a LaneError>}`, whose inner value is
+/// itself either a bare string (`{"lane":"unknown_session"}`) or a one-key
+/// object (`{"lane":{"bad_request":"…"}}`). **Strict**, as every error is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneReopenError {
+    /// Drop the row: the source's words for why it cannot run.
+    #[error("{0}")]
+    Gone(String),
+    /// Show the cause and keep the row.
+    #[error("{0}")]
+    StartFailed(String),
+    /// Transient, a lost answer included: offer Retry.
+    #[error("{0}")]
+    Unavailable(String),
+    /// Anything else, as the contract's error: keep the row.
+    #[error("{0}")]
+    Lane(LaneError),
+}
+
+/// What [`AgentSource::saved`]'s and [`AgentSource::reopen`]'s defaults say:
+/// a source of `kind` that cannot reopen saved sessions.
+fn cannot_reopen(kind: &str) -> LaneError {
+    LaneError::Failed(format!("this {kind} source cannot reopen saved sessions"))
 }
 
 // ---- settings (the lane's half) ----
@@ -2704,6 +2849,30 @@ pub trait AgentSource: Send + Sync {
     /// (opencode, which accepts and ignores the id) has nothing to replay.
     async fn create_held(&self, request: LaneCreateRequest) -> Result<LaneCreated, LaneError> {
         self.create(request).await
+    }
+
+    /// The saved sessions a [`AgentSource::reopen`] can run again, newest
+    /// first (plan 032 §3.4). Honoured where [`SourceCapabilities::reopen`]
+    /// says so.
+    ///
+    /// The default answers [`LaneError::Failed`] — this source cannot reopen
+    /// saved sessions — so an adapter with none (opencode) needs no code.
+    async fn saved(&self) -> Result<LaneSavedSessions, LaneError> {
+        Err(cannot_reopen(self.kind()))
+    }
+
+    /// Ensure the saved session `id` ([`LaneSavedSession::id`]) is running:
+    /// join it where something already runs it, else start it. Idempotent —
+    /// which is why a lost answer is [`LaneReopenError::Unavailable`] (retry
+    /// it), never "outcome unknown". The answer's row is openable at once
+    /// through [`AgentSource::open`]. It can take minutes (a provider's load
+    /// replays the session), and a caller that stops waiting abandons the
+    /// wait, not the reopen.
+    ///
+    /// The default answers [`LaneReopenError::Lane`] with
+    /// [`LaneError::Failed`], as [`AgentSource::saved`]'s does.
+    async fn reopen(&self, _id: &str) -> Result<LaneReopened, LaneReopenError> {
+        Err(LaneReopenError::Lane(cannot_reopen(self.kind())))
     }
 
     /// A session-scoped lane for one row's id ([`LaneSession::id`]).

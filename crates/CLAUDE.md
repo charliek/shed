@@ -22,7 +22,8 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `lane.rs` (plan 015; split in plan 025 C4, shed#391) is the **agent-lane contract** —
   the DTOs plus TWO async traits that normalize "a coding agent with sessions, a
   transcript and approvals": a machine-level `AgentSource` (`subscribe` → the live session
-  list as `SourceEvent`s, `create_options`, `create`, `open(id)`) and the session-scoped
+  list as `SourceEvent`s, `create_options`, `create`, `open(id)`, and — plan 032, both with
+  "this source cannot" defaults — `saved` and `reopen(id)`) and the session-scoped
   `AgentLane` it opens (no verb takes an id; `settings`/`set`/`stop`/`set_title` have no
   default bodies). One adapter per agent implements both (opencode over its local HTTP server;
   craze over its per-machine hub, `shed-craze` — its source since plan 025 C7, its lane
@@ -221,7 +222,9 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `TooOld`) and classifies the find-only probe (`providers --hub --json`, which never
   starts a hub) by its stderr TEXT, never its exit code. `errors.rs` is craze's published
   code → `LaneError` table **verbatim, keyed on `data.code` only**, with P14's one
-  deviation (a create refused `not_accepting/start_failed` → `Failed(data.cause)`).
+  deviation (a create refused `not_accepting/start_failed` → `Failed(data.cause)`) — and a
+  reopen's own `LaneReopenError` map, whose reason-keyed `not_accepting` row is a documented
+  exception (below).
   `CrazeSource::create` retries ONCE under the same `requestId` on an unknown outcome (a
   dropped connection, the 120 s deadline) and never on a definite answer;
   `is_outcome_unknown` is the one test a caller keeps its id on. A create keeps the row it
@@ -244,7 +247,30 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   authority a client lists created rows from (the desktop keeps no copy). So `open(hostId)` on a just-created session binds a
   lane that knows its row at once; `dialling(dial)` is the same source — its rows — on
   another dial (the desktop runs a user's explicit `create_options`/`create` through an
-  ungated one). A row's id is its **hostId** (P11). **`CrazeLane`** (plan 025 C8, `open` binds one with no I/O) is one
+  ungated one). A row's id is its **hostId** (P11).
+  **Saved sessions and reopen** (plan 032 §3.4, craze 0.2.0's hub capability `reopen`,
+  which `SourceCapabilities.reopen` and — read from the SAME `hello` — `LaneCreateOptions.reopen`
+  carry): `saved()` is `create_options`-shaped (`sessions.saved{limit: 50}`, never `subAgents`)
+  and `reopen(id)` is `session.reopen{id}` on a connection of its own, each gated on its
+  connection's `hello` — no `reopen` there is `Unavailable` in `errors::reopen_unsupported`'s
+  words (the one wording, which names `kill <pid>` only for a version that PARSES below 0.2.0
+  and a known pid — never an inferred one), nothing sent. A reopen allows `REOPEN_DEADLINE`
+  (200 s, craze's "at least") per answer; a LOST answer (connection ended, deadline) is sent
+  again ONCE on a fresh connection; a second loss, a resend that cannot reach a hub that
+  reopens, or a success shed cannot read is `LaneReopenError::Unavailable` worded
+  `errors::REOPEN_LOST` ("Retry is safe" — a reopen is idempotent, so never "outcome unknown";
+  `is_reopen_lost` tells it). Its answer's row is a **created row** that is FRESH: it lifts a
+  tombstone for its hostId instead of being refused by one. A reopen that may have started a
+  session (a success, a lost answer) **wakes** every roster pump of the source (clones
+  included) that is waiting out its reconnect backoff. `LaneReopenError` is
+  `Gone`/`StartFailed`/`Unavailable`/`Lane(LaneError)`, mapped by `errors::reopen_error` —
+  and its `not_accepting` row is **the documented exception to "keyed on `data.code` ONLY"**:
+  reason `not_resumable` is `Gone` (drop the saved row), `start_failed` is `StartFailed` (show
+  the cause, keep the row), because craze's own reopen table gives the two opposite client
+  actions and `NotAccepting` is a unit variant; only `session.reopen` reads that reason
+  (`shed_core::lane`'s error table and `errors.rs` say the same). `tests/recipe_source.rs`'s
+  reopen cells are craze's reopen recipe (the index seeded through
+  `Recipe::write_saved_sessions`, the agent the fake agent's `grok-load`). **`CrazeLane`** (plan 025 C8, `open` binds one with no I/O) is one
   session: its watcher (`watcher.rs` — the state machine table is its module doc) dials
   one connection per lane, splices to the host (`session.connect{hostId}` with the host
   `hello` pipelined), re-reads the host's own `sessions.list` row (the craze `sessionId`
@@ -314,6 +340,7 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   but craze could not record it: <cause>" (`index_write_cause`). A create's `title` goes only to a
   hub whose `hello` says `createTitle`, judged on EACH attempt: fresh → `Failed`, nothing
   sent; a retry or held replay → outcome unknown, id and title kept. `testing`'s
+  `reopen_hub_capabilities` is 0.2.0's (`reopen`, plan 032),
   `full_hub_capabilities` is 0.1.1's (`createTitle`), `hub_capabilities_0_1_0` and
   `session_caps` (no `slashCatalog`) the older shapes, `slash_session_caps` the newer.
   The 0.1.0+gx golden's projection drops the two plan-029 capability bits (pinned by

@@ -12,13 +12,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use shed_core::lane::conformance::{drive_source, Drive, DriveEnd, SourceChecker};
+use shed_core::lane::conformance::{
+    drive_lane, drive_source, Drive, DriveEnd, LaneChecker, SourceChecker,
+};
 use shed_core::lane::{
-    AgentSource, LaneCreateRequest, LaneError, LanePromptOutcome, LaneProviderState, LaneSession,
-    SourceEvent, SourceOffline,
+    AgentSource, LaneCreateRequest, LaneError, LaneEvent, LanePromptOutcome, LaneProviderState,
+    LaneReopenError, LaneSavedSession, LaneSavedSessions, LaneSession, SourceEvent, SourceOffline,
 };
 use shed_core::rc::RcActivity;
-use shed_craze::testing::{bins, HookDial, PathKind, Recipe, RECIPE_WAIT};
+use shed_craze::testing::{bins, saved_index_row, HookDial, PathKind, Recipe, RECIPE_WAIT};
 use shed_craze::{is_outcome_unknown, new_request_id, CrazeDial, Probe};
 use tokio::sync::mpsc::Receiver;
 
@@ -91,12 +93,12 @@ async fn the_roster_seeds_upserts_and_removes() {
         assert_eq!(rows.len(), 1, "{:?}", seed.frames);
         assert_eq!(rows[0].id, FAKE, "a row's id is its hostId (P11)");
         assert_eq!(rows[0].activity, RcActivity::Idle);
-        assert!(
-            seed.frames
-                .iter()
-                .any(|e| matches!(e, SourceEvent::Capabilities { capabilities }
-            if capabilities.kind == "craze" && capabilities.create && capabilities.create_options))
-        );
+        assert!(seed
+            .frames
+            .iter()
+            .any(|e| matches!(e, SourceEvent::Capabilities { capabilities }
+            if capabilities.kind == "craze" && capabilities.create && capabilities.create_options
+                && capabilities.reopen)));
 
         recipe.op(FAKE, &permission("perm-1", "Shell")).await;
         let up = drive(
@@ -763,4 +765,188 @@ async fn a_cancelled_teardown_still_cleans_up() {
     let _ = held.wait();
     assert!(gone, "Drop removed {}", root.display());
     assert!(left.is_empty(), "left running: {left:?}");
+}
+
+// ---- plan 032 §3.4: saved sessions, reopened — craze's own reopen recipe
+// ("Reopening a saved session in the recipe": the session index seeded with a
+// saved grok session, the fake agent's `grok-load` replaying every load) ----
+
+/// craze's reopen recipe's saved session: its craze id.
+const SAVED_ID: &str = "0192f0aa-6666-7000-8000-0000000reopen";
+/// What the fake agent's `grok-load` replays on every `session/load`.
+const REPLAYED: &str = "the workspace holds main.py and README.md";
+
+/// The recipe with the grok agent the fake agent's `grok-load` script; a cell
+/// seeds the session index ([`Recipe::write_saved_sessions`]) before any
+/// bridge starts the hub.
+fn reopen_recipe(bins: &shed_craze::testing::Bins) -> Recipe {
+    let recipe = Recipe::start(bins);
+    recipe.set_grok_agent(&recipe.script_agent("grok-load"));
+    recipe
+}
+
+/// **A saved session is listed, reopened, joined, and its transcript is
+/// back** — craze's reopen cell through the source, against the real hub: the
+/// create options say `reopen`; `saved` lists the seeded session by its craze
+/// id; `reopen` starts a host that loads it (`joined: false`), whose row the
+/// source binds at once — a lane opened on it seeds the replayed answer, and
+/// its `history` holds it; running, it is no longer saved; the roster lists
+/// it; and a second `reopen` JOINS it (`joined: true`), the same hostId,
+/// starting nothing, the roster's row kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saved_session_is_listed_reopened_joined_and_replayed() {
+    let Some(bins) = bins("a_saved_session_is_listed_reopened_joined_and_replayed") else {
+        return;
+    };
+    let recipe = reopen_recipe(&bins);
+    recipe.write_saved_sessions(&[saved_index_row(
+        SAVED_ID,
+        "grok",
+        "recipe-saved",
+        &recipe.work,
+        "a saved session",
+        "2026-10-12T10:00:00Z",
+    )]);
+    {
+        let source = recipe.source();
+        assert!(
+            source.create_options().await.unwrap().reopen,
+            "a 0.2.0 hub's hello says reopen"
+        );
+        let ms = |t: &str| shed_core::time::rfc3339_unix_ms(t).unwrap();
+        assert_eq!(
+            source.saved().await.unwrap(),
+            LaneSavedSessions {
+                sessions: vec![LaneSavedSession {
+                    id: SAVED_ID.into(),
+                    provider: "grok".into(),
+                    workspace: recipe.work.to_string_lossy().into_owned(),
+                    title: Some("a saved session".into()),
+                    updated_unix_ms: ms("2026-10-12T10:00:00Z"),
+                    created_unix_ms: Some(ms("2026-10-12T09:00:00Z")),
+                }],
+                more: false,
+            }
+        );
+
+        let reopened = source.reopen(SAVED_ID).await.unwrap();
+        assert!(!reopened.joined, "the hub started a host to load it");
+        assert_eq!(reopened.session.provider.as_deref(), Some("grok"));
+        assert_eq!(reopened.session.cwd, recipe.work.to_string_lossy());
+        let host = reopened.session.id.clone();
+        assert_eq!(
+            source.listed(&host).map(|(_, sid)| sid).as_deref(),
+            Some(SAVED_ID),
+            "the row is the source's at once, its craze id the saved one"
+        );
+
+        let lane = source.open(&host).await.unwrap();
+        {
+            let (mut rx, _stop) = lane.subscribe(None).await.unwrap().into_parts();
+            let mut checker = LaneChecker::new();
+            let d = drive_lane(&mut rx, &mut checker, RECIPE_WAIT, |e| {
+                matches!(e, LaneEvent::Message { message, .. }
+                    if message.text.as_deref() == Some(REPLAYED))
+            })
+            .await
+            .unwrap_or_else(|v| panic!("the reopened lane broke a contract rule: {v}"));
+            assert_eq!(
+                d.end,
+                DriveEnd::Matched,
+                "the replayed answer, on the reopened lane: {:#?}",
+                d.frames
+            );
+            let history = lane.history(None, 50).await.unwrap();
+            assert!(
+                history
+                    .messages
+                    .iter()
+                    .any(|m| m.text.as_deref() == Some(REPLAYED)),
+                "{:#?}",
+                history.messages
+            );
+        }
+
+        assert_eq!(
+            source.saved().await.unwrap(),
+            LaneSavedSessions::default(),
+            "running, it is no longer saved"
+        );
+
+        let (mut rx, _stop) = source.subscribe().await.unwrap().into_parts();
+        let mut checker = SourceChecker::new();
+        drive(
+            &mut rx,
+            &mut checker,
+            "the roster lists the reopened host",
+            |e| matches!(e, SourceEvent::Session { session } if session.id == host),
+        )
+        .await;
+        let again = source.reopen(SAVED_ID).await.unwrap();
+        assert!(again.joined, "joined: a host already serves it");
+        assert_eq!(again.session.id, host, "the same host");
+        assert_eq!(
+            recipe.registered_hosts(),
+            std::slice::from_ref(&host),
+            "exactly one session"
+        );
+        assert!(
+            source.created_rows().is_empty(),
+            "the roster speaks for it: no created row beside it"
+        );
+    }
+    recipe.teardown().await.unwrap();
+}
+
+/// **A saved session that cannot run is `Gone`** — the real hub's refusals:
+/// an id no index row has is `unknown_session`, and a session whose directory
+/// has gone (still LISTED: craze stats no workspace when it lists) is
+/// `not_accepting`/`not_resumable`. Both drop the row; neither starts a host.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reopen_of_an_unknown_id_or_a_gone_workspace_is_gone() {
+    let Some(bins) = bins("a_reopen_of_an_unknown_id_or_a_gone_workspace_is_gone") else {
+        return;
+    };
+    const GONE_ID: &str = "0192f0aa-6666-7000-8000-00000000gone";
+    let recipe = reopen_recipe(&bins);
+    // A directory the session ran in, and that is gone now.
+    let gone_dir = recipe.root().join("gone");
+    recipe.write_saved_sessions(&[saved_index_row(
+        GONE_ID,
+        "grok",
+        "recipe-gone",
+        &gone_dir,
+        "a session whose directory went",
+        "2026-10-11T10:00:00Z",
+    )]);
+    {
+        let source = recipe.source();
+        let saved = source.saved().await.unwrap();
+        assert_eq!(
+            saved
+                .sessions
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            [GONE_ID],
+            "a session whose directory has gone is still listed"
+        );
+
+        let got = source.reopen(GONE_ID).await.unwrap_err();
+        assert!(
+            matches!(&got, LaneReopenError::Gone(m) if m.contains("no longer a directory")),
+            "not_resumable: {got:?}"
+        );
+        let got = source
+            .reopen("0192f0aa-6666-7000-8000-00000000none")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(got, LaneReopenError::Gone(_)),
+            "unknown_session: {got:?}"
+        );
+        assert!(recipe.registered_hosts().is_empty(), "no host was started");
+        assert!(source.created_rows().is_empty());
+    }
+    recipe.teardown().await.unwrap();
 }
