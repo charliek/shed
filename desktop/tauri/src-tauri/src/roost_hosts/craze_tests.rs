@@ -11,7 +11,9 @@ use std::time::Duration;
 use serde_json::json;
 use shed_core::lane::SourceOffline;
 use shed_core::roost::testing::{ownership, FakeRoost};
-use shed_craze::testing::{full_hub_capabilities, roster_row, HookDial, HubEnd, ScriptedDial};
+use shed_craze::testing::{
+    full_hub_capabilities, reopen_hub_capabilities, roster_row, HookDial, HubEnd, ScriptedDial,
+};
 use shed_craze::{CrazeDial, DialError, Probe};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -2860,13 +2862,18 @@ async fn a_dormant_shed_is_offered_not_listed() {
         status_of(&hosts, SHED).is_none(),
         "nor is it in machines.list"
     );
+    let gen = lock(&hosts.state)
+        .get(&srv_shed("s1").0)
+        .expect("state")
+        .craze
+        .gen;
     assert_eq!(
         offered,
         vec![
             json!({"name": SHED, "label": "s1", "origin": SHED, "kind": "shed",
                     "craze": {"state": "dormant", "cause": null,
                               "create": false, "create_options": false,
-                              "create_title": false}})
+                              "create_title": false, "source_gen": gen}})
         ]
     );
 
@@ -3141,4 +3148,365 @@ async fn a_shed_whose_roost_answered_is_watched_before_its_first_inventory() {
         "no roost answered: {status}"
     );
     assert_eq!(status["connected_once"], false, "{status}");
+}
+
+// ---- plan 032 §3.4: the create sheet's Resume mode (C5) ----
+
+/// The saved session the resume cells list and reopen (craze's recipe id).
+const SAVED_ID: &str = "0192f0aa-6666-7000-8000-0000000reopen";
+
+/// A roster connection on a 0.2.0 hub — its `hello` says `reopen` — with
+/// `rows`.
+async fn reopen_roster(craze: &Scripted, rows: serde_json::Value) -> HubEnd {
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, reopen_hub_capabilities()).await;
+    hub.subscribed("sub-1", EPOCH, rows).await;
+    hub
+}
+
+/// The layer on `localhost` over `craze`, its roster live on a 0.2.0 hub
+/// listing [`HOST_A`]; the roster connection is handed back so it stays up.
+async fn live_reopen_host(craze: &Arc<Scripted>) -> (Arc<RoostHosts>, HubEnd) {
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(craze))],
+    ));
+    let roster = reopen_roster(craze, json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the roster, live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live" && craze_rows(&hosts).len() == 1)
+            .then_some(())
+    })
+    .await;
+    (hosts, roster)
+}
+
+/// The next connection of `craze`'s: a 0.2.0 hub's `hello`, then the one
+/// `session.reopen` it carries — for [`SAVED_ID`] — handed back.
+async fn reopen_asked(craze: &Scripted) -> (HubEnd, Value) {
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, reopen_hub_capabilities()).await;
+    let req = hub.expect("session.reopen").await;
+    assert_eq!(req["params"], json!({ "id": SAVED_ID }), "{req}");
+    (hub, req)
+}
+
+/// **A reopened session is listed and its transcript opens at once** (plan
+/// 032 §3.4, the create path's twin): `craze.reopen` asks the hub on a
+/// connection of its own, the answer's row — a hostId no roster frame names
+/// yet — is listed at once, live, and `lane.open` on it succeeds straight
+/// after; the answer says the session was started (`joined: false`), not
+/// ended, and echoes the saved id it was asked for — and names the host's
+/// CURRENT incarnation (`source_gen`, not `superseded`).
+#[tokio::test]
+async fn a_reopened_session_is_listed_and_openable_at_once() {
+    let craze = Scripted::eager();
+    let (hosts, _roster) = live_reopen_host(&craze).await;
+    let lanes = lanes_over(&hosts);
+    let gen = lock(&hosts.state).get(&local()).expect("state").craze.gen;
+
+    let reopening = {
+        let hosts = Arc::clone(&hosts);
+        tokio::spawn(async move { hosts.craze_reopen(LOCALHOST, SAVED_ID).await })
+    };
+    let (mut hub, req) = reopen_asked(&craze).await;
+    hub.reply(
+        &req,
+        json!({"session": roster_row(HOST_NEW, SAVED_ID, "/work/saved",
+                                     json!({"title": "a saved session", "activity": "idle",
+                                            "providerSessionId": "ses-saved"})),
+               "joined": false}),
+    )
+    .await;
+    let answer = reopening.await.unwrap().expect("reopened");
+    assert_eq!(answer["host_id"], HOST_NEW);
+    assert_eq!(answer["joined"], false);
+    assert_eq!(answer["ended"], false);
+    assert_eq!(answer["id"], SAVED_ID);
+    assert_eq!(answer["session"]["slug"], HOST_NEW);
+    assert_eq!(answer["session"]["stale"], false);
+    assert_eq!(answer["superseded"], false);
+    assert_eq!(answer["source_gen"], gen);
+
+    let listed = craze_rows(&hosts);
+    assert!(
+        listed.iter().any(|r| r["slug"] == HOST_NEW),
+        "listed at once: {listed:?}"
+    );
+    lanes
+        .open(LOCALHOST, "craze", HOST_NEW)
+        .await
+        .expect("the transcript of a just-reopened session opens at once");
+    assert!(lanes.is_open(LOCALHOST, "craze", HOST_NEW));
+}
+
+/// **The saved sessions are craze's, read afresh** (plan 032 §3.4):
+/// `craze.saved` asks `sessions.saved{limit: 50}` on a connection of its own
+/// and answers craze's rows as the contract's — the id opaque, the times in
+/// Unix ms, Go's zero creation time absent — with craze's `more`, and the
+/// incarnation it came through (`source_gen`).
+#[tokio::test]
+async fn saved_lists_crazes_saved_sessions() {
+    let craze = Scripted::eager();
+    let (hosts, _roster) = live_reopen_host(&craze).await;
+    let gen = lock(&hosts.state).get(&local()).expect("state").craze.gen;
+    let listing = {
+        let hosts = Arc::clone(&hosts);
+        tokio::spawn(async move { hosts.craze_saved(LOCALHOST).await })
+    };
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, reopen_hub_capabilities()).await;
+    let req = hub.expect("sessions.saved").await;
+    assert_eq!(req["params"], json!({ "limit": 50 }), "{req}");
+    hub.reply(
+        &req,
+        json!({"sessions": [
+                  {"id": SAVED_ID, "crazeSessionId": SAVED_ID, "provider": "grok",
+                   "providerSessionId": "ses-saved", "workspace": "/work/saved",
+                   "title": "a saved session", "createdAt": "0001-01-01T00:00:00Z",
+                   "updatedAt": "2026-10-12T10:00:00Z"},
+                  {"id": "grok:legacy", "provider": "grok", "providerSessionId": "legacy",
+                   "workspace": "/work/old", "createdAt": "2026-10-01T09:00:00Z",
+                   "updatedAt": "2026-10-01T10:00:00Z"}],
+               "more": true}),
+    )
+    .await;
+    let answer = listing.await.unwrap().expect("the saved sessions");
+    assert_eq!(answer["machine"], LOCALHOST);
+    let sessions = answer["saved"]["sessions"].as_array().unwrap();
+    assert_eq!(
+        sessions.iter().map(|s| s["id"].clone()).collect::<Vec<_>>(),
+        [json!(SAVED_ID), json!("grok:legacy")],
+        "craze's order, the ids opaque"
+    );
+    assert_eq!(sessions[0]["workspace"], "/work/saved");
+    assert_eq!(sessions[0]["title"], "a saved session");
+    assert_eq!(
+        sessions[0]["updated_unix_ms"],
+        shed_core::time::rfc3339_unix_ms("2026-10-12T10:00:00Z").unwrap()
+    );
+    assert!(
+        sessions[0].get("created_unix_ms").is_none(),
+        "Go's zero time is no time: {}",
+        sessions[0]
+    );
+    assert!(sessions[1].get("title").is_none(), "{}", sessions[1]);
+    assert_eq!(answer["saved"]["more"], true);
+    assert_eq!(answer["source_gen"], gen);
+}
+
+/// **A reopen that outlives its host's incarnation is `superseded`, never
+/// folded** (C5 review): the shed is removed and registered again — the same
+/// address, a NEW craze source — while its reopen is held at the hub. The
+/// answer, when it comes, is the OLD source's: `superseded` (not `ended` —
+/// the session runs), its row the last known (stale), `source_gen` the old
+/// generation — and nothing is listed under the new incarnation, whose source
+/// never saw it, so nothing could open on it. A reopen on the CURRENT
+/// incarnation says `superseded: false` ([`a_reopened_session_is_listed_and_openable_at_once`]).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopen_that_outlives_its_hosts_incarnation_is_superseded() {
+    let (id, config) = srv_shed("s1");
+    let address = id.address();
+    let old = Scripted::attach_only();
+    let new = Scripted::attach_only();
+    let hosts = start_queued(&config, &id, vec![Arc::clone(&old), Arc::clone(&new)]);
+    refresh(&hosts, &["s1"]).await;
+    old.probe.as_ref().unwrap().answer(Probe::Hub);
+    let _old_roster = reopen_roster(&old, json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the old source's row", || {
+        craze_rows(&hosts)
+            .iter()
+            .any(|r| r["slug"] == HOST_A && r["stale"] == false)
+            .then_some(())
+    })
+    .await;
+    let old_gen = lock(&hosts.state).get(&id).expect("state").craze.gen;
+
+    let reopening = {
+        let hosts = Arc::clone(&hosts);
+        let address = address.clone();
+        tokio::spawn(async move { hosts.craze_reopen(&address, SAVED_ID).await })
+    };
+    let (mut hub, req) = reopen_asked(&old).await;
+    // Removed, and registered again, while the reopen is held at the hub.
+    refresh(&hosts, &[]).await;
+    refresh(&hosts, &["s1"]).await;
+    let new_gen = lock(&hosts.state)
+        .get(&id)
+        .expect("the new registration's state")
+        .craze
+        .gen;
+    assert_ne!(old_gen, new_gen, "a new incarnation");
+
+    hub.reply(
+        &req,
+        json!({"session": roster_row(HOST_NEW, SAVED_ID, "/work/saved",
+                                     json!({"title": "a saved session", "activity": "idle",
+                                            "providerSessionId": "ses-saved"})),
+               "joined": false}),
+    )
+    .await;
+    let answer = reopening.await.unwrap().expect("answered");
+    assert_eq!(answer["superseded"], true, "{answer}");
+    assert_eq!(answer["ended"], false, "the session runs: {answer}");
+    assert_eq!(answer["session"]["stale"], true, "the last known: {answer}");
+    assert_eq!(answer["source_gen"], old_gen);
+    let listed = craze_rows(&hosts);
+    assert!(
+        !listed.iter().any(|r| r["slug"] == HOST_NEW),
+        "nothing listed under the new incarnation: {listed:?}"
+    );
+}
+
+/// **Every craze status names the host's incarnation** (C5 re-review): a
+/// shed's `shed_craze` entry while dormant, and its status row once listed,
+/// carry `craze.source_gen` — the generation `craze.create_options`,
+/// `craze.saved` and `craze.reopen` report. Removed and registered again
+/// under the same address, the shed is a new incarnation whose status names
+/// a new, LARGER generation from its first appearance: what the sheet resets
+/// its Resume state on (a reopen the old one left running included) with no
+/// create-options read, which may fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_craze_status_names_the_hosts_incarnation() {
+    let (id, config) = srv_shed("s1");
+    let old = Scripted::attach_only();
+    let new = Scripted::attach_only();
+    let hosts = start_queued(&config, &id, vec![Arc::clone(&old), Arc::clone(&new)]);
+    let gen_now = || lock(&hosts.state).get(&id).expect("state").craze.gen;
+    let offered_gen = || {
+        shed_craze_of(&hosts)
+            .into_iter()
+            .find(|e| e["origin"] == SHED)
+            .map(|e| e["craze"]["source_gen"].clone())
+    };
+
+    refresh(&hosts, &["s1"]).await;
+    probe_answers(old.probe.as_ref().unwrap(), Probe::NoHub).await;
+    let old_gen = gen_now();
+    assert_eq!(offered_gen(), Some(json!(old_gen)), "the dormant entry's");
+
+    // Removed, and registered again under the same address.
+    refresh(&hosts, &[]).await;
+    assert_eq!(offered_gen(), None, "removed: nothing names it");
+    refresh(&hosts, &["s1"]).await;
+    let new_probe = new.probe.as_ref().unwrap();
+    probe_answers(new_probe, Probe::NoHub).await;
+    let new_gen = gen_now();
+    assert!(
+        new_gen > old_gen,
+        "a later incarnation's is the larger: {old_gen}, then {new_gen}"
+    );
+    assert_eq!(
+        offered_gen(),
+        Some(json!(new_gen)),
+        "the new entry names the new incarnation"
+    );
+
+    // Listed by its first Ready: its status row names the same one.
+    new_probe.answer(Probe::Hub);
+    let _hub = new.roster(json!([row(HOST_A, "ses-a")])).await;
+    let listed = wait_for("listed by its first Ready", || status_of(&hosts, SHED)).await;
+    assert_eq!(listed["craze"]["source_gen"], new_gen, "{listed}");
+}
+
+/// **A hub without `reopen` is refused before any dial** (plan 032 PC14i):
+/// a LIVE source whose hub's `hello` lacks `reopen` (craze 0.1.x) answers
+/// both resume ops `unavailable`, in shed-craze's one older-hub wording —
+/// naming no version or pid, which this layer never holds (PC10) — and
+/// nothing is dialled.
+#[tokio::test]
+async fn a_hub_without_reopen_refuses_resume_before_any_dial() {
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let _roster = craze.roster(json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let dials = craze.hook.dials();
+    let words = shed_craze::errors::reopen_unsupported_by("", None);
+    assert!(
+        words.starts_with("this craze hub (craze version unknown) does not offer reopening"),
+        "{words}"
+    );
+    let e = hosts.craze_saved(LOCALHOST).await.unwrap_err();
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        ("unavailable", words.as_str())
+    );
+    let e = hosts.craze_reopen(LOCALHOST, SAVED_ID).await.unwrap_err();
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        ("unavailable", words.as_str())
+    );
+    assert_eq!(craze.hook.dials(), dials, "refused before any dial");
+}
+
+/// **A reopen's refusal keeps its variant** (plan 032 §3.4): craze's
+/// `unknown_session` is `gone` (the sheet drops the row),
+/// `not_accepting`/`start_failed` is `start_failed` with craze's cause (the
+/// row kept), and `unavailable` stays `unavailable` (Retry) — and none of
+/// them lists anything.
+#[tokio::test]
+async fn a_reopen_refusal_keeps_its_variant_as_the_code() {
+    let craze = Scripted::eager();
+    let (hosts, _roster) = live_reopen_host(&craze).await;
+    let cases = [
+        ("unknown_session", "unknown_session", json!({}), "gone"),
+        (
+            "not_accepting",
+            "start_failed",
+            json!({"cause": "grok exited: no key"}),
+            "start_failed",
+        ),
+        ("unavailable", "busy", json!({}), "unavailable"),
+    ];
+    for (code, reason, extra, want) in cases {
+        let reopening = {
+            let hosts = Arc::clone(&hosts);
+            tokio::spawn(async move { hosts.craze_reopen(LOCALHOST, SAVED_ID).await })
+        };
+        let (mut hub, req) = reopen_asked(&craze).await;
+        hub.refuse(&req, code, reason, extra).await;
+        let e = reopening.await.unwrap().unwrap_err();
+        assert_eq!(e.code, want, "{code}/{reason}: {e:?}");
+        if want == "start_failed" {
+            assert_eq!(e.message, "could not start: grok exited: no key");
+        }
+    }
+    let rows = craze_rows(&hosts);
+    assert_eq!(rows.len(), 1, "nothing listed: {rows:?}");
+}
+
+/// **The home a workspace is shortened by is one this app KNOWS** (plan 032
+/// §3.4): this machine's own `HOME` for the implicit `localhost`, every
+/// shed's `/home/shed`, and none for a configured machine — reached over
+/// ssh, its home never learned (a machine configured AS `localhost` too).
+#[tokio::test]
+async fn the_resume_home_is_known_never_guessed() {
+    let hosts = start_scripted(&config_with(&["mini3"]), &test_options(&[]), vec![]);
+    assert_eq!(
+        hosts.craze_home(&local()),
+        std::env::var("HOME")
+            .ok()
+            .filter(|h| h.starts_with('/') && h.len() > 1)
+    );
+    assert_eq!(
+        hosts.craze_home(&HostId::Shed {
+            server: "srv".into(),
+            name: "s1".into()
+        }),
+        Some("/home/shed".to_string())
+    );
+    assert_eq!(hosts.craze_home(&HostId::Machine("mini3".into())), None);
+    let configured = start_scripted(&config_with(&[LOCALHOST]), &test_options(&[]), vec![]);
+    assert_eq!(
+        configured.craze_home(&local()),
+        None,
+        "an ssh-reached localhost"
+    );
 }

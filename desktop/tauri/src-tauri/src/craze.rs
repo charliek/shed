@@ -988,6 +988,17 @@ impl CrazeState {
     /// LIVE hub's capabilities, `false` otherwise — so a dormant machine's
     /// create sheet offers "Name (optional)" once its hub is live, exactly as
     /// it learns `create_options` (plan 029 P10).
+    ///
+    /// `source_gen` is this source's generation ([`Self::gen`]) — the host's
+    /// INCARNATION, as `craze.create_options`, `craze.saved` and
+    /// `craze.reopen` report it — `null` while the host has no craze source
+    /// (gen `0`). A host removed and registered again under the same address
+    /// is a new incarnation with a new generation, and generations only GROW
+    /// (one counter for the app's life), so a later incarnation's is always
+    /// the larger. Carried on every status (C5 re-review) so the sheet's
+    /// per-machine Resume state is reset by the status it already reads —
+    /// sheet open or not — and never waits on a create-options read that may
+    /// fail.
     pub fn status(&self) -> Value {
         let (state, cause) = match (self.gen, self.phase, &self.offline) {
             (0, ..) | (_, None, _) => ("absent", None),
@@ -1008,6 +1019,7 @@ impl CrazeState {
             "create": caps.is_some_and(|c| c.create),
             "create_options": caps.is_some_and(|c| c.create_options),
             "create_title": caps.is_some_and(|c| c.create_title),
+            "source_gen": (self.gen != 0).then_some(self.gen),
         })
     }
 }
@@ -1038,7 +1050,22 @@ impl CrazeState {
 ///   the host at all;
 /// * `bad_request` — a caller's mistake (an unknown host, a request id not in
 ///   craze's form, a session this machine does not list, a host id that is not
-///   craze's form) as well as craze's own `bad_request`.
+///   craze's form, a blank saved-session id) as well as craze's own
+///   `bad_request`.
+///
+/// And the ones only a RESUME needs (`craze.reopen`, plan 032 §3.4) — one per
+/// [`shed_core::lane::LaneReopenError`] variant, so the sheet branches on the
+/// code and never on the words ([`CrazeFailure::reopen`]):
+///
+/// * `gone` — the saved session cannot run here any more (no such id, its
+///   directory gone): the sheet drops its row;
+/// * `start_failed` — it was found and its start failed (`could not start:
+///   <cause>`): shown, the row kept;
+/// * `unavailable` — transient, a lost answer included ("Retry is safe": a
+///   reopen is idempotent), and a hub that cannot reopen saved sessions at
+///   all (craze's older-hub words): shown with Retry;
+/// * anything else is the inner [`shed_core::lane::LaneError`]'s own code
+///   (`bad_request`, `failed`, …): shown, the row kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrazeFailure {
     pub code: &'static str,
@@ -1065,6 +1092,25 @@ impl CrazeFailure {
         }
         let message = e.to_string();
         Self::new(crate::lane::LaneFailure::Lane(e).code(), message)
+    }
+
+    /// A reopen's [`LaneReopenError`](shed_core::lane::LaneReopenError) (plan
+    /// 032 §3.4), its VARIANT kept visible as the code — `gone`,
+    /// `start_failed`, `unavailable` — and an inner contract error as that
+    /// error's own code. Never `outcome_unknown`: a reopen is idempotent, so a
+    /// lost answer is the source's `Unavailable` ("Retry is safe", PC14d),
+    /// and the sheet holds nothing a lost answer would make it keep.
+    pub fn reopen(e: shed_core::lane::LaneReopenError) -> Self {
+        use shed_core::lane::LaneReopenError;
+        let message = e.to_string();
+        match e {
+            LaneReopenError::Gone(_) => Self::new("gone", message),
+            LaneReopenError::StartFailed(_) => Self::new("start_failed", message),
+            LaneReopenError::Unavailable(_) => Self::new("unavailable", message),
+            LaneReopenError::Lane(e) => {
+                Self::new(crate::lane::LaneFailure::Lane(e).code(), message)
+            }
+        }
     }
 
     /// The `#[tauri::command]` door's error string.
@@ -1144,6 +1190,22 @@ pub fn held_create(held: bool, request_id: Option<&str>) -> Result<bool, CrazeFa
         ));
     }
     Ok(held)
+}
+
+/// The saved session a `craze.reopen` names, from a CALLER-SUPPLIED `id` —
+/// both doors' one reading (plan 032 §3.4). The id is OPAQUE (craze's
+/// session id, or `<provider>:<providerSessionId>` for a session recorded
+/// before craze ids — [`shed_core::lane::LaneSavedSession::id`]) and goes to
+/// craze exactly as `sessions.saved` listed it, inside a JSON request: never
+/// spliced into a command line, so nothing about its form is checked here. A
+/// missing, empty or blank one is `bad_request`: it names no session.
+pub fn reopen_id(id: Option<&str>) -> Result<String, CrazeFailure> {
+    match id {
+        Some(id) if !id.trim().is_empty() => Ok(id.to_string()),
+        _ => Err(CrazeFailure::bad_request(
+            "a reopen names the saved session it runs: send its `id`, as `craze.saved` listed it",
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1969,6 +2031,61 @@ mod tests {
         );
     }
 
+    /// **A reopen's failure keeps its variant as the code** (plan 032 §3.4):
+    /// the resume sheet drops a row on `gone`, keeps it on `start_failed`
+    /// and on an inner contract error, and offers Retry on `unavailable` — a
+    /// lost answer's too, which is never `outcome_unknown` (PC14d).
+    #[test]
+    fn a_reopen_failure_carries_its_variant_or_the_inner_lane_code() {
+        use shed_core::lane::{LaneError, LaneReopenError};
+        let gone = CrazeFailure::reopen(LaneReopenError::Gone("no such session".into()));
+        assert_eq!(
+            (gone.code, gone.message.as_str()),
+            ("gone", "no such session")
+        );
+        let failed = CrazeFailure::reopen(LaneReopenError::StartFailed(
+            "could not start: grok exited".into(),
+        ));
+        assert_eq!(failed.code, "start_failed");
+        assert_eq!(
+            failed.command_string(),
+            "start_failed: could not start: grok exited"
+        );
+        let lost = CrazeFailure::reopen(shed_craze::errors::reopen_lost("twice"));
+        assert_eq!(lost.code, "unavailable");
+        assert!(lost.message.contains("Retry is safe"), "{lost:?}");
+        assert_eq!(
+            CrazeFailure::reopen(LaneReopenError::Lane(LaneError::BadRequest("no".into()))).code,
+            "bad_request"
+        );
+        assert_eq!(
+            CrazeFailure::reopen(LaneReopenError::Lane(LaneError::Failed("boom".into()))).code,
+            "failed"
+        );
+        // Even text that reads as shed's lost-create words is the inner code
+        // here: a reopen holds no request id to keep.
+        let worded = CrazeFailure::reopen(LaneReopenError::Lane(
+            shed_craze::errors::outcome_unknown("lost"),
+        ));
+        assert_eq!(worded.code, "failed");
+    }
+
+    /// **A reopen names its saved session**: any non-blank id goes as given
+    /// (opaque — a legacy `grok:<id>` included); a missing or blank one is
+    /// `bad_request`.
+    #[test]
+    fn a_reopen_id_is_any_non_blank_string_as_given() {
+        assert_eq!(reopen_id(Some("0192f0aa-6666")), Ok("0192f0aa-6666".into()));
+        assert_eq!(reopen_id(Some("grok:abc def")), Ok("grok:abc def".into()));
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                reopen_id(blank).unwrap_err().code,
+                "bad_request",
+                "{blank:?}"
+            );
+        }
+    }
+
     /// **Which states make an unlisted host a `shed_craze` entry** (plan 026
     /// §3.2): dormant and too old — the probe proved craze there — and nothing
     /// else; and the standing a repaint is decided on ignores the reason's
@@ -2020,7 +2137,33 @@ mod tests {
         assert_eq!(
             s.status(),
             json!({"state": "live", "cause": null, "create": true, "create_options": true,
-                   "create_title": true})
+                   "create_title": true, "source_gen": 3})
+        );
+    }
+
+    /// **Every status names the source's incarnation** (C5 re-review):
+    /// `source_gen` is the source's generation in every state — the sheet
+    /// resets its per-machine Resume state on a new one without reading the
+    /// create options — and `null` for a host with no craze source at all.
+    #[test]
+    fn every_status_names_the_sources_generation() {
+        assert_eq!(
+            CrazeState::default().status()["source_gen"],
+            Value::Null,
+            "no craze source: no incarnation to name"
+        );
+        let mut s = CrazeState::new(7);
+        assert_eq!(s.status()["source_gen"], 7, "never reached");
+        s.dormant();
+        assert_eq!(s.status()["source_gen"], 7, "dormant");
+        s.offline(SourceOffline::Unreachable, "no route".into());
+        assert_eq!(s.status()["source_gen"], 7, "offline");
+        seed(&mut s, 1, &[]);
+        assert_eq!(s.status()["source_gen"], 7, "live");
+        assert_eq!(
+            CrazeState::new(8).status()["source_gen"],
+            8,
+            "another source, another generation"
         );
     }
 }

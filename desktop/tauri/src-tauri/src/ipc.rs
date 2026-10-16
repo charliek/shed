@@ -388,6 +388,15 @@ fn launch_door(
 /// `prompt` type into their fields, and `recent: <n>` taps the n-th
 /// recent-directory chip. `ui.submit_craze_create` presses the sheet's
 /// primary button — Create, or Try again — through the button's own gate.
+///
+/// The sheet's Resume mode (plan 032 §3.4, PC14i) has two more, on the same
+/// rule: `ui.choose_craze_mode {mode: "new" | "resume"}` presses that half of
+/// the sheet's `New | Resume` control (refused, as a pointer is, while the
+/// control is not shown or is disabled — choosing Resume the first time is
+/// what lists the saved sessions), and `ui.resume_saved {id}` presses the
+/// saved session `id`'s button — Resume, or Retry after `unavailable` —
+/// through ITS gate (one reopen at a time: every other button is disabled
+/// while one runs).
 fn craze_create_door(
     env: &Env,
     op: &str,
@@ -422,6 +431,17 @@ fn craze_create_door(
             Ok(("fill-craze-create", Value::Object(fill)))
         }
         "ui.submit_craze_create" => Ok(("submit-craze-create", json!({}))),
+        "ui.choose_craze_mode" => match params.get("mode").and_then(Value::as_str) {
+            Some(mode @ ("new" | "resume")) => Ok(("choose-craze-mode", json!({ "mode": mode }))),
+            _ => Err(err("bad_request", "'mode' must be \"new\" or \"resume\"")),
+        },
+        "ui.resume_saved" => match params.get("id").and_then(Value::as_str) {
+            Some(id) if !id.trim().is_empty() => Ok(("resume-saved", json!({ "id": id }))),
+            _ => Err(err(
+                "bad_request",
+                "'id' must name a saved session, as craze_create.dump lists it",
+            )),
+        },
         other => Err(err(
             "unknown_op",
             format!("{other} is not a craze create door"),
@@ -1028,8 +1048,12 @@ impl Handler {
                 Ok(json!({}))
             }
             // Its typing-and-clicking doors — TEST-MODE ONLY, see
-            // [`craze_create_door`]. They act on a sheet that is already open.
-            "ui.fill_craze_create" | "ui.submit_craze_create" => {
+            // [`craze_create_door`]. They act on a sheet that is already open:
+            // its create form, and its Resume mode (plan 032 §3.4).
+            "ui.fill_craze_create"
+            | "ui.submit_craze_create"
+            | "ui.choose_craze_mode"
+            | "ui.resume_saved" => {
                 let (event, payload) = craze_create_door(&self.env, op, params)?;
                 let _ = self.app.emit(event, payload);
                 Ok(json!({}))
@@ -1167,6 +1191,8 @@ impl Handler {
             "lane_settings.dump" => Ok(self.lane_settings_dump()),
             "craze.create_options" => self.craze_create_options(params).await,
             "craze.create" => self.craze_create(params).await,
+            "craze.saved" => self.craze_saved(params).await,
+            "craze.reopen" => self.craze_reopen(params).await,
             "craze.open_terminal" => self.craze_open_terminal(params).await,
             "craze_create.dump" => Ok(self.craze_create_dump()),
             "agents.dump" => Ok(self.agents_dump()),
@@ -2049,11 +2075,14 @@ impl Handler {
     // `roost:<server>/<shed>` token, the row's own `machine`. Refusals carry
     // [`crate::craze::CrazeFailure`]'s codes: the lane contract's, plus
     // `outcome_unknown` (the one a caller keeps its request id on), `too_old`,
-    // `not_installed` and `no_craze`.
+    // `not_installed` and `no_craze` — and a reopen's own `gone` and
+    // `start_failed` (plan 032 §3.4).
 
     /// `craze.create_options {machine}` → `{machine, options: {providers,
-    /// default_provider?, recent_dirs}}` — what a create can start there, read
-    /// afresh (D8). May start a hub on a dormant machine: an explicit action.
+    /// default_provider?, recent_dirs, reopen}, source_gen}` — what a create
+    /// can start there, read afresh (D8), and the incarnation of the machine's
+    /// craze source it came through (plan 032 §3.4). May start a hub on a
+    /// dormant machine: an explicit action.
     async fn craze_create_options(&self, params: &Value) -> Result<Value, (String, String)> {
         let machine = req_str(params, "machine")?.to_string();
         self.machines
@@ -2082,6 +2111,37 @@ impl Handler {
             .map_err(craze_err)
     }
 
+    /// `craze.saved {machine}` → `{machine, saved: {sessions, more}, home?,
+    /// source_gen}` (plan 032 §3.4): the saved sessions a resume can run
+    /// again there — each `{id, provider, workspace, title?,
+    /// updated_unix_ms, created_unix_ms?}`, newest first, at most 50 (`more`
+    /// when craze left some out) — read afresh; `home` is the host's home
+    /// directory where the app knows it (`null` otherwise); `source_gen` the
+    /// craze source incarnation it came through. May start a hub on a dormant
+    /// machine.
+    async fn craze_saved(&self, params: &Value) -> Result<Value, (String, String)> {
+        let machine = req_str(params, "machine")?.to_string();
+        self.machines.craze_saved(&machine).await.map_err(craze_err)
+    }
+
+    /// `craze.reopen {machine, id}` → `{session, host_id, ended, superseded,
+    /// joined, id, source_gen}`: the saved session `id` running again (or
+    /// joined where something already runs it), its row folded into the
+    /// machine's listing at once — unless `superseded`: the machine was
+    /// removed (or removed and registered again) while it ran, nothing was
+    /// folded, and there is nothing to open on it here.
+    /// `id` is TYPED like every craze field and must be non-blank
+    /// ([`crate::craze::reopen_id`]). Refusal codes keep the reopen error's
+    /// variant ([`crate::craze::CrazeFailure::reopen`]).
+    async fn craze_reopen(&self, params: &Value) -> Result<Value, (String, String)> {
+        let machine = req_str(params, "machine")?.to_string();
+        let id = crate::craze::reopen_id(opt_str(params, "id")?).map_err(craze_err)?;
+        self.machines
+            .craze_reopen(&machine, &id)
+            .await
+            .map_err(craze_err)
+    }
+
     /// `craze.open_terminal {machine, session_id}` → `{origin, machine,
     /// session_id, tab_id, cwd, argv}`: a roost tab running `craze attach` on
     /// that session (the row's `slug`, its hostId), in its workspace; the row
@@ -2099,7 +2159,9 @@ impl Handler {
     /// `lane.dump` rule): its machine, its state, the providers with their
     /// state, dimming and reason/fix, the selected one, the recent
     /// directories, the typed fields, the request id it holds, the note and
-    /// the outcome — or `null` while none is mounted.
+    /// the outcome — and its Resume mode (plan 032 §3.4): which mode it shows,
+    /// whether it offers the choice, and the saved sessions it lists with
+    /// each row's state — or `null` while none is mounted.
     fn craze_create_dump(&self) -> Value {
         json!({ "craze_create": self.ui_get("craze_create").unwrap_or(Value::Null) })
     }
@@ -3300,6 +3362,55 @@ mod tests {
             assert_eq!(
                 craze_create_door(&test, "ui.fill_craze_create", &bad)
                     .expect_err("a control of the wrong type")
+                    .0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+    }
+
+    /// **The sheet's Resume doors are test-mode only** (plan 032 §3.4,
+    /// PC14i), the create doors' rule: `ui.choose_craze_mode` routes only
+    /// `new` or `resume`, and `ui.resume_saved` only a non-blank id, verbatim
+    /// (opaque — a legacy `grok:<id>` included); anything else is refused
+    /// before it reaches the sheet.
+    #[test]
+    fn the_craze_resume_doors_are_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        for (op, params) in [
+            ("ui.choose_craze_mode", json!({ "mode": "resume" })),
+            ("ui.resume_saved", json!({ "id": "0192f0aa" })),
+        ] {
+            let (code, message) = craze_create_door(&prod, op, &params)
+                .expect_err("a driver door must not be reachable in a shipped app");
+            assert_eq!(code, "not_enabled", "{op}");
+            assert!(message.contains(op), "{message}");
+        }
+        let test = env(None);
+        for mode in ["new", "resume"] {
+            assert_eq!(
+                craze_create_door(&test, "ui.choose_craze_mode", &json!({ "mode": mode })).unwrap(),
+                ("choose-craze-mode", json!({ "mode": mode }))
+            );
+        }
+        assert_eq!(
+            craze_create_door(&test, "ui.resume_saved", &json!({ "id": "grok:abc" })).unwrap(),
+            ("resume-saved", json!({ "id": "grok:abc" }))
+        );
+        for bad in [json!({}), json!({ "mode": "Resume" }), json!({ "mode": 1 })] {
+            assert_eq!(
+                craze_create_door(&test, "ui.choose_craze_mode", &bad)
+                    .expect_err("not a mode")
+                    .0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+        for bad in [json!({}), json!({ "id": "  " }), json!({ "id": 7 })] {
+            assert_eq!(
+                craze_create_door(&test, "ui.resume_saved", &bad)
+                    .expect_err("not a saved session id")
                     .0,
                 "bad_request",
                 "{bad}"

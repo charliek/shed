@@ -1822,8 +1822,10 @@ impl RoostHosts {
     /// source at all (`no_craze`), craze not installed (`not_installed`), or
     /// craze too old for `need` (`too_old`: the probe read a v0.0.1, or a live
     /// hub's `hello` lacks `createOptions`/`sessionCreate` — §3.8's "update
-    /// craze on this machine"). Anything else — live, dormant, unreachable,
-    /// never reached — is tried: the dial says for itself whether it worked.
+    /// craze on this machine"; a live hub without `reopen` refuses a resume
+    /// op `unavailable` instead, [`CrazeNeed::unsupported`]). Anything else —
+    /// live, dormant, unreachable, never reached — is tried: the dial says for
+    /// itself whether it worked.
     #[allow(clippy::type_complexity)]
     fn craze_ask(
         &self,
@@ -1874,15 +1876,10 @@ impl RoostHosts {
                     let has = match need {
                         CrazeNeed::CreateOptions => caps.is_some_and(|c| c.create_options),
                         CrazeNeed::Create => caps.is_some_and(|c| c.create),
+                        CrazeNeed::Saved | CrazeNeed::Reopen => caps.is_some_and(|c| c.reopen),
                     };
                     if !has {
-                        return Err(CrazeFailure::new(
-                            "too_old",
-                            format!(
-                                "update craze on this machine: its hub cannot {}",
-                                need.what()
-                            ),
-                        ));
+                        return Err(need.unsupported());
                     }
                 }
                 _ => {}
@@ -1905,8 +1902,17 @@ impl RoostHosts {
     /// **An explicit user action** (§3.6.1): on an attach-only host with no hub
     /// running, this is what births one — the create sheet opening. The host's
     /// source is woken either way, so a dormant one attaches to that hub now.
+    ///
+    /// `source_gen` is the generation of the craze source the call went
+    /// through ([`CrazeState::gen`]) — the host's INCARNATION, which its
+    /// address alone does not name: a host removed and registered again under
+    /// the same address is a new one. The sheet binds the state it keeps per
+    /// machine (its Resume half's, plan 032 §3.4) to it, so nothing an older
+    /// incarnation left running carries over onto the new one — as it does
+    /// to every status's `craze.source_gen` ([`CrazeState::status`]), which
+    /// names the same generation and needs no read here to succeed.
     pub async fn craze_create_options(&self, host: &str) -> Result<Value, CrazeFailure> {
-        let (id, ask, _gen, wake, _admitted) = self.craze_ask(host, CrazeNeed::CreateOptions)?;
+        let (id, ask, gen, wake, _admitted) = self.craze_ask(host, CrazeNeed::CreateOptions)?;
         let answer = match _admitted
             .run(async { Some(ask.create_options().await) }, || None)
             .await
@@ -1921,7 +1927,7 @@ impl RoostHosts {
         };
         wake.notify_one();
         let options = answer.map_err(CrazeFailure::lane)?;
-        Ok(json!({ "machine": id.address(), "options": options }))
+        Ok(json!({ "machine": id.address(), "options": options, "source_gen": gen }))
     }
 
     /// `craze.create {machine, cwd, provider?, prompt?, request_id}` (plan 025
@@ -2151,6 +2157,174 @@ impl RoostHosts {
             "cwd": tab.cwd,
             "argv": argv,
         }))
+    }
+
+    // -- craze: the create sheet's Resume mode (plan 032 §3.4, C5) --
+
+    /// `craze.saved {machine}` (plan 032 §3.4): the saved sessions a resume
+    /// can run again on `host` — craze's `sessions.saved`, newest first, at
+    /// most 50, `more` when craze left some out — read afresh on every call,
+    /// on a connection of its own, as [`Self::craze_create_options`] reads the
+    /// create options; plus `home`, the host's home directory where this app
+    /// knows it ([`Self::craze_home`]), which the sheet shortens a workspace
+    /// to `~` by; and `source_gen`, the host's incarnation the list came
+    /// through ([`Self::craze_create_options`]'s).
+    ///
+    /// **An explicit user action** (§3.6.1) — the sheet's Resume mode chosen
+    /// — through the same ungated dial: on an attach-only host it may birth a
+    /// hub, as the create options do, and the host's source is woken either
+    /// way. A live hub without `reopen` is refused before any dial
+    /// ([`CrazeNeed::unsupported`]).
+    pub async fn craze_saved(&self, host: &str) -> Result<Value, CrazeFailure> {
+        let (id, ask, gen, wake, admitted) = self.craze_ask(host, CrazeNeed::Saved)?;
+        let Some(answer) = admitted
+            .run(async { Some(ask.saved().await) }, || None)
+            .await
+        else {
+            return Err(CrazeFailure::new(
+                shed_app::spawn_gate::SHUTTING_DOWN,
+                cancelled(),
+            ));
+        };
+        wake.notify_one();
+        let saved = answer.map_err(CrazeFailure::lane)?;
+        Ok(json!({
+            "machine": id.address(),
+            "saved": saved,
+            "home": self.craze_home(&id),
+            "source_gen": gen,
+        }))
+    }
+
+    /// `craze.reopen {machine, id}` (plan 032 §3.4): ensure the saved session
+    /// `id` — as [`Self::craze_saved`] listed it — is running on `host`:
+    /// craze's `session.reopen`, on a connection of its own, which JOINS a
+    /// session something already runs (`joined: true`) or starts a host that
+    /// loads it (`joined: false`), answered with the running session's row
+    /// and hostId. It can take minutes — the source allows 200 s per answer
+    /// and resends a lost one once — and closing the sheet abandons the wait,
+    /// never the reopen.
+    ///
+    /// **The path mirrors [`Self::craze_create`]'s** (PC11): admitted — or
+    /// refused — under the registry lock, the host's explicit-action dial
+    /// (which may birth a hub), the host's source woken on any answer, and the
+    /// answered row listed at once under the source's generation
+    /// ([`Self::list_answered_row`]). The source keeps that row as a created
+    /// row that is FRESH — it lifts a tombstone for its hostId rather than
+    /// being refused by one (PC14f) — so `lane.open {kind: "craze",
+    /// session_id: host_id}` works before any roster lists it. `ended`: the
+    /// source no longer lists it by the time the answer is folded (the
+    /// session already gone again), and nothing is listed.
+    ///
+    /// **`superseded`: the answer outlived its source** (C5 review): the host
+    /// was removed — or removed and registered again under the same address,
+    /// a new incarnation with a new source — while the reopen ran. Nothing is
+    /// folded (the generation check), the row is the last known, marked
+    /// stale, and NOTHING can be opened on it here: a lane opens through the
+    /// host's CURRENT source, which never saw this answer. `source_gen` names
+    /// the incarnation the reopen went through. Not the row's own `stale`,
+    /// which a reopen on a dormant machine answers too — its hub just started,
+    /// the source not attached yet — and which opens at once all the same.
+    ///
+    /// Refusals keep [`shed_core::lane::LaneReopenError`]'s variant
+    /// ([`CrazeFailure::reopen`]): `gone`, `start_failed`, `unavailable` (a
+    /// lost answer included), or the inner contract error's own code.
+    pub async fn craze_reopen(&self, host: &str, saved_id: &str) -> Result<Value, CrazeFailure> {
+        let (id, ask, gen, wake, admitted) = self.craze_ask(host, CrazeNeed::Reopen)?;
+        // Cancelled past phase 0's bound (plan 026 §3.3, F2): the reopen was in
+        // flight and may have started the session — which a reopen of the same
+        // id joins, so nothing is lost by saying so.
+        let Some(answer) = admitted
+            .run(async { Some(ask.reopen(saved_id).await) }, || None)
+            .await
+        else {
+            return Err(CrazeFailure::new(
+                shed_app::spawn_gate::SHUTTING_DOWN,
+                format!(
+                    "the app quit while this reopen was in flight on {host}; the session may be running — resuming it again joins it"
+                ),
+            ));
+        };
+        wake.notify_one();
+        let reopened = answer.map_err(CrazeFailure::reopen)?;
+        let host_id = reopened.session.id.clone();
+        let answered = self.list_answered_row(&id, gen, &ask, &reopened.session);
+        (self.on_change)();
+        Ok(json!({
+            "session": answered.row,
+            "host_id": host_id,
+            "ended": answered.ended,
+            "superseded": answered.superseded,
+            "joined": reopened.joined,
+            "id": saved_id,
+            "source_gen": gen,
+        }))
+    }
+
+    /// A reopen's answered row, folded into `id`'s state at once under the
+    /// source generation `gen` — the row as listed (or, the host removed or
+    /// restarted meanwhile, as the last known: [`AnsweredRow::superseded`])
+    /// and whether the source no longer lists it.
+    ///
+    /// **[`Self::craze_create`]'s created-row integration, rule for rule** —
+    /// a change to one is a change to both: the source's rows read UNDER this
+    /// layer's state lock (live leg 1's ghost-row review: the roster pump
+    /// updates them before the sink applies its frame under this lock); a
+    /// roster row folded ahead of its own frame, with NO return published
+    /// from here (plan 032 §3.1.1 item 3 — the fold that lands the frame
+    /// reports it, in order with its own departures); the host listed,
+    /// because craze answered there; the row read through the source's
+    /// created rows, never a copy of this layer's.
+    fn list_answered_row(
+        &self,
+        id: &HostId,
+        gen: u64,
+        ask: &CrazeSource,
+        answered: &LaneSession,
+    ) -> AnsweredRow {
+        let host_id = &answered.id;
+        let mut guard = lock(&self.state);
+        let roster_row = ask.roster_row(host_id);
+        let ended = ask.listed(host_id).is_none();
+        let shown = roster_row.clone().unwrap_or_else(|| answered.clone());
+        let (row, superseded) = match guard.get_mut(id).filter(|m| m.craze.gen == gen) {
+            Some(m) => {
+                if let Some(listed) = roster_row {
+                    m.craze.listed_now(listed);
+                }
+                m.listed = true;
+                let created_now = created_rows(&lock(&self.reg), id, m);
+                let tab = m.fold_plan(&created_now).tab_of(host_id);
+                (craze_row(id, &shown, !m.craze.live() || ended, tab), false)
+            }
+            None => (craze_row(id, &shown, true, None), true),
+        };
+        AnsweredRow {
+            row,
+            ended,
+            superseded,
+        }
+    }
+
+    /// `id`'s home directory as this app KNOWS it — what the resume sheet
+    /// shortens a saved session's workspace to `~` by (plan 032 §3.4), never
+    /// guessed from the path: this machine's own `HOME` for the implicit
+    /// `localhost` (whose craze runs with it — inherited in production, passed
+    /// through the test-mode seam), every shed's [`SHED_HOME`], and nothing
+    /// for a machine reached over ssh, whose home this app never learns: its
+    /// sheet shows the workspace whole.
+    fn craze_home(&self, id: &HostId) -> Option<String> {
+        match id {
+            HostId::Shed { .. } => Some(SHED_HOME.to_string()),
+            HostId::Machine(name)
+                if name == LOCALHOST && self.config.machine(LOCALHOST).is_none() =>
+            {
+                std::env::var("HOME")
+                    .ok()
+                    .filter(|home| home.starts_with('/') && home.len() > 1)
+            }
+            HostId::Machine(_) => None,
+        }
     }
 
     /// **TEST-MODE ONLY**: put a synthetic row into this host's snapshot, as if a
@@ -4330,20 +4504,62 @@ enum CrazeNeed {
     CreateOptions,
     /// `session.create`.
     Create,
+    /// `sessions.saved` — the sheet's Resume mode listing (plan 032 §3.4).
+    Saved,
+    /// `session.reopen` — its Resume button.
+    Reopen,
 }
 
 impl CrazeNeed {
-    fn what(self) -> &'static str {
-        match self {
+    /// The refusal of a LIVE hub whose capabilities lack what this op needs,
+    /// before any dial. A create-sheet op's is `too_old` — "update craze on
+    /// this machine". A resume op's is the source's own answer to a hub
+    /// without `reopen` (plan 032 PC14i): `unavailable`, in shed-craze's ONE
+    /// older-hub wording, so the sheet says the same whether this gate or the
+    /// source's refused it. This layer keeps no hub version or pid (the
+    /// source's capabilities carry neither), so the words name no version and
+    /// no `kill <pid>` remedy — they never infer one (PC10); the source's own
+    /// gate, which reads the hub's `hello`, can.
+    fn unsupported(self) -> CrazeFailure {
+        let what = match self {
             CrazeNeed::CreateOptions => "list what a create can start",
             CrazeNeed::Create => "create sessions",
-        }
+            CrazeNeed::Saved | CrazeNeed::Reopen => {
+                return CrazeFailure::new(
+                    "unavailable",
+                    shed_craze::errors::reopen_unsupported_by("", None),
+                )
+            }
+        };
+        CrazeFailure::new(
+            "too_old",
+            format!("update craze on this machine: its hub cannot {what}"),
+        )
     }
+}
+
+/// A reopen's answered row as [`RoostHosts::list_answered_row`] folded it
+/// (plan 032 §3.4).
+struct AnsweredRow {
+    /// The row as listed — or, superseded, as the last known (stale).
+    row: Value,
+    /// The source no longer lists the session: it ended again before its row
+    /// was folded, and nothing is listed.
+    ended: bool,
+    /// The host's state no longer holds the generation the reopen went
+    /// through — removed, or removed and registered again (a new incarnation)
+    /// — so nothing was folded, and nothing can open on the row here (C5
+    /// review).
+    superseded: bool,
 }
 
 /// A host whose craze the probe read as too old (v0.0.1) — the machines
 /// pane's note, word for word (plan 025 §3.6.5).
 const CRAZE_TOO_OLD: &str = "craze on this machine is too old for shed; update it";
+
+/// Every shed's user home (the Go side's `config.HomePath`): the `shed`
+/// user's, where a shed's workspaces live ([`RoostHosts::craze_home`]).
+const SHED_HOME: &str = "/home/shed";
 
 /// A `roost.run` command line, parsed into the argv its tab opens with (plan
 /// 025 P5). The only way to build one is [`RunCommand::parse`], so a

@@ -814,6 +814,38 @@ async fn craze_create(
         .map_err(|f| f.command_string())
 }
 
+/// `craze_saved` — the saved sessions the create sheet's Resume mode lists on
+/// `machine` (plan 032 §3.4), read afresh on every call; plus the host's
+/// `home` where the app knows it. May start a hub on a dormant machine.
+#[tauri::command]
+async fn craze_saved(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    machine: String,
+) -> Result<serde_json::Value, String> {
+    machines
+        .craze_saved(&machine)
+        .await
+        .map_err(|f| f.command_string())
+}
+
+/// `craze_reopen` — run the saved session `id` again (or join it where it
+/// already runs), its row listed at once. A refusal's code keeps the reopen
+/// error's variant (`gone`, `start_failed`, `unavailable`, or the inner lane
+/// code) — [`craze::CrazeFailure::reopen`]. Read through
+/// [`craze::reopen_id`], the socket door's one reading.
+#[tauri::command]
+async fn craze_reopen(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    machine: String,
+    id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let id = craze::reopen_id(id.as_deref()).map_err(|f| f.command_string())?;
+    machines
+        .craze_reopen(&machine, &id)
+        .await
+        .map_err(|f| f.command_string())
+}
+
 /// `craze_open_terminal` — Open in terminal on a headless craze row: a roost
 /// tab running `craze attach` on it.
 #[tauri::command]
@@ -1458,6 +1490,8 @@ pub fn run() {
             lane_slash_accept,
             craze_create_options,
             craze_create,
+            craze_saved,
+            craze_reopen,
             craze_open_terminal,
             machines_list,
             add_machine,

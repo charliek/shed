@@ -27,6 +27,11 @@ import {
   replaysHeldRequest, settle, sheetOnScreen,
   type CrazeDraft, type CrazeStatusLike,
 } from "@/lib/crazeCreate";
+import {
+  EMPTY_RESUME, SUPERSEDED_NOTE, beginList, beginResume, canResume, chooseMode, listNeeded, observeSource,
+  observeSources, onSheetOpen, reopenLanding, settleList, settleResume,
+  type CrazeResume, type CrazeSheetMode,
+} from "@/lib/crazeResume";
 import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
 import {
   roostBootstrap, roostPreview, roostProgressSteps, roostToastFor, roostDumpRow,
@@ -40,7 +45,7 @@ import {
   fetchEgressProfiles, reportEgress, inTauri,
   openPreferences, setAppearanceState,
   rcLaunch, machineLaunch, roostRun, machineCapabilities, killSession, sessionKey, reportAgents, reportLaunchDialog, reportMachinesPane, useRcSessions, openMachineTerminal, addMachine,
-  crazeCreate, crazeOpenTerminal, laneFailure,
+  crazeCreate, crazeOpenTerminal, crazeReopen, crazeSaved, laneFailure,
   useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor, attachKind, capabilitiesFor,
   type Pane, type Shed, type HostDiskUsage, type HostFailure,
   type Modal, type CreateProgress, type Approval, type AuditEntry,
@@ -2106,10 +2111,121 @@ export default function App() {
     crazeDrafts.current = { ...crazeDrafts.current, [machine]: next };
     setDrafts(crazeDrafts.current);
   }, []);
+  // Every machine's RESUME state (plan 032 §3.4) — the sheet's Resume half:
+  // the mode shown, the saved list, each row's reopen — held here beside the
+  // drafts and for their reason: a reopen can take minutes, and dismissing
+  // the sheet keeps it running (its session appears as a row). The ref is
+  // the authoritative copy, the state its mirror (`updateDraft`'s rule).
+  // Keyed by machine NAME, which a host removed and registered again keeps,
+  // so each state is bound to the INCARNATION its answers came through
+  // (`observeSource`, C5 review): a new one starts afresh, and an old one's
+  // late answers land nowhere.
+  const crazeResumes = useRef<Record<string, CrazeResume>>({});
+  const [resumes, setResumes] = useState<Record<string, CrazeResume>>({});
+  const updateResume = useCallback((machine: string, f: (r: CrazeResume) => CrazeResume) => {
+    const next = f(crazeResumes.current[machine] ?? EMPTY_RESUME);
+    crazeResumes.current = { ...crazeResumes.current, [machine]: next };
+    setResumes(crazeResumes.current);
+  }, []);
+  // The token each saved-list read is fenced by (`settleList`), and the
+  // attempt number each reopen is (`reopenLanding`/`settleResume`).
+  const savedReads = useRef(0);
+  const reopenAttempts = useRef(0);
+  // An answer about `machine` came through its craze source of generation
+  // `gen` — the sheet's create options, read on every open.
+  const observeCrazeSource = useCallback((machine: string, gen: number | null | undefined) => {
+    updateResume(machine, (r) => observeSource(r, gen));
+  }, [updateResume]);
+  // **Every status binds every machine's Resume state to its incarnation**
+  // (C5 re-review): each `rc.list` names each host's craze source generation
+  // (`craze.source_gen`, read through `crazeStatusFor`, so an unlisted
+  // dormant shed's comes from its `shed_craze` entry), and it is applied to
+  // every state held — sheet open or not (`observeSources`). A host removed
+  // and registered again under the same name thereby resets what its old
+  // incarnation left, a running reopen's lock included, as soon as the new
+  // one is SEEN: never waiting on a create-options read, which may fail. The
+  // ref holds the latest status for the sheet's opening, below.
+  const rcCrazeNow = useRef({ machines: rcMachines, shedCraze: rcShedCraze });
+  const crazeGenOf = useCallback(
+    (machine: string) =>
+      crazeStatusFor(machine, rcCrazeNow.current.machines, rcCrazeNow.current.shedCraze)?.source_gen,
+    [],
+  );
+  useEffect(() => {
+    rcCrazeNow.current = { machines: rcMachines, shedCraze: rcShedCraze };
+    const next = observeSources(crazeResumes.current, crazeGenOf);
+    if (next === crazeResumes.current) return;
+    crazeResumes.current = next;
+    setResumes(next);
+  }, [rcMachines, rcShedCraze, crazeGenOf]);
   const openCrazeSheet = useCallback((machine: string) => {
+    // A sheet opening reads afresh (nothing cached) — unless a reopen still
+    // runs there, which it then shows as it was left: once the machine's
+    // status has said that reopen is still this incarnation's
+    // (`observeSource` first — a newer one starts the sheet afresh).
+    updateResume(machine, (r) => onSheetOpen(observeSource(r, crazeGenOf(machine))));
     setCrazeMachine(machine);
     setModal("craze");
-  }, [setCrazeMachine, setModal]);
+  }, [setCrazeMachine, setModal, updateResume, crazeGenOf]);
+  // Read `machine`'s saved list: on the first choice of Resume since the
+  // sheet opened, and on the list's Retry. Only THIS read's answer lands.
+  const readSaved = useCallback(async (machine: string) => {
+    const token = ++savedReads.current;
+    updateResume(machine, (r) => beginList(r, token));
+    try {
+      const list = await crazeSaved(machine);
+      updateResume(machine, (r) => settleList(r, token, { ok: true, list }));
+    } catch (e) {
+      const f = laneFailure(e);
+      updateResume(machine, (r) => settleList(r, token, { ok: false, refusal: { code: f.code, message: f.message } }));
+    }
+  }, [updateResume]);
+  const chooseCrazeMode = useCallback((machine: string, mode: CrazeSheetMode) => {
+    updateResume(machine, (r) => chooseMode(r, mode));
+    if (listNeeded(crazeResumes.current[machine] ?? EMPTY_RESUME)) void readSaved(machine);
+  }, [updateResume, readSaved]);
+  // Run one reopen of `machine`'s saved session `id` — one at a time
+  // (`canResume`), as its own attempt. Success: the row leaves the list, the
+  // rows refresh, and — if this sheet is still the one open — it closes onto
+  // the session's transcript at once, as a create does. A refusal lands by
+  // its code (`settleResume`: `gone` drops the row, `unavailable` offers
+  // Retry, the rest keep it). **Every effect follows `reopenLanding`**,
+  // decided on the state the answer lands ON (C5 review): an attempt a newer
+  // incarnation of the machine forgot is dropped whole — no state change, no
+  // navigation — and a `superseded` answer opens nothing.
+  const resumeSaved = useCallback(async (machine: string, id: string) => {
+    if (!canResume(crazeResumes.current[machine] ?? EMPTY_RESUME, id)) return;
+    const attempt = ++reopenAttempts.current;
+    updateResume(machine, (r) => beginResume(r, id, attempt));
+    try {
+      const reopened = await crazeReopen(machine, id);
+      const landing = reopenLanding(crazeResumes.current[machine] ?? EMPTY_RESUME, id, attempt, reopened);
+      if (landing === "dropped") return;
+      updateResume(machine, (r) => settleResume(r, id, attempt, { ok: true, answer: reopened }));
+      refreshRc();
+      // Decided by the sheet on screen NOW, read live (C10 review's rule).
+      const onScreen = sheetOnScreen(modalNow.current, crazeMachineNow.current);
+      if (landing === "superseded") {
+        // Said on its row; a sheet not showing it would lose it on its next
+        // open, so the toast says it there.
+        if (onScreen !== machine) setToast({ tone: "warn", lines: [SUPERSEDED_NOTE] });
+        return;
+      }
+      if (landing === "ended") {
+        setToast({ tone: "warn", lines: ["craze reopened the session, and it has already ended."] });
+        if (onScreen === machine) setModal(null);
+        return;
+      }
+      if (closesOntoTranscript(onScreen, machine)) {
+        setModal(null);
+        setPane("agents");
+        setLane({ machine, kind: "craze", sessionId: reopened.host_id });
+      }
+    } catch (e) {
+      const f = laneFailure(e);
+      updateResume(machine, (r) => settleResume(r, id, attempt, { ok: false, refusal: { code: f.code, message: f.message } }));
+    }
+  }, [refreshRc, updateResume, setModal]);
   // Run one submission of `machine`'s draft. **The request id is the draft's**
   // — reused while an outcome is unknown, minted anew after any definite one
   // (`beginSubmit`/`settle`) — and a reused one is sent as a held replay
@@ -2524,6 +2640,13 @@ export default function App() {
           draft={drafts[crazeMachine] ?? EMPTY_DRAFT}
           onEdit={(patch) => updateDraft(crazeMachine, (d) => editCrazeDraft(d, patch))}
           onSubmit={() => void submitCraze(crazeMachine)}
+          // Its Resume half (plan 032 §3.4): the state is this shell's, per
+          // machine, like the draft.
+          resume={resumes[crazeMachine] ?? EMPTY_RESUME}
+          onSourceGen={(gen) => observeCrazeSource(crazeMachine, gen)}
+          onChooseMode={(mode) => chooseCrazeMode(crazeMachine, mode)}
+          onResume={(id) => void resumeSaved(crazeMachine, id)}
+          onRetryList={() => void readSaved(crazeMachine)}
           onClose={() => setModal(null)}
         />
       )}

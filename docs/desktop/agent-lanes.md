@@ -154,10 +154,11 @@ which attaches to a hub that is already running and otherwise exits 3
 connection gets that answer, the source goes `dormant` (its rows leave with
 the hub) and probes again 30 s later; a lane stays stale and retries within
 its own bound. There is no probe in front of each connection: the connection
-itself cannot start a hub. Only two explicit actions start one on a remote
-host, and only they run plain `craze bridge --hub`: opening the create sheet
-(its provider list) and creating a session. After either, the host's source
-probes at once and attaches to the new hub. (Open in terminal runs `craze
+itself cannot start a hub. Only the create sheet's explicit actions start one
+on a remote host, and only they run plain `craze bridge --hub`: opening it
+(its provider list), creating a session, and its Resume half (listing saved
+sessions, resuming one). After any of them, the host's source probes at once
+and attaches to the new hub. (Open in terminal runs `craze
 attach`, which joins the session over the session's own control socket and
 starts nothing.)
 
@@ -351,6 +352,65 @@ end of the lane, including a transcript closed before the close arrived. A
 transcript closed while the stop was still in flight leaves no lane to see the
 close, so the stop's receipt says it instead. The source then tells the
 desktop to re-read the listing, since no roster frame will.
+
+### Resuming a saved session
+
+A craze machine remembers the sessions it ran. A **saved** session is one it
+remembers that nothing runs now, and craze 0.2.0 can run one again: the hub's
+`sessions.saved` lists them and `session.reopen` starts a host that loads one
+(or joins the host already serving it).
+
+The create sheet shows a **New | Resume** control when the create options it
+just read say the hub can reopen (`reopen`, from the same hub `hello`). That
+covers a dormant machine too: opening the sheet starts its hub, and the
+control appears once that hub answers. A hub from before craze 0.2.0 shows no
+control. A hub from before 0.2.0 can keep running after craze is upgraded,
+until it is idle. Asked anyway (the `craze.saved` or `craze.reopen` op), it is
+refused `unavailable` in one wording, "this craze hub (craze <version>) does
+not offer reopening saved sessions". The version reads `version unknown` when
+the app has not read it, and a hub that says a version below 0.2.0 and its
+pid gets the remedy too: end it with `kill <pid>`.
+
+The sheet opens on New. **Resume** reads the saved list the first time it is
+chosen after the sheet opens, as the create options are read: nothing is
+cached. The list is craze's, newest first, at most 50 ("Showing the 50 most
+recent." when craze left some out). Each row shows:
+
+- the session's title, or "Untitled";
+- its provider;
+- its workspace, with the home directory shortened to `~` where the app knows
+  it: this machine's own home, and a shed's `/home/shed`. A machine reached
+  over SSH shows the full path, because the app never learns its home;
+- how long ago it was last active;
+- a **Resume** button.
+
+Resuming runs one reopen at a time. While it runs, its row reads "Resuming…
+(this can take a few minutes)" and every other button, the New | Resume
+control included, is disabled. It can take minutes: a provider's load replays
+the session, and the app allows craze 200 s per answer and sends a lost answer
+again once. Closing the sheet stops waiting, never the reopen; its session
+appears as a row, and the sheet opened again shows the reopen still running.
+
+That state is bound to the machine's **incarnation**, not just its name. A
+machine removed and added again under the same name (a shed restarted out
+from under the app, say) is a new one. Every machine status names its
+incarnation (`craze.source_gen`), and the app resets the state as soon as a
+status names a newer one, whether or not the sheet is open. It does not wait
+for the sheet's create options, which can fail to load. So the new
+incarnation's sheet opens fresh, never locked by a reopen the old one left
+running, and that reopen's late answer is dropped without opening anything.
+
+When the create options fail to load, the sheet says so with a **Retry** in
+whichever half shows, Resume included. The Retry works while a reopen runs.
+
+| Outcome | What the sheet does |
+|---|---|
+| Resumed | The sheet closes and the session's transcript opens at once. The row is listed before any roster frame names it, the same way a created session's is. |
+| Resumed, but the machine was removed (or removed and added again) meanwhile | Nothing opens: the answer came through the machine's old connection, which the transcript cannot open through. The row stays and says so ("Resume again to open it"); resuming again joins the running session. A sheet not on screen says it in a toast. If a status has already named the new incarnation, the state has started afresh and the answer is dropped instead, as described above. |
+| `gone` | The session cannot run here any more (no such session, or its directory is gone). The row is dropped, and the sheet says why where it was. |
+| `start_failed` | The session was found and failed to start. craze's cause shows inline, verbatim, and the row stays. |
+| `unavailable` | Transient: craze is busy or closing, or the answer was lost twice ("Retry is safe": a reopen of a running session joins it). The reason shows inline, and the row's button reads Retry. |
+| Anything else | The error shows inline, and the row stays. |
 
 ### Open in terminal
 
@@ -875,8 +935,8 @@ connection (it may have run, and it is never resent), and `lane_ended` for a
 verb (`lane.send`, `lane.cancel`, `lane.answer`, `lane.set`, `lane.set_title`,
 `lane.stop`) on a finished lane — refused at once, never sent.
 
-The craze ops — `craze.create_options`, `craze.create`, `craze.open_terminal`
-— the UI-truth dumps (`lane.dump`, `lane_settings.dump`, `craze_create.dump`)
+The craze ops — `craze.create_options`, `craze.create`, `craze.saved`,
+`craze.reopen`, `craze.open_terminal` — the UI-truth dumps (`lane.dump`, `lane_settings.dump`, `craze_create.dump`)
 and the test-mode doors are listed in [IPC](ipc.md#craze-sessions-tauri).
 
 ## A stalled client and the channel bound
@@ -920,8 +980,10 @@ lane reseeds.
 - **No model, effort or permission mode at create.** A session starts on its
   provider's defaults; change the model and options from the settings sheet
   afterwards.
-- **Running sessions only.** The hub lists running sessions; a saved session
-  cannot be resumed from the desktop (craze#88).
+- **Saved sessions: the 50 most recent, no filter.** The sheet's Resume half
+  lists the 50 most recent saved sessions, with no workspace filter and no
+  sub-agent sessions; a reopen in flight cannot be cancelled (closing the
+  sheet stops waiting, not the reopen). Resume needs craze 0.2.0 or later.
 - **No sub-agent transcripts.** A sub-agent's asks are answerable; its own
   messages are not shown.
 - **No queue editing,** no send-now.

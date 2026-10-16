@@ -18,33 +18,52 @@
  * - **No state clears the typed form**: loading, a failed options read, the
  *   machine going offline or turning out too old, a refusal, an unknown
  *   outcome — each says its piece and leaves what was typed alone.
+ * - **Resume** (plan 032 §3.4): where the options say the hub can reopen, a
+ *   `New | Resume` control; Resume lists the machine's saved sessions (read
+ *   on its first choice) and runs one again — one at a time, its outcome
+ *   landing by its code (`crazeResume.ts`). Its state is the shell's too, so
+ *   a reopen — minutes, at worst — runs on behind a dismissed sheet, bound
+ *   to the machine's incarnation by every status the shell reads. A failed
+ *   options read offers its Retry in either half.
  *
- * Every rule it applies is `crazeCreate.ts`'s (pure, node-tested); this file
- * is the rendering and the drivable doors (`ui.fill_craze_create` /
- * `ui.submit_craze_create`, test mode only) and its own report
+ * Every rule it applies is `crazeCreate.ts`'s or `crazeResume.ts`'s (pure,
+ * node-tested); this file is the rendering and the drivable doors
+ * (`ui.fill_craze_create` / `ui.submit_craze_create` / `ui.choose_craze_mode`
+ * / `ui.resume_saved`, test mode only) and its own report
  * (`craze_create.dump`), read back off its DOM. */
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { RotateCw, Sparkles } from "lucide-react";
 
-import { DialogShell, Field, Scrim, dialogBtnSecondary, dialogInput, useEscClose } from "@/components/dialog";
+import { DialogShell, Field, Scrim, Segmented, dialogBtnSecondary, dialogInput, useEscClose } from "@/components/dialog";
 import { cn } from "@/lib/utils";
 import { renderedText, renderedValues } from "@/lib/roost";
 import {
   crazeCreateOptions, laneFailure, reportCrazeCreate,
-  type CrazeCreateProviderRow,
+  type CrazeCreateProviderRow, type CrazeSavedDump,
 } from "@/lib/bridge";
 import {
   crazeCreateGate, crazeSheetNote, directoryProblem, preselectedProvider,
   primaryLabel, providerSelectable, reconcileProvider, refusalView, titleFieldShown,
   type CrazeCreateOptions, type CrazeDraft, type CrazeStatusLike,
 } from "@/lib/crazeCreate";
+import {
+  MORE_NOTE, RESUMING_LABEL, canResume, modeLocked, optionsRetryHalf, relativeAge, resumeLabel, resumeOffered,
+  rowState, savedRowError, savedTitle, shortenHome,
+  type CrazeResume, type CrazeSheetMode,
+} from "@/lib/crazeResume";
+
+/** The sheet's two halves (plan 032 §3.4): a new session, or a saved one
+ *  running again. */
+const SHEET_MODES: [CrazeSheetMode, string][] = [["new", "New"], ["resume", "Resume"]];
 
 type OptionsLoad =
   | { phase: "loading" }
   | { phase: "failed"; code: string; message: string }
   | { phase: "ready"; options: CrazeCreateOptions };
 
-export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onClose }: {
+export function CrazeCreateDialog({
+  machine, craze, draft, onEdit, onSubmit, resume, onSourceGen, onChooseMode, onResume, onRetryList, onClose,
+}: {
   machine: string;
   /** This machine's craze status as the shell last read it — what turns the
    *  sheet's note on (offline, too old, not installed) while it is open. Read
@@ -54,25 +73,49 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
   draft: CrazeDraft;
   onEdit: (patch: Partial<Pick<CrazeDraft, "provider" | "cwd" | "title" | "prompt">>) => void;
   onSubmit: () => void;
+  /** The machine's Resume state (plan 032 §3.4) — the shell's, like the
+   *  draft, so a reopen keeps running behind a dismissed sheet. */
+  resume: CrazeResume;
+  /** The create options this open read came through the machine's craze
+   *  source of generation `gen` — its incarnation, which the shell binds the
+   *  Resume state to (`crazeResume.ts`'s `observeSource`, C5 review). One
+   *  of the answers that bind it, not the only one: every status the shell
+   *  reads binds it too (`observeSources`), so a failed read here never
+   *  leaves an older incarnation's state in place. */
+  onSourceGen: (gen: number | null | undefined) => void;
+  /** A half chosen (the shell reads the saved list the first time Resume is). */
+  onChooseMode: (mode: CrazeSheetMode) => void;
+  /** A saved row's Resume (or Retry) pressed. */
+  onResume: (id: string) => void;
+  /** The saved list's Retry, after a failed read. */
+  onRetryList: () => void;
   onClose: () => void;
 }) {
   const fid = useId();
   const [load, setLoad] = useState<OptionsLoad>({ phase: "loading" });
   const [attempt, setAttempt] = useState(0);
 
-  // Read on every open (and every Retry): what a create can start here NOW.
+  // Read on every open (and every Retry): what a create can start here NOW —
+  // and through which incarnation of the machine, which the shell binds the
+  // Resume state to (a host removed and added again under this name is a new
+  // one). The handler is the one rendered with THIS machine (`live` fences
+  // the rest).
   useEffect(() => {
     let live = true;
     setLoad({ phase: "loading" });
     crazeCreateOptions(machine).then(
-      (options) => { if (live) setLoad({ phase: "ready", options }); },
+      (options) => {
+        if (!live) return;
+        setLoad({ phase: "ready", options });
+        onSourceGen(options.source_gen);
+      },
       (e: unknown) => {
         const f = laneFailure(e);
         if (live) setLoad({ phase: "failed", code: f.code, message: f.message });
       },
     );
     return () => { live = false; };
-  }, [machine, attempt]);
+  }, [machine, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // The provider follows the options — for an IDLE draft only: a selection
   // carried over from an earlier open survives only while still ready, else
@@ -114,6 +157,28 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
   // "Name (optional)" where the live hub can take a title at create (P10) —
   // and while a typed one would be sent (`titleFieldShown`).
   const titleField = titleFieldShown(craze, draft);
+  // `New | Resume` (plan 032 §3.4, PC11): shown where the options just read
+  // say the hub can reopen, locked while either half's action runs. Every
+  // rule is `crazeResume.ts`'s.
+  const modesOffered = resumeOffered(options?.reopen, resume);
+  const locked = modeLocked(submitting, resume);
+  const resuming = resume.mode === "resume";
+  // The Resume half says only the machine's own note: the rest of the
+  // create gate's (no provider ready, a held request) is the form's.
+  const sheetNote = resuming ? machineNote : note;
+  // A failed options read says so, with its Retry, in WHICHEVER half shows
+  // (`optionsRetryHalf`, C5 re-review): a sheet opened onto Resume — a
+  // reopen left running — can still read them again. Never locked.
+  const optionsFailure = load.phase === "failed" ? load : null;
+  const retryHalf = optionsRetryHalf(optionsFailure !== null, resume);
+  const retryOptions = useCallback(() => setAttempt((a) => a + 1), []);
+  const choose = useCallback((mode: CrazeSheetMode) => {
+    if (!modesOffered || locked) return;
+    onChooseMode(mode);
+  }, [modesOffered, locked, onChooseMode]);
+  const pressSaved = useCallback((id: string) => {
+    if (canResume(resume, id)) onResume(id);
+  }, [resume, onResume]);
 
   // A click on a provider row: a dimmed one refuses it, as it refuses the
   // harness's door — the rule, not just the look.
@@ -127,13 +192,19 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
   // fill sets the named controls as a person would; submit presses the
   // primary button through its own gate. Refs keep the handlers current —
   // the listeners are registered once.
-  const doors = useRef({ pick, onEdit, recent: [] as string[], press: () => {} });
+  const doors = useRef({
+    pick, onEdit, recent: [] as string[], press: () => {},
+    choose: (_mode: CrazeSheetMode) => {}, resume: (_id: string) => {},
+  });
   useEffect(() => {
     doors.current = {
       pick,
       onEdit,
       recent: options?.recent_dirs ?? [],
-      press: () => { if (canCreate) onSubmit(); },
+      // The primary button exists only in the New half.
+      press: () => { if (canCreate && !resuming) onSubmit(); },
+      choose,
+      resume: pressSaved,
     };
   });
   useEffect(() => {
@@ -155,6 +226,19 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
         }),
       );
       uns.push(await listen("submit-craze-create", () => doors.current.press()));
+      // The Resume half's doors (plan 032 PC14i): each press goes through
+      // its control's own gate, as a pointer's does.
+      uns.push(
+        await listen<{ mode?: unknown }>("choose-craze-mode", (e) => {
+          const mode = e.payload?.mode;
+          if (mode === "new" || mode === "resume") doors.current.choose(mode);
+        }),
+      );
+      uns.push(
+        await listen<{ id?: unknown }>("resume-saved", (e) => {
+          if (typeof e.payload?.id === "string") doors.current.resume(e.payload.id);
+        }),
+      );
       if (cancelled) uns.forEach((u) => u());
     });
     return () => {
@@ -166,9 +250,33 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
   // Report what the sheet RENDERED (`craze_create.dump`), read back off its
   // DOM after the commit — the `launch.dump` rule — so the dump cannot claim a
   // provider row, a dimming or a value the sheet does not show.
-  const shape = JSON.stringify([load, draft, machineNote, canCreate, titleField]);
+  const shape = JSON.stringify([load, draft, machineNote, canCreate, titleField, resume, modesOffered, locked]);
   useEffect(() => {
     const root = document.querySelector("[data-craze-create]");
+    const modeButtons = Array.from(root?.querySelectorAll<HTMLButtonElement>("[data-craze-mode]") ?? []);
+    const savedRoot = root?.querySelector<HTMLElement>("[data-saved]");
+    const saved: CrazeSavedDump | null = savedRoot
+      ? {
+        state: savedRoot.dataset.savedState ?? "",
+        error: savedRoot.querySelector("[data-saved-list-error]")?.textContent ?? null,
+        more: savedRoot.querySelector("[data-saved-more]")?.textContent ?? null,
+        gone: savedRoot.querySelector("[data-saved-gone]")?.textContent ?? null,
+        rows: Array.from(savedRoot.querySelectorAll<HTMLElement>("[data-saved-row]")).map((el) => {
+          const button = el.querySelector<HTMLButtonElement>("[data-saved-resume]");
+          return {
+            id: el.dataset.savedRow ?? "",
+            title: el.querySelector("[data-saved-title]")?.textContent ?? "",
+            provider: el.querySelector("[data-saved-provider]")?.textContent ?? "",
+            workspace: el.querySelector("[data-saved-workspace]")?.textContent ?? "",
+            updated: el.querySelector("[data-saved-updated]")?.textContent ?? "",
+            state: el.dataset.state ?? "",
+            error: el.querySelector("[data-saved-error]")?.textContent ?? null,
+            button: button?.textContent?.trim() ?? "",
+            enabled: button?.disabled === false,
+          };
+        }),
+      }
+      : null;
     const rows: CrazeCreateProviderRow[] = Array.from(
       root?.querySelectorAll<HTMLElement>("[data-provider]") ?? [],
     ).map((el) => ({
@@ -200,6 +308,9 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
       cwd_problem: root?.querySelector("[data-cwd-problem]")?.textContent ?? null,
       create_enabled: primary?.disabled === false,
       primary: primary?.textContent?.trim() ?? "",
+      modes: { offered: modeButtons.length > 0, enabled: modeButtons.some((b) => !b.disabled) },
+      mode: root?.querySelector<HTMLElement>("[data-craze-half]")?.dataset.crazeHalf ?? "",
+      saved,
       rendered: renderedText("[data-craze-create]"),
     });
   }, [shape]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -209,16 +320,24 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
     <Scrim onClose={onClose} mark="craze-create">
       <DialogShell
         icon={Sparkles}
-        title="New craze session"
-        sub={`on ${machine} — a provider, a directory, and an optional first prompt`}
+        title={resuming ? "Resume a craze session" : "New craze session"}
+        sub={resuming
+          ? `on ${machine} — a saved session, running again`
+          : `on ${machine} — a provider, a directory, and an optional first prompt`}
         onClose={onClose}
         width={540}
         footer={
           <>
-            <button onClick={onClose} className={dialogBtnSecondary} title={submitting ? "The create keeps running; its session appears as a row" : undefined}>
-              {submitting ? "Close" : "Cancel"}
-            </button>
             <button
+              onClick={onClose}
+              className={dialogBtnSecondary}
+              title={submitting
+                ? "The create keeps running; its session appears as a row"
+                : locked ? "The resume keeps running; its session appears as a row" : undefined}
+            >
+              {locked ? "Close" : "Cancel"}
+            </button>
+            {!resuming && <button
               data-craze-create-primary
               onClick={() => onSubmit()}
               disabled={!canCreate}
@@ -231,34 +350,40 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
               }}
             >
               <Sparkles size={16} /> {primaryLabel(draft)}
-            </button>
+            </button>}
           </>
         }
       >
-        {note && (
+        {modesOffered && (
+          <div data-craze-modes>
+            <Segmented options={SHEET_MODES} value={resume.mode} set={(v) => choose(v as CrazeSheetMode)} disabled={locked} mark="craze-mode" />
+          </div>
+        )}
+        {sheetNote && (
           <div
             data-craze-note
             className="rounded-md px-3 py-2 text-[13px]"
             style={{ background: "var(--shed-inset)", color: "var(--shed-warn-fg)" }}
           >
-            {note}
+            {sheetNote}
           </div>
         )}
+        {resuming ? (
+          <div data-craze-half="resume" className="contents">
+            {retryHalf === "resume" && optionsFailure && (
+              <OptionsFailed what="craze could not read this machine's options" message={optionsFailure.message} onRetry={retryOptions} />
+            )}
+            <SavedList machine={machine} resume={resume} locked={locked} onResume={pressSaved} onRetryList={onRetryList} />
+          </div>
+        ) : (
+        <div data-craze-half="new" className="contents">
         <Field label="Provider">
           {load.phase === "loading" ? (
             <div className="flex items-center gap-2 px-1 py-2 text-[13px] text-shed-text-muted">
               <RotateCw size={14} className="animate-spin" /> reading what {machine} can start…
             </div>
-          ) : load.phase === "failed" ? (
-            <div className="flex items-center gap-3 px-1 py-2 text-[13px]" style={{ color: "var(--shed-danger)" }} data-options-error>
-              <span className="min-w-0 flex-1 break-words">craze could not list providers: {load.message}</span>
-              <button
-                onClick={() => setAttempt((a) => a + 1)}
-                className="hlink rounded-[8px] border border-shed-border px-3 py-1.5 text-[13px] font-semibold text-shed-text-secondary"
-              >
-                Retry
-              </button>
-            </div>
+          ) : retryHalf === "new" && optionsFailure ? (
+            <OptionsFailed what="craze could not list providers" message={optionsFailure.message} onRetry={retryOptions} />
           ) : (
             <div className="flex flex-col gap-1.5" role="radiogroup" aria-label="Provider">
               {providers.map((p) => {
@@ -405,8 +530,140 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
           </div>
         )}
         </div>
+        </div>
+        )}
       </DialogShell>
     </Scrim>
+  );
+}
+
+/** The sheet's Resume half (plan 032 §3.4): craze's saved sessions, newest
+ *  first — each its title (or "Untitled"), provider, workspace (the home
+ *  shortened to `~` where the app knows it) and age, with a Resume button.
+ *  Rendered from the shell's state by `crazeResume.ts`'s rules and read back
+ *  off this DOM for `craze_create.dump`; it holds no rule of its own. */
+function SavedList({ machine, resume, locked, onResume, onRetryList }: {
+  machine: string;
+  resume: CrazeResume;
+  /** A create submitting or a reopen running: the list's Retry waits. */
+  locked: boolean;
+  /** A row's button pressed — through `canResume`'s gate (the caller's). */
+  onResume: (id: string) => void;
+  onRetryList: () => void;
+}) {
+  const load = resume.load;
+  if (load.phase === "unloaded" || load.phase === "loading") {
+    return (
+      <div data-saved data-saved-state="loading" className="flex items-center gap-2 px-1 py-2 text-[13px] text-shed-text-muted">
+        <RotateCw size={14} className="animate-spin" /> reading the saved sessions on {machine}…
+      </div>
+    );
+  }
+  if (load.phase === "failed") {
+    return (
+      <div data-saved data-saved-state="failed" className="flex items-center gap-3 px-1 py-2 text-[13px]" style={{ color: "var(--shed-danger)" }}>
+        <span data-saved-list-error className="min-w-0 flex-1 break-words">craze could not list saved sessions: {load.refusal.message}</span>
+        <button
+          onClick={onRetryList}
+          disabled={locked}
+          className="hlink rounded-[8px] border border-shed-border px-3 py-1.5 text-[13px] font-semibold text-shed-text-secondary"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+  const now = Date.now();
+  return (
+    <div data-saved data-saved-state="ready" className="flex flex-col gap-1.5">
+      {resume.gone && (
+        <div data-saved-gone className="rounded-md px-3 py-2 text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}>
+          “{resume.gone.title}” cannot run here any more, so it was removed: {resume.gone.message}
+        </div>
+      )}
+      {load.sessions.length === 0 && (
+        <div data-saved-empty className="px-1 py-2 text-[13px] text-shed-text-muted">No saved sessions on {machine}.</div>
+      )}
+      {load.sessions.map((s) => {
+        const state = rowState(resume, s.id);
+        const running = state.phase === "resuming";
+        const enabled = canResume(resume, s.id);
+        const error = savedRowError(state);
+        return (
+          <div
+            key={s.id}
+            data-saved-row={s.id}
+            data-state={state.phase}
+            className="rounded-[9px] border px-3 py-2"
+            style={{
+              borderColor: running ? "var(--shed-accent)" : "var(--shed-border)",
+              background: running ? "var(--shed-accent-subtle)" : "var(--shed-surface)",
+            }}
+          >
+            <div className="flex items-center gap-3">
+              <div className="min-w-0 flex-1">
+                <div data-saved-title className="truncate text-[14px] font-semibold text-shed-text">{savedTitle(s)}</div>
+                <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[12px] text-shed-text-muted">
+                  <span data-saved-provider className="flex-none">{s.provider}</span>
+                  <span data-saved-workspace className="min-w-0 truncate font-mono" title={s.workspace}>
+                    {shortenHome(s.workspace, load.home)}
+                  </span>
+                  <span data-saved-updated className="flex-none">{relativeAge(s.updated_unix_ms, now)}</span>
+                </div>
+              </div>
+              <button
+                data-saved-resume
+                disabled={!enabled}
+                onClick={() => onResume(s.id)}
+                title={running ? RESUMING_LABEL : undefined}
+                className={cn("inline-flex max-w-[45%] flex-none items-center gap-1.5 rounded-[8px] px-3 py-1.5 text-left text-[13px] font-semibold", enabled && "hbtn")}
+                style={{
+                  background: enabled ? "var(--shed-accent)" : "var(--shed-inset)",
+                  color: enabled ? "var(--shed-accent-fg)" : "var(--shed-text-muted)",
+                  border: "none",
+                  cursor: enabled ? "pointer" : "default",
+                }}
+              >
+                {running && <RotateCw size={13} className="flex-none animate-spin" />}
+                {resumeLabel(state)}
+              </button>
+            </div>
+            {error && (error.where === "cause" ? (
+              <pre
+                data-saved-error
+                className="mt-1.5 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-md px-3 py-2 font-mono text-[12px]"
+                style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}
+              >
+                {error.text}
+              </pre>
+            ) : (
+              <div data-saved-error className="mt-1.5 text-[12px]" style={{ color: "var(--shed-danger)" }}>
+                {error.text}
+              </div>
+            ))}
+          </div>
+        );
+      })}
+      {load.more && <div data-saved-more className="px-1 text-[12px] text-shed-text-muted">{MORE_NOTE}</div>}
+    </div>
+  );
+}
+
+/** A failed create-options read, said with its Retry — in the half that
+ *  shows (`optionsRetryHalf`). The Retry is never disabled: a re-read touches
+ *  neither half's action, a reopen left running included. */
+function OptionsFailed({ what, message, onRetry }: { what: string; message: string; onRetry: () => void }) {
+  return (
+    <div className="flex items-center gap-3 px-1 py-2 text-[13px]" style={{ color: "var(--shed-danger)" }} data-options-error>
+      <span className="min-w-0 flex-1 break-words">{what}: {message}</span>
+      <button
+        data-options-retry
+        onClick={onRetry}
+        className="hlink rounded-[8px] border border-shed-border px-3 py-1.5 text-[13px] font-semibold text-shed-text-secondary"
+      >
+        Retry
+      </button>
+    </div>
   );
 }
 
