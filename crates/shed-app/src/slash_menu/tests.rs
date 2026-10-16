@@ -9,7 +9,7 @@
 use super::*;
 
 use serde_json::json;
-use shed_core::lane::LaneSlashRun;
+use shed_core::lane::{LaneModelEffort, LaneSetting, LaneSlashRun};
 
 // ---- builders ----
 
@@ -176,6 +176,112 @@ pub(crate) fn prompt(name: &str, source: LaneSlashSource) -> LaneSlashRow {
     )
 }
 
+/// craze 0.2.0's builtin `/effort` (fixture 30/31's row): a picker that
+/// requires the session's effort, an optional `<level>`, no `whileWorking`.
+pub(crate) fn effort() -> LaneSlashRow {
+    requiring(
+        row(
+            "effort",
+            LaneSlashSource::Builtin,
+            LaneSlashRun {
+                arg: LaneSlashArg::Optional,
+                arg_hint: Some("<level>".to_string()),
+                picker: Some(LaneSlashPicker::Effort),
+                ..run(LaneSlashKind::Picker)
+            },
+        ),
+        LaneSlashRequires::Effort,
+    )
+}
+
+fn choice(id: &str, name: &str) -> LaneChoice {
+    LaneChoice {
+        id: id.to_string(),
+        name: name.to_string(),
+        rank: None,
+        description: None,
+        effort: None,
+    }
+}
+
+/// A select option named by its id, its values `(id, name)`.
+fn select(id: &str, category: &str, current: &str, values: &[(&str, &str)]) -> LaneSetting {
+    LaneSetting {
+        id: id.to_string(),
+        name: id.to_string(),
+        category: category.to_string(),
+        current: current.to_string(),
+        values: values.iter().map(|(v, n)| choice(v, n)).collect(),
+    }
+}
+
+/// The permodel fake's grok-4.6 levels (cursor's capture).
+const GROK_LEVELS: [(&str, &str); 4] = [
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "Extra High"),
+];
+
+/// A session on `model` (none for `None`) whose options are `options`, its
+/// model list the current model alone.
+fn settings_on(model: Option<&str>, options: Vec<LaneSetting>) -> LaneSettings {
+    LaneSettings {
+        model: model.map(str::to_string),
+        models: model.map(|m| choice(m, m)).into_iter().collect(),
+        options,
+        ..LaneSettings::default()
+    }
+}
+
+/// The permodel fake's session on grok-4.6: its effort (`high`) and its fast
+/// toggle — an ACP session, so no effort facts.
+pub(crate) fn grok_46() -> LaneSettings {
+    settings_on(
+        Some("grok-4.6"),
+        vec![
+            select("effort", "thought_level", "high", &GROK_LEVELS),
+            select(
+                "fast",
+                "model_config",
+                "true",
+                &[("false", "Off"), ("true", "Fast")],
+            ),
+        ],
+    )
+}
+
+/// The same session moved to composer-2.5: fast alone, no effort.
+pub(crate) fn composer_25() -> LaneSettings {
+    settings_on(
+        Some("composer-2.5"),
+        vec![select(
+            "fast",
+            "model_config",
+            "false",
+            &[("false", "Off"), ("true", "Fast")],
+        )],
+    )
+}
+
+/// `settings` with effort facts on its current model: `default_effort` its
+/// default level.
+fn with_default(mut settings: LaneSettings, default_effort: &str) -> LaneSettings {
+    let current = settings.model.clone();
+    for m in settings
+        .models
+        .iter_mut()
+        .filter(|m| Some(&m.id) == current.as_ref())
+    {
+        m.effort = Some(LaneModelEffort {
+            efforts: vec!["low".into(), "high".into()],
+            default_effort: Some(default_effort.to_string()),
+            switch_effort: None,
+        });
+    }
+    settings
+}
+
 fn plugin(name: &str, plugin: &str) -> LaneSlashRow {
     LaneSlashRow {
         plugin: Some(plugin.to_string()),
@@ -294,11 +400,15 @@ fn dispatched(dispatch: SlashDispatch) -> Option<SlashAccept> {
 
 // ---- resolve ----
 
-/// One row alone against `caps`: its action when shown; when hidden, the
-/// reason `hidden` lists it with (`None` for a hidden non-builtin, which is
-/// not listed).
-fn verdict(r: LaneSlashRow, caps: &LaneCapabilities) -> Result<SlashAction, Option<String>> {
-    let menu = resolve(&LaneSlashCatalog { rows: vec![r] }, caps);
+/// One row alone against `caps` and `settings`: its action when shown; when
+/// hidden, the reason `hidden` lists it with (`None` for a hidden
+/// non-builtin, which is not listed).
+fn verdict(
+    r: LaneSlashRow,
+    caps: &LaneCapabilities,
+    settings: Option<&LaneSettings>,
+) -> Result<SlashAction, Option<String>> {
+    let menu = resolve(&LaneSlashCatalog { rows: vec![r] }, caps, settings);
     match (menu.rows.as_slice(), menu.hidden.as_slice()) {
         ([shown], []) => Ok(shown.action.clone()),
         ([], [h]) => Err(Some(h.reason.clone())),
@@ -616,7 +726,7 @@ fn every_catalog_row_resolves_per_the_table() {
         ),
     ];
     for (what, r, caps, want) in cases {
-        assert_eq!(verdict(r, caps), want, "{what}");
+        assert_eq!(verdict(r, caps, None), want, "{what}");
     }
 }
 
@@ -624,7 +734,7 @@ fn every_catalog_row_resolves_per_the_table() {
 /// their reasons, and the agent's `/btw` shown where the builtin is hidden.
 #[test]
 fn fixture_30_resolves_to_its_menu() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     assert_eq!(
         names(&menu),
         ["model", "rename", "plan", "agent", "exit", "research", "review", "btw", "deploy"]
@@ -653,7 +763,7 @@ fn fixture_30_resolves_to_its_menu() {
     assert_eq!(rename.description.as_deref(), Some("rename description"));
 
     // A cursor-like session: no stop. /exit hides and says why.
-    let menu = resolve(&fixture_30(), &no_stop());
+    let menu = resolve(&fixture_30(), &no_stop(), None);
     assert!(!names(&menu).contains(&"exit"));
     assert!(hidden(&menu).contains(&("exit", CANNOT_STOP)));
 }
@@ -672,13 +782,13 @@ fn a_requires_row_claims_no_name() {
             prompt("exit", LaneSlashSource::Agent),
         ],
     };
-    let menu = resolve(&catalog, &no_stop());
+    let menu = resolve(&catalog, &no_stop(), None);
     assert_eq!(names(&menu), ["btw", "exit"]);
     assert!(menu.rows.iter().all(|r| r.source == LaneSlashSource::Agent));
     assert!(menu.hidden.is_empty(), "{:?}", menu.hidden);
 
     // With stop, the builtin /exit shows and the agent's is the duplicate.
-    let menu = resolve(&catalog, &all_caps());
+    let menu = resolve(&catalog, &all_caps(), None);
     assert_eq!(names(&menu), ["exit", "btw"]);
     assert_eq!(menu.rows[0].action, SlashAction::Stop);
     assert_eq!(menu.rows[1].source, LaneSlashSource::Agent);
@@ -697,7 +807,7 @@ fn the_first_shown_row_of_a_name_wins_unicode_folded() {
             prompt("deploy", LaneSlashSource::Skill),
         ],
     };
-    let menu = resolve(&catalog, &all_caps());
+    let menu = resolve(&catalog, &all_caps(), None);
     assert_eq!(names(&menu), ["Ünïcode", "Deploy"]);
     assert!(menu.rows.iter().all(|r| r.source == LaneSlashSource::Agent));
     assert!(
@@ -718,7 +828,7 @@ fn hidden_lists_each_refused_name_once() {
             plugin("review", "pr-tools"),
         ],
     };
-    let menu = resolve(&catalog, &all_caps());
+    let menu = resolve(&catalog, &all_caps(), None);
     assert_eq!(names(&menu), ["review"]);
     assert_eq!(hidden(&menu), [("ask", "mode ask is not advertised")]);
 }
@@ -731,7 +841,7 @@ fn a_600_row_catalog_resolves_and_filters() {
             .map(|i| prompt(&format!("cmd{i:03}"), LaneSlashSource::Agent))
             .collect(),
     };
-    let menu = resolve(&catalog, &all_caps());
+    let menu = resolve(&catalog, &all_caps(), None);
     assert_eq!(menu.rows.len(), 600);
     assert_eq!(menu.rows[599].name, "cmd599");
     let all = filter(&menu, "/", 1, false);
@@ -751,7 +861,7 @@ fn a_600_row_catalog_resolves_and_filters() {
 /// A bare `/` lists every row, in menu order.
 #[test]
 fn a_bare_slash_lists_every_row() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     let f = filter(&menu, "/", 1, false);
     assert!(f.open);
     assert_eq!(f.token, "/");
@@ -773,7 +883,7 @@ fn matches_come_in_four_buckets() {
             prompt("other", LaneSlashSource::Agent),      // no match
         ],
     };
-    let menu = resolve(&catalog, &all_caps());
+    let menu = resolve(&catalog, &all_caps(), None);
     let want = ["Rename-all", "research", "lint", "prereq", "fmt"];
     assert_eq!(filtered(&filter(&menu, "/re", 3, false)), want);
     assert_eq!(filtered(&filter(&menu, "/RE", 3, false)), want);
@@ -788,7 +898,7 @@ fn matches_come_in_four_buckets() {
 /// panel is down.
 #[test]
 fn the_menu_opens_only_with_the_caret_in_the_first_token() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     let draft = "/re foo";
     for (caret, open) in [
         (0, false), // before the `/`
@@ -814,7 +924,7 @@ fn the_menu_opens_only_with_the_caret_in_the_first_token() {
 /// Only a one-line draft whose first character is `/` opens the menu.
 #[test]
 fn only_a_one_line_slash_draft_opens() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     for (draft, caret) in [
         ("re", 1),
         (" /re", 3),
@@ -834,7 +944,7 @@ fn only_a_one_line_slash_draft_opens() {
 /// No matching row, or no rows at all, is a closed menu — so Enter sends.
 #[test]
 fn no_match_is_a_closed_menu() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     let f = filter(&menu, "/zzz", 4, false);
     assert!(!f.open);
     assert!(f.rows.is_empty());
@@ -845,6 +955,7 @@ fn no_match_is_a_closed_menu() {
             rows: vec![local("help")],
         },
         &all_caps(),
+        None,
     );
     assert!(nothing.rows.is_empty());
     assert!(!filter(&nothing, "/", 1, false).open);
@@ -855,7 +966,7 @@ fn no_match_is_a_closed_menu() {
 /// queues).
 #[test]
 fn rows_that_wait_for_the_turn_are_dimmed_while_working() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     let dimmed = |working: bool| -> Vec<(String, bool)> {
         filter(&menu, "/", 1, working)
             .rows
@@ -901,7 +1012,7 @@ fn started(f: &SlashFilter) -> Started<'_> {
 /// row (`rename`, `exit`) counts as much as a prompt row, which queues.
 #[test]
 fn the_highlight_starts_on_the_first_row_that_is_not_dimmed() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     // Idle: nothing is dimmed, so the first row, `model`.
     assert_eq!(
         started(&filter(&menu, "/", 1, false)),
@@ -914,7 +1025,7 @@ fn the_highlight_starts_on_the_first_row_that_is_not_dimmed() {
     assert_eq!(started(&f), (1, Some("rename"), Some(false)));
 
     // Further down, and each kind of live row.
-    let catalog = |rows: Vec<LaneSlashRow>| resolve(&LaneSlashCatalog { rows }, &all_caps());
+    let catalog = |rows: Vec<LaneSlashRow>| resolve(&LaneSlashCatalog { rows }, &all_caps(), None);
     let cases: [(&str, Vec<LaneSlashRow>, Started); 3] = [
         (
             "a prompt row, which queues",
@@ -960,6 +1071,7 @@ fn every_row_dimmed_starts_on_the_first() {
             rows: vec![model(), mode("plan"), mode("agent")],
         },
         &all_caps(),
+        None,
     );
     let f = filter(&menu, "/", 1, true);
     assert!(f.open);
@@ -971,7 +1083,7 @@ fn every_row_dimmed_starts_on_the_first() {
 /// highlight.
 #[test]
 fn a_closed_filter_starts_at_zero() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     for (draft, caret) in [
         ("/zzz", 4),    // no match
         ("/re foo", 7), // the caret past the token
@@ -990,7 +1102,7 @@ fn a_closed_filter_starts_at_zero() {
 /// and a filter written before it existed reads as 0.
 #[test]
 fn the_start_survives_serde() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     let f = filter(&menu, "/", 1, true);
     assert_eq!(f.start, 1);
     let v = serde_json::to_value(&f).unwrap();
@@ -1010,6 +1122,7 @@ fn the_caret_counts_utf16_code_units() {
             rows: vec![prompt("😀go", LaneSlashSource::Agent)],
         },
         &all_caps(),
+        None,
     );
     // "/😀g x": the token "/😀g" is 1 + 2 + 1 = 4 units long.
     assert!(filter(&menu, "/😀g x", 4, false).open);
@@ -1024,7 +1137,7 @@ fn the_caret_counts_utf16_code_units() {
 /// carry a hidden builtin out as text, nor stop a real command from running.
 #[test]
 fn the_grammar_reads_the_draft_as_it_would_be_sent() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     for draft in [" /help", "/help\n", "  /help \r\n", "\n/help"] {
         assert!(
             matches!(dispatch(&menu, draft, false), SlashDispatch::Refuse { .. }),
@@ -1040,7 +1153,7 @@ fn the_grammar_reads_the_draft_as_it_would_be_sent() {
 /// What is NOT a command goes out as text, as it would without a menu.
 #[test]
 fn not_commands_are_sent_as_text() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     for draft in [
         "",
         "hello",
@@ -1063,6 +1176,7 @@ fn not_commands_are_sent_as_text() {
             rows: vec![local("")],
         },
         &all_caps(),
+        None,
     );
     assert_eq!(dispatch(&odd, "/", false), SlashDispatch::NotCommand);
 }
@@ -1071,7 +1185,7 @@ fn not_commands_are_sent_as_text() {
 /// rest, trimmed, literal — inner whitespace and quotes kept.
 #[test]
 fn the_argument_is_the_rest_trimmed_and_literal() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     assert_eq!(dispatch(&menu, "/rename   x  y ", false), title("x  y"));
     assert_eq!(dispatch(&menu, "/rename \"a b\"", false), title("\"a b\""));
     assert_eq!(
@@ -1095,7 +1209,7 @@ fn the_argument_is_the_rest_trimmed_and_literal() {
 /// Every action runs.
 #[test]
 fn each_action_dispatches() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     assert_eq!(
         dispatch(&menu, "/rename plan 029 live", false),
         title("plan 029 live")
@@ -1125,8 +1239,8 @@ fn each_action_dispatches() {
 /// **The guard** (P5): every refusal, each with its reason.
 #[test]
 fn the_guard_refuses_with_a_reason() {
-    let menu = resolve(&fixture_30(), &all_caps());
-    let cursor = resolve(&fixture_30(), &no_stop());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
+    let cursor = resolve(&fixture_30(), &no_stop(), None);
     let cases = [
         // A hidden builtin, typed: refused, never sent as text (E1: /help).
         (&menu, "/help", false, "/help: not available here yet"),
@@ -1170,7 +1284,7 @@ fn the_guard_refuses_with_a_reason() {
 /// While working, the `while_working` rows run and a prompt row queues.
 #[test]
 fn while_working_rows_run_and_prompts_queue() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     assert_eq!(dispatch(&menu, "/rename mid-turn", true), title("mid-turn"));
     assert_eq!(
         dispatch(&menu, "/exit", true),
@@ -1189,7 +1303,7 @@ fn while_working_rows_run_and_prompts_queue() {
 fn tokens_match_either_spelling_case_insensitively() {
     let mut catalog = fixture_31();
     catalog.rows.push(prompt("ünïcode", LaneSlashSource::Agent));
-    let menu = resolve(&catalog, &all_caps());
+    let menu = resolve(&catalog, &all_caps(), None);
     assert_eq!(dispatch(&menu, "/RENAME x", false), title("x"));
     assert_eq!(
         dispatch(&menu, "/Ünïcode q", false),
@@ -1226,7 +1340,7 @@ fn tokens_match_either_spelling_case_insensitively() {
 /// completes, taking in one space that followed and keeping the argument.
 #[test]
 fn enter_completes_a_row_not_yet_spelled() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     let enter = |draft: &str, row: &str| accept(&menu, draft, row, SlashAcceptKey::Enter, false);
     assert_eq!(enter("/re", "rename"), complete("/rename ", 8));
     assert_eq!(enter("/re foo", "rename"), complete("/rename foo", 8));
@@ -1239,7 +1353,7 @@ fn enter_completes_a_row_not_yet_spelled() {
 /// either spelling, case-insensitively (its `EqualFold`).
 #[test]
 fn enter_sends_a_row_already_spelled() {
-    let menu = resolve(&fixture_31(), &all_caps());
+    let menu = resolve(&fixture_31(), &all_caps(), None);
     let enter = |draft: &str, row: &str| accept(&menu, draft, row, SlashAcceptKey::Enter, false);
     assert_eq!(
         enter("/rename", "rename"),
@@ -1265,7 +1379,7 @@ fn enter_sends_a_row_already_spelled() {
 /// An argument suffix still gets its refusal.
 #[test]
 fn selecting_a_no_argument_row_runs_it() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     for key in [SlashAcceptKey::Enter, SlashAcceptKey::Pick] {
         let pick = |draft: &str, row: &str| accept(&menu, draft, row, key, false);
         assert_eq!(
@@ -1309,7 +1423,7 @@ fn selecting_a_no_argument_row_runs_it() {
 /// **Tab completes, never runs** — even a spelled row or a no-argument one.
 #[test]
 fn tab_only_completes() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     let tab = |draft: &str, row: &str| accept(&menu, draft, row, SlashAcceptKey::Tab, false);
     assert_eq!(tab("/ex", "exit"), complete("/exit ", 6));
     assert_eq!(tab("/rename", "rename"), complete("/rename ", 8));
@@ -1319,7 +1433,7 @@ fn tab_only_completes() {
 /// A pick on a row that takes an argument completes it, spelled or not.
 #[test]
 fn a_pick_completes_an_argument_row_even_when_spelled() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     assert_eq!(
         accept(&menu, "/rename", "rename", SlashAcceptKey::Pick, false),
         complete("/rename ", 8)
@@ -1333,7 +1447,7 @@ fn a_pick_completes_an_argument_row_even_when_spelled() {
 /// The qualified spelling is written only when the typed token holds a `:`.
 #[test]
 fn completion_writes_the_qualified_spelling_after_a_colon() {
-    let menu = resolve(&fixture_31(), &all_caps());
+    let menu = resolve(&fixture_31(), &all_caps(), None);
     assert_eq!(
         accept(&menu, "/pr:", "review", SlashAcceptKey::Enter, false),
         complete("/pr-tools:review ", 17)
@@ -1363,6 +1477,7 @@ fn a_completion_caret_counts_utf16_code_units() {
             rows: vec![prompt("😀go", LaneSlashSource::Agent)],
         },
         &all_caps(),
+        None,
     );
     assert_eq!(
         accept(&menu, "/😀", "😀go", SlashAcceptKey::Tab, false),
@@ -1380,7 +1495,7 @@ fn a_completion_caret_counts_utf16_code_units() {
 fn a_dimmed_row_that_takes_an_argument_selects_to_its_refusal() {
     let mut rename = rename();
     rename.while_working = false;
-    let menu = resolve(&LaneSlashCatalog { rows: vec![rename] }, &all_caps());
+    let menu = resolve(&LaneSlashCatalog { rows: vec![rename] }, &all_caps(), None);
     let after = || dispatched(refused("/rename: runs after this turn"));
     for key in [SlashAcceptKey::Pick, SlashAcceptKey::Enter] {
         assert_eq!(
@@ -1418,7 +1533,7 @@ fn a_dimmed_row_that_takes_an_argument_selects_to_its_refusal() {
 
 #[test]
 fn accept_answers_none_when_there_is_nothing_to_accept() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     assert_eq!(
         accept(&menu, "/re", "nosuch", SlashAcceptKey::Enter, false),
         None
@@ -1465,7 +1580,7 @@ fn working_is_working_or_needs_approval() {
 /// omitted — and every type reads back what it wrote.
 #[test]
 fn the_json_is_snake_case_and_round_trips() {
-    let menu = resolve(&fixture_30(), &all_caps());
+    let menu = resolve(&fixture_30(), &all_caps(), None);
     let rename = serde_json::to_value(&menu.rows[1]).unwrap();
     assert_eq!(
         rename,
@@ -1547,4 +1662,683 @@ fn the_json_is_snake_case_and_round_trips() {
 
     let back: SlashMenu = serde_json::from_value(serde_json::to_value(&menu).unwrap()).unwrap();
     assert_eq!(back, menu);
+}
+
+// ---- /effort (plan 032 §3.2) ----
+
+/// The effort picker [`resolve`] builds for `settings`' effort option on its
+/// current model, which has no effort facts (so no default level).
+fn picker_for(settings: &LaneSettings) -> SlashAction {
+    let option = settings.effort_option().expect("an effort option");
+    SlashAction::EffortPicker {
+        option: option.id.clone(),
+        for_model: settings.model.clone().expect("a current model"),
+        levels: option.values.clone(),
+        default_level: None,
+    }
+}
+
+/// `/effort` set to `value`, bound to `model`, on the option `id`.
+fn set_effort(id: &str, value: &str, model: &str) -> SlashDispatch {
+    run_action(SlashAction::SetEffort {
+        change: LaneSettingChange::Config {
+            id: id.to_string(),
+            value: value.to_string(),
+            for_model: Some(model.to_string()),
+        },
+    })
+}
+
+/// **`requires: effort` is the session's effort, not a capability** (plan
+/// 032 §3.2, PC9): the row shows only with a current model AND an effort
+/// option (craze's `EffortOption` — glm-5.2's `reasoning` counts), hidden
+/// otherwise with its reason; the picker itself needs `caps.settings`.
+#[test]
+fn the_effort_row_follows_the_current_models_effort() {
+    let caps = all_caps();
+    let no_settings = LaneCapabilities {
+        settings: false,
+        ..all_caps()
+    };
+    let no_effort = Err(Some(NO_EFFORT.to_string()));
+    let grok = grok_46();
+    let composer = composer_25();
+    let glm = settings_on(
+        Some("glm-5.2"),
+        vec![select(
+            "reasoning",
+            "thought_level",
+            "high",
+            &[("high", "High"), ("max", "Max")],
+        )],
+    );
+    let no_model = LaneSettings {
+        model: None,
+        ..grok_46()
+    };
+    let empty_model = LaneSettings {
+        model: Some(String::new()),
+        ..grok_46()
+    };
+    let bare_picker = row(
+        "effort",
+        LaneSlashSource::Builtin,
+        LaneSlashRun {
+            picker: Some(LaneSlashPicker::Effort),
+            ..run(LaneSlashKind::Picker)
+        },
+    );
+    let cases: Vec<(
+        &str,
+        LaneSlashRow,
+        &LaneCapabilities,
+        Option<&LaneSettings>,
+        _,
+    )> = vec![
+        (
+            "grok-4.6",
+            effort(),
+            &caps,
+            Some(&grok),
+            Ok(picker_for(&grok)),
+        ),
+        (
+            "glm-5.2's reasoning",
+            effort(),
+            &caps,
+            Some(&glm),
+            Ok(picker_for(&glm)),
+        ),
+        (
+            "composer-2.5: no effort option",
+            effort(),
+            &caps,
+            Some(&composer),
+            no_effort.clone(),
+        ),
+        (
+            "no settings at all",
+            effort(),
+            &caps,
+            None,
+            no_effort.clone(),
+        ),
+        (
+            "no current model",
+            effort(),
+            &caps,
+            Some(&no_model),
+            no_effort.clone(),
+        ),
+        (
+            "an empty current model",
+            effort(),
+            &caps,
+            Some(&empty_model),
+            no_effort.clone(),
+        ),
+        (
+            "the picker without `settings`",
+            effort(),
+            &no_settings,
+            Some(&grok),
+            Err(Some(NOT_ADVERTISED.to_string())),
+        ),
+        (
+            "an effort picker with no requires",
+            bare_picker.clone(),
+            &caps,
+            Some(&grok),
+            Ok(picker_for(&grok)),
+        ),
+        (
+            "an effort picker with no requires, no effort",
+            bare_picker,
+            &caps,
+            Some(&composer),
+            no_effort.clone(),
+        ),
+        (
+            "a prompt row requiring effort",
+            requiring(
+                prompt("think", LaneSlashSource::Builtin),
+                LaneSlashRequires::Effort,
+            ),
+            &caps,
+            Some(&grok),
+            Ok(SlashAction::Prompt),
+        ),
+        (
+            "a prompt row requiring effort, no effort",
+            requiring(
+                prompt("think", LaneSlashSource::Builtin),
+                LaneSlashRequires::Effort,
+            ),
+            &caps,
+            Some(&composer),
+            no_effort,
+        ),
+        (
+            "an agent's row requiring effort, no effort: hidden, not listed",
+            requiring(
+                prompt("think", LaneSlashSource::Agent),
+                LaneSlashRequires::Effort,
+            ),
+            &caps,
+            None,
+            Err(None),
+        ),
+    ];
+    for (what, r, caps, settings, want) in cases {
+        assert_eq!(verdict(r, caps, settings), want, "{what}");
+    }
+}
+
+/// **The default level is the current model's own, and only one the option
+/// offers** (plan 032 §3.2, PC9): its effort facts' `default_effort`; none
+/// without facts, for another model's facts, or for a default the option
+/// does not offer.
+#[test]
+fn the_default_level_is_the_current_models_offered_default() {
+    let default_of = |settings: LaneSettings| match verdict(effort(), &all_caps(), Some(&settings))
+    {
+        Ok(SlashAction::EffortPicker { default_level, .. }) => default_level,
+        other => panic!("not a picker: {other:?}"),
+    };
+    assert_eq!(
+        default_of(with_default(grok_46(), "high")).as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        default_of(grok_46()),
+        None,
+        "no effort facts (an ACP session)"
+    );
+    assert_eq!(
+        default_of(with_default(grok_46(), "max")),
+        None,
+        "a default the effort option does not offer"
+    );
+    let mut elsewhere = with_default(grok_46(), "high");
+    elsewhere.models[0].id = "other".into();
+    elsewhere.models.insert(0, choice("grok-4.6", "Grok 4.6"));
+    assert_eq!(default_of(elsewhere), None, "another model's facts");
+    let mut no_default = with_default(grok_46(), "high");
+    if let Some(e) = no_default.models[0].effort.as_mut() {
+        e.default_effort = None;
+    }
+    assert_eq!(default_of(no_default), None, "facts with no default");
+}
+
+/// **A hidden `/effort` claims no name** (P:2123): on a model with no effort
+/// option the agent's own `/effort` after the builtin is the one shown —
+/// typed, it goes out as a prompt — and the builtin is not refused; with an
+/// effort option the builtin wins the name. Alone and hidden, the builtin is
+/// refused with its reason, a level or not.
+#[test]
+fn an_agents_effort_answers_while_the_builtin_is_hidden() {
+    let catalog = LaneSlashCatalog {
+        rows: vec![effort(), prompt("effort", LaneSlashSource::Agent)],
+    };
+    let menu = resolve(&catalog, &all_caps(), Some(&composer_25()));
+    assert_eq!(names(&menu), ["effort"]);
+    assert_eq!(
+        (menu.rows[0].source.clone(), menu.rows[0].action.clone()),
+        (LaneSlashSource::Agent, SlashAction::Prompt)
+    );
+    assert!(menu.hidden.is_empty(), "{:?}", menu.hidden);
+    assert_eq!(
+        dispatch(&menu, "/effort low", false),
+        prompt_text("/effort low")
+    );
+
+    let menu = resolve(&catalog, &all_caps(), Some(&grok_46()));
+    assert_eq!(names(&menu), ["effort"]);
+    assert_eq!(menu.rows[0].source, LaneSlashSource::Builtin);
+    assert_eq!(
+        dispatch(&menu, "/effort low", false),
+        set_effort("effort", "low", "grok-4.6")
+    );
+
+    let alone = resolve(
+        &LaneSlashCatalog {
+            rows: vec![effort()],
+        },
+        &all_caps(),
+        Some(&composer_25()),
+    );
+    assert_eq!(hidden(&alone), [("effort", NO_EFFORT)]);
+    for draft in ["/effort", "/effort low", "/EFFORT"] {
+        assert_eq!(
+            dispatch(&alone, draft, false),
+            refused("/effort: the current model has no effort setting"),
+            "{draft}"
+        );
+    }
+}
+
+/// **`/effort` bare runs the picker; `/effort <level>` sets it** (plan 032
+/// §3.2, PC8): a level matched by craze's `MatchEffortValue` — its id
+/// exactly, then in any case, then its name (trimmed) in any case — is ONE
+/// `SetEffort`, a `Config` change bound to the current model, sent even when
+/// it is the current level; anything else is refused with craze's text, the
+/// list folded through `DisplayLine`.
+#[test]
+fn effort_runs_the_picker_bare_and_sets_a_level_inline() {
+    let grok = grok_46();
+    let menu = resolve(
+        &LaneSlashCatalog {
+            rows: vec![effort(), exit()],
+        },
+        &all_caps(),
+        Some(&grok),
+    );
+    let picker = run_action(picker_for(&grok));
+    let all = "one of low, medium, high, xhigh";
+    let cases = [
+        ("/effort", picker.clone()),
+        ("/effort   ", picker.clone()),
+        ("/Effort", picker),
+        ("/effort low", set_effort("effort", "low", "grok-4.6")),
+        ("/EFFORT low", set_effort("effort", "low", "grok-4.6")),
+        (
+            "/effort high",
+            set_effort("effort", "high", "grok-4.6"), // the current level: still sent
+        ),
+        ("/effort LOW", set_effort("effort", "low", "grok-4.6")),
+        ("/effort  xHigh ", set_effort("effort", "xhigh", "grok-4.6")),
+        (
+            "/effort Extra High",
+            set_effort("effort", "xhigh", "grok-4.6"),
+        ),
+        (
+            "/effort extra high",
+            set_effort("effort", "xhigh", "grok-4.6"),
+        ),
+        ("/effort bogus", refused(&format!("no effort bogus: {all}"))),
+        (
+            "/effort \u{1b}[31mbogus\u{1b}[0m", // the escapes go whole
+            refused(&format!("no effort bogus: {all}")),
+        ),
+        (
+            "/effort extra   high",
+            refused(&format!("no effort extra high: {all}")),
+        ),
+        (
+            "/effort default",
+            refused(&format!("no effort default: {all}")),
+        ),
+    ];
+    for (draft, want) in cases {
+        assert_eq!(dispatch(&menu, draft, false), want, "{draft:?}");
+    }
+}
+
+/// **The first rule that matches anything decides, and must match one**
+/// (craze's `effortValue`): an exact id wins over a case-insensitive one
+/// and over a name; a rule matching two levels is refused, never handed to a
+/// looser rule; a level's name is matched trimmed (PC14j).
+#[test]
+fn an_exact_id_wins_and_an_ambiguous_rule_is_refused() {
+    let case = |levels: &[(&str, &str)], typed: &str, want: SlashDispatch| {
+        let menu = resolve(
+            &LaneSlashCatalog {
+                rows: vec![effort()],
+            },
+            &all_caps(),
+            Some(&settings_on(
+                Some("m"),
+                vec![select("effort", "x", levels[0].0, levels)],
+            )),
+        );
+        assert_eq!(
+            dispatch(&menu, &format!("/effort {typed}"), false),
+            want,
+            "{levels:?} {typed:?}"
+        );
+    };
+    let high = [("high", "High"), ("HIGH", "Highest")];
+    case(&high, "high", set_effort("effort", "high", "m"));
+    case(&high, "HIGH", set_effort("effort", "HIGH", "m"));
+    case(&high, "High", refused("no effort High: one of high, HIGH"));
+    case(
+        &[("a", "Fast"), ("b", "fast")],
+        "FAST",
+        refused("no effort FAST: one of a, b"),
+    );
+    case(
+        &[("lo", "low"), ("low", "Lowest")],
+        "low",
+        set_effort("effort", "low", "m"),
+    );
+    case(
+        &[("lo", "low"), ("LOW", "Lowest")],
+        "low",
+        set_effort("effort", "LOW", "m"),
+    );
+    case(
+        &[("x", "  Max  "), ("y", "Min")],
+        "max",
+        set_effort("effort", "x", "m"),
+    );
+
+    // "In any case" is Go's `EqualFold` — Unicode simple case folding —
+    // not a lowercase: `Σ` is `σ` AND `ς`, so it is ambiguous by id and by
+    // name alike, while each spelled exactly is still its own level.
+    let sigmas = [("σ", "Sigma"), ("ς", "Final sigma")];
+    case(&sigmas, "Σ", refused("no effort Σ: one of σ, ς"));
+    case(&sigmas, "σ", set_effort("effort", "σ", "m"));
+    case(&sigmas, "ς", set_effort("effort", "ς", "m"));
+    case(
+        &[("a", "σ"), ("b", "ς")],
+        "Σ",
+        refused("no effort Σ: one of a, b"),
+    );
+    // The fold classes beyond ASCII (the Kelvin sign is a `k`, the long s
+    // an `s`), none for a full-folding expansion (`ß` is not `ss`) or the
+    // Turkic-only `ı`.
+    case(
+        &[("kelvin", "K"), ("fast", "F")],
+        "\u{212a}ELVIN",
+        set_effort("effort", "kelvin", "m"),
+    );
+    case(
+        &[("kelvin", "K"), ("fast", "F")],
+        "FA\u{17f}T",
+        set_effort("effort", "fast", "m"),
+    );
+    case(
+        &[("maß", "Maß")],
+        "MASS",
+        refused("no effort MASS: one of maß"),
+    );
+    case(&[("i", "I")], "ı", refused("no effort ı: one of i"));
+}
+
+/// **`eq_fold` is Go's `strings.EqualFold`** — the fold classes of Go's
+/// `unicode.SimpleFold` (plan 032 C2 review): ASCII case-insensitive, the
+/// whole Greek sigma class, the Kelvin sign and long s with their ASCII
+/// letters, titlecase digraphs with their pairs; never a full-folding
+/// expansion, never `ı` with `i`, and the same number of characters.
+#[test]
+fn eq_fold_is_gos_equal_fold() {
+    for (a, b, want) in [
+        ("", "", true),
+        ("low", "LOW", true),
+        ("xHigh", "XHIGH", true),
+        ("low", "lo", false),
+        ("low", "lowe", false),
+        ("default", "DEFAULT", true),
+        ("Σ", "σ", true),
+        ("Σ", "ς", true),
+        ("σ", "ς", true),
+        ("\u{212a}", "k", true),
+        ("\u{212a}", "K", true),
+        ("\u{17f}", "S", true),
+        ("\u{b5}", "\u{3bc}", true),  // micro sign, mu
+        ("\u{3d1}", "\u{3f4}", true), // theta symbol, capital theta symbol
+        ("\u{1c5}", "\u{1c6}", true), // titlecase and lowercase dz caron
+        ("\u{1c4}", "\u{1c5}", true),
+        ("ß", "\u{1e9e}", true), // capital sharp s
+        ("ß", "ss", false),
+        ("ı", "i", false),
+        ("ı", "I", false),
+        ("\u{130}", "i", false), // capital I with dot
+        ("ÉLAN", "élan", true),
+        ("a", "b", false),
+    ] {
+        assert_eq!(eq_fold(a, b), want, "{a:?} {b:?}");
+        assert_eq!(eq_fold(b, a), want, "{b:?} {a:?}");
+    }
+}
+
+/// **`default` is reserved** (craze's F2): in any case it is the current
+/// model's default level, refused without one — even where a level is
+/// spelled `default`, which a refusal for the reserved word then leaves out
+/// of its list (and lists for any other word). With a default, every
+/// refusal offers `default` first.
+#[test]
+fn default_is_reserved_for_the_models_default_level() {
+    let catalog = LaneSlashCatalog {
+        rows: vec![effort()],
+    };
+    let facts = resolve(
+        &catalog,
+        &all_caps(),
+        Some(&with_default(grok_46(), "high")),
+    );
+    for draft in ["/effort default", "/effort DEFAULT", "/effort  Default "] {
+        assert_eq!(
+            dispatch(&facts, draft, false),
+            set_effort("effort", "high", "grok-4.6"),
+            "{draft:?}"
+        );
+    }
+    assert_eq!(
+        dispatch(&facts, "/effort bogus", false),
+        refused("no effort bogus: one of default, low, medium, high, xhigh")
+    );
+    let unoffered = resolve(&catalog, &all_caps(), Some(&with_default(grok_46(), "max")));
+    assert_eq!(
+        dispatch(&unoffered, "/effort default", false),
+        refused("no effort default: one of low, medium, high, xhigh"),
+        "a default the option does not offer is none"
+    );
+
+    let spelled = |facts: Option<&str>| {
+        let s = settings_on(
+            Some("m"),
+            vec![select(
+                "effort",
+                "x",
+                "low",
+                &[("default", "Default"), ("low", "Low")],
+            )],
+        );
+        let s = match facts {
+            Some(d) => with_default(s, d),
+            None => s,
+        };
+        resolve(&catalog, &all_caps(), Some(&s))
+    };
+    assert_eq!(
+        dispatch(&spelled(None), "/effort default", false),
+        refused("no effort default: one of low"),
+        "the reserved word never reaches the level spelled `default`"
+    );
+    assert_eq!(
+        dispatch(&spelled(None), "/effort bogus", false),
+        refused("no effort bogus: one of default, low"),
+        "listed for any other word"
+    );
+    assert_eq!(
+        dispatch(&spelled(Some("low")), "/effort default", false),
+        set_effort("effort", "low", "m"),
+        "`default` is the model's default level, not the level of that name"
+    );
+}
+
+/// **Mid-turn `/effort` waits for the turn, its argument judged first**
+/// (plan 032 §3.2): the builtin row has no `whileWorking`, so it is dimmed
+/// and a bare or valid `/effort` is refused "runs after this turn" — but a
+/// level that names nothing is refused for THAT.
+#[test]
+fn effort_waits_for_the_turn_after_its_argument_is_judged() {
+    let menu = resolve(
+        &LaneSlashCatalog {
+            rows: vec![effort(), rename()],
+        },
+        &all_caps(),
+        Some(&grok_46()),
+    );
+    let after = refused("/effort: runs after this turn");
+    assert_eq!(dispatch(&menu, "/effort", true), after);
+    assert_eq!(dispatch(&menu, "/effort low", true), after);
+    assert_eq!(
+        dispatch(&menu, "/effort bogus", true),
+        refused("no effort bogus: one of low, medium, high, xhigh")
+    );
+    assert_eq!(
+        dispatch(&menu, "/effort default", true),
+        refused("no effort default: one of low, medium, high, xhigh")
+    );
+    let f = filter(&menu, "/", 1, true);
+    assert_eq!(
+        f.rows
+            .iter()
+            .map(|r| (r.row.name.as_str(), r.dimmed))
+            .collect::<Vec<_>>(),
+        [("effort", true), ("rename", false)]
+    );
+    assert_eq!(f.start, 1, "the highlight starts past the dimmed /effort");
+}
+
+/// **Pick, Enter and Tab on `/effort`** (PC8): the picker takes no argument
+/// here, so a pick or Enter RUNS the completed draft — bare, the picker;
+/// with a level, that level (or its refusal) — Enter on a spelled token
+/// dispatches the draft as it stands, and Tab only completes. Mid-turn a
+/// pick or Enter on a bare `/effort` refuses for the turn; with an argument
+/// they keep dispatch's order (§3.2) — a level that names nothing is refused
+/// for THAT, a valid one for the turn — and Tab still completes.
+#[test]
+fn accepting_effort_runs_the_completed_draft() {
+    let grok = grok_46();
+    let menu = resolve(
+        &LaneSlashCatalog {
+            rows: vec![model(), effort()],
+        },
+        &all_caps(),
+        Some(&grok),
+    );
+    let picker = dispatched(run_action(picker_for(&grok)));
+    let low = dispatched(set_effort("effort", "low", "grok-4.6"));
+    let accept_with = |draft: &str, key: SlashAcceptKey, working: bool| {
+        accept(&menu, draft, "effort", key, working)
+    };
+    for key in [SlashAcceptKey::Pick, SlashAcceptKey::Enter] {
+        assert_eq!(accept_with("/ef", key, false), picker, "{key:?}");
+        assert_eq!(accept_with("/", key, false), picker, "{key:?}");
+        assert_eq!(accept_with("/ef low", key, false), low, "{key:?}");
+        assert_eq!(accept_with("/EF  low", key, false), low, "{key:?}");
+        assert_eq!(
+            accept_with("/ef bogus", key, false),
+            dispatched(refused("no effort bogus: one of low, medium, high, xhigh")),
+            "{key:?}"
+        );
+        let after = dispatched(refused("/effort: runs after this turn"));
+        let bogus = dispatched(refused("no effort bogus: one of low, medium, high, xhigh"));
+        assert_eq!(accept_with("/ef low", key, true), after, "{key:?}");
+        assert_eq!(accept_with("/effort low", key, true), after, "{key:?}");
+        assert_eq!(accept_with("/ef", key, true), after, "{key:?} bare");
+        assert_eq!(accept_with("/ef   ", key, true), after, "{key:?} blank");
+        assert_eq!(accept_with("/ef bogus", key, true), bogus, "{key:?}");
+        assert_eq!(accept_with("/effort bogus", key, true), bogus, "{key:?}");
+        assert_eq!(
+            accept_with("/ef default", key, true),
+            dispatched(refused(
+                "no effort default: one of low, medium, high, xhigh"
+            )),
+            "{key:?}: no default level"
+        );
+    }
+    assert_eq!(accept_with("/effort", SlashAcceptKey::Enter, false), picker);
+    assert_eq!(
+        accept_with("/effort low", SlashAcceptKey::Enter, false),
+        low
+    );
+    assert_eq!(
+        accept_with("/ef", SlashAcceptKey::Tab, false),
+        complete("/effort ", 8)
+    );
+    assert_eq!(
+        accept_with("/ef low", SlashAcceptKey::Tab, false),
+        complete("/effort low", 8)
+    );
+    assert_eq!(
+        accept_with("/effort", SlashAcceptKey::Tab, true),
+        complete("/effort ", 8)
+    );
+}
+
+/// `display_line` is craze's `DisplayLine` exactly: escape sequences go WHOLE
+/// (CSI, OSC to BEL or ST, an escape before a character), then controls (a
+/// newline, carriage return or tab first read as a space), then whitespace
+/// runs collapse — and a clean ASCII line comes back as it was. Every `want`
+/// here is what craze v0.2.0's own `DisplayLine` answered for the input (and
+/// the port agreed with it on 200,000 random strings heavy in escape bytes,
+/// plan 032 C2 review), its byte-level edges included: a C1 CSI spelled in
+/// UTF-8 is a control character, not a sequence, and an OSC ended inside a
+/// character leaves a stray byte that reads as `U+FFFD`.
+#[test]
+fn display_line_folds_a_word_onto_one_clean_line() {
+    for (raw, want) in [
+        ("", ""),
+        ("low", "low"),
+        ("x-high", "x-high"),
+        ("  extra   high ", "extra high"),
+        ("a\tb\nc\rd", "a b c d"),
+        ("a\u{0b}b\u{85}c", "abc"),
+        ("non\u{a0}breaking", "non breaking"),
+        ("très  haut", "très haut"),
+        ("\u{1b}[31mred", "red"),
+        ("\u{1b}[31mbogus\u{1b}[0m", "bogus"),
+        ("\u{1b}]0;title\u{07}x", "x"),
+        ("\u{1b}]8;;http://x\u{1b}\\link", "link"),
+        ("\u{1b}é", "é"),
+        ("low\u{1b}", "low"),
+        ("\u{9b}31mz", "31mz"),
+        ("\u{1b}]\u{e700}x", "\u{fffd}x"),
+    ] {
+        assert_eq!(display_line(raw), want, "{raw:?}");
+    }
+}
+
+/// **The effort actions' JSON** — what the desktop hands back to the
+/// `lane_slash_*` commands and the phone mirrors: the picker with its option,
+/// model, levels and (when there is one) default level; the level a
+/// `Config` change bound to the model.
+#[test]
+fn the_effort_actions_json_round_trips() {
+    let grok = with_default(grok_46(), "high");
+    let menu = resolve(
+        &LaneSlashCatalog {
+            rows: vec![effort()],
+        },
+        &all_caps(),
+        Some(&grok),
+    );
+    let row = serde_json::to_value(&menu.rows[0]).unwrap();
+    assert_eq!(
+        row,
+        json!({
+            "name": "effort", "description": "effort description", "source": "builtin",
+            "arg": "optional", "arg_hint": "<level>", "while_working": false,
+            "action": {"kind": "effort_picker", "option": "effort", "for_model": "grok-4.6",
+                       "levels": [{"id": "low", "name": "Low"}, {"id": "medium", "name": "Medium"},
+                                  {"id": "high", "name": "High"}, {"id": "xhigh", "name": "Extra High"}],
+                       "default_level": "high"},
+        })
+    );
+    let no_default = picker_for(&grok_46());
+    assert!(serde_json::to_value(&no_default)
+        .unwrap()
+        .get("default_level")
+        .is_none());
+    let set = dispatch(&menu, "/effort low", false);
+    assert_eq!(
+        serde_json::to_value(&set).unwrap(),
+        json!({"kind": "run", "action": {"kind": "set_effort", "change": {
+            "kind": "config", "id": "effort", "value": "low", "for_model": "grok-4.6"}}})
+    );
+    assert_eq!(
+        serde_json::from_value::<SlashDispatch>(serde_json::to_value(&set).unwrap()).unwrap(),
+        set
+    );
+    let back: SlashMenu = serde_json::from_value(serde_json::to_value(&menu).unwrap()).unwrap();
+    assert_eq!(back, menu);
+    assert_eq!(
+        dispatch(&back, "/effort default", false),
+        set_effort("effort", "high", "grok-4.6"),
+        "the menu that crossed the bridge dispatches as the one that did not"
+    );
 }

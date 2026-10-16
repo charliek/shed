@@ -27,6 +27,16 @@ export type CrazeCreateOptions = {
   providers: CrazeProvider[];
   default_provider?: string | null;
   recent_dirs: string[];
+  /** The hub can list saved sessions and reopen one (plan 032 §3.4, PC11) —
+   *  read from the SAME hub `hello` these options came from, so a dormant
+   *  machine's sheet, whose hub the sheet itself started, still knows. What
+   *  the sheet's `New | Resume` control is shown on (`crazeResume.ts`). */
+  reopen?: boolean;
+  /** NOT craze's: the reply's `source_gen` — the incarnation of the
+   *  machine's craze source these options came through (plan 032 §3.4),
+   *  which the shell binds the sheet's Resume state to (`crazeResume.ts`'s
+   *  `observeSource`). */
+  source_gen?: number | null;
 };
 
 /** **Only a ready provider is selectable** (D5: dim, not hide — and a dimmed
@@ -269,6 +279,10 @@ export type CrazeStatusLike = {
   create_options?: boolean | null;
   /** The live hub can name a session at create (plan 029 P10). */
   create_title?: boolean | null;
+  /** The machine's INCARNATION — its craze source's generation, `null` with
+   *  no source — which the shell binds the sheet's Resume state to on every
+   *  status (`crazeResume.ts`'s `observeSources`, C5 re-review). */
+  source_gen?: number | null;
 } | null | undefined;
 
 /** **Whether a machine offers "New craze session"** — its craze is LIVE and

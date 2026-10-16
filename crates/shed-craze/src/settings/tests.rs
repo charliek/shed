@@ -8,6 +8,7 @@ fn model(id: &str, recent: Option<u32>) -> CatalogModel {
         id: id.into(),
         name: id.to_uppercase(),
         recent,
+        ..CatalogModel::default()
     }
 }
 
@@ -234,4 +235,65 @@ fn modes_are_hidden_when_the_capabilities_offer_none() {
     assert!(s.lane_settings().modes.is_empty(), "hidden, not listed");
     assert!(!s.has_any(), "modes it cannot switch are nothing to show");
     assert!(!s.apply_info(&info(false)), "the same document again");
+}
+
+/// **A model's effort facts become `LaneChoice::effort`** (plan 032 §3.3):
+/// in craze's model order; `None` for a model that lists no levels (an
+/// effort-less native model, every ACP model, an older host's), an empty
+/// default or switch level read as absent — and a mode or an option value
+/// never carries any. A catalog section's facts replace the list's under the
+/// revision rule, as any of its members do.
+#[test]
+fn a_models_effort_facts_are_projected_onto_its_choice() {
+    let mut s = SettingsState::new();
+    s.apply_catalogs(&catalogs(json!({"models": [
+        {"id": "muse", "name": "Muse", "recent": 1,
+         "efforts": ["minimal", "low", "high"], "defaultEffort": "high", "switchEffort": "low"},
+        {"id": "plain", "name": "Plain"},
+        {"id": "sparse", "name": "Sparse", "efforts": ["low"], "defaultEffort": ""},
+        {"id": "empty", "name": "Empty", "efforts": [], "defaultEffort": "high"}
+    ], "modes": [{"id": "agent", "name": "Agent"}]})));
+    s.apply_sections(&SettingsSections::from_value(&json!({"model": "plain",
+        "config": {"options": [{"id": "effort", "category": "thought_level", "current": "low",
+            "selectValues": [{"value": "low", "name": "Low"}]}]}})));
+    let l = s.lane_settings();
+    let facts: Vec<(&str, Option<&LaneModelEffort>)> = l
+        .models
+        .iter()
+        .map(|m| (m.id.as_str(), m.effort.as_ref()))
+        .collect();
+    let muse = LaneModelEffort {
+        efforts: vec!["minimal".into(), "low".into(), "high".into()],
+        default_effort: Some("high".into()),
+        switch_effort: Some("low".into()),
+    };
+    let sparse = LaneModelEffort {
+        efforts: vec!["low".into()],
+        ..LaneModelEffort::default()
+    };
+    assert_eq!(
+        facts,
+        [
+            ("plain", None),
+            ("muse", Some(&muse)),
+            ("sparse", Some(&sparse)),
+            ("empty", None)
+        ],
+        "the current model first, then the ranked, then the rest"
+    );
+    assert!(l.modes.iter().all(|m| m.effort.is_none()));
+    assert!(l.options[0].values.iter().all(|v| v.effort.is_none()));
+
+    assert!(
+        s.apply_sections(&SettingsSections::from_value(&json!({"catalog": {
+        "revision": 1, "models": [{"id": "muse", "name": "Muse", "efforts": ["low", "high"],
+                                   "defaultEffort": "high", "switchEffort": "high"}]}})))
+    );
+    assert_eq!(
+        s.lane_settings().models[0]
+            .effort
+            .as_ref()
+            .and_then(|e| e.switch_effort.as_deref()),
+        Some("high")
+    );
 }

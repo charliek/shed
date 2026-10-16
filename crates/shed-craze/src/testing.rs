@@ -36,6 +36,12 @@
 //! - **`config.toml`**: `provider = "grok"`, `host_idle_exit = "30s"`,
 //!   `[agents] grok = <BIN>/craze-fake-agent`. [`Recipe::set_grok_agent`]
 //!   rewrites the agent (the hub reads `config.toml` at each create).
+//! - **Saved sessions** (plan 032 §3.4) are craze's "Reopening a saved session
+//!   in the recipe": the session index `CRAZE_HOME/sessions.jsonl` seeded with
+//!   craze's own rows ([`Recipe::write_saved_sessions`], [`saved_index_row`])
+//!   and the grok agent the fake agent's `grok-load` script
+//!   ([`Recipe::script_agent`]), which answers every `session/load` by
+//!   replaying "the workspace holds main.py and README.md".
 //! - **Recorded pids, guarded teardown.** The fake hosts are this harness's
 //!   own children (its stdin is how a fake host is told to go: it unlists
 //!   itself at its end). The hub's pid is read from its record
@@ -406,6 +412,17 @@ impl Recipe {
     /// Replace `config.toml` whole (the live recording's own config).
     pub fn write_config(&self, text: &str) {
         std::fs::write(self.config_path(), text).unwrap_or_else(|e| panic!("config.toml: {e}"));
+    }
+
+    /// Seed the hub's session index — `CRAZE_HOME/sessions.jsonl`, one row per
+    /// line, replaced whole — with `rows` (craze's own index rows: craze's
+    /// "Reopening a saved session in the recipe", which seeds one grok session
+    /// before the hub starts; the hub reads the index afresh on every
+    /// `sessions.saved` and `session.reopen`). [`saved_index_row`] builds one.
+    pub fn write_saved_sessions(&self, rows: &[Value]) {
+        let text: String = rows.iter().map(|row| format!("{row}\n")).collect();
+        let path = self.craze_home.join("sessions.jsonl");
+        std::fs::write(&path, text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
 
     /// Run every craze process with `dirs` after the private directory on
@@ -857,6 +874,11 @@ impl CrazeDial for HookDial {
             Ok(CrazeStream::from_parts(r, w, tail, exit))
         })
     }
+
+    /// A wrapper forwards the fallback it wraps (the trait's rule).
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
+    }
 }
 
 /// A write half that holds its connection's reads, and says so, the moment a
@@ -1097,6 +1119,33 @@ pub fn hub_capabilities_0_1_0() -> Value {
            "snapshot": false, "attachWhenNow": false, "createOptions": true})
 }
 
+/// Every capability a v0.2.0 hub states: [`full_hub_capabilities`] (0.1.1's)
+/// and `reopen` — `sessions.saved` and `session.reopen` (plan 032 §3.4).
+pub fn reopen_hub_capabilities() -> Value {
+    let mut caps = full_hub_capabilities();
+    caps["reopen"] = json!(true);
+    caps
+}
+
+/// One row of craze's session index (`sessions.jsonl`) as craze writes it —
+/// the reopen recipe's shape (craze's `tests/cli/test_client_recipe.py`): a
+/// `provider` session whose provider id is `provider_session`, run in `cwd`,
+/// titled, created at the recipe's `2026-10-12T09:00:00Z` and last active at
+/// `updated_at`, with the craze id `craze_id` (what `sessions.saved` lists it
+/// by and `session.reopen` takes).
+pub fn saved_index_row(
+    craze_id: &str,
+    provider: &str,
+    provider_session: &str,
+    cwd: &Path,
+    title: &str,
+    updated_at: &str,
+) -> Value {
+    json!({"sessionId": provider_session, "provider": provider, "cwd": cwd.to_string_lossy(),
+           "title": title, "pinned": false, "createdAt": "2026-10-12T09:00:00Z",
+           "updatedAt": updated_at, "crazeId": craze_id})
+}
+
 impl HubEnd {
     /// The next request the client wrote, or `None` once it closed.
     pub async fn recv(&mut self) -> Option<Value> {
@@ -1146,9 +1195,16 @@ impl HubEnd {
 
     /// Read `hello` and answer as a hub with `capabilities`; returns the request.
     pub async fn hello(&mut self, epoch: &str, capabilities: Value) -> Value {
+        self.hello_from(epoch, capabilities, "test").await
+    }
+
+    /// [`HubEnd::hello`] from a hub running craze `version` (pid 5150) — the
+    /// older-hub words read both (plan 032 §3.4).
+    pub async fn hello_from(&mut self, epoch: &str, capabilities: Value, version: &str) -> Value {
         let req = self.expect("hello").await;
-        self.reply(&req, hub_hello_result(epoch, capabilities))
-            .await;
+        let mut result = hub_hello_result(epoch, capabilities);
+        result["endpoint"]["crazeVersion"] = json!(version);
+        self.reply(&req, result).await;
         req
     }
 
@@ -1489,6 +1545,11 @@ impl CrazeDial for TeeDial {
             });
             Ok(CrazeStream::from_parts(r, w, tail, exit))
         })
+    }
+
+    /// A wrapper forwards the fallback it wraps (the trait's rule).
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
     }
 }
 

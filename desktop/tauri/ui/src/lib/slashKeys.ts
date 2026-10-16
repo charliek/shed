@@ -232,7 +232,8 @@ export type SlashOutcome =
   | { kind: "failed"; code: string; message: string }
   /** `/exit`'s confirm was answered Keep: nothing was sent. */
   | { kind: "cancelled" }
-  /** `/model`: the settings sheet opens on the model list. */
+  /** `/model`, or a bare `/effort` (plan 032 §3.2): the settings sheet
+   *  opens — its model list, its effort row. */
   | { kind: "picker" };
 
 /** The line a composer note shows: a refusal (the draft kept to fix) or a
@@ -252,7 +253,7 @@ export const MAY_HAVE_APPLIED = "may have applied — check the session";
  *  | a definite refusal from craze | kept | craze's words |
  *  | outcome unknown | kept | "may have applied — check the session" |
  *  | Stop's confirm cancelled | kept | — (nothing sent) |
- *  | `ModelPicker` | cleared | the settings sheet opens |
+ *  | `ModelPicker`, `EffortPicker` | cleared | the settings sheet opens |
  *  | `SetTitle` with `index_write` | cleared | the warning |
  */
 export function draftAfter(o: SlashOutcome): { clear: boolean; note: ComposerNote | null; openSettings: boolean } {

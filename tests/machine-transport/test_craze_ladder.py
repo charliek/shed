@@ -1,12 +1,12 @@
 """The craze ladder's PRODUCTION constants, run for real (plan 025 C5).
 
 `shed_core::craze` composes the `sh -c` ladder every craze connection sends —
-`craze-bridge-hub` and `craze-providers-hub` in `scenarios.json` ARE its output
-(the Rust leg asserts the equality). The Rust behaviour tests
-(`crates/shed-core/tests/craze_ladder.rs`) run that ladder with every absolute
-rung re-rooted under a temp dir, because only root can put a file at
-`/usr/local/bin`. This module closes the gap: it runs the scenarios' argv, byte
-for byte, against the REAL rung paths.
+`craze-bridge-hub`, `craze-bridge-hub-no-start` and `craze-providers-hub` in
+`scenarios.json` ARE its output (the Rust leg asserts the equality). The Rust
+behaviour tests (`crates/shed-core/tests/craze_ladder.rs`) run that ladder
+with every absolute rung re-rooted under a temp dir, because only root can put
+a file at `/usr/local/bin`. This module closes the gap: it runs the scenarios'
+argv, byte for byte, against the REAL rung paths.
 
 That needs a box where the rung directories are ours to write — a throwaway
 container. The README's Docker recipe prepares them (root creates each absolute
@@ -44,6 +44,7 @@ from conftest import load_golden, run_wire, updating
 
 FORMS = {
     "craze-bridge-hub": ["bridge", "--hub"],
+    "craze-bridge-hub-no-start": ["bridge", "--hub", "--no-start"],
     "craze-providers-hub": ["providers", "--hub", "--json"],
 }
 

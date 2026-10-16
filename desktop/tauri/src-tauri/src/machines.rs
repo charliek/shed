@@ -367,11 +367,18 @@ pub(crate) fn build_local_craze(options: &ReachOptions) -> Option<CrazeReach> {
 }
 
 /// A remote machine's or a shed's craze reach (plan 025 §3.6.1) —
-/// ATTACH-ONLY: the find-only probe, and a probe-gated `bridge --hub`, both
-/// over the host's own [`SshExec`] (its pinned host key and its
-/// ControlMaster, shared with the bootstrap) — plus the same bridge UNGATED
+/// ATTACH-ONLY: the find-only probe, and a dial that reaches only a running
+/// hub — craze 0.2.0's `bridge --hub --no-start`, falling back to a
+/// probe-gated `bridge --hub` for an older craze (plan 032 §3.5) — both over
+/// the host's own [`SshExec`] (its pinned host key and its ControlMaster,
+/// shared with the bootstrap); plus the plain bridge UNGATED
 /// ([`CrazeReach::ensure`]), which only a user's explicit action (the create
 /// sheet) dials, and which may birth a hub there.
+///
+/// **One dial per call, so one mode per source**: the source's roster and
+/// every lane it opens dial through this ONE `Arc`, so a fallback any of them
+/// draws moves them all, and the next registration of the host (a new source
+/// generation, which builds its reach anew) starts back on `--no-start`.
 ///
 /// **In test mode it exists only through the fake-ssh seam**, mirroring
 /// [`build_ssh_reach`] — and it composes the JAILED ladder, because the fake
@@ -379,15 +386,17 @@ pub(crate) fn build_local_craze(options: &ReachOptions) -> Option<CrazeReach> {
 /// `/bin/sh`, where the absolute rungs would find this host's craze. A
 /// test-mode host with no fake `ssh` has no craze source.
 pub(crate) fn build_ssh_craze(exec: Arc<SshExec>, options: &ReachOptions) -> Option<CrazeReach> {
-    let (bridge, probe) = if options.test_mode {
+    let (bridge, no_start, probe) = if options.test_mode {
         options.ssh_bin.as_ref()?;
         (
             display_line(&shed_core::craze::bridge_hub_argv_jailed()),
+            display_line(&shed_core::craze::bridge_hub_no_start_argv_jailed()),
             display_line(&shed_core::craze::providers_hub_argv_jailed()),
         )
     } else {
         (
             shed_core::craze::bridge_hub_command(),
+            shed_core::craze::bridge_hub_no_start_command(),
             display_line(&shed_core::craze::providers_hub_argv()),
         )
     };
@@ -399,8 +408,13 @@ pub(crate) fn build_ssh_craze(exec: Arc<SshExec>, options: &ReachOptions) -> Opt
     let gate = options.spawn_gate.clone();
     Some(CrazeReach {
         dial: Arc::new(
-            SshCrazeDial::new(Arc::clone(&exec), bridge.clone(), Arc::clone(&probe))
-                .with_spawn_gate(gate.clone()),
+            SshCrazeDial::new(
+                Arc::clone(&exec),
+                bridge.clone(),
+                no_start,
+                Arc::clone(&probe),
+            )
+            .with_spawn_gate(gate.clone()),
         ),
         probe: Some(probe),
         ensure: Some(Arc::new(

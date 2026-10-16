@@ -40,7 +40,18 @@
      assert the panel, not just the backend behind it. `null` on unmount, because
      "no panel" is the question a caller is actually asking.
 
-   `lane.open` on mount, `lane.close` on unmount, and no polling anywhere.
+   `lane.open` on mount, `lane.close` on unmount, and no polling anywhere —
+   plus `lane.open` AGAIN, in place, when the shell moves `opens`: a resume
+   that landed on the session this panel shows (a finished lane whose host it
+   rejoined), whose address — so whose key — did not change.
+
+   **A finished lane stays on screen, read-only** (plan 032 §3.1.1 item 13):
+   a craze lane outlives its row by a grace and then ends visibly, so the
+   panel keeps its transcript and its `ended · <reason>` banner, and once
+   `lane.messages` says `finished` the composer, Send, Interject and Cancel
+   are disabled (`laneVerbs`' gate) — keyed on `finished`, never on `ended`,
+   which a retryable `Down` sets too. A verb that races the end is refused
+   `lane_ended`, shown in the action-error line like any refusal.
 
    **The lane's kind is part of its address** (plan 025 §3.6.4): the panel is
    opened with the row's `agent_lane.kind`, and every `lane.*` call carries it —
@@ -52,7 +63,9 @@
 
    **The settings chip** (plan 025 §3.10): on a session whose streamed
    capabilities say `settings`, the header carries `<model name> · <effort
-   value> · fast` from the current values; pressing it opens the settings
+   value> · fast` from the current values — the effort being the option
+   `lane.messages`' `effort_option` names, the shared core's reading (plan
+   032 PC14h), never a guess made here; pressing it opens the settings
    sheet (`LaneSettings.tsx`) under the header. No chip, and no sheet even
    when asked for (`ui.show_lane_settings`), on a session that says no —
    hidden, never disabled. The panel counts the session's `Settings` frames
@@ -67,8 +80,13 @@
    goes through the same dispatch, so a typed `/help` is refused inline
    rather than sent as text. Each command runs on the lane's own verb — a rename, a mode (`lane.set`, its errors in the composer,
    P7), Stop behind its confirm, the model picker (the settings sheet), a
-   prompt row as a prompt. No menu on the view → the composer is as it always
-   was. */
+   prompt row as a prompt. `/effort` (plan 032 §3.2): bare, it opens the
+   settings sheet as `/model` does; with a level the shared dispatch matched,
+   it is a `lane.set` of that effort bound to its model, its errors in the
+   composer as a mode's are — sent even at the current level (craze's rule:
+   a dropped no-op could lose a concurrent change), where the sheet's press
+   on the current value sends nothing. No menu on the view → the composer is
+   as it always was. */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, OctagonX, ScrollText, Send, SlidersHorizontal, Square, X, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -210,11 +228,16 @@ function roleColor(role: string): string {
   return "var(--shed-text-secondary)";
 }
 
-export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOpen, onClose }: {
+export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSettingsOpen, onClose }: {
   machine: string;
   /** The row's `agent_lane.kind` — half of the lane's address. */
   kind: string;
   sessionId: string;
+  /** How many times the shell asked this panel to open its lane AGAIN where
+   *  it stands (`crazeResume.ts`'s `laneOnResume`: a resume that landed on
+   *  the session this panel shows). A move re-runs the open, never the
+   *  mount. */
+  opens: number;
   /** The settings sheet is ASKED for (the chip, or `ui.show_lane_settings`);
    *  it shows only while the session's capabilities say `settings`. */
   settingsOpen: boolean;
@@ -314,6 +337,12 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  transcript that yanks itself down while you are reading history is worse
    *  than one that does not follow. */
   const atBottom = useRef(true);
+  /** The lane's open — `lane.open`, then one read — as the mount's effect
+   *  runs it, kept so an ask to open AGAIN in place (`opens` moving) runs the
+   *  very same step; `null` until that effect's listeners are attached. */
+  const openLane = useRef<(() => Promise<void>) | null>(null);
+  /** The `opens` this panel has acted on (its mount's open covers the first). */
+  const opensSeen = useRef(opens);
 
   // One live subscription for as long as the panel is mounted. Everything —
   // the listener, the batch, the open — belongs to this one effect so the
@@ -395,21 +424,29 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
         return;
       }
       unlisten.push(unHold);
-      try {
-        const o = await laneOpen(machine, kind, sessionId);
-        if (cancelled) return;
-        setOpened(o);
-      } catch (e) {
-        if (!cancelled) setReadError(laneFailure(e).message);
-        return;
-      }
-      // The seed may have completed before the first frame-event was scheduled
-      // (an already-open lane re-answers instantly), so read once outright.
-      await pull();
+      const open = async () => {
+        try {
+          const o = await laneOpen(machine, kind, sessionId);
+          if (cancelled) return;
+          setOpened(o);
+        } catch (e) {
+          if (!cancelled) setReadError(laneFailure(e).message);
+          return;
+        }
+        // The seed may have completed before the first frame-event was scheduled
+        // (an already-open lane re-answers instantly), so read once outright.
+        await pull();
+      };
+      // Kept BEFORE the first open is asked: an ask to open again that comes
+      // sooner finds nothing here — and loses nothing, because this open has
+      // not been sent yet and will find the session as it is by then.
+      openLane.current = open;
+      await open();
     })();
 
     return () => {
       cancelled = true;
+      openLane.current = null;
       reads.cancel();
       if (frame !== null) cancelAnimationFrame(frame);
       if (timer !== null) clearTimeout(timer);
@@ -417,6 +454,21 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
       void laneClose(machine, kind, sessionId);
     };
   }, [machine, kind, sessionId]);
+
+  // **Asked to open the lane AGAIN where it stands** (`opens` moved: a resume
+  // landed on this very session — branch review). The mount's own open, with
+  // NO `lane.close` before it: on a FINISHED lane whose session runs again,
+  // the backend opens a fresh lane and replaces the finished one only once
+  // that open commits (a failed open leaves the ended transcript readable);
+  // a live lane is re-answered as it is. A remount would close first, and
+  // its close would race its own open on the same key. The last refusal was
+  // about the lane that ended, so it goes.
+  useEffect(() => {
+    if (opens === opensSeen.current) return;
+    opensSeen.current = opens;
+    setActionError(null);
+    void openLane.current?.();
+  }, [opens]);
 
   const messages = view?.messages ?? [];
   useEffect(() => {
@@ -434,7 +486,11 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  lane has no Interject; a session whose capabilities say `cancel: false`
    *  has no Cancel), and an offered verb is enabled only while it is Working. */
   const capabilities = view?.capabilities ?? null;
-  const verbs = laneVerbs(capabilities, view?.activity ?? "");
+  /** The lane is over for good — the backend's `finished`, not `ended`. */
+  const finished = view?.finished ?? false;
+  const verbs = laneVerbs(capabilities, view?.activity ?? "", finished);
+  /** The composer takes no draft, Send or key once the lane is finished. */
+  const composerOff = !verbs.composer.enabled;
   const canInterject = verbs.interject.shown;
   /** …and the state half: armed only while the agent would accept one. */
   const interjecting = verbs.interject.enabled && interject;
@@ -552,7 +608,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
   /** What the latest render knows, for the async continuations and the doors
    *  (a door's listener is registered once). */
   const rendered = { prompt, caret, menu, catalog, activity, filtered, filter, highlight, dismissed, interjecting,
-                     busy, confirming: confirmStop };
+                     busy, confirming: confirmStop, composerOff };
   const live = useRef(rendered);
   live.current = rendered;
   // A programmatic draft (a completion, the type door) puts the caret where
@@ -668,7 +724,18 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
             setConfirmStop("slash");
             return;
           case "model_picker":
+          case "effort_picker":
+            // `/model`, bare `/effort`: the settings sheet, whose model list
+            // and effort row are those pickers; the draft clears.
             return settleSlash({ kind: "picker" }, at.rev);
+          case "set_effort":
+            // `/effort <level>` (plan 032 §3.2): the composer's verb, its
+            // errors here as a mode's — a `stale_model` (the model moved
+            // since the menu) included. Always sent, the current level too.
+            return slashVerb(async () => {
+              await laneSet(machine, kind, sessionId, action.change);
+              return { kind: "done" };
+            }, at.rev);
           default:
             return;
         }
@@ -689,7 +756,9 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  was for a draft that no longer exists: dropped, silently, nothing sent. */
   const submitAt = async (at: Claim) => {
     const now = live.current;
-    if (now.busy || !at.draft.trim()) return;
+    // A finished lane sends nothing (its Send is disabled; Enter and the
+    // doors land here too).
+    if (now.busy || now.composerOff || !at.draft.trim()) return;
     if (!now.menu) return sendText(at.draft.trim(), at.rev);
     let d: SlashDispatch;
     try {
@@ -713,7 +782,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  completion overwrites the newer text, and nothing runs. */
   const acceptAt = async (name: string, key: SlashAcceptKey, at: Claim, catalog: string) => {
     const now = live.current;
-    if (!now.menu || now.busy || now.catalog !== catalog) return;
+    if (!now.menu || now.busy || now.composerOff || now.catalog !== catalog) return;
     let a;
     try {
       a = await laneSlashAccept(now.menu, at.draft, name, key, now.activity);
@@ -920,7 +989,8 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  and that capability alone decides. */
   const offered = settingsOffered(capabilities);
   const settings = view?.settings ?? NO_SETTINGS;
-  const chip = offered ? settingsChip(settings) : null;
+  const effortOption = view?.effort_option ?? null;
+  const chip = offered ? settingsChip(settings, effortOption) : null;
 
   const pickedFor = (a: LaneApproval): string[][] =>
     picks[a.id] ?? a.questions.map(() => []);
@@ -1020,6 +1090,8 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
     generation: view?.generation ?? 0,
     stale: view?.stale ?? null,
     ended: view?.ended ?? false,
+    finished,
+    composer_disabled: composerOff,
     rows,
     approvals: cards,
     can_cancel: verbs.cancel.enabled,
@@ -1166,6 +1238,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
           kind={kind}
           sessionId={sessionId}
           settings={settings}
+          effortOption={effortOption}
           markOf={changes.markOf}
           press={changes.press}
           onClose={() => onSettingsOpen(false)}
@@ -1442,8 +1515,15 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
           onSelect={(e) => placeCaret(e.currentTarget.selectionStart ?? 0)}
           onKeyDown={onComposerKey}
           rows={2}
-          placeholder={menu ? "Send a prompt, or / for commands…" : "Send a prompt…"}
-          className="min-w-0 flex-1 resize-none rounded-[9px] border border-shed-border bg-shed-inset px-3 py-2 text-[13px] text-shed-text outline-none focus:border-shed-accent"
+          disabled={composerOff}
+          placeholder={
+            composerOff
+              ? "This session has ended"
+              : menu
+                ? "Send a prompt, or / for commands…"
+                : "Send a prompt…"
+          }
+          className="min-w-0 flex-1 resize-none rounded-[9px] border border-shed-border bg-shed-inset px-3 py-2 text-[13px] text-shed-text outline-none focus:border-shed-accent disabled:opacity-50"
         />
         <div className="flex flex-none flex-col gap-2">
           {/* Present only when the adapter says it can interject, enabled only
@@ -1477,14 +1557,14 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
           )}
           <button
             onClick={() => void submit()}
-            disabled={busy || !prompt.trim()}
-            title={interjecting ? "Send (interject)" : "Send"}
+            disabled={busy || composerOff || !prompt.trim()}
+            title={composerOff ? "The session has ended" : interjecting ? "Send (interject)" : "Send"}
             className="hbtn inline-flex h-9 w-9 items-center justify-center rounded-[9px]"
             style={{
               background: "var(--shed-accent)",
               color: "var(--shed-accent-fg)",
               border: "none",
-              opacity: busy || !prompt.trim() ? 0.5 : 1,
+              opacity: busy || composerOff || !prompt.trim() ? 0.5 : 1,
             }}
           >
             <Send size={15} />

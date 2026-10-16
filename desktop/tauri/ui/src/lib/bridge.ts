@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { AgentsEmptyState, AgentsLoad } from "@/lib/agentsEmpty";
 import type { CrazeCreateOptions } from "@/lib/crazeCreate";
+import type { CrazeSavedList } from "@/lib/crazeResume";
 import { killTarget } from "@/lib/crazeRows";
 import { initialReport } from "@/lib/report";
 
@@ -1091,6 +1092,12 @@ export type CrazeStatus = {
    *  P10) — `false` while dormant, offline or too old, exactly as
    *  `create_options`. The create sheet offers "Name (optional)" on it. */
   create_title?: boolean;
+  /** NOT craze's: the generation of this host's craze source — its
+   *  INCARNATION, as `craze.create_options` reports it (`null`: no source).
+   *  A host removed and added again under the same address is a new one with
+   *  a larger generation; the shell resets the sheet's per-machine Resume
+   *  state on it (plan 032 §3.4, C5 re-review). */
+  source_gen?: number | null;
 };
 
 /** A configured machine's health, for the sessions view's group rows. A machine
@@ -1515,6 +1522,13 @@ export type LaneView = {
   generation: number;
   stale: string | null;
   ended: boolean;
+  /** The lane is over for good (plan 032 §3.1.1, PC14b) — the ENTRY's
+   *  lifecycle, not `ended`: its session's final `Down` arrived, or the
+   *  backend ended it (`session_gone`/`hub_gone` after its row left and the
+   *  grace ran out, `host_removed`). Every verb is then refused `lane_ended`,
+   *  and the panel disables its composer, Send and Cancel. `ended` alone may
+   *  be a retryable `Down` the backend is already resubscribing after. */
+  finished: boolean;
   capabilities: LaneCapabilities | null;
   settings: LaneSettings | null;
   /** The session's `/` menu, RESOLVED by the shared core (plan 029 §3.4):
@@ -1522,6 +1536,11 @@ export type LaneView = {
    *  arrived — then the composer offers no menu and sends a `/` draft as
    *  text. Handed back to the `lane_slash_*` commands as is; never edited. */
   slash_menu?: SlashMenu | null;
+  /** The id of `settings`' EFFORT option — craze's `EffortOption` rule, run
+   *  by the shared core (`LaneSettings::effort_option`, plan 032 §3.2,
+   *  PC14h) — or `null` when `settings` is or names none. What the chip shows
+   *  as the effort: read from here, never re-derived from the options. */
+  effort_option?: string | null;
 };
 
 /** One button an approval offers, exactly as the agent offered it.
@@ -1626,13 +1645,21 @@ export type LaneCapabilities = {
  * Mirrors of the shared core's types, as the `lane_slash_*` commands answer
  * them; the panel renders these and hands them back. */
 
-/** What running a shown row does (`SlashAction`). */
+/** What running a shown row does (`SlashAction`). `effort_picker` is
+ *  `/effort` (plan 032 §3.2): bare, it opens the settings sheet, whose effort
+ *  row is `option`; its `levels` and `default_level` are what the shared
+ *  dispatch matched a `/effort <level>` against — the panel never reads them.
+ *  `set_effort` is only ever a dispatch's answer to such a level, never a
+ *  row's: a `lane_set` of its `change` (a config change of the effort option
+ *  bound to `for_model`), sent even when it is the current level. */
 export type SlashAction =
   | { kind: "prompt" }
   | { kind: "set_title" }
   | { kind: "set_mode"; change: LaneSettingChange }
   | { kind: "stop" }
-  | { kind: "model_picker" };
+  | { kind: "model_picker" }
+  | { kind: "effort_picker"; option: string; for_model: string; levels: LaneChoice[]; default_level?: string | null }
+  | { kind: "set_effort"; change: LaneSettingChange };
 
 /** One shown row (`SlashMenuRow`). `arg` is the catalog's word (`none` |
  *  `optional` | `required`), for display. */
@@ -1681,8 +1708,27 @@ export type SlashAccept =
 export type SlashAcceptKey = "enter" | "tab" | "pick";
 
 /** One selectable value — a model, a mode, an option's value
- *  (`shed_core::lane::LaneChoice`). `id` is what a change sends back. */
-export type LaneChoice = { id: string; name: string; rank?: number | null; description?: string | null };
+ *  (`shed_core::lane::LaneChoice`). `id` is what a change sends back.
+ *  `effort` is a MODEL's effort facts (plan 032 §3.3), absent everywhere
+ *  else and on every model whose agent states none (an ACP session's). */
+export type LaneChoice = {
+  id: string;
+  name: string;
+  rank?: number | null;
+  description?: string | null;
+  effort?: LaneModelEffort | null;
+};
+
+/** What a model says about its effort before it is chosen
+ *  (`shed_core::lane::LaneModelEffort`, craze 0.2.0's per-model effort facts,
+ *  a native session's alone): its levels, its default, and the level a switch
+ *  to it lands on. The CURRENT model's effort is its effort option's
+ *  `current`, never these. */
+export type LaneModelEffort = {
+  efforts: string[];
+  default_effort?: string | null;
+  switch_effort?: string | null;
+};
 
 /** One of a model's own options (`shed_core::lane::LaneSetting`): its current
  *  value and the values it offers. `category` is an open string. */
@@ -1995,6 +2041,12 @@ export type LaneReport = {
   stale: string | null;
   /** The subscription ENDED (a `Down`) — not merely stale. */
   ended: boolean;
+  /** The lane is over for good (`lane.messages`' `finished`, plan 032): what
+   *  `composer_disabled` follows. */
+  finished: boolean;
+  /** The composer — its text box, Send, Interject and Cancel — is disabled
+   *  because the lane is FINISHED (`laneVerbs`' `composer`). */
+  composer_disabled: boolean;
   rows: LaneRow[];
   approvals: LaneApprovalCard[];
   /** The Cancel button exists AND is enabled: the session's streamed
@@ -2068,7 +2120,10 @@ export function reportLaneComposer(snapshot: LaneComposerReport | null): void {
  *  as, its values with the selected one, and its state — `pending` while a
  *  change awaits craze, `refused` with the text shown inline, or
  *  `not_confirmed` after an answer lost to a drop, until the next `Settings`.
- *  `enabled` is whether the row takes a press now. */
+ *  `enabled` is whether the row takes a press now. A value's `secondary` is
+ *  the dim line drawn under it — on the model list, `effort → <level>` for a
+ *  model other than the current one whose effort facts name the level a
+ *  switch lands on (plan 032 §3.3) — else `null`. */
 export type LaneSettingsReport = {
   machine: string;
   session_id: string;
@@ -2082,7 +2137,7 @@ export type LaneSettingsReport = {
     control: "segmented" | "list";
     current: string | null;
     current_name: string | null;
-    values: { id: string; name: string; selected: boolean }[];
+    values: { id: string; name: string; selected: boolean; secondary: string | null }[];
     state: "pending" | "refused" | "not_confirmed" | null;
     text: string | null;
     enabled: boolean;
@@ -2117,11 +2172,15 @@ async function crazeInvoke<T>(cmd: string, args: Record<string, unknown>): Promi
 }
 
 /** What a create can start on `machine` — read afresh on every sheet open
- *  (D8: nothing is cached). On a DORMANT machine this is the explicit action
- *  that starts its hub. THROWS a coded failure. */
+ *  (D8: nothing is cached) — with the incarnation of its craze source the
+ *  read came through (`source_gen`, the reply's, carried on the options). On
+ *  a DORMANT machine this is the explicit action that starts its hub. THROWS
+ *  a coded failure. */
 export async function crazeCreateOptions(machine: string): Promise<CrazeCreateOptions> {
-  const r = await crazeInvoke<{ options: CrazeCreateOptions }>("craze_create_options", { machine });
-  return r.options;
+  const r = await crazeInvoke<{ options: CrazeCreateOptions; source_gen?: number | null }>(
+    "craze_create_options", { machine },
+  );
+  return { ...r.options, source_gen: r.source_gen ?? null };
 }
 
 /** The fields of one create — the sheet's typed form and the request id it
@@ -2168,6 +2227,53 @@ export async function crazeCreate(f: CrazeCreateFields): Promise<CrazeCreated> {
     requestId: f.requestId,
     held: f.held,
   });
+}
+
+/** The saved sessions the sheet's Resume mode lists on `machine` (plan 032
+ *  §3.4) — read afresh on every first choice of Resume, newest first, at most
+ *  50 (`more` when craze left some out), with the host's `home` where the app
+ *  knows it (`crazeResume.ts`'s `shortenHome`). Like the create options, on a
+ *  DORMANT machine this may start its hub. THROWS a coded failure. */
+export async function crazeSaved(machine: string): Promise<CrazeSavedList> {
+  const r = await crazeInvoke<{ saved: CrazeSavedList; home?: string | null; source_gen?: number | null }>(
+    "craze_saved", { machine },
+  );
+  return {
+    sessions: r.saved?.sessions ?? [], more: !!r.saved?.more, home: r.home ?? null,
+    source_gen: r.source_gen ?? null,
+  };
+}
+
+/** What `craze_reopen` answers: the running session's row (already in the
+ *  machine's listing), its hostId — what the transcript opens on — and
+ *  whether craze JOINED a session something already ran (`joined`) or
+ *  started one to load it. */
+export type CrazeReopened = {
+  session: RcSession;
+  host_id: string;
+  /** The session had already ended again by the time its row was folded:
+   *  nothing is listed, and there is no transcript to open. */
+  ended?: boolean;
+  /** The machine was removed (or removed and added again) while the reopen
+   *  ran: its answer came through a craze source the machine no longer has,
+   *  nothing was listed, and there is nothing to open on it here — whatever
+   *  the row's own `stale` (`crazeResume.ts`'s `ReopenAnswer`). */
+  superseded?: boolean;
+  joined: boolean;
+  /** The saved id this answered for. */
+  id: string;
+  /** The incarnation of the machine's craze source the reopen went
+   *  through. */
+  source_gen?: number | null;
+};
+
+/** Run the saved session `id` again — or join it where it already runs. It
+ *  can take minutes. THROWS a coded failure whose code keeps the reopen
+ *  error's variant: `gone` (drop the row), `start_failed` (show it, keep the
+ *  row), `unavailable` (Retry — a lost answer included), or the inner lane
+ *  code (`crazeResume.ts`'s `settleResume` branches on it). */
+export async function crazeReopen(machine: string, id: string): Promise<CrazeReopened> {
+  return crazeInvoke<CrazeReopened>("craze_reopen", { machine, id });
 }
 
 /** What `craze_open_terminal` answers: the roost tab it opened. */
@@ -2232,7 +2338,46 @@ export type CrazeCreateDump = {
   cwd_problem: string | null;
   create_enabled: boolean;
   primary: string;
+  /** The sheet's `New | Resume` control (plan 032 §3.4): `offered` — shown,
+   *  because the create options say the hub can reopen — and `enabled` (not
+   *  while a create submits or a reopen runs). */
+  modes: { offered: boolean; enabled: boolean };
+  /** The half on screen: `new` (the create form) or `resume`. */
+  mode: "new" | "resume" | string;
+  /** The Resume half as rendered, or `null` while New shows. */
+  saved: CrazeSavedDump | null;
   rendered: string;
+};
+
+/** The Resume half of the create sheet as rendered (plan 032 §3.4, PC14i). */
+export type CrazeSavedDump = {
+  /** The list's read: `loading` | `failed` | `ready`. */
+  state: string;
+  /** A failed read's words, as shown (with its Retry). */
+  error: string | null;
+  /** "Showing the 50 most recent." when craze left some out. */
+  more: string | null;
+  /** The note a dropped (`gone`) row left: its title and craze's words. */
+  gone: string | null;
+  rows: CrazeSavedRowDump[];
+};
+
+/** One saved session's row AS RENDERED — read back off its DOM. */
+export type CrazeSavedRowDump = {
+  id: string;
+  title: string;
+  provider: string;
+  /** The workspace as shown: the home shortened to `~` where known. */
+  workspace: string;
+  /** The relative age shown ("5 min ago"). */
+  updated: string;
+  /** `idle` | `resuming` | `refused` | `unavailable`. */
+  state: string;
+  /** The row's refusal as shown, or `null`. */
+  error: string | null;
+  /** The button's label (Resume, Resuming…, Retry) and whether it works. */
+  button: string;
+  enabled: boolean;
 };
 
 /** Report the create sheet's rendered state, or `null` on unmount — called

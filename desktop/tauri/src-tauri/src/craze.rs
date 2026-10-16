@@ -24,30 +24,40 @@
 //!   | phase | how it got here | what runs | leaves on |
 //!   |---|---|---|---|
 //!   | (absent) | started; nothing answered yet | the find-only probe | its first answer |
-//!   | **Dormant** | the probe said `no hub is running` | the probe again in [`DORMANT_PROBE`] | a probe that finds a hub |
-//!   | **Live** | the probe found a hub, then the roster seeded | ONE `bridge --hub` roster connection | the roster's `Offline` (EOF, `hub_closing`, an error) |
+//!   | **Dormant** | the probe said `no hub is running` — or the roster's own `--no-start` dial found none (`Offline{NoHub}`, plan 032 §3.5) | the probe again in [`DORMANT_PROBE`] | a probe that finds a hub |
+//!   | **Live** | the probe found a hub, then the roster seeded | ONE `bridge --hub --no-start` roster connection (`bridge --hub` behind a probe for a craze older than 0.2.0) | the roster's `Offline` (EOF, `hub_closing`, an error) |
 //!   | **Offline** | the roster dropped, or the probe could not ask (unreachable; not installed and too old are offline causes too) | the probe again: after about a second once a live cycle ends (jittered [`PROBE_BACKOFF_BASE`]), on a backoff while unreachable, every [`DORMANT_PROBE`] while not installed or too old | the probe's next answer |
 //!
 //!   After a live cycle ends the probe runs again before anything redials: a
 //!   hub that is gone sends the source back to Dormant (its rows dropped and
 //!   its lanes evicted — the hub is gone, so nothing is listed), and a hub that
-//!   is still there is re-joined.
+//!   is still there is re-joined. The probe stays even where every dial is
+//!   find-only: it is what tells not installed, too old and dormant apart for
+//!   the status line, and what a dormant source waits on. A no-hub answer
+//!   from a probe (or roster dial) that started before a create or a reopen
+//!   listed a session is stale, and is not folded: the probe asks again at
+//!   once ([`attach_only`]).
 //!
-//! * **Every remote `bridge --hub` is probe-gated** ([`SshCrazeDial`]): the
-//!   dialer itself runs the find-only probe on the same ControlMaster before it
-//!   spawns the bridge, and answers `Unreachable` instead when no hub is
-//!   running. That covers the roster's dials AND every lane's background
-//!   reconnects (a lane keeps `Stale`, within its own 10-minute bound, rather
-//!   than birthing a hub), and no caller can bypass it because the rule is in
-//!   the dial. A lane's FIRST open runs the probe too — harmless, its row came
-//!   from a live roster.
-//! * **One race is ACCEPTED, not closed** (plan 025 §3.6.1, recorded again by
-//!   the C9 review): the probe sees a hub that exits before the `bridge --hub`
-//!   behind it joins, and the bridge — which always Ensures a hub — births one,
-//!   ssh-born, with no user action. The probe-then-bridge pair cannot be made
-//!   atomic from this side; craze SF-152 (a find-only `bridge --hub`, reserved
-//!   2026-10-04) removes the race and the probe both. Until then the window is
-//!   the gap between two execs on one ControlMaster.
+//! * **No background remote dial can start a hub** ([`SshCrazeDial`], plan 032
+//!   §3.5). Every remote connection but a user's explicit action — the
+//!   roster's, and every lane's, background reconnects included — is craze
+//!   0.2.0's find-only `bridge --hub --no-start`: it attaches to a running hub,
+//!   or exits 3 (`no hub is running`) and starts nothing. A roster that draws
+//!   that is the source going DORMANT ([`attach_only`]); a lane keeps `Stale`,
+//!   within its own 10-minute bound. There is no probe per dial: the dial
+//!   itself cannot start a hub, so there is nothing to gate, and no caller can
+//!   bypass the rule because it is in the dial.
+//! * **A craze older than 0.2.0 falls back, once per source** ([`DialMode`]):
+//!   it refuses the flag (`craze bridge: unknown or malformed flag`, exit 1),
+//!   and the dial — ONE per host, shared by the roster and every lane — swaps
+//!   for good to the older way: the find-only probe on the same ControlMaster
+//!   first, then `bridge --hub`, `Unreachable` when no hub is running. On that
+//!   legacy path **one race remains, ACCEPTED** (plan 025 §3.6.1): the probe
+//!   sees a hub that exits before the `bridge --hub` behind it joins, and the
+//!   bridge — which always Ensures a hub — births one, ssh-born, with no user
+//!   action. The pair cannot be made atomic from this side; craze 0.2.0's
+//!   `--no-start` is what closes it. A new source (a host registered again, a
+//!   restart) builds a new dial, back on `--no-start`.
 //! * **A hub is born remotely only by an explicit user action** (plan 025
 //!   §3.6.1, C10): opening the create sheet (its `create_options`) and the
 //!   create itself run through the host's UNGATED dial,
@@ -86,6 +96,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,7 +139,9 @@ pub trait CrazeProbe: Send + Sync {
 pub struct CrazeReach {
     pub dial: Arc<dyn CrazeDial>,
     /// `None`: EAGER (this machine). `Some`: ATTACH-ONLY (a remote machine or
-    /// a shed) — and its dial is probe-gated too.
+    /// a shed) — and its dial reaches only a running hub too (`bridge --hub
+    /// --no-start`, or probe-gated for a craze older than 0.2.0:
+    /// [`SshCrazeDial`]).
     pub probe: Option<Arc<dyn CrazeProbe>>,
     /// The dial a user's EXPLICIT action runs through — the create sheet's
     /// `create_options` and the create (the module doc): an attach-only host's
@@ -157,7 +170,7 @@ impl Default for CrazeTimings {
 }
 
 // ---------------------------------------------------------------------------
-// the ssh probe and the probe-gated ssh dial
+// the ssh probe and the attach-only ssh dial
 // ---------------------------------------------------------------------------
 
 /// The find-only probe over a host's `SshExec` — a one-shot `run` on the
@@ -213,19 +226,45 @@ impl CrazeProbe for SshCrazeProbe {
     }
 }
 
-/// A remote host's dial: **probe-gated** `craze bridge --hub` over
-/// [`SshExec::spawn_duplex`] (the module doc). Every connection — the roster's
-/// and every lane's — asks the find-only probe first, and a host with no hub
-/// running is `Unreachable`, never a hub this app births in the background.
+/// How an attach-only [`SshCrazeDial`] reaches its hub (plan 032 §3.5) — ONE
+/// mode per dial, and one dial per source, shared by its roster and every lane
+/// it opens (`crate::machines::build_ssh_craze`), so the first refusal moves
+/// them all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DialMode {
+    /// craze 0.2.0+: `bridge --hub --no-start`, no probe in front — it
+    /// attaches to a running hub or exits 3, and never starts one.
+    NoStart = 0,
+    /// Fallen back for a craze older than 0.2.0: the find-only probe, then
+    /// `bridge --hub` (the module doc's accepted race).
+    Legacy = 1,
+}
+
+/// A remote host's dial over [`SshExec::spawn_duplex`] (the module doc): every
+/// connection — the roster's and every lane's — reaches only a hub that is
+/// already running, and a host with none is never given one by a background
+/// dial. In [`DialMode::NoStart`] that is craze's own `bridge --hub
+/// --no-start`; in [`DialMode::Legacy`] the find-only probe gates a `bridge
+/// --hub`, and a host with no hub is `Unreachable`.
 ///
 /// The one UNGATED instance ([`Self::ungated`]) is the host's
-/// [`CrazeReach::ensure`]: only a user's explicit action dials it.
+/// [`CrazeReach::ensure`]: only a user's explicit action dials it, and it runs
+/// `bridge --hub`, which may start a hub.
 pub struct SshCrazeDial {
     exec: Arc<SshExec>,
-    /// `display_line` of the bridge form (production, or jailed in test mode).
+    /// `display_line` of the bridge form (production, or jailed in test mode):
+    /// what [`Self::ungated`] and [`DialMode::Legacy`] run.
     bridge: String,
+    /// `display_line` of the `--no-start` form — what [`DialMode::NoStart`]
+    /// runs. `None` only for [`Self::ungated`].
+    no_start: Option<String>,
+    /// The find-only probe [`DialMode::Legacy`] runs in front of the bridge.
     /// `None` only for [`Self::ungated`].
     probe: Option<Arc<dyn CrazeProbe>>,
+    /// A [`DialMode`] (`as u8`): `NoStart` until a refusal of the flag moves
+    /// it to `Legacy` ([`CrazeDial::fall_back`]), for good.
+    mode: AtomicU8,
     /// The app's spawn gate (plan 026 §3.3). This dial takes its section
     /// around the `spawn_duplex` and the child's registration ALONE — not
     /// around the find-only probe in front of them, which can take
@@ -235,24 +274,36 @@ pub struct SshCrazeDial {
 }
 
 impl SshCrazeDial {
-    pub fn new(exec: Arc<SshExec>, bridge: String, probe: Arc<dyn CrazeProbe>) -> Self {
+    /// An attach-only dial: `no_start` first, falling back to `probe` +
+    /// `bridge` for a craze older than 0.2.0.
+    pub fn new(
+        exec: Arc<SshExec>,
+        bridge: String,
+        no_start: String,
+        probe: Arc<dyn CrazeProbe>,
+    ) -> Self {
         Self {
             exec,
             bridge,
+            no_start: Some(no_start),
             probe: Some(probe),
+            mode: AtomicU8::new(DialMode::NoStart as u8),
             gate: None,
         }
     }
 
-    /// The same bridge with NO probe in front: it Ensures a hub on the far side
-    /// whether or not one runs. For [`CrazeReach::ensure`] only — the create
-    /// sheet's `create_options` and the create, a user's explicit action.
+    /// The bridge with NO probe in front and no `--no-start`: it Ensures a hub
+    /// on the far side whether or not one runs. For [`CrazeReach::ensure`]
+    /// only — the create sheet's `create_options` and the create, a user's
+    /// explicit action. It never falls back: it has nothing to fall back from.
     /// ("Ungated" names the PROBE gate; the spawn gate is [`Self::with_spawn_gate`].)
     pub fn ungated(exec: Arc<SshExec>, bridge: String) -> Self {
         Self {
             exec,
             bridge,
+            no_start: None,
             probe: None,
+            mode: AtomicU8::new(DialMode::Legacy as u8),
             gate: None,
         }
     }
@@ -261,6 +312,15 @@ impl SshCrazeDial {
     pub fn with_spawn_gate(mut self, gate: Option<SpawnGate>) -> Self {
         self.gate = gate;
         self
+    }
+
+    /// The mode the next dial runs in.
+    pub fn mode(&self) -> DialMode {
+        if self.mode.load(Ordering::Acquire) == DialMode::NoStart as u8 {
+            DialMode::NoStart
+        } else {
+            DialMode::Legacy
+        }
     }
 }
 
@@ -274,13 +334,18 @@ pub fn no_hub(label: &str) -> DialError {
 impl CrazeDial for SshCrazeDial {
     fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
         let exec = Arc::clone(&self.exec);
-        let bridge = self.bridge.clone();
         let gate = self.gate.clone();
         // A closed gate refuses before the probe, too: a clean early answer.
         if gate.as_ref().is_some_and(SpawnGate::is_closed) {
             return Box::pin(async { Err(shutting_down_dial()) });
         }
-        let probe = self.probe.as_ref().map(|p| p.probe());
+        // NoStart: the find-only bridge, with NO probe in front — it cannot
+        // start a hub, so there is nothing to gate. Legacy (and the ungated
+        // dial, which has no probe): the bridge, behind the probe if any.
+        let (bridge, probe) = match (&self.no_start, self.mode()) {
+            (Some(no_start), DialMode::NoStart) => (no_start.clone(), None),
+            _ => (self.bridge.clone(), self.probe.as_ref().map(|p| p.probe())),
+        };
         Box::pin(async move {
             match probe {
                 None => {}
@@ -314,6 +379,37 @@ impl CrazeDial for SshCrazeDial {
                 _ => Ok(stream),
             }
         })
+    }
+
+    /// **The `--no-start` fallback** (plan 032 PC12): craze refused the flag,
+    /// so it is older than 0.2.0 — swap this dial (the roster's and every
+    /// lane's: one dial per source) to [`DialMode::Legacy`] and answer `true`,
+    /// so `connect_hub` dials once more, the older way. ONCE: a dial already
+    /// `Legacy` — another dial's refusal won the swap, or this is the ungated
+    /// one — answers `false`, and the refusal it was offered stands (it reads
+    /// as `Unreachable`; the source or lane redials on its own clock, legacy
+    /// from then on).
+    fn fall_back(&self, err: &DialError) -> bool {
+        if !matches!(err, DialError::NoStartUnsupported(_)) || self.no_start.is_none() {
+            return false;
+        }
+        let swapped = self
+            .mode
+            .compare_exchange(
+                DialMode::NoStart as u8,
+                DialMode::Legacy as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if swapped {
+            app_info!(
+                "shed-desktop-tauri: craze on {} does not know `bridge --hub --no-start` \
+                 (older than 0.2.0): its dials probe before `bridge --hub` from now on ({err})",
+                self.exec.label()
+            );
+        }
+        swapped
     }
 }
 
@@ -388,6 +484,11 @@ impl CrazeDial for GatedDial {
                 .await
                 .map_err(|_| shutting_down_dial())
         })
+    }
+
+    /// A wrapper forwards the fallback it wraps (`CrazeDial::fall_back`).
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
     }
 }
 
@@ -505,6 +606,12 @@ impl CrazeDial for TrackedDial {
     fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
         self.inner.dial()
     }
+
+    /// Forwarded: the source's roster and lanes dial through THIS wrapper, so
+    /// a host's `--no-start` fallback (plan 032 §3.5) is only reached here.
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
+    }
 }
 
 /// `inner`, tracked: the dial to build a source on, and a receiver that
@@ -528,6 +635,12 @@ struct Tethered {
 impl CrazeDial for Tethered {
     fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
         self.inner.dial()
+    }
+
+    /// Forwarded, as every wrapper does (the ungated dial inside never
+    /// sends `--no-start`, so it never takes one).
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
     }
 }
 
@@ -594,14 +707,41 @@ pub struct CrazeState {
     pub caps: Option<SourceCapabilities>,
     pub truncated: bool,
     staged: Option<Staged>,
+    /// The last craze news sequence number [`Self::mint_news`] handed out —
+    /// `0` before the first.
+    news: u64,
+    /// **The listing epoch** ([`Self::listings`]): how many rows a create or
+    /// a reopen answered with this source has listed
+    /// ([`Self::answer_listed`]).
+    listings: u64,
 }
 
 /// What one fold changed, for the caller to act on outside the lock.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Applied {
-    /// Rows that left the swapped-in set — their lanes go (`Removed`, or a
-    /// `Ready` swap that dropped them: an epoch reseed produces no `Removed`).
+    /// Rows that left the swapped-in set — their lanes DEPART (`Removed`, or a
+    /// `Ready` swap that dropped them: an epoch reseed produces no `Removed`;
+    /// plan 032 §3.1.1 item 2).
     pub departed: Vec<String>,
+    /// Rows newly IN the swapped-in set — a `Session` upsert of a hostId not
+    /// held, or a `Ready` swap that lists one the old set did not — whose
+    /// departing lanes (if any) are live again (plan 032 §3.1.1 item 3, PC2).
+    /// A row already held is never in it — one [`CrazeState::listed_now`]
+    /// folded in ahead of its frame included: the create or reopen that
+    /// listed it published its return itself
+    /// ([`crate::roost_hosts::RoostHosts`]'s `list_answered_row`, branch
+    /// review), and `listed_now`'s own answer's is always empty.
+    ///
+    /// The fold publishes it after releasing the state lock, as every
+    /// publisher of craze news does, each from its own task — this fold, a
+    /// create's or reopen's listing, the host's removal — so a return can
+    /// reach a lane after a departure computed later. The news sequence
+    /// ([`CrazeState::mint_news`]) orders them: a lane never takes news
+    /// older than what it already took.
+    ///
+    /// Disjoint from [`Self::departed`] — a fold lists or departs a row, never
+    /// both — so the two share the fold's one news number.
+    pub listed: Vec<String>,
     /// A seed swapped in: the host is listed from now on.
     pub ready: bool,
     /// Something a reader can see changed.
@@ -615,6 +755,59 @@ impl CrazeState {
             gen,
             ..Self::default()
         }
+    }
+
+    /// **The next craze news sequence number** (C1 re-review): what one piece
+    /// of this source's news about its lanes carries
+    /// ([`crate::lane::CrazeNews`]) — a fresh number per call, strictly
+    /// increasing for the life of the source (a new source, a new
+    /// generation, starts again, and the generation fence keeps the two
+    /// apart). Never 0.
+    ///
+    /// **Minted under the roost-host layer's state lock, at the moment the
+    /// news is computed** — by the source's fold, a create's or reopen's
+    /// listing of the row it answered with, and the host's removal
+    /// ([`crate::roost_hosts::OnCrazeNews`]). Each publishes AFTER
+    /// that lock is released, from its own task, so news can REACH the lane
+    /// layer in another order than it happened in; the number is the order it
+    /// happened in, and the lane layer applies a piece to a lane only if it is
+    /// newer than every piece that lane already took
+    /// ([`crate::lane::Lanes::craze_news`]).
+    pub fn mint_news(&mut self) -> u64 {
+        // A u64 is never exhausted here: one piece of news a microsecond, for
+        // the life of one source, would take over 500,000 years to wrap.
+        self.news += 1;
+        self.news
+    }
+
+    /// **The listing epoch** (plan 032 §3.1.1 item 2, C8 review finding 2):
+    /// how many rows a create or a reopen answered with this source has
+    /// listed ([`Self::answer_listed`]). Read under the roost-host layer's
+    /// state lock as a find-only probe — or a roster's `--no-start` dial —
+    /// STARTS ([`CrazeSink::listings`]), and handed to [`Self::dormant`] when
+    /// that probe's no-hub answer lands: an answer older than a listing is
+    /// not folded.
+    pub fn listings(&self) -> u64 {
+        self.listings
+    }
+
+    /// **A create's or reopen's answered row was just listed** (plan 032
+    /// §3.1.1 item 3, C8 review): the listing epoch moves — a no-hub answer
+    /// whose probe started before now is stale ([`Self::dormant`]) — and the
+    /// row's RETURN gets its news number, minted here, under the same lock
+    /// ([`Self::mint_news`]).
+    ///
+    /// **Always, a Dormant folded while the request was in flight or not**
+    /// (C8 review): this layer cannot tell a Dormant that rests on a probe
+    /// that looked before the create or reopen started its hub from one that
+    /// saw the hub die after craze answered, so it sides with the session
+    /// craze just said runs — a successful create's or reopen's row always
+    /// stays openable, and its return always ends a departure minted before
+    /// it. What that accepts — a hub that really died meanwhile — is
+    /// [`crate::roost_hosts::RoostHosts`]'s `list_answered_row`'s to say.
+    pub fn answer_listed(&mut self) -> u64 {
+        self.listings += 1;
+        self.mint_news()
     }
 
     /// Whether the hub feed is live — the one condition the row merge absorbs
@@ -643,7 +836,10 @@ impl CrazeState {
                     staged.rows.insert(session.id.clone(), session);
                 }
                 None => {
-                    self.rows.insert(session.id.clone(), session);
+                    let id = session.id.clone();
+                    if self.rows.insert(id.clone(), session).is_none() {
+                        out.listed.push(id);
+                    }
                     out.visible = true;
                 }
             },
@@ -679,6 +875,12 @@ impl CrazeState {
                             .filter(|id| !staged.rows.contains_key(*id))
                             .cloned()
                             .collect();
+                        out.listed = staged
+                            .rows
+                            .keys()
+                            .filter(|id| !self.rows.contains_key(*id))
+                            .cloned()
+                            .collect();
                         self.rows = staged.rows;
                         if staged.caps.is_some() {
                             self.caps = staged.caps;
@@ -706,20 +908,53 @@ impl CrazeState {
 
     /// The probe found no hub: nothing is listed, and every row (and its lane)
     /// goes.
-    pub fn dormant(&mut self) -> Applied {
-        let departed = self.held();
-        let visible = !departed.is_empty() || self.phase != Some(CrazePhase::Dormant);
+    ///
+    /// **`created` departs too** (plan 032 PC14g, branch review): the
+    /// source's created rows read now ([`shed_craze::CrazeSource::created_rows`],
+    /// less the rows held here) — sessions a create or a reopen answered with
+    /// that no roster has listed yet. Their lanes ride the hub as much as a
+    /// roster row's do, so a hub gone before the first seed departs them
+    /// `hub_gone` as well; otherwise nothing would ever end such a lane on
+    /// screen. They are the source's to drop, not this state's (they stay
+    /// listed until the source lets them go), so they change nothing a reader
+    /// sees here: a repeated dormant probe repaints nothing, and only departs
+    /// such a lane again if a listing brought it back meanwhile.
+    ///
+    /// **Only if no create or reopen listed a row since the answer's probe
+    /// started** (C8 review finding 2): `probed_at` is the listing epoch
+    /// ([`Self::listings`]) read as the probe — or the roster's `--no-start`
+    /// dial — that found no hub STARTED. A listing since then answered with
+    /// a session the probe may have looked too early to see: the create or
+    /// reopen may have started the hub it runs on after the probe looked. So
+    /// that answer is STALE and folds nothing — `None`, nothing changed,
+    /// nothing minted — and the source probes again at once
+    /// ([`attach_only`]); folded, it would depart the new session's lane
+    /// with news newer than the listing's return, and its grace would end a
+    /// running session's panel `hub_gone`.
+    pub fn dormant(&mut self, created: &[LaneSession], probed_at: u64) -> Option<Applied> {
+        if self.listings != probed_at {
+            return None;
+        }
+        let held = self.held();
+        let visible = !held.is_empty() || self.phase != Some(CrazePhase::Dormant);
+        let mut departed = held;
+        for row in created {
+            if !departed.contains(&row.id) {
+                departed.push(row.id.clone());
+            }
+        }
         self.rows.clear();
         self.staged = None;
         self.caps = None;
         self.truncated = false;
         self.phase = Some(CrazePhase::Dormant);
         self.offline = None;
-        Applied {
+        Some(Applied {
             departed,
+            listed: Vec::new(),
             ready: false,
             visible,
-        }
+        })
     }
 
     /// The probe could not ask: retained rows stay, stale.
@@ -731,6 +966,7 @@ impl CrazeState {
         self.offline = said;
         Applied {
             departed: Vec::new(),
+            listed: Vec::new(),
             ready: false,
             visible,
         }
@@ -748,6 +984,15 @@ impl CrazeState {
     ///
     /// Into a seed in progress too, so that seed's swap cannot depart it (and
     /// its lane) before its frame lands. Never over a row already held.
+    ///
+    /// **It reports no return** (plan 032 §3.1.1 item 3): its answer's
+    /// [`Applied::listed`] is always empty, and the frame that lands next
+    /// reports none either — the row is already held. The caller lists the
+    /// row and publishes its return itself, a created-only row's too, under a
+    /// news number it mints under the same lock
+    /// ([`crate::roost_hosts::RoostHosts`]'s `list_answered_row`, branch
+    /// review): the news sequence, not the publishing task, orders it with
+    /// the fold's departures.
     pub fn listed_now(&mut self, session: LaneSession) -> Applied {
         if let Some(staged) = self.staged.as_mut() {
             staged
@@ -759,6 +1004,7 @@ impl CrazeState {
         self.rows.entry(session.id.clone()).or_insert(session);
         Applied {
             departed: Vec::new(),
+            listed: Vec::new(),
             ready: false,
             visible,
         }
@@ -798,6 +1044,17 @@ impl CrazeState {
     /// LIVE hub's capabilities, `false` otherwise — so a dormant machine's
     /// create sheet offers "Name (optional)" once its hub is live, exactly as
     /// it learns `create_options` (plan 029 P10).
+    ///
+    /// `source_gen` is this source's generation ([`Self::gen`]) — the host's
+    /// INCARNATION, as `craze.create_options`, `craze.saved` and
+    /// `craze.reopen` report it — `null` while the host has no craze source
+    /// (gen `0`). A host removed and registered again under the same address
+    /// is a new incarnation with a new generation, and generations only GROW
+    /// (one counter for the app's life), so a later incarnation's is always
+    /// the larger. Carried on every status (C5 re-review) so the sheet's
+    /// per-machine Resume state is reset by the status it already reads —
+    /// sheet open or not — and never waits on a create-options read that may
+    /// fail.
     pub fn status(&self) -> Value {
         let (state, cause) = match (self.gen, self.phase, &self.offline) {
             (0, ..) | (_, None, _) => ("absent", None),
@@ -818,6 +1075,7 @@ impl CrazeState {
             "create": caps.is_some_and(|c| c.create),
             "create_options": caps.is_some_and(|c| c.create_options),
             "create_title": caps.is_some_and(|c| c.create_title),
+            "source_gen": (self.gen != 0).then_some(self.gen),
         })
     }
 }
@@ -848,7 +1106,22 @@ impl CrazeState {
 ///   the host at all;
 /// * `bad_request` — a caller's mistake (an unknown host, a request id not in
 ///   craze's form, a session this machine does not list, a host id that is not
-///   craze's form) as well as craze's own `bad_request`.
+///   craze's form, a blank saved-session id) as well as craze's own
+///   `bad_request`.
+///
+/// And the ones only a RESUME needs (`craze.reopen`, plan 032 §3.4) — one per
+/// [`shed_core::lane::LaneReopenError`] variant, so the sheet branches on the
+/// code and never on the words ([`CrazeFailure::reopen`]):
+///
+/// * `gone` — the saved session cannot run here any more (no such id, its
+///   directory gone): the sheet drops its row;
+/// * `start_failed` — it was found and its start failed (`could not start:
+///   <cause>`): shown, the row kept;
+/// * `unavailable` — transient, a lost answer included ("Retry is safe": a
+///   reopen is idempotent), and a hub that cannot reopen saved sessions at
+///   all (craze's older-hub words): shown with Retry;
+/// * anything else is the inner [`shed_core::lane::LaneError`]'s own code
+///   (`bad_request`, `failed`, …): shown, the row kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrazeFailure {
     pub code: &'static str,
@@ -875,6 +1148,25 @@ impl CrazeFailure {
         }
         let message = e.to_string();
         Self::new(crate::lane::LaneFailure::Lane(e).code(), message)
+    }
+
+    /// A reopen's [`LaneReopenError`](shed_core::lane::LaneReopenError) (plan
+    /// 032 §3.4), its VARIANT kept visible as the code — `gone`,
+    /// `start_failed`, `unavailable` — and an inner contract error as that
+    /// error's own code. Never `outcome_unknown`: a reopen is idempotent, so a
+    /// lost answer is the source's `Unavailable` ("Retry is safe", PC14d),
+    /// and the sheet holds nothing a lost answer would make it keep.
+    pub fn reopen(e: shed_core::lane::LaneReopenError) -> Self {
+        use shed_core::lane::LaneReopenError;
+        let message = e.to_string();
+        match e {
+            LaneReopenError::Gone(_) => Self::new("gone", message),
+            LaneReopenError::StartFailed(_) => Self::new("start_failed", message),
+            LaneReopenError::Unavailable(_) => Self::new("unavailable", message),
+            LaneReopenError::Lane(e) => {
+                Self::new(crate::lane::LaneFailure::Lane(e).code(), message)
+            }
+        }
     }
 
     /// The `#[tauri::command]` door's error string.
@@ -956,18 +1248,56 @@ pub fn held_create(held: bool, request_id: Option<&str>) -> Result<bool, CrazeFa
     Ok(held)
 }
 
+/// The saved session a `craze.reopen` names, from a CALLER-SUPPLIED `id` —
+/// both doors' one reading (plan 032 §3.4). The id is OPAQUE (craze's
+/// session id, or `<provider>:<providerSessionId>` for a session recorded
+/// before craze ids — [`shed_core::lane::LaneSavedSession::id`]) and goes to
+/// craze exactly as `sessions.saved` listed it, inside a JSON request: never
+/// spliced into a command line, so nothing about its form is checked here. A
+/// missing, empty or blank one is `bad_request`: it names no session.
+pub fn reopen_id(id: Option<&str>) -> Result<String, CrazeFailure> {
+    match id {
+        Some(id) if !id.trim().is_empty() => Ok(id.to_string()),
+        _ => Err(CrazeFailure::bad_request(
+            "a reopen names the saved session it runs: send its `id`, as `craze.saved` listed it",
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // the loop
 // ---------------------------------------------------------------------------
 
 /// Where a host's [`run`] task reports — implemented by the roost-host layer,
 /// which owns the lock the state lives under. Every method answers `false`
-/// once the host this task was started for is gone (removed, or re-registered
-/// under a newer fence): the task then ends.
+/// (or [`Dormancy::Gone`]) once the host this task was started for is gone
+/// (removed, or re-registered under a newer fence): the task then ends.
 pub trait CrazeSink: Send + Sync {
     fn event(&self, event: SourceEvent) -> bool;
-    fn dormant(&self) -> bool;
+    /// The host's listing epoch now ([`CrazeState::listings`]), read under
+    /// the state lock — what a find-only probe, or a roster's `--no-start`
+    /// dial, records as it STARTS, for the [`Self::dormant`] its no-hub
+    /// answer may become (C8 review finding 2). `0` once the host is gone:
+    /// the next call says so.
+    fn listings(&self) -> u64;
+    /// The hub is gone, by an answer whose probe (or roster dial) started at
+    /// listing epoch `probed_at` ([`CrazeState::dormant`]).
+    fn dormant(&self, probed_at: u64) -> Dormancy;
     fn offline(&self, cause: SourceOffline, reason: String) -> bool;
+}
+
+/// What [`CrazeSink::dormant`] made of a no-hub answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dormancy {
+    /// Folded: the source is Dormant, its rows — and their lanes — gone.
+    Folded,
+    /// Not folded — STALE (C8 review finding 2): a create or a reopen listed
+    /// a session since the answer's probe started, and may have started the
+    /// hub it runs on after the probe looked. Nothing changed; the source
+    /// probes again at once, and that answer decides.
+    Stale,
+    /// The host this task was started for is gone: the task ends.
+    Gone,
 }
 
 /// One host's craze source, for as long as the host is registered (the module
@@ -1018,6 +1348,15 @@ async fn eager(source: CrazeSource, sink: Arc<dyn CrazeSink>) {
 
 /// A remote host: probe, attach only to a hub that is there, and probe again
 /// whenever the roster drops (the module doc's table).
+///
+/// **A no-hub answer is judged against the listings since it was asked**
+/// (C8 review finding 2): the probe — and the roster's own `--no-start`
+/// dial, the other way this loop learns the hub is gone — records the
+/// listing epoch ([`CrazeSink::listings`]) as it STARTS, and a create or a
+/// reopen that listed a session before its answer lands makes that answer
+/// stale ([`Dormancy::Stale`]): it is not folded, and the loop probes again
+/// at once, rather than departing a just-started session's lane on evidence
+/// from before its hub existed.
 async fn attach_only(
     source: CrazeSource,
     probe: Arc<dyn CrazeProbe>,
@@ -1028,17 +1367,35 @@ async fn attach_only(
     use shed_core::lane::AgentSource as _;
     let mut backoff = t.backoff_base;
     loop {
+        let probed_at = sink.listings();
         match probe.probe().await {
             Probe::Hub => {
+                // The roster's dial starts with the subscription (and the
+                // loop drops it at its first `Offline`, so a `NoHub` is its
+                // first dial's).
+                let dialled_at = sink.listings();
                 let Ok(subscription) = source.subscribe().await else {
                     return;
                 };
                 let (mut rx, stop) = subscription.into_parts();
                 let mut reached = false;
+                let mut no_hub = false;
                 loop {
                     let Some(event) = rx.recv().await else {
                         return;
                     };
+                    // **The hub went between the probe and the roster's dial**
+                    // (plan 032 §3.5): its `--no-start` found none, and started
+                    // none. That is no outage — nothing runs there — so the
+                    // source is DORMANT, not offline.
+                    if let SourceEvent::Offline {
+                        cause: SourceOffline::NoHub,
+                        ..
+                    } = &event
+                    {
+                        no_hub = true;
+                        break;
+                    }
                     let offline = matches!(event, SourceEvent::Offline { .. });
                     reached |= matches!(event, SourceEvent::Ready { .. });
                     if !sink.event(event) {
@@ -1052,6 +1409,18 @@ async fn attach_only(
                 // probe say whether there is still a hub to re-join.
                 drop(stop);
                 drop(rx);
+                if no_hub {
+                    // As a probe's `NoHub` below: dormant, and the next probe on
+                    // the dormant clock — or, stale, the next probe now.
+                    match sink.dormant(dialled_at) {
+                        Dormancy::Gone => return,
+                        Dormancy::Stale => continue,
+                        Dormancy::Folded => {}
+                    }
+                    backoff = t.backoff_base;
+                    wait(t.dormant, &wake).await;
+                    continue;
+                }
                 backoff = next_backoff(backoff, reached, t.backoff_base, t.backoff_max);
                 wait(
                     jittered(if reached { t.backoff_base } else { backoff }),
@@ -1060,8 +1429,10 @@ async fn attach_only(
                 .await;
             }
             Probe::NoHub => {
-                if !sink.dormant() {
-                    return;
+                match sink.dormant(probed_at) {
+                    Dormancy::Gone => return,
+                    Dormancy::Stale => continue,
+                    Dormancy::Folded => {}
                 }
                 backoff = t.backoff_base;
                 wait(t.dormant, &wake).await;
@@ -1103,6 +1474,7 @@ mod tests {
             create: true,
             create_options: true,
             create_title: true,
+            reopen: false,
         }
     }
 
@@ -1121,6 +1493,13 @@ mod tests {
             generation,
             truncated: false,
         })
+    }
+
+    /// A no-hub answer whose probe started just now — no listing since — so
+    /// it folds.
+    fn dormant(state: &mut CrazeState, created: &[LaneSession]) -> Applied {
+        let probed_at = state.listings();
+        state.dormant(created, probed_at).expect("no listing since")
     }
 
     #[test]
@@ -1166,6 +1545,83 @@ mod tests {
         assert_eq!(removed.departed, ["b"]);
     }
 
+    /// **A fold says which rows it newly LISTS** (plan 032 §3.1.1 item 3):
+    /// the return signal a departing lane is waiting for — a `Ready` swap's
+    /// rows the old set did not hold, and a live `Session` upsert of a hostId
+    /// not held — and never a row already held, nor anything staged.
+    #[test]
+    fn a_fold_reports_the_rows_it_newly_lists() {
+        let mut s = CrazeState::new(1);
+        assert_eq!(seed(&mut s, 1, &["a", "b"]).listed, ["a", "b"]);
+        let swapped = seed(&mut s, 2, &["b", "c"]);
+        assert_eq!(
+            (swapped.departed, swapped.listed),
+            (vec!["a".to_string()], vec!["c".to_string()])
+        );
+        let held = s.apply(SourceEvent::Session { session: row("b") });
+        assert!(
+            held.listed.is_empty(),
+            "an upsert of a held row is no return"
+        );
+        let new = s.apply(SourceEvent::Session { session: row("d") });
+        assert_eq!(new.listed, ["d"]);
+        s.apply(SourceEvent::Reset {
+            reason: "connect".into(),
+            generation: 3,
+        });
+        let staged = s.apply(SourceEvent::Session { session: row("e") });
+        assert!(staged.listed.is_empty(), "staged rows wait for their Ready");
+        // The hub gone, then back: every row it lists is a return.
+        dormant(&mut s, &[]);
+        assert_eq!(seed(&mut s, 4, &["a"]).listed, ["a"]);
+    }
+
+    /// **A row folded in ahead of its frame reports no return, and neither
+    /// does its frame** (plan 032 §3.1.1 item 3, branch review): the create
+    /// or reopen that listed it published the return itself, minted under the
+    /// state lock (`RoostHosts::list_answered_row`), so the fold never says
+    /// it again — not the live upsert of its frame, nor the swap of the seed
+    /// it was folded into. From then on the roster's frames govern it as any
+    /// row: a `Removed` before its frame departs it, and a later listing is a
+    /// fresh return.
+    #[test]
+    fn a_row_folded_ahead_reports_no_return_of_its_own() {
+        let mut s = CrazeState::new(1);
+        seed(&mut s, 1, &["a"]);
+        let ahead = s.listed_now(row("n"));
+        assert!(ahead.visible && ahead.listed.is_empty(), "{ahead:?}");
+        assert_eq!(s.held(), ["a", "n"]);
+        let framed = s.apply(SourceEvent::Session { session: row("n") });
+        assert!(framed.listed.is_empty(), "its listing said it: {framed:?}");
+
+        // Folded into a seed in progress: its swap keeps it, and says nothing.
+        s.apply(SourceEvent::Reset {
+            reason: "connect".into(),
+            generation: 2,
+        });
+        s.apply(SourceEvent::Session { session: row("a") });
+        s.apply(SourceEvent::Session { session: row("n") });
+        assert!(s.listed_now(row("m")).listed.is_empty());
+        let swapped = s.apply(SourceEvent::Ready {
+            generation: 2,
+            truncated: false,
+        });
+        assert!(
+            swapped.departed.is_empty() && swapped.listed.is_empty(),
+            "{swapped:?}"
+        );
+        assert_eq!(s.held(), ["a", "m", "n"]);
+
+        // Removed before its frame: it departs, and a later listing returns.
+        s.listed_now(row("p"));
+        let removed = s.apply(SourceEvent::Removed {
+            session_id: "p".into(),
+        });
+        assert_eq!(removed.departed, ["p"]);
+        let relisted = s.apply(SourceEvent::Session { session: row("p") });
+        assert_eq!(relisted.listed, ["p"], "a fresh listing");
+    }
+
     /// Retained across an `Offline`, dropped by a `Dormant`.
     #[test]
     fn offline_retains_and_dormant_drops() {
@@ -1179,45 +1635,141 @@ mod tests {
         assert!(!s.live(), "but not live: the merge absorbs nothing");
         assert_eq!(s.status()["state"], "offline");
         assert_eq!(s.status()["cause"], "unreachable");
-        let dormant = s.dormant();
-        assert_eq!(dormant.departed, ["a"]);
+        let gone = dormant(&mut s, &[]);
+        assert_eq!(gone.departed, ["a"]);
         assert!(s.rows.is_empty());
         assert_eq!(s.status()["state"], "dormant");
     }
 
-    /// A probe with one fixed answer.
-    struct FixedProbe(Probe);
+    /// **A Dormant departs the source's created rows too** (plan 032 PC14g,
+    /// branch review): a lane opened on a session only a create or a reopen
+    /// answered with rides the hub as much as a roster row's, so the hub gone
+    /// before any seed listed it departs it with the rest. They are the
+    /// source's rows, not this state's — nothing a reader sees changes for
+    /// them, so a repeated dormant probe still repaints nothing — and a row
+    /// both held and created departs once.
+    #[test]
+    fn a_dormant_departs_the_created_rows_too() {
+        let mut s = CrazeState::new(1);
+        seed(&mut s, 1, &["a"]);
+        let first = dormant(&mut s, &[row("c"), row("a")]);
+        assert_eq!(first.departed, ["a", "c"], "{first:?}");
+        assert!(first.visible && first.listed.is_empty());
+        let again = dormant(&mut s, &[row("c")]);
+        assert_eq!(again.departed, ["c"], "still listed by the source");
+        assert!(!again.visible, "a repeated probe repaints nothing");
+    }
+
+    /// **A no-hub answer older than a listing folds nothing** (plan 032
+    /// §3.1.1 item 2, C8 review finding 2): once a create or a reopen listed
+    /// a row, the listing epoch read as an earlier probe STARTED is behind —
+    /// the session may run on a hub that probe looked too early to see — so
+    /// that probe's `dormant` is `None`: no row dropped, nothing departed and
+    /// no news number minted. A probe started after the listing folds as
+    /// ever.
+    #[test]
+    fn a_no_hub_answer_older_than_a_listing_folds_nothing() {
+        let mut s = CrazeState::new(1);
+        seed(&mut s, 1, &["a"]);
+        let probed_at = s.listings();
+        let returned = s.answer_listed();
+        assert!(s.dormant(&[row("c")], probed_at).is_none(), "stale");
+        assert_eq!(s.held(), ["a"], "nothing dropped");
+        assert!(s.live());
+        assert_eq!(s.mint_news(), returned + 1, "no news minted");
+        let gone = dormant(&mut s, &[row("c")]);
+        assert_eq!(gone.departed, ["a", "c"], "a probe from after it folds");
+    }
+
+    /// **A listing returns its row even after a Dormant folded while its
+    /// request was in flight** (plan 032 §3.1.1 item 3, C8 review): craze's
+    /// answer says the session runs, so its return is minted all the same —
+    /// in the news sequence, newer than that Dormant's departure (minted as
+    /// the fold mints it, after folding), so it ends that departure — the
+    /// listing epoch moves, and the roster's row, folded ahead, is held
+    /// again (openable). If the hub really stayed gone, a probe started
+    /// after the listing finds none and departs the row again.
+    #[test]
+    fn a_listing_after_a_dormant_still_returns_its_row() {
+        let mut s = CrazeState::new(1);
+        seed(&mut s, 1, &["a"]);
+        // The request goes out, and the hub goes before its row is listed.
+        let gone = dormant(&mut s, &[]);
+        assert_eq!(gone.departed, ["a"]);
+        let departed = s.mint_news();
+        let listings = s.listings();
+        let returned = s.answer_listed();
+        assert!(returned > departed, "newer than the departure it ends");
+        assert_eq!(s.listings(), listings + 1, "and it was listed");
+        s.listed_now(row("a"));
+        assert_eq!(s.held(), ["a"], "held again: openable");
+        // The hub stayed gone: a probe from after the listing departs it.
+        let again = dormant(&mut s, &[]);
+        assert_eq!(again.departed, ["a"]);
+    }
+
+    /// A probe with one fixed answer, counting the times it is asked.
+    struct FixedProbe(Probe, Arc<std::sync::atomic::AtomicUsize>);
+
+    impl FixedProbe {
+        fn counted(answer: Probe) -> (Arc<dyn CrazeProbe>, Arc<std::sync::atomic::AtomicUsize>) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (Arc::new(FixedProbe(answer, Arc::clone(&calls))), calls)
+        }
+    }
 
     impl CrazeProbe for FixedProbe {
         fn probe(&self) -> BoxFut<Probe> {
+            self.1.fetch_add(1, Ordering::SeqCst);
             let answer = self.0.clone();
             Box::pin(async move { answer })
         }
     }
 
-    /// **A remote dial is probe-gated** (plan 025 §3.6.1): with no hub running
-    /// it answers `Unreachable` and never spawns `bridge --hub` over ssh — so
-    /// no caller (the roster's redial, a lane's background reconnect) can birth
-    /// a remote hub through it; not installed and too old keep their causes; a
-    /// hub that is there gets its duplex.
-    #[tokio::test]
-    async fn a_remote_dial_spawns_no_bridge_unless_the_probe_found_a_hub() {
+    /// A fake `ssh` under `dir`: records each remote command (its last
+    /// argument, one line each) to `<dir>/ssh.log`, ignores `-O` control
+    /// commands, and then answers it by its text:
+    ///
+    /// * `*--no-start*` — runs `<dir>/no-start.sh` when it exists (a case's
+    ///   own ending: 0.1.x's refusal, exit 3, …), else a duplex (`cat`);
+    /// * `*providers*` — a hub's `createOptions` answer, exit 0 (the probe
+    ///   finds a hub);
+    /// * anything else — a HUB: it answers the client's first line (a hub
+    ///   `hello`, id `"1"`) with `hello`, then drains its stdin.
+    ///
+    /// Written under a staging name and renamed into place (a script still
+    /// open for writing while a sibling test forks answers `execve` with
+    /// ETXTBSY).
+    fn fake_ssh(dir: &std::path::Path) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let log = dir.path().join("ssh.log");
-        let ssh = dir.path().join("ssh");
-        // A fake ssh: records its remote command (the last argument), then
-        // runs as a duplex (`cat`) until its stdin closes.
-        std::fs::write(
-            &ssh,
-            format!(
-                "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '%s\\n' \"$last\" >> '{}'\nexec cat\n",
-                log.display()
-            ),
-        )
-        .expect("write");
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let hello = json!({"jsonrpc": "2.0", "id": "1",
+                           "result": shed_craze::testing::hub_hello_result(
+                               "0a1b2c3d4e5f", shed_craze::testing::reopen_hub_capabilities())});
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do [ \"$a\" = -O ] && exit 0; last=\"$a\"; done\n\
+             printf '%s\\n' \"$last\" >> '{log}'\n\
+             case \"$last\" in\n\
+             *--no-start*) if [ -e '{ns}' ]; then exec /bin/sh '{ns}'; fi; exec cat ;;\n\
+             *providers*) printf '%s\\n' '{{\"providers\":[],\"recentDirs\":[]}}'; exit 0 ;;\n\
+             esac\n\
+             IFS= read -r line\n\
+             printf '%s\\n' '{hello}'\n\
+             exec cat >/dev/null\n",
+            log = dir.join("ssh.log").display(),
+            ns = dir.join("no-start.sh").display(),
+        );
+        let staged = dir.join("ssh.staging");
+        let ssh = dir.join("ssh");
+        std::fs::write(&staged, script).expect("write");
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::rename(&staged, &ssh).expect("rename");
+        ssh
+    }
+
+    /// An `SshExec` for "mini3" through the fake `ssh` under `dir`.
+    fn fake_exec(dir: &std::path::Path) -> Arc<SshExec> {
         let entry = shed_core::config::MachineEntry {
             name: "mini3".to_string(),
             host: "mini3".to_string(),
@@ -1225,19 +1777,63 @@ mod tests {
             ..Default::default()
         };
         let options = shed_app::roost::SshBridgeOptions {
-            ssh_bin: Some(ssh),
+            ssh_bin: Some(fake_ssh(dir)),
             ..Default::default()
         };
-        let exec = Arc::new(SshExec::new(&entry, &options).expect("exec"));
-        let dial = |probe: Probe| {
-            SshCrazeDial::new(
-                Arc::clone(&exec),
-                "BRIDGE-HUB".to_string(),
-                Arc::new(FixedProbe(probe)),
-            )
-        };
+        Arc::new(SshExec::new(&entry, &options).expect("exec"))
+    }
 
-        let err = dial(Probe::NoHub).dial().await.err().expect("no hub");
+    /// The remote commands the fake `ssh` under `dir` recorded, in order —
+    /// once `want` of them have landed (a spawned child records a moment
+    /// after the dial answers).
+    async fn recorded(dir: &std::path::Path, want: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for _ in 0..500 {
+            lines = std::fs::read_to_string(dir.join("ssh.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            if lines.len() >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        lines
+    }
+
+    /// `connect_hub` through `dial`, as the source and the lanes run it.
+    async fn connect(
+        dial: &dyn CrazeDial,
+    ) -> Result<(shed_craze::conn::Conn, shed_craze::conn::Notifications), DialError> {
+        let client = shed_craze::wire::ClientInfo::shed("t");
+        shed_craze::connect_hub(
+            dial,
+            &client,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .await
+        .map(|(conn, notes, _hello)| (conn, notes))
+    }
+
+    /// The probe's verdicts a LEGACY dial turns into errors without spawning
+    /// anything: no hub is `Unreachable` in this app's words, and not
+    /// installed / too old / unreachable keep their causes.
+    async fn assert_legacy_gate(exec: &Arc<SshExec>, dir: &std::path::Path) {
+        let legacy = |probe: Probe| {
+            let (probe, _) = FixedProbe::counted(probe);
+            let dial = SshCrazeDial::new(
+                Arc::clone(exec),
+                "BRIDGE-HUB".to_string(),
+                "NO-START-HUB --no-start".to_string(),
+                probe,
+            );
+            assert!(dial.fall_back(&DialError::NoStartUnsupported("x".into())));
+            dial
+        };
+        let before = recorded(dir, 0).await.len();
+        let err = legacy(Probe::NoHub).dial().await.err().expect("no hub");
         assert!(
             matches!(&err, DialError::Unreachable(m) if m.contains("no craze hub is running")),
             "{err:?}"
@@ -1247,7 +1843,7 @@ mod tests {
             (SourceOffline::TooOld, "TooOld"),
             (SourceOffline::Unreachable, "Unreachable"),
         ] {
-            let err = dial(Probe::Offline {
+            let err = legacy(Probe::Offline {
                 cause,
                 reason: "said".to_string(),
             })
@@ -1257,45 +1853,222 @@ mod tests {
             .expect("offline");
             assert!(format!("{err:?}").starts_with(want), "{err:?}");
         }
-        assert!(
-            !log.exists(),
+        assert_eq!(
+            recorded(dir, 0).await.len(),
+            before,
             "no ssh ran while the probe said there was nothing to join"
         );
+    }
 
-        let stream = dial(Probe::Hub).dial().await.expect("a hub: its duplex");
-        // The child is spawned when the dial answers; it records a moment later.
-        let mut recorded = String::new();
-        for _ in 0..500 {
-            recorded = std::fs::read_to_string(&log).unwrap_or_default();
-            if !recorded.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(recorded.trim(), "BRIDGE-HUB", "the bridge ran over ssh");
+    /// **A remote dial reaches only a hub that is already running** (plan 032
+    /// §3.5; plan 025 §3.6.1 before it). In `NoStart` it spawns the find-only
+    /// `bridge --hub --no-start` and asks NO probe — it cannot start a hub, so
+    /// there is nothing to gate. Fallen back to `Legacy`, it is probe-gated:
+    /// with no hub running it answers `Unreachable` and never spawns `bridge
+    /// --hub` over ssh, not installed and too old keep their causes, and a
+    /// hub that is there gets its duplex. The UNGATED instance —
+    /// `CrazeReach::ensure`, a user's explicit action — asks no probe and runs
+    /// the plain bridge, and has no fallback to take.
+    #[tokio::test]
+    async fn a_remote_dial_reaches_only_a_running_hub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exec = fake_exec(dir.path());
+
+        // NoStart: the find-only bridge, no probe.
+        let (probe, asked) = FixedProbe::counted(Probe::NoHub);
+        let dial = SshCrazeDial::new(
+            Arc::clone(&exec),
+            "BRIDGE-HUB".to_string(),
+            "NO-START-HUB --no-start".to_string(),
+            probe,
+        );
+        assert_eq!(dial.mode(), DialMode::NoStart);
+        let stream = dial
+            .dial()
+            .await
+            .expect("a no-start dial spawns its bridge");
+        assert_eq!(recorded(dir.path(), 1).await, ["NO-START-HUB --no-start"]);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "no probe per dial");
         drop(stream);
 
-        // The UNGATED instance — a user's explicit action, `CrazeReach::ensure`
-        // — asks no probe: it runs the bridge, which Ensures a hub.
-        std::fs::remove_file(&log).expect("rm log");
-        let stream = SshCrazeDial::ungated(Arc::clone(&exec), "ENSURE-HUB".to_string())
+        // Only a no-start refusal is taken, and only once.
+        for unrelated in [
+            DialError::Unreachable("craze bridge: no hub: x".into()),
+            DialError::TooOld("unknown flag: --hub".into()),
+            DialError::NotInstalled("exit 127".into()),
+            DialError::NoHub("exit 3".into()),
+        ] {
+            assert!(!dial.fall_back(&unrelated), "{unrelated:?}");
+            assert_eq!(dial.mode(), DialMode::NoStart, "{unrelated:?}");
+        }
+        let refused =
+            DialError::NoStartUnsupported("craze bridge: unknown or malformed flag".into());
+        assert!(dial.fall_back(&refused), "the first refusal swaps the mode");
+        assert_eq!(dial.mode(), DialMode::Legacy);
+        assert!(
+            !dial.fall_back(&refused),
+            "once: Legacy has nothing to fall back to"
+        );
+
+        // Legacy: probe-gated.
+        assert_legacy_gate(&exec, dir.path()).await;
+        let (probe, asked) = FixedProbe::counted(Probe::Hub);
+        let legacy = SshCrazeDial::new(
+            Arc::clone(&exec),
+            "BRIDGE-HUB".to_string(),
+            "NO-START-HUB --no-start".to_string(),
+            probe,
+        );
+        assert!(legacy.fall_back(&refused));
+        let stream = legacy.dial().await.expect("a hub: its duplex");
+        assert_eq!(
+            recorded(dir.path(), 2).await,
+            ["NO-START-HUB --no-start", "BRIDGE-HUB"],
+            "the probe found a hub, then the plain bridge ran over ssh"
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        drop(stream);
+
+        // The UNGATED instance asks no probe, runs the plain bridge, and never
+        // falls back.
+        let ungated = SshCrazeDial::ungated(Arc::clone(&exec), "ENSURE-HUB".to_string());
+        let stream = ungated
             .dial()
             .await
             .expect("an ungated dial always spawns its bridge");
-        let mut recorded = String::new();
-        for _ in 0..500 {
-            recorded = std::fs::read_to_string(&log).unwrap_or_default();
-            if !recorded.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         assert_eq!(
-            recorded.trim(),
-            "ENSURE-HUB",
+            recorded(dir.path(), 3).await.last().map(String::as_str),
+            Some("ENSURE-HUB"),
             "no probe, straight to the bridge"
         );
+        assert!(!ungated.fall_back(&refused));
         drop(stream);
+    }
+
+    /// **A refusal of `--no-start` falls back ONCE for the whole source**
+    /// (plan 032 PC12): the roster and a lane dial concurrently through the
+    /// source's ONE dial — the reach `build_ssh_craze` builds, tracked as
+    /// `RoostHosts::start_craze` tracks it, so the wrapper's forwarding is
+    /// under test too — both draw the 0.1.x refusal, the mode swaps once, and
+    /// the dial that won the swap redials the older way (the probe, then
+    /// `bridge --hub`) and goes live. The other's refusal stands, and reads as
+    /// `Unreachable`; its retry, and every dial after, is legacy — no
+    /// `--no-start` is ever sent again by this source. A NEW source — the
+    /// host registered again — builds a new dial, back on `--no-start`.
+    #[tokio::test]
+    async fn a_refused_no_start_falls_back_once_for_every_dial_of_the_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exec = fake_exec(dir.path());
+        // 0.1.x: a moment, then the refusal — so both dials spawn before either
+        // is classified.
+        std::fs::write(
+            dir.path().join("no-start.sh"),
+            "sleep 0.3\nprintf '%s\\n' 'craze bridge: unknown or malformed flag; see craze bridge --help' >&2\nexit 1\n",
+        )
+        .expect("write");
+        let options = crate::machines::ReachOptions::default();
+        let reach = crate::machines::build_ssh_craze(Arc::clone(&exec), &options)
+            .expect("a production remote reach");
+        let (dial, _gone) = tracked(Arc::clone(&reach.dial));
+        let no_starts = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|l| l.contains("bridge --hub --no-start"))
+                .count()
+        };
+
+        let (roster, lane) = tokio::join!(connect(dial.as_ref()), connect(dial.as_ref()));
+        let (won, lost) = match (roster, lane) {
+            (Ok(won), Err(lost)) | (Err(lost), Ok(won)) => (won, lost),
+            (r, l) => panic!(
+                "exactly one dial wins the swap: roster {:?}, lane {:?}",
+                r.err(),
+                l.err()
+            ),
+        };
+        assert!(matches!(lost, DialError::NoStartUnsupported(_)), "{lost:?}");
+        assert_eq!(
+            lost.cause(),
+            SourceOffline::Unreachable,
+            "unconsumed: as Unreachable"
+        );
+        let lines = recorded(dir.path(), 4).await;
+        assert_eq!(no_starts(&lines), 2, "{lines:#?}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("providers --hub --json"))
+                .count(),
+            1,
+            "the ONE fallback probed once: {lines:#?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("bridge --hub") && !l.contains("--no-start"))
+                .count(),
+            1,
+            "and dialled the plain bridge once: {lines:#?}"
+        );
+        drop(won);
+
+        // The loser's retry — and every dial after — is legacy.
+        let (_conn, _notes) = connect(dial.as_ref()).await.expect("legacy: live");
+        let lines = recorded(dir.path(), 6).await;
+        assert_eq!(
+            no_starts(&lines),
+            2,
+            "no --no-start after the swap: {lines:#?}"
+        );
+
+        // A new source generation: a new dial, back on --no-start.
+        std::fs::remove_file(dir.path().join("no-start.sh")).expect("rm");
+        let again = crate::machines::build_ssh_craze(Arc::clone(&exec), &options)
+            .expect("the host registered again");
+        let (dial, _gone) = tracked(Arc::clone(&again.dial));
+        let stream = dial.dial().await.expect("a duplex");
+        let lines = recorded(dir.path(), 7).await;
+        assert_eq!(
+            no_starts(&lines),
+            3,
+            "the new source dials --no-start: {lines:#?}"
+        );
+        drop(stream);
+    }
+
+    /// **Precedence holds through the real dial** (plan 032 PC12): a
+    /// `--no-start` that exits 127, says v0.0.1's `unknown flag: --hub`, fails
+    /// with an unrelated exit 1, or finds no hub (exit 3) is classified as
+    /// such — and none of them moves the mode or redials.
+    #[tokio::test]
+    async fn only_a_refusal_of_the_flag_falls_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exec = fake_exec(dir.path());
+        let options = crate::machines::ReachOptions::default();
+        let reach = crate::machines::build_ssh_craze(Arc::clone(&exec), &options).expect("reach");
+        let (dial, _gone) = tracked(Arc::clone(&reach.dial));
+        let cases: [(&str, &str); 4] = [
+            ("printf '%s\\n' 'sh: 1: craze: not found' >&2; exit 127\n", "NotInstalled"),
+            ("printf '%s\\n' 'Error: unknown flag: --hub' >&2; exit 1\n", "TooOld"),
+            (
+                "printf '%s\\n' 'craze bridge: no hub: the runtime dir is group-writable' >&2; exit 1\n",
+                "Unreachable",
+            ),
+            ("printf '%s\\n' 'craze bridge: no hub is running' >&2; exit 3\n", "NoHub"),
+        ];
+        for (i, (ending, want)) in cases.iter().enumerate() {
+            std::fs::write(dir.path().join("no-start.sh"), ending).expect("write");
+            let err = connect(dial.as_ref()).await.err().expect("no hub here");
+            assert!(format!("{err:?}").starts_with(want), "{want}: {err:?}");
+            let lines = recorded(dir.path(), i + 1).await;
+            assert_eq!(lines.len(), i + 1, "one dial, no fallback: {lines:#?}");
+            assert!(
+                lines.iter().all(|l| l.contains("bridge --hub --no-start")),
+                "still --no-start: {lines:#?}"
+            );
+        }
+        let no_hub = connect(dial.as_ref()).await.err().expect("no hub");
+        assert_eq!(no_hub.cause(), SourceOffline::NoHub);
     }
 
     /// **A roster-listed row is folded ahead of its frame** (plan 025
@@ -1426,6 +2199,61 @@ mod tests {
         );
     }
 
+    /// **A reopen's failure keeps its variant as the code** (plan 032 §3.4):
+    /// the resume sheet drops a row on `gone`, keeps it on `start_failed`
+    /// and on an inner contract error, and offers Retry on `unavailable` — a
+    /// lost answer's too, which is never `outcome_unknown` (PC14d).
+    #[test]
+    fn a_reopen_failure_carries_its_variant_or_the_inner_lane_code() {
+        use shed_core::lane::{LaneError, LaneReopenError};
+        let gone = CrazeFailure::reopen(LaneReopenError::Gone("no such session".into()));
+        assert_eq!(
+            (gone.code, gone.message.as_str()),
+            ("gone", "no such session")
+        );
+        let failed = CrazeFailure::reopen(LaneReopenError::StartFailed(
+            "could not start: grok exited".into(),
+        ));
+        assert_eq!(failed.code, "start_failed");
+        assert_eq!(
+            failed.command_string(),
+            "start_failed: could not start: grok exited"
+        );
+        let lost = CrazeFailure::reopen(shed_craze::errors::reopen_lost("twice"));
+        assert_eq!(lost.code, "unavailable");
+        assert!(lost.message.contains("Retry is safe"), "{lost:?}");
+        assert_eq!(
+            CrazeFailure::reopen(LaneReopenError::Lane(LaneError::BadRequest("no".into()))).code,
+            "bad_request"
+        );
+        assert_eq!(
+            CrazeFailure::reopen(LaneReopenError::Lane(LaneError::Failed("boom".into()))).code,
+            "failed"
+        );
+        // Even text that reads as shed's lost-create words is the inner code
+        // here: a reopen holds no request id to keep.
+        let worded = CrazeFailure::reopen(LaneReopenError::Lane(
+            shed_craze::errors::outcome_unknown("lost"),
+        ));
+        assert_eq!(worded.code, "failed");
+    }
+
+    /// **A reopen names its saved session**: any non-blank id goes as given
+    /// (opaque — a legacy `grok:<id>` included); a missing or blank one is
+    /// `bad_request`.
+    #[test]
+    fn a_reopen_id_is_any_non_blank_string_as_given() {
+        assert_eq!(reopen_id(Some("0192f0aa-6666")), Ok("0192f0aa-6666".into()));
+        assert_eq!(reopen_id(Some("grok:abc def")), Ok("grok:abc def".into()));
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                reopen_id(blank).unwrap_err().code,
+                "bad_request",
+                "{blank:?}"
+            );
+        }
+    }
+
     /// **Which states make an unlisted host a `shed_craze` entry** (plan 026
     /// §3.2): dormant and too old — the probe proved craze there — and nothing
     /// else; and the standing a repaint is decided on ignores the reason's
@@ -1438,7 +2266,7 @@ mod tests {
         );
         let mut s = CrazeState::new(4);
         assert!(!s.proven_unattached(), "never probed");
-        s.dormant();
+        dormant(&mut s, &[]);
         assert!(s.proven_unattached(), "dormant");
         s.offline(SourceOffline::TooOld, "unknown flag: --hub".into());
         assert!(s.proven_unattached(), "too old");
@@ -1477,7 +2305,33 @@ mod tests {
         assert_eq!(
             s.status(),
             json!({"state": "live", "cause": null, "create": true, "create_options": true,
-                   "create_title": true})
+                   "create_title": true, "source_gen": 3})
+        );
+    }
+
+    /// **Every status names the source's incarnation** (C5 re-review):
+    /// `source_gen` is the source's generation in every state — the sheet
+    /// resets its per-machine Resume state on a new one without reading the
+    /// create options — and `null` for a host with no craze source at all.
+    #[test]
+    fn every_status_names_the_sources_generation() {
+        assert_eq!(
+            CrazeState::default().status()["source_gen"],
+            Value::Null,
+            "no craze source: no incarnation to name"
+        );
+        let mut s = CrazeState::new(7);
+        assert_eq!(s.status()["source_gen"], 7, "never reached");
+        dormant(&mut s, &[]);
+        assert_eq!(s.status()["source_gen"], 7, "dormant");
+        s.offline(SourceOffline::Unreachable, "no route".into());
+        assert_eq!(s.status()["source_gen"], 7, "offline");
+        seed(&mut s, 1, &[]);
+        assert_eq!(s.status()["source_gen"], 7, "live");
+        assert_eq!(
+            CrazeState::new(8).status()["source_gen"],
+            8,
+            "another source, another generation"
         );
     }
 }

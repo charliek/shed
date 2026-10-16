@@ -11,8 +11,10 @@ use std::time::Duration;
 use serde_json::json;
 use shed_core::lane::SourceOffline;
 use shed_core::roost::testing::{ownership, FakeRoost};
-use shed_craze::testing::{full_hub_capabilities, roster_row, HookDial, HubEnd, ScriptedDial};
-use shed_craze::{CrazeDial, DialError, Probe};
+use shed_craze::testing::{
+    full_hub_capabilities, reopen_hub_capabilities, roster_row, HookDial, HubEnd, ScriptedDial,
+};
+use shed_craze::{CrazeDial, CrazeStream, DialError, Probe};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::*;
@@ -613,12 +615,25 @@ async fn a_host_removed_at_each_await_of_a_start_leaks_nothing() {
     assert!(rows_of(&hosts).is_empty(), "{:?}", rows_of(&hosts));
 }
 
-/// The lanes over a craze roster, wired the way `lib.rs` wires them.
+/// The departure grace these cells' lanes run with (plan 032 §3.1's seam).
+const GRACE: Duration = Duration::from_millis(300);
+
+/// The lanes over a craze roster, wired the way `lib.rs` wires them, with a
+/// [`GRACE`] departure grace.
 fn lanes_over(hosts: &Arc<RoostHosts>) -> Arc<Lanes> {
-    let lanes = Arc::new(Lanes::for_test(
-        tokio::runtime::Handle::current(),
-        Arc::clone(hosts) as Arc<dyn crate::lane::LaneMachines>,
-    ));
+    lanes_holding(hosts, GRACE, Arc::new(NewsHold::default()))
+}
+
+/// [`lanes_over`], with a `grace` departure grace and its craze news passed
+/// through `hold` — which holds back nothing until a cell says what.
+fn lanes_holding(hosts: &Arc<RoostHosts>, grace: Duration, hold: Arc<NewsHold>) -> Arc<Lanes> {
+    let lanes = Arc::new(
+        Lanes::for_test(
+            tokio::runtime::Handle::current(),
+            Arc::clone(hosts) as Arc<dyn crate::lane::LaneMachines>,
+        )
+        .with_depart_grace(grace),
+    );
     let weak = Arc::downgrade(&lanes);
     hosts.set_lane_observer(Arc::new(move |m: &str, open: &_| {
         if let Some(l) = weak.upgrade() {
@@ -626,18 +641,123 @@ fn lanes_over(hosts: &Arc<RoostHosts>) -> Arc<Lanes> {
         }
     }));
     let weak = Arc::downgrade(&lanes);
-    hosts.set_craze_observer(Arc::new(move |m: &str, gen: u64, gone: &[String]| {
+    hosts.set_craze_observer(Arc::new(move |m: &str, gen: u64, news: CrazeNews<'_>| {
+        if hold.holds(m, gen, &news) {
+            return;
+        }
         if let Some(l) = weak.upgrade() {
-            l.evict_craze(m, gen, gone);
+            l.craze_news(m, gen, news);
         }
     }));
     lanes
 }
 
+/// **A hand on the craze news hook** (C1 re-review): while it holds, every
+/// RETURN is held back instead of applied — the fold that minted it under the
+/// state lock paused before publishing it, the window every publisher has —
+/// until [`Self::release`] delivers it, after news minted LATER.
+#[derive(Default)]
+struct NewsHold {
+    holding: std::sync::atomic::AtomicBool,
+    held: std::sync::Mutex<Vec<HeldReturn>>,
+    /// The number of every return published, held or not, in order.
+    returns: std::sync::Mutex<Vec<u64>>,
+}
+
+/// A return a [`NewsHold`] held back, owned.
+struct HeldReturn {
+    machine: String,
+    gen: u64,
+    host_ids: Vec<String>,
+    seq: u64,
+}
+
+impl NewsHold {
+    fn hold_returns(&self, hold: bool) {
+        self.holding.store(hold, Ordering::SeqCst);
+    }
+
+    /// Note `news`, and hold it back if it is a return and this holds —
+    /// answering whether it did.
+    fn holds(&self, machine: &str, gen: u64, news: &CrazeNews<'_>) -> bool {
+        let CrazeNews::Returned { host_ids, seq } = *news else {
+            return false;
+        };
+        lock(&self.returns).push(seq);
+        if !self.holding.load(Ordering::SeqCst) {
+            return false;
+        }
+        lock(&self.held).push(HeldReturn {
+            machine: machine.to_string(),
+            gen,
+            host_ids: host_ids.to_vec(),
+            seq,
+        });
+        true
+    }
+
+    /// The number of the first return held back, once one is.
+    fn held_seq(&self) -> Option<u64> {
+        lock(&self.held).first().map(|held| held.seq)
+    }
+
+    /// The number of the last return published.
+    fn last_return(&self) -> Option<u64> {
+        lock(&self.returns).last().copied()
+    }
+
+    /// Deliver every return held back to `lanes`, in the order it was held.
+    fn release(&self, lanes: &Lanes) {
+        let held = std::mem::take(&mut *lock(&self.held));
+        for piece in &held {
+            let news = CrazeNews::Returned {
+                host_ids: &piece.host_ids,
+                seq: piece.seq,
+            };
+            lanes.craze_news(&piece.machine, piece.gen, news);
+        }
+    }
+}
+
+/// A departure of host A (`Removed`) minted under the state lock with the
+/// generation it is judged by — answering that number — to be published
+/// later, from another task: the news fence's general case. No publisher but
+/// the fold departs a lane today (plan 032 E6: End tab publishes nothing),
+/// so the cells play one, both halves apart, to pin that the lane layer
+/// orders news by its number and not by when it lands.
+fn departure_minted(hosts: &RoostHosts, id: &HostId) -> (u64, u64) {
+    let mut state = lock(&hosts.state);
+    let m = state.get_mut(id).expect("the host's state");
+    (m.craze.gen, m.craze.mint_news())
+}
+
+/// …and published, as a publisher would.
+fn departure_published(hosts: &RoostHosts, id: &HostId, (gen, seq): (u64, u64)) {
+    let ended = [HOST_A.to_string()];
+    publish_craze_gone(&hosts.on_craze, id, gen, seq, &ended, Departure::Removed);
+}
+
+/// The craze lane on `host_id`'s state on `machine` — `live`, `departing`,
+/// `finished` — or `None` with no entry.
+fn lane_state(lanes: &Lanes, machine: &str, host_id: &str) -> Option<&'static str> {
+    lanes.lane_state(machine, "craze", host_id)
+}
+
+/// `lane.messages`' `stale` for the craze lane on `host_id` — a finished
+/// lane's final reason.
+fn reason(lanes: &Lanes, machine: &str, host_id: &str) -> Value {
+    lanes
+        .messages(machine, "craze", host_id)
+        .expect("a craze lane stays readable")["stale"]
+        .clone()
+}
+
 /// **A roost snapshot does not evict a craze lane, and a `Ready` swap that
 /// drops its row does** (plan 025 §3.6.4): `reconcile` judges only the
-/// roost-stamped lanes, and the craze source's own reseed is what retires a
-/// craze one — an epoch reseed carries no `Removed`.
+/// roost-stamped lanes, and the craze source's own reseed is what ends a
+/// craze one — an epoch reseed carries no `Removed`. Since plan 032 the swap
+/// starts the lane's DEPARTURE, and the grace ends it `session_gone`: it stays
+/// registered and readable, finished — never removed, never `no_lane`.
 #[tokio::test]
 async fn a_craze_lane_outlives_roost_snapshots_and_leaves_with_its_row() {
     let fake = FakeRoost::start().await;
@@ -682,7 +802,8 @@ async fn a_craze_lane_outlives_roost_snapshots_and_leaves_with_its_row() {
         "a roost snapshot does not evict a craze lane"
     );
 
-    // The hub reseeds (a roster reset) WITHOUT host A: its lane goes.
+    // The hub reseeds (a roster reset) WITHOUT host A: its lane departs, and
+    // ends with the grace.
     roster.reset("sub-1", "omitted").await;
     let resub = roster.expect("sessions.subscribe").await;
     roster
@@ -692,10 +813,15 @@ async fn a_craze_lane_outlives_roost_snapshots_and_leaves_with_its_row() {
                    "sessions": [row(HOST_B, "ses-b")]}),
         )
         .await;
-    wait_for("the swap dropped A's lane", || {
-        (!lanes.is_open(LOCALHOST, "craze", HOST_A)).then_some(())
+    wait_for("the swap to depart A's lane", || {
+        (lane_state(&lanes, LOCALHOST, HOST_A) == Some("departing")).then_some(())
     })
     .await;
+    wait_for("the grace to end A's lane", || {
+        (lane_state(&lanes, LOCALHOST, HOST_A) == Some("finished")).then_some(())
+    })
+    .await;
+    assert_eq!(reason(&lanes, LOCALHOST, HOST_A), "session_gone");
     assert_eq!(craze_rows(&hosts).len(), 1);
 }
 
@@ -834,11 +960,12 @@ async fn a_remove_racing_a_reregistration_leaves_the_new_registration_whole() {
 }
 
 /// **A stale source's eviction never ends a newer generation's lane** (C9
-/// review): the shed's craze lane on hostId A is open; the shed is removed and
-/// registered again, and a lane on the SAME hostId opens through the new
-/// source. The old source's news — published, as its sink does, after its
-/// fence was passed — then arrives, and the new lane stays; the new
-/// generation's own news does end it.
+/// review): the shed's craze lane on hostId A is open; the shed is removed
+/// (the lane ends `host_removed` at once, and stays readable) and registered
+/// again, and a lane on the SAME hostId opens through the new source,
+/// REPLACING the finished one. The old source's news — published, as its sink
+/// does, after its fence was passed — then arrives, and the new lane stays
+/// live; the new generation's own news starts its departure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_sources_eviction_never_ends_a_new_generations_lane() {
     let (id, config) = srv_shed("s1");
@@ -861,10 +988,12 @@ async fn a_stale_sources_eviction_never_ends_a_new_generations_lane() {
     let old_gen = lock(&hosts.state).get(&id).expect("state").craze.gen;
 
     refresh(&hosts, &[]).await;
-    assert!(
-        !lanes.is_open(&address, "craze", HOST_A),
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("finished"),
         "removing the host ended its lane"
     );
+    assert_eq!(reason(&lanes, &address, HOST_A), "host_removed");
     refresh(&hosts, &["s1"]).await;
     new.probe.as_ref().unwrap().answer(Probe::Hub);
     let _new_end = new.roster(json!([row(HOST_A, "ses-a")])).await;
@@ -879,15 +1008,506 @@ async fn a_stale_sources_eviction_never_ends_a_new_generations_lane() {
     let new_gen = lock(&hosts.state).get(&id).expect("state").craze.gen;
     assert_ne!(old_gen, new_gen);
 
-    // The OLD source's news, late.
-    publish_craze_gone(&hosts.on_craze, &id, old_gen, &[HOST_A.to_string()]);
-    assert!(
-        lanes.is_open(&address, "craze", HOST_A),
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("live"),
+        "the new generation's lane replaced the finished one"
+    );
+
+    // The OLD source's news, late — numbered past anything of the new one's,
+    // which no other generation's number ever outranks (C1 re-review).
+    let gone = [HOST_A.to_string()];
+    publish_craze_gone(
+        &hosts.on_craze,
+        &id,
+        old_gen,
+        u64::MAX,
+        &gone,
+        Departure::Removed,
+    );
+    publish_craze(
+        &hosts.on_craze,
+        &id,
+        old_gen,
+        CrazeNews::HostRemoved { seq: u64::MAX },
+    );
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("live"),
         "a stale source's eviction never ends a newer generation's lane"
     );
     // The current generation's does.
-    publish_craze_gone(&hosts.on_craze, &id, new_gen, &[HOST_A.to_string()]);
-    assert!(!lanes.is_open(&address, "craze", HOST_A));
+    let seq = mint_news(&hosts, &id);
+    publish_craze_gone(
+        &hosts.on_craze,
+        &id,
+        new_gen,
+        seq,
+        &gone,
+        Departure::Removed,
+    );
+    assert_eq!(lane_state(&lanes, &address, HOST_A), Some("departing"));
+}
+
+/// `id`'s craze source's next news number, minted under the state lock as
+/// every publisher mints its own ([`crate::craze::CrazeState::mint_news`]).
+fn mint_news(hosts: &RoostHosts, id: &HostId) -> u64 {
+    lock(&hosts.state)
+        .get_mut(id)
+        .expect("the host's state")
+        .craze
+        .mint_news()
+}
+
+/// **A row listed again within the grace keeps its lane** (plan 032 §3.1.1
+/// item 3, W1 cell 2 through the real fold): the roster removes A — its lane
+/// departs — and lists it again before the grace ends; `HostCrazeSink::fold`
+/// publishes the return, and the lane stays live past the grace.
+#[tokio::test]
+async fn a_row_listed_again_within_the_grace_keeps_its_lane() {
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_over(&hosts);
+    let mut roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the row", || (craze_rows(&hosts).len() == 1).then_some(())).await;
+    lanes
+        .open(LOCALHOST, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+
+    roster
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_A]))
+        .await;
+    wait_for("the removal to depart the lane", || {
+        (lane_state(&lanes, LOCALHOST, HOST_A) == Some("departing")).then_some(())
+    })
+    .await;
+    roster
+        .roster("sub-1", EPOCH, json!([row(HOST_A, "ses-a")]), json!([]))
+        .await;
+    wait_for("the return to keep the lane", || {
+        (lane_state(&lanes, LOCALHOST, HOST_A) == Some("live")).then_some(())
+    })
+    .await;
+    tokio::time::sleep(GRACE * 2).await;
+    assert_eq!(
+        lane_state(&lanes, LOCALHOST, HOST_A),
+        Some("live"),
+        "the cancelled grace ended nothing"
+    );
+}
+
+/// **A Dormant departure expires `hub_gone`** (plan 032 PC14g, W1 cell 16
+/// through the real source): the remote hub's roster ends, the find-only
+/// probe finds no hub, the source goes Dormant — every row leaves WITH the
+/// hub — and the lane's grace ends it `hub_gone`, not `session_gone`.
+#[tokio::test]
+async fn a_dormant_sources_lane_ends_hub_gone() {
+    let craze = Scripted::attach_only();
+    let id = HostId::Machine("mini3".to_string());
+    let hosts = Arc::new(start_scripted(
+        &config_with(&["mini3"]),
+        &test_options(&[]),
+        vec![(id.clone(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_over(&hosts);
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::Hub);
+    let roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("live", || {
+        (status_of(&hosts, "mini3").unwrap()["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let address = id.address();
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+
+    // The hub goes: its roster connection ends, and the probe finds none.
+    roster.close().await;
+    probe.answer(Probe::NoHub);
+    wait_for("the source to go dormant", || {
+        (status_of(&hosts, "mini3").unwrap()["craze"]["state"] == "dormant").then_some(())
+    })
+    .await;
+    wait_for("the grace to end the lane", || {
+        (lane_state(&lanes, &address, HOST_A) == Some("finished")).then_some(())
+    })
+    .await;
+    assert_eq!(reason(&lanes, &address, HOST_A), "hub_gone");
+}
+
+/// **The hub gone between the probe and the roster's dial** (plan 032 §3.5,
+/// W5): the probe still saw a hub, but the roster's own dial — the find-only
+/// `bridge --hub --no-start` — finds none (`DialError::NoHub`, so the source
+/// says `Offline{NoHub}`). That is the source going DORMANT, not offline: every
+/// row leaves WITH the hub (a lane on one ends `hub_gone`), the subscription is
+/// dropped, and nothing redials — the next thing the source does is probe.
+#[tokio::test]
+async fn a_roster_that_finds_no_hub_sends_the_source_dormant() {
+    let craze = Scripted::attach_only();
+    let id = HostId::Machine("mini3".to_string());
+    let hosts = Arc::new(start_scripted(
+        &config_with(&["mini3"]),
+        &test_options(&[]),
+        vec![(id.clone(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_over(&hosts);
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::Hub);
+    let roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("live", || {
+        (status_of(&hosts, "mini3").unwrap()["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let address = id.address();
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+    // The lane has dialled its own connection (left unanswered), so the next
+    // dial is the roster's.
+    wait_for("the lane's dial", || {
+        (craze.hook.dials() == 2).then_some(())
+    })
+    .await;
+
+    // The roster ends; the probe still finds a hub; it is gone by the redial.
+    craze
+        .dial
+        .fail_next(DialError::NoHub("craze bridge: no hub is running".into()));
+    roster.close().await;
+    probe.answer(Probe::Hub);
+    wait_for("the source to go dormant", || {
+        (status_of(&hosts, "mini3").unwrap()["craze"]["state"] == "dormant").then_some(())
+    })
+    .await;
+    let status = status_of(&hosts, "mini3").unwrap();
+    assert_eq!(
+        status["craze"]["cause"],
+        Value::Null,
+        "dormant, not offline: {status}"
+    );
+    assert!(
+        craze_rows(&hosts).is_empty(),
+        "nothing is listed from craze"
+    );
+    assert_eq!(craze.hook.dials(), 3, "the roster's one find-only dial");
+    wait_for("the grace to end the lane", || {
+        (lane_state(&lanes, &address, HOST_A) == Some("finished")).then_some(())
+    })
+    .await;
+    assert_eq!(reason(&lanes, &address, HOST_A), "hub_gone");
+
+    // Dormant: the next thing is a probe, and it dials nothing.
+    probe.answer(Probe::NoHub);
+    wait_for("a dormant probe to take its answer", || {
+        lock(&probe.answers).is_empty().then_some(())
+    })
+    .await;
+    assert_eq!(craze.hook.dials(), 3, "a dormant source never redials");
+    assert_eq!(
+        status_of(&hosts, "mini3").unwrap()["craze"]["state"],
+        "dormant"
+    );
+}
+
+/// **A lane on a created-only row departs `hub_gone` when the hub goes
+/// before any seed** (plan 032 PC14g, branch review): a dormant remote
+/// machine's create starts a hub and answers with a session no roster has
+/// listed — the source's created row, which the transcript opens on at once —
+/// and the hub is gone again by the source's next probe, before its roster
+/// ever seeded. That Dormant departs the created row's lane with the
+/// roster's rows, and the grace ends it `hub_gone`. Before the fix a Dormant
+/// departed only the rows its roster had listed — none here — and nothing
+/// ever ended the lane on screen.
+#[tokio::test]
+async fn a_lane_on_a_created_row_departs_hub_gone_when_the_hub_goes_before_any_seed() {
+    let craze = Scripted::attach_only();
+    let id = HostId::Machine("mini3".to_string());
+    let hosts = Arc::new(start_scripted(
+        &config_with(&["mini3"]),
+        &test_options(&[]),
+        vec![(id.clone(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_over(&hosts);
+    let address = id.address();
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::NoHub);
+    wait_for("the source dormant", || {
+        lock(&hosts.state)
+            .get(&id)
+            .is_some_and(|m| m.craze.phase == Some(CrazePhase::Dormant))
+            .then_some(())
+    })
+    .await;
+    // The dormant source's next probe is asked before the create.
+    wait_for("the next probe", || {
+        (probe.calls.load(Ordering::SeqCst) == 2).then_some(())
+    })
+    .await;
+
+    // The create starts a hub (the explicit action's dial) and answers with a
+    // session no roster lists: the source's created row.
+    let create = {
+        let hosts = Arc::clone(&hosts);
+        let address = address.clone();
+        tokio::spawn(async move {
+            hosts
+                .craze_create(&address, create_req("shed-hub-gone-1"), false)
+                .await
+        })
+    };
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    hub.reply(&req, created_result("ses-new")).await;
+    let answer = create.await.unwrap().expect("created");
+    assert_eq!(answer["ended"], false, "{answer}");
+    assert!(
+        lock(&hosts.state)
+            .get(&id)
+            .is_some_and(|m| !m.craze.rows.contains_key(HOST_NEW)),
+        "no roster lists it: only the source's created row does"
+    );
+    lanes
+        .open(&address, "craze", HOST_NEW)
+        .await
+        .expect("the transcript of a just-created session opens at once");
+    // The lane's own connection, left unanswered.
+    let _lane_conn = craze.next().await;
+    assert_eq!(lane_state(&lanes, &address, HOST_NEW), Some("live"));
+
+    // The hub is gone by the source's next probe — before any seed. (The
+    // probe asked before the create looked too early to judge the session's
+    // hub — its answer is stale, C8 review finding 2 — so it is asked again,
+    // and that answer is the one that folds.)
+    probe.answer(Probe::NoHub);
+    probe.answer(Probe::NoHub);
+    wait_for("the grace to end the created row's lane", || {
+        (lane_state(&lanes, &address, HOST_NEW) == Some("finished")).then_some(())
+    })
+    .await;
+    assert_eq!(reason(&lanes, &address, HOST_NEW), "hub_gone");
+}
+
+/// **A re-registered host never adopts a departing lane** (plan 032 §3.1.1
+/// item 12, W1 cell 14): the lane departs (the roster removed its row), the
+/// host is removed — the lane ends `host_removed` at once, no grace — and is
+/// registered again, its NEW source listing the same hostId. That return is
+/// another generation's: the old lane stays finished. And `open` does not
+/// adopt it either — a fresh lane opens through the new source, filed under
+/// its generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reregistered_host_never_adopts_a_departing_lane() {
+    let (id, config) = srv_shed("s1");
+    let address = id.address();
+    let old = Scripted::attach_only();
+    let new = Scripted::attach_only();
+    let hosts = start_queued(&config, &id, vec![Arc::clone(&old), Arc::clone(&new)]);
+    let lanes = lanes_over(&hosts);
+    refresh(&hosts, &["s1"]).await;
+    old.probe.as_ref().unwrap().answer(Probe::Hub);
+    let mut old_end = old.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the old row", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("the old generation's lane");
+    let old_gen = lock(&hosts.state).get(&id).expect("state").craze.gen;
+    old_end
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_A]))
+        .await;
+    wait_for("the lane to depart", || {
+        (lane_state(&lanes, &address, HOST_A) == Some("departing")).then_some(())
+    })
+    .await;
+    // Another generation's return, while it departs: nothing.
+    publish_craze(
+        &hosts.on_craze,
+        &id,
+        old_gen + 1_000,
+        CrazeNews::Returned {
+            host_ids: &[HOST_A.to_string()],
+            seq: u64::MAX,
+        },
+    );
+    assert_eq!(lane_state(&lanes, &address, HOST_A), Some("departing"));
+
+    refresh(&hosts, &[]).await;
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("finished"),
+        "the host's removal swept its departing lane at once"
+    );
+    assert_eq!(reason(&lanes, &address, HOST_A), "host_removed");
+    refresh(&hosts, &["s1"]).await;
+    new.probe.as_ref().unwrap().answer(Probe::Hub);
+    let _new_end = new.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the new row", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    let new_gen = lock(&hosts.state).get(&id).expect("state").craze.gen;
+    assert_ne!(old_gen, new_gen);
+    tokio::time::sleep(GRACE).await;
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("finished"),
+        "the new source's listing revived nothing"
+    );
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("a fresh lane through the new source");
+    assert_eq!(lane_state(&lanes, &address, HOST_A), Some("live"));
+    assert_eq!(
+        lanes.messages(&address, "craze", HOST_A).expect("readable")["finished"],
+        false
+    );
+}
+
+/// The departure grace of the cells that order craze news: long enough that
+/// a cell's steps between a departure and its late news never outlast it.
+const ORDER_GRACE: Duration = Duration::from_secs(2);
+
+/// `localhost`'s craze roster listing host A, and a lane open on A — over an
+/// [`ORDER_GRACE`], with `hold` on the lanes' news. Answers the roster's
+/// connection, and the scripted craze it rides (kept alive by the cell).
+async fn lane_on_a(hold: &Arc<NewsHold>) -> (Arc<RoostHosts>, Arc<Lanes>, HubEnd, Arc<Scripted>) {
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_holding(&hosts, ORDER_GRACE, Arc::clone(hold));
+    let roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the row", || (craze_rows(&hosts).len() == 1).then_some(())).await;
+    lanes
+        .open(LOCALHOST, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+    (hosts, lanes, roster, craze)
+}
+
+/// Until A's lane is `state`.
+async fn lane_becomes(lanes: &Lanes, state: &'static str) {
+    wait_for(state, || {
+        (lane_state(lanes, LOCALHOST, HOST_A) == Some(state)).then_some(())
+    })
+    .await;
+}
+
+/// **A delayed return never cancels a newer departure** (C1
+/// re-review — the reported interleaving): the roster drops A, and its lane
+/// departs; a reseed restores the row, and its fold (the real one) mints the
+/// return and pauses before publishing it; a departure of the restored row
+/// completes, its departure minted AFTER the return, and publishes it — a
+/// duplicate for the departing lane, but newer news; THEN the return lands.
+/// The lane does not take it: it stays departing, and its grace still ends
+/// it `session_gone`, on time — at the first departure's deadline. Unfenced,
+/// the return revived the lane and cancelled its grace, and with no final
+/// event the 10 s end was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_return_never_cancels_a_newer_departure() {
+    let hold = Arc::new(NewsHold::default());
+    let (hosts, lanes, mut roster, _craze) = lane_on_a(&hold).await;
+
+    // The roster drops A: the lane departs, its grace from here.
+    let departed = std::time::Instant::now();
+    roster
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_A]))
+        .await;
+    lane_becomes(&lanes, "departing").await;
+
+    // A reseed restores A — and its fold pauses, the return minted.
+    hold.hold_returns(true);
+    roster.reset("sub-1", "omitted").await;
+    let resub = roster.expect("sessions.subscribe").await;
+    roster
+        .reply(
+            &resub,
+            json!({"subscription": "sub-2", "epoch": EPOCH, "cursor": 3,
+                   "sessions": [row(HOST_A, "ses-a")]}),
+        )
+        .await;
+    let back = wait_for("the reseed's return, held", || hold.held_seq()).await;
+    hold.hold_returns(false);
+
+    // a departure of the restored row: its departure, minted after the
+    // return, lands first.
+    let departure = departure_minted(&hosts, &local());
+    assert!(
+        back < departure.1,
+        "the return ({back}) was minted before the departure ({})",
+        departure.1
+    );
+    departure_published(&hosts, &local(), departure);
+    assert_eq!(lane_state(&lanes, LOCALHOST, HOST_A), Some("departing"));
+
+    // The delayed return lands.
+    hold.release(&lanes);
+    assert_eq!(
+        lane_state(&lanes, LOCALHOST, HOST_A),
+        Some("departing"),
+        "a return minted before the departure never revives the lane"
+    );
+    lane_becomes(&lanes, "finished").await;
+    let took = departed.elapsed();
+    assert!(
+        took >= ORDER_GRACE && took < ORDER_GRACE + Duration::from_secs(1),
+        "ended {took:?} after the row left (grace {ORDER_GRACE:?})"
+    );
+    assert_eq!(reason(&lanes, LOCALHOST, HOST_A), "session_gone");
+}
+
+/// **A stale departure never departs a lane a newer return kept**
+/// (C1 re-review — the reverse interleaving): a departure of A is minted and
+/// its task pauses before publishing it; meanwhile the roster drops A and
+/// lists it again — a departure and a return, minted by the real fold after
+/// it, and applied; THEN the departure lands. The lane already took
+/// newer news, so it stays live — no departure, no grace, no `session_gone` in
+/// 10 s for a row that is listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_departure_never_departs_a_returned_lane() {
+    let hold = Arc::new(NewsHold::default());
+    let (hosts, lanes, mut roster, _craze) = lane_on_a(&hold).await;
+
+    // A departure minted — and its task paused before publishing.
+    let departure = departure_minted(&hosts, &local());
+
+    // The roster drops A and lists it again, both after the departure.
+    roster
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_A]))
+        .await;
+    lane_becomes(&lanes, "departing").await;
+    roster
+        .roster("sub-1", EPOCH, json!([row(HOST_A, "ses-a")]), json!([]))
+        .await;
+    lane_becomes(&lanes, "live").await;
+    let back = hold.last_return().expect("the roster's return");
+    assert!(
+        departure.1 < back,
+        "the departure ({}) was minted before the return ({back})",
+        departure.1
+    );
+
+    // The stale departure lands.
+    departure_published(&hosts, &local(), departure);
+    assert_eq!(
+        lane_state(&lanes, LOCALHOST, HOST_A),
+        Some("live"),
+        "a departure minted before the return never departs the lane again"
+    );
 }
 
 /// **A craze tab the merge HIDES is still killable** (C9 review): with the
@@ -2169,6 +2789,20 @@ async fn a_created_session_stopped_before_any_roster_lists_it_leaves_the_listing
         json!(1),
         "the machine's count agrees"
     );
+    // `lane.open` on it answers the readable ENDED lane (plan 032 §3.1.1 item
+    // 9) — never a fresh one: its row is gone. And once the panel closes,
+    // nothing opens on it at all.
+    lanes
+        .open(LOCALHOST, "craze", HOST_NEW)
+        .await
+        .expect("the ended lane, readable");
+    assert_eq!(
+        lanes
+            .messages(LOCALHOST, "craze", HOST_NEW)
+            .expect("readable")["finished"],
+        true
+    );
+    lanes.close(LOCALHOST, "craze", HOST_NEW);
     let refused = lanes.open(LOCALHOST, "craze", HOST_NEW).await;
     assert!(refused.is_err(), "no lane opens on it: {refused:?}");
 }
@@ -2307,13 +2941,18 @@ async fn a_dormant_shed_is_offered_not_listed() {
         status_of(&hosts, SHED).is_none(),
         "nor is it in machines.list"
     );
+    let gen = lock(&hosts.state)
+        .get(&srv_shed("s1").0)
+        .expect("state")
+        .craze
+        .gen;
     assert_eq!(
         offered,
         vec![
             json!({"name": SHED, "label": "s1", "origin": SHED, "kind": "shed",
                     "craze": {"state": "dormant", "cause": null,
                               "create": false, "create_options": false,
-                              "create_title": false}})
+                              "create_title": false, "source_gen": gen}})
         ]
     );
 
@@ -2588,4 +3227,968 @@ async fn a_shed_whose_roost_answered_is_watched_before_its_first_inventory() {
         "no roost answered: {status}"
     );
     assert_eq!(status["connected_once"], false, "{status}");
+}
+
+// ---- plan 032 §3.4: the create sheet's Resume mode (C5) ----
+
+/// The saved session the resume cells list and reopen (craze's recipe id).
+const SAVED_ID: &str = "0192f0aa-6666-7000-8000-0000000reopen";
+
+/// A roster connection on a 0.2.0 hub — its `hello` says `reopen` — with
+/// `rows`.
+async fn reopen_roster(craze: &Scripted, rows: serde_json::Value) -> HubEnd {
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, reopen_hub_capabilities()).await;
+    hub.subscribed("sub-1", EPOCH, rows).await;
+    hub
+}
+
+/// The layer on `localhost` over `craze`, its roster live on a 0.2.0 hub
+/// listing [`HOST_A`]; the roster connection is handed back so it stays up.
+async fn live_reopen_host(craze: &Arc<Scripted>) -> (Arc<RoostHosts>, HubEnd) {
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(craze))],
+    ));
+    let roster = reopen_roster(craze, json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the roster, live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live" && craze_rows(&hosts).len() == 1)
+            .then_some(())
+    })
+    .await;
+    (hosts, roster)
+}
+
+/// The next connection of `craze`'s: a 0.2.0 hub's `hello`, then the one
+/// `session.reopen` it carries — for [`SAVED_ID`] — handed back.
+async fn reopen_asked(craze: &Scripted) -> (HubEnd, Value) {
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, reopen_hub_capabilities()).await;
+    let req = hub.expect("session.reopen").await;
+    assert_eq!(req["params"], json!({ "id": SAVED_ID }), "{req}");
+    (hub, req)
+}
+
+/// **A reopened session is listed and its transcript opens at once** (plan
+/// 032 §3.4, the create path's twin): `craze.reopen` asks the hub on a
+/// connection of its own, the answer's row — a hostId no roster frame names
+/// yet — is listed at once, live, and `lane.open` on it succeeds straight
+/// after; the answer says the session was started (`joined: false`), not
+/// ended, and echoes the saved id it was asked for — and names the host's
+/// CURRENT incarnation (`source_gen`, not `superseded`).
+#[tokio::test]
+async fn a_reopened_session_is_listed_and_openable_at_once() {
+    let craze = Scripted::eager();
+    let (hosts, _roster) = live_reopen_host(&craze).await;
+    let lanes = lanes_over(&hosts);
+    let gen = lock(&hosts.state).get(&local()).expect("state").craze.gen;
+
+    let reopening = {
+        let hosts = Arc::clone(&hosts);
+        tokio::spawn(async move { hosts.craze_reopen(LOCALHOST, SAVED_ID).await })
+    };
+    let (mut hub, req) = reopen_asked(&craze).await;
+    hub.reply(
+        &req,
+        json!({"session": roster_row(HOST_NEW, SAVED_ID, "/work/saved",
+                                     json!({"title": "a saved session", "activity": "idle",
+                                            "providerSessionId": "ses-saved"})),
+               "joined": false}),
+    )
+    .await;
+    let answer = reopening.await.unwrap().expect("reopened");
+    assert_eq!(answer["host_id"], HOST_NEW);
+    assert_eq!(answer["joined"], false);
+    assert_eq!(answer["ended"], false);
+    assert_eq!(answer["id"], SAVED_ID);
+    assert_eq!(answer["session"]["slug"], HOST_NEW);
+    assert_eq!(answer["session"]["stale"], false);
+    assert_eq!(answer["superseded"], false);
+    assert_eq!(answer["source_gen"], gen);
+
+    let listed = craze_rows(&hosts);
+    assert!(
+        listed.iter().any(|r| r["slug"] == HOST_NEW),
+        "listed at once: {listed:?}"
+    );
+    lanes
+        .open(LOCALHOST, "craze", HOST_NEW)
+        .await
+        .expect("the transcript of a just-reopened session opens at once");
+    assert!(lanes.is_open(LOCALHOST, "craze", HOST_NEW));
+}
+
+/// The reopen of [`SAVED_ID`] on `address`, answered `joined: true` with
+/// host A's row — the session a host still serves — on `craze`'s next
+/// connection.
+async fn rejoin_a(hosts: &Arc<RoostHosts>, craze: &Scripted, address: &str) -> Value {
+    let reopening = {
+        let hosts = Arc::clone(hosts);
+        let address = address.to_string();
+        tokio::spawn(async move { hosts.craze_reopen(&address, SAVED_ID).await })
+    };
+    let (mut hub, req) = reopen_asked(craze).await;
+    hub.reply(
+        &req,
+        json!({"session": row(HOST_A, "ses-a"), "joined": true}),
+    )
+    .await;
+    let answer = reopening.await.unwrap().expect("reopened");
+    assert_eq!(answer["host_id"], HOST_A);
+    assert_eq!(answer["joined"], true);
+    assert_eq!(answer["ended"], false, "{answer}");
+    assert_eq!(answer["superseded"], false, "{answer}");
+    answer
+}
+
+/// **A reopen that rejoins a departing lane's host keeps its lane** (plan 032
+/// §3.1.1 item 3, branch review): a remote hub goes — the source Dormant,
+/// the lane on its row departing `hub_gone` — while the session's host
+/// outlives it. Resume rejoins that host (`joined: true`) through a hub the
+/// reopen starts, and its listing of the answered row publishes the RETURN
+/// that cancels the departure: the lane is live at once, and stays live past
+/// the grace, though the source has not seeded again (its probe is held).
+/// Before the fix the listing published nothing, and the grace ended the
+/// panel of a session that runs before any roster caught up.
+#[tokio::test]
+async fn a_reopen_that_rejoins_a_departing_lanes_host_keeps_its_lane() {
+    let craze = Scripted::attach_only();
+    let id = HostId::Machine("mini3".to_string());
+    let hosts = Arc::new(start_scripted(
+        &config_with(&["mini3"]),
+        &test_options(&[]),
+        vec![(id.clone(), Arc::clone(&craze))],
+    ));
+    // A grace no step below outlasts before the reopen answers.
+    let lanes = lanes_holding(&hosts, ORDER_GRACE, Arc::new(NewsHold::default()));
+    let address = id.address();
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::Hub);
+    let roster = reopen_roster(&craze, json!([row(HOST_A, "ses-a")])).await;
+    wait_for("live", || {
+        (status_of(&hosts, "mini3")?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+    // The lane's own connection, left unanswered: the session's host lives.
+    let _lane_conn = craze.next().await;
+
+    // The hub goes: its roster ends, and the probe finds none.
+    roster.close().await;
+    probe.answer(Probe::NoHub);
+    wait_for("the lane to depart", || {
+        (lane_state(&lanes, &address, HOST_A) == Some("departing")).then_some(())
+    })
+    .await;
+
+    // Resume rejoins the host, through the hub the reopen starts.
+    rejoin_a(&hosts, &craze, &address).await;
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("live"),
+        "the listing's return cancelled the departure"
+    );
+    tokio::time::sleep(ORDER_GRACE + Duration::from_millis(500)).await;
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("live"),
+        "the cancelled grace ended nothing"
+    );
+    assert!(
+        lock(&hosts.state)
+            .get(&id)
+            .is_some_and(|m| m.craze.phase == Some(CrazePhase::Dormant)),
+        "and no seed did it: the source is still dormant"
+    );
+}
+
+/// **A listing's delayed return never cancels a newer departure** (plan 032
+/// §3.1.1 item 3, branch review — C1's first finding, for the publisher a
+/// create's or reopen's listing now is): a reopen joins a session the roster
+/// lists, and its listing mints the return under the state lock and pauses
+/// before publishing it; the roster then drops the row — its fold's
+/// departure minted after that return, and applied; THEN the return lands.
+/// The lane does not take it: it stays departing, and its grace ends it
+/// `session_gone`. The news fence orders the listing's return as it orders
+/// every other piece of craze news.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listings_delayed_return_never_cancels_a_newer_departure() {
+    let hold = Arc::new(NewsHold::default());
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_holding(&hosts, ORDER_GRACE, Arc::clone(&hold));
+    let mut roster = reopen_roster(&craze, json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the row", || (craze_rows(&hosts).len() == 1).then_some(())).await;
+    lanes
+        .open(LOCALHOST, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+    let _lane_conn = craze.next().await;
+
+    // The reopen joins A: its listing's return is minted, and held back.
+    hold.hold_returns(true);
+    rejoin_a(&hosts, &craze, LOCALHOST).await;
+    assert!(
+        hold.held_seq().is_some(),
+        "the listing published a return, held"
+    );
+    hold.hold_returns(false);
+
+    // The roster drops A: the fold's departure, minted after it, lands first.
+    roster
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_A]))
+        .await;
+    lane_becomes(&lanes, "departing").await;
+
+    // The delayed return lands.
+    hold.release(&lanes);
+    assert_eq!(
+        lane_state(&lanes, LOCALHOST, HOST_A),
+        Some("departing"),
+        "a return minted before the departure never revives the lane"
+    );
+    lane_becomes(&lanes, "finished").await;
+    assert_eq!(reason(&lanes, LOCALHOST, HOST_A), "session_gone");
+}
+
+// ---- C8 review: a no-hub answer judged against the listings since it was
+// asked; a create's or reopen's listing always returns its row ----
+
+/// `mini3`, attach-only through `craze`, with its lanes over a `grace`
+/// departure grace: the layer, the lanes, and the machine's id.
+fn remote_host(craze: &Arc<Scripted>, grace: Duration) -> (Arc<RoostHosts>, Arc<Lanes>, HostId) {
+    let id = HostId::Machine("mini3".to_string());
+    let hosts = Arc::new(start_scripted(
+        &config_with(&["mini3"]),
+        &test_options(&[]),
+        vec![(id.clone(), Arc::clone(craze))],
+    ));
+    let lanes = lanes_holding(&hosts, grace, Arc::new(NewsHold::default()));
+    (hosts, lanes, id)
+}
+
+/// Until `id`'s craze source is Dormant.
+async fn dormant_at(hosts: &RoostHosts, id: &HostId) {
+    wait_for("the source dormant", || {
+        lock(&hosts.state)
+            .get(id)
+            .is_some_and(|m| m.craze.phase == Some(CrazePhase::Dormant))
+            .then_some(())
+    })
+    .await;
+}
+
+/// The reopen of [`SAVED_ID`] on `address`, answered `joined: false` with
+/// [`HOST_NEW`]'s row — a session no roster lists, which the source keeps as
+/// a created row — on `craze`'s next connection.
+async fn reopen_new(hosts: &Arc<RoostHosts>, craze: &Scripted, address: &str) {
+    let reopening = {
+        let hosts = Arc::clone(hosts);
+        let address = address.to_string();
+        tokio::spawn(async move { hosts.craze_reopen(&address, SAVED_ID).await })
+    };
+    let (mut hub, req) = reopen_asked(craze).await;
+    hub.reply(
+        &req,
+        json!({"session": roster_row(HOST_NEW, SAVED_ID, "/work/saved",
+                                     json!({"title": "a saved session", "activity": "idle",
+                                            "providerSessionId": "ses-saved"})),
+               "joined": false}),
+    )
+    .await;
+    let answer = reopening.await.unwrap().expect("reopened");
+    assert_eq!(answer["host_id"], HOST_NEW);
+    assert_eq!(answer["ended"], false, "{answer}");
+}
+
+/// **A create listed after its hub went still revives its lane — the
+/// accepted limitation** (C8 review): a remote create is answered, and its
+/// listing is delayed; a lane opens on the created row meanwhile; the hub
+/// goes — the roster ends, the probe finds none — and the Dormant departs
+/// that lane. THEN the listing runs. The source still lists the row (it
+/// retains its created rows), and the listing returns it as every listing
+/// does: the lane is live again, and the row stays listed — openable. The
+/// desktop cannot tell this Dormant from one resting on a probe that looked
+/// before the create's hub started, and sides with the session. If the hub
+/// stays gone, later evidence ends the lane: the next probe started after
+/// the listing finds no hub (one asked before it is stale, and asked again),
+/// its Dormant departs the created row again, and the grace ends the lane
+/// `hub_gone`.
+#[tokio::test]
+async fn a_create_listed_after_its_hub_went_still_revives_its_lane() {
+    let craze = Scripted::attach_only();
+    let (hosts, lanes, id) = remote_host(&craze, ORDER_GRACE);
+    let address = id.address();
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::Hub);
+    let roster = craze.roster(json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, "mini3")?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+
+    // The create is answered, and its listing held back.
+    let (gap, reached, proceed) = test_gap();
+    *lock(&hosts.create_gap) = Some(gap);
+    let create = {
+        let hosts = Arc::clone(&hosts);
+        let address = address.clone();
+        tokio::spawn(async move {
+            hosts
+                .craze_create(&address, create_req("shed-late-1"), false)
+                .await
+        })
+    };
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    hub.reply(&req, created_result("ses-new")).await;
+    reached.notified().await;
+    lanes
+        .open(&address, "craze", HOST_NEW)
+        .await
+        .expect("the created row's lane opens before its listing");
+    let _lane_conn = craze.next().await;
+
+    // The hub goes, and the Dormant departs the lane.
+    roster.close().await;
+    probe.answer(Probe::NoHub);
+    wait_for("the lane to depart", || {
+        (lane_state(&lanes, &address, HOST_NEW) == Some("departing")).then_some(())
+    })
+    .await;
+
+    // The delayed listing returns the row all the same.
+    proceed.notify_one();
+    let answer = create.await.unwrap().expect("created");
+    assert_eq!(
+        answer["ended"], false,
+        "the source still lists it: {answer}"
+    );
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_NEW),
+        Some("live"),
+        "the listing's return cancelled the departure"
+    );
+    assert!(
+        hosts.craze_lanes(&address).contains_key(HOST_NEW),
+        "and the row is listed: openable"
+    );
+
+    // The hub stays gone: a probe from after the listing finds none.
+    probe.answer(Probe::NoHub);
+    probe.answer(Probe::NoHub);
+    wait_for("the lane to depart again", || {
+        (lane_state(&lanes, &address, HOST_NEW) == Some("departing")).then_some(())
+    })
+    .await;
+    wait_for("the grace to end the lane", || {
+        (lane_state(&lanes, &address, HOST_NEW) == Some("finished")).then_some(())
+    })
+    .await;
+    assert_eq!(reason(&lanes, &address, HOST_NEW), "hub_gone");
+}
+
+/// **A reopen answered after its hub went still revives its lane, and its
+/// row stays openable** (C8 review; c8b review finding 1): Resume rejoins
+/// host A's session while A's lane is live, and the hub goes while the
+/// reopen is in flight — the Dormant departs the lane and drops A from the
+/// listing — before craze's answer arrives. The answer's listing returns A
+/// all the same and folds the roster's row (the shared source still holds
+/// it) back in ahead of its frame: the lane is live at once, A is listed
+/// again, and a panel that closes the lane and opens it again resolves the
+/// row — no seed needed, the source still Dormant. With C8's dormancy epoch
+/// the listing returned nothing and folded nothing ahead: the lane waited on
+/// the next seed, and `lane.open` on A failed until one came.
+#[tokio::test]
+async fn a_reopen_answered_after_its_hub_went_revives_its_lane_and_stays_openable() {
+    let craze = Scripted::attach_only();
+    let (hosts, lanes, id) = remote_host(&craze, ORDER_GRACE);
+    let address = id.address();
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::Hub);
+    let roster = reopen_roster(&craze, json!([row(HOST_A, "ses-a")])).await;
+    wait_for("live", || {
+        (status_of(&hosts, "mini3")?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+    let _lane_conn = craze.next().await;
+
+    // Resume rejoins A; craze has not answered yet.
+    let reopening = {
+        let hosts = Arc::clone(&hosts);
+        let address = address.clone();
+        tokio::spawn(async move { hosts.craze_reopen(&address, SAVED_ID).await })
+    };
+    let (mut hub, req) = reopen_asked(&craze).await;
+
+    // The hub goes meanwhile: the Dormant departs the lane, and drops A.
+    roster.close().await;
+    probe.answer(Probe::NoHub);
+    wait_for("the lane to depart", || {
+        (lane_state(&lanes, &address, HOST_A) == Some("departing")).then_some(())
+    })
+    .await;
+    assert!(
+        !hosts.craze_lanes(&address).contains_key(HOST_A),
+        "the Dormant dropped A from the listing"
+    );
+
+    // craze's answer arrives after the Dormant.
+    hub.reply(
+        &req,
+        json!({"session": row(HOST_A, "ses-a"), "joined": true}),
+    )
+    .await;
+    let answer = reopening.await.unwrap().expect("reopened");
+    assert_eq!(answer["ended"], false, "{answer}");
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("live"),
+        "the listing's return cancelled the departure"
+    );
+    assert!(
+        hosts.craze_lanes(&address).contains_key(HOST_A),
+        "listed again: openable"
+    );
+
+    // The panel closes the lane and opens it again: the row resolves.
+    lanes.close(&address, "craze", HOST_A);
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("the row resolves: a fresh lane");
+    let _again = craze.next().await;
+    assert_eq!(lane_state(&lanes, &address, HOST_A), Some("live"));
+    assert!(
+        lock(&hosts.state)
+            .get(&id)
+            .is_some_and(|m| m.craze.phase == Some(CrazePhase::Dormant)),
+        "and no seed did any of it: the source is still dormant"
+    );
+}
+
+/// **A no-hub probe that folds before a reopen is listed never ends the
+/// resumed lane** (c8b review finding 2): A's lane is live on the roster;
+/// the hub goes — the roster ends — while A's host outlives it, and the
+/// source's next probe is asked, and held: it looks while no hub runs.
+/// Resume is sent, and starts a hub of its own that rejoins A's host; THEN
+/// the held probe answers what it saw — no hub. Nothing was listed since it
+/// started, so its Dormant folds and departs A's lane. Resume's answer is
+/// listed after that: its return cancels the departure, and the lane stays
+/// live past the grace while the replacement probe is held (an ordinary slow
+/// connection) — and when that probe finds Resume's hub, the seed listing A
+/// keeps it live. With C8's dormancy epoch the return was withheld (the
+/// Dormant folded after the request went out), and the grace ended a running
+/// session's panel `hub_gone` whenever the replacement seed came later than
+/// it.
+#[tokio::test]
+async fn a_no_hub_folded_before_a_reopen_is_listed_never_ends_the_resumed_lane() {
+    let craze = Scripted::attach_only();
+    let (hosts, lanes, id) = remote_host(&craze, ORDER_GRACE);
+    let address = id.address();
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::Hub);
+    let roster = reopen_roster(&craze, json!([row(HOST_A, "ses-a")])).await;
+    wait_for("live", || {
+        (status_of(&hosts, "mini3")?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    lanes
+        .open(&address, "craze", HOST_A)
+        .await
+        .expect("the craze lane");
+    let _lane_conn = craze.next().await;
+
+    // The hub goes: the roster ends, and the next probe is asked — and held.
+    roster.close().await;
+    wait_for("the next probe", || {
+        (probe.calls.load(Ordering::SeqCst) == 2).then_some(())
+    })
+    .await;
+
+    // Resume is sent (its own dial starts a hub that rejoins A's host).
+    let reopening = {
+        let hosts = Arc::clone(&hosts);
+        let address = address.clone();
+        tokio::spawn(async move { hosts.craze_reopen(&address, SAVED_ID).await })
+    };
+    let (mut hub, req) = reopen_asked(&craze).await;
+
+    // The held probe answers what it saw: no hub. Its Dormant departs A.
+    probe.answer(Probe::NoHub);
+    wait_for("the lane to depart", || {
+        (lane_state(&lanes, &address, HOST_A) == Some("departing")).then_some(())
+    })
+    .await;
+
+    // Resume's answer is listed after that Dormant.
+    hub.reply(
+        &req,
+        json!({"session": row(HOST_A, "ses-a"), "joined": true}),
+    )
+    .await;
+    let answer = reopening.await.unwrap().expect("reopened");
+    assert_eq!(answer["ended"], false, "{answer}");
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("live"),
+        "the listing's return cancelled the departure"
+    );
+
+    // The replacement probe is slow: the lane outlives the grace.
+    tokio::time::sleep(ORDER_GRACE + Duration::from_millis(500)).await;
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_A),
+        Some("live"),
+        "the cancelled grace ended nothing"
+    );
+    assert!(
+        lock(&hosts.state)
+            .get(&id)
+            .is_some_and(|m| m.craze.phase == Some(CrazePhase::Dormant)),
+        "no seed has come"
+    );
+
+    // The probe finds Resume's hub, and its seed lists A: the lane stays.
+    probe.answer(Probe::Hub);
+    let _roster = reopen_roster(&craze, json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the seed", || {
+        (status_of(&hosts, "mini3")?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    assert_eq!(lane_state(&lanes, &address, HOST_A), Some("live"));
+}
+
+/// **A no-hub probe older than a reopen never departs the session it
+/// started** (C8 review finding 2 — the reported interleaving): a dormant
+/// machine's next probe is asked, and has not answered; Resume starts a hub
+/// and a session on it, the row is listed, and its transcript opens; THEN
+/// that probe answers what it saw — no hub. A listing came after the probe
+/// started, so its answer is stale: it is not folded, the lane stays live
+/// past the grace, and the source asks again at once. Before the fix the
+/// answer departed the new session's row with news newer than the listing's,
+/// and the grace ended a running session's panel `hub_gone`.
+#[tokio::test]
+async fn a_no_hub_probe_older_than_a_reopen_never_departs_its_session() {
+    let craze = Scripted::attach_only();
+    let (hosts, lanes, id) = remote_host(&craze, GRACE);
+    let address = id.address();
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::NoHub);
+    dormant_at(&hosts, &id).await;
+    // The next probe is asked — and held.
+    wait_for("the next probe", || {
+        (probe.calls.load(Ordering::SeqCst) == 2).then_some(())
+    })
+    .await;
+
+    // Resume starts the session; its row is listed, and its lane opens.
+    reopen_new(&hosts, &craze, &address).await;
+    lanes
+        .open(&address, "craze", HOST_NEW)
+        .await
+        .expect("the reopened session's lane");
+    let _lane_conn = craze.next().await;
+
+    // The held probe answers: no hub — as there was none when it looked.
+    probe.answer(Probe::NoHub);
+    wait_for("the source to ask again", || {
+        (probe.calls.load(Ordering::SeqCst) == 3).then_some(())
+    })
+    .await;
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_NEW),
+        Some("live"),
+        "a no-hub answer older than the listing departs nothing"
+    );
+    tokio::time::sleep(GRACE * 2).await;
+    assert_eq!(lane_state(&lanes, &address, HOST_NEW), Some("live"));
+}
+
+/// A dial whose next dial waits at a [`TestGap`] before dialling `inner` —
+/// the roster's, in the cell below, whose explicit actions dial `inner`
+/// itself (the reach's `ensure`) and never wait.
+struct PauseNext {
+    inner: Arc<dyn CrazeDial>,
+    gap: std::sync::Mutex<Option<TestGap>>,
+}
+
+impl CrazeDial for PauseNext {
+    fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
+        let gap = lock(&self.gap).take();
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            if let Some((reached, proceed)) = gap {
+                reached.notify_one();
+                proceed.notified().await;
+            }
+            inner.dial().await
+        })
+    }
+
+    fn fall_back(&self, err: &DialError) -> bool {
+        self.inner.fall_back(err)
+    }
+}
+
+/// **A roster's no-hub dial older than a reopen never departs the session it
+/// started** (C8 review finding 2, the roster's path): a dormant machine's
+/// probe finds a hub, and its roster's `--no-start` dial starts — and is held
+/// — while Resume starts a session on a hub of its own, lists the row, and
+/// opens its transcript; THEN that dial finds no hub. It started before the
+/// listing, so its answer is stale like a probe's: not folded — the lane
+/// stays live, the source Dormant as its last folded answer left it — and
+/// the source probes again at once.
+#[tokio::test]
+async fn a_roster_no_hub_older_than_a_reopen_never_departs_its_session() {
+    let craze = Scripted::attach_only();
+    let pause = Arc::new(PauseNext {
+        inner: Arc::clone(&craze.hook) as Arc<dyn CrazeDial>,
+        gap: std::sync::Mutex::new(None),
+    });
+    let id = HostId::Machine("mini3".to_string());
+    // The roster and the lanes dial through `pause`; Resume through the hook.
+    let reach = CrazeReach {
+        dial: Arc::clone(&pause) as Arc<dyn CrazeDial>,
+        ensure: Some(Arc::clone(&craze.hook) as Arc<dyn CrazeDial>),
+        ..craze.reach()
+    };
+    let only = id.clone();
+    let hosts = Arc::new(RoostHosts::start_with(
+        &tokio::runtime::Handle::current(),
+        &config_with(&["mini3"]),
+        test_options(&[]),
+        false,
+        Arc::new(|| {}),
+        CrazeReaches::Fixed(Arc::new(move |h: &HostId| {
+            (*h == only).then(|| reach.clone())
+        })),
+        timings(),
+    ));
+    let lanes = lanes_holding(&hosts, GRACE, Arc::new(NewsHold::default()));
+    let address = id.address();
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::NoHub);
+    dormant_at(&hosts, &id).await;
+
+    // The probe finds a hub, and the roster's dial is held.
+    let (gap, reached, proceed) = test_gap();
+    *lock(&pause.gap) = Some(gap);
+    probe.answer(Probe::Hub);
+    reached.notified().await;
+
+    // Resume starts the session; its row is listed, and its lane opens.
+    reopen_new(&hosts, &craze, &address).await;
+    lanes
+        .open(&address, "craze", HOST_NEW)
+        .await
+        .expect("the reopened session's lane");
+    let _lane_conn = craze.next().await;
+
+    // The held roster dial finds no hub.
+    let calls = probe.calls.load(Ordering::SeqCst);
+    craze
+        .dial
+        .fail_next(DialError::NoHub("craze bridge: no hub is running".into()));
+    proceed.notify_one();
+    wait_for("the source to ask again", || {
+        (probe.calls.load(Ordering::SeqCst) > calls).then_some(())
+    })
+    .await;
+    assert_eq!(
+        lane_state(&lanes, &address, HOST_NEW),
+        Some("live"),
+        "a no-hub dial older than the listing departs nothing"
+    );
+    assert_eq!(
+        status_of(&hosts, "mini3").unwrap()["craze"]["state"],
+        "dormant",
+        "nothing folded: the source is as its last folded answer left it"
+    );
+    tokio::time::sleep(GRACE * 2).await;
+    assert_eq!(lane_state(&lanes, &address, HOST_NEW), Some("live"));
+}
+
+/// **The saved sessions are craze's, read afresh** (plan 032 §3.4):
+/// `craze.saved` asks `sessions.saved{limit: 50}` on a connection of its own
+/// and answers craze's rows as the contract's — the id opaque, the times in
+/// Unix ms, Go's zero creation time absent — with craze's `more`, and the
+/// incarnation it came through (`source_gen`).
+#[tokio::test]
+async fn saved_lists_crazes_saved_sessions() {
+    let craze = Scripted::eager();
+    let (hosts, _roster) = live_reopen_host(&craze).await;
+    let gen = lock(&hosts.state).get(&local()).expect("state").craze.gen;
+    let listing = {
+        let hosts = Arc::clone(&hosts);
+        tokio::spawn(async move { hosts.craze_saved(LOCALHOST).await })
+    };
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, reopen_hub_capabilities()).await;
+    let req = hub.expect("sessions.saved").await;
+    assert_eq!(req["params"], json!({ "limit": 50 }), "{req}");
+    hub.reply(
+        &req,
+        json!({"sessions": [
+                  {"id": SAVED_ID, "crazeSessionId": SAVED_ID, "provider": "grok",
+                   "providerSessionId": "ses-saved", "workspace": "/work/saved",
+                   "title": "a saved session", "createdAt": "0001-01-01T00:00:00Z",
+                   "updatedAt": "2026-10-12T10:00:00Z"},
+                  {"id": "grok:legacy", "provider": "grok", "providerSessionId": "legacy",
+                   "workspace": "/work/old", "createdAt": "2026-10-01T09:00:00Z",
+                   "updatedAt": "2026-10-01T10:00:00Z"}],
+               "more": true}),
+    )
+    .await;
+    let answer = listing.await.unwrap().expect("the saved sessions");
+    assert_eq!(answer["machine"], LOCALHOST);
+    let sessions = answer["saved"]["sessions"].as_array().unwrap();
+    assert_eq!(
+        sessions.iter().map(|s| s["id"].clone()).collect::<Vec<_>>(),
+        [json!(SAVED_ID), json!("grok:legacy")],
+        "craze's order, the ids opaque"
+    );
+    assert_eq!(sessions[0]["workspace"], "/work/saved");
+    assert_eq!(sessions[0]["title"], "a saved session");
+    assert_eq!(
+        sessions[0]["updated_unix_ms"],
+        shed_core::time::rfc3339_unix_ms("2026-10-12T10:00:00Z").unwrap()
+    );
+    assert!(
+        sessions[0].get("created_unix_ms").is_none(),
+        "Go's zero time is no time: {}",
+        sessions[0]
+    );
+    assert!(sessions[1].get("title").is_none(), "{}", sessions[1]);
+    assert_eq!(answer["saved"]["more"], true);
+    assert_eq!(answer["source_gen"], gen);
+}
+
+/// **A reopen that outlives its host's incarnation is `superseded`, never
+/// folded** (C5 review): the shed is removed and registered again — the same
+/// address, a NEW craze source — while its reopen is held at the hub. The
+/// answer, when it comes, is the OLD source's: `superseded` (not `ended` —
+/// the session runs), its row the last known (stale), `source_gen` the old
+/// generation — and nothing is listed under the new incarnation, whose source
+/// never saw it, so nothing could open on it. A reopen on the CURRENT
+/// incarnation says `superseded: false` ([`a_reopened_session_is_listed_and_openable_at_once`]).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopen_that_outlives_its_hosts_incarnation_is_superseded() {
+    let (id, config) = srv_shed("s1");
+    let address = id.address();
+    let old = Scripted::attach_only();
+    let new = Scripted::attach_only();
+    let hosts = start_queued(&config, &id, vec![Arc::clone(&old), Arc::clone(&new)]);
+    refresh(&hosts, &["s1"]).await;
+    old.probe.as_ref().unwrap().answer(Probe::Hub);
+    let _old_roster = reopen_roster(&old, json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the old source's row", || {
+        craze_rows(&hosts)
+            .iter()
+            .any(|r| r["slug"] == HOST_A && r["stale"] == false)
+            .then_some(())
+    })
+    .await;
+    let old_gen = lock(&hosts.state).get(&id).expect("state").craze.gen;
+
+    let reopening = {
+        let hosts = Arc::clone(&hosts);
+        let address = address.clone();
+        tokio::spawn(async move { hosts.craze_reopen(&address, SAVED_ID).await })
+    };
+    let (mut hub, req) = reopen_asked(&old).await;
+    // Removed, and registered again, while the reopen is held at the hub.
+    refresh(&hosts, &[]).await;
+    refresh(&hosts, &["s1"]).await;
+    let new_gen = lock(&hosts.state)
+        .get(&id)
+        .expect("the new registration's state")
+        .craze
+        .gen;
+    assert_ne!(old_gen, new_gen, "a new incarnation");
+
+    hub.reply(
+        &req,
+        json!({"session": roster_row(HOST_NEW, SAVED_ID, "/work/saved",
+                                     json!({"title": "a saved session", "activity": "idle",
+                                            "providerSessionId": "ses-saved"})),
+               "joined": false}),
+    )
+    .await;
+    let answer = reopening.await.unwrap().expect("answered");
+    assert_eq!(answer["superseded"], true, "{answer}");
+    assert_eq!(answer["ended"], false, "the session runs: {answer}");
+    assert_eq!(answer["session"]["stale"], true, "the last known: {answer}");
+    assert_eq!(answer["source_gen"], old_gen);
+    let listed = craze_rows(&hosts);
+    assert!(
+        !listed.iter().any(|r| r["slug"] == HOST_NEW),
+        "nothing listed under the new incarnation: {listed:?}"
+    );
+}
+
+/// **Every craze status names the host's incarnation** (C5 re-review): a
+/// shed's `shed_craze` entry while dormant, and its status row once listed,
+/// carry `craze.source_gen` — the generation `craze.create_options`,
+/// `craze.saved` and `craze.reopen` report. Removed and registered again
+/// under the same address, the shed is a new incarnation whose status names
+/// a new, LARGER generation from its first appearance: what the sheet resets
+/// its Resume state on (a reopen the old one left running included) with no
+/// create-options read, which may fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_craze_status_names_the_hosts_incarnation() {
+    let (id, config) = srv_shed("s1");
+    let old = Scripted::attach_only();
+    let new = Scripted::attach_only();
+    let hosts = start_queued(&config, &id, vec![Arc::clone(&old), Arc::clone(&new)]);
+    let gen_now = || lock(&hosts.state).get(&id).expect("state").craze.gen;
+    let offered_gen = || {
+        shed_craze_of(&hosts)
+            .into_iter()
+            .find(|e| e["origin"] == SHED)
+            .map(|e| e["craze"]["source_gen"].clone())
+    };
+
+    refresh(&hosts, &["s1"]).await;
+    probe_answers(old.probe.as_ref().unwrap(), Probe::NoHub).await;
+    let old_gen = gen_now();
+    assert_eq!(offered_gen(), Some(json!(old_gen)), "the dormant entry's");
+
+    // Removed, and registered again under the same address.
+    refresh(&hosts, &[]).await;
+    assert_eq!(offered_gen(), None, "removed: nothing names it");
+    refresh(&hosts, &["s1"]).await;
+    let new_probe = new.probe.as_ref().unwrap();
+    probe_answers(new_probe, Probe::NoHub).await;
+    let new_gen = gen_now();
+    assert!(
+        new_gen > old_gen,
+        "a later incarnation's is the larger: {old_gen}, then {new_gen}"
+    );
+    assert_eq!(
+        offered_gen(),
+        Some(json!(new_gen)),
+        "the new entry names the new incarnation"
+    );
+
+    // Listed by its first Ready: its status row names the same one.
+    new_probe.answer(Probe::Hub);
+    let _hub = new.roster(json!([row(HOST_A, "ses-a")])).await;
+    let listed = wait_for("listed by its first Ready", || status_of(&hosts, SHED)).await;
+    assert_eq!(listed["craze"]["source_gen"], new_gen, "{listed}");
+}
+
+/// **A hub without `reopen` is refused before any dial** (plan 032 PC14i):
+/// a LIVE source whose hub's `hello` lacks `reopen` (craze 0.1.x) answers
+/// both resume ops `unavailable`, in shed-craze's one older-hub wording —
+/// naming no version or pid, which this layer never holds (PC10) — and
+/// nothing is dialled.
+#[tokio::test]
+async fn a_hub_without_reopen_refuses_resume_before_any_dial() {
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let _roster = craze.roster(json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let dials = craze.hook.dials();
+    let words = shed_craze::errors::reopen_unsupported_by("", None);
+    assert!(
+        words.starts_with("this craze hub (craze version unknown) does not offer reopening"),
+        "{words}"
+    );
+    let e = hosts.craze_saved(LOCALHOST).await.unwrap_err();
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        ("unavailable", words.as_str())
+    );
+    let e = hosts.craze_reopen(LOCALHOST, SAVED_ID).await.unwrap_err();
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        ("unavailable", words.as_str())
+    );
+    assert_eq!(craze.hook.dials(), dials, "refused before any dial");
+}
+
+/// **A reopen's refusal keeps its variant** (plan 032 §3.4): craze's
+/// `unknown_session` is `gone` (the sheet drops the row),
+/// `not_accepting`/`start_failed` is `start_failed` with craze's cause (the
+/// row kept), and `unavailable` stays `unavailable` (Retry) — and none of
+/// them lists anything.
+#[tokio::test]
+async fn a_reopen_refusal_keeps_its_variant_as_the_code() {
+    let craze = Scripted::eager();
+    let (hosts, _roster) = live_reopen_host(&craze).await;
+    let cases = [
+        ("unknown_session", "unknown_session", json!({}), "gone"),
+        (
+            "not_accepting",
+            "start_failed",
+            json!({"cause": "grok exited: no key"}),
+            "start_failed",
+        ),
+        ("unavailable", "busy", json!({}), "unavailable"),
+    ];
+    for (code, reason, extra, want) in cases {
+        let reopening = {
+            let hosts = Arc::clone(&hosts);
+            tokio::spawn(async move { hosts.craze_reopen(LOCALHOST, SAVED_ID).await })
+        };
+        let (mut hub, req) = reopen_asked(&craze).await;
+        hub.refuse(&req, code, reason, extra).await;
+        let e = reopening.await.unwrap().unwrap_err();
+        assert_eq!(e.code, want, "{code}/{reason}: {e:?}");
+        if want == "start_failed" {
+            assert_eq!(e.message, "could not start: grok exited: no key");
+        }
+    }
+    let rows = craze_rows(&hosts);
+    assert_eq!(rows.len(), 1, "nothing listed: {rows:?}");
+}
+
+/// **The home a workspace is shortened by is one this app KNOWS** (plan 032
+/// §3.4): this machine's own `HOME` for the implicit `localhost`, every
+/// shed's `/home/shed`, and none for a configured machine — reached over
+/// ssh, its home never learned (a machine configured AS `localhost` too).
+#[tokio::test]
+async fn the_resume_home_is_known_never_guessed() {
+    let hosts = start_scripted(&config_with(&["mini3"]), &test_options(&[]), vec![]);
+    assert_eq!(
+        hosts.craze_home(&local()),
+        std::env::var("HOME")
+            .ok()
+            .filter(|h| h.starts_with('/') && h.len() > 1)
+    );
+    assert_eq!(
+        hosts.craze_home(&HostId::Shed {
+            server: "srv".into(),
+            name: "s1".into()
+        }),
+        Some("/home/shed".to_string())
+    );
+    assert_eq!(hosts.craze_home(&HostId::Machine("mini3".into())), None);
+    let configured = start_scripted(&config_with(&[LOCALHOST]), &test_options(&[]), vec![]);
+    assert_eq!(
+        configured.craze_home(&local()),
+        None,
+        "an ssh-reached localhost"
+    );
 }

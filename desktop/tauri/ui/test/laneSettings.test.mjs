@@ -3,7 +3,12 @@
  *
  * The cases marked CONTROL are the ones plan 025's C11 control list names: the
  * sheet shown when the capabilities say `settings: false`, and a change lost to
- * a drop not marked "not confirmed" until the next `Settings`. */
+ * a drop not marked "not confirmed" until the next `Settings`.
+ *
+ * Which option is the effort is NOT decided here (plan 032 PC14h): it is
+ * craze's `EffortOption`, run by the shared core and handed over as the view's
+ * `effort_option` — its cases are Rust tables (`shed_core::lane`'s tests). The
+ * chip cases below feed that id explicitly. */
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -17,11 +22,12 @@ import {
   choiceName,
   compactTokens,
   controlFor,
-  effortOption,
   fastOn,
   markText,
+  modelEffortLine,
   pressSends,
   rowNamed,
+  secondaryLine,
   settingsChip,
   settingsOffered,
   settle,
@@ -124,23 +130,40 @@ test("CONTROL (A13): an option is bound to the model the sheet DISPLAYED", () =>
 });
 
 test("the chip: model name · effort value · fast, from the current values", () => {
-  assert.equal(settingsChip(grok46), "Grok 4.6 · High · fast");
-  // fast OFF says nothing; `effort` outranks `thinking`, both thought_level.
-  assert.equal(settingsChip(opus), "Claude Opus 5 · Max");
+  assert.equal(settingsChip(grok46, "effort"), "Grok 4.6 · High · fast");
+  // fast OFF says nothing.
+  assert.equal(settingsChip(opus, "effort"), "Claude Opus 5 · Max");
   // grok's own effort is a model_option named reasoning_effort.
   assert.equal(settingsChip({
     model: "grok-4.6", models: [{ id: "grok-4.6", name: "Grok 4.6" }], modes: [],
     options: [{ id: "reasoning_effort", name: "Effort", category: "model_option", current: "high",
                 values: [{ id: "low", name: "Low" }, { id: "high", name: "High" }] }],
-  }), "Grok 4.6 · High");
+  }, "reasoning_effort"), "Grok 4.6 · High");
   // A model the list does not name reads as its id; nothing at all reads Settings.
-  assert.equal(settingsChip({ model: "m-1", models: [], modes: [], options: [] }), "m-1");
+  assert.equal(settingsChip({ model: "m-1", models: [], modes: [], options: [] }, null), "m-1");
   assert.equal(settingsChip({ models: [], modes: [{ id: "a", name: "A" }], options: [] }), "Settings");
 });
 
-test("the effort select and the fast toggle are craze's own readings", () => {
-  assert.equal(effortOption(opus.options).id, "effort");
-  assert.equal(effortOption([opus.options[0]]), undefined, "thinking is no effort");
+test("the chip's effort is the option the view NAMES — never a guess from the options", () => {
+  // The view's `effort_option` is the shared core's reading; the chip only
+  // looks the named option up. Thinking named: thinking is what it shows.
+  assert.equal(settingsChip(opus, "thinking"), "Claude Opus 5 · On");
+  // None named (a model whose options hold no effort, or a view with no
+  // settings shown): no effort part, however the options are called.
+  assert.equal(settingsChip(opus, null), "Claude Opus 5");
+  assert.equal(settingsChip(opus), "Claude Opus 5");
+  assert.equal(settingsChip(grok46, undefined), "Grok 4.6 · fast");
+  // A name the options do not hold (a view and settings out of step) is none.
+  assert.equal(settingsChip(grok46, "reasoning"), "Grok 4.6 · fast");
+  // glm-5.2's reasoning select, named: its current value.
+  assert.equal(settingsChip({
+    model: "glm-5.2", models: grok46.models, modes: [],
+    options: [{ id: "reasoning", name: "Reasoning", category: "thought_level", current: "max",
+                values: [{ id: "high", name: "High" }, { id: "max", name: "Max" }] }],
+  }, "reasoning"), "GLM 5.2 · Max");
+});
+
+test("the fast toggle is craze's own reading", () => {
   assert.equal(fastOn(grok46.options), true);
   assert.equal(fastOn(opus.options), false);
   // On is the value that is not off — by name or spelling, never by position.
@@ -148,6 +171,63 @@ test("the effort select and the fast toggle are craze's own readings", () => {
                          values: [{ id: "on", name: "Turbo" }, { id: "off", name: "Off" }] }]), true);
   assert.equal(choiceName(grok46.models, "glm-5.2"), "GLM 5.2");
   assert.equal(choiceName(grok46.models, null), null);
+});
+
+/** A NATIVE session's models (plan 032 §3.3): craze 0.2.0's effort facts on
+ *  each — the levels, the default, and the level a switch lands on. */
+const native = {
+  model: "grok-4.6",
+  models: [
+    { id: "grok-4.6", name: "Grok 4.6",
+      effort: { efforts: ["low", "medium", "high"], default_effort: "high", switch_effort: "low" } },
+    // Switched to before: lands on its last choice, not its default.
+    { id: "claude-opus-5", name: "Claude Opus 5",
+      effort: { efforts: ["low", "high", "max"], default_effort: "high", switch_effort: "max" } },
+    // Never chosen this session: its default.
+    { id: "gpt-6", name: "GPT 6", effort: { efforts: ["low", "high"], default_effort: "low" } },
+    // Levels and no level named: nothing to say.
+    { id: "glm-5.2", name: "GLM 5.2", effort: { efforts: ["high", "max"] } },
+    // No effort control at all.
+    { id: "composer-2.5", name: "Composer 2.5" },
+  ],
+  modes: [],
+  options: [{ id: "effort", name: "Effort", category: "thought_level", current: "medium", values: [
+    { id: "low", name: "Low" }, { id: "medium", name: "Medium" }, { id: "high", name: "High" },
+  ] }],
+};
+
+test("the model list's effort line: where a switch lands — switch_effort, else default_effort", () => {
+  const [current, opus5, gpt6, glm, composer] = native.models;
+  assert.equal(modelEffortLine(opus5, native.model), "effort → max", "switch_effort first");
+  assert.equal(modelEffortLine(gpt6, native.model), "effort → low", "else default_effort");
+  assert.equal(modelEffortLine(glm, native.model), null, "levels, but neither named");
+  assert.equal(modelEffortLine(composer, native.model), null, "no effort facts");
+  // The current model says nothing: its effort row shows its effort.
+  assert.equal(modelEffortLine(current, native.model), null);
+  // A model that is current no longer says where it lands.
+  assert.equal(modelEffortLine(current, "claude-opus-5"), "effort → low");
+  // No current model: every model with a level says it.
+  assert.equal(modelEffortLine(current, null), "effort → low");
+  // An empty level is none (a producer that wrote "" rather than omit it).
+  assert.equal(modelEffortLine({ id: "m", name: "M", effort: { efforts: ["a"], switch_effort: "", default_effort: "a" } },
+                               null), "effort → a");
+  assert.equal(modelEffortLine({ id: "m", name: "M", effort: null }, null), null);
+});
+
+test("the secondary line rides the model list alone, and none on an ACP session", () => {
+  const rows = sheetRows(native);
+  const model = rowNamed(rows, "model");
+  assert.deepEqual(model.values.map((v) => secondaryLine(model, v)),
+                   [null, "effort → max", "effort → low", null, null]);
+  // An option's values and a mode's never carry one.
+  const effort = rowNamed(rows, "effort");
+  assert.deepEqual(effort.values.map((v) => secondaryLine(effort, v)), [null, null, null]);
+  const withModes = sheetRows({ ...native, mode: "agent", modes: [{ id: "agent", name: "Agent" }] });
+  const mode = rowNamed(withModes, "mode");
+  assert.equal(secondaryLine(mode, mode.values[0]), null);
+  // An ACP session (cursor's permodel): no model carries facts, so no line.
+  const acp = rowNamed(sheetRows(grok46), "model");
+  assert.deepEqual(acp.values.map((v) => secondaryLine(acp, v)), [null, null, null, null]);
 });
 
 test("CONTROL: offered only when the capabilities say settings — the capability alone decides", () => {
@@ -217,7 +297,7 @@ test("CONTROL: the fixtures' labels carry no invisible characters", () => {
   // an equality reads (CodeRabbit, C11). Every name a fixture here offers is
   // plain text.
   const invisible = /[\u200B-\u200D\u2060\uFEFF]/;
-  for (const s of [grok46, opus]) {
+  for (const s of [grok46, opus, native]) {
     const names = [
       ...s.models.map((m) => m.name),
       ...s.modes.map((m) => m.name),

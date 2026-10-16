@@ -24,7 +24,8 @@
 //! `session.snapshot`, `asks.get`, and the verbs `session.prompt`,
 //! `session.cancel`, `asks.answer` and `session.stop` — and the settings
 //! milestone's `session.set` (C11), and plan 029's `session.setTitle` (and
-//! `session.create`'s `title`). The attachment's notifications (`event`,
+//! `session.create`'s `title`) — and plan 032's `sessions.saved` and
+//! `session.reopen`, the source's again. The attachment's notifications (`event`,
 //! `synchronized`, `ready`, `presence`, `reset`) decode here as envelopes; an
 //! event's body is the fold's to read (`crate::fold`).
 
@@ -60,6 +61,10 @@ pub mod method {
     pub const SESSIONS_SUBSCRIBE: &str = "sessions.subscribe";
     pub const SESSIONS_CREATE_OPTIONS: &str = "sessions.createOptions";
     pub const SESSION_CREATE: &str = "session.create";
+    /// The saved sessions, and a reopen of one (plan 032 §3.4) — the hub's,
+    /// where its `hello` says `reopen`.
+    pub const SESSIONS_SAVED: &str = "sessions.saved";
+    pub const SESSION_REOPEN: &str = "session.reopen";
     // The lane's (C8).
     pub const SESSION_CONNECT: &str = "session.connect";
     pub const SESSIONS_LIST: &str = "sessions.list";
@@ -153,7 +158,11 @@ pub mod code {
 /// (`host_unreachable`, `busy`, `closing`), a hub that cannot create, a
 /// connection without its `hello`, a success that could not be sent — leaves
 /// the outcome unknown (plan 026 §3.1 and AM1,
-/// [`crate::errors::REPLAY_UNKNOWN`]).
+/// [`crate::errors::REPLAY_UNKNOWN`]). And one place that DOES decide a
+/// variant on the reason, documented as the exception it is (plan 032
+/// PC14e): `session.reopen`'s `not_accepting`, whose `not_resumable` drops
+/// the saved row and whose `start_failed` keeps it
+/// ([`crate::errors::reopen_error`]).
 pub mod reason {
     pub const PROTOCOL_VERSION: &str = "protocol_version";
     pub const START_FAILED: &str = "start_failed";
@@ -165,6 +174,8 @@ pub mod reason {
     pub const HELLO_REQUIRED: &str = "hello_required";
     pub const FAILED: &str = "failed";
     pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
+    /// A saved session that cannot run here any more (plan 032 §3.4).
+    pub const NOT_RESUMABLE: &str = "not_resumable";
 }
 
 // ---- outbound ----
@@ -253,6 +264,22 @@ pub struct CreateParams {
     pub request_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+}
+
+/// `sessions.saved`'s params (plan 032 §3.4) — **only** `limit`: no
+/// `workspace` filter (§4.5) and never `subAgents` (an unattended session is
+/// not a person's to resume).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SavedParams {
+    pub limit: u32,
+}
+
+/// `session.reopen`'s params: the saved session's `id`, opaque, exactly as
+/// `sessions.saved` gave it. No `requestId`: a reopen's safety is the
+/// session's claim, not an id (PM "`session.reopen`", "Retry by session").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReopenParams {
+    pub id: String,
 }
 
 // ---- outbound: the lane's (C8) ----
@@ -609,6 +636,11 @@ pub struct ConnCapabilities {
     /// The hub's `session.create` takes a `title` (craze 0.1.1, plan 029 D8).
     #[serde(default)]
     pub create_title: bool,
+    /// The hub serves `sessions.saved` and `session.reopen` (craze 0.2.0,
+    /// plan 032 §3.4) — a client checks it, and hides its resume entry
+    /// without it.
+    #[serde(default)]
+    pub reopen: bool,
 }
 
 /// `hello`'s `codecs`.
@@ -714,6 +746,59 @@ pub struct CreateResult {
     pub prompt_error: Option<String>,
 }
 
+/// `sessions.saved`'s result (plan 032 §3.4). Rows stay raw JSON here: each
+/// is read on its own ([`SavedSession`]), so one that does not read costs that
+/// row and not the list.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct SavedResult {
+    #[serde(default)]
+    pub sessions: Vec<Value>,
+    /// Sessions the filters kept were left out — by the limit, or by craze's
+    /// 1 MiB bound on the result.
+    #[serde(default)]
+    pub more: bool,
+}
+
+/// One saved session (PM "`SavedSession`"). Every member defaults; a row
+/// without an `id` is nothing a reopen can name, and the source drops it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedSession {
+    /// What reopens it — opaque: its craze id, or
+    /// `<provider>:<providerSessionId>` for a row from before craze ids.
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub craze_session_id: Option<String>,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub provider_session_id: String,
+    #[serde(default)]
+    pub workspace: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// UTC; Go's zero time (`0001-01-01T00:00:00Z`) for a row that records
+    /// none.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// Listed only when `subAgents` asked — which this crate never does.
+    #[serde(default)]
+    pub sub_agent: bool,
+}
+
+/// `session.reopen`'s result: the running session's roster row (kept raw — it
+/// is read as a create's row is, [`RosterRow::from_value`]) and whether the
+/// hub joined a host that already served it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ReopenResult {
+    pub session: Value,
+    #[serde(default)]
+    pub joined: bool,
+}
+
 // ---- inbound: the lane's (C8) ----
 
 /// The session info document (PM "The session info document"): an attach
@@ -771,6 +856,7 @@ pub struct Catalogs {
 
 /// One model: the info document's, and a `catalog` section's (one shape).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CatalogModel {
     #[serde(default)]
     pub id: String,
@@ -780,6 +866,18 @@ pub struct CatalogModel {
     /// absent for a model not remembered.
     #[serde(default)]
     pub recent: Option<u32>,
+    /// Its **effort facts** (craze 0.2.0, PM "The session info document",
+    /// plan 032 §3.3) — a native session's alone (`capabilities.effortFacts`),
+    /// absent for every ACP provider's model and on an older host: the
+    /// levels it offers, in order (empty for a model with no effort control)…
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    /// …its default level…
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    /// …and the level a switch to it lands on.
+    #[serde(default)]
+    pub switch_effort: Option<String>,
 }
 
 /// One mode.
@@ -1180,6 +1278,31 @@ mod tests {
             serde_json::to_value(&titled).unwrap(),
             json!({"cwd": "/w", "requestId": "r-1", "title": "Flaky test"})
         );
+    }
+
+    /// Plan 032's two requests carry exactly their members — `sessions.saved`
+    /// its `limit` (never `subAgents`, never a workspace), `session.reopen`
+    /// its `id` (no `requestId`) — and a hub `hello`'s `reopen` reads `true`
+    /// where it is said and `false` where an older hub omits it.
+    #[test]
+    fn saved_and_reopen_carry_only_their_members_and_reopen_reads_from_the_hello() {
+        assert_eq!(
+            std::str::from_utf8(
+                &request_line("2", method::SESSIONS_SAVED, &SavedParams { limit: 50 }).unwrap()
+            )
+            .unwrap(),
+            r#"{"jsonrpc":"2.0","id":"2","method":"sessions.saved","params":{"limit":50}}"#
+        );
+        assert_eq!(
+            serde_json::to_value(ReopenParams {
+                id: "grok:4f1e2d3c".into()
+            })
+            .unwrap(),
+            json!({"id": "grok:4f1e2d3c"})
+        );
+        let caps = |v: Value| ConnCapabilities::deserialize(v).unwrap();
+        assert!(caps(json!({"rosterSubscribe": true, "reopen": true})).reopen);
+        assert!(!caps(json!({"rosterSubscribe": true, "createTitle": true})).reopen);
     }
 
     #[test]

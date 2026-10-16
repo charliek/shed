@@ -43,6 +43,12 @@
 //!   retry (the ceiling), so installing craze lights the machine up without a
 //!   restart. An `Offline` is said once per distinct cause and reason, not per
 //!   attempt.
+//! - A dial that attaches only to a running hub (the desktop's remote `bridge
+//!   --hub --no-start`, plan 032 §3.5) and finds none is `Offline{NoHub}`
+//!   ([`crate::dial::DialError::NoHub`]) — not an outage, nothing to attach
+//!   to. The source redials on its ordinary backoff like any `Offline`; the
+//!   desktop, whose attach-only loop drops a subscription at its first
+//!   `Offline`, reads this one as DORMANT and probes again on its slow clock.
 //! - The channel's overflow (module doc correction 13) ends the cycle with
 //!   the connection dropped, waits for the client to drain holding nothing,
 //!   backs off, and reseeds as `Reset{lagged} … Ready`.
@@ -130,6 +136,47 @@
 //! and `create` through a second dial, on a clone that shares this source's
 //! rows — so a create through it is openable through the roster's source.
 //!
+//! # `saved` and `reopen` (plan 032 §3.4)
+//!
+//! Both are the hub's where its `hello` says `reopen` (craze 0.2.0) — judged
+//! on the `hello` of the very connection that would carry the request, so a
+//! hub without it is [`LaneError::Unavailable`] /
+//! [`LaneReopenError::Unavailable`] in [`reopen_unsupported`]'s words with
+//! NOTHING sent; [`AgentSource::create_options`] carries the same bit
+//! ([`LaneCreateOptions::reopen`], PC11) so a create dialog knows whether to
+//! offer its resume mode without a roster of its own.
+//!
+//! - `saved` is `create_options`-shaped: one request on its own connection,
+//!   `sessions.saved{limit: SAVED_LIMIT}` under [`REQUEST_DEADLINE`] — never
+//!   `subAgents`, never a workspace filter — mapped by [`lane_saved_sessions`].
+//! - `reopen` is `session.reopen{id}` on a connection of ITS OWN (craze: "one
+//!   short connection per reopen" — the hub answers a connection in order and
+//!   a reopen holds it until its session's start is done), allowing
+//!   [`REOPEN_DEADLINE`] for each answer. **A lost answer** — the connection
+//!   ended, or the deadline passed (craze counts both as lost, PM "Retry by
+//!   session") — **is sent again ONCE, the same `{id}`, on a fresh
+//!   connection**: a reopen means "ensure this session is running", so a
+//!   resend joins whatever host serves it then. A second loss, a resend whose
+//!   dial fails, a resend that reaches a hub which cannot reopen, or a success
+//!   shed cannot read (craze answered ok: the session may run, and a resend
+//!   would read the same) is [`REOPEN_LOST`](crate::errors::REOPEN_LOST) —
+//!   `Unavailable`, Retry is safe (PC14d) — so the worst case is two
+//!   [`REOPEN_DEADLINE`]s plus the dials.
+//!   Every definite refusal is [`reopen_error`]'s, never resent.
+//! - **A reopen's row is a created row** (`Held`): `open(hostId)` binds a
+//!   lane that knows it before any roster lists it, under every rule above —
+//!   but it is FRESH (PC14f): a reopen ensures the session runs NOW, so a
+//!   tombstone for its hostId (a host let go within craze's replay window) is
+//!   lifted rather than refusing it. A roster that already lists the hostId
+//!   (`joined: true` on a session the roster shows) keeps its own row.
+//! - **A reopen that may have started a session wakes the source** — its
+//!   success, and every lost answer: each subscription's roster pump that is
+//!   waiting out its reconnect backoff (no hub until the reopen's own dial
+//!   birthed one) redials now rather than up to [`BACKOFF_MAX`] later. A
+//!   connected roster lists the session on the hub's next flush anyway.
+//! - **No cancellation**: dropping the future drops the connection, which
+//!   abandons the WAIT — craze runs the reopen on to its end regardless.
+//!
 //! # The row (P11)
 //!
 //! A row's id is its `hostId` — the key the roster is keyed by, and what the
@@ -152,22 +199,28 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Deserialize;
+
 use shed_core::lane::backoff::{jittered, next_backoff};
 use shed_core::lane::{
     AgentLane, AgentSource, LaneCreateOptions, LaneCreateRequest, LaneCreated, LaneError,
-    LanePromptOutcome, LaneProvider, LaneProviderState, LaneSession, LaneStop, Publish,
-    SourceCapabilities, SourceEvent, SourceOffline, SourcePublisher, SourceSubscription,
-    MAX_SOURCE_ROWS,
+    LanePromptOutcome, LaneProvider, LaneProviderState, LaneReopenError, LaneReopened,
+    LaneSavedSession, LaneSavedSessions, LaneSession, LaneStop, Publish, SourceCapabilities,
+    SourceEvent, SourceOffline, SourcePublisher, SourceSubscription, MAX_SOURCE_ROWS,
 };
 use shed_core::rc::RcActivity;
 
 use crate::conn::{lock, CallError, Conn, HubHello, Notifications, HELLO_DEADLINE};
 use crate::dial::{connect_hub, CrazeDial, DialError, DIAL_DEADLINE};
-use crate::errors::{create_error, lane_error, outcome_unknown, unknown_why};
+use crate::errors::{
+    create_error, is_reopen_lost, is_reopen_unsupported, lane_error, outcome_unknown, reopen_error,
+    reopen_lost, reopen_unsupported, unknown_why,
+};
 use crate::lane::{CrazeLane, LaneTimings};
 use crate::wire::{
     self, method, notify, ClientInfo, ConnCapabilities, CreateOptionsResult, CreateParams,
-    CreateResult, Empty, HostRow, ResetParams, RosterParams, RosterRow, SubscribeResult,
+    CreateResult, Empty, HostRow, ReopenParams, ReopenResult, ResetParams, RosterParams, RosterRow,
+    SavedParams, SavedResult, SavedSession, SubscribeResult,
 };
 
 /// The agent token: [`AgentSource::kind`], `SourceCapabilities::kind` and
@@ -185,8 +238,18 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// craze's refusal rather than by this deadline.
 pub const CREATE_DEADLINE: Duration = Duration::from_secs(120);
 /// Every other request's deadline (`sessions.subscribe`, which the hub answers
-/// within a second; `sessions.createOptions`, a config read).
+/// within a second; `sessions.createOptions`, a config read; `sessions.saved`,
+/// an index read).
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+/// How long ONE `session.reopen` answer may take (plan 032 §3.4): craze bounds
+/// a reopen at 180 s from its admission (a provider's `session/load` alone may
+/// take 90 s) and asks a client to allow "at least 200 s", so a slow start is
+/// reported by craze's own refusal rather than by this deadline. A lost answer
+/// is sent again once, so a reopen can take two of these.
+pub const REOPEN_DEADLINE: Duration = Duration::from_secs(200);
+/// How many saved sessions `sessions.saved` is asked for — craze's own default
+/// (it allows 1 to 200); [`LaneSavedSessions::more`] says when there were more.
+pub const SAVED_LIMIT: u32 = 50;
 
 /// The source's clocks — the defaults are the pinned ones; a test shortens
 /// them.
@@ -200,6 +263,8 @@ pub struct Timings {
     pub request: Duration,
     /// [`CREATE_DEADLINE`].
     pub create: Duration,
+    /// [`REOPEN_DEADLINE`].
+    pub reopen: Duration,
     /// [`BACKOFF_BASE`].
     pub backoff_base: Duration,
     /// [`BACKOFF_MAX`].
@@ -213,6 +278,7 @@ impl Default for Timings {
             hello: HELLO_DEADLINE,
             request: REQUEST_DEADLINE,
             create: CREATE_DEADLINE,
+            reopen: REOPEN_DEADLINE,
             backoff_base: BACKOFF_BASE,
             backoff_max: BACKOFF_MAX,
         }
@@ -226,6 +292,7 @@ pub fn source_capabilities(caps: &ConnCapabilities) -> SourceCapabilities {
         create: caps.session_create,
         create_options: caps.create_options,
         create_title: caps.create_title,
+        reopen: caps.reopen,
     }
 }
 
@@ -415,6 +482,18 @@ impl Held {
             },
         );
     }
+
+    /// A reopen's row (plan 032 §3.4): kept exactly as a create's is
+    /// ([`Held::remember_created`]) — but FRESH (PC14f). A tombstone stops a
+    /// replayed create's answer resurrecting a session that ended; a reopen's
+    /// answer is craze saying the session runs NOW, on this host, so a
+    /// tombstone for the hostId (the roster or a lane let a host serving it go
+    /// within the replay window) is lifted rather than refusing it. A roster
+    /// that lists the hostId still keeps its own row.
+    fn remember_reopened(&mut self, session: &LaneSession, session_id: &str) {
+        self.gone.retain(|(h, _)| h != &session.id);
+        self.remember_created(session, session_id);
+    }
 }
 
 /// [`Held`], shared by a source's clones.
@@ -453,6 +532,11 @@ pub struct CrazeSource {
     timings: Timings,
     lane_timings: LaneTimings,
     rows: Rows,
+    /// Cuts every roster pump's reconnect wait short — shared, like `rows`, by
+    /// every clone ([`CrazeSource::dialling`] included), so a reopen through
+    /// the user's dial wakes the roster's (the module doc, "`saved` and
+    /// `reopen`").
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for CrazeSource {
@@ -475,6 +559,7 @@ impl CrazeSource {
             timings: Timings::default(),
             lane_timings: LaneTimings::default(),
             rows: Arc::default(),
+            wake: Arc::default(),
         }
     }
 
@@ -513,6 +598,15 @@ impl CrazeSource {
     /// hostId the roster let go, bounded).
     fn remember_created(&self, session: &LaneSession, session_id: &str) {
         lock(&self.rows).remember_created(session, session_id);
+    }
+
+    /// Wake every roster pump of this source that is waiting out its
+    /// reconnect backoff, so it redials now (a reopen that may have started a
+    /// session — the module doc). A pump that is connected, or dialling, is
+    /// not waiting and is untouched: it lists the session on the hub's next
+    /// flush anyway.
+    fn wake_rosters(&self) {
+        self.wake.notify_waiters();
     }
 
     /// **The created rows this source holds right now** — answered by its
@@ -575,7 +669,11 @@ impl CrazeSource {
 
     /// One create attempt. `retry` says an earlier attempt's outcome is
     /// unknown — so even a failure to reach craze leaves it unknown.
-    async fn create_once(&self, params: &CreateParams, retry: bool) -> Attempt {
+    async fn create_once(
+        &self,
+        params: &CreateParams,
+        retry: bool,
+    ) -> Attempt<LaneCreated, LaneError> {
         let (conn, _notes, hello) = match self.connect().await {
             Ok(c) => c,
             Err(e) if retry => {
@@ -622,25 +720,143 @@ impl CrazeSource {
             Err(e) => Attempt::Done(Err(LaneError::Failed(e.to_string()))),
         }
     }
+
+    /// One reopen attempt on a connection of its own. `resend` says an earlier
+    /// attempt's answer was lost, so the session may already run: a failure to
+    /// reach a hub that can reopen is then lost too, never a definite
+    /// "unreachable" or "too old" (the module doc).
+    async fn reopen_once(
+        &self,
+        params: &ReopenParams,
+        resend: bool,
+    ) -> Attempt<LaneReopened, LaneReopenError> {
+        let (conn, _notes, hello) = match self.connect().await {
+            Ok(c) => c,
+            Err(e) if resend => {
+                return Attempt::Done(Err(reopen_lost(&format!(
+                    "the resend could not reach craze: {e}"
+                ))))
+            }
+            // Nothing was sent: what the dial says, quiet where it is quiet.
+            Err(e) => {
+                return Attempt::Done(Err(match e.into_lane_error() {
+                    LaneError::Unavailable(m) => LaneReopenError::Unavailable(m),
+                    other => LaneReopenError::Lane(other),
+                }))
+            }
+        };
+        // A hub that cannot reopen — its `hello` says so, or its refusal does:
+        // the older-hub words, nothing sent; on a resend, lost (the first try
+        // may have started the session on the hub this one replaced).
+        let cannot = || {
+            let why = reopen_unsupported(&hello);
+            if resend {
+                reopen_lost(&format!(
+                    "the resend reached a hub that cannot reopen: {why}"
+                ))
+            } else {
+                LaneReopenError::Unavailable(why)
+            }
+        };
+        if !hello.capabilities.reopen {
+            return Attempt::Done(Err(cannot()));
+        }
+        match conn
+            .request(method::SESSION_REOPEN, params, self.timings.reopen)
+            .await
+        {
+            // craze answered ok: the session runs, even when shed cannot read
+            // the answer — then it is lost, never a definite failure.
+            Ok(result) => match reopened(result) {
+                Ok((reopened, session_id)) => {
+                    lock(&self.rows).remember_reopened(&reopened.session, &session_id);
+                    Attempt::Done(Ok(reopened))
+                }
+                Err(why) => Attempt::Done(Err(reopen_lost(&why))),
+            },
+            Err(CallError::Refused(e)) if is_reopen_unsupported(&e) => Attempt::Done(Err(cannot())),
+            Err(CallError::Refused(e)) => Attempt::Done(Err(reopen_error(&e, &hello))),
+            Err(e) if e.outcome_unknown() => Attempt::Unknown(e.to_string()),
+            Err(e) => Attempt::Done(Err(LaneReopenError::Lane(LaneError::Failed(format!(
+                "session.reopen: {e}"
+            ))))),
+        }
+    }
 }
 
-/// What one create attempt came to.
-///
-/// `Done` carries a whole created row and dwarfs `Unknown` (clippy's
-/// `large_enum_variant`); one is built per create attempt, at most two per
-/// create, so boxing would buy nothing.
-#[allow(clippy::large_enum_variant)]
-enum Attempt {
-    /// A definite answer: the id's life is over.
-    Done(Result<LaneCreated, LaneError>),
-    /// Sent, and no answer: whether it ran is unknown.
+/// `session.reopen`'s result as the contract's, with the session's craze
+/// `sessionId` (what a lane opened on it carries) — or why shed cannot read it
+/// (a lost answer: craze answered ok). A row with no `row` of the host's own —
+/// the one the hub builds from its registry when its fresh read failed — reads
+/// as an approximate row, as a create's does.
+fn reopened(result: serde_json::Value) -> Result<(LaneReopened, String), String> {
+    let r: ReopenResult = serde_json::from_value(result).map_err(|e| {
+        format!("craze answered session.reopen with something shed cannot read: {e}")
+    })?;
+    let row = RosterRow::from_value(&r.session).map_err(|e| {
+        format!("craze reopened a session and answered with a row shed cannot read ({e})")
+    })?;
+    let reopened = LaneReopened {
+        session: lane_session(&row),
+        joined: r.joined,
+    };
+    Ok((reopened, row.session_id))
+}
+
+/// Go's zero time (`0001-01-01T00:00:00Z`) in Unix milliseconds: what craze
+/// writes for a saved session whose index row records no creation time.
+const GO_ZERO_TIME_UNIX_MS: i64 = -62_135_596_800_000;
+
+/// One saved session as the contract's, or `None` for a row a reopen could not
+/// name (no `id`). `title` is craze's, a blank one absent; `updated_unix_ms`
+/// is `0` for a time that does not read (craze lists none such: a row whose
+/// time it cannot write is malformed and never listed); `created_unix_ms` is
+/// absent for Go's zero time.
+fn lane_saved_session(s: &SavedSession) -> Option<LaneSavedSession> {
+    if s.id.is_empty() {
+        return None;
+    }
+    let at = |t: &Option<String>| t.as_deref().and_then(shed_core::time::rfc3339_unix_ms);
+    Some(LaneSavedSession {
+        id: s.id.clone(),
+        provider: s.provider.clone(),
+        workspace: s.workspace.clone(),
+        title: s.title.clone().filter(|t| !t.trim().is_empty()),
+        updated_unix_ms: at(&s.updated_at).unwrap_or(0),
+        created_unix_ms: at(&s.created_at).filter(|ms| *ms != GO_ZERO_TIME_UNIX_MS),
+    })
+}
+
+/// `sessions.saved`'s result as the contract's: craze's order (newest first)
+/// and its `more`, each row read on its own — one that does not read, or names
+/// no id, is left out rather than costing the list.
+pub fn lane_saved_sessions(r: &SavedResult) -> LaneSavedSessions {
+    LaneSavedSessions {
+        sessions: r
+            .sessions
+            .iter()
+            .filter_map(|v| SavedSession::deserialize(v).ok())
+            .filter_map(|s| lane_saved_session(&s))
+            .collect(),
+        more: r.more,
+    }
+}
+
+/// What one attempt of a request sent at most twice — a create, a reopen —
+/// came to.
+enum Attempt<T, E> {
+    /// An answer — craze's, or the source's own on its behalf. A create's is
+    /// definite: the id's life is over.
+    Done(Result<T, E>),
+    /// Sent, and the answer lost (the connection ended, the deadline passed):
+    /// whether it ran is unknown, so it is sent once more.
     Unknown(String),
 }
 
-impl Attempt {
+impl Attempt<LaneCreated, LaneError> {
     /// A hub too old to `do_what` this create needs, nothing sent: `Failed` on
     /// a fresh attempt, but UNKNOWN on a retry — the first may have run.
-    fn too_old(retry: bool, cannot: &str, do_what: &str) -> Attempt {
+    fn too_old(retry: bool, cannot: &str, do_what: &str) -> Self {
         let why = format!("craze on this machine is too old to {do_what}; update it");
         if retry {
             Attempt::Unknown(format!(
@@ -701,6 +917,9 @@ pub fn lane_create_options(r: &CreateOptionsResult) -> LaneCreateOptions {
             .collect(),
         default_provider: r.default_provider.clone(),
         recent_dirs: r.recent_dirs.iter().map(|d| d.dir.clone()).collect(),
+        // Not this answer's to say: the hub's `hello` says it, and
+        // [`AgentSource::create_options`] fills it from that (PC11).
+        reopen: false,
     }
 }
 
@@ -815,7 +1034,9 @@ impl AgentSource for CrazeSource {
     }
 
     /// `sessions.createOptions`, on its own connection, where the hub's
-    /// `hello` says `createOptions`.
+    /// `hello` says `createOptions` — with [`LaneCreateOptions::reopen`] read
+    /// from that same `hello` (PC11: the dialog knows its resume mode from
+    /// the one answer it opens on).
     async fn create_options(&self) -> Result<LaneCreateOptions, LaneError> {
         let (conn, _notes, hello) = self.connect().await.map_err(DialError::into_lane_error)?;
         if !hello.capabilities.create_options {
@@ -836,7 +1057,63 @@ impl AgentSource for CrazeSource {
                 "craze answered sessions.createOptions with something shed cannot read: {e}"
             ))
         })?;
-        Ok(lane_create_options(&r))
+        Ok(LaneCreateOptions {
+            reopen: hello.capabilities.reopen,
+            ..lane_create_options(&r)
+        })
+    }
+
+    /// `sessions.saved{limit: SAVED_LIMIT}`, on its own connection, where the
+    /// hub's `hello` says `reopen` — else `Unavailable` in
+    /// [`reopen_unsupported`]'s words, nothing sent (the module doc).
+    async fn saved(&self) -> Result<LaneSavedSessions, LaneError> {
+        let (conn, _notes, hello) = self.connect().await.map_err(DialError::into_lane_error)?;
+        if !hello.capabilities.reopen {
+            return Err(LaneError::Unavailable(reopen_unsupported(&hello)));
+        }
+        let params = SavedParams { limit: SAVED_LIMIT };
+        let result = conn
+            .request(method::SESSIONS_SAVED, &params, self.timings.request)
+            .await
+            .map_err(|e| match e {
+                CallError::Refused(e) if is_reopen_unsupported(&e) => {
+                    LaneError::Unavailable(reopen_unsupported(&hello))
+                }
+                e => read_error("sessions.saved", e),
+            })?;
+        let r: SavedResult = serde_json::from_value(result).map_err(|e| {
+            LaneError::Failed(format!(
+                "craze answered sessions.saved with something shed cannot read: {e}"
+            ))
+        })?;
+        Ok(lane_saved_sessions(&r))
+    }
+
+    /// `session.reopen{id}`, on its own connection, where the hub's `hello`
+    /// says `reopen`; a lost answer sent again once; the answer's row kept as
+    /// a created row, fresh; the rosters woken when the session may run (the
+    /// module doc).
+    async fn reopen(&self, id: &str) -> Result<LaneReopened, LaneReopenError> {
+        let params = ReopenParams { id: id.to_string() };
+        // Whether any answer was lost: the first reopen may have started the
+        // session even when the resend is then refused (`busy`, say), so a
+        // lost answer wakes the rosters whatever the resend says.
+        let mut lost = false;
+        let answer = match self.reopen_once(&params, false).await {
+            Attempt::Done(answer) => answer,
+            Attempt::Unknown(_) => {
+                lost = true;
+                match self.reopen_once(&params, true).await {
+                    Attempt::Done(answer) => answer,
+                    Attempt::Unknown(why) => Err(reopen_lost(&format!("twice: {why}"))),
+                }
+            }
+        };
+        // Its success, or a lost answer: the session may run now.
+        if lost || answer.as_ref().map_or_else(is_reopen_lost, |_| true) {
+            self.wake_rosters();
+        }
+        answer
     }
 
     /// `session.create`, on its own connection, retried once under the same
@@ -1001,7 +1278,13 @@ impl RosterPump {
                     reason = "reconnect";
                 }
             }
-            tokio::time::sleep(jittered(backoff)).await;
+            // A reopen that may have started a session cuts the wait short
+            // (the module doc, "`saved` and `reopen`"): the backoff curve
+            // itself is unchanged.
+            tokio::select! {
+                () = tokio::time::sleep(jittered(backoff)) => {}
+                () = self.source.wake.notified() => {}
+            }
         }
     }
 

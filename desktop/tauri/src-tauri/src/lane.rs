@@ -53,15 +53,88 @@
 //! every `lane.*` op takes `kind` (the row's `agent_lane.kind`). **Eviction is
 //! split the same way**: [`Lanes::reconcile`] judges only the roost-stamped
 //! entries against a roost snapshot — a craze lane is not in it and must not
-//! be torn down by it — and [`Lanes::evict_craze`] retires the craze entries
-//! whose rows the source no longer holds (a `Removed`, a reseed that dropped
-//! them, the hub gone, the host removed, its tab ended). A craze entry is
-//! filed under the GENERATION of the source it was opened through, and an
-//! eviction names its generation: the news of a source that has since been
-//! replaced (the host removed and registered again) never ends a lane opened
-//! through the new one. An open re-reads the host's current generation after
-//! it declares itself, so a removal that published its eviction before the
+//! be torn down by it — and the craze source's own news governs the craze
+//! entries ([`Lanes::craze_news`]): a row that left it (a `Removed`, a reseed
+//! that dropped it, the hub gone) starts the lane's DEPARTURE
+//! ([`Lanes::evict_craze`], below), a row listed again (by the roster, or by
+//! the create or reopen that answered with it) ends one
+//! ([`Lanes::craze_returned`]), and the host's removal ends every lane of its
+//! generation at once ([`Lanes::evict_craze_generation`]). A craze entry is
+//! filed under the GENERATION of the source it was opened through, and every
+//! piece of news names its generation: the news of a source that has since
+//! been replaced (the host removed and registered again) never touches a lane
+//! opened through the new one. An open re-reads the host's current generation
+//! after it declares itself, so a removal that published its sweep before the
 //! declaration — with nothing yet to cancel — still stops the open.
+//!
+//! # A craze lane outlives its row by a grace, then ends visibly (plan 032 §3.1)
+//!
+//! craze 0.2.0 drops a stopping host's row on the hub's next 1 s roster
+//! round, usually BEFORE the session's last events and its
+//! `reset{session_closed}` arrive on the lane's own connection — an
+//! attachment made before the stop runs on to the session's end (craze's
+//! protocol.md), and nothing orders the two connections. Retiring the lane
+//! the moment its row left (as this module did through plan 029) froze the
+//! panel on its last frame: no "ended" banner, tools still "running", an
+//! enabled composer, and `no_lane` on the next read. So an entry has an
+//! explicit lifecycle, [`EntryState`]:
+//!
+//! | state | how it got here | the pump | verbs | leaves on |
+//! |---|---|---|---|---|
+//! | **Live** | committed by `open`; a return | applies + emits | sent | its row leaving (→ Departing), a final `Down` (→ Finished) |
+//! | **Departing{token, cause}** | its row left the source | applies + emits | sent | the row listed again (→ Live), a final `Down`, the grace's end, the host removed (→ Finished) |
+//! | **Finished{reason}** | a final `Down` — the adapter's, or this layer's `session_gone`/`hub_gone`/`host_removed` | stopped | refused `lane_ended` | never (one-way); `open` on a resolving row replaces it |
+//!
+//! * **The grace** ([`CRAZE_DEPART_GRACE`], 10 s) is one task per departure,
+//!   holding only a `Weak` to the entry. It ends at its deadline or at the
+//!   entry's `finished` notification, whichever is first; at the deadline it
+//!   ends the lane — `Down{session_gone}` for a row the roster removed,
+//!   `Down{hub_gone}` for a hub that went (the source Dormant) — and RETIRES
+//!   it. A departure has an identity (its `token`): a duplicate removal never
+//!   extends one, a return cancels it (the stale task finds the token gone),
+//!   and a removal after a return starts a fresh grace with a new token.
+//! * **News is applied in the order it HAPPENED, not the order it arrives**
+//!   ([`NewsMark`], C1 re-review). Departures, returns and the host's removal
+//!   come from three publishers on their own tasks — the source's fold
+//!   (departures and returns), a create's or reopen's listing of the row it
+//!   answered with (a return), the removal — each publishing after it
+//!   released the roost-host lock its news was computed under. So each piece
+//!   carries a number minted under that lock ([`CrazeNews`]'s `seq`), and a
+//!   lane (or an open in flight) takes only news newer than the last it took:
+//!   a return delayed past a departure computed after it cannot revive the
+//!   lane and lose its grace's end, and a departure delayed past a return
+//!   cannot depart it again. The registry keeps each row's newest number too
+//!   ([`CrazeMarks`], C8 review), whether or not a lane was there to take it,
+//!   and an open starts its fence there — so news that landed while no panel
+//!   was open still fences the lane opened after it. (End tab publishes
+//!   nothing, plan 032 E6.)
+//! * **Atomic, under one lock per entry.** Every transition, AND every frame
+//!   the pump applies and emits, happens under the entry's `state` lock
+//!   ([`LaneCore`]), and nothing is applied once the entry is `Finished` (or
+//!   the app is closing), so a late `Ready` can never un-end a lane and
+//!   exactly one terminal `Down` is ever emitted. **The lock order is `inner`
+//!   (the registry) → an entry's `state` → its `view`**; nothing takes
+//!   `inner` while holding `state`.
+//! * **Retired is not removed.** A finished entry stays in the registry,
+//!   readable from its view (`lane.messages`, `lane.approvals`, and
+//!   `lane.settings` from the view's last settings), with its adapter client,
+//!   pump and forward share released ([`LaneEntry::retire`] — or, at the
+//!   session's own final `Down`, by the pump on its way out,
+//!   [`LaneCore::release`]) — so a finished lane holds no dial, no
+//!   `SshExec`, no tunnel, whatever finished it. Only `close` (and the
+//!   shutdown, and a roost-stamped eviction) removes an entry.
+//! * **A verb is admitted, or refused** ([`Lanes::admit`]): the lifecycle
+//!   check and the adapter clone are one `state` acquisition, so a verb
+//!   admitted before the lane finished runs its course on its own clone, and
+//!   one after is refused `lane_ended` — never `no_lane` for a client a
+//!   finish released.
+//! * **The shutdown's start fences first** ([`Inner::close`]): every entry is
+//!   marked closing under its `state` before the registry's `closing` flag
+//!   is set, so no frame of any lane is emitted once the shutdown began.
+//! * **`finished` is not `view.ended`.** Every `Down` sets the view's `ended`,
+//!   a retryable one included — the pump resubscribes after it and a later
+//!   `Ready` clears it. `lane_ended`, `lane.messages`' `finished` and the
+//!   panel's disabled composer all key on the entry state.
 //!
 //! Since plan 025 split the contract (§3.2), the arm builds the agent's SOURCE
 //! and opens the session-scoped lane through it — `OpencodeSource::new(url,
@@ -237,19 +310,96 @@ const PUMP_JOIN_WAIT: Duration = Duration::from_secs(1);
 /// connect or attach).
 const DOWN_UNKNOWN_SESSION: &str = "unknown_session";
 
+/// How long a craze lane keeps its own connection after its row left the
+/// source (plan 032 §3.1) — the window in which a stopping session's last
+/// events and its `reset{session_closed}` still land.
+///
+/// Why 10 s: craze's roster round is 1 s and a stop's tool teardown takes
+/// seconds; a host that died with no final event gives the lane's watcher a
+/// final `unknown_session` on its redial anyway, so this only bounds the worst
+/// case. Tests shorten it per layer ([`Lanes::with_depart_grace`]).
+pub const CRAZE_DEPART_GRACE: Duration = Duration::from_secs(10);
+
+/// The `Down` reason THIS layer ends a departing lane with when its grace
+/// runs out and its row left the roster (`Removed`, a reseed that dropped it)
+/// — the session is gone and no final event said so.
+pub const DOWN_SESSION_GONE: &str = "session_gone";
+/// …and when the row left with the hub itself (the source went Dormant).
+pub const DOWN_HUB_GONE: &str = "hub_gone";
+/// The `Down` reason a lane ends with, at once and with no grace, when its
+/// HOST is removed (plan 032 §3.1.1 item 5): its source — the one thing that
+/// could have listed the row again — is gone.
+pub const DOWN_HOST_REMOVED: &str = "host_removed";
+
 /// Whether a lane that ENDED with this `Down` reason is gone for good — so the
-/// pump stops instead of resubscribing.
+/// pump stops instead of resubscribing, and the entry is `Finished`.
 ///
 /// `shed_core::lane`'s module doc (plan 025 §3.3.5) names three: the session
 /// does not exist (`unknown_session`), it was closed (`session_closed`, craze's
 /// end after a stop), or it never started (`start_failed:<cause>`). No amount
-/// of reconnecting changes any of them. Every other `Down` is worth another
-/// attempt (the agent restarted, the tunnel blipped, a bound ran out).
+/// of reconnecting changes any of them. Plan 032 adds this layer's own three
+/// ([`DOWN_SESSION_GONE`], [`DOWN_HUB_GONE`], [`DOWN_HOST_REMOVED`]), which
+/// only this layer emits and only as an entry's last frame. Every other `Down`
+/// is worth another attempt (the agent restarted, the tunnel blipped, a bound
+/// ran out).
 fn down_is_final(reason: &str) -> bool {
     reason == DOWN_UNKNOWN_SESSION
         || reason == "session_closed"
         || reason == "start_failed"
         || reason.starts_with("start_failed:")
+        || reason == DOWN_SESSION_GONE
+        || reason == DOWN_HUB_GONE
+        || reason == DOWN_HOST_REMOVED
+}
+
+/// Why a craze lane's row left its source — what its grace ends it with
+/// (plan 032 PC14g).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Departure {
+    /// The roster let the row go: a `Removed`, or a `Ready` swap that no
+    /// longer lists it. Expires as [`DOWN_SESSION_GONE`]. (End tab is not
+    /// one, plan 032 E6: the session runs on after its tab closes.)
+    Removed,
+    /// The hub went (the find-only probe found none: the source is Dormant),
+    /// taking every row with it — the roster's, and a create's or reopen's
+    /// row no roster listed yet. Expires as [`DOWN_HUB_GONE`].
+    HubGone,
+}
+
+impl Departure {
+    /// The `Down` reason a departure of this cause expires with.
+    fn reason(self) -> &'static str {
+        match self {
+            Departure::Removed => DOWN_SESSION_GONE,
+            Departure::HubGone => DOWN_HUB_GONE,
+        }
+    }
+}
+
+/// What a craze source's change means for the lanes opened through it — the
+/// payload of [`crate::roost_hosts::OnCrazeNews`], dispatched by
+/// [`Lanes::craze_news`] (plan 032 §3.1.1 items 2, 3, 5).
+///
+/// Every piece carries its `seq`: the source's news sequence number, minted
+/// under the roost-host layer's state lock when the news was computed
+/// ([`crate::craze::CrazeState::mint_news`]) — the order it HAPPENED in,
+/// which the lane layer applies it by ([`Lanes::craze_news`]'s news fence),
+/// whatever order its publishers' tasks deliver it in.
+#[derive(Debug, Clone, Copy)]
+pub enum CrazeNews<'a> {
+    /// These rows left the source: their lanes DEPART ([`Lanes::evict_craze`]).
+    Departed {
+        host_ids: &'a [String],
+        cause: Departure,
+        seq: u64,
+    },
+    /// These rows are newly listed (a `Session` upsert of an absent host, a
+    /// `Ready` that lists it): a departing lane on one is LIVE again
+    /// ([`Lanes::craze_returned`]).
+    Returned { host_ids: &'a [String], seq: u64 },
+    /// The host was removed: every lane of the generation ends now, with no
+    /// grace ([`Lanes::evict_craze_generation`]).
+    HostRemoved { seq: u64 },
 }
 
 /// `(machine, kind, agent session id)` — one open lane. The kind is part of
@@ -273,7 +423,7 @@ pub(crate) const CRAZE: &str = shed_craze::KIND;
 /// Whether `kind`'s lanes are stamped by ROOST (a tab that reported a server)
 /// rather than listed by a machine-level source — the entries
 /// [`Lanes::reconcile`] judges against a roost snapshot. craze's are the
-/// source's, and [`Lanes::evict_craze`] is theirs.
+/// source's, and its news ([`Lanes::craze_news`]) is theirs.
 fn roost_stamped(kind: &str) -> bool {
     kind != CRAZE
 }
@@ -357,6 +507,13 @@ pub enum LaneFailure {
     /// The app is quitting (plan 026 §3.3): the lane layer has closed, and no
     /// lane opens again. `shutting_down`, the spawn gate's own code.
     ShuttingDown,
+    /// The lane is FINISHED (plan 032 §3.1.1 item 8): its session ended — a
+    /// final `Down` arrived, or this layer ended it (its grace ran out, its
+    /// host was removed) — so a verb has nothing to reach. `lane_ended`, "the
+    /// session has ended", at once: a verb on an ended craze lane used to wait
+    /// out the adapter's 10 s reconnect wait and fail `unavailable`, which
+    /// reads as "try again". The transcript stays readable.
+    Ended,
     /// The adapter (or the transport under it) said no.
     Lane(LaneError),
 }
@@ -382,6 +539,7 @@ impl LaneFailure {
             LaneFailure::UnsupportedLane(_) => "unsupported_lane",
             LaneFailure::OutcomeUnknown(_) => "outcome_unknown",
             LaneFailure::ShuttingDown => shed_app::spawn_gate::SHUTTING_DOWN,
+            LaneFailure::Ended => "lane_ended",
             LaneFailure::Lane(e) => match e {
                 LaneError::Unauthorized => "unauthorized",
                 LaneError::BadRequest(_) => "bad_request",
@@ -406,6 +564,7 @@ impl LaneFailure {
                 LANE_KINDS.join(" and ")
             ),
             LaneFailure::ShuttingDown => ShuttingDown.to_string(),
+            LaneFailure::Ended => "the session has ended".to_string(),
             LaneFailure::Lane(e) => e.to_string(),
         }
     }
@@ -471,7 +630,7 @@ pub trait LaneMachines: Send + Sync {
 
     /// This machine's craze source — what a craze lane opens through — and
     /// the generation it was started under, which the lane is filed with
-    /// ([`Lanes::evict_craze`]).
+    /// ([`Lanes::craze_news`]) and which `open` fences an adoption by.
     fn craze_source(&self, machine: &str) -> Result<(CrazeSource, u64), String> {
         Err(format!("{machine} has no craze source"))
     }
@@ -643,6 +802,14 @@ struct Pending {
     /// The craze source generation this open is building through, or `None`
     /// for a roost-stamped lane — the same fence [`LaneEntry::craze_gen`] is.
     craze_gen: Option<u64>,
+    /// The newest craze news this open took ([`NewsMark`]): a departure older
+    /// than a return it already took does not cancel it, and the entry it
+    /// commits starts its own fence HERE ([`Life::news`]) — so news that
+    /// reached the open is never undone, after the commit, by older news
+    /// delivered late. It STARTS at the registry's mark for its row
+    /// ([`CrazeMarks`], C8 review) — the news that landed before the open
+    /// existed — not at zero.
+    news: NewsMark,
 }
 
 /// Removes the [`Pending`] declaration on every exit path, committed or not.
@@ -703,38 +870,329 @@ impl Drop for GateGuard {
 // one open lane
 // ---------------------------------------------------------------------------
 
+/// Where an entry is in its life (plan 032 §3.1.1 item 1; the module doc's
+/// table). Read and written only under its [`LaneCore::state`] lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryState {
+    /// Its pump runs and its row is listed (or it is not a craze lane).
+    Live,
+    /// Its row left the source; its grace task holds `token`. `cause` is
+    /// what the grace ends it with ([`Departure::reason`]).
+    Departing { token: u64, cause: Departure },
+    /// Its pump has stopped for good: a final `Down` (the adapter's, or one
+    /// this layer emitted). One-way.
+    Finished { reason: String },
+}
+
+/// [`LaneCore::state`]'s contents: the entry's state, and the shutdown's mark.
+#[derive(Debug)]
+struct Life {
+    state: EntryState,
+    /// Set, under this lock, when the entry LEAVES the registry or the
+    /// shutdown BEGINS: by [`Inner::close`] — the shutdown's start
+    /// ([`Lanes::begin_closing`], and [`Lanes::shutdown`] before it drains),
+    /// every entry fenced BEFORE the registry's own flag is set (plan 032
+    /// §3.1.1 item 4) — and by `close` and every eviction as they remove it.
+    /// From then on nothing is applied or emitted for this entry — not a
+    /// pump's frame, not a grace's expiry — so no `lane-event` follows the
+    /// shutdown's start or speaks for a lane that is no longer registered.
+    /// Never cleared.
+    closing: bool,
+    /// The newest craze news this entry took ([`NewsMark`], C1 re-review) —
+    /// started from its open's ([`Pending::news`]) at the commit, and never
+    /// below the registry's mark for its row then ([`CrazeMarks`]). Read and
+    /// advanced only under this lock, by [`Lanes::craze_news`]'s handlers,
+    /// which hold the registry's first (the lock order).
+    news: NewsMark,
+}
+
+/// **The craze news fence** (C1 re-review): the sequence number of the newest
+/// piece of craze news ([`CrazeNews`]'s `seq`) a lane — a committed entry
+/// ([`Life::news`]) or an open in flight ([`Pending::news`]) — has TAKEN.
+///
+/// **Why there is one.** Craze news has three publishers on three kinds of
+/// task — the source's fold (departures and returns, on the source's task),
+/// a create's or reopen's listing of the row it answered with (a return,
+/// from the IPC op's task) and the host's removal — and each publishes after
+/// releasing the state lock its news was computed under, so a piece can
+/// reach this layer AFTER a piece computed later. Unfenced, a return delayed
+/// past a departure computed after it revived the departing lane and
+/// cancelled its grace — its 10 s end lost when no final event followed —
+/// and a departure delayed past a return started a departure the row's
+/// return had already answered. (End tab publishes nothing, plan 032 E6.)
+///
+/// **The rule.** A piece is minted a number, strictly increasing per source,
+/// at the moment it is computed, under that lock
+/// ([`crate::craze::CrazeState::mint_news`]). A lane takes a piece only if
+/// its number is NEWER than the last it took, and records it — whether or not
+/// it changed the lane's state (a duplicate departure is still newer news
+/// than a return minted before it). Old news is dropped, so it never undoes
+/// newer news, in either direction. It is judged AFTER the generation fence:
+/// another source's numbers are another sequence, and its news never reaches
+/// this mark at all.
+///
+/// **A lane's mark does not start at zero** (C8 review). The registry keeps
+/// the same high-water mark per row of each machine's newest source
+/// generation ([`CrazeMarks`]), advanced by EVERY piece that names the row,
+/// whether or not a lane or an open was there to take it; an open declares
+/// itself with its row's mark ([`Pending::news`]) and its entry commits with
+/// it. Without that, news landing while no panel was open was forgotten, and
+/// a lane opened afterwards took any OLDER piece delivered after it — a
+/// stale probe's Dormant departure, published late past a Resume's newer
+/// return, started a `hub_gone` grace on a running session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct NewsMark(u64);
+
+impl NewsMark {
+    /// Take news `seq` if it is newer than everything this lane took —
+    /// answering whether it did. A piece not taken must not be applied.
+    fn take(&mut self, seq: u64) -> bool {
+        if seq <= self.0 {
+            return false;
+        }
+        self.0 = seq;
+        true
+    }
+}
+
+impl Life {
+    /// Whether a frame may still be applied and emitted.
+    fn admits(&self) -> bool {
+        !self.closing && !matches!(self.state, EntryState::Finished { .. })
+    }
+}
+
+/// What one entry's pump, its grace task and the registry SHARE: the
+/// lifecycle and the view, the notification that the lifecycle ended, and the
+/// TRANSPORT the lane holds — its adapter client and its tunnel share.
+///
+/// Its own `Arc` rather than fields of [`LaneEntry`], because the pump is
+/// spawned before the entry exists (and must not hold the entry: dropping the
+/// entry is what ends the pump) — this holds no reference to either task, so
+/// there is no cycle. The transport is here, not on the entry, so that the
+/// pump can let it go itself when the session's own final `Down` finishes the
+/// lane ([`LaneCore::release`], C1 review): a finished entry holds no
+/// transport whichever path finished it.
+///
+/// **The lock order is `inner` → `state` → `view`** (module doc): every
+/// method below takes `state`, then `view` under it, and neither ever takes
+/// the registry's. `client` and `forward` are leaf locks, never held while
+/// another is taken — and a tunnel share is never dropped under `inner` or
+/// `state`, since giving it back takes `inner`.
+struct LaneCore {
+    /// The lifecycle — the plan's "entry `state`". Every frame the pump applies
+    /// and emits is applied and emitted UNDER this lock, so a transition and a
+    /// frame can never interleave.
+    state: Mutex<Life>,
+    /// The staged view `lane.messages` reads.
+    view: Mutex<LaneView>,
+    /// Notified (after the lock is released) when the entry becomes
+    /// `Finished` — what lets a departure's grace task end early.
+    finished: tokio::sync::Notify,
+    /// The adapter, as the CONTRACT. Every verb reaches the agent through
+    /// this trait object; the concrete type was chosen once, in
+    /// [`Lanes::open`]'s match, and is deliberately not knowable from here.
+    ///
+    /// `None` once RELEASED (plan 032 PC4, [`LaneCore::release`]): by
+    /// [`LaneEntry::retire`], or by the pump at the session's own final
+    /// `Down` — so a finished entry kept for its transcript holds no craze
+    /// dial, no `SshExec`, no tunnel. A verb admitted before the release
+    /// finishes with the clone it took ([`LaneCore::client`]).
+    client: Mutex<Option<Arc<dyn AgentLane>>>,
+    /// This entry's share of the tunnel it rides, if any. `None` for a local
+    /// lane, and once released. Taken rather than waited for: an op holding a
+    /// clone of the entry (or of this core) across an await must not be able
+    /// to delay a closed panel's `ssh` child from dying.
+    forward: Mutex<Option<ForwardShare>>,
+}
+
+impl LaneCore {
+    /// A live lane's core, holding its transport — `client` and its tunnel
+    /// share (`None` for a local lane, and for a bare core in a test).
+    fn new(client: Option<Arc<dyn AgentLane>>, forward: Option<ForwardShare>) -> Arc<LaneCore> {
+        Arc::new(LaneCore {
+            state: Mutex::new(Life {
+                state: EntryState::Live,
+                closing: false,
+                news: NewsMark::default(),
+            }),
+            view: Mutex::new(LaneView::default()),
+            finished: tokio::sync::Notify::new(),
+            client: Mutex::new(client),
+            forward: Mutex::new(forward),
+        })
+    }
+
+    /// **A verb's admission** (plan 032 §3.1.1 item 8): `lane_ended` once the
+    /// entry is FINISHED, else a clone of the adapter — `None` when a `close`
+    /// already released it. The lifecycle check and the clone are ONE `state`
+    /// acquisition, and every release follows the `Finished` transition (or
+    /// the entry's removal), so a verb is either admitted before the lane
+    /// finished — and runs its course on the clone it took (a release after
+    /// this takes the core's, not the verb's) — or refused `lane_ended`;
+    /// never handed a finished lane's released client as a missing one.
+    fn client(&self) -> Result<Option<Arc<dyn AgentLane>>, LaneFailure> {
+        let life = lock(&self.state);
+        if matches!(life.state, EntryState::Finished { .. }) {
+            return Err(LaneFailure::Ended);
+        }
+        Ok(lock(&self.client).clone())
+    }
+
+    /// **Release the transport** (plan 032 PC4): take the adapter client and
+    /// the tunnel share out of the core and drop them. Idempotent. Called by
+    /// [`LaneEntry::retire`], and by the pump itself once the session's own
+    /// final `Down` finished the lane ([`LaneCore::end`]; C1 review: a
+    /// natural end used to keep both until `close` or the host's removal).
+    /// **Never under `inner` or `state`**: giving the last tunnel share back
+    /// takes the registry's lock — and each slot's lock is released before
+    /// what it held is dropped.
+    fn release(&self) {
+        let forward = lock(&self.forward).take();
+        let client = lock(&self.client).take();
+        drop(forward);
+        drop(client);
+    }
+
+    /// The pump's own end: the session's final `Down` (`reason`) — applied,
+    /// emitted and `Finished` unless something finished the lane first
+    /// ([`LaneCore::finish`]) — and then the transport released
+    /// ([`LaneCore::release`]), outside the `state` lock. The pump's work is
+    /// over either way: a lane that ended for good has nothing left to dial.
+    fn end(&self, sink: &EventSink, key: &Key, reason: &str) {
+        self.finish(sink, key, reason);
+        self.release();
+    }
+
+    /// Apply `event` to the view and emit it, under `state`, unless the
+    /// entry is `Finished` or closing. Answers whether it was: `false` is the
+    /// pump's cue that its work is over.
+    fn apply(&self, sink: &EventSink, key: &Key, event: &LaneEvent) -> bool {
+        let life = lock(&self.state);
+        if !life.admits() {
+            return false;
+        }
+        lock(&self.view).apply(event);
+        emit(sink, key, event);
+        true
+    }
+
+    /// End the lane with `Down{reason}`: under `state`, unless it is already
+    /// `Finished` or closing — apply and emit the `Down`, become
+    /// `Finished{reason}`, and (the lock released) notify. Answers whether it
+    /// did, so exactly ONE terminal `Down` is emitted whoever races to it: the
+    /// pump's final `Down`, a grace's expiry, the host's removal.
+    fn finish(&self, sink: &EventSink, key: &Key, reason: &str) -> bool {
+        let mut life = lock(&self.state);
+        if !life.admits() {
+            return false;
+        }
+        finish_locked(&mut life, &self.view, sink, key, reason);
+        drop(life);
+        self.finished.notify_waiters();
+        true
+    }
+
+    /// The host's removal reaching this entry as craze news `seq` (plan 032
+    /// §3.1.1 item 5): taken only past the news fence ([`NewsMark`] — always,
+    /// by construction: a removal is minted as the host's state leaves the
+    /// map, so nothing of its generation is minted after it), and then the
+    /// lane ends `Down{host_removed}` as [`Self::finish`] ends it, unless it
+    /// is already finished or closing. Answers whether the news was taken —
+    /// the caller retires the entry if so.
+    fn host_removed(&self, sink: &EventSink, key: &Key, seq: u64) -> bool {
+        let mut life = lock(&self.state);
+        if !life.news.take(seq) {
+            return false;
+        }
+        let ends = life.admits();
+        if ends {
+            finish_locked(&mut life, &self.view, sink, key, DOWN_HOST_REMOVED);
+        }
+        drop(life);
+        if ends {
+            self.finished.notify_waiters();
+        }
+        true
+    }
+
+    /// A grace's deadline (plan 032 §3.1.1 item 4): end the lane — with its
+    /// departure's own reason — only if it is STILL departing under `token`
+    /// and the app is not closing, the check and the transition under one
+    /// `state` lock. A return (a new state, or a later departure's new token)
+    /// or a final `Down` that won the race makes this a no-op.
+    fn expire(&self, sink: &EventSink, key: &Key, token: u64) -> bool {
+        let mut life = lock(&self.state);
+        let cause = match life.state {
+            EntryState::Departing { token: held, cause } if held == token && !life.closing => cause,
+            _ => return false,
+        };
+        finish_locked(&mut life, &self.view, sink, key, cause.reason());
+        drop(life);
+        self.finished.notify_waiters();
+        true
+    }
+
+    /// Whether the departure `token` is still the one in effect.
+    fn departing_under(&self, token: u64) -> bool {
+        matches!(lock(&self.state).state, EntryState::Departing { token: held, .. } if held == token)
+    }
+
+    fn is_finished(&self) -> bool {
+        matches!(lock(&self.state).state, EntryState::Finished { .. })
+    }
+}
+
+/// [`LaneCore::finish`]'s body, for a caller already holding `state` and
+/// having checked it admits a frame.
+fn finish_locked(
+    life: &mut Life,
+    view: &Mutex<LaneView>,
+    sink: &EventSink,
+    key: &Key,
+    reason: &str,
+) {
+    let down = LaneEvent::Down {
+        reason: reason.to_string(),
+    };
+    lock(view).apply(&down);
+    emit(sink, key, &down);
+    life.state = EntryState::Finished {
+        reason: reason.to_string(),
+    };
+}
+
 struct LaneEntry {
     /// The stamp this entry was opened against — the eviction key for a
     /// restarted tab. A new port means a different server, not a reconnect; and
     /// a new KIND on the same port means a different agent, which is the half
     /// the URL alone used to miss.
     stamp: AgentLaneStamp,
-    /// This entry's share of the tunnel it rides, if any. `None` for a local
-    /// lane. Taken by [`LaneEntry::retire`] rather than waited for: an op
-    /// holding a clone of the `Arc<LaneEntry>` across an await must not be able
-    /// to delay a closed panel's `ssh` child from dying.
-    forward: Mutex<Option<ForwardShare>>,
     /// What `lane.open` answered with, cached so a second `open` is genuinely
     /// idempotent rather than a second round trip. The session row ONLY: the
     /// lane's capabilities are stream state, read from the view by
     /// `lane.messages` (module doc), and deliberately not cached here.
     session: LaneSession,
-    /// The adapter, as the CONTRACT. Every verb below reaches the agent through
-    /// this trait object; the concrete type was chosen once, in
-    /// [`Lanes::open`]'s match, and is deliberately not knowable from here.
-    client: Arc<dyn AgentLane>,
-    view: Arc<Mutex<LaneView>>,
-    /// The supervision loop. Shares nothing with this struct but the view, so
+    /// The lifecycle, the view and the transport (the adapter client and the
+    /// tunnel share), shared with the pump and the grace task.
+    core: Arc<LaneCore>,
+    /// The supervision loop. Shares nothing with this struct but the core, so
     /// there is no reference cycle and dropping the entry really does end it.
     /// Behind a lock so [`Lanes::shutdown`] can take the handle and AWAIT it
     /// (plan 026 §3.3) — an abort alone leaves the loop running until its
     /// next poll.
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The running departure's grace task (plan 032 §3.1.1 item 2), if any —
+    /// held so a return, a host removal, `close` and the shutdown can cancel
+    /// it, and the shutdown AWAIT it like a pump. It holds only a `Weak` to
+    /// this entry.
+    grace: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// For a craze lane, the generation of the craze source it was opened
-    /// through; `None` for a roost-stamped one. [`Lanes::evict_craze`] ends
-    /// only the lanes of the generation it names, so a stale source's eviction
-    /// — published after a remove and a re-registration of the same host —
-    /// never ends a lane opened through the new one (C9 review).
+    /// through; `None` for a roost-stamped one. Every piece of craze news
+    /// touches only the lanes of the generation it names, so a stale source's
+    /// news — published after a remove and a re-registration of the same host
+    /// — never touches a lane opened through the new one (C9 review), and
+    /// `open` never adopts an entry of an older one (plan 032 §3.1.1 item 12).
     craze_gen: Option<u64>,
 }
 
@@ -743,12 +1201,52 @@ impl LaneEntry {
         json!({ "session": self.session })
     }
 
-    /// End the subscription and give the tunnel share back. Idempotent, and
-    /// **must not be called under the `inner` lock** — releasing the last share
-    /// takes it.
+    fn is_finished(&self) -> bool {
+        self.core.is_finished()
+    }
+
+    /// The adapter a verb is sent through — or `lane_ended` once the entry is
+    /// FINISHED (plan 032 §3.1.1 item 8), decided with the clone under one
+    /// `state` lock ([`LaneCore::client`]). The clone is the verb's own: a
+    /// release after this point takes the core's, not the one the verb is
+    /// using.
+    fn client(&self) -> Result<Arc<dyn AgentLane>, LaneFailure> {
+        // Not finished, and no client: a lane `close` retired between the
+        // registry read and here — there is no lane any more.
+        self.core.client()?.ok_or_else(|| {
+            LaneFailure::NoLane(format!(
+                "the lane for session {:?} was closed",
+                self.stamp.session_id
+            ))
+        })
+    }
+
+    /// End the subscription, give the tunnel share back and release the
+    /// adapter (plan 032 PC4, [`LaneCore::release`]). The entry itself stays
+    /// wherever it is — a finished craze entry stays in the registry,
+    /// readable from its view. Idempotent, and **must not be called under the
+    /// `inner` lock** — releasing the last share takes it.
     fn retire(&self) {
         self.abort_pump();
-        drop(lock(&self.forward).take());
+        self.core.release();
+    }
+
+    /// Mark the entry as leaving the registry ([`Life::closing`]): nothing
+    /// more is applied or emitted for it. Called under the registry lock (the
+    /// lock order allows `inner` → `state`) by whatever removes it, and by
+    /// the shutdown's start ([`Inner::close`]) for every entry at once.
+    fn detach(&self) {
+        lock(&self.core.state).closing = true;
+    }
+
+    /// Cancel the departure's grace task, if one runs, handing it back to be
+    /// joined.
+    fn cancel_grace(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let task = lock(&self.grace).take();
+        if let Some(task) = &task {
+            task.abort();
+        }
+        task
     }
 
     fn abort_pump(&self) {
@@ -765,6 +1263,9 @@ impl Drop for LaneEntry {
     /// A backstop: every eviction path calls [`LaneEntry::retire`] first.
     fn drop(&mut self) {
         self.abort_pump();
+        if let Some(grace) = lock(&self.grace).as_ref() {
+            grace.abort();
+        }
     }
 }
 
@@ -781,8 +1282,144 @@ struct Inner {
     pending: HashMap<Key, Pending>,
     /// Set when the app's orderly shutdown begins (plan 026 §3.3), never
     /// cleared: read under this lock by every open's declaration and commit,
-    /// and by a pump before it re-`ensure`s its tunnel.
+    /// and by a pump before it re-`ensure`s its tunnel. Set only by
+    /// [`Inner::close`], AFTER every entry is fenced.
     closing: bool,
+    /// The last departure token handed out ([`EntryState::Departing`]) —
+    /// minted under this lock, so two departures never share one.
+    departures: u64,
+    /// The craze news fence's high-water marks, by machine ([`CrazeMarks`],
+    /// C8 review): advanced by every piece [`Lanes::craze_news`] receives,
+    /// in the same acquisition that applies it, and read by every craze
+    /// open's declaration and commit. Under this lock and no other, so the
+    /// lock order (`inner` → `state` → `view`) is unchanged.
+    craze_marks: HashMap<String, CrazeMarks>,
+}
+
+/// The most hostIds one machine's [`CrazeMarks`] keeps (the oldest news goes
+/// first past it) — the same order of backstop shed-craze's own created-row
+/// tombstones keep.
+const CRAZE_MARKS_CAP: usize = 4096;
+
+/// One machine's craze news marks ([`Inner::craze_marks`]): the news fence's
+/// high-water mark ([`NewsMark`]) for each row (hostId) of ONE source
+/// generation — the newest whose news reached this layer.
+///
+/// **Why the registry keeps them** (C8 review): a lane's own mark
+/// ([`Life::news`], [`Pending::news`]) lives only as long as the lane, so news
+/// that landed while no entry and no open existed for its row used to be
+/// forgotten, and a lane opened afterwards started its fence at zero. The
+/// ordering that bit: a probe's no-hub answer folds Dormant and mints the
+/// row's departure, whose publication stalls; a Resume lists the row and
+/// publishes its NEWER return while no panel exists; the panel opens; the
+/// stale departure lands, passes the empty fence, and starts a `hub_gone`
+/// grace on a session that is running. Every piece is recorded here, so the
+/// open starts where the return left the row and the stale departure is
+/// dropped like any other old news.
+///
+/// **Bounded.** One record per machine, holding one generation's marks:
+/// news of a NEWER generation (generations only grow, process-wide) replaces
+/// them, and the generation's `HostRemoved` — its last news by construction
+/// ([`Lanes::evict_craze_generation`]) — empties them for good
+/// ([`Self::removed`]), so a piece of it delivered after its removal records
+/// nothing. Within a generation it holds one mark per hostId the source's
+/// news has named — sessions that source actually listed — up to
+/// [`CRAZE_MARKS_CAP`].
+#[derive(Debug, Default)]
+struct CrazeMarks {
+    /// The source generation these marks are for.
+    gen: u64,
+    /// Set by the generation's `HostRemoved`: `hosts` is empty and stays so.
+    removed: bool,
+    /// hostId → the newest piece of news that named it.
+    hosts: HashMap<String, NewsMark>,
+}
+
+impl Inner {
+    /// Record craze news `seq` of `machine`'s source generation `gen`, naming
+    /// `host_ids` ([`CrazeMarks`]) — called by every handler of
+    /// [`Lanes::craze_news`] in the acquisition that applies the piece, so no
+    /// open can declare between the two. A newer generation's news first
+    /// drops the older one's marks; an older (or a removed) generation's news
+    /// records nothing — no open of it can commit any more (`open`'s
+    /// post-declaration generation re-check refuses it).
+    fn note_craze_news(&mut self, machine: &str, gen: u64, seq: u64, host_ids: &[String]) {
+        let marks = self.craze_marks.entry(machine.to_string()).or_default();
+        if gen > marks.gen {
+            *marks = CrazeMarks {
+                gen,
+                ..CrazeMarks::default()
+            };
+        }
+        if gen < marks.gen || marks.removed {
+            return;
+        }
+        for host_id in host_ids {
+            marks.hosts.entry(host_id.clone()).or_default().take(seq);
+        }
+        // A memory backstop, not a policy (C8 closing review): a machine that
+        // stays registered for weeks names a new hostId with every session it
+        // ever starts. Past the cap the mark with the OLDEST news goes — a row
+        // that quiet is long gone, and only a lane opened on it later, racing
+        // news older still, could ever have read it.
+        while marks.hosts.len() > CRAZE_MARKS_CAP {
+            let oldest = marks
+                .hosts
+                .iter()
+                .min_by_key(|(_, mark)| mark.0)
+                .map(|(host_id, _)| host_id.clone());
+            match oldest {
+                Some(host_id) => {
+                    marks.hosts.remove(&host_id);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// `machine`'s source generation `gen` was removed: its marks are dropped
+    /// for good ([`CrazeMarks::removed`]) — unless a newer generation's news
+    /// already replaced them, which stay.
+    fn note_craze_removed(&mut self, machine: &str, gen: u64) {
+        let marks = self.craze_marks.entry(machine.to_string()).or_default();
+        if gen >= marks.gen {
+            *marks = CrazeMarks {
+                gen,
+                removed: true,
+                hosts: HashMap::new(),
+            };
+        }
+    }
+
+    /// Where a lane on `machine`'s row `host_id`, opened through source
+    /// generation `gen`, starts its news fence: the newest piece of that
+    /// generation's news that named the row — zero if none did, or if the
+    /// marks held are another generation's (another sequence).
+    fn craze_mark(&self, machine: &str, gen: u64, host_id: &str) -> NewsMark {
+        self.craze_marks
+            .get(machine)
+            .filter(|marks| marks.gen == gen)
+            .and_then(|marks| marks.hosts.get(host_id).copied())
+            .unwrap_or_default()
+    }
+
+    /// **The shutdown's start: fence first, flag second** (plan 032 §3.1.1
+    /// items 4 and 11; C1 review). Every registered entry is marked closing
+    /// ([`LaneEntry::detach`]) under its own `state` lock, and only THEN is
+    /// [`Inner::closing`] set — all within the caller's one acquisition of
+    /// this lock. A frame a pump has in flight, or a grace's expiry, holds
+    /// its entry's `state`, so the fence waits it out; once the flag is set,
+    /// every entry is fenced, and no frame of any of them is applied or
+    /// emitted after the shutdown began. (Flag first, the walk let an entry it
+    /// had not reached yet — its pump mid-frame, its grace expiring — emit
+    /// after it.) No entry is registered after it: every commit checks the
+    /// flag under this same lock. Idempotent.
+    fn close(&mut self) {
+        for entry in self.entries.values() {
+            entry.detach();
+        }
+        self.closing = true;
+    }
 }
 
 /// The open gates, by key. See [`Lanes::gates`] and [`GateGuard`].
@@ -800,7 +1437,12 @@ type EventSink = Arc<dyn Fn(&str, &str, &str, &LaneEvent) + Send + Sync>;
 /// 026 AM4), for the shutdown's phase line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanesClosed {
+    /// Every entry the registry held — FINISHED ones included (plan 032
+    /// §3.1.1 item 11): a finished craze lane stays registered, readable,
+    /// until it is closed.
     pub lanes: usize,
+    /// …of which were already finished.
+    pub finished: usize,
     pub forwards: usize,
     /// Forwards whose close did not settle by its bound: a reap another thread
     /// owns, or an `ensure` still in flight (the child SIGKILLed either way).
@@ -808,6 +1450,11 @@ pub struct LanesClosed {
     pub pumps: usize,
     /// Pumps aborted but not ended by [`PUMP_JOIN_WAIT`].
     pub pumps_unjoined: usize,
+    /// Departure grace tasks aborted and joined alongside the pumps, under
+    /// the same bound.
+    pub graces: usize,
+    /// Grace tasks aborted but not ended by [`PUMP_JOIN_WAIT`].
+    pub graces_unjoined: usize,
 }
 
 pub struct Lanes {
@@ -830,10 +1477,35 @@ pub struct Lanes {
     /// and a map that only grows is a leak reachable by anyone who can name a
     /// machine and a session.
     gates: Arc<Mutex<Gates>>,
+    /// How long a departing craze lane waits for its session's final word
+    /// ([`CRAZE_DEPART_GRACE`]; a test's own with [`Lanes::with_depart_grace`]).
+    depart_grace: Duration,
     /// [`crate::roost_hosts::TestGap`], armed by a test: `open`'s gap between
     /// resolving a craze source and declaring the open.
     #[cfg(test)]
     pub(crate) open_gap: Mutex<Option<crate::roost_hosts::TestGap>>,
+    /// [`crate::roost_hosts::TestGap`], armed by a test: `open`'s gap between
+    /// its declaration and its commit — where craze news reaches the open in
+    /// flight ([`Pending::news`]).
+    #[cfg(test)]
+    pub(crate) commit_gap: Mutex<Option<crate::roost_hosts::TestGap>>,
+    /// [`crate::roost_hosts::TestGap`]s armed by a test at one side of a
+    /// verb's admission ([`Admission`], [`Lanes::admit`]) — each taken by the
+    /// first verb to reach its side.
+    #[cfg(test)]
+    pub(crate) verb_gaps: Mutex<Vec<(Admission, crate::roost_hosts::TestGap)>>,
+}
+
+/// **Test-only:** which side of a verb's admission ([`Lanes::admit`]) a
+/// [`Lanes::verb_gaps`] gap parks the verb on — so a cell can land a lane's
+/// final `Down` on either side of it (plan 032 §3.1.1 item 8; C1 review).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// The entry read from the registry, the lifecycle not yet decided.
+    Before,
+    /// Admitted: the adapter clone in hand, the adapter not yet called.
+    After,
 }
 
 impl Lanes {
@@ -864,11 +1536,40 @@ impl Lanes {
     }
 
     /// Whether a lane is committed under this key — the registry's own state.
+    /// A FINISHED craze lane is still committed (it stays readable); ask
+    /// [`Self::lane_state`] which state it is in.
     #[cfg(test)]
     pub(crate) fn is_open(&self, machine: &str, kind: &str, session_id: &str) -> bool {
         lock(&self.inner)
             .entries
             .contains_key(&key(machine, kind, session_id))
+    }
+
+    /// The committed entry's state — `"live"`, `"departing"` or `"finished"`
+    /// — or `None` with no entry: the registry's own word, for the cells that
+    /// pin the lifecycle (plan 032 §3.1.1).
+    #[cfg(test)]
+    pub(crate) fn lane_state(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Option<&'static str> {
+        let entry = self.entry(&key(machine, kind, session_id))?;
+        let life = lock(&entry.core.state);
+        Some(match life.state {
+            EntryState::Live => "live",
+            EntryState::Departing { .. } => "departing",
+            EntryState::Finished { .. } => "finished",
+        })
+    }
+
+    /// This layer with a departure grace of `grace` instead of
+    /// [`CRAZE_DEPART_GRACE`] — the test seam plan 032 §3.1 names.
+    #[cfg(test)]
+    pub(crate) fn with_depart_grace(mut self, grace: Duration) -> Lanes {
+        self.depart_grace = grace;
+        self
     }
 
     fn with_sink(
@@ -882,8 +1583,13 @@ impl Lanes {
             machines,
             inner: Arc::new(Mutex::new(Inner::default())),
             gates: Arc::new(Mutex::new(Gates::new())),
+            depart_grace: CRAZE_DEPART_GRACE,
             #[cfg(test)]
             open_gap: Mutex::new(None),
+            #[cfg(test)]
+            commit_gap: Mutex::new(None),
+            #[cfg(test)]
+            verb_gaps: Mutex::new(Vec::new()),
         }
     }
 
@@ -900,6 +1606,17 @@ impl Lanes {
     /// on the same port — evicts the stale entry and opens against the new one:
     /// that is a restarted tab, not a reconnect.
     ///
+    /// **The registry first** (plan 032 §3.1.1 item 9, PC5): an entry is
+    /// judged before the row is required, because a DEPARTING lane has no row
+    /// to resolve and is still the lane — re-opening it (the panel's remount)
+    /// answers it as it is. A FINISHED entry is a readable ended lane: with no
+    /// row it is answered as it is; with a row that resolves (the session runs
+    /// again — a reopened one, or an opencode tab still listed) a fresh lane is
+    /// opened, and the finished entry is replaced only when that open COMMITS,
+    /// so a failed open leaves it readable. **Generation-fenced** (item 12): a
+    /// craze entry of an older source generation is never adopted by an equal
+    /// stamp — it is evicted and reopened through the current source.
+    ///
     /// **Transactional.** See the module doc: everything it builds is owned
     /// while it builds it, and it commits under the same lock acquisition that
     /// re-checks whether the lane is still wanted. There is no path on which it
@@ -915,13 +1632,16 @@ impl Lanes {
         if self.closing() {
             return Err(LaneFailure::ShuttingDown);
         }
-        // The row is resolved BEFORE a gate is registered for the key. Both IPC
-        // doors take `machine` and `session_id` as free strings, so a call that
-        // names nothing real must not be able to make this app remember it:
-        // `lane.open` with junk (or with the session ids of a machine whose tabs
-        // churn) used to mint a gate per call and keep it for the life of the
-        // process.
-        self.lane_stamp(machine, kind, session_id)?;
+        // The row is resolved BEFORE a gate is registered for the key — unless
+        // the registry already holds the key (a departing or finished lane,
+        // which may have no row). Both IPC doors take `machine` and
+        // `session_id` as free strings, so a call that names nothing real must
+        // not be able to make this app remember it: `lane.open` with junk (or
+        // with the session ids of a machine whose tabs churn) used to mint a
+        // gate per call and keep it for the life of the process.
+        if self.entry(&key).is_none() {
+            self.lane_stamp(machine, kind, session_id)?;
+        }
         let gate = self.gate(&key);
         let _serialized = gate.lock().await;
         // **An open that waited on its gate re-checks before going on** (plan
@@ -936,13 +1656,26 @@ impl Lanes {
         // uses: the pre-gate one was read before waiting, and waiting is exactly
         // when a tab restarts onto a new port or goes away. Using it would open
         // a lane against a socket the snapshot has already retired.
-        let stamp = self.lane_stamp(machine, kind, session_id)?;
+        let resolved = self.lane_stamp(machine, kind, session_id);
         if let Some(entry) = self.entry(&key) {
-            if entry.stamp == stamp {
-                return Ok(entry.opened());
+            // Read once: `Finished` is one-way, so a lane that finishes after
+            // this read is answered as the live one it was a moment ago (a
+            // readable lane either way) or replaced by a fresh open at commit.
+            let finished = entry.is_finished();
+            match &resolved {
+                // No row: a departing lane is still the lane (its grace runs),
+                // and a finished one is a readable ended lane.
+                Err(_) => return Ok(entry.opened()),
+                // A finished entry stays until the fresh open commits.
+                Ok(_) if finished => {}
+                Ok(stamp) if *stamp == entry.stamp && self.current_generation(machine, &entry) => {
+                    return Ok(entry.opened());
+                }
+                // Another stamp, or another source generation: not this lane.
+                Ok(_) => self.evict(&key),
             }
-            self.evict(&key);
         }
+        let stamp = resolved?;
 
         // Refused BEFORE anything is reserved. A kind with no adapter is a
         // permanent property of the row, so there is no reason to spend an ssh
@@ -1013,7 +1746,13 @@ impl Lanes {
         // password-protected agent — hence the share above.
         let session = client.session().await.map_err(LaneFailure::from)?;
 
-        let view = Arc::new(Mutex::new(LaneView::default()));
+        // The transport goes into the core the pump shares — declared before
+        // the registry guard below, so an early return drops the guard first
+        // and the tunnel share (which takes `inner`) after it.
+        let forward_weak = forward.as_ref().map(ForwardShare::weak);
+        let core = LaneCore::new(Some(Arc::clone(&client)), forward);
+        #[cfg(test)]
+        crate::roost_hosts::at_gap(&self.commit_gap).await;
         // Commit, or roll back. ONE acquisition: the re-check and the insert
         // must not be separable, or a `close` landing between them would be
         // lost — and the pump is not started until the commit is decided, so a
@@ -1022,30 +1761,64 @@ impl Lanes {
         if inner.closing {
             return Err(LaneFailure::ShuttingDown);
         }
-        if !inner.pending.get(&key).is_some_and(|p| !p.cancelled) {
+        let Some(news) = inner
+            .pending
+            .get(&key)
+            .filter(|p| !p.cancelled)
+            .map(|p| p.news)
+        else {
             return Err(LaneFailure::NoLane(format!(
                 "the lane for session {session_id:?} on machine {machine:?} was closed \
                  while it was being opened"
             )));
-        }
-        let pump = self.spawn_pump(
-            key.clone(),
-            Arc::clone(&client),
-            Arc::clone(&view),
-            forward.as_ref().map(ForwardShare::weak),
-        );
+        };
+        // The entry starts its news fence where its open's stands (C1
+        // re-review): the craze news that reached the open is never undone
+        // by older news delivered after the commit. Under the registry lock,
+        // which every piece of news is applied under first, so none lands
+        // between this and the insert. Re-read against the registry's mark
+        // for the row ([`CrazeMarks`], C8 review), as the declaration read
+        // it: the open's mark already covers it — every piece is recorded
+        // there and taken by the open in one acquisition — and the later of
+        // the two is what the entry must never fall below.
+        let news = craze_gen.map_or(news, |gen| {
+            news.max(inner.craze_mark(machine, gen, session_id))
+        });
+        lock(&core.state).news = news;
+        let pump = self.spawn_pump(key.clone(), client, Arc::clone(&core), forward_weak);
         let entry = Arc::new(LaneEntry {
             stamp,
-            forward: Mutex::new(forward),
             session,
-            client,
-            view,
+            core,
             pump: Mutex::new(Some(pump)),
+            grace: Mutex::new(None),
             craze_gen,
         });
         let opened = entry.opened();
-        inner.entries.insert(key, entry);
+        // The one entry this can replace is a FINISHED one, kept readable
+        // until now (item 9): opens on a key are serialized by its gate, and
+        // a live one was evicted above.
+        let replaced = inner.entries.insert(key, entry);
+        if let Some(old) = &replaced {
+            old.detach();
+        }
+        drop(inner);
+        // Outside the lock: retiring gives a tunnel share back, which takes it.
+        if let Some(old) = replaced {
+            old.cancel_grace();
+            old.retire();
+        }
         Ok(opened)
+    }
+
+    /// Whether `entry` was opened through `machine`'s CURRENT craze source —
+    /// always, for a roost-stamped lane (plan 032 §3.1.1 item 12).
+    fn current_generation(&self, machine: &str, entry: &LaneEntry) -> bool {
+        entry.craze_gen.is_none_or(|gen| {
+            self.machines
+                .craze_source(machine)
+                .is_ok_and(|(_, now)| now == gen)
+        })
     }
 
     /// The roost-stamped half of [`Self::open`]: the machine's reach, the
@@ -1092,7 +1865,7 @@ impl Lanes {
 
     /// `lane.messages` — the staged-then-swapped view, as this app's IPC
     /// payload: `{messages, activity, session, generation, stale, ended,
-    /// capabilities, settings}`.
+    /// finished, capabilities, settings, slash_menu, effort_option}`.
     ///
     /// `capabilities` and `settings` are the LIVE generation's (each `null`
     /// until a seed carrying it has swapped in), which is where a client reads
@@ -1114,6 +1887,14 @@ impl Lanes {
     /// that belongs here is the envelope's SHAPE, which is Tauri's and not a
     /// client-neutral API (the phone converts the same
     /// [`shed_app::lane_view::LaneViewSnapshot`] into its own DTOs).
+    ///
+    /// `finished` (plan 032 §3.1.1 item 13, PC14b) is the ENTRY's lifecycle,
+    /// not the view's `ended`: `true` once the lane is over for good — a final
+    /// `Down`, its grace run out, its host removed — when every verb is
+    /// refused `lane_ended` and the panel disables its composer. `ended` alone
+    /// may be a retryable `Down` the pump is already resubscribing after. Read
+    /// with the snapshot under one `state` lock, so a `finished` lane's
+    /// snapshot always carries its terminal `Down`.
     pub fn messages(
         &self,
         machine: &str,
@@ -1121,7 +1902,11 @@ impl Lanes {
         session_id: &str,
     ) -> Result<Value, LaneFailure> {
         let entry = self.open_entry(machine, kind, session_id)?;
-        let snap = lock(&entry.view).snapshot(None);
+        let (finished, snap) = {
+            let life = lock(&entry.core.state);
+            let finished = matches!(life.state, EntryState::Finished { .. });
+            (finished, lock(&entry.core.view).snapshot(None))
+        };
         Ok(json!({
             "messages": snap.messages,
             "activity": snap.activity,
@@ -1129,6 +1914,7 @@ impl Lanes {
             "generation": snap.generation,
             "stale": snap.stale,
             "ended": snap.ended,
+            "finished": finished,
             "capabilities": snap.capabilities,
             "settings": snap.settings,
             // The session's `/` menu, RESOLVED (plan 029 §3.4, P4/P10):
@@ -1138,6 +1924,11 @@ impl Lanes {
             // then the composer offers no menu. The panel hands it back to
             // the `lane_slash_*` commands; it never re-derives a rule.
             "slash_menu": snap.slash_menu,
+            // The id of `settings`' effort option (plan 032 §3.2, PC14h):
+            // craze's `EffortOption` rule, run once by the shared core — the
+            // option the chip names as the effort and `/effort` sets — or
+            // `null` when the settings shown are or name none.
+            "effort_option": snap.effort_option,
         }))
     }
 
@@ -1154,7 +1945,7 @@ impl Lanes {
         session_id: &str,
     ) -> Result<Value, LaneFailure> {
         let entry = self.open_entry(machine, kind, session_id)?;
-        let snap = lock(&entry.view).snapshot(None);
+        let snap = lock(&entry.core.view).snapshot(None);
         Ok(json!({ "approvals": snap.approvals }))
     }
 
@@ -1169,8 +1960,10 @@ impl Lanes {
         text: &str,
         mode: SendMode,
     ) -> Result<Value, LaneFailure> {
-        let entry = self.open_entry(machine, kind, session_id)?;
-        entry.client.send(text, mode).await?;
+        self.admit(machine, kind, session_id)
+            .await?
+            .send(text, mode)
+            .await?;
         Ok(json!({}))
     }
 
@@ -1181,17 +1974,20 @@ impl Lanes {
         kind: &str,
         session_id: &str,
     ) -> Result<Value, LaneFailure> {
-        let entry = self.open_entry(machine, kind, session_id)?;
-        entry.client.cancel().await?;
+        self.admit(machine, kind, session_id)
+            .await?
+            .cancel()
+            .await?;
         Ok(json!({}))
     }
 
     /// `lane.stop` — end the SESSION (plan 025 §3.6.4), not just this
     /// transcript: craze's `session.stop`, answered on its receipt; the lane
     /// itself ends when the session's `session_closed` arrives, and the row
-    /// leaves then — the roster's `Removed`, or, for a session no roster has
-    /// listed yet, the source letting its created row go
-    /// (`shed_craze::lane`'s "The session's end"). A session whose
+    /// leaves around then — the roster's `Removed` (on craze 0.2.0 usually
+    /// FIRST, which the lane's departure grace absorbs: plan 032 §3.1), or,
+    /// for a session no roster has listed yet, the source letting its
+    /// created row go (`shed_craze::lane`'s "The session's end"). A session whose
     /// capabilities say `stop: false` (a TUI-hosted craze session, every
     /// opencode one) refuses it — the panel offers no Stop there.
     pub async fn stop(
@@ -1200,8 +1996,7 @@ impl Lanes {
         kind: &str,
         session_id: &str,
     ) -> Result<Value, LaneFailure> {
-        let entry = self.open_entry(machine, kind, session_id)?;
-        entry.client.stop().await?;
+        self.admit(machine, kind, session_id).await?.stop().await?;
         Ok(json!({}))
     }
 
@@ -1211,6 +2006,11 @@ impl Lanes {
     /// `settings: false` answers the empty default. What the settings sheet
     /// renders is the STREAM's copy — `lane.messages`' `settings`, staged with
     /// the rest of the view — which this read does not replace.
+    ///
+    /// **A finished lane answers from its view** (plan 032 §3.1.1 item 7):
+    /// the last settings the session stated (the empty default if it stated
+    /// none), with no adapter call — a retired lane has no adapter, and an
+    /// ended session has nothing newer to say.
     pub async fn settings(
         &self,
         machine: &str,
@@ -1218,7 +2018,18 @@ impl Lanes {
         session_id: &str,
     ) -> Result<Value, LaneFailure> {
         let entry = self.open_entry(machine, kind, session_id)?;
-        let settings = entry.client.settings().await?;
+        let client = match entry.client() {
+            Ok(client) => client,
+            Err(LaneFailure::Ended) => {
+                let settings = lock(&entry.core.view)
+                    .snapshot(None)
+                    .settings
+                    .unwrap_or_default();
+                return Ok(json!({ "settings": settings }));
+            }
+            Err(e) => return Err(e),
+        };
+        let settings = client.settings().await?;
         Ok(json!({ "settings": settings }))
     }
 
@@ -1237,8 +2048,10 @@ impl Lanes {
         session_id: &str,
         change: LaneSettingChange,
     ) -> Result<Value, LaneFailure> {
-        let entry = self.open_entry(machine, kind, session_id)?;
-        entry.client.set(change).await?;
+        self.admit(machine, kind, session_id)
+            .await?
+            .set(change)
+            .await?;
         Ok(json!({}))
     }
 
@@ -1263,8 +2076,12 @@ impl Lanes {
                 "a session's title must not be blank".to_string(),
             ));
         }
-        let entry = self.open_entry(machine, kind, session_id)?;
-        renamed(entry.client.set_title(title).await)
+        renamed(
+            self.admit(machine, kind, session_id)
+                .await?
+                .set_title(title)
+                .await,
+        )
     }
 
     /// `lane.answer` — resolve one approval.
@@ -1276,8 +2093,10 @@ impl Lanes {
         approval_id: &str,
         answer: LaneAnswer,
     ) -> Result<Value, LaneFailure> {
-        let entry = self.open_entry(machine, kind, session_id)?;
-        entry.client.answer(approval_id, answer).await?;
+        self.admit(machine, kind, session_id)
+            .await?
+            .answer(approval_id, answer)
+            .await?;
         Ok(json!({}))
     }
 
@@ -1286,6 +2105,9 @@ impl Lanes {
     /// Idempotent: closing a lane that is not open is success, because the
     /// caller's intent (there is no lane here any more) is already true. The
     /// panel calls this on unmount, and an unmount can race an eviction.
+    ///
+    /// Removes the entry in ANY state — live, departing (its grace task
+    /// cancelled) or finished (plan 032 §3.1.1 item 10).
     pub fn close(&self, machine: &str, kind: &str, session_id: &str) -> Value {
         self.evict(&key(machine, kind, session_id));
         json!({})
@@ -1323,6 +2145,7 @@ impl Lanes {
                     .get(session_id)
                     .is_some_and(|stamp| stamp == &entry.stamp);
                 if !keep {
+                    entry.detach();
                     gone.push(Arc::clone(entry));
                 }
                 keep
@@ -1331,50 +2154,226 @@ impl Lanes {
         };
         // Outside the lock: retiring gives a tunnel share back, which takes it.
         for entry in gone {
+            entry.cancel_grace();
             entry.retire();
         }
     }
 
-    /// Retire the craze lanes on `machine` whose rows left its craze source of
-    /// generation `gen` (plan 025 §3.6.4) — a roster `Removed`, a `Ready` swap
-    /// that no longer lists them, the hub gone (Dormant), the host removed, or
-    /// the tab of a TUI-hosted session ended — and cancel any open of theirs
-    /// still in flight. Driven by [`crate::roost_hosts::OnCrazeGone`].
+    /// One piece of `machine`'s craze source news, of generation `gen`, to the
+    /// handler it names — what [`crate::roost_hosts::OnCrazeNews`] is wired to
+    /// (`lib.rs`, and the craze cells' `lanes_over`).
+    ///
+    /// **Two fences, in this order, both under the registry lock and then the
+    /// lane's `state` (the lock order)**, for every kind of news and every
+    /// lane it names — a committed entry, or an open in flight:
+    ///
+    /// 1. **The generation** (C9 review): only a lane opened through source
+    ///    generation `gen` is touched — a removed and re-registered host's
+    ///    old source never ends, or revives, a lane of its new one.
+    /// 2. **The news sequence** (C1 re-review, [`NewsMark`]): the lane takes
+    ///    the piece only if its `seq` is newer than every piece it already
+    ///    took, so news delivered out of the order it happened in — its three
+    ///    publishers (the source's fold, a create's or reopen's listing, the
+    ///    host's removal) each publish from their own task after releasing
+    ///    the lock their news was minted under — never undoes newer news: a
+    ///    return delayed past a departure computed after it does not revive
+    ///    the lane (its grace runs on and ends it on time), and a departure
+    ///    delayed past a return does not depart it again.
+    ///
+    /// The generation fence comes first so that another generation's numbers
+    /// — another sequence — never advance a lane's mark.
+    ///
+    /// **Every piece is also RECORDED** (C8 review, [`CrazeMarks`]), in the
+    /// same acquisition, whether or not a lane or an open is there to take
+    /// it: the registry's per-row mark for `(machine, gen)`, which a craze
+    /// open declares itself with and its entry commits with — so news that
+    /// landed while no panel was open still fences the lane opened after it.
+    /// A newer generation's news, or this generation's `HostRemoved`, drops
+    /// the older marks.
+    pub fn craze_news(&self, machine: &str, gen: u64, news: CrazeNews<'_>) {
+        match news {
+            CrazeNews::Departed {
+                host_ids,
+                cause,
+                seq,
+            } => self.evict_craze(machine, gen, seq, host_ids, cause),
+            CrazeNews::Returned { host_ids, seq } => {
+                self.craze_returned(machine, gen, seq, host_ids)
+            }
+            CrazeNews::HostRemoved { seq } => self.evict_craze_generation(machine, gen, seq),
+        }
+    }
+
+    /// **A craze lane's row left its source** (plan 032 §3.1.1 item 2, E6) —
+    /// a roster `Removed` or a `Ready` swap that no longer lists it (`cause`
+    /// [`Departure::Removed`]), or the hub gone, the source Dormant, taking
+    /// a created-only row with the roster's ([`Departure::HubGone`]) — so the
+    /// lane DEPARTS: it keeps its own connection for [`Self::depart_grace`]
+    /// and ends at its session's final `Down`, a return, or the grace's end.
+    /// Any open of the row still in flight is cancelled, as before plan 032.
+    ///
+    /// Per entry of generation `gen`, under the registry lock and then the
+    /// entry's `state` (the lock order), and only if it takes news `seq`
+    /// ([`Self::craze_news`]'s fence — an entry that already took a newer
+    /// return stays live):
+    ///
+    /// * **Live** → `Departing{a fresh token, cause}`, and one grace task
+    ///   starts on this layer's runtime, holding a `Weak` to the entry; its
+    ///   handle is stored on the entry (a stale one, from a departure a return
+    ///   ended, is aborted).
+    /// * **Departing or Finished** → unchanged: a duplicate removal never
+    ///   extends a departure (PC2). Its `seq` is still taken: a return minted
+    ///   before it, delivered after, must not cancel the departure.
+    ///
+    /// A pending open takes the news by the same fence, and is cancelled if
+    /// it does.
     ///
     /// **Fenced by the generation, under this registry's own lock** (C9
-    /// review): the eviction is published after the roost-host layer's lock
-    /// that computed it is released, and by then the host may have been
-    /// removed, registered again and had a lane opened on the same hostId
-    /// through its NEW source. Only an entry (or a pending open) filed under
-    /// `gen` is touched, and the comparison and the removal are one
-    /// acquisition, so a lane of another generation can never be ended by
-    /// this one's news.
-    pub fn evict_craze(&self, machine: &str, gen: u64, host_ids: &[String]) {
-        let gone: Vec<Arc<LaneEntry>> = {
+    /// review): the news is published after the roost-host layer's lock that
+    /// computed it is released, and by then the host may have been removed,
+    /// registered again and had a lane opened on the same hostId through its
+    /// NEW source. Only an entry (or a pending open) filed under `gen` is
+    /// touched, and the comparison and the transition are one acquisition, so
+    /// a lane of another generation can never be ended by this one's news.
+    pub fn evict_craze(
+        &self,
+        machine: &str,
+        gen: u64,
+        seq: u64,
+        host_ids: &[String],
+        cause: Departure,
+    ) {
+        let mut inner = lock(&self.inner);
+        inner.note_craze_news(machine, gen, seq, host_ids);
+        for host_id in host_ids {
+            let key = key(machine, CRAZE, host_id);
+            if let Some(pending) = inner.pending.get_mut(&key) {
+                if pending.craze_gen == Some(gen) && pending.news.take(seq) {
+                    pending.cancelled = true;
+                }
+            }
+            let Some(entry) = inner
+                .entries
+                .get(&key)
+                .filter(|entry| entry.craze_gen == Some(gen))
+                .map(Arc::clone)
+            else {
+                continue;
+            };
+            let mut life = lock(&entry.core.state);
+            // The fence first: a newer piece is taken even when it changes
+            // nothing below (a duplicate departure).
+            if !life.news.take(seq) || life.closing || life.state != EntryState::Live {
+                continue;
+            }
+            inner.departures += 1;
+            let token = inner.departures;
+            life.state = EntryState::Departing { token, cause };
+            let task = self.handle.spawn(depart(
+                Arc::downgrade(&entry),
+                Arc::clone(&entry.core),
+                token,
+                self.depart_grace,
+                Arc::clone(&self.sink),
+                key,
+            ));
+            drop(life);
+            let stale = lock(&entry.grace).replace(task);
+            if let Some(stale) = stale {
+                stale.abort();
+            }
+        }
+    }
+
+    /// **A departing craze lane's row is listed again** (plan 032 §3.1.1
+    /// item 3, PC2): the row came back within the grace — a reseed that
+    /// briefly dropped it, a source that went Dormant and found the hub again,
+    /// a create or a reopen that answered with it (a reopen that rejoined a
+    /// host which outlived its hub) — so the lane is LIVE again, its
+    /// connection never having been let go.
+    /// Its grace task is aborted (and would find its token gone if it were
+    /// already past its wait); a later removal starts a fresh grace under a
+    /// new token. Only a `Departing` entry of generation `gen` that takes news
+    /// `seq` changes ([`Self::craze_news`]'s fences): a re-registered host's
+    /// source never revives an older generation's lane (item 12), a return
+    /// minted before the departure it would cancel — delivered after it —
+    /// never revives the lane (C1 re-review), and nothing un-finishes a
+    /// finished one.
+    ///
+    /// A pending open of `gen` takes the news too, so a departure minted
+    /// before this return cannot cancel it afterwards, nor depart the entry it
+    /// commits. (One already cancelled stays cancelled: a cancelled open fails,
+    /// as `close` makes it fail, and its panel's retry opens the listed row.)
+    pub fn craze_returned(&self, machine: &str, gen: u64, seq: u64, host_ids: &[String]) {
+        let mut inner = lock(&self.inner);
+        inner.note_craze_news(machine, gen, seq, host_ids);
+        for host_id in host_ids {
+            let key = key(machine, CRAZE, host_id);
+            if let Some(pending) = inner.pending.get_mut(&key) {
+                if pending.craze_gen == Some(gen) {
+                    // Taken (or not) — a return changes nothing else here.
+                    pending.news.take(seq);
+                }
+            }
+            let Some(entry) = inner
+                .entries
+                .get(&key)
+                .filter(|entry| entry.craze_gen == Some(gen))
+            else {
+                continue;
+            };
+            let mut life = lock(&entry.core.state);
+            if life.news.take(seq) && matches!(life.state, EntryState::Departing { .. }) {
+                life.state = EntryState::Live;
+                drop(life);
+                entry.cancel_grace();
+            }
+        }
+    }
+
+    /// **`machine`'s host was removed** (plan 032 §3.1.1 item 5, PC3): its
+    /// craze source of generation `gen` is gone, so EVERY lane filed under
+    /// it — listed or departing, whatever the source last held — ends now,
+    /// with no grace: under its `state`, unless already finished,
+    /// `Down{host_removed}` is applied and emitted and it becomes `Finished`;
+    /// then its grace task is cancelled and it is retired at once (its client
+    /// released, PC4). The entries STAY, readable — `lane.messages` still
+    /// answers. Every pending open of `gen` is cancelled, and the registry's
+    /// news marks of `gen` are dropped for good ([`CrazeMarks`]).
+    ///
+    /// Through the news fence like any news ([`Self::craze_news`]), which it
+    /// always passes: `seq` is minted in the critical section that takes the
+    /// host's state out of the map, so it is the last of its generation — no
+    /// later news of `gen` can be minted.
+    ///
+    /// The old rule published only the rows the source still held, which
+    /// missed a lane whose row had already left (a departing lane) and left it
+    /// holding the removed host's dial for the rest of its grace.
+    pub fn evict_craze_generation(&self, machine: &str, gen: u64, seq: u64) {
+        let ended: Vec<Arc<LaneEntry>> = {
             let mut inner = lock(&self.inner);
-            host_ids
+            // The generation's last news: its marks go with it.
+            inner.note_craze_removed(machine, gen);
+            for (key, pending) in inner.pending.iter_mut() {
+                if key.0 == machine
+                    && key.1 == CRAZE
+                    && pending.craze_gen == Some(gen)
+                    && pending.news.take(seq)
+                {
+                    pending.cancelled = true;
+                }
+            }
+            inner
+                .entries
                 .iter()
-                .filter_map(|host_id| {
-                    let key = key(machine, CRAZE, host_id);
-                    if let Some(pending) = inner.pending.get_mut(&key) {
-                        if pending.craze_gen == Some(gen) {
-                            pending.cancelled = true;
-                        }
-                    }
-                    let ours = inner
-                        .entries
-                        .get(&key)
-                        .is_some_and(|entry| entry.craze_gen == Some(gen));
-                    if ours {
-                        inner.entries.remove(&key)
-                    } else {
-                        None
-                    }
-                })
+                .filter(|((m, _, _), entry)| m == machine && entry.craze_gen == Some(gen))
+                .filter(|(key, entry)| entry.core.host_removed(&self.sink, key, seq))
+                .map(|(_, entry)| Arc::clone(entry))
                 .collect()
         };
         // Outside the lock: retiring gives a tunnel share back, which takes it.
-        for entry in gone {
+        for entry in ended {
+            entry.cancel_grace();
             entry.retire();
         }
     }
@@ -1394,12 +2393,20 @@ impl Lanes {
         if inner.closing {
             return Err(LaneFailure::ShuttingDown);
         }
+        // A craze open's fence starts where the news its row already had
+        // left it ([`CrazeMarks`], C8 review) — under this lock, which every
+        // piece is recorded under, so none falls between the read and the
+        // declaration.
+        let news = craze_gen.map_or_else(NewsMark::default, |gen| {
+            inner.craze_mark(&key.0, gen, &key.2)
+        });
         inner.pending.insert(
             key.clone(),
             Pending {
                 stamp: stamp.clone(),
                 cancelled: false,
                 craze_gen,
+                news,
             },
         );
         Ok(PendingGuard {
@@ -1417,18 +2424,28 @@ impl Lanes {
     /// spawn gate, at the start of its orderly shutdown. Every open not yet
     /// declared is refused `shutting_down`; [`Self::shutdown`] tears down the
     /// rest.
+    ///
+    /// **And emit nothing from now on** (plan 032 §3.1.1 item 4; C1 review):
+    /// this is where the registry's `closing` flag is first set, so every
+    /// entry is fenced FIRST ([`Inner::close`]) — waiting out a frame a pump
+    /// has in flight — and no pump frame or grace expiry lands after it.
     pub fn begin_closing(&self) {
-        lock(&self.inner).closing = true;
+        lock(&self.inner).close();
     }
 
     /// **The lanes phase of the orderly shutdown** (plan 026 §3.3, phase 1).
     /// **Blocking**: run it on a dedicated OS thread, never an async worker —
     /// it kills and reaps `ssh` children — and never on the blocking pool.
     ///
-    /// * Every committed entry and every pending open is taken (the opens
-    ///   cancelled, so none commits).
-    /// * Every pump is aborted AND AWAITED (bounded by [`PUMP_JOIN_WAIT`]): an
-    ///   aborted pump keeps running until its next poll, holding its forward.
+    /// * Every committed entry — finished ones included — and every pending
+    ///   open is taken (the opens cancelled, so none commits). Each entry is
+    ///   marked `closing` under its own `state` lock BEFORE the registry's
+    ///   flag is set ([`Inner::close`], plan 032 §3.1.1 item 4; a no-op past
+    ///   [`Self::begin_closing`], which did it first), so from then on no pump
+    ///   frame and no grace expiry is applied or emitted.
+    /// * Every pump AND every departure's grace task is aborted and AWAITED
+    ///   (one bound for them all, [`PUMP_JOIN_WAIT`]): an aborted pump keeps
+    ///   running until its next poll, holding its forward.
     /// * Every forward is closed through the trait ([`MachineForward::close_now`]),
     ///   all at once on threads of their own, overlapping the pump joins
     ///   (F10), whatever its reference count —
@@ -1442,7 +2459,11 @@ impl Lanes {
     pub fn shutdown(&self) -> LanesClosed {
         let (entries, forwards) = {
             let mut inner = lock(&self.inner);
-            inner.closing = true;
+            // Fence every entry, then set the flag — under each entry's
+            // `state` lock (the lock order: `inner` first) and BEFORE the
+            // drain: a grace expiry checks its entry's mark and makes its
+            // transition under that same lock, so none lands after this.
+            inner.close();
             for pending in inner.pending.values_mut() {
                 pending.cancelled = true;
             }
@@ -1454,6 +2475,7 @@ impl Lanes {
                 .collect();
             (entries, forwards)
         };
+        let finished = entries.iter().filter(|entry| entry.is_finished()).count();
         let pumps: Vec<tokio::task::JoinHandle<()>> = entries
             .iter()
             .filter_map(|entry| lock(&entry.pump).take())
@@ -1461,32 +2483,34 @@ impl Lanes {
         for pump in &pumps {
             pump.abort();
         }
+        let graces: Vec<tokio::task::JoinHandle<()>> = entries
+            .iter()
+            .filter_map(|entry| entry.cancel_grace())
+            .collect();
         let pump_count = pumps.len();
-        // The forwards' closes and the pumps' joins OVERLAP (F10): each close
+        let grace_count = graces.len();
+        // The forwards' closes and the tasks' joins OVERLAP (F10): each close
         // on a thread of its own, the joins on this one. An aborted pump in its
         // tunnel's `ensure` sees the slot closed and ends within about a poll.
-        let (forwards_unsettled, pumps_unjoined) = std::thread::scope(|scope| {
+        let (forwards_unsettled, (pumps_unjoined, graces_unjoined)) = std::thread::scope(|scope| {
             // Every close is started before anything is joined.
             let mut closes = Vec::with_capacity(forwards.len());
             for forward in &forwards {
                 closes.push(scope.spawn(move || forward.get().close_now()));
             }
-            let pumps_unjoined = if pumps.is_empty() {
-                0
+            let unjoined = if pumps.is_empty() && graces.is_empty() {
+                (0, 0)
             } else {
                 // Not a runtime worker (the caller's promise), so blocking on
                 // the app's runtime here is legal. One deadline for them all;
-                // a pump still running at it is aborted already and is left —
+                // a task still running at it is aborted already and is left —
                 // counted — to end at its next poll.
                 self.handle.block_on(async move {
                     let deadline = tokio::time::Instant::now() + PUMP_JOIN_WAIT;
-                    let mut unjoined = 0;
-                    for pump in pumps {
-                        if tokio::time::timeout_at(deadline, pump).await.is_err() {
-                            unjoined += 1;
-                        }
-                    }
-                    unjoined
+                    (
+                        join_by(deadline, pumps).await,
+                        join_by(deadline, graces).await,
+                    )
                 })
             };
             let forwards_unsettled = closes
@@ -1494,14 +2518,17 @@ impl Lanes {
                 .map(|close| close.join().unwrap_or(false))
                 .filter(|settled| !settled)
                 .count();
-            (forwards_unsettled, pumps_unjoined)
+            (forwards_unsettled, unjoined)
         });
         let closed = LanesClosed {
             lanes: entries.len(),
+            finished,
             forwards: forwards.len(),
             forwards_unsettled,
             pumps: pump_count,
             pumps_unjoined,
+            graces: grace_count,
+            graces_unjoined,
         };
         // The shares go back here, on this thread: the last one out drops the
         // forward (already closed) through [`OwnedForward`]'s own thread.
@@ -1529,6 +2556,46 @@ impl Lanes {
 
     fn entry(&self, key: &Key) -> Option<Arc<LaneEntry>> {
         lock(&self.inner).entries.get(key).map(Arc::clone)
+    }
+
+    /// **A verb's admission** (plan 032 §3.1.1 item 8): the entry, then the
+    /// adapter the verb is sent through — refused `lane_ended` once the lane
+    /// is finished, the lifecycle decided with the clone under one `state`
+    /// lock ([`LaneCore::client`]). A verb admitted before the lane finished
+    /// runs its course on the clone it took, whatever retires the entry
+    /// meanwhile; one admitted after is refused, with nothing sent. The
+    /// entry itself is not held past this, so a verb in flight never keeps a
+    /// retired entry alive.
+    async fn admit(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<Arc<dyn AgentLane>, LaneFailure> {
+        let entry = self.open_entry(machine, kind, session_id)?;
+        #[cfg(test)]
+        self.at_verb_gap(Admission::Before).await;
+        let client = entry.client()?;
+        drop(entry);
+        #[cfg(test)]
+        self.at_verb_gap(Admission::After).await;
+        Ok(client)
+    }
+
+    /// Pass through the first [`Self::verb_gaps`] gap armed at `side`, if a
+    /// test armed one.
+    #[cfg(test)]
+    async fn at_verb_gap(&self, side: Admission) {
+        let gap = {
+            let mut gaps = lock(&self.verb_gaps);
+            gaps.iter()
+                .position(|(at, _)| *at == side)
+                .map(|i| gaps.remove(i).1)
+        };
+        if let Some((reached, proceed)) = gap {
+            reached.notify_one();
+            proceed.notified().await;
+        }
     }
 
     /// The entry every verb but `open` needs, or the reason there is none.
@@ -1668,10 +2735,15 @@ impl Lanes {
             if let Some(pending) = inner.pending.get_mut(key) {
                 pending.cancelled = true;
             }
-            inner.entries.remove(key)
+            let entry = inner.entries.remove(key);
+            if let Some(entry) = &entry {
+                entry.detach();
+            }
+            entry
         };
         // Outside the lock: retiring gives a tunnel share back, which takes it.
         if let Some(entry) = entry {
+            entry.cancel_grace();
             entry.retire();
         }
     }
@@ -1691,7 +2763,13 @@ impl Lanes {
     /// `Down`, or its channel closing) — never on an ADAPTER's `Stale`, which
     /// is the adapter saying it is retrying with its cursor intact; a
     /// resubscribe there would throw the cursor away (plan 025 §3.2.4). And it
-    /// does not replace one that ended for good ([`down_is_final`]). Every
+    /// does not replace one that ended for good ([`down_is_final`]): that
+    /// `Down` is applied together with the entry's move to `Finished`
+    /// ([`LaneCore::finish`], plan 032 §3.1.1 item 1), and the pump returns.
+    /// Every frame goes through [`LaneCore::apply`] — under the entry's
+    /// `state`, and only while it is not finished — so once this layer has
+    /// ended the lane (a grace's expiry, the host's removal) nothing more is
+    /// applied, and the pump stops at its next frame. Every
     /// failure this loop itself retries — a forward that would not come up, a
     /// `subscribe` refused for any reason but a missing session — is shown as
     /// [`LaneEvent::Stale`], because it is not an end: the next attempt is
@@ -1721,7 +2799,7 @@ impl Lanes {
         &self,
         key: Key,
         client: Arc<dyn AgentLane>,
-        view: Arc<Mutex<LaneView>>,
+        core: Arc<LaneCore>,
         forward: Option<Weak<OwnedForward>>,
     ) -> tokio::task::JoinHandle<()> {
         let sink = Arc::clone(&self.sink);
@@ -1733,7 +2811,9 @@ impl Lanes {
                     Ensured::Ready => {}
                     Ensured::Gone => return,
                     Ensured::Failed(e) => {
-                        note(&sink, &view, &key, stale(format!("forward: {e}")));
+                        if !core.apply(&sink, &key, &stale(format!("forward: {e}"))) {
+                            return;
+                        }
                         tokio::time::sleep(backoff).await;
                         backoff = next_backoff(backoff);
                         continue;
@@ -1745,18 +2825,13 @@ impl Lanes {
                     // Anything else is worth retrying — the agent may simply be
                     // restarting — so it is stale, not ended.
                     Err(LaneError::UnknownSession) => {
-                        note(
-                            &sink,
-                            &view,
-                            &key,
-                            LaneEvent::Down {
-                                reason: DOWN_UNKNOWN_SESSION.to_string(),
-                            },
-                        );
+                        core.end(&sink, &key, DOWN_UNKNOWN_SESSION);
                         return;
                     }
                     Err(e) => {
-                        note(&sink, &view, &key, stale(e.to_string()));
+                        if !core.apply(&sink, &key, &stale(e.to_string())) {
+                            return;
+                        }
                         tokio::time::sleep(backoff).await;
                         backoff = next_backoff(backoff);
                         continue;
@@ -1765,11 +2840,6 @@ impl Lanes {
                 // BOTH halves, for the whole read: taking `.rx` alone drops the
                 // stop handle, which aborts the pump it is reading from.
                 let (mut rx, stop) = subscription.into_parts();
-                let mut down: Option<String> = None;
-                // This loop's OWN reason to drop the subscription — set when the
-                // tunnel under it failed, so the read below is abandoned and a
-                // fresh subscription brings the lane back.
-                let mut restart = false;
                 // The subscription's FIRST Reset is the seed of the connect this
                 // loop just ensured for; every later one is a reconnect.
                 let mut generations = 0usize;
@@ -1778,15 +2848,31 @@ impl Lanes {
                         // A generation that reached steady state is the signal
                         // the transport is healthy again.
                         LaneEvent::Ready { .. } => backoff = RESUBSCRIBE_BASE,
-                        LaneEvent::Down { reason } => down = Some(reason.clone()),
+                        // **The lane is over for good** (plan 032 §3.1.1 item
+                        // 1): applied, emitted and `Finished` in one `state`
+                        // acquisition — unless a grace's expiry or the host's
+                        // removal ended it first, in which case this `Down`
+                        // is not applied at all — then the transport released
+                        // (C1 review: a natural end lets it go as every other
+                        // end does), and the pump's work is done.
+                        LaneEvent::Down { reason } if down_is_final(reason) => {
+                            core.end(&sink, &key, reason);
+                            return;
+                        }
                         LaneEvent::Reset { .. } => generations += 1,
                         // A `Stale` is the adapter retrying on its own, cursor
                         // intact: keep reading. It is folded into the view (the
-                        // banner) like any other frame, and that is all.
+                        // banner) like any other frame, and that is all. A
+                        // retryable `Down` is folded too, and the subscription
+                        // ends behind it.
                         _ => {}
                     }
-                    lock(&view).apply(&event);
-                    emit(&sink, &key, &event);
+                    // Under `state`, and only while the entry is not finished:
+                    // once it is, nothing more is applied — a late `Ready`
+                    // cannot un-end a lane — and the pump stops.
+                    if !core.apply(&sink, &key, &event) {
+                        return;
+                    }
                     if generations > 1 && matches!(event, LaneEvent::Reset { .. }) {
                         match ensure_forward(&forward, &inner).await {
                             Ensured::Ready => {}
@@ -1807,24 +2893,35 @@ impl Lanes {
                             // Ready`. (An ADAPTER's own `Stale` is not this
                             // case: the adapter reseeds or resumes on its own.)
                             Ensured::Failed(e) => {
-                                note(&sink, &view, &key, stale(format!("forward: {e}")));
-                                restart = true;
+                                if !core.apply(&sink, &key, &stale(format!("forward: {e}"))) {
+                                    return;
+                                }
                                 break;
                             }
                         }
                     }
                 }
                 drop(stop);
-                // The subscription ENDED, or this loop ended it. Replace it —
-                // unless the adapter ended it for good.
-                if !restart && down.as_deref().is_some_and(down_is_final) {
-                    return;
-                }
+                // The subscription ENDED (its channel closed, or a retryable
+                // `Down`), or this loop ended it: replace it. One that ended
+                // for good returned above, at its final `Down`.
                 tokio::time::sleep(backoff).await;
                 backoff = next_backoff(backoff);
             }
         })
     }
+}
+
+/// Await every task by `deadline`, answering how many had not ended by then
+/// (aborted already; each ends at its next poll).
+async fn join_by(deadline: tokio::time::Instant, tasks: Vec<tokio::task::JoinHandle<()>>) -> usize {
+    let mut unjoined = 0;
+    for task in tasks {
+        if tokio::time::timeout_at(deadline, task).await.is_err() {
+            unjoined += 1;
+        }
+    }
+    unjoined
 }
 
 /// What one attempt at making the tunnel usable said.
@@ -1854,7 +2951,11 @@ async fn ensure_forward(forward: &Option<Weak<OwnedForward>>, inner: &Mutex<Inne
     }
 }
 
-/// A failure THIS layer is retrying, as the frame that says so.
+/// A failure THIS layer is retrying, as the frame that says so — folded into
+/// the view and emitted exactly as the adapter's own frames are
+/// ([`LaneCore::apply`]): the panel must not care whether the thing that went
+/// away was the agent or the tunnel to it, since both mean "this transcript is
+/// not live" and both are recovered by the same retry.
 ///
 /// [`LaneEvent::Stale`], not `Down`: the pump has already scheduled its next
 /// attempt, so the lane has not ended — and `Down` would set the view's `ended`,
@@ -1863,15 +2964,47 @@ fn stale(reason: String) -> LaneEvent {
     LaneEvent::Stale { reason }
 }
 
-/// Fold a frame THIS layer minted (not the adapter) into the view, and tell the
-/// UI about it on the same event.
+/// **One departure's grace** (plan 032 §3.1.1 items 2 and 4): wait until
+/// `grace` passes or the lane finishes, whichever is first; at the deadline,
+/// end the lane — `Down{session_gone}` or `Down{hub_gone}`, by its cause —
+/// if it is STILL departing under `token` and the app is not closing
+/// ([`LaneCore::expire`], the check and the transition under one `state`
+/// lock), then retire it, outside every lock. Anything else — a return (the
+/// token gone), the session's own final `Down`, the entry closed, the
+/// shutdown — and it exits doing nothing.
 ///
-/// The panel must not care whether the thing that went away was the agent or the
-/// tunnel to it: both mean "this transcript is not live", and both are recovered
-/// by the same retry.
-fn note(sink: &EventSink, view: &Arc<Mutex<LaneView>>, key: &Key, event: LaneEvent) {
-    lock(view).apply(&event);
-    emit(sink, key, &event);
+/// Holds a `Weak` to the entry, so a closed lane is not kept alive for the
+/// rest of its grace, and the entry's [`LaneCore`] for the notification it
+/// waits on.
+async fn depart(
+    entry: Weak<LaneEntry>,
+    core: Arc<LaneCore>,
+    token: u64,
+    grace: Duration,
+    sink: EventSink,
+    key: Key,
+) {
+    // Registered BEFORE the state is read, so a finish between the departure
+    // and this task's first poll is never missed: either the read below sees
+    // `Finished`, or the notification wakes the wait.
+    let finished = core.finished.notified();
+    tokio::pin!(finished);
+    finished.as_mut().enable();
+    if !core.departing_under(token) {
+        return;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(grace) => {}
+        _ = &mut finished => return,
+    }
+    let Some(entry) = entry.upgrade() else {
+        return;
+    };
+    if core.expire(&sink, &key, token) {
+        // Outside the `state` lock (and never under `inner`): retiring gives a
+        // tunnel share back, which takes the registry's.
+        entry.retire();
+    }
 }
 
 fn emit(sink: &EventSink, key: &Key, event: &LaneEvent) {
@@ -2160,6 +3293,11 @@ mod tests {
             .message()
             .starts_with("shutting_down"));
         assert!(seen.insert("shutting_down"));
+        // A verb on a FINISHED lane (plan 032 §3.1.1 item 8): its own code,
+        // and the words the panel's action-error line shows.
+        assert_eq!(LaneFailure::Ended.code(), "lane_ended");
+        assert_eq!(LaneFailure::Ended.message(), "the session has ended");
+        assert!(seen.insert("lane_ended"));
         // A craze verb whose answer was lost: its own code, recognised by the
         // adapter's one test — the settings sheet's "not confirmed" (plan 025
         // §3.10) — and its message whole.
@@ -2703,6 +3841,10 @@ mod tests {
         /// When set, every forward is a [`SpawningForward`] writing its child's
         /// pid here (plan 026 §3.3's mid-spawn cell).
         spawning: Mutex<Option<std::path::PathBuf>>,
+        /// The craze source's generation [`LaneMachines::craze_source`]
+        /// answers — moved by a cell to play a host removed and registered
+        /// again (plan 032 §3.1.1 item 12).
+        craze_gen: std::sync::atomic::AtomicU64,
     }
 
     impl LaneMachines for FakeMachines {
@@ -2737,7 +3879,7 @@ mod tests {
             lock(&self.craze)
                 .as_ref()
                 .filter(|_| machine == MACHINE)
-                .map(|(source, _)| (source.clone(), 1))
+                .map(|(source, _)| (source.clone(), self.craze_gen.load(SeqCst)))
                 .ok_or_else(|| format!("{machine} has no craze source"))
         }
 
@@ -2767,14 +3909,19 @@ mod tests {
         }
     }
 
-    /// Every `lane-event` the layer emitted, by kind.
+    /// Every `lane-event` the layer emitted, by kind — and every `Down`'s
+    /// reason, in order (plan 032: exactly one terminal `Down`).
     #[derive(Default)]
     struct Recorder {
         kinds: Mutex<Vec<&'static str>>,
+        downs: Mutex<Vec<String>>,
     }
 
     impl Recorder {
         fn record(&self, event: &LaneEvent) {
+            if let LaneEvent::Down { reason } = event {
+                lock(&self.downs).push(reason.clone());
+            }
             lock(&self.kinds).push(match event {
                 LaneEvent::Reset { .. } => "reset",
                 LaneEvent::Ready { .. } => "ready",
@@ -2792,6 +3939,14 @@ mod tests {
 
         fn count(&self, kind: &str) -> usize {
             lock(&self.kinds).iter().filter(|k| **k == kind).count()
+        }
+
+        fn downs(&self) -> Vec<String> {
+            lock(&self.downs).clone()
+        }
+
+        fn total(&self) -> usize {
+            lock(&self.kinds).len()
         }
     }
 
@@ -2842,6 +3997,30 @@ mod tests {
         rows: BTreeMap<String, AgentLaneStamp>,
         craze: Option<(CrazeSource, Vec<String>)>,
     ) -> (Arc<Lanes>, Arc<ForwardLog>, Arc<Recorder>) {
+        let (lanes, log, recorder, _machines) = lanes_with_machines(port, rows, craze, None);
+        (lanes, log, recorder)
+    }
+
+    /// The departure grace every cell runs with (plan 032 §3.1's test seam):
+    /// short enough to wait out, long enough that a cell's own steps fit
+    /// inside it.
+    const TEST_GRACE: Duration = Duration::from_millis(300);
+
+    /// [`lanes_with_craze`], and the machine layer itself (a cell that moves
+    /// its craze rows or generation), every forward a [`SpawningForward`]
+    /// writing to `spawning` when given. The departure grace is
+    /// [`TEST_GRACE`].
+    fn lanes_with_machines(
+        port: u16,
+        rows: BTreeMap<String, AgentLaneStamp>,
+        craze: Option<(CrazeSource, Vec<String>)>,
+        spawning: Option<&std::path::Path>,
+    ) -> (
+        Arc<Lanes>,
+        Arc<ForwardLog>,
+        Arc<Recorder>,
+        Arc<FakeMachines>,
+    ) {
         let log = Arc::new(ForwardLog::default());
         let recorder = Arc::new(Recorder::default());
         let machines = Arc::new(FakeMachines {
@@ -2850,7 +4029,8 @@ mod tests {
             log: Arc::clone(&log),
             reach: ReachKind::Ssh(fake_entry()),
             craze: Mutex::new(craze),
-            spawning: Mutex::new(None),
+            spawning: Mutex::new(spawning.map(std::path::Path::to_path_buf)),
+            craze_gen: std::sync::atomic::AtomicU64::new(1),
         });
         let sink: EventSink = {
             let recorder = Arc::clone(&recorder);
@@ -2860,12 +4040,15 @@ mod tests {
                 },
             )
         };
-        let lanes = Arc::new(Lanes::with_sink(
-            tokio::runtime::Handle::current(),
-            sink,
-            machines,
-        ));
-        (lanes, log, recorder)
+        let lanes = Arc::new(
+            Lanes::with_sink(
+                tokio::runtime::Handle::current(),
+                sink,
+                Arc::clone(&machines) as Arc<dyn LaneMachines>,
+            )
+            .with_depart_grace(TEST_GRACE),
+        );
+        (lanes, log, recorder, machines)
     }
 
     /// The `MachineEntry` [`FakeMachines`] hands out — what a forward is
@@ -3419,6 +4602,7 @@ mod tests {
             "the seed's capabilities, from the staged view: {view}"
         );
         assert_eq!(view["settings"], Value::Null, "opencode has no settings");
+        assert_eq!(view["effort_option"], Value::Null, "nor an effort option");
         assert_eq!(view["stale"], Value::Null);
         assert_eq!(view["ended"], false);
     }
@@ -3675,13 +4859,34 @@ mod tests {
             lanes.is_open(MACHINE, CRAZE, ID),
             "the craze lane is not roost's to evict"
         );
-        lanes.evict_craze(MACHINE, 2, &[ID.to_string()]);
-        assert!(
-            lanes.is_open(MACHINE, CRAZE, ID),
+        // Re-based on the lifecycle (plan 032 §3.1.1): another generation's
+        // news leaves it LIVE; its own generation's starts its departure, and
+        // the grace's end finishes it — readable, never removed.
+        let gone = [ID.to_string()];
+        let departed = CrazeNews::Departed {
+            host_ids: &gone,
+            cause: Departure::Removed,
+            seq: 1,
+        };
+        lanes.craze_news(MACHINE, 2, departed);
+        assert_eq!(
+            lanes.lane_state(MACHINE, CRAZE, ID),
+            Some("live"),
             "another generation's eviction leaves it alone"
         );
-        lanes.evict_craze(MACHINE, 1, &[ID.to_string()]);
-        assert!(!lanes.is_open(MACHINE, CRAZE, ID), "evict_craze retires it");
+        lanes.craze_news(MACHINE, 1, departed);
+        assert_eq!(lanes.lane_state(MACHINE, CRAZE, ID), Some("departing"));
+        wait_for("the grace to end the lane", || {
+            (lanes.lane_state(MACHINE, CRAZE, ID) == Some("finished")).then_some(())
+        })
+        .await;
+        assert!(
+            lanes.is_open(MACHINE, CRAZE, ID),
+            "a finished craze lane stays, readable"
+        );
+        let view = lanes.messages(MACHINE, CRAZE, ID).expect("still readable");
+        assert_eq!(view["finished"], true, "{view}");
+        assert_eq!(view["stale"], DOWN_SESSION_GONE, "{view}");
     }
 
     /// **A craze lane opened on a row that states no permission mode shows the
@@ -3875,6 +5080,10 @@ mod tests {
         assert_eq!(rows.len(), 1, "{view}");
         assert_eq!(rows[0]["name"], "research");
         assert_eq!(rows[0]["action"], json!({"kind": "prompt"}));
+        // The settings' effort option rides the same reply (plan 032 PC14h):
+        // the seed's `effort` select on `grok`, by the shared core's rule.
+        assert_eq!(view["settings"]["model"], "grok", "{view}");
+        assert_eq!(view["effort_option"], "effort", "{view}");
 
         // A blank title: refused here, nothing sent.
         let blank = lanes.set_title(MACHINE, CRAZE, HOST, "  \t ").await;
@@ -3913,6 +5122,1387 @@ mod tests {
         conn.refuse(&req, "bad_request", "bad_request", json!({}))
             .await;
         assert_eq!(refusing.await.unwrap().unwrap_err().code(), "bad_request");
+    }
+
+    // -----------------------------------------------------------------------
+    // a craze lane outlives its row by a grace (plan 032 §3.1.1, §7 W1)
+    //
+    // The REAL `CrazeSource` and `CrazeLane` over a SCRIPTED hub (the test
+    // plays craze line by line), a machine layer whose craze rows and source
+    // generation a cell moves, and a `TEST_GRACE` departure grace. The
+    // lifecycle's own races (exactly one terminal `Down`, nothing applied
+    // after the finish or the shutdown) are pinned on a bare `LaneCore`
+    // below them, where the interleavings can be forced.
+    // -----------------------------------------------------------------------
+
+    use shed_craze::testing::HubEnd;
+
+    /// The craze session every grace cell's lane is on.
+    const GHOST: &str = "0123456789ab";
+    const GSID: &str = "craze-1";
+    const GINC: &str = "INCARNATION-1";
+
+    /// One craze lane's rig: a source over a scripted hub listing [`GHOST`],
+    /// and a `Lanes` over it whose machine layer lists the row too.
+    struct CrazeRig {
+        lanes: Arc<Lanes>,
+        events: Arc<Recorder>,
+        machines: Arc<FakeMachines>,
+        source: CrazeSource,
+        /// The roster's connection — a cell's `roster` frames go out on it.
+        hub: HubEnd,
+        conns: tokio::sync::mpsc::UnboundedReceiver<HubEnd>,
+        _roster: shed_core::lane::SourceSubscription,
+        /// The last news number [`Self::seq`] minted — the source's
+        /// [`crate::craze::CrazeState::mint_news`], played by the cell.
+        seq: std::sync::atomic::AtomicU64,
+    }
+
+    impl CrazeRig {
+        async fn start() -> CrazeRig {
+            CrazeRig::start_with(None, shed_craze::LaneTimings::default()).await
+        }
+
+        /// [`Self::start`], its craze lanes on `lane` clocks, and — given an
+        /// opencode fake — the machine also stamping that fake's `ses_a` (its
+        /// tunnels landing on the fake's port), for a cell about two lanes of
+        /// two kinds at once.
+        async fn start_with(
+            opencode: Option<&FakeOpencode>,
+            lane: shed_craze::LaneTimings,
+        ) -> CrazeRig {
+            use shed_core::lane::AgentSource as _;
+            use shed_craze::testing::{full_hub_capabilities, roster_row, ScriptedDial};
+
+            let (dial, mut conns) = ScriptedDial::new();
+            let source = CrazeSource::new(dial, "shed-desktop-test").with_lane_timings(lane);
+            let roster = source.subscribe().await.expect("subscribe");
+            let mut hub = conns.recv().await.expect("the roster dialled");
+            hub.hello("0a1b2c3d4e5f", full_hub_capabilities()).await;
+            hub.subscribed(
+                "sub-1",
+                "0a1b2c3d4e5f",
+                json!([roster_row(GHOST, GSID, "/w", json!({"title": "w"}))]),
+            )
+            .await;
+            wait_for("the source lists the row", || {
+                source.listed(GHOST).map(|_| ())
+            })
+            .await;
+            let (port, rows) = match opencode {
+                Some(fake) => (fake.addr().port(), lane_rows(&["ses_a"])),
+                None => (REMOTE_PORT, BTreeMap::new()),
+            };
+            let (lanes, _log, events, machines) = lanes_with_machines(
+                port,
+                rows,
+                Some((source.clone(), vec![GHOST.to_string()])),
+                None,
+            );
+            CrazeRig {
+                lanes,
+                events,
+                machines,
+                source,
+                hub,
+                conns,
+                _roster: roster,
+                seq: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        /// Open the lane and seed it; answers the lane's own connection.
+        async fn open_seeded(&mut self) -> HubEnd {
+            use shed_craze::testing::{
+                attach_result, host_session_row, session_caps, session_info, snapshot_at,
+            };
+
+            self.lanes
+                .open(MACHINE, CRAZE, GHOST)
+                .await
+                .expect("the craze lane opens");
+            let mut conn = self.conns.recv().await.expect("the lane dialled");
+            conn.splice(GHOST).await;
+            let info = session_info(GHOST, GSID, GINC, session_caps(true));
+            conn.listed(host_session_row(&info, json!({"title": "w"})))
+                .await;
+            conn.attached(attach_result(
+                "s-1",
+                &info,
+                (GINC, 1),
+                Some(snapshot_at(GINC, 1, json!({}))),
+                None,
+            ))
+            .await;
+            conn.synchronized("s-1", 1).await;
+            wait_for("the seed to swap in", || {
+                let v = self.lanes.messages(MACHINE, CRAZE, GHOST).ok()?;
+                (v["generation"].as_u64() >= Some(1)).then_some(())
+            })
+            .await;
+            conn
+        }
+
+        fn news(&self, gen: u64, news: CrazeNews<'_>) {
+            self.lanes.craze_news(MACHINE, gen, news);
+        }
+
+        /// The source's next news number: a piece the cell publishes at once
+        /// is minted as it is published; one minted and published LATER plays
+        /// a publisher paused between its lock and its publication.
+        fn seq(&self) -> u64 {
+            self.seq.fetch_add(1, SeqCst) + 1
+        }
+
+        /// The row left the source (generation 1), for `cause`.
+        fn depart(&self, cause: Departure) {
+            self.depart_as(cause, self.seq());
+        }
+
+        /// [`Self::depart`], as news number `seq`.
+        fn depart_as(&self, cause: Departure, seq: u64) {
+            self.news(
+                1,
+                CrazeNews::Departed {
+                    host_ids: &[GHOST.to_string()],
+                    cause,
+                    seq,
+                },
+            );
+        }
+
+        /// The row is listed again (generation 1).
+        fn returned(&self) {
+            self.returned_as(self.seq());
+        }
+
+        /// [`Self::returned`], as news number `seq`.
+        fn returned_as(&self, seq: u64) {
+            self.news(
+                1,
+                CrazeNews::Returned {
+                    host_ids: &[GHOST.to_string()],
+                    seq,
+                },
+            );
+        }
+
+        /// The host was removed (generation `gen`).
+        fn host_removed(&self, gen: u64) {
+            self.news(gen, CrazeNews::HostRemoved { seq: self.seq() });
+        }
+
+        /// What the machine layer lists — `false` plays the row gone, so a
+        /// stamp no longer resolves.
+        fn listed(&self, listed: bool) {
+            if let Some((_, ids)) = lock(&self.machines.craze).as_mut() {
+                ids.clear();
+                if listed {
+                    ids.push(GHOST.to_string());
+                }
+            }
+        }
+
+        fn state(&self) -> Option<&'static str> {
+            self.lanes.lane_state(MACHINE, CRAZE, GHOST)
+        }
+
+        fn entry(&self) -> Arc<LaneEntry> {
+            self.lanes
+                .entry(&key(MACHINE, CRAZE, GHOST))
+                .expect("the entry")
+        }
+
+        fn token(&self) -> Option<u64> {
+            match lock(&self.entry().core.state).state {
+                EntryState::Departing { token, .. } => Some(token),
+                _ => None,
+            }
+        }
+
+        fn messages(&self) -> Value {
+            self.lanes
+                .messages(MACHINE, CRAZE, GHOST)
+                .expect("lane.messages answers")
+        }
+
+        async fn finished(&self, what: &str) -> Value {
+            wait_for(what, || (self.state() == Some("finished")).then_some(())).await;
+            self.messages()
+        }
+    }
+
+    /// **W1 cell 1 — a vanished host ends `session_gone`, within the grace
+    /// plus 1 s.** The row leaves and no final event follows: the lane keeps
+    /// its connection for the grace, then THIS layer ends it — one
+    /// `Down{session_gone}`, `finished`, still readable — and retires it: the
+    /// adapter is released (its connection closes) and every verb is refused
+    /// `lane_ended`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vanished_hosts_lane_ends_session_gone_within_the_grace() {
+        let mut rig = CrazeRig::start().await;
+        let mut conn = rig.open_seeded().await;
+        let departed = std::time::Instant::now();
+        rig.depart(Departure::Removed);
+        assert_eq!(rig.state(), Some("departing"));
+        assert_eq!(rig.messages()["finished"], false, "departing is not over");
+        let view = rig.finished("the grace to end the lane").await;
+        let took = departed.elapsed();
+        assert!(
+            took >= TEST_GRACE && took <= TEST_GRACE + Duration::from_secs(1),
+            "ended {took:?} after the row left (grace {TEST_GRACE:?})"
+        );
+        assert_eq!(rig.events.downs(), [DOWN_SESSION_GONE]);
+        assert_eq!(view["finished"], true);
+        assert_eq!(view["ended"], true);
+        assert_eq!(view["stale"], DOWN_SESSION_GONE);
+        assert!(
+            lock(&rig.entry().core.client).is_none(),
+            "the adapter released"
+        );
+        // The released lane's connection closes (its watcher went with it).
+        let started = std::time::Instant::now();
+        assert!(conn.recv_within(Duration::from_secs(5)).await.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "closed, not idle"
+        );
+        let refused = rig
+            .lanes
+            .send(MACHINE, CRAZE, GHOST, "anyone?", SendMode::Queue)
+            .await
+            .expect_err("an ended lane takes no verb");
+        assert_eq!(refused.code(), "lane_ended");
+        assert_eq!(refused.message(), "the session has ended");
+        assert!(rig.lanes.approvals(MACHINE, CRAZE, GHOST).is_ok());
+    }
+
+    /// **W1 cell 2 — a return within the grace keeps the lane live, and a
+    /// later send works.**
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_return_within_the_grace_keeps_the_lane_live() {
+        let mut rig = CrazeRig::start().await;
+        let mut conn = rig.open_seeded().await;
+        rig.depart(Departure::Removed);
+        assert_eq!(rig.state(), Some("departing"));
+        rig.returned();
+        assert_eq!(rig.state(), Some("live"), "the return cancels it");
+        assert!(lock(&rig.entry().grace).is_none(), "its grace task went");
+        tokio::time::sleep(TEST_GRACE * 2).await;
+        assert_eq!(rig.state(), Some("live"), "and nothing ends it later");
+        assert!(rig.events.downs().is_empty());
+        let sending = {
+            let lanes = Arc::clone(&rig.lanes);
+            tokio::spawn(async move {
+                lanes
+                    .send(MACHINE, CRAZE, GHOST, "still here", SendMode::Queue)
+                    .await
+            })
+        };
+        let req = conn.expect("session.prompt").await;
+        assert_eq!(req["params"]["text"], "still here");
+        conn.reply(&req, json!({"turn": "turn-1", "text": "still here"}))
+            .await;
+        sending
+            .await
+            .expect("the send task")
+            .expect("a returned lane takes verbs");
+    }
+
+    /// **W1 cell 3 — a departure after a return gets a full, fresh grace**
+    /// (PC2): a new token, and an end measured from the SECOND removal —
+    /// the first departure's deadline passes with the lane still departing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_departure_after_a_return_gets_a_full_fresh_grace() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        rig.depart(Departure::Removed);
+        let first = rig.token().expect("departing");
+        tokio::time::sleep(TEST_GRACE * 2 / 3).await;
+        rig.returned();
+        let again = std::time::Instant::now();
+        rig.depart(Departure::Removed);
+        let second = rig.token().expect("departing again");
+        assert_ne!(first, second, "a fresh departure, a fresh token");
+        // Past the FIRST departure's deadline.
+        tokio::time::sleep(TEST_GRACE / 2).await;
+        assert_eq!(
+            rig.state(),
+            Some("departing"),
+            "the first grace's task did not end the second departure"
+        );
+        rig.finished("the second grace to end").await;
+        assert!(
+            again.elapsed() >= TEST_GRACE,
+            "a full grace from the second removal"
+        );
+        assert_eq!(rig.events.downs(), [DOWN_SESSION_GONE]);
+    }
+
+    /// **W1 cell 4 — a duplicate removal never extends the grace** (PC2):
+    /// the same token, and the end lands at the FIRST removal's deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_duplicate_removal_does_not_extend_the_grace() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        let departed = std::time::Instant::now();
+        rig.depart(Departure::Removed);
+        let token = rig.token().expect("departing");
+        tokio::time::sleep(TEST_GRACE / 2).await;
+        rig.depart(Departure::Removed);
+        rig.depart(Departure::HubGone);
+        assert_eq!(rig.token(), Some(token), "the same departure");
+        rig.finished("the first grace to end").await;
+        assert!(
+            departed.elapsed() < TEST_GRACE + TEST_GRACE / 2,
+            "ended {:?} after the FIRST removal — extended by the duplicate",
+            departed.elapsed()
+        );
+        assert_eq!(
+            rig.events.downs(),
+            [DOWN_SESSION_GONE],
+            "the first removal's cause, too"
+        );
+    }
+
+    /// **W1 cell 5 — the host removed during a grace ends the lane
+    /// `host_removed` AT ONCE** (PC3, PC4): no waiting out the grace, its
+    /// adapter released, its grace task gone — and `lane.messages` still
+    /// answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_removed_during_a_grace_ends_the_lane_at_once() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        rig.depart(Departure::Removed);
+        rig.listed(false);
+        rig.host_removed(1);
+        assert_eq!(rig.state(), Some("finished"), "at once, no grace");
+        assert_eq!(rig.events.downs(), [DOWN_HOST_REMOVED]);
+        let entry = rig.entry();
+        assert!(lock(&entry.core.client).is_none(), "the adapter released");
+        assert!(lock(&entry.grace).is_none(), "the grace task cancelled");
+        let view = rig.messages();
+        assert_eq!(view["finished"], true);
+        assert_eq!(view["stale"], DOWN_HOST_REMOVED);
+        // The cancelled grace never speaks again.
+        tokio::time::sleep(TEST_GRACE * 2).await;
+        assert_eq!(rig.events.downs(), [DOWN_HOST_REMOVED], "one terminal Down");
+    }
+
+    /// **W1 cell 6 — old-generation news touches nothing** (item 12): the
+    /// host was registered again (the source's generation is now 2), and the
+    /// OLD source's departure, removal and return all leave the new lane be;
+    /// its own generation's news governs it. The old news is numbered past
+    /// anything the new lane takes, and is still refused — and never advances
+    /// the lane's news mark (C1 re-review): the generation fence comes first,
+    /// so the current generation's lower numbers still govern.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_old_generations_news_touches_nothing() {
+        let mut rig = CrazeRig::start().await;
+        rig.machines.craze_gen.store(2, SeqCst);
+        let _conn = rig.open_seeded().await;
+        let gone = [GHOST.to_string()];
+        rig.news(
+            1,
+            CrazeNews::Departed {
+                host_ids: &gone,
+                cause: Departure::Removed,
+                seq: u64::MAX,
+            },
+        );
+        assert_eq!(rig.state(), Some("live"), "an old departure");
+        rig.news(1, CrazeNews::HostRemoved { seq: u64::MAX });
+        assert_eq!(rig.state(), Some("live"), "an old removal");
+        rig.news(
+            2,
+            CrazeNews::Departed {
+                host_ids: &gone,
+                cause: Departure::Removed,
+                seq: rig.seq(),
+            },
+        );
+        assert_eq!(rig.state(), Some("departing"));
+        rig.news(
+            1,
+            CrazeNews::Returned {
+                host_ids: &gone,
+                seq: u64::MAX,
+            },
+        );
+        assert_eq!(rig.state(), Some("departing"), "an old return");
+        rig.news(
+            2,
+            CrazeNews::Returned {
+                host_ids: &gone,
+                seq: rig.seq(),
+            },
+        );
+        assert_eq!(rig.state(), Some("live"));
+        assert!(rig.events.downs().is_empty());
+    }
+
+    /// **An open in flight carries the news fence into its entry** (C1
+    /// re-review): craze news reaches an open between its declaration and its
+    /// commit ([`Pending::news`]). Two departures are minted, their
+    /// publishers paused, and then the return that answers them; the return
+    /// reaches the open first. The first stale departure lands on the open and
+    /// does not cancel it; the second lands once it committed and does not
+    /// depart it — the entry starts its news mark where its open's stood. A
+    /// departure minted after all of them still does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_in_flight_carries_the_news_fence_into_its_entry() {
+        let rig = CrazeRig::start().await;
+        let (first, second, back) = (rig.seq(), rig.seq(), rig.seq());
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        *lock(&rig.lanes.commit_gap) = Some((Arc::clone(&reached), Arc::clone(&proceed)));
+        let opening = {
+            let lanes = Arc::clone(&rig.lanes);
+            tokio::spawn(async move { lanes.open(MACHINE, CRAZE, GHOST).await })
+        };
+        reached.notified().await;
+        rig.returned_as(back);
+        rig.depart_as(Departure::Removed, first);
+        proceed.notify_one();
+        opening
+            .await
+            .expect("the open task")
+            .expect("a departure older than the open's return does not cancel it");
+        assert_eq!(rig.state(), Some("live"));
+        rig.depart_as(Departure::Removed, second);
+        assert_eq!(
+            rig.state(),
+            Some("live"),
+            "an older departure, delivered after the commit, does not depart it"
+        );
+        rig.depart(Departure::Removed);
+        assert_eq!(rig.state(), Some("departing"), "a newer one does");
+    }
+
+    /// **News that landed while no lane was open still fences the lane
+    /// opened after it** (C8 review, [`CrazeMarks`]) — the reported
+    /// ordering: a stale probe's no-hub answer folds Dormant and mints the
+    /// row's departure, whose publication stalls; a Resume lists the row and
+    /// publishes its NEWER return while no panel exists; the panel opens; only
+    /// then does the stale departure land. It must not start a `hub_gone`
+    /// grace on the running session — the lane's fence starts where the
+    /// return left the row. A departure minted after the return still
+    /// departs it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn news_that_landed_before_the_open_fences_the_lane() {
+        let mut rig = CrazeRig::start().await;
+        let (stale, back) = (rig.seq(), rig.seq());
+        rig.returned_as(back);
+        assert_eq!(rig.state(), None, "no lane was open for the return");
+        let _conn = rig.open_seeded().await;
+        rig.depart_as(Departure::HubGone, stale);
+        assert_eq!(
+            rig.state(),
+            Some("live"),
+            "a departure older than a return that landed before the open does not depart it"
+        );
+        assert!(lock(&rig.entry().grace).is_none(), "no grace started");
+        rig.depart(Departure::HubGone);
+        assert_eq!(rig.state(), Some("departing"), "a newer one does");
+        rig.finished("the newer departure's grace to end").await;
+        assert_eq!(rig.events.downs(), [DOWN_HUB_GONE]);
+    }
+
+    /// [`news_that_landed_before_the_open_fences_the_lane`]'s ordering with
+    /// the stale departure landing on the open IN FLIGHT (C8 review): the
+    /// open declared itself with the row's mark, so the departure does not
+    /// cancel it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn news_that_landed_before_the_open_fences_the_open_in_flight() {
+        let rig = CrazeRig::start().await;
+        let (stale, back) = (rig.seq(), rig.seq());
+        rig.returned_as(back);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        *lock(&rig.lanes.commit_gap) = Some((Arc::clone(&reached), Arc::clone(&proceed)));
+        let opening = {
+            let lanes = Arc::clone(&rig.lanes);
+            tokio::spawn(async move { lanes.open(MACHINE, CRAZE, GHOST).await })
+        };
+        reached.notified().await;
+        rig.depart_as(Departure::HubGone, stale);
+        proceed.notify_one();
+        opening.await.expect("the open task").expect(
+            "a departure older than a return that landed before the open does not cancel it",
+        );
+        assert_eq!(rig.state(), Some("live"));
+    }
+
+    /// **The registry's news marks hold one generation per machine** (C8
+    /// review, [`CrazeMarks`]): every piece of news records its rows' marks,
+    /// lane or no lane; a newer generation's news drops the older one's; an
+    /// older generation's news delivered late records nothing; and the
+    /// generation's `HostRemoved` empties them for good — an older
+    /// generation's removal leaves a newer one's be.
+    /// **The marks table is capped** (C8 closing review): past
+    /// [`CRAZE_MARKS_CAP`] hostIds on one machine, the mark with the oldest
+    /// news is dropped first, and the newest are kept.
+    #[tokio::test]
+    async fn the_registrys_news_marks_are_capped_oldest_first() {
+        let (lanes, _log, _events) = lanes_on(REMOTE_PORT, BTreeMap::new());
+        for n in 0..(CRAZE_MARKS_CAP + 10) {
+            let ids = [format!("{n:012x}")];
+            lanes.craze_news(
+                MACHINE,
+                1,
+                CrazeNews::Returned {
+                    host_ids: &ids,
+                    seq: n as u64 + 1,
+                },
+            );
+        }
+        let inner = lock(&lanes.inner);
+        assert_eq!(inner.craze_marks[MACHINE].hosts.len(), CRAZE_MARKS_CAP);
+        assert_eq!(
+            inner.craze_mark(MACHINE, 1, &format!("{:012x}", 0)),
+            NewsMark(0),
+            "the oldest went"
+        );
+        let newest = CRAZE_MARKS_CAP + 9;
+        assert_eq!(
+            inner.craze_mark(MACHINE, 1, &format!("{newest:012x}")),
+            NewsMark(newest as u64 + 1),
+            "the newest stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_registrys_news_marks_hold_one_generation_per_machine() {
+        let (lanes, _log, _events) = lanes_on(REMOTE_PORT, BTreeMap::new());
+        let (a, b, c) = ("a".to_string(), "b".to_string(), "c".to_string());
+        let mark = |gen: u64, host: &str| lock(&lanes.inner).craze_mark(MACHINE, gen, host);
+        let hosts = || lock(&lanes.inner).craze_marks[MACHINE].hosts.len();
+        let returned = |gen: u64, seq: u64, ids: &[String]| {
+            lanes.craze_news(MACHINE, gen, CrazeNews::Returned { host_ids: ids, seq });
+        };
+
+        returned(1, 5, &[a.clone(), b.clone()]);
+        lanes.craze_news(
+            MACHINE,
+            1,
+            CrazeNews::Departed {
+                host_ids: std::slice::from_ref(&a),
+                cause: Departure::Removed,
+                seq: 3,
+            },
+        );
+        assert_eq!(mark(1, "a"), NewsMark(5), "older news never lowers a mark");
+        assert_eq!(mark(1, "b"), NewsMark(5));
+        assert_eq!(
+            mark(2, "a"),
+            NewsMark(0),
+            "another generation, another sequence"
+        );
+
+        // A newer generation's news drops the older one's marks.
+        returned(2, 1, std::slice::from_ref(&c));
+        assert_eq!(mark(1, "a"), NewsMark(0));
+        assert_eq!(mark(2, "c"), NewsMark(1));
+        assert_eq!(hosts(), 1);
+        // An older generation's news, delivered late, records nothing.
+        returned(1, 9, std::slice::from_ref(&a));
+        assert_eq!(mark(1, "a"), NewsMark(0));
+        assert_eq!(hosts(), 1);
+        // An older generation's removal leaves the newer one's marks.
+        lanes.craze_news(MACHINE, 1, CrazeNews::HostRemoved { seq: 10 });
+        assert_eq!(mark(2, "c"), NewsMark(1));
+        // Its own removal empties them — for good.
+        lanes.craze_news(MACHINE, 2, CrazeNews::HostRemoved { seq: 2 });
+        assert_eq!(hosts(), 0);
+        returned(2, 1, std::slice::from_ref(&c));
+        assert_eq!(
+            hosts(),
+            0,
+            "a removed generation's late news records nothing"
+        );
+        assert_eq!(
+            lock(&lanes.inner).craze_marks.len(),
+            1,
+            "one record per machine"
+        );
+    }
+
+    /// **W1 cell 7 — the session's final `Down` racing the expiry: whichever
+    /// lands first, exactly ONE terminal `Down`.** Here the session's own
+    /// `reset{session_closed}` lands inside the grace: the lane ends as a
+    /// normal end does, the grace task wakes on `finished` and leaves, and
+    /// the grace's deadline adds nothing. (Both orders, forced, are pinned on
+    /// a bare core: `exactly_one_terminal_down_whoever_lands_first`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sessions_final_down_inside_the_grace_ends_the_lane_once() {
+        let mut rig = CrazeRig::start().await;
+        let mut conn = rig.open_seeded().await;
+        rig.depart(Departure::Removed);
+        conn.reset("s-1", "session_closed").await;
+        let view = rig.finished("the session's close").await;
+        assert_eq!(view["stale"], "session_closed");
+        wait_for("the grace task to leave on `finished`", || {
+            lock(&rig.entry().grace)
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+                .then_some(())
+        })
+        .await;
+        tokio::time::sleep(TEST_GRACE * 2).await;
+        assert_eq!(rig.events.downs(), ["session_closed"], "one terminal Down");
+    }
+
+    /// **W1 cell 10 — `open` on a departing entry returns it** (item 9, PC5):
+    /// its row no longer resolves, and the lane is still the lane — no new
+    /// adapter, no new connection, still departing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_on_a_departing_entry_returns_it() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        rig.depart(Departure::Removed);
+        rig.listed(false);
+        let before = rig.entry();
+        let opened = rig
+            .lanes
+            .open(MACHINE, CRAZE, GHOST)
+            .await
+            .expect("a departing lane re-opens");
+        assert_eq!(opened["session"]["id"], GHOST);
+        assert!(Arc::ptr_eq(&rig.entry(), &before), "the same entry");
+        assert_eq!(rig.state(), Some("departing"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rig.conns.recv())
+                .await
+                .is_err(),
+            "no second connection"
+        );
+        // …and so is a finished one with no row: a readable ended lane.
+        rig.finished("the grace to end").await;
+        let again = rig
+            .lanes
+            .open(MACHINE, CRAZE, GHOST)
+            .await
+            .expect("a finished lane with no row re-opens readable");
+        assert_eq!(again["session"]["id"], GHOST);
+        assert_eq!(rig.state(), Some("finished"));
+    }
+
+    /// **W1 cell 11 — `open` on a finished entry whose row resolves opens a
+    /// fresh lane and replaces it — only when that open COMMITS** (item 9):
+    /// a failing open (the source no longer lists the session, though the
+    /// machine layer does) leaves the finished entry readable; a good one
+    /// replaces it with a live lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_on_a_finished_entry_replaces_it_only_when_the_open_commits() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        rig.depart(Departure::Removed);
+        rig.finished("the grace to end").await;
+        let finished = rig.entry();
+
+        // The machine layer lists the row; the source's roster does not.
+        rig.hub
+            .roster("sub-1", "0a1b2c3d4e5f", json!([]), json!([GHOST]))
+            .await;
+        wait_for("the source to let the row go", || {
+            rig.source.listed(GHOST).is_none().then_some(())
+        })
+        .await;
+        rig.listed(true);
+        let failed = rig
+            .lanes
+            .open(MACHINE, CRAZE, GHOST)
+            .await
+            .expect_err("the source lists no such session");
+        assert_eq!(failed.code(), "unknown_session", "{}", failed.message());
+        assert!(Arc::ptr_eq(&rig.entry(), &finished), "kept");
+        assert_eq!(rig.messages()["finished"], true, "and readable");
+
+        // Listed again: the fresh open commits, and replaces it.
+        rig.hub
+            .roster(
+                "sub-1",
+                "0a1b2c3d4e5f",
+                json!([shed_craze::testing::roster_row(
+                    GHOST,
+                    GSID,
+                    "/w",
+                    json!({"title": "w"})
+                )]),
+                json!([]),
+            )
+            .await;
+        wait_for("the source to list the row", || {
+            rig.source.listed(GHOST).map(|_| ())
+        })
+        .await;
+        rig.lanes
+            .open(MACHINE, CRAZE, GHOST)
+            .await
+            .expect("a fresh lane");
+        assert!(!Arc::ptr_eq(&rig.entry(), &finished), "replaced");
+        assert_eq!(rig.state(), Some("live"));
+        assert_eq!(rig.messages()["finished"], false);
+        let _fresh = rig.conns.recv().await.expect("the fresh lane dialled");
+    }
+
+    /// **W1 cell 14, the `open` half — an equal stamp never adopts an older
+    /// generation's lane** (item 12): the host was registered again (the
+    /// source's generation moved) and no removal reached this live entry —
+    /// `open` evicts it and opens a fresh lane through the current source,
+    /// filed under the new generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_never_adopts_an_older_generations_lane() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        let old = rig.entry();
+        rig.lanes
+            .open(MACHINE, CRAZE, GHOST)
+            .await
+            .expect("an idempotent re-open");
+        assert!(Arc::ptr_eq(&rig.entry(), &old), "same generation: adopted");
+        rig.machines.craze_gen.store(2, SeqCst);
+        rig.lanes
+            .open(MACHINE, CRAZE, GHOST)
+            .await
+            .expect("a fresh lane");
+        let fresh = rig.entry();
+        assert!(
+            !Arc::ptr_eq(&fresh, &old),
+            "another generation: not adopted"
+        );
+        assert_eq!(fresh.craze_gen, Some(2));
+        assert_eq!(rig.state(), Some("live"));
+    }
+
+    /// **W1 cell 12 — `lane.settings` on a finished entry answers from the
+    /// view** (item 7): the session's last-stated settings, with no adapter
+    /// (a retired lane has none).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lane_settings_on_a_finished_entry_answer_from_the_view() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        let stated = wait_for("the seed's settings", || {
+            let v = rig.messages();
+            (!v["settings"].is_null()).then_some(v["settings"].clone())
+        })
+        .await;
+        assert_eq!(stated["model"], "grok", "{stated}");
+        rig.host_removed(1);
+        assert!(
+            lock(&rig.entry().core.client).is_none(),
+            "no adapter to ask"
+        );
+        let answered = rig
+            .lanes
+            .settings(MACHINE, CRAZE, GHOST)
+            .await
+            .expect("answered from the view");
+        assert_eq!(answered["settings"], stated);
+    }
+
+    /// **W1 cell 15 — a verb after the final `Down` is refused `lane_ended`
+    /// at once** (item 8): the session closed, and a send that follows is
+    /// refused by THIS layer — not handed to the adapter to wait out its 10 s
+    /// reconnect wait and fail `unavailable` — with nothing sent. The race
+    /// itself, both admission orders forced on one final `Down`, is
+    /// `a_craze_verb_racing_the_final_down_both_orders` (and its opencode
+    /// twin).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_verb_after_the_final_down_is_refused_lane_ended_at_once() {
+        let mut rig = CrazeRig::start().await;
+        let mut conn = rig.open_seeded().await;
+        conn.reset("s-1", "session_closed").await;
+        rig.finished("the session's close").await;
+        let started = std::time::Instant::now();
+        let refused = rig
+            .lanes
+            .send(MACHINE, CRAZE, GHOST, "too late", SendMode::Queue)
+            .await
+            .expect_err("refused");
+        assert_eq!(refused.code(), "lane_ended");
+        assert!(started.elapsed() < Duration::from_secs(1), "at once");
+        for verb in [
+            rig.lanes.cancel(MACHINE, CRAZE, GHOST).await,
+            rig.lanes.stop(MACHINE, CRAZE, GHOST).await,
+            rig.lanes.set_title(MACHINE, CRAZE, GHOST, "renamed").await,
+            rig.lanes
+                .answer(MACHINE, CRAZE, GHOST, "perm-1", LaneAnswer::Reject)
+                .await,
+            rig.lanes
+                .set(
+                    MACHINE,
+                    CRAZE,
+                    GHOST,
+                    LaneSettingChange::Mode { id: "agent".into() },
+                )
+                .await,
+        ] {
+            assert_eq!(verb.expect_err("refused").code(), "lane_ended");
+        }
+        const VERBS: [&str; 6] = [
+            "session.prompt",
+            "session.cancel",
+            "session.stop",
+            "session.setTitle",
+            "session.set",
+            "asks.answer",
+        ];
+        while let Some(req) = conn.recv_within(Duration::from_millis(100)).await {
+            let method = req["method"].as_str().unwrap_or_default();
+            assert!(
+                !VERBS.contains(&method),
+                "a verb went out after the end: {req}"
+            );
+        }
+    }
+
+    /// **W1 cell 16 — a Dormant departure expires `hub_gone`** (PC14g): the
+    /// hub went, not just the row, and the banner says so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_dormant_departure_ends_hub_gone() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        rig.depart(Departure::HubGone);
+        let view = rig.finished("the grace to end").await;
+        assert_eq!(view["stale"], DOWN_HUB_GONE);
+        assert_eq!(rig.events.downs(), [DOWN_HUB_GONE]);
+    }
+
+    /// **W1 cell 9 — the shutdown during a grace JOINS the grace task, and
+    /// nothing is emitted after `closing`** (item 11): the lanes phase counts
+    /// the departure's grace (and joins it within its bound) and the finished
+    /// lane beside it, and no frame — not the grace's expiry — follows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_joins_a_running_grace_and_emits_nothing_after() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        rig.depart(Departure::Removed);
+        let emitted = rig.events.total();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lanes = Arc::clone(&rig.lanes);
+        std::thread::spawn(move || {
+            let _ = tx.send(lanes.shutdown());
+        });
+        let closed = rx.await.expect("the lanes thread");
+        assert_eq!(
+            (
+                closed.lanes,
+                closed.finished,
+                closed.graces,
+                closed.graces_unjoined
+            ),
+            (1, 0, 1, 0),
+            "{closed:?}"
+        );
+        tokio::time::sleep(TEST_GRACE * 2).await;
+        assert_eq!(rig.events.total(), emitted, "nothing after closing");
+        assert!(rig.events.downs().is_empty());
+    }
+
+    /// The lanes phase counts a FINISHED lane too (item 11): it is still
+    /// registered, readable, until closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_counts_a_finished_lane() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        rig.host_removed(1);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lanes = Arc::clone(&rig.lanes);
+        std::thread::spawn(move || {
+            let _ = tx.send(lanes.shutdown());
+        });
+        let closed = rx.await.expect("the lanes thread");
+        assert_eq!((closed.lanes, closed.finished), (1, 1), "{closed:?}");
+    }
+
+    /// `close` removes a DEPARTING lane outright and cancels its grace: the
+    /// lane is gone (no transcript, `no_lane` once its row is gone too) and
+    /// the grace never emits (item 10).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_removes_a_departing_lane_and_cancels_its_grace() {
+        let mut rig = CrazeRig::start().await;
+        let _conn = rig.open_seeded().await;
+        rig.depart(Departure::Removed);
+        rig.listed(false);
+        let grace = lock(&rig.entry().grace)
+            .as_ref()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .expect("a grace task");
+        rig.lanes.close(MACHINE, CRAZE, GHOST);
+        assert!(!rig.lanes.is_open(MACHINE, CRAZE, GHOST));
+        wait_for("the grace task to end", || {
+            grace.is_finished().then_some(())
+        })
+        .await;
+        tokio::time::sleep(TEST_GRACE * 2).await;
+        assert!(rig.events.downs().is_empty(), "no Down for a closed lane");
+        assert_eq!(
+            rig.lanes
+                .messages(MACHINE, CRAZE, GHOST)
+                .expect_err("gone")
+                .code(),
+            "no_lane"
+        );
+    }
+
+    // ---- the C1 review's cells: a natural end's transport, the shutdown's
+    // ---- fence, and the verb race with both admission orders forced
+
+    /// **A natural final `Down` releases the transport** (plan 032 PC4; C1
+    /// review): the session's own `reset{session_closed}` — no grace run
+    /// out, no host removed — finishes the lane, and the pump lets the
+    /// adapter go on its way out, so the finished entry kept for its
+    /// transcript holds no craze dial. Live, and inside a departure too:
+    /// there the grace task leaves on `finished` without retiring anything,
+    /// and the pump's release is the only one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_natural_final_down_releases_the_craze_lanes_client() {
+        for departing in [false, true] {
+            let mut rig = CrazeRig::start().await;
+            let mut conn = rig.open_seeded().await;
+            if departing {
+                rig.depart(Departure::Removed);
+            }
+            conn.reset("s-1", "session_closed").await;
+            let view = rig.finished("the session's close").await;
+            assert_eq!(view["stale"], "session_closed", "departing={departing}");
+            let entry = rig.entry();
+            wait_for("the pump to release the adapter", || {
+                lock(&entry.core.client).is_none().then_some(())
+            })
+            .await;
+            assert!(rig.lanes.is_open(MACHINE, CRAZE, GHOST), "kept, readable");
+            assert_eq!(rig.messages()["finished"], true);
+            assert_eq!(rig.events.downs(), ["session_closed"]);
+        }
+    }
+
+    /// **An opencode lane's natural end releases its client AND its tunnel
+    /// share** (plan 032 PC4; C1 review): a reseed answered 404 is
+    /// `Down{unknown_session}`, final — the lane finishes, the pump lets the
+    /// adapter and its share of the tunnel go, and with its last user gone
+    /// the tunnel's child is reaped, off the async runtime. The finished
+    /// entry stays readable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_opencode_lanes_natural_end_releases_its_client_and_tunnel() {
+        let fake = one_session("ses_a").await;
+        let (lanes, log, events) = lanes_for(&fake, &["ses_a"]);
+        lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the lane opens");
+        wait_for("the first generation to seed", || {
+            (generation(&lanes, "ses_a") >= 1).then_some(())
+        })
+        .await;
+        assert_eq!(forward_users(&lanes), Some(1));
+
+        // The session is gone: the reconnect's seed answers 404.
+        fake.fail_get("/session/ses_a", 404);
+        fake.close_streams();
+        wait_for("the lane to finish", || {
+            (lanes.lane_state(MACHINE, OC, "ses_a") == Some("finished")).then_some(())
+        })
+        .await;
+        let entry = lanes.entry(&key(MACHINE, OC, "ses_a")).expect("kept");
+        wait_for("the pump to release the transport", || {
+            (lock(&entry.core.client).is_none() && lock(&entry.core.forward).is_none())
+                .then_some(())
+        })
+        .await;
+        assert!(
+            forward_users(&lanes).is_none(),
+            "the tunnel's last share went with the lane"
+        );
+        wait_for("the tunnel's child to be reaped", || {
+            (log.dropped.load(SeqCst) == 1).then_some(())
+        })
+        .await;
+        assert_eq!(log.dropped_on_runtime.load(SeqCst), 0);
+        assert_eq!(events.downs(), [DOWN_UNKNOWN_SESSION]);
+        let view = lanes
+            .messages(MACHINE, OC, "ses_a")
+            .expect("a finished lane stays readable");
+        assert_eq!(view["finished"], true);
+        assert_eq!(view["stale"], DOWN_UNKNOWN_SESSION);
+    }
+
+    /// **The shutdown's start fences EVERY lane before its flag, so nothing is
+    /// emitted after it** (plan 032 §3.1.1 items 4 and 11; C1 review), the
+    /// window forced with two lanes. One lane's `state` is HELD — what a
+    /// frame its pump has in flight holds (here a plain thread's, so no
+    /// runtime worker is parked) — so the shutdown's start blocks on it, and
+    /// the other lane's grace runs out while it waits. Whichever lane the
+    /// fence reaches first, that expiry lands before `begin_closing` returns
+    /// or never, and from its return on no frame of either lane is emitted.
+    /// (Flag first, the walk let a lane it had not reached yet emit after the
+    /// flag — here, the expiry's `Down`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdowns_start_fences_every_lane_before_its_flag() {
+        let fake = one_session("ses_a").await;
+        let mut rig = CrazeRig::start_with(Some(&fake), shed_craze::LaneTimings::default()).await;
+        let _conn = rig.open_seeded().await;
+        rig.lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the opencode lane opens");
+        wait_for("the opencode lane to seed", || {
+            (generation(&rig.lanes, "ses_a") >= 1).then_some(())
+        })
+        .await;
+
+        // The opencode lane's `state`, held as a frame in flight holds it.
+        let held = rig
+            .lanes
+            .entry(&key(MACHINE, OC, "ses_a"))
+            .expect("the opencode lane");
+        let (holding, release) = {
+            let (took, holding) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let core = Arc::clone(&held.core);
+            std::thread::spawn(move || {
+                let _frame = lock(&core.state);
+                let _ = took.send(());
+                let _ = released.recv();
+            });
+            (holding, release)
+        };
+        holding.recv().expect("the state held");
+        // The craze lane departs: its grace runs out inside the window.
+        rig.depart(Departure::Removed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let lanes = Arc::clone(&rig.lanes);
+            let events = Arc::clone(&rig.events);
+            std::thread::spawn(move || {
+                lanes.begin_closing();
+                // Read the moment it returns: nothing may follow this.
+                let _ = tx.send(events.total());
+            });
+        }
+        tokio::time::sleep(TEST_GRACE + Duration::from_millis(200)).await;
+        release.send(()).expect("the held state");
+        let at_close = rx.await.expect("the closing thread");
+        tokio::time::sleep(TEST_GRACE * 2).await;
+        assert_eq!(
+            rig.events.total(),
+            at_close,
+            "a frame landed after the shutdown began"
+        );
+        assert!(
+            matches!(rig.state(), Some("departing" | "finished")),
+            "{:?}",
+            rig.state()
+        );
+        let refused = rig
+            .lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect_err("closing");
+        assert_eq!(refused.code(), shed_app::spawn_gate::SHUTTING_DOWN);
+
+        // The opencode lane's next frame — a reconnect's — is not emitted
+        // either, and the drain joins both lanes' tasks.
+        fake.close_streams();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lanes = Arc::clone(&rig.lanes);
+        std::thread::spawn(move || {
+            let _ = tx.send(lanes.shutdown());
+        });
+        let closed = rx.await.expect("the lanes thread");
+        assert_eq!(
+            (closed.lanes, closed.pumps_unjoined, closed.graces_unjoined),
+            (2, 0, 0),
+            "{closed:?}"
+        );
+        assert_eq!(rig.events.total(), at_close, "nor during the drain");
+    }
+
+    /// Arm a [`Lanes::verb_gaps`] gap at `side`: answers its `(reached,
+    /// proceed)` pair.
+    fn verb_gap(
+        lanes: &Lanes,
+        side: Admission,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        lock(&lanes.verb_gaps).push((side, (Arc::clone(&reached), Arc::clone(&proceed))));
+        (reached, proceed)
+    }
+
+    /// Two sends on `session`'s lane parked around their admission (C1
+    /// review): the first ADMITTED — its adapter clone in hand — the second
+    /// past its registry read, NOT yet admitted. Answers both tasks and the
+    /// gate that releases each, in that order.
+    async fn sends_around_admission(
+        lanes: &Arc<Lanes>,
+        kind: &'static str,
+        session: &'static str,
+    ) -> (
+        tokio::task::JoinHandle<Result<Value, LaneFailure>>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<Result<Value, LaneFailure>>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let send = |text: &'static str| {
+            let lanes = Arc::clone(lanes);
+            tokio::spawn(async move {
+                lanes
+                    .send(MACHINE, kind, session, text, SendMode::Queue)
+                    .await
+            })
+        };
+        // In turn, so the first passes the `Before` side with no gap armed.
+        let (at, admitted_go) = verb_gap(lanes, Admission::After);
+        let admitted = send("admitted before the end");
+        at.notified().await;
+        let (at, late_go) = verb_gap(lanes, Admission::Before);
+        let late = send("admitted after the end");
+        at.notified().await;
+        (admitted, admitted_go, late, late_go)
+    }
+
+    /// **A verb racing the final `Down`, both admission orders forced** (plan
+    /// 032 §3.1.1 item 8; C1 review), on a craze lane. One send is ADMITTED —
+    /// its adapter clone in hand — and parked; another has read the entry and
+    /// is parked BEFORE its admission. The session's `reset{session_closed}`
+    /// then finishes the lane, and the pump releases the entry's client. The
+    /// admitted send runs its course on its own clone — the adapter, its
+    /// connection gone with the session, answers it `unavailable`, not sent
+    /// (the lane's connect wait shortened here) — and the other is refused
+    /// `lane_ended` at once: not `no_lane`, though the entry's client is
+    /// gone. Neither prompt reaches the hub.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_craze_verb_racing_the_final_down_both_orders() {
+        let lane = shed_craze::LaneTimings {
+            wait_connected: Duration::from_millis(300),
+            ..shed_craze::LaneTimings::default()
+        };
+        let mut rig = CrazeRig::start_with(None, lane).await;
+        let mut conn = rig.open_seeded().await;
+        let (admitted, admitted_go, late, late_go) =
+            sends_around_admission(&rig.lanes, CRAZE, GHOST).await;
+
+        conn.reset("s-1", "session_closed").await;
+        rig.finished("the session's close").await;
+        let entry = rig.entry();
+        wait_for("the pump to release the adapter", || {
+            lock(&entry.core.client).is_none().then_some(())
+        })
+        .await;
+
+        late_go.notify_one();
+        let started = std::time::Instant::now();
+        let refused = late
+            .await
+            .expect("the late send's task")
+            .expect_err("admitted after the end");
+        assert_eq!(refused.code(), "lane_ended", "{}", refused.message());
+        assert!(started.elapsed() < Duration::from_millis(250), "at once");
+        admitted_go.notify_one();
+        let answered = admitted
+            .await
+            .expect("the admitted send's task")
+            .expect_err("no connection to send it on");
+        assert_eq!(
+            answered.code(),
+            "unavailable",
+            "the ADAPTER's answer, on the verb's own clone: {}",
+            answered.message()
+        );
+        assert!(
+            answered.message().contains("was not sent"),
+            "{}",
+            answered.message()
+        );
+        while let Some(req) = conn.recv_within(Duration::from_millis(100)).await {
+            assert_ne!(req["method"], "session.prompt", "a prompt went out: {req}");
+        }
+    }
+
+    /// **The same race on an opencode lane** (C1 review: opencode's natural
+    /// end refuses verbs `lane_ended` now too). The admitted send runs on its
+    /// clone and SUCCEEDS — opencode's prompt is a plain POST that needs no
+    /// subscription, so the agent takes it although the lane has finished and
+    /// released its client — and the other is refused `lane_ended`, with
+    /// nothing sent: exactly one prompt reaches the agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_opencode_verb_racing_the_final_down_both_orders() {
+        let fake = one_session("ses_a").await;
+        let (lanes, _log, _events) = lanes_for(&fake, &["ses_a"]);
+        lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the lane opens");
+        wait_for("the first generation to seed", || {
+            (generation(&lanes, "ses_a") >= 1).then_some(())
+        })
+        .await;
+        let (admitted, admitted_go, late, late_go) =
+            sends_around_admission(&lanes, OC, "ses_a").await;
+
+        // The session's natural end: the reconnect's seed answers 404.
+        fake.fail_get("/session/ses_a", 404);
+        fake.close_streams();
+        wait_for("the lane to finish", || {
+            (lanes.lane_state(MACHINE, OC, "ses_a") == Some("finished")).then_some(())
+        })
+        .await;
+        let entry = lanes.entry(&key(MACHINE, OC, "ses_a")).expect("kept");
+        wait_for("the pump to release the adapter", || {
+            lock(&entry.core.client).is_none().then_some(())
+        })
+        .await;
+
+        late_go.notify_one();
+        let refused = late
+            .await
+            .expect("the late send's task")
+            .expect_err("admitted after the end");
+        assert_eq!(refused.code(), "lane_ended", "{}", refused.message());
+        admitted_go.notify_one();
+        admitted
+            .await
+            .expect("the admitted send's task")
+            .expect("the admitted send runs on its own clone");
+        let prompts: Vec<String> = fake
+            .post_paths()
+            .into_iter()
+            .filter(|p| p.ends_with("/prompt_async"))
+            .collect();
+        assert_eq!(prompts.len(), 1, "only the admitted send: {prompts:?}");
+        assert!(
+            fake.post_body("/prompt_async")
+                .is_some_and(|b| b.contains("admitted before the end")),
+            "{:?}",
+            fake.post_body("/prompt_async")
+        );
+    }
+
+    /// A bare [`LaneCore`] whose frames go to a [`Recorder`], DEPARTING under
+    /// `token` 7 for `cause`.
+    fn departing_core(cause: Departure) -> (Arc<LaneCore>, EventSink, Arc<Recorder>) {
+        let core = LaneCore::new(None, None);
+        lock(&core.state).state = EntryState::Departing { token: 7, cause };
+        let recorder = Arc::new(Recorder::default());
+        let sink: EventSink = {
+            let recorder = Arc::clone(&recorder);
+            Arc::new(move |_: &str, _: &str, _: &str, event: &LaneEvent| recorder.record(event))
+        };
+        (core, sink, recorder)
+    }
+
+    fn core_key() -> Key {
+        key(MACHINE, CRAZE, GHOST)
+    }
+
+    /// **W1 cell 7, forced — exactly one terminal `Down` whoever lands
+    /// first** (item 4): the session's final `Down` then the grace's expiry,
+    /// the expiry then the `Down`, the host's removal after either — and the
+    /// two racing on threads, many times over. The check and the transition
+    /// share one `state` lock, so the loser emits nothing.
+    #[test]
+    fn exactly_one_terminal_down_whoever_lands_first() {
+        let k = core_key();
+        let (core, sink, events) = departing_core(Departure::Removed);
+        assert!(core.finish(&sink, &k, "session_closed"));
+        assert!(!core.expire(&sink, &k, 7), "the expiry lost");
+        assert!(
+            !core.finish(&sink, &k, DOWN_HOST_REMOVED),
+            "so did the removal"
+        );
+        assert_eq!(events.downs(), ["session_closed"]);
+
+        let (core, sink, events) = departing_core(Departure::Removed);
+        assert!(core.expire(&sink, &k, 7));
+        assert!(!core.finish(&sink, &k, "session_closed"), "the Down lost");
+        assert_eq!(events.downs(), [DOWN_SESSION_GONE]);
+
+        // A stale token (a departure a return ended) expires nothing.
+        let (core, sink, events) = departing_core(Departure::Removed);
+        assert!(!core.expire(&sink, &k, 6));
+        assert!(events.downs().is_empty());
+
+        for _ in 0..200 {
+            let (core, sink, events) = departing_core(Departure::HubGone);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let racer = {
+                let (core, sink, barrier, k) = (
+                    Arc::clone(&core),
+                    Arc::clone(&sink),
+                    Arc::clone(&barrier),
+                    k.clone(),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    core.expire(&sink, &k, 7)
+                })
+            };
+            barrier.wait();
+            let finished = core.finish(&sink, &k, "session_closed");
+            let expired = racer.join().expect("the racer");
+            assert!(finished ^ expired, "exactly one won");
+            assert_eq!(events.downs().len(), 1, "{:?}", events.downs());
+        }
+    }
+
+    /// **W1 cell 8 — a late `Ready` after the lane finishes is not applied**
+    /// (item 1, PC1): a whole reseed arriving after the end would clear the
+    /// view's `ended` and `stale`; under the finished state none of it is
+    /// applied or emitted, and the banner stays.
+    #[test]
+    fn a_late_ready_after_the_finish_is_not_applied() {
+        let k = core_key();
+        let (core, sink, events) = departing_core(Departure::Removed);
+        assert!(core.apply(
+            &sink,
+            &k,
+            &LaneEvent::Reset {
+                reason: "connect".into(),
+                generation: 1
+            }
+        ));
+        assert!(core.apply(&sink, &k, &LaneEvent::Ready { generation: 1 }));
+        assert!(core.expire(&sink, &k, 7));
+        for late in [
+            LaneEvent::Reset {
+                reason: "connect".into(),
+                generation: 2,
+            },
+            LaneEvent::Ready { generation: 2 },
+            LaneEvent::Ready { generation: 1 },
+        ] {
+            assert!(!core.apply(&sink, &k, &late), "{late:?} applied");
+        }
+        let snap = lock(&core.view).snapshot(None);
+        assert!(snap.ended, "the late Ready un-ended the lane");
+        assert_eq!(snap.stale.as_deref(), Some(DOWN_SESSION_GONE));
+        assert_eq!(events.count("ready"), 1, "only the live seed's Ready");
+    }
+
+    /// **The shutdown's mark stops everything** (item 4): an entry marked
+    /// closing applies, emits, finishes and expires nothing.
+    #[test]
+    fn a_closing_entry_applies_and_expires_nothing() {
+        let k = core_key();
+        let (core, sink, events) = departing_core(Departure::Removed);
+        lock(&core.state).closing = true;
+        assert!(!core.expire(&sink, &k, 7));
+        assert!(!core.finish(&sink, &k, "session_closed"));
+        assert!(!core.apply(&sink, &k, &LaneEvent::Ready { generation: 1 }));
+        assert_eq!(events.total(), 0);
+    }
+
+    /// The three reasons this layer ends a lane with are final: the pump
+    /// never resubscribes after one (plan 032 §3.1.1 item 12).
+    #[test]
+    fn this_layers_own_reasons_are_final() {
+        for reason in [DOWN_SESSION_GONE, DOWN_HUB_GONE, DOWN_HOST_REMOVED] {
+            assert!(down_is_final(reason), "{reason}");
+        }
+        assert_eq!(Departure::Removed.reason(), DOWN_SESSION_GONE);
+        assert_eq!(Departure::HubGone.reason(), DOWN_HUB_GONE);
     }
 
     // -----------------------------------------------------------------------
@@ -4121,29 +6711,7 @@ mod tests {
         rows: BTreeMap<String, AgentLaneStamp>,
         pids: &std::path::Path,
     ) -> (Arc<Lanes>, Arc<ForwardLog>, Arc<Recorder>) {
-        let log = Arc::new(ForwardLog::default());
-        let recorder = Arc::new(Recorder::default());
-        let machines = Arc::new(FakeMachines {
-            lanes: Mutex::new(rows),
-            port,
-            log: Arc::clone(&log),
-            reach: ReachKind::Ssh(fake_entry()),
-            craze: Mutex::new(None),
-            spawning: Mutex::new(Some(pids.to_path_buf())),
-        });
-        let sink: EventSink = {
-            let recorder = Arc::clone(&recorder);
-            Arc::new(
-                move |_machine: &str, _kind: &str, _session: &str, event: &LaneEvent| {
-                    recorder.record(event)
-                },
-            )
-        };
-        let lanes = Arc::new(Lanes::with_sink(
-            tokio::runtime::Handle::current(),
-            sink,
-            machines,
-        ));
+        let (lanes, log, recorder, _machines) = lanes_with_machines(port, rows, None, Some(pids));
         (lanes, log, recorder)
     }
 }

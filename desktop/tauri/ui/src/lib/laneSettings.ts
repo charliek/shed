@@ -12,11 +12,28 @@
  * model order (the current model, then the remembered ones by rank, then the
  * catalog's) and the options' (the current model's own, `thought_level` first,
  * then `model_config`, each in the provider's order) ONCE; this module never
- * re-sorts what it is given. It only decides how each row is drawn. */
+ * re-sorts what it is given. It only decides how each row is drawn.
+ *
+ * **Nor does it decide which option is the effort** (plan 032 PC14h): that is
+ * craze's `EffortOption` rule, run once by the shared core and handed over
+ * with the view (`lane.messages`' `effort_option`, the option's id) — the
+ * same answer the `/effort` row is judged by. */
+
+/** A model's effort facts (`shed_core::lane::LaneModelEffort`, plan 032
+ *  §3.3): what craze 0.2.0 says of a model before it is chosen — a native
+ *  session's alone. */
+export type ModelEffort = { efforts: string[]; default_effort?: string | null; switch_effort?: string | null };
 
 /** One selectable value (`shed_core::lane::LaneChoice`): a model, a mode, an
- *  option's value. `id` is what a change sends back — opaque, verbatim. */
-export type SettingsChoice = { id: string; name: string; rank?: number | null; description?: string | null };
+ *  option's value. `id` is what a change sends back — opaque, verbatim.
+ *  `effort` rides a model alone, and only where the agent states it. */
+export type SettingsChoice = {
+  id: string;
+  name: string;
+  rank?: number | null;
+  description?: string | null;
+  effort?: ModelEffort | null;
+};
 
 /** One of the current model's options (`shed_core::lane::LaneSetting`). */
 export type SettingsOption = { id: string; name: string; category: string; current: string; values: SettingsChoice[] };
@@ -131,35 +148,32 @@ export function changeFor(row: SettingsRow, value: string, displayedModel?: stri
   }
 }
 
+// ---- the model list's effort line (plan 032 §3.3) -------------------------
+
+/** **The dim line under a model in the list**: `effort → <level>`, the level
+ *  a switch to `model` lands on — its effort facts' `switch_effort` (the
+ *  session's last choice on it, else craze's model memory, else its
+ *  default), else its `default_effort`. A native switch moves the effort with
+ *  the model, and this says where to before the press.
+ *
+ *  `null` for the CURRENT model (its effort row shows its effort), for a
+ *  model whose facts name neither level, and for one with no facts at all —
+ *  every model of an ACP session, of an older host, and one without an
+ *  effort control. The level is its id, as the facts carry it: a model not
+ *  current has no option to name it. */
+export function modelEffortLine(model: SettingsChoice, current: string | null | undefined): string | null {
+  if (model.id === current) return null;
+  const level = model.effort?.switch_effort || model.effort?.default_effort;
+  return level ? `effort → ${level}` : null;
+}
+
+/** The dim secondary line a sheet row draws under `value`: the model list's
+ *  effort line ([`modelEffortLine`]), and nothing on any other row. */
+export function secondaryLine(row: SettingsRow, value: SettingsChoice): string | null {
+  return row.kind === "model" ? modelEffortLine(value, row.current) : null;
+}
+
 // ---- the chip -------------------------------------------------------------
-
-/** Words that make an option an effort select (craze's own reading,
- *  `agent.isEffortSelect`): the id or the name says effort or reasoning. */
-function isEffort(o: SettingsOption): boolean {
-  const id = o.id.toLowerCase();
-  const name = o.name.toLowerCase();
-  return o.values.length > 0
-    && (id.includes("effort") || id.includes("reasoning") || name.includes("effort") || name.includes("reasoning"));
-}
-
-/** craze's rank among effort selects (`agent.effortRank`): the exact id
- *  `effort` first — cursor files `thinking` under `thought_level` beside it, so
- *  a category is no evidence — then `model_option`, then `thought_level`. */
-function effortRank(o: SettingsOption): number {
-  if (o.id.toLowerCase() === "effort") return 0;
-  if (o.category === "model_option") return 1;
-  if (o.category === "thought_level") return 2;
-  return 3;
-}
-
-/** The session's effort select, or `undefined` when it offers none. */
-export function effortOption(options: SettingsOption[]): SettingsOption | undefined {
-  let best: SettingsOption | undefined;
-  for (const o of options) {
-    if (isEffort(o) && (!best || effortRank(o) < effortRank(best))) best = o;
-  }
-  return best;
-}
 
 /** Whether the session's fast toggle exists AND is on (craze's `FastOn`): a
  *  `model_config` option named fast, whose current value is its ON one — the
@@ -184,12 +198,17 @@ export function choiceName(values: SettingsChoice[], id: string | null | undefin
  *  value> · fast`, from the CURRENT values, each part only when the session
  *  has it — and "fast" only when the toggle is ON (off is the quiet default
  *  and says nothing, craze's own status-row rule). A session whose current
- *  values say none of the three reads "Settings". */
-export function settingsChip(s: SessionSettings): string {
+ *  values say none of the three reads "Settings".
+ *
+ *  The effort is the option `effortOption` names — the view's
+ *  `effort_option`, the shared core's reading (plan 032 PC14h) — and no
+ *  other: with none named, the chip names no effort, whatever the options
+ *  are called. */
+export function settingsChip(s: SessionSettings, effortOption?: string | null): string {
   const parts: string[] = [];
   const model = choiceName(s.models, s.model);
   if (model) parts.push(model);
-  const effort = effortOption(s.options);
+  const effort = effortOption ? s.options.find((o) => o.id === effortOption) : undefined;
   const effortName = effort ? choiceName(effort.values, effort.current) : null;
   if (effortName) parts.push(effortName);
   if (fastOn(s.options)) parts.push("fast");

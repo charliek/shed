@@ -22,7 +22,8 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `lane.rs` (plan 015; split in plan 025 C4, shed#391) is the **agent-lane contract** —
   the DTOs plus TWO async traits that normalize "a coding agent with sessions, a
   transcript and approvals": a machine-level `AgentSource` (`subscribe` → the live session
-  list as `SourceEvent`s, `create_options`, `create`, `open(id)`) and the session-scoped
+  list as `SourceEvent`s, `create_options`, `create`, `open(id)`, and — plan 032, both with
+  "this source cannot" defaults — `saved` and `reopen(id)`) and the session-scoped
   `AgentLane` it opens (no verb takes an id; `settings`/`set`/`stop`/`set_title` have no
   default bodies). One adapter per agent implements both (opencode over its local HTTP server;
   craze over its per-machine hub, `shed-craze` — its source since plan 025 C7, its lane
@@ -72,15 +73,18 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   plus a tolerant `Deserialize` delegating to their existing `from_map` reader.
   `craze.rs` (plan 025 C5) is the **craze remote command**, pure like `machine.rs`: the
   `sh -c '<ladder>'` argv every client runs to reach `craze` on a host —
-  `bridge_hub_argv`/`bridge_hub_command` (every hub connection), `providers_hub_argv` (the
+  `bridge_hub_argv`/`bridge_hub_command` (a hub connection that starts a hub when none runs),
+  `bridge_hub_no_start_argv`/`bridge_hub_no_start_command` (plan 032 §3.5: craze 0.2.0's
+  `bridge --hub --no-start`, which attaches only to a running hub — none is exit 3 — the
+  desktop's background remote dial), `providers_hub_argv` (the
   find-only probe, which never starts a hub) and `attach_argv(host_id)` (Open in terminal;
   the id must be twelve lowercase hex digits). The script is craze's published
   binary-finding ladder verbatim plus one change, an enhanced PATH applied only at the
   `exec`, composed over two tables (`Ladder { rungs, exec_path }`) so tests can re-root
   them; the `*_argv_jailed()` variants keep rungs 1–2 and no PATH change, for test mode
-  only. `tests/machine-transport`'s `craze-bridge-hub`/`craze-providers-hub` scenarios
-  EQUAL the composers' output (the Rust leg asserts it), and `tests/craze_ladder.rs` runs
-  the ladder for real under every local `sh`.
+  only. `tests/machine-transport`'s `craze-bridge-hub`/`craze-bridge-hub-no-start`/
+  `craze-providers-hub` scenarios EQUAL the composers' output (the Rust leg asserts it), and
+  `tests/craze_ladder.rs` runs the ladder for real under every local `sh`.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
   embedded broker bridge (`broker_bridge.rs`, behind the non-default
   `broker = ["dep:shed-broker"]` feature — leg 3a.2), which since plan 022 is its ONLY
@@ -106,13 +110,20 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   a property of one implementation, not two that have to agree. Since plan 029 it also
   stages the session's slash catalog with the seed (every `Reset` clears it, so a seed
   with no `Slash` is no catalog; capabilities that drop `slash` drop it) and hands out
-  the RESOLVED menu as `LaneViewSnapshot.slash_menu`, recomputed only when the catalog
-  or the capabilities change. `slash_menu.rs` (plan 029 §3.4, ungated, pure) is the `/`
-  menu's one rule set — `resolve` (which rows show, each with its `SlashAction`, and the
-  hidden builtin names a typed command is refused for), `filter` (the open rule, craze's
+  the RESOLVED menu as `LaneViewSnapshot.slash_menu`, recomputed only when the catalog,
+  the capabilities or the settings change (the settings decide craze 0.2.0's `/effort`,
+  plan 032) — plus `effort_option`, the shown settings' effort option by craze's
+  `EffortOption` rule (`shed_core::lane::LaneSettings::effort_option`), so neither
+  client's chip ports it. `slash_menu.rs` (plan 029 §3.4, ungated, pure) is the `/`
+  menu's one rule set — `resolve(catalog, caps, settings)` (which rows show, each with its
+  `SlashAction`, and the hidden builtin names a typed command is refused for; `/effort`
+  shows only with a current model that has an effort option, and its `EffortPicker`
+  carries the levels and the model's offered default level), `filter` (the open rule, craze's
   four match buckets, UTF-16 carets, `dimmed` while working, and `start` — the first
   row not dimmed, where a client's highlight resets to, plan 030), `dispatch` (the
-  single-line grammar and its guard), `accept` (Enter/Tab/pick) and `is_working` — which
+  single-line grammar and its guard — and `/effort <level>`'s own arm, craze's
+  `MatchEffortValue` and its exact refusal text, `default` reserved; plan 032 PC8),
+  `accept` (Enter/Tab/pick) and `is_working` — which
   the desktop calls through Tauri commands and the phone through FRB, so neither client
   re-derives a rule.
   `craze_rows.rs` (plan 025 §3.6.3, ungated for the same reason) is **the craze row
@@ -124,7 +135,8 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   The desktop applies it in `roost_hosts.rs`; the phone (CM3) links the same function.
   `SshExec::spawn_duplex(command)` (C9) is the long-lived sibling of `SshExec::run` — the
   same pinned config and private ControlMaster, all three bands piped, killed on drop —
-  that the desktop's remote craze dial runs `craze bridge --hub` through.
+  that the desktop's remote craze dial runs `craze bridge --hub` (`--no-start`, plan 032)
+  through.
   `spawn_gate.rs` (plan 026 §3.3, ungated) is the desktop's orderly-shutdown barrier: a
   `SpawnGate` whose sections every spawn site takes across check → spawn → registration
   (`SshExec`, `SshForward`'s slot and `SshBridge`'s establishment, each through an optional
@@ -208,13 +220,27 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   -lc` login profile — kept for the error; after it, any non-JSON line, a blank one
   included, is a fault), and the hub `hello` (protocol 1, **codecs event 1 and snapshot
   1**, `rosterSubscribe` + `connect`). `dial.rs` classifies a dial that never reached a hub, in
-  plan 025 §3.3.2's precedence (exit 127 → `NotInstalled`; `unknown flag: --hub` on stderr
-  — v0.0.1 — or a hub `hello` short of the rule → `TooOld`; anything else before `hello` →
-  `Unreachable` with the stderr tail; a refused `hello` → `Failed`, `protocol_version` →
-  `TooOld`) and classifies the find-only probe (`providers --hub --json`, which never
-  starts a hub) by its stderr TEXT, never its exit code. `errors.rs` is craze's published
+  plan 025 §3.3.2's precedence as plan 032 §3.5 (PC12) extends it — pinned row by row by a
+  table cell (exit 127 → `NotInstalled`; `unknown flag: --hub` on stderr — v0.0.1 — or a hub
+  `hello` short of the rule → `TooOld`; exit 1 with craze 0.1.x's `craze bridge: unknown or
+  malformed flag` → `NoStartUnsupported`, which only a `--no-start` dial can draw; exit 3
+  with `no hub is running` or an empty stderr → `NoHub`, `SourceOffline::NoHub`, a lane's
+  `Unavailable("no craze hub is running")`; anything else before `hello` → `Unreachable`
+  with the stderr tail; a refused `hello` → `Failed`, `protocol_version` → `TooOld`) and
+  classifies the find-only probe (`providers --hub --json`, which never starts a hub) by
+  its stderr TEXT, never its exit code. **The `NoHub` row is the documented exception** to
+  that rule (PC14e): it reads exit code 3, because craze documents exit 3 as `--no-start`'s
+  contract (`cli.md`, "craze bridge") and every other bridge failure exits 1 — and it still
+  requires craze's words or none, so an unrelated exit 3 stays `Unreachable`. **The
+  fallback:** `CrazeDial::fall_back(&err)` (default `false`; a wrapping dial MUST forward
+  it) is asked on a `NoStartUnsupported` once `connect_hub` has closed the failed
+  connection, and on `true` `connect_hub` dials ONCE more; one it does not take reads as
+  `Unreachable` (the desktop's `SshCrazeDial` takes it once per source, swapping to its
+  probe-then-`bridge --hub` legacy). `errors.rs` is craze's published
   code → `LaneError` table **verbatim, keyed on `data.code` only**, with P14's one
-  deviation (a create refused `not_accepting/start_failed` → `Failed(data.cause)`).
+  deviation (a create refused `not_accepting/start_failed` → `Failed(data.cause)`) — and a
+  reopen's own `LaneReopenError` map, whose reason-keyed `not_accepting` row is a documented
+  exception (below).
   `CrazeSource::create` retries ONCE under the same `requestId` on an unknown outcome (a
   dropped connection, the 120 s deadline) and never on a definite answer;
   `is_outcome_unknown` is the one test a caller keeps its id on. A create keeps the row it
@@ -237,7 +263,30 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   authority a client lists created rows from (the desktop keeps no copy). So `open(hostId)` on a just-created session binds a
   lane that knows its row at once; `dialling(dial)` is the same source — its rows — on
   another dial (the desktop runs a user's explicit `create_options`/`create` through an
-  ungated one). A row's id is its **hostId** (P11). **`CrazeLane`** (plan 025 C8, `open` binds one with no I/O) is one
+  ungated one). A row's id is its **hostId** (P11).
+  **Saved sessions and reopen** (plan 032 §3.4, craze 0.2.0's hub capability `reopen`,
+  which `SourceCapabilities.reopen` and — read from the SAME `hello` — `LaneCreateOptions.reopen`
+  carry): `saved()` is `create_options`-shaped (`sessions.saved{limit: 50}`, never `subAgents`)
+  and `reopen(id)` is `session.reopen{id}` on a connection of its own, each gated on its
+  connection's `hello` — no `reopen` there is `Unavailable` in `errors::reopen_unsupported`'s
+  words (the one wording, which names `kill <pid>` only for a version that PARSES below 0.2.0
+  and a known pid — never an inferred one), nothing sent. A reopen allows `REOPEN_DEADLINE`
+  (200 s, craze's "at least") per answer; a LOST answer (connection ended, deadline) is sent
+  again ONCE on a fresh connection; a second loss, a resend that cannot reach a hub that
+  reopens, or a success shed cannot read is `LaneReopenError::Unavailable` worded
+  `errors::REOPEN_LOST` ("Retry is safe" — a reopen is idempotent, so never "outcome unknown";
+  `is_reopen_lost` tells it). Its answer's row is a **created row** that is FRESH: it lifts a
+  tombstone for its hostId instead of being refused by one. A reopen that may have started a
+  session (a success, a lost answer) **wakes** every roster pump of the source (clones
+  included) that is waiting out its reconnect backoff. `LaneReopenError` is
+  `Gone`/`StartFailed`/`Unavailable`/`Lane(LaneError)`, mapped by `errors::reopen_error` —
+  and its `not_accepting` row is **the documented exception to "keyed on `data.code` ONLY"**:
+  reason `not_resumable` is `Gone` (drop the saved row), `start_failed` is `StartFailed` (show
+  the cause, keep the row), because craze's own reopen table gives the two opposite client
+  actions and `NotAccepting` is a unit variant; only `session.reopen` reads that reason
+  (`shed_core::lane`'s error table and `errors.rs` say the same). `tests/recipe_source.rs`'s
+  reopen cells are craze's reopen recipe (the index seeded through
+  `Recipe::write_saved_sessions`, the agent the fake agent's `grok-load`). **`CrazeLane`** (plan 025 C8, `open` binds one with no I/O) is one
   session: its watcher (`watcher.rs` — the state machine table is its module doc) dials
   one connection per lane, splices to the host (`session.connect{hostId}` with the host
   `hello` pipelined), re-reads the host's own `sessions.list` row (the craze `sessionId`
@@ -279,7 +328,9 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `segment.rs` is shed-gx's segmenter, ported (8 KiB lossless splits, the 2 s flush
   clock); `settings.rs` is the settings data (plan 025 §3.10: craze's model order and the
   options' order, computed once; modes hidden when the session's `modes` capability is
-  off) and `set` (C11) is `session.set` — `setting_for` binds a config change to the model
+  off; each model's craze 0.2.0 effort facts — `efforts`/`defaultEffort`/`switchEffort`,
+  a native session's — as `LaneChoice::effort`, plan 032 §3.3) and `set` (C11) is
+  `session.set` — `setting_for` binds a config change to the model
   the CLIENT displayed (`LaneSettingChange::Config`'s `for_model`, Amendment A13), else the
   lane's folded one, waiting for the lane's first settings rather than going out unbound
   (`forModel`), so craze refuses it `stale_model` (`NotAccepting`) once the session has left
@@ -305,6 +356,7 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   but craze could not record it: <cause>" (`index_write_cause`). A create's `title` goes only to a
   hub whose `hello` says `createTitle`, judged on EACH attempt: fresh → `Failed`, nothing
   sent; a retry or held replay → outcome unknown, id and title kept. `testing`'s
+  `reopen_hub_capabilities` is 0.2.0's (`reopen`, plan 032),
   `full_hub_capabilities` is 0.1.1's (`createTitle`), `hub_capabilities_0_1_0` and
   `session_caps` (no `slashCatalog`) the older shapes, `slash_session_caps` the newer.
   The 0.1.0+gx golden's projection drops the two plan-029 capability bits (pinned by

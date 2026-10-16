@@ -43,33 +43,54 @@
 //! client tells it from a rename that failed: a warning beside the new
 //! title, never a rollback or a retry.
 //!
+//! **And a reopen's own error** (plan 032 §3.4, PC10): `session.reopen`'s
+//! refusals become [`LaneReopenError`], whose variants say what a client does
+//! next — drop the saved row, show the cause, retry ([`reopen_error`]). Its
+//! `not_accepting` row is **the documented exception to "keyed on `data.code`
+//! ONLY"** (PC14e): craze's own reopen table gives the reasons
+//! `not_resumable` (drop the row: `Gone`) and `start_failed` (show the cause,
+//! keep the row: `StartFailed`) opposite client actions, and the contract's
+//! `NotAccepting` is a unit variant that could carry neither. Only that code,
+//! and only on `session.reopen`; `shed_core::lane`'s module doc and
+//! `crates/CLAUDE.md` carry the same exception. A hub that cannot reopen at
+//! all — its `hello` without `reopen`, or a refusal `unsupported` /
+//! `unknown_method` — is said in one set of words, [`reopen_unsupported`],
+//! which never infers a version it was not told; and an answer that never came
+//! is [`REOPEN_LOST`], `Unavailable` — a reopen is idempotent, so Retry is
+//! safe (PC14d), never a separate "outcome unknown".
+//!
 //! A code this build does not know (or a refusal with no `data.code` at all)
 //! is [`LaneError::Failed`] with the message — the contract's rule that an
 //! unknown code is `Failed`'s job.
 //!
 //! **craze's words never wear shed's "outcome unknown"** (nor its
-//! [`RENAMED_UNRECORDED`]): a client keeps a create's request id, and the
-//! desktop shows a change "not confirmed", only on [`is_outcome_unknown`] —
-//! which reads a `Failed`'s text prefix, because the contract's `LaneError`
-//! has no variant for it. So every text craze (or the far side of a dial)
-//! wrote that becomes a message here goes through [`craze_says`], which
-//! escapes one that happens to begin with either prefix: only shed's own
-//! [`outcome_unknown`] and [`set_title_error`] carry them.
+//! [`RENAMED_UNRECORDED`] or [`REOPEN_LOST`]): a client keeps a create's
+//! request id, and the desktop shows a change "not confirmed", only on
+//! [`is_outcome_unknown`] — which reads a `Failed`'s text prefix, because the
+//! contract's `LaneError` has no variant for it. So every text craze (or the
+//! far side of a dial) wrote that becomes a message here goes through
+//! [`craze_says`], which escapes one that happens to begin with any of the
+//! three: only shed's own [`outcome_unknown`], [`set_title_error`] and
+//! [`reopen_lost`] carry them.
 
-use shed_core::lane::LaneError;
+use shed_core::lane::{LaneError, LaneReopenError};
 
+use crate::conn::{version_or_unknown, HubHello};
 use crate::wire::{code, reason, RpcError};
 
 /// craze's own text (a refusal's message, a start failure's cause, a refused
 /// `hello`'s or `session.connect`'s words) as a [`LaneError`]'s message:
 /// verbatim — unless it begins with shed's [`OUTCOME_UNKNOWN`], which marks a
-/// request whose answer was LOST and is never a definite answer's, or with
-/// its [`RENAMED_UNRECORDED`]: then it is said as craze's (`craze: outcome
-/// unknown: …`) and neither [`is_outcome_unknown`] nor [`index_write_cause`]
-/// can mistake it for shed's own.
+/// request whose answer was LOST and is never a definite answer's, with its
+/// [`RENAMED_UNRECORDED`], or with its [`REOPEN_LOST`]: then it is said as
+/// craze's (`craze: outcome unknown: …`) and neither [`is_outcome_unknown`],
+/// [`index_write_cause`] nor [`is_reopen_lost`] can mistake it for shed's own.
 pub fn craze_says(text: impl Into<String>) -> String {
     let text = text.into();
-    if text.starts_with(OUTCOME_UNKNOWN) || text.starts_with(RENAMED_UNRECORDED) {
+    if text.starts_with(OUTCOME_UNKNOWN)
+        || text.starts_with(RENAMED_UNRECORDED)
+        || text.starts_with(REOPEN_LOST)
+    {
         format!("craze: {text}")
     } else {
         text
@@ -247,6 +268,120 @@ fn failed_after<'a>(e: &'a LaneError, prefix: &str) -> Option<&'a str> {
     match e {
         LaneError::Failed(m) => m.strip_prefix(prefix),
         _ => None,
+    }
+}
+
+// ---- a reopen's refusals (plan 032 §3.4) ----
+
+/// What a reopen whose answer was LOST says — the connection ended or the
+/// deadline passed on both tries, the retry's dial failed, or craze answered
+/// with a success shed cannot read: the session may be running, and since a
+/// reopen means "ensure it is running", trying again is safe (PC10, PC14d).
+/// A caller's [`LaneReopenError::Unavailable`] starts with these words; what
+/// was lost follows in parentheses.
+pub const REOPEN_LOST: &str =
+    "the reopen's answer was lost; the session may already be running — Retry is safe";
+
+/// [`REOPEN_LOST`], and what was lost.
+pub fn reopen_lost(why: &str) -> LaneReopenError {
+    LaneReopenError::Unavailable(format!("{REOPEN_LOST} ({why})"))
+}
+
+/// Whether `e` is [`reopen_lost`]'s — the session may be running though no
+/// answer said so. One implementation, so no client string-matches it on its
+/// own. craze's own `unavailable` words never read as it: [`craze_says`]
+/// escapes a message that happens to begin with [`REOPEN_LOST`].
+pub fn is_reopen_lost(e: &LaneReopenError) -> bool {
+    matches!(e, LaneReopenError::Unavailable(m) if m.starts_with(REOPEN_LOST))
+}
+
+/// The first craze version that reopens saved sessions: a hub that says it is
+/// older, and says its pid, is one an upgrade left running.
+const REOPEN_SINCE: (u64, u64, u64) = (0, 2, 0);
+
+/// The words for a hub that does not offer reopening saved sessions — its
+/// `hello` without `reopen`, or a refusal `unsupported`/`unknown_method` —
+/// in the ONE wording every client says it in (the source's gate, and the
+/// desktop's live-capability gate, PC14i).
+pub fn reopen_unsupported(hello: &HubHello) -> String {
+    reopen_unsupported_by(&hello.craze_version, hello.pid)
+}
+
+/// [`reopen_unsupported`] from what a caller knows of the hub: its craze
+/// version (`""` when unknown) and its pid. The upgrade remedy — a hub from
+/// before craze 0.2.0 outlives an upgrade until it is idle, and `kill <pid>`
+/// ends it — is said ONLY when the version parses as one below 0.2.0 and the
+/// pid is known: the words never infer a version (PC10), so a `dev` or test
+/// build, or no version at all, gets the plain sentence.
+pub fn reopen_unsupported_by(craze_version: &str, pid: Option<i64>) -> String {
+    let text = format!(
+        "this craze hub (craze {}) does not offer reopening saved sessions",
+        version_or_unknown(craze_version)
+    );
+    let older = parse_version(craze_version).is_some_and(|v| v < REOPEN_SINCE);
+    match pid.filter(|p| older && *p > 0) {
+        Some(pid) => format!(
+            "{text}; a hub from before craze 0.2.0 keeps running after an upgrade until it is idle — end it with kill {pid}"
+        ),
+        None => text,
+    }
+}
+
+/// A craze version as `(major, minor, patch)` — an optional `v`, three decimal
+/// numbers, anything after a `-` or `+` ignored — or `None` for anything else
+/// (`dev`, a test build's `test-…`, empty).
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.strip_prefix('v').unwrap_or(v).split(['-', '+']).next()?;
+    let parts: Vec<u64> = core
+        .split('.')
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    match parts[..] {
+        [major, minor, patch] => Some((major, minor, patch)),
+        _ => None,
+    }
+}
+
+/// Whether `e` is a hub that cannot answer a reopen at all: `unsupported`
+/// (reason `unsupported` from a hub given no answer, `unknown_method` from one
+/// from before the method), or a bare JSON-RPC `-32601` with no `data.code`.
+pub fn is_reopen_unsupported(e: &RpcError) -> bool {
+    match e.data_code.as_deref() {
+        Some(c) => c == code::UNSUPPORTED,
+        None => e.code == -32601,
+    }
+}
+
+/// `session.reopen`'s refusal as [`LaneReopenError`] (the module doc; the
+/// table is `shed_core::lane`'s too):
+///
+/// | craze's answer | [`LaneReopenError`] |
+/// |---|---|
+/// | `unknown_session` | `Gone` (craze's message) |
+/// | `not_accepting` / `not_resumable` | `Gone` (craze's message) |
+/// | `not_accepting` / `start_failed` | `StartFailed("could not start: <data.cause, else the message>")` |
+/// | `unavailable` / any reason | `Unavailable` (craze's message) |
+/// | `unsupported` (any reason), a bare `-32601` | `Unavailable(`[`reopen_unsupported`]`)` |
+/// | `bad_request` | `Lane(BadRequest)` |
+/// | anything else | `Lane(Failed)` (craze's message) |
+///
+/// The `not_accepting` split is the one place a reason decides the variant
+/// (PC14e).
+pub fn reopen_error(e: &RpcError, hello: &HubHello) -> LaneReopenError {
+    if is_reopen_unsupported(e) {
+        return LaneReopenError::Unavailable(reopen_unsupported(hello));
+    }
+    let text = craze_says(e.text());
+    match (e.data_code.as_deref(), e.reason.as_deref()) {
+        (Some(code::UNKNOWN_SESSION), _) => LaneReopenError::Gone(text),
+        (Some(code::NOT_ACCEPTING), Some(reason::NOT_RESUMABLE)) => LaneReopenError::Gone(text),
+        (Some(code::NOT_ACCEPTING), Some(reason::START_FAILED)) => {
+            let cause = said_cause(e.cause.as_deref()).map_or(text, craze_says);
+            LaneReopenError::StartFailed(format!("could not start: {cause}"))
+        }
+        (Some(code::UNAVAILABLE), _) => LaneReopenError::Unavailable(text),
+        (Some(code::BAD_REQUEST), _) => LaneReopenError::Lane(LaneError::BadRequest(text)),
+        _ => LaneReopenError::Lane(LaneError::Failed(text)),
     }
 }
 
@@ -532,5 +667,165 @@ mod tests {
         ] {
             assert_eq!(set_title_error(&refusal(code, code)), want, "{code}");
         }
+    }
+
+    /// A hub `hello` as a reopen sees it: `version`, `pid`, nothing else read.
+    fn hub(version: &str, pid: Option<i64>) -> HubHello {
+        HubHello {
+            epoch: "0a1b2c3d4e5f".into(),
+            craze_version: version.into(),
+            pid,
+            capabilities: crate::wire::ConnCapabilities::default(),
+        }
+    }
+
+    /// **The reopen table, row by row** (plan 032 §3.4, PC10): each craze
+    /// answer lands on the variant that says what a client does next — and
+    /// `not_accepting` is split on its reason (the documented exception,
+    /// PC14e) while every other method keeps the code-only table.
+    #[test]
+    fn the_reopen_table_row_by_row() {
+        let h = hub("0.2.0", Some(5150));
+        let with = |code: &str, reason: &str, cause: Option<&str>| {
+            RpcError::from_value(&json!({"code": -32000,
+                "message": format!("craze says {code}/{reason}"),
+                "data": {"code": code, "reason": reason, "cause": cause}}))
+        };
+        let rows: Vec<(RpcError, LaneReopenError)> = vec![
+            (
+                with("unknown_session", "unknown_session", None),
+                LaneReopenError::Gone("craze says unknown_session/unknown_session".into()),
+            ),
+            (
+                with("not_accepting", "not_resumable", None),
+                LaneReopenError::Gone("craze says not_accepting/not_resumable".into()),
+            ),
+            (
+                with(
+                    "not_accepting",
+                    "start_failed",
+                    Some(" acp: agent exited: KEYCHAIN LOCKED "),
+                ),
+                LaneReopenError::StartFailed(
+                    "could not start: acp: agent exited: KEYCHAIN LOCKED".into(),
+                ),
+            ),
+            (
+                with("not_accepting", "start_failed", None),
+                LaneReopenError::StartFailed(
+                    "could not start: craze says not_accepting/start_failed".into(),
+                ),
+            ),
+            (
+                with("unavailable", "busy", None),
+                LaneReopenError::Unavailable("craze says unavailable/busy".into()),
+            ),
+            (
+                with("unavailable", "closing", None),
+                LaneReopenError::Unavailable("craze says unavailable/closing".into()),
+            ),
+            (
+                with("unavailable", "spawn_failed", None),
+                LaneReopenError::Unavailable("craze says unavailable/spawn_failed".into()),
+            ),
+            (
+                with("unsupported", "unknown_method", None),
+                LaneReopenError::Unavailable(reopen_unsupported(&h)),
+            ),
+            (
+                with("unsupported", "unsupported", None),
+                LaneReopenError::Unavailable(reopen_unsupported(&h)),
+            ),
+            (
+                RpcError::from_value(&json!({"code": -32601, "message": "method not found"})),
+                LaneReopenError::Unavailable(reopen_unsupported(&h)),
+            ),
+            (
+                with("bad_request", "unknown_field", None),
+                LaneReopenError::Lane(LaneError::BadRequest(
+                    "craze says bad_request/unknown_field".into(),
+                )),
+            ),
+            (
+                with("not_accepting", "not_accepting", None),
+                LaneReopenError::Lane(LaneError::Failed(
+                    "craze says not_accepting/not_accepting".into(),
+                )),
+            ),
+            (
+                with("failed", "failed", None),
+                LaneReopenError::Lane(LaneError::Failed("craze says failed/failed".into())),
+            ),
+            (
+                with("brand_new_code", "x", None),
+                LaneReopenError::Lane(LaneError::Failed("craze says brand_new_code/x".into())),
+            ),
+        ];
+        for (refusal, want) in rows {
+            assert_eq!(reopen_error(&refusal, &h), want, "{refusal}");
+        }
+        // The exception is the reopen's alone: the code-only table still
+        // reads `not_accepting/not_resumable` as `NotAccepting`.
+        assert_eq!(
+            lane_error(&with("not_accepting", "not_resumable", None)),
+            LaneError::NotAccepting
+        );
+        // craze's words never wear shed's "outcome unknown", here either.
+        let sneaky = with("not_accepting", "start_failed", Some("outcome unknown: x"));
+        assert_eq!(
+            reopen_error(&sneaky, &h),
+            LaneReopenError::StartFailed("could not start: craze: outcome unknown: x".into())
+        );
+    }
+
+    /// **The older-hub words never infer a version** (PC10): the upgrade
+    /// remedy — `kill <pid>` — only for a version that PARSES below 0.2.0 and
+    /// a known pid; a 0.2.0-or-later hub, a dev or test build, an empty
+    /// version or no pid get the plain sentence.
+    #[test]
+    fn the_older_hub_words_name_a_kill_only_for_a_parsed_older_version_and_a_pid() {
+        let plain =
+            |v: &str| format!("this craze hub (craze {v}) does not offer reopening saved sessions");
+        let remedy = "; a hub from before craze 0.2.0 keeps running after an upgrade until it is idle — end it with kill 5150";
+        for v in ["0.1.1", "v0.1.0", "0.0.1", "0.1.9-rc1", "0.1.1+abc"] {
+            assert_eq!(
+                reopen_unsupported(&hub(v, Some(5150))),
+                format!("{}{remedy}", plain(v)),
+                "{v}"
+            );
+        }
+        for (v, pid) in [
+            ("0.2.0", Some(5150)),
+            ("0.10.0", Some(5150)),
+            ("1.0.0", Some(5150)),
+            ("0.2.0-rc1", Some(5150)),
+            ("test-75b046893f9a", Some(5150)),
+            ("dev", Some(5150)),
+            ("0.1", Some(5150)),
+            ("0.1.1.1", Some(5150)),
+            ("0.1.x", Some(5150)),
+            ("0.1.1", None),
+            ("0.1.1", Some(0)),
+        ] {
+            assert_eq!(reopen_unsupported(&hub(v, pid)), plain(v), "{v} {pid:?}");
+        }
+        assert_eq!(
+            reopen_unsupported_by("", Some(5150)),
+            "this craze hub (craze version unknown) does not offer reopening saved sessions"
+        );
+    }
+
+    /// A lost reopen is `Unavailable`, worded [`REOPEN_LOST`] and then what
+    /// was lost — never shed's "outcome unknown" (a reopen is idempotent).
+    #[test]
+    fn a_lost_reopen_is_unavailable_and_says_retry_is_safe() {
+        let LaneReopenError::Unavailable(m) = reopen_lost("no answer from craze within 200s")
+        else {
+            panic!("a lost reopen is Unavailable")
+        };
+        assert_eq!(
+            m,
+            "the reopen's answer was lost; the session may already be running — Retry is safe (no answer from craze within 200s)"
+        );
     }
 }

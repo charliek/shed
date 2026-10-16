@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use shed_app::slash_menu::{self, SlashAction};
 use shed_core::lane::conformance::{drive_lane, Drive, DriveEnd, LaneChecker};
 use shed_core::lane::{
     AgentLane, AgentSource, LaneAnswer, LaneApprovalKind, LaneCreateRequest, LaneCreated,
@@ -829,7 +830,8 @@ fn titles(frames: &[LaneEvent]) -> Vec<String> {
 /// `meta` delta arrives as a live `Slash` — the catalog WHOLE, as craze built
 /// it: its builtins (the picker, the rename, `/exit` requiring `stop`, the
 /// mode rows resolved to the modes the session advertised) and exactly the
-/// agent's new commands, the old `research` gone.
+/// agent's new commands, the old `research` gone. Through the shared `/` rule
+/// on the session's settings, craze 0.2.0's `/effort` shows (plan 032 §3.2).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_agents_set_commands_reach_the_lane_as_a_slash() {
     let Some(bins) = bins("the_agents_set_commands_reach_the_lane_as_a_slash") else {
@@ -840,7 +842,9 @@ async fn the_agents_set_commands_reach_the_lane_as_a_slash() {
         let source = recipe.source();
         let host = create_grok(&source, &recipe, None).await.session.id;
         let (lane, _sub) = lane_on(&source, &host).await;
-        let (mut rx, _stop, mut checker) = seeded(&lane).await;
+        let (mut rx, _stop) = lane.subscribe(None).await.unwrap().into_parts();
+        let mut checker = LaneChecker::new();
+        let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
         let caps = checker.live_capabilities().unwrap().clone();
         assert!(caps.slash && caps.set_title, "{caps:?}");
 
@@ -852,6 +856,39 @@ async fn the_agents_set_commands_reach_the_lane_as_a_slash() {
         })
         .await;
         let catalog = last_catalog(&f).unwrap();
+
+        // Plan 032 §3.2: what the shared `/` rule makes of it on the grok
+        // fake's grok-4.6, whose `reasoning_effort` is its effort option —
+        // craze 0.2.0's `/effort` shows, after `/exit` (what the desktop's
+        // e2e `MENU_ROWS` rest on).
+        let settings = seed
+            .iter()
+            .chain(&f)
+            .rev()
+            .find_map(|e| match e {
+                LaneEvent::Settings { settings } => Some(settings.clone()),
+                _ => None,
+            })
+            .expect("the session's settings");
+        let menu = slash_menu::resolve(&catalog, &caps, Some(&settings));
+        assert_eq!(
+            menu.rows
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["model", "rename", "plan", "ask", "agent", "exit", "effort", "alpha", "beta"]
+        );
+        let effort = &menu
+            .rows
+            .iter()
+            .find(|r| r.name == "effort")
+            .unwrap()
+            .action;
+        assert!(
+            matches!(effort, SlashAction::EffortPicker { option, for_model, .. }
+                if option == "reasoning_effort" && for_model == "grok-4.6"),
+            "{effort:?}"
+        );
         let row = |name: &str| {
             catalog
                 .rows

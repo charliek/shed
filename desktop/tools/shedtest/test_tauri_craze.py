@@ -10,7 +10,7 @@ and `craze-0.0.1` (the real v0.0.1, for the too-old cell). They come from
 `SHED_CRAZE_REQUIRE=1` (CI) it FAILS instead, so a run can never go green on
 skipped craze cells.
 
-Four independent app instances (`test_tauri_lane.py`'s fixture shape — each
+Five independent app instances (`test_tauri_lane.py`'s fixture shape — each
 its own throwaway HOME/XDG_RUNTIME_DIR, so its own socket and single-instance
 lock, the session app untouched):
 
@@ -44,6 +44,11 @@ lock, the session app untouched):
   through the same fake `ssh` in a jail of its own (a shed's ssh user is its
   name) and none running a roost-session — the running sheds a dormant craze
   is offered on without listing them.
+* `app_no_start` (plan 032 §3.5, W5) — no local craze; two remote machines
+  through the same fake `ssh`, each with a hub running before launch and a
+  switch set before the app's first dial: one whose roster dial is held so
+  its hub can end between the probe and the `--no-start` bridge, and one
+  emulating a craze older than 0.2.0 (`--no-start` refused).
 
 **Every craze process is torn down** at module end by its program path (each
 rig's private copies, never this host's own craze), checked just before each
@@ -91,6 +96,10 @@ KIND = "craze"
 #: The fake host's registry identity (twelve hex digits, as craze mints them).
 FAKE_HOST = "0c0c0c0c0c0c"
 FAKE_SESSION = "craze-desk-fake"
+#: A second fake host, the one the stop-race cell stops (plan 032 §3.1): the
+#: module's `FAKE_HOST` serves the cells after it.
+RACE_HOST = "0f0f0f0f0f0f"
+RACE_SESSION = "craze-desk-race"
 #: The roost tab a craze TUI would run in, for the row merge.
 CRAZE_TAB = 7
 #: Every craze wait is bounded by this, scaled like every other harness wait.
@@ -127,7 +136,12 @@ HELLO = {"protocols": [1], "client": {"kind": "test", "name": "shedtest"}}
 #: `swap-plan` exists (plan 030 FU7), every slash catalog coming DOWN has the
 #: mode id behind its `plan` row rewritten (`-swapped` appended): the same
 #: rows in the same order, another action behind one of them — a catalog swap
-#: no fake agent directive can make.
+#: no fake agent directive can make. Every `session.reopen` (plan 032 §3.4)
+#: goes to `reopens.log` with its saved id, and while `hold-reopens` (a FIFO,
+#: `SetGate`) exists it is HELD the way a rename is — so a resume stays
+#: running for as long as a cell needs to look at it; its REPLY goes to
+#: `reopen-replies.log` as it comes down, a create's way — what a cell that
+#: fails mid-resume waits for before it changes the rig (`_settle_reopens`).
 BRIDGE_PROXY = r"""
 import json, os, subprocess, sys, threading, time
 root = os.path.dirname(os.path.abspath(__file__))
@@ -165,6 +179,8 @@ def answered(line):
     entry["relayed"] = not cut.is_set()
     if name == "create-replies.log":
         entry["session"] = result.get("session")
+    elif name == "reopen-replies.log":
+        entry["hostId"] = (result.get("session") or {}).get("hostId")
     else:
         snap = result.get("snapshot")
         settings = (snap.get("settings") or {}) if isinstance(snap, dict) else {}
@@ -257,6 +273,13 @@ for line in sys.stdin.buffer:
             log.write(json.dumps({"method": msg["method"], "params": msg.get("params")}) + "\n")
         if msg["method"] == "session.setTitle":
             hold(os.path.join(root, "hold-titles"))
+    if isinstance(msg, dict) and msg.get("method") == "session.reopen":
+        saved = (msg.get("params") or {}).get("id")
+        with open(os.path.join(root, "reopens.log"), "a") as log:
+            log.write(json.dumps({"id": saved}) + "\n")
+        if "id" in msg:
+            watched[json.dumps(msg["id"])] = ("reopen-replies.log", {"id": saved})
+        hold(os.path.join(root, "hold-reopens"))
     if isinstance(msg, dict) and msg.get("method") == "session.set":
         drop = os.path.exists(os.path.join(root, "drop-sets"))
         with open(os.path.join(root, "sets.log"), "a") as log:
@@ -476,6 +499,17 @@ class CrazeEnv:
         in order."""
         return self._jsonl("sets.log")
 
+    def reopens(self) -> list[dict]:
+        """Every `session.reopen` a proxied bridge carried: `{id}`, in
+        order."""
+        return self._jsonl("reopens.log")
+
+    def reopen_replies(self) -> list[dict]:
+        """The hub's REPLY to every `session.reopen` a proxied bridge
+        carried, recorded as it came down the wire: `{id, hostId, error,
+        relayed}`, in order — `hostId` the session it answered with."""
+        return self._jsonl("reopen-replies.log")
+
     def switch(self, name: str, on: bool) -> None:
         """Turn one of the wrapper's switches (`outage`, `proxy`,
         `drop-creates`, `drop-sets`, `refuse-dials`, `swap-plan`) on or
@@ -527,7 +561,10 @@ class CrazeEnv:
         for rec in hubs.glob("*.json"):
             try:
                 pids.append(int(json.loads(rec.read_text())["pid"]))
-            except (ValueError, KeyError, json.JSONDecodeError):
+            # A hub that exits removes its record between the glob and the
+            # read (seen on macOS CI, plan 032 C6's race cell): a record that is
+            # gone is a hub that is gone.
+            except (FileNotFoundError, ValueError, KeyError, json.JSONDecodeError):
                 pass
         return pids
 
@@ -944,15 +981,80 @@ def test_cancel_ends_a_running_turn(app, rig):
 
 
 def test_stop_ends_the_session_and_its_row(app, created):
-    """`lane.stop` ends the SESSION: the lane ends (`ended`) and the row leaves
-    the roster — and its lane is evicted with it."""
+    """`lane.stop` ends the SESSION: the row leaves the roster, and the lane —
+    which outlives its row by a grace (plan 032 §3.1) — ends with the
+    session's own `session_closed`: `ended` and `finished`, still readable
+    (never `no_lane`), and a verb after it is refused `lane_ended`. (A 0.2.0
+    host drops its row ahead of its last events; plan 025's desktop retired
+    the lane with the row and the panel froze.)"""
     host = created["slug"]
     _ready(app, host)
     _lane(app, "lane.stop", host)
     app.wait_until(lambda: _row(app, host) is None, timeout=WAIT,
                    what="the stopped session's row to leave")
-    gone = _error(lambda: _messages(app, host))
-    assert gone.code == "no_lane", gone
+    app.wait_until(lambda: _messages(app, host)["finished"], timeout=WAIT,
+                   what="the stopped session's lane to end")
+    view = _messages(app, host)
+    assert view["ended"] is True and view["stale"] == "session_closed", view
+    refused = _error(lambda: _lane(app, "lane.send", host, text="after the end"))
+    assert refused.code == "lane_ended", refused
+
+
+def test_a_lane_outlives_its_stopping_row_and_ends_visibly(app, rig):
+    """**A craze lane outlives its row by a grace, then ends VISIBLY** (plan 032
+    §3.1, the Stop freeze; §7 W1 e2e 1). A fake host's turn is running, and
+    `mark_stopping` makes the hub drop its row on its next round — ahead of
+    the session's last events, exactly as a 0.2.0 host's stop does. The lane
+    keeps its own connection: the late text and the turn's end still land on
+    it, the host then quits, and the lane ENDS — `finished`, with a final
+    reason — instead of freezing on its last frame. No read fails `no_lane`
+    at any point, a send is refused `lane_ended`, and the panel shows the
+    ended banner with its composer disabled.
+
+    The fake host's `quit` sends no `session_closed` (PC14a), so the final
+    reason is the lane's redial finding no such session (`unknown_session`)
+    or the grace running out (`session_gone`); `session_closed` itself is
+    `test_stop_ends_the_session_and_its_row`'s, through a real `craze serve`."""
+    host = rig.fake_host(RACE_HOST, RACE_SESSION)
+    app.wait_until(lambda: _row(app, RACE_HOST) is not None, timeout=WAIT,
+                   what="the racing fake host's row")
+    _ready(app, RACE_HOST)
+    _panel(app, RACE_HOST)
+    rig.op(host, {"name": "hang_next"})
+    _lane(app, "lane.send", RACE_HOST, text="the last turn")
+    app.wait_until(lambda: _messages(app, RACE_HOST)["activity"] == "working", timeout=WAIT,
+                   what="the last turn to be running")
+
+    rig.op(host, {"name": "mark_stopping"})
+    app.wait_until(lambda: _row(app, RACE_HOST) is None, timeout=WAIT,
+                   what="the stopping host's row to leave the roster")
+    view = _messages(app, RACE_HOST)
+    assert view["finished"] is False, f"a departing lane is not over yet: {view}"
+    late = "late words after the row left"
+    rig.op(host, {"name": "text", "text": late})
+    rig.op(host, {"name": "end"})
+    app.wait_until(lambda: any(late in t for t in _texts(app, RACE_HOST)),
+                   timeout=WAIT, what="the late text to land on the departing lane")
+    rig.op(host, {"name": "quit"})
+    host.wait(timeout=10)
+
+    app.wait_until(lambda: _messages(app, RACE_HOST)["finished"], timeout=WAIT,
+                   what="the lane to end with a final reason")
+    view = _messages(app, RACE_HOST)
+    assert view["ended"] is True, view
+    assert view["stale"] in ("unknown_session", "session_gone"), view
+    assert any(late in t for t in _texts(app, RACE_HOST)), "the transcript stays"
+    assert _lane(app, "lane.approvals", RACE_HOST)["approvals"] == []
+    refused = _error(lambda: _lane(app, "lane.send", RACE_HOST, text="anyone there?"))
+    assert refused.code == "lane_ended", refused
+    app.wait_until(lambda: bool((d := _dump(app)) and d["finished"]), timeout=20,
+                   what="the panel to render the ended lane")
+    panel = _dump(app)
+    assert panel["ended"] is True and panel["composer_disabled"] is True, panel
+    assert panel["can_cancel"] is False, panel
+    assert panel["stale"] == view["stale"], panel
+    _shot(app, "craze-lane-ended.png")
+    _unmount(app)
 
 
 # ---------------------------------------------------------------------------
@@ -969,11 +1071,19 @@ def _sheet(app: TauriClient) -> dict | None:
 
 
 def _open_sheet(app: TauriClient, machine: str = LOCAL) -> dict:
-    """`ui.show_craze_create`, then the sheet's options read (or failed)."""
+    """`ui.show_craze_create`, then the sheet's options read (or failed) — and,
+    on an idle sheet, its provider settled: the preselection is an effect of
+    the render that shows the options, so one dump can land between the two."""
     app.call("ui.show_craze_create", {"machine": machine})
-    app.wait_until(lambda: bool((d := _sheet(app)) and d["machine"] == machine
-                                and d["state"] != "loading"),
-                   timeout=WAIT, what=f"the create sheet on {machine} to read its options")
+
+    def settled() -> bool:
+        d = _sheet(app)
+        if not (d and d["machine"] == machine and d["state"] != "loading"):
+            return False
+        return (d["state"] != "idle" or d["preselected"] is None
+                or any(p["selected"] for p in d["providers"]))
+
+    app.wait_until(settled, timeout=WAIT, what=f"the create sheet on {machine} to read its options")
     return _sheet(app)
 
 
@@ -1406,6 +1516,223 @@ def test_open_in_terminal_attaches_a_tab_across_roost_snapshots(app, roost):
 
 
 # ---------------------------------------------------------------------------
+# (2b') the sheet's Resume mode (plan 032 §3.4 — C5)
+# ---------------------------------------------------------------------------
+
+#: The saved sessions these cells seed (craze ids, as craze mints them): one
+#: that resumes, and one whose directory never existed — still LISTED (craze
+#: stats no workspace when it lists), refused `not_resumable` when reopened.
+SAVED_ID = "0192f0aa-6666-7000-8000-00000000desk"
+GONE_ID = "0192f0aa-6666-7000-8000-00000000gone"
+#: What the fake agent's `grok-load` replays on every `session/load` — the
+#: resumed transcript's proof (craze's reopen recipe, and shed-craze's).
+REPLAYED = "the workspace holds main.py and README.md"
+RESUMING = "Resuming… (this can take a few minutes)"
+
+
+def _saved_row(craze_id: str, provider_session: str, cwd: Path, title: str, updated_at: str) -> dict:
+    """One row of craze's session index (`sessions.jsonl`) as craze writes it —
+    craze's reopen recipe's shape (`shed_craze::testing::saved_index_row`): a
+    grok session run in `cwd`."""
+    return {"sessionId": provider_session, "provider": "grok", "cwd": str(cwd), "title": title,
+            "pinned": False, "createdAt": "2026-10-12T09:00:00Z", "updatedAt": updated_at,
+            "crazeId": craze_id}
+
+
+def _seed_saved(rig: CrazeEnv, *rows: dict) -> None:
+    """Add `rows` to the rig's session index the way craze's own writer does
+    (`sessions.Store.Upsert`): under its lock file, flock'd, the index read
+    whole and replaced by an atomic rename — so a row the running hub writes
+    at the same moment is never lost, nor ours. The hub reads the index afresh
+    on every `sessions.saved` and `session.reopen`, so the shared rig needs no
+    new hub (craze's recipe seeds before its hub starts only because it has
+    none yet). A repeated row is harmless: craze keeps the last per key."""
+    import fcntl
+
+    index = rig.craze_home / "sessions.jsonl"
+    with open(f"{index}.lock", "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            text = index.read_text() if index.exists() else ""
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows)
+            tmp = rig.craze_home / "sessions.jsonl.shedtest"
+            tmp.write_text(text)
+            tmp.chmod(0o600)
+            os.replace(tmp, index)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _choose_resume(app: TauriClient) -> dict:
+    """Choose Resume (test-mode door, the control's own gate) and wait for the
+    saved list it reads on that first choice."""
+    app.call("ui.choose_craze_mode", {"mode": "resume"})
+    app.wait_until(lambda: bool((d := _sheet(app)) and d["mode"] == "resume"
+                                and (d["saved"] or {}).get("state") in ("ready", "failed")),
+                   timeout=WAIT, what="the Resume half's saved list")
+    return _sheet(app)
+
+
+def _saved_of(d: dict | None, saved_id: str) -> dict | None:
+    """The rendered saved row `saved_id` in a `craze_create.dump`, if listed."""
+    rows = ((d or {}).get("saved") or {}).get("rows", [])
+    return next((r for r in rows if r["id"] == saved_id), None)
+
+
+def _resuming(d: dict | None) -> bool:
+    """Whether a `craze_create.dump` shows a reopen running."""
+    return any(r["state"] == "resuming" for r in ((d or {}).get("saved") or {}).get("rows", []))
+
+
+def _settle_reopens(app: TauriClient, rig: CrazeEnv, sent: int, replied: int) -> None:
+    """Settle every reopen a FAILING Resume cell left outstanding, and close
+    what it left on screen — before the cell restores the rig (C5 review P3).
+
+    A failure inside the reopen hold leaves the held `session.reopen` to go
+    through on its own (`SetGate`'s exit removes the FIFO, and the proxy then
+    relays it) and the app waiting on it, its sheet locked on "Resuming…".
+    Restoring `grok-echo` at once would let craze run that reopen with an
+    agent that cannot load a session, and the next cell would open a sheet
+    still locked on it, or be navigated by its late answer. So, with the
+    agent still the one it was meant for: craze's answer to every reopen
+    sent since `sent` comes down the wire (`reopen-replies.log`, counted from
+    `replied`); the app lands it — its sheet closes onto the transcript, or
+    its row leaves the running state; a dismissed sheet, which keeps the
+    reopen running behind it, is opened again to see that — and then the
+    sheet, and any transcript it opened, are closed."""
+    if len(rig.reopens()) > sent or _resuming(_sheet(app)):
+        app.wait_until(lambda: len(rig.reopen_replies()) - replied >= len(rig.reopens()) - sent,
+                       timeout=WAIT * 3, what="craze's answer to every reopen the cell sent")
+        if _sheet(app) is None:
+            app.call("ui.show_craze_create", {"machine": LOCAL})
+            app.wait_until(lambda: _sheet(app) is not None, timeout=WAIT,
+                           what="the sheet, to see its reopen land")
+        app.wait_until(lambda: not _resuming(_sheet(app)), timeout=WAIT * 3,
+                       what="the outstanding reopen to land in the app")
+    if _sheet(app) is not None:
+        _close_sheet(app)
+    if _dump(app) is not None:
+        _unmount(app)
+
+
+def test_a_saved_session_resumes_into_its_transcript(app, rig):
+    """**Resume a saved session** (plan 032 §3.4, W4) — craze's reopen recipe
+    through the app: the index holds a saved grok session, and the agent is
+    the fake's `grok-load`, which replays a short transcript on every
+    `session/load`. On this 0.2.0 hub the sheet offers `New | Resume` (the
+    create options say `reopen`) and opens on New; Resume lists the session —
+    title, provider, workspace with the home shortened to `~`, age — beside a
+    second saved one. Its Resume sends ONE `session.reopen` (held at the proxy
+    here, so the running state can be read): the row says "Resuming… (this
+    can take a few minutes)", and every other button — the other row's, the
+    mode control — waits, a press of one refused by its gate. On craze's
+    answer the sheet closes onto the session's transcript, which shows the
+    replayed answer; the session is listed, and — running — no longer
+    saved."""
+    work = _mkdir_0700(rig.home / "resume-me")
+    _seed_saved(rig,
+                _saved_row(SAVED_ID, "desk-saved", work, "a saved desk session", "2026-10-12T10:00:00Z"),
+                _saved_row(GONE_ID, "desk-gone", rig.root / "w-resume-gone",
+                           "a session whose directory went", "2026-10-11T10:00:00Z"))
+    loader = _write_exec(rig.root / "grok-load-agent",
+                         f"#!/bin/sh\nexec '{rig.real / 'craze-fake-agent'}' -script grok-load \"$@\"\n")
+    rig.set_grok(loader)
+    rig.switch("proxy", True)
+    before = len(rig.reopens())
+    replied = len(rig.reopen_replies())
+    try:
+        d = _open_sheet(app)
+        assert d["modes"] == {"offered": True, "enabled": True}, d["modes"]
+        assert d["mode"] == "new" and d["saved"] is None, d
+        d = _choose_resume(app)
+        assert d["saved"]["state"] == "ready", d["saved"]
+        assert d["primary"] == "" and d["create_enabled"] is False, "no Create in the Resume half"
+        row = _saved_of(d, SAVED_ID)
+        assert row, d["saved"]["rows"]
+        assert row["title"] == "a saved desk session" and row["provider"] == "grok", row
+        assert row["workspace"] == "~/resume-me", "the app's own home, shortened"
+        assert row["updated"], row
+        assert (row["state"], row["button"], row["enabled"]) == ("idle", "Resume", True), row
+        assert _saved_of(d, GONE_ID), "a session whose directory went is still listed"
+        _shot(app, "craze-resume-list.png")
+
+        with SetGate(rig.root / "hold-reopens", what="reopen") as gate:
+            app.call("ui.resume_saved", {"id": SAVED_ID})
+            app.wait_until(lambda: len(rig.reopens()) > before, timeout=WAIT,
+                           what="the reopen on the wire, held")
+            app.wait_until(lambda: (_saved_of(_sheet(app), SAVED_ID) or {}).get("state") == "resuming",
+                           timeout=WAIT, what="the row resuming")
+            d = _sheet(app)
+            row = _saved_of(d, SAVED_ID)
+            assert (row["button"], row["enabled"]) == (RESUMING, False), row
+            others = [r for r in d["saved"]["rows"] if r["id"] != SAVED_ID]
+            assert others and not any(r["enabled"] for r in others), f"every other button waits: {others}"
+            assert d["modes"] == {"offered": True, "enabled": False}, d["modes"]
+            # Pressed anyway, the other row's gate refuses it (nothing sent).
+            app.call("ui.resume_saved", {"id": GONE_ID})
+            _shot(app, "craze-resume-resuming.png")
+            gate.release()
+            app.wait_until(lambda: _sheet(app) is None, timeout=WAIT * 3,
+                           what="the sheet to close on the reopen's answer")
+    except BaseException:
+        # Failed mid-resume: its reopen may still be outstanding. Settle it —
+        # with `grok-load` still the agent — and close its sheet BEFORE the
+        # rig is restored, so it can leak into no later cell.
+        _settle_reopens(app, rig, before, replied)
+        raise
+    finally:
+        rig.switch("proxy", False)
+        rig.set_grok(rig.grok_echo)
+    assert rig.reopens()[before:] == [{"id": SAVED_ID}], "one reopen; the refused press sent nothing"
+
+    app.wait_until(lambda: bool((lane := _dump(app)) and lane["lane_kind"] == KIND
+                                and any(REPLAYED in (r.get("text") or "") for r in lane["rows"])),
+                   timeout=WAIT, what="the resumed session's transcript, with its replayed answer")
+    host = _dump(app)["session_id"]
+    assert any(REPLAYED in t for t in _texts(app, host))
+    row = _row(app, host)
+    assert row and row["workdir"] == str(work) and row["provider"] == "grok", row
+    _shot(app, "craze-resume-transcript.png")
+    _unmount(app)
+
+    # Read afresh on the next open: running, it is no longer saved.
+    _open_sheet(app)
+    d = _choose_resume(app)
+    assert _saved_of(d, SAVED_ID) is None, d["saved"]["rows"]
+    assert _saved_of(d, GONE_ID), d["saved"]["rows"]
+    _close_sheet(app)
+
+
+def test_a_saved_session_that_cannot_run_is_dropped_from_the_list(app, rig):
+    """**`gone` drops the row** (plan 032 §3.4): a saved session whose
+    directory is gone is still listed, and its Resume is refused by craze
+    (`not_accepting`/`not_resumable` → `gone`): the row leaves the list, the
+    sheet says why where it was — the session's title and craze's words — and
+    stays open on Resume. No session starts there."""
+    gone_dir = rig.root / "w-resume-gone"
+    assert not gone_dir.exists()
+    _seed_saved(rig, _saved_row(GONE_ID, "desk-gone", gone_dir, "a session whose directory went",
+                                "2026-10-11T10:00:00Z"))
+    _open_sheet(app)
+    d = _choose_resume(app)
+    assert _saved_of(d, GONE_ID), d["saved"]["rows"]
+    app.call("ui.resume_saved", {"id": GONE_ID})
+    app.wait_until(lambda: bool((d := _sheet(app)) and (d["saved"] or {}).get("gone")),
+                   timeout=WAIT * 2, what="the gone row's note")
+    d = _sheet(app)
+    assert _saved_of(d, GONE_ID) is None, "the row is dropped"
+    gone = d["saved"]["gone"]
+    assert "a session whose directory went" in gone and "no longer a directory" in gone, gone
+    assert d["mode"] == "resume" and d["modes"]["enabled"] is True, d
+    assert all(r["enabled"] for r in d["saved"]["rows"]), "nothing runs: every button works"
+    assert not _rows_in(app, gone_dir), "no session started there"
+    _shot(app, "craze-resume-gone.png")
+    _close_sheet(app)
+
+
+# ---------------------------------------------------------------------------
 # (2c) the settings sheet (plan 025 §3.10 — C11)
 # ---------------------------------------------------------------------------
 
@@ -1447,7 +1774,9 @@ class SetGate:
     holds every set behind it. Absent, sets run at once. Also the held
     session's turn gate (`CRAZE_FAKE_GATE`, `what="turn"`): one byte lets one
     held turn finish. And the proxy's rename hold (`hold-titles`,
-    `what="rename"`): one byte relays one held `session.setTitle`."""
+    `what="rename"`): one byte relays one held `session.setTitle` — and its
+    reopen hold (`hold-reopens`, `what="reopen"`, plan 032 §3.4), one held
+    `session.reopen`."""
 
     def __init__(self, path: Path, what: str = "set"):
         self.path = path
@@ -1796,13 +2125,17 @@ def test_no_settings_where_the_capabilities_say_none(app, roost):
 # textarea), `ui.pick_slash_row`, `ui.answer_lane_stop` — and read through
 # `lane.dump`'s `draft` and `slash_menu`.
 
-#: The rows a hub-created session's menu SHOWS (craze 0.1.1's builtins this
+#: The rows a hub-created session's menu SHOWS (craze 0.2.0's builtins this
 #: client can run, then the agent's `research`), in catalog order; `help`,
 #: `clear`, `tasks`, `theme` (local) and `btw` (aside) are hidden in phase 1.
-MENU_ROWS = ["model", "rename", "plan", "ask", "agent", "exit", "research"]
+#: `effort` (plan 032 §3.2) shows because each of these sessions' current
+#: model has an effort option — the grok fake's `reasoning_effort` on
+#: grok-4.6, the cursor fakes' `effort` — and would hide (and claim no name)
+#: on a model without one.
+MENU_ROWS = ["model", "rename", "plan", "ask", "agent", "exit", "effort", "research"]
 #: Rows that wait for the turn (no `whileWorking`, not a prompt): dimmed and
 #: refused while one runs.
-WAITING_ROWS = {"model", "plan", "ask", "agent"}
+WAITING_ROWS = {"model", "plan", "ask", "agent", "effort"}
 
 
 def _hub_create(rig: CrazeEnv, request_id: str, workdir: str, **params) -> str:
@@ -1830,6 +2163,16 @@ def _hub_session(app: TauriClient, rig: CrazeEnv, request_id: str, workdir: str)
 def _catalog(app: TauriClient, host: str) -> list[str]:
     """The names of the resolved menu's rows on the lane (`lane.messages`)."""
     return [r["name"] for r in (_messages(app, host).get("slash_menu") or {}).get("rows", [])]
+
+
+def _effort_levels(app: TauriClient, host: str) -> list[str]:
+    """The level ids of the resolved menu's `/effort` row (its
+    `effort_picker`, plan 032 §3.2) on the lane — what a `/effort <level>`
+    is matched against and craze's refusal lists. Empty without the row."""
+    for r in (_messages(app, host).get("slash_menu") or {}).get("rows", []):
+        if r["name"] == "effort" and r["action"]["kind"] == "effort_picker":
+            return [lvl["id"] for lvl in r["action"]["levels"]]
+    return []
 
 
 def _menu(app: TauriClient) -> dict | None:
@@ -1960,10 +2303,14 @@ def test_slash_lists_the_sessions_commands(app, rig, slashed):
     assert _highlighted(m) == "model" and not any(r["dimmed"] for r in m["rows"]), m["rows"]
     _shot(app, "craze-slash-menu.png")
 
-    # P9: the highlight goes back to the first row on EVERY filter change —
-    # `/r` → `/re` lists the very same two rows, and still starts over.
+    # `/r` matches `effort` too — by substring, after the two prefix matches.
     _type(app, "/r")
     m = _wait_menu(app, "/r")
+    assert _names(m) == ["rename", "research", "effort"], _names(m)
+    # P9: the highlight goes back to the first row on EVERY filter change —
+    # `/RE` → `/re` lists the very same two rows, and still starts over.
+    _type(app, "/RE")
+    m = _wait_menu(app, "/RE")
     assert _names(m) == ["rename", "research"], _names(m)
     _key(app, "ArrowDown")
     app.wait_until(lambda: _highlighted(_menu(app)) == "research", timeout=20, what="↓ to research")
@@ -1997,26 +2344,30 @@ def test_a_six_hundred_row_catalog_renders_whole(app, rig, slashed):
     """**No row cap** (plan 029 P16, P24): the agent re-advertises 600
     commands — a live catalog delta, which craze does not cap — and the menu
     lists every one of them after the builtins, the panel capped in height and
-    scrolling (↑ from the first row wraps the highlight to the 607th). The
+    scrolling (↑ from the first row wraps the highlight to the last). The
     agent's two-command catalog is put back for the cells after."""
     host = slashed
     _menu_ready(app, host)
     names = [f"cmd-{i:03}" for i in range(600)]
+    builtins = MENU_ROWS[:-1]  # every shown row but the agent's `research`
+    total = len(builtins) + len(names)
     _lane(app, "lane.send", host, text="SET-COMMANDS " + ",".join(names))
-    app.wait_until(lambda: len(_catalog(app, host)) == 606, timeout=WAIT,
+    app.wait_until(lambda: len(_catalog(app, host)) == total, timeout=WAIT,
                    what="the 600-command catalog on the lane")
     _type(app, "/")
-    app.wait_until(lambda: len((_menu(app) or {}).get("rows", [])) == 606, timeout=20,
-                   what="the menu listing all 606 rows")
+    app.wait_until(lambda: len((_menu(app) or {}).get("rows", [])) == total, timeout=20,
+                   what=f"the menu listing all {total} rows")
     m = _menu(app)
-    assert _names(m)[:6] == MENU_ROWS[:-1] and _names(m)[6:] == names, _names(m)[:8]
+    assert _names(m)[:len(builtins)] == builtins and _names(m)[len(builtins):] == names, \
+        _names(m)[:len(builtins) + 2]
     _key(app, "ArrowUp")
     app.wait_until(lambda: _highlighted(_menu(app)) == "cmd-599", timeout=20,
                    what="the highlight wrapped to the last row")
     _shot(app, "craze-slash-600.png")
     _type(app, "")
     _lane(app, "lane.send", host, text="SET-COMMANDS alpha-cmd,beta-cmd")
-    app.wait_until(lambda: len(_catalog(app, host)) == 8, timeout=WAIT, what="the two-command catalog back")
+    app.wait_until(lambda: len(_catalog(app, host)) == len(builtins) + 2, timeout=WAIT,
+                   what="the two-command catalog back")
 
 
 def test_a_hidden_builtin_typed_is_refused_and_nothing_is_sent(app, rig, slashed):
@@ -2304,7 +2655,9 @@ def test_while_a_turn_runs_rows_dim_and_a_prompt_row_queues(app, rig, held):
     """**While working** (plan 029 X7/P29, P23, P26): with a turn held open,
     the rows that wait for the turn are listed DIMMED ("after this turn") —
     `rename`, `exit` and the agent's prompt row are not — and a click on a
-    dimmed `/plan` is refused inline, no `session.set` sent. A PROMPT row
+    dimmed `/plan` is refused inline, no `session.set` sent. So is a valid
+    `/effort low` (plan 032 §3.2), while `/effort bogus` is refused for its
+    level first, in craze's words. A PROMPT row
     queues: `/research deep dive` + Enter goes out as one queued
     `session.prompt` of the row's own spelling, the draft clears, and the
     agent does not read it while the turn holds; released, the agent reads
@@ -2356,6 +2709,24 @@ def test_while_a_turn_runs_rows_dim_and_a_prompt_row_queues(app, rig, held):
     assert _draft(app) == "/", "the draft kept"
     _settle(0.5)
     assert len(rig.sets()) == sets, "nothing sent"
+
+    # `/effort <level>` mid-turn (plan 032 §3.2): the level is judged FIRST —
+    # one that names nothing is refused for that, in craze's words — and a
+    # valid one is refused for the turn, as its dimmed row is. Nothing sent.
+    levels = _effort_levels(app, host)
+    assert levels, "the held session's model has an effort setting: /effort is its row"
+    levels = ", ".join(levels)
+    _type(app, "/effort bogus")
+    _key(app, "Enter")
+    app.wait_until(lambda: (_menu(app) or {}).get("refusal") == f"no effort bogus: one of {levels}",
+                   timeout=20, what="a level naming nothing refused for that, mid-turn")
+    _type(app, "/effort low")
+    _key(app, "Enter")
+    app.wait_until(lambda: (_menu(app) or {}).get("refusal") == "/effort: runs after this turn",
+                   timeout=20, what="a valid level refused for the turn")
+    assert _draft(app) == "/effort low", "the draft kept"
+    _settle(0.5)
+    assert len(rig.sets()) == sets, f"no effort was sent: {rig.sets()[sets:]}"
 
     prompts = len(rig.verbs("session.prompt"))
     _type(app, "/Research   deep dive ")
@@ -2616,6 +2987,268 @@ def test_a_name_at_create_titles_the_session_from_its_first_frame(app, rig):
 
 
 # ---------------------------------------------------------------------------
+# (2e) `/effort` and the effort facts (plan 032 §3.2, §3.3 — C3)
+# ---------------------------------------------------------------------------
+#
+# On the permodel session ((2c)'s, cursor's per-model catalogs): grok-4.6 and
+# claude-opus-5 offer an `effort` select, composer-2.5 none, glm-5.2 a
+# `reasoning` one. Whether `/effort` shows is the shared core's reading of the
+# session's SETTINGS (a current model with an effort option), so a model
+# switch — a settings change alone, the catalog as it was — moves the row.
+# Every change goes out through the rig's proxy (`sets.log`) and reaches the
+# agent's own record (`CRAZE_FAKE_DUMP_CALLS`, `_agent_sets`). An ACP session
+# states no per-model effort facts (they are a native session's), so its model
+# list carries no `effort → <level>` line; the line itself is the unit cells'
+# (`laneSettings.test.mjs`), there being no fake host that states the facts.
+
+#: craze's refusal of a level grok-4.6's effort select does not offer: its
+#: levels, as the agent spells them, and no `default, ` (no effort facts, so
+#: no default level).
+GROK_EFFORT_REFUSAL = "no effort {typed}: one of low, medium, high, xhigh"
+
+
+def _effort_sets(rig: CrazeEnv, before: int) -> list[dict]:
+    """The config `session.set`s the proxy carried since `before`."""
+    return [e["params"]["setting"] for e in rig.sets()[before:]
+            if e["params"]["setting"].get("kind") == "config"]
+
+
+def _option_current(app: TauriClient, host: str, option: str) -> str | None:
+    """The current value of the session's option `option` (`lane.messages`)."""
+    for o in (_messages(app, host).get("settings") or {}).get("options", []):
+        if o["id"] == option:
+            return o["current"]
+    return None
+
+
+def _on_model(app: TauriClient, host: str, model: str) -> None:
+    """Move the session to `model` through the production door (`lane.set`) —
+    a settings change, no new catalog — and wait until the lane has folded it
+    and the PANEL's chip names it: the panel's own read, so the menu the
+    composer filters is the new model's too."""
+    if (_messages(app, host).get("settings") or {}).get("model") != model:
+        _lane(app, "lane.set", host, change={"kind": "model", "id": model})
+    app.wait_until(lambda: (_messages(app, host).get("settings") or {}).get("model") == model,
+                   timeout=WAIT, what=f"the session on {model}")
+    name = next(m["name"] for m in _messages(app, host)["settings"]["models"] if m["id"] == model)
+    app.wait_until(lambda: ((_dump(app) or {}).get("settings_chip") or "").split(" · ")[0] == name,
+                   timeout=20, what=f"the panel's chip on {name}")
+
+
+def test_effort_follows_the_model_with_no_new_catalog(app, rig, permodel):
+    """**`/effort` shows only while the current model has an effort setting**
+    (plan 032 §3.2, PC7): on grok-4.6 it is listed and the lane names its
+    effort option; a switch to composer-2.5 — a settings change, the catalog
+    unchanged — takes the row out of the menu (every other row where it was)
+    and the effort out of the chip, and typed it is refused with the shared
+    core's reason, the draft kept, nothing sent; back on grok-4.6 the row
+    returns where it was."""
+    host = permodel["host"]
+    _menu_ready(app, host)
+    _type(app, "")
+    _on_model(app, host, "grok-4.6")
+    on_grok = _catalog(app, host)
+    assert "effort" in on_grok, on_grok
+    assert _messages(app, host)["effort_option"] == "effort"
+    _type(app, "/")
+    assert "effort" in _names(_wait_menu(app, "/"))
+    _type(app, "")
+
+    before = len(rig.sets())
+    _on_model(app, host, "composer-2.5")
+    view = _messages(app, host)
+    assert _catalog(app, host) == [n for n in on_grok if n != "effort"], \
+        f"only the effort row left: {_catalog(app, host)}"
+    hidden = {h["name"]: h["reason"] for h in view["slash_menu"]["hidden"]}
+    assert hidden.get("effort") == "the current model has no effort setting", hidden
+    assert view["effort_option"] is None, view["effort_option"]
+    assert _dump(app)["settings_chip"] in ("Composer 2.5", "Composer 2.5 · fast"), \
+        f"no effort in the chip: {_dump(app)['settings_chip']}"
+    _type(app, "/")
+    assert "effort" not in _names(_wait_menu(app, "/")), "the composer's menu lists no /effort"
+    _type(app, "/effort")
+    _key(app, "Enter")
+    app.wait_until(lambda: (_menu(app) or {}).get("refusal")
+                   == "/effort: the current model has no effort setting",
+                   timeout=20, what="a typed /effort refused on composer-2.5")
+    assert _draft(app) == "/effort", "the draft is kept"
+    _settle(0.5)
+    assert _effort_sets(rig, before) == [] and _settings(app) is None, "nothing sent, no sheet"
+    _shot(app, "craze-effort-hidden.png")
+
+    _type(app, "")
+    _on_model(app, host, "grok-4.6")
+    assert _catalog(app, host) == on_grok, "the row returns where it was"
+    _type(app, "/")
+    assert "effort" in _names(_wait_menu(app, "/"))
+    _type(app, "")
+
+
+def test_bare_effort_opens_the_sheet_and_no_acp_model_names_an_effort(app, rig, permodel):
+    """**Bare `/effort` is the effort picker: the settings sheet** (plan 032
+    §3.2, PC8): Enter on `/effort` clears the draft and opens the sheet, its
+    effort row the option the lane names; a pick of the row on `/eff` runs it
+    too (it takes no argument here, so a pick runs the completed draft).
+    Nothing is sent. **An ACP session's model list says nothing of effort**
+    (§3.3): no model carries effort facts, and the sheet draws no secondary
+    line under any of them — `secondary` is in the dump, `null`."""
+    host = permodel["host"]
+    _menu_ready(app, host)
+    _type(app, "")
+    _on_model(app, host, "grok-4.6")
+    before = len(rig.sets())
+    _type(app, "/effort")
+    _wait_menu(app, "/effort")
+    _key(app, "Enter")
+    app.wait_until(lambda: bool((d := _settings(app)) and d["session_id"] == host), timeout=WAIT,
+                   what="the settings sheet, opened by /effort")
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the picker clearing the draft")
+    d = _settings(app)
+    assert [r["id"] for r in d["rows"]] == ["model", "effort", "fast", "mode"], d["rows"]
+    effort = _row_of(app, "effort")
+    assert effort["current"] == _option_current(app, host, "effort"), effort
+    assert d["chip"].startswith(f"Grok 4.6 · {effort['current_name']}"), d["chip"]
+
+    models = _messages(app, host)["settings"]["models"]
+    assert all(m.get("effort") is None for m in models), f"an ACP session states no effort facts: {models}"
+    values = _row_of(app, "model")["values"]
+    assert [v["id"] for v in values] == [m["id"] for m in models]
+    assert [v["secondary"] for v in values] == [None] * len(values), \
+        f"no model of an ACP session says where its effort lands: {values}"
+    _shot(app, "craze-effort-sheet.png")
+
+    app.call("ui.close_lane_settings")
+    app.wait_until(lambda: _settings(app) is None, timeout=20, what="the sheet to close")
+    _type(app, "/eff")
+    _wait_menu(app, "/eff")
+    app.call("ui.pick_slash_row", {"name": "effort"})
+    app.wait_until(lambda: bool((d := _settings(app)) and d["session_id"] == host), timeout=WAIT,
+                   what="the settings sheet, opened by a pick of /effort")
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the pick clearing the draft")
+    _settle(0.5)
+    assert len(rig.sets()) == before, f"opening the picker sent nothing: {rig.sets()[before:]}"
+    app.call("ui.close_lane_settings")
+    app.wait_until(lambda: _settings(app) is None, timeout=20, what="the sheet to close")
+
+
+def test_an_effort_level_is_sent_bound_to_its_model_even_the_current_one(app, rig, permodel):
+    """**`/effort <level>` sets the effort from the composer** (plan 032
+    §3.2): `/effort low` sends ONE `session.set` — the lane's effort option,
+    `low`, bound to the model the menu was resolved on (`forModel`) — the
+    agent is asked for it, the session's effort and the chip follow, and the
+    draft clears; no sheet opens. `/effort LOW` matches the level by id in any
+    case, and — `low` now being the current level — is sent all the same
+    (craze's rule: a dropped no-op could lose a concurrent change), where a
+    press on the sheet's current value sends nothing."""
+    host = permodel["host"]
+    calls = permodel["calls"]
+    _menu_ready(app, host)
+    _type(app, "")
+    _on_model(app, host, "grok-4.6")
+
+    def to_level(level):
+        _type(app, f"/effort {level}")
+        _key(app, "Enter")
+        app.wait_until(lambda: _option_current(app, host, "effort") == level, timeout=WAIT,
+                       what=f"the session's effort at {level}")
+        app.wait_until(lambda: _draft(app) == "", timeout=20, what="the draft cleared")
+
+    # The session is module-scoped: start from a known level other than `low`
+    # and leave the effort where it was found, whatever this cell's order.
+    start = _option_current(app, host, "effort")
+    if start == "low":
+        to_level("high")
+    try:
+        before = len(rig.sets())
+        asked = _agent_sets(calls).count("effort=low")
+
+        to_level("low")
+        want = {"kind": "config", "id": "effort", "value": "low", "forModel": "grok-4.6"}
+        assert _effort_sets(rig, before) == [want], _effort_sets(rig, before)
+        assert _agent_sets(calls).count("effort=low") == asked + 1, _agent_sets(calls)
+        app.wait_until(lambda: ((_dump(app) or {}).get("settings_chip") or "").startswith("Grok 4.6 · Low"),
+                       timeout=20, what="the chip at Low")
+        assert (_menu(app) or {}).get("refusal") is None and _settings(app) is None
+
+        _type(app, "/effort LOW")
+        _key(app, "Enter")
+        app.wait_until(lambda: len(_effort_sets(rig, before)) == 2, timeout=WAIT,
+                       what="the current level sent again")
+        assert _effort_sets(rig, before) == [want, want], _effort_sets(rig, before)
+        app.wait_until(lambda: _draft(app) == "", timeout=20, what="the draft cleared")
+        assert (_menu(app) or {}).get("refusal") is None
+        assert _option_current(app, host, "effort") == "low"
+        _shot(app, "craze-effort-set.png")
+    finally:
+        if start and _option_current(app, host, "effort") != start:
+            to_level(start)
+
+
+def test_an_effort_level_naming_nothing_is_refused_in_crazes_words(app, rig, permodel):
+    """**A level the option does not offer is refused with craze's own text**
+    (plan 032 §3.2, PC9): `/effort bogus` reads `no effort bogus: one of low,
+    medium, high, xhigh` — the draft kept, nothing sent. `default` is
+    reserved for the model's default level, which only effort facts state:
+    an ACP session has none, so `/effort default` is refused the same way."""
+    host = permodel["host"]
+    _menu_ready(app, host)
+    _type(app, "")
+    _on_model(app, host, "grok-4.6")
+    assert _effort_levels(app, host) == ["low", "medium", "high", "xhigh"]
+    before = len(rig.sets())
+    for typed in ["bogus", "default"]:
+        _type(app, f"/effort {typed}")
+        _key(app, "Enter")
+        app.wait_until(lambda: (_menu(app) or {}).get("refusal") == GROK_EFFORT_REFUSAL.format(typed=typed),
+                       timeout=20, what=f"/effort {typed} refused")
+        assert _draft(app) == f"/effort {typed}", "the draft is kept"
+        if typed == "bogus":
+            _shot(app, "craze-effort-refused.png")
+    _settle()
+    assert len(rig.sets()) == before, f"nothing was sent: {rig.sets()[before:]}"
+    _type(app, "")
+
+
+def test_glm_reasoning_is_its_effort(app, rig, permodel):
+    """**A `reasoning` select is an effort** (plan 032 §3.2, craze's
+    `EffortOption`): on glm-5.2 the lane names `reasoning` as the effort
+    option, `/effort` is listed and the chip shows its value; `/effort <the
+    other level>` sends a config change of `reasoning`, bound to glm-5.2, and
+    the agent is asked for it. The session goes back to grok-4.6 after."""
+    host = permodel["host"]
+    calls = permodel["calls"]
+    _menu_ready(app, host)
+    _type(app, "")
+    try:
+        _on_model(app, host, "glm-5.2")
+        view = _messages(app, host)
+        assert view["effort_option"] == "reasoning", view["effort_option"]
+        assert "effort" in _catalog(app, host), _catalog(app, host)
+        assert _effort_levels(app, host) == ["high", "max"]
+        current = _option_current(app, host, "reasoning")
+        names = {"high": "High", "max": "Max"}
+        app.wait_until(lambda: (_dump(app) or {}).get("settings_chip") == f"GLM 5.2 · {names[current]}",
+                       timeout=20, what="the chip naming the reasoning value")
+        target = "max" if current != "max" else "high"
+        before = len(rig.sets())
+        _type(app, f"/effort {target}")
+        _key(app, "Enter")
+        app.wait_until(lambda: _option_current(app, host, "reasoning") == target, timeout=WAIT,
+                       what=f"glm-5.2's reasoning at {target}")
+        assert _effort_sets(rig, before) == [
+            {"kind": "config", "id": "reasoning", "value": target, "forModel": "glm-5.2"}], \
+            _effort_sets(rig, before)
+        assert f"reasoning={target}" in _agent_sets(calls), _agent_sets(calls)
+        app.wait_until(lambda: (_dump(app) or {}).get("settings_chip") == f"GLM 5.2 · {names[target]}",
+                       timeout=20, what="the chip following")
+        app.wait_until(lambda: _draft(app) == "", timeout=20, what="the draft cleared")
+        _shot(app, "craze-effort-reasoning.png")
+    finally:
+        _type(app, "")
+        _on_model(app, host, "grok-4.6")
+
+
+# ---------------------------------------------------------------------------
 # (3) the row merge — D4, on this machine
 # ---------------------------------------------------------------------------
 
@@ -2721,11 +3354,17 @@ def _fake_ssh(root: Path) -> str:
       becomes the craze process itself: its recorded pid (`pids/<record>`) is
       the bridge, and signalling it ends the connection the way a dropped ssh
       would (plan 026 §3.2).
-    * Two switches in the JAIL's root (plan 026 §3.2): `probe-127` makes the
+    * Switches in the JAIL's root (plan 026 §3.2): `probe-127` makes the
       find-only probe exit 127 (the ladder's not-found) before running
       anything; `hold-roster` (its content a number N) holds the (N+1)-th
-      `bridge --hub` of that jail — recording its record's name in `held` —
-      until the switch is removed, and lets every other one through.
+      `bridge --hub` of that jail — `--no-start` or not — recording its
+      record's name in `held`, until the switch is removed, and lets every
+      other one through.
+    * **`bridge --hub --no-start`** (plan 032 §3.5) is matched BEFORE the
+      plain bridge: it runs the REAL 0.2.0 bridge with the flag (attach to a
+      running hub, else exit 3 and start none) — unless the jail's `craze-0.1`
+      switch exists, which emulates a craze older than 0.2.0: the flag
+      refused with 0.1.x's own line, exit 1, nothing run.
     """
     return f"""#!/bin/sh
 set -u
@@ -2792,6 +3431,14 @@ if [ ! -d "$jail" ]; then
     printf '%s\\n' "ssh: Could not resolve hostname $dest" >&2
     exit 255
 fi
+case "$cmd" in
+  *"bridge --hub --no-start"*)
+    if [ -e "$jail/craze-0.1" ]; then
+        printf '%s\\n' 'craze bridge: unknown or malformed flag; see craze bridge --help' >&2
+        exit 1
+    fi
+    ;;
+esac
 case "$cmd" in
   *"providers --hub --json"*)
     if [ -e "$jail/probe-127" ]; then
@@ -2930,6 +3577,62 @@ def test_a_remote_hub_is_attached_over_ssh(app_remote):
     assert row["origin"] == "machine:craze-live" and row["source"] == "craze", row
 
 
+def _craze_records(rig: "Remote", user: str) -> list["Record"]:
+    """`user`'s craze commands (roost's own bootstrap steps left out), in
+    order."""
+    return [r for r in rig.records(user) if "craze" in r.text]
+
+
+def _is_probe(text: str) -> bool:
+    return "providers --hub --json" in text
+
+
+def _is_no_start(text: str) -> bool:
+    return "bridge --hub --no-start" in text
+
+
+def _is_plain_bridge(text: str) -> bool:
+    return "bridge --hub" in text and "--no-start" not in text
+
+
+def _live_hubs(env: "CrazeEnv") -> list[int]:
+    """The hubs of `env`'s namespace still running ITS private craze — a
+    record whose pid is gone (a hub stopped by signal) is not one."""
+    return [pid for pid in env.hub_pids() if _program_args(pid).startswith(str(env.real))]
+
+
+def test_a_live_remote_roster_dials_no_start_and_probes_once(app_remote, remote):
+    """**A remote roster attaches with `--no-start`** (plan 032 §3.5): the
+    live machine was probed ONCE, then its roster dialled craze 0.2.0's
+    find-only `bridge --hub --no-start` — no second probe in front of it, and
+    never a plain `bridge --hub`. A lane opened on its row dials the same way
+    with no probe of its own: nothing a background dial runs can start a hub."""
+    machine = "craze-live"
+    app_remote.wait_until(lambda: _craze_state(app_remote, machine).get("state") == "live",
+                          timeout=WAIT, what="the live remote's craze attached")
+    recs = _craze_records(remote, machine)
+    first = next((i for i, r in enumerate(recs) if _is_no_start(r.text)), None)
+    assert first is not None, f"the roster dialled --no-start: {recs}"
+    assert [_is_probe(r.text) for r in recs[:first]] == [True], \
+        f"exactly one probe, then the roster's --no-start: {recs}"
+    assert not any(_is_plain_bridge(r.text) for r in recs), f"a plain bridge --hub ran: {recs}"
+
+    probes = sum(_is_probe(r.text) for r in recs)
+    no_starts = sum(_is_no_start(r.text) for r in recs)
+    args = {"machine": machine, "kind": KIND, "session_id": "0d0d0d0d0d0d"}
+    app_remote.call("lane.open", args)
+    try:
+        app_remote.wait_until(lambda: app_remote.call("lane.messages", args)["generation"] >= 1,
+                              timeout=WAIT, what="the seeded remote craze lane")
+        recs = _craze_records(remote, machine)
+        assert sum(_is_no_start(r.text) for r in recs) > no_starts, \
+            f"the lane dialled --no-start: {recs}"
+        assert sum(_is_probe(r.text) for r in recs) == probes, f"the lane asked no probe: {recs}"
+        assert not any(_is_plain_bridge(r.text) for r in recs), recs
+    finally:
+        app_remote.call("lane.close", args)
+
+
 def test_no_remote_hub_is_born_while_dormant(app_remote, remote):
     """**Attach-only** (plan 025 §3.6.1): a remote machine with craze and NO hub
     stays dormant — the fake ssh recorded the find-only probe and never a
@@ -3026,6 +3729,159 @@ def test_the_sheet_on_a_dormant_machine_starts_its_hub_and_attaches(app_remote, 
     assert "Name" in _sheet(app_remote)["values"], _sheet(app_remote)["values"]
     _shot(app_remote, "craze-create-dormant.png")
     _close_sheet(app_remote)
+
+
+# ---------------------------------------------------------------------------
+# (5b) `--no-start` (plan 032 §3.5, W5): the race closed, and the fallback
+# ---------------------------------------------------------------------------
+
+#: Two remote machines, each with a hub running BEFORE launch (the harness's
+#: own bridge holds it) and its switch set before the app's first dial:
+#: `craze-race`'s roster dial is HELD (`hold-roster` 0) so the cell can end
+#: its hub between the probe and the bridge; `craze-legacy` emulates a craze
+#: older than 0.2.0 (`craze-0.1`: `--no-start` refused).
+RACE_MACHINE = "craze-race"
+LEGACY_MACHINE = "craze-legacy"
+LEGACY_FAKE_HOST = "0b0b0b0b0b0b"
+NO_START_JAILS = ((RACE_MACHINE, "recipe"), (LEGACY_MACHINE, "recipe"))
+NO_START_CONFIG = f"""servers:
+    mock:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: mock
+sheds: {{}}
+machines:
+    {RACE_MACHINE}:
+        host: craze-host
+        user: {RACE_MACHINE}
+    {LEGACY_MACHINE}:
+        host: craze-host
+        user: {LEGACY_MACHINE}
+"""
+#: The app's log line when a host's dial falls back (`SshCrazeDial::fall_back`).
+FELL_BACK = "does not know `bridge --hub --no-start`"
+
+
+@pytest.fixture(scope="module")
+def no_start_rig(bins):
+    """The fake ssh, the two jails, their hubs and their switches."""
+    r = Remote(bins, jails=NO_START_JAILS, prefix="shcn-")
+    holders: dict[str, Bridge] = {}
+    try:
+        r.jails[LEGACY_MACHINE].fake_host(LEGACY_FAKE_HOST, "craze-legacy-fake")
+        for name, _ in NO_START_JAILS:
+            holders[name] = r.jails[name].bridge()
+            assert holders[name].call("hello", HELLO)["endpoint"]["kind"] == "hub"
+        (r.jails[RACE_MACHINE].root / "hold-roster").write_text("0")
+        (r.jails[LEGACY_MACHINE].root / "craze-0.1").touch()
+        r.holders = holders  # type: ignore[attr-defined]
+        yield r
+    finally:
+        for env in r.jails.values():
+            for switch in ("hold-roster", "craze-0.1"):
+                (env.root / switch).unlink(missing_ok=True)
+        for holder in holders.values():
+            holder.close()
+        left = r.teardown()
+        assert not left, f"craze processes left behind: {left}"
+
+
+@pytest.fixture(scope="module")
+def app_no_start(no_start_rig, mock):
+    """No local craze; the two W5 machines through the fake ssh."""
+    runtime_dir = Path(tempfile.mkdtemp(prefix="shns-", dir="/tmp")).resolve()
+    config = no_start_rig.root / "config.yaml"
+    config.write_text(NO_START_CONFIG)
+    started = _launch(mock, runtime_dir=runtime_dir, craze=None, roost=None,
+                      ssh_bin=no_start_rig.ssh, config=config)
+    client = started[0]
+    client.log_path = runtime_dir / "craze-ui.log"  # type: ignore[attr-defined]
+    try:
+        yield client
+    finally:
+        _stop(*started)
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+def test_a_hub_gone_between_the_probe_and_the_bridge_leaves_the_source_dormant(
+        app_no_start, no_start_rig):
+    """**The race is closed** (plan 032 §3.5): the probe finds the hub, the
+    roster's dial is held, and the hub is ended before that dial runs. The
+    dial is `bridge --hub --no-start`, so it finds no hub and starts none
+    (exit 3): the source goes DORMANT — no row listed — and NO hub is born
+    (the jail's hub count stays 0). Its next craze command is a probe, on the
+    30 s dormant clock, not a redial."""
+    app = app_no_start
+    jail = no_start_rig.jails[RACE_MACHINE]
+    app.wait_until(lambda: (jail.root / "held").exists(), timeout=WAIT,
+                   what="the roster's dial to be held behind the probe")
+    recs = _craze_records(no_start_rig, RACE_MACHINE)
+    held = (jail.root / "held").read_text().strip()
+    assert [r.name for r in recs if not _is_probe(r.text)] == [held], recs
+    assert _is_no_start(recs[-1].text) and _is_probe(recs[0].text), recs
+    assert _craze_state(app, RACE_MACHINE).get("state") != "live"
+
+    # The hub goes, between the probe that saw it and the bridge behind it.
+    no_start_rig.holders[RACE_MACHINE].close()
+    jail.sigterm_hub()
+    deadline = time.monotonic() + scaled_timeout(WAIT)
+    while _live_hubs(jail) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not _live_hubs(jail), "the hub did not stop"
+
+    (jail.root / "hold-roster").unlink()
+    released = time.monotonic()
+    app.wait_until(lambda: _craze_state(app, RACE_MACHINE).get("state") == "dormant",
+                   timeout=WAIT, what="the source to go dormant on the bridge's exit 3")
+    assert not _rows(app, RACE_MACHINE), "dormant: nothing listed"
+    assert not _live_hubs(jail), "the find-only bridge started a hub"
+
+    seen = len(_craze_records(no_start_rig, RACE_MACHINE))
+    app.wait_until(lambda: len(_craze_records(no_start_rig, RACE_MACHINE)) > seen,
+                   timeout=45, what="the dormant source's next craze command")
+    after = _craze_records(no_start_rig, RACE_MACHINE)[seen:]
+    assert all(_is_probe(r.text) for r in after), f"dormant: only the probe: {after}"
+    assert time.monotonic() - released >= 20, "the dormant clock, not a redial's backoff"
+    assert not _live_hubs(jail), "still no hub"
+    assert not any(_is_plain_bridge(r.text)
+                   for r in _craze_records(no_start_rig, RACE_MACHINE)), "a plain bridge ran"
+    _shot(app, "craze-no-start-race.png")
+
+
+def test_a_craze_older_than_0_2_falls_back_once_and_goes_live(app_no_start, no_start_rig):
+    """**A craze older than 0.2.0 falls back, once** (plan 032 PC12): its
+    roster's `--no-start` is refused (0.1.x's own line, exit 1), the host's
+    ONE dial swaps to the older way — the probe, then `bridge --hub` — and
+    the roster goes live with its row. A lane opened on that row dials the
+    older way too: `--no-start` was sent exactly once, and the app said so
+    once."""
+    app = app_no_start
+    machine = LEGACY_MACHINE
+    app.wait_until(lambda: _craze_state(app, machine).get("state") == "live",
+                   timeout=WAIT, what="the 0.1.x machine live through the fallback")
+    app.wait_until(lambda: _row(app, LEGACY_FAKE_HOST, machine=machine), timeout=WAIT,
+                   what="its fake host's row")
+    recs = _craze_records(no_start_rig, machine)
+    kinds = ["probe" if _is_probe(r.text) else "no-start" if _is_no_start(r.text)
+             else "bridge" if _is_plain_bridge(r.text) else r.text for r in recs]
+    assert kinds[:4] == ["probe", "no-start", "probe", "bridge"], kinds
+
+    args = {"machine": machine, "kind": KIND, "session_id": LEGACY_FAKE_HOST}
+    app.call("lane.open", args)
+    try:
+        app.wait_until(lambda: app.call("lane.messages", args)["generation"] >= 1,
+                       timeout=WAIT, what="the seeded lane on the 0.1.x machine")
+        recs = _craze_records(no_start_rig, machine)
+        assert sum(_is_no_start(r.text) for r in recs) == 1, f"--no-start once: {recs}"
+        assert sum(_is_plain_bridge(r.text) for r in recs) == 2, \
+            f"the roster's and the lane's plain bridge: {recs}"
+        assert _is_probe(recs[-2].text) and _is_plain_bridge(recs[-1].text), \
+            f"the lane's dial probed first: {recs}"
+    finally:
+        app.call("lane.close", args)
+    log = app.log_path.read_text(errors="replace")
+    assert log.count(FELL_BACK) == 1, f"the fallback is logged once: {log.count(FELL_BACK)}"
 
 
 # ---------------------------------------------------------------------------
@@ -3208,8 +4064,8 @@ def test_a_dormant_shed_offers_craze_on_its_row(app_shed, shed_rig):
         assert all(d["note"] is None for d in seen), \
             f"the sheet read the unlisted shed as without craze: {[d['note'] for d in seen]}"
         # The first bridge --hub is the sheet's: none ran before the click, no
-        # hub ran (a probe-gated roster dial cannot run one without a hub), and
-        # the second — the one held — is the roster's.
+        # hub ran (a roster dial — `--no-start`, plan 032 — never starts one),
+        # and the second — the one held — is the roster's.
         bridges = [r for r in shed_rig.records(name) if "bridge --hub" in r.text]
         held = (jail.root / "held").read_text().strip()
         assert len(bridges) >= 2 and bridges[0].name != held and bridges[1].name == held, \

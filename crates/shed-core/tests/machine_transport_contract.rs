@@ -143,9 +143,11 @@ fn every_element_is_always_quoted_never_conditionally() {
 }
 
 /// **The corpus pins the production craze command** (plan 025 C5): the
-/// `craze-bridge-hub` and `craze-providers-hub` scenarios' argv EQUAL what
-/// `shed_core::craze` composes — the remote command every craze hub
-/// connection and every find-only probe actually sends.
+/// `craze-bridge-hub`, `craze-bridge-hub-no-start` (plan 032 C6) and
+/// `craze-providers-hub` scenarios' argv EQUAL what `shed_core::craze`
+/// composes — the remote command every craze hub connection, every
+/// attach-only background connection and every find-only probe actually
+/// sends.
 ///
 /// Without this the two scenarios would be quoting fixtures that merely look
 /// like the command: the composer could change (a rung moved, the exec PATH
@@ -171,6 +173,12 @@ fn the_craze_scenarios_are_the_production_composers_argv() {
          scenario at the composer's output and re-record both goldens"
     );
     assert_eq!(
+        argv_for("craze-bridge-hub-no-start"),
+        shed_core::craze::bridge_hub_no_start_argv(),
+        "craze-bridge-hub-no-start is not shed_core::craze::bridge_hub_no_start_argv() — \
+         re-point the scenario at the composer's output and re-record both goldens"
+    );
+    assert_eq!(
         argv_for("craze-providers-hub"),
         shed_core::craze::providers_hub_argv(),
         "craze-providers-hub is not shed_core::craze::providers_hub_argv() — re-point \
@@ -183,5 +191,11 @@ fn the_craze_scenarios_are_the_production_composers_argv() {
         wire["craze-bridge-hub"].as_str(),
         Some(shed_core::craze::bridge_hub_command().as_str()),
         "goldens/wire.json's craze-bridge-hub is not shed_core::craze::bridge_hub_command()"
+    );
+    assert_eq!(
+        wire["craze-bridge-hub-no-start"].as_str(),
+        Some(shed_core::craze::bridge_hub_no_start_command().as_str()),
+        "goldens/wire.json's craze-bridge-hub-no-start is not \
+         shed_core::craze::bridge_hub_no_start_command()"
     );
 }

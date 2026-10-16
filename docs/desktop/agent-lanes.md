@@ -77,8 +77,23 @@ two facts apart:
 
 A lane that ended with `unknown_session`, `session_closed` or
 `start_failed:<cause>` is never reopened: the session is gone, closed or never
-started. Any other `Down` (the agent restarted, a reconnect bound ran out) is
-reopened with a short backoff.
+started. Neither is one the desktop ended itself — `session_gone`, `hub_gone`
+or `host_removed` (see [A lane outlives its row](#a-lane-outlives-its-row)).
+Any other `Down` (the agent restarted, a reconnect bound ran out) is reopened
+with a short backoff.
+
+The desktop keeps a third fact apart from both, **finished**: the lane is
+over for good — one of those final reasons arrived, and nothing will reopen
+it. `lane.messages` answers it as `finished`. A finished lane stays on screen
+and readable (its transcript, approvals and last settings) but holds no
+connection, however it finished — the session's own final event included: its
+subscription, its adapter and its share of any SSH forward are released (the
+last share out tears the forward down). Every verb on it is refused
+`lane_ended` ("the session has ended") at once — a verb already under way when
+the lane finished runs its course — and the panel disables its composer, Send,
+Interject and Cancel. `ended` alone is not
+enough to key that on: a retryable `Down` sets it too, and the desktop is
+already resubscribing behind it.
 
 A source streams the same way: `Reset` … `Session`* … `Capabilities` …
 `Ready`, then upserts and removals. Its outage is the non-terminal `Offline`
@@ -117,7 +132,8 @@ says so on its row. A shed without craze says nothing.
 - **Every other host is attach-only.** The desktop never starts a hub on
   another machine in the background. While a host has no hub, its source runs
   only a find-only probe, `craze providers --hub --json`, which never starts
-  one; the roster connection opens once the probe finds a hub.
+  one; the roster connection opens once the probe finds a hub, and it too is
+  find-only (`craze bridge --hub --no-start`, below).
 
 A remote host's source cycles through these states (this machine's is live,
 offline or absent, and retries its roster connection rather than probing —
@@ -125,29 +141,46 @@ every 30 s while craze is not installed or too old):
 
 | State | Meaning | What runs |
 |---|---|---|
-| `live` | Attached to the hub's roster | One `craze bridge --hub` roster connection |
-| `dormant` | craze is there, no hub is running; nothing is listed from craze (a dormant shed is offered New craze session without being listed) | The probe again every 30 s |
+| `live` | Attached to the hub's roster | One roster connection: `craze bridge --hub --no-start` (craze 0.2.0 and later), or the probe and then `craze bridge --hub` for an older craze |
+| `dormant` | craze is there, no hub is running — the probe said so, or the roster's own `--no-start` connection found none; nothing is listed from craze (a dormant shed is offered New craze session without being listed) | The probe again every 30 s |
 | `offline` | The roster dropped, the probe could not ask (`cause: unreachable`), or craze is too old (`cause: too_old`) | The probe: about a second after a live roster ends, on a backoff (1 s → 30 s) while the host is unreachable, every 30 s while craze is too old |
 | `absent` | Never reached, or craze is not installed (`cause: not_installed`) | The probe; every 30 s while craze is not installed |
 
-**Every remote `bridge --hub` is probe-gated.** The dial itself runs the probe
-on the same SSH ControlMaster before it starts the bridge, and gives up when
-no hub is running — so neither the roster's redials nor a lane's background
-reconnects can start a hub. Only two explicit actions start one on a remote
-host: opening the create sheet (its provider list) and creating a session.
-After either, the host's source probes at once and attaches to the new hub.
-(Open in terminal runs `craze attach`, which joins the session over the
-session's own control socket and starts nothing.)
+**No background connection can start a remote hub.** Every remote connection
+the desktop makes on its own — the roster's, its redials, and every lane's
+background reconnects — runs craze 0.2.0's `craze bridge --hub --no-start`,
+which attaches to a hub that is already running and otherwise exits 3
+(`craze bridge: no hub is running`) without starting one. When the roster's
+connection gets that answer, the source goes `dormant` (its rows leave with
+the hub) and probes again 30 s later; a lane stays stale and retries within
+its own bound. There is no probe in front of each connection: the connection
+itself cannot start a hub. Only the create sheet's explicit actions start one
+on a remote host, and only they run plain `craze bridge --hub`: opening it
+(its provider list), creating a session, and its Resume half (listing saved
+sessions, resuming one). After any of them, the host's source probes at once
+and attaches to the new hub. A "no hub" answer from a probe or roster
+connection that started before a create or resume listed its session is not
+believed: it may predate the hub that action started, so the source asks
+again at once instead of going `dormant`. (Open in terminal runs `craze
+attach`, which joins the session over the session's own control socket and
+starts nothing.)
 
-One race is accepted rather than closed: the probe sees a hub that exits
-before the bridge behind it joins, and the bridge starts a new one. craze
-SF-152 (a find-only `bridge --hub`) removes the race and the probe both.
+**An older craze falls back.** A craze older than 0.2.0 refuses the flag
+(`craze bridge: unknown or malformed flag`). The host's connections then fall
+back together, once, for as long as the desktop keeps that host's source
+(until the host is removed and added again, or the app restarts): each runs
+the probe on the same SSH ControlMaster first and starts `craze bridge --hub`
+only when a hub is running. On that path one race remains, accepted rather
+than closed: the probe sees a hub that exits before the bridge behind it
+joins, and the bridge starts a new one. craze 0.2.0's `--no-start` is what
+closes it — update craze on that host.
 
 ### Reaching craze: the remote command
 
-Every connection to a hub runs `craze bridge --hub` through one composed
-`sh -c` line (`shed_core::craze`): craze's published binary-finding ladder,
-verbatim, which tries, in order:
+Every connection to a hub runs `craze bridge --hub` — or, for a remote
+host's background connections, `craze bridge --hub --no-start` (above) —
+through one composed `sh -c` line (`shed_core::craze`): craze's published
+binary-finding ladder, verbatim, which tries, in order:
 
 1. `$HOME/.local/bin/craze` (only when `HOME` is absolute)
 2. `craze` on the PATH (`command -v`, absolute results only)
@@ -323,6 +356,65 @@ transcript closed while the stop was still in flight leaves no lane to see the
 close, so the stop's receipt says it instead. The source then tells the
 desktop to re-read the listing, since no roster frame will.
 
+### Resuming a saved session
+
+A craze machine remembers the sessions it ran. A **saved** session is one it
+remembers that nothing runs now, and craze 0.2.0 can run one again: the hub's
+`sessions.saved` lists them and `session.reopen` starts a host that loads one
+(or joins the host already serving it).
+
+The create sheet shows a **New | Resume** control when the create options it
+just read say the hub can reopen (`reopen`, from the same hub `hello`). That
+covers a dormant machine too: opening the sheet starts its hub, and the
+control appears once that hub answers. A hub from before craze 0.2.0 shows no
+control. A hub from before 0.2.0 can keep running after craze is upgraded,
+until it is idle. Asked anyway (the `craze.saved` or `craze.reopen` op), it is
+refused `unavailable` in one wording, "this craze hub (craze <version>) does
+not offer reopening saved sessions". The version reads `version unknown` when
+the app has not read it, and a hub that says a version below 0.2.0 and its
+pid gets the remedy too: end it with `kill <pid>`.
+
+The sheet opens on New. **Resume** reads the saved list the first time it is
+chosen after the sheet opens, as the create options are read: nothing is
+cached. The list is craze's, newest first, at most 50 ("Showing the 50 most
+recent." when craze left some out). Each row shows:
+
+- the session's title, or "Untitled";
+- its provider;
+- its workspace, with the home directory shortened to `~` where the app knows
+  it: this machine's own home, and a shed's `/home/shed`. A machine reached
+  over SSH shows the full path, because the app never learns its home;
+- how long ago it was last active;
+- a **Resume** button.
+
+Resuming runs one reopen at a time. While it runs, its row reads "Resuming…
+(this can take a few minutes)" and every other button, the New | Resume
+control included, is disabled. It can take minutes: a provider's load replays
+the session, and the app allows craze 200 s per answer and sends a lost answer
+again once. Closing the sheet stops waiting, never the reopen; its session
+appears as a row, and the sheet opened again shows the reopen still running.
+
+That state is bound to the machine's **incarnation**, not just its name. A
+machine removed and added again under the same name (a shed restarted out
+from under the app, say) is a new one. Every machine status names its
+incarnation (`craze.source_gen`), and the app resets the state as soon as a
+status names a newer one, whether or not the sheet is open. It does not wait
+for the sheet's create options, which can fail to load. So the new
+incarnation's sheet opens fresh, never locked by a reopen the old one left
+running, and that reopen's late answer is dropped without opening anything.
+
+When the create options fail to load, the sheet says so with a **Retry** in
+whichever half shows, Resume included. The Retry works while a reopen runs.
+
+| Outcome | What the sheet does |
+|---|---|
+| Resumed | The sheet closes and the session's transcript opens at once. The row is listed before any roster frame names it, the same way a created session's is. A lane already open on that session that was departing is live again. If that session's transcript is already on screen, ended (a host that outlived its hub, rejoined), it opens again in place on a fresh lane. |
+| Resumed, but the machine was removed (or removed and added again) meanwhile | Nothing opens: the answer came through the machine's old connection, which the transcript cannot open through. The row stays and says so ("Resume again to open it"); resuming again joins the running session. A sheet not on screen says it in a toast. If a status has already named the new incarnation, the state has started afresh and the answer is dropped instead, as described above. |
+| `gone` | The session cannot run here any more (no such session, or its directory is gone). The row is dropped, and the sheet says why where it was. |
+| `start_failed` | The session was found and failed to start. craze's cause shows inline, verbatim, and the row stays. |
+| `unavailable` | Transient: craze is busy or closing, or the answer was lost twice ("Retry is safe": a reopen of a running session joins it). The reason shows inline, and the row's button reads Retry. |
+| Anything else | The error shows inline, and the row stays. |
+
 ### Open in terminal
 
 Open in terminal opens a roost tab on the session's host running
@@ -374,8 +466,8 @@ the craze session id every later call uses), then `session.attach`.
   The panel keeps a Send's text after `outcome_unknown` and says to check the
   transcript before sending again.
 - **Stop** ends the session, not just the transcript, behind an inline
-  confirm. craze answers with a receipt; the lane ends with `session_closed`
-  and the row leaves.
+  confirm. craze answers with a receipt; the row leaves, and the lane ends
+  with `session_closed` — usually just after the row, see below.
 - **End tab and Stop are different on a row hosted in a TUI.** **End tab**
   closes only that roost tab; the session keeps running in craze's hub, and its
   row stays (without the tab). **Stop** is what ends the session.
@@ -395,6 +487,57 @@ on its own), a cancelled turn, errors and "restored" after a replay draw rows
 in craze's own wording. A snapshot whose window was cut opens with one "earlier transcript
 omitted" row. Only the main agent draws rows: a sub-agent's events and
 transcript are not shown.
+
+### A lane outlives its row
+
+craze 0.2.0 marks a stopping session's host `stopping` before its engine
+closes, and the hub drops the row on its next roster round (once a second) —
+usually **before** the session's last events and its `session_closed` reach
+the lane on its own connection. craze promises that connection runs on to the
+session's end, and nothing orders the two connections. So the desktop does
+not end a craze lane when its row leaves; the lane **departs**:
+
+- **The grace.** The lane keeps its own connection for **10 seconds**. A
+  final `Down` inside it — the normal Stop: the closing rows, then
+  `session_closed` — ends the lane exactly as a normal end does, with every
+  last row on screen.
+- **A return.** A row listed again inside the grace (a reseed that briefly
+  dropped it, a hub that came back, or a create or resume that answers with
+  it, such as a resume that rejoins a host which outlived its hub) cancels the
+  departure: the lane never let its connection go. That holds even for an
+  answer that arrives after the hub really went (the source went dormant
+  while the create or resume ran), a deliberate bias toward never ending a
+  running session's panel: if that hub stays gone, the lane ends `hub_gone` a
+  grace after the next probe finds no hub, or, with the machine unreachable,
+  when its dials give up 10 minutes in. A row that leaves again later gets a
+  fresh grace; a repeated removal during one absence never extends it.
+  Departures and returns apply in the order they happened, however late one
+  reaches the lane: a return reported before a departure never revives the
+  lane that departure departed, and a departure from before a return never
+  departs the lane again. **End tab** departs no lane: the session runs on in
+  its host after its tab closes, and a session that does end leaves the roster
+  on the hub's next round.
+- **The end.** Otherwise the grace's end ends the lane itself, with a final
+  reason the banner shows (`ended · <reason> — showing the last known
+  transcript`): **`session_gone`** when the roster removed the row (a
+  `Removed`, or a reseed without it), or
+  **`hub_gone`** when the row left with the hub (the source went dormant).
+  That includes a just-created or just-resumed session's row that no roster
+  had listed yet.
+  10 s only bounds the worst case: a host that died without a final event
+  answers the lane's redial with `unknown_session` well before it.
+- **Host removed.** A machine removed from the config, or a shed that
+  stopped, ends every lane of its craze source at once with
+  **`host_removed`** — no grace: the source that could list the row again is
+  gone.
+
+An ended lane releases its connection (and on a remote host its ssh exec),
+whatever ended it, but stays readable until its panel closes. `lane.open` on it answers the ended
+lane while its row stays gone, and opens a fresh lane once the row is listed
+again (the old one is replaced only when the new open succeeds). Closing the
+panel removes it. The app's orderly shutdown counts these finished lanes too
+(its lanes phase line reads `lanes=<n> (finished=<n>) … graces=<n>`, the
+grace timers joined alongside the subscriptions).
 
 ### The `/` menu
 
@@ -423,15 +566,34 @@ the panel only renders and handles keys.
   craze's update arrives. A mode row (`/plan`, `/ask`, `/agent`) changes the
   mode at once, even to the mode it is in. `/exit` opens Stop's confirm.
   `/model` opens the settings sheet's model list (no inline model yet).
+- **`/effort [<level>]`** (craze 0.2.0) is listed only while the current
+  model has an effort setting — a select whose id or name says effort or
+  reasoning (glm's `reasoning` counts), the same option the chip shows. A
+  model switch alone moves it: on a model with no effort setting the row
+  leaves the menu, and typing it says "the current model has no effort
+  setting". Bare, `/effort` opens the settings sheet (its effort row). With
+  a level it sets the effort at once, bound to the model you saw (a model
+  that changed meanwhile is refused like a stale sheet change). The level
+  matches by id exactly, then by id in any case, then by name; one that
+  names nothing — or more than one — is refused with craze's own words,
+  `no effort <typed>: one of <levels>`, and the draft is kept. `default` is
+  the model's default level, known only from a native session's effort
+  facts; elsewhere it is refused the same way. A level is sent even when it
+  is the current one (craze's rule: a dropped no-op could lose a concurrent
+  change) — unlike a press on the sheet's current value, which sends
+  nothing.
 - **While a turn runs**, a row that cannot run until it ends (a mode,
-  `/model`) is shown dimmed, "after this turn", and choosing it says so —
-  rather than hidden, because the limit is temporary.
+  `/model`, `/effort`) is shown dimmed, "after this turn", and choosing it
+  says so — rather than hidden, because the limit is temporary. A
+  `/effort <level>` is checked first: a level that names nothing is refused
+  for that, a valid one for the turn.
 - **Refused here, never sent.** A builtin this client does not run yet
   (`/help`, `/clear`, `/btw` and craze's other local rows) is refused with a
   reason when typed and sent — not passed to the agent as text. So is an
   argument to a row that takes none, and `/rename` with no title.
-- **The draft.** It clears when a command succeeds and when `/model` opens the
-  sheet; it stays — with craze's words, or the reason — when a command is
+- **The draft.** It clears when a command succeeds and when `/model` or a
+  bare `/effort` opens the sheet; it stays — with craze's words, or the
+  reason — when a command is
   refused, when its answer is lost ("may have applied — check the session"),
   and when Stop's confirm is answered Keep. A rename craze made but could not
   record shows as a warning, the draft cleared. A command only ever clears the
@@ -472,10 +634,20 @@ as malformed leaves the ask open (`bad_request`).
 On a session whose capabilities say `settings`, the transcript header carries
 a chip — `<model name> · <effort value> · fast`, from the current values, each
 part only when the session has it ("fast" only when it is on) — and the chip
-opens one sheet:
+(or `/model`, or a bare `/effort`) opens one sheet. Which option is the
+effort is craze's own rule (a select whose id or name says effort or
+reasoning, the id `effort` first), read once by the shared core — the same
+option `/effort` sets.
 
 - **Model** — a list, in craze's order: the current model, then the models
-  you used recently, then the rest of the catalog.
+  you used recently, then the rest of the catalog. On a native session each
+  model other than the current one carries a dim second line, `effort →
+  <level>`: the level a switch to it lands on — that model's last effort in
+  this session, else the one craze remembers for it, else its default — for
+  a native model switch moves the effort with the model. A model that says
+  neither shows no line, nor does the current model (its effort row shows
+  its effort). Only a native session states these effort facts, so on any
+  other session no model shows a line.
 - **Options** — the current model's own, `thought_level` first, then
   `model_config`, each in the provider's order. Four values or fewer are a
   segmented control; more are a list.
@@ -527,8 +699,9 @@ SF-126).
   SSH-born hub (every session runs on), then `craze ps` in a terminal on the
   Mac starts one in the GUI session.
 
-A GUI-session hub reachable over SSH (craze SF-130) and a find-only
-`bridge --hub` (SF-152) are open craze follow-ups.
+A GUI-session hub reachable over SSH (craze SF-130) is an open craze
+follow-up. The find-only `bridge --hub --no-start` (SF-152) shipped in craze
+0.2.0, and every background remote connection runs it.
 
 ## opencode
 
@@ -751,28 +924,30 @@ namespaces.
 
 | Op | Does |
 |---|---|
-| `lane.open` | Ensures a subscription (idempotent — a second call for an already-open lane re-answers from the existing entry) and answers the session row as the source listed it at the open. |
-| `lane.messages` | The staged transcript: up to the last 500 rows, current activity, the live session row (`session`, `null` until the first seed), generation, a `stale` reason when the lane is not live, `ended` once its subscription is over, and the session's `capabilities` and `settings` — the only place the panel reads what the session can do. The panel's header reads the live row too: `lane.open`'s is re-answered unchanged while the lane stays open, and for a session opened the moment its create answered it is the create's own, with no permission mode. |
+| `lane.open` | Ensures a subscription (idempotent — a second call for an already-open lane re-answers from the existing entry) and answers the session row as the source listed it at the open. A craze lane whose row has left (departing, or finished) is answered as it is; a finished one whose row is listed again is replaced by a fresh lane once that open succeeds. |
+| `lane.messages` | The staged transcript: up to the last 500 rows, current activity, the live session row (`session`, `null` until the first seed), generation, a `stale` reason when the lane is not live, `ended` once its subscription is over, `finished` once the lane is over for good (every verb then answers `lane_ended`), and the session's `capabilities` and `settings` — the only place the panel reads what the session can do. The panel's header reads the live row too: `lane.open`'s is re-answered unchanged while the lane stays open, and for a session opened the moment its create answered it is the create's own, with no permission mode. |
 | `lane.approvals` | Pending approvals, oldest first (`created_at`, then `id`): for opencode the root session's and its children's, for craze every open ask in the session's registry, a sub-agent's included. |
 | `lane.send` | Queues a prompt (`mode: queue`), or preempts the turn in flight (`mode: interject`) when the lane advertises `interject` — the panel shows the toggle only then, and only enables it while the turn is `Working`. |
 | `lane.cancel` | Aborts the turn in flight. The panel offers Cancel only when the session's streamed `capabilities.cancel` is true, and enables it only while the session is `Working`. |
 | `lane.answer` | Answers one approval. Four forms, exactly one per answer and nothing beside it (any other key — say an `option_id` next to `permission` — is `bad_request`, so an answer can never execute as something other than what it reads as): `{choice: "<id>"}` — the exact option id the approval offered, which is what the panel always sends (see [the ambiguity refusal](#an-ambiguous-decision-is-refused-never-guessed)); the scripted `{permission: "allow-once" \| "allow-always" \| "reject"}`, which resolves by semantic kind and refuses an ambiguous one; `{question: [[…]]}`, optionally with `custom_text` beside it (see [Free-text answers](#free-text-answers)); and `{reject: true}`. |
 | `lane.stop` | Ends the SESSION (craze's `session.stop`), not just the transcript: answered on craze's receipt, after which the lane ends and the row leaves. The panel offers Stop only when the session's `capabilities.stop` is true, behind an inline confirm. |
-| `lane.settings` | The session's settings, read now — the model and models in craze's order, the mode and modes, the current model's own options and the usage. The panel renders the stream's copy, `lane.messages`' `settings`. |
+| `lane.settings` | The session's settings, read now — the model and models in craze's order, the mode and modes, the current model's own options and the usage. The panel renders the stream's copy, `lane.messages`' `settings`. A finished lane answers the last settings it stated, with no call to the agent. |
 | `lane.set` | Changes one setting: `{kind: "model"\|"mode", id}` or `{kind: "config", id, value, for_model?}` (craze's `session.set`; `for_model` is the model the client displayed, else the lane's folded one). The new value arrives on the stream; craze's `stale_model` is `not_accepting`, and an answer lost to a drop is `outcome_unknown` — never resent. |
 | `lane.set_title` | Renames the SESSION (craze's `session.setTitle`; the composer's `/rename`): the title trimmed, a blank one refused unsent. The new title arrives on the stream; `{warning}` is a rename craze made but could not record. Refused by a session whose `capabilities.set_title` is false. |
-| `lane.close` | Ends the subscription; the last close on a shared SSH forward tears it down. |
+| `lane.close` | Ends the subscription and removes the lane, whether it is live, departing or finished; the last close on a shared SSH forward tears it down. |
 
 A failure comes back as `{code, message}` with the contract's own snake_case
 codes (`unauthorized`, `unknown_session`, `unknown_approval`,
 `already_submitted`, `already_resolved`, `not_accepting`, `unavailable`,
 `failed`), plus `no_lane` for a row with no `agent_lane` stamp at all,
 `unsupported_lane` for a row whose `agent_lane.kind` names no adapter this
-build has, and `outcome_unknown` for a craze verb whose answer was lost with its
-connection (it may have run, and it is never resent).
+build has, `outcome_unknown` for a craze verb whose answer was lost with its
+connection (it may have run, and it is never resent), and `lane_ended` for a
+verb (`lane.send`, `lane.cancel`, `lane.answer`, `lane.set`, `lane.set_title`,
+`lane.stop`) on a finished lane — refused at once, never sent.
 
-The craze ops — `craze.create_options`, `craze.create`, `craze.open_terminal`
-— the UI-truth dumps (`lane.dump`, `lane_settings.dump`, `craze_create.dump`)
+The craze ops — `craze.create_options`, `craze.create`, `craze.saved`,
+`craze.reopen`, `craze.open_terminal` — the UI-truth dumps (`lane.dump`, `lane_settings.dump`, `craze_create.dump`)
 and the test-mode doors are listed in [IPC](ipc.md#craze-sessions-tauri).
 
 ## A stalled client and the channel bound
@@ -816,8 +991,10 @@ lane reseeds.
 - **No model, effort or permission mode at create.** A session starts on its
   provider's defaults; change the model and options from the settings sheet
   afterwards.
-- **Running sessions only.** The hub lists running sessions; a saved session
-  cannot be resumed from the desktop (craze#88).
+- **Saved sessions: the 50 most recent, no filter.** The sheet's Resume half
+  lists the 50 most recent saved sessions, with no workspace filter and no
+  sub-agent sessions; a reopen in flight cannot be cancelled (closing the
+  sheet stops waiting, not the reopen). Resume needs craze 0.2.0 or later.
 - **No sub-agent transcripts.** A sub-agent's asks are answerable; its own
   messages are not shown.
 - **No queue editing,** no send-now.

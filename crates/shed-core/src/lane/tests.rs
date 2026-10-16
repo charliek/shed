@@ -975,6 +975,20 @@ fn both_traits_are_object_safe_and_the_lane_is_session_scoped() {
         rt.block_on(source.create(request)).unwrap_err(),
         "the default create_held answers what create does"
     );
+    // `saved`/`reopen` are additive too (plan 032 §3.4): a source that never
+    // wrote them says it cannot reopen saved sessions, naming its kind.
+    assert_send(&source.saved());
+    assert_send(&source.reopen("saved-1"));
+    assert_eq!(
+        rt.block_on(source.saved()).unwrap_err(),
+        LaneError::Failed("this nothing source cannot reopen saved sessions".into())
+    );
+    assert_eq!(
+        rt.block_on(source.reopen("saved-1")).unwrap_err(),
+        LaneReopenError::Lane(LaneError::Failed(
+            "this nothing source cannot reopen saved sessions".into()
+        ))
+    );
     let lane: Arc<dyn AgentLane> = Arc::new(NoLane("ses_1".into()));
     assert_eq!(lane.session_id(), "ses_1", "the id is bound, not passed");
     assert_send(&lane.send("hi", SendMode::Queue));
@@ -1778,6 +1792,7 @@ fn the_new_lane_frames_are_tagged_and_nested() {
             name: "Model one".into(),
             rank: Some(1),
             description: None,
+            effort: None,
         }],
         ..LaneSettings::default()
     };
@@ -1822,11 +1837,12 @@ fn source_event_is_tagged_on_kind_in_snake_case() {
                 create: true,
                 create_options: true,
                 create_title: false,
+                reopen: false,
             }
         }),
         json!({"kind": "capabilities",
                "capabilities": {"kind": "opencode", "create": true, "create_options": true,
-                                "create_title": false}})
+                                "create_title": false, "reopen": false}})
     );
     assert_eq!(
         round_trip(&SourceEvent::Ready {
@@ -1875,6 +1891,7 @@ fn the_tolerant_enums_are_bare_strings_and_keep_an_unknown_word() {
         (SourceOffline::TooOld, "too_old"),
         (SourceOffline::Unreachable, "unreachable"),
         (SourceOffline::Failed, "failed"),
+        (SourceOffline::NoHub, "no_hub"),
     ] {
         assert_eq!(round_trip(&v), json!(wire));
         assert_eq!(SourceOffline::from_wire(wire), v);
@@ -2059,6 +2076,7 @@ fn create_options_created_and_settings_round_trip_and_tolerate() {
         ],
         default_provider: Some("grok".into()),
         recent_dirs: vec!["/home/me/lumen".into()],
+        reopen: true,
     };
     let encoded = round_trip(&options);
     assert_eq!(encoded["providers"][0]["state"], "unavailable");
@@ -2084,6 +2102,7 @@ fn create_options_created_and_settings_round_trip_and_tolerate() {
             name: "Model one".into(),
             rank: Some(2),
             description: Some("the fast one".into()),
+            effort: None,
         }],
         mode: Some("default".into()),
         modes: vec![LaneChoice {
@@ -2091,6 +2110,7 @@ fn create_options_created_and_settings_round_trip_and_tolerate() {
             name: "Default".into(),
             rank: None,
             description: None,
+            effort: None,
         }],
         options: vec![LaneSetting {
             id: "effort".into(),
@@ -2102,6 +2122,7 @@ fn create_options_created_and_settings_round_trip_and_tolerate() {
                 name: "High".into(),
                 rank: None,
                 description: None,
+                effort: None,
             }],
         }],
         usage: Some(LaneUsage {
@@ -2413,6 +2434,7 @@ fn the_slash_enums_are_bare_strings_and_keep_an_unknown_word() {
         &[
             (LaneSlashRequires::Stop, "stop"),
             (LaneSlashRequires::Aside, "aside"),
+            (LaneSlashRequires::Effort, "effort"),
         ],
         LaneSlashRequires::Other,
     );
@@ -2451,7 +2473,13 @@ fn the_slash_enums_are_bare_strings_and_keep_an_unknown_word() {
         let back: LaneSlashMethod = serde_json::from_value(encoded).unwrap();
         assert!(!back.is_known(), "{bare}");
     }
-    check(&[(LaneSlashPicker::Model, "model")], LaneSlashPicker::Other);
+    check(
+        &[
+            (LaneSlashPicker::Model, "model"),
+            (LaneSlashPicker::Effort, "effort"),
+        ],
+        LaneSlashPicker::Other,
+    );
     assert!(LaneSlashKind::Prompt.is_known());
     assert!(!LaneSlashKind::Other("dance".into()).is_known());
     assert_eq!(LaneSlashArg::default(), LaneSlashArg::None);
@@ -2526,4 +2554,337 @@ fn a_pre_029_producer_decodes_with_the_new_fields_defaulted() {
     );
     let empty: LaneSlashCatalog = serde_json::from_value(json!({})).expect("no rows");
     assert!(empty.rows.is_empty());
+}
+
+// ---- effort (plan 032 §3.2, §3.3) ----
+
+/// **A model's effort facts ride its `LaneChoice`** (plan 032 §3.3):
+/// snake_case, every `None` omitted — so a choice without facts writes what
+/// a pre-032 build wrote — and tolerant inbound: a pre-032 choice decodes
+/// with none, a sparse facts object with its members defaulted.
+#[test]
+fn a_models_effort_facts_round_trip_and_tolerate_a_sparse_producer() {
+    let model = LaneChoice {
+        id: "glm-5.3".into(),
+        name: "GLM 5.3 (Z.AI)".into(),
+        rank: Some(1),
+        description: None,
+        effort: Some(LaneModelEffort {
+            efforts: vec!["low".into(), "high".into(), "max".into()],
+            default_effort: Some("max".into()),
+            switch_effort: Some("high".into()),
+        }),
+    };
+    assert_eq!(
+        round_trip(&model),
+        json!({"id": "glm-5.3", "name": "GLM 5.3 (Z.AI)", "rank": 1, "effort": {
+            "efforts": ["low", "high", "max"], "default_effort": "max", "switch_effort": "high"}})
+    );
+    let plain = LaneChoice {
+        effort: None,
+        ..model.clone()
+    };
+    assert_eq!(
+        round_trip(&plain),
+        json!({"id": "glm-5.3", "name": "GLM 5.3 (Z.AI)", "rank": 1}),
+        "no facts is no member — a pre-032 build's JSON"
+    );
+    let levels_alone = LaneModelEffort {
+        efforts: vec!["low".into()],
+        ..LaneModelEffort::default()
+    };
+    assert_eq!(
+        round_trip(&levels_alone),
+        json!({"efforts": ["low"]}),
+        "no default and no switch level: omitted, never null"
+    );
+
+    let old: LaneChoice =
+        serde_json::from_value(json!({"id": "m", "name": "M"})).expect("a pre-032 choice");
+    assert_eq!(old.effort, None);
+    let sparse: LaneModelEffort =
+        serde_json::from_value(json!({"default_effort": "high", "later": 1})).expect("sparse");
+    assert_eq!(
+        sparse,
+        LaneModelEffort {
+            default_effort: Some("high".into()),
+            ..LaneModelEffort::default()
+        }
+    );
+    let settings: LaneSettings = serde_json::from_value(json!({"model": "m", "models": [
+        {"id": "m", "name": "M", "effort": {"efforts": ["low", "high"], "switch_effort": "low"}}]}))
+    .expect("inside its settings");
+    assert_eq!(
+        settings.models[0]
+            .effort
+            .as_ref()
+            .and_then(|e| e.switch_effort.as_deref()),
+        Some("low")
+    );
+}
+
+/// An option for [`LaneSettings::effort_option`]'s table: `values` are its
+/// value ids, each named by its id.
+fn option(id: &str, name: &str, category: &str, values: &[&str]) -> LaneSetting {
+    LaneSetting {
+        id: id.into(),
+        name: name.into(),
+        category: category.into(),
+        current: values.first().copied().unwrap_or_default().into(),
+        values: values
+            .iter()
+            .map(|v| LaneChoice {
+                id: (*v).into(),
+                name: (*v).into(),
+                rank: None,
+                description: None,
+                effort: None,
+            })
+            .collect(),
+    }
+}
+
+/// **The effort option is craze's `agent.EffortOption`, rule for rule**
+/// (plan 032 §3.2, PC14h): which options qualify (values, and `effort` or
+/// `reasoning` in the id or name, any case) and which one wins (the id
+/// `effort` first, then `model_option`, then `thought_level`, then the
+/// rest; the first listed on a tie). The cases are the fakes' and fixtures'
+/// real shapes plus each rule's edge.
+#[test]
+fn the_effort_option_is_crazes_rule() {
+    let lh = &["low", "high"][..];
+    let cases: Vec<(&str, Vec<LaneSetting>, Option<&str>)> = vec![
+        ("no options", vec![], None),
+        (
+            "cursor's (WIRE/01, permodel grok-4.6): effort beside fast",
+            vec![
+                option(
+                    "effort",
+                    "Effort",
+                    "thought_level",
+                    &["low", "medium", "high"],
+                ),
+                option("fast", "Fast", "model_config", &["false", "true"]),
+            ],
+            Some("effort"),
+        ),
+        (
+            "grok's (the fake agent's grok scripts): the id reasoning_effort",
+            vec![option("reasoning_effort", "Effort", "model_option", lh)],
+            Some("reasoning_effort"),
+        ),
+        (
+            "glm-5.2's reasoning select (permodel)",
+            vec![option("reasoning", "Reasoning", "thought_level", lh)],
+            Some("reasoning"),
+        ),
+        (
+            "by its name alone",
+            vec![option("lvl", "Reasoning Effort", "x", lh)],
+            Some("lvl"),
+        ),
+        (
+            "any case, in the id",
+            vec![option("Model_REASONING", "x", "x", lh)],
+            Some("Model_REASONING"),
+        ),
+        (
+            "no values: not an effort",
+            vec![option("effort", "Effort", "thought_level", &[])],
+            None,
+        ),
+        (
+            "cursor's thinking is no effort (by id and name), whatever its category",
+            vec![option("thinking", "Thinking", "thought_level", lh)],
+            None,
+        ),
+        (
+            "the id `effort`, any case, outranks every category",
+            vec![
+                option("reasoning_effort", "Effort", "model_option", lh),
+                option("EFFORT", "Effort", "x", lh),
+            ],
+            Some("EFFORT"),
+        ),
+        (
+            "claude-opus-5's (permodel): thinking first, then the effort",
+            vec![
+                option("thinking", "Thinking", "thought_level", lh),
+                option("effort", "Effort", "thought_level", lh),
+                option("context", "Context", "model_config", lh),
+            ],
+            Some("effort"),
+        ),
+        (
+            "model_option before thought_level",
+            vec![
+                option("a_effort", "A", "thought_level", lh),
+                option("b_effort", "B", "model_option", lh),
+            ],
+            Some("b_effort"),
+        ),
+        (
+            "thought_level before any other category",
+            vec![
+                option("p_reasoning", "P", "model_config", lh),
+                option("q_reasoning", "Q", "thought_level", lh),
+            ],
+            Some("q_reasoning"),
+        ),
+        (
+            "a tie: the first listed",
+            vec![
+                option("x_effort", "X", "other", lh),
+                option("y_reasoning", "Y", "other", lh),
+            ],
+            Some("x_effort"),
+        ),
+        (
+            "one that qualifies after one that does not",
+            vec![
+                option("fast", "Fast", "model_config", &["false", "true"]),
+                option("think", "Reasoning", "model_config", lh),
+            ],
+            Some("think"),
+        ),
+    ];
+    for (what, options, want) in cases {
+        let settings = LaneSettings {
+            options,
+            ..LaneSettings::default()
+        };
+        assert_eq!(
+            settings.effort_option().map(|o| o.id.as_str()),
+            want,
+            "{what}"
+        );
+    }
+}
+
+// ---- plan 032 §3.4: saved sessions, reopened ----
+
+/// The saved list and a reopen's answer round-trip, and decode TOLERANTLY: an
+/// unknown field is ignored, an absent list is empty and an absent `more` or
+/// `joined` false; a session with no title and no creation time omits both.
+#[test]
+fn saved_sessions_and_a_reopen_round_trip_and_tolerate() {
+    let saved = LaneSavedSessions {
+        sessions: vec![
+            LaneSavedSession {
+                id: "0190ab12-cd34-7ef0-8123-456789abcdef".into(),
+                provider: "cursor".into(),
+                workspace: "/home/me/projects/lumen".into(),
+                title: Some("fix the flaky test".into()),
+                updated_unix_ms: 1_791_799_200_000,
+                created_unix_ms: Some(1_791_795_600_000),
+            },
+            LaneSavedSession {
+                id: "grok:4f1e2d3c".into(),
+                provider: "grok".into(),
+                workspace: "/home/me/projects/lumen".into(),
+                title: None,
+                updated_unix_ms: 1_791_712_800_000,
+                created_unix_ms: None,
+            },
+        ],
+        more: true,
+    };
+    let encoded = round_trip(&saved);
+    assert_eq!(
+        encoded["sessions"][0],
+        json!({"id": "0190ab12-cd34-7ef0-8123-456789abcdef", "provider": "cursor",
+               "workspace": "/home/me/projects/lumen", "title": "fix the flaky test",
+               "updated_unix_ms": 1_791_799_200_000_i64, "created_unix_ms": 1_791_795_600_000_i64})
+    );
+    assert_eq!(
+        encoded["sessions"][1],
+        json!({"id": "grok:4f1e2d3c", "provider": "grok", "workspace": "/home/me/projects/lumen",
+               "updated_unix_ms": 1_791_712_800_000_i64}),
+        "no title and no creation time: both omitted"
+    );
+    assert_eq!(encoded["more"], true);
+    let sparse: LaneSavedSessions =
+        serde_json::from_value(json!({"cursor": 3})).expect("tolerated");
+    assert_eq!(sparse, LaneSavedSessions::default());
+
+    let reopened = LaneReopened {
+        session: sample_session(),
+        joined: true,
+    };
+    let encoded = round_trip(&reopened);
+    assert_eq!(encoded["joined"], true);
+    assert_eq!(encoded["session"]["id"], "ses_1");
+    let unjoined: LaneReopened = serde_json::from_value(json!({
+        "session": round_trip(&sample_session()), "epoch": "e"
+    }))
+    .expect("an absent joined and an unknown field are tolerated");
+    assert!(!unjoined.joined);
+}
+
+/// **[`LaneReopenError`] crosses in both of [`LaneError`]'s shapes** — its own
+/// payload variants as one-key objects, and its `lane` variant wrapping a
+/// `LaneError` that is itself a bare string or a one-key object (the FRB
+/// mirror decodes all of them). Strict: a kind it does not know is refused.
+/// Each says its text as itself.
+#[test]
+fn every_reopen_error_round_trips_in_both_wire_shapes() {
+    for (e, wire) in [
+        (
+            LaneReopenError::Gone("no session 0190ab12".into()),
+            json!({"gone": "no session 0190ab12"}),
+        ),
+        (
+            LaneReopenError::StartFailed("could not start: keychain locked".into()),
+            json!({"start_failed": "could not start: keychain locked"}),
+        ),
+        (
+            LaneReopenError::Unavailable("the hub is busy".into()),
+            json!({"unavailable": "the hub is busy"}),
+        ),
+        (
+            LaneReopenError::Lane(LaneError::UnknownSession),
+            json!({"lane": "unknown_session"}),
+        ),
+        (
+            LaneReopenError::Lane(LaneError::BadRequest("bad id".into())),
+            json!({"lane": {"bad_request": "bad id"}}),
+        ),
+    ] {
+        assert_eq!(round_trip(&e), wire, "{e:?}");
+    }
+    assert_eq!(
+        LaneReopenError::StartFailed("could not start: x".into()).to_string(),
+        "could not start: x"
+    );
+    assert_eq!(
+        LaneReopenError::Lane(LaneError::UnknownSession).to_string(),
+        "no such session"
+    );
+    for bad in [json!({"lost": "x"}), json!("gone"), json!({"lane": "nope"})] {
+        assert!(
+            serde_json::from_value::<LaneReopenError>(bad.clone()).is_err(),
+            "{bad} must be refused"
+        );
+    }
+}
+
+/// **A pre-032 producer still decodes** (plan 032 §3.4, PC11): source
+/// capabilities and create options without `reopen` read `false` — the
+/// reading that offers no resume entry.
+#[test]
+fn a_pre_032_producer_decodes_with_reopen_false() {
+    let caps: SourceCapabilities = serde_json::from_value(json!({
+        "kind": "craze", "create": true, "create_options": true, "create_title": true
+    }))
+    .expect("a pre-032 source capabilities object decodes");
+    assert!(!caps.reopen);
+    let options: LaneCreateOptions =
+        serde_json::from_value(json!({"providers": [], "recent_dirs": ["/w"]}))
+            .expect("pre-032 create options decode");
+    assert!(!options.reopen);
+    let options = LaneCreateOptions {
+        reopen: true,
+        ..LaneCreateOptions::default()
+    };
+    assert_eq!(round_trip(&options)["reopen"], true);
 }

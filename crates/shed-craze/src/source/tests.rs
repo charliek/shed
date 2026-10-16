@@ -17,7 +17,8 @@ use tokio::sync::mpsc::Receiver;
 
 use super::*;
 use crate::testing::{
-    full_hub_capabilities, hub_capabilities_0_1_0, roster_row, HubEnd, ScriptedDial, SCRIPT_WAIT,
+    full_hub_capabilities, hub_capabilities_0_1_0, reopen_hub_capabilities, roster_row, HubEnd,
+    ScriptedDial, SCRIPT_WAIT,
 };
 use crate::wire::RosterRow;
 
@@ -27,6 +28,7 @@ fn fast() -> Timings {
         hello: Duration::from_secs(5),
         request: Duration::from_secs(5),
         create: Duration::from_secs(120),
+        reopen: REOPEN_DEADLINE,
         backoff_base: Duration::from_millis(10),
         backoff_max: Duration::from_millis(40),
     }
@@ -2184,4 +2186,663 @@ async fn a_held_titled_create_to_a_hub_without_create_title_stays_unknown() {
     let got = replay.await.unwrap().unwrap_err();
     assert!(crate::errors::is_outcome_unknown(&got), "{got:?}");
     assert_eq!(dial.dials(), 2);
+}
+
+// ---- plan 032 §3.4: saved sessions, reopened ----
+
+/// The hostId [`reopen_result`] answers with.
+const REOPENED: &str = "dddddddddddd";
+/// A saved session's id — its craze id.
+const SAVED_ID: &str = "0190ab12-cd34-7ef0-8123-456789abcdef";
+
+/// `session.reopen`'s answer: the session's roster row on `host_id` (its
+/// craze `sessionId` [`SAVED_ID`]), `joined` as given.
+fn reopen_result(host_id: &str, joined: bool) -> Value {
+    json!({"session": roster_row(host_id, SAVED_ID, "/w/lumen",
+                                 json!({"title": "the reopen's", "activity": "idle", "pendingAsks": 0})),
+           "joined": joined})
+}
+
+/// A reopen of `id` through `src`, on its own task.
+fn reopening(
+    src: &CrazeSource,
+    id: &str,
+) -> tokio::task::JoinHandle<Result<LaneReopened, LaneReopenError>> {
+    let src = src.clone();
+    let id = id.to_string();
+    tokio::spawn(async move { src.reopen(&id).await })
+}
+
+/// A connection that must close with nothing more written on it.
+async fn nothing_more(hub: &mut HubEnd, what: &str) {
+    assert!(hub.recv().await.is_none(), "{what}: nothing was sent");
+}
+
+/// The next connection, as a 0.2.0 hub that says `hello` as `epoch` and reads
+/// the source's `session.reopen`: that connection and the request.
+async fn reopen_asked(
+    conns: &mut tokio::sync::mpsc::UnboundedReceiver<HubEnd>,
+    epoch: &str,
+) -> (HubEnd, Value) {
+    let mut hub = next_conn(conns).await;
+    hub.hello(epoch, reopen_hub_capabilities()).await;
+    let req = hub.expect("session.reopen").await;
+    (hub, req)
+}
+
+/// **`saved` asks for 50 and keeps craze's order and words** (plan 032
+/// §3.4): `sessions.saved{limit: 50}` and nothing else (no `subAgents`, no
+/// workspace), on its own connection; each row read on its own — a title that
+/// is blank is none, Go's zero time is no creation time, a row with no id (or
+/// one that is not a row) is left out, an unknown member is ignored — and
+/// `more` as craze says it.
+#[tokio::test]
+async fn saved_asks_for_fifty_and_keeps_crazes_order_and_words() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let asked = tokio::spawn(async move { src.saved().await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello("epoch-1", reopen_hub_capabilities()).await;
+    let req = hub.expect("sessions.saved").await;
+    assert_eq!(req["params"], json!({"limit": 50}));
+    hub.reply(
+        &req,
+        json!({"sessions": [
+        {"id": SAVED_ID, "crazeSessionId": SAVED_ID, "provider": "cursor",
+         "providerSessionId": "7c1f9e2a", "workspace": "/home/me/projects/lumen",
+         "title": "fix the flaky test", "createdAt": "2026-10-12T09:00:00Z",
+         "updatedAt": "2026-10-12T10:00:00Z"},
+        {"id": "grok:4f1e2d3c", "provider": "grok", "providerSessionId": "4f1e2d3c",
+         "workspace": "/home/me/projects/lumen", "title": "  ",
+         "createdAt": "0001-01-01T00:00:00Z", "updatedAt": "2026-10-11T10:00:00Z"},
+        {"provider": "grok", "workspace": "/w"},
+        "not a row",
+        {"id": "future-1", "provider": "native", "workspace": "/w",
+         "updatedAt": "2026-10-10T10:00:00Z", "pinnedBy": "a newer craze"}],
+        "more": true}),
+    )
+    .await;
+    let got = asked.await.unwrap().unwrap();
+    let ms = |t: &str| shed_core::time::rfc3339_unix_ms(t).unwrap();
+    assert_eq!(
+        got,
+        LaneSavedSessions {
+            sessions: vec![
+                LaneSavedSession {
+                    id: SAVED_ID.into(),
+                    provider: "cursor".into(),
+                    workspace: "/home/me/projects/lumen".into(),
+                    title: Some("fix the flaky test".into()),
+                    updated_unix_ms: ms("2026-10-12T10:00:00Z"),
+                    created_unix_ms: Some(ms("2026-10-12T09:00:00Z")),
+                },
+                LaneSavedSession {
+                    id: "grok:4f1e2d3c".into(),
+                    provider: "grok".into(),
+                    workspace: "/home/me/projects/lumen".into(),
+                    title: None,
+                    updated_unix_ms: ms("2026-10-11T10:00:00Z"),
+                    created_unix_ms: None,
+                },
+                LaneSavedSession {
+                    id: "future-1".into(),
+                    provider: "native".into(),
+                    workspace: "/w".into(),
+                    title: None,
+                    updated_unix_ms: ms("2026-10-10T10:00:00Z"),
+                    created_unix_ms: None,
+                },
+            ],
+            more: true,
+        }
+    );
+    assert_eq!(
+        ms("0001-01-01T00:00:00Z"),
+        GO_ZERO_TIME_UNIX_MS,
+        "Go's zero time, read"
+    );
+    assert_eq!(dial.dials(), 1);
+}
+
+/// **A hub without `reopen` is asked nothing** (plan 032 §3.4): `saved` is
+/// `Unavailable` and `reopen` is [`LaneReopenError::Unavailable`], both in the
+/// one older-hub wording — here a 0.1.1 hub with a pid, so the upgrade remedy
+/// is named — and each connection closes with nothing written; the reopen is
+/// never resent. A dev build's hub gets the plain sentence.
+#[tokio::test]
+async fn a_hub_without_reopen_is_asked_nothing() {
+    let older = crate::errors::reopen_unsupported_by("0.1.1", Some(5150));
+    assert!(older.ends_with("end it with kill 5150"), "{older}");
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let s = src.clone();
+    let asked = tokio::spawn(async move { s.saved().await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello_from("epoch-1", full_hub_capabilities(), "0.1.1")
+        .await;
+    assert_eq!(
+        asked.await.unwrap().unwrap_err(),
+        LaneError::Unavailable(older.clone())
+    );
+    nothing_more(&mut hub, "saved").await;
+
+    let reopen = reopening(&src, SAVED_ID);
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello_from("epoch-1", full_hub_capabilities(), "0.1.1")
+        .await;
+    assert_eq!(
+        reopen.await.unwrap().unwrap_err(),
+        LaneReopenError::Unavailable(older)
+    );
+    nothing_more(&mut hub, "reopen").await;
+    assert_eq!(dial.dials(), 2, "no resend: nothing was lost");
+
+    let reopen = reopening(&src, SAVED_ID);
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello_from("epoch-1", full_hub_capabilities(), "dev")
+        .await;
+    assert_eq!(
+        reopen.await.unwrap().unwrap_err(),
+        LaneReopenError::Unavailable(
+            "this craze hub (craze dev) does not offer reopening saved sessions".into()
+        ),
+        "a version that does not parse infers nothing"
+    );
+    nothing_more(&mut hub, "reopen (dev)").await;
+}
+
+/// **The create options and the capabilities say `reopen` from the hub's
+/// `hello`** (PC11): the SAME `hello` the create options were read on, and
+/// every roster seed's — true for a 0.2.0 hub, false for a 0.1.1 one.
+#[tokio::test]
+async fn create_options_and_the_capabilities_say_reopen_from_the_hello() {
+    for (caps, want) in [
+        (reopen_hub_capabilities(), true),
+        (full_hub_capabilities(), false),
+    ] {
+        let (dial, mut conns) = ScriptedDial::new();
+        let src = source(Arc::clone(&dial));
+        let s = src.clone();
+        let asked = tokio::spawn(async move { s.create_options().await });
+        let mut hub = next_conn(&mut conns).await;
+        hub.hello("epoch-1", caps.clone()).await;
+        let req = hub.expect("sessions.createOptions").await;
+        hub.reply(
+            &req,
+            json!({"providers": [{"id": "grok", "label": "grok", "state": "ready"}]}),
+        )
+        .await;
+        assert_eq!(asked.await.unwrap().unwrap().reopen, want, "{caps}");
+
+        let (mut rx, _stop) = src.subscribe().await.unwrap().into_parts();
+        let mut hub = next_conn(&mut conns).await;
+        hub.hello("epoch-1", caps.clone()).await;
+        hub.subscribed("r-1", "epoch-1", json!([])).await;
+        let seed = until(&mut rx, "the seed", is_ready).await;
+        assert!(
+            seed.iter()
+                .any(|e| matches!(e, SourceEvent::Capabilities { capabilities }
+                if capabilities.reopen == want)),
+            "{caps}: {seed:?}"
+        );
+    }
+}
+
+/// **A saved list's refusal** follows the code table — and one that says the
+/// hub cannot answer it at all (`unsupported`/`unknown_method`, a hub that
+/// said `reopen` and could not) is the older-hub words, as the gate's.
+#[tokio::test]
+async fn a_saved_refusal_follows_the_table_and_an_unsupported_one_names_the_hub() {
+    for (code, reason, want) in [
+        (
+            "unavailable",
+            "host_unreachable",
+            LaneError::Unavailable("unavailable/host_unreachable".into()),
+        ),
+        (
+            "bad_request",
+            "unknown_field",
+            LaneError::BadRequest("bad_request/unknown_field".into()),
+        ),
+        (
+            "unsupported",
+            "unknown_method",
+            LaneError::Unavailable(
+                "this craze hub (craze test) does not offer reopening saved sessions".into(),
+            ),
+        ),
+    ] {
+        let (dial, mut conns) = ScriptedDial::new();
+        let src = source(Arc::clone(&dial));
+        let asked = tokio::spawn(async move { src.saved().await });
+        let mut hub = next_conn(&mut conns).await;
+        hub.hello("epoch-1", reopen_hub_capabilities()).await;
+        let req = hub.expect("sessions.saved").await;
+        hub.refuse(&req, code, reason, json!({})).await;
+        assert_eq!(asked.await.unwrap().unwrap_err(), want, "{code}/{reason}");
+    }
+}
+
+/// **A reopen goes on a connection of its own, `{id}` and nothing else**, and
+/// its answer's row is the source's at once: `joined` as craze says it, the
+/// row (its id the hostId) openable before any roster lists it.
+#[tokio::test]
+async fn a_reopen_sends_its_id_alone_and_its_row_is_openable_at_once() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let reopen = reopening(&src, SAVED_ID);
+    let (mut hub, req) = reopen_asked(&mut conns, "epoch-1").await;
+    assert_eq!(req["params"], json!({ "id": SAVED_ID }));
+    hub.reply(&req, reopen_result(REOPENED, false)).await;
+    let got = reopen.await.unwrap().unwrap();
+    assert_eq!((got.session.id.as_str(), got.joined), (REOPENED, false));
+    assert_eq!(got.session.title, "the reopen's");
+    assert_eq!(ids(&src.created_rows()), [REOPENED]);
+    let (row, session_id) = src.listed(REOPENED).expect("the reopen's row");
+    assert_eq!((row.id.as_str(), session_id.as_str()), (REOPENED, SAVED_ID));
+    let lane = src.open(REOPENED).await.unwrap();
+    assert_eq!(lane.session().await.unwrap().id, REOPENED);
+    assert_eq!(dial.dials(), 1, "one connection; session() never dials");
+}
+
+/// **A lost answer is sent again ONCE, the same `{id}`, on a fresh
+/// connection** (plan 032 §3.4, PC10): a connection that ended after the
+/// reopen was written — craze counts it lost — and the resend's answer is
+/// the reopen's.
+#[tokio::test]
+async fn a_reopen_whose_connection_ended_is_sent_again_once() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let reopen = reopening(&src, SAVED_ID);
+    let (hub, first) = reopen_asked(&mut conns, "epoch-1").await;
+    hub.close().await;
+    let (mut hub2, second) = reopen_asked(&mut conns, "epoch-2").await;
+    assert_eq!(second["params"], first["params"], "the same {{id}}");
+    hub2.reply(&second, reopen_result(REOPENED, true)).await;
+    let got = reopen.await.unwrap().unwrap();
+    assert_eq!((got.session.id.as_str(), got.joined), (REOPENED, true));
+    assert_eq!(dial.dials(), 2, "the reopen, then the one resend");
+}
+
+/// **The deadline is a lost answer too** (paused clock: the real 200 s, not
+/// the create's 120): the resend goes out once [`REOPEN_DEADLINE`] has passed
+/// with no answer, on a fresh connection.
+#[tokio::test(start_paused = true)]
+async fn a_reopen_past_its_deadline_is_sent_again_once() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = CrazeSource::new(Arc::clone(&dial) as Arc<dyn CrazeDial>, "t");
+    let reopen = reopening(&src, SAVED_ID);
+    let (hub, _) = reopen_asked(&mut conns, "epoch-1").await;
+    let asked = tokio::time::Instant::now();
+    let mut hub2 = tokio::time::timeout(REOPEN_DEADLINE + Duration::from_secs(1), conns.recv())
+        .await
+        .expect("the resend dialled after the deadline")
+        .unwrap();
+    assert!(
+        asked.elapsed() >= REOPEN_DEADLINE,
+        "{:?}: no sooner than craze's \"at least 200 s\"",
+        asked.elapsed()
+    );
+    hub2.hello("epoch-1", reopen_hub_capabilities()).await;
+    let again = hub2.expect("session.reopen").await;
+    assert_eq!(again["params"], json!({ "id": SAVED_ID }));
+    hub2.reply(&again, reopen_result(REOPENED, false)).await;
+    assert!(reopen.await.unwrap().is_ok());
+    assert_eq!(dial.dials(), 2);
+    drop(hub);
+}
+
+/// **Two lost answers are `Unavailable`, "Retry is safe"** (PC14d) — never a
+/// separate "outcome unknown", never a third try; and so is a resend whose
+/// dial fails, and a resend that reaches a hub which cannot reopen (nothing
+/// sent there): each time the first try may have started the session.
+#[tokio::test]
+async fn two_lost_reopen_answers_are_unavailable_and_retry_is_safe() {
+    let lost = |got: &LaneReopenError, why: &str| {
+        assert!(crate::errors::is_reopen_lost(got), "{why}: {got:?}");
+        assert!(
+            got.to_string().starts_with(crate::errors::REOPEN_LOST),
+            "{why}: {got}"
+        );
+    };
+    // Lost twice.
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let reopen = reopening(&src, SAVED_ID);
+    for epoch in ["epoch-1", "epoch-2"] {
+        let (hub, _) = reopen_asked(&mut conns, epoch).await;
+        hub.close().await;
+    }
+    lost(&reopen.await.unwrap().unwrap_err(), "twice");
+    assert_eq!(dial.dials(), 2, "one resend, no more");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), conns.recv())
+            .await
+            .is_err(),
+        "no third try"
+    );
+
+    // Lost, then the resend's dial fails.
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let reopen = reopening(&src, SAVED_ID);
+    let (hub, _) = reopen_asked(&mut conns, "epoch-1").await;
+    dial.fail_next(DialError::Unreachable("ssh: connection refused".into()));
+    hub.close().await;
+    let got = reopen.await.unwrap().unwrap_err();
+    lost(&got, "a resend that could not dial");
+    assert!(got.to_string().contains("connection refused"), "{got}");
+    assert_eq!(dial.dials(), 2);
+
+    // Lost, then the resend reaches a hub that cannot reopen.
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let reopen = reopening(&src, SAVED_ID);
+    let (hub, _) = reopen_asked(&mut conns, "epoch-1").await;
+    hub.close().await;
+    let mut hub2 = next_conn(&mut conns).await;
+    hub2.hello("epoch-2", full_hub_capabilities()).await;
+    lost(
+        &reopen.await.unwrap().unwrap_err(),
+        "a resend that reached an older hub",
+    );
+    nothing_more(&mut hub2, "the older hub").await;
+}
+
+/// **A definite refusal is never resent**, and lands on the variant that
+/// says what a client does next (the reopen table; `errors.rs` pins every
+/// row).
+#[tokio::test]
+async fn a_definite_reopen_refusal_is_never_resent() {
+    for (code, reason, extra, want) in [
+        (
+            "unknown_session",
+            "unknown_session",
+            json!({}),
+            LaneReopenError::Gone("unknown_session/unknown_session".into()),
+        ),
+        (
+            "not_accepting",
+            "not_resumable",
+            json!({}),
+            LaneReopenError::Gone("not_accepting/not_resumable".into()),
+        ),
+        (
+            "not_accepting",
+            "start_failed",
+            json!({"cause": "the session did not start within 2m30s"}),
+            LaneReopenError::StartFailed(
+                "could not start: the session did not start within 2m30s".into(),
+            ),
+        ),
+        (
+            "unavailable",
+            "busy",
+            json!({}),
+            LaneReopenError::Unavailable("unavailable/busy".into()),
+        ),
+        (
+            "unsupported",
+            "unknown_method",
+            json!({}),
+            LaneReopenError::Unavailable(
+                "this craze hub (craze test) does not offer reopening saved sessions".into(),
+            ),
+        ),
+        (
+            "bad_request",
+            "bad_request",
+            json!({}),
+            LaneReopenError::Lane(LaneError::BadRequest("bad_request/bad_request".into())),
+        ),
+    ] {
+        let (dial, mut conns) = ScriptedDial::new();
+        let src = source(Arc::clone(&dial));
+        let reopen = reopening(&src, SAVED_ID);
+        let (mut hub, req) = reopen_asked(&mut conns, "epoch-1").await;
+        hub.refuse(&req, code, reason, extra).await;
+        assert_eq!(reopen.await.unwrap().unwrap_err(), want, "{code}/{reason}");
+        assert_eq!(dial.dials(), 1, "{code}/{reason}: never resent");
+        assert!(src.created_rows().is_empty(), "{code}/{reason}: no row");
+    }
+}
+
+/// **A success shed cannot read is `Unavailable` — lost, never resent — and
+/// wakes the rosters**: craze answered ok, so the session may run, and a
+/// resend would read the same. A roster of the same source waiting out its
+/// reconnect backoff (here a minute: no hub was there to dial) redials at
+/// once, through a clone dialling elsewhere ([`CrazeSource::dialling`]).
+#[tokio::test]
+async fn an_undecodable_reopen_success_is_unavailable_and_wakes_the_source() {
+    let (roster_dial, mut roster_conns) = ScriptedDial::new();
+    let (ask_dial, mut ask_conns) = ScriptedDial::new();
+    let slow = Timings {
+        backoff_base: Duration::from_secs(60),
+        backoff_max: Duration::from_secs(60),
+        ..fast()
+    };
+    let src =
+        CrazeSource::new(Arc::clone(&roster_dial) as Arc<dyn CrazeDial>, "t").with_timings(slow);
+    let ask = src.dialling(Arc::clone(&ask_dial) as Arc<dyn CrazeDial>);
+    roster_dial.fail_next(DialError::Unreachable("no hub is running".into()));
+    let (mut rx, _stop) = src.subscribe().await.unwrap().into_parts();
+    assert!(matches!(
+        next(&mut rx, "the Offline").await,
+        SourceEvent::Offline { .. }
+    ));
+    // The roster now waits 30–60 s before it dials again.
+
+    let reopen = reopening(&ask, SAVED_ID);
+    let (mut hub, req) = reopen_asked(&mut ask_conns, "epoch-1").await;
+    hub.reply(
+        &req,
+        json!({"session": {"hostId": REOPENED}, "joined": false}),
+    )
+    .await;
+    let got = reopen.await.unwrap().unwrap_err();
+    assert!(crate::errors::is_reopen_lost(&got), "{got:?}");
+    assert!(got.to_string().contains("cannot read"), "{got}");
+    assert_eq!(ask_dial.dials(), 1, "never resent");
+    assert!(src.created_rows().is_empty(), "no row it could not read");
+
+    let mut roster = next_conn(&mut roster_conns).await;
+    roster.hello("epoch-1", reopen_hub_capabilities()).await;
+    roster
+        .subscribed(
+            "r-1",
+            "epoch-1",
+            json!([roster_row(REOPENED, SAVED_ID, "/w/lumen", json!(null))]),
+        )
+        .await;
+    let seed = until(&mut rx, "the seed after the wake", is_ready).await;
+    assert!(
+        seed.iter()
+            .any(|e| matches!(e, SourceEvent::Session { session } if session.id == REOPENED)),
+        "{seed:?}"
+    );
+}
+
+/// **A lost first answer wakes the rosters even when the resend is refused**
+/// (C4 review): the first reopen may have started the session before its
+/// connection dropped, so the resend's definite `unavailable/busy` keeps its
+/// own mapping, yet a roster of the same source waiting out its backoff
+/// redials at once rather than up to a minute later.
+#[tokio::test]
+async fn a_lost_reopen_answer_wakes_the_rosters_whatever_the_resend_says() {
+    let (roster_dial, mut roster_conns) = ScriptedDial::new();
+    let (ask_dial, mut ask_conns) = ScriptedDial::new();
+    let slow = Timings {
+        backoff_base: Duration::from_secs(60),
+        backoff_max: Duration::from_secs(60),
+        ..fast()
+    };
+    let src =
+        CrazeSource::new(Arc::clone(&roster_dial) as Arc<dyn CrazeDial>, "t").with_timings(slow);
+    let ask = src.dialling(Arc::clone(&ask_dial) as Arc<dyn CrazeDial>);
+    roster_dial.fail_next(DialError::Unreachable("no hub is running".into()));
+    let (mut rx, _stop) = src.subscribe().await.unwrap().into_parts();
+    assert!(matches!(
+        next(&mut rx, "the Offline").await,
+        SourceEvent::Offline { .. }
+    ));
+    // The roster now waits a minute before it dials again.
+
+    let reopen = reopening(&ask, SAVED_ID);
+    let (hub, _) = reopen_asked(&mut ask_conns, "epoch-1").await;
+    hub.close().await;
+    let (mut hub2, again) = reopen_asked(&mut ask_conns, "epoch-2").await;
+    hub2.refuse(&again, "unavailable", "busy", json!({})).await;
+    assert_eq!(
+        reopen.await.unwrap().unwrap_err(),
+        LaneReopenError::Unavailable("unavailable/busy".into()),
+        "the resend's definite answer keeps its own mapping"
+    );
+    assert_eq!(ask_dial.dials(), 2, "the reopen, then the one resend");
+
+    tokio::time::timeout(Duration::from_secs(5), roster_conns.recv())
+        .await
+        .expect("the roster redialled at once, not after its minute")
+        .expect("a roster connection");
+}
+
+/// **A legacy id binds the hostId craze answers** (PM: a legacy id's session
+/// carries the craze id its host gave it): `grok:<id>` goes out verbatim, and
+/// the row is keyed by the answer's hostId with the answer's craze session id
+/// — what every call of a lane opened on it carries — never by the id asked.
+#[tokio::test]
+async fn a_reopened_legacy_id_binds_the_returned_host_id() {
+    const MINTED: &str = "0192f0aa-6666-7000-8000-00000000beef";
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let reopen = reopening(&src, "grok:4f1e2d3c");
+    let (mut hub, req) = reopen_asked(&mut conns, "epoch-1").await;
+    assert_eq!(req["params"], json!({"id": "grok:4f1e2d3c"}));
+    hub.reply(
+        &req,
+        json!({"session": roster_row(REOPENED, MINTED, "/w/lumen",
+                                     json!({"activity": "idle", "pendingAsks": 0})),
+               "joined": false}),
+    )
+    .await;
+    let got = reopen.await.unwrap().unwrap();
+    assert_eq!(got.session.id, REOPENED);
+    assert!(
+        src.listed("grok:4f1e2d3c").is_none(),
+        "the saved id is no row id"
+    );
+    assert_eq!(src.listed(REOPENED).unwrap().1, MINTED);
+    assert_eq!(
+        src.open_lane(REOPENED).craze_session_id().as_deref(),
+        Some(MINTED),
+        "a lane on it carries the minted craze id"
+    );
+}
+
+/// **An approximate row with no `row` of its own still opens** — the row the
+/// hub builds from its registry when its fresh read of the host fails (PM:
+/// "the reopen is still a success … treat such a row as a create's"). The real
+/// hub cannot be made to give one on demand, so it is scripted here.
+#[tokio::test]
+async fn an_approximate_reopened_row_with_no_row_of_its_own_still_opens() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let reopen = reopening(&src, SAVED_ID);
+    let (mut hub, req) = reopen_asked(&mut conns, "epoch-1").await;
+    let mut row = roster_row(REOPENED, SAVED_ID, "/w/lumen", json!(null));
+    row["approximate"] = json!(true);
+    hub.reply(&req, json!({"session": row, "joined": false}))
+        .await;
+    let got = reopen.await.unwrap().unwrap();
+    assert!(got.session.approximate);
+    assert_eq!(got.session.title, "lumen", "the workspace's name");
+    let lane = src.open(REOPENED).await.unwrap();
+    let s = lane.session().await.expect("it opens");
+    assert_eq!((s.id.as_str(), s.approximate), (REOPENED, true));
+    assert_eq!(
+        src.open_lane(REOPENED).craze_session_id().as_deref(),
+        Some(SAVED_ID)
+    );
+}
+
+/// **A reopened hostId inside the tombstone window still opens** (PC14f): the
+/// roster let the host go — a replayed create's answer for it would stay
+/// refused — and a reopen answered on that very hostId is craze saying the
+/// session runs there NOW, so its row is kept and openable.
+#[tokio::test]
+async fn a_reopened_host_id_inside_the_tombstone_window_still_opens() {
+    let (roster_dial, mut roster_conns) = ScriptedDial::new();
+    let (ask_dial, mut ask_conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&roster_dial));
+    let ask = src.dialling(Arc::clone(&ask_dial) as Arc<dyn CrazeDial>);
+    let (mut rx, _stop) = src.subscribe().await.unwrap().into_parts();
+    let mut roster = next_conn(&mut roster_conns).await;
+    roster.hello("epoch-1", reopen_hub_capabilities()).await;
+    let listed = roster_row(REOPENED, SAVED_ID, "/w/lumen", json!(null));
+    roster.subscribed("r-1", "epoch-1", json!([listed])).await;
+    until(&mut rx, "the seed", is_ready).await;
+    roster
+        .roster("r-1", "epoch-1", json!([]), json!([REOPENED]))
+        .await;
+    until(&mut rx, "the remove", |e| {
+        matches!(e, SourceEvent::Removed { .. })
+    })
+    .await;
+    assert!(src.listed(REOPENED).is_none(), "let go, and tombstoned");
+
+    let reopen = reopening(&ask, SAVED_ID);
+    let (mut hub, req) = reopen_asked(&mut ask_conns, "epoch-1").await;
+    hub.reply(&req, reopen_result(REOPENED, true)).await;
+    reopen.await.unwrap().unwrap();
+    assert_eq!(
+        ids(&src.created_rows()),
+        [REOPENED],
+        "the tombstone does not refuse a reopen"
+    );
+    let lane = src.open(REOPENED).await.unwrap();
+    assert_eq!(lane.session().await.unwrap().title, "the reopen's");
+}
+
+/// **`joined: true` while the roster already lists the row** keeps the
+/// roster's row — the roster speaks for its hosts — and adds no created row.
+#[tokio::test]
+async fn a_joined_reopen_of_a_listed_row_keeps_the_rosters_row() {
+    let (roster_dial, mut roster_conns) = ScriptedDial::new();
+    let (ask_dial, mut ask_conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&roster_dial));
+    let ask = src.dialling(Arc::clone(&ask_dial) as Arc<dyn CrazeDial>);
+    let (mut rx, _stop) = src.subscribe().await.unwrap().into_parts();
+    let mut roster = next_conn(&mut roster_conns).await;
+    roster.hello("epoch-1", reopen_hub_capabilities()).await;
+    let listed = roster_row(
+        REOPENED,
+        SAVED_ID,
+        "/w/lumen",
+        json!({"title": "the roster's", "activity": "idle", "pendingAsks": 0}),
+    );
+    roster.subscribed("r-1", "epoch-1", json!([listed])).await;
+    until(&mut rx, "the seed", is_ready).await;
+
+    let reopen = reopening(&ask, SAVED_ID);
+    let (mut hub, req) = reopen_asked(&mut ask_conns, "epoch-1").await;
+    hub.reply(&req, reopen_result(REOPENED, true)).await;
+    assert!(reopen.await.unwrap().unwrap().joined);
+    assert!(src.created_rows().is_empty(), "the roster speaks for it");
+    assert_eq!(src.listed(REOPENED).unwrap().0.title, "the roster's");
+}
+
+/// **A reopen's row is fresh** ([`Held`] alone): a tombstoned hostId refuses
+/// a create's row and keeps a reopen's — and the reopen lifts the tombstone,
+/// so the row is the source's like any created row from then on.
+#[tokio::test]
+async fn a_reopens_row_lifts_the_tombstone_a_creates_row_respects() {
+    let mut held = Held::default();
+    held.let_go(REOPENED);
+    held.remember_created(&session_row(REOPENED), "s");
+    assert!(
+        held.listed(REOPENED).is_none(),
+        "a create's replay: refused"
+    );
+    held.remember_reopened(&session_row(REOPENED), "s");
+    assert!(held.listed(REOPENED).is_some(), "a reopen: kept");
+    assert!(!held.is_gone(REOPENED), "and no longer tombstoned");
 }

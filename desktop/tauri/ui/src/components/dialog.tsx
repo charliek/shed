@@ -210,21 +210,34 @@ export function Switch({ on, set, disabled }: { on: boolean; set: (v: boolean) =
   );
 }
 
-/** A segmented control. Each option is `[value, label, activeColor?]`. */
-export function Segmented({ options, value, set }: { options: [string, string, string?][]; value: string; set: (v: string) => void }) {
+/** A segmented control. Each option is `[value, label, activeColor?]`.
+ *  `disabled` locks every option (a press is refused, as a pointer's is);
+ *  `mark` stamps `data-<mark>="<value>"` on each option for the harness. */
+export function Segmented({ options, value, set, disabled, mark }: {
+  options: [string, string, string?][];
+  value: string;
+  set: (v: string) => void;
+  disabled?: boolean;
+  mark?: string;
+}) {
   return (
-    <div className="flex gap-[5px] rounded-[9px] border border-shed-border bg-shed-bg p-1">
+    <div className="flex gap-[5px] rounded-[9px] border border-shed-border bg-shed-bg p-1" style={disabled ? { opacity: 0.6 } : undefined}>
       {options.map(([v, l, c]) => {
         const on = value === v;
+        const markAttr = mark ? { [`data-${mark}`]: v } : {};
         return (
           <button
             key={v}
+            {...markAttr}
+            aria-pressed={on}
+            disabled={disabled}
             onClick={() => set(v)}
             className={cn(on ? "hbtn" : "hlink", "flex-1 rounded-md px-1.5 py-2 text-[13px] font-semibold")}
             style={{
               background: on ? "var(--shed-surface)" : "transparent",
               color: on ? c ?? "var(--shed-text)" : "var(--shed-text-secondary)",
               boxShadow: on ? "var(--shed-shadow)" : "none",
+              cursor: disabled ? "default" : undefined,
             }}
           >
             {l}

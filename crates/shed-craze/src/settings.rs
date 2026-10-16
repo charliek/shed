@@ -21,7 +21,11 @@
 //!
 //! - **Models** — craze's prescription (PM "The session info document"): the
 //!   current model first, then the remembered ones by `recent` ascending, then
-//!   the rest in catalog order.
+//!   the rest in catalog order. Each carries its **effort facts** where the
+//!   session states them (a native session's `efforts`/`defaultEffort`/
+//!   `switchEffort`, craze 0.2.0; plan 032 §3.3) as `LaneChoice::effort` —
+//!   `None` for every ACP model and on an older host. No capability flag is
+//!   read for them: a model that lists levels has facts.
 //! - **Options** — the current model's `config.options`, excluding category
 //!   `model` (the model row is the model list) and `mode` (the mode row),
 //!   ordered `thought_level` first, then `model_config` in the provider's
@@ -42,7 +46,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use shed_core::lane::{LaneChoice, LaneSetting, LaneSettings, LaneUsage};
+use shed_core::lane::{LaneChoice, LaneModelEffort, LaneSetting, LaneSettings, LaneUsage};
 
 use crate::wire::{CatalogModel, Catalogs, ModeInfo, SessionInfo};
 
@@ -282,6 +286,7 @@ impl SettingsState {
                     name: name_or_id(&m.name, &m.id),
                     rank: m.recent,
                     description: None,
+                    effort: effort_facts(m),
                 })
                 .collect(),
             mode: self.mode.clone(),
@@ -293,6 +298,7 @@ impl SettingsState {
                     name: name_or_id(&m.name, &m.id),
                     rank: None,
                     description: m.description.clone().filter(|d| !d.is_empty()),
+                    effort: None,
                 })
                 .collect(),
             options: self
@@ -311,6 +317,7 @@ impl SettingsState {
                             name: name_or_id(&v.name, &v.value),
                             rank: None,
                             description: None,
+                            effort: None,
                         })
                         .collect(),
                 })
@@ -346,6 +353,22 @@ fn replace_id(slot: &mut Option<String>, id: &str) -> bool {
     }
     *slot = id.map(str::to_string);
     true
+}
+
+/// A model's effort facts as the contract's (plan 032 §3.3): only where it
+/// lists levels — an ACP session's model, an older host's, and a native model
+/// with no effort control list none, and are `None` — with an empty default or
+/// switch level read as absent (craze omits both when it has none).
+fn effort_facts(m: &CatalogModel) -> Option<LaneModelEffort> {
+    if m.efforts.is_empty() {
+        return None;
+    }
+    let level = |l: &Option<String>| l.clone().filter(|l| !l.is_empty());
+    Some(LaneModelEffort {
+        efforts: m.efforts.clone(),
+        default_effort: level(&m.default_effort),
+        switch_effort: level(&m.switch_effort),
+    })
 }
 
 /// A choice's shown name: its own, else its id.
