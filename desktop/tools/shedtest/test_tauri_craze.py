@@ -1071,11 +1071,19 @@ def _sheet(app: TauriClient) -> dict | None:
 
 
 def _open_sheet(app: TauriClient, machine: str = LOCAL) -> dict:
-    """`ui.show_craze_create`, then the sheet's options read (or failed)."""
+    """`ui.show_craze_create`, then the sheet's options read (or failed) — and,
+    on an idle sheet, its provider settled: the preselection is an effect of
+    the render that shows the options, so one dump can land between the two."""
     app.call("ui.show_craze_create", {"machine": machine})
-    app.wait_until(lambda: bool((d := _sheet(app)) and d["machine"] == machine
-                                and d["state"] != "loading"),
-                   timeout=WAIT, what=f"the create sheet on {machine} to read its options")
+
+    def settled() -> bool:
+        d = _sheet(app)
+        if not (d and d["machine"] == machine and d["state"] != "loading"):
+            return False
+        return (d["state"] != "idle" or d["preselected"] is None
+                or any(p["selected"] for p in d["providers"]))
+
+    app.wait_until(settled, timeout=WAIT, what=f"the create sheet on {machine} to read its options")
     return _sheet(app)
 
 
