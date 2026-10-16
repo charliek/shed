@@ -260,12 +260,11 @@ jobs:
           rustup default stable
           rustup target add aarch64-apple-darwin x86_64-apple-darwin \
                             aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
-          # cargo-zigbuild pinned to the locally-validated version (reproducibility).
-          # zig itself is brew-current: a zig bump is a LOUD build failure caught
-          # by this snapshot job before any tag (not a silent ship); pinning zig
-          # harder is a tracked follow-up (see the glibc-floor note in
-          # .goreleaser.host-agent.yaml).
-          brew install zig
+          # zig and cargo-zigbuild are both pinned. zig comes from
+          # scripts/release/install-zig.sh (a checksummed ziglang.org tarball),
+          # which the release job runs too; a zig bump is a change there, proven
+          # by this snapshot job before any tag.
+          scripts/release/install-zig.sh
           cargo install --locked --version 0.23.0 cargo-zigbuild
       # Mirrors the release job's guard (plan 002 D5): the split configs are
       # invoked sequentially and a before-hook MUST NOT mutate a tracked file

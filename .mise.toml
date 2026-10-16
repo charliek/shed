@@ -6,9 +6,8 @@ golangci-lint = "2.10.1"
 # goreleaser-action pins in ci.yml / publish-images.yaml — the point of a local
 # snapshot is to predict CI, so a patch drift defeats it. zig backs
 # `cargo zigbuild`, which goreleaser's `builder: rust` shells out to for the
-# *-unknown-linux-gnu cross targets; it is deliberately NOT version-matched to
-# CI, which does a bare `brew install zig` (a zig bump there is a loud
-# release-snapshot failure caught pre-tag, not a silent ship). `cargo-zigbuild`
-# itself is a `cargo install` (see RELEASING.md), not a mise tool.
+# *-unknown-linux-gnu cross targets; it matches the zig CI installs through
+# scripts/release/install-zig.sh (move both together). `cargo-zigbuild` itself
+# is a `cargo install` (see RELEASING.md), not a mise tool.
 goreleaser = "2.15.3"
-zig = "0.15.2"
+zig = "0.16.0"
