@@ -23,13 +23,18 @@
      confirmed" until the next `Settings` says what the session is at. Nothing
      is ever resent. The marks live in the PANEL (`useSettingChanges`), not
      here, so closing the sheet mid-change loses nothing.
+   * **A model says where its effort lands** (plan 032 §3.3): every model in
+     the list but the current one whose effort facts name a level — a native
+     session's — carries a dim `effort → <level>` under its name
+     (`secondaryLine`): a native switch moves the effort with the model, to
+     that level. An ACP session's models carry none.
    * **It reports what it rendered** (`reportLaneSettings` →
      `lane_settings.dump`), `null` when closed. */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, X } from "lucide-react";
 import {
-  changeFor, choiceName, markText, pressSends, rowNamed, settingsChip, settle, sheetRows, shownMark, usageMeter,
-  type RowMark, type SessionSettings, type SettingsRow,
+  changeFor, choiceName, markText, pressSends, rowNamed, secondaryLine, settingsChip, settle, sheetRows, shownMark,
+  usageMeter, type RowMark, type SessionSettings, type SettingsRow,
 } from "@/lib/laneSettings";
 import { laneFailure, laneSet, reportLaneSettings, type LaneSettingsReport } from "@/lib/bridge";
 
@@ -109,6 +114,7 @@ export function LaneSettingsSheet({
   kind,
   sessionId,
   settings,
+  effortOption,
   markOf,
   press,
   onClose,
@@ -117,6 +123,9 @@ export function LaneSettingsSheet({
   kind: string;
   sessionId: string;
   settings: SessionSettings;
+  /** The view's `effort_option` — which option the chip names as the
+   *  effort (the shared core's reading, plan 032 PC14h). */
+  effortOption: string | null;
   markOf: (r: SettingsRow) => RowMark | null;
   press: (r: SettingsRow, value: string) => void;
   onClose: () => void;
@@ -155,7 +164,7 @@ export function LaneSettingsSheet({
     machine,
     session_id: sessionId,
     lane_kind: kind,
-    chip: settingsChip(settings),
+    chip: settingsChip(settings, effortOption),
     rows: rows.map((r) => {
       const mark = markOf(r);
       return {
@@ -166,7 +175,9 @@ export function LaneSettingsSheet({
         control: r.control,
         current: r.current,
         current_name: choiceName(r.values, r.current),
-        values: r.values.map((v) => ({ id: v.id, name: v.name, selected: v.id === r.current })),
+        values: r.values.map((v) => ({
+          id: v.id, name: v.name, selected: v.id === r.current, secondary: secondaryLine(r, v),
+        })),
         state: mark?.state ?? null,
         text: markText(mark),
         enabled: mark?.state !== "pending",
@@ -253,6 +264,7 @@ export function LaneSettingsSheet({
                 <div className="mt-1.5 flex max-h-[180px] flex-col overflow-y-auto rounded-[9px] border border-shed-border bg-shed-surface">
                   {r.values.map((v) => {
                     const on = v.id === r.current;
+                    const secondary = secondaryLine(r, v);
                     return (
                       <button
                         key={v.id}
@@ -267,7 +279,17 @@ export function LaneSettingsSheet({
                         }}
                       >
                         <span className="w-3.5 flex-none">{on && <Check size={13} />}</span>
-                        <span className="min-w-0 flex-1 truncate">{v.name || v.id}</span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate">{v.name || v.id}</span>
+                          {secondary && (
+                            <span
+                              data-setting-secondary
+                              className="block truncate font-mono text-[11px] leading-snug text-shed-text-muted"
+                            >
+                              {secondary}
+                            </span>
+                          )}
+                        </span>
                       </button>
                     );
                   })}

@@ -60,7 +60,9 @@
 
    **The settings chip** (plan 025 §3.10): on a session whose streamed
    capabilities say `settings`, the header carries `<model name> · <effort
-   value> · fast` from the current values; pressing it opens the settings
+   value> · fast` from the current values — the effort being the option
+   `lane.messages`' `effort_option` names, the shared core's reading (plan
+   032 PC14h), never a guess made here; pressing it opens the settings
    sheet (`LaneSettings.tsx`) under the header. No chip, and no sheet even
    when asked for (`ui.show_lane_settings`), on a session that says no —
    hidden, never disabled. The panel counts the session's `Settings` frames
@@ -75,8 +77,13 @@
    goes through the same dispatch, so a typed `/help` is refused inline
    rather than sent as text. Each command runs on the lane's own verb — a rename, a mode (`lane.set`, its errors in the composer,
    P7), Stop behind its confirm, the model picker (the settings sheet), a
-   prompt row as a prompt. No menu on the view → the composer is as it always
-   was. */
+   prompt row as a prompt. `/effort` (plan 032 §3.2): bare, it opens the
+   settings sheet as `/model` does; with a level the shared dispatch matched,
+   it is a `lane.set` of that effort bound to its model, its errors in the
+   composer as a mode's are — sent even at the current level (craze's rule:
+   a dropped no-op could lose a concurrent change), where the sheet's press
+   on the current value sends nothing. No menu on the view → the composer is
+   as it always was. */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, OctagonX, ScrollText, Send, SlidersHorizontal, Square, X, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -680,7 +687,18 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
             setConfirmStop("slash");
             return;
           case "model_picker":
+          case "effort_picker":
+            // `/model`, bare `/effort`: the settings sheet, whose model list
+            // and effort row are those pickers; the draft clears.
             return settleSlash({ kind: "picker" }, at.rev);
+          case "set_effort":
+            // `/effort <level>` (plan 032 §3.2): the composer's verb, its
+            // errors here as a mode's — a `stale_model` (the model moved
+            // since the menu) included. Always sent, the current level too.
+            return slashVerb(async () => {
+              await laneSet(machine, kind, sessionId, action.change);
+              return { kind: "done" };
+            }, at.rev);
           default:
             return;
         }
@@ -934,7 +952,8 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  and that capability alone decides. */
   const offered = settingsOffered(capabilities);
   const settings = view?.settings ?? NO_SETTINGS;
-  const chip = offered ? settingsChip(settings) : null;
+  const effortOption = view?.effort_option ?? null;
+  const chip = offered ? settingsChip(settings, effortOption) : null;
 
   const pickedFor = (a: LaneApproval): string[][] =>
     picks[a.id] ?? a.questions.map(() => []);
@@ -1182,6 +1201,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
           kind={kind}
           sessionId={sessionId}
           settings={settings}
+          effortOption={effortOption}
           markOf={changes.markOf}
           press={changes.press}
           onClose={() => onSettingsOpen(false)}

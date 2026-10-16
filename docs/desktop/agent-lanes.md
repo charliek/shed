@@ -481,15 +481,34 @@ the panel only renders and handles keys.
   craze's update arrives. A mode row (`/plan`, `/ask`, `/agent`) changes the
   mode at once, even to the mode it is in. `/exit` opens Stop's confirm.
   `/model` opens the settings sheet's model list (no inline model yet).
+- **`/effort [<level>]`** (craze 0.2.0) is listed only while the current
+  model has an effort setting — a select whose id or name says effort or
+  reasoning (glm's `reasoning` counts), the same option the chip shows. A
+  model switch alone moves it: on a model with no effort setting the row
+  leaves the menu, and typing it says "the current model has no effort
+  setting". Bare, `/effort` opens the settings sheet (its effort row). With
+  a level it sets the effort at once, bound to the model you saw (a model
+  that changed meanwhile is refused like a stale sheet change). The level
+  matches by id exactly, then by id in any case, then by name; one that
+  names nothing — or more than one — is refused with craze's own words,
+  `no effort <typed>: one of <levels>`, and the draft is kept. `default` is
+  the model's default level, known only from a native session's effort
+  facts; elsewhere it is refused the same way. A level is sent even when it
+  is the current one (craze's rule: a dropped no-op could lose a concurrent
+  change) — unlike a press on the sheet's current value, which sends
+  nothing.
 - **While a turn runs**, a row that cannot run until it ends (a mode,
-  `/model`) is shown dimmed, "after this turn", and choosing it says so —
-  rather than hidden, because the limit is temporary.
+  `/model`, `/effort`) is shown dimmed, "after this turn", and choosing it
+  says so — rather than hidden, because the limit is temporary. A
+  `/effort <level>` is checked first: a level that names nothing is refused
+  for that, a valid one for the turn.
 - **Refused here, never sent.** A builtin this client does not run yet
   (`/help`, `/clear`, `/btw` and craze's other local rows) is refused with a
   reason when typed and sent — not passed to the agent as text. So is an
   argument to a row that takes none, and `/rename` with no title.
-- **The draft.** It clears when a command succeeds and when `/model` opens the
-  sheet; it stays — with craze's words, or the reason — when a command is
+- **The draft.** It clears when a command succeeds and when `/model` or a
+  bare `/effort` opens the sheet; it stays — with craze's words, or the
+  reason — when a command is
   refused, when its answer is lost ("may have applied — check the session"),
   and when Stop's confirm is answered Keep. A rename craze made but could not
   record shows as a warning, the draft cleared. A command only ever clears the
@@ -530,10 +549,20 @@ as malformed leaves the ask open (`bad_request`).
 On a session whose capabilities say `settings`, the transcript header carries
 a chip — `<model name> · <effort value> · fast`, from the current values, each
 part only when the session has it ("fast" only when it is on) — and the chip
-opens one sheet:
+(or `/model`, or a bare `/effort`) opens one sheet. Which option is the
+effort is craze's own rule (a select whose id or name says effort or
+reasoning, the id `effort` first), read once by the shared core — the same
+option `/effort` sets.
 
 - **Model** — a list, in craze's order: the current model, then the models
-  you used recently, then the rest of the catalog.
+  you used recently, then the rest of the catalog. On a native session each
+  model other than the current one carries a dim second line, `effort →
+  <level>`: the level a switch to it lands on — that model's last effort in
+  this session, else the one craze remembers for it, else its default — for
+  a native model switch moves the effort with the model. A model that says
+  neither shows no line, nor does the current model (its effort row shows
+  its effort). Only a native session states these effort facts, so on any
+  other session no model shows a line.
 - **Options** — the current model's own, `thought_level` first, then
   `model_config`, each in the provider's order. Four values or fewer are a
   segmented control; more are a list.

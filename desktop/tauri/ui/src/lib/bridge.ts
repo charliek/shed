@@ -1529,6 +1529,11 @@ export type LaneView = {
    *  arrived — then the composer offers no menu and sends a `/` draft as
    *  text. Handed back to the `lane_slash_*` commands as is; never edited. */
   slash_menu?: SlashMenu | null;
+  /** The id of `settings`' EFFORT option — craze's `EffortOption` rule, run
+   *  by the shared core (`LaneSettings::effort_option`, plan 032 §3.2,
+   *  PC14h) — or `null` when `settings` is or names none. What the chip shows
+   *  as the effort: read from here, never re-derived from the options. */
+  effort_option?: string | null;
 };
 
 /** One button an approval offers, exactly as the agent offered it.
@@ -1633,13 +1638,21 @@ export type LaneCapabilities = {
  * Mirrors of the shared core's types, as the `lane_slash_*` commands answer
  * them; the panel renders these and hands them back. */
 
-/** What running a shown row does (`SlashAction`). */
+/** What running a shown row does (`SlashAction`). `effort_picker` is
+ *  `/effort` (plan 032 §3.2): bare, it opens the settings sheet, whose effort
+ *  row is `option`; its `levels` and `default_level` are what the shared
+ *  dispatch matched a `/effort <level>` against — the panel never reads them.
+ *  `set_effort` is only ever a dispatch's answer to such a level, never a
+ *  row's: a `lane_set` of its `change` (a config change of the effort option
+ *  bound to `for_model`), sent even when it is the current level. */
 export type SlashAction =
   | { kind: "prompt" }
   | { kind: "set_title" }
   | { kind: "set_mode"; change: LaneSettingChange }
   | { kind: "stop" }
-  | { kind: "model_picker" };
+  | { kind: "model_picker" }
+  | { kind: "effort_picker"; option: string; for_model: string; levels: LaneChoice[]; default_level?: string | null }
+  | { kind: "set_effort"; change: LaneSettingChange };
 
 /** One shown row (`SlashMenuRow`). `arg` is the catalog's word (`none` |
  *  `optional` | `required`), for display. */
@@ -1688,8 +1701,27 @@ export type SlashAccept =
 export type SlashAcceptKey = "enter" | "tab" | "pick";
 
 /** One selectable value — a model, a mode, an option's value
- *  (`shed_core::lane::LaneChoice`). `id` is what a change sends back. */
-export type LaneChoice = { id: string; name: string; rank?: number | null; description?: string | null };
+ *  (`shed_core::lane::LaneChoice`). `id` is what a change sends back.
+ *  `effort` is a MODEL's effort facts (plan 032 §3.3), absent everywhere
+ *  else and on every model whose agent states none (an ACP session's). */
+export type LaneChoice = {
+  id: string;
+  name: string;
+  rank?: number | null;
+  description?: string | null;
+  effort?: LaneModelEffort | null;
+};
+
+/** What a model says about its effort before it is chosen
+ *  (`shed_core::lane::LaneModelEffort`, craze 0.2.0's per-model effort facts,
+ *  a native session's alone): its levels, its default, and the level a switch
+ *  to it lands on. The CURRENT model's effort is its effort option's
+ *  `current`, never these. */
+export type LaneModelEffort = {
+  efforts: string[];
+  default_effort?: string | null;
+  switch_effort?: string | null;
+};
 
 /** One of a model's own options (`shed_core::lane::LaneSetting`): its current
  *  value and the values it offers. `category` is an open string. */
@@ -2081,7 +2113,10 @@ export function reportLaneComposer(snapshot: LaneComposerReport | null): void {
  *  as, its values with the selected one, and its state — `pending` while a
  *  change awaits craze, `refused` with the text shown inline, or
  *  `not_confirmed` after an answer lost to a drop, until the next `Settings`.
- *  `enabled` is whether the row takes a press now. */
+ *  `enabled` is whether the row takes a press now. A value's `secondary` is
+ *  the dim line drawn under it — on the model list, `effort → <level>` for a
+ *  model other than the current one whose effort facts name the level a
+ *  switch lands on (plan 032 §3.3) — else `null`. */
 export type LaneSettingsReport = {
   machine: string;
   session_id: string;
@@ -2095,7 +2130,7 @@ export type LaneSettingsReport = {
     control: "segmented" | "list";
     current: string | null;
     current_name: string | null;
-    values: { id: string; name: string; selected: boolean }[];
+    values: { id: string; name: string; selected: boolean; secondary: string | null }[];
     state: "pending" | "refused" | "not_confirmed" | null;
     text: string | null;
     enabled: boolean;

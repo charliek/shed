@@ -226,6 +226,58 @@ mod tests {
         );
     }
 
+    /// **`/effort` crosses as the shapes `bridge.ts` mirrors** (plan 032
+    /// §3.2): the `effort_picker` row as `lane.messages` answers it — its
+    /// option, model, levels and default level — comes back through the three
+    /// commands intact. Bare (a pick on the completed draft too) it runs the
+    /// picker, which the panel opens the settings sheet for; a level matched
+    /// by id in any case is a `set_effort` whose `change` the panel hands to
+    /// `lane_set` verbatim; a level naming nothing is craze's refusal text;
+    /// a valid level mid-turn waits for the turn.
+    #[test]
+    fn an_effort_picker_crosses_and_its_level_is_a_set_effort() {
+        let picker = json!({"kind": "effort_picker", "option": "effort", "for_model": "grok-4.6",
+                            "levels": [{"id": "low", "name": "Low"}, {"id": "high", "name": "High"}],
+                            "default_level": "high"});
+        let effort_menu = json!({
+            "rows": [{"name": "effort", "source": "builtin", "arg": "optional", "arg_hint": "[level]",
+                      "while_working": false, "action": picker}],
+            "hidden": []
+        });
+
+        assert_eq!(
+            dispatch(effort_menu.clone(), "/effort", None).unwrap(),
+            json!({"kind": "run", "action": picker}),
+            "bare: the picker, every field across"
+        );
+        assert_eq!(
+            accept(effort_menu.clone(), "/eff", "effort", "pick", None).unwrap(),
+            json!({"kind": "dispatch", "dispatch": {"kind": "run", "action": picker}}),
+            "a pick runs the completed draft"
+        );
+        assert_eq!(
+            dispatch(effort_menu.clone(), "/effort LOW", None).unwrap(),
+            json!({"kind": "run", "action": {"kind": "set_effort", "change": {
+                "kind": "config", "id": "effort", "value": "low", "for_model": "grok-4.6"}}}),
+            "a level, by id in any case, bound to the picker's model"
+        );
+        assert_eq!(
+            dispatch(effort_menu.clone(), "/effort default", None).unwrap(),
+            json!({"kind": "run", "action": {"kind": "set_effort", "change": {
+                "kind": "config", "id": "effort", "value": "high", "for_model": "grok-4.6"}}}),
+            "`default` is the model's default level"
+        );
+        assert_eq!(
+            dispatch(effort_menu.clone(), "/effort bogus", None).unwrap(),
+            json!({"kind": "refuse", "reason": "no effort bogus: one of default, low, high"}),
+            "craze's own refusal text"
+        );
+        assert_eq!(
+            dispatch(effort_menu, "/effort low", Some("working")).unwrap(),
+            json!({"kind": "refuse", "reason": "/effort: runs after this turn"})
+        );
+    }
+
     /// **A turn is `working` or `needs_approval`** (P23), read off the
     /// activity word; anything else — an unknown word, none — is not.
     #[test]

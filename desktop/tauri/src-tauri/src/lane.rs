@@ -1724,7 +1724,7 @@ impl Lanes {
 
     /// `lane.messages` — the staged-then-swapped view, as this app's IPC
     /// payload: `{messages, activity, session, generation, stale, ended,
-    /// capabilities, settings}`.
+    /// finished, capabilities, settings, slash_menu, effort_option}`.
     ///
     /// `capabilities` and `settings` are the LIVE generation's (each `null`
     /// until a seed carrying it has swapped in), which is where a client reads
@@ -1783,6 +1783,11 @@ impl Lanes {
             // then the composer offers no menu. The panel hands it back to
             // the `lane_slash_*` commands; it never re-derives a rule.
             "slash_menu": snap.slash_menu,
+            // The id of `settings`' effort option (plan 032 §3.2, PC14h):
+            // craze's `EffortOption` rule, run once by the shared core — the
+            // option the chip names as the effort and `/effort` sets — or
+            // `null` when the settings shown are or name none.
+            "effort_option": snap.effort_option,
         }))
     }
 
@@ -4434,6 +4439,7 @@ mod tests {
             "the seed's capabilities, from the staged view: {view}"
         );
         assert_eq!(view["settings"], Value::Null, "opencode has no settings");
+        assert_eq!(view["effort_option"], Value::Null, "nor an effort option");
         assert_eq!(view["stale"], Value::Null);
         assert_eq!(view["ended"], false);
     }
@@ -4911,6 +4917,10 @@ mod tests {
         assert_eq!(rows.len(), 1, "{view}");
         assert_eq!(rows[0]["name"], "research");
         assert_eq!(rows[0]["action"], json!({"kind": "prompt"}));
+        // The settings' effort option rides the same reply (plan 032 PC14h):
+        // the seed's `effort` select on `grok`, by the shared core's rule.
+        assert_eq!(view["settings"]["model"], "grok", "{view}");
+        assert_eq!(view["effort_option"], "effort", "{view}");
 
         // A blank title: refused here, nothing sent.
         let blank = lanes.set_title(MACHINE, CRAZE, HOST, "  \t ").await;

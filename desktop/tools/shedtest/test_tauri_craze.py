@@ -1905,6 +1905,16 @@ def _catalog(app: TauriClient, host: str) -> list[str]:
     return [r["name"] for r in (_messages(app, host).get("slash_menu") or {}).get("rows", [])]
 
 
+def _effort_levels(app: TauriClient, host: str) -> list[str]:
+    """The level ids of the resolved menu's `/effort` row (its
+    `effort_picker`, plan 032 §3.2) on the lane — what a `/effort <level>`
+    is matched against and craze's refusal lists. Empty without the row."""
+    for r in (_messages(app, host).get("slash_menu") or {}).get("rows", []):
+        if r["name"] == "effort" and r["action"]["kind"] == "effort_picker":
+            return [lvl["id"] for lvl in r["action"]["levels"]]
+    return []
+
+
 def _menu(app: TauriClient) -> dict | None:
     """The composer's `/` menu as the panel rendered it (`lane.dump`)."""
     return (_dump(app) or {}).get("slash_menu")
@@ -2385,7 +2395,9 @@ def test_while_a_turn_runs_rows_dim_and_a_prompt_row_queues(app, rig, held):
     """**While working** (plan 029 X7/P29, P23, P26): with a turn held open,
     the rows that wait for the turn are listed DIMMED ("after this turn") —
     `rename`, `exit` and the agent's prompt row are not — and a click on a
-    dimmed `/plan` is refused inline, no `session.set` sent. A PROMPT row
+    dimmed `/plan` is refused inline, no `session.set` sent. So is a valid
+    `/effort low` (plan 032 §3.2), while `/effort bogus` is refused for its
+    level first, in craze's words. A PROMPT row
     queues: `/research deep dive` + Enter goes out as one queued
     `session.prompt` of the row's own spelling, the draft clears, and the
     agent does not read it while the turn holds; released, the agent reads
@@ -2437,6 +2449,24 @@ def test_while_a_turn_runs_rows_dim_and_a_prompt_row_queues(app, rig, held):
     assert _draft(app) == "/", "the draft kept"
     _settle(0.5)
     assert len(rig.sets()) == sets, "nothing sent"
+
+    # `/effort <level>` mid-turn (plan 032 §3.2): the level is judged FIRST —
+    # one that names nothing is refused for that, in craze's words — and a
+    # valid one is refused for the turn, as its dimmed row is. Nothing sent.
+    levels = _effort_levels(app, host)
+    assert levels, "the held session's model has an effort setting: /effort is its row"
+    levels = ", ".join(levels)
+    _type(app, "/effort bogus")
+    _key(app, "Enter")
+    app.wait_until(lambda: (_menu(app) or {}).get("refusal") == f"no effort bogus: one of {levels}",
+                   timeout=20, what="a level naming nothing refused for that, mid-turn")
+    _type(app, "/effort low")
+    _key(app, "Enter")
+    app.wait_until(lambda: (_menu(app) or {}).get("refusal") == "/effort: runs after this turn",
+                   timeout=20, what="a valid level refused for the turn")
+    assert _draft(app) == "/effort low", "the draft kept"
+    _settle(0.5)
+    assert len(rig.sets()) == sets, f"no effort was sent: {rig.sets()[sets:]}"
 
     prompts = len(rig.verbs("session.prompt"))
     _type(app, "/Research   deep dive ")
@@ -2694,6 +2724,268 @@ def test_a_name_at_create_titles_the_session_from_its_first_frame(app, rig):
     row = _exactly_one_session_in(app, cwd)
     assert row["slug"] == host and row["display_name"] == name, row
     _unmount(app)
+
+
+# ---------------------------------------------------------------------------
+# (2e) `/effort` and the effort facts (plan 032 §3.2, §3.3 — C3)
+# ---------------------------------------------------------------------------
+#
+# On the permodel session ((2c)'s, cursor's per-model catalogs): grok-4.6 and
+# claude-opus-5 offer an `effort` select, composer-2.5 none, glm-5.2 a
+# `reasoning` one. Whether `/effort` shows is the shared core's reading of the
+# session's SETTINGS (a current model with an effort option), so a model
+# switch — a settings change alone, the catalog as it was — moves the row.
+# Every change goes out through the rig's proxy (`sets.log`) and reaches the
+# agent's own record (`CRAZE_FAKE_DUMP_CALLS`, `_agent_sets`). An ACP session
+# states no per-model effort facts (they are a native session's), so its model
+# list carries no `effort → <level>` line; the line itself is the unit cells'
+# (`laneSettings.test.mjs`), there being no fake host that states the facts.
+
+#: craze's refusal of a level grok-4.6's effort select does not offer: its
+#: levels, as the agent spells them, and no `default, ` (no effort facts, so
+#: no default level).
+GROK_EFFORT_REFUSAL = "no effort {typed}: one of low, medium, high, xhigh"
+
+
+def _effort_sets(rig: CrazeEnv, before: int) -> list[dict]:
+    """The config `session.set`s the proxy carried since `before`."""
+    return [e["params"]["setting"] for e in rig.sets()[before:]
+            if e["params"]["setting"].get("kind") == "config"]
+
+
+def _option_current(app: TauriClient, host: str, option: str) -> str | None:
+    """The current value of the session's option `option` (`lane.messages`)."""
+    for o in (_messages(app, host).get("settings") or {}).get("options", []):
+        if o["id"] == option:
+            return o["current"]
+    return None
+
+
+def _on_model(app: TauriClient, host: str, model: str) -> None:
+    """Move the session to `model` through the production door (`lane.set`) —
+    a settings change, no new catalog — and wait until the lane has folded it
+    and the PANEL's chip names it: the panel's own read, so the menu the
+    composer filters is the new model's too."""
+    if (_messages(app, host).get("settings") or {}).get("model") != model:
+        _lane(app, "lane.set", host, change={"kind": "model", "id": model})
+    app.wait_until(lambda: (_messages(app, host).get("settings") or {}).get("model") == model,
+                   timeout=WAIT, what=f"the session on {model}")
+    name = next(m["name"] for m in _messages(app, host)["settings"]["models"] if m["id"] == model)
+    app.wait_until(lambda: ((_dump(app) or {}).get("settings_chip") or "").split(" · ")[0] == name,
+                   timeout=20, what=f"the panel's chip on {name}")
+
+
+def test_effort_follows_the_model_with_no_new_catalog(app, rig, permodel):
+    """**`/effort` shows only while the current model has an effort setting**
+    (plan 032 §3.2, PC7): on grok-4.6 it is listed and the lane names its
+    effort option; a switch to composer-2.5 — a settings change, the catalog
+    unchanged — takes the row out of the menu (every other row where it was)
+    and the effort out of the chip, and typed it is refused with the shared
+    core's reason, the draft kept, nothing sent; back on grok-4.6 the row
+    returns where it was."""
+    host = permodel["host"]
+    _menu_ready(app, host)
+    _type(app, "")
+    _on_model(app, host, "grok-4.6")
+    on_grok = _catalog(app, host)
+    assert "effort" in on_grok, on_grok
+    assert _messages(app, host)["effort_option"] == "effort"
+    _type(app, "/")
+    assert "effort" in _names(_wait_menu(app, "/"))
+    _type(app, "")
+
+    before = len(rig.sets())
+    _on_model(app, host, "composer-2.5")
+    view = _messages(app, host)
+    assert _catalog(app, host) == [n for n in on_grok if n != "effort"], \
+        f"only the effort row left: {_catalog(app, host)}"
+    hidden = {h["name"]: h["reason"] for h in view["slash_menu"]["hidden"]}
+    assert hidden.get("effort") == "the current model has no effort setting", hidden
+    assert view["effort_option"] is None, view["effort_option"]
+    assert _dump(app)["settings_chip"] in ("Composer 2.5", "Composer 2.5 · fast"), \
+        f"no effort in the chip: {_dump(app)['settings_chip']}"
+    _type(app, "/")
+    assert "effort" not in _names(_wait_menu(app, "/")), "the composer's menu lists no /effort"
+    _type(app, "/effort")
+    _key(app, "Enter")
+    app.wait_until(lambda: (_menu(app) or {}).get("refusal")
+                   == "/effort: the current model has no effort setting",
+                   timeout=20, what="a typed /effort refused on composer-2.5")
+    assert _draft(app) == "/effort", "the draft is kept"
+    _settle(0.5)
+    assert _effort_sets(rig, before) == [] and _settings(app) is None, "nothing sent, no sheet"
+    _shot(app, "craze-effort-hidden.png")
+
+    _type(app, "")
+    _on_model(app, host, "grok-4.6")
+    assert _catalog(app, host) == on_grok, "the row returns where it was"
+    _type(app, "/")
+    assert "effort" in _names(_wait_menu(app, "/"))
+    _type(app, "")
+
+
+def test_bare_effort_opens_the_sheet_and_no_acp_model_names_an_effort(app, rig, permodel):
+    """**Bare `/effort` is the effort picker: the settings sheet** (plan 032
+    §3.2, PC8): Enter on `/effort` clears the draft and opens the sheet, its
+    effort row the option the lane names; a pick of the row on `/eff` runs it
+    too (it takes no argument here, so a pick runs the completed draft).
+    Nothing is sent. **An ACP session's model list says nothing of effort**
+    (§3.3): no model carries effort facts, and the sheet draws no secondary
+    line under any of them — `secondary` is in the dump, `null`."""
+    host = permodel["host"]
+    _menu_ready(app, host)
+    _type(app, "")
+    _on_model(app, host, "grok-4.6")
+    before = len(rig.sets())
+    _type(app, "/effort")
+    _wait_menu(app, "/effort")
+    _key(app, "Enter")
+    app.wait_until(lambda: bool((d := _settings(app)) and d["session_id"] == host), timeout=WAIT,
+                   what="the settings sheet, opened by /effort")
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the picker clearing the draft")
+    d = _settings(app)
+    assert [r["id"] for r in d["rows"]] == ["model", "effort", "fast", "mode"], d["rows"]
+    effort = _row_of(app, "effort")
+    assert effort["current"] == _option_current(app, host, "effort"), effort
+    assert d["chip"].startswith(f"Grok 4.6 · {effort['current_name']}"), d["chip"]
+
+    models = _messages(app, host)["settings"]["models"]
+    assert all(m.get("effort") is None for m in models), f"an ACP session states no effort facts: {models}"
+    values = _row_of(app, "model")["values"]
+    assert [v["id"] for v in values] == [m["id"] for m in models]
+    assert [v["secondary"] for v in values] == [None] * len(values), \
+        f"no model of an ACP session says where its effort lands: {values}"
+    _shot(app, "craze-effort-sheet.png")
+
+    app.call("ui.close_lane_settings")
+    app.wait_until(lambda: _settings(app) is None, timeout=20, what="the sheet to close")
+    _type(app, "/eff")
+    _wait_menu(app, "/eff")
+    app.call("ui.pick_slash_row", {"name": "effort"})
+    app.wait_until(lambda: bool((d := _settings(app)) and d["session_id"] == host), timeout=WAIT,
+                   what="the settings sheet, opened by a pick of /effort")
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the pick clearing the draft")
+    _settle(0.5)
+    assert len(rig.sets()) == before, f"opening the picker sent nothing: {rig.sets()[before:]}"
+    app.call("ui.close_lane_settings")
+    app.wait_until(lambda: _settings(app) is None, timeout=20, what="the sheet to close")
+
+
+def test_an_effort_level_is_sent_bound_to_its_model_even_the_current_one(app, rig, permodel):
+    """**`/effort <level>` sets the effort from the composer** (plan 032
+    §3.2): `/effort low` sends ONE `session.set` — the lane's effort option,
+    `low`, bound to the model the menu was resolved on (`forModel`) — the
+    agent is asked for it, the session's effort and the chip follow, and the
+    draft clears; no sheet opens. `/effort LOW` matches the level by id in any
+    case, and — `low` now being the current level — is sent all the same
+    (craze's rule: a dropped no-op could lose a concurrent change), where a
+    press on the sheet's current value sends nothing."""
+    host = permodel["host"]
+    calls = permodel["calls"]
+    _menu_ready(app, host)
+    _type(app, "")
+    _on_model(app, host, "grok-4.6")
+
+    def to_level(level):
+        _type(app, f"/effort {level}")
+        _key(app, "Enter")
+        app.wait_until(lambda: _option_current(app, host, "effort") == level, timeout=WAIT,
+                       what=f"the session's effort at {level}")
+        app.wait_until(lambda: _draft(app) == "", timeout=20, what="the draft cleared")
+
+    # The session is module-scoped: start from a known level other than `low`
+    # and leave the effort where it was found, whatever this cell's order.
+    start = _option_current(app, host, "effort")
+    if start == "low":
+        to_level("high")
+    try:
+        before = len(rig.sets())
+        asked = _agent_sets(calls).count("effort=low")
+
+        to_level("low")
+        want = {"kind": "config", "id": "effort", "value": "low", "forModel": "grok-4.6"}
+        assert _effort_sets(rig, before) == [want], _effort_sets(rig, before)
+        assert _agent_sets(calls).count("effort=low") == asked + 1, _agent_sets(calls)
+        app.wait_until(lambda: ((_dump(app) or {}).get("settings_chip") or "").startswith("Grok 4.6 · Low"),
+                       timeout=20, what="the chip at Low")
+        assert (_menu(app) or {}).get("refusal") is None and _settings(app) is None
+
+        _type(app, "/effort LOW")
+        _key(app, "Enter")
+        app.wait_until(lambda: len(_effort_sets(rig, before)) == 2, timeout=WAIT,
+                       what="the current level sent again")
+        assert _effort_sets(rig, before) == [want, want], _effort_sets(rig, before)
+        app.wait_until(lambda: _draft(app) == "", timeout=20, what="the draft cleared")
+        assert (_menu(app) or {}).get("refusal") is None
+        assert _option_current(app, host, "effort") == "low"
+        _shot(app, "craze-effort-set.png")
+    finally:
+        if start and _option_current(app, host, "effort") != start:
+            to_level(start)
+
+
+def test_an_effort_level_naming_nothing_is_refused_in_crazes_words(app, rig, permodel):
+    """**A level the option does not offer is refused with craze's own text**
+    (plan 032 §3.2, PC9): `/effort bogus` reads `no effort bogus: one of low,
+    medium, high, xhigh` — the draft kept, nothing sent. `default` is
+    reserved for the model's default level, which only effort facts state:
+    an ACP session has none, so `/effort default` is refused the same way."""
+    host = permodel["host"]
+    _menu_ready(app, host)
+    _type(app, "")
+    _on_model(app, host, "grok-4.6")
+    assert _effort_levels(app, host) == ["low", "medium", "high", "xhigh"]
+    before = len(rig.sets())
+    for typed in ["bogus", "default"]:
+        _type(app, f"/effort {typed}")
+        _key(app, "Enter")
+        app.wait_until(lambda: (_menu(app) or {}).get("refusal") == GROK_EFFORT_REFUSAL.format(typed=typed),
+                       timeout=20, what=f"/effort {typed} refused")
+        assert _draft(app) == f"/effort {typed}", "the draft is kept"
+        if typed == "bogus":
+            _shot(app, "craze-effort-refused.png")
+    _settle()
+    assert len(rig.sets()) == before, f"nothing was sent: {rig.sets()[before:]}"
+    _type(app, "")
+
+
+def test_glm_reasoning_is_its_effort(app, rig, permodel):
+    """**A `reasoning` select is an effort** (plan 032 §3.2, craze's
+    `EffortOption`): on glm-5.2 the lane names `reasoning` as the effort
+    option, `/effort` is listed and the chip shows its value; `/effort <the
+    other level>` sends a config change of `reasoning`, bound to glm-5.2, and
+    the agent is asked for it. The session goes back to grok-4.6 after."""
+    host = permodel["host"]
+    calls = permodel["calls"]
+    _menu_ready(app, host)
+    _type(app, "")
+    try:
+        _on_model(app, host, "glm-5.2")
+        view = _messages(app, host)
+        assert view["effort_option"] == "reasoning", view["effort_option"]
+        assert "effort" in _catalog(app, host), _catalog(app, host)
+        assert _effort_levels(app, host) == ["high", "max"]
+        current = _option_current(app, host, "reasoning")
+        names = {"high": "High", "max": "Max"}
+        app.wait_until(lambda: (_dump(app) or {}).get("settings_chip") == f"GLM 5.2 · {names[current]}",
+                       timeout=20, what="the chip naming the reasoning value")
+        target = "max" if current != "max" else "high"
+        before = len(rig.sets())
+        _type(app, f"/effort {target}")
+        _key(app, "Enter")
+        app.wait_until(lambda: _option_current(app, host, "reasoning") == target, timeout=WAIT,
+                       what=f"glm-5.2's reasoning at {target}")
+        assert _effort_sets(rig, before) == [
+            {"kind": "config", "id": "reasoning", "value": target, "forModel": "glm-5.2"}], \
+            _effort_sets(rig, before)
+        assert f"reasoning={target}" in _agent_sets(calls), _agent_sets(calls)
+        app.wait_until(lambda: (_dump(app) or {}).get("settings_chip") == f"GLM 5.2 · {names[target]}",
+                       timeout=20, what="the chip following")
+        app.wait_until(lambda: _draft(app) == "", timeout=20, what="the draft cleared")
+        _shot(app, "craze-effort-reasoning.png")
+    finally:
+        _type(app, "")
+        _on_model(app, host, "grok-4.6")
 
 
 # ---------------------------------------------------------------------------
