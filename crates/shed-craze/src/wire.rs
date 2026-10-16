@@ -771,6 +771,7 @@ pub struct Catalogs {
 
 /// One model: the info document's, and a `catalog` section's (one shape).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CatalogModel {
     #[serde(default)]
     pub id: String,
@@ -780,6 +781,18 @@ pub struct CatalogModel {
     /// absent for a model not remembered.
     #[serde(default)]
     pub recent: Option<u32>,
+    /// Its **effort facts** (craze 0.2.0, PM "The session info document",
+    /// plan 032 §3.3) — a native session's alone (`capabilities.effortFacts`),
+    /// absent for every ACP provider's model and on an older host: the
+    /// levels it offers, in order (empty for a model with no effort control)…
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    /// …its default level…
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    /// …and the level a switch to it lands on.
+    #[serde(default)]
+    pub switch_effort: Option<String>,
 }
 
 /// One mode.

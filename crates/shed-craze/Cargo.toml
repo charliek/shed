@@ -59,6 +59,11 @@ shed-craze = { path = ".", features = ["test-support"] }
 # 025 §3.2.4), behind shed-core's own `test-support`. A dev-dependency
 # (resolver v2), so the shipped build never carries the kit.
 shed-core = { path = "../shed-core", features = ["test-support"] }
+# `shed_app::slash_menu` — the shared `/` rule both clients run — so a wire
+# cell can judge what a recording's settings make of `/effort` (plan 032
+# §3.3, WIRE/33). Default features (no broker), a workspace member: no crate
+# joins the lock, and shed-app does not depend on this crate, so no cycle.
+shed-app = { path = "../shed-app" }
 
 # The manual verification tool and the smallest proof the contract is usable
 # from OUTSIDE this crate: past building the source it calls nothing but

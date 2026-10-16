@@ -3358,6 +3358,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "shed-app",
  "shed-core",
  "shed-craze",
  "thiserror 1.0.69",

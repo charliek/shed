@@ -29,8 +29,14 @@
 //!   carries) and `session.setTitle`.
 //! - **The slash catalog and the title (plan 029)**: WIRE/30's and WIRE/31's
 //!   catalogs — the snapshot's and each delta's — fold into the rows craze
-//!   wrote, the rename's delta into the title, and the hub's `createTitle`
-//!   and the session's `slashCatalog` into the contract's capabilities.
+//!   wrote (craze 0.2.0's `/effort` as the effort picker, plan 032), the
+//!   rename's delta into the title, and the hub's `createTitle` and the
+//!   session's `slashCatalog` into the contract's capabilities.
+//! - **The effort facts (plan 032 §3.3)**: WIRE/33's per-model `efforts`,
+//!   `defaultEffort` and `switchEffort` — the attach's and the live models
+//!   refresh's — fold into each model's `LaneChoice::effort`, and the shared
+//!   `/` rule offers `/effort` on that recording's settings and refuses
+//!   `/effort default` there.
 //! - **What the source makes of those answers** is the contract's: rows keyed
 //!   by hostId, an upsert with an open ask, a remove; craze's provider order;
 //!   the created row and its prompt; P14's start failure with its cause.
@@ -40,11 +46,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use shed_app::slash_menu::{self, SlashAction, SlashDispatch};
 use shed_core::lane::conformance::{drive_source, SourceChecker};
 use shed_core::lane::{
-    AgentSource, LaneCreateRequest, LaneError, LanePromptOutcome, LaneProviderState,
-    LaneSettingChange, LaneSlashArg, LaneSlashKind, LaneSlashMethod, LaneSlashPicker,
-    LaneSlashRequires, LaneSlashRow, LaneSlashSource, SourceEvent,
+    AgentSource, LaneCapabilities, LaneCreateRequest, LaneError, LaneModelEffort,
+    LanePromptOutcome, LaneProviderState, LaneSettingChange, LaneSettings, LaneSlashArg,
+    LaneSlashKind, LaneSlashMethod, LaneSlashPicker, LaneSlashRequires, LaneSlashRow,
+    LaneSlashSource, SourceEvent,
 };
 use shed_core::rc::RcActivity;
 use shed_craze::conn::{check_protocol_and_codecs, judge_hub_hello};
@@ -684,6 +692,31 @@ fn slash_names(rows: &[LaneSlashRow]) -> Vec<&str> {
     rows.iter().map(|r| r.name.as_str()).collect()
 }
 
+/// craze 0.2.0's builtin `/effort` row (WIRE/30's and WIRE/31's), decoded
+/// into the variants plan 032 §3.2 named: `requires: effort`, the effort
+/// picker, an optional `<level>`, no `whileWorking`.
+fn assert_effort_row(effort: &LaneSlashRow) {
+    assert_eq!(
+        (
+            &effort.source,
+            &effort.requires,
+            &effort.run.kind,
+            &effort.run.picker
+        ),
+        (
+            &LaneSlashSource::Builtin,
+            &Some(LaneSlashRequires::Effort),
+            &LaneSlashKind::Picker,
+            &Some(LaneSlashPicker::Effort)
+        )
+    );
+    assert_eq!(
+        (&effort.run.arg, effort.run.arg_hint.as_deref()),
+        (&LaneSlashArg::Optional, Some("<level>"))
+    );
+    assert!(!effort.while_working);
+}
+
 /// The `s2c` messages of conn 1 of a fixture, in order.
 fn s2c(lines: &[Value]) -> Vec<Value> {
     lines
@@ -760,17 +793,9 @@ fn wire_30_folds_into_crazes_catalog() {
     let exit = row("exit");
     assert_eq!(exit.requires, Some(LaneSlashRequires::Stop));
     assert_eq!(exit.run.method, Some(LaneSlashMethod::Stop));
-    // craze 0.2.0's `/effort`: a picker shed has no verb for yet, kept as
-    // craze wrote it.
-    let effort = row("effort");
-    assert_eq!(
-        (&effort.requires, &effort.run.kind, &effort.run.picker),
-        (
-            &Some(LaneSlashRequires::Other("effort".into())),
-            &LaneSlashKind::Picker,
-            &Some(LaneSlashPicker::Other("effort".into()))
-        )
-    );
+    // craze 0.2.0's `/effort` (plan 032 §3.2): the effort picker, requiring
+    // the session's effort, its `<level>` optional.
+    assert_effort_row(&row("effort"));
     let research = row("research");
     assert_eq!(
         (&research.source, &research.run.kind, research.while_working),
@@ -837,6 +862,7 @@ fn wire_31_folds_into_the_native_catalog_and_the_renamed_title() {
     fold.restore(attach.snapshot.as_ref().unwrap()).unwrap();
     assert_eq!(fold.title(), None, "an untitled session");
     let rows = fold.slash().unwrap().rows.clone();
+    assert_effort_row(rows.iter().find(|r| r.name == "effort").unwrap());
     let connect = rows.iter().find(|r| r.name == "connect").unwrap();
     assert_eq!(connect.run.local.as_deref(), Some("connect"));
     assert!(!connect.while_working);
@@ -873,6 +899,159 @@ fn wire_31_folds_into_the_native_catalog_and_the_renamed_title() {
     assert!(
         !fold.take_slash_changed(),
         "a title-only delta leaves the catalog"
+    );
+}
+
+/// The models of `s` in the order a client lists them, each with its effort
+/// facts.
+fn facts(s: &LaneSettings) -> Vec<(String, Option<LaneModelEffort>)> {
+    s.models
+        .iter()
+        .map(|m| (m.id.clone(), m.effort.clone()))
+        .collect()
+}
+
+/// A model with effort facts, as [`facts`] lists it.
+fn fact(
+    id: &str,
+    efforts: &[&str],
+    default_effort: &str,
+    switch_effort: &str,
+) -> (String, Option<LaneModelEffort>) {
+    let effort = LaneModelEffort {
+        efforts: efforts.iter().map(|e| e.to_string()).collect(),
+        default_effort: Some(default_effort.to_string()),
+        switch_effort: Some(switch_effort.to_string()),
+    };
+    (id.to_string(), Some(effort))
+}
+
+/// **WIRE/33 (a native session's per-model effort facts, craze 0.2.0)**
+/// decodes into `LaneChoice::effort` per model (plan 032 §3.3): the attach's
+/// info document gives each model its levels, default and switch level —
+/// `None` for the model with no effort control — in craze's order; the
+/// catalog delta (a live models refresh, revision 1) replaces them with the
+/// new switch levels and ranks; the second connection's attach carries what
+/// the delta left.
+///
+/// And what the shared `/` rule makes of that recording's settings (PC9):
+/// its current model `grok` is absent from its catalog, so it has an effort
+/// option (`effort`, low/medium/high) and no facts — `/effort` is offered,
+/// and `/effort default` refused with craze's text, since there is no
+/// default level to resolve it to. The row is WIRE/31's (the same native
+/// builtins; WIRE/33's fake host states no catalog of its own).
+#[test]
+fn wire_33_decodes_each_models_effort_facts() {
+    let lines = fixture("33-");
+    let msgs = s2c(&lines);
+    let attach: wire::AttachResult = serde_json::from_value(msgs[1]["result"].clone()).unwrap();
+    let mut fold = shed_craze::fold::CrazeFold::new("0123456789ab");
+    fold.restore(attach.snapshot.as_ref().unwrap()).unwrap();
+    fold.apply_info(&attach.session);
+    let seeded = fold.settings().lane_settings();
+    assert_eq!(seeded.model.as_deref(), Some("grok"));
+    let muse = ["minimal", "low", "medium", "high", "xhigh", "max"];
+    assert_eq!(
+        facts(&seeded),
+        [
+            fact("muse-wonder-1.0", &muse, "high", "max"),
+            fact("glm-5.3", &["low", "high", "max"], "max", "max"),
+            ("other/plain".to_string(), None),
+        ],
+        "the remembered model first (grok, the current one, is not listed)"
+    );
+    assert!(
+        seeded
+            .options
+            .iter()
+            .all(|o| o.values.iter().all(|v| v.effort.is_none()))
+            && seeded.modes.iter().all(|m| m.effort.is_none()),
+        "facts ride models alone"
+    );
+
+    let refresh = msgs
+        .iter()
+        .find(|m| m["params"]["event"]["state"].get("catalog").is_some())
+        .expect("the catalog delta");
+    fold.apply(&refresh["params"]["event"]);
+    assert!(fold.take_settings_changed());
+    let refreshed = fold.settings().lane_settings();
+    let want = [
+        fact("glm-5.3", &["low", "high", "max"], "max", "high"),
+        fact("muse-wonder-1.0", &muse, "high", "low"),
+        ("other/plain".to_string(), None),
+    ];
+    assert_eq!(
+        facts(&refreshed),
+        want,
+        "the refresh's ranks and switch levels"
+    );
+
+    let reply = conn_lines(&lines, 2)
+        .into_iter()
+        .find(|l| l["dir"] == "s2c" && l["msg"]["id"] == "2")
+        .unwrap();
+    let again: wire::AttachResult = serde_json::from_value(reply["msg"]["result"].clone()).unwrap();
+    let mut reseeded = shed_craze::fold::CrazeFold::new("0123456789ab");
+    reseeded.restore(again.snapshot.as_ref().unwrap()).unwrap();
+    reseeded.apply_info(&again.session);
+    assert_eq!(facts(&reseeded.settings().lane_settings()), want);
+
+    // `/effort` on the recording's settings, through the shared rule.
+    let native = s2c(&fixture("31-"));
+    let native: wire::AttachResult = serde_json::from_value(native[1]["result"].clone()).unwrap();
+    let mut catalog_fold = shed_craze::fold::CrazeFold::new("0123456789ab");
+    catalog_fold
+        .restore(native.snapshot.as_ref().unwrap())
+        .unwrap();
+    let catalog = catalog_fold.slash().unwrap().clone();
+    let caps = LaneCapabilities {
+        slash: true,
+        ..shed_craze::lane_capabilities(&attach.session.capabilities, fold.settings().has_any())
+    };
+    assert!(caps.settings);
+    let menu = slash_menu::resolve(&catalog, &caps, Some(&refreshed));
+    let effort = menu
+        .rows
+        .iter()
+        .find(|r| r.name == "effort")
+        .expect("/effort is offered: grok has an effort option");
+    let SlashAction::EffortPicker {
+        option,
+        for_model,
+        levels,
+        default_level,
+    } = &effort.action
+    else {
+        panic!("not the effort picker: {:?}", effort.action)
+    };
+    assert_eq!(
+        (option.as_str(), for_model.as_str(), default_level),
+        ("effort", "grok", &None),
+        "no facts for grok: no default level"
+    );
+    assert_eq!(
+        levels.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+        ["low", "medium", "high"]
+    );
+    assert_eq!(
+        slash_menu::dispatch(&menu, "/effort default", false),
+        SlashDispatch::Refuse {
+            reason: "no effort default: one of low, medium, high".into()
+        }
+    );
+    assert_eq!(
+        slash_menu::dispatch(&menu, "/effort High", false),
+        SlashDispatch::Run {
+            action: SlashAction::SetEffort {
+                change: LaneSettingChange::Config {
+                    id: "effort".into(),
+                    value: "high".into(),
+                    for_model: Some("grok".into()),
+                }
+            },
+            arg: None
+        }
     );
 }
 

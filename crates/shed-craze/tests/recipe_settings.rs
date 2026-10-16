@@ -180,7 +180,10 @@ async fn seeded(
 /// `model_config`, each in the provider's order; the modes as the catalog
 /// lists them. A model change re-emits `Settings` with the new model's own
 /// options (claude-opus-5's four, reordered); a config change and a mode
-/// change each come back the same way.
+/// change each come back the same way. Along the way, craze's effort rule
+/// (`LaneSettings::effort_option`, plan 032 §3.2) names each model's effort:
+/// `effort` on grok-4.6 and claude-opus-5, none on composer-2.5, glm-5.2's
+/// `reasoning` select — and no model carries effort facts (an ACP session).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_settings_follow_crazes_order_and_a_model_change_redraws_the_options() {
     let Some(bins) =
@@ -208,6 +211,14 @@ async fn the_settings_follow_crazes_order_and_a_model_change_redraws_the_options
         assert_eq!(ids(&s.modes, |m| &m.id), ["agent", "plan", "ask"]);
         assert_eq!(s.mode.as_deref(), Some("agent"));
         assert_eq!(s.usage, None, "an ACP session reports no usage");
+        // Plan 032: the effort option craze's rule names, and no model with
+        // effort facts — an ACP session states none (§3.3).
+        assert_eq!(effort_of(&s), Some("effort"));
+        assert!(
+            s.models.iter().all(|m| m.effort.is_none()),
+            "{:?}",
+            s.models
+        );
 
         lane.set(LaneSettingChange::Model {
             id: "claude-opus-5".into(),
@@ -233,6 +244,11 @@ async fn the_settings_follow_crazes_order_and_a_model_change_redraws_the_options
             ids(&effort.values, |v| &v.id),
             ["low", "medium", "high", "xhigh", "max"],
             "a select's values keep the provider's order"
+        );
+        assert_eq!(
+            effort_of(&s),
+            Some("effort"),
+            "the id `effort`, not `thinking` (thought_level too) listed before it"
         );
 
         lane.set(LaneSettingChange::Config {
@@ -270,8 +286,27 @@ async fn the_settings_follow_crazes_order_and_a_model_change_redraws_the_options
             ["fast"],
             "a model with no effort offers none"
         );
+        assert_eq!(effort_of(&s), None);
+
+        // glm-5.2's `reasoning` select is its effort (plan 032 §7 W2).
+        lane.set(LaneSettingChange::Model {
+            id: "glm-5.2".into(),
+        })
+        .await
+        .unwrap();
+        let s = settings_where(&mut rx, &mut checker, "glm's Settings", |s| {
+            s.model.as_deref() == Some("glm-5.2")
+        })
+        .await;
+        assert_eq!(effort_of(&s), Some("reasoning"), "{:?}", s.options);
     }
     recipe.teardown().await.unwrap();
+}
+
+/// The settings' effort option ([`LaneSettings::effort_option`], craze's
+/// `EffortOption` rule): its id.
+fn effort_of(s: &LaneSettings) -> Option<&str> {
+    s.effort_option().map(|o| o.id.as_str())
 }
 
 /// **A config change is bound to the model it was chosen for** (plan 025

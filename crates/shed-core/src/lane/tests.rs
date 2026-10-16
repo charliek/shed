@@ -1778,6 +1778,7 @@ fn the_new_lane_frames_are_tagged_and_nested() {
             name: "Model one".into(),
             rank: Some(1),
             description: None,
+            effort: None,
         }],
         ..LaneSettings::default()
     };
@@ -2084,6 +2085,7 @@ fn create_options_created_and_settings_round_trip_and_tolerate() {
             name: "Model one".into(),
             rank: Some(2),
             description: Some("the fast one".into()),
+            effort: None,
         }],
         mode: Some("default".into()),
         modes: vec![LaneChoice {
@@ -2091,6 +2093,7 @@ fn create_options_created_and_settings_round_trip_and_tolerate() {
             name: "Default".into(),
             rank: None,
             description: None,
+            effort: None,
         }],
         options: vec![LaneSetting {
             id: "effort".into(),
@@ -2102,6 +2105,7 @@ fn create_options_created_and_settings_round_trip_and_tolerate() {
                 name: "High".into(),
                 rank: None,
                 description: None,
+                effort: None,
             }],
         }],
         usage: Some(LaneUsage {
@@ -2413,6 +2417,7 @@ fn the_slash_enums_are_bare_strings_and_keep_an_unknown_word() {
         &[
             (LaneSlashRequires::Stop, "stop"),
             (LaneSlashRequires::Aside, "aside"),
+            (LaneSlashRequires::Effort, "effort"),
         ],
         LaneSlashRequires::Other,
     );
@@ -2451,7 +2456,13 @@ fn the_slash_enums_are_bare_strings_and_keep_an_unknown_word() {
         let back: LaneSlashMethod = serde_json::from_value(encoded).unwrap();
         assert!(!back.is_known(), "{bare}");
     }
-    check(&[(LaneSlashPicker::Model, "model")], LaneSlashPicker::Other);
+    check(
+        &[
+            (LaneSlashPicker::Model, "model"),
+            (LaneSlashPicker::Effort, "effort"),
+        ],
+        LaneSlashPicker::Other,
+    );
     assert!(LaneSlashKind::Prompt.is_known());
     assert!(!LaneSlashKind::Other("dance".into()).is_known());
     assert_eq!(LaneSlashArg::default(), LaneSlashArg::None);
@@ -2526,4 +2537,209 @@ fn a_pre_029_producer_decodes_with_the_new_fields_defaulted() {
     );
     let empty: LaneSlashCatalog = serde_json::from_value(json!({})).expect("no rows");
     assert!(empty.rows.is_empty());
+}
+
+// ---- effort (plan 032 §3.2, §3.3) ----
+
+/// **A model's effort facts ride its `LaneChoice`** (plan 032 §3.3):
+/// snake_case, every `None` omitted — so a choice without facts writes what
+/// a pre-032 build wrote — and tolerant inbound: a pre-032 choice decodes
+/// with none, a sparse facts object with its members defaulted.
+#[test]
+fn a_models_effort_facts_round_trip_and_tolerate_a_sparse_producer() {
+    let model = LaneChoice {
+        id: "glm-5.3".into(),
+        name: "GLM 5.3 (Z.AI)".into(),
+        rank: Some(1),
+        description: None,
+        effort: Some(LaneModelEffort {
+            efforts: vec!["low".into(), "high".into(), "max".into()],
+            default_effort: Some("max".into()),
+            switch_effort: Some("high".into()),
+        }),
+    };
+    assert_eq!(
+        round_trip(&model),
+        json!({"id": "glm-5.3", "name": "GLM 5.3 (Z.AI)", "rank": 1, "effort": {
+            "efforts": ["low", "high", "max"], "default_effort": "max", "switch_effort": "high"}})
+    );
+    let plain = LaneChoice {
+        effort: None,
+        ..model.clone()
+    };
+    assert_eq!(
+        round_trip(&plain),
+        json!({"id": "glm-5.3", "name": "GLM 5.3 (Z.AI)", "rank": 1}),
+        "no facts is no member — a pre-032 build's JSON"
+    );
+    let levels_alone = LaneModelEffort {
+        efforts: vec!["low".into()],
+        ..LaneModelEffort::default()
+    };
+    assert_eq!(
+        round_trip(&levels_alone),
+        json!({"efforts": ["low"]}),
+        "no default and no switch level: omitted, never null"
+    );
+
+    let old: LaneChoice =
+        serde_json::from_value(json!({"id": "m", "name": "M"})).expect("a pre-032 choice");
+    assert_eq!(old.effort, None);
+    let sparse: LaneModelEffort =
+        serde_json::from_value(json!({"default_effort": "high", "later": 1})).expect("sparse");
+    assert_eq!(
+        sparse,
+        LaneModelEffort {
+            default_effort: Some("high".into()),
+            ..LaneModelEffort::default()
+        }
+    );
+    let settings: LaneSettings = serde_json::from_value(json!({"model": "m", "models": [
+        {"id": "m", "name": "M", "effort": {"efforts": ["low", "high"], "switch_effort": "low"}}]}))
+    .expect("inside its settings");
+    assert_eq!(
+        settings.models[0]
+            .effort
+            .as_ref()
+            .and_then(|e| e.switch_effort.as_deref()),
+        Some("low")
+    );
+}
+
+/// An option for [`LaneSettings::effort_option`]'s table: `values` are its
+/// value ids, each named by its id.
+fn option(id: &str, name: &str, category: &str, values: &[&str]) -> LaneSetting {
+    LaneSetting {
+        id: id.into(),
+        name: name.into(),
+        category: category.into(),
+        current: values.first().copied().unwrap_or_default().into(),
+        values: values
+            .iter()
+            .map(|v| LaneChoice {
+                id: (*v).into(),
+                name: (*v).into(),
+                rank: None,
+                description: None,
+                effort: None,
+            })
+            .collect(),
+    }
+}
+
+/// **The effort option is craze's `agent.EffortOption`, rule for rule**
+/// (plan 032 §3.2, PC14h): which options qualify (values, and `effort` or
+/// `reasoning` in the id or name, any case) and which one wins (the id
+/// `effort` first, then `model_option`, then `thought_level`, then the
+/// rest; the first listed on a tie). The cases are the fakes' and fixtures'
+/// real shapes plus each rule's edge.
+#[test]
+fn the_effort_option_is_crazes_rule() {
+    let lh = &["low", "high"][..];
+    let cases: Vec<(&str, Vec<LaneSetting>, Option<&str>)> = vec![
+        ("no options", vec![], None),
+        (
+            "cursor's (WIRE/01, permodel grok-4.6): effort beside fast",
+            vec![
+                option(
+                    "effort",
+                    "Effort",
+                    "thought_level",
+                    &["low", "medium", "high"],
+                ),
+                option("fast", "Fast", "model_config", &["false", "true"]),
+            ],
+            Some("effort"),
+        ),
+        (
+            "grok's (the fake agent's grok scripts): the id reasoning_effort",
+            vec![option("reasoning_effort", "Effort", "model_option", lh)],
+            Some("reasoning_effort"),
+        ),
+        (
+            "glm-5.2's reasoning select (permodel)",
+            vec![option("reasoning", "Reasoning", "thought_level", lh)],
+            Some("reasoning"),
+        ),
+        (
+            "by its name alone",
+            vec![option("lvl", "Reasoning Effort", "x", lh)],
+            Some("lvl"),
+        ),
+        (
+            "any case, in the id",
+            vec![option("Model_REASONING", "x", "x", lh)],
+            Some("Model_REASONING"),
+        ),
+        (
+            "no values: not an effort",
+            vec![option("effort", "Effort", "thought_level", &[])],
+            None,
+        ),
+        (
+            "cursor's thinking is no effort (by id and name), whatever its category",
+            vec![option("thinking", "Thinking", "thought_level", lh)],
+            None,
+        ),
+        (
+            "the id `effort`, any case, outranks every category",
+            vec![
+                option("reasoning_effort", "Effort", "model_option", lh),
+                option("EFFORT", "Effort", "x", lh),
+            ],
+            Some("EFFORT"),
+        ),
+        (
+            "claude-opus-5's (permodel): thinking first, then the effort",
+            vec![
+                option("thinking", "Thinking", "thought_level", lh),
+                option("effort", "Effort", "thought_level", lh),
+                option("context", "Context", "model_config", lh),
+            ],
+            Some("effort"),
+        ),
+        (
+            "model_option before thought_level",
+            vec![
+                option("a_effort", "A", "thought_level", lh),
+                option("b_effort", "B", "model_option", lh),
+            ],
+            Some("b_effort"),
+        ),
+        (
+            "thought_level before any other category",
+            vec![
+                option("p_reasoning", "P", "model_config", lh),
+                option("q_reasoning", "Q", "thought_level", lh),
+            ],
+            Some("q_reasoning"),
+        ),
+        (
+            "a tie: the first listed",
+            vec![
+                option("x_effort", "X", "other", lh),
+                option("y_reasoning", "Y", "other", lh),
+            ],
+            Some("x_effort"),
+        ),
+        (
+            "one that qualifies after one that does not",
+            vec![
+                option("fast", "Fast", "model_config", &["false", "true"]),
+                option("think", "Reasoning", "model_config", lh),
+            ],
+            Some("think"),
+        ),
+    ];
+    for (what, options, want) in cases {
+        let settings = LaneSettings {
+            options,
+            ..LaneSettings::default()
+        };
+        assert_eq!(
+            settings.effort_option().map(|o| o.id.as_str()),
+            want,
+            "{what}"
+        );
+    }
 }

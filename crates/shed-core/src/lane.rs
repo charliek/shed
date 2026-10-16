@@ -232,7 +232,11 @@
 //! session whose capabilities do not say `slash` (the conformance kit's
 //! `SlashNotAdvertised`). It is not a part of [`LaneSettings`]: a catalog is
 //! not gated on `settings`, and hundreds of rows have no business riding
-//! every model change.
+//! every model change. One row is decided by the settings all the same:
+//! `requires: effort` ([`LaneSlashRequires::Effort`], craze 0.2.0's
+//! `/effort`) is not a capability but "the current model has an effort
+//! option" ([`LaneSettings::effort_option`]), so a client re-judges its menu
+//! when the settings change, not only when the catalog does (plan 032 §3.2).
 //!
 //! # Generations are matched, not assumed
 //!
@@ -2258,6 +2262,11 @@ pub struct LaneChoice {
     pub rank: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// A MODEL's effort facts (plan 032 §3.3) — `None` on a mode, on an
+    /// option's value, and on a model whose agent states none (every ACP
+    /// session's, an older host's, a model with no effort control).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<LaneModelEffort>,
 }
 
 /// One of a model's options.
@@ -2317,6 +2326,100 @@ pub enum LaneSettingChange {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         for_model: Option<String>,
     },
+}
+
+// ---- effort (plan 032 §3.2, §3.3) ----
+
+/// What a model says about its effort before it is chosen — craze 0.2.0's
+/// per-model **effort facts** (`catalogs.models[].efforts` / `defaultEffort` /
+/// `switchEffort`, a native session's alone), on [`LaneChoice::effort`].
+///
+/// The CURRENT model's effort is never read from here: it is its effort
+/// option's `current` ([`LaneSettings::effort_option`]), as craze says a client
+/// reads it. What this adds is the levels of a model the session is not on,
+/// and the level a switch to it would land on.
+///
+/// **Inbound, tolerant**: every member defaults, so a sparse or older producer
+/// decodes; `None`s are omitted from the wire, never `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LaneModelEffort {
+    /// The levels the model offers, in its order (craze caps them at 8).
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    /// The model's default level — what `/effort default` resolves to on
+    /// this model, where it is one of the effort option's values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    /// The level a switch to this model lands on: the session's own last
+    /// choice on it, else the one craze's model memory keeps, else its
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_effort: Option<String>,
+}
+
+impl LaneSettings {
+    /// The current model's EFFORT option — craze's `agent.EffortOption`
+    /// (`internal/agent/catalog.go`, isEffortSelect/effortRank), ported rule
+    /// for rule (plan 032 §3.2), so both clients' chips and the `/effort` row
+    /// read the one rule rather than a TypeScript and a Dart port of it.
+    ///
+    /// A candidate offers values and its id or name, lowercased, contains
+    /// `effort` or `reasoning` (the name untrimmed, as craze reads it — the
+    /// trimming is its LEVEL match's, `shed_app::slash_menu`'s port of
+    /// `MatchEffortValue`). Candidates rank: the id `effort` (any case) 0 —
+    /// ahead of every category, since cursor files `thinking` under
+    /// `thought_level` beside its effort select — then category
+    /// `model_option` 1, `thought_level` 2, anything else 3. The lowest rank
+    /// wins, the first listed a tie. `None` when no option qualifies.
+    ///
+    /// A known deviation in that tie: "first listed" is `options`' order, and
+    /// shed-craze's `shown_options` has already regrouped craze's options by
+    /// category (`thought_level`, then `model_config`, then the rest), so a
+    /// rank-3 tie between options of different categories goes to the first
+    /// in that display order, where craze picks the first ADVERTISED (plan 032
+    /// C2 review; accepted, not ported).
+    ///
+    /// craze also requires a select (`type` absent or `select`); the
+    /// contract carries no option type, and only a select carries values,
+    /// so the values rule is that check here. craze searches the full
+    /// config, `options` here is without the model and mode rows — neither
+    /// of which is ever an effort.
+    pub fn effort_option(&self) -> Option<&LaneSetting> {
+        // `min_by_key` answers the FIRST of equal minima: craze's tie rule.
+        self.options
+            .iter()
+            .filter(|o| is_effort_select(o))
+            .min_by_key(|o| effort_rank(o))
+    }
+}
+
+/// craze's `isEffortSelect`, less the select check the contract cannot make
+/// ([`LaneSettings::effort_option`]).
+fn is_effort_select(option: &LaneSetting) -> bool {
+    if option.values.is_empty() {
+        return false;
+    }
+    let id = option.id.to_lowercase();
+    let name = option.name.to_lowercase();
+    ["effort", "reasoning"]
+        .iter()
+        .any(|word| id.contains(word) || name.contains(word))
+}
+
+/// craze's `effortRank`: the id `effort` before every category, then
+/// `model_option`, then `thought_level`, then the rest. craze's `EqualFold`
+/// is an ASCII comparison here exactly: no other letter case-folds to one
+/// of `effort`'s.
+fn effort_rank(option: &LaneSetting) -> u8 {
+    if option.id.eq_ignore_ascii_case("effort") {
+        0
+    } else if option.category == "model_option" {
+        1
+    } else if option.category == "thought_level" {
+        2
+    } else {
+        3
+    }
 }
 
 // ---- the slash catalog (plan 029) ----
@@ -2486,6 +2589,12 @@ tolerant_enum! {
         Stop => "stop",
         /// Side questions (no contract verb yet, plan 029 X1).
         Aside => "aside",
+        /// The current model has an effort option (craze 0.2.0's `/effort`,
+        /// plan 032 §3.2): not a capability but the client's own reading of
+        /// the session's settings — a current model and
+        /// [`LaneSettings::effort_option`] — which changes with the model
+        /// while the catalog stays as it is.
+        Effort => "effort",
     }
 }
 
@@ -2539,6 +2648,10 @@ tolerant_enum! {
     pub enum LaneSlashPicker {
         /// The model picker (the settings sheet's model list).
         Model => "model",
+        /// The effort picker: the current model's effort option's levels
+        /// ([`LaneSettings::effort_option`], plan 032 §3.2), set with a
+        /// [`LaneSettingChange::Config`] bound to that model.
+        Effort => "effort",
     }
 }
 

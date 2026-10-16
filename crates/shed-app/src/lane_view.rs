@@ -50,10 +50,14 @@
 //! `slash` clear it, and a `Slash` under capabilities that do not say `slash`
 //! is dropped, so the flag coming back never resurrects an old one — only a
 //! fresh `Slash` does. What a reader is handed is the RESOLVED menu
-//! ([`crate::slash_menu::resolve`]), computed when the catalog or the
-//! capabilities change and cached beside them: a reader polls `snapshot` on
-//! every nudge (the phone converts each one over FRB), and a catalog can be
-//! hundreds of rows.
+//! ([`crate::slash_menu::resolve`]), computed when the catalog, the
+//! capabilities or the settings change — the settings decide `/effort`, which
+//! a model switch shows or hides with no new catalog (plan 032 PC7) — and
+//! cached beside them: a reader polls `snapshot` on every nudge (the phone
+//! converts each one over FRB), and a catalog can be hundreds of rows. Every
+//! snapshot also names the settings' effort option
+//! ([`LaneViewSnapshot::effort_option`], plan 032 PC14h), so neither client's
+//! chip ports that rule either.
 //!
 //! # Generations are matched, not assumed
 //!
@@ -137,9 +141,10 @@ struct Snapshot {
     settings: Option<LaneSettings>,
     /// The raw catalog, held only under capabilities that say `slash`.
     slash: Option<LaneSlashCatalog>,
-    /// `slash` resolved against `capabilities` — the cache a reader is
-    /// handed. Recomputed by [`Snapshot::resolve_slash_menu`] whenever either
-    /// input changes, never per read.
+    /// `slash` resolved against `capabilities` and the shown `settings` — the
+    /// cache a reader is handed. Recomputed by
+    /// [`Snapshot::resolve_slash_menu`] whenever an input changes, never per
+    /// read.
     slash_menu: Option<SlashMenu>,
 }
 
@@ -151,11 +156,25 @@ impl Snapshot {
         }
     }
 
-    /// Re-resolve the cached menu from the catalog and the capabilities: a
-    /// menu exactly when both are here and the capabilities say `slash`.
+    /// The settings a reader is shown: only under capabilities that say
+    /// `settings`. A seed or a re-emission that dropped the flag has already
+    /// cleared them, and a `Settings` frame a producer sent anyway (against
+    /// the contract) is not shown beside `settings: false`.
+    fn shown_settings(&self) -> Option<&LaneSettings> {
+        self.settings
+            .as_ref()
+            .filter(|_| self.capabilities.as_ref().is_some_and(|c| c.settings))
+    }
+
+    /// Re-resolve the cached menu from the catalog, the capabilities and the
+    /// shown settings: a menu exactly when the first two are here and the
+    /// capabilities say `slash`. The settings decide `/effort` alone (plan
+    /// 032 §3.2).
     fn resolve_slash_menu(&mut self) {
         self.slash_menu = match (&self.capabilities, &self.slash) {
-            (Some(caps), Some(catalog)) if caps.slash => Some(slash_menu::resolve(catalog, caps)),
+            (Some(caps), Some(catalog)) if caps.slash => {
+                Some(slash_menu::resolve(catalog, caps, self.shown_settings()))
+            }
             _ => None,
         };
     }
@@ -215,6 +234,11 @@ pub struct LaneViewSnapshot {
     /// of nothing this client can run — still what a typed `/x` dispatches
     /// against.
     pub slash_menu: Option<SlashMenu>,
+    /// The id of the settings' EFFORT option — craze's `EffortOption` rule,
+    /// [`LaneSettings::effort_option`] (plan 032 §3.2, PC14h) — `None` when
+    /// `settings` is or names none. What both clients' chips show as the
+    /// effort, read from here so neither ports the rule.
+    pub effort_option: Option<String>,
     /// The asks still waiting on the human, oldest first, id as the tiebreak.
     /// Pending only — see [`LaneView::snapshot`].
     pub approvals: Vec<LaneApproval>,
@@ -306,7 +330,17 @@ impl LaneView {
                     target.resolve_slash_menu();
                 }
             }
-            LaneEvent::Settings { settings } => self.target().settings = Some(settings.clone()),
+            LaneEvent::Settings { settings } => {
+                let target = self.target();
+                // The menu reads the settings too — `/effort` shows only while
+                // the current model has an effort option, which a model switch
+                // changes with no new catalog (plan 032 PC7). So re-resolve on
+                // a change, and only on one, exactly as for `Capabilities`.
+                if target.settings.as_ref() != Some(settings) {
+                    target.settings = Some(settings.clone());
+                    target.resolve_slash_menu();
+                }
+            }
             LaneEvent::Slash { catalog } => {
                 let target = self.target();
                 // REPLACES the catalog whole (an empty one included); dropped
@@ -412,9 +446,10 @@ impl LaneView {
     /// A cursor that fell out the back of the 500-row cap is refused by the same
     /// bound, for the same reason: the delta would have a hole in it.
     ///
-    /// `session`, `generation`, `stale`, `ended`, `capabilities`, `settings`
-    /// and `slash_menu` ride EVERY snapshot, delta or not, so a reader that
-    /// wants to react to any of them changing has them without a second call.
+    /// `session`, `generation`, `stale`, `ended`, `capabilities`, `settings`,
+    /// `slash_menu` and `effort_option` ride EVERY snapshot, delta or not, so
+    /// a reader that wants to react to any of them changing has them without
+    /// a second call.
     ///
     /// `approvals` is always the complete pending set — there is no cursor for
     /// it and it is bounded by what the human has not answered. `is_pending()`
@@ -452,6 +487,7 @@ impl LaneView {
                 .then_with(|| a.id.cmp(&b.id))
         });
 
+        let settings = self.live.shown_settings().cloned();
         LaneViewSnapshot {
             messages,
             full,
@@ -466,15 +502,13 @@ impl LaneView {
             stale: self.stale.clone(),
             ended: self.ended,
             capabilities: self.live.capabilities.clone(),
-            // Only under capabilities that say `settings`: a seed or a
-            // re-emission that dropped the flag has already cleared them, and a
-            // `Settings` frame a producer sent anyway (against the contract) is
-            // not shown beside `settings: false`.
-            settings: self
-                .live
-                .settings
-                .clone()
-                .filter(|_| self.live.capabilities.as_ref().is_some_and(|c| c.settings)),
+            // Of the settings shown, so a chip never names an option the
+            // reader is not handed.
+            effort_option: settings
+                .as_ref()
+                .and_then(LaneSettings::effort_option)
+                .map(|o| o.id.clone()),
+            settings,
             // The cached resolution — cloned, never rebuilt here.
             slash_menu: self.live.slash_menu.clone(),
             approvals,
@@ -1268,6 +1302,133 @@ mod tests {
             capabilities: slash_caps(true, true),
         });
         assert_eq!(menu(&view), some(&["model", "a"]), "the catalog was kept");
+    }
+
+    // ---- /effort and the settings (plan 032 §3.2, PC7, PC14h) ----
+
+    /// The `/effort` row's hidden reason in the menu a reader is handed, if
+    /// it is hidden.
+    fn effort_hidden(view: &LaneView) -> Option<String> {
+        view.snapshot(None)
+            .slash_menu?
+            .hidden
+            .into_iter()
+            .find(|h| h.name == "effort")
+            .map(|h| h.reason)
+    }
+
+    /// A seed whose catalog is `/effort` and `a`, on `settings`.
+    fn effort_seed(view: &mut LaneView, generation: u64, settings: LaneSettings) {
+        stage_slash(
+            view,
+            generation,
+            slash_caps(true, true),
+            Some(LaneSlashCatalog {
+                rows: vec![
+                    slash_rows::effort(),
+                    slash_rows::prompt("a", LaneSlashSource::Agent),
+                ],
+            }),
+        );
+        view.apply(&LaneEvent::Settings { settings });
+        view.apply(&LaneEvent::Ready { generation });
+    }
+
+    /// **A settings change re-resolves the menu** (PC7): a model switch is a
+    /// `Settings` alone, the catalog unchanged, and `/effort` follows it —
+    /// gone (and refused with its reason) on composer-2.5, back on grok-4.6 —
+    /// as does the snapshot's effort option. The settings restated unchanged
+    /// change nothing.
+    #[test]
+    fn a_model_switch_alone_moves_the_effort_row() {
+        let mut view = LaneView::default();
+        effort_seed(&mut view, 1, slash_rows::grok_46());
+        assert_eq!(menu(&view), some(&["effort", "a"]));
+        assert_eq!(view.snapshot(None).effort_option.as_deref(), Some("effort"));
+
+        view.apply(&LaneEvent::Settings {
+            settings: slash_rows::composer_25(),
+        });
+        assert_eq!(menu(&view), some(&["a"]));
+        assert_eq!(
+            effort_hidden(&view).as_deref(),
+            Some("the current model has no effort setting")
+        );
+        assert_eq!(view.snapshot(None).effort_option, None);
+
+        view.apply(&LaneEvent::Settings {
+            settings: slash_rows::grok_46(),
+        });
+        assert_eq!(menu(&view), some(&["effort", "a"]), "the row returns");
+        let cached = view.live.slash_menu.clone();
+        view.apply(&LaneEvent::Settings {
+            settings: slash_rows::grok_46(),
+        });
+        assert_eq!(
+            view.live.slash_menu, cached,
+            "restated settings: the same menu"
+        );
+    }
+
+    /// **The settings are staged with their seed** — mid-reseed the reader
+    /// keeps the live generation's menu and effort option; the seed's settings
+    /// decide the new menu at its `Ready`, not before.
+    #[test]
+    fn a_seeds_settings_decide_its_menu_at_the_swap() {
+        let mut view = LaneView::default();
+        effort_seed(&mut view, 1, slash_rows::grok_46());
+        stage_slash(
+            &mut view,
+            2,
+            slash_caps(true, true),
+            Some(LaneSlashCatalog {
+                rows: vec![slash_rows::effort()],
+            }),
+        );
+        view.apply(&LaneEvent::Settings {
+            settings: slash_rows::composer_25(),
+        });
+        assert_eq!(
+            menu(&view),
+            some(&["effort", "a"]),
+            "mid-seed: the live menu"
+        );
+        assert_eq!(view.snapshot(None).effort_option.as_deref(), Some("effort"));
+        view.apply(&LaneEvent::Ready { generation: 2 });
+        assert_eq!(menu(&view), some(&[]));
+        assert_eq!(view.snapshot(None).effort_option, None);
+    }
+
+    /// **Settings a reader is not shown decide nothing**: under capabilities
+    /// that drop `settings` the effort picker hides and the effort option goes
+    /// — and a `Settings` sent anyway (against the contract) brings back
+    /// neither.
+    #[test]
+    fn effort_follows_only_the_settings_a_reader_is_shown() {
+        let mut view = LaneView::default();
+        effort_seed(&mut view, 1, slash_rows::grok_46());
+        view.apply(&LaneEvent::Capabilities {
+            capabilities: slash_caps(false, true),
+        });
+        assert_eq!(menu(&view), some(&["a"]));
+        assert_eq!(view.snapshot(None).effort_option, None);
+        view.apply(&LaneEvent::Settings {
+            settings: slash_rows::grok_46(),
+        });
+        assert_eq!(
+            menu(&view),
+            some(&["a"]),
+            "a rogue Settings shows no /effort"
+        );
+        assert_eq!(view.snapshot(None).effort_option, None);
+        view.apply(&LaneEvent::Capabilities {
+            capabilities: slash_caps(true, true),
+        });
+        assert_eq!(
+            menu(&view),
+            some(&["effort", "a"]),
+            "the capability back: the settings now shown decide"
+        );
     }
 
     /// **A mismatched `Ready` commits no catalog**: a late `Ready(1)` while

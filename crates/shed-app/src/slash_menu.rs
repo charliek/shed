@@ -16,11 +16,13 @@
 //!
 //! # The five calls
 //!
-//! * [`resolve`]`(catalog, caps)` → [`SlashMenu`]: the rows shown, each with
-//!   its resolved [`SlashAction`], and the hidden BUILTIN names a typed command
-//!   is refused for. [`crate::lane_view::LaneView`] calls it, caches the result
-//!   and hands it out as [`crate::lane_view::LaneViewSnapshot::slash_menu`];
-//!   a client never calls it itself.
+//! * [`resolve`]`(catalog, caps, settings)` → [`SlashMenu`]: the rows shown,
+//!   each with its resolved [`SlashAction`], and the hidden BUILTIN names a
+//!   typed command is refused for. [`crate::lane_view::LaneView`] calls it —
+//!   again whenever the catalog, the capabilities or the settings change (the
+//!   settings decide `/effort`, plan 032 PC7) — caches the result and hands it
+//!   out as [`crate::lane_view::LaneViewSnapshot::slash_menu`]; a client never
+//!   calls it itself.
 //! * [`filter`]`(menu, draft, caret, working)` → [`SlashFilter`]: whether the
 //!   menu panel is up for this draft and caret, its rows in order, each
 //!   marked `dimmed` while a turn runs, and the row a highlight starts on.
@@ -44,11 +46,20 @@
 //! | kind `Method`, [`LaneSlashMethod::Set`] with a `mode` | [`SlashAction::SetMode`] (`LaneSettingChange::Mode`) | — (P7: not `caps.settings`) |
 //! | kind `Method`, [`LaneSlashMethod::Stop`] | [`SlashAction::Stop`] | `caps.stop`, with or without `requires` |
 //! | kind `Picker`, [`LaneSlashPicker::Model`] | [`SlashAction::ModelPicker`] | `caps.settings` |
+//! | kind `Picker`, [`LaneSlashPicker::Effort`] | [`SlashAction::EffortPicker`] (the effort option, the current model, its levels, its default level) | `caps.settings` and the session's effort (below) |
 //! | kind `Aside`, `Local`, `Unavailable`, anything else | hidden | — |
 //!
 //! `requires: stop` needs `caps.stop`; `requires: aside` hides the row in phase
 //! 1 whatever the session serves (X1 — there is no aside verb yet), as does any
-//! `requires` this build cannot name. An unknown (`Other`) `source`,
+//! `requires` this build cannot name. `requires: effort` (craze 0.2.0's
+//! `/effort`, plan 032 §3.2) is no capability but the session's EFFORT: a
+//! current model ([`LaneSettings::model`]) and an effort option
+//! ([`LaneSettings::effort_option`], craze's `EffortOption`) — without both
+//! the row is hidden, "the current model has no effort setting", and claims no
+//! name, so an agent's own `/effort` after it shows instead (P:2123). The
+//! effort picker reads the same two, plus the current model's default level:
+//! its effort facts' `default_effort`, only where it is one of the option's
+//! values. An unknown (`Other`) `source`,
 //! `requires`, `run.kind`, `run.arg`, `run.method` or `run.picker` hides the
 //! row, and only that row — craze's rule ("a client hides a row with a value it
 //! does not know"). So does a `name` or `qualified` that is not one token, which
@@ -92,11 +103,35 @@
 //! | an argument to `SetMode` or `Stop` | `Refuse` — `/<name>: takes no argument` |
 //! | an argument to `/model` (X2: no inline model) | `Refuse` — `/<name>: takes no argument — pick a model from the list` |
 //! | `SetTitle` with no argument | `Refuse` — `type a title after /<name>` |
+//! | an `EffortPicker` row's argument naming no level | `Refuse` — craze's own text, `no effort <typed>: one of <levels>` (below) |
 //! | a non-`while_working` row while [`is_working`] | `Refuse` — `/<name>: runs after this turn` |
+//! | an `EffortPicker` row's argument naming a level | [`SlashDispatch::Run`] — [`SlashAction::SetEffort`] |
 //! | otherwise | [`SlashDispatch::Run`] — the action, and for `SetTitle` its title |
 //!
 //! The argument checks come before the turn check: a draft that will never
 //! run should not wait for the turn to say so.
+//!
+//! **`/effort [<level>]`** (plan 032 §3.2, PC8; craze's `runEffort`): bare, it
+//! runs the `EffortPicker` (the client opens its settings sheet). With an
+//! argument it is checked in its OWN arm, before the no-argument guard — the
+//! picker still [`takes no argument`](SlashAction::takes_argument), so a pick
+//! and Enter run it and Tab completes it like any picker row. `default`, in
+//! any case, is reserved: the picker's `default_level`, and refused when there
+//! is none — even where a level is spelled `default`. Any other argument is
+//! craze's `MatchEffortValue`: trimmed, then the level whose id is it exactly,
+//! else in any case, else the level whose name (trimmed) is it in any case —
+//! the first rule that matches anything decides and must match exactly one.
+//! "In any case" is craze's: Go's `EqualFold`, Unicode SIMPLE case folding,
+//! so `Σ` is both `σ` and `ς` — ambiguous where a session offers both.
+//! A match is `SetEffort { change: Config { id: <option>, value: <its id>,
+//! for_model: Some(<the model>) } }`, sent even when it is the current level;
+//! anything else is refused `no effort <typed>: one of default, <level>, …`
+//! (`default, ` only where there is a default level; a level spelled `default`
+//! left out when `default` was what failed), the draft kept. A valid level
+//! mid-turn is refused "runs after this turn": the builtin row has no
+//! `whileWorking`. shed holds no "a model switch is pending" state, so craze's
+//! TUI refusal for one is the session's own `stale_model` answer to the
+//! `for_model`-bound change (plan 032 §4.6).
 //!
 //! # The menu ([`filter`]) and the keys ([`accept`])
 //!
@@ -127,10 +162,18 @@
 //!   Enter SELECTS the row, as a click does.
 //! * **Pick** (a click or a tap): SELECT. An action that takes no argument
 //!   here ([`SlashAction::takes_argument`] — `SetMode`, `Stop`,
-//!   `ModelPicker`) runs at once: the answer is [`dispatch`] of the completed
-//!   draft, so an argument suffix still gets its refusal. A `prompt` or
-//!   `SetTitle` row completes instead.
+//!   `ModelPicker`, `EffortPicker`) runs at once: the answer is [`dispatch`]
+//!   of the completed draft, so an argument suffix still gets its refusal —
+//!   or, for `/effort`, its level. A `prompt` or `SetTitle` row completes
+//!   instead.
 //! * **Tab**: complete, never run (the TUI's accept).
+//!
+//! While a turn runs, selecting a dimmed row (a pick, or Enter on a token
+//! that does not spell it) answers its refusal, `/<name>: runs after this
+//! turn`, the draft kept — but for `/effort` with an argument, whose level is
+//! judged before the turn there as in [`dispatch`] (plan 032 §3.2): the
+//! completed draft is dispatched, so a level that names nothing is refused
+//! for that, and a valid one for the turn.
 //!
 //! Completing replaces only the token with `/<spelling> ` — `qualified` when
 //! the typed token holds a `:` and the row has one, else `name` — taking in
@@ -143,7 +186,11 @@
 //! `kind` like the lane contract's, `None` fields omitted. A [`SlashMenuRow`]:
 //! `{"name":"rename","description":"…","source":"builtin","arg":"required",
 //! "arg_hint":"<title>","while_working":true,"action":{"kind":"set_title"}}`; a
-//! mode row's action `{"kind":"set_mode","change":{"kind":"mode","id":"plan"}}`.
+//! mode row's action `{"kind":"set_mode","change":{"kind":"mode","id":"plan"}}`;
+//! the effort row's `{"kind":"effort_picker","option":"effort","for_model":
+//! "grok-4.6","levels":[{"id":"low","name":"Low"},…],"default_level":"high"}`
+//! and a level's `{"kind":"set_effort","change":{"kind":"config","id":"effort",
+//! "value":"low","for_model":"grok-4.6"}}`.
 //! [`SlashDispatch`]: `{"kind":"not_command"}`, `{"kind":"prompt","text":…}`,
 //! `{"kind":"run","action":{…},"arg":…}`, `{"kind":"refuse","reason":…}`.
 //! [`SlashAccept`]: `{"kind":"complete","draft":…,"caret":…}` or
@@ -157,10 +204,14 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use shed_core::lane::{
-    LaneCapabilities, LaneSettingChange, LaneSlashArg, LaneSlashCatalog, LaneSlashKind,
-    LaneSlashMethod, LaneSlashPicker, LaneSlashRequires, LaneSlashRow, LaneSlashSource,
+    LaneCapabilities, LaneChoice, LaneSettingChange, LaneSettings, LaneSlashArg, LaneSlashCatalog,
+    LaneSlashKind, LaneSlashMethod, LaneSlashPicker, LaneSlashRequires, LaneSlashRow,
+    LaneSlashSource,
 };
 use shed_core::rc::RcActivity;
+
+mod display_line;
+use display_line::display_line;
 
 /// A hidden row's reason when this client cannot run it yet: phase 1's
 /// deferred kinds (`aside`, `local`, X1) and any value it does not know.
@@ -170,6 +221,12 @@ const CANNOT_STOP: &str = "this session cannot be stopped";
 /// A hidden row's reason when the session does not advertise what it needs
 /// (`set_title`, `settings`) — and an `unavailable` row's, when it gave none.
 const NOT_ADVERTISED: &str = "not advertised";
+/// A hidden `requires: effort` (or effort picker) row's reason: no current
+/// model, or no effort option for it (plan 032 §3.2).
+const NO_EFFORT: &str = "the current model has no effort setting";
+/// The reserved `/effort` argument: the current model's default level
+/// (craze's `effortDefaultTag`).
+const DEFAULT_LEVEL: &str = "default";
 
 /// What running a shown row does, resolved against the session's
 /// capabilities ([`resolve`]'s table).
@@ -190,17 +247,49 @@ pub enum SlashAction {
     Stop,
     /// Open the client's model picker (its settings sheet).
     ModelPicker,
+    /// Open the client's effort picker — its settings sheet, whose effort row
+    /// is this option (plan 032 §3.2). Resolved from the session's settings
+    /// when the menu was: what a `/effort <level>` is matched against, and
+    /// bound to.
+    EffortPicker {
+        /// The effort option's id ([`LaneSettings::effort_option`]) — what a
+        /// [`LaneSettingChange::Config`] names.
+        option: String,
+        /// The model the option belongs to: the session's current model.
+        for_model: String,
+        /// The option's values, in the agent's order: the levels.
+        levels: Vec<LaneChoice>,
+        /// That model's default level (its effort facts' `default_effort`),
+        /// only where it is one of `levels`' ids — what `/effort default`
+        /// sets. `None` without effort facts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_level: Option<String>,
+    },
+    /// Set the effort: `AgentLane::set(change)`, `change` always a
+    /// `LaneSettingChange::Config` of the effort option bound to its model
+    /// (`for_model`). Only [`dispatch`] builds one, from an `EffortPicker`
+    /// row and a level — no menu row carries it — and a client sends it even
+    /// when it is the current level (craze's rule: a dropped no-op could lose
+    /// a concurrent change).
+    SetEffort { change: LaneSettingChange },
 }
 
 impl SlashAction {
     /// Whether this client takes an argument for the action: a prompt's text
     /// and a title. `SetMode`, `Stop` and `ModelPicker` take none here (X2:
     /// `/model`'s inline `<model> [effort]` is deferred), which is what makes
-    /// selecting their row run it at once ([`accept`]).
+    /// selecting their row run it at once ([`accept`]). Nor does
+    /// `EffortPicker` (PC8): its optional `<level>` is read by [`dispatch`]'s
+    /// own arm, so a pick and Enter still run the completed draft and Tab
+    /// completes it. `SetEffort` is never a row's.
     pub fn takes_argument(&self) -> bool {
         match self {
             SlashAction::Prompt | SlashAction::SetTitle => true,
-            SlashAction::SetMode { .. } | SlashAction::Stop | SlashAction::ModelPicker => false,
+            SlashAction::SetMode { .. }
+            | SlashAction::Stop
+            | SlashAction::ModelPicker
+            | SlashAction::EffortPicker { .. }
+            | SlashAction::SetEffort { .. } => false,
         }
     }
 }
@@ -267,7 +356,8 @@ pub struct SlashMenu {
 pub struct SlashFilterRow {
     pub row: SlashMenuRow,
     /// A turn is running and this row would be refused for it: drawn dimmed,
-    /// labelled "after this turn", and selecting it answers the refusal (X7).
+    /// labelled "after this turn", and selecting it answers the refusal (X7)
+    /// — `/effort` with a level after that level is judged ([`accept`]).
     pub dimmed: bool,
 }
 
@@ -351,9 +441,18 @@ pub fn is_working(activity: RcActivity) -> bool {
 /// The session's menu: the rows shown and the hidden builtin names (the
 /// module doc's table and claiming rule).
 ///
+/// `settings` are the session's as a reader is shown them — `None` when it
+/// has none — and decide `/effort` alone (`requires: effort` and the effort
+/// picker, plan 032 §3.2).
+///
 /// Does not read `caps.slash`: a catalog is only ever held where the
 /// capabilities say `slash`, and the view gates the whole menu on it.
-pub fn resolve(catalog: &LaneSlashCatalog, caps: &LaneCapabilities) -> SlashMenu {
+pub fn resolve(
+    catalog: &LaneSlashCatalog,
+    caps: &LaneCapabilities,
+    settings: Option<&LaneSettings>,
+) -> SlashMenu {
+    let effort = settings.and_then(effort_picker);
     let mut rows: Vec<SlashMenuRow> = Vec::new();
     let mut hidden: Vec<SlashHidden> = Vec::new();
     let mut claimed: HashSet<String> = HashSet::new();
@@ -364,7 +463,7 @@ pub fn resolve(catalog: &LaneSlashCatalog, caps: &LaneCapabilities) -> SlashMenu
         if !is_token(&row.name) {
             continue;
         }
-        match judge(row, caps) {
+        match judge(row, caps, effort.as_ref()) {
             // The first shown row of a name keeps it; a hidden one never
             // claimed it (A1).
             Ok(action) => {
@@ -400,9 +499,38 @@ pub fn resolve(catalog: &LaneSlashCatalog, caps: &LaneCapabilities) -> SlashMenu
     SlashMenu { rows, hidden }
 }
 
-/// One catalog row (its name a token) against the session's capabilities:
-/// its action when it shows, else why not.
-fn judge<'a>(row: &'a LaneSlashRow, caps: &LaneCapabilities) -> Result<SlashAction, &'a str> {
+/// What `/effort` acts on (plan 032 §3.2), as the [`SlashAction::EffortPicker`]
+/// a row runs: the session's current model, its effort option, and that
+/// model's default level. `None` — the row hidden, [`NO_EFFORT`] — without a
+/// current model (PC9) or without an effort option.
+fn effort_picker(settings: &LaneSettings) -> Option<SlashAction> {
+    let model = settings.model.as_deref().filter(|m| !m.is_empty())?;
+    let option = settings.effort_option()?;
+    // craze's `effortDefault` and `offers` together: the current model's
+    // `defaultEffort` as its own catalog row states it (effort facts alone),
+    // only where the effort option offers that level.
+    let default_level = settings
+        .models
+        .iter()
+        .find(|m| m.id == model)
+        .and_then(|m| m.effort.as_ref()?.default_effort.clone())
+        .filter(|d| offers(&option.values, d));
+    Some(SlashAction::EffortPicker {
+        option: option.id.clone(),
+        for_model: model.to_string(),
+        levels: option.values.clone(),
+        default_level,
+    })
+}
+
+/// One catalog row (its name a token) against the session's capabilities and
+/// its effort picker ([`effort_picker`]): its action when it shows, else why
+/// not.
+fn judge<'a>(
+    row: &'a LaneSlashRow,
+    caps: &LaneCapabilities,
+    effort: Option<&SlashAction>,
+) -> Result<SlashAction, &'a str> {
     let run = &row.run;
     let unknown = !row.source.is_known()
         || row.requires.as_ref().is_some_and(|r| !r.is_known())
@@ -417,6 +545,9 @@ fn judge<'a>(row: &'a LaneSlashRow, caps: &LaneCapabilities) -> Result<SlashActi
         Some(LaneSlashRequires::Stop) if !caps.stop => return Err(CANNOT_STOP),
         // Phase 1 has no aside verb (X1): hidden whatever the session serves.
         Some(LaneSlashRequires::Aside) => return Err(NOT_YET),
+        // The session's state, not a capability: shown only while the
+        // current model has an effort option (P:2052, 2115-2128).
+        Some(LaneSlashRequires::Effort) if effort.is_none() => return Err(NO_EFFORT),
         _ => {}
     }
     match run.kind {
@@ -439,6 +570,8 @@ fn judge<'a>(row: &'a LaneSlashRow, caps: &LaneCapabilities) -> Result<SlashActi
                 .settings
                 .then_some(SlashAction::ModelPicker)
                 .ok_or(NOT_ADVERTISED),
+            Some(LaneSlashPicker::Effort) if !caps.settings => Err(NOT_ADVERTISED),
+            Some(LaneSlashPicker::Effort) => effort.cloned().ok_or(NO_EFFORT),
             _ => Err(NOT_YET),
         },
         LaneSlashKind::Unavailable => Err(run.reason.as_deref().unwrap_or(NOT_ADVERTISED)),
@@ -534,6 +667,21 @@ pub fn dispatch(menu: &SlashMenu, draft: &str, working: bool) -> SlashDispatch {
         SlashAction::ModelPicker if !arg.is_empty() => {
             refuse(&row.name, "takes no argument — pick a model from the list")
         }
+        // `/effort <level>` (PC8): its own arm, ahead of the no-argument
+        // guard, and still ahead of the turn check — a level that names
+        // nothing is refused for that, a valid one mid-turn for the turn.
+        SlashAction::EffortPicker {
+            option,
+            for_model,
+            levels,
+            default_level,
+        } if !arg.is_empty() => {
+            match set_effort(option, for_model, levels, default_level.as_deref(), arg) {
+                Err(reason) => SlashDispatch::Refuse { reason },
+                Ok(_) if working && row.waits_for_the_turn() => refuse(&row.name, AFTER_THIS_TURN),
+                Ok(action) => SlashDispatch::Run { action, arg: None },
+            }
+        }
         action if !action.takes_argument() && !arg.is_empty() => {
             refuse(&row.name, "takes no argument")
         }
@@ -570,7 +718,13 @@ pub fn accept(
     // A dimmed row (it waits for the turn) SELECTS to its refusal, the draft
     // kept (§3.5, X7) — whether or not it takes an argument. Tab only
     // completes, so a command can still be readied for after the turn.
-    if key != SlashAcceptKey::Tab && working && row.waits_for_the_turn() {
+    // `/effort` with a level is the exception (plan 032 §3.2): its argument
+    // is judged before the turn, by pick and Enter as by dispatch, so it
+    // falls through to the completed draft's dispatch — a level that names
+    // nothing is refused for that, a valid one still for the turn.
+    let level_first =
+        matches!(row.action, SlashAction::EffortPicker { .. }) && !command.rest.trim().is_empty();
+    if key != SlashAcceptKey::Tab && working && row.waits_for_the_turn() && !level_first {
         return Some(SlashAccept::Dispatch {
             dispatch: refuse(&row.name, AFTER_THIS_TURN),
         });
@@ -640,6 +794,101 @@ impl<'a> Command<'a> {
 /// Why a row that waits for the turn is refused while one runs.
 const AFTER_THIS_TURN: &str = "runs after this turn";
 
+/// `/effort <level>` — craze's `runEffort` with an argument (its
+/// `internal/tui/effort_picker.go`; the module doc's grammar): `typed` (the
+/// argument, trimmed) as the [`SlashAction::SetEffort`] it names, else the
+/// refusal. `default`, in any case, is reserved and decided first: the
+/// default level where there is one the option offers, refused anywhere else
+/// — even where a level is spelled `default`, which the sheet still reaches.
+fn set_effort(
+    option: &str,
+    for_model: &str,
+    levels: &[LaneChoice],
+    default_level: Option<&str>,
+    typed: &str,
+) -> Result<SlashAction, String> {
+    // Checked again here: the picker may have crossed a client bridge as JSON.
+    let default_level = default_level.filter(|d| offers(levels, d));
+    let reserved = eq_fold(typed, DEFAULT_LEVEL);
+    let level = if reserved {
+        default_level.map(str::to_string)
+    } else {
+        match_effort_value(levels, typed)
+    };
+    let Some(value) = level else {
+        return Err(effort_refusal(levels, default_level, typed, reserved));
+    };
+    Ok(SlashAction::SetEffort {
+        change: LaneSettingChange::Config {
+            id: option.to_string(),
+            value,
+            for_model: Some(for_model.to_string()),
+        },
+    })
+}
+
+/// craze's `agent.MatchEffortValue` (`effortValue`, `internal/agent/
+/// startsettings.go`): `typed` trimmed, then the level whose id is it
+/// exactly, else the one whose id is it in any case, else the one whose name,
+/// trimmed, is it in any case — the first rule that matches anything decides,
+/// and it must match exactly one level (an ambiguous rule never falls through
+/// to a looser one). Answered in the agent's spelling: the level's id. "In
+/// any case" is craze's `strings.EqualFold` ([`eq_fold`]), not this module's
+/// [`fold`]: with levels `σ` and `ς`, `Σ` is both, so it is refused as
+/// ambiguous rather than taken as the `σ` lowercasing makes it.
+fn match_effort_value(levels: &[LaneChoice], typed: &str) -> Option<String> {
+    let want = typed.trim();
+    if want.is_empty() {
+        return None;
+    }
+    let id_exactly = |l: &LaneChoice| l.id == want;
+    let id_in_any_case = |l: &LaneChoice| eq_fold(&l.id, want);
+    let name_in_any_case = |l: &LaneChoice| eq_fold(l.name.trim(), want);
+    let rules: [&dyn Fn(&LaneChoice) -> bool; 3] =
+        [&id_exactly, &id_in_any_case, &name_in_any_case];
+    for rule in rules {
+        let mut found = levels.iter().filter(|l| rule(l));
+        match (found.next(), found.next()) {
+            (None, _) => continue,
+            (Some(one), None) => return Some(one.id.clone()),
+            (Some(_), Some(_)) => return None,
+        }
+    }
+    None
+}
+
+/// craze's `effortRefusal`, its exact text: what was typed and what would do
+/// — `default` first where the model has a default level the option offers,
+/// then the levels as the agent spells them, less one spelled `default` when
+/// the reserved word was what failed (typed, it is the reserved word again).
+fn effort_refusal(
+    levels: &[LaneChoice],
+    default_level: Option<&str>,
+    typed: &str,
+    reserved: bool,
+) -> String {
+    let mut one: Vec<String> = Vec::new();
+    if default_level.is_some() {
+        one.push(DEFAULT_LEVEL.to_string());
+    }
+    for level in levels {
+        if reserved && eq_fold(&level.id, DEFAULT_LEVEL) {
+            continue;
+        }
+        one.push(display_line(&level.id));
+    }
+    format!(
+        "no effort {}: one of {}",
+        display_line(typed),
+        one.join(", ")
+    )
+}
+
+/// Whether `levels` offers the level `id` (craze's `offers`).
+fn offers(levels: &[LaneChoice], id: &str) -> bool {
+    levels.iter().any(|l| l.id == id)
+}
+
 /// `/<name>: <why>`, refused.
 fn refuse(name: &str, why: &str) -> SlashDispatch {
     SlashDispatch::Refuse {
@@ -651,6 +900,46 @@ fn refuse(name: &str, why: &str) -> SlashDispatch {
 /// lowercase, so `/Ünïcode` finds `ünïcode`.
 fn fold(s: &str) -> String {
     s.to_lowercase()
+}
+
+/// Go's `strings.EqualFold`, which craze matches an effort level by (and
+/// spots its reserved `default` with): as many characters each, every pair
+/// equal or of one [`simple_fold`] class. Unlike [`fold`] it relates `Σ` to
+/// BOTH `σ` and `ς` — a case-insensitive match that can be ambiguous, as
+/// craze's is.
+fn eq_fold(a: &str, b: &str) -> bool {
+    let (mut a, mut b) = (a.chars(), b.chars());
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x == y || simple_fold(x) == simple_fold(y) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// `c`'s Unicode SIMPLE case-folding class, as one representative — Go's
+/// `unicode.SimpleFold` orbit: `σ`, `ς` and `Σ` one class, `k`, `K` and the
+/// Kelvin sign another. It is `c` uppercased, then lowercased, each step
+/// taken only where it maps to ONE character: an expansion (`ß` → `SS`,
+/// `İ` → `i̇`) is full case folding, which Go's simple folding never does.
+/// `ı` (U+0131) is the one exception, its own class: its `I` is a Turkic
+/// fold only (CaseFolding.txt's `T`), not a simple one, and Go keeps it out
+/// of `i`'s orbit. Checked against Go 1.25's orbits over every scalar value
+/// (plan 032 C2 review): the same classes, but for the case pairs Unicode
+/// added after Go's tables (15.0), which Rust's newer tables know.
+fn simple_fold(c: char) -> char {
+    if c == '\u{131}' {
+        return c;
+    }
+    let upper = only_char(c.to_uppercase()).unwrap_or(c);
+    only_char(upper.to_lowercase()).unwrap_or(upper)
+}
+
+/// The one character `chars` yields, if it yields exactly one.
+fn only_char(mut chars: impl Iterator<Item = char>) -> Option<char> {
+    let c = chars.next()?;
+    chars.next().is_none().then_some(c)
 }
 
 /// A name a draft's token could hold: not empty, no whitespace, no control

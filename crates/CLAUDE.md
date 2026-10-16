@@ -106,13 +106,20 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   a property of one implementation, not two that have to agree. Since plan 029 it also
   stages the session's slash catalog with the seed (every `Reset` clears it, so a seed
   with no `Slash` is no catalog; capabilities that drop `slash` drop it) and hands out
-  the RESOLVED menu as `LaneViewSnapshot.slash_menu`, recomputed only when the catalog
-  or the capabilities change. `slash_menu.rs` (plan 029 §3.4, ungated, pure) is the `/`
-  menu's one rule set — `resolve` (which rows show, each with its `SlashAction`, and the
-  hidden builtin names a typed command is refused for), `filter` (the open rule, craze's
+  the RESOLVED menu as `LaneViewSnapshot.slash_menu`, recomputed only when the catalog,
+  the capabilities or the settings change (the settings decide craze 0.2.0's `/effort`,
+  plan 032) — plus `effort_option`, the shown settings' effort option by craze's
+  `EffortOption` rule (`shed_core::lane::LaneSettings::effort_option`), so neither
+  client's chip ports it. `slash_menu.rs` (plan 029 §3.4, ungated, pure) is the `/`
+  menu's one rule set — `resolve(catalog, caps, settings)` (which rows show, each with its
+  `SlashAction`, and the hidden builtin names a typed command is refused for; `/effort`
+  shows only with a current model that has an effort option, and its `EffortPicker`
+  carries the levels and the model's offered default level), `filter` (the open rule, craze's
   four match buckets, UTF-16 carets, `dimmed` while working, and `start` — the first
   row not dimmed, where a client's highlight resets to, plan 030), `dispatch` (the
-  single-line grammar and its guard), `accept` (Enter/Tab/pick) and `is_working` — which
+  single-line grammar and its guard — and `/effort <level>`'s own arm, craze's
+  `MatchEffortValue` and its exact refusal text, `default` reserved; plan 032 PC8),
+  `accept` (Enter/Tab/pick) and `is_working` — which
   the desktop calls through Tauri commands and the phone through FRB, so neither client
   re-derives a rule.
   `craze_rows.rs` (plan 025 §3.6.3, ungated for the same reason) is **the craze row
@@ -279,7 +286,9 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `segment.rs` is shed-gx's segmenter, ported (8 KiB lossless splits, the 2 s flush
   clock); `settings.rs` is the settings data (plan 025 §3.10: craze's model order and the
   options' order, computed once; modes hidden when the session's `modes` capability is
-  off) and `set` (C11) is `session.set` — `setting_for` binds a config change to the model
+  off; each model's craze 0.2.0 effort facts — `efforts`/`defaultEffort`/`switchEffort`,
+  a native session's — as `LaneChoice::effort`, plan 032 §3.3) and `set` (C11) is
+  `session.set` — `setting_for` binds a config change to the model
   the CLIENT displayed (`LaneSettingChange::Config`'s `for_model`, Amendment A13), else the
   lane's folded one, waiting for the lane's first settings rather than going out unbound
   (`forModel`), so craze refuses it `stale_model` (`NotAccepting`) once the session has left

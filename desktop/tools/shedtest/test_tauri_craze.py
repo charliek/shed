@@ -1865,13 +1865,17 @@ def test_no_settings_where_the_capabilities_say_none(app, roost):
 # textarea), `ui.pick_slash_row`, `ui.answer_lane_stop` — and read through
 # `lane.dump`'s `draft` and `slash_menu`.
 
-#: The rows a hub-created session's menu SHOWS (craze 0.1.1's builtins this
+#: The rows a hub-created session's menu SHOWS (craze 0.2.0's builtins this
 #: client can run, then the agent's `research`), in catalog order; `help`,
 #: `clear`, `tasks`, `theme` (local) and `btw` (aside) are hidden in phase 1.
-MENU_ROWS = ["model", "rename", "plan", "ask", "agent", "exit", "research"]
+#: `effort` (plan 032 §3.2) shows because each of these sessions' current
+#: model has an effort option — the grok fake's `reasoning_effort` on
+#: grok-4.6, the cursor fakes' `effort` — and would hide (and claim no name)
+#: on a model without one.
+MENU_ROWS = ["model", "rename", "plan", "ask", "agent", "exit", "effort", "research"]
 #: Rows that wait for the turn (no `whileWorking`, not a prompt): dimmed and
 #: refused while one runs.
-WAITING_ROWS = {"model", "plan", "ask", "agent"}
+WAITING_ROWS = {"model", "plan", "ask", "agent", "effort"}
 
 
 def _hub_create(rig: CrazeEnv, request_id: str, workdir: str, **params) -> str:
@@ -2029,10 +2033,14 @@ def test_slash_lists_the_sessions_commands(app, rig, slashed):
     assert _highlighted(m) == "model" and not any(r["dimmed"] for r in m["rows"]), m["rows"]
     _shot(app, "craze-slash-menu.png")
 
-    # P9: the highlight goes back to the first row on EVERY filter change —
-    # `/r` → `/re` lists the very same two rows, and still starts over.
+    # `/r` matches `effort` too — by substring, after the two prefix matches.
     _type(app, "/r")
     m = _wait_menu(app, "/r")
+    assert _names(m) == ["rename", "research", "effort"], _names(m)
+    # P9: the highlight goes back to the first row on EVERY filter change —
+    # `/RE` → `/re` lists the very same two rows, and still starts over.
+    _type(app, "/RE")
+    m = _wait_menu(app, "/RE")
     assert _names(m) == ["rename", "research"], _names(m)
     _key(app, "ArrowDown")
     app.wait_until(lambda: _highlighted(_menu(app)) == "research", timeout=20, what="↓ to research")
@@ -2066,26 +2074,30 @@ def test_a_six_hundred_row_catalog_renders_whole(app, rig, slashed):
     """**No row cap** (plan 029 P16, P24): the agent re-advertises 600
     commands — a live catalog delta, which craze does not cap — and the menu
     lists every one of them after the builtins, the panel capped in height and
-    scrolling (↑ from the first row wraps the highlight to the 607th). The
+    scrolling (↑ from the first row wraps the highlight to the last). The
     agent's two-command catalog is put back for the cells after."""
     host = slashed
     _menu_ready(app, host)
     names = [f"cmd-{i:03}" for i in range(600)]
+    builtins = MENU_ROWS[:-1]  # every shown row but the agent's `research`
+    total = len(builtins) + len(names)
     _lane(app, "lane.send", host, text="SET-COMMANDS " + ",".join(names))
-    app.wait_until(lambda: len(_catalog(app, host)) == 606, timeout=WAIT,
+    app.wait_until(lambda: len(_catalog(app, host)) == total, timeout=WAIT,
                    what="the 600-command catalog on the lane")
     _type(app, "/")
-    app.wait_until(lambda: len((_menu(app) or {}).get("rows", [])) == 606, timeout=20,
-                   what="the menu listing all 606 rows")
+    app.wait_until(lambda: len((_menu(app) or {}).get("rows", [])) == total, timeout=20,
+                   what=f"the menu listing all {total} rows")
     m = _menu(app)
-    assert _names(m)[:6] == MENU_ROWS[:-1] and _names(m)[6:] == names, _names(m)[:8]
+    assert _names(m)[:len(builtins)] == builtins and _names(m)[len(builtins):] == names, \
+        _names(m)[:len(builtins) + 2]
     _key(app, "ArrowUp")
     app.wait_until(lambda: _highlighted(_menu(app)) == "cmd-599", timeout=20,
                    what="the highlight wrapped to the last row")
     _shot(app, "craze-slash-600.png")
     _type(app, "")
     _lane(app, "lane.send", host, text="SET-COMMANDS alpha-cmd,beta-cmd")
-    app.wait_until(lambda: len(_catalog(app, host)) == 8, timeout=WAIT, what="the two-command catalog back")
+    app.wait_until(lambda: len(_catalog(app, host)) == len(builtins) + 2, timeout=WAIT,
+                   what="the two-command catalog back")
 
 
 def test_a_hidden_builtin_typed_is_refused_and_nothing_is_sent(app, rig, slashed):
