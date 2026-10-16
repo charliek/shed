@@ -561,7 +561,10 @@ class CrazeEnv:
         for rec in hubs.glob("*.json"):
             try:
                 pids.append(int(json.loads(rec.read_text())["pid"]))
-            except (ValueError, KeyError, json.JSONDecodeError):
+            # A hub that exits removes its record between the glob and the
+            # read (seen on macOS CI, plan 032 C6's race cell): a record that is
+            # gone is a hub that is gone.
+            except (FileNotFoundError, ValueError, KeyError, json.JSONDecodeError):
                 pass
         return pids
 
