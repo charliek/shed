@@ -334,33 +334,41 @@ ARG CRAZE_VERSION=0.2.0
 ARG CRAZE_SHA256_AMD64=aabdd601a1c65d921082d8f160e408469102e01e80fb9b01402047538006df7c
 ARG CRAZE_SHA256_ARM64=0a8002aa1a6867b92a89e8e65c328040d1970722212727371b68c348a2fdda47
 
-RUN install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://apt.stridelabs.ai/pubkey.gpg -o /etc/apt/keyrings/stridelabs.gpg \
-    && chmod a+r /etc/apt/keyrings/stridelabs.gpg \
-    && printf "Types: deb\nURIs: https://apt.stridelabs.ai\nSuites: noble\nComponents: main\nSigned-By: /etc/apt/keyrings/stridelabs.gpg\n" \
-       > /etc/apt/sources.list.d/stridelabs.sources \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends strix prox \
-    && rm -rf /var/lib/apt/lists/* \
-    && arch="$(dpkg --print-architecture)" \
-    && case "$arch" in amd64) want="$ROOST_SESSION_SHA256_AMD64";; arm64) want="$ROOST_SESSION_SHA256_ARM64";; *) echo "ERROR: no roost-session digest for $arch" >&2; exit 1;; esac \
-    && base="https://github.com/charliek/roost/releases/download/v${ROOST_SESSION_VERSION}" \
-    && curl -fsSL --retry 5 --retry-delay 2 -o /tmp/rs "${base}/roost-session-${ROOST_SESSION_VERSION}-linux-${arch}" \
-    && echo "${want}  /tmp/rs" | sha256sum -c - \
-    && install -m 0755 /tmp/rs /usr/bin/roost-session && rm -f /tmp/rs \
-    && /usr/bin/roost-session identify \
-         | jq -e ".session_protocol == ${ROOST_SESSION_PROTOCOL} and .app_version == \"${ROOST_SESSION_VERSION}\"" >/dev/null \
-         || { echo "ERROR: baked roost-session is not ${ROOST_SESSION_VERSION}/protocol ${ROOST_SESSION_PROTOCOL}" >&2; exit 1; } \
-    && case "$arch" in amd64) craze_want="$CRAZE_SHA256_AMD64";; arm64) craze_want="$CRAZE_SHA256_ARM64";; *) echo "ERROR: no craze digest for $arch" >&2; exit 1;; esac \
-    && craze_base="https://github.com/charliek/craze/releases/download/v${CRAZE_VERSION}" \
-    && curl -fsSL --retry 5 --retry-delay 2 -o /tmp/craze.tgz "${craze_base}/craze_linux_${arch}.tar.gz" \
-    && echo "${craze_want}  /tmp/craze.tgz" | sha256sum -c - \
-    && craze_dir="$(mktemp -d)" \
-    && tar -xzf /tmp/craze.tgz -C "$craze_dir" \
-    && install -m 0755 "$craze_dir/craze" /usr/bin/craze \
-    && rm -rf /tmp/craze.tgz "$craze_dir" \
-    && test "$(/usr/bin/craze --version)" = "${CRAZE_VERSION}" \
-         || { echo "ERROR: baked craze is not ${CRAZE_VERSION} — check ARG CRAZE_VERSION in vz/Dockerfile and firecracker/Dockerfile and CRAZE_RELEASE in craze-pin.env" >&2; exit 1; }
+# Plain statements under `set -euo pipefail`, no `&&`/`||` chains: set -e ignores a
+# failure in a non-final element of an `&&`/`||` list, and the old chain's trailing `||`
+# put every earlier failure behind the wrong error message. Each failure now stops the
+# build at its own command (or its own ERROR line).
+RUN set -euo pipefail; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://apt.stridelabs.ai/pubkey.gpg -o /etc/apt/keyrings/stridelabs.gpg; \
+    chmod a+r /etc/apt/keyrings/stridelabs.gpg; \
+    printf "Types: deb\nURIs: https://apt.stridelabs.ai\nSuites: noble\nComponents: main\nSigned-By: /etc/apt/keyrings/stridelabs.gpg\n" \
+       > /etc/apt/sources.list.d/stridelabs.sources; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends strix prox; \
+    rm -rf /var/lib/apt/lists/*; \
+    arch="$(dpkg --print-architecture)"; \
+    case "${arch}" in amd64) want="${ROOST_SESSION_SHA256_AMD64}";; arm64) want="${ROOST_SESSION_SHA256_ARM64}";; *) echo "ERROR: no roost-session digest for ${arch}" >&2; exit 1;; esac; \
+    base="https://github.com/charliek/roost/releases/download/v${ROOST_SESSION_VERSION}"; \
+    curl -fsSL --retry 5 --retry-delay 2 -o /tmp/rs "${base}/roost-session-${ROOST_SESSION_VERSION}-linux-${arch}"; \
+    echo "${want}  /tmp/rs" | sha256sum -c -; \
+    install -m 0755 /tmp/rs /usr/bin/roost-session; \
+    rm -f /tmp/rs; \
+    if ! /usr/bin/roost-session identify | jq -e ".session_protocol == ${ROOST_SESSION_PROTOCOL} and .app_version == \"${ROOST_SESSION_VERSION}\"" >/dev/null; then \
+      echo "ERROR: baked roost-session is not ${ROOST_SESSION_VERSION}/protocol ${ROOST_SESSION_PROTOCOL}" >&2; exit 1; \
+    fi; \
+    case "${arch}" in amd64) craze_want="${CRAZE_SHA256_AMD64}";; arm64) craze_want="${CRAZE_SHA256_ARM64}";; *) echo "ERROR: no craze digest for ${arch}" >&2; exit 1;; esac; \
+    craze_base="https://github.com/charliek/craze/releases/download/v${CRAZE_VERSION}"; \
+    curl -fsSL --retry 5 --retry-delay 2 -o /tmp/craze.tgz "${craze_base}/craze_linux_${arch}.tar.gz"; \
+    echo "${craze_want}  /tmp/craze.tgz" | sha256sum -c -; \
+    craze_dir="$(mktemp -d)"; \
+    tar -xzf /tmp/craze.tgz -C "${craze_dir}"; \
+    install -m 0755 "${craze_dir}/craze" /usr/bin/craze; \
+    rm -rf /tmp/craze.tgz "${craze_dir}"; \
+    craze_version="$(/usr/bin/craze --version)"; \
+    if [ "${craze_version}" != "${CRAZE_VERSION}" ]; then \
+      echo "ERROR: baked craze is not ${CRAZE_VERSION} — check ARG CRAZE_VERSION in vz/Dockerfile and firecracker/Dockerfile and CRAZE_RELEASE in craze-pin.env" >&2; exit 1; \
+    fi
 
 WORKDIR /home/shed
 ENTRYPOINT ["/sbin/init"]
