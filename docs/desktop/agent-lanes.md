@@ -121,9 +121,11 @@ A session likewise keeps the craze it started with. So a 0.2.0 feature that is
 missing right after an upgrade usually means an old hub (Resume) or an old
 session (`/effort`, effort facts). The `--no-start` reach follows the craze
 installed on the host instead, and a machine the app has already fallen back on
-keeps the older path until the app is relaunched.
-Find the hub with `pgrep -fa 'craze hub'` and end it with `kill <pid>`; that
-ends no session, and the next client starts a new hub. A session started on
+keeps the older path until the app restarts or the machine is removed and added
+again.
+Find the hub with `pgrep -fa 'craze hub$'` and end it with
+`pkill -f 'craze hub$'`; that ends no session, and the next client starts a
+new hub. A session started on
 0.1.x stays as it is until you start a new one. See craze's
 [Upgrading while sessions run](https://github.com/charliek/craze/blob/main/docs/getting-started/upgrading.md#upgrading-while-sessions-run).
 
