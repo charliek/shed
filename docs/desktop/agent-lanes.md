@@ -107,9 +107,31 @@ roster), says which providers a create can start, starts sessions, and splices
 a client through to any one session's **host**. `CrazeSource` is one hub;
 `CrazeLane` is one session, reached through the hub's splice.
 
-shed needs craze **0.1.0 or later** on a host. An older craze is reported as
+shed needs craze **0.1.0 or later** on a host. The `/` menu and a name at
+create need **0.1.1**; Resume, `/effort`, effort facts and the `--no-start`
+reach need **0.2.0**. An older craze is reported as
 too old; a host without craze lists no craze sessions and says nothing about
 it.
+
+### Upgrading craze on a host
+
+A hub that was running before an upgrade keeps the old craze until it exits,
+which it does by itself only once no session runs and no client is attached.
+A session likewise keeps the craze it started with. So a 0.2.0 feature that is
+missing right after an upgrade usually means an old hub (Resume) or an old
+session (`/effort`, effort facts). The `--no-start` reach follows the craze
+installed on the host instead, and a machine the app has already fallen back on
+keeps the older path until the app restarts or the machine is removed and added
+again.
+Find the hub's pid with `pgrep -f 'craze hub$'` and end it with
+`pkill -f 'craze hub$'`; that ends no session, and the next client starts a
+new hub. A session started on
+0.1.x stays as it is until you start a new one. See craze's
+[Upgrading while sessions run](https://github.com/charliek/craze/blob/main/docs/getting-started/upgrading.md#upgrading-while-sessions-run).
+
+A shed's craze comes from its image. Upgrading craze on your own machine does
+not change a shed's: recreate the shed from an image that bakes the craze you
+want ([Images](../reference/images.md)).
 
 ### A source per machine: this machine eager, every other attach-only
 
@@ -368,7 +390,7 @@ just read say the hub can reopen (`reopen`, from the same hub `hello`). That
 covers a dormant machine too: opening the sheet starts its hub, and the
 control appears once that hub answers. A hub from before craze 0.2.0 shows no
 control. A hub from before 0.2.0 can keep running after craze is upgraded,
-until it is idle. Asked anyway (the `craze.saved` or `craze.reopen` op), it is
+until it is idle (see [Upgrading craze on a host](#upgrading-craze-on-a-host)). Asked anyway (the `craze.saved` or `craze.reopen` op), it is
 refused `unavailable` in one wording, "this craze hub (craze <version>) does
 not offer reopening saved sessions". The version reads `version unknown` when
 the app has not read it, and a hub that says a version below 0.2.0 and its

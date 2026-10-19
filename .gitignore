@@ -7,7 +7,9 @@ dist-test/
 /shed-server
 /shed-agent
 firecracker/shed-agent
+firecracker/shed-firstboot
 vz/shed-agent
+vz/shed-firstboot
 # Guest extension binaries + /etc overlay staged into the rootfs build
 # context by scripts/stage-guest-binaries.sh (SIGKILL'd builds can leave
 # them behind; the build scripts' cleanup traps normally remove them).
