@@ -59,7 +59,9 @@ All notable changes to this project will be documented in this file.
   shed's CI tests against it. See
   [craze's changelog](https://github.com/charliek/craze/blob/main/CHANGELOG.md) for what changed
   in craze itself, including that a model switch on a native session now lands on the effort
-  last used on that model.
+  last used on that model. A machine with its own craze needs it upgraded and its running hub
+  ended; see the [upgrade guide's craze
+  section](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.9.1/#craze).
 - **Desktop (craze): a remote host's hub is reached with `craze bridge --hub --no-start`.**
   The connections the desktop makes on its own attach only to a hub that is already running,
   so they can never start a hub on a remote shed, and the race this leaves behind is gone.

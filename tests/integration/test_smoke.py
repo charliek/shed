@@ -492,8 +492,8 @@ def _roost_baked_backends() -> set[str]:
 @pytest.mark.skipif(
     not _roost_baked_backends(),
     reason=(
-        "SHED_IMAGE_HAS_ROOST unset: the published images carry no "
-        "roost-session until the 0.9.0 tag"
+        "SHED_IMAGE_HAS_ROOST unset: images built before 0.9.0 carry "
+        "no roost-session"
     ),
 )
 def test_roost_session_baked(shed_server, test_shed_name):
@@ -501,8 +501,8 @@ def test_roost_session_baked(shed_server, test_shed_name):
     no systemd unit enabled — the CLI/desktop/phone start it on first
     contact instead.
 
-    Gated behind `SHED_IMAGE_HAS_ROOST=<backends>`: the published images carry no
-    roost-session until the 0.9.0 tag, so this stays skipped everywhere
+    Gated behind `SHED_IMAGE_HAS_ROOST=<backends>`: images built before 0.9.0 carry
+    no roost-session, so this stays skipped everywhere
     except the parallel-dev servers (`test-integration-dev[-fc]`, which
     export the variable — see the root Makefile). The gate is a
     `skipif` marker rather than a runtime `pytest.skip()`, so pytest
@@ -515,7 +515,7 @@ def test_roost_session_baked(shed_server, test_shed_name):
     if backend_key not in _roost_baked_backends():
         pytest.skip(
             f"SHED_IMAGE_HAS_ROOST does not list {backend_key}: this backend "
-            "still boots the published image, which carries no roost-session"
+            "still boots a published image, which may carry no roost-session"
         )
 
     want_version = os.environ.get("SHED_ROOST_SESSION_VERSION", "0.0.21")
@@ -667,8 +667,8 @@ def _baked_image_verdict(
 @pytest.mark.skipif(
     not _craze_baked_backends(),
     reason=(
-        "SHED_IMAGE_HAS_CRAZE unset: the published images carry no craze "
-        "until the 0.9.0 tag"
+        "SHED_IMAGE_HAS_CRAZE unset: published images bake their "
+        "release's craze (0.9.0: 0.1.0), not the pinned version"
     ),
 )
 def test_craze_baked(shed_server, test_shed_name):
@@ -677,8 +677,8 @@ def test_craze_baked(shed_server, test_shed_name):
     asset, checksum-verified at build time, with no systemd unit — the
     desktop's create sheet starts a remote hub; nothing in the CLI runs craze.
 
-    Gated behind `SHED_IMAGE_HAS_CRAZE=<backends>`: the published images
-    carry no craze until the 0.9.0 tag, so this stays skipped everywhere
+    Gated behind `SHED_IMAGE_HAS_CRAZE=<backends>`: published images bake
+    their release's craze (0.9.0: 0.1.0) and this test asserts the pinned version, so this stays skipped everywhere
     except the parallel-dev servers (`test-integration-dev[-fc]`, which
     export the variable — see the root Makefile). The gate is a `skipif`
     marker rather than a runtime `pytest.skip()`, so pytest evaluates it
@@ -693,8 +693,8 @@ def test_craze_baked(shed_server, test_shed_name):
         # unlisted backend never even attempts `shed_server.create` below.
         pytest.skip(
             f"SHED_IMAGE_HAS_CRAZE does not list {backend_key}: this "
-            "backend still boots the published image, which carries no "
-            "craze"
+            "backend still boots a published image, which bakes its "
+            "release's craze, not the pinned version"
         )
 
     want_version = os.environ.get("SHED_CRAZE_VERSION") or _default_craze_version()
