@@ -45,6 +45,7 @@ jobs:
       machinetransport: ${{ steps.filter.outputs.machinetransport }}
       integrationunits: ${{ steps.filter.outputs.integrationunits }}
       docs: ${{ steps.filter.outputs.docs }}
+      images: ${{ steps.filter.outputs.images }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
       - uses: actions/checkout@v6
@@ -150,6 +151,14 @@ jobs:
               - 'pyproject.toml'
               - 'uv.lock'
               - '.github/workflows/docs.yml'
+            images:
+              # The `images` leg proves the vz/firecracker image Dockerfiles
+              # (extensions stage) still build before a tag does (#404).
+              - 'vz/**'
+              - 'firecracker/**'
+              - 'guest/extensions/etc/**'
+              - 'scripts/stage-guest-binaries.sh'
+              - 'scripts/install-input-sha.sh'
             ci:
               - '.github/workflows/**'
               - '.github/actions/**'
@@ -505,6 +514,7 @@ jobs:
   swift:
     name: swift · build · test · e2e
     needs: changes
+    timeout-minutes: 45  # normally 15-17 min; a hang once ran this job for 6 h
     if: ${{ needs.changes.outputs.desktop == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true' }}
     runs-on: macos-15
     defaults:
@@ -833,6 +843,70 @@ jobs:
           # shellcheck disable=SC2012  # controlled out/ dir, glob is safe
           ./linux/scripts/validate-deb.sh "$(ls -t out/shed-desktop_*.deb | head -1)"
 
+  # ---- image build legs (#404) ----------------------------------------------
+  # Until #404 the first CI build of an image change was the release tag itself.
+  # This builds the `extensions` stage of each backend's Dockerfile on the PR,
+  # without pushing. `extensions` and not `full`: `full` only adds third-party
+  # installs (Docker's apt repo, profile scripts) that would make PR CI flakier,
+  # and the tag still builds all three. Native runners (arm64 for vz, amd64 for
+  # fc) because the extensions RUN executes the baked binaries.
+  # Cache: PRs read main's cache and write none (PR caches are branch-scoped and
+  # would only churn the 10 GB budget with GBs of kernel layers); only a push to
+  # main writes it, with a mode per backend (fc max, vz min).
+  images:
+    name: images · ${{ matrix.backend }}
+    needs: changes
+    if: ${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60  # a cold FC run compiles the kernel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: vz
+            runner: ubuntu-24.04-arm
+            context: vz
+            arch: arm64
+            target: shed-vz-extensions
+            cache-mode: min
+          - backend: fc
+            runner: ubuntu-latest
+            context: firecracker
+            arch: amd64
+            target: shed-fc-extensions
+            cache-mode: max
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Stage the build context
+        id: stage
+        # Mirrors publish-images.yaml's "Build shed binaries" step (minus the
+        # version stamps and the host CLI) and scripts/release-validation.sh.
+        # SHED_INSTALL_SHA is the bind-mount cache-buster (#227); keep all
+        # three in step.
+        run: |
+          set -euo pipefail
+          ctx="${{ matrix.context }}"
+          arch="${{ matrix.arch }}"
+          GOOS=linux GOARCH="${arch}" go build -o "${ctx}/shed-agent" ./cmd/shed-agent
+          GOOS=linux GOARCH="${arch}" go build -o "${ctx}/shed-firstboot" ./cmd/shed-firstboot
+          ./scripts/stage-guest-binaries.sh "${ctx}" "${arch}"
+          echo "install_sha=$(./scripts/install-input-sha.sh "${ctx}")" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the ${{ matrix.target }} stage (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.context }}/Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          build-args: SHED_INSTALL_SHA=${{ steps.stage.outputs.install_sha }}
+          cache-from: type=gha,scope=images-${{ matrix.backend }}
+          cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && format('type=gha,mode={0},scope=images-{1},ignore-error=true', matrix.cache-mode, matrix.backend) || '' }}
+
   tauri-linux:
     name: tauri-linux
     needs: changes
@@ -885,6 +959,7 @@ jobs:
   tauri-mac:
     name: tauri-mac
     needs: changes
+    timeout-minutes: 60  # normally 26-28 min; same macOS runner hang risk as swift
     if: ${{ needs.changes.outputs.tauri == 'true' || needs.changes.outputs.harness == 'true' || needs.changes.outputs.ci == 'true' }}
     runs-on: macos-15
     steps:
@@ -1022,12 +1097,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, pins, release-snapshot, server-deb-upgrade, swift, core-linux, host-agent-diff, machine-transport, integration-units, deb, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, pins, release-snapshot, server-deb-upgrade, swift, core-linux, host-agent-diff, machine-transport, integration-units, deb, images, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.server-deb-upgrade.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.server-deb-upgrade.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.images.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in
