@@ -123,7 +123,7 @@ session (`/effort`, effort facts). The `--no-start` reach follows the craze
 installed on the host instead, and a machine the app has already fallen back on
 keeps the older path until the app restarts or the machine is removed and added
 again.
-Find the hub with `pgrep -fa 'craze hub$'` and end it with
+Find the hub's pid with `pgrep -f 'craze hub$'` and end it with
 `pkill -f 'craze hub$'`; that ends no session, and the next client starts a
 new hub. A session started on
 0.1.x stays as it is until you start a new one. See craze's
