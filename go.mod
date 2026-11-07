@@ -10,7 +10,7 @@ require (
 	github.com/distribution/reference v0.6.0
 	github.com/firecracker-microvm/firecracker-go-sdk v1.0.1-0.20251224190957-6fb280e993d4
 	github.com/gliderlabs/ssh v0.3.8
-	github.com/go-chi/chi/v5 v5.2.4
+	github.com/go-chi/chi/v5 v5.4.0
 	github.com/google/cel-go v0.28.1
 	github.com/google/go-containerregistry v0.21.5
 	github.com/hugelgupf/p9 v0.3.0
