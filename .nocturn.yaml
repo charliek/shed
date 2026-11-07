@@ -1,0 +1,42 @@
+version: 1
+# One vX.Y.Z tag family carries three components; a tag ships a component
+# only when its version manifest equals the tag (scripts/release/release-plan.sh,
+# RELEASING.md "Component selection").
+targets:
+  server:
+    kind: cli
+    # Component `server` (manifest .claude-plugin/plugin.json):
+    # .goreleaser.server.yaml builds ./cmd/shed, shed-server,
+    # shed-egress-proxy and shed-agent from go.mod into the tap's shed
+    # formula and the shed-server deb (apt-charliek); publish-images.yaml also
+    # pushes the shed-vz and shed-fc guest images to ghcr on the same tag.
+    released: { tag_pattern: '^v\d+\.\d+\.\d+$', homebrew: shed }
+    ships: [go.mod]
+  host-agent:
+    kind: cli
+    # Component `host-agent` (manifest crates/shed-host-agent/VERSION):
+    # .goreleaser.host-agent.yaml builds the Rust shed-host-agent from the
+    # crates/ workspace (--locked) into the tap's shed-host-agent formula.
+    released: { tag_pattern: '^v\d+\.\d+\.\d+$', homebrew: shed-host-agent }
+    ships: [crates/Cargo.lock]
+  desktop:
+    kind: desktop
+    # Component `desktop` (manifest desktop/VERSION): publish-images.yaml's
+    # desktop-macos (Tauri DMG + Sparkle) and desktop-linux (shed-desktop
+    # deb) jobs build desktop/tauri: its own Cargo workspace, which links
+    # shed-core and shed-app by path, and the UI built from ui/.
+    released: { tag_pattern: '^v\d+\.\d+\.\d+$' }
+    ships: [desktop/tauri/src-tauri/Cargo.lock, desktop/tauri/ui/package-lock.json]
+  sdk:
+    kind: library
+    # A separate Go module, tagged sdk/vX.Y.Z; the root module replaces it
+    # with ./sdk, so its code also ships in the server binaries.
+    released: { tag_pattern: '^sdk/v\d+\.\d+\.\d+$' }
+    ships: [sdk/go.mod]
+lockfiles:
+  # pyproject.toml has only the docs group (zensical and the docs theme): it
+  # builds the documentation site, which no release artifact contains.
+  uv.lock: { role: build-tool }
+  # desktop/pyproject.toml has only a test group (pytest): the shed-desktop
+  # functional test harness in tools/shedtest.
+  desktop/uv.lock: { role: test }
