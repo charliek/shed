@@ -145,7 +145,7 @@ func TestServiceClientsFromYAML(t *testing.T) {
 		"typo in policy":  auth + "      policy:\n        name_prefix: nocturn-\n        max_shed: 4\n        max_age: 30h\n",
 		"typo at client":  auth + "      cert_max_tll: 1h\n      policy:\n        name_prefix: nocturn-\n        max_sheds: 4\n        max_age: 30h\n",
 		"typo in caps":    auth + "      policy:\n        name_prefix: nocturn-\n        max_sheds: 4\n        max_age: 30h\n        caps: {cpu: 2}\n",
-		"network not yet": auth + "      policy:\n        name_prefix: nocturn-\n        max_sheds: 4\n        max_age: 30h\n        network: isolated\n",
+		"typo in network": auth + "      policy:\n        name_prefix: nocturn-\n        max_sheds: 4\n        max_age: 30h\n        netwrk: isolated\n",
 	} {
 		if _, err := LoadServerConfigForCLI(write(base + body)); err == nil || !strings.Contains(err.Error(), "auth.clients") {
 			t.Errorf("%s: err = %v, want an auth.clients refusal", name, err)

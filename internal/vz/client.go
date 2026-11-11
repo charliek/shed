@@ -302,6 +302,13 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, err
 	}
 
+	// vmnet's NAT belongs to macOS: VZ cannot filter a guest, so it offers
+	// only the open profile (the API refuses earlier with 422; this is the
+	// backend's own refusal, for any other caller).
+	if req.Network != "" && req.Network != config.NetworkProfileOpen {
+		return nil, fmt.Errorf("%w: %q (the vz backend offers only %q)", config.ErrNetworkProfileUnsupportedSentinel, req.Network, config.NetworkProfileOpen)
+	}
+
 	if req.FromSnapshot != "" {
 		if req.Image != "" || req.Repo != "" {
 			return nil, fmt.Errorf("%w: --from-snapshot cannot be combined with --image or --repo", config.ErrInvalidShedRequestSentinel)
@@ -735,6 +742,7 @@ func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 		EgressToken:    meta.EgressToken,
 		Owner:          meta.Owner,
 		Mounts:         config.EffectiveMountSelection(meta.MountSelection),
+		NetworkProfile: config.EffectiveNetworkProfile(meta.NetworkProfile),
 	}
 }
 

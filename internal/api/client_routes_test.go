@@ -94,6 +94,10 @@ type clientFakeBackend struct {
 	onLock func()
 }
 
+// Type matches clientTestServer's config (default_backend: firecracker), so a
+// client's pinned isolated profile is enforceable.
+func (b *clientFakeBackend) Type() backend.Type { return backend.TypeFirecracker }
+
 func newClientFakeBackend(sheds ...config.Shed) *clientFakeBackend {
 	b := &clientFakeBackend{sheds: map[string]config.Shed{}}
 	for _, s := range sheds {

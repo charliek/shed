@@ -43,6 +43,7 @@ type clientListEntry struct {
 	NamePrefix   string   `json:"name_prefix"`
 	MaxSheds     int      `json:"max_sheds"`
 	MaxAge       string   `json:"max_age"`
+	Network      string   `json:"network"`
 	ServerMounts []string `json:"server_mounts"`
 	Images       []string `json:"images"`
 	CapsCPUs     int      `json:"caps_cpus,omitempty"`
@@ -241,6 +242,7 @@ func printClientList(w io.Writer, cfg *config.ServerConfig, asJSON bool) error {
 				NamePrefix:   p.NamePrefix,
 				MaxSheds:     p.MaxSheds,
 				MaxAge:       p.MaxAge.Duration().String(),
+				Network:      p.NetworkProfile(),
 				ServerMounts: append([]string{}, p.ServerMounts...),
 				Images:       append([]string{}, p.Images...),
 				CapsCPUs:     p.Caps.CPUs,
@@ -258,10 +260,10 @@ func printClientList(w io.Writer, cfg *config.ServerConfig, asJSON bool) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tPREFIX\tMAX SHEDS\tMAX AGE\tCERT MAX TTL\tSERVER MOUNTS\tIMAGES\tCAPS")
+	fmt.Fprintln(tw, "NAME\tPREFIX\tMAX SHEDS\tMAX AGE\tCERT MAX TTL\tNETWORK\tSERVER MOUNTS\tIMAGES\tCAPS")
 	for _, e := range entries {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
-			e.Name, e.NamePrefix, e.MaxSheds, e.MaxAge, e.CertMaxTTL,
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			e.Name, e.NamePrefix, e.MaxSheds, e.MaxAge, e.CertMaxTTL, e.Network,
 			listOrDash(e.ServerMounts, "none"), listOrDash(e.Images, "default"), capsString(e.CapsCPUs, e.CapsMemoryMB))
 	}
 	return tw.Flush()

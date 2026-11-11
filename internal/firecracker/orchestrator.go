@@ -21,6 +21,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/backend/orchestrator"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/netpolicy"
 	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmimage/clone"
 	"github.com/charliek/shed/internal/vmutil"
@@ -65,6 +66,7 @@ type fcNet struct {
 	cid       uint32
 	ipAddress string
 	tapDevice string
+	profile   netpolicy.Profile
 }
 
 // fcMetaHandle carries the persisted *Metadata between hooks. The
@@ -217,6 +219,10 @@ func (b *fcCreator) PreFlight(ctx context.Context, req config.CreateShedRequest,
 func (b *fcCreator) AllocateNetwork(ctx context.Context, req config.CreateShedRequest, cleanup *backend.Cleanup) (orchestrator.NetworkResources, error) {
 	backend.Phase(ctx, "network")
 	backend.Status(ctx, "Allocating network resources...")
+	profile, err := b.c.resolveNetworkProfile(req.Network)
+	if err != nil {
+		return nil, err
+	}
 	cid, err := b.c.AllocateCID(req.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate CID: %w", err)
@@ -242,7 +248,14 @@ func (b *fcCreator) AllocateNetwork(ctx context.Context, req config.CreateShedRe
 		return b.c.netMgr.DeleteTAPDevice(tapDevice)
 	})
 
-	return fcNet{cid: cid, ipAddress: ipAddress, tapDevice: tapDevice}, nil
+	// A guarded shed's rules go in before its VM exists, so the guest's very
+	// first frame is already filtered; when they cannot be applied the create
+	// fails (503) rather than boot an unguarded guest.
+	if err := b.c.guardNewShed(ctx, req.Name, profile, tapDevice, cid, ipAddress, cleanup); err != nil {
+		return nil, err
+	}
+
+	return fcNet{cid: cid, ipAddress: ipAddress, tapDevice: tapDevice, profile: profile}, nil
 }
 
 // AllocateUpper provisions the writable upper layer. Includes the
@@ -318,6 +331,7 @@ func (b *fcCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		Owner:          req.Owner,
 		// Always explicit for a new shed; nil (a non-API caller) is "all".
 		MountSelection: config.EffectiveMountSelection(req.ResolvedMounts),
+		NetworkProfile: string(net.profile),
 	}
 
 	cleanup.Register("delete instance dir", func() error {
@@ -464,6 +478,9 @@ func (b *fcCreator) ConfigureEgressProxy(ctx context.Context, req config.CreateS
 	if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("egress: save metadata: %w", err)
 	}
+	// A guarded shed may reach its own proxy port on the gateway (before the
+	// clone, which goes through the proxy).
+	b.c.syncEgressPort(meta.Name, port)
 	b.egressEnv = env
 	return nil
 }
@@ -625,6 +642,12 @@ func (c *Client) sweepStaleP9Servers(name string) {
 // startup re-populates the maps from on-disk metadata).
 func (b *fcStarter) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHandle, cleanup *backend.Cleanup) (orchestrator.VMHandle, error) {
 	meta := metaRaw.(*fcMetaHandle).meta
+
+	// A guarded shed starts only with its rules in place (503 otherwise) and
+	// its TAP up.
+	if err := b.c.ensureGuardedForStart(ctx, meta); err != nil {
+		return nil, err
+	}
 
 	vm, err := CreateVM(ctx, meta, b.c.cfg, b.c.netMgr)
 	if err != nil {
@@ -804,6 +827,7 @@ func (b *fcStarter) ConfigureEgressProxy(ctx context.Context, metaRaw orchestrat
 			return fmt.Errorf("egress: save metadata: %w", err)
 		}
 	}
+	b.c.syncEgressPort(meta.Name, port)
 	return nil
 }
 

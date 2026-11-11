@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 )
 
@@ -52,7 +53,39 @@ func (s *Server) clientCreateRefusal(c Caller, req *config.CreateShedRequest) st
 			}
 		}
 	}
+	if req.Network != "" && req.Network != p.NetworkProfile() {
+		return fmt.Sprintf("network %q is not allowed (the client's sheds are %s)", req.Network, p.NetworkProfile())
+	}
 	return ""
+}
+
+// resolveNetworkProfile returns the network profile a create gets. Admin:
+// the request's (a known profile, else 400 INVALID_NETWORK_PROFILE), or the
+// server's network.default_profile when omitted. Service client: its pinned
+// policy.network (a different explicit value was already refused by
+// clientCreateRefusal). A non-open profile on a backend that cannot enforce it
+// (VZ) is 422 NETWORK_PROFILE_UNSUPPORTED. ok=false means a refusal was
+// written.
+func (s *Server) resolveNetworkProfile(w http.ResponseWriter, c Caller, req *config.CreateShedRequest) (string, bool) {
+	var profile string
+	switch {
+	case c.IsClient():
+		profile = c.Client.Policy.NetworkProfile()
+	case req.Network == "":
+		profile = s.cfg.NetworkDefaultProfile()
+	case config.ValidNetworkProfile(req.Network):
+		profile = req.Network
+	default:
+		writeError(w, http.StatusBadRequest, config.ErrInvalidNetworkProfile,
+			fmt.Sprintf("network: %q is not a network profile (use %s or %s)", req.Network, config.NetworkProfileOpen, config.NetworkProfileIsolated))
+		return "", false
+	}
+	if profile != config.NetworkProfileOpen && s.backend.Type() != backend.TypeFirecracker {
+		writeError(w, http.StatusUnprocessableEntity, config.ErrNetworkProfileUnsupported,
+			fmt.Sprintf("network profile %s is not supported by the %s backend (only %s)", profile, s.backend.Type(), config.NetworkProfileOpen))
+		return "", false
+	}
+	return profile, true
 }
 
 // resolveMountSelection turns a create request's mounts field into the

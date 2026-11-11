@@ -233,6 +233,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// resumeChannels re-opens the message channel of every shed that is
 	// already running (#315). Captured per-backend like attachEgress.
 	var resumeChannels func(context.Context)
+	// startNetPolicy installs the backend's network-policy tables from shed
+	// metadata and starts their presence check (Firecracker only; nil
+	// otherwise). It runs before the resume walk and the listeners.
+	var startNetPolicy func(context.Context)
 	switch cfg.DefaultBackend {
 	case config.BackendFirecracker:
 		fcCfg := cfg.Firecracker
@@ -250,6 +254,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		attachEgress = fcClient.SetEgressManager
 		attachEgressStore = fcClient.SetEgressUserStore
 		resumeChannels = fcClient.ResumeRunningInstances
+		startNetPolicy = fcClient.StartNetworkPolicy
 
 	case config.BackendVZ:
 		vzCfg := cfg.VZ
@@ -279,6 +284,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// extension health until the shed was stopped and started by hand (#315).
 	// Run in the background so a wedged VM can never delay startup; cancelled
 	// on shutdown alongside the other background loops.
+	// Isolated sheds' firewall rules go back in before anything else can
+	// reach a shed: before the resume walk, any create or start, and the
+	// listeners. A failure is logged loudly and the guarded TAPs go down; an
+	// open-only server with no nft makes no call at all.
+	if startNetPolicy != nil {
+		netPolicyCtx, cancelNetPolicy := context.WithCancel(context.Background())
+		defer cancelNetPolicy()
+		startNetPolicy(netPolicyCtx)
+	}
+
 	resumeCtx, cancelResume := context.WithCancel(context.Background())
 	defer cancelResume()
 	log.Printf("Resuming message channels for already-running sheds in the background")

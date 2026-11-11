@@ -195,6 +195,14 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	}
 	req.ResolvedMounts = sel
 
+	// The network profile, resolved and written back so the backend always
+	// sees an explicit value.
+	network, ok := s.resolveNetworkProfile(w, caller, &req)
+	if !ok {
+		return
+	}
+	req.Network = network
+
 	if caller.IsClient() {
 		release, rule, err := s.reserveClientCreate(r.Context(), caller, req.Name)
 		if err != nil {
@@ -784,6 +792,12 @@ func mapBackendError(err error) (int, string, string) {
 	}
 	if errors.Is(err, config.ErrInvalidShedRequestSentinel) {
 		return http.StatusBadRequest, config.ErrInvalidRequest, err.Error()
+	}
+	if errors.Is(err, config.ErrNetworkProfileUnsupportedSentinel) {
+		return http.StatusUnprocessableEntity, config.ErrNetworkProfileUnsupported, err.Error()
+	}
+	if errors.Is(err, config.ErrNetworkEnforcementUnavailableSentinel) {
+		return http.StatusServiceUnavailable, config.ErrNetworkEnforcementUnavailable, err.Error()
 	}
 
 	// Fallback to string matching for errors without sentinels

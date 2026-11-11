@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/version"
 )
@@ -24,6 +25,10 @@ const (
 	// configured (mtls mode with auth.clients): owned sheds, the client
 	// route allowlist and the create policy.
 	FeatureServiceClients = "service_clients"
+	// FeatureNetworkProfiles signals the create request's "network" field
+	// and the isolated profile (a Firecracker server). An older server
+	// ignores the field, so a client must not ask for isolation without it.
+	FeatureNetworkProfiles = config.FeatureNetworkProfiles
 )
 
 // serverFeatures returns the feature-token set as a fresh slice, so the
@@ -34,6 +39,9 @@ func (s *Server) serverFeatures() []string {
 	features := []string{FeatureOverview, FeatureHTTPExec, FeatureMountSelection}
 	if s.cfg.ServiceClientsEnabled() {
 		features = append(features, FeatureServiceClients)
+	}
+	if s.backend != nil && s.backend.Type() == backend.TypeFirecracker {
+		features = append(features, FeatureNetworkProfiles)
 	}
 	return features
 }

@@ -121,6 +121,10 @@ type ServerConfig struct {
 	// auth.clients is set.
 	Audit *AuditConfig `yaml:"audit,omitempty"`
 
+	// Network sets the default network profile and the isolated profile's
+	// allowed ranges. Default (nil) is the open profile for every shed.
+	Network *NetworkConfig `yaml:"network,omitempty"`
+
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
 }
@@ -300,6 +304,78 @@ func (c *ServerConfig) validateAudit() error {
 	default:
 		return fmt.Errorf("invalid audit.exec_argv: %q (must be empty or %q)", c.Audit.ExecArgv, AuditExecArgvFull)
 	}
+}
+
+// NetworkDefaultProfile is network.default_profile, or "open" when unset.
+func (c *ServerConfig) NetworkDefaultProfile() string {
+	if c != nil && c.Network != nil && c.Network.DefaultProfile != "" {
+		return c.Network.DefaultProfile
+	}
+	return NetworkProfileOpen
+}
+
+// NetworkAllowCIDRs is network.allow_cidrs in canonical form (each the
+// network address of its prefix, as nft wants it). Entries are validated at
+// load (validateNetwork); one that does not parse is skipped here.
+func (c *ServerConfig) NetworkAllowCIDRs() []string {
+	if c == nil || c.Network == nil {
+		return nil
+	}
+	out := make([]string, 0, len(c.Network.AllowCIDRs))
+	for _, s := range c.Network.AllowCIDRs {
+		if _, n, err := net.ParseCIDR(strings.TrimSpace(s)); err == nil && n.IP.To4() != nil {
+			out = append(out, n.String())
+		}
+	}
+	return out
+}
+
+// validateNetwork checks the network block and every service client's
+// policy.network: known profile names, and allow_cidrs as IPv4 CIDRs. Shared
+// by Validate and ValidateNoHostCoupling; the backend check is separate
+// (validateNetworkBackend), after the backend is resolved.
+func (c *ServerConfig) validateNetwork() error {
+	if c.Network != nil {
+		if p := c.Network.DefaultProfile; p != "" && !ValidNetworkProfile(p) {
+			return fmt.Errorf("invalid network.default_profile: %q (must be %s or %s)", p, NetworkProfileOpen, NetworkProfileIsolated)
+		}
+		for _, s := range c.Network.AllowCIDRs {
+			ip, _, err := net.ParseCIDR(strings.TrimSpace(s))
+			if err != nil || ip.To4() == nil {
+				return fmt.Errorf("invalid network.allow_cidrs entry %q (must be an IPv4 CIDR such as 192.168.1.0/24)", s)
+			}
+		}
+	}
+	if c.Auth != nil {
+		for name, cc := range c.Auth.Clients {
+			if p := cc.Policy.Network; p != "" && !ValidNetworkProfile(p) {
+				return fmt.Errorf("invalid auth.clients.%s.policy.network: %q (must be %s or %s)", name, p, NetworkProfileOpen, NetworkProfileIsolated)
+			}
+		}
+	}
+	return nil
+}
+
+// validateNetworkBackend refuses a non-open profile the resolved backend
+// cannot enforce: VZ offers only "open", so a non-open
+// network.default_profile, or a service client whose policy.network is not
+// open (the default is isolated), is refused there. Run after default_backend
+// is resolved.
+func (c *ServerConfig) validateNetworkBackend() error {
+	if c.DefaultBackend != BackendVZ {
+		return nil
+	}
+	if p := c.NetworkDefaultProfile(); p != NetworkProfileOpen {
+		return fmt.Errorf("network.default_profile: %s is not supported by the vz backend (only %s; isolation needs firecracker)", p, NetworkProfileOpen)
+	}
+	if c.Auth != nil {
+		for name, cc := range c.Auth.Clients {
+			if p := cc.Policy.NetworkProfile(); p != NetworkProfileOpen {
+				return fmt.Errorf("auth.clients.%s.policy.network is %s (the default when unset), which the vz backend cannot enforce; set network: %s", name, p, NetworkProfileOpen)
+			}
+		}
+	}
+	return nil
 }
 
 // validateAuth checks the optional auth config. Shared by Validate and
@@ -1713,6 +1789,31 @@ func rejectUnknownClientKeys(data []byte) error {
 	return nil
 }
 
+// rejectUnknownNetworkKeys fails loudly on an unknown key under network:
+// (say `default_profle:`), for the same reason as rejectUnknownClientKeys: a
+// typo in an isolation setting must not be silently dropped.
+func rejectUnknownNetworkKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	block, present := raw["network"]
+	if !present || block == nil {
+		return nil
+	}
+	sub, err := yaml.Marshal(block)
+	if err != nil {
+		return fmt.Errorf("network: %w", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(sub))
+	dec.KnownFields(true)
+	var typed NetworkConfig
+	if err := dec.Decode(&typed); err != nil {
+		return fmt.Errorf("network: %w", err)
+	}
+	return nil
+}
+
 // LoadServerConfig loads server configuration from standard locations.
 // It checks in order: ./server.yaml, ~/.config/shed/server.yaml, /etc/shed/server.yaml
 func LoadServerConfig() (*ServerConfig, error) {
@@ -1750,7 +1851,7 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 func rejectRemovedKeys(data []byte) error {
 	for _, check := range []func([]byte) error{
 		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys,
-		rejectUnknownClientKeys,
+		rejectUnknownClientKeys, rejectUnknownNetworkKeys,
 	} {
 		if err := check(data); err != nil {
 			return err
@@ -2088,6 +2189,9 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if err := c.validateAudit(); err != nil {
 		return err
 	}
+	if err := c.validateNetwork(); err != nil {
+		return err
+	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[c.LogLevel] {
@@ -2125,7 +2229,7 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 			return fmt.Errorf("vz configuration is required when backend is vz")
 		}
 	}
-	return nil
+	return c.validateNetworkBackend()
 }
 
 // ActiveDefaultImage returns the resolved default_image for the configured
@@ -2172,6 +2276,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := c.validateAudit(); err != nil {
+		return err
+	}
+	if err := c.validateNetwork(); err != nil {
 		return err
 	}
 
@@ -2249,6 +2356,9 @@ func (c *ServerConfig) Validate() error {
 
 	// Service clients' image aliases need the resolved backend's block.
 	if err := c.validateClientImages(); err != nil {
+		return err
+	}
+	if err := c.validateNetworkBackend(); err != nil {
 		return err
 	}
 

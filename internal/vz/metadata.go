@@ -126,6 +126,10 @@ type Metadata struct {
 	// honoured on every start. New sheds always store it explicitly; a
 	// missing value (an older shed) means every mount.
 	MountSelection *config.MountSelection `json:"mount_selection,omitempty"`
+
+	// NetworkProfile is the shed's network profile. VZ offers only "open";
+	// new sheds store it explicitly and a missing value means open.
+	NetworkProfile string `json:"network_profile,omitempty"`
 }
 
 const metadataFilename = "metadata.json"

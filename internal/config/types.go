@@ -79,6 +79,15 @@ var (
 	// got out of sync (partial save / external tampering / server crash
 	// between vm.Start and metadata.Save).
 	ErrZombiePresentSentinel = errors.New("recorded VMM pid is still alive; refusing to spawn a second instance")
+
+	// ErrNetworkProfileUnsupportedSentinel is returned when a backend cannot
+	// provide the requested network profile (VZ offers only "open").
+	ErrNetworkProfileUnsupportedSentinel = errors.New("network profile is not supported by this backend")
+
+	// ErrNetworkEnforcementUnavailableSentinel is returned when shed-server
+	// cannot install the firewall rules a non-open network profile needs, so
+	// a create or start of such a shed is refused rather than run unguarded.
+	ErrNetworkEnforcementUnavailableSentinel = errors.New("network enforcement is unavailable")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -171,6 +180,36 @@ type Shed struct {
 	// `mounts:`). A shed created before mount selection existed reports
 	// {"mode":"all"}.
 	Mounts *MountSelection `json:"mounts,omitempty" yaml:"mounts,omitempty"`
+	// NetworkProfile is the shed's network profile ("open" or "isolated"),
+	// fixed at create. A shed created before network profiles existed
+	// reports "open".
+	NetworkProfile string `json:"network_profile,omitempty" yaml:"network_profile,omitempty"`
+}
+
+// Network profiles (CreateShedRequest.Network, Shed.NetworkProfile,
+// network.default_profile, auth.clients.<name>.policy.network).
+const (
+	// NetworkProfileOpen is today's network: the guest reaches whatever the
+	// host's NAT reaches. The default.
+	NetworkProfileOpen = "open"
+	// NetworkProfileIsolated gives the guest the internet and nothing else:
+	// not the host, other guests, private, CGNAT/tailnet, link-local or
+	// multicast ranges, and no IPv6. Firecracker only.
+	NetworkProfileIsolated = "isolated"
+)
+
+// ValidNetworkProfile reports whether p is a known network profile name.
+func ValidNetworkProfile(p string) bool {
+	return p == NetworkProfileOpen || p == NetworkProfileIsolated
+}
+
+// EffectiveNetworkProfile is the profile a shed with the stored value p runs
+// with: empty (metadata written before network profiles existed) is "open".
+func EffectiveNetworkProfile(p string) string {
+	if p == "" {
+		return NetworkProfileOpen
+	}
+	return p
 }
 
 // Mount selection modes (MountSelection.Mode).
@@ -344,6 +383,12 @@ type ServerInfo struct {
 // is this constant); the CLI refuses to send --mounts to a server without it,
 // since an older server would ignore the field and mount everything.
 const FeatureMountSelection = "mount_selection"
+
+// FeatureNetworkProfiles is the /api/info feature token for the create
+// request's "network" field (advertised by a Firecracker server). The CLI
+// refuses to send --network isolated to a server without it, since an older
+// server would ignore the field and create an open shed.
+const FeatureNetworkProfiles = "network_profiles"
 
 // HasFeature reports whether the server advertises the feature token f.
 func (i *ServerInfo) HasFeature(f string) bool {
@@ -669,6 +714,13 @@ type CreateShedRequest struct {
 	// server_mounts, and omitting it means exactly those.
 	Mounts *[]string `json:"mounts,omitempty"`
 
+	// Network is the shed's network profile ("open" or "isolated"; omitted =
+	// the server's network.default_profile, or a service client's pinned
+	// policy.network). The API server resolves it and writes the effective
+	// profile back here before the backend runs, so a backend always sees an
+	// explicit value from the API.
+	Network string `json:"network,omitempty"`
+
 	// Owner and ResolvedMounts are set by the API server after
 	// authorization (json:"-": no caller can set them on the wire). Owner is
 	// the service client creating the shed ("" for an admin);
@@ -821,6 +873,15 @@ const (
 	ErrForbidden = "FORBIDDEN"
 	// ErrUnauthorized (401) means no valid credential was presented.
 	ErrUnauthorized = "UNAUTHORIZED"
+	// ErrInvalidNetworkProfile (400) means a create request's network is not
+	// a known profile.
+	ErrInvalidNetworkProfile = "INVALID_NETWORK_PROFILE"
+	// ErrNetworkProfileUnsupported (422) means the backend cannot provide the
+	// requested profile (VZ offers only "open").
+	ErrNetworkProfileUnsupported = "NETWORK_PROFILE_UNSUPPORTED"
+	// ErrNetworkEnforcementUnavailable (503) means the server could not
+	// install the firewall rules a non-open profile needs.
+	ErrNetworkEnforcementUnavailable = "NETWORK_ENFORCEMENT_UNAVAILABLE"
 
 	ErrSnapshotNotFound        = "SNAPSHOT_NOT_FOUND"
 	ErrSnapshotAlreadyExists   = "SNAPSHOT_ALREADY_EXISTS"
@@ -917,6 +978,31 @@ type ServiceClientPolicy struct {
 	Images []string `yaml:"images,omitempty"`
 	// Caps bound the resources of one shed, compared after defaults.
 	Caps ServiceClientCaps `yaml:"caps,omitempty"`
+	// Network is the network profile every shed of this client gets
+	// ("open" or "isolated"; default isolated). A create that names another
+	// profile is refused.
+	Network string `yaml:"network,omitempty"`
+}
+
+// NetworkProfile is the client's pinned network profile: policy.network, or
+// "isolated" when unset.
+func (p ServiceClientPolicy) NetworkProfile() string {
+	if p.Network == "" {
+		return NetworkProfileIsolated
+	}
+	return p.Network
+}
+
+// NetworkConfig is the server-level network block. Every field is optional;
+// an absent block is the open default.
+type NetworkConfig struct {
+	// DefaultProfile is the profile a create that names none gets ("open",
+	// the default, or "isolated"; non-open requires Firecracker).
+	DefaultProfile string `yaml:"default_profile,omitempty"`
+	// AllowCIDRs are IPv4 ranges an isolated shed may reach although they
+	// fall in the blocked ranges (a LAN registry, say). They apply to
+	// forwarded traffic only, never to the host itself.
+	AllowCIDRs []string `yaml:"allow_cidrs,omitempty"`
 }
 
 // ServiceClientCaps are optional per-shed resource caps (0 = no cap).

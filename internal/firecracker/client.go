@@ -19,6 +19,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/lockmap"
+	"github.com/charliek/shed/internal/netpolicy"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/retry"
 	"github.com/charliek/shed/internal/stallwatch"
@@ -73,6 +74,14 @@ type Client struct {
 	// the resume liveness predicate can be exercised against synthetic
 	// processes (vanished PIDs, reused PIDs, wedged reads).
 	procCmdline func(ctx context.Context, pid int) (string, error)
+
+	// netpol is this server's network-policy Manager (its own nftables
+	// tables for non-open profiles). nil (a zero-value Client in tests)
+	// turns every network-policy hook into a no-op.
+	netpol   *netpolicy.Manager
+	netpolSt netpolState
+	// setLinkState overrides netlink for setting a TAP up or down (tests).
+	setLinkState func(name string, up bool) error
 }
 
 // SetEgressManager attaches the egress-control proxy manager, called by
@@ -105,6 +114,7 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, br
 
 		procCmdline: readProcCmdline,
 	}
+	client.netpol = newNetworkPolicy(cfg, serverCfg, netMgr.Gateway())
 
 	// Load existing instances to populate CID and IP maps
 	if err := client.loadExistingInstances(); err != nil {
@@ -475,7 +485,33 @@ func (c *Client) startP9Server(name, bridgeIP, hostPath, mountPath string, readO
 	c.p9Servers[name] = append(c.p9Servers[name], srv)
 	c.mu.Unlock()
 
+	// A guarded shed may reach only its own ports on the gateway: allow this
+	// one before the guest is asked to mount it. Without the allowance the
+	// guest could not mount, so a failure here fails the mount.
+	if err := c.syncP9Ports(name); err != nil {
+		c.removeP9Server(name, srv)
+		srv.Close()
+		return nil, fmt.Errorf("allow 9P port for %s: %w", hostPath, err)
+	}
+
 	return srv, nil
+}
+
+// removeP9Server drops one server from a shed's registered set (the caller
+// closes it) and refreshes a guarded shed's allowed ports.
+func (c *Client) removeP9Server(name string, srv *P9Server) {
+	c.mu.Lock()
+	servers := c.p9Servers[name]
+	for i, s := range servers {
+		if s == srv {
+			c.p9Servers[name] = append(servers[:i], servers[i+1:]...)
+			break
+		}
+	}
+	c.mu.Unlock()
+	if err := c.syncP9Ports(name); err != nil {
+		log.Printf("Warning: network policy: 9P ports for %s: %v", name, err)
+	}
 }
 
 // stopP9Servers stops all P9 servers for a VM and removes them from the map.
@@ -493,6 +529,11 @@ func (c *Client) stopP9Servers(name string) {
 	c.mu.Unlock()
 
 	closeP9ServerSet(servers)
+	if len(servers) > 0 {
+		if err := c.syncP9Ports(name); err != nil {
+			log.Printf("Warning: network policy: 9P ports for %s: %v", name, err)
+		}
+	}
 }
 
 // closeP9ServerSet closes servers concurrently and waits for all of them, so a
@@ -573,18 +614,10 @@ func (c *Client) mount9PCredentialFunc(shedName string) vmutil.DirMountFunc {
 
 		tag := config.CredentialMountTag(credName)
 		if err := c.mount9PInGuest(ctx, agent, srv.Addr(), mount.Target, mount.ReadOnly, tag); err != nil {
-			// Clean up the P9 server to avoid leaked listeners
+			// Clean up the P9 server to avoid leaked listeners, and drop it
+			// from the p9Servers slice (and a guarded shed's allowed ports).
 			srv.Close()
-			// Remove from the p9Servers slice
-			c.mu.Lock()
-			servers := c.p9Servers[shedName]
-			for i, s := range servers {
-				if s == srv {
-					c.p9Servers[shedName] = append(servers[:i], servers[i+1:]...)
-					break
-				}
-			}
-			c.mu.Unlock()
+			c.removeP9Server(shedName, srv)
 			return fmt.Errorf("mount 9P credential %q: %w", credName, err)
 		}
 
@@ -638,6 +671,7 @@ func (c *Client) SetShedEgress(ctx context.Context, name string, profiles []stri
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		return nil, fmt.Errorf("egress: save metadata: %w", err)
 	}
+	c.syncEgressPort(name, meta.EgressPort)
 	return c.GetShed(ctx, name)
 }
 
@@ -671,6 +705,7 @@ func (c *Client) clearShedEgressLocked(ctx context.Context, meta *Metadata) (*co
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		return nil, fmt.Errorf("egress: save metadata: %w", err)
 	}
+	c.syncEgressPort(meta.Name, 0)
 	return c.GetShed(ctx, meta.Name)
 }
 
@@ -697,6 +732,7 @@ func metadataToShed(meta *Metadata) *config.Shed {
 		EgressToken:    meta.EgressToken,
 		Owner:          meta.Owner,
 		Mounts:         config.EffectiveMountSelection(meta.MountSelection),
+		NetworkProfile: config.EffectiveNetworkProfile(meta.NetworkProfile),
 	}
 }
 
@@ -916,6 +952,9 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 	c.credMgr.StopListener(name)
 
 	backend.Status(ctx, "Releasing network...")
+	// The VMM is gone: drop the shed's network-policy entry before its TAP
+	// (and so its IP) can be reused.
+	c.removeNetworkPolicy(ctx, name)
 	if err := c.netMgr.DeleteTAPDevice(meta.TAPDevice); err != nil {
 		log.Printf("Warning: failed to delete TAP device %s: %v", meta.TAPDevice, err)
 	}

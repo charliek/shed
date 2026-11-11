@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -626,6 +626,7 @@ dev-server-down-fc:
 	      sudo -n kill -KILL \$$PID 2>/dev/null; \
 	    fi; \
 	    echo \"Dev FC server (pid \$$PID) stopped on $(FC_REMOTE_HOST).\"; \
+	    sudo -n $(FC_DEV_BIN_PATH) network teardown --config $(FC_DEV_CONFIG) || true; \
 	    sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_BIN_PATH) $(FC_DEV_PROXY_PATH) $(FC_DEV_CONFIG) $(FC_DEV_LOG_PATH); \
 	  fi"
 
@@ -660,6 +661,26 @@ dev-server-logs-fc:
 	@ssh -t $(FC_REMOTE_HOST) "sudo -n tail -F $(FC_DEV_LOG_PATH)"
 
 dev-server-restart-fc: dev-server-down-fc dev-server-up-fc
+
+# Root-only proof of the isolated network profile's nftables rules, run on
+# $(FC_REMOTE_HOST) entirely inside network namespaces the test creates and
+# deletes (a bridge and veth pairs stand in for TAPs; nft only ever runs via
+# `ip netns exec`). Cross-compiles the netpolicy test binary with the netns
+# tag for the remote's arch, runs it under sudo, and deletes the copy.
+NETNS_TEST_BIN := bin/netpolicy-netns.test
+test-netns-remote:
+	@ARCH=$$(ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) "uname -m" 2>/dev/null); \
+	 case "$$ARCH" in \
+	   x86_64)  GOARCH=amd64 ;; \
+	   aarch64) GOARCH=arm64 ;; \
+	   *) echo "ERROR: unsupported or unreachable remote arch on $(FC_REMOTE_HOST): '$$ARCH'"; exit 1 ;; \
+	 esac; \
+	 echo "Cross-compiling the netpolicy netns test for linux/$$GOARCH..."; \
+	 GOOS=linux GOARCH=$$GOARCH CGO_ENABLED=0 go test -c -tags netns -o $(NETNS_TEST_BIN) ./internal/netpolicy || exit 1; \
+	 scp -q $(NETNS_TEST_BIN) $(FC_REMOTE_HOST):/tmp/netpolicy-netns.test || exit 1; \
+	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "sudo -n /tmp/netpolicy-netns.test -test.v -test.count=1 -test.run '^TestNetns'"; RC=$$?; \
+	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "rm -f /tmp/netpolicy-netns.test"; \
+	 exit $$RC
 
 # Run the integration suite against the parallel dev FC shed-server.
 # Auto-ups the dev server if it isn't already running. Doesn't

@@ -317,6 +317,7 @@ func (b *vzCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		Owner:          req.Owner,
 		// Always explicit for a new shed; nil (a non-API caller) is "all".
 		MountSelection: config.EffectiveMountSelection(req.ResolvedMounts),
+		NetworkProfile: config.NetworkProfileOpen,
 	}
 
 	// Register BEFORE Save: Save's `os.MkdirAll` runs first, so a
