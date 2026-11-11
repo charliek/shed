@@ -267,10 +267,12 @@ arrives over a network the rules match). The first time a changed rule set
 reaches the FC remote's dev server, arm an automatic rollback that stops the
 dev server (its 30 s presence check would otherwise put the tables back),
 waits for it to exit (up to 35 s, its 30 s graceful shutdown included, then
-SIGKILL) and only then deletes **only its own tables**:
+SIGKILL), and deletes **only its own tables**, and only once the server is
+gone (if it is somehow still alive, the tables are left alone). It refuses to
+arm while another rollback is armed, so a cancel always reaches the live one:
 
 ```sh
-ssh mini3 "sudo -n sh -c 'setsid nohup sh -c \"sleep 120; P=\\\$(cat /tmp/shed-server-dev.pid); kill -TERM \\\$P; i=0; while kill -0 \\\$P 2>/dev/null && [ \\\$i -lt 35 ]; do sleep 1; i=\\\$((i+1)); done; kill -0 \\\$P 2>/dev/null && kill -KILL \\\$P; sleep 1; nft delete table bridge shed_mini3_dev; nft delete table inet shed_mini3_dev\" </dev/null >/dev/null 2>&1 & echo \$! > /tmp/shed-dev-nft-rollback.pid'"
+ssh mini3 "sudo -n sh -c 'if [ -s /tmp/shed-dev-nft-rollback.pid ] && kill -0 -\$(cat /tmp/shed-dev-nft-rollback.pid) 2>/dev/null; then echo \"a rollback is already armed; cancel it first\" >&2; exit 1; fi; setsid nohup sh -c \"sleep 120; P=\\\$(cat /tmp/shed-server-dev.pid); kill -TERM \\\$P; i=0; while kill -0 \\\$P 2>/dev/null && [ \\\$i -lt 35 ]; do sleep 1; i=\\\$((i+1)); done; kill -0 \\\$P 2>/dev/null && kill -KILL \\\$P; sleep 2; if ! kill -0 \\\$P 2>/dev/null; then nft delete table bridge shed_mini3_dev; nft delete table inet shed_mini3_dev; fi\" </dev/null >/dev/null 2>&1 & echo \$! > /tmp/shed-dev-nft-rollback.pid'"
 ```
 
 Then, within the window: create one isolated shed on the dev server
@@ -280,7 +282,7 @@ and that the production and dev HTTPS ports still accept TCP, and cancel the
 rollback by killing its whole process group (the `sleep` included):
 
 ```sh
-ssh mini3 'sudo -n sh -c "kill -TERM -\$(cat /tmp/shed-dev-nft-rollback.pid)"'
+ssh mini3 'sudo -n sh -c "kill -TERM -\$(cat /tmp/shed-dev-nft-rollback.pid) && rm -f /tmp/shed-dev-nft-rollback.pid"'
 ssh mini3 'ps -ef | grep -v grep | grep "sleep 120"'   # expect nothing
 ```
 
@@ -288,6 +290,13 @@ If anything looks wrong, let the rollback fire. The table names come from the
 dev config's `name:` (`mini3-dev` gives `shed_mini3_dev`). Never delete another
 table, the bridge or the NAT rules: the dev server shares `shed-br0` with the
 production server on the same host.
+
+If the rollback fired, the test shed's VM is still running (stopping
+shed-server never stops a Firecracker VM) and is **unguarded** until the dev
+server starts again. Once the host is reachable, stop that shed's
+`firecracker` process; or, once the rule change is fixed, start the dev server
+(`make dev-server-up-fc SHED_DEV_AUTH_MODE=mtls`, which reinstalls the tables
+from the sheds' metadata before it serves) and delete the shed.
 
 `make dev-server-down-fc` runs `shed-server network teardown` for the dev
 server after stopping it, so its tables never outlive it.
