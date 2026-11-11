@@ -223,7 +223,11 @@ separate stderr stream):
 
 `scripts/render-dev-config.sh --mtls` gives the FC dev config an `itest` service
 client (prefix `itest-svc-`, `max_sheds: 3`, `max_age: 2h`, images `[itest]`, no
-server mounts, network isolated by default). Run them with:
+server mounts, network isolated by default) and a `nocturn` client for a development
+Nocturn's shed-craze Agent Provider (prefix `nocturn-`, `max_sheds: 4`, `max_age: 30h`,
+network isolated, no server mounts, images `[itest]`; issue its bundle on the dev host
+with `sudo -n /tmp/shed-server-dev client issue nocturn --config /tmp/shed-server-dev.yaml`).
+Run them with:
 
 ```sh
 make build && make dev-server-restart-fc SHED_DEV_AUTH_MODE=mtls

@@ -124,6 +124,19 @@ auth:
         max_sheds: 3
         max_age: 2h
         images: [itest]
+    # The client a development Nocturn (the shed-craze Agent Provider) uses
+    # against this dev server. Isolated network, no server mounts. It may use
+    # the `itest` alias because the v0.5.9 default image predates the exec
+    # fixes (process-group cleanup, a separate stderr stream). Issue its bundle
+    # on the dev host with `shed-server client issue nocturn`.
+    nocturn:
+      policy:
+        name_prefix: "nocturn-"
+        max_sheds: 4
+        max_age: 30h
+        network: isolated
+        server_mounts: []
+        images: [itest]
 EOF
   fi
   applied+=("auth.mode: mtls")

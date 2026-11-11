@@ -512,7 +512,8 @@ mtls credential for the dev entry (`~/.shed/creds/<entry>/client.pem` and
 `client.key`), pinned by the entry's `tls_cert_fingerprint`; the client side
 with the bundle from `client issue`, pinned by its `tls_cert_fingerprint`.
 `scripts/render-dev-config.sh --mtls` gives the FC dev config the `itest` client
-(prefix `itest-svc-`, `max_sheds: 3`, `max_age: 2h`, images `[itest]`).
+(prefix `itest-svc-`, `max_sheds: 3`, `max_age: 2h`, images `[itest]`), and a
+`nocturn` client the suite does not use (it is a development Nocturn's).
 
 **The `itest` image alias.** Their sheds use the FC dev config's `itest` alias,
 `ghcr.io/charliek/shed-fc-base:v0.9.0`, not the dev config's default v0.5.9
