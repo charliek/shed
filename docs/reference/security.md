@@ -278,6 +278,12 @@ This ownership tracking is enforced whenever HTTP auth is on (i.e. `token`
 mode); with auth off (the `open` default) the bus behaves exactly as before, and
 without re-delivery.
 
+The bus is **always off for a shed a [service client](#service-clients) owns**
+(not a policy option): the server drops that shed's plugin messages before they
+reach a listener, refuses to send it any, and leaves it out of
+`GET /api/plugins/sheds`. An owned shed can never ask the host for an SSH
+signature or a cloud credential.
+
 ## Token mode
 
 `auth.mode: token` is the internet-facing posture. It derives the full bundle
@@ -450,12 +456,14 @@ per-purpose revocation without cutting SSH access should stay on `token` mode.
   behavior (tokens are also only checked at request time, not mid-stream).
   Revocation and expiry bind on the *next* request/dial, not on
   already-hijacked byte-copy loops.
-- **`curl` and ad-hoc scripts cannot reach an mtls server.** There is no way
-  to hand a script a bearer header and have it work — it needs a client
-  certificate and the private key that signed its CSR. **This is exactly why
-  `token` mode is retained and not deprecated**: anything that needs
-  programmatic HTTP access without the shed client fleet (CI runners,
-  third-party integrations, `curl` debugging) stays on `token`.
+- **`curl` and ad-hoc scripts cannot reach an mtls server as an admin.** There
+  is no way to hand a script a bearer header and have it work — it needs a
+  client certificate and the private key that signed its CSR. **This is
+  exactly why `token` mode is retained and not deprecated**: anything that
+  needs admin HTTP access without the shed client fleet (CI runners,
+  third-party integrations, `curl` debugging) stays on `token`. An
+  orchestrator that only needs its own sheds can instead be a
+  [service client](#service-clients), whose bundle works with `curl --cert`.
 - **CA rotation is manual.** Deleting `ca_cert.pem` + `ca_key.pem` and
   restarting the server invalidates every previously-issued client
   certificate at once — a fleet-wide re-enrollment. Every well-behaved client
@@ -471,6 +479,186 @@ per-purpose revocation without cutting SSH access should stay on `token` mode.
 
 See [Upgrading to mTLS](../upgrades/token-to-mtls.md) for the client-then-server
 rollout order and the desktop component-upgrade ordering.
+
+## Service clients
+
+A **service client** is an orchestrator that drives sheds on a server it does
+not administer: a CI system, or an agent runner such as Nocturn. It gets a
+narrow identity and a narrow blast radius. Clients are declared under
+[`auth.clients`](configuration.md#service-clients), exist only in `auth.mode:
+mtls` (the config is refused otherwise), and are set up as the [Orchestrated
+sheds guide](../guides/orchestrated-sheds.md) describes. A server with no
+`auth.clients` behaves exactly as before.
+
+### Identity
+
+`shed-server client issue <name>`, run on the shed host, signs a certificate
+with the server's existing mtls client CA. A service certificate is shaped so
+it can never be confused with a user's (whose CN is an SSH key fingerprint):
+
+- **CN** = the client name (`^[a-z][a-z0-9-]{0,62}$`, so it can never match an
+  SSH fingerprint), **OU** = `service`, and exactly one URI SAN,
+  `shed-client://<name>`. Nothing else.
+- A certificate with either service marker is judged as a service certificate
+  only. If its shape is wrong, it is refused, never treated as a user's.
+- It is accepted only while `<name>` is in `auth.clients`, at the TLS
+  handshake and again on every request. It is **never checked against the SSH
+  allowlist**, and it carries no SSH access.
+- A user's certificate (from `shed server add`) is never treated as a client,
+  whatever its CSR asked for, because the server composes its subject itself.
+
+### What a client can and cannot do
+
+Client requests are deny by default. A client can read `/api/info` and
+`/api/images`, list its own sheds, create sheds within its policy, and get,
+start, stop, delete and [exec](api.md#post-apishedsnameexec) in the sheds it
+owns. Everything else is `403 FORBIDDEN`: snapshots, images other than the
+list, system and prune, the credential bus, Connect tunnels, egress, reset,
+sessions. A shed it does not own is `404 SHED_NOT_FOUND`, with the same body
+as a shed that does not exist. The full table is in [API › Service
+clients](api.md#service-clients); a unit test walks every registered route and
+fails when one is neither on the client allowlist nor asserted forbidden.
+
+The create policy (`403 POLICY_VIOLATION`) refuses host directories
+(`local_dir`, `add_dirs`), snapshots, images outside the policy, names without
+its prefix, resources over its caps, more than `max_sheds` owned sheds, a
+network profile other than the pinned one, and server mounts outside
+`server_mounts`. It runs before anything touches the host's filesystem.
+
+Ownership is the `owner` field in the shed's metadata and JSON. It is bound to
+the shed an operation acts on: the backend re-checks the owner under its
+per-shed lock, so a request cannot act on a shed someone else recreated under
+the same name in the meantime. Sheds created before service clients existed
+have no owner and are admin-only. **Admins see and control every shed**, owned
+or not.
+
+Each owned shed:
+
+- gets **no server mounts** unless the policy's `server_mounts` names some;
+- has the **credential bus off** (see [Credential bus](#credential-bus));
+- never sees the server's `env_file` variables, which are otherwise passed to
+  a `repo` clone;
+- has the client's pinned **network profile**, `isolated` by default (see
+  [Network profiles](#network-profiles));
+- is **deleted once it is older than the policy's `max_age`**: a reaper checks
+  at start and every 60 s, stops the shed, deletes it and writes a `reap`
+  audit line. It is the only server-side lifetime bound; the orchestrator is
+  expected to delete its sheds itself.
+
+Every client request, allowed or refused, writes one `api` line to the [audit
+log](configuration.md#audit-log), and every HTTPS exec writes an `exec.end`
+line (argv[0] and the argument count by default, never the arguments).
+
+### Residual risks
+
+- **A leaked bundle is root in that client's sheds.** Whoever holds a client's
+  certificate and key can do everything the client can: create sheds within its
+  policy, run any command as root (through `sudo`) in its live sheds, read
+  whatever the orchestrator put there (a clone, a token passed to a command),
+  and delete them. It cannot reach an admin's shed, another client's, the
+  host, or SSH. Store the bundle as a secret, and keep `cert_max_ttl` short.
+- **No serial revocation.** One certificate cannot be revoked on its own.
+  Removing the client from `auth.clients` and restarting `serve` revokes every
+  certificate issued for it; re-adding it later trusts them again until they
+  expire. Rename the client when a bundle leaks.
+- **A guest is root in its VM**, by design, and an `isolated` guest still has
+  the internet: isolation keeps it away from the host and its networks, not
+  from exfiltrating what the shed holds.
+- **Firecracker runs as root, without the jailer.** shed-server starts
+  `firecracker` directly, not under Firecracker's `jailer` (chroot,
+  namespaces, privilege drop), so a VMM escape would be root on the host. The
+  KVM boundary and Firecracker's own seccomp filters are what stand between a
+  guest and the host.
+- **Exec cancellation is `SIGHUP`.** A timeout or a client disconnect closes
+  the agent connection, and the guest agent sends `SIGHUP` to the command's
+  process group. A process that ignores `SIGHUP` (or leaves the group) keeps
+  running until the shed stops.
+
+## Mount selection
+
+Every shed gets every server mount (`mounts:`) by default, as before. A shed
+can be created with fewer, through `shed create --mounts none|a,b` or the
+API's `mounts` field, and a service client's sheds get only its
+`server_mounts`. The choice is stored with the shed as an explicit mode
+(`all`, or `selected` plus names; a stored selection with no names is none,
+and an unknown mode mounts nothing) and is applied on every start, including
+an SSH auto-start, on both backends. Without a mount, the guest has no path to
+that host directory at all: on Firecracker no 9P server is started for it, on
+VZ no VirtioFS device is attached.
+
+## Network profiles
+
+Each shed has a network profile, chosen at create and fixed for its life:
+
+- **`open`** (the default): today's network. The guest reaches whatever the
+  host's NAT reaches, including the host, the LAN and other sheds.
+- **`isolated`** (Firecracker only): the internet and nothing else. Not the
+  host (on any of its addresses, the gateway included), other sheds, RFC 1918,
+  CGNAT and tailnet (`100.64.0.0/10`), link-local and cloud metadata
+  (`169.254.0.0/16`), loopback, multicast and the other reserved IPv4 ranges,
+  and no IPv6 at all. Anti-spoofing is on. The guest's DNS server (8.8.8.8) is
+  on the internet, so name resolution works. The host still reaches the
+  guest: `shed exec`, the HTTPS exec, tunnels and the agent's health checks
+  run over vsock, not the network.
+
+Choose it per shed with `shed create --network isolated`, for every create
+without a `--network` with `network.default_profile`, or for a service client
+with its `policy.network` (isolated unless set). VZ answers
+`422 NETWORK_PROFILE_UNSUPPORTED` for anything but `open`.
+
+### How it is enforced
+
+shed-server owns two nftables tables named after the server's `name:`
+(`bridge shed_<name>` and `inet shed_<name>`, every character outside
+`[A-Za-z0-9_]` replaced by `_`). It installs, reasserts and removes them itself,
+always as one `nft -f -` transaction that replaces both tables. The tables only
+**add drops**: shed-server's existing iptables NAT and `FORWARD` rules, the
+bridge, and every other table are left alone. Each isolated shed is a set of
+elements (its TAP, MAC and IP):
+
+- **Anti-spoofing, keyed on the claimed address.** A frame or ARP whose source
+  IP is an isolated shed's is dropped unless it arrives on that shed's TAP with
+  that shed's MAC, whatever port it arrives on, and a frame carrying an
+  isolated shed's MAC from any other port is dropped. An isolated guest's own
+  port passes only its own ARP and IPv4 (IPv6 and everything else are
+  dropped). So neither the guest nor an open shed (or another server's guest
+  on a shared bridge) can take an isolated shed's address.
+- **Guest to guest:** anything to or from an isolated shed's TAP is dropped at
+  the bridge.
+- **Host input** from an isolated shed is dropped, except replies on
+  connections the host opened and the shed's own ports on the gateway: its
+  egress-proxy port when it has an [egress profile](egress.md) and its own 9P
+  ports when it has server mounts.
+- **Forwarded traffic** from an isolated shed is dropped back onto the bridge
+  and to the blocked ranges, minus `network.allow_cidrs`. New inbound
+  connections routed to it are dropped.
+
+The tables exist only while something needs them: an isolated shed exists or is
+being created, or the default profile is `isolated`. An open-only server
+installs nothing and does not need `nft`.
+
+### Guarantees and limits
+
+- **Fails closed at create and start.** An isolated shed's entry is installed
+  before its VM exists or starts; if that fails, the create or start is refused
+  with `503 NETWORK_ENFORCEMENT_UNAVAILABLE`. An isolated shed never runs
+  unguarded because the rules could not be installed.
+- **Rebuilt at `serve` start**, from shed metadata (stopped isolated sheds
+  included), before the API listens and before running sheds are resumed. If
+  that fails, every isolated shed's TAP is set down (no network) until it
+  succeeds.
+- **Checked every 30 s.** A missing table is put back and logged loudly. If the
+  reapply fails, the isolated sheds' TAPs go down until it succeeds, then come
+  back up. So **if something else flushes the ruleset** (`nft flush ruleset`, a
+  firewall reload), isolated sheds can be open **for up to 30 s** before the
+  check restores the tables.
+- **`allow_cidrs` is forward-only.** It opens routed destinations (a LAN
+  registry); it never opens the host's own addresses or other sheds.
+- **While `serve` is stopped** the tables stay in the kernel; `shed-server
+  network teardown` removes them, and isolated sheds are then open until
+  `serve` starts again.
+- **Not in this release:** a proxy-only or no-network profile, and MSS
+  clamping.
 
 ## Deferred
 

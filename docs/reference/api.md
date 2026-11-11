@@ -21,7 +21,16 @@ The `shed-server` exposes a REST API for managing sheds.
     certificate is ever issued over plain HTTP —
     both are minted/issued over the SSH `_bootstrap` channel (see
     [Authentication](#authentication)). See [Security](security.md) for the full
-    model and pinned TLS.
+    model and pinned TLS. In mtls mode a server may also accept **service
+    clients** (orchestrators with a certificate from `shed-server client
+    issue`), which reach a fixed subset of the API for their own sheds only;
+    see [Service clients](#service-clients).
+
+Errors share one JSON shape, whatever the endpoint:
+
+```json
+{"error": {"code": "SHED_NOT_FOUND", "message": "shed not found: codelens"}}
+```
 
 ## Authentication
 
@@ -104,6 +113,7 @@ limitations.
 | POST | `/api/sheds/{name}/start` | Start a shed |
 | POST | `/api/sheds/{name}/stop` | Stop a shed |
 | POST | `/api/sheds/{name}/reset` | Wipe and recreate the shed's writable upper layer |
+| POST | `/api/sheds/{name}/exec` | Run one command in a running shed, streamed as NDJSON |
 | GET | `/api/sheds/{name}/sessions` | List tmux sessions in shed |
 | DELETE | `/api/sheds/{name}/sessions/{session}` | Kill a tmux session |
 | GET | `/api/sessions` | List all sessions across sheds |
@@ -140,7 +150,8 @@ Returns server metadata and capabilities.
   "ssh_port": 2222,
   "http_port": 8080,
   "backend": "vz",
-  "auth_mode": "token"
+  "auth_mode": "token",
+  "features": ["overview", "http_exec", "mount_selection"]
 }
 ```
 
@@ -155,9 +166,26 @@ valid certificate, since the listener runs `RequireAndVerifyClientCert`:**
   "backend": "vz",
   "auth_mode": "mtls",
   "ca_fingerprint": "sha256:…",
-  "ca_not_after": "2036-06-15T00:00:00Z"
+  "ca_not_after": "2036-06-15T00:00:00Z",
+  "features": ["overview", "http_exec", "mount_selection", "service_clients", "network_profiles"]
 }
 ```
+
+`features` lists what this server supports beyond the base API, so a client can
+refuse to send a field an older server would silently ignore. Tokens are added,
+never renamed; treat an unknown token as absent.
+
+| Token | Advertised | Meaning |
+|-------|------------|---------|
+| `overview` | always | `GET /api/overview`, the single-call host snapshot |
+| `http_exec` | always | [`POST /api/sheds/{name}/exec`](#post-apishedsnameexec) |
+| `mount_selection` | always | The create request's `mounts` field |
+| `service_clients` | mtls mode with `auth.clients` configured | This server accepts [service clients](#service-clients) |
+| `network_profiles` | Firecracker backend | The create request's `network` field (`open` or `isolated`) |
+
+The `shed` CLI refuses `--mounts none|<names>` against a server without
+`mount_selection`, and `--network isolated` against one without
+`network_profiles`, before it sends anything.
 
 The `backend` field reflects the resolved backend for this server (`vz` or `firecracker`). When the server is configured with `default_backend: detect`, this field shows the auto-detected value.
 
@@ -220,13 +248,23 @@ Lists all sheds on this server.
       "backend": "vz",
       "ip_address": "192.168.64.2",
       "cpus": 2,
-      "memory_mb": 4096
+      "memory_mb": 4096,
+      "mounts": {"mode": "all"},
+      "network_profile": "open"
     }
   ]
 }
 ```
 
-Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mounts`, and `landing_dir` are omitted when empty or zero.
+Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mounts`, `landing_dir` and `owner` are omitted when empty or zero.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `owner` | string | The [service client](#service-clients) that created the shed. Omitted for a shed an admin created, which includes every shed created before service clients existed. |
+| `mounts` | object | The server mounts (top-level `mounts:` in the server config) the shed gets on every start: `{"mode": "all"}` (every server mount, the default) or `{"mode": "selected", "names": [...]}` (only those; no `names` means none). A shed created before mount selection existed reports `{"mode": "all"}`. |
+| `network_profile` | string | `open` or `isolated`, fixed at create. A shed created before network profiles existed reports `open`. See [Security › Network profiles](security.md#network-profiles). |
+
+A service client's list holds only the sheds it owns.
 
 **Status values:** `running`, `stopped`, `starting`, `error`
 
@@ -257,6 +295,12 @@ Creates a new shed.
 | `from_snapshot` | No | null | Snapshot name to spawn from (mutually exclusive with `image` and `repo`). Provisioning is skipped because the snapshot is already provisioned. |
 | `upper_size_bytes` | No | Server default | Per-shed overlay upper size in bytes. Range-validated 1 GiB – 100 GiB. When omitted, the per-backend `upper_size_default` config value applies. |
 | `no_provision` | No | `false` | Skip provisioning hooks (repo clone, install hook, first-time auto-sync). |
+| `mounts` | No | every server mount | Which server mounts (top-level `mounts:`) the shed gets. Omitted: every one, as before. `[]`: none. `["claude", "gh"]`: exactly those; each must be a configured mount name (else `400 INVALID_REQUEST`). Stored with the shed and honoured on every later start, including an SSH auto-start. Needs the `mount_selection` feature. |
+| `network` | No | `network.default_profile` (`open`) | Network profile: `open` (today's network) or `isolated` (the internet only; Firecracker). Fixed for the shed's life. Needs the `network_profiles` feature. See [Security › Network profiles](security.md#network-profiles). |
+
+A [service client](#service-clients)'s create is checked against its policy
+first: `mounts` defaults to its `server_mounts`, `network` to its pinned
+profile, and the shed is recorded with the client as its `owner`.
 
 **Response (201 Created):**
 
@@ -309,9 +353,17 @@ Without the `Accept: text/event-stream` header, the endpoint behaves synchronous
 | 400 | `INVALID_SHED_NAME` | Invalid name format |
 | 400 | `INVALID_REPO_URL` | Invalid repository URL |
 | 400 | `INVALID_LOCAL_DIR` | Invalid local directory path |
-| 400 | `INVALID_REQUEST` | No `image` specified and `default_image` is not configured on the chosen backend, or `upper_size_bytes` is outside the 1–100 GiB range, or `from_snapshot` was passed together with `image`/`repo`. |
+| 400 | `INVALID_REQUEST` | No `image` specified and `default_image` is not configured on the chosen backend, or `upper_size_bytes` is outside the 1–100 GiB range, or `from_snapshot` was passed together with `image`/`repo`, or `mounts` names a mount the server does not have. |
+| 400 | `INVALID_NETWORK_PROFILE` | `network` is not `open` or `isolated` |
+| 403 | `POLICY_VIOLATION` | Service clients only: the request breaks the client's policy; the message names the client and the rule |
 | 409 | `SHED_ALREADY_EXISTS` | Shed already exists |
+| 422 | `NETWORK_PROFILE_UNSUPPORTED` | A non-`open` profile on a backend that cannot enforce it (VZ) |
 | 500 | `CLONE_FAILED` / `BACKEND_ERROR` | Backend or clone failure |
+| 503 | `NETWORK_ENFORCEMENT_UNAVAILABLE` | The server could not install the firewall rules an `isolated` shed needs, so it refused to create it |
+
+With SSE streaming, a refusal that happens before streaming starts
+(validation, policy, network profile) is the ordinary JSON error above; a
+failure after that arrives as an `error` event with the same `code`.
 
 ### GET /api/sheds/{name}
 
@@ -380,6 +432,7 @@ Starts a stopped shed.
 |------|-------------|
 | 404 | Shed not found |
 | 409 | Shed already running |
+| 503 | `NETWORK_ENFORCEMENT_UNAVAILABLE`: an `isolated` shed cannot start while its firewall rules cannot be installed |
 
 ### POST /api/sheds/{name}/stop
 
@@ -418,6 +471,132 @@ image is untouched, and host-mounted `local_dir`/`add_dirs` directories
 |------|-------|-------------|
 | 404 | `SHED_NOT_FOUND` | Shed does not exist |
 | 409 | `SHED_NOT_STOPPED` | Shed must be stopped before reset |
+
+### POST /api/sheds/{name}/exec
+
+Runs one command in a running shed and streams its output, with no SSH client.
+Available to admins (the `control` scope in token and mtls mode) and to a
+[service client](#service-clients) on a shed it owns. Advertised by the
+`http_exec` feature.
+
+**Request:**
+
+```json
+{
+  "argv": ["bash", "-lc", "craze --version"],
+  "cwd": "/home/shed/project",
+  "env": {"CI": "1"},
+  "stdin": "aGVsbG8K",
+  "timeout_seconds": 60,
+  "max_output_bytes": 4194304
+}
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `argv` | Yes | - | The command, run exactly as given with no shell wrap, as the `shed` user. 1 to 1024 elements, no NUL bytes. A caller who wants a login shell (and its `PATH`) passes `["bash", "-lc", "..."]`; root is `sudo`. |
+| `cwd` | No | the shed's landing dir | Working directory; an absolute path. |
+| `env` | No | `{}` | Extra environment. At most 256 keys matching `^[A-Za-z_][A-Za-z0-9_]*$`, no NUL in values. `argv` and `env` together are at most 1 MiB. |
+| `stdin` | No | none (EOF at once) | Standard base64. At most `exec.max_stdin_bytes` once decoded (default 1 MiB). |
+| `timeout_seconds` | No | 60 (or `exec.max_timeout` if lower) | At most `exec.max_timeout` (default 1h). A larger or negative value is refused, never clamped. |
+| `max_output_bytes` | No | 4194304 (4 MiB) | Output budget for stdout and stderr together, at most 268435456 (256 MiB). |
+
+Unknown fields and trailing data after the JSON object are refused (`400`).
+
+**Response (200 OK, `Content-Type: application/x-ndjson`):** one JSON object
+per line, flushed as output arrives:
+
+```text
+{"t":"stdout","d":"Y3JhemUgMC4yLjAK"}
+{"t":"stderr","d":"d2FybmluZzogLi4uCg=="}
+{"t":"exit","code":0,"timed_out":false,"truncated":false,"duration_ms":412}
+```
+
+| Frame | Fields | Meaning |
+|-------|--------|---------|
+| `stdout`, `stderr` | `d` | One chunk of output, standard base64 |
+| `exit` | `code`, `timed_out`, `truncated`, `duration_ms` | Always the last line when the result is known. `duration_ms` is measured from the request's arrival. |
+
+How a stream ends:
+
+- **The command exits:** an `exit` frame with its exit code.
+- **Output past `max_output_bytes`:** the part that fits is sent, the rest is
+  discarded while the command keeps running, and the `exit` frame carries the
+  real exit code with `"truncated": true`.
+- **Timeout:** the server cancels the command and sends
+  `{"t":"exit","code":124,"timed_out":true,...}`.
+- **Client disconnect:** the command is cancelled; nothing more is written.
+- **No `exit` frame:** the result was lost (for example, the guest agent
+  connection failed after the command started). The command may or may not
+  have finished; do not read this as success or failure.
+
+Cancellation (timeout or disconnect) closes the agent connection, and the guest
+agent then sends `SIGHUP` to the command's process group. A process that
+ignores `SIGHUP` survives. The 200 is sent only once the command has started,
+so every refusal before that is an ordinary JSON error:
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_REQUEST` | Validation failed (empty `argv`, a NUL byte, a bad `env` key, a relative `cwd`, invalid base64, an unknown field, `timeout_seconds` over `exec.max_timeout`, `max_output_bytes` over 256 MiB) |
+| 404 | `SHED_NOT_FOUND` | No such shed (or, for a service client, one it does not own) |
+| 409 | `SHED_NOT_RUNNING` | The shed is not running. Exec never starts a shed; start it first. |
+| 413 | `REQUEST_TOO_LARGE` | The body, or its decoded `stdin`, is over the limit |
+| 429 | `EXEC_LIMIT` | The shed already runs `exec.max_concurrent_per_shed` HTTPS execs (default 8) |
+| 504 | `BACKEND_ERROR` | The timeout expired before the command started |
+
+!!! note "Read only `SHED_NOT_FOUND` as \"shed gone\""
+    A 404 means the shed is missing only when its code is `SHED_NOT_FOUND`.
+    A proxy or an unknown route can also answer 404; check the code, not the
+    status.
+
+The `shed exec` CLI command is unchanged: it still runs over SSH (see
+[CLI › shed exec](cli.md#shed-exec)), where the server wraps the command in
+`bash -lc`. The HTTPS endpoint does not.
+
+## Service clients
+
+A **service client** is an orchestrator (a CI system, an agent runner) that
+drives sheds on a server it does not administer. Clients exist only in
+`auth.mode: mtls`, are declared under [`auth.clients`](configuration.md#service-clients),
+and authenticate with a certificate signed by `shed-server client issue` (see
+the [Orchestrated sheds guide](../guides/orchestrated-sheds.md)). A request
+whose certificate is a service certificate is a *client request*; every other
+request is an *admin request* and behaves exactly as before.
+
+Client requests are deny by default. The whole surface a client can reach:
+
+| Method | Endpoint | Rule |
+|--------|----------|------|
+| GET | `/api/info` | |
+| GET | `/api/images` | |
+| GET | `/api/sheds` | Only the sheds it owns |
+| POST | `/api/sheds` | Checked against its policy; the shed's `owner` is the client |
+| GET | `/api/sheds/{name}` | Owned sheds only |
+| DELETE | `/api/sheds/{name}` | Owned sheds only |
+| POST | `/api/sheds/{name}/start` | Owned sheds only |
+| POST | `/api/sheds/{name}/stop` | Owned sheds only |
+| POST | `/api/sheds/{name}/exec` | Owned sheds only |
+
+| Status | Code | When |
+|--------|------|------|
+| 401 | `UNAUTHORIZED` | The certificate is service-shaped but malformed, names a client that is not configured, or is expired. The connection is closed. (An unknown client is normally refused at the TLS handshake already.) |
+| 403 | `FORBIDDEN` | Any route not in the table above, including every unknown path and wrong method |
+| 403 | `POLICY_VIOLATION` | A create that breaks the client's policy (the message is `client <name>: <rule>`) |
+| 404 | `SHED_NOT_FOUND` | A shed it does not own, an admin's shed, or one that does not exist: the same body in every case, so a client cannot learn which sheds exist |
+
+The create policy refuses `local_dir`, `add_dirs`, `from_snapshot`, an `image`
+outside the policy's `images` (empty: only the server default), a name without
+the policy's `name_prefix`, CPUs or memory over the policy's `caps` (compared
+after defaults), a create that would take the client past `max_sheds` (owned
+sheds plus creates in flight), a `network` other than the pinned profile, and a
+`mounts` entry outside `server_mounts`. It runs before any other validation
+touches the host, so a refused client learns nothing about the server's
+filesystem. `repo`, `egress`, `no_provision`, `cpus`, `memory_mb` and
+`upper_size_bytes` are allowed within those limits.
+
+Admins see and control every shed, owned or not, through the full API.
 
 ## Snapshots
 

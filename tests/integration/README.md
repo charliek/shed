@@ -31,7 +31,9 @@ That target:
 1. Verifies `uv` is installed (install via `brew install uv` or
    https://docs.astral.sh/uv/getting-started/installation/).
 2. `uv sync` the Python deps into `tests/integration/.venv` (gitignored).
-3. `uv run pytest -v` the suite.
+3. `uv run pytest -v` the suite, plus whatever `PYTEST_ARGS` holds (every
+   `test-integration*` target passes it on), for example
+   `PYTEST_ARGS="test_smoke.py -k 'not vz'"`.
 
 Each test is parameterized over `["vz", "fc"]` and skips cleanly when its
 target backend isn't reachable from this host. The session-scoped server
@@ -122,6 +124,10 @@ tests/integration/
   README.md               # this file
   conftest.py             # vz_server, fc_server, shed_server, test_shed_name
   test_smoke.py           # the MVP smoke tests
+  test_http_exec.py       # HTTPS exec (FC dev server, mtls)
+  test_service_client.py  # service clients end to end (FC dev server, mtls)
+  test_create_mounts.py   # shed create --mounts (FC dev server)
+  test_network_profiles.py # the isolated network profile (FC dev server, mtls)
   fixtures/
     __init__.py
     server.py             # LocalServer + RemoteServer + ShedHandle
@@ -326,6 +332,15 @@ The FC dev server:
 **FC-specific isolation:**
 
 - **Different ports** (18080/12222 vs deb's 8080/2222).
+- **Its own identity directory**: `state_dir: /var/lib/shed-dev/state` holds
+  the dev server's SSH host key, TLS cert, mtls client CA and GitHub key cache,
+  so the root dev server never writes to production's `/etc/shed`. The first
+  `dev-server-up-fc` with this setting generates a new host key and TLS pin:
+  remove only the stale `mini3-dev` entry and re-add it.
+- **Its own nftables tables** (`shed_mini3_dev`, from the config's `name:`),
+  installed only while an isolated shed exists. `make dev-server-down-fc`
+  removes them with `shed-server network teardown` after stopping the server;
+  the shared bridge and NAT rules are never touched.
 - **Offset `vsock_base_cid: 600`** (deb default is 100). vsock
   allocation is in-memory per-server with no kernel check; two
   servers with the same base would collide on the first VM.
@@ -477,6 +492,44 @@ FC-config-mutation-is-out-of-scope stance, VZ-only:
 SHED_MTLS_FLIP_TEST=1 SHED_DEV_AUTH_MODE=mtls \
   make test-integration-dev   # runs test_mode_flip_migrates_live too
 ```
+
+## Orchestrated sheds: exec, service clients, mounts, network profiles
+
+Four modules cover HTTPS exec, service clients, `--mounts` and the network
+profiles. They are Firecracker-only and use the `fc_server_dev` fixture, so they
+can only ever reach the dev entry (`$SHED_FC_DEV_SERVER`), never a production
+server:
+
+| Module | Covers | Skips unless |
+|--------|--------|--------------|
+| `test_http_exec.py` | `POST /api/sheds/{name}/exec` on the wire: frames, exit codes, stdin, the 124 timeout and a client disconnect (the guest process is gone afterwards), 8 MiB intact, truncation, a 70 s quiet stream, 404 and 409, validation | `SHED_DEV_AUTH_MODE=mtls` |
+| `test_service_client.py` | A service client issued with `client issue itest` over SSH: owned sheds with no 9P mounts across stop/start, 403 and 404 refusals, admin visibility, the dev audit log's `api` and `exec.end` lines | `SHED_DEV_AUTH_MODE=mtls` |
+| `test_create_mounts.py` | `shed create --mounts none`, the `list -v`/`-vv`/`--json` columns, an unknown mount refused | (mode-independent) |
+| `test_network_profiles.py` | `--network isolated` probed from inside guests, the client's shed isolated by default, the dev server's nftables tables (rebuild on restart, reapply after a manual delete, `dev-server-down-fc` removing only its two tables) | `SHED_DEV_AUTH_MODE=mtls` |
+
+They talk HTTPS themselves (stdlib `http.client`): the admin side with the CLI's
+mtls credential for the dev entry (`~/.shed/creds/<entry>/client.pem` and
+`client.key`), pinned by the entry's `tls_cert_fingerprint`; the client side
+with the bundle from `client issue`, pinned by its `tls_cert_fingerprint`.
+`scripts/render-dev-config.sh --mtls` gives the FC dev config the `itest` client
+(prefix `itest-svc-`, `max_sheds: 3`, `max_age: 2h`, images `[itest]`).
+
+**The `itest` image alias.** Their sheds use the FC dev config's `itest` alias,
+`ghcr.io/charliek/shed-fc-base:v0.9.0`, not the dev config's default v0.5.9
+images: the exec semantics need a guest agent from about v0.7.10 on (it SIGHUPs
+the command's process group when the host goes away, and sends stderr as its
+own stream). The guest agent notices a lost host at its 15 s keepalive, so the
+cleanup probes wait up to 45 s.
+
+```sh
+make build && make dev-server-restart-fc SHED_DEV_AUTH_MODE=mtls
+make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls \
+  PYTEST_ARGS="test_http_exec.py test_service_client.py test_create_mounts.py test_network_profiles.py"
+```
+
+The rule set behind `test_network_profiles.py` is proven first, as root in
+network namespaces, by `make test-netns-remote` (see
+`docs/development/testing.md`).
 
 ## Known-skipped tests
 

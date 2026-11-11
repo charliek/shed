@@ -329,6 +329,29 @@ Making egress a real boundary (forcing all traffic through the proxy via
 netns/pf or a userspace netstack) is tracked as future work
 ([#203](https://github.com/charliek/shed/issues/203)).
 
+## With the `isolated` network profile
+
+On Firecracker, a shed created with `--network isolated` (see [Security ›
+Network
+profiles](security.md#network-profiles)) is fenced by shed-server's own
+nftables rules, which are enforced in the kernel and do not depend on the guest
+cooperating. They close several of the bypasses above for that shed: a raw
+`connect()` can no longer reach IMDS, private ranges, the host or other sheds,
+and VM-to-VM traffic on the bridge is dropped. The internet stays reachable, so
+egress profiles remain the way to filter *which* internet hosts a cooperating
+client may use. The two compose:
+
+- An isolated guest may reach **only its own egress-proxy port on the
+  gateway** (plus its own 9P ports when it has server mounts). Every other port
+  on the host, other sheds' proxy ports included, is dropped. shed-server keeps
+  this allowance in step with the listener: it is added when the shed's egress
+  listener opens, moved by `shed egress set`, and removed by `shed egress off`.
+- The proxy itself runs on the host, so its upstream connections are not
+  subject to the isolated rules; its own deny-CIDR guards still apply to them.
+- A process that ignores the proxy environment still reaches the internet
+  directly (isolation does not force traffic through the proxy), but nothing
+  else.
+
 ## Other caveats
 
 - **Live policy tightening** does not interrupt connections already in flight —
