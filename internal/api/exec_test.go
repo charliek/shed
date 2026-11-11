@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -658,5 +660,86 @@ func TestServerFeaturesAdvertiseHTTPExec(t *testing.T) {
 	s := newExecTestServer(&execFakeBackend{}, nil)
 	if f := s.serverFeatures(); !sliceHas(f, FeatureHTTPExec) || !sliceHas(f, FeatureOverview) {
 		t.Errorf("features %v", f)
+	}
+}
+
+// TestExecStalledClientReleasesSlot: a client that keeps its connection open
+// but stops reading must not hold the handler, or its exec slot, past the
+// command's timeout plus execFinishWriteGrace. The output path is blocked in a
+// write while holding the stream when the timeout fires.
+func TestExecStalledClientReleasesSlot(t *testing.T) {
+	old := execFinishWriteGrace
+	execFinishWriteGrace = 200 * time.Millisecond
+	defer func() { execFinishWriteGrace = old }()
+
+	chunk := bytes.Repeat([]byte("y"), 64<<10)
+	writerDone := make(chan struct{})
+	b := &execFakeBackend{shed: runningShed(), exec: func(ctx context.Context, _ string, opts backend.ExecOptions) error {
+		opts.OnStarted()
+		// The agent's reader: deliver output until the client's socket is
+		// full, then block in the write, as a real command's output would.
+		go func() {
+			defer close(writerDone)
+			for ctx.Err() == nil {
+				if _, err := opts.Stdout.Write(chunk); err != nil {
+					return
+				}
+			}
+		}()
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	s := newExecTestServer(b, &config.ExecConfig{MaxConcurrentPerShed: 1})
+	router := s.Router()
+	handlerDone := make(chan struct{}, 2)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { handlerDone <- struct{}{} }()
+		router.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	// A raw connection that sends the request and never reads the response.
+	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	body, _ := json.Marshal(config.ExecRequest{
+		Argv: []string{"yes"}, TimeoutSeconds: 1, MaxOutputBytes: 256 << 20,
+	})
+	fmt.Fprintf(conn, "POST /api/sheds/box/exec HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+
+	select {
+	case <-handlerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler is still blocked on a client that stopped reading")
+	}
+	select {
+	case <-writerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blocked output write was never released")
+	}
+	s.execMu.Lock()
+	left := len(s.execInFlight)
+	s.execMu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d sheds still hold exec slots", left)
+	}
+
+	// The slot is free for the next exec while the stalled connection is
+	// still open.
+	b.exec = func(_ context.Context, _ string, opts backend.ExecOptions) error {
+		opts.OnStarted()
+		return nil
+	}
+	resp, err := http.Post(ts.URL+"/api/sheds/box/exec", "application/json",
+		bytes.NewReader([]byte(`{"argv":["true"]}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("exec after the stalled one: status %d, want 200", resp.StatusCode)
 	}
 }

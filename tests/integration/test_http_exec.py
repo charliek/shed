@@ -102,22 +102,27 @@ class HTTPSExec:
                 payload = json.loads(resp.read() or b"{}")
                 return ExecResult(resp.status, (payload.get("error") or {}).get("code"))
             assert resp.getheader("Content-Type") == "application/x-ndjson"
-            res = ExecResult(200)
-            for line in resp:
-                frame = json.loads(line)
-                res.frames.append(frame)
-                if frame["t"] == "exit":
-                    assert res.exit is None, "two exit frames"
-                    res.exit = frame
-                else:
-                    data = base64.b64decode(frame["d"])
-                    if frame["t"] == "stdout":
-                        res.stdout += data
-                    else:
-                        res.stderr += data
-            return res
+            return read_frames(resp)
         finally:
             conn.close()
+
+
+def read_frames(resp) -> ExecResult:
+    """Read an exec stream's (remaining) NDJSON frames to its end."""
+    res = ExecResult(200)
+    for line in resp:
+        frame = json.loads(line)
+        res.frames.append(frame)
+        if frame["t"] == "exit":
+            assert res.exit is None, "two exit frames"
+            res.exit = frame
+        else:
+            data = base64.b64decode(frame["d"])
+            if frame["t"] == "stdout":
+                res.stdout += data
+            else:
+                res.stderr += data
+    return res
 
 
 def _load_entry(name: str) -> dict:
@@ -143,21 +148,53 @@ def shed(fc_server_dev, client):
     fc_server_dev.delete(name, ignore_missing=True)
 
 
-def _marker_count(client: HTTPSExec, shed: str, marker: str) -> int:
-    # The bracket keeps grep from matching its own command line.
-    pattern = f"[{marker[0]}]{marker[1:]}"
+def _grep_count(client: HTTPSExec, shed: str, pattern: str) -> int:
+    """How many guest processes' command lines match a grep regex. The
+    pattern must bracket a character so grep never matches its own line."""
     r = client.exec(shed, {"argv": ["bash", "-c", f"ps -eo args | grep -c '{pattern}' || true"]})
     assert r.exit and r.exit["code"] == 0, r
     return int(r.stdout.strip() or b"0")
 
 
-def _wait_marker_gone(client: HTTPSExec, shed: str, marker: str) -> bool:
-    deadline = time.time() + CLEANUP_WAIT_S
-    while time.time() < deadline:
-        if _marker_count(client, shed, marker) == 0:
-            return True
-        time.sleep(1)
-    return False
+@dataclass
+class Probe:
+    """A command whose shell and whose child each carry their own marker.
+
+    The command is `bash -lc "<prefix>sleep <secs>; : <marker>"`. The trailing
+    no-op keeps bash from exec'ing sleep, so the shell stays the parent and
+    only its command line carries the marker. The child's own argv is
+    `sleep <secs>`, with a fractional length unique to this probe, so a
+    cleanup that kills the shell but not its process group is caught.
+    """
+
+    marker: str
+    secs: str
+
+    @classmethod
+    def new(cls, base_secs: int) -> "Probe":
+        return cls(f"marker-{uuid.uuid4().hex}", f"{base_secs}.{uuid.uuid4().int % 10**9:09d}")
+
+    def argv(self, prefix: str = "") -> list:
+        return ["bash", "-lc", f"{prefix}sleep {self.secs}; : {self.marker}"]
+
+    def counts(self, client: HTTPSExec, shed: str) -> tuple:
+        shell = _grep_count(client, shed, f"[{self.marker[0]}]{self.marker[1:]}")
+        child = _grep_count(client, shed, "^ *[s]leep " + self.secs.replace(".", "\\."))
+        return shell, child
+
+    def assert_running(self, client: HTTPSExec, shed: str) -> None:
+        shell, child = self.counts(client, shed)
+        assert shell >= 1, "the command's shell is not running"
+        assert child >= 1, "the command's child (sleep) is not running"
+
+    def wait_gone(self, client: HTTPSExec, shed: str) -> tuple:
+        """Wait for the shell and its child to exit; returns the last counts."""
+        deadline = time.time() + CLEANUP_WAIT_S
+        while True:
+            counts = self.counts(client, shed)
+            if counts == (0, 0) or time.time() >= deadline:
+                return counts
+            time.sleep(1)
 
 
 def test_info_advertises_http_exec(client):
@@ -191,30 +228,41 @@ def test_stdin_round_trip(client, shed):
 
 
 def test_timeout_gives_124_and_kills_the_command(client, shed):
-    marker = f"marker-{uuid.uuid4().hex}"
+    probe = Probe.new(300)
     start = time.time()
-    r = client.exec(shed, {"argv": ["bash", "-lc", f"sleep 300; : {marker}"], "timeout_seconds": 2})
-    assert r.status == 200
-    assert r.exit["code"] == 124 and r.exit["timed_out"] is True, r.exit
-    assert time.time() - start < 15
-    assert _wait_marker_gone(client, shed, marker), "the timed-out command is still running in the guest"
-
-
-def test_disconnect_kills_the_command(client, shed):
-    marker = f"marker-{uuid.uuid4().hex}"
     conn, resp = client.open(
         "POST",
         f"/api/sheds/{shed}/exec",
-        {"argv": ["bash", "-lc", f"echo started; sleep 600; : {marker}"], "timeout_seconds": 900},
+        {"argv": probe.argv("echo started; "), "timeout_seconds": 8},
     )
     try:
         assert resp.status == 200
         first = json.loads(resp.readline())
         assert first["t"] == "stdout" and base64.b64decode(first["d"]) == b"started\n"
-        assert _marker_count(client, shed, marker) >= 1, "the command is not running"
+        probe.assert_running(client, shed)
+        r = read_frames(resp)
     finally:
         conn.close()
-    assert _wait_marker_gone(client, shed, marker), "the command survived the client's disconnect"
+    assert r.exit and r.exit["code"] == 124 and r.exit["timed_out"] is True, r.exit
+    assert time.time() - start < 25
+    assert probe.wait_gone(client, shed) == (0, 0), "the timed-out command (shell, child) is still running"
+
+
+def test_disconnect_kills_the_command(client, shed):
+    probe = Probe.new(600)
+    conn, resp = client.open(
+        "POST",
+        f"/api/sheds/{shed}/exec",
+        {"argv": probe.argv("echo started; "), "timeout_seconds": 900},
+    )
+    try:
+        assert resp.status == 200
+        first = json.loads(resp.readline())
+        assert first["t"] == "stdout" and base64.b64decode(first["d"]) == b"started\n"
+        probe.assert_running(client, shed)
+    finally:
+        conn.close()
+    assert probe.wait_gone(client, shed) == (0, 0), "the command (shell, child) survived the client's disconnect"
 
 
 def test_large_output_arrives_intact(client, shed):

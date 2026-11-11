@@ -40,6 +40,15 @@ const (
 	execTimeoutExitCode = 124
 )
 
+// execFinishWriteGrace bounds every write to the client once the command is
+// over (finished, timed out or cancelled): the exit frame, a JSON refusal, and
+// any output still in flight. A client that stopped reading would otherwise
+// hold the handler, and its exec slot, for as long as it kept the connection
+// open. While the command runs, writes have no deadline, so a long quiet
+// command is never cut; a stalled client only stalls the command's output
+// until its timeout. A variable so tests can shorten it.
+var execFinishWriteGrace = 10 * time.Second
+
 var execEnvKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // execRequestError is a refusal before anything ran: the status, the API code
@@ -135,6 +144,9 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = s.backend.Exec(ctx, name, opts)
+	// From here every write is bounded. This takes no lock, so it also cuts
+	// short a write the output path is blocked in while holding the stream.
+	stream.boundWrites(time.Now().Add(execFinishWriteGrace))
 
 	exit := config.ExecExitFrame{T: config.ExecFrameExit}
 	var exitErr *vmutil.ExitError
@@ -422,6 +434,13 @@ func (s *execStream) finish(exit config.ExecExitFrame) {
 	exit.Truncated = s.truncated
 	_ = s.writeFrameLocked(exit)
 	s.closed = true
+}
+
+// boundWrites sets a write deadline on the response. It deliberately takes no
+// lock: it must reach a write that is blocked (on a client that stopped
+// reading) while holding s.mu. A deadline applies to pending writes too.
+func (s *execStream) boundWrites(deadline time.Time) {
+	_ = s.rc.SetWriteDeadline(deadline)
 }
 
 // abandon closes the stream with no exit frame.

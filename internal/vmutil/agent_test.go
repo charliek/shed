@@ -754,3 +754,76 @@ func TestExecOnStartedNotCalledWhenRequestFails(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// stalledGuestDialer is a guest that accepts the connection and never reads,
+// so the host's first write blocks (net.Pipe has no buffer). closed is closed
+// when the host side of the connection is closed.
+type stalledGuestDialer struct {
+	closed chan struct{}
+}
+
+func (d *stalledGuestDialer) Dial(context.Context, uint32) (net.Conn, error) {
+	client, server := net.Pipe()
+	go func() {
+		// Never read. A write on a pipe blocks until the peer reads (it
+		// never will) or the peer closes, which makes it fail.
+		_, _ = server.Write([]byte{0})
+		close(d.closed)
+	}()
+	return client, nil
+}
+
+// TestExecBoundedWhenGuestStopsReading: a guest that never reads the request
+// (or the stdin EOF) must not hold Exec past its context, whether the
+// context's deadline passes or it is cancelled, and the connection is closed.
+func TestExecBoundedWhenGuestStopsReading(t *testing.T) {
+	big := strings.Repeat("x", 1<<20)
+	cases := []struct {
+		name  string
+		ctx   func() (context.Context, context.CancelFunc)
+		want  error
+		stdin bool
+	}{
+		{"deadline", func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 100*time.Millisecond)
+		}, context.DeadlineExceeded, false},
+		{"cancel", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			time.AfterFunc(100*time.Millisecond, cancel)
+			return ctx, cancel
+		}, context.Canceled, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &stalledGuestDialer{closed: make(chan struct{})}
+			client := NewAgentClient(d, 1024, 1026)
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			opts := backend.ExecOptions{Cmd: []string{"echo", big}, Env: []string{"BIG=" + big}}
+			if tc.stdin {
+				opts.Stdin = io.NopCloser(strings.NewReader("in"))
+			}
+			started := false
+			opts.OnStarted = func() { started = true }
+
+			errc := make(chan error, 1)
+			go func() { errc <- client.Exec(ctx, opts) }()
+			select {
+			case err := <-errc:
+				if !errors.Is(err, tc.want) {
+					t.Errorf("Exec() = %v, want %v", err, tc.want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Exec blocked on a guest that does not read, past its context")
+			}
+			if started {
+				t.Error("OnStarted was called though the request was never written")
+			}
+			select {
+			case <-d.closed:
+			case <-time.After(5 * time.Second):
+				t.Error("the guest connection was not closed")
+			}
+		})
+	}
+}
