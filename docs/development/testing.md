@@ -268,11 +268,14 @@ reaches the FC remote's dev server, arm an automatic rollback that stops the
 dev server (its 30 s presence check would otherwise put the tables back),
 waits for it to exit (up to 35 s, its 30 s graceful shutdown included, then
 SIGKILL), and deletes **only its own tables**, and only once the server is
-gone (if it is somehow still alive, the tables are left alone). It refuses to
+gone (if it is somehow still alive, the tables are left alone). It signals
+the PID only while that process is still a `shed-server` (like
+`make dev-server-down-fc`); a stale PID file is treated as a server already
+gone. It refuses to
 arm while another rollback is armed, so a cancel always reaches the live one:
 
 ```sh
-ssh mini3 "sudo -n sh -c 'if [ -s /tmp/shed-dev-nft-rollback.pid ] && kill -0 -\$(cat /tmp/shed-dev-nft-rollback.pid) 2>/dev/null; then echo \"a rollback is already armed; cancel it first\" >&2; exit 1; fi; setsid nohup sh -c \"sleep 120; P=\\\$(cat /tmp/shed-server-dev.pid); kill -TERM \\\$P; i=0; while kill -0 \\\$P 2>/dev/null && [ \\\$i -lt 35 ]; do sleep 1; i=\\\$((i+1)); done; kill -0 \\\$P 2>/dev/null && kill -KILL \\\$P; sleep 2; if ! kill -0 \\\$P 2>/dev/null; then nft delete table bridge shed_mini3_dev; nft delete table inet shed_mini3_dev; fi\" </dev/null >/dev/null 2>&1 & echo \$! > /tmp/shed-dev-nft-rollback.pid'"
+ssh mini3 "sudo -n sh -c 'if [ -s /tmp/shed-dev-nft-rollback.pid ] && kill -0 -\$(cat /tmp/shed-dev-nft-rollback.pid) 2>/dev/null; then echo \"a rollback is already armed; cancel it first\" >&2; exit 1; fi; setsid nohup sh -c \"sleep 120; P=\\\$(cat /tmp/shed-server-dev.pid); case \\\$(ps -p \\\$P -o comm= 2>/dev/null) in *shed-server*) kill -TERM \\\$P;; *) P=;; esac; i=0; while [ -n \\\"\\\$P\\\" ] && kill -0 \\\$P 2>/dev/null && [ \\\$i -lt 35 ]; do sleep 1; i=\\\$((i+1)); done; [ -n \\\"\\\$P\\\" ] && case \\\$(ps -p \\\$P -o comm= 2>/dev/null) in *shed-server*) kill -KILL \\\$P;; esac; sleep 2; if [ -z \\\"\\\$P\\\" ] || ! kill -0 \\\$P 2>/dev/null; then nft delete table bridge shed_mini3_dev; nft delete table inet shed_mini3_dev; fi\" </dev/null >/dev/null 2>&1 & echo \$! > /tmp/shed-dev-nft-rollback.pid'"
 ```
 
 Then, within the window: create one isolated shed on the dev server
