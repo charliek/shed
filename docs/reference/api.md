@@ -148,20 +148,24 @@ allowlist and scope. Its bundle carries `client` (the client name) in place of
 
 Returns server metadata and capabilities.
 
-**Response (open or token mode; token mode is `"secure"` on the wire, see the
-warning below):**
+**Response (token mode; `"secure"` on the wire, see the warning below):**
 
 ```json
 {
   "name": "mini-desktop",
   "version": "1.0.0",
   "ssh_port": 2222,
-  "http_port": 8080,
   "backend": "vz",
   "auth_mode": "secure",
+  "https_port": 8443,
   "features": ["overview", "http_exec", "mount_selection"]
 }
 ```
+
+An open-mode server reports `"auth_mode": "open"` and `"http_port": 8080` in
+place of `https_port`: an enforced mode serves no plain HTTP, so `http_port` is
+omitted there. A server whose backend has a `default_image` (configured, or set
+by a release build) also reports it as `default_image`.
 
 **Response (mtls mode) — reachable only by a client that already presents a
 valid certificate, since the listener runs `RequireAndVerifyClientCert`:**
@@ -173,6 +177,7 @@ valid certificate, since the listener runs `RequireAndVerifyClientCert`:**
   "ssh_port": 2222,
   "backend": "firecracker",
   "auth_mode": "mtls",
+  "https_port": 8443,
   "ca_fingerprint": "sha256:…",
   "ca_not_after": "2036-06-15T00:00:00Z",
   "features": ["overview", "http_exec", "mount_selection", "service_clients", "network_profiles"]
@@ -545,7 +550,10 @@ How a stream ends:
 
 Cancellation (timeout or disconnect) closes the agent connection, and the guest
 agent then sends `SIGHUP` to the command's process group. A process that
-ignores `SIGHUP` survives. The 200 is sent once the request has been
+ignores `SIGHUP` survives. Both this and the separate `stderr` frames come from
+the guest agent baked into the shed's image: an agent older than v0.7.7 sends
+stderr inside the `stdout` frames, and one older than v0.7.6 does not signal the
+process group, so the command outlives the cancellation. The 200 is sent once the request has been
 dispatched to the guest agent, so every refusal before that is an ordinary JSON
 error. A 200 does not prove the command launched: if the guest cannot start it
 (a missing executable, a bad `cwd`), the stream carries no output and an `exit`

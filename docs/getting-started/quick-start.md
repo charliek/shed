@@ -130,7 +130,7 @@ agent you trust less, give it neither:
 
 ```bash
 # No host directories; on Firecracker, the internet and nothing else
-shed create untrusted --repo someone/tool --mounts none --network isolated
+shed create untrusted --repo https://github.com/someone/tool.git --mounts none --network isolated
 
 # Check: MOUNTS shows none, NETWORK shows isolated
 shed list -v
@@ -140,7 +140,10 @@ shed exec untrusted -- curl -sS -m 5 -o /dev/null -w '%{http_code}\n' https://gi
 shed exec untrusted -- curl -sS -m 5 http://192.168.1.1/    # times out
 ```
 
-`--network isolated` needs a Firecracker server with `nft` (see [Firecracker
+The repository is an `https://` URL because an `owner/repo` shorthand expands
+to an SSH URL (`git@github.com:owner/repo.git`), and the clone then needs an SSH
+key, which `--mounts none` may have just left out. `--network isolated` needs a
+Firecracker server with `nft` (see [Firecracker
 setup](fc-setup.md#prerequisites)); on VZ use `--mounts none` alone. What the
 profile blocks is in [Security › Network
 profiles](../reference/security.md#network-profiles).

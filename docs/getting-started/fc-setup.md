@@ -528,7 +528,7 @@ This rule is typically not needed if the default INPUT policy is ACCEPT, which i
 An ACCEPT rule like this does not reopen an [isolated](../reference/security.md#network-profiles)
 shed: shed-server's own nftables tables drop its traffic independently of
 other tables and chains. An isolated shed can still reach its own 9P ports on
-the bridge, so its server mounts keep working.
+the bridge, so its server mounts and `--local-dir` mounts keep working.
 
 ## Troubleshooting
 

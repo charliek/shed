@@ -4,8 +4,9 @@ An orchestrator, such as a CI system or an agent runner, can drive sheds on a
 shed-server it does not administer. It authenticates as a **service client**: an
 mTLS identity that can create sheds within a policy, run commands in them over
 HTTPS, and delete them, and can see or touch nothing else on the server. Its
-sheds get no server mounts and no credential bus by default, and on Firecracker
-an `isolated` network that reaches the internet and nothing else.
+sheds never get the credential bus, get no server mounts unless its policy
+names some, and by default, on Firecracker, get an `isolated` network that
+reaches the internet and nothing else.
 
 This guide sets one up. The model and its limits are in [Security › Service
 clients](../reference/security.md#service-clients); every key is in
@@ -61,6 +62,13 @@ On the shed host, as the user that runs `serve` and with the same config:
 ```bash
 sudo shed-server client issue nocturn --out nocturn-bundle.json
 ```
+
+`sudo` matches the deb install, whose unit runs `serve` as root with
+`/etc/shed/server.yaml`. A brew install on macOS runs `serve` as your own user
+with `--config "$(brew --prefix)/etc/shed/server.yaml"`, so run the command
+without `sudo` and with that `--config`: as root it would use `/etc/shed` as
+its state directory instead of `~/.shed`, and sign with a different CA than the
+one `serve` trusts.
 
 The file (mode `0600`) holds one JSON object: the client name, `auth_mode`,
 `https_port`, the server's `tls_cert_fingerprint`, the PEM `client_cert` and
@@ -139,7 +147,7 @@ is in [API › POST /api/sheds/{name}/exec](../reference/api.md#post-apishedsnam
 | Read `/api/info` and `/api/images` | Reach any other route (`403 FORBIDDEN`) |
 | List, create, get, start, stop, delete and exec in its own sheds | See or touch an admin's or another client's shed (`404 SHED_NOT_FOUND`, the same as a shed that does not exist) |
 | Create within its policy: prefix, image list, caps, `max_sheds` | Use `local_dir`, `add_dirs`, `from_snapshot`, another network profile, or mounts outside `server_mounts` (`403 POLICY_VIOLATION`) |
-| Run anything as root inside its sheds (`sudo`) | Use the credential bus, SSH, Connect tunnels, snapshots or egress settings |
+| Run anything as root inside its sheds (`sudo`) | Use the credential bus, SSH, Connect tunnels, snapshots, or the egress routes (a create may still name `egress` profiles) |
 
 `GET /api/info` needs no shed, so call it first: its `features` say what the
 server supports (`service_clients`, `http_exec`, `mount_selection`, and
@@ -154,7 +162,9 @@ Admins keep the full API and see every shed, with its `owner`, in
 
 A create's `repo` is cloned inside the shed with only the egress proxy
 settings in its environment, never the server's `env_file` variables, so the
-server's git credentials do not reach an owned shed. Use a public URL, or
+server's git credentials do not reach an owned shed. Use a public `https://`
+URL (an `owner/repo` shorthand expands to an SSH URL,
+`git@github.com:owner/repo.git`, which needs a key the shed does not have), or
 create the shed without `repo` and clone it yourself with a short-lived token
 the orchestrator passes in the exec request's `env`:
 

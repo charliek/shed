@@ -259,7 +259,7 @@ set per shed, in any posture:
 
 ```bash
 # No server mounts, and (Firecracker) the internet and nothing else
-shed create untrusted --repo someone/tool --mounts none --network isolated
+shed create untrusted --repo https://github.com/someone/tool.git --mounts none --network isolated
 shed list -v      # the MOUNTS column shows none, NETWORK shows isolated
 ```
 

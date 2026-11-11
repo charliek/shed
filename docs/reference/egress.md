@@ -365,7 +365,8 @@ egress profiles remain the way to filter *which* internet hosts a cooperating
 client may use. The two compose:
 
 - An isolated guest may reach **only its own egress-proxy port on the
-  gateway** (plus its own 9P ports when it has server mounts). Every other port
+  gateway** (plus its own 9P ports when it has server or `--local-dir`
+  mounts). Every other port
   on the host, other sheds' proxy ports included, is dropped. shed-server keeps
   this allowance in step with the listener: it is added when the shed's egress
   listener opens, moved by `shed egress set`, and removed by `shed egress off`.

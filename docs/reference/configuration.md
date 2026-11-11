@@ -283,7 +283,7 @@ Each line is one JSON object with `ts` first:
 | `event` | Written for | Fields |
 |---------|-------------|--------|
 | `api` | Every service-client request, allowed or refused (401, 403, 404 and policy refusals included). Admin API requests are not logged. | `identity` (`kind: client`, `name`, `serial`), `request_id`, `remote`, `method`, `route` (the matched pattern, `""` when none matched), `path`, `shed`, `status`, `duration_ms` |
-| `exec.end` | Every HTTPS exec that reached the guest, admin or client, however it ended | `identity` (`kind: client` or `kind: admin` with `subject`), `request_id`, `shed`, `argv0` and `argc` (or `argv` with `exec_argv: full`), `exit_code` (`-1` when there is none), `timed_out`, `truncated`, `disconnected`, `duration_ms` |
+| `exec.end` | Every HTTPS exec, admin or client, that passed the request checks and was handed to the backend, however it ended (a timeout before the command started included). An exec refused with `400`, `404`, `409`, `413` or `429` writes none. | `identity` (`kind: client` or `kind: admin` with `subject`), `request_id`, `shed`, `argv0` and `argc` (or `argv` with `exec_argv: full`), `exit_code` (`-1` when there is none), `timed_out`, `truncated`, `disconnected`, `duration_ms` |
 | `reap` | Each shed the `max_age` reaper deleted | `shed`, `owner`, `age_seconds`, `error` (when the delete failed) |
 
 ### Mounts

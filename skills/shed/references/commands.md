@@ -55,7 +55,7 @@ shed create scratch
 shed create codelens --repo charliek/codelens
 shed create myproj --local-dir ~/projects/myproj
 shed create big --repo org/large-repo --timeout 30m
-shed create untrusted --repo someone/tool --mounts none --network isolated   # hardened: no host dirs, internet only
+shed create untrusted --repo https://github.com/someone/tool.git --mounts none --network isolated   # hardened: no host dirs, internet only
 ```
 
 `shed list -v` shows `OWNER` (a service client, or `-`), `MOUNTS` (`all`, `none`

@@ -564,8 +564,9 @@ Each owned shed:
   expected to delete its sheds itself.
 
 Every client request, allowed or refused, writes one `api` line to the [audit
-log](configuration.md#audit-log), and every HTTPS exec writes an `exec.end`
-line (argv[0] and the argument count by default, never the arguments).
+log](configuration.md#audit-log), and every HTTPS exec that passes the request
+checks writes an `exec.end` line (argv[0] and the argument count by default,
+never the arguments).
 
 ### Residual risks
 
@@ -669,7 +670,7 @@ elements (its TAP, MAC and IP):
 - **Host input** from an isolated shed is dropped, except replies on
   connections the host opened and the shed's own ports on the gateway: its
   egress-proxy port when it has an [egress profile](egress.md) and its own 9P
-  ports when it has server mounts.
+  ports when it has server mounts or `--local-dir`/`--add-dir` mounts.
 - **Forwarded traffic** from an isolated shed is dropped back onto the bridge
   and to the blocked ranges, minus `network.allow_cidrs`. New inbound
   connections routed to it are dropped.

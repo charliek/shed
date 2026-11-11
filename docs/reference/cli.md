@@ -180,7 +180,7 @@ shed create myproj --local-dir ~/projects/myproj
 shed create myproj --local-dir ~/projects/myproj --add-dir ~/projects/shared-lib
 
 # A hardened shed: no server mounts, internet only (Firecracker)
-shed create untrusted --repo someone/tool --mounts none --network isolated
+shed create untrusted --repo https://github.com/someone/tool.git --mounts none --network isolated
 
 # Only the Claude Code and GitHub CLI mounts
 shed create agent --mounts claude,gh
