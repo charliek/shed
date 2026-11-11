@@ -12,7 +12,7 @@ require (
 	github.com/gliderlabs/ssh v0.3.8
 	github.com/go-chi/chi/v5 v5.5.0
 	github.com/google/go-containerregistry v0.22.1
-	github.com/hugelgupf/p9 v0.5.1
+	github.com/hugelgupf/p9 v0.3.0
 	github.com/mdlayher/vsock v1.4.0
 	github.com/sirupsen/logrus v1.10.2
 	github.com/spf13/cobra v1.10.2

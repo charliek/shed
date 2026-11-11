@@ -65,7 +65,7 @@ tests they would have run, not the whole session.
 
 | Variable               | Default                                            | Effect |
 |------------------------|----------------------------------------------------|--------|
-| `SHED_VZ_SERVER`       | `my-server`                                        | Entry name in `~/.shed/config.yaml` for the local VZ server. |
+| `SHED_VZ_SERVER`       | `my-server`                                        | Entry name in `~/.shed/config.yaml` for the local VZ server. Empty skips every `[vz]` case (`make test-integration-dev-fc` sets it empty). |
 | `SHED_VZ_LOG_PATH`     | `/opt/homebrew/var/log/shed-server.log`            | Where the VZ shed-server's log file lives. Override for Intel Macs (`/usr/local/...`) or custom installs. |
 | `SHED_FC_HOST`         | `mini3`                                            | SSH hostname for the FC server (used for journald log fetch). |
 | `SHED_FC_SERVER`       | same as host                                       | Entry name for the FC server (when it differs from the SSH host). |

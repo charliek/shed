@@ -112,7 +112,7 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the brew-installed VZ server. The `dev-server-*` and `test-integration-dev` Makefile targets use `SHED_VZ_DEV_SERVER` instead. |
+| `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the brew-installed VZ server. The `dev-server-*` and `test-integration-dev` Makefile targets use `SHED_VZ_DEV_SERVER` instead. Empty skips every `[vz]` case; `test-integration-dev-fc` sets it empty. |
 | `SHED_VZ_LOG_PATH` | `/opt/homebrew/var/log/shed-server.log` | Where the local VZ server writes its log file. Override for Intel-Mac Homebrew (`/usr/local/...`) or custom installs. Set automatically by `make test-integration-dev` to the dev server's log file. |
 | `SHED_VZ_DEV_SERVER` | `my-server-dev` | `~/.shed/config.yaml` entry for the parallel dev VZ server. Honored by the `dev-server-*` Makefile targets. |
 | `SHED_FC_HOST` | `mini3` | SSH hostname for the FC server. Also honored by `make dev-server-up-fc` / `dev-server-status-fc` / `test-integration-dev-fc`. |
@@ -175,6 +175,8 @@ make dev-server-down-fc         # when done
 ```sh
 make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls PYTEST_ARGS="test_smoke.py test_mounts.py test_mtls.py"
 ```
+
+`test-integration-dev-fc` is FC-only: it sets `SHED_VZ_SERVER` and `SHED_VZ_DEV_SERVER` empty, so every `[vz]` case skips. Without that the `[vz]` cases would reach the `my-server` entry, which on a Linux workstation can be a production FC server (mini3's deb server), and create and delete sheds there. An empty `SHED_VZ_SERVER` (or `SHED_FC_SERVER`) always means "no server for that backend", never the client's default server.
 
 The FC dev server runs via `sudo nohup` on the remote (needs root for FC's CAP_NET_ADMIN bridge/TAP operations). No systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server (crashes visible, no survives-reboot). Listens on `mini3:18080/12222` alongside the deb shed-server's `mini3:8080/2222`. Isolated state-dirs under `/var/lib/shed-dev/firecracker/`.
 

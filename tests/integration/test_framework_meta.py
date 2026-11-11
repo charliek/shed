@@ -349,6 +349,10 @@ def test_meta_full_suite_still_passes_against_brew():
     """
     if os.environ.get(_RECURSION_GUARD) == "1":
         pytest.skip("recursion guard")
+    if os.environ.get("SHED_VZ_SERVER", "my-server") == "":
+        # An FC-only run (`make test-integration-dev-fc`): `my-server` may be
+        # a production server there, and this backstop would create on it.
+        pytest.skip("SHED_VZ_SERVER is empty: no VZ server for this run")
 
     # Probe brew reachability before invoking pytest.
     if shutil.which("shed") is None:

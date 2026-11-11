@@ -688,7 +688,14 @@ test-integration-dev-fc:
 	@# exact value the remote dev server was last (re)started with.
 	@# Same PATH reasoning as test-integration-dev: drive the branch's `shed`,
 	@# not the brew-installed release.
+	@# SHED_VZ_SERVER and SHED_VZ_DEV_SERVER are set EMPTY so every [vz] case
+	@# skips (conftest treats an empty name as "no server"): this target is
+	@# FC-only, and the VZ default (`my-server`) can name a production server
+	@# (on a Linux workstation it is often mini3's deb server), which the
+	@# suite would otherwise create and delete sheds on.
 	PATH="$(CURDIR)/bin:$$PATH" \
+	  SHED_VZ_SERVER= \
+	  SHED_VZ_DEV_SERVER= \
 	  SHED_FC_HOST=$(FC_REMOTE_HOST) \
 	  SHED_FC_SERVER=$(SHED_FC_DEV_SERVER) \
 	  SHED_FC_LOG_PATH=$(FC_DEV_LOG_PATH) \

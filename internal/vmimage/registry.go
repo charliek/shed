@@ -182,6 +182,7 @@ func PushFromOCILayout(ctx context.Context, opts PushOptions) error {
 	remoteOpts := []remote.Option{
 		remote.WithAuthFromKeychain(keychain),
 		remote.WithContext(ctx),
+		registryTransport(),
 	}
 
 	// Upload kernel / initrd / rootfs-erofs loose blobs first so
@@ -349,6 +350,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 	remoteOpts := []remote.Option{
 		remote.WithAuthFromKeychain(keychain),
 		remote.WithContext(ctx),
+		registryTransport(),
 	}
 	if opts.Platform != "" {
 		p, err := PlatformOCI(opts.Platform)

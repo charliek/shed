@@ -12,7 +12,8 @@ Conventions:
 
 Two environment overrides for non-default setups:
     - `SHED_VZ_SERVER` — entry name in `~/.shed/config.yaml` for the VZ
-      server (default: `my-server`).
+      server (default: `my-server`). Set empty, the `[vz]` cases skip
+      (`make test-integration-dev-fc` does this).
     - `SHED_FC_HOST`   — SSH host for the FC server (default: `mini3`).
 """
 
@@ -73,6 +74,11 @@ def vz_server() -> LocalServer:
     `SHED_VZ_SERVER`. Skips if the server can't be reached or if the
     `shed` CLI isn't installed.
     """
+    if not VZ_SERVER_NAME:
+        # Set empty on purpose (`make test-integration-dev-fc` does): no VZ
+        # server for this run. Never probe with an empty name, which `shed
+        # -s ""` would resolve to the client's default server.
+        pytest.skip("SHED_VZ_SERVER is empty: no VZ server for this run.")
     log_path = VZ_BREW_LOG if VZ_BREW_LOG.exists() else None
     s = LocalServer(name=VZ_SERVER_NAME, backend="vz", log_path=log_path)
     if not s.available():
@@ -100,6 +106,10 @@ def fc_server() -> RemoteServer:
 
     Skips if SSH to the host fails or `shed -s <name> list` returns nonzero.
     """
+    if not FC_SERVER_NAME:
+        # Same as vz_server: an empty name means no FC server, never the
+        # client's default server.
+        pytest.skip("SHED_FC_SERVER is empty: no FC server for this run.")
     s = RemoteServer(
         ssh_host=FC_SSH_HOST,
         name=FC_SERVER_NAME,
