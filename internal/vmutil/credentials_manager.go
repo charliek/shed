@@ -44,9 +44,12 @@ func NewCredentialManager(serverCfg *config.ServerConfig, bridge *plugin.Bridge,
 
 // SetupCredentials mounts directory credentials via the provided callback
 // and starts the message channel for plugin communication and health tracking.
+// owned is true for a shed a service client owns: its message channel still
+// carries health heartbeats, but the credential bus is off for it in both
+// directions (see plugin.ShedConn.Owned).
 //
 // Directory mount failures are logged as warnings (non-fatal).
-func (cm *CredentialManager) SetupCredentials(ctx context.Context, agent *AgentClient, shedName string, dirCreds map[string]config.MountConfig, mountDir DirMountFunc) {
+func (cm *CredentialManager) SetupCredentials(ctx context.Context, agent *AgentClient, shedName string, dirCreds map[string]config.MountConfig, mountDir DirMountFunc, owned bool) {
 	// Mount directory credentials via backend-specific callback
 	if len(dirCreds) > 0 && mountDir != nil {
 		backend.Phase(ctx, "credentials")
@@ -61,7 +64,7 @@ func (cm *CredentialManager) SetupCredentials(ctx context.Context, agent *AgentC
 	}
 
 	// Start the message channel for plugin messages and health tracking.
-	cm.startMessageChannel(shedName, agent)
+	cm.startMessageChannel(shedName, agent, owned)
 }
 
 // HealthTracker returns the health tracker for querying VM health state.
@@ -115,8 +118,8 @@ func (cm *CredentialManager) Close() {
 // It is deliberately message-channel-only: no mounts, no provisioning, no
 // hooks. Those all ran when the shed was created/started and the guest still
 // has them.
-func (cm *CredentialManager) ResumeMessageChannel(name string, agent *AgentClient) {
-	if cm.startMessageChannel(name, agent) {
+func (cm *CredentialManager) ResumeMessageChannel(name string, agent *AgentClient, owned bool) {
+	if cm.startMessageChannel(name, agent, owned) {
 		log.Printf("[%s] resumed message channel after server restart", name)
 	}
 }
@@ -128,7 +131,7 @@ func (cm *CredentialManager) ResumeMessageChannel(name string, agent *AgentClien
 // (SetupCredentials on create/start, ResumeMessageChannel on server startup)
 // can't race a second NotifyConn onto the same guest — e.g. a StartShed that
 // lands just after the startup resume walk has already resumed the shed.
-func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient) bool {
+func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient, owned bool) bool {
 	// Health heartbeat callback: update the tracker with agent boot time.
 	var healthFn func(env *plugin.Envelope)
 	if cm.healthTracker != nil {
@@ -153,6 +156,12 @@ func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient
 	}
 
 	handler := NewMessageHandler(healthFn, func(env *plugin.Envelope) {
+		// An owned shed's plugin messages are dropped here as well as in the
+		// bridge: the credential bus is off for it, whatever the bridge's
+		// registration state.
+		if owned {
+			return
+		}
 		if cm.bridge != nil {
 			if err := cm.bridge.PublishToHost(name, env); err != nil {
 				log.Printf("[%s] Failed to publish plugin message: %v", name, err)
@@ -196,6 +205,7 @@ func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient
 			Backend: cm.backendName,
 			Server:  serverName,
 			Send:    handler.SendPluginMessage,
+			Owned:   owned,
 		})
 	}
 

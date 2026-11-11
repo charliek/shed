@@ -129,6 +129,16 @@ type Metadata struct {
 	EgressProfiles []string `json:"egress_profiles,omitempty"`
 	EgressPort     int      `json:"egress_port,omitempty"`
 	EgressToken    string   `json:"egress_token,omitempty"`
+
+	// Owner is the service client that created this shed ("" for an
+	// admin's, and for every shed created before service clients existed).
+	// An owned shed has the credential bus off.
+	Owner string `json:"owner,omitempty"`
+
+	// MountSelection is the server-mount selection the shed starts with,
+	// honoured on every start. New sheds always store it explicitly; a
+	// missing value (an older shed) means every mount.
+	MountSelection *config.MountSelection `json:"mount_selection,omitempty"`
 }
 
 const metadataFilename = "metadata.json"

@@ -16,6 +16,14 @@ const (
 	// FeatureHTTPExec signals POST /api/sheds/{name}/exec, the NDJSON exec
 	// over HTTPS (see exec.go).
 	FeatureHTTPExec = "http_exec"
+	// FeatureMountSelection signals the create request's "mounts" field
+	// (and the stored selection on every shed). An older server ignores the
+	// field, so a client must not send it without this token.
+	FeatureMountSelection = "mount_selection"
+	// FeatureServiceClients signals that this server has service clients
+	// configured (mtls mode with auth.clients): owned sheds, the client
+	// route allowlist and the create policy.
+	FeatureServiceClients = "service_clients"
 )
 
 // serverFeatures returns the feature-token set as a fresh slice, so the
@@ -23,7 +31,11 @@ const (
 // the returned value (an append can't alias a shared backing array). It is a
 // method because some tokens depend on the server's configuration.
 func (s *Server) serverFeatures() []string {
-	return []string{FeatureOverview, FeatureHTTPExec}
+	features := []string{FeatureOverview, FeatureHTTPExec, FeatureMountSelection}
+	if s.cfg.ServiceClientsEnabled() {
+		features = append(features, FeatureServiceClients)
+	}
+	return features
 }
 
 // OverviewServer is the server block of GET /api/overview: the server's version

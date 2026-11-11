@@ -82,7 +82,9 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 //
 // mtls adds three things: trust only the internal CA, require a client
 // certificate that verifies against it, and refuse the handshake outright when
-// the identity that certificate names has left the SSH allowlist.
+// the identity that certificate names has left the SSH allowlist (a user
+// certificate) or is not a configured auth.clients entry (a service
+// certificate, which is never checked against the allowlist).
 //
 // The allowlist check is the FIRST of two, not the only one. A TLS peer's
 // identity is established at the handshake and then held for the life of the
@@ -101,7 +103,14 @@ func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientC
 	if cfg.MTLSMode() && clientCA != nil {
 		tlsCfg.ClientCAs = clientCA.Pool()
 		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
-		tlsCfg.VerifyConnection = servertls.AllowlistConnectionVerifier(authorized)
+		// A service certificate (auth.clients) is accepted while its client
+		// is configured and never checked against the SSH allowlist; every
+		// other certificate goes through the allowlist as before.
+		clientKnown := func(name string) bool {
+			_, ok := cfg.ServiceClient(name)
+			return ok
+		}
+		tlsCfg.VerifyConnection = servertls.ClientConnectionVerifier(authorized, clientKnown)
 	}
 	return tlsCfg
 }

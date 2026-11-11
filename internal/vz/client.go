@@ -172,7 +172,7 @@ func (c *Client) resumeInstance(ctx context.Context, name string) {
 		return
 	}
 
-	c.credMgr.ResumeMessageChannel(name, c.newAgentClient(name))
+	c.credMgr.ResumeMessageChannel(name, c.newAgentClient(name), meta.Owner != "")
 }
 
 // vmmServesInstance reports whether pid is a live vfkit serving THIS
@@ -708,6 +708,8 @@ func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 		EgressProfiles: meta.EgressProfiles,
 		EgressPort:     meta.EgressPort,
 		EgressToken:    meta.EgressToken,
+		Owner:          meta.Owner,
+		Mounts:         config.EffectiveMountSelection(meta.MountSelection),
 	}
 }
 

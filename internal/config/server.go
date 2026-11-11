@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -316,7 +317,125 @@ func (c *ServerConfig) validateAuth() error {
 	if c.HTTPSPort > 0 && !enforced {
 		return fmt.Errorf("https_port requires auth.mode: token or mtls (an open-mode server serves plain http only)")
 	}
+	return c.validateClients()
+}
+
+// clientNamePattern is the shape of a service client's name (auth.clients
+// key). It can never match an SSH key fingerprint (no ':'), so a service
+// certificate's CN and a user certificate's CN cannot be confused.
+var clientNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+
+// clientNamePrefixPattern is the shape of policy.name_prefix: the start of a
+// valid shed name.
+var clientNamePrefixPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+
+// ValidClientName reports whether s is a valid service client name.
+func ValidClientName(s string) bool { return clientNamePattern.MatchString(s) }
+
+// ServiceClientsEnabled reports whether service clients are configured and
+// usable: mtls mode with at least one auth.clients entry.
+func (c *ServerConfig) ServiceClientsEnabled() bool {
+	return c.MTLSMode() && c.Auth != nil && len(c.Auth.Clients) > 0
+}
+
+// ServiceClient returns the named service client's config, or false when
+// there is no such client or service clients are not enabled (any mode other
+// than mtls). The config is static for the life of the process, so removing a
+// client and restarting revokes its certificates.
+func (c *ServerConfig) ServiceClient(name string) (*ServiceClientConfig, bool) {
+	if !c.ServiceClientsEnabled() {
+		return nil, false
+	}
+	cc, ok := c.Auth.Clients[name]
+	if !ok {
+		return nil, false
+	}
+	return &cc, true
+}
+
+// validateClients checks auth.clients: refused outside mtls; each client's
+// name, cert_max_ttl and policy. The image aliases are checked separately
+// (validateClientImages), by Validate only, because they belong to the active
+// backend's block. Called from validateAuth, so both validators run it.
+func (c *ServerConfig) validateClients() error {
+	if c.Auth == nil || len(c.Auth.Clients) == 0 {
+		return nil
+	}
+	if !c.MTLSMode() {
+		return fmt.Errorf("auth.clients requires auth.mode: mtls")
+	}
+	for name, cc := range c.Auth.Clients {
+		key := "auth.clients." + name
+		if !ValidClientName(name) {
+			return fmt.Errorf("invalid auth.clients name %q (must match %s)", name, clientNamePattern)
+		}
+		if cc.CertMaxTTL < 0 {
+			return fmt.Errorf("%s.cert_max_ttl must be positive", key)
+		}
+		p := cc.Policy
+		switch {
+		case p.NamePrefix == "":
+			return fmt.Errorf("%s.policy.name_prefix is required", key)
+		case !clientNamePrefixPattern.MatchString(p.NamePrefix) || len(p.NamePrefix) >= MaxShedNameLength:
+			return fmt.Errorf("%s.policy.name_prefix %q must be lowercase alphanumeric with hyphens, start with a letter, and be shorter than %d characters", key, p.NamePrefix, MaxShedNameLength)
+		case p.MaxSheds < 1:
+			return fmt.Errorf("%s.policy.max_sheds is required and must be at least 1", key)
+		case p.MaxAge <= 0:
+			return fmt.Errorf("%s.policy.max_age is required and must be positive", key)
+		case p.Caps.CPUs < 0 || p.Caps.MemoryMB < 0:
+			return fmt.Errorf("%s.policy.caps must not be negative", key)
+		}
+		for _, m := range p.ServerMounts {
+			if _, ok := c.Mounts[m]; !ok {
+				return fmt.Errorf("%s.policy.server_mounts names %q, which is not in mounts", key, m)
+			}
+		}
+	}
 	return nil
+}
+
+// validateClientImages checks that every auth.clients policy.images entry is
+// an alias in the active backend's image_aliases. Validate only: it needs the
+// resolved backend.
+func (c *ServerConfig) validateClientImages() error {
+	if c.Auth == nil || len(c.Auth.Clients) == 0 {
+		return nil
+	}
+	var aliases map[string]string
+	switch c.DefaultBackend {
+	case BackendFirecracker:
+		if c.Firecracker != nil {
+			aliases = c.Firecracker.ImageAliases
+		}
+	case BackendVZ:
+		if c.VZ != nil {
+			aliases = c.VZ.ImageAliases
+		}
+	}
+	for name, cc := range c.Auth.Clients {
+		for _, img := range cc.Policy.Images {
+			if _, ok := aliases[img]; !ok {
+				return fmt.Errorf("auth.clients.%s.policy.images names %q, which is not an image alias of the %s backend", name, img, c.DefaultBackend)
+			}
+		}
+	}
+	return nil
+}
+
+// ActiveDefaultResources returns the active backend's default_cpus and
+// default_memory_mb, the values a create that sets neither gets.
+func (c *ServerConfig) ActiveDefaultResources() (cpus, memoryMB int) {
+	switch c.DefaultBackend {
+	case BackendFirecracker:
+		if c.Firecracker != nil {
+			return c.Firecracker.DefaultCPUs, c.Firecracker.DefaultMemoryMB
+		}
+	case BackendVZ:
+		if c.VZ != nil {
+			return c.VZ.DefaultCPUs, c.VZ.DefaultMemoryMB
+		}
+	}
+	return 0, 0
 }
 
 // HTTPListenAddr returns the bind address for the plain-HTTP listener, honoring
@@ -1531,6 +1650,36 @@ func rejectRemovedNetworkKeys(data []byte) error {
 	return nil
 }
 
+// rejectUnknownClientKeys fails loudly on an unknown key anywhere under
+// auth.clients. The typed unmarshal is lenient (it ignores unknown fields), and
+// a typo in a security policy (say `max_shed:`) must not be silently dropped.
+// The subtree is re-encoded and decoded strictly into the typed form.
+func rejectUnknownClientKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	auth, ok := raw["auth"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	clients, present := auth["clients"]
+	if !present || clients == nil {
+		return nil
+	}
+	sub, err := yaml.Marshal(clients)
+	if err != nil {
+		return fmt.Errorf("auth.clients: %w", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(sub))
+	dec.KnownFields(true)
+	var typed map[string]ServiceClientConfig
+	if err := dec.Decode(&typed); err != nil {
+		return fmt.Errorf("auth.clients: %w", err)
+	}
+	return nil
+}
+
 // LoadServerConfig loads server configuration from standard locations.
 // It checks in order: ./server.yaml, ~/.config/shed/server.yaml, /etc/shed/server.yaml
 func LoadServerConfig() (*ServerConfig, error) {
@@ -1568,6 +1717,7 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 func rejectRemovedKeys(data []byte) error {
 	for _, check := range []func([]byte) error{
 		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys,
+		rejectUnknownClientKeys,
 	} {
 		if err := check(data); err != nil {
 			return err
@@ -2056,6 +2206,11 @@ func (c *ServerConfig) Validate() error {
 	// Validate egress config if present (compiles profiles/CEL, fails fast).
 	if err := c.Egress.Validate(); err != nil {
 		return fmt.Errorf("egress config: %w", err)
+	}
+
+	// Service clients' image aliases need the resolved backend's block.
+	if err := c.validateClientImages(); err != nil {
+		return err
 	}
 
 	return nil

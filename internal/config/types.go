@@ -162,6 +162,74 @@ type Shed struct {
 	// shed. It is a secret: never serialized to API/CLI responses (json:"-").
 	// It lives durably in the per-backend on-disk metadata, not here.
 	EgressToken string `json:"-" yaml:"-"`
+	// Owner is the service client (auth.clients) that created this shed.
+	// Empty for a shed an admin created, and for every shed created before
+	// service clients existed: those are admin-only.
+	Owner string `json:"owner,omitempty" yaml:"owner,omitempty"`
+	// Mounts is the server-mount selection this shed starts with (top-level
+	// `mounts:`). A shed created before mount selection existed reports
+	// {"mode":"all"}.
+	Mounts *MountSelection `json:"mounts,omitempty" yaml:"mounts,omitempty"`
+}
+
+// Mount selection modes (MountSelection.Mode).
+const (
+	// MountModeAll mounts every configured server mount (the default, and
+	// what a shed created before mount selection existed gets).
+	MountModeAll = "all"
+	// MountModeSelected mounts only the named server mounts; no names means
+	// none.
+	MountModeSelected = "selected"
+)
+
+// MountSelection is a shed's stored choice of server mounts. The mode, not
+// the slice, carries the meaning, so a "selected" selection with no names can
+// never reload as "every mount".
+type MountSelection struct {
+	Mode  string   `json:"mode" yaml:"mode"`
+	Names []string `json:"names,omitempty" yaml:"names,omitempty"`
+}
+
+// Allows reports whether the server mount called name is part of the
+// selection. A nil selection (legacy metadata) and mode "all" allow every
+// mount; "selected" allows only Names; any other mode allows nothing, so a
+// corrupted or future mode fails closed.
+func (m *MountSelection) Allows(name string) bool {
+	if m == nil {
+		return true
+	}
+	switch m.Mode {
+	case MountModeAll:
+		return true
+	case MountModeSelected:
+		for _, n := range m.Names {
+			if n == name {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// AllMounts returns a fresh {mode: all} selection.
+func AllMounts() *MountSelection { return &MountSelection{Mode: MountModeAll} }
+
+// SelectedMounts returns a {mode: selected} selection of a copy of names
+// (nil or empty: no mounts).
+func SelectedMounts(names []string) *MountSelection {
+	return &MountSelection{Mode: MountModeSelected, Names: append([]string(nil), names...)}
+}
+
+// EffectiveMountSelection is the selection a shed with the stored value sel
+// runs with: a missing selection (metadata written before mount selection
+// existed) is {mode: all}. It returns a copy, never sel itself.
+func EffectiveMountSelection(sel *MountSelection) *MountSelection {
+	if sel == nil {
+		return AllMounts()
+	}
+	return &MountSelection{Mode: sel.Mode, Names: append([]string(nil), sel.Names...)}
 }
 
 // ExtensionHealthInfo is the API-facing extension health for a shed.
@@ -579,6 +647,20 @@ type CreateShedRequest struct {
 	// UpperSizeBytes is the logical size of the per-shed writable upper.
 	// Zero falls back to the backend's upper_size_default config value.
 	UpperSizeBytes int64 `json:"upper_size_bytes,omitempty"`
+
+	// Mounts selects the server mounts (top-level `mounts:`) the shed gets:
+	// omitted (nil) = every server mount, as before; [] = none; names =
+	// exactly those. A service client may name only its policy's
+	// server_mounts, and omitting it means exactly those.
+	Mounts *[]string `json:"mounts,omitempty"`
+
+	// Owner and ResolvedMounts are set by the API server after
+	// authorization (json:"-": no caller can set them on the wire). Owner is
+	// the service client creating the shed ("" for an admin);
+	// ResolvedMounts is the stored mount selection. A backend called with a
+	// nil ResolvedMounts (a non-API caller) stores {mode: all}.
+	Owner          string          `json:"-"`
+	ResolvedMounts *MountSelection `json:"-"`
 }
 
 // SnapshotSchemaVersion is the current snapshot schema version. Bumped
@@ -715,6 +797,15 @@ const (
 	// ErrRequestTooLarge (413) means a request body or its decoded stdin is
 	// over the server's limit.
 	ErrRequestTooLarge = "REQUEST_TOO_LARGE"
+	// ErrPolicyViolation (403) means a service client's create request
+	// breaks its auth.clients policy; the message names the rule.
+	ErrPolicyViolation = "POLICY_VIOLATION"
+	// ErrForbidden (403) means the caller's credential may not reach this
+	// route (a scope mismatch, or a route outside a service client's
+	// allowlist).
+	ErrForbidden = "FORBIDDEN"
+	// ErrUnauthorized (401) means no valid credential was presented.
+	ErrUnauthorized = "UNAUTHORIZED"
 
 	ErrSnapshotNotFound        = "SNAPSHOT_NOT_FOUND"
 	ErrSnapshotAlreadyExists   = "SNAPSHOT_ALREADY_EXISTS"
@@ -772,6 +863,59 @@ type AuthConfig struct {
 	TokenTTL Duration `yaml:"token_ttl,omitempty"`
 	// SSH configures the SSH public-key allowlist (key sources + advanced mode).
 	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`
+	// Clients are the service clients (mtls mode only): orchestrators that
+	// authenticate with a certificate from `shed-server client issue` and may
+	// create, run commands in and delete only their own sheds, within their
+	// policy. Keyed by client name.
+	Clients map[string]ServiceClientConfig `yaml:"clients,omitempty"`
+}
+
+// DefaultClientCertMaxTTL is auth.clients.<name>.cert_max_ttl when unset.
+const DefaultClientCertMaxTTL = 90 * 24 * time.Hour
+
+// ServiceClientConfig is one service client under auth.clients. Unknown keys are
+// refused at config load (rejectUnknownClientKeys), so a typo in a security
+// policy fails loudly.
+type ServiceClientConfig struct {
+	// CertMaxTTL is the longest certificate `client issue` may sign for this
+	// client (default 90 days).
+	CertMaxTTL Duration `yaml:"cert_max_ttl,omitempty"`
+	// Policy bounds what the client may create.
+	Policy ServiceClientPolicy `yaml:"policy"`
+}
+
+// ServiceClientPolicy is a service client's create policy.
+type ServiceClientPolicy struct {
+	// NamePrefix is required: every shed the client creates must start
+	// with it.
+	NamePrefix string `yaml:"name_prefix"`
+	// MaxSheds is the most sheds the client may own at once, running or
+	// stopped (at least 1).
+	MaxSheds int `yaml:"max_sheds"`
+	// MaxAge is how old an owned shed may get before the server deletes it.
+	MaxAge Duration `yaml:"max_age"`
+	// ServerMounts names the top-level mounts the client's sheds may get
+	// (default none). A create that omits mounts gets exactly these.
+	ServerMounts []string `yaml:"server_mounts,omitempty"`
+	// Images are the image aliases the client may ask for; empty means the
+	// server default only.
+	Images []string `yaml:"images,omitempty"`
+	// Caps bound the resources of one shed, compared after defaults.
+	Caps ServiceClientCaps `yaml:"caps,omitempty"`
+}
+
+// ServiceClientCaps are optional per-shed resource caps (0 = no cap).
+type ServiceClientCaps struct {
+	CPUs     int `yaml:"cpus,omitempty"`
+	MemoryMB int `yaml:"memory_mb,omitempty"`
+}
+
+// CertMaxTTLValue is cert_max_ttl, or DefaultClientCertMaxTTL when unset.
+func (c ServiceClientConfig) CertMaxTTLValue() time.Duration {
+	if c.CertMaxTTL > 0 {
+		return c.CertMaxTTL.Duration()
+	}
+	return DefaultClientCertMaxTTL
 }
 
 // ExecConfig bounds the HTTPS exec endpoint (POST /api/sheds/{name}/exec).

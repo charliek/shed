@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/authtoken"
+	"github.com/charliek/shed/internal/servertls"
 )
 
 // authMiddleware enforces the server's auth.mode on every /api request. There
@@ -34,7 +35,10 @@ import (
 // client needs to bootstrap arrives in the SSH `_bootstrap` bundle instead.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	if !s.cfg.HTTPAuthEnforced() {
-		return next
+		// Open mode: every caller is an admin (no subject).
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), Caller{Kind: CallerAdmin})))
+		})
 	}
 	if s.cfg.MTLSMode() {
 		return s.certAuthMiddleware(next)
@@ -50,7 +54,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 func (s *Server) tokenAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isBootstrapExempt(r) {
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), Caller{Kind: CallerAdmin})))
 			return
 		}
 		rec, ok := s.validateToken(bearerToken(r))
@@ -62,7 +66,7 @@ func (s *Server) tokenAuthMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "FORBIDDEN", detail)
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), Caller{Kind: CallerAdmin, Name: rec.Subject})))
 	})
 }
 
@@ -129,6 +133,19 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is expired or not yet valid")
 			return
 		}
+		// A service certificate (auth.clients) is decided here and never
+		// reaches the SSH allowlist; a malformed one, or one for a client that
+		// is not configured, is refused rather than treated as a user's.
+		if name, isService, err := servertls.ServiceClientName(leaf); isService {
+			cc, known := s.cfg.ServiceClient(name)
+			if err != nil || !known {
+				closeIdentityBoundConnection(w, r)
+				writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is not authorized")
+				return
+			}
+			s.serveServiceClient(w, r, next, name, cc, leaf)
+			return
+		}
 		if !s.certSubjectAuthorized(leaf.Subject.CommonName) {
 			closeIdentityBoundConnection(w, r)
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is not authorized")
@@ -138,7 +155,11 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "FORBIDDEN", detail)
 			return
 		}
-		next.ServeHTTP(w, r)
+		caller := Caller{Kind: CallerAdmin, Name: leaf.Subject.CommonName}
+		if leaf.SerialNumber != nil {
+			caller.Serial = strings.ToLower(leaf.SerialNumber.Text(16))
+		}
+		next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), caller)))
 	})
 }
 

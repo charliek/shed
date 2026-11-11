@@ -114,6 +114,16 @@ auth:
   mode: mtls
   ssh:
     github_users: [charliek]
+  # A service client for tests/integration/test_service_client.py. Its bundle
+  # is issued on the dev host with `shed-server client issue itest`.
+  clients:
+    itest:
+      cert_max_ttl: 24h
+      policy:
+        name_prefix: "itest-svc-"
+        max_sheds: 3
+        max_age: 2h
+        images: [itest]
 EOF
   fi
   applied+=("auth.mode: mtls")

@@ -117,7 +117,7 @@ func TestResumeMessageChannel(t *testing.T) {
 	t.Run("registers_on_bridge", func(t *testing.T) {
 		cm, bridge := newResumeTestManager(t)
 
-		cm.ResumeMessageChannel("shed-a", newResumeTestAgent())
+		cm.ResumeMessageChannel("shed-a", newResumeTestAgent(), false)
 
 		if got := bridgeNames(bridge); len(got) != 1 || got[0] != "shed-a" {
 			t.Fatalf("bridge sheds = %v, want [shed-a]", got)
@@ -151,13 +151,13 @@ func TestResumeMessageChannel(t *testing.T) {
 	t.Run("resume_then_setup_opens_one_channel", func(t *testing.T) {
 		cm, bridge := newResumeTestManager(t)
 
-		cm.ResumeMessageChannel("shed-a", newResumeTestAgent())
+		cm.ResumeMessageChannel("shed-a", newResumeTestAgent(), false)
 		first := cm.channel("shed-a")
 		if first == nil {
 			t.Fatal("resume did not open a channel")
 		}
 
-		cm.SetupCredentials(context.Background(), newResumeTestAgent(), "shed-a", nil, nil)
+		cm.SetupCredentials(context.Background(), newResumeTestAgent(), "shed-a", nil, nil, false)
 
 		if n := cm.channelCount(); n != 1 {
 			t.Fatalf("messageChannels = %d after resume+setup, want 1", n)
@@ -174,13 +174,13 @@ func TestResumeMessageChannel(t *testing.T) {
 	t.Run("setup_then_resume_opens_one_channel", func(t *testing.T) {
 		cm, _ := newResumeTestManager(t)
 
-		cm.SetupCredentials(context.Background(), newResumeTestAgent(), "shed-a", nil, nil)
+		cm.SetupCredentials(context.Background(), newResumeTestAgent(), "shed-a", nil, nil, false)
 		first := cm.channel("shed-a")
 		if first == nil {
 			t.Fatal("SetupCredentials did not open a channel")
 		}
 
-		cm.ResumeMessageChannel("shed-a", newResumeTestAgent())
+		cm.ResumeMessageChannel("shed-a", newResumeTestAgent(), false)
 
 		if n := cm.channelCount(); n != 1 {
 			t.Fatalf("messageChannels = %d after setup+resume, want 1", n)
@@ -234,10 +234,10 @@ func TestStartMessageChannelLifecycleRace(t *testing.T) {
 			name := fmt.Sprintf("shed-%d", i)
 
 			wg.Add(3)
-			go func() { defer wg.Done(); cm.ResumeMessageChannel(name, newResumeTestAgent()) }()
+			go func() { defer wg.Done(); cm.ResumeMessageChannel(name, newResumeTestAgent(), false) }()
 			go func() {
 				defer wg.Done()
-				cm.SetupCredentials(context.Background(), newResumeTestAgent(), name, nil, nil)
+				cm.SetupCredentials(context.Background(), newResumeTestAgent(), name, nil, nil, false)
 			}()
 			go func() { defer wg.Done(); cm.StopListener(name) }()
 		}

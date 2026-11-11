@@ -37,6 +37,17 @@ type Server struct {
 	caFingerprint string
 	caNotAfter    time.Time
 
+	// mux is the router Router() built, kept so the auth middleware (which
+	// runs at the root, before routing) can resolve a service client's
+	// request to its route pattern with Find. nil until Router() runs; a
+	// client request with no mux is refused.
+	mux *chi.Mux
+
+	// clientMu guards clientCreates, the creates each service client has in
+	// flight, counted against policy.max_sheds with the sheds it owns.
+	clientMu      sync.Mutex
+	clientCreates map[string]int
+
 	// execMu guards execInFlight, the count of HTTPS execs running per shed
 	// (exec.max_concurrent_per_shed). The map is created on first use.
 	execMu       sync.Mutex
@@ -70,8 +81,7 @@ func (s *Server) SetClientCertAuthorizer(fn func(fingerprint string) bool) { s.c
 
 // SetClientCAInfo records the internal client CA's fingerprint and expiry for
 // /api/info reporting in mtls mode. Two scalars rather than the CA itself: the
-// API server has no use for issuance, and copying the values keeps
-// internal/servertls out of this package's imports.
+// API server has no use for issuance.
 func (s *Server) SetClientCAInfo(fingerprint string, notAfter time.Time) {
 	s.caFingerprint = fingerprint
 	s.caNotAfter = notAfter
@@ -119,6 +129,7 @@ func (s *Server) useCommonMiddleware(r chi.Router) {
 // certificate (see authMiddleware).
 func (s *Server) Router() chi.Router {
 	r := chi.NewRouter()
+	s.mux = r
 	s.useCommonMiddleware(r)
 
 	r.Route("/api", func(r chi.Router) {

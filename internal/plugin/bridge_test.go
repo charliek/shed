@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 )
@@ -150,4 +151,62 @@ func TestBridgeConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestBridgeOwnedShedCredentialBusOff: the credential bus is off for a shed a
+// service client owns. With a listener registered for the ssh-agent
+// namespace, the owned shed's request never reaches it while an unowned
+// shed's does; sending to the owned shed fails without calling its Send; and
+// the owned shed is not listed to bus consumers.
+func TestBridgeOwnedShedCredentialBusOff(t *testing.T) {
+	reg := NewRegistry()
+	b := NewBridge(reg)
+	l, err := reg.Register("ssh-agent")
+	if err != nil {
+		t.Fatalf("register listener: %v", err)
+	}
+
+	ownedSends := 0
+	b.RegisterShed("owned", &ShedConn{
+		Send:  func(*Envelope) error { ownedSends++; return nil },
+		Owned: true,
+	})
+	b.RegisterShed("mine", &ShedConn{Send: func(*Envelope) error { return nil }})
+
+	req := NewEnvelope("ssh-agent", MessageTypeRequest, json.RawMessage(`{"op":"list"}`))
+	if err := b.PublishToHost("owned", req); err != nil {
+		t.Fatalf("PublishToHost(owned) = %v, want a silent drop", err)
+	}
+	select {
+	case got := <-l.Messages:
+		t.Fatalf("owned shed's ssh-agent request reached the listener: %+v", got)
+	default:
+	}
+
+	req2 := NewEnvelope("ssh-agent", MessageTypeRequest, json.RawMessage(`{"op":"list"}`))
+	if err := b.PublishToHost("mine", req2); err != nil {
+		t.Fatalf("PublishToHost(mine): %v", err)
+	}
+	select {
+	case got := <-l.Messages:
+		if got.Shed == nil || got.Shed.Name != "mine" {
+			t.Fatalf("unowned shed's envelope arrived without its shed info: %+v", got.Shed)
+		}
+	default:
+		t.Fatal("unowned shed's envelope did not reach the listener")
+	}
+
+	resp := NewEnvelope("ssh-agent", MessageTypeResponse, nil)
+	if err := b.SendToShed("owned", resp); !errors.Is(err, ErrCredentialBusDisabled) {
+		t.Fatalf("SendToShed(owned) = %v, want ErrCredentialBusDisabled", err)
+	}
+	if ownedSends != 0 {
+		t.Fatalf("owned shed's Send was called %d times", ownedSends)
+	}
+
+	for _, s := range b.ListSheds() {
+		if s.Name == "owned" {
+			t.Fatalf("owned shed listed to bus consumers: %+v", b.ListSheds())
+		}
+	}
 }

@@ -315,6 +315,9 @@ func (b *fcCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		LowerDigest:    pre.lowerDigest,
 		LowerImageTag:  pre.lowerImageTag,
 		FromSnapshot:   req.FromSnapshot,
+		Owner:          req.Owner,
+		// Always explicit for a new shed; nil (a non-API caller) is "all".
+		MountSelection: config.EffectiveMountSelection(req.ResolvedMounts),
 	}
 
 	cleanup.Register("delete instance dir", func() error {
@@ -415,13 +418,13 @@ func (b *fcCreator) MountLocalDir(ctx context.Context, req config.CreateShedRequ
 // Best-effort.
 func (b *fcCreator) SetupCredentials(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
 	meta := metaRaw.(*fcMetaHandle).meta
-	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	if len(dirCreds) > 0 {
 		backend.Phase(ctx, "credentials")
 		backend.Status(ctx, "Setting up credentials...")
 	}
 	agent := b.c.newAgentClient(meta.Name)
-	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mount9PCredentialFunc(req.Name))
+	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mount9PCredentialFunc(req.Name), meta.Owner != "")
 }
 
 // ConfigureEgressProxy opens this shed's egress proxy listener and injects the
@@ -746,9 +749,9 @@ func (b *fcStarter) MountLocalDir(ctx context.Context, metaRaw orchestrator.Meta
 // per credential).
 func (b *fcStarter) SetupCredentials(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
 	meta := metaRaw.(*fcMetaHandle).meta
-	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	agent := b.c.newAgentClient(meta.Name)
-	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mount9PCredentialFunc(meta.Name))
+	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mount9PCredentialFunc(meta.Name), meta.Owner != "")
 }
 
 // ConfigureEgressProxy re-opens this shed's egress proxy listener on the
