@@ -85,21 +85,30 @@ jq -r .client_cert nocturn-bundle.json > client.crt
 jq -r .client_key  nocturn-bundle.json > client.key
 chmod 600 client.key
 
-# Fetch the server certificate and check it against the bundle's pin.
+# Fetch the server certificate and stop unless it matches the bundle's pin.
 openssl s_client -connect shed-host:8443 -cert client.crt -key client.key </dev/null 2>/dev/null \
   | openssl x509 > server.pem
-echo "sha256:$(openssl x509 -in server.pem -noout -fingerprint -sha256 | cut -d= -f2 | tr -d : | tr A-F a-f)"
-jq -r .tls_cert_fingerprint nocturn-bundle.json   # must print the same value
+got="sha256:$(openssl x509 -in server.pem -noout -fingerprint -sha256 | cut -d= -f2 | tr -d : | tr A-F a-f)"
+want="$(jq -r .tls_cert_fingerprint nocturn-bundle.json)"
+[ "$got" = "$want" ] || { echo "server certificate does not match the pin" >&2; exit 1; }
+
+# Pin the verified certificate's public key for every later call.
+PIN="sha256//$(openssl x509 -in server.pem -noout -pubkey \
+  | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)"
 ```
 
-`--cacert server.pem` then trusts exactly that certificate. curl also checks the
-host name, so call the server by a name in the certificate: `localhost`,
-`127.0.0.1`, or one listed in the server's `tls_names`. A client written in a
-programming language should instead compare the SHA-256 of the presented leaf
-certificate (DER) with the pin, as the `shed` CLI does.
+Every call then passes `--pinnedpubkey "$PIN"`, so curl refuses any server
+whose key is not the one just checked against the bundle. `--cacert server.pem`
+alone is not enough: curl built with OpenSSL can keep trusting its system CA
+directory alongside the file, so a certificate from a system-trusted CA (an
+intercepting proxy's, say) would also pass. curl also checks the host name, so
+call the server by a name in the certificate: `localhost`, `127.0.0.1`, or one
+listed in the server's `tls_names`. A client written in a programming language
+should instead compare the SHA-256 of the presented leaf certificate (DER) with
+the pin on every connection, as the `shed` CLI does.
 
 ```bash
-API="curl -sS --cacert server.pem --cert client.crt --key client.key -H Content-Type:application/json"
+API="curl -sS --cacert server.pem --pinnedpubkey $PIN --cert client.crt --key client.key -H Content-Type:application/json"
 
 # What the server supports: expect service_clients and http_exec.
 $API https://shed-host:8443/api/info | jq .features
@@ -169,6 +178,14 @@ again until they expire, so give a replacement client a new name.
 
 Whoever holds the bundle can do everything the client can, within its policy:
 create sheds, run commands as root in its live sheds, read what the
-orchestrator put in them, and delete them. It cannot reach the host, an
-admin's sheds, another client's, or SSH. Keep `cert_max_ttl` short, keep the
+orchestrator put in them, and delete them. Through the API it cannot touch an
+admin's sheds or another client's, and it gives no admin route and no SSH.
+What those commands can reach on the network and the host is set by the
+shed's profile and mounts, not by the certificate: an `isolated` shed reaches
+only the internet (and its own egress proxy), while with `policy.network:
+open` (required on VZ) a command reaches whatever the host's NAT reaches,
+including the host, the LAN and other open sheds; the client's
+`server_mounts` are host directories it can read and, unless read-only, write.
+See [Security › Service clients](../reference/security.md#residual-risks).
+Keep `cert_max_ttl` short, keep the
 bundle in a secret store, and revoke the client as above if it leaks.

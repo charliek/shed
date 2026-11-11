@@ -201,7 +201,10 @@ tls_names:                       # extra SANs so hostname verification passes
 `shed server add` pins the fingerprint automatically (it is in the bootstrap
 bundle). All clients verify by pin: the Go CLI and sdk via
 `VerifyPeerCertificate`, the desktop via `URLSessionDelegate`, and `curl` via
-the cert handed in with `--cacert`. A client that configures a pin but a
+`--pinnedpubkey` alongside the cert handed in with `--cacert` (with OpenSSL,
+`--cacert` alone can leave the system CA directory trusted; see the
+[orchestrated sheds guide](../guides/orchestrated-sheds.md#4-call-the-api)).
+A client that configures a pin but a
 non-`https` URL **fails closed** rather than sending plaintext.
 
 **Rotation.** Changing `tls_names` regenerates the certificate (new
@@ -555,8 +558,15 @@ line (argv[0] and the argument count by default, never the arguments).
   certificate and key can do everything the client can: create sheds within its
   policy, run any command as root (through `sudo`) in its live sheds, read
   whatever the orchestrator put there (a clone, a token passed to a command),
-  and delete them. It cannot reach an admin's shed, another client's, the
-  host, or SSH. Store the bundle as a secret, and keep `cert_max_ttl` short.
+  and delete them. Through the API it cannot touch an admin's shed or another
+  client's, and the certificate gives no admin route and no SSH. What a command
+  run in its sheds can reach is a separate question, answered by the shed's
+  network profile and mounts: with the default `isolated` profile, only the
+  internet (see [Network profiles](#network-profiles) for the egress-proxy
+  exception); with `policy.network: open` (required on VZ), whatever the host's
+  NAT reaches, including the host, the LAN and other open sheds; and the host
+  directories in the client's `server_mounts`. Store the bundle as a secret,
+  and keep `cert_max_ttl` short.
 - **No serial revocation.** One certificate cannot be revoked on its own.
   Removing the client from `auth.clients` and restarting `serve` revokes every
   certificate issued for it; re-adding it later trusts them again until they
@@ -582,9 +592,18 @@ API's `mounts` field, and a service client's sheds get only its
 `server_mounts`. The choice is stored with the shed as an explicit mode
 (`all`, or `selected` plus names; a stored selection with no names is none,
 and an unknown mode mounts nothing) and is applied on every start, including
-an SSH auto-start, on both backends. Without a mount, the guest has no path to
-that host directory at all: on Firecracker no 9P server is started for it, on
-VZ no VirtioFS device is attached.
+an SSH auto-start, on both backends. The selection controls which exports are
+started or attached **for that shed**: without a mount, on Firecracker no 9P
+server is started for it, and on VZ no VirtioFS device is attached.
+
+!!! warning "Leaving out a mount is not, alone, an access boundary on Firecracker"
+    Each Firecracker 9P server listens on the bridge gateway and does not
+    authenticate which shed connects. An `open` shed with no mounts can still
+    reach another running shed's 9P port, and with it that shed's export. Pair
+    a reduced mount selection with the [`isolated`](#network-profiles) profile,
+    whose rules let a guest reach only its own ports on the gateway, when the
+    shed must not reach host directories. (Service clients' sheds are
+    `isolated` by default.)
 
 ## Network profiles
 
@@ -596,7 +615,14 @@ Each shed has a network profile, chosen at create and fixed for its life:
   host (on any of its addresses, the gateway included), other sheds, RFC 1918,
   CGNAT and tailnet (`100.64.0.0/10`), link-local and cloud metadata
   (`169.254.0.0/16`), loopback, multicast and the other reserved IPv4 ranges,
-  and no IPv6 at all. Anti-spoofing is on. The guest's DNS server (8.8.8.8) is
+  and no IPv6 at all. Anti-spoofing is on. These rules cover the guest's
+  **direct** traffic. One exception is mediated: a shed with an [egress
+  profile](egress.md) may reach its own egress proxy on the gateway, and the
+  proxy dials upstream from the host, outside these rules. Its deny-CIDR guards
+  refuse private, reserved and link-local ranges and the gateway, but not the
+  host's own public addresses, so through the proxy an isolated guest can
+  reach a service listening on a public address of the host (in `audit` mode,
+  or when an allow rule matches it). The guest's DNS server (8.8.8.8) is
   on the internet, so name resolution works. The host still reaches the
   guest: `shed exec`, the HTTPS exec, tunnels and the agent's health checks
   run over vsock, not the network.

@@ -532,8 +532,11 @@ How a stream ends:
 
 Cancellation (timeout or disconnect) closes the agent connection, and the guest
 agent then sends `SIGHUP` to the command's process group. A process that
-ignores `SIGHUP` survives. The 200 is sent only once the command has started,
-so every refusal before that is an ordinary JSON error:
+ignores `SIGHUP` survives. The 200 is sent once the request has been
+dispatched to the guest agent, so every refusal before that is an ordinary JSON
+error. A 200 does not prove the command launched: if the guest cannot start it
+(a missing executable, a bad `cwd`), the stream carries no output and an `exit`
+frame with code 1.
 
 **Errors:**
 
@@ -544,7 +547,7 @@ so every refusal before that is an ordinary JSON error:
 | 409 | `SHED_NOT_RUNNING` | The shed is not running. Exec never starts a shed; start it first. |
 | 413 | `REQUEST_TOO_LARGE` | The body, or its decoded `stdin`, is over the limit |
 | 429 | `EXEC_LIMIT` | The shed already runs `exec.max_concurrent_per_shed` HTTPS execs (default 8) |
-| 504 | `BACKEND_ERROR` | The timeout expired before the command started |
+| 504 | `BACKEND_ERROR` | The timeout expired before the request reached the guest agent |
 
 !!! note "Read only `SHED_NOT_FOUND` as \"shed gone\""
     A 404 means the shed is missing only when its code is `SHED_NOT_FOUND`.
