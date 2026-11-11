@@ -54,6 +54,13 @@ type ExecOptions struct {
 
 	// ResizeChan receives terminal resize events.
 	ResizeChan <-chan TerminalSize
+
+	// OnStarted, when set, is called once, synchronously, right after the
+	// exec request has been written to the guest agent: the point after which
+	// the command may be running. It is not called when the exec fails before
+	// that (a dial failure, the shed not running). The HTTPS exec handler uses
+	// it to commit its 200 response only once the command has started.
+	OnStarted func()
 }
 
 // TerminalSize represents terminal dimensions.

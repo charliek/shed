@@ -13,13 +13,17 @@ import (
 const (
 	// FeatureOverview signals the GET /api/overview single-call host snapshot.
 	FeatureOverview = "overview"
+	// FeatureHTTPExec signals POST /api/sheds/{name}/exec, the NDJSON exec
+	// over HTTPS (see exec.go).
+	FeatureHTTPExec = "http_exec"
 )
 
 // serverFeatures returns the feature-token set as a fresh slice, so the
 // advertised set lives in exactly one place yet no caller can mutate it through
-// the returned value (an append can't alias a shared backing array).
-func serverFeatures() []string {
-	return []string{FeatureOverview}
+// the returned value (an append can't alias a shared backing array). It is a
+// method because some tokens depend on the server's configuration.
+func (s *Server) serverFeatures() []string {
+	return []string{FeatureOverview, FeatureHTTPExec}
 }
 
 // OverviewServer is the server block of GET /api/overview: the server's version
@@ -65,7 +69,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	resp := OverviewResponse{
-		Server: OverviewServer{Version: version.Info(), Features: serverFeatures()},
+		Server: OverviewServer{Version: version.Info(), Features: s.serverFeatures()},
 		Sheds:  []OverviewShed{},
 	}
 	var warnings []string

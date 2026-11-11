@@ -3,9 +3,11 @@ package vmutil
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -681,3 +683,74 @@ func TestExecFoldsStderrWhenNilStderr(t *testing.T) {
 		t.Errorf("folded stdout = %q, want %q", stdout.String(), "out-1err-1out-2")
 	}
 }
+
+// TestExecOnStartedFiresOnceAfterRequest: OnStarted runs exactly once, only
+// after the agent has the exec request, and before any output is delivered.
+func TestExecOnStartedFiresOnceAfterRequest(t *testing.T) {
+	gotReq := make(chan struct{})
+	dialer := &pipeDialer{
+		handler: func(conn net.Conn) {
+			defer conn.Close()
+			msgType, _, err := agentproto.ReadMessage(conn)
+			if err != nil || msgType != agentproto.MsgTypeExecRequest {
+				return
+			}
+			close(gotReq)
+			agentproto.ReadMessage(conn) // stdin EOF
+			agentproto.WriteData(conn, []byte("out"))
+			agentproto.WriteExitCode(conn, 0)
+		},
+	}
+	client := NewAgentClient(dialer, 1024, 1026)
+
+	var mu sync.Mutex
+	calls := 0
+	var output strings.Builder
+	opts := backend.ExecOptions{
+		Cmd: []string{"echo"},
+		Stdout: NopWriteCloser(writerFunc(func(p []byte) (int, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 1 {
+				t.Errorf("output delivered with OnStarted called %d times", calls)
+			}
+			return output.Write(p)
+		})),
+		OnStarted: func() {
+			// Called before the request was written, this would wait in vain:
+			// the agent cannot have read a request that is not sent yet.
+			select {
+			case <-gotReq:
+			case <-time.After(2 * time.Second):
+				t.Error("OnStarted ran before the agent received the exec request")
+			}
+			mu.Lock()
+			calls++
+			mu.Unlock()
+		},
+	}
+	if err := client.Exec(context.Background(), opts); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("OnStarted called %d times, want 1", calls)
+	}
+	if output.String() != "out" {
+		t.Errorf("output %q", output.String())
+	}
+}
+
+// TestExecOnStartedNotCalledWhenRequestFails: a request the agent never got
+// (here, a dial failure) never reports a start.
+func TestExecOnStartedNotCalledWhenRequestFails(t *testing.T) {
+	client := NewAgentClient(&errDialer{err: errors.New("no route")}, 1024, 1026)
+	called := false
+	err := client.Exec(context.Background(), backend.ExecOptions{Cmd: []string{"true"}, OnStarted: func() { called = true }})
+	if err == nil || called {
+		t.Fatalf("err %v, OnStarted called %v", err, called)
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

@@ -2,6 +2,7 @@
 package api
 
 import (
+	"sync"
 	"time"
 
 	"github.com/charliek/shed/internal/authtoken"
@@ -35,6 +36,11 @@ type Server struct {
 	// trusts and when it must be rotated. Zero values in every other mode.
 	caFingerprint string
 	caNotAfter    time.Time
+
+	// execMu guards execInFlight, the count of HTTPS execs running per shed
+	// (exec.max_concurrent_per_shed). The map is created on first use.
+	execMu       sync.Mutex
+	execInFlight map[string]int
 }
 
 // SetEgressAudit attaches the durable egress audit log so `shed egress show`
@@ -209,6 +215,10 @@ func (s *Server) Router() chi.Router {
 				r.Post("/start", s.handleStartShed)
 				r.Post("/stop", s.handleStopShed)
 				r.Post("/reset", s.handleResetShed)
+
+				// HTTPS exec: one command, NDJSON output (control scope
+				// in an enforced mode, via authorizeScope's default).
+				r.Post("/exec", s.handleExecShed)
 
 				// Sessions within a shed
 				r.Get("/sessions", s.handleListSessions)

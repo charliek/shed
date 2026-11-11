@@ -35,7 +35,7 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		AuthMode:     config.LegacyWireAuthMode(s.cfg.AuthModeValue()),
 		DefaultImage: s.cfg.ActiveDefaultImage(),
 		HTTPSPort:    s.cfg.HTTPSPort,
-		Features:     serverFeatures(),
+		Features:     s.serverFeatures(),
 	}
 	// Client-CA visibility, mtls only. Reaching /api/info in mtls mode already
 	// required a valid client certificate (that mode has no bootstrap

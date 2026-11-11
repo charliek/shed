@@ -705,6 +705,17 @@ const (
 	ErrInvalidLocalDir    = "INVALID_LOCAL_DIR"
 	ErrInvalidRequest     = "INVALID_REQUEST"
 
+	// ErrShedNotRunning (409) is the exec endpoint's "the shed must be
+	// running" refusal. Exec never auto-starts a shed. Other routes keep
+	// SHED_ALREADY_STOPPED for the same condition.
+	ErrShedNotRunning = "SHED_NOT_RUNNING"
+	// ErrExecLimit (429) means the shed already runs
+	// exec.max_concurrent_per_shed HTTPS execs.
+	ErrExecLimit = "EXEC_LIMIT"
+	// ErrRequestTooLarge (413) means a request body or its decoded stdin is
+	// over the server's limit.
+	ErrRequestTooLarge = "REQUEST_TOO_LARGE"
+
 	ErrSnapshotNotFound        = "SNAPSHOT_NOT_FOUND"
 	ErrSnapshotAlreadyExists   = "SNAPSHOT_ALREADY_EXISTS"
 	ErrSnapshotSourceRunning   = "SNAPSHOT_SOURCE_RUNNING"
@@ -761,6 +772,58 @@ type AuthConfig struct {
 	TokenTTL Duration `yaml:"token_ttl,omitempty"`
 	// SSH configures the SSH public-key allowlist (key sources + advanced mode).
 	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`
+}
+
+// ExecConfig bounds the HTTPS exec endpoint (POST /api/sheds/{name}/exec).
+// Every field is optional; a zero value takes its default (see the
+// ServerConfig.Exec* accessors in server.go).
+type ExecConfig struct {
+	// MaxStdinBytes caps a request's decoded stdin (default 1 MiB).
+	MaxStdinBytes int64 `yaml:"max_stdin_bytes,omitempty"`
+	// MaxTimeout is the largest timeout_seconds a request may ask for
+	// (default 1h, at least 1s). A larger request is refused, not clamped.
+	MaxTimeout Duration `yaml:"max_timeout,omitempty"`
+	// MaxConcurrentPerShed caps the HTTPS execs running in one shed at once
+	// (default 8); one more is refused with 429 EXEC_LIMIT.
+	MaxConcurrentPerShed int `yaml:"max_concurrent_per_shed,omitempty"`
+}
+
+// ExecRequest is the body of POST /api/sheds/{name}/exec. Argv runs as given
+// (no shell wrap) as the shed user; a caller who wants a login shell passes
+// ["bash","-lc",...]. Stdin is standard base64.
+type ExecRequest struct {
+	Argv           []string          `json:"argv"`
+	Cwd            string            `json:"cwd,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	Stdin          string            `json:"stdin,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	MaxOutputBytes int64             `json:"max_output_bytes,omitempty"`
+}
+
+// Exec stream frame types: each NDJSON line of a 200 exec response carries
+// one of these in "t".
+const (
+	ExecFrameStdout = "stdout"
+	ExecFrameStderr = "stderr"
+	ExecFrameExit   = "exit"
+)
+
+// ExecDataFrame is one chunk of a command's stdout or stderr, base64-encoded.
+type ExecDataFrame struct {
+	T string `json:"t"`
+	D string `json:"d"`
+}
+
+// ExecExitFrame is the last line of an exec stream. A stream that ends
+// without one means the result was lost (the command may or may not have
+// finished). Code is 124 with TimedOut on a timeout; Truncated means output
+// past max_output_bytes was discarded (the command still ran to its exit).
+type ExecExitFrame struct {
+	T          string `json:"t"`
+	Code       int    `json:"code"`
+	TimedOut   bool   `json:"timed_out"`
+	Truncated  bool   `json:"truncated"`
+	DurationMS int64  `json:"duration_ms"`
 }
 
 // SSHAuthConfig configures the SSH public-key allowlist. Identity comes from

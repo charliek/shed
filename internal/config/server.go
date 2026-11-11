@@ -112,6 +112,10 @@ type ServerConfig struct {
 	// legacy accept-all behavior.
 	Auth *AuthConfig `yaml:"auth,omitempty"`
 
+	// Exec bounds the HTTPS exec endpoint. Default (nil) applies the
+	// defaults below.
+	Exec *ExecConfig `yaml:"exec,omitempty"`
+
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
 }
@@ -209,6 +213,59 @@ func (c *ServerConfig) TokenTTL() time.Duration {
 		return c.Auth.TokenTTL.Duration()
 	}
 	return DefaultTokenTTL
+}
+
+// Exec endpoint defaults (exec.* in server.yaml).
+const (
+	DefaultExecMaxStdinBytes        int64 = 1 << 20
+	DefaultExecMaxTimeout                 = time.Hour
+	DefaultExecMaxConcurrentPerShed       = 8
+	// minExecMaxTimeout is the smallest exec.max_timeout accepted.
+	minExecMaxTimeout = time.Second
+)
+
+// ExecMaxStdinBytes is exec.max_stdin_bytes, or its default when unset.
+func (c *ServerConfig) ExecMaxStdinBytes() int64 {
+	if c.Exec != nil && c.Exec.MaxStdinBytes > 0 {
+		return c.Exec.MaxStdinBytes
+	}
+	return DefaultExecMaxStdinBytes
+}
+
+// ExecMaxTimeout is exec.max_timeout, or its default when unset.
+func (c *ServerConfig) ExecMaxTimeout() time.Duration {
+	if c.Exec != nil && c.Exec.MaxTimeout > 0 {
+		return c.Exec.MaxTimeout.Duration()
+	}
+	return DefaultExecMaxTimeout
+}
+
+// ExecMaxConcurrentPerShed is exec.max_concurrent_per_shed, or its default
+// when unset.
+func (c *ServerConfig) ExecMaxConcurrentPerShed() int {
+	if c.Exec != nil && c.Exec.MaxConcurrentPerShed > 0 {
+		return c.Exec.MaxConcurrentPerShed
+	}
+	return DefaultExecMaxConcurrentPerShed
+}
+
+// validateExec checks the optional exec block: no negative values, and a set
+// max_timeout of at least one second. Zero means "use the default". Shared by
+// Validate and ValidateNoHostCoupling.
+func (c *ServerConfig) validateExec() error {
+	if c.Exec == nil {
+		return nil
+	}
+	if c.Exec.MaxStdinBytes < 0 {
+		return fmt.Errorf("invalid exec.max_stdin_bytes: %d (must be positive)", c.Exec.MaxStdinBytes)
+	}
+	if c.Exec.MaxConcurrentPerShed < 0 {
+		return fmt.Errorf("invalid exec.max_concurrent_per_shed: %d (must be positive)", c.Exec.MaxConcurrentPerShed)
+	}
+	if d := c.Exec.MaxTimeout.Duration(); d < 0 || (d > 0 && d < minExecMaxTimeout) {
+		return fmt.Errorf("invalid exec.max_timeout: %s (must be at least %s)", d, minExecMaxTimeout)
+	}
+	return nil
 }
 
 // validateAuth checks the optional auth config. Shared by Validate and
@@ -1842,6 +1899,9 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if err := c.validateStateDir(); err != nil {
 		return err
 	}
+	if err := c.validateExec(); err != nil {
+		return err
+	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[c.LogLevel] {
@@ -1920,6 +1980,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := c.validateStateDir(); err != nil {
+		return err
+	}
+	if err := c.validateExec(); err != nil {
 		return err
 	}
 
