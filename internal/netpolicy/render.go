@@ -102,6 +102,32 @@ func ipv4(s, what string) (string, error) {
 	return ip.To4().String(), nil
 }
 
+// uncoveredNets returns nets, in order, without each entry another one covers
+// (a duplicate keeps its first occurrence). Two CIDRs are either nested or
+// disjoint, so what is left has no overlap: nft refuses overlapping elements
+// in an interval set without auto-merge ("conflicting intervals"), and
+// allow_cidrs may list 10.0.0.0/8 beside 10.20.0.0/16.
+func uncoveredNets(nets []*net.IPNet) []*net.IPNet {
+	var out []*net.IPNet
+	for i, n := range nets {
+		nOnes, _ := n.Mask.Size()
+		covered := false
+		for j, o := range nets {
+			if i == j || !o.Contains(n.IP) {
+				continue
+			}
+			if oOnes, _ := o.Mask.Size(); oOnes < nOnes || (oOnes == nOnes && j < i) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // guardedSheds validates and returns the guarded sheds, sorted by name.
 func guardedSheds(sheds []Shed) ([]Shed, error) {
 	var out []Shed
@@ -148,12 +174,16 @@ func Render(cfg Config, sheds []Shed) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var allow []string
+	var allowNets []*net.IPNet
 	for _, c := range cfg.AllowCIDRs {
 		ip, n, err := net.ParseCIDR(strings.TrimSpace(c))
 		if err != nil || ip.To4() == nil {
 			return "", fmt.Errorf("netpolicy: allow_cidrs entry %q is not an IPv4 CIDR", c)
 		}
+		allowNets = append(allowNets, n)
+	}
+	var allow []string
+	for _, n := range uncoveredNets(allowNets) {
 		allow = append(allow, n.String())
 	}
 	guarded, err := guardedSheds(sheds)

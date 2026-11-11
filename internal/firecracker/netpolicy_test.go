@@ -459,6 +459,47 @@ func TestNetpolRestartRestoresDownTAPs(t *testing.T) {
 	}
 }
 
+// A raise that fails (other than for a TAP that does not exist) keeps the
+// cut-off pending, so the next check retries it instead of treating the TAPs
+// as restored.
+func TestNetpolFailedRaiseIsRetried(t *testing.T) {
+	c, cfg := newP9TeardownClient(t)
+	f, _ := withFakeNetpol(c, netpolicy.Open)
+	f.applyErr = errors.New("exit status 1")
+	writeNetInstance(t, cfg.InstanceDir, "iso", config.StatusRunning, "isolated", 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.StartNetworkPolicy(ctx) // apply fails: the TAP goes down
+
+	var links []string
+	raiseErr := errors.New("netlink: resource busy")
+	c.setLinkState = func(name string, up bool) error {
+		state := "down"
+		if up {
+			state = "up"
+		}
+		links = append(links, name+" "+state)
+		if up {
+			return raiseErr
+		}
+		return nil
+	}
+	f.applyErr = nil
+	c.checkNetworkPolicy(ctx) // tables apply; the raise fails
+	if got := strings.Join(links, ","); got != "fc-tap-0 up" {
+		t.Fatalf("links = %q, want one raise", got)
+	}
+	raiseErr = nil
+	c.checkNetworkPolicy(ctx) // tables in place; the raise is retried
+	if got := strings.Join(links, ","); got != "fc-tap-0 up,fc-tap-0 up" {
+		t.Fatalf("links = %q, want the failed raise retried", got)
+	}
+	c.checkNetworkPolicy(ctx) // restored: nothing more
+	if len(links) != 2 {
+		t.Errorf("links = %v, want no change after the raise succeeded", links)
+	}
+}
+
 func TestNetpolLoopStopsWithContext(t *testing.T) {
 	c := &Client{}
 	withFakeNetpol(c, netpolicy.Open)

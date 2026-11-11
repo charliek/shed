@@ -98,6 +98,12 @@ func (c *Client) networkPolicySheds() []netpolicy.Shed {
 	for _, name := range names {
 		meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 		if err != nil {
+			if !errors.Is(err, ErrInstanceNotFound) {
+				// Its TAP and profile are unknown, so it gets no entry: if
+				// it is a running isolated shed, it is unguarded until its
+				// metadata is readable and the server restarts.
+				log.Printf("ERROR: network policy: cannot read shed %q's metadata (%v); it has no network-policy entry", name, err)
+			}
 			continue
 		}
 		p, err := netpolicy.Parse(meta.NetworkProfile)
@@ -195,17 +201,23 @@ func (c *Client) checkNetworkPolicy(ctx context.Context) {
 	}
 }
 
-// setGuardedTAPs sets every guarded shed's TAP up or down.
+// setGuardedTAPs sets every guarded shed's TAP up or down. It walks the
+// Manager's entries under its lock (EachGuarded), so a shed deleted meanwhile
+// cannot have its TAP name reused by another shed before the link change.
+// tapsDown stays set after a raise that failed for any TAP (other than one
+// that does not exist), so the next check retries it.
 func (c *Client) setGuardedTAPs(up bool) {
-	c.netpolSt.mu.Lock()
-	c.netpolSt.tapsDown = !up
-	c.netpolSt.mu.Unlock()
-	for _, s := range c.netpol.Guarded() {
+	failed := false
+	c.netpol.EachGuarded(func(s netpolicy.Shed) {
 		var notFound netlink.LinkNotFoundError
 		if err := c.linkState(s.TAP, up); err != nil && !errors.As(err, &notFound) {
 			log.Printf("Warning: network policy: set %s (shed %s) up=%v: %v", s.TAP, s.Name, up, err)
+			failed = true
 		}
-	}
+	})
+	c.netpolSt.mu.Lock()
+	c.netpolSt.tapsDown = !up || failed
+	c.netpolSt.mu.Unlock()
 }
 
 // linkState sets an interface up or down (netlink; replaced in tests).

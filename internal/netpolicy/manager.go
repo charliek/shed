@@ -141,6 +141,26 @@ func (m *Manager) Guarded() []Shed {
 	return out
 }
 
+// EachGuarded calls fn for each guarded shed in the desired state, sorted by
+// name, holding the Manager's lock for the whole walk: no entry can be removed
+// (and so, since a delete removes the entry before it deletes the TAP, no
+// guarded shed's TAP can be deleted and its name reused) while fn acts on it.
+// fn must not call the Manager.
+func (m *Manager) EachGuarded(fn func(Shed)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	names := make([]string, 0, len(m.sheds))
+	for name := range m.sheds {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		s := m.sheds[name]
+		s.P9Ports = slices.Clone(s.P9Ports)
+		fn(s)
+	}
+}
+
 // Upsert sets a shed's entry (all of it, ports included) and applies. An open
 // shed is removed instead.
 func (m *Manager) Upsert(ctx context.Context, s Shed) error {

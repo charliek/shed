@@ -62,6 +62,30 @@ func TestRenderGoldens(t *testing.T) {
 	}
 }
 
+// Nested and duplicate allow_cidrs render as the outermost ranges only, so
+// the interval set has no overlapping elements (nft refuses those without
+// auto-merge), and the script equals the one for the non-overlapping list.
+func TestRenderDropsCoveredAllowCIDRs(t *testing.T) {
+	overlapping := testConfig()
+	overlapping.AllowCIDRs = []string{"10.20.0.0/16", "192.168.77.5/24", "10.0.0.0/8", "10.20.30.0/24", "192.168.77.0/24", "10.0.0.0/8"}
+	got, err := Render(overlapping, mixedSheds())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "elements = { 192.168.77.0/24, 10.0.0.0/8 }") {
+		t.Errorf("allow4 should hold only 192.168.77.0/24 and 10.0.0.0/8:\n%s", got)
+	}
+	plain := testConfig()
+	plain.AllowCIDRs = []string{"192.168.77.0/24", "10.0.0.0/8"}
+	want, err := Render(plain, mixedSheds())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Error("overlapping allow_cidrs render differently from their outermost ranges")
+	}
+}
+
 // The order of the input never changes the script, so an unchanged state
 // renders the same bytes.
 func TestRenderDeterministic(t *testing.T) {

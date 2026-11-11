@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/config"
 )
@@ -228,6 +229,43 @@ func TestManagerMissingNFT(t *testing.T) {
 	}
 	if _, err := m2.Present(ctx); err == nil {
 		t.Error("Present without nft should be an error")
+	}
+}
+
+// EachGuarded walks the entries in name order and holds the lock while fn
+// runs, so a Remove (a delete, which removes the entry before the TAP) waits
+// for the walk: the TAP fn acts on cannot be deleted and reused meanwhile.
+func TestManagerEachGuardedHoldsTheLock(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(testConfig(), &fakeRunner{}, Open)
+	for _, s := range []Shed{guarded("b", "shed-tap-1", "172.30.0.3"), guarded("a", "shed-tap-0", "172.30.0.2")} {
+		if err := m.Upsert(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed := make(chan struct{})
+	var seen []string
+	m.EachGuarded(func(s Shed) {
+		seen = append(seen, s.Name+"="+s.TAP)
+		if s.Name != "a" {
+			return
+		}
+		go func() {
+			_ = m.Remove(ctx, "a")
+			close(removed)
+		}()
+		select {
+		case <-removed:
+			t.Error("Remove finished while EachGuarded was acting on the entry")
+		case <-time.After(50 * time.Millisecond):
+		}
+	})
+	<-removed
+	if got := strings.Join(seen, ","); got != "a=shed-tap-0,b=shed-tap-1" {
+		t.Errorf("walk = %q, want both entries in name order", got)
+	}
+	if m.IsGuarded("a") {
+		t.Error("a is still guarded after Remove")
 	}
 }
 
