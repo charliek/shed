@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"time"
 )
 
@@ -336,6 +337,20 @@ type ServerInfo struct {
 	// is mirrored in the GET /api/overview server block. The token list is owned
 	// by internal/api (serverFeatures); older clients decode it as an empty slice.
 	Features []string `json:"features,omitempty"`
+}
+
+// FeatureMountSelection is the /api/info feature token for the create
+// request's "mounts" field. internal/api advertises it (api.FeatureMountSelection
+// is this constant); the CLI refuses to send --mounts to a server without it,
+// since an older server would ignore the field and mount everything.
+const FeatureMountSelection = "mount_selection"
+
+// HasFeature reports whether the server advertises the feature token f.
+func (i *ServerInfo) HasFeature(f string) bool {
+	if i == nil {
+		return false
+	}
+	return slices.Contains(i.Features, f)
 }
 
 // SSHHostKeyResponse is returned by GET /api/ssh-host-key.
@@ -931,6 +946,21 @@ type ExecConfig struct {
 	// (default 8); one more is refused with 429 EXEC_LIMIT.
 	MaxConcurrentPerShed int `yaml:"max_concurrent_per_shed,omitempty"`
 }
+
+// AuditConfig turns on and shapes shed-server's audit log (<state>/audit.jsonl).
+// The log is on whenever auth.clients is set, whatever Enabled says.
+type AuditConfig struct {
+	// Enabled turns the audit log on for a server with no service clients
+	// (it then records HTTPS execs; admin API requests are never logged).
+	Enabled bool `yaml:"enabled,omitempty"`
+	// ExecArgv is "" (the default: an exec.end line records argv[0] and the
+	// argument count) or "full" (the whole argv, which may carry prompts or
+	// secrets).
+	ExecArgv string `yaml:"exec_argv,omitempty"`
+}
+
+// AuditExecArgvFull is audit.exec_argv's one non-default value.
+const AuditExecArgvFull = "full"
 
 // ExecRequest is the body of POST /api/sheds/{name}/exec. Argv runs as given
 // (no shell wrap) as the shed user; a caller who wants a login shell passes

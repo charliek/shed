@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -48,6 +49,13 @@ type Server struct {
 	// with the sheds it owns.
 	clientMu      sync.Mutex
 	clientCreates map[string]map[string]int
+
+	// audit is the audit log (nil: off). See audit.go.
+	audit *audit.Log
+
+	// reapSkipped records the owned sheds the reaper has already logged as
+	// left alone (owner no longer configured), so each is logged once.
+	reapSkipped map[string]bool
 
 	// execMu guards execInFlight, the count of HTTPS execs running per shed
 	// (exec.max_concurrent_per_shed). The map is created on first use.

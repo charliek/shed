@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/api"
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -408,8 +409,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// The audit log (service client requests, HTTPS execs, max_age reaps),
+	// next to the egress audit log in the backend's state directory. On when
+	// auth.clients is set or audit.enabled; a server that needs it and can't
+	// open it does not start.
+	var auditLog *audit.Log
+	if cfg.AuditEnabled() {
+		auditPath := filepath.Join(egressStateDir, audit.FileName)
+		auditLog, err = audit.Open(auditPath, audit.DefaultMaxBytes, audit.DefaultKeep)
+		if err != nil {
+			return fmt.Errorf("audit: open %s: %w", auditPath, err)
+		}
+		defer func() { _ = auditLog.Close() }()
+		log.Printf("Audit log: %s", auditPath)
+	}
+
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
+	apiServer.SetAuditLog(auditLog)               // nil-safe: records nothing when audit is off
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
 	apiServer.SetTokenStore(tokenStore)           // shared with the SSH bootstrap handler (1c)
@@ -511,6 +528,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 			errChan <- fmt.Errorf("SSH server error: %w", err)
 		}
 	}()
+
+	// The max_age reaper: the only server-side lifetime bound on a service
+	// client's sheds. It runs only when clients are configured, and stops at
+	// shutdown (a delete in progress finishes; see RunReaper).
+	if cfg.ServiceClientsEnabled() {
+		reapCtx, cancelReap := context.WithCancel(context.Background())
+		defer cancelReap()
+		log.Printf("Starting the max_age reaper (every %s)", api.DefaultReapInterval)
+		go apiServer.RunReaper(reapCtx, api.DefaultReapInterval, time.Now)
+	}
 
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)

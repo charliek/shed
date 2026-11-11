@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/servertls"
 )
@@ -136,14 +137,23 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 		// A service certificate (auth.clients) is decided here and never
 		// reaches the SSH allowlist; a malformed one, or one for a client that
 		// is not configured, is refused rather than treated as a user's.
+		//
+		// Every service-certificate request, refused ones included, gets one
+		// api line in the audit log.
 		if name, isService, err := servertls.ServiceClientName(leaf); isService {
-			cc, known := s.cfg.ServiceClient(name)
-			if err != nil || !known {
-				closeIdentityBoundConnection(w, r)
-				writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is not authorized")
-				return
+			id := audit.Identity{Kind: audit.KindClient, Name: name, Serial: certSerial(leaf)}
+			if err != nil {
+				id.Name = leaf.Subject.CommonName
 			}
-			s.serveServiceClient(w, r, next, name, cc, leaf)
+			s.auditClientRequest(w, r, id, func(w http.ResponseWriter, r *http.Request) {
+				cc, known := s.cfg.ServiceClient(name)
+				if err != nil || !known {
+					closeIdentityBoundConnection(w, r)
+					writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is not authorized")
+					return
+				}
+				s.serveServiceClient(w, r, next, name, cc, leaf)
+			})
 			return
 		}
 		if !s.certSubjectAuthorized(leaf.Subject.CommonName) {
@@ -155,12 +165,17 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "FORBIDDEN", detail)
 			return
 		}
-		caller := Caller{Kind: CallerAdmin, Name: leaf.Subject.CommonName}
-		if leaf.SerialNumber != nil {
-			caller.Serial = strings.ToLower(leaf.SerialNumber.Text(16))
-		}
+		caller := Caller{Kind: CallerAdmin, Name: leaf.Subject.CommonName, Serial: certSerial(leaf)}
 		next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), caller)))
 	})
+}
+
+// certSerial is a certificate's serial as lowercase hex ("" when it has none).
+func certSerial(leaf *x509.Certificate) string {
+	if leaf.SerialNumber == nil {
+		return ""
+	}
+	return strings.ToLower(leaf.SerialNumber.Text(16))
 }
 
 // closeIdentityBoundConnection marks the response so the server tears the

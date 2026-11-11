@@ -19,7 +19,7 @@ const (
 	// FeatureMountSelection signals the create request's "mounts" field
 	// (and the stored selection on every shed). An older server ignores the
 	// field, so a client must not send it without this token.
-	FeatureMountSelection = "mount_selection"
+	FeatureMountSelection = config.FeatureMountSelection
 	// FeatureServiceClients signals that this server has service clients
 	// configured (mtls mode with auth.clients): owned sheds, the client
 	// route allowlist and the create policy.

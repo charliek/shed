@@ -117,6 +117,10 @@ type ServerConfig struct {
 	// defaults below.
 	Exec *ExecConfig `yaml:"exec,omitempty"`
 
+	// Audit configures the audit log. Default (nil) leaves it off unless
+	// auth.clients is set.
+	Audit *AuditConfig `yaml:"audit,omitempty"`
+
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
 }
@@ -267,6 +271,35 @@ func (c *ServerConfig) validateExec() error {
 		return fmt.Errorf("invalid exec.max_timeout: %s (must be at least %s)", d, minExecMaxTimeout)
 	}
 	return nil
+}
+
+// AuditEnabled reports whether the audit log is on: auth.clients is set, or
+// audit.enabled is true.
+func (c *ServerConfig) AuditEnabled() bool {
+	if c.Auth != nil && len(c.Auth.Clients) > 0 {
+		return true
+	}
+	return c.Audit != nil && c.Audit.Enabled
+}
+
+// AuditExecArgvFull reports whether exec.end lines record the whole argv
+// (audit.exec_argv: full) rather than argv[0] and the count.
+func (c *ServerConfig) AuditExecArgvFull() bool {
+	return c.Audit != nil && c.Audit.ExecArgv == AuditExecArgvFull
+}
+
+// validateAudit checks the optional audit block. Shared by Validate and
+// ValidateNoHostCoupling.
+func (c *ServerConfig) validateAudit() error {
+	if c.Audit == nil {
+		return nil
+	}
+	switch c.Audit.ExecArgv {
+	case "", AuditExecArgvFull:
+		return nil
+	default:
+		return fmt.Errorf("invalid audit.exec_argv: %q (must be empty or %q)", c.Audit.ExecArgv, AuditExecArgvFull)
+	}
 }
 
 // validateAuth checks the optional auth config. Shared by Validate and
@@ -2052,6 +2085,9 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if err := c.validateExec(); err != nil {
 		return err
 	}
+	if err := c.validateAudit(); err != nil {
+		return err
+	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[c.LogLevel] {
@@ -2133,6 +2169,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := c.validateExec(); err != nil {
+		return err
+	}
+	if err := c.validateAudit(); err != nil {
 		return err
 	}
 

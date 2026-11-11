@@ -96,6 +96,8 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidShedName, "invalid request body: "+err.Error())
 		return
 	}
+	// A service client's api audit line names the shed it asked to create.
+	setAuditShed(r.Context(), req.Name)
 
 	// Validate shed name
 	if req.Name == "" {

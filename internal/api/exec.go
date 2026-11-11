@@ -148,6 +148,15 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 	// short a write the output path is blocked in while holding the stream.
 	stream.boundWrites(time.Now().Add(execFinishWriteGrace))
 
+	// Every exec that reached the backend gets one exec.end audit line,
+	// however it ended (exit_code -1 when there is no exit status).
+	end := s.newExecEndEvent(r, name, plan.argv)
+	defer func() {
+		end.Truncated = stream.wasTruncated()
+		end.DurationMS = time.Since(start).Milliseconds()
+		s.recordAudit(end)
+	}()
+
 	exit := config.ExecExitFrame{T: config.ExecFrameExit}
 	var exitErr *vmutil.ExitError
 	switch {
@@ -157,9 +166,11 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 	case r.Context().Err() != nil:
 		// The client went away: nobody is left to read an exit frame.
 		stream.abandon()
+		end.Disconnected = true
 		log.Printf("exec %s: client disconnected after %s; command cancelled", name, time.Since(start).Round(time.Millisecond))
 		return
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		end.TimedOut = true
 		if stream.refuseIfNotStarted() {
 			writeError(w, http.StatusGatewayTimeout, config.ErrBackendError,
 				fmt.Sprintf("exec in %s did not start within its %s timeout", name, plan.timeout))
@@ -184,6 +195,7 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	exit.DurationMS = time.Since(start).Milliseconds()
+	end.ExitCode = exit.Code
 	stream.finish(exit)
 }
 
@@ -434,6 +446,13 @@ func (s *execStream) finish(exit config.ExecExitFrame) {
 	exit.Truncated = s.truncated
 	_ = s.writeFrameLocked(exit)
 	s.closed = true
+}
+
+// wasTruncated reports whether output went past the budget.
+func (s *execStream) wasTruncated() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.truncated
 }
 
 // boundWrites sets a write deadline on the response. It deliberately takes no

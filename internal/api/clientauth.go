@@ -73,7 +73,17 @@ func (s *Server) serveServiceClient(w http.ResponseWriter, r *http.Request, next
 	if s.mux != nil {
 		pattern = s.mux.Find(rctx, r.Method, routePath(r))
 	}
-	if pattern == "" || !clientAllowedRoutes[r.Method+" "+normalizeRoutePattern(pattern)] {
+	route := ""
+	if pattern != "" {
+		route = normalizeRoutePattern(pattern)
+	}
+	if e := auditEntryFrom(r.Context()); e != nil {
+		e.route = route
+		if strings.Contains(pattern, "{name}") {
+			e.shed = rctx.URLParam("name")
+		}
+	}
+	if pattern == "" || !clientAllowedRoutes[r.Method+" "+route] {
 		writeError(w, http.StatusForbidden, config.ErrForbidden, "route not available to service clients")
 		return
 	}
@@ -98,10 +108,7 @@ func (s *Server) serveServiceClient(w http.ResponseWriter, r *http.Request, next
 			return
 		}
 	}
-	caller := Caller{Kind: CallerClient, Name: name, Client: cc}
-	if leaf.SerialNumber != nil {
-		caller.Serial = strings.ToLower(leaf.SerialNumber.Text(16))
-	}
+	caller := Caller{Kind: CallerClient, Name: name, Client: cc, Serial: certSerial(leaf)}
 	next.ServeHTTP(w, r.WithContext(withCaller(ctx, caller)))
 }
 

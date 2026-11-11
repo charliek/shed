@@ -15,7 +15,9 @@ What it shows, live: a client creates and execs in its own shed, which has no
 9P mounts before or after stop/start (an admin shed created by the CLI next to
 it does, as the positive control); it cannot see or touch the admin's shed;
 policy and route refusals are 403; the admin sees the client's shed with its
-owner and can exec in it. An admin create with `"mounts": []` also boots with
+owner and can exec in it; the dev server's audit log (read with `sudo cat`)
+has the client's api lines and an exec.end line with argv[0] and the count,
+never the arguments. An admin create with `"mounts": []` also boots with
 no 9P mounts, before and after stop/start.
 
 Run: `make build && make dev-server-restart-fc SHED_DEV_AUTH_MODE=mtls &&
@@ -55,6 +57,9 @@ DEV_CONFIG = os.environ.get("SHED_FC_DEV_CONFIG", "/tmp/shed-server-dev.yaml")
 CLIENT = "itest"
 PREFIX = "itest-svc-"
 CREATE_TIMEOUT = 300
+# The audit log sits in the FC backend's state dir, the parent of the dev
+# config's instance_dir (/var/lib/shed-dev/firecracker/instances).
+AUDIT_LOG = os.environ.get("SHED_FC_DEV_AUDIT_LOG", "/var/lib/shed-dev/firecracker/audit.jsonl")
 
 
 class Pinned:
@@ -248,6 +253,50 @@ def test_admin_sees_owner_and_can_exec(admin, client_shed):
     assert mine and mine[0]["owner"] == CLIENT
     status, out, code, _ = admin.exec(name, ["echo", "admin-here"])
     assert (status, code, out) == (200, 0, b"admin-here\n")
+
+
+def read_audit(fc_server_dev) -> tuple[str, list[dict]]:
+    r = fc_server_dev.ssh_run(f"sudo -n cat {AUDIT_LOG}", timeout=30)
+    assert r.returncode == 0, f"reading {AUDIT_LOG} failed: {r.stderr}"
+    return r.stdout, [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+
+
+def test_audit_log_records_client_requests_and_execs(svc, admin, bundle, client_shed, fc_server_dev):
+    name, _ = client_shed
+    secret = f"audit-secret-{uuid.uuid4().hex}"
+    status, out, code, _ = svc.exec(name, ["echo", secret])
+    assert (status, code, out) == (200, 0, f"{secret}\n".encode())
+    bogus = f"/api/no-such-route-{uuid.uuid4().hex[:8]}"
+    status, body = svc.request("GET", bogus)
+    assert (status, error_code(body)) == (403, "FORBIDDEN")
+    # An admin request, which must not be logged.
+    status, _ = admin.request("GET", "/api/sheds")
+    assert status == 200
+
+    raw, lines = read_audit(fc_server_dev)
+    assert secret not in raw, "the exec's arguments reached the audit log (exec_argv is not full)"
+
+    serial = bundle["cert_serial"]
+    api = [l for l in lines if l.get("event") == "api"]
+    assert api and all(l["identity"]["kind"] == "client" for l in api), "admin requests must not be logged"
+    mine = [l for l in api if l["identity"].get("name") == CLIENT and l["identity"].get("serial") == serial]
+    exec_lines = [l for l in mine if l["route"] == "/api/sheds/{name}/exec" and l["shed"] == name and l["method"] == "POST"]
+    assert exec_lines and exec_lines[-1]["status"] == 200, exec_lines
+    refused = [l for l in mine if l["path"] == bogus]
+    assert len(refused) == 1 and refused[0]["status"] == 403 and refused[0]["route"] == "", refused
+    for l in mine:
+        assert {"ts", "request_id", "remote", "duration_ms"} <= set(l), l
+
+    ends = [
+        l for l in lines
+        if l.get("event") == "exec.end" and l["shed"] == name
+        and l["identity"].get("kind") == "client" and l["identity"].get("serial") == serial
+    ]
+    echo = [e for e in ends if e.get("argv0") == "echo"]
+    assert echo, ends
+    e = echo[-1]
+    assert e["argc"] == 2 and "argv" not in e, e
+    assert e["exit_code"] == 0 and e["timed_out"] is False and e["disconnected"] is False, e
 
 
 def test_client_stop_start_keeps_no_mounts(svc, client_shed):
