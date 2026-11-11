@@ -129,23 +129,29 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 		leaf := r.TLS.PeerCertificates[0]
 
 		now := time.Now()
-		if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+		valid := !now.Before(leaf.NotBefore) && !now.After(leaf.NotAfter)
+		refuseInvalid := func(w http.ResponseWriter, r *http.Request) {
 			closeIdentityBoundConnection(w, r)
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is expired or not yet valid")
-			return
 		}
 		// A service certificate (auth.clients) is decided here and never
 		// reaches the SSH allowlist; a malformed one, or one for a client that
 		// is not configured, is refused rather than treated as a user's.
 		//
 		// Every service-certificate request, refused ones included, gets one
-		// api line in the audit log.
+		// api line in the audit log: the certificate is classified first, and
+		// its validity is checked inside the audit wrapper (an expired one
+		// reaches here over a connection that opened while it was valid).
 		if name, isService, err := servertls.ServiceClientName(leaf); isService {
 			id := audit.Identity{Kind: audit.KindClient, Name: name, Serial: certSerial(leaf)}
 			if err != nil {
 				id.Name = leaf.Subject.CommonName
 			}
 			s.auditClientRequest(w, r, id, func(w http.ResponseWriter, r *http.Request) {
+				if !valid {
+					refuseInvalid(w, r)
+					return
+				}
 				cc, known := s.cfg.ServiceClient(name)
 				if err != nil || !known {
 					closeIdentityBoundConnection(w, r)
@@ -154,6 +160,10 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 				}
 				s.serveServiceClient(w, r, next, name, cc, leaf)
 			})
+			return
+		}
+		if !valid {
+			refuseInvalid(w, r)
 			return
 		}
 		if !s.certSubjectAuthorized(leaf.Subject.CommonName) {

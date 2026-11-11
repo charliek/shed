@@ -180,3 +180,107 @@ func TestRunReaperUsesClockAndStops(t *testing.T) {
 		t.Errorf("want one delete, got %v", b.callsSnapshot())
 	}
 }
+
+// TestReaperLeavesARecreatedShed: the reaper requires the creation time its
+// listing saw, so a shed deleted and recreated under the same name by its own
+// client (the owner still matches) after the listing, before the stop or
+// between the stop and the delete, is a new, young shed and is left alone,
+// with no reap recorded.
+func TestReaperLeavesARecreatedShed(t *testing.T) {
+	now := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	old := config.Shed{Name: "nocturn-x", Status: config.StatusRunning, Owner: testClientName, CreatedAt: now.Add(-100 * time.Hour)}
+	young := config.Shed{Name: "nocturn-x", Status: config.StatusRunning, Owner: testClientName, CreatedAt: now.Add(-time.Minute)}
+
+	for _, tc := range []struct {
+		name      string
+		replaceAt int // the backend call (1: stop, 2: delete) the recreate lands before
+		wantCalls []string
+	}{
+		{"before the stop", 1, nil},
+		{"between the stop and the delete", 2, []string{"stop nocturn-x"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &reaperBackend{clientFakeBackend: newClientFakeBackend(old)}
+			n := 0
+			b.onLock = func() {
+				n++
+				if n == tc.replaceAt {
+					b.mu.Lock()
+					b.sheds[young.Name] = young
+					b.mu.Unlock()
+				}
+			}
+			s, _ := clientTestServer(t, b, defaultTestPolicy())
+			path := attachTestAudit(t, s)
+
+			s.reapOnce(context.Background(), now)
+
+			if got := b.callsSnapshot(); !slices.Equal(got, tc.wantCalls) {
+				t.Errorf("calls = %v, want %v", got, tc.wantCalls)
+			}
+			left, _ := b.ListSheds(context.Background())
+			if len(left) != 1 || !left[0].CreatedAt.Equal(young.CreatedAt) {
+				t.Errorf("the recreated shed was not left alone: %v", left)
+			}
+			if _, _, other := auditLines(t, path); len(other) != 0 {
+				t.Errorf("recorded a reap that did not happen: %v", other)
+			}
+		})
+	}
+}
+
+// gatedDeleteBackend blocks DeleteShed until release is closed, signalling
+// entered when it starts.
+type gatedDeleteBackend struct {
+	*clientFakeBackend
+	entered, release chan struct{}
+}
+
+func (b *gatedDeleteBackend) DeleteShed(ctx context.Context, name string) error {
+	close(b.entered)
+	<-b.release
+	return b.clientFakeBackend.DeleteShed(ctx, name)
+}
+
+// TestStartReaperStopWaitsForAReapInProgress: stop (shed-server's shutdown)
+// ends the reaper's scheduling but waits for a delete that has begun, so it
+// finishes and is recorded before the audit log and the backend close.
+func TestStartReaperStopWaitsForAReapInProgress(t *testing.T) {
+	b := &gatedDeleteBackend{
+		clientFakeBackend: newClientFakeBackend(config.Shed{Name: "nocturn-x", Status: config.StatusStopped, Owner: testClientName, CreatedAt: time.Now().Add(-100 * time.Hour)}),
+		entered:           make(chan struct{}),
+		release:           make(chan struct{}),
+	}
+	s, _ := clientTestServer(t, b, defaultTestPolicy())
+	path := attachTestAudit(t, s)
+
+	stop := s.StartReaper(time.Hour, time.Now)
+	select {
+	case <-b.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reaper never began the delete")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("stop returned while a delete was in progress")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(b.release)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop did not return after the delete finished")
+	}
+	if got := b.callsSnapshot(); !slices.Equal(got, []string{"delete nocturn-x"}) {
+		t.Errorf("calls = %v", got)
+	}
+	if _, _, other := auditLines(t, path); len(other) != 1 || other[0]["shed"] != "nocturn-x" {
+		t.Errorf("reap lines = %v", other)
+	}
+	stop() // idempotent
+}

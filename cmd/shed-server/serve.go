@@ -530,14 +530,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}()
 
 	// The max_age reaper: the only server-side lifetime bound on a service
-	// client's sheds. It runs only when clients are configured, and stops at
-	// shutdown (a delete in progress finishes; see RunReaper).
+	// client's sheds. It runs only when clients are configured. stopReaper
+	// ends it and waits for a stop or delete in progress to finish: it runs
+	// first thing at shutdown, and (deferred, for an error return) before the
+	// audit log and the backend, deferred earlier, close.
+	stopReaper := func() {}
 	if cfg.ServiceClientsEnabled() {
-		reapCtx, cancelReap := context.WithCancel(context.Background())
-		defer cancelReap()
 		log.Printf("Starting the max_age reaper (every %s)", api.DefaultReapInterval)
-		go apiServer.RunReaper(reapCtx, api.DefaultReapInterval, time.Now)
+		stopReaper = apiServer.StartReaper(api.DefaultReapInterval, time.Now)
 	}
+	defer stopReaper()
 
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -554,7 +556,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Graceful shutdown
+	// Graceful shutdown. The reaper first: a reap that has begun finishes
+	// (an expired shed is not left half torn down, nor its reap unrecorded).
+	if cfg.ServiceClientsEnabled() {
+		log.Printf("Stopping the max_age reaper...")
+	}
+	stopReaper()
+
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 

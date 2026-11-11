@@ -136,8 +136,8 @@ func (b *clientFakeBackend) GetShed(ctx context.Context, name string) (*config.S
 }
 
 // beforeLocked runs b.onLock (the window where a real backend waits for its
-// per-shed lock) and then checks a required owner against the shed as it is
-// now, as the real backends do once they hold the lock.
+// per-shed lock) and then checks a required owner and creation time against
+// the shed as it is now, as the real backends do once they hold the lock.
 func (b *clientFakeBackend) beforeLocked(ctx context.Context, name string) error {
 	b.mu.Lock()
 	hook := b.onLock
@@ -148,7 +148,10 @@ func (b *clientFakeBackend) beforeLocked(ctx context.Context, name string) error
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if s, ok := b.sheds[name]; ok {
-		return backend.CheckOwner(ctx, name, s.Owner)
+		if err := backend.CheckOwner(ctx, name, s.Owner); err != nil {
+			return err
+		}
+		return backend.CheckCreatedAt(ctx, name, s.CreatedAt)
 	}
 	return nil
 }

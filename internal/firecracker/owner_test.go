@@ -8,6 +8,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -56,6 +57,42 @@ func TestRequiredOwnerIsCheckedAgainstTheLoadedShed(t *testing.T) {
 	}
 	if err := c.DeleteShed(ctx, "nocturn-a"); err != nil {
 		t.Errorf("DeleteShed on the client's own shed = %v", err)
+	}
+}
+
+// TestRequiredCreatedAtRefusesARecreatedShed: the max_age reaper requires
+// the creation time its listing saw as well as the owner. A shed the same
+// client deleted and recreated under the name since (so the owner still
+// matches) is a different, young shed: stop and delete refuse it and leave
+// it alone, while the listed incarnation passes.
+func TestRequiredCreatedAtRefusesARecreatedShed(t *testing.T) {
+	c, cfg := newP9TeardownClient(t)
+	writeResumeInstance(t, cfg.InstanceDir, "nocturn-a", config.StatusStopped, 0)
+	meta, err := LoadMetadata(cfg.InstanceDir, "nocturn-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Owner = "nocturn"
+	meta.CreatedAt = time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	if err := meta.Save(cfg.InstanceDir); err != nil {
+		t.Fatal(err)
+	}
+	listed := meta.CreatedAt.Add(-48 * time.Hour) // the expired incarnation
+	ctx := backend.WithRequiredCreatedAt(backend.WithRequiredOwner(context.Background(), "nocturn"), listed)
+
+	if _, err := c.StopShed(ctx, "nocturn-a"); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Errorf("StopShed on a recreated shed = %v, want not found", err)
+	}
+	if err := c.DeleteShed(ctx, "nocturn-a"); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Errorf("DeleteShed on a recreated shed = %v, want not found", err)
+	}
+	if _, err := LoadMetadata(cfg.InstanceDir, "nocturn-a"); err != nil {
+		t.Fatalf("the recreated shed was removed: %v", err)
+	}
+
+	same := backend.WithRequiredCreatedAt(backend.WithRequiredOwner(context.Background(), "nocturn"), meta.CreatedAt)
+	if err := c.DeleteShed(same, "nocturn-a"); err != nil {
+		t.Errorf("DeleteShed on the listed incarnation = %v", err)
 	}
 }
 

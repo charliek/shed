@@ -848,6 +848,9 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
 		return err
 	}
+	if err := backend.CheckCreatedAt(ctx, name, meta.CreatedAt); err != nil {
+		return err
+	}
 
 	if meta.Status == config.StatusRunning {
 		backend.Status(ctx, "Terminating virtual machine...")
@@ -974,6 +977,9 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		return nil, err
 	}
 	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
+		return nil, err
+	}
+	if err := backend.CheckCreatedAt(ctx, name, meta.CreatedAt); err != nil {
 		return nil, err
 	}
 

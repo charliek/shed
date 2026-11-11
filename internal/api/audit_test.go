@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
@@ -163,6 +164,37 @@ func TestAuditOneAPILinePerClientRequest(t *testing.T) {
 
 // A streamed (SSE) create still goes through the audit wrapper, which keeps
 // the writer flushable, and its api line names the shed.
+// TestAuditExpiredServiceCertificate: a service client's request refused
+// because its certificate has expired (sent over a connection that opened
+// while it was valid; the middleware's request-time check is what refuses it)
+// still gets its api line, with the 401. An expired admin certificate's
+// request gets none.
+func TestAuditExpiredServiceCertificate(t *testing.T) {
+	s, h := clientTestServer(t, newClientFakeBackend(), defaultTestPolicy())
+	path := attachTestAudit(t, s)
+
+	expired := serviceLeaf(testClientName)
+	expired.NotAfter = time.Now().Add(-time.Second)
+	if got := do(h, expired, "GET", "/api/sheds", ""); got.code != http.StatusUnauthorized {
+		t.Fatalf("expired service cert = %d, want 401", got.code)
+	}
+	if got := do(h, testClientCert(testAdminFP, "control", -time.Second), "GET", "/api/sheds", ""); got.code != http.StatusUnauthorized {
+		t.Fatalf("expired admin cert = %d, want 401", got.code)
+	}
+
+	api, _, other := auditLines(t, path)
+	if len(other) != 0 || len(api) != 1 {
+		t.Fatalf("want one api line (the client's), got api %v, other %v", api, other)
+	}
+	line := api[0]
+	if line["status"] != float64(http.StatusUnauthorized) || line["path"] != "/api/sheds" {
+		t.Errorf("line = %v", line)
+	}
+	if id := line["identity"].(map[string]any); id["kind"] != "client" || id["name"] != testClientName {
+		t.Errorf("identity = %v", id)
+	}
+}
+
 func TestAuditSSECreate(t *testing.T) {
 	b := newClientFakeBackend()
 	s, h := clientTestServer(t, b, defaultTestPolicy())
