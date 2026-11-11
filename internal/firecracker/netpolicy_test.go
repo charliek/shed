@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -342,6 +343,10 @@ func TestNetpolCheckReappliesAndCutsOffWhenItCannot(t *testing.T) {
 	defer cancel()
 	c.StartNetworkPolicy(ctx)
 	applied := len(f.scripts)
+	if got := strings.Join(*links, ","); got != "fc-tap-0 up,fc-tap-1 up" {
+		t.Errorf("links after start = %q, want the guarded TAPs up", got)
+	}
+	*links = nil
 
 	// Present: nothing to do.
 	c.checkNetworkPolicy(ctx)
@@ -385,6 +390,72 @@ func TestNetpolStartFailureSetsTAPsDown(t *testing.T) {
 	c.StartNetworkPolicy(ctx)
 	if got := strings.Join(*links, ","); got != "fc-tap-0 down" {
 		t.Errorf("links = %q, want the guarded TAP down", got)
+	}
+}
+
+// A failed replacement leaves the old (more permissive) tables in place, so
+// their presence must not end the cut-off: the check retries the desired
+// state and keeps the TAPs down until it applies.
+func TestNetpolFailedReplacementWithOldTablesPresent(t *testing.T) {
+	c, cfg := newP9TeardownClient(t)
+	f, links := withFakeNetpol(c, netpolicy.Open)
+	f.installed = true // the previous process's tables
+	f.applyErr = errors.New("nft timed out")
+	writeNetInstance(t, cfg.InstanceDir, "iso", config.StatusRunning, "isolated", 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.StartNetworkPolicy(ctx)
+	if got := strings.Join(*links, ","); got != "fc-tap-0 down" {
+		t.Fatalf("links = %q, want the guarded TAP down", got)
+	}
+
+	// Both tables exist, nft still fails: retried, and the TAP stays down.
+	calls := f.callCount()
+	c.checkNetworkPolicy(ctx)
+	f.mu.Lock()
+	retried := slices.Contains(f.calls[calls:], "-f -")
+	f.mu.Unlock()
+	if !retried {
+		t.Error("check did not retry the failed apply")
+	}
+	if got := strings.Join(*links, ","); strings.Contains(got, "up") {
+		t.Errorf("links = %q: TAP raised over the stale tables", got)
+	}
+
+	// nft works: the desired state is installed, then the TAP comes up.
+	f.applyErr = nil
+	applied := len(f.scripts)
+	c.checkNetworkPolicy(ctx)
+	if len(f.scripts) != applied+1 || c.netpol.Pending() {
+		t.Error("desired state not applied on recovery")
+	}
+	if got := strings.Join(*links, ","); !strings.HasSuffix(got, "fc-tap-0 up") {
+		t.Errorf("links = %q, want the TAP back up", got)
+	}
+}
+
+// A process that set the guarded TAPs down and exited leaves them down; the
+// next process, once its tables are installed, sets them up (a running VM
+// survives the restart and cannot be started again to recover).
+func TestNetpolRestartRestoresDownTAPs(t *testing.T) {
+	c, cfg := newP9TeardownClient(t)
+	f, links := withFakeNetpol(c, netpolicy.Open)
+	writeNetInstance(t, cfg.InstanceDir, "iso", config.StatusRunning, "isolated", 0)
+	writeNetInstance(t, cfg.InstanceDir, "open", config.StatusRunning, "open", 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.StartNetworkPolicy(ctx)
+	if !f.installed {
+		t.Fatal("tables not installed")
+	}
+	if got := strings.Join(*links, ","); got != "fc-tap-0 up" {
+		t.Errorf("links = %q, want only the guarded TAP set up", got)
+	}
+	// Later checks with the tables in place change nothing.
+	*links = nil
+	c.checkNetworkPolicy(ctx)
+	if len(*links) != 0 {
+		t.Errorf("links = %v after a clean check", *links)
 	}
 }
 

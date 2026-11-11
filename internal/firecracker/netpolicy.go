@@ -4,6 +4,7 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -119,7 +120,9 @@ func (c *Client) networkPolicySheds() []netpolicy.Shed {
 // when nft is there, and makes no nft call at all when it is not. When the
 // tables cannot be installed, every guarded shed's TAP is set down (it is
 // cut off rather than left unguarded) and the server keeps serving; a later
-// successful check sets them up again.
+// successful check sets them up again. When the tables are installed, every
+// guarded shed's TAP is set up: a previous process may have set them down and
+// exited before its own check restored them.
 func (c *Client) StartNetworkPolicy(ctx context.Context) {
 	if c.netpol == nil {
 		return
@@ -130,6 +133,7 @@ func (c *Client) StartNetworkPolicy(ctx context.Context) {
 		c.setGuardedTAPs(false)
 	} else if c.netpol.Needed() {
 		log.Printf("Network policy: tables bridge/inet %s installed (%d guarded shed(s), default profile %s)", c.netpol.TableName(), len(sheds), c.serverCfg.NetworkDefaultProfile())
+		c.setGuardedTAPs(true)
 	}
 	go c.networkPolicyLoop(ctx, networkPolicyCheckInterval)
 }
@@ -147,19 +151,34 @@ func (c *Client) networkPolicyLoop(ctx context.Context, every time.Duration) {
 	}
 }
 
-// checkNetworkPolicy is one presence check: while the tables are needed and
-// either is missing, log loudly and reapply; when that fails, set the guarded
-// TAPs down; once the tables are in place again, set them back up.
+// checkNetworkPolicy is one presence check: while an earlier apply failed
+// (the kernel may still hold an older, more permissive rule set even though
+// both tables exist), or the tables are needed and either is missing, log
+// loudly and reapply; when that fails, set the guarded TAPs down; once the
+// desired tables are in place, set them back up.
 func (c *Client) checkNetworkPolicy(ctx context.Context) {
-	if c.netpol == nil || !c.netpol.Needed() {
+	if c.netpol == nil {
 		return
 	}
-	present, err := c.netpol.Present(ctx)
-	if err == nil && !present {
-		log.Printf("ERROR: network policy: table bridge/inet %s is missing (flushed by something else?); reapplying", c.netpol.TableName())
-		err = c.netpol.Reapply(ctx)
-		if err == nil {
+	pending := c.netpol.Pending()
+	if !pending && !c.netpol.Needed() {
+		return
+	}
+	var err error
+	if pending {
+		log.Printf("ERROR: network policy: an earlier apply of tables %s failed; reapplying", c.netpol.TableName())
+		if err = c.netpol.Reapply(ctx); err == nil {
 			log.Printf("Network policy: tables %s reapplied", c.netpol.TableName())
+		}
+	} else {
+		var present bool
+		present, err = c.netpol.Present(ctx)
+		if err == nil && !present {
+			log.Printf("ERROR: network policy: table bridge/inet %s is missing (flushed by something else?); reapplying", c.netpol.TableName())
+			err = c.netpol.Reapply(ctx)
+			if err == nil {
+				log.Printf("Network policy: tables %s reapplied", c.netpol.TableName())
+			}
 		}
 	}
 	if err != nil {
@@ -182,7 +201,8 @@ func (c *Client) setGuardedTAPs(up bool) {
 	c.netpolSt.tapsDown = !up
 	c.netpolSt.mu.Unlock()
 	for _, s := range c.netpol.Guarded() {
-		if err := c.linkState(s.TAP, up); err != nil {
+		var notFound netlink.LinkNotFoundError
+		if err := c.linkState(s.TAP, up); err != nil && !errors.As(err, &notFound) {
 			log.Printf("Warning: network policy: set %s (shed %s) up=%v: %v", s.TAP, s.Name, up, err)
 		}
 	}

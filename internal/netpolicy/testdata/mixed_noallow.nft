@@ -13,6 +13,10 @@ table bridge shed_mini3_dev {
 		type ipv4_addr
 		elements = { 172.30.0.2, 172.30.0.4 }
 	}
+	set guarded_macs {
+		type ether_addr
+		elements = { 02:fc:00:00:02:58, 02:fc:00:00:02:5a }
+	}
 	set addr4 {
 		type ifname . ether_addr . ipv4_addr
 		elements = { "shed-tap-0" . 02:fc:00:00:02:58 . 172.30.0.2, "shed-tap-2" . 02:fc:00:00:02:5a . 172.30.0.4 }
@@ -21,6 +25,7 @@ table bridge shed_mini3_dev {
 		type filter hook prerouting priority filter; policy accept;
 		meta ibrname != "shed-br0" accept
 		iifname @guarded_ports jump from_guarded
+		ether saddr @guarded_macs drop
 		ether type arp arp saddr ip @guarded_ip4 jump verify_arp
 		ether type ip ip saddr @guarded_ip4 jump verify_ip
 	}

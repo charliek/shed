@@ -72,9 +72,12 @@ const applyTimeout = 15 * time.Second
 // transaction, under the Manager's lock, so applies happen in the order of the
 // changes and the kernel always ends up holding the latest state that applied.
 //
-// A failed apply leaves the desired state changed (the next successful apply,
-// or the presence check, installs it); callers decide what a failure means
-// (a create or start fails, a delete only logs). Errors wrap
+// A failed apply leaves the desired state changed and marks it pending (the
+// next successful apply, or the presence check's Reapply, installs it);
+// callers decide what a failure means (a create or start fails, a delete only
+// logs). A failed apply is one transaction that did not commit, so the kernel
+// may still hold an older, more permissive rule set: Pending, not Present, is
+// what says the kernel holds the desired state. Errors wrap
 // config.ErrNetworkEnforcementUnavailableSentinel.
 type Manager struct {
 	cfg            Config
@@ -83,6 +86,10 @@ type Manager struct {
 
 	mu    sync.Mutex
 	sheds map[string]Shed // guarded sheds only
+	// pending is set when the last apply or teardown failed: the kernel may
+	// hold an older rule set than the desired state (or tables that should
+	// be gone).
+	pending bool
 }
 
 // NewManager returns a Manager for cfg that applies through runner (nil: nft
@@ -219,20 +226,30 @@ func (m *Manager) Rebuild(ctx context.Context, sheds []Shed) error {
 		return err
 	}
 	if !present {
+		m.pending = false
 		return nil
 	}
 	return m.teardownLocked(ctx)
 }
 
 // Reapply re-renders and applies the current desired state (the presence
-// check's repair). It does nothing when the tables are not needed.
+// check's repair), or retries a teardown that failed. It does nothing when the
+// tables are not needed and nothing is pending.
 func (m *Manager) Reapply(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.neededLocked() {
+	if !m.neededLocked() && !m.pending {
 		return nil
 	}
 	return m.applyLocked(ctx)
+}
+
+// Pending reports whether the last apply or teardown failed, so the kernel
+// may not hold the desired state even when both tables exist.
+func (m *Manager) Pending() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pending
 }
 
 // Present reports whether both of this server's tables exist.
@@ -275,10 +292,17 @@ func (m *Manager) applyLocked(ctx context.Context) error {
 		// Nothing guarded and an open default: the tables go (when nft is
 		// there to have installed them at all).
 		if !m.available() {
+			m.pending = false
 			return nil
 		}
 		return m.teardownLocked(ctx)
 	}
+	err := m.installLocked(ctx)
+	m.pending = err != nil
+	return err
+}
+
+func (m *Manager) installLocked(ctx context.Context) error {
 	if !m.available() {
 		return m.enforcementErr("nft is not installed; it is needed to enforce non-open network profiles")
 	}
@@ -301,12 +325,11 @@ func (m *Manager) applyLocked(ctx context.Context) error {
 func (m *Manager) teardownLocked(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTimeout)
 	defer cancel()
-	if out, err := m.runner.Run(ctx, RenderTeardown(m.cfg.ServerName), "-f", "-"); err != nil {
-		if isNotFound(err) {
-			return nil
-		}
+	if out, err := m.runner.Run(ctx, RenderTeardown(m.cfg.ServerName), "-f", "-"); err != nil && !isNotFound(err) {
+		m.pending = true
 		return m.enforcementErr("nft teardown: %v: %s", err, strings.TrimSpace(string(out)))
 	}
+	m.pending = false
 	return nil
 }
 

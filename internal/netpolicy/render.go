@@ -161,10 +161,11 @@ func Render(cfg Config, sheds []Shed) (string, error) {
 		return "", err
 	}
 
-	var ports, ips, addr4, hostAllow []string
+	var ports, ips, macs, addr4, hostAllow []string
 	for _, s := range guarded {
 		ports = append(ports, fmt.Sprintf("%q", s.TAP))
 		ips = append(ips, s.IP)
+		macs = append(macs, s.MAC)
 		addr4 = append(addr4, fmt.Sprintf("%q . %s . %s", s.TAP, s.MAC, s.IP))
 		for _, p := range s.HostPorts() {
 			hostAllow = append(hostAllow, fmt.Sprintf("%s . %d", s.IP, p))
@@ -178,18 +179,26 @@ func Render(cfg Config, sheds []Shed) (string, error) {
 	fmt.Fprintf(&b, "add table bridge %s\ndelete table bridge %s\n", table, table)
 	fmt.Fprintf(&b, "add table inet %s\ndelete table inet %s\n\n", table, table)
 
-	// L2: anti-spoofing keyed on the claimed address, and guest-to-guest.
+	// L2: anti-spoofing keyed on the claimed address (IP and MAC), and
+	// guest-to-guest. A frame from an unguarded port with a guarded shed's
+	// source MAC is dropped whatever it carries: the bridge learns source
+	// MACs after prerouting, so letting it through would move that MAC's FDB
+	// entry to the other port, and traffic for the guarded shed (the host's
+	// replies included) would be delivered there.
 	fmt.Fprintf(&b, "table bridge %s {\n", table)
 	b.WriteString("\tset guarded_ports {\n\t\ttype ifname\n")
 	elements(&b, "\t\t", ports)
 	b.WriteString("\t}\n\tset guarded_ip4 {\n\t\ttype ipv4_addr\n")
 	elements(&b, "\t\t", ips)
+	b.WriteString("\t}\n\tset guarded_macs {\n\t\ttype ether_addr\n")
+	elements(&b, "\t\t", macs)
 	b.WriteString("\t}\n\tset addr4 {\n\t\ttype ifname . ether_addr . ipv4_addr\n")
 	elements(&b, "\t\t", addr4)
 	b.WriteString("\t}\n")
 	b.WriteString("\tchain pre {\n\t\ttype filter hook prerouting priority filter; policy accept;\n")
 	fmt.Fprintf(&b, "\t\tmeta ibrname != %s accept\n", br)
 	b.WriteString("\t\tiifname @guarded_ports jump from_guarded\n")
+	b.WriteString("\t\tether saddr @guarded_macs drop\n")
 	b.WriteString("\t\tether type arp arp saddr ip @guarded_ip4 jump verify_arp\n")
 	b.WriteString("\t\tether type ip ip saddr @guarded_ip4 jump verify_ip\n")
 	b.WriteString("\t}\n")

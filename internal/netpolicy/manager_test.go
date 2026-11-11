@@ -279,6 +279,73 @@ func TestManagerRebuild(t *testing.T) {
 	}
 }
 
+// A failed apply is a transaction that did not commit: the old tables stay,
+// so their presence proves nothing. Pending says so until an apply succeeds,
+// and Reapply retries even with both tables present (a removed allowance, a
+// pending teardown).
+func TestManagerPendingAfterFailedApply(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeRunner{}
+	m := NewManager(testConfig(), f, Open)
+	a, b := guarded("a", "shed-tap-0", "172.30.0.2"), guarded("b", "shed-tap-1", "172.30.0.3")
+	a.EgressPort = 40001
+	if err := m.Upsert(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Upsert(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if m.Pending() {
+		t.Fatal("pending after successful applies")
+	}
+
+	// Removing an allowance fails: the old (more permissive) tables stay.
+	f.applyErr = errors.New("exit status 1")
+	if err := m.SetEgressPort(ctx, "a", 0); err == nil {
+		t.Fatal("SetEgressPort with failing nft succeeded")
+	}
+	if ok, err := m.Present(ctx); err != nil || !ok {
+		t.Fatalf("fixture: old tables gone (%v, %v)", ok, err)
+	}
+	if !m.Pending() {
+		t.Error("not pending after a failed apply with the old tables present")
+	}
+	if err := m.Reapply(ctx); err == nil || !m.Pending() {
+		t.Errorf("Reapply with failing nft = %v, pending %v", err, m.Pending())
+	}
+	f.applyErr = nil
+	if err := m.Reapply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if m.Pending() || strings.Contains(f.lastApply(t), "40001") {
+		t.Errorf("Reapply did not install the narrowed state (pending %v)", m.Pending())
+	}
+
+	// The guarded set empties while teardown fails: the stale tables are
+	// retried although nothing is needed any more.
+	if err := m.Remove(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	f.applyErr = errors.New("exit status 1")
+	if err := m.Remove(ctx, "b"); err == nil {
+		t.Fatal("Remove with failing teardown succeeded")
+	}
+	if m.Needed() || !m.Pending() || !f.installed {
+		t.Fatalf("needed %v, pending %v, installed %v", m.Needed(), m.Pending(), f.installed)
+	}
+	f.applyErr = nil
+	if err := m.Reapply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if m.Pending() || f.installed || f.lastApply(t) != RenderTeardown("mini3-dev") {
+		t.Errorf("pending teardown not retried (pending %v, installed %v)", m.Pending(), f.installed)
+	}
+	n := f.count()
+	if err := m.Reapply(ctx); err != nil || f.count() != n {
+		t.Errorf("Reapply with nothing needed or pending = %v, %d calls", err, f.count()-n)
+	}
+}
+
 func TestManagerTeardownTouchesOnlyItsTables(t *testing.T) {
 	f := &fakeRunner{}
 	m := NewManager(testConfig(), f, Open)

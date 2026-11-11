@@ -185,6 +185,34 @@ func (r *nsRunner) Run(ctx context.Context, stdin string, args ...string) ([]byt
 	return r.inner.Run(ctx, stdin, args...)
 }
 
+// setMAC changes a guest's MAC (the link goes down and up, which drops its
+// default route, so that is put back).
+func (tp *topo) setMAC(ns, mac string) {
+	tp.t.Helper()
+	tp.ipn(ns, "link", "set", "eth0", "down")
+	tp.ipn(ns, "link", "set", "eth0", "address", mac)
+	tp.ipn(ns, "link", "set", "eth0", "up")
+	tp.ipn(ns, "route", "replace", "default", "via", gw)
+	tp.ipn(ns, "neigh", "flush", "dev", "eth0")
+}
+
+// fdbPort returns the bridge port the host's bridge has learned mac on ("" when
+// it has no entry).
+func (tp *topo) fdbPort(mac string) string {
+	tp.t.Helper()
+	out, err := exec.Command("ip", "netns", "exec", tp.ns("host"), "bridge", "fdb", "show", "br", "shed-br0").CombinedOutput()
+	if err != nil {
+		tp.t.Fatalf("bridge fdb show: %v %s", err, out)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 3 && strings.EqualFold(f[0], mac) && f[1] == "dev" {
+			return f[2]
+		}
+	}
+	return ""
+}
+
 const (
 	g1IP  = "172.30.0.2"
 	g1MAC = "02:fc:00:00:00:02"
@@ -292,6 +320,21 @@ func TestNetnsIsolatedProfile(t *testing.T) {
 	}
 	tp.ipn("g2", "addr", "del", g1IP+"/32", "dev", "eth0")
 	tp.ipn("host", "neigh", "flush", "dev", "shed-br0")
+	// Control for the MAC case: with no rules, an open guest that sends with
+	// g1's MAC (and its own IP) moves the bridge's FDB entry for that MAC to
+	// its own port.
+	tp.expect("host", at(g1IP), "", true)
+	if got := tp.fdbPort(g1MAC); got != "shed-tap-0" {
+		t.Errorf("control: FDB has %s on %q before the steal, want shed-tap-0", g1MAC, got)
+	}
+	tp.setMAC("g2", g1MAC)
+	tp.expect("g2", hostPort(7001), "", true)
+	if got := tp.fdbPort(g1MAC); got != "shed-tap-1" {
+		t.Errorf("control: FDB has %s on %q after the steal, want the spoofer's shed-tap-1", g1MAC, got)
+	}
+	tp.setMAC("g2", g2MAC)
+	tp.ipn("host", "neigh", "flush", "dev", "shed-br0")
+	tp.expect("host", at(g1IP), "", true) // g1 answers, and its port relearns its MAC
 	if t.Failed() {
 		t.Fatal("the spoofing control did not behave as expected")
 	}
@@ -372,6 +415,27 @@ func TestNetnsIsolatedProfile(t *testing.T) {
 			t.Errorf("host neighbour entry for %s is %q, want g1's MAC %s", g1IP, strings.TrimSpace(string(out)), g1MAC)
 		}
 		tp.expect("host", at(g1IP), "", true)
+	})
+	t.Run("open guest cannot take a guarded MAC", func(t *testing.T) {
+		tp.t = t
+		tp.expect("host", at(g1IP), "", true)
+		if got := tp.fdbPort(g1MAC); got != "shed-tap-0" {
+			t.Fatalf("FDB has %s on %q before the steal, want shed-tap-0", g1MAC, got)
+		}
+		// g2 keeps its own IP and sends with g1's MAC: everything it sends is
+		// dropped before the bridge learns from it.
+		tp.setMAC("g2", g1MAC)
+		tp.expect("g2", hostPort(7001), "", false)
+		tp.expect("g2", at(wanIP), "", false)
+		if got := tp.fdbPort(g1MAC); got != "shed-tap-0" {
+			t.Errorf("FDB has %s on %q after the steal, want g1's shed-tap-0", g1MAC, got)
+		}
+		// Traffic for g1 still reaches g1: the host's own, and replies to
+		// g1's internet connection (sent while g2 still holds the MAC).
+		tp.expect("host", at(g1IP), "", true)
+		tp.expect("g1", at(wanIP), "", true)
+		tp.setMAC("g2", g2MAC)
+		tp.expect("g2", at(wanIP), "", true)
 	})
 	t.Run("no IPv6", func(t *testing.T) {
 		tp.t = t

@@ -113,6 +113,19 @@ func TestRenderShape(t *testing.T) {
 	if !strings.Contains(got, `"shed-tap-0" . 02:fc:00:00:02:58 . 172.30.0.2`) {
 		t.Error("addr4 element missing or not lowercased")
 	}
+	// A guarded shed's MAC is bound to its port whatever the frame carries:
+	// after the guarded ports have jumped to their own verification, any
+	// other port sending with a guarded MAC is dropped before the bridge can
+	// learn it, ahead of the claimed-IP checks.
+	if !strings.Contains(got, "elements = { 02:fc:00:00:02:58, 02:fc:00:00:02:5a }") {
+		t.Error("guarded_macs set missing or wrong")
+	}
+	jump := strings.Index(got, "iifname @guarded_ports jump from_guarded")
+	macDrop := strings.Index(got, "ether saddr @guarded_macs drop")
+	arp := strings.Index(got, "ether type arp arp saddr ip @guarded_ip4 jump verify_arp")
+	if jump < 0 || macDrop < jump || arp < macDrop {
+		t.Errorf("prerouting order: jump %d, MAC drop %d, ARP check %d", jump, macDrop, arp)
+	}
 	if strings.Count(got, "172.30.0.2 . 41003") != 1 {
 		t.Error("host port not deduplicated")
 	}
