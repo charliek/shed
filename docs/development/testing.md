@@ -170,9 +170,17 @@ make test-integration-dev-fc
 make dev-server-down-fc         # when done
 ```
 
+`PYTEST_ARGS` passes extra arguments to pytest in every `test-integration*` target, for example a subset of modules:
+
+```sh
+make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls PYTEST_ARGS="test_smoke.py test_mounts.py test_mtls.py"
+```
+
 The FC dev server runs via `sudo nohup` on the remote (needs root for FC's CAP_NET_ADMIN bridge/TAP operations). No systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server (crashes visible, no survives-reboot). Listens on `mini3:18080/12222` alongside the deb shed-server's `mini3:8080/2222`. Isolated state-dirs under `/var/lib/shed-dev/firecracker/`.
 
 FC-specific isolation:
+- **Its own identity directory.** The FC dev config sets `state_dir: /var/lib/shed-dev/state`, so the root dev server keeps its SSH host key, TLS cert, mtls client CA and GitHub key cache there instead of in production's `/etc/shed`. The first `make dev-server-up-fc` after this change generates a new host key and TLS pin: remove only the stale `mini3-dev` entry from `~/.shed/config.yaml` and re-add it with `shed server add mini3 --port 18080 --ssh-port 12222 --name mini3-dev` (leave the `mini3` entry and `default_server` alone).
+- **An `itest` image alias** (`ghcr.io/charliek/shed-fc-base:v0.9.0`) for tests that need a newer guest agent than the v0.5.9 images (exec process-group cleanup, a separate stderr stream).
 - **Five throwaway writable 9P mounts.** The FC dev config carries `claude`, `codex`, `opencode_data`, `opencode_state` and `gh` mounts mirroring a typical production mount set (same keys and targets). Their sources live under `/var/lib/shed-dev/mounts/` on the remote and are created by `make dev-server-up-fc` (derived from the uploaded config's `source:` lines). They hold no real credentials; they exist so the suite exercises the 9P credential-mount path (stop latency, nested mount targets).
 - **Offset `vsock_base_cid: 600`** (deb default is 100) so the two servers' vsock CIDs don't collide. vsock allocation is in-memory per-server with no kernel check.
 - **Shared bridge + CIDR + tap_prefix.** Kernel-level TAP existence check in `internal/firecracker/network.go:FindAvailableTAPIndex` coordinates cross-server. Known race window: two servers can both pick the same TAP index before either calls `LinkAdd`; the second call fails loudly with EEXIST. Diagnosable, not silent. For PR-validation workloads (one dev creating one shed at a time on the dev server while the deb server handles its own creates) this never fires; for production-style concurrent stress it would need a server-side `retry-on-EEXIST` fix.

@@ -38,6 +38,12 @@ allow_insecure_exposure: true
 default_backend: firecracker
 log_level: debug
 
+# The dev server's OWN identity directory (SSH host key, TLS cert + key, the
+# mtls client CA, the GitHub key cache). It runs as root, so without this it
+# would resolve to /etc/shed -- production's directory on the same host -- and
+# share its host key and TLS pin, and in mtls mode write a client CA there.
+state_dir: /var/lib/shed-dev/state
+
 # THROWAWAY writable mounts, never real credentials. They mirror the keys and
 # targets of mini3's deb server so the dev FC suite exercises the 9P mount
 # path. That path hid shed#284 (5 writable mounts x a 5 s 9P close made every
@@ -81,6 +87,10 @@ firecracker:
     base:       ghcr.io/charliek/shed-fc-base:v0.5.9
     extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.9
     full:       ghcr.io/charliek/shed-fc-full:v0.5.9
+    # The image the newer integration tests create from: exec semantics
+    # (process-group cleanup on disconnect, a separate stderr stream) need
+    # an agent newer than the v0.5.9 images above.
+    itest:      ghcr.io/charliek/shed-fc-base:v0.9.0
   pull_policy: missing
 
   # Separate state-dirs so prune from the deb server never touches

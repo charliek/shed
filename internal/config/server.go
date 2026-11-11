@@ -67,6 +67,13 @@ type ServerConfig struct {
 	// Empty (default) places them next to the SSH host key.
 	TLSCertFile string `yaml:"tls_cert_file,omitempty"`
 	TLSKeyFile  string `yaml:"tls_key_file,omitempty"`
+	// StateDir is the directory holding the server's identity material: the
+	// SSH host key, the HTTPS cert + key (unless tls_cert_file/tls_key_file
+	// say otherwise), the mtls client CA and the GitHub key cache. Empty
+	// (default) is /etc/shed as root and ~/.shed otherwise. Set it when two
+	// servers share a host, so the second does not adopt the first's
+	// identity. Absolute or ~/-relative; created 0700 at serve start.
+	StateDir string `yaml:"state_dir,omitempty"`
 
 	// Mounts are host directories mounted into every shed (e.g. ~/.ssh,
 	// ~/.config/gh). This was previously named "credentials".
@@ -342,6 +349,19 @@ func (c *ServerConfig) validateNetworkSurface() error {
 	}
 	if c.HTTPSPort > 0 && (c.HTTPSPort == c.HTTPPort || c.HTTPSPort == c.SSHPort) {
 		return fmt.Errorf("https_port (%d) must differ from http_port and ssh_port", c.HTTPSPort)
+	}
+	return nil
+}
+
+// validateStateDir refuses a relative state_dir: it would resolve against
+// whatever directory serve was started from. Shared by Validate and
+// ValidateNoHostCoupling.
+func (c *ServerConfig) validateStateDir() error {
+	if c.StateDir == "" {
+		return nil
+	}
+	if p := ExpandPath(c.StateDir); !filepath.IsAbs(p) {
+		return fmt.Errorf("state_dir must be an absolute path or start with ~/ (got %q)", c.StateDir)
 	}
 	return nil
 }
@@ -1819,6 +1839,9 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if err := c.validateAuth(); err != nil {
 		return err
 	}
+	if err := c.validateStateDir(); err != nil {
+		return err
+	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[c.LogLevel] {
@@ -1894,6 +1917,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := c.validateAuth(); err != nil {
+		return err
+	}
+	if err := c.validateStateDir(); err != nil {
 		return err
 	}
 

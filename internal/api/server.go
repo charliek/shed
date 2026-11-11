@@ -89,7 +89,12 @@ func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, p
 func (s *Server) useCommonMiddleware(r chi.Router) {
 	r.Use(middleware.RequestID)
 	if s.cfg.TrustedProxy {
-		r.Use(middleware.RealIP)
+		// chi v5.5 deprecates RealIP for trusting client-supplied headers.
+		// That trust is exactly what trusted_proxy opts into (off by
+		// default, documented as safe only behind a proxy that overwrites
+		// the headers), and the ClientIP* replacements leave RemoteAddr
+		// untouched, which would change behaviour for existing configs.
+		r.Use(middleware.RealIP) //nolint:staticcheck // SA1019: deliberate, gated by trusted_proxy
 	}
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)

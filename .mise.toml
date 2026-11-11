@@ -1,6 +1,6 @@
 [tools]
-go = "1.25"
-golangci-lint = "2.10.1"
+go = "1.27"
+golangci-lint = "2.15.0"
 # Release tooling, for running a goreleaser snapshot LOCALLY before trusting CI
 # (`make snapshot-server`). goreleaser is pinned to the exact version the
 # goreleaser-action pins in ci.yml / publish-images.yaml — the point of a local

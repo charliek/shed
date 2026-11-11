@@ -106,20 +106,26 @@ func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientC
 	return tlsCfg
 }
 
-// defaultHostKeyPath returns the default path for the SSH host key.
-// Uses /etc/shed/host_key when running as root (Linux servers), otherwise
-// falls back to ~/.shed/host_key (macOS development without sudo).
-func defaultHostKeyPath() string {
-	if os.Getuid() == 0 {
-		return "/etc/shed/host_key"
+// serverStateDir returns the directory that holds the server's identity
+// material: the SSH host key, the HTTPS cert + key (unless tls_cert_file /
+// tls_key_file override them), the mtls client CA and the GitHub key cache.
+// state_dir wins when set; otherwise it is /etc/shed when running as root
+// (Linux servers) and ~/.shed otherwise (macOS development without sudo).
+// `serve` and any command that must see the same identity (the CA, the TLS
+// pin) resolve it here.
+func serverStateDir(cfg *config.ServerConfig) string {
+	if cfg != nil && cfg.StateDir != "" {
+		return config.ExpandPath(cfg.StateDir)
 	}
-	return config.ExpandPath("~/.shed/host_key")
+	if os.Getuid() == 0 {
+		return "/etc/shed"
+	}
+	return config.ExpandPath("~/.shed")
 }
 
 // tlsCertPaths returns the cert + key file paths for the HTTPS listener,
 // honoring tls_cert_file / tls_key_file and otherwise placing them in stateDir
-// (the directory that holds the SSH host key: /etc/shed as root, ~/.shed
-// otherwise).
+// (serverStateDir: the directory that holds the SSH host key).
 func tlsCertPaths(cfg *config.ServerConfig, stateDir string) (certPath, keyPath string) {
 	certPath = filepath.Join(stateDir, "tls_cert.pem")
 	if cfg.TLSCertFile != "" {
@@ -334,8 +340,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Build the SSH key allowlist (default off = accept all). GitHub-seeded
 	// keys are cached next to the host key. Fails closed (returns an error)
 	// when mode=enforce but no keys resolved.
-	hostKeyPath := defaultHostKeyPath()
-	githubCacheDir := filepath.Join(filepath.Dir(hostKeyPath), "github_keys")
+	stateDir := serverStateDir(cfg)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fmt.Errorf("state dir %s: %w", stateDir, err)
+	}
+	log.Printf("State dir: %s", stateDir)
+	hostKeyPath := filepath.Join(stateDir, "host_key")
+	githubCacheDir := filepath.Join(stateDir, "github_keys")
 	sshAllowlist, err := sshd.NewKeyAllowlist(cfg.EffectiveSSHAuth(), githubCacheDir)
 	if err != nil {
 		return fmt.Errorf("ssh auth: %w", err)
@@ -371,7 +382,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Loaded — never silently regenerated — from the state dir.
 	var clientCA *servertls.CA
 	if cfg.MTLSMode() {
-		caCertPath, caKeyPath := caCertPaths(filepath.Dir(hostKeyPath))
+		caCertPath, caKeyPath := caCertPaths(stateDir)
 		ca, err := servertls.LoadOrGenerateCA(caCertPath, caKeyPath)
 		if err != nil {
 			return fmt.Errorf("client CA: %w", err)
@@ -431,7 +442,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	var httpsServer *http.Server
 	var tlsFingerprint string
 	if cfg.HTTPSEnabled() {
-		certPath, keyPath := tlsCertPaths(cfg, filepath.Dir(hostKeyPath))
+		certPath, keyPath := tlsCertPaths(cfg, stateDir)
 		cert, der, err := servertls.LoadOrGenerate(certPath, keyPath, cfg.TLSNames)
 		if err != nil {
 			return fmt.Errorf("tls cert: %w", err)

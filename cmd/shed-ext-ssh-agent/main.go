@@ -86,9 +86,10 @@ func main() {
 		}
 		go func() {
 			defer conn.Close()
-			if err := agent.ServeAgent(a, conn); err != nil {
-				logger.Debug("connection closed", "error", err)
-			}
+			// ServeAgent only returns when the connection ends, always with
+			// a non-nil error (io.EOF on a clean close).
+			err := agent.ServeAgent(a, conn)
+			logger.Debug("connection closed", "error", err)
 		}()
 	}
 

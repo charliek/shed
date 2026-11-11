@@ -37,7 +37,7 @@ The host `shed-server` is a separate binary. This split is the #1 source of
 
 ```bash
 docker run --rm -v "$PWD":/src -w /src -e GOFLAGS=-buildvcs=false \
-  golang:1.25 go test -count=1 -race ./cmd/shed-agent/   # match the `go` line in go.mod
+  golang:1.27 go test -count=1 -race ./cmd/shed-agent/   # match the `go` line in go.mod
 ```
 
 Cross-compile + lint locally without running:

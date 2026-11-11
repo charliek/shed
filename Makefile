@@ -47,13 +47,17 @@ test:
 # `brew install uv` or https://docs.astral.sh/uv/getting-started/installation/).
 # Tests parameterized over [vz, fc]; each skips cleanly when its target
 # backend is unreachable from this host. See tests/integration/README.md.
+# PYTEST_ARGS passes extra arguments to pytest, e.g. a subset of modules:
+#   make test-integration-dev-fc PYTEST_ARGS="test_smoke.py test_mounts.py"
+PYTEST_ARGS ?=
+
 test-integration:
 	@command -v uv >/dev/null 2>&1 || { \
 	  echo "uv is required for integration tests."; \
 	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
 	  exit 1; \
 	}
-	cd tests/integration && uv sync && uv run pytest -v
+	cd tests/integration && uv sync && uv run pytest -v $(PYTEST_ARGS)
 
 # Hermetic host-agent wire harness (the THIRD pytest suite — never merged with
 # tests/integration or desktop/tools/shedtest). It spawns the Rust
