@@ -46,6 +46,12 @@ All server settings live in the server config (`/etc/shed/server.yaml` on
 Linux, `~/.config/shed/server.yaml` on macOS). Client settings live per server
 entry in `~/.shed/config.yaml`.
 
+Beyond the posture, this page covers what a shed itself can reach and who can
+drive it: [service clients](#service-clients) (orchestrators limited to their
+own sheds, in mtls mode), [mount selection](#mount-selection) (which host
+directories a shed gets) and [network profiles](#network-profiles) (on
+Firecracker, an `isolated` shed reaches the internet and nothing else).
+
 ## SSH key allowlist
 
 By default any public key is accepted (the username still selects the shed).
@@ -421,6 +427,11 @@ hold:
 - TTL = `auth.token_ttl` (default 24h), extended-key-usage
   `ClientAuth` only.
 
+This describes a user's certificate. A [service client](#service-clients)'s
+certificate has a different shape (CN = the client name, OU = `service`, a
+`shed-client://` URI SAN), is signed by `shed-server client issue` on the shed
+host, and is checked against `auth.clients` rather than the SSH allowlist.
+
 Enrollment rides the `_bootstrap` channel exactly like a token mint, with a
 CSR appended to the request line: the client generates a P-256 keypair
 locally, sends the CSR, and the server signs it — ignoring every requested
@@ -450,6 +461,10 @@ mtls mode also cuts off shell/SFTP access (the SSH allowlist is now the one
 lever for both), where token mode can revoke an HTTP credential independently
 via `RevokeBySubject`. Documented and accepted — an mtls deployment that wants
 per-purpose revocation without cutting SSH access should stay on `token` mode.
+
+A service client's certificates are revoked differently: remove the client
+from `auth.clients` and restart `serve` (see [Service
+clients](#service-clients)).
 
 ### Accepted limitations
 
@@ -691,3 +706,13 @@ installs nothing and does not need `nft`.
 An **enrollment secret** (a transport-layer HMAC over the bootstrap handshake,
 to gate issuance even tighter than the SSH allowlist) remains out of scope.
 Mutual TLS itself is no longer deferred — see [mTLS mode](#mtls-mode) above.
+
+Also not built yet (see the [Roadmap](../ROADMAP.md)):
+
+- **Per-certificate revocation** for service clients (by serial); today a
+  client is revoked as a whole.
+- **Running Firecracker under its `jailer`** (chroot, namespaces, privilege
+  drop).
+- **A proxy-only and a no-network profile**: isolated with the [egress
+  proxy](egress.md) as the only way out, and no network at all
+  ([#205](https://github.com/charliek/shed/issues/205)).

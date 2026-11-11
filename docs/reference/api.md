@@ -100,6 +100,13 @@ support)` error rather than a silent fallback. See [Security › mTLS
 mode](security.md#mtls-mode) for the full guarantee and the accepted
 limitations.
 
+A [service client](#service-clients)'s certificate is different: it is issued
+on the shed host by `shed-server client issue`, never over `_bootstrap`, and
+is checked against `auth.clients` and a fixed route list instead of the SSH
+allowlist and scope. Its bundle carries `client` (the client name) in place of
+`scope`, and also `client_key`, because the server generates the key. See
+[Service clients](#service-clients).
+
 ## Endpoints
 
 | Method | Endpoint | Description |
@@ -386,9 +393,14 @@ Gets details for a specific shed.
       "target": "/home/shed/codelens",
       "readonly": false
     }
-  ]
+  ],
+  "mounts": {"mode": "selected", "names": ["claude"]},
+  "network_profile": "open"
 }
 ```
+
+The fields are those of [GET /api/sheds](#get-apisheds), including `owner`
+(omitted here: an admin's shed), `mounts` and `network_profile`.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -399,7 +411,7 @@ Gets details for a specific shed.
 
 | Code | Description |
 |------|-------------|
-| 404 | Shed not found |
+| 404 | Shed not found; for a service client, also a shed it does not own (the same body) |
 
 ### DELETE /api/sheds/{name}
 

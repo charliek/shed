@@ -96,7 +96,7 @@ Returns `202 Accepted` immediately.
 
 ## Building a Host-Side Listener
 
-A host-side listener subscribes to a namespace via SSE and receives messages from all running sheds.
+A host-side listener subscribes to a namespace via SSE and receives messages from all running sheds, except a shed a [service client](security.md#service-clients) owns: the bus is always off for those, so their messages are dropped and they never appear here.
 
 ### Subscribe to a namespace
 
@@ -225,6 +225,9 @@ GET /api/plugins/sheds
   ]
 }
 ```
+
+A shed a service client owns is left out of this list, and a response sent to
+it is refused.
 
 ## Extension Management
 

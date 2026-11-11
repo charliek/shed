@@ -6,7 +6,9 @@ device, issued over the same SSH `_bootstrap` channel that mints tokens today,
 instead of a bearer token. It is **additive**, not a breaking config rename
 like the v0.7.x auth patches: `open` and `token` are unaffected, `mtls` is a
 new value alongside them, and `token` is retained (not deprecated) for
-`curl`/scripts/CI/third-party callers that can't present a client certificate.
+`curl`/scripts/CI/third-party callers that need admin access and can't present
+a client certificate (or, for an orchestrator that needs only its own sheds, a
+service client; see the [Orchestrated sheds guide](../guides/orchestrated-sheds.md)).
 See [Security › mTLS mode](../reference/security.md#mtls-mode) for the full
 model.
 
@@ -152,7 +154,9 @@ The recovery story is intentionally simple, and mostly self-driving:
       server you plan to flip to `mtls`.
 - [ ] Desktop users: confirm `shed-host-agent` is upgraded, not just the app.
 - [ ] Flip `auth.mode: mtls` on the server(s) you want hardened; leave others
-      on `token` if `curl`/CI/scripts need direct access.
+      on `token` if `curl`/CI/scripts need direct admin access (or, for an
+      orchestrator that needs only its own sheds, a service client; see the
+      [Orchestrated sheds guide](../guides/orchestrated-sheds.md)).
 - [ ] Existing client entries re-bootstrap on their own on next use — no
       manual `shed server add` re-run needed after the flip.
 - [ ] Note the CA fingerprint/expiry from the server's startup log somewhere

@@ -25,7 +25,7 @@ Before acting, read the lay of the land:
 ```bash
 shed server list          # configured servers + which is default/online
 shed list                 # sheds on the default server (use --all for every server)
-shed list -v              # expanded: backend, status, SSH target, IP, resources
+shed list -v              # expanded: backend, status, SSH target, IP, resources, OWNER, MOUNTS, NETWORK
 ```
 
 If no server is configured yet, add one (one-time): `shed server add <host> --name <name>`.
@@ -47,7 +47,7 @@ Other ways to create: `--local-dir ~/path` mounts a host directory as the worksp
 
 | Task | Command |
 |------|---------|
-| Create a shed | `shed create <name> [--repo owner/repo \| --local-dir PATH]` |
+| Create a shed | `shed create <name> [--repo owner/repo \| --local-dir PATH] [--mounts none\|a,b] [--network isolated]` |
 | List / inspect | `shed list [--all] [-v]` |
 | Start / stop / delete | `shed start <name>` · `shed stop <name>` · `shed delete <name> [--force]` |
 | Reset the writable layer | `shed reset <name>` (discard in-VM changes, keep the workspace; shed must be stopped) |
@@ -68,6 +68,8 @@ Usage notes that matter:
 - **One-off vs interactive:** `shed exec <name> <command...>` runs a single command over SSH with the argv passed through verbatim (it is not a shell), e.g. `shed exec myproj git status`. For pipes, `&&`, redirection, or `cd`, wrap it yourself: `shed exec myproj bash -lc "cd /workspace && npm test"`. Reserve `attach`/`console` for interactive work.
 - **Multi-server:** target one with `-s <server>`; sweep all with `--all` (on `list`, `sessions`, `system`).
 - **Scripting:** `--json` emits structured output. Destructive commands require `--force` when combined with `--json` (no interactive prompt).
+- **Untrusted code:** create with `--mounts none --network isolated` (no host directories, the internet only; `--network isolated` needs a Firecracker server, on VZ use `--mounts none` alone).
+- **Sheds you didn't create:** a shed whose `OWNER` in `shed list -v` is not `-` belongs to a service client (an orchestrator such as a CI system), which manages and deletes it. Don't stop, reset or delete it unless the user asks for that shed by name.
 
 ## Reaching services inside a shed (tunnels)
 

@@ -64,7 +64,7 @@ No two mounted directories may share a basename, and dotfile basenames are rejec
 
 ## Mounts
 
-All mounts configured under the `mounts:` section of `server.yaml` are bound into VZ VMs via VirtioFS. Changes are immediately visible on both sides, similar to Docker bind mounts.
+A shed gets the mounts configured under the `mounts:` section of `server.yaml` that its `--mounts` selection names (all of them by default), bound into the VZ VM via VirtioFS; an unselected mount's VirtioFS device is not attached. Changes are immediately visible on both sides, similar to Docker bind mounts.
 
 Read-only mounts (`readonly: true`) are enforced as read-only at the mount level. Writable mounts (`readonly: false`) reflect changes immediately in both directions.
 
@@ -132,6 +132,14 @@ ls ~/.shed/vz/sockets/
 VZ uses NAT networking provided by Apple's Virtualization.framework. The guest obtains an IP address via DHCP through `systemd-networkd`.
 
 From the host, `shed` commands communicate with the VM over vsock (Unix sockets), not TCP. `shed list` and the API still report a `127.0.0.1` IP for running VZ sheds (so the field has a sensible value in JSON output), but service traffic itself routes through `DialService`'s vsock TCP-proxy hop rather than that IP.
+
+VZ supports only the `open` [network profile](security.md#network-profiles). A
+guest reaches whatever the Mac's NAT reaches, including the Mac itself and its
+LAN. `shed create --network isolated` is refused
+(`422 NETWORK_PROFILE_UNSUPPORTED`), `network.default_profile` must stay `open`
+(an isolated default is refused at load), and a [service
+client](security.md#service-clients) on a VZ server needs `policy.network: open`
+in its policy. `--mounts` works on VZ as on Firecracker.
 
 ## Docker Inside VZ
 

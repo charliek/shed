@@ -49,7 +49,8 @@ flowchart TB
 
 | Protocol | Port | Purpose |
 |----------|------|---------|
-| HTTP | 8080 | REST API for CRUD operations, Connect API, server discovery |
+| HTTP | 8080 | REST API for CRUD operations, Connect API, server discovery (`open` mode only) |
+| HTTPS | 8443 | The same API over pinned TLS in `token` and `mtls` mode (the only API listener there), including the HTTPS exec |
 | SSH | 2222 | Terminal access (exec, attach), IDE remote connections |
 | vsock | 1024 | VM console I/O (Firecracker, VZ) |
 | vsock | 1026 | Message bus — health checks, plugins (Firecracker, VZ) |
@@ -147,7 +148,7 @@ The diagrams below show the internal implementation flow for each backend.
 
 ### Mount Mechanisms
 
-The server-config `mounts:` section (which falls back to the deprecated `credentials:` key when absent) binds host directories into each VM. Each backend handles them differently based on its isolation model. All mount sources must be directories.
+The server-config `mounts:` section (which falls back to the deprecated `credentials:` key when absent) binds host directories into a VM: the shed's selected mounts (`--mounts`, stored in its metadata; all of them by default), on every start. Each backend handles them differently based on its isolation model. All mount sources must be directories.
 
 **Firecracker** — Mounts are bound via 9P over the TAP bridge network. Each mount directory gets a TCP-based 9P server on the bridge IP. Changes are immediately visible on both sides.
 
@@ -188,11 +189,17 @@ The **Connect API** (`GET /api/sheds/{name}/connect/{port}`) exposes `DialServic
 - TCP tunneling (ports, services, proxy): Connect API / `DialService`
 - Interactive sessions (exec, attach): SSH / vsock binary framed protocol
 
+A third path runs one command without SSH: `POST /api/sheds/{name}/exec`
+takes an argv over the HTTPS API, runs it through the guest agent's exec over
+vsock (the same `AgentClient.Exec` SSH sessions use), and streams NDJSON
+`stdout`/`stderr` frames and an `exit` frame back. It is what service clients
+(orchestrators) use, and admins can too.
+
 ## Internal Packages
 
 ### `internal/api`
 
-HTTP API handlers and routing. Uses standard `net/http` with Chi router. Includes the Connect API endpoint for TCP tunneling.
+HTTP API handlers and routing. Uses standard `net/http` with Chi router. Includes the Connect API endpoint for TCP tunneling, the HTTPS exec endpoint (`exec.go`), service-client authorization (`clientauth.go`: a fixed route allowlist and per-shed ownership) and create policy (`policy.go`), the audit hooks (`audit.go`), and the `max_age` reaper that deletes service clients' expired sheds (`reaper.go`).
 
 ### `internal/config`
 
@@ -217,6 +224,18 @@ Firecracker backend (Linux only): VM lifecycle via Firecracker SDK, TAP networki
 ### `internal/vz`
 
 VZ backend (macOS Apple Silicon only): VM lifecycle via vfkit subprocess, NAT networking, rootfs management, metadata persistence. Implements `vmutil.Dialer` with direct per-port Unix socket connections (no handshake needed).
+
+### `internal/netpolicy`
+
+The `isolated` network profile on Firecracker: renders this server's two nftables tables (`bridge` and `inet shed_<name>`) from the guarded sheds' TAP, MAC and IP, applies them with `nft -f -` in one transaction, and tracks the desired state so the backend's 30 s check can reapply them. It never touches the bridge, the NAT rules or another table.
+
+### `internal/audit`
+
+The JSON Lines audit log, `audit.jsonl` (service-client requests, HTTPS execs, reaps), written `0600` and rotated at 50 MiB.
+
+### `internal/servertls`
+
+The server's self-signed TLS certificate, the mtls client CA, client-certificate verification, and service-client certificates (`service.go`: their shape, `shed-server client issue`'s signing, and the handshake check against `auth.clients`).
 
 ### `internal/plugin`
 
@@ -244,13 +263,9 @@ Connect API-based tunnel management for port forwarding.
 
 ## Security Model
 
-Shed relies on network-level trust:
-
-- Assumes all machines are on a private network (Tailscale)
-- No authentication on HTTP API
-- SSH accepts all keys (network access = trust)
-- Workloads run as a non-root `shed` user (UID 1000) with passwordless sudo
-- Not suitable for multi-tenant or public deployments
+- **Postures:** `open` (the default, loopback-bound, no credential), `token` and `mtls` (pinned TLS, an HTTP credential and an enforced SSH key allowlist). Service clients, in `mtls` mode, reach only their own sheds.
+- **Per shed:** a mount selection and, on Firecracker, the `isolated` network profile limit what a guest reaches. Workloads run as the `shed` user (UID 1000) with passwordless sudo.
+- Built for one owner; not multi-tenant. The full model is in [Security](../reference/security.md).
 
 ## Shed Lifecycle
 
@@ -265,6 +280,8 @@ stateDiagram-v2
     Running --> [*]: shed delete
     Stopped --> [*]: shed delete
 ```
+
+A shed a service client owns has one more exit: once it is older than the client's `max_age`, the reaper (at `serve` start, then every 60 s) stops and deletes it.
 
 ## File Locations
 
@@ -282,5 +299,7 @@ stateDiagram-v2
 | Path | Purpose |
 |------|---------|
 | `/etc/shed/server.yaml` | Server configuration |
-| `/etc/shed/host_key` or `~/.shed/host_key` | SSH host private key (root vs. non-root) |
-| `~/.shed/env` | Environment variables for VMs |
+| `{state_dir}/` | Identity material: `host_key`, `tls_cert.pem`/`tls_key.pem`, the mtls client CA (`ca_cert.pem`/`ca_key.pem`) and `github_keys/`. `state_dir` defaults to `/etc/shed` as root and `~/.shed` otherwise |
+| `~/.shed/env` (`env_file`) | Variables passed to the in-VM `git clone` of `repo` (never for a service client's sheds) |
+| `<instance_dir parent>/audit.jsonl` | Audit log: service-client requests, HTTPS execs, reaps (`/var/lib/shed/firecracker/audit.jsonl` by default) |
+| `<instance_dir parent>/egress-audit.jsonl` | Egress-proxy decisions, when egress is enabled |

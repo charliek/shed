@@ -170,6 +170,18 @@ shed create my-new-shed --from-snapshot <snap>
 
 ## Known caveats
 
+- **A snapshot keeps the disk, not the shed's settings.** It records no
+  network profile, mount selection or owner. `shed create --from-snapshot`
+  takes `--network` and `--mounts` from its own flags, which default to the
+  server's `network.default_profile` and every server mount. Spawning from a
+  snapshot of an isolated shed with no mounts therefore gives an open shed with
+  every mount unless you pass them again:
+
+  ```bash
+  shed create work2 --from-snapshot baseline-v1 --mounts none --network isolated
+  ```
+
+  (Service clients cannot use snapshots at all.)
 - **machine-id is not stable across reboots of the same shed.** Because
   `/etc/machine-id` is a tmpfs symlink (see "Identity regeneration"), every
   VM boot generates a fresh value. This is the trade-off for unique-per-VM

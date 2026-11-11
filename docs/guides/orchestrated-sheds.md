@@ -141,8 +141,38 @@ is in [API › POST /api/sheds/{name}/exec](../reference/api.md#post-apishedsnam
 | Create within its policy: prefix, image list, caps, `max_sheds` | Use `local_dir`, `add_dirs`, `from_snapshot`, another network profile, or mounts outside `server_mounts` (`403 POLICY_VIOLATION`) |
 | Run anything as root inside its sheds (`sudo`) | Use the credential bus, SSH, Connect tunnels, snapshots or egress settings |
 
+`GET /api/info` needs no shed, so call it first: its `features` say what the
+server supports (`service_clients`, `http_exec`, `mount_selection`, and
+`network_profiles` on Firecracker). `GET /api/images` returns the server's
+whole image list, the same one an admin sees; the client can create only from
+the server's `default_image` and the aliases its policy's `images` names.
+
 Admins keep the full API and see every shed, with its `owner`, in
 `shed list -v`.
+
+### Repositories and credentials
+
+A create's `repo` is cloned inside the shed with only the egress proxy
+settings in its environment, never the server's `env_file` variables, so the
+server's git credentials do not reach an owned shed. Use a public URL, or
+create the shed without `repo` and clone it yourself with a short-lived token
+the orchestrator passes in the exec request's `env`:
+
+```bash
+$API -d '{"argv":["bash","-lc","git clone \"https://x-access-token:${TOKEN}@github.com/org/repo.git\" ~/repo"],
+          "env":{"TOKEN":"<short-lived token>"},"timeout_seconds":300}' \
+  https://shed-host:8443/api/sheds/nocturn-demo/exec | jq -c 'select(.t == "exit")'
+```
+
+The token is then in the shed (the clone's `.git/config` keeps the URL), so
+scope it to the one repository and keep its lifetime short.
+
+The [credential bus](../reference/security.md#credential-bus) is always off for
+an owned shed, so SSH-agent, AWS and Docker credential forwarding do not work
+there: `ssh-add -l`, the Docker and AWS credential helpers, and any publish to
+the in-guest agent at `127.0.0.1:498` get no answer: each request waits out the
+agent's 30 s timeout, then fails. An owned shed has no server mounts unless the policy's
+`server_mounts` names some, so no host credential directory is there either.
 
 ## Lifetime
 

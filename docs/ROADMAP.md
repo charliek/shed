@@ -6,6 +6,18 @@ This document outlines planned future enhancements for Shed.
 
 - Consider reducing `MaxMessageSize` (16MB) or adding streaming for large messages in agentproto.
 
+## Shed Hardening and Orchestration
+
+Follow-ups to service clients and the `isolated` network profile (see [Security](reference/security.md)):
+
+- **Proxy-only profile** — isolated, with the [egress proxy](reference/egress.md) as the only way out, so domain policy becomes enforced rather than cooperative ([#205](https://github.com/charliek/shed/issues/205)).
+- **No-network profile** — a shed with no network at all (the host still reaches it over vsock), for code that needs none.
+- **MSS clamping** on the host's forwarding path, for container traffic on a reduced-MTU path ([#202](https://github.com/charliek/shed/issues/202)).
+- **Per-certificate revocation** for service clients, by serial, instead of removing the whole client.
+- **Firecracker under its `jailer`** (chroot, namespaces, privilege drop), so a VMM escape is not root on the host.
+- **9P over vsock**, so a shed's server mounts are not reachable on the bridge by other open sheds.
+- **Restore the bridge and NAT at `serve` start**, so creates work after a host reboot without re-running `shed-server setup` ([#413](https://github.com/charliek/shed/issues/413)).
+
 ## Notification Channel Enhancements
 
 Future uses for the persistent agent↔host notification port (1026):

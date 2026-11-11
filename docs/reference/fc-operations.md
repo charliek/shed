@@ -66,7 +66,7 @@ shed delete myproject --force
 
 ## Mounts
 
-All mounts configured under the `mounts:` section of `server.yaml` are bound into Firecracker VMs via 9P over the TAP bridge network. Each mount directory gets its own TCP-based 9P server. Changes are immediately visible on both sides, similar to Docker bind mounts.
+A shed gets the mounts configured under the `mounts:` section of `server.yaml` that its selection names (`shed create --mounts`; all of them by default), bound into the Firecracker VM via 9P over the TAP bridge network. Each mount directory gets its own TCP-based 9P server; an unselected mount gets none for that shed. See [Configuration › Mounts](configuration.md#mounts). Changes are immediately visible on both sides, similar to Docker bind mounts.
 
 The legacy `credentials:` key is still honored as a fallback when `mounts:` is absent.
 
@@ -174,9 +174,16 @@ Example output:
   "rootfs_path": "/var/lib/shed/firecracker/uppers/myproject/upper.ext4",
   "upper_path": "/var/lib/shed/firecracker/uppers/myproject/upper.ext4",
   "upper_size_bytes": 5368709120,
-  "lower_digest": "sha256:abc123..."
+  "lower_digest": "sha256:abc123...",
+  "mount_selection": {"mode": "selected", "names": ["claude"]},
+  "network_profile": "isolated"
 }
 ```
+
+`mount_selection` is `{"mode": "all"}` for a shed with every server mount, and
+`network_profile` is `open` or `isolated`; a shed created before these existed
+has neither (every mount, open). A shed a [service client](security.md#service-clients)
+created also has `"owner": "<client name>"`.
 
 ### Check VM Process
 
@@ -233,6 +240,78 @@ shed exec myproject -- ip addr show
 # Test internet connectivity
 shed exec myproject -- curl -I https://google.com
 ```
+
+## Network profiles
+
+An `isolated` shed (`shed create --network isolated`, or `network.default_profile:
+isolated`) reaches the internet and nothing else. shed-server enforces it with
+two nftables tables of its own, named after the server's `name:` with every
+character outside `[A-Za-z0-9_]` replaced by `_` (`shed_my_server` for
+`my-server`). What they block is in [Security › Network
+profiles](security.md#network-profiles); this section is the operational side.
+
+### Inspect the rules
+
+```bash
+sudo nft list table inet shed_my_server     # host input and forwarding drops, the blocked ranges
+sudo nft list table bridge shed_my_server   # anti-spoofing and shed-to-shed drops on shed-br0
+```
+
+The tables exist only while something needs them (an isolated shed exists, or
+the default profile is `isolated`). Each isolated shed is a set element: its
+TAP, MAC and IP. `shed list -v` shows each shed's profile in the `NETWORK`
+column.
+
+### Log lines
+
+```bash
+journalctl -u shed-server | grep -i 'network policy'
+```
+
+| Line | Meaning |
+|------|---------|
+| `Network policy: tables bridge/inet shed_<name> installed (N guarded shed(s), default profile …)` | `serve` start rebuilt the tables from shed metadata. |
+| `ERROR: network policy: could not install tables shed_<name> for N guarded shed(s): …; setting their TAPs down until the rules apply` | The rebuild at start failed. Every isolated shed's TAP is down (no network) until a later check applies the rules. |
+| `ERROR: network policy: table bridge/inet shed_<name> is missing (flushed by something else?); reapplying` | The 30 s check found a table gone (`nft flush ruleset`, a firewall reload). Isolated sheds were open from the flush until now. Followed by `tables shed_<name> reapplied` on success. |
+| `ERROR: network policy: an earlier apply of tables shed_<name> failed; reapplying` | A previous change could not be applied; the check retries it. |
+| `ERROR: network policy: cannot ensure tables shed_<name>: …; setting guarded sheds' TAPs down` | The reapply failed. Isolated sheds are cut off until it succeeds. |
+| `Network policy: tables shed_<name> are in place again; setting guarded sheds' TAPs up` | A later check applied the rules and restored the isolated sheds' network. |
+
+### `503 NETWORK_ENFORCEMENT_UNAVAILABLE`
+
+Creating or starting an isolated shed fails with this when shed-server cannot
+install its entry. The shed never runs unguarded. Check, in order:
+
+1. `nft` is on shed-server's `PATH`: `command -v nft` (install with
+   `sudo apt install nftables`).
+2. shed-server runs as root. The deb's systemd unit does; a server started
+   with only `setcap` capabilities cannot run `nft`.
+3. The error text, also in the log, carries nft's own output.
+
+Once `nft` works for the server, retry the create or start.
+
+### An isolated shed has no network
+
+If the rules could not be applied (at `serve` start, or after a table went
+missing), shed-server sets the isolated sheds' TAPs down rather than leave them
+unguarded. The shed is running, but nothing leaves it:
+
+```bash
+TAP=$(sudo jq -r .tap_device /var/lib/shed/firecracker/instances/myproject/metadata.json)
+ip link show "$TAP"       # state DOWN
+journalctl -u shed-server | grep -i 'network policy' | tail
+```
+
+Fix the cause from the log (usually `nft`, as above). The 30 s check then
+applies the rules and sets the TAPs up again, or restart `serve`.
+
+### Removing the tables
+
+`sudo shed-server network teardown` deletes this server's two tables and
+nothing else (not the bridge, the NAT or `FORWARD` rules, or another table),
+and lists the isolated sheds that are now unguarded. Run it only with `serve`
+stopped: a running server puts the tables back, and the next `serve` start
+does too while an isolated shed exists.
 
 ## Time synchronization
 
@@ -353,6 +432,10 @@ done
 
 # Remove sockets
 sudo rm -f /var/run/shed/firecracker/*.sock
+
+# Stop the server, then remove its nftables tables (isolated sheds' rules)
+sudo systemctl stop shed-server
+sudo shed-server network teardown
 ```
 
 ## Docker Inside VMs
@@ -542,3 +625,8 @@ sudo shed-server serve
 sudo setcap cap_net_admin+ep $(which shed-server)
 sudo setcap cap_net_admin+ep $(which firecracker)
 ```
+
+The capability-only setup does not cover the [isolated network
+profile](#network-profiles): shed-server runs `nft` as a child process, which
+does not get the capability, so isolated sheds need shed-server running as
+root.
