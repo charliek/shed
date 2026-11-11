@@ -86,6 +86,12 @@ type clientFakeBackend struct {
 	// createGate, when set, blocks CreateShed until it is closed.
 	createGate chan struct{}
 	createdHit chan struct{}
+	// publishEarly lists the shed (as a real backend persists its metadata)
+	// before waiting on createGate.
+	publishEarly bool
+	// onLock, when set, runs at the start of delete, start, stop and exec,
+	// before the owner check.
+	onLock func()
 }
 
 func newClientFakeBackend(sheds ...config.Shed) *clientFakeBackend {
@@ -114,14 +120,37 @@ func (b *clientFakeBackend) createdSnapshot() []config.CreateShedRequest {
 	return append([]config.CreateShedRequest(nil), b.created...)
 }
 
-func (b *clientFakeBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
+// GetShed, like the real backends, checks a required owner (the context of a
+// client's request on a {name} route) against the shed it loads.
+func (b *clientFakeBackend) GetShed(ctx context.Context, name string) (*config.Shed, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s, ok := b.sheds[name]
 	if !ok {
 		return nil, config.ErrShedNotFoundSentinel
 	}
+	if err := backend.CheckOwner(ctx, name, s.Owner); err != nil {
+		return nil, err
+	}
 	return &s, nil
+}
+
+// beforeLocked runs b.onLock (the window where a real backend waits for its
+// per-shed lock) and then checks a required owner against the shed as it is
+// now, as the real backends do once they hold the lock.
+func (b *clientFakeBackend) beforeLocked(ctx context.Context, name string) error {
+	b.mu.Lock()
+	hook := b.onLock
+	b.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s, ok := b.sheds[name]; ok {
+		return backend.CheckOwner(ctx, name, s.Owner)
+	}
+	return nil
 }
 
 func (b *clientFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
@@ -139,6 +168,10 @@ func (b *clientFakeBackend) CreateShed(_ context.Context, req config.CreateShedR
 	b.mu.Lock()
 	b.created = append(b.created, req)
 	gate, hit := b.createGate, b.createdHit
+	s := config.Shed{Name: req.Name, Status: config.StatusRunning, Owner: req.Owner, Mounts: config.EffectiveMountSelection(req.ResolvedMounts)}
+	if b.publishEarly {
+		b.sheds[req.Name] = s
+	}
 	b.mu.Unlock()
 	if hit != nil {
 		hit <- struct{}{}
@@ -146,14 +179,16 @@ func (b *clientFakeBackend) CreateShed(_ context.Context, req config.CreateShedR
 	if gate != nil {
 		<-gate
 	}
-	s := config.Shed{Name: req.Name, Status: config.StatusRunning, Owner: req.Owner, Mounts: config.EffectiveMountSelection(req.ResolvedMounts)}
 	b.mu.Lock()
 	b.sheds[req.Name] = s
 	b.mu.Unlock()
 	return &s, nil
 }
 
-func (b *clientFakeBackend) DeleteShed(_ context.Context, name string) error {
+func (b *clientFakeBackend) DeleteShed(ctx context.Context, name string) error {
+	if err := b.beforeLocked(ctx, name); err != nil {
+		return err
+	}
 	b.record("delete " + name)
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -162,16 +197,25 @@ func (b *clientFakeBackend) DeleteShed(_ context.Context, name string) error {
 }
 
 func (b *clientFakeBackend) StartShed(ctx context.Context, name string) (*config.Shed, error) {
+	if err := b.beforeLocked(ctx, name); err != nil {
+		return nil, err
+	}
 	b.record("start " + name)
 	return b.GetShed(ctx, name)
 }
 
 func (b *clientFakeBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
+	if err := b.beforeLocked(ctx, name); err != nil {
+		return nil, err
+	}
 	b.record("stop " + name)
 	return b.GetShed(ctx, name)
 }
 
-func (b *clientFakeBackend) Exec(_ context.Context, name string, opts backend.ExecOptions) error {
+func (b *clientFakeBackend) Exec(ctx context.Context, name string, opts backend.ExecOptions) error {
+	if err := b.beforeLocked(ctx, name); err != nil {
+		return err
+	}
 	b.record("exec " + name)
 	if opts.OnStarted != nil {
 		opts.OnStarted()
@@ -690,6 +734,115 @@ func TestClientMaxSheds(t *testing.T) {
 	}
 	if r := do(router, client, "POST", "/api/sheds", `{"name":"nocturn-third"}`); r.code != http.StatusCreated {
 		t.Errorf("create after a delete = %d %s", r.code, r.body)
+	}
+}
+
+// swapOnRead is a request body that, on its first Read (after the auth
+// middleware has authorized the request), runs swap.
+type swapOnRead struct {
+	r    io.Reader
+	swap func()
+	once sync.Once
+}
+
+func (b *swapOnRead) Read(p []byte) (int, error) {
+	b.once.Do(b.swap)
+	return b.r.Read(p)
+}
+
+// replaceWithAdminShed is a delete and recreate by an admin under the same
+// name: the shed is there, running, with no owner.
+func (b *clientFakeBackend) replaceWithAdminShed(name string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sheds[name] = config.Shed{Name: name, Status: config.StatusRunning}
+}
+
+// TestClientOwnershipBoundToTheShedOperatedOn: ownership is checked against
+// the shed an operation acts on, not only by the middleware's lookup. A shed
+// the client owned when the request was authorized, deleted and recreated by
+// an admin under the same name before the operation runs (exec: while the
+// client withholds its body; lifecycle: while the operation waits for the
+// backend's per-shed lock), is 404 and the admin's shed is not touched.
+func TestClientOwnershipBoundToTheShedOperatedOn(t *testing.T) {
+	owned := config.Shed{Name: "nocturn-a", Status: config.StatusRunning, Owner: testClientName}
+	client := serviceLeaf(testClientName)
+
+	t.Run("exec", func(t *testing.T) {
+		be := newClientFakeBackend(owned)
+		_, router := clientTestServer(t, be, defaultTestPolicy())
+		body := &swapOnRead{r: strings.NewReader(`{"argv":["true"]}`), swap: func() { be.replaceWithAdminShed("nocturn-a") }}
+		req := httptest.NewRequest("POST", "/api/sheds/nocturn-a/exec", body)
+		req.Header.Set("Content-Type", "application/json")
+		withClientCert(req, client)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		r := apiResp{rec.Code, rec.Body.Bytes(), rec.Header()}
+		if r.code != http.StatusNotFound || r.errCode(t) != config.ErrShedNotFound {
+			t.Errorf("exec into a replaced shed = %d %s, want 404 SHED_NOT_FOUND", r.code, r.body)
+		}
+		if calls := be.callsSnapshot(); len(calls) != 0 {
+			t.Errorf("the replacement was operated on: %v", calls)
+		}
+	})
+
+	for _, tc := range [][2]string{
+		{"DELETE", "/api/sheds/nocturn-a"},
+		{"POST", "/api/sheds/nocturn-a/stop"},
+		{"POST", "/api/sheds/nocturn-a/start"},
+	} {
+		t.Run(tc[0]+" "+tc[1], func(t *testing.T) {
+			be := newClientFakeBackend(owned)
+			be.onLock = func() { be.replaceWithAdminShed("nocturn-a") }
+			_, router := clientTestServer(t, be, defaultTestPolicy())
+			r := do(router, client, tc[0], tc[1], "")
+			if r.code != http.StatusNotFound || r.errCode(t) != config.ErrShedNotFound {
+				t.Errorf("%s on a replaced shed = %d %s, want 404 SHED_NOT_FOUND", tc[0], r.code, r.body)
+			}
+			if calls := be.callsSnapshot(); len(calls) != 0 {
+				t.Errorf("the replacement was operated on: %v", calls)
+			}
+			if sh, err := be.GetShed(context.Background(), "nocturn-a"); err != nil || sh.Owner != "" {
+				t.Errorf("the admin's shed = %+v, %v", sh, err)
+			}
+		})
+	}
+}
+
+// TestClientMaxShedsCountsAnInFlightCreateOnce: a real backend persists an
+// owned shed's metadata before it boots, so a create in flight is listed as
+// owned too. It still takes one slot, not two.
+func TestClientMaxShedsCountsAnInFlightCreateOnce(t *testing.T) {
+	policy := defaultTestPolicy()
+	policy.MaxSheds = 2
+	be := newClientFakeBackend()
+	be.publishEarly = true
+	_, router := clientTestServer(t, be, policy)
+	client := serviceLeaf(testClientName)
+
+	gate := make(chan struct{})
+	be.createGate = gate
+	be.createdHit = make(chan struct{}, 1)
+	done := make(chan apiResp, 1)
+	go func() { done <- do(router, client, "POST", "/api/sheds", `{"name":"nocturn-a"}`) }()
+	<-be.createdHit // nocturn-a is listed as owned and still in flight
+	be.mu.Lock()
+	be.createGate, be.createdHit = nil, nil
+	be.mu.Unlock()
+
+	if r := do(router, client, "POST", "/api/sheds", `{"name":"nocturn-b"}`); r.code != http.StatusCreated {
+		t.Errorf("second create while the first is listed and in flight = %d %s", r.code, r.body)
+	}
+	if r := do(router, client, "POST", "/api/sheds", `{"name":"nocturn-c"}`); r.code != http.StatusForbidden || !strings.Contains(r.errMessage(t), "max_sheds") {
+		t.Errorf("third create = %d %s", r.code, r.body)
+	}
+	close(gate)
+	if first := <-done; first.code != http.StatusCreated {
+		t.Fatalf("first create = %d %s", first.code, first.body)
+	}
+	// Both done and owned: still at the limit.
+	if r := do(router, client, "POST", "/api/sheds", `{"name":"nocturn-c"}`); r.code != http.StatusForbidden {
+		t.Errorf("create at max_sheds = %d %s", r.code, r.body)
 	}
 }
 

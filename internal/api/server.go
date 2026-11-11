@@ -44,9 +44,10 @@ type Server struct {
 	mux *chi.Mux
 
 	// clientMu guards clientCreates, the creates each service client has in
-	// flight, counted against policy.max_sheds with the sheds it owns.
+	// flight (client -> shed name -> count), counted against policy.max_sheds
+	// with the sheds it owns.
 	clientMu      sync.Mutex
-	clientCreates map[string]int
+	clientCreates map[string]map[string]int
 
 	// execMu guards execInFlight, the count of HTTPS execs running per shed
 	// (exec.max_concurrent_per_shed). The map is created on first use.

@@ -194,7 +194,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	req.ResolvedMounts = sel
 
 	if caller.IsClient() {
-		release, rule, err := s.reserveClientCreate(r.Context(), caller)
+		release, rule, err := s.reserveClientCreate(r.Context(), caller, req.Name)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, config.ErrBackendError, err.Error())
 			return

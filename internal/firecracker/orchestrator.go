@@ -378,6 +378,14 @@ func (b *fcCreator) FinalizeStartedVM(ctx context.Context, metaRaw orchestrator.
 		delete(b.c.vms, shedName)
 		return nil
 	})
+	// SetupCredentials, later in the sequence, opens the shed's message
+	// channel; a failure after it (egress setup) must not leave the channel
+	// behind for the next shed created under this name. A no-op when no
+	// channel was opened.
+	cleanup.Register("stop message channel", func() error {
+		b.c.credMgr.StopListener(shedName)
+		return nil
+	})
 	return nil
 }
 
@@ -470,7 +478,7 @@ func (b *fcCreator) CloneRepo(ctx context.Context, req config.CreateShedRequest,
 	agent := b.c.newAgentClient(meta.Name)
 	backend.Phase(ctx, "repo")
 	backend.Status(ctx, "Cloning repository...")
-	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, b.egressEnv); err != nil {
+	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, meta.Owner != "", b.egressEnv); err != nil {
 		log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
 		backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
 	} else {
@@ -688,6 +696,14 @@ func (b *fcStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.
 		b.c.mu.Lock()
 		defer b.c.mu.Unlock()
 		delete(b.c.vms, shedName)
+		return nil
+	})
+	// SetupCredentials, later in the sequence, opens the shed's message
+	// channel; a failure after it (egress setup) must not leave the channel
+	// behind for the next shed created under this name. A no-op when no
+	// channel was opened.
+	cleanup.Register("stop message channel", func() error {
+		b.c.credMgr.StopListener(shedName)
 		return nil
 	})
 	return nil

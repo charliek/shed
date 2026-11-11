@@ -2,6 +2,7 @@ package vmutil
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -191,6 +192,44 @@ func TestResumeMessageChannel(t *testing.T) {
 	})
 }
 
+// TestStaleAdminChannelNotReusedForOwnedShed: an admin shed's channel left
+// behind under a name (a teardown that missed StopListener) is replaced, not
+// reused, when a service client creates an owned shed with that name, so the
+// owned shed never inherits the admin shed's credential-bus access.
+func TestStaleAdminChannelNotReusedForOwnedShed(t *testing.T) {
+	cm, bridge := newResumeTestManager(t)
+
+	cm.SetupCredentials(context.Background(), newResumeTestAgent(), "nocturn-a", nil, nil, false)
+	stale := cm.channel("nocturn-a")
+	if got := bridgeNames(bridge); len(got) != 1 {
+		t.Fatalf("admin shed not on the bridge: %v", got)
+	}
+
+	// No StopListener: the owned shed's setup finds the stale channel.
+	cm.SetupCredentials(context.Background(), newResumeTestAgent(), "nocturn-a", nil, nil, true)
+
+	if got := cm.channel("nocturn-a"); got == nil || got == stale {
+		t.Fatalf("owned setup reused the admin shed's channel (%p -> %p)", stale, got)
+	}
+	if n := cm.channelCount(); n != 1 {
+		t.Fatalf("messageChannels = %d, want 1", n)
+	}
+	if got := bridgeNames(bridge); len(got) != 0 {
+		t.Fatalf("owned shed listed on the bridge: %v", got)
+	}
+	resp := &plugin.Envelope{ID: "r1", Namespace: "ssh-agent", Type: plugin.MessageTypeResponse}
+	if err := bridge.SendToShed("nocturn-a", resp); !errors.Is(err, plugin.ErrCredentialBusDisabled) {
+		t.Fatalf("SendToShed(owned) = %v, want ErrCredentialBusDisabled", err)
+	}
+
+	// The same flag again still dedupes.
+	owned := cm.channel("nocturn-a")
+	cm.ResumeMessageChannel("nocturn-a", newResumeTestAgent(), true)
+	if got := cm.channel("nocturn-a"); got != owned {
+		t.Fatalf("same-flag resume replaced the channel (%p -> %p)", owned, got)
+	}
+}
+
 // channelCount and channel are test-only accessors over the manager's
 // internal map (same package).
 func (cm *CredentialManager) channelCount() int {
@@ -205,7 +244,7 @@ func (cm *CredentialManager) channelCount() int {
 func (cm *CredentialManager) channel(name string) *NotifyConn {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	return cm.messageChannels[name]
+	return cm.messageChannels[name].conn
 }
 
 // TestStartMessageChannelLifecycleRace hammers the window that #315's startup

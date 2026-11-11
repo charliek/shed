@@ -762,6 +762,9 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 		}
 		return nil, err
 	}
+	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
+		return nil, err
+	}
 
 	status := meta.Status
 	if status == config.StatusRunning {
@@ -841,6 +844,10 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 		}
 		return err
 	}
+	// Checked under the per-shed lock, against the shed being deleted.
+	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
+		return err
+	}
 
 	if meta.Status == config.StatusRunning {
 		backend.Status(ctx, "Terminating virtual machine...")
@@ -899,6 +906,11 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 	// can still hold servers: an unexpected VMM exit that GetShed
 	// reconciled to Stopped never closed them.
 	c.stopP9Servers(name)
+	// The message channel and bridge registration too: a Stopped shed (a VMM
+	// exit GetShed reconciled, or a failed create's leftovers) can still hold
+	// them, and a channel left under this name would be found by the next
+	// shed created with it.
+	c.credMgr.StopListener(name)
 
 	backend.Status(ctx, "Releasing network...")
 	if err := c.netMgr.DeleteTAPDevice(meta.TAPDevice); err != nil {
@@ -933,6 +945,9 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 // start.go for the lifecycle contract.
 func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, error) {
 	defer c.acquireCreateLock(name)()
+	if err := c.checkOwnerLocked(ctx, name); err != nil {
+		return nil, err
+	}
 	return orchestrator.StartShed(ctx, &fcStarter{c: c}, orchestrator.StartRequest{Name: name})
 }
 
@@ -956,6 +971,9 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		if errors.Is(err, ErrInstanceNotFound) {
 			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 		}
+		return nil, err
+	}
+	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
 		return nil, err
 	}
 
@@ -1214,4 +1232,15 @@ func (c *Client) ResetShed(ctx context.Context, name string) (*config.Shed, erro
 
 	log.Printf("reset shed %s: upper recreated at %s (%d bytes)", name, upperPath, size)
 	return metadataToShed(meta), nil
+}
+
+// checkOwnerLocked applies backend.CheckOwner to the shed's stored owner, for
+// an operation that holds the per-shed lock and loads the metadata itself
+// later. A shed that cannot be loaded is left to the operation to report.
+func (c *Client) checkOwnerLocked(ctx context.Context, name string) error {
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		return nil
+	}
+	return backend.CheckOwner(ctx, name, meta.Owner)
 }

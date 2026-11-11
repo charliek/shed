@@ -79,37 +79,54 @@ func (s *Server) resolveMountSelection(w http.ResponseWriter, c Caller, req *con
 	return config.SelectedMounts(*req.Mounts), true
 }
 
-// reserveClientCreate counts a service client's owned sheds, plus its creates
-// already in flight, against policy.max_sheds, and reserves a slot for this
-// create. On success the caller must call release when the create returns.
+// reserveClientCreate counts a service client's sheds against
+// policy.max_sheds and reserves a slot for this create of shedName. The count
+// is the union, by name, of the sheds the client owns and its creates in
+// flight: a backend persists an owned shed's metadata before it boots, so a
+// create still in flight is usually listed as owned too and must not count
+// twice. On success the caller must call release when the create returns.
 // refusal is the policy rule when the client is at its limit; err is a failed
 // shed listing.
-func (s *Server) reserveClientCreate(ctx context.Context, c Caller) (release func(), refusal string, err error) {
+func (s *Server) reserveClientCreate(ctx context.Context, c Caller, shedName string) (release func(), refusal string, err error) {
 	s.clientMu.Lock()
 	defer s.clientMu.Unlock()
 	sheds, err := s.backend.ListSheds(ctx)
 	if err != nil {
 		return nil, "", err
 	}
-	owned := 0
+	names := map[string]bool{}
 	for i := range sheds {
 		if sheds[i].Owner == c.Name {
-			owned++
+			names[sheds[i].Name] = true
 		}
 	}
-	if s.clientCreates == nil {
-		s.clientCreates = map[string]int{}
+	owned := len(names)
+	inFlight := s.clientCreates[c.Name]
+	for n := range inFlight {
+		names[n] = true
 	}
 	limit := c.Client.Policy.MaxSheds
-	if inFlight := s.clientCreates[c.Name]; owned+inFlight >= limit {
-		return nil, fmt.Sprintf("max_sheds %d reached (%d owned, %d being created)", limit, owned, inFlight), nil
+	if !names[shedName] && len(names) >= limit {
+		return nil, fmt.Sprintf("max_sheds %d reached (%d owned, %d being created)", limit, owned, len(inFlight)), nil
 	}
-	s.clientCreates[c.Name]++
+	if s.clientCreates == nil {
+		s.clientCreates = map[string]map[string]int{}
+	}
+	if inFlight == nil {
+		inFlight = map[string]int{}
+		s.clientCreates[c.Name] = inFlight
+	}
+	inFlight[shedName]++
 	return func() {
 		s.clientMu.Lock()
 		defer s.clientMu.Unlock()
-		s.clientCreates[c.Name]--
-		if s.clientCreates[c.Name] <= 0 {
+		inFlight[shedName]--
+		if inFlight[shedName] <= 0 {
+			delete(inFlight, shedName)
+		}
+		if len(inFlight) == 0 {
+			// No release of this map is outstanding, so a later reservation
+			// starts a fresh one.
 			delete(s.clientCreates, c.Name)
 		}
 	}, "", nil

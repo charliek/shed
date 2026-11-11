@@ -28,7 +28,15 @@ type CredentialManager struct {
 	healthTracker *HealthTracker // tracks per-VM heartbeat state
 
 	mu              sync.Mutex
-	messageChannels map[string]*NotifyConn // name -> per-VM message channel
+	messageChannels map[string]messageChannel // name -> per-VM message channel
+}
+
+// messageChannel is a shed's message channel and whether it was started for
+// an owned shed. The owned flag is captured by the channel's handler and its
+// bridge registration, so a channel is reused only for the same flag.
+type messageChannel struct {
+	conn  *NotifyConn
+	owned bool
 }
 
 // NewCredentialManager creates a new CredentialManager.
@@ -38,7 +46,7 @@ func NewCredentialManager(serverCfg *config.ServerConfig, bridge *plugin.Bridge,
 		bridge:          bridge,
 		backendName:     backendName,
 		healthTracker:   healthTracker,
-		messageChannels: make(map[string]*NotifyConn),
+		messageChannels: make(map[string]messageChannel),
 	}
 }
 
@@ -76,12 +84,12 @@ func (cm *CredentialManager) HealthTracker() *HealthTracker {
 // from the plugin bridge.
 func (cm *CredentialManager) StopListener(name string) {
 	cm.mu.Lock()
-	ch := cm.messageChannels[name]
+	ch, ok := cm.messageChannels[name]
 	delete(cm.messageChannels, name)
 	cm.mu.Unlock()
 
-	if ch != nil {
-		ch.Stop()
+	if ok {
+		ch.conn.Stop()
 	}
 
 	if cm.bridge != nil {
@@ -97,7 +105,7 @@ func (cm *CredentialManager) StopListener(name string) {
 func (cm *CredentialManager) Close() {
 	cm.mu.Lock()
 	for name, ch := range cm.messageChannels {
-		ch.Stop()
+		ch.conn.Stop()
 		if cm.bridge != nil {
 			cm.bridge.UnregisterShed(name)
 		}
@@ -131,6 +139,12 @@ func (cm *CredentialManager) ResumeMessageChannel(name string, agent *AgentClien
 // (SetupCredentials on create/start, ResumeMessageChannel on server startup)
 // can't race a second NotifyConn onto the same guest — e.g. a StartShed that
 // lands just after the startup resume walk has already resumed the shed.
+//
+// A channel left behind for the same name with the other owned flag (a shed
+// deleted and recreated under its name by another caller, when a teardown
+// path missed StopListener) is stopped and replaced, never reused: its
+// handler and bridge registration would carry the old shed's credential-bus
+// access.
 func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient, owned bool) bool {
 	// Health heartbeat callback: update the tracker with agent boot time.
 	var healthFn func(env *plugin.Envelope)
@@ -189,11 +203,19 @@ func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	if _, exists := cm.messageChannels[name]; exists {
-		return false
+	if old, exists := cm.messageChannels[name]; exists {
+		if old.owned == owned {
+			return false
+		}
+		log.Printf("[%s] replacing a stale message channel (owned=%v) for owned=%v", name, old.owned, owned)
+		old.conn.Stop()
+		if cm.bridge != nil {
+			cm.bridge.UnregisterShed(name)
+		}
+		delete(cm.messageChannels, name)
 	}
 	conn := NewNotifyConn(agent.Dialer(), agent.NotifyPort(), name)
-	cm.messageChannels[name] = conn
+	cm.messageChannels[name] = messageChannel{conn: conn, owned: owned}
 
 	if cm.bridge != nil {
 		serverName := ""

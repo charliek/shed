@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 )
 
@@ -76,7 +77,13 @@ func (s *Server) serveServiceClient(w http.ResponseWriter, r *http.Request, next
 		writeError(w, http.StatusForbidden, config.ErrForbidden, "route not available to service clients")
 		return
 	}
+	ctx := r.Context()
 	if strings.Contains(pattern, "{name}") {
+		// The backend checks the owner again against the shed it loads,
+		// under its per-shed lock (and exec at the dial): this lookup alone
+		// would let an operation that waits (a lock, a slow body) act on a
+		// shed someone else recreated under the name in the meantime.
+		ctx = backend.WithRequiredOwner(ctx, name)
 		shedName := rctx.URLParam("name")
 		owned, err := s.clientOwnsShed(r, shedName, name)
 		if err != nil {
@@ -95,7 +102,7 @@ func (s *Server) serveServiceClient(w http.ResponseWriter, r *http.Request, next
 	if leaf.SerialNumber != nil {
 		caller.Serial = strings.ToLower(leaf.SerialNumber.Text(16))
 	}
-	next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), caller)))
+	next.ServeHTTP(w, r.WithContext(withCaller(ctx, caller)))
 }
 
 // clientOwnsShed reports whether shedName names an existing shed whose owner
