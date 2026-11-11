@@ -610,6 +610,9 @@ dev-server-down-fc:
 	  COMM=\$$(ps -p \$$PID -o comm= 2>/dev/null || true); \
 	  if [ -z \"\$$COMM\" ]; then \
 	    echo \"Dev FC server PID \$$PID is stale (process already gone); cleaning up PID file.\"; \
+	    echo '  Its nftables tables (if any) are left in place: they still guard any isolated dev shed whose VM is running.'; \
+	    echo '  Once no dev shed is running, delete them with:'; \
+	    echo '    ssh $(FC_REMOTE_HOST) sudo $(FC_DEV_BIN_PATH) network teardown --config $(FC_DEV_CONFIG)'; \
 	    sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_LOG_PATH); \
 	  elif ! echo \"\$$COMM\" | grep -q 'shed-server'; then \
 	    echo \"Dev FC server PID \$$PID points at an unrelated process (current comm: \$$COMM).\"; \
@@ -626,8 +629,15 @@ dev-server-down-fc:
 	      sudo -n kill -KILL \$$PID 2>/dev/null; \
 	    fi; \
 	    echo \"Dev FC server (pid \$$PID) stopped on $(FC_REMOTE_HOST).\"; \
-	    sudo -n $(FC_DEV_BIN_PATH) network teardown --config $(FC_DEV_CONFIG) || true; \
-	    sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_BIN_PATH) $(FC_DEV_PROXY_PATH) $(FC_DEV_CONFIG) $(FC_DEV_LOG_PATH); \
+	    if sudo -n $(FC_DEV_BIN_PATH) network teardown --config $(FC_DEV_CONFIG); then \
+	      sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_BIN_PATH) $(FC_DEV_PROXY_PATH) $(FC_DEV_CONFIG) $(FC_DEV_LOG_PATH); \
+	    else \
+	      echo 'ERROR: network teardown failed; the dev tables may still be installed.'; \
+	      echo '  Kept $(FC_DEV_BIN_PATH) and $(FC_DEV_CONFIG) for a retry:'; \
+	      echo '    ssh $(FC_REMOTE_HOST) sudo $(FC_DEV_BIN_PATH) network teardown --config $(FC_DEV_CONFIG)'; \
+	      sudo rm -f $(FC_DEV_PID_PATH); \
+	      exit 1; \
+	    fi; \
 	  fi"
 
 dev-server-status-fc:
@@ -677,9 +687,21 @@ test-netns-remote:
 	 esac; \
 	 echo "Cross-compiling the netpolicy netns test for linux/$$GOARCH..."; \
 	 GOOS=linux GOARCH=$$GOARCH CGO_ENABLED=0 go test -c -tags netns -o $(NETNS_TEST_BIN) ./internal/netpolicy || exit 1; \
-	 scp -q $(NETNS_TEST_BIN) $(FC_REMOTE_HOST):/tmp/netpolicy-netns.test || exit 1; \
-	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "sudo -n /tmp/netpolicy-netns.test -test.v -test.count=1 -test.run '^TestNetns'"; RC=$$?; \
-	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "rm -f /tmp/netpolicy-netns.test"; \
+	 RDIR=$$(ssh -o BatchMode=yes $(FC_REMOTE_HOST) "mktemp -d /tmp/netpolicy-netns.XXXXXXXX") || exit 1; \
+	 case "$$RDIR" in /tmp/netpolicy-netns.*) ;; *) echo "ERROR: unexpected remote temp dir '$$RDIR'"; exit 1 ;; esac; \
+	 RC=0; \
+	 if scp -q $(NETNS_TEST_BIN) $(FC_REMOTE_HOST):$$RDIR/netpolicy-netns.test; then \
+	   OUT=$$(ssh -o BatchMode=yes $(FC_REMOTE_HOST) "sudo -n $$RDIR/netpolicy-netns.test -test.v -test.count=1 -test.run '^TestNetns'" 2>&1); RC=$$?; \
+	   printf '%s\n' "$$OUT"; \
+	   if [ $$RC -eq 0 ] && printf '%s\n' "$$OUT" | grep -q -- '--- SKIP'; then \
+	     echo "ERROR: a netns test skipped (root, nft and ip are required on $(FC_REMOTE_HOST)); the rules were not proven"; RC=1; \
+	   elif [ $$RC -eq 0 ] && ! printf '%s\n' "$$OUT" | grep -q -- '--- PASS: TestNetns'; then \
+	     echo "ERROR: no netns test ran"; RC=1; \
+	   fi; \
+	 else \
+	   RC=1; \
+	 fi; \
+	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "rm -rf $$RDIR"; \
 	 exit $$RC
 
 # Run the integration suite against the parallel dev FC shed-server.

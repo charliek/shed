@@ -141,7 +141,8 @@ limitations.
 
 Returns server metadata and capabilities.
 
-**Response (open or token mode):**
+**Response (open or token mode; token mode is `"secure"` on the wire, see the
+warning below):**
 
 ```json
 {
@@ -150,7 +151,7 @@ Returns server metadata and capabilities.
   "ssh_port": 2222,
   "http_port": 8080,
   "backend": "vz",
-  "auth_mode": "token",
+  "auth_mode": "secure",
   "features": ["overview", "http_exec", "mount_selection"]
 }
 ```
@@ -160,10 +161,10 @@ valid certificate, since the listener runs `RequireAndVerifyClientCert`:**
 
 ```json
 {
-  "name": "mini-desktop",
+  "name": "mini3",
   "version": "1.0.0",
   "ssh_port": 2222,
-  "backend": "vz",
+  "backend": "firecracker",
   "auth_mode": "mtls",
   "ca_fingerprint": "sha256:…",
   "ca_not_after": "2036-06-15T00:00:00Z",

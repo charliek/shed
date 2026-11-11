@@ -265,11 +265,12 @@ host. The golden-file tests for the rendered script run in `make check`.
 A mistake in the rules can cut the remote host off (including SSH, when SSH
 arrives over a network the rules match). The first time a changed rule set
 reaches the FC remote's dev server, arm an automatic rollback that stops the
-dev server (its 30 s presence check would otherwise put the tables back) and
-deletes **only its own tables**:
+dev server (its 30 s presence check would otherwise put the tables back),
+waits for it to exit (up to 35 s, its 30 s graceful shutdown included, then
+SIGKILL) and only then deletes **only its own tables**:
 
 ```sh
-ssh mini3 "sudo -n sh -c 'setsid nohup sh -c \"sleep 120; kill -TERM \\\$(cat /tmp/shed-server-dev.pid); sleep 5; nft delete table bridge shed_mini3_dev; nft delete table inet shed_mini3_dev\" </dev/null >/dev/null 2>&1 & echo \$! > /tmp/shed-dev-nft-rollback.pid'"
+ssh mini3 "sudo -n sh -c 'setsid nohup sh -c \"sleep 120; P=\\\$(cat /tmp/shed-server-dev.pid); kill -TERM \\\$P; i=0; while kill -0 \\\$P 2>/dev/null && [ \\\$i -lt 35 ]; do sleep 1; i=\\\$((i+1)); done; kill -0 \\\$P 2>/dev/null && kill -KILL \\\$P; sleep 1; nft delete table bridge shed_mini3_dev; nft delete table inet shed_mini3_dev\" </dev/null >/dev/null 2>&1 & echo \$! > /tmp/shed-dev-nft-rollback.pid'"
 ```
 
 Then, within the window: create one isolated shed on the dev server
