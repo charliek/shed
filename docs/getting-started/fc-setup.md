@@ -262,7 +262,7 @@ sudo systemctl start shed-server
 sudo shed-server pull-images
 ```
 
-See the [v0.4 → v0.5 Upgrade Guide](../upgrades/v0.4-to-v0.5.md) for
+See the [v0.4 → v0.5 Upgrade Guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.4-to-v0.5.md) for
 what's new in v0.5.0, what carries over, and recovery scenarios.
 
 Workspace data under `--local-dir` mounts is unaffected. Workspace data

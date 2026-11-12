@@ -158,7 +158,7 @@ func TestReadBlobDetectsLegacyBundledDirectory(t *testing.T) {
 	}
 	for _, want := range []string{
 		"v0.4.x bundled directory layout",
-		"docs/upgrades/v0.4-to-v0.5.md",
+		"https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.4-to-v0.5.md",
 		"wipe legacy store",
 	} {
 		if !strings.Contains(err.Error(), want) {

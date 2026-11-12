@@ -154,6 +154,25 @@ All notable changes to this project will be documented in this file.
   the client's default server. The FC dev config gains an `itest` image alias
   (`shed-fc-base:v0.9.0`) for the exec and service-client tests.
 
+### Removed
+
+- **Desktop: the Swift macOS app's sources.** The Tauri app has been the shipped macOS client
+  since 0.9.0; the retired Swift app (`desktop/Sources`, its tests, `Package.swift`), the
+  `shed-core-ffi` UniFFI crate that bridged the Rust core to it, its build/smoke scripts and
+  its CI job are gone ([#364](https://github.com/charliek/shed/issues/364)). Nothing a user
+  installs changes: the Tauri mac app keeps the bundle id, Sparkle feed and EdDSA key, so
+  pre-0.9.0 installs still update in place. The Swift app's iTerm2 and Warp terminal presets
+  have no Tauri equivalent yet ([#449](https://github.com/charliek/shed/issues/449),
+  [#450](https://github.com/charliek/shed/issues/450)).
+- **Development: `make -C desktop` targets for the Swift app** (`core`, `bundle`, `dmg`,
+  `e2e-ci`, `e2e-swift`, `m0-gates`, `smoke*`, swift-format). `build`, `test`, `lint`, `fmt`,
+  `e2e` and `run` now alias the Tauri and Rust-core targets, and the shedtest harness no
+  longer takes `--target`. CI's `swift` job is replaced by `core-mac` (the Rust core's tests
+  and clippy on macOS).
+- **Docs: the upgrade guides before v0.8.2 → v0.9.0.** Links to them, including the server's
+  config-error messages, now point at their copies in the
+  [v0.9.0 tag](https://github.com/charliek/shed/tree/v0.9.0/docs/upgrades).
+
 ### Fixed
 
 - **Desktop (craze): stopping a session no longer freezes its transcript panel.** craze 0.2.0
@@ -1179,7 +1198,7 @@ Local-first, zero-plaintext-secure network surface — finishes the `0.7` auth
 line: the credential bus loses its plaintext escape hatch, binding is one knob
 that defaults to loopback, and `http_port` is no longer required in secure mode.
 A `0.7.x` patch that carries **breaking config changes** — see the
-[upgrade guide](docs/upgrades/v0.7.3-to-v0.7.4.md).
+[upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md).
 
 ### Changed
 
@@ -1207,7 +1226,7 @@ A `0.7.x` patch that carries **breaking config changes** — see the
 - With no `bind_address` set, every listener now binds **loopback only** (was all
   interfaces) — a networked server becomes local-only until you set `bind_address`.
   The deb postinstall warns on upgrade; other channels surface it via a startup
-  `WARNING`. Migration + recovery: [upgrade guide](docs/upgrades/v0.7.3-to-v0.7.4.md).
+  `WARNING`. Migration + recovery: [upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md).
 
 ### Packaging
 
@@ -1271,7 +1290,7 @@ unaffected.
 - An explicit **`auth.ssh.mode: off`/`warn` under `auth.mode: secure`** — secure
   forces `enforce`.
 
-See [Upgrading v0.7.1 → v0.7.2](docs/upgrades/v0.7.1-to-v0.7.2.md).
+See [Upgrading v0.7.1 → v0.7.2](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md).
 
 ## v0.7.1 — 2026-06-15
 
@@ -1306,7 +1325,7 @@ A redesign of how the server issues and tracks API tokens. A new binary
   `auth.http.tokens` were removed; a config that still sets either is **rejected
   at startup** with a migration message. Token issuance is now automatic, so
   `shed-server token` has no subcommands. See the
-  [v0.7.0 → v0.7.1 upgrade guide](upgrades/v0.7.0-to-v0.7.1.md) — most users
+  [v0.7.0 → v0.7.1 upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.0-to-v0.7.1.md) — most users
   (no `auth` block, or `auth.mode` unset) need no change.
 
 ### shed-extensions v0.4.2 (#207)
@@ -1385,7 +1404,7 @@ are byte-identical until opted in.
 
 See the new [Security reference](reference/security.md), the
 [Public VPS deployment guide](guides/vps-deployment.md), and the
-[v0.6 → v0.7 upgrade guide](upgrades/v0.6-to-v0.7.md).
+[v0.6 → v0.7 upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.6-to-v0.7.md).
 
 ### shed-extensions v0.4.1 (#200)
 
@@ -1546,7 +1565,7 @@ Discovery docs cut to release shape.
 Image-pull overhaul: faster, clearer, and smaller. Pulls now download
 blobs in parallel, render Docker-style live progress, and skip the layer
 tarballs the host never boots from. **Non-breaking** — see
-`docs/upgrades/v0.6.1-to-v0.6.2.md` for the one behavior change
+`https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.6.1-to-v0.6.2.md` for the one behavior change
 (boot-only pulls).
 
 ### Boot-only image pulls (#179)
@@ -1582,7 +1601,7 @@ Piped / `--json` output is unchanged. Cached layers are now reported
 
 Image pull / build / push / on-disk architecture folded into the
 [Images reference](docs/reference/images.md); new v0.6.1→v0.6.2
-[upgrade guide](docs/upgrades/v0.6.1-to-v0.6.2.md).
+[upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.6.1-to-v0.6.2.md).
 
 ## v0.6.1 — 2026-06-03
 
@@ -1601,7 +1620,7 @@ the documented `source` values to `config` / `user` / `dangling`.
 Image-system milestone: VM images move to a **Docker-style, ref-keyed
 identity model**, replacing the old `_base`-tag / `base_rootfs` scheme.
 This is a **breaking config change** — read
-`docs/upgrades/v0.5.9-to-v0.6.0.md` before upgrading. The work lands in
+`https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.9-to-v0.6.0.md` before upgrading. The work lands in
 three parts (the breaking core, an additive UX layer, a docs pass) plus
 a CI-auth follow-up.
 
@@ -1667,7 +1686,7 @@ Additive — no `shed create` / boot-path change.
   `client-id` for `create-github-app-token` v3 (#167).
 
 **Upgrade**: this release changes the config format. Follow
-`docs/upgrades/v0.5.9-to-v0.6.0.md` — rename `base_rootfs` →
+`https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.9-to-v0.6.0.md` — rename `base_rootfs` →
 `default_image`, `images:` → `image_aliases:`, and (optionally) set
 `pull_policy`. The deb postinstall skips the service restart until the
 config is migrated.
@@ -1745,7 +1764,7 @@ actual binary in memory. `packaging/postinstall.sh` now does a
 `try-restart` of `shed-server.service` only on **upgrade** (`$2` set);
 fresh installs preserve the existing "edit `server.yaml`, then
 start" contract. Closes the gap documented as a follow-up in
-`docs/upgrades/v0.5.7-to-v0.5.8.md`.
+`https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md`.
 
 **VMM-exit verification + PID-reuse guard on FC (#151).** Three gaps
 in the stop/start lifecycle could silently leave shed running a
@@ -1875,7 +1894,7 @@ the routine "I upgraded shed, clean up the old images and reclaim disk
 space" workflow. No manifest format changes, no image cache wipe
 required — not the v0.5.1 → v0.5.2 kind of upgrade.
 
-See [docs/upgrades/v0.5.7-to-v0.5.8.md](docs/upgrades/v0.5.7-to-v0.5.8.md)
+See [https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md)
 for the operator upgrade steps and the cleanup playbook.
 
 ### `shed image prune` now protects tagged manifests (#147)
@@ -1935,7 +1954,7 @@ explaining the ARG, the bump procedure, and the FC carve-out.
 
 ### Documentation (#149)
 
-New `docs/upgrades/v0.5.7-to-v0.5.8.md` with operator upgrade steps
+New `https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md` with operator upgrade steps
 for both Linux/.deb (with an explicit `systemctl restart shed-server`
 callout — the .deb postinst doesn't restart automatically, tracked as
 a follow-up) and macOS/brew (with the manual `server.yaml` images-map
@@ -2293,7 +2312,7 @@ on hosts drops ~37 % per cached image (the duplicate
   v0.5.1 or earlier lack the new
   `io.shed.rootfs.erofs.digest` annotation and fail with a precise
   error pointing at the upgrade command. No silent fallback. **See
-  the [v0.5.1 → v0.5.2 upgrade guide](docs/upgrades/v0.5.1-to-v0.5.2.md)
+  the [v0.5.1 → v0.5.2 upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.1-to-v0.5.2.md)
   for the required `shed image rm` / `shed-server pull-images`
   sequence — users upgrading from v0.5.1 must wipe their cached
   images and re-pull.**
@@ -2356,7 +2375,7 @@ on hosts drops ~37 % per cached image (the duplicate
 
 - **New `docs/reference/build-tools.md`**: shed-build-tools image
   purpose, versioning, bump procedure.
-- **New `docs/upgrades/v0.5.1-to-v0.5.2.md`**: required wipe + pull
+- **New `https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.1-to-v0.5.2.md`**: required wipe + pull
   sequence, rationale for no on-host fallback, rollback notes.
 - **Refreshed `docs/reference/images.md`** and `storage-model.md`:
   prose updated for the erofs-as-blob model; removed `mkfs.erofs`
@@ -2492,17 +2511,17 @@ absent.
   v0.4.x users upgrading without wiping `images_dir` previously hit a
   cryptic `... is a directory` error. `internal/vmimage/ocilayout.go`
   now detects this case and wraps it as `ErrLegacyBundledBlob`; the CLI
-  surfaces a message pointing the user at [`docs/upgrades/v0.4-to-v0.5.md`](docs/upgrades/v0.4-to-v0.5.md).
+  surfaces a message pointing the user at [`https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.4-to-v0.5.md`](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.4-to-v0.5.md).
 - **`image has N layers (max 16)` rejection now includes a recovery
   hint.** `internal/vmimage/registry.go` extends the pull-time
   `MaxLayers` error with concrete next steps (wait for the v0.5.0+
   published image, or rebuild locally with the backend's build script).
 - **`SHED-INIT-04` panic cross-references the upgrade guide.** The
   initramfs overlay-mount panic in `initramfs/init` now points at
-  [`docs/upgrades/v0.4-to-v0.5.md#shed-init-04-panic-during-vm-boot`](docs/upgrades/v0.4-to-v0.5.md#shed-init-04-panic-during-vm-boot)
+  [`https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.4-to-v0.5.md#shed-init-04-panic-during-vm-boot`](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.4-to-v0.5.md#shed-init-04-panic-during-vm-boot)
   so operators know to refresh the cached initramfs by re-running the
   build script.
-- **New top-level [`docs/upgrades/v0.4-to-v0.5.md`](docs/upgrades/v0.4-to-v0.5.md).** Walks v0.4.x →
+- **New top-level [`https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.4-to-v0.5.md`](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.4-to-v0.5.md).** Walks v0.4.x →
   v0.5.0 with a "what's new", a keep/lose table, links into the
   backend-specific wipe steps in `vz-setup.md` / `fc-setup.md`, and a
   recovery-scenarios index keyed off the error strings users actually

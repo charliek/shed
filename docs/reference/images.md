@@ -32,7 +32,7 @@ as a content-addressed blob. (Hosts that *publish* images — i.e., run
 but not `erofs-utils` directly on the host.)
 
 If you're upgrading from v0.5.1 or earlier, see the
-[v0.5.1 → v0.5.2 upgrade guide](../upgrades/v0.5.1-to-v0.5.2.md) for the
+[v0.5.1 → v0.5.2 upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.1-to-v0.5.2.md) for the
 breaking-change details and the required `shed image rm` / `pull-images`
 steps.
 
@@ -142,7 +142,7 @@ pushing](#pulling-building-pushing) below and the
 The legacy `cache/sha256/<manifest-digest>.erofs` directory (used
 through v0.5.1 for locally-materialized erofs files) is gone. Older
 installs may still have one — it's safe to `rm -rf` after upgrading;
-see the [v0.5.1 → v0.5.2 upgrade guide](../upgrades/v0.5.1-to-v0.5.2.md).
+see the [v0.5.1 → v0.5.2 upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.1-to-v0.5.2.md).
 
 **Layer sharing happens at the blob layer.** When layers *are* present
 (a `--with-layers` pull, or a locally-built image), two tags that share a
@@ -606,7 +606,7 @@ docker buildx prune --all --force
 # Then boot a shed against the rebuilt blob and verify uname -r.
 ```
 
-See `docs/upgrades/v0.5.7-to-v0.5.8.md` for the original SHED-INIT-03
+See `https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md` for the original SHED-INIT-03
 incident report.
 
 ## Image Caching
@@ -637,7 +637,7 @@ manifest digests they pin (`tags/<name>.json`,
 manifest to the layers it references, and deletes any blob or cached
 ext4 not in that reachable set. Tags ARE protective as of v0.5.8 —
 pre-v0.5.8 they were informational and prune deleted blobs they
-pointed at (see [v0.5.7 → v0.5.8](../upgrades/v0.5.7-to-v0.5.8.md)).
+pointed at (see [v0.5.7 → v0.5.8](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md)).
 
 Deleting a tag for an image that's still pinned by a running or stopped
 shed is safe — the shed boots from the digest pinned in its metadata,
@@ -647,7 +647,7 @@ not the tag.
 
 For the full step-by-step (with Linux/.deb + macOS/brew variants and
 local-image-build cache cleanup), see the
-[v0.5.7 → v0.5.8 upgrade guide](../upgrades/v0.5.7-to-v0.5.8.md#image-cache-cleanup-playbook).
+[v0.5.7 → v0.5.8 upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md#image-cache-cleanup-playbook).
 Same shape applies to every shed version bump:
 
 1. Delete any sheds you no longer need.

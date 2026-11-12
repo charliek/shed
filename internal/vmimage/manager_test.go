@@ -364,7 +364,7 @@ func TestManagerPruneRespectsSnapshotRefs(t *testing.T) {
 // initrd, and the rootfs erofs blob) alive across `shed image
 // prune`. Before the fix, `shed image pull X && shed image prune`
 // would delete the manifest just pulled. See refs.go RefKindTag and
-// docs/upgrades/v0.5.7-to-v0.5.8.md.
+// https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md.
 func TestPruneProtectsTaggedManifest(t *testing.T) {
 	imagesDir := t.TempDir()
 	cfg := &testConfig{imagesDir: imagesDir}
