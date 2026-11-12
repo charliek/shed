@@ -349,7 +349,7 @@ shed (Firecracker) changes:
   **Isolated:** unchanged (the proxy dials from the host).
 - Containers other than dockerd's own pulls (only dockerd's egress is routed at
   Level 1). **Isolated:** their traffic leaves through the guest, so the same
-  limit applies (the internet only).
+  limit applies (the internet, plus any `network.allow_cidrs`).
 - VM-to-VM traffic on a shared host bridge. **Isolated:** dropped at the bridge,
   in both directions.
 
@@ -365,9 +365,9 @@ Network
 profiles](security.md#network-profiles)) is fenced by shed-server's own
 nftables rules, which are enforced in the kernel and do not depend on the guest
 cooperating. They close several of the bypasses above for that shed: a raw
-`connect()` can no longer reach IMDS, private ranges (other than those in
-`network.allow_cidrs`), the host or other sheds, and VM-to-VM traffic on the
-bridge is dropped. The internet stays reachable, so
+`connect()` can no longer reach IMDS or private ranges (other than ranges
+`network.allow_cidrs` lists), the host or other sheds, and VM-to-VM traffic on
+the bridge is dropped. The internet stays reachable, so
 egress profiles remain the way to filter *which* internet hosts a cooperating
 client may use. The two compose:
 
