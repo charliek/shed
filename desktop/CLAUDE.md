@@ -1,10 +1,10 @@
 # CLAUDE.md — working in `desktop/`
 
-The shed desktop app: a Tauri client, shipping as both the **macOS** client (as of 0.9.0) and
-the **Linux** client, a thin shell over the shared Rust core in the sibling `crates/` workspace.
-A native Swift macOS menu-bar client (SwiftUI + AppKit) also lives here — its release job
-retired in 0.9.0, but the sources are retained pending a later demolition and stay buildable
-(`make -C desktop test`). This file orients an AI assistant working in this subtree. The root
+The shed desktop app: a Tauri client (React/Vite/Tailwind UI + a Rust shell), shipping as both
+the **macOS** client and the **Linux** client, a thin shell over the shared Rust core in the
+sibling `crates/` workspace. (Before 0.9.0 the macOS client was a native Swift app; it has been
+removed — the Tauri mac app keeps its bundle id, Sparkle feed and EdDSA key so those installs
+update in place.) This file orients an AI assistant working in this subtree. The root
 `CLAUDE.md` owns the monorepo layout + release model; `crates/CLAUDE.md` owns the core.
 
 Run targets from here with `make <target>`, or from the monorepo root with `make -C desktop
@@ -22,77 +22,71 @@ definition of done here.
 
 Core/UI split (see `docs/desktop/architecture.md`):
 
-- `Sources/ShedKit/` — core, no SwiftUI: HTTP (`ShedServerClient`) + SSE (`SSEParser`)
-  clients, models (`Models.swift`, `ShedConfig.swift`), the IPC server (`IPC/`),
-  `Screenshot.swift`, the **Approval** subsystem (`Approval/`: `HostAgentClient`,
-  `PolicyEngine`, `AuditStore`, `NotificationPresenter`), behind the `UiBridge`/`ShedBackend`
-  seam.
-- `Sources/ShedDesktopUI/` — SwiftUI views (Sheds/Approvals/Agents/Activity/System/
-  Preferences/menu) + `AppState` (the observable view-model).
-- `Sources/ShedDesktopApp/` — `@main`, `AppModel` (host poller + windows + IPC handler +
-  approval coordinator), `IPCHandlerImpl`, `SystemNotificationPresenter`, the Sparkle updater.
-- `Sources/shedctl/` — the Swift CLI driver for the socket (bundled in the `.app`).
-- **The shared Rust core lives in `../crates/`** (`shed-core` + `shed-app` + `shed-core-ffi` +
-  the Rust `shedctl`), NOT here. The macOS app links a static xcframework generated from it;
-  `SHED_DESKTOP_RUST_CORE=0` forces the legacy Swift `URLSession` path (a rollback escape
-  hatch).
-- `tauri/` — the **Tauri Linux client** (React/Vite/Tailwind on WebKitGTK), its **own
-  standalone Cargo workspace** (`tauri/src-tauri`) so its WebKitGTK/Tauri deps never bleed
-  into `../crates/`. Takes `shed-core` + `shed-app` as cross-workspace path-deps
-  (`../../../crates/…`). The shipped Linux `.deb` (`shed-desktop`, bin `shed-desktop-tauri`)
-  is built from it via nfpm (`linux/scripts/build-deb.sh`).
-- `tools/shedtest/` — ONE pytest harness + in-process mock shed-server, driving BOTH UIs via
-  `--target mac|tauri` (default `mac`).
+- **The shared Rust core lives in `../crates/`** (`shed-core` + `shed-app` + the Rust
+  `shedctl`), NOT here.
+- `tauri/` — the **Tauri client**: the React/Vite/Tailwind frontend in `tauri/ui`, the Rust
+  shell in `tauri/src-tauri` (IPC server `ipc.rs`, tray, approval gate, Sparkle updater,
+  broker wiring, …). `tauri/src-tauri` is its **own standalone Cargo workspace** so its
+  WebKitGTK/Tauri deps never bleed into `../crates/`; it takes `shed-core` + `shed-app` as
+  cross-workspace path-deps (`../../../crates/…`). Runs on macOS (WKWebView) and Linux
+  (WebKitGTK). The Linux `.deb` (`shed-desktop`, bin `shed-desktop-tauri`) is built from it
+  via nfpm (`linux/scripts/build-deb.sh`); the macOS `.app`/DMG via
+  `scripts/bundle-tauri-mac.sh` + `scripts/make-dmg.sh`.
+- `tools/shedtest/` — the pytest harness + in-process mock shed-server that drives the app.
+- `Resources/bin/` — the terminal-opener scripts bundled into the app (`tauri.conf.json`
+  `bundle.resources`; `build.rs` validates them).
 
 The dedicated GTK client that used to ship the `.deb` has been **retired** — Tauri replaced
-it. There is no `--target gtk` and no `shed-gtk` crate.
+it. There is no `shed-gtk` crate.
 
-The Tauri client also has a **macOS packaging path**, the shipped macOS client as of 0.9.0:
-`make tauri-bundle-mac` / `make tauri-dmg-mac` build a signed `ShedDesktop.app`/DMG with an
-embedded real Sparkle updater. On **Darwin** every Tauri build (`tauri-build`/`-lint`/`-test`/
-`-run`) needs `Sparkle.framework` staged first (`make sparkle-framework` runs
-`scripts/fetch-sparkle.sh`, pinned + gitignored) — the sparkle-updater crate's `build.rs`
-panics without it. The mac Tauri bundle aligns its identity to the (retired-release-job) Swift
-app's (`ai.stridelabs.ShedDesktop`, mac-only overlay `tauri.macos.conf.json`), so the mac dev
-config dir is `~/Library/Application Support/ai.stridelabs.ShedDesktop`; the **Linux** identity
-`ai.stridelabs.shed-desktop` (polkit/D-Bus/nfpm) is unchanged. See `desktop/RELEASING.md` for
-the release flow.
+**macOS packaging:** `make tauri-bundle-mac` / `make tauri-dmg-mac` build a signed
+`ShedDesktop.app`/DMG with an embedded real Sparkle updater. On **Darwin** every Tauri build
+(`tauri-build`/`-lint`/`-test`/`-run`) needs `Sparkle.framework` staged first
+(`make sparkle-framework` runs `scripts/fetch-sparkle.sh`, pinned + gitignored) — the
+sparkle-updater crate's `build.rs` panics without it. The mac bundle uses the identity
+`ai.stridelabs.ShedDesktop` (mac-only overlay `tauri.macos.conf.json`), so the mac dev config
+dir is `~/Library/Application Support/ai.stridelabs.ShedDesktop`; the **Linux** identity
+`ai.stridelabs.shed-desktop` (polkit/D-Bus/nfpm) is different. **Never change the mac bundle
+id, `SUFeedURL` or `SUPublicEDKey`** (`tauri/src-tauri/Info.plist`) — every installed copy
+updates against them, and CI's bundle smoke pins the key. See `desktop/RELEASING.md` for the
+release flow.
 
-## The change loop (macOS)
+## The change loop
 
 ```bash
-make build && make test      # compile (Rust core + Swift) + unit tests
-make bundle                  # build/ShedDesktop.app (ad-hoc signed)
-make e2e-ci                  # hermetic functional harness (mock shed-server)
-# Eyeball a change against a running app:
-make run
-build/ShedDesktop.app/Contents/Resources/bin/shedctl ui show-window
-build/ShedDesktop.app/Contents/Resources/bin/shedctl screenshot --surface window --out /tmp/s.png
+npm --prefix tauri/ui ci     # once: the frontend's deps
+make build && make test      # tauri-build; core-test + tauri-test (cargo unit tests)
+make lint                    # clippy (core + tauri), -D warnings
+make e2e                     # the hermetic pytest harness (Xvfb on Linux: wrap in xvfb-run -a)
+make run                     # launch the app against your real ~/.shed/config.yaml
 ```
 
-The harness is hermetic: it launches the app with `SHED_DESKTOP_TEST_MODE=1` +
-`SHED_DESKTOP_MOCK_BASE_URL`, so all HTTP hits the in-process mock and no real shed-server is
-touched. `identify` is checked up front to confirm hermeticity (and, on mac, that
-`identify.core` is the expected `rust`/`swift` backend). Use condition-waits (`wait_until`),
-**never sleeps**. Fixtures live in `tools/shedtest/fixtures/`.
+The harness is hermetic: it launches the binary with `SHED_TAURI_TEST_MODE=1` +
+`SHED_TAURI_MOCK_BASE_URL` and a throwaway HOME/XDG_RUNTIME_DIR, so all HTTP hits the
+in-process mock and no real shed-server or your own config is touched. `identify` is checked up
+front to confirm hermeticity. Use condition-waits (`wait_until`), **never sleeps**. Fixtures
+live in `tools/shedtest/fixtures/`. To eyeball a change, drive a running app with the Rust
+`shedctl` (`cargo run -p shedctl --manifest-path ../crates/Cargo.toml -- …`) or the harness's
+`TauriClient`, and read `app.screenshot` (Linux; on macOS the capture is Screen-Recording-TCC-
+gated, so the harness skips it there). The `shedtest-mac` / `shedtest-linux` skills have the
+full loops.
 
 ## Build-order gotchas (read these)
 
-- **`make core` (or `make build`) MUST run before any bare `swift build`/`swift test`.** The
-  Swift package links a static xcframework generated from the Rust core; that `.binaryTarget`
-  path must exist first. `bundle.sh` / `make e2e-ci` build it themselves.
-- **Generated Rust-core artifacts land under `desktop/artifacts/`** (gitignored), NOT under
-  `crates/` — SwiftPM requires target paths inside the package root. `scripts/build-core.sh`
-  writes them (plus a staleness stamp) there.
-- **NEVER `swift format -i` the whole tree** reflexively — match the existing 4-space style;
-  formatting churn muddies review.
+- **The frontend bundle must exist before any `cargo` build of the Tauri crate.**
+  `generate_context!` fails closed if `tauri.conf.json`'s `frontendDist` (`../ui/dist`) is
+  missing; every `tauri-*` make target builds it first (`tauri-ui-build`, which also runs the
+  frontend's type-check + unit tests).
+- **On macOS stage Sparkle first** (`make sparkle-framework`; the make targets do it for you).
+- **If the mise `cargo` shim errors** ("No version is set for shim: cargo") put
+  `~/.cargo/bin` first on `PATH` — the workspaces pin `stable` via `rust-toolchain.toml`.
 
-## The Linux client (Tauri) + the `.deb`
+## Linux: the render gate + the `.deb`
 
 ```bash
-make tauri-run           # build + launch the Tauri client natively (Mac Homebrew WebKitGTK / Linux)
-make e2e-tauri           # hermetic Tauri pytest (--target tauri; needs a display, Xvfb on Linux)
-make tauri-build-linux   # the WebKitGTK render gate: --target tauri on ubuntu:24.04 / WebKitGTK 2.44 (Docker, Xvfb)
+make tauri-run           # build + launch the Tauri client natively
+make e2e-tauri           # the hermetic pytest harness (needs a display, Xvfb on Linux)
+make tauri-build-linux   # the WebKitGTK render gate: the e2e on ubuntu:24.04 / WebKitGTK 2.44 (Docker, Xvfb)
 make tauri-test-linux    # the Tauri crate's Linux-only approval-seam tests (polkit gate; Docker)
 make core-linux          # shed-core cargo test/clippy on Linux (Docker)
 make deb / make deb-validate   # build the .deb / build + install-validate in a clean ubuntu:24.04 container
@@ -104,7 +98,7 @@ layout (`crates desktop/tauri desktop/tools …`) into `/work` inside the contai
 `--cap-add SYS_ADMIN --security-opt seccomp=unconfined` (WebKitGTK's web-process bubblewrap
 sandbox needs user namespaces). `WEBKIT_DISABLE_DMABUF_RENDERER=1` is set in the image (no GPU
 in Docker). **Run `make tauri-build-linux` (the render gate) for any shared/Linux change** —
-the mac WKWebView e2e alone can miss Linux-only breaks. On Linux the tray is a native menu
+the macOS WKWebView e2e alone can miss Linux-only breaks. On Linux the tray is a native menu
 (Tauri emits no Linux tray-click events → no popover; expected).
 
 The craze cells (`tools/shedtest/test_tauri_craze.py`, plan 025) drive the REAL craze hub and
@@ -128,8 +122,7 @@ Three modes, resolved once at startup from a persisted `broker_mode` pref (`auto
 default) overlaid on a probe of both daemon sockets — `external` (a full daemon is
 running, dial it as before), `headless-coexist` (only a headless daemon's status
 socket is live — mint-only, no in-app approvals), `embedded` (neither socket live —
-start the in-process broker). The Swift app has no embedded path; it is always
-`external`.
+start the in-process broker).
 
 Test pointers:
 
@@ -137,8 +130,7 @@ Test pointers:
   resolution, `load_or_synthesize`, outcome mapping, timeout/dismiss). `broker` is
   `shed-app`'s ONLY non-default feature since plan 022 (S6, `charliek/shed#328`)
   retired `rc` with the RC hub, so there is no `broker,rc` pair left to run.
-- `desktop/tools/shedtest/test_tauri_broker.py` — the `--target tauri`-only hermetic
-  e2e cells (three-way auto-detect, the bus → AppGate → Coordinator → respond
+- `desktop/tools/shedtest/test_tauri_broker.py` — the hermetic e2e cells (three-way auto-detect, the bus → AppGate → Coordinator → respond
   round-trip via the mock server's plugin-bus endpoints, split-namespace `409`,
   malformed-config fail-closed, the synthesized fresh-install namespace set).
 - The mock server's plugin-bus routes live in `desktop/tools/shedtest/mockserver.py`
@@ -152,21 +144,15 @@ Test pointers:
 
 ## mTLS credentials
 
-Both UIs can drive a `shed-server` running `auth.mode: mtls` (client
+The app can drive a `shed-server` running `auth.mode: mtls` (client
 certificates instead of bearer tokens — see the root `docs/reference/
-security.md#mtls-mode`), but **only through the Rust-core path**. The
-legacy Swift `URLSession` transport (`SHED_DESKTOP_RUST_CORE=0`) has no
-certificate machinery at all and fails fast with an explicit error the
-moment it's asked to talk to an mtls server, rather than attempting a
-handshake it can't complete — see `ShedServerClient.swift`'s zero-network
-guard. There is no equivalent escape hatch on Tauri; it's Rust-core-only by
-construction.
+security.md#mtls-mode`) through the Rust core's credential provider.
 
 The private key is generated inside the Rust core's credential provider and
-**never crosses the FFI/UDS boundary** — only the CSR goes out (to the
+**never crosses the UDS boundary** — only the CSR goes out (to the
 host-agent, over the UDS `credential.get` message) and the signed public
-certificate comes back. Swift/Tauri code never holds, sees, or serializes
-key material. The app process itself **persists no credential**: the
+certificate comes back. The Tauri shell and frontend never hold, see, or
+serialize key material. The app process itself **persists no credential**: the
 control-scope certificate lives in memory only, and a cold launch re-mints
 it from scratch over SSH via the host-agent relay (matches the existing
 no-persistence posture of the Rust core's control-scope token, just extended
@@ -184,18 +170,16 @@ app; they're separate release selectors).
 
 ## Socket paths
 
-- **mac IPC:** `~/Library/Caches/ShedDesktop/shed-desktop.sock` (override `SHED_DESKTOP_SOCKET`).
-  Hermeticity: `SHED_DESKTOP_TEST_MODE` / `SHED_DESKTOP_MOCK_BASE_URL` / `SHED_DESKTOP_SHED_CONFIG`.
-- **Tauri IPC:** `$XDG_RUNTIME_DIR/shed-tauri.sock` (override `SHED_TAURI_SOCKET`; `/tmp`
-  fallback). Hermeticity: `SHED_TAURI_TEST_MODE` / `SHED_TAURI_MOCK_BASE_URL` /
+- **App IPC:** `$XDG_RUNTIME_DIR/shed-tauri.sock` (override `SHED_TAURI_SOCKET`; `/tmp`
+  fallback; same on macOS). Hermeticity: `SHED_TAURI_TEST_MODE` / `SHED_TAURI_MOCK_BASE_URL` /
   `SHED_TAURI_SHED_CONFIG`. In containers, point the harness at a prebuilt binary with
   `SHED_TAURI_BIN`.
 - **host-agent (mac):** `~/Library/Application Support/shed/host-agent.sock`.
 
 ## Conventions
 
-- Swift 6 strict concurrency. Keep `ShedKit` free of SwiftUI. The IPC handler is an actor;
-  reach the app via `@MainActor` op methods that return only `Sendable` results.
+- New UI or behavior gets an IPC op (`tauri/src-tauri/src/ipc.rs`) + harness coverage — the
+  north star above.
 - Default to no comments; add one only when the *why* is non-obvious.
 - Decode defensively against real shed-server shapes (`{"sheds": null}`, omitted fields,
   mixed timestamp formats) — there are unit tests pinning these.
@@ -205,7 +189,8 @@ app; they're separate release selectors).
 ## Skills + docs
 
 The end-to-end validation loops are documented as skills (update them when you hit a new
-rough edge): `.claude/skills/shedtest-mac` (the macOS app loop) and
-`.claude/skills/shedtest-linux` (the Tauri/Linux loop). The user-facing docs live under
+rough edge): `.claude/skills/shedtest-mac` (the macOS loop: WKWebView e2e, the signed
+bundle + DMG) and `.claude/skills/shedtest-linux` (the Linux loop: the WebKitGTK render gate,
+the `.deb`, Docker legs). The user-facing docs live under
 `docs/desktop/` — the [Test automation](../docs/desktop/test-automation.md) page mirrors the
 harness. Recurring release steps: `desktop/RELEASING.md`.

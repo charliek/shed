@@ -3,58 +3,34 @@
 shed-desktop is a desktop app that ties the **shed** toolchain into one resident control
 surface: it lists and controls sheds (VMs) across hosts, shows the agent sessions running in
 them as [roost](../extensions/roost-session-hosts.md) rows with live
-[craze and opencode lanes](agent-lanes.md), and brokers the credential-approval gate. It holds
-no credentials of its own to manage: the Swift app, and the Tauri app when it dials an external `shed-host-agent`, only coordinate the daemon that holds them, while the Tauri app's default **embedded broker** runs that credential brokering (SSH, AWS, Docker) in-process — see [The embedded credential broker](#the-embedded-credential-broker-tauri). There is no remote-control (RC)
-launcher: the RC stack was retired, and agents start through roost or craze.
+[craze and opencode lanes](agent-lanes.md), and brokers the credential-approval gate. By
+default its **embedded broker** runs the credential brokering (SSH, AWS, Docker) in-process —
+see [The embedded credential broker](#the-embedded-credential-broker); pointed at an external
+`shed-host-agent` instead, it holds no credentials and only coordinates the daemon that does.
+There is no remote-control (RC) launcher: the RC stack was retired, and agents start through
+roost or craze.
 
-The shipped client is **Tauri on both macOS (as of 0.9.0) and Linux**, built from
-`tauri/src-tauri` (bin `shed-desktop-tauri`). All protocol and app logic lives in the shared
-**Rust core**: `shed-core` (the shed-server protocol layer — HTTP/SSE, decoding, control-token
-auth, TLS pinning) and **`shed-app`**, the UI-free app-logic layer, with `shed-craze` and
+The app is a **Tauri** client on both macOS and Linux, built from `desktop/tauri/src-tauri`
+(bin `shed-desktop-tauri`). All protocol and app logic lives in the shared **Rust core**:
+`shed-core` (the shed-server protocol layer — HTTP/SSE, decoding, control-token auth, TLS
+pinning) and **`shed-app`**, the UI-free app-logic layer, with `shed-craze` and
 `shed-opencode` as the agent-lane adapters — see [Rust core](rust-core.md). On Linux it ships
 as the `shed-desktop` nfpm `.deb` (`/usr/bin/shed-desktop`, with a headless `shedctl` and the
 polkit action alongside) via `charliek/apt-charliek` (`apt install shed-desktop`); on macOS as
-the notarized DMG with Sparkle updates.
-
-A Swift/SwiftUI macOS menu-bar app also remains in the tree. Its sources are retained pending
-demolition, its release job was retired in 0.9.0, and it stays buildable; the sections below
-that describe `ShedKit` and the SPM targets are about that app. `SHED_DESKTOP_RUST_CORE=0`
-forces its legacy path (a rollback escape hatch). A first-class design goal for both is that
-the app is **drivable and observable by an automated agent** over an IPC socket — see
-[IPC](ipc.md).
-
-## Why a native app
-
-!!! note "Historical rationale"
-    This section records why the Swift app was written natively. The shipped client is now
-    Tauri on both platforms.
-
-The app's whole job is to call HTTP endpoints, consume SSE streams, shell out and read
-pipes, and integrate deeply with macOS (menu bar, Touch ID, notifications, login item,
-Sparkle). Swift does the first three natively (`URLSession.bytes`, `Process`/`Pipe`) and is
-categorically best at the fourth. The one capability that would favor a web stack — an
-embedded streaming terminal — is a deliberate non-goal (terminals are delegated to the
-user's terminal app), which takes SwiftUI's weakest area off the critical path. On Linux the
-Tauri client fills the same role over WebKitGTK.
-
-Electron was rejected on size (~85–120 MB of bundled Chromium); Tauri was the earlier lean
-*when an embedded terminal was assumed* — once terminals are delegated out, its web-native
-advantage no longer applies on macOS while its weak spots (menu-bar popover, Touch ID) are
-exactly this app's headline features, so macOS stays native Swift. If a future pane genuinely
-needs web rendering, a `WKWebView` scoped to that one pane is the escape hatch — not the
-default substrate.
+the notarized DMG with Sparkle updates. A first-class design goal is that the app is
+**drivable and observable by an automated agent** over an IPC socket — see [IPC](ipc.md).
 
 ## System context
 
 shed-desktop sits between three other systems: the **shed servers** (one per host, over
 HTTP), the **shed-host-agent** (the local credential broker, over a Unix-domain socket),
-and the **shed CLI's config file** (read-only). It also serves its own control socket that
+and the **shed CLI's config file** (read; the app only ever appends a `machines:` entry). It also serves its own control socket that
 `shedctl` and the test harness drive, and checks GitHub Pages for Sparkle updates.
 
 ```mermaid
 flowchart LR
-    subgraph mac["Your Mac"]
-        SD["shed-desktop<br/>(menu-bar app)"]
+    subgraph mac["Your machine"]
+        SD["shed-desktop<br/>(Tauri app)"]
         CFG[("~/.shed/config.yaml<br/>read-only")]
         HA["shed-host-agent<br/>(credential broker,<br/>holds the real keys)"]
         CTL["shedctl /<br/>pytest harness"]
@@ -74,28 +50,34 @@ flowchart LR
     SD -.->|"Sparkle: check for updates"| PAGES
 ```
 
-With the external host-agent (the Swift app, or Tauri in `external` mode) the app is **never in the credential path**; with Tauri's embedded broker (below) it is, since the broker runs in the app's process. A shed inside a VM asks its shed-server for a
-credential (SSH signature, AWS creds, docker login); that request flows out over the
-server's plugin bus to the host-agent, which holds the real keys. shed-desktop only sees
-request *metadata* and returns an approve/deny decision (see [the approval flow](#the-host-agent-unix-domain-socket)).
+The diagram shows the external-daemon mode. In the default embedded mode the same broker runs
+inside shed-desktop, with no Unix-domain-socket hop. With an external host-agent the app is
+**never in the credential path**; with the embedded
+broker (below) it is, since the broker runs in the app's process. A shed inside a VM asks its
+shed-server for a credential (SSH signature, AWS creds, docker login); that request flows out
+over the server's plugin bus to the broker, which holds the real keys. The approval gate only
+sees request *metadata* and returns an approve/deny decision (see [the approval
+flow](#the-host-agent-unix-domain-socket)).
 
-## Targets (SPM modules)
+## Structure
 
-These are the Swift app's modules (retained, not the shipped client).
+| Part | Where | Role |
+|---|---|---|
+| Rust shell | `desktop/tauri/src-tauri/src/` | The Tauri app: `lib.rs` (setup, the Tauri commands the UI invokes, mode selection), `ipc.rs` (the control socket and its op dispatch), `approval.rs` (the native Touch ID / polkit gate and notifier), `broker.rs` (credential-broker mode selection), `tray.rs` (tray menu + macOS popover), `updater.rs` (Sparkle, macOS), `roost_hosts.rs` / `machines.rs` / `lane.rs` / `craze.rs` (agent sessions and lanes), `termctl.rs` (terminal launch), `prefs.rs` (persisted preferences), `screenshot.rs`, `single_instance.rs`, `shutdown.rs`, `applog.rs` |
+| Web UI | `desktop/tauri/ui/` | React + Vite + TypeScript: the dashboard (`App.tsx`), the Preferences window, the macOS tray popover, and the agent-lane panels. It reports what it rendered back to the shell, which is what the IPC `*.dump` ops answer from |
+| Shared core | `crates/` | `shed-core` (protocol, config, approval policy model), `shed-app` (`Backend`, the approval `Coordinator`, `HostAgentClient`, `AuditStore`, roost hosts), `shed-broker` (the embedded broker), `shed-craze` / `shed-opencode` (lane adapters) — see [Rust core](rust-core.md) |
+| `shedctl` | `crates/shedctl/` | A headless CLI for the control socket — see [shedctl](cli.md) |
+| Bundled openers | `desktop/Resources/bin/` | `shed-open-ghostty` and `shed-open-roost.py`, the terminal presets' launch scripts, shipped as app resources |
 
-| Target | Role |
-|--------|------|
-| `ShedKit` | Core, no SwiftUI. HTTP/SSE clients (`ShedServerClient`), models + `ShedConfig` parser, the IPC server, in-process screenshot, and the **Approval** subsystem (`HostAgentClient`, `PolicyEngine`, `AuditStore`, `NotificationPresenter`) behind the `UiBridge`/`ShedBackend` seam. |
-| `ShedDesktopUI` | SwiftUI views (Sheds, Approvals, Agents, Activity, System, Preferences, the menu) + the `AppState` observable view-model. |
-| `ShedDesktopApp` | The `@main` app: `AppModel` (host poller, windows, the `UiBridge` conformer, approval coordinator), `IPCHandlerImpl`, the real `SystemNotificationPresenter`, the Sparkle updater, and `PreferencesStore`. |
-| `shedctl` | CLI driver for the app's IPC socket (mirrors the pytest harness's transport). |
+The Tauri crate is its own cargo workspace (so its WebKitGTK/Tauri dependencies stay out of
+`crates/`) and takes `shed-core` + `shed-app` as path dependencies.
 
 ## How the pieces connect
 
 ### Shed servers (HTTP)
 
-`AppModel` builds one `ShedServerClient` per host from the config and fans out to all of
-them concurrently. Unreachable hosts degrade to a grey dot, never a hard failure of the
+`shed-app`'s `Backend` builds one `shed-core` client per host from the config and fans out to
+all of them concurrently. Unreachable hosts degrade to a grey dot, never a hard failure of the
 whole list.
 
 | Call | Endpoint | Notes |
@@ -114,9 +96,8 @@ further.
 
 ### The host agent (Unix-domain socket)
 
-This section describes the **external-daemon** path — the only path the Swift macOS app
-has, and one of three modes the Tauri app can run (see [The embedded credential
-broker](#the-embedded-credential-broker-tauri) below for the Tauri-only in-process path
+This section describes the **external-daemon** path, one of the three broker modes (see [The
+embedded credential broker](#the-embedded-credential-broker) below for the in-process path
 and the mode selection between them).
 
 The headline feature. When an extension is configured with `approval.policy: shed-desktop`,
@@ -126,8 +107,9 @@ Allow/Deny), while streaming an **all-namespace audit feed** (ssh-agent + aws-cr
 docker-credentials) that the app surfaces in **Activity**. See [Credential
 approvals](approvals.md) for the policy model.
 
-- **Socket:** `~/Library/Application Support/shed/host-agent.sock` (override
-  `SHED_DESKTOP_HOST_AGENT_SOCKET`). `HostAgentClient` dials it, auto-reconnecting with
+- **Socket:** `host-agent.sock` in `~/Library/Application Support/shed/` on macOS, and in
+  `$XDG_RUNTIME_DIR/shed/` (else `~/.local/share/shed/`) on Linux; `SHED_HOST_AGENT_SOCKET_DIR`
+  moves the directory. `shed-app`'s `HostAgentClient` dials it, auto-reconnecting with
   0.5→5 s backoff.
 - **Wire protocol** (newline-delimited JSON, `v=1`): app → agent `hello`,
   `approval_response`, `pong`; agent → app `hello_ack`, `approval_request`, `event`, `ping`.
@@ -155,21 +137,20 @@ sequenceDiagram
     HA-->>SD: event (audit; all namespaces)
 ```
 
-### The embedded credential broker (Tauri)
+### The embedded credential broker
 
-The Tauri client (macOS and Linux) can also run the credential broker **in-process** —
+The app (macOS and Linux) can also run the credential broker **in-process** —
 the same `shed-broker` Rust crate the standalone `shed-host-agent` daemon is built from,
 embedded via `shed-app`'s non-default `broker` feature instead of dialed over a socket.
 Quitting the app stops brokering (server-side fails closed, same as stopping the daemon);
-there is no LaunchAgent/systemd unit for it. The Swift app does not have this path — it
-always uses the [external daemon](#the-host-agent-unix-domain-socket) above.
+there is no LaunchAgent/systemd unit for it.
 
 **Mode selection.** A persisted preference (`Preferences → Credential broker`; wire value
 `broker_mode`, default `auto`) resolved against a startup probe of both daemon sockets:
 
 | Effective mode | When | Broker behavior |
 |---|---|---|
-| `external` | Pref `auto` + the daemon's desktop socket is live, or pref pinned to `external` | Dials the daemon exactly as the Swift app does — unchanged. |
+| `external` | Pref `auto` + the daemon's desktop socket is live, or pref pinned to `external` | Dials the [external daemon](#the-host-agent-unix-domain-socket) above. |
 | `headless-coexist` | Pref `auto` + only the daemon's *status* socket is live (a daemon run with `--no-default-features`, no desktop socket) | The app does **not** start its own bus broker (avoids per-namespace `409`s with the headless daemon) and gets no in-app approvals; it still self-mints its own secure-server tokens in-process. |
 | `embedded` | Pref `auto` + neither socket is live, or pref pinned to `embedded` | The app starts its own in-process broker. Pinning `embedded` alongside a running daemon is allowed — the two race per server/namespace; the loser gets `409 NAMESPACE_ALREADY_REGISTERED`, surfaced (never hidden) in `broker.status`, never a double prompt. |
 
@@ -231,40 +212,40 @@ to dial or probe against it. All observability goes through the app's own IPC
 ### The shed CLI config
 
 shed-desktop reads the **same config the `shed` CLI manages** — `~/.shed/config.yaml`
-(override `SHED_DESKTOP_SHED_CONFIG`) — to discover hosts. It parses it with a tiny
-indentation reader (`ShedConfig`, no YAML dependency), reading `servers:` (name → `host`,
-`http_port`, `ssh_port`) and `default_server`. The relationship is **read-only**: the app
-never writes this file. To add or remove hosts, use the `shed` CLI; the app reflects the
+— to discover hosts. It parses it with `shed-core`'s tiny indentation reader (`ShedConfig`,
+no YAML dependency), reading `servers:` (name → `host`, `http_port`, `ssh_port`, and the
+secure-server fields) and `default_server`, plus the `machines:` section. The app never
+writes `servers:`; its one write is the Machines pane's **Add machine**, which appends a
+`machines:` entry after backing the file up. To add or remove hosts, use the `shed` CLI; the app reflects the
 change on its next poll (the Preferences → Hosts section is a read-only mirror). A missing
 config degrades to an empty host list, never a crash.
 
 ### The control socket (shedctl + the harness)
 
-So the app is drivable/observable by an automated agent, `ShedKit`'s `IPCServer` serves a
-newline-JSON socket at `~/Library/Caches/ShedDesktop/shed-desktop.sock` (mode `0600`, with
-a sibling `.lock` for single-instance). Both `shedctl` and the hermetic pytest harness speak
-this exact protocol — listing state, navigating panes, driving lifecycle/approvals, and
-capturing in-process PNG screenshots. This is the seam that lets every change be verified by
-driving the real app, not by asking a human to click. The Tauri client (the shipped Linux
-client) speaks the same protocol over `$XDG_RUNTIME_DIR/shed-tauri.sock` (with a second launch
-handed off via an `app.activate` op), so **one** `tools/shedtest --target mac|tauri` harness
-drives both clients — Mac-only ops stay Mac-gated. Note the two `shedctl`s: the Swift
-`Sources/shedctl` bundled in the macOS `.app`, and the Rust `crates/shedctl` shipped in the Linux
-`.deb` — same name, different platforms. See [IPC](ipc.md) and [shedctl](cli.md).
+So the app is drivable/observable by an automated agent, `ipc.rs` serves a newline-JSON
+socket at `$XDG_RUNTIME_DIR/shed-tauri.sock` (falling back to
+`/tmp/shed-tauri-<uid>/shed-tauri.sock`; mode `0600`, with a sibling `shed-tauri.lock` for
+single-instance — a second launch hands off to the running app with an `app.activate` op).
+Both `shedctl` and the hermetic pytest harness (`desktop/tools/shedtest`) speak this exact
+protocol — listing state, navigating panes, driving lifecycle/approvals, reading what the UI
+rendered, and capturing PNG screenshots. This is the seam that lets every change be verified
+by driving the real app, not by asking a human to click. See [IPC](ipc.md) and
+[shedctl](cli.md).
 
-## Windows
+## Windows + tray
 
-The dashboard and the menu-bar dropdown are **AppKit windows hosting SwiftUI views**
-(`NSHostingController` / `NSPopover`), managed by `AppModel` — not a SwiftUI
-`WindowGroup`/`MenuBarExtra`. This gives the screenshot op a stable `NSWindow` handle and
-makes show/hide deterministic for the harness, where the built-in backing windows are
-private/unstable. The app is an accessory (`LSUIElement`): menu-bar only, no Dock icon.
-(On Linux the Tauri tray is a native menu — Tauri emits no Linux tray-click events, so there
-is no popover; this is expected.)
+The dashboard, the Preferences window and (on macOS) the tray popover are Tauri webview
+windows over the one React UI. Both platforms get a native tray menu (Open Dashboard,
+Approvals, Preferences, Quit). On macOS a left-click on the menu-bar icon opens the popover
+and a right-click the menu; on Linux the menu is the whole tray surface, because Tauri emits
+no tray-click events there. On macOS the app is an accessory (`LSUIElement`): no Dock icon
+until a dashboard or Preferences window is open. Building the tray is best-effort — a headless
+or no-StatusNotifier Linux session has nowhere to show it — and the dashboard window is always
+reachable.
 
-## Shutting down (Tauri)
+## Shutting down
 
-The Tauri app ends every child process it owns from every way it can exit: the tray's or
+The app ends every child process it owns from every way it can exit: the tray's or
 the popover's Quit, SIGTERM, SIGINT and SIGHUP, and on macOS a Dock Quit, a logout or an
 AppleScript `quit` (which reach the app only as Tauri's `RunEvent::Exit`). All of them run
 one bounded, orderly shutdown, once — a later trigger waits for the run already going. Two
@@ -305,9 +286,9 @@ exits on its own once its 60-second `ControlPersist` lapses.
 
 | What | Where | Notes |
 |---|---|---|
-| Audit log | `<stateDir>/audit.jsonl` | append-only JSONL; `stateDir` = `~/Library/Application Support/ShedDesktop/`, override `SHED_DESKTOP_STATE_DIR`. Reachable over IPC via `activity.log_path`. |
-| Preferences | `UserDefaults` (`ai.stridelabs.ShedDesktop`) | three keys: `terminalTemplate`, `defaultApprovalMode`, `policyRules` (JSON). See [Configuration](configuration.md). |
-| Control socket + lock | `~/Library/Caches/ShedDesktop/shed-desktop.{sock,lock}` | **not** moved by `SHED_DESKTOP_STATE_DIR` (so harness + dev session agree). |
+| Audit log | `audit.jsonl` in the app data dir: macOS `~/Library/Application Support/ai.stridelabs.ShedDesktop/`, Linux `${XDG_DATA_HOME:-~/.local/share}/ai.stridelabs.shed-desktop/` | append-only JSONL. Reachable over IPC via `activity.log_path`. |
+| Preferences | `prefs.json` in the app config dir: macOS `~/Library/Application Support/ai.stridelabs.ShedDesktop/`, Linux `${XDG_CONFIG_HOME:-~/.config}/ai.stridelabs.shed-desktop/` | terminal preset + template, SSH approval prefs, AWS/Docker modes, per-shed rules, broker mode. See [Configuration](configuration.md). |
+| Control socket + lock | `$XDG_RUNTIME_DIR/shed-tauri.{sock,lock}`, else `/tmp/shed-tauri-<uid>/` | `SHED_TAURI_SOCKET` moves the socket; the lock sits beside it. |
 | Log | macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`; Linux `${XDG_STATE_HOME:-~/.local/state}/ai.stridelabs.shed-desktop/shed-desktop.log` | The Tauri app's own lines, the shed crates' `tracing` events (INFO and up) and the embedded broker's lines (bus connects, drops and `409` rejections, each naming its `server=`), every line stamped `<RFC 3339 UTC> <LEVEL>` and also written to stderr. `SHED_TAURI_LOG=debug` raises the shed crates to DEBUG and adds roost-ipc's events, which are off without it. Rotates at 5 MiB, keeping `.log.1`–`.log.3`. The file is private (`0600`, under your own directories; those the app creates are `0700`) and holds host names, paths and diagnostic text; `SHED_TAURI_LOG=debug` adds roost's ssh diagnostics, which can include ssh's own stderr. `SHED_TAURI_LOG_FILE` overrides the path, which must name a regular file: a symlink there is refused, never followed, as is a FIFO or a device. `identify.log_path` reports the file in use (`null` when file logging is off — a destination that cannot be opened, or a failed write, falls back to stderr only, said once). Opened only once the single-instance lock is held, so a second launch that raises the running app never writes it; a launch whose lock check fails carries on with stderr only. A dev build run beside the installed app (a different `SHED_TAURI_SOCKET`) shares this default path; set `SHED_TAURI_LOG_FILE` to keep them apart. |
 
 ## Security model

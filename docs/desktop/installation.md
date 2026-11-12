@@ -21,7 +21,7 @@ which carries a `FIRST-LAUNCH.txt` with the one-time bypass steps.
 The app updates through **Sparkle**, served from the appcast at
 `https://charliek.github.io/shed/appcast.xml` and verified by an EdDSA signature independent
 of Apple notarization. Updates are **user-invoked only** — there are no automatic background
-checks. Trigger one from the menu-bar dropdown (or the tray popover) → **Check for Updates…**;
+checks. Trigger one from the menu-bar popover → **Check for Updates…**;
 if a newer build is published, Sparkle offers it and applies it in place.
 
 | Behavior | Value |
@@ -31,15 +31,14 @@ if a newer build is published, Sparkle offers it and applies it in place.
 | Verification | EdDSA signature (`SUPublicEDKey`), independent of Apple notarization |
 | Channels | Stable by default; prerelease (rc) builds subscribe to a **beta** channel |
 
-The Tauri macOS app is the shipped macOS client as of 0.9.0 — prerelease
-(`vX.Y.Z-rc.N`) tags publish a beta-channel DMG, stable tags publish the stable-channel DMG,
-both from the same job. It shares the feed, EdDSA key, and bundle identity
-(`ai.stridelabs.ShedDesktop`) that the earlier Swift app used, so the first Tauri release is
-designed to update in place for existing Swift installs (0.9.0 is the first release to exercise
-that path; see the [0.9.0 upgrade guide](../upgrades/v0.8.2-to-v0.9.0.md#macos-desktop)). See
+Prerelease (`vX.Y.Z-rc.N`) tags publish a beta-channel DMG and stable tags the
+stable-channel DMG, both from the same job. The app shares the feed, EdDSA key, and bundle
+identity (`ai.stridelabs.ShedDesktop`) of the Swift app that shipped before 0.9.0, so an
+install from before 0.9.0 updates in place (see the [0.9.0 upgrade
+guide](../upgrades/v0.8.2-to-v0.9.0.md#macos-desktop)). See
 [RELEASING.md](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md).
 
-Locally built DMGs (`make -C desktop dmg`) are **ad-hoc signed**, so Gatekeeper blocks the
+Locally built DMGs (`make -C desktop tauri-dmg-mac`) are **ad-hoc signed**, so Gatekeeper blocks the
 first launch. Clear the quarantine once, after copying it in:
 
 ```bash
@@ -74,13 +73,13 @@ its shared Rust core is the sibling `crates/` workspace. Every `make` target bel
 the monorepo root via the `desktop-` passthrough (`make desktop-<target>`) or directly with
 `make -C desktop <target>`.
 
-**macOS** — prerequisites: Rust stable ≥1.85, Node 20+.
-
-This builds the **shipped** client, the Tauri app:
+**macOS** — prerequisites: Rust stable ≥1.97, Node 20+, and the Xcode Command Line Tools
+(see [Development setup](development-setup.md) for the full list).
 
 ```bash
 git clone https://github.com/charliek/shed
 cd shed
+npm --prefix desktop/tauri/ui ci
 make -C desktop tauri-bundle-mac   # desktop/build/ShedDesktop.app (ad-hoc signed)
 open desktop/build/ShedDesktop.app
 ```
@@ -92,14 +91,6 @@ signing identity:
 ```bash
 SHED_DESKTOP_DEVELOPER_ID_IDENTITY="Developer ID Application: …" make -C desktop tauri-dmg-mac
 ```
-
-!!! note "The Swift app still builds, but is not what ships"
-
-    The original SwiftUI menu-bar client remains in the tree and is still tested in CI, but
-    its release job retired in 0.9.0 — `make -C desktop bundle` builds **that** app, not the
-    one on the releases page. Building it needs Xcode 16+ (Swift 6 toolchain). Use it only if
-    you are working on the Swift sources themselves; see
-    [the desktop RELEASING notes](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md).
 
 **Linux** — the `.deb` is built (in Docker, to pin the WebKitGTK toolchain) with:
 
@@ -115,25 +106,17 @@ make -C desktop deb-validate   # build + install-validate in a clean ubuntu:24.0
 - A reachable `shed-server` on at least one configured host. Unreachable hosts are shown
   as a degraded state, never a hard failure.
 
-**Nothing else — for the Tauri client.** `brew install shed` (or `apt install shed-server` on a Linux host) plus the
-Tauri desktop app is a complete install — its embedded broker handles credential approvals
-(SSH sign, AWS, Docker) itself, no extra daemon needed. The **Swift macOS client** (sources
-retained pending demolition; not shipped since 0.9.0) still requires the separately-installed
-`shed-host-agent` daemon for credential approvals (Homebrew formula, `brew services start
-shed-host-agent`). See below for how that differs between the two clients.
+**Nothing else.** `brew install shed` (or `apt install shed-server` on a Linux host) plus the
+desktop app is a complete install — its embedded broker handles credential approvals (SSH
+sign, AWS, Docker) itself, no extra daemon needed.
 
 ## Credential broker
 
 The app's headline feature — SSH-sign approvals, AWS/Docker credential gating, and the
-Activity audit feed — needs a **credential broker** in the loop. How that broker runs
-differs by client:
+Activity audit feed — needs a **credential broker** in the loop. By default the app runs it
+**embedded**, in-process, on both macOS and Linux: no extra install.
 
-| Client | Broker |
-|---|---|
-| **Tauri** (macOS and Linux) | **Embedded** — runs in-process, on by default. No extra install. |
-| **Swift** (macOS, not shipped since 0.9.0) | **Separate daemon** — a standalone `shed-host-agent` process (Homebrew formula, `brew services start shed-host-agent`). See [Credential approvals](approvals.md). |
-
-The Tauri client can also run against a standalone daemon instead of its embedded broker
+The app can also run against a standalone `shed-host-agent` daemon instead of its embedded broker
 — useful if you already run `shed-host-agent` headless on a server, or want one broker
 shared across tools. A **Preferences → Credential broker** setting (`Automatic` /
 `In-app (embedded)` / `External daemon`) controls it, default `Automatic`:
@@ -156,4 +139,4 @@ produced it, and (for embedded) the resolved SSH backend and per-server connecti
 are visible in Preferences and over IPC (`broker.status`, `identify.broker_mode`). Full
 mechanics — `extensions.yaml` handling, the synthesized fresh-install default, and the
 fail-closed behaviors — are documented in
-[Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker-tauri).
+[Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker).

@@ -7,7 +7,7 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
 
 ## The crates
 
-- **`shed-core`** — a *pure* Rust lib (no UI, no UniFFI): the reqwest(rustls) HTTP client, the
+- **`shed-core`** — a *pure* Rust lib (no UI): the reqwest(rustls) HTTP client, the
   SSE parser, defensive wire decoders, leaf-cert TLS pinning, the control-token FSM, a `config`
   parser, the pull-based `create` orchestration store, and `rc.rs` — which since plan 022
   (S6, charliek/shed#328) is the Remote-Control **model and nothing else**: `RcKind` /
@@ -154,10 +154,6 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   unconfirmed master's `Drop` would have made — clamped to one `MASTER_SHUTDOWN_BOUND`, after
   which the runner is marked so its `Drop` does nothing.
   `shed-craze`'s `ExitWatch::pid()` exists only to name a child in such a log.
-- **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib", "lib"]`)
-  exposing a `ShedCore` object to Swift. The `.a` is what the app links (signing/notarization
-  unchanged); `lib` is required so `cargo run -p shed-core-ffi --bin uniffi-bindgen` works
-  in `desktop/scripts/build-core.sh`.
 - **`shedctl`** — a headless UDS/IPC client on `shed-core` (no GUI-toolkit dep), shipped in the
   Linux `.deb` and drives the Tauri app's socket. In `default-members`.
 - **`shed-broker`** — the embeddable host-agent broker core: the shed-server plugin bus,
@@ -360,8 +356,7 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `full_hub_capabilities` is 0.1.1's (`createTitle`), `hub_capabilities_0_1_0` and
   `session_caps` (no `slashCatalog`) the older shapes, `slash_session_caps` the newer.
   The 0.1.0+gx golden's projection drops the two plan-029 capability bits (pinned by
-  their own cell), so the golden stays byte-identical. Pure lib — serde, tokio, no `reqwest`, no `chrono` — not
-  FFI-exported, builds for `aarch64-linux-android` (mobile links it). In
+  their own cell), so the golden stays byte-identical. Pure lib — serde, tokio, no `reqwest`, no `chrono` — builds for `aarch64-linux-android` (mobile links it). In
   `default-members`. **Tests:** `tests/wire.rs` runs every vendored WIRE fixture
   (`fixtures/wire/`, craze's `internal/fakehost/testdata/wire` at the sha
   `fixtures/wire.PIN` names, its `README.md` included — `make check-craze-pin` requires
@@ -385,8 +380,8 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `shed_core::lane::conformance`.
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
-egress profiles, enriched image, config) that both the Rust decoders and the Swift
-`ConfigParityTests` assert against — keep them byte-real, not hand-trimmed.
+egress profiles, enriched image, config) that the Rust decoders assert against — keep them
+byte-real, not hand-trimmed.
 `fixtures/roost-vectors/` is a **vendored copy** of roost's own golden IPC vectors at the
 pinned rev (see below); its README carries the source sha and roost's never-semantically-edit
 rule.
@@ -494,15 +489,11 @@ gone — not narrowed, retired outright, with no replacement — and everything 
 
 **What it drags in.** `roost-ipc`'s own leaf deps — **`anyhow`**, the **`tracing` facade** (a
 facade only: no subscriber, no `tracing-subscriber`) and **`libc`** — are new to `shed-core`'s
-dependency set but were *already* in this workspace's lock and already reached `shed-core-ffi`
-through `uniffi`, `reqwest`/`hyper-util` and `tokio` respectively. So the Swift staticlib's
-crate graph gains exactly one crate: `roost-ipc` itself. What it does gain is tokio features:
-the workspace asks for `rt-multi-thread, macros, sync, time`, `shed-core` adds `net, io-util`
-(the roost connection and its loopback pump — build-time now, not just dev-time), and roost-ipc
-unifies in `fs, process, signal, rt`. Measured at `shed-core-ffi`, the delta from before this
-dep is **+`process`, +`signal`, +`signal-hook-registry`** (`fs`/`net`/`io-util` already arrived
-via reqwest). Nothing FFI-exported changes; `cargo tree -e features -p shed-core-ffi` prints the
-resulting set. The workspace `rust-version` is **1.97**, which is roost-ipc's MSRV.
+dependency set but were *already* in this workspace's lock. What it does gain is tokio
+features: the workspace asks for `rt-multi-thread, macros, sync, time`, `shed-core` adds
+`net, io-util` (the roost connection and its loopback pump — build-time now, not just
+dev-time), and roost-ipc unifies in `fs, process, signal, rt`; `cargo tree -e features -p
+shed-core` prints the resulting set. The workspace `rust-version` is **1.97**, which is roost-ipc's MSRV.
 
 `shed-app` also takes the **`tracing` facade** directly (plan 014): the roost observer loop has
 two things worth saying that are neither an error nor an update — a resync, and somebody else
@@ -550,10 +541,10 @@ not detect — a real Go-vs-Rust divergence on the product's own default config.
 sits behind the `Node` interface (swap-insulation for its pre-1.0 API). It — and `shed-broker`'s
 other leaf deps (`notify`, the `aws-sdk-*` stack) — are **deps of `shed-broker`, reaching only its
 embedders** (today the `shed-host-agent` bin; from leg 3a.2 also `shed-app` under its non-default
-`broker` feature and, transitively, the Tauri client). They must **never** reach `shed-core`,
-`shed-core-ffi`, or **default-features `shed-app`** (proven by `cargo tree -i saphyr-parser` /
+`broker` feature and, transitively, the Tauri client). They must **never** reach `shed-core`
+or **default-features `shed-app`** (proven by `cargo tree -i saphyr-parser` /
 `notify` / `aws-sdk-sts` — the §7 reverse-dep AC mechanically enforces this). **shed-core's own
-`yaml_lite` stays hand-rolled** (it carries a Swift byte-parity test); converging the two readers
+`yaml_lite` stays hand-rolled**; converging the two readers
 onto `saphyr-parser` would be a separate shed-core slice, not assumed here.
 
 ## Build / test
@@ -581,12 +572,7 @@ unification, was sunset in plan 016 (S7, #329).
 
 `shed-core` also builds/tests on Linux — `make -C desktop core-linux` runs it in Docker.
 
-## FFI regeneration + version lockstep
-
-The Swift-facing `ShedCoreFFI.xcframework` is **not** regenerated here — it is built by
-`desktop/scripts/build-core.sh` (run `make -C desktop core`), which outputs into
-`desktop/artifacts/` (SwiftPM requires target paths inside the package root). Editing
-`shed-core-ffi`'s exported surface means re-running that from `desktop/`.
+## Version lockstep
 
 At **release**, this workspace's `Cargo.toml` version is bumped in **lockstep** with
 `desktop/VERSION` (and the Tauri manifests) by `scripts/release/update-version.sh X.Y.Z

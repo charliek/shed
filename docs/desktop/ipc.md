@@ -6,48 +6,52 @@ first-class feature: it is how changes are verified without a human clicking.
 
 ## Transport
 
-- A Unix-domain socket at `~/Library/Caches/ShedDesktop/shed-desktop.sock` (mode `0600`).
-- Newline-delimited JSON, one object per line, 16 MiB frame cap.
-- Request: `{"id": "<int64-as-string>", "op": "...", "params": {...}}`
+- A Unix-domain socket at `$XDG_RUNTIME_DIR/shed-tauri.sock`, falling back to
+  `/tmp/shed-tauri-<uid>/shed-tauri.sock` when `XDG_RUNTIME_DIR` is unset (the usual case on
+  macOS). `SHED_TAURI_SOCKET` overrides the path. The socket is mode `0600` and its directory
+  `0700`.
+- A sibling `shed-tauri.lock` keeps a single instance: a second launch sends `app.activate`
+  to the running app and exits.
+- Newline-delimited JSON, one object per line, 1 MiB frame cap (a longer line is answered
+  `frame_too_large` and the connection closes).
+- Request: `{"id": "<string>", "op": "...", "params": {...}}`
 - Response: `{"id": "...", "ok": true, "result": {...}}` or
   `{"id": "...", "ok": false, "error": {"code": "...", "message": "..."}}`
 
-Request structs reject unknown fields. Errors use stable codes: `unknown-op`,
-`invalid-param`, `unknown-field`, `not-found`, `internal`, `not-enabled`.
+Error codes are stable snake_case strings. The common ones are `unknown_op`, `bad_request`
+(a missing or malformed param), `not_enabled` (a test-mode-only op outside test mode),
+`not_supported`, `not_found`, `action_failed` (the op was tried and failed),
+`frontend_not_ready` (the UI has not reported yet; retry) and `internal`. Op families add their
+own, documented with them below.
 
 ## Core ops
 
 | op | params | result |
 |----|--------|--------|
-| `identify` | — | `socket_path`, `pid`, `app_label`, `app_id`, `ui_version`, `protocol_version`, `test_mode`, `mock_base_url?`; the Tauri app also `log_path` (its log file, `null` when file logging is off) |
-| `ui.state` | — | `pane`, `hosts[]`, `sheds[]`, `host_agent_connected`, `last_error?`, `sheds_empty_state` |
-| `ui.navigate` | `pane` (sheds\|machines\|approvals\|agents\|activity\|egress\|system) | `pane` |
-| `ui.set_ssh_approval` | `method?`, `scope?`, `ttl?` | `{}` (applies SSH approval prefs + resets live SSH grants) |
-| `ui.show_window` | — | `{}` |
-| `ui.hide_window` | — | `{}` (closes the dashboard → menu-bar-only accessory) |
-| `ui.window_state` | — | `visible` (bool), `activation_policy` (regular\|accessory) |
-| `ui.open_preferences` | — | `{}` |
-| `ui.open_menu` | `open` (bool) | `open` |
-| `host.list` | — | `hosts[]` |
-| `sheds.list` | `host?` | `sheds[]` (Tauri also returns `host_errors[]`) |
-| `sheds.refresh` | — | `{}` (forces an immediate poll); Tauri returns the `sheds.list` payload the UI committed |
+| `identify` | — | `socket_path`, `pid`, `core` (`rust`), `platform` (`tauri`), `test_mode`, `mock_base_url` (`null` outside test mode), `log_path` (the app's log file, `null` when file logging is off), `broker_mode` (`{effective, pref, restart_required}`) |
+| `sheds.list` | — | `{sheds, host_errors}` — a fresh query of every configured host |
+| `sheds.refresh` | — | `{sheds, host_errors}` — asks the dashboard to re-fetch, waits for it to render, and answers with the listing it committed |
 | `system.df` | — | `usage[]` (per-host `GET /api/system/df`: totals + image/shed/orphan disk entries) |
-| `app.window_metrics` | — | `window_width`, `window_height`, `sidebar_width`, `visible_pane` |
-| `app.screenshot` | `surface` (window\|menu), `scale` (1\|2) | `png` (base64), `width`, `height`, `scale`, `surface` |
-| `app.quit` | — | `{}`, then the app exits (Tauri, test mode only): the tray's Quit, drivable — the orderly shutdown runs, then the process ends (see [Architecture](architecture.md#shutting-down-tauri)) |
-| `app.terminate` | — | `{}`, then the app exits (Tauri on macOS, test mode only): the macOS system quit, drivable — `[NSApplication terminate:]`, the path a Dock Quit, a logout and an AppleScript `quit` take, so the orderly shutdown runs from `RunEvent::Exit` alone and AppKit ends the process with status 0. Off macOS it answers `not_supported` (use `app.quit`) |
+| `hosts.auth` | — | `hosts[]`, each `{name, auth_mode, learned}`: the credential mode per server (`token` or `mtls`) and whether this session learned it or read it from the config |
+| `app.screenshot` | — | `png` (base64), `width`, `height` |
+| `app.activate` | — | `{}` — raises the dashboard window (what a second launch sends) |
+| `app.quit` | — | `{}`, then the app exits (test mode only): the tray's Quit, drivable — the orderly shutdown runs, then the process ends (see [Architecture](architecture.md#shutting-down)) |
+| `app.terminate` | — | `{}`, then the app exits (macOS, test mode only): the macOS system quit, drivable — `[NSApplication terminate:]`, the path a Dock Quit, a logout and an AppleScript `quit` take, so the orderly shutdown runs from `RunEvent::Exit` alone and the process ends with status 0. Off macOS it answers `not_supported` (use `app.quit`) |
 
-The screenshot renders the target window's content view to a PNG in-process — no screen
-capture permission, works even when the window is occluded or off-screen. Capturing the
-menu requires it to be open first (`ui.open_menu {open:true}`).
+`app.screenshot` shells out to a platform capture tool — `grim` (Wayland/wlroots), `scrot` or
+ImageMagick `import` (X11) on Linux, `screencapture` on macOS — and returns the first non-empty
+PNG, or `screenshot_failed` naming each tool's problem. It captures the screen, not one window,
+so treat it as a visual aid; the `*.dump` ops below are the deterministic truth. On macOS
+`screencapture` needs the Screen Recording permission, so in an agent or headless session it
+fails there.
 
-**Per-host failures (Tauri).** A host whose sheds can't be listed is reported rather than
-dropped: `host_errors[]` carries `{server, kind, summary, detail}` per failed host, where
-`kind` is `agent_upgrade_required` or `other`, `summary` is the one-line remedy-first text,
-and `detail` is the hover/log body. It is always present — `[]` when every host is healthy.
-The Tauri UI-truth op `dashboard.dump` returns `{rows, host_errors, empty}`: the rendered
-shed rows, the failures the shell holds, and the rendered empty state (`{title, body}`,
-`null` when the list rendered).
+**Per-host failures.** A host whose sheds can't be listed is reported rather than dropped:
+`host_errors[]` carries `{server, kind, summary, detail}` per failed host, where `kind` is
+`agent_upgrade_required` (shed-host-agent is too old to obtain a certificate) or `other`,
+`summary` is the one-line remedy-first text, and `detail` is the hover/log body. It is always
+present — `[]` when every host is healthy. The UI-truth op `dashboard.dump` returns
+`{rows, host_errors, empty}`: the rendered shed rows, the failures the shell holds, and the
+rendered empty state (`{title, body}`, `null` when the list rendered).
 
 The Sheds pane renders no error rows of its own. An unreachable server is a *status*, and
 status lives in the sidebar's **SHED SERVERS** section (the row's dot, with the reason on
@@ -55,30 +59,46 @@ hover) and the System pane. The pane's only duty when it cannot list is to not c
 sheds yet" — its empty state names the unreachable servers and points at the sidebar,
 carrying no transport error text.
 
-**Per-host failures (mac).** The same shape rides on the host itself. Each entry in
-`hosts[]` carries `name`, `host`, `http_port`, `ssh_port`, `reachable`, `backend?`,
-`version?`, `last_error?` and — when the probe failed — a typed `failure`:
+## Window, panes + preferences
 
-| field | meaning |
-|-------|---------|
-| `server` | the configured server name the failure belongs to |
-| `kind` | `agent_upgrade_required` (shed-host-agent is too old to obtain a certificate) or `other` |
-| `summary` | the one-line banner text, remedy first (also mirrored into `last_error`) |
-| `detail` | the full cause — the sidebar tooltip and the diagnostic log body |
-
-`sheds_empty_state` is the sentence the Sheds pane's empty state renders: a known
-`failure.kind` speaks (naming the remedy) instead of the generic "check
-~/.shed/config.yaml" advice, which remains for a failure with no recognized cause.
+| op | params | result |
+|----|--------|--------|
+| `ui.navigate` | `pane` (sheds\|machines\|approvals\|agents\|activity\|egress\|system) | `pane` |
+| `ui.current_pane` | — | `pane` (as the dashboard last reported it) |
+| `ui.modal` | — | `modal`: `create` \| `launch` \| `null` |
+| `ui.badges` | — | `badges`: the sidebar nav badge counts `{sheds, agents, hosts, pending}`, `null` before the first report |
+| `ui.computed_style` | — | `style`: the dashboard's reported computed style (its `mode` echoes `ui.set_appearance`) |
+| `ui.set_appearance` | `mode` (light\|dark) | `{}` |
+| `ui.show_window` | — | `{}` (raises the dashboard; same as `app.activate`) |
+| `ui.show_create` | — | `{}` (raises the dashboard and opens the Create dialog) |
+| `ui.show_preferences` (alias `ui.open_preferences`) | — | `{}` — opens or focuses the Preferences window without raising the dashboard |
+| `egress.show` | `tab?` (activity\|profiles), `profile?`, `host?` | `{}` — drives the Egress pane (it must be the current pane) |
+| `prefs.dump` | — | `{visible, title, prefs}` — the Preferences window's native state plus its reported `{sections, values, mode}` snapshot (`prefs` is `null` before the first open) |
+| `prefs.close` | — | `{}` (hides the Preferences window) |
+| `prefs.get` | — | `{terminal_preset, terminal_template}` |
+| `prefs.set_terminal` | `preset` (ghostty\|roost\|custom), `template?` | `{}` (persists the terminal preference) |
+| `terminal.presets` | — | `presets[]`, each `{id, label, detail, available}` |
+| `loginitem.status` | — | `enabled` |
+| `loginitem.set` | `enabled` (bool) | `{}` |
+| `tray.show` / `tray.hide` / `tray.toggle` | — | `{}` — runs the same path a tray-icon left-click runs (the macOS popover) |
+| `tray.dump` | — | `{present, items, popover, popover_visible, popover_height}` — whether the tray installed (a headless or no-StatusNotifier Linux session has nowhere to show it), its menu item ids, and on macOS the popover's reported rows, visibility and height (`popover` is `null` on Linux, which has no popover) |
+| `updater.status` | — | `{os, enabled, reason, instantiated}` — the Sparkle updater's state (macOS; disabled in test mode) |
+| `updater.check` | — | `{}` — fronts the app and presents Sparkle's check; a disabled updater answers `updater_disabled` with the reason |
 
 ## Lifecycle, create + terminal
 
 | op | params | result |
 |----|--------|--------|
-| `shed.start` / `shed.stop` / `shed.reset` / `shed.delete` | `host?`, `name` | `{}` (refreshes first) |
+| `shed.start` / `shed.stop` / `shed.reset` / `shed.delete` | `host?`, `name` | `{}`; a failure is `action_failed` |
 | `create.start` | `host?`, `name`, `repo?`, `local_dir?`, `image?`, `backend?`, `cpus?`, `memory_mb?`, `no_provision?` | `create_id` |
-| `create.status` | `create_id` | `CreateProgress` (poll until `complete`/`error`) |
-| `terminal.preview` | `host?`, `shed`, `session?` | the ssh `TerminalCommand` (spawns nothing) |
-| `terminal.open` | `host?`, `shed`, `session?` | launches the terminal (**disabled** in test mode) |
+| `create.status` | `create_id` | the create's progress snapshot (poll until `complete`/`error`); `{state: "unknown"}` once it is cancelled or gone |
+| `create.cancel` | `create_id` | `{}` — aborts the create's stream and drops its state (idempotent) |
+| `terminal.preview` | `host?`, `shed`, `session?`, `preset?`, `template?` | the resolved ssh command and terminal invocation (spawns nothing) |
+| `terminal.open` | `host?`, `shed`, `session?`, `preset?`, `template?` | launches the terminal (`not_enabled` in test mode; use `terminal.preview`) |
+
+`preset` is a `terminal.presets` id (`ghostty`, `roost` or `custom`) and `template` the custom
+command template; both default to the saved preference. A `machine` param refuses either op
+with `not_enabled`: a machine row's terminal belongs to roost.
 
 ## Agent sessions
 
@@ -123,7 +143,7 @@ dialog). roost's `tab.open` is the agent binary plus a working directory, so:
   "permission_mode is not supported by a roost launch; set the mode in the agent once its tab
   is open". A launch has no channel to deliver either, and accepting one to drop it would say
   the launch did what it did not. A craze session's create takes a first prompt
-  ([`craze.create`](#craze-sessions-tauri)).
+  ([`craze.create`](#craze-sessions)).
 - **Blank is absent** for every field: an empty or whitespace-only `display_name`,
   `workdir`, `initial_prompt` or `permission_mode` is treated as not sent.
 - **Error codes:** `bad_request` for a request a launch refuses, and `action_failed` for a
@@ -155,13 +175,18 @@ once roost's own agent hooks claim the tab (a `codex`, say), and none for a tab 
 roost's synthesized contract, not a probe: there is nothing to ask, and it answers for a host
 that is currently asleep.
 
-### Machines (Tauri)
+### Machines
 
 A **machine** is a native host you reach over SSH that runs a `roost-session` — no shed
 server in the path, no TLS pin, no control token. Machines come
-from the `machines:` section of `~/.shed/config.yaml` and are
-read ONCE at startup, so there is no in-app add/edit; an editor that silently needed a
-relaunch would be worse than the file.
+from the `machines:` section of `~/.shed/config.yaml`, read at startup. The Machines pane's
+**Add machine** dialog (and `machine.add`) appends one entry — insert-only, after a backup of
+the file — and starts watching it at once; there is no in-app edit or remove.
+
+| op | params | result |
+|----|--------|--------|
+| `machine.add` | `name`, `host?`, `user?`, `ssh_port?` | `{}` — appends the machine to the config and starts its watcher; a duplicate or reserved name, or an unusable port, is `bad_request` |
+| `machine.capabilities` | `machine` | `{capabilities}` — the host's synthesized roost contract |
 
 Machine sessions appear in `rc.list` beside shed sessions, each stamped with
 `origin_kind: "machine"` and `origin: "machine:<name>"`. **Row keys and grouping must use
@@ -214,7 +239,7 @@ returns them. **A shed with no `roost-session` lists no sessions**, which is wha
 pane's empty state says — and it offers the setup, which happens on the shed's own card.
 See the roost project's own docs for the daemon and its IPC contract.
 
-### Craze sessions (Tauri)
+### Craze sessions
 
 Each host — this machine, every configured machine, every running shed — has a **craze
 source**: its craze hub's live session list (craze is the provider abstraction for cursor,
@@ -334,7 +359,7 @@ the words:
 `craze.saved` refuses with the create ops' codes: `unavailable` for a hub without `reopen` (the
 same words), the lane contract's otherwise.
 
-### Agent lanes (Tauri)
+### Agent lanes
 
 A row that carries an `agent_lane` stamp — an opencode tab that reported its server, or a
 craze row — opens a live transcript through these ops. `session_id` is the **agent's**
@@ -400,7 +425,7 @@ session opened the moment its create answered, the open's row is the create's ow
 stream's carries the attach's `permission_mode`. The panel's header (title, directory,
 permission line) reads the live row, and `lane.open`'s only until the first seed.
 
-### UI-truth ops (Tauri)
+### UI-truth ops
 
 These report what the frontend RENDERED, so a test can assert the window rather than the
 backend's view — the two can disagree, and have.
@@ -413,6 +438,8 @@ backend's view — the two can disagree, and have.
 | `egress.profiles` | on the Egress pane | `{egress}` |
 | `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs, plus its `craze_note`: the note the card renders about the machine's craze ("craze on this machine is too old for shed; update it", or for a live hub that cannot create "update craze on this machine to create sessions here"), `null` when it says nothing — a machine without craze is not a problem to report — and `craze_create`: whether the card offers New craze session |
 | `sidebar.dump` | **always** | `{servers, machines}` — the sidebar's status foot; each machine row is `{name, origin, status, note, tone}`, `tone` its dot: `ok`, `pending` (still connecting), `off`, or `neutral` (listed by craze alone, `craze only`) |
+| `roost_consent.dump` | while the roost bootstrap consent dialog is open | `{consent}` — the dialog's rendered copy, `null` when none is mounted |
+| `toast.dump` | **always** | `{toast}` — the toast on screen, `null` when none is |
 | `shed_roost.dump` | on the Sheds pane | `{sheds}` — each RUNNING shed's row by its `roost:<server>/<shed>` target: its roost line (`status`, `button`, `busy`, `error`, `rendered`), and its craze: `craze_create` (whether the row shows New craze session) and `craze_note` (the too-old note it shows, else `null`) — read off the row |
 | `craze_create.dump` | while the craze create sheet is open | `{craze_create}` — what the sheet rendered: `machine`; `state` (`loading` \| `failed` (the options) \| `idle` \| `submitting` \| `refused` \| `unknown` \| `created`); `providers[]` — `{id, label, state, dimmed, selected, reason, fix}`, a non-ready one dimmed and never selectable — except the provider of a kept request id being replayed, which stays `selected` whatever its state (one the re-read no longer lists is a row of its own, `state: "absent"`); `preselected` (the default provider when listed and ready, else the first ready one) and `default_provider`; `recent_dirs`; `values` (the typed "Directory", "Name" and "First prompt"); `title_field` (whether "Name (optional)" is shown: the machine's live hub takes a title at create, or one is typed) and `title_problem` (a refusal about the title, shown under it — craze's `params.title …` `bad_request`); the `request_id` it holds (only while a submission is in flight or its outcome is unknown); its `note` (offline / too old / not installed; else, while a kept request id is replayed, the unknown outcome and "Changing the form starts a new request instead."; else "no provider is ready on this machine"); the `error` as shown (`{code, message, where, text}`), a start failure's `cause` verbatim, the directory's own `cwd_problem`; `create_enabled` and the `primary` button's label (Create, Try again, Creating…; empty in the Resume half); `modes` — `{offered, enabled}`: whether the `New \| Resume` control is shown (the options say `reopen`) and usable (not while a create submits or a reopen runs); `mode` (`new` \| `resume`, the half on screen); and `saved` — the Resume half as rendered, `null` while New shows: `{state, error, more, gone, rows[]}`, `state` the list's read (`loading` \| `failed` \| `ready`), `error` a failed read's words, `more` "Showing the 50 most recent." when craze left some out, `gone` the note a dropped row left (its title and craze's words), and each row `{id, title, provider, workspace, updated, state, error, button, enabled}` — `workspace` as shown (the home shortened to `~` where known), `updated` its age as shown, `state` `idle` \| `resuming` \| `refused` \| `unavailable`, `error` its refusal as shown, `button` Resume / "Resuming… (this can take a few minutes)" / Retry — read off the mounted DOM; `null` when none is mounted |
 | `lane.dump` | while the transcript panel is open | `{lane}` — what the panel rendered: its rows, approval cards, `kind` badge (and `lane_kind`, the kind it was opened with), the `permission` line (`bypass` reads "runs tools without asking"), Interject toggle, `can_cancel` and `stop` (`{confirming}`, or `null` with no Stop button) — all read off `lane.messages`' `capabilities`; Cancel, Interject and Stop exist only when the capabilities offer them, and Cancel/Interject are live only while the session is working and the lane is not finished — `finished` (`lane.messages`' own) and `composer_disabled` (the composer's text box, Send, Interject and Cancel disabled because the lane is finished; the banner reads `ended · <reason>`), `settings_chip` (the header's `<model name> · <effort value> · fast`, from the current values, the effort being the option `lane.messages`' `effort_option` names; `null` — no chip — when the capabilities do not say `settings`), `stale`, `ended`, and its error; the composer's `draft`; and `slash_menu` — `{open, token, rows: [{name, dimmed, highlighted}], draft, refusal, warning}`, the `/` menu as rendered: `open` is the menu ON SCREEN (the shared filter's, less an Esc dismissal, which lasts until the token changes), `rows` what it lists in order (`dimmed` while a turn runs and the row would wait for it — "after this turn"; `highlighted` what Enter and Tab accept), `refusal` the line a refused command left (the shared core's reason, craze's words, or "may have applied — check the session"), `warning` a rename that took with a caveat — or `null` on a session with no menu (no `slash` capability, or no catalog yet); `null` when none is mounted |
@@ -474,6 +501,12 @@ outside test mode both answer `not_enabled`, and the production door onto the sa
 a dormant shed, by its address) leads on to the craze create sheet: its button reads Continue.
 `ui.close_launch` closes the dialog (its Escape or Cancel).
 
+The roost bootstrap consent dialog opens from a card's plan button, a click, so it has doors
+too — **test mode only**, because showing the card and confirming it are the two halves of a
+user's consent: `ui.show_roost_consent {target}` opens it for a shed or machine target,
+`ui.confirm_roost_consent` presses Confirm, and `ui.close_roost_consent` closes it. The
+production door is `roost.bootstrap`, which takes `consent: true` and the probe's fingerprint.
+
 The craze create sheet is opened by `ui.show_craze_create {machine}` (the New craze session
 action, a click; opening it reads `craze.create_options`, so on a dormant machine it starts the
 hub) and closed by `ui.close_craze_create` — closing it while a create runs keeps the create
@@ -513,9 +546,17 @@ These drive the credential-approval gate (see [Credential approvals](approvals.m
 | `activity.log_path` | — | `path` (the append-only audit log) |
 | `policy.list` | — | `rules[]` (effective: default + per-namespace + per-shed) |
 | `policy.set` | `rules[]` | `{}` (test mode only) |
-| `notifications.list` | — | `notifications[]` (test mode: what the gate posted) |
-| `notification.invoke` | `id`, `action` (approve\|deny) | `{}` (test mode: drive a notification action) |
-| `notification.open` | — | `{}` (test mode: drive a banner-body tap → opens the Approvals pane) |
+| `notifications.list` | — | `notifications[]` (what the gate posted) |
+| `notification.invoke` | `id`, `action` (approve\|deny) | `{}` — drives a posted notification's action; `not_found` for an unknown id |
+| `notification.open` | — | `{}` — a banner-body tap: raises the window on the Approvals pane |
+| `ui.set_ssh_approval` | `method?` (biometrics-or-password\|biometrics\|prompt), `policy?` (always-allow\|per-shed-allow\|time-based-allow\|always-ask\|always-deny), `ttl?` | `{}` — applies and persists the SSH approval prefs and resets live SSH grants |
+| `ui.ssh_prefs` | — | `{method, policy, ttl}` — the SSH approval prefs in effect |
+| `prefs.provider_modes` | — | `{namespace: "approve"\|"deny"}` for `aws-credentials` and `docker-credentials` |
+| `prefs.set_provider` | `namespace`, `decision` (approve\|deny) | `{}` — sets and persists an AWS/Docker mode |
+| `prefs.remove_shed_rule` | `server`, `shed` | `{}` — removes one per-shed override (`server` verbatim; `""` is the single unnamed server) |
+| `broker.status` | — | `{effective_mode, pref, restart_required, probe, config, resolved_ssh_mode, gate_namespaces, servers, broker_error}` — see [Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker) |
+| `broker.mode` | — | `{effective, pref, restart_required}` |
+| `broker.set_mode` | `mode` (auto\|embedded\|external) | `{pref, effective, restart_required}` — persisted; takes effect on the next launch |
 
 `approval.decide` with `persist:true` saves a per-`(server,shed)` rule (always-allow
 when `decision:approve`, always-deny when `decision:deny`). For an approve, `scope`
@@ -525,20 +566,24 @@ so its durable audit records how the decision was made.
 
 ## Test mode
 
-When launched with `SHED_DESKTOP_TEST_MODE=1`, `identify` reports `test_mode: true` and the
-`mock_base_url` the app's HTTP clients were redirected to, so the harness can confirm a run
-is hermetic before asserting anything. Fault-injection ops (like `policy.set`) are gated
-behind this flag.
+When launched with `SHED_TAURI_TEST_MODE=1`, `identify` reports `test_mode: true` and the
+`mock_base_url` the app's HTTP clients were redirected to (`SHED_TAURI_MOCK_BASE_URL`), so the
+harness can confirm a run is hermetic before asserting anything. Test mode also unlocks the
+fault-injection and driver ops marked "test mode only" above (`policy.set`, `rc.inject_test`,
+`app.quit`, the `ui.fill_*`/`ui.submit_*` doors, and so on), swaps the notification presenter and
+the Touch ID / polkit gate for fakes (so `notification.invoke` drives what `notifications.list`
+reports, and every gate approves), disables
+`terminal.open` and Sparkle, and never reads the developer's own `~/.shed/config.yaml`: an
+unset `SHED_TAURI_SHED_CONFIG` loads an empty config.
 
-`SHED_TAURI_CRAZE_PATH` (Tauri, test mode **and** a debug build) names the directory this
+`SHED_TAURI_MOCK_UNREACHABLE_HOSTS` (comma-separated server names) points those hosts at a
+closed port instead of the mock, a deterministic per-host failure. `SHED_TAURI_ROOST_SOCKETS`
+(`<machine>=<socket path>,…`) dials a machine's `roost-session` on a local socket instead of
+over ssh; with it set, no machine ever spawns ssh.
+
+`SHED_TAURI_CRAZE_PATH` (test mode **and** a debug build) names the directory this
 machine's craze source finds `craze` in: the local dial then runs craze's ladder JAILED to its
 first two rungs, with `PATH` exactly that directory and nothing of the app's environment but
 `HOME`, `CRAZE_HOME` and `CRAZE_RUNTIME_DIR`. Unset in test mode, the app has no local craze
 source; a remote one exists in test mode only through the fake-`ssh` seam
-(`SHED_TAURI_SSH_BIN`), jailed the same way.
-
-Two launch-time overrides exist only in test mode, both taking comma-separated server
-names: `SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS` points a host at a closed port (a
-deterministic per-host failure), and `SHED_DESKTOP_MOCK_CREDENTIAL_HOSTS` keeps a host's
-REAL control-credential wiring — the host agent plus the config's `auth_mode` — against
-the mock, so the mint → refusal → banner chain is drivable end to end.
+(`SHED_TAURI_SSH_BIN`, also debug builds only), jailed the same way.
