@@ -5,7 +5,7 @@
 //! (whose stderr goes nowhere) still leaves a record.
 //!
 //! * **Where:** macOS `~/Library/Logs/ShedDesktop/shed-desktop.log` (the path the
-//!   retired Swift app wrote); Linux
+//!   pre-0.9.0 Swift app wrote); Linux
 //!   `${XDG_STATE_HOME:-$HOME/.local/state}/ai.stridelabs.shed-desktop/shed-desktop.log`.
 //!   `SHED_TAURI_LOG_FILE` overrides both ([`resolve_path`], read by `env.rs`).
 //! * **When:** the sink opens only once the single-instance lock is held
@@ -334,7 +334,7 @@ fn create_private_dirs(dir: &Path) -> io::Result<()> {
 /// writing (and chmodding) whatever it points at; `O_NONBLOCK` makes a FIFO
 /// fail or open at once instead of waiting for a reader (it changes nothing
 /// for a regular file); the handle's own `fstat` then refuses anything that
-/// is not a regular file. One found with a wider mode (one the retired Swift
+/// is not a regular file. One found with a wider mode (one the pre-0.9.0 Swift
 /// app left on macOS) is narrowed to `0600`.
 fn open_append(path: &Path) -> io::Result<(File, u64)> {
     let file = OpenOptions::new()

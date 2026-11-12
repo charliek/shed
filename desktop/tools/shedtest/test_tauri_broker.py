@@ -18,10 +18,6 @@ throwaway HOME (`shed_broker::DEFAULT_DISCOVERY_SOURCE`), which we point at the
 private mock; because that URL is plain `http://`, `ServerTarget::is_secure` is
 false, the bus attaches a static (empty) token and NEVER mints over SSH — so no
 cell shells real `ssh` (hermetic token handling, §C4.2).
-
-Target-scoped: gated on `--target tauri` (skipped otherwise), like `test_tauri.py`.
-The mac target never starts an in-process broker, so none of this — nor the mock's
-new bus routes — is exercised on the mac suite.
 """
 
 from __future__ import annotations
@@ -43,11 +39,6 @@ import ui
 from client import TauriClient, scaled_timeout
 from fake_host_agent import FakeHostAgent
 from mockserver import MockShedServer
-
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SHED_TEST_TARGET", "mac") != "tauri",
-    reason="tauri-only: embedded credential-broker e2e",
-)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CONFIG = FIXTURES / "config.yaml"
@@ -313,7 +304,7 @@ def test_autodetect_headless_coexist_when_only_status_socket_live():
 @pytest.mark.skipif(
     shutil.which("ssh-keygen") is None,
     reason="needs ssh-keygen to seed a local-keys backend (absent on the Linux render "
-           "gate image; the round-trip runs on the mac e2e-tauri gate + in-crate tests)",
+           "gate image; the round-trip runs on the macOS e2e-tauri gate + in-crate tests)",
 )
 def test_embedded_sign_round_trip_through_appgate():
     """A bus `sign` request reaches the Coordinator queue, the app approves (test-mode

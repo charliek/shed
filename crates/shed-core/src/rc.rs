@@ -1,7 +1,6 @@
 //! The pure Remote-Control **model** (RC Session Convention v2) — the kind /
 //! state / activity vocabulary, the capability block, the neutral wire DTOs,
-//! the message-feed rows, and the enriched `RcSession`. Ported from
-//! shed-desktop's `ShedKit/RC/RemoteControl.swift` + `Models.swift` `RcSession`.
+//! the message-feed rows, and the enriched `RcSession`.
 //!
 //! **This is types, not machinery.** Plan 022 (S6, `charliek/shed#328`) deleted
 //! the RC hub and with it everything in this file that DID something: the
@@ -325,7 +324,6 @@ impl<'de> Deserialize<'de> for RcActivity {
 
 /// A binary-domain outcome, distinguished from an SSH transport failure by the
 /// exit code (the orchestrator maps SSH auth/unreachable; these are the binary's).
-/// Mirrors Swift's `RcError`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RcError {
     #[error("rc session already exists: {0}")]
@@ -368,7 +366,7 @@ pub struct RcSessionDto {
     pub tmux_session: String,
     pub kind: RcKind,
     pub state: RcState,
-    // Strict like Swift's `RcSessionDTO` (binary output, golden-pinned): `managed`
+    // Strict (binary output, golden-pinned): `managed`
     // is required — a DTO omitting it is a shed-ext-rc contract violation, not a
     // silent "unmanaged". (The enriched `RcSession` model below stays defensive.)
     pub managed: bool,
@@ -1365,7 +1363,7 @@ mod tests {
         assert_eq!(j["kind"], "shell");
         assert_eq!(j["managed"], false);
         assert_eq!(j["lane"], "tui");
-        // None optionals are omitted (Swift's encodeIfPresent parity), and `id`
+        // None optionals are omitted, and `id`
         // (the computed key) is never on the wire.
         assert!(j.get("url").is_none());
         assert!(j.get("rc_id").is_none());
@@ -1390,8 +1388,8 @@ mod tests {
     /// module until S6 (`charliek/shed#328`) deleted the `shed-ext-rc` stdout
     /// contract along with the binary that produced it; the golden itself
     /// survives because it is the cross-repo pin for [`RcSessionDto`] and
-    /// [`RcCapabilities`], which BOTH survive (Swift's `RCTests` asserts the same
-    /// file, and `roost::model` synthesizes exactly these two shapes). Declaring
+    /// [`RcCapabilities`], which BOTH survive (`roost::model` synthesizes exactly
+    /// these two shapes). Declaring
     /// it here rather than in the module keeps a dead wire type out of the
     /// shipped surface while losing none of the parity coverage.
     #[derive(Debug, PartialEq, Deserialize, Serialize)]
@@ -1521,8 +1519,8 @@ mod tests {
     /// Mirrors the Go producer's `TestSessionMarshalOmitsEmptyOptionals`
     /// (`internal/ext/rc/golden_test.go:119`): a minimal DTO re-marshals with its
     /// optional fields ABSENT (not `null`, not `""`), while `managed` and `lane`
-    /// are the always-present exceptions. This is the wire contract the Swift
-    /// Codable and TS Zod consumers rely on.
+    /// are the always-present exceptions. This is the wire contract the TS Zod
+    /// consumers rely on.
     #[test]
     fn minimal_session_marshals_without_empty_optionals() {
         let dto = RcSessionDto {

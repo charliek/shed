@@ -1,6 +1,6 @@
-//! Runtime configuration resolved from `SHED_TAURI_*` env vars, mirroring the
-//! Swift `ShedBackend` hermeticity hooks so the pytest harness can point the Tauri
-//! app at an in-process mock + a fixture config without touching real hosts.
+//! Runtime configuration resolved from `SHED_TAURI_*` env vars — the
+//! hermeticity hooks that let the pytest harness point the Tauri app at an
+//! in-process mock + a fixture config without touching real hosts.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -355,8 +355,8 @@ fn default_extensions_path() -> PathBuf {
     home.join(".config/shed/extensions.yaml")
 }
 
-/// The host agent's approval socket, matching where `shed-host-agent` (and the
-/// Swift app, `ShedBackend`) place it PER PLATFORM: an explicit
+/// The host agent's approval socket, matching where `shed-host-agent` places it
+/// PER PLATFORM: an explicit
 /// `$SHED_HOST_AGENT_SOCKET_DIR` wins everywhere; else **macOS** uses the native
 /// `~/Library/Application Support/shed`, and **Linux** the XDG convention
 /// (`$XDG_RUNTIME_DIR/shed`, else `~/.local/share/shed`) — plus `host-agent.sock`.

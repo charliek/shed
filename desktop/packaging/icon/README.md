@@ -46,7 +46,6 @@ the UI tree, not here; this pipeline is only the app/launcher/dock icon.
 - `packaging/icons/hicolor/{256x256,512x512}/apps/shed-desktop.png` — Linux
   `.deb` hicolor icons (nfpm installs the same file under both `shed-desktop`
   and `ai.stridelabs.shed-desktop` names — see `packaging/nfpm.yaml`)
-- `Resources/AppIcon.icns` — the Swift macOS app icon (via `iconutil`)
 
 **Not produced here:** `tauri/src-tauri/icons/tray-template{,@2x}.png` — the
 menu-bar template glyph is a separate black-on-transparent silhouette and stays
@@ -67,7 +66,7 @@ prefix):
 ```
 
 The PNG + `.ico` legs are cross-platform. The **`.icns` legs require `iconutil`,
-which is macOS-only** — full regeneration (including `Resources/AppIcon.icns` and
+which is macOS-only** — full regeneration (including
 `tauri/.../icon.icns`) must run on a Mac. On Linux the script writes the PNGs +
 `.ico` and skips the `.icns` bundles. On a Mac dev box the wrapper adds
 Homebrew's `lib` to the dyld path so cairosvg finds `libcairo`.

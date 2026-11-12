@@ -1,7 +1,7 @@
 //! The shed-core-backed data layer shared by every client: it owns one HTTP
 //! client per configured server (+ a create store) and performs the reads,
 //! lifecycle actions, and creates. In test mode every client is pointed at the
-//! single mock base URL (hermetic), mirroring the Swift ShedBackend/AppModel.
+//! single mock base URL (hermetic).
 //!
 //! Env-agnostic: [`from_env_parts`](Backend::from_env_parts) takes the resolved
 //! `(test_mode, mock_base_url, config_path)` rather than a client's `SHED_*_` env
@@ -358,7 +358,7 @@ impl Backend {
 
     /// Like [`list_sheds`](Self::list_sheds) but ALSO rolls up per-host failures
     /// into a `last_error` summary (`0 → None`, `1 → that error`, `2+ → "N hosts
-    /// unreachable"`) — the Swift AppModel's reachability rollup. Additive:
+    /// unreachable"`) — the reachability rollup. Additive:
     /// `list_sheds` keeps its error-dropping contract (GTK uses it and never
     /// surfaces the rollup); the Tauri client surfaces `last_error`.
     pub async fn refresh(&self) -> Reachability {
@@ -384,7 +384,7 @@ impl Backend {
 
     /// Per-host disk usage (`GET /api/system/df`) for the System pane. Unlike
     /// `list_sheds`, a per-host failure is KEPT as an error row (the pane shows
-    /// which host is unreachable + why), mirroring the Swift `system.df`. Concurrent.
+    /// which host is unreachable + why). Concurrent.
     pub async fn system_df(&self) -> Vec<HostDiskUsage> {
         self.per_host(async |c: &Client| c.system_df().await)
             .await
@@ -407,7 +407,7 @@ impl Backend {
     /// Per-host egress profiles (`GET /api/egress/profiles`) for the Egress pane.
     /// Like [`system_df`](Self::system_df), a per-host failure is KEPT as an error
     /// row (that host is unreachable or has egress disabled) rather than failing
-    /// the call, mirroring the Swift `doEgressRefresh`. Concurrent.
+    /// the call. Concurrent.
     pub async fn egress_profiles(&self) -> Vec<HostEgressProfiles> {
         self.per_host(async |c: &Client| c.egress_profiles().await)
             .await
@@ -477,7 +477,7 @@ impl Backend {
     /// The RC ssh targets for every RUNNING shed (optionally filtered by
     /// host/shed) — what `rc.list` fans out over. Pairs each running shed with the
     /// resolved ssh endpoint of its host, so `RcService::list` can probe them all
-    /// without touching `Backend`. Mirrors the Swift `rcList` target selection.
+    /// without touching `Backend`.
     pub async fn rc_targets(
         &self,
         host: Option<&str>,
@@ -538,8 +538,8 @@ pub(crate) fn known_hosts_path() -> String {
     PATH.clone()
 }
 
-/// All hosts' sheds + a rollup of per-host reachability failures (what the Swift
-/// AppModel surfaces as "N hosts unreachable").
+/// All hosts' sheds + a rollup of per-host reachability failures (what the
+/// dashboard surfaces as "N hosts unreachable").
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Reachability {
     pub sheds: Vec<Shed>,
@@ -612,7 +612,7 @@ pub struct HostDiskUsage {
 
 /// One host's egress profiles, or the error that host returned — the Egress pane
 /// shows an error row per host (unreachable / egress disabled) rather than
-/// dropping it. Mirrors the Swift `HostEgressProfiles` + the `HostDiskUsage` row shape.
+/// dropping it. Same row shape as `HostDiskUsage`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HostEgressProfiles {
     pub host: String,

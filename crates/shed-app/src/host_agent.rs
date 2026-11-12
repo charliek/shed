@@ -1,5 +1,5 @@
-//! The shed-host-agent UDS client — the stateful state machine ported from
-//! `HostAgentClient.swift`. Connects to the agent's socket, registers with a
+//! The shed-host-agent UDS client — the stateful state machine. Connects to
+//! the agent's socket, registers with a
 //! `hello`, streams inbound frames (approval requests + the all-namespace audit
 //! feed), answers pings, sends approve/deny responses, and correlates
 //! `token.get`/`token.response` for control-token minting. Auto-reconnects with
@@ -34,7 +34,7 @@ use crate::traits::ClockRef;
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
-/// Default per-request timeout for `token.get` (mirrors the Swift 10s).
+/// Default per-request timeout for `token.get`.
 pub const DEFAULT_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Max bytes per newline-framed message (mirrors the mac `ipcMaxFrameBytes`); a
 /// larger frame is a protocol violation → disconnect, never unbounded growth.
@@ -773,7 +773,7 @@ fn peer_trusted(peer: Option<u32>, ours: u32) -> bool {
 /// Read one newline-terminated frame into `buf` (including the trailing `\n`),
 /// capped at `max` bytes. `Ok(true)` = a complete frame; `Ok(false)` = EOF — any
 /// partial bytes are dropped (a frame missing its terminator at EOF is never
-/// processed, matching the Swift `LineFrameReader`); `Err` on an I/O error or a
+/// processed); `Err` on an I/O error or a
 /// frame exceeding `max` (a protocol violation → disconnect, no unbounded growth).
 async fn read_frame_capped(
     reader: &mut BufReader<OwnedReadHalf>,
@@ -1423,11 +1423,10 @@ mod tests {
     // -----------------------------------------------------------------------
     // Plan 002 §7 P9 — the shared, language-neutral desktop-credential vectors.
     //
-    // These are the SAME files the Swift decoder tests
-    // (`desktop/Tests/ShedKitTests/HostAgentCredentialFixtureTests.swift`) and
-    // the Go/Rust AGENT suites read. The point is not that each language has a
-    // test — it is that a divergence in how Go, Rust and Swift read one byte
-    // string fails a test, per commit, instead of surfacing as a field report.
+    // These are the SAME files the Go/Rust AGENT suites read. The point is not
+    // that each language has a test — it is that a divergence in how Go and
+    // Rust read one byte string fails a test, per commit, instead of surfacing
+    // as a field report.
     // -----------------------------------------------------------------------
 
     fn fixture(name: &str) -> Value {

@@ -39,7 +39,7 @@ pub fn production_seams() -> (NotifierRef, AuthGateRef) {
     #[cfg(target_os = "macos")]
     {
         // B3 + B5: the real Touch-ID gate (LAContext.evaluatePolicy via objc2) +
-        // real approval banners (osascript) — full mac parity with the Swift app.
+        // real approval banners (osascript).
         (Arc::new(macos::OsaNotifier), Arc::new(macos::TouchIdGate::default()))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -607,8 +607,8 @@ mod macos {
     use shed_core::approval::ApprovalRequest;
 
     /// Posts an approval banner via `osascript` (Notification Center) — the mac
-    /// analog of the Linux `notify-send` notifier (B5), matching the Swift app's
-    /// approval banners. Best-effort + fire-and-forget so the actor never blocks;
+    /// analog of the Linux `notify-send` notifier (B5). Best-effort +
+    /// fire-and-forget so the actor never blocks;
     /// withdraw is a no-op (Notification Center banners auto-dismiss — precise
     /// recall via `UNUserNotificationCenter` is a follow-up, as on Linux).
     pub struct OsaNotifier;
@@ -739,7 +739,7 @@ mod macos {
     }
 
     /// The macOS Touch-ID `AuthGate` (B3) — `LAContext.evaluatePolicy` behind the
-    /// rich `AuthOutcome` (never a bool, F5), mirroring the Swift `TouchID.swift`.
+    /// rich `AuthOutcome` (never a bool, F5).
     /// Generic over the [`LocalAuth`] seam so tests inject a fake; prod is
     /// `TouchIdGate::default()` = [`RealLocalAuth`].
     pub(crate) struct TouchIdGate<L: LocalAuth = RealLocalAuth> {
@@ -756,8 +756,7 @@ mod macos {
     impl<L: LocalAuth> AuthGate for TouchIdGate<L> {
         async fn gate(&self, prompt: AuthPrompt) -> AuthOutcome {
             // Deny-safe: if the device can't satisfy the policy (no biometrics /
-            // passcode enrolled), NEVER prompt — Unavailable (F5), matching
-            // TouchID.swift's `canEvaluatePolicy == false` path.
+            // passcode enrolled), NEVER prompt — Unavailable (F5).
             if !self.la.can_evaluate(prompt.biometrics_only) {
                 return AuthOutcome::Unavailable;
             }

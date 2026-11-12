@@ -19,7 +19,7 @@ const (
 	// reverting to a stale locally-cached manifest). To delete a
 	// blob a tag points at, the workflow is `shed image rm <tag>`
 	// followed by `shed image prune`. See
-	// docs/upgrades/v0.5.7-to-v0.5.8.md.
+	// https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md.
 	RefKindTag RefKind = "tag"
 
 	// RefKindPending indicates a reference held by an in-flight

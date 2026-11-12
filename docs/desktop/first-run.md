@@ -26,7 +26,7 @@ The sidebar selects a pane:
   CPU/memory, then streams creation progress live (SSE). The list is kept current by polling
   each `shed-server`.
 - **Approvals** — pending credential-approval requests, with Approve / Deny (optionally
-  Touch ID on macOS) and "always allow". They come from the app's own embedded broker by
+  confirmed with Touch ID on macOS or a polkit password prompt on Linux). They come from the app's own embedded broker by
   default, or from a separate `shed-host-agent` configured to delegate — see
   [Credential approvals](approvals.md).
 - **Agents** — the agent sessions on each shed and machine, as [roost](../extensions/roost-session-hosts.md)
@@ -51,8 +51,8 @@ through apt.
 
 ## Preferences
 
-**Preferences…** (in the menu) covers launch-at-login, the terminal command template, and
-the approval policy (default mode + per-namespace / per-shed overrides). The full set of
+**Preferences…** (in the menu) covers launch-at-login, the terminal, the credential broker
+mode, and the approval policy (SSH policy and method, AWS/Docker modes, per-shed overrides). The full set of
 settings — and the environment-variable overrides — is in
 [Configuration](configuration.md).
 

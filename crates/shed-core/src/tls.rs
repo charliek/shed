@@ -1,9 +1,9 @@
 //! TLS leaf-cert pinning for shed-server's self-signed HTTPS cert.
 //!
 //! The pin is `sha256:<lowercase-hex>` of the leaf cert's DER — byte-for-byte
-//! with Swift's `certFingerprint`, the server (`internal/servertls.Fingerprint`),
-//! and the Go clients. A pinned client accepts a handshake iff the leaf hashes
-//! to the pin (chain/name checks skipped, like the Swift pinning delegate), but
+//! with the server (`internal/servertls.Fingerprint`) and the Go clients. A
+//! pinned client accepts a handshake iff the leaf hashes to the pin (chain/name
+//! checks skipped), but
 //! still verifies the handshake signature against the presented cert so a
 //! different key can't MITM. Fail-closed on a non-https URL is enforced by the
 //! caller (`Client::new`).

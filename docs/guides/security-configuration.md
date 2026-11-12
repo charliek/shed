@@ -36,7 +36,7 @@ the [Security reference](../reference/security.md). For a full internet-facing
 walkthrough, see [Public VPS Deployment](vps-deployment.md). Upgrading an
 existing token-mode server to mtls, or upgrading from a pre-v0.7.4 server (the
 loopback default is new)? See [Upgrading to mTLS](../upgrades/token-to-mtls.md)
-and [Upgrading v0.7.3 → v0.7.4](../upgrades/v0.7.3-to-v0.7.4.md).
+and [Upgrading v0.7.3 → v0.7.4](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md).
 
 Server settings live in `server.yaml` (`/etc/shed/server.yaml` on Linux,
 `~/.config/shed/server.yaml` or the Homebrew `…/etc/shed/server.yaml` on macOS).

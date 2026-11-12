@@ -1,12 +1,10 @@
-"""tauri-only E2E: behavior specific to the Tauri client's runtime that has no
-mac analog — the single-instance hand-off, and the A0a UI ops (navigate /
-show_window / activate) that aren't in the cross-target shared suite. Gated on
-`SHED_TEST_TARGET`, so the whole module is skipped unless `--target tauri`.
+"""Tauri E2E: the app runtime — the single-instance hand-off, the UI ops
+(navigate / show_window / activate), the tray, preferences, terminal presets,
+the System and Egress panes, and the dialogs.
 """
 
 from __future__ import annotations
 
-import os
 import platform
 import subprocess
 from pathlib import Path
@@ -17,11 +15,6 @@ import ui
 from client import ShedError, scaled_timeout
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SHED_TEST_TARGET", "mac") != "tauri",
-    reason="tauri-only: single-instance hand-off + A0a UI ops",
-)
 
 
 def test_ui_ops_ack(tauri):
@@ -36,8 +29,7 @@ def test_ui_ops_ack(tauri):
 
 
 def test_dashboard_auto_refreshes_new_shed(tauri, mock):
-    # P1: the open dashboard polls on a cadence (5s, visible-only — mac AppModel
-    # parity) so a shed created OUTSIDE the app (e.g. `shed create` from the CLI)
+    # P1: the open dashboard polls on a cadence (5s, visible-only) so a shed created OUTSIDE the app (e.g. `shed create` from the CLI)
     # surfaces on its own, with NO manual refresh. Drive it: make the window
     # visible, add a shed to the mock's served list, then assert it appears via the
     # UI-truth dashboard.dump within one poll interval + slack — the test NEVER
@@ -46,15 +38,15 @@ def test_dashboard_auto_refreshes_new_shed(tauri, mock):
     tauri.activate()
     tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
     # Baseline: the CLI shed isn't in the reset fixture (hello-world + callbell).
-    assert "cli-created" not in {r["name"] for r in tauri.dashboard_rows("tauri")}
+    assert "cli-created" not in {r["name"] for r in tauri.dashboard_rows()}
     # Externally create a shed (the mock stands in for the CLI) — no app-side action.
     mock.add_shed({"name": "cli-created", "status": "running", "backend": "vz"})
     tauri.wait_until(
-        lambda: "cli-created" in {r["name"] for r in tauri.dashboard_rows("tauri")},
+        lambda: "cli-created" in {r["name"] for r in tauri.dashboard_rows()},
         timeout=9.0,  # covers the 5s poll interval + slack (wait_until scales it)
         what="auto-refresh surfaces the CLI-created shed without a manual refresh",
     )
-    rows = {r["name"]: r for r in tauri.dashboard_rows("tauri")}
+    rows = {r["name"]: r for r in tauri.dashboard_rows()}
     assert rows["cli-created"]["status"] == "running"
 
 
@@ -70,10 +62,10 @@ def test_tray_dump(tauri):
 
 
 def test_tray_popover_drivable(tauri):
-    # B1b: the mac menu-bar popover is drivable + observable over IPC — OS tray
+    # B1b: the macOS menu-bar popover is drivable + observable over IPC — OS tray
     # clicks aren't hermetic, so tray.show/tray.dump ARE the drivability AC (a real
     # screenshot is the maintainer's manual native-feel check). The popover is a 2nd
-    # webview mirroring the Swift MenuBarContentView; it reports its OWN compact rows
+    # webview; it reports its OWN compact rows
     # under the `popover` window key. macOS-only — Linux emits no tray click events
     # and creates no popover window.
     if platform.system() != "Darwin":
@@ -98,7 +90,7 @@ def test_tray_popover_drivable(tauri):
     tauri.wait_until(lambda: tauri.tray_dump()["popover_visible"] is True,
                      timeout=15, what="popover visible after tray.show")
 
-    # M2: the popover CONTENT-SIZES to hug its rows (Swift NSPopover parity, no dead
+    # M2: the popover CONTENT-SIZES to hug its rows (no dead
     # space). It's built at MAX height (640) and shrunk by the resize_popover protocol;
     # a silently-ignored set_size (the borderless-window regression this de-risks) would
     # leave it stuck at 640. popover_height is logical px (display-independent), so a
@@ -115,7 +107,7 @@ def test_tray_popover_drivable(tauri):
 
 def test_updater_status_and_check_disabled(tauri):
     # Sparkle updater (C2): the drivable status/check ops prove the gated wiring.
-    # The plugin is NEVER registered under the harness (test mode ⇒ Swift-parity: no
+    # The plugin is NEVER registered under the harness (test mode ⇒ no
     # updater instantiated), so on macOS the status is disabled with reason
     # 'test_mode'. On Linux there's no in-app updater at all (apt channel), so the
     # reason is 'linux_apt' regardless of test mode. Branch on the platform per the
@@ -259,8 +251,8 @@ _GiB = 1024 ** 3
 
 
 def test_system_df_returns_per_host_usage(tauri):
-    # A1c: the System pane's per-host disk usage on the shared shed-app Backend
-    # (the same `system.df` the mac app exposes). The row shape + values match the
+    # A1c: the System pane's per-host disk usage on the shared shed-app Backend.
+    # The row shape + values match the
     # mock df fixture.
     usage = tauri.system_df()
     assert usage, "expected at least one host"
@@ -272,8 +264,7 @@ def test_system_df_returns_per_host_usage(tauri):
 
 
 def test_system_pane_renders(tauri):
-    # A1c parity with the mac test_system_pane_renders + the A1b dashboard render:
-    # the live SystemPane paints per-host df without crashing (the data itself is
+    # A1c: the live SystemPane paints per-host df without crashing (the data itself is
     # pinned by test_system_df_returns_per_host_usage above). Screenshot is the
     # smoke; TCC-gated on macOS, so Linux/Xvfb is the real gate.
     if platform.system() == "Darwin":
@@ -310,7 +301,7 @@ def test_terminal_presets_and_open_gate(tauri):
     with pytest.raises(ShedError) as e:
         tauri.terminal_open("hello-world")
     assert e.value.code == "not_enabled"
-    # an explicit but unrecognized preset (e.g. a mac-only one) is a bad_request,
+    # an explicit but unrecognized preset (e.g. `iterm2`, which the Tauri app doesn't offer yet) is a bad_request,
     # not a silent coercion to Custom.
     with pytest.raises(ShedError) as e2:
         tauri.terminal_preview("hello-world", preset="iterm2")
@@ -407,8 +398,8 @@ def test_provider_mode_round_trip_drives_docker_policy(tauri, fake):
 
 
 def test_loginitem_probe(tauri):
-    # B4: launch-at-login is drivable + observable (the Swift PreferencesView
-    # "Launch at login" toggle parity). On Linux (the shipped target) `auto-launch`
+    # B4: launch-at-login is drivable + observable (the Preferences "Launch at
+    # login" toggle). On Linux (the shipped target) `auto-launch`
     # writes a .desktop under the throwaway HOME/XDG → a REAL hermetic round-trip;
     # on macOS a real write hits a LaunchAgent/TCC, so test mode round-trips through
     # an in-memory cell instead — either way the IPC + status path is exercised.
@@ -471,7 +462,7 @@ def test_preferences_window_opens(tauri):
     tauri.prefs_close()
     tauri.wait_until(lambda: tauri.prefs_dump()["visible"] is False,
                      timeout=15, what="preferences window hidden after prefs.close")
-    # ...and a reopen (via the mac-named alias op) re-fronts the same window.
+    # ...and a reopen (via the `ui.open_preferences` alias op) re-fronts the same window.
     tauri.open_preferences()
     tauri.wait_until(lambda: tauri.prefs_dump()["visible"] is True,
                      timeout=15, what="preferences window re-shown")

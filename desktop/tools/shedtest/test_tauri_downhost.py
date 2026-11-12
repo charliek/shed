@@ -14,13 +14,10 @@ named in the `SHED_TAURI_MOCK_UNREACHABLE_HOSTS` override (the backend redirects
 it to a closed port → deterministic ECONNREFUSED). A second fixture
 (`config-alldown.yaml`, BOTH servers overridden) covers the every-host-down case:
 zero sheds + two failures, where the empty state must defer to the failures.
-
-Gated on `--target tauri` (skipped otherwise), like `test_tauri.py`.
 """
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import tempfile
@@ -34,11 +31,6 @@ import ui
 from client import TauriClient
 from fake_host_agent import FakeHostAgent
 from mockserver import MockShedServer
-
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SHED_TEST_TARGET", "mac") != "tauri",
-    reason="tauri-only: hermetic down-host per-host error row",
-)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 DOWNHOST_CONFIG = FIXTURES / "config-downhost.yaml"

@@ -1,7 +1,6 @@
-//! The credential-approval domain, ported from shed-desktop's
-//! `ApprovalModels.swift`. These double as IPC wire shapes (snake_case), like
-//! the rest of the models, so the approval queue + activity feed need no
-//! separate DTOs.
+//! The credential-approval domain. These double as IPC wire shapes
+//! (snake_case), like the rest of the models, so the approval queue + activity
+//! feed need no separate DTOs.
 //!
 //! Timestamps (`ts`, `expires_at`) are carried VERBATIM as strings — flexible
 //! parsing lives in `shed-app` (`timefmt`), off this pure crate, matching
@@ -10,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 // The defensive `null`/absent -> default deserializer is shared with the other
-// wire DTOs (mirrors Swift's `decodeIfPresent(...) ?? default`).
+// wire DTOs.
 use crate::models::null_default;
 
 /// The credential namespaces the host agent brokers. Only `ssh-agent` is gated

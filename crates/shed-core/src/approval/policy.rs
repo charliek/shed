@@ -1,4 +1,4 @@
-//! The pure approval-policy decision, ported from `PolicyEngine.swift`.
+//! The pure approval-policy decision.
 //!
 //! Given a request, the configured rules, and the set of currently-valid session
 //! grants, returns approve | deny | prompt with the gate to apply. No I/O — the

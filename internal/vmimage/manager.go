@@ -383,7 +383,7 @@ func (m *Manager) resolveManifestLower(_ context.Context, imagesDir, manifestDig
 		return EnsureResult{}, fmt.Errorf(
 			"image manifest %s lacks %s annotation (built with pre-v0.5.2 tooling); "+
 				"re-pull against current images: shed image rm %s && shed-server pull-images "+
-				"(see docs/upgrades/v0.5.1-to-v0.5.2.md for the full upgrade path)",
+				"(see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.1-to-v0.5.2.md for the full upgrade path)",
 			ShortDigest(manifestDigest), AnnotationRootfsErofsDigest, ShortDigest(manifestDigest),
 		)
 	}
@@ -921,7 +921,7 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 	// informational and prune deleted blobs they pointed at; the
 	// `shed image pull X && shed image prune` workflow then deleted
 	// the manifest just pulled. See refs.go RefKindTag and
-	// docs/upgrades/v0.5.7-to-v0.5.8.md.
+	// https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md.
 	liveManifests := make(map[string]bool)
 	for _, r := range refs {
 		liveManifests[r.Digest] = true

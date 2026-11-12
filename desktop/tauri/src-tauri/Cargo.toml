@@ -1,7 +1,7 @@
-# The Tauri desktop client — the shipped Linux client (and a Mac-parity client),
-# on the shared shed-core. Deliberately its OWN cargo workspace (note the empty
+# The Tauri desktop client — the shipped macOS and Linux client, on the shared
+# shed-core. Deliberately its OWN cargo workspace (note the empty
 # `[workspace]` table) so WebKitGTK + Tauri deps are NEVER absorbed into ../../../crates'
-# workspace: `make build` / `core-lint --workspace` stay WebKit-free. shed-core /
+# workspace: `make core-test` / `core-lint` stay WebKit-free. shed-core /
 # shed-app are pulled in as plain path deps (that does not make this a member of
 # core's workspace). See plans/tauri-phase-a.md.
 [package]
@@ -115,7 +115,7 @@ objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAErro
 # 0.3 is already transitively in the lock (the sparkle-updater crate pulls it); we
 # depend on it directly for the `NSApplication` activation glue.
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
-# Real Sparkle updater (macOS only, Swift-parity). Exact pin — young third-party
+# Real Sparkle updater (macOS only). Exact pin — young third-party
 # crate, deliberate bumps only. Registered ONLY outside test mode (lib.rs), so the
 # harness never instantiates an updater. build.rs links the staged Sparkle.framework
 # (make sparkle-framework prereq); Linux never compiles it (mac-only target dep).
@@ -123,7 +123,7 @@ tauri-plugin-sparkle-updater = "=0.2.4"
 # macOS-only tauri features, unioned into the base `tauri` features:
 #  - image-png: `Image::from_bytes` for the menu-bar template tray icon (tray.rs).
 #  - macos-private-api: a TRANSPARENT popover window — needed for both its rounded
-#    corners AND the native `Popover` vibrancy material (Swift NSPopover parity).
+#    corners AND the native `Popover` vibrancy material.
 #    Private CoreAnimation API — fine for the DMG/Sparkle distribution (would matter
 #    only for the App Store, not a target).
 # Both kept off the Linux build (it uses the colored icon + a native menu, no popover).

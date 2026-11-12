@@ -88,7 +88,7 @@ type BootstrapInfo struct {
 // pre-mtls client ignores the unknown key, which is exactly the legacy parity
 // the token path preserves in the other direction.
 //
-// The SDK/CLI/Rust/Swift/Dart decoders MUST keep these json tags in sync.
+// The SDK/CLI/Rust/Dart decoders MUST keep these json tags in sync.
 type bootstrapBundle struct {
 	AuthMode           string    `json:"auth_mode"`
 	HTTPPort           int       `json:"http_port,omitempty"`

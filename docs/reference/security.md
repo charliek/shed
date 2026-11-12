@@ -334,7 +334,7 @@ exits) so an old config can't silently weaken a deployment:
 | `admin` scope | `control` + `credentials` only. |
 | client `credentials_token` | The host-agent mints its own `credentials` token. |
 
-See [Upgrading v0.7.0 → v0.7.1](../upgrades/v0.7.0-to-v0.7.1.md) for the migration.
+See [Upgrading v0.7.0 → v0.7.1](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.0-to-v0.7.1.md) for the migration.
 
 ### Removed/changed in v0.7.2
 
@@ -350,7 +350,7 @@ at startup**:
 | `auth.ssh.mode: off`/`warn` under `token` | Remove it — token forces `enforce`. |
 
 Plus a behavior change: **token mode no longer serves a loopback plain-HTTP
-listener** (TLS-only). See [Upgrading v0.7.1 → v0.7.2](../upgrades/v0.7.1-to-v0.7.2.md).
+listener** (TLS-only). See [Upgrading v0.7.1 → v0.7.2](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md).
 
 ### Removed/changed in v0.7.4
 
@@ -366,7 +366,7 @@ Plus a behavior change: **`bind_address` defaults to loopback (`127.0.0.1`) in
 both modes** (previously unset = all interfaces), and `http_port` is optional in
 token mode. A non-loopback bind in open mode now requires
 `allow_insecure_exposure: true`; token mode binds the network without an ack.
-See [Upgrading v0.7.3 → v0.7.4](../upgrades/v0.7.3-to-v0.7.4.md).
+See [Upgrading v0.7.3 → v0.7.4](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md).
 
 ## mTLS mode
 

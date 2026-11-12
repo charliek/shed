@@ -1,10 +1,9 @@
-//! Wire DTOs ported from shed-desktop's `Models.swift`.
+//! Wire DTOs for the shed-server HTTP API.
 //!
-//! These decoders reproduce the defensive semantics pinned by
-//! `ModelDecodingTests` exactly: `{"sheds": null}` -> `[]`, omitted optionals,
+//! These decoders are defensive: `{"sheds": null}` -> `[]`, omitted optionals,
 //! `host` absent on the wire (stamped by the client), lenient `ShedStatus`,
 //! `"?"` name sentinels, and timestamps carried VERBATIM as strings (flexible
-//! parsing + all display helpers stay in Swift, off the decode path).
+//! parsing + all display helpers stay in the clients, off the decode path).
 //!
 //! Rust field names are snake_case and shed-server JSON is snake_case, so no
 //! `#[serde(rename)]` is needed; serde also maps a missing `Option` field to
@@ -36,7 +35,7 @@ fn unknown_name() -> String {
     "?".to_string()
 }
 
-/// A shed's lifecycle status. Lenient like the Swift enum: an unrecognized value
+/// A shed's lifecycle status. Lenient: an unrecognized value
 /// (`#[serde(other)]`) OR an absent field (`default` on the field) both decode
 /// to `Unknown`, so a new server status never breaks decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -92,7 +91,7 @@ pub struct Shed {
     pub ip_address: Option<String>,
     pub cpus: Option<i64>,
     pub memory_mb: Option<i64>,
-    // Carried verbatim — never parsed/normalized here (Swift owns flexible
+    // Carried verbatim — never parsed/normalized here (the clients own flexible
     // timestamp parsing for display).
     pub created_at: Option<String>,
     pub started_at: Option<String>,
@@ -202,8 +201,8 @@ pub struct EgressProfileInfo {
     pub profile: EgressProfile,
 }
 
-/// Body for `POST /api/sheds`. Only non-null fields are sent (mirrors Swift's
-/// Codable, which omits nil optionals). `repo`/`local_dir` are mutually exclusive.
+/// Body for `POST /api/sheds`. Only non-null fields are sent (`None` optionals
+/// are omitted). `repo`/`local_dir` are mutually exclusive.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CreateShedRequest {
     pub name: String,
@@ -444,8 +443,8 @@ fn rc_session_from_flat(j: &serde_json::Map<String, Value>, shed_name: &str) -> 
 /// per-field like Dart's `Shed.fromJson` (`shed_dtos.dart:31-41`: missing/blank
 /// `name` → `"?"`, missing/invalid `status` → `Unknown`, wrong-typed scalars →
 /// `None`), so a malformed shed row never vanishes from the snapshot. The
-/// strict serde derive on [`Shed`] stays the `/api/sheds` + Swift-parity
-/// contract; this hand-decode is the overview path only.
+/// strict serde derive on [`Shed`] stays the `/api/sheds` contract; this
+/// hand-decode is the overview path only.
 fn overview_shed_record(obj: &serde_json::Map<String, Value>) -> Shed {
     let opt_verbatim =
         |key: &str| -> Option<String> { obj.get(key).and_then(Value::as_str).map(str::to_string) };
@@ -508,7 +507,7 @@ fn overview_disk_entries(v: Option<&Value>) -> Vec<DiskEntry> {
 /// every malformed/missing substructure (Dart `SystemDiskUsage.fromJson` +
 /// `DiskTotals.fromJson`, `shed_dtos.dart:345-392`), so a bad nested field
 /// degrades that field instead of discarding the whole disk block. The strict
-/// serde derive stays the `/api/system/df` + Swift-parity contract.
+/// serde derive stays the `/api/system/df` contract.
 fn overview_df(obj: &serde_json::Map<String, Value>) -> SystemDiskUsage {
     let totals = obj.get("totals").and_then(Value::as_object);
     let total = |key: &str| overview_disk_size(totals.and_then(|t| t.get(key)));

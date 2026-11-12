@@ -10,8 +10,8 @@ Shed is a CLI tool for managing persistent, VM-based development environments ac
 
 The Go tree (`cmd/`, `internal/`, the CLI/server/agent) is the primary product. Two imported subtrees live alongside it, each an isolated build world with its own nested `CLAUDE.md` — read that before working in it:
 
-- **`crates/`** — the shared **Rust client core** (`shed-core`, `shed-core-ffi`, `shed-app`, `shedctl`), the broker core and its daemon (`shed-broker`, `shed-host-agent`), and the two agent-lane adapters (`shed-opencode`, `shed-craze`), its own Cargo workspace + committed `Cargo.lock` + `rust-toolchain.toml`. Dependency-clean: WebKitGTK/Tauri deps must never enter it. See `crates/CLAUDE.md`.
-- **`desktop/`** — the desktop app: the **Tauri** client, shipping as both the **macOS** client (as of 0.9.0) and the **Linux** client, + packaging + the `shedtest` harness. The **Swift macOS** menu-bar app's sources are retained pending demolition — its release job retired in 0.9.0, but it stays buildable (`make -C desktop test`) until removed. A **second, isolated** Cargo workspace (`desktop/tauri/src-tauri`, on purpose so its WebKitGTK deps stay out of `crates/`) and its own `uv` env (`desktop/pyproject.toml`). See `desktop/CLAUDE.md`.
+- **`crates/`** — the shared **Rust client core** (`shed-core`, `shed-app`, `shedctl`), the broker core and its daemon (`shed-broker`, `shed-host-agent`), and the two agent-lane adapters (`shed-opencode`, `shed-craze`), its own Cargo workspace + committed `Cargo.lock` + `rust-toolchain.toml`. Dependency-clean: WebKitGTK/Tauri deps must never enter it. See `crates/CLAUDE.md`.
+- **`desktop/`** — the desktop app: the **Tauri** client, shipping as both the **macOS** and the **Linux** client, + packaging + the `shedtest` harness. (The pre-0.9.0 Swift macOS app has been removed.) A **second, isolated** Cargo workspace (`desktop/tauri/src-tauri`, on purpose so its WebKitGTK deps stay out of `crates/`) and its own `uv` env (`desktop/pyproject.toml`). See `desktop/CLAUDE.md`.
 
 The Go build never traverses `crates/` or `desktop/` (`go list ./...` / `golangci-lint` stay Go-only); root `make build`/`test`/`check` are Go-only. Desktop targets are reached via the reserved `desktop-` passthrough (`make desktop-<target>`, e.g. `make desktop-build`) or `make -C desktop <target>`.
 
@@ -164,7 +164,7 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - `internal/backend/` — Backend interface all backends implement
 - `guest/extensions/etc/` — Guest overlay (systemd units, `environment.d`, `shed-extensions.d` manifests) staged into the rootfs alongside the guest binaries
 - `crates/` — shared Rust client core workspace (see `crates/CLAUDE.md` and "Monorepo layout" above)
-- `desktop/` — Swift/Tauri desktop app + `shedtest` harness (see `desktop/CLAUDE.md`)
+- `desktop/` — Tauri desktop app (macOS + Linux) + `shedtest` harness (see `desktop/CLAUDE.md`)
 - `docs/` — Zensical documentation site (desktop docs under `docs/desktop/`)
 
 ## In-repo skills
@@ -216,7 +216,7 @@ Since v0.5.2 the read-only rootfs **erofs is built at image-publish time** by `m
 - Build locally: `./scripts/build-vz-rootfs.sh --variant extensions`
 - Local dev with guest-extension changes: edit `cmd/shed-ext-*` or `guest/extensions/etc/` and rebuild the `extensions` (or `full`) variant — `scripts/stage-guest-binaries.sh` recompiles them in-tree automatically (no image ref to bump)
 - Local dev iterating on the build-tools image: `make build-tools && ./scripts/build-{vz,firecracker}-rootfs.sh --build-tools-version dev`
-- See `docs/reference/images.md`, `docs/reference/build-tools.md`, and `docs/upgrades/v0.5.1-to-v0.5.2.md` for full docs.
+- See `docs/reference/images.md`, `docs/reference/build-tools.md`, and the [v0.5.1 → v0.5.2 upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.1-to-v0.5.2.md) for full docs.
 
 ## Storage Model
 

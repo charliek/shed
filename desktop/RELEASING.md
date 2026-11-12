@@ -59,8 +59,7 @@ the lockstep at workflow time and refuses to ship a drifted tree.
    - **Sparkle appcast**: signs the (stapled) DMG with
      `SPARKLE_ED_PRIVATE_KEY` via
      `desktop/tauri/src-tauri/.sparkle-dist/bin/sign_update` (staged by
-     `fetch-sparkle.sh` — there is no SwiftPM artifacts path for this
-     job), appends the entry to `docs/appcast.xml` with
+     `fetch-sparkle.sh`), appends the entry to `docs/appcast.xml` with
      `desktop/scripts/update-appcast.py` (run from the REPO ROOT —
      `SHED_DESKTOP_APPCAST=docs/appcast.xml`,
      `SHED_DESKTOP_REPO=charliek/shed`), validates with `xmllint`, and
@@ -167,7 +166,7 @@ Sparkle update**, not a same-version no-op.
   `tauri-test`, so a macOS-only failure surfaces before a tag.
 - `sign_update` comes from
   `desktop/tauri/src-tauri/.sparkle-dist/bin/sign_update` (staged by
-  `fetch-sparkle.sh`) — there is no SwiftPM artifacts path for this job.
+  `fetch-sparkle.sh`).
 - The Tauri script (`scripts/bundle-tauri-mac.sh`) signs Sparkle's nested
   helpers in the required inner→outer order (`Installer.xpc` →
   `Downloader.xpc` with `--preserve-metadata=entitlements` → `Autoupdate`
@@ -178,9 +177,9 @@ Sparkle update**, not a same-version no-op.
 ### Promoted in 0.9.0
 
 The Tauri app is the shipped macOS client as of 0.9.0 — the former
-Swift release job (which used to own stable tags) is retired; the Swift
-*sources* stay in the tree pending a later demolition, tracked in
-[#364](https://github.com/charliek/shed/issues/364).
+Swift release job (which used to own stable tags) is retired, and the Swift
+*sources* were removed afterwards
+([#364](https://github.com/charliek/shed/issues/364)).
 
 The two-tag rc rehearsal described above (cut `vX.Y.Z-rc.1`, install by
 hand, cut `vX.Y.Z-rc.2`, verify a real in-place Sparkle update) remains
@@ -210,12 +209,11 @@ a 0.9.1 blocker rather than a surprise.
 ## Local commands
 
 ```bash
-make -C desktop bundle        # build + assemble ShedDesktop.app (debug)
-make -C desktop dmg           # release bundle + drag-install DMG (ad-hoc unless
-                              # SHED_DESKTOP_DEVELOPER_ID_IDENTITY is set)
-make -C desktop test          # swift unit tests (builds the Rust core first)
-make -C desktop tauri-dmg-mac # Tauri mac bundle + drag-install DMG (Sparkle staged + signed;
-                              # clobbers the Swift `dmg` outputs under desktop/build/)
+make -C desktop test          # cargo unit tests: the Rust core + the Tauri crate
+make -C desktop e2e           # the hermetic pytest harness against the Tauri app
+make -C desktop tauri-bundle-mac  # build + sign desktop/build/ShedDesktop.app (ad-hoc unless
+                                  # SHED_DESKTOP_DEVELOPER_ID_IDENTITY is set)
+make -C desktop tauri-dmg-mac # the bundle + a drag-install DMG under desktop/build/
 make -C desktop deb           # the Tauri .deb via Docker
 make -C desktop deb-validate  # install-validate it in a clean container
 scripts/release/release-scripts-test.sh   # self-test the release scripts (repo root)

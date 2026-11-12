@@ -68,7 +68,7 @@ pulled registry-direct from `ghcr.io`. See
 - [Images](https://charliek.github.io/shed/reference/images/) · [Storage Model](https://charliek.github.io/shed/reference/storage-model/)
 - [Extensions](https://charliek.github.io/shed/reference/extensions/) — credential brokering
 - [Provisioning](https://charliek.github.io/shed/reference/provisioning/) — `.shed/` install/startup hooks + tutorials
-- [Desktop app](https://charliek.github.io/shed/desktop/) — the macOS menu-bar + Tauri Linux approval app (`desktop/`, on the shared Rust core in `crates/`)
+- [Desktop app](https://charliek.github.io/shed/desktop/) — the Tauri desktop app for macOS (menu bar) and Linux (`desktop/`, on the shared Rust core in `crates/`)
 
 ## Requirements
 

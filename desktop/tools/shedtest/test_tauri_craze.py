@@ -1,5 +1,4 @@
-"""The **craze source and lane** in the Tauri app (plan 025 §3.6, C9) —
-`--target tauri`.
+"""The **craze source and lane** in the Tauri app (plan 025 §3.6, C9).
 
 **Hermetic, against the REAL craze hub.** Every craze process here is one of
 the pinned binaries (`make craze-binaries`, CI's `craze-binaries` action):
@@ -79,11 +78,6 @@ from fake_host_agent import FakeHostAgent
 from fake_opencode import FakeOpencode
 from fake_roost import FakeRoost
 from mockserver import MockShedServer
-
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SHED_TEST_TARGET", "mac") != "tauri",
-    reason="tauri-only: the mac app has no machine layer, and so no craze source",
-)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"

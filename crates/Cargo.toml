@@ -1,15 +1,14 @@
 # shed-core Rust workspace — the shared shed-server protocol client + wire DTOs.
 # Conventions mirror ../roost (workspace, lints, release profile). Consumed by the
-# Swift app via the shed-core-ffi UniFFI wrapper, and by the Tauri client (its own
-# standalone workspace in ../tauri/src-tauri) linking shed-core + shed-app directly.
+# Tauri client (its own standalone workspace in ../desktop/tauri/src-tauri),
+# which links shed-core + shed-app directly, and by shed-mobile (via FRB).
 [workspace]
 resolver = "2"
-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
+members = ["shed-core", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
 # All members are default members: a plain `cargo build` / `cargo test` (and
-# `make core-test`) build shed-core + shed-core-ffi + shed-app + shedctl. shedctl
-# (the headless Linux CLI driver for the shed-desktop IPC socket) has no GUI-toolkit
-# dependency, so it gets Mac `cargo test` coverage too; the Mac bundle is unaffected
-# (build-core.sh is `-p shed-core-ffi`-scoped). The Tauri client (WebKitGTK) lives
+# `make core-test`) build every crate here. shedctl (the headless CLI driver for
+# the shed-desktop IPC socket) has no GUI-toolkit dependency, so it gets Mac
+# `cargo test` coverage too. The Tauri client (WebKitGTK) lives
 # in its OWN workspace so its heavy deps never enter this one.
 #
 # `sx` (the RC porcelain, plan 009) was sunset in plan 016 (S7, #329) and
@@ -21,19 +20,18 @@ members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "
 # `shed-opencode` (the opencode agent-lane adapter, plan 015) is a member AND a
 # default member: a pure lib on shed-core with no GUI-toolkit and no daemon
 # dependency, so a plain `cargo test`/`clippy --workspace` covers it. It is not
-# reachable from `shed-core-ffi` or from shed-core's Android target, which is
-# what keeps the two `cargo tree` invariants true.
+# reachable from shed-core's Android target, which keeps that `cargo tree`
+# invariant true.
 #
 # `shed-gx` (the gx agent-lane adapter, plan 017) was retired in plan 025 C1
 # (shed#390) — gx and the other direct-agent kinds left shed for the craze lane.
 #
 # `shed-craze` (the craze adapter, plan 025 C7+, shed#392) is a member AND a
 # default member on the same terms as `shed-opencode`: a pure lib on shed-core
-# (serde, tokio, no reqwest, no chrono), not reachable from `shed-core-ffi`, so
-# the `cargo tree -p shed-core-ffi` invariant holds. Its recipe cells skip
+# (serde, tokio, no reqwest, no chrono). Its recipe cells skip
 # without `SHED_CRAZE_BIN_DIR` (`make craze-binaries`); CI sets
 # `SHED_CRAZE_REQUIRE=1` so a skip there fails.
-default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
+default-members = ["shed-core", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
 
 [workspace.package]
 version = "0.9.0"
@@ -58,7 +56,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 futures-util = "0.3"
-uniffi = "0.28"
 async-trait = "0.1"
 # rustls with the ring provider to match reqwest's rustls-tls stack (so cargo
 # unifies one provider); used for the leaf-cert pinning verifier.

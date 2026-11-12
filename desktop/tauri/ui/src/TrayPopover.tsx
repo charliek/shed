@@ -1,9 +1,9 @@
-/* TrayPopover — the macOS menu-bar popover (B1b), mirroring the Swift
-   MenuBarContentView: a host-agent status dot, ≤3 pending-approval cards, ≤6
-   running sheds, and a footer (Open dashboard · Preferences… · Check for Updates…
-   [disabled] · Quit). A SEPARATE webview/entry from the dashboard shell, so it
-   fetches its own data and reports its rows under the `popover` window key (never
-   the dashboard's `main`, which `dashboard.dump`/`current_pane` read). */
+/* TrayPopover — the macOS menu-bar popover (B1b): a host-agent status dot, ≤3
+   pending-approval cards, ≤6 running sheds, and a footer (Open dashboard ·
+   Preferences… · Check for Updates… [disabled] · Quit). A SEPARATE webview/entry
+   from the dashboard shell, so it fetches its own data and reports its rows under
+   the `popover` window key (never the dashboard's `main`, which
+   `dashboard.dump`/`current_pane` read). */
 import { useEffect, useRef, useState } from "react";
 import { Fingerprint, Check, X, Shield, AppWindow, Settings, ArrowDownCircle, Power } from "lucide-react";
 import {
@@ -83,7 +83,7 @@ export default function TrayPopover() {
   }, [connected, sheds, approvals]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Content-size the window: measure the rendered root height and ask Rust to resize
-  // the popover to hug it (Swift NSPopover parity — no dead space). The root is
+  // the popover to hug it (no dead space). The root is
   // content-height (no min-h-screen), so its box height IS the content; a
   // ResizeObserver re-measures when approvals/sheds change. rAF-debounced + only
   // invoked when the height actually changed (>1px), so the window resize (which
@@ -194,7 +194,7 @@ export default function TrayPopover() {
       </div>
       <div className="h-px bg-shed-border" />
 
-      {/* footer — icon'd rows with the Swift MenuActionRow accent-blue hover */}
+      {/* footer — icon'd rows with an accent-blue hover */}
       <div className="flex flex-col p-1.5">
         <FooterRow icon={AppWindow} label="Open dashboard" onClick={() => void openDashboard()} />
         <FooterRow icon={Settings} label="Preferences…" onClick={() => void openPreferences()} />

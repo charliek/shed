@@ -5,8 +5,7 @@
 //!
 //! A shed is reached as `<shed>@<host> -p <sshPort>` (the shed name is the SSH
 //! username; shed-server's SSH daemon routes by it), pinning the server's host
-//! key in the shed CLI's `known_hosts` with strict checking. Mirrors the Swift
-//! `TerminalLauncher.sshCommand` + `ShedSSH.hostKeyOptions`.
+//! key in the shed CLI's `known_hosts` with strict checking.
 
 use serde::{Deserialize, Serialize};
 
@@ -64,8 +63,7 @@ pub fn quote_argv(argv: &[String]) -> String {
 
 /// The shared `-o` host-key options: strict checking against the shed CLI's
 /// `known_hosts`. Used by both the interactive terminal ssh (`ssh_command`) and
-/// the non-interactive RC ssh (`rc::ssh_argv`), so the two never drift. Mirrors
-/// Swift `ShedSSH.hostKeyOptions`.
+/// the non-interactive RC ssh (`rc::ssh_argv`), so the two never drift.
 pub(crate) fn ssh_host_key_opts(known_hosts: &str) -> Vec<String> {
     vec![
         "-o".to_string(),
@@ -90,8 +88,7 @@ pub(crate) fn shell_quote(s: &str) -> String {
 }
 
 /// Which terminal to open a shed in. Narrowed to the two terminals used on both
-/// platforms + a custom escape hatch (the Swift app also offers Terminal.app /
-/// iTerm2 / Warp, which are macOS-only).
+/// platforms + a custom escape hatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TerminalPreset {
@@ -155,8 +152,6 @@ pub struct LaunchInvocation {
 /// - script presets → `<interp> <scripts_dir>/<script> <shed> <cmd.command>`
 ///   (the opener scripts handle macOS vs Linux themselves); a missing
 ///   `scripts_dir` (e.g. an unbundled dev run) falls back too.
-///
-/// Mirrors the Swift `TerminalLauncher.resolveLaunch`.
 pub fn resolve_launch(
     preset: TerminalPreset,
     cmd: &TerminalCommand,

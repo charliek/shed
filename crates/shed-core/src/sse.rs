@@ -1,5 +1,4 @@
-//! Server-Sent Events framing — ported from Swift's `SSEParser` + the hand-rolled
-//! byte loop in `ShedServerClient.createShed`.
+//! Server-Sent Events framing for the `POST /api/sheds` create stream.
 //!
 //! `reqwest`'s `bytes_stream()` yields `Bytes` chunks, NOT lines, and an SSE
 //! event can split across chunk boundaries (mid-line or mid-blank-line), so the

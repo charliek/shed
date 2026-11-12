@@ -768,10 +768,9 @@ const PREFS_WIDTH: f64 = 520.0;
 const PREFS_HEIGHT: f64 = 640.0;
 
 /// Show + focus the singleton Preferences window — lazy-create on the first open,
-/// front-if-already-open after (mac `AppModel.openPreferences` parity). Closing it
-/// only HIDES it (the generic `CloseRequested` arm in `lib.rs` hides + prevents
-/// close for every window), so a reopen is a plain show+focus — the mac
-/// `isReleasedWhenClosed = false` semantics. Creation is marshalled to the main
+/// front-if-already-open after. Closing it only HIDES it (the generic
+/// `CloseRequested` arm in `lib.rs` hides + prevents close for every window), so a
+/// reopen is a plain show+focus. Creation is marshalled to the main
 /// thread (required on macOS — the IPC handler runs on a tokio worker; harmless on
 /// Linux). Shared by the tray menu, the popover footer, the dashboard gear
 /// (`open_preferences` command), and the `ui.show_preferences`/`ui.open_preferences`
@@ -817,7 +816,7 @@ pub fn show_preferences_window(app: &AppHandle) {
 /// harness — an unguarded flip can leave `main` unmounted so `ui_report` never fires
 /// and `wait_until(current_pane)` times out). `regular` shows the Dock icon (a
 /// dashboard window is open); otherwise `Accessory` = menu-bar-first (no Dock icon,
-/// the tray/popover is the surface). Mirrors the Swift app's `!testMode`-guarded flips.
+/// the tray/popover is the surface).
 #[cfg(target_os = "macos")]
 pub fn set_activation_policy_prod<R: tauri::Runtime>(app: &AppHandle<R>, regular: bool) {
     if app.state::<Env>().test_mode {

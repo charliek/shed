@@ -43,7 +43,7 @@ every host. The on-host pull path does not invoke `mkfs.erofs`.
 Through v0.5.1 the erofs was built lazily on the host into a separate
 `cache/sha256/<manifest-digest>.erofs` directory. That directory is no
 longer used; older installs may still have one and can `rm -rf` it.
-See the [v0.5.1 → v0.5.2 upgrade guide](../upgrades/v0.5.1-to-v0.5.2.md).
+See the [v0.5.1 → v0.5.2 upgrade guide](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.1-to-v0.5.2.md).
 
 ## Concepts, mapped to Docker
 

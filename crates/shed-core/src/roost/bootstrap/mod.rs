@@ -20,7 +20,7 @@
 //!
 //! ## One choreography, two transports
 //!
-//! | step | desktop (Tauri/Swift) | mobile (Flutter) |
+//! | step | desktop (Tauri) | mobile (Flutter) |
 //! |---|---|---|
 //! | [`Step::Exec`] | an `ssh` subprocess on a private ControlMaster | `dartssh2` |
 //! | [`Step::Call`] | the client's roost [`Conn`] over the ssh bridge | the same `Conn` over a loopback port |

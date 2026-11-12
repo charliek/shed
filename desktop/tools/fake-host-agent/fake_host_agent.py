@@ -1,8 +1,8 @@
 """An in-process fake shed-host-agent speaking the UDS approval protocol.
 
-Stands in for the real Go host agent so the approval queue, policy engine,
+Stands in for the real shed-host-agent so the approval queue, policy engine,
 audit store, and merged activity feed can be driven end-to-end without it.
-The harness points the app at this socket via SHED_DESKTOP_HOST_AGENT_SOCKET;
+The harness points the app at this socket via SHED_TAURI_HOST_AGENT_SOCKET;
 the app connects, sends `hello`, and we reply `hello_ack`. Tests then emit
 approval_request / event frames and assert on the recorded responses.
 """
@@ -31,7 +31,7 @@ class FakeHostAgent:
         # three-way auto-detect (`shed_app::probe_sockets_at`) keys off
         # `shed_broker::socket_is_live`, whose probe is a bare `connect(2)` success — so
         # a bound+listening socket that accepts and closes suffices (no hello/ack). The
-        # default (False) keeps the full Surface-A desktop fake the mac suite uses.
+        # default (False) is the full Surface-A desktop fake the session app uses.
         self.status_only = status_only
         self._dir = tempfile.mkdtemp(prefix="fake-host-agent-")
         sock_name = "host-agent-status.sock" if status_only else "host-agent.sock"

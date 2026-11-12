@@ -7,7 +7,8 @@ description: Validate the shed desktop app's Tauri Linux client from a Mac (or L
 
 The shipped **Linux** client is the **Tauri** app (`desktop/tauri/`, React/Vite/Tailwind on
 WebKitGTK), a thin shell over the shared Rust core in `crates/`. Its WebKitGTK toolchain isn't
-on macOS, so the Linux legs run **in Docker** — the same north star as the mac loop applies:
+on macOS, so the Linux legs run **in Docker** (or natively on a Linux host) — the same north
+star as the macOS loop applies:
 verify by driving the real app over its IPC socket, not by clicking. Run targets with
 `make -C desktop <target>` (or the root `make desktop-<target>` passthrough). Docker must be
 running.
@@ -16,14 +17,14 @@ running.
 
 ```bash
 make -C desktop tauri-test-linux    # Tauri crate's Linux-only approval-seam tests (polkit gate; Docker, no display)
-make -C desktop tauri-build-linux   # the render gate: --target tauri on ubuntu:24.04 / WebKitGTK 2.44 under Xvfb (Docker)
+make -C desktop tauri-build-linux   # the render gate: the e2e on ubuntu:24.04 / WebKitGTK 2.44 under Xvfb (Docker)
 make -C desktop core-linux          # shed-core cargo test + clippy on Linux (Docker)
 ```
 
 - **`tauri-build-linux` is the render gate and the one to trust for any shared/Linux change.**
-  It builds the Tauri Rust app and runs the `--target tauri` pytest suite on the **real shipped
+  It builds the Tauri Rust app and runs the pytest suite on the **real shipped
   WebView** (WebKitGTK 2.44) under Xvfb — the render smoke *is* the CSS gate (2.44 supports
-  oklch/color-mix/`:has()`/`@container`, so a static denylist would be miscalibrated). The mac
+  oklch/color-mix/`:has()`/`@container`, so a static denylist would be miscalibrated). The macOS
   WKWebView e2e alone can miss Linux-only breaks.
 - **`tauri-test-linux`** compiles the Tauri crate on Linux (where the polkit `AuthGate` +
   libnotify `Notifier` compile) and asserts the gate is fail-closed. No display needed.
@@ -42,7 +43,7 @@ cd ../..                                            # desktop/
 SHED_TAURI_BIN=$PWD/tauri/src-tauri/target/debug/shed-desktop-tauri \
 WEBKIT_DISABLE_DMABUF_RENDERER=1 \
 xvfb-run -a --server-args="-screen 0 1400x900x24" \
-  uv run --group test pytest tools/shedtest --target tauri -q -p no:cacheprovider
+  uv run --group test pytest tools/shedtest -q -p no:cacheprovider
 ```
 
 Three traps, all of which cost real time and none of which produces a useful error:
@@ -81,26 +82,27 @@ action bundled; `deb-validate` installs it in a fresh container and runs
 
 ## Driving the Tauri app over IPC
 
-The Tauri client speaks the same `{id,op,params}` JSON IPC as the mac app, over
+The Tauri client speaks `{id,op,params}` JSON IPC over
 `$XDG_RUNTIME_DIR/shed-tauri.sock` (override `SHED_TAURI_SOCKET`; `/tmp/shed-tauri-<uid>/`
 fallback). Hermeticity hooks are `SHED_TAURI_TEST_MODE` / `SHED_TAURI_MOCK_BASE_URL` /
 `SHED_TAURI_SHED_CONFIG`; timeouts scale with `SHED_TAURI_TEST_TIMEOUT_SCALE`.
 
 ```bash
-make -C desktop tauri-run       # build the UI bundle + launch natively (Mac Homebrew WebKitGTK / Linux)
-make -C desktop e2e-tauri       # shared suite + test_tauri at --target tauri (needs a display; Xvfb on Linux)
+make -C desktop tauri-run       # build the UI bundle + launch natively
+make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; Xvfb on Linux)
 ```
 
 - The harness picks a prebuilt binary via **`SHED_TAURI_BIN`** — the render gate points it at
   `/target/debug/shed-desktop-tauri` inside the container so the pytest run drives the binary
   built in the same step. Set `SHED_TAURI_BIN` when driving a binary you built out-of-band.
-- `e2e-tauri` runs the ONE `tools/shedtest` harness with `--target tauri`; mac-only ops stay
-  gated off. On Linux the tray is a native menu (Tauri emits no Linux tray-click events → no
+- `e2e-tauri` runs the ONE `tools/shedtest` harness (there is no `--target` any more; the
+  Tauri app is the only client). Natively on a Linux host wrap it in `xvfb-run -a` and pass
+  `SHED_CRAZE_BIN_DIR` (from `make craze-binaries`) or the craze cells skip. On Linux the tray is a native menu (Tauri emits no Linux tray-click events → no
   popover; expected).
-- **Driving the Preferences window.** Preferences is a dedicated native window (mac parity,
-  no longer a dashboard modal), so it has its own IPC surface rather than `ui.modal`:
+- **Driving the Preferences window.** Preferences is a dedicated native window (not a
+  dashboard modal), so it has its own IPC surface rather than `ui.modal`:
   `ui.show_preferences` (open/focus the lazy-created singleton; **it does NOT raise the
-  dashboard**) with `ui.open_preferences` as the mac-named alias op; `prefs.dump` →
+  dashboard**) with `ui.open_preferences` as an alias op; `prefs.dump` →
   `{visible, title, prefs}` (the window's UI truth — `visible`/`title` are Rust-side native
   window state, `prefs` is the React-reported `{sections, values, mode}` snapshot keyed under
   the **`preferences`** window label); `prefs.close` (hide, close-hides contract);
@@ -824,11 +826,11 @@ deliver — neither of which a screenshot can be made to fail on.
   rely on `prefs.dump`'s reported `sections`/`values` for the logical assertions. Pixels are the
   eyeball; `prefs.dump` is the truth.
 
-## Native run on a Mac (quick UI-comparison loop)
+## Native run on a Mac
 
-`make -C desktop tauri-run` builds + launches the Tauri client natively via Homebrew WebKitGTK
-— useful to eyeball the Linux UI against the Swift app without Docker. It is **not** the render
-gate; still run `tauri-build-linux` before trusting a shared/Linux change.
+On macOS `make -C desktop tauri-run` builds + launches the client on **WKWebView**, not
+WebKitGTK, so it is **not** the render gate; still run `tauri-build-linux` before trusting a
+shared/Linux change. The macOS loop itself is the `shedtest-mac` skill.
 
 ## When you hit a NEW rough edge
 

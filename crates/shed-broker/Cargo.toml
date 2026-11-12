@@ -49,7 +49,7 @@ saphyr-parser = { version = "0.0.11", default-features = false }
 # defeat the whole point of the `fsnotify` mode. notify 8's defaults are already lean:
 # no `crossbeam-channel`, no `serde`, no `mio-extra` — the callback (`EventHandler`)
 # API we use needs none of them. Leaf-crate only (see the PR DEP_DELTA reverse-dep
-# proof): it must not reach shed-core / shed-core-ffi / shed-app.
+# proof): it must not reach shed-core / shed-app.
 notify = "8"
 # The bus HTTP client: reqwest (rustls) for SSE subscribe + respond POST, and
 # futures-util for the bytes-stream adaptor. Match shed-core's stack so cargo

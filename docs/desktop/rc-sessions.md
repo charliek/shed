@@ -108,7 +108,8 @@ terminal tab in roost.
 
 A **machine** is a native host reached over SSH that runs a `roost-session` — no shed
 server in the path, no TLS pin, no control token. Machines come from the `machines:`
-section of `~/.shed/config.yaml`, read once at startup (no in-app add/edit). A machine
+section of `~/.shed/config.yaml`, read at startup; the Machines pane's **Add machine** dialog
+appends one (there is no in-app edit or remove). A machine
 worth showing even when it has no sessions and cannot currently be reached (asleep,
 off-network) contributes its own row on the Machines pane, naming why.
 

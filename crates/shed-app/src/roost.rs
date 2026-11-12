@@ -5675,7 +5675,7 @@ except Exception:
                 // NOT the per-test tempdir: on macOS that is
                 // `/var/folders/<..>/T/.tmpXXXX`, and roost refuses a scratch
                 // parent that leaves no room for its `<dir>/ctl.<16 hex>` under
-                // the 103-byte AF_UNIX limit (the CI Swift job runs this suite
+                // the 103-byte AF_UNIX limit (the macOS CI job runs this suite
                 // there). `/tmp` is short on every platform, and roost's own
                 // per-attempt `roost-ssh-<host>-<pid>-<seq>` naming keeps two
                 // processes apart under it — for the SCRATCH. The liveness

@@ -2,77 +2,58 @@
 
 The shed-server protocol client — HTTP + SSE, control-token auth, TLS pinning,
 and the wire DTOs — lives in a shared Rust core in the monorepo's top-level
-`crates/` workspace, so the same logic backs both the macOS Swift app and the
-**Tauri cross-platform client** (the shipped Linux client) without being
-re-implemented per language.
+`crates/` workspace, so every client runs the same logic instead of
+re-implementing it per language. Its consumers:
+
+- **the desktop app** — the Tauri client on macOS and Linux (`desktop/tauri/src-tauri`),
+  which links `shed-core` + `shed-app` as path dependencies;
+- **shed-mobile** — the phone client, which takes `shed-core` as a git dependency and calls
+  it from Dart through flutter_rust_bridge (FRB);
+- **`shed-host-agent`** — the credential-broker daemon, built on `shed-broker`, which itself
+  builds on `shed-core`.
 
 ## Layout
 
 A cargo workspace under `crates/`, every member a default-member. The client
-core is `shed-core`, `shed-core-ffi`, `shed-app` and `shedctl`, below; beside
-them sit the credential broker (`shed-broker`) and its daemon
-(`shed-host-agent`), and the two [agent-lane](agent-lanes.md) adapters,
-`shed-opencode` and `shed-craze`:
+core is `shed-core`, `shed-app` and `shedctl`, below; beside them sit the
+credential broker (`shed-broker`) and its daemon (`shed-host-agent`), and the
+two [agent-lane](agent-lanes.md) adapters, `shed-opencode` and `shed-craze`:
 
-- **`shed-core`** — a *pure* Rust lib (no UniFFI): wire DTOs + serde decoders
+- **`shed-core`** — a *pure* Rust lib (no UI): wire DTOs + serde decoders
   (`models.rs`), the reqwest(rustls) client (`http.rs`), the SSE parser
   (`sse.rs`), leaf-cert pinning (`tls.rs`), and the control-token FSM
-  (`token.rs`), plus a `config` parser and a pull-based `create` orchestration
-  store — and **`rc.rs`** (the pure Remote-Control **model**: `RcKind`,
+  (`token.rs`), plus a `config` parser, a pull-based `create` orchestration
+  store, the approval policy model (`approval/`), the agent-lane contract
+  (`lane.rs`) — and **`rc.rs`** (the pure Remote-Control **model**: `RcKind`,
   `RcSession`, `RcState`, `RcActivity`, `RcKindFeatures`, `RcCapabilities`,
   `RcAgentInfo`, `RcError` and the wire DTOs — types read by the lane crates,
   `roost::model`, and shed-mobile. Plan 022 (S6,
   [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)) deleted
   everything in this file that *did* something — the `shed-ext-rc` argv
   builders, the permission-mode table, and the pane classifier — with the RC
-  hub itself). The Linux clients (the Tauri app, `shedctl`) link this crate
-  directly (no UniFFI).
-- **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib", "lib"]`)
-  exposing a `ShedCore` object + records to Swift. `desktop/scripts/build-core.sh`
-  builds the staticlib, runs `uniffi-bindgen` (needs the `lib` crate type), and
-  assembles a **static** `ShedCoreFFI.xcframework` linked into the app's Mach-O —
-  no new dylib, so the release signing/notarization path is unaffected.
-- **`shed-app`** — the UI-free app-logic layer (`Backend`), a workspace
-  default-member; consumed by the Tauri client (as a cross-workspace path dep).
-  `broker` (the in-process host-agent-replacement bridge, backed by
-  `shed-broker`) is its only non-default feature — the RC hub's `RcRunner`
-  seam, `rc.rs` and `RcService` were deleted with the hub in plan 022 (S6);
-  agent sessions are driven through `roost.rs` instead (see
-  [Agent lanes](agent-lanes.md) and [IPC § Agent sessions](ipc.md#agent-sessions)).
-- **`shedctl`** — a headless UDS/IPC client shipped in the `.deb` alongside the Tauri
-  `shed-desktop` binary, mirroring the macOS Swift `shedctl`. It *is* in `default-members`, so
-  `make -C desktop core-test`/`core-lint` cover it on the Mac.
-- **Tauri client** — *not* a `crates/` workspace member, but a consumer and the
-  **shipped Linux client**: `desktop/tauri/src-tauri` is its own standalone cargo
-  workspace that takes `shed-core` + `shed-app` as cross-workspace **path deps**.
-  Its `[[bin]]` is **`shed-desktop-tauri`**, installed to `/usr/bin/shed-desktop`
-  in the `.deb` (built via nfpm, `linux/scripts/build-deb.sh`). Runs on macOS
-  (WKWebView, a UI-comparison loop vs the Swift app) and Linux (WebKitGTK, the
-  shipped target).
+  hub itself).
+- **`shed-app`** — the UI-free app-logic layer (`Backend`, the approval
+  `Coordinator`, `HostAgentClient`, `AuditStore`, the roost client), consumed by
+  the Tauri client as a cross-workspace path dep. `broker` (the in-process
+  host-agent-replacement bridge, backed by `shed-broker`) is its only
+  non-default feature — the RC hub's `RcRunner` seam, `rc.rs` and `RcService`
+  were deleted with the hub in plan 022 (S6); agent sessions are driven through
+  `roost.rs` instead (see [Agent lanes](agent-lanes.md) and
+  [IPC § Agent sessions](ipc.md#agent-sessions)).
+- **`shedctl`** — a headless client for the desktop app's IPC socket, shipped in
+  the Linux `.deb` alongside `shed-desktop`. It depends on no other crate here
+  (only `serde_json`, `base64` and `libc`); see [shedctl](cli.md).
+- **Tauri client** — *not* a `crates/` workspace member, but the main consumer:
+  `desktop/tauri/src-tauri` is its own standalone cargo workspace (so its
+  WebKitGTK/Tauri dependencies stay out of `crates/`). Its `[[bin]]` is
+  **`shed-desktop-tauri`** — installed to `/usr/bin/shed-desktop` in the Linux
+  `.deb` (built via nfpm, `linux/scripts/build-deb.sh`), and bundled as
+  `ShedDesktop.app` on macOS (WKWebView).
 
-`make -C desktop core` builds it; `make -C desktop build` / `bundle` / CI build it before any
-SwiftPM step (the `.binaryTarget` path must exist first). The generated artifacts
-under `desktop/artifacts/` are gitignored.
-
-## How the Swift app uses it
-
-`ShedServerClient` (ShedKit) delegates to the core when `SHED_DESKTOP_RUST_CORE=1`
-and otherwise keeps its existing `URLSession` path. `RustShedCoreAdapter` maps the
-Rust records to the app's Swift `Models` (which double as the IPC wire shapes),
-so every IPC op stays byte-unchanged. `identify` reports `core: rust|swift`.
-
-The Rust core is the macOS **default**; `SHED_DESKTOP_RUST_CORE=0`
-forces the Swift path (a rollback escape hatch kept ≥2 releases). A per-host
-adapter-construction failure fails **loudly** rather than silently downgrading. CI
-runs the e2e suite on the default (rust) plus a `=0` Swift-fallback leg, and a
-golden-JSON cross-backend byte-diff guards parity; `identify.core` reports which
-backend is active.
-
-## Invariants preserved (parity with the Swift client)
+## Invariants
 
 - **Defensive decoding**: `{"sheds": null}` → `[]`, omitted optionals, lenient
-  `ShedStatus`, `"?"` name sentinels, and timestamps carried verbatim (parsing
-  stays in Swift).
+  `ShedStatus`, `"?"` name sentinels, and timestamps carried verbatim.
 - **Auth, fail-closed**: a provider mint failure sends **no** token (never the
   static one — no secure-by-default downgrade); a 401 invalidates + retries once
   (provider-backed only); create mints once with no retry.
@@ -86,26 +67,23 @@ backend is active.
 All targets run from the monorepo root (or `make -C desktop …`):
 
 ```bash
-make -C desktop core            # build the staticlib + regenerate the xcframework
-make -C desktop core-test       # cargo test the workspace
-make -C desktop core-lint       # cargo clippy -D warnings
-make -C desktop test            # swift tests (builds the core first)
-SHED_DESKTOP_RUST_CORE=1 make -C desktop e2e-ci   # the hermetic e2e with the Rust backend
+make -C desktop core-test       # cargo test the workspace (+ shed-app's `broker` feature)
+make -C desktop core-lint       # cargo clippy -D warnings (same two passes)
+make -C desktop core-fmt        # cargo fmt --all
+make -C desktop core-linux      # shed-core test + clippy on ubuntu:24.04, in Docker
 ```
 
 You can also drive the workspace directly from `crates/` (`cargo test`, `cargo clippy`). Rust
 changes need `cargo`/`rustup` (the workspace pins the channel in `crates/rust-toolchain.toml`).
+In CI, `core-mac` runs the test and clippy targets on macOS and `core-linux` on Linux.
 
 ## Status & scope
 
 The core covers the read client, lifecycle, SSE create, TLS pinning, the
-control-token FSM, a `config` parser, and the create orchestration store; it is
-the macOS **default** and builds/tests on **Linux**. The **Tauri cross-platform
-client** (`desktop/tauri/`), built on `shed-core` + `shed-app`, is the **shipped
-Linux client** — an earlier GTK MVP has been retired and the `.deb` is now built
-from `tauri/src-tauri` (WebKitGTK). It carries lifecycle + create, the approval
-spine (polkit gate + zbus notifier on Linux, Touch-ID on macOS), the
-[Agents pane](rc-sessions.md), tray/native-menu, and launch-at-login, driven by the
-`tools/shedtest --target mac|tauri` harness. Still deferred: retiring the Swift
-`URLSession` path + unifying config via the FFI, and absorbing/rewriting the
-credential broker in Rust (the final consolidation).
+control-token FSM, a `config` parser, the create orchestration store, the
+approval policy model and the agent-lane contract, and builds and tests on macOS
+and Linux. The Tauri client, built on `shed-core` + `shed-app`, is the shipped
+desktop client on both platforms. It carries lifecycle + create, the approval
+spine (polkit gate + D-Bus notifier on Linux, Touch ID on macOS), the embedded
+credential broker, the [Agents pane](rc-sessions.md), the tray, and
+launch-at-login, driven by the `tools/shedtest` harness.

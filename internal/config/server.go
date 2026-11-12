@@ -1682,7 +1682,7 @@ func rejectRemovedImageKeys(data []byte) error {
 	}
 	if _, present := raw["default_image"]; present {
 		return fmt.Errorf(
-			"top-level config key %q was removed in v0.6.0; move it into the active backend block as vz.default_image / firecracker.default_image (see docs/upgrades/v0.5.9-to-v0.6.0.md)",
+			"top-level config key %q was removed in v0.6.0; move it into the active backend block as vz.default_image / firecracker.default_image (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.9-to-v0.6.0.md)",
 			"default_image")
 	}
 	for _, backend := range []string{"vz", "firecracker"} {
@@ -1693,7 +1693,7 @@ func rejectRemovedImageKeys(data []byte) error {
 		for _, removed := range []string{"base_rootfs", "images"} {
 			if _, present := sub[removed]; present {
 				return fmt.Errorf(
-					"config key %q under %q was removed in v0.6.0; replace base_rootfs + images with default_image + image_aliases + pull_policy (see docs/upgrades/v0.5.9-to-v0.6.0.md)",
+					"config key %q under %q was removed in v0.6.0; replace base_rootfs + images with default_image + image_aliases + pull_policy (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.9-to-v0.6.0.md)",
 					removed, backend)
 			}
 		}
@@ -1713,7 +1713,7 @@ func rejectRemovedAuthKeys(data []byte) error {
 		return nil // malformed YAML — let the typed unmarshal surface the parse error
 	}
 	if _, present := raw["public_exposure"]; present {
-		return fmt.Errorf("config key %q was removed; use %q instead (see docs/upgrades/v0.7.0-to-v0.7.1.md)",
+		return fmt.Errorf("config key %q was removed; use %q instead (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.0-to-v0.7.1.md)",
 			"public_exposure", "auth.mode: token")
 	}
 	auth, ok := raw["auth"].(map[string]any)
@@ -1727,11 +1727,11 @@ func rejectRemovedAuthKeys(data []byte) error {
 	if httpBlock, present := auth["http"]; present {
 		if hb, ok := httpBlock.(map[string]any); ok {
 			if _, hasTokens := hb["tokens"]; hasTokens {
-				return fmt.Errorf("config key %q was removed; tokens are now minted over the SSH bootstrap channel under %q (see docs/upgrades/v0.7.1-to-v0.7.2.md)",
+				return fmt.Errorf("config key %q was removed; tokens are now minted over the SSH bootstrap channel under %q (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md)",
 					"auth.http.tokens", "auth.mode: token")
 			}
 		}
-		return fmt.Errorf("config key %q was removed; HTTP token enforcement is now derived from %q (see docs/upgrades/v0.7.1-to-v0.7.2.md)",
+		return fmt.Errorf("config key %q was removed; HTTP token enforcement is now derived from %q (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md)",
 			"auth.http", "auth.mode: token")
 	}
 	return nil
@@ -1747,12 +1747,12 @@ func rejectRemovedNetworkKeys(data []byte) error {
 		return nil // malformed YAML — let the typed unmarshal surface the parse error
 	}
 	if _, present := raw["internal_http_port"]; present {
-		return fmt.Errorf("config key %q was removed in v0.7.4; the credential bus and Connect tunnel now ride the single listener (pinned TLS in token mode), gated by the credentials scope (see docs/upgrades/v0.7.3-to-v0.7.4.md)",
+		return fmt.Errorf("config key %q was removed in v0.7.4; the credential bus and Connect tunnel now ride the single listener (pinned TLS in token mode), gated by the credentials scope (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md)",
 			"internal_http_port")
 	}
 	for _, removed := range []string{"http_bind", "ssh_bind"} {
 		if _, present := raw[removed]; present {
-			return fmt.Errorf("config key %q was unified into %q in v0.7.4 (one interface for all listeners; defaults to loopback). Use %q (and allow_insecure_exposure for non-loopback open-mode exposure) — see docs/upgrades/v0.7.3-to-v0.7.4.md",
+			return fmt.Errorf("config key %q was unified into %q in v0.7.4 (one interface for all listeners; defaults to loopback). Use %q (and allow_insecure_exposure for non-loopback open-mode exposure) — see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md",
 				removed, "bind_address", "bind_address")
 		}
 	}

@@ -1,8 +1,8 @@
-//! The Sparkle auto-updater integration — Swift-parity, user-invoked checks only.
+//! The Sparkle auto-updater integration — user-invoked checks only.
 //!
 //! Real Sparkle is embedded via `tauri-plugin-sparkle-updater` (macOS only). The
 //! plugin is registered ONLY outside test mode (see `lib.rs`), so the harness never
-//! instantiates an updater (the Swift-parity guarantee, enforced at registration).
+//! instantiates an updater (a guarantee enforced at registration).
 //! The crate itself is inert outside a real bundle (`is_valid_bundle()` → the
 //! managed `SparkleUpdater` state is absent under `cargo run`/the raw harness binary).
 //!

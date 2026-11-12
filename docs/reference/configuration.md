@@ -138,11 +138,11 @@ The pre-v0.7.1 `public_exposure` flag and `auth.http.tokens` list are removed an
 `shed server add` obtain a credential over SSH. As of v0.7.2 the whole
 `auth.http` block is gone (HTTP enforcement derives from `auth.mode`), and
 `https_port` / `auth.ssh.mode: enforce` are valid only in an enforced mode —
-see [Upgrading v0.7.1 → v0.7.2](../upgrades/v0.7.1-to-v0.7.2.md). As of v0.7.4
+see [Upgrading v0.7.1 → v0.7.2](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md). As of v0.7.4
 `http_bind`/`ssh_bind`/`internal_http_port` are removed in favour of a single
 `bind_address` (loopback by default), and `http_port` is optional in an
 enforced mode — see
-[Upgrading v0.7.3 → v0.7.4](../upgrades/v0.7.3-to-v0.7.4.md). `mtls` mode was
+[Upgrading v0.7.3 → v0.7.4](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md). `mtls` mode was
 added afterward — see [Upgrading to mTLS](../upgrades/token-to-mtls.md).
 
 ### SSH authentication

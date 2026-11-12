@@ -1,7 +1,7 @@
 """A hermetic in-process fake shed-server.
 
 A stdlib ThreadingHTTPServer on 127.0.0.1:<ephemeral> the harness points
-the app at (via SHED_DESKTOP_MOCK_BASE_URL in test mode), so E2E runs
+the app at (via SHED_TAURI_MOCK_BASE_URL in test mode), so E2E runs
 without a real shed-server and nothing leaves the box. State is a plain
 dict the test mutates directly (server + test share the pytest process),
 then forces a poll via `sheds.refresh`.
@@ -61,7 +61,7 @@ _IMAGES_FIXTURE = {
 
 
 # GET /api/egress/profiles: a config baseline + a user profile, so the egress
-# pane renders and the Rust/Swift backends decode the same shape.
+# pane renders a decoded shape.
 _EGRESS_FIXTURE = [
     {"name": "default", "source": "config",
      "profile": {"mode": "audit", "allow": ["*.github.com"], "deny": ["evil.example.com"]}},
@@ -115,9 +115,8 @@ DEFAULT_SHEDS = [
 #     SSE framing, 204-on-respond, 409-terminal-conflict, 501-egress-unavailable);
 #   * `docs/development/host-agent-wire-catalog.md` §0/§9 (the observable channels).
 #
-# Target-scoped: only the tauri-target embedded-broker cells exercise these. The
-# mac target never starts an in-process broker, so it never hits them (the mock
-# object is shared, but these routes stay dormant for every non-broker test).
+# Only the embedded-broker cells exercise these (the mock object is shared, but
+# these routes stay dormant for every non-broker test).
 _MESSAGES_RE = re.compile(r"^/api/plugins/listeners/([^/]+)/messages$")
 _RESPOND_RE = re.compile(r"^/api/plugins/listeners/([^/]+)/respond$")
 _EGRESS_PATH = "/api/egress/stream"

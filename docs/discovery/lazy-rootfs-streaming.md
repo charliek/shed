@@ -328,5 +328,5 @@ re-learning if C is ever built:
 - [`../reference/images.md`](../reference/images.md) and
   [`../reference/storage-model.md`](../reference/storage-model.md) — the
   current pull/build/push/on-disk model (strategy D).
-- [`../upgrades/v0.5.1-to-v0.5.2.md`](../upgrades/v0.5.1-to-v0.5.2.md) — the
+- [`https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.1-to-v0.5.2.md`](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.1-to-v0.5.2.md) — the
   move to publish-time erofs that C preserves.

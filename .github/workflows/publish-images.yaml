@@ -110,10 +110,9 @@ name: Publish Images and Release
 # every ship_desktop tag, stable and prerelease alike — its `if:` is
 # byte-identical to desktop-linux's, no prerelease/stable split at the job
 # level. (Before 0.9.0 there was a second, mutually exclusive Swift job that
-# owned STABLE tags only; it's retired — Swift sources stay for a later
-# demolition.) The prerelease/stable split lives solely in
-# update-appcast.py, which is unchanged: it emits the beta channel iff the
-# tag has a `-`. desktop-linux + desktop-apt-dispatch are unaffected by that
+# owned STABLE tags only; it's retired and the Swift sources are gone.)
+# The prerelease/stable split lives solely in update-appcast.py: it emits
+# the beta channel iff the tag has a `-`. desktop-linux + desktop-apt-dispatch are unaffected by that
 # axis (the .deb builds on both; apt-dispatch's own *-* guard already skips
 # prereleases).
 #
@@ -1136,8 +1135,7 @@ jobs:
 
   # macOS (Tauri app): the default macOS client as of 0.9.0 — runs on every
   # ship_desktop tag, stable and prerelease alike (the Swift release job that
-  # used to own stable tags is retired; Swift sources stay for a later
-  # demolition — see the follow-up ticket). Bundle (Sparkle.framework via
+  # used to own stable tags is retired, and its sources removed). Bundle (Sparkle.framework via
   # fetch-sparkle) → notarize+staple when the six Apple secrets exist
   # (CAN_NOTARIZE; a stable tag requires all six, enforced by the desktop
   # signing gate) → upload → EdDSA-sign for the Sparkle appcast → bot-push
@@ -1353,7 +1351,7 @@ jobs:
           DMG="desktop/build/ShedDesktop-${VER}.dmg"
           test -s "${DMG}" || { echo "::error::${DMG} missing — the DMG step must run first."; exit 1; }
           # sign_update comes from fetch-sparkle's dist (staged into the
-          # Tauri src-tauri by the bundle step), not a SwiftPM artifacts path.
+          # Tauri src-tauri by the bundle step).
           SIGN_UPDATE="desktop/tauri/src-tauri/.sparkle-dist/bin/sign_update"
           [ -x "${SIGN_UPDATE}" ] || { echo "::error::${SIGN_UPDATE} not found (fetch-sparkle must run in the build step)."; exit 1; }
           W="$(mktemp -d)"; chmod 700 "$W"; trap 'rm -rf "$W"' EXIT

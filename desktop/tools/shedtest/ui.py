@@ -1,12 +1,10 @@
 """Launch / quit a hermetic shed-desktop UI for tests, and resolve its socket.
 
-Both UIs speak the same IPC, so the test driver is one client parameterized by
-`--target`; only launch/quit/socket differ per UI. mac launches the Swift
-`ShedDesktop.app` via `open --env`. The Tauri client is a *subprocess* UI — a
-binary run in test mode, pointed at the in-process mock, with a throwaway
-HOME/XDG_RUNTIME_DIR — driven through one config-driven path (`_SUBPROC`),
-differing from mac in binary, env-var prefix, socket name, and the
-`identify.platform` stamp. The harness ALWAYS owns the app it drives.
+The Tauri client is a *subprocess* UI — a binary run in test mode, pointed at the
+in-process mock, with a throwaway HOME/XDG_RUNTIME_DIR — described by one config
+entry in `_SUBPROC` (binary, env-var prefix, socket name, `identify.platform`
+stamp). The `target` argument every helper takes is a key into that table; it
+defaults to the only entry, `"tauri"`. The harness ALWAYS owns the app it drives.
 """
 
 from __future__ import annotations
@@ -20,14 +18,10 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from client import IPCClient, ShedDesktop, ShedError, TauriClient, scaled_timeout
+from client import IPCClient, ShedError, TauriClient, scaled_timeout
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TARGETS = ("mac", "tauri")
-
-# mac: the ad-hoc-signed bundle the harness drives.
-APP = REPO_ROOT / "build" / "ShedDesktop.app"
-DEFAULTS_SUITE = "ai.stridelabs.ShedDesktop.e2e"
+DEFAULT_TARGET = "tauri"
 
 
 @dataclass(frozen=True)
@@ -52,7 +46,7 @@ _SUBPROC: dict[str, _Subproc] = {
 }
 
 # The Linux render gate builds the Tauri app with a relocated CARGO_TARGET_DIR (so
-# a container build can't clobber the mac target dir); let it point the harness at
+# a container build can't clobber the host's target dir); let it point the harness at
 # that binary via SHED_TAURI_BIN.
 if os.environ.get("SHED_TAURI_BIN"):
     _SUBPROC["tauri"] = replace(_SUBPROC["tauri"], binary=Path(os.environ["SHED_TAURI_BIN"]))
@@ -77,12 +71,15 @@ class _ProcState:
 _state: dict[str, _ProcState] = {t: _ProcState() for t in _SUBPROC}
 
 
-def socket_path(target: str = "mac") -> Path:
-    if target == "mac":
-        return Path.home() / "Library/Caches/ShedDesktop/shed-desktop.sock"
+def _cfg(target: str) -> _Subproc:
     cfg = _SUBPROC.get(target)
     if cfg is None:
-        raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
+        raise ValueError(f"unknown target {target!r} (want {'|'.join(_SUBPROC)})")
+    return cfg
+
+
+def socket_path(target: str = DEFAULT_TARGET) -> Path:
+    cfg = _cfg(target)
     runtime = _state[target].runtime_dir or Path(
         os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/{cfg.fallback_stem}-{os.getuid()}"
     )
@@ -91,23 +88,17 @@ def socket_path(target: str = "mac") -> Path:
 
 def _client_at(target: str, sock: Path) -> IPCClient:
     """The IPC client class for a target, bound to an EXPLICIT socket path — the
-    single source of the target→class map (subprocess targets carry their
-    `client_cls` in `_SUBPROC`). `make_client` resolves the socket from session
-    state; a self-managed instance (down-host) passes its own."""
-    if target == "mac":
-        return ShedDesktop(sock)
-    cfg = _SUBPROC.get(target)
-    if cfg is None:
-        raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
-    return cfg.client_cls(sock)
+    single source of the target→class map. `make_client` resolves the socket
+    from session state; a self-managed instance (down-host) passes its own."""
+    return _cfg(target).client_cls(sock)
 
 
-def make_client(target: str) -> IPCClient:
+def make_client(target: str = DEFAULT_TARGET) -> IPCClient:
     """The IPC client for a target at its session-resolved socket."""
     return _client_at(target, socket_path(target))
 
 
-def launch_env(target: str) -> dict[str, str]:
+def launch_env(target: str = DEFAULT_TARGET) -> dict[str, str]:
     """The env the session's subprocess UI was launched with — so the
     second-instance (single-instance) test can spawn a sibling against the same
     runtime."""
@@ -127,15 +118,7 @@ def _log_path(cfg: _Subproc) -> Path:
     return base / f"{cfg.fallback_stem}-ui.log"
 
 
-# -- mac process helpers (unchanged behavior) ----------------------------------
-def _running() -> bool:
-    return subprocess.run(
-        ["pgrep", "-x", "ShedDesktop"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    ).returncode == 0
-
-
-def is_alive(target: str = "mac") -> bool:
+def is_alive(target: str = DEFAULT_TARGET) -> bool:
     try:
         c = make_client(target)
         try:
@@ -147,55 +130,11 @@ def is_alive(target: str = "mac") -> bool:
         return False
 
 
-def _wait_gone(timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while _running():
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
-    return True
-
-
-def quit(target: str = "mac") -> None:
-    """Quit the harness-owned UI. A switch, never flattened: the mac path
-    (osascript → pkill → `defaults delete` → unlink sock/lock) and the subprocess
-    path (terminate/kill the child → remove its temp dir) share nothing."""
-    if target == "mac":
-        _quit_mac()
-    elif target in _SUBPROC:
-        _quit_subproc(target)
-    else:
-        raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
-
-
-def _quit_mac() -> None:
-    """Force-quit any running ShedDesktop (the harness always owns a hermetic
-    instance, so a developer's running app would be force-quit — that is
-    intended). Only unlink the socket/lock once the process is CONFIRMED gone:
-    unlinking out from under a still-live (wedged) process frees the path and a
-    fresh launch would create a second instance."""
-    if _running():
-        try:
-            subprocess.run(
-                ["osascript", "-e", 'tell application "ShedDesktop" to quit'],
-                check=False, timeout=5,
-            )
-        except subprocess.TimeoutExpired:
-            pass
-        if not _wait_gone(3.0):
-            subprocess.run(["pkill", "-x", "ShedDesktop"], check=False)         # SIGTERM
-            if not _wait_gone(3.0):
-                subprocess.run(["pkill", "-9", "-x", "ShedDesktop"], check=False)  # SIGKILL
-                if not _wait_gone(5.0):
-                    raise RuntimeError(
-                        "ShedDesktop survived SIGKILL — refusing to unlink its socket/lock "
-                        "(would risk a second instance)")
-    cache = Path.home() / "Library/Caches/ShedDesktop"
-    (cache / "shed-desktop.sock").unlink(missing_ok=True)
-    (cache / "shed-desktop.lock").unlink(missing_ok=True)
-    # Drop the throwaway preferences suite so a run never leaves dev defaults.
-    subprocess.run(["defaults", "delete", DEFAULTS_SUITE],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+def quit(target: str = DEFAULT_TARGET) -> None:
+    """Quit the harness-owned UI: terminate/kill the child, then remove its
+    throwaway runtime dir."""
+    _cfg(target)
+    _quit_subproc(target)
 
 
 def terminate(proc: "subprocess.Popen[bytes] | None") -> None:
@@ -222,9 +161,8 @@ def _quit_subproc(target: str) -> None:
     _state[target] = _ProcState()
 
 
-def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_dir: Path,
+def launch(target: str = DEFAULT_TARGET, *, mock_base_url: str, config_path: Path, state_dir: Path,
            host_agent_socket: str | None = None, unreachable_hosts: tuple[str, ...] = (),
-           credential_hosts: tuple[str, ...] = (),
            roost_sockets: dict[str, object] | None = None,
            ssh_bin: object | None = None,
            roost_jail: bool = False,
@@ -232,13 +170,12 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
            roost_session_bin: object | None = None) -> None:
     """Launch the UI hermetically and block until it answers `identify`.
 
-    `state_dir` is the throwaway per-session dir: on mac SHED_DESKTOP_STATE_DIR;
-    on a subprocess target it doubles as HOME + XDG_RUNTIME_DIR (so ~/.shed and
-    the runtime socket are both isolated). `host_agent_socket` backs the approval
-    gate — set for both mac + tauri (the fake host-agent). `unreachable_hosts` are
-    config server NAMES the backend points at a closed port instead of the mock
-    (the `<PREFIX>_MOCK_UNREACHABLE_HOSTS` down-host override) so the per-host error
-    row is exercisable e2e; wired for both targets, though only tauri drives it now.
+    `state_dir` is the throwaway per-session dir; it doubles as HOME +
+    XDG_RUNTIME_DIR (so ~/.shed and the runtime socket are both isolated).
+    `host_agent_socket` backs the approval gate (the fake host-agent).
+    `unreachable_hosts` are config server NAMES the backend points at a closed
+    port instead of the mock (the `<PREFIX>_MOCK_UNREACHABLE_HOSTS` down-host
+    override) so the per-host error row is exercisable e2e.
     `roost_sockets` maps machine NAME -> the Unix socket its `roost-session`
     answers on, replacing roost's SSH client-bridge with a direct `LocalSession`
     — the test-mode-only `<PREFIX>_ROOST_SOCKETS` seam. Per-machine so a suite
@@ -248,8 +185,7 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     developer's own session. That is what makes the machine path testable
     hermetically: the harness serves a fake `roost-session` there
     (`fake_roost.py`) and the app reaches it through the REAL roost client +
-    watcher, with no ssh and no remote host anywhere. Tauri-only (the mac app has
-    no machine layer). Set-or-clear like `unreachable_hosts`: `None` (not given)
+    watcher, with no ssh and no remote host anywhere. Set-or-clear like `unreachable_hosts`: `None` (not given)
     or `{}` clears the env var so a hermetic launch never inherits a value from
     the parent shell; a non-empty map sets it. Driving against a real
     roost-session daemon is a separate, explicit opt-in — see the
@@ -284,60 +220,15 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     roost" deterministic: without it the rung finds whatever `roost-session`
     happens to be on the developer's PATH and the NoSource cell reads
     differently on a workstation than in CI.
-    `credential_hosts` are server NAMES that keep their REAL control-credential
-    wiring against the mock (host agent + the config's auth_mode) instead of the
-    tokenless open-mode shortcut — the agent-upgrade scenario's override, mac-only
-    for now (the Tauri backend has no counterpart yet).
     """
-    if target == "mac":
-        _launch_mac(mock_base_url=mock_base_url, config_path=config_path,
-                    state_dir=state_dir, host_agent_socket=host_agent_socket,
+    _cfg(target)
+    _launch_subproc(target, mock_base_url=mock_base_url, config_path=config_path,
+                    runtime_dir=state_dir, host_agent_socket=host_agent_socket,
                     unreachable_hosts=unreachable_hosts,
-                    credential_hosts=credential_hosts)
-    elif target in _SUBPROC:
-        _launch_subproc(target, mock_base_url=mock_base_url, config_path=config_path,
-                        runtime_dir=state_dir, host_agent_socket=host_agent_socket,
-                        unreachable_hosts=unreachable_hosts,
-                        roost_sockets=roost_sockets,
-                        ssh_bin=ssh_bin, roost_jail=roost_jail,
-                        roost_install_bin=roost_install_bin,
-                        roost_session_bin=roost_session_bin)
-    else:
-        raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
-
-
-def _launch_mac(*, mock_base_url: str, config_path: Path, state_dir: Path,
-                host_agent_socket: str | None,
-                unreachable_hosts: tuple[str, ...] = (),
-                credential_hosts: tuple[str, ...] = ()) -> None:
-    if platform.system() != "Darwin":
-        raise RuntimeError("the mac target requires macOS")
-    if not APP.is_dir():
-        subprocess.run(["./scripts/bundle.sh", "debug"], cwd=REPO_ROOT, check=True)
-    argv = [
-        "open", "--env", "SHED_DESKTOP_TEST_MODE=1",
-        "--env", f"SHED_DESKTOP_MOCK_BASE_URL={mock_base_url}",
-        "--env", f"SHED_DESKTOP_SHED_CONFIG={config_path}",
-        "--env", f"SHED_DESKTOP_STATE_DIR={state_dir}",
-    ]
-    if host_agent_socket:
-        argv += ["--env", f"SHED_DESKTOP_HOST_AGENT_SOCKET={host_agent_socket}"]
-    if unreachable_hosts:
-        argv += ["--env", f"SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS={','.join(unreachable_hosts)}"]
-    if credential_hosts:
-        argv += ["--env", f"SHED_DESKTOP_MOCK_CREDENTIAL_HOSTS={','.join(credential_hosts)}"]
-    # Throwaway UserDefaults suite so preferences never touch the dev's real
-    # defaults (the SHED_DESKTOP_STATE_DIR analog for UserDefaults).
-    argv += ["--env", f"SHED_DESKTOP_DEFAULTS_SUITE={DEFAULTS_SUITE}"]
-    # The Rust core is the default (M0). Forward SHED_DESKTOP_RUST_CORE verbatim
-    # whenever the harness set it, so the `=0` Swift-fallback leg is exercised
-    # (and an explicit `=1` still works). Unset ⇒ the app defaults to rust.
-    rust_core = os.environ.get("SHED_DESKTOP_RUST_CORE")
-    if rust_core is not None:
-        argv += ["--env", f"SHED_DESKTOP_RUST_CORE={rust_core}"]
-    argv += [str(APP)]
-    subprocess.run(argv, check=True)
-    wait_alive("mac", mock_base_url=mock_base_url)
+                    roost_sockets=roost_sockets,
+                    ssh_bin=ssh_bin, roost_jail=roost_jail,
+                    roost_install_bin=roost_install_bin,
+                    roost_session_bin=roost_session_bin)
 
 
 def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
@@ -519,7 +410,7 @@ def await_hermetic(target: str, *, sock: Path, mock_base_url: str, timeout: floa
         time.sleep(0.25)
 
 
-def wait_alive(target: str = "mac", *, mock_base_url: str, timeout: float = 30.0) -> None:
+def wait_alive(target: str = DEFAULT_TARGET, *, mock_base_url: str, timeout: float = 30.0) -> None:
     """Session-instance wait: resolve the socket + subprocess bookkeeping from
     `_state` and block until hermetically ready (see `await_hermetic`)."""
     st = _state.get(target)
@@ -532,11 +423,4 @@ def wait_alive(target: str = "mac", *, mock_base_url: str, timeout: float = 30.0
 def _hermetic(target: str, info: dict, mock_base_url: str) -> bool:
     if not (info.get("test_mode") and info.get("mock_base_url") == mock_base_url):
         return False
-    cfg = _SUBPROC.get(target)
-    if cfg is not None:
-        return info.get("core") == "rust" and info.get("platform") == cfg.platform_id
-    # mac: confirm the active backend matches the flag so a silent Rust->Swift
-    # downgrade can't make a run falsely green. Default-on (M0): unset ⇒ rust;
-    # only an explicit `=0` selects swift.
-    want_core = "swift" if os.environ.get("SHED_DESKTOP_RUST_CORE") == "0" else "rust"
-    return info.get("core") == want_core
+    return info.get("core") == "rust" and info.get("platform") == _cfg(target).platform_id

@@ -5,12 +5,12 @@
   Extra Info.plist keys for the Tauri mac app — Tauri merges this file into
   the plist it generates for ShedDesktop.app (mac-only by nature).
 
-  These MUST stay identical to the Swift app's Resources/Info.plist.template:
-  same SUFeedURL + SUPublicEDKey means the eventual Swift-to-Tauri hop is a
-  same-feed, same-key, in-place Sparkle update. The matching private key is
-  the SPARKLE_ED_PRIVATE_KEY repo secret. SUEnableAutomaticChecks=false so a
-  background check never pops a panel (updates are user-invoked, Swift
-  parity). LSUIElement=true: menu-bar/accessory app, no Dock icon (runtime
+  SUFeedURL + SUPublicEDKey are the feed and key every shipped mac release
+  has used (the Swift app before 0.9.0 included), so updates stay same-feed,
+  same-key and in-place. Never change them: CI's bundle check pins the key.
+  The matching private key is the SPARKLE_ED_PRIVATE_KEY repo secret.
+  SUEnableAutomaticChecks=false so a background check never pops a panel
+  (updates are user-invoked). LSUIElement=true: menu-bar/accessory app, no Dock icon (runtime
   activation-policy switching promotes to Regular when a window opens).
 -->
 <plist version="1.0">
@@ -23,8 +23,7 @@
     stages post-build — the glass, edge-to-edge treatment. Without it a loose
     .icns is drawn as a legacy icon inset on the system tile (gray frame +
     muted color). When actool is unavailable the script falls back to a flat
-    AppIcon.icns and the OS still resolves this name to it. Mirrors the Swift
-    app's Resources/Info.plist.template.
+    AppIcon.icns and the OS still resolves this name to it.
   -->
   <key>CFBundleIconName</key>
   <string>AppIcon</string>

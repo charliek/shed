@@ -970,7 +970,7 @@ verb (`lane.send`, `lane.cancel`, `lane.answer`, `lane.set`, `lane.set_title`,
 
 The craze ops — `craze.create_options`, `craze.create`, `craze.saved`,
 `craze.reopen`, `craze.open_terminal` — the UI-truth dumps (`lane.dump`, `lane_settings.dump`, `craze_create.dump`)
-and the test-mode doors are listed in [IPC](ipc.md#craze-sessions-tauri).
+and the test-mode doors are listed in [IPC](ipc.md#craze-sessions).
 
 ## A stalled client and the channel bound
 

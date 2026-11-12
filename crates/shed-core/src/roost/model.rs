@@ -646,9 +646,9 @@ pub fn launch_argv(kind: &RcKind) -> Option<Vec<String>> {
 /// shape every other `created_at` / `activity_at` on this wire already has.
 ///
 /// Hand-rolled rather than pulled from `chrono`: `shed-core` is the
-/// dependency-clean crate (it is what the Swift staticlib and the Android build
-/// link), formatting one UTC instant is thirty lines of integer arithmetic, and
-/// the alternative is a date-time crate in the FFI tree for a `format!`.
+/// dependency-clean crate (it is what the Android build links), formatting one
+/// UTC instant is thirty lines of integer arithmetic, and the alternative is a
+/// date-time crate in the FFI tree for a `format!`.
 /// `shed-app` keeps `timefmt` (which *parses* the many shapes shed-server emits,
 /// and does need a real library); this is the one-way, one-shape half.
 ///

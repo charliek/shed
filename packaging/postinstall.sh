@@ -11,7 +11,7 @@
 # unit so the new binary actually replaces the running old one — pre-
 # v0.5.9 the postinst skipped the restart, leaving operators with a
 # 0.5.x-1 binary still serving while `dpkg-query` reported 0.5.x. See
-# docs/upgrades/v0.5.7-to-v0.5.8.md for the original incident.
+# https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.5.7-to-v0.5.8.md for the original incident.
 #
 # /etc/shed/server.yaml is not a dpkg conffile (#109). An edited config plus a
 # changed template made dpkg prompt, and an unattended upgrade died at that
@@ -128,7 +128,7 @@ if [ -n "${2:-}" ]; then
         echo "  (open mode also requires allow_insecure_exposure: true; prefer"
         echo "   auth.mode: secure for anything exposed on a network)"
         echo "then: sudo systemctl restart shed-server"
-        echo "Guide: https://github.com/charliek/shed/blob/main/docs/upgrades/v0.7.3-to-v0.7.4.md"
+        echo "Guide: https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md"
         echo ""
     fi
 

@@ -12,8 +12,8 @@
 //! adapter needs the other direction too. It lives here rather than in that
 //! adapter because both clients' Rust (the desktop, and the phone through FRB)
 //! may need it, and here rather than behind a date crate for the reason the lane
-//! module's correction 10 gives: `cargo tree -p shed-core-ffi` and the Android
-//! tree must list no crate they did not list before. `chrono` stays out.
+//! module's correction 10 gives: the Android tree must list no crate it did
+//! not list before. `chrono` stays out.
 //!
 //! What it accepts is RFC 3339's `date-time` as a Go producer writes it
 //! (`time.RFC3339Nano`): `YYYY-MM-DDTHH:MM:SS`, an optional fraction of any

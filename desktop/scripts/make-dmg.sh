@@ -8,7 +8,7 @@
 # which matters on GitHub's GUI-less macOS runners. Set SHED_DESKTOP_DMG_FANCY=1
 # (local/manual builds) to use `create-dmg` for a styled window.
 #
-# Run scripts/bundle.sh first (this packages whatever is in build/).
+# Run scripts/bundle-tauri-mac.sh first (this packages whatever is in build/).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,7 +19,7 @@ VERSION="${SHED_DESKTOP_VERSION:-${FILE_VERSION:-0.0.0}}"
 APP_DIR="${REPO_ROOT}/build/ShedDesktop.app"
 DMG_OUT="${REPO_ROOT}/build/ShedDesktop-${VERSION}.dmg"
 
-[ -d "${APP_DIR}" ] || { echo "error: ${APP_DIR} missing — run scripts/bundle.sh first" >&2; exit 1; }
+[ -d "${APP_DIR}" ] || { echo "error: ${APP_DIR} missing — run scripts/bundle-tauri-mac.sh first" >&2; exit 1; }
 
 STAGING="$(mktemp -d -t shed-desktop-dmg)"
 trap 'rm -rf "${STAGING}"' EXIT
@@ -28,7 +28,7 @@ cp -R "${APP_DIR}" "${STAGING}/"
 # First-launch note for the ad-hoc / non-notarized interim. It sits beside the
 # app in the mounted DMG so the Gatekeeper-bypass step is visible before the
 # user hits the wall. Gated on SHED_DESKTOP_DEVELOPER_ID_IDENTITY (the same
-# signal bundle.sh uses): once a real identity is present the build is on the
+# signal bundle-tauri-mac.sh uses): once a real identity is present the build is on the
 # notarization path and the note is omitted.
 if [ -z "${SHED_DESKTOP_DEVELOPER_ID_IDENTITY:-}" ]; then
   cat > "${STAGING}/FIRST-LAUNCH.txt" <<'EOF'

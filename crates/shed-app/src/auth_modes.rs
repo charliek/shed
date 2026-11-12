@@ -8,8 +8,7 @@
 //! drop every key it does not model, race the CLI, and wake the config watcher
 //! into rebuilding clients mid-mint. The cost of not persisting is one silent
 //! re-bootstrap on a cold launch against a server that flipped — which is the
-//! trade plan 002 pins for BOTH desktop clients (the Swift app's
-//! `CredentialModeObserver` is the same decision in the other language).
+//! trade plan 002 pins for the desktop client.
 //!
 //! # The three writers, and why there are three
 //!

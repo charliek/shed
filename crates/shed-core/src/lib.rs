@@ -1,8 +1,7 @@
 //! shed-core — the pure Rust shed-server protocol client + wire DTOs.
 //!
-//! No UniFFI here; the `shed-core-ffi` crate wraps this for Swift. Phase 3's
-//! GTK app links this crate directly. Decoders in `models` must reproduce the
-//! defensive semantics pinned by shed-desktop's `ModelDecodingTests` exactly.
+//! Clients link this crate directly. Decoders in `models` must
+//! reproduce the defensive semantics documented there exactly.
 
 pub mod approval;
 pub mod authfail;
@@ -25,8 +24,8 @@ pub mod time;
 pub mod tls;
 pub mod token;
 
-/// M0 canary health check, exercised through the FFI bridge until the real
-/// client lands in M2. Async so the UniFFI async-over-tokio path is proven early.
+/// M0 canary health check. Async so an async-over-tokio caller path is proven
+/// early.
 pub async fn ping(echo: String) -> String {
     format!("shed-core ok: {echo}")
 }
