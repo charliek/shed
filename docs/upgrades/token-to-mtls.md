@@ -138,6 +138,13 @@ The recovery story is intentionally simple, and mostly self-driving:
   above). So the operator-facing cost of a CA rotation is **"every client
   pays one extra SSH round-trip on its next command,"** not a coordinated
   maintenance window.
+- **Service clients are the exception.** A
+  [service client](../guides/orchestrated-sheds.md)'s certificate is signed on
+  the shed host by `shed-server client issue`, never over `_bootstrap`, so it
+  has no way to re-enroll. After a rotation each one is refused until you
+  issue it a new bundle (`sudo shed-server client issue <name> --out …`) and
+  hand that to the orchestrator, so a rotation on a server with `auth.clients`
+  is coordinated with whoever runs those orchestrators.
 - There is **no `shed server ca rotate` / `ca status` CLI yet** — rotation
   today means deleting the two files and restarting, and recovery means
   "wait for each client's next command" (or manually trigger one, e.g. `shed

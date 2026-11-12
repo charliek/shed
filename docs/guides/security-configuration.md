@@ -268,14 +268,27 @@ shed list -v      # the MOUNTS column shows none, NETWORK shows isolated
   choice is stored and applied on every start. See [Security › Mount
   selection](../reference/security.md#mount-selection).
 - **`--network isolated`** (Firecracker only) lets the shed reach the internet
-  and nothing else: not the host on any of its addresses, other sheds, the LAN
-  (RFC 1918), the tailnet (`100.64.0.0/10`), link-local addresses and the cloud
-  metadata service, and no IPv6. shed-server enforces it with its own nftables
-  tables, so a process in the guest cannot opt out. See [Security › Network
+  and nothing else: not the host on any of its addresses (except the shed's own
+  9P and egress-proxy ports on the gateway), other sheds, the LAN (RFC 1918),
+  the tailnet (`100.64.0.0/10`), link-local addresses and the cloud metadata
+  service, and no IPv6. shed-server enforces it with its own nftables tables,
+  so a process in the guest cannot opt out. Something on the host can remove
+  them (`nft flush ruleset`, a firewall reload), and the shed is then open for
+  up to 30 s, until shed-server's check puts them back. See [Security › Network
   profiles](../reference/security.md#network-profiles).
 - **Use both.** On Firecracker, an `open` shed with no mounts can still reach
   another running shed's 9P port on the bridge, so leaving out mounts is not a
   boundary by itself.
+- **Neither flag turns off the credential bus.** While a host-agent brokers for
+  this server, code in the shed can request SSH signatures and the cloud and
+  registry credentials configured for it, like any shed (see [Credential
+  isolation › Compromised VM](../extensions/security-posture.md#compromised-vm)).
+  For untrusted code, stop the host-agent while the shed runs, or have a
+  [service client](../reference/security.md#service-clients) own the shed: the
+  bus is always off for an owned shed.
+- **Neither flag stops the create's sync.** `shed create` still syncs your
+  `default` [sync profile](../reference/sync.md#auto-sync-on-create) into the
+  shed; add `--no-sync` when it copies anything the code should not see.
 
 To make `isolated` the default for every create on a Firecracker server:
 

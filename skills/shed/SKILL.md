@@ -68,7 +68,7 @@ Usage notes that matter:
 - **One-off vs interactive:** `shed exec <name> <command...>` runs a single command over SSH with the argv passed through verbatim (it is not a shell), e.g. `shed exec myproj git status`. For pipes, `&&`, redirection, or `cd`, wrap it yourself: `shed exec myproj bash -lc "cd /workspace && npm test"`. Reserve `attach`/`console` for interactive work.
 - **Multi-server:** target one with `-s <server>`; sweep all with `--all` (on `list`, `sessions`, `system`).
 - **Scripting:** `--json` emits structured output. Destructive commands require `--force` when combined with `--json` (no interactive prompt).
-- **Untrusted code:** create with `--mounts none --network isolated` (no host directories, the internet only; `--network isolated` needs a Firecracker server, on VZ use `--mounts none` alone).
+- **Untrusted code:** create with `--mounts none --network isolated` (no host directories, the internet only; `--network isolated` needs a Firecracker server). On VZ only `--mounts none` is available, and it leaves the network open: the shed still reaches the Mac and its LAN, so tell the user before running untrusted code there. Add `--no-sync` when the user's `default` sync profile copies anything private, and note that neither flag turns off the credential bus while a host-agent serves the server.
 - **Sheds you didn't create:** a shed whose `OWNER` in `shed list -v` is not `-` belongs to a service client (an orchestrator such as a CI system), which manages and deletes it. Don't stop, reset or delete it unless the user asks for that shed by name.
 
 ## Reaching services inside a shed (tunnels)

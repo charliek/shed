@@ -15,10 +15,15 @@ Off by default. Works on both backends (Firecracker and VZ).
 
     On Firecracker, the [`isolated` network
     profile](security.md#network-profiles) is a kernel-enforced fence: the
-    guest reaches the internet and nothing else, whether or not a process
-    cooperates. The proxy decides which internet hosts a cooperating client may
-    use; isolation decides what any process can reach. See [With the `isolated`
-    network profile](#with-the-isolated-network-profile).
+    guest's direct traffic reaches the internet and nothing else (beyond any
+    `network.allow_cidrs` and its own 9P ports on the gateway), whether or not
+    a process cooperates. The proxy
+    decides which internet hosts a cooperating client may use; isolation
+    decides what any process can reach directly. The proxy dials from the host,
+    outside the fence, so through it a cooperating client can still reach a
+    service on one of the host's public addresses when the policy allows it.
+    See [With the `isolated` network
+    profile](#with-the-isolated-network-profile).
 
 ## What it does
 
@@ -329,10 +334,11 @@ shed (Firecracker) changes:
   — reaches everything directly, **including IMDS and private ranges**, since
   the deny-CIDR guards only apply to proxy-routed traffic. **Isolated:** IMDS,
   private and reserved ranges, the host and other sheds are dropped in the
-  kernel; any internet host is still reachable.
+  kernel, except the ranges `network.allow_cidrs` lists (IMDS too, if a listed
+  range covers it); any internet host is still reachable.
 - A sudo user who unsets `HTTP_PROXY`/`HTTPS_PROXY` or overrides the docker
   proxy drop-in. **Isolated:** the same limit as a raw `connect()` (the
-  internet only).
+  internet, plus any `network.allow_cidrs`).
 - Direct connections to an IP literal (the proxy filters by hostname).
   **Isolated:** still open to any internet address.
 - UDP / QUIC / HTTP3 — the proxy env only captures TCP HTTP(S).
@@ -359,8 +365,9 @@ Network
 profiles](security.md#network-profiles)) is fenced by shed-server's own
 nftables rules, which are enforced in the kernel and do not depend on the guest
 cooperating. They close several of the bypasses above for that shed: a raw
-`connect()` can no longer reach IMDS, private ranges, the host or other sheds,
-and VM-to-VM traffic on the bridge is dropped. The internet stays reachable, so
+`connect()` can no longer reach IMDS, private ranges (other than those in
+`network.allow_cidrs`), the host or other sheds, and VM-to-VM traffic on the
+bridge is dropped. The internet stays reachable, so
 egress profiles remain the way to filter *which* internet hosts a cooperating
 client may use. The two compose:
 
@@ -372,9 +379,12 @@ client may use. The two compose:
   listener opens, moved by `shed egress set`, and removed by `shed egress off`.
 - The proxy itself runs on the host, so its upstream connections are not
   subject to the isolated rules; its own deny-CIDR guards still apply to them.
+  The guards do not cover the host's own public addresses, so a service
+  listening on one is reachable through the proxy (in `audit` mode, or when an
+  allow rule matches it).
 - A process that ignores the proxy environment still reaches the internet
-  directly (isolation does not force traffic through the proxy), but nothing
-  else.
+  directly (isolation does not force traffic through the proxy), and beyond it
+  only any `network.allow_cidrs` and its own 9P ports.
 
 A profile that combines the two, isolated with the proxy as the only way out
 (proxy-only), is planned and not built; see
@@ -414,9 +424,12 @@ A profile that combines the two, isolated with the proxy as the only way out
 
 On Firecracker, an `isolated` shed's direct traffic (everything that does not
 go to its proxy port) also passes shed-server's nftables tables (`bridge` and
-`inet shed_<name>`) on the host, which drop anything bound for the host, other
-sheds or a blocked range before it leaves. Open sheds and VZ sheds have no such
-layer.
+`inet shed_<name>`) on the host, which drop anything bound for the host (other
+than the shed's own 9P ports), other sheds or a blocked range (minus
+`network.allow_cidrs`) before it leaves. If
+something else removes the tables (`nft flush ruleset`, a firewall reload),
+isolated sheds are open until shed-server's 30 s check puts them back. Open
+sheds and VZ sheds have no such layer.
 
 The proxy is a child of shed-server: it starts only when egress is enabled and
 exits with shed-server. It ships in the brew and deb packages alongside

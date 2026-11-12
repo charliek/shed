@@ -144,9 +144,16 @@ The repository is an `https://` URL because an `owner/repo` shorthand expands
 to an SSH URL (`git@github.com:owner/repo.git`), and the clone then needs an SSH
 key, which `--mounts none` may have just left out. `--network isolated` needs a
 Firecracker server with `nft` (see [Firecracker
-setup](fc-setup.md#prerequisites)); on VZ use `--mounts none` alone. What the
+setup](fc-setup.md#prerequisites)); on VZ use `--mounts none` alone, which
+leaves the network open: the guest still reaches the Mac and its LAN (see [VZ
+operations › Networking](../reference/vz-operations.md#networking)). What the
 profile blocks is in [Security › Network
 profiles](../reference/security.md#network-profiles).
+
+Neither flag stops `shed create` from syncing your `default` [sync
+profile](../reference/sync.md#auto-sync-on-create) into the shed, and code in
+it can read what was synced. Add `--no-sync` when that profile copies anything
+the code should not see.
 
 ### Port forwarding
 

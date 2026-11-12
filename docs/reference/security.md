@@ -50,7 +50,9 @@ Beyond the posture, this page covers what a shed itself can reach and who can
 drive it: [service clients](#service-clients) (orchestrators limited to their
 own sheds, in mtls mode), [mount selection](#mount-selection) (which host
 directories a shed gets) and [network profiles](#network-profiles) (on
-Firecracker, an `isolated` shed reaches the internet and nothing else).
+Firecracker, an `isolated` shed reaches the internet and, beyond it, only its
+own ports on the gateway, any `network.allow_cidrs`, and what its egress proxy
+dials for it).
 
 ## SSH key allowlist
 
@@ -488,7 +490,10 @@ clients](#service-clients)).
   recovers automatically (one silent SSH round-trip on its next command, via
   the same adaptive-transport mechanism that handles ordinary renewal and
   mode flips), so the operator-facing cost is "every client pays one extra
-  SSH round-trip," not an outage requiring per-client intervention. There is
+  SSH round-trip," not an outage requiring per-client intervention. A
+  [service client](#service-clients) is the exception: its certificate comes
+  from `shed-server client issue`, not `_bootstrap`, so after a rotation it is
+  refused until you issue and deliver a new bundle. There is
   no `shed server ca rotate` / `ca status` command yet — a full CLI story is
   future work. The server logs the CA fingerprint and expiry at startup (like
   the TLS cert fingerprint) and **warns when the CA is within 90 days of
@@ -628,7 +633,8 @@ Each shed has a network profile, chosen at create and fixed for its life:
 - **`open`** (the default): today's network. The guest reaches whatever the
   host's NAT reaches, including the host, the LAN and other sheds.
 - **`isolated`** (Firecracker only): the internet and nothing else. Not the
-  host (on any of its addresses, the gateway included), other sheds, RFC 1918,
+  host (on any of its addresses, the gateway included, except the shed's own
+  ports there; see [How it is enforced](#how-it-is-enforced)), other sheds, RFC 1918,
   CGNAT and tailnet (`100.64.0.0/10`), link-local and cloud metadata
   (`169.254.0.0/16`), loopback, multicast and the other reserved IPv4 ranges,
   and no IPv6 at all. Anti-spoofing is on. These rules cover the guest's

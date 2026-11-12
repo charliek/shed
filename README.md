@@ -15,9 +15,10 @@ Firecracker microVMs on Linux or Apple Virtualization VMs on macOS Apple Silicon
 - **IDE integration** — native Cursor / VS Code Remote-SSH support.
 - **AI-ready** — pre-configured for Claude Code and OpenCode workflows.
 - **VM backends** — Firecracker microVMs (Linux) or Apple VZ (macOS Apple Silicon).
-- **Hardened sheds** — `--mounts none` keeps host directories out of a shed, and on
+- **Hardened sheds** — `--mounts none` keeps host directories out of a shed's mounts, and on
   Firecracker `--network isolated` lets it reach the internet and nothing else, enforced by
-  nftables on the host.
+  nftables on the host. Use both: on Firecracker an `open` shed with no mounts can still reach
+  another running shed's 9P export on the bridge.
 - **Orchestrator API** — mTLS service clients that create, run commands in
   (`POST /api/sheds/{name}/exec`) and delete only their own sheds, within a policy.
 
