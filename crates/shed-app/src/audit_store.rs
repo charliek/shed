@@ -1,4 +1,4 @@
-//! The app's own append-only audit log, ported from `AuditStore.swift`.
+//! The app's own append-only audit log.
 //!
 //! A superset of the host agent's JSON-lines log: it adds the app's own approval
 //! decisions (with the policy applied) and the streamed host events. Append-only

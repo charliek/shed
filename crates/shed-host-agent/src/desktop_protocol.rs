@@ -482,8 +482,8 @@ pub fn credential_response(
 }
 
 /// Read one of the plan 002 §7 P9 desktop-credential vectors — the SAME files
-/// the Go agent runner (`cmd/shed-host-agent/golden_test.go`), the Rust client
-/// (`crates/shed-app`), and the Swift client read. Lives outside the tests
+/// the Go agent runner (`cmd/shed-host-agent/golden_test.go`) and the Rust
+/// client (`crates/shed-app`) read. Lives outside the tests
 /// module so `desktop.rs`'s live-server golden shares it.
 #[cfg(test)]
 pub(crate) fn desktop_fixture(name: &str) -> serde_json::Value {
@@ -788,9 +788,8 @@ mod tests {
 
     // --- plan 002 §7 P9: the shared desktop-credential wire vectors ---------
     //
-    // The SAME files the Go agent runner (cmd/shed-host-agent/golden_test.go),
-    // the Rust client (crates/shed-app), and the Swift client
-    // (desktop/Tests/ShedKitTests/HostAgentCredentialFixtureTests.swift) read.
+    // The SAME files the Go agent runner (cmd/shed-host-agent/golden_test.go)
+    // and the Rust client (crates/shed-app) read.
     // This crate is only ever the AGENT, so it asserts the two directions an
     // agent owns: the frames it EMITS and the frame it DECODES. Which of those
     // frames a client may adopt is the clients' half of the same fixture.

@@ -10,8 +10,8 @@
 //! **Two things changed at the move, neither of them behaviour.**
 //!
 //! 1. [`MessageRing::append`] takes `now_unix_ms: i64` instead of a
-//!    `DateTime<Utc>` — `shed-core` is the dependency-clean crate (the Swift
-//!    staticlib and the Android build link it) and must not gain `chrono` for
+//!    `DateTime<Utc>` — `shed-core` is the dependency-clean crate (the Android
+//!    build links it) and must not gain `chrono` for
 //!    one `format!`. This crate still holds chrono for [`crate::fold`]'s
 //!    timestamp conversion, so its call sites simply pass
 //!    [`now_utc`]`().timestamp_millis()` and produce the same second-precision

@@ -12,8 +12,7 @@
 # The framework location is where the updater crate's build.rs looks (the dir
 # containing tauri.conf.json) and what tauri.macos.conf.json's
 # bundle.macOS.frameworks references. The .sparkle-dist tools are what the
-# release workflow uses to EdDSA-sign the DMG (the Swift job takes sign_update
-# from SwiftPM artifacts; the Tauri job has none, so it comes from here).
+# release workflow uses to EdDSA-sign the DMG.
 #
 # Idempotent: skips the download when the framework is present and the stamp
 # file matches the pinned version + checksum.

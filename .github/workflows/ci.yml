@@ -37,7 +37,6 @@ jobs:
     outputs:
       go: ${{ steps.filter-go.outputs.go }}
       rust: ${{ steps.filter.outputs.rust }}
-      desktop: ${{ steps.filter.outputs.desktop }}
       tauri: ${{ steps.filter.outputs.tauri }}
       packaging: ${{ steps.filter.outputs.packaging }}
       harness: ${{ steps.filter.outputs.harness }}
@@ -66,7 +65,7 @@ jobs:
               - '!docs/**'
               # docs toolchain: zensical.toml plus the uv project that exists
               # only to install it. A theme bump touches pyproject.toml and
-              # uv.lock and nothing else -- without these the whole Go/Swift/
+              # uv.lock and nothing else -- without these the whole Go/
               # Tauri/deb matrix runs for a docs-only change.
               - '!zensical.toml'
               - '!pyproject.toml'
@@ -81,9 +80,6 @@ jobs:
               # craze release the images bake, read by the craze-binaries
               # composite action and make check-craze-pin.
               - 'craze-pin.env'
-            desktop:
-              - 'desktop/**'
-              - 'crates/**'
             tauri:
               - 'desktop/tauri/**'
               - 'crates/**'
@@ -511,75 +507,23 @@ jobs:
 
   # ---- desktop / crates legs (imported from shed-desktop's ci.yml) ----------
 
-  swift:
-    name: swift · build · test · e2e
+  core-mac:
+    name: core-mac
     needs: changes
-    timeout-minutes: 45  # normally 15-17 min; a hang once ran this job for 6 h
-    if: ${{ needs.changes.outputs.desktop == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true' }}
+    timeout-minutes: 30
+    # The Rust core workspace on macOS: shed-host-agent's Touch ID gate and the
+    # other cfg(target_os = "macos") paths only compile and run here. core-linux
+    # covers the Linux side.
+    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true' }}
     runs-on: macos-15
-    defaults:
-      run:
-        working-directory: desktop
     steps:
       - uses: actions/checkout@v6
-      - name: Swift toolchain
-        run: swift --version
       - name: Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustc --version && cargo --version
-      - name: Build (Rust core + Swift)
-        # `make build` runs scripts/build-core.sh (staticlib + UniFFI bindings +
-        # xcframework) before `swift build` — the .binaryTarget path must exist.
-        run: make build
-      - name: Rust core — test + clippy
-        run: make core-test core-lint
-      - name: Swift unit tests
-        run: make test
-      - name: Bundle
-        run: ./scripts/bundle.sh debug
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-      - name: Hermetic E2E (Rust core — default)
-        # Default-on since M0: with no flag the Rust shed-core backs reads/
-        # lifecycle/create. Headless GUI launch via `open`; the screenshot op
-        # renders in-process so no screen-recording TCC grant is needed.
-        # wait_alive asserts identify.core=rust, and a Rust-adapter construction
-        # failure now fails the host loudly (no silent Swift fallback), so a
-        # false-green can't slip through. Slower CI gets a wider wait budget.
-        run: SHED_DESKTOP_TEST_TIMEOUT_SCALE=4 uv run --group test pytest tools/shedtest -q
-      - name: Hermetic E2E (Swift fallback — SHED_DESKTOP_RUST_CORE=0)
-        # The rollback escape hatch (kept ≥2 releases): the legacy Swift URLSession
-        # path. wait_alive asserts identify.core=swift, so the fallback stays
-        # reachable and green.
-        run: SHED_DESKTOP_RUST_CORE=0 SHED_DESKTOP_TEST_TIMEOUT_SCALE=4 uv run --group test pytest tools/shedtest -q
-      - name: M0 ship-gates (arm64 + cold-launch + golden cross-backend byte-diff)
-        # The deferred Phase-1 safety nets for the default flip: arm64-only Mach-Os,
-        # a cold-launch budget, and a BYTE-IDENTICAL Rust-vs-Swift IPC payload diff
-        # (the cross-backend parity guard). Runs against the debug bundle here for a
-        # continuous per-PR guard; `make m0-gates` runs the same checks on a release
-        # bundle for the pre-ship size budget. A slower CI runner gets a wider
-        # cold-launch budget.
-        #
-        # Size budget is a wider 70 MB here because this measures the *unstripped
-        # debug* bundle, whose size tracks the CI Swift/Xcode toolchain (the same
-        # branch is ~52 MB locally). The shipped artifact is the *release* bundle,
-        # tightly gated at 20 MB by `make m0-gates` — this coarse debug tripwire only
-        # needs to catch an explosion, not shave megabytes.
-        run: >
-          SHED_DESKTOP_TEST_TIMEOUT_SCALE=4
-          SHED_DESKTOP_COLD_LAUNCH_BUDGET_S=30
-          SHED_DESKTOP_SIZE_BUDGET_MB=70
-          uv run --group test python tools/shedtest/m0_ship_gates.py
-      - name: Real-launch smoke
-        # Non-test launch on a fresh runner (undetermined notification auth) —
-        # exercises the real SystemNotificationPresenter path the hermetic suite
-        # can't reach. Regression guard for the v0.0.2 SIGTRAP (issue #2).
-        run: ./scripts/smoke-real-launch.sh
-      - name: Launch/reopen window smoke
-        # Real launch path the hermetic suite gates off: a user launch opens the
-        # dashboard and reopening the running app reaches it. Guards issue #4.
-        run: ./scripts/smoke-launch-window.sh
+      - name: Rust core — test + clippy (macOS)
+        run: make -C desktop core-test core-lint
 
   core-linux:
     name: core-linux (${{ matrix.arch }})
@@ -621,8 +565,7 @@ jobs:
           fi
           sudo timeout 300 apt-get install -y build-essential
       - name: shed-core + shed-opencode — test + clippy (Linux)
-        # Scoped to -p so the macOS-only shed-core-ffi (uniffi) is never dragged
-        # in. --all-targets runs the pinned-TLS verifier + redirect/non-https
+        # Scoped to -p. --all-targets runs the pinned-TLS verifier + redirect/non-https
         # fail-closed tests here; the e2e's plain-HTTP mock never exercises the
         # pin/token paths, so they stay cargo-only on Linux.
         #
@@ -947,7 +890,7 @@ jobs:
           SHED_CRAZE_BIN_DIR: /work/desktop/tools/shedtest/.craze-bin
         run: make -C desktop tauri-test-linux
       # The render gate: builds the frontend + the Tauri app and runs the
-      # --target tauri hermetic e2e on WebKitGTK 2.44 under Xvfb (the pinned
+      # the hermetic e2e on WebKitGTK 2.44 under Xvfb (the pinned
       # WebView = the real CSS/render gate). GitHub runners allow privileged
       # docker run for the WebKitGTK web-process sandbox.
       - name: Tauri render gate + hermetic E2E (WebKitGTK)
@@ -959,7 +902,7 @@ jobs:
   tauri-mac:
     name: tauri-mac
     needs: changes
-    timeout-minutes: 60  # normally 26-28 min; same macOS runner hang risk as swift
+    timeout-minutes: 60  # normally 26-28 min; macOS runners have hung for hours
     if: ${{ needs.changes.outputs.tauri == 'true' || needs.changes.outputs.harness == 'true' || needs.changes.outputs.ci == 'true' }}
     runs-on: macos-15
     steps:
@@ -995,8 +938,8 @@ jobs:
           shed-path: ${{ github.workspace }}
           out-dir: ${{ runner.temp }}/craze-bin
       - name: Hermetic Tauri E2E (macOS WKWebView)
-        # A wider timeout scale buys headroom on a shared CI runner (as the swift
-        # + tauri-linux legs do). WKWebView needs no Xvfb; the mac screenshot op is
+        # A wider timeout scale buys headroom on a shared CI runner (as the
+        # tauri-linux leg does). WKWebView needs no Xvfb; the mac screenshot op is
         # TCC-gated so it's skipped here (the WebKitGTK leg is the screenshot gate).
         run: SHED_TAURI_TEST_TIMEOUT_SCALE=4 make -C desktop e2e-tauri
       - name: Bundle smoke (Sparkle staging + ordered re-sign + plist/signing assertions)
@@ -1010,14 +953,15 @@ jobs:
         working-directory: desktop
         run: |
           set -euo pipefail
+          PINNED_EDKEY="ROs7kN5cyTTVpMUriF1B/RZ/BaV/HJeOC8gMbBjDw+4="
           die() { echo "::error::$1"; exit 1; }
           assert_bundle() {
             local expect_ver="$1"
             local app="build/ShedDesktop.app"
             local plist="${app}/Contents/Info.plist"
             [ -d "${app}" ] || die "${app} missing"
-            # ShedDesktop.app named + bundle id aligned to the Swift app (so the
-            # eventual Swift->Tauri hop is a same-identity in-place Sparkle update).
+            # ShedDesktop.app named + the bundle id every shipped mac release has
+            # used, Swift-era included, so Sparkle updates stay in-place.
             local bid; bid="$(plutil -extract CFBundleIdentifier raw "${plist}")"
             [ "${bid}" = "ai.stridelabs.ShedDesktop" ] || die "CFBundleIdentifier ${bid} != ai.stridelabs.ShedDesktop"
             # CFBundleExecutable must name a real Mach-O under Contents/MacOS/.
@@ -1051,17 +995,17 @@ jobs:
             diff "${ent_dir}/bundled" "${ent_dir}/dist" >/dev/null \
               || die "Downloader.xpc entitlements differ from the pristine dist copy"
             rm -rf "${ent_dir}"
-            # The three Sparkle keys are present, and SUPublicEDKey matches the
-            # Swift app's Info.plist.template (a drift would break the EdDSA chain
-            # exactly at the Swift->Tauri hop).
+            # The three Sparkle keys are present, and SUPublicEDKey is the
+            # pinned key every shipped DMG has been signed for, Swift-era
+            # releases included. A different key would break the EdDSA chain
+            # for every installed copy, so it must never change silently.
             local k
             for k in SUFeedURL SUPublicEDKey SUEnableAutomaticChecks; do
               plutil -extract "${k}" raw "${plist}" >/dev/null 2>&1 || die "Info.plist missing ${k}"
             done
-            local app_edkey tmpl_edkey
+            local app_edkey
             app_edkey="$(plutil -extract SUPublicEDKey raw "${plist}")"
-            tmpl_edkey="$(plutil -extract SUPublicEDKey raw Resources/Info.plist.template)"
-            [ "${app_edkey}" = "${tmpl_edkey}" ] || die "SUPublicEDKey ${app_edkey} != template ${tmpl_edkey}"
+            [ "${app_edkey}" = "${PINNED_EDKEY}" ] || die "SUPublicEDKey ${app_edkey} != pinned ${PINNED_EDKEY}"
             # The ordered re-sign must produce a strictly-valid bundle.
             codesign --verify --strict "${app}" || die "codesign --verify --strict failed"
             echo "bundle smoke OK: id=${bid} exec=${exec} ver=${cfv}/${cfsv} edkey=${app_edkey}"
@@ -1097,12 +1041,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, pins, release-snapshot, server-deb-upgrade, swift, core-linux, host-agent-diff, machine-transport, integration-units, deb, images, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, pins, release-snapshot, server-deb-upgrade, core-mac, core-linux, host-agent-diff, machine-transport, integration-units, deb, images, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.server-deb-upgrade.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.images.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.server-deb-upgrade.result }} ${{ needs.core-mac.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.images.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in

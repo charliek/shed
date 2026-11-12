@@ -1,18 +1,13 @@
 """The Agents pane: the roost tabs on every listed host, and the ops that
 list, launch, close and inject them.
 
-**Tauri-only, and roost-backed, since S6** (`charliek/shed#328`). A shed's agent
+**Roost-backed since S6** (`charliek/shed#328`). A shed's agent
 sessions used to be a UNION — the hub's rows, listed by ssh'ing `shed-ext-rc`
 into the shed, beside the tabs its `roost-session` reported. The guest binary,
 the server's routes and the Go engine are gone, so what is left is the roost
 half: `rc.list` returns it, `rc.launch` is `roost.launch` addressed by
 `{shed, host?}` (an alias kept for 0.9.x), `rc.kill` is a `tab.close`, and
 `rc.inject_test` puts a row into the roost snapshot.
-
-That makes this suite tauri-only (`needs_agents`). The Swift app's Agents pane
-still shells `shed-ext-rc` and is retained pending demolition; it is not being
-re-pointed at roost, so driving it with these ops would be testing a client
-nobody ships against a binary that no longer exists.
 
 **Hermetic, and genuinely exercising the real code.** The app is launched with
 the test-mode `SHED_TAURI_ROOST_SOCKETS` seam — which swaps roost's SSH
@@ -39,12 +34,8 @@ import ui
 from client import ShedError, TauriClient
 from fake_roost import FakeRoost, ownership
 
-from _marks import needs_agents
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fake-host-agent"))
 from fake_host_agent import FakeHostAgent  # noqa: E402
-
-pytestmark = needs_agents
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -340,7 +331,7 @@ def test_inject_refuses_a_kind_roost_has_no_adapter_for(app, kind):
 
 # ---- render (the pane's own truth) ---------------------------------------
 
-def test_agents_pane_renders_an_injected_session(app, target):
+def test_agents_pane_renders_an_injected_session(app):
     """The Agents pane renders a row: the drivable `agents.dump` truth (which
     needs no display) + a window screenshot where the capture is available —
     macOS-tauri shells out to a Screen-Recording-TCC-gated tool, so the
@@ -351,7 +342,7 @@ def test_agents_pane_renders_an_injected_session(app, target):
     app.show_window()
     app.wait_until(lambda: "78" in {s["slug"] for s in app.agents_dump()},
                    timeout=20, what="agents.dump shows the injected session")
-    if not (target == "tauri" and platform.system() == "Darwin"):
+    if platform.system() != "Darwin":
         png, w, h = app.screenshot(scale=2)
         assert png[:8] == b"\x89PNG\r\n\x1a\n", "expected a PNG"
         assert w > 0 and h > 0

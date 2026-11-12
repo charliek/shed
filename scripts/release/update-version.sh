@@ -38,10 +38,9 @@
 #
 #   desktop     — the shed-desktop app (absorbed from the old shed-desktop
 #                 repo's scripts/release/update-version.sh). Bumps, in lockstep:
-#                 * desktop/VERSION            the macOS app's marketing version
-#                                              (bundle.sh + shedctl identify read
-#                                              it); drives the DMG + Sparkle
-#                                              appcast. The desktop ship selector.
+#                 * desktop/VERSION            the desktop app's marketing version;
+#                                              drives the DMG + Sparkle appcast.
+#                                              The desktop ship selector.
 #                 * crates/Cargo.toml          the Rust workspace
 #                                              ([workspace.package].version; every
 #                                              member inherits) + Cargo.lock regen.

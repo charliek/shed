@@ -1,13 +1,9 @@
-"""Cross-target E2E: the IPC ops the clients implement, driven through the
-`client` (target-appropriate) + `target` fixtures so one suite is the
-behavioral-parity gate. `identify` + a `screenshot` run on every target; the
-backend-dependent tests (sheds / lifecycle / create) carry `@needs_backend` and
-run on both `--target mac` + `--target tauri` — a regression on either leg fails
-its CI leg.
+"""Core E2E: identify, the shed list and the rendered dashboard, lifecycle
+(start / stop / delete), create (stream / cancel / error), and a screenshot.
 
-The dashboard-truth op differs per UI (mac `ui.state.sheds`, tauri
-`dashboard.dump.rows`) but is normalized by `client.dashboard_rows(target)` to
-`[{name, status, host}]`, so the assertions here are identical across targets.
+`client.dashboard_rows()` reads what the UI rendered (`dashboard.dump`),
+normalized to `[{name, status, host}]`, so these assert on the UI's truth rather
+than only the backend's.
 """
 
 from __future__ import annotations
@@ -16,52 +12,63 @@ import platform
 
 import pytest
 
-from _marks import needs_backend
-from client import ShedError
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-def test_identify_is_hermetic(client, target, mock):
+def test_identify_is_hermetic(client, mock):
     info = client.identify()
     assert info["test_mode"] is True
     assert info["mock_base_url"] == mock.base_url
-    if target == "tauri":
-        # The Rust-core client stamps its platform + socket name (shed-tauri.sock).
-        assert info["core"] == "rust"
-        assert info["platform"] == target
-        assert info["socket_path"].endswith(f"shed-{target}.sock")
-    else:
-        # The mac app also runs a Swift-fallback leg (SHED_DESKTOP_RUST_CORE=0),
-        # so don't pin the backend here; the M0 ship-gates own the rust==swift
-        # parity assertion. These fields are mac-only.
-        assert info["protocol_version"] == 1
-        assert info["app_id"] == "ai.stridelabs.ShedDesktop"
+    assert info["core"] == "rust"
+    assert info["platform"] == "tauri"
+    assert info["socket_path"].endswith("shed-tauri.sock")
 
 
-@needs_backend
 def test_sheds_list_matches_fixture(client):
-    client.sheds_refresh()  # re-sync to the reset mock (mac reads rendered state)
+    client.sheds_refresh()  # re-sync to the reset mock
     client.wait_until(lambda: len(client.sheds_list()) >= 2, timeout=10, what="sheds populated")
     names = sorted(s["name"] for s in client.sheds_list())
     assert names == ["callbell", "hello-world"]
 
 
-@needs_backend
-def test_dashboard_rows_match_fixture(client, target):
+def test_dashboard_rows_match_fixture(client):
     client.sheds_refresh()
     client.wait_until(
-        lambda: len(client.dashboard_rows(target)) >= 2, timeout=10, what="dashboard populated")
-    rows = {r["name"]: r for r in client.dashboard_rows(target)}
+        lambda: len(client.dashboard_rows()) >= 2, timeout=10, what="dashboard populated")
+    rows = {r["name"]: r for r in client.dashboard_rows()}
     assert set(rows) == {"hello-world", "callbell"}
     assert rows["hello-world"]["status"] == "running"
     assert rows["callbell"]["status"] == "stopped"
-    # Both backends stamp the configured server name as the host.
+    # The configured server name is stamped as the host.
     assert all(r["host"] == "mock" for r in rows.values())
 
 
-@needs_backend
-def test_lifecycle_stop_start_delete(client, target):
+def test_null_sheds_is_an_empty_list_not_an_error(client, mock):
+    # A real shed-server answers `{"sheds": null}` when it has none. That decodes
+    # to an empty list, and the host is still reachable — not a host error.
+    mock.set_sheds(None)
+    client.sheds_refresh()
+    client.wait_until(lambda: client.dashboard_rows() == [], timeout=10,
+                      what="dashboard empty")
+    assert client.sheds_list() == []
+    assert client.dashboard_dump()["host_errors"] == []
+    assert client.sheds_host_errors() == []
+
+
+def test_sheds_list_carries_image_and_digest(client):
+    # A shed created from the server's default image carries only `image_digest`
+    # (no `image` label); one created from an alias carries both.
+    client.sheds_refresh()
+    client.wait_until(lambda: len(client.sheds_list()) >= 2, timeout=10, what="sheds populated")
+    sheds = {s["name"]: s for s in client.sheds_list()}
+    assert not sheds["callbell"].get("image"), sheds["callbell"]
+    assert sheds["callbell"]["image_digest"].startswith("sha256:")
+    assert sheds["hello-world"]["image"] == "full"
+    assert sheds["hello-world"]["image_digest"].startswith("sha256:")
+
+
+def test_lifecycle_stop_start_delete(client):
     client.sheds_refresh()
     client.wait_until(lambda: len(client.sheds_list()) >= 2, timeout=10, what="sheds populated")
 
@@ -75,7 +82,7 @@ def test_lifecycle_stop_start_delete(client, target):
 
     # after a refresh, the UI-truth dashboard reflects both
     client.sheds_refresh()
-    dump = {r["name"]: r for r in client.dashboard_rows(target)}
+    dump = {r["name"]: r for r in client.dashboard_rows()}
     assert dump["hello-world"]["status"] == "stopped"
     assert dump["callbell"]["status"] == "running"
 
@@ -87,8 +94,7 @@ def test_lifecycle_stop_start_delete(client, target):
     )
 
 
-@needs_backend
-def test_create_streams_to_complete(client, target):
+def test_create_streams_to_complete(client):
     cid = client.create_start("shared-created", image="base")
     client.wait_until(
         lambda: client.create_status(cid).get("state") == "complete",
@@ -102,28 +108,35 @@ def test_create_streams_to_complete(client, target):
 
     # the new shed shows up in the dashboard after a refresh
     client.sheds_refresh()
-    assert "shared-created" in {r["name"] for r in client.dashboard_rows(target)}
+    assert "shared-created" in {r["name"] for r in client.dashboard_rows()}
 
 
-@needs_backend
+def test_create_sends_the_chosen_image(client, mock):
+    cid = client.create_start("picked", image="base")
+    client.wait_until(lambda: client.create_status(cid).get("state") == "complete",
+                      timeout=15, what="create complete")
+    # The image reached the create request...
+    assert mock.last_create()["image"] == "base"
+    # ...and the created shed reports it.
+    client.sheds_refresh()
+    client.wait_until(lambda: any(s["name"] == "picked" for s in client.sheds_list()),
+                      timeout=10, what="created shed listed")
+    created = {s["name"]: s for s in client.sheds_list()}["picked"]
+    assert created["image"] == "base"
+
+
 def test_create_cancel_drops_it(client):
     cid = client.create_start("cancelme")
     client.create_cancel(cid)
-    # After cancel the store entry is gone (whether or not it had completed):
-    # the Tauri client's create.status reports {"state": "unknown"}; the mac app
-    # raises not-found. Either outcome proves the create was dropped.
-    try:
-        assert client.create_status(cid).get("state") == "unknown"
-    except ShedError as e:
-        assert e.code == "not-found"
+    # After cancel the store entry is gone (whether or not it had completed), so
+    # create.status reports {"state": "unknown"}.
+    assert client.create_status(cid).get("state") == "unknown"
 
 
-@needs_backend
 def test_create_error_surfaced(client, mock):
     # A server-side create failure surfaces as an `error` state carrying the
-    # message — the cross-target parity of the mac-only
-    # test_lifecycle::test_create_error_surfaced. The shared shed-app CreateStore
-    # folds the SSE error event into state=error the same way the mac backend does.
+    # message: the shed-app CreateStore folds the SSE error event into
+    # state=error.
     mock.create_should_fail = True
     cid = client.create_start("doomed")
     client.wait_until(
@@ -136,15 +149,15 @@ def test_create_error_surfaced(client, mock):
     assert "doomed" in (st.get("error") or "")
 
 
-def test_screenshot_returns_non_empty_png(client, target):
+def test_screenshot_returns_non_empty_png(client):
     # Deliberately lenient — "a non-empty PNG of expected dimensions" — so the
     # gate isn't coupled to a container's GL stack (dashboard_rows is the truth
     # op). Tauri shells out to a screenshot tool; on macOS that's screencapture,
     # which is Screen-Recording-TCC-gated for a harness-launched binary, so the
-    # Linux/Xvfb capture is the real gate and mac-tauri is skipped.
-    if target == "tauri" and platform.system() == "Darwin":
-        pytest.skip("tauri screenshot on macOS is Screen-Recording-TCC-gated; Linux/Xvfb is the gate")
-    # Front the window so the capture has the app on screen (both targets have it).
+    # Linux/Xvfb capture is the real gate and macOS skips.
+    if platform.system() == "Darwin":
+        pytest.skip("screenshot on macOS is Screen-Recording-TCC-gated; Linux/Xvfb is the gate")
+    # Front the window so the capture has the app on screen.
     client.show_window()
 
     captured: dict = {}

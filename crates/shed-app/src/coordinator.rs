@@ -1,7 +1,6 @@
-//! The approval coordinator — the security heart, ported from `AppModel`'s M3
-//! section. A single-task mpsc **actor**: all of `pending`/`session_grants`/
-//! `policy` mutate on one serialized task, reproducing the mac `@MainActor`
-//! semantics. External callers send `Command`s over a channel; the actor
+//! The approval coordinator — the security heart. A single-task mpsc
+//! **actor**: all of `pending`/`session_grants`/`policy` mutate on one
+//! serialized task. External callers send `Command`s over a channel; the actor
 //! processes them one at a time.
 //!
 //! The gate (§2.2 crux): `decide_approval` NEVER awaits the `AuthGate` inline in

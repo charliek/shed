@@ -1,5 +1,5 @@
 # Seed shed config for the hermetic E2E harness. In test mode the app
-# overrides every host's base URL with SHED_DESKTOP_MOCK_BASE_URL, so the
+# overrides every host's base URL with SHED_TAURI_MOCK_BASE_URL, so the
 # host/port here are placeholders — only the server name ("mock") and the
 # single-host shape matter (one host = no duplicate-shed confusion).
 servers:

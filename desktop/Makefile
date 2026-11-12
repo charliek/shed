@@ -1,12 +1,11 @@
 # shed-desktop — common dev tasks. Run `make` (or `make help`) to list them.
 #
-# A native macOS menu-bar app for the shed toolchain. SwiftUI + an
-# in-process JSON IPC socket that `shedctl` and the pytest harness drive,
-# so changes can be verified (and screenshotted) without a human clicking.
+# The shed desktop app: a Tauri client (macOS + Linux) over the shared Rust
+# core in ../crates, with an in-process JSON IPC socket that `shedctl` and the
+# pytest harness drive, so changes can be verified (and screenshotted) without a
+# human clicking.
 
 .DEFAULT_GOAL := help
-
-APP := build/ShedDesktop.app
 
 # The desktop package lives at <monorepo>/desktop; the shared Rust core is the
 # sibling <monorepo>/crates workspace. REPO_ROOT is the monorepo root — the
@@ -30,31 +29,23 @@ help:  ## List available targets
 	  | sort \
 	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
-# ---- build ------------------------------------------------------------
+# ---- everyday aliases ---------------------------------------------------
+# The short names point at the Tauri client + the Rust core, so the obvious
+# commands do the obvious thing. Each one is a plain alias for the target named
+# in its help text.
 
-.PHONY: build bundle dmg run
-build: core  ## swift build the package
-	swift build
-
-bundle:  ## Build + assemble ShedDesktop.app (debug)
-	./scripts/bundle.sh debug
-
-dmg:  ## Build a release bundle + package a drag-install DMG
-	./scripts/bundle.sh release
-	./scripts/make-dmg.sh
-
-run: bundle  ## Build the bundle and launch it
-	open $(APP)
+.PHONY: build test lint fmt e2e run
+build: tauri-build  ## Alias: tauri-build
+test: core-test tauri-test  ## Alias: core-test + tauri-test (cargo unit tests)
+lint: core-lint tauri-lint  ## Alias: core-lint + tauri-lint (clippy, deny warnings)
+fmt: core-fmt  ## cargo fmt the Rust core + the Tauri crate
+	cd tauri/src-tauri && cargo fmt
+e2e: e2e-tauri  ## Alias: e2e-tauri (the hermetic pytest harness)
+run: tauri-run  ## Alias: tauri-run
 
 # ---- rust core --------------------------------------------------------
-# The Swift package links a static xcframework generated from the Rust core, so
-# `core` must run before any bare `swift build`/`swift test` (build/test depend
-# on it; bundle.sh builds it itself). See plans/phase-1-rust-core.md.
 
-.PHONY: core core-test core-lint core-fmt core-linux
-core:  ## Build the Rust core + generate Swift UniFFI bindings (xcframework)
-	./scripts/build-core.sh debug
-
+.PHONY: core-test core-lint core-fmt core-linux
 core-test:  ## cargo test the Rust core workspace (+ the non-default `broker` feature)
 	cd ../crates && cargo test
 	# `broker` (the embedded host-agent bridge) is non-default, so a bare
@@ -126,13 +117,10 @@ tauri-lint: sparkle-framework
 tauri-test: sparkle-framework
 endif
 
-# NOTE: `dmg` (Swift) and `tauri-dmg-mac` (Tauri) write the SAME outputs —
-# build/ShedDesktop.app + build/ShedDesktop-<ver>.dmg — building one clobbers
-# the other's artifacts.
 tauri-bundle-mac: sparkle-framework  ## Build + sign the Tauri mac app -> build/ShedDesktop.app
 	./scripts/bundle-tauri-mac.sh
 
-tauri-dmg-mac: tauri-bundle-mac  ## Tauri mac bundle + drag-install DMG (reuses make-dmg.sh; clobbers the Swift `dmg` outputs)
+tauri-dmg-mac: tauri-bundle-mac  ## Tauri mac bundle + drag-install DMG -> build/ShedDesktop-<ver>.dmg
 	./scripts/make-dmg.sh
 
 tauri-ui-build:  ## Type-check + unit-test + build the Vite/React frontend bundle (tauri/ui/dist)
@@ -157,7 +145,7 @@ tauri-lint: tauri-ui-build  ## clippy the Tauri client (its own standalone works
 tauri-test: tauri-ui-build  ## cargo test the Tauri client locally (its standalone workspace; the cross-platform dbus_notify race tests etc. — Linux-only approval-seam tests run under tauri-test-linux)
 	cd tauri/src-tauri && cargo test
 
-# The render gate: build the Tauri Rust app + run the --target tauri e2e on
+# The render gate: build the Tauri Rust app + run the hermetic e2e on
 # ubuntu:24.04 / WebKitGTK 2.44 under Xvfb, so the oklch linen theme + the
 # drivability probes + the scrot screenshot are verified on the real shipped
 # WebView (a static CSS denylist would be miscalibrated — 2.44 supports oklch,
@@ -203,7 +191,7 @@ tauri-build-linux: tauri-ui-build  ## Render gate: Tauri e2e on ubuntu:24.04 + W
 	      -cf - crates desktop/tauri desktop/tools desktop/Resources desktop/pyproject.toml desktop/uv.lock | tar -C /work -xf -; \
 	    cd /work/desktop && (cd tauri/src-tauri && cargo build --locked) && \
 	    xvfb-run -a --server-args="-screen 0 1400x900x24" \
-	      uv run --group test pytest tools/shedtest --target tauri -q -p no:cacheprovider'
+	      uv run --group test pytest tools/shedtest -q -p no:cacheprovider'
 
 # The Tauri Rust crate's unit tests on Linux (the platform where the polkit
 # AuthGate + libnotify Notifier are compiled): asserts the gate is fail-closed
@@ -243,34 +231,9 @@ core-linux:  ## Build+test shed-core on Linux in Docker (ubuntu:24.04; ring need
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test e2e e2e-ci e2e-swift e2e-tauri m0-gates smoke smoke-real-launch smoke-launch-window
-test: core  ## swift test (ShedKit unit tests + Rust FFI canary)
-	swift test
-
-e2e:  ## pytest functional harness against a running/auto-launched app
-	uv run --group test pytest tools/shedtest
-
-e2e-ci: bundle  ## E2E at CI parity: fresh, test-mode, hermetic mock (Rust core, default)
-	SHED_DESKTOP_TEST_MODE=1 SHED_DESKTOP_TEST_TIMEOUT_SCALE=4 uv run --group test pytest tools/shedtest -q
-
-e2e-swift: bundle  ## E2E with the Rust core forced off (SHED_DESKTOP_RUST_CORE=0 fallback leg)
-	SHED_DESKTOP_TEST_MODE=1 SHED_DESKTOP_RUST_CORE=0 SHED_DESKTOP_TEST_TIMEOUT_SCALE=4 uv run --group test pytest tools/shedtest -q
-
-m0-gates:  ## M0 ship-gates (release bundle): arm64/size/cold-launch + golden cross-backend byte-diff
-	./scripts/bundle.sh release
-	SHED_DESKTOP_SIZE_BUDGET_MB=20 uv run --group test python tools/shedtest/m0_ship_gates.py
-
-e2e-tauri: tauri-build  ## Tauri e2e: shared suite + test_tauri at --target tauri (needs a display; Xvfb on Linux)
-	uv run --group test pytest tools/shedtest --target tauri -q
-
-smoke:  ## Drive the app and capture labeled screenshots
-	tools/screenshot/smoke.sh
-
-smoke-real-launch: bundle  ## Non-test launch survival check (real notification path, issue #2)
-	./scripts/smoke-real-launch.sh
-
-smoke-launch-window: bundle  ## Non-test launch/reopen window behavior (issue #4)
-	./scripts/smoke-launch-window.sh
+.PHONY: e2e-tauri
+e2e-tauri: tauri-build  ## Tauri e2e: the hermetic pytest harness (needs a display; Xvfb on Linux)
+	uv run --group test pytest tools/shedtest -q
 
 # ---- docs -------------------------------------------------------------
 
@@ -281,14 +244,8 @@ docs:  ## Build the mkdocs site into site-build/
 docs-serve:  ## Serve the docs locally with live reload
 	uv run --locked --group docs zensical serve
 
-# ---- lint / format ----------------------------------------------------
+# ---- clean ------------------------------------------------------------
 
-.PHONY: fmt lint clean
-fmt:  ## Format Swift sources with swift-format
-	swift format format -i -r Sources Tests
-
-lint:  ## Lint Swift sources with swift-format
-	swift format lint -r Sources Tests
-
+.PHONY: clean
 clean:  ## Remove build artifacts
-	rm -rf .build build site-build
+	rm -rf build site-build

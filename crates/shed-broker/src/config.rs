@@ -17,8 +17,8 @@
 //! sequences, flow maps, and malformed-input detection the line/colon reader
 //! could not, which the shipped `configs/extensions.example.yaml` (block-style
 //! `registries:`) actually needs. See `crates/CLAUDE.md` for the carve-out;
-//! shed-core's own `yaml_lite` (a separate crate, Swift byte-parity test) stays
-//! hand-rolled.
+//! shed-core's own `yaml_lite` (a separate crate, with its own parity fixture)
+//! stays hand-rolled.
 
 use std::collections::BTreeMap;
 use std::io;

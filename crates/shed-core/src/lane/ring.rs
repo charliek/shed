@@ -29,8 +29,8 @@
 //!    you are not holding a complete history, refetch rather than splice.
 //! 3. **No `chrono`.** [`MessageRing::append`] takes `now_unix_ms: i64` and
 //!    formats a missing `ts` through [`crate::roost::rfc3339_z`]. `shed-core` is
-//!    the dependency-clean crate — it is what the Swift staticlib and the
-//!    Android build link — and pulling a date-time crate down here for one
+//!    the dependency-clean crate — it is what the Android build links — and
+//!    pulling a date-time crate down here for one
 //!    `format!` is exactly the invariant plan 017 §3.1 #10 forbids. Callers that
 //!    already hold a `DateTime<Utc>` pass `…timestamp_millis()`.
 

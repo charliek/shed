@@ -1,17 +1,14 @@
 //! Host discovery: parse `~/.shed/config.yaml` — the multi-host server list that
-//! shed and shed-remote-agent both read. A faithful Rust port of the Swift
-//! `ShedConfig` (`Sources/ShedKit/Models/ShedConfig.swift`): a deliberately tiny
+//! shed and shed-remote-agent both read: a deliberately tiny
 //! indentation-aware reader scoped to the machine-generated shape
 //! (`servers: {NAME: {host, http_port, ssh_port, control_token, api_url,
 //! tls_cert_fingerprint, auth_mode, client_cert_file, client_key_file,
-//! client_cert_expires_at}}` + `default_server`), so neither client takes on a
+//! client_cert_expires_at}}` + `default_server`), so no client takes on a
 //! YAML dependency. The GTK client (M2) reads secure/token-gated Linux hosts through
 //! this, so it carries **all** per-server fields — not just host/ports.
 //!
-//! A cross-language parity test (`fixtures/config_sample.yaml`) pins this parser
-//! byte-for-byte against the Swift one — the config analog of Phase 1's
-//! golden-JSON backbone — until the Swift parser is retired (the two coexist for
-//! now; see `docs/enhancements.md`).
+//! A parity fixture (`fixtures/config_sample.yaml`) pins this parser's output —
+//! the config analog of Phase 1's golden-JSON backbone.
 
 /// One server entry from `~/.shed/config.yaml`.
 ///
@@ -114,9 +111,8 @@ impl ShedServerEntry {
 
     /// Resolve the control-plane endpoint the client should dial: the https
     /// `api_url` (with its pinned cert) when it's a valid http(s) URL with a
-    /// host, else plain `http://host:http_port`. Mirrors Swift's
-    /// `resolvedEndpoint()` — the resolution whose absence once dialed the dead
-    /// `:8080` instead of the secure `:8443`.
+    /// host, else plain `http://host:http_port` — the resolution whose absence
+    /// once dialed the dead `:8080` instead of the secure `:8443`.
     pub fn resolved_endpoint(&self) -> ResolvedEndpoint {
         if !self.api_url.is_empty() && is_http_url_with_host(&self.api_url) {
             ResolvedEndpoint {
@@ -133,9 +129,8 @@ impl ShedServerEntry {
 }
 
 /// True iff `s` is an `http://`/`https://` URL with a non-empty, whitespace-free
-/// host — the observable subset of Swift's `URL(string:)` + scheme + host check
-/// that `resolvedEndpoint` relies on (a relative path, a non-http scheme, an
-/// empty host, or an unparseable string all fail, matching Swift's fallback).
+/// host — the check `resolved_endpoint` relies on (a relative path, a non-http
+/// scheme, an empty host, or an unparseable string all fail).
 fn is_http_url_with_host(s: &str) -> bool {
     let lower = s.to_lowercase();
     let rest = match lower
@@ -209,7 +204,7 @@ impl ShedConfig {
 
     /// Load + parse the config at `path`. A missing/unreadable file → an empty
     /// config (a degraded but non-fatal state the dashboard surfaces, never an
-    /// error) — mirrors Swift's `load`.
+    /// error).
     pub fn load(path: &str) -> Self {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::parse(&text),
@@ -297,8 +292,7 @@ impl ShedConfig {
 
 /// A deliberately tiny indentation-based reader. Handles exactly what
 /// `~/.shed/config.yaml` contains: nested maps and scalar leaves. Inline `{}` is
-/// an empty map; comments (`#`) and blank lines are skipped. A faithful port of
-/// Swift's `YAMLLite`.
+/// an empty map; comments (`#`) and blank lines are skipped.
 mod yaml_lite {
     use std::collections::HashMap;
 
@@ -415,7 +409,6 @@ mod tests {
 
     #[test]
     fn parses_servers_and_default() {
-        // Mirrors Swift's testConfigParsesServersAndDefault.
         let yaml = "\
 servers:
     mini2:
@@ -512,7 +505,7 @@ default_server: ghost
     #[test]
     fn malformed_api_url_falls_back_to_plain_http() {
         // Relative path, wrong scheme, no host, unparseable, host-with-space —
-        // all fall back to the plain endpoint (matches Swift's URL(string:) checks).
+        // all fall back to the plain endpoint.
         for bad in [
             "/api/info",
             "ftp://example.com:21",
@@ -537,9 +530,8 @@ default_server: ghost
         }
     }
 
-    /// Cross-language parity backbone: the Swift `ShedConfig` parser asserts the
-    /// SAME expected values against this SAME fixture (see
-    /// Tests/ShedKitTests/ConfigParityTests.swift). Keep the two in lockstep.
+    /// Parity backbone: the expected values for the shared
+    /// `fixtures/config_sample.yaml`. Keep the two in lockstep.
     #[test]
     fn parity_fixture_matches_expected() {
         let config = ShedConfig::parse(include_str!("../../fixtures/config_sample.yaml"));
@@ -578,10 +570,7 @@ default_server: ghost
         assert_eq!(minimal.resolved_endpoint().base_url, "http://minimal:8080");
     }
 
-    /// The `machines:` half of the same fixture (plan 009 C7). Swift does not
-    /// model the key and structurally ignores it (an unknown top-level entry in
-    /// `top`), which is why adding the block leaves `ConfigParityTests` passing
-    /// unchanged — the same lockstep argument the mtls fields made above.
+    /// The `machines:` half of the same fixture (plan 009 C7).
     #[test]
     fn parity_fixture_carries_the_machines_section() {
         let config = ShedConfig::parse(include_str!("../../fixtures/config_sample.yaml"));
@@ -705,9 +694,7 @@ default_server: mini2
         );
     }
 
-    /// The mtls half of the same fixture (plan 001 D6). Swift does not model
-    /// these keys yet and ignores them, which is why adding them to the shared
-    /// fixture leaves `ConfigParityTests` passing unchanged.
+    /// The mtls half of the same fixture (plan 001 D6).
     #[test]
     fn parity_fixture_carries_the_mtls_entry_fields() {
         use crate::token::AuthMode;

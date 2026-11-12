@@ -1,23 +1,17 @@
-# shed config — shared cross-language parity fixture.
-# The Rust `shed_core::config` parser (config.rs) and the Swift `ShedConfig`
-# parser (ShedConfig.swift) must produce identical results from this file.
+# shed config — the parity fixture for the Rust `shed_core::config` parser
+# (config.rs), whose `parity_fixture_*` tests pin what it parses from this file.
 # Exercises: multiple servers (sorted by name), default_server, a control token
 # present + absent, api_url + a mixed-case pin (lowercased), an inline comment,
 # an ignored field (added_at), and an inline empty map `{}` (all-defaults).
 #
 # The `secure` entry additionally carries the mtls credential keys a real entry
-# gets once its server runs `auth.mode: mtls` (plan 001 D6). The server SET is
-# unchanged on purpose: the Swift parser ignores keys it does not model, so its
-# ConfigParityTests keep passing byte-for-byte while the Rust parser asserts the
-# new fields — and `mini2`, which omits `auth_mode` entirely, pins the
-# absent-means-token rule.
+# gets once its server runs `auth.mode: mtls` (plan 001 D6) — and `mini2`,
+# which omits `auth_mode` entirely, pins the absent-means-token rule.
 #
 # The `machines:` block (plan 009 §3.3) is the Rust-owned native-RC-host section:
 # a full entry (`localmac`), a defaults-only one (`mini2box` — host falls back to
 # the entry name, ssh_port to 22, every optional to absent), and an inline empty
-# map (`bare`). The Swift parser does not model the key at all and structurally
-# ignores it (unknown top-level keys are just another entry in `top`), so
-# ConfigParityTests keeps passing byte-for-byte on the SERVER assertions it owns.
+# map (`bare`).
 default_server: mini2
 servers:
     mini2:

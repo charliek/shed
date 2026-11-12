@@ -8,22 +8,32 @@ don't leak across tests.
 
 from __future__ import annotations
 
-from _marks import needs_approvals
+import platform
+
 from client import ShedError
 
-# The approval spine is shared (mac + tauri); each test drives the
-# target-appropriate `client` fixture.
-pytestmark = needs_approvals
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
 def _pending_ids(client) -> set[str]:
     return {a["id"] for a in client.approvals_list()}
 
 
-def _pane(client, target) -> str | None:
-    """The pane the UI currently shows — the truth op differs per target (mac:
-    `ui.state.pane`; tauri: `ui.current_pane`)."""
-    return client.ui_state().get("pane") if target == "mac" else client.current_pane()
+def _assert_window_renders(client) -> None:
+    """A non-empty PNG of the dashboard. Linux/Xvfb only: on macOS the capture is
+    Screen-Recording-TCC-gated for a harness-launched binary."""
+    if platform.system() == "Darwin":
+        return
+    client.show_window()
+    shot: dict = {}
+
+    def grab() -> bool:
+        png, width, height = client.screenshot(scale=1)
+        shot.update(png=png, width=width, height=height)
+        return True
+
+    client.wait_until(grab, timeout=20, what="window screenshot")
+    assert shot["png"][:8] == PNG_MAGIC and shot["width"] > 0 and shot["height"] > 0
 
 
 def test_app_connected_to_host_agent(fake):
@@ -169,16 +179,14 @@ def test_notification_posted_and_invoked(client, fake):
     assert rid not in _pending_ids(client)
 
 
-def test_notification_open_navigates_to_approvals(client, fake, target):
+def test_notification_open_navigates_to_approvals(client, fake):
     # Tapping the banner body (not Approve/Deny) opens the dashboard on the
     # Approvals pane and leaves the request pending.
     client.navigate("sheds")
     rid = fake.emit_request("ssh-agent", "sign", "open-shed", "ssh-ed25519")
     client.wait_until(lambda: rid in _pending_ids(client), what="request queued")
     client.notification_open()
-    client.wait_until(lambda: _pane(client, target) == "approvals", what="navigated to approvals")
-    if target == "mac":
-        assert client.window_state().get("visible") is True
+    client.wait_until(lambda: client.current_pane() == "approvals", what="navigated to approvals")
     assert rid in _pending_ids(client)  # default tap doesn't decide it
     client.approval_decide(rid, "deny")  # cleanup
     client.wait_until(lambda: rid not in _pending_ids(client), what="cleanup resolved")
@@ -333,7 +341,7 @@ def test_expiry_fails_closed(client, fake):
 
 
 def test_disconnect_drops_pending_fail_closed(client, fake):
-    # F3 (coverage add over the mac suite): a host-agent disconnect drops ALL
+    # F3: a host-agent disconnect drops ALL
     # pending — the user can't act on, or persist a rule from, a stale prompt — and
     # a late decide is a no-op (the agent fails closed on its side regardless).
     hellos = fake.hello_count
@@ -343,10 +351,35 @@ def test_disconnect_drops_pending_fail_closed(client, fake):
     client.wait_until(lambda: rid not in _pending_ids(client), what="pending dropped on disconnect")
     # Wait for the client's backoff-reconnect (so later tests have a live channel).
     assert fake.wait_hello_count(hellos + 1), "client did not reconnect after the drop"
-    # A decide for the now-gone request never sends an approve to the host. The app
-    # either rejects it (mac: not-found) or silently no-ops (tauri) — both fail closed.
+    # A decide for the now-gone request never sends an approve to the host: the app
+    # either rejects it (not-found) or silently no-ops — both fail closed.
     try:
         client.approval_decide(rid, "approve")
     except ShedError as e:
         assert e.code in ("not-found", "not_found")
     assert fake.wait_response(rid, timeout=2) is None  # no late approve
+
+
+def test_approvals_pane_shows_a_pending_request(client, fake):
+    # The Approvals pane renders a real pending request, not just its empty state:
+    # the sidebar's pending badge (UI truth) counts it while the pane is up.
+    rid = fake.emit_request("ssh-agent", "sign", "shot-shed", "ssh-ed25519", server="mini3")
+    client.wait_until(lambda: rid in _pending_ids(client), what="request queued")
+    client.navigate("approvals")
+    client.wait_until(lambda: client.current_pane() == "approvals", what="approvals pane up")
+    client.wait_until(lambda: (client.badges() or {}).get("pending") == 1, timeout=15,
+                      what="pending badge counts the request")
+    _assert_window_renders(client)
+    client.approval_decide(rid, "deny")
+    client.wait_until(lambda: (client.badges() or {}).get("pending") == 0, timeout=15,
+                      what="pending badge cleared")
+
+
+def test_activity_pane_renders_streamed_events(client, fake):
+    fake.emit_event("aws-credentials", "get_credentials", "activity-shed", result="ok",
+                    server="mini3")
+    client.wait_until(lambda: any(e.get("shed") == "activity-shed" for e in client.activity_list()),
+                      what="event in the activity feed")
+    client.navigate("activity")
+    client.wait_until(lambda: client.current_pane() == "activity", what="activity pane up")
+    _assert_window_renders(client)

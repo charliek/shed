@@ -1,8 +1,5 @@
-# Swift / SPM
-.build/
+# Tauri mac bundle + DMG output (scripts/bundle-tauri-mac.sh, make-dmg.sh)
 build/
-*.xcodeproj
-.swiftpm/
 
 # Docs
 site-build/
@@ -16,10 +13,6 @@ tools/shedtest/.craze-bin/
 __pycache__/
 *.pyc
 .pytest_cache/
-
-# Rust core — generated FFI artifacts (the core build output lives under the
-# top-level crates/ workspace, ignored by the root .gitignore as crates/target/).
-artifacts/
 
 # shed-desktop .deb packaging staging + output (linux/scripts/build-deb.sh)
 dist/

@@ -1,12 +1,11 @@
-"""Thin JSON-IPC clients for a running shed-desktop UI (the mac app or the Tauri client).
+"""Thin JSON-IPC client for a running shed-desktop (Tauri) app.
 
-Both UIs speak the same newline-delimited JSON protocol over a Unix socket — the
-same contract `shedctl` uses. The wire (connect / `_readline` / `call` /
-`identify` / `wait_until`) and the ops the clients share (sheds.list /
-sheds.refresh / lifecycle / create) live on the `IPCClient` base, so one test
-driver can drive either target. Swift-only ops stay on `ShedDesktop`; the Tauri
-client adds the UI-truth op `dashboard.dump`. Request ids are string-wrapped
-int64 on the wire, ints here.
+The app speaks newline-delimited JSON over a Unix socket — the same contract
+`shedctl` uses. The wire (connect / `_readline` / `call` / `identify` /
+`wait_until`) and the core ops (sheds.list / sheds.refresh / lifecycle / create)
+live on the `IPCClient` base; `TauriClient` adds the rest of the op surface,
+grouped by the `_ApprovalOps` and `_RcOps` mixins. Request ids are
+string-wrapped int64 on the wire, ints here.
 """
 
 from __future__ import annotations
@@ -18,12 +17,8 @@ import socket
 import time
 
 # Scale every wait from one knob so a slower CI runner buys headroom without
-# editing each call site. Honor both targets' scale knobs (mac + tauri) and take
-# the largest, so a run under either CI leg gets its intended headroom.
-_TIMEOUT_SCALE = max(
-    float(os.environ.get("SHED_DESKTOP_TEST_TIMEOUT_SCALE", "1.0")),
-    float(os.environ.get("SHED_TAURI_TEST_TIMEOUT_SCALE", "1.0")),
-)
+# editing each call site.
+_TIMEOUT_SCALE = float(os.environ.get("SHED_TAURI_TEST_TIMEOUT_SCALE", "1.0"))
 
 
 def scaled_timeout(timeout: float) -> float:
@@ -45,7 +40,7 @@ class Timeout(ShedError):
 
 
 class IPCClient:
-    """The shared newline-JSON wire + the ops both targets implement."""
+    """The newline-JSON wire + the core shed ops."""
 
     def __init__(self, socket_path: str):
         self.path = str(socket_path)
@@ -93,7 +88,7 @@ class IPCClient:
         line, self._buf = self._buf.split(b"\n", 1)
         return line.decode()
 
-    # -- ops shared by both targets --------------------------------------
+    # -- core shed ops ----------------------------------------------------
     def identify(self) -> dict:
         return self.call("identify")
 
@@ -104,8 +99,7 @@ class IPCClient:
     def sheds_host_errors(self, host: str | None = None) -> list[dict]:
         """The per-host failures `sheds.list` carries beside the rows
         (`[{server, kind, summary, detail}]`) — a host that couldn't be listed is
-        surfaced, not silently dropped (shed#300). Tauri-only for now; absent on a
-        client that doesn't publish it → []."""
+        surfaced, not silently dropped (shed#300)."""
         params = {"host": host} if host else {}
         return self.call("sheds.list", params).get("host_errors", [])
 
@@ -113,14 +107,10 @@ class IPCClient:
         """Re-fetch + re-render the dashboard so the UI-truth op reflects it."""
         self.call("sheds.refresh")
 
-    def dashboard_rows(self, target: str) -> list[dict]:
-        """The sheds the UI currently shows (its rendered state), normalized to
-        `[{name, status, host}]`. The truth op differs per target: the mac app
-        exposes it as `ui.state.sheds`; the Tauri client as `dashboard.dump.rows`."""
-        if target == "mac":
-            rows = self.call("ui.state")["sheds"]
-        else:
-            rows = self.call("dashboard.dump")["rows"]
+    def dashboard_rows(self) -> list[dict]:
+        """The sheds the UI currently shows (its rendered state, from
+        `dashboard.dump`), normalized to `[{name, status, host}]`."""
+        rows = self.call("dashboard.dump")["rows"]
         return [{"name": r["name"], "status": r["status"], "host": r["host"]} for r in rows]
 
     def shed_action(self, action: str, name: str, host: str | None = None) -> None:
@@ -164,9 +154,7 @@ class IPCClient:
 
 class _ApprovalOps:
     """The credential-approval op surface (SSH-approval prefs / policy / approvals
-    / activity / notifications), shared by the mac app and the Tauri client — both
-    wire the same shed-core approval spine with identical op names + shapes.
-    `self.call` comes from the `IPCClient` base each mixes in with."""
+    / activity / notifications). `self.call` comes from the `IPCClient` base."""
 
     def set_ssh_approval(self, method: str | None = None, policy: str | None = None,
                          ttl: str | None = None) -> None:
@@ -283,85 +271,13 @@ class _RcOps:
         self.call("rc.inject_test", params)
 
 
-class ShedDesktop(_ApprovalOps, _RcOps, IPCClient):
-    """The macOS app's full op surface (drives the SwiftUI dashboard, the
-    approval gate, remote-control agents, prefs, and notifications)."""
-
-    # `sheds.refresh` reads more naturally as `refresh()` at the mac call sites
-    # that predate the shared base; keep the alias so those stay untouched.
-    def refresh(self) -> None:
-        self.sheds_refresh()
-
-    def ui_state(self) -> dict:
-        return self.call("ui.state")
-
-    def navigate(self, pane: str) -> dict:
-        return self.call("ui.navigate", {"pane": pane})
-
-    def show_window(self) -> None:
-        self.call("ui.show_window")
-
-    def hide_window(self) -> None:
-        self.call("ui.hide_window")
-
-    def show_create(self) -> None:
-        self.call("ui.show_create")
-
-    def show_launch(self) -> None:
-        self.call("ui.show_launch")
-
-    def open_menu(self, open_: bool) -> None:
-        self.call("ui.open_menu", {"open": open_})
-
-    def open_preferences(self) -> None:
-        self.call("ui.open_preferences")
-
-    def host_list(self) -> list[dict]:
-        return self.call("host.list")["hosts"]
-
-    def system_df(self) -> list[dict]:
-        return self.call("system.df")["usage"]
-
-    def images_list(self) -> list[dict]:
-        """Per-host image lists (`[HostImageList]`); each has host/images/error."""
-        return self.call("images.list")["images"]
-
-    # -- M1: lifecycle, create, terminal ---------------------------------
-    def terminal_preview(self, shed: str, host: str | None = None, session: str | None = None) -> dict:
-        params: dict = {"shed": shed}
-        if host:
-            params["host"] = host
-        if session:
-            params["session"] = session
-        return self.call("terminal.preview", params)
-
-    def window_metrics(self) -> dict:
-        return self.call("app.window_metrics")
-
-    def window_state(self) -> dict:
-        """Dashboard visibility + activation policy (issue #4 launch/reopen)."""
-        return self.call("ui.window_state")
-
-    def screenshot(self, surface: str = "window", scale: int = 1) -> tuple[bytes, int, int]:
-        r = self.call("app.screenshot", {"surface": surface, "scale": scale})
-        return base64.b64decode(r["png"]), r["width"], r["height"]
-
-
-class _RustCoreClient(IPCClient):
-    """The Rust-core subprocess client base (the Tauri client): a surface-less
-    `app.screenshot` (the mac app's takes a `surface` arg instead). The
-    sheds/lifecycle/create ops live on `IPCClient`, and the UI-truth
-    `dashboard.dump` is issued by `dashboard_rows(target)` there."""
+class TauriClient(_ApprovalOps, _RcOps, IPCClient):
+    """The Tauri client's op surface: the `IPCClient` core ops + the approval ops
+    (`_ApprovalOps`, B3) + the RC/Agents ops (`_RcOps`, B2) + the UI ops."""
 
     def screenshot(self, scale: int = 1) -> tuple[bytes, int, int]:
         r = self.call("app.screenshot", {"scale": scale})
         return base64.b64decode(r["png"]), r["width"], r["height"]
-
-
-class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
-    """The Tauri client's op surface: the shared Rust-core base + the approval ops
-    (`_ApprovalOps`, B3) + the RC/Agents ops (`_RcOps`, B2) + pane `navigate` and
-    `show_window`/`activate` (A0a)."""
 
     def navigate(self, pane: str) -> None:
         self.call("ui.navigate", {"pane": pane})
@@ -372,12 +288,11 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
     def show_preferences(self) -> None:
         """Open/focus the dedicated Preferences window (a singleton: created lazily
         on the first open, fronted if already open; closing it hides it). Does NOT
-        raise the dashboard (mac parity). `ui.open_preferences` is an equivalent
-        alias op (the mac op name)."""
+        raise the dashboard. `ui.open_preferences` is an equivalent alias op."""
         self.call("ui.show_preferences")
 
     def open_preferences(self) -> None:
-        """The `ui.open_preferences` alias (the mac op name) for show_preferences."""
+        """The `ui.open_preferences` alias for show_preferences."""
         self.call("ui.open_preferences")
 
     def prefs_dump(self) -> dict:
@@ -650,7 +565,7 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
                          session: str | None = None, preset: str | None = None,
                          template: str | None = None, machine: str | None = None) -> dict:
         """The ssh command + resolved preset/invocation that would open the shed —
-        no spawn. Same `terminal.preview` contract as the mac app (param key `shed`).
+        no spawn (param key `shed`).
 
         `machine` is the roost row's ask, and it is REFUSED server-side (plan 013:
         a machine row's attach is `native-remote`, so there is no tmux to attach)."""

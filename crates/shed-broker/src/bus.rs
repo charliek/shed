@@ -6,7 +6,7 @@
 //! response envelopes routed back to the originating shed. It reuses shed-core's
 //! transport primitives — the SSE framer (`shed_core::sse::SseParser`) and the
 //! leaf-cert TLS pin verifier (`shed_core::tls::pinned_client_config`) — over a
-//! reqwest+rustls client, so the wire behavior matches the Swift/Go clients byte
+//! reqwest+rustls client, so the wire behavior matches the Go clients byte
 //! for byte.
 //!
 //! Wire behavior mirrored from `hostclient.go` EXACTLY:
@@ -949,8 +949,8 @@ async fn read_error_body(mut resp: reqwest::Response, shutdown: &watch::Receiver
     String::from_utf8_lossy(&buf).trim().to_string()
 }
 
-/// Build the reqwest client. Fail-closed on a plaintext redirect (mirrors Swift's
-/// pinned session + shed-core's `build_http_client`); with a `pin` it installs the
+/// Build the reqwest client. Fail-closed on a plaintext redirect (mirrors
+/// shed-core's `build_http_client`); with a `pin` it installs the
 /// leaf-cert verifier. No global timeout — the SSE subscribe holds a long-lived
 /// connection, and shutdown/`ctx` cancellation bound it instead.
 /// A `client_certs` resolver, when the caller has a credential source that can produce a

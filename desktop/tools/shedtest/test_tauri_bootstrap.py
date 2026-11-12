@@ -1,5 +1,4 @@
 """Putting a `roost-session` on a shed, from the Tauri app (plan 019 S5).
-`--target tauri`.
 
 **Hermetic, and the real transports.** Everything else in this harness that
 touches roost uses `SHED_TAURI_ROOST_SOCKETS`, which swaps the SSH client-bridge
@@ -66,11 +65,6 @@ from client import ShedError, TauriClient, scaled_timeout
 from fake_host_agent import FakeHostAgent
 from fake_roost import ROOST_WIRED_AGENTS, SESSION_PROTOCOL, FakeRoost, vector
 from mockserver import MockShedServer
-
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SHED_TEST_TARGET", "mac") != "tauri",
-    reason="tauri-only: the mac app has no roost bootstrap surface",
-)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

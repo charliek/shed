@@ -5,9 +5,9 @@
 //! left-click events or icon geometry there (`tauri-2.11/src/tray/mod.rs`: "Linux:
 //! Unsupported"), so a rich anchored popover is impossible; a click opens the menu.
 //! On **macOS** the menu moves to **right-click** and a **left-click opens the rich
-//! popover** (B1b) — a second, opaque webview mirroring the Swift `MenuBarContentView`,
-//! anchored at the tray via `tauri-plugin-positioner`. Building the tray is best-effort
-//! (a headless / no-SNI host may have nowhere to show it), so a failure logs and the
+//! popover** (B1b) — a second, opaque webview anchored at the tray via
+//! `tauri-plugin-positioner`. Building the tray is best-effort (a headless /
+//! no-SNI host may have nowhere to show it), so a failure logs and the
 //! app keeps running — the dashboard window is always reachable.
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -27,7 +27,7 @@ pub const POPOVER_ID: &str = "popover";
 
 /// The popover is a fixed WIDTH; its height content-sizes — the webview measures its
 /// rendered content and reports it to `resize_popover` (clamped to these bounds), so
-/// the window hugs its content like the Swift `NSPopover` (no dead space). Built at
+/// the window hugs its content (no dead space). Built at
 /// MAX height so a silently-ignored `set_size` (a non-resizable-window regression)
 /// leaves the window tall and is caught by `tray.dump`'s reported height.
 #[cfg(target_os = "macos")]
@@ -93,7 +93,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     }
     // Icon. macOS: a monochrome TEMPLATE glyph (a black-on-transparent shippingbox
     // silhouette) + `icon_as_template(true)`, so the status item auto-tints for the
-    // light/dark menu bar and sizes to ~18pt — Swift `NSStatusItem` parity. The @2x
+    // light/dark menu bar and sizes to ~18pt, like a native status item. The @2x
     // (36px) asset renders crisp when tray-icon scales it to 18pt on retina. Falls
     // back to the colored window icon if the embedded template can't decode.
     // Elsewhere (Linux): the colored window icon — a template silhouette would render
@@ -117,9 +117,8 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
 }
 
 /// Update the menu-bar status-item title to the running-shed count (`" N"`, empty
-/// when zero) — Swift `updateStatusItemTitle` parity (`AppModel.swift`). Driven from
-/// `ui_report` when the dashboard (`main`) reports its shed list, so it tracks live
-/// like the Swift status item. macOS-only (Linux trays carry no title). A
+/// when zero). Driven from `ui_report` when the dashboard (`main`) reports its shed
+/// list, so it tracks live. macOS-only (Linux trays carry no title). A
 /// process-global cached count skips the native `set_title` on identical re-renders
 /// (`ui_report` fires every dashboard render — e.g. the Approvals pane's 1s tick).
 #[cfg(target_os = "macos")]

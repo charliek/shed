@@ -27,7 +27,6 @@ Outputs (all committed; CI does not regenerate):
         Icon Composer source; scripts/bundle-tauri-mac.sh compiles it with actool
     packaging/icons/hicolor/256x256/apps/shed-desktop.png   Linux .deb hicolor
     packaging/icons/hicolor/512x512/apps/shed-desktop.png   Linux .deb hicolor
-    Resources/AppIcon.icns                      Swift macOS app (iconutil)
 
 The tray-template*.png glyphs are NOT produced here — the menu-bar template is a
 separate black-on-transparent silhouette and stays as committed.
@@ -56,7 +55,6 @@ SVG = REF_DIR / "owl_logo_colored.svg"
 TAURI_ICONS = DESKTOP_ROOT / "tauri" / "src-tauri" / "icons"
 TAURI_APPICON_ICON = DESKTOP_ROOT / "tauri" / "src-tauri" / "AppIcon.icon"
 HICOLOR = DESKTOP_ROOT / "packaging" / "icons" / "hicolor"
-APPICON_ICNS = DESKTOP_ROOT / "Resources" / "AppIcon.icns"
 
 # --- Brand — tweak me (or pass --color/--bg/--eye) --------------------------
 DEFAULT_COLOR = "#FFFFFF"  # owl body (white)
@@ -251,9 +249,6 @@ def main() -> None:
     # Linux .deb hicolor PNGs.
     write_png(compose(owl, 256, bg), HICOLOR / "256x256" / "apps" / "shed-desktop.png")
     write_png(compose(owl, 512, bg), HICOLOR / "512x512" / "apps" / "shed-desktop.png")
-
-    # Swift macOS app icon.
-    build_icns(owl, bg, APPICON_ICNS)
 
     print("Done.")
 

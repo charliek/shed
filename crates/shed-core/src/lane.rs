@@ -487,9 +487,9 @@
 //!     `chrono`.** [`ring::MessageRing::append`] takes `now_unix_ms: i64` and
 //!     defaults a missing `ts` through [`crate::roost::rfc3339_z`]; callers that
 //!     hold a `DateTime<Utc>` pass `…timestamp_millis()`. The invariant this
-//!     protects is mechanical: `cargo tree -p shed-core-ffi` and
+//!     protects is mechanical:
 //!     `cargo tree -p shed-core --target aarch64-linux-android` must list no crate
-//!     they did not list before. `regex` was already a shed-core dependency, which
+//!     it did not list before. `regex` was already a shed-core dependency, which
 //!     is the only reason the ANSI stripper could come along. (Plan 025's parse
 //!     direction, [`crate::time`], keeps the same invariant: no date crate.)
 //! 11. **[`crate::roost::loopback_base_url`]** is roost's own rule, ported

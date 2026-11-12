@@ -6,7 +6,6 @@
 #   tauri/src-tauri/icons/{32x32,128x128,128x128@2x,icon.png,icon.icns,icon.ico,
 #                          Square30x30Logo,StoreLogo}
 #   packaging/icons/hicolor/{256x256,512x512}/apps/shed-desktop.png   (Linux .deb)
-#   Resources/AppIcon.icns                                            (Swift app)
 #
 # Change the brand colors (then commit the regenerated assets):
 #   ./packaging/icon/regenerate.sh --bg '#1F6FEB'

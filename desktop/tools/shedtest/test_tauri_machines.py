@@ -1,6 +1,5 @@
 """Machine targets in the Tauri app — read from each machine's `roost-session`
 (plan 013 S3, the Roost Pivot's first milestone; originally plan 012 S4).
-`--target tauri`.
 
 **Hermetic, and genuinely exercising the real code.** A machine's roost-session
 is reached over roost's SSH client-bridge, which a hermetic harness cannot do —
@@ -41,11 +40,6 @@ import pytest
 import ui
 from client import ShedError, TauriClient, scaled_timeout
 from fake_roost import FakeRoost, RoostWireError, roost_call
-
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SHED_TEST_TARGET", "mac") != "tauri",
-    reason="tauri-only: the mac app has no machine layer",
-)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

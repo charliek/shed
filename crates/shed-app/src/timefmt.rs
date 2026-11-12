@@ -1,5 +1,4 @@
-//! Flexible ISO-8601 timestamp parse/format, ported from shed-desktop's
-//! `DateFormatting.swift`.
+//! Flexible ISO-8601 timestamp parse/format.
 //!
 //! shed-server (and the host agent) render timestamps in more than one shape —
 //! `2026-05-31T13:33:00.884935839-05:00` (nanosecond fraction + local offset),
@@ -35,7 +34,7 @@ pub fn parse_unix(raw: &str) -> Option<i64> {
 }
 
 /// Format unix seconds as a plain ISO-8601 UTC string with a `Z` suffix and no
-/// fractional seconds — the wire `ts` format (matches Swift's `nowISO8601`).
+/// fractional seconds — the wire `ts` format.
 /// The Clock seam supplies "now"; this only formats it.
 pub fn format_iso8601(unix: i64) -> String {
     DateTime::<Utc>::from_timestamp(unix, 0)

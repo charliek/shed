@@ -3,8 +3,7 @@
 //! host agent's UDS. The shed-core `ControlTokenProvider` caches/refreshes
 //! around this and invalidates on a refusal; a fail-closed reply (its `error`
 //! set, or no credential) surfaces as an `Err`, so the FSM sends NOTHING — never
-//! a static downgrade (F6). Ports Swift's `HostAgentTokenMinter` +
-//! `ControlTokenProvider.hostAgent`.
+//! a static downgrade (F6).
 //!
 //! Two messages, chosen per request, not per build:
 //!
@@ -36,11 +35,9 @@ use crate::timefmt;
 /// Size caps on the credential exchange, in both directions — re-exported from
 /// [`shed_core::token::limits`], which owns them.
 ///
-/// They live in the core because the OTHER Rust credential mapper
-/// (`shed-core-ffi`'s `credential_from_answer`, which serves any foreign
-/// UniFFI minter) must enforce the same numbers and cannot depend on this
-/// crate. Swift's `HostAgentCredentialLimits` is the third site and is pinned
-/// to the same numbers by the shared §7 P9 fixtures' `limits` block.
+/// They live in the core so every credential mapper enforces the same numbers;
+/// a mapper that cannot import them is pinned to the same numbers by the shared
+/// §7 P9 fixtures' `limits` block.
 pub use shed_core::token::limits;
 
 /// How long an mtls-expecting mint waits for the agent's `hello_ack` before
@@ -370,8 +367,8 @@ pub(crate) fn credential_from_parts(
     server: &str,
 ) -> Result<MintedCredential, ShedError> {
     // 4. Size caps first, so an oversized field is named as such rather than
-    //    reaching the arm logic (byte-for-byte the Swift order, so the shared
-    //    §7 P9 vectors get the same message from both clients).
+    //    reaching the arm logic (the order the shared §7 P9 vectors pin, so
+    //    they get the same message from every client).
     if let Some(field) = over_cap_field(&parts) {
         return Err(ShedError::Config(format!(
             "host agent returned an oversized {field} for {server}; refusing"
@@ -489,7 +486,7 @@ pub(crate) fn minted_token(
 }
 
 /// A wire expiry string as unix seconds. An absent/unparseable expiry -> `None`
-/// -> the provider caches and only re-mints on `invalidate()` (matches Swift +
+/// -> the provider caches and only re-mints on `invalidate()` (matches
 /// `token.rs`); shed-app owns timestamp parsing, so this is the one conversion.
 pub(crate) fn expiry_unix(raw: Option<&str>) -> Option<u64> {
     raw.and_then(timefmt::parse_unix).map(|s| s.max(0) as u64)
@@ -673,11 +670,10 @@ mod tests {
     // -----------------------------------------------------------------------
     // Plan 002 §7 P9 — the shared `credential.response` vectors.
     //
-    // The SAME file the Swift mapper tests and the Go/Rust agent suites read.
-    // This is the Rust CLIENT half: the Tauri app's external-broker path runs
-    // every reply through `map_credential_response`, and the embedded path runs
-    // its own struct through the same `credential_from_parts`, so one fixture
-    // gates both modes and pins them against Swift.
+    // The SAME file the Go/Rust agent suites read. This is the Rust CLIENT
+    // half: the Tauri app's external-broker path runs every reply through
+    // `map_credential_response`, and the embedded path runs its own struct
+    // through the same `credential_from_parts`, so one fixture gates both modes.
     // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
@@ -872,10 +868,10 @@ mod tests {
 
     #[test]
     fn agent_upgrade_error_matches_the_shared_fixture() {
-        // The wording contract with the Swift twin (plan 006 D6): both
-        // languages derive the SAME typed case with the same remedy-first
-        // message from an `unsupported` capability, pinned by the shared
-        // fixture rather than two copies of the strings.
+        // The wording contract (plan 006 D6): the client derives the SAME
+        // typed case with the same remedy-first message from an `unsupported`
+        // capability, pinned by the shared fixture rather than a copy of the
+        // strings.
         let fx = fixture("hello_ack.json");
         let spec = &fx["unsupported_mint_error"];
         let server = spec["server"].as_str().unwrap();

@@ -1,5 +1,5 @@
 """The opencode **agent lane** in the Tauri app — the `lane.*` ops and the
-transcript panel over them (plan 015 §3.4, C5 + C6). `--target tauri`.
+transcript panel over them (plan 015 §3.4, C5 + C6).
 
 **Hermetic, and every layer under test is the shipped one.** Two fakes and no
 network beyond loopback:
@@ -54,11 +54,6 @@ from client import ShedError, TauriClient
 from fake_host_agent import FakeHostAgent
 from fake_opencode import FakeOpencode
 from fake_roost import FakeRoost, roost_call
-
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SHED_TEST_TARGET", "mac") != "tauri",
-    reason="tauri-only: the mac app has no machine layer, and so no lanes",
-)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

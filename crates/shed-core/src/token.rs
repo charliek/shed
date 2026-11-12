@@ -1,11 +1,10 @@
-//! Control-token FSM — ported from Swift's `ControlTokenProvider` actor, with
-//! the mobile client's FSM extensions ported from
+//! Control-token FSM, with the mobile client's FSM extensions ported from
 //! `shed-mobile/lib/control/control_token_provider.dart` (itself a faithful
 //! port of the orchestrator's controlToken.ts).
 //!
 //! Caches a shed-server CONTROL token, refreshing it near expiry or on demand
 //! (`invalidate*`, called on a 401). The mint primitive is a foreign
-//! `TokenMinter` (the host agent, in Swift; a mock in tests) — this crate owns
+//! `TokenMinter` (the host agent; a mock in tests) — this crate owns
 //! only the cache/refresh/single-flight logic, so it stays pure.
 //!
 //! FSM extensions (all builder-opted, defaults preserve the pre-existing
@@ -83,15 +82,12 @@ use crate::tls::{certified_key_from_pem, ClientCertResolver};
 ///
 /// These live in `shed-core` (rather than in one of the layers above it)
 /// because every credential mapper the clients ship must enforce the SAME
-/// numbers, and they sit in different crates: `shed-app`'s
-/// `token_minter::credential_from_parts` (UDS + embedded broker) and
-/// `shed-core-ffi`'s `credential_from_answer` (any foreign UniFFI minter, e.g.
-/// Swift's). Both re-export or reference these constants — a cap that differed
-/// by crate would be a cross-client divergence.
+/// numbers: `shed-app`'s `token_minter::credential_from_parts` (UDS + embedded
+/// broker) re-exports these constants — a cap that differed by crate would be a
+/// cross-client divergence.
 ///
-/// The THIRD mapper is Swift's `HostAgentCredentialLimits`
-/// (`desktop/Sources/ShedKit/Approval/HostAgentProtocol.swift`), which cannot
-/// import Rust constants; it is pinned to the same numbers by the shared
+/// A mapper that cannot import Rust constants is pinned to the same numbers by
+/// the shared
 /// `tests/host-agent-diff/fixtures/desktop-credential/credential_response.json`
 /// `limits` block, which every language asserts against.
 pub mod limits {
@@ -106,8 +102,8 @@ pub mod limits {
 
 /// A minted control token plus its optional expiry (unix seconds). `None` expiry
 /// → only an explicit `invalidate*()` forces a refresh (mirrors `MintedToken`).
-/// Swift parses the host agent's ISO-8601 expiry to epoch before handing it over;
-/// the SSH-bundle path parses RFC3339 in this module instead
+/// A foreign minter parses the host agent's ISO-8601 expiry to epoch before
+/// handing it over; the SSH-bundle path parses RFC3339 in this module instead
 /// ([`parse_token_bundle`]), and always yields `Some` — a bundle without a
 /// parseable expiry is rejected, never treated as non-expiring (plan 001 §3.5).
 #[derive(Clone, PartialEq, Eq)]
@@ -235,7 +231,7 @@ impl CredentialRequest {
 }
 
 /// The mint primitive: request a fresh CONTROL credential for `server`.
-/// Implemented by the foreign host-agent bridge (Swift), the embedded broker, the
+/// Implemented by the host-agent UDS minter, the embedded broker, the
 /// mobile bridge, or a test mock. A failure (Err) is fail-closed — the provider
 /// surfaces it and the caller sends no credential.
 ///
@@ -375,8 +371,8 @@ struct Emission {
 ///
 /// # Why a thread and not a task
 ///
-/// [`CredentialObserver`]'s callbacks are synchronous and foreign — a Swift
-/// closure over UniFFI, a Dart `StreamSink`, a UI store's mutex. Any of them may
+/// [`CredentialObserver`]'s callbacks are synchronous and foreign — a Dart
+/// `StreamSink`, a UI store's mutex. Any of them may
 /// block. Delivering them from a `tokio::spawn`ed task would put that block on a
 /// runtime worker, and on a current-thread runtime (which is what a test, and any
 /// embedder that builds one, gets) it would stall the entire executor — including
@@ -843,8 +839,8 @@ fn credential_fields(
 /// trust-model change this client refuses to make silently — while an absent one
 /// is tolerated, exactly as [`parse_token_bundle`] does.
 ///
-/// This is the decoder a foreign minter (Swift's `HostAgentTokenMinter`, the
-/// mobile mint sink, the broker's SSH bootstrap) runs over the raw bundle line to
+/// This is the decoder a foreign minter (the mobile mint sink, the broker's SSH
+/// bootstrap) runs over the raw bundle line to
 /// produce a [`MintedCredential`].
 pub fn parse_credential_bundle(
     stdout: &str,
@@ -3354,8 +3350,8 @@ mod credential_tests {
         }));
     }
 
-    // A foreign handler that blocks — a Swift closure taking a UI lock, a Dart
-    // sink whose isolate is busy — must not slow the mint path down, let alone
+    // A foreign handler that blocks — a closure taking a UI lock, a Dart sink
+    // whose isolate is busy — must not slow the mint path down, let alone
     // stall it. It cannot, because the mint only ENQUEUES: everything foreign runs
     // on the dispatcher thread.
     //

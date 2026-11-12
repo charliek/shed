@@ -1,6 +1,5 @@
-//! shed-desktop (Tauri) — a real Linux client toward Mac parity, on the shared
-//! shed-core. Runs on Linux (WebKitGTK, the shipped target) and macOS (WKWebView,
-//! the dev / UI-comparison loop vs the SwiftUI app).
+//! shed-desktop (Tauri) — the desktop client, on the shared shed-core. Runs on
+//! Linux (WebKitGTK) and macOS (WKWebView).
 //!
 //! Thin entry: resolve the `SHED_TAURI_*` env, take the single-instance flock,
 //! and in `setup` bind the JSON IPC server (the drivability North Star) on Tauri's
@@ -65,7 +64,7 @@ fn ui_report(
     window: tauri::WebviewWindow,
     snapshot: serde_json::Value,
 ) {
-    // Mirror the running-shed count onto the menu-bar status item (Swift parity).
+    // Mirror the running-shed count onto the menu-bar status item.
     // The dashboard (`main`) reports the full shed list here even while hidden at
     // launch, so the tray count is live without a Rust-side poller. macOS-only;
     // computed before the snapshot is moved into `merge`. Guarded on the `sheds` key
@@ -1318,7 +1317,7 @@ fn app_exit(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-/// Content-size the menu-bar popover (Swift `NSPopover` parity — no dead space): the
+/// Content-size the menu-bar popover so it hugs its content (no dead space): the
 /// popover webview measures its rendered content height and reports it here; the width
 /// stays fixed and the height is clamped. Targets the `popover` window EXPLICITLY, so
 /// it can only ever resize the popover — a stray call from another window can't resize
@@ -1440,7 +1439,7 @@ pub fn run() {
         .manage(AppearanceState(Mutex::new(None)));
 
     // Real Sparkle updater — registered ONLY on macOS AND outside test mode, so the
-    // updater is never instantiated under the harness (Swift-parity, enforced at
+    // updater is never instantiated under the harness (enforced at
     // registration, not inside the crate). The plugin's setup manages a
     // `SparkleUpdater` state iff it's a valid bundle (inert under `cargo run` / the
     // raw harness binary). Its post-init config (auto-checks off + the channel set)
@@ -1785,11 +1784,11 @@ pub fn run() {
                 app_warn!("shed-desktop-tauri: tray unavailable ({e}); window-only");
             }
 
-            // The mac menu-bar popover (B1b): a 2nd, opaque webview mirroring the
-            // Swift MenuBarContentView, created HIDDEN + anchored at the tray on a
-            // left-click. macOS-only (Linux emits no tray click events / has no
-            // popover). It fetches its own data + reports under the `popover` window
-            // key, so it never clobbers the dashboard's `main` snapshot.
+            // The mac menu-bar popover (B1b): a 2nd, opaque webview, created
+            // HIDDEN + anchored at the tray on a left-click. macOS-only (Linux
+            // emits no tray click events / has no popover). It fetches its own
+            // data + reports under the `popover` window key, so it never clobbers
+            // the dashboard's `main` snapshot.
             #[cfg(target_os = "macos")]
             {
                 if let Err(e) = tauri::WebviewWindowBuilder::new(
@@ -1799,7 +1798,7 @@ pub fn run() {
                 )
                 .title("shed")
                 // Built at MAX height; the webview content-sizes it down via
-                // `resize_popover` (Swift NSPopover parity). `resizable(true)` is
+                // `resize_popover` (no dead space). `resizable(true)` is
                 // REQUIRED — a borderless NSWindow without it silently ignores
                 // programmatic `set_size`. It stays borderless + dismiss-on-blur, so
                 // there are no visible resize handles and the user can't drag it.
@@ -1822,7 +1821,7 @@ pub fn run() {
                     app_warn!("shed-desktop-tauri: popover window unavailable ({e})");
                 }
                 // Menu-bar-first in PRODUCTION: hide the dashboard at launch + become
-                // an accessory (no Dock icon), matching the Swift app. "Open dashboard"
+                // an accessory (no Dock icon). "Open dashboard"
                 // brings it back (Regular). Guarded so the harness keeps `main` shown +
                 // never flips policy (else the webview may not mount → ui_report never
                 // fires → wait_until(current_pane) times out).

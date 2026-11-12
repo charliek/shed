@@ -1,7 +1,7 @@
 //! Pull-based create orchestration: kick off an SSE `POST /api/sheds` in the
-//! background, poll its progress by id, cancel it. Hoisted out of `shed-core-ffi`
-//! (M1) so the Swift FFI wrapper and the GTK app share ONE implementation rather
-//! than writing this store twice — the duplication the Rust core exists to kill.
+//! background, poll its progress by id, cancel it. Lives in the core so every
+//! client shares ONE implementation rather than each writing this store — the
+//! duplication the Rust core exists to kill.
 //!
 //! The low-level SSE streaming + `CreateSink` live in `http`; this module only
 //! adds the id-keyed store the pull-based callers poll. It is an owned object
@@ -19,7 +19,7 @@ use tokio::task::AbortHandle;
 use crate::http::{Client, CreateSink};
 use crate::models::{CreateShedRequest, Shed};
 
-/// The state of an in-flight create (maps to Swift's `CreateState` wire strings).
+/// The state of an in-flight create (serialized as lowercase wire strings).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CreateState {

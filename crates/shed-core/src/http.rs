@@ -4,12 +4,12 @@
 //! mock in test mode — the core is env-agnostic). Decoding is the defensive
 //! `models` layer.
 //!
-//! Parity with Swift's `ShedServerClient`: an 8s GET timeout, an explicit
+//! The client contract: an 8s GET timeout, an explicit
 //! User-Agent, an https-only redirect policy, leaf-cert pinning (fail-closed on
 //! a non-https URL), a credential with an auth-failure → invalidate + retry-once
 //! (provider-backed only; the retry is skipped when the re-mint returns the same
-//! rejected credential — plan 001 §3.4), and `ShedError` matching
-//! `ShedClientError`. Lifecycle + SSE create land in M4.
+//! rejected credential — plan 001 §3.4), and a typed `ShedError`. Lifecycle +
+//! SSE create land in M4.
 //!
 //! Every request shape — JSON, lifecycle, and the SSE create stream — goes
 //! through one re-auth path, [`Client::send_authed`]: classify the outcome
@@ -32,7 +32,7 @@ use crate::models::{
 use crate::sse::SseParser;
 use crate::token::{ControlTokenProvider, TokenMinter};
 
-/// Mirrors Swift's `ShedClientError` (same cases, same messages).
+/// Every failure the shed-server client surfaces.
 #[derive(Debug, Error)]
 pub enum ShedError {
     #[error("shed-server returned HTTP {0}")]
@@ -63,8 +63,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const CREATE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const USER_AGENT: &str = concat!("shed-desktop-core/", env!("CARGO_PKG_VERSION"));
 
-/// Sink for create progress. shed-core streams the SSE and drives these; the FFI
-/// layer implements it to update a create-status store the Swift side polls.
+/// Sink for create progress. shed-core streams the SSE and drives these; the
+/// `create` store implements it to update the status its callers poll.
 pub trait CreateSink: Send + Sync {
     fn on_progress(&self, message: String);
     fn on_complete(&self, shed: Shed);
@@ -122,8 +122,8 @@ impl Resolution {
 /// with the mint message is load-bearing, not cosmetic: banners truncate from
 /// the END, and refusal-first ordering was exactly how the actionable clause
 /// got cut off (shed#300). The mint error's variant is preserved so a consumer
-/// mapping [`ShedError`] onto its own error surface (the FFI, the Swift/Tauri
-/// clients) keeps the same category.
+/// mapping [`ShedError`] onto its own error surface (the Tauri app, the mobile
+/// client) keeps the same category.
 fn refused_because(outcome: &Result<reqwest::Response, ShedError>, mint: ShedError) -> ShedError {
     let refusal = match outcome {
         Ok(resp) => format!("HTTP {}", resp.status().as_u16()),
@@ -839,7 +839,7 @@ impl Client {
     }
 
     /// `GET /api/sheds` -> sheds stamped with this host's config name (the server
-    /// omits `host`; the client stamps it, as Swift's `listSheds` does).
+    /// omits `host`; the client stamps it).
     pub async fn list_sheds(&self) -> Result<Vec<Shed>, ShedError> {
         let list: ShedList = self.get_json(&["api", "sheds"], &[]).await?;
         Ok(list
@@ -947,8 +947,7 @@ impl Client {
     /// a final shed, delivered via `sink`. A transport/parse/error-event failure,
     /// or a stream that ends without a `complete`, is delivered as
     /// `sink.on_error`. Create mints its token inline once and does NOT 401-retry
-    /// (one-shot stream), never downgrading to the static token — mirroring
-    /// Swift's `createShed`.
+    /// (one-shot stream), never downgrading to the static token.
     pub async fn create_shed(&self, req: &CreateShedRequest, sink: &dyn CreateSink) {
         if let Err(e) = self.create_stream(req, sink).await {
             sink.on_error(e.to_string());
@@ -1042,7 +1041,7 @@ fn build_http_client(
 ) -> Result<reqwest::Client, ShedError> {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        // Fail closed on a plaintext redirect, mirroring the Swift pinned session.
+        // Fail closed on a plaintext redirect.
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.url().scheme() == "https" {
                 attempt.follow()
@@ -1078,7 +1077,7 @@ fn decode_progress(data: &str) -> Option<String> {
     }
 }
 
-/// An error event's `message ?? code ?? raw` (mirrors Swift's decodeErrorMessage).
+/// An error event's `message ?? code ?? raw`.
 fn decode_error(data: &str) -> String {
     #[derive(serde::Deserialize)]
     struct ApiError {

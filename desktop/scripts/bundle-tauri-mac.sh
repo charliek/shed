@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 # Tauri ShedDesktop.app bundling (macOS).
 #
-# The Tauri sibling of scripts/bundle.sh: builds the Tauri client with the
+# Builds the Tauri client with the
 # tauri CLI (which applies the tauri.macos.conf.json overlay — productName
 # ShedDesktop, identifier ai.stridelabs.ShedDesktop, embedded
 # Sparkle.framework), copies the .app to build/ShedDesktop.app, and re-signs
 # it in Sparkle's required order. scripts/make-dmg.sh packages the result
-# unchanged (same output paths as the Swift bundle — they clobber each other).
+# unchanged.
 #
-# Signing is deliberately STRICTER than bundle.sh (which --deep-signs the
-# framework): Sparkle 2 documents an ordered inner->outer sign of its nested
-# helpers, and a wrong order (or --deep on the outer app) signs + notarizes
-# clean but BREAKS AT UPDATE TIME. Do not "align" this down to bundle.sh.
+# Signing is deliberately strict: Sparkle 2 documents an ordered inner->outer
+# sign of its nested helpers, and a wrong order (or --deep on the outer app)
+# signs + notarizes clean but BREAKS AT UPDATE TIME. Never --deep-sign it.
 #
-# Env (same conventions as bundle.sh):
+# Env:
 #   SHED_DESKTOP_DEVELOPER_ID_IDENTITY  codesign identity (default: ad-hoc "-")
 #   SHED_DESKTOP_ALLOW_UNSIGNED=1       continue past codesign failures
 #   SHED_TAURI_CONFIG_OVERRIDE          inline `tauri build --config <json>` merge
@@ -176,8 +175,7 @@ fi
 
 # Sign in Sparkle's REQUIRED order, innermost first, never --deep. The
 # scripts under Contents/Resources/bin/ are NOT signed individually — they
-# are shell/Python text, not Mach-O; the outer app signature seals them
-# (same convention as bundle.sh).
+# are shell/Python text, not Mach-O; the outer app signature seals them.
 SIGN_IDENTITY="${SHED_DESKTOP_DEVELOPER_ID_IDENTITY:--}"
 TS_FLAG=""
 if [ "${SIGN_IDENTITY}" != "-" ]; then

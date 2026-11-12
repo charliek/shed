@@ -1,6 +1,6 @@
 # Linux render gate for the Tauri client. ubuntu:24.04 ships webkit2gtk-4.1
 # (WebKitGTK 2.44 — the WebView Tauri uses on Linux, i.e. the shipped target).
-# Builds the Tauri Rust app and runs the `--target tauri` e2e under Xvfb, so the
+# Builds the Tauri Rust app and runs the hermetic e2e under Xvfb, so the
 # oklch linen theme + the drivability probes are verified on real WebKitGTK, not
 # just mac WKWebView. `scrot` backs app.screenshot (Tauri has no in-process capture
 # on Linux). The frontend bundle (tauri/ui/dist) is built on the host first — it's

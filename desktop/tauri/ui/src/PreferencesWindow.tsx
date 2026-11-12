@@ -36,7 +36,7 @@ const APPROVAL_METHODS: { id: SshPrefs["method"]; label: string; detail: string 
 
 // The SSH approval policies, most → least permissive (mirrors SshApprovalPolicy in
 // shed-core). `prompts` gates the Method radios and `usesDuration` gates the
-// Duration field — the SAME policy→behavior mapping as the Swift app.
+// Duration field.
 const SSH_POLICIES: { id: string; label: string; prompts: boolean; usesDuration: boolean }[] = [
   { id: "always-allow", label: "Always Allow", prompts: false, usesDuration: false },
   { id: "per-shed-allow", label: "Per Shed Allow", prompts: true, usesDuration: false },

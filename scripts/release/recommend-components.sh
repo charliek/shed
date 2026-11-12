@@ -137,7 +137,6 @@ PATHS_DESKTOP=(
   desktop
   crates/shed-core
   crates/shed-app
-  crates/shed-core-ffi
   crates/shedctl
   crates/shed-broker
   crates/shed-opencode

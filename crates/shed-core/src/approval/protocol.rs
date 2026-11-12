@@ -1,6 +1,6 @@
-//! The UDS wire protocol between shed-host-agent and the desktop, ported from
-//! `HostAgentProtocol.swift`. Newline-delimited JSON, one typed envelope per
-//! line. Mirrors the mini-RFC in shed-extensions.
+//! The UDS wire protocol between shed-host-agent and the desktop.
+//! Newline-delimited JSON, one typed envelope per line. Mirrors the mini-RFC in
+//! shed-extensions.
 //!
 //!   app -> agent:  hello, approval_response, pong, token.get, credential.get
 //!   agent -> app:  hello_ack, approval_request, event, ping, token.response,

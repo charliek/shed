@@ -312,15 +312,14 @@ export function useUiBridge(
 
   // Auto-refresh the shed list on a cadence so an externally-created shed (e.g.
   // `shed create` from the CLI, or another client) surfaces on the ALREADY-OPEN
-  // dashboard without a manual action — the mac AppModel polls every 5s
-  // (AppModel.swift `pollInterval`); this is the Tauri parity. Reuses the SAME
+  // dashboard without a manual action (every 5s). Reuses the SAME
   // `fetchSheds` path the `refresh` event uses — no second fetch mechanism.
   //
   // JS-side by design (why-only): no Rust ticker / IPC-event plumbing is needed —
-  // @tauri-apps/api/window is enough to observe visibility from JS. Unlike Swift
-  // (which polls even when hidden), we poll ONLY while the window is actually
-  // shown — the webview is HIDDEN (not unmounted) when the window is closed to the
-  // tray, so polling then would waste battery + network.
+  // @tauri-apps/api/window is enough to observe visibility from JS. We poll ONLY
+  // while the window is actually shown — the webview is HIDDEN (not unmounted)
+  // when the window is closed to the tray, so polling then would waste battery +
+  // network.
   //
   // The GATE is the NATIVE window `isVisible()` (shown vs hidden-to-tray), NOT
   // `document.visibilityState`: the latter tracks WebKit *occlusion*, so a shown-
@@ -2436,8 +2435,8 @@ export async function updaterCheck(): Promise<void> {
   const core = await import("@tauri-apps/api/core");
   await core.invoke("updater_check").catch((e) => console.error("updater_check failed", e));
 }
-/** Ask Rust to content-size the popover window to the measured height (Swift NSPopover
- *  parity — no dead space). macOS-only in effect; a no-op on other targets. */
+/** Ask Rust to content-size the popover window to the measured height (no dead
+ *  space). macOS-only in effect; a no-op on other targets. */
 export async function resizePopover(height: number): Promise<void> {
   await invoke("resize_popover", { height });
 }

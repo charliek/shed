@@ -1,5 +1,5 @@
 //! The credential-approval domain — pure models, the host-agent wire codec, and
-//! the policy engine, ported from shed-desktop's `Sources/ShedKit/Approval/*`.
+//! the policy engine.
 //!
 //! Pure and I/O-free: the stateful `HostAgentClient` UDS state machine, the
 //! approval coordinator, and the `AuditStore` writer live in `shed-app`; only
