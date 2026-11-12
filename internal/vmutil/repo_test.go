@@ -1,0 +1,67 @@
+package vmutil
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"slices"
+	"testing"
+
+	"github.com/charliek/shed/internal/agentproto"
+	"github.com/charliek/shed/internal/config"
+)
+
+// cloneEnvSeen runs CloneRepo against an in-memory guest and returns the
+// environment of the git clone the guest was asked to run.
+func cloneEnvSeen(t *testing.T, owned bool) []string {
+	t.Helper()
+	envs := make(chan []string, 1)
+	dialer := &pipeDialer{handler: func(conn net.Conn) {
+		defer conn.Close()
+		msgType, data, err := agentproto.ReadMessage(conn)
+		if err != nil || msgType != agentproto.MsgTypeExecRequest {
+			return
+		}
+		var req agentproto.ExecRequest
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		if len(req.Cmd) > 1 && req.Cmd[0] == "git" && req.Cmd[1] == "clone" {
+			envs <- req.Env
+		}
+		_, _, _ = agentproto.ReadMessage(conn) // stdin EOF
+		_ = agentproto.WriteExitCode(conn, 0)
+	}}
+	agent := NewAgentClient(dialer, 1024, 1026)
+	serverCfg := &config.ServerConfig{EnvVars: map[string]string{"GITHUB_TOKEN": "sentinel-server-secret"}}
+	if err := CloneRepo(context.Background(), agent, serverCfg, "https://github.com/example/repo.git", owned, []string{"HTTPS_PROXY=http://10.0.0.1:3128"}); err != nil {
+		t.Fatalf("CloneRepo: %v", err)
+	}
+	select {
+	case env := <-envs:
+		return env
+	default:
+		t.Fatal("the guest never saw a git clone")
+		return nil
+	}
+}
+
+// TestCloneRepoOwnedShedGetsNoServerEnv: the server's env_file variables (its
+// own credentials) never reach an owned shed's clone, which the owning client
+// can read by exec while it runs; an admin shed's clone keeps them.
+func TestCloneRepoOwnedShedGetsNoServerEnv(t *testing.T) {
+	owned := cloneEnvSeen(t, true)
+	for _, kv := range owned {
+		if kv == "GITHUB_TOKEN=sentinel-server-secret" {
+			t.Errorf("owned shed's clone env carries the server's secret: %v", owned)
+		}
+	}
+	if !slices.Contains(owned, "HTTPS_PROXY=http://10.0.0.1:3128") {
+		t.Errorf("owned shed's clone env lost the egress env: %v", owned)
+	}
+
+	admin := cloneEnvSeen(t, false)
+	if !slices.Contains(admin, "GITHUB_TOKEN=sentinel-server-secret") || !slices.Contains(admin, "HTTPS_PROXY=http://10.0.0.1:3128") {
+		t.Errorf("admin shed's clone env = %v, want the server env and the egress env", admin)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"time"
 )
 
@@ -78,6 +79,15 @@ var (
 	// got out of sync (partial save / external tampering / server crash
 	// between vm.Start and metadata.Save).
 	ErrZombiePresentSentinel = errors.New("recorded VMM pid is still alive; refusing to spawn a second instance")
+
+	// ErrNetworkProfileUnsupportedSentinel is returned when a backend cannot
+	// provide the requested network profile (VZ offers only "open").
+	ErrNetworkProfileUnsupportedSentinel = errors.New("network profile is not supported by this backend")
+
+	// ErrNetworkEnforcementUnavailableSentinel is returned when shed-server
+	// cannot install the firewall rules a non-open network profile needs, so
+	// a create or start of such a shed is refused rather than run unguarded.
+	ErrNetworkEnforcementUnavailableSentinel = errors.New("network enforcement is unavailable")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -162,6 +172,104 @@ type Shed struct {
 	// shed. It is a secret: never serialized to API/CLI responses (json:"-").
 	// It lives durably in the per-backend on-disk metadata, not here.
 	EgressToken string `json:"-" yaml:"-"`
+	// Owner is the service client (auth.clients) that created this shed.
+	// Empty for a shed an admin created, and for every shed created before
+	// service clients existed: those are admin-only.
+	Owner string `json:"owner,omitempty" yaml:"owner,omitempty"`
+	// Mounts is the server-mount selection this shed starts with (top-level
+	// `mounts:`). A shed created before mount selection existed reports
+	// {"mode":"all"}.
+	Mounts *MountSelection `json:"mounts,omitempty" yaml:"mounts,omitempty"`
+	// NetworkProfile is the shed's network profile ("open" or "isolated"),
+	// fixed at create. A shed created before network profiles existed
+	// reports "open".
+	NetworkProfile string `json:"network_profile,omitempty" yaml:"network_profile,omitempty"`
+}
+
+// Network profiles (CreateShedRequest.Network, Shed.NetworkProfile,
+// network.default_profile, auth.clients.<name>.policy.network).
+const (
+	// NetworkProfileOpen is today's network: the guest reaches whatever the
+	// host's NAT reaches. The default.
+	NetworkProfileOpen = "open"
+	// NetworkProfileIsolated gives the guest the internet and nothing else:
+	// not the host, other guests, private, CGNAT/tailnet, link-local or
+	// multicast ranges, and no IPv6. Firecracker only.
+	NetworkProfileIsolated = "isolated"
+)
+
+// ValidNetworkProfile reports whether p is a known network profile name.
+func ValidNetworkProfile(p string) bool {
+	return p == NetworkProfileOpen || p == NetworkProfileIsolated
+}
+
+// EffectiveNetworkProfile is the profile a shed with the stored value p runs
+// with: empty (metadata written before network profiles existed) is "open".
+func EffectiveNetworkProfile(p string) string {
+	if p == "" {
+		return NetworkProfileOpen
+	}
+	return p
+}
+
+// Mount selection modes (MountSelection.Mode).
+const (
+	// MountModeAll mounts every configured server mount (the default, and
+	// what a shed created before mount selection existed gets).
+	MountModeAll = "all"
+	// MountModeSelected mounts only the named server mounts; no names means
+	// none.
+	MountModeSelected = "selected"
+)
+
+// MountSelection is a shed's stored choice of server mounts. The mode, not
+// the slice, carries the meaning, so a "selected" selection with no names can
+// never reload as "every mount".
+type MountSelection struct {
+	Mode  string   `json:"mode" yaml:"mode"`
+	Names []string `json:"names,omitempty" yaml:"names,omitempty"`
+}
+
+// Allows reports whether the server mount called name is part of the
+// selection. A nil selection (legacy metadata) and mode "all" allow every
+// mount; "selected" allows only Names; any other mode allows nothing, so a
+// corrupted or future mode fails closed.
+func (m *MountSelection) Allows(name string) bool {
+	if m == nil {
+		return true
+	}
+	switch m.Mode {
+	case MountModeAll:
+		return true
+	case MountModeSelected:
+		for _, n := range m.Names {
+			if n == name {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// AllMounts returns a fresh {mode: all} selection.
+func AllMounts() *MountSelection { return &MountSelection{Mode: MountModeAll} }
+
+// SelectedMounts returns a {mode: selected} selection of a copy of names
+// (nil or empty: no mounts).
+func SelectedMounts(names []string) *MountSelection {
+	return &MountSelection{Mode: MountModeSelected, Names: append([]string(nil), names...)}
+}
+
+// EffectiveMountSelection is the selection a shed with the stored value sel
+// runs with: a missing selection (metadata written before mount selection
+// existed) is {mode: all}. It returns a copy, never sel itself.
+func EffectiveMountSelection(sel *MountSelection) *MountSelection {
+	if sel == nil {
+		return AllMounts()
+	}
+	return &MountSelection{Mode: sel.Mode, Names: append([]string(nil), sel.Names...)}
 }
 
 // ExtensionHealthInfo is the API-facing extension health for a shed.
@@ -268,6 +376,26 @@ type ServerInfo struct {
 	// is mirrored in the GET /api/overview server block. The token list is owned
 	// by internal/api (serverFeatures); older clients decode it as an empty slice.
 	Features []string `json:"features,omitempty"`
+}
+
+// FeatureMountSelection is the /api/info feature token for the create
+// request's "mounts" field. internal/api advertises it (api.FeatureMountSelection
+// is this constant); the CLI refuses to send --mounts to a server without it,
+// since an older server would ignore the field and mount everything.
+const FeatureMountSelection = "mount_selection"
+
+// FeatureNetworkProfiles is the /api/info feature token for the create
+// request's "network" field (advertised by a Firecracker server). The CLI
+// refuses to send --network isolated to a server without it, since an older
+// server would ignore the field and create an open shed.
+const FeatureNetworkProfiles = "network_profiles"
+
+// HasFeature reports whether the server advertises the feature token f.
+func (i *ServerInfo) HasFeature(f string) bool {
+	if i == nil {
+		return false
+	}
+	return slices.Contains(i.Features, f)
 }
 
 // SSHHostKeyResponse is returned by GET /api/ssh-host-key.
@@ -579,6 +707,27 @@ type CreateShedRequest struct {
 	// UpperSizeBytes is the logical size of the per-shed writable upper.
 	// Zero falls back to the backend's upper_size_default config value.
 	UpperSizeBytes int64 `json:"upper_size_bytes,omitempty"`
+
+	// Mounts selects the server mounts (top-level `mounts:`) the shed gets:
+	// omitted (nil) = every server mount, as before; [] = none; names =
+	// exactly those. A service client may name only its policy's
+	// server_mounts, and omitting it means exactly those.
+	Mounts *[]string `json:"mounts,omitempty"`
+
+	// Network is the shed's network profile ("open" or "isolated"; omitted =
+	// the server's network.default_profile, or a service client's pinned
+	// policy.network). The API server resolves it and writes the effective
+	// profile back here before the backend runs, so a backend always sees an
+	// explicit value from the API.
+	Network string `json:"network,omitempty"`
+
+	// Owner and ResolvedMounts are set by the API server after
+	// authorization (json:"-": no caller can set them on the wire). Owner is
+	// the service client creating the shed ("" for an admin);
+	// ResolvedMounts is the stored mount selection. A backend called with a
+	// nil ResolvedMounts (a non-API caller) stores {mode: all}.
+	Owner          string          `json:"-"`
+	ResolvedMounts *MountSelection `json:"-"`
 }
 
 // SnapshotSchemaVersion is the current snapshot schema version. Bumped
@@ -705,6 +854,35 @@ const (
 	ErrInvalidLocalDir    = "INVALID_LOCAL_DIR"
 	ErrInvalidRequest     = "INVALID_REQUEST"
 
+	// ErrShedNotRunning (409) is the exec endpoint's "the shed must be
+	// running" refusal. Exec never auto-starts a shed. Other routes keep
+	// SHED_ALREADY_STOPPED for the same condition.
+	ErrShedNotRunning = "SHED_NOT_RUNNING"
+	// ErrExecLimit (429) means the shed already runs
+	// exec.max_concurrent_per_shed HTTPS execs.
+	ErrExecLimit = "EXEC_LIMIT"
+	// ErrRequestTooLarge (413) means a request body or its decoded stdin is
+	// over the server's limit.
+	ErrRequestTooLarge = "REQUEST_TOO_LARGE"
+	// ErrPolicyViolation (403) means a service client's create request
+	// breaks its auth.clients policy; the message names the rule.
+	ErrPolicyViolation = "POLICY_VIOLATION"
+	// ErrForbidden (403) means the caller's credential may not reach this
+	// route (a scope mismatch, or a route outside a service client's
+	// allowlist).
+	ErrForbidden = "FORBIDDEN"
+	// ErrUnauthorized (401) means no valid credential was presented.
+	ErrUnauthorized = "UNAUTHORIZED"
+	// ErrInvalidNetworkProfile (400) means a create request's network is not
+	// a known profile.
+	ErrInvalidNetworkProfile = "INVALID_NETWORK_PROFILE"
+	// ErrNetworkProfileUnsupported (422) means the backend cannot provide the
+	// requested profile (VZ offers only "open").
+	ErrNetworkProfileUnsupported = "NETWORK_PROFILE_UNSUPPORTED"
+	// ErrNetworkEnforcementUnavailable (503) means the server could not
+	// install the firewall rules a non-open profile needs.
+	ErrNetworkEnforcementUnavailable = "NETWORK_ENFORCEMENT_UNAVAILABLE"
+
 	ErrSnapshotNotFound        = "SNAPSHOT_NOT_FOUND"
 	ErrSnapshotAlreadyExists   = "SNAPSHOT_ALREADY_EXISTS"
 	ErrSnapshotSourceRunning   = "SNAPSHOT_SOURCE_RUNNING"
@@ -761,6 +939,151 @@ type AuthConfig struct {
 	TokenTTL Duration `yaml:"token_ttl,omitempty"`
 	// SSH configures the SSH public-key allowlist (key sources + advanced mode).
 	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`
+	// Clients are the service clients (mtls mode only): orchestrators that
+	// authenticate with a certificate from `shed-server client issue` and may
+	// create, run commands in and delete only their own sheds, within their
+	// policy. Keyed by client name.
+	Clients map[string]ServiceClientConfig `yaml:"clients,omitempty"`
+}
+
+// DefaultClientCertMaxTTL is auth.clients.<name>.cert_max_ttl when unset.
+const DefaultClientCertMaxTTL = 90 * 24 * time.Hour
+
+// ServiceClientConfig is one service client under auth.clients. Unknown keys are
+// refused at config load (rejectUnknownClientKeys), so a typo in a security
+// policy fails loudly.
+type ServiceClientConfig struct {
+	// CertMaxTTL is the longest certificate `client issue` may sign for this
+	// client (default 90 days).
+	CertMaxTTL Duration `yaml:"cert_max_ttl,omitempty"`
+	// Policy bounds what the client may create.
+	Policy ServiceClientPolicy `yaml:"policy"`
+}
+
+// ServiceClientPolicy is a service client's create policy.
+type ServiceClientPolicy struct {
+	// NamePrefix is required: every shed the client creates must start
+	// with it.
+	NamePrefix string `yaml:"name_prefix"`
+	// MaxSheds is the most sheds the client may own at once, running or
+	// stopped (at least 1).
+	MaxSheds int `yaml:"max_sheds"`
+	// MaxAge is how old an owned shed may get before the server deletes it.
+	MaxAge Duration `yaml:"max_age"`
+	// ServerMounts names the top-level mounts the client's sheds may get
+	// (default none). A create that omits mounts gets exactly these.
+	ServerMounts []string `yaml:"server_mounts,omitempty"`
+	// Images are the image aliases the client may ask for; empty means the
+	// server default only.
+	Images []string `yaml:"images,omitempty"`
+	// Caps bound the resources of one shed, compared after defaults.
+	Caps ServiceClientCaps `yaml:"caps,omitempty"`
+	// Network is the network profile every shed of this client gets
+	// ("open" or "isolated"; default isolated). A create that names another
+	// profile is refused.
+	Network string `yaml:"network,omitempty"`
+}
+
+// NetworkProfile is the client's pinned network profile: policy.network, or
+// "isolated" when unset.
+func (p ServiceClientPolicy) NetworkProfile() string {
+	if p.Network == "" {
+		return NetworkProfileIsolated
+	}
+	return p.Network
+}
+
+// NetworkConfig is the server-level network block. Every field is optional;
+// an absent block is the open default.
+type NetworkConfig struct {
+	// DefaultProfile is the profile a create that names none gets ("open",
+	// the default, or "isolated"; non-open requires Firecracker).
+	DefaultProfile string `yaml:"default_profile,omitempty"`
+	// AllowCIDRs are IPv4 ranges an isolated shed may reach although they
+	// fall in the blocked ranges (a LAN registry, say). They apply to
+	// forwarded traffic only, never to the host itself.
+	AllowCIDRs []string `yaml:"allow_cidrs,omitempty"`
+}
+
+// ServiceClientCaps are optional per-shed resource caps (0 = no cap).
+type ServiceClientCaps struct {
+	CPUs     int `yaml:"cpus,omitempty"`
+	MemoryMB int `yaml:"memory_mb,omitempty"`
+}
+
+// CertMaxTTLValue is cert_max_ttl, or DefaultClientCertMaxTTL when unset.
+func (c ServiceClientConfig) CertMaxTTLValue() time.Duration {
+	if c.CertMaxTTL > 0 {
+		return c.CertMaxTTL.Duration()
+	}
+	return DefaultClientCertMaxTTL
+}
+
+// ExecConfig bounds the HTTPS exec endpoint (POST /api/sheds/{name}/exec).
+// Every field is optional; a zero value takes its default (see the
+// ServerConfig.Exec* accessors in server.go).
+type ExecConfig struct {
+	// MaxStdinBytes caps a request's decoded stdin (default 1 MiB).
+	MaxStdinBytes int64 `yaml:"max_stdin_bytes,omitempty"`
+	// MaxTimeout is the largest timeout_seconds a request may ask for
+	// (default 1h, at least 1s). A larger request is refused, not clamped.
+	MaxTimeout Duration `yaml:"max_timeout,omitempty"`
+	// MaxConcurrentPerShed caps the HTTPS execs running in one shed at once
+	// (default 8); one more is refused with 429 EXEC_LIMIT.
+	MaxConcurrentPerShed int `yaml:"max_concurrent_per_shed,omitempty"`
+}
+
+// AuditConfig turns on and shapes shed-server's audit log (<state>/audit.jsonl).
+// The log is on whenever auth.clients is set, whatever Enabled says.
+type AuditConfig struct {
+	// Enabled turns the audit log on for a server with no service clients
+	// (it then records HTTPS execs; admin API requests are never logged).
+	Enabled bool `yaml:"enabled,omitempty"`
+	// ExecArgv is "" (the default: an exec.end line records argv[0] and the
+	// argument count) or "full" (the whole argv, which may carry prompts or
+	// secrets).
+	ExecArgv string `yaml:"exec_argv,omitempty"`
+}
+
+// AuditExecArgvFull is audit.exec_argv's one non-default value.
+const AuditExecArgvFull = "full"
+
+// ExecRequest is the body of POST /api/sheds/{name}/exec. Argv runs as given
+// (no shell wrap) as the shed user; a caller who wants a login shell passes
+// ["bash","-lc",...]. Stdin is standard base64.
+type ExecRequest struct {
+	Argv           []string          `json:"argv"`
+	Cwd            string            `json:"cwd,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	Stdin          string            `json:"stdin,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	MaxOutputBytes int64             `json:"max_output_bytes,omitempty"`
+}
+
+// Exec stream frame types: each NDJSON line of a 200 exec response carries
+// one of these in "t".
+const (
+	ExecFrameStdout = "stdout"
+	ExecFrameStderr = "stderr"
+	ExecFrameExit   = "exit"
+)
+
+// ExecDataFrame is one chunk of a command's stdout or stderr, base64-encoded.
+type ExecDataFrame struct {
+	T string `json:"t"`
+	D string `json:"d"`
+}
+
+// ExecExitFrame is the last line of an exec stream. A stream that ends
+// without one means the result was lost (the command may or may not have
+// finished). Code is 124 with TimedOut on a timeout; Truncated means output
+// past max_output_bytes was discarded (the command still ran to its exit).
+type ExecExitFrame struct {
+	T          string `json:"t"`
+	Code       int    `json:"code"`
+	TimedOut   bool   `json:"timed_out"`
+	Truncated  bool   `json:"truncated"`
+	DurationMS int64  `json:"duration_ms"`
 }
 
 // SSHAuthConfig configures the SSH public-key allowlist. Identity comes from

@@ -132,7 +132,7 @@ This catches the v0.5.4-class regression where the binary built correctly but a 
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the brew/deb VZ server. |
+| `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the brew/deb VZ server. Empty skips every `[vz]` case; `test-integration-dev-fc` sets it (and `SHED_VZ_DEV_SERVER`) empty, so an FC run never reaches a `my-server` entry that names a production server. |
 | `SHED_VZ_DEV_SERVER` | `my-server-dev` | `~/.shed/config.yaml` entry for the parallel dev VZ server. Honored by `make dev-server-up` / `dev-server-status` / `test-integration-dev`. |
 | `SHED_VZ_LOG_PATH` | `/opt/homebrew/var/log/shed-server.log` | brew log path (override for Intel-Mac homebrew prefix or custom installs). Set by `test-integration-dev` to the dev log path automatically. |
 | `SHED_FC_HOST` | `mini3` | SSH host for FC live tests + the `dev-server-*-fc` Makefile targets. |

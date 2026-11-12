@@ -172,7 +172,7 @@ func (c *Client) resumeInstance(ctx context.Context, name string) {
 		return
 	}
 
-	c.credMgr.ResumeMessageChannel(name, c.newAgentClient(name))
+	c.credMgr.ResumeMessageChannel(name, c.newAgentClient(name), meta.Owner != "")
 }
 
 // vmmServesInstance reports whether pid is a live vfkit serving THIS
@@ -302,6 +302,13 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, err
 	}
 
+	// vmnet's NAT belongs to macOS: VZ cannot filter a guest, so it offers
+	// only the open profile (the API refuses earlier with 422; this is the
+	// backend's own refusal, for any other caller).
+	if req.Network != "" && req.Network != config.NetworkProfileOpen {
+		return nil, fmt.Errorf("%w: %q (the vz backend offers only %q)", config.ErrNetworkProfileUnsupportedSentinel, req.Network, config.NetworkProfileOpen)
+	}
+
 	if req.FromSnapshot != "" {
 		if req.Image != "" || req.Repo != "" {
 			return nil, fmt.Errorf("%w: --from-snapshot cannot be combined with --image or --repo", config.ErrInvalidShedRequestSentinel)
@@ -355,6 +362,9 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 		if errors.Is(err, ErrInstanceNotFound) {
 			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 		}
+		return nil, err
+	}
+	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
 		return nil, err
 	}
 
@@ -433,6 +443,13 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 		}
 		return err
 	}
+	// Checked under the per-shed lock, against the shed being deleted.
+	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
+		return err
+	}
+	if err := backend.CheckCreatedAt(ctx, name, meta.CreatedAt); err != nil {
+		return err
+	}
 
 	if meta.Status == config.StatusRunning {
 		backend.Status(ctx, "Terminating virtual machine...")
@@ -457,6 +474,12 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 			}
 		}
 	}
+
+	// A Stopped shed can still hold a message channel and a bridge
+	// registration (a VM exit GetShed reconciled, or a failed create's
+	// leftovers); a channel left under this name would be found by the next
+	// shed created with it.
+	c.credMgr.StopListener(name)
 
 	// Free this shed's egress port reservation. Stop only closes the listener
 	// and keeps the port reserved (for restart); delete frees it. No-op when
@@ -484,6 +507,9 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 // start.go for the lifecycle contract.
 func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, error) {
 	defer c.acquireCreateLock(name)()
+	if err := c.checkOwnerLocked(ctx, name); err != nil {
+		return nil, err
+	}
 	return orchestrator.StartShed(ctx, &vzStarter{c: c}, orchestrator.StartRequest{Name: name})
 }
 
@@ -507,6 +533,12 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		if errors.Is(err, ErrInstanceNotFound) {
 			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 		}
+		return nil, err
+	}
+	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
+		return nil, err
+	}
+	if err := backend.CheckCreatedAt(ctx, name, meta.CreatedAt); err != nil {
 		return nil, err
 	}
 
@@ -708,6 +740,9 @@ func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 		EgressProfiles: meta.EgressProfiles,
 		EgressPort:     meta.EgressPort,
 		EgressToken:    meta.EgressToken,
+		Owner:          meta.Owner,
+		Mounts:         config.EffectiveMountSelection(meta.MountSelection),
+		NetworkProfile: config.EffectiveNetworkProfile(meta.NetworkProfile),
 	}
 }
 
@@ -833,4 +868,15 @@ func (c *Client) ResetShed(ctx context.Context, name string) (*config.Shed, erro
 
 	log.Printf("reset shed %s: upper recreated at %s (%d bytes)", name, upperPath, size)
 	return metadataToShed(meta, ""), nil
+}
+
+// checkOwnerLocked applies backend.CheckOwner to the shed's stored owner, for
+// an operation that holds the per-shed lock and loads the metadata itself
+// later. A shed that cannot be loaded is left to the operation to report.
+func (c *Client) checkOwnerLocked(ctx context.Context, name string) error {
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		return nil
+	}
+	return backend.CheckOwner(ctx, name, meta.Owner)
 }

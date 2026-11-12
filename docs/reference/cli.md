@@ -156,6 +156,8 @@ shed create <name> [flags]
 | `--local-dir` | | None | Mount a local host directory into the guest at `~/<basename>`. The login lands there. Mutually exclusive with `--repo`. |
 | `--add-dir` | | None | Mount an additional local host directory at `~/<basename>` as a reference sibling. Repeatable. Requires `--local-dir`. |
 | `--egress` | | Server default | Egress-control profiles to apply (comma-separated, e.g. `base,github`; `off` to disable). Requires egress enabled on the server. See [Egress Control](egress.md). |
+| `--mounts` | | `all` | Which server mounts (the server config's `mounts:`) the shed gets: `all`, `none`, or a comma-separated list of mount names (`claude,gh`). Stored with the shed and applied on every start. `none` and a list need a server that advertises `mount_selection`; the CLI refuses them before creating anything otherwise. |
+| `--network` | | Server default (`open`) | Network profile: `open` (today's network) or `isolated` (the internet only: no host, LAN, tailnet or other sheds). Fixed for the shed's life. `isolated` needs a Firecracker server that advertises `network_profiles`; the CLI refuses it before creating anything otherwise. See [Security › Network profiles](security.md#network-profiles). |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
 | `--no-sync` | | `false` | Skip syncing default profile |
@@ -176,6 +178,12 @@ shed create myproj --local-dir ~/projects/myproj
 
 # Mount additional reference directories alongside the primary one
 shed create myproj --local-dir ~/projects/myproj --add-dir ~/projects/shared-lib
+
+# A hardened shed: no server mounts, internet only (Firecracker)
+shed create untrusted --repo https://github.com/someone/tool.git --mounts none --network isolated
+
+# Only the Claude Code and GitHub CLI mounts
+shed create agent --mounts claude,gh
 ```
 
 !!! note "Local directory mounts"
@@ -209,12 +217,19 @@ mcp-test      vz         stopped    -                                2026-01-17 
 **Output with `-v` (expanded):**
 
 ```text
-NAME          BACKEND    STATUS     SSH                              IP             RESOURCES    SOURCE              UPTIME
-codelens      vz         running    codelens@mini-desktop:2222       192.168.64.2   2c/4096MB    charliek/codelens    2h30m
-mcp-test      vz         stopped    -                                -              -            -                    -
+NAME          BACKEND      STATUS   SSH                             IP          RESOURCES  SOURCE             OWNER    MOUNTS  NETWORK   UPTIME
+codelens      firecracker  running  codelens@mini-desktop:2222      172.30.0.2  2c/4096MB  charliek/codelens  -        all     open      2h30m
+nocturn-3f2a  firecracker  running  nocturn-3f2a@mini-desktop:2222  172.30.0.3  4c/8192MB  -                  nocturn  none    isolated  12m
+mcp-test      firecracker  stopped  -                               -           -          -                  -        claude  open      -
 ```
 
-With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections.
+| Column | Values |
+|--------|--------|
+| `OWNER` | The service client that created the shed, or `-` for an admin's shed |
+| `MOUNTS` | The shed's server-mount selection: `all`, `none`, or the selected names (`claude,gh`); `-` when the server does not report one (an older server) |
+| `NETWORK` | `open` or `isolated`; `-` when the server does not report one |
+
+With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)).
 
 ### shed start
 
@@ -807,7 +822,9 @@ Opens `/bin/bash` in the shed, landing in the shed's landing directory — the s
 
 ### shed exec
 
-Executes a command in a shed.
+Executes a command in a shed, over SSH. (A program that wants to run commands
+without an SSH client can use the server's HTTPS endpoint,
+[`POST /api/sheds/{name}/exec`](api.md#post-apishedsnameexec), instead.)
 
 ```bash
 shed exec <name> <command...>
@@ -1349,6 +1366,71 @@ sudo shed-server uninstall
 ```
 
 Stops the service, disables it, and removes the unit file.
+
+### shed-server client issue
+
+Signs a certificate for a [service client](../guides/orchestrated-sheds.md) and
+prints its JSON bundle. Run it on the shed host, as the user that runs `serve`,
+with the same `--config`: it uses the same state directory (`state_dir`), so the
+bundle's CA and TLS pin match the running server.
+
+```bash
+sudo shed-server client issue <name> [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ttl` | the client's `cert_max_ttl` | Certificate lifetime as a Go duration (`720h`); may not exceed `cert_max_ttl` |
+| `--out` | stdout | Write the bundle to this new file (mode `0600`; an existing file or a symlink is refused) and print a one-line summary to stderr |
+| `--config` | Auto-detect | Path to server config file |
+
+`<name>` must be under `auth.clients`, and the server must run `auth.mode: mtls`.
+The bundle is one JSON object:
+
+```json
+{
+  "client": "nocturn",
+  "auth_mode": "mtls",
+  "https_port": 8443,
+  "tls_cert_fingerprint": "sha256:…",
+  "client_cert": "-----BEGIN CERTIFICATE-----\n…",
+  "client_key": "-----BEGIN PRIVATE KEY-----\n…",
+  "cert_serial": "5f0c…",
+  "expires_at": "2027-02-09T03:00:00Z"
+}
+```
+
+The bundle holds a private key: store it as a secret. Each run signs a new
+certificate; earlier ones stay valid until they expire or the client is removed
+from `auth.clients` and `serve` is restarted.
+
+### shed-server client list
+
+Lists the configured service clients and their policies.
+
+```bash
+shed-server client list [--json] [--config <path>]
+```
+
+The table has `NAME`, `PREFIX`, `MAX SHEDS`, `MAX AGE`, `CERT MAX TTL`,
+`NETWORK`, `SERVER MOUNTS`, `IMAGES` and `CAPS`; `--json` prints an array.
+
+### shed-server network teardown
+
+Deletes this server's own nftables tables, `bridge shed_<name>` and
+`inet shed_<name>` (from the config's `name:`, with every character outside
+`[A-Za-z0-9_]` replaced by `_`), which enforce the `isolated` network profile.
+
+```bash
+sudo shed-server network teardown [--config <path>]
+```
+
+Nothing else is touched: not the bridge, not the NAT or `FORWARD` rules, not any
+other table. A missing table, or a missing `nft`, counts as success. The
+command lists the isolated sheds found in this server's metadata, because they
+lose their isolation until `shed-server serve` starts again and reinstalls the
+tables. Stop `serve` first: a running server puts the tables back within 30 s.
+`make dev-server-down-fc` runs it for the parallel dev server.
 
 ## Utility
 

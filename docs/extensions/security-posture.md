@@ -48,6 +48,10 @@ An attacker **cannot**:
 
 **Mitigation**: Audit logs on the host capture every credential operation with the shed name and timestamp. STS tokens expire and become useless.
 
+A shed owned by a [service client](../reference/security.md#service-clients) (an orchestrator) cannot do any of the above: the credential bus is always off for it, so it can request no signature and no credential, and its messages are dropped before they reach a listener.
+
+The bus is only one side. What a compromised guest can reach on the **network** (the host's ports, the LAN, other sheds, a cloud metadata service) is set by its network profile, not by the extensions: an `open` shed reaches whatever the host's NAT reaches, and on Firecracker an `isolated` shed reaches the internet and nothing else. See [Security › Network profiles](../reference/security.md#network-profiles).
+
 ### Compromised Host Agent
 
 The host agent has access to the developer's SSH keys (via SSH_AUTH_SOCK or ~/.ssh/) and AWS credentials (~/.aws/credentials). This is equivalent to the current threat model — a compromised developer machine. No regression.

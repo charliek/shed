@@ -158,3 +158,5 @@ image with no config edit — see
 - [Firecracker Developer Setup](fc-setup.md) — manual setup, custom kernels/images, from source.
 - [Firecracker Operations](../reference/fc-operations.md) — running and debugging the FC backend.
 - [Configuration](../reference/configuration.md) — all server-config fields.
+- [Security Configuration](../guides/security-configuration.md) — server postures, and hardening sheds with `--mounts none` and `--network isolated`.
+- [Orchestrated Sheds](../guides/orchestrated-sheds.md) — letting CI or an agent runner drive its own sheds over the API.

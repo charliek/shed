@@ -1,7 +1,9 @@
 package plugin
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"sync"
 )
 
@@ -11,7 +13,14 @@ type ShedConn struct {
 	Backend string
 	Server  string
 	Send    func(env *Envelope) error // writes MsgTypePluginMessage to vsock
+	// Owned marks a shed a service client owns. The credential bus is off
+	// for it, always: the bridge drops its envelopes to the host, refuses to
+	// send to it, and leaves it out of ListSheds.
+	Owned bool
 }
+
+// ErrCredentialBusDisabled is returned by SendToShed for a client-owned shed.
+var ErrCredentialBusDisabled = errors.New("credential bus is disabled for client-owned sheds")
 
 // ShedConnInfo is the public representation of a connected shed.
 type ShedConnInfo struct {
@@ -26,6 +35,8 @@ type Bridge struct {
 	registry *Registry
 	mu       sync.RWMutex
 	sheds    map[string]*ShedConn
+
+	ownedDropLogged sync.Map // shed name -> true, once a drop was logged
 }
 
 // NewBridge creates a new bridge backed by the given registry.
@@ -59,6 +70,9 @@ func (b *Bridge) ListSheds() []ShedConnInfo {
 
 	result := make([]ShedConnInfo, 0, len(b.sheds))
 	for _, conn := range b.sheds {
+		if conn.Owned {
+			continue
+		}
 		result = append(result, ShedConnInfo{
 			Name:    conn.Name,
 			Backend: conn.Backend,
@@ -69,12 +83,17 @@ func (b *Bridge) ListSheds() []ShedConnInfo {
 }
 
 // PublishToHost enriches the envelope with shed metadata and routes it to the
-// registered listener for the envelope's namespace.
+// registered listener for the envelope's namespace. An envelope from a
+// client-owned shed is dropped (nil error): the credential bus is off for it.
 func (b *Bridge) PublishToHost(shedName string, env *Envelope) error {
 	b.mu.RLock()
 	conn, ok := b.sheds[shedName]
 	b.mu.RUnlock()
 
+	if ok && conn.Owned {
+		b.logOwnedDrop(shedName)
+		return nil
+	}
 	if ok {
 		env.Shed = &ShedInfo{
 			Name:    conn.Name,
@@ -95,6 +114,17 @@ func (b *Bridge) SendToShed(shedName string, env *Envelope) error {
 	if !ok {
 		return fmt.Errorf("shed %q is not connected", shedName)
 	}
+	if conn.Owned {
+		return fmt.Errorf("shed %q: %w", shedName, ErrCredentialBusDisabled)
+	}
 
 	return conn.Send(env)
+}
+
+// logOwnedDrop logs, once per shed name, that an owned shed's envelope was
+// dropped.
+func (b *Bridge) logOwnedDrop(shedName string) {
+	if _, loaded := b.ownedDropLogged.LoadOrStore(shedName, true); !loaded {
+		log.Printf("[%s] credential bus is disabled for client-owned sheds; dropping its plugin messages", shedName)
+	}
 }

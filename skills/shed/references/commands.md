@@ -35,6 +35,9 @@ Client (`shed`) commands only. Server operation (`shed-server setup/serve/instal
 | `--backend <firecracker\|vz>` | Override backend (default: server default) |
 | `--cpus <n>` / `--memory <MB>` | Resource overrides |
 | `--upper-size <size>` | Size of the per-shed writable upper layer, e.g. `5G`, `20G` (default: server config) |
+| `--mounts <all\|none\|a,b>` | Server mounts (the server config's `mounts:`, e.g. `claude`, `gh`) the shed gets; default `all`. `none` or a list needs a server that supports mount selection |
+| `--network <open\|isolated>` | Network profile, fixed at create (default: the server's, usually `open`). `isolated` = internet only, no host/LAN/tailnet/other sheds; Firecracker servers only |
+| `--egress <profiles\|off>` | Egress-control profiles, comma-separated (server must have egress enabled) |
 | `--sync-profile <name>` | Profile to sync after create (default `default`) |
 | `--no-sync` / `--no-provision` | Skip sync / skip provisioning hooks |
 | `--timeout <dur>` | Create timeout, e.g. `30s`, `5m`, `30m` (default `10m`) |
@@ -52,7 +55,11 @@ shed create scratch
 shed create codelens --repo charliek/codelens
 shed create myproj --local-dir ~/projects/myproj
 shed create big --repo org/large-repo --timeout 30m
+shed create untrusted --repo https://github.com/someone/tool.git --mounts none --network isolated   # hardened: no host dirs, internet only (Firecracker)
 ```
+
+`shed list -v` shows `OWNER` (a service client, or `-`), `MOUNTS` (`all`, `none`
+or names) and `NETWORK` (`open`/`isolated`) columns.
 
 ## Interactive access & sessions
 

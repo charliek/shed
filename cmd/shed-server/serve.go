@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/api"
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -82,7 +83,9 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 //
 // mtls adds three things: trust only the internal CA, require a client
 // certificate that verifies against it, and refuse the handshake outright when
-// the identity that certificate names has left the SSH allowlist.
+// the identity that certificate names has left the SSH allowlist (a user
+// certificate) or is not a configured auth.clients entry (a service
+// certificate, which is never checked against the allowlist).
 //
 // The allowlist check is the FIRST of two, not the only one. A TLS peer's
 // identity is established at the handshake and then held for the life of the
@@ -101,25 +104,38 @@ func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientC
 	if cfg.MTLSMode() && clientCA != nil {
 		tlsCfg.ClientCAs = clientCA.Pool()
 		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
-		tlsCfg.VerifyConnection = servertls.AllowlistConnectionVerifier(authorized)
+		// A service certificate (auth.clients) is accepted while its client
+		// is configured and never checked against the SSH allowlist; every
+		// other certificate goes through the allowlist as before.
+		clientKnown := func(name string) bool {
+			_, ok := cfg.ServiceClient(name)
+			return ok
+		}
+		tlsCfg.VerifyConnection = servertls.ClientConnectionVerifier(authorized, clientKnown)
 	}
 	return tlsCfg
 }
 
-// defaultHostKeyPath returns the default path for the SSH host key.
-// Uses /etc/shed/host_key when running as root (Linux servers), otherwise
-// falls back to ~/.shed/host_key (macOS development without sudo).
-func defaultHostKeyPath() string {
-	if os.Getuid() == 0 {
-		return "/etc/shed/host_key"
+// serverStateDir returns the directory that holds the server's identity
+// material: the SSH host key, the HTTPS cert + key (unless tls_cert_file /
+// tls_key_file override them), the mtls client CA and the GitHub key cache.
+// state_dir wins when set; otherwise it is /etc/shed when running as root
+// (Linux servers) and ~/.shed otherwise (macOS development without sudo).
+// `serve` and any command that must see the same identity (the CA, the TLS
+// pin) resolve it here.
+func serverStateDir(cfg *config.ServerConfig) string {
+	if cfg != nil && cfg.StateDir != "" {
+		return config.ExpandPath(cfg.StateDir)
 	}
-	return config.ExpandPath("~/.shed/host_key")
+	if os.Getuid() == 0 {
+		return "/etc/shed"
+	}
+	return config.ExpandPath("~/.shed")
 }
 
 // tlsCertPaths returns the cert + key file paths for the HTTPS listener,
 // honoring tls_cert_file / tls_key_file and otherwise placing them in stateDir
-// (the directory that holds the SSH host key: /etc/shed as root, ~/.shed
-// otherwise).
+// (serverStateDir: the directory that holds the SSH host key).
 func tlsCertPaths(cfg *config.ServerConfig, stateDir string) (certPath, keyPath string) {
 	certPath = filepath.Join(stateDir, "tls_cert.pem")
 	if cfg.TLSCertFile != "" {
@@ -217,6 +233,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// resumeChannels re-opens the message channel of every shed that is
 	// already running (#315). Captured per-backend like attachEgress.
 	var resumeChannels func(context.Context)
+	// startNetPolicy installs the backend's network-policy tables from shed
+	// metadata and starts their presence check (Firecracker only; nil
+	// otherwise). It runs before the resume walk and the listeners.
+	var startNetPolicy func(context.Context)
 	switch cfg.DefaultBackend {
 	case config.BackendFirecracker:
 		fcCfg := cfg.Firecracker
@@ -234,6 +254,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		attachEgress = fcClient.SetEgressManager
 		attachEgressStore = fcClient.SetEgressUserStore
 		resumeChannels = fcClient.ResumeRunningInstances
+		startNetPolicy = fcClient.StartNetworkPolicy
 
 	case config.BackendVZ:
 		vzCfg := cfg.VZ
@@ -263,6 +284,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// extension health until the shed was stopped and started by hand (#315).
 	// Run in the background so a wedged VM can never delay startup; cancelled
 	// on shutdown alongside the other background loops.
+	// Isolated sheds' firewall rules go back in before anything else can
+	// reach a shed: before the resume walk, any create or start, and the
+	// listeners. A failure is logged loudly and the guarded TAPs go down; an
+	// open-only server with no nft makes no call at all.
+	if startNetPolicy != nil {
+		netPolicyCtx, cancelNetPolicy := context.WithCancel(context.Background())
+		defer cancelNetPolicy()
+		startNetPolicy(netPolicyCtx)
+	}
+
 	resumeCtx, cancelResume := context.WithCancel(context.Background())
 	defer cancelResume()
 	log.Printf("Resuming message channels for already-running sheds in the background")
@@ -334,8 +365,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Build the SSH key allowlist (default off = accept all). GitHub-seeded
 	// keys are cached next to the host key. Fails closed (returns an error)
 	// when mode=enforce but no keys resolved.
-	hostKeyPath := defaultHostKeyPath()
-	githubCacheDir := filepath.Join(filepath.Dir(hostKeyPath), "github_keys")
+	stateDir := serverStateDir(cfg)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fmt.Errorf("state dir %s: %w", stateDir, err)
+	}
+	log.Printf("State dir: %s", stateDir)
+	hostKeyPath := filepath.Join(stateDir, "host_key")
+	githubCacheDir := filepath.Join(stateDir, "github_keys")
 	sshAllowlist, err := sshd.NewKeyAllowlist(cfg.EffectiveSSHAuth(), githubCacheDir)
 	if err != nil {
 		return fmt.Errorf("ssh auth: %w", err)
@@ -371,7 +407,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Loaded — never silently regenerated — from the state dir.
 	var clientCA *servertls.CA
 	if cfg.MTLSMode() {
-		caCertPath, caKeyPath := caCertPaths(filepath.Dir(hostKeyPath))
+		caCertPath, caKeyPath := caCertPaths(stateDir)
 		ca, err := servertls.LoadOrGenerateCA(caCertPath, caKeyPath)
 		if err != nil {
 			return fmt.Errorf("client CA: %w", err)
@@ -388,8 +424,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// The audit log (service client requests, HTTPS execs, max_age reaps),
+	// next to the egress audit log in the backend's state directory. On when
+	// auth.clients is set or audit.enabled; a server that needs it and can't
+	// open it does not start.
+	var auditLog *audit.Log
+	if cfg.AuditEnabled() {
+		auditPath := filepath.Join(egressStateDir, audit.FileName)
+		auditLog, err = audit.Open(auditPath, audit.DefaultMaxBytes, audit.DefaultKeep)
+		if err != nil {
+			return fmt.Errorf("audit: open %s: %w", auditPath, err)
+		}
+		defer func() { _ = auditLog.Close() }()
+		log.Printf("Audit log: %s", auditPath)
+	}
+
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
+	apiServer.SetAuditLog(auditLog)               // nil-safe: records nothing when audit is off
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
 	apiServer.SetTokenStore(tokenStore)           // shared with the SSH bootstrap handler (1c)
@@ -431,7 +483,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	var httpsServer *http.Server
 	var tlsFingerprint string
 	if cfg.HTTPSEnabled() {
-		certPath, keyPath := tlsCertPaths(cfg, filepath.Dir(hostKeyPath))
+		certPath, keyPath := tlsCertPaths(cfg, stateDir)
 		cert, der, err := servertls.LoadOrGenerate(certPath, keyPath, cfg.TLSNames)
 		if err != nil {
 			return fmt.Errorf("tls cert: %w", err)
@@ -492,6 +544,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	// The max_age reaper: the only server-side lifetime bound on a service
+	// client's sheds. It runs only when clients are configured. stopReaper
+	// ends it and waits for a stop or delete in progress to finish: it runs
+	// first thing at shutdown, and (deferred, for an error return) before the
+	// audit log and the backend, deferred earlier, close.
+	stopReaper := func() {}
+	if cfg.ServiceClientsEnabled() {
+		log.Printf("Starting the max_age reaper (every %s)", api.DefaultReapInterval)
+		stopReaper = apiServer.StartReaper(api.DefaultReapInterval, time.Now)
+	}
+	defer stopReaper()
+
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -507,7 +571,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Graceful shutdown
+	// Graceful shutdown. The reaper first: a reap that has begun finishes
+	// (an expired shed is not left half torn down, nor its reap unrecorded).
+	if cfg.ServiceClientsEnabled() {
+		log.Printf("Stopping the max_age reaper...")
+	}
+	stopReaper()
+
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 

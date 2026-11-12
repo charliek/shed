@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/version"
 )
@@ -13,13 +14,36 @@ import (
 const (
 	// FeatureOverview signals the GET /api/overview single-call host snapshot.
 	FeatureOverview = "overview"
+	// FeatureHTTPExec signals POST /api/sheds/{name}/exec, the NDJSON exec
+	// over HTTPS (see exec.go).
+	FeatureHTTPExec = "http_exec"
+	// FeatureMountSelection signals the create request's "mounts" field
+	// (and the stored selection on every shed). An older server ignores the
+	// field, so a client must not send it without this token.
+	FeatureMountSelection = config.FeatureMountSelection
+	// FeatureServiceClients signals that this server has service clients
+	// configured (mtls mode with auth.clients): owned sheds, the client
+	// route allowlist and the create policy.
+	FeatureServiceClients = "service_clients"
+	// FeatureNetworkProfiles signals the create request's "network" field
+	// and the isolated profile (a Firecracker server). An older server
+	// ignores the field, so a client must not ask for isolation without it.
+	FeatureNetworkProfiles = config.FeatureNetworkProfiles
 )
 
 // serverFeatures returns the feature-token set as a fresh slice, so the
 // advertised set lives in exactly one place yet no caller can mutate it through
-// the returned value (an append can't alias a shared backing array).
-func serverFeatures() []string {
-	return []string{FeatureOverview}
+// the returned value (an append can't alias a shared backing array). It is a
+// method because some tokens depend on the server's configuration.
+func (s *Server) serverFeatures() []string {
+	features := []string{FeatureOverview, FeatureHTTPExec, FeatureMountSelection}
+	if s.cfg.ServiceClientsEnabled() {
+		features = append(features, FeatureServiceClients)
+	}
+	if s.backend != nil && s.backend.Type() == backend.TypeFirecracker {
+		features = append(features, FeatureNetworkProfiles)
+	}
+	return features
 }
 
 // OverviewServer is the server block of GET /api/overview: the server's version
@@ -65,7 +89,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	resp := OverviewResponse{
-		Server: OverviewServer{Version: version.Info(), Features: serverFeatures()},
+		Server: OverviewServer{Version: version.Info(), Features: s.serverFeatures()},
 		Sheds:  []OverviewShed{},
 	}
 	var warnings []string

@@ -29,10 +29,10 @@ When you run `shed create`, the following steps execute in order:
 | Step | Firecracker | VZ |
 |------|-------------|-----|
 | 1. Storage setup | Copy base rootfs to instance directory | Copy base rootfs to instance directory |
-| 2. VM start | Spawn Firecracker process, allocate TAP device and IP, wait for agent health | Spawn vfkit process, wait for agent health |
+| 2. VM start | Allocate TAP device and IP, install an isolated shed's firewall entry before the VM starts, spawn Firecracker process, wait for agent health | Spawn vfkit process, wait for agent health |
 | 3. Local-dir mount | 9P mount at `/home/shed/<basename>` (plus each `--add-dir`) | VirtioFS mount at `/home/shed/<basename>` (plus each `--add-dir`) |
-| 4. Mount setup | All `mounts:` entries mounted via 9P | All `mounts:` entries mounted via VirtioFS |
-| 5. Repo clone | `git clone` into `/home/shed/<reponame>` (skipped if `--local-dir`) | Same |
+| 4. Mount setup | The shed's selected server mounts (`--mounts`; all by default) mounted via 9P | The shed's selected server mounts (`--mounts`; all by default) mounted via VirtioFS |
+| 5. Repo clone | `git clone` into `/home/shed/<reponame>` (skipped if `--local-dir`), with the server's `env_file` variables (a service client's shed: without them) | Same |
 | 6. Install hook | Runs via vsock; state file marks completion | Same as Firecracker |
 | 7. Startup hook | Runs via vsock | Same as Firecracker |
 | 8. Auto-sync | Default [sync](sync.md) profile from `~/.shed/sync.yaml` runs (unless `--no-sync`) | Same |
@@ -45,9 +45,9 @@ When you run `shed start` on a stopped shed, the sequence is shorter:
 
 | Step | Firecracker | VZ |
 |------|-------------|-----|
-| 1. VM start | Spawn Firecracker process, wait for agent health | Spawn vfkit process, wait for agent health |
+| 1. VM start | Reinstall an isolated shed's firewall entry, spawn Firecracker process, wait for agent health | Spawn vfkit process, wait for agent health |
 | 2. Local-dir re-mount | 9P re-mount (mounts do not persist across VM reboots) | VirtioFS re-mount (mounts do not persist across VM reboots) |
-| 3. Mount refresh | All `mounts:` entries re-mounted via 9P | All `mounts:` entries re-mounted via VirtioFS |
+| 3. Mount refresh | The shed's selected server mounts (`--mounts`; all by default) re-mounted via 9P | The shed's selected server mounts re-mounted via VirtioFS |
 | 4. Startup hook | Runs (install hook skipped — state file records it already ran) | Same |
 
 No storage setup, repo clone, install hook, or auto-sync on start.
@@ -82,6 +82,7 @@ Not all failures during create are fatal:
 |------|-----------|
 | Storage setup, VM start, agent health check | **Fatal** — create fails, resources cleaned up |
 | Local-dir mount | **Fatal** — VM stopped, create fails |
+| Isolated profile rules (Firecracker) | **Fatal** — create (or start) fails with `503 NETWORK_ENFORCEMENT_UNAVAILABLE` before the VM boots |
 | Mount setup | Warning logged, create continues |
 | Repo clone | Warning logged, create continues |
 | Provisioning hooks | Warning logged, create continues |

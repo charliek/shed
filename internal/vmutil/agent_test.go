@@ -3,9 +3,11 @@ package vmutil
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -679,5 +681,149 @@ func TestExecFoldsStderrWhenNilStderr(t *testing.T) {
 	// Frames arrive in order out-1, err-1(folded), out-2 (unknown ignored).
 	if stdout.String() != "out-1err-1out-2" {
 		t.Errorf("folded stdout = %q, want %q", stdout.String(), "out-1err-1out-2")
+	}
+}
+
+// TestExecOnStartedFiresOnceAfterRequest: OnStarted runs exactly once, only
+// after the agent has the exec request, and before any output is delivered.
+func TestExecOnStartedFiresOnceAfterRequest(t *testing.T) {
+	gotReq := make(chan struct{})
+	dialer := &pipeDialer{
+		handler: func(conn net.Conn) {
+			defer conn.Close()
+			msgType, _, err := agentproto.ReadMessage(conn)
+			if err != nil || msgType != agentproto.MsgTypeExecRequest {
+				return
+			}
+			close(gotReq)
+			agentproto.ReadMessage(conn) // stdin EOF
+			agentproto.WriteData(conn, []byte("out"))
+			agentproto.WriteExitCode(conn, 0)
+		},
+	}
+	client := NewAgentClient(dialer, 1024, 1026)
+
+	var mu sync.Mutex
+	calls := 0
+	var output strings.Builder
+	opts := backend.ExecOptions{
+		Cmd: []string{"echo"},
+		Stdout: NopWriteCloser(writerFunc(func(p []byte) (int, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 1 {
+				t.Errorf("output delivered with OnStarted called %d times", calls)
+			}
+			return output.Write(p)
+		})),
+		OnStarted: func() {
+			// Called before the request was written, this would wait in vain:
+			// the agent cannot have read a request that is not sent yet.
+			select {
+			case <-gotReq:
+			case <-time.After(2 * time.Second):
+				t.Error("OnStarted ran before the agent received the exec request")
+			}
+			mu.Lock()
+			calls++
+			mu.Unlock()
+		},
+	}
+	if err := client.Exec(context.Background(), opts); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("OnStarted called %d times, want 1", calls)
+	}
+	if output.String() != "out" {
+		t.Errorf("output %q", output.String())
+	}
+}
+
+// TestExecOnStartedNotCalledWhenRequestFails: a request the agent never got
+// (here, a dial failure) never reports a start.
+func TestExecOnStartedNotCalledWhenRequestFails(t *testing.T) {
+	client := NewAgentClient(&errDialer{err: errors.New("no route")}, 1024, 1026)
+	called := false
+	err := client.Exec(context.Background(), backend.ExecOptions{Cmd: []string{"true"}, OnStarted: func() { called = true }})
+	if err == nil || called {
+		t.Fatalf("err %v, OnStarted called %v", err, called)
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// stalledGuestDialer is a guest that accepts the connection and never reads,
+// so the host's first write blocks (net.Pipe has no buffer). closed is closed
+// when the host side of the connection is closed.
+type stalledGuestDialer struct {
+	closed chan struct{}
+}
+
+func (d *stalledGuestDialer) Dial(context.Context, uint32) (net.Conn, error) {
+	client, server := net.Pipe()
+	go func() {
+		// Never read. A write on a pipe blocks until the peer reads (it
+		// never will) or the peer closes, which makes it fail.
+		_, _ = server.Write([]byte{0})
+		close(d.closed)
+	}()
+	return client, nil
+}
+
+// TestExecBoundedWhenGuestStopsReading: a guest that never reads the request
+// (or the stdin EOF) must not hold Exec past its context, whether the
+// context's deadline passes or it is cancelled, and the connection is closed.
+func TestExecBoundedWhenGuestStopsReading(t *testing.T) {
+	big := strings.Repeat("x", 1<<20)
+	cases := []struct {
+		name  string
+		ctx   func() (context.Context, context.CancelFunc)
+		want  error
+		stdin bool
+	}{
+		{"deadline", func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 100*time.Millisecond)
+		}, context.DeadlineExceeded, false},
+		{"cancel", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			time.AfterFunc(100*time.Millisecond, cancel)
+			return ctx, cancel
+		}, context.Canceled, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &stalledGuestDialer{closed: make(chan struct{})}
+			client := NewAgentClient(d, 1024, 1026)
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			opts := backend.ExecOptions{Cmd: []string{"echo", big}, Env: []string{"BIG=" + big}}
+			if tc.stdin {
+				opts.Stdin = io.NopCloser(strings.NewReader("in"))
+			}
+			started := false
+			opts.OnStarted = func() { started = true }
+
+			errc := make(chan error, 1)
+			go func() { errc <- client.Exec(ctx, opts) }()
+			select {
+			case err := <-errc:
+				if !errors.Is(err, tc.want) {
+					t.Errorf("Exec() = %v, want %v", err, tc.want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Exec blocked on a guest that does not read, past its context")
+			}
+			if started {
+				t.Error("OnStarted was called though the request was never written")
+			}
+			select {
+			case <-d.closed:
+			case <-time.After(5 * time.Second):
+				t.Error("the guest connection was not closed")
+			}
+		})
 	}
 }

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -67,6 +68,13 @@ type ServerConfig struct {
 	// Empty (default) places them next to the SSH host key.
 	TLSCertFile string `yaml:"tls_cert_file,omitempty"`
 	TLSKeyFile  string `yaml:"tls_key_file,omitempty"`
+	// StateDir is the directory holding the server's identity material: the
+	// SSH host key, the HTTPS cert + key (unless tls_cert_file/tls_key_file
+	// say otherwise), the mtls client CA and the GitHub key cache. Empty
+	// (default) is /etc/shed as root and ~/.shed otherwise. Set it when two
+	// servers share a host, so the second does not adopt the first's
+	// identity. Absolute or ~/-relative; created 0700 at serve start.
+	StateDir string `yaml:"state_dir,omitempty"`
 
 	// Mounts are host directories mounted into every shed (e.g. ~/.ssh,
 	// ~/.config/gh). This was previously named "credentials".
@@ -104,6 +112,18 @@ type ServerConfig struct {
 	// Auth configures optional authentication. Default (nil) preserves the
 	// legacy accept-all behavior.
 	Auth *AuthConfig `yaml:"auth,omitempty"`
+
+	// Exec bounds the HTTPS exec endpoint. Default (nil) applies the
+	// defaults below.
+	Exec *ExecConfig `yaml:"exec,omitempty"`
+
+	// Audit configures the audit log. Default (nil) leaves it off unless
+	// auth.clients is set.
+	Audit *AuditConfig `yaml:"audit,omitempty"`
+
+	// Network sets the default network profile and the isolated profile's
+	// allowed ranges. Default (nil) is the open profile for every shed.
+	Network *NetworkConfig `yaml:"network,omitempty"`
 
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
@@ -204,6 +224,160 @@ func (c *ServerConfig) TokenTTL() time.Duration {
 	return DefaultTokenTTL
 }
 
+// Exec endpoint defaults (exec.* in server.yaml).
+const (
+	DefaultExecMaxStdinBytes        int64 = 1 << 20
+	DefaultExecMaxTimeout                 = time.Hour
+	DefaultExecMaxConcurrentPerShed       = 8
+	// minExecMaxTimeout is the smallest exec.max_timeout accepted.
+	minExecMaxTimeout = time.Second
+)
+
+// ExecMaxStdinBytes is exec.max_stdin_bytes, or its default when unset.
+func (c *ServerConfig) ExecMaxStdinBytes() int64 {
+	if c.Exec != nil && c.Exec.MaxStdinBytes > 0 {
+		return c.Exec.MaxStdinBytes
+	}
+	return DefaultExecMaxStdinBytes
+}
+
+// ExecMaxTimeout is exec.max_timeout, or its default when unset.
+func (c *ServerConfig) ExecMaxTimeout() time.Duration {
+	if c.Exec != nil && c.Exec.MaxTimeout > 0 {
+		return c.Exec.MaxTimeout.Duration()
+	}
+	return DefaultExecMaxTimeout
+}
+
+// ExecMaxConcurrentPerShed is exec.max_concurrent_per_shed, or its default
+// when unset.
+func (c *ServerConfig) ExecMaxConcurrentPerShed() int {
+	if c.Exec != nil && c.Exec.MaxConcurrentPerShed > 0 {
+		return c.Exec.MaxConcurrentPerShed
+	}
+	return DefaultExecMaxConcurrentPerShed
+}
+
+// validateExec checks the optional exec block: no negative values, and a set
+// max_timeout of at least one second. Zero means "use the default". Shared by
+// Validate and ValidateNoHostCoupling.
+func (c *ServerConfig) validateExec() error {
+	if c.Exec == nil {
+		return nil
+	}
+	if c.Exec.MaxStdinBytes < 0 {
+		return fmt.Errorf("invalid exec.max_stdin_bytes: %d (must be positive)", c.Exec.MaxStdinBytes)
+	}
+	if c.Exec.MaxConcurrentPerShed < 0 {
+		return fmt.Errorf("invalid exec.max_concurrent_per_shed: %d (must be positive)", c.Exec.MaxConcurrentPerShed)
+	}
+	if d := c.Exec.MaxTimeout.Duration(); d < 0 || (d > 0 && d < minExecMaxTimeout) {
+		return fmt.Errorf("invalid exec.max_timeout: %s (must be at least %s)", d, minExecMaxTimeout)
+	}
+	return nil
+}
+
+// AuditEnabled reports whether the audit log is on: auth.clients is set, or
+// audit.enabled is true.
+func (c *ServerConfig) AuditEnabled() bool {
+	if c.Auth != nil && len(c.Auth.Clients) > 0 {
+		return true
+	}
+	return c.Audit != nil && c.Audit.Enabled
+}
+
+// AuditExecArgvFull reports whether exec.end lines record the whole argv
+// (audit.exec_argv: full) rather than argv[0] and the count.
+func (c *ServerConfig) AuditExecArgvFull() bool {
+	return c.Audit != nil && c.Audit.ExecArgv == AuditExecArgvFull
+}
+
+// validateAudit checks the optional audit block. Shared by Validate and
+// ValidateNoHostCoupling.
+func (c *ServerConfig) validateAudit() error {
+	if c.Audit == nil {
+		return nil
+	}
+	switch c.Audit.ExecArgv {
+	case "", AuditExecArgvFull:
+		return nil
+	default:
+		return fmt.Errorf("invalid audit.exec_argv: %q (must be empty or %q)", c.Audit.ExecArgv, AuditExecArgvFull)
+	}
+}
+
+// NetworkDefaultProfile is network.default_profile, or "open" when unset.
+func (c *ServerConfig) NetworkDefaultProfile() string {
+	if c != nil && c.Network != nil && c.Network.DefaultProfile != "" {
+		return c.Network.DefaultProfile
+	}
+	return NetworkProfileOpen
+}
+
+// NetworkAllowCIDRs is network.allow_cidrs in canonical form (each the
+// network address of its prefix, as nft wants it). Entries are validated at
+// load (validateNetwork); one that does not parse is skipped here.
+func (c *ServerConfig) NetworkAllowCIDRs() []string {
+	if c == nil || c.Network == nil {
+		return nil
+	}
+	out := make([]string, 0, len(c.Network.AllowCIDRs))
+	for _, s := range c.Network.AllowCIDRs {
+		if _, n, err := net.ParseCIDR(strings.TrimSpace(s)); err == nil && n.IP.To4() != nil {
+			out = append(out, n.String())
+		}
+	}
+	return out
+}
+
+// validateNetwork checks the network block and every service client's
+// policy.network: known profile names, and allow_cidrs as IPv4 CIDRs. Shared
+// by Validate and ValidateNoHostCoupling; the backend check is separate
+// (validateNetworkBackend), after the backend is resolved.
+func (c *ServerConfig) validateNetwork() error {
+	if c.Network != nil {
+		if p := c.Network.DefaultProfile; p != "" && !ValidNetworkProfile(p) {
+			return fmt.Errorf("invalid network.default_profile: %q (must be %s or %s)", p, NetworkProfileOpen, NetworkProfileIsolated)
+		}
+		for _, s := range c.Network.AllowCIDRs {
+			ip, _, err := net.ParseCIDR(strings.TrimSpace(s))
+			if err != nil || ip.To4() == nil {
+				return fmt.Errorf("invalid network.allow_cidrs entry %q (must be an IPv4 CIDR such as 192.168.1.0/24)", s)
+			}
+		}
+	}
+	if c.Auth != nil {
+		for name, cc := range c.Auth.Clients {
+			if p := cc.Policy.Network; p != "" && !ValidNetworkProfile(p) {
+				return fmt.Errorf("invalid auth.clients.%s.policy.network: %q (must be %s or %s)", name, p, NetworkProfileOpen, NetworkProfileIsolated)
+			}
+		}
+	}
+	return nil
+}
+
+// validateNetworkBackend refuses a non-open profile the resolved backend
+// cannot enforce: VZ offers only "open", so a non-open
+// network.default_profile, or a service client whose policy.network is not
+// open (the default is isolated), is refused there. Run after default_backend
+// is resolved.
+func (c *ServerConfig) validateNetworkBackend() error {
+	if c.DefaultBackend != BackendVZ {
+		return nil
+	}
+	if p := c.NetworkDefaultProfile(); p != NetworkProfileOpen {
+		return fmt.Errorf("network.default_profile: %s is not supported by the vz backend (only %s; isolation needs firecracker)", p, NetworkProfileOpen)
+	}
+	if c.Auth != nil {
+		for name, cc := range c.Auth.Clients {
+			if p := cc.Policy.NetworkProfile(); p != NetworkProfileOpen {
+				return fmt.Errorf("auth.clients.%s.policy.network is %s (the default when unset), which the vz backend cannot enforce; set network: %s", name, p, NetworkProfileOpen)
+			}
+		}
+	}
+	return nil
+}
+
 // validateAuth checks the optional auth config. Shared by Validate and
 // ValidateNoHostCoupling.
 func (c *ServerConfig) validateAuth() error {
@@ -252,7 +426,125 @@ func (c *ServerConfig) validateAuth() error {
 	if c.HTTPSPort > 0 && !enforced {
 		return fmt.Errorf("https_port requires auth.mode: token or mtls (an open-mode server serves plain http only)")
 	}
+	return c.validateClients()
+}
+
+// clientNamePattern is the shape of a service client's name (auth.clients
+// key). It can never match an SSH key fingerprint (no ':'), so a service
+// certificate's CN and a user certificate's CN cannot be confused.
+var clientNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+
+// clientNamePrefixPattern is the shape of policy.name_prefix: the start of a
+// valid shed name.
+var clientNamePrefixPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+
+// ValidClientName reports whether s is a valid service client name.
+func ValidClientName(s string) bool { return clientNamePattern.MatchString(s) }
+
+// ServiceClientsEnabled reports whether service clients are configured and
+// usable: mtls mode with at least one auth.clients entry.
+func (c *ServerConfig) ServiceClientsEnabled() bool {
+	return c.MTLSMode() && c.Auth != nil && len(c.Auth.Clients) > 0
+}
+
+// ServiceClient returns the named service client's config, or false when
+// there is no such client or service clients are not enabled (any mode other
+// than mtls). The config is static for the life of the process, so removing a
+// client and restarting revokes its certificates.
+func (c *ServerConfig) ServiceClient(name string) (*ServiceClientConfig, bool) {
+	if !c.ServiceClientsEnabled() {
+		return nil, false
+	}
+	cc, ok := c.Auth.Clients[name]
+	if !ok {
+		return nil, false
+	}
+	return &cc, true
+}
+
+// validateClients checks auth.clients: refused outside mtls; each client's
+// name, cert_max_ttl and policy. The image aliases are checked separately
+// (validateClientImages), by Validate only, because they belong to the active
+// backend's block. Called from validateAuth, so both validators run it.
+func (c *ServerConfig) validateClients() error {
+	if c.Auth == nil || len(c.Auth.Clients) == 0 {
+		return nil
+	}
+	if !c.MTLSMode() {
+		return fmt.Errorf("auth.clients requires auth.mode: mtls")
+	}
+	for name, cc := range c.Auth.Clients {
+		key := "auth.clients." + name
+		if !ValidClientName(name) {
+			return fmt.Errorf("invalid auth.clients name %q (must match %s)", name, clientNamePattern)
+		}
+		if cc.CertMaxTTL < 0 {
+			return fmt.Errorf("%s.cert_max_ttl must be positive", key)
+		}
+		p := cc.Policy
+		switch {
+		case p.NamePrefix == "":
+			return fmt.Errorf("%s.policy.name_prefix is required", key)
+		case !clientNamePrefixPattern.MatchString(p.NamePrefix) || len(p.NamePrefix) >= MaxShedNameLength:
+			return fmt.Errorf("%s.policy.name_prefix %q must be lowercase alphanumeric with hyphens, start with a letter, and be shorter than %d characters", key, p.NamePrefix, MaxShedNameLength)
+		case p.MaxSheds < 1:
+			return fmt.Errorf("%s.policy.max_sheds is required and must be at least 1", key)
+		case p.MaxAge <= 0:
+			return fmt.Errorf("%s.policy.max_age is required and must be positive", key)
+		case p.Caps.CPUs < 0 || p.Caps.MemoryMB < 0:
+			return fmt.Errorf("%s.policy.caps must not be negative", key)
+		}
+		for _, m := range p.ServerMounts {
+			if _, ok := c.Mounts[m]; !ok {
+				return fmt.Errorf("%s.policy.server_mounts names %q, which is not in mounts", key, m)
+			}
+		}
+	}
 	return nil
+}
+
+// validateClientImages checks that every auth.clients policy.images entry is
+// an alias in the active backend's image_aliases. Validate only: it needs the
+// resolved backend.
+func (c *ServerConfig) validateClientImages() error {
+	if c.Auth == nil || len(c.Auth.Clients) == 0 {
+		return nil
+	}
+	var aliases map[string]string
+	switch c.DefaultBackend {
+	case BackendFirecracker:
+		if c.Firecracker != nil {
+			aliases = c.Firecracker.ImageAliases
+		}
+	case BackendVZ:
+		if c.VZ != nil {
+			aliases = c.VZ.ImageAliases
+		}
+	}
+	for name, cc := range c.Auth.Clients {
+		for _, img := range cc.Policy.Images {
+			if _, ok := aliases[img]; !ok {
+				return fmt.Errorf("auth.clients.%s.policy.images names %q, which is not an image alias of the %s backend", name, img, c.DefaultBackend)
+			}
+		}
+	}
+	return nil
+}
+
+// ActiveDefaultResources returns the active backend's default_cpus and
+// default_memory_mb, the values a create that sets neither gets.
+func (c *ServerConfig) ActiveDefaultResources() (cpus, memoryMB int) {
+	switch c.DefaultBackend {
+	case BackendFirecracker:
+		if c.Firecracker != nil {
+			return c.Firecracker.DefaultCPUs, c.Firecracker.DefaultMemoryMB
+		}
+	case BackendVZ:
+		if c.VZ != nil {
+			return c.VZ.DefaultCPUs, c.VZ.DefaultMemoryMB
+		}
+	}
+	return 0, 0
 }
 
 // HTTPListenAddr returns the bind address for the plain-HTTP listener, honoring
@@ -342,6 +634,19 @@ func (c *ServerConfig) validateNetworkSurface() error {
 	}
 	if c.HTTPSPort > 0 && (c.HTTPSPort == c.HTTPPort || c.HTTPSPort == c.SSHPort) {
 		return fmt.Errorf("https_port (%d) must differ from http_port and ssh_port", c.HTTPSPort)
+	}
+	return nil
+}
+
+// validateStateDir refuses a relative state_dir: it would resolve against
+// whatever directory serve was started from. Shared by Validate and
+// ValidateNoHostCoupling.
+func (c *ServerConfig) validateStateDir() error {
+	if c.StateDir == "" {
+		return nil
+	}
+	if p := ExpandPath(c.StateDir); !filepath.IsAbs(p) {
+		return fmt.Errorf("state_dir must be an absolute path or start with ~/ (got %q)", c.StateDir)
 	}
 	return nil
 }
@@ -1454,6 +1759,61 @@ func rejectRemovedNetworkKeys(data []byte) error {
 	return nil
 }
 
+// rejectUnknownClientKeys fails loudly on an unknown key anywhere under
+// auth.clients. The typed unmarshal is lenient (it ignores unknown fields), and
+// a typo in a security policy (say `max_shed:`) must not be silently dropped.
+// The subtree is re-encoded and decoded strictly into the typed form.
+func rejectUnknownClientKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	auth, ok := raw["auth"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	clients, present := auth["clients"]
+	if !present || clients == nil {
+		return nil
+	}
+	sub, err := yaml.Marshal(clients)
+	if err != nil {
+		return fmt.Errorf("auth.clients: %w", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(sub))
+	dec.KnownFields(true)
+	var typed map[string]ServiceClientConfig
+	if err := dec.Decode(&typed); err != nil {
+		return fmt.Errorf("auth.clients: %w", err)
+	}
+	return nil
+}
+
+// rejectUnknownNetworkKeys fails loudly on an unknown key under network:
+// (say `default_profle:`), for the same reason as rejectUnknownClientKeys: a
+// typo in an isolation setting must not be silently dropped.
+func rejectUnknownNetworkKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	block, present := raw["network"]
+	if !present || block == nil {
+		return nil
+	}
+	sub, err := yaml.Marshal(block)
+	if err != nil {
+		return fmt.Errorf("network: %w", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(sub))
+	dec.KnownFields(true)
+	var typed NetworkConfig
+	if err := dec.Decode(&typed); err != nil {
+		return fmt.Errorf("network: %w", err)
+	}
+	return nil
+}
+
 // LoadServerConfig loads server configuration from standard locations.
 // It checks in order: ./server.yaml, ~/.config/shed/server.yaml, /etc/shed/server.yaml
 func LoadServerConfig() (*ServerConfig, error) {
@@ -1491,6 +1851,7 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 func rejectRemovedKeys(data []byte) error {
 	for _, check := range []func([]byte) error{
 		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys,
+		rejectUnknownClientKeys, rejectUnknownNetworkKeys,
 	} {
 		if err := check(data); err != nil {
 			return err
@@ -1819,6 +2180,18 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if err := c.validateAuth(); err != nil {
 		return err
 	}
+	if err := c.validateStateDir(); err != nil {
+		return err
+	}
+	if err := c.validateExec(); err != nil {
+		return err
+	}
+	if err := c.validateAudit(); err != nil {
+		return err
+	}
+	if err := c.validateNetwork(); err != nil {
+		return err
+	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[c.LogLevel] {
@@ -1856,7 +2229,7 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 			return fmt.Errorf("vz configuration is required when backend is vz")
 		}
 	}
-	return nil
+	return c.validateNetworkBackend()
 }
 
 // ActiveDefaultImage returns the resolved default_image for the configured
@@ -1894,6 +2267,18 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := c.validateAuth(); err != nil {
+		return err
+	}
+	if err := c.validateStateDir(); err != nil {
+		return err
+	}
+	if err := c.validateExec(); err != nil {
+		return err
+	}
+	if err := c.validateAudit(); err != nil {
+		return err
+	}
+	if err := c.validateNetwork(); err != nil {
 		return err
 	}
 
@@ -1967,6 +2352,14 @@ func (c *ServerConfig) Validate() error {
 	// Validate egress config if present (compiles profiles/CEL, fails fast).
 	if err := c.Egress.Validate(); err != nil {
 		return fmt.Errorf("egress config: %w", err)
+	}
+
+	// Service clients' image aliases need the resolved backend's block.
+	if err := c.validateClientImages(); err != nil {
+		return err
+	}
+	if err := c.validateNetworkBackend(); err != nil {
+		return err
 	}
 
 	return nil

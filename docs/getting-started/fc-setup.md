@@ -15,7 +15,14 @@ and `shed-server` on a separate Linux box you SSH into.
 - Linux host with KVM support (`/dev/kvm`)
 - Root access (for network and capability setup)
 - Docker CE (for pulling and converting images). Install from [Docker's official repository](https://docs.docker.com/engine/install/ubuntu/), not the `docker.io` package in Ubuntu's default repositories.
-- **For source builds:** Go 1.24+ on the host where you run
+- **For isolated sheds** (`--network isolated` or `network.default_profile:
+  isolated`): nftables (`command -v nft`; `sudo apt install nftables` if it is
+  missing) and shed-server running as root, as the deb's systemd unit does.
+  shed-server runs `nft` itself as a child process, and a capability set with
+  `setcap` does not pass to it, so the capability-only setup below cannot
+  install the rules. A server with only open sheds needs neither. See
+  [Security › Network profiles](../reference/security.md#network-profiles).
+- **For source builds:** Go 1.27+ on the host where you run
   `scripts/build-firecracker-rootfs.sh` (the script unconditionally
   builds `shed-agent` and `shed-firstboot` with Go). If you don't want
   Go on the remote Linux host, cross-compile the binaries on another
@@ -86,6 +93,9 @@ This performs:
 | NAT | Enables IP forwarding and iptables masquerade rules |
 | Capabilities | Sets `CAP_NET_ADMIN` on `shed-server` and `firecracker` |
 
+`setup` does not install nftables. Install it yourself if you will run
+isolated sheds (see [Prerequisites](#prerequisites)).
+
 The command is idempotent — safe to re-run after upgrades or if something needs to be reconfigured.
 
 ## 3. Pre-cache Images (Optional)
@@ -130,7 +140,7 @@ mounts:
     target: /home/shed/.claude
     readonly: false
 
-# Environment variables passed to git clone and provisioning hooks
+# Environment variables passed to the in-VM git clone of --repo (not to sessions or hooks)
 env_file: /root/.shed/env
 
 # Extensions provide credential brokering from host to VM.
@@ -336,7 +346,7 @@ configuration details.
 
 #### Option B: Build from source
 
-Build rootfs images locally. Requires Go 1.24+ on the host where the
+Build rootfs images locally. Requires Go 1.27+ on the host where the
 script runs (the script compiles `shed-agent` and `shed-firstboot`).
 
 ```bash
@@ -514,6 +524,11 @@ sudo iptables -A INPUT -i shed-br0 -j ACCEPT
 ```
 
 This rule is typically not needed if the default INPUT policy is ACCEPT, which is common on desktop Linux systems.
+
+An ACCEPT rule like this does not reopen an [isolated](../reference/security.md#network-profiles)
+shed: shed-server's own nftables tables drop its traffic independently of
+other tables and chains. An isolated shed can still reach its own 9P ports on
+the bridge, so its server mounts and `--local-dir` mounts keep working.
 
 ## Troubleshooting
 

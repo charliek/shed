@@ -15,6 +15,12 @@ Firecracker microVMs on Linux or Apple Virtualization VMs on macOS Apple Silicon
 - **IDE integration** — native Cursor / VS Code Remote-SSH support.
 - **AI-ready** — pre-configured for Claude Code and OpenCode workflows.
 - **VM backends** — Firecracker microVMs (Linux) or Apple VZ (macOS Apple Silicon).
+- **Hardened sheds** — `--mounts none` keeps host directories out of a shed's mounts, and on
+  Firecracker `--network isolated` lets it reach the internet and nothing else, enforced by
+  nftables on the host. Use both: on Firecracker an `open` shed with no mounts can still reach
+  another running shed's 9P export on the bridge.
+- **Orchestrator API** — mTLS service clients that create, run commands in
+  (`POST /api/sheds/{name}/exec`) and delete only their own sheds, within a policy.
 
 ## Quick start
 
@@ -56,6 +62,9 @@ pulled registry-direct from `ghcr.io`. See
 - [Getting Started](https://charliek.github.io/shed/getting-started/quick-start/) — quickstarts + developer setup
 - [CLI Reference](https://charliek.github.io/shed/reference/cli/) — every command
 - [Configuration](https://charliek.github.io/shed/reference/configuration/) — client + server config
+- [Security Configuration](https://charliek.github.io/shed/guides/security-configuration/) — choosing a server posture and hardening sheds
+- [Security](https://charliek.github.io/shed/reference/security/) — the model: postures, service clients, mount selection, network profiles
+- [Orchestrated Sheds](https://charliek.github.io/shed/guides/orchestrated-sheds/) — driving sheds from CI or an agent runner
 - [Images](https://charliek.github.io/shed/reference/images/) · [Storage Model](https://charliek.github.io/shed/reference/storage-model/)
 - [Extensions](https://charliek.github.io/shed/reference/extensions/) — credential brokering
 - [Provisioning](https://charliek.github.io/shed/reference/provisioning/) — `.shed/` install/startup hooks + tutorials
@@ -78,7 +87,11 @@ networked — it works locally too. Open mode (plain HTTP, no tokens) stays
 available for a trusted private network (e.g. Tailscale), but exposing it
 off-loopback is explicit. Workloads run as a non-root `shed` user (UID 1000) with
 passwordless sudo. Shed targets single-user setups and is **not** built for
-multi-tenant use.
+multi-tenant use. In mtls mode an orchestrator can be a
+[service client](https://charliek.github.io/shed/reference/security/#service-clients) with a
+policy, which narrows what it can reach through the API; that is a narrow identity, not tenant
+isolation (Firecracker runs without its jailer, for one). Each shed can also be hardened on its
+own, with fewer mounts and, on Firecracker, the `isolated` network.
 
 ## Development
 

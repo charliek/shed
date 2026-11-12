@@ -16,9 +16,11 @@ missing; one `bind_address` faces the network:
   never complete the TLS handshake, let alone reach the router.
 - **[`auth.mode: token`](#token-mode-alternative)** — a bearer token minted
   over SSH. Use this instead when something outside the shed client fleet
-  needs to call the API directly with a bearer header — `curl`, a CI runner, a
-  third-party integration. mtls servers cannot be reached that way at all, so
-  `token` mode is retained and not deprecated.
+  needs admin access to the API with a bearer header — `curl`, a CI runner, a
+  third-party integration. An mtls server has no bearer credential, so `token`
+  mode is retained and not deprecated. A CI runner or agent runner that needs
+  only its own sheds can instead be a [service client](orchestrated-sheds.md)
+  of an mtls server.
 
 Either way, there are no credentials to mint or paste by hand: clients get
 them automatically over SSH.
@@ -64,8 +66,9 @@ auth.mode: mtls requires at least one SSH key source (auth.ssh.github_users, aut
 
 ### Token mode alternative
 
-If you need `curl`/CI/third-party callers to reach the API directly, use
-`auth.mode: token` instead — everything else in this guide (the `bind_address`
+If you need `curl`/CI/third-party callers to reach the API directly as an
+admin, use `auth.mode: token` instead (an orchestrator that needs only its own
+sheds can stay on mtls as a [service client](orchestrated-sheds.md)) — everything else in this guide (the `bind_address`
 requirement, the SSH-first add flow, the rotation story) is the same shape,
 just with a bearer token instead of a certificate:
 
@@ -179,6 +182,33 @@ re-pin clients — this is independent of the client-certificate CA above:
 ```bash
 shed server update shed.example.com --refetch   # fetch the new cert + re-pin
 ```
+
+## Hardening the sheds (Firecracker)
+
+The steps above protect the server's API and SSH. They do not limit what a
+shed can reach: an `open` shed, the default, reaches whatever the host's NAT
+reaches. On a cloud VPS that includes the provider's metadata service at
+`169.254.169.254`, the host's own ports, other sheds and the provider's
+private network. The `isolated` network profile closes all of those, leaving
+the internet. Make it the default for every create:
+
+```yaml
+network:
+  default_profile: isolated    # every shed is internet-only unless created with --network open
+  allow_cidrs: []              # add private ranges the sheds must still reach (a registry on the VPC)
+```
+
+Create the sheds that need more with `shed create <name> --network open`, and
+the ones that should not see the host's directories with `--mounts none`
+(`shed list -v` shows both). `allow_cidrs` opens only routed destinations,
+never the host or other sheds.
+
+The host needs the `nft` binary (`command -v nft`; `sudo apt install
+nftables` if it is missing), and shed-server must run as root, which the deb's
+systemd unit does. With `default_profile: isolated` and no working `nft`,
+every create without `--network open` is refused with
+`503 NETWORK_ENFORCEMENT_UNAVAILABLE`. What the profile blocks, and its limits,
+are in [Security › Network profiles](../reference/security.md#network-profiles).
 
 ## Hardening the add-time trust
 

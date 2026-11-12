@@ -80,7 +80,7 @@ log_level: info
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name` | string | `shed-server` | Server identifier |
+| `name` | string | `shed-server` | Server identifier. Also names this server's nftables tables for the [`isolated` profile](#network-profiles) (`bridge`/`inet shed_<name>`, every character outside `[A-Za-z0-9_]` as `_`), so two servers on one host need names that still differ after that. |
 | `http_port` | int | `8080` | Plain-HTTP API port. **Required in open mode; optional in token/mtls mode** (an enforced mode serves no plain HTTP, so it is omitted from `/api/info` and the written client config entry). |
 | `ssh_port` | int | `2222` | SSH server port |
 | `bind_address` | string | `127.0.0.1` | Interface every listener (HTTP, HTTPS, SSH) binds to. **Defaults to loopback in every mode** — shed is local-first. Set a specific IP (LAN/tailnet), `0.0.0.0` or `*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`; token/mtls mode needs no acknowledgment. |
@@ -88,13 +88,17 @@ log_level: info
 | `trusted_proxy` | bool | `false` | Trust the client-supplied `X-Forwarded-For` header for the request source IP. Only enable behind a reverse proxy that overwrites that header; the default uses the real TCP peer address. |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
 | `mounts` | map | `{}` | Host directories to mount into sheds (formerly `credentials`) |
-| `env_file` | string | - | Path to environment variables file |
+| `env_file` | string | - | Path to a `KEY=value` file whose variables are passed to the in-VM `git clone` of `repo` (git settings and credentials such as `GIT_SSH_COMMAND`); see [Environment File](#environment-file) |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
 | `extensions` | object | `{}` | Extensions to activate in VMs (see [Extensions](extensions.md)) |
 | `git` | object | - | Git behaviour for in-VM clones (see [Git](#git)) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
 | `vz` | object | - | VZ-specific configuration (see below) |
-| `auth` | object | - | Optional authentication (see [SSH authentication](#ssh-authentication)) |
+| `auth` | object | - | Optional authentication (see [SSH authentication](#ssh-authentication)) and, in mtls mode, [service clients](#service-clients) |
+| `state_dir` | string | `/etc/shed` as root, `~/.shed` otherwise | Identity material (see [TLS and network surface](#tls-and-network-surface)). A second server on the same host needs its own `state_dir` and a distinct `name`. |
+| `exec` | object | - | Limits for the HTTPS exec endpoint (see [HTTPS exec](#https-exec)) |
+| `audit` | object | - | The audit log (see [Audit log](#audit-log)) |
+| `network` | object | - | Network profiles (see [Network profiles](#network-profiles)) |
 
 **Note:** Only VM backends are supported. Firecracker is available on Linux. VZ is available on macOS Apple Silicon (arm64). The `detect` backend auto-selects based on platform.
 
@@ -111,8 +115,9 @@ certificate, bound to a key that never leaves the client, issued over SSH
 (`mtls`). Two invariants hold for both enforced modes: **credential ⟺ TLS ⟺
 enforced mode** and **https ⟺ enforced mode**. `mtls` is the **recommended
 posture for anything internet-facing**; `token` is retained (not deprecated)
-because `curl`/scripts/CI/third-party callers can't present a client
-certificate. See [Security](security.md) — in particular [mTLS
+because `curl`/scripts/CI/third-party callers that need admin access can't
+present a client certificate. An orchestrator that needs only its own sheds
+can instead be a [service client](#service-clients) of an mtls server. See [Security](security.md) — in particular [mTLS
 mode](security.md#mtls-mode) — and the [Security Configuration
 guide](../guides/security-configuration.md).
 
@@ -120,12 +125,13 @@ guide](../guides/security-configuration.md).
 |-------------|------------------|----------------|-------|
 | `open` (default) | none | as configured (`auth.ssh.mode: off`/`warn`) | Plain HTTP; `https_port` rejected. |
 | `token` | bearer token, minted over the `_bootstrap` SSH channel | forced `enforce` | TLS-only; `curl`/scripts can present the token directly. `secure` is a permanent deprecated alias, normalized at load with a one-time stderr warning. |
-| `mtls` | client certificate, issued over the `_bootstrap` SSH channel (CSR in, signed cert out); revalidated on every request | forced `enforce` | TLS-only; recommended for internet-facing deployments. Revocation removes the SSH key (coarser than token's per-token revoke). `curl`/scripts cannot authenticate. |
+| `mtls` | client certificate, issued over the `_bootstrap` SSH channel (CSR in, signed cert out); revalidated on every request | forced `enforce` | TLS-only; recommended for internet-facing deployments. Revocation removes the SSH key (coarser than token's per-token revoke). `curl`/scripts cannot authenticate as an admin; a [service client](#service-clients)'s bundle works with `curl --cert`. |
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `auth.mode` | string | `open` | `open` enforces nothing (plain HTTP only); `token`/`mtls` both derive SSH-allowlist enforce + HTTP-credential enforce + TLS-only (`https_port` defaults to `8443`; **no plain-HTTP listener is served**), and **fail to start without a key source**. `secure` is accepted as a deprecated alias for `token`, normalized at load with a one-time stderr warning. |
 | `auth.token_ttl` | duration | `24h` | Lifetime of a bootstrap-minted HTTP token (`token` mode) or issued client certificate (`mtls` mode). Clients refresh/re-enroll transparently near expiry / on an auth failure. |
+| `auth.clients` | map | `{}` | Service clients, keyed by name. **Requires `auth.mode: mtls`** (refused at load otherwise). See [Service clients](#service-clients). |
 
 The pre-v0.7.1 `public_exposure` flag and `auth.http.tokens` list are removed and
 **rejected at startup** — set `auth.mode: token` (or `mtls`) and let
@@ -175,6 +181,7 @@ independent field — it is derived from `auth.mode: token`/`mtls` (there is no
 | `https_port` | int | `8443` in an enforced mode | Serve HTTPS with a self-signed, client-pinned cert, bound to `bind_address`. **Requires `auth.mode: token` or `mtls`** (rejected in open mode); defaults to `8443` there. In `token`/`mtls` mode this is the *only* listener — no plain HTTP is served. In `mtls` mode the listener also runs `RequireAndVerifyClientCert` against the internal CA (see [mTLS mode](security.md#mtls-mode)). |
 | `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs (on the server's own leaf; unrelated to the mtls client-CA). `localhost`, `127.0.0.1`, `::1` are always included. |
 | `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
+| `state_dir` | string | `/etc/shed` as root, `~/.shed` otherwise | Directory for the server's identity material: the SSH host key, the TLS cert + key (unless overridden above), the mtls client CA and the GitHub key cache. Absolute or `~/`-relative; created `0700` at start. Set it when a second server runs on the same host, and give that server a `name` that differs from the first's after sanitization (the `name` also names its nftables tables). |
 | `bind_address` | string | `127.0.0.1` | Interface every listener binds to (loopback by default in every mode). Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`. |
 | `allow_insecure_exposure` | bool | `false` | Acknowledge a non-loopback `bind_address` in **open** mode (no transport security). Ignored in token/mtls mode. |
 | `trusted_proxy` | bool | `false` | Trust `X-Forwarded-For` (only behind a proxy that overwrites it). |
@@ -185,6 +192,99 @@ that mode — it signs client certificates only; the server's own leaf above is
 unaffected. There is no separate config field for it: it is generated lazily,
 logged (fingerprint + expiry) at startup, and surfaced on `GET /api/info` as
 `ca_fingerprint` / `ca_not_after` (see [API reference](api.md#get-apiinfo)).
+
+### Service clients
+
+`auth.clients` declares **service clients**: orchestrators that reach the API
+with a certificate from `shed-server client issue` and may create, run commands
+in and delete only their own sheds, within a policy. They exist only in
+`auth.mode: mtls`. The [Orchestrated sheds guide](../guides/orchestrated-sheds.md)
+walks through setting one up; [Security › Service
+clients](security.md#service-clients) says what a client can and cannot do.
+
+```yaml
+auth:
+  mode: mtls
+  ssh:
+    github_users: [charliek]
+  clients:
+    nocturn:
+      cert_max_ttl: 2160h            # default 90 days
+      policy:
+        name_prefix: "nocturn-"      # required
+        max_sheds: 4                 # required
+        max_age: 30h                 # required
+        network: isolated            # default isolated
+        server_mounts: []            # default none
+        images: []                   # default: the server default image only
+        caps: {cpus: 4, memory_mb: 8192}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth.clients.<name>` | object | - | One client. The name matches `^[a-z][a-z0-9-]{0,62}$`; it is the certificate's identity and the `owner` of the client's sheds. |
+| `auth.clients.<name>.cert_max_ttl` | duration | `2160h` (90 days) | The longest certificate `shed-server client issue` signs for this client, and its default lifetime. |
+| `auth.clients.<name>.policy.name_prefix` | string | required | Every shed the client creates must start with it. Lowercase letters, digits and hyphens, starting with a letter. |
+| `auth.clients.<name>.policy.max_sheds` | int | required, at least 1 | The most sheds the client may own at once, running or stopped (creates in flight count). |
+| `auth.clients.<name>.policy.max_age` | duration | required, positive | How old an owned shed may get. The server stops and deletes an owned shed once it is older than this (checked at start, then every 60 s). |
+| `auth.clients.<name>.policy.network` | string | `isolated` | The network profile every shed of this client gets (`open` or `isolated`); a create that asks for another is refused. On a VZ server it must be set to `open` explicitly. |
+| `auth.clients.<name>.policy.server_mounts` | list | `[]` (none) | Names from the top-level `mounts:` the client's sheds may get. A create that omits `mounts` gets exactly these. Each name must exist in `mounts`. |
+| `auth.clients.<name>.policy.images` | list | `[]` | `image_aliases` keys of the active backend the client may ask for. Empty: only the server's `default_image`. Each must be an alias. |
+| `auth.clients.<name>.policy.caps.cpus` / `caps.memory_mb` | int | `0` (no cap) | Per-shed resource caps, compared after the backend's defaults are applied. |
+
+Unknown keys anywhere under `auth.clients` are refused at load, so a typo in a
+policy fails loudly instead of being ignored. Clients are read once at start:
+**removing a client and restarting `serve` revokes its certificates** (there is
+no serial revocation yet). Configuring any client turns the [audit
+log](#audit-log) on.
+
+### HTTPS exec
+
+Limits for [`POST /api/sheds/{name}/exec`](api.md#post-apishedsnameexec). Every
+field is optional; zero means the default.
+
+```yaml
+exec:
+  max_stdin_bytes: 1048576
+  max_timeout: 1h
+  max_concurrent_per_shed: 8
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `exec.max_stdin_bytes` | int | `1048576` (1 MiB) | Largest decoded `stdin` a request may carry (`413 REQUEST_TOO_LARGE` above it). |
+| `exec.max_timeout` | duration | `1h` | Largest `timeout_seconds` a request may ask for (refused above it, never clamped). At least `1s`. A request with no timeout gets 60 s, or this value if it is lower. |
+| `exec.max_concurrent_per_shed` | int | `8` | HTTPS execs one shed may run at once (`429 EXEC_LIMIT` above it). |
+
+Negative values are refused at load.
+
+### Audit log
+
+shed-server can keep a JSON Lines audit log, `audit.jsonl`, next to
+`egress-audit.jsonl` in the parent of the backend's `instance_dir`
+(`/var/lib/shed/firecracker/audit.jsonl` with the Firecracker defaults,
+`~/Library/Application Support/shed/vz/audit.jsonl` with the VZ defaults). It is
+created `0600` and rotated at 50 MiB, keeping five old files (`audit.jsonl.1`
+is the newest). A server that needs the log and cannot open it does not start.
+
+```yaml
+audit:
+  enabled: true      # on anyway whenever auth.clients is set
+  exec_argv: ""      # "" (argv[0] and the count) or "full"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `audit.enabled` | bool | `false` | Turns the log on for a server without service clients (it then records HTTPS execs). The log is always on when `auth.clients` is set, whatever this says. |
+| `audit.exec_argv` | string | `""` | `""` records only `argv0` and `argc` for each exec; `full` records the whole `argv`, which can carry prompts or secrets. Any other value is refused. |
+
+Each line is one JSON object with `ts` first:
+
+| `event` | Written for | Fields |
+|---------|-------------|--------|
+| `api` | Every service-client request, allowed or refused (401, 403, 404 and policy refusals included). Admin API requests are not logged. | `identity` (`kind: client`, `name`, `serial`), `request_id`, `remote`, `method`, `route` (the matched pattern, `""` when none matched), `path`, `shed`, `status`, `duration_ms` |
+| `exec.end` | Every HTTPS exec, admin or client, that passed the request checks and was handed to the backend, however it ended (a timeout before the command started included). An exec refused with `400`, `404`, `409`, `413` or `429` writes none. | `identity` (`kind: client` or `kind: admin` with `subject`), `request_id`, `shed`, `argv0` and `argc` (or `argv` with `exec_argv: full`), `exit_code` (`-1` when there is none), `timed_out`, `truncated`, `disconnected`, `duration_ms` |
+| `reap` | Each shed the `max_age` reaper deleted | `shed`, `owner`, `age_seconds`, `error` (when the delete failed) |
 
 ### Mounts
 
@@ -209,6 +309,14 @@ mounts:
 **Mount sources must be directories.** Single-file mounts are not supported. For individual config files like `.gitconfig`, use [`shed sync`](sync.md) to push them as dotfiles. For SSH-based git authentication, use the SSH agent forwarding extension instead of mounting `~/.ssh`.
 
 **Missing sources:** If a mount's source path does not exist on the host, it is skipped with a log warning. Create the source directory on the host before starting the shed.
+
+**Per-shed selection:** by default every shed gets every mount, as before. A
+shed can be created with fewer: `shed create --mounts none` or
+`--mounts claude,gh` (the API's `mounts` field). The selection is stored with
+the shed and applies on every start, including an SSH auto-start; a selected
+name that is later removed from `mounts:` is skipped with a log line. A
+[service client](#service-clients)'s sheds get only its `server_mounts`
+(none by default).
 
 **Common mounts:**
 
@@ -379,6 +487,35 @@ egress:
 | `default` | `[]` | Profiles applied to sheds created without `--egress`. `[]`/absent = no egress for those sheds. |
 | `profiles` | `{}` | Named policy fragments (`allow`/`deny` globs, `mode: audit`, or a CEL `rule`). Names `off`/`none`/`default` are reserved. |
 
+## Network profiles
+
+Each shed has a network profile, fixed at create: `open` (today's network, the
+default) or `isolated` (the internet and nothing else: not the host, other
+sheds, private, CGNAT/tailnet, link-local or multicast ranges, and no IPv6).
+`isolated` is enforced by nftables tables shed-server owns, and is available on
+Firecracker only. See [Security › Network profiles](security.md#network-profiles)
+for what it guarantees and its limits.
+
+```yaml
+network:
+  default_profile: open        # open (default) | isolated
+  allow_cidrs: []              # IPv4 ranges isolated sheds may still reach
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `network.default_profile` | string | `open` | The profile a create that names none gets (`shed create` without `--network`). `isolated` requires the Firecracker backend; a VZ server refuses it at load. |
+| `network.allow_cidrs` | list | `[]` | IPv4 CIDRs an isolated shed may reach although they fall in a blocked range (a LAN registry, say). Forwarded traffic only: they never open the host itself or other sheds. |
+
+Unknown keys under `network:` are refused at load. A server with no isolated
+sheds and an `open` default installs no rules and needs no `nft` binary; one
+that needs them (an isolated shed exists, or the default is `isolated`) needs
+`nft` on its `PATH` (tested with nftables 1.0.9), run with the server's own
+privileges, so the server must be allowed to change nftables (the deb
+package's unit runs it as root). If it cannot install them, an isolated shed
+is refused (`503 NETWORK_ENFORCEMENT_UNAVAILABLE`), never run unguarded. A service client's
+sheds use its `policy.network` instead of the default.
+
 ## Firecracker Configuration
 
 When enabling Firecracker, configure the Firecracker-specific settings:
@@ -524,12 +661,15 @@ See [VZ Setup](../getting-started/vz-setup.md) for setup details.
 
 **Location:** As configured in `env_file` (typically `~/.shed/env`)
 
-Environment variables injected into all containers:
+`KEY=value` lines, passed as the environment of the in-VM `git clone` that
+`shed create --repo` runs, so a private repository can be cloned with git
+settings and credentials from the host (see [Firecracker Operations › Private
+Repository Access](fc-operations.md#private-repository-access)). They are not
+set in shell sessions, `shed exec`, or provisioning hooks, and a [service
+client](#service-clients)'s sheds never get them.
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
-GITHUB_TOKEN=ghp_...
+GIT_SSH_COMMAND=ssh -i /home/shed/.ssh/id_ed25519
 ```
 
 Set restricted permissions:

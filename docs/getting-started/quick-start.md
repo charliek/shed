@@ -123,6 +123,38 @@ claude
 shed attach myproj
 ```
 
+### Run untrusted code in a hardened shed
+
+A shed gets every server mount and an open network by default. For code or an
+agent you trust less, give it neither:
+
+```bash
+# No host directories; on Firecracker, the internet and nothing else
+shed create untrusted --repo https://github.com/someone/tool.git --mounts none --network isolated
+
+# Check: MOUNTS shows none, NETWORK shows isolated
+shed list -v
+
+# The internet works; your LAN does not (use an address on your LAN, such as your router)
+shed exec untrusted -- curl -sS -m 5 -o /dev/null -w '%{http_code}\n' https://github.com
+shed exec untrusted -- curl -sS -m 5 http://192.168.1.1/    # times out
+```
+
+The repository is an `https://` URL because an `owner/repo` shorthand expands
+to an SSH URL (`git@github.com:owner/repo.git`), and the clone then needs an SSH
+key, which `--mounts none` may have just left out. `--network isolated` needs a
+Firecracker server with `nft` (see [Firecracker
+setup](fc-setup.md#prerequisites)); on VZ use `--mounts none` alone, which
+leaves the network open: the guest still reaches the Mac and its LAN (see [VZ
+operations › Networking](../reference/vz-operations.md#networking)). What the
+profile blocks is in [Security › Network
+profiles](../reference/security.md#network-profiles).
+
+Neither flag stops `shed create` from syncing your `default` [sync
+profile](../reference/sync.md#auto-sync-on-create) into the shed, and code in
+it can read what was synced. Add `--no-sync` when that profile copies anything
+the code should not see.
+
 ### Port forwarding
 
 ```bash
@@ -137,3 +169,5 @@ shed tunnels start myproj -t 3000:3000 -d
 - [Extensions](../reference/extensions.md) — credential brokering with the host agent
 - [Tunnels](../reference/tunnels.md) — port forwarding configuration
 - [Provisioning](../reference/provisioning.md) — `.shed/` install/startup hooks
+- [Security Configuration](../guides/security-configuration.md) — server postures and hardening sheds
+- [Orchestrated Sheds](../guides/orchestrated-sheds.md) — driving sheds from CI or an agent runner

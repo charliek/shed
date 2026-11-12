@@ -67,20 +67,7 @@ var ErrClientCertNotAuthorized = errors.New("client certificate: identity is not
 // closed: an mtls listener with no way to check authorization must not
 // authorize anything.
 func AllowlistConnectionVerifier(authorized func(fingerprint string) bool) func(tls.ConnectionState) error {
-	return func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return ErrClientCertMissing
-		}
-		if authorized == nil {
-			return ErrClientCertNotAuthorized
-		}
-		// PeerCertificates[0] is the leaf by definition (crypto/tls preserves
-		// the peer's send order, leaf first) — the identity being asserted. An
-		// issuer further up the chain must never be what gets checked.
-		leaf := cs.PeerCertificates[0]
-		if !authorized(leaf.Subject.CommonName) {
-			return ErrClientCertNotAuthorized
-		}
-		return nil
-	}
+	// A thin wrapper that knows no service clients: every service-shaped
+	// certificate is refused, every other one goes through the allowlist.
+	return ClientConnectionVerifier(authorized, nil)
 }

@@ -10,6 +10,8 @@ Shed is a lightweight tool for managing persistent, VM-based development environ
 - **IDE Integration** - Native Cursor/VS Code support via SSH Remote
 - **AI-Ready** - Pre-configured for Claude Code and OpenCode workflows
 - **VM Backends** - Firecracker microVMs (Linux) or Apple VZ virtual machines (macOS Apple Silicon)
+- **Hardened Sheds** - `--mounts none` keeps host directories out of a shed's mounts, and on Firecracker `--network isolated` lets it reach the internet and nothing else, enforced by nftables on the host. Use both: on Firecracker an `open` shed with no mounts can still reach another running shed's 9P export
+- **Orchestrator API** - mTLS service clients that create, run commands in (`POST /api/sheds/{name}/exec`) and delete only their own sheds, within a policy
 
 ## Architecture
 
@@ -52,7 +54,7 @@ flowchart LR
 
 | Component | Requirements |
 |-----------|--------------|
-| Client | macOS or Linux with Go 1.24+ |
+| Client | macOS or Linux (Go 1.27+ to build from source) |
 | Server (VZ) | macOS 13+ (Ventura) on Apple Silicon (arm64) |
 | Server (Firecracker) | Linux with KVM support |
 | Network | Tailscale (or any private network) connecting all machines |
@@ -66,14 +68,17 @@ flowchart LR
 - [VZ Operations](reference/vz-operations.md) - Using VZ sheds
 - [Firecracker Setup](getting-started/fc-setup.md) - Set up Firecracker backend
 - [Firecracker Operations](reference/fc-operations.md) - Using Firecracker sheds
+- [Security Configuration](guides/security-configuration.md) - Choosing a server posture and hardening sheds
+- [Security](reference/security.md) - The security model, service clients and network profiles
+- [Orchestrated Sheds](guides/orchestrated-sheds.md) - Driving sheds from CI or an agent runner
+- [HTTP API](reference/api.md) - Every endpoint, including the HTTPS exec
 - [Roadmap](ROADMAP.md) - Future enhancements
 
 ## Security Model
 
-Shed is designed for single-user scenarios where:
+- **Local by default.** The server binds loopback and runs in `open` mode until you change it.
+- **`token` or `mtls` for anything networked.** Both enforce pinned TLS, an HTTP credential and an SSH key allowlist; `mtls` is recommended. See [Security Configuration](guides/security-configuration.md).
+- **Per-shed hardening.** `shed create --mounts none` keeps the server's host directories out of a shed's mounts, and `--network isolated` (Firecracker) limits it to the internet; use both, since on Firecracker an `open` shed can still reach another shed's 9P export. See [Mount selection](reference/security.md#mount-selection) and [Network profiles](reference/security.md#network-profiles).
+- **Service clients for orchestrators.** In `mtls` mode a CI system or agent runner can get a certificate that reaches only its own sheds. See [Service clients](reference/security.md#service-clients).
 
-- All machines are connected via Tailscale (or similar private network)
-- The developer owns/controls all machines
-- Network access implies trust
-
-**Not suitable for:** Multi-tenant environments, public internet exposure, or untrusted network access.
+Shed is built for one owner and the machines they control. A service client is a narrow identity, not tenant isolation, so shed is **not suitable for multi-tenant use**. The full model is in [Security](reference/security.md).

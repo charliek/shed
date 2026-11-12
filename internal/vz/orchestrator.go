@@ -314,6 +314,10 @@ func (b *vzCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		LowerDigest:    pre.lowerDigest,
 		LowerImageTag:  pre.lowerImageTag,
 		FromSnapshot:   req.FromSnapshot,
+		Owner:          req.Owner,
+		// Always explicit for a new shed; nil (a non-API caller) is "all".
+		MountSelection: config.EffectiveMountSelection(req.ResolvedMounts),
+		NetworkProfile: config.NetworkProfileOpen,
 	}
 
 	// Register BEFORE Save: Save's `os.MkdirAll` runs first, so a
@@ -341,7 +345,7 @@ func (b *vzCreator) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHa
 	// VM boots; SetupCredentials post-Start only handles the guest-
 	// side mount. Filter to creds whose source exists to avoid vfkit
 	// rejecting the share.
-	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	vm := CreateVM(meta, b.c.cfg)
 	vm.credentialShares = buildCredentialShares(dirCreds)
 
@@ -376,6 +380,14 @@ func (b *vzCreator) FinalizeStartedVM(ctx context.Context, metaRaw orchestrator.
 		delete(b.c.vms, shedName)
 		return nil
 	})
+	// SetupCredentials, later in the sequence, opens the shed's message
+	// channel; a failure after it (egress setup) must not leave the channel
+	// behind for the next shed created under this name. A no-op when no
+	// channel was opened.
+	cleanup.Register("stop message channel", func() error {
+		b.c.credMgr.StopListener(shedName)
+		return nil
+	})
 	return nil
 }
 
@@ -401,9 +413,9 @@ func (b *vzCreator) MountLocalDir(ctx context.Context, req config.CreateShedRequ
 // SetupCredentials mounts configured credentials post-Start. Best-effort.
 func (b *vzCreator) SetupCredentials(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
 	meta := metaRaw.(*vzMetaHandle).meta
-	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	agent := b.c.newAgentClient(meta.Name)
-	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mountVirtioFSCredential)
+	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mountVirtioFSCredential, meta.Owner != "")
 }
 
 // ConfigureEgressProxy opens this shed's egress proxy listener and injects the
@@ -451,7 +463,7 @@ func (b *vzCreator) CloneRepo(ctx context.Context, req config.CreateShedRequest,
 	agent := b.c.newAgentClient(meta.Name)
 	backend.Phase(ctx, "repo")
 	backend.Status(ctx, "Cloning repository...")
-	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, b.egressEnv); err != nil {
+	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, meta.Owner != "", b.egressEnv); err != nil {
 		log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
 		// Status attaches to the current ("clone") phase — see
 		// PR #135's opportunistic cleanup that removed the
@@ -554,7 +566,7 @@ func (b *vzStarter) CheckNotRunning(_ context.Context, metaRaw orchestrator.Meta
 func (b *vzStarter) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHandle, cleanup *backend.Cleanup) (orchestrator.VMHandle, error) {
 	meta := metaRaw.(*vzMetaHandle).meta
 
-	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	vm := CreateVM(meta, b.c.cfg)
 	vm.credentialShares = buildCredentialShares(dirCreds)
 
@@ -593,6 +605,14 @@ func (b *vzStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.
 		b.c.mu.Lock()
 		defer b.c.mu.Unlock()
 		delete(b.c.vms, shedName)
+		return nil
+	})
+	// SetupCredentials, later in the sequence, opens the shed's message
+	// channel; a failure after it (egress setup) must not leave the channel
+	// behind for the next shed created under this name. A no-op when no
+	// channel was opened.
+	cleanup.Register("stop message channel", func() error {
+		b.c.credMgr.StopListener(shedName)
 		return nil
 	})
 	return nil
@@ -641,9 +661,9 @@ func (b *vzStarter) MountLocalDir(ctx context.Context, metaRaw orchestrator.Meta
 // (the credentials manager itself log-and-continues per credential).
 func (b *vzStarter) SetupCredentials(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
 	meta := metaRaw.(*vzMetaHandle).meta
-	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	agent := b.c.newAgentClient(meta.Name)
-	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mountVirtioFSCredential)
+	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mountVirtioFSCredential, meta.Owner != "")
 }
 
 // ConfigureEgressProxy re-opens this shed's egress proxy listener on the

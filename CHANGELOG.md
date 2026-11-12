@@ -32,7 +32,79 @@ All notable changes to this project will be documented in this file.
 > Read the [v0.9.0 to v0.9.1 upgrade guide](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.9.1/)
 > before upgrading.
 
+### Upgrade notes
+
+- **A server upgraded with no config change behaves as before**: token or mtls mode as
+  configured, every server `mounts:` entry in every shed, the `open` network, no audit log
+  and no reaper. Everything below is opt-in, per shed (`shed create --mounts`, `--network`)
+  or per service client (`auth.clients`).
+- **`auth.clients` requires `auth.mode: mtls`**; a config that sets it in `open` or `token`
+  mode is refused at load. Unknown keys under `auth.clients` and `network:` are refused too.
+- **Isolated sheds need `nft`.** A Firecracker server that creates an `isolated` shed, or
+  sets `network.default_profile: isolated`, needs the `nft` binary and the privilege to
+  change nftables (the deb unit runs as root). Without them such sheds are refused with
+  `503 NETWORK_ENFORCEMENT_UNAVAILABLE`; open-only servers need nothing.
+- **Development: the Firecracker dev config now has its own `state_dir`**
+  (`/var/lib/shed-dev/state`), so the first `make dev-server-up-fc` after this change makes a
+  new host key and TLS pin. Remove only the stale `mini3-dev` entry from
+  `~/.shed/config.yaml` and re-add it with `shed server add`.
+- **Development: `make dev-server-down-fc` now runs `shed-server network teardown`** after
+  stopping the dev server, deleting only the dev server's own nftables tables.
+
 ### Added
+
+- **Server: service clients (mtls mode).** Orchestrators such as CI systems or agent
+  runners can drive sheds on a server they do not administer. Declare one under
+  `auth.clients` with a policy (`name_prefix`, `max_sheds`, `max_age`, `network`,
+  `server_mounts`, `images`, `caps`), and sign its certificate on the shed host with
+  `shed-server client issue <name> [--ttl] [--out]`, which prints a JSON bundle
+  (`shed-server client list` shows the configured clients). A client can list, create, get,
+  start, stop, delete and exec in only the sheds it owns; every other route is
+  `403 FORBIDDEN`, another shed is `404 SHED_NOT_FOUND`, and a create outside its policy is
+  `403 POLICY_VIOLATION`. Owned sheds get no server mounts unless the policy names some, the
+  `isolated` network by default, never the credential bus, and never the server's `env_file`
+  variables. A service certificate is never checked against the SSH allowlist and carries no
+  SSH access. Remove a client and restart `serve` to revoke it. See the new [Orchestrated
+  sheds guide](https://charliek.github.io/shed/guides/orchestrated-sheds/).
+- **Server: `POST /api/sheds/{name}/exec`, a command over HTTPS.** For admins and for a
+  service client on its own sheds. `argv` runs as given (no shell wrap) with optional `cwd`,
+  `env`, base64 `stdin`, `timeout_seconds` and `max_output_bytes`; the response streams
+  NDJSON `stdout`/`stderr` frames and a final `exit` frame (`124` with `timed_out` on a
+  timeout; no `exit` frame means the result was lost). A stopped shed is
+  `409 SHED_NOT_RUNNING` (exec never starts one). New `exec:` config block:
+  `max_stdin_bytes` (1 MiB), `max_timeout` (1h), `max_concurrent_per_shed` (8).
+- **Server (Firecracker): the `isolated` network profile.** `shed create --network isolated`
+  (or the API's `network` field) gives a shed the internet and nothing else: not the host,
+  other sheds, RFC 1918, CGNAT/tailnet, link-local and metadata, multicast, and no IPv6, with
+  anti-spoofing. shed-server enforces it with its own nftables tables (`bridge` and `inet
+  shed_<name>`), which only add drops and leave the bridge and NAT rules alone; it rebuilds
+  them at start and checks them every 30 s. New `network:` config block
+  (`default_profile`, `allow_cidrs`) and `shed-server network teardown`. VZ answers
+  `422 NETWORK_PROFILE_UNSUPPORTED` for anything but `open`. See [Security › Network
+  profiles](https://charliek.github.io/shed/reference/security/#network-profiles).
+- **Server and CLI: per-shed server mounts.** `shed create --mounts none|all|a,b` (the API's
+  `mounts` field) picks which of the server's `mounts:` a shed gets; the choice is stored and
+  honoured on every start, including an SSH auto-start.
+- **Server: a `max_age` reaper and an audit log.** A service client's sheds are stopped and
+  deleted once older than its `max_age`. `audit.jsonl` (next to `egress-audit.jsonl`, `0600`,
+  rotated at 50 MiB) records every service-client request, every HTTPS exec (`argv[0]` and the
+  argument count unless `audit.exec_argv: full`) and every reap. It is on whenever
+  `auth.clients` is set, or with `audit.enabled: true`.
+- **Server: `/api/info` `features`** now lists `http_exec`, `mount_selection`,
+  `service_clients` (mtls with clients configured) and `network_profiles` (Firecracker). The
+  CLI refuses `--mounts none|<names>` and `--network isolated` against a server that does not
+  advertise them, before creating anything. New error codes: `SHED_NOT_RUNNING`,
+  `EXEC_LIMIT`, `REQUEST_TOO_LARGE`, `POLICY_VIOLATION`, `INVALID_NETWORK_PROFILE`,
+  `NETWORK_PROFILE_UNSUPPORTED`, `NETWORK_ENFORCEMENT_UNAVAILABLE`.
+- **CLI: `shed list -v` gains `OWNER`, `MOUNTS` and `NETWORK` columns**; `-vv` gains
+  `Owner:`, `Server Mounts:` and `Network:`, and `--json list` gains `owner`, `mounts` and
+  `network_profile`.
+- **Server: `state_dir`.** One directory for the server's SSH host key, TLS cert, mtls client
+  CA and GitHub key cache (default unchanged: `/etc/shed` as root, `~/.shed` otherwise), so
+  two servers can run on one host.
+- **Development: `make test-netns-remote`** runs the `isolated` profile's nftables rules for
+  real, as root inside throwaway network namespaces on the FC remote, and `PYTEST_ARGS`
+  passes arguments to pytest in every `test-integration*` target.
 
 - **Desktop: a log file.** The desktop app now writes its own lines, its embedded credential
   broker's and its `shed_*` diagnostics to `~/Library/Logs/ShedDesktop/shed-desktop.log`
@@ -67,6 +139,20 @@ All notable changes to this project will be documented in this file.
   so they can never start a hub on a remote shed, and the race this leaves behind is gone.
   A host with craze older than 0.2.0 falls back to the earlier probe-then-bridge path, race
   included, until craze is updated there.
+- **Build: Go 1.27 and dependency updates.** chi v5.5.0, `golang.org/x/{crypto,net,sys,sync,term}`,
+  `mdlayher/vsock` v1.4.0, `creack/pty` v1.1.24, logrus v1.10.2, go-containerregistry v0.22.1,
+  and cel-go v0.33.2 under its new module path `cel.dev/cel-go`; golangci-lint 2.15.0.
+  `hugelgupf/p9` stays on v0.3.0 (v0.5.1 gives a file a new QID on every lookup).
+  go-containerregistry v0.22 dropped Go's bound on registry redirects; shed restores it
+  (at most 10) on pulls and pushes.
+- **Server: a cancelled exec closes the guest connection at once**, on every exec path (SSH
+  sessions included), so a guest that stops reading cannot hold a timed-out or abandoned
+  command's request open.
+- **Development: `make test-integration-dev-fc` is FC-only.** It sets `SHED_VZ_SERVER` and
+  `SHED_VZ_DEV_SERVER` empty, so its `[vz]` cases skip instead of reaching the `my-server`
+  entry (which can name a production server), and an empty server name never falls back to
+  the client's default server. The FC dev config gains an `itest` image alias
+  (`shed-fc-base:v0.9.0`) for the exec and service-client tests.
 
 ### Fixed
 

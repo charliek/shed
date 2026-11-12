@@ -1,0 +1,89 @@
+# shed-server network policy for server "mini3-dev" (generated; do not edit)
+add table bridge shed_mini3_dev
+delete table bridge shed_mini3_dev
+add table inet shed_mini3_dev
+delete table inet shed_mini3_dev
+
+table bridge shed_mini3_dev {
+	set guarded_ports {
+		type ifname
+		elements = { "shed-tap-0", "shed-tap-2" }
+	}
+	set guarded_ip4 {
+		type ipv4_addr
+		elements = { 172.30.0.2, 172.30.0.4 }
+	}
+	set guarded_macs {
+		type ether_addr
+		elements = { 02:fc:00:00:02:58, 02:fc:00:00:02:5a }
+	}
+	set addr4 {
+		type ifname . ether_addr . ipv4_addr
+		elements = { "shed-tap-0" . 02:fc:00:00:02:58 . 172.30.0.2, "shed-tap-2" . 02:fc:00:00:02:5a . 172.30.0.4 }
+	}
+	chain pre {
+		type filter hook prerouting priority filter; policy accept;
+		meta ibrname != "shed-br0" accept
+		iifname @guarded_ports jump from_guarded
+		ether saddr @guarded_macs drop
+		ether type arp arp saddr ip @guarded_ip4 jump verify_arp
+		ether type ip ip saddr @guarded_ip4 jump verify_ip
+	}
+	chain from_guarded {
+		ether type arp jump verify_arp
+		ether type ip jump verify_ip
+		drop
+	}
+	chain verify_arp {
+		iifname . ether saddr . arp saddr ip @addr4 accept
+		drop
+	}
+	chain verify_ip {
+		iifname . ether saddr . ip saddr @addr4 accept
+		drop
+	}
+	chain bridged {
+		type filter hook forward priority filter; policy accept;
+		meta ibrname != "shed-br0" accept
+		iifname @guarded_ports drop
+		oifname @guarded_ports drop
+	}
+}
+
+table inet shed_mini3_dev {
+	set guarded4 {
+		type ipv4_addr
+		elements = { 172.30.0.2, 172.30.0.4 }
+	}
+	set host_allow {
+		type ipv4_addr . inet_service
+		elements = { 172.30.0.2 . 40001, 172.30.0.2 . 41003, 172.30.0.2 . 41007 }
+	}
+	set allow4 {
+		type ipv4_addr
+		flags interval
+		elements = { 192.168.77.0/24, 10.20.0.0/16 }
+	}
+	set blocked4 {
+		type ipv4_addr
+		flags interval
+		elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 }
+	}
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "shed-br0" ip saddr @guarded4 jump guarded_in
+	}
+	chain guarded_in {
+		ct state established,related accept
+		ip daddr 172.30.0.1 ip saddr . tcp dport @host_allow accept
+		drop
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		ip daddr @guarded4 ct state established,related accept
+		ip daddr @guarded4 drop
+		ip saddr @guarded4 oifname "shed-br0" drop
+		ip saddr @guarded4 ip daddr @allow4 accept
+		ip saddr @guarded4 ip daddr @blocked4 drop
+	}
+}

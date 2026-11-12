@@ -10,6 +10,7 @@ This document covers Shed's testing strategy, how to run each tier of tests, and
 | Integration suite (installed binary) | Live create-cycle via `shed` CLI against the brew/deb-installed shed-server | `pytest` + subprocess (uv-managed) | Reachable shed-server (local or remote); for FC: SSH to the host | No (locally + bare-metal release-validation) |
 | Integration suite (dev binary, VZ) | Same, but targets a parallel dev shed-server running from the just-built source on the local Mac | `make dev-server-up` + `make test-integration-dev` | All of the above + a `~/.shed/config.yaml` entry for the dev server | No |
 | Integration suite (dev binary, FC) | Same, but targets a parallel dev shed-server on the FC remote (alongside the deb one on a different port) | `make dev-server-up-fc` + `make test-integration-dev-fc` | SSH + sudo NOPASSWD on the remote + a `~/.shed/config.yaml` entry for the FC dev server | No |
+| Network namespace (netpolicy) | The `isolated` profile's nftables rules, applied for real inside throwaway network namespaces | `make test-netns-remote` | SSH + sudo NOPASSWD on the FC remote, `nft` and `ip` there | No |
 | E2E (Firecracker, legacy) | Full VM lifecycle via API directly | `go test -tags=e2e` | KVM, root, Firecracker assets | No |
 
 The **integration suite** (PR #132) is the recommended path for live create-cycle verification on both backends. The Go-tagged FC e2e tests predate it and remain available for low-level API exercise.
@@ -112,7 +113,7 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the brew-installed VZ server. The `dev-server-*` and `test-integration-dev` Makefile targets use `SHED_VZ_DEV_SERVER` instead. |
+| `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the brew-installed VZ server. The `dev-server-*` and `test-integration-dev` Makefile targets use `SHED_VZ_DEV_SERVER` instead. Empty skips every `[vz]` case; `test-integration-dev-fc` sets it empty. |
 | `SHED_VZ_LOG_PATH` | `/opt/homebrew/var/log/shed-server.log` | Where the local VZ server writes its log file. Override for Intel-Mac Homebrew (`/usr/local/...`) or custom installs. Set automatically by `make test-integration-dev` to the dev server's log file. |
 | `SHED_VZ_DEV_SERVER` | `my-server-dev` | `~/.shed/config.yaml` entry for the parallel dev VZ server. Honored by the `dev-server-*` Makefile targets. |
 | `SHED_FC_HOST` | `mini3` | SSH hostname for the FC server. Also honored by `make dev-server-up-fc` / `dev-server-status-fc` / `test-integration-dev-fc`. |
@@ -170,9 +171,19 @@ make test-integration-dev-fc
 make dev-server-down-fc         # when done
 ```
 
+`PYTEST_ARGS` passes extra arguments to pytest in every `test-integration*` target, for example a subset of modules:
+
+```sh
+make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls PYTEST_ARGS="test_smoke.py test_mounts.py test_mtls.py"
+```
+
+`test-integration-dev-fc` is FC-only: it sets `SHED_VZ_SERVER` and `SHED_VZ_DEV_SERVER` empty, so every `[vz]` case skips. Without that the `[vz]` cases would reach the `my-server` entry, which on a Linux workstation can be a production FC server (mini3's deb server), and create and delete sheds there. An empty `SHED_VZ_SERVER` (or `SHED_FC_SERVER`) always means "no server for that backend", never the client's default server.
+
 The FC dev server runs via `sudo nohup` on the remote (needs root for FC's CAP_NET_ADMIN bridge/TAP operations). No systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server (crashes visible, no survives-reboot). Listens on `mini3:18080/12222` alongside the deb shed-server's `mini3:8080/2222`. Isolated state-dirs under `/var/lib/shed-dev/firecracker/`.
 
 FC-specific isolation:
+- **Its own identity directory.** The FC dev config sets `state_dir: /var/lib/shed-dev/state`, so the root dev server keeps its SSH host key, TLS cert, mtls client CA and GitHub key cache there instead of in production's `/etc/shed`. The first `make dev-server-up-fc` after this change generates a new host key and TLS pin: remove only the stale `mini3-dev` entry from `~/.shed/config.yaml` and re-add it with `shed server add mini3 --port 18080 --ssh-port 12222 --name mini3-dev` (leave the `mini3` entry and `default_server` alone).
+- **An `itest` image alias** (`ghcr.io/charliek/shed-fc-base:v0.9.0`) for tests that need a newer guest agent than the v0.5.9 images (exec process-group cleanup, a separate stderr stream).
 - **Five throwaway writable 9P mounts.** The FC dev config carries `claude`, `codex`, `opencode_data`, `opencode_state` and `gh` mounts mirroring a typical production mount set (same keys and targets). Their sources live under `/var/lib/shed-dev/mounts/` on the remote and are created by `make dev-server-up-fc` (derived from the uploaded config's `source:` lines). They hold no real credentials; they exist so the suite exercises the 9P credential-mount path (stop latency, nested mount targets).
 - **Offset `vsock_base_cid: 600`** (deb default is 100) so the two servers' vsock CIDs don't collide. vsock allocation is in-memory per-server with no kernel check.
 - **Shared bridge + CIDR + tap_prefix.** Kernel-level TAP existence check in `internal/firecracker/network.go:FindAvailableTAPIndex` coordinates cross-server. Known race window: two servers can both pick the same TAP index before either calls `LinkAdd`; the second call fails loudly with EEXIST. Diagnosable, not silent. For PR-validation workloads (one dev creating one shed at a time on the dev server while the deb server handles its own creates) this never fires; for production-style concurrent stress it would need a server-side `retry-on-EEXIST` fix.
@@ -194,6 +205,105 @@ per the knob below), so the entry above only registers the *connection*
 details — it carries no credential. `shed server add localhost --ssh-port
 12222 --name my-server-dev` (SSH-first: see the callout below) is what
 actually bootstraps one; prefer it over hand-editing the file.
+
+#### Service clients, HTTPS exec and network profiles (FC, mtls)
+
+Four modules cover the orchestrated-sheds work against the FC dev server. All
+of them use the `fc_server_dev` fixture, so they can only reach the dev entry,
+and they create their sheds from the dev config's `itest` alias
+(`shed-fc-base:v0.9.0`, whose agent has the exec process-group cleanup and the
+separate stderr stream):
+
+| Module | Covers | Needs |
+|--------|--------|-------|
+| `test_http_exec.py` | `POST /api/sheds/{name}/exec`: frames, exit codes, stdin, the 124 timeout and the disconnect (both followed by the guest process being gone), 8 MiB intact, truncation, a 70 s quiet stream, 404, validation, 409 | mtls |
+| `test_service_client.py` | A service client end to end: the bundle from `client issue` over SSH, owned sheds with no 9P mounts across stop/start, 403 and 404 refusals, admin visibility, the audit log's `api` and `exec.end` lines | mtls |
+| `test_create_mounts.py` | `shed create --mounts none` and the `list -v`/`-vv`/`--json` columns, with a default create as the positive control | any mode |
+| `test_network_profiles.py` | `--network isolated` probed from inside real guests, the service client's shed isolated by default, the dev server's tables in `nft`, rebuild at restart, reapply within 40 s of a manual delete, `dev-server-down-fc` removing only its two tables | mtls |
+
+`scripts/render-dev-config.sh --mtls` gives the FC dev config an `itest` service
+client (prefix `itest-svc-`, `max_sheds: 3`, `max_age: 2h`, images `[itest]`, no
+server mounts, network isolated by default) and a `nocturn` client for a development
+Nocturn's shed-craze Agent Provider (prefix `nocturn-`, `max_sheds: 4`, `max_age: 30h`,
+network isolated, no server mounts, images `[itest]`; issue its bundle on the dev host
+with `sudo -n /tmp/shed-server-dev client issue nocturn --config /tmp/shed-server-dev.yaml`).
+Run them with:
+
+```sh
+make build && make dev-server-restart-fc SHED_DEV_AUTH_MODE=mtls
+make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls \
+  PYTEST_ARGS="test_http_exec.py test_service_client.py test_create_mounts.py test_network_profiles.py"
+```
+
+The audit log the service-client module reads is the dev server's
+`/var/lib/shed-dev/firecracker/audit.jsonl` (read with `sudo -n cat`).
+
+#### Proving the network rules in a namespace: `make test-netns-remote`
+
+The `isolated` profile's rule set is tested for real, as root, by
+`internal/netpolicy/netns_linux_test.go` (build tags `linux && netns`; it skips
+unless it runs as root with `nft` and `ip`). It builds a bridge, veth pairs
+standing in for TAPs, an "internet" and a "LAN" entirely inside
+`shedtest-<pid>-*` network namespaces, runs every `nft` call through
+`ip netns exec` (the test asserts it), and probes with its own binary
+re-executed inside a namespace, so it never touches the host's ruleset or
+links. It covers internet reachability, the blocked ranges with and without
+`allow_cidrs`, host input except the shed's own ports, guest to guest,
+a second source address, IP and MAC spoofing (each with a no-rules control),
+IPv6, removing a guarded shed, and a teardown that leaves an unrelated table
+alone.
+
+```sh
+make test-netns-remote      # cross-compiles, copies to $SHED_FC_HOST:/tmp, runs ^TestNetns under sudo, deletes it
+```
+
+Run it before any change to `internal/netpolicy`'s rendering reaches a real
+host. The golden-file tests for the rendered script run in `make check`.
+
+#### Applying new firewall rules to a remote host for the first time
+
+A mistake in the rules can cut the remote host off (including SSH, when SSH
+arrives over a network the rules match). The first time a changed rule set
+reaches the FC remote's dev server, arm an automatic rollback that stops the
+dev server (its 30 s presence check would otherwise put the tables back),
+waits for it to exit (up to 35 s, its 30 s graceful shutdown included, then
+SIGKILL), and deletes **only its own tables**, and only once the server is
+gone (if it is somehow still alive, the tables are left alone). It signals
+the PID only while that process is still the dev server: its command name must
+be exactly `shed-server-dev` (the binary is `/tmp/shed-server-dev`), so a
+stale PID reused by the production `shed-server`, or by anything else, is
+never signalled and is treated as a server already gone. It refuses to
+arm while another rollback is armed, so a cancel always reaches the live one:
+
+```sh
+ssh mini3 "sudo -n sh -c 'if [ -s /tmp/shed-dev-nft-rollback.pid ] && kill -0 -\$(cat /tmp/shed-dev-nft-rollback.pid) 2>/dev/null; then echo \"a rollback is already armed; cancel it first\" >&2; exit 1; fi; setsid nohup sh -c \"sleep 120; P=\\\$(cat /tmp/shed-server-dev.pid); case \\\$(ps -p \\\$P -o comm= 2>/dev/null) in shed-server-dev) kill -TERM \\\$P;; *) P=;; esac; i=0; while [ -n \\\"\\\$P\\\" ] && kill -0 \\\$P 2>/dev/null && [ \\\$i -lt 35 ]; do sleep 1; i=\\\$((i+1)); done; [ -n \\\"\\\$P\\\" ] && case \\\$(ps -p \\\$P -o comm= 2>/dev/null) in shed-server-dev) kill -KILL \\\$P;; esac; sleep 2; if [ -z \\\"\\\$P\\\" ] || ! kill -0 \\\$P 2>/dev/null; then nft delete table bridge shed_mini3_dev; nft delete table inet shed_mini3_dev; fi\" </dev/null >/dev/null 2>&1 & echo \$! > /tmp/shed-dev-nft-rollback.pid'"
+```
+
+Then, within the window: create one isolated shed on the dev server
+(`shed -s mini3-dev create netiso --image itest --network isolated`), confirm
+from your workstation that a **new** `ssh -o ConnectTimeout=5 mini3 true` works
+and that the production and dev HTTPS ports still accept TCP, and cancel the
+rollback by killing its whole process group (the `sleep` included):
+
+```sh
+ssh mini3 'sudo -n sh -c "kill -TERM -\$(cat /tmp/shed-dev-nft-rollback.pid) && rm -f /tmp/shed-dev-nft-rollback.pid"'
+ssh mini3 'ps -ef | grep -v grep | grep "sleep 120"'   # expect nothing
+```
+
+If anything looks wrong, let the rollback fire. The table names come from the
+dev config's `name:` (`mini3-dev` gives `shed_mini3_dev`). Never delete another
+table, the bridge or the NAT rules: the dev server shares `shed-br0` with the
+production server on the same host.
+
+If the rollback fired, the test shed's VM is still running (stopping
+shed-server never stops a Firecracker VM) and is **unguarded** until the dev
+server starts again. Once the host is reachable, stop that shed's
+`firecracker` process; or, once the rule change is fixed, start the dev server
+(`make dev-server-up-fc SHED_DEV_AUTH_MODE=mtls`, which reinstalls the tables
+from the sheds' metadata before it serves) and delete the shed.
+
+`make dev-server-down-fc` runs `shed-server network teardown` for the dev
+server after stopping it, so its tables never outlive it.
 
 #### Validating the mtls auth mode
 
@@ -536,6 +646,10 @@ tests/integration/
   test_lifecycle.py       # create → stop → start → exec → delete
   test_exec_shell.py      # ssh shell semantics + shed exec direct-argv
   test_timing_parser.py   # PhaseTimer parser unit tests (no live server)
+  test_http_exec.py       # HTTPS exec (FC dev server, mtls)
+  test_service_client.py  # service clients end to end (FC dev server, mtls)
+  test_create_mounts.py   # shed create --mounts (FC dev server)
+  test_network_profiles.py # the isolated network profile (FC dev server, mtls)
   fixtures/
     server.py             # LocalServer + RemoteServer + ShedHandle
     timing.py             # PhaseTimer log-line parser

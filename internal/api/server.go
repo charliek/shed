@@ -2,8 +2,10 @@
 package api
 
 import (
+	"sync"
 	"time"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -35,6 +37,30 @@ type Server struct {
 	// trusts and when it must be rotated. Zero values in every other mode.
 	caFingerprint string
 	caNotAfter    time.Time
+
+	// mux is the router Router() built, kept so the auth middleware (which
+	// runs at the root, before routing) can resolve a service client's
+	// request to its route pattern with Find. nil until Router() runs; a
+	// client request with no mux is refused.
+	mux *chi.Mux
+
+	// clientMu guards clientCreates, the creates each service client has in
+	// flight (client -> shed name -> count), counted against policy.max_sheds
+	// with the sheds it owns.
+	clientMu      sync.Mutex
+	clientCreates map[string]map[string]int
+
+	// audit is the audit log (nil: off). See audit.go.
+	audit *audit.Log
+
+	// reapSkipped records the owned sheds the reaper has already logged as
+	// left alone (owner no longer configured), so each is logged once.
+	reapSkipped map[string]bool
+
+	// execMu guards execInFlight, the count of HTTPS execs running per shed
+	// (exec.max_concurrent_per_shed). The map is created on first use.
+	execMu       sync.Mutex
+	execInFlight map[string]int
 }
 
 // SetEgressAudit attaches the durable egress audit log so `shed egress show`
@@ -64,8 +90,7 @@ func (s *Server) SetClientCertAuthorizer(fn func(fingerprint string) bool) { s.c
 
 // SetClientCAInfo records the internal client CA's fingerprint and expiry for
 // /api/info reporting in mtls mode. Two scalars rather than the CA itself: the
-// API server has no use for issuance, and copying the values keeps
-// internal/servertls out of this package's imports.
+// API server has no use for issuance.
 func (s *Server) SetClientCAInfo(fingerprint string, notAfter time.Time) {
 	s.caFingerprint = fingerprint
 	s.caNotAfter = notAfter
@@ -89,7 +114,12 @@ func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, p
 func (s *Server) useCommonMiddleware(r chi.Router) {
 	r.Use(middleware.RequestID)
 	if s.cfg.TrustedProxy {
-		r.Use(middleware.RealIP)
+		// chi v5.5 deprecates RealIP for trusting client-supplied headers.
+		// That trust is exactly what trusted_proxy opts into (off by
+		// default, documented as safe only behind a proxy that overwrites
+		// the headers), and the ClientIP* replacements leave RemoteAddr
+		// untouched, which would change behaviour for existing configs.
+		r.Use(middleware.RealIP) //nolint:staticcheck // SA1019: deliberate, gated by trusted_proxy
 	}
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -108,6 +138,7 @@ func (s *Server) useCommonMiddleware(r chi.Router) {
 // certificate (see authMiddleware).
 func (s *Server) Router() chi.Router {
 	r := chi.NewRouter()
+	s.mux = r
 	s.useCommonMiddleware(r)
 
 	r.Route("/api", func(r chi.Router) {
@@ -204,6 +235,10 @@ func (s *Server) Router() chi.Router {
 				r.Post("/start", s.handleStartShed)
 				r.Post("/stop", s.handleStopShed)
 				r.Post("/reset", s.handleResetShed)
+
+				// HTTPS exec: one command, NDJSON output (control scope
+				// in an enforced mode, via authorizeScope's default).
+				r.Post("/exec", s.handleExecShed)
 
 				// Sessions within a shed
 				r.Get("/sessions", s.handleListSessions)

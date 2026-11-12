@@ -254,3 +254,29 @@ func TestHTTPSListenAddr(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateStateDir(t *testing.T) {
+	tests := []struct {
+		name    string
+		dir     string
+		wantErr bool
+	}{
+		{"unset ok", "", false},
+		{"absolute ok", "/var/lib/shed-dev/state", false},
+		{"home-relative ok", "~/.shed-dev", false},
+		{"relative rejected", "state", true},
+		{"dot-relative rejected", "./state", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ServerConfig{StateDir: tt.dir}
+			err := cfg.validateStateDir()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateStateDir(%q) error = %v, wantErr %v", tt.dir, err, tt.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "state_dir") {
+				t.Errorf("error %q does not name state_dir", err)
+			}
+		})
+	}
+}

@@ -5,7 +5,9 @@
 #   - ~/.config/shed/server.yaml
 #   - /etc/shed/server.yaml
 
-# Server identity - used in API responses and logging
+# Server identity - used in API responses and logging. It also names this
+# server's nftables tables for isolated sheds (shed_<name>, non-alphanumerics
+# as _), so two servers on one host need names that differ after that.
 name: my-server
 
 # Network configuration
@@ -25,7 +27,8 @@ bind_address: 127.0.0.1
 # "detect" picks vz on macOS Apple Silicon and firecracker on Linux.
 default_backend: detect
 
-# Host directories to mount into every shed (formerly "credentials")
+# Host directories to mount into sheds (formerly "credentials"): every shed by
+# default; per shed with `shed create --mounts none|all|a,b`.
 # Each entry creates a directory mount from host to VM
 # Paths support ~ expansion
 # (The deprecated key "credentials" is still accepted as a fallback.)
@@ -47,8 +50,60 @@ mounts:
 
 # Environment file path
 # Each line should be in format: KEY=value
-# These variables are injected into all VMs
+# These variables are passed to the in-VM `git clone` of a create's repo (not
+# to sessions or hooks), and never to a service client's sheds.
 env_file: ~/.shed/env
+
+# Identity directory: SSH host key, TLS cert, mtls client CA, GitHub key cache.
+# Default /etc/shed as root, ~/.shed otherwise; set it for a second server on
+# the same host. See docs/reference/configuration.md#tls-and-network-surface
+# state_dir: /etc/shed
+
+# --- Authentication and service clients ---
+# auth.mode: open (default) | token | mtls. See docs/guides/security-configuration.md.
+# Service clients (orchestrators that create, exec in and delete only their own
+# sheds) need mtls. Issue a client's certificate on this host with
+# `shed-server client issue <name>`. See docs/guides/orchestrated-sheds.md and
+# docs/reference/configuration.md#service-clients
+# auth:
+#   mode: mtls
+#   ssh:
+#     github_users: [your-github-user]
+#   clients:
+#     nocturn:
+#       cert_max_ttl: 2160h          # longest certificate `client issue` signs
+#       policy:
+#         name_prefix: "nocturn-"    # required
+#         max_sheds: 4               # required
+#         max_age: 30h               # required: older owned sheds are deleted
+#         network: isolated          # default isolated; must be open on vz
+#         server_mounts: []          # default: no server mounts
+#         images: []                 # default: only the default image
+#         caps: {cpus: 4, memory_mb: 8192}
+
+# --- HTTPS exec limits (POST /api/sheds/{name}/exec) ---
+# See docs/reference/configuration.md#https-exec
+# exec:
+#   max_stdin_bytes: 1048576
+#   max_timeout: 1h
+#   max_concurrent_per_shed: 8
+
+# --- Audit log (audit.jsonl next to egress-audit.jsonl) ---
+# Always on when auth.clients is set. exec_argv: "" logs argv[0] and the
+# argument count; "full" logs every argument. See
+# docs/reference/configuration.md#audit-log
+# audit:
+#   enabled: false
+#   exec_argv: ""
+
+# --- Network profiles (isolated is Firecracker only) ---
+# isolated: the internet and nothing else (not the host, other sheds, the
+# LAN, the tailnet or cloud metadata). Needs the nft binary and shed-server
+# running as root (the deb's unit does); vz supports only open. Per shed:
+# `shed create --network isolated`. See docs/reference/security.md#network-profiles
+# network:
+#   default_profile: open      # open | isolated
+#   allow_cidrs: []            # IPv4 ranges isolated sheds may still reach (forwarded only)
 
 # Terminal configuration (optional)
 # The base images include ncurses-term which handles most terminal types.

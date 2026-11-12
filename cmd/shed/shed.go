@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -79,6 +80,8 @@ var (
 	createEgress       []string
 	createFromSnapshot string
 	createUpperSize    string
+	createMounts       string
+	createNetwork      string
 	startTimeout       time.Duration
 	listAll            bool
 	deleteForce        bool
@@ -99,6 +102,8 @@ func init() {
 	createCmd.Flags().StringSliceVar(&createEgress, "egress", nil, "Egress profiles to apply (comma-separated, e.g. base,github; 'off' to disable; default: server default)")
 	createCmd.Flags().StringVar(&createFromSnapshot, "from-snapshot", "", "Spawn from a snapshot's rootfs (mutually exclusive with --image and --repo)")
 	createCmd.Flags().StringVar(&createUpperSize, "upper-size", "", "Logical size of the per-shed writable upper layer (e.g. 5G, 20G; default: server config)")
+	createCmd.Flags().StringVar(&createNetwork, "network", "", "Network profile: open (today's network) or isolated (the internet only: no host, LAN, tailnet or other sheds; Firecracker servers only). Default: the server's network.default_profile")
+	createCmd.Flags().StringVar(&createMounts, "mounts", "", "Server mounts the shed gets: all (the default), none, or a comma-separated list of mount names (needs a server that supports mount selection)")
 
 	startCmd.Flags().DurationVar(&startTimeout, "timeout", 0, "Timeout for start operation (default: from config or 10m)")
 
@@ -190,6 +195,15 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	mounts, err := parseMountsFlag(createMounts, cmd.Flags().Changed("mounts"))
+	if err != nil {
+		return err
+	}
+	network, err := parseNetworkFlag(createNetwork, cmd.Flags().Changed("network"))
+	if err != nil {
+		return err
+	}
+
 	entry, serverName, err := getServerEntry()
 	if err != nil {
 		printError("no server configured",
@@ -213,6 +227,18 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	info, err := client.GetInfo()
 	if err != nil {
 		return fmt.Errorf("failed to fetch server info: %w", err)
+	}
+
+	// An older server ignores "mounts" and gives the shed every server
+	// mount, so never send it to one that doesn't advertise the feature.
+	if mounts != nil {
+		if err := requireServerFeature(info, serverName, config.FeatureMountSelection, "--mounts"); err != nil {
+			return err
+		}
+	}
+	network, err = networkForServer(info, serverName, network)
+	if err != nil {
+		return err
 	}
 
 	resolvedBackend, warning, err := resolveCreateBackend(info, createBackend, createCPUs, createMemory)
@@ -245,6 +271,8 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		Egress:         createEgress,
 		FromSnapshot:   createFromSnapshot,
 		UpperSizeBytes: upperSizeBytes,
+		Mounts:         mounts,
+		Network:        network,
 	}
 
 	// On an interactive terminal, the image-pull leg renders as live per-blob
@@ -283,6 +311,97 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\nConnect with:\n  shed console %s\n", name)
 
 	return nil
+}
+
+// parseMountsFlag turns `shed create --mounts` into the request's mounts
+// field: "all" (or the flag not given) is nil, which the server reads as every
+// server mount; "none" is an empty list; anything else is a comma-separated
+// list of mount names. A nil result means the field is not sent at all.
+func parseMountsFlag(value string, changed bool) (*[]string, error) {
+	if !changed {
+		return nil, nil
+	}
+	switch strings.TrimSpace(value) {
+	case "":
+		return nil, fmt.Errorf("--mounts must not be empty (use all, none, or a comma-separated list of mount names)")
+	case "all":
+		return nil, nil
+	case "none":
+		return &[]string{}, nil
+	}
+	var names []string
+	for _, n := range strings.Split(value, ",") {
+		n = strings.TrimSpace(n)
+		switch {
+		case n == "":
+			return nil, fmt.Errorf("--mounts %q has an empty name", value)
+		case n == "all" || n == "none":
+			return nil, fmt.Errorf("--mounts: %q cannot be combined with mount names", n)
+		case slices.Contains(names, n):
+			return nil, fmt.Errorf("--mounts names %q twice", n)
+		}
+		names = append(names, n)
+	}
+	return &names, nil
+}
+
+// parseNetworkFlag checks `shed create --network`: "" when the flag is not
+// given (the server's default), else open or isolated.
+func parseNetworkFlag(value string, changed bool) (string, error) {
+	if !changed {
+		return "", nil
+	}
+	v := strings.TrimSpace(value)
+	if !config.ValidNetworkProfile(v) {
+		return "", fmt.Errorf("--network must be %s or %s (got %q)", config.NetworkProfileOpen, config.NetworkProfileIsolated, value)
+	}
+	return v, nil
+}
+
+// networkForServer decides what to send for --network. A server that does
+// not advertise network_profiles ignores the field and creates an open shed,
+// so isolated is refused there (never a silent downgrade); open is what such a
+// server does anyway, so it is simply not sent.
+func networkForServer(info *config.ServerInfo, serverName, network string) (string, error) {
+	if network == "" || info.HasFeature(config.FeatureNetworkProfiles) {
+		return network, nil
+	}
+	if network == config.NetworkProfileOpen {
+		return "", nil
+	}
+	return "", requireServerFeature(info, serverName, config.FeatureNetworkProfiles, "--network "+network)
+}
+
+// formatNetworkProfile renders a shed's network profile for `shed list`; "-"
+// when the server doesn't report one (an older server).
+func formatNetworkProfile(p string) string { return valueOrDash(p) }
+
+// requireServerFeature refuses to use flag against a server that does not
+// advertise feature on /api/info.
+func requireServerFeature(info *config.ServerInfo, serverName, feature, flag string) error {
+	if info.HasFeature(feature) {
+		return nil
+	}
+	return fmt.Errorf("server %s does not support %s (it does not advertise the %q feature); upgrade shed-server or drop the flag", serverName, flag, feature)
+}
+
+// formatShedMounts renders a shed's server-mount selection for `shed list`:
+// "all", "none", or the names; "-" when the server doesn't report one.
+func formatShedMounts(sel *config.MountSelection) string {
+	if sel == nil {
+		return "-"
+	}
+	switch sel.Mode {
+	case config.MountModeAll:
+		return "all"
+	case config.MountModeSelected:
+		if len(sel.Names) == 0 {
+			return "none"
+		}
+		return strings.Join(sel.Names, ",")
+	default:
+		return "none"
+	}
 }
 
 func resolveCreateBackend(info *config.ServerInfo, requested string, cpus, memory int) (string, string, error) {
@@ -337,12 +456,7 @@ func runList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	type shedWithServer struct {
-		shed   config.Shed
-		server string
-	}
-
-	var allSheds []shedWithServer
+	var allSheds []listedShed
 
 	if listAll {
 		// Query all servers
@@ -356,7 +470,7 @@ func runList(cmd *cobra.Command, args []string) error {
 				continue
 			}
 			for _, shed := range resp.Sheds {
-				allSheds = append(allSheds, shedWithServer{shed: shed, server: name})
+				allSheds = append(allSheds, listedShed{shed: shed, server: name})
 			}
 		}
 	} else {
@@ -366,7 +480,7 @@ func runList(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to list sheds: %w", err)
 		}
 		for _, shed := range resp.Sheds {
-			allSheds = append(allSheds, shedWithServer{shed: shed, server: serverName})
+			allSheds = append(allSheds, listedShed{shed: shed, server: serverName})
 		}
 	}
 
@@ -393,41 +507,47 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	if jsonFlag {
 		type shedJSON struct {
-			Name          string                                `json:"name"`
-			Server        string                                `json:"server"`
-			Status        string                                `json:"status"`
-			CreatedAt     time.Time                             `json:"created_at"`
-			Backend       string                                `json:"backend,omitempty"`
-			IPAddress     string                                `json:"ip_address,omitempty"`
-			CPUs          int                                   `json:"cpus,omitempty"`
-			MemoryMB      int                                   `json:"memory_mb,omitempty"`
-			Repo          string                                `json:"repo,omitempty"`
-			PID           int                                   `json:"pid,omitempty"`
-			RootfsPath    string                                `json:"rootfs_path,omitempty"`
-			ProjectMounts []config.MountConfig                  `json:"project_mounts,omitempty"`
-			LandingDir    string                                `json:"landing_dir,omitempty"`
-			SSH           string                                `json:"ssh,omitempty"`
-			Uptime        string                                `json:"uptime,omitempty"`
-			LastHealthy   *time.Time                            `json:"last_healthy,omitempty"`
-			StartedAt     *time.Time                            `json:"started_at,omitempty"`
-			Extensions    map[string]config.ExtensionHealthInfo `json:"extensions,omitempty"`
+			Name           string                                `json:"name"`
+			Server         string                                `json:"server"`
+			Status         string                                `json:"status"`
+			CreatedAt      time.Time                             `json:"created_at"`
+			Backend        string                                `json:"backend,omitempty"`
+			IPAddress      string                                `json:"ip_address,omitempty"`
+			CPUs           int                                   `json:"cpus,omitempty"`
+			MemoryMB       int                                   `json:"memory_mb,omitempty"`
+			Repo           string                                `json:"repo,omitempty"`
+			PID            int                                   `json:"pid,omitempty"`
+			RootfsPath     string                                `json:"rootfs_path,omitempty"`
+			ProjectMounts  []config.MountConfig                  `json:"project_mounts,omitempty"`
+			LandingDir     string                                `json:"landing_dir,omitempty"`
+			SSH            string                                `json:"ssh,omitempty"`
+			Uptime         string                                `json:"uptime,omitempty"`
+			LastHealthy    *time.Time                            `json:"last_healthy,omitempty"`
+			StartedAt      *time.Time                            `json:"started_at,omitempty"`
+			Extensions     map[string]config.ExtensionHealthInfo `json:"extensions,omitempty"`
+			Owner          string                                `json:"owner,omitempty"`
+			Mounts         *config.MountSelection                `json:"mounts,omitempty"`
+			NetworkProfile string                                `json:"network_profile,omitempty"`
 		}
 		result := make([]shedJSON, 0, len(allSheds))
 		for _, s := range allSheds {
 			sj := shedJSON{
-				Name:          s.shed.Name,
-				Server:        s.server,
-				Status:        s.shed.Status,
-				CreatedAt:     s.shed.CreatedAt,
-				Backend:       s.shed.Backend,
-				IPAddress:     s.shed.IPAddress,
-				CPUs:          s.shed.CPUs,
-				MemoryMB:      s.shed.MemoryMB,
-				Repo:          s.shed.Repo,
-				PID:           s.shed.PID,
-				RootfsPath:    s.shed.RootfsPath,
-				ProjectMounts: s.shed.ProjectMounts,
-				LandingDir:    s.shed.LandingDir,
+				Name:           s.shed.Name,
+				Server:         s.server,
+				Status:         s.shed.Status,
+				CreatedAt:      s.shed.CreatedAt,
+				Backend:        s.shed.Backend,
+				IPAddress:      s.shed.IPAddress,
+				CPUs:           s.shed.CPUs,
+				MemoryMB:       s.shed.MemoryMB,
+				Repo:           s.shed.Repo,
+				PID:            s.shed.PID,
+				RootfsPath:     s.shed.RootfsPath,
+				ProjectMounts:  s.shed.ProjectMounts,
+				LandingDir:     s.shed.LandingDir,
+				Owner:          s.shed.Owner,
+				Mounts:         s.shed.Mounts,
+				NetworkProfile: s.shed.NetworkProfile,
 			}
 			if s.shed.Status == config.StatusRunning {
 				sj.SSH = shedSSHString(s.shed.Name, s.server)
@@ -455,155 +575,18 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	// Tier 3: key-value display (verboseLevel >= 2)
 	if verboseLevel >= 2 {
-		for i, s := range allSheds {
-			if i > 0 {
-				fmt.Println("---")
-			}
-			fmt.Printf("Name:           %s\n", s.shed.Name)
-			fmt.Printf("Status:         %s\n", s.shed.Status)
-			fmt.Printf("Backend:        %s\n", valueOrDash(s.shed.Backend))
-			if listAll {
-				fmt.Printf("Server:         %s\n", s.server)
-			}
-			fmt.Printf("Created:        %s\n", s.shed.CreatedAt.Format("2006-01-02 15:04:05"))
-			if img := formatShedImage(s.shed); img != "" {
-				fmt.Printf("Image:          %s\n", img)
-			}
-			if s.shed.Status == config.StatusRunning {
-				// Use agent boot time for uptime if available
-				if s.shed.StartedAt != nil {
-					fmt.Printf("Uptime:         %s\n", formatUptime(*s.shed.StartedAt))
-				} else {
-					fmt.Printf("Uptime:         %s\n", formatUptime(s.shed.CreatedAt))
-				}
-				// Show health status
-				if s.shed.LastHealthy != nil {
-					fmt.Printf("Health:         %s ago\n", formatUptime(*s.shed.LastHealthy))
-				} else {
-					fmt.Printf("Health:         unknown\n")
-				}
-
-				// Show extension health (sorted for consistent output)
-				if len(s.shed.Extensions) > 0 {
-					fmt.Println()
-					fmt.Println("Extensions:")
-					names := slices.Sorted(maps.Keys(s.shed.Extensions))
-					for _, ns := range names {
-						ext := s.shed.Extensions[ns]
-						fmt.Printf("  %-20s guest=%-8s host=%s\n", ns+":", ext.Guest, ext.Host)
-					}
-				}
-			}
-
-			// Network section
-			if s.shed.IPAddress != "" || s.shed.Status == config.StatusRunning {
-				fmt.Println()
-				fmt.Println("Network:")
-				if s.shed.IPAddress != "" {
-					fmt.Printf("  IP:           %s\n", s.shed.IPAddress)
-				}
-				if s.shed.Status == config.StatusRunning {
-					fmt.Printf("  SSH:          %s\n", shedSSHString(s.shed.Name, s.server))
-				}
-			}
-
-			// Resources section
-			if s.shed.CPUs > 0 || s.shed.MemoryMB > 0 {
-				fmt.Println()
-				fmt.Println("Resources:")
-				if s.shed.CPUs > 0 {
-					fmt.Printf("  CPUs:         %d\n", s.shed.CPUs)
-				}
-				if s.shed.MemoryMB > 0 {
-					fmt.Printf("  Memory:       %d MB\n", s.shed.MemoryMB)
-				}
-			}
-
-			// Repo / Local Dir
-			if s.shed.Repo != "" {
-				fmt.Println()
-				fmt.Printf("Repo:           %s\n", s.shed.Repo)
-			}
-			if len(s.shed.ProjectMounts) > 0 {
-				fmt.Println()
-				fmt.Println("Mounts:")
-				for _, m := range s.shed.ProjectMounts {
-					fmt.Printf("  %s -> %s\n", m.Source, m.Target)
-				}
-			}
-			if s.shed.LandingDir != "" && s.shed.LandingDir != config.HomePath {
-				fmt.Println()
-				fmt.Printf("Landing Dir:    %s\n", s.shed.LandingDir)
-			}
-
-			// Runtime section
-			if s.shed.PID > 0 || s.shed.ContainerID != "" || s.shed.RootfsPath != "" {
-				fmt.Println()
-				fmt.Println("Runtime:")
-				if s.shed.PID > 0 {
-					fmt.Printf("  PID:          %d\n", s.shed.PID)
-				}
-				if s.shed.ContainerID != "" {
-					fmt.Printf("  Container ID: %s\n", s.shed.ContainerID)
-				}
-				if s.shed.RootfsPath != "" {
-					fmt.Printf("  Rootfs:       %s\n", s.shed.RootfsPath)
-				}
-			}
-			fmt.Println()
-		}
+		renderShedDetails(os.Stdout, allSheds, listAll)
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-
 	// Tier 2: verbose table (verboseLevel == 1)
 	if verboseLevel >= 1 {
-		if listAll {
-			fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tUPTIME")
-		} else {
-			fmt.Fprintln(w, "NAME\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tUPTIME")
-		}
-		for _, s := range allSheds {
-			ssh := "-"
-			uptime := "-"
-			if s.shed.Status == config.StatusRunning {
-				ssh = shedSSHString(s.shed.Name, s.server)
-				if s.shed.StartedAt != nil {
-					uptime = formatUptime(*s.shed.StartedAt)
-				} else {
-					uptime = formatUptime(s.shed.CreatedAt)
-				}
-			}
-			ip := valueOrDash(s.shed.IPAddress)
-			resources := "-"
-			if s.shed.CPUs > 0 && s.shed.MemoryMB > 0 {
-				resources = fmt.Sprintf("%dc/%dMB", s.shed.CPUs, s.shed.MemoryMB)
-			} else if s.shed.CPUs > 0 {
-				resources = fmt.Sprintf("%dc", s.shed.CPUs)
-			} else if s.shed.MemoryMB > 0 {
-				resources = fmt.Sprintf("%dMB", s.shed.MemoryMB)
-			}
-			source := valueOrDash(s.shed.Repo)
-			if len(s.shed.ProjectMounts) > 0 {
-				source = s.shed.ProjectMounts[0].Source
-				if len(s.shed.ProjectMounts) > 1 {
-					source = fmt.Sprintf("%s (+%d)", source, len(s.shed.ProjectMounts)-1)
-				}
-			}
-			if listAll {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					s.shed.Name, s.server, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, source, uptime)
-			} else {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					s.shed.Name, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, source, uptime)
-			}
-		}
-		w.Flush()
+		renderShedTableVerbose(os.Stdout, allSheds, listAll)
 		return nil
 	}
 
 	// Tier 1: default table
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	if listAll {
 		fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tCREATED")
 	} else {
@@ -627,6 +610,163 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	w.Flush()
 	return nil
+}
+
+// listedShed is one row of `shed list`: a shed and the server it is on.
+type listedShed struct {
+	shed   config.Shed
+	server string
+}
+
+// renderShedTableVerbose is `shed list -v`: one wide table row per shed.
+func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	if listAll {
+		fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tOWNER\tMOUNTS\tNETWORK\tUPTIME")
+	} else {
+		fmt.Fprintln(w, "NAME\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tOWNER\tMOUNTS\tNETWORK\tUPTIME")
+	}
+	for _, s := range sheds {
+		ssh := "-"
+		uptime := "-"
+		if s.shed.Status == config.StatusRunning {
+			ssh = shedSSHString(s.shed.Name, s.server)
+			if s.shed.StartedAt != nil {
+				uptime = formatUptime(*s.shed.StartedAt)
+			} else {
+				uptime = formatUptime(s.shed.CreatedAt)
+			}
+		}
+		ip := valueOrDash(s.shed.IPAddress)
+		resources := "-"
+		if s.shed.CPUs > 0 && s.shed.MemoryMB > 0 {
+			resources = fmt.Sprintf("%dc/%dMB", s.shed.CPUs, s.shed.MemoryMB)
+		} else if s.shed.CPUs > 0 {
+			resources = fmt.Sprintf("%dc", s.shed.CPUs)
+		} else if s.shed.MemoryMB > 0 {
+			resources = fmt.Sprintf("%dMB", s.shed.MemoryMB)
+		}
+		source := valueOrDash(s.shed.Repo)
+		if len(s.shed.ProjectMounts) > 0 {
+			source = s.shed.ProjectMounts[0].Source
+			if len(s.shed.ProjectMounts) > 1 {
+				source = fmt.Sprintf("%s (+%d)", source, len(s.shed.ProjectMounts)-1)
+			}
+		}
+		owner, mounts, network := valueOrDash(s.shed.Owner), formatShedMounts(s.shed.Mounts), formatNetworkProfile(s.shed.NetworkProfile)
+		if listAll {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				s.shed.Name, s.server, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, source, owner, mounts, network, uptime)
+		} else {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				s.shed.Name, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, source, owner, mounts, network, uptime)
+		}
+	}
+	w.Flush()
+}
+
+// renderShedDetails is `shed list -vv`: one key-value block per shed.
+func renderShedDetails(out io.Writer, sheds []listedShed, listAll bool) {
+	for i, s := range sheds {
+		if i > 0 {
+			fmt.Fprintln(out, "---")
+		}
+		fmt.Fprintf(out, "Name:           %s\n", s.shed.Name)
+		fmt.Fprintf(out, "Status:         %s\n", s.shed.Status)
+		fmt.Fprintf(out, "Backend:        %s\n", valueOrDash(s.shed.Backend))
+		if listAll {
+			fmt.Fprintf(out, "Server:         %s\n", s.server)
+		}
+		fmt.Fprintf(out, "Created:        %s\n", s.shed.CreatedAt.Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(out, "Owner:          %s\n", valueOrDash(s.shed.Owner))
+		fmt.Fprintf(out, "Server Mounts:  %s\n", formatShedMounts(s.shed.Mounts))
+		fmt.Fprintf(out, "Network:        %s\n", formatNetworkProfile(s.shed.NetworkProfile))
+		if img := formatShedImage(s.shed); img != "" {
+			fmt.Fprintf(out, "Image:          %s\n", img)
+		}
+		if s.shed.Status == config.StatusRunning {
+			// Use agent boot time for uptime if available
+			if s.shed.StartedAt != nil {
+				fmt.Fprintf(out, "Uptime:         %s\n", formatUptime(*s.shed.StartedAt))
+			} else {
+				fmt.Fprintf(out, "Uptime:         %s\n", formatUptime(s.shed.CreatedAt))
+			}
+			// Show health status
+			if s.shed.LastHealthy != nil {
+				fmt.Fprintf(out, "Health:         %s ago\n", formatUptime(*s.shed.LastHealthy))
+			} else {
+				fmt.Fprintf(out, "Health:         unknown\n")
+			}
+
+			// Show extension health (sorted for consistent output)
+			if len(s.shed.Extensions) > 0 {
+				fmt.Fprintln(out)
+				fmt.Fprintln(out, "Extensions:")
+				names := slices.Sorted(maps.Keys(s.shed.Extensions))
+				for _, ns := range names {
+					ext := s.shed.Extensions[ns]
+					fmt.Fprintf(out, "  %-20s guest=%-8s host=%s\n", ns+":", ext.Guest, ext.Host)
+				}
+			}
+		}
+
+		// Network section
+		if s.shed.IPAddress != "" || s.shed.Status == config.StatusRunning {
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, "Network:")
+			if s.shed.IPAddress != "" {
+				fmt.Fprintf(out, "  IP:           %s\n", s.shed.IPAddress)
+			}
+			if s.shed.Status == config.StatusRunning {
+				fmt.Fprintf(out, "  SSH:          %s\n", shedSSHString(s.shed.Name, s.server))
+			}
+		}
+
+		// Resources section
+		if s.shed.CPUs > 0 || s.shed.MemoryMB > 0 {
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, "Resources:")
+			if s.shed.CPUs > 0 {
+				fmt.Fprintf(out, "  CPUs:         %d\n", s.shed.CPUs)
+			}
+			if s.shed.MemoryMB > 0 {
+				fmt.Fprintf(out, "  Memory:       %d MB\n", s.shed.MemoryMB)
+			}
+		}
+
+		// Repo / Local Dir
+		if s.shed.Repo != "" {
+			fmt.Fprintln(out)
+			fmt.Fprintf(out, "Repo:           %s\n", s.shed.Repo)
+		}
+		if len(s.shed.ProjectMounts) > 0 {
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, "Mounts:")
+			for _, m := range s.shed.ProjectMounts {
+				fmt.Fprintf(out, "  %s -> %s\n", m.Source, m.Target)
+			}
+		}
+		if s.shed.LandingDir != "" && s.shed.LandingDir != config.HomePath {
+			fmt.Fprintln(out)
+			fmt.Fprintf(out, "Landing Dir:    %s\n", s.shed.LandingDir)
+		}
+
+		// Runtime section
+		if s.shed.PID > 0 || s.shed.ContainerID != "" || s.shed.RootfsPath != "" {
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, "Runtime:")
+			if s.shed.PID > 0 {
+				fmt.Fprintf(out, "  PID:          %d\n", s.shed.PID)
+			}
+			if s.shed.ContainerID != "" {
+				fmt.Fprintf(out, "  Container ID: %s\n", s.shed.ContainerID)
+			}
+			if s.shed.RootfsPath != "" {
+				fmt.Fprintf(out, "  Rootfs:       %s\n", s.shed.RootfsPath)
+			}
+		}
+		fmt.Fprintln(out)
+	}
 }
 
 // shedSSHString returns the SSH connection string for a shed.

@@ -176,7 +176,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
+          go-version: '1.27'
       # Root module tests. The nested sdk module gets compile + vet coverage
       # from the lint job (`make lint` runs `cd sdk && go vet ./...`); we do
       # NOT run `cd sdk && go test` here because sdk/bootstrap's TestRunSuccess
@@ -194,10 +194,10 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
+          go-version: '1.27'
       - uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.10.1
+          version: v2.15.0
 
   plugin:
     needs: changes

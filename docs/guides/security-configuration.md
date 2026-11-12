@@ -16,6 +16,11 @@ independent choices:
    server is reachable only on this machine until you set it to a routable
    address.
 
+Separately from both, you can limit what each **shed** reaches: no server
+mounts, and on Firecracker an internet-only network. That works in every
+posture, a localhost-only laptop included; see [Hardening the sheds
+themselves](#hardening-the-sheds-themselves).
+
 Think of it as two deployment shapes:
 
 - **Local development** (the default) — localhost-only, open (the installed
@@ -44,8 +49,9 @@ Client settings are written per server into `~/.shed/config.yaml` by
 |----------|--------|
 | Is everything on **one machine**, and do you want zero auth ceremony? | **Open + loopback** (Case 1) — the installed default |
 | One machine, but you want TLS + key checking anyway (shared box, or mirror prod locally)? | **Token + loopback** (Case 2) |
-| Reachable **over the network** / internet-facing, and `curl`/scripts/CI need to reach the API directly? | **Token, all interfaces** (Case 3) |
+| Reachable **over the network** / internet-facing, and `curl`/scripts/CI need **admin** access to the API with a bearer header? | **Token, all interfaces** (Case 3) |
 | Reachable **over the network** / internet-facing, and every caller is part of the shed client fleet (CLI, desktop, host-agent, mobile)? | **mtls, all interfaces** (Case 3b) — the **recommended** networked posture |
+| Reachable over the network, and an orchestrator (CI, an agent runner) needs to create and drive **only its own sheds**? | **mtls** (Case 3b) with a [service client](orchestrated-sheds.md) |
 | Reachable over the network, but a **trusted private network only** and you accept plaintext? | **Open on a LAN** (Case 4) — needs `allow_insecure_exposure: true` |
 
 Two invariants hold across every token- and mtls-mode deployment, and explain
@@ -159,8 +165,11 @@ the credential bus over the same pinned-TLS listener at
 fingerprint verification, and rotation.
 
 **When to prefer Case 3b instead:** token mode is the right call whenever
-`curl`, a CI runner, or any third-party integration needs to hit the API
-directly with a bearer header — that's not possible against an mtls server.
+`curl`, a CI runner, or any third-party integration needs **admin** access to
+the API with a bearer header — an mtls server has no bearer credential. An
+orchestrator that needs only its own sheds does not need token mode: on an
+mtls server it can be a [service client](orchestrated-sheds.md), whose
+certificate bundle works with `curl --cert`.
 
 ---
 
@@ -201,7 +210,8 @@ demands a client certificate as part of `RequireAndVerifyClientCert`
 (`curl -k` with no certificate gets no HTTP response at all, not even a 401).
 **Trade-off:** revoking access means removing the SSH key (coarser than
 token mode's per-token revoke — it also cuts SSH/SFTP), and `curl`/scripts
-cannot reach the server at all. See
+cannot reach the server as an admin. A script or orchestrator that needs only
+its own sheds can be a [service client](orchestrated-sheds.md) instead. See
 [mTLS mode](../reference/security.md#mtls-mode) for the full guarantee, the
 per-request re-validation, and the accepted limitations, and
 [Upgrading to mTLS](../upgrades/token-to-mtls.md) for flipping an existing
@@ -239,6 +249,74 @@ shed server add my-host.tailnet.ts.net --name my-host
 everything is plaintext and any host that can reach the address can reach the
 API — the private network *is* the trust boundary. Move to mtls (Case 3b) or
 token mode (Case 3) the moment the server faces anything wider.
+
+---
+
+## Hardening the sheds themselves
+
+The posture decides who reaches the server. What a shed itself can reach is
+set per shed, in any posture:
+
+```bash
+# No server mounts, and (Firecracker) the internet and nothing else
+shed create untrusted --repo https://github.com/someone/tool.git --mounts none --network isolated
+shed list -v      # the MOUNTS column shows none, NETWORK shows isolated
+```
+
+- **`--mounts none`** (or `--mounts claude,gh`) picks which of the server's
+  `mounts:` the shed gets. Without the flag it gets all of them, as before. The
+  choice is stored and applied on every start. See [Security › Mount
+  selection](../reference/security.md#mount-selection).
+- **`--network isolated`** (Firecracker only) lets the shed reach the internet
+  and nothing else: not the host on any of its addresses (except the shed's own
+  9P and egress-proxy ports on the gateway), other sheds, the LAN (RFC 1918),
+  the tailnet (`100.64.0.0/10`), link-local addresses and the cloud metadata
+  service, and no IPv6. shed-server enforces it with its own nftables tables,
+  so a process in the guest cannot opt out. Something on the host can remove
+  them (`nft flush ruleset`, a firewall reload), and the shed is then open for
+  up to 30 s, until shed-server's check puts them back. See [Security › Network
+  profiles](../reference/security.md#network-profiles).
+- **Use both.** On Firecracker, an `open` shed with no mounts can still reach
+  another running shed's 9P port on the bridge, so leaving out mounts is not a
+  boundary by itself.
+- **Neither flag turns off the credential bus.** While a host-agent brokers for
+  this server, code in the shed can request SSH signatures and the cloud and
+  registry credentials configured for it, like any shed (see [Credential
+  isolation › Compromised VM](../extensions/security-posture.md#compromised-vm)).
+  For untrusted code, stop the host-agent while the shed runs, or have a
+  [service client](../reference/security.md#service-clients) own the shed: the
+  bus is always off for an owned shed.
+- **Neither flag stops the create's sync.** `shed create` still syncs your
+  `default` [sync profile](../reference/sync.md#auto-sync-on-create) into the
+  shed; add `--no-sync` when it copies anything the code should not see.
+
+To make `isolated` the default for every create on a Firecracker server:
+
+```yaml
+network:
+  default_profile: isolated    # a create without --network gets this; --network open opts out
+  allow_cidrs:
+    - 192.168.1.20/32          # optional: private addresses the sheds still need (a LAN registry)
+```
+
+`allow_cidrs` opens only routed destinations. It never opens the host itself
+or other sheds.
+
+**Requirements.** An isolated shed needs the `nft` binary on the server's
+`PATH` and shed-server running as root, which the deb package's systemd unit
+does. Without them the create or start is refused with
+`503 NETWORK_ENFORCEMENT_UNAVAILABLE`; a server with only open sheds needs
+neither. See [Firecracker setup › Prerequisites](../getting-started/fc-setup.md#prerequisites).
+
+**VZ (macOS) supports only `open`.** `--network isolated` is refused there
+(`422 NETWORK_PROFILE_UNSUPPORTED`), and a VZ server refuses
+`network.default_profile: isolated` at load. `--mounts` works on both backends.
+
+**Egress profiles add domain filtering on top.** The isolated profile decides
+what any process in the shed can reach; an [egress profile](../reference/egress.md)
+decides which internet hosts a cooperating client (one that honours
+`HTTP_PROXY`) may use, and audits it. See [Egress Control › With the isolated
+network profile](../reference/egress.md#with-the-isolated-network-profile).
 
 ---
 
@@ -298,6 +376,16 @@ server names the gap and exits):
 | `config key "internal_http_port" was removed` | a leftover `internal_http_port` | Delete it — the bus + Connect tunnel ride the single listener (Case 3/3b). |
 | `bind_address … requires allow_insecure_exposure` | a non-loopback `bind_address` in **open** mode | Add `allow_insecure_exposure: true` (Case 4), or switch to `token`/`mtls` mode (Case 3/3b). |
 | `invalid auth.mode: … (must be open, token, or mtls)` | a typo or unsupported value in `auth.mode` | Use `open`, `token`, or `mtls` (`secure` is also accepted, as a deprecated alias for `token`). |
+| `auth.clients requires auth.mode: mtls` | [service clients](orchestrated-sheds.md) declared in `open` or `token` mode | Switch to `auth.mode: mtls` (Case 3b), or remove `auth.clients`. |
+| `invalid auth.clients name …`, or `auth.clients.<name>.policy.name_prefix is required` (likewise `max_sheds is required and must be at least 1`, `max_age is required and must be positive`) | a client name that is not lowercase letters, digits and hyphens, or a required policy field missing or zero | Fix the name, or set the field (see [Configuration › Service clients](../reference/configuration.md#service-clients)). |
+| `auth.clients.<name>.policy.server_mounts names "…", which is not in mounts` (or `policy.images names "…", which is not an image alias of the … backend`) | a policy that names a mount or an image alias the server does not define | Add it to `mounts:` or the backend's `image_aliases`, or remove it from the policy. |
+| `auth.clients: … field … not found` (or `network: … field … not found`) | an unknown key, usually a typo, under `auth.clients` or `network:` | Correct the key the message names. |
+| `network.default_profile: isolated is not supported by the vz backend` | an isolated default on a VZ (macOS) server | Use `default_profile: open` (or leave it out); VZ supports only `open`. |
+| `auth.clients.<name>.policy.network is isolated (the default when unset), which the vz backend cannot enforce; set network: open` | a service client on a VZ server with no `policy.network` | Set `network: open` in that client's policy. |
+| `invalid network.default_profile: …` or `invalid network.allow_cidrs entry …` | a profile other than `open`/`isolated`, or an `allow_cidrs` entry that is not an IPv4 CIDR | Use `open` or `isolated`, and CIDRs such as `192.168.1.0/24`. |
+| `state_dir must be an absolute path or start with ~/` | a relative `state_dir` | Use an absolute path (`/var/lib/shed/state`) or one under `~/`. |
+| `invalid audit.exec_argv: …` | a value other than `""` or `full` | Leave it empty (argv[0] and the count) or set `full`. |
+| `audit: open …/audit.jsonl: …` | the audit log is needed (`auth.clients` is set, or `audit.enabled: true`) and the server cannot create or open it | Make the parent of the backend's `instance_dir` writable by the user that runs `serve` (see [Configuration › Audit log](../reference/configuration.md#audit-log)). |
 
 ## Quick reference
 
@@ -305,6 +393,6 @@ server names the gap and exits):
 |------|-------------|----------------|-----|-------------------|
 | 1 — local simple | `open` | `127.0.0.1` (default) | none | `shed server add localhost` |
 | 2 — local hardened | `token` | `127.0.0.1` (default) | loopback `:8443` | `shed server add localhost --https-port 8443` |
-| 3 — remote, curl/CI-compatible | `token` | `0.0.0.0` | all ifaces `:8443` | `shed server add <host> --https-port 8443` |
+| 3 — remote, bearer-token admin scripts | `token` | `0.0.0.0` | all ifaces `:8443` | `shed server add <host> --https-port 8443` |
 | 3b — remote (recommended) | `mtls` | `0.0.0.0` | all ifaces `:8443`, client cert required | `shed server add <host> --ssh-port <port>` |
 | 4 — remote open on LAN | `open` + `allow_insecure_exposure` | `0.0.0.0` | none | `shed server add <host>` |

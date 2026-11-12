@@ -21,6 +21,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/backend/orchestrator"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/netpolicy"
 	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmimage/clone"
 	"github.com/charliek/shed/internal/vmutil"
@@ -65,6 +66,7 @@ type fcNet struct {
 	cid       uint32
 	ipAddress string
 	tapDevice string
+	profile   netpolicy.Profile
 }
 
 // fcMetaHandle carries the persisted *Metadata between hooks. The
@@ -217,6 +219,10 @@ func (b *fcCreator) PreFlight(ctx context.Context, req config.CreateShedRequest,
 func (b *fcCreator) AllocateNetwork(ctx context.Context, req config.CreateShedRequest, cleanup *backend.Cleanup) (orchestrator.NetworkResources, error) {
 	backend.Phase(ctx, "network")
 	backend.Status(ctx, "Allocating network resources...")
+	profile, err := b.c.resolveNetworkProfile(req.Network)
+	if err != nil {
+		return nil, err
+	}
 	cid, err := b.c.AllocateCID(req.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate CID: %w", err)
@@ -242,7 +248,14 @@ func (b *fcCreator) AllocateNetwork(ctx context.Context, req config.CreateShedRe
 		return b.c.netMgr.DeleteTAPDevice(tapDevice)
 	})
 
-	return fcNet{cid: cid, ipAddress: ipAddress, tapDevice: tapDevice}, nil
+	// A guarded shed's rules go in before its VM exists, so the guest's very
+	// first frame is already filtered; when they cannot be applied the create
+	// fails (503) rather than boot an unguarded guest.
+	if err := b.c.guardNewShed(ctx, req.Name, profile, tapDevice, cid, ipAddress, cleanup); err != nil {
+		return nil, err
+	}
+
+	return fcNet{cid: cid, ipAddress: ipAddress, tapDevice: tapDevice, profile: profile}, nil
 }
 
 // AllocateUpper provisions the writable upper layer. Includes the
@@ -315,6 +328,10 @@ func (b *fcCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		LowerDigest:    pre.lowerDigest,
 		LowerImageTag:  pre.lowerImageTag,
 		FromSnapshot:   req.FromSnapshot,
+		Owner:          req.Owner,
+		// Always explicit for a new shed; nil (a non-API caller) is "all".
+		MountSelection: config.EffectiveMountSelection(req.ResolvedMounts),
+		NetworkProfile: string(net.profile),
 	}
 
 	cleanup.Register("delete instance dir", func() error {
@@ -375,6 +392,14 @@ func (b *fcCreator) FinalizeStartedVM(ctx context.Context, metaRaw orchestrator.
 		delete(b.c.vms, shedName)
 		return nil
 	})
+	// SetupCredentials, later in the sequence, opens the shed's message
+	// channel; a failure after it (egress setup) must not leave the channel
+	// behind for the next shed created under this name. A no-op when no
+	// channel was opened.
+	cleanup.Register("stop message channel", func() error {
+		b.c.credMgr.StopListener(shedName)
+		return nil
+	})
 	return nil
 }
 
@@ -415,13 +440,13 @@ func (b *fcCreator) MountLocalDir(ctx context.Context, req config.CreateShedRequ
 // Best-effort.
 func (b *fcCreator) SetupCredentials(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
 	meta := metaRaw.(*fcMetaHandle).meta
-	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	if len(dirCreds) > 0 {
 		backend.Phase(ctx, "credentials")
 		backend.Status(ctx, "Setting up credentials...")
 	}
 	agent := b.c.newAgentClient(meta.Name)
-	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mount9PCredentialFunc(req.Name))
+	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mount9PCredentialFunc(req.Name), meta.Owner != "")
 }
 
 // ConfigureEgressProxy opens this shed's egress proxy listener and injects the
@@ -453,6 +478,9 @@ func (b *fcCreator) ConfigureEgressProxy(ctx context.Context, req config.CreateS
 	if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("egress: save metadata: %w", err)
 	}
+	// A guarded shed may reach its own proxy port on the gateway (before the
+	// clone, which goes through the proxy).
+	b.c.syncEgressPort(meta.Name, port)
 	b.egressEnv = env
 	return nil
 }
@@ -467,7 +495,7 @@ func (b *fcCreator) CloneRepo(ctx context.Context, req config.CreateShedRequest,
 	agent := b.c.newAgentClient(meta.Name)
 	backend.Phase(ctx, "repo")
 	backend.Status(ctx, "Cloning repository...")
-	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, b.egressEnv); err != nil {
+	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, meta.Owner != "", b.egressEnv); err != nil {
 		log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
 		backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
 	} else {
@@ -615,6 +643,12 @@ func (c *Client) sweepStaleP9Servers(name string) {
 func (b *fcStarter) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHandle, cleanup *backend.Cleanup) (orchestrator.VMHandle, error) {
 	meta := metaRaw.(*fcMetaHandle).meta
 
+	// A guarded shed starts only with its rules in place (503 otherwise) and
+	// its TAP up.
+	if err := b.c.ensureGuardedForStart(ctx, meta); err != nil {
+		return nil, err
+	}
+
 	vm, err := CreateVM(ctx, meta, b.c.cfg, b.c.netMgr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create VM: %w", err)
@@ -687,6 +721,14 @@ func (b *fcStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.
 		delete(b.c.vms, shedName)
 		return nil
 	})
+	// SetupCredentials, later in the sequence, opens the shed's message
+	// channel; a failure after it (egress setup) must not leave the channel
+	// behind for the next shed created under this name. A no-op when no
+	// channel was opened.
+	cleanup.Register("stop message channel", func() error {
+		b.c.credMgr.StopListener(shedName)
+		return nil
+	})
 	return nil
 }
 
@@ -746,9 +788,9 @@ func (b *fcStarter) MountLocalDir(ctx context.Context, metaRaw orchestrator.Meta
 // per credential).
 func (b *fcStarter) SetupCredentials(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
 	meta := metaRaw.(*fcMetaHandle).meta
-	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	agent := b.c.newAgentClient(meta.Name)
-	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mount9PCredentialFunc(meta.Name))
+	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mount9PCredentialFunc(meta.Name), meta.Owner != "")
 }
 
 // ConfigureEgressProxy re-opens this shed's egress proxy listener on the
@@ -785,6 +827,7 @@ func (b *fcStarter) ConfigureEgressProxy(ctx context.Context, metaRaw orchestrat
 			return fmt.Errorf("egress: save metadata: %w", err)
 		}
 	}
+	b.c.syncEgressPort(meta.Name, port)
 	return nil
 }
 

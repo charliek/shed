@@ -3,6 +3,7 @@ package vmutil
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -140,6 +141,13 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	}
 	defer conn.Close()
 
+	// The connection lives no longer than ctx: a cancel or a deadline closes
+	// it, which unblocks any write to a guest that has stopped reading (the
+	// request, stdin, the stdin EOF) as well as the reader. The guest agent
+	// sees the close and SIGHUPs the command's process group.
+	stopCloseOnCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCloseOnCancel()
+
 	// execDone is closed when Exec returns, allowing spawned goroutines to
 	// detect completion and exit even if ctx is still alive.
 	execDone := make(chan struct{})
@@ -174,7 +182,15 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	}
 
 	if err := writeMessage(agentproto.MsgTypeExecRequest, reqData); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("failed to send exec request: %w", err)
+	}
+	// The request is out: from here the command may be running. Tell the
+	// caller once, before any output can be delivered to its writers.
+	if opts.OnStarted != nil {
+		opts.OnStarted()
 	}
 
 	// Handle resize events in a goroutine
@@ -291,6 +307,11 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	// Wait for completion or context cancellation
 	select {
 	case err := <-done:
+		// An I/O error the cancel's close caused is reported as ctx's.
+		var exitErr *ExitError
+		if err != nil && !errors.As(err, &exitErr) && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return err
 	case <-ctx.Done():
 		return ctx.Err()

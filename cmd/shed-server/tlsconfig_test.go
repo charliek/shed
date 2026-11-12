@@ -117,6 +117,37 @@ func TestBuildHTTPSTLSConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("mtls verifier accepts a configured service client without the allowlist", func(t *testing.T) {
+		cfg := &config.ServerConfig{Auth: &config.AuthConfig{
+			Mode: config.AuthModeMTLS,
+			Clients: map[string]config.ServiceClientConfig{
+				"nocturn": {Policy: config.ServiceClientPolicy{NamePrefix: "nocturn-", MaxSheds: 1, MaxAge: config.Duration(time.Hour)}},
+			},
+		}}
+		got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(string) bool {
+			t.Fatal("the SSH allowlist was consulted for a service certificate")
+			return true
+		})
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, want := range map[string]bool{"nocturn": true, "other": false} {
+			der, err := ca.SignServiceCert(&key.PublicKey, name, time.Hour)
+			if err != nil {
+				t.Fatalf("SignServiceCert: %v", err)
+			}
+			leaf, err := x509.ParseCertificate(der)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = got.VerifyConnection(tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}})
+			if (err == nil) != want {
+				t.Errorf("service client %q: VerifyConnection err = %v, want accepted=%v", name, err, want)
+			}
+		}
+	})
+
 	t.Run("token mode has no client auth", func(t *testing.T) {
 		cfg := &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeToken}}
 		// Pass a CA anyway: mode, not the argument, is what decides.

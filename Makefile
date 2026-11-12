@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -47,13 +47,17 @@ test:
 # `brew install uv` or https://docs.astral.sh/uv/getting-started/installation/).
 # Tests parameterized over [vz, fc]; each skips cleanly when its target
 # backend is unreachable from this host. See tests/integration/README.md.
+# PYTEST_ARGS passes extra arguments to pytest, e.g. a subset of modules:
+#   make test-integration-dev-fc PYTEST_ARGS="test_smoke.py test_mounts.py"
+PYTEST_ARGS ?=
+
 test-integration:
 	@command -v uv >/dev/null 2>&1 || { \
 	  echo "uv is required for integration tests."; \
 	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
 	  exit 1; \
 	}
-	cd tests/integration && uv sync && uv run pytest -v
+	cd tests/integration && uv sync && uv run pytest -v $(PYTEST_ARGS)
 
 # Hermetic host-agent wire harness (the THIRD pytest suite — never merged with
 # tests/integration or desktop/tools/shedtest). It spawns the Rust
@@ -606,6 +610,9 @@ dev-server-down-fc:
 	  COMM=\$$(ps -p \$$PID -o comm= 2>/dev/null || true); \
 	  if [ -z \"\$$COMM\" ]; then \
 	    echo \"Dev FC server PID \$$PID is stale (process already gone); cleaning up PID file.\"; \
+	    echo '  Its nftables tables (if any) are left in place: they still guard any isolated dev shed whose VM is running.'; \
+	    echo '  Once no dev shed is running, delete them with:'; \
+	    echo '    ssh $(FC_REMOTE_HOST) sudo $(FC_DEV_BIN_PATH) network teardown --config $(FC_DEV_CONFIG)'; \
 	    sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_LOG_PATH); \
 	  elif ! echo \"\$$COMM\" | grep -q 'shed-server'; then \
 	    echo \"Dev FC server PID \$$PID points at an unrelated process (current comm: \$$COMM).\"; \
@@ -622,7 +629,15 @@ dev-server-down-fc:
 	      sudo -n kill -KILL \$$PID 2>/dev/null; \
 	    fi; \
 	    echo \"Dev FC server (pid \$$PID) stopped on $(FC_REMOTE_HOST).\"; \
-	    sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_BIN_PATH) $(FC_DEV_PROXY_PATH) $(FC_DEV_CONFIG) $(FC_DEV_LOG_PATH); \
+	    if sudo -n $(FC_DEV_BIN_PATH) network teardown --config $(FC_DEV_CONFIG); then \
+	      sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_BIN_PATH) $(FC_DEV_PROXY_PATH) $(FC_DEV_CONFIG) $(FC_DEV_LOG_PATH); \
+	    else \
+	      echo 'ERROR: network teardown failed; the dev tables may still be installed.'; \
+	      echo '  Kept $(FC_DEV_BIN_PATH) and $(FC_DEV_CONFIG) for a retry:'; \
+	      echo '    ssh $(FC_REMOTE_HOST) sudo $(FC_DEV_BIN_PATH) network teardown --config $(FC_DEV_CONFIG)'; \
+	      sudo rm -f $(FC_DEV_PID_PATH); \
+	      exit 1; \
+	    fi; \
 	  fi"
 
 dev-server-status-fc:
@@ -657,6 +672,38 @@ dev-server-logs-fc:
 
 dev-server-restart-fc: dev-server-down-fc dev-server-up-fc
 
+# Root-only proof of the isolated network profile's nftables rules, run on
+# $(FC_REMOTE_HOST) entirely inside network namespaces the test creates and
+# deletes (a bridge and veth pairs stand in for TAPs; nft only ever runs via
+# `ip netns exec`). Cross-compiles the netpolicy test binary with the netns
+# tag for the remote's arch, runs it under sudo, and deletes the copy.
+NETNS_TEST_BIN := bin/netpolicy-netns.test
+test-netns-remote:
+	@ARCH=$$(ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) "uname -m" 2>/dev/null); \
+	 case "$$ARCH" in \
+	   x86_64)  GOARCH=amd64 ;; \
+	   aarch64) GOARCH=arm64 ;; \
+	   *) echo "ERROR: unsupported or unreachable remote arch on $(FC_REMOTE_HOST): '$$ARCH'"; exit 1 ;; \
+	 esac; \
+	 echo "Cross-compiling the netpolicy netns test for linux/$$GOARCH..."; \
+	 GOOS=linux GOARCH=$$GOARCH CGO_ENABLED=0 go test -c -tags netns -o $(NETNS_TEST_BIN) ./internal/netpolicy || exit 1; \
+	 RDIR=$$(ssh -o BatchMode=yes $(FC_REMOTE_HOST) "mktemp -d /tmp/netpolicy-netns.XXXXXXXX") || exit 1; \
+	 case "$$RDIR" in /tmp/netpolicy-netns.*) ;; *) echo "ERROR: unexpected remote temp dir '$$RDIR'"; exit 1 ;; esac; \
+	 RC=0; \
+	 if scp -q $(NETNS_TEST_BIN) $(FC_REMOTE_HOST):$$RDIR/netpolicy-netns.test; then \
+	   OUT=$$(ssh -o BatchMode=yes $(FC_REMOTE_HOST) "sudo -n $$RDIR/netpolicy-netns.test -test.v -test.count=1 -test.run '^TestNetns'" 2>&1); RC=$$?; \
+	   printf '%s\n' "$$OUT"; \
+	   if [ $$RC -eq 0 ] && printf '%s\n' "$$OUT" | grep -q -- '--- SKIP'; then \
+	     echo "ERROR: a netns test skipped (root, nft and ip are required on $(FC_REMOTE_HOST)); the rules were not proven"; RC=1; \
+	   elif [ $$RC -eq 0 ] && ! printf '%s\n' "$$OUT" | grep -q -- '--- PASS: TestNetns'; then \
+	     echo "ERROR: no netns test ran"; RC=1; \
+	   fi; \
+	 else \
+	   RC=1; \
+	 fi; \
+	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "rm -rf $$RDIR"; \
+	 exit $$RC
+
 # Run the integration suite against the parallel dev FC shed-server.
 # Auto-ups the dev server if it isn't already running. Doesn't
 # auto-stop after — the dev server is intentionally long-lived for
@@ -684,7 +731,14 @@ test-integration-dev-fc:
 	@# exact value the remote dev server was last (re)started with.
 	@# Same PATH reasoning as test-integration-dev: drive the branch's `shed`,
 	@# not the brew-installed release.
+	@# SHED_VZ_SERVER and SHED_VZ_DEV_SERVER are set EMPTY so every [vz] case
+	@# skips (conftest treats an empty name as "no server"): this target is
+	@# FC-only, and the VZ default (`my-server`) can name a production server
+	@# (on a Linux workstation it is often mini3's deb server), which the
+	@# suite would otherwise create and delete sheds on.
 	PATH="$(CURDIR)/bin:$$PATH" \
+	  SHED_VZ_SERVER= \
+	  SHED_VZ_DEV_SERVER= \
 	  SHED_FC_HOST=$(FC_REMOTE_HOST) \
 	  SHED_FC_SERVER=$(SHED_FC_DEV_SERVER) \
 	  SHED_FC_LOG_PATH=$(FC_DEV_LOG_PATH) \

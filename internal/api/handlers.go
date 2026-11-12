@@ -35,7 +35,7 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		AuthMode:     config.LegacyWireAuthMode(s.cfg.AuthModeValue()),
 		DefaultImage: s.cfg.ActiveDefaultImage(),
 		HTTPSPort:    s.cfg.HTTPSPort,
-		Features:     serverFeatures(),
+		Features:     s.serverFeatures(),
 	}
 	// Client-CA visibility, mtls only. Reaching /api/info in mtls mode already
 	// required a valid client certificate (that mode has no bootstrap
@@ -69,6 +69,17 @@ func (s *Server) handleListSheds(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A service client sees only the sheds it owns.
+	if c := callerFrom(r.Context()); c.IsClient() {
+		owned := make([]config.Shed, 0, len(sheds))
+		for _, sh := range sheds {
+			if sh.Owner == c.Name {
+				owned = append(owned, sh)
+			}
+		}
+		sheds = owned
+	}
+
 	resp := config.ShedsResponse{
 		Sheds: sheds,
 	}
@@ -85,6 +96,8 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidShedName, "invalid request body: "+err.Error())
 		return
 	}
+	// A service client's api audit line names the shed it asked to create.
+	setAuditShed(r.Context(), req.Name)
 
 	// Validate shed name
 	if req.Name == "" {
@@ -94,6 +107,23 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	if err := config.ValidateShedName(req.Name); err != nil {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidShedName, err.Error())
 		return
+	}
+
+	// Owner and ResolvedMounts are server-set (json:"-" already keeps them
+	// off the wire); start from zero whatever the decoder did.
+	req.Owner = ""
+	req.ResolvedMounts = nil
+
+	// A service client's create policy runs before any validation that
+	// touches the host (local_dir existence would otherwise be an oracle for
+	// the server's filesystem), and before the SSE branch, so a refusal is
+	// always a plain 403.
+	caller := callerFrom(r.Context())
+	if caller.IsClient() {
+		if rule := s.clientCreateRefusal(caller, &req); rule != "" {
+			writePolicyViolation(w, caller, rule)
+			return
+		}
 	}
 
 	// Validate local_dir and repo are mutually exclusive
@@ -155,6 +185,36 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	if err := config.ValidateGitRepoURL(req.Repo); err != nil {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidRepoURL, err.Error())
 		return
+	}
+
+	// The stored server-mount selection (explicit, so it is honoured on
+	// every later start).
+	sel, ok := s.resolveMountSelection(w, caller, &req)
+	if !ok {
+		return
+	}
+	req.ResolvedMounts = sel
+
+	// The network profile, resolved and written back so the backend always
+	// sees an explicit value.
+	network, ok := s.resolveNetworkProfile(w, caller, &req)
+	if !ok {
+		return
+	}
+	req.Network = network
+
+	if caller.IsClient() {
+		release, rule, err := s.reserveClientCreate(r.Context(), caller, req.Name)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, config.ErrBackendError, err.Error())
+			return
+		}
+		if rule != "" {
+			writePolicyViolation(w, caller, rule)
+			return
+		}
+		defer release()
+		req.Owner = caller.Name
 	}
 
 	// Stream progress via SSE if the client requests it
@@ -732,6 +792,12 @@ func mapBackendError(err error) (int, string, string) {
 	}
 	if errors.Is(err, config.ErrInvalidShedRequestSentinel) {
 		return http.StatusBadRequest, config.ErrInvalidRequest, err.Error()
+	}
+	if errors.Is(err, config.ErrNetworkProfileUnsupportedSentinel) {
+		return http.StatusUnprocessableEntity, config.ErrNetworkProfileUnsupported, err.Error()
+	}
+	if errors.Is(err, config.ErrNetworkEnforcementUnavailableSentinel) {
+		return http.StatusServiceUnavailable, config.ErrNetworkEnforcementUnavailable, err.Error()
 	}
 
 	// Fallback to string matching for errors without sentinels

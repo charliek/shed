@@ -13,6 +13,18 @@ Off by default. Works on both backends (Firecracker and VZ).
     guards. Treat this as visibility + guardrails for a *trusted* team, not as a
     sandbox escape boundary. The full bypass inventory is below.
 
+    On Firecracker, the [`isolated` network
+    profile](security.md#network-profiles) is a kernel-enforced fence: the
+    guest's direct traffic reaches the internet and nothing else (beyond any
+    `network.allow_cidrs` and its own 9P ports on the gateway), whether or not
+    a process cooperates. The proxy
+    decides which internet hosts a cooperating client may use; isolation
+    decides what any process can reach directly. The proxy dials from the host,
+    outside the fence, so through it a cooperating client can still reach a
+    service on one of the host's public addresses when the policy allows it.
+    See [With the `isolated` network
+    profile](#with-the-isolated-network-profile).
+
 ## What it does
 
 When enabled, shed-server runs a small `shed-egress-proxy` child process. Each
@@ -306,28 +318,77 @@ Every decision is appended as one JSON line to `{state}/egress-audit.jsonl`
 are also streamed over `GET /api/egress/stream` (Server-Sent Events) for the
 shed-host-agent → shed-desktop activity feed.
 
+The server's own audit log, `audit.jsonl` (service-client requests, HTTPS execs
+and `max_age` reaps), sits beside `egress-audit.jsonl` in the same directory. It
+is separate and records no network decisions; see [Configuration › Audit
+log](configuration.md#audit-log).
+
 ## Bypass inventory (read this)
 
 Level 1 is cooperative. Each of these reaches the network **without** going
-through the proxy, and is therefore **not filtered and not audited**:
+through the proxy, and is therefore **not filtered and not audited**. The
+**isolated** note on each says what an [`isolated`](#with-the-isolated-network-profile)
+shed (Firecracker) changes:
 
 - A raw `connect()` / any non-proxy-aware tool (`nc`, `ssh`, a compiled binary)
   — reaches everything directly, **including IMDS and private ranges**, since
-  the deny-CIDR guards only apply to proxy-routed traffic.
+  the deny-CIDR guards only apply to proxy-routed traffic. **Isolated:** IMDS,
+  private and reserved ranges, the host and other sheds are dropped in the
+  kernel, except the ranges `network.allow_cidrs` lists (IMDS too, if a listed
+  range covers it); any internet host is still reachable.
 - A sudo user who unsets `HTTP_PROXY`/`HTTPS_PROXY` or overrides the docker
-  proxy drop-in.
+  proxy drop-in. **Isolated:** the same limit as a raw `connect()` (the
+  internet, plus any `network.allow_cidrs`).
 - Direct connections to an IP literal (the proxy filters by hostname).
+  **Isolated:** still open to any internet address.
 - UDP / QUIC / HTTP3 — the proxy env only captures TCP HTTP(S).
-- DoH / DoT (DNS over HTTPS/TLS) to an allowed host.
+  **Isolated:** still open to the internet.
+- DoH / DoT (DNS over HTTPS/TLS) to an allowed host. **Isolated:** still open.
 - A cooperating client that lies about the destination (SNI / Host is
   client-asserted) — though resolve-and-pin still controls which IP is dialed.
+  **Isolated:** unchanged (the proxy dials from the host).
 - Containers other than dockerd's own pulls (only dockerd's egress is routed at
-  Level 1).
-- VM-to-VM traffic on a shared host bridge.
+  Level 1). **Isolated:** their traffic leaves through the guest, so the same
+  limit applies (the internet, plus any `network.allow_cidrs`).
+- VM-to-VM traffic on a shared host bridge. **Isolated:** dropped at the bridge,
+  in both directions.
 
 Making egress a real boundary (forcing all traffic through the proxy via
 netns/pf or a userspace netstack) is tracked as future work
-([#203](https://github.com/charliek/shed/issues/203)).
+([#203](https://github.com/charliek/shed/issues/203), and the egress roadmap
+[#205](https://github.com/charliek/shed/issues/205)).
+
+## With the `isolated` network profile
+
+On Firecracker, a shed created with `--network isolated` (see [Security ›
+Network
+profiles](security.md#network-profiles)) is fenced by shed-server's own
+nftables rules, which are enforced in the kernel and do not depend on the guest
+cooperating. They close several of the bypasses above for that shed: a raw
+`connect()` can no longer reach IMDS or private ranges (other than ranges
+`network.allow_cidrs` lists), the host or other sheds, and VM-to-VM traffic on
+the bridge is dropped. The internet stays reachable, so
+egress profiles remain the way to filter *which* internet hosts a cooperating
+client may use. The two compose:
+
+- An isolated guest may reach **only its own egress-proxy port on the
+  gateway** (plus its own 9P ports when it has server or `--local-dir`
+  mounts). Every other port
+  on the host, other sheds' proxy ports included, is dropped. shed-server keeps
+  this allowance in step with the listener: it is added when the shed's egress
+  listener opens, moved by `shed egress set`, and removed by `shed egress off`.
+- The proxy itself runs on the host, so its upstream connections are not
+  subject to the isolated rules; its own deny-CIDR guards still apply to them.
+  The guards do not cover the host's own public addresses, so a service
+  listening on one is reachable through the proxy (in `audit` mode, or when an
+  allow rule matches it).
+- A process that ignores the proxy environment still reaches the internet
+  directly (isolation does not force traffic through the proxy), and beyond it
+  only any `network.allow_cidrs` and its own 9P ports.
+
+A profile that combines the two, isolated with the proxy as the only way out
+(proxy-only), is planned and not built; see
+[#205](https://github.com/charliek/shed/issues/205).
 
 ## Other caveats
 
@@ -360,6 +421,15 @@ netns/pf or a userspace netstack) is tracked as future work
    ▼
  shed-server  ── durable JSONL + recent ring + SSE stream ──▶ shed-host-agent ──▶ shed-desktop (view)
 ```
+
+On Firecracker, an `isolated` shed's direct traffic (everything that does not
+go to its proxy port) also passes shed-server's nftables tables (`bridge` and
+`inet shed_<name>`) on the host, which drop anything bound for the host (other
+than the shed's own 9P ports), other sheds or a blocked range (minus
+`network.allow_cidrs`) before it leaves. If
+something else removes the tables (`nft flush ruleset`, a firewall reload),
+isolated sheds are open until shed-server's 30 s check puts them back. Open
+sheds and VZ sheds have no such layer.
 
 The proxy is a child of shed-server: it starts only when egress is enabled and
 exits with shed-server. It ships in the brew and deb packages alongside
