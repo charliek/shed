@@ -12,8 +12,14 @@ running-shed delete must complete well under the old ~30s and the shed must
 actually be gone. The fix is entirely server-side, so it holds regardless of
 the CLI version driving the delete.
 
-Parameterized over ["vz", "fc"] via the shed_server fixture; skips cleanly when
-a backend is unreachable.
+Parameterized over ["vz", "fc", "remote"] via the shed_server fixture; skips
+cleanly when a backend is unreachable.
+
+On `remote` the claim is a different one. The CLI's delete (a streamed
+request) returns only once the cloud VM is gone, so a create right after it
+never finds the old VM still holding a run slot; that took 29 to 34 s on the
+dev server. The ceiling there bounds a destroy that hangs, not a graceful
+teardown.
 """
 
 from __future__ import annotations
@@ -21,29 +27,37 @@ from __future__ import annotations
 import subprocess
 import time
 
+# Seconds a `shed delete --force` of a running shed may take, per backend
+# (`shed_server.backend`). Local VMs: the old graceful teardown took ~30s and
+# the fast destroy path ~1-2s, so 10s decisively catches a regression while
+# tolerating CI/dev-machine variance and (for FC) SSH round-trips. Remote: the
+# command waits for the cloud to destroy the VM (about 30s measured).
+DEFAULT_DELETE_CEILING_S = 10
+DELETE_CEILING_S = {"remote": 120}
+
 
 def test_delete_running_shed_is_fast(shed_server, test_shed_name):
-    """A running shed deletes far under the old ~30s, and is actually gone."""
+    """A running shed deletes far under the old ~30s (on `remote`: within the
+    cloud's destroy time), and is actually gone."""
     shed_server.create(test_shed_name, image="base")
+    ceiling = DELETE_CEILING_S.get(shed_server.backend, DEFAULT_DELETE_CEILING_S)
 
     start = time.monotonic()
     r = subprocess.run(
         ["shed", "-s", shed_server.name, "delete", test_shed_name, "--force"],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=max(60, ceiling + 30),
     )
     elapsed = time.monotonic() - start
 
     assert r.returncode == 0, (
         f"delete failed (exit {r.returncode}): stdout={r.stdout!r} stderr={r.stderr!r}"
     )
-    # The old graceful teardown took ~30s; the fast destroy path is ~1-2s. A
-    # 10s ceiling decisively catches a regression to the old behavior while
-    # tolerating CI/dev-machine variance and (for FC) SSH round-trips.
-    assert elapsed < 10, (
-        f"delete of a running shed took {elapsed:.1f}s — expected the fast "
-        f"destroy path (<10s); a regression to the graceful ~30s teardown?"
+    assert elapsed < ceiling, (
+        f"delete of a running shed took {elapsed:.1f}s on {shed_server.backend} "
+        f"(ceiling {ceiling}s) — on a local VM backend, a regression to the "
+        f"graceful ~30s teardown?"
     )
 
     # The shed must actually be gone (a fast delete that didn't delete is worse
