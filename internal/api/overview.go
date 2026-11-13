@@ -40,8 +40,11 @@ func (s *Server) serverFeatures() []string {
 	if s.cfg.ServiceClientsEnabled() {
 		features = append(features, FeatureServiceClients)
 	}
-	if s.backend != nil && s.backend.Type() == backend.TypeFirecracker {
+	if s.backend != nil && backend.SupportsNetworkProfile(s.backend, config.NetworkProfileIsolated) {
 		features = append(features, FeatureNetworkProfiles)
+	}
+	if _, ok := backend.IsAsync(s.backend); ok {
+		features = append(features, FeatureAsyncLifecycle)
 	}
 	return features
 }

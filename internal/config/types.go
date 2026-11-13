@@ -440,6 +440,12 @@ type ServerInfo struct {
 	// is mirrored in the GET /api/overview server block. The token list is owned
 	// by internal/api (serverFeatures); older clients decode it as an empty slice.
 	Features []string `json:"features,omitempty"`
+
+	// Isolation says how the isolated network profile is provided, reported
+	// only by a backend that states its own capabilities: "topology" on
+	// remote (no route between sheds or to the server host). Omitted on
+	// Firecracker and VZ, whose /api/info is unchanged.
+	Isolation string `json:"isolation,omitempty"`
 }
 
 // FeatureMountSelection is the /api/info feature token for the create

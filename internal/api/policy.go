@@ -80,7 +80,7 @@ func (s *Server) resolveNetworkProfile(w http.ResponseWriter, c Caller, req *con
 			fmt.Sprintf("network: %q is not a network profile (use %s or %s)", req.Network, config.NetworkProfileOpen, config.NetworkProfileIsolated))
 		return "", false
 	}
-	if profile != config.NetworkProfileOpen && s.backend.Type() != backend.TypeFirecracker {
+	if profile != config.NetworkProfileOpen && !backend.SupportsNetworkProfile(s.backend, profile) {
 		writeError(w, http.StatusUnprocessableEntity, config.ErrNetworkProfileUnsupported,
 			fmt.Sprintf("network profile %s is not supported by the %s backend (only %s)", profile, s.backend.Type(), config.NetworkProfileOpen))
 		return "", false
@@ -101,6 +101,11 @@ func (s *Server) resolveMountSelection(w http.ResponseWriter, c Caller, req *con
 		return config.SelectedMounts(*req.Mounts), true
 	}
 	if req.Mounts == nil {
+		// A backend without host mounts stores "none", so nothing later reads
+		// the selection as every server mount.
+		if !s.capabilities().Mounts {
+			return config.SelectedMounts(nil), true
+		}
 		return config.AllMounts(), true
 	}
 	for _, m := range *req.Mounts {

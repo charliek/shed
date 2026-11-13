@@ -162,19 +162,22 @@ func (s *Server) Router() chi.Router {
 			// Ref-keyed forms (?ref=) for slash-bearing Docker refs; see
 			// imageIdent. The legacy /{name} + /inspect/{name} forms below
 			// stay for slash-free identifiers from older clients.
-			r.Delete("/", s.handleDeleteImage)
-			r.Get("/inspect", s.handleInspectImage)
-			r.Post("/prune", s.handlePruneImages)
-			r.Post("/tag", s.handleTagImage)
-			r.Post("/pull", s.handlePullImage)
-			r.Post("/push", s.handlePushImage)
-			r.Get("/inspect/{name}", s.handleInspectImage)
+			// A backend with no image store (remote) answers the routes
+			// below 501 FEATURE_UNSUPPORTED; the list above still works.
+			images := r.With(s.requireCapability("image management", capImageManagement))
+			images.Delete("/", s.handleDeleteImage)
+			images.Get("/inspect", s.handleInspectImage)
+			images.Post("/prune", s.handlePruneImages)
+			images.Post("/tag", s.handleTagImage)
+			images.Post("/pull", s.handlePullImage)
+			images.Post("/push", s.handlePushImage)
+			images.Get("/inspect/{name}", s.handleInspectImage)
 			// Wrap parametric /{name} in a sub-router so it doesn't shadow
 			// literal sibling routes like /pull, /push, /prune, /tag at the
 			// chi trie level (which would return 405 Method Not Allowed
 			// instead of dispatching to the literal POST handler).
 			r.Route("/{name}", func(r chi.Router) {
-				r.Delete("/", s.handleDeleteImage)
+				r.With(s.requireCapability("image management", capImageManagement)).Delete("/", s.handleDeleteImage)
 			})
 		})
 
@@ -187,12 +190,13 @@ func (s *Server) Router() chi.Router {
 		// Snapshots
 		r.Route("/snapshots", func(r chi.Router) {
 			r.Get("/", s.handleListSnapshots)
-			r.Post("/", s.handleCreateSnapshot)
+			snap := s.requireCapability("snapshots", capSnapshots)
+			r.With(snap).Post("/", s.handleCreateSnapshot)
 			// Same defensive wrap as /images — drift insurance if we ever
 			// add literal sibling routes (e.g. /snapshots/prune).
 			r.Route("/{name}", func(r chi.Router) {
-				r.Get("/", s.handleGetSnapshot)
-				r.Delete("/", s.handleDeleteSnapshot)
+				r.With(snap).Get("/", s.handleGetSnapshot)
+				r.With(snap).Delete("/", s.handleDeleteSnapshot)
 			})
 		})
 
@@ -204,15 +208,16 @@ func (s *Server) Router() chi.Router {
 		r.Route("/egress", func(r chi.Router) {
 			r.Get("/stream", s.handleEgressStream)
 			r.Get("/profiles", s.handleListProfiles)
+			egressWrite := s.requireCapability("egress control", capEgressProfiles)
 			r.Route("/profiles/{name}", func(r chi.Router) {
 				r.Get("/", s.handleGetProfile)
-				r.Put("/", s.handlePutProfile)
-				r.Delete("/", s.handleDeleteProfile)
+				r.With(egressWrite).Put("/", s.handlePutProfile)
+				r.With(egressWrite).Delete("/", s.handleDeleteProfile)
 			})
 			r.Route("/{name}", func(r chi.Router) {
 				r.Get("/", s.handleEgressShow)
-				r.Post("/", s.handleEgressSet)
-				r.Delete("/", s.handleEgressOff)
+				r.With(egressWrite).Post("/", s.handleEgressSet)
+				r.With(egressWrite).Delete("/", s.handleEgressOff)
 			})
 		})
 
@@ -234,7 +239,7 @@ func (s *Server) Router() chi.Router {
 				r.Delete("/", s.handleDeleteShed)
 				r.Post("/start", s.handleStartShed)
 				r.Post("/stop", s.handleStopShed)
-				r.Post("/reset", s.handleResetShed)
+				r.With(s.requireCapability("reset", capReset)).Post("/reset", s.handleResetShed)
 
 				// HTTPS exec: one command, NDJSON output (control scope
 				// in an enforced mode, via authorizeScope's default).

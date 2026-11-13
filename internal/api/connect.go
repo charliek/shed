@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/vmutil"
 	"github.com/go-chi/chi/v5"
@@ -35,7 +36,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, config.ErrShedNotRunningSentinel) {
-			writeError(w, http.StatusServiceUnavailable, "SHED_NOT_RUNNING", err.Error())
+			// An asynchronous backend's shed may be starting or stopping:
+			// that is a state conflict (409, as exec answers), not an outage.
+			// Firecracker and VZ keep their 503.
+			status := http.StatusServiceUnavailable
+			if _, ok := backend.IsAsync(s.backend); ok {
+				status = http.StatusConflict
+			}
+			writeError(w, status, config.ErrShedNotRunning, err.Error())
 			return
 		}
 		// Dial failure (connection refused, timeout, etc.)
