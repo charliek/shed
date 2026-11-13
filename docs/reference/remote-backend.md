@@ -50,6 +50,25 @@ Exec (`POST /api/sheds/{name}/exec`) and the Connect tunnel on a shed that is no
 
 The CLI waits for you: `shed start` and `shed stop` poll until the shed settles (up to 180 s), and `shed attach`, `shed console`, `shed sync` and `shed tunnels` wait for a starting or stopping shed. SSH to the server (`ssh <shed>@<server>`) starts a stopped shed and waits up to 150 s, writing progress to stderr.
 
+## Keeping records and the cloud in step
+
+The server reads the cloud when it starts and then once a minute. Each pass lists the environment's VMs and corrects what differs, for sheds with no job in flight:
+
+| The server finds | It does |
+|---|---|
+| A delete that was acknowledged and whose VM still exists | Retries the destroy. The shed stays hidden. |
+| A `running` shed whose VM is stopped | Records it `stopped`, with reason `run_limit` or `external`. |
+| A `stopped` shed whose VM is running | Records it `starting` and probes its agent. It never stops the VM. |
+| A shed whose VM no longer exists | Removes the shed, after a read of that one VM confirms it. |
+| A shed left `stopping` by a failed cloud call | Stops it again. |
+| A create that failed | Destroys its VM, retrying until it is gone. The shed stays, in `error`, until it is deleted. |
+
+A pass destroys a VM only for a delete that was acknowledged or a create that failed. A VM it does not know (another environment's, or one with no record) is logged and left alone.
+
+A VM that cannot be destroyed still runs, so two minutes after its delete it counts against `max_running` until it is gone. `SERVER_LIMIT_REACHED` then says how many such VMs there are; the server log has the cloud's error.
+
+The `--repo` clone of a create runs with `GIT_TERMINAL_PROMPT=0`, for at most 5 minutes an attempt and at most 3 attempts. A clone that still fails is a warning, as on the other backends: the shed runs without the repository.
+
 ## Error codes
 
 | Code | HTTP | When |
