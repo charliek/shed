@@ -88,7 +88,7 @@ func remoteCreateRefusal(localDir string, addDirs []string, fromSnapshot string,
 		flag = "--add-dir"
 	case fromSnapshot != "":
 		flag = "--from-snapshot"
-	case len(egress) > 0 && !(len(egress) == 1 && egress[0] == "off"):
+	case asksForEgress(egress):
 		flag = "--egress"
 	case mounts != nil && len(*mounts) > 0:
 		flag = "--mounts"
@@ -96,4 +96,10 @@ func remoteCreateRefusal(localDir string, addDirs []string, fromSnapshot string,
 		return nil
 	}
 	return fmt.Errorf("%s is not supported on a remote server (cloud sheds have no host directories, snapshots, egress profiles or server mounts)", flag)
+}
+
+// asksForEgress reports whether an egress selection asks for any profile:
+// nothing and exactly ["off"] ask for none.
+func asksForEgress(egress []string) bool {
+	return len(egress) > 1 || (len(egress) == 1 && egress[0] != "off")
 }

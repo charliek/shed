@@ -38,7 +38,7 @@ func createFieldRefusal(caps backend.Capabilities, req *config.CreateShedRequest
 	if !caps.Snapshots && req.FromSnapshot != "" {
 		return "from_snapshot"
 	}
-	if !caps.EgressProfiles && len(req.Egress) > 0 && !(len(req.Egress) == 1 && req.Egress[0] == "off") {
+	if !caps.EgressProfiles && asksForEgress(req.Egress) {
 		return "egress"
 	}
 	return ""
@@ -142,4 +142,10 @@ func (s *Server) deleteAndWait(ctx context.Context, jobCtx context.Context, al b
 		return err
 	}
 	return nil
+}
+
+// asksForEgress reports whether an egress selection asks for any profile:
+// nothing and exactly ["off"] ask for none.
+func asksForEgress(egress []string) bool {
+	return len(egress) > 1 || (len(egress) == 1 && egress[0] != "off")
 }
