@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -858,7 +858,7 @@ check-kernel-pin:
 # build. Modeled on check-kernel-pin above — same fail-fast-on-drift shape.
 # Portable to macOS BSD sed/grep: awk/sed -E only, no grep -P (023 found that
 # breaks there).
-check-roost-pin:
+check-roost-pin: check-gce-pins
 	@vz_v=$$(awk -F= '/^ARG ROOST_SESSION_VERSION=/ { print $$2; exit }' vz/Dockerfile) ; \
 	 fc_v=$$(awk -F= '/^ARG ROOST_SESSION_VERSION=/ { print $$2; exit }' firecracker/Dockerfile) ; \
 	 vz_p=$$(awk -F= '/^ARG ROOST_SESSION_PROTOCOL=/ { print $$2; exit }' vz/Dockerfile) ; \
@@ -905,6 +905,44 @@ check-roost-pin:
 	   exit 1 ; \
 	 fi ; \
 	 echo "roost-session pin OK: $$vz_v / protocol $$vz_p"
+
+# check-gce-pins: the GCE image bake (scripts/build-gce-image.sh, gce/) takes
+# its roost-session and craze pins from firecracker/Dockerfile through
+# scripts/read-guest-pins.sh, so check-roost-pin and check-craze-pin above
+# (which hold that Dockerfile in lockstep with vz/, crates/shed-core and
+# craze-pin.env) guard the cloud image too. This target, a prerequisite of
+# both, fails if the reader cannot produce all seven values or if gce/ holds a
+# literal pin of its own (a version or any 64-hex digest).
+check-gce-pins:
+	@pins="$$(scripts/read-guest-pins.sh firecracker/Dockerfile)" || { \
+	   echo "ERROR: scripts/read-guest-pins.sh could not read the guest pins from firecracker/Dockerfile" ; exit 1 ; } ; \
+	 bad=0 ; \
+	 for v in $$(printf '%s\n' "$$pins" | grep -E '^(ROOST_SESSION_VERSION|CRAZE_VERSION)=' | cut -d= -f2) ; do \
+	   if grep -rnwF -- "$$v" gce/ ; then \
+	     echo "ERROR: gce/ holds the literal pin version $$v; it must come from scripts/read-guest-pins.sh" ; bad=1 ; \
+	   fi ; \
+	 done ; \
+	 if grep -rnE '[0-9a-f]{64}' gce/ ; then \
+	   echo "ERROR: gce/ holds a literal sha256; digests must come from scripts/read-guest-pins.sh" ; bad=1 ; \
+	 fi ; \
+	 [ "$$bad" -eq 0 ] || exit 1 ; \
+	 echo "gce pins OK: read from firecracker/Dockerfile, none literal in gce/"
+
+# gce-image: bake a shed remote VM image on GCE (scripts/build-gce-image.sh).
+# Project, zone, network, subnet and tag come from the environment
+# (SHED_GCE_PROJECT, SHED_GCE_ZONE, SHED_GCE_NETWORK, SHED_GCE_SUBNET,
+# SHED_GCE_BAKE_TAG or SHED_GCE_TAG) or GCE_IMAGE_ARGS, e.g.
+#   make gce-image GCE_IMAGE_ARGS="--env-file ~/my-gce.env --label purpose=test"
+#   make gce-image GCE_IMAGE_ARGS=--print     # show the gcloud steps, run nothing
+GCE_IMAGE_ARGS ?=
+gce-image:
+	scripts/build-gce-image.sh $(GCE_IMAGE_ARGS)
+
+# test-gce-image: offline checks of the image tooling (syntax, shellcheck when
+# installed, the --print golden, gce/shed-identity.sh against a fake metadata
+# server). Needs python3, curl and ssh-keygen.
+test-gce-image:
+	scripts/test-gce-image.sh
 
 # CRAZE_SRC: the dedicated cache clone craze-binaries builds from (plan 025
 # Amendment A4). NEVER ~/projects/craze and NEVER a `git worktree add` into
@@ -991,7 +1029,7 @@ craze-binaries:
 # — the craze sha the vendored WIRE fixtures were copied from — must equal
 # CRAZE_TEST_SHA, so moving the test pin without re-vendoring the fixtures (or
 # the other way round) fails here, offline, before CI's drift diff ever runs.
-check-craze-pin:
+check-craze-pin: check-gce-pins
 	@sha="$$(scripts/release/read-craze-pin.sh --field CRAZE_TEST_SHA craze-pin.env)" || exit 1; \
 	 rel="$$(scripts/release/read-craze-pin.sh --field CRAZE_RELEASE craze-pin.env)" || exit 1; \
 	 pin_file=crates/shed-craze/fixtures/wire.PIN; \

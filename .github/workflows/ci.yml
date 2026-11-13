@@ -228,7 +228,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: check-roost-pin + check-craze-pin (offline)
+        # Both depend on check-gce-pins: the GCE image bake reads its pins
+        # from firecracker/Dockerfile and gce/ may hold none of its own.
         run: make check-roost-pin check-craze-pin
+      - name: GCE image tooling (offline)
+        # bash -n + shellcheck on gce/ and the bake driver, the --print
+        # golden, and gce/shed-identity.sh against a fake metadata server.
+        run: make test-gce-image
 
   release-snapshot:
     name: GoReleaser snapshot (artifact sanity)
