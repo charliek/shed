@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -823,6 +823,31 @@ dev-server-logs-remote:
 	@tail -F "$(REMOTE_DEV_LOG_PATH)"
 
 dev-server-restart-remote: dev-server-down-remote dev-server-up-remote
+
+# Run the integration suite's [remote] cases against the remote dev server.
+# MANUAL ONLY: every case that creates a shed creates a billed cloud VM (a full
+# run is about 25 VMs, each up for a minute or two, at most
+# remote.limits.max_running at once). It does not start the dev server for
+# you; run `make dev-server-up-remote` first.
+#
+# Every vz/fc server variable is set EMPTY so no [vz] or [fc] case runs (the
+# defaults can name production servers). Cases the remote backend cannot run
+# (mounts, image store, snapshots, reset, egress, vz/fc timing) skip with a
+# reason. Narrow a run with PYTEST_ARGS, e.g.
+#   make test-integration-remote PYTEST_ARGS="test_remote_refusals.py"
+test-integration-remote: build-cli
+	@if [ ! -f "$(REMOTE_DEV_PID_PATH)" ] || ! kill -0 "$$(cat $(REMOTE_DEV_PID_PATH))" 2>/dev/null; then \
+	  echo "ERROR: the remote dev server is not running; 'make dev-server-up-remote' first."; \
+	  exit 1; \
+	fi
+	PATH="$(CURDIR)/bin:$$PATH" \
+	  SHED_VZ_SERVER= \
+	  SHED_VZ_DEV_SERVER= \
+	  SHED_FC_SERVER= \
+	  SHED_FC_DEV_SERVER= \
+	  SHED_REMOTE_SERVER=$(SHED_REMOTE_DEV_SERVER) \
+	  SHED_REMOTE_LOG_PATH=$(REMOTE_DEV_LOG_PATH) \
+	  $(MAKE) test-integration
 
 # Root-only proof of the isolated network profile's nftables rules, run on
 # $(FC_REMOTE_HOST) entirely inside network namespaces the test creates and

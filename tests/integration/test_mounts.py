@@ -38,6 +38,9 @@ def test_default_landing_is_home(shed_server, test_shed_name):
     )
 
 
+@pytest.mark.local_vm_only(
+    "host and server mounts are refused on remote (FEATURE_UNSUPPORTED)"
+)
 def test_local_dir_and_add_dir_mounts(shed_server, test_shed_name, tmp_path):
     """--local-dir mounts at ~/<basename> and is the landing dir; --add-dir
     mounts additional dirs as siblings; each surfaces its host contents."""
@@ -101,6 +104,9 @@ def _mount_parents(server, name: str) -> mp.MountParents:
     return mp.classify(mounts, facts)
 
 
+@pytest.mark.local_vm_only(
+    "host and server mounts are refused on remote (FEATURE_UNSUPPORTED)"
+)
 def test_mount_parents_owned_by_shed(shed_server, test_shed_name):
     """Directories a server mount needs under the home directory are created
     as `shed`, not by the mount's root `mkdir -p` (#410), and a root-owned

@@ -124,6 +124,28 @@ All notable changes to this project will be documented in this file.
   half that lists the host's saved, not-running sessions, newest first. Resume reopens one
   and opens its transcript. It needs craze 0.2.0 or later on the host. A reopen can take a
   few minutes; a session craze can no longer reopen leaves the list with craze's reason.
+- **Server: the `remote` backend (cloud VMs), experimental.** `default_backend: remote` runs
+  each shed as its own Google Compute Engine VM, reached over SSH as a dedicated login user;
+  clients keep the same API, CLI and SSH entry point. The lifecycle is asynchronous: a JSON
+  create answers `201` with `status: "starting"`, sheds pass through `starting` and
+  `stopping`, a shed carries a permanent `id` and a `status_reason`, and `/api/info` reports
+  `backend: "remote"`, the `async_lifecycle` feature and `isolation: "topology"` (the
+  `isolated` profile holds because the network gives a shed no route to another shed or the
+  server). The CLI waits for start and stop to settle, and SSH to a stopped shed starts it.
+  Limits (`max_running`, `max_sheds`) answer `503 SERVER_LIMIT_REACHED`; host directories,
+  mounts, snapshots, reset, the image store and egress profiles answer `422` or `501
+  FEATURE_UNSUPPORTED`. The config file names no project, zone or key: every value comes from
+  an environment variable. Images are baked with `make gce-image`; the one-time cloud setup is
+  printed by `scripts/remote/gce-setup.sh --print`. Not built yet: copying an agent into a VM
+  (`agent_install` behaves as `never`) and any firewall mode but `static`. See the [Remote
+  Backend reference](https://charliek.github.io/shed/reference/remote-backend/).
+- **Development: a remote-backend dev server and suite parameter.**
+  `make dev-server-up-remote` (and `-down-`, `-restart-`, `-status-`, `-logs-remote`) runs the
+  dev build with `default_backend: remote` beside an installed server, reading the cloud
+  settings from a private env file. The integration suite gains an opt-in `remote` parameter
+  (`SHED_REMOTE_SERVER`; `make test-integration-remote`, manual only, since every shed is a
+  billed VM). See [Remote Backend
+  Development](https://charliek.github.io/shed/development/remote-backend/).
 
 ### Changed
 

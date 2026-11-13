@@ -27,16 +27,18 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 | `capacity` | The zone had no room for the machine type. |
 | `quota` | The cloud project's quota was reached. |
 | `limit` | The server's `limits` (`max_running` or `max_sheds`) were reached. |
-| `run_limit` | The shed ran for longer than the run limit and was stopped. |
+| `run_limit` | The shed ran for longer than the run limit and was stopped. Not reported yet: see below. |
 | `external` | The VM was stopped outside shed. |
-| `isolation_lost` | The network no longer isolates the shed. |
+| `isolation_lost` | The network no longer isolates the shed. Not reported yet. |
 | `layout` | The VM's agent or guest layout is not compatible with this server. |
 | `create_failed` | The create failed for another reason; the server log has the detail. |
 | `host_key` | The host key the VM presented did not match the pinned key. |
 
+The run limit is enforced by the cloud: each VM is created with a maximum run duration (the larger of `max_run_duration` and the owning client's `max_age`) after which the cloud stops it. The server notices a VM stopped by the run limit or from outside shed only when it next starts, and records it as `stopped` with reason `external`; until then it lists the shed as `running`. `run_limit` and `isolation_lost` are defined but no code path sets them yet.
+
 ## Calls and statuses
 
-`POST /api/sheds` without `Accept: text/event-stream` returns **201 with `status: "starting"`** and the create continues in the background. Poll `GET /api/sheds/{name}` until the status is `running`. With `Accept: text/event-stream` the stream stays open until the shed settles: the `complete` event carries the running shed, and an `error` event reports a create that failed. Closing the stream ends the stream only, never the create.
+`POST /api/sheds` without `Accept: text/event-stream` returns **201 with `status: "starting"`** and the create continues in the background. The reply waits up to 15 s first, so that a quota or capacity refusal arriving that early is answered as a 503 and leaves no shed; a measured JSON create answered after 11 s. Poll `GET /api/sheds/{name}` until the status is `running`. With `Accept: text/event-stream` the stream stays open until the shed settles: the `complete` event carries the running shed, and an `error` event reports a create that failed. Closing the stream ends the stream only, never the create.
 
 | Call | `starting` | `running` | `stopping` | `stopped` | `error` |
 |---|---|---|---|---|---|
@@ -44,7 +46,7 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 | stop | 200, queued | 200 `stopping` | 200, no change | 409 | 409 |
 | delete | 204 in every state; the shed disappears from lists at once | | | | |
 
-"Queued" means the job waits for the cloud operation already running, then acts. A delete with `Accept: text/event-stream` stays open until the VM is destroyed.
+"Queued" means the job waits for the cloud operation already running, then acts. A delete answers as soon as the shed is hidden, with or without `Accept: text/event-stream`; the VM is destroyed in the background (about 30 s measured). A destroy that fails is retried only when the server next starts.
 
 Exec (`POST /api/sheds/{name}/exec`) and the Connect tunnel on a shed that is not running return **409 `SHED_NOT_RUNNING`**.
 
@@ -126,13 +128,13 @@ remote:
   limits: {max_running: 2, max_sheds: 8}
   max_run_duration: 24h          # a client's shed gets the larger of this and its max_age
   agent_dir: <path>              # holds shed-agent-linux-<arch> (default <state dir>/agent)
-  agent_install: incompatible    # incompatible | always | never
+  agent_install: incompatible    # incompatible | always | never; only never is built (see below)
   ssh:
     client_key_env: SHED_REMOTE_SSH_KEY             # base64 of the OpenSSH private key
     client_key_file_env: SHED_REMOTE_SSH_KEY_FILE   # or a path to it; exactly one must be set
   firewall:
-    mode: static                 # static | auto | any
-    source_ranges: []            # static: the firewall rule's sources
+    mode: static                 # static | auto | any; only static is supported (see below)
+    source_ranges: []            # static: the firewall rule's sources (not checked yet)
     acknowledge_any: false       # must be true for mode: any
     echo_urls: []                # auto only
   gce:
@@ -145,3 +147,32 @@ remote:
 ```
 
 Only `environment` and `default_image` are required; every other field has the default shown. With `default_backend: remote` the server refuses to load when the config also has a `firecracker:` or `vz:` block, `env_file`, top-level `mounts`, `egress.enabled`, `network.allow_cidrs`, `extensions.enabled`, a client `policy.server_mounts`, a client `policy.images` entry that is not an `image_aliases` name, or `firewall.mode: any` beside service clients or an `isolated` default profile. A `remote:` block under any other backend is refused too.
+
+Two fields are accepted by the loader but not built yet:
+
+| Field | What happens today |
+|---|---|
+| `agent_install` | Every value behaves as `never`: the server does not copy an agent into a VM. A VM whose agent reports an incompatible protocol or guest layout fails its create (`error`, reason `layout`) or start (`stopped`, reason `layout`). Bake a new image instead (`make gce-image`). |
+| `firewall.mode` | Use `static`. The server neither reads nor changes the firewall rule in any mode: create the rule once with `scripts/remote/gce-setup.sh` and keep its source the server's public address. `source_ranges` is not compared with the rule, `auto` does nothing, and `any` only makes the `isolated` profile unavailable. |
+
+## Server restarts
+
+A server stop leaves every VM as it is: running sheds keep running and keep costing money. At start-up the server lists the cloud VMs of its `environment` and reconciles them with its record cache (`state_dir`):
+
+- A VM labelled ready that has no record is adopted under its own shed ID.
+- A record left `starting` or `stopping` resumes its job.
+- A record whose VM is stopped but was `running` becomes `stopped` with reason `external`.
+- A record whose VM is gone is dropped, unless the shed is in `error` or its create had not reached the cloud.
+- Only a VM labelled `deleting`, or one with a local delete marker, is deleted. Nothing else is ever removed.
+
+## Not supported yet
+
+| Item | Today |
+|---|---|
+| Stops from outside shed and run-limit stops | Seen only at the next server start-up. |
+| Failed destroys | Retried only at the next server start-up. |
+| `--repo` clone | One attempt with no timeout of its own; a slow first clone can fail the create. |
+| Agent install | Not built; see `agent_install` above. |
+| Firewall `auto` mode and the network check | Not built; see `firewall.mode` above. |
+| Zones | One zone per server, from its environment variable. |
+| Architectures | `amd64` images only. |

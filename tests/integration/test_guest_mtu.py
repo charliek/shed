@@ -24,6 +24,11 @@ import re
 
 import pytest
 
+# Every case here is vz/fc only; `[remote]` skips with this reason.
+pytestmark = pytest.mark.local_vm_only(
+    "guest MTU detection is a vz/fc host-network feature; the cloud network sets the guest MTU"
+)
+
 
 def _guest_default_iface(shed_server, name: str) -> str:
     r = shed_server.exec(name, ["bash", "-lc", "ip route show default | awk '{print $5; exit}'"])
