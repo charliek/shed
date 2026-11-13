@@ -819,7 +819,7 @@ dev-server-restart-remote: dev-server-down-remote dev-server-up-remote
 
 # Run the integration suite's [remote] cases against the remote dev server.
 # MANUAL ONLY: every case that creates a shed creates a billed cloud VM (a full
-# run is a few dozen VMs, each up for a minute or two, at most
+# run is about 25 VMs, each up for a minute or two, at most
 # remote.limits.max_running at once). It does not start the dev server for
 # you; run `make dev-server-up-remote` first.
 #
