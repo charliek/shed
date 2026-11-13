@@ -278,7 +278,8 @@ install -d -o root -g shed-link -m 0750 /var/lib/shed-link
 log "writing the sshd policy"
 install -d -m 0755 /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/10-shed.conf <<'SSHD_EOF'
-# shed remote guest, layout 1. Owned by gce/provision.sh.
+# shed remote guest, layout 1. Owned by gce/provision.sh; the lines below
+# are guest.SSHDConfig verbatim (internal/remote/guest/sshd.go).
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -286,7 +287,8 @@ AllowUsers shed-link
 HostKey /etc/ssh/ssh_host_ed25519_key
 AuthorizedKeysFile /etc/ssh/shed-link/authorized_keys
 AllowStreamLocalForwarding local
-AllowTcpForwarding no
+AllowTcpForwarding local
+PermitOpen [/run/shed-agent/1024.sock]:* [/run/shed-agent/1026.sock]:* [/run/shed-agent/1028.sock]:*
 AllowAgentForwarding no
 X11Forwarding no
 PermitTunnel no

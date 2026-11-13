@@ -117,7 +117,9 @@ func TestGCEIdentityEnvFile(t *testing.T) {
 	}
 }
 
-// The sshd drop-in in provision.sh is the contract's list, line for line.
+// The sshd drop-in in provision.sh is SSHDConfig, line for line: the
+// transport's real-sshd tests run exactly SSHDConfig, so the image must bake
+// the same text.
 func TestGCESSHDPolicy(t *testing.T) {
 	body := readGCE(t, "provision.sh")
 	start := strings.Index(body, "<<'SSHD_EOF'\n")
@@ -132,22 +134,8 @@ func TestGCESSHDPolicy(t *testing.T) {
 		}
 		got = append(got, line)
 	}
-	want := []string{
-		"PermitRootLogin no",
-		"PasswordAuthentication no",
-		"KbdInteractiveAuthentication no",
-		"AllowUsers " + LinkUser,
-		"HostKey " + HostKeyFile,
-		"AuthorizedKeysFile " + AuthorizedKeysFile,
-		"AllowStreamLocalForwarding local",
-		"AllowTcpForwarding no",
-		"AllowAgentForwarding no",
-		"X11Forwarding no",
-		"PermitTunnel no",
-		"PermitTTY no",
-		"PermitUserRC no",
-	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Errorf("sshd policy in gce/provision.sh:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	want := strings.TrimSuffix(SSHDConfig, "\n")
+	if strings.Join(got, "\n") != want {
+		t.Errorf("sshd policy in gce/provision.sh:\n%s\nwant (guest.SSHDConfig):\n%s", strings.Join(got, "\n"), want)
 	}
 }

@@ -93,7 +93,8 @@ verify_live() {
     "hostkey /etc/ssh/ssh_host_ed25519_key" \
     "authorizedkeysfile /etc/ssh/shed-link/authorized_keys" \
     "allowstreamlocalforwarding local" \
-    "allowtcpforwarding no" \
+    "allowtcpforwarding local" \
+    "permitopen [/run/shed-agent/1024.sock]:* [/run/shed-agent/1026.sock]:* [/run/shed-agent/1028.sock]:*" \
     "allowagentforwarding no" \
     "x11forwarding no" \
     "permittunnel no" \
