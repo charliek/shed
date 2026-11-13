@@ -82,7 +82,11 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		return nil, err
 	}
 	if resolver, ok := b.prov.(provider.ImageResolver); ok {
-		exact, err := resolver.ResolveImage(ctx, image)
+		// Bounded: this runs before the fast-fail window, and the two
+		// together must fit in the time a client waits for a create.
+		rctx, cancel := context.WithTimeout(ctx, b.opts.ImageResolveTimeout)
+		exact, err := resolver.ResolveImage(rctx, image)
+		cancel()
 		if err != nil {
 			if errors.Is(err, provider.ErrNotFound) {
 				return nil, fmt.Errorf("%w: %s: %w", config.ErrUnknownImageSentinel, image, err)
@@ -378,7 +382,18 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 		b.mu.Unlock()
 		return err
 	}
-	marker := &state.Marker{ID: r.Shed.ID, Name: name, Env: r.Env, Ref: r.Ref, At: b.now().UTC()}
+	marker := &state.Marker{
+		ID: r.Shed.ID, Name: name, Env: r.Env, Ref: r.Ref, At: b.now().UTC(),
+		Owner: r.Shed.Owner, CreatedAt: r.Shed.CreatedAt,
+	}
+	if d := b.deletes[marker.ID]; d != nil && d.marker != nil {
+		// The clean-up of this shed's failed create is still destroying
+		// its VM. That job carries on; its marker now stands for the
+		// whole shed.
+		d.marker.KeepRecord = false
+		d.marker.At = marker.At
+		marker = d.marker
+	}
 	if err := b.store.SaveMarker(marker); err != nil {
 		b.mu.Unlock()
 		return fmt.Errorf("recording the delete of %s: %w", name, err)
@@ -388,14 +403,15 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 		prior.cancel()
 	}
 	b.dropLocked(name)
+	ref := marker.Ref
 	b.mu.Unlock()
 
 	b.credMgr.StopListener(name)
 	b.closeLink(marker.ID)
 
-	if marker.Ref != "" {
+	if ref != "" {
 		lctx, cancel := context.WithTimeout(b.rootCtx, labelTimeout)
-		if err := b.markDeleting(lctx, marker.Ref, marker.ID); err != nil {
+		if err := b.markDeleting(lctx, ref, marker.ID); err != nil {
 			b.logf("remote: delete %s: could not label the instance %s=%s (the local marker stands): %v",
 				name, provider.LabelState, provider.ShedStateDeleting, err)
 		}
@@ -432,8 +448,19 @@ func (b *Backend) WaitSettled(ctx context.Context, name string) (*config.Shed, e
 		b.mu.Lock()
 		r, err := b.lookupLocked(ctx, name)
 		if err != nil {
+			gone := b.deletingLocked(ctx, name)
 			b.mu.Unlock()
-			return nil, err
+			if gone == nil || !errors.Is(err, config.ErrShedNotFoundSentinel) {
+				return nil, err
+			}
+			// The shed's delete was acknowledged and its VM is still
+			// going: wait for the delete job, then report the shed gone.
+			select {
+			case <-gone.done:
+				return nil, err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		j := b.jobs[name]
 		shed := b.shedOf(r)
@@ -468,6 +495,27 @@ func (b *Backend) WaitSettled(ctx context.Context, name string) (*config.Shed, e
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// deletingLocked returns the delete job in flight for a shed of this name that
+// the caller was allowed to see, or nil. A name with no record is all the
+// caller has; the marker carries the deleted shed's owner and creation time,
+// so another client's shed is as invisible while it is destroyed as it was
+// before.
+func (b *Backend) deletingLocked(ctx context.Context, name string) *job {
+	if b.records[name] != nil {
+		return nil
+	}
+	for _, d := range b.deletes {
+		if d.name != name || d.marker == nil || d.marker.KeepRecord {
+			continue
+		}
+		if backend.CheckOwner(ctx, name, d.marker.Owner) != nil || backend.CheckCreatedAt(ctx, name, d.marker.CreatedAt) != nil {
+			continue
+		}
+		return d
+	}
+	return nil
 }
 
 // replay sends the job's progress events from index from into the sink on

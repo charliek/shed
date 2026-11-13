@@ -45,6 +45,22 @@ const (
 	cleanupTimeout = 3 * time.Minute
 	// closeGrace is how long Close waits for jobs to notice the shutdown.
 	closeGrace = 5 * time.Second
+	// DefaultCloneTimeout bounds one attempt at a create's --repo clone.
+	DefaultCloneTimeout = 5 * time.Minute
+	// DefaultCloneRetryPause is the pause between two clone attempts.
+	DefaultCloneRetryPause = 5 * time.Second
+	// DefaultSweepInterval is the time between two periodic passes.
+	DefaultSweepInterval = 60 * time.Second
+	// DefaultDeleteRetryAge is how old a delete marker with no job must be
+	// before the periodic pass retries it. A delete that was just
+	// acknowledged has its own job on the way.
+	DefaultDeleteRetryAge = 2 * time.Minute
+	// DefaultImageResolveTimeout bounds the image lookup a create makes
+	// before it saves anything. With the fast-fail window it keeps the JSON
+	// create's reply under the 30 s a client waits.
+	DefaultImageResolveTimeout = 10 * time.Second
+	// sweepTimeout bounds one periodic pass.
+	sweepTimeout = 2 * time.Minute
 	// localAuthorizedKey stands in for the server's public key when the
 	// transport needs none (the local link).
 	localAuthorizedKey = "none local-transport"
@@ -89,6 +105,19 @@ type Options struct {
 	// published host key. Default 6 s, which keeps under Google's limit on
 	// guest-attribute reads.
 	HostKeyPollInterval time.Duration
+	// CloneTimeout bounds one attempt at a create's --repo clone and
+	// CloneRetryPause is the pause before the next attempt.
+	CloneTimeout    time.Duration
+	CloneRetryPause time.Duration
+	// SweepInterval is the time between two periodic passes (see Sweep).
+	// Default 60 s; a negative value turns the periodic pass off.
+	SweepInterval time.Duration
+	// DeleteRetryAge is how old a delete marker with no job must be before
+	// the periodic pass retries it. Default 2 minutes.
+	DeleteRetryAge time.Duration
+	// ImageResolveTimeout bounds the image lookup a create makes before it
+	// saves anything. Default 10 s.
+	ImageResolveTimeout time.Duration
 	// Logf receives the backend's log lines. Default log.Printf.
 	Logf func(format string, args ...any)
 	// Now is the clock for record timestamps. Default time.Now.
@@ -106,6 +135,9 @@ type Backend struct {
 	credMgr *vmutil.CredentialManager
 	logf    func(format string, args ...any)
 	now     func() time.Time
+	// clone runs one attempt at a create's --repo clone. It is
+	// vmutil.CloneRepo; tests replace it.
+	clone func(ctx context.Context, agent *vmutil.AgentClient, serverCfg *config.ServerConfig, repo string, owned bool, extraEnv []string) error
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -113,6 +145,7 @@ type Backend struct {
 
 	ready     chan struct{}
 	readyOnce sync.Once
+	sweepOnce sync.Once
 
 	mu       sync.Mutex
 	closed   bool
@@ -164,6 +197,21 @@ func New(opts Options) (*Backend, error) {
 	if opts.HostKeyPollInterval <= 0 {
 		opts.HostKeyPollInterval = guestAttrInterval
 	}
+	if opts.CloneTimeout <= 0 {
+		opts.CloneTimeout = DefaultCloneTimeout
+	}
+	if opts.CloneRetryPause <= 0 {
+		opts.CloneRetryPause = DefaultCloneRetryPause
+	}
+	if opts.SweepInterval == 0 {
+		opts.SweepInterval = DefaultSweepInterval
+	}
+	if opts.DeleteRetryAge <= 0 {
+		opts.DeleteRetryAge = DefaultDeleteRetryAge
+	}
+	if opts.ImageResolveTimeout <= 0 {
+		opts.ImageResolveTimeout = DefaultImageResolveTimeout
+	}
 	if opts.Logf == nil {
 		opts.Logf = log.Printf
 	}
@@ -193,6 +241,7 @@ func New(opts Options) (*Backend, error) {
 		credMgr:    vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
 		logf:       opts.Logf,
 		now:        opts.Now,
+		clone:      vmutil.CloneRepo,
 		rootCtx:    ctx,
 		rootCancel: cancel,
 		ready:      make(chan struct{}),

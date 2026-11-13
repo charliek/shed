@@ -8,6 +8,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/remote/guest"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/state"
 	"github.com/charliek/shed/internal/remote/transport"
@@ -55,6 +56,7 @@ func (b *Backend) Reconcile(ctx context.Context) {
 	}
 	b.reconcile(insts)
 	b.readyOnce.Do(func() { close(b.ready) })
+	b.startSweeper()
 }
 
 func (b *Backend) reconcile(insts []provider.Instance) {
@@ -87,11 +89,25 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 
 	// A record that survived beside its own delete marker (the server died
 	// between the two writes) is dropped: the delete was acknowledged.
-	for id := range marked {
-		if name, ok := recordIDs[id]; ok {
-			b.dropLocked(name)
-			delete(recordIDs, id)
+	// The marker of a failed create's clean-up keeps the record, in
+	// "error": if the server died between the marker and the status, the
+	// status is written now.
+	for id, m := range marked {
+		name, ok := recordIDs[id]
+		if !ok {
+			continue
 		}
+		if m.KeepRecord {
+			if r := b.records[name]; r.Shed.Status != config.StatusError {
+				r.Shed.Status = config.StatusError
+				r.Shed.StatusReason = config.StatusReasonCreateFailed
+				r.Job, r.Queued, r.Pending = "", "", nil
+				b.saveLocked(r)
+			}
+			continue
+		}
+		b.dropLocked(name)
+		delete(recordIDs, id)
 	}
 
 	for _, inst := range insts {
@@ -198,11 +214,8 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 			case provider.StateRunning:
 				resumeChannels = append(resumeChannels, r.Clone())
 			case provider.StateStopped:
-				note("shed %s was running and the cloud reports it stopped; recording it stopped", name)
-				r.Shed.Status = config.StatusStopped
-				r.Shed.StatusReason = config.StatusReasonExternal
-				r.Address = ""
-				b.saveLocked(r)
+				b.recordStoppedLocked(r, inst)
+				note("shed %s was running and the cloud reports it stopped; recording it stopped (%s)", name, r.Shed.StatusReason)
 			case provider.StateStopping:
 				r.Shed.Status = config.StatusStopping
 				r.Job = state.JobStop
@@ -337,6 +350,15 @@ func (b *Backend) runProbe(ctx context.Context, j *job) error {
 		// Job stays JobProbe: a later start call, or the next server
 		// start, probes again and never restarts the instance.
 		b.update(j.name, j.id, func(r *state.Record) { r.Shed.StatusReason = reason })
+		return err
+	}
+	if !guest.ProtocolCompatible(info.Protocol) || !guest.LayoutSupported(info.Layout) {
+		// The instance runs an agent this server cannot drive. It is left
+		// as it is, and the shed is not reported running.
+		err := fmt.Errorf("the guest agent reports protocol %d and layout %d, which this server cannot drive", info.Protocol, info.Layout)
+		b.logf("remote: adopted shed %s cannot be used: %v", j.name, err)
+		b.closeLink(j.id)
+		b.update(j.name, j.id, func(r *state.Record) { r.Shed.StatusReason = config.StatusReasonUnreachable })
 		return err
 	}
 	rec = b.snapshot(j.name, j.id)
