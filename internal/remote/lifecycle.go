@@ -394,7 +394,7 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 		d.marker.At = marker.At
 		marker = d.marker
 	}
-	if err := b.store.SaveMarker(marker); err != nil {
+	if err := b.saveMarkerLocked(marker); err != nil {
 		b.mu.Unlock()
 		return fmt.Errorf("recording the delete of %s: %w", name, err)
 	}

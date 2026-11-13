@@ -84,6 +84,9 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 	var confirm []sweepCheck
 
 	b.mu.Lock()
+	for _, m := range markers {
+		b.pending[m.ID] = m.At
+	}
 	recordIDs := make(map[string]string, len(b.records)) // shed ID -> name
 	for name, r := range b.records {
 		recordIDs[r.Shed.ID] = name
@@ -135,7 +138,7 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 		}
 		if inst.ShedState() == provider.ShedStateDeleting {
 			m := &state.Marker{ID: id.ID, Name: id.Name, Env: id.Env, Ref: inst.Ref, At: b.now().UTC()}
-			if err := b.store.SaveMarker(m); err != nil {
+			if err := b.saveMarkerLocked(m); err != nil {
 				note("instance %s is labelled deleting but its marker could not be written: %v", inst.Name, err)
 				continue
 			}

@@ -609,3 +609,50 @@ func TestRestartKeepsARecordWhoseInstanceIsOnlyUnlisted(t *testing.T) {
 		t.Fatalf("%d destroy or stop calls, want none", n)
 	}
 }
+
+// --- limits ---
+
+// While destroys fail, the VM of each deleted shed still runs. Once its
+// delete is older than DeleteRetryAge it holds a run slot, so max_running
+// still caps what the server has running.
+func TestStuckDeleteHoldsARunSlot(t *testing.T) {
+	e := newEnv(t, limits(1, 4))
+	e.running("one")
+	e.prov.FailNext(fake.OpDestroy, errors.New("destroy refused"))
+	if err := e.b.DeleteShed(ctxT(t), "one"); err != nil {
+		t.Fatal(err)
+	}
+	e.idle()
+	if n := e.instances(); n != 1 {
+		t.Fatalf("%d instances after the failed destroy, want 1", n)
+	}
+	_, err := e.create("two")
+	if !errors.Is(err, config.ErrServerLimitReachedSentinel) {
+		t.Fatalf("create beside a VM that could not be destroyed = %v, want the limit", err)
+	}
+	if !strings.Contains(err.Error(), "could not be destroyed") {
+		t.Fatalf("the refusal does not say why: %v", err)
+	}
+	e.sweep()
+	e.idle()
+	if n := e.instances(); n != 0 {
+		t.Fatalf("%d instances after the periodic pass, want 0", n)
+	}
+	e.running("two")
+}
+
+// A delete that is going normally frees its run slot at once.
+func TestDeleteInFlightFreesItsRunSlot(t *testing.T) {
+	e := newEnv(t, manual(), limits(1, 4), tuned(func(o *Options) { o.DeleteRetryAge = time.Hour }))
+	e.put("one", config.StatusRunning)
+	if err := e.b.DeleteShed(ctxT(t), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.create("two"); err != nil {
+		t.Fatalf("create while the deleted shed's VM is going: %v", err)
+	}
+	e.auto()
+	if got := e.settled("two"); got.Status != config.StatusRunning {
+		t.Fatalf("settled %q", got.Status)
+	}
+}

@@ -391,7 +391,7 @@ func (b *Backend) failCreate(j *job, cause error, reason string) error {
 			ID: j.id, Name: j.name, Env: rec.Env, Ref: ref, At: b.now().UTC(),
 			Owner: rec.Shed.Owner, CreatedAt: rec.Shed.CreatedAt, KeepRecord: !removed,
 		}
-		if err := b.store.SaveMarker(marker); err != nil {
+		if err := b.saveMarkerLocked(marker); err != nil {
 			b.logf("remote: create of shed %s failed and its clean-up could not be recorded: %v", j.name, err)
 		}
 	}
@@ -774,6 +774,7 @@ func (b *Backend) startDelete(marker *state.Marker, prior *job) {
 				if err := b.store.DeleteMarker(j.id); err != nil {
 					b.logf("remote: removing the delete marker of shed %s: %v", j.name, err)
 				}
+				delete(b.pending, j.id)
 			}
 			delete(b.deletes, j.id)
 			b.finishLocked()

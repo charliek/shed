@@ -24,7 +24,13 @@ func usesRunSlot(status string) bool {
 }
 
 // countsLocked returns how many sheds exist and how many hold a run slot.
-// A shed being deleted is not counted: its record is already gone.
+//
+// A shed being deleted is not counted: its record is already gone, and its
+// VM normally follows within a minute. But a VM whose delete was acknowledged
+// longer ago than DeleteRetryAge and that still exists is a destroy that is
+// not working, and it does hold a run slot: otherwise max_running would cap
+// nothing while destroys fail, and every create-and-delete would leave one
+// more VM running.
 func (b *Backend) countsLocked() (sheds, running int) {
 	for _, r := range b.records {
 		sheds++
@@ -32,12 +38,28 @@ func (b *Backend) countsLocked() (sheds, running int) {
 			running++
 		}
 	}
-	return sheds, running
+	return sheds, running + b.stuckDeletesLocked()
+}
+
+// stuckDeletesLocked counts the delete markers older than DeleteRetryAge.
+func (b *Backend) stuckDeletesLocked() int {
+	n := 0
+	now := b.now()
+	for _, at := range b.pending {
+		if now.Sub(at) >= b.opts.DeleteRetryAge {
+			n++
+		}
+	}
+	return n
 }
 
 // limitError is the refusal for a reached server limit. It matches
 // provider.ErrLimit and the API's 503 SERVER_LIMIT_REACHED sentinel.
-func limitError(what string, limit int) error {
+func limitError(what string, limit, stuck int) error {
+	if stuck > 0 {
+		return fmt.Errorf("%w: %w: %s (%d) reached; %d of them are VMs of deleted sheds that could not be destroyed yet (see the server log)",
+			config.ErrServerLimitReachedSentinel, provider.ErrLimit, what, limit, stuck)
+	}
 	return fmt.Errorf("%w: %w: %s (%d) reached", config.ErrServerLimitReachedSentinel, provider.ErrLimit, what, limit)
 }
 
@@ -46,10 +68,10 @@ func limitError(what string, limit int) error {
 func (b *Backend) checkCreateLocked() error {
 	sheds, running := b.countsLocked()
 	if limit := b.cfg.Limits.MaxSheds; limit > 0 && sheds >= limit {
-		return limitError("remote.limits.max_sheds", limit)
+		return limitError("remote.limits.max_sheds", limit, 0)
 	}
 	if limit := b.cfg.Limits.MaxRunning; limit > 0 && running >= limit {
-		return limitError("remote.limits.max_running", limit)
+		return limitError("remote.limits.max_running", limit, b.stuckDeletesLocked())
 	}
 	return nil
 }
@@ -58,7 +80,7 @@ func (b *Backend) checkCreateLocked() error {
 func (b *Backend) checkStartLocked() error {
 	_, running := b.countsLocked()
 	if limit := b.cfg.Limits.MaxRunning; limit > 0 && running >= limit {
-		return limitError("remote.limits.max_running", limit)
+		return limitError("remote.limits.max_running", limit, b.stuckDeletesLocked())
 	}
 	return nil
 }

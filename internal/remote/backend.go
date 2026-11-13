@@ -152,6 +152,7 @@ type Backend struct {
 	records  map[string]*state.Record // by shed name
 	jobs     map[string]*job          // lifecycle job in flight, by shed name
 	deletes  map[string]*job          // delete job in flight, by shed ID
+	pending  map[string]time.Time     // delete markers on disk: shed ID -> when acknowledged
 	conns    map[string]*shedLink     // by shed ID
 	idle     chan struct{}            // closed and replaced whenever a job ends
 	reported []string                 // what the last reconcile pass reported
@@ -248,6 +249,7 @@ func New(opts Options) (*Backend, error) {
 		records:    make(map[string]*state.Record),
 		jobs:       make(map[string]*job),
 		deletes:    make(map[string]*job),
+		pending:    make(map[string]time.Time),
 		conns:      make(map[string]*shedLink),
 		idle:       make(chan struct{}),
 	}
@@ -382,6 +384,15 @@ func (b *Backend) saveLocked(r *state.Record) {
 	if err := b.store.SaveRecord(r); err != nil {
 		b.logf("remote: saving the record of shed %s: %v", r.Shed.Name, err)
 	}
+}
+
+// saveMarkerLocked writes a delete marker and notes it as pending.
+func (b *Backend) saveMarkerLocked(m *state.Marker) error {
+	if err := b.store.SaveMarker(m); err != nil {
+		return err
+	}
+	b.pending[m.ID] = m.At
+	return nil
 }
 
 // dropLocked removes a record from memory and disk.
