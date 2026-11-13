@@ -63,7 +63,10 @@ func handleTCPProxyConnection(conn net.Conn) {
 	// Each direction half-closes its destination when its source ends, so
 	// an end-of-file crosses the proxy in both directions without a full
 	// close. Host-side conns are vsock (vsock.Conn) or unix (net.UnixConn);
-	// both have CloseWrite, as does the TCP target.
+	// both have CloseWrite, as does the TCP target. What the host then sees
+	// is up to what carries the conn: a unix socket delivers the EOF, while
+	// Firecracker's vsock device records the shutdown and tells the host
+	// nothing until full close (see firecracker.Client.DialService).
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
