@@ -80,24 +80,35 @@ func TestValidateNetworkBackend(t *testing.T) {
 		c.Policy.Network = network
 		return map[string]ServiceClientConfig{"nocturn": c}
 	}
+	staticFirewall := &RemoteConfig{Firewall: RemoteFirewallConfig{Mode: RemoteFirewallStatic}}
+	anyFirewall := &RemoteConfig{Firewall: RemoteFirewallConfig{Mode: RemoteFirewallAny, AcknowledgeAny: true}}
 	tests := []struct {
 		name    string
 		backend string
 		network *NetworkConfig
 		clients map[string]ServiceClientConfig
+		remote  *RemoteConfig
 		wantErr string
 	}{
-		{"fc isolated default", BackendFirecracker, &NetworkConfig{DefaultProfile: "isolated"}, clientWith(""), ""},
-		{"vz no network block", BackendVZ, nil, nil, ""},
-		{"vz open default", BackendVZ, &NetworkConfig{DefaultProfile: "open"}, nil, ""},
-		{"vz isolated default", BackendVZ, &NetworkConfig{DefaultProfile: "isolated"}, nil, "vz backend"},
-		{"vz client default is isolated", BackendVZ, nil, clientWith(""), "set network: open"},
-		{"vz client isolated", BackendVZ, nil, clientWith("isolated"), "set network: open"},
-		{"vz client open", BackendVZ, nil, clientWith("open"), ""},
+		{"fc isolated default", BackendFirecracker, &NetworkConfig{DefaultProfile: "isolated"}, clientWith(""), nil, ""},
+		{"vz no network block", BackendVZ, nil, nil, nil, ""},
+		{"vz open default", BackendVZ, &NetworkConfig{DefaultProfile: "open"}, nil, nil, ""},
+		{"vz isolated default", BackendVZ, &NetworkConfig{DefaultProfile: "isolated"}, nil, nil, "vz backend"},
+		{"vz client default is isolated", BackendVZ, nil, clientWith(""), nil, "set network: open"},
+		{"vz client isolated", BackendVZ, nil, clientWith("isolated"), nil, "set network: open"},
+		{"vz client open", BackendVZ, nil, clientWith("open"), nil, ""},
+		// Remote accepts isolated: there it is isolation by topology.
+		{"remote no network block", BackendRemote, nil, nil, staticFirewall, ""},
+		{"remote isolated default", BackendRemote, &NetworkConfig{DefaultProfile: "isolated"}, nil, staticFirewall, ""},
+		{"remote client default is isolated", BackendRemote, nil, clientWith(""), staticFirewall, ""},
+		{"remote client isolated", BackendRemote, nil, clientWith("isolated"), staticFirewall, ""},
+		{"remote client open", BackendRemote, nil, clientWith("open"), staticFirewall, ""},
+		{"remote any firewall, open default", BackendRemote, nil, nil, anyFirewall, ""},
+		{"remote any firewall, isolated default", BackendRemote, &NetworkConfig{DefaultProfile: "isolated"}, nil, anyFirewall, "remote.firewall.mode: any"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &ServerConfig{DefaultBackend: tt.backend, Network: tt.network}
+			c := &ServerConfig{DefaultBackend: tt.backend, Network: tt.network, Remote: tt.remote}
 			if tt.clients != nil {
 				c.Auth = &AuthConfig{Mode: AuthModeMTLS, Clients: tt.clients}
 			}

@@ -16,6 +16,9 @@ const (
 	TypeFirecracker Type = "firecracker"
 	// TypeVZ is the Apple Virtualization.framework-based backend (macOS only).
 	TypeVZ Type = "vz"
+	// TypeRemote is the remote backend: each shed is a cloud VM the server
+	// reaches over a link (config.BackendRemote).
+	TypeRemote Type = "remote"
 )
 
 // Backend defines the interface for shed execution backends.

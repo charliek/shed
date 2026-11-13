@@ -88,6 +88,24 @@ var (
 	// cannot install the firewall rules a non-open network profile needs, so
 	// a create or start of such a shed is refused rather than run unguarded.
 	ErrNetworkEnforcementUnavailableSentinel = errors.New("network enforcement is unavailable")
+
+	// ErrServerLimitReachedSentinel is returned when a create or start would
+	// pass the remote backend's limits.max_running or limits.max_sheds.
+	ErrServerLimitReachedSentinel = errors.New("server limit reached")
+
+	// ErrCloudQuotaExceededSentinel is returned when the cloud project's
+	// quota refuses a create or start.
+	ErrCloudQuotaExceededSentinel = errors.New("cloud quota exceeded")
+
+	// ErrZoneCapacityUnavailableSentinel is returned when the cloud zone has
+	// no room for the machine a create or start asks for.
+	ErrZoneCapacityUnavailableSentinel = errors.New("zone capacity unavailable")
+
+	// ErrFeatureUnsupportedSentinel is returned when a request uses a
+	// feature the active backend does not offer (on remote: host directory
+	// mounts, server mounts, snapshots, reset, image management, egress
+	// profiles). The API answers 422 for a create field and 501 for a route.
+	ErrFeatureUnsupportedSentinel = errors.New("feature is not supported by this backend")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -138,17 +156,25 @@ func ValidateSnapshotName(name string) error {
 
 // Shed represents a development environment container.
 type Shed struct {
-	Name        string    `json:"name" yaml:"name"`
-	Status      string    `json:"status" yaml:"status"`
-	CreatedAt   time.Time `json:"created_at" yaml:"created_at"`
-	Repo        string    `json:"repo,omitempty" yaml:"repo,omitempty"`
-	ContainerID string    `json:"container_id" yaml:"container_id"`
-	Backend     string    `json:"backend,omitempty" yaml:"backend,omitempty"`
-	IPAddress   string    `json:"ip_address,omitempty" yaml:"ip_address,omitempty"`
-	CPUs        int       `json:"cpus,omitempty" yaml:"cpus,omitempty"`
-	MemoryMB    int       `json:"memory_mb,omitempty" yaml:"memory_mb,omitempty"`
-	PID         int       `json:"pid,omitempty" yaml:"pid,omitempty"`
-	RootfsPath  string    `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
+	Name string `json:"name" yaml:"name"`
+	// ID is the shed's permanent identifier (NewShedID). A name can be
+	// reused after a delete; an ID never is. Only the remote backend sets
+	// it; a Firecracker or VZ shed reports none.
+	ID     string `json:"id,omitempty" yaml:"id,omitempty"`
+	Status string `json:"status" yaml:"status"`
+	// StatusReason says why the shed is in Status when that is not the
+	// plain case: one of the StatusReason* constants, or empty. Only the
+	// remote backend sets it.
+	StatusReason string    `json:"status_reason,omitempty" yaml:"status_reason,omitempty"`
+	CreatedAt    time.Time `json:"created_at" yaml:"created_at"`
+	Repo         string    `json:"repo,omitempty" yaml:"repo,omitempty"`
+	ContainerID  string    `json:"container_id" yaml:"container_id"`
+	Backend      string    `json:"backend,omitempty" yaml:"backend,omitempty"`
+	IPAddress    string    `json:"ip_address,omitempty" yaml:"ip_address,omitempty"`
+	CPUs         int       `json:"cpus,omitempty" yaml:"cpus,omitempty"`
+	MemoryMB     int       `json:"memory_mb,omitempty" yaml:"memory_mb,omitempty"`
+	PID          int       `json:"pid,omitempty" yaml:"pid,omitempty"`
+	RootfsPath   string    `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
 	// ProjectMounts are host directories mounted under the home directory
 	// (--local-dir / --add-dir), each at /home/shed/<basename>.
 	ProjectMounts []MountConfig `json:"project_mounts,omitempty" yaml:"project_mounts,omitempty"`
@@ -284,6 +310,44 @@ const (
 	StatusStopped  = "stopped"
 	StatusStarting = "starting"
 	StatusError    = "error"
+	// StatusStopping means a stop is in progress. Only a backend with an
+	// asynchronous lifecycle (remote) reports it.
+	StatusStopping = "stopping"
+)
+
+// Shed.StatusReason values. A reason qualifies the status it comes with; the
+// comment on each names that status.
+const (
+	// StatusReasonNoPin (starting): the VM is marked ready in the cloud but
+	// carries no pinned host key, so the server will not connect to it.
+	StatusReasonNoPin = "no_pin"
+	// StatusReasonUnreachable (starting): the agent has not answered yet.
+	StatusReasonUnreachable = "unreachable"
+	// StatusReasonCapacity (stopped, error): the zone had no room.
+	StatusReasonCapacity = "capacity"
+	// StatusReasonQuota (stopped, error): the project's quota refused it.
+	StatusReasonQuota = "quota"
+	// StatusReasonLimit (stopped): a start was refused by the server's own
+	// limits.max_running.
+	StatusReasonLimit = "limit"
+	// StatusReasonRunLimit (stopped): the cloud stopped the VM at the end
+	// of its run limit.
+	StatusReasonRunLimit = "run_limit"
+	// StatusReasonExternal (stopped): something other than this server
+	// stopped the VM.
+	StatusReasonExternal = "external"
+	// StatusReasonIsolationLost (stopped): the server stopped the VM because
+	// the network no longer isolates it.
+	StatusReasonIsolationLost = "isolation_lost"
+	// StatusReasonLayout (stopped, error): the image's agent or guest layout
+	// is one this server cannot drive.
+	StatusReasonLayout = "layout"
+	// StatusReasonCreateFailed (error): the create failed for a reason that
+	// has no code of its own.
+	StatusReasonCreateFailed = "create_failed"
+	// StatusReasonHostKey (error): the VM presented a host key other than
+	// the pinned one.
+	StatusReasonHostKey = "host_key"
 )
 
 // Session represents a tmux session within a shed container.
@@ -669,7 +733,11 @@ type SystemPruneResponse struct {
 
 // CreateShedRequest is the request body for POST /api/sheds.
 type CreateShedRequest struct {
-	Name        string `json:"name"`
+	Name string `json:"name"`
+	// ID is the shed's permanent identifier. It is never read from the
+	// request body: the server mints it (NewShedID) on a backend that
+	// stores one, the way it sets Owner.
+	ID          string `json:"-"`
 	Repo        string `json:"repo,omitempty"`
 	Image       string `json:"image,omitempty"`
 	NoProvision bool   `json:"no_provision,omitempty"`
@@ -892,6 +960,22 @@ const (
 	ErrProfileNotFound = "PROFILE_NOT_FOUND"
 	ErrProfileReserved = "PROFILE_RESERVED" // name collides with a config/reserved profile
 	ErrProfileInUse    = "PROFILE_IN_USE"   // referenced by one or more sheds
+
+	// ErrServerLimitReached (503) means the remote backend's
+	// limits.max_running or limits.max_sheds is reached. Never a 409: a
+	// client may read a 409 on create as "the shed exists".
+	ErrServerLimitReached = "SERVER_LIMIT_REACHED"
+	// ErrCloudQuotaExceeded (503) means the cloud project's quota refused
+	// the create or start.
+	ErrCloudQuotaExceeded = "CLOUD_QUOTA_EXCEEDED"
+	// ErrZoneCapacityUnavailable (503) means the cloud zone has no room for
+	// the machine.
+	ErrZoneCapacityUnavailable = "ZONE_CAPACITY_UNAVAILABLE"
+	// ErrFeatureUnsupported means the active backend does not offer what
+	// the request uses: 422 for a create field (local_dir, add_dirs, a
+	// non-empty mounts, from_snapshot, egress profiles), 501 for a route
+	// (snapshot, reset, image and egress writes).
+	ErrFeatureUnsupported = "FEATURE_UNSUPPORTED"
 )
 
 // Backend type constants for Shed.Backend field.
@@ -899,6 +983,9 @@ const (
 	BackendFirecracker = "firecracker"
 	BackendVZ          = "vz"
 	BackendDetect      = "detect"
+	// BackendRemote runs each shed as a cloud VM the server reaches over an
+	// SSH link. It is never the result of BackendDetect.
+	BackendRemote = "remote"
 )
 
 // SSH auth modes for SSHAuthConfig.Mode.
@@ -1165,4 +1252,198 @@ func sanitizeMountTag(s string) string {
 		}
 	}
 	return string(b)
+}
+
+// Remote backend drivers (remote.provider, remote.transport).
+const (
+	RemoteProviderGCE    = "gce"
+	RemoteProviderFake   = "fake"
+	RemoteTransportSSH   = "ssh"
+	RemoteTransportLocal = "local"
+)
+
+// remote.agent_install values: when the server replaces the agent binary a
+// cloud image carries with its own build.
+const (
+	// RemoteAgentInstallIncompatible (the default) installs only when the
+	// image's agent speaks a protocol or layout the server cannot drive.
+	RemoteAgentInstallIncompatible = "incompatible"
+	// RemoteAgentInstallAlways installs whenever the hashes differ (the
+	// development loop).
+	RemoteAgentInstallAlways = "always"
+	// RemoteAgentInstallNever never installs; an incompatible agent is an
+	// error.
+	RemoteAgentInstallNever = "never"
+)
+
+// remote.firewall.mode values.
+const (
+	// RemoteFirewallStatic (the default): the firewall rule's sources are
+	// fixed and must equal firewall.source_ranges.
+	RemoteFirewallStatic = "static"
+	// RemoteFirewallAuto: the server follows its own public address and
+	// patches the rule (needs firewall.echo_urls).
+	RemoteFirewallAuto = "auto"
+	// RemoteFirewallAny: the rule admits every address. Needs
+	// firewall.acknowledge_any, and is refused beside service clients or the
+	// isolated network profile, because one shed can then reach another's
+	// SSH port.
+	RemoteFirewallAny = "any"
+)
+
+// Defaults for the remote block. The *_env defaults are the variable names
+// the development environment file defines.
+const (
+	DefaultRemoteMaxRunning     = 2
+	DefaultRemoteMaxSheds       = 8
+	DefaultRemoteMaxRunDuration = 24 * time.Hour
+	// RemoteMinRunDuration and RemoteMaxRunDuration bound
+	// remote.max_run_duration.
+	RemoteMinRunDuration = 10 * time.Minute
+	RemoteMaxRunDuration = 120 * 24 * time.Hour
+	// RemoteMinDiskGB and RemoteMaxDiskGB bound remote.disk_gb and a
+	// create's --upper-size.
+	RemoteMinDiskGB = 10
+	RemoteMaxDiskGB = 500
+
+	DefaultRemoteSSHClientKeyEnv       = "SHED_REMOTE_SSH_KEY"
+	DefaultRemoteSSHClientKeyFileEnv   = "SHED_REMOTE_SSH_KEY_FILE"
+	DefaultRemoteGCEProjectEnv         = "SHED_GCE_PROJECT"
+	DefaultRemoteGCEZoneEnv            = "SHED_GCE_ZONE"
+	DefaultRemoteGCENetworkEnv         = "SHED_GCE_NETWORK"
+	DefaultRemoteGCESubnetEnv          = "SHED_GCE_SUBNET"
+	DefaultRemoteGCECredentialsEnv     = "GOOGLE_CREDENTIALS_BASE64"
+	DefaultRemoteGCECredentialsFileEnv = "SHED_GCE_CREDENTIALS_FILE"
+)
+
+// RemoteConfig is the `remote:` block: the backend that runs each shed as a
+// cloud VM (default_backend: remote). The file holds no project, zone,
+// address or key: every *_env field names a process environment variable,
+// read at start-up by Resolve.
+type RemoteConfig struct {
+	// Provider is the cloud driver: RemoteProviderGCE (the default) or
+	// RemoteProviderFake (tests; needs AllowTestDrivers).
+	Provider string `yaml:"provider,omitempty"`
+	// Transport is how the server reaches a shed's agent: RemoteTransportSSH
+	// (the default) or RemoteTransportLocal (tests; needs AllowTestDrivers).
+	Transport string `yaml:"transport,omitempty"`
+	// AllowTestDrivers must be true for provider: fake or transport: local,
+	// so a production config cannot select them by a typo.
+	AllowTestDrivers bool `yaml:"allow_test_drivers,omitempty"`
+	// Environment names this server's set of cloud VMs (label shed_env).
+	// Required, no default: 1 to 20 lowercase letters, digits and hyphens,
+	// starting with a letter and not ending with a hyphen. Two servers must
+	// never share one.
+	Environment string `yaml:"environment"`
+	// StateDir holds the record cache and delete markers. Empty means
+	// "remote" under the server's state directory (StateDirPath).
+	StateDir string `yaml:"state_dir,omitempty"`
+	// DefaultImage is the cloud image a create that names none gets.
+	// Required. "family/<name>" follows an image family; anything else is an
+	// exact image name.
+	DefaultImage string `yaml:"default_image"`
+	// ImageAliases maps the names a create may pass as its image to cloud
+	// image names. A create may name only an alias.
+	ImageAliases map[string]string `yaml:"image_aliases,omitempty"`
+	// DefaultSize is the Sizes entry a create that asks for no CPUs or
+	// memory gets (default "standard").
+	DefaultSize string `yaml:"default_size,omitempty"`
+	// Sizes are the machine shapes a shed may have, by name. Empty means the
+	// provider's built-in table (standard, large).
+	Sizes map[string]RemoteSizeConfig `yaml:"sizes,omitempty"`
+	// DiskGB is the boot disk size when a create names none (default 50).
+	DiskGB int `yaml:"disk_gb,omitempty"`
+	// Limits caps what this server runs.
+	Limits RemoteLimitsConfig `yaml:"limits,omitempty"`
+	// MaxRunDuration is the run limit: the cloud stops a VM that has run
+	// this long (default 24h). A service client's shed gets the larger of
+	// this and the client's max_age (RunLimit).
+	MaxRunDuration Duration `yaml:"max_run_duration,omitempty"`
+	// AgentDir holds the agent builds the server can install, one per
+	// architecture (shed-agent-linux-<arch>). Empty means "agent" under the
+	// server's state directory (AgentDirPath).
+	AgentDir string `yaml:"agent_dir,omitempty"`
+	// AgentInstall is one of the RemoteAgentInstall* values (default
+	// incompatible).
+	AgentInstall string `yaml:"agent_install,omitempty"`
+	// SSH names where the server's SSH client key comes from.
+	SSH RemoteSSHConfig `yaml:"ssh,omitempty"`
+	// Firewall says how the cloud firewall rule that admits the server is
+	// kept.
+	Firewall RemoteFirewallConfig `yaml:"firewall,omitempty"`
+	// GCE names the environment variables the GCE provider reads. Only
+	// used with provider: gce.
+	GCE *RemoteGCEConfig `yaml:"gce,omitempty"`
+}
+
+// RemoteSizeConfig is one remote.sizes entry.
+type RemoteSizeConfig struct {
+	// MachineType is the cloud's name for the shape (e2-standard-2).
+	MachineType string `yaml:"machine_type"`
+	// CPUs and MemoryMB are what the shape provides; a shed's record
+	// reports them and client caps are checked against them.
+	CPUs     int `yaml:"cpus"`
+	MemoryMB int `yaml:"memory_mb"`
+	// Arch is "amd64" (the default) or "arm64"; it must match the image.
+	Arch string `yaml:"arch,omitempty"`
+}
+
+// RemoteLimitsConfig is remote.limits.
+type RemoteLimitsConfig struct {
+	// MaxRunning caps VMs that are starting or running (default 2).
+	MaxRunning int `yaml:"max_running,omitempty"`
+	// MaxSheds caps sheds in any state (default 8).
+	MaxSheds int `yaml:"max_sheds,omitempty"`
+}
+
+// RemoteSSHConfig is remote.ssh. Exactly one of the two variables must be
+// set when the server starts.
+type RemoteSSHConfig struct {
+	// ClientKeyEnv names a variable holding the OpenSSH private key in
+	// base64.
+	ClientKeyEnv string `yaml:"client_key_env,omitempty"`
+	// ClientKeyFileEnv names a variable holding a path to the key.
+	ClientKeyFileEnv string `yaml:"client_key_file_env,omitempty"`
+}
+
+// RemoteFirewallConfig is remote.firewall.
+type RemoteFirewallConfig struct {
+	// Mode is one of the RemoteFirewall* values (default static).
+	Mode string `yaml:"mode,omitempty"`
+	// SourceRanges are the IPv4 CIDRs the rule admits. In static mode they
+	// must equal the rule's sources; not allowed in any mode.
+	SourceRanges []string `yaml:"source_ranges,omitempty"`
+	// AcknowledgeAny must be true for mode: any.
+	AcknowledgeAny bool `yaml:"acknowledge_any,omitempty"`
+	// EchoURLs are the https services that report the caller's public
+	// address. Auto mode only, and it needs at least two.
+	EchoURLs []string `yaml:"echo_urls,omitempty"`
+}
+
+// RemoteGCEConfig is remote.gce: the names of the environment variables that
+// carry the GCE provider's settings.
+type RemoteGCEConfig struct {
+	ProjectEnv string `yaml:"project_env,omitempty"`
+	ZoneEnv    string `yaml:"zone_env,omitempty"`
+	NetworkEnv string `yaml:"network_env,omitempty"`
+	SubnetEnv  string `yaml:"subnet_env,omitempty"`
+	// CredentialsEnv names a variable holding the service account JSON key
+	// in base64; CredentialsFileEnv names one holding a path to it. Exactly
+	// one must be set when the server starts.
+	CredentialsEnv     string `yaml:"credentials_env,omitempty"`
+	CredentialsFileEnv string `yaml:"credentials_file_env,omitempty"`
+}
+
+// RemoteRuntime is what Resolve read from the environment. It holds secrets:
+// never log it.
+type RemoteRuntime struct {
+	// Project, Zone, Network and Subnet are set for provider: gce.
+	Project string
+	Zone    string
+	Network string
+	Subnet  string
+	// Credentials is the service account JSON key (provider: gce).
+	Credentials []byte
+	// SSHClientKey is the server's OpenSSH private key (transport: ssh).
+	SSHClientKey []byte
 }
