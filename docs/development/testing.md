@@ -243,6 +243,14 @@ details — it carries no credential. `shed server add localhost --ssh-port
 12222 --name my-server-dev` (SSH-first: see the callout below) is what
 actually bootstraps one; prefer it over hand-editing the file.
 
+#### Remote backend (cloud sheds)
+
+A dev server with `default_backend: remote` runs on your machine and creates one cloud VM per shed. Its setup (the private env file, `make dev-server-up-remote` and its siblings, the image bake) is on [Remote Backend Development](remote-backend.md). The suite's `[remote]` cases are opt-in and billed:
+
+```bash
+make test-integration-remote
+```
+
 #### Service clients, HTTPS exec and network profiles (FC, mtls)
 
 Four modules cover the orchestrated-sheds work against the FC dev server. All

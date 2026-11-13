@@ -115,6 +115,7 @@ nav = [
   { "Development" = [
     { "Setup" = "development/setup.md" },
     { "Testing" = "development/testing.md" },
+    { "Remote Backend" = "development/remote-backend.md" },
     { "Architecture" = "development/architecture.md" },
     { "In-shed Build Debugging" = "development/in-shed-build-debugging.md" },
   ] },
