@@ -49,6 +49,8 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("vz config is required when backend is vz")
 		}
 		imgCfg = cfg.VZ
+	case config.BackendRemote:
+		return fmt.Errorf("pull-images does not apply to the remote backend: a cloud shed boots from the cloud image named by remote.default_image, and nothing is cached on this host")
 	default:
 		return fmt.Errorf("unsupported backend: %s", cfg.DefaultBackend)
 	}

@@ -237,6 +237,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// metadata and starts their presence check (Firecracker only; nil
 	// otherwise). It runs before the resume walk and the listeners.
 	var startNetPolicy func(context.Context)
+	// waitBackendReady blocks until the backend may serve shed routes
+	// (remote only: its first complete list of the cloud; nil otherwise).
+	var waitBackendReady func(context.Context) error
 	switch cfg.DefaultBackend {
 	case config.BackendFirecracker:
 		fcCfg := cfg.Firecracker
@@ -273,6 +276,23 @@ func runServe(cmd *cobra.Command, args []string) error {
 		attachEgressStore = vzClient.SetEgressUserStore
 		resumeChannels = vzClient.ResumeRunningInstances
 
+	case config.BackendRemote:
+		rb, err := newRemoteBackend(cfg, pluginBridge)
+		if err != nil {
+			return err
+		}
+		log.Printf("Initialized remote backend (provider=%s, transport=%s, environment=%s, default_image=%q)",
+			cfg.Remote.Provider, cfg.Remote.Transport, cfg.Remote.Environment, cfg.Remote.DefaultImage)
+		be = rb
+		// Egress control is refused on remote at load, so these two are
+		// never used; they are set so nothing below sees an empty path.
+		egressSocketDir = cfg.Remote.StateDirPath(serverStateDir(cfg))
+		egressStateDir = egressSocketDir
+		// The start-up pass lists the cloud, repairs the record cache and
+		// resumes the jobs and message channels a previous server left.
+		resumeChannels = rb.Reconcile
+		waitBackendReady = rb.WaitReady
+
 	default:
 		return fmt.Errorf("unsupported backend type: %s", cfg.DefaultBackend)
 	}
@@ -298,6 +318,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer cancelResume()
 	log.Printf("Resuming message channels for already-running sheds in the background")
 	go resumeChannels(resumeCtx)
+	if waitBackendReady != nil {
+		// Shed routes may be served only after the backend's first
+		// complete list of the cloud, so the listeners wait for it.
+		log.Printf("Waiting up to %s for the %s backend's first cloud list", backendReadyTimeout, cfg.DefaultBackend)
+		readyCtx, cancelReady := context.WithTimeout(context.Background(), backendReadyTimeout)
+		err := waitBackendReady(readyCtx)
+		cancelReady()
+		if err != nil {
+			return err
+		}
+	}
 
 	// Optional egress-control proxy child, started only when enabled. A start
 	// failure is a hard startup error — never a silent disable (AC-11).
