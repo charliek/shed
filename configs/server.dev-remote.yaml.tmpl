@@ -1,0 +1,89 @@
+# Shed Server — Parallel Dev Configuration (remote backend)
+#
+# A TEMPLATE, not a config: `make dev-server-up-remote` renders it to
+# ~/.shed/dev-remote/server.yaml, replacing the three @...@ placeholders, and
+# runs the dev build with it. Nothing private lives here. The cloud project,
+# zone, network, subnet, credentials and SSH client key are read from the
+# process environment at start-up through the `*_env` names in the `remote:`
+# block; the Make target sources them from a private env file
+# (default ~/.config/shed/remote-dev/env, override with SHED_REMOTE_ENV_FILE).
+#
+# The server runs ALONGSIDE an installed shed-server on the same machine:
+# its own ports, its own identity directory, its own record cache. Each shed
+# is a cloud VM, so a shed left running costs money: `shed -s remote-dev list`
+# before `make dev-server-down-remote`.
+#
+# Register it with the CLI once, after the first start:
+#   shed server add localhost --port 18090 --ssh-port 12290 --name remote-dev
+#
+# auth.mode is mtls, so the API is served on https_port only (an enforced mode
+# starts no plain-HTTP listener; http_port is declared for the day the mode is
+# flipped to open). See docs/reference/remote-backend.md.
+
+name: remote-dev
+
+http_port: 18090
+ssh_port: 12290
+https_port: 18490
+bind_address: 127.0.0.1
+
+default_backend: remote
+log_level: debug
+
+# The dev server's own identity directory: SSH host key, TLS pair, the mtls
+# client CA and the GitHub key cache.
+state_dir: @DEV_REMOTE_DIR@/state
+
+auth:
+  mode: mtls
+  ssh:
+    github_users: [@GITHUB_USER@]
+  clients:
+    # A development Nocturn (the shed-craze Agent Provider). Issue its bundle
+    # with the dev build and the rendered config:
+    #   bin/shed-server client issue nocturn --config ~/.shed/dev-remote/server.yaml --ttl 72h --out <file>
+    nocturn:
+      cert_max_ttl: 72h
+      policy:
+        name_prefix: "nocturn-"
+        max_sheds: 4
+        # Above Nocturn's delegate.max_age (24h). Also this client's cloud run
+        # limit: a shed gets the larger of this and remote.max_run_duration.
+        max_age: 30h
+        # On remote, isolated means isolation by network topology.
+        network: isolated
+        server_mounts: []
+        images: [cloud]
+
+remote:
+  provider: gce
+  transport: ssh
+  environment: @SHED_REMOTE_ENV@
+  state_dir: @DEV_REMOTE_DIR@/remote
+  # The newest image of the family `make gce-image` bakes.
+  default_image: family/shed-extensions-amd64
+  image_aliases:
+    cloud: family/shed-extensions-amd64
+  default_size: standard
+  disk_gb: 50
+  limits:
+    max_running: 2
+    max_sheds: 8
+  max_run_duration: 24h
+  # `make dev-server-up-remote` builds shed-agent-linux-amd64 into it.
+  agent_dir: @DEV_REMOTE_DIR@/agent
+  # The backend does not push agents yet: an image whose agent is
+  # incompatible fails the create with reason `layout`.
+  agent_install: never
+  ssh:
+    client_key_env: SHED_REMOTE_SSH_KEY
+    client_key_file_env: SHED_REMOTE_SSH_KEY_FILE
+  firewall:
+    mode: static
+  gce:
+    project_env: SHED_GCE_PROJECT
+    zone_env: SHED_GCE_ZONE
+    network_env: SHED_GCE_NETWORK
+    subnet_env: SHED_GCE_SUBNET
+    credentials_env: GOOGLE_CREDENTIALS_BASE64
+    credentials_file_env: SHED_GCE_CREDENTIALS_FILE
