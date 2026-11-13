@@ -65,6 +65,7 @@ nav = [
     { "Provisioning" = "reference/provisioning.md" },
     { "Firecracker Operations" = "reference/fc-operations.md" },
     { "VZ Operations (macOS)" = "reference/vz-operations.md" },
+    { "Remote Backend (Cloud)" = "reference/remote-backend.md" },
     { "Images" = "reference/images.md" },
     { "Build Tools" = "reference/build-tools.md" },
     { "Extensions" = "reference/extensions.md" },
