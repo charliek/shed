@@ -184,8 +184,9 @@ func TestCheckHealthWrongType(t *testing.T) {
 			}
 			var env plugin.Envelope
 			json.Unmarshal(data, &env)
-			// Respond with event instead of response
-			resp := plugin.NewEnvelope(plugin.NamespaceHealth, plugin.MessageTypeEvent, nil)
+			// Respond with a request instead of a response (events are
+			// skipped: an old agent may send a heartbeat first).
+			resp := plugin.NewEnvelope(plugin.NamespaceHealth, plugin.MessageTypeRequest, nil)
 			respData, _ := json.Marshal(resp)
 			agentproto.WriteMessage(conn, agentproto.MsgTypePluginMessage, respData)
 		},

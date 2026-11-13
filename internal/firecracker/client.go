@@ -1193,10 +1193,26 @@ func (c *Client) vmmTeardown(name string, pid int, teardownErr error) vmmVerdict
 // unreachable via connect/{port} — none exist in-tree; sshd and user services
 // bind 0.0.0.0, which the proxy reaches via loopback all the same.
 //
-// Semantic delta vs the old bridge dial: half-close/EOF does not propagate
-// through the tcpproxy until full close (guest-side tcpproxy CloseWrite asserts
-// *net.TCPConn, which fails for the vsock.Conn it holds). This matches VZ; a
-// guest-side fix is deferred (it needs an image rebuild).
+// Half-close does not cross Firecracker's vsock in either direction, with any
+// agent:
+//
+//   - Guest to host: the guest-side tcpproxy calls CloseWrite on its vsock
+//     conn when the service ends its output (agents before that fix asserted
+//     *net.TCPConn, never true for a vsock.Conn, and did not). Firecracker
+//     records the guest's one-sided shutdown and does not pass it on to the
+//     host's unix socket, so the host sees EOF only once the connection is
+//     fully closed, which the proxy does only after the host has closed or
+//     half-closed its side. A caller that reads to EOF without closing first
+//     waits forever.
+//   - Host to guest: Firecracker turns the host's write-side shutdown into a
+//     full shutdown of the vsock connection, so whatever the service sends
+//     after it sees EOF is lost.
+//
+// Checked on Firecracker v1.14.1 by running the transport conformance suite
+// over FirecrackerDialer against an agent with and without the fix: the same
+// two half-close checks fail either way, and nothing else differs. Both
+// half-closes do cross where the agent listens on unix sockets (the remote
+// backend).
 func (c *Client) DialService(ctx context.Context, name string, port uint16) (net.Conn, error) {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {

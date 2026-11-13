@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/plugin"
-	"github.com/mdlayher/vsock"
+	"github.com/charliek/shed/internal/remote/guest"
 )
 
 // userInfo holds resolved user credentials for spawning processes.
@@ -43,7 +43,7 @@ const (
 // DefaultHeartbeatInterval is the default interval between health heartbeats.
 const DefaultHeartbeatInterval = 15 * time.Second
 
-// Server handles vsock connections from the host.
+// Server handles connections from the host on vsock or unix sockets.
 type Server struct {
 	consolePort       uint32
 	notifyPort        uint32
@@ -52,6 +52,11 @@ type Server struct {
 	shedName          string
 	startedAt         time.Time
 	heartbeatInterval time.Duration
+
+	// listenCfg says where the three ports listen; the zero value is vsock.
+	listenCfg listenConfig
+	// info is the payload of a probe reply (version, protocol, layout).
+	info guest.AgentInfo
 
 	consoleListener  net.Listener
 	notifyListener   net.Listener
@@ -96,6 +101,8 @@ func NewServer(consolePort, notifyPort, tcpProxyPort, httpPort uint32, shedName 
 		heartbeatInterval: DefaultHeartbeatInterval,
 		pending:           make(map[string]chan *plugin.Envelope),
 		manifestDir:       "/etc/shed-extensions.d",
+		listenCfg:         listenConfig{mode: listenVsock, gid: -1},
+		info:              buildAgentInfo(0),
 		ctx:               ctx,
 		cancel:            cancel,
 	}
@@ -143,17 +150,21 @@ func NewServer(consolePort, notifyPort, tcpProxyPort, httpPort uint32, shedName 
 	return s
 }
 
-// Start starts the vsock listeners.
+// Start starts the listeners (vsock or unix, per listenCfg).
 func (s *Server) Start() error {
+	if err := s.listenCfg.prepare(s.consolePort, s.notifyPort, s.tcpProxyPort); err != nil {
+		return err
+	}
+
 	// Start console listener
 	var err error
-	s.consoleListener, err = vsock.Listen(s.consolePort, nil)
+	s.consoleListener, err = s.listenCfg.listen(s.consolePort)
 	if err != nil {
 		return err
 	}
 
 	// Start notify listener (handles health checks, plugins)
-	s.notifyListener, err = vsock.Listen(s.notifyPort, nil)
+	s.notifyListener, err = s.listenCfg.listen(s.notifyPort)
 	if err != nil {
 		s.consoleListener.Close()
 		return err
@@ -168,7 +179,7 @@ func (s *Server) Start() error {
 	s.acceptLoop(s.notifyListener, "Message channel", s.handleNotifyConnection)
 
 	// Start TCP proxy listener (for DialService / Connect API)
-	s.tcpProxyListener, err = vsock.Listen(s.tcpProxyPort, nil)
+	s.tcpProxyListener, err = s.listenCfg.listen(s.tcpProxyPort)
 	if err != nil {
 		s.consoleListener.Close()
 		s.notifyListener.Close()
@@ -192,8 +203,9 @@ func (s *Server) Start() error {
 		s.runClockSync(s.ctx)
 	}()
 
-	log.Printf("Listening on vsock ports: console=%d, message=%d, tcp_proxy=%d; HTTP on 127.0.0.1:%d",
-		s.consolePort, s.notifyPort, s.tcpProxyPort, s.httpPort)
+	log.Printf("Listening on %s: console=%d, message=%d, tcp_proxy=%d; HTTP on 127.0.0.1:%d; agent %s protocol %d layout %d",
+		s.listenCfg.describe(), s.consolePort, s.notifyPort, s.tcpProxyPort, s.httpPort,
+		s.info.Version, s.info.Protocol, s.info.Layout)
 	return nil
 }
 
@@ -260,7 +272,7 @@ func (s *Server) acceptLoop(listener net.Listener, name string, handler func(net
 // VM shutdown indefinitely.
 const drainTimeout = 5 * time.Second
 
-// Stop stops the vsock listeners and waits for active connections to finish.
+// Stop stops the listeners and waits for active connections to finish.
 // If connections don't drain within drainTimeout, shutdown proceeds anyway.
 func (s *Server) Stop() {
 	// Signal shutdown

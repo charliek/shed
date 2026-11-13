@@ -180,7 +180,14 @@ jobs:
       # the system ssh binary against a spawned test server). Keeping sdk out of
       # the CI test command matches pre-existing behavior; the imported
       # extensions code's use of the sdk is fully compile-checked.
+      #
+      # SHED_REQUIRE_SSHD=1: the remote transport's real-sshd leg
+      # (internal/remote/transport/sshlink) builds and runs an OpenSSH
+      # container. Without Docker it skips; here a skip is a failure, so the
+      # leg cannot silently stop running.
       - run: go test -v ./...
+        env:
+          SHED_REQUIRE_SSHD: "1"
 
   lint:
     needs: changes
