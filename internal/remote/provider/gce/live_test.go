@@ -121,5 +121,14 @@ func TestLiveReadOnly(t *testing.T) {
 		if err != nil || p.Want != provider.StateAbsent {
 			t.Errorf("destroy of a missing instance = %+v, %v", p, err)
 		}
+		if _, err := c.GuestHostKey(ctx, makeRef(c.Zone(), "shed-no-such-instance")); !errors.Is(err, provider.ErrNotFound) {
+			t.Errorf("GuestHostKey of a missing instance = %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("missing operation", func(t *testing.T) {
+		// 404, not 403, shows the role may wait on operations.
+		if _, err := c.waitOperation(ctx, "wait", c.Zone(), "operation-shed-no-such-op"); !errors.Is(err, errOpUnknown) {
+			t.Errorf("waitOperation of a missing operation = %v, want errOpUnknown", err)
+		}
 	})
 }
