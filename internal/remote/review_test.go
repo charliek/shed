@@ -690,3 +690,36 @@ func TestCapWriterKeepsOnlyTheFirstBytes(t *testing.T) {
 		t.Fatalf("kept %q, want the first 10 bytes", got)
 	}
 }
+
+// --- queued operations ---
+
+// An adopted shed whose agent cannot be reached stays "starting" while its VM
+// runs. A stop must still stop the VM: it is the only way, short of a delete,
+// to end what the VM costs.
+func TestStopOfAnUnreachableStartingShedStopsItsVM(t *testing.T) {
+	e := newEnv(t)
+	e.running("deaf")
+	if err := e.b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(e.dir); err != nil {
+		t.Fatal(err)
+	}
+	e.fl.failAlways("deaf", transport.ErrUnreachable)
+	e.b = e.open()
+	e.idle()
+	if got, why := e.status("deaf"), e.reason("deaf"); got != config.StatusStarting || why != config.StatusReasonUnreachable {
+		t.Fatalf("adopted shed is %q (%q), want starting (unreachable)", got, why)
+	}
+	if _, err := e.b.StopShed(ctxT(t), "deaf"); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	e.idle()
+	if got := e.status("deaf"); got != config.StatusStopped {
+		t.Fatalf("shed is %q after the stop, want stopped", got)
+	}
+	inst, err := e.prov.Get(context.Background(), e.ref("deaf"))
+	if err != nil || inst.State != provider.StateStopped {
+		t.Fatalf("instance is %q (%v) after the stop, want stopped", inst.State, err)
+	}
+}

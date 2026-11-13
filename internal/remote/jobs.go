@@ -186,7 +186,10 @@ func (b *Backend) nextStep(j *job) string {
 	r.Queued = ""
 	next := ""
 	switch {
-	case queued == state.QueuedStop && r.Shed.Status == config.StatusRunning:
+	case queued == state.QueuedStop && (r.Shed.Status == config.StatusRunning || r.Shed.Status == config.StatusStarting):
+		// "starting" here is a shed whose probe just failed: its VM runs
+		// and its agent cannot be reached. A stop that was asked for
+		// still stops the VM; nothing else short of a delete would.
 		r.Shed.Status = config.StatusStopping
 		r.Shed.StatusReason = ""
 		r.Job = state.JobStop
