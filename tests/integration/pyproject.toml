@@ -14,6 +14,7 @@ markers = [
     "vz: tests requiring the VZ backend (Apple Silicon mac with vfkit)",
     "fc: tests requiring the Firecracker backend (Linux/KVM, default mini3)",
     "slow: tests that take more than ~10 s wall-clock",
+    "local_vm_only(reason): a shed_server test only a local VM backend (vz, fc) can run; its [remote] case skips with this reason",
 ]
 addopts = "-ra --strict-markers"
 # Make repeated runs deterministic: tests pick unique shed names per node id.

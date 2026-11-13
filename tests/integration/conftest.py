@@ -4,7 +4,7 @@ Conventions:
     - `vz_server` / `fc_server` are session-scoped fixtures that detect
       backend availability and skip the dependent tests cleanly when the
       environment can't run them.
-    - `shed_server` is parameterized across `["vz", "fc"]` via
+    - `shed_server` is parameterized across `["vz", "fc", "remote"]` via
       `request.getfixturevalue(f"{request.param}_server")` so each
       sub-fixture is only instantiated when actually used.
     - `test_shed_name` allocates a unique per-test name and tears it down
@@ -15,6 +15,13 @@ Two environment overrides for non-default setups:
       server (default: `my-server`). Set empty, the `[vz]` cases skip
       (`make test-integration-dev-fc` does this).
     - `SHED_FC_HOST`   — SSH host for the FC server (default: `mini3`).
+
+The `remote` parameter (a server running `default_backend: remote`, where
+each shed is a cloud VM) is opt-in: it skips unless `SHED_REMOTE_SERVER`
+names a `~/.shed/config.yaml` entry (`make test-integration-remote` sets it).
+A test the remote backend cannot run carries
+`@pytest.mark.local_vm_only("<reason>")` and skips on `[remote]` with
+that reason, before any server is probed.
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.server import LocalServer, RemoteServer
+from fixtures.server import CloudServer, LocalServer, RemoteServer
 
 
 VZ_SERVER_NAME = os.environ.get("SHED_VZ_SERVER", "my-server")
@@ -59,6 +66,18 @@ FC_DEV_LOG_PATH = os.environ.get("SHED_FC_DEV_LOG_PATH", "")
 # PhaseTimer lines from the file (the dev FC server runs via sudo
 # nohup, not systemd, so journald has no records for it).
 FC_LOG_PATH = os.environ.get("SHED_FC_LOG_PATH", "")
+
+# The remote-backend server (`default_backend: remote`; each shed is a billed
+# cloud VM). Unset by default, so `make test-integration` never creates a
+# cloud VM: every `[remote]` case skips. `make test-integration-remote` sets
+# the entry name (default `remote-dev`) and the dev server's log file.
+# `SHED_REMOTE_IMAGE`, when set, is the image alias every create asks for;
+# unset, creates boot the server's `remote.default_image`.
+REMOTE_SERVER_NAME = os.environ.get("SHED_REMOTE_SERVER", "")
+REMOTE_LOG_PATH = os.environ.get(
+    "SHED_REMOTE_LOG_PATH", str(Path.home() / ".shed" / "dev-remote" / "server.log")
+)
+REMOTE_IMAGE = os.environ.get("SHED_REMOTE_IMAGE", "")
 
 
 # ----------------------------------------------------------------------------
@@ -125,14 +144,51 @@ def fc_server() -> RemoteServer:
     return s
 
 
-@pytest.fixture(params=["vz", "fc"])
+@pytest.fixture(scope="session")
+def remote_server() -> CloudServer:
+    """A shed-server running `default_backend: remote` (each shed is a
+    cloud VM), reached through the local CLI.
+
+    Skips unless `SHED_REMOTE_SERVER` names a `~/.shed/config.yaml` entry,
+    so no run creates a cloud VM by accident. `make test-integration-remote`
+    sets it (default `remote-dev`) together with `SHED_REMOTE_LOG_PATH`.
+    """
+    if not REMOTE_SERVER_NAME:
+        pytest.skip(
+            "SHED_REMOTE_SERVER not set: no remote-backend server for this run "
+            "(each remote shed is a billed cloud VM; run "
+            "`make test-integration-remote` to opt in)."
+        )
+    log_path = Path(REMOTE_LOG_PATH) if REMOTE_LOG_PATH else None
+    s = CloudServer(
+        name=REMOTE_SERVER_NAME,
+        log_path=log_path if log_path is not None and log_path.exists() else None,
+        image=REMOTE_IMAGE or None,
+    )
+    if not s.available():
+        pytest.skip(
+            f"remote-backend shed-server ({REMOTE_SERVER_NAME!r}) is not "
+            f"reachable; start it with `make dev-server-up-remote`."
+        )
+    return s
+
+
+@pytest.fixture(params=["vz", "fc", "remote"])
 def shed_server(request):
     """Parameterized across backends.
 
     `request.getfixturevalue` lazily instantiates only the requested
     sub-fixture, so each backend's skip-on-unavailable triggers only
     when that backend would actually have run.
+
+    On `[remote]`, a test marked `local_vm_only(reason)` skips with
+    that reason before the remote server is probed.
     """
+    if request.param == "remote":
+        marker = request.node.get_closest_marker("local_vm_only")
+        if marker is not None:
+            reason = marker.args[0] if marker.args else "not supported"
+            pytest.skip(f"not on the remote backend: {reason}")
     return request.getfixturevalue(f"{request.param}_server")
 
 
