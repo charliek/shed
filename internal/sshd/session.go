@@ -31,6 +31,9 @@ const (
 	containerReadyPollInterval = 250 * time.Millisecond
 )
 
+// readyTimeout is containerReadyTimeout as a var, so tests can shorten it.
+var readyTimeout = containerReadyTimeout
+
 // handleSession is the main session handler for SSH connections.
 func (s *Server) handleSession(sess ssh.Session) {
 	user := sess.User()
@@ -67,52 +70,10 @@ func (s *Server) handleSession(sess ssh.Session) {
 
 	ctx := sess.Context()
 
-	// Look up the shed.
-	shed, err := s.backend.GetShed(ctx, shedName)
+	// Look up the shed, waking it when it is stopped.
+	shed, err := s.ensureRunning(ctx, shedName, sess.Stderr(), true)
 	if err != nil {
-		log.Printf("Failed to get shed %s: %v", shedName, err)
-		fmt.Fprintf(sess.Stderr(), "Error: shed '%s' not found\n", shedName)
-		_ = sess.Exit(1)
-		return
-	}
-
-	// Auto-start if stopped.
-	if shed.Status == config.StatusStopped {
-		log.Printf("Auto-starting stopped shed: %s", shedName)
-		fmt.Fprintf(sess.Stderr(), "Starting shed '%s'...\n", shedName)
-
-		if _, err := s.backend.StartShed(ctx, shedName); err != nil {
-			log.Printf("Failed to start shed %s: %v", shedName, err)
-			fmt.Fprintf(sess.Stderr(), "Error: failed to start shed: %v\n", err)
-			_ = sess.Exit(1)
-			return
-		}
-	}
-
-	// Wait for a shed that is still starting up (either just auto-started above,
-	// or already mid-startup from another concurrent connection).
-	if shed.Status == config.StatusStopped || shed.Status == config.StatusStarting {
-		if err := s.waitForReady(ctx, shedName); err != nil {
-			log.Printf("Shed %s not ready: %v", shedName, err)
-			fmt.Fprintf(sess.Stderr(), "Error: shed not ready: %v\n", err)
-			_ = sess.Exit(1)
-			return
-		}
-
-		// Refresh shed info after starting.
-		shed, err = s.backend.GetShed(ctx, shedName)
-		if err != nil {
-			log.Printf("Failed to get shed %s after start: %v", shedName, err)
-			fmt.Fprintf(sess.Stderr(), "Error: failed to get shed after start: %v\n", err)
-			_ = sess.Exit(1)
-			return
-		}
-	}
-
-	// Verify the shed is running.
-	if shed.Status != config.StatusRunning {
-		log.Printf("Shed %s is not running (status: %s)", shedName, shed.Status)
-		fmt.Fprintf(sess.Stderr(), "Error: shed '%s' is not running (status: %s)\n", shedName, shed.Status)
+		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
 		_ = sess.Exit(1)
 		return
 	}
@@ -134,7 +95,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 
 // waitForReady polls until the container is ready or timeout.
 func (s *Server) waitForReady(ctx context.Context, shedName string) error {
-	deadline := time.Now().Add(containerReadyTimeout)
+	deadline := time.Now().Add(readyTimeout)
 	ticker := time.NewTicker(containerReadyPollInterval)
 	defer ticker.Stop()
 
