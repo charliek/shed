@@ -35,19 +35,27 @@ usage() {
 	exit 2
 }
 
+fail() { echo "gce-setup.sh: $*" >&2; exit 2; }
+
+# value FLAG [VALUE]: the flag's value, or exit 2 when the flag came last.
+value() {
+	[[ $# -ge 2 ]] || fail "$1 needs a value"
+	printf '%s' "$2"
+}
+
 print=0
 project="" env="" region="" source_range=""
 subnet_range="10.10.0.0/24" role_id="shedServer" key_out=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--print) print=1 ;;
-	--project) project=${2:-}; shift ;;
-	--env) env=${2:-}; shift ;;
-	--region) region=${2:-}; shift ;;
-	--source-range) source_range=${2:-}; shift ;;
-	--subnet-range) subnet_range=${2:-}; shift ;;
-	--role-id) role_id=${2:-}; shift ;;
-	--key-out) key_out=${2:-}; shift ;;
+	--project) project=$(value "$@") || exit 2; shift ;;
+	--env) env=$(value "$@") || exit 2; shift ;;
+	--region) region=$(value "$@") || exit 2; shift ;;
+	--source-range) source_range=$(value "$@") || exit 2; shift ;;
+	--subnet-range) subnet_range=$(value "$@") || exit 2; shift ;;
+	--role-id) role_id=$(value "$@") || exit 2; shift ;;
+	--key-out) key_out=$(value "$@") || exit 2; shift ;;
 	-h | --help) usage ;;
 	*) echo "gce-setup.sh: unknown argument: $1" >&2; usage ;;
 	esac
@@ -59,14 +67,23 @@ if [[ $print -ne 1 ]]; then
 	exit 2
 fi
 
-fail() { echo "gce-setup.sh: $*" >&2; exit 2; }
+# valid_cidr CIDR: a dotted IPv4 address with octets of 0-255 and a prefix
+# length of 0-32, with no leading zeros (so there is one spelling of each).
+valid_cidr() {
+	local octet='(0|[1-9][0-9]{0,2})' o
+	[[ $1 =~ ^$octet\.$octet\.$octet\.$octet/(0|[1-9][0-9]?)$ ]] || return 1
+	for o in "${BASH_REMATCH[@]:1:4}"; do
+		((o <= 255)) || return 1
+	done
+	((BASH_REMATCH[5] <= 32))
+}
+
 [[ $project =~ ^[a-z][-a-z0-9]{4,28}[a-z0-9]$ ]] || fail "--project: not a project ID: '$project'"
 [[ $env =~ ^[a-z]([-a-z0-9]{0,18}[a-z0-9])?$ ]] || fail "--env: 1-20 of a-z, 0-9, '-', starting with a letter: '$env'"
 [[ $region =~ ^[a-z]+-[a-z]+[0-9]+$ ]] || fail "--region: not a region (e.g. us-central1): '$region'"
-cidr='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
-[[ $source_range =~ $cidr ]] || fail "--source-range: not an IPv4 CIDR: '$source_range'"
-[[ $source_range != 0.0.0.0/0 ]] || fail "--source-range: 0.0.0.0/0 opens every shed to the internet; name the server's address"
-[[ $subnet_range =~ $cidr ]] || fail "--subnet-range: not an IPv4 CIDR: '$subnet_range'"
+valid_cidr "$source_range" || fail "--source-range: not an IPv4 CIDR: '$source_range'"
+[[ ${source_range##*/} != 0 ]] || fail "--source-range: a /0 range opens every shed to the internet; name the server's address"
+valid_cidr "$subnet_range" || fail "--subnet-range: not an IPv4 CIDR: '$subnet_range'"
 [[ $role_id =~ ^[a-zA-Z0-9_.]{3,64}$ ]] || fail "--role-id: 3-64 of letters, digits, '_' and '.': '$role_id'"
 key_out=${key_out:-./shed-$env-key.b64}
 [[ $key_out =~ ^[-A-Za-z0-9_./~]+$ ]] || fail "--key-out: use a plain path: '$key_out'"

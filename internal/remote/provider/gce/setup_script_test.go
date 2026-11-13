@@ -49,14 +49,29 @@ func TestSetupScript(t *testing.T) {
 			{"--env", "Dev"},
 			{"--env", "dev;rm -rf"},
 			{"--source-range", "0.0.0.0/0"},
+			{"--source-range", "0.0.0.0/00"},
+			{"--source-range", "192.0.2.0/0"},
 			{"--source-range", "192.0.2.10"},
+			{"--source-range", "999.0.2.10/32"},
+			{"--source-range", "192.0.2.10/33"},
+			{"--source-range", "192.0.02.10/32"},
+			{"--subnet-range", "10.10.0.0/40"},
+			{"--subnet-range", "10.256.0.0/24"},
+			// A flag that comes last with no value is a usage error, not a
+			// silent exit.
+			{"--key-out"},
+			{"--env"},
 			{"--project", "$(id)"},
 			{"--region", "us central"},
 		} {
 			args := append([]string{"--print"}, good...)
 			args = append(args, bad...)
-			if out, code := run(args...); code != 2 {
+			out, code := run(args...)
+			if code != 2 {
 				t.Errorf("%v: exit %d, want 2\n%s", bad, code, out)
+			}
+			if strings.Contains(out, "gcloud ") {
+				t.Errorf("%v: a refused run still printed commands", bad)
 			}
 		}
 	})
