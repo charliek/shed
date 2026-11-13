@@ -440,7 +440,7 @@ remote:
   provider: gce
   transport: ssh
   allow_test_drivers: false
-  environment: dev-mini4
+  environment: dev-one
   state_dir: ~/.shed/dev-remote/remote
   default_image: family/shed-extensions-amd64
   image_aliases: {cloud: family/shed-extensions-amd64}
