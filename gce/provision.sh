@@ -101,7 +101,23 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 # unattended-upgrades runs on a fresh VM; wait for its dpkg lock, not fail.
-apt_get() { apt-get -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confold "$@"; }
+# A download from the regional mirror can stall on an open connection (seen
+# on a real bake: no byte for minutes, no timeout), so each try is capped
+# and retried; apt keeps what it already fetched.
+apt_get() {
+  local try
+  for try in 1 2 3; do
+    if timeout --kill-after=10 600 apt-get -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confold \
+      -o Acquire::Retries=3 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60 "$@"; then
+      return 0
+    fi
+    echo "provision: apt-get $* failed (try ${try} of 3)" >&2
+    # A killed run can leave dpkg half-configured.
+    dpkg --configure -a || true
+    sleep 5
+  done
+  return 1
+}
 
 if [ "${live_systemd}" = yes ] && command -v cloud-init >/dev/null 2>&1; then
   log "waiting for cloud-init to finish"
