@@ -131,6 +131,14 @@ type Marker struct {
 	Ref  provider.Ref `json:"ref,omitempty"`
 	// At is when the delete was acknowledged.
 	At time.Time `json:"at"`
+	// Owner and CreatedAt are the deleted shed's, so a caller waiting for
+	// the VM to go can be checked against them once the record is gone.
+	Owner     string    `json:"owner,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	// KeepRecord marks the clean-up of a failed create: the VM is to be
+	// destroyed, and the shed's record (in status "error") stays until the
+	// shed itself is deleted.
+	KeepRecord bool `json:"keep_record,omitempty"`
 }
 
 // Store reads and writes records and markers. It does no locking: the

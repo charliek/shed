@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +30,9 @@ const (
 	// acknowledged.
 	findInsertAttempts = 6
 	findInsertInterval = 5 * time.Second
+
+	// cloneAttempts is how many times a create tries the --repo clone.
+	cloneAttempts = 3
 )
 
 // errSuperseded ends a job whose shed was deleted, or whose server is
@@ -59,9 +64,11 @@ type job struct {
 	fastWindow bool
 	fastErr    error
 
-	// marker and prior belong to a delete job.
+	// marker, prior and gone belong to a delete job. gone is set by the
+	// job's own goroutine when the instance no longer exists.
 	marker *state.Marker
 	prior  *job
+	gone   bool
 
 	emu    sync.Mutex
 	events []backend.ProgressEvent
@@ -179,7 +186,10 @@ func (b *Backend) nextStep(j *job) string {
 	r.Queued = ""
 	next := ""
 	switch {
-	case queued == state.QueuedStop && r.Shed.Status == config.StatusRunning:
+	case queued == state.QueuedStop && (r.Shed.Status == config.StatusRunning || r.Shed.Status == config.StatusStarting):
+		// "starting" here is a shed whose probe just failed: its VM runs
+		// and its agent cannot be reached. A stop that was asked for
+		// still stops the VM; nothing else short of a delete would.
 		r.Shed.Status = config.StatusStopping
 		r.Shed.StatusReason = ""
 		r.Job = state.JobStop
@@ -302,7 +312,7 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		}
 		backend.Phase(ctx, "repo")
 		backend.Status(ctx, "Cloning repository...")
-		if err := vmutil.CloneRepo(ctx, agent, b.opts.Server, repo, owned, []string{"GIT_TERMINAL_PROMPT=0"}); err != nil {
+		if err := b.cloneRepo(ctx, agent, rec, repo, owned); err != nil {
 			if ctx.Err() != nil {
 				return errSuperseded
 			}
@@ -351,7 +361,14 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 // failCreate records a failed create. Inside the fast-fail window a refusal
 // (quota, capacity, an invalid request) is handed to the create handler and
 // leaves no record; any other failure leaves the shed in status "error".
-// Unless the VM is kept for inspection it is destroyed.
+//
+// Unless the VM is kept for inspection it is destroyed, by a delete job
+// backed by a marker written here, in the same critical section as the
+// status: a destroy that fails, or a server that dies first, is retried by
+// the periodic pass and at the next start. The marker is written even when
+// the cloud gave no instance back, unless the cloud refused the request
+// outright: an insert whose reply was lost may still have made an instance,
+// and the delete job looks for it by shed ID.
 func (b *Backend) failCreate(j *job, cause error, reason string) error {
 	if j.ctx.Err() != nil {
 		return errSuperseded
@@ -359,6 +376,7 @@ func (b *Backend) failCreate(j *job, cause error, reason string) error {
 	if r := provider.Reason(cause); r != "" {
 		reason = r
 	}
+	refused := provider.IsRefusal(cause) || errors.Is(cause, provider.ErrInvalid)
 	b.mu.Lock()
 	rec := b.currentLocked(j.name, j.id)
 	if rec == nil {
@@ -366,15 +384,23 @@ func (b *Backend) failCreate(j *job, cause error, reason string) error {
 		return errSuperseded
 	}
 	ref := rec.Ref
-	removed := false
+	removed := j.fastWindow && refused
 	if j.fastWindow {
 		j.fastErr = cause
-		if provider.IsRefusal(cause) || errors.Is(cause, provider.ErrInvalid) {
-			b.dropLocked(j.name)
-			removed = true
+	}
+	var marker *state.Marker
+	if !b.opts.KeepFailedCreate && (ref != "" || !refused) {
+		marker = &state.Marker{
+			ID: j.id, Name: j.name, Env: rec.Env, Ref: ref, At: b.now().UTC(),
+			Owner: rec.Shed.Owner, CreatedAt: rec.Shed.CreatedAt, KeepRecord: !removed,
+		}
+		if err := b.saveMarkerLocked(marker); err != nil {
+			b.logf("remote: create of shed %s failed and its clean-up could not be recorded: %v", j.name, err)
 		}
 	}
-	if !removed {
+	if removed {
+		b.dropLocked(j.name)
+	} else {
 		rec.Shed.Status = config.StatusError
 		rec.Shed.StatusReason = reason
 		rec.Job = ""
@@ -387,24 +413,10 @@ func (b *Backend) failCreate(j *job, cause error, reason string) error {
 	b.logf("remote: create of shed %s failed (%s): %v", j.name, reason, cause)
 	b.credMgr.StopListener(j.name)
 	b.closeLink(j.id)
-	if ref != "" && !b.opts.KeepFailedCreate {
-		b.destroyQuietly(ref, j.id, "failed create of "+j.name)
+	if marker != nil {
+		b.startDelete(marker, nil)
 	}
 	return cause
-}
-
-// destroyQuietly destroys an instance on a bounded context of its own and
-// logs the outcome. The record, if any, is not touched.
-func (b *Backend) destroyQuietly(ref provider.Ref, id, why string) {
-	ctx, cancel := context.WithTimeout(b.rootCtx, cleanupTimeout)
-	defer cancel()
-	pend, err := b.mutate(ctx, ref, id, func() (provider.Pending, error) { return b.prov.Destroy(ctx, ref) })
-	if err == nil {
-		_, err = b.prov.Wait(ctx, pend)
-	}
-	if err != nil && !errors.Is(err, provider.ErrNotFound) {
-		b.logf("remote: destroying the instance of a %s: %v", why, err)
-	}
 }
 
 // noteInstance copies what the cloud reported about a started instance into
@@ -419,6 +431,57 @@ func (b *Backend) noteInstance(j *job, inst provider.Instance) {
 		}
 		r.Address = inst.Address
 		r.AddressAt = now
+	})
+}
+
+// cloneRepo clones the shed's repository through the agent. Each attempt runs
+// under its own deadline, and a failed attempt is retried a bounded number of
+// times: a guest's first clone can fail or hang while its network settles.
+// Git never prompts (GIT_TERMINAL_PROMPT=0), so a repository that needs
+// credentials the URL lacks fails at once instead of waiting on a terminal.
+// repo may carry credentials; it is never logged.
+func (b *Backend) cloneRepo(ctx context.Context, agent *vmutil.AgentClient, rec *state.Record, repo string, owned bool) error {
+	shown := config.SanitizeRepoURL(rec.Shed.Repo)
+	for attempt := 1; ; attempt++ {
+		actx, cancel := context.WithTimeout(ctx, b.opts.CloneTimeout)
+		err := b.clone(actx, agent, b.opts.Server, repo, owned, []string{"GIT_TERMINAL_PROMPT=0"})
+		timedOut := actx.Err() != nil && ctx.Err() == nil
+		cancel()
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+		if timedOut {
+			err = fmt.Errorf("no result within %s: %w", b.opts.CloneTimeout, err)
+		}
+		if attempt >= cloneAttempts {
+			return fmt.Errorf("after %d attempts: %w", attempt, err)
+		}
+		b.logf("remote: clone of %s into shed %s failed (attempt %d of %d); retrying in %s: %v",
+			shown, rec.Shed.Name, attempt, cloneAttempts, b.opts.CloneRetryPause, err)
+		backend.Status(ctx, fmt.Sprintf("Clone failed; retrying (attempt %d of %d)...", attempt+1, cloneAttempts))
+		b.removePartialClone(ctx, agent, repo)
+		select {
+		case <-time.After(b.opts.CloneRetryPause):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// removePartialClone removes what a failed clone left behind, so the next
+// attempt does not find a directory in its way. Best-effort.
+func (b *Backend) removePartialClone(ctx context.Context, agent *vmutil.AgentClient, repo string) {
+	dir, err := config.RepoDirName(repo)
+	if err != nil || strings.HasPrefix(dir, "-") {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	_ = agent.Exec(rctx, backend.ExecOptions{
+		Cmd:        []string{"rm", "-rf", "--", dir},
+		Stdout:     vmutil.NopWriteCloser(io.Discard),
+		Stderr:     vmutil.NopWriteCloser(io.Discard),
+		WorkingDir: config.HomePath,
 	})
 }
 
@@ -710,16 +773,22 @@ func (b *Backend) startDelete(marker *state.Marker, prior *job) {
 		defer func() {
 			cancel()
 			b.mu.Lock()
-			delete(b.deletes, marker.ID)
+			if j.gone {
+				if err := b.store.DeleteMarker(j.id); err != nil {
+					b.logf("remote: removing the delete marker of shed %s: %v", j.name, err)
+				}
+				delete(b.pending, j.id)
+			}
+			delete(b.deletes, j.id)
 			b.finishLocked()
 			b.mu.Unlock()
 			close(j.done)
 		}()
-		timer := backend.NewPhaseTimer(fmt.Sprintf("delete name=%s backend=%s", marker.Name, backend.TypeRemote), nil)
+		timer := backend.NewPhaseTimer(fmt.Sprintf("delete name=%s backend=%s", j.name, backend.TypeRemote), nil)
 		ctx := backend.ContextWithProgress(ctx, timer.Track)
 		err := b.runDelete(ctx, j)
 		if ctx.Err() != nil {
-			b.logf("remote: delete of shed %s ended early; its marker stands: %v", marker.Name, ctx.Err())
+			b.logf("remote: delete of shed %s ended early; its marker stands: %v", j.name, ctx.Err())
 			return
 		}
 		b.logf("timing: %s", timer.Finish(err))
@@ -745,10 +814,10 @@ func (b *Backend) runDelete(ctx context.Context, j *job) error {
 		// becomes visible within seconds.
 		found, err := b.findInstance(ctx, j.id)
 		if err != nil {
-			return err
+			return fmt.Errorf("%w (the marker stands and the delete is retried)", err)
 		}
 		if found == "" {
-			return b.clearMarker(j.id)
+			return j.finished()
 		}
 		ref = found
 	}
@@ -756,28 +825,32 @@ func (b *Backend) runDelete(ctx context.Context, j *job) error {
 	if err := b.markDeleting(ctx, ref, j.id); err != nil {
 		if errors.Is(err, provider.ErrForeign) {
 			b.logf("remote: delete of shed %s: %v; leaving the instance alone", j.name, err)
-			return b.clearMarker(j.id)
+			return j.finished()
 		}
 		b.logf("remote: delete of shed %s: labelling: %v", j.name, err)
 	}
 	pend, err := b.mutate(ctx, ref, j.id, func() (provider.Pending, error) { return b.prov.Destroy(ctx, ref) })
 	switch {
 	case errors.Is(err, provider.ErrNotFound):
-		return b.clearMarker(j.id)
+		return j.finished()
 	case errors.Is(err, provider.ErrForeign):
 		b.logf("remote: delete of shed %s: %v; leaving the instance alone", j.name, err)
-		return b.clearMarker(j.id)
+		return j.finished()
 	case err != nil:
-		return fmt.Errorf("destroying the instance of %s (the marker stands and the next start retries): %w", j.name, err)
+		return fmt.Errorf("destroying the instance of %s (the marker stands and the delete is retried): %w", j.name, err)
 	}
 	if _, err := b.prov.Wait(ctx, pend); err != nil && !errors.Is(err, provider.ErrNotFound) {
-		return fmt.Errorf("waiting for the instance of %s to go (the marker stands and the next start retries): %w", j.name, err)
+		return fmt.Errorf("waiting for the instance of %s to go (the marker stands and the delete is retried): %w", j.name, err)
 	}
-	return b.clearMarker(j.id)
+	return j.finished()
 }
 
-// findInstance looks for the instance carrying a shed ID.
+// findInstance looks for the instance carrying a shed ID. It returns "" only
+// when at least one complete list did not show it; when the cloud could not
+// be listed at all it returns the error, so the caller's marker stands.
 func (b *Backend) findInstance(ctx context.Context, id string) (provider.Ref, error) {
+	listed := false
+	var lastErr error
 	for attempt := 0; attempt < findInsertAttempts; attempt++ {
 		if attempt > 0 {
 			select {
@@ -791,13 +864,18 @@ func (b *Backend) findInstance(ctx context.Context, id string) (provider.Ref, er
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
+			lastErr = err
 			continue
 		}
+		listed = true
 		for _, inst := range insts {
 			if inst.Labels[provider.LabelID] == id {
 				return inst.Ref, nil
 			}
 		}
+	}
+	if !listed {
+		return "", fmt.Errorf("looking for the instance of shed id %s: %w", id, lastErr)
 	}
 	return "", nil
 }
@@ -811,8 +889,13 @@ func (b *Backend) findInterval() time.Duration {
 	return findInsertInterval
 }
 
-func (b *Backend) clearMarker(id string) error {
-	return b.store.DeleteMarker(id)
+// finished records that a delete job's instance is gone (or was never the
+// shed's own). The marker is removed as the job leaves Backend.deletes, in
+// one critical section, so a marker with no job is always one whose work is
+// still to do.
+func (j *job) finished() error {
+	j.gone = true
+	return nil
 }
 
 // --- the link to a shed's agent ---

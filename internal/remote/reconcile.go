@@ -8,6 +8,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/remote/guest"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/state"
 	"github.com/charliek/shed/internal/remote/transport"
@@ -30,8 +31,9 @@ const listRetry = 5 * time.Second
 //     on from what the cloud says now;
 //   - an instance with a local delete marker, or labelled
 //     shed_state=deleting, is destroyed. Nothing else is ever destroyed;
-//   - a record whose instance is gone is dropped, unless it is in "error" or
-//     its create had not reached the cloud yet;
+//   - a record whose instance is not in the list is dropped once a read of
+//     that one instance confirms it is gone, unless the record is in "error"
+//     or its create had not reached the cloud yet;
 //   - anything else is logged and left alone.
 func (b *Backend) Reconcile(ctx context.Context) {
 	var insts []provider.Instance
@@ -53,11 +55,12 @@ func (b *Backend) Reconcile(ctx context.Context) {
 			return
 		}
 	}
-	b.reconcile(insts)
+	b.reconcile(ctx, insts)
 	b.readyOnce.Do(func() { close(b.ready) })
+	b.startSweeper()
 }
 
-func (b *Backend) reconcile(insts []provider.Instance) {
+func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 	var report []string
 	note := func(format string, args ...any) {
 		line := fmt.Sprintf(format, args...)
@@ -78,8 +81,12 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 	var deletes []*state.Marker
 	var launch []*job
 	var resumeChannels []*state.Record
+	var confirm []sweepCheck
 
 	b.mu.Lock()
+	for _, m := range markers {
+		b.pending[m.ID] = m.At
+	}
 	recordIDs := make(map[string]string, len(b.records)) // shed ID -> name
 	for name, r := range b.records {
 		recordIDs[r.Shed.ID] = name
@@ -87,11 +94,25 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 
 	// A record that survived beside its own delete marker (the server died
 	// between the two writes) is dropped: the delete was acknowledged.
-	for id := range marked {
-		if name, ok := recordIDs[id]; ok {
-			b.dropLocked(name)
-			delete(recordIDs, id)
+	// The marker of a failed create's clean-up keeps the record, in
+	// "error": if the server died between the marker and the status, the
+	// status is written now.
+	for id, m := range marked {
+		name, ok := recordIDs[id]
+		if !ok {
+			continue
 		}
+		if m.KeepRecord {
+			if r := b.records[name]; r.Shed.Status != config.StatusError {
+				r.Shed.Status = config.StatusError
+				r.Shed.StatusReason = config.StatusReasonCreateFailed
+				r.Job, r.Queued, r.Pending = "", "", nil
+				b.saveLocked(r)
+			}
+			continue
+		}
+		b.dropLocked(name)
+		delete(recordIDs, id)
 	}
 
 	for _, inst := range insts {
@@ -117,7 +138,7 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 		}
 		if inst.ShedState() == provider.ShedStateDeleting {
 			m := &state.Marker{ID: id.ID, Name: id.Name, Env: id.Env, Ref: inst.Ref, At: b.now().UTC()}
-			if err := b.store.SaveMarker(m); err != nil {
+			if err := b.saveMarkerLocked(m); err != nil {
 				note("instance %s is labelled deleting but its marker could not be written: %v", inst.Name, err)
 				continue
 			}
@@ -171,8 +192,14 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 				// The create had not finished; it is sent again,
 				// and Create is idempotent.
 				launch = append(launch, b.newJobLocked(state.JobCreate, name, r.Shed.ID))
+			case r.Ref != "":
+				// Not in the list. That is not proof the instance is
+				// gone (a server restarted with another zone lists
+				// none of its sheds), so the one instance is read
+				// before the record is dropped.
+				confirm = append(confirm, sweepCheck{name: name, id: r.Shed.ID, ref: r.Ref, status: r.Shed.Status})
 			default:
-				note("shed %s (%s) has no instance in the cloud any more; dropping its record", name, r.Shed.ID)
+				note("shed %s (%s) never had an instance; dropping its record", name, r.Shed.ID)
 				b.dropLocked(name)
 			}
 			continue
@@ -198,11 +225,8 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 			case provider.StateRunning:
 				resumeChannels = append(resumeChannels, r.Clone())
 			case provider.StateStopped:
-				note("shed %s was running and the cloud reports it stopped; recording it stopped", name)
-				r.Shed.Status = config.StatusStopped
-				r.Shed.StatusReason = config.StatusReasonExternal
-				r.Address = ""
-				b.saveLocked(r)
+				b.recordStoppedLocked(r, inst)
+				note("shed %s was running and the cloud reports it stopped; recording it stopped (%s)", name, r.Shed.StatusReason)
 			case provider.StateStopping:
 				r.Shed.Status = config.StatusStopping
 				r.Job = state.JobStop
@@ -219,6 +243,10 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 	}
 	b.reported = report
 	b.mu.Unlock()
+
+	for _, c := range confirm {
+		b.correct(ctx, c)
+	}
 
 	for _, m := range markers {
 		b.startDelete(m, nil)
@@ -337,6 +365,15 @@ func (b *Backend) runProbe(ctx context.Context, j *job) error {
 		// Job stays JobProbe: a later start call, or the next server
 		// start, probes again and never restarts the instance.
 		b.update(j.name, j.id, func(r *state.Record) { r.Shed.StatusReason = reason })
+		return err
+	}
+	if !guest.ProtocolCompatible(info.Protocol) || !guest.LayoutSupported(info.Layout) {
+		// The instance runs an agent this server cannot drive. It is left
+		// as it is, and the shed is not reported running.
+		err := fmt.Errorf("the guest agent reports protocol %d and layout %d, which this server cannot drive", info.Protocol, info.Layout)
+		b.logf("remote: adopted shed %s cannot be used: %v", j.name, err)
+		b.closeLink(j.id)
+		b.update(j.name, j.id, func(r *state.Record) { r.Shed.StatusReason = config.StatusReasonUnreachable })
 		return err
 	}
 	rec = b.snapshot(j.name, j.id)

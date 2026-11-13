@@ -206,14 +206,20 @@ func ensureRunningShed(client *APIClient, name string) (*config.Shed, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get shed status: %w", err)
 	}
-	if shed, err = waitSettled(client, shed, os.Stderr); err != nil {
-		return nil, err
+	// Only a remote shed is waited on, or refused in status "error": a
+	// Firecracker or VZ shed in any status but running is started, exactly
+	// as before.
+	remote := shed.Backend == config.BackendRemote
+	if remote {
+		if shed, err = waitSettled(client, shed, os.Stderr); err != nil {
+			return nil, err
+		}
 	}
 
 	if shed.Status == config.StatusRunning {
 		return shed, nil
 	}
-	if shed.Status == config.StatusError {
+	if remote && shed.Status == config.StatusError {
 		return nil, fmt.Errorf("shed %s is %s; delete it and create it again", name, statusWithReason(*shed))
 	}
 

@@ -14,6 +14,26 @@ import (
 	"github.com/charliek/shed/internal/vmutil"
 )
 
+// maxGuestReply is the most guest output the server keeps in memory when it
+// reads a reply to act on. The guest controls what its commands print.
+const maxGuestReply = 1 << 20
+
+// capWriter keeps the first max bytes written to it and discards the rest,
+// reporting every write as complete so the command is not disturbed.
+type capWriter struct {
+	buf strings.Builder
+	max int
+}
+
+func (w *capWriter) Write(p []byte) (int, error) {
+	if room := w.max - w.buf.Len(); room > 0 {
+		w.buf.Write(p[:min(room, len(p))])
+	}
+	return len(p), nil
+}
+
+func (w *capWriter) String() string { return w.buf.String() }
+
 // running returns a copy of the record of a shed that is running, with the
 // caller's ownership requirements checked against it. Any other status is
 // config.ErrShedNotRunningSentinel, which the API answers with 409.
@@ -60,10 +80,10 @@ func (b *Backend) ListSessions(ctx context.Context, shedName string) ([]config.S
 	if err != nil {
 		return nil, err
 	}
-	var output strings.Builder
+	output := &capWriter{max: maxGuestReply}
 	err = agent.Exec(ctx, backend.ExecOptions{
 		Cmd:    []string{"tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_attached}:#{session_windows}"},
-		Stdout: vmutil.NopWriteCloser(&output),
+		Stdout: vmutil.NopWriteCloser(output),
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "no server running") {

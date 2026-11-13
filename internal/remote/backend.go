@@ -45,6 +45,22 @@ const (
 	cleanupTimeout = 3 * time.Minute
 	// closeGrace is how long Close waits for jobs to notice the shutdown.
 	closeGrace = 5 * time.Second
+	// DefaultCloneTimeout bounds one attempt at a create's --repo clone.
+	DefaultCloneTimeout = 5 * time.Minute
+	// DefaultCloneRetryPause is the pause between two clone attempts.
+	DefaultCloneRetryPause = 5 * time.Second
+	// DefaultSweepInterval is the time between two periodic passes.
+	DefaultSweepInterval = 60 * time.Second
+	// DefaultDeleteRetryAge is how old a delete marker with no job must be
+	// before the periodic pass retries it. A delete that was just
+	// acknowledged has its own job on the way.
+	DefaultDeleteRetryAge = 2 * time.Minute
+	// DefaultImageResolveTimeout bounds the image lookup a create makes
+	// before it saves anything. With the fast-fail window it keeps the JSON
+	// create's reply under the 30 s a client waits.
+	DefaultImageResolveTimeout = 10 * time.Second
+	// sweepTimeout bounds one periodic pass.
+	sweepTimeout = 2 * time.Minute
 	// localAuthorizedKey stands in for the server's public key when the
 	// transport needs none (the local link).
 	localAuthorizedKey = "none local-transport"
@@ -89,6 +105,19 @@ type Options struct {
 	// published host key. Default 6 s, which keeps under Google's limit on
 	// guest-attribute reads.
 	HostKeyPollInterval time.Duration
+	// CloneTimeout bounds one attempt at a create's --repo clone and
+	// CloneRetryPause is the pause before the next attempt.
+	CloneTimeout    time.Duration
+	CloneRetryPause time.Duration
+	// SweepInterval is the time between two periodic passes (see Sweep).
+	// Default 60 s; a negative value turns the periodic pass off.
+	SweepInterval time.Duration
+	// DeleteRetryAge is how old a delete marker with no job must be before
+	// the periodic pass retries it. Default 2 minutes.
+	DeleteRetryAge time.Duration
+	// ImageResolveTimeout bounds the image lookup a create makes before it
+	// saves anything. Default 10 s.
+	ImageResolveTimeout time.Duration
 	// Logf receives the backend's log lines. Default log.Printf.
 	Logf func(format string, args ...any)
 	// Now is the clock for record timestamps. Default time.Now.
@@ -106,6 +135,9 @@ type Backend struct {
 	credMgr *vmutil.CredentialManager
 	logf    func(format string, args ...any)
 	now     func() time.Time
+	// clone runs one attempt at a create's --repo clone. It is
+	// vmutil.CloneRepo; tests replace it.
+	clone func(ctx context.Context, agent *vmutil.AgentClient, serverCfg *config.ServerConfig, repo string, owned bool, extraEnv []string) error
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -113,12 +145,14 @@ type Backend struct {
 
 	ready     chan struct{}
 	readyOnce sync.Once
+	sweepOnce sync.Once
 
 	mu       sync.Mutex
 	closed   bool
 	records  map[string]*state.Record // by shed name
 	jobs     map[string]*job          // lifecycle job in flight, by shed name
 	deletes  map[string]*job          // delete job in flight, by shed ID
+	pending  map[string]time.Time     // delete markers on disk: shed ID -> when acknowledged
 	conns    map[string]*shedLink     // by shed ID
 	idle     chan struct{}            // closed and replaced whenever a job ends
 	reported []string                 // what the last reconcile pass reported
@@ -164,6 +198,21 @@ func New(opts Options) (*Backend, error) {
 	if opts.HostKeyPollInterval <= 0 {
 		opts.HostKeyPollInterval = guestAttrInterval
 	}
+	if opts.CloneTimeout <= 0 {
+		opts.CloneTimeout = DefaultCloneTimeout
+	}
+	if opts.CloneRetryPause <= 0 {
+		opts.CloneRetryPause = DefaultCloneRetryPause
+	}
+	if opts.SweepInterval == 0 {
+		opts.SweepInterval = DefaultSweepInterval
+	}
+	if opts.DeleteRetryAge <= 0 {
+		opts.DeleteRetryAge = DefaultDeleteRetryAge
+	}
+	if opts.ImageResolveTimeout <= 0 {
+		opts.ImageResolveTimeout = DefaultImageResolveTimeout
+	}
 	if opts.Logf == nil {
 		opts.Logf = log.Printf
 	}
@@ -193,12 +242,14 @@ func New(opts Options) (*Backend, error) {
 		credMgr:    vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
 		logf:       opts.Logf,
 		now:        opts.Now,
+		clone:      vmutil.CloneRepo,
 		rootCtx:    ctx,
 		rootCancel: cancel,
 		ready:      make(chan struct{}),
 		records:    make(map[string]*state.Record),
 		jobs:       make(map[string]*job),
 		deletes:    make(map[string]*job),
+		pending:    make(map[string]time.Time),
 		conns:      make(map[string]*shedLink),
 		idle:       make(chan struct{}),
 	}
@@ -333,6 +384,15 @@ func (b *Backend) saveLocked(r *state.Record) {
 	if err := b.store.SaveRecord(r); err != nil {
 		b.logf("remote: saving the record of shed %s: %v", r.Shed.Name, err)
 	}
+}
+
+// saveMarkerLocked writes a delete marker and notes it as pending.
+func (b *Backend) saveMarkerLocked(m *state.Marker) error {
+	if err := b.store.SaveMarker(m); err != nil {
+		return err
+	}
+	b.pending[m.ID] = m.At
+	return nil
 }
 
 // dropLocked removes a record from memory and disk.

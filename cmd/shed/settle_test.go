@@ -60,7 +60,12 @@ func shortSettle(t *testing.T, timeout time.Duration) {
 }
 
 func sh(status, reason string) config.Shed {
-	return config.Shed{Name: "a1", Status: status, StatusReason: reason}
+	return config.Shed{Name: "a1", Backend: config.BackendRemote, Status: status, StatusReason: reason}
+}
+
+// local is a Firecracker shed in the given status.
+func local(status string) config.Shed {
+	return config.Shed{Name: "a1", Backend: config.BackendFirecracker, Status: status}
 }
 
 func TestWaitSettled(t *testing.T) {
@@ -117,6 +122,10 @@ func TestEnsureRunningShedSettles(t *testing.T) {
 		{name: "start refused names the reason", startStatus: config.StatusStarting,
 			seq: []config.Shed{sh(config.StatusStopped, ""), sh(config.StatusStopped, config.StatusReasonCapacity)}, wantStarts: 1, wantErr: "stopped (capacity)"},
 		{name: "error shed is not started", seq: []config.Shed{sh(config.StatusError, config.StatusReasonHostKey)}, wantErr: "error (host_key)"},
+		// Firecracker and VZ are unchanged: any status but running is
+		// started at once, with no wait and no refusal.
+		{name: "local starting shed is started, not waited on", startStatus: config.StatusRunning, seq: []config.Shed{local(config.StatusStarting)}, wantStarts: 1},
+		{name: "local error shed is started", startStatus: config.StatusRunning, seq: []config.Shed{local(config.StatusError)}, wantStarts: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

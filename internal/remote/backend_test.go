@@ -176,6 +176,11 @@ type env struct {
 	logMu sync.Mutex
 	logs  []string
 
+	// wrap, when set, wraps the provider the backend is given.
+	wrap func(provider.Provider) provider.Provider
+	// tune, when set, edits the backend's options.
+	tune func(*Options)
+
 	autoStop chan struct{}
 	autoDone chan struct{}
 }
@@ -240,9 +245,13 @@ func (e *env) logLines() []string {
 // and runs its start-up pass.
 func (e *env) open() *Backend {
 	e.t.Helper()
-	b, err := New(Options{
+	var prov provider.Provider = e.prov
+	if e.wrap != nil {
+		prov = e.wrap(e.prov)
+	}
+	o := Options{
 		Config:              e.cfg,
-		Provider:            e.prov,
+		Provider:            prov,
 		Links:               e.links,
 		StateDir:            e.dir,
 		AuthorizedKeys:      []string{testKey},
@@ -251,8 +260,17 @@ func (e *env) open() *Backend {
 		AuthGrace:           300 * time.Millisecond,
 		ProbeInterval:       5 * time.Millisecond,
 		HostKeyPollInterval: 20 * time.Millisecond,
-		Logf:                e.logf,
-	})
+		CloneRetryPause:     time.Millisecond,
+		// The periodic pass runs only when a test calls Sweep, and a delete
+		// marker with no job is retried whatever its age.
+		SweepInterval:  -1,
+		DeleteRetryAge: time.Nanosecond,
+		Logf:           e.logf,
+	}
+	if e.tune != nil {
+		e.tune(&o)
+	}
+	b, err := New(o)
 	if err != nil {
 		e.t.Fatalf("New: %v", err)
 	}
@@ -465,14 +483,25 @@ func TestCallTable(t *testing.T) {
 				if sheds, _ := e.b.ListSheds(ctx); len(sheds) != 0 {
 					t.Fatalf("ListSheds right after delete = %d sheds, want 0", len(sheds))
 				}
+				// WaitSettled lasts until the VM is gone, then reports the
+				// shed not found. The provider is manual, so while an
+				// instance exists the delete cannot have finished.
+				if insts, _ := e.prov.List(ctx, provider.Selector{}); len(insts) != 0 {
+					short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+					_, err := e.b.WaitSettled(short, name)
+					cancel()
+					if !errors.Is(err, context.DeadlineExceeded) {
+						t.Fatalf("WaitSettled while the VM still exists = %v, want it to block", err)
+					}
+				}
+				e.auto()
 				if _, err := e.b.WaitSettled(ctx, name); !errors.Is(err, config.ErrShedNotFoundSentinel) {
 					t.Fatalf("WaitSettled after delete = %v, want not found", err)
 				}
-				e.auto()
-				e.idle()
 				if insts, _ := e.prov.List(ctx, provider.Selector{}); len(insts) != 0 {
-					t.Fatalf("%d instances left after the delete finished", len(insts))
+					t.Fatalf("%d instances left when WaitSettled reported the shed gone", len(insts))
 				}
+				e.idle()
 				if n := markerCount(t, e.dir); n != 0 {
 					t.Fatalf("%d delete markers left after the delete finished", n)
 				}

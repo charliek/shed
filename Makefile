@@ -694,7 +694,9 @@ dev-server-restart-fc: dev-server-down-fc dev-server-up-fc
 SHED_REMOTE_ENV_FILE    ?= $(HOME)/.config/shed/remote-dev/env
 SHED_REMOTE_DEV_SERVER  ?= remote-dev
 # The GitHub account whose SSH keys may enrol a CLI against the dev server.
-SHED_REMOTE_GITHUB_USER ?= charliek
+# No account is named here: the default is the owner of this checkout's
+# origin remote. Set it in the environment, or in the env file, to override.
+SHED_REMOTE_GITHUB_USER ?= $(shell git remote get-url origin 2>/dev/null | sed -nE 's|^.*github\.com[:/]([^/]+)/[^/]+$$|\1|p')
 REMOTE_DEV_DIR          := $(HOME)/.shed/dev-remote
 REMOTE_DEV_TEMPLATE     := $(CURDIR)/configs/server.dev-remote.yaml.tmpl
 REMOTE_DEV_CONFIG       := $(REMOTE_DEV_DIR)/server.yaml
@@ -727,10 +729,15 @@ dev-server-up-remote: build-server build-cli
 	  echo "ERROR: $(SHED_REMOTE_ENV_FILE) does not set SHED_REMOTE_ENV (the environment name)."; \
 	  exit 1; \
 	fi; \
+	GITHUB_USER="$${SHED_REMOTE_GITHUB_USER:-$(SHED_REMOTE_GITHUB_USER)}"; \
+	if [ -z "$$GITHUB_USER" ]; then \
+	  echo "ERROR: set SHED_REMOTE_GITHUB_USER (the GitHub account whose SSH keys may enrol a CLI)."; \
+	  exit 1; \
+	fi; \
 	umask 077; \
 	sed -e "s|@DEV_REMOTE_DIR@|$(REMOTE_DEV_DIR)|g" \
 	    -e "s|@SHED_REMOTE_ENV@|$$SHED_REMOTE_ENV|g" \
-	    -e "s|@GITHUB_USER@|$(SHED_REMOTE_GITHUB_USER)|g" \
+	    -e "s|@GITHUB_USER@|$$GITHUB_USER|g" \
 	    "$(REMOTE_DEV_TEMPLATE)" > "$(REMOTE_DEV_CONFIG)" || exit 1; \
 	echo "=== dev-server-up-remote $$(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$(REMOTE_DEV_LOG_PATH)"; \
 	START_LINE=$$(wc -l < "$(REMOTE_DEV_LOG_PATH)"); \
