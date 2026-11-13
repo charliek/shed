@@ -181,9 +181,14 @@ func (s *Server) handleHealthRequest(conn net.Conn, env *plugin.Envelope) {
 	}
 	// Written under msgMu: on a promoted connection the heartbeat goroutine
 	// writes too, and a frame is two writes, so unserialised writes could
-	// interleave.
+	// interleave. The write is bounded like sendPluginMessage's: msgMu also
+	// guards msgConn, so a host that stopped reading must not be able to
+	// hold it (and with it every sender and the next connection's
+	// promotion) for longer than writeTimeout.
 	s.msgMu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	err = writeMessage(conn, MsgTypePluginMessage, data)
+	_ = conn.SetWriteDeadline(time.Time{})
 	s.msgMu.Unlock()
 	if err != nil {
 		log.Printf("Failed to write health response: %v", err)

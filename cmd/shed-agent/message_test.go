@@ -322,3 +322,55 @@ func TestNotifyProbeDuringLiveChannelKeepsHeartbeats(t *testing.T) {
 	}
 	waitFor(t, msgs, "heartbeat after probes", isHeartbeat)
 }
+
+// deadlineConn records the write deadline in force at each Write.
+type deadlineConn struct {
+	net.Conn
+	deadline time.Time
+	atWrite  []time.Time
+}
+
+func (c *deadlineConn) SetWriteDeadline(t time.Time) error {
+	c.deadline = t
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *deadlineConn) Write(p []byte) (int, error) {
+	c.atWrite = append(c.atWrite, c.deadline)
+	return c.Conn.Write(p)
+}
+
+// The health reply is written under msgMu, which also guards msgConn. A host
+// that stopped reading must not hold that lock without bound, so the write
+// has a deadline, and the deadline is cleared afterwards.
+func TestHealthReplyWriteIsBounded(t *testing.T) {
+	s := newMessageTestServer(t)
+	host, agent := unixPair(t)
+	conn := &deadlineConn{Conn: agent}
+
+	req := healthRequest(t, nil)
+	before := time.Now()
+	s.handleHealthRequest(conn, req)
+
+	if len(conn.atWrite) == 0 {
+		t.Fatal("no reply was written")
+	}
+	for i, d := range conn.atWrite {
+		if d.IsZero() {
+			t.Fatalf("write %d had no deadline", i)
+		}
+		if d.Before(before) || d.After(time.Now().Add(writeTimeout)) {
+			t.Errorf("write %d deadline %v is not within writeTimeout of now", i, d)
+		}
+	}
+	if !conn.deadline.IsZero() {
+		t.Errorf("the write deadline was left set (%v); later writes on the channel would inherit it", conn.deadline)
+	}
+	resp, err := readEnvelope(t, host, 2*time.Second)
+	if err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if resp.InReplyTo != req.ID {
+		t.Errorf("in_reply_to = %q, want %q", resp.InReplyTo, req.ID)
+	}
+}
