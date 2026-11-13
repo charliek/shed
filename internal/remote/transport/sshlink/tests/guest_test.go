@@ -27,6 +27,9 @@ import (
 //	SHED_LINK_HOST_KEY='ssh-ed25519 AAAA...' \
 //	go test ./internal/remote/transport/sshlink/tests -run TestLiveGuest -count=1 -v
 //
+// SHED_LINK_GUEST_RUN=<bash script> runs one more command as shed and logs its
+// output, for looking around.
+//
 // SHED_LINK_GUEST_MARK=<text> also writes /home/shed/.shed-live-mark with that
 // text when absent and reports it, so a stop and start can show the disk kept
 // it.
@@ -101,6 +104,11 @@ func TestLiveGuest(t *testing.T) {
 				t.Errorf("err %v, output %q", err, out)
 			}
 		})
+	}
+
+	if script := os.Getenv("SHED_LINK_GUEST_RUN"); script != "" {
+		out, err := run(script)
+		t.Logf("SHED_LINK_GUEST_RUN: err %v\n%s", err, out)
 	}
 
 	if mark := os.Getenv("SHED_LINK_GUEST_MARK"); mark != "" {
