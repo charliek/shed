@@ -60,10 +60,27 @@ type Credentials struct {
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
 
+	// mu guards tok, exp and minting. It is never held across the token
+	// exchange, so a caller whose context ends is not kept waiting on one.
 	mu  sync.Mutex
 	tok string
 	exp time.Time
+	// minting is non-nil while one caller is at the token endpoint; it is
+	// closed when that exchange ends, whatever its outcome.
+	minting chan struct{}
 }
+
+// String keeps the cached token and the key out of anything that prints a
+// Credentials with %v, %+v or %s.
+func (c *Credentials) String() string {
+	if c == nil || c.key == nil {
+		return "gce.Credentials(none)"
+	}
+	return "gce.Credentials(" + c.key.ClientEmail + ")"
+}
+
+// GoString does the same for %#v.
+func (c *Credentials) GoString() string { return c.String() }
 
 type serviceAccountKey struct {
 	Type         string `json:"type"`
@@ -198,19 +215,51 @@ func (c *Credentials) Email() string { return c.key.ClientEmail }
 // ProjectID returns the project the key was issued in, as the key file says.
 func (c *Credentials) ProjectID() string { return c.key.ProjectID }
 
-// Token implements TokenSource.
+// Token implements TokenSource. One caller at a time trades the key for a
+// token; the others wait for it, each only as long as its own context lasts.
+// A failed exchange is reported to the caller that made it, and the next
+// waiter tries again.
 func (c *Credentials) Token(ctx context.Context) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := c.now()
-	if c.tok != "" && c.exp.Sub(now) > tokenRefreshMargin {
-		return c.tok, nil
+	for {
+		c.mu.Lock()
+		now := c.now()
+		if c.tok != "" && c.exp.Sub(now) > tokenRefreshMargin {
+			tok := c.tok
+			c.mu.Unlock()
+			return tok, nil
+		}
+		if wait := c.minting; wait != nil {
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-wait:
+			}
+			continue
+		}
+		done := make(chan struct{})
+		c.minting = done
+		c.mu.Unlock()
+		return c.exchange(ctx, now, done)
 	}
-	tok, exp, err := c.mint(ctx, now)
+}
+
+// exchange mints a token, stores it, and releases the waiters.
+func (c *Credentials) exchange(ctx context.Context, now time.Time, done chan struct{}) (tok string, err error) {
+	var exp time.Time
+	defer func() {
+		c.mu.Lock()
+		if err == nil {
+			c.tok, c.exp = tok, exp
+		}
+		c.minting = nil
+		c.mu.Unlock()
+		close(done)
+	}()
+	tok, exp, err = c.mint(ctx, now)
 	if err != nil {
 		return "", err
 	}
-	c.tok, c.exp = tok, exp
 	return tok, nil
 }
 
