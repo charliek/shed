@@ -59,24 +59,32 @@ func handleTCPProxyConnection(conn net.Conn) {
 
 	// Bidirectional copy. Uses reader (not conn directly) for client->target
 	// to drain any data buffered during the CONNECT handshake read.
+	//
+	// Each direction half-closes its destination when its source ends, so
+	// an end-of-file crosses the proxy in both directions without a full
+	// close. Host-side conns are vsock (vsock.Conn) or unix (net.UnixConn);
+	// both have CloseWrite, as does the TCP target.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(targetConn, reader)
-		if tc, ok := targetConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
+		closeWrite(targetConn)
 	}()
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(conn, targetConn)
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
+		closeWrite(conn)
 	}()
 	wg.Wait()
 	targetConn.Close()
+}
+
+// closeWrite shuts down the write side of c when c supports it.
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
 }
 
 func writeProxyErr(conn net.Conn, msg string) {

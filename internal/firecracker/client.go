@@ -1193,10 +1193,11 @@ func (c *Client) vmmTeardown(name string, pid int, teardownErr error) vmmVerdict
 // unreachable via connect/{port} — none exist in-tree; sshd and user services
 // bind 0.0.0.0, which the proxy reaches via loopback all the same.
 //
-// Semantic delta vs the old bridge dial: half-close/EOF does not propagate
-// through the tcpproxy until full close (guest-side tcpproxy CloseWrite asserts
-// *net.TCPConn, which fails for the vsock.Conn it holds). This matches VZ; a
-// guest-side fix is deferred (it needs an image rebuild).
+// Half-close: the guest-side tcpproxy calls CloseWrite on any conn that has
+// it, vsock.Conn included, so a guest service's EOF reaches the host before
+// full close. Images whose agent predates that fix only asserted *net.TCPConn
+// (never true for vsock), so on them EOF arrives only at full close, as on VZ
+// with the same agent.
 func (c *Client) DialService(ctx context.Context, name string, port uint16) (net.Conn, error) {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
