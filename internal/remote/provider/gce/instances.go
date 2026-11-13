@@ -118,11 +118,13 @@ type gceInstance struct {
 // mapState turns a GCE status into a provider.State.
 func mapState(status string) provider.State {
 	switch status {
-	case "PROVISIONING", "STAGING":
+	case "PENDING", "PROVISIONING", "STAGING":
 		return provider.StateStarting
 	case "RUNNING":
 		return provider.StateRunning
-	case "STOPPING", "SUSPENDING":
+	case "PENDING_STOP", "STOPPING", "SUSPENDING", "DEPROVISIONING":
+		// PENDING_STOP is a graceful shutdown under way; DEPROVISIONING is
+		// the tear-down after the VM has halted.
 		return provider.StateStopping
 	case "TERMINATED", "STOPPED":
 		return provider.StateStopped
@@ -484,13 +486,20 @@ func (c *Client) Create(ctx context.Context, spec provider.Spec) (provider.Pendi
 			return provider.Pending{}, provider.Errorf(provider.ErrInvalid, "create", "metadata key %q is reserved", k)
 		}
 	}
+	// Metadata is readable by every process in the guest and by anyone who
+	// may read the instance. provider.NewSpec strips repo credentials; a
+	// Spec built another way must not get them past this point.
+	if shed, err := provider.DecodeShedSpec(spec.Metadata[provider.MetadataShedSpec]); err == nil && provider.StripRepoUserinfo(shed.Repo) != shed.Repo {
+		return provider.Pending{}, provider.Errorf(provider.ErrInvalid, "create", "metadata %s holds a repo URL with credentials", provider.MetadataShedSpec)
+	}
 	ref := makeRef(c.cfg.Zone, spec.Name)
 	o, err := c.mutate(ctx, "create", http.MethodPost, c.zonePath(c.cfg.Zone)+"instances", nil, c.buildInsert(spec))
 	if errors.Is(err, provider.ErrExists) {
 		g, gerr := c.getRaw(ctx, "create", c.cfg.Zone, spec.Name)
 		if errors.Is(gerr, provider.ErrNotFound) {
-			// Deleted in between; the caller retries.
-			return provider.Pending{}, err
+			// Deleted in between. The name is not taken, so this is not
+			// ErrExists: the outcome is unknown and the caller retries.
+			return provider.Pending{}, provider.Errorf(nil, "create", "%s existed when the insert was refused and is gone now; try again", spec.Name)
 		}
 		if gerr != nil {
 			return provider.Pending{}, gerr
@@ -614,7 +623,13 @@ func (c *Client) Wait(ctx context.Context, p provider.Pending) (provider.Instanc
 		case err != nil:
 			return provider.Instance{}, err
 		default:
-			if ferr := o.failure("wait"); ferr != nil {
+			ferr := o.failure("wait")
+			if p.Want == provider.StateAbsent && errors.Is(ferr, provider.ErrNotFound) {
+				// A delete that found nothing to delete (another delete got
+				// there first) is the outcome that was asked for.
+				ferr = nil
+			}
+			if ferr != nil {
 				return provider.Instance{}, ferr
 			}
 		}

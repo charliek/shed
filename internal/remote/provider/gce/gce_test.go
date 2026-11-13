@@ -897,6 +897,9 @@ func TestStateMapping(t *testing.T) {
 		"PROVISIONING": provider.StateStarting, "STAGING": provider.StateStarting,
 		"RUNNING": provider.StateRunning, "STOPPING": provider.StateStopping,
 		"SUSPENDING": provider.StateStopping, "TERMINATED": provider.StateStopped,
+		"STOPPED": provider.StateStopped,
+		// Statuses in the Compute v1 enum that the lifecycle page also names.
+		"PENDING": provider.StateStarting, "PENDING_STOP": provider.StateStopping, "DEPROVISIONING": provider.StateStopping,
 		"SUSPENDED": provider.StateUnknown, "REPAIRING": provider.StateUnknown, "": provider.StateUnknown,
 	}
 	for in, want := range cases {
