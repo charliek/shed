@@ -190,7 +190,7 @@ func TestCreateWithLostReplyIsCleanedUp(t *testing.T) {
 					return provider.Pending{}, err
 				}
 				for range tt.listFails {
-					h.Provider.FailNext(fake.OpList, errors.New("list failed"))
+					h.FailNext(fake.OpList, errors.New("list failed"))
 				}
 				return provider.Pending{}, errors.New("the reply was lost")
 			}
