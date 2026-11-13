@@ -656,3 +656,37 @@ func TestDeleteInFlightFreesItsRunSlot(t *testing.T) {
 		t.Fatalf("settled %q", got.Status)
 	}
 }
+
+// --- secrets and guest output ---
+
+// A repository URL with no path makes git's directory name out of the URL's
+// authority, credentials included. It must never become the landing
+// directory (which is stored and written to instance metadata) or be echoed.
+func TestCreateRefusesARepoWhoseDirectoryNameWouldHoldCredentials(t *testing.T) {
+	const secret = "s3kr1t-token"
+	for _, repo := range []string{"https://builder:" + secret + "@git.example.com", "https://" + secret + "@git.example.com/"} {
+		e := newEnv(t)
+		_, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: "leaky", NoProvision: true, Repo: repo})
+		if !errors.Is(err, config.ErrInvalidShedRequestSentinel) {
+			t.Fatalf("create with repo %q = %v, want an invalid request", strings.ReplaceAll(repo, secret, "<secret>"), err)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("the refusal echoes the credentials: %v", err)
+		}
+		if n := e.instances(); n != 0 {
+			t.Fatalf("%d instances created", n)
+		}
+	}
+}
+
+func TestCapWriterKeepsOnlyTheFirstBytes(t *testing.T) {
+	w := &capWriter{max: 10}
+	for _, chunk := range []string{"0123", "4567", "89ab", "cdef"} {
+		if n, err := w.Write([]byte(chunk)); n != len(chunk) || err != nil {
+			t.Fatalf("Write(%q) = %d, %v; want the whole chunk accepted", chunk, n, err)
+		}
+	}
+	if got := w.String(); got != "0123456789" {
+		t.Fatalf("kept %q, want the first 10 bytes", got)
+	}
+}

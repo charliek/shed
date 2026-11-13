@@ -103,16 +103,20 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		}
 	}
 	repoURL := httpsRepoURL(req.Repo)
+	// Everything that is stored, labelled or reported is derived from the
+	// URL with its user and password removed; only the clone sees repoURL.
+	storedRepo := provider.StripRepoUserinfo(repoURL)
 	landingDir := ""
 	if repoURL != "" {
 		dir, err := config.RepoDirName(repoURL)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", config.ErrInvalidShedRequestSentinel, err)
+		if err != nil || strings.Contains(dir, "@") {
+			// The name git would clone into is not a usable one (a URL
+			// with no path yields its authority, credentials included).
+			return nil, fmt.Errorf("%w: cannot derive a directory name from repository URL %q", config.ErrInvalidShedRequestSentinel, storedRepo)
 		}
 		landingDir = config.HomePath + "/" + dir
 	}
 	createdAt := b.now().UTC().Round(0)
-	storedRepo := provider.StripRepoUserinfo(repoURL)
 	maxRun := b.runLimit(req.Owner)
 
 	spec, err := provider.NewSpec(
