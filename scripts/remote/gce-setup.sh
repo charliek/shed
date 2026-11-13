@@ -148,8 +148,8 @@ gcloud compute networks subnets create $name --project="\$PROJECT" \\
 
 ########################################################################
 # 3. The one ingress rule: tcp:22 from the shed-server only, to instances
-#    tagged $name. The server checks this rule at start-up and never
-#    creates or deletes rules itself.
+#    tagged $name. The server never creates, changes or deletes rules
+#    itself (its role can only list them), so keep the source range current.
 ########################################################################
 gcloud compute firewall-rules create $rule --project="\$PROJECT" \\
   --network=$name --direction=INGRESS --priority=1000 --action=ALLOW \\
