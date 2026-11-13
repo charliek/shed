@@ -51,7 +51,7 @@ Create the SSH key the server uses to log in to every VM:
 
 ```bash
 mkdir -p ~/.config/shed/remote-dev && chmod 700 ~/.config/shed/remote-dev
-ssh-keygen -t ed25519 -N '' -C shed-remote-dev -f ~/.config/shed/remote-dev/link_ed25519
+ssh-keygen -t ed25519 -N '' -C shed-remote-link -f ~/.config/shed/remote-dev/link_ed25519
 ```
 
 ## The private env file
@@ -142,7 +142,7 @@ gcloud compute instances list --project <project-id> --filter='labels.shed_env=<
 gcloud compute disks list --project <project-id> --filter='labels.shed_env=<env-name>'
 ```
 
-Both `gcloud` lists must be empty once every shed is deleted. A delete returns at once and destroys the VM in the background (about 30 s), so a VM can show for a short while after `shed delete`. A destroy that fails is retried only when the server next starts. A VM that should not exist can be deleted with `gcloud compute instances delete`; the server then forgets its record at its next start.
+Both `gcloud` lists must be empty once every shed is deleted. `shed delete` returns only when the VM is gone (about 30 s); a JSON `DELETE` through the API answers in about 3 s and the VM goes in the background, so it can show for a short while. A destroy that fails is retried by the server's periodic pass, which runs once a minute. A VM that should not exist can be deleted with `gcloud compute instances delete`; the server forgets its record at the next pass.
 
 Every VM also carries a maximum run duration (the larger of `remote.max_run_duration`, 24 h in the dev config, and the owning client's `max_age`), after which the cloud stops it. A stopped VM still bills for its disk.
 
@@ -155,20 +155,24 @@ make test-integration-remote                                          # every [r
 make test-integration-remote PYTEST_ARGS="test_remote_refusals.py"    # no VMs
 ```
 
-The target is manual only and never starts the server for you. It sets every vz and fc server variable empty, so no other backend is touched. A full run creates about 25 VMs one after another, never more than `remote.limits.max_running` (2) at once. Tests the backend cannot run (mounts, image store, guest MTU, vz/fc timing and image bakes) skip with a reason. See `tests/integration/README.md` for the list.
+The target is manual only and never starts the server for you. It sets every vz and fc server variable empty, so no other backend is touched. A full run creates about 25 VMs one after another, never more than `remote.limits.max_running` (2) at once, and takes about 42 minutes. Tests the backend cannot run (mounts, image store, guest MTU, vz/fc timing and image bakes) skip with a reason. See `tests/integration/README.md` for the list.
 
 ## Measured timings
 
-From the first live run on the dev project (`e2-standard-2`, 20 GB image, one zone):
+From two live runs on the dev project (`e2-standard-2`, 20 GB image, one zone). The cloud's own share varies from run to run: the provider phase of a create took between 12 and 35 s.
 
 | Step | Seconds |
 |---|---|
-| `shed create` (streamed) | 55.9: provider 11.9, boot 40.1, provision 0.5, ready 3.1 |
+| `shed create` (streamed) | 52 to 58 usually, 81 once: provider 12 to 35, boot 33 to 43, provision 0.1 to 0.5, ready 3 |
 | `shed create --repo` (a public repo) | 59.7: clone 1.4, provision 4.2 |
+| `shed create --repo` (a repository that does not exist) | 68: three clone attempts 11, then a warning and a running shed |
 | `shed exec` on a running shed | 0.22 |
-| `shed stop` (VM powered off) | 28.1 |
-| `shed start` (disk and host key kept) | 46.2 |
+| `shed stop` (VM powered off) | 28 to 34 |
+| `shed start` (disk and host key kept) | 42 to 54 |
 | Create refused at `max_running` | 0.3, no VM created |
-| JSON create (`POST /api/sheds`), until 201 `starting` | 11.0 |
+| JSON create (`POST /api/sheds`), until 201 `starting` | 11 to 15 |
 | Adopting a running VM after the record cache was removed | probe 0.6 |
-| `shed delete` | answers at once; VM gone after about 30 |
+| `shed delete` (streamed) | 29 to 34, returns when the VM is gone |
+| JSON `DELETE` | 204 after about 3; VM gone after about 30 |
+| A VM stopped outside shed, until listed `stopped (external)` | 10 after the VM stopped (the pass runs once a minute) |
+| A VM deleted outside shed, until its record is gone | 2 to 12 after the VM was gone |

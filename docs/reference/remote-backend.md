@@ -4,7 +4,7 @@ The `remote` backend runs each shed as its own virtual machine in a cloud projec
 
 A remote server differs from a Firecracker or VZ server in three ways:
 
-- **Lifecycle is asynchronous.** Create, start, stop and delete return as soon as the new status is saved, and a job owned by the server does the cloud work. A shed passes through `starting` and `stopping`.
+- **Lifecycle is asynchronous.** A JSON create, start, stop or delete returns as soon as the new status is saved, and a job owned by the server does the cloud work. A shed passes through `starting` and `stopping`.
 - **Some features do not exist.** There are no host directories, server mounts, snapshots, reset, image store or egress profiles. Requests for them are refused before anything is created.
 - **Isolation is by network topology.** The `isolated` network profile is accepted because the network gives a shed no route to another shed or to the server host.
 
@@ -18,7 +18,7 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 | `running` | The agent answered a probe. | empty |
 | `stopping` | A stop is in progress. | empty |
 | `stopped` | The VM is off and its disk is kept. | empty, `capacity`, `quota`, `limit`, `run_limit`, `external`, `isolation_lost`, `layout` |
-| `error` | The create failed. Only a delete leaves this state. | `capacity`, `quota`, `create_failed`, `host_key` |
+| `error` | The create failed. Only a delete leaves this state. | `capacity`, `quota`, `create_failed`, `host_key`, `layout` |
 
 | Reason | Meaning |
 |---|---|
@@ -27,30 +27,34 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 | `capacity` | The zone had no room for the machine type. |
 | `quota` | The cloud project's quota was reached. |
 | `limit` | The server's `limits` (`max_running` or `max_sheds`) were reached. |
-| `run_limit` | The shed ran for longer than the run limit and was stopped. Not reported yet: see below. |
+| `run_limit` | The shed ran for as long as its run limit and the cloud stopped it. |
 | `external` | The VM was stopped outside shed. |
 | `isolation_lost` | The network no longer isolates the shed. Not reported yet. |
 | `layout` | The VM's agent or guest layout is not compatible with this server. |
 | `create_failed` | The create failed for another reason; the server log has the detail. |
 | `host_key` | The host key the VM presented did not match the pinned key. |
 
-The run limit is enforced by the cloud: each VM is created with a maximum run duration (the larger of `max_run_duration` and the owning client's `max_age`) after which the cloud stops it. The server notices a VM stopped by the run limit or from outside shed only when it next starts, and records it as `stopped` with reason `external`; until then it lists the shed as `running`. `run_limit` and `isolation_lost` are defined but no code path sets them yet.
+The run limit is enforced by the cloud: each VM is created with a maximum run duration (the larger of `max_run_duration` and the owning client's `max_age`) after which the cloud stops it. The server notices a VM stopped by the run limit or from outside shed at its next [pass over the cloud](#keeping-records-and-the-cloud-in-step), at most about a minute later, and until then lists the shed as `running`. It records the shed as `stopped` with reason `run_limit` when the VM stopped within two minutes of its run limit, and with reason `external` otherwise. `isolation_lost` is defined but no code path sets it yet.
+
+`shed list -v` shows the reason beside the status (`stopped (external)`), and `shed list --json` and the API carry it as `status_reason`.
 
 ## Calls and statuses
 
-`POST /api/sheds` without `Accept: text/event-stream` returns **201 with `status: "starting"`** and the create continues in the background. The reply waits up to 15 s first, so that a quota or capacity refusal arriving that early is answered as a 503 and leaves no shed; a measured JSON create answered after 11 s. Poll `GET /api/sheds/{name}` until the status is `running`. With `Accept: text/event-stream` the stream stays open until the shed settles: the `complete` event carries the running shed, and an `error` event reports a create that failed. Closing the stream ends the stream only, never the create.
+`POST /api/sheds` without `Accept: text/event-stream` returns **201 with `status: "starting"`** and the create continues in the background. The reply waits first for the cloud to accept the new VM, for at most 15 s, so that a quota or capacity refusal arriving that early is answered as a 503 and leaves no shed; measured JSON creates answered after 11 to 15 s. The image lookup before it is bounded at 10 s, so the reply always comes within 25 s. Poll `GET /api/sheds/{name}` until the status is `running`. With `Accept: text/event-stream` the stream stays open until the shed settles: the `complete` event carries the running shed, and an `error` event reports a create that failed. Closing the stream ends the stream only, never the create.
 
 | Call | `starting` | `running` | `stopping` | `stopped` | `error` |
 |---|---|---|---|---|---|
 | start | 200, no change | 409 | 200, queued | 200 `starting` | 409 with the reason |
 | stop | 200, queued | 200 `stopping` | 200, no change | 409 | 409 |
-| delete | 204 in every state; the shed disappears from lists at once | | | | |
+| delete | 204 (JSON) in every state; the shed disappears from lists at once | | | | |
 
-"Queued" means the job waits for the cloud operation already running, then acts. A delete answers as soon as the shed is hidden, with or without `Accept: text/event-stream`; the VM is destroyed in the background (about 30 s measured). A destroy that fails is retried only when the server next starts.
+"Queued" means the job waits for the cloud operation already running, then acts.
+
+A delete without `Accept: text/event-stream` answers as soon as the shed is hidden (about 3 s measured, and about 10 s when the VM cannot be labelled at once because its create or a stop is still in flight); the VM is destroyed in the background, about 30 s measured. With `Accept: text/event-stream`, which is what `shed delete` sends, the shed is hidden just as fast but the stream stays open until the VM is gone, so the command returns only then (29 to 34 s measured) and a create right after it never meets the old VM. A delete sent while the shed's create is still asking the cloud for its VM waits for that VM to appear and then destroys it, which took about two and a half minutes when measured. A destroy that fails is retried by the periodic pass (see below).
 
 Exec (`POST /api/sheds/{name}/exec`) and the Connect tunnel on a shed that is not running return **409 `SHED_NOT_RUNNING`**.
 
-The CLI waits for you: `shed start` and `shed stop` poll until the shed settles (up to 180 s), and `shed attach`, `shed console`, `shed sync` and `shed tunnels` wait for a starting or stopping shed. SSH to the server (`ssh <shed>@<server>`) starts a stopped shed and waits up to 150 s, writing progress to stderr.
+The CLI waits for you: `shed start` and `shed stop` poll until the shed settles (up to 180 s), `shed delete` returns once the VM is gone, and `shed attach`, `shed console`, `shed sync` and `shed tunnels` wait for a starting or stopping shed. SSH to the server (`ssh <shed>@<server>`) starts a stopped shed and waits up to 150 s, writing progress to stderr.
 
 ## Keeping records and the cloud in step
 
@@ -58,16 +62,18 @@ The server reads the cloud when it starts and then once a minute. Each pass list
 
 | The server finds | It does |
 |---|---|
-| A delete that was acknowledged and whose VM still exists | Retries the destroy. The shed stays hidden. |
-| A `running` shed whose VM is stopped | Records it `stopped`, with reason `run_limit` or `external`. |
+| A delete acknowledged more than two minutes ago whose VM still exists and has no delete job | Retries the destroy. The shed stays hidden. |
+| A `running` shed whose VM is stopped | Records it `stopped`, with reason `run_limit` or `external`. A VM still on its way down is recorded `stopping` first. |
 | A `stopped` shed whose VM is running | Records it `starting` and probes its agent. It never stops the VM. |
-| A shed whose VM no longer exists | Removes the shed, after a read of that one VM confirms it. |
+| A `running` or `stopped` shed whose VM no longer exists | Removes the shed, after a read of that one VM confirms it. `shed delete` on it then answers "not found". |
 | A shed left `stopping` by a failed cloud call | Stops it again. |
 | A create that failed | Destroys its VM, retrying until it is gone. The shed stays, in `error`, until it is deleted. |
 
 A pass destroys a VM only for a delete that was acknowledged or a create that failed. A VM it does not know (another environment's, or one with no record) is logged and left alone.
 
-A VM that cannot be destroyed still runs, so two minutes after its delete it counts against `max_running` until it is gone. `SERVER_LIMIT_REACHED` then says how many such VMs there are; the server log has the cloud's error.
+Measured on the development server: a VM stopped with the cloud's own tools was listed `stopped (external)` 10 s after it finished stopping, and `shed start` brought it back in 42 s. A VM deleted with the cloud's tools lost its record 2 to 12 s after it was gone. A stopped shed's VM started with the cloud's tools was listed `starting` at the next pass and `running` 3 s later. A `shed delete` sent in between, for a shed whose VM was already gone, succeeded in under a second.
+
+A VM that cannot be destroyed still runs, so two minutes after its delete it counts against `max_running` until it is gone. A delete that is merely slow (one that raced its own create, above) counts the same way for as long as it lasts beyond the two minutes. `SERVER_LIMIT_REACHED` then says how many such VMs there are; the server log has the cloud's error.
 
 The `--repo` clone of a create runs with `GIT_TERMINAL_PROMPT=0`, for at most 5 minutes an attempt and at most 3 attempts. A clone that still fails is a warning, as on the other backends: the shed runs without the repository.
 
@@ -161,7 +167,7 @@ A server stop leaves every VM as it is: running sheds keep running and keep cost
 
 - A VM labelled ready that has no record is adopted under its own shed ID.
 - A record left `starting` or `stopping` resumes its job.
-- A record whose VM is stopped but was `running` becomes `stopped` with reason `external`.
+- A record whose VM is stopped but was `running` becomes `stopped` with reason `run_limit` or `external`.
 - A record whose VM is gone is dropped, unless the shed is in `error` or its create had not reached the cloud.
 - Only a VM labelled `deleting`, or one with a local delete marker, is deleted. Nothing else is ever removed.
 
@@ -169,9 +175,6 @@ A server stop leaves every VM as it is: running sheds keep running and keep cost
 
 | Item | Today |
 |---|---|
-| Stops from outside shed and run-limit stops | Seen only at the next server start-up. |
-| Failed destroys | Retried only at the next server start-up. |
-| `--repo` clone | One attempt with no timeout of its own; a slow first clone can fail the create. |
 | Agent install | Not built; see `agent_install` above. |
 | Firewall `auto` mode and the network check | Not built; see `firewall.mode` above. |
 | Zones | One zone per server, from its environment variable. |

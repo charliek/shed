@@ -518,12 +518,14 @@ make test-integration-remote PYTEST_ARGS="test_remote_refusals.py"   # no VMs
 **Every case that creates a shed creates a billed VM.** The target is manual
 only: CI and `make test-integration` never set the variable. A full run
 creates about 25 VMs, one after another, each up for a minute or two, never more than
-`remote.limits.max_running` at once. Check nothing is left afterwards with
+`remote.limits.max_running` at once, and takes about 42 minutes (measured: 24
+VMs, about 90 s a case, most of it the create and the delete, which waits for
+the VM to go). Check nothing is left afterwards with
 `shed -s remote-dev list`.
 
 | Runs on `[remote]` | Skips on `[remote]` (`local_vm_only`) |
 |---|---|
-| create and delete (`test_smoke`, `test_delete_fast`), `--repo` clone, exec, exec-shell, exec stderr, exec disconnect, the binary channel, stop/start (`test_lifecycle`), landing directory, background tunnels | host and server mounts (`test_mounts`, `test_stop_hook_mount`), the image store (`test_images`), guest MTU detection, the vz/fc boot-path timing tests, the vz/fc image-bake tests, the extensions image smoke |
+| create and delete (`test_smoke`; `test_delete_fast` with a 120 s ceiling, because a remote `shed delete` returns when the VM is gone), `--repo` clone, exec, exec-shell, exec stderr, exec disconnect, the binary channel, stop/start (`test_lifecycle`), landing directory, background tunnels | host and server mounts (`test_mounts`, `test_stop_hook_mount`), the image store (`test_images`), guest MTU detection, the vz/fc boot-path timing tests, the vz/fc image-bake tests, the extensions image smoke |
 
 Two remote-only modules:
 
