@@ -154,7 +154,7 @@ func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 	inst, err := b.prov.Get(ctx, c.ref)
 	gone := errors.Is(err, provider.ErrNotFound)
 	if err != nil && !gone {
-		b.logf("remote: periodic pass: reading the instance of shed %s: %v", c.name, err)
+		b.logf("remote: reading the instance of shed %s (its record is kept): %v", c.name, err)
 		return
 	}
 	if !gone && inst.Labels[provider.LabelID] != c.id {
@@ -172,7 +172,7 @@ func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 	}
 	switch {
 	case gone && !c.listed:
-		b.logf("remote: periodic pass: shed %s (%s) has no instance in the cloud any more; dropping its record", c.name, c.id)
+		b.logf("remote: shed %s (%s) has no instance in the cloud any more; dropping its record", c.name, c.id)
 		b.dropLocked(c.name)
 		dropped = true
 	case gone:

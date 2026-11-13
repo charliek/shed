@@ -24,6 +24,7 @@ import (
 type hookProvider struct {
 	*fake.Provider
 	create  func(ctx context.Context, spec provider.Spec) (provider.Pending, error)
+	list    func(ctx context.Context, sel provider.Selector) ([]provider.Instance, error)
 	resolve func(ctx context.Context, image string) (string, error)
 }
 
@@ -32,6 +33,13 @@ func (h *hookProvider) Create(ctx context.Context, spec provider.Spec) (provider
 		return h.create(ctx, spec)
 	}
 	return h.Provider.Create(ctx, spec)
+}
+
+func (h *hookProvider) List(ctx context.Context, sel provider.Selector) ([]provider.Instance, error) {
+	if h.list != nil {
+		return h.list(ctx, sel)
+	}
+	return h.Provider.List(ctx, sel)
 }
 
 func (h *hookProvider) ResolveImage(ctx context.Context, image string) (string, error) {
@@ -569,5 +577,35 @@ func TestAdoptedShedWithIncompatibleAgentIsNotRunning(t *testing.T) {
 	}
 	if n := e.prov.Count(fake.OpStop) + e.prov.Count(fake.OpDestroy); n != 0 {
 		t.Fatalf("adoption made %d stop or destroy calls, want none", n)
+	}
+}
+
+// --- restart ---
+
+// A list that does not show a shed's instance is not proof the instance is
+// gone: a server restarted with another zone lists none of its sheds. The
+// record goes only when a read of that one instance says not found.
+func TestRestartKeepsARecordWhoseInstanceIsOnlyUnlisted(t *testing.T) {
+	h := &hookProvider{}
+	e := newEnv(t, hooked(h))
+	e.running("here")
+	e.running("gone")
+	e.prov.ExternalDelete(e.ref("gone"))
+	h.list = func(context.Context, provider.Selector) ([]provider.Instance, error) { return nil, nil }
+	e.restart()
+	e.idle()
+	if got := e.status("here"); got != config.StatusRunning {
+		t.Fatalf("the unlisted shed is %q after the restart, want running", got)
+	}
+	if _, err := e.b.GetShed(context.Background(), "gone"); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Fatalf("GetShed of the shed whose instance is gone = %v, want not found", err)
+	}
+	// And the periodic pass draws the same line.
+	e.sweep()
+	if got := e.status("here"); got != config.StatusRunning {
+		t.Fatalf("the unlisted shed is %q after the periodic pass, want running", got)
+	}
+	if n := e.prov.Count(fake.OpDestroy) + e.prov.Count(fake.OpStop); n != 0 {
+		t.Fatalf("%d destroy or stop calls, want none", n)
 	}
 }

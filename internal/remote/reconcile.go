@@ -31,8 +31,9 @@ const listRetry = 5 * time.Second
 //     on from what the cloud says now;
 //   - an instance with a local delete marker, or labelled
 //     shed_state=deleting, is destroyed. Nothing else is ever destroyed;
-//   - a record whose instance is gone is dropped, unless it is in "error" or
-//     its create had not reached the cloud yet;
+//   - a record whose instance is not in the list is dropped once a read of
+//     that one instance confirms it is gone, unless the record is in "error"
+//     or its create had not reached the cloud yet;
 //   - anything else is logged and left alone.
 func (b *Backend) Reconcile(ctx context.Context) {
 	var insts []provider.Instance
@@ -54,12 +55,12 @@ func (b *Backend) Reconcile(ctx context.Context) {
 			return
 		}
 	}
-	b.reconcile(insts)
+	b.reconcile(ctx, insts)
 	b.readyOnce.Do(func() { close(b.ready) })
 	b.startSweeper()
 }
 
-func (b *Backend) reconcile(insts []provider.Instance) {
+func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 	var report []string
 	note := func(format string, args ...any) {
 		line := fmt.Sprintf(format, args...)
@@ -80,6 +81,7 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 	var deletes []*state.Marker
 	var launch []*job
 	var resumeChannels []*state.Record
+	var confirm []sweepCheck
 
 	b.mu.Lock()
 	recordIDs := make(map[string]string, len(b.records)) // shed ID -> name
@@ -187,8 +189,14 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 				// The create had not finished; it is sent again,
 				// and Create is idempotent.
 				launch = append(launch, b.newJobLocked(state.JobCreate, name, r.Shed.ID))
+			case r.Ref != "":
+				// Not in the list. That is not proof the instance is
+				// gone (a server restarted with another zone lists
+				// none of its sheds), so the one instance is read
+				// before the record is dropped.
+				confirm = append(confirm, sweepCheck{name: name, id: r.Shed.ID, ref: r.Ref, status: r.Shed.Status})
 			default:
-				note("shed %s (%s) has no instance in the cloud any more; dropping its record", name, r.Shed.ID)
+				note("shed %s (%s) never had an instance; dropping its record", name, r.Shed.ID)
 				b.dropLocked(name)
 			}
 			continue
@@ -232,6 +240,10 @@ func (b *Backend) reconcile(insts []provider.Instance) {
 	}
 	b.reported = report
 	b.mu.Unlock()
+
+	for _, c := range confirm {
+		b.correct(ctx, c)
+	}
 
 	for _, m := range markers {
 		b.startDelete(m, nil)
