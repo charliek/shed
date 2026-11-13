@@ -1,0 +1,22 @@
+[Unit]
+Description=Shed identity from instance metadata (hostname, host key, server key)
+Documentation=https://github.com/charliek/shed
+Wants=network-online.target
+After=network-online.target
+# Before sshd and the agent. Not Before=ssh.socket: Ubuntu's ssh.socket is
+# ordered Before=sockets.target, which every default-dependency service
+# (this one included) comes after, so that line would be an ordering cycle.
+# Ordering before ssh.service is enough: ssh.socket only listens, and the
+# sshd it starts on the first connection waits for this unit.
+Before=ssh.service sshd.service shed-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/shed-identity
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

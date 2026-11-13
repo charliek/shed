@@ -1,0 +1,44 @@
+# build-gce-image: image shed-remote-extensions-v0-0-0-test-20260101-000000 (family shed-extensions-amd64) from builder shed-image-builder-20260101-000000
+WORK=$(mktemp -d)
+==> building the agent for linux/amd64
+make build-agent GOARCH=amd64
+==> staging the bake files
+mkdir -p ${WORK}/stage
+cp gce/bake.sh gce/provision.sh gce/verify.sh gce/seal.sh gce/shed-identity.sh gce/shed-agent-install.sh gce/shed-identity.service gce/shed-agent.service gce/daemon.json ${WORK}/stage/
+install -m 0755 bin/shed-agent ${WORK}/stage/shed-agent
+scripts/read-guest-pins.sh > ${WORK}/stage/pins.env
+ssh-keygen -q -t ed25519 -N '' -C shed-bake -f ${WORK}/bake_key
+ssh-keygen -q -t ed25519 -N '' -C shed-bake-link -f ${WORK}/stage/link_key
+# ${WORK}/user-data: cloud-config creating shedbake (uid 2999, sudo) with ${WORK}/bake_key.pub
+#   #cloud-config
+#   users:
+#     - name: shedbake
+#       uid: 2999
+#       shell: /bin/bash
+#       lock_passwd: true
+#       sudo: "ALL=(ALL) NOPASSWD:ALL"
+#       ssh_authorized_keys:
+#         - <bake_key.pub>
+gcloud compute images describe-from-family ubuntu-2404-lts-amd64 --project ubuntu-os-cloud '--format=value(name)'
+==> creating builder shed-image-builder-20260101-000000
+gcloud compute instances create shed-image-builder-20260101-000000 --project example-project --zone example-zone-a --machine-type e2-standard-4 --image '<newest ubuntu-2404-lts-amd64>' --image-project ubuntu-os-cloud --boot-disk-size 20GB --boot-disk-type pd-balanced --network example-net --subnet example-subnet --tags example-bake --no-service-account --no-scopes --max-run-duration 3h --instance-termination-action DELETE --labels shed_bake=true,purpose=example --metadata enable-guest-attributes=TRUE,block-project-ssh-keys=TRUE,enable-oslogin=FALSE,shed-name=shed-bake,shed-id=bake20260101000000 --metadata-from-file user-data=${WORK}/user-data,shed-link-authorized-keys=${WORK}/stage/link_key.pub
+gcloud compute instances describe shed-image-builder-20260101-000000 --project example-project --zone example-zone-a '--format=get(networkInterfaces[0].accessConfigs[0].natIP)'
+==> learning the builder's host key from its guest attributes
+# poll until set (up to 180 s), then write '<builder-ip> <key>' to ${WORK}/known_hosts:
+gcloud compute instances get-guest-attributes shed-image-builder-20260101-000000 --project example-project --zone example-zone-a --query-path=hostkeys/ssh-ed25519 '--format=value(value)'
+==> waiting for SSH as shedbake
+# retry until it succeeds (up to 300 s):
+ssh -i ${WORK}/bake_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o UserKnownHostsFile=${WORK}/known_hosts -o StrictHostKeyChecking=yes 'shedbake@<builder-ip>' true
+==> copying the bake files
+scp -p -r -i ${WORK}/bake_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o UserKnownHostsFile=${WORK}/known_hosts -o StrictHostKeyChecking=yes ${WORK}/stage 'shedbake@<builder-ip>:/tmp/shed-bake'
+==> running gce/bake.sh on the builder
+ssh -i ${WORK}/bake_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o UserKnownHostsFile=${WORK}/known_hosts -o StrictHostKeyChecking=yes 'shedbake@<builder-ip>' 'sudo /tmp/shed-bake/bake.sh --variant extensions --arch amd64 --bake-user shedbake'
+# the last line of its output must be BAKE OK
+==> stopping the builder
+gcloud compute instances stop shed-image-builder-20260101-000000 --project example-project --zone example-zone-a
+==> creating image shed-remote-extensions-v0-0-0-test-20260101-000000 in family shed-extensions-amd64
+gcloud compute images create shed-remote-extensions-v0-0-0-test-20260101-000000 --project example-project --source-disk shed-image-builder-20260101-000000 --source-disk-zone example-zone-a --family shed-extensions-amd64 --labels shed_layout=1,shed_protocol=1,shed_arch=amd64,shed_variant=extensions,shed_version=v0-0-0-test --description 'shed remote guest layout 1, agent protocol 1, variant extensions, amd64, shed v0.0.0-test, from <newest ubuntu-2404-lts-amd64>'
+==> deleting the builder
+gcloud compute instances delete shed-image-builder-20260101-000000 --project example-project --zone example-zone-a --quiet
+rm -rf "${WORK}"
+==> image shed-remote-extensions-v0-0-0-test-20260101-000000 (family shed-extensions-amd64)

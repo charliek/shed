@@ -1,0 +1,22 @@
+[Unit]
+Description=Shed Agent (cloud guest, unix sockets for the server's SSH link)
+Documentation=https://github.com/charliek/shed
+Requires=shed-identity.service
+After=shed-identity.service network.target
+# Never give up restarting.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=/run/shed/identity.env
+ExecStart=/usr/local/bin/shed-agent --listen unix:/run/shed-agent --socket-group shed-link --shed-name ${SHED_NAME}
+# A restart (an agent install) stops only the agent: the commands it started
+# keep running.
+KillMode=process
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
