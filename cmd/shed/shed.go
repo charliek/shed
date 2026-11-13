@@ -94,15 +94,15 @@ func init() {
 	createCmd.Flags().BoolVar(&createNoSync, "no-sync", false, "Skip syncing default profile")
 	createCmd.Flags().StringVar(&createSyncProfile, "sync-profile", "", "Profile to sync after creation (default: 'default')")
 	createCmd.Flags().DurationVar(&createTimeout, "timeout", 0, "Timeout for create operation (default: from config or 10m)")
-	createCmd.Flags().StringVar(&createBackend, "backend", "", "Backend to use: firecracker or vz (default: server default)")
-	createCmd.Flags().IntVar(&createCPUs, "cpus", 0, "Number of vCPUs (firecracker/vz only)")
-	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker/vz only)")
+	createCmd.Flags().StringVar(&createBackend, "backend", "", "Backend to use: firecracker, vz or remote; must match the server's backend (default: server default)")
+	createCmd.Flags().IntVar(&createCPUs, "cpus", 0, "Number of vCPUs (on a remote server: the smallest configured size that fits)")
+	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (on a remote server: the smallest configured size that fits)")
 	createCmd.Flags().StringVar(&createLocalDir, "local-dir", "", "Mount a host directory under the home directory (at ~/<name>) and land there; mutually exclusive with --repo")
 	createCmd.Flags().StringArrayVar(&createAddDirs, "add-dir", nil, "Mount an additional host directory under the home directory (repeatable; requires --local-dir)")
 	createCmd.Flags().StringSliceVar(&createEgress, "egress", nil, "Egress profiles to apply (comma-separated, e.g. base,github; 'off' to disable; default: server default)")
 	createCmd.Flags().StringVar(&createFromSnapshot, "from-snapshot", "", "Spawn from a snapshot's rootfs (mutually exclusive with --image and --repo)")
 	createCmd.Flags().StringVar(&createUpperSize, "upper-size", "", "Logical size of the per-shed writable upper layer (e.g. 5G, 20G; default: server config)")
-	createCmd.Flags().StringVar(&createNetwork, "network", "", "Network profile: open (today's network) or isolated (the internet only: no host, LAN, tailnet or other sheds; Firecracker servers only). Default: the server's network.default_profile")
+	createCmd.Flags().StringVar(&createNetwork, "network", "", "Network profile: open (today's network) or isolated (the internet only: no host, LAN, tailnet or other sheds; Firecracker and remote servers). Default: the server's network.default_profile")
 	createCmd.Flags().StringVar(&createMounts, "mounts", "", "Server mounts the shed gets: all (the default), none, or a comma-separated list of mount names (needs a server that supports mount selection)")
 
 	startCmd.Flags().DurationVar(&startTimeout, "timeout", 0, "Timeout for start operation (default: from config or 10m)")
@@ -124,9 +124,10 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// Validate backend flag
 	if createBackend != "" &&
 		createBackend != config.BackendFirecracker &&
-		createBackend != config.BackendVZ {
-		return fmt.Errorf("invalid backend %q: must be %q or %q",
-			createBackend, config.BackendFirecracker, config.BackendVZ)
+		createBackend != config.BackendVZ &&
+		createBackend != config.BackendRemote {
+		return fmt.Errorf("invalid backend %q: must be %q, %q or %q",
+			createBackend, config.BackendFirecracker, config.BackendVZ, config.BackendRemote)
 	}
 
 	if createCPUs < 0 {
@@ -244,6 +245,11 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	resolvedBackend, warning, err := resolveCreateBackend(info, createBackend, createCPUs, createMemory)
 	if err != nil {
 		return err
+	}
+	if resolvedBackend == config.BackendRemote {
+		if err := remoteCreateRefusal(createLocalDir, createAddDirs, createFromSnapshot, createEgress, mounts); err != nil {
+			return err
+		}
 	}
 	if warning != "" {
 		fmt.Fprintln(os.Stderr, warning)
@@ -442,6 +448,9 @@ func resolveCreateBackend(info *config.ServerInfo, requested string, cpus, memor
 		if memory > config.MaxVZMemoryMB {
 			return "", "", fmt.Errorf("invalid memory %d: must be at most %d MB", memory, config.MaxVZMemoryMB)
 		}
+	case config.BackendRemote:
+		// The server picks the smallest configured size that fits cpus and
+		// memory, and refuses (400) when none does.
 	}
 
 	return backend, "", nil
@@ -621,10 +630,20 @@ type listedShed struct {
 // renderShedTableVerbose is `shed list -v`: one wide table row per shed.
 func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	// The ID column appears only when a listed shed has one (remote sheds
+	// do; Firecracker and VZ sheds do not, and their table is unchanged).
+	withID := false
+	for _, s := range sheds {
+		withID = withID || s.shed.ID != ""
+	}
+	idHeader := ""
+	if withID {
+		idHeader = "\tID"
+	}
 	if listAll {
-		fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tOWNER\tMOUNTS\tNETWORK\tUPTIME")
+		fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tOWNER\tMOUNTS\tNETWORK\tUPTIME"+idHeader)
 	} else {
-		fmt.Fprintln(w, "NAME\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tOWNER\tMOUNTS\tNETWORK\tUPTIME")
+		fmt.Fprintln(w, "NAME\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tOWNER\tMOUNTS\tNETWORK\tUPTIME"+idHeader)
 	}
 	for _, s := range sheds {
 		ssh := "-"
@@ -654,12 +673,17 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 			}
 		}
 		owner, mounts, network := valueOrDash(s.shed.Owner), formatShedMounts(s.shed.Mounts), formatNetworkProfile(s.shed.NetworkProfile)
+		status := statusWithReason(s.shed)
+		idCell := ""
+		if withID {
+			idCell = "\t" + valueOrDash(s.shed.ID)
+		}
 		if listAll {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				s.shed.Name, s.server, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, source, owner, mounts, network, uptime)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n",
+				s.shed.Name, s.server, valueOrDash(s.shed.Backend), status, ssh, ip, resources, source, owner, mounts, network, uptime, idCell)
 		} else {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				s.shed.Name, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, source, owner, mounts, network, uptime)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n",
+				s.shed.Name, valueOrDash(s.shed.Backend), status, ssh, ip, resources, source, owner, mounts, network, uptime, idCell)
 		}
 	}
 	w.Flush()
@@ -672,7 +696,10 @@ func renderShedDetails(out io.Writer, sheds []listedShed, listAll bool) {
 			fmt.Fprintln(out, "---")
 		}
 		fmt.Fprintf(out, "Name:           %s\n", s.shed.Name)
-		fmt.Fprintf(out, "Status:         %s\n", s.shed.Status)
+		if s.shed.ID != "" {
+			fmt.Fprintf(out, "ID:             %s\n", s.shed.ID)
+		}
+		fmt.Fprintf(out, "Status:         %s\n", statusWithReason(s.shed))
 		fmt.Fprintf(out, "Backend:        %s\n", valueOrDash(s.shed.Backend))
 		if listAll {
 			fmt.Fprintf(out, "Server:         %s\n", s.server)
@@ -907,6 +934,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to start shed: %w", err)
 	}
+	// A remote server answers "starting"; wait until the shed runs.
+	waited := inTransition(shed.Status)
+	if shed, err = waitSettled(client, shed, os.Stderr); err != nil {
+		return err
+	}
 
 	// Update cache
 	if err := cacheShedLocation(name, serverName, shed.Status); err != nil {
@@ -925,6 +957,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 		})
 	}
 
+	if waited {
+		if err := requireSettledStatus(shed, config.StatusRunning); err != nil {
+			return err
+		}
+	}
 	printSuccess("Started shed %s", name)
 	return nil
 }
@@ -949,6 +986,11 @@ func runStop(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to stop shed: %w", err)
 	}
+	// A remote server answers "stopping"; wait until the shed is stopped.
+	waited := inTransition(shed.Status)
+	if shed, err = waitSettled(client, shed, os.Stderr); err != nil {
+		return err
+	}
 
 	// Update cache
 	if err := cacheShedLocation(name, serverName, shed.Status); err != nil {
@@ -967,6 +1009,11 @@ func runStop(cmd *cobra.Command, args []string) error {
 		})
 	}
 
+	if waited {
+		if err := requireSettledStatus(shed, config.StatusStopped); err != nil {
+			return err
+		}
+	}
 	printSuccess("Stopped shed %s", name)
 	return nil
 }
