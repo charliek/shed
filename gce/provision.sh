@@ -392,12 +392,15 @@ printf '[Resolve]\nLLMNR=no\nMulticastDNS=no\n' > /etc/systemd/resolved.conf.d/1
 chmod 0644 /etc/systemd/resolved.conf.d/10-shed.conf
 
 # A GCE stop or delete presses the power key. unattended-upgrades.service
-# holds a shutdown delay lock, and on a real shed it was never released, so
-# every stop waited out logind's 30 s inhibitor timeout (stop took 55 s).
-# Cap the wait; an upgrade that is mid-run still gets 5 s to finish a step.
+# holds a shutdown delay lock that it did not release on a real shed, and the
+# package raises logind's inhibitor timeout to 30 s with
+# /usr/lib/systemd/logind.conf.d/unattended-upgrades-logind-maxdelay.conf, so
+# every stop took 55 s. A file of the same name in /etc replaces it (a drop-in
+# with another name would sort before it and lose). An upgrade that is mid-run
+# still gets 5 s to finish a step. Measured: stop 55 s -> 27 s.
 install -d -m 0755 /etc/systemd/logind.conf.d
-printf '[Login]\nInhibitDelayMaxSec=5\n' > /etc/systemd/logind.conf.d/10-shed.conf
-chmod 0644 /etc/systemd/logind.conf.d/10-shed.conf
+printf '[Login]\nInhibitDelayMaxSec=5\n' > /etc/systemd/logind.conf.d/unattended-upgrades-logind-maxdelay.conf
+chmod 0644 /etc/systemd/logind.conf.d/unattended-upgrades-logind-maxdelay.conf
 
 # ---------------------------------------------------------------------------
 # Units
