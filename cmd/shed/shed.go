@@ -517,8 +517,10 @@ func runList(cmd *cobra.Command, args []string) error {
 	if jsonFlag {
 		type shedJSON struct {
 			Name           string                                `json:"name"`
+			ID             string                                `json:"id,omitempty"`
 			Server         string                                `json:"server"`
 			Status         string                                `json:"status"`
+			StatusReason   string                                `json:"status_reason,omitempty"`
 			CreatedAt      time.Time                             `json:"created_at"`
 			Backend        string                                `json:"backend,omitempty"`
 			IPAddress      string                                `json:"ip_address,omitempty"`
@@ -542,8 +544,10 @@ func runList(cmd *cobra.Command, args []string) error {
 		for _, s := range allSheds {
 			sj := shedJSON{
 				Name:           s.shed.Name,
+				ID:             s.shed.ID,
 				Server:         s.server,
 				Status:         s.shed.Status,
+				StatusReason:   s.shed.StatusReason,
 				CreatedAt:      s.shed.CreatedAt,
 				Backend:        s.shed.Backend,
 				IPAddress:      s.shed.IPAddress,

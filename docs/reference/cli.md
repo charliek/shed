@@ -231,7 +231,7 @@ mcp-test      firecracker  stopped  -                               -           
 | `STATUS` | `running`, `stopped`, `starting`, `stopping` or `error`, followed by the reason in brackets when the server gives one (`stopped (run_limit)`). See [Remote backend › Statuses](remote-backend.md#statuses). |
 | `ID` | The shed's permanent ID. Shown only when a listed shed has one (remote sheds do). |
 
-With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)).
+With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`.
 
 ### shed start
 
