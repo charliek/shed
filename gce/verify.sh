@@ -126,6 +126,7 @@ verify_live() {
   expect "shed-agent.service Restart" always "$(systemctl show -p Restart --value shed-agent.service)"
   check "shed-agent.service requires shed-identity.service" bash -c 'systemctl show -p Requires --value shed-agent.service | grep -qw shed-identity.service'
   check "security updates are on" bash -c 'apt-config dump | grep -q "^APT::Periodic::Unattended-Upgrade \"1\";"'
+  check "shutdown inhibitors are capped at 5 s" bash -c 'systemd-analyze cat-config systemd/logind.conf | grep -E "^InhibitDelayMaxSec=" | tail -1 | grep -qx "InhibitDelayMaxSec=5"'
   check "guest agent leaves host keys alone" grep -Eq '^set_host_keys[[:space:]]*=[[:space:]]*false' /etc/default/instance_configs.cfg
 
   echo "--- identity"

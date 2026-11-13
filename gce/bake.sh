@@ -32,6 +32,13 @@ done
 "${here}/provision.sh" --variant "${variant}" --arch "${arch}" \
   --agent "${here}/shed-agent" --pins "${here}/pins.env"
 
+# sshd has been running since boot (and was restarted by needrestart during
+# the package install) with the stock policy; provision.sh only wrote the shed
+# drop-in. Reload so the live checks see the policy a shed boots with. A
+# reload leaves this bake session open.
+echo "==> bake: reloading sshd with the shed policy"
+systemctl try-reload-or-restart ssh.service
+
 echo "==> bake: starting shed-identity and shed-agent from the builder's metadata"
 systemctl start shed-identity.service
 systemctl start docker.service shed-agent.service
