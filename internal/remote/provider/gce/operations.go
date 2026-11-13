@@ -65,6 +65,9 @@ func (c *Client) mutate(ctx context.Context, op, method, path string, query url.
 	q.Set("requestId", c.cfg.NewRequestID())
 	var o operation
 	if err := c.call(ctx, request{op: op, method: method, path: path, query: q, body: body}, &o); err != nil {
+		if op == "create" || op == "start" {
+			return nil, asRefusal(op, err)
+		}
 		return nil, asProviderError(op, err)
 	}
 	if err := o.failure(op); err != nil {

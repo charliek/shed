@@ -353,7 +353,10 @@ func classify(status int, codes []string, message string) error {
 }
 
 // asProviderError wraps a call failure in a *provider.Error of the right
-// kind. A rate limit that outlasted the retries is reported as ErrQuota.
+// kind. A rate limit that outlasted the retries has no kind here: on a read
+// or a poll it says nothing about the instance, and calling it a quota
+// refusal would make Wait report an accepted create or start as refused.
+// See asRefusal for the two calls where it is one.
 func asProviderError(op string, err error) error {
 	if err == nil {
 		return nil
@@ -367,13 +370,29 @@ func asProviderError(op string, err error) error {
 		return &provider.Error{Op: op, Err: err}
 	}
 	kind := classify(ae.HTTPStatus, ae.Reasons, ae.Message)
-	if kind == nil && ae.rateLimited() {
-		kind = provider.ErrQuota
+	if kind == provider.ErrQuota && ae.rateLimited() {
+		// A rate limit whose message reads like a quota is still a rate
+		// limit.
+		kind = nil
 	}
 	if kind == errFingerprint {
 		return &provider.Error{Op: op, Detail: ae.Error(), Err: errFingerprint}
 	}
 	return &provider.Error{Kind: kind, Op: op, Detail: ae.Error()}
+}
+
+// asRefusal is asProviderError for the calls that ask the cloud to run
+// something (insert and start). There a rate limit that outlasted the retries
+// is reported as ErrQuota: the request was not accepted, nothing was created
+// or started, and the caller should answer "try later".
+func asRefusal(op string, err error) error {
+	perr := asProviderError(op, err)
+	var ae *apiError
+	var pe *provider.Error
+	if errors.As(err, &ae) && ae.rateLimited() && errors.As(perr, &pe) && pe.Kind == nil && pe.Err == nil {
+		pe.Kind = provider.ErrQuota
+	}
+	return perr
 }
 
 // request is one API call.
