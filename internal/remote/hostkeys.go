@@ -171,7 +171,7 @@ func (h *hostKeys) Learn(ctx context.Context, presented string) error {
 	}
 
 	h.mu.Lock()
-	if h.publishedAt.IsZero() || time.Since(h.publishedAt) >= guestAttrInterval {
+	if h.publishedAt.IsZero() || time.Since(h.publishedAt) >= h.b.opts.HostKeyPollInterval {
 		h.published, h.publishErr = reader.GuestHostKey(ctx, rec.Ref)
 		h.publishedAt = time.Now()
 	}

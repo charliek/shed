@@ -439,10 +439,14 @@ func (b *Backend) WaitSettled(ctx context.Context, name string) (*config.Shed, e
 		shed := b.shedOf(r)
 		b.mu.Unlock()
 
-		if j == nil {
+		if j != following {
 			if following != nil {
-				sent = following.replay(ctx, sent)
+				// Flush what the job that just ended said last.
+				following.replay(ctx, sent)
 			}
+			following, sent = j, 0
+		}
+		if j == nil {
 			if shed.Status != config.StatusStarting && shed.Status != config.StatusStopping {
 				return shed, nil
 			}
@@ -453,19 +457,13 @@ func (b *Backend) WaitSettled(ctx context.Context, name string) (*config.Shed, e
 			}
 			continue
 		}
-		if j != following {
-			if following != nil {
-				following.replay(ctx, sent)
-			}
-			following, sent = j, 0
-		}
+		// Take the wake-up channel before reading, so an event that lands
+		// between the two is not slept through.
+		changed := j.changed()
 		sent = j.replay(ctx, sent)
 		select {
 		case <-j.done:
-			sent = j.replay(ctx, sent)
-			following = nil
-			sent = 0
-		case <-j.changed():
+		case <-changed:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}

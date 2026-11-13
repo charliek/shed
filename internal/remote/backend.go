@@ -85,6 +85,10 @@ type Options struct {
 	BootTimeout    time.Duration
 	AuthGrace      time.Duration
 	ProbeInterval  time.Duration
+	// HostKeyPollInterval is the least time between two reads of a guest's
+	// published host key. Default 6 s, which keeps under Google's limit on
+	// guest-attribute reads.
+	HostKeyPollInterval time.Duration
 	// Logf receives the backend's log lines. Default log.Printf.
 	Logf func(format string, args ...any)
 	// Now is the clock for record timestamps. Default time.Now.
@@ -156,6 +160,9 @@ func New(opts Options) (*Backend, error) {
 	}
 	if opts.ProbeInterval <= 0 {
 		opts.ProbeInterval = DefaultProbeInterval
+	}
+	if opts.HostKeyPollInterval <= 0 {
+		opts.HostKeyPollInterval = guestAttrInterval
 	}
 	if opts.Logf == nil {
 		opts.Logf = log.Printf
