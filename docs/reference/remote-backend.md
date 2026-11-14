@@ -24,7 +24,7 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 |---|---|
 | `no_pin` | The VM has no pinned host key yet. |
 | `unreachable` | The server cannot reach the VM's SSH port. |
-| `cloud_unreadable` | The server could not learn from the cloud what the VM is doing: the read failed, or the VM's labels are another shed version's. It changed nothing, keeps the create or start, and looks again at every periodic pass; a delete still works. |
+| `cloud_unreadable` | The server could not learn from the cloud what the VM is doing: the read failed, or the VM's labels are another shed version's. It changed nothing, keeps the create or start, and looks again at every periodic pass. A delete still works after a failed read. While the labels are another version's, a delete is recorded and answered with an error, the shed leaves the list, and the VM keeps running (and is billed) until a server that reads those labels, or this one once they are readable again, destroys it. |
 | `capacity` | The zone had no room for the machine type. |
 | `quota` | The cloud project's quota was reached. |
 | `limit` | The server's `limits` (`max_running` or `max_sheds`) were reached. |
