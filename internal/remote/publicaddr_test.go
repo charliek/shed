@@ -119,6 +119,9 @@ func TestPublicAddrAgreement(t *testing.T) {
 		{name: "carrier-grade nat", bodies: []string{"100.64.0.9", "100.64.0.9"}, wantNote: "not a public address"},
 		{name: "multicast", bodies: []string{"224.0.0.1", "224.0.0.1"}, wantNote: "not a public address"},
 		{name: "broadcast", bodies: []string{"255.255.255.255", "255.255.255.255"}, wantNote: "not a public address"},
+		{name: "reserved 240/4", bodies: []string{"240.0.0.9", "240.0.0.9"}, wantNote: "not a public address"},
+		{name: "benchmarking 198.18/15", bodies: []string{"198.18.0.9", "198.18.0.9"}, wantNote: "not a public address"},
+		{name: "protocol assignments 192.0.0/24", bodies: []string{"192.0.0.9", "192.0.0.9"}, wantNote: "not a public address"},
 
 		{name: "garbage words", bodies: []string{"hello", "hello"}, wantNote: "not one IPv4 address"},
 		{name: "html around an address", bodies: []string{"<html>" + a + "</html>", "<html>" + a + "</html>"}, wantNote: "not one IPv4 address"},
@@ -239,6 +242,10 @@ func TestPublicIPv4(t *testing.T) {
 		{"10.1.2.3", false}, {"172.31.255.255", false}, {"192.168.0.1", false}, {"127.0.0.53", false},
 		{"169.254.0.1", false}, {"0.0.0.0", false}, {"100.64.0.1", false}, {"100.127.255.255", false},
 		{"224.0.0.251", false}, {"255.255.255.255", false}, {"2001:db8::1", false}, {"::ffff:203.0.113.7", false},
+		// Reserved, protocol-assignment and benchmarking space: Go calls
+		// these global unicast, and no server's public address is in them.
+		{"240.0.0.1", false}, {"250.1.2.3", false}, {"198.18.0.1", false}, {"198.19.255.255", false},
+		{"192.0.0.8", false}, {"0.1.2.3", false}, {"198.17.255.255", true}, {"198.20.0.0", true}, {"192.0.1.1", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.addr, func(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/redact"
 )
 
@@ -32,16 +33,12 @@ const (
 	echoQuorum = 2
 )
 
-// cgnat is the shared address space of RFC 6598. An address in it is not one
-// the internet can see.
-var cgnat = netip.MustParsePrefix("100.64.0.0/10")
-
-// publicIPv4 reports whether addr could be a server's public address: an
-// IPv4 unicast address that is not private, loopback, link-local,
-// unspecified, multicast, broadcast or carrier-grade NAT space. The firewall
-// rule is never pointed at anything else.
+// publicIPv4 reports whether addr could be a server's public address. The
+// firewall rule is never pointed at anything else. The definition is the
+// config's, so auto mode never believes an address that a static source
+// range could not name.
 func publicIPv4(addr netip.Addr) bool {
-	return addr.Is4() && addr.IsGlobalUnicast() && !addr.IsPrivate() && !cgnat.Contains(addr)
+	return config.PublicIPv4(addr)
 }
 
 // addrFinder learns the server's public IPv4 address from echo services.

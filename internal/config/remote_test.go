@@ -164,6 +164,12 @@ func TestRemoteValidate(t *testing.T) {
 		{"firewall static with carrier-grade NAT space", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"100.64.3.0/24"}}
 		}, "not public address space"},
+		{"firewall static with benchmarking space", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"198.18.4.0/24"}}
+		}, "not public address space"},
+		{"firewall static with the protocol assignments", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"192.0.0.8/32"}}
+		}, "not public address space"},
 		{"firewall static with a private range, acknowledged", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"10.10.0.0/24"}, AcknowledgeAny: true}
 		}, ""},
@@ -196,6 +202,12 @@ func TestRemoteValidate(t *testing.T) {
 		{"firewall auto with a third entry on a used host", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", "https://b.example", "https://user@b.example/x"}}
 		}, "names host b.example more than once"},
+		{"firewall auto with a host name outside ASCII", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://b\u00fccher.example/", "https://xn--bcher-kva.example/"}}
+		}, "ASCII (punycode) form"},
+		{"firewall auto with a punycode host name", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://xn--bcher-kva.example/", "https://b.example/"}}
+		}, ""},
 		{"firewall auto with ranges", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", "https://b.example"}, SourceRanges: []string{"203.0.113.7/32"}}
 		}, "source_ranges is only used"},

@@ -260,6 +260,13 @@ func (c *RemoteConfig) validateFirewall() error {
 			return fmt.Errorf("invalid firewall.echo_urls entry %q (must be an https URL)", redact.String(u))
 		}
 		host := EchoHost(parsed)
+		// A host name outside ASCII has a second spelling (its punycode
+		// form) that the comparison below would count as another
+		// service. Only the ASCII form is accepted, so one service has
+		// one name.
+		if !isASCII(host) {
+			return fmt.Errorf("invalid firewall.echo_urls entry %q: write the host name in its ASCII (punycode) form", redact.String(u))
+		}
 		if echoHosts[host] {
 			return fmt.Errorf("firewall.echo_urls names host %s more than once; each entry must be a different, independently run service", host)
 		}
@@ -326,11 +333,23 @@ func EchoHost(u *url.URL) string {
 	return strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 }
 
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
 // notPublicIPv4 is the IPv4 space that is never a public source address:
 // "this network", the private ranges, carrier-grade NAT, loopback,
-// link-local, multicast and the reserved top. A shed's own address is in one
-// of the private ranges, so a rule that admits one of these may admit sheds
-// to each other.
+// link-local, the IETF protocol assignments, the benchmarking range,
+// multicast and the reserved top. A shed's own address is in one of the
+// private ranges, so a rule that admits one of these may admit sheds to each
+// other. The documentation ranges (192.0.2.0/24, 198.51.100.0/24,
+// 203.0.113.0/24) are not listed: nothing routes them, and they are what
+// this repository's examples and tests use for "a public address".
 var notPublicIPv4 = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("10.0.0.0/8"),
@@ -338,9 +357,28 @@ var notPublicIPv4 = []netip.Prefix{
 	netip.MustParsePrefix("127.0.0.0/8"),
 	netip.MustParsePrefix("169.254.0.0/16"),
 	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
 	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
 	netip.MustParsePrefix("224.0.0.0/4"),
 	netip.MustParsePrefix("240.0.0.0/4"),
+}
+
+// PublicIPv4 reports whether addr could be a server's public address: an
+// IPv4 address outside every range of notPublicIPv4. It is the one
+// definition of "public" for the firewall check: what a static source range
+// may name without an acknowledgement, and what auto mode may believe from
+// an echo service and point the rule at.
+func PublicIPv4(addr netip.Addr) bool {
+	if !addr.Is4() {
+		return false
+	}
+	for _, np := range notPublicIPv4 {
+		if np.Contains(addr) {
+			return false
+		}
+	}
+	return true
 }
 
 // ParseFirewallSources checks a list of firewall source ranges and returns
