@@ -52,6 +52,12 @@ func stateDirs(cfg *config.ServerConfig) []string {
 			return nil
 		}
 		images, instances, snapshots, uppers, sockets = v.ImagesDir, v.InstanceDir, v.SnapshotsDir, v.UppersDir, v.SocketDir
+	case config.BackendRemote:
+		// The remote backend keeps only its record cache on this host.
+		if cfg.Remote == nil {
+			return nil
+		}
+		return []string{cfg.Remote.StateDirPath(serverStateDir(cfg))}
 	default:
 		return nil
 	}

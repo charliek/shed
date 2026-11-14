@@ -885,3 +885,57 @@ class RemoteServer(LocalServer):
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return ""
         return r.stdout if r.returncode == 0 else ""
+
+
+class CloudServer(LocalServer):
+    """A shed-server running `default_backend: remote`, reached through the
+    local `shed` CLI (the remote dev server runs on this machine).
+
+    Each shed is a cloud VM, so this class differs from `LocalServer` in two
+    places only:
+
+      - Images. A remote server names images by alias (`remote.image_aliases`)
+        or falls back to `remote.default_image`; the vz/fc image names the
+        suite passes (`base`, `extensions`) do not exist there. `create`
+        therefore sends `--image` only when `image` was set on this object
+        (`SHED_REMOTE_IMAGE`), and otherwise boots the server's default.
+      - Timeouts. A cloud create takes about a minute, a stop about 30 s and a
+        start about 45 s (measured on the dev server), so the stop and start
+        defaults are wider than the local ones.
+
+    The log is the dev server's own file (`~/.shed/dev-remote/server.log`),
+    read like any `LocalServer` log.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        log_path: Optional[Path] = None,
+        image: Optional[str] = None,
+    ) -> None:
+        super().__init__(name=name, backend="remote", log_path=log_path)
+        self.image = image
+
+    def create(self, name: str, image: Optional[str] = "base", **kwargs) -> ShedHandle:
+        kwargs.setdefault("timeout", 300)
+        return super().create(name, image=self.image, **kwargs)
+
+    def stop(self, name: str, timeout: int = 180) -> None:
+        super().stop(name, timeout=timeout)
+
+    def start(self, name: str, timeout: int = 240) -> None:
+        super().start(name, timeout=timeout)
+
+    def list_sheds(self) -> list[dict]:
+        """`shed --json list` as parsed objects (fail-loud, unlike
+        `list_shed_names`): the remote tests assert on `id`, `backend` and
+        `status`, which a quiet `[]` would hide."""
+        r = self.cli("--json", "list", timeout=30)
+        if r.returncode != 0:
+            raise AssertionError(
+                f"shed --json list failed (exit {r.returncode}) on {self.name}: "
+                f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            )
+        sheds = json.loads(r.stdout)
+        assert isinstance(sheds, list), f"shed --json list gave {r.stdout!r}"
+        return sheds

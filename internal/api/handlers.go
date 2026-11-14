@@ -37,6 +37,11 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		HTTPSPort:    s.cfg.HTTPSPort,
 		Features:     s.serverFeatures(),
 	}
+	// Only a backend that reports its own capabilities (remote) states its
+	// isolation kind; Firecracker and VZ answer exactly as before.
+	if r, ok := s.backend.(backend.CapabilityReporter); ok {
+		info.Isolation = r.Capabilities().Isolation
+	}
 	// Client-CA visibility, mtls only. Reaching /api/info in mtls mode already
 	// required a valid client certificate (that mode has no bootstrap
 	// exemptions), so this is reported to authenticated callers only.
@@ -113,6 +118,31 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	// off the wire); start from zero whatever the decoder did.
 	req.Owner = ""
 	req.ResolvedMounts = nil
+	// The shed ID is server-minted, like Owner. Only an asynchronous backend
+	// (remote) stores it today; Firecracker and VZ get none.
+	req.ID = ""
+	asyncBackend, isAsync := backend.IsAsync(s.backend)
+	if isAsync {
+		id, err := config.NewShedID()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, config.ErrBackendError, "mint shed id: "+err.Error())
+			return
+		}
+		req.ID = id
+	}
+
+	// A remote server offers named sizes: the request's cpus and memory pick
+	// one, and the record carries that size's numbers. This runs before the
+	// client cap check so the caps apply to what the shed will really get.
+	if s.cfg.DefaultBackend == config.BackendRemote && s.cfg.Remote != nil {
+		size, err := s.cfg.Remote.ResolveSize(req.CPUs, req.MemoryMB)
+		if err != nil {
+			code, errCode, msg := mapBackendError(err)
+			writeError(w, code, errCode, msg)
+			return
+		}
+		req.CPUs, req.MemoryMB = size.CPUs, size.MemoryMB
+	}
 
 	// A service client's create policy runs before any validation that
 	// touches the host (local_dir existence would otherwise be an oracle for
@@ -124,6 +154,14 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 			writePolicyViolation(w, caller, rule)
 			return
 		}
+	}
+
+	// Fields the backend cannot honour are refused here, before any check
+	// that reads the host and before the backend is called.
+	caps := s.capabilities()
+	if field := createFieldRefusal(caps, &req); field != "" {
+		s.writeFeatureUnsupported(w, http.StatusUnprocessableEntity, field)
+		return
 	}
 
 	// Validate local_dir and repo are mutually exclusive
@@ -219,7 +257,32 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 
 	// Stream progress via SSE if the client requests it
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		if isAsync {
+			s.streamSSE(w, r, r.Context(), nil, nil, func(ctx context.Context) (any, error) {
+				shed, err := s.createAndWait(ctx, context.WithoutCancel(r.Context()), asyncBackend, req)
+				if err != nil {
+					log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, s.backend.Type(), err)
+				}
+				return shed, err
+			})
+			return
+		}
 		s.handleCreateShedSSE(w, r, req)
+		return
+	}
+
+	// An asynchronous backend saves the shed as starting and finishes in a
+	// job it owns, which also owns the phase timer. The request must not be
+	// able to cancel that job.
+	if isAsync {
+		shed, err := s.backend.CreateShed(context.WithoutCancel(r.Context()), req)
+		if err != nil {
+			log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, s.backend.Type(), err)
+			code, errCode, msg := mapBackendError(err)
+			writeError(w, code, errCode, msg)
+			return
+		}
+		writeJSON(w, http.StatusCreated, shed)
 		return
 	}
 
@@ -544,9 +607,31 @@ func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
+	asyncBackend, isAsync := backend.IsAsync(s.backend)
+
 	// Stream teardown progress via SSE if the client requests it.
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		if isAsync {
+			// The record is hidden at once; the stream stays open until the
+			// job has destroyed the VM. A disconnect ends the wait only.
+			s.streamSSE(w, r, r.Context(), nil, nil, func(ctx context.Context) (any, error) {
+				return map[string]string{"name": name}, s.deleteAndWait(ctx, context.WithoutCancel(r.Context()), asyncBackend, name)
+			})
+			return
+		}
 		s.handleDeleteShedSSE(w, r, name)
+		return
+	}
+
+	// An asynchronous backend hides the record and returns; its job owns the
+	// teardown and its timing.
+	if isAsync {
+		if err := s.backend.DeleteShed(context.WithoutCancel(r.Context()), name); err != nil {
+			code, errCode, msg := mapBackendError(err)
+			writeError(w, code, errCode, msg)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
@@ -599,7 +684,12 @@ func (s *Server) handleDeleteShedSSE(w http.ResponseWriter, r *http.Request, nam
 func (s *Server) handleStartShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	shed, err := s.backend.StartShed(r.Context(), name)
+	// An asynchronous backend starts a job that must outlive the request.
+	ctx := r.Context()
+	if _, ok := backend.IsAsync(s.backend); ok {
+		ctx = context.WithoutCancel(ctx)
+	}
+	shed, err := s.backend.StartShed(ctx, name)
 	if err != nil {
 		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
@@ -798,6 +888,23 @@ func mapBackendError(err error) (int, string, string) {
 	}
 	if errors.Is(err, config.ErrNetworkEnforcementUnavailableSentinel) {
 		return http.StatusServiceUnavailable, config.ErrNetworkEnforcementUnavailable, err.Error()
+	}
+	// A cloud backend's refusals. None is a 409: a client reads a 409 on
+	// create as "the shed exists".
+	if errors.Is(err, config.ErrServerLimitReachedSentinel) {
+		return http.StatusServiceUnavailable, config.ErrServerLimitReached, err.Error()
+	}
+	if errors.Is(err, config.ErrCloudQuotaExceededSentinel) {
+		return http.StatusServiceUnavailable, config.ErrCloudQuotaExceeded, err.Error()
+	}
+	if errors.Is(err, config.ErrZoneCapacityUnavailableSentinel) {
+		return http.StatusServiceUnavailable, config.ErrZoneCapacityUnavailable, err.Error()
+	}
+	if errors.Is(err, config.ErrFeatureUnsupportedSentinel) {
+		return http.StatusNotImplemented, config.ErrFeatureUnsupported, err.Error()
+	}
+	if errors.Is(err, errSettledNotRunning) {
+		return http.StatusInternalServerError, config.ErrBackendError, err.Error()
 	}
 
 	// Fallback to string matching for errors without sentinels

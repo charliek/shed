@@ -198,15 +198,29 @@ func printError(msg string, suggestions ...string) {
 }
 
 // ensureRunningShed gets a shed and starts it if not running.
-// Returns the shed after ensuring it's running.
+// Returns the shed after ensuring it's running. A remote shed that is
+// starting or stopping is waited on first (progress on stderr), and a start
+// is waited on until the shed runs.
 func ensureRunningShed(client *APIClient, name string) (*config.Shed, error) {
 	shed, err := client.GetShed(name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get shed status: %w", err)
 	}
+	// Only a remote shed is waited on, or refused in status "error": a
+	// Firecracker or VZ shed in any status but running is started, exactly
+	// as before.
+	remote := shed.Backend == config.BackendRemote
+	if remote {
+		if shed, err = waitSettled(client, shed, os.Stderr); err != nil {
+			return nil, err
+		}
+	}
 
 	if shed.Status == config.StatusRunning {
 		return shed, nil
+	}
+	if remote && shed.Status == config.StatusError {
+		return nil, fmt.Errorf("shed %s is %s; delete it and create it again", name, statusWithReason(*shed))
 	}
 
 	// Auto-start the shed
@@ -216,6 +230,14 @@ func ensureRunningShed(client *APIClient, name string) (*config.Shed, error) {
 	shed, err = client.StartShed(name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start shed: %w", err)
+	}
+	if inTransition(shed.Status) {
+		if shed, err = waitSettled(client, shed, os.Stderr); err != nil {
+			return nil, err
+		}
+		if err := requireSettledStatus(shed, config.StatusRunning); err != nil {
+			return nil, err
+		}
 	}
 	if !jsonFlag {
 		printSuccess("Shed %s started", name)

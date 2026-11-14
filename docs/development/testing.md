@@ -39,6 +39,43 @@ Firecracker unit tests (metadata, rootfs, networking) use the `linux` build tag 
 go test ./internal/firecracker/...
 ```
 
+### Remote transport suite
+
+The remote backend reaches a shed's agent through a transport link (`internal/remote/transport`). One conformance suite (`internal/remote/transport/conformance`) runs against every link, driving a real `shed-agent` the way the server does. It is part of `go test ./...`:
+
+| Leg | Test | Needs |
+|-----|------|-------|
+| Local link (agent on unix sockets, no SSH) | `go test ./internal/remote/transport/locallink` | Linux |
+| SSH link through an in-process SSH server | `go test ./internal/remote/transport/sshlink -run InProcess` | Linux |
+| SSH link through a real OpenSSH `sshd` | `go test ./internal/remote/transport/sshlink -run SSHD` | Docker |
+| SSH link against a real machine | `go test ./internal/remote/transport/sshlink/tests -run TestLive` | See below |
+
+The `sshd` leg builds a container from `ubuntu:24.04` with `openssh-server`, the guest's `sshd` policy (`guest.SSHDConfig`) and an agent built from the source tree. It skips without Docker and with `-short`. Set `SHED_REQUIRE_SSHD=1` to turn a skip into a failure; CI does.
+
+```bash
+SHED_REQUIRE_SSHD=1 go test ./internal/remote/transport/... -count=1
+```
+
+The live check points the same suite at a real machine. It runs only when `SHED_LINK_HOST` is set:
+
+```bash
+SHED_LINK_HOST=<address or address:port> \
+SHED_LINK_KEY_FILE=<OpenSSH ed25519 private key> \
+SHED_LINK_HOST_KEY='ssh-ed25519 AAAA...' \
+go test ./internal/remote/transport/sshlink/tests -run TestLive -count=1 -v
+```
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SHED_LINK_HOST` | _unset_ (the check skips) | Address of the machine's `sshd`, with or without a port. |
+| `SHED_LINK_KEY_FILE` | _required_ | The client key. Unencrypted ed25519. |
+| `SHED_LINK_HOST_KEY` | _required_ | The machine's ed25519 host key. It is pinned, never learned. |
+| `SHED_LINK_USER` | `shed-link` | Login name. |
+| `SHED_LINK_SOCKET_DIR` | `/run/shed-agent` | The agent's `--listen unix:<dir>`. |
+| `SHED_LINK_HTTP_PORT` | `498` | The agent's `--http-port`. |
+| `SHED_LINK_STREAM_MIB` | `16` | Size of the large-stream check. |
+| `SHED_LINK_RESTART_CMD` | _unset_ | Local shell command that drops the machine's connections and brings `sshd` and the agent back. Without it the restart check is skipped. |
+
 ### Integration Suite (pytest)
 
 Live create-cycle tests that drive a running `shed-server` via the `shed` CLI. The suite lives at `tests/integration/` and is the recommended path for verifying that the host-side and guest-side pieces actually fit together — boot timing, SSE events, `--repo` clone, `shed exec` round-trip, etc.
@@ -205,6 +242,14 @@ per the knob below), so the entry above only registers the *connection*
 details — it carries no credential. `shed server add localhost --ssh-port
 12222 --name my-server-dev` (SSH-first: see the callout below) is what
 actually bootstraps one; prefer it over hand-editing the file.
+
+#### Remote backend (cloud sheds)
+
+A dev server with `default_backend: remote` runs on your machine and creates one cloud VM per shed. Its setup (the private env file, `make dev-server-up-remote` and its siblings, the image bake) is on [Remote Backend Development](remote-backend.md). The suite's `[remote]` cases are opt-in and billed:
+
+```bash
+make test-integration-remote
+```
 
 #### Service clients, HTTPS exec and network profiles (FC, mtls)
 

@@ -115,6 +115,10 @@ The FC dev server runs via `sudo nohup` on the remote (no systemd unit — same 
 
 **For PRs that change `shed-build-tools` (`build-tools/`) or base images (`vz/Dockerfile`, `firecracker/Dockerfile`, shed-extensions bumps):** the dev-server workflow extends to those too — see `docs/development/testing.md` § "Validating pre-release: build-tools image changes" and § "Validating pre-release: base image changes" for the `RELEASE_BUILD_TOOLS_REF=shed-build-tools:dev` and `OUTPUT_DIR=...shed-dev/vz ./scripts/build-vz-rootfs.sh ...` overrides that wire local builds into the dev server's blob store.
 
+#### Remote backend dev server (cloud VMs)
+
+`make dev-server-up-remote` (siblings `-down-`, `-restart-`, `-status-`, `-logs-remote`) runs the dev build with `default_backend: remote` on this machine: mtls, HTTPS 18490, SSH 12290, state under `~/.shed/dev-remote/`, CLI entry `remote-dev`. Cloud settings come from a private env file (`~/.config/shed/remote-dev/env`, override `SHED_REMOTE_ENV_FILE`) and never enter the repo, which is public: no project IDs, hosts or addresses in committed files. **Every shed is a billed VM that keeps running after the server stops**; check `shed -s remote-dev list` (and the cloud) before you finish. `make test-integration-remote` runs the suite's opt-in `[remote]` cases (manual only, about 25 VMs). Setup, image bake and timings: `docs/development/remote-backend.md`.
+
 #### Performance impact — vet against the released version
 
 For changes that touch the boot path, agent dial, healthPoll, upper-allocation, mount, image-resolution, or any other hot path: **measure the impact on each platform the change affects, against the most recent release binary, before merging.** The split timing gate (`test_create_agent_p50` + `test_create_rootfs_template_present`) is the floor — it fires on regressions around 500 ms or more (see `tests/integration/fixtures/server.py:DEFAULT_AGENT_P50_MS` for the per-backend regression budget) — but a sub-threshold regression (or worse, a "no regression" that masks an actual gain that didn't materialise) won't trip it.
@@ -139,6 +143,7 @@ This catches the v0.5.4-class regression where the binary built correctly but a 
 | `SHED_FC_SERVER` | same as `$SHED_FC_HOST` | `~/.shed/config.yaml` entry name for the deb FC server. |
 | `SHED_FC_DEV_SERVER` | `$(SHED_FC_HOST)-dev` | `~/.shed/config.yaml` entry name for the parallel dev FC server. |
 | `SHED_FC_LOG_PATH` | _unset_ (uses journald) | Remote file path for `fc_server` fixture to read logs from (set by `test-integration-dev-fc` to the dev server's log file because the dev FC server runs via `sudo nohup` and isn't under systemd). |
+| `SHED_REMOTE_SERVER` | _unset_ | `~/.shed/config.yaml` entry for a `default_backend: remote` server. Unset skips every `[remote]` case (each would create a billed cloud VM); `make test-integration-remote` sets it to `remote-dev`. |
 | `RELEASE_BUILD_TOOLS_REF` | latest `git tag` matching `v*` | shed-build-tools image ref injected into the dev binary so it uses release-shaped upper-template behavior. Pin to an older release if your source has drifted: `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7`. |
 | `SHED_IMAGE_HAS_ROOST` | _unset_ | Gates `test_roost_session_baked`: a comma list of the backends (`vz`, `fc`) whose `extensions` image was rebuilt with the roost-session bake. `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the suite is parameterized over both backends and the other one still boots the published image); unset (skips) for plain `test-integration` since images built before 0.9.0 carry no roost-session. |
 | `SHED_IMAGE_HAS_CRAZE` | _unset_ | Gates `test_craze_baked`: a comma list of the backends (`vz`, `fc`) whose `extensions` image was rebuilt with the craze bake. `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (same split as `SHED_IMAGE_HAS_ROOST`); unset (skips) for plain `test-integration` since published images bake their release's craze (0.9.0: 0.1.0) and the test asserts the pinned version. |
@@ -162,6 +167,9 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - `internal/agentproto/` — Binary protocol for vsock communication
 - `internal/sshd/` — SSH server implementation
 - `internal/backend/` — Backend interface all backends implement
+- `internal/remote/` — Remote (cloud VM) backend: async jobs, record cache, start-up reconcile, limits; `provider/` (cloud seam, `gce/` REST client, `fake/`), `transport/` (SSH link to the VM, `sshlink/`, `locallink/`), `guest/` (guest layout contract)
+- `gce/` — Remote VM image provisioning (provision, identity and agent units, verify, seal, bake), run by `scripts/build-gce-image.sh` (`make gce-image`)
+- `scripts/remote/` — `gce-setup.sh --print`: the one-time Google Cloud setup for a remote environment (prints `gcloud` commands, runs none)
 - `guest/extensions/etc/` — Guest overlay (systemd units, `environment.d`, `shed-extensions.d` manifests) staged into the rootfs alongside the guest binaries
 - `crates/` — shared Rust client core workspace (see `crates/CLAUDE.md` and "Monorepo layout" above)
 - `desktop/` — Tauri desktop app (macOS + Linux) + `shedtest` harness (see `desktop/CLAUDE.md`)
@@ -204,8 +212,9 @@ This convention is documented end-user-style in `docs/reference/cli.md` under `s
 |---------|----------|-----------|-----------|
 | Firecracker | Linux (KVM) | microVM | Rootfs ext4 image |
 | VZ | macOS (Apple Silicon) | VM via vfkit | Overlay rootfs; host dirs via VirtioFS (`--local-dir`/`--add-dir`) |
+| Remote | any (server); VMs on Google Compute Engine | one cloud VM per shed, isolated by network topology | VM boot disk; no host dirs, mounts, snapshots, reset, image store or egress profiles (422/501 `FEATURE_UNSUPPORTED`) |
 
-The server config `default_backend` supports `vz`, `firecracker`, or `detect` (auto-selects based on platform).
+The server config `default_backend` supports `vz`, `firecracker`, `remote`, or `detect` (auto-selects `vz` or `firecracker` by platform; never `remote`). The remote backend's lifecycle is asynchronous (`starting`/`stopping` statuses, `async_lifecycle` feature token); see `docs/reference/remote-backend.md`.
 
 ## VM Images
 

@@ -14,10 +14,18 @@ import (
 	"github.com/charliek/shed/internal/plugin"
 )
 
+// probeLinger bounds how long the agent waits, after answering a probe, for
+// the host to hang up first. Waiting lets the reply drain on every transport
+// before the agent's close; the host normally closes as soon as it has read
+// the reply.
+const probeLinger = 2 * time.Second
+
 // handleNotifyConnection handles a connection on the notify port. It reads the
 // first message to determine the connection type:
-//   - Transient health check (system:health request): respond inline and close
-//   - Persistent message channel: promote to msgConn, start heartbeats, enter read loop
+//   - Probe (system:health request with probe:true): reply with the agent's
+//     version, protocol and layout, then close. Never promoted.
+//   - Anything else: the persistent message channel. Promote to msgConn,
+//     start heartbeats, enter the read loop.
 func (s *Server) handleNotifyConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -34,12 +42,18 @@ func (s *Server) handleNotifyConnection(conn net.Conn) {
 		return
 	}
 
+	if env, ok := parseProbe(msgType, data); ok {
+		s.handleProbe(conn, env)
+		return
+	}
+
 	// The persistent message channel starts with a system:health handshake
-	// from the host. Respond to it, then promote this connection and start heartbeats.
-	// Transient health checks (from WaitForHealth during startup) use the same
-	// protocol but close the connection after one exchange — the agent handles
-	// both identically, and clearMessageConnIfCurrent safely cleans up when
-	// the transient connection closes.
+	// from the host. Respond to it, then promote this connection and start
+	// heartbeats. A server older than the probe field sends its transient
+	// health checks the same way; those are promoted too, and
+	// clearMessageConnIfCurrent cleans up when they close. That is the bug
+	// probe:true exists to avoid: a check arriving while the real channel is
+	// up steals the msgConn slot, leaving the real channel silent.
 	s.setMessageConn(conn)
 	defer s.clearMessageConnIfCurrent(conn)
 
@@ -165,13 +179,26 @@ func (s *Server) handleHealthRequest(conn net.Conn, env *plugin.Envelope) {
 		log.Printf("Failed to marshal health response: %v", err)
 		return
 	}
-	if err := writeMessage(conn, MsgTypePluginMessage, data); err != nil {
+	// Written under msgMu: on a promoted connection the heartbeat goroutine
+	// writes too, and a frame is two writes, so unserialised writes could
+	// interleave. The write is bounded like sendPluginMessage's: msgMu also
+	// guards msgConn, so a host that stopped reading must not be able to
+	// hold it (and with it every sender and the next connection's
+	// promotion) for longer than writeTimeout.
+	s.msgMu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	err = writeMessage(conn, MsgTypePluginMessage, data)
+	_ = conn.SetWriteDeadline(time.Time{})
+	s.msgMu.Unlock()
+	if err != nil {
 		log.Printf("Failed to write health response: %v", err)
 	}
 
 	// Parse the optional extensions payload from the health handshake.
-	// Transient health polls (WaitForHealth/CheckHealth) send nil payload —
-	// only the persistent message channel handshake includes extensions.
+	// Transient health polls from servers older than the probe field send a
+	// nil payload; only the persistent message channel handshake includes
+	// extensions. (Probes never reach here: handleNotifyConnection answers
+	// them with handleProbe.)
 	if len(env.Payload) > 0 {
 		var reqPayload plugin.HealthRequestPayload
 		if err := json.Unmarshal(env.Payload, &reqPayload); err != nil {
@@ -182,6 +209,50 @@ func (s *Server) handleHealthRequest(conn net.Conn, env *plugin.Envelope) {
 			s.enableExtensions(reqPayload.Extensions)
 		}
 	}
+}
+
+// parseProbe reports whether the first message on a notify connection is a
+// probe: a system:health request whose payload sets probe:true.
+func parseProbe(msgType byte, data []byte) (*plugin.Envelope, bool) {
+	if msgType != MsgTypePluginMessage {
+		return nil, false
+	}
+	var env plugin.Envelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil, false
+	}
+	if env.Type != plugin.MessageTypeRequest || env.Namespace != plugin.NamespaceHealth || len(env.Payload) == 0 {
+		return nil, false
+	}
+	var req plugin.HealthRequestPayload
+	if err := json.Unmarshal(env.Payload, &req); err != nil || !req.Probe {
+		return nil, false
+	}
+	return &env, true
+}
+
+// handleProbe answers a probe with the agent's version, protocol and layout.
+// It does not promote the connection, start heartbeats or act on extensions.
+// After the reply it waits (at most probeLinger) for the host to close, then
+// the caller closes the connection.
+func (s *Server) handleProbe(conn net.Conn, env *plugin.Envelope) {
+	payload, err := json.Marshal(s.info)
+	if err != nil {
+		log.Printf("Failed to marshal probe reply: %v", err)
+		return
+	}
+	data, err := json.Marshal(plugin.NewResponse(env.ID, plugin.NamespaceHealth, payload))
+	if err != nil {
+		log.Printf("Failed to marshal probe reply: %v", err)
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if err := writeMessage(conn, MsgTypePluginMessage, data); err != nil {
+		log.Printf("Failed to write probe reply: %v", err)
+		return
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(probeLinger))
+	_, _ = io.Copy(io.Discard, io.LimitReader(conn, MaxMessageSize))
 }
 
 // deliverResponse routes a response envelope to the pending request channel.

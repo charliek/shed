@@ -70,6 +70,9 @@ def test_create_delete_lifecycle(shed_server, test_shed_name):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.local_vm_only(
+    "vz/fc boot-path timing (setup/vm/agent phases); a remote create's phases are provider/boot/provision/ready"
+)
 def test_phase_timer_emitted(shed_server, test_shed_name):
     """The server logs a PhaseTimer line for the create with expected phase keys."""
     handle = shed_server.create(test_shed_name, image="base")
@@ -193,6 +196,9 @@ def test_repo_clone_https(shed_server, test_shed_name):
 ROOTFS_TEMPLATE_FAST_PATH_CEILING_MS = 100
 
 
+@pytest.mark.local_vm_only(
+    "vz/fc boot-path timing (setup/vm/agent phases); a remote create's phases are provider/boot/provision/ready"
+)
 def test_create_agent_p50(shed_server):
     """Boot-path p50 regression gate for the `agent` phase.
 
@@ -267,6 +273,9 @@ def test_create_agent_p50(shed_server):
     )
 
 
+@pytest.mark.local_vm_only(
+    "vz/fc boot-path timing (setup/vm/agent phases); a remote create's phases are provider/boot/provision/ready"
+)
 def test_create_rootfs_template_present(shed_server, test_shed_name):
     """The VZ upper-template fast-path (pre-formatted template clone) is active.
 
@@ -380,6 +389,9 @@ _SHED_EXTENSIONS_CONFIGS = (
 )
 
 
+@pytest.mark.local_vm_only(
+    "the cloud image carries no shed-extensions credential brokering (extensions.enabled is refused on remote)"
+)
 def test_extensions_image_smoke(shed_server, test_shed_name):
     """The `extensions` image variant carries the shed-extensions payload.
 
@@ -489,6 +501,9 @@ def _roost_baked_backends() -> set[str]:
     return {b.strip() for b in raw.split(",") if b.strip()}
 
 
+@pytest.mark.local_vm_only(
+    "checks the vz/fc rootfs bakes; the cloud image's bakes are checked when it is baked (gce/verify.sh)"
+)
 @pytest.mark.skipif(
     not _roost_baked_backends(),
     reason=(
@@ -664,6 +679,9 @@ def _baked_image_verdict(
     return "run" if image_present else "fail"
 
 
+@pytest.mark.local_vm_only(
+    "checks the vz/fc rootfs bakes; the cloud image's bakes are checked when it is baked (gce/verify.sh)"
+)
 @pytest.mark.skipif(
     not _craze_baked_backends(),
     reason=(
@@ -776,6 +794,9 @@ def _home_dirs_baked_backends() -> set[str]:
     return {b.strip() for b in raw.split(",") if b.strip()}
 
 
+@pytest.mark.local_vm_only(
+    "checks the vz/fc rootfs bakes; the cloud image's bakes are checked when it is baked (gce/verify.sh)"
+)
 @pytest.mark.skipif(
     not _home_dirs_baked_backends(),
     reason=(

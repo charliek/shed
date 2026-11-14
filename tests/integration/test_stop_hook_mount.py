@@ -40,6 +40,11 @@ import pytest
 
 from fixtures.server import RemoteServer
 
+# Every case here is vz/fc only; `[remote]` skips with this reason.
+pytestmark = pytest.mark.local_vm_only(
+    "--local-dir host mounts are refused on remote (FEATURE_UNSUPPORTED)"
+)
+
 MIN_VERSION = "0.9.1"
 
 HOOK_MARKER = "stop-hook-marker"

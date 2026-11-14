@@ -87,9 +87,10 @@ type ServerConfig struct {
 	LogLevel    string                 `yaml:"log_level"`
 	Terminal    *terminal.Config       `yaml:"terminal"`
 
-	// DefaultBackend specifies the backend type: "vz", "firecracker", or "detect".
-	// When set to "detect", the backend is chosen based on the platform
-	// (vz on macOS/arm64, firecracker on linux).
+	// DefaultBackend specifies the backend type: "vz", "firecracker",
+	// "remote", or "detect". When set to "detect", the backend is chosen
+	// based on the platform (vz on macOS/arm64, firecracker on linux);
+	// detect never chooses remote.
 	DefaultBackend string `yaml:"default_backend,omitempty"`
 
 	// Firecracker contains Firecracker-specific configuration
@@ -97,6 +98,11 @@ type ServerConfig struct {
 
 	// VZ contains Apple Virtualization.framework-specific configuration (macOS only)
 	VZ *VZConfig `yaml:"vz,omitempty"`
+
+	// Remote configures the remote backend (each shed a cloud VM). It is
+	// required with default_backend: remote and refused with any other
+	// backend; a firecracker: or vz: block beside it is refused too.
+	Remote *RemoteConfig `yaml:"remote,omitempty"`
 
 	// Extensions configures which extensions the agent should enable in VMs.
 	Extensions *ExtensionsConfig `yaml:"extensions,omitempty"`
@@ -361,7 +367,21 @@ func (c *ServerConfig) validateNetwork() error {
 // network.default_profile, or a service client whose policy.network is not
 // open (the default is isolated), is refused there. Run after default_backend
 // is resolved.
+//
+// The remote backend accepts "isolated": there it means isolation by network
+// topology (no route between sheds or to the server host). That holds only
+// while the firewall rule admits the server alone, so firewall.mode: any
+// refuses it.
 func (c *ServerConfig) validateNetworkBackend() error {
+	if c.DefaultBackend == BackendRemote {
+		if c.Remote == nil || c.Remote.Firewall.Mode != RemoteFirewallAny {
+			return nil
+		}
+		if p := c.NetworkDefaultProfile(); p != NetworkProfileOpen {
+			return fmt.Errorf("network.default_profile: %s is not allowed with remote.firewall.mode: %s (every shed's SSH port is then reachable from the others)", p, RemoteFirewallAny)
+		}
+		return nil
+	}
 	if c.DefaultBackend != BackendVZ {
 		return nil
 	}
@@ -520,6 +540,10 @@ func (c *ServerConfig) validateClientImages() error {
 		if c.VZ != nil {
 			aliases = c.VZ.ImageAliases
 		}
+	case BackendRemote:
+		if c.Remote != nil {
+			aliases = c.Remote.ImageAliases
+		}
 	}
 	for name, cc := range c.Auth.Clients {
 		for _, img := range cc.Policy.Images {
@@ -532,9 +556,16 @@ func (c *ServerConfig) validateClientImages() error {
 }
 
 // ActiveDefaultResources returns the active backend's default_cpus and
-// default_memory_mb, the values a create that sets neither gets.
+// default_memory_mb, the values a create that sets neither gets. On remote
+// they are the CPUs and memory of remote.default_size.
 func (c *ServerConfig) ActiveDefaultResources() (cpus, memoryMB int) {
 	switch c.DefaultBackend {
+	case BackendRemote:
+		if c.Remote != nil {
+			if s, ok := c.Remote.Sizes[c.Remote.DefaultSize]; ok {
+				return s.CPUs, s.MemoryMB
+			}
+		}
 	case BackendFirecracker:
 		if c.Firecracker != nil {
 			return c.Firecracker.DefaultCPUs, c.Firecracker.DefaultMemoryMB
@@ -2066,6 +2097,9 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	if cfg.VZ != nil {
 		cfg.VZ.applyDefaults()
 	}
+	if cfg.Remote != nil {
+		cfg.Remote.applyDefaults()
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -2150,6 +2184,9 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 	if cfg.VZ != nil {
 		cfg.VZ.applyDefaults()
 	}
+	if cfg.Remote != nil {
+		cfg.Remote.applyDefaults()
+	}
 
 	return cfg, nil
 }
@@ -2203,7 +2240,7 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	}
 
 	if !isValidBackend(c.DefaultBackend) {
-		return fmt.Errorf("invalid default_backend: %s (must be firecracker, vz, or detect)", c.DefaultBackend)
+		return fmt.Errorf("invalid default_backend: %s (must be firecracker, vz, remote, or detect)", c.DefaultBackend)
 	}
 
 	// Resolve detect to the actual backend (no OS coupling check below).
@@ -2213,6 +2250,10 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 			return fmt.Errorf("default_backend: %w", err)
 		}
 		c.DefaultBackend = resolved
+	}
+
+	if err := c.validateRemoteBlockUnused(); err != nil {
+		return err
 	}
 
 	// Per-backend config block presence is still validated (you can't
@@ -2227,6 +2268,10 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	case BackendVZ:
 		if c.VZ == nil {
 			return fmt.Errorf("vz configuration is required when backend is vz")
+		}
+	case BackendRemote:
+		if err := c.validateRemote(); err != nil {
+			return err
 		}
 	}
 	return c.validateNetworkBackend()
@@ -2244,6 +2289,10 @@ func (c *ServerConfig) ActiveDefaultImage() string {
 	case BackendVZ:
 		if c.VZ != nil {
 			return c.VZ.DefaultImage
+		}
+	case BackendRemote:
+		if c.Remote != nil {
+			return c.Remote.DefaultImage
 		}
 	}
 	return ""
@@ -2292,7 +2341,7 @@ func (c *ServerConfig) Validate() error {
 	}
 
 	if !isValidBackend(c.DefaultBackend) {
-		return fmt.Errorf("invalid default_backend: %s (must be firecracker, vz, or detect)", c.DefaultBackend)
+		return fmt.Errorf("invalid default_backend: %s (must be firecracker, vz, remote, or detect)", c.DefaultBackend)
 	}
 
 	// Resolve detect to the actual backend
@@ -2302,6 +2351,12 @@ func (c *ServerConfig) Validate() error {
 			return fmt.Errorf("default_backend: %w", err)
 		}
 		c.DefaultBackend = resolved
+	}
+
+	// A remote: block is refused beside any other backend, before that
+	// backend's own checks, so the message names the real mistake.
+	if err := c.validateRemoteBlockUnused(); err != nil {
+		return err
 	}
 
 	if runtime.GOOS != "linux" && c.DefaultBackend == BackendFirecracker {
@@ -2332,6 +2387,13 @@ func (c *ServerConfig) Validate() error {
 		}
 		if err := c.VZ.Validate(); err != nil {
 			return fmt.Errorf("vz config: %w", err)
+		}
+	}
+
+	// Validate the remote block if enabled
+	if c.DefaultBackend == BackendRemote {
+		if err := c.validateRemote(); err != nil {
+			return err
 		}
 	}
 
@@ -2366,7 +2428,18 @@ func (c *ServerConfig) Validate() error {
 }
 
 func isValidBackend(backend string) bool {
-	return backend == BackendFirecracker || backend == BackendVZ || backend == BackendDetect
+	return backend == BackendFirecracker || backend == BackendVZ || backend == BackendRemote || backend == BackendDetect
+}
+
+// validateRemoteBlockUnused refuses a remote: block beside a backend that is
+// not remote. Run after default_backend is resolved: detect never resolves
+// to remote, so `default_backend: detect` with a remote: block fails here
+// rather than quietly running Firecracker or VZ.
+func (c *ServerConfig) validateRemoteBlockUnused() error {
+	if c.Remote != nil && c.DefaultBackend != BackendRemote {
+		return fmt.Errorf("a remote: block needs default_backend: %s (it is %s; detect never picks remote)", BackendRemote, c.DefaultBackend)
+	}
+	return nil
 }
 
 // ResolveBackend resolves a backend string to a concrete backend type.

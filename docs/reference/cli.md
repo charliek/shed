@@ -149,15 +149,15 @@ shed create <name> [flags]
 | `--repo` | `-r` | None | Repository to clone into `~/<reponame>` (`owner/repo` shorthand or full URL). The login lands in the cloned repo directory. Mutually exclusive with `--local-dir`/`--add-dir`. |
 | `--server` | `-s` | Default server | Target server |
 | `--image` | `-i` | Server default | Image [variant name](images.md) to use |
-| `--backend` | | Server default | Backend to use: `firecracker` or `vz` |
-| `--cpus` | | Server default | Number of vCPUs |
-| `--memory` | | Server default | Memory in MB |
+| `--backend` | | Server default | Backend to use: `firecracker`, `vz` or `remote`. Must match the server's backend. |
+| `--cpus` | | Server default | Number of vCPUs. On a [remote](remote-backend.md) server, the smallest configured size with at least this many. |
+| `--memory` | | Server default | Memory in MB. On a remote server, the smallest configured size with at least this much. |
 | `--upper-size` | | Server default (`5G`) | Logical size of the per-shed writable overlay upper layer (e.g. `1G`, `5G`, `10G`, `100G`). Validated range: 1–100 GiB. The overlay grows copy-on-write, so this is the maximum, not the on-disk physical bytes. |
 | `--local-dir` | | None | Mount a local host directory into the guest at `~/<basename>`. The login lands there. Mutually exclusive with `--repo`. |
 | `--add-dir` | | None | Mount an additional local host directory at `~/<basename>` as a reference sibling. Repeatable. Requires `--local-dir`. |
 | `--egress` | | Server default | Egress-control profiles to apply (comma-separated, e.g. `base,github`; `off` to disable). Requires egress enabled on the server. See [Egress Control](egress.md). |
 | `--mounts` | | `all` | Which server mounts (the server config's `mounts:`) the shed gets: `all`, `none`, or a comma-separated list of mount names (`claude,gh`). Stored with the shed and applied on every start. `none` and a list need a server that advertises `mount_selection`; the CLI refuses them before creating anything otherwise. |
-| `--network` | | Server default (`open`) | Network profile: `open` (today's network) or `isolated` (the internet only: no host, LAN, tailnet or other sheds). Fixed for the shed's life. `isolated` needs a Firecracker server that advertises `network_profiles`; the CLI refuses it before creating anything otherwise. See [Security › Network profiles](security.md#network-profiles). |
+| `--network` | | Server default (`open`) | Network profile: `open` (today's network) or `isolated` (the internet only: no host, LAN, tailnet or other sheds). Fixed for the shed's life. `isolated` needs a server that advertises `network_profiles` (Firecracker, or a [remote](remote-backend.md) server); the CLI refuses it before creating anything otherwise. See [Security › Network profiles](security.md#network-profiles). |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
 | `--no-sync` | | `false` | Skip syncing default profile |
@@ -228,8 +228,10 @@ mcp-test      firecracker  stopped  -                               -           
 | `OWNER` | The service client that created the shed, or `-` for an admin's shed |
 | `MOUNTS` | The shed's server-mount selection: `all`, `none`, or the selected names (`claude,gh`); `-` when the server does not report one (an older server) |
 | `NETWORK` | `open` or `isolated`; `-` when the server does not report one |
+| `STATUS` | `running`, `stopped`, `starting`, `stopping` or `error`, followed by the reason in brackets when the server gives one (`stopped (run_limit)`). See [Remote backend › Statuses](remote-backend.md#statuses). |
+| `ID` | The shed's permanent ID. Shown only when a listed shed has one (remote sheds do). |
 
-With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)).
+With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`.
 
 ### shed start
 
@@ -243,6 +245,8 @@ shed start <name> [flags]
 |------|-------|---------|-------------|
 | `--timeout` | | `10m` | Timeout for start operation (e.g., `30s`, `5m`, `2h`) |
 
+On a [remote](remote-backend.md) server the start answers at once with status `starting`. The CLI then polls the shed every 2 s for up to 180 s, printing progress on stderr, and prints "Started" only once the shed is running. If the start is refused (for example `stopped (capacity)`), the command fails and names the reason. CLIs released before this change print "Started" as soon as the server answers.
+
 ### shed stop
 
 Stops a running shed.
@@ -250,6 +254,8 @@ Stops a running shed.
 ```bash
 shed stop <name>
 ```
+
+On a remote server the stop answers with status `stopping`, and the CLI waits until the shed is `stopped` in the same way. `shed attach`, `shed console`, `shed sync` and `shed tunnels` wait for a starting or stopping shed before they start it.
 
 ### shed delete
 

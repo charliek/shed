@@ -35,8 +35,11 @@ That target:
    `test-integration*` target passes it on), for example
    `PYTEST_ARGS="test_smoke.py -k 'not vz'"`.
 
-Each test is parameterized over `["vz", "fc"]` and skips cleanly when its
-target backend isn't reachable from this host. The session-scoped server
+Each test is parameterized over `["vz", "fc", "remote"]` and skips cleanly
+when its target backend isn't reachable from this host. The `remote` cases
+are opt-in: they skip unless `SHED_REMOTE_SERVER` is set (see
+[Remote backend](#remote-backend-cloud-sheds)), so `make test-integration`
+never creates a cloud VM. The session-scoped server
 fixtures probe once per pytest run; un-reachable backends skip *only* the
 tests they would have run, not the whole session.
 
@@ -81,13 +84,20 @@ tests they would have run, not the whole session.
 | `SHED_MTLS_FLIP_TEST`  | _unset_                                            | Opt-in for `test_mtls.py::test_mode_flip_migrates_live`, which restarts the real Mac dev server twice (token, then back to mtls) to prove the live auth-mode migration in both directions. Unset (the default) skips it — every other test in that module only ever reads the already-running dev server. |
 | `SHED_IMAGE_HAS_ROOST` | _unset_                                            | Gates `test_smoke.py::test_roost_session_baked` — a comma list of the backends (`vz`, `fc`) whose `extensions` image was rebuilt with roost-session baked in. `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the other backend still boots the published image); unset for plain `test-integration` (images built before 0.9.0 carry no roost-session). Overrides `SHED_ROOST_SESSION_VERSION`/`SHED_ROOST_SESSION_PROTOCOL` (default `0.0.21`/`6`) let the test track a future bump. |
 | `SHED_IMAGE_HAS_CRAZE` | _unset_                                            | Gates `test_smoke.py::test_craze_baked` — a comma list of the backends (`vz`, `fc`) whose `extensions` image was rebuilt with craze baked in. `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the other backend still boots the published image); unset for plain `test-integration` (published images bake their release's craze, 0.9.0: 0.1.0, and the test asserts the pinned version). `SHED_CRAZE_VERSION` overrides the default, which the test reads from `craze-pin.env`'s `CRAZE_RELEASE` via `scripts/release/read-craze-pin.sh`. |
+| `SHED_REMOTE_SERVER`   | _unset_                                            | Entry name for a shed-server running `default_backend: remote`. When unset every `[remote]` case skips. Set by `make test-integration-remote` (default `remote-dev`). |
+| `SHED_REMOTE_LOG_PATH` | `~/.shed/dev-remote/server.log`                    | Local file the remote dev server logs to (its PhaseTimer lines). Set by `make test-integration-remote`. |
+| `SHED_REMOTE_IMAGE`    | _unset_                                            | Image alias every `[remote]` create asks for. Unset, creates boot the server's `remote.default_image` (the vz/fc names `base` and `extensions` do not exist on a remote server). |
+| `SHED_REMOTE_MAX_RUNNING` | `2`                                             | The server's `remote.limits.max_running`, for `test_remote_lifecycle.py::test_create_past_running_limit_is_refused`. |
 | `SHED_IMAGE_HAS_HOME_DIRS` | _unset_                                            | Gates `test_smoke.py::test_home_dirs_owned_by_shed` — a comma list of the backends (`vz`, `fc`) whose `base` image was rebuilt with the shed-owned `~/.local`, `~/.config` and `~/.cache` dirs (#410). `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the other backend still boots the published image); unset for plain `test-integration` (published images carry these dirs only from the 0.9.1 tag). |
 
 ## Fixtures
 
-- `shed_server` (params: `["vz", "fc"]`) — parameterized across the
-  brew/deb-installed shed-server on each backend. This is what the
-  existing test files use.
+- `shed_server` (params: `["vz", "fc", "remote"]`) — parameterized across
+  the brew/deb-installed shed-server on each backend, plus the opt-in
+  remote-backend server (`remote_server`, a `CloudServer`). This is what the
+  existing test files use. A test only a local VM backend can run carries
+  `@pytest.mark.local_vm_only("<reason>")`; its `[remote]` case skips with
+  that reason before any server is probed.
 - `shed_server_dev` (params: `["vz", "fc"]`) — parameterized across
   the PARALLEL dev shed-server on each backend. Skips per-backend
   when the corresponding `SHED_*_DEV_SERVER` env var isn't set. New
@@ -492,6 +502,46 @@ FC-config-mutation-is-out-of-scope stance, VZ-only:
 SHED_MTLS_FLIP_TEST=1 SHED_DEV_AUTH_MODE=mtls \
   make test-integration-dev   # runs test_mode_flip_migrates_live too
 ```
+
+## Remote backend (cloud sheds)
+
+A server with `default_backend: remote` runs each shed as a cloud VM. The
+`[remote]` cases run against it only when `SHED_REMOTE_SERVER` names its
+`~/.shed/config.yaml` entry, which `make test-integration-remote` does:
+
+```sh
+make dev-server-up-remote           # once; see docs/development/remote-backend.md
+make test-integration-remote        # every [remote] case; vz/fc variables set empty
+make test-integration-remote PYTEST_ARGS="test_remote_refusals.py"   # no VMs
+```
+
+**Every case that creates a shed creates a billed VM.** The target is manual
+only: CI and `make test-integration` never set the variable. A full run
+creates about 25 VMs, one after another, each up for a minute or two, never more than
+`remote.limits.max_running` at once, and takes about 42 minutes (measured: 24
+VMs, about 90 s a case, most of it the create and the delete, which waits for
+the VM to go). Check nothing is left afterwards with
+`shed -s remote-dev list`.
+
+| Runs on `[remote]` | Skips on `[remote]` (`local_vm_only`) |
+|---|---|
+| create and delete (`test_smoke`; `test_delete_fast` with a 120 s ceiling, because a remote `shed delete` returns when the VM is gone), `--repo` clone, exec, exec-shell, exec stderr, exec disconnect, the binary channel, stop/start (`test_lifecycle`), landing directory, background tunnels | host and server mounts (`test_mounts`, `test_stop_hook_mount`), the image store (`test_images`), guest MTU detection, the vz/fc boot-path timing tests, the vz/fc image-bake tests, the extensions image smoke |
+
+Two remote-only modules:
+
+- `test_remote_lifecycle.py`: `shed --json list` reports `id` and
+  `backend: remote`; a file survives `shed stop` and `shed start`; a create
+  past `max_running` is refused with `SERVER_LIMIT_REACHED` and leaves no shed.
+  Two VMs with the default limit of 2.
+- `test_remote_refusals.py`: a create asking for `local_dir`, `add_dirs`,
+  `mounts`, `from_snapshot` or `egress` is 422 `FEATURE_UNSUPPORTED`; the
+  snapshot, reset, image-pull and egress-set routes are 501
+  `FEATURE_UNSUPPORTED`. Talks to the API over pinned mTLS (the CLI refuses
+  these flags itself) and creates no VM.
+
+Snapshot, reset and egress-profile behaviour has no `shed_server` case to
+skip: those modules use the vz/fc dev fixtures and never reach a remote
+server.
 
 ## Orchestrated sheds: exec, service clients, mounts, network profiles
 

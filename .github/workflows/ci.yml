@@ -180,7 +180,14 @@ jobs:
       # the system ssh binary against a spawned test server). Keeping sdk out of
       # the CI test command matches pre-existing behavior; the imported
       # extensions code's use of the sdk is fully compile-checked.
+      #
+      # SHED_REQUIRE_SSHD=1: the remote transport's real-sshd leg
+      # (internal/remote/transport/sshlink) builds and runs an OpenSSH
+      # container. Without Docker it skips; here a skip is a failure, so the
+      # leg cannot silently stop running.
       - run: go test -v ./...
+        env:
+          SHED_REQUIRE_SSHD: "1"
 
   lint:
     needs: changes
@@ -228,7 +235,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: check-roost-pin + check-craze-pin (offline)
+        # Both depend on check-gce-pins: the GCE image bake reads its pins
+        # from firecracker/Dockerfile and gce/ may hold none of its own.
         run: make check-roost-pin check-craze-pin
+      - name: GCE image tooling (offline)
+        # bash -n + shellcheck on gce/ and the bake driver, the --print
+        # golden, and gce/shed-identity.sh against a fake metadata server.
+        run: make test-gce-image
 
   release-snapshot:
     name: GoReleaser snapshot (artifact sanity)

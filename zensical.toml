@@ -65,6 +65,7 @@ nav = [
     { "Provisioning" = "reference/provisioning.md" },
     { "Firecracker Operations" = "reference/fc-operations.md" },
     { "VZ Operations (macOS)" = "reference/vz-operations.md" },
+    { "Remote Backend (Cloud)" = "reference/remote-backend.md" },
     { "Images" = "reference/images.md" },
     { "Build Tools" = "reference/build-tools.md" },
     { "Extensions" = "reference/extensions.md" },
@@ -114,6 +115,7 @@ nav = [
   { "Development" = [
     { "Setup" = "development/setup.md" },
     { "Testing" = "development/testing.md" },
+    { "Remote Backend" = "development/remote-backend.md" },
     { "Architecture" = "development/architecture.md" },
     { "In-shed Build Debugging" = "development/in-shed-build-debugging.md" },
   ] },

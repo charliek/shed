@@ -326,6 +326,67 @@ Related, for KillMode legs: a transient unit that merely ADOPTS a VMM spawned el
 cannot reap it on stop under any KillMode (wrong cgroup) — spawn the shed UNDER the unit
 you are testing, and `cat /proc/<vmm>/cgroup` to prove it.
 
+## Rough edges from the remote-backend suite runs (2026-11)
+
+Both dev suites were run against a branch that changed the agent (health probe,
+proxy half-close). What bit, by backend:
+
+**VZ (Mac)**
+
+- **The mise `go` shim can be a self-referencing symlink** (`too many levels of
+  symbolic links: go`). Bypass the shim for the session:
+  `eval "$(~/.local/bin/mise env -s zsh -C <checkout>)"`.
+- **`make test-integration-dev` still runs every `[fc]` case against the
+  PRODUCTION FC server** (`SHED_FC_SERVER` defaults to the FC host). For a
+  VZ-only run set `SHED_FC_SERVER=` (empty); an empty name skips that backend.
+- **Choose backends with the server variables, not `-k`.** `-k <word>` also
+  matches module names, test names and MARKER names, so `-k remote` once
+  selected `[vz]` and `[fc]` cases (their `local_vm_only` marker was then
+  called `remote_unsupported`) and created sheds on the installed server.
+  Empty the variables of every backend you do not want instead
+  (`make test-integration-remote` and `-dev-fc` do this).
+- **Two VZ cases fail in token mode for harness reasons**, not the change under
+  test: `test_network_surface.py::test_bus_and_connect_on_single_listener`
+  (`KeyError: 'http_port'`: an SSH-first `shed server add` writes no
+  `http_port` into the entry) and `test_ssh_auth.py::test_warn_admits_offlist`
+  (the restarted server refuses its config: `auth.mode: token forces
+  auth.ssh.mode: enforce`). Compare against a baseline before blaming the
+  branch.
+- **`make dev-server-down` can need SIGKILL** after its 5 s grace even with
+  zero sheds. Not a sign of a stuck VM by itself.
+- **A scratch copy of the repo needs its tags.** Make it with
+  `git bundle create f HEAD --tags` and clone the bundle, so `git describe`
+  and `RELEASE_BUILD_TOOLS_REF` resolve.
+- **Proving the agent in a VM:** since the probe change, `shed-agent version`
+  prints one JSON line, `{"version":"v…-g<sha>","protocol":1,"layout":0}`;
+  `shed -s <dev> exec <shed> -- /usr/local/bin/shed-agent version` is the
+  quickest step-4 check (an older agent has no `version` command).
+
+**Firecracker**
+
+- **A third FC server on the same host** (beside the deb server and the dev
+  server, so neither is disturbed) needs, all of its own: ports, state and run
+  dirs, server name, a `vsock_base_cid` that cannot collide (the deb server
+  uses 100, the dev server 600; pick e.g. 1600), and a bridge, TAP prefix and
+  subnet. **The server does not create its bridge**: add the bridge and its
+  NAT and FORWARD rules by hand, and remove them afterwards. Do not run
+  `shed-server setup` for it; that also reinstalls the shared firecracker
+  binary.
+- **Exclude `test_network_profiles.py` unless the target IS the standard FC dev
+  server**: it hard-codes that server's binary path, nft table and gateway,
+  and runs `make dev-server-down-fc` / `dev-server-up-fc`, which would replace
+  whatever dev server is running.
+- **Never replace a dev server someone else is using.** Check its PID and
+  sheds first (`make dev-server-status[-fc]`, `shed -s <dev> list`); if it is
+  busy, run a third server as above instead of `dev-server-restart`.
+- **The mtls-only modules** (`test_http_exec`, `test_service_client`,
+  `test_mtls`, `test_create_mounts`) need the target restarted in mtls mode;
+  run them as a second pass.
+- **Half-close does not cross FC vsock** in either direction (measured on
+  firecracker v1.14.1, old and new agent alike), so a test that expects a
+  guest `CloseWrite` to reach the host as EOF holds on VZ and fails on FC by
+  design. The `probe:true` health check works with old and new agents on both.
+
 ## When you hit a NEW rough edge
 
 Add it here. This file exists because the agent-in-image split has non-obvious

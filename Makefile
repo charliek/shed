@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -672,6 +672,183 @@ dev-server-logs-fc:
 
 dev-server-restart-fc: dev-server-down-fc dev-server-up-fc
 
+# Parallel dev shed-server lifecycle (remote backend).
+#
+# Runs the dev build with `default_backend: remote` on THIS machine, beside
+# any installed shed-server (which keeps 8080/2222 and is never touched).
+# Each shed is a cloud VM. Same intentionally-ephemeral shape as the other
+# dev servers: nohup + PID file, no unit, no auto-restart.
+#
+#   make dev-server-up-remote        # render the config, build, start
+#   shed server add localhost --port 18090 --ssh-port 12290 --name remote-dev   # once
+#   shed -s remote-dev create t1
+#   make build && make dev-server-restart-remote   # pick up a rebuild
+#   make dev-server-down-remote      # sheds (cloud VMs) are NOT deleted
+#
+# Cloud settings are private and never in this repo. The targets source them
+# from $(SHED_REMOTE_ENV_FILE) (VAR=value lines): SHED_REMOTE_ENV (the
+# environment name), SHED_GCE_PROJECT, SHED_GCE_ZONE, SHED_GCE_NETWORK,
+# SHED_GCE_SUBNET, SHED_GCE_CREDENTIALS_FILE and SHED_REMOTE_SSH_KEY_FILE.
+# The config is rendered from configs/server.dev-remote.yaml.tmpl on every
+# start; edit the template, not the rendered file.
+SHED_REMOTE_ENV_FILE    ?= $(HOME)/.config/shed/remote-dev/env
+SHED_REMOTE_DEV_SERVER  ?= remote-dev
+# The GitHub account whose SSH keys may enrol a CLI against the dev server.
+# No account is named here: the default is the owner of this checkout's
+# origin remote. Set it in the environment, or in the env file, to override.
+SHED_REMOTE_GITHUB_USER ?= $(shell git remote get-url origin 2>/dev/null | sed -nE 's|^.*github\.com[:/]([^/]+)/[^/]+$$|\1|p')
+REMOTE_DEV_DIR          := $(HOME)/.shed/dev-remote
+REMOTE_DEV_TEMPLATE     := $(CURDIR)/configs/server.dev-remote.yaml.tmpl
+REMOTE_DEV_CONFIG       := $(REMOTE_DEV_DIR)/server.yaml
+REMOTE_DEV_LOG_PATH     := $(REMOTE_DEV_DIR)/server.log
+REMOTE_DEV_PID_PATH     := $(REMOTE_DEV_DIR)/server.pid
+REMOTE_DEV_AGENT        := $(REMOTE_DEV_DIR)/agent/shed-agent-linux-amd64
+
+dev-server-up-remote: build-server build-cli
+	@if [ ! -f "$(SHED_REMOTE_ENV_FILE)" ]; then \
+	  echo "ERROR: no env file at $(SHED_REMOTE_ENV_FILE)."; \
+	  echo "       It holds the cloud settings (see the comment above this target);"; \
+	  echo "       point SHED_REMOTE_ENV_FILE at yours."; \
+	  exit 1; \
+	fi
+	@if [ -f "$(REMOTE_DEV_PID_PATH)" ] && kill -0 "$$(cat $(REMOTE_DEV_PID_PATH))" 2>/dev/null; then \
+	  echo "ERROR: remote dev server already running (pid $$(cat $(REMOTE_DEV_PID_PATH)))."; \
+	  echo "       Use 'make dev-server-restart-remote' to pick up a rebuild,"; \
+	  echo "       or 'make dev-server-down-remote' to stop it first."; \
+	  exit 1; \
+	fi
+	@mkdir -p "$(REMOTE_DEV_DIR)/state" "$(REMOTE_DEV_DIR)/remote" "$(REMOTE_DEV_DIR)/agent"
+	@chmod 700 "$(REMOTE_DEV_DIR)"
+	@# The agent build the backend offers a guest whose own is incompatible.
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build $(LDFLAGS) -o "$(REMOTE_DEV_AGENT)" ./cmd/shed-agent
+	@# Render, then launch, in ONE shell: the sourced env file must reach both
+	@# the render (the environment name) and the server process (everything
+	@# else). The log is appended to, so a restart keeps the earlier run.
+	@set -a; . "$(SHED_REMOTE_ENV_FILE)"; set +a; \
+	if [ -z "$$SHED_REMOTE_ENV" ]; then \
+	  echo "ERROR: $(SHED_REMOTE_ENV_FILE) does not set SHED_REMOTE_ENV (the environment name)."; \
+	  exit 1; \
+	fi; \
+	GITHUB_USER="$${SHED_REMOTE_GITHUB_USER:-$(SHED_REMOTE_GITHUB_USER)}"; \
+	if [ -z "$$GITHUB_USER" ]; then \
+	  echo "ERROR: set SHED_REMOTE_GITHUB_USER (the GitHub account whose SSH keys may enrol a CLI)."; \
+	  exit 1; \
+	fi; \
+	umask 077; \
+	sed -e "s|@DEV_REMOTE_DIR@|$(REMOTE_DEV_DIR)|g" \
+	    -e "s|@SHED_REMOTE_ENV@|$$SHED_REMOTE_ENV|g" \
+	    -e "s|@GITHUB_USER@|$$GITHUB_USER|g" \
+	    "$(REMOTE_DEV_TEMPLATE)" > "$(REMOTE_DEV_CONFIG)" || exit 1; \
+	echo "=== dev-server-up-remote $$(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$(REMOTE_DEV_LOG_PATH)"; \
+	START_LINE=$$(wc -l < "$(REMOTE_DEV_LOG_PATH)"); \
+	nohup bin/shed-server serve --config "$(REMOTE_DEV_CONFIG)" \
+	  >> "$(REMOTE_DEV_LOG_PATH)" 2>&1 & \
+	echo $$! > "$(REMOTE_DEV_PID_PATH)"; \
+	for i in $$(seq 1 150); do \
+	  if tail -n +$$START_LINE "$(REMOTE_DEV_LOG_PATH)" | grep -q "Shed server is ready"; then \
+	    echo "Remote dev shed-server ready after $${i}s."; \
+	    break; \
+	  fi; \
+	  if ! kill -0 "$$(cat $(REMOTE_DEV_PID_PATH))" 2>/dev/null; then \
+	    echo "ERROR: remote dev shed-server exited during start-up:"; \
+	    tail -n 20 "$(REMOTE_DEV_LOG_PATH)"; \
+	    rm -f "$(REMOTE_DEV_PID_PATH)"; \
+	    exit 1; \
+	  fi; \
+	  if [ "$$i" = "150" ]; then \
+	    echo "WARNING: remote dev shed-server did not report ready after 150 s."; \
+	    echo "  - Tail the log:  make dev-server-logs-remote"; \
+	  fi; \
+	  sleep 1; \
+	done
+	@echo ""
+	@echo "Remote dev shed-server up: pid $$(cat $(REMOTE_DEV_PID_PATH))"
+	@echo "  Config:  $(REMOTE_DEV_CONFIG) (rendered from $(REMOTE_DEV_TEMPLATE))"
+	@echo "  Log:     $(REMOTE_DEV_LOG_PATH)"
+	@echo "  Ports:   HTTPS 18490 (mtls), SSH 12290"
+	@echo "  CLI:     shed -s $(SHED_REMOTE_DEV_SERVER) list"
+
+dev-server-down-remote:
+	@if [ ! -f "$(REMOTE_DEV_PID_PATH)" ]; then \
+	  echo "Remote dev server not running (no PID file at $(REMOTE_DEV_PID_PATH))."; \
+	  echo "  (Idempotent: this is OK.)"; \
+	else \
+	  PID=$$(cat "$(REMOTE_DEV_PID_PATH)"); \
+	  if ! kill -0 $$PID 2>/dev/null; then \
+	    echo "Remote dev server PID $$PID is stale (process already gone); cleaning up PID file."; \
+	    rm -f "$(REMOTE_DEV_PID_PATH)"; \
+	  elif ! ps -p $$PID -o comm= 2>/dev/null | grep -q "shed-server"; then \
+	    echo "Remote dev server PID $$PID points at an unrelated process"; \
+	    echo "  (current comm: $$(ps -p $$PID -o comm= 2>/dev/null))."; \
+	    echo "  Refusing to send signals; cleaning up the stale PID file only."; \
+	    rm -f "$(REMOTE_DEV_PID_PATH)"; \
+	  else \
+	    kill -TERM $$PID 2>/dev/null; \
+	    for i in 1 2 3 4 5 6 7 8 9 10; do \
+	      if ! kill -0 $$PID 2>/dev/null; then break; fi; \
+	      sleep 1; \
+	    done; \
+	    if kill -0 $$PID 2>/dev/null; then \
+	      echo "Remote dev server didn't stop gracefully after 10s; SIGKILL"; \
+	      kill -KILL $$PID 2>/dev/null; \
+	    fi; \
+	    echo "Remote dev server (pid $$PID) stopped. Its sheds are cloud VMs and keep running."; \
+	    rm -f "$(REMOTE_DEV_PID_PATH)"; \
+	  fi; \
+	fi
+
+dev-server-status-remote:
+	@if [ -f "$(REMOTE_DEV_PID_PATH)" ] && kill -0 "$$(cat $(REMOTE_DEV_PID_PATH))" 2>/dev/null; then \
+	  echo "Remote dev server: running (pid $$(cat $(REMOTE_DEV_PID_PATH)))"; \
+	  if bin/shed -s $(SHED_REMOTE_DEV_SERVER) list >/dev/null 2>&1; then \
+	    echo "Reachable:  YES (shed -s $(SHED_REMOTE_DEV_SERVER) list succeeds)"; \
+	  else \
+	    echo "Reachable:  NO (shed -s $(SHED_REMOTE_DEV_SERVER) list failed)"; \
+	    echo "            (check ~/.shed/config.yaml has '$(SHED_REMOTE_DEV_SERVER)')"; \
+	  fi; \
+	  echo "Log:        $(REMOTE_DEV_LOG_PATH)"; \
+	  echo "Config:     $(REMOTE_DEV_CONFIG)"; \
+	else \
+	  echo "Remote dev server: NOT running"; \
+	  if [ -f "$(REMOTE_DEV_PID_PATH)" ]; then \
+	    echo "  (Stale PID file at $(REMOTE_DEV_PID_PATH); 'make dev-server-down-remote' will clean up.)"; \
+	  fi; \
+	fi
+
+dev-server-logs-remote:
+	@if [ ! -f "$(REMOTE_DEV_LOG_PATH)" ]; then \
+	  echo "No log at $(REMOTE_DEV_LOG_PATH). Run 'make dev-server-up-remote' first."; \
+	  exit 1; \
+	fi
+	@tail -F "$(REMOTE_DEV_LOG_PATH)"
+
+dev-server-restart-remote: dev-server-down-remote dev-server-up-remote
+
+# Run the integration suite's [remote] cases against the remote dev server.
+# MANUAL ONLY: every case that creates a shed creates a billed cloud VM (a full
+# run is about 25 VMs, each up for a minute or two, at most
+# remote.limits.max_running at once). It does not start the dev server for
+# you; run `make dev-server-up-remote` first.
+#
+# Every vz/fc server variable is set EMPTY so no [vz] or [fc] case runs (the
+# defaults can name production servers). Cases the remote backend cannot run
+# (mounts, image store, snapshots, reset, egress, vz/fc timing) skip with a
+# reason. Narrow a run with PYTEST_ARGS, e.g.
+#   make test-integration-remote PYTEST_ARGS="test_remote_refusals.py"
+test-integration-remote: build-cli
+	@if [ ! -f "$(REMOTE_DEV_PID_PATH)" ] || ! kill -0 "$$(cat $(REMOTE_DEV_PID_PATH))" 2>/dev/null; then \
+	  echo "ERROR: the remote dev server is not running; 'make dev-server-up-remote' first."; \
+	  exit 1; \
+	fi
+	PATH="$(CURDIR)/bin:$$PATH" \
+	  SHED_VZ_SERVER= \
+	  SHED_VZ_DEV_SERVER= \
+	  SHED_FC_SERVER= \
+	  SHED_FC_DEV_SERVER= \
+	  SHED_REMOTE_SERVER=$(SHED_REMOTE_DEV_SERVER) \
+	  SHED_REMOTE_LOG_PATH=$(REMOTE_DEV_LOG_PATH) \
+	  $(MAKE) test-integration
+
 # Root-only proof of the isolated network profile's nftables rules, run on
 # $(FC_REMOTE_HOST) entirely inside network namespaces the test creates and
 # deletes (a bridge and veth pairs stand in for TAPs; nft only ever runs via
@@ -858,7 +1035,7 @@ check-kernel-pin:
 # build. Modeled on check-kernel-pin above — same fail-fast-on-drift shape.
 # Portable to macOS BSD sed/grep: awk/sed -E only, no grep -P (023 found that
 # breaks there).
-check-roost-pin:
+check-roost-pin: check-gce-pins
 	@vz_v=$$(awk -F= '/^ARG ROOST_SESSION_VERSION=/ { print $$2; exit }' vz/Dockerfile) ; \
 	 fc_v=$$(awk -F= '/^ARG ROOST_SESSION_VERSION=/ { print $$2; exit }' firecracker/Dockerfile) ; \
 	 vz_p=$$(awk -F= '/^ARG ROOST_SESSION_PROTOCOL=/ { print $$2; exit }' vz/Dockerfile) ; \
@@ -905,6 +1082,44 @@ check-roost-pin:
 	   exit 1 ; \
 	 fi ; \
 	 echo "roost-session pin OK: $$vz_v / protocol $$vz_p"
+
+# check-gce-pins: the GCE image bake (scripts/build-gce-image.sh, gce/) takes
+# its roost-session and craze pins from firecracker/Dockerfile through
+# scripts/read-guest-pins.sh, so check-roost-pin and check-craze-pin above
+# (which hold that Dockerfile in lockstep with vz/, crates/shed-core and
+# craze-pin.env) guard the cloud image too. This target, a prerequisite of
+# both, fails if the reader cannot produce all seven values or if gce/ holds a
+# literal pin of its own (a version or any 64-hex digest).
+check-gce-pins:
+	@pins="$$(scripts/read-guest-pins.sh firecracker/Dockerfile)" || { \
+	   echo "ERROR: scripts/read-guest-pins.sh could not read the guest pins from firecracker/Dockerfile" ; exit 1 ; } ; \
+	 bad=0 ; \
+	 for v in $$(printf '%s\n' "$$pins" | grep -E '^(ROOST_SESSION_VERSION|CRAZE_VERSION)=' | cut -d= -f2) ; do \
+	   if grep -rnwF -- "$$v" gce/ ; then \
+	     echo "ERROR: gce/ holds the literal pin version $$v; it must come from scripts/read-guest-pins.sh" ; bad=1 ; \
+	   fi ; \
+	 done ; \
+	 if grep -rnE '[0-9a-f]{64}' gce/ ; then \
+	   echo "ERROR: gce/ holds a literal sha256; digests must come from scripts/read-guest-pins.sh" ; bad=1 ; \
+	 fi ; \
+	 [ "$$bad" -eq 0 ] || exit 1 ; \
+	 echo "gce pins OK: read from firecracker/Dockerfile, none literal in gce/"
+
+# gce-image: bake a shed remote VM image on GCE (scripts/build-gce-image.sh).
+# Project, zone, network, subnet and tag come from the environment
+# (SHED_GCE_PROJECT, SHED_GCE_ZONE, SHED_GCE_NETWORK, SHED_GCE_SUBNET,
+# SHED_GCE_BAKE_TAG or SHED_GCE_TAG) or GCE_IMAGE_ARGS, e.g.
+#   make gce-image GCE_IMAGE_ARGS="--env-file ~/my-gce.env --label purpose=test"
+#   make gce-image GCE_IMAGE_ARGS=--print     # show the gcloud steps, run nothing
+GCE_IMAGE_ARGS ?=
+gce-image:
+	scripts/build-gce-image.sh $(GCE_IMAGE_ARGS)
+
+# test-gce-image: offline checks of the image tooling (syntax, shellcheck when
+# installed, the --print golden, gce/shed-identity.sh against a fake metadata
+# server). Needs python3, curl and ssh-keygen.
+test-gce-image:
+	scripts/test-gce-image.sh
 
 # CRAZE_SRC: the dedicated cache clone craze-binaries builds from (plan 025
 # Amendment A4). NEVER ~/projects/craze and NEVER a `git worktree add` into
@@ -991,7 +1206,7 @@ craze-binaries:
 # — the craze sha the vendored WIRE fixtures were copied from — must equal
 # CRAZE_TEST_SHA, so moving the test pin without re-vendoring the fixtures (or
 # the other way round) fails here, offline, before CI's drift diff ever runs.
-check-craze-pin:
+check-craze-pin: check-gce-pins
 	@sha="$$(scripts/release/read-craze-pin.sh --field CRAZE_TEST_SHA craze-pin.env)" || exit 1; \
 	 rel="$$(scripts/release/read-craze-pin.sh --field CRAZE_RELEASE craze-pin.env)" || exit 1; \
 	 pin_file=crates/shed-craze/fixtures/wire.PIN; \

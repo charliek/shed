@@ -7,7 +7,6 @@ import (
 	"github.com/gliderlabs/ssh"
 
 	"github.com/charliek/shed/internal/backend"
-	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -29,41 +28,8 @@ func (s *Server) handleSFTP(sess ssh.Session) {
 
 	ctx := sess.Context()
 
-	shed, err := s.backend.GetShed(ctx, shedName)
-	if err != nil {
-		log.Printf("SFTP: failed to get shed %s: %v", shedName, err)
-		fmt.Fprintf(sess.Stderr(), "Error: shed '%s' not found\n", shedName)
-		_ = sess.Exit(1)
-		return
-	}
-
-	if shed.Status == config.StatusStopped {
-		log.Printf("SFTP: auto-starting stopped shed: %s", shedName)
-		if _, err := s.backend.StartShed(ctx, shedName); err != nil {
-			fmt.Fprintf(sess.Stderr(), "Error: failed to start shed: %v\n", err)
-			_ = sess.Exit(1)
-			return
-		}
-	}
-
-	// Wait for a shed that is still starting up (either just auto-started above,
-	// or already mid-startup from another concurrent connection).
-	if shed.Status == config.StatusStopped || shed.Status == config.StatusStarting {
-		if err := s.waitForReady(ctx, shedName); err != nil {
-			fmt.Fprintf(sess.Stderr(), "Error: shed not ready: %v\n", err)
-			_ = sess.Exit(1)
-			return
-		}
-		shed, err = s.backend.GetShed(ctx, shedName)
-		if err != nil {
-			fmt.Fprintf(sess.Stderr(), "Error: failed to get shed after start: %v\n", err)
-			_ = sess.Exit(1)
-			return
-		}
-	}
-
-	if shed.Status != config.StatusRunning {
-		fmt.Fprintf(sess.Stderr(), "Error: shed '%s' is not running (status: %s)\n", shedName, shed.Status)
+	if _, err := s.ensureRunning(ctx, shedName, sess.Stderr(), false); err != nil {
+		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
 		_ = sess.Exit(1)
 		return
 	}

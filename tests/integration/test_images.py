@@ -15,6 +15,11 @@ from __future__ import annotations
 
 import pytest
 
+# Every case here is vz/fc only; `[remote]` skips with this reason.
+pytestmark = pytest.mark.local_vm_only(
+    "the image store (image ls/pull/tag) is vz/fc only; a remote server names cloud images by alias"
+)
+
 
 def test_images_expose_alias_and_default(shed_server, test_shed_name):
     """`image ls` labels config images with their alias + marks the default."""
