@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charliek/shed/internal/redact"
 	"github.com/charliek/shed/internal/remote/provider"
 )
 
@@ -71,6 +72,9 @@ func (c *RemoteConfig) applyDefaults() {
 	}
 	if c.Firewall.Mode == "" {
 		c.Firewall.Mode = RemoteFirewallStatic
+	}
+	if c.Firewall.Mode == RemoteFirewallStatic && len(c.Firewall.SourceRanges) == 0 && c.Firewall.SourceRangesEnv == "" {
+		c.Firewall.SourceRangesEnv = DefaultRemoteFirewallSourceRangesEnv
 	}
 	if c.Provider == RemoteProviderGCE {
 		if c.GCE == nil {
@@ -246,44 +250,206 @@ func (c *RemoteConfig) validateSizes() error {
 
 func (c *RemoteConfig) validateFirewall() error {
 	f := c.Firewall
-	for _, s := range f.SourceRanges {
-		ip, _, err := net.ParseCIDR(strings.TrimSpace(s))
-		if err != nil || ip.To4() == nil {
-			return fmt.Errorf("invalid firewall.source_ranges entry %q (must be an IPv4 CIDR such as 203.0.113.7/32)", s)
-		}
-	}
+	// One service is one voice, however many URLs name it: two entries on
+	// one host would let whoever runs that host supply the whole agreement
+	// auto mode needs before it rewrites the rule.
+	echoHosts := make(map[string]bool)
 	for _, u := range f.EchoURLs {
 		parsed, err := url.Parse(u)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-			return fmt.Errorf("invalid firewall.echo_urls entry %q (must be an https URL)", u)
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+			return fmt.Errorf("invalid firewall.echo_urls entry %q (must be an https URL)", redact.String(u))
 		}
+		host := EchoHost(parsed)
+		// A host name outside ASCII has a second spelling (its punycode
+		// form) that the comparison below would count as another
+		// service. Only the ASCII form is accepted, so one service has
+		// one name.
+		if !isASCII(host) {
+			return fmt.Errorf("invalid firewall.echo_urls entry %q: write the host name in its ASCII (punycode) form", redact.String(u))
+		}
+		if echoHosts[host] {
+			return fmt.Errorf("firewall.echo_urls names host %s more than once; each entry must be a different, independently run service", host)
+		}
+		echoHosts[host] = true
+	}
+	notStatic := func() error {
+		if len(f.SourceRanges) > 0 {
+			return fmt.Errorf("firewall.source_ranges is only used with firewall.mode: %s", RemoteFirewallStatic)
+		}
+		if f.SourceRangesEnv != "" {
+			return fmt.Errorf("firewall.source_ranges_env is only used with firewall.mode: %s", RemoteFirewallStatic)
+		}
+		return nil
 	}
 	switch f.Mode {
 	case RemoteFirewallStatic:
 		if len(f.EchoURLs) > 0 {
 			return fmt.Errorf("firewall.echo_urls is only used with firewall.mode: %s", RemoteFirewallAuto)
 		}
+		switch {
+		case len(f.SourceRanges) > 0 && f.SourceRangesEnv != "":
+			return fmt.Errorf("firewall.source_ranges and firewall.source_ranges_env are both set; set exactly one")
+		case len(f.SourceRanges) == 0 && f.SourceRangesEnv == "":
+			return fmt.Errorf("firewall.mode: %s needs firewall.source_ranges or firewall.source_ranges_env", RemoteFirewallStatic)
+		case f.SourceRangesEnv != "":
+			if !envVarNameRegex.MatchString(f.SourceRangesEnv) {
+				return fmt.Errorf("invalid firewall.source_ranges_env: %q is not an environment variable name", f.SourceRangesEnv)
+			}
+		default:
+			if _, err := ParseFirewallSources("firewall.source_ranges", f.SourceRanges, f.AcknowledgeAny); err != nil {
+				return err
+			}
+		}
 	case RemoteFirewallAuto:
 		if len(f.EchoURLs) < 2 {
 			return fmt.Errorf("firewall.mode: %s needs at least two firewall.echo_urls", RemoteFirewallAuto)
+		}
+		if f.AcknowledgeAny {
+			return fmt.Errorf("firewall.acknowledge_any is not used with firewall.mode: %s", RemoteFirewallAuto)
+		}
+		if err := notStatic(); err != nil {
+			return err
 		}
 	case RemoteFirewallAny:
 		if !f.AcknowledgeAny {
 			return fmt.Errorf("firewall.mode: %s opens every shed's SSH port to every address; set firewall.acknowledge_any: true to accept that", RemoteFirewallAny)
 		}
-		if len(f.SourceRanges) > 0 {
-			return fmt.Errorf("firewall.source_ranges must be empty with firewall.mode: %s", RemoteFirewallAny)
-		}
 		if len(f.EchoURLs) > 0 {
 			return fmt.Errorf("firewall.echo_urls is only used with firewall.mode: %s", RemoteFirewallAuto)
+		}
+		if err := notStatic(); err != nil {
+			return err
 		}
 	default:
 		return fmt.Errorf("invalid firewall.mode: %q (must be %s, %s or %s)", f.Mode, RemoteFirewallStatic, RemoteFirewallAuto, RemoteFirewallAny)
 	}
-	if f.AcknowledgeAny && f.Mode != RemoteFirewallAny {
-		return fmt.Errorf("firewall.acknowledge_any is only used with firewall.mode: %s", RemoteFirewallAny)
-	}
 	return nil
+}
+
+// EchoHost is the name an echo URL's service is counted under: its host name,
+// lower-cased, without the port and without a trailing dot. Two URLs with the
+// same EchoHost are one service.
+func EchoHost(u *url.URL) string {
+	return strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// notPublicIPv4 is the IPv4 space that is never a public source address:
+// "this network", the private ranges, carrier-grade NAT, loopback,
+// link-local, the IETF protocol assignments, the benchmarking range,
+// multicast and the reserved top. A shed's own address is in one of the
+// private ranges, so a rule that admits one of these may admit sheds to each
+// other. The documentation ranges (192.0.2.0/24, 198.51.100.0/24,
+// 203.0.113.0/24) are not listed: nothing routes them, and they are what
+// this repository's examples and tests use for "a public address".
+var notPublicIPv4 = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+}
+
+// PublicIPv4 reports whether addr could be a server's public address: an
+// IPv4 address outside every range of notPublicIPv4. It is the one
+// definition of "public" for the firewall check: what a static source range
+// may name without an acknowledgement, and what auto mode may believe from
+// an echo service and point the rule at.
+func PublicIPv4(addr netip.Addr) bool {
+	if !addr.Is4() {
+		return false
+	}
+	for _, np := range notPublicIPv4 {
+		if np.Contains(addr) {
+			return false
+		}
+	}
+	return true
+}
+
+// ParseFirewallSources checks a list of firewall source ranges and returns
+// them in canonical form (the network address and its prefix length), sorted
+// and without repeats. Each entry must be an IPv4 CIDR. A range wider than a
+// /24, 0.0.0.0/0 included, and a range in private or otherwise non-public
+// space are refused unless acknowledged. An empty list is
+// an error. key names where the list came from, for the message; an entry is
+// quoted only as the operator wrote it.
+func ParseFirewallSources(key string, entries []string, acknowledged bool) ([]string, error) {
+	seen := make(map[netip.Prefix]bool)
+	var out []netip.Prefix
+	for _, raw := range entries {
+		s := strings.TrimSpace(raw)
+		prefix, err := netip.ParsePrefix(s)
+		if err != nil || !prefix.Addr().Is4() {
+			return nil, fmt.Errorf("invalid %s entry %q (must be an IPv4 CIDR such as 203.0.113.7/32)", key, raw)
+		}
+		prefix = prefix.Masked()
+		if prefix.Bits() < RemoteFirewallMinPrefix && !acknowledged {
+			return nil, fmt.Errorf("%s entry %q is wider than a /%d; name the server's own address, or set firewall.acknowledge_any: true to accept a range that wide", key, raw, RemoteFirewallMinPrefix)
+		}
+		if !acknowledged {
+			for _, np := range notPublicIPv4 {
+				if prefix.Overlaps(np) {
+					return nil, fmt.Errorf("%s entry %q is not public address space (it is within %s); sheds have private addresses, so a rule that admits a private range can admit one shed to another's SSH port. Name the server's public address, or set firewall.acknowledge_any: true to accept the range", key, raw, np)
+				}
+			}
+		}
+		if !seen[prefix] {
+			seen[prefix] = true
+			out = append(out, prefix)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s lists no source range", key)
+	}
+	sort.Slice(out, func(i, k int) bool {
+		if c := out[i].Addr().Compare(out[k].Addr()); c != 0 {
+			return c < 0
+		}
+		return out[i].Bits() < out[k].Bits()
+	})
+	list := make([]string, len(out))
+	for i, p := range out {
+		list[i] = p.String()
+	}
+	return list, nil
+}
+
+// resolveFirewallSources returns static mode's expected source ranges: the
+// config's own list, or the comma-separated value of the variable
+// source_ranges_env names. set is false when the variable is unset or blank.
+func (c *RemoteConfig) resolveFirewallSources(getenv func(string) string) (sources []string, set bool, err error) {
+	f := c.Firewall
+	if len(f.SourceRanges) > 0 {
+		sources, err = ParseFirewallSources("remote.firewall.source_ranges", f.SourceRanges, f.AcknowledgeAny)
+		return sources, true, err
+	}
+	value := strings.TrimSpace(getenv(f.SourceRangesEnv))
+	if value == "" {
+		return nil, false, fmt.Errorf("environment variable %s (remote.firewall.source_ranges_env) is not set; it must hold the firewall rule's source ranges, comma-separated", f.SourceRangesEnv)
+	}
+	var entries []string
+	for _, e := range strings.Split(value, ",") {
+		if strings.TrimSpace(e) != "" {
+			entries = append(entries, e)
+		}
+	}
+	sources, err = ParseFirewallSources("environment variable "+f.SourceRangesEnv+" (remote.firewall.source_ranges_env)", entries, f.AcknowledgeAny)
+	return sources, true, err
 }
 
 func (c *RemoteConfig) sizeNames() []string {
@@ -388,8 +554,9 @@ func (c *RemoteConfig) AgentDirPath(serverStateDir string) string {
 //
 // With provider: gce it needs the project, zone, network and subnet
 // variables and exactly one of the credentials pair; with transport: ssh,
-// exactly one of the client key pair. An error names the variable (never its
-// value). A test driver needs none of its half.
+// exactly one of the client key pair; with firewall.mode: static and
+// firewall.source_ranges_env, that variable. An error names the variable
+// (never a secret's value). A test driver needs none of its half.
 func (c *RemoteConfig) Resolve(getenv func(string) string) (*RemoteRuntime, error) {
 	if getenv == nil {
 		getenv = os.Getenv
@@ -426,6 +593,15 @@ func (c *RemoteConfig) Resolve(getenv func(string) string) (*RemoteRuntime, erro
 			return nil, err
 		}
 		rt.SSHClientKey = key
+	}
+	if c.Firewall.Mode == RemoteFirewallStatic {
+		sources, set, err := c.resolveFirewallSources(getenv)
+		// A test provider has no real rule to compare with, so it may be
+		// given no ranges; a list that is given must still be valid.
+		if err != nil && (set || c.Provider == RemoteProviderGCE) {
+			return nil, err
+		}
+		rt.FirewallSources = sources
 	}
 	return rt, nil
 }
@@ -504,8 +680,11 @@ func (c *ServerConfig) validateRemote() error {
 				return fmt.Errorf("auth.clients.%s.policy.server_mounts is not supported by the %s backend", name, BackendRemote)
 			}
 		}
-		if len(c.Auth.Clients) > 0 && c.Remote.Firewall.Mode == RemoteFirewallAny {
-			return fmt.Errorf("remote.firewall.mode: %s is not allowed with auth.clients (one client's shed could reach another's SSH port)", RemoteFirewallAny)
+		if len(c.Auth.Clients) > 0 && c.Remote.Firewall.AdmitsAny() {
+			if c.Remote.Firewall.Mode == RemoteFirewallAny {
+				return fmt.Errorf("remote.firewall.mode: %s is not allowed with auth.clients (one client's shed could reach another's SSH port)", RemoteFirewallAny)
+			}
+			return fmt.Errorf("remote.firewall.acknowledge_any is not allowed with auth.clients (one client's shed could reach another's SSH port)")
 		}
 	}
 	// A client's images must be remote image aliases. Checked here as well

@@ -9,6 +9,7 @@ import (
 	"github.com/anmitsu/go-shlex"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/redact"
 )
 
 // TestShellQuoteRoundTrip verifies that every element of argv survives a
@@ -381,4 +382,36 @@ func TestSSHSessionArgs(t *testing.T) {
 			t.Errorf("interactive argv should end at the host, got %v", got)
 		}
 	})
+}
+
+// TestQuotedArgvRedacts: the command string the CLI sends is what the server
+// and the agent log, after redact has been over it. A URL password must stay
+// hidden whatever the quoting did to it, an apostrophe included (which is
+// sent as '\” and so puts a backslash in the middle of the userinfo).
+func TestQuotedArgvRedacts(t *testing.T) {
+	passwords := []struct {
+		name     string
+		password string
+	}{
+		{"plain", "s3cr3t-token"},
+		{"an apostrophe", "s3cr3t'token"},
+		{"two apostrophes", "'s3cr3t'token"},
+		{"an apostrophe at the end", "s3cr3t-token'"},
+	}
+	for _, tt := range passwords {
+		t.Run(tt.name, func(t *testing.T) {
+			quoted, err := validateAndQuoteArgs([]string{"git", "clone", "https://user:" + tt.password + "@git.example/o/r.git"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire := strings.Join(quoted, " ")
+			got := redact.String(wire)
+			if strings.Contains(got, "s3cr3t") || strings.Contains(got, "token") {
+				t.Errorf("the redacted command still carries the password: %s", got)
+			}
+			if want := "'git' 'clone' 'https://REDACTED@git.example/o/r.git'"; got != want {
+				t.Errorf("redacted = %s, want %s", got, want)
+			}
+		})
+	}
 }

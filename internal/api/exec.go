@@ -106,7 +106,7 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 	}
 	shed, err := s.backend.GetShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -184,7 +184,7 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusConflict, config.ErrShedNotRunning, err.Error())
 				return
 			}
-			code, errCode, msg := mapBackendError(err)
+			code, errCode, msg := backendErrorFor(r.Context(), err)
 			writeError(w, code, errCode, msg)
 			return
 		}

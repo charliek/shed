@@ -87,8 +87,8 @@ var errSettledNotRunning = errors.New("shed did not reach running")
 
 // settledError turns the shed a create's job settled on into the error the
 // SSE stream reports, or nil when the shed is running. A refusal the job met
-// keeps its 503 code (capacity, quota, limit) so a client can tell it apart
-// from a failure.
+// keeps its 503 code (capacity, quota, limit, firewall) so a client can tell
+// it apart from a failure.
 func settledError(shed *config.Shed) error {
 	if shed == nil {
 		return fmt.Errorf("%w: no shed returned", errSettledNotRunning)
@@ -107,6 +107,11 @@ func settledError(shed *config.Shed) error {
 		return fmt.Errorf("%w: %s", config.ErrCloudQuotaExceededSentinel, msg)
 	case config.StatusReasonLimit:
 		return fmt.Errorf("%w: %s", config.ErrServerLimitReachedSentinel, msg)
+	case config.StatusReasonFirewall:
+		// The job met a failing firewall check just before its insert.
+		// Nothing was made; the client may try again once the check
+		// passes, exactly as when the request itself is refused.
+		return fmt.Errorf("%w: %s", config.ErrFirewallCheckFailedSentinel, msg)
 	}
 	return fmt.Errorf("%w: %s", errSettledNotRunning, msg)
 }
@@ -117,8 +122,16 @@ func settledError(shed *config.Shed) error {
 // the sink into the job as well would print every line twice), then waits on
 // ctx, which the request's disconnect ends without touching the job.
 func (s *Server) createAndWait(ctx context.Context, jobCtx context.Context, al backend.AsyncLifecycle, req config.CreateShedRequest) (any, error) {
-	if _, err := s.backend.CreateShed(jobCtx, req); err != nil {
+	created, err := s.backend.CreateShed(jobCtx, req)
+	if err != nil {
 		return nil, err
+	}
+	if created != nil {
+		// Follow the shed this request made and no other. The wait is by
+		// name and can last minutes; without this, a shed deleted and
+		// created again under the name by someone else would have its
+		// progress and its final state sent down this caller's stream.
+		ctx = backend.WithRequiredCreatedAt(backend.WithRequiredOwner(ctx, created.Owner), created.CreatedAt)
 	}
 	shed, err := al.WaitSettled(ctx, req.Name)
 	if err != nil {
@@ -133,7 +146,9 @@ func (s *Server) createAndWait(ctx context.Context, jobCtx context.Context, al b
 // deleteAndWait is the SSE delete on an AsyncLifecycle backend: the delete
 // returns once the record is hidden, then the stream waits for the job to
 // destroy the VM. WaitSettled reports the finished delete as
-// ErrShedNotFoundSentinel, which here means success.
+// ErrShedNotFoundSentinel, which here means success; a destroy that failed
+// comes back as another error and is reported, so "deleted" is never said of
+// a VM that still exists.
 func (s *Server) deleteAndWait(ctx context.Context, jobCtx context.Context, al backend.AsyncLifecycle, name string) error {
 	if err := s.backend.DeleteShed(jobCtx, name); err != nil {
 		return err

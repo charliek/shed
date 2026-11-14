@@ -92,6 +92,44 @@ func TestLiveReadOnly(t *testing.T) {
 			t.Logf("rule %s %s prio=%d targets=%v allowed=%v", r.Name, r.Direction, r.Priority, r.TargetTags, r.Allowed)
 		}
 	})
+	// The two reads the backend's firewall check makes, and what that check
+	// expects of an environment the setup script made. Addresses are not
+	// logged.
+	t.Run("firewall check reads", func(t *testing.T) {
+		rule, err := c.EnvFirewallRule(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		view, err := c.NetworkIngress(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("rule %s network=%s direction=%s disabled=%v allowed=%v targets=%v sources=%d source-tags=%d",
+			rule.Name, rule.Network, rule.Direction, rule.Disabled, rule.Allowed, rule.TargetTags, len(rule.SourceRanges), len(rule.SourceTags))
+		if rule.Name != provider.FirewallRuleName(c.Env()) || rule.Network != view.Network || rule.Direction != provider.DirectionIngress || rule.Disabled {
+			t.Errorf("the environment's rule is not an enabled ingress rule on network %s", view.Network)
+		}
+		if len(rule.Allowed) != 1 || rule.Allowed[0].Protocol != "tcp" || len(rule.Allowed[0].Ports) != 1 || rule.Allowed[0].Ports[0] != "22" || len(rule.Denied) != 0 {
+			t.Errorf("the rule allows %v and denies %v, want allow tcp:22", rule.Allowed, rule.Denied)
+		}
+		if len(rule.TargetTags) != 1 || rule.TargetTags[0] != provider.NetworkTag(c.Env()) {
+			t.Errorf("the rule targets %v, want [%s]", rule.TargetTags, provider.NetworkTag(c.Env()))
+		}
+		if len(rule.SourceRanges) == 0 {
+			t.Error("the rule has no source range")
+		}
+		if view.Default {
+			t.Errorf("network %s is the default network", view.Network)
+		}
+		found := false
+		for _, r := range view.Rules {
+			t.Logf("ingress rule %s disabled=%v allowed=%v denied=%v targets=%v", r.Name, r.Disabled, r.Allowed, r.Denied, r.TargetTags)
+			found = found || r.Name == rule.Name
+		}
+		if !found {
+			t.Errorf("NetworkIngress does not list %s", rule.Name)
+		}
+	})
 	t.Run("image family", func(t *testing.T) {
 		name, err := c.ResolveImage(ctx, "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64")
 		if err != nil {

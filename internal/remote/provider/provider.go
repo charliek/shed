@@ -244,6 +244,18 @@ type Provider interface {
 	// returns; a following Get shows the new values. Metadata is readable
 	// by every process in the guest, so it never holds a secret.
 	SetMetadata(ctx context.Context, ref Ref, metadata map[string]string) error
+
+	// EnvFirewallRule returns the environment's one ingress rule,
+	// FirewallRuleName(env), as the cloud holds it now, whichever network
+	// it is on. ErrNotFound means there is no rule of that name. The
+	// provider never creates or deletes the rule.
+	EnvFirewallRule(ctx context.Context) (FirewallRule, error)
+
+	// NetworkIngress returns the network this provider puts instances on
+	// and every ingress rule on it. It returns the complete set or an
+	// error, never a partial list: the backend's firewall check reads a
+	// missing rule as "no such rule".
+	NetworkIngress(ctx context.Context) (NetworkIngress, error)
 }
 
 // HostKeyReader is an optional interface. A provider implements it when the

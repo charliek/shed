@@ -2,7 +2,10 @@ package sshd
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/charliek/shed/internal/redact"
 )
 
 // TestWrapCommand locks the contract `wrapCommand` exposes: empty raw
@@ -81,6 +84,31 @@ func TestWrapCommand(t *testing.T) {
 			got := wrapCommand(tc.raw)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("wrapCommand(%q) = %#v, want %#v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWrappedCommandRedacts: the "Executing in shed" log line prints
+// redact.Args of the wrapped command. The command is one string the shed CLI
+// built by single-quoting each argv element, so an apostrophe in a URL
+// password arrives as '\”; the password must not reach the log either way.
+func TestWrappedCommandRedacts(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{"plain password", `'git' 'clone' 'https://user:s3cr3t-token@git.example/o/r.git'`},
+		{"apostrophe in the password", `'git' 'clone' 'https://user:s3cr3t'\''token@git.example/o/r.git'`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logged := strings.Join(redact.Args(wrapCommand(tt.raw)), " ")
+			if strings.Contains(logged, "s3cr3t") || strings.Contains(logged, "token") {
+				t.Errorf("the logged command carries the password: %s", logged)
+			}
+			if !strings.Contains(logged, "https://REDACTED@git.example/o/r.git") {
+				t.Errorf("the logged command lost the URL: %s", logged)
 			}
 		})
 	}

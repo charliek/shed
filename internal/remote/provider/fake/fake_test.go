@@ -744,3 +744,66 @@ func names(insts []provider.Instance) []string {
 	}
 	return out
 }
+
+// A rule handed to the fake, and a rule read from it, share nothing with the
+// fake's own copy: not the lists, and not the port lists inside each allow
+// and deny entry. A test that edits its fixture after storing it, or a rule
+// it read, must not change what the next read returns.
+func TestFirewallRulesAreDeepCopies(t *testing.T) {
+	ctx := context.Background()
+	name := provider.FirewallRuleName("test")
+	rule := func() provider.FirewallRule {
+		return provider.FirewallRule{
+			Name:         name,
+			SourceRanges: []string{DefaultFirewallSource},
+			TargetTags:   []string{provider.NetworkTag("test")},
+			Allowed:      []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}},
+			Denied:       []provider.FirewallPorts{{Protocol: "udp", Ports: []string{"53"}}},
+		}
+	}
+	ports := func(r provider.FirewallRule) string {
+		return r.Allowed[0].Ports[0] + " " + r.Denied[0].Ports[0] + " " + r.SourceRanges[0] + " " + r.TargetTags[0]
+	}
+	want := ports(rule())
+	spoil := func(r provider.FirewallRule) {
+		r.Allowed[0].Ports[0] = "0-65535"
+		r.Denied[0].Ports[0] = "0"
+		r.SourceRanges[0] = "0.0.0.0/0"
+		r.TargetTags[0] = "other"
+	}
+	tests := []struct {
+		name  string
+		store func(p *Provider, r provider.FirewallRule)
+		read  func(p *Provider) provider.FirewallRule
+	}{
+		{"SetFirewallRules, then the input is edited",
+			func(p *Provider, r provider.FirewallRule) { p.SetFirewallRules(r); spoil(r) },
+			func(p *Provider) provider.FirewallRule { r, _ := p.EnvFirewallRule(ctx); return r }},
+		{"AddFirewallRule, then the input is edited",
+			func(p *Provider, r provider.FirewallRule) { p.SetFirewallRules(); p.AddFirewallRule(r); spoil(r) },
+			func(p *Provider) provider.FirewallRule { r, _ := p.EnvFirewallRule(ctx); return r }},
+		{"a rule read with EnvFirewallRule is edited",
+			func(p *Provider, r provider.FirewallRule) {
+				p.SetFirewallRules(r)
+				got, _ := p.EnvFirewallRule(ctx)
+				spoil(got)
+			},
+			func(p *Provider) provider.FirewallRule { r, _ := p.EnvFirewallRule(ctx); return r }},
+		{"a rule read with NetworkIngress is edited",
+			func(p *Provider, r provider.FirewallRule) {
+				p.SetFirewallRules(r)
+				view, _ := p.NetworkIngress(ctx)
+				spoil(view.Rules[0])
+			},
+			func(p *Provider) provider.FirewallRule { view, _ := p.NetworkIngress(ctx); return view.Rules[0] }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := New(Options{Env: "test"})
+			tt.store(p, rule())
+			if got := ports(tt.read(p)); got != want {
+				t.Errorf("the fake's rule reads %q after the edit, want %q", got, want)
+			}
+		})
+	}
+}

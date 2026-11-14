@@ -183,7 +183,8 @@ func safeName(name string) error {
 	return nil
 }
 
-// SaveRecord writes a record, replacing any record of the same name.
+// SaveRecord writes a record, replacing any record of the same name. See
+// ErrNotDurable for the one error after which the record is in place.
 func (s *Store) SaveRecord(r *Record) error {
 	if err := safeName(r.Shed.Name); err != nil {
 		return err
@@ -218,7 +219,8 @@ func (s *Store) Records() (records []*Record, bad []string, err error) {
 	return records, bad, nil
 }
 
-// SaveMarker writes a delete marker.
+// SaveMarker writes a delete marker. See ErrNotDurable for the one error
+// after which the marker is in place.
 func (s *Store) SaveMarker(m *Marker) error {
 	if err := safeName(m.ID); err != nil {
 		return err
@@ -275,8 +277,18 @@ func readJSON(path string, v any) error {
 	return json.Unmarshal(data, v)
 }
 
-// writeJSON writes v to path atomically: a temp file beside it, fsync,
-// rename.
+// ErrNotDurable is returned by a write that put its file in place and could
+// not flush the directory afterwards. The file is there: this process reads
+// it, and so does the next server, unless a power cut takes the rename back.
+// So a caller must treat the write as made. Reporting it as failed would
+// leave a file behind that says otherwise: a delete marker the periodic pass
+// and the next start-up act on, a record the next start-up resumes. Every
+// other error from a write means nothing was put in place.
+var ErrNotDurable = errors.New("the file is in place but its directory could not be flushed")
+
+// writeJSON writes v to path atomically and durably: a temp file beside it,
+// fsync, rename, fsync of the directory. An error that is ErrNotDurable means
+// the rename was made; any other error means path is as it was.
 func writeJSON(path string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -306,12 +318,40 @@ func writeJSON(path string, v any) error {
 		cleanup()
 		return fmt.Errorf("remote state: %w", err)
 	}
+	// The rename is durable only once the directory is. Callers act in the
+	// cloud on the strength of this write (a record before an insert, a
+	// marker before a delete is acknowledged), so a power loss must not be
+	// able to take it back.
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("remote state: %s: %w: %w", filepath.Base(path), ErrNotDurable, err)
+	}
 	return nil
 }
 
+// removeIfExists removes a file and flushes its directory. A file that is not
+// there is flushed for all the same: an earlier call may have removed it and
+// failed at the flush, and reporting success for the retry would call a
+// removal durable that a power cut can still undo.
 func removeIfExists(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remote state: %w", err)
 	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("remote state: %w", err)
+	}
 	return nil
+}
+
+// syncDir flushes a directory, which makes a rename or a removal inside it
+// durable. A variable so a test can watch it.
+var syncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }

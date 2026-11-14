@@ -142,6 +142,7 @@ func TestConformance(t *testing.T) {
 						f.failNextOp("insert", "ZONE_RESOURCE_POOL_EXHAUSTED", "The zone 'projects/test-proj/zones/us-central1-a' does not have enough resources available to fulfill the request.")
 					}
 				},
+				SetFirewall: func(t *testing.T, rules []provider.FirewallRule) { f.setFirewall(rules) },
 			}
 		},
 	})
@@ -861,9 +862,25 @@ func TestNewValidates(t *testing.T) {
 		{"no network", func(c *Config) { c.Network = "" }},
 		{"no token", func(c *Config) { c.Token = nil }},
 		{"bad tier", func(c *Config) { c.NetworkTier = "GOLD" }},
+		// A Shared VPC: the firewall check would read this project's rules
+		// for a network that lives in another.
+		{"network in another project", func(c *Config) { c.Network = "projects/host/global/networks/n" }},
+		{"network URL in another project", func(c *Config) {
+			c.Network = "https://www.googleapis.com/compute/v1/projects/host/global/networks/n"
+		}},
+		{"subnet in another project", func(c *Config) { c.Subnet = "projects/host/regions/us-central1/subnetworks/s" }},
+		{"network path that names no project", func(c *Config) { c.Network = "global/networks/n" }},
 	}
 	if _, err := New(ok); err != nil {
 		t.Fatalf("New(valid) = %v", err)
+	}
+	for _, same := range []Config{
+		{Project: "p", Zone: "us-central1-a", Env: "dev", Network: "projects/p/global/networks/n", Subnet: "projects/p/regions/us-central1/subnetworks/s", Token: staticToken("x")},
+		{Project: "p", Zone: "us-central1-a", Env: "dev", Network: "https://www.googleapis.com/compute/v1/projects/p/global/networks/n", Subnet: "s", Token: staticToken("x")},
+	} {
+		if _, err := New(same); err != nil {
+			t.Errorf("New with a path in its own project (%s) = %v", same.Network, err)
+		}
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -919,4 +936,33 @@ func mustName(ref provider.Ref) string {
 		panic(err)
 	}
 	return n
+}
+
+// TestCreateOwnsTheMetadataSwitches: every instance is made with OS Login
+// off, project SSH keys blocked and guest attributes on, whatever the project
+// sets, and a caller cannot set any of the three.
+func TestCreateOwnsTheMetadataSwitches(t *testing.T) {
+	f := newFakeCompute(t)
+	c := testClient(t, f)
+	spec := goldenSpec(t, "", 0)
+	if _, err := c.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	got := f.instance(spec.Name).metadata
+	for key, want := range map[string]string{
+		MetadataEnableOSLogin: "FALSE", MetadataBlockProjectSSHKeys: "TRUE", MetadataEnableGuestAttributes: "TRUE",
+	} {
+		if got[key] != want {
+			t.Errorf("instance metadata %s = %q, want %q", key, got[key], want)
+		}
+	}
+	for _, key := range []string{MetadataEnableOSLogin, MetadataBlockProjectSSHKeys, MetadataEnableGuestAttributes} {
+		t.Run(key, func(t *testing.T) {
+			spec := goldenSpec(t, "", 0)
+			spec.Metadata[key] = "TRUE"
+			if _, err := c.Create(context.Background(), spec); !errors.Is(err, provider.ErrInvalid) {
+				t.Errorf("Create with %s set by the caller: %v, want ErrInvalid", key, err)
+			}
+		})
+	}
 }

@@ -46,8 +46,8 @@ type ShedState string
 const (
 	// ShedStateCreating is set by Create. The instance is not a usable
 	// shed yet: the host key is not pinned or the agent has not answered.
-	// Reconcile destroys a creating instance that is over 15 minutes old
-	// and has no work in flight.
+	// The start-up and periodic passes destroy a creating instance that
+	// is over 15 minutes old and has no local record (remote.StaleCreateAge).
 	ShedStateCreating ShedState = "creating"
 	// ShedStateReady is set by the backend once the host key pin is
 	// written and read back and the agent has answered a probe. It is

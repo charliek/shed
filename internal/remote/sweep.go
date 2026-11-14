@@ -56,17 +56,22 @@ type sweepCheck struct {
 	listed   bool
 }
 
-// Sweep is the periodic pass. It lists this environment's instances once and
-// then, for sheds with no job in flight:
+// Sweep is the periodic pass. It runs the firewall check, lists this
+// environment's instances once and then, for sheds with no job in flight:
 //
 //   - starts the delete job of every delete marker that has none (a destroy
 //     that failed is retried here, not only at the next server start);
+//   - writes a delete marker for an instance still labelled creating
+//     StaleCreateAge after the cloud made it, with no record: a create whose
+//     record was lost, which nothing else would ever remove;
 //   - records a "running" shed whose instance stopped (the run limit, or a
 //     stop from outside) as "stopped", with the reason;
 //   - drops the record of a shed whose instance no longer exists;
 //   - records a "stopped" shed whose instance runs as "starting" and probes
 //     it, so a VM that costs money is never shown as stopped;
-//   - gives a shed left "stopping" by a failed cloud call a new stop job.
+//   - gives a shed left "stopping" by a failed cloud call a new stop job;
+//   - runs again the create or start of a shed kept "starting" because the
+//     cloud could not be read when its job looked (Backend.keep).
 //
 // It destroys nothing itself: only a delete job does, and a delete job exists
 // only for a delete marker. Each correction is confirmed with a fresh read of
@@ -76,6 +81,9 @@ func (b *Backend) Sweep(ctx context.Context) error {
 	if err := b.checkReady(); err != nil {
 		return err
 	}
+	// Refresh the firewall check. Its result gates creates and starts only;
+	// nothing below depends on it, and nothing is stopped or deleted for it.
+	b.CheckFirewall(ctx)
 	insts, err := b.prov.List(ctx, provider.Selector{Env: b.cfg.Environment})
 	if err != nil {
 		return err
@@ -101,12 +109,43 @@ func (b *Backend) Sweep(ctx context.Context) error {
 	if err != nil {
 		b.logf("remote: periodic pass: reading delete markers: %v", err)
 	}
-	var retry []*state.Marker
+	var retry, abandoned []*state.Marker
 	now := b.now()
 	for _, m := range markers {
 		if b.deletes[m.ID] == nil && now.Sub(m.At) >= b.opts.DeleteRetryAge {
 			retry = append(retry, m)
 		}
+	}
+	// A create nobody is finishing (see abandonedCreate) gets a marker, and
+	// with it a delete job.
+	recorded := make(map[string]bool, len(b.records))
+	for _, r := range b.records {
+		recorded[r.Shed.ID] = true
+	}
+	marked := make(map[string]bool, len(markers))
+	for _, m := range markers {
+		marked[m.ID] = true
+	}
+	carriers := make(map[string]int, len(insts))
+	for _, inst := range insts {
+		carriers[inst.Labels[provider.LabelID]]++
+	}
+	for _, inst := range insts {
+		id, err := inst.Identity()
+		if err != nil || id.Env != b.cfg.Environment || carriers[id.ID] != 1 {
+			continue
+		}
+		if recorded[id.ID] || marked[id.ID] || b.deletes[id.ID] != nil || !b.abandonedCreate(inst) {
+			continue
+		}
+		m := &state.Marker{ID: id.ID, Name: id.Name, Env: id.Env, Ref: inst.Ref, At: now.UTC()}
+		if err := b.saveMarkerLocked(m); err != nil {
+			b.logf("remote: periodic pass: instance %s (shed %s) is an abandoned create but its marker could not be written: %v", inst.Name, id.Name, err)
+			continue
+		}
+		b.logf("remote: periodic pass: instance %s (shed %s) has been %q since %s with no local record; destroying it",
+			inst.Name, id.Name, inst.ShedState(), inst.CreatedAt.UTC().Format(time.RFC3339))
+		abandoned = append(abandoned, m)
 	}
 	var checks []sweepCheck
 	var launch []*job
@@ -116,6 +155,17 @@ func (b *Backend) Sweep(ctx context.Context) error {
 		}
 		inst, listed := byID[r.Shed.ID]
 		switch r.Shed.Status {
+		case config.StatusStarting:
+			// A create or start with no job is one that was kept because
+			// the cloud could not be read (Backend.keep). It is run again
+			// here: one read of its instance, and on from what that shows.
+			// A probe is not: a start call or the next server start
+			// retries it.
+			if (r.Job == state.JobCreate && !r.Ready) || r.Job == state.JobStart {
+				if j := b.healLocked(r); j != nil {
+					launch = append(launch, j)
+				}
+			}
 		case config.StatusStopping:
 			if j := b.healLocked(r); j != nil {
 				b.logf("remote: periodic pass: shed %s is stopping with no job; stopping it again", name)
@@ -135,6 +185,9 @@ func (b *Backend) Sweep(ctx context.Context) error {
 
 	for _, m := range retry {
 		b.logf("remote: periodic pass: retrying the delete of shed %s (%s)", m.Name, m.ID)
+		b.startDelete(m, nil)
+	}
+	for _, m := range abandoned {
 		b.startDelete(m, nil)
 	}
 	for _, j := range launch {

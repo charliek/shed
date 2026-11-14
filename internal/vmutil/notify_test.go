@@ -199,3 +199,49 @@ func TestNotifyConnGracefulStop(t *testing.T) {
 		t.Fatal("Stop() did not return within 5 seconds")
 	}
 }
+
+// blockingConnectHandler writes its handshake in OnConnect, as MessageHandler
+// does.
+type blockingConnectHandler struct{ entered chan struct{} }
+
+func (h *blockingConnectHandler) OnConnect(conn net.Conn) error {
+	close(h.entered)
+	_, err := conn.Write([]byte("handshake"))
+	return err
+}
+
+func (h *blockingConnectHandler) OnMessage(byte, []byte) error { return nil }
+
+// TestNotifyConnStopDuringBlockedHandshake: a far end that accepts the
+// connection and never reads leaves OnConnect's write blocked. Stop must still
+// return; before the connection was closed on cancel only after OnConnect, it
+// waited for ever, and with it every stop and delete of that shed.
+func TestNotifyConnStopDuringBlockedHandshake(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	dialer := &pipeDialer{
+		handler: func(conn net.Conn) {
+			defer conn.Close()
+			<-release // never reads
+		},
+	}
+	handler := &blockingConnectHandler{entered: make(chan struct{})}
+	nc := NewNotifyConn(dialer, 1026, "test-vm")
+	nc.Start(context.Background(), handler)
+
+	select {
+	case <-handler.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnConnect was never called")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		nc.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return while OnConnect's write was blocked")
+	}
+}

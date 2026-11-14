@@ -415,6 +415,7 @@ func TestAsyncErrorMapping(t *testing.T) {
 		{config.ErrServerLimitReachedSentinel, http.StatusServiceUnavailable, config.ErrServerLimitReached},
 		{config.ErrCloudQuotaExceededSentinel, http.StatusServiceUnavailable, config.ErrCloudQuotaExceeded},
 		{config.ErrZoneCapacityUnavailableSentinel, http.StatusServiceUnavailable, config.ErrZoneCapacityUnavailable},
+		{config.ErrFirewallCheckFailedSentinel, http.StatusServiceUnavailable, config.ErrFirewallCheckFailed},
 		{config.ErrFeatureUnsupportedSentinel, http.StatusNotImplemented, config.ErrFeatureUnsupported},
 		{config.ErrShedAlreadyExistsSentinel, http.StatusConflict, config.ErrShedAlreadyExists},
 	}
@@ -590,5 +591,68 @@ func TestAsyncConnectNotRunning(t *testing.T) {
 	resp := doCtx(context.Background(), h, http.MethodGet, "/api/sheds/a1/connect/22", "")
 	if resp.code != http.StatusConflict || resp.errCode(t) != config.ErrShedNotRunning {
 		t.Errorf("got %d %s, want 409 SHED_NOT_RUNNING", resp.code, resp.body)
+	}
+}
+
+// TestSettledErrorKeepsTheRefusalCode: a create whose job met a refusal ends
+// its stream with that refusal's 503, not a 500. The firewall reason is one
+// of them: the job asks the check again just before the insert.
+func TestSettledErrorKeepsTheRefusalCode(t *testing.T) {
+	tests := []struct {
+		reason   string
+		wantCode string
+		status   int
+	}{
+		{config.StatusReasonCapacity, config.ErrZoneCapacityUnavailable, http.StatusServiceUnavailable},
+		{config.StatusReasonQuota, config.ErrCloudQuotaExceeded, http.StatusServiceUnavailable},
+		{config.StatusReasonLimit, config.ErrServerLimitReached, http.StatusServiceUnavailable},
+		{config.StatusReasonFirewall, config.ErrFirewallCheckFailed, http.StatusServiceUnavailable},
+		{config.StatusReasonCreateFailed, config.ErrBackendError, http.StatusInternalServerError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.reason, func(t *testing.T) {
+			err := settledError(&config.Shed{Name: "x", Status: config.StatusError, StatusReason: tt.reason})
+			status, code, _ := mapBackendError(err)
+			if status != tt.status || code != tt.wantCode {
+				t.Errorf("settled %s maps to %d %s, want %d %s", tt.reason, status, code, tt.status, tt.wantCode)
+			}
+		})
+	}
+}
+
+// TestFirewallRefusalHidesDetailsFromClients: the firewall refusal names the
+// server's address, the rule and the echo services. An admin gets all of it;
+// a service client gets the code and a message with none of it.
+func TestFirewallRefusalHidesDetailsFromClients(t *testing.T) {
+	detail := "firewall rule shed-dev-ssh admits the wrong sources: expected source ranges [203.0.113.7/32], found source ranges [198.51.100.9/32] (echo-one.example: 203.0.113.7)"
+	err := fmt.Errorf("%w: %s; creates and starts are refused until the check passes", config.ErrFirewallCheckFailedSentinel, detail)
+	tests := []struct {
+		name       string
+		ctx        context.Context
+		wantDetail bool
+	}{
+		{"admin", withCaller(context.Background(), Caller{Kind: CallerAdmin}), true},
+		{"no caller (a unit test, an admin)", context.Background(), true},
+		{"service client", withCaller(context.Background(), Caller{Kind: CallerClient, Name: "nocturn"}), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, code, msg := backendErrorFor(tt.ctx, err)
+			if status != http.StatusServiceUnavailable || code != config.ErrFirewallCheckFailed {
+				t.Fatalf("mapped to %d %s, want 503 %s", status, code, config.ErrFirewallCheckFailed)
+			}
+			leaked := strings.Contains(msg, "203.0.113.7") || strings.Contains(msg, "198.51.100.9") ||
+				strings.Contains(msg, "echo-one.example") || strings.Contains(msg, "shed-dev-ssh")
+			if leaked != tt.wantDetail {
+				t.Errorf("message %q: details present = %v, want %v", msg, leaked, tt.wantDetail)
+			}
+		})
+	}
+	// Any other refusal reads the same for everyone.
+	other := fmt.Errorf("%w: 2 of 2 running", config.ErrServerLimitReachedSentinel)
+	_, _, admin := backendErrorFor(context.Background(), other)
+	_, _, client := backendErrorFor(withCaller(context.Background(), Caller{Kind: CallerClient}), other)
+	if admin != client {
+		t.Errorf("a limit refusal differs by caller: %q and %q", admin, client)
 	}
 }

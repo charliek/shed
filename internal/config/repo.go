@@ -1,10 +1,13 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/charliek/shed/internal/redact"
 )
 
 // gitSSHRegex matches git@host:path format (e.g., git@github.com:user/repo.git)
@@ -51,29 +54,20 @@ func RepoDirName(repo string) (string, error) {
 	}
 	s = strings.TrimSuffix(s, ".git")
 	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, "/\x00") {
-		return "", fmt.Errorf("cannot derive a directory name from repository URL %q", repo)
+		// The message reaches logs and API replies: never with the URL's
+		// credentials.
+		return "", fmt.Errorf("cannot derive a directory name from repository URL %q", SanitizeRepoURL(repo))
 	}
 	return s, nil
 }
 
-// SanitizeRepoURL returns repo with the password component removed from the
-// URL's userinfo, if any. The username is preserved (it's informational, not
-// a secret). SSH-form URLs (git@host:path) and shorthand pass through
-// unchanged. Use this when logging URLs to avoid leaking embedded credentials
-// from forms like `https://user:password@host/repo.git`.
+// SanitizeRepoURL returns repo with the whole userinfo of a URL replaced by
+// redact.Marker, for logging. The user name goes too: a token is often passed
+// as the user alone (https://TOKEN@host/repo.git). SSH-form URLs
+// (git@host:path) and shorthand pass through unchanged, and nothing else in
+// the URL is re-encoded.
 func SanitizeRepoURL(repo string) string {
-	if repo == "" || strings.HasPrefix(repo, "git@") {
-		return repo
-	}
-	u, err := url.Parse(repo)
-	if err != nil || u.User == nil {
-		return repo
-	}
-	if _, hasPassword := u.User.Password(); !hasPassword {
-		return repo
-	}
-	u.User = url.User(u.User.Username())
-	return u.String()
+	return redact.String(repo)
 }
 
 // IsSSHRepoURL reports whether a repo URL uses SSH transport.
@@ -110,7 +104,7 @@ func ValidateGitRepoURL(repoURL string) error {
 	// Parse as standard URL
 	parsed, err := url.Parse(repoURL)
 	if err != nil {
-		return fmt.Errorf("invalid repository URL: %w", err)
+		return fmt.Errorf("invalid repository URL: %s", parseFailure(err))
 	}
 
 	// Validate scheme
@@ -135,4 +129,19 @@ func ValidateGitRepoURL(repoURL string) error {
 	}
 
 	return nil
+}
+
+// parseFailure says why url.Parse refused a repository URL without repeating
+// any of it. The message reaches API replies and logs, a URL that does not
+// parse cannot be trusted to redact (its userinfo is often the part that is
+// wrong), and net/url quotes the whole URL, or the piece it choked on, in its
+// own text: that piece can be the password.
+func parseFailure(err error) string {
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.Err != nil {
+		if why := uerr.Err.Error(); !strings.ContainsAny(why, "\"'`") {
+			return strings.TrimPrefix(why, "net/url: ")
+		}
+	}
+	return "it does not parse as a URL"
 }

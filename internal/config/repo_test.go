@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestExpandRepoShorthand(t *testing.T) {
 	tests := []struct {
@@ -39,11 +42,12 @@ func TestSanitizeRepoURL(t *testing.T) {
 	}{
 		{name: "empty", input: "", want: ""},
 		{name: "git@ unchanged", input: "git@github.com:charliek/prox.git", want: "git@github.com:charliek/prox.git"},
-		{name: "ssh:// with username unchanged", input: "ssh://git@host/path", want: "ssh://git@host/path"},
+		{name: "ssh:// username redacted", input: "ssh://git@host/path", want: "ssh://REDACTED@host/path"},
 		{name: "https no userinfo unchanged", input: "https://github.com/charliek/prox.git", want: "https://github.com/charliek/prox.git"},
-		{name: "https with username only unchanged", input: "https://user@host/repo.git", want: "https://user@host/repo.git"},
-		{name: "https with password stripped", input: "https://user:pw@host/repo.git", want: "https://user@host/repo.git"},
-		{name: "https with empty password stripped", input: "https://user:@host/repo.git", want: "https://user@host/repo.git"},
+		{name: "https token as username redacted", input: "https://ghp_token@host/repo.git", want: "https://REDACTED@host/repo.git"},
+		{name: "https with password redacted", input: "https://user:pw@host/repo.git", want: "https://REDACTED@host/repo.git"},
+		{name: "https with empty password redacted", input: "https://user:@host/repo.git", want: "https://REDACTED@host/repo.git"},
+		{name: "not re-encoded", input: "https://u:p@host/a%2Fb repo", want: "https://REDACTED@host/a%2Fb repo"},
 		{name: "malformed url passes through", input: "not a url", want: "not a url"},
 	}
 	for _, tt := range tests {
@@ -110,6 +114,53 @@ func TestValidateGitRepoURL(t *testing.T) {
 			err := ValidateGitRepoURL(tt.input)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateGitRepoURL(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRepoDirNameErrorHidesCredentials: the refusal quotes the URL, and it
+// reaches logs and API replies.
+func TestRepoDirNameErrorHidesCredentials(t *testing.T) {
+	for _, repo := range []string{"https://user:s3cret@example.com/..", "https://s3cret@example.com/.git"} {
+		t.Run(repo, func(t *testing.T) {
+			_, err := RepoDirName(repo)
+			if err == nil {
+				t.Fatal("no error")
+			}
+			if strings.Contains(err.Error(), "s3cret") || !strings.Contains(err.Error(), "example.com") {
+				t.Errorf("error = %q, want the URL without its credentials", err)
+			}
+		})
+	}
+}
+
+// TestValidateGitRepoURLErrorHidesCredentials: a URL that does not parse is
+// refused without any of its text, because net/url quotes the URL (or the
+// piece it could not read) in its error and the refusal is an API reply.
+func TestValidateGitRepoURLErrorHidesCredentials(t *testing.T) {
+	tests := []struct {
+		name string
+		repo string
+		want string
+	}{
+		{name: "backslash in the password", repo: `https://alice:pa\$s3cret@example.com/x.git`, want: "invalid userinfo"},
+		{name: "space in the password", repo: "https://alice:my s3cret@example.com/x.git", want: "invalid userinfo"},
+		{name: "bad escape in the password", repo: "https://alice:%zzs3cret@example.com/x.git", want: "does not parse"},
+		{name: "password read as a port", repo: "https://alice:s3cret/x.git", want: "does not parse"},
+		{name: "control character", repo: "https://alice:s3cret@example.com/x\x7f.git", want: "invalid control character"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateGitRepoURL(tt.repo)
+			if err == nil {
+				t.Fatal("no error")
+			}
+			if strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), "alice") {
+				t.Errorf("error = %q, want none of the URL", err)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %q, want it to say %q", err, tt.want)
 			}
 		})
 	}

@@ -145,33 +145,6 @@ type Subnetwork struct {
 	PrivateIPGoogleAccess bool
 }
 
-// FirewallRule is one VPC firewall rule.
-type FirewallRule struct {
-	Name      string
-	Network   string // the network's name
-	Direction string // INGRESS or EGRESS
-	Priority  int
-	Disabled  bool
-	// SourceRanges, SourceTags and SourceServiceAccounts select who an
-	// ingress rule admits.
-	SourceRanges          []string
-	SourceTags            []string
-	SourceServiceAccounts []string
-	// TargetTags and TargetServiceAccounts select the instances it covers;
-	// both empty means every instance on the network.
-	TargetTags            []string
-	TargetServiceAccounts []string
-	DestinationRanges     []string
-	Allowed               []FirewallPorts
-	Denied                []FirewallPorts
-}
-
-// FirewallPorts is one protocol and its ports; no ports means all of them.
-type FirewallPorts struct {
-	Protocol string
-	Ports    []string
-}
-
 // GetNetwork reads the client's network.
 func (c *Client) GetNetwork(ctx context.Context) (Network, error) {
 	var g struct {
@@ -224,68 +197,4 @@ func (c *Client) GetSubnetwork(ctx context.Context) (Subnetwork, error) {
 		StackType:             g.StackType,
 		PrivateIPGoogleAccess: g.PrivateIPGoogleAccess,
 	}, nil
-}
-
-// ListFirewalls returns every firewall rule on the client's network, all
-// pages or an error, in API order. The project's rules are read and filtered
-// here by network, so no filter syntax is involved.
-func (c *Client) ListFirewalls(ctx context.Context) ([]FirewallRule, error) {
-	network := lastSegment(c.networkURL)
-	var out []FirewallRule
-	err := c.listPages(ctx, "list_firewalls", c.projectPath()+"global/firewalls", nil, func(raw json.RawMessage) error {
-		var items []struct {
-			Name                  string   `json:"name"`
-			Network               string   `json:"network"`
-			Direction             string   `json:"direction"`
-			Priority              int      `json:"priority"`
-			Disabled              bool     `json:"disabled"`
-			SourceRanges          []string `json:"sourceRanges"`
-			SourceTags            []string `json:"sourceTags"`
-			SourceServiceAccounts []string `json:"sourceServiceAccounts"`
-			TargetTags            []string `json:"targetTags"`
-			TargetServiceAccounts []string `json:"targetServiceAccounts"`
-			DestinationRanges     []string `json:"destinationRanges"`
-			Allowed               []struct {
-				IPProtocol string   `json:"IPProtocol"`
-				Ports      []string `json:"ports"`
-			} `json:"allowed"`
-			Denied []struct {
-				IPProtocol string   `json:"IPProtocol"`
-				Ports      []string `json:"ports"`
-			} `json:"denied"`
-		}
-		if err := json.Unmarshal(raw, &items); err != nil {
-			return err
-		}
-		for _, it := range items {
-			if lastSegment(it.Network) != network {
-				continue
-			}
-			r := FirewallRule{
-				Name:                  it.Name,
-				Network:               network,
-				Direction:             it.Direction,
-				Priority:              it.Priority,
-				Disabled:              it.Disabled,
-				SourceRanges:          it.SourceRanges,
-				SourceTags:            it.SourceTags,
-				SourceServiceAccounts: it.SourceServiceAccounts,
-				TargetTags:            it.TargetTags,
-				TargetServiceAccounts: it.TargetServiceAccounts,
-				DestinationRanges:     it.DestinationRanges,
-			}
-			for _, a := range it.Allowed {
-				r.Allowed = append(r.Allowed, FirewallPorts{Protocol: a.IPProtocol, Ports: a.Ports})
-			}
-			for _, d := range it.Denied {
-				r.Denied = append(r.Denied, FirewallPorts{Protocol: d.IPProtocol, Ports: d.Ports})
-			}
-			out = append(out, r)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
 }

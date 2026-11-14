@@ -39,6 +39,14 @@ func httpsRepoURL(repo string) string {
 	return repo
 }
 
+// asksForEgress reports whether a create's egress selection asks for any
+// profile. Nothing and exactly ["off"] ask for none, as the API's own gate
+// reads them (internal/api: asksForEgress), so a client that spells out "no
+// egress profile" is not refused for a feature it did not ask for.
+func asksForEgress(egress []string) bool {
+	return len(egress) > 1 || (len(egress) == 1 && egress[0] != "off")
+}
+
 // CreateShed saves the shed as "starting", starts its create job and
 // returns. It waits up to the fast-fail window first: a quota or capacity
 // refusal that arrives inside it is returned here and leaves no record.
@@ -58,7 +66,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		return nil, fmt.Errorf("%w: mounts on the remote backend", config.ErrFeatureUnsupportedSentinel)
 	case req.FromSnapshot != "":
 		return nil, fmt.Errorf("%w: from_snapshot on the remote backend", config.ErrFeatureUnsupportedSentinel)
-	case len(req.Egress) > 0:
+	case asksForEgress(req.Egress):
 		return nil, fmt.Errorf("%w: egress profiles on the remote backend", config.ErrFeatureUnsupportedSentinel)
 	}
 	network := req.Network
@@ -79,6 +87,18 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	}
 	image, err := b.cfg.ResolveImage(req.Image)
 	if err != nil {
+		return nil, err
+	}
+	// A name that is taken is answered as such whatever the firewall check
+	// says: a client reads that 409 as "the shed exists".
+	b.mu.Lock()
+	_, exists := b.records[req.Name]
+	b.mu.Unlock()
+	if exists {
+		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
+	}
+	// No VM is created while the firewall check fails.
+	if err := b.firewallGate(ctx); err != nil {
 		return nil, err
 	}
 	if resolver, ok := b.prov.(provider.ImageResolver); ok {
@@ -165,7 +185,9 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		b.mu.Unlock()
 		return nil, err
 	}
-	if err := b.store.SaveRecord(rec); err != nil {
+	// A record that is in place is one the next server would resume, so the
+	// create goes on with it (inPlace); any other error left no record.
+	if err := b.inPlace(b.store.SaveRecord(rec)); err != nil {
 		b.mu.Unlock()
 		return nil, err
 	}
@@ -241,15 +263,30 @@ func (b *Backend) ListSheds(context.Context) ([]config.Shed, error) {
 //	stopping  queued: the start runs when the stop has finished
 //	stopped   "starting"
 //	error     refused with the reason
+//
+// A call that would start a VM (the shed is stopped, or stopping so the start
+// is queued) is refused while the firewall check fails.
 func (b *Backend) StartShed(ctx context.Context, name string) (*config.Shed, error) {
 	if err := b.checkReady(); err != nil {
 		return nil, err
 	}
+	gated := false
+relock:
 	b.mu.Lock()
 	r, err := b.lookupLocked(ctx, name)
 	if err != nil {
 		b.mu.Unlock()
 		return nil, err
+	}
+	if !gated && (r.Shed.Status == config.StatusStopped || r.Shed.Status == config.StatusStopping) {
+		// The gate may read the cloud, so it runs without the lock; the
+		// shed is then looked at afresh.
+		b.mu.Unlock()
+		if err := b.firewallGate(ctx); err != nil {
+			return nil, err
+		}
+		gated = true
+		goto relock
 	}
 	var launch *job
 	switch r.Shed.Status {
@@ -390,17 +427,24 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 		ID: r.Shed.ID, Name: name, Env: r.Env, Ref: r.Ref, At: b.now().UTC(),
 		Owner: r.Shed.Owner, CreatedAt: r.Shed.CreatedAt,
 	}
-	if d := b.deletes[marker.ID]; d != nil && d.marker != nil {
+	cleanup := b.deletes[marker.ID]
+	if cleanup != nil && cleanup.marker != nil {
 		// The clean-up of this shed's failed create is still destroying
 		// its VM. That job carries on; its marker now stands for the
-		// whole shed.
-		d.marker.KeepRecord = false
-		d.marker.At = marker.At
-		marker = d.marker
+		// whole shed. The job's own copy changes only once the new one is
+		// written: a delete that is refused here leaves it a clean-up.
+		whole := *cleanup.marker
+		whole.KeepRecord = false
+		whole.At = marker.At
+		marker = &whole
 	}
 	if err := b.saveMarkerLocked(marker); err != nil {
 		b.mu.Unlock()
 		return fmt.Errorf("recording the delete of %s: %w", name, err)
+	}
+	if cleanup != nil && cleanup.marker != nil {
+		*cleanup.marker = *marker
+		marker = cleanup.marker
 	}
 	prior := b.jobs[name]
 	if prior != nil {
@@ -452,15 +496,36 @@ func (b *Backend) WaitSettled(ctx context.Context, name string) (*config.Shed, e
 		b.mu.Lock()
 		r, err := b.lookupLocked(ctx, name)
 		if err != nil {
+			notFound := errors.Is(err, config.ErrShedNotFoundSentinel)
 			gone := b.deletingLocked(ctx, name)
+			var owed bool
+			var unread error
+			if notFound && gone == nil {
+				owed, unread = b.deleteOwedLocked(ctx, name)
+			}
 			b.mu.Unlock()
-			if gone == nil || !errors.Is(err, config.ErrShedNotFoundSentinel) {
+			if unread != nil {
+				// Not "not found": a streamed delete reads that as a delete
+				// that finished. The cause names the state directory, so it
+				// goes to the log and not to the caller.
+				b.logf("remote: shed %s: whether a delete of it is unfinished is not known; the delete markers could not be read: %v", name, unread)
+				return nil, fmt.Errorf("shed %s: %w", name, ErrDeleteUnknown)
+			}
+			if owed {
+				return nil, deleteOwed(name)
+			}
+			if gone == nil || !notFound {
 				return nil, err
 			}
 			// The shed's delete was acknowledged and its VM is still
-			// going: wait for the delete job, then report the shed gone.
+			// going: wait for the delete job, then report the shed gone,
+			// if it is. A job that ended with its marker standing did
+			// not destroy the VM, and "gone" would be untrue.
 			select {
 			case <-gone.done:
+				if !gone.gone {
+					return nil, deleteOwed(name)
+				}
 				return nil, err
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -520,6 +585,61 @@ func (b *Backend) deletingLocked(ctx context.Context, name string) *job {
 		return d
 	}
 	return nil
+}
+
+// ErrDeleteOwed is what WaitSettled returns for a shed whose delete was
+// acknowledged and whose VM is not destroyed yet with nothing working on it:
+// the destroy failed, or was cut short, and the periodic pass will try again.
+// It is not config.ErrShedNotFoundSentinel, which a waiter reads as "gone".
+var ErrDeleteOwed = errors.New("the delete is recorded but the VM could not be destroyed yet; the server keeps trying")
+
+// ErrDeleteUnknown is what WaitSettled returns for a name with no record and
+// no delete job when delete markers stand and cannot be read: a destroy that
+// failed leaves nothing but its marker, so the server cannot tell a shed that
+// is gone from one whose VM still exists. Like ErrDeleteOwed it is not
+// config.ErrShedNotFoundSentinel.
+var ErrDeleteUnknown = errors.New("the server could not read its delete records, so it cannot say whether the VM is destroyed (see the server log)")
+
+func deleteOwed(name string) error { return fmt.Errorf("shed %s: %w", name, ErrDeleteOwed) }
+
+// deleteOwedLocked reports whether a delete marker stands, with no delete job
+// in flight, for a shed of this name that the caller was allowed to see. The
+// marker is removed in the critical section in which its job leaves
+// Backend.deletes, so such a marker is a destroy that did not happen.
+//
+// Markers are read from disk only when one is known to stand (Backend.pending).
+// A read that fails, of the directory or of one marker known to stand, is
+// returned as an error, never as "no marker": the marker is then the only
+// evidence of the unfinished delete.
+func (b *Backend) deleteOwedLocked(ctx context.Context, name string) (bool, error) {
+	if b.records[name] != nil || len(b.pending) == 0 {
+		return false, nil
+	}
+	markers, err := b.store.Markers()
+	if err != nil {
+		return false, err
+	}
+	read := make(map[string]bool, len(markers))
+	for _, m := range markers {
+		read[m.ID] = true
+		if m.Name != name || m.KeepRecord || b.deletes[m.ID] != nil {
+			continue
+		}
+		if backend.CheckOwner(ctx, name, m.Owner) == nil && backend.CheckCreatedAt(ctx, name, m.CreatedAt) == nil {
+			return true, nil
+		}
+	}
+	// Store.Markers leaves out a file it cannot read or parse, without an
+	// error. A marker this server knows to stand (b.pending; files and map
+	// change together under b.mu) that did not come back may be this shed's:
+	// the file is where its name is kept, so whose it is cannot be told. One
+	// with a delete job is in hand and is waited for by the caller.
+	for id := range b.pending {
+		if !read[id] && b.deletes[id] == nil {
+			return false, fmt.Errorf("the delete marker of shed ID %s is on record and could not be read", id)
+		}
+	}
+	return false, nil
 }
 
 // replay sends the job's progress events from index from into the sink on

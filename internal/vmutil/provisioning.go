@@ -15,6 +15,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/provision"
+	"github.com/charliek/shed/internal/redact"
 	"github.com/charliek/shed/internal/retry"
 )
 
@@ -112,17 +113,28 @@ func (p *Provisioner) LoadConfig(ctx context.Context) (*provision.Config, error)
 
 	var content string
 	lastCode := -1
-	readErr := retry.Do(ctx, "read provision config", provisionReadBackoffs, nil, func() error {
-		var stdout, stderr strings.Builder
+	retryable := func(err error) bool {
+		return !errors.Is(err, errGuestReadTooLarge) && retry.DefaultIsRetryable(err)
+	}
+	readErr := retry.Do(ctx, "read provision config", provisionReadBackoffs, retryable, func() error {
+		// Bounded: the guest decides what the config path holds, and a read
+		// that passes the bound is ended, not drained.
+		ectx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		stdout := &cappedBuffer{max: maxGuestFileRead, onOver: cancel}
+		stderr := &cappedBuffer{max: maxGuestFileRead, onOver: cancel}
 		opts := backend.ExecOptions{
 			Cmd: []string{"sh", "-c", loadConfigProbe, "sh", configPath, p.workDir},
 			// Run from "/" so the exec itself never depends on the racing mount.
-			Stdout:     NopWriteCloser(&stdout),
-			Stderr:     NopWriteCloser(&stderr),
+			Stdout:     NopWriteCloser(stdout),
+			Stderr:     NopWriteCloser(stderr),
 			WorkingDir: "/",
 			TTY:        false,
 		}
-		err := p.agent.Exec(ctx, opts)
+		err := p.agent.Exec(ectx, opts)
+		if stdout.over || stderr.over {
+			return fmt.Errorf("%s: %w (limit %d bytes)", configPath, errGuestReadTooLarge, maxGuestFileRead)
+		}
 		if err == nil {
 			content = stdout.String()
 			lastCode = 0
@@ -150,6 +162,8 @@ func (p *Provisioner) LoadConfig(ctx context.Context) (*provision.Config, error)
 	})
 
 	switch {
+	case errors.Is(readErr, errGuestReadTooLarge):
+		return nil, fmt.Errorf("failed to read provision config: %w", readErr)
 	case strings.TrimSpace(content) != "":
 		// Got config content (possibly after retries) — parse it.
 		return provision.ParseConfigContent([]byte(content))
@@ -280,19 +294,31 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 		exit ${PIPESTATUS[0]}
 	`, fullScriptPath, fullScriptPath, logFile)
 
-	var outputBuf bytes.Buffer
-	multiWriter := io.MultiWriter(p.output, &outputBuf)
+	// Only the tail is kept: it is quoted in a failure, and a hook may print
+	// without end.
+	outputBuf := &tailBuffer{max: hookOutputTail}
+	// A hook's output goes to the server log, so URL credentials are
+	// redacted from it line by line, as git clone's are. The log file in the
+	// guest keeps the output as the hook printed it. The tail is kept from
+	// the redacted stream, never the raw one: cutting raw output to its last
+	// bytes can cut a URL after its scheme, and what is left of the password
+	// would no longer look like a credential to anything that reads it.
+	stdout := redact.NewWriter(io.MultiWriter(p.output, outputBuf))
+	stderr := redact.NewWriter(p.errOut)
 
 	opts := backend.ExecOptions{
 		Cmd:        []string{"bash", "--login", "-c", cmd},
 		Env:        env,
-		Stdout:     NopWriteCloser(multiWriter),
-		Stderr:     NopWriteCloser(p.errOut),
+		Stdout:     NopWriteCloser(stdout),
+		Stderr:     NopWriteCloser(stderr),
 		WorkingDir: p.workDir,
 		TTY:        false,
 	}
 
-	if err := p.agent.Exec(ctx, opts); err != nil {
+	err := p.agent.Exec(ctx, opts)
+	_ = stdout.Flush()
+	_ = stderr.Flush()
+	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("%s hook timed out after %v: %w", hookType, timeout, ctx.Err())
 		}
@@ -303,7 +329,7 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 			exitCode = exitErr.Code
 		}
 
-		lastOutput := getLastLines(outputBuf.String(), 5)
+		lastOutput := redact.String(getLastLines(outputBuf.String(), 5))
 		return &provision.HookError{
 			HookType:   hookType,
 			ExitCode:   exitCode,
@@ -531,15 +557,21 @@ SHED_EOF`, provision.LogDir, provision.LogDir, stateFilePath, content.String())
 
 // readStateFile reads provisioning state from the VM.
 func (s *ProvisionState) readStateFile(ctx context.Context) (map[string]string, error) {
-	var stdout strings.Builder
+	ectx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stdout := &cappedBuffer{max: maxGuestFileRead, onOver: cancel}
 	opts := backend.ExecOptions{
 		Cmd:        []string{"sh", "-c", fmt.Sprintf("test -f %s && cat %s", stateFilePath, stateFilePath)},
-		Stdout:     NopWriteCloser(&stdout),
+		Stdout:     NopWriteCloser(stdout),
 		WorkingDir: "/",
 		TTY:        false,
 	}
 
-	if err := s.agent.Exec(ctx, opts); err != nil {
+	err := s.agent.Exec(ectx, opts)
+	if stdout.over {
+		return nil, fmt.Errorf("%s: %w (limit %d bytes)", stateFilePath, errGuestReadTooLarge, maxGuestFileRead)
+	}
+	if err != nil {
 		// test -f returns exit code 1 when file doesn't exist (expected on first run)
 		var exitErr *ExitError
 		if errors.As(err, &exitErr) {

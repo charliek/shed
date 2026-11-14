@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/charliek/shed/internal/audit"
+	"github.com/charliek/shed/internal/redact"
 )
 
 // SetAuditLog attaches the audit log (<state>/audit.jsonl). shed-server opens
@@ -95,7 +96,8 @@ func (s *Server) auditClientRequest(w http.ResponseWriter, r *http.Request, id a
 
 // newExecEndEvent starts the exec.end line for an exec of argv in shed name:
 // argv[0] and the count by default, the whole argv with audit.exec_argv: full.
-// ExitCode starts at -1 (no exit status) until the handler learns one.
+// ExitCode starts at -1 (no exit status) until the handler learns one. URL
+// credentials in argv are redacted (redact.Args); env is never recorded.
 func (s *Server) newExecEndEvent(r *http.Request, name string, argv []string) *audit.ExecEndEvent {
 	e := &audit.ExecEndEvent{
 		Event:     audit.EventExecEnd,
@@ -105,9 +107,9 @@ func (s *Server) newExecEndEvent(r *http.Request, name string, argv []string) *a
 		ExitCode:  -1,
 	}
 	if s.cfg.AuditExecArgvFull() {
-		e.Argv = append([]string(nil), argv...)
+		e.Argv = append([]string(nil), redact.Args(argv)...)
 	} else if len(argv) > 0 {
-		e.Argv0 = argv[0]
+		e.Argv0 = redact.String(argv[0])
 		e.Argc = len(argv)
 	}
 	return e

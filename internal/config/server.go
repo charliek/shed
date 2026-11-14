@@ -370,14 +370,17 @@ func (c *ServerConfig) validateNetwork() error {
 //
 // The remote backend accepts "isolated": there it means isolation by network
 // topology (no route between sheds or to the server host). That holds only
-// while the firewall rule admits the server alone, so firewall.mode: any
-// refuses it.
+// while the firewall rule admits the server alone, so firewall.mode: any,
+// and a static mode that acknowledged wide ranges, refuse it.
 func (c *ServerConfig) validateNetworkBackend() error {
 	if c.DefaultBackend == BackendRemote {
-		if c.Remote == nil || c.Remote.Firewall.Mode != RemoteFirewallAny {
+		if c.Remote == nil || !c.Remote.Firewall.AdmitsAny() {
 			return nil
 		}
 		if p := c.NetworkDefaultProfile(); p != NetworkProfileOpen {
+			if c.Remote.Firewall.Mode != RemoteFirewallAny {
+				return fmt.Errorf("network.default_profile: %s is not allowed with remote.firewall.acknowledge_any (every shed's SSH port may then be reachable from the others)", p)
+			}
 			return fmt.Errorf("network.default_profile: %s is not allowed with remote.firewall.mode: %s (every shed's SSH port is then reachable from the others)", p, RemoteFirewallAny)
 		}
 		return nil
@@ -1845,6 +1848,32 @@ func rejectUnknownNetworkKeys(data []byte) error {
 	return nil
 }
 
+// rejectUnknownRemoteKeys fails loudly on an unknown key anywhere under
+// remote:, for the same reason as rejectUnknownClientKeys. Every setting
+// there bounds what a billed cloud VM may do or who may reach it; a typo
+// (say `max_runs:` or `source_range:`) must not fall back to a default.
+func rejectUnknownRemoteKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	block, present := raw["remote"]
+	if !present || block == nil {
+		return nil
+	}
+	sub, err := yaml.Marshal(block)
+	if err != nil {
+		return fmt.Errorf("remote: %w", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(sub))
+	dec.KnownFields(true)
+	var typed RemoteConfig
+	if err := dec.Decode(&typed); err != nil {
+		return fmt.Errorf("remote: %w", err)
+	}
+	return nil
+}
+
 // LoadServerConfig loads server configuration from standard locations.
 // It checks in order: ./server.yaml, ~/.config/shed/server.yaml, /etc/shed/server.yaml
 func LoadServerConfig() (*ServerConfig, error) {
@@ -1882,7 +1911,7 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 func rejectRemovedKeys(data []byte) error {
 	for _, check := range []func([]byte) error{
 		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys,
-		rejectUnknownClientKeys, rejectUnknownNetworkKeys,
+		rejectUnknownClientKeys, rejectUnknownNetworkKeys, rejectUnknownRemoteKeys,
 	} {
 		if err := check(data); err != nil {
 			return err

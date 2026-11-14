@@ -57,6 +57,10 @@ type Controls struct {
 	// FailNextCreateOperation makes the next Create be accepted and its
 	// operation fail with kind, so Wait returns it.
 	FailNextCreateOperation func(t *testing.T, kind error)
+	// SetFirewall replaces the cloud's whole firewall with rules. A rule
+	// whose Network is empty goes on the provider's own network; any other
+	// value names another network in the same cloud.
+	SetFirewall func(t *testing.T, rules []provider.FirewallRule)
 }
 
 var idCounter atomic.Int64
@@ -117,6 +121,8 @@ func Run(t *testing.T, h Harness) {
 		{"resolve image", testResolveImage},
 		{"refusal on the call", testRefusalOnCall},
 		{"refusal on the operation", testRefusalOnOperation},
+		{"firewall reads", testFirewallReads},
+		{"firewall sources", testFirewallSources},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, h) })
@@ -618,6 +624,172 @@ func testRefusalOnOperation(t *testing.T, h Harness) {
 			}
 		})
 	}
+}
+
+// envRule is the environment's rule as the setup script makes it.
+func envRule(env string, sources ...string) provider.FirewallRule {
+	return provider.FirewallRule{
+		Name:         provider.FirewallRuleName(env),
+		Direction:    provider.DirectionIngress,
+		Priority:     1000,
+		SourceRanges: sources,
+		TargetTags:   []string{provider.NetworkTag(env)},
+		Allowed:      []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}},
+	}
+}
+
+func testFirewallReads(t *testing.T, h Harness) {
+	p, c := h.New(t)
+	if c.SetFirewall == nil {
+		t.Skip("the harness cannot set the cloud's firewall")
+	}
+	ctx := h.ctx(t)
+
+	t.Run("no rule", func(t *testing.T) {
+		c.SetFirewall(t, nil)
+		if _, err := p.EnvFirewallRule(ctx); !errors.Is(err, provider.ErrNotFound) {
+			t.Errorf("EnvFirewallRule with no rule: %v, want ErrNotFound", err)
+		}
+		view, err := p.NetworkIngress(ctx)
+		if err != nil || view.Network == "" || len(view.Rules) != 0 {
+			t.Errorf("NetworkIngress with no rule = %+v, %v", view, err)
+		}
+	})
+
+	t.Run("rules", func(t *testing.T) {
+		c.SetFirewall(t, []provider.FirewallRule{
+			{Name: "zz-stray", Direction: provider.DirectionIngress, Priority: 900, SourceRanges: []string{"198.51.100.0/24"},
+				Allowed: []provider.FirewallPorts{{Protocol: "all"}}},
+			envRule(h.Env, "192.0.2.10/32", "203.0.113.0/24"),
+			{Name: "aa-deny", Direction: provider.DirectionIngress, Priority: 500, Disabled: true, SourceTags: []string{"other"},
+				TargetServiceAccounts: []string{"sa@example.iam.gserviceaccount.com"},
+				Denied:                []provider.FirewallPorts{{Protocol: "udp", Ports: []string{"53", "1000-2000"}}}},
+			{Name: "egress-rule", Direction: provider.DirectionEgress, DestinationRanges: []string{"0.0.0.0/0"},
+				Denied: []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"25"}}}},
+			{Name: "elsewhere", Network: "another-network", Direction: provider.DirectionIngress, SourceRanges: []string{"0.0.0.0/0"},
+				Allowed: []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}}},
+		})
+		rule, err := p.EnvFirewallRule(ctx)
+		if err != nil {
+			t.Fatalf("EnvFirewallRule: %v", err)
+		}
+		view, err := p.NetworkIngress(ctx)
+		if err != nil {
+			t.Fatalf("NetworkIngress: %v", err)
+		}
+		if rule.Name != provider.FirewallRuleName(h.Env) || rule.Network != view.Network || rule.Direction != provider.DirectionIngress ||
+			rule.Disabled || rule.Priority != 1000 ||
+			!slices.Equal(rule.SourceRanges, []string{"192.0.2.10/32", "203.0.113.0/24"}) ||
+			!slices.Equal(rule.TargetTags, []string{provider.NetworkTag(h.Env)}) ||
+			len(rule.Allowed) != 1 || rule.Allowed[0].Protocol != "tcp" || !slices.Equal(rule.Allowed[0].Ports, []string{"22"}) || len(rule.Denied) != 0 {
+			t.Errorf("EnvFirewallRule = %+v", rule)
+		}
+		if view.Default {
+			t.Error("the test network is reported as the default network")
+		}
+		var names []string
+		for _, r := range view.Rules {
+			names = append(names, r.Name)
+			if r.Network != view.Network || r.Direction != provider.DirectionIngress {
+				t.Errorf("NetworkIngress returned %+v", r)
+			}
+		}
+		// Ordered by name; the egress rule and the other network's rule
+		// are left out; a disabled rule is still listed.
+		if want := []string{"aa-deny", provider.FirewallRuleName(h.Env), "zz-stray"}; !slices.Equal(names, want) {
+			t.Fatalf("NetworkIngress rules = %v, want %v", names, want)
+		}
+		deny := view.Rules[0]
+		if !deny.Disabled || deny.Priority != 500 || !slices.Equal(deny.SourceTags, []string{"other"}) || len(deny.TargetServiceAccounts) != 1 ||
+			len(deny.Allowed) != 0 || len(deny.Denied) != 1 || deny.Denied[0].Protocol != "udp" || !slices.Equal(deny.Denied[0].Ports, []string{"53", "1000-2000"}) {
+			t.Errorf("deny rule = %+v", deny)
+		}
+		stray := view.Rules[2]
+		if len(stray.TargetTags) != 0 || len(stray.Allowed) != 1 || stray.Allowed[0].Protocol != "all" || len(stray.Allowed[0].Ports) != 0 {
+			t.Errorf("stray rule = %+v", stray)
+		}
+	})
+
+	t.Run("the rule on another network is still found by name", func(t *testing.T) {
+		moved := envRule(h.Env, "192.0.2.10/32")
+		moved.Network = "another-network"
+		c.SetFirewall(t, []provider.FirewallRule{moved})
+		rule, err := p.EnvFirewallRule(ctx)
+		if err != nil || rule.Network != "another-network" {
+			t.Errorf("EnvFirewallRule = %+v, %v", rule, err)
+		}
+		view, err := p.NetworkIngress(ctx)
+		if err != nil || len(view.Rules) != 0 {
+			t.Errorf("NetworkIngress = %+v, %v", view, err)
+		}
+	})
+}
+
+func testFirewallSources(t *testing.T, h Harness) {
+	p, c := h.New(t)
+	setter, ok := p.(provider.FirewallSourceSetter)
+	if !ok || c.SetFirewall == nil {
+		t.Skip("the provider cannot set firewall sources, or the harness cannot set the firewall")
+	}
+	ctx := h.ctx(t)
+	other := provider.FirewallRule{Name: "shed-otherenv-ssh", Direction: provider.DirectionIngress, Priority: 1000,
+		SourceRanges: []string{"198.51.100.7/32"}, TargetTags: []string{"shed-otherenv"},
+		Allowed: []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}}}
+	c.SetFirewall(t, []provider.FirewallRule{envRule(h.Env, "192.0.2.10/32"), other})
+
+	t.Run("invalid ranges send nothing", func(t *testing.T) {
+		for _, bad := range [][]string{
+			nil, {}, {"203.0.113.9"}, {"203.0.113.9/24"}, {"2001:db8::1/128"}, {"0.0.0.0/0"}, {"203.0.0.0/16"}, {"203.0.113.9/32", "junk"},
+		} {
+			if err := setter.SetEnvFirewallSources(ctx, bad); !errors.Is(err, provider.ErrInvalid) {
+				t.Errorf("SetEnvFirewallSources(%v): %v, want ErrInvalid", bad, err)
+			}
+		}
+		rule, err := p.EnvFirewallRule(ctx)
+		if err != nil || !slices.Equal(rule.SourceRanges, []string{"192.0.2.10/32"}) {
+			t.Errorf("the rule changed: %+v, %v", rule, err)
+		}
+	})
+
+	t.Run("sets the one rule's sources and nothing else", func(t *testing.T) {
+		before, err := p.EnvFirewallRule(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := setter.SetEnvFirewallSources(ctx, []string{"203.0.113.9/32"}); err != nil {
+			t.Fatalf("SetEnvFirewallSources: %v", err)
+		}
+		after, err := p.EnvFirewallRule(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(after.SourceRanges, []string{"203.0.113.9/32"}) {
+			t.Errorf("sources = %v", after.SourceRanges)
+		}
+		before.SourceRanges, after.SourceRanges = nil, nil
+		if fmt.Sprintf("%+v", before) != fmt.Sprintf("%+v", after) {
+			t.Errorf("more than the sources changed:\n before %+v\n after  %+v", before, after)
+		}
+		view, err := p.NetworkIngress(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range view.Rules {
+			if r.Name == other.Name && !slices.Equal(r.SourceRanges, other.SourceRanges) {
+				t.Errorf("another environment's rule changed: %+v", r)
+			}
+		}
+	})
+
+	t.Run("a missing rule is not created", func(t *testing.T) {
+		c.SetFirewall(t, []provider.FirewallRule{other})
+		if err := setter.SetEnvFirewallSources(ctx, []string{"203.0.113.9/32"}); !errors.Is(err, provider.ErrNotFound) {
+			t.Errorf("SetEnvFirewallSources with no rule: %v, want ErrNotFound", err)
+		}
+		if _, err := p.EnvFirewallRule(ctx); !errors.Is(err, provider.ErrNotFound) {
+			t.Errorf("the rule exists now: %v", err)
+		}
+	})
 }
 
 func refs(insts []provider.Instance) []provider.Ref {

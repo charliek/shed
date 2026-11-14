@@ -137,12 +137,70 @@ All notable changes to this project will be documented in this file.
   FEATURE_UNSUPPORTED`. The config file names no project, zone or key: every value comes from
   an environment variable. Images are baked with `make gce-image`; the one-time cloud setup is
   printed by `scripts/remote/gce-setup.sh --print`. Not built yet: copying an agent into a VM
-  (`agent_install` behaves as `never`) and any firewall mode but `static`. See the [Remote
+  (`agent_install` behaves as `never`). See the [Remote
   Backend reference](https://charliek.github.io/shed/reference/remote-backend/).
+- **Remote backend: the server checks its cloud firewall.** It reads the environment's rule
+  (`shed-<env>-ssh`) and the network's other ingress rules at start-up, once a minute, and
+  before a create or start. While the rule is missing, altered, admits the wrong sources, or
+  another rule reaches the sheds, `shed create` and `shed start` answer the new
+  `503 FIREWALL_CHECK_FAILED` with what was expected and what was found; stop, delete, list and
+  exec are unaffected and nothing is stopped or deleted. `remote.firewall.mode: static` now
+  needs its expected sources: `source_ranges`, or `source_ranges_env` naming a variable
+  (default `SHED_REMOTE_SOURCE_RANGES`) so the config file holds no address. **A remote server
+  upgraded to this version does not start until one of them is set.** `mode: auto` is built:
+  the server learns its public address from two agreeing `echo_urls` services and patches the
+  rule's sources to that `/32`, under two extra roles that
+  `gce-setup.sh --print --firewall-auto` prints. Each `echo_urls` entry must be on a different
+  host. A static source range in private space needs `acknowledge_any: true`, a network or
+  subnet in another project (a Shared VPC) is refused, and a create or start that reaches the
+  cloud while the check fails is not sent: the shed is left in `error` or `stopped` with the new
+  reason `firewall`.
+- **Remote backend: stricter config, and an abandoned create is destroyed.** An unknown key
+  anywhere under `remote:` now stops the load (a misspelt limit or firewall setting used to
+  fall back to its default). A static source range in `198.18.0.0/15` or `192.0.0.0/24` needs
+  `acknowledge_any: true`, auto mode never believes an address in those ranges or in
+  `240.0.0.0/4`, and an `echo_urls` host name outside ASCII must be written in its punycode
+  form. A VM still labelled `creating` 15 minutes after the cloud made it, with no record on
+  the server (a lost `state_dir`, or a server that died mid-create), is destroyed by the
+  start-up and periodic passes; before, it ran to its run limit and its disk stayed. Every
+  shed VM is made with `enable-oslogin=FALSE`. A streamed create refused by the firewall check
+  inside its job ends with `503 FIREWALL_CHECK_FAILED`, not a 500, and a service client's
+  `FIREWALL_CHECK_FAILED` message no longer names the rule, its source ranges or the server's
+  address.
+- **Logs: URL credentials with shell punctuation are redacted.** A password holding a
+  backslash, quote, backtick, brace, pipe, caret or angle bracket (`pa\$word` in a raw SSH
+  command) ended the scan early and reached the server, agent and audit logs whole; so did a
+  URL whose scheme the shell glues on (`"https"://`). Both are redacted now. In text with no
+  white space, an `@` after a path-less URL's closing quote is hidden with it. A create whose
+  `repo` URL does not parse gets a `400 INVALID_REPO_URL` that repeats none of the URL (the
+  parser's error used to quote it, password included).
+- **Remote backend: a failed read of the cloud never destroys or stops a VM.** A create or start
+  resumed after a server restart reads its VM first. When that read failed, the create was
+  failed and its VM queued for destruction (a finished shed included, if the restart came
+  between the create's last two writes), and a start was failed and its running VM stopped. Such
+  a shed now stays `starting` with the new reason `cloud_unreadable`, nothing is changed, and
+  the periodic pass looks again; a delete ends it at any time. A resumed create also leaves a VM
+  whose labels are another shed version's untouched, where it used to connect, clone and
+  provision before it noticed, and a start that finds such labels is kept the same way, where it
+  used to record the shed `stopped` while its VM might be running. A delete whose marker was
+  written but could not be flushed to disk is acknowledged and carried out; it used to answer
+  500 and destroy the VM two minutes later all the same. A streamed delete whose destroy failed
+  is no longer reported as done when the server cannot read its delete markers; it ends in an
+  error. A create or start that needs a new firewall check waits 10 s at most, the wait for a
+  check already in progress included, and gives up at once when its client has gone.
+- **Logs: three more ways a URL's credentials could reach a log are closed.** The second of
+  two URLs with no white space between them (`["https://u:p@one","https://v:q@two"]`, as a
+  JSON-encoded argv is written) kept its user and password in the exec log line and the audit
+  record. Clone or hook output that stopped inside a URL, before its `@`, was logged as it
+  stood; the server log now shows `scheme://REDACTED` for a URL still open where a stream
+  ends, host included. And one 16 MiB write with no space or line break was copied whole
+  before it was dropped; the redacting writer now holds 128 KiB at most.
 - **Development: a remote-backend dev server and suite parameter.**
   `make dev-server-up-remote` (and `-down-`, `-restart-`, `-status-`, `-logs-remote`) runs the
   dev build with `default_backend: remote` beside an installed server, reading the cloud
-  settings from a private env file. The integration suite gains an opt-in `remote` parameter
+  settings from a private env file. The env file also picks the firewall mode
+  (`SHED_REMOTE_FIREWALL_MODE=auto` with `SHED_REMOTE_ECHO_URLS`; static otherwise). The
+  integration suite gains an opt-in `remote` parameter
   (`SHED_REMOTE_SERVER`; `make test-integration-remote`, manual only, since every shed is a
   billed VM). See [Remote Backend
   Development](https://charliek.github.io/shed/development/remote-backend/).

@@ -35,6 +35,8 @@ scripts/remote/gce-setup.sh --print \
   --key-out ~/.config/shed/remote-dev/gce-key.b64
 ```
 
+Use a documentation address such as `203.0.113.7/32` when you only want to read the output.
+
 | Flag | Meaning |
 |---|---|
 | `--project` | The Google Cloud project ID. |
@@ -43,9 +45,28 @@ scripts/remote/gce-setup.sh --print \
 | `--source-range` | Your machine's public address as a `/32`: the only source the firewall rule admits on port 22. |
 | `--subnet-range` | The subnet range (default `10.10.0.0/24`). |
 | `--role-id` | The custom role ID (default `shedServer`), shared by every environment in the project. |
-| `--key-out` | Where the base64 service account key is written, mode `0600`. |
+| `--key-out` | Where the base64 service account key is written, mode `0600`. The file must not exist yet: the printed block stops before making a key when it does. |
+| `--firewall-auto` | Also print the two extra roles `remote.firewall.mode: auto` needs. Leave it out for `static`, the dev default. |
 
-Read each printed block, then run it yourself. It enables the Compute Engine API and creates a custom-mode network and subnet, one firewall rule (tcp:22 from your address to the environment's tag), the custom role, a service account holding only that role, and its key. The printed text ends with the environment variables to set. The server does not create, read or check the firewall rule: if your public address changes, update the rule's source range yourself.
+Read each printed block, then run it yourself. It enables the Compute Engine API and creates a custom-mode network and subnet, one firewall rule (tcp:22 from your address to the environment's tag), the custom role, a service account holding only that role, and its key. The printed text ends with the environment variables to set.
+
+The server never creates or deletes the firewall rule, but it reads it. Unless the env file says otherwise, the dev config is rendered with `firewall.mode: static` and `source_ranges_env: SHED_REMOTE_SOURCE_RANGES`: the rule's source ranges must equal that variable, and while they do not, `shed create` and `shed start` answer `503 FIREWALL_CHECK_FAILED`. When your public address changes, update both:
+
+```bash
+gcloud compute firewall-rules update shed-<env-name>-ssh --project <project-id> \
+  --source-ranges=<new-address>/32
+# then set SHED_REMOTE_SOURCE_RANGES=<new-address>/32 in the env file and
+make dev-server-restart-remote
+```
+
+If the address changes often, let the server follow it: run the block `gce-setup.sh --print --firewall-auto` adds (pass the `--role-id` your project's base role was made with, and check the printed service account is the one your key belongs to), then set two variables in the env file and restart:
+
+```bash
+SHED_REMOTE_FIREWALL_MODE=auto
+SHED_REMOTE_ECHO_URLS=https://<first-echo-service>/,https://<second-echo-service>/
+```
+
+The config is then rendered with `mode: auto` and those `echo_urls`, and `SHED_REMOTE_SOURCE_RANGES` is no longer read. The start-up log line `firewall check passed (mode auto, ...)` shows the address the services agreed on. See [The firewall check](../reference/remote-backend.md#the-firewall-check) for every clause, the two extra roles and what each failure means.
 
 Create the SSH key the server uses to log in to every VM:
 
@@ -65,8 +86,9 @@ SHED_GCE_ZONE=<zone>
 SHED_GCE_NETWORK=shed-<env-name>
 SHED_GCE_SUBNET=shed-<env-name>
 SHED_GCE_TAG=shed-<env-name>
-SHED_GCE_CREDENTIALS_FILE=<path to the base64 key>
+SHED_GCE_CREDENTIALS_FILE=<path to the key file>
 SHED_REMOTE_SSH_KEY_FILE=<path to link_ed25519>
+SHED_REMOTE_SOURCE_RANGES=<your-public-address>/32
 ```
 
 | Variable | Read by | Meaning |
@@ -77,8 +99,11 @@ SHED_REMOTE_SSH_KEY_FILE=<path to link_ed25519>
 | `SHED_GCE_NETWORK` | server, `gce-image` | The environment's network. |
 | `SHED_GCE_SUBNET` | server, `gce-image` | The environment's subnet. |
 | `SHED_GCE_TAG` | `gce-image` | The network tag the firewall rule admits; the image bake gives it to its builder VM (`SHED_GCE_BAKE_TAG` overrides). |
-| `SHED_GCE_CREDENTIALS_FILE` | server | Path to the base64 service account key. `GOOGLE_CREDENTIALS_BASE64` (the key itself) is the alternative; set exactly one. |
+| `SHED_GCE_CREDENTIALS_FILE` | server | Path to the service account key file: the JSON key or its base64, as `--key-out` writes it. `GOOGLE_CREDENTIALS_BASE64` (the key itself) is the alternative; set exactly one. |
 | `SHED_REMOTE_SSH_KEY_FILE` | server | Path to the SSH private key. `SHED_REMOTE_SSH_KEY` (base64 of the key) is the alternative; set exactly one. |
+| `SHED_REMOTE_SOURCE_RANGES` | server | The firewall rule's source ranges, comma-separated IPv4 CIDRs: what you passed as `--source-range`. The server compares the rule with it (`remote.firewall.source_ranges_env`). Not read in `auto` mode. |
+| `SHED_REMOTE_FIREWALL_MODE` | `dev-server-up-remote` | Optional: `static` (the default) or `auto`, rendered into `remote.firewall.mode`. |
+| `SHED_REMOTE_ECHO_URLS` | `dev-server-up-remote` | For `auto` only: two or more https echo services on different hosts, comma-separated with no spaces, rendered into `remote.firewall.echo_urls`. |
 
 Keep the file mode `0600`. The server refuses to start, naming the variable, when one it needs is unset.
 
@@ -144,7 +169,7 @@ gcloud compute disks list --project <project-id> --filter='labels.shed_env=<env-
 
 Both `gcloud` lists must be empty once every shed is deleted. `shed delete` returns only when the VM is gone (about 30 s); a JSON `DELETE` through the API answers in about 3 s and the VM goes in the background, so it can show for a short while. A destroy that fails is retried by the server's periodic pass, which runs once a minute. A VM that should not exist can be deleted with `gcloud compute instances delete`; the server forgets its record at the next pass.
 
-Every VM also carries a maximum run duration (the larger of `remote.max_run_duration`, 24 h in the dev config, and the owning client's `max_age`), after which the cloud stops it. A stopped VM still bills for its disk.
+Every VM also carries a maximum run duration (the larger of `remote.max_run_duration`, 24 h in the dev config, and the owning client's `max_age`), after which the cloud stops it and the shed is listed `stopped (run_limit)`. A stopped VM still bills for its disk. To see it happen, render the config with `max_run_duration: 10m`, the shortest the server accepts.
 
 ## Integration tests
 
@@ -159,7 +184,7 @@ The target is manual only and never starts the server for you. It sets every vz 
 
 ## Measured timings
 
-From two live runs on the dev project (`e2-standard-2`, 20 GB image, one zone). The cloud's own share varies from run to run: the provider phase of a create took between 12 and 35 s.
+From three live runs on the dev project (`e2-standard-2`, 20 GB image, one zone). The cloud's own share varies from run to run: the provider phase of a create took between 12 and 35 s.
 
 | Step | Seconds |
 |---|---|
@@ -176,3 +201,9 @@ From two live runs on the dev project (`e2-standard-2`, 20 GB image, one zone). 
 | JSON `DELETE` | 204 after about 3; VM gone after about 30 |
 | A VM stopped outside shed, until listed `stopped (external)` | 10 after the VM stopped (the pass runs once a minute) |
 | A VM deleted outside shed, until its record is gone | 2 to 12 after the VM was gone |
+| `make gce-image` | 272 |
+| A create from an image with no shed agent, until `error (create_failed)` | 324 (the 5 minute wait for the agent); VM and disk gone 58 later |
+| A VM at its run limit (10 minutes), until listed `stopped (run_limit)` | 63 after the limit; `shed start` 44, with a new limit |
+| `shed delete` of a VM under deletion protection | 4, with an error; a create refused at `max_running` from 2 minutes on; VM gone 80 after the protection was cleared |
+| Firewall rule changed by hand, until creates are refused | 29 to 53 (the next pass) |
+| Auto mode: rule sources changed by hand, until patched back | 45 to 47 |

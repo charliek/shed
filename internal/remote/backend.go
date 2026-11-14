@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"sync"
 	"time"
 
@@ -55,6 +56,12 @@ const (
 	// before the periodic pass retries it. A delete that was just
 	// acknowledged has its own job on the way.
 	DefaultDeleteRetryAge = 2 * time.Minute
+	// StaleCreateAge is how long after the cloud made it an instance may
+	// stay labelled creating with no local record before the start-up and
+	// periodic passes destroy it as an abandoned create. A create waits 15 s
+	// for the insert, 5 minutes for the agent and less for everything else,
+	// and has a record throughout; this is three times that.
+	StaleCreateAge = 15 * time.Minute
 	// DefaultImageResolveTimeout bounds the image lookup a create makes
 	// before it saves anything. With the fast-fail window it keeps the JSON
 	// create's reply under the 30 s a client waits.
@@ -118,6 +125,14 @@ type Options struct {
 	// ImageResolveTimeout bounds the image lookup a create makes before it
 	// saves anything. Default 10 s.
 	ImageResolveTimeout time.Duration
+	// FirewallSources are the source ranges the environment's firewall
+	// rule must have with remote.firewall.mode: static, as the server
+	// resolved them at start-up (config.RemoteRuntime.FirewallSources).
+	// Required in static mode.
+	FirewallSources []string
+	// EchoClient, when set, supplies the HTTP transport for auto mode's
+	// echo requests. Tests pass one that trusts their servers.
+	EchoClient *http.Client
 	// Logf receives the backend's log lines. Default log.Printf.
 	Logf func(format string, args ...any)
 	// Now is the clock for record timestamps. Default time.Now.
@@ -131,6 +146,7 @@ type Backend struct {
 	cfg     *config.RemoteConfig
 	prov    provider.Provider
 	links   transport.Factory
+	fw      *firewallState
 	store   *state.Store
 	credMgr *vmutil.CredentialManager
 	logf    func(format string, args ...any)
@@ -165,7 +181,8 @@ var (
 	_ backend.CapabilityReporter = (*Backend)(nil)
 )
 
-// New builds the backend and loads the record cache. It makes no cloud call.
+// New builds the backend and loads the record cache. It makes no cloud call
+// and no echo request.
 func New(opts Options) (*Backend, error) {
 	switch {
 	case opts.Config == nil:
@@ -220,6 +237,11 @@ func New(opts Options) (*Backend, error) {
 		opts.Now = time.Now
 	}
 
+	fw, err := newFirewallState(opts.Config, opts.FirewallSources, opts.EchoClient)
+	if err != nil {
+		return nil, err
+	}
+
 	store, err := state.Open(opts.StateDir)
 	if err != nil {
 		return nil, err
@@ -238,6 +260,7 @@ func New(opts Options) (*Backend, error) {
 		cfg:        opts.Config,
 		prov:       opts.Provider,
 		links:      opts.Links,
+		fw:         fw,
 		store:      store,
 		credMgr:    vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
 		logf:       opts.Logf,
@@ -266,14 +289,18 @@ func (b *Backend) Type() backend.Type { return backend.TypeRemote }
 func (b *Backend) Capabilities() backend.Capabilities { return backend.RemoteCapabilities() }
 
 // SupportsNetworkProfile reports whether a shed may ask for the profile.
-// "isolated" means isolation by network topology: no route between sheds or
-// to the server host. It is refused when the firewall is open to anyone.
+// "isolated" means isolation by network topology: no route between sheds and
+// no private route to the server host. Outbound traffic is not filtered, so a
+// shed still reaches any public address, a public port of the server host
+// included; no egress rule exists or is checked. It is refused when the
+// config accepts a firewall rule open to more than the server (mode any, or
+// acknowledged wide ranges).
 func (b *Backend) SupportsNetworkProfile(profile string) bool {
 	switch profile {
 	case config.NetworkProfileOpen:
 		return true
 	case config.NetworkProfileIsolated:
-		return b.cfg.Firewall.Mode != config.RemoteFirewallAny
+		return !b.cfg.Firewall.AdmitsAny()
 	}
 	return false
 }
@@ -386,13 +413,30 @@ func (b *Backend) saveLocked(r *state.Record) {
 	}
 }
 
-// saveMarkerLocked writes a delete marker and notes it as pending.
+// saveMarkerLocked writes a delete marker and notes it as pending. An error
+// means no marker was put in place, and nothing will ever act on one. A
+// marker that is in place with only its directory's flush failed
+// (state.ErrNotDurable) is a written marker: the periodic pass and the next
+// start-up read it and destroy the VM, so the caller must not report the
+// delete as failed.
 func (b *Backend) saveMarkerLocked(m *state.Marker) error {
-	if err := b.store.SaveMarker(m); err != nil {
+	if err := b.inPlace(b.store.SaveMarker(m)); err != nil {
 		return err
 	}
 	b.pending[m.ID] = m.At
 	return nil
+}
+
+// inPlace turns the error of a state write that did put its file in place
+// (state.ErrNotDurable) into a log line and nil. What is lost is only that a
+// power cut might undo the write; the cloud's own labels cover that for a
+// delete (shed_state=deleting) and the start-up pass for a create.
+func (b *Backend) inPlace(err error) error {
+	if errors.Is(err, state.ErrNotDurable) {
+		b.logf("remote: %v; carrying on with the file as written", err)
+		return nil
+	}
+	return err
 }
 
 // dropLocked removes a record from memory and disk.

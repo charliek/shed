@@ -29,6 +29,9 @@ func TestConformance(t *testing.T) {
 				FailNextCreateOperation: func(t *testing.T, kind error) {
 					p.FailOperation(OpCreate, provider.Errorf(kind, string(OpWait), "injected"))
 				},
+				SetFirewall: func(t *testing.T, rules []provider.FirewallRule) {
+					p.SetFirewallRules(rules...)
+				},
 			}
 		},
 	})
