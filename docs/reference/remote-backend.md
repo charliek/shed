@@ -114,7 +114,7 @@ The CLI refuses `--local-dir`, `--add-dir`, `--from-snapshot`, `--egress` and na
 
 ## Server information
 
-`GET /api/info` on a remote server reports `backend: "remote"`, the remote `default_image`, and in `features` the tokens `async_lifecycle` and `network_profiles` (with `service_clients` and `http_exec` as on any server). It also reports `isolation: "topology"`. No response names the cloud project, zone or any address.
+`GET /api/info` on a remote server reports `backend: "remote"`, the remote `default_image`, and in `features` the tokens `async_lifecycle` and `network_profiles` (with `service_clients` and `http_exec` as on any server). It also reports `isolation: "topology"`. No response to a service client names the cloud project, zone or any address; a `503 FIREWALL_CHECK_FAILED` sent to an admin does name the rule, its source ranges and the server's own address, because the admin is who must fix them, and a service client gets the code with a message that names none of them.
 
 ## Sizes
 

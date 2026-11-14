@@ -137,7 +137,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.DefaultBackend == config.BackendRemote && s.cfg.Remote != nil {
 		size, err := s.cfg.Remote.ResolveSize(req.CPUs, req.MemoryMB)
 		if err != nil {
-			code, errCode, msg := mapBackendError(err)
+			code, errCode, msg := backendErrorFor(r.Context(), err)
 			writeError(w, code, errCode, msg)
 			return
 		}
@@ -278,7 +278,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		shed, err := s.backend.CreateShed(context.WithoutCancel(r.Context()), req)
 		if err != nil {
 			log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, s.backend.Type(), err)
-			code, errCode, msg := mapBackendError(err)
+			code, errCode, msg := backendErrorFor(r.Context(), err)
 			writeError(w, code, errCode, msg)
 			return
 		}
@@ -292,7 +292,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	log.Printf("timing: %s", timer.Finish(err))
 	if err != nil {
 		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, err)
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -427,7 +427,7 @@ drain:
 	}
 
 	if res.err != nil {
-		_, errCode, msg := mapBackendError(res.err)
+		_, errCode, msg := backendErrorFor(r.Context(), res.err)
 		writeSSEEvent(w, "error", config.NewAPIError(errCode, msg))
 	} else {
 		writeSSEEvent(w, "complete", res.payload)
@@ -462,7 +462,7 @@ func (s *Server) handleGetShed(w http.ResponseWriter, r *http.Request) {
 
 	shed, err := s.backend.GetShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -477,7 +477,7 @@ func (s *Server) handleEgressShow(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 	shed, err := s.backend.GetShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -532,7 +532,7 @@ func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 	}
 	shed, err := ec.SetShedEgress(r.Context(), name, req.Profiles)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -593,7 +593,7 @@ func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
 	}
 	shed, err := ec.ClearShedEgress(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -627,7 +627,7 @@ func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	// teardown and its timing.
 	if isAsync {
 		if err := s.backend.DeleteShed(context.WithoutCancel(r.Context()), name); err != nil {
-			code, errCode, msg := mapBackendError(err)
+			code, errCode, msg := backendErrorFor(r.Context(), err)
 			writeError(w, code, errCode, msg)
 			return
 		}
@@ -643,7 +643,7 @@ func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	err := s.backend.DeleteShed(ctx, name)
 	log.Printf("timing: %s", timer.Finish(err))
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -691,7 +691,7 @@ func (s *Server) handleStartShed(w http.ResponseWriter, r *http.Request) {
 	}
 	shed, err := s.backend.StartShed(ctx, name)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -715,7 +715,7 @@ func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 	// create still runs (gracefully) after the client has given up.
 	shed, err := s.backend.StopShed(context.WithoutCancel(r.Context()), name)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -732,7 +732,7 @@ func (s *Server) handleResetShed(w http.ResponseWriter, r *http.Request) {
 
 	shed, err := s.backend.ResetShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -831,6 +831,24 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	apiErr := config.NewAPIError(code, message)
 	writeJSON(w, status, apiErr)
+}
+
+// firewallRefusalForClients is all a service client is told of a failing
+// firewall check. The full message is written for the operator who must fix
+// the cloud: it names the server's public address, the rule's source ranges,
+// the echo services and what each answered. None of that is a client's to
+// know (no response names an address), and the server log has it.
+const firewallRefusalForClients = "firewall check failed: the server's check of its cloud firewall is failing, so creates and starts are refused until its operator fixes it; try again later"
+
+// backendErrorFor is mapBackendError for one request's caller: the same
+// status and code for everyone, and for a service client a message without
+// the server's own details where the full one carries them.
+func backendErrorFor(ctx context.Context, err error) (int, string, string) {
+	status, code, msg := mapBackendError(err)
+	if code == config.ErrFirewallCheckFailed && callerFrom(ctx).IsClient() {
+		msg = firewallRefusalForClients
+	}
+	return status, code, msg
 }
 
 // mapBackendError maps a backend error to an HTTP status code, error code, and message.
@@ -993,7 +1011,7 @@ func (s *Server) handleDeleteImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.backend.DeleteImage(r.Context(), name); err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -1016,7 +1034,7 @@ func (s *Server) handlePruneImages(w http.ResponseWriter, r *http.Request) {
 
 	deleted, err := s.backend.PruneImages(r.Context(), dryRun)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -1037,7 +1055,7 @@ func (s *Server) handleInspectImage(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.backend.InspectImage(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -1062,7 +1080,7 @@ func (s *Server) handleTagImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.backend.TagImage(r.Context(), req.Source, req.Target); err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -1092,7 +1110,7 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 	}
 	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag, req.Platform, req.WithLayers)
 	if err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -1131,7 +1149,7 @@ func (s *Server) handlePushImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.backend.PushImage(r.Context(), req.Source, req.Destination); err != nil {
-		code, errCode, msg := mapBackendError(err)
+		code, errCode, msg := backendErrorFor(r.Context(), err)
 		writeError(w, code, errCode, msg)
 		return
 	}
