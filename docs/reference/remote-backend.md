@@ -107,7 +107,7 @@ None of the 503 refusals is ever a 409, because a client reads a 409 on create a
 | Server mounts | non-empty `mounts` (`--mounts`) | 422; an omitted `mounts` stores `none` |
 | Snapshots | `from_snapshot`, `POST /api/snapshots`, `GET` and `DELETE /api/snapshots/{name}` | 422 or 501; `GET /api/snapshots` lists nothing |
 | Reset | `POST /api/sheds/{name}/reset` | 501 |
-| Image store | image inspect, tag, pull, push, delete and prune | 501; `GET /api/images` lists the configured aliases |
+| Image store | image inspect, tag, pull, push, delete and prune | 501; `GET /api/images` lists nothing (the images are the `image_aliases` names in the server config) |
 | Egress profiles | `egress` other than `["off"]`, egress set, off and profile writes | 422 or 501 |
 
 The CLI refuses `--local-dir`, `--add-dir`, `--from-snapshot`, `--egress` and named `--mounts` before sending anything when `/api/info` reports `backend: "remote"`.
