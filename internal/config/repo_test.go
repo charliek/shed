@@ -134,3 +134,34 @@ func TestRepoDirNameErrorHidesCredentials(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateGitRepoURLErrorHidesCredentials: a URL that does not parse is
+// refused without any of its text, because net/url quotes the URL (or the
+// piece it could not read) in its error and the refusal is an API reply.
+func TestValidateGitRepoURLErrorHidesCredentials(t *testing.T) {
+	tests := []struct {
+		name string
+		repo string
+		want string
+	}{
+		{name: "backslash in the password", repo: `https://alice:pa\$s3cret@example.com/x.git`, want: "invalid userinfo"},
+		{name: "space in the password", repo: "https://alice:my s3cret@example.com/x.git", want: "invalid userinfo"},
+		{name: "bad escape in the password", repo: "https://alice:%zzs3cret@example.com/x.git", want: "does not parse"},
+		{name: "password read as a port", repo: "https://alice:s3cret/x.git", want: "does not parse"},
+		{name: "control character", repo: "https://alice:s3cret@example.com/x\x7f.git", want: "invalid control character"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateGitRepoURL(tt.repo)
+			if err == nil {
+				t.Fatal("no error")
+			}
+			if strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), "alice") {
+				t.Errorf("error = %q, want none of the URL", err)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %q, want it to say %q", err, tt.want)
+			}
+		})
+	}
+}
