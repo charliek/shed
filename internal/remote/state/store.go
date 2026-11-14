@@ -316,11 +316,12 @@ func writeJSON(path string, v any) error {
 	return nil
 }
 
+// removeIfExists removes a file and flushes its directory. A file that is not
+// there is flushed for all the same: an earlier call may have removed it and
+// failed at the flush, and reporting success for the retry would call a
+// removal durable that a power cut can still undo.
 func removeIfExists(path string) error {
-	if err := os.Remove(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remote state: %w", err)
 	}
 	if err := syncDir(filepath.Dir(path)); err != nil {

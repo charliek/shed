@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -128,7 +129,10 @@ func TestStoreWritesAreDurable(t *testing.T) {
 		{"save marker", func() error { return s.SaveMarker(&Marker{ID: "abcdefgh", Name: "one", Env: "test"}) }, []string{"deleting"}},
 		{"delete record", func() error { return s.DeleteRecord("one") }, []string{"sheds"}},
 		{"delete marker", func() error { return s.DeleteMarker("abcdefgh") }, []string{"deleting"}},
-		{"delete a marker that is not there", func() error { return s.DeleteMarker("abcdefgh") }, nil},
+		// A removal whose flush failed is retried as the removal of a file
+		// that is not there, and the retry must still flush.
+		{"delete a marker that is not there", func() error { return s.DeleteMarker("abcdefgh") }, []string{"deleting"}},
+		{"delete a record that is not there", func() error { return s.DeleteRecord("one") }, []string{"sheds"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -138,6 +142,57 @@ func TestStoreWritesAreDurable(t *testing.T) {
 			}
 			if len(synced) != len(tt.want) || (len(synced) == 1 && synced[0] != tt.want[0]) {
 				t.Fatalf("flushed directories %v, want %v", synced, tt.want)
+			}
+		})
+	}
+}
+
+// failSyncDir makes the next n directory flushes fail.
+func failSyncDir(t *testing.T, n int) {
+	t.Helper()
+	orig := syncDir
+	syncDir = func(dir string) error {
+		if n > 0 {
+			n--
+			return errors.New("flush failed")
+		}
+		return orig(dir)
+	}
+	t.Cleanup(func() { syncDir = orig })
+}
+
+// A removal that unlinked the file and could not flush the directory reports
+// an error. The retry finds no file; it succeeds only once the directory has
+// been flushed, because until then a power cut can bring the file back.
+func TestStoreRemovalRetryFlushes(t *testing.T) {
+	tests := []struct {
+		name   string
+		save   func(s *Store) error
+		remove func(s *Store) error
+	}{
+		{"marker", func(s *Store) error { return s.SaveMarker(&Marker{ID: "abcdefgh", Name: "one", Env: "test"}) },
+			func(s *Store) error { return s.DeleteMarker("abcdefgh") }},
+		{"record", func(s *Store) error { return s.SaveRecord(&Record{Shed: config.Shed{Name: "one", ID: "abcdefgh"}}) },
+			func(s *Store) error { return s.DeleteRecord("one") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tt.save(s); err != nil {
+				t.Fatal(err)
+			}
+			failSyncDir(t, 2)
+			if err := tt.remove(s); err == nil {
+				t.Fatal("a removal whose directory flush failed reported success")
+			}
+			if err := tt.remove(s); err == nil {
+				t.Fatal("the retry reported success though the directory was still not flushed")
+			}
+			if err := tt.remove(s); err != nil {
+				t.Fatalf("the retry with a working flush: %v", err)
 			}
 		})
 	}
