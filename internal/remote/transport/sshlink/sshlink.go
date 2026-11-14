@@ -50,6 +50,10 @@ import (
 	"github.com/charliek/shed/internal/remote/transport"
 )
 
+// maxRefusalLogs is how many channels opened by the guest are logged one by
+// one on a connection before the rest are only counted.
+const maxRefusalLogs = 8
+
 // Defaults for Config.
 const (
 	DefaultConnectTimeout    = 5 * time.Second
@@ -592,12 +596,26 @@ func (l *Link) connectTo(ctx context.Context, addr string, pin ssh.PublicKey) (*
 	// client sees it. The client is handed a channel that only ever
 	// closes, so nothing registered on it later (a Listen, an agent
 	// forward) could accept one.
+	//
+	// The guest decides how many it opens, so only the first few are
+	// logged one by one: a guest must not be able to fill the server's
+	// log.
 	none := make(chan ssh.NewChannel)
 	go func() {
 		defer close(none)
+		refused := 0
 		for ch := range chans {
-			l.cfg.Logf("sshlink: %s: refused a %q channel opened by the guest", l.name(), ch.ChannelType())
+			refused++
+			switch {
+			case refused <= maxRefusalLogs:
+				l.cfg.Logf("sshlink: %s: refused a %q channel opened by the guest", l.name(), ch.ChannelType())
+			case refused == maxRefusalLogs+1:
+				l.cfg.Logf("sshlink: %s: the guest keeps opening channels; each is turned away, and no more of them are logged for this connection", l.name())
+			}
 			_ = ch.Reject(ssh.Prohibited, "the server accepts no channels")
+		}
+		if refused > maxRefusalLogs {
+			l.cfg.Logf("sshlink: %s: the guest opened %d channels on this connection; all were turned away", l.name(), refused)
 		}
 	}()
 

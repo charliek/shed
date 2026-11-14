@@ -487,6 +487,24 @@ func TestGuestOpenedChannelsAreRefused(t *testing.T) {
 	if refusals != len(types) {
 		t.Errorf("%d refusals logged, want %d", refusals, len(types))
 	}
+
+	// A guest that keeps asking is still refused every time, and cannot
+	// fill the server's log: past the first few, nothing more is logged
+	// per channel.
+	before := len(f.logs.all())
+	for i := 0; i < 200; i++ {
+		errs := f.srv.OpenChannel("session", nil)
+		var refused *ssh.OpenChannelError
+		if len(errs) != 1 || !errors.As(errs[0], &refused) {
+			t.Fatalf("channel %d was not refused: %v", i, errs)
+		}
+	}
+	if grew := len(f.logs.all()) - before; grew > maxRefusalLogs+1 {
+		t.Errorf("200 more channels wrote %d log lines, want at most %d", grew, maxRefusalLogs+1)
+	}
+	if logs := strings.Join(f.logs.all(), "\n"); !strings.Contains(logs, "no more of them are logged") {
+		t.Errorf("the log does not say that it stopped listing refusals: %s", logs)
+	}
 }
 
 // A connection into a black hole: the peer stops answering but nothing closes
