@@ -284,21 +284,42 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 
 	backend.Phase(ctx, "provider")
 	backend.Status(ctx, "Creating the cloud instance...")
-	// Create is idempotent on the instance name and shed ID, so a create
-	// resumed after a restart sends the same request and gets the same
-	// instance.
-	pend, err := b.prov.Create(ctx, *rec.Spec)
-	if err != nil {
-		return b.failCreate(j, err, config.StatusReasonCreateFailed)
+	// A create resumed after a restart goes back to the instance its first
+	// attempt was given, where that instance is. Sending the request again
+	// is right only when that instance is gone: Create places an instance
+	// where the server is configured now, so a server that came back with
+	// another zone would make a second instance and lose track of the first.
+	var pend provider.Pending
+	if rec.Ref != "" {
+		inst, err := b.prov.Get(ctx, rec.Ref)
+		switch {
+		case errors.Is(err, provider.ErrNotFound):
+		case err != nil:
+			return b.failCreate(j, err, config.StatusReasonCreateFailed)
+		case inst.Labels[provider.LabelID] != j.id || inst.Labels[provider.LabelEnv] != b.cfg.Environment:
+			err := fmt.Errorf("%w: instance %s is not this shed's", provider.ErrForeign, inst.Name)
+			return b.failCreate(j, err, config.StatusReasonCreateFailed)
+		case inst.ShedState() == provider.ShedStateReady:
+			return b.resumeCommitted(ctx, j, inst)
+		default:
+			pend = provider.Pending{Ref: rec.Ref, Want: provider.StateRunning}
+		}
 	}
-	if !b.update(j.name, j.id, func(r *state.Record) {
-		r.Ref = pend.Ref
-		r.Pending = &pend
-	}) {
-		// Deleted while the insert was being accepted: hand the delete
-		// job the instance it could not have known.
-		b.setMarkerRef(j.id, pend.Ref)
-		return errSuperseded
+	if pend.Ref == "" {
+		// Create is idempotent on the instance name and shed ID.
+		var err error
+		if pend, err = b.prov.Create(ctx, *rec.Spec); err != nil {
+			return b.failCreate(j, err, config.StatusReasonCreateFailed)
+		}
+		if !b.update(j.name, j.id, func(r *state.Record) {
+			r.Ref = pend.Ref
+			r.Pending = &pend
+		}) {
+			// Deleted while the insert was being accepted: hand the
+			// delete job the instance it could not have known.
+			b.setMarkerRef(j.id, pend.Ref)
+			return errSuperseded
+		}
 	}
 	inst, err := b.prov.Wait(ctx, pend)
 	if err != nil {
@@ -378,6 +399,62 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		return errSuperseded
 	}
 	backend.Status(ctx, "Shed is running")
+	return nil
+}
+
+// commitCreatedLocked repairs the record of a create that the cloud shows as
+// finished. A create's last two writes are the shed_state=ready label and the
+// local Ready flag, in that order; a server that died between them left a
+// finished shed with a record that still says "create in flight". The label
+// is the commit point: such a shed is never created again and never cleaned
+// up as a failed create, whatever its instance is doing now. The record takes
+// the status an adopted shed would get.
+func (b *Backend) commitCreatedLocked(r *state.Record, inst provider.Instance) {
+	r.Ready, r.Cloned, r.Provisioned = true, true, true
+	r.Pending = nil
+	if r.Ref == "" {
+		r.Ref = inst.Ref
+	}
+	if l := inst.Layout(); l != 0 {
+		r.Layout = l
+	}
+	switch inst.State {
+	case provider.StateStopped:
+		b.recordStoppedLocked(r, inst)
+		return
+	case provider.StateStopping:
+		r.Shed.Status = config.StatusStopping
+		r.Job = state.JobStop
+	default:
+		// Running, or on its way: "starting" until a probe succeeds.
+		r.Shed.Status = config.StatusStarting
+		r.Job = state.JobProbe
+		r.Address = inst.Address
+		r.AddressAt = b.now()
+	}
+	b.saveLocked(r)
+}
+
+// resumeCommitted carries a resumed create job on as the job a finished shed
+// needs: a probe when its instance runs, a stop when it is stopping.
+func (b *Backend) resumeCommitted(ctx context.Context, j *job, inst provider.Instance) error {
+	b.mu.Lock()
+	r := b.currentLocked(j.name, j.id)
+	if r == nil {
+		b.mu.Unlock()
+		return errSuperseded
+	}
+	b.commitCreatedLocked(r, inst)
+	status := r.Shed.Status
+	b.mu.Unlock()
+	b.logf("remote: create of shed %s had finished in the cloud (%s=%s); recording it %s", j.name, provider.LabelState, provider.ShedStateReady, status)
+	j.markAccepted()
+	switch status {
+	case config.StatusStarting:
+		return b.runProbe(ctx, j)
+	case config.StatusStopping:
+		return b.runStop(ctx, j)
+	}
 	return nil
 }
 
