@@ -1,10 +1,11 @@
 package sshd
 
 import (
-	"github.com/charliek/shed/internal/redact"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/charliek/shed/internal/redact"
 )
 
 // TestWrapCommand locks the contract `wrapCommand` exposes: empty raw
