@@ -152,3 +152,55 @@ func TestWaitSettledDoesNotCallADeleteGoneWhenTheMarkersCannotBeRead(t *testing.
 		t.Fatalf("WaitSettled after the delete finished = %v, want not found", err)
 	}
 }
+
+// One marker file that cannot be parsed is left out by the store without an
+// error. It is still the only evidence of its unfinished delete, so the wait
+// must not answer not-found on the strength of a list it is missing from.
+func TestWaitSettledDoesNotCallADeleteGoneWhenItsMarkerFileCannotBeRead(t *testing.T) {
+	e := newEnv(t)
+	const name = "stuck"
+	e.running(name)
+	e.prov.FailNext(fake.OpDestroy, errors.New("the cloud is having a moment"))
+	if err := e.b.DeleteShed(ctxT(t), name); err != nil {
+		t.Fatal(err)
+	}
+	e.idle()
+	if e.instances() != 1 || markerCount(t, e.dir) != 1 {
+		t.Fatalf("%d instances and %d markers, want the VM and its marker left by the failed destroy", e.instances(), markerCount(t, e.dir))
+	}
+
+	// The marker file's content is replaced by something that does not
+	// parse: unreadable for root too, and the directory still lists.
+	entries, err := os.ReadDir(filepath.Join(e.dir, "deleting"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("marker directory: %v, %d entries", err, len(entries))
+	}
+	path := filepath.Join(e.dir, "deleting", entries[0].Name())
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.b.WaitSettled(ctxT(t), name)
+	if werr := os.WriteFile(path, good, 0o600); werr != nil {
+		t.Fatal(werr)
+	}
+	if !errors.Is(err, ErrDeleteUnknown) || errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Fatalf("WaitSettled with an unreadable marker file = %v, want ErrDeleteUnknown: the VM still exists", err)
+	}
+	if strings.Contains(err.Error(), e.dir) {
+		t.Fatalf("the error repeats the server's state path to the caller: %v", err)
+	}
+
+	// Readable again, the answers are the usual ones.
+	if _, err := e.b.WaitSettled(ctxT(t), name); !errors.Is(err, ErrDeleteOwed) {
+		t.Fatalf("WaitSettled with the marker standing = %v, want ErrDeleteOwed", err)
+	}
+	e.sweep()
+	e.idle()
+	if _, err := e.b.WaitSettled(ctxT(t), name); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Fatalf("WaitSettled after the delete finished = %v, want not found", err)
+	}
+}

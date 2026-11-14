@@ -608,8 +608,9 @@ func deleteOwed(name string) error { return fmt.Errorf("shed %s: %w", name, ErrD
 // Backend.deletes, so such a marker is a destroy that did not happen.
 //
 // Markers are read from disk only when one is known to stand (Backend.pending).
-// A read that fails is returned as an error, never as "no marker": the marker
-// is then the only evidence of the unfinished delete.
+// A read that fails, of the directory or of one marker known to stand, is
+// returned as an error, never as "no marker": the marker is then the only
+// evidence of the unfinished delete.
 func (b *Backend) deleteOwedLocked(ctx context.Context, name string) (bool, error) {
 	if b.records[name] != nil || len(b.pending) == 0 {
 		return false, nil
@@ -618,12 +619,24 @@ func (b *Backend) deleteOwedLocked(ctx context.Context, name string) (bool, erro
 	if err != nil {
 		return false, err
 	}
+	read := make(map[string]bool, len(markers))
 	for _, m := range markers {
+		read[m.ID] = true
 		if m.Name != name || m.KeepRecord || b.deletes[m.ID] != nil {
 			continue
 		}
 		if backend.CheckOwner(ctx, name, m.Owner) == nil && backend.CheckCreatedAt(ctx, name, m.CreatedAt) == nil {
 			return true, nil
+		}
+	}
+	// Store.Markers leaves out a file it cannot read or parse, without an
+	// error. A marker this server knows to stand (b.pending; files and map
+	// change together under b.mu) that did not come back may be this shed's:
+	// the file is where its name is kept, so whose it is cannot be told. One
+	// with a delete job is in hand and is waited for by the caller.
+	for id := range b.pending {
+		if !read[id] && b.deletes[id] == nil {
+			return false, fmt.Errorf("the delete marker of shed ID %s is on record and could not be read", id)
 		}
 	}
 	return false, nil
