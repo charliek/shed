@@ -174,6 +174,25 @@ All notable changes to this project will be documented in this file.
   white space, an `@` after a path-less URL's closing quote is hidden with it. A create whose
   `repo` URL does not parse gets a `400 INVALID_REPO_URL` that repeats none of the URL (the
   parser's error used to quote it, password included).
+- **Remote backend: a failed read of the cloud never destroys or stops a VM.** A create or
+  start resumed after a server restart reads its VM first. When that read failed, the create
+  was failed and its VM queued for destruction (a finished shed included, if the restart came
+  between the create's last two writes), and a start was failed and its running VM stopped.
+  Such a shed now stays `starting` with the new reason `cloud_unreadable`, nothing is changed,
+  and the periodic pass looks again; a delete ends it at any time. A resumed create also
+  leaves a VM whose labels are another shed version's untouched, where it used to connect,
+  clone and provision before it noticed. A delete whose marker was written but could not be
+  flushed to disk is acknowledged and carried out; it used to answer 500 and destroy the VM
+  two minutes later all the same. A create or start that needs a new firewall check waits
+  10 s at most, the wait for a check already in progress included, and gives up at once when
+  its client has gone.
+- **Logs: three more ways a URL's credentials could reach a log are closed.** The second of
+  two URLs with no white space between them (`["https://u:p@one","https://v:q@two"]`, as a
+  JSON-encoded argv is written) kept its user and password in the exec log line and the audit
+  record. Clone or hook output that stopped inside a URL, before its `@`, was logged as it
+  stood; the server log now shows `scheme://REDACTED` for a URL still open where a stream
+  ends, host included. And one 16 MiB write with no space or line break was copied whole
+  before it was dropped; the redacting writer now holds 128 KiB at most.
 - **Development: a remote-backend dev server and suite parameter.**
   `make dev-server-up-remote` (and `-down-`, `-restart-`, `-status-`, `-logs-remote`) runs the
   dev build with `default_backend: remote` beside an installed server, reading the cloud

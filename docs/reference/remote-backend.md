@@ -14,7 +14,7 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 
 | `status` | Meaning | `status_reason` values |
 |---|---|---|
-| `starting` | A create or start is in progress, or the server adopted the VM and has not yet reached its agent. | empty, `no_pin`, `unreachable` |
+| `starting` | A create or start is in progress, or the server adopted the VM and has not yet reached its agent. | empty, `no_pin`, `unreachable`, `cloud_unreadable` |
 | `running` | The agent answered a probe. | empty |
 | `stopping` | A stop is in progress. | empty |
 | `stopped` | The VM is off and its disk is kept. | empty, `capacity`, `quota`, `limit`, `run_limit`, `external`, `isolation_lost`, `layout`, `firewall` |
@@ -24,6 +24,7 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 |---|---|
 | `no_pin` | The VM has no pinned host key yet. |
 | `unreachable` | The server cannot reach the VM's SSH port. |
+| `cloud_unreadable` | The server could not learn from the cloud what the VM is doing: the read failed, or the VM's labels are another shed version's. It changed nothing, keeps the create or start, and looks again at every periodic pass; a delete still works. |
 | `capacity` | The zone had no room for the machine type. |
 | `quota` | The cloud project's quota was reached. |
 | `limit` | The server's `limits` (`max_running` or `max_sheds`) were reached. |
