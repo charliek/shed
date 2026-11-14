@@ -628,3 +628,55 @@ func TestPublicAddrSummaryHidesCredentials(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestFirewallFailureLoggedOncePerFailure: a live run logged one failure at
+// every pass while auto mode waited out its patch interval, because the
+// message says how long ago the rule was patched and so differed each time.
+// A failure is logged again only when what is wrong changes (or after
+// firewallRelog).
+func TestFirewallFailureLoggedOncePerFailure(t *testing.T) {
+	const addr = "203.0.113.7"
+	tests := []struct {
+		name string
+		// between runs between the first failing check and the second.
+		between func(a *autoEnv)
+		want    int
+	}{
+		{name: "the same failure, the last patch one minute older", between: func(*autoEnv) {}, want: 1},
+		{name: "the rule's sources change again", between: func(a *autoEnv) {
+			a.prov.EditEnvRule(func(r *provider.FirewallRule) { r.SourceRanges = []string{"198.51.100.10/32"} })
+		}, want: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The start-up check patches the rule, so the interval is running.
+			a := newAutoEnv(t, "192.0.2.1/32", []string{addr, addr})
+			if n := a.count(fake.OpSetFirewallSources); n != 1 {
+				t.Fatalf("%d patches at start-up, want 1", n)
+			}
+			a.prov.EditEnvRule(func(r *provider.FirewallRule) { r.SourceRanges = []string{"198.51.100.9/32"} })
+
+			first := a.check(time.Minute)
+			if first.OK || first.Failure.Reason != FirewallRuleSources || !strings.Contains(first.Failure.Error(), "not repaired yet") {
+				t.Fatalf("first check = %+v (%v), want rule_sources, not repaired yet", first, first.Failure)
+			}
+			tt.between(a)
+			second := a.check(time.Minute)
+			if second.OK || second.Failure.Reason != FirewallRuleSources {
+				t.Fatalf("second check = %+v (%v), want rule_sources", second, second.Failure)
+			}
+			if first.Failure.Error() == second.Failure.Error() {
+				t.Fatalf("the two messages are equal, so this test proves nothing: %v", first.Failure)
+			}
+			got := 0
+			for _, line := range a.logLines() {
+				if strings.Contains(line, "firewall check FAILED") {
+					got++
+				}
+			}
+			if got != tt.want {
+				t.Errorf("%d FAILED lines in the log, want %d:\n%s", got, tt.want, strings.Join(a.logLines(), "\n"))
+			}
+		})
+	}
+}

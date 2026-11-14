@@ -103,6 +103,14 @@ type FirewallFailure struct {
 	Detail string
 }
 
+// logKey names what is wrong without the parts of the message that change
+// from one check to the next while nothing else does (how long ago the rule
+// was patched, how long the echo services have disagreed). Two failures with
+// the same key are the same failure to the log.
+func (f *FirewallFailure) logKey() string {
+	return strings.Join([]string{string(f.Reason), f.Rule, f.Expected, f.Found}, "\x00")
+}
+
 func (f *FirewallFailure) Error() string {
 	msg := f.What
 	if f.Expected != "" || f.Found != "" {
@@ -144,7 +152,7 @@ type firewallState struct {
 	agreedAt  time.Time  // when they last agreed
 	lastPatch time.Time  // when the rule was last patched, or tried
 	loggedAt  time.Time  // when the result was last logged
-	loggedMsg string     // what was logged then ("" for a pass)
+	loggedKey string     // the logKey of the failure logged then ("" for a pass)
 
 	mu     sync.Mutex
 	status FirewallStatus
@@ -216,18 +224,18 @@ func (b *Backend) checkFirewallLocked(ctx context.Context) FirewallStatus {
 	b.fw.status = status
 	b.fw.mu.Unlock()
 
-	msg := ""
+	msg, key := "", ""
 	if failure != nil {
-		msg = failure.Error()
+		msg, key = failure.Error(), failure.logKey()
 	}
 	switch {
-	case failure == nil && (first || b.fw.loggedMsg != ""):
+	case failure == nil && (first || b.fw.loggedKey != ""):
 		b.logf("remote: firewall check passed (mode %s, rule %s, sources %s)", b.fw.mode, provider.FirewallRuleName(b.cfg.Environment), describeExpected(b.fw.mode, status.Expected))
-		b.fw.loggedMsg, b.fw.loggedAt = "", status.CheckedAt
-	case failure != nil && (first || msg != b.fw.loggedMsg || status.CheckedAt.Sub(b.fw.loggedAt) >= firewallRelog):
+		b.fw.loggedKey, b.fw.loggedAt = "", status.CheckedAt
+	case failure != nil && (first || key != b.fw.loggedKey || status.CheckedAt.Sub(b.fw.loggedAt) >= firewallRelog):
 		b.logf("remote: firewall check FAILED (mode %s, reason %s): %s. Creates and starts are refused until it passes; stop, delete, list and exec are not affected",
 			b.fw.mode, failure.Reason, msg)
-		b.fw.loggedMsg, b.fw.loggedAt = msg, status.CheckedAt
+		b.fw.loggedKey, b.fw.loggedAt = key, status.CheckedAt
 	}
 	return status
 }
