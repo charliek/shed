@@ -39,6 +39,11 @@ const (
 // shutting down, without touching the record.
 var errSuperseded = errors.New("job superseded")
 
+// errUnresolved ends a job step that decided nothing, because the cloud did
+// not say what the shed's instance is doing (see Backend.keep). The record
+// keeps its job, and the step is run again later.
+var errUnresolved = errors.New("the job is kept and tried again")
+
 // job is background work for one shed. A lifecycle job may run more than one
 // step: a stop queued behind a start runs in the same job.
 type job struct {
@@ -159,6 +164,11 @@ func (b *Backend) runJob(j *job) {
 			b.logf("remote: %s of shed %s ended early: %v", kind, j.name, firstErr(err, j.ctx.Err()))
 			return
 		}
+		if errors.Is(err, errUnresolved) {
+			// keep has recorded and logged why. Whatever is queued behind the
+			// job stays queued: it runs when the job itself has.
+			return
+		}
 		b.logf("timing: %s", timer.Finish(err))
 		kind = b.nextStep(j)
 	}
@@ -234,6 +244,9 @@ func (b *Backend) nextStep(j *job) string {
 func (b *Backend) verify(ctx context.Context, ref provider.Ref, id string) error {
 	inst, err := b.prov.Get(ctx, ref)
 	if err != nil {
+		if unread(err) {
+			return &unreadError{err}
+		}
 		return err
 	}
 	if got := inst.Labels[provider.LabelID]; got != id {
@@ -251,6 +264,64 @@ func (b *Backend) verify(ctx context.Context, ref provider.Ref, id string) error
 			provider.ErrInvalid, inst.Name, provider.LabelSchema, got, provider.SchemaVersion)
 	}
 	return nil
+}
+
+// unread reports whether err, from a read of one instance, means the read
+// itself failed, so that nothing is known about the instance. "It is not
+// there" and "it is another environment's" are answers, not failures.
+func unread(err error) bool {
+	return err != nil && !errors.Is(err, provider.ErrNotFound) && !errors.Is(err, provider.ErrForeign)
+}
+
+// unreadError is verify's error when its read of the instance failed, as
+// opposed to a read that showed an instance the caller must not touch. A job
+// may give up a mutation for it, and must never stop or destroy anything
+// because of it.
+type unreadError struct{ err error }
+
+func (e *unreadError) Error() string { return e.err.Error() }
+func (e *unreadError) Unwrap() error { return e.err }
+
+func isUnread(err error) bool {
+	var u *unreadError
+	return errors.As(err, &u)
+}
+
+// keep ends a create step that cannot decide what to do: the cloud did not
+// say what the instance is doing (a read failed). Giving the job up as failed is not an option. A
+// failed create is cleaned up by destroying its VM and a failed start by
+// stopping it, and the VM may be a finished shed, or one that runs. So
+// nothing is changed, in the cloud or in the guest, and the record keeps its
+// status ("starting"), its job and what is queued behind it, with reason
+// cloud_unreadable for anyone who lists it.
+//
+// How it ends: the periodic pass runs the job again (Sweep; one read of the
+// instance per pass), and so do a start call and the next server start. Once
+// the cloud answers, the job carries on from what it finds. A delete works
+// as for any shed and ends it at once, VM included. Until then the shed
+// holds its name and its slot under the limits, because its VM may be
+// running and billed; the VM's own run limit stops it in any case.
+func (b *Backend) keep(j *job, kind string, cause error) error {
+	if j.ctx.Err() != nil {
+		return errSuperseded
+	}
+	b.mu.Lock()
+	r := b.currentLocked(j.name, j.id)
+	if r == nil {
+		b.mu.Unlock()
+		return errSuperseded
+	}
+	first := r.Shed.StatusReason != config.StatusReasonCloudUnreadable
+	if first {
+		r.Shed.StatusReason = config.StatusReasonCloudUnreadable
+		b.saveLocked(r)
+	}
+	b.mu.Unlock()
+	if first {
+		// Once, not at every pass: the reason on the record says the rest.
+		b.logf("remote: %s of shed %s is kept as it is, with nothing changed, and looked at again at every periodic pass: %v", kind, j.name, cause)
+	}
+	return fmt.Errorf("%w: %w", errUnresolved, cause)
 }
 
 // mutate runs one accepting provider call (start, stop or destroy) with the
@@ -294,6 +365,12 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		inst, err := b.prov.Get(ctx, rec.Ref)
 		switch {
 		case errors.Is(err, provider.ErrNotFound):
+		case unread(err):
+			// The read failed, so nothing is known: the instance may be a
+			// create half done, or a shed the server that died had finished
+			// (labelled ready) and that the list did not show. Failing the
+			// create would queue its VM for destruction either way.
+			return b.keep(j, state.JobCreate, fmt.Errorf("reading instance %s: %w", rec.Ref, err))
 		case err != nil:
 			return b.failCreate(j, err, config.StatusReasonCreateFailed)
 		case inst.Labels[provider.LabelID] != j.id || inst.Labels[provider.LabelEnv] != b.cfg.Environment:
@@ -385,6 +462,12 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 
 	backend.Phase(ctx, "ready")
 	if err := b.verify(ctx, rec.Ref, j.id); err != nil {
+		if isUnread(err) {
+			// Everything but the label is done and the instance cannot be
+			// read just now. The create is kept, not failed and destroyed;
+			// run again, it skips the steps recorded as done.
+			return b.keep(j, state.JobCreate, fmt.Errorf("reading instance %s before labelling it ready: %w", rec.Ref, err))
+		}
 		return b.failCreate(j, err, config.StatusReasonCreateFailed)
 	}
 	labels := map[string]string{
@@ -430,10 +513,12 @@ func (b *Backend) commitCreatedLocked(r *state.Record, inst provider.Instance) {
 		return
 	case provider.StateStopping:
 		r.Shed.Status = config.StatusStopping
+		r.Shed.StatusReason = ""
 		r.Job = state.JobStop
 	default:
 		// Running, or on its way: "starting" until a probe succeeds.
 		r.Shed.Status = config.StatusStarting
+		r.Shed.StatusReason = ""
 		r.Job = state.JobProbe
 		r.Address = inst.Address
 		r.AddressAt = b.now()

@@ -328,6 +328,11 @@ const (
 	StatusReasonNoPin = "no_pin"
 	// StatusReasonUnreachable (starting): the agent has not answered yet.
 	StatusReasonUnreachable = "unreachable"
+	// StatusReasonCloudUnreadable (starting): the server could not learn
+	// from the cloud what the VM is doing (the read failed, or the VM's
+	// labels are another version's), so it changed nothing and looks again
+	// at every periodic pass.
+	StatusReasonCloudUnreadable = "cloud_unreadable"
 	// StatusReasonCapacity (stopped, error): the zone had no room.
 	StatusReasonCapacity = "capacity"
 	// StatusReasonQuota (stopped, error): the project's quota refused it.

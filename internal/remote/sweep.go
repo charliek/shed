@@ -69,7 +69,9 @@ type sweepCheck struct {
 //   - drops the record of a shed whose instance no longer exists;
 //   - records a "stopped" shed whose instance runs as "starting" and probes
 //     it, so a VM that costs money is never shown as stopped;
-//   - gives a shed left "stopping" by a failed cloud call a new stop job.
+//   - gives a shed left "stopping" by a failed cloud call a new stop job;
+//   - runs again the create or start of a shed kept "starting" because the
+//     cloud could not be read when its job looked (Backend.keep).
 //
 // It destroys nothing itself: only a delete job does, and a delete job exists
 // only for a delete marker. Each correction is confirmed with a fresh read of
@@ -153,6 +155,17 @@ func (b *Backend) Sweep(ctx context.Context) error {
 		}
 		inst, listed := byID[r.Shed.ID]
 		switch r.Shed.Status {
+		case config.StatusStarting:
+			// A create or start with no job is one that was kept because
+			// the cloud could not be read (Backend.keep). It is run again
+			// here: one read of its instance, and on from what that shows.
+			// A probe is not: a start call or the next server start
+			// retries it.
+			if r.Job == state.JobCreate && !r.Ready {
+				if j := b.healLocked(r); j != nil {
+					launch = append(launch, j)
+				}
+			}
 		case config.StatusStopping:
 			if j := b.healLocked(r); j != nil {
 				b.logf("remote: periodic pass: shed %s is stopping with no job; stopping it again", name)
