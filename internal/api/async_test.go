@@ -593,3 +593,29 @@ func TestAsyncConnectNotRunning(t *testing.T) {
 		t.Errorf("got %d %s, want 409 SHED_NOT_RUNNING", resp.code, resp.body)
 	}
 }
+
+// TestSettledErrorKeepsTheRefusalCode: a create whose job met a refusal ends
+// its stream with that refusal's 503, not a 500. The firewall reason is one
+// of them: the job asks the check again just before the insert.
+func TestSettledErrorKeepsTheRefusalCode(t *testing.T) {
+	tests := []struct {
+		reason   string
+		wantCode string
+		status   int
+	}{
+		{config.StatusReasonCapacity, config.ErrZoneCapacityUnavailable, http.StatusServiceUnavailable},
+		{config.StatusReasonQuota, config.ErrCloudQuotaExceeded, http.StatusServiceUnavailable},
+		{config.StatusReasonLimit, config.ErrServerLimitReached, http.StatusServiceUnavailable},
+		{config.StatusReasonFirewall, config.ErrFirewallCheckFailed, http.StatusServiceUnavailable},
+		{config.StatusReasonCreateFailed, config.ErrBackendError, http.StatusInternalServerError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.reason, func(t *testing.T) {
+			err := settledError(&config.Shed{Name: "x", Status: config.StatusError, StatusReason: tt.reason})
+			status, code, _ := mapBackendError(err)
+			if status != tt.status || code != tt.wantCode {
+				t.Errorf("settled %s maps to %d %s, want %d %s", tt.reason, status, code, tt.status, tt.wantCode)
+			}
+		})
+	}
+}

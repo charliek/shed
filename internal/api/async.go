@@ -87,8 +87,8 @@ var errSettledNotRunning = errors.New("shed did not reach running")
 
 // settledError turns the shed a create's job settled on into the error the
 // SSE stream reports, or nil when the shed is running. A refusal the job met
-// keeps its 503 code (capacity, quota, limit) so a client can tell it apart
-// from a failure.
+// keeps its 503 code (capacity, quota, limit, firewall) so a client can tell
+// it apart from a failure.
 func settledError(shed *config.Shed) error {
 	if shed == nil {
 		return fmt.Errorf("%w: no shed returned", errSettledNotRunning)
@@ -107,6 +107,11 @@ func settledError(shed *config.Shed) error {
 		return fmt.Errorf("%w: %s", config.ErrCloudQuotaExceededSentinel, msg)
 	case config.StatusReasonLimit:
 		return fmt.Errorf("%w: %s", config.ErrServerLimitReachedSentinel, msg)
+	case config.StatusReasonFirewall:
+		// The job met a failing firewall check just before its insert.
+		// Nothing was made; the client may try again once the check
+		// passes, exactly as when the request itself is refused.
+		return fmt.Errorf("%w: %s", config.ErrFirewallCheckFailedSentinel, msg)
 	}
 	return fmt.Errorf("%w: %s", errSettledNotRunning, msg)
 }
