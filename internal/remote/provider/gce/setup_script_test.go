@@ -99,16 +99,110 @@ func TestSetupScript(t *testing.T) {
 				t.Errorf("output lacks %q", want)
 			}
 		}
-		m := regexp.MustCompile(`--permissions=(\S+)`).FindStringSubmatch(out)
-		if m == nil {
-			t.Fatal("no --permissions line")
+		lists := permissionLists(out)
+		if len(lists) != 1 {
+			t.Fatalf("%d --permissions lines, want 1", len(lists))
 		}
-		got := strings.Split(m[1], ",")
-		want := slices.Clone(Permissions)
-		slices.Sort(got)
-		slices.Sort(want)
-		if !slices.Equal(got, want) {
-			t.Errorf("role permissions differ from gce.Permissions:\n got %v\nwant %v", got, want)
+		samePermissions(t, "the base role", lists[0], Permissions)
+		// Without --firewall-auto nothing that can change a rule is
+		// printed.
+		for _, forbidden := range []string{"compute.firewalls.update", "compute.networks.updatePolicy", "compute.firewalls.create", "compute.firewalls.delete", "FirewallRule", "--condition='"} {
+			if strings.Contains(out, forbidden) {
+				t.Errorf("output without --firewall-auto holds %q", forbidden)
+			}
+		}
+		if !strings.Contains(out, "SHED_REMOTE_SOURCE_RANGES=192.0.2.10/32") {
+			t.Error("output does not name the source ranges variable")
 		}
 	})
+	t.Run("prints the firewall-auto roles when asked", func(t *testing.T) {
+		out, code := run(append([]string{"--print", "--firewall-auto"}, good...)...)
+		if code != 0 {
+			t.Fatalf("exit %d\n%s", code, out)
+		}
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatal("the script ran gcloud")
+		}
+		lists := permissionLists(out)
+		if len(lists) != 3 {
+			t.Fatalf("%d --permissions lines, want 3 (base, rule, network)", len(lists))
+		}
+		samePermissions(t, "the base role", lists[0], Permissions)
+		samePermissions(t, "the firewall rule role", lists[1], FirewallAutoRulePermissions)
+		samePermissions(t, "the firewall network role", lists[2], FirewallAutoNetworkPermissions)
+		for _, want := range []string{
+			"gcloud iam roles create shedServerFirewallRule",
+			"gcloud iam roles create shedServerFirewallNet",
+			`--role="projects/$PROJECT/roles/shedServerFirewallRule"`,
+			// The rule role is bound to the one derived rule, by name.
+			`--condition='expression=resource.name == "projects/example-project/global/firewalls/shed-dev-box-ssh",title=shed-dev-box-ssh only,`,
+			`--role="projects/$PROJECT/roles/shedServerFirewallNet" --condition=None`,
+			"What a holder of these roles can do",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output lacks %q", want)
+			}
+		}
+	})
+	t.Run("a long role id is refused with --firewall-auto", func(t *testing.T) {
+		long := strings.Repeat("r", 53)
+		if _, code := run(append([]string{"--print", "--firewall-auto", "--role-id", long}, good...)...); code != 2 {
+			t.Errorf("exit %d, want 2", code)
+		}
+		if _, code := run(append([]string{"--print", "--role-id", long}, good...)...); code != 0 {
+			t.Errorf("without --firewall-auto: exit %d, want 0", code)
+		}
+	})
+}
+
+// TestPermissionListsDisjoint: the base role holds nothing that can change a
+// firewall rule, and the rule role holds only permissions on a rule (the
+// ones an IAM condition on the rule's name can govern).
+func TestPermissionListsDisjoint(t *testing.T) {
+	for _, p := range Permissions {
+		if slices.Contains(FirewallAutoRulePermissions, p) || slices.Contains(FirewallAutoNetworkPermissions, p) {
+			t.Errorf("%s is in the base role and in a firewall-auto role", p)
+		}
+		if strings.HasPrefix(p, "compute.firewalls.") && p != "compute.firewalls.list" {
+			t.Errorf("the base role holds %s; it may only list rules", p)
+		}
+		if p == "compute.networks.updatePolicy" {
+			t.Errorf("the base role holds %s", p)
+		}
+	}
+	for _, p := range FirewallAutoRulePermissions {
+		if !strings.HasPrefix(p, "compute.firewalls.") {
+			t.Errorf("%s is bound under a condition on a firewall rule's name, which cannot govern it", p)
+		}
+	}
+	for _, p := range FirewallAutoNetworkPermissions {
+		if strings.HasPrefix(p, "compute.firewalls.") {
+			t.Errorf("%s is bound without a condition; it belongs in the rule role", p)
+		}
+	}
+	for _, list := range [][]string{Permissions, FirewallAutoRulePermissions, FirewallAutoNetworkPermissions} {
+		if !slices.IsSorted(list) {
+			t.Errorf("list is not sorted: %v", list)
+		}
+	}
+}
+
+// permissionLists returns every --permissions value in the script's output,
+// in order.
+func permissionLists(out string) [][]string {
+	var lists [][]string
+	for _, m := range regexp.MustCompile(`--permissions=(\S+)`).FindAllStringSubmatch(out, -1) {
+		lists = append(lists, strings.Split(m[1], ","))
+	}
+	return lists
+}
+
+func samePermissions(t *testing.T, what string, got, want []string) {
+	t.Helper()
+	got, want = slices.Clone(got), slices.Clone(want)
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("%s: the script's permissions differ from the Go list:\n got %v\nwant %v", what, got, want)
+	}
 }

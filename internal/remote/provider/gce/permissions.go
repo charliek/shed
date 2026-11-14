@@ -52,3 +52,31 @@ var Permissions = []string{
 	"compute.subnetworks.useExternalIp",
 	"compute.zoneOperations.get",
 }
+
+// The permissions firewalls.patch needs, which only remote.firewall.mode:
+// auto uses (Client.SetEnvFirewallSources). They are deliberately not in
+// Permissions: a server in static mode holds no permission to change a rule.
+// gce-setup.sh prints them, as two more custom roles, only when it is given
+// --firewall-auto.
+//
+//	firewalls.patch         compute.firewalls.update and compute.firewalls.get on the
+//	                        rule, compute.networks.updatePolicy on its network
+//	globalOperations.wait   compute.globalOperations.get
+//
+// They are two lists because they are bound differently. The rule's own
+// permissions are bound with an IAM condition on resource.name, so they hold
+// for the environment's one rule and no other; Google's IAM documentation
+// lists compute.googleapis.com/Firewall among the resource types a condition
+// can name. Networks and operations are not on that list, so those two
+// permissions are bound without a condition. On their own they change no
+// rule.
+var (
+	FirewallAutoRulePermissions = []string{
+		"compute.firewalls.get",
+		"compute.firewalls.update",
+	}
+	FirewallAutoNetworkPermissions = []string{
+		"compute.globalOperations.get",
+		"compute.networks.updatePolicy",
+	}
+)
