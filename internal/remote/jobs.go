@@ -178,13 +178,28 @@ func firstErr(errs ...error) error {
 func (b *Backend) nextStep(j *job) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// Only the job the shed is registered to may take the queued action. A
+	// job that published "running" and has not left yet can already have a
+	// successor (a stop registers its own job), and an action queued since
+	// then is the successor's: taking it here would throw it away.
+	if b.jobs[j.name] != j {
+		return ""
+	}
 	r := b.currentLocked(j.name, j.id)
 	if r == nil {
 		return ""
 	}
+	// With no next step the job gives the shed up in this critical section,
+	// so an action queued from now on finds no job and starts its own
+	// (healLocked) instead of waiting on one that will never look again.
+	next := ""
+	defer func() {
+		if next == "" {
+			delete(b.jobs, j.name)
+		}
+	}()
 	queued := r.Queued
 	r.Queued = ""
-	next := ""
 	switch {
 	case queued == state.QueuedStop && (r.Shed.Status == config.StatusRunning || r.Shed.Status == config.StatusStarting):
 		// "starting" here is a shed whose probe just failed: its VM runs
