@@ -498,8 +498,19 @@ func (b *Backend) WaitSettled(ctx context.Context, name string) (*config.Shed, e
 		if err != nil {
 			notFound := errors.Is(err, config.ErrShedNotFoundSentinel)
 			gone := b.deletingLocked(ctx, name)
-			owed := notFound && gone == nil && b.deleteOwedLocked(ctx, name)
+			var owed bool
+			var unread error
+			if notFound && gone == nil {
+				owed, unread = b.deleteOwedLocked(ctx, name)
+			}
 			b.mu.Unlock()
+			if unread != nil {
+				// Not "not found": a streamed delete reads that as a delete
+				// that finished. The cause names the state directory, so it
+				// goes to the log and not to the caller.
+				b.logf("remote: shed %s: whether a delete of it is unfinished is not known; the delete markers could not be read: %v", name, unread)
+				return nil, fmt.Errorf("shed %s: %w", name, ErrDeleteUnknown)
+			}
 			if owed {
 				return nil, deleteOwed(name)
 			}
@@ -582,29 +593,40 @@ func (b *Backend) deletingLocked(ctx context.Context, name string) *job {
 // It is not config.ErrShedNotFoundSentinel, which a waiter reads as "gone".
 var ErrDeleteOwed = errors.New("the delete is recorded but the VM could not be destroyed yet; the server keeps trying")
 
+// ErrDeleteUnknown is what WaitSettled returns for a name with no record and
+// no delete job when delete markers stand and cannot be read: a destroy that
+// failed leaves nothing but its marker, so the server cannot tell a shed that
+// is gone from one whose VM still exists. Like ErrDeleteOwed it is not
+// config.ErrShedNotFoundSentinel.
+var ErrDeleteUnknown = errors.New("the server could not read its delete records, so it cannot say whether the VM is destroyed (see the server log)")
+
 func deleteOwed(name string) error { return fmt.Errorf("shed %s: %w", name, ErrDeleteOwed) }
 
 // deleteOwedLocked reports whether a delete marker stands, with no delete job
 // in flight, for a shed of this name that the caller was allowed to see. The
 // marker is removed in the critical section in which its job leaves
 // Backend.deletes, so such a marker is a destroy that did not happen.
-func (b *Backend) deleteOwedLocked(ctx context.Context, name string) bool {
+//
+// Markers are read from disk only when one is known to stand (Backend.pending).
+// A read that fails is returned as an error, never as "no marker": the marker
+// is then the only evidence of the unfinished delete.
+func (b *Backend) deleteOwedLocked(ctx context.Context, name string) (bool, error) {
 	if b.records[name] != nil || len(b.pending) == 0 {
-		return false
+		return false, nil
 	}
 	markers, err := b.store.Markers()
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, m := range markers {
 		if m.Name != name || m.KeepRecord || b.deletes[m.ID] != nil {
 			continue
 		}
 		if backend.CheckOwner(ctx, name, m.Owner) == nil && backend.CheckCreatedAt(ctx, name, m.CreatedAt) == nil {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // replay sends the job's progress events from index from into the sink on
