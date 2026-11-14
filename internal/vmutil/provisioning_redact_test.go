@@ -119,3 +119,73 @@ func TestHookOutputRedacted(t *testing.T) {
 		})
 	}
 }
+
+// TestHookLastOutputRedactedBeforeTheTailCut: only the last hookOutputTail
+// bytes of a hook's output are kept to quote in a failure. The tail is cut
+// from the redacted output; cut from the raw output it could begin inside a
+// URL's password, which then has no scheme before it and is not recognised.
+func TestHookLastOutputRedactedBeforeTheTailCut(t *testing.T) {
+	const prefix, secret, rest = "https://user:", "s3cr3t-token", "@git.example/repo.git "
+	tests := []struct {
+		name string
+		// into is how many bytes of the secret lie before the raw tail.
+		into int
+	}{
+		{"the raw tail begins inside the password", 6},
+		{"the raw tail begins at the password", 0},
+		{"the raw tail begins inside the scheme", -8},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			padding := hookOutputTail - (len(secret) - tt.into) - len(rest)
+			stdout := prefix + secret + rest + strings.Repeat("p ", padding/2) + strings.Repeat("p", padding%2)
+			if got := len(stdout) - hookOutputTail; got != len(prefix)+tt.into {
+				t.Fatalf("the fixture's raw tail begins at byte %d, want %d", got, len(prefix)+tt.into)
+			}
+			dialer := &pipeDialer{
+				handler: func(conn net.Conn) {
+					defer conn.Close()
+					_, data, err := agentproto.ReadMessage(conn) // exec request
+					if err != nil {
+						return
+					}
+					var req agentproto.ExecRequest
+					_ = json.Unmarshal(data, &req)
+					agentproto.ReadMessage(conn) // stdin EOF
+					if len(req.Cmd) > 0 && req.Cmd[0] == "/bin/sh" {
+						_ = agentproto.WriteExitCode(conn, 0)
+						return
+					}
+					// In pieces, as a hook's output arrives.
+					for b := []byte(stdout); len(b) > 0; {
+						n := min(len(b), 8000)
+						_ = agentproto.WriteData(conn, b[:n])
+						b = b[n:]
+					}
+					_ = agentproto.WriteExitCode(conn, 3)
+				},
+			}
+			var out, errOut syncBuffer
+			p := NewProvisioner(NewAgentClient(dialer, 1024, 1026), "test")
+			p.SetOutput(&out, &errOut)
+
+			err := p.runHook(context.Background(), &provision.Config{}, provision.HookTypeStartup, "hook.sh")
+			var hookErr *provision.HookError
+			if !errors.As(err, &hookErr) {
+				t.Fatalf("runHook() error = %v, want a HookError", err)
+			}
+			if len(hookErr.LastOutput) == 0 || len(hookErr.LastOutput) > hookOutputTail {
+				t.Errorf("last output is %d bytes, want 1 to %d", len(hookErr.LastOutput), hookOutputTail)
+			}
+			// No three bytes of the secret may survive, wherever the cut fell.
+			for where, text := range map[string]string{"output": out.String(), "last output": hookErr.LastOutput, "error": hookErr.Error()} {
+				for i := 0; i+3 <= len(secret); i++ {
+					if part := secret[i : i+3]; strings.Contains(text, part) {
+						t.Errorf("%s carries %q of the credential", where, part)
+						break
+					}
+				}
+			}
+		})
+	}
+}

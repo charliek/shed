@@ -299,14 +299,17 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 	outputBuf := &tailBuffer{max: hookOutputTail}
 	// A hook's output goes to the server log, so URL credentials are
 	// redacted from it line by line, as git clone's are. The log file in the
-	// guest keeps the output as the hook printed it.
-	stdout, stderr := redact.NewWriter(p.output), redact.NewWriter(p.errOut)
-	multiWriter := io.MultiWriter(stdout, outputBuf)
+	// guest keeps the output as the hook printed it. The tail is kept from
+	// the redacted stream, never the raw one: cutting raw output to its last
+	// bytes can cut a URL after its scheme, and what is left of the password
+	// would no longer look like a credential to anything that reads it.
+	stdout := redact.NewWriter(io.MultiWriter(p.output, outputBuf))
+	stderr := redact.NewWriter(p.errOut)
 
 	opts := backend.ExecOptions{
 		Cmd:        []string{"bash", "--login", "-c", cmd},
 		Env:        env,
-		Stdout:     NopWriteCloser(multiWriter),
+		Stdout:     NopWriteCloser(stdout),
 		Stderr:     NopWriteCloser(stderr),
 		WorkingDir: p.workDir,
 		TTY:        false,
