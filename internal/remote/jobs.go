@@ -259,11 +259,36 @@ func (b *Backend) verify(ctx context.Context, ref provider.Ref, id string) error
 	// and never touched (provider.LabelSchema). The error is not ErrForeign:
 	// the instance is this shed's, so a delete keeps its marker and is tried
 	// again by a server that can read the labels.
+	return schemaOf(inst)
+}
+
+// otherSchemaError says that an instance carries this shed's ID in a label
+// set of another version (provider.LabelSchema). The instance is the shed's
+// and this server may not change it, or decide anything from its other
+// labels. It is a provider.ErrInvalid for callers that only refuse; a create
+// or start tells it apart (isOtherSchema) from the provider's own ErrInvalid,
+// which is a request the cloud turned down, and is kept (Backend.keep).
+type otherSchemaError struct{ instance, got string }
+
+func (e *otherSchemaError) Error() string {
+	return fmt.Sprintf("instance %s carries label %s=%q and this server reads %q; leaving it alone",
+		e.instance, provider.LabelSchema, e.got, provider.SchemaVersion)
+}
+
+func (e *otherSchemaError) Unwrap() error { return provider.ErrInvalid }
+
+// schemaOf returns an otherSchemaError for an instance whose labels are not
+// in the version this server reads, and nil otherwise.
+func schemaOf(inst provider.Instance) error {
 	if got := inst.Labels[provider.LabelSchema]; got != provider.SchemaVersion {
-		return fmt.Errorf("%w: instance %s carries label %s=%q and this server reads %q; leaving it alone",
-			provider.ErrInvalid, inst.Name, provider.LabelSchema, got, provider.SchemaVersion)
+		return &otherSchemaError{instance: inst.Name, got: got}
 	}
 	return nil
+}
+
+func isOtherSchema(err error) bool {
+	var o *otherSchemaError
+	return errors.As(err, &o)
 }
 
 // unread reports whether err, from a read of one instance, means the read
@@ -392,7 +417,7 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		case inst.Labels[provider.LabelID] != j.id || inst.Labels[provider.LabelEnv] != b.cfg.Environment:
 			err := fmt.Errorf("%w: instance %s is not this shed's", provider.ErrForeign, inst.Name)
 			return b.failCreate(j, err, config.StatusReasonCreateFailed)
-		case inst.Labels[provider.LabelSchema] != provider.SchemaVersion:
+		case schemaOf(inst) != nil:
 			// Labelled by another version of the label set: reported and
 			// never touched (provider.LabelSchema). Checked here, before the
 			// guest is connected to, given credentials, cloned into and
@@ -400,8 +425,7 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 			// all of that. Not failed either: the clean-up of a failed create
 			// leaves a marker that a server reading these labels would act
 			// on, and this may be a finished shed.
-			return b.keep(j, state.JobCreate, fmt.Errorf("instance %s carries label %s=%q and this server reads %q; leaving it alone",
-				inst.Name, provider.LabelSchema, inst.Labels[provider.LabelSchema], provider.SchemaVersion))
+			return b.keep(j, state.JobCreate, schemaOf(inst))
 		case inst.ShedState() == provider.ShedStateReady:
 			return b.resumeCommitted(ctx, j, inst)
 		default:
@@ -754,6 +778,12 @@ func (b *Backend) runStart(ctx context.Context, j *job) error {
 		if err != nil {
 			return b.failStart(j, err, "", false)
 		}
+		// Only the instance's state is used here, and that is the cloud's own
+		// field, not a label: it reads the same whatever version the labels
+		// are. A VM that is not up gets no start while the check fails, so
+		// the shed goes back to "stopped", which is true, and holds no run
+		// slot. One that is up goes on to the read before the start call,
+		// which looks at the labels.
 		if inst.State != provider.StateStarting && inst.State != provider.StateRunning {
 			return b.refuseStart(j, gerr)
 		}
@@ -767,6 +797,16 @@ func (b *Backend) runStart(ctx context.Context, j *job) error {
 		// accepted. The VM may be up all the same (a start resumed after a
 		// restart), so it is not stopped on the strength of that.
 		return b.keep(j, state.JobStart, fmt.Errorf("reading instance %s before starting it: %w", rec.Ref, err))
+	}
+	if isOtherSchema(err) {
+		// The instance is the shed's, in labels of another version, and no
+		// start was sent. Failing the start would record the shed stopped
+		// and try to stop the VM, and the VM may be up: a start resumed
+		// after a restart, or one another server sent. So it is kept, like a
+		// create that meets such labels, and goes on once they can be read.
+		// The provider's own ErrInvalid (a start the cloud turned down) is
+		// not this, and fails the start as before.
+		return b.keep(j, state.JobStart, err)
 	}
 	if err != nil {
 		return b.failStart(j, err, "", false)

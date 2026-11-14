@@ -181,7 +181,8 @@ All notable changes to this project will be documented in this file.
   Such a shed now stays `starting` with the new reason `cloud_unreadable`, nothing is changed,
   and the periodic pass looks again; a delete ends it at any time. A resumed create also
   leaves a VM whose labels are another shed version's untouched, where it used to connect,
-  clone and provision before it noticed. A delete whose marker was written but could not be
+  clone and provision before it noticed, and a start that finds such labels is kept the same
+  way, where it used to record the shed `stopped` while its VM might be running. A delete whose marker was written but could not be
   flushed to disk is acknowledged and carried out; it used to answer 500 and destroy the VM
   two minutes later all the same. A create or start that needs a new firewall check waits
   10 s at most, the wait for a check already in progress included, and gives up at once when

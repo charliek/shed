@@ -39,6 +39,28 @@ func (s *schemaProvider) Get(ctx context.Context, ref provider.Ref) (provider.In
 	return inst, err
 }
 
+// otherSchema gives the environment a provider whose instances can be shown
+// under another label schema (sp.schema, sp.listToo).
+func otherSchema(sp *schemaProvider) envOpt {
+	return func(e *env, _ *fake.Options) {
+		e.wrap = func(p provider.Provider) provider.Provider {
+			sp.Provider = p.(*fake.Provider)
+			return sp
+		}
+	}
+}
+
+// keptLines counts the log lines that say a job was kept.
+func (e *env) keptLines() int {
+	n := 0
+	for _, l := range e.logLines() {
+		if strings.Contains(l, "is kept as it is") {
+			n++
+		}
+	}
+	return n
+}
+
 // An instance whose labels are another version's is never touched: not
 // stopped, and not destroyed by a delete, whose marker stands for a server
 // that can read the labels.
