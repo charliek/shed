@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 import pytest
+import yaml
 
 from .timing import PhaseTimings, parse_timing_line
 
@@ -129,6 +130,29 @@ def resolve_server_entry(name: str, timeout: int = 10) -> Optional[dict]:
         if isinstance(e, dict) and e.get("name") == name:
             return e
     return None
+
+
+def client_cert_pair(name: str, config_path: Optional[Path] = None) -> Optional[tuple[str, str]]:
+    """The `(cert, key)` file pair the CLI keeps for an mtls entry, or None.
+
+    Read straight from the CLI's config file (`~/.shed/config.yaml`, honouring
+    `$HOME`), because `shed --json server list` does not report the
+    certificate paths. None when the file, the entry or either path is
+    missing: a token or open entry has no certificate.
+    """
+    path = config_path if config_path is not None else Path.home() / ".shed" / "config.yaml"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    servers = data.get("servers") if isinstance(data, dict) else None
+    entry = servers.get(name) if isinstance(servers, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    cert, key = entry.get("client_cert_file"), entry.get("client_key_file")
+    if not cert or not key:
+        return None
+    return str(cert), str(key)
 
 
 # A shed-server version string, as `GET /api/info` reports it: goreleaser's
@@ -255,12 +279,13 @@ class LocalServer:
         """The server's version string from `GET /api/info`, or None.
 
         Reads the endpoint the CLI itself uses (the entry's `endpoint` in
-        `shed --json server list`). `/api/info` is unauthenticated in open and
-        token mode; a token-mode server's TLS certificate is pinned by the CLI,
-        not by a CA, so the read skips verification — it only needs the
-        version string. Under mtls the handshake needs a client certificate
-        and fails, so the version is unknown (None) there, as it is for any
-        unreachable server.
+        `shed --json server list`). A TLS server's certificate is pinned by the
+        CLI, not by a CA, so the read skips verification — it only needs the
+        version string. An mtls listener refuses a handshake without a client
+        certificate, so the entry's own certificate (`client_cert_pair`) is
+        presented when it has one; the `available()` probe has just renewed it
+        if it was near expiry. Without one the version is unknown (None), as it
+        is for any unreachable server.
         """
         entry = resolve_server_entry(self.name)
         endpoint = entry.get("endpoint") if entry else None
@@ -272,6 +297,14 @@ class LocalServer:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            pair = client_cert_pair(self.name)
+            if pair is not None:
+                try:
+                    ctx.load_cert_chain(*pair)
+                except OSError:
+                    # Unreadable or mismatched files: try without, which an
+                    # open or token server still answers.
+                    pass
         try:
             with urllib.request.urlopen(url, timeout=timeout, context=ctx) as resp:
                 info = json.loads(resp.read().decode("utf-8"))

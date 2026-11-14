@@ -1,9 +1,9 @@
 """Service clients (`auth.clients`) against the parallel FC dev server.
 
-Firecracker only, and only against a dev server started in mtls mode
-(`SHED_DEV_AUTH_MODE=mtls`), whose rendered config carries the `itest` service
-client (`scripts/render-dev-config.sh --mtls`: prefix `itest-svc-`,
-`max_sheds: 3`, images `[itest]`, no server mounts).
+Firecracker only, against the FC dev server, which runs mtls: its committed
+config (`configs/server.dev-parallel.linux-fc.yaml`) carries the `itest`
+service client (prefix `itest-svc-`, `max_sheds: 3`, images `[itest]`, no
+server mounts).
 
 The bundle is issued the way an operator would, on the dev host:
 `sudo -n /tmp/shed-server-dev client issue itest --config /tmp/shed-server-dev.yaml`
@@ -20,8 +20,8 @@ has the client's api lines and an exec.end line with argv[0] and the count,
 never the arguments. An admin create with `"mounts": []` also boots with
 no 9P mounts, before and after stop/start.
 
-Run: `make build && make dev-server-restart-fc SHED_DEV_AUTH_MODE=mtls &&
-make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls PYTEST_ARGS="test_service_client.py"`.
+Run: `make build && make dev-server-restart-fc &&
+make test-integration-dev-fc PYTEST_ARGS="test_service_client.py"`.
 """
 
 from __future__ import annotations
@@ -40,17 +40,10 @@ from urllib.parse import urlparse
 import pytest
 import yaml
 
-from fixtures.devcontrol import DEV_AUTH_MODE
 from fixtures.tlsclient import fingerprint, server_cert_pem
 
-pytestmark = pytest.mark.skipif(
-    DEV_AUTH_MODE != "mtls",
-    reason=(
-        f"SHED_DEV_AUTH_MODE={DEV_AUTH_MODE!r} (want 'mtls'): service clients "
-        "exist only in mtls mode. Run "
-        "`make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls`."
-    ),
-)
+# No auth-mode gate: the FC dev server is always mtls, and `_load_entry`
+# skips cleanly when the dev entry has no mtls client certificate.
 
 DEV_BIN = os.environ.get("SHED_FC_DEV_BIN_PATH", "/tmp/shed-server-dev")
 DEV_CONFIG = os.environ.get("SHED_FC_DEV_CONFIG", "/tmp/shed-server-dev.yaml")

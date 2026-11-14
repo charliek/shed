@@ -44,21 +44,21 @@ config-mutating test actually calls, so it is also the single source of
 truth for `SHED_DEV_AUTH_MODE` detection (`DEV_AUTH_MODE` below) — the
 exact mechanism `test_mtls.py`'s module docstring documents (env var, never
 an unauthenticated `/api/info` probe, which is unreachable once a server is
-actually in mtls). Two ready-made `pytest.mark.skipif` marks are exported
-for tests elsewhere in the suite that structurally cannot run against an
-mtls dev server, expressing the two distinct reasons a test in this suite
-runs into that wall:
+actually in mtls). Both parallel dev servers run the committed
+`configs/server.dev-parallel.*.yaml`, which are `auth.mode: mtls`, and that
+is the default. `SHED_DEV_AUTH_MODE=token` (Mac only) runs a rendered
+token-mode copy instead, for the bearer-token tests that remain until the
+server's token mode is removed; the knob goes with them. Two ready-made
+`pytest.mark.skipif` marks are exported for tests that structurally cannot
+run against an mtls dev server, expressing the two distinct reasons a test
+in this suite runs into that wall:
 
-  - `skip_mtls_reconfigure` — the test calls `dev_config()` (or otherwise
-    depends on the dev server running the *committed* base config) to set
-    up a scenario unrelated to bearer tokens (TLS pinning, SSH allowlist
-    mechanics, the `dev_config()` round-trip itself). Under
-    `SHED_DEV_AUTH_MODE=mtls` the running server executes a *generated*
-    config (`~/.shed/dev/server.mtls-generated.yaml`, produced by
-    `scripts/render-dev-mtls-config.sh` at `dev-server-up`/`-restart`
-    time) instead — `dev_config()` refuses to touch it (see the guard at
-    the top of `dev_config()` below) rather than silently clobbering the
-    live mtls server other work may depend on.
+  - `skip_mtls_reconfigure` — the test calls `dev_config()` to set up a
+    token-mode or open-mode scenario (TLS pinning, SSH allowlist mechanics,
+    the `dev_config()` round-trip itself). `dev_config()` confirms each
+    restart by reading `/api/info`, which an mtls listener refuses without
+    a client certificate, so it cannot confirm the restore to the mtls base
+    and refuses to start (see the guard at the top of `dev_config()`).
   - `skip_mtls_token_semantics` — the test's actual assertions are about
     bearer-credential semantics (scoped HTTP tokens, TTL expiry,
     allowlist-gated minting, the open-mode single-plain-listener shape)
@@ -66,9 +66,9 @@ runs into that wall:
     a short-lived certificate, never a bearer token (see
     `internal/servertls/ca.go`, `internal/config/server.go`).
 
-Both marks are inert (no-ops) when `SHED_DEV_AUTH_MODE` is unset or
-`"token"` (today's default) — see `docs/development/testing.md` and
-`tests/integration/README.md` for the full token-vs-mtls run split.
+Both marks skip under the default (`mtls`) and are inert under
+`SHED_DEV_AUTH_MODE=token` — see `docs/development/testing.md` and
+`tests/integration/README.md`.
 
 **Pre-existing, mode-independent gap: no open-mode dev server exists at
 all.** A third, unconditional mark — `skip_needs_open_mode_dev_server` — is
@@ -128,18 +128,28 @@ PROD_SSH_PORT = 2222
 # read of the same env var exactly; both must agree on what "mtls mode" means.
 # ----------------------------------------------------------------------------
 
-DEV_AUTH_MODE = os.environ.get("SHED_DEV_AUTH_MODE", "token")
+# The committed dev configs are mtls, so that is the default; `token` is the
+# Mac-only escape hatch for the remaining bearer-token tests.
+DEFAULT_DEV_AUTH_MODE = "mtls"
+
+
+def dev_auth_mode(env: Optional[dict] = None) -> str:
+    """The parallel dev server's auth mode, as `SHED_DEV_AUTH_MODE` names it
+    (the Makefile forwards the value it started the server with)."""
+    env = os.environ if env is None else env
+    return env.get("SHED_DEV_AUTH_MODE") or DEFAULT_DEV_AUTH_MODE
+
+
+DEV_AUTH_MODE = dev_auth_mode()
 
 _MTLS_RECONFIGURE_REASON = (
-    f"SHED_DEV_AUTH_MODE={DEV_AUTH_MODE!r}: this test calls dev_config() (or an "
-    "equivalent dev-server-config-mutating helper) to set up a scenario "
-    "unrelated to bearer tokens. Under SHED_DEV_AUTH_MODE=mtls the running "
-    "dev server executes a GENERATED config "
-    "(~/.shed/dev/server.mtls-generated.yaml, produced by "
-    "scripts/render-dev-mtls-config.sh), not the committed base config "
-    "dev_config() merges onto and restores — reconfiguring would silently "
-    "flip the live mtls server other work may depend on. Run this test only "
-    "with SHED_DEV_AUTH_MODE=token (the default)."
+    f"SHED_DEV_AUTH_MODE={DEV_AUTH_MODE!r}: this test calls dev_config() to "
+    "restart the dev server into a token-mode or open-mode scenario. "
+    "dev_config() confirms each restart by reading /api/info, which an mtls "
+    "listener refuses without a client certificate, so it cannot confirm the "
+    "restore to the committed mtls base. Run this test with "
+    "SHED_DEV_AUTH_MODE=token (make dev-server-restart SHED_DEV_AUTH_MODE=token, "
+    "then SHED_DEV_AUTH_MODE=token make test-integration-dev)."
 )
 
 skip_mtls_reconfigure = pytest.mark.skipif(
@@ -153,7 +163,7 @@ _MTLS_TOKEN_SEMANTICS_REASON = (
     "hold under mtls — the mtls client authenticates with a short-lived "
     "certificate, never a bearer token (see internal/servertls/ca.go, "
     "internal/config/server.go). Run this test only with "
-    "SHED_DEV_AUTH_MODE=token (the default)."
+    "SHED_DEV_AUTH_MODE=token (not the default)."
 )
 
 skip_mtls_token_semantics = pytest.mark.skipif(
@@ -336,6 +346,15 @@ def _merge_config(overrides: dict) -> dict:
     return _deep_merge(base, overrides or {})
 
 
+def running_base_config(auth_mode: Optional[str] = None) -> dict:
+    """The config the dev server runs when no test has reconfigured it: the
+    committed base, with `auth.mode` flipped to token under
+    `SHED_DEV_AUTH_MODE=token` (what `scripts/render-dev-config.sh --token`
+    renders)."""
+    mode = DEV_AUTH_MODE if auth_mode is None else auth_mode
+    return _merge_config({"auth": {"mode": "token"}} if mode == "token" else {})
+
+
 def _write_config(config: dict, path: Path) -> Path:
     """Write `config` to `path` under `~/.shed/dev/` (never the committed
     base config)."""
@@ -345,19 +364,37 @@ def _write_config(config: dict, path: Path) -> Path:
     return path
 
 
-def _make_restart(dev_config: Path) -> None:
-    """`make dev-server-restart DEV_CONFIG=<path>` — always with an
-    explicit config so the restart never inherits a stale/foreign
-    `DEV_CONFIG` from a parent `make`/`MAKEFLAGS`.
+def _restart_argv(dev_config: Path, auth_mode: str) -> list[str]:
+    """The `make` command `_make_restart` runs (split out so the unit tests
+    can pin it without a server)."""
+    return [
+        "make", "dev-server-restart",
+        f"DEV_CONFIG={dev_config}",
+        f"SHED_DEV_AUTH_MODE={auth_mode}",
+    ]
 
-    Command-line variable assignments win over the Makefile's `:=`
-    default. `dev-server-down` keys off the PID file, so it stops whatever
+
+def _make_restart(dev_config: Path, auth_mode: str) -> None:
+    """`make dev-server-restart DEV_CONFIG=<path> SHED_DEV_AUTH_MODE=<mode>`
+    — always with an explicit config and mode, so the restart never
+    inherits a stale/foreign value from a parent `make`/`MAKEFLAGS` or the
+    environment.
+
+    `auth_mode` is what the Makefile does with the config: `mtls` runs it
+    as written (its own `auth:` block, whatever mode that names); `token`
+    renders a copy with `auth.mode: mtls` flipped to token first
+    (`scripts/render-dev-config.sh --token`). A reconfigured config passes
+    `mtls` so its override is never rewritten; the restore passes the
+    run's own `DEV_AUTH_MODE` so the server returns to what it was.
+
+    Command-line variable assignments win over the Makefile's `:=`/`?=`
+    defaults. `dev-server-down` keys off the PID file, so it stops whatever
     is running regardless of config. (The restart drags the Makefile's
     `build` prerequisite along; the Go build cache makes that cheap and
     the VM/server spin-up dominates the latency, so it's left as-is.)
     """
     r = subprocess.run(
-        ["make", "dev-server-restart", f"DEV_CONFIG={dev_config}"],
+        _restart_argv(dev_config, auth_mode),
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
     )
     if r.returncode != 0:
@@ -444,28 +481,34 @@ def dev_config(
     only ever restart a `*-dev` server on offset ports. Pass `server`
     from the `vz_server_dev` fixture's `.name`.
 
-    Raises (does not skip) when `SHED_DEV_AUTH_MODE=mtls`: this is a
-    defense-in-depth rail, not the primary mechanism — callers should
-    prefer skipping up front via `skip_mtls_reconfigure` (see the module
-    docstring) so a test never even attempts the restart under mtls. This
-    guard exists for any caller that doesn't.
+    Raises (does not skip) when `SHED_DEV_AUTH_MODE` is `mtls` (the
+    default): the restore to the committed mtls base cannot be confirmed,
+    because `_wait_reachable` reads `/api/info` and an mtls listener refuses
+    that without a client certificate. This is a defense-in-depth rail, not
+    the primary mechanism — callers should prefer skipping up front via
+    `skip_mtls_reconfigure` (see the module docstring) so a test never even
+    attempts the restart under mtls. This guard exists for any caller that
+    doesn't.
     """
-    if DEV_AUTH_MODE == "mtls":
+    if DEV_AUTH_MODE != "token":
         raise RuntimeError(
-            f"refusing to reconfigure {server!r}: SHED_DEV_AUTH_MODE=mtls means "
-            f"it is running a GENERATED config "
-            f"(~/.shed/dev/server.mtls-generated.yaml, produced by "
-            f"scripts/render-dev-mtls-config.sh), not the committed base config "
-            f"{DEV_BASE_CONFIG} that dev_config() merges onto and restores; "
-            f"tests that reconfigure the dev server must skip under mtls "
+            f"refusing to reconfigure {server!r}: SHED_DEV_AUTH_MODE="
+            f"{DEV_AUTH_MODE!r} means the dev server runs the committed mtls "
+            f"base {DEV_BASE_CONFIG}, and dev_config() cannot confirm a restore "
+            f"to it (its /api/info readiness probe needs a client certificate "
+            f"under mtls); tests that reconfigure the dev server run only with "
+            f"SHED_DEV_AUTH_MODE=token "
             f"(see fixtures.devcontrol.skip_mtls_reconfigure)"
         )
     assert_dev_target(server)
-    merged = _merge_config(overrides)
+    # Merge onto what the server runs now (the token copy, here), so an
+    # override that names no auth.mode keeps the run's mode.
+    merged = _deep_merge(running_base_config(), overrides or {})
     _assert_config_ports_safe(merged)
     temp = _write_config(merged, DEV_CONFIG_TMP)
     try:
-        _make_restart(temp)
+        # `mtls` = run the merged config as written (see _make_restart).
+        _make_restart(temp, "mtls")
         # The merged config (not the client entry) says which ports/mode the
         # restart just bound — see `_wait_reachable`'s docstring for why the
         # entry can't be used here.
@@ -473,12 +516,13 @@ def dev_config(
         yield server
     finally:
         try:
-            _make_restart(DEV_BASE_CONFIG)  # restore, base config pinned
-            # The restored server runs the committed base config, which is
-            # itself an enforced (token) mode server today — not "open" as
-            # this used to assume — so re-derive its ports/mode the same way
+            # Restore, base config pinned, in the mode the run started with.
+            _make_restart(DEV_BASE_CONFIG, DEV_AUTH_MODE)
+            # The restored server runs the committed base as the Makefile
+            # renders it for DEV_AUTH_MODE (token here: the guard above), an
+            # enforced mode, so re-derive its ports/mode from that config
             # rather than falling back to a plain-HTTP probe.
-            _wait_reachable(server, ready_timeout, config=_merge_config({}))
+            _wait_reachable(server, ready_timeout, config=running_base_config())
         finally:
             try:
                 temp.unlink()

@@ -70,8 +70,8 @@ The suite is **parameterized over `["vz", "fc"]`** and skips cleanly when a back
 
 ```bash
 # One-time setup per developer (Mac):
-#   1. Add a ~/.shed/config.yaml entry for the dev server (snippet below).
-#   2. make dev-server-up           # launches dev shed-server on ports 18080/12222
+#   1. make dev-server-up           # launches dev shed-server, mtls on 18443, SSH 12222
+#   2. shed server add localhost --ssh-port 12222 --name my-server-dev
 #
 # Per development cycle:
 make dev-server-up                  # refuses if already running (use dev-server-restart)
@@ -84,32 +84,24 @@ make dev-server-down                # when done
 
 The dev server's lifecycle is intentionally `nohup` + PID file under `~/.shed/dev/` — no launchd plist, no auto-restart on crash (crashes should be visible), no survives-reboot. State-dirs are isolated under `~/Library/Application Support/shed-dev/vz/` so `shed image prune` from the brew server never touches dev blobs. The dev server's `SHED_BUILD_TOOLS_REF` is set inline to the latest release tag so the dev binary uses release-shaped upper-template behavior (sub-100 ms rootfs phase).
 
-**`~/.shed/config.yaml` entry** (copy-paste alongside the existing `my-server` entry):
-
-```yaml
-servers:
-  my-server-dev:
-    host: localhost
-    http_port: 18080
-    ssh_port: 12222
-```
-
-Or run `shed server add localhost --port 18080 --ssh-port 12222 --name my-server-dev` after the first `make dev-server-up` — first contact is SSH-first, so the dev server's SSH port (12222) must be named explicitly.
+**Both dev servers run `auth.mode: mtls`** (the committed `configs/server.dev-parallel.*.yaml`), and so does the suite by default. Register each with `shed server add` after its first start — first contact is SSH-first and enrols an mtls client certificate, so the dev server's SSH port (12222) must be named and a hand-written `config.yaml` entry cannot work. `SHED_DEV_AUTH_MODE=token` (Mac only) runs a rendered token-mode copy for the bearer-token tests that remain until the server's token mode is removed; see `docs/development/testing.md` § "Auth mode: mtls".
 
 **FC remote parallel-dev** (same shape, over SSH to `$SHED_FC_HOST`):
 
 ```bash
-# One-time setup: register the FC dev entry (after first dev-server-up-fc):
-shed server add mini3 --port 18080 --ssh-port 12222 --name mini3-dev
+# One-time setup: register the FC dev entry (after first dev-server-up-fc).
+# An entry from when this server ran open is plain HTTP and does not heal:
+# `shed server remove mini3-dev` first.
+shed server add mini3 --ssh-port 12222 --name mini3-dev
 
 # Per dev cycle:
-make dev-server-up-fc                    # launches dev shed-server on mini3:18080
+make dev-server-up-fc                    # launches dev shed-server on mini3 (mtls, HTTPS 18443)
 make test-integration-dev-fc             # runs suite against FC dev (auto-ups if needed)
 make build && make dev-server-restart-fc # pick up the rebuild
 make dev-server-down-fc                  # when done
 ```
 
-The FC dev server runs via `sudo nohup` on the remote (no systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server). Listens on `mini3:18080/12222` alongside the deb shed-server's `mini3:8080/2222`. Separate state-dirs under `/var/lib/shed-dev/firecracker/`. Offset `vsock_base_cid: 600` (deb default is 100) to avoid CID collision. SHARED bridge/CIDR/tap_prefix — kernel-level TAP coordination handles the cross-server case.
+The FC dev server runs via `sudo nohup` on the remote (no systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server). Listens on `mini3:18443` (HTTPS, mtls) and `mini3:12222` (SSH) alongside the deb shed-server's `mini3:8080/2222`. Separate state-dirs under `/var/lib/shed-dev/firecracker/`. Offset `vsock_base_cid: 600` (deb default is 100) to avoid CID collision. SHARED bridge/CIDR/tap_prefix — kernel-level TAP coordination handles the cross-server case.
 
 **Open a server-side PR with `make test-integration-dev: N/N pass against dev-build at commit <sha>`**, and that statement is true and meaningful — not a brew-binary alibi.
 

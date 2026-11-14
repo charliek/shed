@@ -25,8 +25,9 @@ import fixtures.devcontrol as devcontrol
 
 def _api_info(config: dict) -> dict:
     """Fetch `/api/info`, choosing scheme/port the same way
-    `devcontrol._wait_reachable` does: an enforced-mode CONFIG (today's
-    committed dev-parallel base is `auth.mode: token`) is TLS-only, so read
+    `devcontrol._wait_reachable` does: an enforced-mode CONFIG (the
+    committed dev-parallel base is `auth.mode: mtls`, run as a token copy
+    under `SHED_DEV_AUTH_MODE=token`) is TLS-only, so read
     `https_port` off the CONFIG the server was actually started with — never
     the CLIENT ENTRY, which carries no `http_port` at all once the server
     enforces token/mtls (see `fixtures/devcontrol.py`'s module docstring)."""
@@ -157,7 +158,7 @@ def test_run_preflight_captures_startup_failure(vz_server_dev):
     the exact subprocess-launch-and-capture path Phase 6's public-exposure
     preflight will use to assert a refuse-to-start.
     """
-    result = devcontrol.run_preflight({})  # base config -> reuses :18080 -> bind conflict
+    result = devcontrol.run_preflight({})  # base config -> reuses :18443/:12222 -> bind conflict
     assert not result.timed_out, (
         "expected the second server to fail to bind, but it stayed up; "
         f"stderr={result.stderr[-500:]!r}"

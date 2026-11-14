@@ -5,9 +5,9 @@
 `RequireAndVerifyClientCert` with per-request re-validation (see
 `internal/config/server.go`, `internal/servertls/ca.go`,
 `internal/sshd/bootstrap.go`). This module drives that live, against the
-parallel dev server, in `SHED_DEV_AUTH_MODE=mtls` (see the Makefile knob added
-alongside this module and documented in `docs/development/testing.md` /
-`tests/integration/README.md`).
+parallel dev server, which runs mtls by default (both committed
+`configs/server.dev-parallel.*.yaml` are mtls; see
+`docs/development/testing.md` / `tests/integration/README.md`).
 
 **Detection.** The suite cannot probe `GET /api/info` to find out whether a
 server is in mtls mode — that endpoint is bootstrap-exempt at the HTTP layer,
@@ -17,20 +17,18 @@ including from bootstrap-exempt routes (this is exactly what
 `test_bare_tls_probe_without_client_cert_fails_before_http` below asserts).
 Instead, this module gates on the `SHED_DEV_AUTH_MODE` environment variable
 (set by `make test-integration-dev[-fc]`, forwarded from the same knob that
-picked the dev server's config — see the Makefile) — the whole module skips
-unless it is exactly `"mtls"`. Individual tests additionally assert against the
+picked the dev server's config — see the Makefile; unset means `mtls`) — the
+whole module skips unless it is exactly `"mtls"`, i.e. only under the Mac-only
+`SHED_DEV_AUTH_MODE=token` escape hatch. Individual tests additionally assert against the
 *client entry's* cached `auth_mode` in `~/.shed/config.yaml` (or a throwaway
 `$HOME`'s copy of it) as their actual pass/fail signal, per
 `internal/config/client.go: ServerEntry.AuthMode` — that field is populated by
 a real bootstrap exchange, not probed unauthenticated.
 
-**Two-config choreography** (see docs/development/testing.md for the full
-version): run the suite once against the dev server in `token` mode (today's
-default — the existing modules, unaffected by this one), then flip the dev
-server to mtls and run this module:
+**One run.** `make test-integration-dev` (or `-dev-fc`) runs this module
+with the rest of the suite; no mode flip is needed:
 
-    make dev-server-restart SHED_DEV_AUTH_MODE=mtls        # (or -fc)
-    SHED_DEV_AUTH_MODE=mtls make test-integration-dev       # (or -fc)
+    make dev-server-restart && make test-integration-dev    # (or -fc)
 
 **Mode-flip test.** `test_mode_flip_migrates_live` restarts the *actual*
 parallel-dev server mid-test (via the Makefile's `SHED_DEV_AUTH_MODE` knob,
@@ -42,8 +40,8 @@ module's run* depends on being in mtls mode is a real footgun if the test
 fails halfway. It is therefore VZ-only (mirroring `fixtures/devcontrol.py`'s
 documented FC-config-mutation-is-out-of-scope stance) and gated behind an
 explicit opt-in env var, `SHED_MTLS_FLIP_TEST=1`, so a plain
-`SHED_DEV_AUTH_MODE=mtls make test-integration-dev` run never restarts the
-server out from under itself.
+`make test-integration-dev` run never restarts the server out from under
+itself.
 """
 
 from __future__ import annotations
@@ -77,9 +75,9 @@ pytestmark = pytest.mark.skipif(
     SHED_DEV_AUTH_MODE != "mtls",
     reason=(
         f"SHED_DEV_AUTH_MODE={SHED_DEV_AUTH_MODE!r} (want 'mtls'): this module "
-        "only runs against a dev server started with SHED_DEV_AUTH_MODE=mtls. "
-        "Run `make dev-server-restart SHED_DEV_AUTH_MODE=mtls` (or `-fc`), then "
-        "`SHED_DEV_AUTH_MODE=mtls make test-integration-dev` (or `-fc`). "
+        "only runs against a dev server in mtls, the default. Unset "
+        "SHED_DEV_AUTH_MODE, then `make dev-server-restart && "
+        "make test-integration-dev` (or `-fc`). "
         "See docs/development/testing.md."
     ),
 )
@@ -88,9 +86,9 @@ FLIP_TEST_ENV = "SHED_MTLS_FLIP_TEST"
 
 # The identity copied into a throwaway $HOME for the SSH-first `server add`
 # test (see `_isolated_home_with_identity`). Must already be allowlisted by
-# the dev server's `auth.ssh` — today `github_users: [charliek]` on both
-# configs/server.dev-parallel.mac.yaml and .linux-fc.yaml (see
-# scripts/render-dev-mtls-config.sh) — which is the "allowlisted SSH key"
+# the dev server's `auth.ssh` — today `github_users: [charliek]` in both
+# committed configs/server.dev-parallel.mac.yaml and .linux-fc.yaml
+# — which is the "allowlisted SSH key"
 # precondition this module's docstring and the plan both refer to; nothing
 # here sets that allowlisting up.
 _REAL_SSH_DIR = Path.home() / ".ssh"

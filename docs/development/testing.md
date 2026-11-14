@@ -159,7 +159,7 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
 | `SHED_FC_LOG_PATH` | _unset_ (uses journald) | Remote file path for `fc_server` fixture to read logs from. `test-integration-dev-fc` sets this to the dev server's log file so the existing tests find PhaseTimer lines (the dev server runs via `sudo nohup`, not systemd). |
 | `RELEASE_BUILD_TOOLS_REF` | latest `git tag` matching `v*` | shed-build-tools image ref injected into the dev binary so it uses release-shaped upper-template behavior. Pin to an older release if your source has drifted: `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7`. |
 | `SHED_DEV_STATE_DIR` | _unset_ | **Per-machine, optional.** Relocates the Mac dev server's blob-heavy state (`images_dir`, `instance_dir`, `snapshots_dir`, `uppers_dir`) under this directory — for a boot volume that cannot host a multi-GB dev image store. Unset means the committed default (`~/Library/Application Support/shed-dev/vz`), so no other developer is affected; set it in your shell profile (e.g. `export SHED_DEV_STATE_DIR=/Volumes/ext/shed-dev/vz`). `socket_dir` is deliberately NOT relocated (unix socket path length limits). `dev-server-up` refuses to start if the path is unmounted or unwritable, rather than silently building a second empty store on the mount point. |
-| `SHED_DEV_AUTH_MODE` | `token` | `auth.mode` the parallel dev server (Mac or FC) is (re)started with — `token` (byte-identical to today's dev config) or `mtls` (renders a throwaway variant via `scripts/render-dev-config.sh`, never editing the committed base). Honored by `dev-server-up`/`-restart` and the `-fc` variants; forwarded by `test-integration-dev[-fc]` so `tests/integration/test_mtls.py` can tell which mode is running. See "Validating the mtls auth mode" below. |
+| `SHED_DEV_AUTH_MODE` | `mtls` | `auth.mode` the Mac parallel dev server is (re)started with — `mtls` (default: the committed config as written) or `token` (a throwaway copy rendered by `scripts/render-dev-config.sh --token`, never an edit of the committed config; only for the bearer-token tests that remain until the server's token mode is removed, and removed with them). Honored by `dev-server-up`/`-restart`; forwarded by `test-integration-dev` so the suite knows which mode is running. The FC dev server runs mtls only: the `-fc` targets refuse any other value. See "Auth mode: mtls" below. |
 | `SHED_MTLS_FLIP_TEST` | _unset_ | Opt-in for `test_mtls.py::test_mode_flip_migrates_live`, which restarts the real Mac dev server twice to prove the live auth-mode migration in both directions. Unset skips it. |
 
 #### Validating server-side changes — parallel dev server
@@ -171,13 +171,12 @@ The mechanism for closing this gap is a **parallel dev shed-server** that runs a
 **VZ (local Mac):**
 
 ```sh
-# One-time setup per developer:
-#   Add a ~/.shed/config.yaml entry for the dev server (snippet at the
-#   end of this section), OR run `shed server add localhost --port 18080
-#   --ssh-port 12222 --name my-server-dev` after the first `make dev-server-up`.
+# One-time setup per developer, after the first `make dev-server-up`
+# (SSH-first: it enrols an mtls client certificate):
+#   shed server add localhost --ssh-port 12222 --name my-server-dev
 
 # Per dev cycle:
-make dev-server-up              # launches dev shed-server on 18080/12222
+make dev-server-up              # launches dev shed-server on 18443/12222 (mtls)
 make test-integration-dev       # runs suite against dev server (auto-ups if needed)
 # ... edit source ...
 make build && make dev-server-restart
@@ -188,19 +187,19 @@ make dev-server-down            # when done
 The dev server:
 
 - Runs from `bin/shed-server` (the just-built dev binary) via `nohup` — no launchd plist, no auto-restart, no survives-reboot. Crashes are visible (not silently recovered); re-up after a reboot is one command.
-- Listens on ports `18080` (HTTP) + `12222` (SSH), separate from the brew server's `8080` + `2222`. Both servers run simultaneously without conflict.
+- Runs `auth.mode: mtls` and listens on ports `18443` (HTTPS) + `12222` (SSH), separate from the brew server's `8080` + `2222`. Both servers run simultaneously without conflict.
 - Uses isolated state-dirs under `~/Library/Application Support/shed-dev/vz/` — separate `images_dir`, `instance_dir`, `snapshots_dir`, `uppers_dir`, `socket_dir`. `shed image prune` from the brew server never touches dev blobs, and vice versa.
 - Has `SHED_BUILD_TOOLS_REF` set inline to the latest release tag, so the dev binary uses the release-shaped upper-template fast path (sub-100 ms rootfs phase) — the suite's `test_create_rootfs_template_present` test passes against the dev server when the env var is wired correctly.
 
 **FC (remote Linux over SSH; default `$SHED_FC_HOST=mini3`):**
 
 ```sh
-# One-time setup per developer:
-#   shed server add mini3 --port 18080 --ssh-port 12222 --name mini3-dev  # after first dev-server-up-fc
-#   (or manually add the entry to ~/.shed/config.yaml)
+# One-time setup per developer, after the first `make dev-server-up-fc`
+# (SSH-first: it enrols an mtls client certificate):
+#   shed server add mini3 --ssh-port 12222 --name mini3-dev
 
 # Per dev cycle:
-make dev-server-up-fc           # launches dev shed-server on mini3:18080 via sudo nohup
+make dev-server-up-fc           # launches dev shed-server on mini3:18443 (mtls) via sudo nohup
 make test-integration-dev-fc    # runs suite against FC dev (auto-ups if needed)
 # ... edit source ...
 make build && make dev-server-restart-fc
@@ -211,15 +210,17 @@ make dev-server-down-fc         # when done
 `PYTEST_ARGS` passes extra arguments to pytest in every `test-integration*` target, for example a subset of modules:
 
 ```sh
-make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls PYTEST_ARGS="test_smoke.py test_mounts.py test_mtls.py"
+make test-integration-dev-fc PYTEST_ARGS="test_smoke.py test_mounts.py test_mtls.py"
 ```
 
 `test-integration-dev-fc` is FC-only: it sets `SHED_VZ_SERVER` and `SHED_VZ_DEV_SERVER` empty, so every `[vz]` case skips. Without that the `[vz]` cases would reach the `my-server` entry, which on a Linux workstation can be a production FC server (mini3's deb server), and create and delete sheds there. An empty `SHED_VZ_SERVER` (or `SHED_FC_SERVER`) always means "no server for that backend", never the client's default server.
 
-The FC dev server runs via `sudo nohup` on the remote (needs root for FC's CAP_NET_ADMIN bridge/TAP operations). No systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server (crashes visible, no survives-reboot). Listens on `mini3:18080/12222` alongside the deb shed-server's `mini3:8080/2222`. Isolated state-dirs under `/var/lib/shed-dev/firecracker/`.
+The FC dev server runs via `sudo nohup` on the remote (needs root for FC's CAP_NET_ADMIN bridge/TAP operations). No systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server (crashes visible, no survives-reboot). Runs `auth.mode: mtls` (its only mode) and listens on `mini3:18443` (HTTPS) and `mini3:12222` (SSH) alongside the deb shed-server's `mini3:8080/2222`. Isolated state-dirs under `/var/lib/shed-dev/firecracker/`. `make dev-server-up-fc` (like the Mac `make dev-server-up`) waits on `scripts/dev-server-probe.sh`: the server's readiness line, the process still running, and every logged listener accepting a TCP connection, so it needs no enrolled CLI entry, and a server that dies starting up (a port already taken, say) fails the target instead of being reported up.
+
+**After the switch to mtls,** an existing `mini3-dev` entry from when this server ran open is plain HTTP and does not heal itself: `shed server remove mini3-dev`, then `shed server add mini3 --ssh-port 12222 --name mini3-dev`.
 
 FC-specific isolation:
-- **Its own identity directory.** The FC dev config sets `state_dir: /var/lib/shed-dev/state`, so the root dev server keeps its SSH host key, TLS cert, mtls client CA and GitHub key cache there instead of in production's `/etc/shed`. The first `make dev-server-up-fc` after this change generates a new host key and TLS pin: remove only the stale `mini3-dev` entry from `~/.shed/config.yaml` and re-add it with `shed server add mini3 --port 18080 --ssh-port 12222 --name mini3-dev` (leave the `mini3` entry and `default_server` alone).
+- **Its own identity directory.** The FC dev config sets `state_dir: /var/lib/shed-dev/state`, so the root dev server keeps its SSH host key, TLS cert, mtls client CA and GitHub key cache there instead of in production's `/etc/shed`. The first `make dev-server-up-fc` after this change generates a new host key and TLS pin: remove only the stale `mini3-dev` entry from `~/.shed/config.yaml` and re-add it with `shed server add mini3 --ssh-port 12222 --name mini3-dev` (leave the `mini3` entry and `default_server` alone).
 - **An `itest` image alias** (`ghcr.io/charliek/shed-fc-base:v0.9.0`) for tests that need a newer guest agent than the v0.5.9 images (exec process-group cleanup, a separate stderr stream).
 - **Five throwaway writable 9P mounts.** The FC dev config carries `claude`, `codex`, `opencode_data`, `opencode_state` and `gh` mounts mirroring a typical production mount set (same keys and targets). Their sources live under `/var/lib/shed-dev/mounts/` on the remote and are created by `make dev-server-up-fc` (derived from the uploaded config's `source:` lines). They hold no real credentials; they exist so the suite exercises the 9P credential-mount path (stop latency, nested mount targets).
 - **Offset `vsock_base_cid: 600`** (deb default is 100) so the two servers' vsock CIDs don't collide. vsock allocation is in-memory per-server with no kernel check.
@@ -227,21 +228,15 @@ FC-specific isolation:
 
 A server-side PR should open with **"`make test-integration-dev`: N/N pass against dev-build at commit `<sha>`"** (or `make test-integration-dev-fc` for FC changes). That sentence is then true and meaningful — not a brew/deb-binary alibi.
 
-**`~/.shed/config.yaml` entry** to add for the parallel-dev VZ server:
+**Registering the dev servers.** Both dev configs run `auth.mode: mtls`, so a
+hand-written `~/.shed/config.yaml` entry cannot reach them: an entry needs a
+client certificate, which only `shed server add` obtains (SSH-first: see the
+callout below). Use exactly:
 
-```yaml
-servers:
-  my-server-dev:
-    host: localhost
-    http_port: 18080
-    ssh_port: 12222
+```sh
+shed server add localhost --ssh-port 12222 --name my-server-dev   # Mac
+shed server add mini3 --ssh-port 12222 --name mini3-dev           # FC
 ```
-
-Both dev configs already run with auth enforced (`auth.mode: token`, or `mtls`
-per the knob below), so the entry above only registers the *connection*
-details — it carries no credential. `shed server add localhost --ssh-port
-12222 --name my-server-dev` (SSH-first: see the callout below) is what
-actually bootstraps one; prefer it over hand-editing the file.
 
 #### Remote backend (cloud sheds)
 
@@ -261,12 +256,12 @@ separate stderr stream):
 
 | Module | Covers | Needs |
 |--------|--------|-------|
-| `test_http_exec.py` | `POST /api/sheds/{name}/exec`: frames, exit codes, stdin, the 124 timeout and the disconnect (both followed by the guest process being gone), 8 MiB intact, truncation, a 70 s quiet stream, 404, validation, 409 | mtls |
-| `test_service_client.py` | A service client end to end: the bundle from `client issue` over SSH, owned sheds with no 9P mounts across stop/start, 403 and 404 refusals, admin visibility, the audit log's `api` and `exec.end` lines | mtls |
+| `test_http_exec.py` | `POST /api/sheds/{name}/exec`: frames, exit codes, stdin, the 124 timeout and the disconnect (both followed by the guest process being gone), 8 MiB intact, truncation, a 70 s quiet stream, 404, validation, 409 | an mtls dev entry |
+| `test_service_client.py` | A service client end to end: the bundle from `client issue` over SSH, owned sheds with no 9P mounts across stop/start, 403 and 404 refusals, admin visibility, the audit log's `api` and `exec.end` lines | an mtls dev entry |
 | `test_create_mounts.py` | `shed create --mounts none` and the `list -v`/`-vv`/`--json` columns, with a default create as the positive control | any mode |
-| `test_network_profiles.py` | `--network isolated` probed from inside real guests, the service client's shed isolated by default, the dev server's tables in `nft`, rebuild at restart, reapply within 40 s of a manual delete, `dev-server-down-fc` removing only its two tables | mtls |
+| `test_network_profiles.py` | `--network isolated` probed from inside real guests, the service client's shed isolated by default, the dev server's tables in `nft`, rebuild at restart, reapply within 40 s of a manual delete, `dev-server-down-fc` removing only its two tables | an mtls dev entry |
 
-`scripts/render-dev-config.sh --mtls` gives the FC dev config an `itest` service
+The committed FC dev config carries an `itest` service
 client (prefix `itest-svc-`, `max_sheds: 3`, `max_age: 2h`, images `[itest]`, no
 server mounts, network isolated by default) and a `nocturn` client for a development
 Nocturn's shed-craze Agent Provider (prefix `nocturn-`, `max_sheds: 4`, `max_age: 30h`,
@@ -275,8 +270,8 @@ with `sudo -n /tmp/shed-server-dev client issue nocturn --config /tmp/shed-serve
 Run them with:
 
 ```sh
-make build && make dev-server-restart-fc SHED_DEV_AUTH_MODE=mtls
-make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls \
+make build && make dev-server-restart-fc
+make test-integration-dev-fc \
   PYTEST_ARGS="test_http_exec.py test_service_client.py test_create_mounts.py test_network_profiles.py"
 ```
 
@@ -344,100 +339,50 @@ If the rollback fired, the test shed's VM is still running (stopping
 shed-server never stops a Firecracker VM) and is **unguarded** until the dev
 server starts again. Once the host is reachable, stop that shed's
 `firecracker` process; or, once the rule change is fixed, start the dev server
-(`make dev-server-up-fc SHED_DEV_AUTH_MODE=mtls`, which reinstalls the tables
+(`make dev-server-up-fc`, which reinstalls the tables
 from the sheds' metadata before it serves) and delete the shed.
 
 `make dev-server-down-fc` runs `shed-server network teardown` for the dev
 server after stopping it, so its tables never outlive it.
 
-#### Validating the mtls auth mode
+#### Auth mode: mtls
 
-`auth.mode: mtls` — client certificates minted over the SSH `_bootstrap`
-channel, `RequireAndVerifyClientCert` enforced on the HTTPS listener with
-per-request re-validation — is exercised live by
-`tests/integration/test_mtls.py`, against the parallel dev server, gated by a
-Makefile knob:
-
-```sh
-SHED_DEV_AUTH_MODE ?= token   # default: byte-identical to today's dev config
-```
-
-Honored by `dev-server-up` / `dev-server-restart` (and the `-fc` variants):
-`token` runs the committed `configs/server.dev-parallel.*.yaml` unmodified —
-no generation step at all; `mtls` first renders a throwaway variant
-(`scripts/render-dev-config.sh`, never editing the committed base) with
-`auth.mode: mtls`. The mac config already carries the `https_port` +
-`auth.ssh` key source mtls needs (only the mode line flips); the FC config
-defaults to open mode with no `auth:` block at all, so the mtls render also
-appends `https_port` + a `github_users` key source — the two invariants mtls
-mode requires (`internal/config/server.go`).
-
-**Two-config choreography:**
+Both parallel dev servers run `auth.mode: mtls` — client certificates issued
+over the SSH `_bootstrap` channel, `RequireAndVerifyClientCert` enforced on the
+HTTPS listener with per-request re-validation. The committed
+`configs/server.dev-parallel.mac.yaml` and `configs/server.dev-parallel.linux-fc.yaml`
+say so, and the dev targets run them as written, so one run covers the whole
+suite, `tests/integration/test_mtls.py` and the FC-only mtls modules included:
 
 ```sh
-# 1. Regression pass in the default (token) mode — every other module.
-make test-integration-dev                                # or -dev-fc
-
-# 2. Flip the dev server to mtls, run just the mtls module.
-make dev-server-restart SHED_DEV_AUTH_MODE=mtls           # or -restart-fc
-SHED_DEV_AUTH_MODE=mtls make test-integration-dev         # or -dev-fc
-
-# 3. Flip back (also the default):
-make dev-server-restart                                   # or -restart-fc
+make dev-server-restart && make test-integration-dev          # Mac (VZ)
+make dev-server-restart-fc && make test-integration-dev-fc    # Firecracker
 ```
 
-**`shed server add` needs `--ssh-port` for the dev servers** — it is SSH-first
-(host-key pin + credential bootstrap happen over SSH before HTTP is ever
-touched), so:
+**`shed server add` needs only `--ssh-port` for the dev servers** — it is
+SSH-first (host-key pin + certificate enrolment happen over SSH before HTTPS
+is ever touched, and the bootstrap reports the HTTPS port), so:
 
 ```sh
-shed server add localhost --ssh-port 12222 --name my-server-dev        # Mac
-shed server add mini3 --ssh-port 12222 --port 18080 --name mini3-dev   # FC
+shed server add localhost --ssh-port 12222 --name my-server-dev   # Mac
+shed server add mini3 --ssh-port 12222 --name mini3-dev           # FC
 ```
 
-**Detection.** The test module cannot probe `GET /api/info` to tell whether a
-server is in mtls mode — under mtls that endpoint is unreachable outright
-(the TLS listener refuses an uncertificated handshake before any HTTP request
-is even parsed), which is exactly what
-`test_bare_tls_probe_without_client_cert_fails_before_http` asserts. Instead
-the whole module skips unless `SHED_DEV_AUTH_MODE` is exactly `mtls`
-(forwarded by `test-integration-dev[-fc]`); individual tests additionally
-assert against the *client entry's* cached `auth_mode` in
-`~/.shed/config.yaml` (`internal/config/client.go: ServerEntry.AuthMode`) as
-their real pass/fail signal.
+A token-mode entry heals itself on its next request; a plain-HTTP entry for
+the FC dev server from when it ran open does not (`shed server remove
+mini3-dev`, then add it again).
 
-**The mode-flip test is opt-in and VZ-only.**
-`test_mode_flip_migrates_live` restarts the real Mac dev server twice
-(token, then back to mtls) mid-test to prove the live migration in both
-directions — more invasive than every other test in the module, which only
-ever read the already-running dev server. Gated behind
-`SHED_MTLS_FLIP_TEST=1`:
+**The remaining bearer-token tests (Mac only).** Until the server's token mode
+is removed, a few tests still assert token semantics or restart the dev
+server into token/secure or open mode through
+`tests/integration/fixtures/devcontrol.py: dev_config()`. They skip under mtls
+via two marks exported from that module:
 
-```sh
-SHED_MTLS_FLIP_TEST=1 SHED_DEV_AUTH_MODE=mtls make test-integration-dev
-```
-
-**The full suite (`make test-integration-dev[-fc]` with no
-`SHED_DEV_AUTH_MODE` override) is a TOKEN-mode regression run.** Nearly
-every module outside `test_mtls.py` assumes the dev server's token-mode
-invariants — bearer tokens exist, a plain-HTTP listener exists where
-expected, `dev_config()`'s config-mutation round-trip works against the
-committed base config — and doesn't read `SHED_DEV_AUTH_MODE` at all.
-Running the suite against a server actually in `mtls` mode therefore mixes
-two incompatible postures on purpose only in the sense that it's meant to
-degrade gracefully: a documented set of tests **skip cleanly** instead of
-failing, via two shared `pytest.mark.skipif` marks exported from
-`tests/integration/fixtures/devcontrol.py`:
-
-- `skip_mtls_reconfigure` — the test mutates the dev server's config via
-  `dev_config()`/`bootstrap_mint()` for a scenario unrelated to bearer
-  tokens (TLS pinning, SSH allowlist mechanics, the `dev_config()`
-  round-trip test itself). Under mtls the server runs a *generated* config
-  (`~/.shed/dev/server.mtls-generated.yaml`) rather than the committed base
-  `dev_config()` expects, so reconfiguring would silently knock the live
-  server out of mtls — `dev_config()` itself raises `RuntimeError` if
-  called under mtls as a defense-in-depth rail, but the mark is what
-  actually keeps the test from calling it in the first place.
+- `skip_mtls_reconfigure` — the test reconfigures the dev server.
+  `dev_config()` confirms each restart by reading `/api/info`, which an mtls
+  listener refuses without a client certificate, so it cannot confirm the
+  restore to the mtls base; `dev_config()` itself raises `RuntimeError` under
+  mtls as a defense-in-depth rail.
 - `skip_mtls_token_semantics` — the test's assertions are inherently about
   bearer-credential behavior (scoped HTTP tokens, TTL expiry,
   allowlist-gated minting, the open-mode single-plain-listener shape) that
@@ -449,12 +394,44 @@ Guarded tests: `test_tls.py` (all four live tests), `test_ssh_auth.py`
 `test_http_auth.py::test_secure_mode_enforces_scoped_tokens`,
 `test_bootstrap.py::test_bootstrap_mint_is_allowlist_gated`,
 `test_cred_bus.py::test_cred_bus_forged_respond_dropped`, and
-`test_network_surface.py::test_bus_and_connect_on_single_listener`. Running
-`SHED_DEV_AUTH_MODE=mtls make test-integration-dev[-fc]` is thus **not** a
-second full regression pass — it runs `test_mtls.py` plus whatever else in
-the suite is mode-independent, with the tests above skipping by design; the
-two-config choreography above (run once in each mode) is what gets full
-coverage.
+`test_network_surface.py::test_bus_and_connect_on_single_listener`. To run
+them, start the Mac dev server from a token-mode copy of its config
+(`scripts/render-dev-config.sh --token` renders it; the committed file is never
+edited) and pass the same value to the suite:
+
+```sh
+make dev-server-restart SHED_DEV_AUTH_MODE=token
+SHED_DEV_AUTH_MODE=token make test-integration-dev
+make dev-server-restart            # back to mtls
+```
+
+In that run `dev_config()` restarts with the test's own config as written and
+restores the token copy afterwards; `test_mtls.py` skips. The FC dev server has
+no token mode: the `-fc` targets refuse `SHED_DEV_AUTH_MODE=token`.
+
+**Detection.** The test module cannot probe `GET /api/info` to tell whether a
+server is in mtls mode — under mtls that endpoint is unreachable outright
+(the TLS listener refuses an uncertificated handshake before any HTTP request
+is even parsed), which is exactly what
+`test_bare_tls_probe_without_client_cert_fails_before_http` asserts. Instead
+the whole module skips unless `SHED_DEV_AUTH_MODE` is `mtls` (unset means
+`mtls`; forwarded by `test-integration-dev[-fc]`); individual tests
+additionally assert against the *client entry's* cached `auth_mode` in
+`~/.shed/config.yaml` (`internal/config/client.go: ServerEntry.AuthMode`) as
+their real pass/fail signal. The released-version gate
+(`LocalServer.server_version()`) reads `/api/info` with the entry's own client
+certificate, so it works against an mtls server too.
+
+**The mode-flip test is opt-in and VZ-only.**
+`test_mode_flip_migrates_live` restarts the real Mac dev server twice
+(token, then back to mtls) mid-test to prove the live migration in both
+directions — more invasive than every other test in the module, which only
+ever read the already-running dev server. Gated behind
+`SHED_MTLS_FLIP_TEST=1`:
+
+```sh
+SHED_MTLS_FLIP_TEST=1 make test-integration-dev
+```
 
 #### Validating pre-release: build-tools image changes
 

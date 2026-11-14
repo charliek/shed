@@ -1,7 +1,7 @@
 """HTTPS exec (`POST /api/sheds/{name}/exec`) against the parallel FC dev server.
 
-Firecracker only, and only against a dev server started in mtls mode
-(`SHED_DEV_AUTH_MODE=mtls`): the module authenticates as the admin with the
+Firecracker only, against the FC dev server, which runs mtls (its committed
+config; it has no other mode): the module authenticates as the admin with the
 client certificate the CLI keeps for the dev entry
 (`~/.shed/creds/<entry>/client.pem` and `client.key`, refreshed by the
 `fc_server_dev` fixture's `shed -s <entry> list` probe), and pins the server by
@@ -14,8 +14,8 @@ agent SIGHUPs the command's process group when the host goes away). The
 guest agent notices a silent command's lost host through a keepalive probe
 every 15 s, so the cleanup probes wait up to 45 s.
 
-Run: `make build && make dev-server-restart-fc SHED_DEV_AUTH_MODE=mtls &&
-make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls PYTEST_ARGS="test_http_exec.py"`.
+Run: `make build && make dev-server-restart-fc &&
+make test-integration-dev-fc PYTEST_ARGS="test_http_exec.py"`.
 """
 
 from __future__ import annotations
@@ -35,17 +35,10 @@ from urllib.parse import urlparse
 import pytest
 import yaml
 
-from fixtures.devcontrol import DEV_AUTH_MODE
 from fixtures.tlsclient import fingerprint, server_cert_pem
 
-pytestmark = pytest.mark.skipif(
-    DEV_AUTH_MODE != "mtls",
-    reason=(
-        f"SHED_DEV_AUTH_MODE={DEV_AUTH_MODE!r} (want 'mtls'): HTTPS exec is "
-        "tested as an mtls admin against the FC dev server. Run "
-        "`make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls`."
-    ),
-)
+# No auth-mode gate: the FC dev server is always mtls, and `_load_entry`
+# skips cleanly when the dev entry has no mtls client certificate.
 
 # A disconnected or timed-out command dies when the guest agent notices the
 # host is gone: at once if it writes, else at the next keepalive probe (15 s).

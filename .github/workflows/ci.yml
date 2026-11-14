@@ -139,8 +139,14 @@ jobs:
               - 'crates/shed-core/src/machine.rs'
               - 'crates/shed-core/src/craze.rs'
             integrationunits:
-              # The integration suite's server-free unit tests (shed#398).
+              # The integration suite's server-free unit tests (shed#398),
+              # which also pin the parallel dev configs, their renderer, the
+              # dev-server targets' guard ordering and readiness probe.
               - 'tests/integration/**'
+              - 'configs/server.dev-parallel.*.yaml'
+              - 'scripts/render-dev-config.sh'
+              - 'scripts/dev-server-probe.sh'
+              - 'Makefile'
             docs:
               - 'docs/**'
               - 'zensical.toml'
