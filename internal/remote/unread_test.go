@@ -132,68 +132,70 @@ func TestResumedCreateIsKeptWhenItsInstanceCannotBeRead(t *testing.T) {
 	}
 }
 
-// A kept create never blocks its name or its VM for good: a delete ends it
-// like any other shed, and the VM goes with it.
-func TestKeptCreateCanBeDeleted(t *testing.T) {
-	e := newEnv(t, manual())
-	const name = "kept"
-	e.put(name, config.StatusStarting)
-	e.waitRef(name)
-	if err := e.b.Close(); err != nil {
-		t.Fatal(err)
+// What can be asked of a create that is kept. It never blocks its name or its
+// VM for good: a delete ends it like any other shed, and the VM goes with it.
+// A stop waits for the create: it must not turn the unfinished create into a
+// stopped shed.
+func TestKeptCreateStaysUsable(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T, e *env, name, id string)
+	}{
+		{"a delete ends it, VM included, and frees the name", func(t *testing.T, e *env, name, _ string) {
+			e.auto()
+			if err := e.b.DeleteShed(ctxT(t), name); err != nil {
+				t.Fatal(err)
+			}
+			e.idle()
+			if e.instances() != 0 || markerCount(t, e.dir) != 0 {
+				t.Fatalf("%d instances and %d markers after the delete, want none", e.instances(), markerCount(t, e.dir))
+			}
+			if _, err := e.create(name); err != nil {
+				t.Fatalf("the name is not free after the delete: %v", err)
+			}
+		}},
+		{"a stop waits behind it and runs once the create has finished", func(t *testing.T, e *env, name, id string) {
+			// The look the stop call asks for fails as well.
+			e.prov.FailNext(fake.OpGet, errCloudDown)
+			if _, err := e.b.StopShed(ctxT(t), name); err != nil {
+				t.Fatalf("stop on a kept create: %v", err)
+			}
+			e.idle()
+			if n := e.count(fake.OpStop); n != 0 {
+				t.Fatalf("%d stop calls while the create is unfinished, want none", n)
+			}
+			rec := e.b.snapshot(name, id)
+			if rec.Shed.Status != config.StatusStarting || rec.Job != state.JobCreate || rec.Queued != state.QueuedStop {
+				t.Fatalf("record %q job %q queued %q, want the create kept with the stop queued", rec.Shed.Status, rec.Job, rec.Queued)
+			}
+			e.auto()
+			e.sweep()
+			got := e.settled(name)
+			if got.Status != config.StatusStopped {
+				t.Fatalf("came to rest %q (%q), want stopped: the create finished and the queued stop ran", got.Status, got.StatusReason)
+			}
+			if rec := e.b.snapshot(name, id); !rec.Ready {
+				t.Fatal("the create did not finish before the stop ran")
+			}
+		}},
 	}
-	e.prov.FailNext(fake.OpGet, errCloudDown)
-	e.b = e.open()
-	e.idle()
-	if got := e.reason(name); got != config.StatusReasonCloudUnreadable {
-		t.Fatalf("reason %q, want %s", got, config.StatusReasonCloudUnreadable)
-	}
-	e.auto()
-	if err := e.b.DeleteShed(ctxT(t), name); err != nil {
-		t.Fatal(err)
-	}
-	e.idle()
-	if e.instances() != 0 || markerCount(t, e.dir) != 0 {
-		t.Fatalf("%d instances and %d markers after the delete, want none", e.instances(), markerCount(t, e.dir))
-	}
-	if _, err := e.create(name); err != nil {
-		t.Fatalf("the name is not free after the delete: %v", err)
-	}
-}
-
-// A stop asked for while a create is kept waits for the create: it must not
-// turn the unfinished create into a stopped shed.
-func TestStopQueuedOnAKeptCreateWaitsForIt(t *testing.T) {
-	e := newEnv(t, manual())
-	const name = "kept"
-	e.put(name, config.StatusStarting)
-	id := e.waitRef(name)
-	if err := e.b.Close(); err != nil {
-		t.Fatal(err)
-	}
-	e.prov.FailNext(fake.OpGet, errCloudDown)
-	e.prov.FailNext(fake.OpGet, errCloudDown)
-	e.b = e.open()
-	e.idle()
-	if _, err := e.b.StopShed(ctxT(t), name); err != nil {
-		t.Fatalf("stop on a kept create: %v", err)
-	}
-	e.idle()
-	if n := e.count(fake.OpStop); n != 0 {
-		t.Fatalf("%d stop calls while the create is unfinished, want none", n)
-	}
-	rec := e.b.snapshot(name, id)
-	if rec.Shed.Status != config.StatusStarting || rec.Job != state.JobCreate || rec.Queued != state.QueuedStop {
-		t.Fatalf("record %q job %q queued %q, want the create kept with the stop queued", rec.Shed.Status, rec.Job, rec.Queued)
-	}
-	e.auto()
-	e.sweep()
-	got := e.settled(name)
-	if got.Status != config.StatusStopped {
-		t.Fatalf("came to rest %q (%q), want stopped: the create finished and the queued stop ran", got.Status, got.StatusReason)
-	}
-	if rec := e.b.snapshot(name, id); !rec.Ready {
-		t.Fatal("the create did not finish before the stop ran")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t, manual())
+			const name = "kept"
+			e.put(name, config.StatusStarting)
+			id := e.waitRef(name)
+			if err := e.b.Close(); err != nil {
+				t.Fatal(err)
+			}
+			e.prov.FailNext(fake.OpGet, errCloudDown)
+			e.b = e.open()
+			e.idle()
+			if got := e.reason(name); got != config.StatusReasonCloudUnreadable {
+				t.Fatalf("reason %q, want %s", got, config.StatusReasonCloudUnreadable)
+			}
+			tt.run(t, e, name, id)
+		})
 	}
 }
 
