@@ -65,6 +65,13 @@ func (f *fakeLinks) Open(_ context.Context, target transport.Target) (transport.
 	return &fakeLink{f: f, target: target}, nil
 }
 
+// dialCount is how many connections to guests have been asked for.
+func (f *fakeLinks) dialCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dials
+}
+
 func (f *fakeLinks) fail(name string, errs ...error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

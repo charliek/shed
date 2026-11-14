@@ -197,6 +197,89 @@ func TestStopQueuedOnAKeptCreateWaitsForIt(t *testing.T) {
 	}
 }
 
+// A create resumed against an instance whose labels are another version's
+// touches nothing: no link to the guest, no credentials, no clone, no label
+// write, and no clean-up marker that a later server would act on. A server
+// that reads the labels finishes the create.
+func TestResumedCreateLeavesAnotherSchemaAlone(t *testing.T) {
+	tests := []struct {
+		name     string
+		finished bool
+	}{
+		{"an unfinished create", false},
+		{"a create the cloud calls finished", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sp := &schemaProvider{}
+			wrap := func(e *env, _ *fake.Options) {
+				e.wrap = func(p provider.Provider) provider.Provider {
+					sp.Provider = p.(*fake.Provider)
+					return sp
+				}
+			}
+			var e *env
+			var id string
+			const name = "newer"
+			if tt.finished {
+				e = newEnv(t, wrap)
+				e.running(name)
+				id = e.uncommit(name)
+			} else {
+				e = newEnv(t, manual(), wrap)
+				e.put(name, config.StatusStarting)
+				id = e.waitRef(name)
+			}
+			if err := e.b.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// The start-up pass leaves an instance with such labels alone
+			// (it cannot read whose it is), so the record's create is
+			// resumed and only its own read of the instance finds it.
+			sp.schema.Store("2")
+			sp.listToo.Store(true)
+			dials := e.fl.dialCount()
+			labels, meta := e.count(fake.OpSetLabels), e.count(fake.OpSetMetadata)
+			e.auto()
+			e.b = e.open()
+			e.idle()
+			e.sweep()
+			e.idle()
+
+			rec := e.b.snapshot(name, id)
+			if rec == nil || rec.Shed.Status != config.StatusStarting || rec.Job != state.JobCreate || rec.Shed.StatusReason != config.StatusReasonCloudUnreadable {
+				t.Fatalf("the record is %+v, want starting (%s) with its create kept", rec, config.StatusReasonCloudUnreadable)
+			}
+			if n := e.fl.dialCount() - dials; n != 0 {
+				t.Errorf("%d connections to the guest of an instance with another label schema, want none", n)
+			}
+			if n := e.count(fake.OpSetLabels) - labels; n != 0 {
+				t.Errorf("%d label writes, want none", n)
+			}
+			if n := e.count(fake.OpSetMetadata) - meta; n != 0 {
+				t.Errorf("%d metadata writes, want none", n)
+			}
+			if n := e.count(fake.OpDestroy) + e.count(fake.OpStop); n != 0 {
+				t.Errorf("%d stop or destroy calls, want none", n)
+			}
+			if n := markerCount(t, e.dir); n != 0 {
+				t.Errorf("%d delete markers, want none", n)
+			}
+			if e.instances() != 1 {
+				t.Fatalf("%d instances, want 1", e.instances())
+			}
+
+			// A server that reads the labels carries on.
+			sp.schema.Store(provider.SchemaVersion)
+			sp.listToo.Store(false)
+			e.sweep()
+			if got := e.settled(name); got.Status != config.StatusRunning || got.ID != id {
+				t.Fatalf("with readable labels came to rest %q (%q), want running", got.Status, got.StatusReason)
+			}
+		})
+	}
+}
+
 // nthGet is the fake with one chosen read of an instance made to fail.
 type nthGet struct {
 	*fake.Provider

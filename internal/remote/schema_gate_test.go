@@ -16,6 +16,19 @@ import (
 type schemaProvider struct {
 	*fake.Provider
 	schema atomic.Value
+	// listToo makes List report the other schema as well, as the cloud
+	// would: the labels are the instance's, whoever reads them.
+	listToo atomic.Bool
+}
+
+func (s *schemaProvider) List(ctx context.Context, sel provider.Selector) ([]provider.Instance, error) {
+	insts, err := s.Provider.List(ctx, sel)
+	if v, ok := s.schema.Load().(string); ok && err == nil && s.listToo.Load() {
+		for i := range insts {
+			insts[i].Labels[provider.LabelSchema] = v
+		}
+	}
+	return insts, err
 }
 
 func (s *schemaProvider) Get(ctx context.Context, ref provider.Ref) (provider.Instance, error) {

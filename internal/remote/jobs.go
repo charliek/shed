@@ -288,7 +288,8 @@ func isUnread(err error) bool {
 }
 
 // keep ends a create step that cannot decide what to do: the cloud did not
-// say what the instance is doing (a read failed). Giving the job up as failed is not an option. A
+// say what the instance is doing (a read failed), or showed labels this
+// server does not read. Giving the job up as failed is not an option. A
 // failed create is cleaned up by destroying its VM and a failed start by
 // stopping it, and the VM may be a finished shed, or one that runs. So
 // nothing is changed, in the cloud or in the guest, and the record keeps its
@@ -376,6 +377,16 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		case inst.Labels[provider.LabelID] != j.id || inst.Labels[provider.LabelEnv] != b.cfg.Environment:
 			err := fmt.Errorf("%w: instance %s is not this shed's", provider.ErrForeign, inst.Name)
 			return b.failCreate(j, err, config.StatusReasonCreateFailed)
+		case inst.Labels[provider.LabelSchema] != provider.SchemaVersion:
+			// Labelled by another version of the label set: reported and
+			// never touched (provider.LabelSchema). Checked here, before the
+			// guest is connected to, given credentials, cloned into and
+			// provisioned; the check before the ready label would come after
+			// all of that. Not failed either: the clean-up of a failed create
+			// leaves a marker that a server reading these labels would act
+			// on, and this may be a finished shed.
+			return b.keep(j, state.JobCreate, fmt.Errorf("instance %s carries label %s=%q and this server reads %q; leaving it alone",
+				inst.Name, provider.LabelSchema, inst.Labels[provider.LabelSchema], provider.SchemaVersion))
 		case inst.ShedState() == provider.ShedStateReady:
 			return b.resumeCommitted(ctx, j, inst)
 		default:
