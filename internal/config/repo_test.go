@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestExpandRepoShorthand(t *testing.T) {
 	tests := []struct {
@@ -111,6 +114,22 @@ func TestValidateGitRepoURL(t *testing.T) {
 			err := ValidateGitRepoURL(tt.input)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateGitRepoURL(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRepoDirNameErrorHidesCredentials: the refusal quotes the URL, and it
+// reaches logs and API replies.
+func TestRepoDirNameErrorHidesCredentials(t *testing.T) {
+	for _, repo := range []string{"https://user:s3cret@example.com/..", "https://s3cret@example.com/.git"} {
+		t.Run(repo, func(t *testing.T) {
+			_, err := RepoDirName(repo)
+			if err == nil {
+				t.Fatal("no error")
+			}
+			if strings.Contains(err.Error(), "s3cret") || !strings.Contains(err.Error(), "example.com") {
+				t.Errorf("error = %q, want the URL without its credentials", err)
 			}
 		})
 	}

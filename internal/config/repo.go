@@ -53,7 +53,9 @@ func RepoDirName(repo string) (string, error) {
 	}
 	s = strings.TrimSuffix(s, ".git")
 	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, "/\x00") {
-		return "", fmt.Errorf("cannot derive a directory name from repository URL %q", repo)
+		// The message reaches logs and API replies: never with the URL's
+		// credentials.
+		return "", fmt.Errorf("cannot derive a directory name from repository URL %q", SanitizeRepoURL(repo))
 	}
 	return s, nil
 }
