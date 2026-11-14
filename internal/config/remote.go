@@ -326,10 +326,28 @@ func EchoHost(u *url.URL) string {
 	return strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 }
 
+// notPublicIPv4 is the IPv4 space that is never a public source address:
+// "this network", the private ranges, carrier-grade NAT, loopback,
+// link-local, multicast and the reserved top. A shed's own address is in one
+// of the private ranges, so a rule that admits one of these may admit sheds
+// to each other.
+var notPublicIPv4 = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+}
+
 // ParseFirewallSources checks a list of firewall source ranges and returns
 // them in canonical form (the network address and its prefix length), sorted
 // and without repeats. Each entry must be an IPv4 CIDR. A range wider than a
-// /24, 0.0.0.0/0 included, is refused unless acknowledged. An empty list is
+// /24, 0.0.0.0/0 included, and a range in private or otherwise non-public
+// space are refused unless acknowledged. An empty list is
 // an error. key names where the list came from, for the message; an entry is
 // quoted only as the operator wrote it.
 func ParseFirewallSources(key string, entries []string, acknowledged bool) ([]string, error) {
@@ -344,6 +362,13 @@ func ParseFirewallSources(key string, entries []string, acknowledged bool) ([]st
 		prefix = prefix.Masked()
 		if prefix.Bits() < RemoteFirewallMinPrefix && !acknowledged {
 			return nil, fmt.Errorf("%s entry %q is wider than a /%d; name the server's own address, or set firewall.acknowledge_any: true to accept a range that wide", key, raw, RemoteFirewallMinPrefix)
+		}
+		if !acknowledged {
+			for _, np := range notPublicIPv4 {
+				if prefix.Overlaps(np) {
+					return nil, fmt.Errorf("%s entry %q is not public address space (it is within %s); sheds have private addresses, so a rule that admits a private range can admit one shed to another's SSH port. Name the server's public address, or set firewall.acknowledge_any: true to accept the range", key, raw, np)
+				}
+			}
 		}
 		if !seen[prefix] {
 			seen[prefix] = true

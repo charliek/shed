@@ -155,6 +155,18 @@ func TestRemoteValidate(t *testing.T) {
 		{"firewall static any address", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"0.0.0.0/0"}}
 		}, "wider than a /24"},
+		{"firewall static with the guest subnet", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"203.0.113.7/32", "10.10.0.0/24"}}
+		}, "not public address space"},
+		{"firewall static with one private address", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"192.168.1.5/32"}}
+		}, "not public address space"},
+		{"firewall static with carrier-grade NAT space", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"100.64.3.0/24"}}
+		}, "not public address space"},
+		{"firewall static with a private range, acknowledged", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"10.10.0.0/24"}, AcknowledgeAny: true}
+		}, ""},
 		{"firewall static wide range", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"203.0.113.7/32", "198.51.0.0/16"}}
 		}, "wider than a /24"},

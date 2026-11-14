@@ -210,7 +210,7 @@ remote: firewall check FAILED (mode static, reason rule_sources): firewall rule 
 | `auto` | The server's own public address, as one `/32` | Yes: only the rule's source ranges, only under the conditions below. |
 | `any` | Not compared | Never. |
 
-**static.** Set exactly one of `source_ranges` (a list in the config file) and `source_ranges_env` (the name of an environment variable holding the list, comma-separated). The variable keeps the address out of a config file that lives in a public repository; with neither set, the variable `SHED_REMOTE_SOURCE_RANGES` is read. The server refuses to start when the list is empty or holds anything but IPv4 CIDRs. A range wider than a `/24`, `0.0.0.0/0` included, is refused unless `acknowledge_any: true`.
+**static.** Set exactly one of `source_ranges` (a list in the config file) and `source_ranges_env` (the name of an environment variable holding the list, comma-separated). The variable keeps the address out of a config file that lives in a public repository; with neither set, the variable `SHED_REMOTE_SOURCE_RANGES` is read. The server refuses to start when the list is empty or holds anything but IPv4 CIDRs. A range wider than a `/24`, `0.0.0.0/0` included, is refused unless `acknowledge_any: true`. So is a range in private, carrier-grade NAT, loopback or link-local space: sheds have private addresses, so a rule that admits such a range can admit one shed to another's SSH port, and the server always connects to a shed's public address.
 
 ```yaml
 remote:
