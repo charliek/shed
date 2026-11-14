@@ -266,9 +266,15 @@ cat <<EOF
 #    shown. Give it to the server as GOOGLE_CREDENTIALS_BASE64 (the file's
 #    content) or SHED_GCE_CREDENTIALS_FILE (the path), then delete any
 #    other copy.
+#
+#    The file must not exist yet: an existing file would keep its own
+#    mode, whatever the umask. With noclobber the first redirect creates
+#    it (mode 0600) or stops the block before any key is made; '>|' then
+#    writes the file this block created.
 ########################################################################
-( umask 077 && gcloud iam service-accounts keys create /dev/stdout \\
-    --iam-account="$sa" --project="\$PROJECT" | base64 | tr -d '\\n' > $key_out )
+( umask 077 && set -o noclobber && : > $key_out && \\
+  gcloud iam service-accounts keys create /dev/stdout \\
+    --iam-account="$sa" --project="\$PROJECT" | base64 | tr -d '\\n' >| $key_out )
 
 ########################################################################
 # 7. Optional, recommended for a project that only runs sheds: stop new VMs

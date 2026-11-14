@@ -206,3 +206,85 @@ func samePermissions(t *testing.T, what string, got, want []string) {
 		t.Errorf("%s: the script's permissions differ from the Go list:\n got %v\nwant %v", what, got, want)
 	}
 }
+
+// TestSetupScriptKeyBlock runs the printed key block (and only it) against a
+// stand-in gcloud. A key file that already exists keeps its own mode whatever
+// the umask, so the block must stop before any key is made; a new file is
+// made readable by its owner only.
+func TestSetupScriptKeyBlock(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("no bash")
+	}
+	tests := []struct {
+		name       string
+		existing   bool
+		wantOK     bool
+		wantCalled bool
+		wantBody   string
+		wantMode   os.FileMode
+	}{
+		{name: "a new file", wantOK: true, wantCalled: true, wantBody: "a2V5LWpzb24K", wantMode: 0o600},
+		{name: "an existing file", existing: true, wantBody: "old", wantMode: 0o644},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			keyOut := filepath.Join(dir, "key.b64")
+			if !regexp.MustCompile(`^[-A-Za-z0-9_./~]+$`).MatchString(keyOut) {
+				t.Skipf("the temp path %q is not one --key-out accepts", keyOut)
+			}
+			if tt.existing {
+				if err := os.WriteFile(keyOut, []byte("old"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(keyOut, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := exec.Command("bash", setupScript, "--print", "--project", "example-project", "--env", "dev-box",
+				"--region", "us-central1", "--source-range", "192.0.2.10/32", "--key-out", keyOut).Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := string(out)
+			start := strings.Index(script, "( umask 077")
+			end := strings.Index(script, ">| "+keyOut+" )")
+			if start < 0 || end < start {
+				t.Fatalf("no key block in the printed script:\n%s", script)
+			}
+			block := script[start : end+len(">| "+keyOut+" )")]
+
+			stubDir := t.TempDir()
+			marker := filepath.Join(stubDir, "called")
+			stub := "#!/bin/sh\ntouch " + marker + "\necho key-json\n"
+			if err := os.WriteFile(filepath.Join(stubDir, "gcloud"), []byte(stub), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", "-c", block)
+			cmd.Env = append(os.Environ(), "PROJECT=example-project",
+				"PATH="+stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			runOut, runErr := cmd.CombinedOutput()
+			if (runErr == nil) != tt.wantOK {
+				t.Errorf("block ended with %v, want success %v\n%s", runErr, tt.wantOK, runOut)
+			}
+			_, statErr := os.Stat(marker)
+			if called := statErr == nil; called != tt.wantCalled {
+				t.Errorf("gcloud called = %v, want %v", called, tt.wantCalled)
+			}
+			body, err := os.ReadFile(keyOut)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != tt.wantBody {
+				t.Errorf("key file = %q, want %q", body, tt.wantBody)
+			}
+			info, err := os.Stat(keyOut)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != tt.wantMode {
+				t.Errorf("key file mode = %o, want %o", info.Mode().Perm(), tt.wantMode)
+			}
+		})
+	}
+}

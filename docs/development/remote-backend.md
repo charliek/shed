@@ -45,7 +45,7 @@ Use a documentation address such as `203.0.113.7/32` when you only want to read 
 | `--source-range` | Your machine's public address as a `/32`: the only source the firewall rule admits on port 22. |
 | `--subnet-range` | The subnet range (default `10.10.0.0/24`). |
 | `--role-id` | The custom role ID (default `shedServer`), shared by every environment in the project. |
-| `--key-out` | Where the base64 service account key is written, mode `0600`. |
+| `--key-out` | Where the base64 service account key is written, mode `0600`. The file must not exist yet: the printed block stops before making a key when it does. |
 | `--firewall-auto` | Also print the two extra roles `remote.firewall.mode: auto` needs. Leave it out for `static`, the dev default. |
 
 Read each printed block, then run it yourself. It enables the Compute Engine API and creates a custom-mode network and subnet, one firewall rule (tcp:22 from your address to the environment's tag), the custom role, a service account holding only that role, and its key. The printed text ends with the environment variables to set.
