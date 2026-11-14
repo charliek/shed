@@ -15,6 +15,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/provision"
+	"github.com/charliek/shed/internal/redact"
 	"github.com/charliek/shed/internal/retry"
 )
 
@@ -296,18 +297,25 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 	// Only the tail is kept: it is quoted in a failure, and a hook may print
 	// without end.
 	outputBuf := &tailBuffer{max: hookOutputTail}
-	multiWriter := io.MultiWriter(p.output, outputBuf)
+	// A hook's output goes to the server log, so URL credentials are
+	// redacted from it line by line, as git clone's are. The log file in the
+	// guest keeps the output as the hook printed it.
+	stdout, stderr := redact.NewWriter(p.output), redact.NewWriter(p.errOut)
+	multiWriter := io.MultiWriter(stdout, outputBuf)
 
 	opts := backend.ExecOptions{
 		Cmd:        []string{"bash", "--login", "-c", cmd},
 		Env:        env,
 		Stdout:     NopWriteCloser(multiWriter),
-		Stderr:     NopWriteCloser(p.errOut),
+		Stderr:     NopWriteCloser(stderr),
 		WorkingDir: p.workDir,
 		TTY:        false,
 	}
 
-	if err := p.agent.Exec(ctx, opts); err != nil {
+	err := p.agent.Exec(ctx, opts)
+	_ = stdout.Flush()
+	_ = stderr.Flush()
+	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("%s hook timed out after %v: %w", hookType, timeout, ctx.Err())
 		}
@@ -318,7 +326,7 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 			exitCode = exitErr.Code
 		}
 
-		lastOutput := getLastLines(outputBuf.String(), 5)
+		lastOutput := redact.String(getLastLines(outputBuf.String(), 5))
 		return &provision.HookError{
 			HookType:   hookType,
 			ExitCode:   exitCode,
