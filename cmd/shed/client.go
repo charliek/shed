@@ -1429,6 +1429,15 @@ func (c *APIClient) DeleteSnapshot(name string) error {
 	return c.doRequest(http.MethodDelete, "/api/snapshots/"+name, nil, nil, http.StatusNoContent, http.StatusOK)
 }
 
+// RefreshUsers asks the server to fetch its GitHub logins again (admin only).
+func (c *APIClient) RefreshUsers() (*config.UsersRefreshResponse, error) {
+	var resp config.UsersRefreshResponse
+	if err := c.doRequest(http.MethodPost, "/api/users/refresh", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // GetSystemDF retrieves disk usage information for the server.
 func (c *APIClient) GetSystemDF() (*config.DiskUsage, error) {
 	var du config.DiskUsage

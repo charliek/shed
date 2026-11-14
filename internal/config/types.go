@@ -569,6 +569,35 @@ type ShedsResponse struct {
 	Sheds []Shed `json:"sheds"`
 }
 
+// UsersRefreshResponse is returned by POST /api/users/refresh: one row per
+// GitHub login whose keys the server follows.
+type UsersRefreshResponse struct {
+	Logins []GitHubLoginRefresh `json:"logins"`
+}
+
+// GitHubLoginRefresh is one GitHub login's row in UsersRefreshResponse.
+type GitHubLoginRefresh struct {
+	// User is the user the login's keys belong to ("" for the implicit user
+	// of a server with no user list).
+	User string `json:"user"`
+	// Login is the GitHub login as configured.
+	Login string `json:"login"`
+	// Status is ok, pinned, unchanged, unreachable, mismatch, gone,
+	// pin-write-failed or invalid-login.
+	Status string `json:"status"`
+	// GitHubID is the account id the login is pinned to (0: none yet).
+	GitHubID int64 `json:"github_id,omitempty"`
+	// SeenID is, on a mismatch, the account the login names instead.
+	SeenID int64 `json:"seen_id,omitempty"`
+	// Keys is how many of the login's keys are accepted now.
+	Keys int `json:"keys"`
+	// Added and Removed are the key fingerprints this fetch added and removed.
+	Added   []string `json:"added,omitempty"`
+	Removed []string `json:"removed,omitempty"`
+	// Error says why the login is not ok, when it is not.
+	Error string `json:"error,omitempty"`
+}
+
 // SessionsResponse is returned by GET /api/sheds/{name}/sessions and GET /api/sessions.
 type SessionsResponse struct {
 	Sessions []Session `json:"sessions"`
@@ -1324,8 +1353,11 @@ type SSHAuthConfig struct {
 	AuthorizedKeys []string `yaml:"authorized_keys,omitempty"`
 	// AuthorizedKeysFile is a path to an authorized_keys-format file.
 	AuthorizedKeysFile string `yaml:"authorized_keys_file,omitempty"`
-	// GitHubUsers seeds the allowlist from https://github.com/<user>.keys,
-	// cached to disk and failing closed to the last-known-good cache.
+	// GitHubUsers seeds the allowlist from each login's GitHub account: the
+	// login is pinned to its numeric account id at its first good fetch, and
+	// keys come only from that id's key list on the GitHub REST API, cached
+	// to disk and failing closed to the last-known-good keys. Logins are
+	// case-insensitive; a login listed twice fails config load.
 	GitHubUsers []string `yaml:"github_users,omitempty"`
 	// GitHubRefresh is how often to re-fetch GitHub keys (default 1h).
 	GitHubRefresh Duration `yaml:"github_refresh,omitempty"`
@@ -1341,7 +1373,7 @@ type SSHAuthConfig struct {
 var githubUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
 
 // ValidGitHubUsername reports whether s is a syntactically valid GitHub
-// username (and, by construction, safe to interpolate into the .keys URL).
+// username (and, by construction, safe to interpolate into a GitHub URL).
 func ValidGitHubUsername(s string) bool { return githubUsernamePattern.MatchString(s) }
 
 // HomePath is the shed user's home directory inside the VM. Repos, --local-dir,

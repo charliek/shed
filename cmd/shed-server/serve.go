@@ -392,9 +392,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 	log.Printf("State dir: %s", stateDir)
 	hostKeyPath := filepath.Join(stateDir, "host_key")
 	githubCacheDir := filepath.Join(stateDir, "github_keys")
+	// Every GitHub fetch (the first, the scheduled refresh, `shed users
+	// refresh`, an unknown key's) is bound to refreshCtx, cancelled at
+	// shutdown so a fetch in flight ends then.
+	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
+	defer cancelRefresh()
+	// Each GitHub login is pinned to its numeric account id at its first good
+	// fetch, in the pin store next to the key cache.
 	userLookup, err := users.NewConfigLookup(users.ConfigOptions{
 		SSH:            cfg.EffectiveSSHAuth(),
 		GitHubCacheDir: githubCacheDir,
+		PinsPath:       filepath.Join(stateDir, users.PinsFileName),
+		Context:        refreshCtx,
 	})
 	if err != nil {
 		return fmt.Errorf("ssh auth: %w", err)
@@ -402,8 +411,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	log.Printf("SSH auth mode: %s", userLookup.Mode())
 
 	// Refresh GitHub-seeded keys in the background until shutdown.
-	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
-	defer cancelRefresh()
 	userLookup.StartRefresh(refreshCtx)
 
 	// The access guard: the one door both front doors call the backend
@@ -468,6 +475,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	apiServer.SetAuditLog(auditLog)               // nil-safe: records nothing when audit is off
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
+	apiServer.SetKeyRefresher(userLookup)         // `shed users refresh`, in every mode
 	if clientCA != nil {
 		// mtls: the middleware re-validates every request's client certificate
 		// against the LIVE user lookup, so removing an SSH key de-authorizes its
@@ -594,6 +602,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Stopping the max_age reaper...")
 	}
 	stopReaper()
+	// GitHub key fetches end now: none in flight outlives the shutdown.
+	cancelRefresh()
 
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()

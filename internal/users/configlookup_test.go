@@ -5,12 +5,10 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	gossh "golang.org/x/crypto/ssh"
@@ -90,19 +88,8 @@ func TestWarnEmptyIsAllowed(t *testing.T) {
 func TestGitHubSeedAndFailClosedToCache(t *testing.T) {
 	listed, listedLine := genKey(t)
 
-	var failFetch atomic.Bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if failFetch.Load() {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		_, _ = w.Write([]byte(listedLine))
-	}))
-	defer srv.Close()
-
-	orig := githubKeysBaseURL
-	githubKeysBaseURL = srv.URL
-	defer func() { githubKeysBaseURL = orig }()
+	gh := newFakeGitHub(t)
+	gh.set("octocat", 583231, listedLine)
 
 	cacheDir := t.TempDir()
 	a, err := NewConfigLookup(ConfigOptions{SSH: &config.SSHAuthConfig{
@@ -118,7 +105,8 @@ func TestGitHubSeedAndFailClosedToCache(t *testing.T) {
 
 	// GitHub now down: a rebuild must keep the cached key (fail closed),
 	// not drop it.
-	failFetch.Store(true)
+	gh.setAPIStatus(http.StatusInternalServerError, nil)
+	gh.setKeysStatus(http.StatusInternalServerError)
 	if err := a.rebuild(); err != nil {
 		t.Fatalf("rebuild should not error on github outage: %v", err)
 	}
@@ -220,18 +208,8 @@ func TestRebuildKeepsKeysOnFailedRefetch(t *testing.T) {
 	// A transient GitHub outage must never drop a key: the fail-closed fallback
 	// keeps the key set unchanged.
 	listed, listedLine := genKey(t)
-	var failFetch atomic.Bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if failFetch.Load() {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		_, _ = w.Write([]byte(listedLine))
-	}))
-	defer srv.Close()
-	orig := githubKeysBaseURL
-	githubKeysBaseURL = srv.URL
-	defer func() { githubKeysBaseURL = orig }()
+	gh := newFakeGitHub(t)
+	gh.set("octocat", 583231, listedLine)
 
 	a, err := NewConfigLookup(ConfigOptions{SSH: &config.SSHAuthConfig{
 		Mode:        config.SSHAuthEnforce,
@@ -241,7 +219,8 @@ func TestRebuildKeepsKeysOnFailedRefetch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	failFetch.Store(true)
+	gh.setAPIStatus(http.StatusInternalServerError, nil)
+	gh.setKeysStatus(http.StatusInternalServerError)
 	if err := a.rebuild(); err != nil {
 		t.Fatal(err)
 	}
@@ -255,16 +234,8 @@ func TestRebuildDropsAKeyGitHubNoLongerServes(t *testing.T) {
 	// the next successful fetch returns fewer keys → the dropped key leaves.
 	k1, line1 := genKey(t)
 	k2, line2 := genKey(t)
-	var served atomic.Pointer[string]
-	both := line1 + line2
-	served.Store(&both)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(*served.Load()))
-	}))
-	defer srv.Close()
-	orig := githubKeysBaseURL
-	githubKeysBaseURL = srv.URL
-	defer func() { githubKeysBaseURL = orig }()
+	gh := newFakeGitHub(t)
+	gh.set("octocat", 583231, line1+line2)
 
 	a, err := NewConfigLookup(ConfigOptions{SSH: &config.SSHAuthConfig{
 		Mode:        config.SSHAuthEnforce,
@@ -277,8 +248,7 @@ func TestRebuildDropsAKeyGitHubNoLongerServes(t *testing.T) {
 		t.Fatal("both keys should be authorized initially")
 	}
 
-	only1 := line1
-	served.Store(&only1)
+	gh.set("octocat", 583231, line1)
 	if err := a.rebuild(); err != nil {
 		t.Fatal(err)
 	}
@@ -305,18 +275,8 @@ func TestRebuildPrefersInMemoryOverStaleDiskCache(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var failFetch atomic.Bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if failFetch.Load() {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		_, _ = w.Write([]byte(line1 + line2)) // fresh: k1 + k2
-	}))
-	defer srv.Close()
-	orig := githubKeysBaseURL
-	githubKeysBaseURL = srv.URL
-	defer func() { githubKeysBaseURL = orig }()
+	gh := newFakeGitHub(t)
+	gh.set("octocat", 583231, line1+line2) // fresh: k1 + k2
 
 	a, err := NewConfigLookup(ConfigOptions{SSH: &config.SSHAuthConfig{Mode: config.SSHAuthEnforce, GitHubUsers: []string{"octocat"}}, GitHubCacheDir: cacheDir})
 	if err != nil {
@@ -330,7 +290,8 @@ func TestRebuildPrefersInMemoryOverStaleDiskCache(t *testing.T) {
 
 	// Transient failure: must use the in-memory last-known-good (k1+k2), not the
 	// stale disk cache (k1 only).
-	failFetch.Store(true)
+	gh.setAPIStatus(http.StatusInternalServerError, nil)
+	gh.setKeysStatus(http.StatusInternalServerError)
 	if err := a.rebuild(); err != nil {
 		t.Fatal(err)
 	}
@@ -425,20 +386,9 @@ func TestKeysReportTheirSource(t *testing.T) {
 	if err := os.WriteFile(keysFile, []byte(fileData), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/octocat.keys":
-			_, _ = w.Write([]byte(octoLine + sharedLine))
-		case "/hubot.keys":
-			_, _ = w.Write([]byte(hubotLine + octoLine))
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer srv.Close()
-	orig := githubKeysBaseURL
-	githubKeysBaseURL = srv.URL
-	defer func() { githubKeysBaseURL = orig }()
+	gh := newFakeGitHub(t)
+	gh.set("octocat", 583231, octoLine+sharedLine)
+	gh.set("hubot", 480938, hubotLine+octoLine)
 
 	a, err := NewConfigLookup(ConfigOptions{SSH: &config.SSHAuthConfig{
 		Mode:               config.SSHAuthEnforce,
@@ -513,13 +463,8 @@ func TestImplicitUserIsTheOnlyUser(t *testing.T) {
 // serialize on the per-login last-known-good map.
 func TestRebuildRacesLookups(t *testing.T) {
 	key, line := genKey(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(line))
-	}))
-	defer srv.Close()
-	orig := githubKeysBaseURL
-	githubKeysBaseURL = srv.URL
-	defer func() { githubKeysBaseURL = orig }()
+	gh := newFakeGitHub(t)
+	gh.set("octocat", 583231, line)
 
 	a, err := NewConfigLookup(ConfigOptions{SSH: &config.SSHAuthConfig{
 		Mode:        config.SSHAuthEnforce,

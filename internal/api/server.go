@@ -30,6 +30,9 @@ type Server struct {
 	// middleware, which re-checks a presented client certificate's Subject CN
 	// on every request. nil until SetUserLookup; nil authorizes nothing.
 	users users.Lookup
+	// keyRefresher fetches the GitHub logins again for POST
+	// /api/users/refresh. nil until SetKeyRefresher.
+	keyRefresher users.Refresher
 	// caFingerprint / caNotAfter describe the internal client CA, reported on
 	// /api/info in mtls mode so an operator can confirm which CA this server
 	// trusts and when it must be rotated. Zero values in every other mode.
@@ -216,6 +219,9 @@ func (s *Server) Router() chi.Router {
 				r.With(egressWrite).Delete("/", s.handleEgressOff)
 			})
 		})
+
+		// Users: fetch the GitHub logins again (admin only; control scope).
+		r.Post("/users/refresh", s.handleUsersRefresh)
 
 		// Plugins / Extensions (the credential bus)
 		r.Route("/plugins", func(r chi.Router) {

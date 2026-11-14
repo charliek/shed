@@ -14,7 +14,10 @@
 // without losing that.
 package users
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // ImplicitName is the implicit user's name: the empty string. It is the name a
 // record, a principal and a binding carry on a server with no user list.
@@ -92,6 +95,88 @@ type Lookup interface {
 	User(name string) (User, bool)
 	// Users lists every user, sorted by name.
 	Users() []User
+}
+
+// Refresher is a Lookup whose keys come partly from GitHub logins, which it
+// can be told to fetch again at once (`shed users refresh`).
+type Refresher interface {
+	// Refresh fetches every GitHub login again, checking each against its
+	// pinned account id, and reports what it found. It joins a fetch that
+	// has not started yet, and otherwise starts one after any fetch already
+	// running, so its result is never older than the call. It returns when
+	// the fetch ends or ctx ends, whichever is first.
+	Refresh(ctx context.Context) (RefreshReport, error)
+}
+
+// UnknownKeyRefetcher is a Lookup that can look for a key it does not know
+// on GitHub, at most once a minute for the whole server. The SSH front door
+// asks it, in enforce mode only, when an unknown key logs in as `_bootstrap`
+// or as a name that is a valid shed name.
+type UnknownKeyRefetcher interface {
+	// RefetchForUnknownKey takes the server-wide slot (one a minute) before
+	// doing anything else; when it gets it, it starts a fetch on behalf of
+	// the unknown key with this fingerprint, waits up to five seconds for
+	// it, and reports whether the key is known (and not expired)
+	// afterwards. Every other call returns false at once, having started
+	// nothing and waited for nothing: while the slot is used, for a key
+	// dropped because its GitHub login no longer names its pinned account,
+	// and outside enforce mode.
+	RefetchForUnknownKey(ctx context.Context, fingerprint string) bool
+}
+
+// RefreshReport is what one fetch of the GitHub logins found.
+type RefreshReport struct {
+	// Logins has one row per configured GitHub login, in config order.
+	Logins []LoginRefresh
+}
+
+// Login refresh statuses (LoginRefresh.Status).
+const (
+	// RefreshOK: the login named its pinned account; its keys are current.
+	RefreshOK = "ok"
+	// RefreshPinned: the login had no pin and is now pinned to the account
+	// it named.
+	RefreshPinned = "pinned"
+	// RefreshUnchanged: a check made for an unknown key found the login's
+	// keys as they were; the account was not asked about.
+	RefreshUnchanged = "unchanged"
+	// RefreshUnreachable: GitHub could not be asked (network, an error, a
+	// rate limit) or answered inconsistently. The last known keys stay and
+	// nothing new is accepted.
+	RefreshUnreachable = "unreachable"
+	// RefreshMismatch: the login names another account than its pin, or
+	// none. Its keys are dropped until it names the pinned account again.
+	RefreshMismatch = "mismatch"
+	// RefreshGone: a login with no pin names no account. It has no keys.
+	RefreshGone = "gone"
+	// RefreshPinWriteFailed: the fetch was good but the pin store could not
+	// be written, so nothing new is accepted (keys GitHub stopped listing
+	// still leave).
+	RefreshPinWriteFailed = "pin-write-failed"
+	// RefreshInvalidLogin: the configured login is not a valid GitHub login
+	// and is never fetched.
+	RefreshInvalidLogin = "invalid-login"
+)
+
+// LoginRefresh is one GitHub login's row in a RefreshReport.
+type LoginRefresh struct {
+	// User is the name of the user the login's keys belong to.
+	User string
+	// Login is the GitHub login as configured.
+	Login string
+	// Status is one of the Refresh* statuses.
+	Status string
+	// PinnedID is the account id the login is pinned to; 0 for none.
+	PinnedID int64
+	// SeenID is, on a mismatch, the account the login names instead (0 when
+	// it names none).
+	SeenID int64
+	// Keys is how many of the login's keys are accepted after the fetch.
+	Keys int
+	// Added and Removed are the fingerprints the fetch added and removed.
+	Added, Removed []string
+	// Error says why the login is not ok, when it is not.
+	Error string
 }
 
 // HasKey reports whether l resolves the fingerprint to a user. It is the one

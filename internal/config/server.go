@@ -406,10 +406,17 @@ func (c *ServerConfig) validateAuth() error {
 		if ssh.MaxAuthTries < 0 {
 			return fmt.Errorf("invalid auth.ssh.max_auth_tries: %d", ssh.MaxAuthTries)
 		}
+		// GitHub logins are case-insensitive: two spellings of one login are
+		// one account, pinned once, so a list naming it twice is refused.
+		seenLogins := make(map[string]string, len(ssh.GitHubUsers))
 		for _, u := range ssh.GitHubUsers {
 			if !ValidGitHubUsername(u) {
 				return fmt.Errorf("invalid auth.ssh.github_users entry: %q", u)
 			}
+			if first, dup := seenLogins[strings.ToLower(u)]; dup {
+				return fmt.Errorf("auth.ssh.github_users lists %q and %q, which are the same GitHub login (logins are case-insensitive); list it once", first, u)
+			}
+			seenLogins[strings.ToLower(u)] = u
 		}
 		// certs ⟺ TLS ⟺ mtls: SSH enforce is the mtls posture. An explicit enforce on an open-mode server is rejected (warn
 		// stages an allowlist on a trusted network); an enforced mode forces

@@ -217,6 +217,16 @@ func TestCrossFieldAuthValidation(t *testing.T) {
 			wantErr: "",
 		},
 		{
+			name:    "github_users naming one login twice rejected",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{GitHubUsers: []string{"octocat", "hubot", "OctoCat"}}}},
+			wantErr: `auth.ssh.github_users lists "octocat" and "OctoCat"`,
+		},
+		{
+			name:    "github_users distinct logins ok",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{GitHubUsers: []string{"octocat", "hubot"}}}},
+			wantErr: "",
+		},
+		{
 			name:    "mtls + https_port ok",
 			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8443, Auth: &AuthConfig{Mode: AuthModeMTLS}},
 			wantErr: "",

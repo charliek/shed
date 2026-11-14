@@ -283,6 +283,10 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	}
 
 	authorized := s.keyAuth.known(fingerprint)
+	if !authorized && s.refetchUnknownKey(ctx, user, fingerprint) {
+		log.Printf("SSH auth: key %s is known after fetching the GitHub logins again", fingerprint)
+		authorized = true
+	}
 	if s.keyAuth.enforced() && !authorized {
 		log.Printf("SSH auth DENIED: user=%s fingerprint=%s", user, fingerprint)
 		return false
@@ -294,6 +298,31 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 		log.Printf("SSH auth WOULD DENY (warn mode): user=%s fingerprint=%s", user, fingerprint)
 	}
 	return true
+}
+
+// refetchUnknownKey asks the user lookup to look for a key it does not know on
+// GitHub, and reports whether the key is known afterwards. Only in enforce
+// mode (warn lets the key in anyway; off looks nothing up), only when the
+// lookup can fetch (a users.UnknownKeyRefetcher), and only when the login is
+// `_bootstrap` (`shed server add`) or a valid shed name. That check is on the
+// name's syntax alone: nothing about sheds is looked up for a peer that has
+// not authenticated. The lookup then allows one fetch a minute for the whole
+// server, checked before it does anything else; only the login that takes
+// that slot waits for the fetch (up to five seconds), every other returns at
+// once. A key the lookup knows (an expired one included) never gets here, and
+// the lookup refuses a key it dropped for a GitHub account mismatch.
+func (s *Server) refetchUnknownKey(ctx ssh.Context, user, fingerprint string) bool {
+	if !s.keyAuth.enforced() {
+		return false
+	}
+	if user != reservedBootstrapUser && config.ValidateShedName(user) != nil {
+		return false
+	}
+	r, ok := s.keyAuth.Users.(users.UnknownKeyRefetcher)
+	if !ok {
+		return false
+	}
+	return r.RefetchForUnknownKey(ctx, fingerprint)
 }
 
 // localForwardChannelData matches RFC4254 Section 7.2
