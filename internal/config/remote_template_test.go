@@ -10,31 +10,32 @@ import (
 
 const devRemoteTemplate = "../../configs/server.dev-remote.yaml.tmpl"
 
-// TestDevRemoteTemplate keeps configs/server.dev-remote.yaml.tmpl loadable,
-// in the static mode it ships with and with its commented auto mode switched
-// on, and free of any address.
+// TestDevRemoteTemplate keeps configs/server.dev-remote.yaml.tmpl loadable
+// in both firewall modes `make dev-server-up-remote` renders it in, and free
+// of any address. The replacements are the Make target's own: a static
+// render names the variable, an auto render lists SHED_REMOTE_ECHO_URLS as a
+// flow sequence.
 func TestDevRemoteTemplate(t *testing.T) {
 	raw, err := os.ReadFile(devRemoteTemplate)
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	rendered := strings.NewReplacer("@DEV_REMOTE_DIR@", dir, "@SHED_REMOTE_ENV@", "dev-box", "@GITHUB_USER@", "example").Replace(string(raw))
-
-	// Switch the commented auto block on, the way its comment says to.
-	auto := rendered
-	for _, r := range []struct{ old, new string }{
-		{"    mode: static\n", ""},
-		{"    source_ranges_env: SHED_REMOTE_SOURCE_RANGES\n", ""},
-		{"    # mode: auto\n", "    mode: auto\n"},
-		{"    # echo_urls:\n", "    echo_urls:\n"},
-		{"    #   - https://<first-echo-service>/\n", "      - https://echo-one.example/\n"},
-		{"    #   - https://<second-echo-service>/\n", "      - https://echo-two.example/\n"},
-	} {
-		if !strings.Contains(auto, r.old) {
-			t.Fatalf("the template lacks the line %q", r.old)
+	for _, placeholder := range []string{"    mode: @FIREWALL_MODE@\n", "    @FIREWALL_SETTING@\n"} {
+		if strings.Count(string(raw), placeholder) != 1 {
+			t.Fatalf("the template must hold the line %q exactly once", placeholder)
 		}
-		auto = strings.Replace(auto, r.old, r.new, 1)
+	}
+	render := func(mode, setting string) string {
+		return strings.NewReplacer("@DEV_REMOTE_DIR@", dir, "@SHED_REMOTE_ENV@", "dev-box", "@GITHUB_USER@", "example",
+			"@FIREWALL_MODE@", mode, "@FIREWALL_SETTING@", setting).Replace(string(raw))
+	}
+	rendered := render("static", "source_ranges_env: SHED_REMOTE_SOURCE_RANGES")
+	auto := render("auto", "echo_urls: [https://echo-one.example/, https://echo-two.example/]")
+	for name, y := range map[string]string{"static": rendered, "auto": auto} {
+		if strings.Contains(y, "@") && regexp.MustCompile(`@[A-Z_]+@`).MatchString(y) {
+			t.Fatalf("the %s render still holds a placeholder", name)
+		}
 	}
 
 	tests := []struct {
@@ -42,9 +43,9 @@ func TestDevRemoteTemplate(t *testing.T) {
 		yaml string
 		want RemoteFirewallConfig
 	}{
-		{"as shipped: static, sources from a variable", rendered,
+		{"static, the default: sources from a variable", rendered,
 			RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRangesEnv: "SHED_REMOTE_SOURCE_RANGES"}},
-		{"auto switched on", auto,
+		{"auto: echo services from the env file", auto,
 			RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://echo-one.example/", "https://echo-two.example/"}}},
 	}
 	for _, tt := range tests {

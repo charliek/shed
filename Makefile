@@ -689,7 +689,10 @@ dev-server-restart-fc: dev-server-down-fc dev-server-up-fc
 # from $(SHED_REMOTE_ENV_FILE) (VAR=value lines): SHED_REMOTE_ENV (the
 # environment name), SHED_GCE_PROJECT, SHED_GCE_ZONE, SHED_GCE_NETWORK,
 # SHED_GCE_SUBNET, SHED_GCE_CREDENTIALS_FILE, SHED_REMOTE_SSH_KEY_FILE and
-# SHED_REMOTE_SOURCE_RANGES (the firewall rule's source ranges).
+# SHED_REMOTE_SOURCE_RANGES (the firewall rule's source ranges). Two more
+# choose the firewall mode: SHED_REMOTE_FIREWALL_MODE (static, the default,
+# or auto) and, for auto, SHED_REMOTE_ECHO_URLS (two or more https echo
+# services on different hosts, comma-separated).
 # The config is rendered from configs/server.dev-remote.yaml.tmpl on every
 # start; edit the template, not the rendered file.
 SHED_REMOTE_ENV_FILE    ?= $(HOME)/.config/shed/remote-dev/env
@@ -735,10 +738,27 @@ dev-server-up-remote: build-server build-cli
 	  echo "ERROR: set SHED_REMOTE_GITHUB_USER (the GitHub account whose SSH keys may enrol a CLI)."; \
 	  exit 1; \
 	fi; \
+	FW_MODE="$${SHED_REMOTE_FIREWALL_MODE:-static}"; \
+	case "$$FW_MODE" in \
+	  static) FW_SETTING="source_ranges_env: SHED_REMOTE_SOURCE_RANGES" ;; \
+	  auto) \
+	    case "$$SHED_REMOTE_ECHO_URLS" in \
+	      ""|*[!A-Za-z0-9:/._,-]*) \
+	        echo "ERROR: SHED_REMOTE_FIREWALL_MODE=auto needs SHED_REMOTE_ECHO_URLS in $(SHED_REMOTE_ENV_FILE):"; \
+	        echo "       two or more https echo services on different hosts, comma-separated, no spaces."; \
+	        exit 1 ;; \
+	    esac; \
+	    FW_SETTING="echo_urls: [$$(printf '%s' "$$SHED_REMOTE_ECHO_URLS" | sed 's/,/, /g')]" ;; \
+	  *) \
+	    echo "ERROR: SHED_REMOTE_FIREWALL_MODE is '$$FW_MODE'; want static or auto."; \
+	    exit 1 ;; \
+	esac; \
 	umask 077; \
 	sed -e "s|@DEV_REMOTE_DIR@|$(REMOTE_DEV_DIR)|g" \
 	    -e "s|@SHED_REMOTE_ENV@|$$SHED_REMOTE_ENV|g" \
 	    -e "s|@GITHUB_USER@|$$GITHUB_USER|g" \
+	    -e "s|@FIREWALL_MODE@|$$FW_MODE|g" \
+	    -e "s|@FIREWALL_SETTING@|$$FW_SETTING|g" \
 	    "$(REMOTE_DEV_TEMPLATE)" > "$(REMOTE_DEV_CONFIG)" || exit 1; \
 	echo "=== dev-server-up-remote $$(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$(REMOTE_DEV_LOG_PATH)"; \
 	START_LINE=$$(wc -l < "$(REMOTE_DEV_LOG_PATH)"); \

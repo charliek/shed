@@ -1,7 +1,7 @@
 # Shed Server — Parallel Dev Configuration (remote backend)
 #
 # A TEMPLATE, not a config: `make dev-server-up-remote` renders it to
-# ~/.shed/dev-remote/server.yaml, replacing the three @...@ placeholders, and
+# ~/.shed/dev-remote/server.yaml, replacing the @...@ placeholders, and
 # runs the dev build with it. Nothing private lives here. The cloud project,
 # zone, network, subnet, credentials, SSH client key and the firewall rule's
 # source ranges are read from the process environment at start-up through the
@@ -83,21 +83,27 @@ remote:
   # and refuses creates and starts (503 FIREWALL_CHECK_FAILED) while the rule
   # or its network is not as scripts/remote/gce-setup.sh made it.
   firewall:
-    # static: the rule's source ranges must equal the comma-separated list in
-    # this variable (your public address as a /32). The address stays in the
-    # private env file, never here. The server only reads the rule.
-    mode: static
-    source_ranges_env: SHED_REMOTE_SOURCE_RANGES
-    # auto, for a machine whose public address changes: the server asks the
-    # echo services for its address and, when two agree, patches the rule's
-    # sources to that one /32. It needs the extra roles that
-    # `gce-setup.sh --print --firewall-auto` prints. Use instead of the two
-    # lines above; name at least two https services you trust that answer
-    # with the caller's IPv4 address as plain text.
-    # mode: auto
-    # echo_urls:
-    #   - https://<first-echo-service>/
-    #   - https://<second-echo-service>/
+    # `make dev-server-up-remote` renders the two lines after this comment
+    # from the private env file, so neither an address nor a service you
+    # trust is named here.
+    #
+    # static (the default): the rule's source ranges must equal the
+    # comma-separated list in SHED_REMOTE_SOURCE_RANGES (your public address
+    # as a /32). The server only reads the rule. Rendered as
+    #   mode: static
+    #   source_ranges_env: SHED_REMOTE_SOURCE_RANGES
+    #
+    # auto (SHED_REMOTE_FIREWALL_MODE=auto), for a machine whose public
+    # address changes: the server asks the echo services for its address
+    # and, when two agree, patches the rule's sources to that one /32. It
+    # needs the extra roles that `gce-setup.sh --print --firewall-auto`
+    # prints, and SHED_REMOTE_ECHO_URLS: two or more https services you
+    # trust, on different hosts, comma-separated, that answer with the
+    # caller's IPv4 address as plain text. Rendered as
+    #   mode: auto
+    #   echo_urls: [https://<first-echo-service>/, https://<second-echo-service>/]
+    mode: @FIREWALL_MODE@
+    @FIREWALL_SETTING@
   gce:
     project_env: SHED_GCE_PROJECT
     zone_env: SHED_GCE_ZONE
