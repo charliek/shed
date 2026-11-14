@@ -3,8 +3,11 @@ package vmutil
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
+	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/charliek/shed/internal/agentproto"
@@ -63,5 +66,60 @@ func TestCloneRepoOwnedShedGetsNoServerEnv(t *testing.T) {
 	admin := cloneEnvSeen(t, false)
 	if !slices.Contains(admin, "GITHUB_TOKEN=sentinel-server-secret") || !slices.Contains(admin, "HTTPS_PROXY=http://10.0.0.1:3128") {
 		t.Errorf("admin shed's clone env = %v, want the server env and the egress env", admin)
+	}
+}
+
+// TestCloneRepoRedactsOnlyTheLog: a clone URL with credentials reaches the
+// guest's git unchanged, while git's output on its way to the server log has
+// the credentials replaced.
+func TestCloneRepoRedactsOnlyTheLog(t *testing.T) {
+	const repo = "https://user:sentinel-token@github.com/example/repo.git"
+	argvs := make(chan []string, 1)
+	dialer := &pipeDialer{handler: func(conn net.Conn) {
+		defer conn.Close()
+		msgType, data, err := agentproto.ReadMessage(conn)
+		if err != nil || msgType != agentproto.MsgTypeExecRequest {
+			return
+		}
+		var req agentproto.ExecRequest
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		argvs <- req.Cmd
+		_, _, _ = agentproto.ReadMessage(conn) // stdin EOF
+		_ = agentproto.WriteStderr(conn, []byte("fatal: unable to access '"+repo+"': 403\n"))
+		_ = agentproto.WriteExitCode(conn, 128)
+	}}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stderr
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = saved })
+	logged := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		logged <- string(b)
+	}()
+
+	agent := NewAgentClient(dialer, 1024, 1026)
+	cloneErr := CloneRepo(context.Background(), agent, &config.ServerConfig{}, repo, true, nil)
+	os.Stderr = saved
+	_ = w.Close()
+	out := <-logged
+
+	if cloneErr == nil || strings.Contains(cloneErr.Error(), "sentinel-token") {
+		t.Errorf("CloneRepo error = %v, want a failure without the credential", cloneErr)
+	}
+	if got := <-argvs; !slices.Equal(got, []string{"git", "clone", repo, "repo"}) {
+		t.Errorf("guest ran %q, want the URL as given", got)
+	}
+	if strings.Contains(out, "sentinel-token") {
+		t.Errorf("server log carries the credential: %q", out)
+	}
+	if !strings.Contains(out, "https://REDACTED@github.com/example/repo.git") {
+		t.Errorf("server log = %q, want git's line with the URL redacted", out)
 	}
 }

@@ -39,11 +39,12 @@ func TestSanitizeRepoURL(t *testing.T) {
 	}{
 		{name: "empty", input: "", want: ""},
 		{name: "git@ unchanged", input: "git@github.com:charliek/prox.git", want: "git@github.com:charliek/prox.git"},
-		{name: "ssh:// with username unchanged", input: "ssh://git@host/path", want: "ssh://git@host/path"},
+		{name: "ssh:// username redacted", input: "ssh://git@host/path", want: "ssh://REDACTED@host/path"},
 		{name: "https no userinfo unchanged", input: "https://github.com/charliek/prox.git", want: "https://github.com/charliek/prox.git"},
-		{name: "https with username only unchanged", input: "https://user@host/repo.git", want: "https://user@host/repo.git"},
-		{name: "https with password stripped", input: "https://user:pw@host/repo.git", want: "https://user@host/repo.git"},
-		{name: "https with empty password stripped", input: "https://user:@host/repo.git", want: "https://user@host/repo.git"},
+		{name: "https token as username redacted", input: "https://ghp_token@host/repo.git", want: "https://REDACTED@host/repo.git"},
+		{name: "https with password redacted", input: "https://user:pw@host/repo.git", want: "https://REDACTED@host/repo.git"},
+		{name: "https with empty password redacted", input: "https://user:@host/repo.git", want: "https://REDACTED@host/repo.git"},
+		{name: "not re-encoded", input: "https://u:p@host/a%2Fb repo", want: "https://REDACTED@host/a%2Fb repo"},
 		{name: "malformed url passes through", input: "not a url", want: "not a url"},
 	}
 	for _, tt := range tests {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/redact"
 )
 
 // CloneRepo clones a git repository into the VM's home directory at
@@ -47,17 +48,23 @@ func CloneRepo(ctx context.Context, agent *AgentClient, serverCfg *config.Server
 	}
 	env = append(env, extraEnv...)
 
+	// git's output goes to the server log, so URL credentials are redacted
+	// from it line by line. The command itself gets repo as given.
 	var output strings.Builder
+	stdout, stderr := redact.NewWriter(os.Stdout), redact.NewWriter(os.Stderr)
 	opts := backend.ExecOptions{
 		Cmd:        []string{"git", "clone", repo, dirName},
 		Env:        env,
-		Stdout:     NopWriteCloser(io.MultiWriter(&output, os.Stdout)),
-		Stderr:     NopWriteCloser(io.MultiWriter(&output, os.Stderr)),
+		Stdout:     NopWriteCloser(io.MultiWriter(&output, stdout)),
+		Stderr:     NopWriteCloser(io.MultiWriter(&output, stderr)),
 		WorkingDir: config.HomePath,
 		TTY:        false,
 	}
 
-	if err := agent.Exec(ctx, opts); err != nil {
+	err = agent.Exec(ctx, opts)
+	_ = stdout.Flush()
+	_ = stderr.Flush()
+	if err != nil {
 		return fmt.Errorf("git clone failed: %w", err)
 	}
 

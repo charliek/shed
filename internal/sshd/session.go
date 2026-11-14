@@ -12,6 +12,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/provision"
+	"github.com/charliek/shed/internal/redact"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -188,7 +189,9 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *co
 		ResizeChan:  resizeChan,
 	}
 
-	log.Printf("Executing in shed %s: tty=%v cmd=%v", shed.Name, isPTY, cmd)
+	// URL credentials in the command are redacted from the log; env is never
+	// logged.
+	log.Printf("Executing in shed %s: tty=%v cmd=%v", shed.Name, isPTY, redact.Args(cmd))
 
 	return s.backend.Exec(ctx, shed.Name, opts)
 }
