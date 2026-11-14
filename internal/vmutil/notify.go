@@ -108,20 +108,23 @@ func (nc *NotifyConn) connectAndListen(handler NotifyHandler) (connected bool, e
 	}
 	defer conn.Close()
 
-	if err := handler.OnConnect(conn); err != nil {
-		return false, fmt.Errorf("handler OnConnect failed: %w", err)
-	}
-
 	// Per-connection context — canceling this unblocks the close-helper
 	// goroutine when connectAndListen returns.
 	connCtx, connCancel := context.WithCancel(nc.ctx)
 	defer connCancel()
 
 	// Close the connection when context is canceled so ReadMessage unblocks.
+	// It is installed before OnConnect: the handshake OnConnect writes can
+	// block for as long as the far end likes (a guest that accepts the
+	// connection and never reads), and Stop must end that write too.
 	go func() {
 		<-connCtx.Done()
 		conn.Close()
 	}()
+
+	if err := handler.OnConnect(conn); err != nil {
+		return false, fmt.Errorf("handler OnConnect failed: %w", err)
+	}
 
 	for {
 		msgType, data, err := agentproto.ReadMessage(conn)

@@ -208,6 +208,14 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 			r.Ref = inst.Ref
 			b.saveLocked(r)
 		}
+		if r.Job == state.JobCreate && !r.Ready && inst.ShedState() == provider.ShedStateReady {
+			// The create's last cloud write landed and its last local one
+			// did not. It is a finished shed: resuming the create could
+			// only end in the clean-up of a failed one, which destroys
+			// the VM and its disk.
+			b.commitCreatedLocked(r, inst)
+			note("shed %s is labelled %s and its record still held the create; recording it %s", name, provider.ShedStateReady, r.Shed.Status)
+		}
 		switch r.Shed.Status {
 		case config.StatusStarting, config.StatusStopping:
 			kind := r.Job

@@ -68,7 +68,9 @@ func DialService(ctx context.Context, d Dialer, tcpProxyPort uint32, servicePort
 		reader = bufio.NewReader(conn)
 	}
 
-	response, err := reader.ReadString('\n')
+	// Bounded: the reply is one short line, and the far end is a guest. A
+	// proxy that never sends the newline must not grow this read without end.
+	response, err := readLineBounded(reader, maxProxyReplyLine)
 	if err != nil {
 		return handshakeFailed("read CONNECT response", err)
 	}
@@ -92,4 +94,23 @@ func DialService(ctx context.Context, d Dialer, tcpProxyPort uint32, servicePort
 	// handshake-buffered reader first. Close/CloseWrite forward to conn, which
 	// on FC chains through the inner BufferedConn to the underlying net.Conn.
 	return &BufferedConn{Conn: conn, Reader: reader}, nil
+}
+
+// readLineBounded reads through the next newline, and fails once more than
+// limit bytes have arrived without one. It never reads past the newline.
+func readLineBounded(r *bufio.Reader, limit int) (string, error) {
+	var line []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		line = append(line, b)
+		if b == '\n' {
+			return string(line), nil
+		}
+		if len(line) >= limit {
+			return "", fmt.Errorf("no newline in the first %d bytes of the reply", limit)
+		}
+	}
 }
