@@ -19,6 +19,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/charliek/shed/internal/remote/provider"
 )
 
 // fakeCompute is an httptest server that speaks enough of the Compute v1 API,
@@ -109,6 +111,7 @@ type fOp struct {
 	name, opType, target string
 	status               string
 	remaining            int
+	global               bool   // a global operation (a firewall patch)
 	apply                func() // effect on success, run under mu
 	rollback             func() // effect on failure, run under mu
 	errs                 []fOpErr
@@ -250,6 +253,8 @@ var (
 	reNetwork    = regexp.MustCompile(`^projects/([^/]+)/global/networks/([^/]+)$`)
 	reSubnet     = regexp.MustCompile(`^projects/([^/]+)/regions/([^/]+)/subnetworks/([^/]+)$`)
 	reFirewalls  = regexp.MustCompile(`^projects/([^/]+)/global/firewalls$`)
+	reFirewall   = regexp.MustCompile(`^projects/([^/]+)/global/firewalls/([^/]+)$`)
+	reGlobalWait = regexp.MustCompile(`^projects/([^/]+)/global/operations/([^/]+)/wait$`)
 	reLabelEq    = regexp.MustCompile(`^labels\.([a-z0-9_-]+) = "([^"]*)"$`)
 )
 
@@ -291,9 +296,30 @@ func (f *fakeCompute) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case reGlobalWait.MatchString(path):
+		// A global operation is waited on at the global URL only; a zone
+		// operation is not found there, and the other way round.
+		op, ok := f.ops[reGlobalWait.FindStringSubmatch(path)[2]]
+		if !ok || !op.global {
+			f.apiErr(w, 404, "notFound", "The resource 'operation' was not found")
+			return
+		}
+		if op.status != "DONE" {
+			if op.remaining > 0 {
+				op.remaining--
+			} else {
+				f.finishLocked(op)
+			}
+		}
+		f.writeJSON(w, 200, f.opJSON(op))
+	case reFirewall.MatchString(path):
+		f.patchFirewall(w, r, reFirewall.FindStringSubmatch(path)[2], body)
 	case reOpWait.MatchString(path):
 		m := reOpWait.FindStringSubmatch(path)
 		op, ok := f.ops[m[3]]
+		if ok && op.global {
+			ok = false
+		}
 		if !ok {
 			f.apiErr(w, 404, "notFound", "The resource 'operation' was not found")
 			return
@@ -574,6 +600,9 @@ func (f *fakeCompute) opJSON(op *fOp) map[string]any {
 		"status":        op.status,
 		"targetLink":    op.target,
 	}
+	if op.global {
+		delete(out, "zone")
+	}
 	if op.status == "DONE" && len(op.errs) > 0 {
 		var errs []any
 		for _, e := range op.errs {
@@ -599,6 +628,7 @@ func (f *fakeCompute) startOp(w http.ResponseWriter, r *http.Request, opType, ta
 		apply:     apply,
 		rollback:  rollback,
 	}
+	op.global = reFirewall.MatchString(strings.TrimPrefix(r.URL.Path, "/compute/v1/"))
 	if q := f.failOps[opType]; len(q) > 0 {
 		op.errs = []fOpErr{q[0]}
 		f.failOps[opType] = q[1:]
@@ -611,6 +641,31 @@ func (f *fakeCompute) startOp(w http.ResponseWriter, r *http.Request, opType, ta
 		f.finishLocked(op)
 	}
 	f.writeJSON(w, 200, f.opJSON(op))
+}
+
+// patchFirewall is firewalls.patch: a JSON merge patch of one rule, applied
+// when its global operation finishes.
+func (f *fakeCompute) patchFirewall(w http.ResponseWriter, r *http.Request, name string, body []byte) {
+	if r.Method != http.MethodPatch {
+		f.apiErr(w, 405, "methodNotAllowed", "only PATCH is served for a firewall")
+		return
+	}
+	var rule map[string]any
+	for _, fw := range f.firewalls {
+		if fw["name"] == name {
+			rule = fw
+		}
+	}
+	if rule == nil {
+		f.apiErr(w, 404, "notFound", fmt.Sprintf("The resource 'projects/%s/global/firewalls/%s' was not found", f.project, name))
+		return
+	}
+	var patch map[string]any
+	if err := json.Unmarshal(body, &patch); err != nil {
+		f.apiErr(w, 400, "invalid", "bad patch body")
+		return
+	}
+	f.startOp(w, r, "patch", name, func() { maps.Copy(rule, patch) }, nil)
 }
 
 // doneOp registers an operation that finished at once.
@@ -819,4 +874,59 @@ func parseForm(s string) (map[string]string, error) {
 		out[k] = v.Get(k)
 	}
 	return out, nil
+}
+
+// setFirewall replaces the project's firewall rules. A rule with no Network
+// goes on the test client's network, shed-net.
+func (f *fakeCompute) setFirewall(rules []provider.FirewallRule) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.firewalls = nil
+	for _, r := range rules {
+		network := r.Network
+		if network == "" {
+			network = "shed-net"
+		}
+		ports := func(in []provider.FirewallPorts) []any {
+			out := make([]any, 0, len(in))
+			for _, p := range in {
+				entry := map[string]any{"IPProtocol": p.Protocol}
+				if len(p.Ports) > 0 {
+					entry["ports"] = toAny(p.Ports)
+				}
+				out = append(out, entry)
+			}
+			return out
+		}
+		fw := map[string]any{
+			"name":      r.Name,
+			"network":   f.selfLink("projects/" + f.project + "/global/networks/" + network),
+			"direction": r.Direction,
+			"priority":  r.Priority,
+			"disabled":  r.Disabled,
+		}
+		for key, list := range map[string][]string{
+			"sourceRanges": r.SourceRanges, "sourceTags": r.SourceTags, "sourceServiceAccounts": r.SourceServiceAccounts,
+			"targetTags": r.TargetTags, "targetServiceAccounts": r.TargetServiceAccounts, "destinationRanges": r.DestinationRanges,
+		} {
+			if len(list) > 0 {
+				fw[key] = toAny(list)
+			}
+		}
+		if len(r.Allowed) > 0 {
+			fw["allowed"] = ports(r.Allowed)
+		}
+		if len(r.Denied) > 0 {
+			fw["denied"] = ports(r.Denied)
+		}
+		f.firewalls = append(f.firewalls, fw)
+	}
+}
+
+func toAny(in []string) []any {
+	out := make([]any, len(in))
+	for i, s := range in {
+		out[i] = s
+	}
+	return out
 }

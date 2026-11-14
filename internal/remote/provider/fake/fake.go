@@ -14,6 +14,9 @@
 //   - Seed: put an instance in the cloud directly, for adoption tests.
 //   - PublishHostKey: what the guest's boot unit would publish.
 //   - ResolveImage: exact names resolve to themselves, families to a fixed name.
+//   - SetFirewallRules, EditEnvRule, AddFirewallRule, SetDefaultNetwork: the
+//     cloud's firewall as someone else left it. A fake with an environment
+//     starts with the one rule the setup script makes.
 //   - Calls, Count: what was called, in order.
 package fake
 
@@ -44,10 +47,23 @@ const (
 	OpSetMetadata  Op = "set_metadata"
 	OpGuestHostKey Op = "guest_host_key"
 	OpResolveImage Op = "resolve_image"
+
+	OpEnvFirewallRule    Op = "env_firewall_rule"
+	OpNetworkIngress     Op = "network_ingress"
+	OpSetFirewallSources Op = "set_firewall_sources"
 )
 
 // Zone is the Instance.Zone the fake reports.
 const Zone = "fake-zone-a"
+
+// DefaultNetwork is the network the fake's instances are on unless
+// Options.Network names another.
+const DefaultNetwork = "fake-net"
+
+// DefaultFirewallSource is the source range of the environment rule a fake
+// starts with unless Options.FirewallSources says otherwise. It is a
+// documentation address.
+const DefaultFirewallSource = "192.0.2.1/32"
 
 // Options configures a fake provider. The zero value is usable: operations
 // finish at once and no environment check is made.
@@ -70,6 +86,12 @@ type Options struct {
 	// Capabilities overrides the default (run limit enforced, address not
 	// stable), which matches GCE.
 	Capabilities *provider.Capabilities
+	// Network is the network's name. Empty means DefaultNetwork.
+	Network string
+	// FirewallSources are the source ranges of the environment rule the
+	// fake starts with (when Env is set). Empty means
+	// DefaultFirewallSource.
+	FirewallSources []string
 }
 
 // Call records one provider call.
@@ -107,12 +129,20 @@ type Provider struct {
 	calls     []Call
 	nextOp    int
 	nextAddr  int
+
+	// rules is the whole cloud firewall: every rule on every network.
+	rules      []provider.FirewallRule
+	defaultNet bool
+	// patches are the source lists SetEnvFirewallSources applied, in order.
+	patches [][]string
 }
 
 var (
 	_ provider.Provider      = (*Provider)(nil)
 	_ provider.HostKeyReader = (*Provider)(nil)
 	_ provider.ImageResolver = (*Provider)(nil)
+
+	_ provider.FirewallSourceSetter = (*Provider)(nil)
 )
 
 // New returns an empty fake provider.
@@ -120,13 +150,189 @@ func New(opts Options) *Provider {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	return &Provider{
+	if opts.Network == "" {
+		opts.Network = DefaultNetwork
+	}
+	p := &Provider{
 		opts:      opts,
 		instances: make(map[provider.Ref]*instance),
 		ops:       make(map[string]*operation),
 		failCall:  make(map[Op][]error),
 		failOp:    make(map[Op][]error),
 	}
+	if opts.Env != "" {
+		sources := opts.FirewallSources
+		if len(sources) == 0 {
+			sources = []string{DefaultFirewallSource}
+		}
+		p.rules = []provider.FirewallRule{EnvRule(opts.Env, opts.Network, sources...)}
+	}
+	return p
+}
+
+// EnvRule returns an environment's firewall rule exactly as the setup script
+// makes it: ingress, allow tcp:22, to the environment's network tag, from the
+// given sources.
+func EnvRule(env, network string, sources ...string) provider.FirewallRule {
+	return provider.FirewallRule{
+		Name:         provider.FirewallRuleName(env),
+		Network:      network,
+		Direction:    provider.DirectionIngress,
+		Priority:     1000,
+		SourceRanges: append([]string(nil), sources...),
+		TargetTags:   []string{provider.NetworkTag(env)},
+		Allowed:      []provider.FirewallPorts{{Protocol: "tcp", Ports: []string{"22"}}},
+	}
+}
+
+// SetFirewallRules replaces the cloud's whole firewall. A rule whose Network
+// is empty is put on the fake's own network.
+func (p *Provider) SetFirewallRules(rules ...provider.FirewallRule) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rules = nil
+	for _, r := range rules {
+		p.rules = append(p.rules, p.ownedRule(r))
+	}
+}
+
+// AddFirewallRule adds one rule to the cloud's firewall, replacing a rule of
+// the same name. A rule whose Network is empty is put on the fake's network.
+func (p *Provider) AddFirewallRule(rule provider.FirewallRule) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rule = p.ownedRule(rule)
+	for i := range p.rules {
+		if p.rules[i].Name == rule.Name {
+			p.rules[i] = rule
+			return
+		}
+	}
+	p.rules = append(p.rules, rule)
+}
+
+// RemoveFirewallRule deletes a rule by name; a missing rule is ignored.
+func (p *Provider) RemoveFirewallRule(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.rules {
+		if p.rules[i].Name == name {
+			p.rules = append(p.rules[:i], p.rules[i+1:]...)
+			return
+		}
+	}
+}
+
+// EditEnvRule changes the environment's rule in place, as a person with the
+// console would. It reports false when the rule does not exist.
+func (p *Provider) EditEnvRule(edit func(*provider.FirewallRule)) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	name := provider.FirewallRuleName(p.opts.Env)
+	for i := range p.rules {
+		if p.rules[i].Name == name {
+			edit(&p.rules[i])
+			return true
+		}
+	}
+	return false
+}
+
+// SetDefaultNetwork makes the fake report its network as the cloud's default
+// one.
+func (p *Provider) SetDefaultNetwork(isDefault bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.defaultNet = isDefault
+}
+
+// FirewallPatches returns every source list SetEnvFirewallSources applied, in
+// order.
+func (p *Provider) FirewallPatches() [][]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([][]string, len(p.patches))
+	for i, ranges := range p.patches {
+		out[i] = append([]string(nil), ranges...)
+	}
+	return out
+}
+
+func (p *Provider) ownedRule(r provider.FirewallRule) provider.FirewallRule {
+	r = cloneRule(r)
+	if r.Network == "" {
+		r.Network = p.opts.Network
+	}
+	if r.Direction == "" {
+		r.Direction = provider.DirectionIngress
+	}
+	return r
+}
+
+func cloneRule(r provider.FirewallRule) provider.FirewallRule {
+	r.SourceRanges = append([]string(nil), r.SourceRanges...)
+	r.SourceTags = append([]string(nil), r.SourceTags...)
+	r.SourceServiceAccounts = append([]string(nil), r.SourceServiceAccounts...)
+	r.TargetTags = append([]string(nil), r.TargetTags...)
+	r.TargetServiceAccounts = append([]string(nil), r.TargetServiceAccounts...)
+	r.DestinationRanges = append([]string(nil), r.DestinationRanges...)
+	r.Allowed = append([]provider.FirewallPorts(nil), r.Allowed...)
+	r.Denied = append([]provider.FirewallPorts(nil), r.Denied...)
+	return r
+}
+
+// EnvFirewallRule returns the environment's rule.
+func (p *Provider) EnvFirewallRule(ctx context.Context) (provider.FirewallRule, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.enterLocked(ctx, OpEnvFirewallRule, ""); err != nil {
+		return provider.FirewallRule{}, err
+	}
+	name := provider.FirewallRuleName(p.opts.Env)
+	for _, r := range p.rules {
+		if r.Name == name {
+			return cloneRule(r), nil
+		}
+	}
+	return provider.FirewallRule{}, provider.Errorf(provider.ErrNotFound, string(OpEnvFirewallRule), "no firewall rule named %s", name)
+}
+
+// NetworkIngress returns the fake's network and the ingress rules on it.
+func (p *Provider) NetworkIngress(ctx context.Context) (provider.NetworkIngress, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.enterLocked(ctx, OpNetworkIngress, ""); err != nil {
+		return provider.NetworkIngress{}, err
+	}
+	out := provider.NetworkIngress{Network: p.opts.Network, Default: p.defaultNet}
+	for _, r := range p.rules {
+		if r.Network == p.opts.Network && r.Direction == provider.DirectionIngress {
+			out.Rules = append(out.Rules, cloneRule(r))
+		}
+	}
+	provider.SortFirewallRules(out.Rules)
+	return out, nil
+}
+
+// SetEnvFirewallSources replaces the source ranges of the environment's rule.
+func (p *Provider) SetEnvFirewallSources(ctx context.Context, ranges []string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.enterLocked(ctx, OpSetFirewallSources, ""); err != nil {
+		return err
+	}
+	if err := provider.CheckFirewallSources(string(OpSetFirewallSources), ranges); err != nil {
+		return err
+	}
+	name := provider.FirewallRuleName(p.opts.Env)
+	for i := range p.rules {
+		if p.rules[i].Name == name {
+			p.rules[i].SourceRanges = append([]string(nil), ranges...)
+			p.patches = append(p.patches, append([]string(nil), ranges...))
+			return nil
+		}
+	}
+	return provider.Errorf(provider.ErrNotFound, string(OpSetFirewallSources), "no firewall rule named %s", name)
 }
 
 // FailNext makes the next call of the given kind return err without changing

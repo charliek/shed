@@ -84,7 +84,12 @@ var errOpUnknown = errors.New("operation unknown")
 // minutes, and asks again until the operation is done or ctx ends. The
 // operation's own failure is not checked here.
 func (c *Client) waitOperation(ctx context.Context, op, zone, name string) (*operation, error) {
-	path := c.zonePath(zone) + "operations/" + url.PathEscape(name) + "/wait"
+	return c.waitOperationAt(ctx, op, c.zonePath(zone)+"operations/"+url.PathEscape(name)+"/wait")
+}
+
+// waitOperationAt is waitOperation for the wait URL of an operation in any
+// scope (a zone's, or the project's global ones).
+func (c *Client) waitOperationAt(ctx context.Context, op, path string) (*operation, error) {
 	for {
 		started := time.Now()
 		var o operation
@@ -120,6 +125,22 @@ func (c *Client) runOperation(ctx context.Context, op string, o *operation) erro
 		zone = c.cfg.Zone
 	}
 	done, err := c.waitOperation(ctx, op, zone, o.Name)
+	if errors.Is(err, errOpUnknown) {
+		return provider.Errorf(nil, op, "operation %s vanished before it finished", o.Name)
+	}
+	if err != nil {
+		return err
+	}
+	return done.failure(op)
+}
+
+// runGlobalOperation is runOperation for a global operation (a firewall
+// patch): it waits with globalOperations.wait.
+func (c *Client) runGlobalOperation(ctx context.Context, op string, o *operation) error {
+	if o.Status == opDone {
+		return o.failure(op)
+	}
+	done, err := c.waitOperationAt(ctx, op, c.projectPath()+"global/operations/"+url.PathEscape(o.Name)+"/wait")
 	if errors.Is(err, errOpUnknown) {
 		return provider.Errorf(nil, op, "operation %s vanished before it finished", o.Name)
 	}

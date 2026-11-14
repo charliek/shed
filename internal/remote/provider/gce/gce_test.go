@@ -142,6 +142,7 @@ func TestConformance(t *testing.T) {
 						f.failNextOp("insert", "ZONE_RESOURCE_POOL_EXHAUSTED", "The zone 'projects/test-proj/zones/us-central1-a' does not have enough resources available to fulfill the request.")
 					}
 				},
+				SetFirewall: func(t *testing.T, rules []provider.FirewallRule) { f.setFirewall(rules) },
 			}
 		},
 	})
