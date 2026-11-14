@@ -171,7 +171,9 @@ All notable changes to this project will be documented in this file.
   backslash, quote, backtick, brace, pipe, caret or angle bracket (`pa\$word` in a raw SSH
   command) ended the scan early and reached the server, agent and audit logs whole; so did a
   URL whose scheme the shell glues on (`"https"://`). Both are redacted now. In text with no
-  white space, an `@` after a path-less URL's closing quote is hidden with it.
+  white space, an `@` after a path-less URL's closing quote is hidden with it. A create whose
+  `repo` URL does not parse gets a `400 INVALID_REPO_URL` that repeats none of the URL (the
+  parser's error used to quote it, password included).
 - **Development: a remote-backend dev server and suite parameter.**
   `make dev-server-up-remote` (and `-down-`, `-restart-`, `-status-`, `-logs-remote`) runs the
   dev build with `default_backend: remote` beside an installed server, reading the cloud
