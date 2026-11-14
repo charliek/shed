@@ -325,6 +325,21 @@ func (b *Backend) keep(j *job, kind string, cause error) error {
 	return fmt.Errorf("%w: %w", errUnresolved, cause)
 }
 
+// answered takes reason cloud_unreadable off a kept create or start once the
+// read it was kept for has been answered and the job goes on. From there it
+// is an ordinary job in flight, for as long as an insert, a boot and the
+// guest's set-up take, and the reason would tell anyone who lists the shed
+// that the server is still waiting for the cloud. A job kept a second time
+// gets the reason, and its log line, again.
+func (b *Backend) answered(j *job) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r := b.currentLocked(j.name, j.id); r != nil && r.Shed.StatusReason == config.StatusReasonCloudUnreadable {
+		r.Shed.StatusReason = ""
+		b.saveLocked(r)
+	}
+}
+
 // mutate runs one accepting provider call (start, stop or destroy) with the
 // shed ID re-checked first. On provider.ErrBusy it waits for the transition
 // in progress to end and calls again.
@@ -393,6 +408,9 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 			pend = provider.Pending{Ref: rec.Ref, Want: provider.StateRunning}
 		}
 	}
+	// The cloud has said what there is (an instance on its way, or none), so
+	// a create that was kept is one in flight again.
+	b.answered(j)
 	if pend.Ref == "" {
 		// The request was let in past the firewall check, but that may be
 		// long ago: a create resumed after a restart was let in by a server
@@ -756,6 +774,11 @@ func (b *Backend) runStart(ctx context.Context, j *job) error {
 	b.update(j.name, j.id, func(r *state.Record) {
 		r.Pending = &pend
 		r.MaxRun = maxRun
+		if r.Shed.StatusReason == config.StatusReasonCloudUnreadable {
+			// The instance was read and the start accepted: a start that
+			// was kept is one in flight again (see answered).
+			r.Shed.StatusReason = ""
+		}
 	})
 	inst, err := b.prov.Wait(ctx, pend)
 	if err != nil {

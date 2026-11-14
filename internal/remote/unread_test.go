@@ -413,3 +413,77 @@ func TestCreateIsKeptWhenTheReadBeforeItsReadyLabelFails(t *testing.T) {
 		t.Fatalf("%d instances and %d destroy calls, want 2 and 0", e.instances(), e.count(fake.OpDestroy))
 	}
 }
+
+// Reason cloud_unreadable says the server is waiting for the cloud to answer.
+// Once the cloud has answered and the kept job goes on (an insert to wait
+// for, a VM to boot, a guest to set up), the shed is an ordinary one that is
+// starting, and must not go on telling whoever lists it that the cloud cannot
+// be read.
+func TestKeptReasonEndsWhenTheCloudAnswers(t *testing.T) {
+	tests := []struct {
+		name string
+		job  string
+	}{
+		{"a kept create", state.JobCreate},
+		{"a kept start", state.JobStart},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t, manual())
+			const name = "kept"
+			var id string
+			if tt.job == state.JobCreate {
+				e.put(name, config.StatusStarting)
+				id = e.waitRef(name)
+				if err := e.b.Close(); err != nil {
+					t.Fatal(err)
+				}
+				e.prov.FailNext(fake.OpGet, errCloudDown)
+				e.b = e.open()
+			} else {
+				e.put(name, config.StatusStopped)
+				id = e.settledID(name)
+				e.prov.FailNext(fake.OpGet, errCloudDown)
+				if _, err := e.b.StartShed(ctxT(t), name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			e.idle()
+			if rec := e.b.snapshot(name, id); rec.Job != tt.job || rec.Shed.StatusReason != config.StatusReasonCloudUnreadable {
+				t.Fatalf("the record is %q (%q) job %q, want its %s kept (%s)", rec.Shed.Status, rec.Shed.StatusReason, rec.Job, tt.job, config.StatusReasonCloudUnreadable)
+			}
+
+			// The cloud answers. The provider is manual, so the job now waits
+			// on its insert or its start, for as long as the test likes.
+			e.sweep()
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				rec := e.b.snapshot(name, id)
+				if rec == nil || rec.Shed.Status != config.StatusStarting || rec.Job != tt.job {
+					t.Fatalf("the record is %+v, want the %s in flight", rec, tt.job)
+				}
+				if rec.Shed.StatusReason == "" {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the cloud answered and the %s is in flight again, and the reason still reads %q", tt.job, rec.Shed.StatusReason)
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+			e.b.mu.Lock()
+			inFlight := e.b.jobs[name] != nil
+			e.b.mu.Unlock()
+			if !inFlight {
+				t.Fatalf("no job is working on the %s", tt.job)
+			}
+
+			e.auto()
+			if got := e.settled(name); got.Status != config.StatusRunning || got.StatusReason != "" {
+				t.Fatalf("came to rest %q (%q), want running", got.Status, got.StatusReason)
+			}
+			if n := e.count(fake.OpDestroy) + markerCount(t, e.dir); n != 0 {
+				t.Fatalf("%d destroy calls and markers, want none", n)
+			}
+		})
+	}
+}
