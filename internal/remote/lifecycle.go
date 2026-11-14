@@ -39,6 +39,14 @@ func httpsRepoURL(repo string) string {
 	return repo
 }
 
+// asksForEgress reports whether a create's egress selection asks for any
+// profile. Nothing and exactly ["off"] ask for none, as the API's own gate
+// reads them (internal/api: asksForEgress), so a client that spells out "no
+// egress profile" is not refused for a feature it did not ask for.
+func asksForEgress(egress []string) bool {
+	return len(egress) > 1 || (len(egress) == 1 && egress[0] != "off")
+}
+
 // CreateShed saves the shed as "starting", starts its create job and
 // returns. It waits up to the fast-fail window first: a quota or capacity
 // refusal that arrives inside it is returned here and leaves no record.
@@ -58,7 +66,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		return nil, fmt.Errorf("%w: mounts on the remote backend", config.ErrFeatureUnsupportedSentinel)
 	case req.FromSnapshot != "":
 		return nil, fmt.Errorf("%w: from_snapshot on the remote backend", config.ErrFeatureUnsupportedSentinel)
-	case len(req.Egress) > 0:
+	case asksForEgress(req.Egress):
 		return nil, fmt.Errorf("%w: egress profiles on the remote backend", config.ErrFeatureUnsupportedSentinel)
 	}
 	network := req.Network
