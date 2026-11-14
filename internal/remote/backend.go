@@ -413,13 +413,30 @@ func (b *Backend) saveLocked(r *state.Record) {
 	}
 }
 
-// saveMarkerLocked writes a delete marker and notes it as pending.
+// saveMarkerLocked writes a delete marker and notes it as pending. An error
+// means no marker was put in place, and nothing will ever act on one. A
+// marker that is in place with only its directory's flush failed
+// (state.ErrNotDurable) is a written marker: the periodic pass and the next
+// start-up read it and destroy the VM, so the caller must not report the
+// delete as failed.
 func (b *Backend) saveMarkerLocked(m *state.Marker) error {
-	if err := b.store.SaveMarker(m); err != nil {
+	if err := b.inPlace(b.store.SaveMarker(m)); err != nil {
 		return err
 	}
 	b.pending[m.ID] = m.At
 	return nil
+}
+
+// inPlace turns the error of a state write that did put its file in place
+// (state.ErrNotDurable) into a log line and nil. What is lost is only that a
+// power cut might undo the write; the cloud's own labels cover that for a
+// delete (shed_state=deleting) and the start-up pass for a create.
+func (b *Backend) inPlace(err error) error {
+	if errors.Is(err, state.ErrNotDurable) {
+		b.logf("remote: %v; carrying on with the file as written", err)
+		return nil
+	}
+	return err
 }
 
 // dropLocked removes a record from memory and disk.

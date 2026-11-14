@@ -185,7 +185,9 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 		b.mu.Unlock()
 		return nil, err
 	}
-	if err := b.store.SaveRecord(rec); err != nil {
+	// A record that is in place is one the next server would resume, so the
+	// create goes on with it (inPlace); any other error left no record.
+	if err := b.inPlace(b.store.SaveRecord(rec)); err != nil {
 		b.mu.Unlock()
 		return nil, err
 	}
@@ -425,17 +427,24 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 		ID: r.Shed.ID, Name: name, Env: r.Env, Ref: r.Ref, At: b.now().UTC(),
 		Owner: r.Shed.Owner, CreatedAt: r.Shed.CreatedAt,
 	}
-	if d := b.deletes[marker.ID]; d != nil && d.marker != nil {
+	cleanup := b.deletes[marker.ID]
+	if cleanup != nil && cleanup.marker != nil {
 		// The clean-up of this shed's failed create is still destroying
 		// its VM. That job carries on; its marker now stands for the
-		// whole shed.
-		d.marker.KeepRecord = false
-		d.marker.At = marker.At
-		marker = d.marker
+		// whole shed. The job's own copy changes only once the new one is
+		// written: a delete that is refused here leaves it a clean-up.
+		whole := *cleanup.marker
+		whole.KeepRecord = false
+		whole.At = marker.At
+		marker = &whole
 	}
 	if err := b.saveMarkerLocked(marker); err != nil {
 		b.mu.Unlock()
 		return fmt.Errorf("recording the delete of %s: %w", name, err)
+	}
+	if cleanup != nil && cleanup.marker != nil {
+		*cleanup.marker = *marker
+		marker = cleanup.marker
 	}
 	prior := b.jobs[name]
 	if prior != nil {

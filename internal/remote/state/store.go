@@ -183,7 +183,8 @@ func safeName(name string) error {
 	return nil
 }
 
-// SaveRecord writes a record, replacing any record of the same name.
+// SaveRecord writes a record, replacing any record of the same name. See
+// ErrNotDurable for the one error after which the record is in place.
 func (s *Store) SaveRecord(r *Record) error {
 	if err := safeName(r.Shed.Name); err != nil {
 		return err
@@ -218,7 +219,8 @@ func (s *Store) Records() (records []*Record, bad []string, err error) {
 	return records, bad, nil
 }
 
-// SaveMarker writes a delete marker.
+// SaveMarker writes a delete marker. See ErrNotDurable for the one error
+// after which the marker is in place.
 func (s *Store) SaveMarker(m *Marker) error {
 	if err := safeName(m.ID); err != nil {
 		return err
@@ -275,8 +277,18 @@ func readJSON(path string, v any) error {
 	return json.Unmarshal(data, v)
 }
 
+// ErrNotDurable is returned by a write that put its file in place and could
+// not flush the directory afterwards. The file is there: this process reads
+// it, and so does the next server, unless a power cut takes the rename back.
+// So a caller must treat the write as made. Reporting it as failed would
+// leave a file behind that says otherwise: a delete marker the periodic pass
+// and the next start-up act on, a record the next start-up resumes. Every
+// other error from a write means nothing was put in place.
+var ErrNotDurable = errors.New("the file is in place but its directory could not be flushed")
+
 // writeJSON writes v to path atomically and durably: a temp file beside it,
-// fsync, rename, fsync of the directory.
+// fsync, rename, fsync of the directory. An error that is ErrNotDurable means
+// the rename was made; any other error means path is as it was.
 func writeJSON(path string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -311,7 +323,7 @@ func writeJSON(path string, v any) error {
 	// marker before a delete is acknowledged), so a power loss must not be
 	// able to take it back.
 	if err := syncDir(filepath.Dir(path)); err != nil {
-		return fmt.Errorf("remote state: %w", err)
+		return fmt.Errorf("remote state: %s: %w: %w", filepath.Base(path), ErrNotDurable, err)
 	}
 	return nil
 }
