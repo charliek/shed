@@ -1848,6 +1848,32 @@ func rejectUnknownNetworkKeys(data []byte) error {
 	return nil
 }
 
+// rejectUnknownRemoteKeys fails loudly on an unknown key anywhere under
+// remote:, for the same reason as rejectUnknownClientKeys. Every setting
+// there bounds what a billed cloud VM may do or who may reach it; a typo
+// (say `max_runing:` or `source_range:`) must not fall back to a default.
+func rejectUnknownRemoteKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	block, present := raw["remote"]
+	if !present || block == nil {
+		return nil
+	}
+	sub, err := yaml.Marshal(block)
+	if err != nil {
+		return fmt.Errorf("remote: %w", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(sub))
+	dec.KnownFields(true)
+	var typed RemoteConfig
+	if err := dec.Decode(&typed); err != nil {
+		return fmt.Errorf("remote: %w", err)
+	}
+	return nil
+}
+
 // LoadServerConfig loads server configuration from standard locations.
 // It checks in order: ./server.yaml, ~/.config/shed/server.yaml, /etc/shed/server.yaml
 func LoadServerConfig() (*ServerConfig, error) {
@@ -1885,7 +1911,7 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 func rejectRemovedKeys(data []byte) error {
 	for _, check := range []func([]byte) error{
 		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys,
-		rejectUnknownClientKeys, rejectUnknownNetworkKeys,
+		rejectUnknownClientKeys, rejectUnknownNetworkKeys, rejectUnknownRemoteKeys,
 	} {
 		if err := check(data); err != nil {
 			return err

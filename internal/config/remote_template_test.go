@@ -77,3 +77,51 @@ func TestDevRemoteTemplate(t *testing.T) {
 		}
 	})
 }
+
+// TestRemoteUnknownKeysRefused: a misspelt key under remote: stops the load.
+// Every setting there bounds a billed VM or who may reach it, and the typed
+// decode alone would drop the key and use the default.
+func TestRemoteUnknownKeysRefused(t *testing.T) {
+	raw, err := os.ReadFile(devRemoteTemplate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	good := strings.NewReplacer("@DEV_REMOTE_DIR@", dir, "@SHED_REMOTE_ENV@", "dev-box", "@GITHUB_USER@", "example",
+		"@FIREWALL_MODE@", "static", "@FIREWALL_SETTING@", "source_ranges_env: SHED_REMOTE_SOURCE_RANGES").Replace(string(raw))
+	load := func(t *testing.T, y string) error {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "server.yaml")
+		if err := os.WriteFile(path, []byte(y), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadServerConfigFromPath(path)
+		return err
+	}
+	if err := load(t, good); err != nil {
+		t.Fatalf("the unchanged template does not load: %v", err)
+	}
+
+	tests := []struct {
+		name, old, new, want string
+	}{
+		{"a limit", "    max_running: 2\n", "    max_runing: 2\n", "max_runing"},
+		{"a limit at the wrong level", "  disk_gb: 50\n", "  disk_gb: 50\n  max_running: 1\n", "max_running"},
+		{"the run limit", "  max_run_duration: 24h\n", "  max_run: 24h\n", "max_run"},
+		{"a firewall setting", "    source_ranges_env: SHED_REMOTE_SOURCE_RANGES\n", "    source_range_env: SHED_REMOTE_SOURCE_RANGES\n", "source_range_env"},
+		{"the firewall acknowledgement", "    mode: static\n", "    mode: static\n    acknowledge: false\n", "acknowledge"},
+		{"an ssh setting", "    client_key_env: SHED_REMOTE_SSH_KEY\n", "    client_key: SHED_REMOTE_SSH_KEY\n", "client_key"},
+		{"a gce setting", "    zone_env: SHED_GCE_ZONE\n", "    zone: SHED_GCE_ZONE\n", "zone"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if strings.Count(good, tt.old) != 1 {
+				t.Fatalf("the template must hold %q exactly once", tt.old)
+			}
+			err := load(t, strings.Replace(good, tt.old, tt.new, 1))
+			if err == nil || !strings.Contains(err.Error(), "remote:") || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("err = %v, want a refusal under remote: naming %q", err, tt.want)
+			}
+		})
+	}
+}
