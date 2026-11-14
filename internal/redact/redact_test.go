@@ -351,3 +351,45 @@ func TestStringLeavesNoCredentialedURL(t *testing.T) {
 		}
 	}
 }
+
+// A guest's data frame can be 16 MiB. The Writer holds back at most a small
+// multiple of maxPending of it, whatever the size of one Write, and keeps no
+// large buffer once the token is dropped.
+func TestWriterBoundsPendingWithinOneWrite(t *testing.T) {
+	const frame = 16 << 20
+	tests := []struct {
+		name string
+		in   []byte
+		want string // "" when only the bound is checked
+	}{
+		{"one token with no break", bytes.Repeat([]byte("x"), frame), Dropped},
+		{"one token, then a line", append(bytes.Repeat([]byte("x"), frame), "\nnext\n"...), Dropped + "\nnext\n"},
+		{"a credentialed URL deep inside one token",
+			append(append(bytes.Repeat([]byte("x"), frame/2), "https://u:s3cr3t-token@h/r"...), bytes.Repeat([]byte("y"), frame/2)...), Dropped},
+		{"words with no line end", bytes.Repeat([]byte("word "), frame/5), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			w := NewWriter(&out)
+			if n, err := w.Write(tt.in); err != nil || n != len(tt.in) {
+				t.Fatalf("Write = %d, %v, want %d", n, err, len(tt.in))
+			}
+			if c := cap(w.pending); c > 4*maxPending {
+				t.Errorf("the Writer holds a %d byte buffer after one %d byte Write, want at most %d", c, len(tt.in), 4*maxPending)
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(out.String(), "s3cr3t") {
+				t.Error("the credential was written")
+			}
+			if tt.want != "" && out.String() != tt.want {
+				t.Errorf("wrote %d bytes ending %q, want %q", out.Len(), tail(out.String(), 80), tt.want)
+			}
+			if tt.want == "" && out.Len() != len(tt.in) {
+				t.Errorf("wrote %d bytes of %d", out.Len(), len(tt.in))
+			}
+		})
+	}
+}

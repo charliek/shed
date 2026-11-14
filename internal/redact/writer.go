@@ -38,17 +38,38 @@ func isBreak(c byte) bool { return c <= ' ' }
 
 // Write buffers p and passes on every complete line, redacted. It reports
 // len(p) unless the underlying writer fails.
+//
+// p is taken in pieces of at most maxPending bytes, so the Writer never holds
+// more than twice that, whatever the size of one Write: a guest's data frame
+// can be 16 MiB, and one with no break in it would otherwise be copied whole
+// before it is dropped. Cutting p anywhere is safe, because a Write boundary
+// may already fall anywhere.
 func (rw *Writer) Write(p []byte) (int, error) {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	n := len(p)
+	for len(p) > 0 {
+		piece := p
+		if len(piece) > maxPending {
+			piece = piece[:maxPending]
+		}
+		p = p[len(piece):]
+		if err := rw.write(piece); err != nil {
+			return 0, err
+		}
+	}
+	return n, nil
+}
+
+// write takes one piece of at most maxPending bytes. The caller holds rw.mu.
+func (rw *Writer) write(p []byte) error {
 	if rw.skipping {
 		i := 0
 		for i < len(p) && !isBreak(p[i]) {
 			i++
 		}
 		if i == len(p) {
-			return n, nil
+			return nil
 		}
 		p = p[i:]
 		rw.skipping = false
@@ -65,7 +86,7 @@ func (rw *Writer) Write(p []byte) (int, error) {
 		err := rw.emit(rw.pending[:cut])
 		rw.pending = append(rw.pending[:0], rw.pending[cut:]...)
 		if err != nil {
-			return 0, err
+			return err
 		}
 	}
 	if len(rw.pending) > maxPending {
@@ -75,10 +96,10 @@ func (rw *Writer) Write(p []byte) (int, error) {
 		rw.pending = rw.pending[:0]
 		rw.skipping = true
 		if _, err := io.WriteString(rw.w, Dropped); err != nil {
-			return 0, err
+			return err
 		}
 	}
-	return n, nil
+	return nil
 }
 
 // Flush passes on whatever is buffered, redacted.
