@@ -259,7 +259,7 @@ Read the reason in the server log or in the `503` message, then:
 
 The next periodic pass, at most a minute later, picks up the fix; no restart is needed unless the configured list changed.
 
-The check covers VPC firewall rules. It does not read hierarchical or network firewall policies, VPC peering or routes.
+The check covers VPC firewall rules. It does not read hierarchical or network firewall policies, VPC peering or routes. The network and subnet must be in the project the sheds are in: a network of another project (a Shared VPC) is refused when the server starts, because the check reads that one project's rules.
 
 ## Server restarts
 

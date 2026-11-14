@@ -186,7 +186,32 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Subnet != "" {
 		c.subnetURL = qualify(cfg.Subnet, "projects/"+cfg.Project+"/regions/"+region+"/subnetworks/")
 	}
+	// A network in another project (a Shared VPC) is refused. The firewall
+	// reads and the one patch go to cfg.Project, and a network is known
+	// there by its name alone: with the instances on a host project's
+	// network, a network of the same name in this project would be the one
+	// checked, and the one whose rule auto mode rewrites.
+	for _, r := range []struct{ what, path string }{{"network", c.networkURL}, {"subnet", c.subnetURL}} {
+		if r.path == "" {
+			continue
+		}
+		if p, ok := projectOf(r.path); !ok || p != cfg.Project {
+			return nil, fmt.Errorf("gce: the %s %q is not in project %s; a network of another project (a Shared VPC) is not supported, because the firewall check reads that project's rules only", r.what, r.path, cfg.Project)
+		}
+	}
 	return c, nil
+}
+
+// projectOf returns the project a resource path or URL names: the segment
+// after the first "projects" segment.
+func projectOf(path string) (string, bool) {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if p == "projects" && i+1 < len(parts) && parts[i+1] != "" {
+			return parts[i+1], true
+		}
+	}
+	return "", false
 }
 
 // qualify turns a bare resource name into a project path; a value that is

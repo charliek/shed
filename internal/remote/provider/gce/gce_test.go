@@ -862,9 +862,25 @@ func TestNewValidates(t *testing.T) {
 		{"no network", func(c *Config) { c.Network = "" }},
 		{"no token", func(c *Config) { c.Token = nil }},
 		{"bad tier", func(c *Config) { c.NetworkTier = "GOLD" }},
+		// A Shared VPC: the firewall check would read this project's rules
+		// for a network that lives in another.
+		{"network in another project", func(c *Config) { c.Network = "projects/host/global/networks/n" }},
+		{"network URL in another project", func(c *Config) {
+			c.Network = "https://www.googleapis.com/compute/v1/projects/host/global/networks/n"
+		}},
+		{"subnet in another project", func(c *Config) { c.Subnet = "projects/host/regions/us-central1/subnetworks/s" }},
+		{"network path that names no project", func(c *Config) { c.Network = "global/networks/n" }},
 	}
 	if _, err := New(ok); err != nil {
 		t.Fatalf("New(valid) = %v", err)
+	}
+	for _, same := range []Config{
+		{Project: "p", Zone: "us-central1-a", Env: "dev", Network: "projects/p/global/networks/n", Subnet: "projects/p/regions/us-central1/subnetworks/s", Token: staticToken("x")},
+		{Project: "p", Zone: "us-central1-a", Env: "dev", Network: "https://www.googleapis.com/compute/v1/projects/p/global/networks/n", Subnet: "s", Token: staticToken("x")},
+	} {
+		if _, err := New(same); err != nil {
+			t.Errorf("New with a path in its own project (%s) = %v", same.Network, err)
+		}
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
