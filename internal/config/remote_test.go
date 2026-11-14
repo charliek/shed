@@ -175,6 +175,15 @@ func TestRemoteValidate(t *testing.T) {
 		{"firewall auto", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", "https://b.example"}}
 		}, ""},
+		{"firewall auto with one host twice", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example/ip", "https://a.example/ip"}}
+		}, "names host a.example more than once"},
+		{"firewall auto with two paths on one host", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example/ip", "https://A.Example.:8443/other"}}
+		}, "names host a.example more than once"},
+		{"firewall auto with a third entry on a used host", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", "https://b.example", "https://user@b.example/x"}}
+		}, "names host b.example more than once"},
 		{"firewall auto with ranges", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", "https://b.example"}, SourceRanges: []string{"203.0.113.7/32"}}
 		}, "source_ranges is only used"},

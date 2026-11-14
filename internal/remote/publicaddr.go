@@ -149,19 +149,31 @@ func (f *addrFinder) agreed(ctx context.Context) (addr netip.Addr, ok bool, summ
 	wg.Wait()
 
 	votes := make(map[netip.Addr]int)
+	voted := make(map[string]bool)
 	notes := make([]string, 0, len(answers))
 	for i, a := range answers {
 		// The host alone names the service. An entry that does not parse is
 		// named whole, with any userinfo redacted: the summary is logged and
 		// sent to clients in the refusal.
 		host := redact.String(f.urls[i])
+		service := ""
 		if u, err := url.Parse(f.urls[i]); err == nil && u.Host != "" {
 			host = u.Host
+			service = strings.ToLower(u.Host)
 		}
 		if a.err != nil {
 			notes = append(notes, fmt.Sprintf("%s: %v", host, a.err))
 			continue
 		}
+		// One service has one vote: two entries on one host and port are
+		// one voice, whatever their paths. The config is stricter and
+		// refuses two entries on one host name; this holds whatever built
+		// the list.
+		if voted[service] {
+			notes = append(notes, fmt.Sprintf("%s: %s (not counted: this service already answered)", host, a.addr))
+			continue
+		}
+		voted[service] = true
 		votes[a.addr]++
 		notes = append(notes, fmt.Sprintf("%s: %s", host, a.addr))
 	}

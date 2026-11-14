@@ -164,6 +164,39 @@ func TestPublicAddrAgreement(t *testing.T) {
 	}
 }
 
+// TestPublicAddrOneServiceOneVote: an address reported twice by one service
+// (the same URL listed twice, or two paths on one host) is one report, so
+// whoever runs that service cannot supply the agreement alone.
+func TestPublicAddrOneServiceOneVote(t *testing.T) {
+	const a = "203.0.113.7"
+	servers, urls, client := echoes(t, a)
+	tests := []struct {
+		name string
+		urls []string
+	}{
+		{"the same URL twice", []string{urls[0], urls[0]}},
+		{"two paths on one host", []string{urls[0] + "/ip", urls[0] + "/other"}},
+		{"three entries, one host", []string{urls[0], urls[0] + "/a", urls[0] + "/b"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, ok, summary := newAddrFinder(tt.urls, client).agreed(context.Background())
+			if ok {
+				t.Errorf("believed %s on the word of one service", addr)
+			}
+			if !strings.Contains(summary, "not counted") {
+				t.Errorf("summary does not say the repeat was not counted: %s", summary)
+			}
+		})
+	}
+	// A second, separate service that agrees makes the quorum.
+	other := newEcho(t, a)
+	if addr, ok, _ := newAddrFinder([]string{urls[0], urls[0], other.srv.URL}, client).agreed(context.Background()); !ok || addr.String() != a {
+		t.Errorf("two services agreeing = %v, %v; want %s", addr, ok, a)
+	}
+	_ = servers
+}
+
 func TestPublicAddrRedirectNotFollowed(t *testing.T) {
 	const a = "203.0.113.7"
 	servers, urls, client := echoes(t, a, a)

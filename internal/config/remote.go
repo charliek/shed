@@ -250,11 +250,20 @@ func (c *RemoteConfig) validateSizes() error {
 
 func (c *RemoteConfig) validateFirewall() error {
 	f := c.Firewall
+	// One service is one voice, however many URLs name it: two entries on
+	// one host would let whoever runs that host supply the whole agreement
+	// auto mode needs before it rewrites the rule.
+	echoHosts := make(map[string]bool)
 	for _, u := range f.EchoURLs {
 		parsed, err := url.Parse(u)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
 			return fmt.Errorf("invalid firewall.echo_urls entry %q (must be an https URL)", redact.String(u))
 		}
+		host := EchoHost(parsed)
+		if echoHosts[host] {
+			return fmt.Errorf("firewall.echo_urls names host %s more than once; each entry must be a different, independently run service", host)
+		}
+		echoHosts[host] = true
 	}
 	notStatic := func() error {
 		if len(f.SourceRanges) > 0 {
@@ -308,6 +317,13 @@ func (c *RemoteConfig) validateFirewall() error {
 		return fmt.Errorf("invalid firewall.mode: %q (must be %s, %s or %s)", f.Mode, RemoteFirewallStatic, RemoteFirewallAuto, RemoteFirewallAny)
 	}
 	return nil
+}
+
+// EchoHost is the name an echo URL's service is counted under: its host name,
+// lower-cased, without the port and without a trailing dot. Two URLs with the
+// same EchoHost are one service.
+func EchoHost(u *url.URL) string {
+	return strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 }
 
 // ParseFirewallSources checks a list of firewall source ranges and returns

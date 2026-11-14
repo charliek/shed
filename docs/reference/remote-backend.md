@@ -146,7 +146,7 @@ remote:
     source_ranges: []            # static: the rule's sources, as IPv4 CIDRs, or
     source_ranges_env: SHED_REMOTE_SOURCE_RANGES   # static: a variable holding them, comma-separated
     acknowledge_any: false       # must be true for mode: any, and for a static range wider than a /24
-    echo_urls: []                # auto: at least two https services that answer with the caller's address
+    echo_urls: []                # auto: at least two https services, on different hosts, that answer with the caller's address
   gce:
     project_env: SHED_GCE_PROJECT
     zone_env: SHED_GCE_ZONE
@@ -218,7 +218,7 @@ remote:
     source_ranges_env: SHED_REMOTE_SOURCE_RANGES   # e.g. 203.0.113.7/32,198.51.100.0/24
 ```
 
-**auto.** For a server whose public address changes. Each check asks every `echo_urls` service for the caller's address. A service must be `https`, answer `200` without a redirect, with at most 64 bytes that are exactly one IPv4 address. The address is believed only when at least two services report the same one, and never when it is private, loopback, link-local, unspecified, multicast or carrier-grade NAT space. One service alone can never move the rule.
+**auto.** For a server whose public address changes. Each check asks every `echo_urls` service for the caller's address. A service must be `https`, answer `200` without a redirect, with at most 64 bytes that are exactly one IPv4 address. The address is believed only when at least two services report the same one, and never when it is private, loopback, link-local, unspecified, multicast or carrier-grade NAT space. One service alone can never move the rule: each entry must be on a different host name (two entries on one host are refused when the config loads), and the services should be run by different operators.
 
 When the believed address differs from the rule's source ranges, and every other clause of the check passes, the server patches the rule's source ranges to that one `/32`, waits for the cloud, reads the rule back and logs the old and new sources. It patches at most once every 5 minutes, and never when the rule or the network fails any other clause. When the services have not agreed for 15 minutes, or have never agreed since the server started, creates and starts are refused (`address_unknown`) and the rule is left alone.
 
