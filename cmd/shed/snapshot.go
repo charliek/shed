@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -153,20 +154,35 @@ func runSnapshotList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tBACKEND\tSOURCE\tSIZE\tCREATED\tCOMMENT")
+	renderSnapshotTable(os.Stdout, snaps)
+	return nil
+}
+
+// renderSnapshotTable is the `shed snapshot list` table. It has a USER column
+// only when the snapshots belong to more than one user (mixedUsers), so on a
+// server with no user list it is as it was.
+func renderSnapshotTable(out io.Writer, snaps []config.Snapshot) {
+	users := make([]string, len(snaps))
+	for i, s := range snaps {
+		users[i] = s.User
+	}
+	withUser := mixedUsers(users)
+
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	header := []string{"NAME", "BACKEND", "SOURCE"}
+	if withUser {
+		header = append(header, "USER")
+	}
+	fmt.Fprintln(w, strings.Join(append(header, "SIZE", "CREATED", "COMMENT"), "\t"))
 	for _, s := range snaps {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			s.Name,
-			valueOrDash(s.Backend),
-			valueOrDash(s.SourceShed),
-			formatSize(s.SizeBytes),
-			s.CreatedAt.Format("2006-01-02 15:04"),
-			valueOrDash(s.Comment),
-		)
+		row := []string{s.Name, valueOrDash(s.Backend), valueOrDash(s.SourceShed)}
+		if withUser {
+			row = append(row, valueOrDash(s.User))
+		}
+		row = append(row, formatSize(s.SizeBytes), s.CreatedAt.Format("2006-01-02 15:04"), valueOrDash(s.Comment))
+		fmt.Fprintln(w, strings.Join(row, "\t"))
 	}
 	w.Flush()
-	return nil
 }
 
 func runSnapshotInfo(cmd *cobra.Command, args []string) error {
@@ -192,6 +208,9 @@ func runSnapshotInfo(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Backend:        %s\n", snap.Backend)
 	fmt.Printf("Version:        %d\n", snap.Version)
 	fmt.Printf("Source shed:    %s\n", valueOrDash(snap.SourceShed))
+	if snap.User != "" {
+		fmt.Printf("User:           %s\n", snap.User)
+	}
 	if snap.SourceImage != "" {
 		fmt.Printf("Source image:   %s\n", snap.SourceImage)
 	}

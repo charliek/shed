@@ -329,6 +329,7 @@ func (b *fcCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		LowerImageTag:  pre.lowerImageTag,
 		FromSnapshot:   req.FromSnapshot,
 		Owner:          req.Owner,
+		User:           req.User,
 		// Always explicit for a new shed; nil (a non-API caller) is "all".
 		MountSelection: config.EffectiveMountSelection(req.ResolvedMounts),
 		NetworkProfile: string(net.profile),

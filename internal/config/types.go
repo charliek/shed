@@ -159,6 +159,48 @@ func ValidateSnapshotName(name string) error {
 	return nil
 }
 
+// userNameRegex is the form of a user's name: a lowercase letter, then up to
+// 62 lowercase letters, digits and hyphens. It fits a cloud label value.
+var userNameRegex = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+
+// ValidUserName reports whether s can name a user. The implicit user's name,
+// the empty string, is not one.
+func ValidUserName(s string) bool { return userNameRegex.MatchString(s) }
+
+// UserUnresolved is the user a shed is reported with when its records do not
+// agree about whose it is: a stored record that names both a service client
+// and a user, or (on the remote backend) a local record and an instance label
+// that name two different users. It is not a valid user name, so no caller's
+// user can ever equal it: only an admin can reach such a shed. Nothing stores
+// it; it is computed where a record is read.
+const UserUnresolved = "!unresolved"
+
+// ValidateShedOwnership checks the service client (owner) and person (user) a
+// new shed or snapshot is to be recorded with. A user is "" (the implicit
+// user) or a valid user name, and a shed belongs to a service client or to a
+// person, never both. The error wraps ErrInvalidShedRequestSentinel.
+func ValidateShedOwnership(owner, user string) error {
+	if user != "" && !ValidUserName(user) {
+		return fmt.Errorf("%w: %q is not a valid user name", ErrInvalidShedRequestSentinel, user)
+	}
+	if owner != "" && user != "" {
+		return fmt.Errorf("%w: a shed belongs to a service client or to a user, not both", ErrInvalidShedRequestSentinel)
+	}
+	return nil
+}
+
+// ShedOwnership returns the owner and user a stored shed is reported with. A
+// record that names both a service client and a user is invalid, and fails
+// closed: it is reported with no owner (so the service client does not reach
+// it) and with UserUnresolved (so no user does). Any other record is reported
+// as stored.
+func ShedOwnership(owner, user string) (string, string) {
+	if owner != "" && user != "" {
+		return "", UserUnresolved
+	}
+	return owner, user
+}
+
 // Shed represents a development environment container.
 type Shed struct {
 	Name string `json:"name" yaml:"name"`
@@ -207,6 +249,13 @@ type Shed struct {
 	// Empty for a shed an admin created, and for every shed created before
 	// service clients existed: those are admin-only.
 	Owner string `json:"owner,omitempty" yaml:"owner,omitempty"`
+	// User is the person (a user of the server) the shed belongs to. Empty
+	// is the implicit user of a server with no user list, and every shed
+	// created before users existed. A shed belongs to a service client
+	// (Owner) or to a person (User), never both; a stored record that names
+	// both is reported through ShedOwnership. UserUnresolved marks a shed
+	// whose records disagree about its user.
+	User string `json:"user,omitempty" yaml:"user,omitempty"`
 	// Mounts is the server-mount selection this shed starts with (top-level
 	// `mounts:`). A shed created before mount selection existed reports
 	// {"mode":"all"}.
@@ -812,6 +861,10 @@ type CreateShedRequest struct {
 	// nil ResolvedMounts (a non-API caller) stores {mode: all}.
 	Owner          string          `json:"-"`
 	ResolvedMounts *MountSelection `json:"-"`
+	// User is the person the shed is created for ("" for the implicit
+	// user). Like Owner it never comes from the wire (json:"-"), and the
+	// two are never both set (ValidateShedOwnership).
+	User string `json:"-"`
 }
 
 // SnapshotSchemaVersion is the current snapshot schema version. Bumped
@@ -860,6 +913,13 @@ type Snapshot struct {
 	// false, `shed create --from-snapshot` will fail until the lower
 	// image is pulled or rebuilt; surfaced by `shed snapshot info`.
 	LowerCached bool `json:"lower_cached,omitempty"`
+
+	// User is the person the snapshot belongs to: the user its source shed
+	// was reported with when it was taken (config.ShedOwnership), so a
+	// snapshot of a service client's shed has none. Empty is also the
+	// implicit user, and every snapshot written before users existed.
+	// Additive: the schema version is unchanged.
+	User string `json:"user,omitempty"`
 }
 
 // SnapshotCreateRequest is the request body for POST /api/snapshots.
@@ -867,6 +927,8 @@ type SnapshotCreateRequest struct {
 	Name       string `json:"name"`
 	SourceShed string `json:"source_shed"`
 	Comment    string `json:"comment,omitempty"`
+	// There is no User here: a snapshot records the user its source shed
+	// is reported with, never one a request names.
 }
 
 // SnapshotsResponse is returned by GET /api/snapshots.

@@ -394,6 +394,7 @@ func (b *Backend) Reported() []string {
 func (b *Backend) shedOf(r *state.Record) *config.Shed {
 	shed := r.Shed
 	shed.Backend = config.BackendRemote
+	shed.Owner, shed.User = ownership(r)
 	if r.Shed.Status == config.StatusRunning {
 		if hs, ok := b.credMgr.HealthTracker().Get(r.Shed.Name); ok {
 			lastHealthy := hs.LastSeen
@@ -403,6 +404,17 @@ func (b *Backend) shedOf(r *state.Record) *config.Shed {
 		}
 	}
 	return &shed
+}
+
+// ownership returns the service client and user a record is reported with.
+// A record that names both, or whose instance's shed_user label names
+// another user (Record.UserConflict), fails closed: no owner, and
+// config.UserUnresolved, which no caller's user can equal.
+func ownership(r *state.Record) (owner, user string) {
+	if r.UserConflict != "" {
+		return "", config.UserUnresolved
+	}
+	return config.ShedOwnership(r.Shed.Owner, r.Shed.User)
 }
 
 // saveLocked writes a record to disk. A failure is logged: the record in
@@ -485,7 +497,8 @@ func (b *Backend) lookupLocked(ctx context.Context, name string) (*state.Record,
 	if r == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 	}
-	if err := backend.CheckOwner(ctx, name, r.Shed.Owner); err != nil {
+	owner, _ := ownership(r)
+	if err := backend.CheckOwner(ctx, name, owner); err != nil {
 		return nil, err
 	}
 	if err := backend.CheckCreatedAt(ctx, name, r.Shed.CreatedAt); err != nil {

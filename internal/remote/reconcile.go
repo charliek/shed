@@ -192,6 +192,12 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 		b.records[id.Name] = rec
 		recordIDs[id.ID] = id.Name
 		b.logf("remote: reconcile: adopted shed %s (%s) as %s", id.Name, id.ID, rec.Shed.Status)
+		switch {
+		case rec.UserConflict != "":
+			note("adopted shed %s is labelled %s=%q, which is not a valid user name; only an admin can reach it until the label is corrected", id.Name, provider.LabelUser, id.User)
+		case id.Owner != "" && id.User != "":
+			note("adopted shed %s is labelled with owner %q and user %q; only an admin can reach it", id.Name, id.Owner, id.User)
+		}
 		if rec.Job != "" {
 			launch = append(launch, b.newJobLocked(rec.Job, id.Name, id.ID))
 		}
@@ -224,6 +230,9 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 		}
 		if r.Ref == "" {
 			r.Ref = inst.Ref
+			b.saveLocked(r)
+		}
+		if b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], note) {
 			b.saveLocked(r)
 		}
 		if r.Job == state.JobCreate && !r.Ready && inst.ShedState() == provider.ShedStateReady {
@@ -306,8 +315,95 @@ func (b *Backend) abandonedCreate(inst provider.Instance) bool {
 		!inst.CreatedAt.IsZero() && b.now().Sub(inst.CreatedAt) >= StaleCreateAge
 }
 
-// adoptedRecord rebuilds a shed's record from its instance: name, ID and
-// owner from labels, the shed-spec metadata, and the cloud's own facts.
+// reconcileUserLocked brings a record's user into line with the shed_user
+// label on its instance, and reports whether it changed the record (the
+// caller saves it). The label is written at create, beside the record, so the
+// two agree unless one was lost or changed:
+//
+//   - no user on the label (absent, or empty): the record stands;
+//   - a label that is a valid label value but not a valid user name
+//     (config.ValidUserName; no server writes one): a conflict, whatever the
+//     record says. It is never stored or reported as a user;
+//   - the record has neither a user nor an owner and the label has a user:
+//     the record lost it (a build that predates users rewrote it, or a
+//     rollback did) and takes the label's;
+//   - the record names another user, or an owner, and the label a user: a
+//     conflict.
+//
+// A conflict fails closed: the shed is reported with config.UserUnresolved,
+// so only an admin can reach it, until a read of the instance finds the two
+// in line again, which clears it. It is noted at every such read.
+//
+// It runs on every path that reads the shed's instance: the start-up pass,
+// whether the instance was in the list or read through the record's stored
+// reference (correct); the periodic pass, for every listed instance and every
+// correction it reads; and the create, start, probe and stop jobs
+// (noteInstance, resumeCommitted, reconcileUserFromLocked). A save that fails
+// leaves the record in memory as decided, and the next read decides again
+// from the label.
+func (b *Backend) reconcileUserLocked(r *state.Record, label string, note func(string, ...any)) bool {
+	conflict := ""
+	changed := false
+	switch {
+	case label == "":
+	case !config.ValidUserName(label):
+		conflict = label
+		note("shed %s: its instance is labelled %s=%q, which is not a valid user name; only an admin can reach it until the label is corrected",
+			r.Shed.Name, provider.LabelUser, label)
+	case label == r.Shed.User && r.Shed.Owner == "":
+	case r.Shed.User == "" && r.Shed.Owner == "":
+		r.Shed.User = label
+		changed = true
+		note("shed %s had no user on record and its instance is labelled %s=%s; recording that user", r.Shed.Name, provider.LabelUser, label)
+	default:
+		conflict = label
+		note("shed %s is recorded with user %q and owner %q and its instance is labelled %s=%q; only an admin can reach it until the two agree",
+			r.Shed.Name, r.Shed.User, r.Shed.Owner, provider.LabelUser, label)
+	}
+	if conflict != r.UserConflict {
+		if conflict == "" {
+			note("shed %s: its record and its instance's %s label agree again", r.Shed.Name, provider.LabelUser)
+		}
+		r.UserConflict = conflict
+		changed = true
+	}
+	return changed
+}
+
+// reconcileUserFromLocked is reconcileUserLocked from an instance a job or the
+// periodic pass read, for a caller that holds b.mu and saves the record when
+// it reports a change. An instance that does not carry the record's shed ID
+// in this environment, or is labelled by another version of the label set,
+// decides nothing.
+func (b *Backend) reconcileUserFromLocked(r *state.Record, inst provider.Instance) bool {
+	if inst.Labels[provider.LabelID] != r.Shed.ID || inst.Labels[provider.LabelEnv] != b.cfg.Environment || schemaOf(inst) != nil {
+		return false
+	}
+	return b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], b.logNote)
+}
+
+// reconcileUserRead is reconcileUserFromLocked under b.mu, for the shed's
+// current record (the incarnation id), saving it when it changed.
+func (b *Backend) reconcileUserRead(name, id string, inst provider.Instance) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r := b.currentLocked(name, id); r != nil && b.reconcileUserFromLocked(r, inst) {
+		b.saveLocked(r)
+	}
+}
+
+// logNote is the note reconcileUserLocked writes to outside the start-up
+// pass: the log alone.
+func (b *Backend) logNote(format string, args ...any) {
+	b.logf("remote: "+format, args...)
+}
+
+// adoptedRecord rebuilds a shed's record from its instance: name, ID, owner
+// and user from labels, the shed-spec metadata, and the cloud's own facts. A
+// label set that names both an owner and a user is adopted as it is, and
+// reported as config.ShedOwnership says (no one but an admin reaches it). A
+// shed_user label that is not a valid user name is not taken as the user: it
+// is adopted as a conflict (Record.UserConflict), reported unresolved.
 func (b *Backend) adoptedRecord(inst provider.Instance, id provider.Identity) (*state.Record, error) {
 	spec, err := inst.ShedSpec()
 	if err != nil {
@@ -338,6 +434,11 @@ func (b *Backend) adoptedRecord(inst provider.Instance, id provider.Identity) (*
 		Size:        spec.Size,
 		DiskGB:      inst.DiskGB,
 		MaxRun:      inst.MaxRun,
+	}
+	if config.ValidUserName(id.User) {
+		rec.Shed.User = id.User
+	} else {
+		rec.UserConflict = id.User // "" for no user
 	}
 	switch inst.State {
 	case provider.StateStopped:
@@ -385,6 +486,7 @@ func (b *Backend) runProbe(ctx context.Context, j *job) error {
 			r.Shed.StatusReason = ""
 			r.Job = ""
 			r.Address = ""
+			b.reconcileUserFromLocked(r, inst)
 		})
 		return nil
 	}

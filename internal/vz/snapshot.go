@@ -169,6 +169,17 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 		return nil, err
 	}
 
+	// The snapshot is its source's user's: the user the source is
+	// reported with, never one the request names. A source whose record
+	// names both a service client and a user is reported unresolved; it is
+	// refused rather than snapshotted, so no snapshot record ever carries
+	// config.UserUnresolved or an ownership the source does not have.
+	_, srcUser := config.ShedOwnership(srcMeta.Owner, srcMeta.User)
+	if srcUser == config.UserUnresolved {
+		return nil, fmt.Errorf("%w: source shed %s names both a service client and a user; its ownership must be resolved before it can be snapshotted",
+			config.ErrInvalidShedRequestSentinel, req.SourceShed)
+	}
+
 	if srcMeta.Status == config.StatusRunning {
 		return nil, fmt.Errorf("%w: %s", config.ErrSnapshotSourceRunningSentinel, req.SourceShed)
 	}
@@ -261,6 +272,7 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 		CreatedAt:       time.Now(),
 		SizeBytes:       sizeBytes,
 		LowerDigest:     srcMeta.LowerDigest,
+		User:            srcUser,
 	}
 
 	backend.Phase(ctx, "snapshot")

@@ -23,6 +23,13 @@ const (
 	// LabelOwner is the service client that owns the shed, or the empty
 	// string for a shed an admin created. The label is always present.
 	LabelOwner = "shed_owner"
+	// LabelUser is the person the shed belongs to, or the empty string for
+	// the implicit user (a server with no user list). It was added to
+	// SchemaVersion "1" without changing it, so an instance labelled
+	// before it existed carries no such key: absent means no user, the
+	// same as empty. The server writes it on every new instance. A shed
+	// never carries both a non-empty owner and a non-empty user.
+	LabelUser = "shed_user"
 	// LabelState is the lifecycle marker; see ShedState. It is on the
 	// instance only, not its disk.
 	LabelState = "shed_state"
@@ -38,7 +45,10 @@ const (
 
 // DiskLabelKeys are the labels a provider copies from Spec.Labels to the
 // boot disk at create, so a disk that outlives its instance can be traced.
-var DiskLabelKeys = []string{LabelSchema, LabelEnv, LabelID, LabelName, LabelOwner}
+//
+// A disk is labelled once, at create, so the disk of an instance made before
+// LabelUser existed carries no user label, and nothing adds one later.
+var DiskLabelKeys = []string{LabelSchema, LabelEnv, LabelID, LabelName, LabelOwner, LabelUser}
 
 // ShedState is the value of LabelState.
 type ShedState string
@@ -102,6 +112,9 @@ type Identity struct {
 	Name string
 	// Owner is the owning service client, or "" for an admin's shed.
 	Owner string
+	// User is the person the shed belongs to, or "" for the implicit
+	// user. Read from LabelUser; an instance without that label has none.
+	User string
 }
 
 // Validate checks that every field can be a label and that the instance name
@@ -116,6 +129,8 @@ func (i Identity) Validate() error {
 		return Errorf(ErrInvalid, "", "shed name %q cannot be a label", i.Name)
 	case !ValidLabelValue(i.Owner):
 		return Errorf(ErrInvalid, "", "owner %q cannot be a label", i.Owner)
+	case !ValidLabelValue(i.User):
+		return Errorf(ErrInvalid, "", "user %q cannot be a label", i.User)
 	}
 	return nil
 }
@@ -132,6 +147,7 @@ func (i Identity) Labels(state ShedState) map[string]string {
 		LabelID:     i.ID,
 		LabelName:   i.Name,
 		LabelOwner:  i.Owner,
+		LabelUser:   i.User,
 		LabelState:  string(state),
 	}
 }
@@ -149,6 +165,7 @@ func IdentityFromLabels(labels map[string]string) (Identity, error) {
 		ID:    labels[LabelID],
 		Name:  labels[LabelName],
 		Owner: labels[LabelOwner],
+		User:  labels[LabelUser],
 	}
 	if err := id.Validate(); err != nil {
 		return Identity{}, err

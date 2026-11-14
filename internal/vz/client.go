@@ -72,6 +72,11 @@ type Client struct {
 	// the resume liveness predicate can be exercised against synthetic
 	// processes (vanished PIDs, reused PIDs, wedged reads).
 	procCmdline func(ctx context.Context, pid int) (string, error)
+
+	// beforeStaleSave, when set, runs in GetShed between finding a shed's
+	// recorded VM gone and the save that records it stopped (tests: it
+	// forces another request in between).
+	beforeStaleSave func(name string)
 }
 
 // SetEgressManager attaches the egress-control proxy manager, called by
@@ -301,6 +306,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
 	}
+	if err := config.ValidateShedOwnership(req.Owner, req.User); err != nil {
+		return nil, err
+	}
 
 	// vmnet's NAT belongs to macOS: VZ cannot filter a guest, so it offers
 	// only the open profile (the API refuses earlier with 422; this is the
@@ -357,6 +365,18 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 // GetShed returns a shed by name.
 func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error) {
+	return c.getShed(ctx, name, false)
+}
+
+// getShedLocked is GetShed for a caller that already holds name's per-shed
+// lock (egress set and clear): a stale running record is recorded stopped
+// under that lock, which a try of the lock would never get.
+func (c *Client) getShedLocked(ctx context.Context, name string) (*config.Shed, error) {
+	return c.getShed(ctx, name, true)
+}
+
+// getShed is GetShed; held says whether the caller holds name's lock.
+func (c *Client) getShed(ctx context.Context, name string, held bool) (*config.Shed, error) {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
 		if errors.Is(err, ErrInstanceNotFound) {
@@ -364,7 +384,7 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 		}
 		return nil, err
 	}
-	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
+	if err := checkOwner(ctx, name, meta); err != nil {
 		return nil, err
 	}
 
@@ -372,16 +392,10 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 	if status == config.StatusRunning {
 		vm := &VM{meta: meta, cfg: c.cfg}
 		if !vm.IsRunning() {
+			c.recordStaleStopped(name, meta, held)
 			meta.Status = config.StatusStopped
 			meta.PID = 0
-			if err := meta.Save(c.cfg.InstanceDir); err != nil {
-				log.Printf("Warning: failed to save updated metadata for %q: %v", name, err)
-			}
 			status = config.StatusStopped
-			// Clean up stale health state for the stopped VM
-			if ht := c.credMgr.HealthTracker(); ht != nil {
-				ht.Remove(name)
-			}
 		}
 	}
 
@@ -410,6 +424,50 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 	}
 
 	return shed, nil
+}
+
+// recordStaleStopped records stopped a shed that GetShed read as running
+// (seen) and whose VM is gone. An unlocked read can be overtaken: the shed
+// may since have been started again, or deleted and replaced by another shed
+// of the same name. The save is therefore made under the per-shed lock, and
+// only to the record as it is now, when that is still the incarnation that
+// was read (same creation time) in the state that was read (running, same
+// pid), and when its recorded VM, checked again under the lock, is still
+// gone: a restart of the same shed can be handed the very pid the read saw
+// dead, and nothing in the record tells the two apart. Only the status and
+// pid change.
+//
+// held says the caller already holds the lock (getShedLocked), and the save
+// is made under it. Otherwise the lock is tried, never waited for: a read
+// must not queue behind a long lifecycle operation, and whoever holds it is
+// writing this record anyway. A skipped save is made by the next read.
+func (c *Client) recordStaleStopped(name string, seen *Metadata, held bool) {
+	if c.beforeStaleSave != nil {
+		c.beforeStaleSave(name)
+	}
+	if !held {
+		unlock, ok := c.shedLocks.TryAcquire(name)
+		if !ok {
+			return
+		}
+		defer unlock()
+	}
+	cur, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil || !cur.CreatedAt.Equal(seen.CreatedAt) || cur.Status != config.StatusRunning || cur.PID != seen.PID {
+		return
+	}
+	if (&VM{meta: cur, cfg: c.cfg}).IsRunning() {
+		return
+	}
+	cur.Status = config.StatusStopped
+	cur.PID = 0
+	if err := cur.Save(c.cfg.InstanceDir); err != nil {
+		log.Printf("Warning: failed to save updated metadata for %q: %v", name, err)
+	}
+	// Clean up stale health state for the stopped VM
+	if ht := c.credMgr.HealthTracker(); ht != nil {
+		ht.Remove(name)
+	}
 }
 
 // ListSheds returns all sheds.
@@ -444,7 +502,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 		return err
 	}
 	// Checked under the per-shed lock, against the shed being deleted.
-	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
+	if err := checkOwner(ctx, name, meta); err != nil {
 		return err
 	}
 	if err := backend.CheckCreatedAt(ctx, name, meta.CreatedAt); err != nil {
@@ -535,7 +593,7 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		}
 		return nil, err
 	}
-	if err := backend.CheckOwner(ctx, name, meta.Owner); err != nil {
+	if err := checkOwner(ctx, name, meta); err != nil {
 		return nil, err
 	}
 	if err := backend.CheckCreatedAt(ctx, name, meta.CreatedAt); err != nil {
@@ -682,7 +740,7 @@ func (c *Client) SetShedEgress(ctx context.Context, name string, profiles []stri
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		return nil, fmt.Errorf("egress: save metadata: %w", err)
 	}
-	return c.GetShed(ctx, name)
+	return c.getShedLocked(ctx, name)
 }
 
 // ClearShedEgress turns egress off for a shed (live on a running shed).
@@ -715,11 +773,12 @@ func (c *Client) clearShedEgressLocked(ctx context.Context, meta *Metadata) (*co
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		return nil, fmt.Errorf("egress: save metadata: %w", err)
 	}
-	return c.GetShed(ctx, meta.Name)
+	return c.getShedLocked(ctx, meta.Name)
 }
 
 // metadataToShed converts VZ metadata to a config.Shed response.
 func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
+	owner, user := config.ShedOwnership(meta.Owner, meta.User)
 	return &config.Shed{
 		Name:           meta.Name,
 		Status:         meta.Status,
@@ -740,7 +799,8 @@ func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 		EgressProfiles: meta.EgressProfiles,
 		EgressPort:     meta.EgressPort,
 		EgressToken:    meta.EgressToken,
-		Owner:          meta.Owner,
+		Owner:          owner,
+		User:           user,
 		Mounts:         config.EffectiveMountSelection(meta.MountSelection),
 		NetworkProfile: config.EffectiveNetworkProfile(meta.NetworkProfile),
 	}
@@ -870,13 +930,23 @@ func (c *Client) ResetShed(ctx context.Context, name string) (*config.Shed, erro
 	return metadataToShed(meta, ""), nil
 }
 
-// checkOwnerLocked applies backend.CheckOwner to the shed's stored owner, for
-// an operation that holds the per-shed lock and loads the metadata itself
-// later. A shed that cannot be loaded is left to the operation to report.
+// checkOwnerLocked applies checkOwner to the shed's stored record, for an
+// operation that holds the per-shed lock and loads the metadata itself later.
+// A shed that cannot be loaded is left to the operation to report.
 func (c *Client) checkOwnerLocked(ctx context.Context, name string) error {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
 		return nil
 	}
-	return backend.CheckOwner(ctx, name, meta.Owner)
+	return checkOwner(ctx, name, meta)
+}
+
+// checkOwner applies backend.CheckOwner to the owner the shed is reported
+// with (config.ShedOwnership), never the raw stored one: a record that names
+// both a service client and a user reaches no service client, here as at the
+// API. Every authorization read of a record goes through it. The credential
+// bus still reads the raw owner, so such a record keeps the bus off.
+func checkOwner(ctx context.Context, name string, meta *Metadata) error {
+	owner, _ := config.ShedOwnership(meta.Owner, meta.User)
+	return backend.CheckOwner(ctx, name, owner)
 }

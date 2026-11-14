@@ -28,7 +28,28 @@ func New() *NamedMutexMap {
 // internal/vz/client.go's acquireSnapshotLock vs acquireCreateLock comments).
 // AB-BA deadlock between distinct NamedMutexMaps is the caller's responsibility.
 func (m *NamedMutexMap) Acquire(name string) func() {
+	mu := m.mutex(name)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// TryAcquire takes the per-name mutex only if no one holds it, and reports
+// whether it did; it never waits. On success the caller MUST call the
+// returned unlock closure. It is for work that is worth doing only when it
+// costs no wait and cannot deadlock against a caller that already holds the
+// lock, such as a read path's opportunistic repair of a stale record.
+func (m *NamedMutexMap) TryAcquire(name string) (func(), bool) {
+	mu := m.mutex(name)
+	if !mu.TryLock() {
+		return nil, false
+	}
+	return mu.Unlock, true
+}
+
+// mutex returns name's mutex, making it on first use.
+func (m *NamedMutexMap) mutex(name string) *sync.Mutex {
 	m.guard.Lock()
+	defer m.guard.Unlock()
 	if m.locks == nil {
 		m.locks = make(map[string]*sync.Mutex)
 	}
@@ -37,7 +58,5 @@ func (m *NamedMutexMap) Acquire(name string) func() {
 		mu = &sync.Mutex{}
 		m.locks[name] = mu
 	}
-	m.guard.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return mu
 }

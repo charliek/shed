@@ -57,6 +57,9 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
 	}
+	if err := config.ValidateShedOwnership(req.Owner, req.User); err != nil {
+		return nil, err
+	}
 	switch {
 	case req.LocalDir != "":
 		return nil, fmt.Errorf("%w: local_dir on the remote backend", config.ErrFeatureUnsupportedSentinel)
@@ -140,7 +143,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	maxRun := b.runLimit(req.Owner)
 
 	spec, err := provider.NewSpec(
-		provider.Identity{Env: b.cfg.Environment, ID: id, Name: req.Name, Owner: req.Owner},
+		provider.Identity{Env: b.cfg.Environment, ID: id, Name: req.Name, Owner: req.Owner, User: req.User},
 		provider.ShedSpec{CreatedAt: createdAt, Repo: storedRepo, Network: network, LandingDir: landingDir},
 		b.opts.AuthorizedKeys, size, diskGB, image, maxRun,
 	)
@@ -161,6 +164,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 			LandingDir:     landingDir,
 			Image:          image,
 			Owner:          req.Owner,
+			User:           req.User,
 			NetworkProfile: network,
 		},
 		Env:         b.cfg.Environment,

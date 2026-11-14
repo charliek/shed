@@ -174,7 +174,7 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 	// The shed actually dialed is the one checked: the API server's earlier
 	// lookups may have seen a shed since deleted and recreated by another
 	// caller under this name.
-	if err := backend.CheckOwner(ctx, shedName, meta.Owner); err != nil {
+	if err := checkOwner(ctx, shedName, meta); err != nil {
 		return err
 	}
 

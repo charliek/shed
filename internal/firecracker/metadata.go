@@ -135,6 +135,11 @@ type Metadata struct {
 	// An owned shed has the credential bus off.
 	Owner string `json:"owner,omitempty"`
 
+	// User is the person the shed belongs to ("" for the implicit user,
+	// and for every shed created before users existed). Additive: the
+	// metadata version is unchanged. Never set together with Owner.
+	User string `json:"user,omitempty"`
+
 	// MountSelection is the server-mount selection the shed starts with,
 	// honoured on every start. New sheds always store it explicitly; a
 	// missing value (an older shed) means every mount.

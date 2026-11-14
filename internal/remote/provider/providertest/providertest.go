@@ -112,6 +112,7 @@ func Run(t *testing.T, h Harness) {
 		{"create refuses a bad spec", testCreateInvalid},
 		{"stop and start", testStopStart},
 		{"labels", testLabels},
+		{"user label", testUserLabel},
 		{"metadata", testMetadata},
 		{"destroy", testDestroy},
 		{"missing instance", testMissing},
@@ -385,6 +386,45 @@ func testLabels(t *testing.T, h Harness) {
 	}
 	if err := p.SetLabels(ctx, ref, map[string]string{"shed_state": "Not Valid"}); !errors.Is(err, provider.ErrInvalid) {
 		t.Errorf("SetLabels(bad value) = %v, want ErrInvalid", err)
+	}
+}
+
+// testUserLabel: shed_user is carried from the spec to the instance, read
+// back into the Identity, and can be changed and emptied later (an admin's
+// assignment of a shed made before users existed writes it).
+func testUserLabel(t *testing.T, h Harness) {
+	p, _ := h.New(t)
+	ctx := h.ctx(t)
+	spec := h.Spec(t, h.Env, "eta")
+	spec.Labels[provider.LabelOwner] = ""
+	spec.Labels[provider.LabelUser] = "alice"
+	pend, err := p.Create(ctx, spec)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	inst, err := p.Wait(ctx, pend)
+	if err != nil {
+		t.Fatalf("Wait(create): %v", err)
+	}
+	id, err := inst.Identity()
+	if err != nil {
+		t.Fatalf("Identity: %v", err)
+	}
+	if id.User != "alice" || id.Owner != "" {
+		t.Errorf("identity after create = %+v, want user alice and no owner", id)
+	}
+	if err := p.SetLabels(ctx, inst.Ref, map[string]string{provider.LabelUser: "bob"}); err != nil {
+		t.Fatalf("SetLabels(user): %v", err)
+	}
+	if got, _ := p.Get(ctx, inst.Ref); got.Labels[provider.LabelUser] != "bob" {
+		t.Errorf("user = %q after SetLabels, want bob", got.Labels[provider.LabelUser])
+	}
+	if err := p.SetLabels(ctx, inst.Ref, map[string]string{provider.LabelUser: ""}); err != nil {
+		t.Fatalf("SetLabels(empty user): %v", err)
+	}
+	got, _ := p.Get(ctx, inst.Ref)
+	if id, err := got.Identity(); err != nil || id.User != "" {
+		t.Errorf("identity after emptying the user = %+v, %v; want no user", id, err)
 	}
 }
 

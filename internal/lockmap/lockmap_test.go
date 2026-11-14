@@ -115,3 +115,32 @@ func TestTwoMapsConsistentOrderNoDeadlock(t *testing.T) {
 		t.Fatal("consistent-order acquires deadlocked")
 	}
 }
+
+// TryAcquire takes a free name's mutex, never waits for a held one, and the
+// name is free again once its holder releases it.
+func TestTryAcquire(t *testing.T) {
+	m := New()
+	release, ok := m.TryAcquire("a")
+	if !ok {
+		t.Fatal("TryAcquire of a free name failed")
+	}
+	if _, ok := m.TryAcquire("a"); ok {
+		t.Fatal("TryAcquire of a held name succeeded")
+	}
+	if r, ok := m.TryAcquire("b"); !ok {
+		t.Fatal("TryAcquire of another name failed")
+	} else {
+		r()
+	}
+	release()
+	held := m.Acquire("a")
+	if _, ok := m.TryAcquire("a"); ok {
+		t.Fatal("TryAcquire succeeded while Acquire holds the name")
+	}
+	held()
+	if r, ok := m.TryAcquire("a"); !ok {
+		t.Fatal("TryAcquire after release failed")
+	} else {
+		r()
+	}
+}

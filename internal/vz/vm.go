@@ -406,8 +406,13 @@ func (vm *VM) IsRunning() bool {
 	}
 
 	// Guard against PID reuse: verify the process is actually vfkit.
-	return isVfkitProcess(vm.meta.PID)
+	return runningVfkit(vm.meta.PID)
 }
+
+// runningVfkit is IsRunning's identity check. A package-level seam so a test
+// can make a pid read as gone and then as a restarted vfkit; never reassigned
+// at runtime.
+var runningVfkit = isVfkitProcess
 
 // waitForProcessExit polls until a process exits or timeout expires.
 func waitForProcessExit(pid int, timeout time.Duration) bool {

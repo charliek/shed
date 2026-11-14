@@ -71,7 +71,9 @@ type sweepCheck struct {
 //     it, so a VM that costs money is never shown as stopped;
 //   - gives a shed left "stopping" by a failed cloud call a new stop job;
 //   - runs again the create or start of a shed kept "starting" because the
-//     cloud could not be read when its job looked (Backend.keep).
+//     cloud could not be read when its job looked (Backend.keep);
+//   - brings each listed shed's user into line with its instance's
+//     shed_user label (reconcileUserLocked).
 //
 // It destroys nothing itself: only a delete job does, and a delete job exists
 // only for a delete marker. Each correction is confirmed with a fresh read of
@@ -154,6 +156,7 @@ func (b *Backend) Sweep(ctx context.Context) error {
 			continue
 		}
 		inst, listed := byID[r.Shed.ID]
+		scheduled := len(checks) + len(launch)
 		switch r.Shed.Status {
 		case config.StatusStarting:
 			// A create or start with no job is one that was kept because
@@ -179,6 +182,14 @@ func (b *Backend) Sweep(ctx context.Context) error {
 			if r.Ref != "" && (!listed || inst.State == provider.StateRunning || inst.State == provider.StateStarting) {
 				checks = append(checks, sweepCheck{name: name, id: r.Shed.ID, ref: r.Ref, status: r.Shed.Status, listed: listed})
 			}
+		}
+		// A listed instance that needs no correction and no job (its state
+		// matches the record) is still a read of its shed_user label, so a
+		// label that changes on a shed that keeps running is noticed at
+		// this pass, not at its next restart. A correction or a job reads
+		// the instance again and reconciles there.
+		if listed && carriers[r.Shed.ID] == 1 && len(checks)+len(launch) == scheduled && b.reconcileUserFromLocked(r, inst) {
+			b.saveLocked(r)
 		}
 	}
 	b.mu.Unlock()
@@ -222,6 +233,9 @@ func (b *Backend) correct(ctx context.Context, c sweepCheck) {
 	if r == nil || b.closed || b.jobs[c.name] != nil || r.Shed.Status != c.status || r.Ref != c.ref {
 		b.mu.Unlock()
 		return // a request got there first
+	}
+	if !gone && b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], b.logNote) {
+		b.saveLocked(r)
 	}
 	switch {
 	case gone && !c.listed:
