@@ -26,13 +26,24 @@ func (s *Server) handleSFTP(sess ssh.Session) {
 		return
 	}
 
-	ctx := sess.Context()
-
-	if _, err := s.ensureRunning(ctx, shedName, sess.Stderr(), false); err != nil {
+	// The channel's principal, from the key the connection authenticated
+	// with, resolved again for this channel.
+	p, err := s.principalFor(sess.Context())
+	if err != nil {
+		log.Printf("SFTP session refused: user=%s: %v", user, err)
 		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
 		_ = sess.Exit(1)
 		return
 	}
+	ctx := backend.WithPrincipal(sess.Context(), p)
+
+	shed, err := s.ensureRunning(ctx, shedName, sess.Stderr(), false)
+	if err != nil {
+		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
+		_ = sess.Exit(1)
+		return
+	}
+	ctx = backend.PinCreatedAt(ctx, shed.CreatedAt)
 
 	opts := backend.ExecOptions{
 		Cmd:    []string{"/usr/lib/openssh/sftp-server"},

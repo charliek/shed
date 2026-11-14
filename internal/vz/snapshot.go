@@ -157,8 +157,14 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	defer c.acquireSnapshotLock(req.Name)()
 	defer c.acquireCreateLock(req.SourceShed)()
 
+	// Only a definitive "no such snapshot" frees the name. A snapshot.json
+	// that cannot be read or parsed is still someone's snapshot (whose, it
+	// does not say): it is never treated as absent and overwritten.
 	if _, err := loadSnapshot(c.cfg.SnapshotsDir, req.Name); err == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrSnapshotAlreadyExistsSentinel, req.Name)
+	} else if !errors.Is(err, config.ErrSnapshotNotFoundSentinel) {
+		log.Printf("snapshot %s: refusing to create over an existing snapshot whose metadata cannot be read: %v", req.Name, err)
+		return nil, fmt.Errorf("%w: %s (its metadata cannot be read, so it is left alone)", config.ErrSnapshotAlreadyExistsSentinel, req.Name)
 	}
 
 	srcMeta, err := LoadMetadata(c.cfg.InstanceDir, req.SourceShed)
@@ -166,6 +172,11 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 		if errors.Is(err, ErrInstanceNotFound) {
 			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, req.SourceShed)
 		}
+		return nil, err
+	}
+	// Checked under the source's lock, against the shed being snapshotted:
+	// the incarnation the caller was authorized to enter.
+	if err := checkIdentity(ctx, req.SourceShed, srcMeta); err != nil {
 		return nil, err
 	}
 
@@ -332,14 +343,20 @@ func (c *Client) augmentSnapshot(snap *config.Snapshot) {
 }
 
 // DeleteSnapshot removes a snapshot from disk.
-func (c *Client) DeleteSnapshot(_ context.Context, name string) error {
+func (c *Client) DeleteSnapshot(ctx context.Context, name string) error {
 	if err := config.ValidateSnapshotName(name); err != nil {
 		return err
 	}
 
 	defer c.acquireSnapshotLock(name)()
 
-	if _, err := loadSnapshot(c.cfg.SnapshotsDir, name); err != nil {
+	snap, err := loadSnapshot(c.cfg.SnapshotsDir, name)
+	if err != nil {
+		return err
+	}
+	// Checked under the snapshot lock, against the snapshot being deleted:
+	// the one the caller was authorized for (backend.WithRequiredSnapshot).
+	if err := backend.CheckSnapshot(ctx, name, snap); err != nil {
 		return err
 	}
 

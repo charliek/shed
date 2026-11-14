@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,7 +26,10 @@ import (
 
 // Server is an SSH server that connects users to shed containers.
 type Server struct {
-	sshServer   *ssh.Server
+	sshServer *ssh.Server
+	// backend is always a *backend.Guard (or nil in tests that open no
+	// channel): every call is decided by the access rule for the principal
+	// each channel resolves from its connection's key (principalFor).
 	backend     backend.Backend
 	hostKeyPath string
 	listenAddr  string
@@ -64,9 +68,16 @@ func (k KeyAuth) known(fingerprint string) bool { return users.HasKey(k.Users, f
 // ":2222" for all interfaces).
 // keyAuth gates public-key auth; its zero value (mode off) is the legacy
 // accept-all behavior.
+//
+// b is wrapped in a backend.Guard unless it is one already (shed-server passes
+// the one Guard the API server shares).
 func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termConfig *terminal.Config, keyAuth KeyAuth) (*Server, error) {
+	var guarded backend.Backend
+	if b != nil {
+		guarded = backend.Guarded(b)
+	}
 	s := &Server{
-		backend:     b,
+		backend:     guarded,
 		hostKeyPath: hostKeyPath,
 		listenAddr:  listenAddr,
 		termConfig:  termConfig,
@@ -86,9 +97,17 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
 			return s.handlePublicKey(ctx, key)
 		},
-		ServerConfigCallback: func(ssh.Context) *gossh.ServerConfig {
+		ServerConfigCallback: func(ctx ssh.Context) *gossh.ServerConfig {
 			maxTries := s.effectiveMaxAuthTries()
 			cfg := &gossh.ServerConfig{MaxAuthTries: maxTries}
+			// The connection's identity is the key whose signature x/crypto
+			// verified, recorded only then (connIdentity). It is never taken
+			// from a key the client merely asked about: a client may offer
+			// several keys, and have more than one accepted, before it signs.
+			cfg.VerifiedPublicKeyCallback = func(_ gossh.ConnMetadata, key gossh.PublicKey, perms *gossh.Permissions, _ string) (*gossh.Permissions, error) {
+				setConnIdentity(ctx, key)
+				return perms, nil
+			}
 			// Best-effort diagnostic from the transport's authoritative per-attempt
 			// log (one closure per connection): warn once when a connection exhausts
 			// the public-key attempt cap — usually a many-key agent (1Password,
@@ -245,6 +264,15 @@ func (s *Server) effectiveMaxAuthTries() int {
 // is logged but accepted; in enforce mode it is rejected. The username (which
 // selects the shed) is unaffected — identity comes from the key, GitHub-style.
 // Applies uniformly to all usernames, including `_api`.
+//
+// It decides only: it records nothing. A client may ask about several keys
+// before it signs with one, so a key this accepts is not yet the connection's
+// identity. The key whose signature x/crypto then verifies is recorded on the
+// connection by the VerifiedPublicKeyCallback (connIdentity), and each channel
+// resolves its principal from that (principalFor), so a key that leaves the
+// lookup or expires stops opening new channels. identity_test.go pins that a
+// key that was asked about but not used to sign never becomes the identity,
+// of a session or of a certificate at _bootstrap.
 func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	fingerprint := gossh.FingerprintSHA256(key)
 	user := ctx.User()
@@ -296,13 +324,28 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 		return
 	}
 
-	// Look up container for this shed
-	shed, err := s.backend.GetShed(ctx, user)
+	// The channel's principal, from the key the connection authenticated
+	// with, resolved again for this channel.
+	p, err := s.principalFor(ctx)
 	if err != nil {
-		log.Printf("Port forward: shed not found for user %s: %v", user, err)
+		log.Printf("Port forward refused: user=%s: %v", user, err)
+		_ = newChan.Reject(gossh.Prohibited, err.Error())
+		return
+	}
+	bctx := backend.WithPrincipal(ctx, p)
+
+	// Look up the shed and check the right to enter it.
+	shed, err := s.guard().Check(bctx, user, backend.ActionEnter)
+	if err != nil {
+		log.Printf("Port forward refused: user=%s principal=%s: %v", user, p, err)
+		if errors.Is(err, config.ErrForbiddenSentinel) {
+			_ = newChan.Reject(gossh.Prohibited, forbiddenMessage(user, err))
+			return
+		}
 		_ = newChan.Reject(gossh.ConnectionFailed, "shed not found")
 		return
 	}
+	bctx = backend.PinCreatedAt(bctx, shed.CreatedAt)
 
 	// Validate port range (SSH protocol uses uint32, TCP ports are uint16).
 	if d.DestPort > 65535 {
@@ -312,7 +355,7 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 	}
 
 	// Connect to the service inside the VM via DialService.
-	dialCtx, dialCancel := context.WithTimeout(ctx, 30*time.Second)
+	dialCtx, dialCancel := context.WithTimeout(bctx, 30*time.Second)
 	defer dialCancel()
 	dconn, err := s.backend.DialService(dialCtx, shed.Name, uint16(d.DestPort))
 	if err != nil {

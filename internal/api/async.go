@@ -149,7 +149,15 @@ func (s *Server) createAndWait(ctx context.Context, jobCtx context.Context, al b
 // ErrShedNotFoundSentinel, which here means success; a destroy that failed
 // comes back as another error and is reported, so "deleted" is never said of
 // a VM that still exists.
+//
+// Through the access guard (always, in this server) the delete and the wait
+// are one call: the wait is authorized with the delete, follows the
+// incarnation the delete acted on through its tombstone, and needs no
+// second lookup of a record that is already gone.
 func (s *Server) deleteAndWait(ctx context.Context, jobCtx context.Context, al backend.AsyncLifecycle, name string) error {
+	if d, ok := al.(backend.AsyncDeleter); ok {
+		return d.DeleteAndWait(ctx, jobCtx, name)
+	}
 	if err := s.backend.DeleteShed(jobCtx, name); err != nil {
 		return err
 	}

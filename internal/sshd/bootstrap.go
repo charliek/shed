@@ -99,8 +99,24 @@ func (s *Server) SetBootstrap(info BootstrapInfo) {
 // handleBootstrap serves a reserved `_bootstrap` SSH session: it issues a
 // client certificate over the already-authenticated SSH channel and returns the
 // bundle (the certificate plus the TLS pin + port) as a single JSON line. It never touches the shed routing or the shell wrap.
+//
+// The certificate is issued for the key the connection authenticated with,
+// as recorded by handlePublicKey (connIdentity), and only while that key
+// still resolves to a user for this channel (principalFor).
 func (s *Server) handleBootstrap(sess ssh.Session) {
-	bundle, err := s.mintBootstrap(sess.PublicKey(), sess.RawCommand())
+	var key gossh.PublicKey
+	if id, ok := connIdentityFrom(sess.Context()); ok {
+		key = id.key
+	}
+	if s.keyAuth.enforced() {
+		if _, err := s.principalFor(sess.Context()); err != nil {
+			log.Printf("bootstrap refused: %v", err)
+			fmt.Fprintln(sess.Stderr(), "bootstrap: key not authorized")
+			_ = sess.Exit(1)
+			return
+		}
+	}
+	bundle, err := s.mintBootstrap(key, sess.RawCommand())
 	if err != nil {
 		fmt.Fprintf(sess.Stderr(), "%v\n", err)
 		_ = sess.Exit(1)

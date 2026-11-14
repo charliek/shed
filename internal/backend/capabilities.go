@@ -29,8 +29,17 @@ type AsyncLifecycle interface {
 	WaitSettled(ctx context.Context, name string) (*config.Shed, error)
 }
 
-// IsAsync returns b as an AsyncLifecycle when it is one.
+// IsAsync returns b as an AsyncLifecycle when it is one. Through a Guard it
+// returns a guarded one (which also implements AsyncDeleter) when the backend
+// the Guard wraps is asynchronous.
 func IsAsync(b Backend) (AsyncLifecycle, bool) {
+	if g, ok := b.(*Guard); ok {
+		inner, ok := IsAsync(g.inner)
+		if !ok {
+			return nil, false
+		}
+		return guardedAsync{g: g, inner: inner}, true
+	}
 	a, ok := b.(AsyncLifecycle)
 	return a, ok
 }
@@ -52,6 +61,7 @@ func SupportsNetworkProfile(b Backend, profile string) bool {
 	if b == nil {
 		return false
 	}
+	b = unwrap(b)
 	if np, ok := b.(NetworkProfiles); ok {
 		return np.SupportsNetworkProfile(profile)
 	}
@@ -98,6 +108,20 @@ type CapabilityReporter interface {
 	Capabilities() Capabilities
 }
 
+// ReportedCapabilities returns what b says it offers when it reports its own
+// capabilities (CapabilityReporter), seeing through a Guard. ok is false for
+// a backend that does not report (Firecracker, VZ).
+func ReportedCapabilities(b Backend) (Capabilities, bool) {
+	if b == nil {
+		return Capabilities{}, false
+	}
+	r, ok := unwrap(b).(CapabilityReporter)
+	if !ok {
+		return Capabilities{}, false
+	}
+	return r.Capabilities(), true
+}
+
 // CapabilitiesOf returns what b offers. A backend that does not implement
 // CapabilityReporter is a local VM backend and offers every feature (egress
 // profiles still depend on the server's egress config and on the backend
@@ -106,6 +130,7 @@ func CapabilitiesOf(b Backend) Capabilities {
 	if b == nil {
 		return Capabilities{}
 	}
+	b = unwrap(b)
 	if r, ok := b.(CapabilityReporter); ok {
 		return r.Capabilities()
 	}

@@ -36,8 +36,8 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	// Only a backend that reports its own capabilities (remote) states its
 	// isolation kind; Firecracker and VZ answer exactly as before.
-	if r, ok := s.backend.(backend.CapabilityReporter); ok {
-		info.Isolation = r.Capabilities().Isolation
+	if caps, ok := backend.ReportedCapabilities(s.backend); ok {
+		info.Isolation = caps.Isolation
 	}
 	// Client-CA visibility, mtls only. Reaching /api/info in mtls mode already
 	// required a valid client certificate (that mode has no bootstrap
@@ -71,7 +71,8 @@ func (s *Server) handleListSheds(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A service client sees only the sheds it owns.
+	// The access guard lists only the sheds the caller may view; a service
+	// client's list is filtered again here, by owner, as before the guard.
 	if c := callerFrom(r.Context()); c.IsClient() {
 		owned := make([]config.Shed, 0, len(sheds))
 		for _, sh := range sheds {
@@ -111,9 +112,13 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Owner and ResolvedMounts are server-set (json:"-" already keeps them
-	// off the wire); start from zero whatever the decoder did.
+	// Owner, User, NoServerEnv and ResolvedMounts are server-set
+	// (json:"-" already keeps them off the wire); start from zero whatever
+	// the decoder did. The access guard stamps the owner and user from the
+	// caller's principal.
 	req.Owner = ""
+	req.User = ""
+	req.NoServerEnv = false
 	req.ResolvedMounts = nil
 	// The shed ID is server-minted, like Owner. Only an asynchronous backend
 	// (remote) stores it today; Firecracker and VZ get none.
@@ -151,6 +156,11 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 			writePolicyViolation(w, caller, rule)
 			return
 		}
+	} else if field := s.userCreateRefusal(caller, &req); field != "" {
+		// A user who is not an admin may not use what is shared on the host.
+		// Like the client policy this runs before anything reads the host.
+		writeError(w, http.StatusForbidden, config.ErrForbidden, "admin only: "+field)
+		return
 	}
 
 	// Fields the backend cannot honour are refused here, before any check
@@ -501,23 +511,38 @@ func (s *Server) handleEgressShow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.egressAudit != nil {
-		status.Recent = s.egressAudit.Recent(name, 50)
+		status.Recent = recentForShed(s.egressAudit.Recent(name, 0), shed, 50)
 	}
 	writeJSON(w, http.StatusOK, status)
 }
 
-// egressController is the optional backend capability for live egress changes.
-// The native vz/fc backends implement it; a backend that doesn't yields a 501.
-type egressController interface {
-	SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error)
-	ClearShedEgress(ctx context.Context, name string) (*config.Shed, error)
+// recentForShed returns up to limit of recs (oldest first) that belong to
+// shed's incarnation and not to an earlier shed of the same name: a record
+// stamped with an incarnation must carry shed's creation time, and one with
+// none (written before records carried it) must not be older than shed.
+func recentForShed(recs []egress.AuditRecord, shed *config.Shed, limit int) []egress.AuditRecord {
+	out := recs[:0] // recs is the caller's own copy: filter it in place
+	for _, rec := range recs {
+		if !rec.ShedCreatedAt.IsZero() {
+			if !rec.ShedCreatedAt.Equal(shed.CreatedAt) {
+				continue
+			}
+		} else if rec.Time.Before(shed.CreatedAt) {
+			continue
+		}
+		out = append(out, rec)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out
 }
 
 // handleEgressSet applies a profile selection to a shed (live on a running one).
 // POST /api/egress/{name}  body: {"profiles":["base","github"]}
 func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
-	ec, ok := s.backend.(egressController)
+	ec, ok := backend.AsEgressController(s.backend)
 	if !ok {
 		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not supported by this backend")
 		return
@@ -583,7 +608,7 @@ func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/egress/{name}
 func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
-	ec, ok := s.backend.(egressController)
+	ec, ok := backend.AsEgressController(s.backend)
 	if !ok {
 		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not supported by this backend")
 		return
@@ -794,6 +819,11 @@ func (s *Server) handleListAllSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		sessions, err := s.backend.ListSessions(r.Context(), shed.Name)
 		if err != nil {
+			// A shed the caller may list but not enter (an admin and
+			// another user's shed) is left out without a warning.
+			if errors.Is(err, config.ErrForbiddenSentinel) {
+				continue
+			}
 			// Record warning for sheds where we can't list sessions
 			if errors.Is(err, config.ErrTmuxNotAvailableSentinel) {
 				warnings = append(warnings, "shed "+shed.Name+": tmux not available")
@@ -848,12 +878,27 @@ func backendErrorFor(ctx context.Context, err error) (int, string, string) {
 	return status, code, msg
 }
 
+// mapAccessError maps the access guard's refusals (no principal, forbidden, a
+// shed the caller may not see) to an HTTP status code, error code, and
+// message. ok is false for any other error.
+func mapAccessError(err error) (status int, code, msg string, ok bool) {
+	switch {
+	case errors.Is(err, backend.ErrNoPrincipal):
+		return http.StatusInternalServerError, config.ErrInternalError, err.Error(), true
+	case errors.Is(err, config.ErrForbiddenSentinel):
+		return http.StatusForbidden, config.ErrForbidden, err.Error(), true
+	case errors.Is(err, config.ErrShedNotFoundSentinel):
+		return http.StatusNotFound, config.ErrShedNotFound, err.Error(), true
+	}
+	return 0, "", "", false
+}
+
 // mapBackendError maps a backend error to an HTTP status code, error code, and message.
 func mapBackendError(err error) (int, string, string) {
-	// Check sentinel errors
-	if errors.Is(err, config.ErrShedNotFoundSentinel) {
-		return http.StatusNotFound, config.ErrShedNotFound, err.Error()
+	if status, code, msg, ok := mapAccessError(err); ok {
+		return status, code, msg
 	}
+	// Check sentinel errors
 	if errors.Is(err, config.ErrShedAlreadyExistsSentinel) {
 		return http.StatusConflict, config.ErrShedAlreadyExists, err.Error()
 	}
@@ -952,6 +997,9 @@ func mapBackendError(err error) (int, string, string) {
 
 // mapSessionError maps a session-related error to an HTTP status code, error code, and message.
 func mapSessionError(err error) (int, string, string) {
+	if status, code, msg, ok := mapAccessError(err); ok {
+		return status, code, msg
+	}
 	// Check for specific sentinel errors using errors.Is
 	if errors.Is(err, config.ErrSessionNotFoundSentinel) {
 		return http.StatusNotFound, config.ErrSessionNotFound, err.Error()

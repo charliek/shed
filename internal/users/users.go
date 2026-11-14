@@ -72,6 +72,12 @@ type Key struct {
 	Script bool
 }
 
+// Expired reports whether k has stopped being accepted at now: it has an
+// expiry, and now is not before it.
+func (k Key) Expired(now time.Time) bool {
+	return !k.Expires.IsZero() && !now.Before(k.Expires)
+}
+
 // Lookup is the user seam. Implementations must answer from live state (a key
 // that leaves its source must stop resolving as soon as the implementation
 // notices) and must be safe for concurrent use.

@@ -41,8 +41,11 @@ func (f *snapshotFakeBackend) CreateShed(ctx context.Context, req config.CreateS
 	}
 	panic("unexpected")
 }
-func (f *snapshotFakeBackend) GetShed(_ context.Context, _ string) (*config.Shed, error) {
-	panic("unexpected")
+
+// GetShed reports every name as an existing shed: the access guard loads a
+// snapshot's source shed before it lets a snapshot through.
+func (f *snapshotFakeBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
+	return &config.Shed{Name: name}, nil
 }
 func (f *snapshotFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
 	panic("unexpected")
@@ -99,7 +102,14 @@ func (f *snapshotFakeBackend) CreateSnapshot(_ context.Context, req config.Snaps
 	f.createCalled = req
 	return f.createResp, f.createErr
 }
-func (f *snapshotFakeBackend) GetSnapshot(_ context.Context, _ string) (*config.Snapshot, error) {
+
+// GetSnapshot returns the configured answer; with none it reports the name
+// as an existing snapshot, since the access guard loads a snapshot before it
+// lets a delete through.
+func (f *snapshotFakeBackend) GetSnapshot(_ context.Context, name string) (*config.Snapshot, error) {
+	if f.getResp == nil && f.getErr == nil {
+		return &config.Snapshot{Name: name}, nil
+	}
 	return f.getResp, f.getErr
 }
 func (f *snapshotFakeBackend) DeleteSnapshot(_ context.Context, _ string) error {

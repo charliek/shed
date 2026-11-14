@@ -127,6 +127,12 @@ func (b *fcCreator) PreFlight(ctx context.Context, req config.CreateShedRequest,
 		if err != nil {
 			return nil, err
 		}
+		// CreateShed holds the snapshot's lock here: the snapshot read is
+		// the one the caller was authorized to use, not one taken again
+		// under the name since.
+		if err := backend.CheckSnapshot(ctx, req.FromSnapshot, snap); err != nil {
+			return nil, err
+		}
 		if snap.Backend != config.BackendFirecracker {
 			return nil, fmt.Errorf("%w: snapshot %q is for backend %q, server is %q",
 				config.ErrSnapshotBackendMismatchSentinel, req.FromSnapshot, snap.Backend, config.BackendFirecracker)
@@ -469,7 +475,7 @@ func (b *fcCreator) ConfigureEgressProxy(ctx context.Context, req config.CreateS
 	meta := metaRaw.(*fcMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
 	gateway, subnet := b.c.egressGatewaySubnet()
-	port, token, env, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
+	port, token, env, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.CreatedAt, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
 	if err != nil {
 		return fmt.Errorf("egress: %w", err)
 	}
@@ -496,7 +502,7 @@ func (b *fcCreator) CloneRepo(ctx context.Context, req config.CreateShedRequest,
 	agent := b.c.newAgentClient(meta.Name)
 	backend.Phase(ctx, "repo")
 	backend.Status(ctx, "Cloning repository...")
-	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, meta.Owner != "", b.egressEnv); err != nil {
+	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, req.ServerEnvWithheld(meta.Owner), b.egressEnv); err != nil {
 		log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
 		backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
 	} else {
@@ -815,7 +821,7 @@ func (b *fcStarter) ConfigureEgressProxy(ctx context.Context, metaRaw orchestrat
 	}
 	agent := b.c.newAgentClient(meta.Name)
 	gateway, subnet := b.c.egressGatewaySubnet()
-	port, token, _, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
+	port, token, _, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.CreatedAt, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
 	if err != nil {
 		return fmt.Errorf("egress: %w", err)
 	}

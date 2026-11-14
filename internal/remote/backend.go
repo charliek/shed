@@ -498,10 +498,7 @@ func (b *Backend) lookupLocked(ctx context.Context, name string) (*state.Record,
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 	}
 	owner, _ := ownership(r)
-	if err := backend.CheckOwner(ctx, name, owner); err != nil {
-		return nil, err
-	}
-	if err := backend.CheckCreatedAt(ctx, name, r.Shed.CreatedAt); err != nil {
+	if err := backend.CheckIdentity(ctx, name, owner, r.Shed.CreatedAt); err != nil {
 		return nil, err
 	}
 	return r, nil

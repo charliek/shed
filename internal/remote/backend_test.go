@@ -187,6 +187,9 @@ type env struct {
 	wrap func(provider.Provider) provider.Provider
 	// tune, when set, edits the backend's options.
 	tune func(*Options)
+	// clone, when set, replaces the backend's repo clone before it starts
+	// (so a create resumed at start-up uses it too).
+	clone func(ctx context.Context, agent *vmutil.AgentClient, serverCfg *config.ServerConfig, repo string, owned bool, extraEnv []string) error
 
 	autoStop chan struct{}
 	autoDone chan struct{}
@@ -281,6 +284,9 @@ func (e *env) open() *Backend {
 	b, err := New(o)
 	if err != nil {
 		e.t.Fatalf("New: %v", err)
+	}
+	if e.clone != nil {
+		b.clone = e.clone
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()

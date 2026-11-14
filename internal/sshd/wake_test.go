@@ -122,7 +122,7 @@ func TestSyncWakeUnchanged(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{backend: tt.b}
 			var stderr bytes.Buffer
-			shed, err := s.ensureRunning(context.Background(), "a1", &stderr, tt.announce)
+			shed, err := s.ensureRunning(implicitCtx(), "a1", &stderr, tt.announce)
 			if tt.wantErr != "" {
 				if err == nil || err.Error() != tt.wantErr {
 					t.Fatalf("err = %v, want %q", err, tt.wantErr)
@@ -170,7 +170,7 @@ func TestAsyncWake(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{backend: tt.b}
 			var stderr bytes.Buffer
-			shed, err := s.ensureRunning(context.Background(), "a1", &stderr, true)
+			shed, err := s.ensureRunning(implicitCtx(), "a1", &stderr, true)
 			if tt.wantErr != "" {
 				if err == nil || err.Error() != tt.wantErr {
 					t.Fatalf("err = %v, want %q", err, tt.wantErr)
@@ -191,4 +191,10 @@ func TestAsyncWake(t *testing.T) {
 			}
 		})
 	}
+}
+
+// implicitCtx is a context carrying the implicit user's principal, as every
+// channel on a server with no user list resolves to.
+func implicitCtx() context.Context {
+	return backend.WithPrincipal(context.Background(), backend.ImplicitPrincipal())
 }

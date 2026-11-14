@@ -82,15 +82,9 @@ func (b *VZBackend) ResetShed(ctx context.Context, name string) (*config.Shed, e
 	return b.client.ResetShed(ctx, name)
 }
 
-// newAgentClient creates a vmutil.AgentClient for the given instance name.
-func (b *VZBackend) newAgentClient(name string) *vmutil.AgentClient {
-	dialer := NewVZDialer(b.client.cfg.SocketDir, name)
-	return vmutil.NewAgentClient(dialer, b.client.cfg.ConsolePort, b.client.cfg.NotifyPort)
-}
-
 // ListSessions returns all tmux sessions in a shed.
 func (b *VZBackend) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
-	meta, err := LoadMetadata(b.client.cfg.InstanceDir, shedName)
+	meta, err := b.loadChecked(ctx, shedName)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +93,7 @@ func (b *VZBackend) ListSessions(ctx context.Context, shedName string) ([]config
 		return nil, config.ErrShedNotRunningSentinel
 	}
 
-	agent := b.newAgentClient(meta.Name)
+	agent := b.client.newCheckedAgentClient(meta)
 
 	var output strings.Builder
 	opts := backend.ExecOptions{
@@ -142,7 +136,7 @@ func (b *VZBackend) ListSessions(ctx context.Context, shedName string) ([]config
 
 // KillSession terminates a tmux session in a shed.
 func (b *VZBackend) KillSession(ctx context.Context, shedName, sessionName string) error {
-	meta, err := LoadMetadata(b.client.cfg.InstanceDir, shedName)
+	meta, err := b.loadChecked(ctx, shedName)
 	if err != nil {
 		return err
 	}
@@ -151,7 +145,7 @@ func (b *VZBackend) KillSession(ctx context.Context, shedName, sessionName strin
 		return config.ErrShedNotRunningSentinel
 	}
 
-	agent := b.newAgentClient(meta.Name)
+	agent := b.client.newCheckedAgentClient(meta)
 
 	opts := backend.ExecOptions{
 		Cmd: []string{"tmux", "kill-session", "-t", sessionName},
@@ -173,14 +167,11 @@ func (b *VZBackend) KillSession(ctx context.Context, shedName, sessionName strin
 
 // Exec executes a command in a shed with the given options.
 func (b *VZBackend) Exec(ctx context.Context, shedName string, opts backend.ExecOptions) error {
-	meta, err := LoadMetadata(b.client.cfg.InstanceDir, shedName)
-	if err != nil {
-		return err
-	}
 	// The shed actually dialed is the one checked: the API server's earlier
 	// lookups may have seen a shed since deleted and recreated by another
 	// caller under this name.
-	if err := checkOwner(ctx, shedName, meta); err != nil {
+	meta, err := b.loadChecked(ctx, shedName)
+	if err != nil {
 		return err
 	}
 
@@ -204,8 +195,26 @@ func (b *VZBackend) Exec(ctx context.Context, shedName string, opts backend.Exec
 		opts.Cmd = []string{"/bin/bash", "--login"}
 	}
 
-	agent := b.newAgentClient(meta.Name)
+	agent := b.client.newCheckedAgentClient(meta)
 	return agent.Exec(ctx, opts)
+}
+
+// loadChecked loads a shed's metadata for an operation that reaches into its
+// running VM (exec, sessions) and checks it against the identity the context
+// requires (checkIdentity): the agent dialed afterwards is that shed's. A
+// missing shed is config.ErrShedNotFoundSentinel.
+func (b *VZBackend) loadChecked(ctx context.Context, name string) (*Metadata, error) {
+	meta, err := LoadMetadata(b.client.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+	if err := checkIdentity(ctx, name, meta); err != nil {
+		return nil, err
+	}
+	return meta, nil
 }
 
 // DialService opens a TCP connection to a port inside a running shed's VM.

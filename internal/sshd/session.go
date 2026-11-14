@@ -70,7 +70,16 @@ func (s *Server) handleSession(sess ssh.Session) {
 		return
 	}
 
-	ctx := sess.Context()
+	// The channel's principal, from the key the connection authenticated
+	// with, resolved again for this channel.
+	p, err := s.principalFor(sess.Context())
+	if err != nil {
+		log.Printf("SSH session refused: user=%s: %v", user, err)
+		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
+		_ = sess.Exit(1)
+		return
+	}
+	ctx := backend.WithPrincipal(sess.Context(), p)
 
 	// Look up the shed, waking it when it is stopped.
 	shed, err := s.ensureRunning(ctx, shedName, sess.Stderr(), true)
@@ -79,6 +88,8 @@ func (s *Server) handleSession(sess ssh.Session) {
 		_ = sess.Exit(1)
 		return
 	}
+	// The exec acts on the incarnation that was checked and woken.
+	ctx = backend.PinCreatedAt(ctx, shed.CreatedAt)
 
 	// Execute in the container.
 	if err := s.execInContainer(ctx, sess, shed); err != nil {

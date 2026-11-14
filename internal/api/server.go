@@ -17,6 +17,8 @@ import (
 
 // Server is the HTTP API server for shed.
 type Server struct {
+	// backend is always a *backend.Guard (or nil): every call is decided by
+	// the access rule for the principal on the request's context.
 	backend     backend.Backend
 	cfg         *config.ServerConfig
 	sshHostKey  string
@@ -86,10 +88,16 @@ func (s *Server) SetClientCAInfo(fingerprint string, notAfter time.Time) {
 	s.caNotAfter = notAfter
 }
 
-// NewServer creates a new API server.
+// NewServer creates a new API server. Every backend call it makes goes
+// through the access guard: b is wrapped in a backend.Guard unless it is one
+// already (shed-server passes the one Guard the SSH server shares).
 func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, plugins *plugin.Registry, bridge *plugin.Bridge) *Server {
+	var guarded backend.Backend
+	if b != nil {
+		guarded = backend.Guarded(b)
+	}
 	return &Server{
-		backend:    b,
+		backend:    guarded,
 		cfg:        cfg,
 		sshHostKey: sshHostKey,
 		plugins:    plugins,

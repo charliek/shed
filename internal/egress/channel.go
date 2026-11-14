@@ -20,15 +20,18 @@ import (
 // failed listener open aborts the shed's create/start); the proxy streams audit
 // asynchronously. ID correlates a request with its ack.
 type ControlMsg struct {
-	Type     string        `json:"type"` // "configure" | "remove" | "ack" | "audit"
-	ID       string        `json:"id,omitempty"`
-	Shed     string        `json:"shed,omitempty"`
-	Port     int           `json:"port,omitempty"`
-	Token    string        `json:"token,omitempty"`
-	Gateway  string        `json:"gateway,omitempty"` // VM-facing bind IP (guests reach the proxy here)
-	Profiles []ProfileSpec `json:"profiles,omitempty"`
-	Error    string        `json:"error,omitempty"` // set on a failed ack
-	Audit    *AuditRecord  `json:"audit,omitempty"`
+	Type string `json:"type"` // "configure" | "remove" | "ack" | "audit"
+	ID   string `json:"id,omitempty"`
+	Shed string `json:"shed,omitempty"`
+	// ShedCreatedAt names the shed incarnation a configure is for; the
+	// listener stamps it on every audit record (AuditRecord.ShedCreatedAt).
+	ShedCreatedAt time.Time     `json:"shed_created_at,omitzero"`
+	Port          int           `json:"port,omitempty"`
+	Token         string        `json:"token,omitempty"`
+	Gateway       string        `json:"gateway,omitempty"` // VM-facing bind IP (guests reach the proxy here)
+	Profiles      []ProfileSpec `json:"profiles,omitempty"`
+	Error         string        `json:"error,omitempty"` // set on a failed ack
+	Audit         *AuditRecord  `json:"audit,omitempty"`
 }
 
 // ProxyServer is the data plane: it manages one forward-proxy listener per shed,
@@ -76,7 +79,7 @@ func (s *ProxyServer) Configure(msg ControlMsg) error {
 	if resolve == nil {
 		resolve = defaultResolver
 	}
-	h := &ConnHandler{Shed: msg.Shed, Token: msg.Token, Policy: pol, Resolve: resolve, Dial: s.Dial, Audit: s.audit}
+	h := &ConnHandler{Shed: msg.Shed, ShedCreatedAt: msg.ShedCreatedAt, Token: msg.Token, Policy: pol, Resolve: resolve, Dial: s.Dial, Audit: s.audit}
 
 	// Close any existing listener for this shed BEFORE binding, so a live
 	// re-Configure (e.g. `egress set` changing profiles) that reuses the same
@@ -283,8 +286,8 @@ func (c *Client) failWaiters(cause error) {
 }
 
 // Configure pushes a shed's listener config to the proxy and waits for the ack.
-func (c *Client) Configure(shed string, port int, token, gateway string, profiles []ProfileSpec) error {
-	return c.call(ControlMsg{Type: "configure", Shed: shed, Port: port, Token: token, Gateway: gateway, Profiles: profiles})
+func (c *Client) Configure(shed string, createdAt time.Time, port int, token, gateway string, profiles []ProfileSpec) error {
+	return c.call(ControlMsg{Type: "configure", Shed: shed, ShedCreatedAt: createdAt, Port: port, Token: token, Gateway: gateway, Profiles: profiles})
 }
 
 // Remove closes a shed's listener on the proxy and waits for the ack.

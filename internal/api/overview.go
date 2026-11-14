@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/charliek/shed/internal/backend"
@@ -124,6 +125,11 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		sess, err := s.backend.ListSessions(ctx, sheds[i].Name)
+		if errors.Is(err, config.ErrForbiddenSentinel) {
+			// Listed but not to be entered (an admin and another user's
+			// shed): no sessions, and no warning.
+			continue
+		}
 		if err != nil {
 			warnings = append(warnings, "shed "+sheds[i].Name+": sessions unavailable: "+err.Error())
 			continue

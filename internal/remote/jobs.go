@@ -511,7 +511,11 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		}
 		backend.Phase(ctx, "repo")
 		backend.Status(ctx, "Cloning repository...")
-		if err := b.cloneRepo(ctx, agent, rec, repo, owned); err != nil {
+		// The server's env_file variables stay out of the clone of a
+		// service client's shed and of a shed of a user who is not an admin
+		// (the record keeps that from the create, across a restart).
+		withheld := owned || rec.NoServerEnv
+		if err := b.cloneRepo(ctx, agent, rec, repo, withheld); err != nil {
 			if ctx.Err() != nil {
 				return errSuperseded
 			}
@@ -660,9 +664,10 @@ func (b *Backend) failCreate(j *job, cause error, reason string) error {
 	}
 	var marker *state.Marker
 	if !b.opts.KeepFailedCreate && (ref != "" || !refused) {
+		reportedOwner, _ := ownership(rec)
 		marker = &state.Marker{
 			ID: j.id, Name: j.name, Env: rec.Env, Ref: ref, At: b.now().UTC(),
-			Owner: rec.Shed.Owner, CreatedAt: rec.Shed.CreatedAt, KeepRecord: !removed,
+			Owner: reportedOwner, CreatedAt: rec.Shed.CreatedAt, KeepRecord: !removed,
 		}
 		if err := b.saveMarkerLocked(marker); err != nil {
 			b.logf("remote: create of shed %s failed and its clean-up could not be recorded: %v", j.name, err)

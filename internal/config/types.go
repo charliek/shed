@@ -111,6 +111,13 @@ var (
 	// mounts, server mounts, snapshots, reset, image management, egress
 	// profiles). The API answers 422 for a create field and 501 for a route.
 	ErrFeatureUnsupportedSentinel = errors.New("feature is not supported by this backend")
+
+	// ErrForbiddenSentinel is returned when the caller may see a shed or a
+	// resource but not do what was asked: an admin entering another user's
+	// shed, or a user who is not an admin asking for an admin-only one. The
+	// API answers 403 FORBIDDEN. A caller who may not see the thing at all
+	// gets the not-found sentinel instead.
+	ErrForbiddenSentinel = errors.New("forbidden")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -264,6 +271,31 @@ type Shed struct {
 	// fixed at create. A shed created before network profiles existed
 	// reports "open".
 	NetworkProfile string `json:"network_profile,omitempty" yaml:"network_profile,omitempty"`
+}
+
+// HostResources names what the shed, as its backend reports it, reaches that
+// is shared on the host and so is for admins only: "host directories" (its
+// --local-dir / --add-dir mounts, ProjectMounts) and "server mounts" (a
+// server-mount selection, Mounts, that is not explicitly empty: mode "all",
+// any named mount, or a mode this server does not know). The server mounts
+// are how server credentials (~/.config/gh and the like) reach a shed. It
+// returns nil for a shed that reaches none of them.
+//
+// Firecracker and VZ always report a selection (a shed created before
+// selection existed reports {mode: all}, so it counts); the remote backend
+// cannot mount anything and reports none (nil), which counts as nothing.
+// The access rule refuses a user who is not an admin entry to (and a start
+// of) a shed that carries any of these, and assigning such a shed to a user
+// is refused for the same reason.
+func (s *Shed) HostResources() []string {
+	var out []string
+	if len(s.ProjectMounts) > 0 {
+		out = append(out, "host directories")
+	}
+	if m := s.Mounts; m != nil && (m.Mode != MountModeSelected || len(m.Names) > 0) {
+		out = append(out, "server mounts")
+	}
+	return out
 }
 
 // Network profiles (CreateShedRequest.Network, Shed.NetworkProfile,
@@ -691,6 +723,13 @@ type ShedDiskEntry struct {
 	ConsoleLog *FileEntry  `json:"console_log,omitempty"` // nil for Firecracker
 	OtherFiles []FileEntry `json:"other_files,omitempty"`
 	Total      DiskSize    `json:"total"`
+	// Owner, User and CreatedAt are whose the shed is (as ShedOwnership
+	// reports it) and its incarnation, read from the same record as the
+	// sizes above. The access guard decides who sees the entry from them,
+	// never from a later listing by name. Server-side only (json:"-").
+	Owner     string    `json:"-"`
+	User      string    `json:"-"`
+	CreatedAt time.Time `json:"-"`
 }
 
 // DiskUsageTotals aggregates bytes across df sections.
@@ -865,6 +904,19 @@ type CreateShedRequest struct {
 	// user). Like Owner it never comes from the wire (json:"-"), and the
 	// two are never both set (ValidateShedOwnership).
 	User string `json:"-"`
+	// NoServerEnv keeps the server's env_file variables (its own
+	// credentials) out of the shed's repo clone, as for a service client's
+	// shed. The access guard sets it for a user who is not an admin; it
+	// never comes from the wire.
+	NoServerEnv bool `json:"-"`
+}
+
+// ServerEnvWithheld reports whether the server's env_file variables are kept
+// out of the clone of a shed created by r and recorded with the service
+// client owner: for a service client's shed, and for a shed of a user who is
+// not an admin (NoServerEnv).
+func (r CreateShedRequest) ServerEnvWithheld(owner string) bool {
+	return owner != "" || r.NoServerEnv
 }
 
 // SnapshotSchemaVersion is the current snapshot schema version. Bumped
@@ -955,6 +1007,11 @@ type SnapshotDiskEntry struct {
 	Rootfs     FileEntry   `json:"rootfs"`
 	OtherFiles []FileEntry `json:"other_files,omitempty"`
 	Total      DiskSize    `json:"total"`
+	// User and CreatedAt are the snapshot's user and incarnation, read from
+	// the same snapshot.json as the entry. The access guard decides who sees
+	// the entry from them. Server-side only (json:"-").
+	User      string    `json:"-"`
+	CreatedAt time.Time `json:"-"`
 }
 
 // APIError represents an error response from the API.

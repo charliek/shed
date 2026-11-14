@@ -69,13 +69,15 @@ func newManager(client *Client, proc *exec.Cmd, socket string, portLo, portHi in
 	}
 }
 
-// Configure opens (or replaces) a shed's listener. A zero port allocates a free
+// Configure opens (or replaces) a shed's listener for the shed incarnation
+// created at createdAt (stamped on every audit record the listener emits, so
+// a record is never taken for a later shed of the same name). A zero port allocates a free
 // one from the range; a non-zero port reuses the caller's persisted assignment
 // (restart re-push). An empty token mints a fresh one. On a proxy-side failure
 // the freshly reserved port is released and the error is returned so the
 // orchestrator hook aborts the create/start. Returns the effective port+token
 // for the caller to persist in shed metadata.
-func (m *Manager) Configure(shed string, port int, token, gateway string, specs []ProfileSpec) (int, string, error) {
+func (m *Manager) Configure(shed string, createdAt time.Time, port int, token, gateway string, specs []ProfileSpec) (int, string, error) {
 	m.mu.Lock()
 	if port == 0 {
 		p, err := m.allocPortLocked(shed)
@@ -104,7 +106,7 @@ func (m *Manager) Configure(shed string, port int, token, gateway string, specs 
 	}
 	m.mu.Unlock()
 
-	if err := m.client.Configure(shed, port, token, gateway, specs); err != nil {
+	if err := m.client.Configure(shed, createdAt, port, token, gateway, specs); err != nil {
 		m.mu.Lock()
 		m.releaseLocked(shed, port)
 		m.mu.Unlock()

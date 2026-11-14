@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/config"
 )
@@ -184,5 +185,92 @@ func TestRefScanner_StrictModeFailsOnMalformedMetadata(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "remove the directory") {
 		t.Errorf("error should hint at fix, got: %v", err)
+	}
+}
+
+// TestDiskUsage_ReplacedBetweenLoadAndStat: DiskUsage reads a shed's or a
+// snapshot's record and then stats its files (the upper, the console log, the
+// metadata) without the lock. When the shed or snapshot is deleted and made
+// again under its name by someone else in between, the sizes it read are the
+// new one's: the entry is dropped rather than shown with the old record's
+// owner. One left alone is still reported.
+func TestDiskUsage_ReplacedBetweenLoadAndStat(t *testing.T) {
+	client, _, instanceDir := newSystemTestClient(t)
+	snapshotsDir := t.TempDir()
+	client.cfg.SnapshotsDir = snapshotsDir
+	t0 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	putShed := func(name, user string, at time.Time, size int) {
+		t.Helper()
+		meta := &Metadata{Version: MetadataVersion, Name: name, Status: config.StatusStopped, Backend: "vz", User: user, CreatedAt: at}
+		if err := meta.Save(instanceDir); err != nil {
+			t.Fatal(err)
+		}
+		dir := InstanceDir(instanceDir, name)
+		if err := os.WriteFile(RootfsPath(instanceDir, name), make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, consoleLogFilename), make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putSnap := func(name, user string, at time.Time, size int) {
+		t.Helper()
+		if err := saveSnapshot(snapshotsDir, &config.Snapshot{Name: name, SourceShed: "src", User: user, CreatedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(SnapshotRootfsPath(snapshotsDir, name), make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putShed("box", "alice", t0, 4096)
+	putShed("keep", "alice", t0, 4096)
+	putSnap("snap", "alice", t0, 4096)
+	putSnap("kept", "alice", t0, 4096)
+
+	replaced := map[string]bool{}
+	diskUsageLoaded = func(kind, name string) {
+		switch {
+		case kind == "shed" && name == "box":
+			if err := os.RemoveAll(InstanceDir(instanceDir, name)); err != nil {
+				t.Fatal(err)
+			}
+			putShed(name, "bob", t0.Add(time.Minute), 1<<20)
+			replaced[kind] = true
+		case kind == "snapshot" && name == "snap":
+			if err := os.RemoveAll(SnapshotDir(snapshotsDir, name)); err != nil {
+				t.Fatal(err)
+			}
+			putSnap(name, "bob", t0.Add(time.Minute), 1<<20)
+			replaced[kind] = true
+		}
+	}
+	t.Cleanup(func() { diskUsageLoaded = nil })
+
+	du, err := client.DiskUsage(context.Background())
+	if err != nil {
+		t.Fatalf("DiskUsage: %v", err)
+	}
+	if !replaced["shed"] || !replaced["snapshot"] {
+		t.Fatalf("the replacement never ran: %v", replaced)
+	}
+	var sheds, snaps []string
+	for _, e := range du.Sheds {
+		sheds = append(sheds, e.Name)
+		if e.Name == "box" {
+			t.Errorf("shed box reported as %s's with %d bytes: the sizes are the replacement's", e.User, e.Total.LogicalBytes)
+		}
+	}
+	for _, e := range du.Snapshots {
+		snaps = append(snaps, e.Name)
+		if e.Name == "snap" {
+			t.Errorf("snapshot snap reported as %s's with %d bytes: the sizes are the replacement's", e.User, e.Rootfs.Size.LogicalBytes)
+		}
+	}
+	if len(sheds) != 1 || sheds[0] != "keep" {
+		t.Errorf("sheds %v, want only keep", sheds)
+	}
+	if len(snaps) != 1 || snaps[0] != "kept" {
+		t.Errorf("snapshots %v, want only kept", snaps)
 	}
 }

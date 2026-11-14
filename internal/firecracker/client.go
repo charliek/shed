@@ -87,6 +87,12 @@ type Client struct {
 	// recorded VMM gone and the save that records it stopped (tests: it
 	// forces another request in between).
 	beforeStaleSave func(name string)
+
+	// beforeVMDial, when set, runs in an operation that reaches into a
+	// running VM (exec, sessions, a service dial) after it has checked the
+	// shed's record and before it connects (tests: it replaces the shed in
+	// that window). See checkedDialer.
+	beforeVMDial func(name string)
 }
 
 // SetEgressManager attaches the egress-control proxy manager, called by
@@ -455,6 +461,51 @@ func (c *Client) newAgentClient(name string) *vmutil.AgentClient {
 	return vmutil.NewAgentClient(dialer, c.cfg.ConsolePort, c.cfg.NotifyPort)
 }
 
+// checkedDialer returns the dialer for the VM of the shed whose record meta
+// the caller has checked (checkIdentity). The vsock socket is named only by
+// the shed's name, so every connection is rechecked once it is made: it is
+// kept only while the record is still meta's incarnation (vmutil.
+// RecheckedDialer). Exec, the session operations and DialService, which hold
+// no lock while they connect (they can run for hours), reach a VM only
+// through it.
+func (c *Client) checkedDialer(meta *Metadata) vmutil.Dialer {
+	name, createdAt := meta.Name, meta.CreatedAt
+	return &vmutil.RecheckedDialer{
+		Dialer: NewFirecrackerDialer(filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", name))),
+		Recheck: func() error {
+			return c.stillIncarnation(name, createdAt)
+		},
+		BeforeDial: func() {
+			if c.beforeVMDial != nil {
+				c.beforeVMDial(name)
+			}
+		},
+	}
+}
+
+// newCheckedAgentClient is newAgentClient over checkedDialer.
+func (c *Client) newCheckedAgentClient(meta *Metadata) *vmutil.AgentClient {
+	return vmutil.NewAgentClient(c.checkedDialer(meta), c.cfg.ConsolePort, c.cfg.NotifyPort)
+}
+
+// stillIncarnation returns nil when the named shed's stored record is still
+// the incarnation created at createdAt, and a shed-not-found error when it is
+// gone or was created again since. A record that cannot be read is an error
+// too: the connection is refused rather than trusted.
+func (c *Client) stillIncarnation(name string, createdAt time.Time) error {
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return fmt.Errorf("%w: %s (deleted while it was being connected to)", config.ErrShedNotFoundSentinel, name)
+		}
+		return fmt.Errorf("rechecking shed %s after connecting: %w", name, err)
+	}
+	if !meta.CreatedAt.Equal(createdAt) {
+		return fmt.Errorf("%w: %s (deleted and created again while it was being connected to)", config.ErrShedNotFoundSentinel, name)
+	}
+	return nil
+}
+
 // resolvePathOwner returns the UID and GID of the given path's owner.
 // This is the most reliable way to determine the target UID/GID: the owner
 // of the directory being shared IS the correct target, regardless of how
@@ -653,6 +704,10 @@ func (c *Client) SetShedEgress(ctx context.Context, name string, profiles []stri
 		}
 		return nil, err
 	}
+	// Checked under the per-shed lock, against the shed being changed.
+	if err := checkIdentity(ctx, name, meta); err != nil {
+		return nil, err
+	}
 
 	specs, err := c.serverCfg.Egress.ResolveProfiles(profiles, c.userProfiles())
 	if err != nil {
@@ -665,7 +720,7 @@ func (c *Client) SetShedEgress(ctx context.Context, name string, profiles []stri
 	if meta.Status == config.StatusRunning {
 		gateway, subnet := c.egressGatewaySubnet()
 		agent := c.newAgentClient(name)
-		port, token, err := vmutil.ApplyEgressLive(ctx, c.egressMgr, agent, name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs)
+		port, token, err := vmutil.ApplyEgressLive(ctx, c.egressMgr, agent, name, meta.CreatedAt, meta.EgressPort, meta.EgressToken, gateway, subnet, specs)
 		if err != nil {
 			return nil, fmt.Errorf("egress: apply: %w", err)
 		}
@@ -692,6 +747,9 @@ func (c *Client) ClearShedEgress(ctx context.Context, name string) (*config.Shed
 		if errors.Is(err, ErrInstanceNotFound) {
 			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 		}
+		return nil, err
+	}
+	if err := checkIdentity(ctx, name, meta); err != nil {
 		return nil, err
 	}
 	return c.clearShedEgressLocked(ctx, meta)
@@ -820,7 +878,7 @@ func (c *Client) getShed(ctx context.Context, name string, held bool) (*config.S
 		}
 		return nil, err
 	}
-	if err := checkOwner(ctx, name, meta); err != nil {
+	if err := checkIdentity(ctx, name, meta); err != nil {
 		return nil, err
 	}
 
@@ -941,10 +999,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 		return err
 	}
 	// Checked under the per-shed lock, against the shed being deleted.
-	if err := checkOwner(ctx, name, meta); err != nil {
-		return err
-	}
-	if err := backend.CheckCreatedAt(ctx, name, meta.CreatedAt); err != nil {
+	if err := checkIdentity(ctx, name, meta); err != nil {
 		return err
 	}
 
@@ -1047,7 +1102,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 // start.go for the lifecycle contract.
 func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, error) {
 	defer c.acquireCreateLock(name)()
-	if err := c.checkOwnerLocked(ctx, name); err != nil {
+	if err := c.checkIdentityLocked(ctx, name); err != nil {
 		return nil, err
 	}
 	return orchestrator.StartShed(ctx, &fcStarter{c: c}, orchestrator.StartRequest{Name: name})
@@ -1075,10 +1130,7 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		}
 		return nil, err
 	}
-	if err := checkOwner(ctx, name, meta); err != nil {
-		return nil, err
-	}
-	if err := backend.CheckCreatedAt(ctx, name, meta.CreatedAt); err != nil {
+	if err := checkIdentity(ctx, name, meta); err != nil {
 		return nil, err
 	}
 
@@ -1281,13 +1333,16 @@ func (c *Client) DialService(ctx context.Context, name string, port uint16) (net
 		}
 		return nil, err
 	}
+	// The shed dialed is the one checked: it is loaded here, and the vsock
+	// socket below is that shed's.
+	if err := checkIdentity(ctx, name, meta); err != nil {
+		return nil, err
+	}
 	if meta.Status != config.StatusRunning {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
 	}
 
-	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", name))
-	dialer := NewFirecrackerDialer(vsockPath)
-	return vmutil.DialService(ctx, dialer, c.cfg.TCPProxyPort, port)
+	return vmutil.DialService(ctx, c.checkedDialer(meta), c.cfg.TCPProxyPort, port)
 }
 
 // ResetShed nukes the per-shed upper and recreates it as a fresh
@@ -1303,6 +1358,10 @@ func (c *Client) ResetShed(ctx context.Context, name string) (*config.Shed, erro
 		if errors.Is(err, ErrInstanceNotFound) {
 			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 		}
+		return nil, err
+	}
+	// Checked under the per-shed lock, against the shed being reset.
+	if err := checkIdentity(ctx, name, meta); err != nil {
 		return nil, err
 	}
 	if meta.Status != config.StatusStopped {
@@ -1355,23 +1414,28 @@ func (c *Client) ResetShed(ctx context.Context, name string) (*config.Shed, erro
 	return metadataToShed(meta), nil
 }
 
-// checkOwnerLocked applies checkOwner to the shed's stored record, for an
-// operation that holds the per-shed lock and loads the metadata itself later.
-// A shed that cannot be loaded is left to the operation to report.
-func (c *Client) checkOwnerLocked(ctx context.Context, name string) error {
+// checkIdentityLocked applies checkIdentity to the shed's stored record, for
+// an operation that holds the per-shed lock and loads the metadata itself
+// later. A shed that cannot be loaded is left to the operation to report.
+func (c *Client) checkIdentityLocked(ctx context.Context, name string) error {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
 		return nil
 	}
-	return checkOwner(ctx, name, meta)
+	return checkIdentity(ctx, name, meta)
 }
 
-// checkOwner applies backend.CheckOwner to the owner the shed is reported
-// with (config.ShedOwnership), never the raw stored one: a record that names
-// both a service client and a user reaches no service client, here as at the
-// API. Every authorization read of a record goes through it. The credential
-// bus still reads the raw owner, so such a record keeps the bus off.
-func checkOwner(ctx context.Context, name string, meta *Metadata) error {
+// checkIdentity checks the shed an operation loaded against what its context
+// requires (backend.CheckIdentity): the service client that must own it and
+// the incarnation (creation time) the caller looked up and was authorized for
+// (backend.WithRequiredCreatedAt, which the access guard sets on every call
+// on a named shed). The owner checked is the one the shed is reported with
+// (config.ShedOwnership), never the raw stored one: a record that names both
+// a service client and a user reaches no service client, here as at the API.
+// Every authorization read of a record goes through it. The credential bus
+// still reads the raw owner, so such a record keeps the bus off. Callers that
+// hold the per-shed lock call it under it.
+func checkIdentity(ctx context.Context, name string, meta *Metadata) error {
 	owner, _ := config.ShedOwnership(meta.Owner, meta.User)
-	return backend.CheckOwner(ctx, name, owner)
+	return backend.CheckIdentity(ctx, name, owner, meta.CreatedAt)
 }

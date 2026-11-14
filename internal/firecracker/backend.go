@@ -84,7 +84,7 @@ func (b *FirecrackerBackend) ResetShed(ctx context.Context, name string) (*confi
 
 // ListSessions returns all tmux sessions in a shed.
 func (b *FirecrackerBackend) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
-	meta, err := LoadMetadata(b.client.cfg.InstanceDir, shedName)
+	meta, err := b.loadChecked(ctx, shedName)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +93,7 @@ func (b *FirecrackerBackend) ListSessions(ctx context.Context, shedName string) 
 		return nil, config.ErrShedNotRunningSentinel
 	}
 
-	agent := b.client.newAgentClient(meta.Name)
+	agent := b.client.newCheckedAgentClient(meta)
 
 	var output strings.Builder
 	opts := backend.ExecOptions{
@@ -136,7 +136,7 @@ func (b *FirecrackerBackend) ListSessions(ctx context.Context, shedName string) 
 
 // KillSession terminates a tmux session in a shed.
 func (b *FirecrackerBackend) KillSession(ctx context.Context, shedName, sessionName string) error {
-	meta, err := LoadMetadata(b.client.cfg.InstanceDir, shedName)
+	meta, err := b.loadChecked(ctx, shedName)
 	if err != nil {
 		return err
 	}
@@ -145,7 +145,7 @@ func (b *FirecrackerBackend) KillSession(ctx context.Context, shedName, sessionN
 		return config.ErrShedNotRunningSentinel
 	}
 
-	agent := b.client.newAgentClient(meta.Name)
+	agent := b.client.newCheckedAgentClient(meta)
 
 	opts := backend.ExecOptions{
 		Cmd: []string{"tmux", "kill-session", "-t", sessionName},
@@ -167,14 +167,11 @@ func (b *FirecrackerBackend) KillSession(ctx context.Context, shedName, sessionN
 
 // Exec executes a command in a shed with the given options.
 func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts backend.ExecOptions) error {
-	meta, err := LoadMetadata(b.client.cfg.InstanceDir, shedName)
-	if err != nil {
-		return err
-	}
 	// The shed actually dialed is the one checked: the API server's earlier
 	// lookups may have seen a shed since deleted and recreated by another
 	// caller under this name.
-	if err := checkOwner(ctx, shedName, meta); err != nil {
+	meta, err := b.loadChecked(ctx, shedName)
+	if err != nil {
 		return err
 	}
 
@@ -198,8 +195,26 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 		opts.Cmd = []string{"/bin/bash", "--login"}
 	}
 
-	agent := b.client.newAgentClient(meta.Name)
+	agent := b.client.newCheckedAgentClient(meta)
 	return agent.Exec(ctx, opts)
+}
+
+// loadChecked loads a shed's metadata for an operation that reaches into its
+// running VM (exec, sessions) and checks it against the identity the context
+// requires (checkIdentity): the agent dialed afterwards is that shed's. A
+// missing shed is config.ErrShedNotFoundSentinel.
+func (b *FirecrackerBackend) loadChecked(ctx context.Context, name string) (*Metadata, error) {
+	meta, err := LoadMetadata(b.client.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+	if err := checkIdentity(ctx, name, meta); err != nil {
+		return nil, err
+	}
+	return meta, nil
 }
 
 // DialService opens a TCP connection to a port inside a running shed's VM.

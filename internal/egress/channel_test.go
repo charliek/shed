@@ -86,7 +86,7 @@ func TestControlChannel_ConfigureDenyAudit(t *testing.T) {
 	port := freePort(t)
 	// Empty spec ⇒ enforce mode, no allows ⇒ default-deny. Configure blocks for
 	// the ack, so a nil return proves the listener actually opened.
-	if err := client.Configure("web", port, "", "", []ProfileSpec{{}}); err != nil {
+	if err := client.Configure("web", time.Time{}, port, "", "", []ProfileSpec{{}}); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
 
@@ -123,7 +123,7 @@ func TestControlChannel_ConfigureFailsClosed(t *testing.T) {
 	defer occupied.Close()
 	port := occupied.Addr().(*net.TCPAddr).Port
 
-	if err := client.Configure("web", port, "", "", []ProfileSpec{{}}); err == nil {
+	if err := client.Configure("web", time.Time{}, port, "", "", []ProfileSpec{{}}); err == nil {
 		t.Fatal("expected Configure to fail when the port is already in use")
 	}
 }
@@ -133,7 +133,7 @@ func TestControlChannel_RemoveFreesPort(t *testing.T) {
 	client, _ := serveControl(t, ps)
 
 	port := freePort(t)
-	if err := client.Configure("web", port, "", "", []ProfileSpec{{}}); err != nil {
+	if err := client.Configure("web", time.Time{}, port, "", "", []ProfileSpec{{}}); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
 	dialGuest(t, port).Close() // listener is up
@@ -170,7 +170,7 @@ func TestControlChannel_ConcurrentConfigure(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			port := freePort(t)
-			if err := client.Configure("shed-"+strconv.Itoa(n), port, "", "", []ProfileSpec{{}}); err != nil {
+			if err := client.Configure("shed-"+strconv.Itoa(n), time.Time{}, port, "", "", []ProfileSpec{{}}); err != nil {
 				t.Errorf("Configure shed-%d: %v", n, err)
 				return
 			}
@@ -178,4 +178,41 @@ func TestControlChannel_ConcurrentConfigure(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// TestControlChannel_RecordsCarryTheIncarnation: a listener is configured for
+// one shed incarnation (its creation time) and every record it emits carries
+// it, so a shed deleted and created again under the same name, whose listener
+// is configured anew, never has the earlier one's records taken for its own,
+// even on a stream that stays open across the two.
+func TestControlChannel_RecordsCarryTheIncarnation(t *testing.T) {
+	ps := NewProxyServer()
+	ps.Resolve = fakeResolver(map[string][]string{"pypi.org": {"151.101.0.223"}})
+	client, audits := serveControl(t, ps)
+	first := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	second := first.Add(time.Hour)
+
+	for _, created := range []time.Time{first, second} {
+		port := freePort(t)
+		if err := client.Configure("web", created, port, "", "", []ProfileSpec{{}}); err != nil {
+			t.Fatalf("Configure: %v", err)
+		}
+		guest := dialGuest(t, port)
+		if _, err := guest.Write([]byte("CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org:443\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = bufio.NewReader(guest).ReadString('\n')
+		_ = guest.Close()
+		select {
+		case rec := <-audits:
+			if rec.Shed != "web" || !rec.ShedCreatedAt.Equal(created) {
+				t.Errorf("record %+v, want shed web of the incarnation created %v", rec, created)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("no audit record streamed back")
+		}
+		if err := client.Remove("web"); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

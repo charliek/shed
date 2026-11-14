@@ -406,8 +406,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer cancelRefresh()
 	userLookup.StartRefresh(refreshCtx)
 
+	// The access guard: the one door both front doors call the backend
+	// through. It applies the access rule (internal/backend/access.go) for
+	// the principal each request or channel carries, and binds every
+	// operation on a named shed to the incarnation it authorized. The
+	// backend's own internal work (start-up resume, reconcile, the credential
+	// bus) keeps the raw backend.
+	guard := backend.NewGuard(be)
+
 	// Initialize SSH server
-	sshServer, err := sshd.NewServer(be, hostKeyPath, cfg.SSHListenAddr(), cfg.Terminal, sshd.KeyAuth{
+	sshServer, err := sshd.NewServer(guard, hostKeyPath, cfg.SSHListenAddr(), cfg.Terminal, sshd.KeyAuth{
 		Mode:         userLookup.Mode(),
 		MaxAuthTries: userLookup.MaxAuthTries(),
 		Users:        userLookup,
@@ -456,7 +464,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Initialize HTTP API server
-	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
+	apiServer := api.NewServer(guard, cfg, hostKey, pluginRegistry, pluginBridge)
 	apiServer.SetAuditLog(auditLog)               // nil-safe: records nothing when audit is off
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled

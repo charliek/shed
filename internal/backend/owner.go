@@ -42,14 +42,43 @@ func WithRequiredCreatedAt(ctx context.Context, createdAt time.Time) context.Con
 	return context.WithValue(ctx, requiredCreatedAtKey{}, createdAt)
 }
 
+// RequiredCreatedAt returns the creation time ctx requires of the shed an
+// operation acts on (WithRequiredCreatedAt), if any.
+func RequiredCreatedAt(ctx context.Context) (time.Time, bool) {
+	t, ok := ctx.Value(requiredCreatedAtKey{}).(time.Time)
+	return t, ok
+}
+
+// PinCreatedAt returns ctx requiring createdAt (WithRequiredCreatedAt) unless
+// ctx already requires a creation time, which is never replaced: what follows
+// acts on the shed that was looked up, never on one created again under its
+// name.
+func PinCreatedAt(ctx context.Context, createdAt time.Time) context.Context {
+	if _, ok := RequiredCreatedAt(ctx); ok {
+		return ctx
+	}
+	return WithRequiredCreatedAt(ctx, createdAt)
+}
+
 // CheckCreatedAt returns a shed-not-found error for name when ctx requires a
 // creation time (WithRequiredCreatedAt) and createdAt is not it, and nil
 // otherwise. A backend calls it with CheckOwner, under its per-shed lock,
 // against the shed it loaded.
 func CheckCreatedAt(ctx context.Context, name string, createdAt time.Time) error {
-	want, ok := ctx.Value(requiredCreatedAtKey{}).(time.Time)
+	want, ok := RequiredCreatedAt(ctx)
 	if !ok || createdAt.Equal(want) {
 		return nil
 	}
 	return fmt.Errorf("%w: %s (recreated since it was listed)", config.ErrShedNotFoundSentinel, name)
+}
+
+// CheckIdentity applies CheckOwner and then CheckCreatedAt to a shed whose
+// reported service client is owner (config.ShedOwnership, never the raw
+// stored field) and whose creation time is createdAt. A backend calls it
+// under its per-shed lock, against the shed it loaded.
+func CheckIdentity(ctx context.Context, name, owner string, createdAt time.Time) error {
+	if err := CheckOwner(ctx, name, owner); err != nil {
+		return err
+	}
+	return CheckCreatedAt(ctx, name, createdAt)
 }

@@ -241,8 +241,11 @@ func (f *createShedFakeBackend) Close() error       { return nil }
 func (f *createShedFakeBackend) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 	return f.createFn(ctx, req)
 }
-func (f *createShedFakeBackend) GetShed(_ context.Context, _ string) (*config.Shed, error) {
-	panic("unexpected")
+
+// GetShed reports every name as an existing shed: the access guard loads a
+// shed before it lets a delete through.
+func (f *createShedFakeBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
+	return &config.Shed{Name: name}, nil
 }
 func (f *createShedFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
 	panic("unexpected")
@@ -716,6 +719,11 @@ type stopDetachBackend struct {
 	entered         chan struct{}
 	release         chan struct{}
 	ctxErr          chan error
+}
+
+// GetShed reports the shed: the access guard loads it before a stop.
+func (b *stopDetachBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
+	return &config.Shed{Name: name, Status: config.StatusRunning}, nil
 }
 
 func (b *stopDetachBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {

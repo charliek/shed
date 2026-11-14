@@ -45,9 +45,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	case s.cfg.HTTPAuthEnforced():
 		return s.certAuthMiddleware(next)
 	case mode == config.AuthModeOpen:
-		// Open mode: every caller is an admin (no subject).
+		// Open mode: every caller is the implicit user, an admin (no
+		// subject).
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), Caller{Kind: CallerAdmin})))
+			next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), implicitCaller())))
 		})
 	default:
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -147,7 +148,8 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 			refuseInvalid(w, r)
 			return
 		}
-		if !s.certSubjectAuthorized(leaf.Subject.CommonName) {
+		user, ok := s.certSubjectUser(leaf.Subject.CommonName)
+		if !ok {
 			closeIdentityBoundConnection(w, r)
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is not authorized")
 			return
@@ -156,7 +158,10 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "FORBIDDEN", detail)
 			return
 		}
-		caller := Caller{Kind: CallerAdmin, Name: leaf.Subject.CommonName, Serial: certSerial(leaf)}
+		// The caller is the user the certificate's key belongs to, read from
+		// the live lookup on every request like the check above. On a server
+		// with no user list that is the implicit user, an admin.
+		caller := userCaller(user, leaf.Subject.CommonName, certSerial(leaf))
 		next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), caller)))
 	})
 }
@@ -249,11 +254,19 @@ func certScope(leaf *x509.Certificate) string {
 	return leaf.Subject.OrganizationalUnit[0]
 }
 
-// certSubjectAuthorized reports whether a client certificate's Subject CN (an
-// SSH key fingerprint) still resolves to a user through the live user lookup.
-// A nil lookup (no SetUserLookup call) authorizes nothing — fail closed.
-func (s *Server) certSubjectAuthorized(cn string) bool {
-	return users.HasKey(s.users, cn)
+// certSubjectUser returns the user a client certificate's Subject CN (an SSH
+// key fingerprint) still resolves to through the live user lookup. ok is false
+// for a key that resolves to nobody, an expired key, and with a nil lookup (no
+// SetUserLookup call) — fail closed.
+func (s *Server) certSubjectUser(cn string) (users.User, bool) {
+	if s.users == nil {
+		return users.User{}, false
+	}
+	u, k, ok := s.users.UserForKey(cn)
+	if !ok || k.Expired(time.Now()) {
+		return users.User{}, false
+	}
+	return u, true
 }
 
 // busOwnershipEnforced reports whether credential-bus /respond ownership is

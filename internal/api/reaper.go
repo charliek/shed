@@ -69,6 +69,9 @@ func (s *Server) reapOnce(ctx context.Context, now time.Time) {
 	if ctx.Err() != nil {
 		return
 	}
+	// The reaper acts for the server itself: it lists, stops and deletes
+	// every expired owned shed, whoever's request is in flight.
+	ctx = systemContext(ctx)
 	sheds, err := s.backend.ListSheds(ctx)
 	if err != nil {
 		log.Printf("reaper: list sheds: %v", err)

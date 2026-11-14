@@ -15,6 +15,10 @@ import (
 	"github.com/charliek/shed/internal/vmimage"
 )
 
+// diskUsageLoaded, when a test sets it, runs in DiskUsage between loading a
+// shed's or a snapshot's record and statting its files.
+var diskUsageLoaded func(kind, name string)
+
 // DiskUsage returns disk-usage information for everything the Firecracker
 // backend manages on the local server: image cache, per-instance rootfs
 // copies, kernel, and orphan sidecar files.
@@ -114,7 +118,18 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 			if err != nil {
 				continue
 			}
-			du.Sheds = append(du.Sheds, shedDiskEntryForFC(instanceDir, meta))
+			if diskUsageLoaded != nil {
+				diskUsageLoaded("shed", name)
+			}
+			entry := shedDiskEntryForFC(instanceDir, meta)
+			// The files were statted without the shed's lock: a delete and a
+			// new shed of the same name in between would have their sizes
+			// shown under the old shed's owner. Keep the entry only if the
+			// record is still the incarnation loaded above.
+			if again, err := LoadMetadata(instanceDir, name); err != nil || !again.CreatedAt.Equal(meta.CreatedAt) {
+				continue
+			}
+			du.Sheds = append(du.Sheds, entry)
 		}
 	}
 
@@ -129,11 +144,16 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 			if err != nil {
 				continue
 			}
+			if diskUsageLoaded != nil {
+				diskUsageLoaded("snapshot", name)
+			}
 			rootfs := SnapshotRootfsPath(c.cfg.SnapshotsDir, name)
 			logical, physical, _ := diskstat.Stat(rootfs)
 			entry := config.SnapshotDiskEntry{
 				Name:       snap.Name,
 				SourceShed: snap.SourceShed,
+				User:       snap.User,
+				CreatedAt:  snap.CreatedAt,
 				Rootfs: config.FileEntry{
 					Path: rootfs,
 					Size: config.DiskSize{LogicalBytes: logical, PhysicalBytes: physical},
@@ -150,6 +170,10 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 				})
 				entry.Total.LogicalBytes += metaLogical
 				entry.Total.PhysicalBytes += metaPhysical
+			}
+			// As for sheds: keep the sizes only if they are this snapshot's.
+			if again, err := loadSnapshot(c.cfg.SnapshotsDir, name); err != nil || !again.CreatedAt.Equal(snap.CreatedAt) {
+				continue
 			}
 			du.Snapshots = append(du.Snapshots, entry)
 		}
@@ -196,10 +220,16 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 // summing per-shed bytes against image bytes gives an honest picture
 // of total disk consumed.
 func shedDiskEntryForFC(instanceDir string, meta *Metadata) config.ShedDiskEntry {
+	// Whose the shed is comes from this same record, so the access guard
+	// never shows the entry to someone by matching its name to a later one.
+	owner, user := config.ShedOwnership(meta.Owner, meta.User)
 	entry := config.ShedDiskEntry{
-		Name:   meta.Name,
-		Status: meta.Status,
-		Image:  meta.Image,
+		Name:      meta.Name,
+		Status:    meta.Status,
+		Image:     meta.Image,
+		Owner:     owner,
+		User:      user,
+		CreatedAt: meta.CreatedAt,
 	}
 
 	upperPath := meta.UpperPath

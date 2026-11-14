@@ -513,26 +513,32 @@ func (c *ServerConfig) validateClientImages() error {
 	if c.Auth == nil || len(c.Auth.Clients) == 0 {
 		return nil
 	}
-	var aliases map[string]string
-	switch c.DefaultBackend {
-	case BackendFirecracker:
-		if c.Firecracker != nil {
-			aliases = c.Firecracker.ImageAliases
-		}
-	case BackendVZ:
-		if c.VZ != nil {
-			aliases = c.VZ.ImageAliases
-		}
-	case BackendRemote:
-		if c.Remote != nil {
-			aliases = c.Remote.ImageAliases
-		}
-	}
+	aliases := c.ActiveImageAliases()
 	for name, cc := range c.Auth.Clients {
 		for _, img := range cc.Policy.Images {
 			if _, ok := aliases[img]; !ok {
 				return fmt.Errorf("auth.clients.%s.policy.images names %q, which is not an image alias of the %s backend", name, img, c.DefaultBackend)
 			}
+		}
+	}
+	return nil
+}
+
+// ActiveImageAliases returns the active backend's image_aliases (alias name
+// to image ref), or nil when it has none. Callers must not modify it.
+func (c *ServerConfig) ActiveImageAliases() map[string]string {
+	switch c.DefaultBackend {
+	case BackendFirecracker:
+		if c.Firecracker != nil {
+			return c.Firecracker.ImageAliases
+		}
+	case BackendVZ:
+		if c.VZ != nil {
+			return c.VZ.ImageAliases
+		}
+	case BackendRemote:
+		if c.Remote != nil {
+			return c.Remote.ImageAliases
 		}
 	}
 	return nil

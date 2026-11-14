@@ -25,25 +25,33 @@ type Dialer func(ctx context.Context, network, addr string) (net.Conn, error)
 // AuditRecord is one egress decision. It deliberately records host/port/IP/
 // verdict/rule only — NEVER full URLs or paths, which can carry tokens.
 type AuditRecord struct {
-	Time       time.Time `json:"ts"`
-	Shed       string    `json:"shed"`
-	Host       string    `json:"host"`
-	Port       int       `json:"port"`
-	ResolvedIP string    `json:"resolved_ip,omitempty"`
-	Protocol   string    `json:"protocol"`
-	Verdict    string    `json:"verdict"` // "allow" | "deny"
-	Reason     string    `json:"reason"`
+	Time time.Time `json:"ts"`
+	Shed string    `json:"shed"`
+	// ShedCreatedAt is the creation time of the shed incarnation whose
+	// listener made the decision: a shed deleted and created again under
+	// the same name is another incarnation, and its records are not this
+	// one's. Zero on records written before it was recorded.
+	ShedCreatedAt time.Time `json:"shed_created_at,omitzero"`
+	Host          string    `json:"host"`
+	Port          int       `json:"port"`
+	ResolvedIP    string    `json:"resolved_ip,omitempty"`
+	Protocol      string    `json:"protocol"`
+	Verdict       string    `json:"verdict"` // "allow" | "deny"
+	Reason        string    `json:"reason"`
 }
 
 // ConnHandler applies one shed's policy to its forward-proxy connections.
 type ConnHandler struct {
-	Shed    string
-	Token   string // per-shed proxy-auth token (binds the listener port to this shed)
-	Policy  *Policy
-	Resolve Resolver
-	Dial    Dialer
-	Audit   func(AuditRecord)
-	now     func() time.Time
+	Shed string
+	// ShedCreatedAt is the shed incarnation the listener was configured
+	// for; every record it emits carries it.
+	ShedCreatedAt time.Time
+	Token         string // per-shed proxy-auth token (binds the listener port to this shed)
+	Policy        *Policy
+	Resolve       Resolver
+	Dial          Dialer
+	Audit         func(AuditRecord)
+	now           func() time.Time
 }
 
 func (h *ConnHandler) clock() time.Time {
@@ -58,7 +66,7 @@ func (h *ConnHandler) clock() time.Time {
 // first non-guard address, and evaluates the policy. Returns the pinned dial IP
 // on allow, or nil + a deny record. Pure w.r.t. injected Resolve, so testable.
 func (h *ConnHandler) decide(ctx context.Context, host string, port int, proto string) (net.IP, AuditRecord) {
-	rec := AuditRecord{Time: h.clock(), Shed: h.Shed, Host: host, Port: port, Protocol: proto, Verdict: "deny"}
+	rec := AuditRecord{Time: h.clock(), Shed: h.Shed, ShedCreatedAt: h.ShedCreatedAt, Host: host, Port: port, Protocol: proto, Verdict: "deny"}
 	canon, err := CanonicalizeHost(host)
 	if err != nil {
 		rec.Reason = "bad-host:" + err.Error()
@@ -151,7 +159,7 @@ func (h *ConnHandler) Handle(client net.Conn) {
 	// Per-shed token gate (binds this listener port to this shed).
 	if h.Token != "" && !proxyAuthOK(target.req, h.Token) {
 		writeStatus(client, target.proto, http.StatusProxyAuthRequired, "egress: proxy authentication required")
-		h.emit(AuditRecord{Time: h.clock(), Shed: h.Shed, Host: target.host, Port: target.port, Protocol: target.proto, Verdict: "deny", Reason: "bad-token"})
+		h.emit(AuditRecord{Time: h.clock(), Shed: h.Shed, ShedCreatedAt: h.ShedCreatedAt, Host: target.host, Port: target.port, Protocol: target.proto, Verdict: "deny", Reason: "bad-token"})
 		return
 	}
 

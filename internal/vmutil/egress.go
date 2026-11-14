@@ -6,6 +6,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/egress"
@@ -91,8 +92,8 @@ func renderDockerProxyDropIn(e EgressProxyEnv) string {
 // create). Returns the effective port + token (for the caller to persist in
 // backend metadata) and the env pairs to thread into the clone exec. A failure
 // returns a non-nil error so the orchestrator aborts + unwinds.
-func SetupEgress(ctx context.Context, mgr *egress.Manager, agent *AgentClient, name string, existingPort int, existingToken, gateway, subnet string, specs []egress.ProfileSpec, cleanup *backend.Cleanup) (port int, token string, env []string, err error) {
-	port, token, err = mgr.Configure(name, existingPort, existingToken, gateway, specs)
+func SetupEgress(ctx context.Context, mgr *egress.Manager, agent *AgentClient, name string, createdAt time.Time, existingPort int, existingToken, gateway, subnet string, specs []egress.ProfileSpec, cleanup *backend.Cleanup) (port int, token string, env []string, err error) {
+	port, token, err = mgr.Configure(name, createdAt, existingPort, existingToken, gateway, specs)
 	if err != nil {
 		return 0, "", nil, err
 	}
@@ -108,8 +109,8 @@ func SetupEgress(ctx context.Context, mgr *egress.Manager, agent *AgentClient, n
 // guest env — the live `shed egress set` path (no create-transaction cleanup).
 // On an inject failure it rolls back the listener it just opened. Returns the
 // effective port + token to persist.
-func ApplyEgressLive(ctx context.Context, mgr *egress.Manager, agent *AgentClient, name string, existingPort int, existingToken, gateway, subnet string, specs []egress.ProfileSpec) (int, string, error) {
-	port, token, err := mgr.Configure(name, existingPort, existingToken, gateway, specs)
+func ApplyEgressLive(ctx context.Context, mgr *egress.Manager, agent *AgentClient, name string, createdAt time.Time, existingPort int, existingToken, gateway, subnet string, specs []egress.ProfileSpec) (int, string, error) {
+	port, token, err := mgr.Configure(name, createdAt, existingPort, existingToken, gateway, specs)
 	if err != nil {
 		return 0, "", err
 	}
