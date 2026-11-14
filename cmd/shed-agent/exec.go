@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+
+	"github.com/charliek/shed/internal/redact"
 )
 
 // connKeepaliveInterval is how often the exec paths probe the host connection
@@ -58,7 +60,9 @@ func handleExecConnection(conn net.Conn, user *userInfo) {
 		req.Cmd = []string{"/bin/bash", "--login"}
 	}
 
-	log.Printf("Executing: %v (TTY: %v)", req.Cmd, req.TTY)
+	// The log gets argv with URL credentials redacted; the command runs as
+	// given. Env is never logged.
+	log.Printf("Executing: %v (TTY: %v)", redact.Args(req.Cmd), req.TTY)
 
 	// Create the command
 	cmd := exec.Command(req.Cmd[0], req.Cmd[1:]...)
@@ -154,7 +158,7 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 	// Start command with PTY
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		log.Printf("Failed to start command with PTY: %v", err)
+		log.Printf("Failed to start command with PTY: %s", redact.String(err.Error()))
 		if err := writeExitCode(conn, 1); err != nil {
 			log.Printf("Warning: failed to write exit code: %v", err)
 		}
@@ -292,7 +296,7 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 
 	// Start command
 	if err := cmd.Start(); err != nil {
-		log.Printf("Failed to start command: %v", err)
+		log.Printf("Failed to start command: %s", redact.String(err.Error()))
 		if err := writeExitCode(conn, 1); err != nil {
 			log.Printf("Warning: failed to write exit code: %v", err)
 		}
