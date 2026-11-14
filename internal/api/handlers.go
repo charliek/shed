@@ -900,6 +900,11 @@ func mapBackendError(err error) (int, string, string) {
 	if errors.Is(err, config.ErrZoneCapacityUnavailableSentinel) {
 		return http.StatusServiceUnavailable, config.ErrZoneCapacityUnavailable, err.Error()
 	}
+	// The remote backend's firewall check: a 503, so a client waits and
+	// tries again, with the reason in the message.
+	if errors.Is(err, config.ErrFirewallCheckFailedSentinel) {
+		return http.StatusServiceUnavailable, config.ErrFirewallCheckFailed, err.Error()
+	}
 	if errors.Is(err, config.ErrFeatureUnsupportedSentinel) {
 		return http.StatusNotImplemented, config.ErrFeatureUnsupported, err.Error()
 	}

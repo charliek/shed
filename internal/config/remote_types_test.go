@@ -78,6 +78,7 @@ func TestRemoteErrorCodes(t *testing.T) {
 		{ErrCloudQuotaExceeded, "CLOUD_QUOTA_EXCEEDED", ErrCloudQuotaExceededSentinel},
 		{ErrZoneCapacityUnavailable, "ZONE_CAPACITY_UNAVAILABLE", ErrZoneCapacityUnavailableSentinel},
 		{ErrFeatureUnsupported, "FEATURE_UNSUPPORTED", ErrFeatureUnsupportedSentinel},
+		{ErrFirewallCheckFailed, "FIREWALL_CHECK_FAILED", ErrFirewallCheckFailedSentinel},
 	}
 	sentinels := make([]error, 0, len(tests))
 	for _, tt := range tests {

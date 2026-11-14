@@ -101,6 +101,11 @@ var (
 	// no room for the machine a create or start asks for.
 	ErrZoneCapacityUnavailableSentinel = errors.New("zone capacity unavailable")
 
+	// ErrFirewallCheckFailedSentinel is returned when the remote backend's
+	// check of its cloud firewall rule and network fails, or cannot be made.
+	// Creates and starts are refused until it passes; nothing else is.
+	ErrFirewallCheckFailedSentinel = errors.New("firewall check failed")
+
 	// ErrFeatureUnsupportedSentinel is returned when a request uses a
 	// feature the active backend does not offer (on remote: host directory
 	// mounts, server mounts, snapshots, reset, image management, egress
@@ -977,6 +982,12 @@ const (
 	// ErrZoneCapacityUnavailable (503) means the cloud zone has no room for
 	// the machine.
 	ErrZoneCapacityUnavailable = "ZONE_CAPACITY_UNAVAILABLE"
+	// ErrFirewallCheckFailed (503) means the remote backend's check of the
+	// cloud firewall rule and network is failing, so it will not create or
+	// start a VM. The message says which rule and what was expected against
+	// what was found. A client waits and tries again; an operator fixes the
+	// rule.
+	ErrFirewallCheckFailed = "FIREWALL_CHECK_FAILED"
 	// ErrFeatureUnsupported means the active backend does not offer what
 	// the request uses: 422 for a create field (local_dir, add_dirs, a
 	// non-empty mounts, from_snapshot, egress profiles), 501 for a route
@@ -1285,16 +1296,23 @@ const (
 // remote.firewall.mode values.
 const (
 	// RemoteFirewallStatic (the default): the firewall rule's sources are
-	// fixed and must equal firewall.source_ranges.
+	// fixed and must equal the configured set (firewall.source_ranges, or
+	// the variable firewall.source_ranges_env names). The server reads the
+	// rule and refuses creates and starts while it differs; it never changes
+	// it.
 	RemoteFirewallStatic = "static"
-	// RemoteFirewallAuto: the server follows its own public address and
-	// patches the rule (needs firewall.echo_urls).
+	// RemoteFirewallAuto: the server follows its own public address
+	// (firewall.echo_urls) and patches the rule's sources to that one /32.
 	RemoteFirewallAuto = "auto"
-	// RemoteFirewallAny: the rule admits every address. Needs
-	// firewall.acknowledge_any, and is refused beside service clients or the
-	// isolated network profile, because one shed can then reach another's
-	// SSH port.
+	// RemoteFirewallAny: the rule may admit any address; its sources are
+	// not compared. Needs firewall.acknowledge_any, and is refused beside
+	// service clients or the isolated network profile, because one shed can
+	// then reach another's SSH port.
 	RemoteFirewallAny = "any"
+
+	// RemoteFirewallMinPrefix is the widest source range static mode takes
+	// without firewall.acknowledge_any: a /24.
+	RemoteFirewallMinPrefix = 24
 )
 
 // Defaults for the remote block. The *_env defaults are the variable names
@@ -1320,6 +1338,9 @@ const (
 	DefaultRemoteGCESubnetEnv          = "SHED_GCE_SUBNET"
 	DefaultRemoteGCECredentialsEnv     = "GOOGLE_CREDENTIALS_BASE64"
 	DefaultRemoteGCECredentialsFileEnv = "SHED_GCE_CREDENTIALS_FILE"
+	// DefaultRemoteFirewallSourceRangesEnv is firewall.source_ranges_env
+	// when static mode names neither it nor firewall.source_ranges.
+	DefaultRemoteFirewallSourceRangesEnv = "SHED_REMOTE_SOURCE_RANGES"
 )
 
 // RemoteConfig is the `remote:` block: the backend that runs each shed as a
@@ -1416,14 +1437,31 @@ type RemoteSSHConfig struct {
 type RemoteFirewallConfig struct {
 	// Mode is one of the RemoteFirewall* values (default static).
 	Mode string `yaml:"mode,omitempty"`
-	// SourceRanges are the IPv4 CIDRs the rule admits. In static mode they
-	// must equal the rule's sources; not allowed in any mode.
+	// SourceRanges are the IPv4 CIDRs the rule admits, written in the
+	// config file. Static mode only, where the rule's sources must equal
+	// them. Exactly one of SourceRanges and SourceRangesEnv is used.
 	SourceRanges []string `yaml:"source_ranges,omitempty"`
-	// AcknowledgeAny must be true for mode: any.
+	// SourceRangesEnv names an environment variable holding the same list,
+	// comma-separated, so a config kept in a public repository holds no
+	// address. Static mode only; read once, when the server starts. When
+	// static mode sets neither field it defaults to
+	// DefaultRemoteFirewallSourceRangesEnv.
+	SourceRangesEnv string `yaml:"source_ranges_env,omitempty"`
+	// AcknowledgeAny must be true for mode: any, and for a static source
+	// range wider than a /24 (0.0.0.0/0 included). Wherever it is true the
+	// config is treated as open to anyone: see AdmitsAny.
 	AcknowledgeAny bool `yaml:"acknowledge_any,omitempty"`
 	// EchoURLs are the https services that report the caller's public
 	// address. Auto mode only, and it needs at least two.
 	EchoURLs []string `yaml:"echo_urls,omitempty"`
+}
+
+// AdmitsAny reports whether the config accepts a rule that admits addresses
+// other than the server's own: mode any, or a static mode that acknowledged
+// wide ranges. Such a config is refused beside service clients and beside
+// the isolated network profile.
+func (f RemoteFirewallConfig) AdmitsAny() bool {
+	return f.Mode == RemoteFirewallAny || f.AcknowledgeAny
 }
 
 // RemoteGCEConfig is remote.gce: the names of the environment variables that
@@ -1452,4 +1490,8 @@ type RemoteRuntime struct {
 	Credentials []byte
 	// SSHClientKey is the server's OpenSSH private key (transport: ssh).
 	SSHClientKey []byte
+	// FirewallSources are the source ranges the firewall rule must have in
+	// static mode, as canonical IPv4 CIDRs. Nil in the other modes, and
+	// with a test provider that was given none.
+	FirewallSources []string
 }
