@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -121,5 +122,58 @@ func TestCloneRepoRedactsOnlyTheLog(t *testing.T) {
 	}
 	if !strings.Contains(out, "https://REDACTED@github.com/example/repo.git") {
 		t.Errorf("server log = %q, want git's line with the URL redacted", out)
+	}
+}
+
+// TestCloneRepoKeepsNoOutput: the guest decides how much git prints, so the
+// server must not hold it. 48 MiB of clone output leaves the heap where it
+// was.
+func TestCloneRepoKeepsNoOutput(t *testing.T) {
+	const chunk, chunks = 32 << 10, 1536 // 48 MiB
+	line := []byte(strings.Repeat("remote: counting objects\n", chunk/25))
+	live := make(chan uint64, 1)
+	dialer := &pipeDialer{handler: func(conn net.Conn) {
+		defer conn.Close()
+		if _, _, err := agentproto.ReadMessage(conn); err != nil {
+			return
+		}
+		_, _, _ = agentproto.ReadMessage(conn) // stdin EOF
+		for i := 0; i < chunks; i++ {
+			if err := agentproto.WriteData(conn, line); err != nil {
+				return
+			}
+		}
+		// Everything is written and read; whatever the server still
+		// holds of it is live now.
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		live <- m.HeapAlloc
+		_ = agentproto.WriteExitCode(conn, 0)
+	}}
+
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devnull.Close()
+	saved := os.Stdout
+	os.Stdout = devnull
+	t.Cleanup(func() { os.Stdout = saved })
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	agent := NewAgentClient(dialer, 1024, 1026)
+	err = CloneRepo(context.Background(), agent, &config.ServerConfig{}, "https://github.com/example/repo.git", true, nil)
+	os.Stdout = saved
+	if err != nil {
+		t.Fatalf("CloneRepo: %v", err)
+	}
+	after := <-live
+	const allowed = 16 << 20
+	if after > before.HeapAlloc && after-before.HeapAlloc > allowed {
+		t.Fatalf("the heap grew by %d MiB while the guest printed %d MiB; want under %d MiB",
+			(after-before.HeapAlloc)>>20, (chunk*chunks)>>20, allowed>>20)
 	}
 }

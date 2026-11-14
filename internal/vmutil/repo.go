@@ -49,14 +49,14 @@ func CloneRepo(ctx context.Context, agent *AgentClient, serverCfg *config.Server
 	env = append(env, extraEnv...)
 
 	// git's output goes to the server log, so URL credentials are redacted
-	// from it line by line. The command itself gets repo as given.
-	var output strings.Builder
+	// from it line by line. The command itself gets repo as given. Nothing
+	// of the output is kept in memory: the guest decides how much there is.
 	stdout, stderr := redact.NewWriter(os.Stdout), redact.NewWriter(os.Stderr)
 	opts := backend.ExecOptions{
 		Cmd:        []string{"git", "clone", repo, dirName},
 		Env:        env,
-		Stdout:     NopWriteCloser(io.MultiWriter(&output, stdout)),
-		Stderr:     NopWriteCloser(io.MultiWriter(&output, stderr)),
+		Stdout:     NopWriteCloser(stdout),
+		Stderr:     NopWriteCloser(stderr),
 		WorkingDir: config.HomePath,
 		TTY:        false,
 	}
