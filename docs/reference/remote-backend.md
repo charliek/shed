@@ -51,7 +51,7 @@ The run limit is enforced by the cloud: each VM is created with a maximum run du
 
 "Queued" means the job waits for the cloud operation already running, then acts.
 
-A delete without `Accept: text/event-stream` answers as soon as the shed is hidden (about 3 s measured, and about 10 s when the VM cannot be labelled at once because its create or a stop is still in flight); the VM is destroyed in the background, about 30 s measured. With `Accept: text/event-stream`, which is what `shed delete` sends, the shed is hidden just as fast but the stream stays open until the VM is gone, so the command returns only then (29 to 34 s measured) and a create right after it never meets the old VM. A delete sent while the shed's create is still asking the cloud for its VM waits for that VM to appear and then destroys it, which took about two and a half minutes when measured. A destroy that fails is retried by the periodic pass (see below).
+A delete without `Accept: text/event-stream` answers as soon as the shed is hidden (about 3 s measured, and about 10 s when the VM cannot be labelled at once because its create or a stop is still in flight); the VM is destroyed in the background, about 30 s measured. With `Accept: text/event-stream`, which is what `shed delete` sends, the shed is hidden just as fast but the stream stays open until the VM is gone, so the command returns only then (29 to 34 s measured) and a create right after it never meets the old VM. A delete sent while the shed's create is still asking the cloud for its VM waits for that VM to appear and then destroys it, which took about two and a half minutes when measured. A destroy that fails is retried by the periodic pass (see below). The shed is hidden all the same; a streamed delete then ends with an error event (`shed delete` prints `the delete is recorded but the VM could not be destroyed yet; the server keeps trying` and exits 1), and a JSON delete has already answered 204.
 
 Exec (`POST /api/sheds/{name}/exec`) and the Connect tunnel on a shed that is not running return **409 `SHED_NOT_RUNNING`**.
 
@@ -77,6 +77,10 @@ A pass destroys a VM only for a delete that was acknowledged or a create that fa
 Measured on the development server: a VM stopped with the cloud's own tools was listed `stopped (external)` 10 s after it finished stopping, and `shed start` brought it back in 42 s. A VM deleted with the cloud's tools lost its record 2 to 12 s after it was gone. A stopped shed's VM started with the cloud's tools was listed `starting` at the next pass and `running` 3 s later. A `shed delete` sent in between, for a shed whose VM was already gone, succeeded in under a second.
 
 A VM that cannot be destroyed still runs, so two minutes after its delete it counts against `max_running` until it is gone. A delete that is merely slow (one that raced its own create, above) counts the same way for as long as it lasts beyond the two minutes. `SERVER_LIMIT_REACHED` then says how many such VMs there are; the server log has the cloud's error.
+
+Measured with a VM put under the cloud's deletion protection: `shed delete` returned after 4 s with the error above, the VM kept running with its delete marker, a create 2 min 5 s later was refused at `max_running`, and each pass from then on retried the destroy. The VM was gone 80 s after the protection was cleared.
+
+Measured for a create that fails late, from a stock image with no shed agent: the create ended in `error` (`create_failed`) after 324 s, which is the 5 minute wait for the agent, and its VM and disk were gone 58 s later with no delete sent. For the run limit, with `max_run_duration: 10m`: the cloud stopped the VM at the limit, the shed was listed `stopped (run_limit)` 63 s after it, and `shed start` (44 s) gave the VM a new limit counted from that start.
 
 The `--repo` clone of a create runs with `GIT_TERMINAL_PROMPT=0`, for at most 5 minutes an attempt and at most 3 attempts. A clone that still fails is a warning, as on the other backends: the shed runs without the repository.
 
@@ -136,7 +140,7 @@ remote:
     large:    {machine_type: e2-standard-8, cpus: 8, memory_mb: 32768, arch: amd64}
   disk_gb: 50
   limits: {max_running: 2, max_sheds: 8}
-  max_run_duration: 24h          # a client's shed gets the larger of this and its max_age
+  max_run_duration: 24h          # 10m to 2880h; a client's shed gets the larger of this and its max_age
   agent_dir: <path>              # holds shed-agent-linux-<arch> (default <state dir>/agent)
   agent_install: incompatible    # incompatible | always | never; only never is built (see below)
   ssh:
@@ -191,9 +195,11 @@ Another environment's rule on a shared network targets its own tag and is not a 
 The check runs when the server starts, in every periodic pass (once a minute), and before a create or start whose last result is more than 60 seconds old. While it fails:
 
 - `shed create` and `shed start` (and an SSH connection that would wake a stopped shed) are refused with `503 FIREWALL_CHECK_FAILED`. The message says which rule, what was expected and what was found.
-- `stop`, `delete`, `list`, `exec` and connections to running sheds work as before.
+- `stop`, `delete`, `list`, `exec` and connections to running sheds work as before. When the rule itself no longer admits the server, the SSH connections the server already holds keep working (a rule change does not cut an open connection), so `exec` works until one drops; `stop`, `delete` and `list` never need the rule.
 - The server still starts, so existing sheds can be listed and deleted.
 - Nothing is stopped or deleted because of it.
+
+A change to the rule is seen at the next check, so for up to a minute after it a create or start is still judged by the last result. Measured: a rule changed by hand was reported failing 29 to 53 s later, and a repaired one passing within a minute, with no restart.
 
 The result is written to the server log when it changes, and again every ten minutes while it fails:
 
@@ -239,7 +245,9 @@ Auto mode needs two more custom roles, which `gce-setup.sh --print --firewall-au
 | `<role-id>FirewallRule` | `compute.firewalls.get`, `compute.firewalls.update` | With an IAM condition on `resource.name`, so it holds for the one rule `shed-<environment>-ssh` |
 | `<role-id>FirewallNet` | `compute.networks.updatePolicy`, `compute.globalOperations.get` | Without a condition (IAM conditions cannot name a network or an operation); alone these change no rule |
 
-A holder of both can change any field of that one rule, not only its sources: Google has no narrower permission. A stolen key could open the sheds' ports to any address, so use `auto` only where the address really changes. The condition is written from Google's IAM documentation, which lists firewall rules among the resources a condition can name; confirm it in your project by checking that the server's key cannot update another rule.
+A holder of both can change any field of that one rule, not only its sources: Google has no narrower permission. A stolen key could open the sheds' ports to any address, so use `auto` only where the address really changes. The condition comes from Google's IAM documentation, which lists firewall rules among the resources a condition can name. It was run once by hand on the development project: the binding was accepted, the server patched its own rule, and its key was refused an update, a create and a delete of another rule. That project's base role already held `compute.firewalls.get` and `compute.globalOperations.get`, so the run does not show that `compute.networks.updatePolicy` is needed, or that the read of the rule works through the condition alone. Confirm it in your project by checking that the server's key cannot update another rule.
+
+Measured on the development server: a rule whose sources were changed by hand was patched back 45 and 47 s later (at the next pass). With its port changed as well it was left alone for six minutes, creates refused with `rule_allow`, and its sources were patched 45 s after the port was put back. Sources changed again a minute after a patch were not repaired at the next pass, and the message said so: `not repaired yet: the rule was last patched 1m0s ago and is patched at most once every 5m0s`.
 
 **any.** The rule may admit any address; its sources are not compared and the rest of the check still runs. It needs `acknowledge_any: true`, makes the `isolated` profile unavailable, and is refused beside service clients. `acknowledge_any: true` in static mode has the same two effects.
 

@@ -234,8 +234,10 @@ if [[ $firewall_auto -eq 1 ]]; then
 #     compute.globalOperations.get go in a second role bound without a
 #     condition. Those two alone change no rule: every firewall change
 #     also needs a compute.firewalls.* permission on the rule. This split
-#     was taken from the documentation and has not been exercised against
-#     a live project by the shed test suite. After running it, confirm that
+#     was run by hand against one live project: the binding with the
+#     condition was accepted, the server patched its own rule, and its key
+#     was refused an update, a create and a delete of another rule. No
+#     automated test repeats that, so after running the block confirm that
 #     the server's log shows "patched rule $rule" when its address
 #     changes, and that updating any OTHER firewall rule with the server's
 #     key is refused.

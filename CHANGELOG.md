@@ -158,7 +158,9 @@ All notable changes to this project will be documented in this file.
 - **Development: a remote-backend dev server and suite parameter.**
   `make dev-server-up-remote` (and `-down-`, `-restart-`, `-status-`, `-logs-remote`) runs the
   dev build with `default_backend: remote` beside an installed server, reading the cloud
-  settings from a private env file. The integration suite gains an opt-in `remote` parameter
+  settings from a private env file. The env file also picks the firewall mode
+  (`SHED_REMOTE_FIREWALL_MODE=auto` with `SHED_REMOTE_ECHO_URLS`; static otherwise). The
+  integration suite gains an opt-in `remote` parameter
   (`SHED_REMOTE_SERVER`; `make test-integration-remote`, manual only, since every shed is a
   billed VM). See [Remote Backend
   Development](https://charliek.github.io/shed/development/remote-backend/).
