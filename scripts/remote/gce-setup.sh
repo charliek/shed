@@ -161,9 +161,10 @@ gcloud services enable compute.googleapis.com --project="\$PROJECT"
 ########################################################################
 # 2. A custom-mode network and one subnet for this environment, IPv4 only.
 #    No rule allows VM-to-VM traffic, so sheds cannot reach each other
-#    (the 'isolated' network profile holds by construction). Never use the
-#    project's default network: it allows internal traffic and SSH from
-#    anywhere.
+#    (the 'isolated' network profile holds by construction). Outbound
+#    traffic is not filtered: a shed reaches any public address, a public
+#    port of the shed-server host included. Never use the project's default
+#    network: it allows internal traffic and SSH from anywhere.
 ########################################################################
 gcloud compute networks create $name --project="\$PROJECT" \\
   --subnet-mode=custom --bgp-routing-mode=regional

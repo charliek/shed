@@ -283,9 +283,12 @@ func (b *Backend) Type() backend.Type { return backend.TypeRemote }
 func (b *Backend) Capabilities() backend.Capabilities { return backend.RemoteCapabilities() }
 
 // SupportsNetworkProfile reports whether a shed may ask for the profile.
-// "isolated" means isolation by network topology: no route between sheds or
-// to the server host. It is refused when the config accepts a firewall rule
-// open to more than the server (mode any, or acknowledged wide ranges).
+// "isolated" means isolation by network topology: no route between sheds and
+// no private route to the server host. Outbound traffic is not filtered, so a
+// shed still reaches any public address, a public port of the server host
+// included; no egress rule exists or is checked. It is refused when the
+// config accepts a firewall rule open to more than the server (mode any, or
+// acknowledged wide ranges).
 func (b *Backend) SupportsNetworkProfile(profile string) bool {
 	switch profile {
 	case config.NetworkProfileOpen:

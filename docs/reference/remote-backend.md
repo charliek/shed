@@ -6,7 +6,7 @@ A remote server differs from a Firecracker or VZ server in three ways:
 
 - **Lifecycle is asynchronous.** A JSON create, start, stop or delete returns as soon as the new status is saved, and a job owned by the server does the cloud work. A shed passes through `starting` and `stopping`.
 - **Some features do not exist.** There are no host directories, server mounts, snapshots, reset, image store or egress profiles. Requests for them are refused before anything is created.
-- **Isolation is by network topology.** The `isolated` network profile is accepted because the network gives a shed no route to another shed or to the server host.
+- **Isolation is by network topology.** The `isolated` network profile is accepted because the network gives a shed no route to another shed and no private route to the server host. Outbound traffic is not filtered: a shed has a public address and reaches any public address, including a port the server host exposes to the internet.
 
 ## Statuses
 
@@ -166,7 +166,7 @@ One field is accepted by the loader but not built yet:
 
 ## The firewall check
 
-Every shed's SSH port is open to whatever one cloud firewall rule admits: `shed-<environment>-ssh`, which `scripts/remote/gce-setup.sh` creates. The `isolated` profile holds only while no other rule lets VMs reach each other. The server never creates or deletes a rule. It reads the rule and its network, and refuses to create or start a VM while they are not as expected.
+Every shed's SSH port is open to whatever one cloud firewall rule admits: `shed-<environment>-ssh`, which `scripts/remote/gce-setup.sh` creates. The `isolated` profile holds only while no other rule lets VMs reach each other. The check covers ingress only: no rule denies a shed's outbound traffic, so nothing in the cloud keeps a shed from a public address of the server host. The server never creates or deletes a rule. It reads the rule and its network, and refuses to create or start a VM while they are not as expected.
 
 The check passes when all of these hold:
 
