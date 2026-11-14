@@ -557,3 +557,41 @@ func TestFirewallAutoProviderCannotPatch(t *testing.T) {
 		t.Errorf("%d patches", n)
 	}
 }
+
+// TestPublicAddrSummaryHidesCredentials: the summary is logged and sent to
+// clients in the refusal, so an echo URL's userinfo never appears in it,
+// whether the entry parses (the host alone is named) or not.
+func TestPublicAddrSummaryHidesCredentials(t *testing.T) {
+	const secret = "s3cr3t-token"
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{"parses", "https://user:" + secret + "@echo.invalid/ip", "echo.invalid: "},
+		{"plain http", "http://" + secret + "@echo.invalid/ip", "echo.invalid: not an https URL"},
+		{"does not parse", "https://user:" + secret + "@echo.invalid/%zz", "https://REDACTED@echo.invalid/%zz: not an https URL"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A transport that fails every request: nothing leaves the test.
+			client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("no network in this test")
+			})}
+			_, ok, summary := newAddrFinder([]string{tt.url, tt.url}, client).agreed(context.Background())
+			if ok {
+				t.Fatal("believed an address nobody reported")
+			}
+			if strings.Contains(summary, secret) {
+				t.Errorf("summary carries the credential: %s", summary)
+			}
+			if !strings.Contains(summary, tt.want) {
+				t.Errorf("summary lacks %q: %s", tt.want, summary)
+			}
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

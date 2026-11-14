@@ -677,3 +677,34 @@ func TestResolveBackendNeverPicksRemote(t *testing.T) {
 		t.Error("remote is not a valid default_backend")
 	}
 }
+
+// TestRemoteFirewallEchoURLErrorHidesCredentials: a refused echo URL is quoted
+// in a start-up error that reaches the log, without its userinfo.
+func TestRemoteFirewallEchoURLErrorHidesCredentials(t *testing.T) {
+	const secret = "s3cr3t-token"
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{"user and password", "http://user:" + secret + "@b.example/ip", `"http://REDACTED@b.example/ip"`},
+		{"token as the user", "http://" + secret + "@b.example", `"http://REDACTED@b.example"`},
+		{"nothing to hide", "http://b.example/ip", `"http://b.example/ip"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := validRemote()
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", tt.url}}
+			err := c.Validate()
+			if err == nil {
+				t.Fatal("a plain-http echo URL was accepted")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("the error carries the credential: %v", err)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %v, want it to quote %s", err, tt.want)
+			}
+		})
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charliek/shed/internal/redact"
 	"github.com/charliek/shed/internal/remote/provider"
 )
 
@@ -252,7 +253,7 @@ func (c *RemoteConfig) validateFirewall() error {
 	for _, u := range f.EchoURLs {
 		parsed, err := url.Parse(u)
 		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-			return fmt.Errorf("invalid firewall.echo_urls entry %q (must be an https URL)", u)
+			return fmt.Errorf("invalid firewall.echo_urls entry %q (must be an https URL)", redact.String(u))
 		}
 	}
 	notStatic := func() error {

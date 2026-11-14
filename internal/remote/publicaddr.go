@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/charliek/shed/internal/redact"
 )
 
 // What remote.firewall.mode: auto asks an echo service. An echo service is an
@@ -149,8 +151,11 @@ func (f *addrFinder) agreed(ctx context.Context) (addr netip.Addr, ok bool, summ
 	votes := make(map[netip.Addr]int)
 	notes := make([]string, 0, len(answers))
 	for i, a := range answers {
-		host := f.urls[i]
-		if u, err := url.Parse(host); err == nil && u.Host != "" {
+		// The host alone names the service. An entry that does not parse is
+		// named whole, with any userinfo redacted: the summary is logged and
+		// sent to clients in the refusal.
+		host := redact.String(f.urls[i])
+		if u, err := url.Parse(f.urls[i]); err == nil && u.Host != "" {
 			host = u.Host
 		}
 		if a.err != nil {
@@ -160,7 +165,9 @@ func (f *addrFinder) agreed(ctx context.Context) (addr netip.Addr, ok bool, summ
 		votes[a.addr]++
 		notes = append(notes, fmt.Sprintf("%s: %s", host, a.addr))
 	}
-	summary = strings.Join(notes, "; ")
+	// An error may quote a URL (a proxy's, a redirect's), so the whole
+	// summary is redacted too.
+	summary = redact.String(strings.Join(notes, "; "))
 
 	type tally struct {
 		addr netip.Addr
