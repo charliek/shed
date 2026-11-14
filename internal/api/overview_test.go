@@ -14,6 +14,7 @@ import (
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 // overviewFakeBackend is a Backend stub for the overview + session-listing
@@ -324,7 +325,7 @@ func TestOverview_Scope(t *testing.T) {
 	be := &overviewFakeBackend{} // empty: handler returns 200 with no sheds
 	fp := testFingerprint("overview")
 	srv := NewServer(be, &config.ServerConfig{Name: "test-server", Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}}, "", nil, nil)
-	srv.SetClientCertAuthorizer(func(got string) bool { return got == fp })
+	srv.SetUserLookup(userstest.Implicit(fp))
 
 	call := func(scope string) int {
 		r := httptest.NewRequest(http.MethodGet, "/api/overview", nil)

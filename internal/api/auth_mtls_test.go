@@ -23,6 +23,7 @@ import (
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 // ---------------------------------------------------------------------------
@@ -74,13 +75,9 @@ func withClientCert(r *http.Request, certs ...*x509.Certificate) *http.Request {
 // exactly the fingerprints in authorized.
 func mtlsTestServer(t *testing.T, authorized ...string) *Server {
 	t.Helper()
-	allowed := make(map[string]bool, len(authorized))
-	for _, fp := range authorized {
-		allowed[fp] = true
-	}
 	return &Server{
-		cfg:            &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}},
-		certAuthorized: func(fp string) bool { return allowed[fp] },
+		cfg:   &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}},
+		users: userstest.Implicit(authorized...),
 	}
 }
 
@@ -209,12 +206,12 @@ func TestMTLSMiddlewareFailsClosed(t *testing.T) {
 		}
 	})
 
-	t.Run("nil authorizer authorizes nothing", func(t *testing.T) {
+	t.Run("nil user lookup authorizes nothing", func(t *testing.T) {
 		s := mtlsTestServer(t)
-		s.certAuthorized = nil
+		s.users = nil
 		valid := testClientCert(fp, authtoken.ScopeControl, time.Hour)
 		if got := doCert(s, "GET", "/api/sheds", valid); got != 401 {
-			t.Errorf("nil authorizer: got %d, want 401", got)
+			t.Errorf("nil user lookup: got %d, want 401", got)
 		}
 	})
 
@@ -267,7 +264,7 @@ func TestMTLSProductionRouterEnforces(t *testing.T) {
 			Name: "test-server",
 			Auth: &config.AuthConfig{Mode: config.AuthModeMTLS},
 		}, "ssh-ed25519 AAAAtest", nil, nil)
-		srv.SetClientCertAuthorizer(func(f string) bool { return f == fp })
+		srv.SetUserLookup(userstest.Implicit(fp))
 		return srv
 	}
 
@@ -347,7 +344,7 @@ func TestMTLSRouterOverRealTLSRejectsMissingCertificate(t *testing.T) {
 				Name: "test-server",
 				Auth: &config.AuthConfig{Mode: config.AuthModeMTLS},
 			}, "ssh-ed25519 AAAAtest", nil, nil)
-			api.SetClientCertAuthorizer(h.authorized)
+			api.SetUserLookup(userstest.Matching(h.authorized))
 			router := api.Router()
 
 			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -445,7 +442,7 @@ func TestMTLSInfoReportsCA(t *testing.T) {
 			Name: "test-server",
 			Auth: &config.AuthConfig{Mode: mode},
 		}, "", nil, nil)
-		srv.SetClientCertAuthorizer(func(string) bool { return true })
+		srv.SetUserLookup(userstest.Matching(func(string) bool { return true }))
 		srv.SetClientCAInfo("sha256:deadbeef", notAfter)
 		return srv
 	}
@@ -604,8 +601,8 @@ func newMTLSHarness(t *testing.T, allowed map[string]bool, handler http.Handler)
 	})
 
 	api := &Server{
-		cfg:            &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}},
-		certAuthorized: h.authorized,
+		cfg:   &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}},
+		users: userstest.Matching(h.authorized),
 	}
 
 	srv := httptest.NewUnstartedServer(api.authMiddleware(counting))

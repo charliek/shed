@@ -20,6 +20,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 // clientAllowedList is the service-client allowlist as this test states it.
@@ -257,7 +258,7 @@ func clientTestServer(t *testing.T, b backend.Backend, policy config.ServiceClie
 		},
 	}
 	s := NewServer(b, cfg, "", nil, nil)
-	s.SetClientCertAuthorizer(func(fp string) bool { return fp == testAdminFP })
+	s.SetUserLookup(userstest.Implicit(testAdminFP))
 	return s, s.Router()
 }
 

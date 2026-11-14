@@ -25,6 +25,7 @@ import (
 	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/internal/sshd"
 	"github.com/charliek/shed/internal/stallwatch"
+	"github.com/charliek/shed/internal/users"
 	"github.com/charliek/shed/internal/vz"
 )
 
@@ -67,9 +68,9 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 //
 // clientCA is non-nil only in mtls mode (runServe loads it there and nowhere
 // else, and aborts startup if the load fails); authorized is the live
-// SSH-allowlist predicate. Outside mtls the result is a plain server-auth-only
-// config: no ClientAuth, no ClientCAs (open mode serves no HTTPS today, so this
-// is the defensive case).
+// SSH-allowlist predicate (users.HasKey over the user lookup). Outside mtls the
+// result is a plain server-auth-only config: no ClientAuth, no ClientCAs (open
+// mode serves no HTTPS today, so this is the defensive case).
 //
 // Both conditions are required deliberately, and the belt-and-braces costs
 // nothing: an mtls server that somehow reached here with no CA would produce a
@@ -379,9 +380,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Initialized egress-control proxy (proxy %s, ports %d-%d, socket %s, audit %s, profiles %s)", proxyBin, lo, hi, sockPath, auditPath, storeDir)
 	}
 
-	// Build the SSH key allowlist (default off = accept all). GitHub-seeded
-	// keys are cached next to the host key. Fails closed (returns an error)
-	// when mode=enforce but no keys resolved.
+	// Build the user lookup: the SSH key allowlist (default off = accept all),
+	// each key belonging to a user with where it came from. Both the SSH
+	// server and the mtls API ask it. GitHub-seeded keys are cached next to
+	// the host key. Fails closed (returns an error) when mode=enforce but no
+	// keys resolved.
 	stateDir := serverStateDir(cfg)
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return fmt.Errorf("state dir %s: %w", stateDir, err)
@@ -389,19 +392,26 @@ func runServe(cmd *cobra.Command, args []string) error {
 	log.Printf("State dir: %s", stateDir)
 	hostKeyPath := filepath.Join(stateDir, "host_key")
 	githubCacheDir := filepath.Join(stateDir, "github_keys")
-	sshAllowlist, err := sshd.NewKeyAllowlist(cfg.EffectiveSSHAuth(), githubCacheDir)
+	userLookup, err := users.NewConfigLookup(users.ConfigOptions{
+		SSH:            cfg.EffectiveSSHAuth(),
+		GitHubCacheDir: githubCacheDir,
+	})
 	if err != nil {
 		return fmt.Errorf("ssh auth: %w", err)
 	}
-	log.Printf("SSH auth mode: %s", sshAllowlist.Mode())
+	log.Printf("SSH auth mode: %s", userLookup.Mode())
 
 	// Refresh GitHub-seeded keys in the background until shutdown.
 	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
 	defer cancelRefresh()
-	sshAllowlist.StartRefresh(refreshCtx)
+	userLookup.StartRefresh(refreshCtx)
 
 	// Initialize SSH server
-	sshServer, err := sshd.NewServer(be, hostKeyPath, cfg.SSHListenAddr(), cfg.Terminal, sshAllowlist)
+	sshServer, err := sshd.NewServer(be, hostKeyPath, cfg.SSHListenAddr(), cfg.Terminal, sshd.KeyAuth{
+		Mode:         userLookup.Mode(),
+		MaxAuthTries: userLookup.MaxAuthTries(),
+		Users:        userLookup,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create SSH server: %w", err)
 	}
@@ -452,9 +462,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
 	if clientCA != nil {
 		// mtls: the middleware re-validates every request's client certificate
-		// against the LIVE allowlist, so removing an SSH key de-authorizes its
+		// against the LIVE user lookup, so removing an SSH key de-authorizes its
 		// certificates on the next request.
-		apiServer.SetClientCertAuthorizer(sshAllowlist.IsAuthorizedFingerprint)
+		apiServer.SetUserLookup(userLookup)
 		apiServer.SetClientCAInfo(clientCA.Fingerprint(), clientCA.NotAfter())
 	}
 
@@ -494,7 +504,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		tlsFingerprint = servertls.Fingerprint(der)
 		log.Printf("TLS cert fingerprint: %s", tlsFingerprint)
 		httpsServer = newHTTPServer(cfg.HTTPSListenAddr(), publicHandler)
-		httpsServer.TLSConfig = buildHTTPSTLSConfig(cfg, cert, clientCA, sshAllowlist.IsAuthorizedFingerprint)
+		httpsServer.TLSConfig = buildHTTPSTLSConfig(cfg, cert, clientCA, func(fp string) bool {
+			return users.HasKey(userLookup, fp)
+		})
 	}
 
 	// Wire the SSH bootstrap handler: in mtls mode it issues a client

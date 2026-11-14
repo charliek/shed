@@ -2,8 +2,6 @@ package sshd
 
 import (
 	"bytes"
-	"crypto/ed25519"
-	"crypto/rand"
 	"errors"
 	"net"
 	"path/filepath"
@@ -13,6 +11,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 // serveForTest starts s on a loopback port and returns its address. The
@@ -73,35 +72,21 @@ func runBootstrap(t *testing.T, addr string, signer gossh.Signer, cmd string) (s
 func TestBootstrapOpenServerRefusalOnTheWire(t *testing.T) {
 	const wantStderr = "bootstrap requires auth.ssh.mode: enforce\n"
 
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer, err := gossh.NewSignerFromKey(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	listed, err := NewKeyAllowlist(&config.SSHAuthConfig{
-		Mode:           config.SSHAuthWarn,
-		AuthorizedKeys: []string{string(gossh.MarshalAuthorizedKey(signer.PublicKey()))},
-	}, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	off, err := NewKeyAllowlist(nil, "")
-	if err != nil {
-		t.Fatal(err)
+	signer := testSigner(t)
+	listed := KeyAuth{
+		Mode:  config.SSHAuthWarn,
+		Users: userstest.Implicit(gossh.FingerprintSHA256(signer.PublicKey())),
 	}
 
 	for _, tc := range []struct {
 		name string
-		al   *KeyAllowlist
+		auth KeyAuth
 	}{
-		{"allowlist off", off},
+		{"allowlist off", KeyAuth{}},
 		{"allowlist warn with the key listed", listed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, err := NewServer(nil, filepath.Join(t.TempDir(), "host_key"), "127.0.0.1:0", nil, tc.al)
+			s, err := NewServer(nil, filepath.Join(t.TempDir(), "host_key"), "127.0.0.1:0", nil, tc.auth)
 			if err != nil {
 				t.Fatal(err)
 			}

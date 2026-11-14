@@ -20,6 +20,7 @@ import (
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/users/userstest"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -621,7 +622,7 @@ func TestExecNeedsControlScope(t *testing.T) {
 	fp := testFingerprint("exec")
 	b := &execFakeBackend{shed: runningShed(), exec: func(context.Context, string, backend.ExecOptions) error { return nil }}
 	s := NewServer(b, &config.ServerConfig{Name: "t", Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}}, "", nil, nil)
-	s.SetClientCertAuthorizer(func(got string) bool { return got == fp })
+	s.SetUserLookup(userstest.Implicit(fp))
 	router := s.Router()
 
 	do := func(scope string) (int, []byte) {

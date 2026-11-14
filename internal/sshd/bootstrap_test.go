@@ -2,7 +2,6 @@ package sshd
 
 import (
 	"crypto/ecdsa"
-	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
@@ -23,19 +22,12 @@ import (
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 func testKey(t *testing.T) gossh.PublicKey {
 	t.Helper()
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer, err := gossh.NewSignerFromKey(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return signer.PublicKey()
+	return testSigner(t).PublicKey()
 }
 
 // TestBootstrapOpenServerRefusal pins the exact refusal an open server (one
@@ -48,28 +40,21 @@ func testKey(t *testing.T) gossh.PublicKey {
 func TestBootstrapOpenServerRefusal(t *testing.T) {
 	const want = "bootstrap requires auth.ssh.mode: enforce"
 	key := testKey(t)
-	line := string(gossh.MarshalAuthorizedKey(key))
-	allowlist := func(mode string) *KeyAllowlist {
-		al, err := NewKeyAllowlist(&config.SSHAuthConfig{Mode: mode, AuthorizedKeys: []string{line}}, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		return al
-	}
+	listed := userstest.Implicit(gossh.FingerprintSHA256(key))
 	csr := "control cli csr=" + testCSR(t, elliptic.P256())
 	for _, tc := range []struct {
 		name string
-		al   *KeyAllowlist
+		auth KeyAuth
 	}{
-		{"no auth.ssh block", nil},
-		{"auth.ssh off", allowlist(config.SSHAuthOff)},
+		{"no auth.ssh block", KeyAuth{}},
+		{"auth.ssh off", KeyAuth{Mode: config.SSHAuthOff, Users: listed}},
 		// In warn mode a listed key is admitted at the transport, so the
 		// handler must refuse on its own.
-		{"auth.ssh warn with the key listed", allowlist(config.SSHAuthWarn)},
+		{"auth.ssh warn with the key listed", KeyAuth{Mode: config.SSHAuthWarn, Users: listed}},
 	} {
 		for _, cmd := range []string{"", "control", "control cli", "credentials host-agent", csr} {
 			t.Run(tc.name+"/"+strings.SplitN(cmd, " csr=", 2)[0], func(t *testing.T) {
-				s := &Server{allowlist: tc.al}
+				s := &Server{keyAuth: tc.auth}
 				// Even a server that somehow has a CA wired must not issue.
 				s.SetBootstrap(BootstrapInfo{HTTPSPort: 8443, TokenTTL: time.Hour, CA: testCA(t)})
 				_, err := s.mintBootstrap(key, cmd)
@@ -91,11 +76,7 @@ func TestMintBootstrapRejectsInvalidScope(t *testing.T) {
 
 func TestMintBootstrapUnconfigured(t *testing.T) {
 	key := testKey(t)
-	al, _ := NewKeyAllowlist(&config.SSHAuthConfig{
-		Mode:           config.SSHAuthEnforce,
-		AuthorizedKeys: []string{string(gossh.MarshalAuthorizedKey(key))},
-	}, "")
-	s := &Server{allowlist: al} // no SetBootstrap
+	s := &Server{keyAuth: enforceKeys(key)} // no SetBootstrap
 	_, err := s.mintBootstrap(key, "control csr="+testCSR(t, elliptic.P256()))
 	if err == nil || err.Error() != "bootstrap: credential issuance not configured" {
 		t.Fatalf("error = %v, want the not-configured refusal", err)
@@ -146,18 +127,21 @@ func testCSR(t *testing.T, curve elliptic.Curve) string {
 	return base64.StdEncoding.EncodeToString(der)
 }
 
-// mtlsServer builds an enforce-mode mtls server whose allowlist authorizes the
+// enforceKeys is enforce-mode key auth in which exactly the given keys belong
+// to the implicit user (a server with no user list).
+func enforceKeys(keys ...gossh.PublicKey) KeyAuth {
+	fps := make([]string, len(keys))
+	for i, k := range keys {
+		fps[i] = gossh.FingerprintSHA256(k)
+	}
+	return KeyAuth{Mode: config.SSHAuthEnforce, Users: userstest.Implicit(fps...)}
+}
+
+// mtlsServer builds an enforce-mode mtls server whose user lookup resolves the
 // given key.
 func mtlsServer(t *testing.T, authorized gossh.PublicKey, ca *servertls.CA) *Server {
 	t.Helper()
-	al, err := NewKeyAllowlist(&config.SSHAuthConfig{
-		Mode:           config.SSHAuthEnforce,
-		AuthorizedKeys: []string{string(gossh.MarshalAuthorizedKey(authorized))},
-	}, "")
-	if err != nil {
-		t.Fatalf("allowlist: %v", err)
-	}
-	s := &Server{allowlist: al}
+	s := &Server{keyAuth: enforceKeys(authorized)}
 	s.SetBootstrap(BootstrapInfo{
 		HTTPSPort:      8443,
 		TLSFingerprint: "sha256:abc",

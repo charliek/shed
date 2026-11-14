@@ -20,6 +20,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/terminal"
+	"github.com/charliek/shed/internal/users"
 )
 
 // Server is an SSH server that connects users to shed containers.
@@ -31,22 +32,45 @@ type Server struct {
 	hostKey     gossh.Signer
 	listener    net.Listener
 	termConfig  *terminal.Config
-	allowlist   *KeyAllowlist
+	keyAuth     KeyAuth
 	bootstrap   *BootstrapInfo // static bundle metadata; nil until SetBootstrap
 }
+
+// KeyAuth is how the SSH server decides public-key auth: the auth.ssh mode,
+// the per-connection attempt cap, and the user seam that says whose a key is.
+// The zero value is off (accept every key), the legacy behavior.
+type KeyAuth struct {
+	// Mode is config.SSHAuthOff, SSHAuthWarn or SSHAuthEnforce; "" is off.
+	Mode string
+	// MaxAuthTries caps public-key attempts per connection; 0 applies
+	// defaultMaxAuthTries.
+	MaxAuthTries int
+	// Users resolves an offered key's fingerprint to its user. nil resolves
+	// nothing, so enforce mode then accepts no key.
+	Users users.Lookup
+}
+
+// enforced reports whether keys the lookup does not resolve are refused.
+func (k KeyAuth) enforced() bool { return k.Mode == config.SSHAuthEnforce }
+
+// off reports whether every key is accepted without a lookup.
+func (k KeyAuth) off() bool { return k.Mode == "" || k.Mode == config.SSHAuthOff }
+
+// known reports whether the lookup resolves the key's fingerprint to a user.
+func (k KeyAuth) known(fingerprint string) bool { return users.HasKey(k.Users, fingerprint) }
 
 // NewServer creates a new SSH server. listenAddr is the TCP bind address
 // (e.g. "127.0.0.1:2222" for loopback (the default), "<tailnet-ip>:2222", or
 // ":2222" for all interfaces).
-// allowlist gates public-key auth; pass an "off"-mode allowlist (or one built
-// from nil config) for the legacy accept-all behavior.
-func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termConfig *terminal.Config, allowlist *KeyAllowlist) (*Server, error) {
+// keyAuth gates public-key auth; its zero value (mode off) is the legacy
+// accept-all behavior.
+func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termConfig *terminal.Config, keyAuth KeyAuth) (*Server, error) {
 	s := &Server{
 		backend:     b,
 		hostKeyPath: hostKeyPath,
 		listenAddr:  listenAddr,
 		termConfig:  termConfig,
-		allowlist:   allowlist,
+		keyAuth:     keyAuth,
 	}
 
 	// Load or generate the host key.
@@ -209,30 +233,29 @@ const defaultMaxAuthTries = 10
 // effectiveMaxAuthTries is the configured per-connection attempt cap, or
 // defaultMaxAuthTries when unset.
 func (s *Server) effectiveMaxAuthTries() int {
-	if s.allowlist != nil {
-		if n := s.allowlist.MaxAuthTries(); n > 0 {
-			return n
-		}
+	if n := s.keyAuth.MaxAuthTries; n > 0 {
+		return n
 	}
 	return defaultMaxAuthTries
 }
 
-// handlePublicKey gates public-key auth through the allowlist. With the
-// allowlist off (default), every key is accepted (legacy). In warn mode an
-// unlisted key is logged but accepted; in enforce mode it is rejected. The
-// username (which selects the shed) is unaffected — identity comes from the
-// key, GitHub-style. Applies uniformly to all users, including `_api`.
+// handlePublicKey gates public-key auth through the user lookup: a key is
+// authorized when the lookup resolves its fingerprint to a user. With key auth
+// off (default), every key is accepted (legacy). In warn mode an unresolved key
+// is logged but accepted; in enforce mode it is rejected. The username (which
+// selects the shed) is unaffected — identity comes from the key, GitHub-style.
+// Applies uniformly to all usernames, including `_api`.
 func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	fingerprint := gossh.FingerprintSHA256(key)
 	user := ctx.User()
 
-	if s.allowlist == nil || s.allowlist.Mode() == config.SSHAuthOff {
+	if s.keyAuth.off() {
 		log.Printf("SSH auth attempt: user=%s fingerprint=%s (allowlist off)", user, fingerprint)
 		return true
 	}
 
-	authorized := s.allowlist.IsAuthorized(key)
-	if s.allowlist.Mode() == config.SSHAuthEnforce && !authorized {
+	authorized := s.keyAuth.known(fingerprint)
+	if s.keyAuth.enforced() && !authorized {
 		log.Printf("SSH auth DENIED: user=%s fingerprint=%s", user, fingerprint)
 		return false
 	}

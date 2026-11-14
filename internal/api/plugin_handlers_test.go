@@ -12,6 +12,7 @@ import (
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 func newTestServerWithPlugins() *Server {
@@ -230,7 +231,7 @@ func TestHandlePluginRespondOwnershipEnforced(t *testing.T) {
 	srv := newTestServerWithPlugins()
 	fp := testFingerprint("bus")
 	srv.cfg.Auth = &config.AuthConfig{Mode: config.AuthModeMTLS}
-	srv.SetClientCertAuthorizer(func(got string) bool { return got == fp })
+	srv.SetUserLookup(userstest.Implicit(fp))
 	creds := testClientCert(fp, authtoken.ScopeCredentials, time.Hour)
 	srv.plugins.EnableOwnershipTracking() // a server with HTTP auth enforced does this
 	srv.bridge.RegisterShed("dev", &plugin.ShedConn{

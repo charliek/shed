@@ -9,6 +9,7 @@ import (
 
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 // TestHandleGetInfo_HTTPSPort verifies GET /api/info reports https_port only
@@ -90,7 +91,7 @@ func TestHandleGetInfo_AuthMode(t *testing.T) {
 			// client certificate like every other route, so the request has to
 			// carry one to reach the handler at all.
 			if tt.auth != nil && tt.auth.Mode == config.AuthModeMTLS {
-				srv.SetClientCertAuthorizer(func(string) bool { return true })
+				srv.SetUserLookup(userstest.Matching(func(string) bool { return true }))
 				withClientCert(r, testClientCert(testFingerprint("info"), authtoken.ScopeControl, time.Hour))
 			}
 			w := httptest.NewRecorder()

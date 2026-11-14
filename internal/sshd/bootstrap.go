@@ -119,8 +119,8 @@ func (s *Server) handleBootstrap(sess ssh.Session) {
 //
 // It RE-VERIFIES authorization rather than trusting the transport: keys are
 // surfaced by gliderlabs even in `off`/`warn` mode (PublicKeyHandler returns
-// true for them), so the handler requires `enforce` AND an allowlisted key
-// before issuing a credential. rawCmd is the client's request line:
+// true for them), so the handler requires `enforce` AND a key the user lookup
+// resolves before issuing a credential. rawCmd is the client's request line:
 // "<scope> [<client-kind>] [csr=<base64>]" (scope defaults to control).
 //
 // Config load allows enforce only in mtls mode, so an open server always stops
@@ -128,10 +128,10 @@ func (s *Server) handleBootstrap(sess ssh.Session) {
 // it as a whole line to recognise an open server and fall back to plain HTTP
 // (cmd/shed/server_add.go), so it must stay byte-identical.
 func (s *Server) mintBootstrap(key gossh.PublicKey, rawCmd string) (bootstrapBundle, error) {
-	if s.allowlist == nil || s.allowlist.Mode() != config.SSHAuthEnforce {
+	if !s.keyAuth.enforced() {
 		return bootstrapBundle{}, errBootstrapOpenServer
 	}
-	if key == nil || !s.allowlist.IsAuthorized(key) {
+	if key == nil || !s.keyAuth.known(gossh.FingerprintSHA256(key)) {
 		return bootstrapBundle{}, errors.New("bootstrap: key not authorized")
 	}
 	if s.bootstrap == nil {

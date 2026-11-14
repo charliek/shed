@@ -10,6 +10,7 @@ import (
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/internal/users"
 )
 
 // authMiddleware enforces the server's auth.mode on every /api request. There
@@ -249,13 +250,10 @@ func certScope(leaf *x509.Certificate) string {
 }
 
 // certSubjectAuthorized reports whether a client certificate's Subject CN (an
-// SSH key fingerprint) is still in the live SSH allowlist. A nil authorizer
-// (no SetClientCertAuthorizer call) authorizes nothing — fail closed.
+// SSH key fingerprint) still resolves to a user through the live user lookup.
+// A nil lookup (no SetUserLookup call) authorizes nothing — fail closed.
 func (s *Server) certSubjectAuthorized(cn string) bool {
-	if s.certAuthorized == nil {
-		return false
-	}
-	return s.certAuthorized(cn)
+	return users.HasKey(s.users, cn)
 }
 
 // busOwnershipEnforced reports whether credential-bus /respond ownership is

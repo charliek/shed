@@ -158,6 +158,7 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - `internal/vmutil/` — Shared VM agent communication (no build tags)
 - `internal/agentproto/` — Binary protocol for vsock communication
 - `internal/sshd/` — SSH server implementation
+- `internal/users/` — User seam (`users.Lookup`: which user owns a key, list users); `ConfigLookup` holds the SSH key allowlist with each key's source; `userstest/` has the test doubles
 - `internal/backend/` — Backend interface all backends implement
 - `internal/remote/` — Remote (cloud VM) backend: async jobs, record cache, start-up reconcile, limits; `provider/` (cloud seam, `gce/` REST client, `fake/`), `transport/` (SSH link to the VM, `sshlink/`, `locallink/`), `guest/` (guest layout contract)
 - `gce/` — Remote VM image provisioning (provision, identity and agent units, verify, seal, bake), run by `scripts/build-gce-image.sh` (`make gce-image`)

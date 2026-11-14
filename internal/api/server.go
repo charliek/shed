@@ -10,6 +10,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/users"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -23,13 +24,10 @@ type Server struct {
 	bridge      *plugin.Bridge
 	egressAudit *egress.AuditLog         // nil when egress is disabled
 	egressStore *config.UserProfileStore // nil when egress is disabled
-	// certAuthorized answers "is this SSH key fingerprint still allowlisted?"
-	// for the mtls middleware, which re-checks a presented client certificate's
-	// Subject CN on every request. It is a plain predicate rather than the
-	// sshd.KeyAllowlist itself so this package never imports internal/sshd (and
-	// so tests can drive revocation with a closure). nil until
-	// SetClientCertAuthorizer; nil authorizes nothing.
-	certAuthorized func(fingerprint string) bool
+	// users answers "which user owns this SSH key fingerprint?" for the mtls
+	// middleware, which re-checks a presented client certificate's Subject CN
+	// on every request. nil until SetUserLookup; nil authorizes nothing.
+	users users.Lookup
 	// caFingerprint / caNotAfter describe the internal client CA, reported on
 	// /api/info in mtls mode so an operator can confirm which CA this server
 	// trusts and when it must be rotated. Zero values in every other mode.
@@ -72,14 +70,13 @@ func (s *Server) SetEgressAudit(a *egress.AuditLog) { s.egressAudit = a }
 // config profiles (and PUT/DELETE returning 501).
 func (s *Server) SetEgressUserStore(st *config.UserProfileStore) { s.egressStore = st }
 
-// SetClientCertAuthorizer attaches the live SSH-allowlist predicate the mtls
-// middleware re-checks a client certificate's Subject CN against on every
-// request. In shed-server this is sshd.KeyAllowlist.IsAuthorizedFingerprint;
-// passing a function rather than the allowlist keeps internal/api free of an
-// internal/sshd import. It MUST read live state — a snapshot would make
-// certificates unrevokable. Called once at startup in mtls mode; leaving it nil
-// makes the mtls path authorize nothing.
-func (s *Server) SetClientCertAuthorizer(fn func(fingerprint string) bool) { s.certAuthorized = fn }
+// SetUserLookup attaches the user lookup the mtls middleware re-checks a
+// client certificate's Subject CN (an SSH key fingerprint) against on every
+// request. In shed-server this is the same users.ConfigLookup the SSH server
+// asks. It MUST read live state — a snapshot would make certificates
+// unrevokable. Called once at startup in mtls mode; leaving it nil makes the
+// mtls path authorize nothing.
+func (s *Server) SetUserLookup(l users.Lookup) { s.users = l }
 
 // SetClientCAInfo records the internal client CA's fingerprint and expiry for
 // /api/info reporting in mtls mode. Two scalars rather than the CA itself: the
