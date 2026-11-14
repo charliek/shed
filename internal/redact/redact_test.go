@@ -1,0 +1,212 @@
+package redact
+
+import (
+	"bytes"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
+
+func TestString(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"plain text", "git clone", "git clone"},
+		{"user and password", "https://user:token@github.com/o/r.git", "https://REDACTED@github.com/o/r.git"},
+		{"token as user", "https://ghp_abc123@github.com/o/r.git", "https://REDACTED@github.com/o/r.git"},
+		{"x-access-token", "https://x-access-token:ghs_xyz@github.com/o/r", "https://REDACTED@github.com/o/r"},
+		{"no userinfo", "https://github.com/o/r.git", "https://github.com/o/r.git"},
+		{"at sign in path", "https://registry.example/@scope/pkg", "https://registry.example/@scope/pkg"},
+		{"at sign in query", "https://h/x?email=a@b", "https://h/x?email=a@b"},
+		{"at sign in fragment", "https://h#a@b", "https://h#a@b"},
+		{"no path", "https://u:p@host", "https://REDACTED@host"},
+		{"port", "https://u:p@host:8443/r", "https://REDACTED@host:8443/r"},
+		{"ipv6 host", "https://u:p@[::1]:8443/r", "https://REDACTED@[::1]:8443/r"},
+		{"several at signs", "https://u@x:p@w@host/r", "https://REDACTED@host/r"},
+		{"percent encoded", "https://u%40x:p%2Fq@host/r", "https://REDACTED@host/r"},
+		{"empty userinfo", "https://@host/r", "https://@host/r"},
+		{"ssh scheme", "ssh://git@github.com/o/r.git", "ssh://REDACTED@github.com/o/r.git"},
+		{"git+ssh scheme", "git+ssh://u:p@h/r", "git+ssh://REDACTED@h/r"},
+		{"uppercase scheme", "HTTPS://u:p@h/r", "HTTPS://REDACTED@h/r"},
+		{"scp-like remote", "git@github.com:o/r.git", "git@github.com:o/r.git"},
+		{"scp-like with user and colon", "user:pass@host:o/r.git", "user:pass@host:o/r.git"},
+		{"email", "mail me at a@b.example", "mail me at a@b.example"},
+		{"no scheme", "://u:p@h", "://u:p@h"},
+		{"digit-only scheme", "123://u:p@h", "123://u:p@h"},
+		{"assignment prefix", "URL=https://u:p@h/r", "URL=https://REDACTED@h/r"},
+		{"embedded in bash -c", "set -e; git clone 'https://u:p@h/o/r.git' r && cd r",
+			"set -e; git clone 'https://REDACTED@h/o/r.git' r && cd r"},
+		{"double-quoted", `git clone "https://u:p@h"`, `git clone "https://REDACTED@h"`},
+		{"single-quoted no path", "git clone 'https://u:p@h'", "git clone 'https://REDACTED@h'"},
+		{"two urls", "a https://u:p@h1/x b http://v:q@h2/y c", "a https://REDACTED@h1/x b http://REDACTED@h2/y c"},
+		{"adjacent urls", "https://u:p@h/https://v:q@i/", "https://REDACTED@h/https://REDACTED@i/"},
+		{"newline ends authority", "https://h\nuser@host", "https://h\nuser@host"},
+		{"tab ends authority", "https://h\tuser@host", "https://h\tuser@host"},
+		{"backslash ends authority", `https://h\u@x`, `https://h\u@x`},
+		{"bare separator", "://", "://"},
+		{"scheme only", "https://", "https://"},
+		{"trailing at", "https://u:p@", "https://REDACTED@"},
+		{"repeated separators", "a://://://@", "a://://://@"},
+		{"invalid utf8 kept", "\xff https://u:p@h \xfe", "\xff https://REDACTED@h \xfe"},
+		{"unicode userinfo", "https://ü:pä@h/r", "https://REDACTED@h/r"},
+		{"nul byte", "https://u\x00:p@h", "https://u\x00:p@h"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := String(tt.in); got != tt.want {
+				t.Errorf("String(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStringUnchangedIsSameString(t *testing.T) {
+	in := "git clone https://github.com/o/r.git"
+	if allocs := testing.AllocsPerRun(100, func() { _ = String(in) }); allocs != 0 {
+		t.Errorf("String allocated %v times on input with nothing to redact", allocs)
+	}
+}
+
+func TestStringHostileInputsAreLinear(t *testing.T) {
+	inputs := map[string]string{
+		"separators":     strings.Repeat("://", 200000),
+		"scheme run":     strings.Repeat("a", 500000) + "://",
+		"many urls":      strings.Repeat("a://u@h/", 100000),
+		"long authority": "https://" + strings.Repeat("u", 500000) + "@h",
+		"at signs":       "https://" + strings.Repeat("@", 500000),
+	}
+	for name, in := range inputs {
+		t.Run(name, func(t *testing.T) {
+			out := String(in)
+			// Each redaction replaces at least one byte with len(Marker), and
+			// needs at least five bytes of input ("a://" plus one userinfo byte
+			// and '@'), so output is linear in input.
+			if len(out) > len(in)*(1+len(Marker)) {
+				t.Errorf("output %d bytes from %d bytes of input", len(out), len(in))
+			}
+		})
+	}
+}
+
+func TestArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"nil", nil, nil},
+		{"empty", []string{}, []string{}},
+		{"clean", []string{"git", "clone", "https://h/r"}, []string{"git", "clone", "https://h/r"}},
+		{"clone url", []string{"git", "clone", "https://u:p@h/r", "r"}, []string{"git", "clone", "https://REDACTED@h/r", "r"}},
+		{"first element", []string{"https://u:p@h", "x"}, []string{"https://REDACTED@h", "x"}},
+		{"bash -c", []string{"bash", "-c", "curl https://u:p@h/x | sh"}, []string{"bash", "-c", "curl https://REDACTED@h/x | sh"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var orig []string
+			if tt.in != nil {
+				orig = append([]string{}, tt.in...)
+			}
+			got := Args(tt.in)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Args(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			if !reflect.DeepEqual(tt.in, orig) {
+				t.Errorf("Args modified its input: now %q, was %q", tt.in, orig)
+			}
+		})
+	}
+}
+
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, errors.New("boom") }
+
+func TestWriter(t *testing.T) {
+	tests := []struct {
+		name   string
+		chunks []string
+		want   string
+	}{
+		{"one line", []string{"fatal: https://u:p@h/r not found\n"}, "fatal: https://REDACTED@h/r not found\n"},
+		{"split across writes", []string{"fatal: http", "s://u:", "p@h/r\n"}, "fatal: https://REDACTED@h/r\n"},
+		{"carriage returns", []string{"Receiving 10%\rReceiving https://u:p@h\r"}, "Receiving 10%\rReceiving https://REDACTED@h\r"},
+		{"unterminated tail flushed", []string{"a\nhttps://u:p@h"}, "a\nhttps://REDACTED@h"},
+		{"nothing", nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			w := NewWriter(&out)
+			for _, c := range tt.chunks {
+				n, err := w.Write([]byte(c))
+				if err != nil || n != len(c) {
+					t.Fatalf("Write(%q) = %d, %v", c, n, err)
+				}
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+			if out.String() != tt.want {
+				t.Errorf("got %q, want %q", out.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestWriterBoundsPending(t *testing.T) {
+	var out bytes.Buffer
+	w := NewWriter(&out)
+	chunk := bytes.Repeat([]byte("x"), 4096)
+	for range (maxPending / len(chunk)) + 2 {
+		if _, err := w.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(w.pending) > maxPending {
+		t.Errorf("pending grew to %d bytes", len(w.pending))
+	}
+	if out.Len() == 0 {
+		t.Error("a line longer than the bound was never passed on")
+	}
+}
+
+func TestWriterReportsError(t *testing.T) {
+	w := NewWriter(errWriter{})
+	if _, err := w.Write([]byte("line\n")); err == nil {
+		t.Error("Write did not report the underlying error")
+	}
+}
+
+func FuzzString(f *testing.F) {
+	for _, s := range []string{
+		"https://u:p@h/r", "git@h:o/r", "a://://@", "https://@", "x https://u@h y",
+		"\xff://\xfe@", "bash -c 'git clone https://t@h/r'",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		out := String(s)
+		if len(out) > len(s)*(1+len(Marker)) {
+			t.Fatalf("output %d bytes from %d", len(out), len(s))
+		}
+		// Idempotent: redacting twice changes nothing more.
+		if again := String(out); again != out {
+			t.Fatalf("not idempotent: %q -> %q -> %q", s, out, again)
+		}
+		// Without a "://" nothing can change.
+		if !strings.Contains(s, "://") && out != s {
+			t.Fatalf("changed input without a scheme separator: %q -> %q", s, out)
+		}
+		// Valid UTF-8 stays valid: only ASCII is inserted, and cuts fall
+		// next to ASCII bytes.
+		if utf8.ValidString(s) && !utf8.ValidString(out) {
+			t.Fatalf("broke UTF-8: %q -> %q", s, out)
+		}
+	})
+}
