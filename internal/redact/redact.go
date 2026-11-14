@@ -20,6 +20,10 @@ import (
 // Marker replaces the userinfo of a URL.
 const Marker = "REDACTED"
 
+// shellApostrophe is an apostrophe as it appears inside a single-quoted
+// shell word.
+const shellApostrophe = `'\''`
+
 // String returns s with the userinfo of every URL-shaped token replaced by
 // Marker. It runs in time linear in len(s), never panics, and returns s
 // itself (no allocation) when there is nothing to redact.
@@ -38,7 +42,20 @@ func String(s string) string {
 		}
 		start := i + 3
 		end := start
-		for end < len(s) && !endsAuthority(s[end]) {
+		for end < len(s) {
+			// An apostrophe inside a single-quoted shell word is written
+			// '\'' (close the quote, an escaped quote, open it again).
+			// That is how the shed CLI sends an argv element holding one,
+			// so the sequence is part of the token, not its end: a
+			// password with an apostrophe in it must not stop the scan
+			// short of the '@'.
+			if strings.HasPrefix(s[end:], shellApostrophe) {
+				end += len(shellApostrophe)
+				continue
+			}
+			if endsAuthority(s[end]) {
+				break
+			}
 			end++
 		}
 		at := strings.LastIndexByte(s[start:end], '@')
@@ -114,7 +131,8 @@ func isSchemeByte(c byte) bool {
 // characters that cannot appear in a URL and so mark where a token embedded in
 // a larger string stops. A single quote does not end it (a userinfo may hold
 // one); a quoted 'https://u:p@host' still redacts because the userinfo is
-// everything before the last '@'.
+// everything before the last '@'. A backslash ends it except in the shell's
+// spelling of an apostrophe, which String steps over before asking.
 func endsAuthority(c byte) bool {
 	switch c {
 	case '/', '?', '#', '\\', '"', '`', '<', '>', '{', '}', '|', '^', 0x7f:
