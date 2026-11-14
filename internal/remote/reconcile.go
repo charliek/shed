@@ -56,6 +56,11 @@ func (b *Backend) Reconcile(ctx context.Context) {
 		}
 	}
 	b.reconcile(ctx, insts)
+	// The firewall check's first run, so a result exists before the first
+	// create or start. It only logs: a failing check never keeps the server
+	// from starting, because existing sheds must stay listable and
+	// deletable.
+	b.CheckFirewall(ctx)
 	b.readyOnce.Do(func() { close(b.ready) })
 	b.startSweeper()
 }

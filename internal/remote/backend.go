@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"sync"
 	"time"
 
@@ -118,6 +119,14 @@ type Options struct {
 	// ImageResolveTimeout bounds the image lookup a create makes before it
 	// saves anything. Default 10 s.
 	ImageResolveTimeout time.Duration
+	// FirewallSources are the source ranges the environment's firewall
+	// rule must have with remote.firewall.mode: static, as the server
+	// resolved them at start-up (config.RemoteRuntime.FirewallSources).
+	// Required in static mode.
+	FirewallSources []string
+	// EchoClient, when set, supplies the HTTP transport for auto mode's
+	// echo requests. Tests pass one that trusts their servers.
+	EchoClient *http.Client
 	// Logf receives the backend's log lines. Default log.Printf.
 	Logf func(format string, args ...any)
 	// Now is the clock for record timestamps. Default time.Now.
@@ -131,6 +140,7 @@ type Backend struct {
 	cfg     *config.RemoteConfig
 	prov    provider.Provider
 	links   transport.Factory
+	fw      *firewallState
 	store   *state.Store
 	credMgr *vmutil.CredentialManager
 	logf    func(format string, args ...any)
@@ -165,7 +175,8 @@ var (
 	_ backend.CapabilityReporter = (*Backend)(nil)
 )
 
-// New builds the backend and loads the record cache. It makes no cloud call.
+// New builds the backend and loads the record cache. It makes no cloud call
+// and no echo request.
 func New(opts Options) (*Backend, error) {
 	switch {
 	case opts.Config == nil:
@@ -220,6 +231,11 @@ func New(opts Options) (*Backend, error) {
 		opts.Now = time.Now
 	}
 
+	fw, err := newFirewallState(opts.Config, opts.FirewallSources, opts.EchoClient)
+	if err != nil {
+		return nil, err
+	}
+
 	store, err := state.Open(opts.StateDir)
 	if err != nil {
 		return nil, err
@@ -238,6 +254,7 @@ func New(opts Options) (*Backend, error) {
 		cfg:        opts.Config,
 		prov:       opts.Provider,
 		links:      opts.Links,
+		fw:         fw,
 		store:      store,
 		credMgr:    vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
 		logf:       opts.Logf,
@@ -267,13 +284,14 @@ func (b *Backend) Capabilities() backend.Capabilities { return backend.RemoteCap
 
 // SupportsNetworkProfile reports whether a shed may ask for the profile.
 // "isolated" means isolation by network topology: no route between sheds or
-// to the server host. It is refused when the firewall is open to anyone.
+// to the server host. It is refused when the config accepts a firewall rule
+// open to more than the server (mode any, or acknowledged wide ranges).
 func (b *Backend) SupportsNetworkProfile(profile string) bool {
 	switch profile {
 	case config.NetworkProfileOpen:
 		return true
 	case config.NetworkProfileIsolated:
-		return b.cfg.Firewall.Mode != config.RemoteFirewallAny
+		return !b.cfg.Firewall.AdmitsAny()
 	}
 	return false
 }
