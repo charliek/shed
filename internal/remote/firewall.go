@@ -42,8 +42,10 @@ const (
 	PublicAddrMaxAge = 15 * time.Minute
 	// firewallCheckTimeout bounds one check.
 	firewallCheckTimeout = 30 * time.Second
-	// firewallGateTimeout bounds a check a create or start waits for, so
-	// the reply still fits in the time a client waits.
+	// firewallGateTimeout bounds what a create or start waits for at the
+	// gate, so the reply still fits in the time a client waits: the wait
+	// for a check already in progress and the check it then runs itself,
+	// together.
 	firewallGateTimeout = 10 * time.Second
 	// firewallRelog is how often a failure that has not changed is logged
 	// again.
@@ -146,7 +148,11 @@ type firewallState struct {
 	finder *addrFinder    // auto mode only
 
 	// run serialises checks: one reads the cloud (and may patch) at a time.
-	run sync.Mutex
+	// It is a one-slot channel, not a mutex, so a caller can stop waiting
+	// for its turn (acquire) while the check in progress carries on.
+	run chan struct{}
+	// gateTimeout is firewallGateTimeout; tests shorten it.
+	gateTimeout time.Duration
 	// The fields below are written with run held.
 	believed  netip.Addr // the address the echo services last agreed on
 	agreedAt  time.Time  // when they last agreed
@@ -159,7 +165,7 @@ type firewallState struct {
 }
 
 func newFirewallState(cfg *config.RemoteConfig, sources []string, echo *http.Client) (*firewallState, error) {
-	fw := &firewallState{mode: cfg.Firewall.Mode}
+	fw := &firewallState{mode: cfg.Firewall.Mode, run: make(chan struct{}, 1), gateTimeout: firewallGateTimeout}
 	if fw.mode == "" {
 		fw.mode = config.RemoteFirewallStatic
 	}
@@ -201,10 +207,32 @@ func (b *Backend) FirewallStatus() FirewallStatus {
 // returns it. In auto mode it may patch the rule's source ranges. Checks run
 // one at a time.
 func (b *Backend) CheckFirewall(ctx context.Context) FirewallStatus {
-	b.fw.run.Lock()
-	defer b.fw.run.Unlock()
+	if err := b.fw.acquire(ctx, nil); err != nil {
+		// ctx ended while another check ran: the last result stands.
+		return b.FirewallStatus()
+	}
+	defer b.fw.release()
 	return b.checkFirewallLocked(ctx)
 }
+
+// errCheckBusy is acquire's error when the turn did not come in time.
+var errCheckBusy = errors.New("a firewall check is in progress")
+
+// acquire waits for the caller's turn to run a check. It gives up when ctx
+// ends (ctx's error) or when timeout fires (errCheckBusy); a nil timeout
+// never fires. The check in progress is not disturbed either way.
+func (fw *firewallState) acquire(ctx context.Context, timeout <-chan time.Time) error {
+	select {
+	case fw.run <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timeout:
+		return errCheckBusy
+	}
+}
+
+func (fw *firewallState) release() { <-fw.run }
 
 func (b *Backend) checkFirewallLocked(ctx context.Context) FirewallStatus {
 	ctx, cancel := context.WithTimeout(ctx, firewallCheckTimeout)
@@ -253,19 +281,35 @@ func describeExpected(mode string, expected []string) string {
 // config.ErrFirewallCheckFailedSentinel (503 FIREWALL_CHECK_FAILED) and
 // carries the *FirewallFailure. Never call it with b.mu held: it may read
 // the cloud.
+//
+// The caller waits firewallGateTimeout at most, counted from here: a check
+// already in progress (the periodic one may take firewallCheckTimeout) uses
+// up the same budget as the check this call then runs. A caller whose turn
+// does not come in time is refused like any other; a caller whose ctx ends
+// leaves at once. Neither stops the check in progress.
 func (b *Backend) firewallGate(ctx context.Context) error {
 	status := b.FirewallStatus()
 	if !b.firewallFresh(status) {
-		b.fw.run.Lock()
+		deadline := time.Now().Add(b.fw.gateTimeout)
+		budget := time.NewTimer(b.fw.gateTimeout)
+		err := b.fw.acquire(ctx, budget.C)
+		budget.Stop()
+		switch {
+		case errors.Is(err, errCheckBusy):
+			return fmt.Errorf("%w: a firewall check in progress did not finish within %s; creates and starts are refused until the check passes",
+				config.ErrFirewallCheckFailedSentinel, b.fw.gateTimeout)
+		case err != nil:
+			return err
+		}
 		// Another request may have checked while this one waited.
 		if status = b.FirewallStatus(); !b.firewallFresh(status) {
 			// On the server's context: a client that hangs up must not
 			// leave a half-made check behind as the next caller's result.
-			cctx, cancel := context.WithTimeout(b.rootCtx, firewallGateTimeout)
+			cctx, cancel := context.WithDeadline(b.rootCtx, deadline)
 			status = b.checkFirewallLocked(cctx)
 			cancel()
 		}
-		b.fw.run.Unlock()
+		b.fw.release()
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
