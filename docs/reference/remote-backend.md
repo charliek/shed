@@ -69,10 +69,11 @@ The server reads the cloud when it starts and then once a minute. Each pass list
 | A `running` or `stopped` shed whose VM no longer exists | Removes the shed, after a read of that one VM confirms it. `shed delete` on it then answers "not found". |
 | A shed left `stopping` by a failed cloud call | Stops it again. |
 | A create that failed | Destroys its VM, retrying until it is gone. The shed stays, in `error`, until it is deleted. |
+| A VM of this environment still labelled `creating` 15 minutes after the cloud made it, with no record | Destroys it. It is a create whose record was lost (the `state_dir`, or a server that died before writing it); nothing would ever list, limit or delete it. A younger one is left alone. |
 
 Each pass also runs the [firewall check](#the-firewall-check). Its result decides only whether creates and starts are accepted.
 
-A pass destroys a VM only for a delete that was acknowledged or a create that failed. A VM it does not know (another environment's, or one with no record) is logged and left alone.
+A pass destroys a VM only for a delete that was acknowledged, a create that failed, or a create abandoned as in the last row. Any other VM it does not know (another environment's, one with labels of a schema it cannot read, or a finished one with no record) is left alone.
 
 Measured on the development server: a VM stopped with the cloud's own tools was listed `stopped (external)` 10 s after it finished stopping, and `shed start` brought it back in 42 s. A VM deleted with the cloud's tools lost its record 2 to 12 s after it was gone. A stopped shed's VM started with the cloud's tools was listed `starting` at the next pass and `running` 3 s later. A `shed delete` sent in between, for a shed whose VM was already gone, succeeded in under a second.
 
@@ -277,7 +278,7 @@ A server stop leaves every VM as it is: running sheds keep running and keep cost
 - A record left `starting` or `stopping` resumes its job.
 - A record whose VM is stopped but was `running` becomes `stopped` with reason `run_limit` or `external`.
 - A record whose VM is gone is dropped, unless the shed is in `error` or its create had not reached the cloud.
-- Only a VM labelled `deleting`, or one with a local delete marker, is deleted. Nothing else is ever removed.
+- A VM labelled `deleting`, or one with a local delete marker, is deleted. So is a VM still labelled `creating` 15 minutes after the cloud made it that has no record: a create nobody will finish. Nothing else is ever removed.
 
 ## Not supported yet
 

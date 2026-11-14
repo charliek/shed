@@ -56,6 +56,12 @@ const (
 	// before the periodic pass retries it. A delete that was just
 	// acknowledged has its own job on the way.
 	DefaultDeleteRetryAge = 2 * time.Minute
+	// StaleCreateAge is how long after the cloud made it an instance may
+	// stay labelled creating with no local record before the start-up and
+	// periodic passes destroy it as an abandoned create. A create waits 15 s
+	// for the insert, 5 minutes for the agent and less for everything else,
+	// and has a record throughout; this is three times that.
+	StaleCreateAge = 15 * time.Minute
 	// DefaultImageResolveTimeout bounds the image lookup a create makes
 	// before it saves anything. With the fast-fail window it keeps the JSON
 	// create's reply under the 30 s a client waits.

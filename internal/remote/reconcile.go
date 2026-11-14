@@ -158,7 +158,20 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 			continue
 		}
 
-		// No record. Adopt it only if it was a finished shed.
+		// No record. A create that no one is finishing is destroyed: its
+		// VM would run to its limit and its disk would be billed for
+		// ever, on no list and under no limit.
+		if b.abandonedCreate(inst) {
+			m := &state.Marker{ID: id.ID, Name: id.Name, Env: id.Env, Ref: inst.Ref, At: b.now().UTC()}
+			if err := b.saveMarkerLocked(m); err != nil {
+				note("instance %s (shed %s) is an abandoned create but its marker could not be written: %v", inst.Name, id.Name, err)
+				continue
+			}
+			note("instance %s (shed %s) has been %q since %s with no local record; destroying it", inst.Name, id.Name, inst.ShedState(), inst.CreatedAt.UTC().Format(time.RFC3339))
+			deletes = append(deletes, m)
+			continue
+		}
+		// Otherwise adopt it only if it was a finished shed.
 		if inst.ShedState() != provider.ShedStateReady {
 			note("instance %s (shed %s) is %q with no local record; leaving it alone", inst.Name, id.Name, inst.ShedState())
 			continue
@@ -278,6 +291,19 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 		}
 		b.credMgr.ResumeMessageChannel(rec.Shed.Name, agent, rec.Shed.Owner != "")
 	}
+}
+
+// abandonedCreate reports whether inst is a create nobody will finish: still
+// labelled creating StaleCreateAge after the cloud made it. The caller has
+// checked that it carries this environment's labels in a schema this server
+// reads, and that no record, delete marker or delete job names its shed ID. A
+// create this server is working on always has a record, so only a create
+// whose record was lost (the state directory, or a server that died with the
+// record unwritten) gets here. An instance whose age is unknown is left
+// alone.
+func (b *Backend) abandonedCreate(inst provider.Instance) bool {
+	return inst.ShedState() == provider.ShedStateCreating &&
+		!inst.CreatedAt.IsZero() && b.now().Sub(inst.CreatedAt) >= StaleCreateAge
 }
 
 // adoptedRecord rebuilds a shed's record from its instance: name, ID and

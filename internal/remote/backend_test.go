@@ -870,6 +870,12 @@ func TestReconcileLeavesTheRestAlone(t *testing.T) {
 	}
 	seed("half-made", "aaaaaaaaaaaa", provider.ShedStateCreating, testEnv)
 	seed("doomed", "bbbbbbbbbbbb", provider.ShedStateDeleting, testEnv)
+	// Old enough to be an abandoned create, but another environment's.
+	theirs := provider.Identity{Env: "other", ID: "dddddddddddd", Name: "their-half"}
+	e.prov.Seed(provider.Instance{
+		Name: theirs.InstanceName(), State: provider.StateRunning,
+		Labels: theirs.Labels(provider.ShedStateCreating), CreatedAt: time.Now().Add(-2 * StaleCreateAge),
+	})
 	seed("theirs", "cccccccccccc", provider.ShedStateReady, "other")
 	e.prov.Seed(provider.Instance{Name: "unlabelled", State: provider.StateRunning})
 
@@ -884,7 +890,7 @@ func TestReconcileLeavesTheRestAlone(t *testing.T) {
 	for _, inst := range insts {
 		left[inst.Labels[provider.LabelName]] = true
 	}
-	if left["doomed"] || !left["half-made"] || !left["theirs"] || len(insts) != 3 {
+	if left["doomed"] || !left["half-made"] || !left["theirs"] || !left["their-half"] || len(insts) != 4 {
 		t.Fatalf("instances left: %v; want everything but the one labelled deleting", left)
 	}
 	if rep := strings.Join(e.b.Reported(), "\n"); !strings.Contains(rep, "half-made") {
