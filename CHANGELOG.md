@@ -137,8 +137,20 @@ All notable changes to this project will be documented in this file.
   FEATURE_UNSUPPORTED`. The config file names no project, zone or key: every value comes from
   an environment variable. Images are baked with `make gce-image`; the one-time cloud setup is
   printed by `scripts/remote/gce-setup.sh --print`. Not built yet: copying an agent into a VM
-  (`agent_install` behaves as `never`) and any firewall mode but `static`. See the [Remote
+  (`agent_install` behaves as `never`). See the [Remote
   Backend reference](https://charliek.github.io/shed/reference/remote-backend/).
+- **Remote backend: the server checks its cloud firewall.** It reads the environment's rule
+  (`shed-<env>-ssh`) and the network's other ingress rules at start-up, once a minute, and
+  before a create or start. While the rule is missing, altered, admits the wrong sources, or
+  another rule reaches the sheds, `shed create` and `shed start` answer the new
+  `503 FIREWALL_CHECK_FAILED` with what was expected and what was found; stop, delete, list and
+  exec are unaffected and nothing is stopped or deleted. `remote.firewall.mode: static` now
+  needs its expected sources: `source_ranges`, or `source_ranges_env` naming a variable
+  (default `SHED_REMOTE_SOURCE_RANGES`) so the config file holds no address. **A remote server
+  upgraded to this version does not start until one of them is set.** `mode: auto` is built:
+  the server learns its public address from two agreeing `echo_urls` services and patches the
+  rule's sources to that `/32`, under two extra roles that
+  `gce-setup.sh --print --firewall-auto` prints.
 - **Development: a remote-backend dev server and suite parameter.**
   `make dev-server-up-remote` (and `-down-`, `-restart-`, `-status-`, `-logs-remote`) runs the
   dev build with `default_backend: remote` beside an installed server, reading the cloud
