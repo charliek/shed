@@ -4,6 +4,9 @@
 //
 // The one rule: in any URL-shaped token, scheme://userinfo@host..., the
 // userinfo is replaced with Marker. Everything else is copied byte for byte.
+// The userinfo is everything from the "://" to the last '@' before the next
+// '/', '?', '#', white space or control byte. A credential anywhere else (a
+// query parameter, a header, an environment variable) is not recognised.
 // A clone URL such as https://user:token@host/owner/repo.git becomes
 // https://REDACTED@host/owner/repo.git wherever it appears: as a whole
 // argument, or inside a larger one such as a bash -c script. An SCP-like git
@@ -19,10 +22,6 @@ import (
 
 // Marker replaces the userinfo of a URL.
 const Marker = "REDACTED"
-
-// shellApostrophe is an apostrophe as it appears inside a single-quoted
-// shell word.
-const shellApostrophe = `'\''`
 
 // String returns s with the userinfo of every URL-shaped token replaced by
 // Marker. It runs in time linear in len(s), never panics, and returns s
@@ -42,20 +41,7 @@ func String(s string) string {
 		}
 		start := i + 3
 		end := start
-		for end < len(s) {
-			// An apostrophe inside a single-quoted shell word is written
-			// '\'' (close the quote, an escaped quote, open it again).
-			// That is how the shed CLI sends an argv element holding one,
-			// so the sequence is part of the token, not its end: a
-			// password with an apostrophe in it must not stop the scan
-			// short of the '@'.
-			if strings.HasPrefix(s[end:], shellApostrophe) {
-				end += len(shellApostrophe)
-				continue
-			}
-			if endsAuthority(s[end]) {
-				break
-			}
+		for end < len(s) && !endsAuthority(s[end]) {
 			end++
 		}
 		at := strings.LastIndexByte(s[start:end], '@')
@@ -104,7 +90,15 @@ func Args(argv []string) []string {
 
 // hasScheme reports whether the "://" at s[i:] is preceded by a URI scheme:
 // a letter followed by letters, digits, '+', '-' or '.'.
+//
+// A shell can glue the scheme to the rest from pieces: "https"://u:p@h,
+// https\://u:p@h, ${S}://u:p@h and $(cmd)://u:p@h all run with an ordinary
+// URL. So the quotes, backslashes and closing brackets that may stand
+// between such a piece and the "://" are stepped over first.
 func hasScheme(s string, i int) bool {
+	for i > 0 && isShellJoin(s[i-1]) {
+		i--
+	}
 	j := i
 	for j > 0 && isSchemeByte(s[j-1]) {
 		j--
@@ -120,22 +114,33 @@ func hasScheme(s string, i int) bool {
 	return j < i
 }
 
+func isShellJoin(c byte) bool {
+	switch c {
+	case '"', '\'', '\\', '}', ')':
+		return true
+	}
+	return false
+}
+
 func isAlpha(c byte) bool { return c|0x20 >= 'a' && c|0x20 <= 'z' }
 
 func isSchemeByte(c byte) bool {
 	return isAlpha(c) || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'
 }
 
-// endsAuthority reports whether c ends a URL's authority: the RFC 3986
-// delimiters '/', '?' and '#', plus whitespace, control bytes and the
-// characters that cannot appear in a URL and so mark where a token embedded in
-// a larger string stops. A single quote does not end it (a userinfo may hold
-// one); a quoted 'https://u:p@host' still redacts because the userinfo is
-// everything before the last '@'. A backslash ends it except in the shell's
-// spelling of an apostrophe, which String steps over before asking.
+// endsAuthority reports whether c ends the text a URL's userinfo is looked
+// for in: the RFC 3986 delimiters '/', '?' and '#', white space and control
+// bytes. Nothing else ends it. Quotes, backslashes, braces and the other
+// bytes a URL may not hold do appear in what people type as a password
+// (pa\$word in a shell command, a raw '"' in an argv element), and stopping
+// at one of them would leave the rest of the password, up to the '@', in the
+// log. The cost is on the other side: in text with no white space, such as
+// compact JSON, an '@' after the URL's closing quote is taken for the end of
+// its userinfo and what stands between is redacted with it. Hiding too much
+// of a log line is the cheaper mistake.
 func endsAuthority(c byte) bool {
 	switch c {
-	case '/', '?', '#', '\\', '"', '`', '<', '>', '{', '}', '|', '^', 0x7f:
+	case '/', '?', '#', 0x7f:
 		return true
 	}
 	return c <= ' '
