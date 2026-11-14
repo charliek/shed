@@ -141,7 +141,9 @@ func (s *Server) createAndWait(ctx context.Context, jobCtx context.Context, al b
 // deleteAndWait is the SSE delete on an AsyncLifecycle backend: the delete
 // returns once the record is hidden, then the stream waits for the job to
 // destroy the VM. WaitSettled reports the finished delete as
-// ErrShedNotFoundSentinel, which here means success.
+// ErrShedNotFoundSentinel, which here means success; a destroy that failed
+// comes back as another error and is reported, so "deleted" is never said of
+// a VM that still exists.
 func (s *Server) deleteAndWait(ctx context.Context, jobCtx context.Context, al backend.AsyncLifecycle, name string) error {
 	if err := s.backend.DeleteShed(jobCtx, name); err != nil {
 		return err

@@ -460,15 +460,25 @@ func (b *Backend) WaitSettled(ctx context.Context, name string) (*config.Shed, e
 		b.mu.Lock()
 		r, err := b.lookupLocked(ctx, name)
 		if err != nil {
+			notFound := errors.Is(err, config.ErrShedNotFoundSentinel)
 			gone := b.deletingLocked(ctx, name)
+			owed := notFound && gone == nil && b.deleteOwedLocked(ctx, name)
 			b.mu.Unlock()
-			if gone == nil || !errors.Is(err, config.ErrShedNotFoundSentinel) {
+			if owed {
+				return nil, deleteOwed(name)
+			}
+			if gone == nil || !notFound {
 				return nil, err
 			}
 			// The shed's delete was acknowledged and its VM is still
-			// going: wait for the delete job, then report the shed gone.
+			// going: wait for the delete job, then report the shed gone,
+			// if it is. A job that ended with its marker standing did
+			// not destroy the VM, and "gone" would be untrue.
 			select {
 			case <-gone.done:
+				if !gone.gone {
+					return nil, deleteOwed(name)
+				}
 				return nil, err
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -528,6 +538,37 @@ func (b *Backend) deletingLocked(ctx context.Context, name string) *job {
 		return d
 	}
 	return nil
+}
+
+// ErrDeleteOwed is what WaitSettled returns for a shed whose delete was
+// acknowledged and whose VM is not destroyed yet with nothing working on it:
+// the destroy failed, or was cut short, and the periodic pass will try again.
+// It is not config.ErrShedNotFoundSentinel, which a waiter reads as "gone".
+var ErrDeleteOwed = errors.New("the delete is recorded but the VM could not be destroyed yet; the server keeps trying")
+
+func deleteOwed(name string) error { return fmt.Errorf("shed %s: %w", name, ErrDeleteOwed) }
+
+// deleteOwedLocked reports whether a delete marker stands, with no delete job
+// in flight, for a shed of this name that the caller was allowed to see. The
+// marker is removed in the critical section in which its job leaves
+// Backend.deletes, so such a marker is a destroy that did not happen.
+func (b *Backend) deleteOwedLocked(ctx context.Context, name string) bool {
+	if b.records[name] != nil || len(b.pending) == 0 {
+		return false
+	}
+	markers, err := b.store.Markers()
+	if err != nil {
+		return false
+	}
+	for _, m := range markers {
+		if m.Name != name || m.KeepRecord || b.deletes[m.ID] != nil {
+			continue
+		}
+		if backend.CheckOwner(ctx, name, m.Owner) == nil && backend.CheckCreatedAt(ctx, name, m.CreatedAt) == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // replay sends the job's progress events from index from into the sink on
