@@ -53,14 +53,30 @@ func (b *Backend) stuckDeletesLocked() int {
 	return n
 }
 
-// limitError is the refusal for a reached server limit. It matches
-// provider.ErrLimit and the API's 503 SERVER_LIMIT_REACHED sentinel.
+// limitReached is the refusal for a reached server limit. It matches
+// provider.ErrLimit and the API's 503 SERVER_LIMIT_REACHED sentinel, and
+// says "server limit reached" once: the two sentinels have the same text.
+type limitReached struct{ detail string }
+
+func (e *limitReached) Error() string {
+	return config.ErrServerLimitReachedSentinel.Error() + ": " + e.detail
+}
+
+func (e *limitReached) Unwrap() []error {
+	return []error{config.ErrServerLimitReachedSentinel, provider.ErrLimit}
+}
+
+// limitError builds the refusal. stuck is how many of the counted run slots
+// are held by VMs of deleted sheds whose destroy is not working.
 func limitError(what string, limit, stuck int) error {
-	if stuck > 0 {
-		return fmt.Errorf("%w: %w: %s (%d) reached; %d of them are VMs of deleted sheds that could not be destroyed yet (see the server log)",
-			config.ErrServerLimitReachedSentinel, provider.ErrLimit, what, limit, stuck)
+	detail := fmt.Sprintf("%s (%d) reached", what, limit)
+	switch {
+	case stuck == 1:
+		detail += ", counting 1 deleted shed whose VM could not be destroyed yet (see the server log)"
+	case stuck > 1:
+		detail += fmt.Sprintf(", counting %d deleted sheds whose VMs could not be destroyed yet (see the server log)", stuck)
 	}
-	return fmt.Errorf("%w: %w: %s (%d) reached", config.ErrServerLimitReachedSentinel, provider.ErrLimit, what, limit)
+	return &limitReached{detail: detail}
 }
 
 // checkCreateLocked refuses a create that would pass max_sheds or
