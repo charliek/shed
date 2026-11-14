@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -50,30 +51,53 @@ func TestWaitSettledDoesNotCallAFailedDeleteGone(t *testing.T) {
 
 // A wait bound to one incarnation of a name, as the SSE create binds it, ends
 // when that shed is deleted and never follows a shed created under the name
-// afterwards.
+// afterwards. The replacement by the same owner is the case only the creation
+// time tells apart: the owner check alone lets it through.
 func TestWaitSettledBoundToAnIncarnationDoesNotFollowAReplacement(t *testing.T) {
-	e := newEnv(t, manual())
-	const name = "reused"
-	first, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: name, NoProvision: true, Owner: "alice"})
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name        string
+		replacement string // the replacement's owner; the first shed is alice's
+	}{
+		{"replaced by another owner", "bob"},
+		{"replaced by the same owner", "alice"},
 	}
-	bound := backend.WithRequiredCreatedAt(backend.WithRequiredOwner(ctxT(t), first.Owner), first.CreatedAt)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newTestClock()
+			e := newEnv(t, manual(), withClock(clock))
+			const name = "reused"
+			first, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: name, NoProvision: true, Owner: "alice"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bound := backend.WithRequiredCreatedAt(backend.WithRequiredOwner(ctxT(t), first.Owner), first.CreatedAt)
 
-	if err := e.b.DeleteShed(context.Background(), name); err != nil {
-		t.Fatal(err)
-	}
-	e.auto()
-	e.idle()
-	e.stopAuto()
-	second, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: name, NoProvision: true, Owner: "bob"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second.ID == first.ID {
-		t.Fatal("the replacement has the first shed's ID")
-	}
-	if shed, err := e.b.WaitSettled(bound, name); !errors.Is(err, config.ErrShedNotFoundSentinel) {
-		t.Fatalf("a wait bound to the first shed = %+v, %v; want not found", shed, err)
+			if err := e.b.DeleteShed(context.Background(), name); err != nil {
+				t.Fatal(err)
+			}
+			e.auto()
+			e.idle()
+			e.stopAuto()
+			clock.Advance(time.Second)
+			second, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: name, NoProvision: true, Owner: tt.replacement})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second.ID == first.ID {
+				t.Fatal("the replacement has the first shed's ID")
+			}
+			if second.CreatedAt.Equal(first.CreatedAt) {
+				t.Fatal("the replacement has the first shed's creation time")
+			}
+			if shed, err := e.b.WaitSettled(bound, name); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+				t.Fatalf("a wait bound to the first shed = %+v, %v; want not found", shed, err)
+			}
+			// The replacement itself is there for a caller not bound to the
+			// first one.
+			owner := backend.WithRequiredOwner(ctxT(t), tt.replacement)
+			if shed, err := e.b.GetShed(owner, name); err != nil || shed.ID != second.ID {
+				t.Fatalf("the replacement's owner reads %+v, %v; want shed %s", shed, err, second.ID)
+			}
+		})
 	}
 }
