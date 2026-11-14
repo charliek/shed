@@ -176,9 +176,71 @@ func TestWriterBoundsPending(t *testing.T) {
 	if len(w.pending) > maxPending {
 		t.Errorf("pending grew to %d bytes", len(w.pending))
 	}
-	if out.Len() == 0 {
-		t.Error("a line longer than the bound was never passed on")
+	if out.String() != Dropped {
+		t.Errorf("a token longer than the bound: wrote %d bytes, want the dropped notice once", out.Len())
 	}
+}
+
+// TestWriterLongLineNeverSplitsAURL: a line longer than the Writer holds is
+// passed on in pieces, and a credentialed URL that falls across a piece
+// boundary, or across two writes, is still redacted or not written at all.
+func TestWriterLongLineNeverSplitsAURL(t *testing.T) {
+	const secret = "s3cr3t-token"
+	tests := []struct {
+		name   string
+		writes []string
+		want   string // "" when only the absence of the secret is checked
+	}{
+		{"one long token, the URL split across two writes",
+			[]string{strings.Repeat("x", maxPending) + "https://u:", secret + "@h/r\n", "next line\n"},
+			Dropped + "\nnext line\n"},
+		{"one long token, the URL inside it",
+			[]string{strings.Repeat("x", maxPending) + "https://u:" + secret + "@h/r tail\n"},
+			""},
+		{"one long token written a byte short of the bound, then the URL",
+			[]string{strings.Repeat("x", maxPending-10), "https://u:" + secret, "@h/r\n"},
+			""},
+		{"a long line of words, the URL split across two writes",
+			[]string{strings.Repeat("word ", maxPending/5) + "https://u:", secret + "@h/r\n"},
+			strings.Repeat("word ", maxPending/5) + "https://REDACTED@h/r\n"},
+		{"a long line of words, the scheme split from the userinfo",
+			[]string{strings.Repeat("word ", maxPending/5) + "https:", "//u:" + secret + "@h/r and more\n"},
+			strings.Repeat("word ", maxPending/5) + "https://REDACTED@h/r and more\n"},
+		{"a short line, then a long line of words in the same write",
+			[]string{"first\n" + strings.Repeat("word ", maxPending/5+10) + "https://u:", secret + "@h/r\n"},
+			"first\n" + strings.Repeat("word ", maxPending/5+10) + "https://REDACTED@h/r\n"},
+		{"a long token after a long line of words",
+			[]string{strings.Repeat("word ", maxPending/5), strings.Repeat("y", maxPending) + "https://u:", secret + "@h/r\n"},
+			""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			w := NewWriter(&out)
+			for _, s := range tt.writes {
+				if n, err := w.Write([]byte(s)); err != nil || n != len(s) {
+					t.Fatalf("Write = %d, %v", n, err)
+				}
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			got := out.String()
+			if strings.Contains(got, secret) {
+				t.Errorf("the credential was written (%d bytes of output)", len(got))
+			}
+			if tt.want != "" && got != tt.want {
+				t.Errorf("got %d bytes ending %q, want %d bytes ending %q", len(got), tail(got, 80), len(tt.want), tail(tt.want, 80))
+			}
+		})
+	}
+}
+
+func tail(s string, n int) string {
+	if len(s) > n {
+		return s[len(s)-n:]
+	}
+	return s
 }
 
 func TestWriterReportsError(t *testing.T) {
