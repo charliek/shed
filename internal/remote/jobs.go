@@ -521,6 +521,12 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 			// run again, it skips the steps recorded as done.
 			return b.keep(j, state.JobCreate, fmt.Errorf("reading instance %s before labelling it ready: %w", rec.Ref, err))
 		}
+		if isOtherSchema(err) {
+			// The labels changed while the create was at work. As at the
+			// create's first read: not failed, because the clean-up's marker
+			// would have a server that reads these labels destroy the VM.
+			return b.keep(j, state.JobCreate, err)
+		}
 		return b.failCreate(j, err, config.StatusReasonCreateFailed)
 	}
 	labels := map[string]string{
