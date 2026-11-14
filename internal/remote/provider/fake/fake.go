@@ -276,9 +276,18 @@ func cloneRule(r provider.FirewallRule) provider.FirewallRule {
 	r.TargetTags = append([]string(nil), r.TargetTags...)
 	r.TargetServiceAccounts = append([]string(nil), r.TargetServiceAccounts...)
 	r.DestinationRanges = append([]string(nil), r.DestinationRanges...)
-	r.Allowed = append([]provider.FirewallPorts(nil), r.Allowed...)
-	r.Denied = append([]provider.FirewallPorts(nil), r.Denied...)
+	r.Allowed = clonePorts(r.Allowed)
+	r.Denied = clonePorts(r.Denied)
 	return r
+}
+
+// clonePorts copies the entries and each entry's port list.
+func clonePorts(in []provider.FirewallPorts) []provider.FirewallPorts {
+	out := append([]provider.FirewallPorts(nil), in...)
+	for i := range out {
+		out[i].Ports = append([]string(nil), out[i].Ports...)
+	}
+	return out
 }
 
 // EnvFirewallRule returns the environment's rule.
