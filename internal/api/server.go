@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/audit"
-	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
@@ -24,7 +23,6 @@ type Server struct {
 	bridge      *plugin.Bridge
 	egressAudit *egress.AuditLog         // nil when egress is disabled
 	egressStore *config.UserProfileStore // nil when egress is disabled
-	tokens      *authtoken.Store         // nil until SetTokenStore; consulted only in token mode (auth.mode: token)
 	// certAuthorized answers "is this SSH key fingerprint still allowlisted?"
 	// for the mtls middleware, which re-checks a presented client certificate's
 	// Subject CN on every request. It is a plain predicate rather than the
@@ -73,11 +71,6 @@ func (s *Server) SetEgressAudit(a *egress.AuditLog) { s.egressAudit = a }
 // startup when egress is enabled; nil leaves the profile routes reporting only
 // config profiles (and PUT/DELETE returning 501).
 func (s *Server) SetEgressUserStore(st *config.UserProfileStore) { s.egressStore = st }
-
-// SetTokenStore attaches the HTTP bearer-token store. The same store is shared
-// with the SSH bootstrap handler (which mints into it); the auth middleware
-// validates against it. Constructed once in shed-server.
-func (s *Server) SetTokenStore(t *authtoken.Store) { s.tokens = t }
 
 // SetClientCertAuthorizer attaches the live SSH-allowlist predicate the mtls
 // middleware re-checks a client certificate's Subject CN against on every
@@ -128,23 +121,21 @@ func (s *Server) useCommonMiddleware(r chi.Router) {
 }
 
 // Router returns the chi router for the HTTP API — served over pinned TLS in
-// an enforced mode (token or mtls), plain HTTP in open mode. It registers the
-// full route surface on a single listener: the control plane (info, lifecycle,
-// images, system, snapshots, sessions, egress) plus the credential bus
-// (/api/plugins/*) and the Connect tunnel (/api/sheds/*/connect/*). In either
-// enforced mode the bus requires a credentials-scoped credential, the Connect
-// tunnel accepts control or credentials, and everything else requires control
-// — identically whether that credential is a bearer token or a client
-// certificate (see authMiddleware).
+// mtls mode, plain HTTP in open mode. It registers the full route surface on a
+// single listener: the control plane (info, lifecycle, images, system,
+// snapshots, sessions, egress) plus the credential bus (/api/plugins/*) and the
+// Connect tunnel (/api/sheds/*/connect/*). In mtls mode the bus requires a
+// credentials-scoped certificate, the Connect tunnel accepts control or
+// credentials, and everything else requires control (see authMiddleware).
 func (s *Server) Router() chi.Router {
 	r := chi.NewRouter()
 	s.mux = r
 	s.useCommonMiddleware(r)
 
 	r.Route("/api", func(r chi.Router) {
-		// Server info (in open and token mode also the unauthenticated
-		// bootstrap endpoints used by `shed server add`; mtls has no
-		// exemptions — see authMiddleware).
+		// Server info and the SSH host key. Unauthenticated only in open
+		// mode, where nothing is; mtls has no exemptions — see
+		// authMiddleware.
 		r.Get("/info", s.handleGetInfo)
 		r.Get("/ssh-host-key", s.handleGetSSHHostKey)
 

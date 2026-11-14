@@ -74,8 +74,8 @@ edit the config so it faces the network.
     and a config without them refuses to start, one
     `firecracker config: <field> is required` error at a time.
 
-**Recommended — token mode** (pinned TLS + minted bearer tokens + an SSH key
-allowlist; the preferred posture for anything networked):
+**Networked — mtls mode** (pinned TLS + a client certificate enrolled over
+SSH + an SSH key allowlist; the only mode that may face the network):
 
 ```yaml
 # Merge into /etc/shed/server.yaml (keep the generated firecracker: block).
@@ -85,30 +85,18 @@ ssh_port: 2222
 default_backend: firecracker
 
 auth:
-  mode: token                    # forces SSH enforce + HTTP tokens + TLS-only
+  mode: mtls                     # forces SSH enforce + client certificates + TLS-only
   ssh:
-    github_users: [your-github-username]   # only these keys may SSH in (and mint tokens)
+    github_users: [your-github-username]   # only these keys may SSH in (and enrol)
 bind_address: 0.0.0.0            # face the network (or a specific tailnet/LAN IP)
-# https_port defaults to 8443; http_port is optional in token mode.
+# https_port defaults to 8443; http_port is not served in mtls mode.
 ```
 
-Prefer a client certificate over bearer tokens? `auth.mode: mtls` is the same
-hardened posture with the token replaced by an enrolled client cert — see
-[Case 3b in the Security Configuration guide](../guides/security-configuration.md).
-
-**Alternative — open on a trusted private network** (plaintext; Tailscale / LAN
-only, where the network is the trust boundary):
-
-```yaml
-# Merge into /etc/shed/server.yaml (keep the generated firecracker: block).
-name: my-linux-host
-http_port: 8080
-ssh_port: 2222
-default_backend: firecracker
-
-bind_address: 0.0.0.0            # or a specific tailnet/LAN IP
-allow_insecure_exposure: true    # required: acknowledge a non-loopback bind with no TLS
-```
+**Local only — open mode** (plain HTTP, no credential): the generated config's
+default, reachable on the box itself. An open server binds loopback only; a
+non-loopback `bind_address` in open mode fails to load. (`auth.mode: token`
+and `allow_insecure_exposure` were removed in v0.10.0 and also fail to
+load.)
 
 See the [Security Configuration guide](../guides/security-configuration.md) for
 the full posture walkthrough and [Configuration](../reference/configuration.md)
@@ -119,9 +107,10 @@ for the Firecracker-specific fields (bridge name/CIDR, vsock, resource defaults)
 ```bash
 sudo systemctl start shed-server
 systemctl status shed-server                  # should be active (running)
-# token mode (TLS-only) — check over HTTPS on the box:
-curl -sk https://localhost:8443/api/info      # name, version, backend: firecracker
-# open mode instead? use: curl -s http://localhost:8080/api/info
+# open mode (the default) — check over plain HTTP on the box:
+curl -s http://localhost:8080/api/info        # name, version, backend: firecracker
+# mtls mode answers only a client that presents a certificate; check it from
+# your workstation with `shed server add` (next step) instead.
 ```
 
 The first `shed create` pulls the matching `shed-fc-full` image automatically

@@ -312,7 +312,7 @@ def test_down_removes_only_its_tables_and_up_rebuilds(fc_server_dev, sheds, base
         assert not {f"table bridge {TABLE}", f"table inet {TABLE}"} & tables(fc_server_dev), "teardown left a table"
         assert shared_host_state(fc_server_dev) == baseline, "dev-server-down-fc changed the bridge, NAT or FORWARD rules"
     finally:
-        make("dev-server-up-fc", "SHED_DEV_AUTH_MODE=mtls")
+        make("dev-server-up-fc")
         wait_listed(fc_server_dev)
     assert guarded_ips(fc_server_dev) == before, "the rebuild from metadata differs"
     r = host_run(fc_server_dev, f"sudo -n grep -c 'Network policy: tables bridge/inet {TABLE} installed' {DEV_LOG}")

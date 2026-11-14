@@ -1,85 +1,99 @@
-"""Credential-bus registry-identity hardening + v0.7.1 removed-key rejection (live).
+"""Credential-bus response forgery + removed-key and removed-mode refusal (live).
 
-Puts the VZ dev server in `auth.mode: secure` (the local SSH key allowlisted),
-mints a credentials token over the `_bootstrap` SSH channel, and verifies that a
-forged `/respond` — one that does not correspond to a pending request the
-listener was dispatched — is dropped at the registry even with a valid
-credentials token. The per-route scope gate is covered by test_http_auth.py;
-this is the below-the-handler ownership defense (response-injection /
-listener-squat). A second test asserts the removed `public_exposure` /
-`auth.http.tokens` keys hard-fail at startup.
+Enrols a credentials certificate over the `_bootstrap` SSH channel and verifies
+that a forged `/respond` — one that does not correspond to a pending request
+the listener was dispatched — is dropped at the registry even with a valid
+credentials certificate. The per-route scope gate is covered by
+test_http_auth.py; this is the below-the-handler ownership defense
+(response-injection / listener-squat). It runs against either dev server
+(`shed_server_dev`), which it reads and does not change, over the pinned mtls
+listener. (It replaces the bearer-token form that ran against the removed
+token mode.)
 
-Secure mode is TLS-only (no plain-HTTP listener), so the forged-`/respond` POST
-goes over the pinned HTTPS listener. VZ-only (config mutation restarts the local
-dev server); the ownership logic is backend-agnostic Go covered by
-internal/plugin + internal/api unit tests.
+The second test asserts the config shapes shed-server no longer loads — the
+removed `public_exposure` / `auth.http.tokens` keys, the removed bearer-token
+mode under both its spellings, `allow_insecure_exposure`, and an open server
+bound beyond loopback — each refuse to start with a message naming the fix, and
+never come up open. The ownership logic is backend-agnostic Go covered by
+internal/plugin + internal/api unit tests, and every refused shape has a Go
+config-load test in internal/config.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
-from fixtures.devcontrol import (
-    bootstrap_mint,
-    dev_config,
-    run_preflight,
-    skip_mtls_token_semantics,
-)
-from fixtures.tlsclient import https_status, server_cert_pem
-
-# Secure mode is TLS-only; pin the explicitly-set https_port (the port-safety
-# guard allows 18443) so the POST reaches the only listener facing clients.
-HTTPS_PORT = 18443
+from fixtures.devcontrol import OPEN_MODE_OVERRIDES, bootstrap_cert, run_preflight
+from fixtures.server import resolve_server_entry
+from fixtures.tlsclient import pinned_request
 
 
-@skip_mtls_token_semantics
-@pytest.mark.vz
-@pytest.mark.slow
-def test_cred_bus_forged_respond_dropped(vz_server_dev):
-    server = vz_server_dev.name
-    pubkey = (Path.home() / ".ssh" / "id_ed25519.pub").read_text().strip()
-    overrides = {
-        "https_port": HTTPS_PORT,
-        "auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}},
+def test_cred_bus_forged_respond_dropped(shed_server_dev, tmp_path):
+    server = shed_server_dev
+    entry = resolve_server_entry(server.name)
+    assert entry is not None, f"{server.name!r} not found in ~/.shed/config.yaml"
+    creds = bootstrap_cert(server.name, "credentials", tmp_path)
+    # A /respond that names no pending request is dropped (403) even with a
+    # valid credentials certificate: the requestID was never dispatched to any
+    # listener, so it can't be answered. Forged response-injection defense.
+    body = {
+        "namespace": "itest-ns",
+        "type": "response",
+        "in_reply_to": "forged-request-id",
+        "final": True,
+        "shed": {"name": "itest-shed"},
     }
-    with dev_config(overrides, server):
-        pin = server_cert_pem("localhost", HTTPS_PORT)
-        creds = bootstrap_mint(server, "credentials")
-        # A /respond that names no pending request is dropped (403) even with a
-        # valid credentials token: the requestID was never dispatched to any
-        # listener, so it can't be answered. Forged response-injection defense.
-        body = {
-            "namespace": "itest-ns",
-            "type": "response",
-            "in_reply_to": "forged-request-id",
-            "final": True,
-            "shed": {"name": "itest-shed"},
-        }
-        assert https_status(
-            HTTPS_PORT, "/api/plugins/listeners/itest-ns/respond", pin, creds,
-            method="POST", body=body,
-        ) == 403
+    status, resp = pinned_request(
+        entry.get("host", "localhost"), creds.https_port,
+        "/api/plugins/listeners/itest-ns/respond", creds.pin, creds.pair,
+        method="POST", body=body,
+    )
+    assert status == 403, f"forged respond: status {status}, body {resp!r}"
+
+
+def _assert_refused(result, *needles: str) -> None:
+    assert not result.timed_out, (
+        f"the server started (it was still running at the timeout); want a refusal naming {needles}"
+    )
+    assert result.returncode != 0, f"expected a non-zero exit, got {result.returncode}"
+    err = result.stderr.lower()
+    for needle in needles:
+        assert needle.lower() in err, f"stderr should name {needle!r}: {result.stderr[-800:]!r}"
 
 
 @pytest.mark.vz
-def test_removed_auth_keys_hard_fail():
-    """v0.7.1 removed `public_exposure` and `auth.http.tokens`. A config that still
-    carries either must be **rejected at startup** — a non-zero exit naming the
-    removed key — never silently ignored: a dropped `public_exposure: true` would
-    un-loopback the plaintext listener, and a dropped token list would leave a
-    server the operator believes is gated wide open. Uses the throwaway subprocess
-    harness (not the running dev server); the server exits at config load, before
-    any backend init, so no VM is needed."""
-    pe = run_preflight({"public_exposure": True})
-    assert not pe.timed_out, "a removed public_exposure key must exit, not keep running"
-    assert pe.returncode != 0, f"expected a non-zero exit, got {pe.returncode}"
-    assert "public_exposure" in pe.stderr.lower(), f"stderr should name the removed key: {pe.stderr!r}"
-    assert "removed" in pe.stderr.lower(), f"stderr should say the key was removed: {pe.stderr!r}"
-
-    tok = run_preflight({"auth": {"http": {"tokens": [{"scope": "control", "token": "shed_control_x"}]}}})
-    assert not tok.timed_out, "a removed auth.http.tokens key must exit, not keep running"
-    assert tok.returncode != 0, f"expected a non-zero exit, got {tok.returncode}"
-    assert "tokens" in tok.stderr.lower(), f"stderr should name the removed key: {tok.stderr!r}"
-    assert "removed" in tok.stderr.lower(), f"stderr should say the key was removed: {tok.stderr!r}"
+@pytest.mark.parametrize(
+    "overrides, needles",
+    [
+        # Removed before this release; still refused, now pointing at mtls.
+        ({"public_exposure": True}, ("public_exposure", "removed", "auth.mode: mtls")),
+        ({"auth": {"http": {"tokens": [{"scope": "control", "token": "shed_control_x"}]}}},
+         ("auth.http.tokens", "removed", "auth.mode: mtls")),
+        # The bearer-token mode, under both spellings: refused at load, never
+        # started open.
+        ({"auth": {"mode": "token"}}, ('auth.mode: "token" was removed', "use auth.mode: mtls")),
+        ({"auth": {"mode": "secure"}}, ('auth.mode: "secure" was removed', "use auth.mode: mtls")),
+        # The open-exposure acknowledgment, with any value.
+        ({"allow_insecure_exposure": True}, ("allow_insecure_exposure", "removed", "auth.mode: mtls")),
+        ({"allow_insecure_exposure": False}, ("allow_insecure_exposure", "removed")),
+        # An open server bound beyond loopback.
+        ({**OPEN_MODE_OVERRIDES, "bind_address": "0.0.0.0"}, ("loopback only", "auth.mode: mtls")),
+        ({**OPEN_MODE_OVERRIDES, "bind_address": "::"}, ("loopback only", "auth.mode: mtls")),
+    ],
+    ids=[
+        "public_exposure", "auth.http.tokens", "mode-token", "mode-secure",
+        "allow_insecure_exposure-true", "allow_insecure_exposure-false",
+        "open-on-all-ipv4", "open-on-all-interfaces",
+    ],
+)
+def test_removed_config_shapes_hard_fail(overrides, needles):
+    """A config carrying a removed key or mode must be **rejected at
+    startup** — a non-zero exit naming what to change — never silently
+    ignored and never started open: a dropped `public_exposure: true` would
+    un-loopback the plaintext listener, a token-mode config that fell back to
+    open would leave a server the operator believes is gated wide open, and a
+    wide-open bind is exactly what open mode no longer allows. Uses the
+    throwaway subprocess harness (not the running dev server): the server
+    exits at config load, before any backend init or bind, so no VM is
+    needed."""
+    _assert_refused(run_preflight(overrides), *needles)

@@ -146,6 +146,7 @@ jobs:
               - 'configs/server.dev-parallel.*.yaml'
               - 'scripts/render-dev-config.sh'
               - 'scripts/dev-server-probe.sh'
+              - 'scripts/dev-server-wait.sh'
               - 'Makefile'
             docs:
               - 'docs/**'

@@ -148,22 +148,25 @@ func TestBuildHTTPSTLSConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("token mode has no client auth", func(t *testing.T) {
-		cfg := &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeToken}}
-		// Pass a CA anyway: mode, not the argument, is what decides.
-		got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(string) bool { return true })
+	t.Run("a mode other than mtls has no client auth even with a CA", func(t *testing.T) {
+		// The removed token mode and open mode both leave MTLSMode false; pass a
+		// CA anyway: mode, not the argument, is what decides.
+		for _, mode := range []string{config.AuthModeOpen, config.AuthModeToken} {
+			cfg := &config.ServerConfig{Auth: &config.AuthConfig{Mode: mode}}
+			got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(string) bool { return true })
 
-		if got.ClientAuth != tls.NoClientCert {
-			t.Errorf("ClientAuth = %v, want NoClientCert in token mode", got.ClientAuth)
-		}
-		if got.ClientCAs != nil {
-			t.Error("ClientCAs set in token mode")
-		}
-		if got.VerifyConnection != nil {
-			t.Error("VerifyConnection set in token mode")
-		}
-		if got.MinVersion != tls.VersionTLS12 {
-			t.Errorf("MinVersion = %#x, want TLS 1.2", got.MinVersion)
+			if got.ClientAuth != tls.NoClientCert {
+				t.Errorf("%s: ClientAuth = %v, want NoClientCert", mode, got.ClientAuth)
+			}
+			if got.ClientCAs != nil {
+				t.Errorf("%s: ClientCAs set", mode)
+			}
+			if got.VerifyConnection != nil {
+				t.Errorf("%s: VerifyConnection set", mode)
+			}
+			if got.MinVersion != tls.VersionTLS12 {
+				t.Errorf("%s: MinVersion = %#x, want TLS 1.2", mode, got.MinVersion)
+			}
 		}
 	})
 

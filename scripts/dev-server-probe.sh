@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # dev-server-probe.sh — one readiness check of a parallel dev shed-server,
-# for the Makefile's dev-server-up (run here) and dev-server-up-fc (piped to
-# the FC host over ssh and run there with `bash -s`). The caller polls it.
+# for the Makefile's dev-server-up and dev-server-up-remote (run here) and
+# dev-server-up-fc (piped to the FC host over ssh and run there with
+# `bash -s`), and for the integration suite's dev_config() restarts. The
+# caller polls it: the Makefile through scripts/dev-server-wait.sh, the suite
+# in fixtures/devcontrol.py. Both treat any status but 0, 1 and 2 as a
+# failure, so a probe that refuses its arguments (64) never reads as "not yet".
 #
 # Usage:
-#   dev-server-probe.sh <log> <pid> [settle-seconds]
+#   dev-server-probe.sh <log> <pid> [settle-seconds] [first-line]
 #
-# <log> is the server's log, emptied before the launch so nothing in it is
-# from an earlier run; <pid> is the launched server's process id.
+# <log> is the server's log; <pid> is the launched server's process id. Only
+# the log from line <first-line> on (default 1, the whole file) is read: a
+# caller that empties the log before the launch passes nothing, and one that
+# appends to it (dev-server-up-remote) passes the line count before the
+# launch, so nothing from an earlier run is read.
 #
 # Exit status, with one line on stdout saying why:
 #   0  ready   the server is up and its listeners accept connections
@@ -31,7 +38,7 @@
 set -u
 
 usage() {
-  echo "usage: $0 <log> <pid> [settle-seconds]" >&2
+  echo "usage: $0 <log> <pid> [settle-seconds] [first-line]" >&2
   exit 64
 }
 
@@ -39,7 +46,12 @@ usage() {
 log="$1"
 pid="$2"
 settle="${3:-1}"
+first="${4:-1}"
+case "$first" in '' | *[!0-9]*) usage ;; esac
+[ "$first" -ge 1 ] || first=1
 
+# This run's part of the log.
+logtext() { tail -n "+$first" "$log" 2>/dev/null; }
 not_yet() { echo "not yet: $1"; exit 1; }
 failed() { echo "failed: $1"; exit 2; }
 
@@ -56,7 +68,7 @@ alive() {
 check_not_failed() {
   alive || failed "the server process (pid '${pid}') is not running"
   local err
-  err="$(grep -m1 'Server error:' "$log" 2>/dev/null)"
+  err="$(logtext | grep -m1 'Server error:')"
   [ -z "$err" ] || failed "$err"
 }
 
@@ -73,11 +85,11 @@ connects() {
 }
 
 check_not_failed
-grep -q 'Shed server is ready' "$log" 2>/dev/null || not_yet "no readiness line in $log yet"
-grep -Eq 'HTTPS? server listening on ' "$log" || not_yet "no HTTP(S) listener logged yet"
-grep -q 'SSH server listening on ' "$log" || not_yet "no SSH listener logged yet"
+logtext | grep -q 'Shed server is ready' || not_yet "no readiness line in $log yet"
+logtext | grep -Eq 'HTTPS? server listening on ' || not_yet "no HTTP(S) listener logged yet"
+logtext | grep -q 'SSH server listening on ' || not_yet "no SSH listener logged yet"
 
-addrs="$(sed -n 's/.* server listening on \([^ ]*\)$/\1/p' "$log")"
+addrs="$(logtext | sed -n 's/.* server listening on \([^ ]*\)$/\1/p')"
 for addr in $addrs; do
   port="${addr##*:}"
   host="${addr%:*}"

@@ -153,7 +153,7 @@ func (r *Registry) pendingEnvelopesLocked(namespace string) []*Envelope {
 // sweepStalePendingLocked drops pending entries older than pendingRetention
 // across all namespaces. The caller must hold r.mu. Called on every Publish AND
 // every Register — i.e. on every pending mutation — deliberately NOT from a
-// background sweeper (unlike authtoken.StartSweeper): so any ongoing request
+// background sweeper goroutine: so any ongoing request
 // traffic OR listener churn keeps the set bounded and the effective
 // response-acceptance window at ~pendingRetention, without the goroutine + ctx
 // the Registry doesn't carry. The only un-swept case is a namespace gone fully

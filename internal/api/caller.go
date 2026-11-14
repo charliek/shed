@@ -8,8 +8,8 @@ import (
 
 // Caller kinds.
 const (
-	// CallerAdmin is every caller that is not a service client: open mode,
-	// a bearer token, or a user's client certificate. Admins see and control
+	// CallerAdmin is every caller that is not a service client: open mode or
+	// a user's client certificate. Admins see and control
 	// every shed, exactly as before service clients existed.
 	CallerAdmin = "admin"
 	// CallerClient is a service client (auth.clients) authenticated by its

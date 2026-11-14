@@ -5,29 +5,26 @@ This guide deploys shed-server on an internet-facing VPS, locked down so that
 **credential bus is reachable only with the required scope over TLS**.
 
 The default shed posture is local-only (open, bound to loopback). This guide is
-the opposite end: a hardened, internet-facing server. Two postures both derive
-the same hardening bundle (SSH allowlist enforced + HTTP credential enforced +
-TLS-only, with no plain-HTTP listener) and **refuse to start** if any piece is
+the opposite end: a hardened, internet-facing server. mtls derives the
+hardening bundle (SSH allowlist enforced + client certificate enforced +
+TLS-only, with no plain-HTTP listener) and **refuses to start** if any piece is
 missing; one `bind_address` faces the network:
 
 - **[`auth.mode: mtls`](#1-server-config)** — the **recommended** posture. The
   HTTP credential is a client certificate bound to a private key that never
   leaves the client's device, issued over SSH. An unauthenticated peer can
   never complete the TLS handshake, let alone reach the router.
-- **[`auth.mode: token`](#token-mode-alternative)** — a bearer token minted
-  over SSH. Use this instead when something outside the shed client fleet
-  needs admin access to the API with a bearer header — `curl`, a CI runner, a
-  third-party integration. An mtls server has no bearer credential, so `token`
-  mode is retained and not deprecated. A CI runner or agent runner that needs
-  only its own sheds can instead be a [service client](orchestrated-sheds.md)
-  of an mtls server.
+- The bearer-token mode (`auth.mode: token`) was removed in v0.10.0 and no
+  longer loads (see [Token mode was removed](#token-mode-was-removed)). A CI
+  runner or agent runner that needs only its own sheds can be a
+  [service client](orchestrated-sheds.md) of an mtls server.
 
-Either way, there are no credentials to mint or paste by hand: clients get
+There are no credentials to mint or paste by hand: clients get
 them automatically over SSH.
 
 ## 1. Server config
 
-Write `/etc/shed/server.yaml`. Both modes require an SSH key source, and —
+Write `/etc/shed/server.yaml`. mtls requires an SSH key source, and —
 since v0.7.4 every posture defaults to loopback — a `bind_address` so the VPS
 is reachable from off-box:
 
@@ -53,9 +50,9 @@ anything.)
 !!! warning "`bind_address` is required for a remote server"
     Since v0.7.4 `bind_address` **defaults to loopback (`127.0.0.1`) in every
     mode**, so without the `bind_address: 0.0.0.0` line above the VPS binds
-    loopback only and is unreachable from your laptop. Neither `token` nor
-    `mtls` mode needs an `allow_insecure_exposure` ack — TLS plus a required
-    credential make the network bind safe.
+    loopback only and is unreachable from your laptop. mtls needs no
+    acknowledgment for it — TLS plus a required credential make the network
+    bind safe — and an open server may not bind beyond loopback at all.
 
 Start (or restart) the server. If a required piece is missing it exits
 immediately, naming the gap:
@@ -64,25 +61,14 @@ immediately, naming the gap:
 auth.mode: mtls requires at least one SSH key source (auth.ssh.github_users, authorized_keys, or authorized_keys_file)
 ```
 
-### Token mode alternative
+### Token mode was removed
 
-If you need `curl`/CI/third-party callers to reach the API directly as an
-admin, use `auth.mode: token` instead (an orchestrator that needs only its own
-sheds can stay on mtls as a [service client](orchestrated-sheds.md)) — everything else in this guide (the `bind_address`
-requirement, the SSH-first add flow, the rotation story) is the same shape,
-just with a bearer token instead of a certificate:
-
-```yaml
-auth:
-  mode: token
-  ssh:
-    github_users: [charliek]
-tls_names: [shed.example.com]
-bind_address: 0.0.0.0
-```
-
-See [Security › Token mode](../reference/security.md#token-mode) for the
-token-specific details (scopes, TTL, revocation by allowlist removal).
+`auth.mode: token` (and its older spelling `secure`) was removed in v0.10.0:
+a config that names it fails to load with a message naming `mtls`, rather
+than starting open. Switch it to `auth.mode: mtls`; every client since v0.8.1
+re-enrols with a certificate on its next request. Callers that used a bearer
+token directly (`curl`, scripts, CI) must present a client certificate, or
+become a [service client](orchestrated-sheds.md).
 
 ## 2. Add the server from your client
 
@@ -116,7 +102,7 @@ servers:
 
 Your SSH key must be on the server's allowlist for enrollment to succeed (it
 is — you listed it in `github_users`). This is a **behavior change** from
-plain-TOFU adds: `shed server add` against a `token`/`mtls` server now
+plain-TOFU adds: `shed server add` against an mtls server now
 requires an allowlisted SSH key **at add time**, not just lazily on first API
 call. Verify the control plane over the pinned mTLS connection:
 
@@ -131,11 +117,6 @@ the allowlist), pass them explicitly:
 shed server add shed.example.com --ssh-port 2222 \
   --tls-fingerprint sha256:<hex> --fingerprint SHA256:<ssh>
 ```
-
-Adding against `token` mode looks identical except the entry gets
-`control_token`/`control_token_expires_at` instead of a certificate — see
-[Security › HTTP tokens are minted over
-SSH](../reference/security.md#http-tokens-are-minted-over-ssh).
 
 ## 3. Credential brokering over TLS
 

@@ -228,13 +228,10 @@ func TestHandlePluginRespondSuccess(t *testing.T) {
 
 func TestHandlePluginRespondOwnershipEnforced(t *testing.T) {
 	srv := newTestServerWithPlugins()
-	store := authtoken.NewStore()
-	creds, _, err := store.Mint("SHA256:test", authtoken.ScopeCredentials, authtoken.ClientHostAgent, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv.tokens = store
-	srv.cfg.Auth = &config.AuthConfig{Mode: config.AuthModeToken}
+	fp := testFingerprint("bus")
+	srv.cfg.Auth = &config.AuthConfig{Mode: config.AuthModeMTLS}
+	srv.SetClientCertAuthorizer(func(got string) bool { return got == fp })
+	creds := testClientCert(fp, authtoken.ScopeCredentials, time.Hour)
 	srv.plugins.EnableOwnershipTracking() // a server with HTTP auth enforced does this
 	srv.bridge.RegisterShed("dev", &plugin.ShedConn{
 		Name: "dev",
@@ -247,7 +244,7 @@ func TestHandlePluginRespondOwnershipEnforced(t *testing.T) {
 	post := func(inReplyTo string) int {
 		body := fmt.Sprintf(`{"namespace":"op","type":"response","in_reply_to":%q,"final":true,"shed":{"name":"dev"}}`, inReplyTo)
 		r := httptest.NewRequest(http.MethodPost, "/api/plugins/listeners/op/respond", strings.NewReader(body))
-		r.Header.Set("Authorization", "Bearer "+creds)
+		withClientCert(r, creds)
 		w := httptest.NewRecorder()
 		srv.Router().ServeHTTP(w, r)
 		return w.Code

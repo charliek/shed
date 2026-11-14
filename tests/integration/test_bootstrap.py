@@ -1,37 +1,34 @@
 """Bootstrap-channel allowlist gating (live).
 
-The reserved `_bootstrap` SSH channel mints HTTP tokens, but only for keys in the
-server's SSH allowlist — it re-verifies the connecting key against `auth.ssh`
-before minting. This drives the dev server in `auth.mode: secure` with ONLY the
-local key allowlisted and proves: an off-list key is denied the mint, while the
-allowlisted key still mints. VZ-only (config mutation restarts the dev server);
-the mint re-verify logic is backend-agnostic Go covered by internal/sshd unit
+The reserved `_bootstrap` SSH channel issues client certificates, but only for
+keys in the server's SSH allowlist: an off-list key never reaches a session,
+so it never gets a certificate. This drives the running mtls dev server (no
+reconfiguration: its committed config allowlists the developer's key, as every
+enrolled dev entry already assumes) and proves both halves: the allowlisted key
+is issued a certificate, and an off-list key is refused at SSH auth with
+nothing certificate-shaped on stdout.
+
+It replaces the bearer-token form of this test, which ran against the removed
+token mode. VZ-only because the off-list probe ignores the user's ssh config
+(see `_bootstrap_with_key`) and so must name a host that resolves without it;
+the issue/refuse logic is backend-agnostic Go covered by `internal/sshd` unit
 tests.
 """
 
 from __future__ import annotations
 
+import base64
 import subprocess
-import tempfile
 from pathlib import Path
 
 import pytest
 
-from fixtures.devcontrol import bootstrap_mint, dev_config, skip_mtls_token_semantics
+from fixtures.devcontrol import KNOWN_HOSTS_PATH, bootstrap_cert
 from fixtures.server import resolve_server_entry
 
-KNOWN_HOSTS = Path.home() / ".shed" / "known_hosts"
 
-# Secure mode is TLS-only (no plain-HTTP listener), so the dev_config readiness
-# probe targets https. Pin the explicitly-set https_port (the port-safety guard
-# allows 18443) so the probe hits the actual listener rather than the 8443
-# default. The mint itself is over SSH, unaffected by the HTTP transport.
-HTTPS_PORT = 18443
-
-
-def _bootstrap_with_key(ssh_port: int, key_path: Path, scope: str = "control") -> subprocess.CompletedProcess:
+def _bootstrap_with_key(ssh_port: int, key_path: Path, request: str) -> subprocess.CompletedProcess:
     """Attempt a `_bootstrap` exchange offering ONLY `key_path`.
-    A non-zero returncode means the mint was refused at SSH auth.
 
     `IdentitiesOnly=yes` alone is NOT enough to isolate `key_path`: a user
     `~/.ssh/config` with `Host * IdentityFile ~/.ssh/id_ed25519` (the macOS
@@ -48,41 +45,40 @@ def _bootstrap_with_key(ssh_port: int, key_path: Path, scope: str = "control") -
         "-o", "IdentitiesOnly=yes",
         "-o", "IdentityAgent=none",
         "-o", "BatchMode=yes",
-        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+        "-o", f"UserKnownHostsFile={KNOWN_HOSTS_PATH}",
         "-o", "StrictHostKeyChecking=yes",
-        "_bootstrap@localhost", scope, "cli",
+        "_bootstrap@localhost", *request.split(),
     ]
     return subprocess.run(args, capture_output=True, text=True, timeout=20)
 
 
-@skip_mtls_token_semantics
 @pytest.mark.vz
-@pytest.mark.slow
-def test_bootstrap_mint_is_allowlist_gated(vz_server_dev):
+def test_bootstrap_cert_is_allowlist_gated(vz_server_dev, tmp_path):
     server = vz_server_dev.name
     ssh_port = int(resolve_server_entry(server)["ssh_port"])
-    pubkey = (Path.home() / ".ssh" / "id_ed25519.pub").read_text().strip()
-    overrides = {
-        "https_port": HTTPS_PORT,
-        "auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}},
-    }
-    with dev_config(overrides, server):
-        # Positive control: the allowlisted local key mints a control token.
-        assert bootstrap_mint(server, "control").startswith("shed_control_")
 
-        # An off-list key is refused: generate a throwaway ed25519 not in the
-        # allowlist and offer only it.
-        with tempfile.TemporaryDirectory() as d:
-            offkey = Path(d) / "offkey"
-            kg = subprocess.run(
-                ["ssh-keygen", "-t", "ed25519", "-f", str(offkey), "-N", "", "-q"],
-                capture_output=True, text=True, timeout=15,
-            )
-            assert kg.returncode == 0, f"ssh-keygen failed: {kg.stderr!r}"
-            r = _bootstrap_with_key(ssh_port, offkey, "control")
-            assert r.returncode != 0, (
-                "an off-list key must be refused the bootstrap mint, got exit 0; "
-                f"stdout={r.stdout[-300:]!r}"
-            )
-            # Nothing token-shaped leaked onto stdout.
-            assert "shed_control_" not in r.stdout
+    # Positive control: the allowlisted local key is issued a certificate.
+    issued = bootstrap_cert(server, "control", tmp_path / "issued")
+    assert "BEGIN CERTIFICATE" in issued.cert_path.read_text()
+
+    # An off-list key is refused: a throwaway ed25519 not in the allowlist,
+    # offered alone, with a request line that is otherwise exactly the one
+    # that was just honoured.
+    offkey = tmp_path / "offkey"
+    kg = subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-f", str(offkey), "-N", "", "-q"],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert kg.returncode == 0, f"ssh-keygen failed: {kg.stderr!r}"
+    csr = (tmp_path / "issued" / "control.csr.der").read_bytes()
+    request = f"control cli csr={base64.b64encode(csr).decode('ascii')}"
+    r = _bootstrap_with_key(ssh_port, offkey, request)
+    assert r.returncode != 0, (
+        "an off-list key must be refused a certificate, got exit 0; "
+        f"stdout={r.stdout[-300:]!r}"
+    )
+    # Refused at SSH auth, and not for some other reason (an unknown host key
+    # would also exit non-zero, and prove nothing).
+    assert "Permission denied" in r.stderr, f"expected a publickey refusal: {r.stderr[-500:]!r}"
+    # Nothing certificate-shaped leaked onto stdout.
+    assert "client_cert" not in r.stdout and "BEGIN CERTIFICATE" not in r.stdout

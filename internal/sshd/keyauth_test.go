@@ -178,7 +178,14 @@ func TestMaxAuthTriesPassthrough(t *testing.T) {
 	}
 }
 
-func TestRevokeHookFiresOnRemovedKey(t *testing.T) {
+// The rebuild tests below pin how a key leaves the allowlist. An mtls server
+// re-checks every request's certificate CN (the key fingerprint) against this
+// set, so a rebuild that drops a key is what de-authorizes its certificates,
+// and a rebuild that wrongly drops one locks a user out. (These replaced the
+// revoke-hook tests when the bearer-token store, the hook's only consumer, was
+// deleted.)
+
+func TestRebuildDropsARemovedKey(t *testing.T) {
 	k1, line1 := genKey(t)
 	k2, line2 := genKey(t)
 	a, err := NewKeyAllowlist(&config.SSHAuthConfig{
@@ -188,29 +195,23 @@ func TestRevokeHookFiresOnRemovedKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var revoked []string
-	a.SetRevokeHook(func(subjects []string) { revoked = append(revoked, subjects...) })
 
-	// Drop k2 from the inline source and rebuild → only k2's tokens are revoked.
+	// Drop k2 from the inline source and rebuild → only k2 leaves.
 	a.inline = []string{line1}
 	if err := a.rebuild(); err != nil {
 		t.Fatal(err)
 	}
-	wantFP := gossh.FingerprintSHA256(k2)
-	if len(revoked) != 1 || revoked[0] != wantFP {
-		t.Errorf("revoked = %v, want [%s]", revoked, wantFP)
-	}
-	if !a.IsAuthorized(k1) {
+	if !a.IsAuthorized(k1) || !a.IsAuthorizedFingerprint(gossh.FingerprintSHA256(k1)) {
 		t.Error("k1 should still be authorized")
 	}
-	if a.IsAuthorized(k2) {
+	if a.IsAuthorized(k2) || a.IsAuthorizedFingerprint(gossh.FingerprintSHA256(k2)) {
 		t.Error("k2 should no longer be authorized")
 	}
 }
 
-func TestRevokeHookNotFiredOnFailedRefetch(t *testing.T) {
-	// The panel invariant: a transient GitHub outage must NEVER revoke. The
-	// fail-closed fallback keeps the key set unchanged, so the diff is empty.
+func TestRebuildKeepsKeysOnFailedRefetch(t *testing.T) {
+	// A transient GitHub outage must never drop a key: the fail-closed fallback
+	// keeps the key set unchanged.
 	listed, listedLine := genKey(t)
 	var failFetch atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -232,24 +233,19 @@ func TestRevokeHookNotFiredOnFailedRefetch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var revoked []string
-	a.SetRevokeHook(func(subjects []string) { revoked = append(revoked, subjects...) })
 
 	failFetch.Store(true)
 	if err := a.rebuild(); err != nil {
 		t.Fatal(err)
 	}
-	if len(revoked) != 0 {
-		t.Errorf("a transient fetch failure must NOT revoke, got %v", revoked)
-	}
-	if !a.IsAuthorized(listed) {
+	if !a.IsAuthorized(listed) || !a.IsAuthorizedFingerprint(gossh.FingerprintSHA256(listed)) {
 		t.Error("key should be retained via last-known-good")
 	}
 }
 
-func TestRevokeHookFiresWhenGitHubDropsAKey(t *testing.T) {
+func TestRebuildDropsAKeyGitHubNoLongerServes(t *testing.T) {
 	// The realistic rotation: the user removes a key from their GitHub account;
-	// the next successful fetch returns fewer keys → the dropped key is revoked.
+	// the next successful fetch returns fewer keys → the dropped key leaves.
 	k1, line1 := genKey(t)
 	k2, line2 := genKey(t)
 	var served atomic.Pointer[string]
@@ -273,28 +269,25 @@ func TestRevokeHookFiresWhenGitHubDropsAKey(t *testing.T) {
 	if !a.IsAuthorized(k1) || !a.IsAuthorized(k2) {
 		t.Fatal("both keys should be authorized initially")
 	}
-	var revoked []string
-	a.SetRevokeHook(func(subjects []string) { revoked = append(revoked, subjects...) })
 
 	only1 := line1
 	served.Store(&only1)
 	if err := a.rebuild(); err != nil {
 		t.Fatal(err)
 	}
-	wantFP := gossh.FingerprintSHA256(k2)
-	if len(revoked) != 1 || revoked[0] != wantFP {
-		t.Errorf("revoked = %v, want [%s] (k2 dropped from github)", revoked, wantFP)
+	if !a.IsAuthorized(k1) {
+		t.Error("k1 should still be authorized")
 	}
-	if a.IsAuthorized(k2) {
-		t.Error("k2 should be revoked from the allowlist")
+	if a.IsAuthorized(k2) || a.IsAuthorizedFingerprint(gossh.FingerprintSHA256(k2)) {
+		t.Error("k2 should have left the allowlist (dropped from github)")
 	}
 }
 
-func TestRevokeHookPrefersInMemoryOverStaleDiskCache(t *testing.T) {
+func TestRebuildPrefersInMemoryOverStaleDiskCache(t *testing.T) {
 	// Regression (Codex 1e): when writeCache fails and the disk cache is staler
 	// than the in-memory snapshot, a transient fetch failure must fall back to
 	// the in-memory last-known-good, NOT the stale disk — otherwise it would
-	// falsely shrink the set and revoke a still-valid key.
+	// falsely shrink the set and de-authorize a still-valid key.
 	k1, line1 := genKey(t)
 	k2, line2 := genKey(t)
 
@@ -327,8 +320,6 @@ func TestRevokeHookPrefersInMemoryOverStaleDiskCache(t *testing.T) {
 	if !a.IsAuthorized(k1) || !a.IsAuthorized(k2) {
 		t.Fatal("both keys should be authorized after the successful fetch")
 	}
-	var revoked []string
-	a.SetRevokeHook(func(subjects []string) { revoked = append(revoked, subjects...) })
 
 	// Transient failure: must use the in-memory last-known-good (k1+k2), not the
 	// stale disk cache (k1 only).
@@ -336,10 +327,7 @@ func TestRevokeHookPrefersInMemoryOverStaleDiskCache(t *testing.T) {
 	if err := a.rebuild(); err != nil {
 		t.Fatal(err)
 	}
-	if len(revoked) != 0 {
-		t.Errorf("transient failure with a stale disk cache must NOT revoke, got %v", revoked)
-	}
-	if !a.IsAuthorized(k2) {
+	if !a.IsAuthorized(k2) || !a.IsAuthorizedFingerprint(gossh.FingerprintSHA256(k2)) {
 		t.Error("k2 must be retained via the in-memory snapshot")
 	}
 }

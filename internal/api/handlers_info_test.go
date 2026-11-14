@@ -12,7 +12,7 @@ import (
 )
 
 // TestHandleGetInfo_HTTPSPort verifies GET /api/info reports https_port only
-// when a TLS listener is configured (token mode), and omits it otherwise so a
+// when a TLS listener is configured (mtls mode), and omits it otherwise so a
 // client that predates the field (v0.7.1) decodes a zero value without error.
 func TestHandleGetInfo_HTTPSPort(t *testing.T) {
 	tests := []struct {
@@ -21,7 +21,7 @@ func TestHandleGetInfo_HTTPSPort(t *testing.T) {
 		wantField bool
 		wantValue int
 	}{
-		{name: "token mode reports https_port", httpsPort: 8443, wantField: true, wantValue: 8443},
+		{name: "a TLS listener reports https_port", httpsPort: 8443, wantField: true, wantValue: 8443},
 		{name: "open omits https_port", httpsPort: 0, wantField: false, wantValue: 0},
 	}
 
@@ -63,12 +63,9 @@ func TestHandleGetInfo_HTTPSPort(t *testing.T) {
 }
 
 // TestHandleGetInfo_AuthMode verifies GET /api/info reports auth_mode from
-// the effective config in its WIRE spelling: token mode reports the legacy
-// "secure", because released clients gate their credential bootstrap on that
-// exact string (config.LegacyWireAuthMode) — reporting "token" would make an
-// old client save an entry with no credential. Open and mtls report their
-// canonical names (no pre-rename client can ever read mtls-mode /api/info —
-// it is certificate-gated).
+// the effective config, canonically spelled: open or mtls. This server never
+// reports "secure" or "token" (a 0.9.x token-mode server reported "secure";
+// the clients still normalize that on decode).
 func TestHandleGetInfo_AuthMode(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -77,8 +74,6 @@ func TestHandleGetInfo_AuthMode(t *testing.T) {
 	}{
 		{name: "nil auth reports open", auth: nil, wantMode: config.AuthModeOpen},
 		{name: "open reports open", auth: &config.AuthConfig{Mode: config.AuthModeOpen}, wantMode: config.AuthModeOpen},
-		{name: "token reports legacy secure on the wire", auth: &config.AuthConfig{Mode: config.AuthModeToken}, wantMode: "secure"},
-		{name: "legacy secure config also reports secure on the wire", auth: &config.AuthConfig{Mode: "secure"}, wantMode: "secure"},
 		{name: "mtls reports mtls", auth: &config.AuthConfig{Mode: config.AuthModeMTLS}, wantMode: config.AuthModeMTLS},
 	}
 

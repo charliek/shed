@@ -615,44 +615,36 @@ func TestExecConcurrencyLimit(t *testing.T) {
 	}
 }
 
-// TestExecNeedsControlScope: in token mode exec is a control-scope route, so
-// a credentials token (the host-agent's) is refused before the handler runs.
+// TestExecNeedsControlScope: exec is a control-scope route, so a credentials
+// certificate (the host-agent's) is refused before the handler runs.
 func TestExecNeedsControlScope(t *testing.T) {
-	store := authtoken.NewStore()
-	control, _, err := store.Mint("SHA256:test", authtoken.ScopeControl, authtoken.ClientCLI, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	creds, _, err := store.Mint("SHA256:test", authtoken.ScopeCredentials, authtoken.ClientHostAgent, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fp := testFingerprint("exec")
 	b := &execFakeBackend{shed: runningShed(), exec: func(context.Context, string, backend.ExecOptions) error { return nil }}
-	s := NewServer(b, &config.ServerConfig{Name: "t", Auth: &config.AuthConfig{Mode: config.AuthModeToken}}, "", nil, nil)
-	s.SetTokenStore(store)
+	s := NewServer(b, &config.ServerConfig{Name: "t", Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}}, "", nil, nil)
+	s.SetClientCertAuthorizer(func(got string) bool { return got == fp })
 	router := s.Router()
 
-	do := func(token string) (int, []byte) {
+	do := func(scope string) (int, []byte) {
 		body, _ := json.Marshal(config.ExecRequest{Argv: []string{"true"}})
 		req := httptest.NewRequest(http.MethodPost, "/api/sheds/box/exec", bytes.NewReader(body))
-		if token != "" {
-			req.Header.Set("Authorization", "Bearer "+token)
+		if scope != "" {
+			withClientCert(req, testClientCert(fp, scope, time.Hour))
 		}
 		rr := httptest.NewRecorder()
 		router.ServeHTTP(rr, req)
 		return rr.Code, rr.Body.Bytes()
 	}
-	if code, body := do(creds); code != http.StatusForbidden || apiErrorCode(t, body) != "FORBIDDEN" {
-		t.Errorf("credentials token: %d %s, want 403 FORBIDDEN", code, body)
+	if code, body := do(authtoken.ScopeCredentials); code != http.StatusForbidden || apiErrorCode(t, body) != "FORBIDDEN" {
+		t.Errorf("credentials certificate: %d %s, want 403 FORBIDDEN", code, body)
 	}
 	if code, _ := do(""); code != http.StatusUnauthorized {
-		t.Errorf("no token: %d, want 401", code)
+		t.Errorf("no certificate: %d, want 401", code)
 	}
 	if b.execCalls() != 0 {
 		t.Fatal("exec ran for a refused caller")
 	}
-	if code, _ := do(control); code != http.StatusOK {
-		t.Errorf("control token: %d, want 200", code)
+	if code, _ := do(authtoken.ScopeControl); code != http.StatusOK {
+		t.Errorf("control certificate: %d, want 200", code)
 	}
 }
 

@@ -14,35 +14,9 @@ Two kinds, deliberately separated:
 
 from __future__ import annotations
 
-import json
-import ssl
-import urllib.request
-
 import pytest
 
 import fixtures.devcontrol as devcontrol
-
-
-def _api_info(config: dict) -> dict:
-    """Fetch `/api/info`, choosing scheme/port the same way
-    `devcontrol._wait_reachable` does: an enforced-mode CONFIG (the
-    committed dev-parallel base is `auth.mode: mtls`, run as a token copy
-    under `SHED_DEV_AUTH_MODE=token`) is TLS-only, so read
-    `https_port` off the CONFIG the server was actually started with — never
-    the CLIENT ENTRY, which carries no `http_port` at all once the server
-    enforces token/mtls (see `fixtures/devcontrol.py`'s module docstring)."""
-    ctx = None
-    if devcontrol._config_enforced(config):
-        port = int(config.get("https_port") or 8443)
-        scheme = "https"
-        ctx = ssl._create_unverified_context()
-    else:
-        port = int(config.get("http_port") or 8080)
-        scheme = "http"
-    with urllib.request.urlopen(
-        f"{scheme}://localhost:{port}/api/info", timeout=10, context=ctx
-    ) as resp:
-        return json.loads(resp.read().decode("utf-8"))
 
 
 # --- Hermetic guard tests (no live server) ---------------------------------
@@ -77,7 +51,7 @@ def test_assert_dev_target_accepts_offset_port_dev(monkeypatch):
 
 def test_assert_dev_target_accepts_https_only_dev_entry(monkeypatch):
     """A '-dev' entry with NO `http_port` at all — the real shape an SSH-first
-    `shed server add` now records for an enforced-mode (token/mtls) server,
+    `shed server add` now records for an mtls server,
     per `shed --json server list` (see `fixtures/devcontrol.py`'s module
     docstring and `_ports`'s https_port/endpoint fallback) — is still
     accepted via the `https_port` fallback, not misdiagnosed as malformed."""
@@ -120,32 +94,52 @@ def test_config_ports_safe_rejects_prod_and_nonpositive():
 # --- Live mechanism tests (real dev-server restart) ------------------------
 
 
-@devcontrol.skip_needs_open_mode_dev_server
-@devcontrol.skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
-def test_dev_config_roundtrips_override(vz_server_dev):
+def test_dev_config_roundtrips_override(vz_server_dev, tmp_path):
     """`dev_config` applies an override through a real restart and restores.
 
     Overrides the server's reported `name` (a cosmetic field surfaced by
     /api/info, with no effect on the CLI entry which resolves by
-    host:port) so the change is observable and harmless.
+    host:port) so the change is observable and harmless. The dev server is
+    mtls throughout, so every read presents a freshly enrolled certificate
+    (`devcontrol.api_info`) — which is also what `dev_config` itself waits on.
     """
     server = vz_server_dev.name
-    # The override below only changes `name`; ports/mode are unchanged from
-    # the committed base, so the same resolved config is valid for all three
-    # fetches (before, during, and after the override).
     base_config = devcontrol._merge_config({})
 
-    base_name = _api_info(base_config)["name"]
+    base_name = devcontrol.api_info(server, base_config, tmp_path / "before")["name"]
     sentinel = "harness-selfcheck-name"
     assert base_name != sentinel
 
     with devcontrol.dev_config({"name": sentinel}, server):
-        assert _api_info(base_config)["name"] == sentinel
+        assert devcontrol.api_info(server, devcontrol._merge_config({"name": sentinel}), tmp_path / "during")["name"] == sentinel
 
     # Restored to the committed base config.
-    assert _api_info(base_config)["name"] == base_name
+    assert devcontrol.api_info(server, base_config, tmp_path / "after")["name"] == base_name
+
+
+@pytest.mark.vz
+@pytest.mark.slow
+def test_dev_config_runs_open_mode_on_loopback(vz_server_dev, tmp_path):
+    """`dev_config` can run the dev server as an open server on loopback —
+    the one other mode shed-server has — and returns it to mtls.
+
+    In open mode `/api/info` answers plain HTTP with no credential and
+    reports `open`; back on the base it reports `mtls`, and only to a
+    request that presents a certificate."""
+    server = vz_server_dev.name
+    open_config = devcontrol._merge_config(devcontrol.OPEN_MODE_OVERRIDES)
+    assert open_config.get("bind_address") in (None, "", "127.0.0.1", "localhost"), (
+        "the committed base must keep the dev server on loopback for open mode to load"
+    )
+
+    with devcontrol.dev_config(devcontrol.OPEN_MODE_OVERRIDES, server):
+        info = devcontrol.api_info(server, open_config, tmp_path / "open")
+        assert info.get("auth_mode") == "open", f"open-mode /api/info: {info!r}"
+
+    info = devcontrol.api_info(server, devcontrol._merge_config({}), tmp_path / "mtls")
+    assert info.get("auth_mode") == "mtls", f"restored /api/info: {info!r}"
 
 
 @pytest.mark.vz

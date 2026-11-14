@@ -2,18 +2,21 @@
 
 The `LocalServer` / `RemoteServer` fixtures (`server.py`) drive a
 *running, static-config* shed-server via `shed -s <name>`. Several
-auth/transport phases need more than that:
+auth/transport tests need more than that:
 
   - Set a server config, restart the dev server, assert the new
-    behavior, then restore (Phase 1 bind config, Phase 2 `auth.ssh`
-    mode, Phase 4 token, Phase 5 TLS).
-  - Assert the server *refuses to start* with an incomplete public
-    bundle (Phase 6 preflight) — a shape the running-server fixtures
-    cannot express at all.
+    behavior, then restore (bind config, `auth.ssh` mode, TLS names,
+    open mode on loopback).
+  - Assert the server *refuses to start* with a given config (removed
+    keys and modes, a wide-open bind) — a shape the running-server
+    fixtures cannot express at all.
+  - Obtain a client certificate of a chosen scope over the `_bootstrap`
+    SSH channel, the way every client enrols, to drive the HTTPS API
+    directly.
 
-This module adds three primitives, all **hard-scoped to the `*-dev`
-servers on offset ports** so an autonomous run can never touch
-production. There are two independent safety gates:
+Every primitive is **hard-scoped to the `*-dev` servers on offset ports** so
+an autonomous run can never touch production. There are two independent
+safety gates:
 
   - `assert_dev_target(name)`  — the restart *target* must be a `*-dev`
     entry on offset ports (never the brew/deb production `8080/2222`).
@@ -21,98 +24,86 @@ production. There are two independent safety gates:
     with must not name the production ports either, so a stray override
     like `{"http_port": 8080}` can't bind prod even if prod is down.
 
-The mutation primitives:
+The primitives:
 
   - `dev_config(overrides, server)` — context manager: write a temp
     config merged from the committed dev-parallel base, restart the VZ
-    dev server against it, yield, then **always** restore the base
-    config (pinned explicitly). Never edits the committed
-    `configs/server.dev-parallel.*.yaml`.
+    dev server against it, wait until it is ready, yield, then **always**
+    restore the base config (pinned explicitly) and wait for that too.
+    Never edits the committed `configs/server.dev-parallel.*.yaml`.
   - `run_preflight(overrides)` — launch `bin/shed-server serve` as a
     throwaway subprocess against a merged temp config, with a timeout,
     and return a `PreflightResult` so a test can assert a non-zero exit
     + stderr (expected-startup-failure).
+  - `bootstrap_cert(server, scope, directory)` — a fresh P-256 key and
+    CSR, sent over `_bootstrap` exactly as `shed server add` does; returns
+    the issued certificate, its key and the server's TLS pin.
+  - `api_info(server, config, directory)` — `GET /api/info` from the dev
+    server as the config it was started with serves it: plain HTTP in
+    open mode, and in mtls mode over the pinned HTTPS listener with a
+    freshly bootstrapped certificate.
 
 Temp configs live under `~/.shed/dev/`, never the committed configs.
 
-FC (remote) config mutation is intentionally out of scope here: per the
-plan, config-mutation integration is VZ-only, with FC covered by Go unit
-tests plus a manual pass.
+FC (remote) config mutation is intentionally out of scope here: config
+mutation integration is VZ-only, with FC covered by Go unit tests plus a
+manual pass. `bootstrap_cert` reaches either dev server.
 
-**Auth-mode awareness.** This module (plus `test_mtls.py`) is what a
-config-mutating test actually calls, so it is also the single source of
-truth for `SHED_DEV_AUTH_MODE` detection (`DEV_AUTH_MODE` below) — the
-exact mechanism `test_mtls.py`'s module docstring documents (env var, never
-an unauthenticated `/api/info` probe, which is unreachable once a server is
-actually in mtls). Both parallel dev servers run the committed
-`configs/server.dev-parallel.*.yaml`, which are `auth.mode: mtls`, and that
-is the default. `SHED_DEV_AUTH_MODE=token` (Mac only) runs a rendered
-token-mode copy instead, for the bearer-token tests that remain until the
-server's token mode is removed; the knob goes with them. Two ready-made
-`pytest.mark.skipif` marks are exported for tests that structurally cannot
-run against an mtls dev server, expressing the two distinct reasons a test
-in this suite runs into that wall:
+**Auth modes.** shed-server has two: `mtls`, which both committed dev
+configs run, and `open`, which binds loopback only. `token`/`secure` and
+`allow_insecure_exposure` fail config load. So the dev server is always
+mtls unless a test asks `dev_config()` for `{"auth": {"mode": "open"}}`,
+which on the Mac dev server (loopback) is a valid scenario: a plain-HTTP
+listener with no client authentication.
 
-  - `skip_mtls_reconfigure` — the test calls `dev_config()` to set up a
-    token-mode or open-mode scenario (TLS pinning, SSH allowlist mechanics,
-    the `dev_config()` round-trip itself). `dev_config()` confirms each
-    restart by reading `/api/info`, which an mtls listener refuses without
-    a client certificate, so it cannot confirm the restore to the mtls base
-    and refuses to start (see the guard at the top of `dev_config()`).
-  - `skip_mtls_token_semantics` — the test's actual assertions are about
-    bearer-credential semantics (scoped HTTP tokens, TTL expiry,
-    allowlist-gated minting, the open-mode single-plain-listener shape)
-    that don't exist under mtls at all: the mtls client authenticates with
-    a short-lived certificate, never a bearer token (see
-    `internal/servertls/ca.go`, `internal/config/server.go`).
-
-Both marks skip under the default (`mtls`) and are inert under
-`SHED_DEV_AUTH_MODE=token` — see `docs/development/testing.md` and
-`tests/integration/README.md`.
-
-**Pre-existing, mode-independent gap: no open-mode dev server exists at
-all.** A third, unconditional mark — `skip_needs_open_mode_dev_server` — is
-exported for a handful of tests whose scenario needs the dev server in
-`auth.mode: open` (an unauthenticated plain-HTTP listener), a posture the
-committed `configs/server.dev-parallel.mac.yaml` base config has not had
-since it moved to an enforced auth mode; there is no plain-HTTP listener in
-either `token` or `mtls` mode today. This is unrelated to mtls and predates
-it (verified via git blame) — these tests only ever passed on a developer
-machine whose `~/.shed/config.yaml` still carried a legacy `http_port` on
-the dev entry from before `shed server add` went SSH-first; re-adding the
-dev server with the current CLI (which records only `api_url`/`https_port`)
-exposes the gap. See the mark's `reason=` for the intended fix.
+**Readiness.** `dev_config()` waits on two things after each restart.
+First `scripts/dev-server-probe.sh`, the same probe `make dev-server-up`
+polls: the readiness line in this run's log, the process alive, every
+logged listener accepting a TCP connection, and no listener error a
+moment later. It needs no credential, so it works in every mode. Then one
+real API request (`api_info`), so a server that listens but cannot serve
+fails here: plain HTTP in open mode, and in mtls mode a request that
+presents a certificate the server issued over `_bootstrap` a moment
+earlier (an mtls listener refuses a request without one, by design).
 """
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import os
 import signal
 import ssl
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
+from urllib.parse import urlparse
 
 import pytest
 import yaml
 
 from .server import resolve_server_entry
+from .tlsclient import pinned_request
 
 # fixtures/ -> integration/ -> tests/ -> repo root
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEV_BASE_CONFIG = REPO_ROOT / "configs" / "server.dev-parallel.mac.yaml"
 SHED_SERVER_BIN = REPO_ROOT / "bin" / "shed-server"
+PROBE_SCRIPT = REPO_ROOT / "scripts" / "dev-server-probe.sh"
 DEV_SCRATCH_DIR = Path.home() / ".shed" / "dev"
 DEV_CONFIG_TMP = DEV_SCRATCH_DIR / "test-dev-config.yaml"
 PREFLIGHT_CONFIG_TMP = DEV_SCRATCH_DIR / "test-preflight-config.yaml"
+# The Mac dev server's log and pid file (the Makefile's DEV_LOG_PATH and
+# DEV_PID_PATH); dev-server-up empties the log before each launch.
+DEV_LOG_PATH = DEV_SCRATCH_DIR / "server.log"
+DEV_PID_PATH = DEV_SCRATCH_DIR / "server.pid"
 # The pinned known_hosts the CLI bootstrap reads (config.GetKnownHostsPath()).
 KNOWN_HOSTS_PATH = Path.home() / ".shed" / "known_hosts"
 
@@ -122,80 +113,11 @@ KNOWN_HOSTS_PATH = Path.home() / ".shed" / "known_hosts"
 PROD_HTTP_PORT = 8080
 PROD_SSH_PORT = 2222
 
-# ----------------------------------------------------------------------------
-# Auth-mode detection (single source of truth — see the module docstring's
-# "Auth-mode awareness" section). Matches test_mtls.py's own module-level
-# read of the same env var exactly; both must agree on what "mtls mode" means.
-# ----------------------------------------------------------------------------
-
-# The committed dev configs are mtls, so that is the default; `token` is the
-# Mac-only escape hatch for the remaining bearer-token tests.
-DEFAULT_DEV_AUTH_MODE = "mtls"
-
-
-def dev_auth_mode(env: Optional[dict] = None) -> str:
-    """The parallel dev server's auth mode, as `SHED_DEV_AUTH_MODE` names it
-    (the Makefile forwards the value it started the server with)."""
-    env = os.environ if env is None else env
-    return env.get("SHED_DEV_AUTH_MODE") or DEFAULT_DEV_AUTH_MODE
-
-
-DEV_AUTH_MODE = dev_auth_mode()
-
-_MTLS_RECONFIGURE_REASON = (
-    f"SHED_DEV_AUTH_MODE={DEV_AUTH_MODE!r}: this test calls dev_config() to "
-    "restart the dev server into a token-mode or open-mode scenario. "
-    "dev_config() confirms each restart by reading /api/info, which an mtls "
-    "listener refuses without a client certificate, so it cannot confirm the "
-    "restore to the committed mtls base. Run this test with "
-    "SHED_DEV_AUTH_MODE=token (make dev-server-restart SHED_DEV_AUTH_MODE=token, "
-    "then SHED_DEV_AUTH_MODE=token make test-integration-dev)."
-)
-
-skip_mtls_reconfigure = pytest.mark.skipif(
-    DEV_AUTH_MODE == "mtls", reason=_MTLS_RECONFIGURE_REASON
-)
-
-_MTLS_TOKEN_SEMANTICS_REASON = (
-    f"SHED_DEV_AUTH_MODE={DEV_AUTH_MODE!r}: this test asserts bearer-token/"
-    "token-mode semantics (scoped HTTP tokens, TTL expiry, allowlist-gated "
-    "minting, the open-mode single-plain-listener shape, ...) that do not "
-    "hold under mtls — the mtls client authenticates with a short-lived "
-    "certificate, never a bearer token (see internal/servertls/ca.go, "
-    "internal/config/server.go). Run this test only with "
-    "SHED_DEV_AUTH_MODE=token (not the default)."
-)
-
-skip_mtls_token_semantics = pytest.mark.skipif(
-    DEV_AUTH_MODE == "mtls", reason=_MTLS_TOKEN_SEMANTICS_REASON
-)
-
-# ----------------------------------------------------------------------------
-# Pre-existing, mode-independent gap (see the module docstring's "Pre-existing,
-# mode-independent gap" section): unlike the two marks above, this one is NOT
-# conditioned on SHED_DEV_AUTH_MODE — it fires in both token and mtls mode,
-# because neither mode provides what these tests need.
-# ----------------------------------------------------------------------------
-
-_NEEDS_OPEN_MODE_DEV_SERVER_REASON = (
-    "needs an open-mode dev server (auth.mode: open, an unauthenticated "
-    "plain-HTTP listener) to exercise its scenario, but the committed base "
-    "config (configs/server.dev-parallel.mac.yaml) has not run open mode "
-    "since it moved to an enforced auth mode -- there is no plain-HTTP "
-    "listener in either token or mtls mode today. This is pre-existing "
-    "(verified via git blame) and unrelated to the mtls work; the test only "
-    "ever passed on a developer machine whose ~/.shed/config.yaml still "
-    "carried a legacy http_port on the dev entry from an old 'shed server "
-    "add', which the current SSH-first CLI no longer writes. The fix "
-    "(follow-up, not done here): drive dev_config() with an explicit "
-    "{'auth': {'mode': 'open'}} override so the open-mode scenario this "
-    "test needs actually exists, instead of assuming the base config "
-    "provides it."
-)
-
-skip_needs_open_mode_dev_server = pytest.mark.skip(
-    reason=_NEEDS_OPEN_MODE_DEV_SERVER_REASON
-)
+# The override that turns the Mac dev server into an open-mode server: the
+# committed base binds loopback, keeps http_port 18080 for exactly this, and
+# its https_port must go (an open server serves plain HTTP only). The base's
+# auth.ssh key sources stay: an open server simply does not enforce them.
+OPEN_MODE_OVERRIDES = {"https_port": 0, "auth": {"mode": "open"}}
 
 
 @dataclass
@@ -217,16 +139,35 @@ class PreflightResult:
         return self.returncode is None
 
 
+@dataclass
+class BootstrapCert:
+    """A client certificate issued over `_bootstrap`, on disk.
+
+    `pin` is the server's TLS certificate fingerprint (`sha256:<hex>`) as the
+    bundle reported it; `https_port` the port the bundle named.
+    """
+
+    cert_path: Path
+    key_path: Path
+    pin: str
+    https_port: int
+    scope: str
+    bundle: dict
+
+    @property
+    def pair(self) -> tuple[str, str]:
+        return str(self.cert_path), str(self.key_path)
+
+
 def _ports(d: dict) -> tuple[int, int]:
     """Extract (http_port, ssh_port) from a config/entry dict, defaulting
     missing/blank values to 0 (which the safety checks treat as invalid).
 
-    A CLIENT ENTRY for an enforced-mode server (auth.mode token or mtls) has
-    no `http_port` at all: those modes run no plain-HTTP listener, so
-    SSH-first `shed server add` records only `api_url`. The port that
-    matters for the safety checks — "this is not the production server" — is
-    then the one in `api_url`, so fall back to it. Server CONFIG dicts still
-    carry `http_port` and are unaffected.
+    A CLIENT ENTRY for an mtls server has no `http_port` at all: mtls runs no
+    plain-HTTP listener, so SSH-first `shed server add` records only
+    `api_url`. The port that matters for the safety checks — "this is not the
+    production server" — is then the one in `api_url`, so fall back to it.
+    Server CONFIG dicts still carry `http_port` and are unaffected.
     """
     http_port = int(d.get("http_port", 0) or 0)
     if http_port <= 0:
@@ -245,7 +186,7 @@ def _ports(d: dict) -> tuple[int, int]:
 def assert_dev_target(name: str) -> dict:
     """Raise unless `name` is a parallel-dev server safe to reconfigure.
 
-    The executable form of the plan's safety discipline: every
+    The executable form of the suite's safety discipline: every
     config-mutating / restarting primitive calls it first, so an
     autonomous run physically cannot point a restart at the brew/deb
     production server. It *raises* (RuntimeError) rather than skips — a
@@ -284,20 +225,19 @@ def assert_dev_target(name: str) -> dict:
     return entry
 
 
+def config_auth_mode(config: dict) -> str:
+    """A SERVER CONFIG dict's effective `auth.mode`: `open` when unset, else
+    the value as written (`mtls`; anything else does not load)."""
+    return str((config.get("auth") or {}).get("mode") or "open")
+
+
 def _config_enforced(config: dict) -> bool:
-    """Whether a SERVER CONFIG dict's `auth.mode` enforces token/mtls (no
-    plain-HTTP listener) — the Python mirror of the Go loader's
-    `AuthEnforced()` predicate (`internal/config/server.go`): true for
-    `"token"`, `"mtls"`, and the deprecated `"secure"` alias; false for
-    unset/`""`/`"open"`. `SHED_DEV_AUTH_MODE` only ever selects `token` or
-    `mtls` (see the Makefile), so in practice this is always True for the
-    committed dev-parallel base config — there is no "open" dev server to
-    fall back to today, but the branch is kept so a hand-built override
-    that explicitly sets `auth.mode: open` (or a future default change)
-    is still handled correctly rather than assumed away.
-    """
-    mode = str((config.get("auth") or {}).get("mode") or "")
-    return mode not in ("", "open")
+    """Whether a SERVER CONFIG dict runs an enforced mode (no plain-HTTP
+    listener) — the Python mirror of the Go loader's `AuthEnforced()`
+    predicate (`internal/config/server.go`), which is true for `mtls` only.
+    Any value but `open` counts here, so an override naming a mode the
+    server refuses is never mistaken for an open server."""
+    return config_auth_mode(config) != "open"
 
 
 def _assert_config_ports_safe(config: dict) -> None:
@@ -326,8 +266,8 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
     """Recursively merge `overrides` onto a deep copy of `base`.
 
     Dict values merge key-by-key; every other value (scalars, lists)
-    replaces wholesale. Nested merge is needed so a later phase can
-    override just `auth.ssh.mode` or `vz.default_image` without clobbering
+    replaces wholesale. Nested merge is needed so a test can override
+    just `auth.ssh.mode` or `vz.default_image` without clobbering
     sibling keys in the committed base config.
     """
     out = copy.deepcopy(base)
@@ -346,15 +286,6 @@ def _merge_config(overrides: dict) -> dict:
     return _deep_merge(base, overrides or {})
 
 
-def running_base_config(auth_mode: Optional[str] = None) -> dict:
-    """The config the dev server runs when no test has reconfigured it: the
-    committed base, with `auth.mode` flipped to token under
-    `SHED_DEV_AUTH_MODE=token` (what `scripts/render-dev-config.sh --token`
-    renders)."""
-    mode = DEV_AUTH_MODE if auth_mode is None else auth_mode
-    return _merge_config({"auth": {"mode": "token"}} if mode == "token" else {})
-
-
 def _write_config(config: dict, path: Path) -> Path:
     """Write `config` to `path` under `~/.shed/dev/` (never the committed
     base config)."""
@@ -364,28 +295,16 @@ def _write_config(config: dict, path: Path) -> Path:
     return path
 
 
-def _restart_argv(dev_config: Path, auth_mode: str) -> list[str]:
+def _restart_argv(dev_config: Path) -> list[str]:
     """The `make` command `_make_restart` runs (split out so the unit tests
     can pin it without a server)."""
-    return [
-        "make", "dev-server-restart",
-        f"DEV_CONFIG={dev_config}",
-        f"SHED_DEV_AUTH_MODE={auth_mode}",
-    ]
+    return ["make", "dev-server-restart", f"DEV_CONFIG={dev_config}"]
 
 
-def _make_restart(dev_config: Path, auth_mode: str) -> None:
-    """`make dev-server-restart DEV_CONFIG=<path> SHED_DEV_AUTH_MODE=<mode>`
-    — always with an explicit config and mode, so the restart never
-    inherits a stale/foreign value from a parent `make`/`MAKEFLAGS` or the
-    environment.
-
-    `auth_mode` is what the Makefile does with the config: `mtls` runs it
-    as written (its own `auth:` block, whatever mode that names); `token`
-    renders a copy with `auth.mode: mtls` flipped to token first
-    (`scripts/render-dev-config.sh --token`). A reconfigured config passes
-    `mtls` so its override is never rewritten; the restore passes the
-    run's own `DEV_AUTH_MODE` so the server returns to what it was.
+def _make_restart(dev_config: Path) -> None:
+    """`make dev-server-restart DEV_CONFIG=<path>` — always with an explicit
+    config, so the restart never inherits a stale/foreign value from a parent
+    `make`/`MAKEFLAGS`. The config runs as written (its own `auth:` block).
 
     Command-line variable assignments win over the Makefile's `:=`/`?=`
     defaults. `dev-server-down` keys off the PID file, so it stops whatever
@@ -394,7 +313,7 @@ def _make_restart(dev_config: Path, auth_mode: str) -> None:
     the VM/server spin-up dominates the latency, so it's left as-is.)
     """
     r = subprocess.run(
-        _restart_argv(dev_config, auth_mode),
+        _restart_argv(dev_config),
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
     )
     if r.returncode != 0:
@@ -404,62 +323,161 @@ def _make_restart(dev_config: Path, auth_mode: str) -> None:
         )
 
 
-def _wait_reachable(server: str, timeout: float, *, config: dict) -> None:
-    """Poll the server's bootstrap `/api/info` endpoint until it answers.
+def _probe_once(log: Path, pid_path: Path) -> tuple[int, str]:
+    """One run of `scripts/dev-server-probe.sh` against the dev server's log
+    and pid file: (exit status, its one-line verdict, or its stderr when it
+    printed no verdict). 0 ready, 1 not yet, 2 failed; anything else is a
+    broken probe."""
+    try:
+        pid = pid_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        pid = ""
+    r = subprocess.run(
+        ["bash", str(PROBE_SCRIPT), str(log), pid],
+        capture_output=True, text=True, timeout=60,
+    )
+    return r.returncode, r.stdout.strip() or r.stderr.strip()
 
-    `/api/info` is unauthenticated (bootstrap-exempt) in both open and
-    enforced-token mode, so this readiness check works even when the server
-    is restarted with auth enforcement on — unlike a `shed list` probe, a
-    control-plane call that would need a credential.  `make
-    dev-server-restart` returns as soon as it has launched the process, so
-    the caller must wait for actual readiness here.
 
-    `config` is the SERVER CONFIG dict the restart was just launched with —
-    the merged overrides `dev_config()` wrote to disk, or the committed base
-    (`_merge_config({})`) on the restore path — NOT the client entry. The
-    config is the authority for which ports the server actually binds (see
-    the module docstring and `_ports`): an enforced-mode CLIENT ENTRY may
-    carry no `http_port` at all (SSH-first `shed server add` only records
-    `https_port`/`api_url` for those), so deriving the port from the entry
-    the way this used to work breaks unconditionally once the dev server
-    (or its restored base) runs in an enforced mode — which, per
-    `SHED_DEV_AUTH_MODE` (Makefile: only `token` or `mtls`), it always does
-    today.
+def _wait_probe(timeout: float, *, log: Path = DEV_LOG_PATH, pid_path: Path = DEV_PID_PATH) -> str:
+    """Poll the readiness probe until it says ready; raise when it says the
+    server failed or the deadline passes. Mode-independent: the probe only
+    reads the log and opens TCP connections. Only status 1 means "not yet":
+    any status the probe does not define (64 for arguments it refuses, 127
+    for a missing script) raises at once as a broken check, never as a slow
+    start."""
+    deadline = time.monotonic() + timeout
+    rc, verdict = _probe_once(log, pid_path)
+    while rc == 1 and time.monotonic() < deadline:
+        time.sleep(0.5)
+        rc, verdict = _probe_once(log, pid_path)
+    if rc == 0:
+        return verdict
+    try:
+        tail = "".join(log.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)[-20:])
+    except OSError:
+        tail = ""
+    if rc == 1:
+        why = f"not ready within {timeout:.0f}s"
+    elif rc == 2:
+        why = "failed"
+    else:
+        why = f"failed: the probe exited with unexpected status {rc}"
+    raise AssertionError(f"dev server not ready ({why}): {verdict}; last lines of {log}:\n{tail}")
 
-    When `config`'s `auth.mode` enforces token/mtls (`_config_enforced`),
-    the server serves NO plain-HTTP listener (TLS-only), so the probe
-    targets `https://<host>:<https_port>/api/info` with an unverified
-    context — this only needs a 200 from a bootstrap-exempt endpoint, and
-    the real tests pin the cert for their actual assertions. This function
-    must never be pointed at an mtls-mode config from this module:
-    `dev_config()` already refuses to reconfigure into (or restore under)
-    mtls (see its own guard below), and a bare TLS handshake with no client
-    certificate fails at the transport layer under mtls BY DESIGN — it can
-    never be used as a health signal there (see `test_mtls.py`'s module
-    docstring, `_wait_tcp_open` for that mode's equivalent instead).
+
+def bootstrap_cert(
+    server: str,
+    scope: str,
+    directory: Path,
+    client_kind: str = "cli",
+    *,
+    timeout: float = 25.0,
+) -> BootstrapCert:
+    """Enrol a client certificate of `scope` over the reserved `_bootstrap`
+    SSH channel, exactly as `shed server add` does (sdk/bootstrap): a fresh
+    P-256 key and a CSR for it, then `ssh -T _bootstrap@host` against the
+    pinned known_hosts (BatchMode, strict) running
+    "<scope> <client_kind> csr=<base64 DER>", and the JSON bundle parsed for
+    its `client_cert` and `tls_cert_fingerprint`. The key, CSR and
+    certificate are written under `directory` (a pytest tmp_path).
+
+    Dev-only — `assert_dev_target` gates the target so this can only ever
+    reach a `*-dev` server on offset ports. The local SSH key (the default
+    identity, or the agent's) must be in the server's allowlist, as it is for
+    every enrolled dev entry; the server must be mtls (an open server answers
+    every bootstrap with its refusal). Needs the `openssl` CLI.
     """
+    entry = assert_dev_target(server)
+    host = entry.get("host", "localhost")
+    ssh_port = int(entry["ssh_port"])
+    directory.mkdir(parents=True, exist_ok=True)
+    key_path = directory / f"{scope}.key"
+    csr_path = directory / f"{scope}.csr.der"
+    cert_path = directory / f"{scope}.pem"
+    for argv in (
+        ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(key_path)],
+        ["openssl", "req", "-new", "-key", str(key_path), "-subj", "/CN=itest",
+         "-outform", "DER", "-out", str(csr_path)],
+    ):
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise AssertionError(f"{argv[0]} {argv[1]} failed: {r.stderr[-500:]!r}")
+    key_path.chmod(0o600)
+    csr = base64.b64encode(csr_path.read_bytes()).decode("ascii")
+    args = [
+        "ssh", "-T", "-p", str(ssh_port),
+        "-o", "BatchMode=yes",
+        "-o", f"UserKnownHostsFile={KNOWN_HOSTS_PATH}",
+        "-o", "StrictHostKeyChecking=yes",
+        f"_bootstrap@{host}", scope, client_kind, f"csr={csr}",
+    ]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise AssertionError(
+            f"bootstrap (scope={scope!r}) failed (exit {r.returncode}): "
+            f"stderr={r.stderr[-1000:]!r}"
+        )
+    try:
+        bundle = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        raise AssertionError(f"bootstrap returned invalid JSON: {e}; stdout={r.stdout[-500:]!r}")
+    assert bundle.get("auth_mode") == "mtls", f"bootstrap (scope={scope!r}) is not an mtls bundle: {bundle!r}"
+    pem = bundle.get("client_cert", "")
+    pin = bundle.get("tls_cert_fingerprint", "")
+    assert pem and pin, f"bootstrap (scope={scope!r}) returned no certificate or pin: {bundle!r}"
+    cert_path.write_text(pem, encoding="utf-8")
+    return BootstrapCert(
+        cert_path=cert_path, key_path=key_path, pin=pin,
+        https_port=int(bundle.get("https_port") or 0), scope=scope, bundle=bundle,
+    )
+
+
+def api_info(server: str, config: dict, directory: Path) -> dict:
+    """`GET /api/info` from the dev server, as `config` (the SERVER CONFIG it
+    was started with) serves it — never derived from the CLIENT ENTRY, which
+    names only the mtls endpoint.
+
+    Open mode: plain HTTP on `http_port`. mtls: the pinned HTTPS listener on
+    `https_port`, presenting a control certificate bootstrapped into
+    `directory` a moment earlier (an mtls listener refuses a request without
+    one, at the TLS layer)."""
     entry = resolve_server_entry(server)
     if entry is None:
         raise AssertionError(f"dev server {server!r} not registered in ~/.shed/config.yaml")
     host = entry.get("host", "localhost")
-    ctx = None
-    if _config_enforced(config):
-        port = int(config.get("https_port") or 8443)  # enforced mode defaults https_port to 8443
-        url = f"https://{host}:{port}/api/info"
-        ctx = ssl._create_unverified_context()
-    else:
+    if not _config_enforced(config):
         port = int(config.get("http_port") or 8080)
-        url = f"http://{host}:{port}/api/info"
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/info", timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    cert = bootstrap_cert(server, "control", directory)
+    port = int(config.get("https_port") or cert.https_port or 8443)
+    status, body = pinned_request(host, port, "/api/info", cert.pin, cert.pair)
+    if status != 200:
+        raise AssertionError(f"GET /api/info over mtls: status {status}, body {body!r}")
+    return body or {}
+
+
+def _wait_ready(server: str, timeout: float, *, config: dict) -> None:
+    """Wait until the restarted dev server is serving `config`.
+
+    `make dev-server-restart` has already polled the probe for 15 s, but it
+    only warns when that runs out, so poll it again here up to `timeout`
+    (it fails at once on a server that died). Then one real `GET /api/info`
+    in the config's own mode (`api_info`), retried briefly, so a server that
+    accepts connections but cannot serve them fails here and not in the
+    test."""
+    _wait_probe(timeout)
+    deadline = time.monotonic() + 30
+    while True:
         try:
-            with urllib.request.urlopen(url, timeout=5, context=ctx) as resp:
-                if resp.status == 200:
-                    return
-        except (urllib.error.URLError, OSError):
-            pass
-        time.sleep(0.5)
-    raise AssertionError(f"dev server {server!r} not reachable within {timeout:.0f}s (url={url})")
+            with tempfile.TemporaryDirectory() as scratch:
+                api_info(server, config, Path(scratch))
+            return
+        except (AssertionError, urllib.error.URLError, OSError, ssl.SSLError) as e:
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"dev server {server!r} is listening but did not serve /api/info: {e}")
+            time.sleep(1)
 
 
 @contextmanager
@@ -471,58 +489,34 @@ def dev_config(
 ) -> Iterator[str]:
     """Run the VZ dev server with `overrides` merged onto its base config.
 
-    Restarts the dev server against a temp config, waits for it to come
-    back up, yields the server name, then **always** restores the base
-    config on exit (pinned explicitly, even if the test body raises).
-    Never edits the committed dev-parallel config.
+    Restarts the dev server against a temp config, waits for it to be
+    ready (`_wait_ready`), yields the server name, then **always** restores
+    the committed base config on exit (pinned explicitly, even if the test
+    body raises) and waits for that too. Never edits the committed
+    dev-parallel config.
 
     Guarded by `assert_dev_target` (the target) and
     `_assert_config_ports_safe` (the merged config's ports), so it can
     only ever restart a `*-dev` server on offset ports. Pass `server`
-    from the `vz_server_dev` fixture's `.name`.
-
-    Raises (does not skip) when `SHED_DEV_AUTH_MODE` is `mtls` (the
-    default): the restore to the committed mtls base cannot be confirmed,
-    because `_wait_reachable` reads `/api/info` and an mtls listener refuses
-    that without a client certificate. This is a defense-in-depth rail, not
-    the primary mechanism — callers should prefer skipping up front via
-    `skip_mtls_reconfigure` (see the module docstring) so a test never even
-    attempts the restart under mtls. This guard exists for any caller that
-    doesn't.
+    from the `vz_server_dev` fixture's `.name`. Works whatever mode the
+    override names: the base is mtls, and `OPEN_MODE_OVERRIDES` gives an
+    open server on loopback.
     """
-    if DEV_AUTH_MODE != "token":
-        raise RuntimeError(
-            f"refusing to reconfigure {server!r}: SHED_DEV_AUTH_MODE="
-            f"{DEV_AUTH_MODE!r} means the dev server runs the committed mtls "
-            f"base {DEV_BASE_CONFIG}, and dev_config() cannot confirm a restore "
-            f"to it (its /api/info readiness probe needs a client certificate "
-            f"under mtls); tests that reconfigure the dev server run only with "
-            f"SHED_DEV_AUTH_MODE=token "
-            f"(see fixtures.devcontrol.skip_mtls_reconfigure)"
-        )
     assert_dev_target(server)
-    # Merge onto what the server runs now (the token copy, here), so an
-    # override that names no auth.mode keeps the run's mode.
-    merged = _deep_merge(running_base_config(), overrides or {})
+    merged = _merge_config(overrides or {})
     _assert_config_ports_safe(merged)
     temp = _write_config(merged, DEV_CONFIG_TMP)
     try:
-        # `mtls` = run the merged config as written (see _make_restart).
-        _make_restart(temp, "mtls")
+        _make_restart(temp)
         # The merged config (not the client entry) says which ports/mode the
-        # restart just bound — see `_wait_reachable`'s docstring for why the
-        # entry can't be used here.
-        _wait_reachable(server, ready_timeout, config=merged)
+        # restart just bound.
+        _wait_ready(server, ready_timeout, config=merged)
         yield server
     finally:
         try:
-            # Restore, base config pinned, in the mode the run started with.
-            _make_restart(DEV_BASE_CONFIG, DEV_AUTH_MODE)
-            # The restored server runs the committed base as the Makefile
-            # renders it for DEV_AUTH_MODE (token here: the guard above), an
-            # enforced mode, so re-derive its ports/mode from that config
-            # rather than falling back to a plain-HTTP probe.
-            _wait_reachable(server, ready_timeout, config=running_base_config())
+            # Restore, base config pinned.
+            _make_restart(DEV_BASE_CONFIG)
+            _wait_ready(server, ready_timeout, config=_merge_config({}))
         finally:
             try:
                 temp.unlink()
@@ -546,10 +540,9 @@ def _terminate(proc: subprocess.Popen) -> None:
 def run_preflight(overrides: dict, *, timeout: float = 20.0) -> PreflightResult:
     """Launch `bin/shed-server serve` against a temp config and capture it.
 
-    The primitive Phase 6's public-exposure preflight needs: start the
-    server with a given config and observe whether it *refuses to start*
-    (non-zero exit + a diagnostic on stderr) rather than binding. Runs in
-    its own process group so a server that DID come up can be killed
+    Start the server with a given config and observe whether it *refuses to
+    start* (non-zero exit + a diagnostic on stderr) rather than binding. Runs
+    in its own process group so a server that DID come up can be killed
     cleanly on timeout, and the merged config's ports are validated so a
     throwaway server can never bind a production port.
     """
@@ -590,37 +583,35 @@ def run_preflight(overrides: dict, *, timeout: float = 20.0) -> PreflightResult:
             pass
 
 
-def bootstrap_mint(server: str, scope: str, client_kind: str = "cli", *, timeout: float = 25.0) -> str:
-    """Mint a scoped HTTP token over the reserved `_bootstrap` SSH channel,
-    exactly as `shed server add` does (cmd/shed/bootstrap.go): `ssh -T` as
-    `_bootstrap@host` against the pinned known_hosts (BatchMode, strict), run
-    "<scope> <client_kind>", and parse the JSON bundle for its `token`.
+# The identity copied into a throwaway $HOME by `isolated_home_with_identity`.
+# It must already be allowlisted by the dev server's `auth.ssh` (today
+# `github_users` in both committed configs/server.dev-parallel.*.yaml); nothing
+# here sets that allowlisting up.
+_REAL_SSH_DIR = Path.home() / ".ssh"
+_DEFAULT_IDENTITY = "id_ed25519"
 
-    Dev-only — `assert_dev_target` gates the target so this can only ever reach a
-    `*-dev` server on offset ports. The local SSH key (default identity) must be
-    in the server's allowlist for the mint to succeed; the server must be in
-    `auth.mode: secure` (the bootstrap channel requires `auth.ssh.mode: enforce`).
-    """
-    entry = assert_dev_target(server)
-    host = entry.get("host", "localhost")
-    ssh_port = int(entry["ssh_port"])
-    args = [
-        "ssh", "-T", "-p", str(ssh_port),
-        "-o", "BatchMode=yes",
-        "-o", f"UserKnownHostsFile={KNOWN_HOSTS_PATH}",
-        "-o", "StrictHostKeyChecking=yes",
-        f"_bootstrap@{host}", scope, client_kind,
-    ]
-    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    if r.returncode != 0:
-        raise AssertionError(
-            f"bootstrap mint (scope={scope!r}) failed (exit {r.returncode}): "
-            f"stderr={r.stderr[-1000:]!r}"
-        )
-    try:
-        bundle = json.loads(r.stdout)
-    except json.JSONDecodeError as e:
-        raise AssertionError(f"bootstrap returned invalid JSON: {e}; stdout={r.stdout[-500:]!r}")
-    token = bundle.get("token", "")
-    assert token, f"bootstrap (scope={scope!r}) returned no token: {bundle!r}"
-    return token
+
+@contextmanager
+def isolated_home_with_identity() -> Iterator[str]:
+    """A throwaway `$HOME` carrying a copy of the developer's real default SSH
+    identity, so system `ssh`'s default identity-file resolution (which honors
+    the `HOME` env var for `~/.ssh/id_ed25519`) finds a usable key without
+    depending on an ssh-agent being loaded. `shed server add`'s SSH-first
+    bootstrap shells out to the real `ssh` binary (`sdk/bootstrap`), so this
+    is what lets an add run against a config- and creds-isolated `$HOME`
+    (never the developer's real `~/.shed/config.yaml`) while still
+    authenticating as a key the dev server allowlists.
+
+    Skips the calling test if no default identity exists to copy."""
+    priv = _REAL_SSH_DIR / _DEFAULT_IDENTITY
+    pub = _REAL_SSH_DIR / f"{_DEFAULT_IDENTITY}.pub"
+    if not priv.exists() or not pub.exists():
+        pytest.skip(f"no default SSH identity at {priv} to copy into a throwaway $HOME")
+    with tempfile.TemporaryDirectory() as home:
+        ssh_dir = Path(home) / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        for src in (priv, pub):
+            dst = ssh_dir / src.name
+            dst.write_bytes(src.read_bytes())
+            dst.chmod(0o600)
+        yield home

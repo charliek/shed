@@ -71,26 +71,17 @@ func withClientCert(r *http.Request, certs ...*x509.Certificate) *http.Request {
 }
 
 // mtlsTestServer builds an mtls-mode API server whose allowlist contains
-// exactly the fingerprints in authorized, and whose token store holds one valid
-// control token (returned) so tests can prove a bearer token is ignored on this
-// path.
-func mtlsTestServer(t *testing.T, authorized ...string) (s *Server, controlToken string) {
+// exactly the fingerprints in authorized.
+func mtlsTestServer(t *testing.T, authorized ...string) *Server {
 	t.Helper()
 	allowed := make(map[string]bool, len(authorized))
 	for _, fp := range authorized {
 		allowed[fp] = true
 	}
-	store := authtoken.NewStore()
-	controlToken, _, err := store.Mint("SHA256:test", authtoken.ScopeControl, authtoken.ClientCLI, time.Hour)
-	if err != nil {
-		t.Fatalf("mint control token: %v", err)
-	}
-	s = &Server{
+	return &Server{
 		cfg:            &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}},
-		tokens:         store,
 		certAuthorized: func(fp string) bool { return allowed[fp] },
 	}
-	return s, controlToken
 }
 
 // doCert runs one request through the middleware with the given peer
@@ -108,13 +99,13 @@ func doCert(s *Server, method, path string, certs ...*x509.Certificate) int {
 	return rr.Code
 }
 
-// TestMTLSMiddlewareScopeParity is the mtls twin of TestAuthMiddlewareEnforce:
-// the same route/scope table, driven by certificate OU instead of token scope.
-// The two tables must agree route-for-route — scope semantics belong to the
-// route, not to the credential shape.
+// TestMTLSMiddlewareScopeParity is the route/scope table, driven by
+// certificate OU. (It was the twin of a bearer-token table that went with the
+// token mode; the rows are unchanged.) Scope semantics belong to the route, not
+// to the credential shape.
 func TestMTLSMiddlewareScopeParity(t *testing.T) {
 	fp := testFingerprint("allowed")
-	s, _ := mtlsTestServer(t, fp)
+	s := mtlsTestServer(t, fp)
 	ctl := testClientCert(fp, authtoken.ScopeControl, time.Hour)
 	cred := testClientCert(fp, authtoken.ScopeCredentials, time.Hour)
 
@@ -123,8 +114,8 @@ func TestMTLSMiddlewareScopeParity(t *testing.T) {
 		cert               *x509.Certificate
 		want               int
 	}{
-		// mtls has NO bootstrap exemptions: the routes token mode leaves open
-		// are certificate-gated here like every other route.
+		// mtls has NO bootstrap exemptions: /api/info and the host key are
+		// certificate-gated here like every other route.
 		{"bootstrap info, no cert", "GET", "/api/info", nil, 401},
 		{"bootstrap host-key, no cert", "GET", "/api/ssh-host-key", nil, 401},
 		{"bootstrap info, control cert", "GET", "/api/info", ctl, 200},
@@ -167,20 +158,20 @@ func TestMTLSMiddlewareScopeParity(t *testing.T) {
 }
 
 // TestMTLSMiddlewareFailsClosed covers every way a request can fail to present
-// a usable identity. Each must be refused, and none may fall through to a
-// bearer-token or open-mode path.
+// a usable identity. Each must be refused, and none may fall through to an
+// open-mode path.
 func TestMTLSMiddlewareFailsClosed(t *testing.T) {
 	fp := testFingerprint("allowed")
 
 	t.Run("no TLS at all", func(t *testing.T) {
-		s, _ := mtlsTestServer(t, fp)
+		s := mtlsTestServer(t, fp)
 		if got := doCert(s, "GET", "/api/sheds"); got != 401 {
 			t.Errorf("plaintext request: got %d, want 401", got)
 		}
 	})
 
 	t.Run("TLS with no peer certificate", func(t *testing.T) {
-		s, _ := mtlsTestServer(t, fp)
+		s := mtlsTestServer(t, fp)
 		h := s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -194,7 +185,7 @@ func TestMTLSMiddlewareFailsClosed(t *testing.T) {
 	})
 
 	t.Run("expired certificate", func(t *testing.T) {
-		s, _ := mtlsTestServer(t, fp)
+		s := mtlsTestServer(t, fp)
 		expired := testClientCert(fp, authtoken.ScopeControl, -time.Second)
 		if got := doCert(s, "GET", "/api/sheds", expired); got != 401 {
 			t.Errorf("expired cert: got %d, want 401", got)
@@ -202,7 +193,7 @@ func TestMTLSMiddlewareFailsClosed(t *testing.T) {
 	})
 
 	t.Run("not yet valid certificate", func(t *testing.T) {
-		s, _ := mtlsTestServer(t, fp)
+		s := mtlsTestServer(t, fp)
 		future := testClientCert(fp, authtoken.ScopeControl, time.Hour)
 		future.NotBefore = time.Now().Add(time.Hour)
 		if got := doCert(s, "GET", "/api/sheds", future); got != 401 {
@@ -211,7 +202,7 @@ func TestMTLSMiddlewareFailsClosed(t *testing.T) {
 	})
 
 	t.Run("CN not in allowlist", func(t *testing.T) {
-		s, _ := mtlsTestServer(t, fp)
+		s := mtlsTestServer(t, fp)
 		stranger := testClientCert(testFingerprint("stranger"), authtoken.ScopeControl, time.Hour)
 		if got := doCert(s, "GET", "/api/sheds", stranger); got != 401 {
 			t.Errorf("unlisted CN: got %d, want 401", got)
@@ -219,7 +210,7 @@ func TestMTLSMiddlewareFailsClosed(t *testing.T) {
 	})
 
 	t.Run("nil authorizer authorizes nothing", func(t *testing.T) {
-		s, _ := mtlsTestServer(t)
+		s := mtlsTestServer(t)
 		s.certAuthorized = nil
 		valid := testClientCert(fp, authtoken.ScopeControl, time.Hour)
 		if got := doCert(s, "GET", "/api/sheds", valid); got != 401 {
@@ -228,7 +219,7 @@ func TestMTLSMiddlewareFailsClosed(t *testing.T) {
 	})
 
 	t.Run("no usable scope", func(t *testing.T) {
-		s, _ := mtlsTestServer(t, fp)
+		s := mtlsTestServer(t, fp)
 		// An OU-less certificate carries no scope, and no route grants one by
 		// default: authenticated but unauthorized (403), never defaulted to
 		// control.
@@ -397,11 +388,12 @@ func TestMTLSRouterOverRealTLSRejectsMissingCertificate(t *testing.T) {
 
 // TestMTLSIgnoresAuthorizationHeader proves a bearer token can neither
 // substitute for a client certificate nor widen the scope one carries. The
-// token used here is genuinely valid in the server's store — it is simply never
-// consulted on the mtls path.
+// server holds no token store, so the header below (shaped like a control token
+// a 0.9.x server would have minted) is never even looked up.
 func TestMTLSIgnoresAuthorizationHeader(t *testing.T) {
 	fp := testFingerprint("allowed")
-	s, controlToken := mtlsTestServer(t, fp)
+	s := mtlsTestServer(t, fp)
+	const controlToken = "shed_control_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 	run := func(path string, cert *x509.Certificate) int {
 		h := s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -417,11 +409,11 @@ func TestMTLSIgnoresAuthorizationHeader(t *testing.T) {
 		return rr.Code
 	}
 
-	// A valid control token cannot substitute for a certificate.
+	// A control token cannot substitute for a certificate.
 	if got := run("/api/sheds", nil); got != 401 {
-		t.Errorf("valid token, no cert: got %d, want 401", got)
+		t.Errorf("token, no cert: got %d, want 401", got)
 	}
-	// A valid control token alongside a credentials-scoped certificate does not
+	// A control token alongside a credentials-scoped certificate does not
 	// grant control: the certificate's scope is the only scope.
 	cred := testClientCert(fp, authtoken.ScopeCredentials, time.Hour)
 	if got := run("/api/sheds", cred); got != 403 {
@@ -433,16 +425,17 @@ func TestMTLSIgnoresAuthorizationHeader(t *testing.T) {
 	if got := run("/api/plugins/listeners", ctl); got != 403 {
 		t.Errorf("control token + control cert on bus: got %d, want 403", got)
 	}
-	// A de-authorized identity is not rescued by holding a valid token.
+	// A de-authorized identity is not rescued by holding a token.
 	stranger := testClientCert(testFingerprint("stranger"), authtoken.ScopeControl, time.Hour)
 	if got := run("/api/sheds", stranger); got != 401 {
-		t.Errorf("valid token + unlisted cert: got %d, want 401", got)
+		t.Errorf("token + unlisted cert: got %d, want 401", got)
 	}
 }
 
 // TestMTLSInfoReportsCA verifies the operator-visibility fields on /api/info:
-// present in mtls mode, absent everywhere else (a token/open server has no
-// client CA to report, and an empty string must not appear as a key).
+// present in mtls mode, absent in open mode (an open server has no client CA
+// to report, and an empty string must not appear as a key). auth_mode is the
+// canonical spelling of the mode the server runs.
 func TestMTLSInfoReportsCA(t *testing.T) {
 	fp := testFingerprint("allowed")
 	notAfter := time.Date(2031, 4, 5, 6, 7, 8, 0, time.UTC)
@@ -489,15 +482,21 @@ func TestMTLSInfoReportsCA(t *testing.T) {
 		if want := notAfter.Format(time.RFC3339); info.CANotAfter != want {
 			t.Errorf("ca_not_after=%q, want %q", info.CANotAfter, want)
 		}
+		if info.AuthMode != config.AuthModeMTLS {
+			t.Errorf("auth_mode=%q, want mtls", info.AuthMode)
+		}
 	})
 
-	t.Run("token mode omits both fields", func(t *testing.T) {
-		// Token mode leaves /api/info bootstrap-exempt, so no credential needed.
-		raw := getInfo(t, newInfoServer(config.AuthModeToken), nil)
+	t.Run("open mode omits both fields", func(t *testing.T) {
+		// Open mode passes /api/info through, so no credential needed.
+		raw := getInfo(t, newInfoServer(config.AuthModeOpen), nil)
 		for _, key := range []string{"ca_fingerprint", "ca_not_after"} {
 			if _, present := raw[key]; present {
-				t.Errorf("%s present in token mode", key)
+				t.Errorf("%s present in open mode", key)
 			}
+		}
+		if got := string(raw["auth_mode"]); got != `"open"` {
+			t.Errorf("auth_mode=%s, want \"open\"", got)
 		}
 	})
 }
@@ -846,7 +845,7 @@ func TestMTLSExpiryOnPooledConnection(t *testing.T) {
 // the three identity failures do, the scope failure and the success do not.
 func TestMTLSRejectionSetsConnectionCloseHeader(t *testing.T) {
 	fp := testFingerprint("allowed")
-	s, _ := mtlsTestServer(t, fp)
+	s := mtlsTestServer(t, fp)
 	h := s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -1004,12 +1003,11 @@ func TestMTLSRejectionClosesTheConnection(t *testing.T) {
 	})
 }
 
-// TestMTLSEstablishedStreamSurvivesExpiry pins the documented parity limitation:
+// TestMTLSEstablishedStreamSurvivesExpiry pins the documented limitation:
 // authorization is checked at request dispatch, so an SSE stream that was
 // authorized when it opened keeps streaming after its certificate expires. It
-// is exactly token mode's behavior (an expired token does not tear down a live
-// stream either), and it is asserted rather than left implicit so a future
-// change to it is a deliberate, visible one.
+// is asserted rather than left implicit so a future change to it is a
+// deliberate, visible one.
 func TestMTLSEstablishedStreamSurvivesExpiry(t *testing.T) {
 	fp := testFingerprint("allowed")
 	// x509 encodes validity at SECOND granularity, so a sub-second TTL truncates

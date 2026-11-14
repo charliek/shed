@@ -18,8 +18,8 @@ ssh_port: 2222
 # Defaults to loopback (127.0.0.1): shed is a local-development tool unless
 # explicitly exposed. Set a routable address ("0.0.0.0"/"*" = all IPv4,
 # "::" = all interfaces, or a specific LAN/tailnet IP) to reach it off-box.
-# In OPEN mode (no TLS) a non-loopback bind also requires
-# allow_insecure_exposure: true; token mode (auth.mode: token) needs no ack.
+# Only auth.mode: mtls may bind beyond loopback; an OPEN server (no TLS, no
+# client authentication) is loopback only.
 bind_address: 127.0.0.1
 
 # Backend configuration
@@ -60,7 +60,9 @@ env_file: ~/.shed/env
 # state_dir: /etc/shed
 
 # --- Authentication and service clients ---
-# auth.mode: open (default) | token | mtls. See docs/guides/security-configuration.md.
+# auth.mode: open (default, loopback only) | mtls. See docs/guides/security-configuration.md.
+# (auth.mode: token and its old spelling secure were removed in v0.10.0 and fail
+# config load; use mtls.)
 # Service clients (orchestrators that create, exec in and delete only their own
 # sheds) need mtls. Issue a client's certificate on this host with
 # `shed-server client issue <name>`. See docs/guides/orchestrated-sheds.md and

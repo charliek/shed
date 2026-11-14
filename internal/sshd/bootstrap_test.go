@@ -38,120 +38,54 @@ func testKey(t *testing.T) gossh.PublicKey {
 	return signer.PublicKey()
 }
 
-// enforceServer builds an enforce-mode server whose allowlist authorizes the
-// given key, with bootstrap wired to a fresh token store.
-func enforceServer(t *testing.T, authorized gossh.PublicKey) *Server {
-	t.Helper()
-	al, err := NewKeyAllowlist(&config.SSHAuthConfig{
-		Mode:           config.SSHAuthEnforce,
-		AuthorizedKeys: []string{string(gossh.MarshalAuthorizedKey(authorized))},
-	}, "")
-	if err != nil {
-		t.Fatalf("allowlist: %v", err)
-	}
-	s := &Server{allowlist: al}
-	s.SetBootstrap(authtoken.NewStore(), BootstrapInfo{
-		HTTPPort:       8080,
-		HTTPSPort:      8443,
-		TLSFingerprint: "sha256:abc",
-		TokenTTL:       time.Hour,
-	})
-	return s
-}
-
-func TestMintBootstrapAuthorizedKey(t *testing.T) {
+// TestBootstrapOpenServerRefusal pins the exact refusal an open server (one
+// whose SSH allowlist is not enforced) gives every `_bootstrap` request.
+// Released clients match this line verbatim to recognise an open server and
+// fall back to plain HTTP (cmd/shed/server_add.go openServerMarker), so it must
+// stay byte-identical whatever the request carries and whatever else is wired.
+// The literal is spelled out here, not taken from errBootstrapOpenServer, so a
+// change to the variable fails this test.
+func TestBootstrapOpenServerRefusal(t *testing.T) {
+	const want = "bootstrap requires auth.ssh.mode: enforce"
 	key := testKey(t)
-	s := enforceServer(t, key)
-
-	bundle, err := s.mintBootstrap(key, "control")
-	if err != nil {
-		t.Fatalf("mintBootstrap: %v", err)
+	line := string(gossh.MarshalAuthorizedKey(key))
+	allowlist := func(mode string) *KeyAllowlist {
+		al, err := NewKeyAllowlist(&config.SSHAuthConfig{Mode: mode, AuthorizedKeys: []string{line}}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return al
 	}
-	if bundle.Scope != authtoken.ScopeControl {
-		t.Errorf("scope = %q, want control", bundle.Scope)
-	}
-	if bundle.HTTPSPort != 8443 || bundle.TLSCertFingerprint != "sha256:abc" || bundle.HTTPPort != 8080 {
-		t.Errorf("bundle metadata not propagated: %+v", bundle)
-	}
-	if bundle.Token == "" || bundle.TokenID == "" {
-		t.Error("empty token or token_id")
-	}
-	// The minted token validates in the shared store as control, bound to the
-	// requesting key's fingerprint.
-	rec, ok := s.tokens.Validate(bundle.Token)
-	if !ok || rec.Scope != authtoken.ScopeControl {
-		t.Errorf("minted token does not validate as control: ok=%v rec=%+v", ok, rec)
-	}
-	if rec.Subject != gossh.FingerprintSHA256(key) {
-		t.Errorf("token subject = %q, want key fingerprint %q", rec.Subject, gossh.FingerprintSHA256(key))
-	}
-}
-
-func TestMintBootstrapDefaultsToControl(t *testing.T) {
-	key := testKey(t)
-	s := enforceServer(t, key)
-	bundle, err := s.mintBootstrap(key, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bundle.Scope != authtoken.ScopeControl {
-		t.Errorf("empty request should default to control, got %q", bundle.Scope)
-	}
-}
-
-func TestMintBootstrapCredentialsScopeAndKind(t *testing.T) {
-	key := testKey(t)
-	s := enforceServer(t, key)
-	bundle, err := s.mintBootstrap(key, "credentials host-agent")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bundle.Scope != authtoken.ScopeCredentials {
-		t.Errorf("scope = %q, want credentials", bundle.Scope)
-	}
-	rec, ok := s.tokens.Validate(bundle.Token)
-	if !ok || rec.ClientKind != authtoken.ClientHostAgent {
-		t.Errorf("client kind = %q, want host-agent (ok=%v)", rec.ClientKind, ok)
-	}
-}
-
-func TestMintBootstrapRejectsUnauthorizedKey(t *testing.T) {
-	s := enforceServer(t, testKey(t))
-	if _, err := s.mintBootstrap(testKey(t), "control"); err == nil {
-		t.Fatal("expected error for unauthorized key")
-	}
-}
-
-func TestMintBootstrapRequiresEnforce(t *testing.T) {
-	key := testKey(t)
-	// In warn mode an unlisted key is admitted at the transport, so the mint
-	// handler must independently refuse outside enforce.
-	al, err := NewKeyAllowlist(&config.SSHAuthConfig{
-		Mode:           config.SSHAuthWarn,
-		AuthorizedKeys: []string{string(gossh.MarshalAuthorizedKey(key))},
-	}, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := &Server{allowlist: al}
-	s.SetBootstrap(authtoken.NewStore(), BootstrapInfo{TokenTTL: time.Hour})
-	if _, err := s.mintBootstrap(key, "control"); err == nil {
-		t.Fatal("expected error: bootstrap must require enforce mode")
+	csr := "control cli csr=" + testCSR(t, elliptic.P256())
+	for _, tc := range []struct {
+		name string
+		al   *KeyAllowlist
+	}{
+		{"no auth.ssh block", nil},
+		{"auth.ssh off", allowlist(config.SSHAuthOff)},
+		// In warn mode a listed key is admitted at the transport, so the
+		// handler must refuse on its own.
+		{"auth.ssh warn with the key listed", allowlist(config.SSHAuthWarn)},
+	} {
+		for _, cmd := range []string{"", "control", "control cli", "credentials host-agent", csr} {
+			t.Run(tc.name+"/"+strings.SplitN(cmd, " csr=", 2)[0], func(t *testing.T) {
+				s := &Server{allowlist: tc.al}
+				// Even a server that somehow has a CA wired must not issue.
+				s.SetBootstrap(BootstrapInfo{HTTPSPort: 8443, TokenTTL: time.Hour, CA: testCA(t)})
+				_, err := s.mintBootstrap(key, cmd)
+				if err == nil || err.Error() != want {
+					t.Fatalf("error = %v, want exactly %q", err, want)
+				}
+			})
+		}
 	}
 }
 
 func TestMintBootstrapRejectsInvalidScope(t *testing.T) {
 	key := testKey(t)
-	s := enforceServer(t, key)
-	if _, err := s.mintBootstrap(key, "admin"); err == nil {
+	s := mtlsServer(t, key, testCA(t))
+	if _, err := s.mintBootstrap(key, "admin csr="+testCSR(t, elliptic.P256())); err == nil {
 		t.Fatal("expected error for admin (removed) scope")
-	}
-}
-
-func TestMintBootstrapRejectsNilKey(t *testing.T) {
-	s := enforceServer(t, testKey(t))
-	if _, err := s.mintBootstrap(nil, "control"); err == nil {
-		t.Fatal("expected error for nil key")
 	}
 }
 
@@ -162,8 +96,22 @@ func TestMintBootstrapUnconfigured(t *testing.T) {
 		AuthorizedKeys: []string{string(gossh.MarshalAuthorizedKey(key))},
 	}, "")
 	s := &Server{allowlist: al} // no SetBootstrap
-	if _, err := s.mintBootstrap(key, "control"); err == nil {
-		t.Fatal("expected error when token issuance not configured")
+	_, err := s.mintBootstrap(key, "control csr="+testCSR(t, elliptic.P256()))
+	if err == nil || err.Error() != "bootstrap: credential issuance not configured" {
+		t.Fatalf("error = %v, want the not-configured refusal", err)
+	}
+}
+
+// TestParseBootstrapRequestDefaultsToControl: an empty request line parses as
+// the control scope with no kind and no CSR (an mtls server then refuses it for
+// the missing CSR — see TestMintBootstrapMTLSRequiresCSR).
+func TestParseBootstrapRequestDefaultsToControl(t *testing.T) {
+	req, err := parseBootstrapRequest("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.scope != authtoken.ScopeControl || req.kind != "" || len(req.csrArgs) != 0 {
+		t.Errorf("parseBootstrapRequest(\"\") = %+v, want control scope, no kind, no csr", req)
 	}
 }
 
@@ -198,8 +146,8 @@ func testCSR(t *testing.T, curve elliptic.Curve) string {
 	return base64.StdEncoding.EncodeToString(der)
 }
 
-// mtlsServer builds an enforce-mode mtls server with NO token store: the mtls
-// path must never reach for one, so a nil store is the assertion.
+// mtlsServer builds an enforce-mode mtls server whose allowlist authorizes the
+// given key.
 func mtlsServer(t *testing.T, authorized gossh.PublicKey, ca *servertls.CA) *Server {
 	t.Helper()
 	al, err := NewKeyAllowlist(&config.SSHAuthConfig{
@@ -210,12 +158,10 @@ func mtlsServer(t *testing.T, authorized gossh.PublicKey, ca *servertls.CA) *Ser
 		t.Fatalf("allowlist: %v", err)
 	}
 	s := &Server{allowlist: al}
-	s.SetBootstrap(nil, BootstrapInfo{
-		HTTPPort:       8080, // set, but an mtls bundle must not report it
+	s.SetBootstrap(BootstrapInfo{
 		HTTPSPort:      8443,
 		TLSFingerprint: "sha256:abc",
 		TokenTTL:       time.Hour,
-		AuthMode:       config.AuthModeMTLS,
 		CA:             ca,
 	})
 	return s
@@ -250,70 +196,10 @@ func assertKeys(t *testing.T, got, want []string) {
 	}
 }
 
-// TestMintBootstrapTokenBundleShape golden-compares the token bundle against
-// the pre-mtls wire shape: every field that was there is still there, and the
-// only addition is auth_mode.
-func TestMintBootstrapTokenBundleShape(t *testing.T) {
-	key := testKey(t)
-	s := enforceServer(t, key)
-	bundle, err := s.mintBootstrap(key, "control cli")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bundle.AuthMode != config.AuthModeToken {
-		t.Errorf("auth_mode = %q, want token", bundle.AuthMode)
-	}
-	// The pre-mtls wire shape, verbatim ...
-	preChange := []string{"http_port", "https_port", "tls_cert_fingerprint", "token", "scope", "token_id", "expires_at"}
-	// ... plus exactly one new key, and nothing else.
-	assertKeys(t, bundleKeys(t, bundle), append(preChange, "auth_mode"))
-	if bundle.ClientCert != "" || bundle.CertSerial != "" {
-		t.Errorf("token bundle carries cert fields: %+v", bundle)
-	}
-}
-
-// TestMintBootstrapTokenIgnoresCSR is the legacy-parity case: a token-mode
-// server must return the same bundle whatever csr= carries, including values
-// that would be hard errors in mtls mode. It must never validate them.
-func TestMintBootstrapTokenIgnoresCSR(t *testing.T) {
-	valid := testCSR(t, elliptic.P256())
-	cases := []struct {
-		name string
-		cmd  string
-	}{
-		{"valid csr", "control cli csr=" + valid},
-		{"csr before kind", "control csr=" + valid + " cli"},
-		{"csr without kind", "control csr=" + valid},
-		{"malformed base64", "control cli csr=!!!not-base64!!!"},
-		{"url-safe base64", "control cli csr=a-_b"},
-		{"empty csr", "control cli csr="},
-		{"duplicate csr", "control cli csr=" + valid + " csr=" + valid},
-		{"garbage der", "control cli csr=" + base64.StdEncoding.EncodeToString([]byte("not a csr"))},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			key := testKey(t)
-			s := enforceServer(t, key)
-			bundle, err := s.mintBootstrap(key, tc.cmd)
-			if err != nil {
-				t.Fatalf("token mode must ignore csr, got error: %v", err)
-			}
-			if bundle.Token == "" || bundle.TokenID == "" {
-				t.Errorf("expected a normal token bundle, got %+v", bundle)
-			}
-			if bundle.ClientCert != "" || bundle.CertSerial != "" {
-				t.Errorf("token bundle carries cert fields: %+v", bundle)
-			}
-			if bundle.AuthMode != config.AuthModeToken {
-				t.Errorf("auth_mode = %q, want token", bundle.AuthMode)
-			}
-		})
-	}
-}
-
-// TestMintBootstrapMTLSBundle asserts the mtls bundle's exact wire shape and
-// that the issued leaf is a real, CA-verifiable client cert bound to the SSH
-// key that asked for it.
+// TestMintBootstrapMTLSBundle asserts the bundle's exact wire shape (no bearer
+// token, token_id or http_port: the server has no code that could mint them)
+// and that the issued leaf is a real, CA-verifiable client cert bound to the
+// SSH key that asked for it.
 func TestMintBootstrapMTLSBundle(t *testing.T) {
 	key := testKey(t)
 	ca := testCA(t)
@@ -470,29 +356,19 @@ func mustB64(t *testing.T, s string) []byte {
 	return b
 }
 
-// TestMintBootstrapRequestTooLong caps the raw line before parsing, in both
-// modes — it guards the parser, not the credential.
+// TestMintBootstrapRequestTooLong caps the raw line before parsing — it guards
+// the parser, not the credential.
 func TestMintBootstrapRequestTooLong(t *testing.T) {
 	long := "control cli csr=" + strings.Repeat("A", 16<<10)
-	for _, tc := range []struct {
-		name string
-		srv  func(t *testing.T, key gossh.PublicKey) *Server
-	}{
-		{"token", func(t *testing.T, key gossh.PublicKey) *Server { return enforceServer(t, key) }},
-		{"mtls", func(t *testing.T, key gossh.PublicKey) *Server { return mtlsServer(t, key, testCA(t)) }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			key := testKey(t)
-			_, err := tc.srv(t, key).mintBootstrap(key, long)
-			if err == nil || err.Error() != "bootstrap: request too long" {
-				t.Fatalf("error = %v, want bootstrap: request too long", err)
-			}
-		})
+	key := testKey(t)
+	_, err := mtlsServer(t, key, testCA(t)).mintBootstrap(key, long)
+	if err == nil || err.Error() != "bootstrap: request too long" {
+		t.Fatalf("error = %v, want bootstrap: request too long", err)
 	}
 }
 
 // TestMintBootstrapMTLSWithoutCA fails closed rather than panicking when the
-// mode says mtls but no CA was wired.
+// allowlist is enforced but no CA was wired.
 func TestMintBootstrapMTLSWithoutCA(t *testing.T) {
 	key := testKey(t)
 	s := mtlsServer(t, key, testCA(t))
@@ -504,8 +380,7 @@ func TestMintBootstrapMTLSWithoutCA(t *testing.T) {
 }
 
 // TestMintBootstrapClientKindNormalization pins the kind table, including the
-// shed-mobile → mobile fold, in both modes (nothing consumes the kind beyond
-// bookkeeping, so both must agree).
+// shed-mobile → mobile fold, as burned into the issued certificate.
 func TestMintBootstrapClientKindNormalization(t *testing.T) {
 	cases := []struct {
 		arg  string
@@ -521,21 +396,6 @@ func TestMintBootstrapClientKindNormalization(t *testing.T) {
 		{"", ""},
 	}
 	for _, tc := range cases {
-		t.Run("token/"+tc.arg, func(t *testing.T) {
-			key := testKey(t)
-			s := enforceServer(t, key)
-			bundle, err := s.mintBootstrap(key, strings.TrimRight("control "+tc.arg, " "))
-			if err != nil {
-				t.Fatal(err)
-			}
-			rec, ok := s.tokens.Validate(bundle.Token)
-			if !ok {
-				t.Fatal("minted token does not validate")
-			}
-			if rec.ClientKind != tc.want {
-				t.Errorf("client kind = %q, want %q", rec.ClientKind, tc.want)
-			}
-		})
 		t.Run("mtls/"+tc.arg, func(t *testing.T) {
 			key := testKey(t)
 			s := mtlsServer(t, key, testCA(t))
@@ -560,8 +420,8 @@ func TestMintBootstrapClientKindNormalization(t *testing.T) {
 	}
 }
 
-// TestMintBootstrapMTLSNeedsAuthorization keeps the mtls path behind the same
-// two gates as the token path: enforce mode and an allowlisted key.
+// TestMintBootstrapMTLSNeedsAuthorization keeps issuance behind its two gates:
+// enforce mode and an allowlisted key.
 func TestMintBootstrapMTLSNeedsAuthorization(t *testing.T) {
 	csr := "control csr=" + testCSR(t, elliptic.P256())
 	s := mtlsServer(t, testKey(t), testCA(t))
@@ -588,19 +448,6 @@ func TestMintBootstrapRequestLengthBoundary(t *testing.T) {
 		return cmd + strings.Repeat(" ", target-len(cmd))
 	}
 
-	t.Run("token exactly at cap accepted", func(t *testing.T) {
-		key := testKey(t)
-		s := enforceServer(t, key)
-		cmd := pad(t, "control cli", maxBootstrapCommand)
-		bundle, err := s.mintBootstrap(key, cmd)
-		if err != nil {
-			t.Fatalf("mintBootstrap at exact cap (%d bytes): %v", len(cmd), err)
-		}
-		if bundle.Token == "" {
-			t.Error("expected a minted token")
-		}
-	})
-
 	t.Run("mtls exactly at cap accepted", func(t *testing.T) {
 		key := testKey(t)
 		s := mtlsServer(t, key, testCA(t))
@@ -616,7 +463,7 @@ func TestMintBootstrapRequestLengthBoundary(t *testing.T) {
 
 	t.Run("one byte over cap rejected", func(t *testing.T) {
 		key := testKey(t)
-		s := enforceServer(t, key)
+		s := mtlsServer(t, key, testCA(t))
 		cmd := pad(t, "control cli", maxBootstrapCommand) + " "
 		if len(cmd) != maxBootstrapCommand+1 {
 			t.Fatalf("test setup: cmd length = %d, want %d", len(cmd), maxBootstrapCommand+1)
@@ -630,22 +477,10 @@ func TestMintBootstrapRequestLengthBoundary(t *testing.T) {
 
 // TestMintBootstrapBareCSRWordIsNotCSRArg pins that the literal word "csr"
 // with no '=' is an ordinary (unrecognized) client kind, not a CSR: only the
-// key=value form is ever collected into csrArgs. In mtls mode, with no real
-// csr= present, this must fall through to the same upgrade error a client
-// that sent nothing at all would get.
+// key=value form is ever collected into csrArgs. With no real csr= present,
+// this must fall through to the same upgrade error a client that sent nothing
+// at all would get.
 func TestMintBootstrapBareCSRWordIsNotCSRArg(t *testing.T) {
-	t.Run("token", func(t *testing.T) {
-		key := testKey(t)
-		s := enforceServer(t, key)
-		bundle, err := s.mintBootstrap(key, "control csr")
-		if err != nil {
-			t.Fatalf("mintBootstrap: %v", err)
-		}
-		rec, ok := s.tokens.Validate(bundle.Token)
-		if !ok || rec.ClientKind != "" {
-			t.Errorf("client kind = %q, want \"\" (unrecognized, ok=%v)", rec.ClientKind, ok)
-		}
-	})
 	t.Run("mtls", func(t *testing.T) {
 		key := testKey(t)
 		s := mtlsServer(t, key, testCA(t))
@@ -657,29 +492,12 @@ func TestMintBootstrapBareCSRWordIsNotCSRArg(t *testing.T) {
 }
 
 // TestMintBootstrapUppercaseCSRKeyNotRecognized pins that the csr= match is
-// case-sensitive: "CSR=..." is never collected as a CSR argument. In mtls
-// mode that means the client gets the same upgrade error as if it had sent no
-// csr= at all; in token mode it is simply ignored (normalizes to an
-// unrecognized kind, same as any other unmatched argument).
+// case-sensitive: "CSR=..." is never collected as a CSR argument, so the
+// client gets the same upgrade error as if it had sent no csr= at all.
 func TestMintBootstrapUppercaseCSRKeyNotRecognized(t *testing.T) {
 	valid := testCSR(t, elliptic.P256())
 	cmd := "control CSR=" + valid
 
-	t.Run("token ignored", func(t *testing.T) {
-		key := testKey(t)
-		s := enforceServer(t, key)
-		bundle, err := s.mintBootstrap(key, cmd)
-		if err != nil {
-			t.Fatalf("mintBootstrap: %v", err)
-		}
-		if bundle.Token == "" {
-			t.Error("expected a minted token")
-		}
-		rec, ok := s.tokens.Validate(bundle.Token)
-		if !ok || rec.ClientKind != "" {
-			t.Errorf("client kind = %q, want \"\" (CSR= must not be read as a kind either, ok=%v)", rec.ClientKind, ok)
-		}
-	})
 	t.Run("mtls treated as no csr", func(t *testing.T) {
 		key := testKey(t)
 		s := mtlsServer(t, key, testCA(t))
@@ -691,22 +509,13 @@ func TestMintBootstrapUppercaseCSRKeyNotRecognized(t *testing.T) {
 }
 
 // TestMintBootstrapCSRLiteralAsScope pins that a csr=... argument occupying
-// field 0 (the scope position) is rejected as an invalid scope in both
-// modes: the parser never treats field 0 as anything but the scope, however
-// it's spelled.
+// field 0 (the scope position) is rejected as an invalid scope: the parser
+// never treats field 0 as anything but the scope, however it's spelled.
 func TestMintBootstrapCSRLiteralAsScope(t *testing.T) {
 	valid := testCSR(t, elliptic.P256())
 	cmd := "csr=" + valid
 	wantErr := fmt.Sprintf("bootstrap: invalid scope %q", cmd)
 
-	t.Run("token", func(t *testing.T) {
-		key := testKey(t)
-		s := enforceServer(t, key)
-		_, err := s.mintBootstrap(key, cmd)
-		if err == nil || err.Error() != wantErr {
-			t.Fatalf("error = %v, want %q", err, wantErr)
-		}
-	})
 	t.Run("mtls", func(t *testing.T) {
 		key := testKey(t)
 		s := mtlsServer(t, key, testCA(t))
@@ -746,7 +555,7 @@ func TestMintBootstrapWhitespaceSeparators(t *testing.T) {
 // terminal would interpret.
 func TestMintBootstrapInvalidScopeEscapesControlBytes(t *testing.T) {
 	key := testKey(t)
-	s := enforceServer(t, key)
+	s := mtlsServer(t, key, testCA(t))
 	scope := "\x1b[31mbogus"
 	_, err := s.mintBootstrap(key, scope+" cli")
 	if err == nil {

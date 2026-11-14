@@ -34,31 +34,25 @@ func captureStderr(t *testing.T, fn func()) string {
 	return string(out)
 }
 
-func TestTokenModeAndEnforcement(t *testing.T) {
-	// AuthEnforced is the combined open-vs-(token|mtls) predicate; mtls shares
-	// every enforced-mode invariant, including HTTP enforcement — it just
-	// demands a different credential there (a client certificate rather than a
-	// bearer token). Only open mode leaves the HTTP API unauthenticated.
+func TestAuthModeEnforcement(t *testing.T) {
+	// AuthEnforced is the open-vs-mtls predicate. Only open mode leaves the
+	// HTTP API unauthenticated.
 	tests := []struct {
 		name            string
 		auth            *AuthConfig
-		wantTokenMode   bool
 		wantMTLSMode    bool
 		wantEnforced    bool
 		wantHTTPEnforce bool
+		wantModeValue   string
 	}{
-		{"nil auth", nil, false, false, false, false},
-		{"open default", &AuthConfig{}, false, false, false, false},
-		{"explicit open", &AuthConfig{Mode: AuthModeOpen}, false, false, false, false},
-		{"token", &AuthConfig{Mode: AuthModeToken}, true, false, true, true},
-		{"mtls", &AuthConfig{Mode: AuthModeMTLS}, false, true, true, true},
+		{"nil auth", nil, false, false, false, AuthModeOpen},
+		{"open default", &AuthConfig{}, false, false, false, AuthModeOpen},
+		{"explicit open", &AuthConfig{Mode: AuthModeOpen}, false, false, false, AuthModeOpen},
+		{"mtls", &AuthConfig{Mode: AuthModeMTLS}, true, true, true, AuthModeMTLS},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &ServerConfig{Auth: tt.auth}
-			if c.TokenMode() != tt.wantTokenMode {
-				t.Errorf("TokenMode()=%v, want %v", c.TokenMode(), tt.wantTokenMode)
-			}
 			if c.MTLSMode() != tt.wantMTLSMode {
 				t.Errorf("MTLSMode()=%v, want %v", c.MTLSMode(), tt.wantMTLSMode)
 			}
@@ -68,37 +62,36 @@ func TestTokenModeAndEnforcement(t *testing.T) {
 			if c.HTTPAuthEnforced() != tt.wantHTTPEnforce {
 				t.Errorf("HTTPAuthEnforced()=%v, want %v", c.HTTPAuthEnforced(), tt.wantHTTPEnforce)
 			}
+			if got := c.AuthModeValue(); got != tt.wantModeValue {
+				t.Errorf("AuthModeValue()=%q, want %q", got, tt.wantModeValue)
+			}
 		})
 	}
 }
 
-func TestEffectiveSSHAuthForcesEnforceInTokenMode(t *testing.T) {
-	// Token mode forces enforce while keeping the configured key sources, and
-	// must not mutate the underlying config.
-	c := &ServerConfig{Auth: &AuthConfig{
-		Mode: AuthModeToken,
-		SSH:  &SSHAuthConfig{Mode: SSHAuthWarn, GitHubUsers: []string{"charliek"}},
-	}}
-	eff := c.EffectiveSSHAuth()
-	if eff.Mode != SSHAuthEnforce {
-		t.Errorf("token-mode EffectiveSSHAuth mode = %q, want enforce", eff.Mode)
-	}
-	if len(eff.GitHubUsers) != 1 || eff.GitHubUsers[0] != "charliek" {
-		t.Errorf("key sources not preserved: %+v", eff.GitHubUsers)
-	}
-	if c.Auth.SSH.Mode != SSHAuthWarn {
-		t.Error("EffectiveSSHAuth mutated the underlying config")
-	}
-	// Open mode returns the configured block verbatim (nil when unset).
-	open := &ServerConfig{Auth: &AuthConfig{Mode: AuthModeOpen}}
-	if open.EffectiveSSHAuth() != nil {
-		t.Error("open EffectiveSSHAuth should be nil when auth.ssh unset")
+// TestRemovedAuthModeIsNotEnforced pins that a hand-built config naming the
+// removed token mode (one that never went through a loader) is not treated as
+// an enforced mode by any predicate: validateAuth refuses it, and nothing
+// below that may quietly read it as either open-with-auth or mtls.
+func TestRemovedAuthModeIsNotEnforced(t *testing.T) {
+	for _, mode := range []string{AuthModeToken, "secure"} {
+		t.Run(mode, func(t *testing.T) {
+			c := &ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: mode}}
+			if c.MTLSMode() || c.AuthEnforced() || c.HTTPAuthEnforced() {
+				t.Errorf("mode %q: MTLSMode=%v AuthEnforced=%v HTTPAuthEnforced=%v, want all false",
+					mode, c.MTLSMode(), c.AuthEnforced(), c.HTTPAuthEnforced())
+			}
+			err := c.validateAuth()
+			if err == nil || !strings.Contains(err.Error(), "mtls") {
+				t.Errorf("validateAuth() = %v, want a refusal naming mtls", err)
+			}
+		})
 	}
 }
 
-// TestEffectiveSSHAuthForcesEnforceInMTLSMode mirrors the token-mode case
-// above: mtls forces the same enforce posture, since it shares the SSH
-// allowlist invariant with token mode.
+// TestEffectiveSSHAuthForcesEnforceInMTLSMode: mtls forces enforce while
+// keeping the configured key sources, and must not mutate the underlying
+// config. Open mode returns the configured block verbatim.
 func TestEffectiveSSHAuthForcesEnforceInMTLSMode(t *testing.T) {
 	c := &ServerConfig{Auth: &AuthConfig{
 		Mode: AuthModeMTLS,
@@ -113,6 +106,10 @@ func TestEffectiveSSHAuthForcesEnforceInMTLSMode(t *testing.T) {
 	}
 	if c.Auth.SSH.Mode != SSHAuthWarn {
 		t.Error("EffectiveSSHAuth mutated the underlying config")
+	}
+	open := &ServerConfig{Auth: &AuthConfig{Mode: AuthModeOpen}}
+	if open.EffectiveSSHAuth() != nil {
+		t.Error("open EffectiveSSHAuth should be nil when auth.ssh unset")
 	}
 }
 
@@ -134,13 +131,9 @@ func TestPreflightAuth(t *testing.T) {
 	}{
 		{"open is inert", &AuthConfig{Mode: AuthModeOpen}, false},
 		{"nil auth is inert", nil, false},
-		{"token + github_users ok", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}, false},
-		{"token + authorized_keys ok", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{AuthorizedKeys: []string{"ssh-ed25519 AAAA x"}}}, false},
-		{"token + authorized_keys_file ok", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{AuthorizedKeysFile: "/etc/shed/keys"}}, false},
-		{"token with no key source fails", &AuthConfig{Mode: AuthModeToken}, true},
-		{"token with empty ssh block fails", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{}}, true},
 		{"mtls + github_users ok", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}, false},
 		{"mtls + authorized_keys ok", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{AuthorizedKeys: []string{"ssh-ed25519 AAAA x"}}}, false},
+		{"mtls + authorized_keys_file ok", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{AuthorizedKeysFile: "/etc/shed/keys"}}, false},
 		{"mtls with no key source fails", &AuthConfig{Mode: AuthModeMTLS}, true},
 		{"mtls with empty ssh block fails", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{}}, true},
 	}
@@ -155,16 +148,14 @@ func TestPreflightAuth(t *testing.T) {
 }
 
 func TestPlainHTTPEnabled(t *testing.T) {
-	// Token and mtls modes are both TLS-only: the plain-HTTP listener is not
-	// served (only the pinned-TLS listener faces clients). Open mode serves
-	// plain HTTP.
+	// mtls is TLS-only: the plain-HTTP listener is not served (only the
+	// pinned-TLS listener faces clients). Open mode serves plain HTTP.
 	tests := []struct {
 		name string
 		cfg  ServerConfig
 		want bool
 	}{
 		{"open serves plain HTTP", ServerConfig{HTTPPort: 8080}, true},
-		{"token mode is TLS-only", ServerConfig{HTTPPort: 8080, Auth: &AuthConfig{Mode: AuthModeToken}}, false},
 		{"mtls mode is TLS-only", ServerConfig{HTTPPort: 8080, Auth: &AuthConfig{Mode: AuthModeMTLS}}, false},
 	}
 	for _, tt := range tests {
@@ -176,9 +167,9 @@ func TestPlainHTTPEnabled(t *testing.T) {
 	}
 }
 
-// TestCrossFieldAuthValidation exercises the token⟺tokens⟺TLS coupling: SSH
-// enforce and https_port are token-mode-only surfaces, and token mode forbids
-// an explicit ssh off/warn override.
+// TestCrossFieldAuthValidation exercises the mtls⟺certs⟺TLS coupling: SSH
+// enforce and https_port are mtls-only surfaces, and mtls forbids an explicit
+// ssh off/warn override.
 func TestCrossFieldAuthValidation(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -188,46 +179,21 @@ func TestCrossFieldAuthValidation(t *testing.T) {
 		{
 			name:    "open + ssh enforce rejected",
 			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeOpen, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}},
-			wantErr: "auth.ssh.mode: enforce requires auth.mode: token",
+			wantErr: "auth.ssh.mode: enforce requires auth.mode: mtls",
 		},
 		{
 			name:    "open + https_port rejected",
 			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8443, Auth: &AuthConfig{Mode: AuthModeOpen}},
-			wantErr: "https_port requires auth.mode: token",
+			wantErr: "https_port requires auth.mode: mtls",
 		},
 		{
 			name:    "https_port with no auth block rejected",
 			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8443},
-			wantErr: "https_port requires auth.mode: token",
-		},
-		{
-			name:    "token + ssh warn rejected",
-			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthWarn}}},
-			wantErr: "auth.mode: token forces auth.ssh.mode: enforce",
-		},
-		{
-			name:    "token + ssh off rejected",
-			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthOff}}},
-			wantErr: "auth.mode: token forces auth.ssh.mode: enforce",
+			wantErr: "https_port requires auth.mode: mtls",
 		},
 		{
 			name:    "open + ssh warn ok (staging)",
 			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeOpen, SSH: &SSHAuthConfig{Mode: SSHAuthWarn}}},
-			wantErr: "",
-		},
-		{
-			name:    "token + ssh enforce ok",
-			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}},
-			wantErr: "",
-		},
-		{
-			name:    "token + ssh unset ok (derives enforce)",
-			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}},
-			wantErr: "",
-		},
-		{
-			name:    "token + https_port ok",
-			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8443, Auth: &AuthConfig{Mode: AuthModeToken}},
 			wantErr: "",
 		},
 		{
@@ -275,99 +241,25 @@ func TestCrossFieldAuthValidation(t *testing.T) {
 	}
 }
 
-// TestNormalizeAuthModeValue covers the pure secure→token alias mapping used
-// by normalizeAuthMode at config load time.
-func TestNormalizeAuthModeValue(t *testing.T) {
-	tests := []struct {
-		name          string
-		mode          string
-		wantNormal    string
-		wantDeprecate bool
-	}{
-		{"empty passes through", "", "", false},
-		{"canonical token passes through", AuthModeToken, AuthModeToken, false},
-		{"open passes through", AuthModeOpen, AuthModeOpen, false},
-		{"mtls passes through unchanged (no alias)", AuthModeMTLS, AuthModeMTLS, false},
-		{"legacy secure normalizes to token", "secure", AuthModeToken, true},
-		{"invalid value passes through unchanged", "bogus", "bogus", false},
+// TestNormalizeAuthModeClientBoundary pins the client half of the wire-compat
+// contract with servers older than this one: a 0.9.x token-mode server reports
+// "secure" on /api/info, and the CLI's decode must map it to the canonical
+// constant, or the HTTP-fallback guard in `shed server add` writes a
+// credential-less entry for it. Every other value passes through, so a future
+// mode is not eaten.
+func TestNormalizeAuthModeClientBoundary(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"secure", AuthModeToken},
+		{AuthModeToken, AuthModeToken},
+		{AuthModeOpen, AuthModeOpen},
+		{AuthModeMTLS, AuthModeMTLS},
+		{"", ""},
+		{"bogus", "bogus"},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotMode, gotDeprecated := normalizeAuthModeValue(tt.mode)
-			if gotMode != tt.wantNormal {
-				t.Errorf("normalizeAuthModeValue(%q) mode = %q, want %q", tt.mode, gotMode, tt.wantNormal)
-			}
-			if gotDeprecated != tt.wantDeprecate {
-				t.Errorf("normalizeAuthModeValue(%q) deprecated = %v, want %v", tt.mode, gotDeprecated, tt.wantDeprecate)
-			}
-		})
-	}
-}
-
-// TestWireAuthModeRoundTrip pins the /api/info wire-compat contract: token
-// mode travels as the legacy "secure" spelling (released clients gate their
-// credential bootstrap on that exact string), every mode round-trips
-// LegacyWireAuthMode→NormalizeAuthMode back to its canonical form, and
-// NormalizeAuthMode also accepts what a released pre-rename server reports.
-func TestWireAuthModeRoundTrip(t *testing.T) {
-	wire := map[string]string{
-		AuthModeOpen:  AuthModeOpen,
-		AuthModeToken: "secure", // the load-bearing leg: old clients need this exact string
-		AuthModeMTLS:  AuthModeMTLS,
-	}
-	for canonical, wantWire := range wire {
-		if got := LegacyWireAuthMode(canonical); got != wantWire {
-			t.Errorf("LegacyWireAuthMode(%q) = %q, want %q", canonical, got, wantWire)
-		}
-		if got := NormalizeAuthMode(LegacyWireAuthMode(canonical)); got != canonical {
-			t.Errorf("round-trip of %q = %q, want it back unchanged", canonical, got)
-		}
-	}
-	// A released server reports "secure"; the client boundary must map it to
-	// the canonical constant, or the HTTP-fallback guard in `shed server add`
-	// writes a credential-less entry for it.
-	if got := NormalizeAuthMode("secure"); got != AuthModeToken {
-		t.Errorf("NormalizeAuthMode(secure) = %q, want %q", got, AuthModeToken)
-	}
-	// Unknown/empty values pass through — a future mode must not be eaten.
-	for _, passthrough := range []string{"", "bogus"} {
-		if got := NormalizeAuthMode(passthrough); got != passthrough {
-			t.Errorf("NormalizeAuthMode(%q) = %q, want passthrough", passthrough, got)
-		}
-		if got := LegacyWireAuthMode(passthrough); got != passthrough {
-			t.Errorf("LegacyWireAuthMode(%q) = %q, want passthrough", passthrough, got)
-		}
-	}
-}
-
-// TestNormalizeAuthModeWarning verifies the deprecation warning is emitted
-// exactly once when the legacy "secure" spelling is normalized, and not at
-// all for the canonical "token" (or an unset/open mode).
-func TestNormalizeAuthModeWarning(t *testing.T) {
-	tests := []struct {
-		name      string
-		auth      *AuthConfig
-		wantMode  string
-		wantWarns int
-	}{
-		{"nil auth: no warning", nil, "", 0},
-		{"open: no warning", &AuthConfig{Mode: AuthModeOpen}, AuthModeOpen, 0},
-		{"token: no warning", &AuthConfig{Mode: AuthModeToken}, AuthModeToken, 0},
-		{"mtls: no warning", &AuthConfig{Mode: AuthModeMTLS}, AuthModeMTLS, 0},
-		{"secure: normalizes to token, warns once", &AuthConfig{Mode: "secure"}, AuthModeToken, 1},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &ServerConfig{Auth: tt.auth}
-			stderr := captureStderr(t, func() {
-				normalizeAuthMode(cfg)
-			})
-			if tt.auth != nil && cfg.Auth.Mode != tt.wantMode {
-				t.Errorf("Auth.Mode = %q, want %q", cfg.Auth.Mode, tt.wantMode)
-			}
-			gotWarns := strings.Count(stderr, authModeDeprecationWarning)
-			if gotWarns != tt.wantWarns {
-				t.Errorf("deprecation warning count = %d, want %d (stderr: %q)", gotWarns, tt.wantWarns, stderr)
+		t.Run(tt.in, func(t *testing.T) {
+			if got := NormalizeAuthMode(tt.in); got != tt.want {
+				t.Errorf("NormalizeAuthMode(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}

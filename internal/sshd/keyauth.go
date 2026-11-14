@@ -57,11 +57,6 @@ type KeyAllowlist struct {
 	// swapped together with keys, under the same lock, so the two views can
 	// never disagree.
 	fps map[string]struct{}
-
-	// onRemove, when set, is called (outside the lock) with the fingerprints of
-	// keys that left the allowlist on a rebuild, so a caller can revoke their
-	// HTTP tokens. Set once at startup before StartRefresh; nil on the off path.
-	onRemove func(subjects []string)
 }
 
 // NewKeyAllowlist builds the allowlist from config and does the initial GitHub
@@ -111,11 +106,6 @@ func (a *KeyAllowlist) Mode() string { return a.mode }
 // MaxAuthTries returns the configured per-connection public-key attempt cap, or
 // 0 when unset (the server then applies its own default — see effectiveMaxAuthTries).
 func (a *KeyAllowlist) MaxAuthTries() int { return a.maxAuthTries }
-
-// SetRevokeHook installs a callback invoked (outside the lock) with the
-// fingerprints of keys that leave the allowlist on a rebuild, so the caller can
-// revoke their HTTP tokens. Set once at startup, before StartRefresh.
-func (a *KeyAllowlist) SetRevokeHook(fn func(subjects []string)) { a.onRemove = fn }
 
 // IsAuthorized reports whether key is in the allowlist.
 func (a *KeyAllowlist) IsAuthorized(key gossh.PublicKey) bool {
@@ -206,28 +196,15 @@ func (a *KeyAllowlist) rebuild() error {
 		fps[fingerprint] = struct{}{}
 	}
 
+	// A failed GitHub fetch falls back to last-known-good, so the set never
+	// shrinks on a transient outage; a key leaves only when its source
+	// genuinely stopped listing it. An mtls server re-checks every request's
+	// certificate against this set, so that removal de-authorizes the key's
+	// certificates on their next request.
 	a.mu.Lock()
-	old := a.keys
 	a.keys = set
 	a.fps = fps
 	a.mu.Unlock()
-
-	// Authoritative diff: a key in the old set but absent from the new one was
-	// genuinely removed. A failed GitHub fetch falls back to last-known-good (so
-	// the set never shrinks on a transient outage), which makes this diff safe —
-	// a transient failure produces no removals. The initial build has an empty
-	// old set, so nothing fires at startup.
-	if a.onRemove != nil {
-		var removed []string
-		for marshaled, fingerprint := range old {
-			if _, present := set[marshaled]; !present {
-				removed = append(removed, fingerprint)
-			}
-		}
-		if len(removed) > 0 {
-			a.onRemove(removed)
-		}
-	}
 	return nil
 }
 
@@ -242,8 +219,8 @@ func (a *KeyAllowlist) addGitHubUser(set map[string]string, user string) {
 		// Fail closed to last-known-good. Prefer the in-memory snapshot (the
 		// freshest keys this process actually resolved) over the disk cache: a
 		// previous writeCache failure can leave the disk staler than memory, and
-		// with token revocation wired in, falling back to a stale disk would
-		// shrink the set and revoke a still-valid key. Disk is only the
+		// falling back to a stale disk would shrink the set and de-authorize a
+		// still-valid key (and, in mtls mode, its certificates). Disk is only the
 		// cold-start fallback, before this process has resolved the user.
 		switch {
 		case a.lastGitHub[user] != nil:

@@ -10,12 +10,12 @@ so these probes don't need a real shed — `ssh -v` reports `Authenticated to`
 on success and `Permission denied (publickey)` on rejection. VZ-only (config
 mutation via the Phase 0.5 harness restarts the local VZ dev server).
 
-SSH enforce is now a secure-mode-only posture: `auth.ssh.mode: enforce` on an
-open-mode server is rejected at startup, so the enforce test drives secure mode
-(which itself forces SSH enforce). Secure mode is TLS-only, so it carries an
-explicitly-set `https_port` for the dev_config readiness probe — the SSH probes
-themselves hit the SSH port and are unaffected by the HTTP transport. The warn
-test stays open-mode (secure forbids an explicit warn override).
+SSH enforce is the mtls posture: `auth.ssh.mode: enforce` on an open-mode
+server is rejected at startup, and mtls forces enforce itself, so the enforce
+test reconfigures the (mtls) dev server's key list. Warn stays an open-mode
+setting (mtls forbids an explicit warn override), so the warn test runs the dev
+server as an open server on loopback. `dev_config` waits for either mode to be
+serving before the SSH probes run.
 """
 
 from __future__ import annotations
@@ -25,17 +25,8 @@ import subprocess
 
 import pytest
 
-from fixtures.devcontrol import (
-    dev_config,
-    skip_mtls_reconfigure,
-    skip_needs_open_mode_dev_server,
-)
+from fixtures.devcontrol import OPEN_MODE_OVERRIDES, dev_config
 from fixtures.server import resolve_server_entry
-
-# Secure mode is TLS-only; the enforce test pins this explicitly-set https_port
-# (the port-safety guard allows 18443) so dev_config's readiness probe hits the
-# actual listener rather than the 8443 default.
-HTTPS_PORT = 18443
 
 
 def _keygen(dir_: pathlib.Path, name: str) -> tuple[str, str]:
@@ -70,8 +61,6 @@ def _ssh_auth_stderr(port: int, key_path: str, user: str = "probe-shed") -> str:
         return err.decode() if isinstance(err, bytes) else err
 
 
-@skip_needs_open_mode_dev_server
-@skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
 def test_enforce_denies_offlist_admits_onlist(vz_server_dev, tmp_path):
@@ -81,16 +70,10 @@ def test_enforce_denies_offlist_admits_onlist(vz_server_dev, tmp_path):
     on_key, on_pub = _keygen(tmp_path, "onlist")
     off_key, _ = _keygen(tmp_path, "offlist")
 
-    # SSH enforce is a secure-mode-only posture; secure forces auth.ssh.mode to
-    # enforce, so this exercises the same allowlist gate (off-list denied,
-    # on-list admitted) the explicit enforce mode used to.
-    with dev_config(
-        {
-            "https_port": HTTPS_PORT,
-            "auth": {"mode": "secure", "ssh": {"authorized_keys": [on_pub]}},
-        },
-        server,
-    ):
+    # The base is mtls, which forces auth.ssh.mode to enforce; only the key
+    # list changes. Its github_users stay, so the developer's own key (which
+    # dev_config's readiness check enrols with) is still allowlisted.
+    with dev_config({"auth": {"ssh": {"authorized_keys": [on_pub]}}}, server):
         off = _ssh_auth_stderr(ssh_port, off_key)
         assert "Permission denied" in off, f"off-list key should be denied; stderr={off!r}"
 
@@ -99,7 +82,6 @@ def test_enforce_denies_offlist_admits_onlist(vz_server_dev, tmp_path):
         assert "Permission denied" not in on
 
 
-@skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
 def test_warn_admits_offlist(vz_server_dev, tmp_path):
@@ -109,9 +91,9 @@ def test_warn_admits_offlist(vz_server_dev, tmp_path):
     _, on_pub = _keygen(tmp_path, "onlist")
     off_key, _ = _keygen(tmp_path, "offlist")
 
-    with dev_config(
-        {"auth": {"ssh": {"mode": "warn", "authorized_keys": [on_pub]}}}, server
-    ):
+    # warn is an open-mode setting: an open server on loopback.
+    warn = {**OPEN_MODE_OVERRIDES, "auth": {"mode": "open", "ssh": {"mode": "warn", "authorized_keys": [on_pub]}}}
+    with dev_config(warn, server):
         off = _ssh_auth_stderr(ssh_port, off_key)
         # warn logs would-deny but still authenticates.
         assert "Authenticated to" in off, f"warn mode should admit off-list; stderr={off!r}"

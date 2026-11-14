@@ -46,25 +46,23 @@ const (
 // into issues verbatim: keep the wording stable, and keep it actionable.
 var errBootstrapNeedsCSR = errors.New("this server requires auth.mode: mtls; upgrade shed (client certificate support)")
 
+// errBootstrapOpenServer is what a server whose SSH allowlist is not enforced
+// (an open server) answers every `_bootstrap` request with. Released clients
+// match this exact line to recognise an open server and fall back to plain
+// HTTP (cmd/shed/server_add.go): keep it byte-identical.
+var errBootstrapOpenServer = errors.New("bootstrap requires auth.ssh.mode: enforce")
+
 // BootstrapInfo is the static, server-known half of a bootstrap bundle: the
-// HTTP/HTTPS ports, the TLS pin (empty when TLS is off), the credential TTL,
-// the effective auth mode, and — in mtls mode — the CA that issues client
+// HTTPS port, the TLS pin, the certificate TTL, and the CA that issues client
 // certificates. shed-server fills it in once and wires it via SetBootstrap.
 type BootstrapInfo struct {
-	HTTPPort       int
 	HTTPSPort      int
 	TLSFingerprint string // sha256:... of the server cert; "" when TLS is off
-	// TokenTTL is the lifetime of the credential the bootstrap issues
-	// (auth.token_ttl). It is reused verbatim as the client-certificate TTL in
-	// mtls mode: both are the same short-lived, re-mintable capability, so a
-	// second knob would only be a second thing to get wrong.
+	// TokenTTL is the lifetime of the client certificate the bootstrap issues
+	// (auth.token_ttl, a name kept from the removed bearer-token mode).
 	TokenTTL time.Duration
-	// AuthMode is the server's effective auth.mode (config.AuthMode*). Only
-	// config.AuthModeMTLS changes behavior here; every other value takes the
-	// bearer-token path.
-	AuthMode string
-	// CA issues client certificates in mtls mode. Required there, nil
-	// otherwise.
+	// CA issues client certificates. Set only in mtls mode; with it nil the
+	// bootstrap issues nothing.
 	CA *servertls.CA
 }
 
@@ -73,49 +71,34 @@ type BootstrapInfo struct {
 // itself from the returned port + scheme (the server cannot reliably know its
 // own external hostname).
 //
-// One struct carries both credential shapes, selected by auth_mode, with the
-// mode-specific fields omitempty so each mode's object contains exactly its own
-// keys and no empty placeholders:
+//	{auth_mode:"mtls", https_port, tls_cert_fingerprint, client_cert,
+//	 scope, cert_serial, expires_at}
 //
-//	token: {auth_mode:"token", http_port?, https_port, tls_cert_fingerprint,
-//	        token, scope, token_id, expires_at}
-//	mtls:  {auth_mode:"mtls", https_port, tls_cert_fingerprint, client_cert,
-//	        scope, cert_serial, expires_at}
-//
-// A token bundle never carries client_cert/cert_serial; an mtls bundle never
-// carries token/token_id/http_port (there is no bearer token to leak and no
-// plain-HTTP listener to point at). auth_mode is new as of the mtls work — a
-// pre-mtls client ignores the unknown key, which is exactly the legacy parity
-// the token path preserves in the other direction.
+// A 0.9.x server in token mode answered the same request with a bearer-token
+// bundle (auth_mode "token", token, token_id, http_port); this server never
+// does, and carries no code that could. The clients keep decoding both shapes
+// so they still reach servers that have not been upgraded.
 //
 // The SDK/CLI/Rust/Dart decoders MUST keep these json tags in sync.
 type bootstrapBundle struct {
 	AuthMode           string    `json:"auth_mode"`
-	HTTPPort           int       `json:"http_port,omitempty"`
 	HTTPSPort          int       `json:"https_port"`
 	TLSCertFingerprint string    `json:"tls_cert_fingerprint"`
-	Token              string    `json:"token,omitempty"`
 	ClientCert         string    `json:"client_cert,omitempty"`
 	Scope              string    `json:"scope"`
-	TokenID            string    `json:"token_id,omitempty"`
 	CertSerial         string    `json:"cert_serial,omitempty"`
 	ExpiresAt          time.Time `json:"expires_at"`
 }
 
-// SetBootstrap wires the shared HTTP token store and the static bundle metadata
-// used by the _bootstrap SSH handler. Called once by shed-server before Start.
-//
-// tokens may be nil in mtls mode: that path mints certificates and must never
-// touch the token store, so the server does not hand it one.
-func (s *Server) SetBootstrap(tokens *authtoken.Store, info BootstrapInfo) {
-	s.tokens = tokens
+// SetBootstrap wires the static bundle metadata used by the _bootstrap SSH
+// handler. Called once by shed-server before Start.
+func (s *Server) SetBootstrap(info BootstrapInfo) {
 	s.bootstrap = &info
 }
 
-// handleBootstrap serves a reserved `_bootstrap` SSH session: it issues an HTTP
-// credential over the already-authenticated SSH channel and returns the bundle
-// (bearer token or client certificate, plus the TLS pin + ports) as a single
-// JSON line. It never touches the shed routing or the shell wrap.
+// handleBootstrap serves a reserved `_bootstrap` SSH session: it issues a
+// client certificate over the already-authenticated SSH channel and returns the
+// bundle (the certificate plus the TLS pin + port) as a single JSON line. It never touches the shed routing or the shell wrap.
 func (s *Server) handleBootstrap(sess ssh.Session) {
 	bundle, err := s.mintBootstrap(sess.PublicKey(), sess.RawCommand())
 	if err != nil {
@@ -139,69 +122,29 @@ func (s *Server) handleBootstrap(sess ssh.Session) {
 // true for them), so the handler requires `enforce` AND an allowlisted key
 // before issuing a credential. rawCmd is the client's request line:
 // "<scope> [<client-kind>] [csr=<base64>]" (scope defaults to control).
+//
+// Config load allows enforce only in mtls mode, so an open server always stops
+// at the first check. Its message is a protocol string: released clients match
+// it as a whole line to recognise an open server and fall back to plain HTTP
+// (cmd/shed/server_add.go), so it must stay byte-identical.
 func (s *Server) mintBootstrap(key gossh.PublicKey, rawCmd string) (bootstrapBundle, error) {
 	if s.allowlist == nil || s.allowlist.Mode() != config.SSHAuthEnforce {
-		return bootstrapBundle{}, errors.New("bootstrap requires auth.ssh.mode: enforce")
+		return bootstrapBundle{}, errBootstrapOpenServer
 	}
 	if key == nil || !s.allowlist.IsAuthorized(key) {
 		return bootstrapBundle{}, errors.New("bootstrap: key not authorized")
 	}
 	if s.bootstrap == nil {
-		return bootstrapBundle{}, errors.New("bootstrap: token issuance not configured")
+		return bootstrapBundle{}, errors.New("bootstrap: credential issuance not configured")
 	}
 
 	req, err := parseBootstrapRequest(rawCmd)
 	if err != nil {
 		return bootstrapBundle{}, err
 	}
-	if s.bootstrap.AuthMode == config.AuthModeMTLS {
-		return s.mintClientCert(key, req)
-	}
-	return s.mintToken(key, req)
+	return s.mintClientCert(key, req)
 }
 
-// mintToken is the bearer-token half of the bootstrap: unchanged behavior,
-// plus the new auth_mode field.
-//
-// A csr= argument is accepted and then COMPLETELY ignored — not decoded, not
-// length-checked, not validated. That is deliberate legacy parity in both
-// directions: a pre-mtls server ignores unknown request arguments, so a
-// client that speaks CSRs to a token-mode server must get the same token
-// bundle it would have got from the older binary, whatever the csr= value
-// looks like. Erroring on a malformed CSR here would make a token-mode server
-// stricter than the one it replaced.
-func (s *Server) mintToken(key gossh.PublicKey, req bootstrapRequest) (bootstrapBundle, error) {
-	if s.tokens == nil {
-		return bootstrapBundle{}, errors.New("bootstrap: token issuance not configured")
-	}
-	token, rec, err := s.tokens.Mint(gossh.FingerprintSHA256(key), req.scope, req.kind, s.bootstrap.TokenTTL)
-	if err != nil {
-		return bootstrapBundle{}, fmt.Errorf("bootstrap: mint: %w", err)
-	}
-	return bootstrapBundle{
-		// The field names the credential shape carried by THIS bundle, not the
-		// server's auth.mode verbatim: a legacy open-mode server with
-		// auth.ssh.mode: enforce also reaches here and also hands back a bearer
-		// token, and the client's job is the same either way.
-		AuthMode:           config.AuthModeToken,
-		HTTPPort:           s.bootstrap.HTTPPort,
-		HTTPSPort:          s.bootstrap.HTTPSPort,
-		TLSCertFingerprint: s.bootstrap.TLSFingerprint,
-		Token:              token,
-		Scope:              req.scope,
-		TokenID:            rec.ID,
-		ExpiresAt:          rec.ExpiresAt,
-	}, nil
-}
-
-// mintClientCert is the mtls half of the bootstrap: it signs the submitted CSR
-// with the server's internal CA and returns the leaf. No bearer token is minted
-// and the token store is never touched — in mtls mode the server is not even
-// given one.
-//
-// The issued identity comes entirely from the authenticated SSH channel (the
-// key fingerprint) and this request line (scope, kind); the CSR contributes
-// only its public key. See servertls.CA.SignClientCSR.
 // clientProtocolErrors are the CA errors that are part of the enrollment
 // protocol: each describes something the CLIENT can fix (regenerate the key,
 // use a supported algorithm) or must be told about (the CA needs rotating), and
@@ -230,6 +173,12 @@ func clientIssuanceError(err error) error {
 	return errors.New("bootstrap: certificate issuance failed")
 }
 
+// mintClientCert signs the submitted CSR with the server's internal CA and
+// returns the leaf.
+//
+// The issued identity comes entirely from the authenticated SSH channel (the
+// key fingerprint) and this request line (scope, kind); the CSR contributes
+// only its public key. See servertls.CA.SignClientCSR.
 func (s *Server) mintClientCert(key gossh.PublicKey, req bootstrapRequest) (bootstrapBundle, error) {
 	if s.bootstrap.CA == nil {
 		return bootstrapBundle{}, errors.New("bootstrap: client certificate issuance not configured")
@@ -270,8 +219,7 @@ type bootstrapRequest struct {
 	scope string
 	kind  string // canonical authtoken client kind, or "" when absent/unknown
 	// csrArgs holds the raw (still base64) value of every csr= argument seen,
-	// in order. Decoding — and rejecting duplicates — is the mtls path's job,
-	// because the token path must not validate this at all.
+	// in order. Decoding — and rejecting duplicates — is decodeCSRArgs' job.
 	csrArgs []string
 }
 
@@ -319,10 +267,9 @@ func parseBootstrapRequest(rawCmd string) (bootstrapRequest, error) {
 // authtoken constant, returning "" for anything unrecognized.
 //
 // "shed-mobile" is normalized rather than rejected because that is the literal
-// the mobile app sends today; folding it here (in both token and mtls modes)
-// keeps one spelling in the audit trail without a client release. Nothing
-// downstream consumes the kind beyond bookkeeping, so the normalization is
-// safe to apply uniformly.
+// the mobile app sends today; folding it here keeps one spelling in the audit
+// trail without a client release. Nothing downstream consumes the kind beyond
+// bookkeeping, so the normalization is safe to apply uniformly.
 func normalizeClientKind(arg string) string {
 	switch arg {
 	case authtoken.ClientCLI, authtoken.ClientHostAgent, authtoken.ClientDesktop, authtoken.ClientMobile:

@@ -406,19 +406,16 @@ type ServerInfo struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
 	SSHPort int    `json:"ssh_port"`
-	// HTTPPort is the plain-HTTP port (open mode). Omitted in token mode, which
-	// serves no plain HTTP — clients use the HTTPS endpoint there.
+	// HTTPPort is the plain-HTTP port (open mode). Omitted in an enforced
+	// mode, which serves no plain HTTP — clients use the HTTPS endpoint there.
 	HTTPPort int    `json:"http_port,omitempty"`
 	Backend  string `json:"backend"`
 	// AuthMode is the server's auth.mode, so `shed server add` knows whether
-	// to bootstrap an HTTP token (or, in mtls mode, a client certificate)
-	// over SSH. WIRE CONTRACT: on /api/info token mode travels as the legacy
-	// "secure" spelling — released clients gate their bootstrap on that exact
-	// string (LegacyWireAuthMode) — and the decode boundary normalizes it back
-	// to "token" (NormalizeAuthMode, applied in the CLI's GetInfo), so
-	// in-process consumers only ever see "open", "token", or "mtls".
-	// Reported on the unauthenticated /api/info in open/token mode — the mode
-	// is observable from behavior anyway.
+	// to bootstrap a credential over SSH. This server reports "open" or (behind
+	// a client certificate) "mtls". A 0.9.x server in token mode reports the
+	// legacy "secure" spelling, which the decode boundary normalizes to "token"
+	// (NormalizeAuthMode, applied in the CLI's GetInfo), so in-process
+	// consumers only ever see "open", "token", or "mtls".
 	AuthMode string `json:"auth_mode,omitempty"`
 	// DefaultImage is the resolved default_image for the active backend
 	// (after ${shed.version} expansion / version synthesis at load). Exposed
@@ -426,9 +423,9 @@ type ServerInfo struct {
 	// use — useful when the ref is synthesized and never written in config.
 	DefaultImage string `json:"default_image,omitempty"`
 
-	// HTTPSPort is the pinned-TLS listener port in token mode (auth.mode:
-	// token), so a client adding a token-mode server can learn the TLS
-	// endpoint. 0/omitted in open mode (no HTTPS listener).
+	// HTTPSPort is the pinned-TLS listener port in mtls mode, so a client can
+	// learn the TLS endpoint (0.9.x servers reported it in token mode too).
+	// 0/omitted in open mode (no HTTPS listener).
 	HTTPSPort int `json:"https_port,omitempty"`
 
 	// CAFingerprint is the "sha256:<hex>" pin of the internal CA that signs
@@ -436,12 +433,12 @@ type ServerInfo struct {
 	// visibility, not a trust anchor: a client never needs it (it authenticates
 	// the SERVER by the tls_cert_fingerprint pin and proves itself with the cert
 	// the SSH bootstrap handed it), but an operator comparing two servers, or
-	// confirming a CA rotation landed, does. Omitted in open/token mode.
+	// confirming a CA rotation landed, does. Omitted in open mode.
 	CAFingerprint string `json:"ca_fingerprint,omitempty"`
 	// CANotAfter is the client CA's expiry (RFC 3339), reported only in mtls
 	// mode. Rotating the CA invalidates every issued client certificate
 	// fleet-wide and must be scheduled, so the deadline is worth surfacing
-	// somewhere a human or a monitor can read it. Omitted in open/token mode.
+	// somewhere a human or a monitor can read it. Omitted in open mode.
 	//
 	// A string rather than time.Time so the field can be omitted when unset —
 	// encoding/json's omitempty does not apply to struct values.
@@ -1020,34 +1017,33 @@ const (
 	SSHAuthEnforce = "enforce" // reject keys not in the allowlist
 )
 
-// Auth modes for AuthConfig.Mode — the secure-by-default switch.
-// "secure" is the pre-rename spelling of AuthModeToken, kept as a deprecated
-// alias that config load normalizes to AuthModeToken (see normalizeAuthMode
-// in server.go) — downstream code only ever observes AuthModeToken.
+// Auth modes for AuthConfig.Mode. A server config accepts open and mtls only.
 const (
-	AuthModeOpen  = "open"  // default: no enforcement (tailnet/LAN posture)
-	AuthModeToken = "token" // SSH allowlist + HTTP tokens + TLS, all enforced
+	AuthModeOpen = "open" // default: no enforcement, loopback only
+	// AuthModeToken is the removed bearer-token server mode ("secure" before
+	// its rename). A server config naming it fails to load. The constant stays
+	// for clients: a client entry records it for a 0.9.x token-mode server,
+	// and the CLI still bootstraps bearer tokens from such servers.
+	AuthModeToken = "token"
 	// AuthModeMTLS: the client credential is a short-lived certificate issued
-	// over the SSH bootstrap channel; no bearer tokens exist in this mode.
-	// Shares every other token-mode invariant (SSH allowlist enforce, TLS-only,
-	// https_port default) — see AuthEnforced in server.go.
+	// over the SSH bootstrap channel, with the SSH allowlist enforced, TLS-only
+	// serving and an https_port default — see AuthEnforced in server.go.
 	AuthModeMTLS = "mtls"
 )
 
 // AuthConfig configures authentication. The headline control is Mode (the
-// open|token|mtls switch). The SSH sub-block carries key sources and the
-// advanced SSH mode override. HTTP bearer-token enforcement is derived purely
-// from token mode — there is no HTTP sub-block.
+// open|mtls switch). The SSH sub-block carries key sources and the advanced SSH
+// mode override. There is no HTTP sub-block: HTTP authentication is derived
+// from the mode.
 type AuthConfig struct {
-	// Mode is open | token | mtls (default open; the deprecated "secure"
-	// spelling is normalized to "token" at config load, with one startup
-	// deprecation warning). token derives: SSH allowlist enforce, HTTP
-	// bearer-token enforce, and TLS on (the server serves the TLS listener
-	// only). mtls derives the same SSH-allowlist-enforce and TLS-only posture,
-	// but the client credential is a short-lived certificate rather than a
-	// bearer token. Both require at least one SSH key source.
+	// Mode is open | mtls (default open). mtls derives SSH allowlist enforce,
+	// TLS-only serving, and a short-lived client certificate issued over the
+	// SSH bootstrap channel as the HTTP credential; it requires at least one
+	// SSH key source. Open is loopback only. The removed bearer-token mode
+	// ("token", formerly "secure") fails config load.
 	Mode string `yaml:"mode,omitempty"`
-	// TokenTTL is the lifetime of a bootstrap-minted HTTP token (default 24h).
+	// TokenTTL is the lifetime of a bootstrap-issued client certificate
+	// (default 24h). The name is kept from the removed bearer-token mode.
 	TokenTTL Duration `yaml:"token_ttl,omitempty"`
 	// SSH configures the SSH public-key allowlist (key sources + advanced mode).
 	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`

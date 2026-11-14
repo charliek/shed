@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -40,14 +41,12 @@ type ServerConfig struct {
 	// BindAddress is the interface every listener (HTTP, HTTPS, SSH) binds. It
 	// defaults to loopback (127.0.0.1) — shed is a local-development tool by
 	// default. Set a routable address (a LAN/tailnet IP, "0.0.0.0"/"*" for all
-	// IPv4, or "::" for all interfaces) to reach it off-box. In open mode that
-	// also requires AllowInsecureExposure, since open mode has no transport
-	// security; token mode (TLS + tokens) needs no acknowledgment.
+	// IPv4, or "::" for all interfaces) to reach it off-box. Only an mtls
+	// server may bind off loopback: open mode has no transport security and is
+	// loopback only (validateBindAddress). The old allow_insecure_exposure
+	// acknowledgment was removed and fails config load
+	// (rejectRemovedNetworkKeys).
 	BindAddress string `yaml:"bind_address,omitempty"`
-	// AllowInsecureExposure acknowledges binding an open-mode (plaintext,
-	// possibly unauthenticated) server to a non-loopback interface. Required to
-	// start such a server; ignored in token mode. Prefer auth.mode: token.
-	AllowInsecureExposure bool `yaml:"allow_insecure_exposure,omitempty"`
 	// TrustedProxy enables chi's RealIP middleware, which trusts the
 	// client-supplied X-Forwarded-For. Only safe behind a proxy that
 	// overwrites that header; the default (false) uses the real TCP peer
@@ -143,43 +142,31 @@ func (c *ServerConfig) SSHAuth() *SSHAuthConfig {
 	return c.Auth.SSH
 }
 
-// DefaultTokenTTL is the lifetime of a bootstrap-minted HTTP token when
-// auth.token_ttl is unset.
+// DefaultTokenTTL is the lifetime of a bootstrap-issued client certificate
+// when auth.token_ttl is unset. The key keeps its historical name; since the
+// bearer-token mode was removed it sets only the certificate lifetime.
 const DefaultTokenTTL = 24 * time.Hour
-
-// TokenMode reports whether the server runs in token mode (auth.mode: token):
-// SSH allowlist enforce + HTTP bearer-token enforce + TLS-only (no plain HTTP
-// listener faces clients). The default (open) preserves the legacy accept-all
-// tailnet/LAN posture.
-func (c *ServerConfig) TokenMode() bool {
-	return c.Auth != nil && c.Auth.Mode == AuthModeToken
-}
 
 // MTLSMode reports whether the server runs in mtls mode (auth.mode: mtls):
 // the client credential is a short-lived certificate issued over the SSH
-// bootstrap channel rather than a bearer token, verified at the TLS handshake
-// and re-validated on every HTTP request. It shares every other token-mode
-// network/SSH invariant — see AuthEnforced, the combined predicate most call
-// sites should use when they only care that auth is on.
+// bootstrap channel, verified at the TLS handshake and re-validated on every
+// HTTP request. It is the only enforced mode; the bearer-token mode ("token",
+// formerly "secure") was removed and fails config load.
 func (c *ServerConfig) MTLSMode() bool {
 	return c.Auth != nil && c.Auth.Mode == AuthModeMTLS
 }
 
-// AuthEnforced reports whether the server enforces a non-open auth posture —
-// token or mtls. SSH allowlist enforce, TLS-only serving (no plain HTTP),
-// the https_port default, and non-loopback bind without an explicit
-// acknowledgment all key off this combined predicate: both modes share the
-// same network/SSH shape and differ only in how the client authenticates.
+// AuthEnforced reports whether the server enforces a non-open auth posture.
+// mtls is the only such mode. SSH allowlist enforce, TLS-only serving (no
+// plain HTTP), the https_port default, and non-loopback binding all key off
+// this predicate.
 func (c *ServerConfig) AuthEnforced() bool {
-	return c.TokenMode() || c.MTLSMode()
+	return c.MTLSMode()
 }
 
 // HTTPAuthEnforced reports whether the HTTP API requires an authenticated
-// caller at all. It is the gate on the auth middleware, not a statement about
-// WHICH credential: token mode requires a scoped bearer token, mtls mode
-// requires a scoped client certificate, and only open mode passes traffic
-// through unauthenticated. The middleware branches on TokenMode/MTLSMode after
-// this gate says "enforce something".
+// caller at all. It is the gate on the auth middleware: mtls requires a scoped
+// client certificate and open mode passes traffic through unauthenticated.
 //
 // It is deliberately identical to AuthEnforced today. The two are kept apart
 // because they answer different questions — "does HTTP require a credential"
@@ -189,26 +176,19 @@ func (c *ServerConfig) HTTPAuthEnforced() bool {
 	return c.AuthEnforced()
 }
 
-// AuthModeValue returns the effective auth.mode string, defaulting to
-// AuthModeOpen when auth is unset. Config load guarantees this is one of
-// open, token, or mtls by the time the server starts (normalizeAuthMode
-// resolves the deprecated "secure" alias and validateAuth rejects anything
-// else), so callers — e.g. the /api/info handler — can report it directly.
+// AuthModeValue returns the effective auth.mode string: open (also when auth
+// is unset) or mtls. Config load refuses every other value, so callers — e.g.
+// the /api/info handler — can report it directly.
 func (c *ServerConfig) AuthModeValue() string {
 	if c.Auth == nil || c.Auth.Mode == "" {
 		return AuthModeOpen
 	}
-	// Defensive: loaders normalize the deprecated "secure" alias before
-	// validation, but hand-built configs (tests, tooling) may not have gone
-	// through a loader — report the effective mode either way.
-	mode, _ := normalizeAuthModeValue(c.Auth.Mode)
-	return mode
+	return c.Auth.Mode
 }
 
 // EffectiveSSHAuth returns the SSH auth config to build the allowlist from. In
-// an enforced mode (token or mtls) the mode is forced to enforce (key sources
-// still come from the configured auth.ssh block); otherwise the configured
-// block is used verbatim.
+// mtls mode the mode is forced to enforce (key sources still come from the
+// configured auth.ssh block); otherwise the configured block is used verbatim.
 func (c *ServerConfig) EffectiveSSHAuth() *SSHAuthConfig {
 	if !c.AuthEnforced() {
 		return c.SSHAuth()
@@ -221,8 +201,8 @@ func (c *ServerConfig) EffectiveSSHAuth() *SSHAuthConfig {
 	return &eff
 }
 
-// TokenTTL is the lifetime of a bootstrap-minted HTTP token (auth.token_ttl),
-// defaulting to DefaultTokenTTL when unset.
+// TokenTTL is the lifetime of a bootstrap-issued client certificate
+// (auth.token_ttl), defaulting to DefaultTokenTTL when unset.
 func (c *ServerConfig) TokenTTL() time.Duration {
 	if c.Auth != nil && c.Auth.TokenTTL > 0 {
 		return c.Auth.TokenTTL.Duration()
@@ -406,15 +386,16 @@ func (c *ServerConfig) validateNetworkBackend() error {
 func (c *ServerConfig) validateAuth() error {
 	if c.Auth != nil {
 		switch c.Auth.Mode {
-		case "", AuthModeOpen, AuthModeToken, AuthModeMTLS:
+		case "", AuthModeOpen, AuthModeMTLS:
+		case AuthModeToken, authModeSecureAlias:
+			// The loaders refuse these from the raw YAML first
+			// (rejectRemovedAuthKeys); this catches a hand-built config.
+			return removedAuthModeError(c.Auth.Mode)
 		default:
-			return fmt.Errorf("invalid auth.mode: %q (must be open, token, or mtls)", c.Auth.Mode)
+			return fmt.Errorf("invalid auth.mode: %q (must be open or mtls)", c.Auth.Mode)
 		}
 	}
-	// enforced covers both non-open modes: mtls inherits every token-mode
-	// SSH/network invariant below (it differs only in which HTTP credential the
-	// auth middleware demands — a client certificate rather than a bearer
-	// token — which is out of scope here).
+	// enforced is mtls, the only non-open mode.
 	enforced := c.AuthEnforced()
 	if ssh := c.SSHAuth(); ssh != nil {
 		switch ssh.Mode {
@@ -430,24 +411,23 @@ func (c *ServerConfig) validateAuth() error {
 				return fmt.Errorf("invalid auth.ssh.github_users entry: %q", u)
 			}
 		}
-		// tokens/certs ⟺ TLS ⟺ an enforced mode: SSH enforce is the token/mtls
-		// posture. An explicit enforce on an open-mode server is rejected (warn
+		// certs ⟺ TLS ⟺ mtls: SSH enforce is the mtls posture. An explicit enforce on an open-mode server is rejected (warn
 		// stages an allowlist on a trusted network); an enforced mode forces
 		// enforce itself, so an explicit off/warn there contradicts the mode. An
 		// unset ssh.Mode under an enforced mode stays valid (EffectiveSSHAuth
 		// derives enforce).
 		if ssh.Mode == SSHAuthEnforce && !enforced {
-			return fmt.Errorf("auth.ssh.mode: enforce requires auth.mode: token or mtls (use warn to stage an allowlist on a trusted network)")
+			return fmt.Errorf("auth.ssh.mode: enforce requires auth.mode: mtls (use warn to stage an allowlist on a trusted network)")
 		}
 		if enforced && (ssh.Mode == SSHAuthOff || ssh.Mode == SSHAuthWarn) {
 			return fmt.Errorf("auth.mode: %s forces auth.ssh.mode: enforce; remove the explicit auth.ssh.mode: %s", c.Auth.Mode, ssh.Mode)
 		}
 	}
-	// https_port is an enforced-mode-only surface: an open-mode server serves
-	// plain http only. Checked outside the ssh block so it fires even when
+	// https_port is an mtls-only surface: an open-mode server serves plain
+	// http only. Checked outside the ssh block so it fires even when
 	// auth.ssh is unset.
 	if c.HTTPSPort > 0 && !enforced {
-		return fmt.Errorf("https_port requires auth.mode: token or mtls (an open-mode server serves plain http only)")
+		return fmt.Errorf("https_port requires auth.mode: mtls (an open-mode server serves plain http only)")
 	}
 	return c.validateClients()
 }
@@ -583,15 +563,14 @@ func (c *ServerConfig) ActiveDefaultResources() (cpus, memoryMB int) {
 
 // HTTPListenAddr returns the bind address for the plain-HTTP listener, honoring
 // bind_address (default loopback). The plain-HTTP listener is served only in
-// open mode (see PlainHTTPEnabled); token mode is TLS-only and starts no
-// plain-HTTP listener, so this is not consulted there.
+// open mode (see PlainHTTPEnabled); mtls is TLS-only and starts no plain-HTTP
+// listener, so this is not consulted there.
 func (c *ServerConfig) HTTPListenAddr() string {
 	return listenAddr(c.BindAddress, c.HTTPPort)
 }
 
 // PlainHTTPEnabled reports whether the main plain-HTTP listener should be
-// served. False in an enforced mode (token or mtls; TLS-only — the plain
-// listener is not started).
+// served. False in mtls mode (TLS-only — the plain listener is not started).
 func (c *ServerConfig) PlainHTTPEnabled() bool { return !c.AuthEnforced() }
 
 // HTTPSEnabled reports whether the HTTPS listener is configured.
@@ -610,11 +589,11 @@ func (c *ServerConfig) HTTPSListenAddr() string {
 func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.BindAddress, c.SSHPort) }
 
 // PreflightAuth gates enforced-mode startup: it refuses to start when
-// auth.mode: token or mtls is set without any SSH key source (github_users /
-// authorized_keys / authorized_keys_file). Both modes enforce the SSH
-// allowlist, so an empty allowlist would lock everyone out; mtls additionally
-// needs a key source to identify which client gets a certificate issued over
-// the bootstrap channel. Inert in open mode.
+// auth.mode: mtls is set without any SSH key source (github_users /
+// authorized_keys / authorized_keys_file). mtls enforces the SSH allowlist, so
+// an empty allowlist would lock everyone out, and it needs a key source to
+// identify which client gets a certificate issued over the bootstrap channel.
+// Inert in open mode.
 func (c *ServerConfig) PreflightAuth() error {
 	if !c.AuthEnforced() {
 		return nil
@@ -687,7 +666,7 @@ func (c *ServerConfig) validateStateDir() error {
 
 // validateHTTPPort range-checks http_port: required (1..65535) in open mode,
 // where it drives the plain-HTTP listener; optional (0 = unset) in an enforced
-// mode (token or mtls), which serves no plain HTTP. Shared by Validate and
+// mode (mtls), which serves no plain HTTP. Shared by Validate and
 // ValidateNoHostCoupling.
 func (c *ServerConfig) validateHTTPPort() error {
 	minPort := 1
@@ -700,22 +679,23 @@ func (c *ServerConfig) validateHTTPPort() error {
 	return nil
 }
 
-// validateBindAddress validates the bind_address format and gates non-loopback
-// exposure of an open-mode server. The format check accepts the special tokens
+// validateBindAddress validates the bind_address format and keeps an
+// open-mode server on loopback. The format check accepts the special tokens
 // ("" = loopback default, "*" = all IPv4) plus "localhost" and any IP literal;
 // a hostname or typo is rejected here rather than failing cryptically at
-// net.Listen on startup. Open mode has no transport security, so binding a
-// routable interface also requires an explicit allow_insecure_exposure
-// acknowledgment; an enforced mode (token or mtls; TLS + client auth) needs
-// none. Shared by Validate and ValidateNoHostCoupling.
+// net.Listen on startup. Open mode has no transport security and no client
+// authentication, so it binds loopback only; there is no acknowledgment that
+// widens it (allow_insecure_exposure was removed). Only mtls (TLS + client
+// certificates) may bind a routable interface. Shared by Validate and
+// ValidateNoHostCoupling.
 func (c *ServerConfig) validateBindAddress() error {
 	if b := c.BindAddress; b != "" && b != "*" && b != "localhost" && net.ParseIP(b) == nil {
 		return fmt.Errorf("invalid bind_address %q (want an IP address, \"0.0.0.0\"/\"*\" for all IPv4, \"::\" for all interfaces, \"localhost\", or empty for loopback)", b)
 	}
-	if c.AuthEnforced() || isLoopbackBind(c.BindAddress) || c.AllowInsecureExposure {
+	if c.AuthEnforced() || isLoopbackBind(c.BindAddress) {
 		return nil
 	}
-	return fmt.Errorf("bind_address %q exposes an open-mode (plaintext, no-TLS) server beyond loopback; set allow_insecure_exposure: true to confirm, or use auth.mode: token or mtls", c.BindAddress)
+	return fmt.Errorf("bind_address %q exposes an open-mode server beyond loopback; open mode is loopback only, use auth.mode: mtls to reach it from other hosts", c.BindAddress)
 }
 
 // ExtensionsConfig configures which extensions the agent should enable.
@@ -1748,27 +1728,38 @@ func rejectRemovedAuthKeys(data []byte) error {
 	}
 	if _, present := raw["public_exposure"]; present {
 		return fmt.Errorf("config key %q was removed; use %q instead (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.0-to-v0.7.1.md)",
-			"public_exposure", "auth.mode: token")
+			"public_exposure", "auth.mode: mtls")
 	}
 	auth, ok := raw["auth"].(map[string]any)
 	if !ok {
 		return nil
 	}
-	// The entire auth.http subtree was removed: HTTP token enforcement is now
-	// derived from auth.mode: token (the auth.http.mode knob is gone), and
-	// tokens are minted over the SSH bootstrap channel (auth.http.tokens is
-	// gone). Reject the block wholesale, with a tokens-specific hint when present.
+	// The bearer-token mode (and its pre-rename spelling "secure") was removed.
+	// Refused here, from the raw YAML and before any default is applied, so a
+	// config that names it never loads and nothing falls back to open.
+	if mode, ok := auth["mode"].(string); ok && (mode == AuthModeToken || mode == authModeSecureAlias) {
+		return removedAuthModeError(mode)
+	}
+	// The entire auth.http subtree was removed long before the token mode
+	// itself. Reject the block wholesale, with a tokens-specific hint when
+	// present.
 	if httpBlock, present := auth["http"]; present {
 		if hb, ok := httpBlock.(map[string]any); ok {
 			if _, hasTokens := hb["tokens"]; hasTokens {
-				return fmt.Errorf("config key %q was removed; tokens are now minted over the SSH bootstrap channel under %q (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md)",
-					"auth.http.tokens", "auth.mode: token")
+				return fmt.Errorf("config key %q was removed; clients now enroll over the SSH bootstrap channel under %q (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md)",
+					"auth.http.tokens", "auth.mode: mtls")
 			}
 		}
-		return fmt.Errorf("config key %q was removed; HTTP token enforcement is now derived from %q (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md)",
-			"auth.http", "auth.mode: token")
+		return fmt.Errorf("config key %q was removed; HTTP authentication is now derived from %q (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md)",
+			"auth.http", "auth.mode: mtls")
 	}
 	return nil
+}
+
+// removedAuthModeError is the config-load refusal for the removed bearer-token
+// mode, under either spelling. It names mtls, the replacement.
+func removedAuthModeError(mode string) error {
+	return fmt.Errorf("auth.mode: %q was removed in v0.10.0; use auth.mode: mtls (clients re-enroll with a certificate on their next request), or remove auth.mode for an open server on loopback", mode)
 }
 
 // rejectRemovedNetworkKeys fails loudly if a config still carries network-surface
@@ -1781,14 +1772,21 @@ func rejectRemovedNetworkKeys(data []byte) error {
 		return nil // malformed YAML — let the typed unmarshal surface the parse error
 	}
 	if _, present := raw["internal_http_port"]; present {
-		return fmt.Errorf("config key %q was removed in v0.7.4; the credential bus and Connect tunnel now ride the single listener (pinned TLS in token mode), gated by the credentials scope (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md)",
+		return fmt.Errorf("config key %q was removed in v0.7.4; the credential bus and Connect tunnel now ride the single listener (pinned TLS in mtls mode), gated by the credentials scope (see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md)",
 			"internal_http_port")
 	}
 	for _, removed := range []string{"http_bind", "ssh_bind"} {
 		if _, present := raw[removed]; present {
-			return fmt.Errorf("config key %q was unified into %q in v0.7.4 (one interface for all listeners; defaults to loopback). Use %q (and allow_insecure_exposure for non-loopback open-mode exposure) — see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md",
+			return fmt.Errorf("config key %q was unified into %q in v0.7.4 (one interface for all listeners; defaults to loopback). Use %q; only auth.mode: mtls may bind beyond loopback — see https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md",
 				removed, "bind_address", "bind_address")
 		}
+	}
+	// Present with any value, false included: the key no longer does anything,
+	// and silently ignoring a true would leave an operator believing an open
+	// server is reachable off-box.
+	if _, present := raw["allow_insecure_exposure"]; present {
+		return fmt.Errorf("config key %q was removed in v0.10.0; an open-mode server binds loopback only. Use auth.mode: mtls to reach the server from other hosts",
+			"allow_insecure_exposure")
 	}
 	return nil
 }
@@ -1819,6 +1817,109 @@ func rejectUnknownClientKeys(data []byte) error {
 	var typed map[string]ServiceClientConfig
 	if err := dec.Decode(&typed); err != nil {
 		return fmt.Errorf("auth.clients: %w", err)
+	}
+	return nil
+}
+
+// rejectUnknownAuthKeys fails loudly on an unknown key anywhere under auth:,
+// auth.ssh and auth.clients included. The typed unmarshal is lenient and
+// case-sensitive, so `auth: {Mode: mtls}` or a misspelt `mdoe:` would be
+// dropped and the server would start open with no allowlist enforced: the
+// operator asked for an enforced mode and got none. Runs after
+// rejectRemovedAuthKeys, so a removed key (auth.http) keeps its own message.
+func rejectUnknownAuthKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	block, present := raw["auth"]
+	if !present || block == nil {
+		return nil
+	}
+	sub, err := yaml.Marshal(block)
+	if err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(sub))
+	dec.KnownFields(true)
+	var typed AuthConfig
+	if err := dec.Decode(&typed); err != nil {
+		return fmt.Errorf("auth: %w (keys are case-sensitive)", err)
+	}
+	return nil
+}
+
+// removedTopLevelKeys are top-level keys earlier releases accepted and this
+// one refuses by name (rejectRemovedImageKeys, rejectRemovedAuthKeys,
+// rejectRemovedNetworkKeys). A re-cased spelling of one is refused as well.
+var removedTopLevelKeys = []string{
+	"default_image", "public_exposure", "internal_http_port", "http_bind", "ssh_bind", "allow_insecure_exposure",
+}
+
+// yamlKeys returns the yaml key of every field of struct type t, following
+// ",inline" fields and skipping "-".
+func yamlKeys(t reflect.Type) []string {
+	var keys []string
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		tag := f.Tag.Get("yaml")
+		name, opts, _ := strings.Cut(tag, ",")
+		if name == "-" {
+			continue
+		}
+		if strings.Contains(","+opts+",", ",inline,") {
+			ft := f.Type
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				keys = append(keys, yamlKeys(ft)...)
+			}
+			continue
+		}
+		if name == "" {
+			name = strings.ToLower(f.Name) // yaml.v3's default key
+		}
+		keys = append(keys, name)
+	}
+	return keys
+}
+
+// rejectMiscasedTopLevelKeys fails loudly on a top-level key that matches a
+// known (or removed) top-level key only when case is ignored: `Auth:`,
+// `Bind_Address:`, `ALLOW_INSECURE_EXPOSURE:`. YAML keys are case-sensitive,
+// so the typed unmarshal and every removed-key scan would skip such a key and
+// the server would start on the default it stands beside (an open server, for
+// `Auth:`). An unknown top-level key that matches nothing stays ignored, as it
+// always has: refusing every unknown key would break existing configs for no
+// security gain.
+func rejectMiscasedTopLevelKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	known := append(yamlKeys(reflect.TypeOf(ServerConfig{})), removedTopLevelKeys...)
+	exact := make(map[string]bool, len(known))
+	for _, k := range known {
+		exact[k] = true
+	}
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic: report the first offender by name
+	for _, k := range keys {
+		if exact[k] {
+			continue
+		}
+		for _, want := range known {
+			if strings.EqualFold(k, want) {
+				return fmt.Errorf("config key %q is not recognised; keys are case-sensitive, did you mean %q?", k, want)
+			}
+		}
 	}
 	return nil
 }
@@ -1911,7 +2012,8 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 func rejectRemovedKeys(data []byte) error {
 	for _, check := range []func([]byte) error{
 		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys,
-		rejectUnknownClientKeys, rejectUnknownNetworkKeys, rejectUnknownRemoteKeys,
+		rejectMiscasedTopLevelKeys,
+		rejectUnknownClientKeys, rejectUnknownAuthKeys, rejectUnknownNetworkKeys, rejectUnknownRemoteKeys,
 	} {
 		if err := check(data); err != nil {
 			return err
@@ -1922,11 +2024,10 @@ func rejectRemovedKeys(data []byte) error {
 
 // applyModeAndCommonDefaults fills in the mode-derived and common zero-value
 // defaults shared by both loaders (serve + config-validate), so the two paths
-// can't drift. http_port drives the open-mode plain-HTTP listener; an enforced
-// mode (token or mtls) serves no plain HTTP, so any value there is dropped (set
-// or constructor default) and /api/info + the written client entry omit a
-// vestigial port. An enforced mode also defaults https_port so `auth.mode:
-// token` / `auth.mode: mtls` need no extra TLS config.
+// can't drift. http_port drives the open-mode plain-HTTP listener; mtls serves
+// no plain HTTP, so any value there is dropped (set or constructor default) and
+// /api/info + the written client entry omit a vestigial port. mtls also
+// defaults https_port so `auth.mode: mtls` needs no extra TLS config.
 func applyModeAndCommonDefaults(cfg *ServerConfig) {
 	if cfg.AuthEnforced() {
 		cfg.HTTPPort = 0
@@ -1947,76 +2048,23 @@ func applyModeAndCommonDefaults(cfg *ServerConfig) {
 	}
 }
 
-// authModeSecureAlias is the deprecated pre-rename spelling of AuthModeToken,
-// accepted indefinitely for backward compatibility and normalized away at
-// config load time (see normalizeAuthMode).
+// authModeSecureAlias is the pre-rename spelling of AuthModeToken. A server
+// config naming either fails to load (removedAuthModeError); the constant
+// remains for that check and for the client boundary (NormalizeAuthMode),
+// because a 0.9.x server still reports token mode as "secure" on /api/info.
 const authModeSecureAlias = "secure"
 
-// authModeDeprecationWarning is the single startup line emitted when a config
-// still spells the mode "secure" — printed exactly once per config load.
-const authModeDeprecationWarning = `auth.mode: "secure" is deprecated; use "token"`
-
-// normalizeAuthModeValue maps the deprecated "secure" auth.mode spelling to
-// the canonical "token", reporting whether the legacy alias was used. Any
-// other value — "", the canonical "token", or an invalid string — passes
-// through unchanged; validateAuth rejects an invalid value later. Pure
-// (no I/O) so it can be unit-tested directly; normalizeAuthMode wraps it with
-// the actual warning emission.
-func normalizeAuthModeValue(mode string) (normalized string, isLegacyAlias bool) {
-	if mode == authModeSecureAlias {
-		return AuthModeToken, true
-	}
-	return mode, false
-}
-
-// NormalizeAuthMode maps the deprecated "secure" auth.mode spelling to the
-// canonical "token"; every other value passes through unchanged. This is the
-// client-boundary half of the wire-compat contract (see LegacyWireAuthMode):
-// any code that decodes an auth mode string off the wire — /api/info from a
-// released pre-rename server (which reports "secure"), or from a current
-// server in token mode (which deliberately still reports "secure") — must
-// normalize before comparing against the AuthMode* constants.
+// NormalizeAuthMode maps the pre-rename "secure" auth.mode spelling to the
+// canonical "token"; every other value passes through unchanged. It is the
+// client-boundary half of a wire-compat contract with servers older than this
+// one: a 0.9.x server in token mode reports "secure" on /api/info, and the CLI
+// must normalize what it decodes before comparing against the AuthMode*
+// constants. This server never reports either spelling.
 func NormalizeAuthMode(mode string) string {
-	normalized, _ := normalizeAuthModeValue(mode)
-	return normalized
-}
-
-// LegacyWireAuthMode maps the canonical "token" spelling back to the legacy
-// "secure" for wire surfaces that released pre-rename clients consume.
-//
-// The one such surface is /api/info's auth_mode field: an old client decides
-// whether to bootstrap a credential at all by checking the exact string
-// "secure" (cmd/shed/server.go:352 at v0.8.0). Reporting "token" there makes
-// the old client skip the bootstrap and save an entry with no credential,
-// which then 401s on every command — so token mode keeps the legacy spelling
-// on that wire indefinitely, and clients normalize on decode
-// (NormalizeAuthMode). "open" and "mtls" pass through: "open" predates the
-// rename unchanged, and mtls-mode /api/info is client-certificate-gated, so
-// no pre-rename client can ever read it.
-func LegacyWireAuthMode(mode string) string {
-	if mode == AuthModeToken {
-		return authModeSecureAlias
+	if mode == authModeSecureAlias {
+		return AuthModeToken
 	}
 	return mode
-}
-
-// normalizeAuthMode rewrites cfg.Auth.Mode from the deprecated "secure"
-// spelling to the canonical "token", emitting exactly one startup deprecation
-// warning line when the legacy alias was used. Must run before
-// applyModeAndCommonDefaults and validateAuth — both key off cfg.Auth.Mode —
-// so every downstream reader (TokenMode, MTLSMode, AuthEnforced,
-// HTTPAuthEnforced, PreflightAuth, the /api/info handler, ...) only ever
-// observes "", "open", "token", or "mtls" — never the legacy alias.
-// Shared by both server-config loaders so they can't drift.
-func normalizeAuthMode(cfg *ServerConfig) {
-	if cfg.Auth == nil {
-		return
-	}
-	mode, deprecated := normalizeAuthModeValue(cfg.Auth.Mode)
-	cfg.Auth.Mode = mode
-	if deprecated {
-		fmt.Fprintln(os.Stderr, authModeDeprecationWarning)
-	}
 }
 
 // LoadServerConfigFromPath loads server configuration from a specific path.
@@ -2053,7 +2101,6 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	}
 
 	normalizeMounts(cfg, configPath)
-	normalizeAuthMode(cfg)
 
 	applyModeAndCommonDefaults(cfg)
 
@@ -2201,7 +2248,6 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 	}
 
 	normalizeMounts(cfg, configPath)
-	normalizeAuthMode(cfg)
 
 	applyModeAndCommonDefaults(cfg)
 

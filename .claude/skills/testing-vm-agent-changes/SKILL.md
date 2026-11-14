@@ -347,16 +347,15 @@ proxy half-close). What bit, by backend:
   called `remote_unsupported`) and created sheds on the installed server.
   Empty the variables of every backend you do not want instead
   (`make test-integration-remote` and `-dev-fc` do this).
-- **The dev servers run mtls by default** (both committed dev configs), and the
-  bearer-token and reconfiguring cases skip under it. Only the Mac
-  `SHED_DEV_AUTH_MODE=token` run reaches them, and there two VZ cases fail for
-  harness reasons, not the change under test:
-  `test_network_surface.py::test_bus_and_connect_on_single_listener`
-  (`KeyError: 'http_port'`: an SSH-first `shed server add` writes no
-  `http_port` into the entry) and `test_ssh_auth.py::test_warn_admits_offlist`
-  (the restarted server refuses its config: `auth.mode: token forces
-  auth.ssh.mode: enforce`). Compare against a baseline before blaming the
-  branch.
+- **The dev servers run mtls, the only enforced mode.** shed-server no
+  longer loads `auth.mode: token`/`secure` or `allow_insecure_exposure`, and
+  `SHED_DEV_AUTH_MODE` is gone (a leftover value stops the dev targets with
+  one line). The reconfiguring cases (`fixtures/devcontrol.py: dev_config`)
+  run in the default run on the Mac: their readiness check is
+  `scripts/dev-server-probe.sh` plus one `/api/info` with a freshly enrolled
+  certificate, and the open-mode ones run the dev server as an open server on
+  loopback. Their first live runs were after the token removal; if one fails
+  for a harness reason, compare against a baseline before blaming the branch.
 - **`make dev-server-down` can need SIGKILL** after its 5 s grace even with
   zero sheds. Not a sign of a stuck VM by itself.
 - **A scratch copy of the repo needs its tags.** Make it with

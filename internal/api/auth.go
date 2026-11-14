@@ -8,67 +8,51 @@ import (
 
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/authtoken"
+	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
 )
 
 // authMiddleware enforces the server's auth.mode on every /api request. There
-// are exactly three shapes:
+// are exactly two shapes:
 //
-//	open  — pass-through (the default; unchanged legacy tailnet/LAN posture)
-//	token — a scoped bearer token, validated against the in-memory store
+//	open  — pass-through (the default; loopback only)
 //	mtls  — a scoped client certificate, validated against the internal CA
 //	        at the handshake and RE-validated here on every request
 //
-// The two enforced branches share one authorization table (authorizeScope):
-// the credential bus (/api/plugins/*) requires credentials scope; the Connect
+// The server holds no bearer-token code: the token mode was removed, and a
+// config naming it does not load. An Authorization header is never read.
+//
+// The enforced branch consults one authorization table (authorizeScope): the
+// credential bus (/api/plugins/*) requires credentials scope; the Connect
 // tunnel (/api/sheds/*/connect/*) and the egress audit stream
 // (GET /api/egress/stream) accept control or credentials; everything else
 // requires control. So a leaked control credential can't reach the bus, and a
-// credentials credential can't manage the fleet — identically in both modes.
+// credentials credential can't manage the fleet.
 //
-// Bootstrap exemptions (GET /api/info, GET /api/ssh-host-key) are a TOKEN-MODE
-// concept: they let `shed server add` fetch server info + the host key before
-// the operator holds a token. mtls mode has no exemptions at all. It does not
-// need them (a client that has not enrolled cannot complete the TLS handshake,
-// so an exempt route is unreachable pre-certificate either way), and carving
-// one out would mean a code path in the mtls branch that skips certificate
-// validation — the exact shape of an accidental fail-open. Everything an mtls
-// client needs to bootstrap arrives in the SSH `_bootstrap` bundle instead.
+// mtls has no unauthenticated exemptions at all, /api/info included. It does
+// not need them (a client that has not enrolled cannot complete the TLS
+// handshake, so an exempt route is unreachable pre-certificate either way), and
+// carving one out would mean a code path that skips certificate validation —
+// the exact shape of an accidental fail-open. Everything an mtls client needs
+// to bootstrap arrives in the SSH `_bootstrap` bundle instead.
+//
+// Any other mode string refuses every request. Config load never produces one
+// (it refuses the removed token mode by name), so this guards a config built
+// in code: a mode this server does not implement must not fall back to open.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
-	if !s.cfg.HTTPAuthEnforced() {
+	switch mode := s.cfg.AuthModeValue(); {
+	case s.cfg.HTTPAuthEnforced():
+		return s.certAuthMiddleware(next)
+	case mode == config.AuthModeOpen:
 		// Open mode: every caller is an admin (no subject).
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), Caller{Kind: CallerAdmin})))
 		})
+	default:
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, http.StatusInternalServerError, config.ErrInternalError, "server auth mode is not supported; use auth.mode: mtls")
+		})
 	}
-	if s.cfg.MTLSMode() {
-		return s.certAuthMiddleware(next)
-	}
-	return s.tokenAuthMiddleware(next)
-}
-
-// tokenAuthMiddleware is the token-mode branch: an "Authorization: Bearer"
-// token, validated against the in-memory store (authtoken.Store), not the token
-// string alone — each is a short-lived record minted over the SSH bootstrap
-// channel and bound to the minting key. The store is shared with the bootstrap
-// handler via SetTokenStore.
-func (s *Server) tokenAuthMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isBootstrapExempt(r) {
-			next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), Caller{Kind: CallerAdmin})))
-			return
-		}
-		rec, ok := s.validateToken(bearerToken(r))
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing or invalid bearer token")
-			return
-		}
-		if detail, ok := authorizeScope(r.Method, r.URL.Path, rec.Scope); !ok {
-			writeError(w, http.StatusForbidden, "FORBIDDEN", detail)
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), Caller{Kind: CallerAdmin, Name: rec.Subject})))
-	})
 }
 
 // certAuthMiddleware is the mtls-mode branch. It re-derives the caller's
@@ -79,22 +63,20 @@ func (s *Server) tokenAuthMiddleware(next http.Handler) http.Handler {
 //   - Expiry. A certificate that was valid when the connection was established
 //     stays "verified" for the life of that connection as far as crypto/tls is
 //     concerned. Re-checking NotBefore/NotAfter here is what actually bounds a
-//     certificate's TTL, and is the direct analogue of the token store dropping
-//     an expired token on validate.
+//     certificate's TTL.
 //
 //   - Authorization. The CA issues no CRL. Removing an SSH key from the
 //     allowlist must de-authorize the certificates issued against it, so the
-//     Subject CN is re-checked against the LIVE allowlist on every request —
-//     giving mtls the same "revocation lands on the next request" property that
-//     token mode gets from RevokeBySubject.
+//     Subject CN is re-checked against the LIVE allowlist on every request, so
+//     revocation lands on the next request.
 //
 // The Authorization header is not read on this path, at all. A bearer token can
-// neither substitute for a certificate nor widen the scope one carries: in mtls
-// mode the server holds no token store to validate against, and even if it did,
-// letting a header add authority to an authenticated connection would make the
-// certificate's scope advisory.
+// neither substitute for a certificate nor widen the scope one carries: the
+// server holds no token store to validate against, and letting a header add
+// authority to an authenticated connection would make the certificate's scope
+// advisory.
 //
-// Known parity limitation, shared with token mode: these checks run at request
+// Known limitation: these checks run at request
 // dispatch, so a connection that was authorized when it opened is not torn down
 // when its credential expires or is revoked mid-flight. Two route families are
 // long-lived enough for that to be observable:
@@ -109,9 +91,7 @@ func (s *Server) tokenAuthMiddleware(next http.Handler) http.Handler {
 //     port-forward therefore survives certificate expiry and allowlist removal
 //     for as long as it stays open — potentially indefinitely.
 //
-// This is deliberate, not an oversight: it is exactly token mode's behavior (an
-// expired bearer token does not tear down a live stream or an open tunnel
-// either), so mtls introduces no regression. Bounding an already-established
+// This is deliberate, not an oversight: bounding an already-established
 // connection is a separate mechanism from authenticating a request, and is not
 // something this middleware can do. Revocation binds on the NEXT request, which
 // for the tunnel means the next `shed forward` / reverse-proxy dial.
@@ -210,10 +190,6 @@ func certSerial(leaf *x509.Certificate) string {
 // present the same certificate and be refused identically, so closing would cost
 // a handshake and fix nothing.
 //
-// Token mode does not close either: a bearer token is carried per request, so a
-// rejected one is replaced by putting a different header on the next request over
-// the same healthy connection.
-//
 // HTTP/1.x only. "Connection" is a hop-by-hop header with no HTTP/2 meaning (h2
 // signals with GOAWAY / RST_STREAM instead) and Go's h2 server refuses to emit
 // it, so on a non-1.x request this is a no-op and recovery falls back to the
@@ -231,11 +207,9 @@ func closeIdentityBoundConnection(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "close")
 }
 
-// authorizeScope is the single scope table both enforced modes consult. It
-// returns ok=false plus the client-facing detail when scope may not reach this
-// route. Keeping one function means a token and a certificate carrying the same
-// scope string reach exactly the same route set — the scope semantics are a
-// property of the route, not of the credential shape.
+// authorizeScope is the scope table the mtls branch consults. It returns
+// ok=false plus the client-facing detail when scope may not reach this route.
+// The scope semantics are a property of the route, not of the credential.
 func authorizeScope(method, path, scope string) (detail string, ok bool) {
 	switch {
 	case isCredentialBusPath(path):
@@ -276,8 +250,7 @@ func certScope(leaf *x509.Certificate) string {
 
 // certSubjectAuthorized reports whether a client certificate's Subject CN (an
 // SSH key fingerprint) is still in the live SSH allowlist. A nil authorizer
-// (no SetClientCertAuthorizer call) authorizes nothing — fail closed, the same
-// way a nil token store validates nothing.
+// (no SetClientCertAuthorizer call) authorizes nothing — fail closed.
 func (s *Server) certSubjectAuthorized(cn string) bool {
 	if s.certAuthorized == nil {
 		return false
@@ -285,30 +258,11 @@ func (s *Server) certSubjectAuthorized(cn string) bool {
 	return s.certAuthorized(cn)
 }
 
-// validateToken looks up a bearer token in the store. A nil store (no
-// SetTokenStore call) validates nothing — fail closed.
-func (s *Server) validateToken(tok string) (authtoken.PublicRecord, bool) {
-	if s.tokens == nil {
-		return authtoken.PublicRecord{}, false
-	}
-	return s.tokens.Validate(tok)
-}
-
 // busOwnershipEnforced reports whether credential-bus /respond ownership is
 // validated against the registry's pending set. It is gated on auth being
-// enforced at all (token or mtls — the gate is about "is this server
-// authenticated", not about which credential form carries it), so the default
-// open-mode fleet keeps today's bus behavior.
+// enforced (mtls), so the default open-mode server keeps today's bus behavior.
 func (s *Server) busOwnershipEnforced() bool {
 	return s.cfg.AuthEnforced()
-}
-
-// isBootstrapExempt reports whether r targets an endpoint reachable without a
-// token, so `shed server add` can bootstrap trust before holding one. Consulted
-// only on the token-mode path — mtls has no exemptions (see authMiddleware).
-func isBootstrapExempt(r *http.Request) bool {
-	return r.Method == http.MethodGet &&
-		(r.URL.Path == "/api/info" || r.URL.Path == "/api/ssh-host-key")
 }
 
 // isCredentialBusPath reports whether path is the credential bus (/api/plugins*),
@@ -343,15 +297,4 @@ func isConnectRoute(path string) bool {
 // other /api/egress/* route (profiles, per-shed show/set/off) stays control-only.
 func isEgressStreamPath(method, path string) bool {
 	return method == http.MethodGet && path == "/api/egress/stream"
-}
-
-// bearerToken extracts the token from an "Authorization: Bearer <token>"
-// header, or "" if absent/malformed.
-func bearerToken(r *http.Request) string {
-	const prefix = "Bearer "
-	h := r.Header.Get("Authorization")
-	if strings.HasPrefix(h, prefix) {
-		return strings.TrimPrefix(h, prefix)
-	}
-	return ""
 }

@@ -20,9 +20,9 @@ const (
 	// reservedAPIUser is a special username reserved for API access.
 	reservedAPIUser = "_api"
 
-	// reservedBootstrapUser issues a short-lived HTTP credential — a bearer
-	// token, or a client certificate in mtls mode — over the authenticated SSH
-	// channel (see bootstrap.go). Like _api it is not a shed.
+	// reservedBootstrapUser issues a short-lived client certificate (mtls
+	// mode) over the authenticated SSH channel (see bootstrap.go). Like _api it
+	// is not a shed.
 	reservedBootstrapUser = "_bootstrap"
 
 	// containerReadyTimeout is the maximum time to wait for a container to be ready.
@@ -43,8 +43,9 @@ func (s *Server) handleSession(sess ssh.Session) {
 	log.Printf("SSH session started: user=%s remote=%s", user, remoteAddr)
 	defer log.Printf("SSH session ended: user=%s remote=%s", user, remoteAddr)
 
-	// Reserved bootstrap user: mint + return an HTTP token bundle over the
-	// authenticated SSH channel, before any shed-name routing or shell wrap.
+	// Reserved bootstrap user: issue + return a client-certificate bundle over
+	// the authenticated SSH channel (or the open-server refusal), before any
+	// shed-name routing or shell wrap.
 	if user == reservedBootstrapUser {
 		s.handleBootstrap(sess)
 		return

@@ -28,11 +28,8 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		SSHPort:  s.cfg.SSHPort,
 		HTTPPort: s.cfg.HTTPPort,
 		Backend:  s.cfg.DefaultBackend,
-		// Token mode reports the legacy "secure" spelling: released clients
-		// gate their credential bootstrap on that exact string, and reporting
-		// "token" would make them save an entry with no credential (see
-		// config.LegacyWireAuthMode). Current clients normalize on decode.
-		AuthMode:     config.LegacyWireAuthMode(s.cfg.AuthModeValue()),
+		// open, or mtls (readable only behind a client certificate).
+		AuthMode:     s.cfg.AuthModeValue(),
 		DefaultImage: s.cfg.ActiveDefaultImage(),
 		HTTPSPort:    s.cfg.HTTPSPort,
 		Features:     s.serverFeatures(),

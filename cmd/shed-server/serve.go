@@ -17,7 +17,6 @@ import (
 
 	"github.com/charliek/shed/internal/api"
 	"github.com/charliek/shed/internal/audit"
-	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
@@ -42,10 +41,6 @@ const (
 	httpReadHeaderTimeout = 10 * time.Second
 	httpReadTimeout       = 60 * time.Second
 	httpIdleTimeout       = 120 * time.Second
-
-	// tokenSweepInterval is how often expired HTTP bearer tokens are reaped
-	// from the in-memory store (expired tokens are also dropped on validate).
-	tokenSweepInterval = 10 * time.Minute
 
 	// caExpiryWarnWindow is how much remaining client-CA lifetime triggers a
 	// startup warning. Rotation is a manual, fleet-wide re-enrollment, so the
@@ -72,8 +67,9 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 //
 // clientCA is non-nil only in mtls mode (runServe loads it there and nowhere
 // else, and aborts startup if the load fails); authorized is the live
-// SSH-allowlist predicate. In token and open mode the result is a plain
-// server-auth-only config: no ClientAuth, no ClientCAs.
+// SSH-allowlist predicate. Outside mtls the result is a plain server-auth-only
+// config: no ClientAuth, no ClientCAs (open mode serves no HTTPS today, so this
+// is the defensive case).
 //
 // Both conditions are required deliberately, and the belt-and-braces costs
 // nothing: an mtls server that somehow reached here with no CA would produce a
@@ -174,8 +170,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Enforced-mode preflight: refuse to start `auth.mode: token` or `mtls`
-	// without an SSH key source (an empty enforced allowlist would lock
+	// Enforced-mode preflight: refuse to start `auth.mode: mtls` without an
+	// SSH key source (an empty enforced allowlist would lock
 	// everyone out). Runs before anything binds; inert in open mode.
 	if err := cfg.PreflightAuth(); err != nil {
 		return fmt.Errorf("auth preflight: %w", err)
@@ -203,23 +199,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Initialize plugin system (before backends, since backends use the bridge)
 	pluginRegistry := plugin.NewRegistry()
-	// Track pending requests only when auth is enforced (token or mtls) — the
+	// Track pending requests only when auth is enforced (mtls) — the
 	// /respond ownership gate is consulted only then, so an unauthenticated
 	// open-mode server does no bookkeeping.
 	if cfg.AuthEnforced() {
 		pluginRegistry.EnableOwnershipTracking()
 	}
 	pluginBridge := plugin.NewBridge(pluginRegistry)
-
-	// HTTP bearer-token store: short-lived, scoped tokens minted over the SSH
-	// bootstrap channel and validated by the auth middleware. In-memory by
-	// design — a restart drops tokens and clients transparently re-mint over
-	// SSH. Shared with the SSH server (bootstrap mint) and the API server
-	// (validate).
-	tokenStore := authtoken.NewStore()
-	tokenCtx, cancelTokens := context.WithCancel(context.Background())
-	defer cancelTokens()
-	tokenStore.StartSweeper(tokenCtx, tokenSweepInterval)
 
 	// Initialize the configured backend. egressSocketDir + attachEgress are
 	// captured per-backend so the egress proxy (constructed once, below) can
@@ -409,17 +395,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	log.Printf("SSH auth mode: %s", sshAllowlist.Mode())
 
-	// Revoke a key's HTTP tokens when it leaves the allowlist (removed from
-	// github_users or the user's GitHub keys). Authoritative diff only — a failed
-	// refetch falls back to last-known-good, so a transient outage never revokes.
-	sshAllowlist.SetRevokeHook(func(subjects []string) {
-		for _, s := range subjects {
-			if n := tokenStore.RevokeBySubject(s); n > 0 {
-				log.Printf("auth: revoked %d HTTP token(s) for removed key %s", n, s)
-			}
-		}
-	})
-
 	// Refresh GitHub-seeded keys in the background until shutdown.
 	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
 	defer cancelRefresh()
@@ -475,12 +450,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	apiServer.SetAuditLog(auditLog)               // nil-safe: records nothing when audit is off
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
-	apiServer.SetTokenStore(tokenStore)           // shared with the SSH bootstrap handler (1c)
 	if clientCA != nil {
 		// mtls: the middleware re-validates every request's client certificate
 		// against the LIVE allowlist, so removing an SSH key de-authorizes its
-		// certificates on the next request — the same "revocation lands
-		// immediately" property the token store gets from RevokeBySubject.
+		// certificates on the next request.
 		apiServer.SetClientCertAuthorizer(sshAllowlist.IsAuthorizedFingerprint)
 		apiServer.SetClientCAInfo(clientCA.Fingerprint(), clientCA.NotAfter())
 	}
@@ -492,9 +465,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// resolved addresses separately below.
 	if cfg.BindAddress == "" {
 		if cfg.PlainHTTPEnabled() {
-			log.Printf("WARNING: bind_address is unset — binding loopback (127.0.0.1) only. This was all-interfaces before v0.7.4. To reach this open-mode server off-box, set bind_address (e.g. 0.0.0.0) + allow_insecure_exposure: true, or switch to auth.mode: token.")
+			log.Printf("WARNING: bind_address is unset — binding loopback (127.0.0.1) only. This was all-interfaces before v0.7.4. An open-mode server is loopback only; to reach it off-box, switch to auth.mode: mtls and set bind_address (e.g. 0.0.0.0).")
 		} else {
-			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this token/mtls-mode server off-box.")
+			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this mtls-mode server off-box.")
 		}
 	}
 
@@ -502,8 +475,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// listeners share this single handler.
 	publicHandler := apiServer.Router()
 
-	// Plain-HTTP listener. In an enforced mode (token or mtls) it is not
-	// started — only the pinned-TLS (https_port) listener faces clients.
+	// Plain-HTTP listener. In mtls mode it is not started — only the pinned-TLS (https_port) listener faces clients.
 	var httpServer *http.Server
 	if cfg.PlainHTTPEnabled() {
 		httpServer = newHTTPServer(cfg.HTTPListenAddr(), publicHandler)
@@ -525,29 +497,23 @@ func runServe(cmd *cobra.Command, args []string) error {
 		httpsServer.TLSConfig = buildHTTPSTLSConfig(cfg, cert, clientCA, sshAllowlist.IsAuthorizedFingerprint)
 	}
 
-	// Wire the SSH bootstrap handler: it issues an HTTP credential over the
-	// authenticated SSH channel and returns it (with the TLS pin + ports), so
-	// `shed server add` needs no manual token/pin step. In token mode that is a
-	// bearer token minted into the shared store; in mtls mode it is a client
-	// certificate signed by clientCA, and the token store is deliberately NOT
-	// handed over — that path must never mint a bearer token.
-	bootstrapTokens := tokenStore
-	if cfg.MTLSMode() {
-		bootstrapTokens = nil
-	}
-	sshServer.SetBootstrap(bootstrapTokens, sshd.BootstrapInfo{
-		HTTPPort:       cfg.HTTPPort,
+	// Wire the SSH bootstrap handler: in mtls mode it issues a client
+	// certificate signed by clientCA over the authenticated SSH channel and
+	// returns it (with the TLS pin + port), so `shed server add` needs no
+	// manual pin step. An open server's allowlist is never enforced, so every
+	// request gets the open-server refusal that released clients recognise.
+	// The server issues no other credential: it holds no bearer-token code.
+	sshServer.SetBootstrap(sshd.BootstrapInfo{
 		HTTPSPort:      cfg.HTTPSPort,
 		TLSFingerprint: tlsFingerprint,
 		TokenTTL:       cfg.TokenTTL(),
-		AuthMode:       cfg.AuthModeValue(),
 		CA:             clientCA,
 	})
 
 	// Channel to collect errors from servers (HTTP, HTTPS, SSH).
 	errChan := make(chan error, 3)
 
-	// Start HTTP server in goroutine (skipped in token mode — TLS-only)
+	// Start HTTP server in goroutine (skipped in mtls mode — TLS-only)
 	if httpServer != nil {
 		go func() {
 			log.Printf("HTTP server listening on %s", httpServer.Addr)
@@ -612,7 +578,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	// Shutdown HTTP server (when serving — skipped in token mode)
+	// Shutdown HTTP server (when serving — skipped in mtls mode)
 	if httpServer != nil {
 		log.Printf("Shutting down HTTP server...")
 		if err := httpServer.Shutdown(ctx); err != nil {

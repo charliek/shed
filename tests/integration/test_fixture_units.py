@@ -3,19 +3,23 @@
 committed parallel dev configs and `scripts/render-dev-config.sh` they run.
 
 No shed-server, no `shed` CLI, no network: subprocess and urllib are faked.
-The real subprocesses are the render script on local files, and `make` and
-`scripts/dev-server-probe.sh` with every outward-reaching command stubbed and
-loopback sockets standing in for the server's listeners.
+The real subprocesses are the render script on local files, and `make`,
+`scripts/dev-server-probe.sh` and `scripts/dev-server-wait.sh` with every
+outward-reaching command stubbed and loopback sockets standing in for the
+server's listeners.
 Runs in CI via `make test-integration-units`, next to `test_smoke_units.py`.
 """
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
+import re
 import shutil
 import socket
+import stat
 import subprocess
 import time
 import urllib.error
@@ -27,6 +31,7 @@ import yaml
 from fixtures import devcontrol as dc
 from fixtures import mount_parents as mp
 from fixtures import server as fx
+from fixtures import tlsclient
 
 MAC_DEV_CONFIG = dc.REPO_ROOT / "configs" / "server.dev-parallel.mac.yaml"
 FC_DEV_CONFIG = dc.REPO_ROOT / "configs" / "server.dev-parallel.linux-fc.yaml"
@@ -372,7 +377,8 @@ def test_mount_parents_classify_stops_below_home():
 
 # ----------------------------------------------------------------------------
 # The parallel dev configs, scripts/render-dev-config.sh and
-# fixtures/devcontrol.py's auth-mode handling (plan 035 C1: mtls by default)
+# fixtures/devcontrol.py's dev_config(): mtls is the only enforced mode, and
+# the SHED_DEV_AUTH_MODE knob is gone.
 # ----------------------------------------------------------------------------
 
 
@@ -388,7 +394,7 @@ def test_committed_dev_configs_run_mtls(path):
     # mtls serves only the TLS listener; it needs a port and a key source.
     assert cfg.get("https_port") == 18443
     assert (auth.get("ssh") or {}).get("github_users") or (auth.get("ssh") or {}).get("authorized_keys")
-    # Nothing that only an open-mode server needs.
+    # Nothing that only an open-mode server needed, and which no longer loads.
     assert "allow_insecure_exposure" not in cfg
     # Offset from the production ports (the dev-control safety rails).
     assert cfg.get("ssh_port") == 12222
@@ -401,6 +407,19 @@ def test_fc_dev_config_carries_the_service_clients():
     assert clients["itest"]["policy"]["images"] == ["itest"]
 
 
+def test_open_mode_override_is_a_loopback_open_server():
+    # What dev_config() runs for the open-mode tests: open, plain HTTP on an
+    # offset port, no https_port (an open server serves no TLS), loopback.
+    cfg = dc._merge_config(dc.OPEN_MODE_OVERRIDES)
+    assert dc.config_auth_mode(cfg) == "open"
+    assert not dc._config_enforced(cfg)
+    assert not cfg.get("https_port")
+    assert cfg.get("http_port") == 18080
+    assert cfg.get("bind_address") in (None, "", "127.0.0.1", "localhost", "::1")
+    # The committed base, by contrast, is mtls.
+    assert dc._config_enforced(dc._merge_config({}))
+
+
 def _render(tmp_path: Path, base: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", str(RENDER), str(base), str(tmp_path / "out.yaml"), *args],
@@ -408,117 +427,278 @@ def _render(tmp_path: Path, base: Path, *args: str) -> subprocess.CompletedProce
     )
 
 
-def test_render_token_flips_only_the_mode(tmp_path):
-    r = _render(tmp_path, MAC_DEV_CONFIG, "--token")
+def test_render_state_dir_relocates_only_the_blob_dirs(tmp_path):
+    r = _render(tmp_path, MAC_DEV_CONFIG, "--state-dir", "/Volumes/ext/shed-dev/vz/")
     assert r.returncode == 0, r.stderr
     got = _load_yaml(tmp_path / "out.yaml")
     want = _load_yaml(MAC_DEV_CONFIG)
-    assert got["auth"]["mode"] == "token"
-    want["auth"]["mode"] = "token"
-    assert got == want
-
-
-def test_render_token_composes_with_state_dir(tmp_path):
-    r = _render(tmp_path, MAC_DEV_CONFIG, "--token", "--state-dir", "/Volumes/ext/shed-dev/vz/")
-    assert r.returncode == 0, r.stderr
-    got = _load_yaml(tmp_path / "out.yaml")
-    assert got["auth"]["mode"] == "token"
+    assert got["auth"] == want["auth"]
     assert got["vz"]["images_dir"] == "/Volumes/ext/shed-dev/vz"
     assert got["vz"]["instance_dir"] == "/Volumes/ext/shed-dev/vz/instances"
 
 
-def test_render_token_refuses_a_config_with_service_clients(tmp_path):
-    r = _render(tmp_path, FC_DEV_CONFIG, "--token")
-    assert r.returncode != 0
-    assert "auth.clients" in r.stderr
-
-
-@pytest.mark.parametrize("args", [[], ["--mtls"]], ids=["no-override", "removed-mtls-flag"])
-def test_render_refuses_nothing_to_do(tmp_path, args):
-    # The committed configs are already mtls: there is no --mtls any more,
-    # and the Makefile runs a committed config directly when nothing is set.
+@pytest.mark.parametrize(
+    "args", [[], ["--token"], ["--mtls"], ["--token", "--state-dir", "/x"]],
+    ids=["no-override", "removed-token-flag", "removed-mtls-flag", "token-beside-state-dir"],
+)
+def test_render_refuses_a_mode_flag_or_nothing_to_do(tmp_path, args):
+    # The committed configs are mtls and there is no other mode to render:
+    # both mode flags are unknown arguments, and with no override at all the
+    # Makefile runs a committed config directly.
     r = _render(tmp_path, MAC_DEV_CONFIG, *args)
     assert r.returncode != 0
+    if args:
+        assert "unknown argument" in r.stderr
+        assert not (tmp_path / "out.yaml").exists()
 
 
-@pytest.mark.parametrize(
-    "env, want",
-    [({}, "mtls"), ({"SHED_DEV_AUTH_MODE": ""}, "mtls"), ({"SHED_DEV_AUTH_MODE": "token"}, "token"),
-     ({"SHED_DEV_AUTH_MODE": "mtls"}, "mtls")],
-    ids=["unset", "empty", "token", "mtls"],
-)
-def test_dev_auth_mode_defaults_to_mtls(env, want):
-    assert dc.dev_auth_mode(env) == want
+def test_restart_argv_names_only_the_config():
+    assert dc._restart_argv(Path("/x/cfg.yaml")) == ["make", "dev-server-restart", "DEV_CONFIG=/x/cfg.yaml"]
 
 
-def test_restart_argv_names_config_and_mode():
-    assert dc._restart_argv(Path("/x/cfg.yaml"), "token") == [
-        "make", "dev-server-restart", "DEV_CONFIG=/x/cfg.yaml", "SHED_DEV_AUTH_MODE=token",
-    ]
-
-
-def test_running_base_config_follows_the_knob():
-    base = dc._merge_config({})
-    assert dc.running_base_config("mtls") == base
-    token = dc.running_base_config("token")
-    assert token["auth"]["mode"] == "token"
-    assert {k: v for k, v in token.items() if k != "auth"} == {k: v for k, v in base.items() if k != "auth"}
-    assert token["auth"]["ssh"] == base["auth"]["ssh"]
-
-
-def _fake_dev_control(monkeypatch, tmp_path, mode: str) -> dict:
+def _fake_dev_control(monkeypatch, tmp_path) -> dict:
     """Stub every side effect of dev_config(): no server, no make."""
     calls = {"restarts": [], "waits": [], "targets": []}
-    monkeypatch.setattr(dc, "DEV_AUTH_MODE", mode)
     monkeypatch.setattr(dc, "DEV_CONFIG_TMP", tmp_path / "test-dev-config.yaml")
     monkeypatch.setattr(dc, "DEV_SCRATCH_DIR", tmp_path)
     monkeypatch.setattr(dc, "assert_dev_target", lambda name: calls["targets"].append(name) or {})
-    monkeypatch.setattr(dc, "_make_restart", lambda cfg, auth_mode: calls["restarts"].append((cfg, auth_mode)))
-    monkeypatch.setattr(dc, "_wait_reachable", lambda server, timeout, *, config: calls["waits"].append(config))
+    monkeypatch.setattr(dc, "_make_restart", lambda cfg: calls["restarts"].append(cfg))
+    monkeypatch.setattr(dc, "_wait_ready", lambda server, timeout, *, config: calls["waits"].append(config))
     return calls
-
-
-def test_dev_config_refuses_under_mtls_before_any_restart(monkeypatch, tmp_path):
-    calls = _fake_dev_control(monkeypatch, tmp_path, "mtls")
-    with pytest.raises(RuntimeError, match="SHED_DEV_AUTH_MODE=token"):
-        with dc.dev_config({"name": "x"}, "my-server-dev"):
-            pass
-    assert calls == {"restarts": [], "waits": [], "targets": []}
 
 
 @pytest.mark.parametrize(
     "overrides, want_mode",
     [
-        ({"https_port": 18443, "auth": {"mode": "secure"}}, "secure"),
-        # An override that names no mode keeps the running token copy's.
-        ({"name": "harness-selfcheck-name"}, "token"),
+        ({"name": "harness-selfcheck-name"}, "mtls"),
+        (dc.OPEN_MODE_OVERRIDES, "open"),
     ],
-    ids=["names-a-mode", "inherits-token"],
+    ids=["mtls-base", "open-on-loopback"],
 )
-def test_dev_config_under_token_restores_the_token_base(monkeypatch, tmp_path, overrides, want_mode):
-    calls = _fake_dev_control(monkeypatch, tmp_path, "token")
+def test_dev_config_runs_the_override_then_restores_the_base(monkeypatch, tmp_path, overrides, want_mode):
+    calls = _fake_dev_control(monkeypatch, tmp_path)
     with dc.dev_config(overrides, "my-server-dev") as name:
         assert name == "my-server-dev"
         written = _load_yaml(tmp_path / "test-dev-config.yaml")
-        assert written["auth"]["mode"] == want_mode
+        assert dc.config_auth_mode(written) == want_mode
         # The rest of the committed base survives the merge.
         assert written["auth"]["ssh"] == _load_yaml(MAC_DEV_CONFIG)["auth"]["ssh"]
-    # The override runs as written (`mtls` = no token render); the restore
-    # returns to the committed base rendered for the run's own mode.
-    assert calls["restarts"] == [
-        (tmp_path / "test-dev-config.yaml", "mtls"),
-        (dc.DEV_BASE_CONFIG, "token"),
-    ]
-    assert [w["auth"]["mode"] for w in calls["waits"]] == [want_mode, "token"]
+    # The override runs as written; the restore pins the committed base, and
+    # each restart is waited on in its own mode.
+    assert calls["restarts"] == [tmp_path / "test-dev-config.yaml", dc.DEV_BASE_CONFIG]
+    assert [dc.config_auth_mode(w) for w in calls["waits"]] == [want_mode, "mtls"]
     assert calls["targets"] == ["my-server-dev"]
     assert not (tmp_path / "test-dev-config.yaml").exists()
 
+
+def test_dev_config_restores_the_base_when_the_body_raises(monkeypatch, tmp_path):
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    with pytest.raises(RuntimeError, match="test body"):
+        with dc.dev_config(dc.OPEN_MODE_OVERRIDES, "my-server-dev"):
+            raise RuntimeError("test body")
+    assert calls["restarts"][-1] == dc.DEV_BASE_CONFIG
+    assert dc.config_auth_mode(calls["waits"][-1]) == "mtls"
+
+
+def test_dev_config_refuses_a_production_port_before_any_restart(monkeypatch, tmp_path):
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    with pytest.raises(RuntimeError, match="production ports"):
+        with dc.dev_config({"ssh_port": 2222}, "my-server-dev"):
+            pass
+    assert calls["restarts"] == [] and calls["waits"] == []
+
+
+def test_api_info_open_mode_is_plain_http(monkeypatch):
+    seen = []
+
+    class _Resp(io.BytesIO):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(url, timeout=None, context=None):
+        seen.append(url)
+        return _Resp(b'{"name":"x","auth_mode":"open"}')
+
+    monkeypatch.setattr(dc, "resolve_server_entry", lambda name: {"host": "localhost"})
+    monkeypatch.setattr(dc.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(dc, "bootstrap_cert", lambda *a, **k: pytest.fail("open mode must not enrol"))
+    info = dc.api_info("my-server-dev", dc._merge_config(dc.OPEN_MODE_OVERRIDES), Path("/nonexistent"))
+    assert info["auth_mode"] == "open"
+    assert seen == ["http://localhost:18080/api/info"]
+
+
+def test_api_info_mtls_presents_a_bootstrapped_certificate(monkeypatch, tmp_path):
+    cert = dc.BootstrapCert(
+        cert_path=tmp_path / "c.pem", key_path=tmp_path / "c.key", pin="sha256:" + "ab" * 32,
+        https_port=18443, scope="control", bundle={},
+    )
+    seen = []
+    monkeypatch.setattr(dc, "resolve_server_entry", lambda name: {"host": "localhost"})
+    monkeypatch.setattr(dc, "bootstrap_cert", lambda server, scope, directory: seen.append(("enrol", scope)) or cert)
+    monkeypatch.setattr(
+        dc, "pinned_request",
+        lambda host, port, path, pin, pair: seen.append((host, port, path, pin, pair)) or (200, {"auth_mode": "mtls"}),
+    )
+    info = dc.api_info("my-server-dev", dc._merge_config({}), tmp_path)
+    assert info == {"auth_mode": "mtls"}
+    assert seen == [("enrol", "control"), ("localhost", 18443, "/api/info", cert.pin, cert.pair)]
+
+
+def test_bootstrap_cert_sends_one_csr_and_writes_the_issued_cert(monkeypatch, tmp_path):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not installed")
+    sent = []
+    real_run = subprocess.run
+
+    def run(argv, **kw):
+        if argv[0] != "ssh":
+            return real_run(argv, **kw)
+        sent.append(argv)
+        bundle = {
+            "auth_mode": "mtls", "https_port": 18443, "tls_cert_fingerprint": "sha256:" + "cd" * 32,
+            "client_cert": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+            "scope": "credentials",
+        }
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(bundle) + "\n", stderr="")
+
+    monkeypatch.setattr(dc, "assert_dev_target", lambda name: {"host": "localhost", "ssh_port": 12222})
+    monkeypatch.setattr(dc.subprocess, "run", run)
+    got = dc.bootstrap_cert("my-server-dev", "credentials", tmp_path / "c", "host-agent")
+
+    assert len(sent) == 1
+    argv = sent[0]
+    assert argv[argv.index("-p") + 1] == "12222"
+    assert "StrictHostKeyChecking=yes" in argv and f"UserKnownHostsFile={dc.KNOWN_HOSTS_PATH}" in argv
+    # The request line: scope, kind, exactly one csr= in standard base64 that
+    # decodes to a DER CSR openssl verifies.
+    target = argv.index("_bootstrap@localhost")
+    request = argv[target + 1:]
+    assert request[:2] == ["credentials", "host-agent"]
+    csr_args = [a for a in request if a.startswith("csr=")]
+    assert len(csr_args) == 1 and len(request) == 3
+    der = base64.b64decode(csr_args[0][len("csr="):], validate=True)
+    (tmp_path / "check.der").write_bytes(der)
+    v = real_run(["openssl", "req", "-inform", "DER", "-in", str(tmp_path / "check.der"), "-noout", "-verify"],
+                 capture_output=True, text=True)
+    assert v.returncode == 0, v.stderr
+    # What came back is on disk, with the pin and port the bundle named.
+    assert got.cert_path.read_text().startswith("-----BEGIN CERTIFICATE-----")
+    assert got.pin == "sha256:" + "cd" * 32 and got.https_port == 18443
+    assert stat.S_IMODE(got.key_path.stat().st_mode) == 0o600
+
+
+def test_bootstrap_cert_refuses_a_bundle_that_is_not_mtls(monkeypatch, tmp_path):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not installed")
+    real_run = subprocess.run
+
+    def run(argv, **kw):
+        if argv[0] != "ssh":
+            return real_run(argv, **kw)
+        # What a 0.9.x token-mode server would have answered.
+        token = {"auth_mode": "token", "https_port": 18443, "tls_cert_fingerprint": "sha256:x", "token": "shed_control_x"}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(token), stderr="")
+
+    monkeypatch.setattr(dc, "assert_dev_target", lambda name: {"host": "localhost", "ssh_port": 12222})
+    monkeypatch.setattr(dc.subprocess, "run", run)
+    with pytest.raises(AssertionError, match="not an mtls bundle"):
+        dc.bootstrap_cert("my-server-dev", "control", tmp_path)
+
+
+# ----------------------------------------------------------------------------
+# fixtures/tlsclient.py: pinned_request against a real local TLS listener that
+# requires a client certificate, as an mtls shed-server does.
+# ----------------------------------------------------------------------------
+
+
+def _openssl(*args: str) -> None:
+    r = subprocess.run(["openssl", *args], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+
+
+@pytest.fixture
+def mtls_listener(tmp_path):
+    """A loopback HTTPS server that requires a client certificate signed by
+    its own throwaway CA, and answers every GET with a small JSON body."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not installed")
+    import http.server
+    import ssl
+    import threading
+
+    d = tmp_path / "pki"
+    d.mkdir()
+    for name in ("server", "ca", "client", "stranger"):
+        _openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(d / f"{name}.key"))
+    for name in ("server", "ca", "stranger"):
+        _openssl("req", "-new", "-x509", "-key", str(d / f"{name}.key"), "-subj", f"/CN={name}",
+                 "-days", "1", "-out", str(d / f"{name}.pem"))
+    _openssl("req", "-new", "-key", str(d / "client.key"), "-subj", "/CN=client", "-out", str(d / "client.csr"))
+    _openssl("x509", "-req", "-in", str(d / "client.csr"), "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
+             "-CAcreateserial", "-days", "1", "-out", str(d / "client.pem"))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(d / "server.pem"), str(d / "server.key"))
+    ctx.load_verify_locations(str(d / "ca.pem"))
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    pin = tlsclient.fingerprint((d / "server.pem").read_text())
+    yield {"port": srv.server_address[1], "pin": pin, "dir": d}
+    srv.shutdown()
+    srv.server_close()
+
+
+def test_pinned_request_with_a_client_cert(mtls_listener):
+    d = mtls_listener["dir"]
+    status, body = tlsclient.pinned_request(
+        "127.0.0.1", mtls_listener["port"], "/api/info", mtls_listener["pin"],
+        (str(d / "client.pem"), str(d / "client.key")),
+    )
+    assert (status, body) == (200, {"ok": True})
+
+
+@pytest.mark.parametrize("who", ["none", "stranger"], ids=["no-client-cert", "cert-from-another-ca"])
+def test_pinned_request_refused_without_an_issued_cert_is_no_response(mtls_listener, who):
+    d = mtls_listener["dir"]
+    cert = None if who == "none" else (str(d / "stranger.pem"), str(d / "stranger.key"))
+    assert tlsclient.pinned_request("127.0.0.1", mtls_listener["port"], "/", mtls_listener["pin"], cert) == (None, None)
+
+
+def test_pinned_request_raises_on_the_wrong_server(mtls_listener):
+    d = mtls_listener["dir"]
+    with pytest.raises(tlsclient.PinMismatch):
+        tlsclient.pinned_request(
+            "127.0.0.1", mtls_listener["port"], "/", "sha256:" + "00" * 32,
+            (str(d / "client.pem"), str(d / "client.key")),
+        )
+
+
 # ----------------------------------------------------------------------------
 # The dev-server targets: settings guards that run before any stop, and
-# scripts/dev-server-probe.sh, the readiness probe dev-server-up[-fc] polls.
-# A real `make` and a real probe script; ssh, scp, sudo, go and uname are
-# stubs that only record their argv, and the "server" is a sleep process
-# plus loopback sockets.
+# scripts/dev-server-probe.sh, the readiness probe dev-server-up[-fc|-remote]
+# and dev_config() poll. A real `make` and a real probe script; ssh, scp,
+# sudo, go and uname are stubs that only record their argv, and the "server"
+# is a sleep process plus loopback sockets.
 # ----------------------------------------------------------------------------
 
 PROBE = dc.REPO_ROOT / "scripts" / "dev-server-probe.sh"
@@ -534,39 +714,56 @@ exit 0
 """
 
 
-def _make_with_stubs(tmp_path: Path, target: str, *assigns: str) -> tuple[subprocess.CompletedProcess, list[str]]:
+def _make_with_stubs(tmp_path: Path, target: str, *assigns: str, env_extra: dict | None = None,
+                     dry_run: bool = False) -> tuple[subprocess.CompletedProcess, list[str]]:
     """Run `make -j8 <target>` in the repo with every outward-reaching
     command stubbed. Returns make's result and the stubs' recorded calls."""
     if shutil.which("make") is None:
         pytest.skip("make is not installed")
     stubs = tmp_path / "stubs"
-    stubs.mkdir()
+    stubs.mkdir(exist_ok=True)
     (stubs / "stub").write_text(_STUB)
     (stubs / "stub").chmod(0o755)
     for name in ("ssh", "scp", "sudo", "go", "uname"):
-        (stubs / name).symlink_to("stub")
+        if not (stubs / name).exists():
+            (stubs / name).symlink_to("stub")
     calls = tmp_path / "calls.log"
-    calls.touch()
+    calls.write_text("")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("SHED_", "MAKE"))}
     env.update(PATH=f"{stubs}:{os.environ['PATH']}", STUB_LOG=str(calls), HOME=str(tmp_path / "home"))
+    env.update(env_extra or {})
     r = subprocess.run(
-        ["make", "-j8", "--no-print-directory", "-C", str(dc.REPO_ROOT), target,
+        ["make", *(["-n"] if dry_run else []), "-j8", "--no-print-directory", "-C", str(dc.REPO_ROOT), target,
          "FC_REMOTE_HOST=probe.invalid", "GOARCH=amd64", "RELEASE_BUILD_TOOLS_REF=x", *assigns],
         capture_output=True, text=True, timeout=120, env=env,
     )
     return r, calls.read_text().splitlines()
 
 
-def test_fc_restart_refuses_a_token_mode_before_stopping(tmp_path):
-    r, calls = _make_with_stubs(tmp_path, "dev-server-restart-fc", "SHED_DEV_AUTH_MODE=token")
+_REMOVED_KNOB = "SHED_DEV_AUTH_MODE was removed"
+
+
+@pytest.mark.parametrize("value", ["token", "mtls"])
+@pytest.mark.parametrize(
+    "target", ["dev-server-restart-fc", "dev-server-up-fc", "test-integration-dev-fc",
+               "dev-server-restart", "dev-server-up", "test-integration-dev"],
+)
+def test_a_leftover_auth_knob_fails_before_anything_runs(tmp_path, target, value):
+    r, calls = _make_with_stubs(tmp_path, target, f"SHED_DEV_AUTH_MODE={value}")
     assert r.returncode != 0
-    assert "runs mtls only" in r.stdout + r.stderr
-    # Nothing ran past the guard: no ssh (so no stop), no build.
-    assert calls == []
+    out = r.stdout + r.stderr
+    # One line says it.
+    assert len([line for line in out.splitlines() if _REMOVED_KNOB in line]) == 1, out
+    # Nothing past the guard ran: no stop (ssh kill, or the Mac target's
+    # `uname -s`), no upload, no launch. (A sibling build prerequisite may
+    # have started beside the guard under -j; it stops nothing.)
+    assert not [c for c in calls if "kill" in c or "serve --config" in c or c.startswith(("scp ", "uname -s"))], calls
+    if target.startswith(("dev-server-restart", "test-integration-dev-fc")):
+        assert calls == [], calls
 
 
 def test_fc_restart_stops_before_it_builds_or_starts(tmp_path):
-    r, calls = _make_with_stubs(tmp_path, "dev-server-restart-fc", "SHED_DEV_AUTH_MODE=mtls")
+    r, calls = _make_with_stubs(tmp_path, "dev-server-restart-fc")
     assert r.returncode == 0, r.stdout + r.stderr
     stop = next(i for i, c in enumerate(calls) if "kill -TERM" in c)
     arch = next(i for i, c in enumerate(calls) if "uname -m" in c)
@@ -575,22 +772,72 @@ def test_fc_restart_stops_before_it_builds_or_starts(tmp_path):
     assert stop < arch < launch
 
 
-@pytest.mark.parametrize("mode", ["bogus", ""], ids=["unknown", "empty"])
-def test_mac_restart_refuses_a_bad_mode_before_stopping(tmp_path, mode):
-    r, calls = _make_with_stubs(tmp_path, "dev-server-restart", f"SHED_DEV_AUTH_MODE={mode}")
-    assert r.returncode != 0
-    assert "SHED_DEV_AUTH_MODE must be 'mtls' or 'token'" in r.stdout + r.stderr
-    # dev-server-down's first command is `uname -s`; it never ran.
-    assert calls == []
-
-
-def test_mac_restart_reaches_the_stop_with_a_good_mode(tmp_path):
-    # The control for the test above: with a valid mode the stop does run
-    # (the uname stub says Linux, so dev-server-down refuses right there).
-    r, calls = _make_with_stubs(tmp_path, "dev-server-restart", "SHED_DEV_AUTH_MODE=token")
+def test_mac_restart_reaches_the_stop_without_the_knob(tmp_path):
+    # The control for the knob test: unset, the stop does run (the uname stub
+    # says Linux, so dev-server-down refuses right there).
+    r, calls = _make_with_stubs(tmp_path, "dev-server-restart")
     assert r.returncode != 0
     assert "dev-server-down is macOS-only" in r.stdout + r.stderr
     assert calls == ["uname -s"]
+
+
+def _remote_home(tmp_path: Path) -> tuple[Path, int]:
+    """A $HOME with a remote dev pid file naming a live process that is not
+    a shed-server, so a stop that ran would remove the pid file (and send
+    no signal: dev-server-down-remote checks the process name first)."""
+    run_dir = tmp_path / "home" / ".shed" / "dev-remote"
+    run_dir.mkdir(parents=True)
+    proc = subprocess.Popen(["sleep", "60"])
+    (run_dir / "server.pid").write_text(f"{proc.pid}\n")
+    return run_dir / "server.pid", proc
+
+
+@pytest.mark.parametrize(
+    "env_file, want",
+    [
+        (None, "no env file"),
+        ("SHED_GCE_PROJECT=x\n", "does not set SHED_REMOTE_ENV"),
+        ("SHED_REMOTE_ENV=dev\nSHED_REMOTE_FIREWALL_MODE=auto\n", "needs SHED_REMOTE_ECHO_URLS"),
+    ],
+    ids=["missing-env-file", "no-environment-name", "auto-without-echo-urls"],
+)
+def test_remote_restart_refuses_bad_settings_before_stopping(tmp_path, env_file, want):
+    pid_file, proc = _remote_home(tmp_path)
+    try:
+        path = tmp_path / "remote.env"
+        if env_file is not None:
+            path.write_text(env_file)
+        r, calls = _make_with_stubs(
+            tmp_path, "dev-server-restart-remote", f"SHED_REMOTE_ENV_FILE={path}", "SHED_REMOTE_GITHUB_USER=someone",
+        )
+        assert r.returncode != 0
+        assert want in r.stdout + r.stderr
+        # The stop never ran: the pid file of the "running server" is untouched.
+        assert pid_file.exists(), "dev-server-down-remote ran before the settings were checked"
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_remote_restart_stops_then_starts_in_its_recipe(tmp_path):
+    # Dry run: make prints the recipes and recurses with -n, so nothing runs.
+    env = tmp_path / "remote.env"
+    env.write_text("SHED_REMOTE_ENV=dev\n")
+    r, _ = _make_with_stubs(
+        tmp_path, "dev-server-restart-remote", f"SHED_REMOTE_ENV_FILE={env}", "SHED_REMOTE_GITHUB_USER=someone",
+        dry_run=True,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    stop = out.index("kill -TERM")
+    launch = out.index("nohup bin/shed-server serve")
+    assert stop < launch
+    # Readiness is the probe over this run's part of the log, not the
+    # readiness line alone.
+    probe = out.index("scripts/dev-server-probe.sh")
+    assert launch < probe
+    assert '"$START_LINE"' in out[probe:probe + 300]
 
 
 @pytest.fixture
@@ -684,3 +931,212 @@ def test_probe_fails_an_empty_pid(fake_server):
     # The FC target passes the pid file's contents; a missing file is "".
     r = _probe(fake_server["log"], "")
     assert r.returncode == 2, r.stdout
+
+
+def test_probe_reads_only_from_the_first_line(fake_server):
+    # dev-server-up-remote appends to its log: the probe must not take an
+    # earlier run's readiness, or an earlier run's listener error, for this
+    # run's. Lines 1-3 are an earlier run that failed; this run starts at 4.
+    log = fake_server["log"]
+    current = log.read_text()
+    log.write_text(
+        "2026/11/13 09:00:00 Shed server is ready\n"
+        "2026/11/13 09:00:00 Server error: HTTPS server error: listen tcp: address already in use\n"
+        "=== dev-server-up-remote 2026-11-14T10:00:00Z ===\n"
+        + current
+    )
+    # The whole file: the earlier run's error fails it.
+    assert _probe(log, fake_server["pid"]).returncode == 2
+    # From this run's first line: ready.
+    r = subprocess.run(["bash", str(PROBE), str(log), str(fake_server["pid"]), "0", "4"],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stdout
+    # And an earlier run's readiness line does not stand in for this run's.
+    log.write_text("2026/11/13 09:00:00 Shed server is ready\n" + current.replace("Shed server is ready", "still starting"))
+    r = subprocess.run(["bash", str(PROBE), str(log), str(fake_server["pid"]), "0", "2"],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 1, r.stdout
+
+
+@pytest.mark.parametrize("first", ["x", "-1", "1.5"])
+def test_probe_refuses_a_malformed_first_line(fake_server, first):
+    r = subprocess.run(["bash", str(PROBE), str(fake_server["log"]), str(fake_server["pid"]), "0", first],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 64, r.stdout + r.stderr
+
+
+def test_wait_probe_returns_ready_and_raises_on_a_dead_server(fake_server, tmp_path):
+    pid_file = tmp_path / "server.pid"
+    pid_file.write_text(f"{fake_server['pid']}\n")
+    assert dc._wait_probe(10, log=fake_server["log"], pid_path=pid_file).startswith("ready:")
+    fake_server["proc"].kill()
+    fake_server["proc"].wait()
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match="failed"):
+        dc._wait_probe(30, log=fake_server["log"], pid_path=pid_file)
+    # A dead server fails at once, not at the deadline.
+    assert time.monotonic() - start < 10
+
+
+def test_wait_probe_raises_at_once_on_a_status_the_probe_does_not_define(fake_server, tmp_path, monkeypatch):
+    # A probe that refuses its arguments (64) is a broken check: the fixture
+    # must fail on it at once, not poll it as "not yet" until the deadline
+    # and then blame a slow start.
+    broken = tmp_path / "probe.sh"
+    broken.write_text("#!/bin/bash\necho 'usage: probe <log> <pid>' >&2\nexit 64\n")
+    monkeypatch.setattr(dc, "PROBE_SCRIPT", broken)
+    pid_file = tmp_path / "server.pid"
+    pid_file.write_text(f"{fake_server['pid']}\n")
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match="unexpected status 64") as exc:
+        dc._wait_probe(30, log=fake_server["log"], pid_path=pid_file)
+    assert "usage: probe" in str(exc.value)
+    assert time.monotonic() - start < 5
+
+
+# ----------------------------------------------------------------------------
+# scripts/dev-server-wait.sh: the poll loop every dev-server-up target runs
+# the probe through. A status the probe does not define is a failure.
+# ----------------------------------------------------------------------------
+
+WAIT = dc.REPO_ROOT / "scripts" / "dev-server-wait.sh"
+
+
+def _status_script(tmp_path: Path, *statuses: int) -> Path:
+    """A command that exits with statuses[n] on its n-th run (the last one
+    repeating), printing which run it is."""
+    counter = tmp_path / "runs"
+    counter.write_text("0")
+    script = tmp_path / "probe-stub.sh"
+    seq = " ".join(str(s) for s in statuses)
+    script.write_text(
+        "#!/bin/bash\n"
+        f"n=$(( $(cat {counter}) + 1 )); echo $n > {counter}\n"
+        f"set -- {seq}\n"
+        'i=$n; [ "$i" -le "$#" ] || i=$#\n'
+        'rc=${!i}\n'
+        'echo "run $n status $rc"\n'
+        'exit "$rc"\n'
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _wait(*args, timeout: float = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(["bash", str(WAIT), *map(str, args)], capture_output=True, text=True, timeout=timeout)
+
+
+@pytest.mark.parametrize(
+    "statuses, want_rc, want_out",
+    [
+        ((0,), 0, "run 1 status 0 (try 1 of 3)"),
+        ((1, 1, 0), 0, "run 3 status 0 (try 3 of 3)"),
+        ((1, 2), 2, "run 2 status 2"),
+        ((1,), 1, "run 3 status 1"),
+        ((64,), 2, "probe exited with unexpected status 64: run 1 status 64"),
+        ((1, 127), 2, "probe exited with unexpected status 127: run 2 status 127"),
+        ((255,), 2, "probe exited with unexpected status 255: run 1 status 255"),
+    ],
+    ids=["ready", "ready-on-the-last-try", "failed", "timed-out", "usage-is-a-failure",
+         "missing-command-is-a-failure", "ssh-failure-without-retry"],
+)
+def test_wait_reads_the_probe_status(tmp_path, statuses, want_rc, want_out):
+    r = _wait(3, "--", _status_script(tmp_path, *statuses))
+    assert r.returncode == want_rc, r.stdout + r.stderr
+    assert r.stdout.strip() == want_out, r.stdout
+
+
+def test_wait_does_not_retry_an_unexpected_status(tmp_path):
+    start = time.monotonic()
+    r = _wait(10, "--", _status_script(tmp_path, 64))
+    assert r.returncode == 2
+    assert (tmp_path / "runs").read_text().strip() == "1"
+    assert time.monotonic() - start < 3
+
+
+def test_wait_retries_a_named_status(tmp_path):
+    # dev-server-up-fc's ssh: 255 means the host did not answer this second.
+    r = _wait("--retry", 255, 3, "--", _status_script(tmp_path, 255, 0))
+    assert r.returncode == 0, r.stdout
+    assert r.stdout.strip() == "run 2 status 0 (try 2 of 3)"
+
+
+@pytest.mark.parametrize("args", [[], ["x", "--", "true"], ["0", "--", "true"], ["3", "true"], ["--retry", "x", "3", "--", "true"]])
+def test_wait_refuses_bad_arguments(args):
+    assert _wait(*args).returncode == 64
+
+
+def test_wait_feeds_the_probe_on_stdin_as_the_fc_target_does(fake_server):
+    # The FC target pipes the probe to `bash -s` over ssh; this is that
+    # without the ssh.
+    r = _wait("--stdin", PROBE, 3, "--", "bash", "-s", "--", fake_server["log"], fake_server["pid"], "0")
+    assert r.returncode == 0, r.stdout
+    assert r.stdout.startswith("ready: listening on")
+
+
+@pytest.mark.parametrize("first", ["       4", "4 "])
+def test_wait_fails_the_real_probe_given_a_padded_first_line(fake_server, first):
+    # The review's case: a space-padded count is refused by the probe (64),
+    # and the wait must report that as a failure, not wait out its tries.
+    start = time.monotonic()
+    r = _wait(150, "--", "bash", PROBE, fake_server["log"], fake_server["pid"], "0", first)
+    assert r.returncode == 2, r.stdout
+    assert "unexpected status 64" in r.stdout and "usage" in r.stdout
+    assert time.monotonic() - start < 5
+
+
+def _makefile_logical_lines() -> list[str]:
+    """The Makefile's lines with backslash continuations joined."""
+    out, cur = [], ""
+    for line in (dc.REPO_ROOT / "Makefile").read_text().splitlines():
+        if line.endswith("\\"):
+            cur += line[:-1] + " "
+            continue
+        out.append(cur + line)
+        cur = ""
+    return out
+
+
+def test_every_dev_server_up_target_waits_through_the_shared_loop():
+    lines = [l for l in _makefile_logical_lines() if not l.lstrip().lstrip("@").startswith("#")]
+    probes = [l for l in lines if "dev-server-probe.sh" in l]
+    # The Mac, FC and remote targets, each once, each through the wait script.
+    assert len(probes) == 3, probes
+    for line in probes:
+        assert "scripts/dev-server-wait.sh" in line, line
+        # 0 ready, 1 timed out, anything else fails the target.
+        tail = line[line.index("dev-server-wait.sh"):]
+        assert 'case "$$RC" in' in tail, line
+        assert "*)" in tail, f"no catch-all failure branch: {line}"
+        star = tail.index("*)")
+        assert "exit 1" in tail[star:], line
+        assert tail.index("0)") < tail.index("1)") < star, line
+    fc = next(l for l in probes if "--stdin scripts/dev-server-probe.sh" in l)
+    assert "--retry 255" in fc
+
+
+def test_remote_start_line_survives_a_padded_wc(tmp_path):
+    # Take the remote target's own START_LINE assignment from a dry run and
+    # run it with a wc that pads its count the way macOS wc does.
+    env = tmp_path / "remote.env"
+    env.write_text("SHED_REMOTE_ENV=dev\n")
+    r, _ = _make_with_stubs(
+        tmp_path, "dev-server-up-remote", f"SHED_REMOTE_ENV_FILE={env}", "SHED_REMOTE_GITHUB_USER=someone",
+        dry_run=True,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    m = re.search(r"START_LINE=(\$\([^;]*\));", r.stdout)
+    assert m, r.stdout
+    log = tmp_path / "home" / ".shed" / "dev-remote" / "server.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("a\nb\nc\nd\n")
+    padded = tmp_path / "padded"
+    padded.mkdir()
+    (padded / "wc").write_text('#!/bin/bash\ncat >/dev/null\nprintf "       4\\n"\n')
+    (padded / "wc").chmod(0o755)
+    run = subprocess.run(
+        ["bash", "-c", f'START_LINE={m.group(1)}; printf "[%s]" "$START_LINE"'],
+        capture_output=True, text=True, timeout=30,
+        env={**os.environ, "PATH": f"{padded}:{os.environ['PATH']}"},
+    )
+    assert run.stdout == "[4]", run.stdout + run.stderr

@@ -317,36 +317,19 @@ func TestOverview_StoppedShedShape(t *testing.T) {
 	}
 }
 
-// newTokenModeOverviewServer builds a token-mode server (bearer tokens enforced)
-// backed by be, with a control and a credentials token minted for scope
-// assertions.
-func newTokenModeOverviewServer(t *testing.T, be *overviewFakeBackend) (srv *Server, control, credentials string) {
-	t.Helper()
-	store := authtoken.NewStore()
-	control, _, err := store.Mint("SHA256:test", authtoken.ScopeControl, authtoken.ClientCLI, time.Hour)
-	if err != nil {
-		t.Fatalf("mint control: %v", err)
-	}
-	credentials, _, err = store.Mint("SHA256:test", authtoken.ScopeCredentials, authtoken.ClientHostAgent, time.Hour)
-	if err != nil {
-		t.Fatalf("mint credentials: %v", err)
-	}
-	srv = NewServer(be, &config.ServerConfig{Name: "test-server", Auth: &config.AuthConfig{Mode: config.AuthModeToken}}, "", nil, nil)
-	srv.SetTokenStore(store)
-	return srv, control, credentials
-}
-
 // TestOverview_Scope: control scope required (the #237/#239 dual-scope carve-outs
-// do NOT apply). A credentials token is rejected (403); a control token is
-// accepted (200); an unauthenticated request is 401.
+// do NOT apply). A credentials certificate is rejected (403); a control
+// certificate is accepted (200); a request without one is 401.
 func TestOverview_Scope(t *testing.T) {
 	be := &overviewFakeBackend{} // empty: handler returns 200 with no sheds
-	srv, control, credentials := newTokenModeOverviewServer(t, be)
+	fp := testFingerprint("overview")
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server", Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}}, "", nil, nil)
+	srv.SetClientCertAuthorizer(func(got string) bool { return got == fp })
 
-	call := func(token string) int {
+	call := func(scope string) int {
 		r := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
-		if token != "" {
-			r.Header.Set("Authorization", "Bearer "+token)
+		if scope != "" {
+			withClientCert(r, testClientCert(fp, scope, time.Hour))
 		}
 		w := httptest.NewRecorder()
 		srv.Router().ServeHTTP(w, r)
@@ -354,13 +337,13 @@ func TestOverview_Scope(t *testing.T) {
 	}
 
 	if got := call(""); got != http.StatusUnauthorized {
-		t.Errorf("no token: got %d, want 401", got)
+		t.Errorf("no certificate: got %d, want 401", got)
 	}
-	if got := call(credentials); got != http.StatusForbidden {
-		t.Errorf("credentials token: got %d, want 403", got)
+	if got := call(authtoken.ScopeCredentials); got != http.StatusForbidden {
+		t.Errorf("credentials certificate: got %d, want 403", got)
 	}
-	if got := call(control); got != http.StatusOK {
-		t.Errorf("control token: got %d, want 200", got)
+	if got := call(authtoken.ScopeControl); got != http.StatusOK {
+		t.Errorf("control certificate: got %d, want 200", got)
 	}
 }
 

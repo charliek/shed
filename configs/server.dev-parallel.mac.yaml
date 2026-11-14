@@ -32,10 +32,9 @@ bind_address: 127.0.0.1
 default_backend: vz
 log_level: debug
 
-# mtls, the one enforced mode the dev servers and the integration suite run.
-# The shed-mobile app key is allowlisted so the mobile client can enrol too.
-# `make dev-server-up SHED_DEV_AUTH_MODE=token` renders a throwaway token-mode
-# copy for the remaining bearer-token tests (scripts/render-dev-config.sh).
+# mtls, the one enforced mode shed-server has; the dev servers and the
+# integration suite run it. The shed-mobile app key is allowlisted so the
+# mobile client can enrol too.
 auth:
   mode: mtls
   ssh:
