@@ -117,8 +117,16 @@ func settledError(shed *config.Shed) error {
 // the sink into the job as well would print every line twice), then waits on
 // ctx, which the request's disconnect ends without touching the job.
 func (s *Server) createAndWait(ctx context.Context, jobCtx context.Context, al backend.AsyncLifecycle, req config.CreateShedRequest) (any, error) {
-	if _, err := s.backend.CreateShed(jobCtx, req); err != nil {
+	created, err := s.backend.CreateShed(jobCtx, req)
+	if err != nil {
 		return nil, err
+	}
+	if created != nil {
+		// Follow the shed this request made and no other. The wait is by
+		// name and can last minutes; without this, a shed deleted and
+		// created again under the name by someone else would have its
+		// progress and its final state sent down this caller's stream.
+		ctx = backend.WithRequiredCreatedAt(backend.WithRequiredOwner(ctx, created.Owner), created.CreatedAt)
 	}
 	shed, err := al.WaitSettled(ctx, req.Name)
 	if err != nil {
