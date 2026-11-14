@@ -70,6 +70,34 @@ func String(s string) string {
 	return b.String()
 }
 
+// final returns s, the last piece of a stream that has ended, redacted. It
+// is String(s), except that a URL whose authority is still open at the end of
+// s (no '/', '?', '#', white space or control byte after its "://") loses the
+// whole of what follows the "://": the stream may have stopped inside the
+// userinfo, before its '@', or between two '@' of a password that holds one.
+// A final unterminated line that names a host and nothing after it
+// ("see https://example.com") is hidden with it; that is the cheaper mistake.
+func final(s string) string {
+	// An open authority holds no '/', so no "://" can follow it: only the
+	// last separator of s can be the one.
+	i := strings.LastIndex(s, "://")
+	if i < 0 || !hasScheme(s, i) {
+		return String(s)
+	}
+	start := i + 3
+	if start == len(s) {
+		return String(s)
+	}
+	for end := start; end < len(s); end++ {
+		if endsAuthority(s[end]) {
+			return String(s)
+		}
+	}
+	// s[:start] ends with the separator, so String finds nothing in its
+	// last URL and redacts the ones before it as it would in s.
+	return String(s[:start]) + Marker
+}
+
 // Args returns argv with String applied to each element. The result is a new
 // slice when anything changed and argv itself otherwise, so a caller may log
 // it but must never execute it in place of argv.

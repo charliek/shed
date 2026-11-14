@@ -21,6 +21,8 @@ const Dropped = "[more than 64 KiB without a space or line break: not logged]"
 // Writer redacts a stream line by line before passing it on. Lines end at
 // '\n' or '\r' (git's progress output uses '\r'). Call Flush when the stream
 // ends to pass on a final unterminated line. Safe for concurrent use.
+//
+// It never holds more than 2*maxPending bytes.
 type Writer struct {
 	mu      sync.Mutex
 	w       io.Writer
@@ -102,15 +104,27 @@ func (rw *Writer) write(p []byte) error {
 	return nil
 }
 
-// Flush passes on whatever is buffered, redacted.
+// Flush passes on whatever is buffered, redacted. Call it when the stream
+// has ended.
+//
+// The stream may have ended inside a URL (an exec that timed out, a link that
+// dropped), before the '@' that would have marked its userinfo, and String
+// alone would pass that userinfo on. So a URL whose authority is still open
+// where the buffer ends is passed on as scheme://REDACTED and nothing more
+// (see final). If the stream does go on after a Flush, what follows is
+// discarded up to the next break: it is the rest of a token whose beginning
+// has been passed on, and can no longer be redacted.
 func (rw *Writer) Flush() error {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
-	rw.skipping = false
 	if len(rw.pending) == 0 {
+		// Nothing held back: the stream ended at a line end, or inside an
+		// over-long token that is being discarded (and still is, if more of
+		// it comes).
 		return nil
 	}
-	err := rw.emit(rw.pending)
+	rw.skipping = !isBreak(rw.pending[len(rw.pending)-1])
+	_, err := io.WriteString(rw.w, final(string(rw.pending)))
 	rw.pending = rw.pending[:0]
 	return err
 }

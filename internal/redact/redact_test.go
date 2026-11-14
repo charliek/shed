@@ -171,7 +171,7 @@ func TestWriter(t *testing.T) {
 		{"one line", []string{"fatal: https://u:p@h/r not found\n"}, "fatal: https://REDACTED@h/r not found\n"},
 		{"split across writes", []string{"fatal: http", "s://u:", "p@h/r\n"}, "fatal: https://REDACTED@h/r\n"},
 		{"carriage returns", []string{"Receiving 10%\rReceiving https://u:p@h\r"}, "Receiving 10%\rReceiving https://REDACTED@h\r"},
-		{"unterminated tail flushed", []string{"a\nhttps://u:p@h"}, "a\nhttps://REDACTED@h"},
+		{"unterminated tail flushed", []string{"a\nhttps://u:p@h/r"}, "a\nhttps://REDACTED@h/r"},
 		{"nothing", nil, ""},
 	}
 	for _, tt := range tests {
@@ -392,4 +392,144 @@ func TestWriterBoundsPendingWithinOneWrite(t *testing.T) {
 			}
 		})
 	}
+}
+
+// secretPiece returns the first three-byte piece of secret found in s.
+func secretPiece(s, secret string) string {
+	for i := 0; i+3 <= len(secret); i++ {
+		if strings.Contains(s, secret[i:i+3]) {
+			return secret[i : i+3]
+		}
+	}
+	return ""
+}
+
+// A stream can end anywhere: an exec that timed out, a link that dropped, a
+// guest that stopped writing. Flush then passes on a last piece that may stop
+// inside a URL, before the '@' that would have marked its userinfo. Nothing
+// of the userinfo is passed on, and nothing of it either if the stream goes
+// on after the Flush.
+func TestWriterFlushInsideAURL(t *testing.T) {
+	const secret = "s3cr3t-T0ken"
+	lines := []struct {
+		name string
+		line string
+	}{
+		{"user and password", "fatal: unable to access 'https://user:" + secret + "@host.example/o/r.git/': denied\n"},
+		{"token as user", "remote: https://" + secret + "@host.example/o/r.git\n"},
+		{"an at sign in the password", "https://user@corp:" + secret + "@x@host.example/r\n"},
+		{"two urls with no space between", `["https://a:b@one","https://v:` + secret + `@two/r"]` + "\n"},
+		{"scheme glued on by the shell", `curl "https"://u:` + secret + "@h/x\n"},
+	}
+	for _, tt := range lines {
+		t.Run(tt.name, func(t *testing.T) {
+			for cut := 0; cut <= len(tt.line); cut++ {
+				for _, goesOn := range []bool{false, true} {
+					var out bytes.Buffer
+					w := NewWriter(&out)
+					if _, err := w.Write([]byte(tt.line[:cut])); err != nil {
+						t.Fatal(err)
+					}
+					if err := w.Flush(); err != nil {
+						t.Fatal(err)
+					}
+					if goesOn {
+						if _, err := w.Write([]byte(tt.line[cut:] + "next line\n")); err != nil {
+							t.Fatal(err)
+						}
+						if err := w.Flush(); err != nil {
+							t.Fatal(err)
+						}
+					}
+					got := out.String()
+					if piece := secretPiece(got, secret); piece != "" {
+						t.Fatalf("cut at %d (stream goes on: %v): %q of the credential was written: %q", cut, goesOn, piece, got)
+					}
+					if i := credentialedURL(got); i >= 0 {
+						t.Fatalf("cut at %d (stream goes on: %v): a URL kept its userinfo: %q", cut, goesOn, got)
+					}
+					if goesOn && !strings.HasSuffix(got, "next line\n") {
+						t.Fatalf("cut at %d: the line after the cut one was lost: %q", cut, got)
+					}
+				}
+			}
+		})
+	}
+
+	exact := []struct {
+		name   string
+		writes []string
+		want   string
+	}{
+		{"ends inside the password", []string{"fatal: https://user:s3c"}, "fatal: https://REDACTED"},
+		{"ends inside the user", []string{"a\nhttps://us"}, "a\nhttps://REDACTED"},
+		{"ends after the at sign", []string{"https://u:p@ho"}, "https://REDACTED"},
+		{"ends after the separator", []string{"see https://"}, "see https://"},
+		{"ends after the authority", []string{"see https://u:p@h/pa"}, "see https://REDACTED@h/pa"},
+		{"a whole url with no userinfo and a path", []string{"see https://h/x"}, "see https://h/x"},
+		{"no url", []string{"last words"}, "last words"},
+		{"ends with a line end", []string{"https://u:p@h\n"}, "https://REDACTED@h\n"},
+	}
+	for _, tt := range exact {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			w := NewWriter(&out)
+			for _, c := range tt.writes {
+				if _, err := w.Write([]byte(c)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if out.String() != tt.want {
+				t.Errorf("got %q, want %q", out.String(), tt.want)
+			}
+		})
+	}
+}
+
+// FuzzWriter writes s in two pieces with a Flush between them and one after.
+// However the stream is cut, no URL in what was passed on keeps a userinfo.
+func FuzzWriter(f *testing.F) {
+	f.Add("fatal: https://u:p@h/r not found\n", uint16(12), true)
+	f.Add(`["https://u:p@one","https://v:q@two/r"]`, uint16(20), false)
+	f.Add("https://user@corp:pw@x@host/r\nnext\n", uint16(9), true)
+	f.Fuzz(func(t *testing.T, s string, at uint16, flush bool) {
+		cut := int(at)
+		if cut > len(s) {
+			cut = len(s)
+		}
+		var out bytes.Buffer
+		w := NewWriter(&out)
+		if _, err := w.Write([]byte(s[:cut])); err != nil {
+			t.Fatal(err)
+		}
+		if flush {
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := w.Write([]byte(s[cut:])); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		got := out.String()
+		if i := credentialedURL(got); i >= 0 {
+			t.Fatalf("a URL kept its userinfo at byte %d: %q cut at %d (flush %v) -> %q", i, s, cut, flush, got)
+		}
+		if !flush {
+			// Where a Write ends changes nothing: one Write of all of s
+			// passes on the same bytes.
+			var whole bytes.Buffer
+			one := NewWriter(&whole)
+			_, _ = one.Write([]byte(s))
+			_ = one.Flush()
+			if len(s) <= maxPending && got != whole.String() {
+				t.Fatalf("%q cut at %d -> %q, in one Write -> %q", s, cut, got, whole.String())
+			}
+		}
+	})
 }
