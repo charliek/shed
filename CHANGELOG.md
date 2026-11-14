@@ -150,7 +150,11 @@ All notable changes to this project will be documented in this file.
   upgraded to this version does not start until one of them is set.** `mode: auto` is built:
   the server learns its public address from two agreeing `echo_urls` services and patches the
   rule's sources to that `/32`, under two extra roles that
-  `gce-setup.sh --print --firewall-auto` prints.
+  `gce-setup.sh --print --firewall-auto` prints. Each `echo_urls` entry must be on a different
+  host. A static source range in private space needs `acknowledge_any: true`, a network or
+  subnet in another project (a Shared VPC) is refused, and a create or start that reaches the
+  cloud while the check fails is not sent: the shed is left in `error` or `stopped` with the new
+  reason `firewall`.
 - **Development: a remote-backend dev server and suite parameter.**
   `make dev-server-up-remote` (and `-down-`, `-restart-`, `-status-`, `-logs-remote`) runs the
   dev build with `default_backend: remote` beside an installed server, reading the cloud
