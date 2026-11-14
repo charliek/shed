@@ -242,6 +242,14 @@ func (b *Backend) verify(ctx context.Context, ref provider.Ref, id string) error
 	if got := inst.Labels[provider.LabelEnv]; got != b.cfg.Environment {
 		return fmt.Errorf("%w: instance %s is in environment %q", provider.ErrForeign, inst.Name, got)
 	}
+	// An instance labelled by another version of the label set is reported
+	// and never touched (provider.LabelSchema). The error is not ErrForeign:
+	// the instance is this shed's, so a delete keeps its marker and is tried
+	// again by a server that can read the labels.
+	if got := inst.Labels[provider.LabelSchema]; got != provider.SchemaVersion {
+		return fmt.Errorf("%w: instance %s carries label %s=%q and this server reads %q; leaving it alone",
+			provider.ErrInvalid, inst.Name, provider.LabelSchema, got, provider.SchemaVersion)
+	}
 	return nil
 }
 
