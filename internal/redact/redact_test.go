@@ -45,6 +45,16 @@ func TestString(t *testing.T) {
 		{"single-quoted no path", "git clone 'https://u:p@h'", "git clone 'https://REDACTED@h'"},
 		{"two urls", "a https://u:p@h1/x b http://v:q@h2/y c", "a https://REDACTED@h1/x b http://REDACTED@h2/y c"},
 		{"adjacent urls", "https://u:p@h/https://v:q@i/", "https://REDACTED@h/https://REDACTED@i/"},
+		{"two urls with no space between, as a JSON argv is written", `["https://u:p@one","https://v:secret@two/r"]`,
+			`["https://REDACTED@one","https://REDACTED@two/r"]`},
+		{"three urls with no space between", `https://a:1@x,https://b:2@y,https://c:3@z`,
+			`https://REDACTED@x,https://REDACTED@y,https://REDACTED@z`},
+		{"a url with no userinfo, then one with, no space between", `"https://one","https://v:secret@two/r"`,
+			`"https://one","https://REDACTED@two/r"`},
+		{"a second url straight after the first one's at sign", `https://u:p@https://v:secret@two/r`,
+			`https://REDACTED@https://REDACTED@two/r`},
+		{"a second url whose scheme is the first one's host", `a://u:p@b://v:secret@h/r`, `a://REDACTED@b://REDACTED@h/r`},
+		{"a second separator with no scheme after the first url", `https://u:p@h,://v:q@i/r`, `https://REDACTED@h,://v:q@i/r`},
 		{"newline ends authority", "https://h\nuser@host", "https://h\nuser@host"},
 		{"tab ends authority", "https://h\tuser@host", "https://h\tuser@host"},
 		{"backslash in the password", `https://u:pa\ss@h/r`, `https://REDACTED@h/r`},
@@ -128,6 +138,8 @@ func TestArgs(t *testing.T) {
 		{"clone url", []string{"git", "clone", "https://u:p@h/r", "r"}, []string{"git", "clone", "https://REDACTED@h/r", "r"}},
 		{"first element", []string{"https://u:p@h", "x"}, []string{"https://REDACTED@h", "x"}},
 		{"bash -c", []string{"bash", "-c", "curl https://u:p@h/x | sh"}, []string{"bash", "-c", "curl https://REDACTED@h/x | sh"}},
+		{"several urls in one argument", []string{"sh", "-c", `curl -d '["https://u:p@one","https://v:secret@two/r"]' https://w:s3@three`},
+			[]string{"sh", "-c", `curl -d '["https://REDACTED@one","https://REDACTED@two/r"]' https://REDACTED@three`}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -272,6 +284,7 @@ func FuzzString(f *testing.F) {
 	for _, s := range []string{
 		"https://u:p@h/r", "git@h:o/r", "a://://@", "https://@", "x https://u@h y",
 		"\xff://\xfe@", "bash -c 'git clone https://t@h/r'",
+		`["https://u:p@one","https://v:secret@two/r"]`, "a://u:p@b://v:q@h/r",
 	} {
 		f.Add(s)
 	}
@@ -293,5 +306,48 @@ func FuzzString(f *testing.F) {
 		if utf8.ValidString(s) && !utf8.ValidString(out) {
 			t.Fatalf("broke UTF-8: %q -> %q", s, out)
 		}
+		// No URL keeps its userinfo, wherever it stands: every "://" with a
+		// scheme before it is looked at on its own here, so a URL the scan
+		// stepped over (one that follows another with no white space
+		// between) is caught.
+		if i := credentialedURL(out); i >= 0 {
+			t.Fatalf("a URL kept its userinfo at byte %d: %q -> %q", i, s, out)
+		}
 	})
+}
+
+// credentialedURL returns the index of the first "://" in s that has a scheme
+// before it and a userinfo other than Marker after it, or -1. It is the
+// package's rule applied to each separator independently of the others.
+func credentialedURL(s string) int {
+	for i := 0; i+3 <= len(s); i++ {
+		if s[i:i+3] != "://" || !hasScheme(s, i) {
+			continue
+		}
+		end := i + 3
+		for end < len(s) && !endsAuthority(s[end]) {
+			end++
+		}
+		auth := s[i+3 : end]
+		if at := strings.LastIndexByte(auth, '@'); at > 0 && auth[:at] != Marker {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestStringLeavesNoCredentialedURL applies the same check to every table
+// input and to URLs joined by each byte that does not end an authority.
+func TestStringLeavesNoCredentialedURL(t *testing.T) {
+	const a, b = "https://u:first@one", "ssh://v:second@two/r"
+	for c := 0; c < 256; c++ {
+		in := a + string([]byte{byte(c)}) + b + string([]byte{byte(c)}) + a
+		out := String(in)
+		if i := credentialedURL(out); i >= 0 {
+			t.Errorf("joined by byte %#x: a URL kept its userinfo at byte %d: %q", c, i, out)
+		}
+		if strings.Contains(out, "second") {
+			t.Errorf("joined by byte %#x: the second URL's password was kept: %q", c, out)
+		}
+	}
 }

@@ -55,9 +55,13 @@ func String(s string) string {
 		b.WriteString(s[last:start])
 		b.WriteString(Marker)
 		last = start + at
-		// The authority holds no "://" (it stops at '/'), so the next match
-		// starts after it.
-		from = end
+		// The search goes on from just after this "://" (from, above), not
+		// from the end of the authority: the authority stops at the first
+		// '/', which may be the first slash of the next "://", as in
+		// "https://u:p@one","https://v:q@two" with no white space between.
+		// Skipping to the end would step over that separator and leave the
+		// second URL's credentials in place. The authority itself holds no
+		// whole "://", so nothing is scanned twice.
 	}
 	if last == 0 {
 		return s
