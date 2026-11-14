@@ -1851,7 +1851,7 @@ func rejectUnknownNetworkKeys(data []byte) error {
 // rejectUnknownRemoteKeys fails loudly on an unknown key anywhere under
 // remote:, for the same reason as rejectUnknownClientKeys. Every setting
 // there bounds what a billed cloud VM may do or who may reach it; a typo
-// (say `max_runing:` or `source_range:`) must not fall back to a default.
+// (say `max_runs:` or `source_range:`) must not fall back to a default.
 func rejectUnknownRemoteKeys(data []byte) error {
 	var raw map[string]any
 	if err := yaml.Unmarshal(data, &raw); err != nil {

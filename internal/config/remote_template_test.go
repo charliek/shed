@@ -105,7 +105,7 @@ func TestRemoteUnknownKeysRefused(t *testing.T) {
 	tests := []struct {
 		name, old, new, want string
 	}{
-		{"a limit", "    max_running: 2\n", "    max_runing: 2\n", "max_runing"},
+		{"a limit", "    max_running: 2\n", "    max_runs: 2\n", "max_runs"},
 		{"a limit at the wrong level", "  disk_gb: 50\n", "  disk_gb: 50\n  max_running: 1\n", "max_running"},
 		{"the run limit", "  max_run_duration: 24h\n", "  max_run: 24h\n", "max_run"},
 		{"a firewall setting", "    source_ranges_env: SHED_REMOTE_SOURCE_RANGES\n", "    source_range_env: SHED_REMOTE_SOURCE_RANGES\n", "source_range_env"},
