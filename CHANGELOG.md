@@ -155,6 +155,23 @@ All notable changes to this project will be documented in this file.
   subnet in another project (a Shared VPC) is refused, and a create or start that reaches the
   cloud while the check fails is not sent: the shed is left in `error` or `stopped` with the new
   reason `firewall`.
+- **Remote backend: stricter config, and an abandoned create is destroyed.** An unknown key
+  anywhere under `remote:` now stops the load (a misspelt limit or firewall setting used to
+  fall back to its default). A static source range in `198.18.0.0/15` or `192.0.0.0/24` needs
+  `acknowledge_any: true`, auto mode never believes an address in those ranges or in
+  `240.0.0.0/4`, and an `echo_urls` host name outside ASCII must be written in its punycode
+  form. A VM still labelled `creating` 15 minutes after the cloud made it, with no record on
+  the server (a lost `state_dir`, or a server that died mid-create), is destroyed by the
+  start-up and periodic passes; before, it ran to its run limit and its disk stayed. Every
+  shed VM is made with `enable-oslogin=FALSE`. A streamed create refused by the firewall check
+  inside its job ends with `503 FIREWALL_CHECK_FAILED`, not a 500, and a service client's
+  `FIREWALL_CHECK_FAILED` message no longer names the rule, its source ranges or the server's
+  address.
+- **Logs: URL credentials with shell punctuation are redacted.** A password holding a
+  backslash, quote, backtick, brace, pipe, caret or angle bracket (`pa\$word` in a raw SSH
+  command) ended the scan early and reached the server, agent and audit logs whole; so did a
+  URL whose scheme the shell glues on (`"https"://`). Both are redacted now. In text with no
+  white space, an `@` after a path-less URL's closing quote is hidden with it.
 - **Development: a remote-backend dev server and suite parameter.**
   `make dev-server-up-remote` (and `-down-`, `-restart-`, `-status-`, `-logs-remote`) runs the
   dev build with `default_backend: remote` beside an installed server, reading the cloud
