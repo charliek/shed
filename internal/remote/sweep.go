@@ -161,7 +161,7 @@ func (b *Backend) Sweep(ctx context.Context) error {
 			// here: one read of its instance, and on from what that shows.
 			// A probe is not: a start call or the next server start
 			// retries it.
-			if r.Job == state.JobCreate && !r.Ready {
+			if (r.Job == state.JobCreate && !r.Ready) || r.Job == state.JobStart {
 				if j := b.healLocked(r); j != nil {
 					launch = append(launch, j)
 				}

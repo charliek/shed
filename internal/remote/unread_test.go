@@ -280,6 +280,65 @@ func TestResumedCreateLeavesAnotherSchemaAlone(t *testing.T) {
 	}
 }
 
+// A start resumed with its VM already up is followed even while the firewall
+// check fails. When the read that would tell (is it up?) fails as well, the
+// server knows nothing, and must not treat the start as failed: a failed
+// start stops the VM.
+func TestResumedStartIsKeptWhenItsInstanceCannotBeRead(t *testing.T) {
+	tests := []struct {
+		name string
+		// gate: the firewall check fails, so the follow-up read is the one
+		// that fails. Otherwise it is the read before the start call.
+		gate bool
+	}{
+		{"the firewall check fails and the follow-up read fails", true},
+		{"the read before the start call fails", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t)
+			const name = "up"
+			e.running(name)
+			id := e.settledID(name)
+			// The record of a start that died after the cloud brought the VM up.
+			if !e.b.update(name, id, func(r *state.Record) {
+				r.Shed.Status = config.StatusStarting
+				r.Job = state.JobStart
+			}) {
+				t.Fatal("no record")
+			}
+			if err := e.b.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if tt.gate {
+				brokenSources(e.prov)
+			}
+			// One read fails; the next (the one a failed start's clean-up
+			// makes before it stops the VM) would succeed.
+			e.prov.FailNext(fake.OpGet, errCloudDown)
+			e.b = e.open()
+			e.idle()
+
+			if n := e.count(fake.OpStop); n != 0 {
+				t.Fatalf("%d stop calls on a running VM after a failed read, want none", n)
+			}
+			rec := e.b.snapshot(name, id)
+			if rec == nil || rec.Shed.Status != config.StatusStarting || rec.Job != state.JobStart || rec.Shed.StatusReason != config.StatusReasonCloudUnreadable {
+				t.Fatalf("the record is %+v, want starting (%s) with its start kept", rec, config.StatusReasonCloudUnreadable)
+			}
+			e.sweep()
+			got := e.settled(name)
+			e.idle()
+			if got.Status != config.StatusRunning || got.StatusReason != "" {
+				t.Fatalf("came to rest %q (%q), want running", got.Status, got.StatusReason)
+			}
+			if n := e.count(fake.OpStop); n != 0 {
+				t.Fatalf("%d stop calls, want none", n)
+			}
+		})
+	}
+}
+
 // nthGet is the fake with one chosen read of an instance made to fail.
 type nthGet struct {
 	*fake.Provider

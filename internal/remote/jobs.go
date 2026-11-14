@@ -287,9 +287,9 @@ func isUnread(err error) bool {
 	return errors.As(err, &u)
 }
 
-// keep ends a create step that cannot decide what to do: the cloud did not
-// say what the instance is doing (a read failed), or showed labels this
-// server does not read. Giving the job up as failed is not an option. A
+// keep ends a create or start step that cannot decide what to do: the cloud
+// did not say what the instance is doing (a read failed), or showed labels
+// this server does not read. Giving the job up as failed is not an option. A
 // failed create is cleaned up by destroying its VM and a failed start by
 // stopping it, and the VM may be a finished shed, or one that runs. So
 // nothing is changed, in the cloud or in the guest, and the record keeps its
@@ -727,6 +727,12 @@ func (b *Backend) runStart(ctx context.Context, j *job) error {
 			return errSuperseded
 		}
 		inst, err := b.prov.Get(ctx, rec.Ref)
+		if unread(err) {
+			// Whether the VM is up is not known. A failed start stops the
+			// VM (failStart), and this one may be running, so the start is
+			// neither failed nor refused: it is kept and looked at again.
+			return b.keep(j, state.JobStart, fmt.Errorf("the firewall check fails (%w) and instance %s could not be read: %w", gerr, rec.Ref, err))
+		}
 		if err != nil {
 			return b.failStart(j, err, "", false)
 		}
@@ -738,6 +744,12 @@ func (b *Backend) runStart(ctx context.Context, j *job) error {
 	pend, err := b.mutate(ctx, rec.Ref, j.id, func() (provider.Pending, error) {
 		return b.prov.Start(ctx, rec.Ref, provider.StartOptions{MaxRun: maxRun})
 	})
+	if isUnread(err) {
+		// The read that precedes the start call failed and no start was
+		// accepted. The VM may be up all the same (a start resumed after a
+		// restart), so it is not stopped on the strength of that.
+		return b.keep(j, state.JobStart, fmt.Errorf("reading instance %s before starting it: %w", rec.Ref, err))
+	}
 	if err != nil {
 		return b.failStart(j, err, "", false)
 	}
