@@ -12,6 +12,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/provider/fake"
+	"github.com/charliek/shed/internal/remote/state"
 )
 
 // testClock is an injected clock a test moves by hand.
@@ -587,4 +588,130 @@ func TestNormalizeSources(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestFirewallGateInTheJob: a create or start is let in by the firewall check
+// when it is asked for, and may reach the cloud much later: resumed by the
+// next server after a restart, or queued behind a stop. The job asks the
+// check again before it sends the insert or the start, and sends neither
+// while the check fails.
+func TestFirewallGateInTheJob(t *testing.T) {
+	t.Run("a create resumed after a restart", func(t *testing.T) {
+		h := &hookProvider{}
+		e := newEnv(t, hooked(h))
+		const name = "resumed"
+		// The first server dies while the insert is on its way: the record
+		// holds the create and names no instance.
+		entered := make(chan struct{})
+		h.create = func(ctx context.Context, _ provider.Spec) (provider.Pending, error) {
+			close(entered)
+			<-ctx.Done()
+			return provider.Pending{}, ctx.Err()
+		}
+		if _, err := e.create(name); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		<-entered
+		// While it is down, the rule is opened to another address.
+		brokenSources(e.prov)
+		inserts := 0
+		h.create = func(ctx context.Context, spec provider.Spec) (provider.Pending, error) {
+			inserts++
+			return h.Provider.Create(ctx, spec)
+		}
+		e.restart()
+		got := e.settled(name)
+		e.idle()
+		if inserts != 0 || e.instances() != 0 {
+			t.Fatalf("%d inserts sent and %d instances exist while the firewall check fails, want none", inserts, e.instances())
+		}
+		if got.Status != config.StatusError || got.StatusReason != config.StatusReasonFirewall {
+			t.Errorf("came to rest %q (%q), want error (%s)", got.Status, got.StatusReason, config.StatusReasonFirewall)
+		}
+		if n := e.count(fake.OpDestroy); n != 0 {
+			t.Errorf("%d destroy calls, want none: nothing was made", n)
+		}
+	})
+
+	t.Run("a create resumed after a restart, the check passing", func(t *testing.T) {
+		h := &hookProvider{}
+		e := newEnv(t, hooked(h))
+		const name = "resumed"
+		entered := make(chan struct{})
+		h.create = func(ctx context.Context, _ provider.Spec) (provider.Pending, error) {
+			close(entered)
+			<-ctx.Done()
+			return provider.Pending{}, ctx.Err()
+		}
+		if _, err := e.create(name); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		<-entered
+		h.create = nil
+		e.restart()
+		if got := e.settled(name); got.Status != config.StatusRunning {
+			t.Errorf("came to rest %q (%q), want running", got.Status, got.StatusReason)
+		}
+	})
+
+	t.Run("a start queued behind a stop", func(t *testing.T) {
+		clock := newTestClock()
+		e := newEnv(t, manual(), withClock(clock))
+		const name = "queued"
+		e.put(name, config.StatusStopping)
+		// Let in while the check passes, and queued behind the stop.
+		if _, err := e.b.StartShed(ctxT(t), name); err != nil {
+			t.Fatalf("start while stopping: %v", err)
+		}
+		// The rule changes before the stop ends.
+		brokenSources(e.prov)
+		clock.Advance(FirewallMaxAge + time.Second)
+		starts := e.count(fake.OpStart)
+		e.finish(name)
+		got := e.settled(name)
+		e.idle()
+		if n := e.count(fake.OpStart) - starts; n != 0 {
+			t.Fatalf("%d start calls sent while the firewall check fails, want none", n)
+		}
+		if got.Status != config.StatusStopped || got.StatusReason != config.StatusReasonFirewall {
+			t.Errorf("came to rest %q (%q), want stopped (%s)", got.Status, got.StatusReason, config.StatusReasonFirewall)
+		}
+		if n := e.count(fake.OpStop); n != 1 {
+			t.Errorf("%d stop calls, want the one that was asked for", n)
+		}
+		// Once the rule is right the shed starts.
+		fixedSources(e.prov)
+		clock.Advance(FirewallMaxAge + time.Second)
+		if _, err := e.b.StartShed(ctxT(t), name); err != nil {
+			t.Fatalf("start after the fix: %v", err)
+		}
+		e.finish(name)
+		if got := e.settled(name); got.Status != config.StatusRunning {
+			t.Errorf("after the fix came to rest %q (%q), want running", got.Status, got.StatusReason)
+		}
+	})
+
+	t.Run("a start resumed after a restart, the VM already up", func(t *testing.T) {
+		e := newEnv(t)
+		const name = "up"
+		e.running(name)
+		id := e.settledID(name)
+		// The record of a start that died after the cloud brought the VM up.
+		if !e.b.update(name, id, func(r *state.Record) {
+			r.Shed.Status = config.StatusStarting
+			r.Job = state.JobStart
+		}) {
+			t.Fatal("no record")
+		}
+		brokenSources(e.prov)
+		e.restart()
+		got := e.settled(name)
+		e.idle()
+		if got.Status != config.StatusRunning {
+			t.Errorf("came to rest %q (%q), want running: the check never stops a VM or calls a running one stopped", got.Status, got.StatusReason)
+		}
+		if n := e.count(fake.OpStop); n != 0 {
+			t.Errorf("%d stop calls, want none", n)
+		}
+	})
 }

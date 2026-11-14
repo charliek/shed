@@ -353,6 +353,9 @@ const (
 	// StatusReasonHostKey (error): the VM presented a host key other than
 	// the pinned one.
 	StatusReasonHostKey = "host_key"
+	// StatusReasonFirewall (stopped, error): the firewall check was failing
+	// when the server was about to ask the cloud for the VM, so it did not.
+	StatusReasonFirewall = "firewall"
 )
 
 // Session represents a tmux session within a shed container.

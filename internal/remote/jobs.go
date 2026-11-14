@@ -306,6 +306,12 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		}
 	}
 	if pend.Ref == "" {
+		// The request was let in past the firewall check, but that may be
+		// long ago: a create resumed after a restart was let in by a server
+		// that is gone. No insert is sent while the check fails.
+		if err := b.firewallGate(ctx); err != nil {
+			return b.failCreate(j, err, config.StatusReasonFirewall)
+		}
 		// Create is idempotent on the instance name and shed ID.
 		var err error
 		if pend, err = b.prov.Create(ctx, *rec.Spec); err != nil {
@@ -614,6 +620,24 @@ func (b *Backend) runStart(ctx context.Context, j *job) error {
 	}
 	backend.Phase(ctx, "provider")
 	backend.Status(ctx, "Starting the cloud instance...")
+	// The request was let in past the firewall check, but the job may run
+	// much later: resumed after a restart, or queued behind a stop. No start
+	// is sent to a stopped VM while the check fails. A VM that is already on
+	// its way up or running (a resumed start the cloud had accepted) is
+	// followed, not judged again: the check never stops a VM, and the record
+	// must not call a running one stopped.
+	if gerr := b.firewallGate(ctx); gerr != nil {
+		if ctx.Err() != nil {
+			return errSuperseded
+		}
+		inst, err := b.prov.Get(ctx, rec.Ref)
+		if err != nil {
+			return b.failStart(j, err, "", false)
+		}
+		if inst.State != provider.StateStarting && inst.State != provider.StateRunning {
+			return b.refuseStart(j, gerr)
+		}
+	}
 	maxRun := b.runLimit(rec.Shed.Owner)
 	pend, err := b.mutate(ctx, rec.Ref, j.id, func() (provider.Pending, error) {
 		return b.prov.Start(ctx, rec.Ref, provider.StartOptions{MaxRun: maxRun})
@@ -706,6 +730,27 @@ func (b *Backend) failStart(j *job, cause error, reason string, stopVM bool) err
 		r.Pending = nil
 		r.Address = ""
 	})
+	return cause
+}
+
+// refuseStart records a start the server did not send because the firewall
+// check is failing: the shed goes back to "stopped" with reason "firewall".
+// Nothing was asked of the cloud, so nothing is stopped.
+func (b *Backend) refuseStart(j *job, cause error) error {
+	if j.ctx.Err() != nil {
+		return errSuperseded
+	}
+	b.logf("remote: start of shed %s was not sent: %v", j.name, cause)
+	if !b.update(j.name, j.id, func(r *state.Record) {
+		r.Shed.Status = config.StatusStopped
+		r.Shed.StatusReason = config.StatusReasonFirewall
+		r.Job = ""
+		r.Queued = ""
+		r.Pending = nil
+		r.Address = ""
+	}) {
+		return errSuperseded
+	}
 	return cause
 }
 

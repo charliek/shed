@@ -17,8 +17,8 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 | `starting` | A create or start is in progress, or the server adopted the VM and has not yet reached its agent. | empty, `no_pin`, `unreachable` |
 | `running` | The agent answered a probe. | empty |
 | `stopping` | A stop is in progress. | empty |
-| `stopped` | The VM is off and its disk is kept. | empty, `capacity`, `quota`, `limit`, `run_limit`, `external`, `isolation_lost`, `layout` |
-| `error` | The create failed. Only a delete leaves this state. | `capacity`, `quota`, `create_failed`, `host_key`, `layout` |
+| `stopped` | The VM is off and its disk is kept. | empty, `capacity`, `quota`, `limit`, `run_limit`, `external`, `isolation_lost`, `layout`, `firewall` |
+| `error` | The create failed. Only a delete leaves this state. | `capacity`, `quota`, `create_failed`, `host_key`, `layout`, `firewall` |
 
 | Reason | Meaning |
 |---|---|
@@ -33,6 +33,7 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 | `layout` | The VM's agent or guest layout is not compatible with this server. |
 | `create_failed` | The create failed for another reason; the server log has the detail. |
 | `host_key` | The host key the VM presented did not match the pinned key. |
+| `firewall` | The [firewall check](#the-firewall-check) was failing when the server was about to ask the cloud for the VM, so it did not. |
 
 The run limit is enforced by the cloud: each VM is created with a maximum run duration (the larger of `max_run_duration` and the owning client's `max_age`) after which the cloud stops it. The server notices a VM stopped by the run limit or from outside shed at its next [pass over the cloud](#keeping-records-and-the-cloud-in-step), at most about a minute later, and until then lists the shed as `running`. It records the shed as `stopped` with reason `run_limit` when the VM stopped within two minutes of its run limit, and with reason `external` otherwise. `isolation_lost` is defined but no code path sets it yet.
 
@@ -91,7 +92,7 @@ The `--repo` clone of a create runs with `GIT_TERMINAL_PROMPT=0`, for at most 5 
 | `FEATURE_UNSUPPORTED` | 501 | A snapshot, reset, image-management or egress write route is called. |
 | `INVALID_REQUEST` | 400 | No configured size has the requested `cpus` and `memory_mb`. |
 
-None of the 503 refusals is ever a 409, because a client reads a 409 on create as "the shed already exists". A quota, capacity or limit refusal that arrives after the create was accepted leaves the shed in `error` (create) or `stopped` (start) with the matching reason. `FIREWALL_CHECK_FAILED` is only ever answered on the request, before anything is created or started; a client treats it like the others: wait and try again.
+None of the 503 refusals is ever a 409, because a client reads a 409 on create as "the shed already exists". A quota, capacity or limit refusal that arrives after the create was accepted leaves the shed in `error` (create) or `stopped` (start) with the matching reason. `FIREWALL_CHECK_FAILED` is answered on the request, before anything is created or started; a client treats it like the others: wait and try again. The server asks the check again just before it sends the cloud an insert or a start, because that can be long after the request (a create resumed after a server restart, a start queued behind a stop). If the check fails then, nothing is sent and the shed is left in `error` (create) or `stopped` (start) with reason `firewall`.
 
 ## Unsupported features
 
