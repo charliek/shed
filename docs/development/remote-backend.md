@@ -35,6 +35,8 @@ scripts/remote/gce-setup.sh --print \
   --key-out ~/.config/shed/remote-dev/gce-key.b64
 ```
 
+Use a documentation address such as `203.0.113.7/32` when you only want to read the output.
+
 | Flag | Meaning |
 |---|---|
 | `--project` | The Google Cloud project ID. |
@@ -44,8 +46,20 @@ scripts/remote/gce-setup.sh --print \
 | `--subnet-range` | The subnet range (default `10.10.0.0/24`). |
 | `--role-id` | The custom role ID (default `shedServer`), shared by every environment in the project. |
 | `--key-out` | Where the base64 service account key is written, mode `0600`. |
+| `--firewall-auto` | Also print the two extra roles `remote.firewall.mode: auto` needs. Leave it out for `static`, the dev default. |
 
-Read each printed block, then run it yourself. It enables the Compute Engine API and creates a custom-mode network and subnet, one firewall rule (tcp:22 from your address to the environment's tag), the custom role, a service account holding only that role, and its key. The printed text ends with the environment variables to set. The server does not create, read or check the firewall rule: if your public address changes, update the rule's source range yourself.
+Read each printed block, then run it yourself. It enables the Compute Engine API and creates a custom-mode network and subnet, one firewall rule (tcp:22 from your address to the environment's tag), the custom role, a service account holding only that role, and its key. The printed text ends with the environment variables to set.
+
+The server never creates or deletes the firewall rule, but it reads it. The dev config uses `firewall.mode: static` with `source_ranges_env: SHED_REMOTE_SOURCE_RANGES`: the rule's source ranges must equal that variable, and while they do not, `shed create` and `shed start` answer `503 FIREWALL_CHECK_FAILED`. When your public address changes, update both:
+
+```bash
+gcloud compute firewall-rules update shed-<env-name>-ssh --project <project-id> \
+  --source-ranges=<new-address>/32
+# then set SHED_REMOTE_SOURCE_RANGES=<new-address>/32 in the env file and
+make dev-server-restart-remote
+```
+
+If the address changes often, switch the rendered template to `mode: auto` (it is there, commented out), run the block `gce-setup.sh --print --firewall-auto` adds, and the server follows the address itself. See [The firewall check](../reference/remote-backend.md#the-firewall-check) for every clause, the two extra roles and what each failure means.
 
 Create the SSH key the server uses to log in to every VM:
 
@@ -67,6 +81,7 @@ SHED_GCE_SUBNET=shed-<env-name>
 SHED_GCE_TAG=shed-<env-name>
 SHED_GCE_CREDENTIALS_FILE=<path to the base64 key>
 SHED_REMOTE_SSH_KEY_FILE=<path to link_ed25519>
+SHED_REMOTE_SOURCE_RANGES=<your-public-address>/32
 ```
 
 | Variable | Read by | Meaning |
@@ -79,6 +94,7 @@ SHED_REMOTE_SSH_KEY_FILE=<path to link_ed25519>
 | `SHED_GCE_TAG` | `gce-image` | The network tag the firewall rule admits; the image bake gives it to its builder VM (`SHED_GCE_BAKE_TAG` overrides). |
 | `SHED_GCE_CREDENTIALS_FILE` | server | Path to the base64 service account key. `GOOGLE_CREDENTIALS_BASE64` (the key itself) is the alternative; set exactly one. |
 | `SHED_REMOTE_SSH_KEY_FILE` | server | Path to the SSH private key. `SHED_REMOTE_SSH_KEY` (base64 of the key) is the alternative; set exactly one. |
+| `SHED_REMOTE_SOURCE_RANGES` | server | The firewall rule's source ranges, comma-separated IPv4 CIDRs: what you passed as `--source-range`. The server compares the rule with it (`remote.firewall.source_ranges_env`). Not read in `auto` mode. |
 
 Keep the file mode `0600`. The server refuses to start, naming the variable, when one it needs is unset.
 

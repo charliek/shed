@@ -126,11 +126,45 @@ func TestRemoteValidate(t *testing.T) {
 		{"gce credentials pair same name", func(c *RemoteConfig) { c.GCE.CredentialsFileEnv = c.GCE.CredentialsEnv }, "different variables"},
 		{"gce block missing", func(c *RemoteConfig) { c.GCE = nil }, "gce block is required"},
 		{"firewall unknown mode", func(c *RemoteConfig) { c.Firewall.Mode = "open" }, "invalid firewall.mode"},
-		{"firewall static with ranges", func(c *RemoteConfig) { c.Firewall.SourceRanges = []string{"203.0.113.7/32"} }, ""},
-		{"firewall bad range", func(c *RemoteConfig) { c.Firewall.SourceRanges = []string{"203.0.113.7"} }, "firewall.source_ranges"},
-		{"firewall ipv6 range", func(c *RemoteConfig) { c.Firewall.SourceRanges = []string{"2001:db8::/32"} }, "firewall.source_ranges"},
+		{"firewall static defaults to the env variable", func(c *RemoteConfig) {
+			if c.Firewall.SourceRangesEnv != DefaultRemoteFirewallSourceRangesEnv {
+				panic("no default source_ranges_env")
+			}
+		}, ""},
+		{"firewall static with ranges", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"203.0.113.7/32", "198.51.100.0/24"}}
+		}, ""},
+		{"firewall static with a named variable", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRangesEnv: "MY_RANGES"}
+		}, ""},
+		{"firewall static with neither", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic}
+		}, "needs firewall.source_ranges or firewall.source_ranges_env"},
+		{"firewall static with both", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"203.0.113.7/32"}, SourceRangesEnv: "MY_RANGES"}
+		}, "set exactly one"},
+		{"firewall static variable not a name", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRangesEnv: "203.0.113.7/32"}
+		}, "not an environment variable name"},
+		{"firewall bad range", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"203.0.113.7"}}
+		}, "firewall.source_ranges"},
+		{"firewall ipv6 range", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"2001:db8::/32"}}
+		}, "firewall.source_ranges"},
+		{"firewall static any address", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"0.0.0.0/0"}}
+		}, "wider than a /24"},
+		{"firewall static wide range", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"203.0.113.7/32", "198.51.0.0/16"}}
+		}, "wider than a /24"},
+		{"firewall static wide range acknowledged", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"198.51.0.0/16"}, AcknowledgeAny: true}
+		}, ""},
+		{"firewall static a /24", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"198.51.100.0/24"}}
+		}, ""},
 		{"firewall static with echo urls", func(c *RemoteConfig) { c.Firewall.EchoURLs = []string{"https://a.example", "https://b.example"} }, "echo_urls is only used"},
-		{"firewall static with acknowledge_any", func(c *RemoteConfig) { c.Firewall.AcknowledgeAny = true }, "acknowledge_any is only used"},
 		{"firewall auto without urls", func(c *RemoteConfig) { c.Firewall.Mode = RemoteFirewallAuto }, "at least two"},
 		{"firewall auto with one url", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example"}}
@@ -141,10 +175,22 @@ func TestRemoteValidate(t *testing.T) {
 		{"firewall auto", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", "https://b.example"}}
 		}, ""},
+		{"firewall auto with ranges", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", "https://b.example"}, SourceRanges: []string{"203.0.113.7/32"}}
+		}, "source_ranges is only used"},
+		{"firewall auto with a ranges variable", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", "https://b.example"}, SourceRangesEnv: "MY_RANGES"}
+		}, "source_ranges_env is only used"},
+		{"firewall auto with acknowledge_any", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", "https://b.example"}, AcknowledgeAny: true}
+		}, "acknowledge_any is not used"},
 		{"firewall any unacknowledged", func(c *RemoteConfig) { c.Firewall.Mode = RemoteFirewallAny }, "acknowledge_any: true"},
 		{"firewall any with ranges", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAny, AcknowledgeAny: true, SourceRanges: []string{"0.0.0.0/0"}}
-		}, "source_ranges must be empty"},
+		}, "source_ranges is only used"},
+		{"firewall any with a ranges variable", func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAny, AcknowledgeAny: true, SourceRangesEnv: "MY_RANGES"}
+		}, "source_ranges_env is only used"},
 		{"firewall any acknowledged", func(c *RemoteConfig) {
 			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAny, AcknowledgeAny: true}
 		}, ""},
@@ -325,6 +371,7 @@ func TestRemoteResolve(t *testing.T) {
 			"SHED_GCE_PROJECT": "proj", "SHED_GCE_ZONE": "zone-a", "SHED_GCE_NETWORK": "net", "SHED_GCE_SUBNET": "subnet",
 			"SHED_GCE_CREDENTIALS_FILE": credsFile,
 			"SHED_REMOTE_SSH_KEY_FILE":  keyFile,
+			"SHED_REMOTE_SOURCE_RANGES": "203.0.113.7/32",
 		}
 	}
 	tests := []struct {
@@ -334,7 +381,45 @@ func TestRemoteResolve(t *testing.T) {
 		wantErr   string
 		wantKey   string
 		wantCreds string
+		// wantSources is compared when set; "-" means none.
+		wantSources string
 	}{
+		{name: "source ranges from the variable, canonical and sorted", mutateEnv: func(env map[string]string) {
+			env["SHED_REMOTE_SOURCE_RANGES"] = " 203.0.113.7/32, 198.51.100.9/24 ,203.0.113.7/32,"
+		}, wantKey: "KEY-FROM-FILE\n", wantCreds: `{"type":"service_account"}`, wantSources: "198.51.100.0/24,203.0.113.7/32"},
+		{name: "source ranges from the file", mutateCfg: func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRanges: []string{"192.0.2.44/32"}}
+		}, mutateEnv: func(env map[string]string) {
+			env["SHED_REMOTE_SOURCE_RANGES"] = "not read"
+		}, wantKey: "KEY-FROM-FILE\n", wantCreds: `{"type":"service_account"}`, wantSources: "192.0.2.44/32"},
+		{name: "source ranges from a named variable", mutateCfg: func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallStatic, SourceRangesEnv: "MY_RANGES"}
+		}, mutateEnv: func(env map[string]string) {
+			delete(env, "SHED_REMOTE_SOURCE_RANGES")
+			env["MY_RANGES"] = "192.0.2.45/32"
+		}, wantKey: "KEY-FROM-FILE\n", wantCreds: `{"type":"service_account"}`, wantSources: "192.0.2.45/32"},
+		{name: "source ranges variable unset", mutateEnv: func(env map[string]string) { delete(env, "SHED_REMOTE_SOURCE_RANGES") },
+			wantErr: "SHED_REMOTE_SOURCE_RANGES (remote.firewall.source_ranges_env) is not set"},
+		{name: "source ranges variable only commas", mutateEnv: func(env map[string]string) { env["SHED_REMOTE_SOURCE_RANGES"] = " , ," },
+			wantErr: "lists no source range"},
+		{name: "source ranges variable not a cidr", mutateEnv: func(env map[string]string) { env["SHED_REMOTE_SOURCE_RANGES"] = "203.0.113.7" },
+			wantErr: "must be an IPv4 CIDR"},
+		{name: "source ranges variable ipv6", mutateEnv: func(env map[string]string) { env["SHED_REMOTE_SOURCE_RANGES"] = "2001:db8::1/128" },
+			wantErr: "must be an IPv4 CIDR"},
+		{name: "source ranges variable any address", mutateEnv: func(env map[string]string) { env["SHED_REMOTE_SOURCE_RANGES"] = "0.0.0.0/0" },
+			wantErr: "wider than a /24"},
+		{name: "source ranges variable wide", mutateEnv: func(env map[string]string) { env["SHED_REMOTE_SOURCE_RANGES"] = "203.0.113.7/32,198.51.0.0/23" },
+			wantErr: "wider than a /24"},
+		{name: "source ranges variable wide, acknowledged", mutateCfg: func(c *RemoteConfig) { c.Firewall.AcknowledgeAny = true },
+			mutateEnv: func(env map[string]string) { env["SHED_REMOTE_SOURCE_RANGES"] = "0.0.0.0/0" },
+			wantKey:   "KEY-FROM-FILE\n", wantCreds: `{"type":"service_account"}`, wantSources: "0.0.0.0/0"},
+		{name: "auto mode reads no ranges", mutateCfg: func(c *RemoteConfig) {
+			c.Firewall = RemoteFirewallConfig{Mode: RemoteFirewallAuto, EchoURLs: []string{"https://a.example", "https://b.example"}}
+		}, mutateEnv: func(env map[string]string) { env["SHED_REMOTE_SOURCE_RANGES"] = "garbage" },
+			wantKey: "KEY-FROM-FILE\n", wantCreds: `{"type":"service_account"}`, wantSources: "-"},
+		{name: "fake provider with a bad list is still refused", mutateCfg: func(c *RemoteConfig) {
+			c.Provider, c.AllowTestDrivers, c.GCE = RemoteProviderFake, true, nil
+		}, mutateEnv: func(env map[string]string) { env["SHED_REMOTE_SOURCE_RANGES"] = "garbage" }, wantErr: "must be an IPv4 CIDR"},
 		{name: "file variables", wantKey: "KEY-FROM-FILE\n", wantCreds: `{"type":"service_account"}`},
 		{name: "base64 variables", mutateEnv: func(env map[string]string) {
 			delete(env, "SHED_REMOTE_SSH_KEY_FILE")
@@ -407,6 +492,15 @@ func TestRemoteResolve(t *testing.T) {
 			}
 			if string(rt.SSHClientKey) != tt.wantKey || string(rt.Credentials) != tt.wantCreds {
 				t.Errorf("key %q creds %q, want %q %q", rt.SSHClientKey, rt.Credentials, tt.wantKey, tt.wantCreds)
+			}
+			if tt.wantSources != "" {
+				want := tt.wantSources
+				if want == "-" {
+					want = ""
+				}
+				if got := strings.Join(rt.FirewallSources, ","); got != want {
+					t.Errorf("FirewallSources = %q, want %q", got, want)
+				}
 			}
 			if c.Provider == RemoteProviderGCE && (rt.Project != "proj" || rt.Zone != "zone-a" || rt.Network != "net" || rt.Subnet != "subnet") {
 				t.Errorf("gce values = %+v", rt)
@@ -526,6 +620,10 @@ func TestRemoteConfigFromYAML(t *testing.T) {
 		{"client image that is not an alias", minimal + "https_port: 18490\n" + remoteClientYAML, "not an image alias of the remote backend"},
 		{"client server_mounts", minimalAliased + "https_port: 18490\n" + remoteClientYAML + "        server_mounts: [claude]\n", "server_mounts"},
 		{"firewall any beside a client", minimalAliased + "  firewall: {mode: any, acknowledge_any: true}\nhttps_port: 18490\n" + remoteClientYAML, "not allowed with auth.clients"},
+		{"firewall static acknowledged beside a client", minimalAliased + "  firewall: {mode: static, source_ranges: [198.51.0.0/16], acknowledge_any: true}\nhttps_port: 18490\n" + remoteClientYAML, "acknowledge_any is not allowed with auth.clients"},
+		{"firewall static acknowledged with isolated default", minimal + "  firewall: {mode: static, source_ranges: [198.51.0.0/16], acknowledge_any: true}\nnetwork:\n  default_profile: isolated\n", "not allowed with remote.firewall.acknowledge_any"},
+		{"firewall static acknowledged alone", minimal + "  firewall: {mode: static, source_ranges: [198.51.0.0/16], acknowledge_any: true}\n", ""},
+		{"firewall static with a ranges variable beside a client", minimalAliased + "  firewall: {mode: static, source_ranges_env: MY_RANGES}\nhttps_port: 18490\n" + remoteClientYAML, ""},
 		{"firewall any with isolated default", minimal + "  firewall: {mode: any, acknowledge_any: true}\nnetwork:\n  default_profile: isolated\n", "not allowed with remote.firewall.mode: any"},
 	}
 	for _, tt := range tests {

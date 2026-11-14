@@ -56,8 +56,8 @@ type sweepCheck struct {
 	listed   bool
 }
 
-// Sweep is the periodic pass. It lists this environment's instances once and
-// then, for sheds with no job in flight:
+// Sweep is the periodic pass. It runs the firewall check, lists this
+// environment's instances once and then, for sheds with no job in flight:
 //
 //   - starts the delete job of every delete marker that has none (a destroy
 //     that failed is retried here, not only at the next server start);
@@ -76,6 +76,9 @@ func (b *Backend) Sweep(ctx context.Context) error {
 	if err := b.checkReady(); err != nil {
 		return err
 	}
+	// Refresh the firewall check. Its result gates creates and starts only;
+	// nothing below depends on it, and nothing is stopped or deleted for it.
+	b.CheckFirewall(ctx)
 	insts, err := b.prov.List(ctx, provider.Selector{Env: b.cfg.Environment})
 	if err != nil {
 		return err

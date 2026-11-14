@@ -370,14 +370,17 @@ func (c *ServerConfig) validateNetwork() error {
 //
 // The remote backend accepts "isolated": there it means isolation by network
 // topology (no route between sheds or to the server host). That holds only
-// while the firewall rule admits the server alone, so firewall.mode: any
-// refuses it.
+// while the firewall rule admits the server alone, so firewall.mode: any,
+// and a static mode that acknowledged wide ranges, refuse it.
 func (c *ServerConfig) validateNetworkBackend() error {
 	if c.DefaultBackend == BackendRemote {
-		if c.Remote == nil || c.Remote.Firewall.Mode != RemoteFirewallAny {
+		if c.Remote == nil || !c.Remote.Firewall.AdmitsAny() {
 			return nil
 		}
 		if p := c.NetworkDefaultProfile(); p != NetworkProfileOpen {
+			if c.Remote.Firewall.Mode != RemoteFirewallAny {
+				return fmt.Errorf("network.default_profile: %s is not allowed with remote.firewall.acknowledge_any (every shed's SSH port may then be reachable from the others)", p)
+			}
 			return fmt.Errorf("network.default_profile: %s is not allowed with remote.firewall.mode: %s (every shed's SSH port is then reachable from the others)", p, RemoteFirewallAny)
 		}
 		return nil

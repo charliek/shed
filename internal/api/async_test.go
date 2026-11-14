@@ -415,6 +415,7 @@ func TestAsyncErrorMapping(t *testing.T) {
 		{config.ErrServerLimitReachedSentinel, http.StatusServiceUnavailable, config.ErrServerLimitReached},
 		{config.ErrCloudQuotaExceededSentinel, http.StatusServiceUnavailable, config.ErrCloudQuotaExceeded},
 		{config.ErrZoneCapacityUnavailableSentinel, http.StatusServiceUnavailable, config.ErrZoneCapacityUnavailable},
+		{config.ErrFirewallCheckFailedSentinel, http.StatusServiceUnavailable, config.ErrFirewallCheckFailed},
 		{config.ErrFeatureUnsupportedSentinel, http.StatusNotImplemented, config.ErrFeatureUnsupported},
 		{config.ErrShedAlreadyExistsSentinel, http.StatusConflict, config.ErrShedAlreadyExists},
 	}

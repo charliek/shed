@@ -688,7 +688,8 @@ dev-server-restart-fc: dev-server-down-fc dev-server-up-fc
 # Cloud settings are private and never in this repo. The targets source them
 # from $(SHED_REMOTE_ENV_FILE) (VAR=value lines): SHED_REMOTE_ENV (the
 # environment name), SHED_GCE_PROJECT, SHED_GCE_ZONE, SHED_GCE_NETWORK,
-# SHED_GCE_SUBNET, SHED_GCE_CREDENTIALS_FILE and SHED_REMOTE_SSH_KEY_FILE.
+# SHED_GCE_SUBNET, SHED_GCE_CREDENTIALS_FILE, SHED_REMOTE_SSH_KEY_FILE and
+# SHED_REMOTE_SOURCE_RANGES (the firewall rule's source ranges).
 # The config is rendered from configs/server.dev-remote.yaml.tmpl on every
 # start; edit the template, not the rendered file.
 SHED_REMOTE_ENV_FILE    ?= $(HOME)/.config/shed/remote-dev/env

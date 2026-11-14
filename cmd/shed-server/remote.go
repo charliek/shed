@@ -47,6 +47,7 @@ func newRemoteBackend(cfg *config.ServerConfig, bridge *plugin.Bridge) (*remote.
 		return nil, fmt.Errorf("remote backend: %w", err)
 	}
 	stateRoot := serverStateDir(cfg)
+	firewallSources := rt.FirewallSources
 
 	var prov provider.Provider
 	switch rcfg.Provider {
@@ -69,7 +70,13 @@ func newRemoteBackend(cfg *config.ServerConfig, bridge *plugin.Bridge) (*remote.
 		}
 		prov = client
 	case config.RemoteProviderFake:
-		prov = fake.New(fake.Options{Env: rcfg.Environment})
+		// The fake's firewall rule carries whatever static mode expects, so
+		// the check passes; with no ranges given it is the fake's own
+		// documentation address.
+		if rcfg.Firewall.Mode == config.RemoteFirewallStatic && len(firewallSources) == 0 {
+			firewallSources = []string{fake.DefaultFirewallSource}
+		}
+		prov = fake.New(fake.Options{Env: rcfg.Environment, FirewallSources: firewallSources})
 	default:
 		return nil, fmt.Errorf("remote backend: unknown provider %q", rcfg.Provider)
 	}
@@ -106,6 +113,7 @@ func newRemoteBackend(cfg *config.ServerConfig, bridge *plugin.Bridge) (*remote.
 		Links:            links,
 		StateDir:         rcfg.StateDirPath(stateRoot),
 		AuthorizedKeys:   authorizedKeys,
+		FirewallSources:  firewallSources,
 		Bridge:           bridge,
 		KeepFailedCreate: os.Getenv(keepFailedCreateEnv) == "1",
 	})

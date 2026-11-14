@@ -119,6 +119,8 @@ var (
 	_ provider.Provider      = (*Client)(nil)
 	_ provider.HostKeyReader = (*Client)(nil)
 	_ provider.ImageResolver = (*Client)(nil)
+
+	_ provider.FirewallSourceSetter = (*Client)(nil)
 )
 
 // New checks cfg and returns a Client. It makes no API call.

@@ -69,6 +69,8 @@ The server reads the cloud when it starts and then once a minute. Each pass list
 | A shed left `stopping` by a failed cloud call | Stops it again. |
 | A create that failed | Destroys its VM, retrying until it is gone. The shed stays, in `error`, until it is deleted. |
 
+Each pass also runs the [firewall check](#the-firewall-check). Its result decides only whether creates and starts are accepted.
+
 A pass destroys a VM only for a delete that was acknowledged or a create that failed. A VM it does not know (another environment's, or one with no record) is logged and left alone.
 
 Measured on the development server: a VM stopped with the cloud's own tools was listed `stopped (external)` 10 s after it finished stopping, and `shed start` brought it back in 42 s. A VM deleted with the cloud's tools lost its record 2 to 12 s after it was gone. A stopped shed's VM started with the cloud's tools was listed `starting` at the next pass and `running` 3 s later. A `shed delete` sent in between, for a shed whose VM was already gone, succeeded in under a second.
@@ -84,11 +86,12 @@ The `--repo` clone of a create runs with `GIT_TERMINAL_PROMPT=0`, for at most 5 
 | `SERVER_LIMIT_REACHED` | 503 | The server's `max_running` or `max_sheds` limit is reached. |
 | `CLOUD_QUOTA_EXCEEDED` | 503 | The cloud project's quota is reached. |
 | `ZONE_CAPACITY_UNAVAILABLE` | 503 | The zone has no room for the machine type. |
+| `FIREWALL_CHECK_FAILED` | 503 | The [firewall check](#the-firewall-check) is failing. The message names the rule, what was expected and what was found. |
 | `FEATURE_UNSUPPORTED` | 422 | A create asks for `local_dir`, `add_dirs`, a non-empty `mounts`, `from_snapshot` or egress profiles. |
 | `FEATURE_UNSUPPORTED` | 501 | A snapshot, reset, image-management or egress write route is called. |
 | `INVALID_REQUEST` | 400 | No configured size has the requested `cpus` and `memory_mb`. |
 
-None of the three 503 refusals is ever a 409, because a client reads a 409 on create as "the shed already exists". A refusal that arrives after the create was accepted leaves the shed in `error` (create) or `stopped` (start) with the matching reason.
+None of the 503 refusals is ever a 409, because a client reads a 409 on create as "the shed already exists". A quota, capacity or limit refusal that arrives after the create was accepted leaves the shed in `error` (create) or `stopped` (start) with the matching reason. `FIREWALL_CHECK_FAILED` is only ever answered on the request, before anything is created or started; a client treats it like the others: wait and try again.
 
 ## Unsupported features
 
@@ -138,11 +141,12 @@ remote:
   ssh:
     client_key_env: SHED_REMOTE_SSH_KEY             # base64 of the OpenSSH private key
     client_key_file_env: SHED_REMOTE_SSH_KEY_FILE   # or a path to it; exactly one must be set
-  firewall:
-    mode: static                 # static | auto | any; only static is supported (see below)
-    source_ranges: []            # static: the firewall rule's sources (not checked yet)
-    acknowledge_any: false       # must be true for mode: any
-    echo_urls: []                # auto only
+  firewall:                      # see "The firewall check"
+    mode: static                 # static | auto | any
+    source_ranges: []            # static: the rule's sources, as IPv4 CIDRs, or
+    source_ranges_env: SHED_REMOTE_SOURCE_RANGES   # static: a variable holding them, comma-separated
+    acknowledge_any: false       # must be true for mode: any, and for a static range wider than a /24
+    echo_urls: []                # auto: at least two https services that answer with the caller's address
   gce:
     project_env: SHED_GCE_PROJECT
     zone_env: SHED_GCE_ZONE
@@ -152,14 +156,109 @@ remote:
     credentials_file_env: SHED_GCE_CREDENTIALS_FILE   # or a path to it; exactly one must be set
 ```
 
-Only `environment` and `default_image` are required; every other field has the default shown. With `default_backend: remote` the server refuses to load when the config also has a `firecracker:` or `vz:` block, `env_file`, top-level `mounts`, `egress.enabled`, `network.allow_cidrs`, `extensions.enabled`, a client `policy.server_mounts`, a client `policy.images` entry that is not an `image_aliases` name, or `firewall.mode: any` beside service clients or an `isolated` default profile. A `remote:` block under any other backend is refused too.
+Only `environment` and `default_image` are required; every other field has the default shown. With `default_backend: remote` the server refuses to load when the config also has a `firecracker:` or `vz:` block, `env_file`, top-level `mounts`, `egress.enabled`, `network.allow_cidrs`, `extensions.enabled`, a client `policy.server_mounts`, a client `policy.images` entry that is not an `image_aliases` name, or `firewall.mode: any` (or `firewall.acknowledge_any: true` in any mode) beside service clients or an `isolated` default profile. A `remote:` block under any other backend is refused too.
 
-Two fields are accepted by the loader but not built yet:
+One field is accepted by the loader but not built yet:
 
 | Field | What happens today |
 |---|---|
 | `agent_install` | Every value behaves as `never`: the server does not copy an agent into a VM. A VM whose agent reports an incompatible protocol or guest layout fails its create (`error`, reason `layout`) or start (`stopped`, reason `layout`). Bake a new image instead (`make gce-image`). |
-| `firewall.mode` | Use `static`. The server neither reads nor changes the firewall rule in any mode: create the rule once with `scripts/remote/gce-setup.sh` and keep its source the server's public address. `source_ranges` is not compared with the rule, `auto` does nothing, and `any` only makes the `isolated` profile unavailable. |
+
+## The firewall check
+
+Every shed's SSH port is open to whatever one cloud firewall rule admits: `shed-<environment>-ssh`, which `scripts/remote/gce-setup.sh` creates. The `isolated` profile holds only while no other rule lets VMs reach each other. The server never creates or deletes a rule. It reads the rule and its network, and refuses to create or start a VM while they are not as expected.
+
+The check passes when all of these hold:
+
+| Clause | Reason when it fails |
+|---|---|
+| The rule `shed-<environment>-ssh` exists | `rule_missing` |
+| It is on the network the server puts VMs on | `rule_network` |
+| It is an ingress rule | `rule_direction` |
+| It is enabled | `rule_disabled` |
+| It allows `tcp:22` and nothing else | `rule_allow` |
+| It targets exactly the network tag `shed-<environment>` | `rule_target` |
+| It admits by address only (no source tags or service accounts) | `rule_source_kind` |
+| Its source ranges equal the expected set (see the modes) | `rule_sources` |
+| No other enabled ingress allow rule on the network applies to the tag `shed-<environment>` or to every instance | `stray_rule` |
+| The network is not the project's `default` network | `default_network` |
+| The rules could be read | `unreadable` |
+| In `auto` mode, the server knows its public address | `address_unknown` |
+
+Another environment's rule on a shared network targets its own tag and is not a stray. Disabled rules, deny rules, egress rules and rules that target only a service account are ignored.
+
+The check runs when the server starts, in every periodic pass (once a minute), and before a create or start whose last result is more than 60 seconds old. While it fails:
+
+- `shed create` and `shed start` (and an SSH connection that would wake a stopped shed) are refused with `503 FIREWALL_CHECK_FAILED`. The message says which rule, what was expected and what was found.
+- `stop`, `delete`, `list`, `exec` and connections to running sheds work as before.
+- The server still starts, so existing sheds can be listed and deleted.
+- Nothing is stopped or deleted because of it.
+
+The result is written to the server log when it changes, and again every ten minutes while it fails:
+
+```text
+remote: firewall check passed (mode static, rule shed-<env>-ssh, sources 203.0.113.7/32)
+remote: firewall check FAILED (mode static, reason rule_sources): firewall rule shed-<env>-ssh admits the wrong sources: expected source ranges [203.0.113.7/32], found source ranges [198.51.100.9/32]. Creates and starts are refused until it passes; stop, delete, list and exec are not affected
+```
+
+### Modes
+
+| `firewall.mode` | Expected source ranges | The server changes the rule |
+|---|---|---|
+| `static` (default) | The configured list | Never. Its role can only list rules. |
+| `auto` | The server's own public address, as one `/32` | Yes: only the rule's source ranges, only under the conditions below. |
+| `any` | Not compared | Never. |
+
+**static.** Set exactly one of `source_ranges` (a list in the config file) and `source_ranges_env` (the name of an environment variable holding the list, comma-separated). The variable keeps the address out of a config file that lives in a public repository; with neither set, the variable `SHED_REMOTE_SOURCE_RANGES` is read. The server refuses to start when the list is empty or holds anything but IPv4 CIDRs. A range wider than a `/24`, `0.0.0.0/0` included, is refused unless `acknowledge_any: true`.
+
+```yaml
+remote:
+  firewall:
+    mode: static
+    source_ranges_env: SHED_REMOTE_SOURCE_RANGES   # e.g. 203.0.113.7/32,198.51.100.0/24
+```
+
+**auto.** For a server whose public address changes. Each check asks every `echo_urls` service for the caller's address. A service must be `https`, answer `200` without a redirect, with at most 64 bytes that are exactly one IPv4 address. The address is believed only when at least two services report the same one, and never when it is private, loopback, link-local, unspecified, multicast or carrier-grade NAT space. One service alone can never move the rule.
+
+When the believed address differs from the rule's source ranges, and every other clause of the check passes, the server patches the rule's source ranges to that one `/32`, waits for the cloud, reads the rule back and logs the old and new sources. It patches at most once every 5 minutes, and never when the rule or the network fails any other clause. When the services have not agreed for 15 minutes, or have never agreed since the server started, creates and starts are refused (`address_unknown`) and the rule is left alone.
+
+```yaml
+remote:
+  firewall:
+    mode: auto
+    echo_urls:
+      - https://<first-echo-service>/
+      - https://<second-echo-service>/
+```
+
+Auto mode needs two more custom roles, which `gce-setup.sh --print --firewall-auto` prints. They are not part of the base role:
+
+| Role | Permissions | Bound |
+|---|---|---|
+| `<role-id>FirewallRule` | `compute.firewalls.get`, `compute.firewalls.update` | With an IAM condition on `resource.name`, so it holds for the one rule `shed-<environment>-ssh` |
+| `<role-id>FirewallNet` | `compute.networks.updatePolicy`, `compute.globalOperations.get` | Without a condition (IAM conditions cannot name a network or an operation); alone these change no rule |
+
+A holder of both can change any field of that one rule, not only its sources: Google has no narrower permission. A stolen key could open the sheds' ports to any address, so use `auto` only where the address really changes. The condition is written from Google's IAM documentation, which lists firewall rules among the resources a condition can name; confirm it in your project by checking that the server's key cannot update another rule.
+
+**any.** The rule may admit any address; its sources are not compared and the rest of the check still runs. It needs `acknowledge_any: true`, makes the `isolated` profile unavailable, and is refused beside service clients. `acknowledge_any: true` in static mode has the same two effects.
+
+### When the check fails
+
+Read the reason in the server log or in the `503` message, then:
+
+| Reason | What to do |
+|---|---|
+| `rule_sources` (static) | Your address changed, or someone edited the rule. Update the rule (`gcloud compute firewall-rules update shed-<env>-ssh --source-ranges=<address>/32`) and the server's configured list so they match, and restart the server if the list changed. |
+| `rule_sources` (auto) | The message says why the rule was not repaired: the last patch was under 5 minutes ago (wait), the patch was refused (the extra roles are missing), or the services did not agree in that check. |
+| `address_unknown` | Check that the echo services answer from the server host. The message lists what each one said. |
+| `rule_missing`, `rule_network`, `rule_direction`, `rule_disabled`, `rule_allow`, `rule_target`, `rule_source_kind` | Recreate the rule as `gce-setup.sh --print` shows it. |
+| `stray_rule` | Delete or disable the named rule, or give it a target tag the sheds do not carry. |
+| `default_network` | Move the environment to its own custom-mode network (`gce-setup.sh --print`). |
+| `unreadable` | The message carries the cloud's error: usually the credentials, the role (`compute.firewalls.list`) or the network. |
+
+The next periodic pass, at most a minute later, picks up the fix; no restart is needed unless the configured list changed.
+
+The check covers VPC firewall rules. It does not read hierarchical or network firewall policies, VPC peering or routes.
 
 ## Server restarts
 
@@ -176,6 +275,6 @@ A server stop leaves every VM as it is: running sheds keep running and keep cost
 | Item | Today |
 |---|---|
 | Agent install | Not built; see `agent_install` above. |
-| Firewall `auto` mode and the network check | Not built; see `firewall.mode` above. |
+| Firewall policies and peering | The firewall check reads VPC firewall rules only; see [The firewall check](#the-firewall-check). |
 | Zones | One zone per server, from its environment variable. |
 | Architectures | `amd64` images only. |

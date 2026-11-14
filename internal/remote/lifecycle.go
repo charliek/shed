@@ -89,6 +89,18 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	if err != nil {
 		return nil, err
 	}
+	// A name that is taken is answered as such whatever the firewall check
+	// says: a client reads that 409 as "the shed exists".
+	b.mu.Lock()
+	_, exists := b.records[req.Name]
+	b.mu.Unlock()
+	if exists {
+		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
+	}
+	// No VM is created while the firewall check fails.
+	if err := b.firewallGate(ctx); err != nil {
+		return nil, err
+	}
 	if resolver, ok := b.prov.(provider.ImageResolver); ok {
 		// Bounded: this runs before the fast-fail window, and the two
 		// together must fit in the time a client waits for a create.
@@ -249,15 +261,30 @@ func (b *Backend) ListSheds(context.Context) ([]config.Shed, error) {
 //	stopping  queued: the start runs when the stop has finished
 //	stopped   "starting"
 //	error     refused with the reason
+//
+// A call that would start a VM (the shed is stopped, or stopping so the start
+// is queued) is refused while the firewall check fails.
 func (b *Backend) StartShed(ctx context.Context, name string) (*config.Shed, error) {
 	if err := b.checkReady(); err != nil {
 		return nil, err
 	}
+	gated := false
+relock:
 	b.mu.Lock()
 	r, err := b.lookupLocked(ctx, name)
 	if err != nil {
 		b.mu.Unlock()
 		return nil, err
+	}
+	if !gated && (r.Shed.Status == config.StatusStopped || r.Shed.Status == config.StatusStopping) {
+		// The gate may read the cloud, so it runs without the lock; the
+		// shed is then looked at afresh.
+		b.mu.Unlock()
+		if err := b.firewallGate(ctx); err != nil {
+			return nil, err
+		}
+		gated = true
+		goto relock
 	}
 	var launch *job
 	switch r.Shed.Status {

@@ -255,6 +255,7 @@ func (e *env) open() *Backend {
 		Links:               e.links,
 		StateDir:            e.dir,
 		AuthorizedKeys:      []string{testKey},
+		FirewallSources:     []string{fake.DefaultFirewallSource},
 		FastFailWindow:      60 * time.Millisecond,
 		BootTimeout:         2 * time.Second,
 		AuthGrace:           300 * time.Millisecond,
