@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -260,6 +262,46 @@ func TestAuditExecEndOutcomes(t *testing.T) {
 				}
 				if _, ok := l["argc"]; ok {
 					t.Errorf("argc with exec_argv: full: %v", l)
+				}
+			},
+		},
+		{
+			// The command runs as given; the audit line has URL credentials
+			// redacted and never carries env.
+			name: "full argv redacts credentials and omits env",
+			exec: func(_ context.Context, opts backend.ExecOptions) error {
+				if opts.Cmd[2] != "git clone https://u:sentinel-pass@h/r.git" || !slices.Contains(opts.Env, "TOKEN=sentinel-env") {
+					return fmt.Errorf("backend got cmd %q env %q", opts.Cmd, opts.Env)
+				}
+				opts.OnStarted()
+				return nil
+			},
+			req: config.ExecRequest{
+				Argv: []string{"bash", "-c", "git clone https://u:sentinel-pass@h/r.git"},
+				Env:  map[string]string{"TOKEN": "sentinel-env"},
+			},
+			argvFull: true,
+			check: func(t *testing.T, l map[string]any) {
+				raw, _ := json.Marshal(l)
+				if strings.Contains(string(raw), "sentinel") || strings.Contains(string(raw), "TOKEN") {
+					t.Errorf("audit line carries a credential or env: %s", raw)
+				}
+				argv, _ := l["argv"].([]any)
+				if len(argv) != 3 || argv[2] != "git clone https://REDACTED@h/r.git" || l["exit_code"] != float64(0) {
+					t.Errorf("line = %v", l)
+				}
+			},
+		},
+		{
+			name: "argv0 redacts credentials",
+			exec: func(_ context.Context, opts backend.ExecOptions) error {
+				opts.OnStarted()
+				return nil
+			},
+			req: config.ExecRequest{Argv: []string{"https://u:sentinel-pass@h/tool", "x"}},
+			check: func(t *testing.T, l map[string]any) {
+				if l["argv0"] != "https://REDACTED@h/tool" || l["argc"] != float64(2) {
+					t.Errorf("line = %v", l)
 				}
 			},
 		},

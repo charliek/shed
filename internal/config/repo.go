@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/charliek/shed/internal/redact"
 )
 
 // gitSSHRegex matches git@host:path format (e.g., git@github.com:user/repo.git)
@@ -56,24 +58,13 @@ func RepoDirName(repo string) (string, error) {
 	return s, nil
 }
 
-// SanitizeRepoURL returns repo with the password component removed from the
-// URL's userinfo, if any. The username is preserved (it's informational, not
-// a secret). SSH-form URLs (git@host:path) and shorthand pass through
-// unchanged. Use this when logging URLs to avoid leaking embedded credentials
-// from forms like `https://user:password@host/repo.git`.
+// SanitizeRepoURL returns repo with the whole userinfo of a URL replaced by
+// redact.Marker, for logging. The user name goes too: a token is often passed
+// as the user alone (https://TOKEN@host/repo.git). SSH-form URLs
+// (git@host:path) and shorthand pass through unchanged, and nothing else in
+// the URL is re-encoded.
 func SanitizeRepoURL(repo string) string {
-	if repo == "" || strings.HasPrefix(repo, "git@") {
-		return repo
-	}
-	u, err := url.Parse(repo)
-	if err != nil || u.User == nil {
-		return repo
-	}
-	if _, hasPassword := u.User.Password(); !hasPassword {
-		return repo
-	}
-	u.User = url.User(u.User.Username())
-	return u.String()
+	return redact.String(repo)
 }
 
 // IsSSHRepoURL reports whether a repo URL uses SSH transport.
