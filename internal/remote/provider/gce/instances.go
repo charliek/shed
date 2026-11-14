@@ -22,7 +22,20 @@ import (
 const (
 	MetadataEnableGuestAttributes = "enable-guest-attributes"
 	MetadataBlockProjectSSHKeys   = "block-project-ssh-keys"
+	// MetadataEnableOSLogin is set to FALSE on every instance. An instance
+	// with no value inherits the project's, and with OS Login on the
+	// guest agent rewrites the guest's sshd, NSS and PAM set-up for
+	// cloud-managed logins. A shed has one login, the link user's key,
+	// and its sshd is the image's. The image builder sets the same value.
+	MetadataEnableOSLogin = "enable-oslogin"
 )
+
+// reservedMetadata are the switches a caller may not set.
+var reservedMetadata = map[string]bool{
+	MetadataEnableGuestAttributes: true,
+	MetadataBlockProjectSSHKeys:   true,
+	MetadataEnableOSLogin:         true,
+}
 
 // fingerprintRetries is how often setLabels and setMetadata read again and
 // retry after another writer changed the instance in between.
@@ -407,6 +420,7 @@ func (c *Client) buildInsert(spec provider.Spec) insertBody {
 	md := map[string]string{
 		MetadataEnableGuestAttributes: "TRUE",
 		MetadataBlockProjectSSHKeys:   "TRUE",
+		MetadataEnableOSLogin:         "FALSE",
 	}
 	maps.Copy(md, spec.Metadata)
 	body := insertBody{
@@ -482,7 +496,7 @@ func (c *Client) Create(ctx context.Context, spec provider.Spec) (provider.Pendi
 		return provider.Pending{}, provider.Errorf(provider.ErrInvalid, "create", "spec is for environment %q, this provider serves %q", env, c.cfg.Env)
 	}
 	for k := range spec.Metadata {
-		if k == MetadataEnableGuestAttributes || k == MetadataBlockProjectSSHKeys {
+		if reservedMetadata[k] {
 			return provider.Pending{}, provider.Errorf(provider.ErrInvalid, "create", "metadata key %q is reserved", k)
 		}
 	}

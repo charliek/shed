@@ -937,3 +937,32 @@ func mustName(ref provider.Ref) string {
 	}
 	return n
 }
+
+// TestCreateOwnsTheMetadataSwitches: every instance is made with OS Login
+// off, project SSH keys blocked and guest attributes on, whatever the project
+// sets, and a caller cannot set any of the three.
+func TestCreateOwnsTheMetadataSwitches(t *testing.T) {
+	f := newFakeCompute(t)
+	c := testClient(t, f)
+	spec := goldenSpec(t, "", 0)
+	if _, err := c.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	got := f.instance(spec.Name).metadata
+	for key, want := range map[string]string{
+		MetadataEnableOSLogin: "FALSE", MetadataBlockProjectSSHKeys: "TRUE", MetadataEnableGuestAttributes: "TRUE",
+	} {
+		if got[key] != want {
+			t.Errorf("instance metadata %s = %q, want %q", key, got[key], want)
+		}
+	}
+	for _, key := range []string{MetadataEnableOSLogin, MetadataBlockProjectSSHKeys, MetadataEnableGuestAttributes} {
+		t.Run(key, func(t *testing.T) {
+			spec := goldenSpec(t, "", 0)
+			spec.Metadata[key] = "TRUE"
+			if _, err := c.Create(context.Background(), spec); !errors.Is(err, provider.ErrInvalid) {
+				t.Errorf("Create with %s set by the caller: %v, want ErrInvalid", key, err)
+			}
+		})
+	}
+}

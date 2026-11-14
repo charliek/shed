@@ -25,6 +25,10 @@
         "value": "TRUE"
       },
       {
+        "key": "enable-oslogin",
+        "value": "FALSE"
+      },
+      {
         "key": "shed-id",
         "value": "abcdefghij0123456789klmnop"
       },
