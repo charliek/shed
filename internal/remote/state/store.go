@@ -275,8 +275,8 @@ func readJSON(path string, v any) error {
 	return json.Unmarshal(data, v)
 }
 
-// writeJSON writes v to path atomically: a temp file beside it, fsync,
-// rename.
+// writeJSON writes v to path atomically and durably: a temp file beside it,
+// fsync, rename, fsync of the directory.
 func writeJSON(path string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -306,12 +306,39 @@ func writeJSON(path string, v any) error {
 		cleanup()
 		return fmt.Errorf("remote state: %w", err)
 	}
+	// The rename is durable only once the directory is. Callers act in the
+	// cloud on the strength of this write (a record before an insert, a
+	// marker before a delete is acknowledged), so a power loss must not be
+	// able to take it back.
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("remote state: %w", err)
+	}
 	return nil
 }
 
 func removeIfExists(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("remote state: %w", err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("remote state: %w", err)
 	}
 	return nil
+}
+
+// syncDir flushes a directory, which makes a rename or a removal inside it
+// durable. A variable so a test can watch it.
+var syncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }

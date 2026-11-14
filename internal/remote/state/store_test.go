@@ -101,3 +101,44 @@ func TestStoreRefusesUnsafeNames(t *testing.T) {
 		}
 	}
 }
+
+// Every write and removal flushes the directory it changed: without that a
+// rename or an unlink can be lost to a power cut after the call returned, and
+// the server has by then acted in the cloud on the strength of it.
+func TestStoreWritesAreDurable(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	orig := syncDir
+	syncDir = func(dir string) error {
+		synced = append(synced, filepath.Base(dir))
+		return orig(dir)
+	}
+	defer func() { syncDir = orig }()
+
+	rec := &Record{Shed: config.Shed{Name: "one", ID: "abcdefgh", Status: config.StatusStarting}, Env: "test"}
+	tests := []struct {
+		name string
+		op   func() error
+		want []string
+	}{
+		{"save record", func() error { return s.SaveRecord(rec) }, []string{"sheds"}},
+		{"save marker", func() error { return s.SaveMarker(&Marker{ID: "abcdefgh", Name: "one", Env: "test"}) }, []string{"deleting"}},
+		{"delete record", func() error { return s.DeleteRecord("one") }, []string{"sheds"}},
+		{"delete marker", func() error { return s.DeleteMarker("abcdefgh") }, []string{"deleting"}},
+		{"delete a marker that is not there", func() error { return s.DeleteMarker("abcdefgh") }, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synced = nil
+			if err := tt.op(); err != nil {
+				t.Fatal(err)
+			}
+			if len(synced) != len(tt.want) || (len(synced) == 1 && synced[0] != tt.want[0]) {
+				t.Fatalf("flushed directories %v, want %v", synced, tt.want)
+			}
+		})
+	}
+}
