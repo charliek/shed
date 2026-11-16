@@ -27,7 +27,7 @@ from fixtures.devcontrol import KNOWN_HOSTS_PATH, bootstrap_cert
 from fixtures.server import resolve_server_entry
 
 
-def _bootstrap_with_key(ssh_port: int, key_path: Path, request: str) -> subprocess.CompletedProcess:
+def _bootstrap_with_key(host: str, ssh_port: int, key_path: Path, request: str) -> subprocess.CompletedProcess:
     """Attempt a `_bootstrap` exchange offering ONLY `key_path`.
 
     `IdentitiesOnly=yes` alone is NOT enough to isolate `key_path`: a user
@@ -47,7 +47,7 @@ def _bootstrap_with_key(ssh_port: int, key_path: Path, request: str) -> subproce
         "-o", "BatchMode=yes",
         "-o", f"UserKnownHostsFile={KNOWN_HOSTS_PATH}",
         "-o", "StrictHostKeyChecking=yes",
-        "_bootstrap@localhost", *request.split(),
+        f"_bootstrap@{host}", *request.split(),
     ]
     return subprocess.run(args, capture_output=True, text=True, timeout=20)
 
@@ -55,7 +55,10 @@ def _bootstrap_with_key(ssh_port: int, key_path: Path, request: str) -> subproce
 @pytest.mark.vz
 def test_bootstrap_cert_is_allowlist_gated(vz_server_dev, tmp_path):
     server = vz_server_dev.name
-    ssh_port = int(resolve_server_entry(server)["ssh_port"])
+    entry = resolve_server_entry(server)
+    # The entry's own host: its known_hosts line is the one `shed server add` pinned.
+    host = entry.get("host", "localhost")
+    ssh_port = int(entry["ssh_port"])
 
     # Positive control: the allowlisted local key is issued a certificate.
     issued = bootstrap_cert(server, "control", tmp_path / "issued")
@@ -72,7 +75,7 @@ def test_bootstrap_cert_is_allowlist_gated(vz_server_dev, tmp_path):
     assert kg.returncode == 0, f"ssh-keygen failed: {kg.stderr!r}"
     csr = (tmp_path / "issued" / "control.csr.der").read_bytes()
     request = f"control cli csr={base64.b64encode(csr).decode('ascii')}"
-    r = _bootstrap_with_key(ssh_port, offkey, request)
+    r = _bootstrap_with_key(host, ssh_port, offkey, request)
     assert r.returncode != 0, (
         "an off-list key must be refused a certificate, got exit 0; "
         f"stdout={r.stdout[-300:]!r}"

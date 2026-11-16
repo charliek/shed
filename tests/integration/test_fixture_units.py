@@ -640,7 +640,7 @@ def test_dev_config_refuses_the_installed_servers_state_dir_before_any_stop(monk
 def test_run_preflight_refuses_the_installed_servers_state_dir(monkeypatch, tmp_path):
     # Refused before anything is written or launched.
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(dc, "SHED_SERVER_BIN", Path("/bin/true"))
+    monkeypatch.setattr(dc, "SHED_SERVER_BIN", Path(shutil.which("true")))  # /usr/bin/true on macOS
     monkeypatch.setattr(dc, "PREFLIGHT_CONFIG_TMP", tmp_path / "preflight.yaml")
     launched = []
     monkeypatch.setattr(dc.subprocess, "Popen", lambda *a, **k: launched.append(a) or pytest.fail("launched"))
@@ -2152,8 +2152,12 @@ def test_mac_dev_server_up_names_its_identity_and_says_when_to_re_add(tmp_path, 
     server.write_text(_LISTENING_SERVER_STUB.format(python=sys.executable))
     server.chmod(0o755)
     pid_file = tmp_path / "home" / ".shed" / "dev" / "server.pid"
+    # macOS make runs recipes with /bin/sh, which is bash 3.2; Linux's is dash,
+    # which accepts lines bash refuses (an apostrophe inside "${VAR:-word}"
+    # broke this recipe on the Mac only). Run the recipe under bash here too.
+    shell = [f"SHELL={shutil.which('bash')}"] if shutil.which("bash") else []
     try:
-        r, calls = _make_with_stubs(tmp_path, "dev-server-up", *stubs,
+        r, calls = _make_with_stubs(tmp_path, "dev-server-up", *stubs, *shell,
                                     env_extra={"NEW_HOST_KEY": "1" if new_key else ""})
     finally:
         if pid_file.exists():

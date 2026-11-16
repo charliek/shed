@@ -400,7 +400,7 @@ dev-server-up: check-dev-settings build
 	if [ -n "$$STATE" ]; then echo "  Identity: $$STATE (host key, TLS certificate, client CA, pins)"; fi; \
 	if grep -qF 'Generated new host key:' "$(DEV_LOG_PATH)" 2>/dev/null; then \
 	  echo ""; \
-	  echo "NOTE: this start made a new SSH host key in $${STATE:-the dev server's state directory}"; \
+	  echo "NOTE: this start made a new SSH host key in $${STATE:-the dev server state directory}"; \
 	  echo "  (on a first start there, a new TLS certificate and client CA too). A"; \
 	  echo "  $(SHED_VZ_DEV_SERVER) entry added before this no longer matches it. Remove only that"; \
 	  echo "  entry and its host key line, then add it again:"; \

@@ -991,6 +991,12 @@ def test_the_developers_own_source_is_readable(shed_server_dev):
     is the developer's, whose real host agent may be the source."""
     server = shed_server_dev
     _require_shed_source()
+    # The entry's certificate names the user its key had when the CLI last
+    # enrolled; the [vz] users cases restart the Mac dev server with the list
+    # and back, so let the CLI re-enrol under the current one before the raw
+    # client below reads the certificate file.
+    r = cli_retrying_busy(lambda: server.cli("list"), "shed list")
+    assert r.returncode == 0, f"shed list: {r.returncode} {r.stdout!r} {r.stderr!r}"
     api, _ = _developer_api(server.name)
     status, info = api.request("GET", "/api/info")
     assert status == 200 and FEATURE in (info or {}).get("features", []), (status, info)
