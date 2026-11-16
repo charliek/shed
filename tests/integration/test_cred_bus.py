@@ -117,8 +117,10 @@ def _throwaway_key(tmp_path) -> str:
         # A user list needs mtls; an open server cannot have one.
         ("open", ("auth.users requires auth.mode: mtls",)),
         # The committed base keeps its auth.ssh key sources: beside a user
-        # list they would belong to nobody, so the combination is refused.
-        ("beside-auth-ssh", ("auth.users cannot be combined with auth.ssh.github_users",)),
+        # list they would belong to nobody, so the combination is refused. The
+        # message lists every source present (the base has github_users and
+        # authorized_keys), so the rule and the source are matched apart.
+        ("beside-auth-ssh", ("auth.users cannot be combined with", "auth.ssh.github_users")),
     ],
 )
 def test_a_user_list_outside_its_rules_hard_fails(tmp_path, shape, needles):
