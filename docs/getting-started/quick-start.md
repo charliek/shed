@@ -38,7 +38,7 @@ SSH, which pins the host key, enrols a client certificate and reports the
 HTTPS port:
 
 ```bash
-shed server add my-server.tailnet.ts.net --name my-server
+shed server add my-server.example.com --name my-server
 ```
 
 See the [Security Configuration guide](../guides/security-configuration.md)

@@ -118,18 +118,21 @@ The first `shed create` pulls the matching `shed-fc-full` image automatically
 
 ## 5. Connect from your workstation
 
-From the Mac/Linux box that has the `shed` CLI (over Tailscale/LAN). For a
-token-mode server, `shed server add --https-port` pins the TLS cert + SSH host key and mints
-your token over SSH (your key must be in the `github_users` allowlist):
+From the Mac/Linux box that has the `shed` CLI (over Tailscale/LAN). For an
+mtls server, `shed server add` pins the SSH host key, enrolls a client
+certificate over SSH and pins the TLS cert (your key must be in the
+`github_users` allowlist):
 
 ```bash
-shed server add my-linux-host.tailnet.ts.net --https-port 8443 --name my-linux-host
+shed server add my-linux-host.example.com --name my-linux-host
 shed create demo --repo charliek/your-repo
 shed attach demo
 ```
 
-For an **open** server (the LAN alternative above), drop `--https-port`:
-`shed server add my-linux-host.tailnet.ts.net --name my-linux-host`.
+An **open** server is loopback only, so it is reachable only from the box
+itself (`shed server add localhost` there). Several people sharing the server
+each get their own sheds with a user list: see the [Multi-user server
+guide](../guides/multi-user-server.md).
 
 ## Upgrading
 

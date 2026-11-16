@@ -17,7 +17,7 @@ Client (`shed`) commands only. Server operation (`shed-server setup/serve/instal
 
 | Command | Purpose |
 |---------|---------|
-| `shed server add <host> [--name <n>] [--port 8080]` | Add a server to client config (SSH port auto-discovered) |
+| `shed server add <host> [--name <n>] [--ssh-port 2222]` | Add a server: pins its SSH host key and, for an mtls server, enrolls a client certificate over SSH (your key must be one the server accepts). Use `--ssh-port` when the server's SSH port is not 2222 |
 | `shed server list` | List configured servers, online status, default marker |
 | `shed server remove <name>` | Remove a server |
 | `shed server set-default <name>` | Set the default server |
@@ -58,8 +58,18 @@ shed create big --repo org/large-repo --timeout 30m
 shed create untrusted --repo https://github.com/someone/tool.git --mounts none --network isolated   # hardened: no host dirs, internet only (Firecracker)
 ```
 
-`shed list -v` shows `OWNER` (a service client, or `-`), `MOUNTS` (`all`, `none`
-or names) and `NETWORK` (`open`/`isolated`) columns.
+`shed list -v` shows `OWNER` (a service client, or `-`), `USER` (the person the
+shed belongs to, when a listed shed has one), `MOUNTS` (`all`, `none` or names)
+and `NETWORK` (`open`/`isolated`) columns.
+
+On a server with users you see only your own sheds (an admin sees all, and may
+stop and delete but not enter others'). A user who is not an admin is refused
+`--local-dir`, `--add-dir`, named `--mounts` and a non-default `--image`.
+
+| Command | Purpose |
+|---------|---------|
+| `shed assign <shed> <user>` | Admin: give a shed that has no user (made before the server had users) to a user |
+| `shed users refresh` | Admin: fetch the server's GitHub logins' keys now |
 
 ## Interactive access & sessions
 
@@ -86,6 +96,21 @@ local roost app it is what runs anyway.
 **Native machines.** `shed` targets sheds only; native-machine kickoff is moving to
 roost's palette (S4, [`charliek/shed#326`](https://github.com/charliek/shed/issues/326)),
 with nothing to run today.
+
+## Credential sources
+
+A server sends your sheds' credential requests (SSH agent, Docker, AWS) to one
+of your machines only: your credential source. The first machine to connect
+becomes it; others are refused and keep retrying.
+
+| Command | Purpose |
+|---------|---------|
+| `shed source status [--json]` | Which machine is the source, and whether it is connected |
+| `shed source ls [--json]` | Every machine that has presented itself for you |
+| `shed source use [--] <machine>` | Make another machine the source (full id, 8+ hex id prefix, or exact name); the new one answers within about 30 s |
+
+`--user <name>` (admin) acts on another user's source. A script key cannot use
+these commands.
 
 ## Port forwarding (tunnels)
 

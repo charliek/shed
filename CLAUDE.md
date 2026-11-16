@@ -135,6 +135,9 @@ This catches the v0.5.4-class regression where the binary built correctly but a 
 | `SHED_FC_SERVER` | same as `$SHED_FC_HOST` | `~/.shed/config.yaml` entry name for the deb FC server. |
 | `SHED_FC_DEV_SERVER` | `$(SHED_FC_HOST)-dev` | `~/.shed/config.yaml` entry name for the parallel dev FC server. |
 | `SHED_FC_LOG_PATH` | _unset_ (uses journald) | Remote file path for `fc_server` fixture to read logs from (set by `test-integration-dev-fc` to the dev server's log file because the dev FC server runs via `sudo nohup` and isn't under systemd). |
+| `SHED_DEV_USERS` | _unset_ | Makefile only. `itest` starts the dev servers (`dev-server-up`, `-up-fc`, `-up-remote` and their restarts) with the integration suite's itest user list (`auth.users`: an admin `dev` holding the config's own key sources, plus `itest-alice`, `itest-bob`, `itest-admin`), and has `test-integration-dev-fc` / `-remote` tell the suite so. Empty: no user list. Any other value stops the target. |
+| `SHED_ITEST_USERS` | _unset_ | Suite only. A comma list of the backends (`fc`, `remote`) whose dev server was started with the itest user list; without it the users and pin cases skip on those backends, saying what to set. `[vz]` restarts the Mac dev server with the list itself. |
+| `SHED_ITEST_USERS_DIR` | `~/.shed/dev/itest-users` | The itest users' keys (made once by `make dev-itest-users`, or on first use) and each test identity's throwaway `$HOME`. The dev server's user list must be rendered from the same directory. |
 | `SHED_REMOTE_SERVER` | _unset_ | `~/.shed/config.yaml` entry for a `default_backend: remote` server. Unset skips every `[remote]` case (each would create a billed cloud VM); `make test-integration-remote` sets it to `remote-dev`. |
 | `RELEASE_BUILD_TOOLS_REF` | latest `git tag` matching `v*` | shed-build-tools image ref injected into the dev binary so it uses release-shaped upper-template behavior. Pin to an older release if your source has drifted: `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7`. |
 | `SHED_IMAGE_HAS_ROOST` | _unset_ | Gates `test_roost_session_baked`: a comma list of the backends (`vz`, `fc`) whose `extensions` image was rebuilt with the roost-session bake. `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the suite is parameterized over both backends and the other one still boots the published image); unset (skips) for plain `test-integration` since images built before 0.9.0 carry no roost-session. |
@@ -158,6 +161,7 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - `internal/vmutil/` — Shared VM agent communication (no build tags)
 - `internal/agentproto/` — Binary protocol for vsock communication
 - `internal/sshd/` — SSH server implementation
+- `internal/source/` — Credential source bindings: which machine answers each user's credential-bus requests (`source-bindings.json`); `fake/` is the test double
 - `internal/users/` — User seam (`users.Lookup`: which user owns a key, list users); `ConfigLookup` holds the SSH key allowlist with each key's source; `userstest/` has the test doubles
 - `internal/backend/` — Backend interface all backends implement
 - `internal/remote/` — Remote (cloud VM) backend: async jobs, record cache, start-up reconcile, limits; `provider/` (cloud seam, `gce/` REST client, `fake/`), `transport/` (SSH link to the VM, `sshlink/`, `locallink/`), `guest/` (guest layout contract)

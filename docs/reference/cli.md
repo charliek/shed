@@ -50,11 +50,11 @@ What the bootstrap returns decides the rest:
 
 | Server | Result |
 |---|---|
-| `auth.mode: token` | A scoped, short-TTL control token, written as `control_token` + `control_token_expires_at` (never printed) |
 | `auth.mode: mtls` | A client certificate + key, written `0600` under `~/.shed/creds/<name>/` and referenced by `client_cert_file` / `client_key_file` |
 | `auth.mode: open` | The server issues no credential, so the command falls back to the HTTP probe (`--port`, `--https-port`, `--secure`) to find the API endpoint |
+| `auth.mode: token` (a server older than v0.10.0) | A scoped, short-TTL control token, written as `control_token` + `control_token_expires_at` (never printed) |
 
-In both credentialed modes your SSH key must be on the server's allowlist (`auth.ssh.github_users` / `authorized_keys`); a key that is not is a hard error, not a downgrade. From then on the CLI refreshes the credential transparently — near expiry and on a rejection — so you never run a token command. See [HTTP tokens are minted over SSH](security.md#http-tokens-are-minted-over-ssh) and [Security](security.md#native-pinned-tls).
+Against an mtls server your SSH key must be one the server accepts (listed under `auth.users`, or in `auth.ssh.github_users` / `authorized_keys`); a key that is not is a hard error, not a downgrade. On a server with users, the entry acts as the user your key belongs to. From then on the CLI renews the credential transparently, near expiry and on a rejection. See [Security › Enrollment over SSH](security.md#enrollment-over-ssh) and [Security › Native pinned TLS](security.md#native-pinned-tls).
 
 `--https-port` names the port **you** reach the server's TLS listener on. It overrides the HTTPS port the bootstrap bundle advertises when the `api_url` is built, which is what makes a port-mapped or externally published deployment addable; the pinned certificate fingerprint always comes from the bundle, and the verification request still has to succeed, so a wrong port fails during the add rather than on your next command.
 
@@ -63,7 +63,7 @@ In both credentialed modes your SSH key must be on the server's allowlist (`auth
 The host-key scan dials `<host>:<ssh-port>` directly. `ssh` does not: the bootstrap runs the real ssh client, which honors `~/.ssh/config` — `HostName`, `Port`, `ProxyJump`, `ProxyCommand`, `IdentityAgent`. A scan that cannot connect therefore proves nothing, and `server add` does not stop there. It warns, pins nothing, and runs the bootstrap anyway:
 
 - **ssh reaches the server.** Host-key verification is ssh's: `StrictHostKeyChecking=yes` against `~/.shed/known_hosts`, with the global `known_hosts` and every `ssh_config`-supplied host-key source disabled. Nothing is trusted that was not already pinned there, so an unpinned host is refused **by ssh**. If you reach a server through `~/.ssh/config`, pin its key yourself first — `ssh-keyscan -p <port> <hostname> >> ~/.shed/known_hosts` — and the add proceeds normally.
-- **ssh cannot reach it either.** There is no SSH evidence at all, so the command falls back to the HTTP probe, exactly as it did before first contact moved to SSH. It refuses to write an entry if that probe reports `auth.mode: token` or `mtls`: those servers issue their credential over SSH and nowhere else, so an entry written here could never authenticate.
+- **ssh cannot reach it either.** There is no SSH evidence at all, so the command falls back to the HTTP probe, exactly as it did before first contact moved to SSH. It refuses to write an entry if that probe reports a mode that issues credentials (`mtls`, or an older server's token mode): those servers issue their credential over SSH and nowhere else, so an entry written here could never authenticate.
 
 #### A failed add leaves nothing behind
 
@@ -72,11 +72,10 @@ A host key this command pins is un-pinned again if any later step fails, so a re
 **Example:**
 
 ```bash
-shed server add mini-desktop.tailnet.ts.net --name mini
+shed server add localhost --name local                          # auth.mode: open on this machine, added over plain HTTP
 shed server add vps.example.com --name vps --fingerprint SHA256:HtYK...j4Y
-shed server add secure.example.com --name sec                  # token or mtls: everything comes from the SSH bootstrap
-shed server add mini3 --ssh-port 12222 --name mini3-dev        # a server on a non-default SSH port
-shed server add lan-box --port 8080 --name lan                 # auth.mode: open — added over plain HTTP
+shed server add shed.example.com --name work                    # mtls: everything comes from the SSH bootstrap
+shed server add build-box --ssh-port 12222 --name build-dev     # a server on a non-default SSH port
 ```
 
 ### shed server update
@@ -148,15 +147,15 @@ shed create <name> [flags]
 |------|-------|---------|-------------|
 | `--repo` | `-r` | None | Repository to clone into `~/<reponame>` (`owner/repo` shorthand or full URL). The login lands in the cloned repo directory. Mutually exclusive with `--local-dir`/`--add-dir`. |
 | `--server` | `-s` | Default server | Target server |
-| `--image` | `-i` | Server default | Image [variant name](images.md) to use |
+| `--image` | `-i` | Server default | Image [variant name](images.md) to use. On a server with users, a user who is not an admin may use only the server default or an `image_aliases` name. |
 | `--backend` | | Server default | Backend to use: `firecracker`, `vz` or `remote`. Must match the server's backend. |
 | `--cpus` | | Server default | Number of vCPUs. On a [remote](remote-backend.md) server, the smallest configured size with at least this many. |
 | `--memory` | | Server default | Memory in MB. On a remote server, the smallest configured size with at least this much. |
 | `--upper-size` | | Server default (`5G`) | Logical size of the per-shed writable overlay upper layer (e.g. `1G`, `5G`, `10G`, `100G`). Validated range: 1–100 GiB. The overlay grows copy-on-write, so this is the maximum, not the on-disk physical bytes. |
-| `--local-dir` | | None | Mount a local host directory into the guest at `~/<basename>`. The login lands there. Mutually exclusive with `--repo`. |
-| `--add-dir` | | None | Mount an additional local host directory at `~/<basename>` as a reference sibling. Repeatable. Requires `--local-dir`. |
+| `--local-dir` | | None | Mount a local host directory into the guest at `~/<basename>`. The login lands there. Mutually exclusive with `--repo`. Admin only on a server with users. |
+| `--add-dir` | | None | Mount an additional local host directory at `~/<basename>` as a reference sibling. Repeatable. Requires `--local-dir`. Admin only on a server with users. |
 | `--egress` | | Server default | Egress-control profiles to apply (comma-separated, e.g. `base,github`; `off` to disable). Requires egress enabled on the server. See [Egress Control](egress.md). |
-| `--mounts` | | `all` | Which server mounts (the server config's `mounts:`) the shed gets: `all`, `none`, or a comma-separated list of mount names (`claude,gh`). Stored with the shed and applied on every start. `none` and a list need a server that advertises `mount_selection`; the CLI refuses them before creating anything otherwise. |
+| `--mounts` | | `all` | Which server mounts (the server config's `mounts:`) the shed gets: `all`, `none`, or a comma-separated list of mount names (`claude,gh`). Stored with the shed and applied on every start. `none` and a list need a server that advertises `mount_selection`; the CLI refuses them before creating anything otherwise. On a server with users, server mounts are for admins: for a user who is not an admin `all` gives none, and a named mount is refused. |
 | `--network` | | Server default (`open`) | Network profile: `open` (today's network) or `isolated` (the internet only: no host, LAN, tailnet or other sheds). Fixed for the shed's life. `isolated` needs a server that advertises `network_profiles` (Firecracker, or a [remote](remote-backend.md) server); the CLI refuses it before creating anything otherwise. See [Security › Network profiles](security.md#network-profiles). |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
@@ -193,6 +192,13 @@ shed create agent --mounts claude,gh
 
     Host-mounted directories live outside the writable upper layer, so their contents are **not** captured by `shed snapshot create`. The cloned repo from `--repo` lives in the upper layer and **is** captured.
 
+On a server with [users](configuration.md#users) the shed belongs to the user
+your key belongs to. Shed names are unique across users: a name someone else
+holds answers `409 SHED_ALREADY_EXISTS`, and the name `git` is reserved. A user
+who is not an admin is refused `--local-dir`, `--add-dir`, named `--mounts` and
+an `--image` other than the default or an alias (`403 FORBIDDEN`, `admin only:
+<field>`). See [Security › Ownership](security.md#ownership).
+
 ### shed list
 
 Lists sheds.
@@ -206,6 +212,9 @@ shed list [flags]
 | `--server` | `-s` | Default | List from specific server |
 | `--all` | `-a` | false | List from all servers |
 
+The list holds the sheds you may see: on a server with users, your own, or
+every shed for an admin.
+
 **Output (default):**
 
 ```text
@@ -213,6 +222,9 @@ NAME          BACKEND    STATUS     SSH                              CREATED
 codelens      vz         running    codelens@mini-desktop:2222       2026-01-20 10:30
 mcp-test      vz         stopped    -                                2026-01-17 14:00
 ```
+
+A `USER` column (before `CREATED`) appears only when the listed sheds belong to
+more than one user, which on a server with users means an admin's list.
 
 **Output with `-v` (expanded):**
 
@@ -225,13 +237,14 @@ mcp-test      firecracker  stopped  -                               -           
 
 | Column | Values |
 |--------|--------|
-| `OWNER` | The service client that created the shed, or `-` for an admin's shed |
+| `OWNER` | The service client that created the shed, or `-` for a person's shed |
+| `USER` | The user the shed belongs to (`-` for none). Shown, after `OWNER`, only when a listed shed has a user. |
 | `MOUNTS` | The shed's server-mount selection: `all`, `none`, or the selected names (`claude,gh`); `-` when the server does not report one (an older server) |
 | `NETWORK` | `open` or `isolated`; `-` when the server does not report one |
 | `STATUS` | `running`, `stopped`, `starting`, `stopping` or `error`, followed by the reason in brackets when the server gives one (`stopped (run_limit)`). See [Remote backend › Statuses](remote-backend.md#statuses). |
 | `ID` | The shed's permanent ID. Shown only when a listed shed has one (remote sheds do). |
 
-With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`.
+With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `User:` (when it has one), `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `user`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`.
 
 ### shed start
 
@@ -275,6 +288,117 @@ shed delete <name> [flags]
 | `--force` | `-f` | `false` | Skip confirmation. Without a terminal, a prompt that gets no answer fails with exit 1; pass `--force`. |
 
 **Note:** When using `--json`, the `--force` flag is required (interactive confirmation is not supported in JSON mode).
+
+On a server with users, an admin may stop and delete any shed, but may not
+start, enter or snapshot another user's.
+
+### shed assign
+
+Gives a shed that has no user to one of the server's users (`auth.users`).
+Admin only.
+
+```bash
+shed assign <shed> <user>
+```
+
+Sheds made before a server had a user list have no user. On a server with
+exactly one user they become that user's at its first start with the list; on
+a server with several, only an admin sees, stops and deletes them, and nobody
+enters them, until an admin assigns each one. Only a shed with no user and no
+service client can be assigned: a shed is never moved between users. A shed
+that mounts host directories (`--local-dir`, `--add-dir`) or server mounts is
+refused (`409 SHED_HOST_RESOURCES`), because the user would get those too;
+recreate it with `--mounts none` and no host directories instead. A shed that
+already has a user or a client answers `409 SHED_ALREADY_ASSIGNED`.
+
+Without `-s/--server` the command looks for the shed on your servers and sends
+the assignment only to a server that shows it; with `-s` it asks that server
+directly and prints its answer. See the [Multi-user server
+guide](../guides/multi-user-server.md#sheds-with-no-user).
+
+```bash
+shed assign old-box alice
+# Shed old-box on my-server now belongs to user alice.
+```
+
+## Users
+
+### shed users refresh
+
+Makes the server fetch the SSH keys of every GitHub login it follows now,
+instead of at its next scheduled refresh, and prints what changed. Admin only.
+
+```bash
+shed users refresh [-s <server>] [--json]
+```
+
+```text
+USER   GITHUB    ACCOUNT ID  STATUS     KEYS  ADDED  REMOVED
+alice  alice-gh  1234567     ok         2     1      0
+bob    bob-gh    7654321     mismatch   0     0      1
+
+alice-gh: added SHA256:...
+bob-gh: removed SHA256:...
+bob-gh: pinned to account 7654321 but now names account 1111111; its keys are dropped
+```
+
+Each login is checked against the GitHub account id the server pinned it to:
+a login that now names another account, or none, has its keys dropped
+(`mismatch`). When GitHub cannot be reached the last known keys stay and no new
+key is accepted (`unreachable`). `USER` is `-` on a server with no user list.
+The statuses are listed under [API › POST
+/api/users/refresh](api.md#post-apiusersrefresh).
+
+## Credential Sources
+
+### shed source
+
+A server sends your sheds' credential requests (SSH agent, Docker and AWS
+helpers) to one of your machines only: your **credential source** on that
+server. The first of your machines to connect becomes it; the others are
+refused, keep retrying and name the source. See [Security › One machine
+answers for each user](security.md#one-machine-answers-for-each-user).
+
+```bash
+shed source status           # which machine is the source, and is it connected
+shed source ls               # every machine that has presented itself for you
+shed source use <machine>    # make another of your machines the source
+```
+
+| Flag | Description |
+|------|-------------|
+| `--user <name>` | Another user's credential source (admin) |
+| `--json` | Structured output |
+| `-s`, `--server` | The server (default: the default server) |
+
+`shed source use` takes a machine's full id, a prefix of its id of at least 8
+hex digits, or its exact name, as `shed source ls` shows them. An argument
+that matches more than one machine in any of those ways changes nothing and
+lists them. Put `--` before a name that begins with `-`. The old machine stops
+answering at once; the new one starts when its shed-host-agent or desktop app
+next connects, within about 30 s (at once from the desktop app's "Use this
+machine"). Nothing fails over on its own.
+
+```text
+$ shed source ls
+MACHINE  ID        KEY         BOUND  CONNECTED  FIRST SEEN
+laptop   01234567  SHA256:...  yes    yes        2 days ago
+desktop  fedcba98  SHA256:...  no     no         1 hour ago
+
+$ shed source use desktop
+Machine "desktop" (fedcba98) is now the credential source for you on my-server.
+Machine "laptop" (01234567) no longer answers. The new source answers once its shed-host-agent or desktop app next connects, within about 30 s.
+
+$ shed source status
+Credential source for you on my-server: "desktop" (fedcba98), connected (ssh-agent).
+Bound 1 min ago by user alice with key "laptop" (SHA256:...).
+```
+
+A script key cannot use these commands. Machine names come from the machines,
+so every output is escaped for the terminal. Against a server older than
+v0.10.0 the commands say the server does not support credential sources.
+`shed source status` reads the server; it does not say whether the machine you
+run it on is the source (the host-agent's own status does).
 
 ## Egress Control
 
@@ -1045,7 +1169,7 @@ its tab-specific fields under `roost`:
   {
     "name": "default",
     "shed_name": "codelens",
-    "server_name": "mini3",
+    "server_name": "my-server",
     "created_at": "2026-09-21T09:14:00Z",
     "attached": false,
     "source": "roost",
@@ -1059,7 +1183,7 @@ its tab-specific fields under `roost`:
   {
     "name": "default",
     "shed_name": "codelens",
-    "server_name": "mini3",
+    "server_name": "my-server",
     "created_at": "2026-09-21T07:02:00Z",
     "attached": true,
     "window_count": 1,

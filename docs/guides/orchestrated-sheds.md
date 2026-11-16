@@ -15,8 +15,11 @@ clients](../reference/security.md#service-clients); every key is in
 ## Before you start
 
 - The server runs `auth.mode: mtls` (see [Security
-  Configuration](security-configuration.md#case-3b-remote-internet-facing-mtls-recommended)).
-  Service clients do not exist in `open` or `token` mode.
+  Configuration](security-configuration.md#case-3-networked-mtls-facing-the-network)).
+  Service clients do not exist in `open` mode.
+- Nothing about a client changes with a [user list](multi-user-server.md):
+  the same certificate, routes and policy work on a server with or without
+  `auth.users`. A client name may not also be a user name.
 - For the `isolated` network profile, the server uses the Firecracker backend
   and can run `nft` (the deb package's root unit can). A VZ server works too, with
   `network: open` in the client's policy.
@@ -31,7 +34,7 @@ Add the client under `auth.clients` in `server.yaml` and restart `serve`:
 auth:
   mode: mtls
   ssh:
-    github_users: [charliek]
+    github_users: [alice-gh]
   clients:
     nocturn:
       cert_max_ttl: 2160h          # longest certificate client issue signs (90 days)
@@ -145,7 +148,7 @@ is in [API › POST /api/sheds/{name}/exec](../reference/api.md#post-apishedsnam
 | Can | Cannot |
 |-----|--------|
 | Read `/api/info` and `/api/images` | Reach any other route (`403 FORBIDDEN`) |
-| List, create, get, start, stop, delete and exec in its own sheds | See or touch an admin's or another client's shed (`404 SHED_NOT_FOUND`, the same as a shed that does not exist) |
+| List, create, get, start, stop, delete and exec in its own sheds | See or touch a person's or another client's shed (`404 SHED_NOT_FOUND`, the same as a shed that does not exist) |
 | Create within its policy: prefix, image list, caps, `max_sheds` | Use `local_dir`, `add_dirs`, `from_snapshot`, another network profile, or mounts outside `server_mounts` (`403 POLICY_VIOLATION`) |
 | Run anything as root inside its sheds (`sudo`) | Use the credential bus, SSH, Connect tunnels, snapshots, or the egress routes (a create may still name `egress` profiles) |
 
@@ -156,7 +159,9 @@ whole image list, the same one an admin sees; the client can create only from
 the server's `default_image` and the aliases its policy's `images` names.
 
 Admins keep the full API and see every shed, with its `owner`, in
-`shed list -v`.
+`shed list -v`. An admin may also stop, delete and enter a client's shed. On a
+server with users, a user who is not an admin cannot see a client's sheds, and
+the client cannot see theirs.
 
 ### Repositories and credentials
 
@@ -218,8 +223,8 @@ again until they expire, so give a replacement client a new name.
 
 Whoever holds the bundle can do everything the client can, within its policy:
 create sheds, run commands as root in its live sheds, read what the
-orchestrator put in them, and delete them. Through the API it cannot touch an
-admin's sheds or another client's, and it gives no admin route and no SSH.
+orchestrator put in them, and delete them. Through the API it cannot touch a
+person's sheds or another client's, and it gives no admin route and no SSH.
 What those commands can reach on the network and the host is set by the
 shed's profile and mounts, not by the certificate: an `isolated` shed reaches
 only the internet (and its own egress proxy), while with `policy.network:

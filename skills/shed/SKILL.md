@@ -16,7 +16,8 @@ This skill covers **using the `shed` client** day-to-day. Operating the server �
 - A **shed** is a named, persistent VM that lives on a **server**. The client can target several servers; commands act on the default server unless you pass `-s/--server`, and `--all` fans out across all of them (for `list`, `sessions`, `system`).
 - **The VM persists** after you disconnect. To also keep the *programs* inside alive (an agent, a dev server), run them in a **tmux** session via `shed attach` — not `shed console`.
 - A shed's rootfs is a shared, read-only **image** (variants `base`/`extensions`/`full`) plus a per-shed **writable upper layer**. `shed reset` discards everything written inside the VM and starts fresh from the image, while leaving the workspace intact.
-- The client is configured by `~/.shed/config.yaml` (servers + a cache of known sheds). Networking assumes a private network (Tailscale); auth is SSH-key based, so there is no login/token flag.
+- The client is configured by `~/.shed/config.yaml` (servers + a cache of known sheds). Auth is SSH-key based: `shed server add` enrolls a client certificate over SSH for a networked (mtls) server, so there is no login/token flag.
+- **Sheds belong to a user.** On a server with users, your key decides who you are: you see and enter only your own sheds, and another user's shed answers "not found". An admin also lists, stops and deletes others' sheds but cannot enter them. Shed names are unique across users, and `git` is reserved.
 
 ## First step: know the servers and sheds
 
@@ -25,7 +26,7 @@ Before acting, read the lay of the land:
 ```bash
 shed server list          # configured servers + which is default/online
 shed list                 # sheds on the default server (use --all for every server)
-shed list -v              # expanded: backend, status, SSH target, IP, resources, OWNER, MOUNTS, NETWORK
+shed list -v              # expanded: backend, status, SSH target, IP, resources, OWNER, USER, MOUNTS, NETWORK
 ```
 
 If no server is configured yet, add one (one-time): `shed server add <host> --name <name>`.
@@ -60,6 +61,7 @@ Other ways to create: `--local-dir ~/path` mounts a host directory as the worksp
 | IDE (Cursor/VS Code) | `shed ssh-config --all --install` |
 | Disk usage / cleanup | `shed system df` · `shed system prune` |
 | Snapshots | `shed snapshot create <shed> <snap>` · `shed create <new> --from-snapshot <snap>` |
+| Which machine answers credential requests | `shed source status` · `shed source ls` · `shed source use <machine>` |
 
 Usage notes that matter:
 
@@ -69,7 +71,9 @@ Usage notes that matter:
 - **Multi-server:** target one with `-s <server>`; sweep all with `--all` (on `list`, `sessions`, `system`).
 - **Scripting:** `--json` emits structured output. Destructive commands require `--force` when combined with `--json` (no interactive prompt).
 - **Untrusted code:** create with `--mounts none --network isolated` (no host directories, the internet only; `--network isolated` needs a Firecracker server). On VZ only `--mounts none` is available, and it leaves the network open: the shed still reaches the Mac and its LAN, so tell the user before running untrusted code there. Add `--no-sync` when the user's `default` sync profile copies anything private, and note that neither flag turns off the credential bus while a host-agent serves the server.
-- **Sheds you didn't create:** a shed whose `OWNER` in `shed list -v` is not `-` belongs to a service client (an orchestrator such as a CI system), which manages and deletes it. Don't stop, reset or delete it unless the user asks for that shed by name.
+- **Sheds you didn't create:** a shed whose `OWNER` in `shed list -v` is not `-` belongs to a service client (an orchestrator such as a CI system), which manages and deletes it; one whose `USER` is someone else belongs to another person (only an admin sees it). Don't stop, reset or delete either unless the user asks for that shed by name.
+- **Admin-only on a server with users:** `--local-dir`, `--add-dir`, named `--mounts`, an `--image` that is not the server default or an alias, and image-store changes are refused (`403 FORBIDDEN`, `admin only: ...`) for a user who is not an admin. A user who is not an admin gets no server mounts by default. Don't retry those; tell the user an admin must do it.
+- **SSH helpers answer from one machine:** a server sends your sheds' SSH-agent, Docker and AWS credential requests to one of your machines, your credential source. If `ssh-add -l` or a git push in a shed hangs or fails, run `shed source status`; if the source is another (or a sleeping) machine, `shed source use <this machine's name>` moves it (the new machine answers within about 30 s). Nothing fails over by itself.
 
 ## Reaching services inside a shed (tunnels)
 

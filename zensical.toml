@@ -49,6 +49,7 @@ nav = [
   ] },
   { "Guides" = [
     { "Security Configuration" = "guides/security-configuration.md" },
+    { "Multi-user Server" = "guides/multi-user-server.md" },
     { "Public VPS Deployment" = "guides/vps-deployment.md" },
     { "Orchestrated Sheds" = "guides/orchestrated-sheds.md" },
   ] },

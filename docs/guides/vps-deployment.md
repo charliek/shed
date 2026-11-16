@@ -10,14 +10,15 @@ hardening bundle (SSH allowlist enforced + client certificate enforced +
 TLS-only, with no plain-HTTP listener) and **refuses to start** if any piece is
 missing; one `bind_address` faces the network:
 
-- **[`auth.mode: mtls`](#1-server-config)** — the **recommended** posture. The
+- **[`auth.mode: mtls`](#1-server-config)**, the one networked posture. The
   HTTP credential is a client certificate bound to a private key that never
   leaves the client's device, issued over SSH. An unauthenticated peer can
   never complete the TLS handshake, let alone reach the router.
-- The bearer-token mode (`auth.mode: token`) was removed in v0.10.0 and no
-  longer loads (see [Token mode was removed](#token-mode-was-removed)). A CI
-  runner or agent runner that needs only its own sheds can be a
-  [service client](orchestrated-sheds.md) of an mtls server.
+- A CI runner or agent runner that needs only its own sheds can be a
+  [service client](orchestrated-sheds.md) of the same server.
+- Several people can share it with a user list; see the [Multi-user server
+  guide](multi-user-server.md). This guide uses one person's keys
+  (`auth.ssh.github_users`).
 
 There are no credentials to mint or paste by hand: clients get
 them automatically over SSH.
@@ -32,7 +33,7 @@ is reachable from off-box:
 auth:
   mode: mtls                     # derives the full bundle; refuses to start without a key source
   ssh:
-    github_users: [charliek]     # only these GitHub keys may SSH in (and enroll certificates)
+    github_users: [alice-gh]     # only these GitHub keys may SSH in (and enroll certificates)
 tls_names:
   - shed.example.com             # your VPS hostname / public IP (extra cert SANs on the server's own leaf)
 bind_address: 0.0.0.0            # face the network (loopback is the default) — or a specific public IP
@@ -58,22 +59,22 @@ Start (or restart) the server. If a required piece is missing it exits
 immediately, naming the gap:
 
 ```text
-auth.mode: mtls requires at least one SSH key source (auth.ssh.github_users, authorized_keys, or authorized_keys_file)
+auth.mode: mtls requires at least one SSH key source (auth.users, or auth.ssh.github_users, authorized_keys, or authorized_keys_file)
 ```
 
-### Token mode was removed
-
-`auth.mode: token` (and its older spelling `secure`) was removed in v0.10.0:
-a config that names it fails to load with a message naming `mtls`, rather
-than starting open. Switch it to `auth.mode: mtls`; every client since v0.8.1
-re-enrols with a certificate on its next request. Callers that used a bearer
-token directly (`curl`, scripts, CI) must present a client certificate, or
-become a [service client](orchestrated-sheds.md).
+!!! note "Removed in v0.10.0: token mode"
+    `auth.mode: token` (and its older spelling `secure`) was removed in
+    v0.10.0: a config that names it fails to load with a message naming
+    `mtls`, rather than starting open. Switch it to `auth.mode: mtls`; every
+    client since v0.8.1 re-enrolls with a certificate on its next request.
+    Callers that used a bearer token directly (`curl`, scripts, CI) must
+    present a client certificate, or become a [service
+    client](orchestrated-sheds.md).
 
 ## 2. Add the server from your client
 
 From your laptop, one command enrolls a certificate over SSH — `shed server
-add` is SSH-first for every enforced mode, so it needs the SSH port (default
+add` is SSH-first, so it needs the SSH port (default
 `2222`; override with `--ssh-port` if you changed `ssh_port` in
 `server.yaml`):
 
@@ -129,9 +130,19 @@ same `~/.shed/config.yaml` entry, and persists its own certificate/key in its
 state dir (never the same key material the CLI holds — one certificate per
 process, per scope).
 
-The bus stream is long-lived and often idle; shed-server sends a periodic SSE
-keepalive comment so an idle NAT or proxy does not evict the connection. If the
-agent reconnects across a blip, any un-acked credential request is re-delivered.
+The bus stream is long-lived and often idle; shed-server sends an SSE
+keepalive comment every 25 s so an idle NAT or proxy does not evict the
+connection. If the agent reconnects across a blip, a credential request it had
+not answered is delivered to it again; no other machine ever receives it.
+
+The first machine whose host-agent (or desktop app) connects becomes your
+**credential source** on this server, and only it answers your sheds'
+requests. A second machine of yours is refused, names the first, and keeps
+retrying until you move the source with `shed source use` (see [Security ›
+One machine answers for each
+user](../reference/security.md#one-machine-answers-for-each-user)). Run
+shed-host-agent 0.10.0 or newer: an older one is refused with a message to
+upgrade.
 
 ## 4. Rotation and expiry
 
@@ -142,9 +153,8 @@ generates a fresh keypair + CSR and re-enrolls over SSH — the same
 client rebuild). You never rotate a certificate by hand. To **revoke**
 access, remove the key from the allowlist (drop it from `github_users`, or
 from the GitHub account); the next request on any connection presenting that
-certificate is rejected. This is coarser than token mode's per-token revoke —
-removing the SSH key also cuts shell/SFTP access, since the allowlist is now
-the one lever for both. Accepted tradeoff; see [Security › mTLS
+certificate is rejected. Removing the SSH key also cuts shell and SFTP
+access: the key set is the one lever for both. See [Security › mTLS
 mode](../reference/security.md#mtls-mode) for the full revocation model.
 
 **CA rotation** (distinct from per-client certificate renewal above) is
@@ -203,7 +213,7 @@ leaf, not the internal client-certificate CA).
 
 ## Hardening the SSH surface
 
-SSH stays the internet-exposed root of trust in both modes — it's the shell
+SSH stays the internet-exposed root of trust: it's the shell
 access channel *and* the channel that issues every HTTP credential, so it's
 worth the same operational care as any other internet-facing SSH daemon:
 

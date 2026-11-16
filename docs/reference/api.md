@@ -5,26 +5,23 @@ The `shed-server` exposes a REST API for managing sheds.
 **Base URL:** `http://{host}:8080/api` (or `https://{host}:8443/api` with TLS)
 
 !!! note "Authentication"
-    In `auth.mode: open` (the default) the API has no authentication — security
-    relies on a trusted network (Tailscale, firewall rules). In `auth.mode:
-    token` every request needs an `Authorization: Bearer <token>` header of the
-    required scope, except the bootstrap endpoints `GET /api/info` and
-    `GET /api/ssh-host-key`. In `auth.mode: mtls` every request instead needs a
-    client certificate of the required scope presented at the TLS handshake
-    (`RequireAndVerifyClientCert`) — an unauthenticated peer never reaches the
-    router at all, so `GET /api/info` and `GET /api/ssh-host-key` are moot
-    (unreachable pre-certificate) rather than exempt. The credential bus
-    (`/api/plugins/*`) requires the `credentials` scope; the Connect tunnel
+    In `auth.mode: open` (the default, loopback only) the API has no
+    authentication: every request is the implicit user, an admin. In
+    `auth.mode: mtls` every request needs a client certificate of the required
+    scope, presented at the TLS handshake (`RequireAndVerifyClientCert`): an
+    unauthenticated peer never reaches the router, so no route is exempt,
+    `GET /api/info` included. The credential bus (`/api/plugins/*`) requires
+    the `credentials` scope; the Connect tunnel
     (`/api/sheds/{name}/connect/{port}`) and the egress audit stream
     (`/api/egress/stream`) accept **either** `control` or `credentials`;
-    everything else needs `control`. Neither a bearer token nor a client
-    certificate is ever issued over plain HTTP —
-    both are minted/issued over the SSH `_bootstrap` channel (see
-    [Authentication](#authentication)). See [Security](security.md) for the full
-    model and pinned TLS. In mtls mode a server may also accept **service
-    clients** (orchestrators with a certificate from `shed-server client
-    issue`), which reach a fixed subset of the API for their own sheds only;
-    see [Service clients](#service-clients).
+    everything else needs `control`. A certificate is never issued over HTTP:
+    it is enrolled over the SSH `_bootstrap` channel (see
+    [Authentication](#authentication)). The `Authorization` header is never
+    read. See [Security](security.md) for the full model and pinned TLS. In
+    mtls mode a server may also accept **service clients** (orchestrators with
+    a certificate from `shed-server client issue`), which reach a fixed subset
+    of the API for their own sheds only; see [Service
+    clients](#service-clients).
 
 Errors share one JSON shape, whatever the endpoint:
 
@@ -34,78 +31,85 @@ Errors share one JSON shape, whatever the endpoint:
 
 ## Authentication
 
-In `token` mode the HTTP API is token-gated, but tokens are **not** issued over
-HTTP. A client mints one over a reserved **`_bootstrap` SSH channel**:
+In `mtls` mode the HTTP API is certificate-gated, and certificates are **not**
+issued over HTTP. A client enrolls over a reserved **`_bootstrap` SSH
+channel**:
 
 1. Connect to the SSH port as user `_bootstrap` over the pinned host key.
-2. The server re-verifies the connecting key against the SSH allowlist (the
-   bootstrap channel requires `auth.ssh.mode: enforce`) and mints a scoped,
-   short-TTL token.
+2. Send the request line `"<scope> [<kind>] csr=<base64(std, DER)>"`. The
+   server re-checks the connecting key against the live key set for this
+   channel and signs the CSR with its internal CA, composing the subject
+   entirely from authenticated knowledge (the SSH key fingerprint, the
+   requested scope and kind). Any subject fields, SANs or extensions in the
+   CSR itself are ignored.
 3. The server returns a JSON bundle and closes the channel:
 
    ```json
    {
-     "http_port": 8080,
+     "auth_mode": "mtls",
      "https_port": 8443,
      "tls_cert_fingerprint": "sha256:…",
-     "token": "shed_control_…",
+     "client_cert": "-----BEGIN CERTIFICATE-----\n…",
      "scope": "control",
-     "token_id": "…",
+     "cert_serial": "…",
      "expires_at": "2026-06-15T00:00:00Z"
    }
    ```
 
-`shed server add` performs this exchange automatically; the host-agent mints its
-own `credentials` token the same way. There is no `shed-server token new` and no
-static token list.
+`shed server add` performs this exchange automatically; the host-agent enrolls
+its own `credentials` certificate the same way. The certificate lives
+`auth.token_ttl` (default 24h) and is **re-validated on every request**: its
+expiry, its key against the live key set (with a user list, also the key's
+`expires` and its user's current admin flag), and its scope. A refused
+certificate gets `401 UNAUTHORIZED`; a scope the route does not accept gets
+`403 FORBIDDEN`. Clients re-enroll near expiry and on an auth failure.
 
-**Token properties.** Tokens are opaque (`shed_<scope>_<random>`) and
-server-tracked: the server keeps only a SHA-256 hash, plus the non-secret
-`token_id`, the subject key fingerprint, the scope (`control` or `credentials`),
-and an expiry (`auth.token_ttl`, default 24h). A request with an expired or
-unknown token gets `401`; clients refresh transparently near expiry and retry
-once on a `401`. Removing a key from the SSH allowlist purges every token minted
-for it on the next authoritative refresh. See
-[Security › HTTP tokens are minted over SSH](security.md#http-tokens-are-minted-over-ssh).
+A request acts as the user the certificate's key belongs to: on a server with
+no user list that is the implicit user, an admin; on a server with
+[`auth.users`](configuration.md#users) it is a named user with that user's
+admin flag. What each user may reach is in [Ownership](#ownership).
 
-### mtls mode
-
-In `mtls` mode the same `_bootstrap` channel issues a **client certificate**
-instead of a token: the client appends a CSR to the request line
-(`"<scope> [<kind>] csr=<base64(std, DER)>"`), and the server's internal CA
-signs it, composing the subject entirely from authenticated knowledge (the
-SSH key fingerprint, the requested scope/kind) — any subject fields, SANs, or
-extensions in the CSR itself are ignored. The bundle carries a certificate
-instead of a token:
-
-```json
-{
-  "auth_mode": "mtls",
-  "https_port": 8443,
-  "tls_cert_fingerprint": "sha256:…",
-  "client_cert": "-----BEGIN CERTIFICATE-----\n…",
-  "scope": "control",
-  "cert_serial": "…",
-  "expires_at": "2026-06-15T00:00:00Z"
-}
-```
-
-There is no `Authorization: Bearer` request in mtls mode — the certificate is
-presented at the TLS handshake and **re-validated on every request**
-(expiry, live SSH allowlist membership, and scope), giving it the same
-revocation-lands-on-the-next-request property as tokens. A bootstrap request
-with no `csr=` argument against an mtls-mode server fails with an explicit
-`this server requires auth.mode: mtls; upgrade shed (client certificate
-support)` error rather than a silent fallback. See [Security › mTLS
+A `_bootstrap` request with no `csr=` argument gets `this server requires
+auth.mode: mtls; upgrade shed (client certificate support)`. An open server
+answers every `_bootstrap` request with `bootstrap requires auth.ssh.mode:
+enforce`. A script key cannot take the `credentials` scope (`bootstrap: a
+script key cannot take the credentials scope`). See [Security › mTLS
 mode](security.md#mtls-mode) for the full guarantee and the accepted
 limitations.
 
 A [service client](#service-clients)'s certificate is different: it is issued
 on the shed host by `shed-server client issue`, never over `_bootstrap`, and
-is checked against `auth.clients` and a fixed route list instead of the SSH
-allowlist and scope. Its bundle carries `client` (the client name) in place of
+is checked against `auth.clients` and a fixed route list instead of the key
+set and scope. Its bundle carries `client` (the client name) in place of
 `scope`, and also `client_key`, because the server generates the key. See
 [Service clients](#service-clients).
+
+The bearer-token mode (`auth.mode: token`) was removed in v0.10.0; a server
+never issues or reads a bearer token.
+
+## Ownership
+
+On a server with [`auth.users`](configuration.md#users) every shed and
+snapshot has a `user`. The rules, which [Security ›
+Ownership](security.md#ownership) gives in full:
+
+| Caller | Their own shed | Another user's shed, or one with no user | A service client's shed |
+|---|---|---|---|
+| A user | every route | `404 SHED_NOT_FOUND`, the body of a shed that does not exist | `404 SHED_NOT_FOUND` |
+| An admin | every route | `GET`, list, `stop`, `DELETE`; every other route answers `403 FORBIDDEN` | every route |
+
+`GET /api/sheds` holds only what the caller may view. A record an admin views
+but may not enter carries no `repo` and no `landing_dir`. Creating a shed under
+a name someone else holds is the usual `409 SHED_ALREADY_EXISTS`. A user who
+is not an admin is refused host directories, server mounts, images that are
+not the default or an alias, the image store, `system prune` and egress
+profile changes with `403 FORBIDDEN` (`admin only: <what>`). On a server with
+no user list every caller is the implicit user and reaches everything.
+
+A route under `/api/sheds/{name}` or `/api/egress/{name}` whose `{name}` is not
+a valid shed name (lowercase letters, digits and hyphens, starting with a
+letter) answers `404 SHED_NOT_FOUND` before any other check, so for such a name
+the route's own `403`, `400` or `501` never appears.
 
 ## Endpoints
 
@@ -119,6 +123,7 @@ allowlist and scope. Its bundle carries `client` (the client name) in place of
 | DELETE | `/api/sheds/{name}` | Delete a shed |
 | POST | `/api/sheds/{name}/start` | Start a shed |
 | POST | `/api/sheds/{name}/stop` | Stop a shed |
+| POST | `/api/sheds/{name}/assign` | Give a shed with no user to a user (admin) |
 | POST | `/api/sheds/{name}/reset` | Wipe and recreate the shed's writable upper layer |
 | POST | `/api/sheds/{name}/exec` | Run one command in a running shed, streamed as NDJSON |
 | GET | `/api/sheds/{name}/sessions` | List tmux sessions in shed |
@@ -137,6 +142,9 @@ allowlist and scope. Its bundle carries `client` (the client name) in place of
 | GET | `/api/system/df` | Disk usage report (image cache, sheds, orphans) |
 | POST | `/api/system/prune` | Scoped disk cleanup (dry-run, images/instances/logs/orphans) |
 | GET | `/api/sheds/{name}/connect/{port}` | TCP tunnel via HTTP upgrade |
+| POST | `/api/users/refresh` | Fetch the GitHub logins again (admin) |
+| GET | `/api/sources` | A user's credential source and machines |
+| POST | `/api/sources/use` | Move a user's credential source |
 | GET | `/api/plugins/listeners` | List active extension listeners |
 | GET | `/api/plugins/listeners/{ns}/messages` | Subscribe to namespace (SSE) |
 | POST | `/api/plugins/listeners/{ns}/respond` | Respond to a plugin message |
@@ -148,31 +156,29 @@ allowlist and scope. Its bundle carries `client` (the client name) in place of
 
 Returns server metadata and capabilities.
 
-**Response (token mode; `"secure"` on the wire, see the warning below):**
+**Response (open mode):**
 
 ```json
 {
-  "name": "mini-desktop",
+  "name": "my-server",
   "version": "1.0.0",
   "ssh_port": 2222,
+  "http_port": 8080,
   "backend": "vz",
-  "auth_mode": "secure",
-  "https_port": 8443,
-  "features": ["overview", "http_exec", "mount_selection"]
+  "auth_mode": "open",
+  "features": ["overview", "http_exec", "mount_selection", "source_binding"]
 }
 ```
 
-An open-mode server reports `"auth_mode": "open"` and `"http_port": 8080` in
-place of `https_port`: an enforced mode serves no plain HTTP, so `http_port` is
-omitted there. A server whose backend has a `default_image` (configured, or set
-by a release build) also reports it as `default_image`.
+A server whose backend has a `default_image` (configured, or set by a release
+build) also reports it as `default_image`.
 
-**Response (mtls mode) — reachable only by a client that already presents a
+**Response (mtls mode), reachable only by a client that already presents a
 valid certificate, since the listener runs `RequireAndVerifyClientCert`:**
 
 ```json
 {
-  "name": "mini3",
+  "name": "build-box",
   "version": "1.0.0",
   "ssh_port": 2222,
   "backend": "firecracker",
@@ -180,9 +186,14 @@ valid certificate, since the listener runs `RequireAndVerifyClientCert`:**
   "https_port": 8443,
   "ca_fingerprint": "sha256:…",
   "ca_not_after": "2036-06-15T00:00:00Z",
-  "features": ["overview", "http_exec", "mount_selection", "service_clients", "network_profiles"]
+  "features": ["overview", "http_exec", "mount_selection", "service_clients", "network_profiles", "source_binding"]
 }
 ```
+
+`auth_mode` is `open` or `mtls`. An mtls server serves no plain HTTP, so
+`http_port` is always omitted there. A server older
+than v0.10.0 may report `secure` (its token mode); current clients treat
+`secure` and `token` as the same value.
 
 `features` lists what this server supports beyond the base API, so a client can
 refuse to send a field an older server would silently ignore. Tokens are added,
@@ -194,41 +205,26 @@ never renamed; treat an unknown token as absent.
 | `http_exec` | always | [`POST /api/sheds/{name}/exec`](#post-apishedsnameexec) |
 | `mount_selection` | always | The create request's `mounts` field |
 | `service_clients` | mtls mode with `auth.clients` configured | This server accepts [service clients](#service-clients) |
-| `network_profiles` | Firecracker backend | The create request's `network` field (`open` or `isolated`) |
+| `network_profiles` | Firecracker; remote unless its `firewall.mode` is `any` | The create request's `network` field (`open` or `isolated`) |
+| `async_lifecycle` | remote backend | Create, start, stop and delete return before the cloud work is done; see [Remote backend](remote-backend.md) |
+| `source_binding` | a server with a credential bus | One machine per user answers credential requests; every subscribe and respond must carry the machine headers. See [Credential sources](#credential-sources) |
 
 The `shed` CLI refuses `--mounts none|<names>` against a server without
 `mount_selection`, and `--network isolated` against one without
 `network_profiles`, before it sends anything.
 
-The `backend` field reflects the resolved backend for this server (`vz` or `firecracker`). When the server is configured with `default_backend: detect`, this field shows the auto-detected value.
+The `backend` field reflects the resolved backend for this server (`vz`,
+`firecracker` or `remote`). When the server is configured with
+`default_backend: detect`, this field shows the auto-detected value.
 
-`ca_fingerprint` / `ca_not_after` are present **only in mtls mode** — the
-internal CA's fingerprint and expiry, so `shed server info`-style tooling can
-surface CA state (see [Security › CA rotation](security.md#accepted-limitations)).
+`ca_fingerprint` / `ca_not_after` are present **only in mtls mode**: the
+internal CA's fingerprint and expiry (see [Security › CA
+rotation](security.md#accepted-limitations)).
 
-!!! warning "The wire contract: `auth_mode` reports `"secure"` for token mode"
-    This field's *effective* values are `open`, `token`, and `mtls`, but the
-    **wire spelling for token mode is the legacy `"secure"`**, not `"token"`.
-    A released pre-rename client decides whether to bootstrap a credential at
-    all by checking the literal string `"secure"`; reporting `"token"` here
-    would make that client skip bootstrapping and save a credential-less
-    entry that 401s on every command forever. So the server deliberately
-    keeps reporting `"secure"` for token mode on this one wire surface
-    indefinitely (`config.LegacyWireAuthMode`), and every current client
-    normalizes `"secure"` back to `"token"` on decode
-    (`config.NormalizeAuthMode`) before comparing it against anything. `open`
-    and `mtls` pass through unchanged — `open` predates the rename, and an
-    mtls-mode `/api/info` is certificate-gated, so no pre-rename client can
-    ever observe it. If you are parsing this field yourself, treat `"secure"`
-    and `"token"` as the same value.
-
-This endpoint is reachable without a credential in `open` and `token` mode
-(it is bootstrap-exempt) so `shed server add` can read the mode and ports
-before the client holds one. In `mtls` mode it is **not** exempt in practice
-— the TLS handshake itself requires a certificate, so an un-enrolled client
-can never reach this endpoint at all; `shed server add` instead learns the
-mode from the `_bootstrap` SSH bundle's `auth_mode` field (see
-[Authentication](#authentication)).
+In `open` mode this endpoint needs no credential (nothing does). In `mtls`
+mode no client can reach it before it holds a certificate; `shed server add`
+learns the mode from the `_bootstrap` SSH bundle's `auth_mode` field instead
+(see [Authentication](#authentication)).
 
 ### GET /api/ssh-host-key
 
@@ -269,17 +265,19 @@ Lists all sheds on this server.
 }
 ```
 
-Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mounts`, `landing_dir` and `owner` are omitted when empty or zero.
+Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mounts`, `landing_dir`, `owner` and `user` are omitted when empty or zero.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `owner` | string | The [service client](#service-clients) that created the shed. Omitted for a shed an admin created, which includes every shed created before service clients existed. |
+| `owner` | string | The [service client](#service-clients) that created the shed. Omitted for a shed a person created. |
+| `user` | string | The [user](configuration.md#users) the shed belongs to. Omitted on a server with no user list, and for a shed with no user (one made before the server had a user list, until [assigned](#post-apishedsnameassign)). A shed has an `owner` or a `user`, never both. `!unresolved` marks a shed whose records disagree about whose it is; only an admin reaches it. |
 | `mounts` | object | The server mounts (top-level `mounts:` in the server config) the shed gets on every start: `{"mode": "all"}` (every server mount, the default) or `{"mode": "selected", "names": [...]}` (only those; no `names` means none). A shed created before mount selection existed reports `{"mode": "all"}`. |
 | `network_profile` | string | `open` or `isolated`, fixed at create. A shed created before network profiles existed reports `open`. See [Security › Network profiles](security.md#network-profiles). |
 
-A service client's list holds only the sheds it owns.
+The list holds only the sheds the caller may view: a service client's, its
+own; a user's, their own; an admin's, every shed (see [Ownership](#ownership)).
 
-**Status values:** `running`, `stopped`, `starting`, `error`
+**Status values:** `running`, `stopped`, `starting`, `stopping`, `error`
 
 ### POST /api/sheds
 
@@ -313,7 +311,12 @@ Creates a new shed.
 
 A [service client](#service-clients)'s create is checked against its policy
 first: `mounts` defaults to its `server_mounts`, `network` to its pinned
-profile, and the shed is recorded with the client as its `owner`.
+profile, and the shed is recorded with the client as its `owner`. A person's
+create records them as the shed's `user` (on a server with users). A user who
+is not an admin may not set `local_dir`, `add_dirs`, a non-empty `mounts`, or
+an `image` other than the default or an `image_aliases` name (`403 FORBIDDEN`,
+`admin only: <field>`); omitting `mounts` gives them none, and their `repo`
+clone never gets the server's `env_file` variables.
 
 **Response (201 Created):**
 
@@ -363,13 +366,15 @@ Without the `Accept: text/event-stream` header, the endpoint behaves synchronous
 
 | Code | Error | Description |
 |------|-------|-------------|
-| 400 | `INVALID_SHED_NAME` | Invalid name format |
+| 400 | `INVALID_SHED_NAME` | Invalid name format, or the reserved name `git` (`shed name "git" is reserved`) |
 | 400 | `INVALID_REPO_URL` | Invalid repository URL |
 | 400 | `INVALID_LOCAL_DIR` | Invalid local directory path |
 | 400 | `INVALID_REQUEST` | No `image` specified and `default_image` is not configured on the chosen backend, or `upper_size_bytes` is outside the 1–100 GiB range, or `from_snapshot` was passed together with `image`/`repo`, or `mounts` names a mount the server does not have. |
 | 400 | `INVALID_NETWORK_PROFILE` | `network` is not `open` or `isolated` |
+| 403 | `FORBIDDEN` | A user who is not an admin asked for an admin-only field (`admin only: local_dir`, and the like), or `from_snapshot` names another user's snapshot as an admin |
 | 403 | `POLICY_VIOLATION` | Service clients only: the request breaks the client's policy; the message names the client and the rule |
-| 409 | `SHED_ALREADY_EXISTS` | Shed already exists |
+| 404 | `SNAPSHOT_NOT_FOUND` | `from_snapshot` names a snapshot that does not exist or that the caller may not see |
+| 409 | `SHED_ALREADY_EXISTS` | A shed with that name exists, whoever it belongs to |
 | 422 | `NETWORK_PROFILE_UNSUPPORTED` | A non-`open` profile on a backend that cannot enforce it (VZ) |
 | 500 | `CLONE_FAILED` / `BACKEND_ERROR` | Backend or clone failure |
 | 503 | `NETWORK_ENFORCEMENT_UNAVAILABLE` | The server could not install the firewall rules an `isolated` shed needs, so it refused to create it |
@@ -405,7 +410,8 @@ Gets details for a specific shed.
 ```
 
 The fields are those of [GET /api/sheds](#get-apisheds), including `owner`
-(omitted here: an admin's shed), `mounts` and `network_profile`.
+and `user` (both omitted here), `mounts` and `network_profile`. An admin
+viewing another user's shed gets it without `repo` and `landing_dir`.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -416,7 +422,7 @@ The fields are those of [GET /api/sheds](#get-apisheds), including `owner`
 
 | Code | Description |
 |------|-------------|
-| 404 | Shed not found; for a service client, also a shed it does not own (the same body) |
+| 404 | `SHED_NOT_FOUND`: no such shed, or one the caller may not see (the same body) |
 
 ### DELETE /api/sheds/{name}
 
@@ -428,7 +434,9 @@ Deletes a shed and its data.
 
 | Code | Description |
 |------|-------------|
-| 404 | Shed not found |
+| 404 | `SHED_NOT_FOUND`: no such shed, or one the caller may not see |
+
+An admin may delete any shed.
 
 ### POST /api/sheds/{name}/start
 
@@ -448,7 +456,8 @@ Starts a stopped shed.
 
 | Code | Description |
 |------|-------------|
-| 404 | Shed not found |
+| 403 | `FORBIDDEN`: an admin and another user's shed, or a shed with no user (starting is entering); a user who is not an admin and a shed that carries host directories or server mounts |
+| 404 | `SHED_NOT_FOUND`: no such shed, or one the caller may not see |
 | 409 | Shed already running |
 | 503 | `NETWORK_ENFORCEMENT_UNAVAILABLE`: an `isolated` shed cannot start while its firewall rules cannot be installed |
 
@@ -470,8 +479,39 @@ Stops a running shed.
 
 | Code | Description |
 |------|-------------|
-| 404 | Shed not found |
+| 404 | `SHED_NOT_FOUND`: no such shed, or one the caller may not see |
 | 409 | Shed already stopped |
+
+An admin may stop any shed.
+
+### POST /api/sheds/{name}/assign
+
+Gives a shed that has **no user and no service client** to a configured user:
+a shed made before the server had a user list. Admin only. A shed is never
+moved between users, and snapshots cannot be assigned.
+
+**Request:**
+
+```json
+{"user": "alice"}
+```
+
+**Response (200 OK):** the shed, with its new `user`.
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_REQUEST` | The body is not `{"user":"<name>"}`, or no such user is configured |
+| 403 | `FORBIDDEN` | The caller is not an admin (checked first, so a refused caller learns nothing of the user list or the shed) |
+| 404 | `SHED_NOT_FOUND` | No such shed, or it was deleted and created again since it was looked up |
+| 409 | `SHED_ALREADY_ASSIGNED` | The shed has a user or a service client |
+| 409 | `SHED_HOST_RESOURCES` | The shed carries host directories or a server-mount selection that is not explicitly empty: assigning it would hand those to its new user. Recreate it without them (`--mounts none`). On Firecracker and VZ a shed stored before mount selection existed counts as carrying server mounts. |
+
+On Firecracker and VZ the new user is written to disk before the answer, and a
+running shed's credential requests go to the new user's machine from then on.
+On the remote backend the user is also written to the instance's `shed_user`
+label; see [Remote backend › Users](remote-backend.md#users).
 
 ### POST /api/sheds/{name}/reset
 
@@ -487,14 +527,16 @@ image is untouched, and host-mounted `local_dir`/`add_dirs` directories
 
 | Code | Error | Description |
 |------|-------|-------------|
-| 404 | `SHED_NOT_FOUND` | Shed does not exist |
+| 403 | `FORBIDDEN` | The caller may view the shed but not enter it (an admin and another user's shed) |
+| 404 | `SHED_NOT_FOUND` | No such shed, or one the caller may not see |
 | 409 | `SHED_NOT_STOPPED` | Shed must be stopped before reset |
 
 ### POST /api/sheds/{name}/exec
 
 Runs one command in a running shed and streams its output, with no SSH client.
-Available to admins (the `control` scope in token and mtls mode) and to a
-[service client](#service-clients) on a shed it owns. Advertised by the
+Available to a caller who may enter the shed (the `control` scope in mtls
+mode; see [Ownership](#ownership)) and to a [service client](#service-clients)
+on a shed it owns. Advertised by the
 `http_exec` feature.
 
 **Request:**
@@ -564,7 +606,8 @@ frame with code 1.
 | Code | Error | Description |
 |------|-------|-------------|
 | 400 | `INVALID_REQUEST` | Validation failed (empty `argv`, a NUL byte, a bad `env` key, a relative `cwd`, invalid base64, an unknown field, `timeout_seconds` over `exec.max_timeout`, `max_output_bytes` over 256 MiB) |
-| 404 | `SHED_NOT_FOUND` | No such shed (or, for a service client, one it does not own) |
+| 403 | `FORBIDDEN` | The caller may view the shed but not enter it |
+| 404 | `SHED_NOT_FOUND` | No such shed, or one the caller may not see |
 | 409 | `SHED_NOT_RUNNING` | The shed is not running. Exec never starts a shed; start it first. |
 | 413 | `REQUEST_TOO_LARGE` | The body, or its decoded `stdin`, is over the limit |
 | 429 | `EXEC_LIMIT` | The shed already runs `exec.max_concurrent_per_shed` HTTPS execs (default 8) |
@@ -587,7 +630,9 @@ drives sheds on a server it does not administer. Clients exist only in
 and authenticate with a certificate signed by `shed-server client issue` (see
 the [Orchestrated sheds guide](../guides/orchestrated-sheds.md)). A request
 whose certificate is a service certificate is a *client request*; every other
-request is an *admin request* and behaves exactly as before.
+request is a user's request (the implicit user's on a server with no user
+list) and follows [Ownership](#ownership). Nothing about clients changes with
+a user list.
 
 Client requests are deny by default. The whole surface a client can reach:
 
@@ -608,7 +653,7 @@ Client requests are deny by default. The whole surface a client can reach:
 | 401 | `UNAUTHORIZED` | The certificate is service-shaped but malformed, names a client that is not configured, or is expired. The connection is closed. (An unknown client is normally refused at the TLS handshake already.) |
 | 403 | `FORBIDDEN` | Any route not in the table above, including every unknown path and wrong method |
 | 403 | `POLICY_VIOLATION` | A create that breaks the client's policy (the message is `client <name>: <rule>`) |
-| 404 | `SHED_NOT_FOUND` | A shed it does not own, an admin's shed, or one that does not exist: the same body in every case, so a client cannot learn which sheds exist |
+| 404 | `SHED_NOT_FOUND` | A shed it does not own, a person's shed, or one that does not exist: the same body in every case, so a client cannot learn which sheds exist |
 
 The create policy refuses `local_dir`, `add_dirs`, `from_snapshot`, an `image`
 outside the policy's `images` (empty: only the server default), a name without
@@ -620,15 +665,18 @@ touches the host, so a refused client learns nothing about the server's
 filesystem. `repo`, `egress`, `no_provision`, `cpus`, `memory_mb` and
 `upper_size_bytes` are allowed within those limits.
 
-Admins see and control every shed, owned or not, through the full API.
+An admin may list, stop, delete and enter a client's shed through the full
+API; a user who is not an admin cannot see it.
 
 ## Snapshots
 
 ### GET /api/snapshots
 
-Lists all snapshots managed by this server. Each snapshot's `lower_cached`
-field is recomputed at read time from the local blob store; it is never
-persisted to `snapshot.json`.
+Lists the snapshots the caller may see: a user's own, or, for an admin, every
+snapshot. Each snapshot's `lower_cached` field is recomputed at read time from
+the local blob store; it is never persisted to `snapshot.json`. On a server
+with users each snapshot carries `user`, the user of the shed it was taken
+from (omitted when none).
 
 **Response (200 OK):**
 
@@ -699,7 +747,8 @@ alongside the snapshot rather than failing the request.
 | Code | Error | Description |
 |------|-------|-------------|
 | 400 | `INVALID_SNAPSHOT_NAME` / `INVALID_SHED_NAME` | Name validation failed |
-| 404 | `SHED_NOT_FOUND` | Source shed does not exist |
+| 403 | `FORBIDDEN` | The caller may view the source shed but not enter it (taking a snapshot is entering) |
+| 404 | `SHED_NOT_FOUND` | Source shed does not exist, or the caller may not see it |
 | 409 | `SNAPSHOT_ALREADY_EXISTS` | A snapshot with that name already exists |
 | 409 | `SNAPSHOT_SOURCE_RUNNING` | Source shed is running; stop it before snapshotting |
 
@@ -712,7 +761,7 @@ Returns a single snapshot. Shape matches the list entries above (with
 
 | Code | Error | Description |
 |------|-------|-------------|
-| 404 | `SNAPSHOT_NOT_FOUND` | Snapshot does not exist |
+| 404 | `SNAPSHOT_NOT_FOUND` | Snapshot does not exist, or it is another user's |
 
 ### DELETE /api/snapshots/{name}
 
@@ -727,7 +776,7 @@ that digest a candidate for `shed image prune`.
 
 | Code | Error | Description |
 |------|-------|-------------|
-| 404 | `SNAPSHOT_NOT_FOUND` | Snapshot does not exist |
+| 404 | `SNAPSHOT_NOT_FOUND` | Snapshot does not exist, or it is another user's (an admin may delete any snapshot) |
 
 ## Session Management
 
@@ -799,6 +848,8 @@ Lists all tmux sessions across all running sheds.
 ```
 
 ## Images
+
+On a server with [users](configuration.md#users), every route here but the list and inspect is admin-only (`403 FORBIDDEN`, `admin only: image ...`).
 
 ### GET /api/images
 
@@ -1015,6 +1066,8 @@ retrying. Lenient read paths (`GET /api/sheds`, `GET /api/images`,
 
 ## System
 
+On a server with users, `GET /api/system/df` shows a caller who is not an admin only their own sheds and snapshots and no orphans (the totals are the server's), and `POST /api/system/prune` is admin-only.
+
 ### GET /api/system/df
 
 Returns disk usage information for the server: image cache, per-instance rootfs copies and console logs, kernel/initrd, and orphan sidecar files.
@@ -1207,7 +1260,7 @@ After the 101 response, the connection becomes a bidirectional byte stream to th
 | 502 | `CONNECT_FAILED` | Could not connect to the port (service not running) |
 | 503 | `SHED_NOT_RUNNING` | Shed is not running |
 
-**Security:** In `open` mode the Connect API relies on network-level trust (Tailscale, firewall) like the rest of the API; in `token` mode it requires a bearer token of the `control` **or** `credentials` scope over pinned TLS. It connects to the VM's loopback interface and does not support arbitrary destinations.
+**Security:** In `open` mode (loopback only) the Connect API, like the rest of the API, has no credential; in `mtls` mode it requires a client certificate of the `control` **or** `credentials` scope over pinned TLS. The caller must be allowed to enter the shed (see [Ownership](#ownership)). It connects to the VM's loopback interface and does not support arbitrary destinations.
 
 **Consumers:**
 
@@ -1215,70 +1268,228 @@ After the 101 response, the connection becomes a bidirectional byte stream to th
 - The proxy extension (`shed-ext-proxy`) uses Connect API for reverse proxying
 - SSH port forwarding (`ssh -L`) uses `DialService` internally via `handleDirectTCPIP`
 
+## Users
+
+### POST /api/users/refresh
+
+Makes the server fetch the SSH keys of every GitHub login it follows now,
+instead of at its next scheduled refresh (`auth.ssh.github_refresh`), each
+checked against the account id the login is pinned to (see [Security ›
+GitHub logins are pinned](security.md#github-logins-are-pinned-to-their-account-id)).
+Admin only (the implicit user is one); `shed users refresh` calls it. It waits
+for the fetch for up to 60 s.
+
+**Response (200 OK):** one row per GitHub login.
+
+```json
+{
+  "logins": [
+    {"user": "alice", "login": "alice-gh", "status": "ok", "github_id": 1234567, "keys": 2},
+    {"user": "bob", "login": "bob-gh", "status": "mismatch", "github_id": 7654321, "seen_id": 1111111, "keys": 0,
+     "removed": ["SHA256:..."]}
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `user` | The user the login belongs to; `""` for the implicit user of a server with no user list |
+| `login` | The GitHub login as configured |
+| `status` | `ok` (the login names its pinned account; its keys are current), `pinned` (it had no pin and is now pinned to the account it names), `unchanged` (a check made for an unknown key found its keys as they were), `unreachable` (GitHub could not be asked or answered inconsistently: the last known keys stay and nothing new is accepted), `mismatch` (it names another account than its pin, or none: its keys are dropped until it names the pinned account again), `gone` (a login with no pin names no account), `pin-write-failed` (the pin could not be written, so nothing new is accepted), or `invalid-login` (never fetched) |
+| `github_id` | The account id the login is pinned to (omitted: none yet) |
+| `seen_id` | On a `mismatch`, the account the login names instead |
+| `keys` | How many of the login's keys are accepted now |
+| `added`, `removed` | Key fingerprints this fetch added and removed |
+| `error` | Why the login could not be fetched, when it could not |
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 403 | `FORBIDDEN` | The caller is not an admin |
+| 504 | `INTERNAL_ERROR` | The fetch was still running after 60 s; its result applies when it ends |
+
+## Credential sources
+
+Each user has one **credential source** per server: the machine whose
+credential-bus subscriptions the server takes and whose answers it accepts
+(see [Security › One machine answers for each
+user](security.md#one-machine-answers-for-each-user)). These two routes read
+and move it. They need the `control` scope, so a machine's `credentials`
+certificate can neither read nor move a binding, and they are not on the
+service-client route list. A script key is refused both (`403 FORBIDDEN`, the
+read included).
+
+A user reads and moves their own. An admin may name another configured user
+(`?user=` on the read, `"user"` in the body of the move) and can then choose
+only among that user's own machines; an admin naming a user who is not
+configured gets `400 INVALID_REQUEST`. A user who is not an admin naming anyone
+else gets one fixed `403 FORBIDDEN`, whether or not that user exists.
+
+### GET /api/sources
+
+The caller's binding and the machines that have presented themselves for them,
+read as one moment's state.
+
+**Response (200 OK):**
+
+```json
+{
+  "user": "alice",
+  "binding": {
+    "delivery": [{"kind": "machine", "id": "0123456789abcdef0123456789abcdef"}],
+    "signing": [{"kind": "machine", "id": "0123456789abcdef0123456789abcdef"}],
+    "bound_at": "2026-11-16T09:00:00Z",
+    "bound_by": "first-connect",
+    "generation": 1
+  },
+  "machines": [
+    {"id": "0123456789abcdef0123456789abcdef", "name": "laptop", "key_fingerprint": "SHA256:...",
+     "first_seen": "2026-11-16T09:00:00Z", "connected": true, "namespaces": ["ssh-agent"]},
+    {"id": "fedcba9876543210fedcba9876543210", "name": "desktop", "key_fingerprint": "SHA256:...",
+     "first_seen": "2026-11-16T10:00:00Z", "connected": false, "namespaces": []}
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `user` | The user the answer is for; `""` for the implicit user |
+| `binding` | `null` when no machine is the source yet (the first to connect becomes it). `delivery` (where requests are sent) and `signing` (whose answers are accepted) each name exactly one machine, the same one. |
+| `binding.bound_by` | `first-connect`, or who moved it last: `user <name> with key "<label>" (<fingerprint>)` for a key listed with a label, `user <name> with key <fingerprint>` otherwise, `admin <name> ...` when an admin moved another user's, `the implicit user ...` on a server with no user list |
+| `binding.generation` | Increases on every bind and move |
+| `machines` | Up to 32 machines remembered for the user, oldest first. A machine is known only once its broker has tried to connect. |
+| `machines[].key_fingerprint` | The key the machine's certificate was enrolled with (empty in open mode) |
+| `machines[].connected`, `namespaces` | Whether it holds a subscription now, and for which request types |
+
+**Errors:** `400 INVALID_REQUEST` (`?user` twice, or an unknown user named by
+an admin), `403 FORBIDDEN`, `503 SOURCE_BUSY` with `Retry-After` (the user's
+records were being changed or saved for more than 2 s; retry), `503
+PLUGINS_DISABLED` (the server has no credential bus).
+
+### POST /api/sources/use
+
+Makes a machine that has presented itself for the user their credential
+source. The body is exactly one JSON object with `machine_id` (32 lowercase
+hex digits) and, for an admin, optionally `user`; any other field, a field
+given twice, or trailing data is refused.
+
+```json
+{"machine_id": "fedcba9876543210fedcba9876543210"}
+```
+
+**Response (200 OK):** the same document as `GET /api/sources`, as the move
+left it.
+
+The move takes effect at once: the old machine's streams end, the requests
+sent to it are dropped, and its answers are refused. The new machine is not
+called; it starts answering when its broker next connects. Moving to the
+machine already bound changes nothing (the `generation` is unchanged).
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_REQUEST` | The body, a malformed `machine_id`, or an admin naming a user who is not configured |
+| 403 | `FORBIDDEN` | As for `GET /api/sources` |
+| 404 | `SOURCE_MACHINE_NOT_FOUND` | No machine with that id has presented itself for the user |
+| 500 | `INTERNAL_ERROR` | The move was not confirmed: the store could not save it. The current source stays in use for now, but the move may take effect when the server restarts; check with `GET /api/sources` before retrying |
+| 503 | `PLUGINS_DISABLED` | The server has no credential bus |
+
 ## Extensions
 
-Extension endpoints enable plugin communication between VMs and host processes. See [Extensions](extensions.md) for the full guide.
+Extension endpoints carry the credential bus between sheds and the machines
+that answer for their users. See [Extensions](extensions.md) for the full guide
+and [Security › Credential bus](security.md#credential-bus) for the routing,
+the pin and its limits. Every route here needs the `credentials` scope in mtls
+mode, and refuses a service client (`403 FORBIDDEN`, `the credential bus is for
+users`). Each acts as the caller's user.
 
 ### GET /api/plugins/listeners
 
-Lists all active extension listeners.
+Lists the caller's active listeners; an admin (and the implicit user) sees
+every user's, sorted by user and then namespace.
 
 **Response (200 OK):**
 
 ```json
 {
   "listeners": [
-    {"namespace": "op", "created_at": "2026-03-29T12:00:00Z"}
+    {"namespace": "ssh-agent", "user": "alice", "created_at": "2026-03-29T12:00:00Z"}
   ]
 }
 ```
 
+`user` is omitted for the implicit user.
+
 ### GET /api/plugins/listeners/{namespace}/messages
 
-Subscribes to a namespace via SSE. One listener per namespace.
+Subscribes the caller's machine to the user's requests of one namespace, as
+an SSE stream. Another user's subscription to the same namespace is
+independent.
 
-**Headers:** `Accept: text/event-stream`
+**Headers:** `Accept: text/event-stream`, and the machine headers
+`X-Shed-Machine-Id` (32 lowercase hex digits) and `X-Shed-Machine-Name`
+(percent-encoded UTF-8, 1 to 63 bytes decoded, no control characters).
+
+The stream sends an SSE comment every 25 s when idle. A write that is not
+taken within 15 s closes it.
 
 **Errors:**
 
 | Code | Status | Description |
 |------|--------|-------------|
+| `FORBIDDEN` | 403 | A service client, or a script key |
 | `NAMESPACE_RESERVED` | 403 | `system:*` namespaces cannot be registered |
-| `NAMESPACE_ALREADY_REGISTERED` | 409 | Namespace already has a listener |
+| `INVALID_NAMESPACE` | 400 | The namespace is malformed |
+| `SOURCE_MACHINE_ID_REQUIRED` | 403 | The machine headers are missing or invalid (a broker released before v0.10.0); the message names the minimum versions |
+| `SOURCE_RATE_LIMITED` | 429 | Too many new or changed machines for this user lately; with `Retry-After` in seconds |
+| `SOURCE_NOT_BOUND` | 403 | Another machine is the user's source; the body's `source` names it (`machine_id`, `machine_name`) |
+| `SOURCE_DUPLICATE_STREAM` | 409 | The source machine already holds this namespace. Retryable: nothing is replaced, and a dead stream is closed by its write deadline |
+| `INTERNAL_ERROR` | 500 | The bindings store could not be saved; nothing was registered |
+| `PLUGINS_DISABLED` | 503 | The server has no credential bus, or is shutting down |
 
-Only one listener per namespace is allowed, so the `409` is **terminal** — a
-client treats it as "another agent already owns this namespace" and stops
-retrying rather than hot-looping. When HTTP auth is enforced, un-acked requests
-pending for a namespace are **retained across a disconnect and re-delivered**
-when a listener re-subscribes, so a host-agent that reconnects across a blip
-doesn't strand an in-flight credential request; stale pending is swept after a
-retention TTL. (In `open` mode there is no ownership tracking and no re-delivery.)
+The first machine to connect for a user becomes the source. A request the
+source has not answered when it disconnects is kept for that machine's
+reconnect only; no other machine receives it.
 
 ### POST /api/plugins/listeners/{namespace}/respond
 
-Sends a response back to a shed. The envelope must include `shed.name`. A
-response is honored only if it matches an outstanding pending request for the
-current listener — forged responses (an unknown `requestID`) and replays (an
-already-consumed one) are dropped. See
-[Security › Credential bus](security.md#credential-bus).
+Sends an answer back to a shed. The envelope must include `shed.name`, and
+`in_reply_to` must be the id the server sent with the request. The answer is
+accepted only from the user's source machine (the same machine headers as the
+subscribe), only for a request that machine was sent, and is written only into
+the shed connection the request arrived on.
+
+**Response (204 No Content)** once the answer is written into the shed.
 
 **Errors:**
 
 | Code | Status | Description |
 |------|--------|-------------|
+| `INVALID_BODY` | 400 | The body is not valid JSON |
 | `MISSING_SHED` | 400 | Envelope missing `shed.name` |
-| `SHED_NOT_CONNECTED` | 404 | Target shed not connected |
+| `FORBIDDEN` | 403 | A service client or a script key; or the answer matches no pending request of this user (forged, replayed, already answered, another user's, or for a connection that is gone) |
+| `SOURCE_MACHINE_ID_REQUIRED` | 403 | As for subscribe |
+| `SOURCE_NOT_BOUND` | 403 | The machine is not the user's source, or no longer is (the binding moved since the request was sent) |
+| `SHED_NOT_CONNECTED` | 404 | The write into the shed failed part-way; not retryable |
+| `REQUEST_TOO_LARGE` | 413 | The body is over the guest framing limit |
+| `TOO_MANY_RESPONSES` | 429 | More than 8 answers in flight to this shed connection; with `Retry-After: 1` |
+| `RESPONSE_NOT_DELIVERED` | 503 | The shed did not take the answer within 5 s; nothing was written and the request is still answerable; with `Retry-After: 1` |
 
 ### GET /api/plugins/sheds
 
-Lists sheds with active message channels.
+Lists the caller's sheds with active message channels; an admin (and the
+implicit user) sees every user's. A service client's sheds never appear.
 
 **Response (200 OK):**
 
 ```json
 {
   "sheds": [
-    {"name": "my-dev", "backend": "vz", "server": "mini"}
+    {"name": "my-dev", "backend": "vz", "server": "my-server", "user": "alice"}
   ]
 }
 ```
+
+`user` is omitted for the implicit user and for a shed routed to nobody.

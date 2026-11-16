@@ -54,7 +54,8 @@ mounts:
 # to sessions or hooks), and never to a service client's sheds.
 env_file: ~/.shed/env
 
-# Identity directory: SSH host key, TLS cert, mtls client CA, GitHub key cache.
+# Identity directory: SSH host key, TLS cert, mtls client CA, GitHub key cache
+# and account pins (github_pins.json), the users upgrade marker.
 # Default /etc/shed as root, ~/.shed otherwise; set it for a second server on
 # the same host. See docs/reference/configuration.md#tls-and-network-surface
 # state_dir: /etc/shed
@@ -87,8 +88,8 @@ env_file: ~/.shed/env
 # Without auth.users every accepted key is one implicit user, an admin. With a
 # user list each key belongs to exactly one user, and each user reaches only
 # their own sheds; an admin may also list, stop and delete anyone's shed (never
-# enter it) and use what the host shares (host directories, server mounts, the
-# image store). auth.users replaces auth.ssh's key sources (authorized_keys,
+# enter another user's) and use what the host shares (host directories, server
+# mounts, images that are not the default or an alias, the image store). auth.users replaces auth.ssh's key sources (authorized_keys,
 # authorized_keys_file, github_users): set one or the other, not both.
 # A user needs a github login, a key, or both; at least one admin needs a
 # github login or a key not marked script. admin and script take true or false.
@@ -96,8 +97,11 @@ env_file: ~/.shed/env
 # once in the whole list. A GitHub login is pinned to its numeric account id at
 # its first fetch; github_id pins it from config instead.
 # expires is an RFC 3339 time or a date (the key works through that day, UTC).
-# A script key (script: true) cannot take a credentials certificate or use the
-# credential bus.
+# A script key (script: true) cannot take a credentials certificate, use the
+# credential bus, or see or move the user's credential source.
+# Write the whole list before the first start with it: on that start a server
+# with exactly one user gives that user every shed that has no user. See
+# docs/guides/multi-user-server.md.
 # auth:
 #   mode: mtls
 #   users:
