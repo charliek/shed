@@ -15,15 +15,19 @@ import (
 // listOnlyBackend is a Backend whose only working calls are the listings and
 // the assignment the start-up pass makes; it records the assignments and
 // lists the sheds as they are after them. failAssign makes every assignment
-// fail.
+// fail, failList every listing.
 type listOnlyBackend struct {
 	backend.Backend
 	sheds      []config.Shed
 	assigned   map[string]string
 	failAssign error
+	failList   error
 }
 
 func (b *listOnlyBackend) ListSheds(context.Context) ([]config.Shed, error) {
+	if b.failList != nil {
+		return nil, b.failList
+	}
 	return append([]config.Shed(nil), b.sheds...), nil
 }
 
@@ -148,5 +152,34 @@ func TestServeStampIsAOneTimeStep(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Errorf("no marker after the finished pass: %v", err)
+	}
+}
+
+// TestServeSeveralUsersRecordedBeforeListing: with several users nothing is
+// ever stamped, so the one-time step is recorded before anything is listed. A
+// first start with two users whose listing fails still records it; a later
+// start with one user stamps nothing, the legacy shed left for 'shed assign'.
+func TestServeSeveralUsersRecordedBeforeListing(t *testing.T) {
+	one, two, _ := wiringConfigs(t)
+	state := t.TempDir()
+	marker := filepath.Join(state, backend.UsersUpgradeFile)
+	be := newListOnlyBackend()
+
+	be.failList = errors.New("instance directory unreadable")
+	rep, up := stampUnassignedIn(two, be, state)
+	if !up.FirstUserListStart() || !rep.Incomplete {
+		t.Fatalf("test set-up: first start %v, report %+v; want a first start whose pass did not finish", up.FirstUserListStart(), rep)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("a first start with two users whose listing failed left no marker: %v", err)
+	}
+
+	be.failList = nil
+	rep, up = stampUnassignedIn(one, be, state)
+	if up.FirstUserListStart() {
+		t.Error("the start after a two-user first start was taken as a first start")
+	}
+	if len(be.assigned) != 0 || !reflect.DeepEqual(rep.Unassigned, []string{"legacy"}) {
+		t.Errorf("one user after an interrupted two-user start: assigned %v, report %+v; want nothing stamped", be.assigned, rep)
 	}
 }

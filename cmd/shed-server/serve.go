@@ -651,9 +651,10 @@ const upgradePassTimeout = 2 * time.Minute
 // directory (backend.OpenUsersUpgrade). With no user list it stamps nothing
 // and removes the marker. On the first start with a user list, with exactly
 // one user, it gives them every shed and snapshot with no user (and logs
-// each); with several it stamps nothing; either way the marker is written
-// once the pass has finished without a failure, and a pass that did not
-// finish runs again at the next start. On every later start nothing is
+// each), and the marker is written once the pass has finished without a
+// failure (a pass that did not finish runs again at the next start); with
+// several it stamps nothing, and the marker is written before the pass lists
+// anything, so a pass that then fails cannot lose it. On every later start nothing is
 // stamped. It logs how many sheds it found with no user, naming them when
 // log_level is debug. The returned UsersUpgrade carries the "first start
 // with a user list" decision for the other one-time steps of adding one.
@@ -671,8 +672,22 @@ func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir st
 	if cfg.LogLevel == "debug" {
 		debugf = func(format string, args ...any) { log.Printf("DEBUG: "+format, args...) }
 	}
+	// With several users nothing is ever stamped, so the step's outcome is
+	// known before any listing: it is recorded first, so a listing that then
+	// fails or times out (or a crash) cannot leave a later start, with fewer
+	// users, to take it as the first and stamp what was left unassigned on
+	// purpose. With one user it is recorded only once the pass has finished.
+	recordedFirst := false
+	if upgrade.FirstUserListStart() && len(users) > 1 {
+		if err := upgrade.MarkDone(time.Now()); err != nil {
+			log.Printf("Users: the one-time upgrade step for the user list (several users: nothing is given a user automatically) could not be recorded; it runs again at the next start: %v", err)
+		} else {
+			recordedFirst = true
+			log.Printf("Users: the one-time upgrade step for the user list is recorded (several users: nothing is given a user automatically); from now on a shed with no user is given one only by 'shed assign'")
+		}
+	}
 	rep := backend.StampUnassigned(ctx, be, users, upgrade.FirstUserListStart(), backend.UpgradeLog{Infof: log.Printf, Debugf: debugf})
-	if upgrade.FirstUserListStart() {
+	if upgrade.FirstUserListStart() && !recordedFirst {
 		switch {
 		case rep.Incomplete:
 			log.Printf("Users: the one-time upgrade step for the user list did not finish; it runs again at the next start")

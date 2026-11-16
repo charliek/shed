@@ -235,10 +235,11 @@ type UsersUpgrade struct {
 //     earlier start is removed, so a server that goes back to no user list
 //     and later adds one takes the step again (the way out for an operator
 //     who started with several users by mistake);
-//   - with a user list and no marker it is;
+//   - with a user list and no marker (no directory entry at all) it is;
 //   - with a user list and a marker it is not. A marker that cannot be read,
-//     does not parse, or has a schema version this build does not know is
-//     taken as "already done", never as "run again", and is logged.
+//     is not a regular file (a dangling symlink, a directory, a special
+//     file), does not parse, or has a schema version this build does not
+//     know is taken as "already done", never as "run again", and is logged.
 //
 // Every outcome is logged with logf.
 func OpenUsersUpgrade(stateDir string, userList bool, logf func(format string, args ...any)) *UsersUpgrade {
@@ -258,13 +259,24 @@ func OpenUsersUpgrade(stateDir string, userList bool, logf func(format string, a
 		}
 		return u
 	}
-	data, err := os.ReadFile(u.path)
+	// The directory entry itself decides "absent": an entry of any kind (a
+	// symlink whose target is gone, a directory, a special file) is a
+	// marker that is present, and is never read as a first start.
+	fi, err := os.Lstat(u.path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		u.first = true
 		logf("Users: first start with a user list (no marker at %s): running the one-time upgrade step", u.path)
 		return u
 	case err != nil:
+		logf("Users: the user-list upgrade marker %s cannot be read (%v); the one-time upgrade step is taken as done: nothing is given a user automatically, use 'shed assign'", u.path, err)
+		return u
+	case !fi.Mode().IsRegular():
+		logf("Users: the user-list upgrade marker %s is not a regular file (%s); the one-time upgrade step is taken as done: nothing is given a user automatically, use 'shed assign'", u.path, fi.Mode().Type())
+		return u
+	}
+	data, err := os.ReadFile(u.path)
+	if err != nil {
 		logf("Users: the user-list upgrade marker %s cannot be read (%v); the one-time upgrade step is taken as done: nothing is given a user automatically, use 'shed assign'", u.path, err)
 		return u
 	}

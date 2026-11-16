@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -570,20 +571,54 @@ func TestUsersUpgradeMarker(t *testing.T) {
 		})
 	}
 
-	t.Run("unreadable", func(t *testing.T) {
-		if err := os.Remove(path); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Mkdir(path, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = os.Remove(path) })
-		lines = nil
-		if u := OpenUsersUpgrade(dir, true, logf); u.FirstUserListStart() {
-			t.Error("an unreadable marker taken as a first start")
-		}
-		if !containsLine(lines, "cannot be read") {
-			t.Errorf("log %q", lines)
-		}
-	})
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// A directory entry of any kind at the marker's path is a marker that is
+	// present: it is never read as a first start, even when it cannot be
+	// read or names nothing (a symlink whose target is gone).
+	for _, tc := range []struct {
+		name, line string
+		make       func(t *testing.T)
+	}{
+		{"dangling symlink", "is not a regular file", func(t *testing.T) {
+			if err := os.Symlink(filepath.Join(dir, "gone"), path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"directory", "is not a regular file", func(t *testing.T) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"special file", "is not a regular file", func(t *testing.T) {
+			if err := syscall.Mkfifo(path, 0o600); err != nil {
+				t.Skipf("cannot make a FIFO here: %v", err)
+			}
+		}},
+		{"unreadable file", "cannot be read", func(t *testing.T) {
+			if os.Geteuid() == 0 {
+				t.Skip("root reads a file whatever its mode")
+			}
+			if err := os.WriteFile(path, []byte(`{"version": 1}`), 0o000); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(func() { _ = os.Remove(path) })
+			tc.make(t)
+			lines = nil
+			if u := OpenUsersUpgrade(dir, true, logf); u.FirstUserListStart() {
+				t.Errorf("a marker that is %s taken as a first start", tc.name)
+			}
+			if !containsLine(lines, tc.line) || !containsLine(lines, "taken as done") {
+				t.Errorf("log %q", lines)
+			}
+			if _, err := os.Lstat(path); err != nil {
+				t.Errorf("the marker entry is gone: %v", err)
+			}
+		})
+	}
 }

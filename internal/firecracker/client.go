@@ -977,13 +977,17 @@ func (c *Client) ListSheds(ctx context.Context) ([]config.Shed, error) {
 // could not read and skipped (each is logged; a shed deleted since the
 // directory was read is not counted).
 func (c *Client) listSheds(ctx context.Context) ([]config.Shed, int, error) {
-	names, err := ListInstances(c.cfg.InstanceDir)
+	names, unreadable, err := listInstancesCounting(c.cfg.InstanceDir)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	var sheds []config.Shed
 	skipped := 0
+	for _, u := range unreadable {
+		log.Printf("Warning: skipping shed %q: its metadata cannot be read: %v", u.name, u.err)
+		skipped++
+	}
 	for _, name := range names {
 		shed, err := c.GetShed(ctx, name)
 		if err != nil {

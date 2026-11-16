@@ -388,10 +388,13 @@ func TestAssignmentSyncFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
 		fileErr, dirErr error
-		recordUnchanged bool
+		// wantStored is the user visible on disk after the failure: none
+		// after a failed file sync (the rename never happened), the new
+		// user after a failed directory sync (the rename did).
+		wantStored string
 	}{
-		{"file sync", errors.New("file sync: I/O error"), nil, true},
-		{"directory sync", nil, errors.New("directory sync: I/O error"), false},
+		{"file sync", errors.New("file sync: I/O error"), nil, ""},
+		{"directory sync", nil, errors.New("directory sync: I/O error"), "bob"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, bridge, meta, tmpDir := runningLegacyShed(t)
@@ -403,8 +406,27 @@ func TestAssignmentSyncFailure(t *testing.T) {
 			if u, ok := bridge.ShedUser("box"); ok {
 				t.Errorf("the route moved to %q on a failed assignment", u)
 			}
-			if got, _ := LoadMetadata(tmpDir, "box"); tc.recordUnchanged && got.User != "" {
-				t.Errorf("stored user %q after a failed file sync", got.User)
+			got, err := LoadMetadata(tmpDir, "box")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.User != tc.wantStored {
+				t.Errorf("stored user %q after a failed %s, want %q", got.User, tc.name, tc.wantStored)
+			}
+			if tc.wantStored == "" {
+				return
+			}
+			// The owner visible on disk holds: an assignment to a different
+			// user is refused, under the lock, and writes nothing.
+			_, err = NewBackend(c).AssignUser(backend.WithRequiredCreatedAt(context.Background(), meta.CreatedAt), "box", config.AssignShedRequest{User: "alice"})
+			if !errors.Is(err, config.ErrShedAssignedSentinel) {
+				t.Errorf("assign to alice after a failed %s: %v, want already assigned", tc.name, err)
+			}
+			if got, _ := LoadMetadata(tmpDir, "box"); got.User != tc.wantStored {
+				t.Errorf("stored user %q after the refused assignment, want %q", got.User, tc.wantStored)
+			}
+			if u, ok := bridge.ShedUser("box"); ok {
+				t.Errorf("the route moved to %q on a refused assignment", u)
 			}
 		})
 	}
@@ -439,6 +461,45 @@ func TestListShedsCountsUnreadableRecords(t *testing.T) {
 	}
 	if len(sheds) != 1 || sheds[0].Name != "legacy" || unreadable != 1 {
 		t.Errorf("listed %d sheds, %d unreadable; want legacy and 1", len(sheds), unreadable)
+	}
+	var lines []string
+	rep := backend.StampUnassigned(context.Background(), NewBackend(c), []backend.UpgradeUser{{Name: "root", Admin: true}, {Name: "bob"}}, true,
+		backend.UpgradeLog{Infof: func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) }})
+	if rep.UnreadableSheds != 1 || !strings.Contains(strings.Join(lines, "\n"), "1 shed record(s) could not be read") {
+		t.Errorf("report %+v, log %q", rep, lines)
+	}
+}
+
+// A shed directory whose metadata file cannot even be looked at (here: no
+// search permission on the directory, so its Stat fails with something other
+// than not-exist) is counted as unreadable by the listing the start-up pass
+// uses, not dropped. A directory with no metadata file is still not a shed
+// and is not counted.
+func TestListShedsCountsUnstattableRecords(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root is not held back by directory permissions")
+	}
+	c, cfg := newSnapshotUserClient(t)
+	legacyShed(t, c, cfg, "legacy", nil)
+	legacyShed(t, c, cfg, "locked", nil)
+	if err := os.MkdirAll(InstanceDir(cfg.InstanceDir, "no-metadata"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	locked := InstanceDir(cfg.InstanceDir, "locked")
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if _, err := os.Stat(MetadataPath(cfg.InstanceDir, "locked")); err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("test set-up: the locked shed's metadata Stat gave %v, want a failure other than not-exist", err)
+	}
+
+	sheds, unreadable, err := NewBackend(c).ListShedsCounting(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sheds) != 1 || sheds[0].Name != "legacy" || unreadable != 1 {
+		t.Errorf("listed %d sheds, %d unreadable; want legacy and 1 (the locked shed)", len(sheds), unreadable)
 	}
 	var lines []string
 	rep := backend.StampUnassigned(context.Background(), NewBackend(c), []backend.UpgradeUser{{Name: "root", Admin: true}, {Name: "bob"}}, true,

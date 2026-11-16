@@ -328,23 +328,44 @@ func validateInstanceName(name string) error {
 
 // ListInstances returns the names of all instances in the instance directory.
 func ListInstances(instanceDir string) ([]string, error) {
+	names, _, err := listInstancesCounting(instanceDir)
+	return names, err
+}
+
+// unreadableInstance is an instance directory whose metadata file could not
+// be looked at for a reason other than its not existing.
+type unreadableInstance struct {
+	name string
+	err  error
+}
+
+// listInstancesCounting is ListInstances that also returns the instance
+// directories it left out because their metadata file could not be looked
+// at (a Stat that failed with anything other than not-exist: no search
+// permission on the directory, an I/O error). A directory with no metadata
+// file is left out and not returned.
+func listInstancesCounting(instanceDir string) ([]string, []unreadableInstance, error) {
 	entries, err := os.ReadDir(instanceDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("failed to read instance directory: %w", err)
+		return nil, nil, fmt.Errorf("failed to read instance directory: %w", err)
 	}
 
 	var names []string
+	var unreadable []unreadableInstance
 	for _, entry := range entries {
 		if entry.IsDir() {
 			metaPath := MetadataPath(instanceDir, entry.Name())
-			if _, err := os.Stat(metaPath); err == nil {
+			switch _, err := os.Stat(metaPath); {
+			case err == nil:
 				names = append(names, entry.Name())
+			case !errors.Is(err, os.ErrNotExist):
+				unreadable = append(unreadable, unreadableInstance{name: entry.Name(), err: err})
 			}
 		}
 	}
 
-	return names, nil
+	return names, unreadable, nil
 }

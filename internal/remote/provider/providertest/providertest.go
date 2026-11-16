@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -869,5 +870,41 @@ func testClaimLabel(t *testing.T, h Harness) {
 		if err := p.ClaimLabel(ctx, ref, k, "changed1"); !errors.Is(err, provider.ErrInvalid) {
 			t.Errorf("ClaimLabel(%s) = %v, want ErrInvalid", k, err)
 		}
+	}
+
+	// An empty key is not a label: refused, nothing written.
+	before, err := p.Get(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ClaimLabel(ctx, ref, "", "bob"); !errors.Is(err, provider.ErrInvalid) {
+		t.Errorf("ClaimLabel(empty key) = %v, want ErrInvalid", err)
+	}
+	if got, _ := p.Get(ctx, ref); !maps.Equal(got.Labels, before.Labels) {
+		t.Errorf("labels after a refused empty-key claim: %v, was %v", got.Labels, before.Labels)
+	}
+
+	// An instance takes at most 64 labels: filled to 64, a claim that would
+	// add a 65th is refused and writes nothing.
+	_, full := mustCreate(t, h, p, "iota")
+	fill := map[string]string{}
+	for i := len(full.Labels); i < 64; i++ {
+		fill[fmt.Sprintf("fill-%02d", i)] = "x"
+	}
+	if err := p.SetLabels(ctx, full.Ref, fill); err != nil {
+		t.Fatalf("SetLabels(to 64): %v", err)
+	}
+	if got, _ := p.Get(ctx, full.Ref); len(got.Labels) != 64 {
+		t.Fatalf("test set-up: %d labels, want 64", len(got.Labels))
+	}
+	const extra = "claimed-extra"
+	if _, ok := full.Labels[extra]; ok {
+		t.Fatalf("test set-up: the instance already has label %s", extra)
+	}
+	if err := p.ClaimLabel(ctx, full.Ref, extra, "bob"); !errors.Is(err, provider.ErrInvalid) {
+		t.Errorf("ClaimLabel(a 65th label) = %v, want ErrInvalid", err)
+	}
+	if got, _ := p.Get(ctx, full.Ref); len(got.Labels) != 64 || got.Labels[extra] != "" {
+		t.Errorf("after a refused 65th-label claim: %d labels, %s=%q", len(got.Labels), extra, got.Labels[extra])
 	}
 }

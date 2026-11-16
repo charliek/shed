@@ -361,6 +361,75 @@ func TestAssignUserRouteUsableAtReturn(t *testing.T) {
 	}
 }
 
+// Reconciliation records the new user between the label claim and
+// AssignUser's re-check under the lock (forced: a sweep in the hook reads the
+// label). That read holds the route and leaves it to the shed's bus-route
+// worker, which is held here; AssignUser finds the user already recorded and
+// must still make the route usable before it returns: a request published
+// straight after the return reaches the new user's listener, with no wait.
+func TestAssignUserRouteUsableWhenReconcileRecordedFirst(t *testing.T) {
+	// Registered first so they run last, once Close has joined every worker.
+	t.Cleanup(func() { busSyncHook, assignLabelledHook = nil, nil })
+	reg := plugin.NewRegistry()
+	bridge := plugin.NewBridge(reg, true)
+	e := newEnv(t, func(e *env, _ *fake.Options) { e.tune = func(o *Options) { o.Bridge = bridge } })
+	e.createFor("box", "")
+	e.idle()
+	bobs, err := reg.Register(plugin.ListenerKey{User: "bob", Namespace: "ssh-agent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	held := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock) // runs before Close, so Close never waits on the hook
+	busSyncHook = func(name string) {
+		if name == "box" {
+			held <- struct{}{}
+			<-release
+		}
+	}
+	reconciled := false
+	assignLabelledHook = func(name string) {
+		e.sweep()
+		reconciled = e.userOf(name) == "bob"
+	}
+
+	if _, err := e.assign("box", "bob"); err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+	if !reconciled {
+		t.Fatal("test set-up: the sweep in the window did not record bob from the label, so the branch under test was not reached")
+	}
+	publishNow(t, bridge, "box", "ssh-agent")
+	select {
+	case m := <-bobs.Messages:
+		if env := bobs.Take(m); env == nil || env.Shed == nil || env.Shed.Name != "box" {
+			t.Fatalf("bob's listener was handed %+v, want box's request", env)
+		}
+	default:
+		t.Fatal("a request published as AssignUser returned did not reach the new user's listener (reconciliation recorded the user first)")
+	}
+	if u, ok := bridge.ShedUser("box"); !ok || u != "bob" {
+		t.Errorf("box routes to (%q, %v) at the return, want bob", u, ok)
+	}
+
+	// The worker the sweep scheduled stopped at the hook before applying
+	// anything; checked after the publish that it did get there.
+	select {
+	case <-held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the shed's bus-route worker never ran, so the test proved nothing about it")
+	}
+	unblock()
+	e.idle()
+	if u, ok := bridge.ShedUser("box"); !ok || u != "bob" {
+		t.Errorf("box routes to (%q, %v) after the worker, want bob", u, ok)
+	}
+}
+
 // openSecond opens another Backend over the same cloud (the fake provider)
 // with its own state directory: a second server on the same environment. It
 // adopts every shed from its labels.

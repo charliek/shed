@@ -51,7 +51,10 @@ var (
 // the new user before AssignUser returns: the change holds the route at
 // once (busUserChangedLocked) and AssignUser then applies the user itself
 // and lifts the hold (applyBusRoute), without waiting for the shed's
-// bus-route worker.
+// bus-route worker. It does so on every successful return, including when
+// a read of the instance (reconciliation) recorded the user between the
+// label claim and the re-check: that read held the route too, and left it
+// to the worker.
 func (b *Backend) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
 	if err := b.checkReady(); err != nil {
 		return nil, err
@@ -101,7 +104,6 @@ func (b *Backend) AssignUser(ctx context.Context, name string, req config.Assign
 		b.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s (deleted while it was being assigned)", config.ErrShedNotFoundSentinel, name)
 	}
-	moved := false
 	if _, user := ownership(r); user != req.User {
 		// A read of the instance may have taken the label's user already.
 		if err := backend.CheckAssignable(b.shedOf(r), req); err != nil {
@@ -111,13 +113,13 @@ func (b *Backend) AssignUser(ctx context.Context, name string, req config.Assign
 		r.Shed.User = req.User
 		b.saveLocked(r)
 		b.busUserChangedLocked(r)
-		moved = true
 	}
 	shed := b.shedOf(r)
 	b.mu.Unlock()
-	if moved {
-		b.applyBusRoute(name)
-	}
+	// On every successful return, also when a read of the instance recorded
+	// the user first (it held the route and left it to the shed's worker,
+	// which may not have run yet): the route is usable when this returns.
+	b.applyBusRoute(name)
 	b.logf("remote: shed %s assigned to user %s", name, req.User)
 	return shed, nil
 }
