@@ -184,7 +184,8 @@ ssh:
 | `ssh.offer_keys` | none: every key the backend holds is offered | A list; `[]` offers no key. Each entry a SHA256 fingerprint as `ssh-keygen -l` and `ssh-add -l` print it, or an OpenSSH public key line (as in a `.pub` file or `ssh-add -L`). A key line for a certificate, an `sk-` key, a DSA key or an invalid key fails config load. |
 
 Both settings are machine-wide: they apply to every server and shed the broker answers for.
-An invalid setting fails the daemon's config load (exit 1, `invalid config: …`); the
+An invalid setting fails the daemon's config load (exit 1, logged as
+`failed to load config path=… error=…`); the
 desktop app's embedded broker fails closed instead (see
 [Desktop architecture](../desktop/architecture.md#the-embedded-credential-broker)).
 

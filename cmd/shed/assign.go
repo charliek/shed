@@ -15,9 +15,10 @@ var assignCmd = &cobra.Command{
 	Long: `Give a shed that has no user to one of the server's users (auth.users).
 
 Sheds made before a server had a user list have no user. On a server with
-exactly one user they become that user's when the server starts; on a server
-with several, only an admin can see, stop and delete them, and nobody can
-enter them, until an admin assigns each one here.
+exactly one user they become that user's the first time the server starts with
+a user list, and only that time. On a server with several users, only an admin
+can see, stop and delete them, and nobody can enter them, until an admin
+assigns each one here.
 
 Only a shed with no user and no service client can be assigned: a shed is
 never moved between users. A shed that mounts host directories (--local-dir,
