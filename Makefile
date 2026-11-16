@@ -131,7 +131,10 @@ test-machine-transport:
 # Setup (one-time per developer), after the first `make dev-server-up`:
 #   shed server add localhost --ssh-port 12222 --name $(SHED_VZ_DEV_SERVER)
 #   (first contact is over SSH and enrols an mtls client certificate; see
-#   CLAUDE.md or tests/integration/README.md).
+#   CLAUDE.md or tests/integration/README.md). The dev server keeps its
+#   identity in its own state_dir (~/.shed/dev/state), not the brew server's
+#   ~/.shed; dev-server-up says when a start made a new one and how to re-add
+#   the entry.
 #
 # Why no launchd plist:
 #   The dev server is intentionally ephemeral — no auto-restart on
@@ -162,9 +165,11 @@ DEV_CONFIG   := $(CURDIR)/configs/server.dev-parallel.mac.yaml
 #   export SHED_DEV_STATE_DIR=/Volumes/miniext/shed-dev/vz
 #
 # socket_dir is deliberately NOT relocated (unix socket path length limits) —
-# see scripts/render-dev-config.sh. The volume must be mounted; dev-server-up
-# refuses to start otherwise rather than silently building a second, empty
-# image store on the mount point.
+# see scripts/render-dev-config.sh — and neither is the dev server's identity
+# directory (state_dir: ~/.shed/dev/state in $(DEV_CONFIG): host key, TLS
+# certificate, client CA, upgrade marker, pins). The volume must be mounted;
+# dev-server-up refuses to start otherwise rather than silently building a
+# second, empty image store on the mount point.
 SHED_DEV_STATE_DIR ?=
 
 # OPTIONAL: start a dev server with the integration suite's itest user list
@@ -385,6 +390,26 @@ dev-server-up: check-dev-settings build
 	fi
 	@echo "  Log:     $(DEV_LOG_PATH)"
 	@echo "  CLI:     shed -s $(SHED_VZ_DEV_SERVER) list"
+	@# Its identity directory (the config's own state_dir, never the brew
+	@# server's ~/.shed), as the server logged it. A start that made a new SSH
+	@# host key there (its first start in that directory) also made a new TLS
+	@# certificate and client CA, so a CLI entry added before no longer
+	@# matches: say how to re-add that one entry. Nothing here edits
+	@# ~/.shed/config.yaml or ~/.shed/known_hosts.
+	@STATE=$$(sed -n 's/.*State dir: //p' "$(DEV_LOG_PATH)" 2>/dev/null | head -n 1); \
+	if [ -n "$$STATE" ]; then echo "  Identity: $$STATE (host key, TLS certificate, client CA, pins)"; fi; \
+	if grep -qF 'Generated new host key:' "$(DEV_LOG_PATH)" 2>/dev/null; then \
+	  echo ""; \
+	  echo "NOTE: this start made a new SSH host key in $${STATE:-the dev server's state directory}"; \
+	  echo "  (on a first start there, a new TLS certificate and client CA too). A"; \
+	  echo "  $(SHED_VZ_DEV_SERVER) entry added before this no longer matches it. Remove only that"; \
+	  echo "  entry and its host key line, then add it again:"; \
+	  echo "    shed server remove $(SHED_VZ_DEV_SERVER)"; \
+	  echo "    ssh-keygen -R '[localhost]:12222' -f ~/.shed/known_hosts"; \
+	  echo "    shed server add localhost --ssh-port 12222 --name $(SHED_VZ_DEV_SERVER)"; \
+	  echo "  Leave every other entry, and default_server, alone. With no entry yet, only the add."; \
+	  echo ""; \
+	fi
 	@echo "Run 'make test-integration-dev' to run the suite against it."
 
 dev-server-down:
@@ -444,6 +469,8 @@ dev-server-status:
 	  fi; \
 	  echo "Log:        $(DEV_LOG_PATH)"; \
 	  echo "Config:     $(DEV_CONFIG)"; \
+	  STATE=$$(sed -n 's/.*State dir: //p' "$(DEV_LOG_PATH)" 2>/dev/null | head -n 1); \
+	  if [ -n "$$STATE" ]; then echo "Identity:   $$STATE"; fi; \
 	  if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
 	    echo "State dir:  $(SHED_DEV_STATE_DIR) (SHED_DEV_STATE_DIR now in effect)"; \
 	  fi; \

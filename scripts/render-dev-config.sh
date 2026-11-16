@@ -34,6 +34,12 @@
 #               confusing mid-run socket error. The brew shed-server on this
 #               developer's machine is configured the same way.
 #
+#               The server's identity directory (state_dir: host key, TLS
+#               certificate, client CA, upgrade marker, pins) is NOT
+#               relocated either: the base's state_dir is carried through
+#               unchanged, so identity material never follows the image store
+#               onto another volume.
+#
 # --users       SHED_DEV_USERS=itest. Gives the server the integration suite's
 #               itest user list (auth.users): itest-admin, itest-alice and
 #               itest-bob, with keys generated once under DIR (the suite's

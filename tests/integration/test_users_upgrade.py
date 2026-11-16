@@ -10,7 +10,10 @@ start with a user list:
 
 The step runs once (`<state_dir>/users-upgrade.json`), so cutting a list
 from two users to one later hands nobody the unassigned sheds. A start with
-no user list removes the marker.
+no user list removes the marker. The Mac dev server's `state_dir` is its own
+(`~/.shed/dev/state`, read from the committed config), never the installed
+server's `~/.shed`: the cases check that the marker appears and goes there,
+and that `~/.shed/users-upgrade.json` is not created, changed or removed.
 
 These cases restart a server with another config, which the suite can do
 only to the Mac dev server (`devcontrol.dev_config()`, which always restores
@@ -34,11 +37,12 @@ from __future__ import annotations
 import json
 import sys
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import pytest
 
-from fixtures.devcontrol import assert_dev_target, dev_config
+from fixtures.devcontrol import USERS_UPGRADE_FILE, assert_dev_target, dev_config, dev_state_dir, installed_state_dirs
 from fixtures.identity import ADMIN, ALICE, BOB, DEV_USER, users_environment, with_itest_users
 from fixtures.tlsclient import error_code
 
@@ -88,6 +92,23 @@ def _user_of(server, name: str) -> Optional[str]:
     return found[0].get("user") or None
 
 
+def _dev_marker() -> Path:
+    """The Mac dev server's upgrade marker, in the state_dir of the config it
+    runs (the committed base, and every dev_config() detour, which keeps it)."""
+    return dev_state_dir() / USERS_UPGRADE_FILE
+
+
+def _installed_marker() -> Optional[tuple[int, int, bytes]]:
+    """The installed server's marker (`~/.shed/users-upgrade.json`) as it is
+    now: (mtime, size, content), or None when there is none. Read only."""
+    path = installed_state_dirs()[0] / USERS_UPGRADE_FILE
+    try:
+        st = path.stat()
+        return st.st_mtime_ns, st.st_size, path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
 def _only(names):
     """A dev_config transform: the itest user list with only `names` beside
     the developer's own user `dev`."""
@@ -102,10 +123,17 @@ def test_a_one_user_list_gives_that_user_the_sheds_that_had_none(vz_server_dev):
         _create(server, plain, mounts="none")
         _create(server, mounted, mounts=None)  # every server mount: an admin's shed
         assert _user_of(server, plain) is None and _user_of(server, mounted) is None
+        installed = _installed_marker()
         # The only user is the developer's `dev`, an admin: both become theirs.
         with dev_config({}, server.name, transform=_only([])):
             assert _user_of(server, plain) == DEV_USER
             assert _user_of(server, mounted) == DEV_USER
+            # The step is recorded in the dev server's own state directory.
+            assert _dev_marker().is_file(), f"no upgrade marker at {_dev_marker()}"
+        # Back on the base (no user list): that start removed it, and the
+        # installed server's marker was never touched.
+        assert not _dev_marker().exists(), f"{_dev_marker()} outlived a start with no user list"
+        assert _installed_marker() == installed, "the dev server changed the installed server's upgrade marker"
     finally:
         _cleanup(server, plain, mounted)
 
@@ -116,13 +144,18 @@ def test_cutting_the_list_to_one_user_later_hands_out_nothing(vz_server_dev):
     name = f"itest-uu2-{uuid.uuid4().hex[:6]}"
     try:
         _create(server, name, mounts="none")
+        installed = _installed_marker()
         with dev_config({}, server.name, transform=_only([ALICE])):
-            # Two users (dev, itest-alice): nothing is stamped.
+            # Two users (dev, itest-alice): nothing is stamped, and the step
+            # is recorded in the dev server's own state directory.
             assert _user_of(server, name) is None
+            assert _dev_marker().is_file(), f"no upgrade marker at {_dev_marker()}"
             # Straight from two users to one (no start without a list in
             # between, which would remove the marker): still nobody's.
             with dev_config({}, server.name, transform=_only([])):
                 assert _user_of(server, name) is None
+        assert not _dev_marker().exists(), f"{_dev_marker()} outlived a start with no user list"
+        assert _installed_marker() == installed, "the dev server changed the installed server's upgrade marker"
     finally:
         _cleanup(server, name)
 

@@ -438,6 +438,102 @@ def test_render_state_dir_relocates_only_the_blob_dirs(tmp_path):
     assert got["vz"]["instance_dir"] == "/Volumes/ext/shed-dev/vz/instances"
 
 
+# ----------------------------------------------------------------------------
+# The Mac dev server's own identity directory (state_dir). Without one it
+# resolves shed-server's default, ~/.shed: the brew-installed server's host
+# key, TLS pin, client CA, upgrade marker and pins (C28).
+# ----------------------------------------------------------------------------
+
+
+def test_mac_dev_config_keeps_its_identity_in_its_own_state_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _load_yaml(MAC_DEV_CONFIG)
+    raw = cfg.get("state_dir")
+    assert raw, "the Mac dev config names no state_dir: it would share the brew server's ~/.shed"
+    # What config load accepts (internal/config/server.go: validateStateDir).
+    assert raw.startswith("~/") or raw.startswith("/"), raw
+    got = dc.dev_state_dir(cfg, environ={})
+    # In the dev targets' scratch area, beside the log and the pid file.
+    assert got == tmp_path / ".shed" / "dev" / "state"
+    assert got != tmp_path / ".shed"
+    # Not inside any blob directory SHED_DEV_STATE_DIR relocates.
+    for key in ("images_dir", "instance_dir", "snapshots_dir", "uppers_dir"):
+        blob = Path(dc._go_expand(cfg["vz"][key]))
+        assert blob != got and blob not in got.parents, (key, blob, got)
+    # dev_config() and run_preflight() check the merged base the same way.
+    assert dc.dev_state_dir(environ={}) == got
+
+
+def _render_state_dir_args(tmp_path: Path, which: str, keys_dir: Optional[Path]) -> tuple[list[str], dict]:
+    relocated = str(tmp_path / "ext" / "shed-dev" / "vz")
+    args = {"state-dir": ["--state-dir", relocated], "users": ["--users", str(keys_dir)],
+            "both": ["--state-dir", relocated, "--users", str(keys_dir)]}[which]
+    return args, ({"SHED_DEV_STATE_DIR": relocated} if "--state-dir" in args else {})
+
+
+@pytest.mark.parametrize("which", ["state-dir", "users", "both"])
+def test_the_rendered_mac_config_keeps_its_state_dir(monkeypatch, tmp_path, which):
+    # Every config the Makefile renders for the Mac dev server (with
+    # SHED_DEV_STATE_DIR, SHED_DEV_USERS=itest, or both) keeps the base's
+    # identity directory, and it is not moved with the blob directories.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    keys = None
+    if which != "state-dir":
+        if shutil.which("uv") is None or shutil.which("ssh-keygen") is None:
+            pytest.skip("uv and ssh-keygen are needed for --users")
+        keys = ident.ensure_keys(tmp_path / "keys")
+    args, environ = _render_state_dir_args(tmp_path, which, keys)
+    r = _render(tmp_path, MAC_DEV_CONFIG, *args)
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = _load_yaml(tmp_path / "out.yaml")
+    assert got.get("state_dir") == _load_yaml(MAC_DEV_CONFIG)["state_dir"]
+    state = dc.dev_state_dir(got, environ=environ)
+    assert state == tmp_path / ".shed" / "dev" / "state"
+    if environ:
+        assert got["vz"]["images_dir"] == environ["SHED_DEV_STATE_DIR"]  # the blobs did move
+
+
+@pytest.mark.parametrize(
+    "state_dir, environ, match",
+    [
+        (None, {}, "names no state_dir"),
+        ("", {}, "names no state_dir"),
+        ("~/.shed", {}, "installed server"),
+        ("~/.shed/", {}, "installed server"),
+        ("{home}/.shed", {}, "installed server"),
+        ("/etc/shed", {}, "installed server"),
+        ("dev/state", {}, "not absolute"),
+        ("~/Library/Application Support/shed-dev/vz/state", {}, "inside the blob directory"),
+        ("/Volumes/ext/shed-dev/vz/state", {"SHED_DEV_STATE_DIR": "/Volumes/ext/shed-dev/vz/"}, "inside the blob"),
+        ("/Volumes/ext/shed-dev/vz", {"SHED_DEV_STATE_DIR": "/Volumes/ext/shed-dev/vz"}, "inside the blob"),
+    ],
+    ids=["missing", "empty", "home-shed", "home-shed-slash", "home-shed-absolute", "etc-shed", "relative",
+         "under-images-dir", "under-relocated-blobs", "is-relocated-blobs"],
+)
+def test_dev_state_dir_refuses_the_installed_servers_and_the_blob_dirs(monkeypatch, tmp_path, state_dir, environ,
+                                                                         match):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _load_yaml(MAC_DEV_CONFIG)
+    if state_dir is None:
+        cfg.pop("state_dir", None)
+    else:
+        cfg["state_dir"] = state_dir.format(home=tmp_path)
+    with pytest.raises(RuntimeError, match=match):
+        dc.dev_state_dir(cfg, environ=environ)
+
+
+def test_dev_state_dir_accepts_a_relocated_store_elsewhere(monkeypatch, tmp_path):
+    # The control for the cases above: blobs on another volume, identity at home.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _load_yaml(MAC_DEV_CONFIG)
+    assert dc.dev_state_dir(cfg, environ={"SHED_DEV_STATE_DIR": "/Volumes/ext/shed-dev/vz"}) == \
+        tmp_path / ".shed" / "dev" / "state"
+    # A sibling whose name only starts like a blob directory is not inside it.
+    cfg["state_dir"] = "/Volumes/ext/shed-dev/vz-identity"
+    assert dc.dev_state_dir(cfg, environ={"SHED_DEV_STATE_DIR": "/Volumes/ext/shed-dev/vz"}) == \
+        Path("/Volumes/ext/shed-dev/vz-identity")
+
+
 @pytest.mark.parametrize(
     "args", [[], ["--token"], ["--mtls"], ["--token", "--state-dir", "/x"]],
     ids=["no-override", "removed-token-flag", "removed-mtls-flag", "token-beside-state-dir"],
@@ -529,6 +625,28 @@ def test_dev_config_refuses_a_production_port_before_any_restart(monkeypatch, tm
         with dc.dev_config({"ssh_port": 2222}, "my-server-dev"):
             pass
     assert calls["restarts"] == [] and calls["waits"] == []
+
+
+@pytest.mark.parametrize("override", [{"state_dir": "~/.shed"}, {"state_dir": ""}], ids=["installed", "none"])
+def test_dev_config_refuses_the_installed_servers_state_dir_before_any_stop(monkeypatch, tmp_path, override):
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with pytest.raises(RuntimeError, match="installed server"):
+        with dc.dev_config(override, "my-server-dev"):
+            pytest.fail("the detour ran")
+    assert calls["events"] == [] and calls["waits"] == []
+
+
+def test_run_preflight_refuses_the_installed_servers_state_dir(monkeypatch, tmp_path):
+    # Refused before anything is written or launched.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(dc, "SHED_SERVER_BIN", Path("/bin/true"))
+    monkeypatch.setattr(dc, "PREFLIGHT_CONFIG_TMP", tmp_path / "preflight.yaml")
+    launched = []
+    monkeypatch.setattr(dc.subprocess, "Popen", lambda *a, **k: launched.append(a) or pytest.fail("launched"))
+    with pytest.raises(RuntimeError, match="installed server"):
+        dc.run_preflight({"state_dir": "~/.shed"})
+    assert launched == [] and not (tmp_path / "preflight.yaml").exists()
 
 
 # ----------------------------------------------------------------------------
@@ -1997,6 +2115,65 @@ def test_the_dev_targets_start_with_the_config_they_rendered(tmp_path):
                     "dev-server-up-remote": f"{home}/.shed/dev-remote/server.yaml"}[target]
             assert config == want, (target, users, calls)
             assert Path(config).stat().st_size > 0
+
+
+# A stand-in shed-server that comes up the way the probe wants it (two
+# loopback listeners logged, the readiness line) and stays up, logging its
+# state directory and, with NEW_HOST_KEY set, the line serve logs when it
+# makes a host key (internal/sshd/server.go).
+_LISTENING_SERVER_STUB = """#!{python}
+import os, socket, sys, time
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write("shed-server " + " ".join(sys.argv[1:]) + "\\n")
+socks = []
+for _ in range(2):
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(8)
+    socks.append(s)
+state = os.environ["HOME"] + "/.shed/dev/state"
+print("State dir: " + state)
+if os.environ.get("NEW_HOST_KEY"):
+    print("Generated new host key: " + state + "/host_key")
+print("HTTPS server listening on 127.0.0.1:%d" % socks[0].getsockname()[1])
+print("SSH server listening on 127.0.0.1:%d" % socks[1].getsockname()[1])
+print("Shed server is ready")
+sys.stdout.flush()
+time.sleep(90)
+"""
+
+
+@pytest.mark.parametrize("new_key", [True, False], ids=["new-host-key", "existing-host-key"])
+def test_mac_dev_server_up_names_its_identity_and_says_when_to_re_add(tmp_path, new_key):
+    import sys
+
+    stubs = _render_stubs(tmp_path, darwin=True)
+    server = tmp_path / "stubs" / "shed-server"
+    server.write_text(_LISTENING_SERVER_STUB.format(python=sys.executable))
+    server.chmod(0o755)
+    pid_file = tmp_path / "home" / ".shed" / "dev" / "server.pid"
+    try:
+        r, calls = _make_with_stubs(tmp_path, "dev-server-up", *stubs,
+                                    env_extra={"NEW_HOST_KEY": "1" if new_key else ""})
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text().strip()), 9)
+            except (ValueError, ProcessLookupError):
+                pass
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert [c for c in calls if c.startswith("shed-server serve --config ")], calls
+    state = f"{tmp_path}/home/.shed/dev/state"
+    assert f"Identity: {state}" in out, out
+    hint = f"NOTE: this start made a new SSH host key in {state}"
+    if new_key:
+        assert hint in out, out
+        for line in ("shed server remove my-server-dev", "ssh-keygen -R '[localhost]:12222' -f ~/.shed/known_hosts",
+                     "shed server add localhost --ssh-port 12222 --name my-server-dev"):
+            assert line in out, (line, out)
+    else:
+        assert "NOTE:" not in out and "shed server remove" not in out, out
 
 
 @pytest.mark.parametrize(

@@ -79,7 +79,7 @@ tests they would have run, not the whole session.
 | `SHED_FC_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev FC shed-server (alongside the deb one on a different port). When unset, the `fc_server_dev` fixture skips cleanly. Set by `make test-integration-dev-fc`. |
 | `SHED_FC_DEV_LOG_PATH` | _unset_                                            | Path on the FC remote where the parallel dev shed-server writes its log file. Required when `SHED_FC_DEV_SERVER` is set; the fixture reads it via `ssh + sudo -n tail -c +N` (offset-based) because the dev server runs as root via `sudo nohup` and is not under systemd. |
 | `SHED_FC_LOG_PATH`     | _unset_ (uses journald)                            | Remote file path for the prod `fc_server` fixture to read logs from. When set, the fixture uses `ssh + sudo -n tail -c +N` against this file instead of journalctl. `make test-integration-dev-fc` sets this to the dev FC server's log file so the existing `shed_server`-using tests find PhaseTimer lines (the dev server isn't under systemd). |
-| `SHED_DEV_STATE_DIR`   | _unset_                                             | **Per-machine, optional.** Relocates the Mac dev server's blob-heavy state dirs (images/instances/snapshots/uppers) under this path, for a boot volume too small for a multi-GB dev image store. Unset = the committed default under `~/Library/Application Support/shed-dev/vz`. `socket_dir` stays local. `dev-server-up` refuses to start if it is unmounted/unwritable. |
+| `SHED_DEV_STATE_DIR`   | _unset_                                             | **Per-machine, optional.** Relocates the Mac dev server's blob-heavy state dirs (images/instances/snapshots/uppers) under this path, for a boot volume too small for a multi-GB dev image store. Unset = the committed default under `~/Library/Application Support/shed-dev/vz`. `socket_dir` stays local, and so does the identity directory (`~/.shed/dev/state`). `dev-server-up` refuses to start if it is unmounted/unwritable. |
 | `SHED_IMAGE_HAS_ROOST` | _unset_                                            | Gates `test_smoke.py::test_roost_session_baked` — a comma list of the backends (`vz`, `fc`) whose `extensions` image was rebuilt with roost-session baked in. `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the other backend still boots the published image); unset for plain `test-integration` (images built before 0.9.0 carry no roost-session). Overrides `SHED_ROOST_SESSION_VERSION`/`SHED_ROOST_SESSION_PROTOCOL` (default `0.0.21`/`6`) let the test track a future bump. |
 | `SHED_IMAGE_HAS_CRAZE` | _unset_                                            | Gates `test_smoke.py::test_craze_baked` — a comma list of the backends (`vz`, `fc`) whose `extensions` image was rebuilt with craze baked in. `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the other backend still boots the published image); unset for plain `test-integration` (published images bake their release's craze, 0.9.0: 0.1.0, and the test asserts the pinned version). `SHED_CRAZE_VERSION` overrides the default, which the test reads from `craze-pin.env`'s `CRAZE_RELEASE` via `scripts/release/read-craze-pin.sh`. |
 | `SHED_REMOTE_SERVER`   | _unset_                                            | Entry name for a shed-server running `default_backend: remote`. When unset every `[remote]` case skips. Set by `make test-integration-remote` (default `remote-dev`). |
@@ -264,7 +264,8 @@ to `~/.shed/dev/server.log` with PID tracked at
 (crashes should be visible), no survives-reboot (re-up after reboot is
 one command). State-dirs are isolated under
 `~/Library/Application Support/shed-dev/vz/` so `shed image prune`
-from the brew server never touches dev blobs.
+from the brew server never touches dev blobs, and its identity lives in its
+own `~/.shed/dev/state` (see **Coexistence** below).
 
 The dev server's `SHED_BUILD_TOOLS_REF` is set inline to the latest
 release tag so the dev binary uses release-shaped upper-template
@@ -295,10 +296,29 @@ not auto-start a possibly-stale binary. The PID-file lifecycle gives
 us start / stop / restart semantics with zero Apple-specific machinery.
 
 **Coexistence:** brew shed-server on port 8080/2222 + dev shed-server
-on port 18443/12222. Both run simultaneously. The SSH host key
-(`~/.shed/host_key`) is shared between them; the CLI's
-`~/.shed/known_hosts` keys by `host:port` so each entry's
-fingerprint is recorded independently.
+on port 18443/12222. Both run simultaneously. Each has its own identity
+directory: the brew server's is `~/.shed`, the dev server's is
+`state_dir: ~/.shed/dev/state` (in `configs/server.dev-parallel.mac.yaml`),
+which holds its SSH host key, TLS certificate and key, mtls client CA,
+user-list upgrade marker (`users-upgrade.json`), GitHub account-id pins
+(`github_pins.json`) and GitHub key cache. So no dev or test run writes the
+brew server's identity, marker or pins; `SHED_DEV_STATE_DIR` does not move
+it, and `fixtures/devcontrol.py` refuses (`dev_state_dir()`) to start a dev
+config whose `state_dir` is missing, is `~/.shed`, or lies inside a blob
+directory. The CLI's `~/.shed/known_hosts` keys by `host:port`, so each
+entry's fingerprint is recorded independently.
+
+The first `make dev-server-up` with its own `state_dir` makes a new host key,
+TLS certificate and client CA (the target prints a note when a start makes a
+host key). An existing `my-server-dev` entry no longer matches: remove only
+that entry and its `known_hosts` line, and re-add it. Leave every other entry
+alone:
+
+```sh
+shed server remove my-server-dev
+ssh-keygen -R '[localhost]:12222' -f ~/.shed/known_hosts
+shed server add localhost --ssh-port 12222 --name my-server-dev
+```
 
 ## Validating server-side changes — parallel dev server (FC remote)
 

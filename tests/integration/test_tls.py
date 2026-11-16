@@ -46,8 +46,11 @@ from fixtures.tlsclient import fingerprint as _fingerprint
 from fixtures.tlsclient import server_cert_pem as _server_cert_pem
 
 TEST_SAN = "shed-tls-test.example"
-# Persist the cert outside ~/.shed so it never collides with a real server's
-# pinned material; a fresh path per run regenerates with the configured SANs.
+# Persist the cert outside both identity directories (the installed server's
+# ~/.shed and the dev server's own state_dir, ~/.shed/dev/state) so it never
+# replaces either server's pinned material; a fresh path per run regenerates
+# with the configured SANs. (The client CA stays in the dev server's state_dir:
+# tls_cert_file and tls_key_file do not move it.)
 DEV_TLS_DIR = Path.home() / ".shed" / "dev" / "tls-itest"
 SHED_BIN = SHED_SERVER_BIN.parent / "shed"
 

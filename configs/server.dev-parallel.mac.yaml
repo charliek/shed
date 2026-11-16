@@ -1,7 +1,8 @@
 # Shed Server — Parallel Dev Configuration (macOS / VZ)
 #
 # Runs ALONGSIDE the brew-installed `my-server` shed-server on the same
-# host. Different ports, different state-dirs, separate images_dir.
+# host. Different ports, different state-dirs (its own state_dir for its
+# identity, below), separate images_dir.
 # Used by `make dev-server-up` + `make test-integration-dev` for testing
 # server-side changes against the developer's source tree without
 # restarting (and disrupting) the brew shed-server.
@@ -41,6 +42,21 @@ auth:
     github_users: [charliek]
     authorized_keys:
       - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBaqTm38OGnpaLoZdZGDEBupr/2C0lcFmdcxevD+wUJI shed-mobile
+
+# The dev server's OWN identity directory: its SSH host key (host_key), TLS
+# certificate and key (tls_cert.pem, tls_key.pem), the mtls client CA
+# (ca_cert.pem, ca_key.pem), the user-list upgrade marker (users-upgrade.json),
+# the GitHub account-id pins (github_pins.json) and the GitHub key cache
+# (github_keys/). Without it the dev server resolves the default, ~/.shed --
+# the brew-installed server's directory on the same Mac -- and shares its host
+# key and TLS pin, signs client certificates with its CA, and removes or writes
+# its upgrade marker and pins. It sits in ~/.shed/dev/ (the dev targets'
+# scratch area) and NOT under the blob directories in the vz block below, so
+# SHED_DEV_STATE_DIR, which moves those to another volume, never moves it.
+# shed-server creates it (mode 0700) on first start. The first start with it
+# makes a new host key, TLS certificate and client CA: re-add the
+# my-server-dev CLI entry once (docs/development/testing.md).
+state_dir: ~/.shed/dev/state
 
 # LOCAL (uncommitted) mounts for mobile testing so agent logins persist across
 # dev-server sheds. CAVEAT: these are the SAME host dirs the brew server

@@ -15,7 +15,7 @@ auth/transport tests need more than that:
     directly.
 
 Every primitive is **hard-scoped to the `*-dev` servers on offset ports** so
-an autonomous run can never touch production. There are two independent
+an autonomous run can never touch production. There are three independent
 safety gates:
 
   - `assert_dev_target(name)`  — the restart *target* must be a `*-dev`
@@ -23,6 +23,11 @@ safety gates:
   - `_assert_config_ports_safe()` — the *config* a server is (re)started
     with must not name the production ports either, so a stray override
     like `{"http_port": 8080}` can't bind prod even if prod is down.
+  - `dev_state_dir()` — that config must name the dev server's own
+    `state_dir` (the committed base's `~/.shed/dev/state`), never the
+    installed server's `~/.shed` and never inside the blob directories, so
+    no dev or test run writes the installed server's host key, TLS
+    material, client CA, upgrade marker or pins.
 
 The primitives:
 
@@ -264,6 +269,69 @@ def _assert_config_ports_safe(config: dict) -> None:
             f"refusing to start a dev server on production ports "
             f"({http_port}/{ssh_port}); use offset ports (e.g. 18080/12222)"
         )
+
+
+# The identity directories shed-server falls back to when a config names no
+# `state_dir` (cmd/shed-server/serve.go: serverStateDir): ~/.shed as a user,
+# /etc/shed as root. On a developer's Mac ~/.shed is the brew-installed
+# server's, so the Mac dev server must never resolve to either. A function, so
+# a test that moves $HOME sees its own.
+def installed_state_dirs() -> tuple[Path, Path]:
+    return Path.home() / ".shed", Path("/etc/shed")
+
+
+# The one-time user-list upgrade marker in a server's state directory
+# (internal/backend/upgrade.go: UsersUpgradeFile).
+USERS_UPGRADE_FILE = "users-upgrade.json"
+# The Mac dev config's blob directories, which SHED_DEV_STATE_DIR relocates
+# (scripts/render-dev-config.sh --state-dir).
+_BLOB_DIR_KEYS = ("images_dir", "instance_dir", "snapshots_dir", "uppers_dir")
+
+
+def _inside(path: str, parent: str) -> bool:
+    """Whether `path` is `parent` or under it (both absolute, normalised)."""
+    return path == parent or path.startswith(parent.rstrip("/") + "/")
+
+
+def dev_state_dir(config: Optional[dict] = None, environ: Optional[dict] = None) -> Path:
+    """The Mac dev server's identity directory (`state_dir`) for `config`
+    (default: the committed base), expanded the way shed-server expands it
+    (config.ExpandPath). It holds the dev server's SSH host key, TLS
+    certificate, mtls client CA, user-list upgrade marker, GitHub id pins and
+    GitHub key cache.
+
+    Raises RuntimeError, so nothing is started, when the config names none or
+    a relative one (the server would fall back to the installed server's
+    ~/.shed, or refuse the config), when it is one of installed_state_dirs(), or
+    when it lies inside a blob directory, the vz config's own or the
+    `$SHED_DEV_STATE_DIR` the Makefile moves them under (identity material
+    must not follow an image store onto another volume)."""
+    cfg = _merge_config({}) if config is None else config
+    env = os.environ if environ is None else environ
+    raw = cfg.get("state_dir")
+    if not isinstance(raw, str) or not raw.strip():
+        raise RuntimeError("refusing to start the dev server: its config names no state_dir, so it would keep its "
+                           "identity in the installed server's ~/.shed")
+    expanded = _go_expand(raw)
+    if not os.path.isabs(expanded):
+        raise RuntimeError(f"refusing to start the dev server: state_dir {raw!r} is not absolute")
+    state = os.path.normpath(expanded)
+    for installed in installed_state_dirs():
+        if state == os.path.normpath(str(installed)):
+            raise RuntimeError(f"refusing to start the dev server: state_dir {raw!r} is the installed server's "
+                               f"identity directory {installed}")
+    blobs = [(cfg.get("vz") or {}).get(k) for k in _BLOB_DIR_KEYS]
+    relocated = env.get("SHED_DEV_STATE_DIR", "")
+    if relocated:
+        blobs.append(relocated)
+    for blob in blobs:
+        if not isinstance(blob, str) or not blob.strip():
+            continue
+        b = _go_expand(blob)
+        if os.path.isabs(b) and _inside(state, os.path.normpath(b)):
+            raise RuntimeError(f"refusing to start the dev server: state_dir {raw!r} is inside the blob directory "
+                               f"{blob!r}, which SHED_DEV_STATE_DIR may move to another volume")
+    return Path(state)
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
@@ -741,6 +809,9 @@ def dev_config(
     if transform is not None:
         merged = transform(merged)
     _assert_config_ports_safe(merged)
+    # Its own identity directory, never the installed server's (raises
+    # before anything is stopped).
+    dev_state_dir(merged)
     detour = _bindings_detour(merged) if _detour_depth == 0 else None
     temp = _write_config(merged, DEV_CONFIG_TMP)
     _detour_depth += 1
@@ -798,6 +869,9 @@ def run_preflight(overrides: dict, *, timeout: float = 20.0) -> PreflightResult:
         raise AssertionError(f"{SHED_SERVER_BIN} not built; run 'make build' first")
     merged = _merge_config(overrides)
     _assert_config_ports_safe(merged)
+    # A preflight server that gets as far as its state directory must touch
+    # the dev server's, never the installed server's.
+    dev_state_dir(merged)
     temp = _write_config(merged, PREFLIGHT_CONFIG_TMP)
     proc: Optional[subprocess.Popen] = None
     try:
