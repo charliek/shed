@@ -53,7 +53,8 @@ def _ssh_auth_stderr(port: int, key_path: str, user: str = "probe-shed") -> str:
     timeout), so a post-auth session that stalls can't hide the auth result.
     """
     argv = [
-        "ssh", "-v", "-i", key_path, "-p", str(port),
+        "ssh", "-v", "-F", "/dev/null", "-i", key_path, "-p", str(port),
+        "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",

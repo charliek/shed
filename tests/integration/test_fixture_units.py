@@ -838,10 +838,10 @@ def mtls_listener(tmp_path):
     for name in ("server", "ca", "client", "stranger"):
         _openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(d / f"{name}.key"))
     for name in ("server", "ca", "stranger"):
-        _openssl("req", "-new", "-x509", "-key", str(d / f"{name}.key"), "-subj", f"/CN={name}",
+        _openssl("req", "-new", "-x509", "-sha256", "-key", str(d / f"{name}.key"), "-subj", f"/CN={name}",
                  "-days", "1", "-out", str(d / f"{name}.pem"))
     _openssl("req", "-new", "-key", str(d / "client.key"), "-subj", "/CN=client", "-out", str(d / "client.csr"))
-    _openssl("x509", "-req", "-in", str(d / "client.csr"), "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
+    _openssl("x509", "-req", "-sha256", "-in", str(d / "client.csr"), "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
              "-CAcreateserial", "-days", "1", "-out", str(d / "client.pem"))
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -1467,6 +1467,8 @@ def test_render_users_writes_a_config_the_server_loads(tmp_path, keys_dir, which
     # The server loads it (a vz config loads on macOS only).
     if which == "mac" and os.uname().sysname != "Darwin":
         return
+    if which == "fc" and os.uname().sysname != "Linux":
+        return
     v = _validate(out)
     assert v.returncode == 0, v.stdout + v.stderr
     # Control: the same config with the developer's github_users put back
@@ -1646,10 +1648,10 @@ def sse_listener(tmp_path):
     for name in ("server", "ca", "client"):
         _openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(d / f"{name}.key"))
     for name in ("server", "ca"):
-        _openssl("req", "-new", "-x509", "-key", str(d / f"{name}.key"), "-subj", f"/CN={name}",
+        _openssl("req", "-new", "-x509", "-sha256", "-key", str(d / f"{name}.key"), "-subj", f"/CN={name}",
                  "-days", "1", "-out", str(d / f"{name}.pem"))
     _openssl("req", "-new", "-key", str(d / "client.key"), "-subj", "/CN=client", "-out", str(d / "client.csr"))
-    _openssl("x509", "-req", "-in", str(d / "client.csr"), "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
+    _openssl("x509", "-req", "-sha256", "-in", str(d / "client.csr"), "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
              "-CAcreateserial", "-days", "1", "-out", str(d / "client.pem"))
     stop = threading.Event()
     seen_headers: list[dict] = []
@@ -2369,10 +2371,11 @@ def test_upgrade_module_is_skipped_by_mark_on_this_platform():
 # side closes as soon as stdin reaches EOF, it prints its banner only if
 # stdin is still open after a moment, then copies until stdin closes.
 _FORWARD_SHIM = """#!/bin/bash
-read -t 0.5 -r _; rc=$?
-if [ "$rc" -le 128 ]; then echo "forward torn down: stdin reached EOF before the banner" >&2; exit 255; fi
+cat <&0 >/dev/null & c=$!
+sleep 1
+if ! kill -0 "$c" 2>/dev/null; then echo "forward torn down: stdin reached EOF before the banner" >&2; exit 255; fi
 printf 'SSH-2.0-fake\\r\\n'
-cat >/dev/null
+wait "$c"
 exit 0
 """
 

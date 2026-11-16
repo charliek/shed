@@ -92,7 +92,7 @@ def _sans(pem: str) -> str:
         path = f.name
     try:
         out = subprocess.run(
-            ["openssl", "x509", "-in", path, "-noout", "-ext", "subjectAltName"],
+            ["openssl", "x509", "-in", path, "-noout", "-text"],
             capture_output=True, text=True, timeout=10,
         )
         return out.stdout
