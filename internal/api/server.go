@@ -238,6 +238,12 @@ func (s *Server) Router() chi.Router {
 		// Users: fetch the GitHub logins again (admin only; control scope).
 		r.Post("/users/refresh", s.handleUsersRefresh)
 
+		// Credential sources: which of a user's machines answers their
+		// credential requests, and moving that (control scope: outside
+		// /api/plugins, so a credentials certificate cannot reach them).
+		r.Get("/sources", s.handleListSources)
+		r.Post("/sources/use", s.handleUseSource)
+
 		// Plugins / Extensions (the credential bus)
 		r.Route("/plugins", func(r chi.Router) {
 			r.Get("/listeners", s.handleListListeners)

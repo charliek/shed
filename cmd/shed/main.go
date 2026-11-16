@@ -94,13 +94,32 @@ func init() {
 }
 
 func main() {
-	if err := rootCmd.Execute(); err != nil {
-		if jsonFlag {
-			_ = outputError(err)
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		}
+	if cmd, err := rootCmd.ExecuteC(); err != nil {
+		reportError(cmd, err)
 		os.Exit(1)
+	}
+}
+
+// reportError prints the error a command returned on stderr, as JSON with
+// --json. The source commands' errors can carry machine names, which come
+// from the machines themselves, so they are escaped for the terminal like
+// those commands' other output (each line, and the JSON); every other
+// command's error is printed as it is.
+func reportError(cmd *cobra.Command, err error) {
+	if isSourceCommand(cmd) {
+		if jsonFlag {
+			_ = writeTermJSON(os.Stderr, struct {
+				Error string `json:"error"`
+			}{err.Error()})
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", termSafeLines(err.Error()))
+		}
+		return
+	}
+	if jsonFlag {
+		_ = outputError(err)
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	}
 }
 

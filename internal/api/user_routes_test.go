@@ -20,6 +20,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/source"
 	"github.com/charliek/shed/internal/users"
 	"github.com/charliek/shed/internal/users/userstest"
 )
@@ -341,6 +342,9 @@ func doRouteAs(h http.Handler, fp, route, method, path, body string) apiResp {
 //	                         themselves
 //	bus:respond              an answer to a request of alice's shed "box":
 //	                         alice only (no admin exception), 403 otherwise
+//	pin:list|use             a user's credential source: every user reads and
+//	                         moves their own; only an admin may name another
+//	                         user, 403 otherwise
 //
 // A route added to Router() fails TestUserRouteWalk until it is classified.
 var userRouteClasses = map[string]string{
@@ -372,6 +376,8 @@ var userRouteClasses = map[string]string{
 	"POST /api/egress/{name}":                         "shed:enter",
 	"DELETE /api/egress/{name}":                       "shed:enter",
 	"POST /api/users/refresh":                         "admin",
+	"GET /api/sources":                                "pin:list",
+	"POST /api/sources/use":                           "pin:use",
 	"GET /api/plugins/listeners":                      "bus:list",
 	"GET /api/plugins/listeners/{namespace}/messages": "bus:subscribe",
 	"POST /api/plugins/listeners/{namespace}/respond": "bus:respond",
@@ -461,6 +467,8 @@ var userRouteAllowed = map[string]int{
 	"POST /api/egress/{name}":                         http.StatusOK,
 	"DELETE /api/egress/{name}":                       http.StatusOK,
 	"POST /api/users/refresh":                         http.StatusOK,
+	"GET /api/sources":                                http.StatusOK,
+	"POST /api/sources/use":                           http.StatusOK,
 	"GET /api/plugins/listeners":                      http.StatusOK,
 	"GET /api/plugins/listeners/{namespace}/messages": http.StatusOK,
 	"POST /api/plugins/listeners/{namespace}/respond": http.StatusNoContent,
@@ -545,6 +553,10 @@ func TestUserRouteWalk(t *testing.T) {
 		kind, action, _ := strings.Cut(class, ":")
 		if kind == "bus" {
 			walkBusRoute(t, s, router, be, route, action, box, boxGen)
+			continue
+		}
+		if kind == "pin" {
+			walkPinRoute(t, s, router, be, route)
 			continue
 		}
 
@@ -649,6 +661,89 @@ func walkBusRoute(t *testing.T, s *Server, router http.Handler, be *userFakeBack
 	if action == "respond" && box.count() != before+1 {
 		t.Errorf("alice %s: box was sent %d responses, want 1", route, box.count()-before)
 	}
+}
+
+// walkPinRoute checks one credential source route of the walk for bob, root
+// and alice, with alice's machine bound: it reaches no shed through the
+// backend; each reads and "moves" only their own binding (a move to alice's
+// machine is a no-op for alice and unknown for anyone else, so the walk
+// changes no binding); bob naming alice is refused with 403 and learns
+// nothing; the admin naming alice reads and moves hers.
+func walkPinRoute(t *testing.T, s *Server, router http.Handler, be *userFakeBackend, route string) {
+	t.Helper()
+	aliceM := testMachineFor(aliceFP)
+	l, err := s.plugins.Subscribe(context.Background(), plugin.ListenerKey{User: "alice", Namespace: "x-walk-pin"}, aliceM)
+	if err != nil {
+		t.Fatalf("binding alice's machine: %v", err)
+	}
+	defer s.plugins.Unregister(l.Key(), l.Token)
+	type pinCase struct {
+		who, fp, named string
+		want           int
+		wantCode       string
+		mentionsAlice  bool
+	}
+	var cases []pinCase
+	if route == "GET /api/sources" {
+		cases = []pinCase{
+			{"bob", bobFP, "", http.StatusOK, "", false},
+			{"bob", bobFP, "alice", http.StatusForbidden, config.ErrForbidden, false},
+			{"admin", rootFP, "", http.StatusOK, "", false},
+			{"admin", rootFP, "alice", http.StatusOK, "", true},
+			{"alice", aliceFP, "", http.StatusOK, "", true},
+		}
+	} else {
+		cases = []pinCase{
+			{"bob", bobFP, "", http.StatusNotFound, config.ErrSourceMachineNotFound, false},
+			{"bob", bobFP, "alice", http.StatusForbidden, config.ErrForbidden, false},
+			{"admin", rootFP, "", http.StatusNotFound, config.ErrSourceMachineNotFound, false},
+			{"admin", rootFP, "alice", http.StatusOK, "", true},
+			{"alice", aliceFP, "", http.StatusOK, "", true},
+		}
+	}
+	gen := mustBinding(t, s, "alice").Generation
+	for _, c := range cases {
+		be.reset()
+		var r apiResp
+		if route == "GET /api/sources" {
+			path := "/api/sources"
+			if c.named != "" {
+				path += "?user=" + c.named
+			}
+			r = doAs(router, c.fp, http.MethodGet, path, "")
+		} else {
+			body := fmt.Sprintf(`{"machine_id":%q}`, aliceM.ID)
+			if c.named != "" {
+				body = fmt.Sprintf(`{"machine_id":%q,"user":%q}`, aliceM.ID, c.named)
+			}
+			r = doAs(router, c.fp, http.MethodPost, "/api/sources/use", body)
+		}
+		if got := be.actedSnapshot(); len(got) != 0 {
+			t.Errorf("%s %s reached the backend: %v", c.who, route, got)
+		}
+		if r.code != c.want || (c.wantCode != "" && r.errCode(t) != c.wantCode) {
+			t.Errorf("%s %s (naming %q) = %d %s, want %d %s", c.who, route, c.named, r.code, r.body, c.want, c.wantCode)
+			continue
+		}
+		// A refusal may echo the id the caller sent; an answer lists only
+		// the target user's machines.
+		if mentions := strings.Contains(string(r.body), aliceM.ID); r.code == http.StatusOK && mentions != c.mentionsAlice {
+			t.Errorf("%s %s (naming %q) mentions alice's machine: %v, want %v: %s", c.who, route, c.named, mentions, c.mentionsAlice, r.body)
+		}
+	}
+	if bd := mustBinding(t, s, "alice"); bd.MachineID() != aliceM.ID || bd.Generation != gen {
+		t.Errorf("the walk of %s changed alice's binding: %+v", route, bd)
+	}
+}
+
+// mustBinding is user's binding; the test fails without one.
+func mustBinding(t *testing.T, s *Server, user string) source.Binding {
+	t.Helper()
+	bd, ok := s.plugins.Bindings().Get(user)
+	if !ok {
+		t.Fatalf("%s has no binding", user)
+	}
+	return bd
 }
 
 // TestUserCreateRefusal: a user who is not an admin may not ask for what is

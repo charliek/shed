@@ -1169,3 +1169,132 @@ func TestPinGateWaitersGiveUp(t *testing.T) {
 		t.Fatalf("the answer once the gate is free = %v (written %d)", err, len(written))
 	}
 }
+
+// TestPinSourcesReadDuringAMove: a read of the user's sources that arrives
+// between a move's store write and its clean-up (forced with the move's hook,
+// the moment the store already names the new machine while the old one still
+// holds its listeners) waits for the user's gate and shows the state the move
+// left: the new machine bound, and the old one neither connected nor holding
+// request types. A machine that is not the bound one never shows connected.
+func TestPinSourcesReadDuringAMove(t *testing.T) {
+	reg, _, _ := pinned(t)
+	sub(t, reg, uk("alice", "ssh-agent"), mach(1))
+	sub(t, reg, uk("alice", "docker"), mach(1))
+	if _, err := reg.Subscribe(context.Background(), uk("alice", "ssh-agent"), mach(2)); err == nil {
+		t.Fatal("test set-up")
+	}
+	before, err := reg.Sources(context.Background(), "alice")
+	if err != nil || before.Binding == nil || before.Binding.MachineID() != mach(1).ID ||
+		fmt.Sprint(before.Connected) != fmt.Sprintf("map[%s:[docker ssh-agent]]", mach(1).ID) || len(before.Machines) != 2 {
+		t.Fatalf("sources before the move = %+v, %v", before, err)
+	}
+
+	read := make(chan SourcesView, 1)
+	waiting := make(chan struct{}, 1)
+	setVar(t, &gateWaitHook, func() { waiting <- struct{}{} })
+	hooked := false
+	setVar(t, &moveStoredHook, func(string) {
+		hooked = true
+		go func() {
+			v, err := reg.Sources(context.Background(), "alice")
+			if err != nil {
+				t.Error(err)
+			}
+			read <- v
+		}()
+		// Wait until the read is waiting for the gate (or, were it not to
+		// take the gate, until it has read).
+		select {
+		case <-waiting:
+		case v := <-read:
+			read <- v
+		}
+	})
+	mv, err := reg.Move(context.Background(), "alice", mach(2).ID, "me")
+	if err != nil || !hooked {
+		t.Fatalf("move = %v (hooked %v)", err, hooked)
+	}
+	var v SourcesView
+	within(t, "the read", func() { v = <-read })
+	if v.Binding == nil || v.Binding.MachineID() != mach(2).ID || v.Binding.Generation != mv.Binding.Generation {
+		t.Fatalf("the read during the move shows binding %+v, want machine 2 at generation %d", v.Binding, mv.Binding.Generation)
+	}
+	for id, ns := range v.Connected {
+		if id != v.Binding.MachineID() {
+			t.Fatalf("the read during the move shows machine %s connected with %v, but machine %s is bound", id, ns, v.Binding.MachineID())
+		}
+	}
+}
+
+// TestPinMoveAnswersItsOwnMove: Move's view is the state that move left,
+// read before it releases the gate, even when another move of the same user
+// is waiting for the gate and lands the moment it is released.
+func TestPinMoveAnswersItsOwnMove(t *testing.T) {
+	reg, _, b := pinned(t)
+	sub(t, reg, uk("alice", "ssh-agent"), mach(1))
+	if _, err := reg.Subscribe(context.Background(), uk("alice", "ssh-agent"), mach(2)); err == nil {
+		t.Fatal("test set-up")
+	}
+	second := make(chan error, 1)
+	waiting := make(chan struct{}, 1)
+	setVar(t, &gateWaitHook, func() { waiting <- struct{}{} })
+	first := true
+	setVar(t, &moveStoredHook, func(string) {
+		if !first {
+			return
+		}
+		first = false
+		go func() {
+			_, err := reg.Move(context.Background(), "alice", mach(1).ID, "other")
+			second <- err
+		}()
+		select {
+		case <-waiting:
+		case err := <-second:
+			second <- err
+		}
+	})
+	res, err := reg.Move(context.Background(), "alice", mach(2).ID, "me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	within(t, "the second move", func() { err = <-second })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bd, _ := b.Get("alice"); bd.MachineID() != mach(1).ID {
+		t.Fatalf("test set-up: the second move did not land (bound %s)", bd.MachineID())
+	}
+	v := res.View
+	if !res.Moved || v.Binding == nil || v.Binding.MachineID() != mach(2).ID || v.Binding.Generation != res.Binding.Generation || v.Binding.BoundBy != "me" {
+		t.Fatalf("the first move's view = %+v, want its own move (machine 2, generation %d, by me)", v.Binding, res.Binding.Generation)
+	}
+	if len(v.Connected) != 0 {
+		t.Fatalf("the first move's view shows %v connected; machine 1's stream was closed by it and machine 2 has not connected", v.Connected)
+	}
+}
+
+// TestPinSourcesWaitEndsWithItsContext: a read waiting for a gate held by a
+// move (here, its store write) gives up when its context ends.
+func TestPinSourcesWaitEndsWithItsContext(t *testing.T) {
+	reg, _, _ := pinned(t)
+	sub(t, reg, uk("alice", "ssh-agent"), mach(1))
+	if _, err := reg.Subscribe(context.Background(), uk("alice", "ssh-agent"), mach(2)); err == nil {
+		t.Fatal("test set-up")
+	}
+	var readErr error
+	setVar(t, &moveStoredHook, func(string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_, readErr = reg.Sources(ctx, "alice")
+	})
+	if _, err := reg.Move(context.Background(), "alice", mach(2).ID, "me"); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(readErr, context.DeadlineExceeded) {
+		t.Fatalf("a read while the gate was held = %v, want its context's deadline", readErr)
+	}
+	if _, err := NewRegistry().Sources(context.Background(), "alice"); !errors.Is(err, ErrNotPinned) {
+		t.Fatalf("Sources with no bindings = %v", err)
+	}
+}

@@ -40,7 +40,7 @@ func runAssign(cmd *cobra.Command, args []string) error {
 	if !config.ValidUserName(user) {
 		return fmt.Errorf("%q is not a valid user name", user)
 	}
-	serverName, entry, err := findShedServer(name)
+	serverName, entry, err := assignServer(name)
 	if err != nil {
 		return err
 	}
@@ -54,6 +54,28 @@ func runAssign(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("Shed %s on %s now belongs to user %s.\n", shed.Name, serverName, shed.User)
 	return nil
+}
+
+// assignServer picks the server to send an assignment to. With --server it
+// is that server, asked directly, so its answer is what the user sees (403
+// to a user who is not an admin, who cannot see an unassigned shed; 404 to
+// an admin when the shed does not exist). Without it, it is only a server on
+// which the lookup found the shed: an assignment is never sent to a server
+// that did not show the shed (because it is not there, it is hidden from
+// this caller, or the server could not be asked). When none did, the one
+// error says so and suggests --server; nothing else is printed.
+func assignServer(name string) (string, *config.ServerEntry, error) {
+	if serverFlag == "" {
+		if server, entry, ok := searchShedServer(name); ok {
+			return server, entry, nil
+		}
+		return "", nil, fmt.Errorf("assign shed %s: no configured server shows a shed named %s to you (an unassigned shed is visible only to an admin, and a server that could not be reached shows nothing), so nothing was sent; to send the assignment to a server and see its answer, name it with -s/--server", name, name)
+	}
+	entry, err := clientConfig.GetServer(serverFlag)
+	if err != nil {
+		return "", nil, err
+	}
+	return serverFlag, entry, nil
 }
 
 // AssignShed gives a shed with no user to a user (admin only).

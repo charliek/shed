@@ -140,6 +140,12 @@ func TestMTLSMiddlewareScopeParity(t *testing.T) {
 		{"egress stream DELETE, credentials forbidden", "DELETE", "/api/egress/stream", cred, 403},
 		{"egress stream POST, control cert", "POST", "/api/egress/stream", ctl, 200},
 		{"create, control cert", "POST", "/api/sheds", ctl, 200},
+		// The credential source routes need control: a machine's broker
+		// holds credentials and must not read or move a binding.
+		{"sources, control cert", "GET", "/api/sources", ctl, 200},
+		{"sources, credentials cert forbidden", "GET", "/api/sources", cred, 403},
+		{"sources use, control cert", "POST", "/api/sources/use", ctl, 200},
+		{"sources use, credentials cert forbidden", "POST", "/api/sources/use", cred, 403},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -1113,6 +1113,28 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		return serverFlag, entry, nil
 	}
 
+	if server, entry, ok := searchShedServer(name); ok {
+		return server, entry, nil
+	}
+
+	// Not found anywhere
+	defaultServer := clientConfig.DefaultServer
+	if defaultServer == "" {
+		defaultServer = "any configured server"
+	}
+	printError(fmt.Sprintf("shed %q not found on %s", name, defaultServer),
+		"shed list --all       # Find which server has it",
+		"shed create "+name+"  # Create a new shed")
+	return "", nil, fmt.Errorf("shed %q not found", name)
+}
+
+// searchShedServer looks for the server that hosts a shed, without the
+// --server flag and without printing anything: the shed-name cache first
+// (dropping a stale entry), then the default server, then every configured
+// server. It reports false when no server answers for the shed (a server
+// hides a shed the caller may not see, so "not found" can also mean "not
+// yours").
+func searchShedServer(name string) (string, *config.ServerEntry, bool) {
 	// Check cache first (unqualified form only)
 	if cachedServer, err := clientConfig.GetShedServer(name); err == nil {
 		entry, err := clientConfig.GetServer(cachedServer)
@@ -1120,7 +1142,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 			// Verify the shed still exists
 			client := NewAPIClientFromNamedEntry(cachedServer, entry, DefaultTimeout)
 			if _, err := client.GetShed(name); err == nil {
-				return cachedServer, entry, nil
+				return cachedServer, entry, true
 			}
 			// Shed not found on cached server, clear cache and search
 			clientConfig.RemoveShedCache(name)
@@ -1134,7 +1156,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 			client := NewAPIClientFromNamedEntry(clientConfig.DefaultServer, entry, DefaultTimeout)
 			if _, err := client.GetShed(name); err == nil {
 				clientConfig.CacheShed(name, clientConfig.DefaultServer, "")
-				return clientConfig.DefaultServer, entry, nil
+				return clientConfig.DefaultServer, entry, true
 			}
 		}
 	}
@@ -1149,19 +1171,11 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 			// Update cache
 			clientConfig.CacheShed(name, serverName, "")
 			entryCopy := entry
-			return serverName, &entryCopy, nil
+			return serverName, &entryCopy, true
 		}
 	}
 
-	// Not found anywhere
-	defaultServer := clientConfig.DefaultServer
-	if defaultServer == "" {
-		defaultServer = "any configured server"
-	}
-	printError(fmt.Sprintf("shed %q not found on %s", name, defaultServer),
-		"shed list --all       # Find which server has it",
-		"shed create "+name+"  # Create a new shed")
-	return "", nil, fmt.Errorf("shed %q not found", name)
+	return "", nil, false
 }
 
 // autoSyncAfterCreate syncs files after shed creation.

@@ -613,6 +613,75 @@ type GitHubLoginRefresh struct {
 	Error string `json:"error,omitempty"`
 }
 
+// SourcesResponse is returned by GET /api/sources and POST /api/sources/use
+// (`shed source ls|use|status`): one user's credential source on this server
+// (the machine that answers that user's credential requests) and the
+// machines that have presented themselves for that user. Only that user's
+// machines are ever listed. Machine names come from the machines themselves:
+// show them escaped.
+type SourcesResponse struct {
+	// User is the user the response is for ("" for the implicit user of a
+	// server with no user list).
+	User string `json:"user"`
+	// Binding is the user's binding; null when no machine is the source yet
+	// (the first machine to connect becomes it).
+	Binding *SourceBinding `json:"binding"`
+	// Machines are the machines remembered for the user, oldest first.
+	Machines []SourceMachine `json:"machines"`
+}
+
+// SourceBinding is a user's credential source. Delivery (the machine the
+// user's requests are sent to) and Signing (the machine whose answers are
+// accepted) each name exactly one machine, the same one, in this version.
+type SourceBinding struct {
+	Delivery []SourceRef `json:"delivery"`
+	Signing  []SourceRef `json:"signing"`
+	BoundAt  time.Time   `json:"bound_at"`
+	// BoundBy is "first-connect", or who moved the binding last.
+	BoundBy string `json:"bound_by"`
+	// Generation increases on every bind and move.
+	Generation uint64 `json:"generation"`
+}
+
+// MachineID is the id of the bound machine ("" for a malformed binding).
+func (b *SourceBinding) MachineID() string {
+	if b == nil || len(b.Signing) == 0 {
+		return ""
+	}
+	return b.Signing[0].ID
+}
+
+// SourceRef names what a binding slot points at: a machine, by its id.
+type SourceRef struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+}
+
+// SourceMachine is one machine that has presented itself for a user.
+type SourceMachine struct {
+	// ID is 32 lowercase hex digits.
+	ID string `json:"id"`
+	// Name is the machine's own display name (UTF-8, from the machine).
+	Name string `json:"name"`
+	// KeyFingerprint is the key the machine's credential was enrolled with:
+	// for the bound machine, that of its last accepted subscription; for any
+	// other, as first seen. Empty in open mode.
+	KeyFingerprint string    `json:"key_fingerprint"`
+	FirstSeen      time.Time `json:"first_seen"`
+	// Connected is whether the machine holds a subscription now, and
+	// Namespaces the request types it holds.
+	Connected  bool     `json:"connected"`
+	Namespaces []string `json:"namespaces"`
+}
+
+// SourceUseRequest is the body of POST /api/sources/use: make MachineID (a
+// machine that has presented itself for the user) the user's credential
+// source. User names another user; only an admin may.
+type SourceUseRequest struct {
+	MachineID string `json:"machine_id"`
+	User      string `json:"user,omitempty"`
+}
+
 // SessionsResponse is returned by GET /api/sheds/{name}/sessions and GET /api/sessions.
 type SessionsResponse struct {
 	Sessions []Session `json:"sessions"`
@@ -1205,6 +1274,15 @@ const (
 	// too many admissions that change the source records (a new machine id,
 	// a changed name or key fingerprint) lately. Retryable.
 	ErrSourceRateLimited = "SOURCE_RATE_LIMITED"
+	// ErrSourceMachineNotFound (404) means POST /api/sources/use named a
+	// machine that has never presented itself for the user (or was forgotten
+	// since).
+	ErrSourceMachineNotFound = "SOURCE_MACHINE_NOT_FOUND"
+	// ErrSourceBusy (503, with Retry-After) means GET /api/sources waited its
+	// bounded time for the user's records while a move or a machine's
+	// admission was saving them, and answered nothing rather than a mixed
+	// view. Retryable.
+	ErrSourceBusy = "SOURCE_BUSY"
 )
 
 // Backend type constants for Shed.Backend field.

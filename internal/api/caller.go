@@ -38,6 +38,11 @@ type Caller struct {
 	// Script is set when the user's certificate is for a script key
 	// (users.Key.Script): it may not use the credential bus.
 	Script bool
+	// KeyLabel is the label the user's key has in auth.users, when it has
+	// one: shown (as the mover of a credential source), never matched. An
+	// authorized_keys comment is not used: it often names a person's account
+	// and host.
+	KeyLabel string
 	// Serial is the client certificate's serial (lowercase hex), when the
 	// request carried one.
 	Serial string
@@ -78,7 +83,11 @@ func implicitCaller() Caller {
 // userCaller is the caller a user's certificate (subject cn, the fingerprint
 // of key k) stands for.
 func userCaller(u users.User, k users.Key, cn, serial string) Caller {
-	return Caller{Kind: CallerUser, Name: cn, User: u.Name, Admin: u.Admin, Implicit: u.Implicit, Script: k.Script, Serial: serial}
+	c := Caller{Kind: CallerUser, Name: cn, User: u.Name, Admin: u.Admin, Implicit: u.Implicit, Script: k.Script, Serial: serial}
+	if k.Source == users.SourceAdHoc {
+		c.KeyLabel = k.Label
+	}
+	return c
 }
 
 type callerKey struct{}

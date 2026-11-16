@@ -415,6 +415,75 @@ func logAdmission(user string, d source.Decision) {
 	}
 }
 
+// SourcesView is one user's credential sources as one moment shows them: the
+// binding, the machines the store remembers for the user, and which of them
+// hold listeners. It is read under the user's gate (Sources, and Move after
+// its clean-up), so the binding and the listeners are of the same moment, and
+// only the bound machine, at the binding's generation, is ever listed as
+// connected.
+type SourcesView struct {
+	User string
+	// Binding is nil when the user has no binding.
+	Binding *source.Binding
+	// Machines are the machines the store remembers for the user.
+	Machines []source.Machine
+	// Connected maps the id of a machine holding listeners of the user to
+	// the namespaces (request types) it holds, sorted. It never names a
+	// machine but the bound one.
+	Connected map[string][]string
+}
+
+// MoveResult is what Move did and the user's sources as the move left them,
+// read inside the same hold of the user's gate.
+type MoveResult struct {
+	source.Move
+	View SourcesView
+}
+
+// Sources returns user's sources, read under the user's gate: the per-user
+// critical section that admissions, registrations and moves run in, so the
+// answer never mixes the binding of one side of a move with the listeners of
+// the other. ctx bounds the wait for the gate (an admission or a move holding
+// it may be waiting for the store's disk); its error is returned when the
+// gate was not had in time. ErrNotPinned with no source bindings.
+func (r *Registry) Sources(ctx context.Context, user string) (SourcesView, error) {
+	b := r.pin()
+	if b == nil {
+		return SourcesView{}, ErrNotPinned
+	}
+	g := r.gate(user)
+	if err := g.lock(ctx); err != nil {
+		return SourcesView{}, err
+	}
+	defer g.unlock()
+	return r.view(b, user), nil
+}
+
+// view reads user's sources. The caller holds user's gate. Only listeners
+// stamped with the binding's machine and generation count as connected
+// (under the gate there are no others; the check keeps the view's promise
+// even so).
+func (r *Registry) view(b source.Bindings, user string) SourcesView {
+	v := SourcesView{User: user, Machines: b.Machines(user), Connected: map[string][]string{}}
+	bd, ok := b.Get(user)
+	if !ok {
+		return v
+	}
+	v.Binding = &bd
+	id := bd.MachineID()
+	r.mu.Lock()
+	for _, l := range r.listeners {
+		if l.User == user && l.MachineID == id && l.Generation == bd.Generation {
+			v.Connected[id] = append(v.Connected[id], l.Namespace)
+		}
+	}
+	r.mu.Unlock()
+	for _, ns := range v.Connected {
+		sort.Strings(ns)
+	}
+	return v
+}
+
 // Move moves user's binding to machineID, a machine the store remembers for
 // the user (source.ErrUnknownMachine otherwise), recording by as the mover,
 // and then, still under the user's gate, closes every listener of the user
@@ -423,25 +492,27 @@ func logAdmission(user string, d source.Decision) {
 // generation: the old machine can neither be sent them again nor answer
 // them, and no other machine inherits them. Another user's listeners and
 // requests are untouched. Moving to the machine already bound changes
-// nothing. The store's errors are returned as they are. ctx bounds the wait
-// for the gate.
+// nothing. The result's View is the user's sources read after that clean-up,
+// before the gate is released: the state this move produced, never a later
+// one. The store's errors are returned as they are. ctx bounds the wait for
+// the gate.
 //
 // The routes that call it (and decide who may move) are not part of this
 // package.
-func (r *Registry) Move(ctx context.Context, user, machineID, by string) (source.Move, error) {
+func (r *Registry) Move(ctx context.Context, user, machineID, by string) (MoveResult, error) {
 	b := r.pin()
 	if b == nil {
-		return source.Move{}, ErrNotPinned
+		return MoveResult{}, ErrNotPinned
 	}
 	g := r.gate(user)
 	if err := g.lock(ctx); err != nil {
-		return source.Move{}, err
+		return MoveResult{}, err
 	}
 	defer g.unlock()
 
 	mv, err := b.Use(user, machineID, by)
 	if err != nil {
-		return source.Move{}, err
+		return MoveResult{}, err
 	}
 	if moveStoredHook != nil {
 		moveStoredHook(user)
@@ -452,7 +523,7 @@ func (r *Registry) Move(ctx context.Context, user, machineID, by string) (source
 		log.Printf("credential bus: the credential source%s moved from machine %s (%q) to machine %s (%q) by %q; closed %d stream(s) and dropped %d request(s) of other machines",
 			forUser(user), mv.From.ID, mv.From.Name, mv.To.ID, mv.To.Name, by, closed, dropped)
 	}
-	return mv, nil
+	return MoveResult{Move: mv, View: r.view(b, user)}, nil
 }
 
 // retainOnly closes every listener of user not stamped (machine, gen) and
