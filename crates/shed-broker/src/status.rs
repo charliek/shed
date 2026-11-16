@@ -68,6 +68,12 @@ pub struct ServerHealth {
     pub name: String,
     pub url: String,
     pub namespaces: Vec<NamespaceHealth>,
+    /// Set when ANY namespace on this server is `not-source`: the server answers this
+    /// user's credential requests through another machine, named here. Additive (schema
+    /// stays 1) and absent otherwise, so an older reader and the existing goldens see
+    /// nothing new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_source: Option<ActiveSource>,
 }
 
 /// `NamespaceHealth` is one namespace subscription's state on a server.
@@ -78,6 +84,21 @@ pub struct NamespaceHealth {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_error: String,
     pub since: String,
+    /// The machine the server named when it refused this subscription as `not-source`
+    /// (plan 035 §3.4); absent in every other state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_source: Option<ActiveSource>,
+}
+
+/// The machine a server reports as the active credential source for this user — the
+/// `source` object of its `403 SOURCE_NOT_BOUND` refusal, as the server sent it. Either
+/// field may be empty when the server's body left it out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSource {
+    #[serde(default)]
+    pub machine_id: String,
+    #[serde(default)]
+    pub machine_name: String,
 }
 
 /// `build_live_status` snapshots the daemon's live self-report. `consumer` is the
@@ -310,7 +331,51 @@ mod tests {
             state: state.to_string(),
             last_error: last_error.to_string(),
             since: String::new(),
+            active_source: None,
         }
+    }
+
+    /// The not-source fields are additive: absent when unset (so an old reader and the
+    /// recorded `servers[]` goldens see nothing new), present and round-tripping when set,
+    /// and an older daemon's snapshot without them still decodes.
+    #[test]
+    fn active_source_fields_are_additive() {
+        let src = ActiveSource {
+            machine_id: "0123456789abcdef0123456789abcdef".into(),
+            machine_name: "desk".into(),
+        };
+        let mut sv = ServerHealth {
+            name: "a".into(),
+            url: "http://a".into(),
+            namespaces: vec![ns("ssh-agent", "connected", "")],
+            active_source: None,
+        };
+        let plain = serde_json::to_value(&sv).unwrap();
+        assert!(plain.get("active_source").is_none(), "{plain}");
+        assert!(
+            plain["namespaces"][0].get("active_source").is_none(),
+            "{plain}"
+        );
+
+        sv.namespaces[0].state = "not-source".into();
+        sv.namespaces[0].active_source = Some(src.clone());
+        sv.active_source = Some(src.clone());
+        let v = serde_json::to_value(&sv).unwrap();
+        assert_eq!(v["active_source"]["machine_name"], "desk");
+        assert_eq!(
+            v["namespaces"][0]["active_source"]["machine_id"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        let back: ServerHealth = serde_json::from_value(v).unwrap();
+        assert_eq!(back, sv);
+
+        let old: ServerHealth = serde_json::from_value(serde_json::json!({
+            "name": "a", "url": "http://a",
+            "namespaces": [{"namespace": "ssh-agent", "state": "connected", "since": ""}]
+        }))
+        .unwrap();
+        assert_eq!(old.active_source, None);
+        assert_eq!(old.namespaces[0].active_source, None);
     }
 
     #[test]
@@ -372,6 +437,7 @@ mod tests {
                 name: "mac".to_string(),
                 url: "http://localhost:8080".to_string(),
                 namespaces: vec![ns("ssh-agent", "connected", "")],
+                active_source: None,
             }],
             machine: None,
             machine_error: String::new(),

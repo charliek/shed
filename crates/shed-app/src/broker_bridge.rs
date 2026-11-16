@@ -51,6 +51,7 @@ use shed_broker::config::{
 use shed_broker::controltoken::{
     ControlCredentialMinter, ControlTokenMinter, ControlTokenProvider, MintedControlCredential,
 };
+use shed_broker::machine::{self as broker_machine, LoadOutcome, MachineIdentity};
 use shed_broker::status::ServerHealth;
 use shed_broker::supervisor::{SharedDeps, Supervisor};
 use shed_broker::{
@@ -701,6 +702,13 @@ pub struct EmbeddedHostAgent {
     /// Where the broker's lines go (the bus, the supervisor, the backends, the
     /// Responder's drop path) — the embedder's own log, injected at [`new`](Self::new).
     log: Arc<dyn bus::BusLog>,
+    /// Where this machine's identity file lives: the SAME `<state>/host-agent/machine.json`
+    /// the `shed-host-agent` daemon reads ([`broker_machine::machine_state_path`]), so the
+    /// app and the daemon on one machine present one id.
+    machine_path: std::path::PathBuf,
+    /// The identity loaded at [`spawn`](Self::spawn), or why there is none (`None` until
+    /// then). Surfaced in `broker.status`.
+    machine: Mutex<Option<Result<MachineIdentity, String>>>,
 }
 
 impl EmbeddedHostAgent {
@@ -770,6 +778,8 @@ impl EmbeddedHostAgent {
             supervisor: Mutex::new(None),
             resolved_ssh_mode: Mutex::new(None),
             log,
+            machine_path: broker_machine::machine_state_path(),
+            machine: Mutex::new(None),
         };
         (agent, event_rx)
     }
@@ -809,6 +819,21 @@ impl EmbeddedHostAgent {
     /// The SSH backend mode resolved at spawn (`None` until [`spawn`] succeeds).
     pub fn resolved_ssh_mode(&self) -> Option<String> {
         self.resolved_ssh_mode.lock().unwrap().clone()
+    }
+
+    /// This machine's identity as loaded at [`spawn`](Self::spawn) — `Some(Err(why))`
+    /// when it could not be loaded (the broker then runs without one, as the daemon
+    /// does), `None` before spawn got that far.
+    pub fn machine_identity(&self) -> Option<Result<MachineIdentity, String>> {
+        self.machine.lock().unwrap().clone()
+    }
+
+    /// Cut every waiting bus backoff short so a machine just made the credential source
+    /// connects at once. A no-op before [`spawn`](Self::spawn).
+    pub fn retry_now(&self) {
+        if let Some(sup) = self.supervisor.lock().unwrap().as_ref() {
+            sup.retry_now();
+        }
     }
 
     /// Phase 2 (async, in a tokio runtime): resolve the SSH backend, build the
@@ -851,6 +876,18 @@ impl EmbeddedHostAgent {
             bus_log.warn(w);
         }
         *self.resolved_ssh_mode.lock().unwrap() = Some(ssh_backend.mode().to_string());
+
+        // This machine's identity, from the file the daemon shares (plan 035 §3.4). As in
+        // the daemon, an unusable file never stops the broker: it runs WITHOUT an
+        // identity (no identity headers, exactly the old wire) and `broker.status` says
+        // why. Read on a blocking thread: it is file I/O under an flock.
+        let machine_path = self.machine_path.clone();
+        let loaded =
+            tokio::task::spawn_blocking(move || broker_machine::load_or_create_at(&machine_path))
+                .await
+                .unwrap_or_else(|e| Err(format!("machine identity load task failed: {e}")));
+        let machine = log_machine_identity(&bus_log, &self.machine_path, loaded);
+        *self.machine.lock().unwrap() = Some(machine.clone());
 
         // Per-namespace gate: the built-in routing (approve-all / biometrics / unknown →
         // deny) is shared with the daemon; the `shed-desktop` arm (`None`) supplies THIS
@@ -909,6 +946,7 @@ impl EmbeddedHostAgent {
             audit,
             minter: Some(self.minter.clone()),
             log: bus_log.clone(),
+            machine: machine.ok(),
         };
         let sup = Arc::new(Supervisor::new(self.shutdown_rx.clone(), deps));
         *self.supervisor.lock().unwrap() = Some(sup.clone());
@@ -971,6 +1009,50 @@ impl EmbeddedHostAgent {
         let _ = self.inner.event_tx.send(HostAgentEvent::Connected(ack));
 
         Ok(())
+    }
+}
+
+/// Log how the machine identity was obtained (the daemon's lines, word for word, so one
+/// grep finds either) and reduce the outcome to the identity or why there is none.
+fn log_machine_identity(
+    log: &Arc<dyn bus::BusLog>,
+    path: &std::path::Path,
+    loaded: Result<broker_machine::LoadedIdentity, String>,
+) -> Result<MachineIdentity, String> {
+    let where_ = path.display();
+    match loaded {
+        Ok(loaded) => {
+            let id = &loaded.identity;
+            match &loaded.outcome {
+                LoadOutcome::Existing => log.info(&format!(
+                    "machine identity id={} name={:?} path={where_}",
+                    id.id, id.name
+                )),
+                LoadOutcome::Created => log.info(&format!(
+                    "machine identity created id={} name={:?} path={where_}",
+                    id.id, id.name
+                )),
+                LoadOutcome::Repaired { reason, written } => log.warn(&format!(
+                    "machine identity repaired; the id is kept id={} name={:?} \
+                     reason={reason} written={written} path={where_}",
+                    id.id, id.name
+                )),
+                LoadOutcome::Replaced { reason, old_file } => log.warn(&format!(
+                    "machine identity was unusable and has been REPLACED; servers will see \
+                     a new machine id={} name={:?} reason={reason} old_file={} path={where_}",
+                    id.id,
+                    id.name,
+                    old_file.display()
+                )),
+            }
+            Ok(loaded.identity)
+        }
+        Err(e) => {
+            log.error(&format!(
+                "machine identity unavailable; continuing without one path={where_} error={e}"
+            ));
+            Err(e)
+        }
     }
 }
 
@@ -1332,6 +1414,7 @@ mod tests {
             audit: audit.clone(),
             minter: None,
             log: Arc::new(bus::FileBusLog::new("")),
+            machine: None,
         };
         let target = ServerTarget {
             name: String::new(), // single-server unnamed target (open http)
@@ -1397,7 +1480,10 @@ mod tests {
         );
         let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
 
-        let (agent, mut events) = EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        let (mut agent, mut events) =
+            EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        // Never the developer's real state dir.
+        agent.machine_path = dir.path().join("state/host-agent/machine.json");
         agent
             .spawn()
             .await
@@ -1417,7 +1503,57 @@ mod tests {
         }
         // Populated post-spawn (surfaced in broker.status).
         assert!(agent.resolved_ssh_mode().is_some());
-        // Best-effort drain (the watch loop returns on the flip, then drains groups).
+        // The identity the daemon would load from the same file: created here, and the
+        // file on disk says the same id.
+        let machine = agent
+            .machine_identity()
+            .expect("loaded at spawn")
+            .expect("a fresh state dir yields an identity");
+        let on_disk = broker_machine::load_or_create_at(&agent.machine_path).unwrap();
+        assert_eq!(on_disk.identity, machine);
+        assert_eq!(on_disk.outcome, LoadOutcome::Existing);
+        agent.retry_now(); // reaches the running supervisor without panicking
+                           // Best-effort drain (the watch loop returns on the flip, then drains groups).
+        let _ = agent.shutdown_handle().send(true);
+    }
+
+    /// Following the daemon: an identity that cannot be loaded does NOT fail the broker.
+    /// It spawns, runs without an identity (no identity headers), and the reason is kept
+    /// for `broker.status`.
+    #[tokio::test]
+    async fn spawn_without_a_loadable_identity_still_brokers() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("config.yaml");
+        std::fs::write(&src, "servers: {}\n").unwrap();
+        let yaml = format!(
+            "ssh:\n  approval:\n    policy: shed-desktop\ndiscovery:\n  source: {}\n  watch: off\n",
+            src.display()
+        );
+        let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
+        let (mut agent, mut events) =
+            EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        // A regular FILE where the identity's directory must be: nothing can be created.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+        agent.machine_path = blocker.join("host-agent/machine.json");
+        agent
+            .spawn()
+            .await
+            .expect("an identity failure must not fail the broker");
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ev, HostAgentEvent::Connected(_)), "{ev:?}");
+        let why = agent
+            .machine_identity()
+            .expect("load attempted at spawn")
+            .expect_err("no identity can be created under a file");
+        assert!(!why.is_empty());
+        assert!(
+            agent.supervisor.lock().unwrap().is_some(),
+            "the bus still runs"
+        );
         let _ = agent.shutdown_handle().send(true);
     }
 
@@ -1434,7 +1570,9 @@ mod tests {
         );
         let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
 
-        let (agent, mut events) = EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        let (mut agent, mut events) =
+            EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        agent.machine_path = dir.path().join("state/host-agent/machine.json");
         // First spawn succeeds and emits exactly one Connected.
         agent.spawn().await.expect("first spawn ok");
         let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())

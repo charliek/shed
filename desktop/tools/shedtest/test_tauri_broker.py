@@ -29,6 +29,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -88,6 +89,8 @@ def _broker_app(
     gen_ssh_key: bool = False,
     local_keys_ssh: bool = False,
     conflict_namespaces: tuple[str, ...] = (),
+    refuse: dict[str, str] | None = None,
+    respond_script: dict[str, list] | None = None,
     clear_ssh_auth_sock: bool = True,
     shed_config_path: Path = CONFIG,
 ):
@@ -106,6 +109,10 @@ def _broker_app(
     * `discovery_mock` — write `~/.shed/config.yaml` pointing the broker at the mock.
     * `gen_ssh_key` — generate `~/.ssh/id_ed25519`; `info["ssh_blob"]` is the wire pubkey.
     * `conflict_namespaces` — pre-register these on the mock so their subscribe 409s.
+    * `refuse` — `{ns: kind}`: answer these subscribes with a pinned plan 035 refusal
+      (`mockserver._REFUSALS`) from the broker's first attempt.
+    * `respond_script` — `{ns: [(status, retry_after), ...]}`: answer these responds
+      with pinned refusals first.
     * `clear_ssh_auth_sock` — drop `$SSH_AUTH_SOCK` from the child env (default) so
       `ssh.mode: ""` auto-detect can never reach the developer's real ssh-agent.
     * `shed_config_path` — the app's OWN `~/.shed/config.yaml` (`SHED_TAURI_SHED_CONFIG`),
@@ -125,6 +132,10 @@ def _broker_app(
     mock.start()
     for ns in conflict_namespaces:
         mock.pre_register_conflict(ns)
+    for ns, kind in (refuse or {}).items():
+        mock.refuse(ns, kind)
+    for ns, script in (respond_script or {}).items():
+        mock.respond_script(ns, script)
 
     info: dict = {"ssh_blob": None, "audit_path": None, "runtime_dir": None}
     runtime_dir = Path(tempfile.mkdtemp(prefix="shed-brk-"))
@@ -434,6 +445,117 @@ def test_split_namespace_409_surfaced_in_status():
             lambda: any("SSE subscription rejected" in line and "namespace ssh-agent server=mock " in line
                         for line in _log_lines(log)),
             timeout=10, what="the 409's line, naming its server, in the app's log file")
+
+
+# ---------------------------------------------------------------------------
+# Cell (d1) — the machine pin (plan 035 §3.4): identity on the wire, the three
+# refusals, and the respond retries, through the EMBEDDED broker
+# ---------------------------------------------------------------------------
+
+# The broker's respond deadline (`bus.rs` RESPOND_RETRY_BUDGET): nothing of a respond
+# outlives it.
+_RESPOND_DEADLINE_S = 5.0
+
+
+def _ns_row(status: dict, ns: str) -> dict:
+    servers = status.get("servers") or []
+    for n in (servers[0].get("namespaces", []) if servers else []):
+        if n["namespace"] == ns:
+            return n
+    return {}
+
+
+def _ping(rid: str) -> dict:
+    return {
+        "id": rid, "namespace": "ssh-agent", "type": "request", "final": True,
+        "timestamp": "t", "payload": {"operation": "ping"},
+        "shed": {"name": "web", "backend": "vz", "server": "mock"},
+    }
+
+
+def test_not_source_then_accepted_names_the_active_machine():
+    """Refused 403 SOURCE_NOT_BOUND, the embedded broker reads `not-source` naming the
+    active machine (per namespace and on the server row), keeps retrying, and connects
+    with no relaunch once the server accepts it. Every subscribe carried the identity
+    `broker.status` reports."""
+    with _broker_app(discovery_mock=True, refuse={"ssh-agent": "not-source"}) as (client, mock, _i):
+        # The two namespaces subscribe independently: wait for BOTH, never assume the
+        # docker one is up because the ssh one has been refused.
+        client.wait_until(
+            lambda: (lambda st: _ns_row(st, "ssh-agent").get("state") == "not-source"
+                     and _ns_row(st, "docker-credentials").get("state") == "connected")(
+                         client.broker_status()),
+            timeout=20, what="ssh-agent not-source and docker-credentials connected")
+        st = client.broker_status()
+        row = _ns_row(st, "ssh-agent")
+        assert row["active_source"] == {
+            "machine_id": "fedcba9876543210fedcba9876543210", "machine_name": "desk"}, row
+        assert "the active source is desk" in row["last_error"], row
+        assert st["servers"][0]["active_source"]["machine_name"] == "desk", st
+        assert _ns_row(st, "docker-credentials").get("state") == "connected", st
+        # The identity the embedded broker loaded is on the wire.
+        machine = st["machine"]
+        assert machine and len(machine["id"]) == 32, st
+        assert st["machine_error"] is None, st
+        client.wait_until(lambda: mock.subscribe_count("ssh-agent") >= 2,
+                          timeout=10, what="a retry after not-source")
+        for ident in mock.subscribe_identities("ssh-agent"):
+            assert ident == (machine["id"], machine["name"]), ident
+        # The server stops refusing: the next retry connects, no relaunch.
+        mock.accept("ssh-agent")
+        client.wait_until(
+            lambda: _ns_row(client.broker_status(), "ssh-agent").get("state") == "connected",
+            timeout=40, what="ssh-agent connected after accept")
+        st = client.broker_status()
+        assert "active_source" not in _ns_row(st, "ssh-agent"), st
+        assert "active_source" not in st["servers"][0], st
+
+
+def test_duplicate_stream_is_retried_not_rejected():
+    """409 SOURCE_DUPLICATE_STREAM reads `duplicate` and keeps retrying — unlike the
+    bare 409 cell above, which stops at one attempt."""
+    with _broker_app(discovery_mock=True, refuse={"ssh-agent": "duplicate"}) as (client, mock, _i):
+        client.wait_until(
+            lambda: _ns_row(client.broker_status(), "ssh-agent").get("state") == "duplicate",
+            timeout=20, what="ssh-agent duplicate")
+        client.wait_until(lambda: mock.subscribe_count("ssh-agent") >= 2,
+                          timeout=10, what="a retry after the duplicate")
+
+
+@pytest.mark.parametrize("kind", ["forbidden", "unparseable-403"])
+def test_other_403_is_reconnecting_never_not_source(kind):
+    """Negative control: a 403 with any other code, or a body that does not parse, is
+    plain `reconnecting` with the server's body — never `not-source`."""
+    with _broker_app(discovery_mock=True, refuse={"ssh-agent": kind}) as (client, mock, _i):
+        client.wait_until(lambda: mock.subscribe_count("ssh-agent") >= 2,
+                          timeout=20, what="two attempts")
+        row = _ns_row(client.broker_status(), "ssh-agent")
+        assert row.get("state") == "reconnecting", row
+        assert row.get("last_error", "").startswith("unexpected status 403: "), row
+        assert "active_source" not in row, row
+
+
+def test_respond_503_with_retry_after_is_resent():
+    """A respond answered 503 + Retry-After is re-sent and delivered; a 403 is not."""
+    with _broker_app(discovery_mock=True,
+                     respond_script={"ssh-agent": [(503, "0")]}) as (client, mock, _i):
+        mock.wait_for_subscribe("ssh-agent")
+        client.wait_until(
+            lambda: _ns_row(client.broker_status(), "ssh-agent").get("state") == "connected",
+            timeout=20, what="ssh-agent connected")
+        mock.push_request("ssh-agent", _ping("ping-503"))
+        resp = mock.await_response("ssh-agent")
+        assert resp["in_reply_to"] == "ping-503", resp
+        assert len(mock.respond_identities("ssh-agent")) == 2, "the 503, then the delivered retry"
+        # Now a 403: final, sent once, never delivered.
+        mock.respond_script("ssh-agent", [(403, None)])
+        mock.push_request("ssh-agent", _ping("ping-403"))
+        client.wait_until(lambda: len(mock.respond_identities("ssh-agent")) >= 3,
+                          timeout=10, what="the refused respond")
+        # Read the count only after the respond's whole deadline (5 s from its first
+        # send, which came before this point) has passed: a retry cannot merely be late.
+        time.sleep(_RESPOND_DEADLINE_S + 0.5)
+        assert len(mock.respond_identities("ssh-agent")) == 3, "a 403 is never re-sent"
 
 
 # ---------------------------------------------------------------------------

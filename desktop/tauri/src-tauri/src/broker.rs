@@ -195,6 +195,14 @@ impl BrokerRuntime {
             ),
             None => (Value::Null, json!([]), json!([])),
         };
+        // This machine's identity as the embedded broker loaded it (plan 035 §3.4), or
+        // why there is none; both null outside embedded mode or before the bus started.
+        let (machine, machine_error) = match self.agent.as_ref().and_then(|a| a.machine_identity())
+        {
+            Some(Ok(m)) => (serde_json::to_value(m).unwrap_or(Value::Null), Value::Null),
+            Some(Err(e)) => (Value::Null, Value::from(e)),
+            None => (Value::Null, Value::Null),
+        };
         json!({
             "effective_mode": self.effective_mode_str(),
             "pref": self.pref_str(),
@@ -207,6 +215,8 @@ impl BrokerRuntime {
             "resolved_ssh_mode": resolved_ssh_mode,
             "gate_namespaces": gate_namespaces,
             "servers": servers,
+            "machine": machine,
+            "machine_error": machine_error,
             "broker_error": self.error.lock().unwrap().clone().map_or(Value::Null, Value::from),
         })
     }
@@ -489,6 +499,9 @@ mod tests {
         assert_eq!(v["config"]["source"], Value::Null);
         assert_eq!(v["servers"], json!([]));
         assert_eq!(v["broker_error"], Value::Null);
+        // External mode runs no broker of its own, so it reports no identity of its own.
+        assert_eq!(v["machine"], Value::Null);
+        assert_eq!(v["machine_error"], Value::Null);
         assert_eq!(
             rt.identify_fragment(),
             json!({"effective": "external", "pref": "auto", "restart_required": false})

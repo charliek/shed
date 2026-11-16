@@ -436,6 +436,9 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         audit,
         minter: Some(minter),
         log: bus_log.clone(),
+        // Sent on every bus request; with no identity the bus sends no identity headers
+        // and behaves exactly as before (status says why there is none).
+        machine: machine.as_ref().ok().cloned(),
     };
     let sup = Arc::new(supervisor::Supervisor::new(shutdown_rx.clone(), deps));
 

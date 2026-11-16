@@ -22,6 +22,25 @@ real server. It exposes exactly the three routes a single-server daemon touches:
       deterministic (`now()` is stamped only for an ABSENT ts).
 * Any other path — **404**.
 
+The machine pin (plan 035 §3.4). Every subscribe and respond records the
+`X-Shed-Machine-Id` / `X-Shed-Machine-Name` headers it carried (the name
+percent-decoded). A namespace can be told, at construction (`refuse={ns: kind}`) or
+live (`refuse(ns, kind)`), to refuse its subscribe with one of the pinned shapes, all
+in the API's `{"error":{"code","message"}}` body under 1024 bytes:
+
+* `"not-source"` — **403** `SOURCE_NOT_BOUND` + a top-level `source:{machine_id,
+  machine_name}` naming the active machine (`NOT_SOURCE_ACTIVE`);
+* `"machine-id-required"` — **403** `SOURCE_MACHINE_ID_REQUIRED` (a released broker);
+* `"forbidden"` — **403** `FORBIDDEN` (any other 403: a scope failure, a script key);
+* `"unparseable-403"` — **403** with a body that is not JSON;
+* `"duplicate"` — **409** `SOURCE_DUPLICATE_STREAM` (this machine id already holds it).
+
+`accept(ns)` lifts the refusal so the next retry is served. The bare 409 (terminal) is
+the older `conflict=` set. A respond can be told to answer a script of statuses first
+(`respond_script(ns, [(status, retry_after), ...])`), each with its pinned body and a
+`Retry-After` when one is given. The server sends one only with 503 and 429; a cell may
+attach one to a 403 or 413 to prove the status alone stops the retry.
+
 Threading model mirrors the plain-`socket`/blocking style of `desktop_client.py`:
 a `ThreadingHTTPServer` on a background thread, one handler thread per connection
 (the long-lived SSE GET, the egress GET, and the respond POST each get their own),
@@ -49,6 +68,68 @@ _MESSAGES_RE = re.compile(r"^/api/plugins/listeners/([^/]+)/messages$")
 _RESPOND_RE = re.compile(r"^/api/plugins/listeners/([^/]+)/respond$")
 _EGRESS_PATH = "/api/egress/stream"
 
+# The machine-identity request headers (plan 035 §3.4).
+MACHINE_ID_HEADER = "X-Shed-Machine-Id"
+MACHINE_NAME_HEADER = "X-Shed-Machine-Name"
+
+# The machine a `not-source` refusal names as the active source (fixed, so a golden
+# can pin it unmasked).
+NOT_SOURCE_ACTIVE = {
+    "machine_id": "fedcba9876543210fedcba9876543210",
+    "machine_name": "desk",
+}
+
+# The pinned subscribe refusals: kind -> (status, JSON body or raw text body).
+_REFUSALS: dict[str, tuple[int, object]] = {
+    "not-source": (
+        403,
+        {
+            "error": {
+                "code": "SOURCE_NOT_BOUND",
+                "message": 'credential source for this server is "desk"; '
+                "run 'shed source use <this machine>' to move it",
+            },
+            "source": NOT_SOURCE_ACTIVE,
+        },
+    ),
+    "machine-id-required": (
+        403,
+        {
+            "error": {
+                "code": "SOURCE_MACHINE_ID_REQUIRED",
+                "message": "this server needs shed-host-agent and shed-desktop 0.10.0 or newer",
+            }
+        },
+    ),
+    "forbidden": (
+        403,
+        {"error": {"code": "FORBIDDEN", "message": "a script key cannot subscribe"}},
+    ),
+    "unparseable-403": (403, '{"error": {"code": "SOURCE_NOT_BOUND"'),
+    "duplicate": (
+        409,
+        {
+            "error": {
+                "code": "SOURCE_DUPLICATE_STREAM",
+                "message": 'this machine already holds namespace "ssh-agent"',
+            }
+        },
+    ),
+}
+
+# The pinned respond refusal bodies, by status.
+_RESPOND_REFUSALS: dict[int, dict] = {
+    503: {"error": {"code": "RESPONSE_NOT_DELIVERED", "message": "not delivered; try again"}},
+    429: {"error": {"code": "TOO_MANY_RESPONSES", "message": "too many answers in flight"}},
+    413: {"error": {"code": "RESPONSE_TOO_LARGE", "message": "response too large"}},
+    403: {
+        "error": {
+            "code": "FORBIDDEN",
+            "message": "response does not match a pending request for this namespace",
+        }
+    },
+}
+
 # How often an idle SSE loop re-checks the shutdown flag while waiting to push.
 _SSE_POLL = 0.1
 
@@ -68,6 +149,7 @@ class SyntheticBus:
         tls_cert: str | None = None,
         tls_key: str | None = None,
         unauthorized: set[str] | None = None,
+        refuse: dict[str, str] | None = None,
     ) -> None:
         assert egress in ("unavailable", "events"), f"bad egress mode {egress!r}"
         self.url: str | None = None
@@ -90,6 +172,17 @@ class SyntheticBus:
         self._tls_cert = tls_cert
         self._tls_key = tls_key
         self._subscribe_auths: dict[str, list[str | None]] = {}  # ns -> every Authorization seen
+        # ns -> the pinned refusal kind its subscribe answers (plan 035 §3.4), until
+        # `accept(ns)`.
+        for kind in (refuse or {}).values():
+            assert kind in _REFUSALS, f"unknown refusal kind {kind!r}"
+        self._refuse: dict[str, str] = dict(refuse or {})
+        # ns -> every (machine id, decoded machine name) a subscribe / respond carried
+        # (None for an absent header).
+        self._subscribe_identities: dict[str, list[tuple[str | None, str | None]]] = {}
+        self._respond_identities: dict[str, list[tuple[str | None, str | None]]] = {}
+        # ns -> the statuses its next responds answer, in order ([(status, retry_after)]).
+        self._respond_script: dict[str, list[tuple[int, str | None]]] = {}
 
         # One Condition guards all cross-thread state below (subscribe/respond
         # records + the per-namespace push queues + the SSE thread registry).
@@ -218,6 +311,59 @@ class SyntheticBus:
                 self._cond.wait(remaining)
             return self._responses[ns][index]
 
+    # -- the machine pin (plan 035 §3.4) ---------------------------------------
+
+    def refuse(self, ns: str, kind: str) -> None:
+        """From now on, answer `{ns}`'s subscribe with the pinned refusal `kind`."""
+        assert kind in _REFUSALS, f"unknown refusal kind {kind!r}"
+        with self._cond:
+            self._refuse[ns] = kind
+
+    def accept(self, ns: str) -> None:
+        """Lift `{ns}`'s refusal: its next subscribe is served (the move to this
+        machine, as the server sees it)."""
+        with self._cond:
+            self._refuse.pop(ns, None)
+
+    def respond_script(self, ns: str, script: list[tuple[int, str | None]]) -> None:
+        """Answer `{ns}`'s next responds with these `(status, retry_after)` first (a
+        `None` retry_after sends no header); each is a pinned refusal body, nothing is
+        recorded as delivered. Then 204 as usual."""
+        for status, _ in script:
+            assert status in _RESPOND_REFUSALS, f"no pinned body for {status}"
+        with self._cond:
+            self._respond_script[ns] = list(script)
+
+    def subscribe_count(self, ns: str) -> int:
+        with self._cond:
+            return len(self._subscribe_auths.get(ns, []))
+
+    def subscribe_identities(self, ns: str) -> list[tuple[str | None, str | None]]:
+        """Every (machine id, decoded machine name) `{ns}`'s subscribes carried."""
+        with self._cond:
+            return list(self._subscribe_identities.get(ns, []))
+
+    def respond_identities(self, ns: str) -> list[tuple[str | None, str | None]]:
+        """Every (machine id, decoded machine name) `{ns}`'s respond POSTs carried,
+        refused ones included."""
+        with self._cond:
+            return list(self._respond_identities.get(ns, []))
+
+    def wait_for_respond_attempts(self, ns: str, count: int, timeout: float = 10.0) -> int:
+        """Block until `{ns}` has seen at least `count` respond POSTs (accepted or
+        refused) and return how many it has seen."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while len(self._respond_identities.get(ns, [])) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"fewer than {count} respond POSTs for {ns!r} within {timeout}s "
+                        f"(got {len(self._respond_identities.get(ns, []))})"
+                    )
+                self._cond.wait(remaining)
+            return len(self._respond_identities[ns])
+
     def subscribed_namespaces(self) -> list[str]:
         """A snapshot of the namespaces subscribed so far (sorted)."""
         with self._cond:
@@ -261,11 +407,28 @@ class SyntheticBus:
                 self._queues[ns] = q
             return q
 
-    def _record_subscribe(self, ns: str, auth: str | None) -> None:
+    def _record_subscribe(
+        self, ns: str, auth: str | None, identity: tuple[str | None, str | None]
+    ) -> str | None:
+        """Record a subscribe; return the refusal kind it must be answered with (or
+        None to serve it), read under the same lock so `accept` is never half-seen."""
         with self._cond:
             self._subscribed[ns] = auth
             self._subscribe_auths.setdefault(ns, []).append(auth)
+            self._subscribe_identities.setdefault(ns, []).append(identity)
             self._cond.notify_all()
+            return self._refuse.get(ns)
+
+    def _next_respond_answer(
+        self, ns: str, identity: tuple[str | None, str | None]
+    ) -> tuple[int, str | None] | None:
+        with self._cond:
+            self._respond_identities.setdefault(ns, []).append(identity)
+            self._cond.notify_all()
+            script = self._respond_script.get(ns)
+            if script:
+                return script.pop(0)
+            return None
 
     def _should_401(self, ns: str) -> bool:
         """Whether this subscribe of `ns` should answer 401 (a per-namespace one-shot: the
@@ -346,7 +509,11 @@ class _BusHandler(BaseHTTPRequestHandler):
         answers 401 on its FIRST subscribe (token rejected → the client invalidates +
         re-mints, then reconnects and succeeds)."""
         bus = self._bus
-        bus._record_subscribe(ns, self.headers.get("Authorization"))
+        refusal = bus._record_subscribe(ns, self.headers.get("Authorization"), self._identity())
+        if refusal is not None:
+            status, body = _REFUSALS[refusal]
+            self._send_body(status, body)
+            return
         if ns in bus._conflict:
             self._send_empty(409)
             return
@@ -398,10 +565,41 @@ class _BusHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._send_empty(400)
             return
+        scripted = self._bus._next_respond_answer(ns, self._identity())
+        if scripted is not None:
+            status, retry_after = scripted
+            headers = {"Retry-After": retry_after} if retry_after is not None else {}
+            self._send_body(status, _RESPOND_REFUSALS[status], headers)
+            return
         self._bus._record_response(ns, env)
         self._send_empty(204)
 
     # -- helpers -------------------------------------------------------------
+
+    def _identity(self) -> tuple[str | None, str | None]:
+        """The machine id and the percent-DECODED machine name this request carried
+        (None for an absent header) — what a pinning server reads."""
+        mid = self.headers.get(MACHINE_ID_HEADER)
+        name = self.headers.get(MACHINE_NAME_HEADER)
+        return mid, (unquote(name, errors="strict") if name is not None else None)
+
+    def _send_body(self, code: int, body: object, headers: dict | None = None) -> None:
+        """A refusal with a body: a dict is sent as compact JSON (under 1024 bytes, as
+        the server's are), a str as is."""
+        raw = (
+            json.dumps(body, separators=(",", ":")) if isinstance(body, dict) else str(body)
+        ).encode("utf-8")
+        assert len(raw) < 1024, f"refusal body over 1024 bytes: {len(raw)}"
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(raw)
+        except OSError:
+            pass
 
     def _send_empty(self, code: int) -> None:
         """A bodyless response with an explicit zero Content-Length (keep-alive safe)."""

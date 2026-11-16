@@ -554,7 +554,7 @@ These drive the credential-approval gate (see [Credential approvals](approvals.m
 | `prefs.provider_modes` | — | `{namespace: "approve"\|"deny"}` for `aws-credentials` and `docker-credentials` |
 | `prefs.set_provider` | `namespace`, `decision` (approve\|deny) | `{}` — sets and persists an AWS/Docker mode |
 | `prefs.remove_shed_rule` | `server`, `shed` | `{}` — removes one per-shed override (`server` verbatim; `""` is the single unnamed server) |
-| `broker.status` | — | `{effective_mode, pref, restart_required, probe, config, resolved_ssh_mode, gate_namespaces, servers, broker_error}` — see [Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker) |
+| `broker.status` | — | `{effective_mode, pref, restart_required, probe, config, resolved_ssh_mode, gate_namespaces, servers, machine, machine_error, broker_error}` (`machine` is the embedded broker's `{id, name}`, `machine_error` why there is none; both `null` outside embedded mode; a `servers[]` row and namespace carry `active_source` when the server names another machine as the credential source) — see [Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker) |
 | `broker.mode` | — | `{effective, pref, restart_required}` |
 | `broker.set_mode` | `mode` (auto\|embedded\|external) | `{pref, effective, restart_required}` — persisted; takes effect on the next launch |
 

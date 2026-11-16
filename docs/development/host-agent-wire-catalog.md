@@ -182,8 +182,11 @@ Fan-out happens even when file logging is disabled (`audit.go:104` comment).
       "namespaces": [
         { "namespace": "ssh-agent", "state": "connected",
           "last_error": "",          // omitempty
-          "since": "<RFC3339>" }     // VOLATILE
-      ] }
+          "since": "<RFC3339>",      // VOLATILE
+          "active_source": {         // omitempty; only in state "not-source" (plan 035)
+            "machine_id": "...", "machine_name": "desk" } }
+      ],
+      "active_source": { ... } }     // omitempty; set iff any namespace is "not-source"
   ],
   "machine": {                       // omitted when absent (older daemon, or no identity)
     "id": "0123456789abcdef0123456789abcdef",  // VOLATILE: 32 lowercase hex, no hyphens
@@ -194,9 +197,10 @@ Fan-out happens even when file logging is disabled (`audit.go:104` comment).
 ```
 
 - `policies` keys are always the 3 credential namespaces (`status_server.go:81`).
-- `state` ∈ `connected|reconnecting|stopped` (also `rejected` in the SDK), from `sdk/hostclient.go:28-34` `ConnConnected/ConnReconnecting/ConnStopped/ConnRejected` → the health snapshot maps `client.Status()` (`supervisor.go:243`).
+- `state` ∈ `connected|reconnecting|stopped` (also `rejected` in the SDK), from `sdk/hostclient.go:28-34` `ConnConnected/ConnReconnecting/ConnStopped/ConnRejected` → the health snapshot maps `client.Status()` (`supervisor.go:243`). Plan 035 adds two non-terminal states, Rust only: `not-source` and `duplicate` (§9b).
+- `active_source` (plan 035, additive under schema 1, omitted otherwise so every pre-pin golden is unchanged): on a namespace, the machine a `403 SOURCE_NOT_BOUND` named as the active credential source, exactly as the server sent it (control and Unicode format characters dropped, at most 64 bytes each); on a server, the first such namespace's, so the server row reads as not the source when any of its namespaces is.
 - `buildLiveStatus` (`status_server.go:65`) composes it: policies from `cfg.*.Approval.EffectivePolicy()`, gate list from `desktopGateNamespaces(cfg)`, approval-channel from `desktop.ConsumerInfo()`, servers from `sup.Health()`.
-- `machine` / `machine_error` (plan 035, Rust only — added after the Go daemon's retirement, additive under schema 1): this machine's identity from `<state dir>/host-agent/machine.json` (`shed_broker::machine`), the file the daemon and the desktop app's embedded broker share. Loaded once at start, before any socket binds. The id and the schema are read on their own first, so an id that can be read is never thrown away. Missing → created; a valid id with any other field missing, `null`, of the wrong type or malformed → the id kept and the rest repaired (a WARN line); a newer schema → never rewritten, moved or replaced: its id is used if it can be read, otherwise the daemon runs without one and `machine_error` names the schema; no readable id at all → copied to `machine.json.corrupt` and replaced in one atomic rename (a WARN line: servers will see a new machine); unreadable, impossible to create, or a write whose fsync (file, directory, or a directory it created) fails → the daemon runs without one and `machine_error` says why, and `machine.json` is never left missing by a failed replacement. Nothing here stops the daemon from starting, matching the credential store. No server sees the identity yet.
+- `machine` / `machine_error` (plan 035, Rust only — added after the Go daemon's retirement, additive under schema 1): this machine's identity from `<state dir>/host-agent/machine.json` (`shed_broker::machine`), the file the daemon and the desktop app's embedded broker share. Loaded once at start, before any socket binds. The id and the schema are read on their own first, so an id that can be read is never thrown away. Missing → created; a valid id with any other field missing, `null`, of the wrong type or malformed → the id kept and the rest repaired (a WARN line); a newer schema → never rewritten, moved or replaced: its id is used if it can be read, otherwise the daemon runs without one and `machine_error` names the schema; no readable id at all → copied to `machine.json.corrupt` and replaced in one atomic rename (a WARN line: servers will see a new machine); unreadable, impossible to create, or a write whose fsync (file, directory, or a directory it created) fails → the daemon runs without one and `machine_error` says why, and `machine.json` is never left missing by a failed replacement. Nothing here stops the daemon from starting, matching the credential store. Every bus request carries it (§9b).
 
 ### 4.2 Status socket behavior (`status_server.go:97`, `sockets.go`)
 
@@ -209,7 +213,7 @@ Fan-out happens even when file logging is disabled (`audit.go:104` comment).
 - Decodes `LiveStatus`; `schema != 1` → stderr skew message + **exit 1** (`status.go:48`).
 - `--json`/`-json` → indented `LiveStatus` (exit 0). Else `renderStatus` text (exit 0).
 - Unknown arg or removed `--live` → stderr + **exit 2** (`main.go:61-66`).
-- `renderStatus` text landmarks (good for text golden, `status_test.go:108-122`): `shed-host-agent status (pid N, <ver>)`, `machine:  <name> (<id>)` (or `machine:  unavailable: <error>`) right after `started:`, `Approval policies:`, `(decided in shed-desktop)` for gated ns, `none connected (shed-desktop-policy requests fail closed)`, `Servers (N):`, `(none being watched)`, per-ns marks `ok`/`-`/`x` (`connMark`, `status.go:141`).
+- `renderStatus` text landmarks (good for text golden, `status_test.go:108-122`): `shed-host-agent status (pid N, <ver>)`, `machine:  <name> (<id>)` (or `machine:  unavailable: <error>`) right after `started:`, `Approval policies:`, `(decided in shed-desktop)` for gated ns, `none connected (shed-desktop-policy requests fail closed)`, `Servers (N):`, `(none being watched)`, per-ns marks `ok`/`-`/`x` (`connMark`, `status.go:141`; `not-source` is `-`, `duplicate` is `x`). Under a server with any `not-source` namespace, two more lines (plan 035): `    this machine is not the credential source here; the active source is <name>` and `    to make this machine the source: shed [-s <server> ]source use -- <this machine's name>` (the server and name each one shell word: bare only when non-empty and made of ASCII letters, digits, `.`, `_` and `-`, single-quoted otherwise; `--` so a name beginning with `-` is not an option; `-s` omitted for the unnamed single-server target; the second line omitted when this machine has no identity). No new host-agent verb.
 
 ---
 
@@ -648,6 +652,32 @@ token mode" from "the agent is old", and would let a new agent answer an old app
 - **501 or 404** → `errEgressUnavailable` → **hard backoff 5 min** (not the 30s exp backoff), while still re-checking (`:112,150`). Other non-200 → `unexpected status %d`, normal exp backoff (1s→30s, `×2`).
 - **Gating**: no config toggle; the subscriber always runs per server. Enabled/disabled is decided **by the server** (501/404 = disabled).
 - TLS: pinned transport for https+fingerprint; **pin set on a non-https URL → fail-closed transport** that errors every request (`egressHTTPClient`, `:200`). Pin verify = sha256 of leaf cert vs `sha256:<hex>` (`:225`).
+
+---
+
+## 9b. The machine pin (plan 035 §3.4; Rust only)
+
+A pinning shed-server answers one machine per user. The broker's side of that contract:
+
+- **Request headers.** Every bus subscribe (`GET …/messages`) and every respond (`POST …/respond`) carries `X-Shed-Machine-Id: <32 lowercase hex>` and `X-Shed-Machine-Name: <name, percent-encoded UTF-8>` (every byte outside RFC 3986 unreserved `A-Z a-z 0-9 - . _ ~` as `%XX`, so a space is `%20` and a `+` is `%2B`). The identity is `machine.json`'s (§4.1). With no identity (it could not be loaded) neither header is sent and the wire is exactly the pre-pin one; an identity whose id or name this build would not write is never sent. The egress stream and the SSH bootstrap carry no identity. An older server ignores both headers.
+- **Refusal bodies** are read within 1024 bytes and 3 s (a respond's also within its deadline). A body cut short by either is never classified as a pin refusal or as the server's own; what is shown in `last_error` or written to the log is cleaned (control and Unicode format characters dropped) and capped.
+- **Redirects** are followed only to the configured server's own HTTPS origin (scheme, host, port), at most 3 hops; any other redirect is the answer. The identity headers and the client certificate never reach another host.
+- **Subscribe answers** (`classify_subscribe_refusal`, on at most 1024 bytes of body, read whole):
+
+  | Status | `error.code` (in `{"error":{"code","message"}}`) | State | Loop |
+  |---|---|---|---|
+  | 403 | `SOURCE_NOT_BOUND` (+ top-level `source:{machine_id,machine_name}`) | `not-source`, `active_source` set, `last_error` = `not the credential source for this server; the active source is <name> (<id>)` | backoff 1–30 s and retry; **no re-mint**; one INFO line on entering (or when the named machine changes), DEBUG after |
+  | 409 | `SOURCE_DUPLICATE_STREAM` | `duplicate`, `last_error` names it | backoff and retry; no re-mint; one WARN on entering, DEBUG after |
+  | 409 | anything else, or no parseable or complete body | `rejected` | **terminal**, as before (`namespace already has an active subscriber: <body>`) |
+  | 401 | any | `reconnecting` | re-mint, backoff, retry (as before) |
+  | any other (a 403 with another code — `SOURCE_MACHINE_ID_REQUIRED`, a scope failure, a script key, a reserved namespace — or a 403 whose body does not parse or was cut short) | — | `reconnecting`, `last_error` = `unexpected status <n>: <body>` | backoff and retry (as before) |
+
+  `not-source` is entered if and only if the status is 403 **and** the body was read whole **and** parses with `error.code == SOURCE_NOT_BOUND`; a truncated, slow or unparseable body never is, even when the part read parses. Any other state clears `active_source`.
+- **Respond answers.** A 503 or 429 **with `Retry-After`** means the server wrote nothing: the same body is re-sent at most 3 times. One deadline, 5 s from the first send, covers every refusal body read, every wait, every credential fetch and every send after it; when it passes the respond stops and is audited. `Retry-After` must be a non-negative whole number of seconds (waited at least 100 ms) that ends inside what is left of the deadline; an HTTP date, a negative, a fraction, garbage or a number too large means no retry. A 503/429 without `Retry-After`, a 403, a 413 and every other non-204 are final, one send. One invalidation (401 / TLS alert) and one credential fetch that could mint, per respond, across the retries: after a failed re-mint the surviving credential is presented without minting again.
+- **Audit.** When the shed server itself refused a respond (after any retries) — a non-204 whose body, read whole, is the API's error JSON with an `error.code` — the request's audit entry (if the op audits) is written with `result: "undelivered"` and `reason: "result <what the op came to>, but the server refused the response (status <n> <error.code>)"` appended to any existing reason. Any other non-204 (a proxy's 502, an empty or cut-short body) keeps the op's result and appends `the response was answered with status <n>; delivery unknown`. A transport failure leaves the entry as before (the answer may have been delivered).
+- **Waking.** `Supervisor::retry_now` (and the embedded broker's `EmbeddedHostAgent::retry_now`) cut every waiting subscribe backoff short and reset it to the floor, so a machine just made the source connects at once.
+- **The desktop's embedded broker** loads the same `machine.json` through the same function at spawn and sends the same headers. Like the daemon, an identity it cannot load does not stop it: it brokers without one, and `broker.status` carries `machine` / `machine_error`.
+- **Harness.** `tests/host-agent-diff/synthetic_bus.py` and `desktop/tools/shedtest/mockserver.py` answer each refusal with these exact shapes (`refuse=` / `accept`, `respond_script`) and record the identity headers; the daemon cells are `test_source_pin.py`.
 
 ---
 

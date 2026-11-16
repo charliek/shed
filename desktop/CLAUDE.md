@@ -132,7 +132,9 @@ Test pointers:
   retired `rc` with the RC hub, so there is no `broker,rc` pair left to run.
 - `desktop/tools/shedtest/test_tauri_broker.py` — the hermetic e2e cells (three-way auto-detect, the bus → AppGate → Coordinator → respond
   round-trip via the mock server's plugin-bus endpoints, split-namespace `409`,
-  malformed-config fail-closed, the synthesized fresh-install namespace set).
+  malformed-config fail-closed, the synthesized fresh-install namespace set, and the
+  plan 035 machine pin: `not-source` then accepted, `duplicate`, other 403s, the respond
+  `503` retry).
 - The mock server's plugin-bus routes live in `desktop/tools/shedtest/mockserver.py`
   (`GET /api/plugins/listeners/{ns}/messages` SSE + `POST
   /api/plugins/listeners/{ns}/respond`), shape-pinned against

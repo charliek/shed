@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use shed_broker::sockets::{connect_unix_timeout, status_socket_path};
 use shed_broker::status::{
-    ApprovalChannelStatus, LiveStatus, STATUS_NAMESPACES, STATUS_SCHEMA_VERSION,
+    ApprovalChannelStatus, LiveStatus, ServerHealth, STATUS_NAMESPACES, STATUS_SCHEMA_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -228,6 +228,66 @@ pub fn render_status(out: &mut dyn Write, ls: &LiveStatus) {
             ]);
         }
         tabwrite(out, &srows);
+        render_source_hint(out, sv, ls);
+    }
+}
+
+/// Under a server where any namespace is `not-source` (plan 035 §3.4): who the source is,
+/// and the exact command that makes THIS machine the source. Nothing for any other
+/// server, so an existing report is unchanged.
+fn render_source_hint(out: &mut dyn Write, sv: &ServerHealth, ls: &LiveStatus) {
+    let source = sv.active_source.clone().or_else(|| {
+        sv.namespaces
+            .iter()
+            .find(|n| n.state == "not-source")
+            .map(|n| n.active_source.clone().unwrap_or_default())
+    });
+    let Some(source) = source else {
+        return;
+    };
+    let who = match (source.machine_name.is_empty(), source.machine_id.is_empty()) {
+        (false, _) => source.machine_name.clone(),
+        (true, false) => source.machine_id.clone(),
+        (true, true) => "another machine".to_string(),
+    };
+    let _ = writeln!(
+        out,
+        "    this machine is not the credential source here; the active source is {who}"
+    );
+    if let Some(m) = &ls.machine {
+        let _ = writeln!(
+            out,
+            "    to make this machine the source: {}",
+            source_use_command(&sv.name, &m.name)
+        );
+    }
+}
+
+/// The command that makes this machine the source on `server` (empty: the unnamed
+/// single-server target, no `-s`): `shed [-s <server>] source use -- <name>`. The `--`
+/// ends option parsing, so a name beginning with `-` is never read as an option.
+fn source_use_command(server: &str, name: &str) -> String {
+    let server = if server.is_empty() {
+        String::new()
+    } else {
+        format!("-s {} ", shell_word(server))
+    };
+    format!("shed {server}source use -- {}", shell_word(name))
+}
+
+/// `s` as one shell word: bare only when it is non-empty and made only of ASCII letters,
+/// digits, `.`, `_` and `-`; otherwise single-quoted (an embedded `'` closed, escaped
+/// and reopened). Anything else is quoted: `=` alone begins a zsh filename expansion
+/// (`=sh` becomes `/usr/bin/sh`), and a short allow-list is easier to trust than a list
+/// of what each shell treats specially.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
@@ -289,7 +349,8 @@ fn server_label(name: &str) -> &str {
 fn conn_mark(state: &str) -> &'static str {
     match state {
         "connected" => "ok",
-        "stopped" => "-",
+        // Waiting for another machine to stop being the source is not a fault.
+        "stopped" | "not-source" => "-",
         _ => "x",
     }
 }
@@ -313,6 +374,7 @@ mod tests {
             state: state.to_string(),
             last_error: last_error.to_string(),
             since: String::new(),
+            active_source: None,
         }
     }
 
@@ -371,6 +433,7 @@ mod tests {
                 name: "mac".to_string(),
                 url: "http://localhost:8080".to_string(),
                 namespaces: vec![ns("ssh-agent", "connected", "")],
+                active_source: None,
             }],
             machine: None,
             machine_error: String::new(),
@@ -437,11 +500,13 @@ mod tests {
                         ),
                         ns("docker-credentials", "stopped", ""),
                     ],
+                    active_source: None,
                 },
                 ServerHealth {
                     name: "mini2".to_string(),
                     url: "https://mini2:8443".to_string(),
                     namespaces: vec![],
+                    active_source: None,
                 },
             ],
             machine: None,
@@ -508,6 +573,149 @@ mod tests {
             got.lines().nth(3),
             Some("machine:  unavailable: read machine identity /x/machine.json: Permission denied")
         );
+    }
+
+    /// A server with a `not-source` namespace reads as not the source: an idle `-` mark,
+    /// the active machine in the row and in a hint, and the exact command (this machine's
+    /// name quoted as one shell word) that moves the source here. A `duplicate`
+    /// namespace is a fault mark and adds no hint.
+    #[test]
+    fn render_status_not_source_hint_names_the_command() {
+        let src = shed_broker::ActiveSource {
+            machine_id: "0123456789abcdef0123456789abcdef".into(),
+            machine_name: "desk".into(),
+        };
+        let mut ls = sample_status();
+        ls.machine = Some(shed_broker::MachineIdentity {
+            id: "fedcba9876543210fedcba9876543210".into(),
+            name: "laptop (work)".into(),
+        });
+        let mut not_source = ns(
+            "ssh-agent",
+            "not-source",
+            "not the credential source for this server; the active source is desk (0123456789abcdef0123456789abcdef)",
+        );
+        not_source.active_source = Some(src.clone());
+        ls.servers = vec![
+            ServerHealth {
+                name: "alpha".into(),
+                url: "https://alpha.example:8443".into(),
+                namespaces: vec![ns("docker-credentials", "connected", ""), not_source],
+                active_source: Some(src),
+            },
+            ServerHealth {
+                name: String::new(),
+                url: "http://localhost:8080".into(),
+                namespaces: vec![ns("ssh-agent", "duplicate", "another process")],
+                active_source: None,
+            },
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        render_status(&mut out, &ls);
+        let got = String::from_utf8(out).unwrap();
+        let tail: Vec<&str> = got
+            .lines()
+            .skip_while(|l| !l.starts_with("Servers"))
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "Servers (2):",
+                "  alpha  (https://alpha.example:8443)",
+                "    ok  docker-credentials  connected",
+                "    -   ssh-agent           not-source: not the credential source for this server; the active source is desk (0123456789abcdef0123456789abcdef)",
+                "    this machine is not the credential source here; the active source is desk",
+                "    to make this machine the source: shed -s alpha source use -- 'laptop (work)'",
+                "  (default)  (http://localhost:8080)",
+                "    x  ssh-agent  duplicate: another process",
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_word_quotes_only_when_needed() {
+        assert_eq!(shell_word("box-2.lan_x"), "box-2.lan_x");
+        assert_eq!(shell_word("-rf"), "-rf");
+        for (raw, want) in [
+            ("", "''"),
+            ("=sh", "'=sh'"),
+            ("laptop (work)", "'laptop (work)'"),
+            ("it's", "'it'\\''s'"),
+            ("a$(id)b", "'a$(id)b'"),
+            ("`id`", "'`id`'"),
+            ("x;rm", "'x;rm'"),
+            ("two\nlines", "'two\nlines'"),
+            ("büro", "'büro'"),
+            ("~root", "'~root'"),
+            ("a@b:c/d", "'a@b:c/d'"),
+        ] {
+            assert_eq!(shell_word(raw), want, "{raw:?}");
+        }
+        assert_eq!(
+            source_use_command("", "laptop"),
+            "shed source use -- laptop"
+        );
+        assert_eq!(
+            source_use_command("=sh", "-rf"),
+            "shed -s '=sh' source use -- -rf"
+        );
+    }
+
+    /// The printed command, run by a real shell, gives `shed` exactly the intended
+    /// arguments — every awkward name and server arrives as ONE literal word, `--` before
+    /// the name. Run under `sh` and, where installed, `bash` and `zsh` (where a bare
+    /// `=sh` would have become `/usr/bin/sh`).
+    #[test]
+    fn source_use_command_round_trips_through_real_shells() {
+        let words = [
+            "=sh",
+            "-rf",
+            "--help",
+            "laptop (work)",
+            "it's here",
+            "\"quoted\"",
+            "a$(echo pwned)b",
+            "`echo pwned`",
+            "x; echo pwned",
+            "two\nlines",
+            "tab\there",
+            "büro 日本",
+            "~root",
+            "*",
+            "!!",
+            "",
+        ];
+        let shells: Vec<&str> = ["/bin/sh", "/bin/bash", "/bin/zsh", "/usr/bin/zsh"]
+            .into_iter()
+            .filter(|p| std::path::Path::new(p).exists())
+            .collect();
+        assert!(!shells.is_empty());
+        for shell in shells {
+            for server in ["", "alpha", "=sh", "-x", "my server"] {
+                for name in words {
+                    let line = source_use_command(server, name);
+                    // `shed` is a shell function printing each argument NUL-terminated.
+                    let script = format!("shed() {{ printf '%s\\0' \"$@\"; }}\n{line}\n");
+                    let out = std::process::Command::new(shell)
+                        .arg("-c")
+                        .arg(&script)
+                        .output()
+                        .unwrap();
+                    assert!(out.status.success(), "{shell}: {line:?}: {out:?}");
+                    let got: Vec<String> = String::from_utf8(out.stdout)
+                        .unwrap()
+                        .split_terminator('\0')
+                        .map(str::to_string)
+                        .collect();
+                    let mut want: Vec<String> = Vec::new();
+                    if !server.is_empty() {
+                        want.extend(["-s".to_string(), server.to_string()]);
+                    }
+                    want.extend(["source", "use", "--", name].map(str::to_string));
+                    assert_eq!(got, want, "{shell}: {line:?}");
+                }
+            }
+        }
     }
 
     #[test]

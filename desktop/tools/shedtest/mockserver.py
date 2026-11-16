@@ -121,6 +121,64 @@ _MESSAGES_RE = re.compile(r"^/api/plugins/listeners/([^/]+)/messages$")
 _RESPOND_RE = re.compile(r"^/api/plugins/listeners/([^/]+)/respond$")
 _EGRESS_PATH = "/api/egress/stream"
 
+# The machine pin (plan 035 §3.4): the identity headers every subscribe and respond
+# carries, and the pinned refusals a pinning server answers. KEPT IDENTICAL to
+# `tests/host-agent-diff/synthetic_bus.py` (`_REFUSALS`, `_RESPOND_REFUSALS`,
+# `NOT_SOURCE_ACTIVE`) — the same anti-drift pin as the routes above.
+MACHINE_ID_HEADER = "X-Shed-Machine-Id"
+MACHINE_NAME_HEADER = "X-Shed-Machine-Name"
+NOT_SOURCE_ACTIVE = {
+    "machine_id": "fedcba9876543210fedcba9876543210",
+    "machine_name": "desk",
+}
+_REFUSALS: dict[str, tuple[int, object]] = {
+    "not-source": (
+        403,
+        {
+            "error": {
+                "code": "SOURCE_NOT_BOUND",
+                "message": 'credential source for this server is "desk"; '
+                "run 'shed source use <this machine>' to move it",
+            },
+            "source": NOT_SOURCE_ACTIVE,
+        },
+    ),
+    "machine-id-required": (
+        403,
+        {
+            "error": {
+                "code": "SOURCE_MACHINE_ID_REQUIRED",
+                "message": "this server needs shed-host-agent and shed-desktop 0.10.0 or newer",
+            }
+        },
+    ),
+    "forbidden": (
+        403,
+        {"error": {"code": "FORBIDDEN", "message": "a script key cannot subscribe"}},
+    ),
+    "unparseable-403": (403, '{"error": {"code": "SOURCE_NOT_BOUND"'),
+    "duplicate": (
+        409,
+        {
+            "error": {
+                "code": "SOURCE_DUPLICATE_STREAM",
+                "message": 'this machine already holds namespace "ssh-agent"',
+            }
+        },
+    ),
+}
+_RESPOND_REFUSALS: dict[int, dict] = {
+    503: {"error": {"code": "RESPONSE_NOT_DELIVERED", "message": "not delivered; try again"}},
+    429: {"error": {"code": "TOO_MANY_RESPONSES", "message": "too many answers in flight"}},
+    413: {"error": {"code": "RESPONSE_TOO_LARGE", "message": "response too large"}},
+    403: {
+        "error": {
+            "code": "FORBIDDEN",
+            "message": "response does not match a pending request for this namespace",
+        }
+    },
+}
+
 # How often an idle SSE loop re-checks the shutdown flag while waiting to push
 # (matches synthetic_bus `_SSE_POLL`).
 _SSE_POLL = 0.1
@@ -185,6 +243,14 @@ class MockShedServer:
         self._bus_queues: dict[str, queue.Queue] = {}
         self._bus_sse_threads: set[threading.Thread] = set()
         self._egress_hits = 0
+        # ---- the machine pin (plan 035 §3.4) ----
+        # ns -> the pinned refusal kind its subscribe answers, until `accept(ns)`.
+        self._bus_refuse: dict[str, str] = {}
+        # ns -> every (machine id, decoded machine name) its subscribes / responds carried.
+        self._bus_subscribe_identities: dict[str, list[tuple[str | None, str | None]]] = {}
+        self._bus_respond_identities: dict[str, list[tuple[str | None, str | None]]] = {}
+        # ns -> the statuses its next responds answer first ([(status, retry_after)]).
+        self._bus_respond_script: dict[str, list[tuple[int, str | None]]] = {}
 
     @property
     def base_url(self) -> str:
@@ -311,6 +377,36 @@ class MockShedServer:
         with self._bus_cond:
             self._bus_conflict.update(namespaces)
 
+    def refuse(self, ns: str, kind: str) -> None:
+        """Answer `{ns}`'s subscribe with the pinned refusal `kind` (plan 035 §3.4) until
+        `accept(ns)`. Call before the broker connects to refuse its first attempt."""
+        assert kind in _REFUSALS, f"unknown refusal kind {kind!r}"
+        with self._bus_cond:
+            self._bus_refuse[ns] = kind
+
+    def accept(self, ns: str) -> None:
+        """Lift `{ns}`'s refusal: the broker's next retry is served."""
+        with self._bus_cond:
+            self._bus_refuse.pop(ns, None)
+
+    def respond_script(self, ns: str, script: list[tuple[int, str | None]]) -> None:
+        """Answer `{ns}`'s next responds with these `(status, retry_after)` first, each
+        with its pinned body and nothing recorded as delivered; then 204."""
+        for status, _ in script:
+            assert status in _RESPOND_REFUSALS, f"no pinned body for {status}"
+        with self._bus_cond:
+            self._bus_respond_script[ns] = list(script)
+
+    def subscribe_identities(self, ns: str) -> list[tuple[str | None, str | None]]:
+        with self._bus_cond:
+            return list(self._bus_subscribe_identities.get(ns, []))
+
+    def respond_identities(self, ns: str) -> list[tuple[str | None, str | None]]:
+        """Every respond POST's identity, refused ones included (its length is the
+        attempt count)."""
+        with self._bus_cond:
+            return list(self._bus_respond_identities.get(ns, []))
+
     def wait_for_subscribe(self, ns: str, timeout: float = 10.0) -> str | None:
         """Block until the broker has subscribed to `{ns}`'s SSE stream (deadline poll,
         not a sleep). Returns the recorded `Authorization` header (None in open mode)."""
@@ -369,11 +465,25 @@ class MockShedServer:
                 self._bus_queues[ns] = q
             return q
 
-    def _bus_record_subscribe(self, ns: str, auth: str | None) -> None:
+    def _bus_record_subscribe(
+        self, ns: str, auth: str | None, identity: tuple[str | None, str | None]
+    ) -> str | None:
+        """Record a subscribe; return the refusal kind to answer it with (None: serve)."""
         with self._bus_cond:
             self._bus_subscribed[ns] = auth
             self._bus_subscribe_counts[ns] = self._bus_subscribe_counts.get(ns, 0) + 1
+            self._bus_subscribe_identities.setdefault(ns, []).append(identity)
             self._bus_cond.notify_all()
+            return self._bus_refuse.get(ns)
+
+    def _bus_next_respond_answer(
+        self, ns: str, identity: tuple[str | None, str | None]
+    ) -> tuple[int, str | None] | None:
+        with self._bus_cond:
+            self._bus_respond_identities.setdefault(ns, []).append(identity)
+            self._bus_cond.notify_all()
+            script = self._bus_respond_script.get(ns)
+            return script.pop(0) if script else None
 
     def _bus_try_claim(self, ns: str) -> bool:
         """Claim `{ns}`'s single live-listener slot; False (→ 409) if it's a pre-marked
@@ -420,6 +530,26 @@ class MockShedServer:
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
+
+            def _identity(self) -> tuple[str | None, str | None]:
+                """The machine id and percent-DECODED name this request carried."""
+                mid = self.headers.get(MACHINE_ID_HEADER)
+                name = self.headers.get(MACHINE_NAME_HEADER)
+                return mid, (unquote(name, errors="strict") if name is not None else None)
+
+            def _send_raw(self, code: int, body: object, headers: dict | None = None):
+                """A pinned refusal: a dict as compact JSON, a str as is (under 1024
+                bytes, as the server's are)."""
+                raw = (json.dumps(body, separators=(",", ":")) if isinstance(body, dict)
+                       else str(body)).encode()
+                assert len(raw) < 1024, len(raw)
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(raw)
 
             def _unauthorized(self) -> bool:
                 """A secure-server 401 for an unauthenticated /api request (the
@@ -479,7 +609,12 @@ class MockShedServer:
                 pre-marked conflict — terminal `rejected`, no retry) or hold a 200
                 `text/event-stream` and push queued request frames until teardown /
                 client disconnect."""
-                state._bus_record_subscribe(ns, self.headers.get("Authorization"))
+                refusal = state._bus_record_subscribe(
+                    ns, self.headers.get("Authorization"), self._identity())
+                if refusal is not None:
+                    status, body = _REFUSALS[refusal]
+                    self._send_raw(status, body)
+                    return
                 if not state._bus_try_claim(ns):
                     # NAMESPACE_ALREADY_REGISTERED — a second listener is terminal.
                     self._send(409, {"error": "namespace already registered",
@@ -534,6 +669,13 @@ class MockShedServer:
                     env = json.loads(body)
                 except ValueError:
                     self._send(400, {"error": "bad response body"})
+                    return
+                scripted = state._bus_next_respond_answer(ns, self._identity())
+                if scripted is not None:
+                    status, retry_after = scripted
+                    self._send_raw(
+                        status, _RESPOND_REFUSALS[status],
+                        {"Retry-After": retry_after} if retry_after is not None else None)
                     return
                 state._bus_record_response(ns, env)
                 # 204 No Content — the status the client expects (a non-204 is a bus

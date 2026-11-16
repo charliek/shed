@@ -27,6 +27,7 @@ use crate::bus::{
     AwsHandlers, BusError, BusLog, ConnState, DockerHandlers, SubStatus, TokenProvider,
 };
 use crate::discovery::ServerTarget;
+use crate::machine::MachineIdentity;
 use crate::minter::{CredentialSource, Minter};
 use crate::ssh_backend::SshBackend;
 use crate::status::{NamespaceHealth, ServerHealth};
@@ -65,6 +66,9 @@ impl TokenProvider for Arc<CredentialSource> {
     fn presenting_certificate(&self) -> bool {
         (**self).holds_certificate()
     }
+    fn would_mint(&self) -> bool {
+        (**self).would_mint()
+    }
 }
 
 /// The server-agnostic components every per-server watcher group shares — built once in
@@ -82,6 +86,10 @@ pub struct SharedDeps {
     /// disables minting → every server uses its (usually empty) configured static token.
     pub minter: Option<Arc<dyn Minter>>,
     pub log: Arc<dyn BusLog>,
+    /// This machine's identity ([`crate::machine`]), sent on every bus request so a
+    /// pinning server can tell this machine from another of the same user's. `None` when
+    /// it could not be loaded: the bus then sends no identity headers, exactly as before.
+    pub machine: Option<MachineIdentity>,
 }
 
 /// Whether the agent should self-mint a token for `target` (attaching a token provider +
@@ -107,6 +115,8 @@ struct WatcherGroup {
     cancel: Arc<watch::Sender<bool>>,
     done: JoinHandle<()>,
     statuses: Vec<Arc<Mutex<SubStatus>>>,
+    /// Bumped by [`Supervisor::retry_now`] to cut the group's waiting backoffs short.
+    wake: Arc<watch::Sender<u64>>,
 }
 
 /// The group factory (mirror Go's overridable `newGroup` field): builds + spawns a group
@@ -143,6 +153,7 @@ impl Supervisor {
                 cancel: h.cancel,
                 done: h.done,
                 statuses: h.statuses,
+                wake: h.wake,
             }
         });
         Supervisor::with_factory(parent, deps, factory)
@@ -299,6 +310,7 @@ impl Supervisor {
                                 // `st.Since.UTC().Format(RFC3339)`); the `servers[]` differential
                                 // masks the value after shape-asserting it.
                                 since: st.since.clone(),
+                                active_source: st.active_source.clone(),
                             }
                         })
                         .collect();
@@ -307,10 +319,15 @@ impl Supervisor {
                     // `servers[].namespaces[]` is in the same order on both impls regardless of
                     // subscribe order (ssh-agent, docker-credentials, ...).
                     namespaces.sort_by(|a, b| a.namespace.cmp(&b.namespace));
+                    // Any namespace refused as not-source makes the whole server read as
+                    // not the source (a server binds and moves all of a user's
+                    // namespaces together); the first one, in namespace order, names it.
+                    let active_source = namespaces.iter().find_map(|n| n.active_source.clone());
                     ServerHealth {
                         name,
                         url,
                         namespaces,
+                        active_source,
                     }
                 },
             )
@@ -318,16 +335,29 @@ impl Supervisor {
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
+
+    /// Cut every waiting subscription backoff short, on every server, so a machine that
+    /// has just been made the source connects at once rather than within 30 s. A no-op
+    /// for a subscription that is connected or mid-request (its next wait returns at
+    /// once instead).
+    pub fn retry_now(&self) {
+        let inner = self.inner.lock().unwrap();
+        for g in inner.groups.values() {
+            g.wake.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
 }
 
 /// The wire string for a connection state (mirror the Go SDK's `Conn*` constants, which
-/// `SubStatus.State` carries verbatim).
+/// `SubStatus.State` carries verbatim; `not-source` and `duplicate` are plan 035's).
 fn conn_state_str(state: ConnState) -> &'static str {
     match state {
         ConnState::Reconnecting => "reconnecting",
         ConnState::Connected => "connected",
         ConnState::Stopped => "stopped",
         ConnState::Rejected => "rejected",
+        ConnState::NotSource => "not-source",
+        ConnState::Duplicate => "duplicate",
     }
 }
 
@@ -337,6 +367,7 @@ mod tests {
     use crate::bus::FileBusLog;
     use crate::discovery::ServerTarget;
     use crate::minter::{Minted, MinterError};
+    use crate::status::ActiveSource;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---- test stubs: the fake factory never touches the heavy deps, so these satisfy
@@ -388,6 +419,7 @@ mod tests {
             audit: Arc::new(NoopAuditSink),
             minter,
             log: test_log(),
+            machine: None,
         }
     }
 
@@ -409,6 +441,8 @@ mod tests {
     struct FakeGroups {
         started: Mutex<Vec<ServerTarget>>,
         stopped: Mutex<Vec<String>>,
+        /// One wake shared by every fake group, so a test can watch `retry_now` reach it.
+        wake: Arc<watch::Sender<u64>>,
     }
 
     impl FakeGroups {
@@ -430,6 +464,7 @@ mod tests {
                 cancel: Arc::new(cancel_tx),
                 done,
                 statuses: Vec::new(),
+                wake: self.wake.clone(),
             }
         }
 
@@ -700,6 +735,91 @@ mod tests {
         s.reconcile(vec![tgt("fast", "http://fast:8080")]).await;
         assert_eq!(group_names(&s), vec!["fast".to_string()]);
         assert_eq!(fg.stopped_names(), vec!["slow".to_string()]);
+    }
+
+    fn sub_status(ns: &str, state: ConnState, src: Option<ActiveSource>) -> Arc<Mutex<SubStatus>> {
+        Arc::new(Mutex::new(SubStatus {
+            namespace: ns.into(),
+            state,
+            last_error: String::new(),
+            since: "2026-01-01T00:00:00Z".into(),
+            active_source: src,
+        }))
+    }
+
+    /// `health()` reports the two plan 035 states by their wire names, carries the
+    /// active machine per namespace, and marks the SERVER as not the source when any of
+    /// its namespaces is — and not otherwise.
+    #[tokio::test]
+    async fn health_reports_not_source_and_duplicate() {
+        let src = ActiveSource {
+            machine_id: "0123456789abcdef0123456789abcdef".into(),
+            machine_name: "desk".into(),
+        };
+        let per_server: HashMap<String, Vec<Arc<Mutex<SubStatus>>>> = HashMap::from([
+            (
+                "pinned".to_string(),
+                vec![
+                    sub_status("ssh-agent", ConnState::NotSource, Some(src.clone())),
+                    sub_status("docker-credentials", ConnState::Connected, None),
+                ],
+            ),
+            (
+                "twice".to_string(),
+                vec![sub_status("ssh-agent", ConnState::Duplicate, None)],
+            ),
+        ]);
+        let (_tx, rx) = watch::channel(false);
+        let factory: GroupFactory = Box::new(move |_parent, target, _deps| {
+            let (cancel_tx, _cancel_rx) = watch::channel(false);
+            WatcherGroup {
+                statuses: per_server[&target.name].clone(),
+                target,
+                cancel: Arc::new(cancel_tx),
+                done: tokio::spawn(async {}),
+                wake: Arc::new(watch::channel(0u64).0),
+            }
+        });
+        let s = Supervisor::with_factory(rx, deps_with_minter(None), factory);
+        s.reconcile(vec![tgt("pinned", "http://p"), tgt("twice", "http://t")])
+            .await;
+        let h = s.health();
+        assert_eq!(h[0].name, "pinned");
+        let by_ns: HashMap<&str, &NamespaceHealth> = h[0]
+            .namespaces
+            .iter()
+            .map(|n| (n.namespace.as_str(), n))
+            .collect();
+        assert_eq!(by_ns["ssh-agent"].state, "not-source");
+        assert_eq!(by_ns["ssh-agent"].active_source, Some(src.clone()));
+        assert_eq!(by_ns["docker-credentials"].state, "connected");
+        assert_eq!(by_ns["docker-credentials"].active_source, None);
+        assert_eq!(
+            h[0].active_source,
+            Some(src),
+            "any not-source namespace marks the server"
+        );
+        assert_eq!(h[1].name, "twice");
+        assert_eq!(h[1].namespaces[0].state, "duplicate");
+        assert_eq!(h[1].active_source, None, "a duplicate is not a not-source");
+    }
+
+    /// `retry_now` reaches every running group's wake.
+    #[tokio::test]
+    async fn retry_now_bumps_every_group() {
+        let fg = Arc::new(FakeGroups::default());
+        let s = test_supervisor(&fg);
+        s.reconcile(vec![tgt("a", "http://a"), tgt("b", "http://b")])
+            .await;
+        let mut rx = fg.wake.subscribe();
+        s.retry_now();
+        assert!(
+            rx.has_changed().unwrap(),
+            "retry_now must bump the group wake"
+        );
+        // Both groups share the fake's wake, so one call bumps it once per group.
+        assert_eq!(*rx.borrow_and_update(), 2);
+        s.shutdown().await;
     }
 
     // ---- the bus TokenProvider bridge (the credentials-scope wire) -------------------

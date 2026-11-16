@@ -1,0 +1,13 @@
+{
+  "attempts": 1,
+  "audit": {
+    "approval": "none",
+    "detail": "0 keys",
+    "ns": "ssh-agent",
+    "op": "list",
+    "reason": "result ok, but the server refused the response (status 413 RESPONSE_TOO_LARGE)",
+    "result": "undelivered",
+    "shed": "web",
+    "ts": "<ts>"
+  }
+}

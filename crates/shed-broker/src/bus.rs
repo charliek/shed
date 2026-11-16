@@ -22,6 +22,35 @@
 //!   * TLS pin: install the pin verifier on an https URL, fail-closed if a pin is
 //!     set but the URL is not https.
 //!
+//! The machine pin (plan 035 §3.4), on top of that:
+//!   * every subscribe and every respond carries `X-Shed-Machine-Id` (the 32-hex id) and
+//!     `X-Shed-Machine-Name` (the display name, percent-encoded UTF-8) when this machine
+//!     has an identity ([`crate::machine`]); with none, neither header is sent and the
+//!     wire is exactly as before. An older server ignores both;
+//!   * subscribe answers are classified by [`classify_subscribe_refusal`]:
+//!
+//!     | status | `error.code` | state | what the loop does |
+//!     |---|---|---|---|
+//!     | 403 | `SOURCE_NOT_BOUND` | `not-source` (names the active machine) | backoff and retry, no re-mint |
+//!     | 409 | `SOURCE_DUPLICATE_STREAM` | `duplicate` | backoff and retry, no re-mint |
+//!     | 409 | anything else, or no parseable body | `rejected` | stop (terminal, as before) |
+//!     | 401 | any | `reconnecting` | re-mint, then backoff and retry (as before) |
+//!     | any other, a 403 with another code or an unparseable body included | any | `reconnecting`, the server's body shown | backoff and retry (as before) |
+//!
+//!   * a refusal body is read within a byte AND a time bound; one that was cut short
+//!     (over 1024 bytes, too slow, a read error) is never classified as a pin refusal:
+//!     a 403 is then plain `reconnecting`, a 409 terminal;
+//!   * a respond answered 503 or 429 WITH a whole-seconds `Retry-After` that fits the
+//!     remaining budget (the server wrote nothing) is re-sent a bounded number of times,
+//!     all of it inside one deadline from the first send; every other non-204 (403 and
+//!     413 included) is not retried. The request's audit entry is recorded as
+//!     `undelivered` only when the refusal is the shed server's own (a complete API error
+//!     body with an `error.code`); any other status keeps the operation's result, with
+//!     "delivery unknown" in the reason;
+//!   * redirects are followed only to the configured server's own HTTPS origin, a few
+//!     hops at most, so the identity headers and the client certificate never reach
+//!     another host.
+//!
 //! Scope: the daemon subscribes only to `ssh-agent` and implements the full
 //! ssh-agent op set — the gated **`sign`** flow (decode → approval gate → backend →
 //! response + audit, wire-compatible with the Go `ssh_handler.go`), the ungated
@@ -59,7 +88,45 @@ use crate::discovery::ServerTarget;
 use crate::docker_backend::{
     DockerBackend, DOCKER_CODE_INTERNAL, DOCKER_CODE_NOT_ALLOWED, DOCKER_CODE_NOT_FOUND,
 };
+use crate::machine::MachineIdentity;
 use crate::ssh_backend::SshBackend;
+use crate::status::ActiveSource;
+
+/// The machine-identity request headers every subscribe and respond carries (plan 035
+/// §3.4). The id is sent as is (32 lowercase hex); the name percent-encoded.
+pub const HEADER_MACHINE_ID: &str = "X-Shed-Machine-Id";
+pub const HEADER_MACHINE_NAME: &str = "X-Shed-Machine-Name";
+/// `error.code` of the 403 a pinning server answers when another machine is this user's
+/// credential source. The ONLY code that makes a subscription `not-source`.
+pub const CODE_SOURCE_NOT_BOUND: &str = "SOURCE_NOT_BOUND";
+/// `error.code` of the 409 a pinning server answers when a process with this same
+/// machine id already holds the namespace. Retryable; a 409 without it stays terminal.
+pub const CODE_SOURCE_DUPLICATE_STREAM: &str = "SOURCE_DUPLICATE_STREAM";
+/// The longest a server-supplied machine name or id is kept for display (the server
+/// itself accepts at most 63 bytes; the slack covers an id).
+const MAX_SOURCE_FIELD_BYTES: usize = 64;
+/// The longest server-supplied `error.code` copied into an audit reason.
+const MAX_CODE_CHARS: usize = 64;
+
+/// How many times a respond answered 503/429 with `Retry-After` is re-sent.
+const RESPOND_MAX_RETRIES: u32 = 3;
+/// One absolute deadline, from the first respond send, for everything after it: every
+/// refusal body read, every retry wait, every credential fetch and every send. A shed
+/// waiting on an answer gives up on its own clock; past this a late answer is worth less
+/// than a prompt failure in the log and the audit, and the namespace's serial handler is
+/// free again.
+const RESPOND_RETRY_BUDGET: Duration = Duration::from_secs(5);
+/// The shortest wait before a retried respond (a `Retry-After: 0` must not hot-loop).
+const RESPOND_RETRY_MIN_WAIT: Duration = Duration::from_millis(100);
+/// The longest a non-2xx body may take to arrive (subscribe and respond alike): a body
+/// that never ends must not stall a namespace's loop until shutdown. A respond's read is
+/// also cut at its deadline, whichever comes first.
+const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(3);
+/// The most redirects the bus follows, and only within the configured server's origin.
+const MAX_REDIRECTS: usize = 3;
+/// The audit `result` of an operation whose response the server refused: whatever the
+/// operation did, the shed never received it.
+pub const AUDIT_RESULT_UNDELIVERED: &str = "undelivered";
 
 /// SSH protocol error codes (`internal/ext/protocol/ssh.go`).
 const SSH_CODE_KEY_NOT_FOUND: &str = "KEY_NOT_FOUND";
@@ -265,6 +332,13 @@ pub trait TokenProvider: Send + Sync {
     fn presenting_certificate(&self) -> bool {
         false
     }
+    /// Whether [`Self::token`] would now start (or join) a mint rather than hand back a
+    /// credential already held. A respond makes at most ONE such call: after it, the held
+    /// credential is presented as it is ([`Self::surviving_token`], or the certificate
+    /// still armed on the transport). Default `false` (a static provider never mints).
+    fn would_mint(&self) -> bool {
+        false
+    }
 }
 
 /// A fixed-token provider (the open-mode / static-token analog of Go's
@@ -360,13 +434,21 @@ impl BusLog for FileBusLog {
 
 /// A namespace subscription's connection state (`hostclient.go`'s `Conn*`).
 /// `Rejected` is terminal — a 409 (another listener owns the namespace) stops the
-/// loop instead of hot-looping a retry.
+/// loop instead of hot-looping a retry. `NotSource` and `Duplicate` (plan 035 §3.4) are
+/// NOT terminal: the loop keeps retrying on its backoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
     Reconnecting,
     Connected,
     Stopped,
     Rejected,
+    /// The server answers this user's credential requests through another machine
+    /// (`403 SOURCE_NOT_BOUND`); [`SubStatus::active_source`] names it.
+    NotSource,
+    /// Another process with this machine's id already holds the namespace on the server
+    /// (`409 SOURCE_DUPLICATE_STREAM`) — e.g. the daemon and the desktop's embedded
+    /// broker running at once.
+    Duplicate,
 }
 
 /// A snapshot of one subscription's state (`hostclient.go:SubStatus`). `since` is the
@@ -379,21 +461,32 @@ pub struct SubStatus {
     pub state: ConnState,
     pub last_error: String,
     pub since: String,
+    /// The machine the server named as the active source; `Some` only in
+    /// [`ConnState::NotSource`].
+    pub active_source: Option<ActiveSource>,
 }
 
 /// Record a namespace's connection state, stamping `since` only when the state actually
 /// changes (a same-state call just refreshes `last_error`) — a faithful port of the Go
-/// SDK's `HostClient.setState` (`hostclient.go:256`).
+/// SDK's `HostClient.setState` (`hostclient.go:256`). Any state but `NotSource` clears
+/// the active source.
 fn set_state(status: &Arc<Mutex<SubStatus>>, state: ConnState, cause: Option<&str>) {
+    set_state_with(status, state, cause, None);
+}
+
+fn set_state_with(
+    status: &Arc<Mutex<SubStatus>>,
+    state: ConnState,
+    cause: Option<&str>,
+    active_source: Option<ActiveSource>,
+) {
     let mut s = status.lock().unwrap();
-    let err = cause.unwrap_or("").to_string();
-    if s.state == state {
-        s.last_error = err;
-        return;
+    s.last_error = cause.unwrap_or("").to_string();
+    s.active_source = active_source;
+    if s.state != state {
+        s.state = state;
+        s.since = crate::status::now_rfc3339();
     }
-    s.state = state;
-    s.last_error = err;
-    s.since = crate::status::now_rfc3339();
 }
 
 /// How a single `stream_messages` attempt ended, driving the reconnect decision.
@@ -402,6 +495,15 @@ enum StreamEnd {
     Shutdown,
     /// 409: another listener owns the namespace → terminal (no retry).
     Conflict(String),
+    /// 409 `SOURCE_DUPLICATE_STREAM`: this machine's id already holds the namespace in
+    /// another process → backoff + retry, no re-mint.
+    Duplicate(String),
+    /// 403 `SOURCE_NOT_BOUND`: another machine is the source → backoff + retry, no
+    /// re-mint.
+    NotSource {
+        reason: String,
+        source: ActiveSource,
+    },
     /// 401: token rejected → invalidate + reconnect.
     Unauthorized(String),
     /// A connect/read transport error → backoff + retry.
@@ -411,6 +513,181 @@ enum StreamEnd {
     BadStatus(String),
     /// The server closed a healthy stream → reconnect.
     ClosedByServer(String),
+}
+
+// ---------------------------------------------------------------------------
+// Refusal classification (plan 035 §3.4) — pure, so the table is unit-tested
+// ---------------------------------------------------------------------------
+
+/// What a non-200 answer to a subscribe means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscribeRefusal {
+    /// 403 with `error.code == SOURCE_NOT_BOUND`: another machine is the source.
+    NotSource(ActiveSource),
+    /// 409 with `error.code == SOURCE_DUPLICATE_STREAM`: retryable.
+    Duplicate,
+    /// Any other 409: terminal, exactly as before the pin.
+    Conflict,
+    /// 401: re-mint, as before.
+    Unauthorized,
+    /// Everything else — a 403 with any other code or an unparseable body included —
+    /// retries on the backoff with the server's body shown, as before.
+    Other,
+}
+
+/// Classify a non-200 subscribe answer from its status and (at most 1024 bytes of) body.
+/// `not-source` is entered if and only if the status is 403 AND the body was read
+/// `complete` AND it parses as the API's error shape with `error.code ==
+/// SOURCE_NOT_BOUND`. A body cut short (over the byte cap, too slow, a read error) is
+/// never classified, even when the part read parses on its own: a 403 is then `Other`
+/// and a 409 terminal.
+pub fn classify_subscribe_refusal(status: u16, body: &str, complete: bool) -> SubscribeRefusal {
+    let parsed = || {
+        if complete {
+            parse_api_error(body)
+        } else {
+            None
+        }
+    };
+    match status {
+        401 => SubscribeRefusal::Unauthorized,
+        403 => match parsed() {
+            Some((Some(code), v)) if code == CODE_SOURCE_NOT_BOUND => {
+                SubscribeRefusal::NotSource(active_source_of(&v))
+            }
+            _ => SubscribeRefusal::Other,
+        },
+        409 => match parsed() {
+            Some((Some(code), _)) if code == CODE_SOURCE_DUPLICATE_STREAM => {
+                SubscribeRefusal::Duplicate
+            }
+            _ => SubscribeRefusal::Conflict,
+        },
+        _ => SubscribeRefusal::Other,
+    }
+}
+
+/// Parse an API error body (`{"error":{"code":…,"message":…}, …}`): the JSON value and
+/// `error.code` when it is a string. `None` when the body is not a JSON object.
+fn parse_api_error(body: &str) -> Option<(Option<String>, serde_json::Value)> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+    let code = v
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    Some((code, v))
+}
+
+/// The `error.message` of an API error body, if it has one.
+fn api_error_message(body: &str) -> Option<String> {
+    let (_, v) = parse_api_error(body)?;
+    v.get("error")?
+        .get("message")?
+        .as_str()
+        .map(|m| display_field(m, 256))
+}
+
+/// The `source` object of a `SOURCE_NOT_BOUND` refusal. Tolerant: a missing or
+/// wrongly-typed field is empty. Both values are server-supplied and end up in logs and
+/// status, so they are cleaned for display.
+fn active_source_of(v: &serde_json::Value) -> ActiveSource {
+    let field = |k: &str| {
+        v.get("source")
+            .and_then(|s| s.get(k))
+            .and_then(|f| f.as_str())
+            .map(|s| display_field(s, MAX_SOURCE_FIELD_BYTES))
+            .unwrap_or_default()
+    };
+    ActiveSource {
+        machine_id: field("machine_id"),
+        machine_name: field("machine_name"),
+    }
+}
+
+/// A server-supplied string made safe to log and show: control characters and Unicode
+/// format characters dropped (so it can neither forge a line, send a terminal escape,
+/// nor reorder or hide what is around it), cut to at most `max_bytes` on a character
+/// boundary.
+fn display_field(raw: &str, max_bytes: usize) -> String {
+    let mut out = String::new();
+    for c in raw
+        .chars()
+        .filter(|c| !c.is_control() && !is_format_char(*c))
+    {
+        if out.len() + c.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Unicode format characters (general category Cf): invisible, but they change how the
+/// text around them is shown — bidirectional overrides, embeddings and isolates, the
+/// Arabic letter mark, zero-width spaces and joiners, word joiners and invisible
+/// operators, the byte-order mark, interlinear annotation marks, tag characters.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// A server-supplied response body, as it may be shown in status or written to a log:
+/// cleaned like [`display_field`] and capped at [`MAX_ERROR_BODY_BYTES`].
+fn display_body(raw: &str) -> String {
+    display_field(raw, MAX_ERROR_BODY_BYTES)
+}
+
+/// How this machine's name travels in [`HEADER_MACHINE_NAME`]: UTF-8, every byte that
+/// is not an RFC 3986 unreserved character (`A-Z a-z 0-9 - . _ ~`) as `%XX`. The result
+/// is plain ASCII, valid as a header value, and decodes the same under a path or a query
+/// unescape (a space is `%20`, a `+` is `%2B`).
+pub fn percent_encode_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The text a person reads for a `not-source` subscription (status `last_error`, the
+/// log). An old status reader with no `active_source` field still learns who is active.
+fn not_source_reason(source: &ActiveSource) -> String {
+    let who = match (source.machine_name.is_empty(), source.machine_id.is_empty()) {
+        (false, false) => format!("{} ({})", source.machine_name, source.machine_id),
+        (false, true) => source.machine_name.clone(),
+        (true, false) => source.machine_id.clone(),
+        (true, true) => "another machine".to_string(),
+    };
+    format!("not the credential source for this server; the active source is {who}")
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +715,14 @@ pub struct BusClient {
     log: Arc<dyn BusLog>,
     initial_backoff: Duration,
     max_backoff: Duration,
+    /// This machine's identity, sent on every subscribe and respond; `None` sends no
+    /// identity headers at all (no identity could be loaded).
+    machine: Option<MachineIdentity>,
+    /// Bumped by [`Self::retry_now`]: every subscription of this client waiting out a
+    /// backoff retries at once, with the backoff reset to the floor. A counter in a
+    /// watch channel rather than a `Notify`, so a bump that lands while a subscription
+    /// is mid-request is not lost: its next wait returns immediately.
+    wake: Arc<watch::Sender<u64>>,
 }
 
 impl BusClient {
@@ -465,7 +750,7 @@ impl BusClient {
                 "TLS pin configured for a non-https URL {server_url}; refusing to send unpinned plaintext"
             )));
         }
-        let http = build_http_client(pin.as_deref(), client_certs)?;
+        let http = build_http_client(&server_url, pin.as_deref(), client_certs)?;
         Ok(Self {
             server_url,
             server_name: String::new(),
@@ -475,7 +760,39 @@ impl BusClient {
             log,
             initial_backoff: INITIAL_BACKOFF,
             max_backoff: MAX_BACKOFF,
+            machine: None,
+            wake: Arc::new(watch::channel(0u64).0),
         })
+    }
+
+    /// Present `machine` on every subscribe and respond. An identity whose id or name
+    /// is not one this build would write is dropped (no headers), never sent half-valid.
+    pub fn with_machine(mut self, machine: Option<MachineIdentity>) -> Self {
+        self.machine = machine
+            .filter(|m| crate::machine::valid_id(&m.id) && crate::machine::valid_name(&m.name));
+        self
+    }
+
+    /// Cut every waiting backoff of this client's subscriptions short and reset it to
+    /// the floor — what a "use this machine" move calls so the new source connects at
+    /// once instead of within 30 s.
+    pub fn retry_now(&self) {
+        self.wake.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// The handle [`Self::retry_now`] bumps, for a group that outlives this value.
+    pub(crate) fn wake_handle(&self) -> Arc<watch::Sender<u64>> {
+        self.wake.clone()
+    }
+
+    /// Add the machine-identity headers when this client has an identity.
+    fn with_identity(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.machine {
+            Some(m) => req
+                .header(HEADER_MACHINE_ID, m.id.as_str())
+                .header(HEADER_MACHINE_NAME, percent_encode_name(&m.name)),
+            None => req,
+        }
     }
 
     /// Name the server this client talks to, for its log lines — the supervisor's
@@ -510,12 +827,16 @@ impl BusClient {
             // Stamp the initial "reconnecting" instant (Go's `subscribeLoop` opens with a
             // `setState(ConnReconnecting)`); subsequent same-state calls keep it.
             since: crate::status::now_rfc3339(),
+            active_source: None,
         }));
         let client = self.clone();
         let ns = namespace.to_string();
         let st = status.clone();
+        // Subscribed here, not in the task, so a `retry_now` from the moment this
+        // returns is seen.
+        let wake = self.wake.subscribe();
         let handle = tokio::spawn(async move {
-            client.subscribe_loop(ns, tx, shutdown, st).await;
+            client.subscribe_loop(ns, tx, shutdown, st, wake).await;
         });
         Subscription { rx, status, handle }
     }
@@ -526,6 +847,7 @@ impl BusClient {
         tx: mpsc::Sender<Envelope>,
         shutdown: watch::Receiver<bool>,
         status: Arc<Mutex<SubStatus>>,
+        mut wake: watch::Receiver<u64>,
     ) {
         let mut backoff = self.initial_backoff;
         let mut down_logged = false;
@@ -558,6 +880,41 @@ impl BusClient {
                     terminal_cause = Some(reason);
                     break;
                 }
+                StreamEnd::NotSource { reason, source } => {
+                    // Not terminal and not a credential problem: no invalidate (a
+                    // re-mint per retry would be an SSH round trip every 30 s for
+                    // nothing). Said once at INFO on entering the state (or when the
+                    // active machine changes), then quietly at DEBUG.
+                    let fresh = {
+                        let s = status.lock().unwrap();
+                        s.state != ConnState::NotSource || s.active_source.as_ref() != Some(&source)
+                    };
+                    let line = format!(
+                        "{reason}; retrying namespace={namespace} server={} backoff={backoff:?}",
+                        self.server_label()
+                    );
+                    if fresh {
+                        self.log.info(&line);
+                    } else {
+                        self.log.debug(&line);
+                    }
+                    set_state_with(&status, ConnState::NotSource, Some(&reason), Some(source));
+                    down_logged = false;
+                }
+                StreamEnd::Duplicate(reason) => {
+                    let fresh = status.lock().unwrap().state != ConnState::Duplicate;
+                    let line = format!(
+                        "{reason}; retrying namespace={namespace} server={} backoff={backoff:?}",
+                        self.server_label()
+                    );
+                    if fresh {
+                        self.log.warn(&line);
+                    } else {
+                        self.log.debug(&line);
+                    }
+                    set_state(&status, ConnState::Duplicate, Some(&reason));
+                    down_logged = false;
+                }
                 StreamEnd::Unauthorized(reason) => {
                     // Token rejected — re-mint so the backoff-reconnect authenticates
                     // fresh (only a provider-backed client has anything to invalidate).
@@ -585,10 +942,15 @@ impl BusClient {
                 }
             }
 
-            // Back off, but wake immediately on shutdown.
+            // Back off, but wake immediately on shutdown, and retry at once (from the
+            // floor) on a `retry_now`.
             tokio::select! {
                 _ = wait_shutdown(shutdown.clone()) => break,
                 _ = tokio::time::sleep(backoff) => {}
+                _ = woken(&mut wake) => {
+                    backoff = self.initial_backoff;
+                    continue;
+                }
             }
             backoff = (backoff * 2).min(self.max_backoff);
         }
@@ -625,10 +987,11 @@ impl BusClient {
             "{}/api/plugins/listeners/{}/messages",
             self.server_url, namespace
         );
-        let mut req = self
-            .http
-            .get(&url)
-            .header(reqwest::header::ACCEPT, "text/event-stream");
+        let mut req = self.with_identity(
+            self.http
+                .get(&url)
+                .header(reqwest::header::ACCEPT, "text/event-stream"),
+        );
         // The bearer fetch can itself be a full SSH mint (after an
         // invalidation), so it races shutdown like every other network await —
         // a SIGTERM during a re-mint must not hold teardown for the mint
@@ -669,15 +1032,33 @@ impl BusClient {
 
         let st = resp.status().as_u16();
         if st != 200 {
-            // Bounded + shutdown-raced error-body read (Go's io.LimitReader 1024):
-            // a hostile/huge non-200 body can't blow up memory or block teardown.
-            let body = read_error_body(resp, &shutdown).await;
-            return match st {
-                409 => StreamEnd::Conflict(format!(
+            // Bounded in bytes AND time, and shutdown-raced (Go's io.LimitReader 1024):
+            // a hostile/huge/never-ending non-200 body can't blow up memory, stall this
+            // namespace's loop, or block teardown. Only a complete body is classified;
+            // only a cleaned one is shown.
+            let read = read_error_body(resp, &shutdown, None).await;
+            let body = read.shown();
+            return match classify_subscribe_refusal(st, &read.raw, read.complete) {
+                SubscribeRefusal::Conflict => StreamEnd::Conflict(format!(
                     "namespace already has an active subscriber: {body}"
                 )),
-                401 => StreamEnd::Unauthorized(format!("unexpected status 401: {body}")),
-                other => StreamEnd::BadStatus(format!("unexpected status {other}: {body}")),
+                SubscribeRefusal::Duplicate => StreamEnd::Duplicate(format!(
+                    "another process with this machine's id already holds namespace {namespace} \
+                     on this server (duplicate stream){}",
+                    api_error_message(&read.raw)
+                        .map(|m| format!(": {m}"))
+                        .unwrap_or_default()
+                )),
+                SubscribeRefusal::NotSource(source) => StreamEnd::NotSource {
+                    reason: not_source_reason(&source),
+                    source,
+                },
+                SubscribeRefusal::Unauthorized => {
+                    StreamEnd::Unauthorized(format!("unexpected status 401: {body}"))
+                }
+                SubscribeRefusal::Other => {
+                    StreamEnd::BadStatus(format!("unexpected status {st}: {body}"))
+                }
             };
         }
 
@@ -736,21 +1117,91 @@ impl BusClient {
     /// `shutdown` is threaded through every network await (mirroring Go's `ctx`): a
     /// server that accepted the POST but never replies (or a huge error body) can't
     /// pin the daemon — the send + body-read race the shutdown signal and abort
-    /// promptly when it fires.
+    /// promptly when it fires. Everything after the first send also runs against one
+    /// deadline ([`RESPOND_RETRY_BUDGET`]), so no server can hold it longer.
     pub async fn respond(
         &self,
         namespace: &str,
         env: &Envelope,
         shutdown: &watch::Receiver<bool>,
     ) -> Result<(), BusError> {
+        self.respond_detailed(namespace, env, shutdown)
+            .await
+            .map_err(|f| f.err)
+    }
+
+    /// [`Self::respond`], keeping what an audit needs to know about a refusal: whether it
+    /// was the shed server's own.
+    async fn respond_detailed(
+        &self,
+        namespace: &str,
+        env: &Envelope,
+        shutdown: &watch::Receiver<bool>,
+    ) -> Result<(), RespondFailure> {
         let url = format!(
             "{}/api/plugins/listeners/{}/respond",
             self.server_url, namespace
         );
-        let body = serde_json::to_vec(env)
-            .map_err(|e| BusError::Transport(format!("marshaling response: {e}")))?;
+        let body = serde_json::to_vec(env).map_err(|e| {
+            RespondFailure::from(BusError::Transport(format!("marshaling response: {e}")))
+        })?;
 
-        let mut sent = self.send_respond(&url, &body, shutdown).await;
+        // A 503 or 429 that carries `Retry-After` means the server wrote nothing and
+        // asks to be tried again (a busy delivery path, too many answers in flight), so
+        // the answer is re-sent a bounded number of times, inside the deadline. Every
+        // other non-204 — 403 (a stale or unmatched answer, or not the source) and 413
+        // (too large) among them — is final.
+        let mut ctx = RespondCtx::default();
+        let mut retries = 0u32;
+        loop {
+            let resp = self
+                .respond_attempt(&url, &body, shutdown, &mut ctx)
+                .await?;
+            let st = resp.status().as_u16();
+            if st == 204 {
+                return Ok(());
+            }
+            let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
+            // Bounded in bytes and time (and by the deadline), shutdown-raced.
+            let read = read_error_body(resp, shutdown, ctx.deadline).await;
+            let failed = RespondFailure {
+                err: BusError::BadStatus(st, read.shown()),
+                server_code: read.server_code(),
+            };
+            // Eligibility is decided AFTER the body read, against what is left of the
+            // deadline then.
+            let remaining = ctx.deadline.map_or(Duration::ZERO, |d| {
+                d.saturating_duration_since(tokio::time::Instant::now())
+            });
+            let Some(wait) = respond_retry_wait(st, retry_after.as_ref(), retries, remaining)
+            else {
+                return Err(failed);
+            };
+            retries += 1;
+            self.log.info(&format!(
+                "response not accepted yet; retrying in {wait:?} namespace={namespace} server={} \
+                 status={st} attempt={retries}/{RESPOND_MAX_RETRIES}",
+                self.server_label()
+            ));
+            tokio::select! {
+                _ = wait_shutdown(shutdown.clone()) => return Err(failed),
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+    }
+
+    /// One delivery of a response body, with the credential handling `respond` has
+    /// always had: one plain re-send on a lost pooled connection, and one invalidation (a
+    /// TLS alert or a 401) per call to [`Self::respond`] — `ctx.reminted` carries that
+    /// across the 503/429 retries so a refused fresh credential never earns a second one.
+    async fn respond_attempt(
+        &self,
+        url: &str,
+        body: &[u8],
+        shutdown: &watch::Receiver<bool>,
+        ctx: &mut RespondCtx,
+    ) -> Result<reqwest::Response, BusError> {
+        let mut sent = self.send_respond(url, body, shutdown, ctx).await;
         // Rust-only pool race (shed-core finding 29): a pooled connection the
         // server closed between checkout and write surfaces as "connection was
         // not ready" with no TLS alert anywhere in the chain. Nothing was
@@ -759,7 +1210,7 @@ impl BusClient {
         if matches!(&sent, Err(BusError::Transport(m))
             if shed_core::authfail::is_connection_lost_message(m))
         {
-            sent = self.send_respond(&url, &body, shutdown).await;
+            sent = self.send_respond(url, body, shutdown, ctx).await;
         }
         // A credential can be refused mid-session in TWO shapes, and both must
         // invalidate + retry (one re-mint / two sends total, mirroring the Go
@@ -767,76 +1218,103 @@ impl BusClient {
         // mtls rejection has no HTTP status at all — and a provider-backed
         // 401 (token mode, or mtls per-request re-validation). A fresh
         // credential the server just refused does not earn a second mint.
-        let mut reminted = false;
         let mut resp = match sent {
             Ok(r) => r,
             Err(e) => {
                 let auth_shaped = matches!(&e, BusError::Transport(m)
                     if shed_core::authfail::is_auth_shaped_message(m));
-                match (&self.token_provider, auth_shaped) {
-                    (Some(p), true) => {
+                match (&self.token_provider, auth_shaped, ctx.reminted) {
+                    (Some(p), true, false) => {
                         p.invalidate();
-                        reminted = true;
-                        self.send_respond(&url, &body, shutdown).await?
+                        ctx.reminted = true;
+                        self.send_respond(url, body, shutdown, ctx).await?
                     }
                     _ => return Err(e),
                 }
             }
         };
-        if resp.status().as_u16() == 401 && !reminted {
+        if resp.status().as_u16() == 401 && !ctx.reminted {
             if let Some(p) = &self.token_provider {
                 p.invalidate();
-                resp = self.send_respond(&url, &body, shutdown).await?;
+                ctx.reminted = true;
+                resp = self.send_respond(url, body, shutdown, ctx).await?;
             }
         }
-
-        let st = resp.status().as_u16();
-        if st != 204 {
-            // Bounded + shutdown-raced (Go's io.LimitReader 1024).
-            let body = read_error_body(resp, shutdown).await;
-            return Err(BusError::BadStatus(st, body));
-        }
-        Ok(())
+        Ok(resp)
     }
 
+    /// One POST. The first one starts the respond's deadline (after its own credential
+    /// fetch, which is as it always was); every later one — its credential fetch and its
+    /// send — must finish by that deadline.
     async fn send_respond(
         &self,
         url: &str,
         body: &[u8],
         shutdown: &watch::Receiver<bool>,
+        ctx: &mut RespondCtx,
     ) -> Result<reqwest::Response, BusError> {
-        let mut req = self
-            .http
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.to_vec());
+        let past_deadline = || {
+            BusError::Transport(format!(
+                "sending response: not answered within {RESPOND_RETRY_BUDGET:?} of the first send"
+            ))
+        };
+        let mut req = self.with_identity(
+            self.http
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_vec()),
+        );
         // The bearer fetch can itself be a full SSH mint — this is exactly the
         // call that re-mints after respond()'s invalidate — so it races
-        // shutdown too: a TLS rejection followed by SIGTERM must not hold
-        // teardown for the mint timeout.
+        // shutdown (a TLS rejection followed by SIGTERM must not hold teardown
+        // for the mint timeout) and, after the first send, the deadline.
+        let deadline = ctx.deadline;
         let bearer = tokio::select! {
             _ = wait_shutdown(shutdown.clone()) => {
                 return Err(BusError::Transport("sending response: shutting down".into()))
             }
-            t = self.bearer() => t,
+            t = until(deadline, self.respond_bearer(&mut ctx.mint_spent)) => {
+                t.ok_or_else(past_deadline)?
+            }
         };
         if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
         }
+        let deadline = *ctx
+            .deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + RESPOND_RETRY_BUDGET);
         // Race the POST against shutdown: a server that accepts the connection and
         // never replies must not block the daemon's teardown.
         tokio::select! {
             _ = wait_shutdown(shutdown.clone()) => {
                 Err(BusError::Transport("sending response: shutting down".into()))
             }
-            r = req.send() => {
+            r = tokio::time::timeout_at(deadline, req.send()) => match r {
+                Err(_) => Err(past_deadline()),
                 // Flattened, not `{e}`: reqwest's Display drops the TLS alert
                 // that respond()'s classifier (and any human reading the log)
                 // needs — it sits down the source() chain.
-                r.map_err(|e| BusError::Transport(format!(
-                    "sending response: {}", shed_core::authfail::flatten(&e))))
+                Ok(r) => r.map_err(|e| BusError::Transport(format!(
+                    "sending response: {}", shed_core::authfail::flatten(&e)))),
             }
         }
+    }
+
+    /// The bearer for one respond POST, making at most ONE credential fetch that could
+    /// mint per respond (`mint_spent`). After it — whether the mint succeeded or failed —
+    /// the held credential is presented as it is: the surviving bearer, or nothing (the
+    /// certificate still armed on the transport). Without this bound a failed re-mint
+    /// leaves the source refused, and every 503 retry would mint again.
+    async fn respond_bearer(&self, mint_spent: &mut bool) -> Option<String> {
+        if let Some(p) = &self.token_provider {
+            if p.would_mint() {
+                if *mint_spent {
+                    return p.surviving_token();
+                }
+                *mint_spent = true;
+            }
+        }
+        self.bearer().await
     }
 
     /// The bearer token to send, or `None`. A provider takes precedence (and on a
@@ -923,34 +1401,166 @@ pub(crate) async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|flagged| *flagged).await;
 }
 
-/// Read at most [`MAX_ERROR_BODY_BYTES`] of a (non-2xx) response body, racing each
-/// read against shutdown. Mirrors Go's `io.LimitReader(resp.Body, 1024)`: a hostile
-/// / huge error body can't grow memory unbounded, and a stalled body read can't pin
-/// the daemon's teardown. Returns the (trimmed, lossy-decoded) prefix; on a read
-/// error or shutdown it returns whatever was read so far.
-async fn read_error_body(mut resp: reqwest::Response, shutdown: &watch::Receiver<bool>) -> String {
+/// Resolve when `wake` has been bumped since this receiver last looked. A dropped sender
+/// (nothing can bump it any more) never resolves, so the select it sits in cannot spin.
+async fn woken(wake: &mut watch::Receiver<u64>) {
+    if wake.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// The per-call state of one [`BusClient::respond`].
+#[derive(Default)]
+struct RespondCtx {
+    /// [`RESPOND_RETRY_BUDGET`] from the moment the first POST is sent; `None` until
+    /// then. Every later step — a refusal body read, a retry wait, a credential fetch, a
+    /// send — must finish by it; past it the respond stops (and is audited).
+    deadline: Option<tokio::time::Instant>,
+    /// The one invalidation (a 401 or a TLS alert) has been spent.
+    reminted: bool,
+    /// The one credential fetch that could mint has been made.
+    mint_spent: bool,
+}
+
+/// Why a respond failed, with what the audit needs about it.
+struct RespondFailure {
+    err: BusError,
+    /// The `error.code` of a refusal that is the shed server's OWN — a complete body in
+    /// the API's error shape. `None` for a transport failure and for a status whose body
+    /// is anything else (a proxy's 502, an empty or cut-short body): such a status says
+    /// nothing certain about whether the answer reached the shed.
+    server_code: Option<String>,
+}
+
+impl From<BusError> for RespondFailure {
+    fn from(err: BusError) -> Self {
+        RespondFailure {
+            err,
+            server_code: None,
+        }
+    }
+}
+
+/// Run `f` to completion, or until `deadline` passes (`None` when it did). No deadline
+/// means no bound.
+async fn until<F: std::future::Future>(
+    deadline: Option<tokio::time::Instant>,
+    f: F,
+) -> Option<F::Output> {
+    match deadline {
+        None => Some(f.await),
+        Some(d) => tokio::time::timeout_at(d, f).await.ok(),
+    }
+}
+
+/// Whether, and after how long, a respond answered `status` is sent again: only a 503 or
+/// 429 that carries `Retry-After` (the server's word that it wrote nothing), at most
+/// [`RESPOND_MAX_RETRIES`] times. The value must be a non-negative whole number of
+/// seconds (floored at [`RESPOND_RETRY_MIN_WAIT`]) whose wait ends inside what is left of
+/// the deadline (`remaining`). Anything else — an HTTP date, a negative, a fraction,
+/// garbage, a list, a number too large to hold, a wait past the deadline — means do not
+/// retry.
+fn respond_retry_wait(
+    status: u16,
+    retry_after: Option<&reqwest::header::HeaderValue>,
+    retries_done: u32,
+    remaining: Duration,
+) -> Option<Duration> {
+    if !matches!(status, 429 | 503) || retries_done >= RESPOND_MAX_RETRIES {
+        return None;
+    }
+    let raw = retry_after?.to_str().ok()?.trim();
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let secs: u64 = raw.parse().ok()?;
+    let wait = Duration::from_secs(secs).max(RESPOND_RETRY_MIN_WAIT);
+    (wait < remaining).then_some(wait)
+}
+
+/// A non-2xx response body as read.
+struct ErrorBody {
+    /// At most [`MAX_ERROR_BODY_BYTES`], lossy-decoded and trimmed. RAW server text: for
+    /// classification only; [`Self::shown`] is what may be shown or logged.
+    raw: String,
+    /// Read to its end inside the byte and time bounds. A body that was cut short — over
+    /// the byte cap, slower than the time bound or the deadline, a read error, shutdown —
+    /// is never classified as a pin refusal, nor as the server's own refusal, even when
+    /// the part read parses on its own.
+    complete: bool,
+}
+
+impl ErrorBody {
+    /// The body as a person may see it (status, log lines): cleaned and capped.
+    fn shown(&self) -> String {
+        display_body(&self.raw)
+    }
+
+    /// The `error.code` of a COMPLETE body in the API's error shape — what marks a
+    /// refusal as the shed server's own.
+    fn server_code(&self) -> Option<String> {
+        if !self.complete {
+            return None;
+        }
+        parse_api_error(&self.raw)
+            .and_then(|(code, _)| code)
+            .filter(|c| !c.is_empty())
+    }
+}
+
+/// Read at most [`MAX_ERROR_BODY_BYTES`] of a (non-2xx) response body, within
+/// [`ERROR_BODY_READ_TIMEOUT`] (and by `deadline` when one is given), racing each read
+/// against shutdown. Mirrors Go's `io.LimitReader(resp.Body, 1024)`: a hostile / huge
+/// error body can't grow memory unbounded, and a stalled or never-ending body can't pin
+/// the caller's loop or the daemon's teardown. Whatever stops the read early, what was
+/// read so far is returned, marked incomplete.
+async fn read_error_body(
+    mut resp: reqwest::Response,
+    shutdown: &watch::Receiver<bool>,
+    deadline: Option<tokio::time::Instant>,
+) -> ErrorBody {
+    let bound = tokio::time::Instant::now() + ERROR_BODY_READ_TIMEOUT;
+    let bound = deadline.map_or(bound, |d| d.min(bound));
     let mut buf: Vec<u8> = Vec::new();
-    loop {
+    let complete = loop {
         let chunk = tokio::select! {
-            _ = wait_shutdown(shutdown.clone()) => break,
+            _ = wait_shutdown(shutdown.clone()) => break false,
+            _ = tokio::time::sleep_until(bound) => break false,
             c = resp.chunk() => c,
         };
         match chunk {
             Ok(Some(bytes)) => {
-                let take = (MAX_ERROR_BODY_BYTES - buf.len()).min(bytes.len());
-                buf.extend_from_slice(&bytes[..take]);
-                if buf.len() >= MAX_ERROR_BODY_BYTES {
-                    break;
+                if buf.len() + bytes.len() > MAX_ERROR_BODY_BYTES {
+                    let take = MAX_ERROR_BODY_BYTES - buf.len();
+                    buf.extend_from_slice(&bytes[..take]);
+                    break false;
                 }
+                buf.extend_from_slice(&bytes);
             }
-            Ok(None) | Err(_) => break,
+            Ok(None) => break true,
+            Err(_) => break false,
         }
+    };
+    ErrorBody {
+        raw: String::from_utf8_lossy(&buf).trim().to_string(),
+        complete,
     }
-    String::from_utf8_lossy(&buf).trim().to_string()
 }
 
-/// Build the reqwest client. Fail-closed on a plaintext redirect (mirrors
-/// shed-core's `build_http_client`); with a `pin` it installs the
+/// Whether the bus follows a redirect to `next`, `hops` redirects into a chain: only to
+/// the configured server's own origin (scheme, host and port), only over HTTPS (never a
+/// plaintext downgrade), and at most [`MAX_REDIRECTS`] times. Every request the bus makes
+/// carries this machine's identity headers and may present a client certificate, so
+/// neither must ever reach another host — a redirect it does not follow is the answer.
+fn redirect_allowed(configured: Option<&reqwest::Url>, next: &reqwest::Url, hops: usize) -> bool {
+    next.scheme() == "https"
+        && hops <= MAX_REDIRECTS
+        && configured.is_some_and(|c| c.origin() == next.origin())
+}
+
+/// Build the reqwest client. Redirects stay inside the configured server's HTTPS
+/// origin ([`redirect_allowed`]; fail-closed on a plaintext redirect, as shed-core's
+/// `build_http_client`); with a `pin` it installs the
 /// leaf-cert verifier. No global timeout — the SSE subscribe holds a long-lived
 /// connection, and shutdown/`ctx` cancellation bound it instead.
 /// A `client_certs` resolver, when the caller has a credential source that can produce a
@@ -966,12 +1576,15 @@ async fn read_error_body(mut resp: reqwest::Response, shutdown: &watch::Receiver
 /// reason is recorded), and there is no point paying that extra round trip on a transport
 /// that could never present a certificate.
 fn build_http_client(
+    server_url: &str,
     pin: Option<&str>,
     client_certs: Option<Arc<ClientCertResolver>>,
 ) -> Result<reqwest::Client, BusError> {
+    // An unparseable URL follows no redirect at all.
+    let configured = reqwest::Url::parse(server_url).ok();
     let mut builder =
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.url().scheme() == "https" {
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if redirect_allowed(configured.as_ref(), attempt.url(), attempt.previous().len()) {
                 attempt.follow()
             } else {
                 attempt.stop()
@@ -1060,6 +1673,8 @@ pub struct GroupHandles {
     /// Shared per-namespace status handles for `health()` (incl. the 409 `Rejected`
     /// terminal) — read long after the `Subscription`s are owned by their serve tasks.
     pub statuses: Vec<Arc<Mutex<SubStatus>>>,
+    /// Bump to cut every waiting backoff in this group short ([`BusClient::retry_now`]).
+    pub wake: Arc<watch::Sender<u64>>,
 }
 
 /// Spawn one shed server's watcher group — a MECHANICAL GENERALIZATION of the former
@@ -1153,7 +1768,9 @@ pub fn spawn_server_group(
         bus_certs,
         log.clone(),
     ) {
-        Ok(c) => c.with_server_name(target.name.clone()),
+        Ok(c) => c
+            .with_server_name(target.name.clone())
+            .with_machine(deps.machine.clone()),
         Err(e) => {
             log.error(&format!(
                 "message bus disabled server={} url={}: {e}",
@@ -1166,6 +1783,7 @@ pub fn spawn_server_group(
                 cancel,
                 done,
                 statuses: Vec::new(),
+                wake: Arc::new(watch::channel(0u64).0),
             };
         }
     };
@@ -1279,6 +1897,7 @@ pub fn spawn_server_group(
         cancel,
         done,
         statuses,
+        wake: client.wake_handle(),
     }
 }
 
@@ -1450,13 +2069,55 @@ async fn respond_and_audit(
 ) {
     let mut resp = Envelope::new_response(&env.id, namespace, payload);
     resp.shed = env.shed.clone(); // route the reply back (resp.Shed = req.Shed)
-    if let Err(e) = client.respond(namespace, &resp, shutdown).await {
-        client.log.warn(&format!("failed to send {what}: {e}"));
+    let delivered = client.respond_detailed(namespace, &resp, shutdown).await;
+    if let Err(f) = &delivered {
+        client.log.warn(&format!(
+            "failed to send {what} namespace={namespace} server={}: {}",
+            client.server_label(),
+            f.err
+        ));
     }
-    // Audit after responding — the durable log + desktop fan-out.
-    if let Some(entry) = audit_entry {
+    // Audit after responding — the durable log + desktop fan-out. An answer the shed
+    // server ITSELF refused (its own error body, read whole) never reached the shed, so
+    // the entry says that rather than recording a credential handed over: e.g. a
+    // signature made on a machine that stopped being the source while the person was
+    // approving it. Any other status (a proxy's 502 can follow an answer that WAS
+    // delivered) keeps the operation's result, the status noted as delivery unknown; a
+    // transport failure is left as is: the answer may well have been delivered.
+    if let Some(mut entry) = audit_entry {
+        if let Err(RespondFailure {
+            err: BusError::BadStatus(status, _),
+            server_code,
+        }) = &delivered
+        {
+            mark_refused(&mut entry, *status, server_code.as_deref());
+        }
         audit.log(entry);
     }
+}
+
+/// Record on `entry` that the answer was refused with `status`. When the refusal is the
+/// shed server's own (`server_code`), `result` becomes [`AUDIT_RESULT_UNDELIVERED`] and
+/// `reason` keeps what the operation itself came to; otherwise `result` is kept and the
+/// status is noted with "delivery unknown".
+fn mark_refused(entry: &mut AuditEntry, status: u16, server_code: Option<&str>) {
+    let note = match server_code {
+        Some(code) => {
+            let code: String = code
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take(MAX_CODE_CHARS)
+                .collect();
+            let was = std::mem::replace(&mut entry.result, AUDIT_RESULT_UNDELIVERED.to_string());
+            format!("result {was}, but the server refused the response (status {status} {code})")
+        }
+        None => format!("the response was answered with status {status}; delivery unknown"),
+    };
+    entry.reason = if entry.reason.is_empty() {
+        note
+    } else {
+        format!("{}; {note}", entry.reason)
+    };
 }
 
 /// The sign request payload (`internal/ext/protocol/ssh.go:SSHSignRequest`).
@@ -4734,6 +5395,1512 @@ mod tests {
         assert_eq!(
             docker_error("boom", "INTERNAL_ERROR"),
             serde_json::json!({"error":"boom","code":"INTERNAL_ERROR"})
+        );
+    }
+
+    // ---- plan 035 §3.4: machine identity, the three refusals, respond retries ----
+
+    const MID: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER_ID: &str = "fedcba9876543210fedcba9876543210";
+
+    fn identity(name: &str) -> MachineIdentity {
+        MachineIdentity {
+            id: MID.into(),
+            name: name.into(),
+        }
+    }
+
+    fn not_bound_body(name: &str) -> String {
+        serde_json::json!({
+            "error": {"code": "SOURCE_NOT_BOUND", "message": "credential source for this server is \"desk\""},
+            "source": {"machine_id": OTHER_ID, "machine_name": name},
+        })
+        .to_string()
+    }
+
+    fn api_error(code: &str) -> String {
+        serde_json::json!({"error": {"code": code, "message": "refused"}}).to_string()
+    }
+
+    fn desk() -> ActiveSource {
+        ActiveSource {
+            machine_id: OTHER_ID.into(),
+            machine_name: "desk".into(),
+        }
+    }
+
+    /// The classification table. `not-source` iff 403 AND `error.code ==
+    /// SOURCE_NOT_BOUND`; `duplicate` iff 409 AND `SOURCE_DUPLICATE_STREAM`; every row
+    /// after the first two of each block is a negative control that must NOT take that
+    /// state.
+    #[test]
+    fn classify_subscribe_refusal_table() {
+        use SubscribeRefusal::*;
+        let ns = |name: &str| {
+            NotSource(ActiveSource {
+                machine_id: OTHER_ID.into(),
+                machine_name: name.into(),
+            })
+        };
+        let cases: Vec<(u16, String, SubscribeRefusal)> = vec![
+            // 403: not the source.
+            (403, not_bound_body("desk"), ns("desk")),
+            (403, not_bound_body("büro 2"), ns("büro 2")),
+            // The code alone decides; a missing or malformed source names no one.
+            (
+                403,
+                api_error("SOURCE_NOT_BOUND"),
+                NotSource(ActiveSource::default()),
+            ),
+            (
+                403,
+                r#"{"error":{"code":"SOURCE_NOT_BOUND"},"source":{"machine_id":7,"machine_name":null}}"#.into(),
+                NotSource(ActiveSource::default()),
+            ),
+            // 403 negatives: any other code, a released-broker refusal, a wrong case, the
+            // code in the wrong place, and every unparseable body.
+            (403, api_error("SOURCE_MACHINE_ID_REQUIRED"), Other),
+            (403, api_error("FORBIDDEN"), Other),
+            (403, api_error("NAMESPACE_RESERVED"), Other),
+            (403, api_error("source_not_bound"), Other),
+            (403, r#"{"code":"SOURCE_NOT_BOUND"}"#.into(), Other),
+            (403, r#"{"error":"SOURCE_NOT_BOUND"}"#.into(), Other),
+            (403, r#"{"error":{"code":["SOURCE_NOT_BOUND"]}}"#.into(), Other),
+            (403, "SOURCE_NOT_BOUND".into(), Other),
+            (403, r#"{"error":{"code":"SOURCE_NOT_BOUND""#.into(), Other),
+            (403, r#"["SOURCE_NOT_BOUND"]"#.into(), Other),
+            (403, String::new(), Other),
+            // The right code under the wrong status is not not-source either.
+            (503, not_bound_body("desk"), Other),
+            (400, not_bound_body("desk"), Other),
+            (409, not_bound_body("desk"), Conflict),
+            (401, not_bound_body("desk"), Unauthorized),
+            // 409: the duplicate is retryable; every other 409 is terminal as before.
+            (409, api_error("SOURCE_DUPLICATE_STREAM"), Duplicate),
+            (409, api_error("NAMESPACE_ALREADY_REGISTERED"), Conflict),
+            (409, String::new(), Conflict),
+            (409, "namespace \"ssh-agent\" is already registered".into(), Conflict),
+            (409, api_error("source_duplicate_stream"), Conflict),
+            (403, api_error("SOURCE_DUPLICATE_STREAM"), Other),
+            // 401 keeps its meaning whatever the body says.
+            (401, String::new(), Unauthorized),
+            (401, api_error("SOURCE_DUPLICATE_STREAM"), Unauthorized),
+            (500, String::new(), Other),
+        ];
+        for (status, body, want) in cases {
+            assert_eq!(
+                classify_subscribe_refusal(status, &body, true),
+                want,
+                "status {status} body {body:?}"
+            );
+        }
+    }
+
+    /// A body that was cut short is never a pin refusal, even when the part read parses
+    /// on its own — a complete `SOURCE_NOT_BOUND` (or `SOURCE_DUPLICATE_STREAM`) object,
+    /// whitespace padding up to the byte cap, then garbage past it.
+    #[test]
+    fn an_incomplete_body_is_never_a_pin_refusal() {
+        for (status, code, cut) in [
+            (403u16, CODE_SOURCE_NOT_BOUND, SubscribeRefusal::Other),
+            (
+                409,
+                CODE_SOURCE_DUPLICATE_STREAM,
+                SubscribeRefusal::Conflict,
+            ),
+        ] {
+            let body = api_error(code);
+            assert_ne!(
+                classify_subscribe_refusal(status, &body, true),
+                cut,
+                "control: the whole body classifies"
+            );
+            assert_eq!(
+                classify_subscribe_refusal(status, &body, false),
+                cut,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            classify_subscribe_refusal(401, "", false),
+            SubscribeRefusal::Unauthorized
+        );
+    }
+
+    /// The server names the active machine, so its strings are cleaned before they
+    /// reach a log or a status line: no control characters, bounded length.
+    #[test]
+    fn active_source_strings_are_cleaned() {
+        let long = "x".repeat(500);
+        let body = serde_json::json!({
+            "error": {"code": "SOURCE_NOT_BOUND"},
+            "source": {"machine_id": long, "machine_name": "desk\n\u{1b}[31mred\u{7}"},
+        })
+        .to_string();
+        let SubscribeRefusal::NotSource(src) = classify_subscribe_refusal(403, &body, true) else {
+            panic!("not classified as not-source");
+        };
+        assert_eq!(src.machine_name, "desk[31mred");
+        assert_eq!(src.machine_id.len(), MAX_SOURCE_FIELD_BYTES);
+        // A multi-byte character is never cut in half.
+        assert_eq!(display_field("ééé", 5), "éé");
+    }
+
+    #[test]
+    fn percent_encode_name_table() {
+        for (name, want) in [
+            ("laptop", "laptop"),
+            ("Mini-2.lan_x~", "Mini-2.lan_x~"),
+            ("laptop (work)", "laptop%20%28work%29"),
+            ("a+b%c/d", "a%2Bb%25c%2Fd"),
+            ("büro", "b%C3%BCro"),
+            ("日本", "%E6%97%A5%E6%9C%AC"),
+        ] {
+            assert_eq!(percent_encode_name(name), want, "{name:?}");
+        }
+    }
+
+    /// An identity this build would not write is never put on the wire.
+    #[test]
+    fn with_machine_drops_an_invalid_identity() {
+        let c = open_client("http://x").with_machine(Some(identity("ok")));
+        assert!(c.machine.is_some());
+        for bad in [
+            MachineIdentity {
+                id: "0123".into(),
+                name: "ok".into(),
+            },
+            MachineIdentity {
+                id: MID.to_uppercase(),
+                name: "ok".into(),
+            },
+            MachineIdentity {
+                id: MID.into(),
+                name: "tab\there".into(),
+            },
+            MachineIdentity {
+                id: MID.into(),
+                name: String::new(),
+            },
+        ] {
+            let c = open_client("http://x").with_machine(Some(bad.clone()));
+            assert!(c.machine.is_none(), "{bad:?} must not be sent");
+        }
+    }
+
+    /// A tiny HTTP/1.1 server answering each request from a script (then a default),
+    /// recording every request's method, path and headers. Each answer closes the
+    /// connection, so every request is one fresh accept.
+    struct ScriptedServer {
+        addr: std::net::SocketAddr,
+        seen: Arc<Mutex<Vec<SeenRequest>>>,
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct SeenRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        at: Instant,
+    }
+
+    impl SeenRequest {
+        fn header(&self, name: &str) -> Option<String> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    /// One scripted answer: status, extra headers, body.
+    #[derive(Clone)]
+    struct Answer(u16, Vec<(&'static str, String)>, String);
+
+    /// A scripted reply: a plain [`Answer`], or one that misbehaves in time.
+    #[derive(Clone)]
+    enum Reply {
+        Plain(Answer),
+        /// The head (with `Content-Length: declared`) and `first` at once, then after
+        /// `pause` the `rest` (or, with `None`, nothing more: the body never ends).
+        Slow {
+            status: u16,
+            headers: Vec<(&'static str, String)>,
+            declared: usize,
+            first: String,
+            pause: Duration,
+            rest: Option<String>,
+        },
+        /// Read the request and never answer it.
+        Silent,
+    }
+
+    impl From<Answer> for Reply {
+        fn from(a: Answer) -> Reply {
+            Reply::Plain(a)
+        }
+    }
+
+    impl ScriptedServer {
+        async fn spawn(script: Vec<Answer>, default: Answer) -> ScriptedServer {
+            Self::spawn_replies(
+                script.into_iter().map(Reply::from).collect(),
+                default.into(),
+            )
+            .await
+        }
+
+        async fn spawn_replies(script: Vec<Reply>, default: Reply) -> ScriptedServer {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen: Arc<Mutex<Vec<SeenRequest>>> = Arc::default();
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let script = Arc::new(Mutex::new(std::collections::VecDeque::from(script)));
+            let (seen2, notify2) = (seen.clone(), notify.clone());
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    // Read the head, then any Content-Length body.
+                    let head_end = loop {
+                        let n = match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break None,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(i);
+                        }
+                    };
+                    let Some(head_end) = head_end else { continue };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let mut lines = head.split("\r\n");
+                    let mut first = lines.next().unwrap_or("").split(' ');
+                    let method = first.next().unwrap_or("").to_string();
+                    let path = first.next().unwrap_or("").to_string();
+                    let headers: Vec<(String, String)> = lines
+                        .filter_map(|l| l.split_once(':'))
+                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                        .collect();
+                    let len: usize = headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, v)| v.parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + 4 + len {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    seen2.lock().unwrap().push(SeenRequest {
+                        method,
+                        path,
+                        headers,
+                        at: Instant::now(),
+                    });
+                    notify2.notify_waiters();
+                    let reply = script
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| default.clone());
+                    let head = |status: u16, len: usize, extra: &[(&str, String)]| {
+                        let mut h = format!(
+                            "HTTP/1.1 {status} X\r\nContent-Length: {len}\r\nConnection: close\r\n"
+                        );
+                        for (k, v) in extra {
+                            h.push_str(&format!("{k}: {v}\r\n"));
+                        }
+                        h.push_str("\r\n");
+                        h
+                    };
+                    // Each reply is written on its own task, so a slow or silent one never
+                    // holds up the next accept.
+                    match reply {
+                        Reply::Plain(Answer(status, extra, body)) => {
+                            let resp = head(status, body.len(), &extra) + &body;
+                            tokio::spawn(async move {
+                                let _ = sock.write_all(resp.as_bytes()).await;
+                                let _ = sock.shutdown().await;
+                            });
+                        }
+                        Reply::Slow {
+                            status,
+                            headers,
+                            declared,
+                            first,
+                            pause,
+                            rest,
+                        } => {
+                            let start = head(status, declared, &headers) + &first;
+                            tokio::spawn(async move {
+                                let _ = sock.write_all(start.as_bytes()).await;
+                                let _ = sock.flush().await;
+                                tokio::time::sleep(pause).await;
+                                match rest {
+                                    Some(rest) => {
+                                        let _ = sock.write_all(rest.as_bytes()).await;
+                                        let _ = sock.shutdown().await;
+                                    }
+                                    None => std::future::pending::<()>().await,
+                                }
+                            });
+                        }
+                        Reply::Silent => {
+                            tokio::spawn(async move {
+                                let _keep = sock;
+                                std::future::pending::<()>().await;
+                            });
+                        }
+                    }
+                }
+            });
+            ScriptedServer { addr, seen, notify }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn seen(&self) -> Vec<SeenRequest> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// Wait (bounded) until at least `n` requests have arrived.
+        async fn wait_for(&self, n: usize, within: Duration) -> Vec<SeenRequest> {
+            let deadline = Instant::now() + within;
+            loop {
+                let notified = self.notify.notified();
+                let seen = self.seen();
+                if seen.len() >= n {
+                    return seen;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !left.is_zero(),
+                    "only {} of {n} requests arrived",
+                    seen.len()
+                );
+                let _ = tokio::time::timeout(left.min(Duration::from_millis(50)), notified).await;
+            }
+        }
+    }
+
+    fn sse_one(id: &str) -> String {
+        format!(
+            "data: {{\"id\":\"{id}\",\"namespace\":\"ssh-agent\",\"type\":\"request\",\"final\":true,\"timestamp\":\"t\",\"payload\":{{\"operation\":\"ping\"}}}}\n\n"
+        )
+    }
+
+    async fn wait_state(sub: &Subscription, want: ConnState, within: Duration) -> SubStatus {
+        let deadline = Instant::now() + within;
+        loop {
+            let s = sub.status();
+            if s.state == want {
+                return s;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never reached {want:?}; last {s:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn fast(c: BusClient) -> BusClient {
+        c.with_test_backoff(Duration::from_millis(5), Duration::from_millis(20))
+    }
+
+    fn provider_client(url: &str, tp: Arc<SeqTokenProvider>, log: Arc<dyn BusLog>) -> BusClient {
+        BusClient::new(url.to_string(), String::new(), Some(tp), None, None, log).unwrap()
+    }
+
+    /// Subscribe and respond both carry the id and the percent-encoded name.
+    #[tokio::test]
+    async fn subscribe_and_respond_carry_the_identity_headers() {
+        let srv = ScriptedServer::spawn(
+            vec![Answer(
+                200,
+                vec![("Content-Type", "text/event-stream".into())],
+                sse_one("e1"),
+            )],
+            Answer(204, vec![], String::new()),
+        )
+        .await;
+        let client = fast(open_client(&srv.url())).with_machine(Some(identity("laptop (work)")));
+        let (tx, rx) = shutdown_pair();
+        let mut sub = client.subscribe("ssh-agent", rx);
+        tokio::time::timeout(Duration::from_secs(5), sub.rx.recv())
+            .await
+            .expect("an envelope")
+            .unwrap();
+        let _ = tx.send(true);
+        let env = Envelope::new_response("e1", "ssh-agent", serde_json::Value::Null);
+        client
+            .respond("ssh-agent", &env, &never_shutdown())
+            .await
+            .unwrap();
+        let seen = srv.seen();
+        let get = seen
+            .iter()
+            .find(|r| r.method == "GET")
+            .expect("a subscribe");
+        let post = seen.iter().find(|r| r.method == "POST").expect("a respond");
+        assert_eq!(get.path, "/api/plugins/listeners/ssh-agent/messages");
+        assert_eq!(post.path, "/api/plugins/listeners/ssh-agent/respond");
+        for r in [get, post] {
+            assert_eq!(r.header(HEADER_MACHINE_ID).as_deref(), Some(MID), "{r:?}");
+            assert_eq!(
+                r.header(HEADER_MACHINE_NAME).as_deref(),
+                Some("laptop%20%28work%29"),
+                "{r:?}"
+            );
+        }
+    }
+
+    /// No identity: neither header, on either request — the wire is as before.
+    #[tokio::test]
+    async fn no_identity_sends_no_identity_headers() {
+        let srv = ScriptedServer::spawn(
+            vec![Answer(200, vec![], sse_one("e1"))],
+            Answer(204, vec![], String::new()),
+        )
+        .await;
+        let client = fast(open_client(&srv.url())).with_machine(None);
+        let (tx, rx) = shutdown_pair();
+        let mut sub = client.subscribe("ssh-agent", rx);
+        tokio::time::timeout(Duration::from_secs(5), sub.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = tx.send(true);
+        let env = Envelope::new_response("e1", "ssh-agent", serde_json::Value::Null);
+        client
+            .respond("ssh-agent", &env, &never_shutdown())
+            .await
+            .unwrap();
+        for r in srv.seen() {
+            assert_eq!(r.header(HEADER_MACHINE_ID), None, "{r:?}");
+            assert_eq!(r.header(HEADER_MACHINE_NAME), None, "{r:?}");
+        }
+    }
+
+    /// Not the source: the state names the active machine, the loop keeps retrying on
+    /// its backoff WITHOUT re-minting, says so once at INFO, and connects on its own once
+    /// the server accepts it.
+    #[tokio::test]
+    async fn not_source_retries_without_reminting_then_connects() {
+        let refusal = Answer(403, vec![], not_bound_body("desk"));
+        let srv = ScriptedServer::spawn(
+            vec![refusal.clone(), refusal.clone(), refusal.clone(), refusal],
+            Answer(200, vec![], sse_one("after")),
+        )
+        .await;
+        let tp = SeqTokenProvider::new();
+        let log = Arc::new(CountingLog::default());
+        let client = fast(provider_client(&srv.url(), tp.clone(), log.clone()))
+            .with_machine(Some(identity("laptop")));
+        let (tx, rx) = shutdown_pair();
+        let mut sub = client.subscribe("ssh-agent", rx);
+        let s = wait_state(&sub, ConnState::NotSource, Duration::from_secs(5)).await;
+        assert_eq!(s.active_source, Some(desk()));
+        assert!(
+            s.last_error.contains("the active source is desk"),
+            "{}",
+            s.last_error
+        );
+        let e = tokio::time::timeout(Duration::from_secs(5), sub.rx.recv())
+            .await
+            .expect("connects once the server accepts it")
+            .unwrap();
+        assert_eq!(e.id, "after");
+        let _ = tx.send(true);
+        assert!(srv.seen().len() >= 5, "four refusals then the accept");
+        assert_eq!(
+            tp.invalidated(),
+            0,
+            "a not-source refusal must never re-mint"
+        );
+        let infos: Vec<String> = log
+            .lines()
+            .into_iter()
+            .filter(|l| l.starts_with("INFO ") && l.contains("not the credential source"))
+            .collect();
+        assert_eq!(infos.len(), 1, "said once at INFO, then quiet: {infos:?}");
+        // Never louder than INFO (the scripted server closing the accepted stream
+        // afterwards is a WARN of its own, about the drop).
+        assert!(
+            !log.lines()
+                .iter()
+                .any(|l| (l.starts_with("WARN ") || l.starts_with("ERROR "))
+                    && l.contains("not the credential source")),
+            "{:?}",
+            log.lines()
+        );
+        // Leaving the state clears the active source.
+        let after = sub.status();
+        assert_ne!(after.state, ConnState::NotSource);
+        assert_eq!(after.active_source, None);
+    }
+
+    /// A duplicate stream (this machine's id already holds the namespace in another
+    /// process) keeps retrying, without re-minting; it is never terminal.
+    #[tokio::test]
+    async fn duplicate_stream_keeps_retrying() {
+        let srv = ScriptedServer::spawn(
+            vec![],
+            Answer(409, vec![], api_error(CODE_SOURCE_DUPLICATE_STREAM)),
+        )
+        .await;
+        let tp = SeqTokenProvider::new();
+        let client = fast(provider_client(&srv.url(), tp.clone(), silent_log()))
+            .with_machine(Some(identity("laptop")));
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        srv.wait_for(3, Duration::from_secs(5)).await;
+        let s = sub.status();
+        assert_eq!(s.state, ConnState::Duplicate);
+        assert!(
+            s.last_error.contains("duplicate stream"),
+            "{}",
+            s.last_error
+        );
+        assert_eq!(s.active_source, None);
+        assert_eq!(tp.invalidated(), 0);
+        let _ = tx.send(true);
+    }
+
+    /// Negative controls on the live loop: a 403 with another code, and a 403 whose body
+    /// does not parse, are plain `reconnecting` with the server's body shown — never
+    /// not-source — and keep retrying.
+    #[tokio::test]
+    async fn other_403s_are_reconnecting_never_not_source() {
+        for body in [
+            api_error("FORBIDDEN"),
+            api_error("SOURCE_MACHINE_ID_REQUIRED"),
+            "SOURCE_NOT_BOUND but not json".to_string(),
+        ] {
+            let srv = ScriptedServer::spawn(vec![], Answer(403, vec![], body.clone())).await;
+            let client = fast(open_client(&srv.url())).with_machine(Some(identity("laptop")));
+            let (tx, rx) = shutdown_pair();
+            let sub = client.subscribe("ssh-agent", rx);
+            srv.wait_for(3, Duration::from_secs(5)).await;
+            let s = sub.status();
+            assert_eq!(s.state, ConnState::Reconnecting, "{body}");
+            assert_eq!(s.last_error, format!("unexpected status 403: {body}"));
+            assert_eq!(s.active_source, None);
+            let _ = tx.send(true);
+        }
+    }
+
+    /// A 409 with the API's ordinary already-registered body stays terminal: one hit.
+    #[tokio::test]
+    async fn api_shaped_409_without_the_duplicate_code_is_terminal() {
+        let srv = ScriptedServer::spawn(
+            vec![],
+            Answer(409, vec![], api_error("NAMESPACE_ALREADY_REGISTERED")),
+        )
+        .await;
+        let client = fast(open_client(&srv.url())).with_machine(Some(identity("laptop")));
+        let (_tx, rx) = shutdown_pair();
+        let mut sub = client.subscribe("ssh-agent", rx);
+        let closed = tokio::time::timeout(Duration::from_secs(3), sub.rx.recv())
+            .await
+            .expect("terminal: the channel closes");
+        assert!(closed.is_none());
+        assert_eq!(sub.status().state, ConnState::Rejected);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(srv.seen().len(), 1, "no retry after a terminal 409");
+    }
+
+    /// `retry_now` cuts a long backoff short: with a 10 s floor, the second attempt
+    /// comes at once after the wake rather than ten seconds later.
+    #[tokio::test]
+    async fn retry_now_cuts_the_backoff_short() {
+        let srv = ScriptedServer::spawn(vec![], Answer(403, vec![], not_bound_body("desk"))).await;
+        let client = open_client(&srv.url())
+            .with_test_backoff(Duration::from_secs(10), Duration::from_secs(10))
+            .with_machine(Some(identity("laptop")));
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        wait_state(&sub, ConnState::NotSource, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(srv.seen().len(), 1, "still backing off");
+        client.retry_now();
+        srv.wait_for(2, Duration::from_secs(3)).await;
+        let _ = tx.send(true);
+    }
+
+    fn retry_after(status: u16, secs: &str) -> Answer {
+        Answer(
+            status,
+            vec![("Retry-After", secs.to_string())],
+            api_error("BUSY"),
+        )
+    }
+
+    /// A 503 or 429 that carries `Retry-After` is re-sent, and the answer delivered.
+    #[tokio::test]
+    async fn respond_retries_503_and_429_with_retry_after() {
+        for status in [503u16, 429] {
+            let srv = ScriptedServer::spawn(
+                vec![retry_after(status, "0"), retry_after(status, "0")],
+                Answer(204, vec![], String::new()),
+            )
+            .await;
+            let client = open_client(&srv.url()).with_machine(Some(identity("laptop")));
+            let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+            client
+                .respond("ns", &env, &never_shutdown())
+                .await
+                .unwrap_or_else(|e| panic!("{status}: {e}"));
+            let seen = srv.seen();
+            assert_eq!(seen.len(), 3, "{status}: two refusals then the 204");
+            // Every attempt carries the identity, and a `Retry-After: 0` still waits.
+            for r in &seen {
+                assert_eq!(r.header(HEADER_MACHINE_ID).as_deref(), Some(MID));
+            }
+            assert!(seen[1].at - seen[0].at >= RESPOND_RETRY_MIN_WAIT);
+        }
+    }
+
+    /// Never retried: a 503/429 without `Retry-After`, a 403, a 413 — one send each,
+    /// the status surfaced.
+    #[tokio::test]
+    async fn respond_does_not_retry_other_refusals() {
+        for answer in [
+            Answer(503, vec![], api_error("PLUGINS_DISABLED")),
+            Answer(429, vec![], String::new()),
+            Answer(
+                403,
+                vec![("Retry-After", "0".into())],
+                api_error("FORBIDDEN"),
+            ),
+            Answer(
+                413,
+                vec![("Retry-After", "0".into())],
+                api_error("TOO_LARGE"),
+            ),
+            Answer(500, vec![("Retry-After", "0".into())], String::new()),
+        ] {
+            let status = answer.0;
+            let srv = ScriptedServer::spawn(vec![answer], Answer(204, vec![], String::new())).await;
+            let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+            let err = open_client(&srv.url())
+                .respond("ns", &env, &never_shutdown())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, BusError::BadStatus(s, _) if s == status),
+                "{status}: {err:?}"
+            );
+            assert_eq!(srv.seen().len(), 1, "{status} must not be retried");
+        }
+    }
+
+    /// The retry is bounded: a server that keeps answering 503 gets the first send plus
+    /// `RESPOND_MAX_RETRIES`, and a `Retry-After` past the budget is not waited for.
+    #[tokio::test]
+    async fn respond_retry_is_bounded() {
+        let srv = ScriptedServer::spawn(vec![], retry_after(503, "0")).await;
+        let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+        let err = open_client(&srv.url())
+            .respond("ns", &env, &never_shutdown())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BusError::BadStatus(503, _)), "{err:?}");
+        assert_eq!(srv.seen().len(), 1 + RESPOND_MAX_RETRIES as usize);
+
+        let srv = ScriptedServer::spawn(vec![], retry_after(429, "60")).await;
+        let started = Instant::now();
+        let err = open_client(&srv.url())
+            .respond("ns", &env, &never_shutdown())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BusError::BadStatus(429, _)), "{err:?}");
+        assert_eq!(srv.seen().len(), 1, "a wait past the budget is not taken");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn respond_retry_wait_table() {
+        use reqwest::header::HeaderValue;
+        let v = |s: &str| HeaderValue::from_str(s).unwrap();
+        let budget = RESPOND_RETRY_BUDGET;
+        let ok = |status: u16, raw: &str, remaining: Duration| {
+            respond_retry_wait(status, Some(&v(raw)), 0, remaining)
+        };
+        assert_eq!(ok(503, "2", budget), Some(Duration::from_secs(2)));
+        assert_eq!(ok(429, "0", budget), Some(RESPOND_RETRY_MIN_WAIT));
+        assert_eq!(ok(503, " 1 ", budget), Some(Duration::from_secs(1)));
+        // Only a non-negative whole number of seconds that fits what is left of the
+        // deadline: everything else means do not retry (never "one second").
+        for raw in [
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            "Fri, 01 Jan 2100 00:00:00 GMT",
+            "18446744073709551615",
+            "18446744073709551616",
+            "99999999999999999999999999",
+            "-1",
+            "+1",
+            "1.5",
+            "1, 2",
+            "1 2",
+            "soon",
+            "",
+            "5",
+            "60",
+        ] {
+            assert_eq!(ok(503, raw, budget), None, "Retry-After {raw:?}");
+        }
+        // The wait must end inside the remaining budget, not the whole one.
+        assert_eq!(
+            ok(503, "2", Duration::from_secs(3)),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(ok(503, "2", Duration::from_secs(2)), None);
+        assert_eq!(ok(503, "0", RESPOND_RETRY_MIN_WAIT), None);
+        assert_eq!(ok(503, "0", Duration::ZERO), None);
+        // Negative controls.
+        assert_eq!(respond_retry_wait(503, None, 0, budget), None);
+        assert_eq!(ok(403, "0", budget), None);
+        assert_eq!(ok(413, "0", budget), None);
+        assert_eq!(ok(500, "0", budget), None);
+        assert_eq!(
+            respond_retry_wait(503, Some(&v("0")), RESPOND_MAX_RETRIES, budget),
+            None
+        );
+    }
+
+    /// A refusal body padded past the byte cap is cut short, and a cut-short body is
+    /// never a pin refusal on the live loop either: a complete `SOURCE_NOT_BOUND` object,
+    /// whitespace to the cap, then garbage is plain `reconnecting`; the same with
+    /// `SOURCE_DUPLICATE_STREAM` under a 409 is terminal, never retried.
+    #[tokio::test]
+    async fn a_padded_refusal_body_is_never_a_pin_state() {
+        let padded = |json: String| {
+            let pad = MAX_ERROR_BODY_BYTES - json.len();
+            format!("{json}{}garbage that is not JSON", " ".repeat(pad))
+        };
+        let srv =
+            ScriptedServer::spawn(vec![], Answer(403, vec![], padded(not_bound_body("desk"))))
+                .await;
+        let client = fast(open_client(&srv.url())).with_machine(Some(identity("laptop")));
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        srv.wait_for(3, Duration::from_secs(5)).await;
+        let s = sub.status();
+        assert_eq!(s.state, ConnState::Reconnecting, "{s:?}");
+        assert_eq!(s.active_source, None);
+        let _ = tx.send(true);
+
+        let srv = ScriptedServer::spawn(
+            vec![],
+            Answer(409, vec![], padded(api_error(CODE_SOURCE_DUPLICATE_STREAM))),
+        )
+        .await;
+        let client = fast(open_client(&srv.url())).with_machine(Some(identity("laptop")));
+        let (_tx, rx) = shutdown_pair();
+        let mut sub = client.subscribe("ssh-agent", rx);
+        let closed = tokio::time::timeout(Duration::from_secs(3), sub.rx.recv())
+            .await
+            .expect("terminal: the channel closes");
+        assert!(closed.is_none());
+        assert_eq!(sub.status().state, ConnState::Rejected);
+        assert_eq!(srv.seen().len(), 1, "a terminal 409 is not retried");
+    }
+
+    /// A refusal body that never ends does not stall the subscribe loop: the read gives
+    /// up after [`ERROR_BODY_READ_TIMEOUT`], the cut-short body is not classified (a
+    /// `SOURCE_NOT_BOUND` prefix stays plain `reconnecting`), and the loop retries.
+    #[tokio::test]
+    async fn a_never_ending_refusal_body_does_not_stall_the_subscribe_loop() {
+        let body = not_bound_body("desk");
+        let srv = ScriptedServer::spawn_replies(
+            vec![],
+            Reply::Slow {
+                status: 403,
+                headers: vec![],
+                declared: body.len() + 10,
+                first: body,
+                pause: Duration::ZERO,
+                rest: None,
+            },
+        )
+        .await;
+        let client = fast(open_client(&srv.url())).with_machine(Some(identity("laptop")));
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        let seen = srv
+            .wait_for(2, ERROR_BODY_READ_TIMEOUT + Duration::from_secs(3))
+            .await;
+        let gap = seen[1].at - seen[0].at;
+        assert!(
+            gap >= ERROR_BODY_READ_TIMEOUT,
+            "the read waited its bound: {gap:?}"
+        );
+        let s = sub.status();
+        assert_eq!(s.state, ConnState::Reconnecting, "{s:?}");
+        assert!(s.last_error.starts_with("unexpected status 403: "), "{s:?}");
+        assert_eq!(s.active_source, None);
+        let _ = tx.send(true);
+    }
+
+    /// Server text shown to a person — the active machine's name and id, and refusal
+    /// bodies in status and in the log — loses its controls AND its invisible format
+    /// characters (bidirectional overrides and isolates, zero-width characters, the BOM),
+    /// so a server can neither forge a line, send a terminal escape, nor disguise a name.
+    #[tokio::test]
+    async fn server_text_is_cleaned_before_it_is_shown_or_logged() {
+        let hostile =
+            "de\u{202E}ks\u{200B}\u{2066}x\u{2069}\u{FEFF}\u{061C}\u{200F}\u{2060}\u{00AD}!";
+        assert_eq!(display_field(hostile, 64), "deksx!");
+        let body = serde_json::json!({
+            "error": {"code": "SOURCE_NOT_BOUND"},
+            "source": {"machine_id": "ab\u{202A}cd", "machine_name": hostile},
+        })
+        .to_string();
+        let SubscribeRefusal::NotSource(src) = classify_subscribe_refusal(403, &body, true) else {
+            panic!("not classified as not-source");
+        };
+        assert_eq!(src.machine_name, "deksx!");
+        assert_eq!(src.machine_id, "abcd");
+
+        // A plain 403 body with a forged log line, a terminal escape and a bidi override,
+        // on the subscribe loop (status) and on a respond (the warning log).
+        let raw = "denied\n2026-01-01 INFO forged line\u{1b}[2J\u{202E}tail\u{7}";
+        let srv = ScriptedServer::spawn(vec![], Answer(403, vec![], raw.into())).await;
+        let log = Arc::new(CountingLog::default());
+        let client = fast(open_client_with(&srv.url(), log.clone()));
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        srv.wait_for(2, Duration::from_secs(5)).await;
+        let want = "denied2026-01-01 INFO forged line[2Jtail";
+        assert_eq!(
+            sub.status().last_error,
+            format!("unexpected status 403: {want}")
+        );
+        let _ = tx.send(true);
+
+        let audit = Arc::new(CollectingAudit::default());
+        let handlers = test_handlers(approve_gate(), audit.clone(), empty_backend());
+        handle_bus_message(
+            &client,
+            "ssh-agent",
+            &list_request(),
+            &never_shutdown(),
+            &handlers,
+        )
+        .await;
+        let lines = log.lines();
+        let warn = lines
+            .iter()
+            .find(|l| l.starts_with("WARN ") && l.contains("failed to send"))
+            .expect("the failed respond is logged");
+        assert!(warn.ends_with(want), "{warn:?}");
+        for l in &lines {
+            assert!(
+                !l.chars().any(|c| c.is_control() || is_format_char(c)),
+                "{l:?}"
+            );
+        }
+    }
+
+    fn list_request() -> Envelope {
+        Envelope {
+            id: "req-list".into(),
+            namespace: "ssh-agent".into(),
+            msg_type: "request".into(),
+            in_reply_to: String::new(),
+            is_final: true,
+            timestamp: "t".into(),
+            payload: Some(serde_json::json!({"operation": "list"})),
+            shed: Some(ShedInfo {
+                name: "web".into(),
+                backend: "vz".into(),
+                server: "s".into(),
+            }),
+        }
+    }
+
+    /// One deadline from the first send covers every refusal body read: a server that
+    /// answers `503 Retry-After: 0` at once but dribbles each body out over four seconds
+    /// cannot stretch the respond past [`RESPOND_RETRY_BUDGET`], and no POST starts after
+    /// it.
+    #[tokio::test]
+    async fn respond_deadline_covers_slow_refusal_bodies() {
+        let body = api_error("BUSY");
+        let slow = Reply::Slow {
+            status: 503,
+            headers: vec![("Retry-After", "0".into())],
+            declared: body.len(),
+            first: String::new(),
+            pause: Duration::from_secs(4),
+            rest: Some(body),
+        };
+        let srv = ScriptedServer::spawn_replies(vec![], slow).await;
+        let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+        let started = Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(20),
+            open_client(&srv.url()).respond("ns", &env, &never_shutdown()),
+        )
+        .await
+        .expect("respond returns");
+        let took = started.elapsed();
+        assert!(matches!(r, Err(BusError::BadStatus(503, _))), "{r:?}");
+        assert!(
+            took < RESPOND_RETRY_BUDGET + Duration::from_millis(900),
+            "the deadline covers the body reads: {took:?}"
+        );
+        let first = srv.seen()[0].at;
+        for (i, req) in srv.seen().iter().enumerate() {
+            assert!(
+                req.at - first < RESPOND_RETRY_BUDGET,
+                "POST {i} started {:?} after the first",
+                req.at - first
+            );
+        }
+    }
+
+    /// The deadline covers a retried send: the 503's retry is never answered, and the
+    /// respond gives up at the deadline instead of waiting forever.
+    #[tokio::test]
+    async fn respond_deadline_covers_a_stalled_retry() {
+        let srv =
+            ScriptedServer::spawn_replies(vec![retry_after(503, "0").into()], Reply::Silent).await;
+        let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+        let started = Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(20),
+            open_client(&srv.url()).respond("ns", &env, &never_shutdown()),
+        )
+        .await
+        .expect("respond returns at its deadline");
+        assert!(matches!(r, Err(BusError::Transport(_))), "{r:?}");
+        assert!(started.elapsed() < RESPOND_RETRY_BUDGET + Duration::from_millis(900));
+        assert_eq!(srv.seen().len(), 2);
+    }
+
+    /// The deadline covers getting a credential: after a 401, a re-mint that takes far
+    /// longer than the budget is abandoned at the deadline.
+    #[tokio::test]
+    async fn respond_deadline_covers_a_slow_re_mint() {
+        struct SlowAfterInvalidate(AtomicBool);
+        #[async_trait::async_trait]
+        impl TokenProvider for SlowAfterInvalidate {
+            async fn token(&self) -> Result<String, BusError> {
+                if self.0.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                Ok("tok".into())
+            }
+            fn invalidate(&self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            fn would_mint(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let srv = ScriptedServer::spawn(vec![], Answer(401, vec![], String::new())).await;
+        let client = BusClient::new(
+            srv.url(),
+            String::new(),
+            Some(Arc::new(SlowAfterInvalidate(AtomicBool::new(false)))),
+            None,
+            None,
+            silent_log(),
+        )
+        .unwrap();
+        let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+        let started = Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.respond("ns", &env, &never_shutdown()),
+        )
+        .await
+        .expect("respond returns at its deadline");
+        assert!(matches!(r, Err(BusError::Transport(_))), "{r:?}");
+        assert!(started.elapsed() < RESPOND_RETRY_BUDGET + Duration::from_millis(900));
+        assert_eq!(srv.seen().len(), 1, "the re-sent POST never went out");
+    }
+
+    #[test]
+    fn redirect_allowed_table() {
+        let u = |s: &str| reqwest::Url::parse(s).unwrap();
+        let base = u("https://shed.example:8443/");
+        let allowed = |next: &str, hops: usize| redirect_allowed(Some(&base), &u(next), hops);
+        assert!(allowed("https://shed.example:8443/api/x", 1));
+        assert!(allowed("https://SHED.example:8443/api/x", MAX_REDIRECTS));
+        // Another origin, a downgrade, too many hops, no configured URL: stop.
+        assert!(!allowed("https://shed.example:8444/api/x", 1));
+        assert!(!allowed("https://other.example:8443/api/x", 1));
+        assert!(!allowed("https://evil.shed.example:8443/api/x", 1));
+        assert!(!allowed("http://shed.example:8443/api/x", 1));
+        assert!(!allowed(
+            "https://shed.example:8443/api/x",
+            MAX_REDIRECTS + 1
+        ));
+        assert!(!redirect_allowed(None, &u("https://shed.example:8443/"), 1));
+        // The default port is the same origin as the explicit one.
+        let plain = u("https://shed.example/");
+        assert!(redirect_allowed(
+            Some(&plain),
+            &u("https://shed.example:443/x"),
+            1
+        ));
+        // A plaintext server follows nothing, even to itself.
+        let open = u("http://127.0.0.1:8080/");
+        assert!(!redirect_allowed(
+            Some(&open),
+            &u("http://127.0.0.1:8080/x"),
+            1
+        ));
+    }
+
+    /// A blocking HTTPS server on its own threads for the redirect tests: the pinned
+    /// leaf, an OPTIONAL client certificate (so a client that has one presents it), and
+    /// per request a record of its path, headers and whether a client certificate came
+    /// with it. `accepts` counts TCP connections, so zero proves nothing at all arrived.
+    struct TlsRecorder {
+        port: u16,
+        accepts: Arc<AtomicUsize>,
+        seen: TlsSeen,
+    }
+
+    /// Per request: its path, its headers, and whether a client certificate came with it.
+    type TlsSeen = Arc<Mutex<Vec<(String, Vec<(String, String)>, bool)>>>;
+    /// `answer(path, own_port)`: the raw HTTP response for a request.
+    type TlsAnswer = Arc<dyn Fn(&str, u16) -> String + Send + Sync>;
+
+    #[derive(Debug)]
+    struct AnyClientCert(rustls::crypto::WebPkiSupportedAlgorithms);
+
+    impl rustls::server::danger::ClientCertVerifier for AnyClientCert {
+        fn offer_client_auth(&self) -> bool {
+            true
+        }
+        fn client_auth_mandatory(&self) -> bool {
+            false
+        }
+        fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+            &[]
+        }
+        fn verify_client_cert(
+            &self,
+            _end: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.supported_schemes()
+        }
+    }
+
+    /// The test server's leaf (DER) and key; the pin a client uses for it.
+    fn test_leaf() -> (Vec<u8>, Vec<u8>, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let der = cert.der().to_vec();
+        let pin = shed_core::tls::fingerprint(&der);
+        (der, key.serialize_der(), pin)
+    }
+
+    impl TlsRecorder {
+        /// `answer(path, own_port)` is the raw HTTP response for a request.
+        fn spawn(leaf: &(Vec<u8>, Vec<u8>, String), answer: TlsAnswer) -> TlsRecorder {
+            use std::io::{Read, Write};
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let algs = provider.signature_verification_algorithms;
+            let cfg = Arc::new(
+                rustls::ServerConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_client_cert_verifier(Arc::new(AnyClientCert(algs)))
+                    .with_single_cert(
+                        vec![rustls::pki_types::CertificateDer::from(leaf.0.clone())],
+                        rustls::pki_types::PrivateKeyDer::Pkcs8(
+                            rustls::pki_types::PrivatePkcs8KeyDer::from(leaf.1.clone()),
+                        ),
+                    )
+                    .unwrap(),
+            );
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let seen: TlsSeen = Arc::default();
+            let (accepts2, seen2) = (accepts.clone(), seen.clone());
+            std::thread::spawn(move || {
+                for tcp in listener.incoming() {
+                    let Ok(tcp) = tcp else { continue };
+                    accepts2.fetch_add(1, Ordering::SeqCst);
+                    let (cfg, seen, answer) = (cfg.clone(), seen2.clone(), answer.clone());
+                    std::thread::spawn(move || {
+                        let conn = rustls::ServerConnection::new(cfg).unwrap();
+                        let mut tls = rustls::StreamOwned::new(conn, tcp);
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        let head_end = loop {
+                            match tls.read(&mut tmp) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                        let mut lines = head.split("\r\n");
+                        let path = lines
+                            .next()
+                            .unwrap_or("")
+                            .split(' ')
+                            .nth(1)
+                            .unwrap_or("")
+                            .to_string();
+                        let headers: Vec<(String, String)> = lines
+                            .filter_map(|l| l.split_once(':'))
+                            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                            .collect();
+                        let len: usize = headers
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, v)| v.parse().ok())
+                            .unwrap_or(0);
+                        while buf.len() < head_end + 4 + len {
+                            match tls.read(&mut tmp) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        }
+                        let cert = tls.conn.peer_certificates().is_some_and(|c| !c.is_empty());
+                        seen.lock().unwrap().push((path.clone(), headers, cert));
+                        let _ = tls.write_all(answer(&path, port).as_bytes());
+                        tls.conn.send_close_notify();
+                        let _ = tls.flush();
+                    });
+                }
+            });
+            TlsRecorder {
+                port,
+                accepts,
+                seen,
+            }
+        }
+    }
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    const NO_CONTENT: &str = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+
+    /// An https bus client pinned to `leaf`, presenting a client certificate, with an
+    /// identity: everything a redirect could leak.
+    fn pinned_identity_client(port: u16, leaf: &(Vec<u8>, Vec<u8>, String)) -> BusClient {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "SHA256:agent");
+        let client_leaf = params.self_signed(&key).unwrap();
+        let certified = shed_core::tls::certified_key_from_pem(
+            &shed_core::csr::pem_encode(shed_core::csr::PEM_LABEL_CERTIFICATE, client_leaf.der()),
+            &key.serialize_der(),
+        )
+        .unwrap();
+        let resolver = Arc::new(ClientCertResolver::new());
+        resolver.set(Some(Arc::new(certified)));
+        BusClient::new(
+            format!("https://127.0.0.1:{port}"),
+            String::new(),
+            None,
+            Some(leaf.2.clone()),
+            Some(resolver),
+            silent_log(),
+        )
+        .unwrap()
+        .with_machine(Some(identity("laptop")))
+    }
+
+    /// The identity headers and the client certificate never reach another origin: a
+    /// redirect to another HTTPS host — one even presenting the SAME pinned certificate —
+    /// is not followed, and the redirect itself is the answer; the other host sees no
+    /// connection at all. Within the configured origin a redirect is followed (headers
+    /// and certificate kept), at most [`MAX_REDIRECTS`] times.
+    #[tokio::test]
+    async fn redirects_never_leave_the_configured_origin() {
+        let leaf = test_leaf();
+        let other = TlsRecorder::spawn(&leaf, Arc::new(|_: &str, _: u16| NO_CONTENT.to_string()));
+        let other_port = other.port;
+        let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+
+        // Another origin: stopped, nothing reaches it.
+        let home = TlsRecorder::spawn(
+            &leaf,
+            Arc::new(move |_: &str, _: u16| {
+                redirect_to(&format!(
+                    "https://127.0.0.1:{other_port}/api/plugins/listeners/ns/respond"
+                ))
+            }),
+        );
+        let client = pinned_identity_client(home.port, &leaf);
+        let r = client.respond("ns", &env, &never_shutdown()).await;
+        assert_eq!(
+            other.accepts.load(Ordering::SeqCst),
+            0,
+            "another origin must see no connection: {:?}",
+            other.seen.lock().unwrap()
+        );
+        assert!(matches!(r, Err(BusError::BadStatus(307, _))), "{r:?}");
+        let home_seen = home.seen.lock().unwrap().clone();
+        assert_eq!(home_seen.len(), 1);
+        let (_, headers, cert) = &home_seen[0];
+        assert!(*cert, "the configured server got the client certificate");
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case(HEADER_MACHINE_ID) && v == MID));
+
+        // The same origin: followed, with the headers and the certificate.
+        let same = TlsRecorder::spawn(
+            &leaf,
+            Arc::new(|path: &str, port: u16| {
+                if path == "/moved" {
+                    NO_CONTENT.to_string()
+                } else {
+                    redirect_to(&format!("https://127.0.0.1:{port}/moved"))
+                }
+            }),
+        );
+        pinned_identity_client(same.port, &leaf)
+            .respond("ns", &env, &never_shutdown())
+            .await
+            .expect("a same-origin redirect is followed");
+        let seen = same.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(),
+            ["/api/plugins/listeners/ns/respond", "/moved"]
+        );
+        for (_, headers, cert) in &seen {
+            assert!(*cert);
+            assert!(headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(HEADER_MACHINE_ID)));
+        }
+
+        // A loop within the origin stops after MAX_REDIRECTS hops.
+        let looping = TlsRecorder::spawn(
+            &leaf,
+            Arc::new(|_: &str, port: u16| redirect_to(&format!("https://127.0.0.1:{port}/again"))),
+        );
+        let r = pinned_identity_client(looping.port, &leaf)
+            .respond("ns", &env, &never_shutdown())
+            .await;
+        assert!(matches!(r, Err(BusError::BadStatus(307, _))), "{r:?}");
+        assert_eq!(looping.seen.lock().unwrap().len(), 1 + MAX_REDIRECTS);
+    }
+
+    /// A minter for the real [`crate::minter::CredentialSource`]: answers from a script
+    /// (then fails), counting every mint attempt.
+    struct ScriptedMinter {
+        results: Mutex<std::collections::VecDeque<Result<String, String>>>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::minter::Minter for ScriptedMinter {
+        async fn mint(
+            &self,
+            _target: &ServerTarget,
+            _scope: &str,
+        ) -> Result<crate::minter::Minted, crate::minter::MinterError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.results.lock().unwrap().pop_front() {
+                Some(Ok(t)) => Ok(crate::minter::Minted::token(t, None)),
+                Some(Err(e)) => Err(crate::minter::MinterError::new(e)),
+                None => Err(crate::minter::MinterError::new("no more".into())),
+            }
+        }
+    }
+
+    /// At most ONE mint attempt per respond, against the real credential source: after a
+    /// 401 the replacement mint fails (the source stays refused — its `rejected` flag is
+    /// cleared only by a successful mint — and the old token is presented), the server
+    /// answers 503 with `Retry-After`, and the retry presents the surviving token WITHOUT
+    /// calling the minter again.
+    #[tokio::test]
+    async fn respond_makes_at_most_one_mint_attempt_with_the_real_source() {
+        let minter = Arc::new(ScriptedMinter {
+            results: Mutex::new(vec![Ok("tok-1".to_string()), Err("ssh down".to_string())].into()),
+            calls: AtomicUsize::new(0),
+        });
+        let source = crate::minter::new_credential_source_with_store(
+            minter.clone(),
+            ServerTarget {
+                name: "s".into(),
+                url: String::new(),
+                token: String::new(),
+                tls_fingerprint: String::new(),
+                ssh_host: String::new(),
+                ssh_port: 0,
+                auth_mode: String::new(),
+            },
+            "credentials",
+            None,
+        );
+        assert_eq!(source.token().await.unwrap(), "tok-1");
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 1);
+        let srv = ScriptedServer::spawn(
+            vec![
+                Answer(401, vec![], api_error("UNAUTHORIZED")),
+                retry_after(503, "0"),
+            ],
+            Answer(204, vec![], String::new()),
+        )
+        .await;
+        let client = BusClient::new(
+            srv.url(),
+            String::new(),
+            Some(Arc::new(source.clone())),
+            None,
+            None,
+            silent_log(),
+        )
+        .unwrap();
+        let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+        client
+            .respond("ns", &env, &never_shutdown())
+            .await
+            .expect("delivered on the retry");
+        assert_eq!(
+            minter.calls.load(Ordering::SeqCst),
+            2,
+            "one re-mint attempt for the whole respond, however many retries follow"
+        );
+        let auths: Vec<Option<String>> = srv
+            .seen()
+            .iter()
+            .map(|r| r.header("authorization"))
+            .collect();
+        assert_eq!(
+            auths,
+            vec![Some("Bearer tok-1".to_string()); 3],
+            "the surviving token"
+        );
+        // The source is still refused: the next respond may try one mint of its own.
+        assert!(source.would_mint());
+    }
+
+    /// An answer the shed server itself refused (its own error body, read whole) is
+    /// audited as undelivered, the operation's own result kept in the reason. Any other
+    /// status — a proxy's 502 page, an empty 413, a server-shaped body cut short — keeps
+    /// the operation's result and notes the status as "delivery unknown". A delivered
+    /// answer is audited as before.
+    #[tokio::test]
+    async fn refused_answer_is_audited_as_undelivered() {
+        let padded = format!(
+            "{}{}x",
+            api_error("FORBIDDEN"),
+            " ".repeat(MAX_ERROR_BODY_BYTES)
+        );
+        let unknown = |st: u16| {
+            (
+                "ok".to_string(),
+                format!("the response was answered with status {st}; delivery unknown"),
+            )
+        };
+        for (answer, want) in [
+            (
+                Answer(403, vec![], not_bound_body("desk")),
+                (
+                    "undelivered".to_string(),
+                    "result ok, but the server refused the response (status 403 SOURCE_NOT_BOUND)"
+                        .to_string(),
+                ),
+            ),
+            (
+                Answer(413, vec![], api_error("RESPONSE_TOO_LARGE")),
+                (
+                    "undelivered".to_string(),
+                    "result ok, but the server refused the response (status 413 RESPONSE_TOO_LARGE)"
+                        .to_string(),
+                ),
+            ),
+            (Answer(413, vec![], String::new()), unknown(413)),
+            (
+                Answer(502, vec![], "<html><body>Bad Gateway</body></html>".into()),
+                unknown(502),
+            ),
+            (Answer(502, vec![], r#"{"error":"bad gateway"}"#.into()), unknown(502)),
+            (Answer(403, vec![], padded), unknown(403)),
+            (Answer(204, vec![], String::new()), ("ok".into(), String::new())),
+        ] {
+            let status = answer.0;
+            let srv = ScriptedServer::spawn(vec![answer], Answer(204, vec![], String::new())).await;
+            let audit = Arc::new(CollectingAudit::default());
+            let handlers = test_handlers(approve_gate(), audit.clone(), empty_backend());
+            handle_bus_message(
+                &open_client(&srv.url()),
+                "ssh-agent",
+                &list_request(),
+                &never_shutdown(),
+                &handlers,
+            )
+            .await;
+            let entries = audit.entries.lock().unwrap().clone();
+            assert_eq!(entries.len(), 1, "{status}");
+            assert_eq!(
+                (entries[0].result.clone(), entries[0].reason.clone()),
+                want,
+                "{status}"
+            );
+        }
+        // The code the server gave is named, cleaned; an earlier reason is kept.
+        let mut e = AuditEntry {
+            result: "denied".into(),
+            reason: "the person said no".into(),
+            ..Default::default()
+        };
+        mark_refused(&mut e, 403, Some("SOURCE_NOT_BOUND\u{1b}"));
+        assert_eq!(e.result, "undelivered");
+        assert_eq!(
+            e.reason,
+            "the person said no; result denied, but the server refused the response (status 403 SOURCE_NOT_BOUND)"
+        );
+        let mut e = AuditEntry {
+            result: "denied".into(),
+            reason: "the person said no".into(),
+            ..Default::default()
+        };
+        mark_refused(&mut e, 502, None);
+        assert_eq!(e.result, "denied");
+        assert_eq!(
+            e.reason,
+            "the person said no; the response was answered with status 502; delivery unknown"
         );
     }
 }
