@@ -37,13 +37,30 @@ broker](architecture.md#the-embedded-credential-broker).
 
 Restart the daemon (if you run one), then launch shed-desktop. Pending requests appear in the
 **Approvals** pane; `broker.status` over IPC reports the broker mode in effect and, for the
-embedded broker, the delegated namespaces and per-server connection state.
+embedded broker, the delegated namespaces, per-server connection state, this machine's
+identity and the SSH signing settings in force.
 
 It is **default-off**: an extension whose policy isn't `shed-desktop` is handled by the
 broker itself (`deny-all`, `approve-all`, or native Touch ID for SSH) and is **audit-only**
 to the app — its events still stream to Activity. The broker advertises which extensions it
 delegates (`hello_ack.gate_namespaces` from the daemon); Preferences shows an approval section
 for exactly those.
+
+## What reaches the Approvals pane
+
+An SSH sign request is checked before any policy decides it. The broker signs only a login
+as a username in `ssh.allow_users` (default `git`) with a key it offers, or a `git` commit or
+tag signature; anything else is refused at once, with no card, no notification and no change
+to any grant, and appears in **Activity** with the result `refused` and the reason (for
+example `username_not_allowed`). See
+[SSH Agent → What the machine signs](../extensions/ssh-agent.md#what-the-machine-signs).
+
+A request also reaches this machine only if it is your
+[credential source](../extensions/source-binding.md) on that server. On any other machine
+nothing arrives, and Preferences offers **Use this machine** (see
+[Configuration → Credential sources](configuration.md#credential-sources)). When the source
+moves away, the server drops the requests it had sent here: a card still waiting can be
+answered, but the server refuses the answer, and Activity records it as `undelivered`.
 
 ## Policy (per provider)
 

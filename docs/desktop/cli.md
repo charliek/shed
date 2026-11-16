@@ -26,7 +26,7 @@ running app.
 | `shedctl identify` | `identify` | Print the running app's identity, test mode and broker mode |
 | `shedctl sheds list` | `sheds.list` | List sheds across configured hosts, with per-host failures |
 | `shedctl dashboard dump` | `dashboard.dump` | Dump the shed rows the dashboard rendered |
-| `shedctl hosts auth` | `hosts.auth` | Per-server credential mode (`token` or `mtls`) and whether it was learned this session |
+| `shedctl hosts auth` | `hosts.auth` | Per-server credential mode (`mtls`, or `token` for any other entry: a server older than 0.10.0 still in token mode (removed in 0.10.0), or an entry that records no mode) and whether it was learned this session |
 | `shedctl screenshot [--out FILE] [--scale N]` | `app.screenshot` | Capture a PNG; with `--out`, decode it to FILE and print `wrote FILE (WxH)`, else print the JSON reply. `--scale` is sent but the app ignores it |
 | `shedctl shed <start\|stop\|reset\|delete> NAME [--host H]` | `shed.<action>` | Run a shed lifecycle action |
 | `shedctl raw <op> [--param k=v ...]` | any | Call an arbitrary op; each value is parsed as JSON when it parses (`3`, `true`, `{"a":1}`), else sent as a string |
@@ -44,7 +44,7 @@ shedctl identify
 shedctl raw ui.navigate --param pane=system
 shedctl raw ui.show_window
 shedctl screenshot --out /tmp/shot.png
-shedctl shed stop my-shed --host mini3
+shedctl shed stop my-shed --host buildbox
 shedctl raw system.df                        # per-host disk usage
 shedctl raw approval.decide --param id=<req-id> --param decision=approve
 ```

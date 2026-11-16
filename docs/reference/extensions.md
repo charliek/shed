@@ -8,8 +8,11 @@ The extension system works by routing messages between guest and host:
 
 1. A process inside the VM publishes a message to a **namespace** (e.g., `op` for 1Password)
 2. The shed agent forwards it over vsock to the shed server
-3. The server delivers it to a registered **host-side listener** via SSE
-4. The listener processes the request and sends a response back
+3. The server delivers it via SSE to the **host-side listener** for that namespace of the
+   shed's **user**; a listener is admitted only from the user's
+   [credential source](../extensions/source-binding.md) machine
+4. The listener processes the request and sends a response back, which the server accepts
+   only from that machine
 
 ```mermaid
 sequenceDiagram
@@ -49,14 +52,14 @@ All messages use a common JSON envelope:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | string | UUIDv7 identifier, unique per message |
+| `id` | string | UUIDv7 identifier chosen by the sender. For a request, the server replaces it with an id it mints before delivery; a listener answers with that id in `in_reply_to`, and the guest receives its own id back |
 | `namespace` | string | Routing key (e.g., `op`, `proxy`). `system:*` is reserved. |
 | `type` | string | `request`, `response`, or `event` |
 | `in_reply_to` | string | For responses: the `id` of the original request |
 | `final` | boolean | Whether this is the last response for a request |
 | `timestamp` | string | RFC 3339 timestamp |
 | `payload` | object | Namespace-specific data (opaque to shed) |
-| `shed` | object | Shed metadata, added by the server |
+| `shed` | object | Shed metadata (`name`, `backend`, `server`), set by the server from its own record of the shed; anything the guest put there is replaced |
 
 ## Publishing from Inside a VM
 
@@ -71,7 +74,9 @@ curl -s http://127.0.0.1:498/v1/publish -d '{
 }'
 ```
 
-The agent blocks until the host listener responds (30s timeout). The response envelope is returned as the HTTP body.
+The agent blocks until the host listener responds, for at most 30 seconds. The response envelope is returned as the HTTP body. (The credential helpers set their own, shorter client timeout: 3 seconds per request.)
+
+If the shed's user has no listener for the namespace (no machine connected, or the user's credential source is offline), the server drops the request and logs it; the publish then ends with `504 TIMEOUT`, or earlier at the caller's own timeout.
 
 ### Send an event (fire-and-forget)
 
@@ -91,17 +96,29 @@ Returns `202 Accepted` immediately.
 |--------|------|---------|
 | 400 | `INVALID_BODY` | Malformed JSON |
 | 400 | `MISSING_NAMESPACE` | Namespace field is empty |
+| 400 | `INVALID_TYPE` | `type` is not `request` or `event` |
+| 500 | `SEND_FAILED` | The message could not be sent to the server |
+| 502 | `INVALID_RESPONSE` | The response could not be encoded |
 | 503 | `NO_CONNECTION` | Agent has no active vsock connection to host |
-| 504 | `TIMEOUT` | Host listener did not respond within 30s |
+| 503 | `CONNECTION_LOST` | The connection to the server ended while waiting |
+| 503 | `SHUTTING_DOWN` | The agent is shutting down |
+| 504 | `TIMEOUT` | No response within 30s |
 
 ## Building a Host-Side Listener
 
-A host-side listener subscribes to a namespace via SSE and receives messages from all running sheds, except a shed a [service client](security.md#service-clients) owns: the bus is always off for those, so their messages are dropped and they never appear here.
+A host-side listener subscribes to a namespace via SSE and receives messages from the running sheds of **its caller's user**, except a shed a [service client](security.md#service-clients) owns: the bus is always off for those, so their messages are dropped and they never appear here. There is one listener per user per namespace, and every subscribe and response must name the machine it comes from in two headers; only the user's credential source is admitted (see [Credential Source](../extensions/source-binding.md)). A caller authenticates as for any other route: a client certificate on an `mtls` server, nothing on an `open` server (which listens on loopback only). A script key's certificate cannot subscribe or respond.
+
+| Header | Value |
+|---|---|
+| `X-Shed-Machine-Id` | 32 lowercase hexadecimal characters, stable for the machine |
+| `X-Shed-Machine-Name` | the machine's display name, percent-encoded UTF-8 (1 to 63 bytes decoded, no control characters) |
 
 ### Subscribe to a namespace
 
 ```bash
 curl -N -H "Accept: text/event-stream" \
+  -H "X-Shed-Machine-Id: 0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60" \
+  -H "X-Shed-Machine-Name: laptop" \
   http://localhost:8080/api/plugins/listeners/op/messages
 ```
 
@@ -114,11 +131,13 @@ data: {"id":"...","namespace":"op","type":"request","payload":{...},"shed":{"nam
 
 ### Send a response
 
-When you receive a request, respond by POSTing back to the server. Include the shed name for routing:
+When you receive a request, respond by POSTing back to the server, from the same machine. Put the request's `id` (the one the server sent) in `in_reply_to`, and include the shed name:
 
 ```bash
 curl -X POST http://localhost:8080/api/plugins/listeners/op/respond \
   -H "Content-Type: application/json" \
+  -H "X-Shed-Machine-Id: 0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60" \
+  -H "X-Shed-Machine-Name: laptop" \
   -d '{
     "namespace": "op",
     "type": "response",
@@ -146,6 +165,8 @@ func main() {
     req, _ := http.NewRequest("GET",
         "http://localhost:8080/api/plugins/listeners/op/messages", nil)
     req.Header.Set("Accept", "text/event-stream")
+    req.Header.Set("X-Shed-Machine-Id", "0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60")
+    req.Header.Set("X-Shed-Machine-Name", "laptop")
 
     resp, err := http.DefaultClient.Do(req)
     if err != nil {
@@ -180,10 +201,12 @@ GET /api/plugins/listeners
 ```json
 {
   "listeners": [
-    {"namespace": "op", "created_at": "2026-03-29T12:00:00Z"}
+    {"namespace": "op", "user": "alice", "created_at": "2026-03-29T12:00:00Z"}
   ]
 }
 ```
+
+A caller sees its own user's listeners; an admin sees every user's. `user` is omitted for the implicit user of a server with no user list.
 
 ### Subscribe to namespace (SSE)
 
@@ -191,12 +214,21 @@ GET /api/plugins/listeners
 GET /api/plugins/listeners/{namespace}/messages
 ```
 
-Registers as the listener for the namespace and streams messages as SSE events. Only one listener per namespace is allowed.
+Registers the calling machine as its user's listener for the namespace and streams that user's messages as SSE events, with a `: keepalive` comment every 25 seconds while idle. Each write to the stream has a 15-second deadline; a stream that misses it is closed and its listener removed. Another user's listener for the same namespace is independent.
 
 | Status | Code | Meaning |
 |--------|------|---------|
+| 400 | `INVALID_NAMESPACE` | The namespace name is not valid |
+| 403 | `FORBIDDEN` | The caller is not a user (a service client), or the request was made with a script key |
 | 403 | `NAMESPACE_RESERVED` | `system:*` namespaces cannot be registered |
-| 409 | `NAMESPACE_ALREADY_REGISTERED` | Another listener is already subscribed |
+| 403 | `SOURCE_MACHINE_ID_REQUIRED` | No valid machine headers (a broker older than credential sources) |
+| 403 | `SOURCE_NOT_BOUND` | Another machine is the user's credential source; `source.machine_id` and `source.machine_name` name it |
+| 409 | `SOURCE_DUPLICATE_STREAM` | This machine already holds the namespace for this user; retry later |
+| 429 | `SOURCE_RATE_LIMITED` | Too many new or changed machines for the user lately; `Retry-After` says when to retry |
+| 500 | `INTERNAL_ERROR` | The binding could not be saved; nothing was registered |
+| 503 | `PLUGINS_DISABLED` | The server has no credential bus, or is shutting down |
+
+A refusal body is the API's usual `{"error": {"code", "message"}}`, under 1024 bytes.
 
 ### Respond to a message
 
@@ -204,13 +236,20 @@ Registers as the listener for the namespace and streams messages as SSE events. 
 POST /api/plugins/listeners/{namespace}/respond
 ```
 
-Sends a response envelope back to the originating shed. The envelope body must include `shed.name` to route the response.
+Sends a response envelope back to the originating shed. The envelope must include `shed.name`, and its `in_reply_to` must be the id the server sent with the request. It is accepted only from the machine the request was sent to, while that machine is still the user's credential source. A final response is consumed once it has been written into the shed; an answer to a request that is no longer held is refused.
 
 | Status | Code | Meaning |
 |--------|------|---------|
 | 204 | | Response delivered |
+| 400 | `INVALID_BODY` | The body is not a JSON envelope |
 | 400 | `MISSING_SHED` | Envelope missing `shed.name` |
-| 404 | `SHED_NOT_CONNECTED` | Target shed has no active message channel |
+| 403 | `FORBIDDEN` | The response matches no pending request of the caller's user for this namespace and shed; or the caller is not a user, or used a script key |
+| 403 | `SOURCE_MACHINE_ID_REQUIRED` | No valid machine headers |
+| 403 | `SOURCE_NOT_BOUND` | This machine is not (or no longer) the user's credential source |
+| 404 | `SHED_NOT_CONNECTED` | The write into the shed failed; not retryable |
+| 413 | `REQUEST_TOO_LARGE` | The body is larger than the shed can take |
+| 429 | `TOO_MANY_RESPONSES` | The shed already has 8 responses in flight; `Retry-After: 1` |
+| 503 | `RESPONSE_NOT_DELIVERED` | The shed did not take the response in time; nothing was written; `Retry-After: 1` |
 
 ### List connected sheds
 
@@ -221,12 +260,13 @@ GET /api/plugins/sheds
 ```json
 {
   "sheds": [
-    {"name": "my-dev", "backend": "vz", "server": "mini"}
+    {"name": "my-dev", "backend": "vz", "server": "mini", "user": "alice"}
   ]
 }
 ```
 
-A shed a service client owns is left out of this list, and a response sent to
+A caller sees its own user's sheds; an admin sees every user's. `user` is omitted for the
+implicit user. A shed a service client owns is left out of this list, and a response sent to
 it is refused.
 
 ## Extension Management
@@ -300,7 +340,7 @@ The `github.com/charliek/shed/sdk` Go module provides shared types and clients f
 
 - `sdk.Envelope` — Universal message format
 - `sdk.BusClient` — Guest-side HTTP publisher to shed-agent
-- `sdk.HostClient` — Host-side SSE subscriber to shed-server
+- `sdk.HostClient` — Host-side SSE subscriber to shed-server. It does not send the machine headers, so a server with credential sources refuses it (`403 SOURCE_MACHINE_ID_REQUIRED`); the Rust broker in `crates/shed-broker` is the maintained host-side client
 
 ```go
 import "github.com/charliek/shed/sdk"
@@ -320,13 +360,14 @@ for env := range ch {
 
 ## Credential extensions
 
-The `extensions` and `full` images come with shed's credential extensions pre-installed, providing SSH agent forwarding, AWS credential proxying, and Docker credential brokering. `extensions` is the lightweight starting point (base OS + credential extensions + Docker creds helper, no coding agents); `full` layers the coding agents on top. Create a shed with `--image extensions` (or `--image full` for the kitchen-sink default), enable extensions in your server config, and run the host agent to enable credential brokering.
+The `extensions` and `full` images come with shed's credential extensions pre-installed, providing SSH agent forwarding, AWS credential proxying, and Docker credential brokering. `extensions` is the lightweight starting point (base OS + credential extensions + Docker creds helper, no coding agents); `full` layers the coding agents on top. Create a shed with `--image extensions` (or `--image full` for the kitchen-sink default), enable extensions in your server config, and run a credential broker (the `shed-host-agent` daemon, or the desktop app's embedded broker) on your machine.
 
 These extensions are concrete implementations built on the plugin bus above, and their source lives in this repository (`cmd/shed-ext-*`, `internal/ext/` for the guest side; `crates/shed-host-agent` and `crates/shed-broker` for the host-side broker). See the Extensions reference for setup and usage:
 
 - [Architecture](../extensions/architecture.md) — component layout and message flows
 - [Configuration](../extensions/configuration.md) — host agent `extensions.yaml`
 - [SSH Agent](../extensions/ssh-agent.md), [AWS Credentials](../extensions/aws-credentials.md), [Docker Credentials](../extensions/docker-credentials.md)
+- [Credential Source](../extensions/source-binding.md) — which of a user's machines answers
 - [Host Agent IPC](../extensions/host-agent-ipc.md) and [shed-desktop Approval](../extensions/desktop-approval.md)
 - [Security Posture](../extensions/security-posture.md)
 
@@ -368,6 +409,6 @@ Namespaces prefixed with `system:` are reserved for shed internal use and cannot
 
 ## Limitations
 
-- One listener per namespace (additional registrations are rejected)
+- One listener per user per namespace, and only from the user's credential source machine
 - Guest-side subscribe (receiving host-initiated messages) is not yet supported
 - The agent HTTP endpoint uses plain HTTP (HTTPS support planned)

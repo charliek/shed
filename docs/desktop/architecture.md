@@ -87,12 +87,17 @@ whole list.
 | Disk usage | `GET /api/system/df` | the **System** pane (per-host totals + entries) |
 | Lifecycle | `POST /api/sheds/{name}/start\|stop\|reset`, `DELETE /api/sheds/{name}` | |
 | Create | `POST /api/sheds` with `Accept: text/event-stream` | **SSE** stream: `progress…` → `complete` / `error` |
+| Credential sources | `GET /api/sources`, `POST /api/sources/use` | Preferences' source rows and **Use this machine**; a plain `404` means the server predates them (see [Machine identity and the credential source](#machine-identity-and-the-credential-source)) |
 
 Shed lifecycle has **no push event stream**, so the dashboard **polls** `GET /api/sheds`
-on an interval. SSE is used *only* for create-progress (which the server does stream). The
-HTTP API has no auth and relies on network-level access control (Tailscale/firewall): the
-app treats a reachable server as already trusted by the network and never exposes it
-further.
+on an interval. SSE is used *only* for create-progress (which the server does stream).
+
+Every call to a server reached over `https` presents a control-scope credential: on an `mtls`
+server a client certificate whose private key is generated in the app and never leaves it,
+obtained over the server's `_bootstrap` SSH channel through the credential broker and kept in
+memory only (a server older than 0.10.0 still in token mode, removed in 0.10.0, gets a bearer token the same way). An
+`open` server is reached over plain `http`, listens on loopback only, and takes no credential.
+The app never exposes a server further.
 
 ### The host agent (Unix-domain socket)
 
@@ -111,15 +116,21 @@ approvals](approvals.md) for the policy model.
   `$XDG_RUNTIME_DIR/shed/` (else `~/.local/share/shed/`) on Linux; `SHED_HOST_AGENT_SOCKET_DIR`
   moves the directory. `shed-app`'s `HostAgentClient` dials it, auto-reconnecting with
   0.5→5 s backoff.
-- **Wire protocol** (newline-delimited JSON, `v=1`): app → agent `hello`,
-  `approval_response`, `pong`; agent → app `hello_ack`, `approval_request`, `event`, `ping`.
-  `hello_ack` advertises `namespaces`, `gate_namespaces`, `request_timeout_ms`.
+- **Wire protocol** (newline-delimited JSON, `v` 2): app → agent `hello`,
+  `approval_response`, `pong`, `credential.get`, `token.get`; agent → app `hello_ack`,
+  `approval_request`, `event`, `ping`, `credential.response`, `token.response`.
+  `hello_ack` advertises `namespaces`, `gate_namespaces`, `agent_capabilities`,
+  `request_timeout_ms`. The full catalog is [Host Agent IPC](../extensions/host-agent-ipc.md#approval-channel).
 - **Multi-server:** one agent can broker for many shed servers; `approval_request` and
   `event` frames carry a `server` field so identical shed names on different servers don't
   collide.
 - **Fail-closed:** no connected app, a timeout, or a disconnect all resolve to *deny* — the
   same outcome as an unanswered local prompt. Only request metadata ever crosses the socket;
-  the agent stays the sole key holder. The whole feature is **default-off** in the agent.
+  the agent stays the sole key holder. Delegation is **off** in the daemon until an
+  extension's policy is `shed-desktop`.
+- **Checked first:** an SSH sign request reaches the app only after the broker's
+  [signing check](../extensions/ssh-agent.md#what-the-machine-signs) has accepted it; a
+  refused one never produces an approval card and shows in Activity as `refused`.
 
 ```mermaid
 sequenceDiagram
@@ -128,7 +139,8 @@ sequenceDiagram
     participant HA as shed-host-agent
     participant SD as shed-desktop
     VM->>SRV: SSH-sign request (ssh-agent)
-    SRV->>HA: deliver via plugin bus
+    SRV->>HA: deliver via plugin bus (to the user's credential source only)
+    Note over HA: signing check: a login as an allowed<br/>username or a git signature, else refused
     HA->>SD: approval_request (UDS)
     Note over SD: PolicyEngine.decide →<br/>auto / notification / Touch ID
     SD->>HA: approval_response (approve | deny)
@@ -151,8 +163,8 @@ there is no LaunchAgent/systemd unit for it.
 | Effective mode | When | Broker behavior |
 |---|---|---|
 | `external` | Pref `auto` + the daemon's desktop socket is live, or pref pinned to `external` | Dials the [external daemon](#the-host-agent-unix-domain-socket) above. |
-| `headless-coexist` | Pref `auto` + only the daemon's *status* socket is live (a daemon run with `--no-default-features`, no desktop socket) | The app does **not** start its own bus broker (avoids per-namespace `409`s with the headless daemon) and gets no in-app approvals; it still self-mints its own secure-server tokens in-process. |
-| `embedded` | Pref `auto` + neither socket is live, or pref pinned to `embedded` | The app starts its own in-process broker. Pinning `embedded` alongside a running daemon is allowed — the two race per server/namespace; the loser gets `409 NAMESPACE_ALREADY_REGISTERED`, surfaced (never hidden) in `broker.status`, never a double prompt. |
+| `headless-coexist` | Pref `auto` + only the daemon's *status* socket is live (a daemon run with `--no-default-features`, no desktop socket) | The app does **not** start its own bus broker (two brokers on one machine would compete for the same subscriptions) and gets no in-app approvals; it still obtains its own control credentials in-process. |
+| `embedded` | Pref `auto` + neither socket is live, or pref pinned to `embedded` | The app starts its own in-process broker. Pinning `embedded` alongside a running daemon is allowed, but both present the same machine identity, so per server and namespace the one that subscribes second is refused: `409 SOURCE_DUPLICATE_STREAM` from a server with credential sources (state `duplicate`, retried), or a terminal `409` from an older server (state `rejected`). The refusal is surfaced (never hidden) in `broker.status`; there is never a double prompt. |
 
 The mode is **fixed for the process lifetime** — it is resolved once at startup and never
 hot-swapped. Changing the pref via Preferences (or `broker.set_mode` over IPC) persists
@@ -207,7 +219,37 @@ tooling/parity, not because the app needs two sources of truth.
 **No sockets served.** The embedded broker exposes neither of the daemon's Unix-domain
 sockets (§[Host Agent IPC](../extensions/host-agent-ipc.md)) — there is nothing external
 to dial or probe against it. All observability goes through the app's own IPC
-(`broker.status`, `identify.broker_mode`) instead.
+(`broker.status`, `identify.broker_mode`) instead. `broker.status` carries the same
+`servers[]` health (with the `not-source` / `duplicate` states and `active_source`), `ssh`
+signing block, and `machine` / `machine_error` as the daemon's status report; all of them are
+`null` (or empty) outside embedded mode.
+
+**The signing check and the key filter** apply in the embedded broker exactly as in the
+daemon: `ssh.allow_users` and `ssh.offer_keys` from the same `extensions.yaml`. An invalid
+value there makes the file invalid, so the broker fails closed as above.
+
+### Machine identity and the credential source
+
+A shed server answers each user through one machine, the
+[credential source](../extensions/source-binding.md), and tells machines apart by an id each
+broker sends on every bus request. The embedded broker and `shed-host-agent` read the same
+`machine.json` (`~/Library/Application Support/shed/host-agent/` on macOS,
+`$XDG_DATA_HOME/shed/host-agent/` else `~/.local/share/shed/host-agent/` on Linux), so the
+app and the daemon are one machine, whichever brokers.
+
+- **Embedded mode:** the broker loads the identity when it starts. An identity it cannot load
+  does not stop it: it brokers without one (a server with credential sources then refuses it)
+  and `broker.status.machine_error` says why.
+- **External and headless-coexist modes:** the app reads the shared file itself when it needs
+  this machine's id, for the Preferences rows and **Use this machine**.
+
+Preferences → Credential broker shows this machine's name and, per server, the source and a
+**Use this machine** button (see [Configuration → Credential sources](configuration.md#credential-sources)).
+The button calls `POST /api/sources/use` with this machine's own id over the app's ordinary
+control-scope client, never the broker's certificate. In embedded mode it then wakes the
+broker's waiting subscriptions so it connects at once; an external daemon connects on its next
+retry (within about 30 seconds). The same calls are the IPC ops `source.status` and
+`source.use`.
 
 ### The shed CLI config
 
@@ -289,14 +331,25 @@ exits on its own once its 60-second `ControlPersist` lapses.
 | Audit log | `audit.jsonl` in the app data dir: macOS `~/Library/Application Support/ai.stridelabs.ShedDesktop/`, Linux `${XDG_DATA_HOME:-~/.local/share}/ai.stridelabs.shed-desktop/` | append-only JSONL. Reachable over IPC via `activity.log_path`. |
 | Preferences | `prefs.json` in the app config dir: macOS `~/Library/Application Support/ai.stridelabs.ShedDesktop/`, Linux `${XDG_CONFIG_HOME:-~/.config}/ai.stridelabs.shed-desktop/` | terminal preset + template, SSH approval prefs, AWS/Docker modes, per-shed rules, broker mode. See [Configuration](configuration.md). |
 | Control socket + lock | `$XDG_RUNTIME_DIR/shed-tauri.{sock,lock}`, else `/tmp/shed-tauri-<uid>/` | `SHED_TAURI_SOCKET` moves the socket; the lock sits beside it. |
-| Log | macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`; Linux `${XDG_STATE_HOME:-~/.local/state}/ai.stridelabs.shed-desktop/shed-desktop.log` | The Tauri app's own lines, the shed crates' `tracing` events (INFO and up) and the embedded broker's lines (bus connects, drops and `409` rejections, each naming its `server=`), every line stamped `<RFC 3339 UTC> <LEVEL>` and also written to stderr. `SHED_TAURI_LOG=debug` raises the shed crates to DEBUG and adds roost-ipc's events, which are off without it. Rotates at 5 MiB, keeping `.log.1`–`.log.3`. The file is private (`0600`, under your own directories; those the app creates are `0700`) and holds host names, paths and diagnostic text; `SHED_TAURI_LOG=debug` adds roost's ssh diagnostics, which can include ssh's own stderr. `SHED_TAURI_LOG_FILE` overrides the path, which must name a regular file: a symlink there is refused, never followed, as is a FIFO or a device. `identify.log_path` reports the file in use (`null` when file logging is off — a destination that cannot be opened, or a failed write, falls back to stderr only, said once). Opened only once the single-instance lock is held, so a second launch that raises the running app never writes it; a launch whose lock check fails carries on with stderr only. A dev build run beside the installed app (a different `SHED_TAURI_SOCKET`) shares this default path; set `SHED_TAURI_LOG_FILE` to keep them apart. |
+| Machine identity | `host-agent/machine.json` in the broker state directory: macOS `~/Library/Application Support/shed/`, Linux `$XDG_DATA_HOME/shed/` else `~/.local/share/shed/` | Shared with `shed-host-agent`; created on first use. `SHED_HOST_AGENT_STATE_DIR` moves the directory. See [Credential Source](../extensions/source-binding.md#machine-identity). |
+| Broker certificates | `host-agent/creds/credentials/<server>/` in the same directory | The embedded broker's credentials-scope client certificate and key per server (`0600`), as the daemon keeps them. |
+| Log | macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`; Linux `${XDG_STATE_HOME:-~/.local/state}/ai.stridelabs.shed-desktop/shed-desktop.log` | The Tauri app's own lines, the shed crates' `tracing` events (INFO and up) and the embedded broker's lines (bus connects, drops and refusals such as `not-source` and `duplicate`, each naming its `server=`), every line stamped `<RFC 3339 UTC> <LEVEL>` and also written to stderr. `SHED_TAURI_LOG=debug` raises the shed crates to DEBUG and adds roost-ipc's events, which are off without it. Rotates at 5 MiB, keeping `.log.1`–`.log.3`. The file is private (`0600`, under your own directories; those the app creates are `0700`) and holds host names, paths and diagnostic text; `SHED_TAURI_LOG=debug` adds roost's ssh diagnostics, which can include ssh's own stderr. `SHED_TAURI_LOG_FILE` overrides the path, which must name a regular file: a symlink there is refused, never followed, as is a FIFO or a device. `identify.log_path` reports the file in use (`null` when file logging is off — a destination that cannot be opened, or a failed write, falls back to stderr only, said once). Opened only once the single-instance lock is held, so a second launch that raises the running app never writes it; a launch whose lock check fails carries on with stderr only. A dev build run beside the installed app (a different `SHED_TAURI_SOCKET`) shares this default path; set `SHED_TAURI_LOG_FILE` to keep them apart. |
 
 ## Security model
 
-The app holds **no credentials and no secrets** — it coordinates processes that do. The
-credential-approval gate is **fail-closed** (a missing or unresponsive app denies, matching
-the host agent's unanswered-prompt outcome), and the app only ever handles request metadata,
-never key material. It adds no remote attack surface: it makes outbound HTTP/UDS connections
-and serves one local `0600` socket. Sparkle auto-update authenticity rests on an **EdDSA
+What the app process holds depends on the broker mode:
+
+- **External mode:** the app holds no SSH keys or cloud credentials; the daemon does. The app
+  handles only approval metadata and its own control-scope credential (in memory).
+- **Embedded mode:** the broker runs in the app's process, so the process does what the
+  daemon would: it reaches the SSH agent or the key files, AWS profiles and Docker credential
+  helpers, and keeps its credentials-scope certificate under its state directory. The UI and
+  the IPC socket still see only request metadata, never key material.
+
+In both modes the credential-approval gate is **fail-closed** (a missing or unresponsive app
+denies, matching the host agent's unanswered-prompt outcome), and the signing check refuses
+anything but a login as an allowed username or a `git` signature before any prompt. The app
+adds no remote attack surface: it makes outbound HTTP/UDS connections and serves one local
+`0600` socket. Sparkle auto-update authenticity rests on an **EdDSA
 signature** over each release, independent of Apple notarization (see
 [RELEASING](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md)).

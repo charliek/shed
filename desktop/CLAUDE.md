@@ -116,13 +116,16 @@ daemon's `main.rs` wraps) via `shed-app`'s non-default `broker` feature
 (`crates/shed-app/src/broker_bridge.rs`), wired into the setup hook by
 `desktop/tauri/src-tauri/src/broker.rs`. Full behavior is documented user-facing in
 [docs/desktop/architecture.md § The embedded credential
-broker](../docs/desktop/architecture.md#the-embedded-credential-broker-tauri).
+broker](../docs/desktop/architecture.md#the-embedded-credential-broker).
 
 Three modes, resolved once at startup from a persisted `broker_mode` pref (`auto`
 default) overlaid on a probe of both daemon sockets — `external` (a full daemon is
 running, dial it as before), `headless-coexist` (only a headless daemon's status
 socket is live — mint-only, no in-app approvals), `embedded` (neither socket live —
-start the in-process broker).
+start the in-process broker). Whatever the mode, the app and the daemon share one machine
+identity (`<state>/host-agent/machine.json`, `shed_broker::machine`): `BrokerRuntime::this_machine`
+is the embedded broker's loaded identity, else the shared file, and it is the only id
+`source.use` ever sends.
 
 Test pointers:
 

@@ -32,7 +32,7 @@ own, documented with them below.
 | `sheds.list` | — | `{sheds, host_errors}` — a fresh query of every configured host |
 | `sheds.refresh` | — | `{sheds, host_errors}` — asks the dashboard to re-fetch, waits for it to render, and answers with the listing it committed |
 | `system.df` | — | `usage[]` (per-host `GET /api/system/df`: totals + image/shed/orphan disk entries) |
-| `hosts.auth` | — | `hosts[]`, each `{name, auth_mode, learned}`: the credential mode per server (`token` or `mtls`) and whether this session learned it or read it from the config |
+| `hosts.auth` | — | `hosts[]`, each `{name, auth_mode, learned}`: the credential mode per server (`mtls`, or `token` for any other entry: a server older than 0.10.0 still in token mode (removed in 0.10.0), or an entry that records no mode) and whether this session learned it or read it from the config |
 | `app.screenshot` | — | `png` (base64), `width`, `height` |
 | `app.activate` | — | `{}` — raises the dashboard window (what a second launch sends) |
 | `app.quit` | — | `{}`, then the app exits (test mode only): the tray's Quit, drivable — the orderly shutdown runs, then the process ends (see [Architecture](architecture.md#shutting-down)) |
@@ -193,7 +193,7 @@ Machine sessions appear in `rc.list` beside shed sessions, each stamped with
 `origin`, never `shed`** — a machine row carries an EMPTY shed, so two machines sharing a
 slug would collide into one row. `machines.list` is separate from
 `rc.list` because a machine is worth showing even when it has no sessions and cannot be
-reached: that row IS the information ("mini3 is asleep"), and a sessions-only payload has
+reached: that row IS the information ("buildbox is asleep"), and a sessions-only payload has
 nowhere to put it. Each entry carries `{name, origin, reachable, connected_once, roost_watched,
 sessions, detail?}`, where `detail` is why it is unreachable — verbatim, because "no route to host"
 and "nothing is listening" need different fixes — and `roost_watched` says a roost watcher runs
@@ -554,7 +554,7 @@ These drive the credential-approval gate (see [Credential approvals](approvals.m
 | `prefs.provider_modes` | — | `{namespace: "approve"\|"deny"}` for `aws-credentials` and `docker-credentials` |
 | `prefs.set_provider` | `namespace`, `decision` (approve\|deny) | `{}` — sets and persists an AWS/Docker mode |
 | `prefs.remove_shed_rule` | `server`, `shed` | `{}` — removes one per-shed override (`server` verbatim; `""` is the single unnamed server) |
-| `broker.status` | — | `{effective_mode, pref, restart_required, probe, config, resolved_ssh_mode, gate_namespaces, servers, machine, machine_error, broker_error}` (`machine` is the embedded broker's `{id, name}`, `machine_error` why there is none; both `null` outside embedded mode; a `servers[]` row and namespace carry `active_source` when the server names another machine as the credential source) — see [Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker) |
+| `broker.status` | — | `{effective_mode, pref, restart_required, probe, config, resolved_ssh_mode, gate_namespaces, servers, machine, machine_error, ssh, broker_error}` (`machine` is the embedded broker's `{id, name}`, `machine_error` why there is none; `ssh` is what it signs for a shed, `{mode, allow_users, key_filter, keys_offered?, keys_available?}`, the daemon status's `ssh` block; all three `null` outside embedded mode or before the broker started; a `servers[]` namespace's `state` is one of the daemon's (`connected`, `reconnecting`, `not-source`, `duplicate`, `rejected`, `stopped`), and a row and namespace carry `active_source` when the server names another machine as the credential source) — see [Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker) |
 | `broker.mode` | — | `{effective, pref, restart_required}` |
 | `broker.set_mode` | `mode` (auto\|embedded\|external) | `{pref, effective, restart_required}` — persisted; takes effect on the next launch |
 | `source.status` | — | `{rows, this_machine, this_machine_error, broker_mode}` — one row per configured server, `{host, supported, source, this_machine, connected, busy, error}` (`source` is the machine that answers credential requests for you there, `{id, name}` or `null`; a server older than credential sources is `supported: false` with no error; `busy: true` means the server answered `503 SOURCE_BUSY` on every one of a few retries, so the source is unknown for now rather than absent — read again later); `this_machine` is this machine's `{id, name}`, or `null` with `this_machine_error` saying why |

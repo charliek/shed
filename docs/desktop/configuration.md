@@ -26,6 +26,7 @@ The approval sections appear only for the providers the broker delegates to shed
 | **General** | Launch at login | the OS login item (a LaunchAgent on macOS, an XDG autostart entry on Linux), *not* `prefs.json` | Starts the app when you sign in. |
 | **Terminal** | Open sheds in: Ghostty / Roost / Custom | `terminal_preset`, `terminal_template` | Which terminal **Open in Terminal** launches. Custom takes a command template where `{cmd}` is the ssh command and `{shed}` the shed name, e.g. `ghostty -e {cmd}`; an empty template opens the platform's default terminal. |
 | **Credential broker** | Mode: Automatic / In-app (embedded) / External daemon | `broker_mode` | Where the credential broker runs; applies on the next launch. See [Installation → Credential broker](installation.md#credential-broker). |
+| **Credential broker** | This machine, and one row per server: its credential source, with **Use this machine** | not stored (read from each server) | Which of your machines answers credential requests on each server. See [Credential sources](#credential-sources) below. |
 | **SSH approvals** | Approval policy / Duration / Method | `ssh_policy`, `ssh_ttl`, `ssh_method` | Policy: Always Allow, Per Shed Allow, **Time Based Allow** (default), Always Ask, Always Deny. Duration (default `2h`) applies to Time Based Allow. Method, for the policies that prompt: Authenticate (`biometrics-or-password`, the default) or Prompt only (`prompt`). Changing any of these clears live SSH grants. |
 | **AWS / Docker credentials** | Allow / Deny | `provider_modes` | A live Allow/Deny toggle (default Deny). No prompt; takes effect immediately. |
 | **Per-shed overrides** | list of `(server, shed)` allow/deny rows | `extra_rules` | Per-`(server, shed)` *always-allow* / *always-deny* rules; remove one with the ✕. Shown only when there are any. |
@@ -33,6 +34,39 @@ The approval sections appear only for the providers the broker delegates to shed
 The full policy model is in [Credential approvals](approvals.md). Registries (Docker) and
 roles (AWS) are **not** configurable here — they live in `extensions.yaml`. Server hosts are
 managed with the `shed` CLI (no Preferences UI); machines are added from the Machines pane.
+
+## Credential sources
+
+A shed server sends your sheds' credential requests to one of your machines only: your
+[credential source](../extensions/source-binding.md) on that server. Below the broker mode,
+Preferences shows:
+
+- **This machine:** the name of the machine the app runs on, from the `machine.json` the
+  app and `shed-host-agent` share. If the machine has no identity, the reason is shown and
+  every **Use this machine** button is disabled.
+- One row per configured server that supports credential sources (a server older than that
+  shows no row): the server's name, `Source: <machine>` (with `· not connected` when that
+  machine holds no subscription), or `No source yet — the first machine to connect becomes
+  it.`. A server that answered `503 SOURCE_BUSY` on every retry shows the last source it
+  knew, or `Checking the source — the server is busy, retrying…`.
+- On the row of a server where this machine is the source, `this machine`; on any other row,
+  **Use this machine**.
+
+**Use this machine** makes this machine the source on that server: one click, no
+confirmation, one request that is not retried. It always sends this machine's own id. When it
+succeeds the row shows the server's answer; when the server refuses it the row returns to the
+last confirmed source and shows why. Moving the source here drops any approval still waiting on
+the other machine. If the server has never seen this machine (its broker has not reached that
+server yet), the app says so and does not retry.
+
+With the embedded broker, the app wakes the broker at once, so it connects without waiting for
+its next retry. With an external `shed-host-agent`, the daemon picks the change up on its next
+retry, within about 30 seconds. Nothing fails over by itself: if the source is off, nothing
+answers until you choose another.
+
+The window reads the sources when it opens and again whenever it is shown or focused, at most
+once every five seconds. The same reads and the move are available over IPC as
+[`source.status` and `source.use`](ipc.md#approval-ops).
 
 ## Host list (`~/.shed/config.yaml`)
 
@@ -42,11 +76,11 @@ after backing the file up. Shape (the server fields the app reads):
 
 ```yaml
 servers:
-  mini3:
-    host: mini3
+  buildbox:
+    host: buildbox
     http_port: 8080      # default 8080
     ssh_port: 2222       # default 22
-default_server: mini3
+default_server: buildbox
 ```
 
 A missing file degrades to an empty host list (no crash).
