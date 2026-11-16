@@ -312,9 +312,7 @@ func TestConfigUsersUnknownKeyIsNobodyInEveryMode(t *testing.T) {
 		auth := who.auth
 		auth.Mode = mode
 		s := &Server{keyAuth: auth}
-		fp := gossh.FingerprintSHA256(who.stranger.PublicKey())
-		ctx := context.WithValue(context.Background(), connIdentityKey{}, connIdentity{key: who.stranger.PublicKey(), fingerprint: fp})
-		if p, err := s.principalFor(ctx); err == nil {
+		if p, err := s.principalFor(identityCtx(s, who.stranger.PublicKey())); err == nil {
 			t.Errorf("mode %q: an unknown key is %s", mode, p)
 		}
 		_, addr := configServer(t, twoShedBackend{&identityBackend{}}, auth)
@@ -360,8 +358,7 @@ func TestConfigUsersScriptKeyAtBootstrap(t *testing.T) {
 	}
 
 	// The script flag reaches the session's principal.
-	ctx := context.WithValue(context.Background(), connIdentityKey{}, connIdentity{key: who.bobScript.PublicKey(), fingerprint: gossh.FingerprintSHA256(who.bobScript.PublicKey())})
-	if p, err := s.principalFor(ctx); err != nil || !p.Script || p.User != "bob" || p.Admin {
+	if p, err := s.principalFor(identityCtx(s, who.bobScript.PublicKey())); err != nil || !p.Script || p.User != "bob" || p.Admin {
 		t.Errorf("script key principal %+v %v", p, err)
 	}
 }

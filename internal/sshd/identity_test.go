@@ -390,8 +390,7 @@ func TestUnknownKeyIsImplicitOnlyWithoutAUserList(t *testing.T) {
 		{"enforce", userstest.Implicit(), config.SSHAuthEnforce, false},
 	} {
 		s := &Server{keyAuth: KeyAuth{Mode: tc.mode, Users: tc.lookup}}
-		ctx := context.WithValue(context.Background(), connIdentityKey{}, connIdentity{key: stranger.PublicKey(), fingerprint: gossh.FingerprintSHA256(stranger.PublicKey())})
-		p, err := s.principalFor(ctx)
+		p, err := s.principalFor(identityCtx(s, stranger.PublicKey()))
 		if got := err == nil && p == backend.ImplicitPrincipal(); got != tc.want {
 			t.Errorf("%s: principal %v err %v, want implicit=%v", tc.name, p, err, tc.want)
 		}
@@ -439,4 +438,16 @@ func TestSSHDemotedUserIsRefusedAHostMountedShed(t *testing.T) {
 	if execs, dials := be.seen(); len(execs) != 0 || len(dials) != 0 {
 		t.Errorf("the backend was reached: execs %v dials %v", execs, dials)
 	}
+}
+
+// identityCtx is a context carrying the identity of a connection that has
+// just authenticated with key (newConnIdentity). A key that resolves to
+// nobody gives an identity with the key and no user, which principalFor
+// refuses, as the VerifiedPublicKeyCallback would have refused the login.
+func identityCtx(s *Server, key gossh.PublicKey) context.Context {
+	id, err := s.newConnIdentity(key, "box")
+	if err != nil {
+		id = connIdentity{key: key, fingerprint: gossh.FingerprintSHA256(key), user: "box"}
+	}
+	return context.WithValue(context.Background(), connIdentityKey{}, id)
 }

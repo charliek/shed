@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -86,8 +87,9 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 //
 // mtls adds three things: trust only the internal CA, require a client
 // certificate that verifies against it, and refuse the handshake outright when
-// the identity that certificate names has left the SSH allowlist (a user
-// certificate) or is not a configured auth.clients entry (a service
+// the identity that certificate names has left the SSH allowlist or now
+// belongs to another user than the one it was issued to (a user certificate:
+// api.CertificateUser), or is not a configured auth.clients entry (a service
 // certificate, which is never checked against the allowlist).
 //
 // The allowlist check is the FIRST of two, not the only one. A TLS peer's
@@ -99,7 +101,7 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 // turned away at the door rather than allowed to open connections and collect
 // 401s. It is installed as VerifyConnection specifically because crypto/tls
 // skips VerifyPeerCertificate on RESUMED sessions (see servertls/clientauth.go).
-func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientCA *servertls.CA, authorized func(string) bool) *tls.Config {
+func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientCA *servertls.CA, authorized func(*x509.Certificate) bool) *tls.Config {
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
@@ -117,6 +119,17 @@ func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientC
 		tlsCfg.VerifyConnection = servertls.ClientConnectionVerifier(authorized, clientKnown)
 	}
 	return tlsCfg
+}
+
+// certificateAuthorized is the HTTPS listener's handshake check of a user's
+// client certificate, against the live user lookup l: its key still resolves
+// to the user it was issued to (api.CertificateUser, the rule the API
+// middleware applies again on every request).
+func certificateAuthorized(l users.Lookup) func(*x509.Certificate) bool {
+	return func(leaf *x509.Certificate) bool {
+		_, _, ok := api.CertificateUser(l, leaf, time.Now())
+		return ok
+	}
 }
 
 // serverStateDir returns the directory that holds the server's identity
@@ -564,9 +577,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		tlsFingerprint = servertls.Fingerprint(der)
 		log.Printf("TLS cert fingerprint: %s", tlsFingerprint)
 		httpsServer = newHTTPServer(cfg.HTTPSListenAddr(), publicHandler)
-		httpsServer.TLSConfig = buildHTTPSTLSConfig(cfg, cert, clientCA, func(fp string) bool {
-			return users.HasKey(userLookup, fp)
-		})
+		httpsServer.TLSConfig = buildHTTPSTLSConfig(cfg, cert, clientCA, certificateAuthorized(userLookup))
 	}
 
 	// Wire the SSH bootstrap handler: in mtls mode it issues a client
@@ -689,22 +700,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 // in time is logged and tried again at the next start.
 const upgradePassTimeout = 2 * time.Minute
 
-// stampUnassigned runs, first, the start-up step for the credential source
-// bindings (applySourceUpgrade), and then the start-up pass over sheds and
-// snapshots made before the server had a user list (backend.StampUnassigned) on the raw backend, as
-// a one-time upgrade step recorded by a marker in the server's state
-// directory (backend.OpenUsersUpgrade). With no user list it stamps nothing
-// and removes the marker. On the first start with a user list, with exactly
-// one user, it gives them every shed and snapshot with no user (and logs
-// each), and the marker is written once the pass has finished without a
-// failure (a pass that did not finish runs again at the next start); with
-// several it stamps nothing, and the marker is written before the pass lists
-// anything, so a pass that then fails cannot lose it. On every later start nothing is
-// stamped. It logs how many sheds it found with no user, naming them when
-// log_level is debug. The returned UsersUpgrade carries the "first start
-// with a user list" decision for the other one-time steps of adding one. An
-// error (only from the source bindings' step) means the server must not
-// start: the marker has not been written, so the step runs again.
+// stampUnassigned runs the one-time upgrade step for a user list, recorded
+// by a marker in the server's state directory (backend.OpenUsersUpgrade),
+// and the start-up report of sheds and snapshots with no user. First the
+// step's decision for this start is taken and recorded
+// (backend.UsersUpgrade.Begin): with several users on the first start, done
+// before anything is listed; with exactly one user on the first start, begun
+// for that user (a pending marker naming them) before anything is given to
+// anyone; an unfinished step is resumed only for the user it was begun for,
+// while they are still the only configured user, and is otherwise abandoned
+// (marked done, nothing given). Then the credential source bindings follow
+// that decision (applySourceUpgrade), then the pass over sheds and snapshots
+// runs on the raw backend (backend.StampUnassigned), stamping only for the
+// decided user, and the step is marked done once a stamping pass finishes
+// (backend.UsersUpgrade.Finish). With no user list it stamps nothing and
+// removes the marker. It logs how many sheds it found with no user, naming
+// them when log_level is debug. An error (only from the source bindings'
+// step) means the server must not start; the marker then still says what
+// the next start resumes.
 func stampUnassigned(cfg *config.ServerConfig, be backend.Backend, bindings source.Bindings) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
 	return stampUnassignedIn(cfg, be, serverStateDir(cfg), bindings)
 }
@@ -730,9 +743,11 @@ func reportReservedSheds(be backend.Backend) {
 func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir string, bindings source.Bindings) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
 	users := upgradeUsers(cfg)
 	upgrade := backend.OpenUsersUpgrade(stateDir, len(users) > 0, log.Printf)
-	// The source bindings' step runs before the marker can be written by
-	// either branch below, so a start that fails it records nothing.
-	if err := applySourceUpgrade(bindings, upgrade, cfg.UserNames()); err != nil {
+	// The decision is recorded before anything acts on it, so the source
+	// bindings' step and the pass below follow the same recipient at every
+	// start until the step is done.
+	plan := upgrade.Begin(users, time.Now())
+	if err := applySourceUpgrade(bindings, plan, cfg.UserNames()); err != nil {
 		return backend.UpgradeReport{}, upgrade, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), upgradePassTimeout)
@@ -741,87 +756,75 @@ func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir st
 	if cfg.LogLevel == "debug" {
 		debugf = func(format string, args ...any) { log.Printf("DEBUG: "+format, args...) }
 	}
-	// With several users nothing is ever stamped, so the step's outcome is
-	// known before any listing: it is recorded first, so a listing that then
-	// fails or times out (or a crash) cannot leave a later start, with fewer
-	// users, to take it as the first and stamp what was left unassigned on
-	// purpose. With one user it is recorded only once the pass has finished.
-	recordedFirst := false
-	if upgrade.FirstUserListStart() && len(users) > 1 {
-		if err := upgrade.MarkDone(time.Now()); err != nil {
-			log.Printf("Users: the one-time upgrade step for the user list (several users: nothing is given a user automatically) could not be recorded; it runs again at the next start: %v", err)
-		} else {
-			recordedFirst = true
-			log.Printf("Users: the one-time upgrade step for the user list is recorded (several users: nothing is given a user automatically); from now on a shed with no user is given one only by 'shed assign'")
-		}
+	passUsers, stamp := users, false
+	if plan.StampFor != nil {
+		passUsers, stamp = []backend.UpgradeUser{*plan.StampFor}, true
 	}
-	rep := backend.StampUnassigned(ctx, be, users, upgrade.FirstUserListStart(), backend.UpgradeLog{Infof: log.Printf, Debugf: debugf})
-	if upgrade.FirstUserListStart() && !recordedFirst {
-		switch {
-		case rep.Incomplete:
-			log.Printf("Users: the one-time upgrade step for the user list did not finish; it runs again at the next start")
-		default:
-			if err := upgrade.MarkDone(time.Now()); err != nil {
-				log.Printf("Users: the one-time upgrade step for the user list finished, but its marker could not be written (it runs again at the next start): %v", err)
-			} else {
-				log.Printf("Users: the one-time upgrade step for the user list is done and recorded; from now on a shed with no user is given one only by 'shed assign'")
-			}
-		}
-	}
+	rep := backend.StampUnassigned(ctx, be, passUsers, stamp, backend.UpgradeLog{Infof: log.Printf, Debugf: debugf})
+	upgrade.Finish(plan, rep, time.Now())
 	return rep, upgrade, nil
 }
 
 // applySourceUpgrade is the start-up step for the credential source bindings
-// when a user list is added later, run before any listener can register:
+// when a user list is added later, run before any listener can register. It
+// follows the one-time step's decision for this start
+// (backend.UsersUpgrade.Begin), already recorded:
 //
-//   - On the first start with a user list (the same one-time decision as
-//     the shed upgrade step, UsersUpgrade.FirstUserListStart): with exactly
-//     one configured user, the implicit user's binding and remembered
-//     machines become that user's (AdoptImplicit; when the user already has
-//     records of their own, the implicit ones are dropped instead); with
-//     several users they are dropped.
+//   - When the step gives sheds to one user (plan.StampFor: the first start
+//     with exactly one user, or a resumed step for that same user), the
+//     implicit user's binding and remembered machines become that user's
+//     (AdoptImplicit; when the user already has records of their own, the
+//     implicit ones are dropped instead). Because the pending marker naming
+//     the user is written before this, a start that ends between the two
+//     resumes for the same user only, and AdoptImplicit run again finds no
+//     implicit records (or the ones a crash left) and adopts them for that
+//     same user: the adoption happens once, for the recipient recorded, and
+//     is never redirected. An abandoned step adopts nothing.
+//   - On the first start with several users (plan.SeveralUsers) they are
+//     dropped.
+//   - When the step could not begin (plan.Deferred: its pending marker
+//     could not be written) the implicit user's records are kept for the
+//     start that takes it.
 //   - At every start, the records of every user that is not configured are
 //     dropped (RetainUsers with the configured names, or with the implicit
 //     user alone when there is no user list), so a name configured again
 //     later starts clean. With no user list nothing is adopted, and only
 //     named users' records (unreachable without a user list) are dropped.
 //
-// It runs before the one-time marker is written. A crash after the adoption
-// and before the marker leaves the adopted binding in place and no marker:
-// the next start is again the first with a user list, and its AdoptImplicit
-// finds no implicit records and changes nothing, so the step is safe to run
-// twice. A store that cannot be written fails the start (the marker is then
-// not written either), as a store that cannot be opened does.
-func applySourceUpgrade(b source.Bindings, upgrade *backend.UsersUpgrade, names []string) error {
+// A store that cannot be written fails the start; the marker still says what
+// the next start does.
+func applySourceUpgrade(b source.Bindings, plan backend.UpgradePlan, names []string) error {
 	if b == nil {
 		return nil
 	}
 	keep := names
-	if len(names) == 0 {
+	switch {
+	case len(names) == 0:
 		keep = []string{source.ImplicitUser}
-	} else if upgrade.FirstUserListStart() {
-		if len(names) == 1 {
-			ad, err := b.AdoptImplicit(names[0])
-			if err != nil {
-				return fmt.Errorf("credential source bindings: giving the server's credential source to user %q: %w", names[0], err)
-			}
-			switch {
-			case ad.Adopted && ad.Binding != nil:
-				log.Printf("Users: the credential source of the server before its user list (machine %s) is now user %s's, with %d remembered machine(s)", ad.Binding.MachineID(), names[0], ad.Machines)
-			case ad.Adopted:
-				log.Printf("Users: the %d machine(s) remembered before the user list are now user %s's", ad.Machines, names[0])
-			case ad.Dropped:
-				log.Printf("Users: user %s already has credential source records; those from before the user list (%d machine(s)) were dropped", names[0], ad.Machines)
-			}
-		} else {
-			dropped, err := b.Drop(source.ImplicitUser)
-			if err != nil {
-				return fmt.Errorf("credential source bindings: dropping the credential source from before the user list: %w", err)
-			}
-			if dropped {
-				log.Printf("Users: several users are configured, so the credential source from before the user list was dropped; each user's first machine to connect becomes theirs")
-			}
+	case plan.StampFor != nil:
+		name := plan.StampFor.Name
+		ad, err := b.AdoptImplicit(name)
+		if err != nil {
+			return fmt.Errorf("credential source bindings: giving the server's credential source to user %q: %w", name, err)
 		}
+		switch {
+		case ad.Adopted && ad.Binding != nil:
+			log.Printf("Users: the credential source of the server before its user list (machine %s) is now user %s's, with %d remembered machine(s)", ad.Binding.MachineID(), name, ad.Machines)
+		case ad.Adopted:
+			log.Printf("Users: the %d machine(s) remembered before the user list are now user %s's", ad.Machines, name)
+		case ad.Dropped:
+			log.Printf("Users: user %s already has credential source records; those from before the user list (%d machine(s)) were dropped", name, ad.Machines)
+		}
+	case plan.SeveralUsers:
+		dropped, err := b.Drop(source.ImplicitUser)
+		if err != nil {
+			return fmt.Errorf("credential source bindings: dropping the credential source from before the user list: %w", err)
+		}
+		if dropped {
+			log.Printf("Users: several users are configured, so the credential source from before the user list was dropped; each user's first machine to connect becomes theirs")
+		}
+	case plan.Deferred:
+		keep = append(append([]string(nil), names...), source.ImplicitUser)
 	}
 	dropped, err := b.RetainUsers(keep)
 	if err != nil {

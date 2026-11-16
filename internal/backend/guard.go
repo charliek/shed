@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/charliek/shed/internal/config"
 )
@@ -17,10 +20,15 @@ import (
 // wraps, authorizes on the shed as the backend reports it (its reported owner
 // and user, so a record that disagrees about whose it is reaches an admin
 // only), and then calls the backend with the shed's incarnation (its creation
-// time) required on the context. The backend checks that again, under its
+// time) and the ownership it authorized against (the reported owner and
+// user) required on the context. The backend checks those again, under its
 // per-shed lock, against the shed it actually acts on: a shed deleted and
 // created again under the name, by anyone, between this lookup and the action
-// is not acted on. A creation time the caller already required (the reaper,
+// is not acted on, and neither is one whose reported user changed in between
+// (on the remote backend a reconcile can report it config.UserUnresolved,
+// admin-only; on Firecracker and VZ a shed's user changes only by `shed
+// assign`, of a shed with no user, so there the check refuses an operation
+// authorized on an unassigned shed that was assigned in between). A creation time the caller already required (the reaper,
 // a wait that follows a create) is never replaced: the shed loaded must have
 // it. Snapshots are bound the same way, by creation time and user, under the
 // snapshot lock.
@@ -36,13 +44,42 @@ type Guard struct {
 	// the wrapped backend is called. It is a test seam: a test uses it to
 	// replace the shed between the lookup and the action.
 	beforeAct func(op, name string)
+
+	// masked rate-limits the server log line for a lookup failure answered
+	// as not found (maskLookup): the time each name was last logged.
+	// maskedOldest is no later than the oldest time in masked, so a full
+	// table is scanned for expired names only when one may have expired.
+	// maskedSuppressed counts the failures not logged because the table was
+	// full of names still inside their interval, and maskedSummaryAt is when
+	// that count was last logged.
+	maskedMu         sync.Mutex
+	masked           map[string]time.Time
+	maskedOldest     time.Time
+	maskedSuppressed int
+	maskedSummaryAt  time.Time
+	// now and logf are the clock and the log maskLookup uses; tests replace
+	// them.
+	now  func() time.Time
+	logf func(format string, args ...any)
 }
+
+// maskedLogInterval is how often a lookup failure answered as not found is
+// logged for one name: at most once per interval, so a caller who keeps
+// asking cannot flood the log.
+const maskedLogInterval = time.Minute
+
+// maskedLogMax bounds the names maskLookup remembers. A name is forgotten
+// only once its interval has run out, so the per-name limit holds however
+// many names are asked for: while the table is full of names still inside
+// their interval, a failure for a new name is not logged but counted, and
+// the count is logged at most once per maskedLogInterval.
+const maskedLogMax = 1024
 
 // Compile-time check that *Guard is a Backend.
 var _ Backend = (*Guard)(nil)
 
 // NewGuard returns a Guard around b.
-func NewGuard(b Backend) *Guard { return &Guard{inner: b} }
+func NewGuard(b Backend) *Guard { return &Guard{inner: b, now: time.Now, logf: log.Printf} }
 
 // Guarded returns b as a Guard: b itself when it is one, a new Guard around
 // it otherwise, and nil for nil (a server built without a backend, as some
@@ -89,8 +126,93 @@ func principal(ctx context.Context) (Principal, error) {
 	return p, nil
 }
 
+// maskLookup is what a caller gets when the lookup of the shed or snapshot
+// named name (kind says which) failed with err, before the caller's right to
+// see it was established: a record that cannot be read, is malformed, or has
+// a version this build refuses. Not found stays not found. An admin, the
+// implicit user and the server's own work get err as it is, as before. Every
+// other caller (a user who is not an admin, a service client) gets the
+// ordinary not-found answer (notFound, with the name), as for a shed or
+// snapshot they may not see: the error's detail (it may name a path on the
+// server, or a version) is not theirs to read, and its difference from not
+// found would tell them the name is taken. The detail goes to the server
+// log, at most once per name per maskedLogInterval.
+func (g *Guard) maskLookup(p Principal, kind, name string, err, notFound error) error {
+	if errors.Is(err, notFound) || p.IsAdmin() {
+		return err
+	}
+	logNow, suppressed := g.logMasked(kind + " " + name)
+	if logNow || suppressed > 0 {
+		logf := g.logf
+		if logf == nil {
+			logf = log.Printf
+		}
+		if suppressed > 0 {
+			logf("access guard: %d more lookup failure(s) answered as not found were not logged: more than %d names failed within %s", suppressed, maskedLogMax, maskedLogInterval)
+		}
+		if logNow {
+			logf("access guard: looking up %s %q for %s failed; answered as not found: %v", kind, name, p, err)
+		}
+	}
+	return fmt.Errorf("%w: %s", notFound, name)
+}
+
+// logMasked reports whether a masked lookup failure for key should be logged
+// now (none was in the last maskedLogInterval), and records it if so. A name
+// still inside its interval is never forgotten to make room: when the table
+// is full, names whose interval has run out are dropped, and if none has, a
+// new name is not logged and is counted instead. suppressed, when above zero,
+// is that count, due to be logged now (at most once per maskedLogInterval);
+// it is then reset.
+func (g *Guard) logMasked(key string) (logNow bool, suppressed int) {
+	now := time.Now
+	if g.now != nil {
+		now = g.now
+	}
+	t := now()
+	g.maskedMu.Lock()
+	defer g.maskedMu.Unlock()
+	defer func() {
+		if g.maskedSuppressed > 0 && t.Sub(g.maskedSummaryAt) >= maskedLogInterval {
+			suppressed, g.maskedSuppressed = g.maskedSuppressed, 0
+			g.maskedSummaryAt = t
+		}
+	}()
+	last, known := g.masked[key]
+	if known && t.Sub(last) < maskedLogInterval {
+		return false, 0
+	}
+	if g.masked == nil {
+		g.masked = map[string]time.Time{}
+	}
+	if !known && len(g.masked) >= maskedLogMax && t.Sub(g.maskedOldest) >= maskedLogInterval {
+		oldest := t
+		for k, at := range g.masked {
+			switch {
+			case t.Sub(at) >= maskedLogInterval:
+				delete(g.masked, k)
+			case at.Before(oldest):
+				oldest = at
+			}
+		}
+		g.maskedOldest = oldest
+	}
+	if !known && len(g.masked) >= maskedLogMax {
+		g.maskedSuppressed++
+		return false, 0
+	}
+	if len(g.masked) == 0 {
+		g.maskedOldest = t
+	}
+	g.masked[key] = t
+	return true, 0
+}
+
 // bind loads the named shed, authorizes a on it, and returns ctx bound to the
-// incarnation it loaded (see Guard).
+// incarnation it loaded and to the ownership it authorized against: the
+// shed's creation time and its reported owner and user (see Guard). A value
+// the caller already required is never replaced; the shed loaded must match
+// it.
 func (g *Guard) bind(ctx context.Context, op, name string, a Action) (context.Context, *config.Shed, error) {
 	p, err := principal(ctx)
 	if err != nil {
@@ -98,18 +220,18 @@ func (g *Guard) bind(ctx context.Context, op, name string, a Action) (context.Co
 	}
 	shed, err := g.inner.GetShed(ctx, name)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, g.maskLookup(p, "shed", name, err, config.ErrShedNotFoundSentinel)
 	}
 	if shed == nil {
 		return nil, nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 	}
-	if err := CheckCreatedAt(ctx, name, shed.CreatedAt); err != nil {
+	if err := CheckIdentity(ctx, name, shed.Owner, shed.User, shed.CreatedAt); err != nil {
 		return nil, nil, err
 	}
-	ctx = PinCreatedAt(ctx, shed.CreatedAt)
 	if err := AuthorizeShed(p, shed, a); err != nil {
 		return nil, nil, err
 	}
+	ctx = PinOwnership(PinCreatedAt(ctx, shed.CreatedAt), shed.Owner, shed.User)
 	g.acting(op, name)
 	return ctx, shed, nil
 }
@@ -519,7 +641,7 @@ func (g *Guard) DeleteSnapshot(ctx context.Context, name string) error {
 func (g *Guard) bindSnapshot(ctx context.Context, p Principal, name string, a Action) (context.Context, *config.Snapshot, error) {
 	snap, err := g.inner.GetSnapshot(ctx, name)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, g.maskLookup(p, "snapshot", name, err, config.ErrSnapshotNotFoundSentinel)
 	}
 	if snap == nil {
 		return nil, nil, fmt.Errorf("%w: %s", config.ErrSnapshotNotFoundSentinel, name)
@@ -557,7 +679,7 @@ func (a guardedAsync) DeleteAndWait(ctx, jobCtx context.Context, name string) er
 	if err != nil {
 		return err
 	}
-	if err := a.g.inner.DeleteShed(PinCreatedAt(jobCtx, shed.CreatedAt), name); err != nil {
+	if err := a.g.inner.DeleteShed(PinOwnership(PinCreatedAt(jobCtx, shed.CreatedAt), shed.Owner, shed.User), name); err != nil {
 		return err
 	}
 	// The name is free from here on: anyone may create a shed under it

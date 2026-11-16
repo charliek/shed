@@ -12,6 +12,8 @@ import (
 
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/internal/users"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 // testClientFingerprint is a canonically-shaped OpenSSH SHA-256 fingerprint.
@@ -23,6 +25,13 @@ const testClientFingerprint = "SHA256:1U6JLBiKdyPFRj5o2Vv5uF3d8Kk0Y0mYFDDaC4mHtC
 // and returns the issued leaf.
 func signTestClient(t *testing.T, ca servertls.CA) *x509.Certificate {
 	t.Helper()
+	return signTestClientAs(t, ca, "")
+}
+
+// signTestClientAs is signTestClient for a certificate issued to user ("" is
+// the implicit user).
+func signTestClientAs(t *testing.T, ca servertls.CA, user string) *x509.Certificate {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate client key: %v", err)
@@ -32,7 +41,7 @@ func signTestClient(t *testing.T, ca servertls.CA) *x509.Certificate {
 	if err != nil {
 		t.Fatalf("create CSR: %v", err)
 	}
-	der, err := ca.SignClientCSR(csrDER, testClientFingerprint, "control", "cli", time.Hour)
+	der, err := ca.SignClientCSR(csrDER, testClientFingerprint, user, "control", "cli", time.Hour)
 	if err != nil {
 		t.Fatalf("sign client CSR: %v", err)
 	}
@@ -73,7 +82,7 @@ func TestBuildHTTPSTLSConfig(t *testing.T) {
 
 	t.Run("mtls mode requires and verifies client certificates", func(t *testing.T) {
 		cfg := &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}}
-		got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(string) bool { return true })
+		got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(*x509.Certificate) bool { return true })
 
 		if got.ClientAuth != tls.RequireAndVerifyClientCert {
 			t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert — "+
@@ -105,7 +114,7 @@ func TestBuildHTTPSTLSConfig(t *testing.T) {
 	t.Run("mtls verifier consults the live allowlist", func(t *testing.T) {
 		cfg := &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}}
 		allow := false
-		got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(string) bool { return allow })
+		got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(*x509.Certificate) bool { return allow })
 		state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{signTestClient(t, ca)}}
 
 		if err := got.VerifyConnection(state); err == nil {
@@ -124,7 +133,7 @@ func TestBuildHTTPSTLSConfig(t *testing.T) {
 				"nocturn": {Policy: config.ServiceClientPolicy{NamePrefix: "nocturn-", MaxSheds: 1, MaxAge: config.Duration(time.Hour)}},
 			},
 		}}
-		got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(string) bool {
+		got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(*x509.Certificate) bool {
 			t.Fatal("the SSH allowlist was consulted for a service certificate")
 			return true
 		})
@@ -153,7 +162,7 @@ func TestBuildHTTPSTLSConfig(t *testing.T) {
 		// CA anyway: mode, not the argument, is what decides.
 		for _, mode := range []string{config.AuthModeOpen, config.AuthModeToken} {
 			cfg := &config.ServerConfig{Auth: &config.AuthConfig{Mode: mode}}
-			got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(string) bool { return true })
+			got := buildHTTPSTLSConfig(cfg, serverCert, &ca, func(*x509.Certificate) bool { return true })
 
 			if got.ClientAuth != tls.NoClientCert {
 				t.Errorf("%s: ClientAuth = %v, want NoClientCert", mode, got.ClientAuth)
@@ -181,4 +190,45 @@ func TestBuildHTTPSTLSConfig(t *testing.T) {
 			t.Errorf("MinVersion = %#x, want TLS 1.2", got.MinVersion)
 		}
 	})
+}
+
+// TestHandshakeRefusesACertificateWhoseKeyMoved is the listener's handshake
+// check as runServe wires it (certificateAuthorized over the live lookup):
+// alice's certificate passes while its key is hers, and is refused once the
+// key is bob's; the certificate enrolled with the key after that, bob's,
+// passes.
+func TestHandshakeRefusesACertificateWhoseKeyMoved(t *testing.T) {
+	dir := t.TempDir()
+	serverCert, _, err := servertls.LoadOrGenerate(filepath.Join(dir, "tls.pem"), filepath.Join(dir, "tls.key"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := servertls.LoadOrGenerateCA(filepath.Join(dir, "ca.pem"), filepath.Join(dir, "ca.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := userstest.New()
+	l.AddUser(users.User{Name: "alice"})
+	l.AddUser(users.User{Name: "bob"})
+	l.AddKey("alice", users.Key{Fingerprint: testClientFingerprint, Source: users.SourceAdHoc})
+	cfg := &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}}
+	got := buildHTTPSTLSConfig(cfg, serverCert, &ca, certificateAuthorized(l))
+	state := func(c *x509.Certificate) tls.ConnectionState {
+		return tls.ConnectionState{PeerCertificates: []*x509.Certificate{c}}
+	}
+
+	alices := signTestClientAs(t, ca, "alice")
+	if err := got.VerifyConnection(state(alices)); err != nil {
+		t.Fatalf("alice's certificate while the key is hers: %v", err)
+	}
+	l.AddKey("bob", users.Key{Fingerprint: testClientFingerprint, Source: users.SourceAdHoc})
+	if err := got.VerifyConnection(state(alices)); err == nil {
+		t.Error("alice's certificate passed the handshake after its key moved to bob")
+	}
+	if err := got.VerifyConnection(state(signTestClientAs(t, ca, "bob"))); err != nil {
+		t.Errorf("bob's certificate: %v", err)
+	}
+	if err := got.VerifyConnection(state(signTestClient(t, ca))); err == nil {
+		t.Error("an implicit user's certificate passed on a server whose key is bob's")
+	}
 }

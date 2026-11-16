@@ -142,25 +142,39 @@ func writeSnapshotFile(snapshotsDir string, snap *config.Snapshot, durable bool)
 
 // listSnapshotNames returns the names of all snapshots in snapshotsDir.
 func listSnapshotNames(snapshotsDir string) ([]string, error) {
+	names, _, err := listSnapshotNamesCounting(snapshotsDir)
+	return names, err
+}
+
+// listSnapshotNamesCounting is listSnapshotNames that also counts the
+// snapshot directories whose metadata cannot be looked at (a stat that fails
+// for a reason other than the file being absent): each is left out and
+// logged, never silently.
+func listSnapshotNamesCounting(snapshotsDir string) ([]string, int, error) {
 	entries, err := os.ReadDir(snapshotsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return nil, fmt.Errorf("failed to read snapshots directory: %w", err)
+		return nil, 0, fmt.Errorf("failed to read snapshots directory: %w", err)
 	}
 
 	var names []string
+	unreadable := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		metaPath := SnapshotMetadataPath(snapshotsDir, entry.Name())
-		if _, err := os.Stat(metaPath); err == nil {
+		switch _, err := os.Stat(metaPath); {
+		case err == nil:
 			names = append(names, entry.Name())
+		case !os.IsNotExist(err):
+			log.Printf("Warning: skipping snapshot %q: its metadata cannot be read: %v", entry.Name(), err)
+			unreadable++
 		}
 	}
-	return names, nil
+	return names, unreadable, nil
 }
 
 // acquireSnapshotLock returns an unlock closure after taking the per-name
@@ -336,22 +350,33 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 }
 
 // ListSnapshots returns all snapshots stored on this server.
-func (c *Client) ListSnapshots(_ context.Context) ([]config.Snapshot, error) {
-	names, err := listSnapshotNames(c.cfg.SnapshotsDir)
+func (c *Client) ListSnapshots(ctx context.Context) ([]config.Snapshot, error) {
+	snaps, _, err := c.ListSnapshotsCounting(ctx)
+	return snaps, err
+}
+
+// ListSnapshotsCounting is ListSnapshots that also says how many snapshot
+// records it could not read and left out (backend.CountingSnapshotLister).
+// A snapshot deleted since the directory was read is not counted.
+func (c *Client) ListSnapshotsCounting(_ context.Context) ([]config.Snapshot, int, error) {
+	names, unreadable, err := listSnapshotNamesCounting(c.cfg.SnapshotsDir)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	out := make([]config.Snapshot, 0, len(names))
 	for _, name := range names {
 		snap, err := loadSnapshot(c.cfg.SnapshotsDir, name)
 		if err != nil {
 			log.Printf("Warning: skipping invalid snapshot %q: %v", name, err)
+			if !errors.Is(err, config.ErrSnapshotNotFoundSentinel) {
+				unreadable++
+			}
 			continue
 		}
 		c.augmentSnapshot(snap)
 		out = append(out, *snap)
 	}
-	return out, nil
+	return out, unreadable, nil
 }
 
 // GetSnapshot returns a single snapshot by name.

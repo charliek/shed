@@ -392,6 +392,14 @@ type failingStamper struct {
 	*stampingBackend
 	err        error
 	unreadable int
+	// unreadableSnaps is the same for its snapshot listing
+	// (CountingSnapshotLister).
+	unreadableSnaps int
+}
+
+func (b *failingStamper) ListSnapshotsCounting(ctx context.Context) ([]config.Snapshot, int, error) {
+	snaps, err := b.ListSnapshots(ctx)
+	return snaps, b.unreadableSnaps, err
 }
 
 func (b *failingStamper) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
@@ -476,7 +484,7 @@ func TestStampUnassignedOneTimeStep(t *testing.T) {
 		b := &failingStamper{stampingBackend: upgradeFixture(), unreadable: 2}
 		var l capturedLog
 		rep := StampUnassigned(context.Background(), b, alice, true, l.log())
-		if rep.UnreadableSheds != 2 || rep.Incomplete {
+		if rep.UnreadableSheds != 2 {
 			t.Errorf("report %+v", rep)
 		}
 		if !containsLine(l.info, "found no shed without a user or a service client; 2 shed record(s) could not be read and are not counted") {
@@ -488,6 +496,44 @@ func TestStampUnassignedOneTimeStep(t *testing.T) {
 			}
 		}
 	})
+
+	// With one user, a record the listing could not read may be one with no
+	// user that this pass would have stamped: the pass is unfinished, so the
+	// step runs again (and stamps it once readable). Shed and snapshot
+	// records alike; with several users nothing is stamped and nothing is
+	// held back.
+	for _, tc := range []struct {
+		name            string
+		sheds, snaps    int
+		users           []UpgradeUser
+		firstStart      bool
+		wantIncomplete  bool
+		wantUnfinishLog bool
+	}{
+		{"one user, an unreadable shed record", 1, 0, alice, true, true, true},
+		{"one user, an unreadable snapshot record", 0, 1, alice, true, true, true},
+		{"one user, both readable", 0, 0, alice, true, false, false},
+		{"several users, unreadable records", 2, 2, []UpgradeUser{{Name: "alice", Admin: true}, {Name: "bob"}}, true, false, false},
+		{"one user, not the first start", 1, 1, alice, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &failingStamper{stampingBackend: upgradeFixture(), unreadable: tc.sheds, unreadableSnaps: tc.snaps}
+			var l capturedLog
+			rep := StampUnassigned(context.Background(), b, tc.users, tc.firstStart, l.log())
+			if rep.Incomplete != tc.wantIncomplete {
+				t.Errorf("Incomplete = %v, want %v (report %+v)", rep.Incomplete, tc.wantIncomplete, rep)
+			}
+			if rep.UnreadableSheds != tc.sheds || rep.UnreadableSnapshots != tc.snaps {
+				t.Errorf("unreadable %d sheds %d snapshots, want %d and %d", rep.UnreadableSheds, rep.UnreadableSnapshots, tc.sheds, tc.snaps)
+			}
+			if got := containsLine(l.info, "the one-time upgrade step is not finished and resumes at the next start"); got != tc.wantUnfinishLog {
+				t.Errorf("unfinished line logged %v, want %v: %q", got, tc.wantUnfinishLog, l.info)
+			}
+			if tc.snaps > 0 && !containsLine(l.info, fmt.Sprintf("%d snapshot record(s) could not be read and are not counted", tc.snaps)) {
+				t.Errorf("the unreadable snapshots are not reported: %q", l.info)
+			}
+		})
+	}
 }
 
 // TestUsersUpgradeMarker: the first start with a user list is the one with no
@@ -618,6 +664,117 @@ func TestUsersUpgradeMarker(t *testing.T) {
 			}
 			if _, err := os.Lstat(path); err != nil {
 				t.Errorf("the marker entry is gone: %v", err)
+			}
+		})
+	}
+}
+
+// TestUsersUpgradePending: Begin records a step begun for one user before
+// returning it, resumes a pending step only for that same user (with the
+// admin flag narrowed to what it was when the step began), abandons it
+// otherwise, and a pending marker that is damaged counts as done.
+func TestUsersUpgradePending(t *testing.T) {
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	var lines []string
+	logf := func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) }
+	readState := func(t *testing.T, dir string) map[string]any {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(dir, UsersUpgradeFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(data, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	begin := func(dir string, users ...UpgradeUser) (*UsersUpgrade, UpgradePlan) {
+		u := OpenUsersUpgrade(dir, true, logf)
+		return u, u.Begin(users, now)
+	}
+
+	t.Run("first start with one user writes pending first", func(t *testing.T) {
+		dir := t.TempDir()
+		_, plan := begin(dir, UpgradeUser{Name: "alice", Admin: true})
+		if plan.StampFor == nil || *plan.StampFor != (UpgradeUser{Name: "alice", Admin: true}) {
+			t.Fatalf("plan %+v", plan)
+		}
+		m := readState(t, dir)
+		p, _ := m["pending"].(map[string]any)
+		if m["version"] != float64(1) || p["user"] != "alice" || p["admin"] != true || p["started_at"] != "2026-11-16T12:00:00Z" {
+			t.Errorf("pending marker %v", m)
+		}
+		if _, ok := m["completed_at"]; ok {
+			t.Errorf("a pending marker carries completed_at: %v", m)
+		}
+	})
+
+	t.Run("admin flag only narrows", func(t *testing.T) {
+		for _, tc := range []struct{ was, now, want bool }{{true, true, true}, {true, false, false}, {false, true, false}} {
+			dir := t.TempDir()
+			begin(dir, UpgradeUser{Name: "alice", Admin: tc.was})
+			u, plan := begin(dir, UpgradeUser{Name: "alice", Admin: tc.now})
+			if p, ok := u.PendingFor(); !ok || p.Name != "alice" {
+				t.Fatalf("PendingFor = %+v %v", p, ok)
+			}
+			if plan.StampFor == nil || plan.StampFor.Name != "alice" || plan.StampFor.Admin != tc.want {
+				t.Errorf("was %v now %v: plan %+v, want admin %v", tc.was, tc.now, plan.StampFor, tc.want)
+			}
+		}
+	})
+
+	t.Run("abandoned for another user", func(t *testing.T) {
+		dir := t.TempDir()
+		begin(dir, UpgradeUser{Name: "alice", Admin: true})
+		lines = nil
+		_, plan := begin(dir, UpgradeUser{Name: "bob", Admin: true})
+		if plan != (UpgradePlan{}) {
+			t.Errorf("plan %+v, want nothing", plan)
+		}
+		if m := readState(t, dir); m["pending"] != nil || m["completed_at"] != "2026-11-16T12:00:00Z" {
+			t.Errorf("marker %v, want done", m)
+		}
+		if !containsLine(lines, "the unfinished one-time upgrade step for user alice was abandoned") {
+			t.Errorf("log %q", lines)
+		}
+	})
+
+	t.Run("finish", func(t *testing.T) {
+		dir := t.TempDir()
+		u, plan := begin(dir, UpgradeUser{Name: "alice", Admin: true})
+		u.Finish(plan, UpgradeReport{Incomplete: true}, now)
+		if m := readState(t, dir); m["pending"] == nil {
+			t.Errorf("an unfinished pass left marker %v, want pending", m)
+		}
+		u.Finish(plan, UpgradeReport{}, now)
+		if m := readState(t, dir); m["pending"] != nil || m["completed_at"] == nil {
+			t.Errorf("a finished pass left marker %v, want done", m)
+		}
+	})
+
+	for _, tc := range []struct{ name, body string }{
+		{"invalid user", `{"version": 1, "pending": {"user": "Alice", "admin": true, "started_at": "2026-11-16T12:00:00Z"}}`},
+		{"empty user", `{"version": 1, "pending": {"user": "", "started_at": "2026-11-16T12:00:00Z"}}`},
+		{"pending and completed", `{"version": 1, "completed_at": "2026-11-16T12:00:00Z", "pending": {"user": "alice"}}`},
+		{"pending of a newer schema", `{"version": 2, "pending": {"user": "alice"}}`},
+	} {
+		t.Run("damaged: "+tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, UsersUpgradeFile)
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			lines = nil
+			u, plan := begin(dir, UpgradeUser{Name: "alice", Admin: true})
+			if _, ok := u.PendingFor(); ok || u.FirstUserListStart() || plan != (UpgradePlan{}) {
+				t.Errorf("a damaged pending marker was acted on: plan %+v", plan)
+			}
+			if !containsLine(lines, "taken as done") {
+				t.Errorf("log %q", lines)
+			}
+			if got, _ := os.ReadFile(path); string(got) != tc.body {
+				t.Errorf("the marker was rewritten: %s", got)
 			}
 		})
 	}

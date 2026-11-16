@@ -30,6 +30,9 @@ type recBackend struct {
 	// lenientGet makes GetShed ignore a required creation time, so a test
 	// sees the guard's own check of it rather than the backend's.
 	lenientGet bool
+	// getErr, when set, is what GetShed and GetSnapshot answer: a record
+	// that cannot be read.
+	getErr error
 }
 
 func newRecBackend() *recBackend {
@@ -71,10 +74,7 @@ func (b *recBackend) checked(ctx context.Context, name string) (config.Shed, err
 	if !ok {
 		return config.Shed{}, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 	}
-	if err := CheckOwner(ctx, name, sh.Owner); err != nil {
-		return config.Shed{}, err
-	}
-	if err := CheckCreatedAt(ctx, name, sh.CreatedAt); err != nil {
+	if err := CheckIdentity(ctx, name, sh.Owner, sh.User, sh.CreatedAt); err != nil {
 		return config.Shed{}, err
 	}
 	return sh, nil
@@ -111,6 +111,9 @@ func (b *recBackend) CreateShed(ctx context.Context, req config.CreateShedReques
 }
 
 func (b *recBackend) GetShed(ctx context.Context, name string) (*config.Shed, error) {
+	if b.getErr != nil {
+		return nil, b.getErr
+	}
 	if b.lenientGet {
 		ctx = context.Background()
 	}
@@ -247,6 +250,9 @@ func (b *recBackend) ListSnapshots(context.Context) ([]config.Snapshot, error) {
 }
 
 func (b *recBackend) GetSnapshot(_ context.Context, name string) (*config.Snapshot, error) {
+	if b.getErr != nil {
+		return nil, b.getErr
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s, ok := b.snaps[name]
@@ -461,6 +467,9 @@ func TestGuardCoversEveryBackendMethod(t *testing.T) {
 				if got, ok := RequiredCreatedAt(ctx); !ok || !got.Equal(t0) {
 					t.Errorf("%s reached the backend without the shed's incarnation: %v %v", name, got, ok)
 				}
+				if got, ok := RequiredUser(ctx); !ok || got != "alice" {
+					t.Errorf("%s reached the backend without the user it was authorized against: %q %v", name, got, ok)
+				}
 			}
 		})
 	}
@@ -558,6 +567,78 @@ func TestGuardDeleteAndRecreateBetweenLookupAndAction(t *testing.T) {
 		if !errors.Is(err, config.ErrShedNotFoundSentinel) || len(b.acted()) != 0 {
 			t.Errorf("%s across a recreate: %v, calls %v", op, err, b.acted())
 		}
+	}
+}
+
+// TestGuardOwnershipChangeBetweenLookupAndAction: the shed keeps its
+// incarnation but its reported user changes between the guard's check and the
+// action (on the remote backend a reconcile reports a label conflict as
+// unresolved, admin-only; elsewhere an assignment). The backend's check under
+// its lock compares the user the guard authorized against, so the action is
+// answered as not found and nothing is done, for every guarded shed call.
+func TestGuardOwnershipChangeBetweenLookupAndAction(t *testing.T) {
+	for name, c := range guardCases() {
+		if c.kind != "shed" || name == "GetShed" {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			b, g := fixture()
+			g.SetBeforeAct(func(_, shed string) {
+				if shed == "box" {
+					b.put(config.Shed{Name: "box", User: config.UserUnresolved, CreatedAt: t0, Status: config.StatusRunning})
+				}
+			})
+			err := c.call(g, as(alice))
+			if !errors.Is(err, config.ErrShedNotFoundSentinel) {
+				t.Errorf("%s after box became unresolved: %v, want not found", name, err)
+			}
+			if got := b.acted(); len(got) != 0 {
+				t.Errorf("%s acted on a shed that is no longer alice's: %v", name, got)
+			}
+		})
+	}
+	for _, op := range []string{"SetShedEgress", "ClearShedEgress"} {
+		b, g := fixture()
+		g.SetBeforeAct(func(_, _ string) {
+			b.put(config.Shed{Name: "box", User: config.UserUnresolved, CreatedAt: t0})
+		})
+		ec, _ := AsEgressController(g)
+		var err error
+		if op == "SetShedEgress" {
+			_, err = ec.SetShedEgress(as(alice), "box", []string{"base"})
+		} else {
+			_, err = ec.ClearShedEgress(as(alice), "box")
+		}
+		if !errors.Is(err, config.ErrShedNotFoundSentinel) || len(b.acted()) != 0 {
+			t.Errorf("%s after box became unresolved: %v, calls %v", op, err, b.acted())
+		}
+	}
+}
+
+// TestGuardNeverReplacesARequiredOwner: an owner the caller already required
+// (the reaper's and a service client's, from their own lookup) is checked
+// against the shed the guard loads and passed down unchanged; the guard adds
+// the user it authorized against beside it.
+func TestGuardNeverReplacesARequiredOwner(t *testing.T) {
+	b, g := fixture()
+	b.lenientGet = true
+	wrong := WithRequiredOwner(as(SystemPrincipal()), "nocturn")
+	if err := g.DeleteShed(wrong, "box"); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Errorf("delete requiring another owner: %v, want not found", err)
+	}
+	if got := b.acted(); len(got) != 0 {
+		t.Errorf("acted on a shed of another owner: %v", got)
+	}
+	same := WithRequiredOwner(as(SystemPrincipal()), "")
+	if err := g.DeleteShed(same, "box"); err != nil {
+		t.Fatalf("delete requiring the shed's own owner: %v", err)
+	}
+	ctx := b.ctxs["DeleteShed"]
+	if got, ok := requiredOwner(ctx); !ok || got != "" {
+		t.Errorf("required owner passed down = %q %v", got, ok)
+	}
+	if got, ok := RequiredUser(ctx); !ok || got != "alice" {
+		t.Errorf("required user passed down = %q %v, want alice", got, ok)
 	}
 }
 
@@ -1106,5 +1187,155 @@ func TestGuardHostResourcesNeedAnAdminToEnter(t *testing.T) {
 	b.put(config.Shed{Name: "box", Owner: "nocturn", CreatedAt: t0, Mounts: config.SelectedMounts([]string{"gh"})})
 	if err := NewGuard(b).Exec(as(nocturn), "box", ExecOptions{}); err != nil {
 		t.Errorf("client exec into its own shed with policy mounts: %v", err)
+	}
+}
+
+// TestGuardMasksALookupThatFails: when a shed's or snapshot's record cannot be
+// read (here: malformed, with a server path in the error), the caller's right
+// to see it is unknown. A user who is not an admin and a service client get
+// the ordinary not-found answer, with nothing of the error; an admin, the
+// implicit user and the server get the error as it is. Every guarded call on
+// a named shed or snapshot answers so. The detail is logged once per name per
+// interval.
+func TestGuardMasksALookupThatFails(t *testing.T) {
+	const secret = "/var/lib/shed/instances/box/metadata.json"
+	readErr := fmt.Errorf("failed to parse metadata %s: unexpected end of JSON input", secret)
+	type logged struct{ n int }
+	newGuard := func() (*recBackend, *Guard, *logged, *time.Time) {
+		b, g := fixture()
+		b.getErr = readErr
+		lines := &logged{}
+		now := t0
+		g.now = func() time.Time { return now }
+		g.logf = func(format string, args ...any) {
+			lines.n++
+			if line := fmt.Sprintf(format, args...); !strings.Contains(line, secret) {
+				t.Errorf("the log line lacks the detail: %q", line)
+			}
+		}
+		return b, g, lines, &now
+	}
+	for name, c := range guardCases() {
+		if c.kind != "shed" && c.kind != "snapshot" {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			notFound := config.ErrShedNotFoundSentinel
+			if c.kind == "snapshot" {
+				notFound = config.ErrSnapshotNotFoundSentinel
+			}
+			for _, p := range []Principal{bob, alice, nocturn} {
+				b, g, _, _ := newGuard()
+				err := c.call(g, as(p))
+				if !errors.Is(err, notFound) || strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "JSON") {
+					t.Errorf("%s: %v, want the plain not-found answer", p, err)
+				}
+				if got := b.acted(); len(got) != 0 {
+					t.Errorf("%s reached the backend: %v", p, got)
+				}
+			}
+			for _, p := range []Principal{root, ImplicitPrincipal(), SystemPrincipal()} {
+				_, g, _, _ := newGuard()
+				if err := c.call(g, as(p)); !errors.Is(err, readErr) {
+					t.Errorf("%s: %v, want the error as it is", p, err)
+				}
+			}
+		})
+	}
+
+	// The shed made from a snapshot that cannot be read.
+	_, g, _, _ := newGuard()
+	_, err := g.CreateShed(as(bob), config.CreateShedRequest{Name: "new", FromSnapshot: "snap", ResolvedMounts: config.SelectedMounts(nil)})
+	if !errors.Is(err, config.ErrSnapshotNotFoundSentinel) || strings.Contains(err.Error(), secret) {
+		t.Errorf("create from an unreadable snapshot: %v, want not found", err)
+	}
+
+	// Logged once per name per interval, however often asked.
+	_, g, lines, now := newGuard()
+	for i := 0; i < 5; i++ {
+		_, _ = g.GetShed(as(bob), "box")
+	}
+	if lines.n != 1 {
+		t.Errorf("logged %d times in one interval, want 1", lines.n)
+	}
+	_, _ = g.GetSnapshot(as(bob), "snap")
+	if lines.n != 2 {
+		t.Errorf("a snapshot of another name was not logged (%d lines)", lines.n)
+	}
+	*now = now.Add(maskedLogInterval)
+	_, _ = g.GetShed(as(bob), "box")
+	if lines.n != 3 {
+		t.Errorf("not logged again after the interval (%d lines)", lines.n)
+	}
+}
+
+// TestGuardMaskedLogIsBounded: the names remembered for the log's rate limit
+// never grow past maskedLogMax, and a full table never forgets a name still
+// inside its interval: the review's sequence (fill the table, fail one more
+// name, then repeat the first name within the interval) logs the first name
+// once only. A failure for a new name while the table is full is counted, and
+// the count is logged, at most once per interval.
+func TestGuardMaskedLogIsBounded(t *testing.T) {
+	g := NewGuard(newRecBackend())
+	now := t0
+	g.now = func() time.Time { return now }
+	call := func(key string) (bool, int) {
+		t.Helper()
+		logNow, suppressed := g.logMasked(key)
+		if len(g.masked) > maskedLogMax {
+			t.Fatalf("remembered %d names, more than %d", len(g.masked), maskedLogMax)
+		}
+		return logNow, suppressed
+	}
+	// Half the names at t0, half 30 s later.
+	for i := 0; i < maskedLogMax; i++ {
+		if i == maskedLogMax/2 {
+			now = t0.Add(30 * time.Second)
+		}
+		if logNow, _ := call(fmt.Sprintf("shed s%d", i)); !logNow {
+			t.Fatalf("a first failure for a new name was not logged (%d)", i)
+		}
+	}
+
+	// Full, every name inside its interval: a new name is not logged; the
+	// first summary is due at once.
+	now = t0.Add(31 * time.Second)
+	if logNow, suppressed := call("shed overflow-0"); logNow || suppressed != 1 {
+		t.Errorf("a new name with the table full: logged %v, summary %d; want not logged, a summary of 1", logNow, suppressed)
+	}
+	for i := 1; i <= 5; i++ {
+		if logNow, suppressed := call(fmt.Sprintf("shed overflow-%d", i)); logNow || suppressed != 0 {
+			t.Errorf("overflow %d: logged %v, summary %d; want neither inside the summary's interval", i, logNow, suppressed)
+		}
+	}
+	// The first name is still inside its interval: not logged again.
+	if logNow, _ := call("shed s0"); logNow {
+		t.Error("a name inside its interval was logged again after the table filled")
+	}
+
+	// The first half expires; a new name makes room by dropping expired
+	// names only, and is logged. A name of the second half, still inside its
+	// interval, is remembered and not logged again.
+	now = t0.Add(maskedLogInterval + 2*time.Second)
+	if logNow, suppressed := call("shed after"); !logNow || suppressed != 0 {
+		t.Errorf("a new name once names expired: logged %v, summary %d; want logged, no summary inside the summary's interval", logNow, suppressed)
+	}
+	if _, ok := g.masked["shed s0"]; ok {
+		t.Error("an expired name was kept")
+	}
+	if len(g.masked) != maskedLogMax/2+1 {
+		t.Errorf("remembered %d names, want the %d inside their interval and the new one", len(g.masked), maskedLogMax/2)
+	}
+	if logNow, _ := call(fmt.Sprintf("shed s%d", maskedLogMax-1)); logNow {
+		t.Error("a name inside its interval was forgotten when the table made room")
+	}
+	if logNow, _ := call("shed after"); logNow {
+		t.Error("the new name was logged twice in its interval")
+	}
+	// One summary interval after the first: the five suppressed since are
+	// due, on any masked failure, even one not logged itself.
+	now = t0.Add(31*time.Second + maskedLogInterval)
+	if logNow, suppressed := call("shed after"); logNow || suppressed != 5 {
+		t.Errorf("summary interval over: logged %v, summary %d; want a summary of 5", logNow, suppressed)
 	}
 }

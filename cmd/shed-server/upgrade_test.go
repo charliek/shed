@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -146,24 +147,61 @@ func TestServeStampIsAOneTimeStep(t *testing.T) {
 		t.Fatalf("the marker survived a start with no user list: %v", err)
 	}
 
-	// A pass that fails writes no marker; the next start runs it again.
+	// A pass that fails leaves the step pending for alice; the next start,
+	// with alice still the one user, resumes it.
 	be.failAssign = errors.New("disk full")
 	if rep, _ := stampNoBindings(t, one, be, state); !rep.Incomplete {
 		t.Fatalf("the failing pass reported %+v", rep)
 	}
-	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("a pass that did not finish wrote the marker: %v", err)
+	if got := readMarker(t, state); got != "pending:alice" {
+		t.Fatalf("after a pass that did not finish the marker is %q, want pending for alice", got)
 	}
 	be.failAssign = nil
-	if _, up := stampNoBindings(t, one, be, state); !up.FirstUserListStart() {
-		t.Error("the start after an unfinished pass was not a first start")
+	if _, up := stampNoBindings(t, one, be, state); !isPendingFor(up, "alice") {
+		t.Error("the start after an unfinished pass did not resume it for alice")
 	}
 	if !reflect.DeepEqual(be.assigned, map[string]string{"legacy": "alice"}) {
 		t.Errorf("assigned %v, want legacy to alice", be.assigned)
 	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Errorf("no marker after the finished pass: %v", err)
+	if got := readMarker(t, state); got != "done" {
+		t.Errorf("after the finished pass the marker is %q, want done", got)
 	}
+}
+
+// readMarker reads the one-time step's marker in state: "" when there is
+// none, "done", or "pending:<user>".
+func readMarker(t *testing.T, state string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(state, backend.UsersUpgradeFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return ""
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		Version     int    `json:"version"`
+		CompletedAt string `json:"completed_at"`
+		Pending     *struct {
+			User string `json:"user"`
+		} `json:"pending"`
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("marker %s: %v", data, err)
+	}
+	if m.Pending != nil {
+		return "pending:" + m.Pending.User
+	}
+	if m.Version != 1 || m.CompletedAt == "" {
+		t.Fatalf("marker %s is neither pending nor done", data)
+	}
+	return "done"
+}
+
+// isPendingFor reports whether up opened a marker pending for user.
+func isPendingFor(up *backend.UsersUpgrade, user string) bool {
+	p, ok := up.PendingFor()
+	return ok && p.Name == user
 }
 
 // TestServeSeveralUsersRecordedBeforeListing: with several users nothing is
@@ -192,5 +230,52 @@ func TestServeSeveralUsersRecordedBeforeListing(t *testing.T) {
 	}
 	if len(be.assigned) != 0 || !reflect.DeepEqual(rep.Unassigned, []string{"legacy"}) {
 		t.Errorf("one user after an interrupted two-user start: assigned %v, report %+v; want nothing stamped", be.assigned, rep)
+	}
+}
+
+// countingListBackend is a listOnlyBackend whose listing leaves out records it
+// cannot read and says how many (backend.CountingLister): hidden holds the
+// sheds it cannot read yet.
+type countingListBackend struct {
+	*listOnlyBackend
+	hidden []config.Shed
+}
+
+func (b *countingListBackend) ListShedsCounting(ctx context.Context) ([]config.Shed, int, error) {
+	sheds, err := b.ListSheds(ctx)
+	return sheds, len(b.hidden), err
+}
+
+// TestServeUnreadableShedKeepsTheStepPending: on the first start with one
+// user, a shed record the listing cannot read leaves the one-time step
+// unfinished: no marker. At the next start, with the record readable again,
+// the step runs again and gives that shed (one with host mounts, which
+// `shed assign` would refuse) to the user, and only then is the marker
+// written.
+func TestServeUnreadableShedKeepsTheStepPending(t *testing.T) {
+	one, _, _ := wiringConfigs(t)
+	state := t.TempDir()
+	hosty := config.Shed{Name: "hosty", Mounts: config.SelectedMounts(nil), ProjectMounts: []config.MountConfig{{Source: "/srv", Target: "/home/shed/srv"}}}
+	be := &countingListBackend{listOnlyBackend: newListOnlyBackend(), hidden: []config.Shed{hosty}}
+
+	rep, up := stampNoBindings(t, one, be, state)
+	if !up.FirstUserListStart() || !rep.Incomplete {
+		t.Fatalf("first start: first %v report %+v, want an unfinished first start", up.FirstUserListStart(), rep)
+	}
+	if got := readMarker(t, state); got != "pending:alice" {
+		t.Fatalf("the marker is %q although a shed record could not be read; want pending for alice", got)
+	}
+
+	be.sheds = append(be.sheds, hosty)
+	be.hidden = nil
+	rep, up = stampNoBindings(t, one, be, state)
+	if !isPendingFor(up, "alice") || rep.Incomplete {
+		t.Fatalf("second start: pending %v report %+v, want a finished resumed step", isPendingFor(up, "alice"), rep)
+	}
+	if be.assigned["hosty"] != "alice" {
+		t.Errorf("the shed readable again was not given to the one user: %v", be.assigned)
+	}
+	if got := readMarker(t, state); got != "done" {
+		t.Errorf("the marker is %q once the step finished, want done", got)
 	}
 }

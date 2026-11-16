@@ -50,7 +50,9 @@ func (c *Client) AssignUser(ctx context.Context, name string, req config.AssignS
 	if c.credMgr != nil && c.credMgr.SetShedUser(name, meta.CreatedAt, req.User) {
 		log.Printf("[%s] now routes credential requests as user %q", name, req.User)
 	}
-	return c.getShedLocked(ctx, name)
+	// Read back as what it now is: the user it was bound to (the guard's
+	// WithRequiredUser) is the one this call has just replaced.
+	return c.getShedLocked(backend.WithRequiredUser(ctx, req.User), name)
 }
 
 // StampSnapshotUser records user on a snapshot with none (see

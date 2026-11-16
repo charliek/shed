@@ -209,7 +209,7 @@ const testFingerprint = "SHA256:1U6JLBiKdyPFRj5o2Vv5uF3d8Kk0Y0mYFDDaC4mHtCk"
 // SignClientCSR directly.
 func signOK(t *testing.T, ca CA, csrDER []byte, ttl time.Duration) *x509.Certificate {
 	t.Helper()
-	der, err := ca.SignClientCSR(csrDER, testFingerprint, "shed", "cli", ttl)
+	der, err := ca.SignClientCSR(csrDER, testFingerprint, "", "shed", "cli", ttl)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -684,7 +684,7 @@ func TestSignClientCSRIgnoresRequestedIdentity(t *testing.T) {
 
 	const ttl = 2 * time.Hour
 	before := time.Now()
-	der, err := ca.SignClientCSR(csr, testFingerprint, "shed:my-shed", "cli", ttl)
+	der, err := ca.SignClientCSR(csr, testFingerprint, "", "shed:my-shed", "cli", ttl)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -822,7 +822,7 @@ func TestSignClientCSRKeyIdentifiers(t *testing.T) {
 func TestSignClientCSROmitsEmptySubjectFields(t *testing.T) {
 	ca := loadTestCA(t, caSpec{})
 	csr, _ := p256CSR(t)
-	der, err := ca.SignClientCSR(csr, testFingerprint, "", "", time.Hour)
+	der, err := ca.SignClientCSR(csr, testFingerprint, "", "", "", time.Hour)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -874,7 +874,7 @@ func TestSignClientCSRValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			der, err := ca.SignClientCSR(tt.csr, testFingerprint, "shed", "cli", time.Hour)
+			der, err := ca.SignClientCSR(tt.csr, testFingerprint, "", "shed", "cli", time.Hour)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("error = %v, want %v", err, tt.wantErr)
 			}
@@ -921,7 +921,7 @@ func TestSignClientCSRArgumentGuards(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			der, err := tt.ca.SignClientCSR(csr, tt.fingerprint, "shed", "cli", tt.ttl)
+			der, err := tt.ca.SignClientCSR(csr, tt.fingerprint, "", "shed", "cli", tt.ttl)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("error = %v, want %v", err, tt.wantErr)
 			}
@@ -950,7 +950,7 @@ func TestSignClientCSRSubjectFingerprintForm(t *testing.T) {
 			sshFingerprintPrefix + allSlashes,
 			sshFingerprintPrefix + allZeros,
 		} {
-			if _, err := ca.SignClientCSR(csr, fp, "shed", "cli", time.Hour); err != nil {
+			if _, err := ca.SignClientCSR(csr, fp, "", "shed", "cli", time.Hour); err != nil {
 				t.Errorf("fingerprint %q rejected: %v", fp, err)
 			}
 		}
@@ -974,7 +974,7 @@ func TestSignClientCSRSubjectFingerprintForm(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			der, err := ca.SignClientCSR(csr, tt.fingerprint, "shed", "cli", time.Hour)
+			der, err := ca.SignClientCSR(csr, tt.fingerprint, "", "shed", "cli", time.Hour)
 			if !errors.Is(err, ErrCAInvalidSubject) {
 				t.Fatalf("error = %v, want %v", err, ErrCAInvalidSubject)
 			}
@@ -1006,7 +1006,7 @@ func TestSignClientCSRLifetimeBounds(t *testing.T) {
 
 	t.Run("refuses when the CA expires soon", func(t *testing.T) {
 		ca := loadTestCA(t, caSpec{notAfter: time.Now().Add(24 * time.Hour)})
-		if _, err := ca.SignClientCSR(csr, testFingerprint, "shed", "cli", time.Hour); !errors.Is(err, ErrCAExpiringSoon) {
+		if _, err := ca.SignClientCSR(csr, testFingerprint, "", "shed", "cli", time.Hour); !errors.Is(err, ErrCAExpiringSoon) {
 			t.Errorf("err = %v, want %v", err, ErrCAExpiringSoon)
 		}
 	})

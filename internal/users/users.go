@@ -198,6 +198,50 @@ func HasKey(l Lookup, fingerprint string) bool {
 	return ok && !k.Expired(time.Now())
 }
 
+// Binding is the user a credential was issued to, or a connection
+// authenticated as: the user its key resolved to at that moment. A key can
+// change hands later (an operator gives it to another user, or a GitHub
+// refresh finds it under another user's login), and a credential bound to
+// one user must not then act as the other, so whoever checks the credential
+// asks ResolveBound, not UserForKey.
+type Binding struct {
+	// Bound is false for a credential that names no user: a client
+	// certificate issued before certificates named one. It is checked by
+	// its key alone, as it always was, until it expires.
+	Bound bool
+	// Name is the user's name; ImplicitName for the implicit user.
+	Name string
+	// Implicit marks the implicit user. The implicit user is a user for
+	// this purpose: a credential bound to it never matches a named user,
+	// nor the reverse, whatever the names.
+	Implicit bool
+}
+
+// BindingOf is the binding to user u.
+func BindingOf(u User) Binding { return Binding{Bound: true, Name: u.Name, Implicit: u.Implicit} }
+
+// Matches reports whether u is the user b binds to. An unbound b matches any
+// user.
+func (b Binding) Matches(u User) bool {
+	return !b.Bound || (b.Implicit == u.Implicit && b.Name == u.Name)
+}
+
+// ResolveBound is UserForKey for a credential bound to b: the key with this
+// fingerprint must resolve to a user, must not have expired at now, and must
+// still belong to the user b binds to. ok is false otherwise, and with a nil
+// Lookup. Admin status and the key's script mark come from the lookup as it
+// is now, never from the binding.
+func ResolveBound(l Lookup, fingerprint string, b Binding, now time.Time) (User, Key, bool) {
+	if l == nil {
+		return User{}, Key{}, false
+	}
+	u, k, ok := l.UserForKey(fingerprint)
+	if !ok || k.Expired(now) || !b.Matches(u) {
+		return User{}, Key{}, false
+	}
+	return u, k, true
+}
+
 // HasUserList reports whether l has named users: a server whose lookup does
 // not answer for the implicit user. On such a server an unknown key is
 // nobody's, in every SSH mode, and never an admin. A nil Lookup has none.

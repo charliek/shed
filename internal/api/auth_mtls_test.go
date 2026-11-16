@@ -23,6 +23,7 @@ import (
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/internal/users"
 	"github.com/charliek/shed/internal/users/userstest"
 )
 
@@ -536,6 +537,13 @@ func testCA(t *testing.T) servertls.CA {
 // tests honest about the subject shape the server actually issues.
 func issueClientCert(t *testing.T, ca servertls.CA, fingerprint, scope string, ttl time.Duration) tls.Certificate {
 	t.Helper()
+	return issueClientCertAs(t, ca, fingerprint, users.ImplicitName, scope, ttl)
+}
+
+// issueClientCertAs is issueClientCert for a certificate issued to user (""
+// for the implicit user).
+func issueClientCertAs(t *testing.T, ca servertls.CA, fingerprint, user, scope string, ttl time.Duration) tls.Certificate {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate client key: %v", err)
@@ -545,7 +553,7 @@ func issueClientCert(t *testing.T, ca servertls.CA, fingerprint, scope string, t
 	if err != nil {
 		t.Fatalf("create CSR: %v", err)
 	}
-	certDER, err := ca.SignClientCSR(csrDER, fingerprint, scope, authtoken.ClientCLI, ttl)
+	certDER, err := ca.SignClientCSR(csrDER, fingerprint, user, scope, authtoken.ClientCLI, ttl)
 	if err != nil {
 		t.Fatalf("sign client CSR: %v", err)
 	}
@@ -581,10 +589,13 @@ func (h *mtlsHarness) authorized(fp string) bool {
 // produces on a live wire.
 func (h *mtlsHarness) tlsConfig() *tls.Config {
 	return &tls.Config{
-		MinVersion:       tls.VersionTLS12,
-		ClientCAs:        h.ca.Pool(),
-		ClientAuth:       tls.RequireAndVerifyClientCert,
-		VerifyConnection: servertls.AllowlistConnectionVerifier(h.authorized),
+		MinVersion: tls.VersionTLS12,
+		ClientCAs:  h.ca.Pool(),
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		VerifyConnection: servertls.AllowlistConnectionVerifier(func(leaf *x509.Certificate) bool {
+			_, _, ok := CertificateUser(userstest.Matching(h.authorized), leaf, time.Now())
+			return ok
+		}),
 	}
 }
 

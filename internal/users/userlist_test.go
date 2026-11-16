@@ -380,3 +380,56 @@ func TestAdminCanAct(t *testing.T) {
 		}
 	}
 }
+
+// TestBindingDoesNotFollowAKeyMovedByARefresh: key K is alice's (her GitHub
+// login publishes it) when a credential is bound to her. A refresh, with no
+// restart, then finds K under bob's login only: K resolves to bob, and the
+// credential bound to alice resolves to nobody (ResolveBound), while one bound
+// to bob, enrolled after, resolves to bob. A credential bound to the implicit
+// user never resolves to a named user, and an unbound one (issued before
+// bindings existed) follows the key.
+func TestBindingDoesNotFollowAKeyMovedByARefresh(t *testing.T) {
+	gh := newFakeGitHub(t)
+	k, kLine := genKey(t)
+	bobOwn, bobLine := genKey(t)
+	gh.set("alice-gh", 1001, kLine)
+	gh.set("bob-gh", 1002, bobLine)
+	l := openUserList(t, map[string]config.UserConfig{
+		"alice": {GitHub: "alice-gh", Admin: true},
+		"bob":   {GitHub: "bob-gh"},
+	})
+	alice, ok := l.User("alice")
+	if !ok {
+		t.Fatal("no alice")
+	}
+	bound := BindingOf(alice)
+	now := time.Now()
+	if u, _, ok := ResolveBound(l, fp(k), bound, now); !ok || u.Name != "alice" || !u.Admin {
+		t.Fatalf("before the refresh K bound to alice resolves to %+v %v", u, ok)
+	}
+
+	gh.set("alice-gh", 1001, "")
+	gh.set("bob-gh", 1002, bobLine+kLine)
+	if _, err := l.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if u, _, ok := l.UserForKey(fp(k)); !ok || u.Name != "bob" {
+		t.Fatalf("after the refresh K resolves to %q %v, want bob", u.Name, ok)
+	}
+	if u, _, ok := ResolveBound(l, fp(k), bound, now); ok {
+		t.Errorf("a credential bound to alice resolves to %+v after K moved to bob", u)
+	}
+	bob, _ := l.User("bob")
+	if u, _, ok := ResolveBound(l, fp(k), BindingOf(bob), now); !ok || u.Name != "bob" {
+		t.Errorf("a credential bound to bob resolves to %+v %v", u, ok)
+	}
+	if _, _, ok := ResolveBound(l, fp(k), BindingOf(Implicit()), now); ok {
+		t.Error("a credential bound to the implicit user resolves to a named user")
+	}
+	if u, _, ok := ResolveBound(l, fp(k), Binding{}, now); !ok || u.Name != "bob" {
+		t.Errorf("an unbound credential resolves to %+v %v, want K's user now (bob)", u, ok)
+	}
+	if u, _, ok := ResolveBound(l, fp(bobOwn), BindingOf(bob), now); !ok || u.Name != "bob" {
+		t.Errorf("bob's own key: %+v %v", u, ok)
+	}
+}

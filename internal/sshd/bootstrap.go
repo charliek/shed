@@ -17,6 +17,7 @@ import (
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/internal/users"
 )
 
 const (
@@ -101,22 +102,12 @@ func (s *Server) SetBootstrap(info BootstrapInfo) {
 // bundle (the certificate plus the TLS pin + port) as a single JSON line. It never touches the shed routing or the shell wrap.
 //
 // The certificate is issued for the key the connection authenticated with,
-// as recorded by the VerifiedPublicKeyCallback (connIdentity), and only while that key
-// still resolves to a user for this channel (principalFor).
+// as recorded by the VerifiedPublicKeyCallback (connIdentity), to the user
+// that key resolved to then, and only while the key still resolves to that
+// same user for this channel (principalFor).
 func (s *Server) handleBootstrap(sess ssh.Session) {
-	var key gossh.PublicKey
-	if id, ok := connIdentityFrom(sess.Context()); ok {
-		key = id.key
-	}
-	if s.keyAuth.enforced() {
-		if _, err := s.principalFor(sess.Context()); err != nil {
-			log.Printf("bootstrap refused: %v", err)
-			fmt.Fprintln(sess.Stderr(), "bootstrap: key not authorized")
-			_ = sess.Exit(1)
-			return
-		}
-	}
-	bundle, err := s.mintBootstrap(key, sess.RawCommand())
+	id, _ := connIdentityFrom(sess.Context())
+	bundle, err := s.mintBootstrap(id, sess.RawCommand())
 	if err != nil {
 		fmt.Fprintf(sess.Stderr(), "%v\n", err)
 		_ = sess.Exit(1)
@@ -130,25 +121,37 @@ func (s *Server) handleBootstrap(sess ssh.Session) {
 	_ = sess.Exit(0)
 }
 
+// errBootstrapNotAuthorized refuses a credential to a connection whose key
+// does not resolve, now, to the user it authenticated as.
+var errBootstrapNotAuthorized = errors.New("bootstrap: key not authorized")
+
 // mintBootstrap is the testable core of handleBootstrap: it authorizes the
 // request and issues a credential, independent of the SSH session plumbing.
 //
 // It RE-VERIFIES authorization rather than trusting the transport: keys are
 // surfaced by gliderlabs even in `off`/`warn` mode (PublicKeyHandler returns
-// true for them), so the handler requires `enforce` AND a key the user lookup
-// resolves before issuing a credential. rawCmd is the client's request line:
+// true for them), so the handler requires `enforce` AND a connection whose key
+// the user lookup still resolves to the user it authenticated as
+// (principalForIdentity) before issuing a credential. The certificate names
+// that user (the implicit user included), so it authenticates as nobody else
+// whatever happens to the key later. rawCmd is the client's request line:
 // "<scope> [<client-kind>] [csr=<base64>]" (scope defaults to control).
 //
 // Config load allows enforce only in mtls mode, so an open server always stops
 // at the first check. Its message is a protocol string: released clients match
 // it as a whole line to recognise an open server and fall back to plain HTTP
 // (cmd/shed/server_add.go), so it must stay byte-identical.
-func (s *Server) mintBootstrap(key gossh.PublicKey, rawCmd string) (bootstrapBundle, error) {
+func (s *Server) mintBootstrap(id connIdentity, rawCmd string) (bootstrapBundle, error) {
 	if !s.keyAuth.enforced() {
 		return bootstrapBundle{}, errBootstrapOpenServer
 	}
-	if key == nil || !s.keyAuth.known(gossh.FingerprintSHA256(key)) {
-		return bootstrapBundle{}, errors.New("bootstrap: key not authorized")
+	if id.key == nil {
+		return bootstrapBundle{}, errBootstrapNotAuthorized
+	}
+	p, err := s.principalForIdentity(id)
+	if err != nil {
+		log.Printf("bootstrap refused: %v", err)
+		return bootstrapBundle{}, errBootstrapNotAuthorized
 	}
 	if s.bootstrap == nil {
 		return bootstrapBundle{}, errors.New("bootstrap: credential issuance not configured")
@@ -158,10 +161,14 @@ func (s *Server) mintBootstrap(key gossh.PublicKey, rawCmd string) (bootstrapBun
 	if err != nil {
 		return bootstrapBundle{}, err
 	}
-	if req.scope == authtoken.ScopeCredentials && s.keyAuth.script(gossh.FingerprintSHA256(key)) {
+	if req.scope == authtoken.ScopeCredentials && (p.Script || s.keyAuth.script(id.fingerprint)) {
 		return bootstrapBundle{}, errBootstrapScriptCredentials
 	}
-	return s.mintClientCert(key, req)
+	user := p.User
+	if p.Implicit {
+		user = users.ImplicitName
+	}
+	return s.mintClientCert(id.key, user, req)
 }
 
 // errBootstrapScriptCredentials refuses a credentials certificate to a script
@@ -200,9 +207,10 @@ func clientIssuanceError(err error) error {
 // returns the leaf.
 //
 // The issued identity comes entirely from the authenticated SSH channel (the
-// key fingerprint) and this request line (scope, kind); the CSR contributes
-// only its public key. See servertls.CA.SignClientCSR.
-func (s *Server) mintClientCert(key gossh.PublicKey, req bootstrapRequest) (bootstrapBundle, error) {
+// key fingerprint and the user it resolved to; "" is the implicit user) and
+// this request line (scope, kind); the CSR contributes only its public key.
+// See servertls.CA.SignClientCSR.
+func (s *Server) mintClientCert(key gossh.PublicKey, user string, req bootstrapRequest) (bootstrapBundle, error) {
 	if s.bootstrap.CA == nil {
 		return bootstrapBundle{}, errors.New("bootstrap: client certificate issuance not configured")
 	}
@@ -215,7 +223,7 @@ func (s *Server) mintClientCert(key gossh.PublicKey, req bootstrapRequest) (boot
 	}
 
 	certDER, err := s.bootstrap.CA.SignClientCSR(
-		csrDER, gossh.FingerprintSHA256(key), req.scope, req.kind, s.bootstrap.TokenTTL)
+		csrDER, gossh.FingerprintSHA256(key), user, req.scope, req.kind, s.bootstrap.TokenTTL)
 	if err != nil {
 		return bootstrapBundle{}, clientIssuanceError(err)
 	}

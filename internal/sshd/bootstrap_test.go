@@ -57,7 +57,7 @@ func TestBootstrapOpenServerRefusal(t *testing.T) {
 				s := &Server{keyAuth: tc.auth}
 				// Even a server that somehow has a CA wired must not issue.
 				s.SetBootstrap(BootstrapInfo{HTTPSPort: 8443, TokenTTL: time.Hour, CA: testCA(t)})
-				_, err := s.mintBootstrap(key, cmd)
+				_, err := s.mintBootstrapKey(key, cmd)
 				if err == nil || err.Error() != want {
 					t.Fatalf("error = %v, want exactly %q", err, want)
 				}
@@ -69,7 +69,7 @@ func TestBootstrapOpenServerRefusal(t *testing.T) {
 func TestMintBootstrapRejectsInvalidScope(t *testing.T) {
 	key := testKey(t)
 	s := mtlsServer(t, key, testCA(t))
-	if _, err := s.mintBootstrap(key, "admin csr="+testCSR(t, elliptic.P256())); err == nil {
+	if _, err := s.mintBootstrapKey(key, "admin csr="+testCSR(t, elliptic.P256())); err == nil {
 		t.Fatal("expected error for admin (removed) scope")
 	}
 }
@@ -77,7 +77,7 @@ func TestMintBootstrapRejectsInvalidScope(t *testing.T) {
 func TestMintBootstrapUnconfigured(t *testing.T) {
 	key := testKey(t)
 	s := &Server{keyAuth: enforceKeys(key)} // no SetBootstrap
-	_, err := s.mintBootstrap(key, "control csr="+testCSR(t, elliptic.P256()))
+	_, err := s.mintBootstrapKey(key, "control csr="+testCSR(t, elliptic.P256()))
 	if err == nil || err.Error() != "bootstrap: credential issuance not configured" {
 		t.Fatalf("error = %v, want the not-configured refusal", err)
 	}
@@ -189,7 +189,7 @@ func TestMintBootstrapMTLSBundle(t *testing.T) {
 	ca := testCA(t)
 	s := mtlsServer(t, key, ca)
 
-	bundle, err := s.mintBootstrap(key, "credentials host-agent csr="+testCSR(t, elliptic.P256()))
+	bundle, err := s.mintBootstrapKey(key, "credentials host-agent csr="+testCSR(t, elliptic.P256()))
 	if err != nil {
 		t.Fatalf("mintBootstrap: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestMintBootstrapMTLSCSRPositionIndependent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			key := testKey(t)
 			s := mtlsServer(t, key, testCA(t))
-			bundle, err := s.mintBootstrap(key, tc.cmd(testCSR(t, elliptic.P256())))
+			bundle, err := s.mintBootstrapKey(key, tc.cmd(testCSR(t, elliptic.P256())))
 			if err != nil {
 				t.Fatalf("mintBootstrap: %v", err)
 			}
@@ -283,7 +283,7 @@ func TestMintBootstrapMTLSRequiresCSR(t *testing.T) {
 	key := testKey(t)
 	s := mtlsServer(t, key, testCA(t))
 	for _, cmd := range []string{"", "control", "control cli", "credentials host-agent"} {
-		_, err := s.mintBootstrap(key, cmd)
+		_, err := s.mintBootstrapKey(key, cmd)
 		if err == nil {
 			t.Fatalf("%q: expected error", cmd)
 		}
@@ -320,7 +320,7 @@ func TestMintBootstrapMTLSCSRErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			key := testKey(t)
 			s := mtlsServer(t, key, testCA(t))
-			_, err := s.mintBootstrap(key, tc.cmd)
+			_, err := s.mintBootstrapKey(key, tc.cmd)
 			if err == nil {
 				t.Fatalf("expected error %q", tc.wantErr)
 			}
@@ -345,7 +345,7 @@ func mustB64(t *testing.T, s string) []byte {
 func TestMintBootstrapRequestTooLong(t *testing.T) {
 	long := "control cli csr=" + strings.Repeat("A", 16<<10)
 	key := testKey(t)
-	_, err := mtlsServer(t, key, testCA(t)).mintBootstrap(key, long)
+	_, err := mtlsServer(t, key, testCA(t)).mintBootstrapKey(key, long)
 	if err == nil || err.Error() != "bootstrap: request too long" {
 		t.Fatalf("error = %v, want bootstrap: request too long", err)
 	}
@@ -357,7 +357,7 @@ func TestMintBootstrapMTLSWithoutCA(t *testing.T) {
 	key := testKey(t)
 	s := mtlsServer(t, key, testCA(t))
 	s.bootstrap.CA = nil
-	_, err := s.mintBootstrap(key, "control csr="+testCSR(t, elliptic.P256()))
+	_, err := s.mintBootstrapKey(key, "control csr="+testCSR(t, elliptic.P256()))
 	if err == nil || !strings.Contains(err.Error(), "client certificate issuance not configured") {
 		t.Fatalf("error = %v, want client-certificate-not-configured", err)
 	}
@@ -384,7 +384,7 @@ func TestMintBootstrapClientKindNormalization(t *testing.T) {
 			key := testKey(t)
 			s := mtlsServer(t, key, testCA(t))
 			cmd := strings.TrimRight("control "+tc.arg, " ") + " csr=" + testCSR(t, elliptic.P256())
-			bundle, err := s.mintBootstrap(key, cmd)
+			bundle, err := s.mintBootstrapKey(key, cmd)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -409,10 +409,10 @@ func TestMintBootstrapClientKindNormalization(t *testing.T) {
 func TestMintBootstrapMTLSNeedsAuthorization(t *testing.T) {
 	csr := "control csr=" + testCSR(t, elliptic.P256())
 	s := mtlsServer(t, testKey(t), testCA(t))
-	if _, err := s.mintBootstrap(testKey(t), csr); err == nil {
+	if _, err := s.mintBootstrapKey(testKey(t), csr); err == nil {
 		t.Error("expected error for unauthorized key")
 	}
-	if _, err := s.mintBootstrap(nil, csr); err == nil {
+	if _, err := s.mintBootstrapKey(nil, csr); err == nil {
 		t.Error("expected error for nil key")
 	}
 }
@@ -436,7 +436,7 @@ func TestMintBootstrapRequestLengthBoundary(t *testing.T) {
 		key := testKey(t)
 		s := mtlsServer(t, key, testCA(t))
 		cmd := pad(t, "control cli csr="+testCSR(t, elliptic.P256()), maxBootstrapCommand)
-		bundle, err := s.mintBootstrap(key, cmd)
+		bundle, err := s.mintBootstrapKey(key, cmd)
 		if err != nil {
 			t.Fatalf("mintBootstrap at exact cap (%d bytes): %v", len(cmd), err)
 		}
@@ -452,7 +452,7 @@ func TestMintBootstrapRequestLengthBoundary(t *testing.T) {
 		if len(cmd) != maxBootstrapCommand+1 {
 			t.Fatalf("test setup: cmd length = %d, want %d", len(cmd), maxBootstrapCommand+1)
 		}
-		_, err := s.mintBootstrap(key, cmd)
+		_, err := s.mintBootstrapKey(key, cmd)
 		if err == nil || err.Error() != "bootstrap: request too long" {
 			t.Fatalf("error = %v, want bootstrap: request too long", err)
 		}
@@ -468,7 +468,7 @@ func TestMintBootstrapBareCSRWordIsNotCSRArg(t *testing.T) {
 	t.Run("mtls", func(t *testing.T) {
 		key := testKey(t)
 		s := mtlsServer(t, key, testCA(t))
-		_, err := s.mintBootstrap(key, "control csr")
+		_, err := s.mintBootstrapKey(key, "control csr")
 		if err == nil || err.Error() != errBootstrapNeedsCSR.Error() {
 			t.Fatalf("error = %v, want %v (bare \"csr\" word must not satisfy the CSR requirement)", err, errBootstrapNeedsCSR)
 		}
@@ -485,7 +485,7 @@ func TestMintBootstrapUppercaseCSRKeyNotRecognized(t *testing.T) {
 	t.Run("mtls treated as no csr", func(t *testing.T) {
 		key := testKey(t)
 		s := mtlsServer(t, key, testCA(t))
-		_, err := s.mintBootstrap(key, cmd)
+		_, err := s.mintBootstrapKey(key, cmd)
 		if err == nil || err.Error() != errBootstrapNeedsCSR.Error() {
 			t.Fatalf("error = %v, want %v (CSR= must not satisfy the lowercase csr= requirement)", err, errBootstrapNeedsCSR)
 		}
@@ -503,7 +503,7 @@ func TestMintBootstrapCSRLiteralAsScope(t *testing.T) {
 	t.Run("mtls", func(t *testing.T) {
 		key := testKey(t)
 		s := mtlsServer(t, key, testCA(t))
-		_, err := s.mintBootstrap(key, cmd)
+		_, err := s.mintBootstrapKey(key, cmd)
 		if err == nil || err.Error() != wantErr {
 			t.Fatalf("error = %v, want %q", err, wantErr)
 		}
@@ -516,7 +516,7 @@ func TestMintBootstrapWhitespaceSeparators(t *testing.T) {
 	valid := testCSR(t, elliptic.P256())
 	key := testKey(t)
 	s := mtlsServer(t, key, testCA(t))
-	bundle, err := s.mintBootstrap(key, "control\tcli   csr="+valid)
+	bundle, err := s.mintBootstrapKey(key, "control\tcli   csr="+valid)
 	if err != nil {
 		t.Fatalf("mintBootstrap: %v", err)
 	}
@@ -541,7 +541,7 @@ func TestMintBootstrapInvalidScopeEscapesControlBytes(t *testing.T) {
 	key := testKey(t)
 	s := mtlsServer(t, key, testCA(t))
 	scope := "\x1b[31mbogus"
-	_, err := s.mintBootstrap(key, scope+" cli")
+	_, err := s.mintBootstrapKey(key, scope+" cli")
 	if err == nil {
 		t.Fatal("expected error for invalid scope")
 	}
@@ -580,4 +580,18 @@ func TestClientIssuanceError(t *testing.T) {
 			t.Errorf("clientIssuanceError = %q, want %q", got.Error(), want)
 		}
 	})
+}
+
+// mintBootstrapKey mints as a connection that authenticated with key just now
+// would: its identity binds the user key resolves to now (newConnIdentity). A
+// key that resolves to nobody gives a connection with no identity, which
+// mintBootstrap refuses (after the open-server check, as on the wire).
+func (s *Server) mintBootstrapKey(key gossh.PublicKey, rawCmd string) (bootstrapBundle, error) {
+	var id connIdentity
+	if key != nil {
+		if bound, err := s.newConnIdentity(key, reservedBootstrapUser); err == nil {
+			id = bound
+		}
+	}
+	return s.mintBootstrap(id, rawCmd)
 }

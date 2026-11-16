@@ -301,6 +301,12 @@ func (b *FirecrackerBackend) ListSnapshots(ctx context.Context) ([]config.Snapsh
 	return b.client.ListSnapshots(ctx)
 }
 
+// ListSnapshotsCounting is ListSnapshots that also says how many snapshot
+// records it could not read and left out (see backend.CountingSnapshotLister).
+func (b *FirecrackerBackend) ListSnapshotsCounting(ctx context.Context) ([]config.Snapshot, int, error) {
+	return b.client.ListSnapshotsCounting(ctx)
+}
+
 // GetSnapshot returns a snapshot by name.
 func (b *FirecrackerBackend) GetSnapshot(ctx context.Context, name string) (*config.Snapshot, error) {
 	return b.client.GetSnapshot(ctx, name)

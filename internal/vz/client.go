@@ -1018,16 +1018,20 @@ func (c *Client) checkIdentityLocked(ctx context.Context, name string) error {
 }
 
 // checkIdentity checks the shed an operation loaded against what its context
-// requires (backend.CheckIdentity): the service client that must own it and
-// the incarnation (creation time) the caller looked up and was authorized for
-// (backend.WithRequiredCreatedAt, which the access guard sets on every call
-// on a named shed). The owner checked is the one the shed is reported with
+// requires (backend.CheckIdentity): the service client that must own it, the
+// user it must be reported with, and the incarnation (creation time) the
+// caller looked up and was authorized for (backend.WithRequiredCreatedAt and
+// PinOwnership, which the access guard sets on every call on a named shed).
+// Here a shed's user changes only by `shed assign` (an admin, for a shed with
+// no user) and the start-up pass, so the user check refuses only an operation
+// authorized on an unassigned shed that was assigned in between. The owner
+// and user checked are the ones the shed is reported with
 // (config.ShedOwnership), never the raw stored one: a record that names both
 // a service client and a user reaches no service client, here as at the API.
 // Every authorization read of a record goes through it. The credential bus
 // still reads the raw owner, so such a record keeps the bus off. Callers that
 // hold the per-shed lock call it under it.
 func checkIdentity(ctx context.Context, name string, meta *Metadata) error {
-	owner, _ := config.ShedOwnership(meta.Owner, meta.User)
-	return backend.CheckIdentity(ctx, name, owner, meta.CreatedAt)
+	owner, user := config.ShedOwnership(meta.Owner, meta.User)
+	return backend.CheckIdentity(ctx, name, owner, user, meta.CreatedAt)
 }

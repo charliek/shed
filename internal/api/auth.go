@@ -69,8 +69,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 //
 //   - Authorization. The CA issues no CRL. Removing an SSH key from the
 //     allowlist must de-authorize the certificates issued against it, so the
-//     Subject CN is re-checked against the LIVE allowlist on every request, so
-//     revocation lands on the next request.
+//     Subject CN is re-checked against the LIVE user lookup on every request,
+//     so revocation lands on the next request. The key must also still belong
+//     to the user the certificate was issued to (CertificateUser): a key
+//     given to another user since does not carry the certificate with it.
 //
 // The Authorization header is not read on this path, at all. A bearer token can
 // neither substitute for a certificate nor widen the scope one carries: the
@@ -148,7 +150,7 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 			refuseInvalid(w, r)
 			return
 		}
-		user, key, ok := s.certSubjectUser(leaf.Subject.CommonName)
+		user, key, ok := CertificateUser(s.users, leaf, now)
 		if !ok {
 			closeIdentityBoundConnection(w, r)
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is not authorized")
@@ -158,10 +160,11 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "FORBIDDEN", detail)
 			return
 		}
-		// The caller is the user the certificate's key belongs to, read from
-		// the live lookup on every request like the check above, with the
-		// user's admin flag and the key's script flag as configured now. On a
-		// server with no user list that is the implicit user, an admin.
+		// The caller is the user the certificate was issued to, whose key it
+		// still is (checked above against the live lookup on every request),
+		// with the user's admin flag and the key's script flag as configured
+		// now. On a server with no user list that is the implicit user, an
+		// admin.
 		caller := userCaller(user, key, leaf.Subject.CommonName, certSerial(leaf))
 		next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), caller)))
 	})
@@ -256,19 +259,40 @@ func certScope(leaf *x509.Certificate) string {
 	return leaf.Subject.OrganizationalUnit[0]
 }
 
-// certSubjectUser returns the user a client certificate's Subject CN (an SSH
-// key fingerprint) still resolves to through the live user lookup, and the
-// key. ok is false for a key that resolves to nobody, an expired key, and with
-// a nil lookup (no SetUserLookup call) — fail closed.
-func (s *Server) certSubjectUser(cn string) (users.User, users.Key, bool) {
-	if s.users == nil {
+// CertificateUser returns the user a user's client certificate authenticates
+// as, and its key, from the live user lookup l at now. The certificate's key
+// (its Subject CN, an SSH key fingerprint) must resolve to a user and must
+// not have expired. A certificate that names the user it was issued to
+// (servertls.ClientCertUser) is accepted only while the key still resolves to
+// that same user, so a key that has moved to another user (by a config change
+// with the same CA, or a GitHub refresh) authenticates nobody with it; the
+// implicit user counts as a user here, so a certificate issued to the implicit
+// user is refused on a server where its key is now a named user's, and the
+// reverse. The caller answers that with the same 401 as an unknown key, and
+// the client enrols again as whoever its key now belongs to.
+//
+// A certificate issued before certificates named their user names none. It is
+// checked by its key alone, as it was then, and expires on its own: such a
+// certificate lives auth.token_ttl from its issue (24 hours by default), and
+// the server never issues one again.
+//
+// ok is false with a nil lookup (no SetUserLookup call) or a malformed user
+// attribute: fail closed. Service certificates never come here (they are told
+// apart by their shape first, servertls.ServiceClientName). The API middleware
+// and the HTTPS listener's handshake check both use it.
+func CertificateUser(l users.Lookup, leaf *x509.Certificate, now time.Time) (users.User, users.Key, bool) {
+	if l == nil || leaf == nil {
 		return users.User{}, users.Key{}, false
 	}
-	u, k, ok := s.users.UserForKey(cn)
-	if !ok || k.Expired(time.Now()) {
+	name, bound, err := servertls.ClientCertUser(leaf)
+	if err != nil {
 		return users.User{}, users.Key{}, false
 	}
-	return u, k, true
+	b := users.Binding{}
+	if bound {
+		b = users.Binding{Bound: true, Name: name, Implicit: name == users.ImplicitName}
+	}
+	return users.ResolveBound(l, leaf.Subject.CommonName, b, now)
 }
 
 // isCredentialBusPath reports whether path is the credential bus (/api/plugins*),

@@ -516,14 +516,17 @@ func (b *Backend) update(name, id string, fn func(*state.Record)) bool {
 }
 
 // lookupLocked finds a record by name and applies the caller's ownership
-// requirements to it.
+// requirements to it: the reported owner and user and the creation time the
+// access guard authorized against (backend.CheckIdentity). A reconcile that
+// changed the reported user in between (a label conflict reports
+// config.UserUnresolved) makes the shed not found to that caller.
 func (b *Backend) lookupLocked(ctx context.Context, name string) (*state.Record, error) {
 	r := b.records[name]
 	if r == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 	}
-	owner, _ := ownership(r)
-	if err := backend.CheckIdentity(ctx, name, owner, r.Shed.CreatedAt); err != nil {
+	owner, user := ownership(r)
+	if err := backend.CheckIdentity(ctx, name, owner, user, r.Shed.CreatedAt); err != nil {
 		return nil, err
 	}
 	return r, nil

@@ -255,19 +255,23 @@ func (c CA) Pool() *x509.CertPool {
 // already-authenticated channel:
 //
 //	Subject.CommonName         = subjectFingerprint (the caller's SSH key fingerprint)
+//	Subject userId             = user (ClientUserOID; clientuser.go)
 //	Subject.OrganizationalUnit = scope
 //	Subject.Organization       = clientKind
 //
 // subjectFingerprint must be a canonical OpenSSH SHA-256 fingerprint
-// ("SHA256:" + 43 base64 characters); scope and clientKind are omitted when
-// empty. The issued cert carries no SANs and no extensions beyond
+// ("SHA256:" + 43 base64 characters). user is the user the key resolved to
+// when the caller authenticated: a valid user name, or "" for the implicit
+// user (written as ImplicitUserValue); the server accepts the certificate
+// only while the key still resolves to that user. scope and clientKind are
+// omitted when empty. The issued cert carries no SANs and no extensions beyond
 // basicConstraints (CA:FALSE), keyUsage (digitalSignature), extKeyUsage
 // (clientAuth), the subjectKeyIdentifier derived from the requested key, and
 // the authorityKeyIdentifier naming the CA.
 //
 // NotAfter is now+ttl, clamped to the CA's own expiry; issuance is refused
 // outright when the CA has less than 48h of life left.
-func (c CA) SignClientCSR(csrDER []byte, subjectFingerprint, scope, clientKind string, ttl time.Duration) ([]byte, error) {
+func (c CA) SignClientCSR(csrDER []byte, subjectFingerprint, user, scope, clientKind string, ttl time.Duration) ([]byte, error) {
 	if c.cert == nil || c.key == nil {
 		return nil, ErrCANotInitialized
 	}
@@ -276,6 +280,10 @@ func (c CA) SignClientCSR(csrDER []byte, subjectFingerprint, scope, clientKind s
 	}
 	if !validSSHFingerprint(subjectFingerprint) {
 		return nil, ErrCAInvalidSubject
+	}
+	userAttr, err := clientUserAttribute(user)
+	if err != nil {
+		return nil, err
 	}
 	if ttl <= 0 {
 		return nil, ErrCAInvalidTTL
@@ -300,7 +308,7 @@ func (c CA) SignClientCSR(csrDER []byte, subjectFingerprint, scope, clientKind s
 
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               clientSubject(subjectFingerprint, scope, clientKind),
+		Subject:               clientSubject(subjectFingerprint, userAttr, scope, clientKind),
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
@@ -377,9 +385,10 @@ func validSSHFingerprint(s string) bool {
 
 // clientSubject composes the issued Subject from the caller-supplied identity
 // alone — the CSR's own subject is never consulted. Empty scope/kind are
-// omitted rather than encoded as empty attributes.
-func clientSubject(fingerprint, scope, clientKind string) pkix.Name {
-	subject := pkix.Name{CommonName: fingerprint}
+// omitted rather than encoded as empty attributes; the user attribute is
+// always present.
+func clientSubject(fingerprint string, user pkix.AttributeTypeAndValue, scope, clientKind string) pkix.Name {
+	subject := pkix.Name{CommonName: fingerprint, ExtraNames: []pkix.AttributeTypeAndValue{user}}
 	if scope != "" {
 		subject.OrganizationalUnit = []string{scope}
 	}

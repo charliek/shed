@@ -139,8 +139,13 @@ happens to them is decided **once**, on the first start with a user list:
 
 The step is recorded by a marker, `{state_dir}/users-upgrade.json`, so it
 never runs again: cutting a list from two users to one later does not hand the
-unassigned sheds to whoever is left. A start that fails part-way writes no
-marker and runs the step again. A start with **no** user list removes the
+unassigned sheds to whoever is left. With one user, the marker names that
+user before anything is given away. A start that does not finish (a shed or
+snapshot it could not read or stamp) leaves the step pending for that user,
+and the next start resumes it only while that same user is still the only
+one listed; with any other list it gives nothing more away, records the step
+as done, and logs that the unfinished step was abandoned, so the sheds still
+without a user need `shed assign`. A start with **no** user list removes the
 marker, so removing the list and adding it back repeats the step. At every
 start the log reports how many sheds have no user and how many of those carry
 host resources (with their names at `log_level: debug`).

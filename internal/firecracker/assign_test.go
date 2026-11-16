@@ -508,3 +508,35 @@ func TestListShedsCountsUnstattableRecords(t *testing.T) {
 		t.Errorf("report %+v, log %q", rep, lines)
 	}
 }
+
+// TestAssignmentBetweenCheckAndActionIsRefused: on Firecracker a shed's user
+// changes only by assignment. A reset authorized against a shed with no user,
+// which is assigned to bob before the reset acts, is refused as not found:
+// the backend's check under its lock compares the user the guard authorized
+// against. (The server's own principal is used because nobody else may reset
+// a shed with no user.)
+func TestAssignmentBetweenCheckAndActionIsRefused(t *testing.T) {
+	c, cfg := newSnapshotUserClient(t)
+	legacyShed(t, c, cfg, "legacy", func(m *Metadata) { m.Status = config.StatusStopped })
+	be := NewBackend(c)
+	g := backend.NewGuard(be)
+	g.SetBeforeAct(func(op, name string) {
+		if op != "ResetShed" || name != "legacy" {
+			return
+		}
+		if _, err := be.AssignUser(backend.WithPrincipal(context.Background(), backend.SystemPrincipal()), "legacy", config.AssignShedRequest{User: "bob"}); err != nil {
+			t.Errorf("assign in between: %v", err)
+		}
+	})
+	sys := backend.WithPrincipal(context.Background(), backend.SystemPrincipal())
+	if _, err := g.ResetShed(sys, "legacy"); !errors.Is(err, config.ErrShedNotFoundSentinel) {
+		t.Fatalf("reset across an assignment: %v, want not found", err)
+	}
+	meta, err := LoadMetadata(cfg.InstanceDir, "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.User != "bob" {
+		t.Fatalf("test set-up: the shed was not assigned (user %q)", meta.User)
+	}
+}

@@ -268,3 +268,59 @@ func TestCloneWithholdsServerEnvForAUserWhoIsNotAnAdmin(t *testing.T) {
 		}
 	})
 }
+
+// TestGuardedOperationRefusedWhenTheUserChangesBeforeTheAction: the guard
+// authorizes alice on her shed; before the backend acts, a reconcile finds the
+// shed's user label in conflict and reports it unresolved (admin-only). The
+// backend's check under its lock compares the user the guard authorized
+// against, so alice's stop, start, exec and delete on it
+// are answered as a shed that is not there, and nothing is done to it. The
+// control (no change in between) acts.
+func TestGuardedOperationRefusedWhenTheUserChangesBeforeTheAction(t *testing.T) {
+	alice := backend.UserPrincipal("alice", false)
+	ops := map[string]func(g *backend.Guard, ctx context.Context) error{
+		"StopShed": func(g *backend.Guard, ctx context.Context) error {
+			_, err := g.StopShed(ctx, "box")
+			return err
+		},
+		"StartShed": func(g *backend.Guard, ctx context.Context) error {
+			_, err := g.StartShed(ctx, "box")
+			return err
+		},
+		"DeleteShed": func(g *backend.Guard, ctx context.Context) error { return g.DeleteShed(ctx, "box") },
+		"Exec": func(g *backend.Guard, ctx context.Context) error {
+			return g.Exec(ctx, "box", backend.ExecOptions{Cmd: []string{"true"}})
+		},
+	}
+	for name, op := range ops {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.createFor("box", "alice")
+			g := backend.NewGuard(e.b)
+			g.SetBeforeAct(func(_, shed string) {
+				if shed != "box" {
+					return
+				}
+				e.b.mu.Lock()
+				e.b.records["box"].UserConflict = "mallory"
+				e.b.mu.Unlock()
+			})
+			err := op(g, asUser(t, alice))
+			if !errors.Is(err, config.ErrShedNotFoundSentinel) {
+				t.Fatalf("alice's %s after her shed became unresolved: %v, want not found", name, err)
+			}
+			e.idle()
+			if e.instances() != 1 || e.status("box") != config.StatusRunning {
+				t.Errorf("alice's refused %s acted on the shed: %d instances, status %q", name, e.instances(), e.status("box"))
+			}
+		})
+	}
+
+	t.Run("control: no change in between", func(t *testing.T) {
+		e := newEnv(t)
+		e.createFor("box", "alice")
+		if _, err := backend.NewGuard(e.b).StopShed(asUser(t, alice), "box"); err != nil {
+			t.Fatalf("alice's stop: %v", err)
+		}
+	})
+}

@@ -300,6 +300,12 @@ func (b *VZBackend) ListSnapshots(ctx context.Context) ([]config.Snapshot, error
 	return b.client.ListSnapshots(ctx)
 }
 
+// ListSnapshotsCounting is ListSnapshots that also says how many snapshot
+// records it could not read and left out (see backend.CountingSnapshotLister).
+func (b *VZBackend) ListSnapshotsCounting(ctx context.Context) ([]config.Snapshot, int, error) {
+	return b.client.ListSnapshotsCounting(ctx)
+}
+
 // GetSnapshot returns a snapshot by name.
 func (b *VZBackend) GetSnapshot(ctx context.Context, name string) (*config.Snapshot, error) {
 	return b.client.GetSnapshot(ctx, name)

@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	gossh "golang.org/x/crypto/ssh"
@@ -882,6 +883,33 @@ func encodePins(pins map[string]pinEntry) ([]byte, error) {
 func keysDigest(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+// pinLockSuffix names the pin store's lock file, beside the store.
+const pinLockSuffix = ".lock"
+
+// lockPinStore takes an exclusive advisory lock (flock) on the pin store's
+// lock file, <path>.lock (created 0600), waiting for it, and returns the
+// function that releases it. Every server writing the store takes it around
+// its read, merge and write (ConfigLookup.lockedPins), so two servers sharing
+// a state directory never write over each other's pins.
+func lockPinStore(path string) (func(), error) {
+	lockPath := path + pinLockSuffix
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("opening the pin store lock %s: %w", lockPath, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("locking the pin store %s: %w", lockPath, err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }
 
 // writeFileDurable writes data to path so that, once it returns nil, the new

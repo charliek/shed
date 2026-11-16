@@ -384,14 +384,15 @@ func TestConfigUsersKeyExpiresWhileConnected(t *testing.T) {
 		MinVersion: tls.VersionTLS12,
 		ClientCAs:  ca.Pool(),
 		ClientAuth: tls.RequireAndVerifyClientCert,
-		VerifyConnection: servertls.AllowlistConnectionVerifier(func(fp string) bool {
-			return users.HasKey(s.users, fp)
+		VerifyConnection: servertls.AllowlistConnectionVerifier(func(leaf *x509.Certificate) bool {
+			_, _, ok := CertificateUser(s.users, leaf, time.Now())
+			return ok
 		}),
 	}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 
-	cert := issueClientCert(t, ca, alice.fp, authtoken.ScopeControl, time.Hour)
+	cert := issueClientCertAs(t, ca, alice.fp, "alice", authtoken.ScopeControl, time.Hour)
 	newClient := func() *http.Client {
 		pool := x509.NewCertPool()
 		pool.AddCert(srv.Certificate())

@@ -102,8 +102,10 @@ func (s *Server) serveServiceClient(w http.ResponseWriter, r *http.Request, next
 		shedName := rctx.URLParam("name")
 		owned, err := s.clientOwnsShed(ctx, shedName, name)
 		if err != nil {
-			// The lookup itself failed (not "no such shed"): a 404 here
-			// would tell the client its shed is gone when it may not be.
+			// The lookup failed for a reason the guard does not mask (it
+			// answers a record it cannot read as not found to a service
+			// client, logging the detail; see backend.Guard.maskLookup), such
+			// as a request with no principal: a server fault.
 			log.Printf("service client %q: look up shed %q: %v", name, shedName, err)
 			writeError(w, http.StatusInternalServerError, config.ErrBackendError, "could not look up shed "+shedName)
 			return
@@ -118,7 +120,9 @@ func (s *Server) serveServiceClient(w http.ResponseWriter, r *http.Request, next
 
 // clientOwnsShed reports whether shedName names an existing shed whose owner
 // is client. An invalid name is never looked up. A missing shed is (false,
-// nil); err is set only when the lookup failed for another reason.
+// nil), and so is one whose record cannot be read (the guard answers that as
+// not found to a service client); err is set only when the lookup failed for
+// another reason.
 //
 // ctx carries the client's principal and its required owner, so the backend
 // and the access guard each refuse another caller's shed as not found.

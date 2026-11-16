@@ -197,7 +197,17 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 					log.Printf("SSH auth DENIED: user=%s fingerprint=%s (reserved username)", logUser(conn.User()), gossh.FingerprintSHA256(key))
 					return nil, errReservedUser
 				}
-				setConnIdentity(ctx, key, conn.User())
+				// The identity records the user the key resolves to now,
+				// which every later channel on the connection must still
+				// find (principalFor). A key that resolves to nobody now
+				// (it left the lookup since it was offered) does not
+				// authenticate.
+				id, err := s.newConnIdentity(key, conn.User())
+				if err != nil {
+					log.Printf("SSH auth DENIED: user=%s fingerprint=%s (%v)", logUser(conn.User()), gossh.FingerprintSHA256(key), err)
+					return nil, err
+				}
+				setConnIdentity(ctx, id)
 				return perms, nil
 			}
 			// Best-effort diagnostic from the transport's authoritative per-attempt

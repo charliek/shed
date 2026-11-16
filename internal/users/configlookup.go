@@ -719,17 +719,32 @@ func (l *ConfigLookup) rebuildKind(kind fetchKind) (RefreshReport, error) {
 		addAuthorizedKeys(set, data, ImplicitName, SourceFile, l.file)
 	}
 
+	// The pins as the store holds them now: another server sharing the state
+	// directory may have pinned a login since this one last read it, and a
+	// fetch must ask for that pin.
+	l.syncPins()
 	plans := l.fetchAll(kind)
 
-	// Decide each login, and the pin store that results: the one on disk,
-	// with every revocation an earlier write failed to record applied again.
-	newPins := make(map[string]pinEntry, len(l.pins))
-	for k, v := range l.pins {
+	// Decide each login, and the pin store that results, under the store's
+	// lock (other servers may share the state directory): the store as it is
+	// on disk now, with this rebuild's changes and every revocation an
+	// earlier write failed to record applied to it. A pin another writer
+	// recorded meanwhile is kept; one that disagrees with the account a fetch
+	// here found is a mismatch (reconcilePins), never overwritten.
+	base, unlock, storeErr := l.lockedPins()
+	defer func() {
+		if unlock != nil {
+			unlock()
+		}
+	}()
+	l.reconcilePins(plans, base)
+	newPins := make(map[string]pinEntry, len(base))
+	for k, v := range base {
 		newPins[k] = v
 	}
 	pinsDirty := len(l.pendingPins) > 0
 	for k, v := range l.pendingPins {
-		newPins[k] = v
+		newPins[k] = mergeRevocation(newPins[k], v)
 	}
 	for i := range plans {
 		p := &plans[i]
@@ -780,8 +795,16 @@ func (l *ConfigLookup) rebuildKind(kind fetchKind) (RefreshReport, error) {
 	// had, less any key GitHub stopped listing. A revocation that cannot be
 	// written stays in force in this process and is written again by every
 	// later rebuild.
+	if !pinsDirty && storeErr == nil {
+		// Nothing to write: what this process holds is what the store holds.
+		l.pins = newPins
+	}
 	if pinsDirty {
-		if err := l.storePins(newPins); err != nil {
+		err := storeErr
+		if err == nil {
+			err = l.storePins(newPins)
+		}
+		if err != nil {
 			log.Printf("auth.ssh: writing the github pin store %s failed (%v); accepting no new github key", l.pinsPath, err)
 			pending := make(map[string]pinEntry, len(l.pendingPins))
 			for k, v := range l.pendingPins {
@@ -809,6 +832,10 @@ func (l *ConfigLookup) rebuildKind(kind fetchKind) (RefreshReport, error) {
 			l.pins = newPins
 			l.pendingPins = map[string]pinEntry{}
 		}
+	}
+	if unlock != nil {
+		unlock()
+		unlock = nil
 	}
 
 	// Commit the per-login state, then the key set.
@@ -1116,6 +1143,7 @@ func (l *ConfigLookup) droppedFingerprints(p *loginPlan) []string {
 	var all []string
 	all = append(all, fingerprintsOf(p.prev)...)
 	all = append(all, fingerprintsOf(p.detected)...)
+	all = append(all, fingerprintsOf(p.res.keys)...)
 	if l.cacheDir != "" {
 		if cached, err := os.ReadFile(l.cachePath(p.g.login)); err == nil {
 			all = append(all, fingerprintsOf(cached)...)
@@ -1123,6 +1151,90 @@ func (l *ConfigLookup) droppedFingerprints(p *loginPlan) []string {
 	}
 	sort.Strings(all)
 	return slices.Compact(all)
+}
+
+// syncPins replaces the pins this process holds with the store's, when it
+// can read it (another server sharing the state directory may have written
+// it). A store it cannot read leaves what this process holds; the locked read
+// before any write (lockedPins) fails closed on it. Called under rebuildMu.
+func (l *ConfigLookup) syncPins() {
+	if l.pinsPath == "" || len(l.logins) == 0 {
+		return
+	}
+	pins, err := loadPins(l.pinsPath)
+	if err != nil {
+		log.Printf("auth.ssh: the github pin store %s cannot be read (%v); using the pins this server last read", l.pinsPath, err)
+		return
+	}
+	l.pins = pins
+}
+
+// lockedPins takes the pin store's lock (lockPinStore) and reads the store
+// under it. It returns the store's pins, and the function that releases the
+// lock (nil when none was taken). With no store path (tests), or no login,
+// it returns the pins this process holds and takes no lock. When the lock
+// cannot be taken or the store cannot be read it returns the pins this
+// process holds and the error: the caller then writes nothing and accepts
+// nothing new, as for a failed write. Called under rebuildMu.
+func (l *ConfigLookup) lockedPins() (map[string]pinEntry, func(), error) {
+	if l.pinsPath == "" || len(l.logins) == 0 {
+		return l.pins, nil, nil
+	}
+	unlock, err := lockPinStore(l.pinsPath)
+	if err != nil {
+		return l.pins, nil, err
+	}
+	pins, err := loadPins(l.pinsPath)
+	if err != nil {
+		return l.pins, unlock, fmt.Errorf("reading the pin store under its lock: %w", err)
+	}
+	return pins, unlock, nil
+}
+
+// reconcilePins applies the existing mismatch rule to a fetch that disagrees
+// with the store as read under its lock: a login with no configured id whose
+// fetch confirmed account Y, while the store pins it to account X (another
+// server sharing the state directory pinned it since this fetch began, or
+// an operator edited the store), is a mismatch against X. Its keys are
+// dropped and X stays the pin: never last-writer-wins. A login whose id is
+// configured is pinned to that id, as config wins over the stored pin.
+func (l *ConfigLookup) reconcilePins(plans []loginPlan, store map[string]pinEntry) {
+	for i := range plans {
+		p := &plans[i]
+		if p.status == RefreshInvalidLogin || p.res.outcome != fetchConfirmed || p.g.configID != 0 {
+			continue
+		}
+		e, ok := store[p.g.key]
+		if !ok || e.ID == p.res.id {
+			continue
+		}
+		log.Printf("auth.ssh: github login %q was pinned to account %d in %s while this server's fetch found account %d; the stored pin stands and the fetched keys are not accepted",
+			p.g.login, e.ID, l.pinsPath, p.res.id)
+		p.res = fetchResult{outcome: fetchMismatch, id: p.res.id, keys: p.res.keys,
+			err: fmt.Errorf("the login is pinned to account %d, not %d", e.ID, p.res.id)}
+		// effectivePin answers from the store from here on.
+		if l.pins[p.g.key].ID != e.ID {
+			pins := make(map[string]pinEntry, len(l.pins)+1)
+			for k, v := range l.pins {
+				pins[k] = v
+			}
+			pins[p.g.key] = e
+			l.pins = pins
+		}
+	}
+}
+
+// mergeRevocation applies a revocation this process could not record (rev:
+// its rejected fingerprints, and no keys digest) to the store's entry for
+// the login. The store's account id stands when it has one: a revocation
+// only ever adds rejected keys and withdraws the digest.
+func mergeRevocation(stored, rev pinEntry) pinEntry {
+	if stored.ID == 0 {
+		return rev
+	}
+	stored.KeysSHA256 = ""
+	stored.Rejected = mergeRejected(stored.Rejected, rev.Rejected)
+	return stored
 }
 
 // storePins writes pins durably to the pin store (a no-op with no path).

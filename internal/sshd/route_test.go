@@ -376,7 +376,11 @@ func TestChannelsRefuseANameThatIsNotAShed(t *testing.T) {
 			}
 			conn := func(user string) *fakeSSHContext {
 				ctx := newFakeSSHContext(t, "gitx")
-				setConnIdentity(ctx, listed.PublicKey(), user)
+				id, err := s.newConnIdentity(listed.PublicKey(), user)
+				if err != nil {
+					t.Fatal(err)
+				}
+				setConnIdentity(ctx, id)
 				return ctx
 			}
 			forward := (&wire{}).s("localhost").u32(8080).s("127.0.0.1").u32(40000).b

@@ -151,11 +151,12 @@ func TestSourceUpgradeNoUserList(t *testing.T) {
 	}
 }
 
-// TestSourceUpgradeCrashBeforeTheMarker: the adoption is made, then the
-// start ends before the marker is written (here: the shed pass did not
-// finish, which leaves no marker just as a crash would). The next start is
-// again the first with a user list; its adoption finds nothing to adopt and
-// leaves alice's binding as it was; the marker is then written.
+// TestSourceUpgradeCrashBeforeTheMarker: the step is begun for alice (pending
+// marker), the adoption is made, then the start ends before the step is
+// recorded as done (here: the shed pass did not finish, which leaves the
+// marker pending just as a crash would). The next start, alice still the one
+// user, resumes the step; its adoption finds nothing to adopt and leaves
+// alice's binding as it was; the marker is then written as done.
 func TestSourceUpgradeCrashBeforeTheMarker(t *testing.T) {
 	one, _, _ := wiringConfigs(t)
 	state := t.TempDir()
@@ -167,8 +168,8 @@ func TestSourceUpgradeCrashBeforeTheMarker(t *testing.T) {
 	rep, up := stamp(t, "one, interrupted", func() (backend.UpgradeReport, *backend.UsersUpgrade, error) {
 		return stampUnassignedIn(one, be, state, fb)
 	})
-	if !up.FirstUserListStart() || !rep.Incomplete || markerExists(t, state) {
-		t.Fatalf("test set-up: first %v, incomplete %v, marker %v; want an unrecorded first start", up.FirstUserListStart(), rep.Incomplete, markerExists(t, state))
+	if !up.FirstUserListStart() || !rep.Incomplete || readMarker(t, state) != "pending:alice" {
+		t.Fatalf("test set-up: first %v, incomplete %v, marker %q; want a first start left pending for alice", up.FirstUserListStart(), rep.Incomplete, readMarker(t, state))
 	}
 	adopted, ok := fb.Get("alice")
 	if !ok || adopted.MachineID() != smachine(1).ID {
@@ -180,8 +181,8 @@ func TestSourceUpgradeCrashBeforeTheMarker(t *testing.T) {
 	_, up = stamp(t, "one, after the crash", func() (backend.UpgradeReport, *backend.UsersUpgrade, error) {
 		return stampUnassignedIn(one, be, state, fb)
 	})
-	if !up.FirstUserListStart() || !markerExists(t, state) {
-		t.Fatal("the start after the crash was not a recorded first start")
+	if !isPendingFor(up, "alice") || readMarker(t, state) != "done" {
+		t.Fatalf("the start after the crash did not resume and finish the step for alice (marker %q)", readMarker(t, state))
 	}
 	if bd, _ := fb.Get("alice"); bd.MachineID() != smachine(1).ID || bd.Generation != adopted.Generation {
 		t.Fatalf("the second run changed the adopted binding: %+v, was %+v", bd, adopted)
@@ -192,8 +193,9 @@ func TestSourceUpgradeCrashBeforeTheMarker(t *testing.T) {
 }
 
 // TestSourceUpgradeStoreFailureStopsTheStart: a store that cannot be written
-// fails the start before the marker, and the implicit binding is kept for
-// the next start, which adopts it.
+// fails the start after the step was begun for alice (pending marker) and
+// before anything is stamped; the implicit binding is kept for the next
+// start, which resumes the step for alice and adopts it.
 func TestSourceUpgradeStoreFailureStopsTheStart(t *testing.T) {
 	one, _, _ := wiringConfigs(t)
 	state := t.TempDir()
@@ -204,8 +206,8 @@ func TestSourceUpgradeStoreFailureStopsTheStart(t *testing.T) {
 	if _, _, err := stampUnassignedIn(one, be, state, b); err == nil {
 		t.Fatal("a failing store did not fail the start")
 	}
-	if markerExists(t, state) || len(be.assigned) != 0 {
-		t.Fatalf("a failed start recorded the step (marker %v) or stamped sheds (%v)", markerExists(t, state), be.assigned)
+	if readMarker(t, state) != "pending:alice" || len(be.assigned) != 0 {
+		t.Fatalf("a failed start: marker %q (want pending for alice), stamped sheds %v (want none)", readMarker(t, state), be.assigned)
 	}
 	if boundTo(b, source.ImplicitUser) != smachine(1).ID {
 		t.Fatal("the implicit binding was lost")
@@ -214,7 +216,7 @@ func TestSourceUpgradeStoreFailureStopsTheStart(t *testing.T) {
 	stamp(t, "one", func() (backend.UpgradeReport, *backend.UsersUpgrade, error) {
 		return stampUnassignedIn(one, be, state, b)
 	})
-	if boundTo(b, "alice") != smachine(1).ID || !markerExists(t, state) {
+	if boundTo(b, "alice") != smachine(1).ID || readMarker(t, state) != "done" {
 		t.Fatal("the retried start did not adopt and record")
 	}
 }

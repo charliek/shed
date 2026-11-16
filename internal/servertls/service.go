@@ -145,15 +145,17 @@ func ServiceClientName(leaf *x509.Certificate) (name string, isService bool, err
 
 // ClientConnectionVerifier builds the HTTPS listener's VerifyConnection
 // callback for mtls mode. A service-shaped leaf is accepted only when it is
-// well formed and clientKnown(name) holds; authorized (the SSH allowlist) is
-// never consulted for it. Any other leaf goes through the allowlist check,
-// exactly as AllowlistConnectionVerifier does. A nil clientKnown knows no
-// clients, so every service certificate fails closed.
+// well formed and clientKnown(name) holds; authorized (the user check) is
+// never consulted for it. Any other leaf is a user's certificate and is
+// accepted only when authorized(leaf) holds: shed-server's says whether the
+// leaf's key (its Subject CN) still resolves to the user the certificate was
+// issued to (ClientCertUser). A nil clientKnown knows no clients, so every
+// service certificate fails closed.
 //
 // Like the allowlist check, this runs on every handshake, new and resumed, and
 // is the first of two checks: the API middleware re-derives the identity on
 // every request.
-func ClientConnectionVerifier(authorized func(fingerprint string) bool, clientKnown func(name string) bool) func(tls.ConnectionState) error {
+func ClientConnectionVerifier(authorized func(leaf *x509.Certificate) bool, clientKnown func(name string) bool) func(tls.ConnectionState) error {
 	return func(cs tls.ConnectionState) error {
 		if len(cs.PeerCertificates) == 0 {
 			return ErrClientCertMissing
@@ -169,7 +171,7 @@ func ClientConnectionVerifier(authorized func(fingerprint string) bool, clientKn
 			}
 			return nil
 		}
-		if authorized == nil || !authorized(leaf.Subject.CommonName) {
+		if authorized == nil || !authorized(leaf) {
 			return ErrClientCertNotAuthorized
 		}
 		return nil

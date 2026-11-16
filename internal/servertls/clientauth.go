@@ -26,6 +26,7 @@ package servertls
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 )
 
@@ -43,9 +44,10 @@ var ErrClientCertMissing = errors.New("client certificate: none presented")
 var ErrClientCertNotAuthorized = errors.New("client certificate: identity is not authorized")
 
 // AllowlistConnectionVerifier builds a tls.Config.VerifyConnection callback that
-// accepts a client certificate only when its Subject CN — the SSH key
-// fingerprint the certificate was issued against — is still in the live
-// allowlist.
+// accepts a client certificate only when authorized(leaf) holds: shed-server's
+// says whether its Subject CN — the SSH key fingerprint the certificate was
+// issued against — still resolves to the user the certificate was issued to
+// (ClientCertUser).
 //
 // When it runs: on EVERY completed handshake, both new and resumed. That is why
 // this is a VerifyConnection callback and not a VerifyPeerCertificate one —
@@ -66,7 +68,7 @@ var ErrClientCertNotAuthorized = errors.New("client certificate: identity is not
 // than a snapshot taken at startup. A nil authorized fails every handshake
 // closed: an mtls listener with no way to check authorization must not
 // authorize anything.
-func AllowlistConnectionVerifier(authorized func(fingerprint string) bool) func(tls.ConnectionState) error {
+func AllowlistConnectionVerifier(authorized func(leaf *x509.Certificate) bool) func(tls.ConnectionState) error {
 	// A thin wrapper that knows no service clients: every service-shaped
 	// certificate is refused, every other one goes through the allowlist.
 	return ClientConnectionVerifier(authorized, nil)

@@ -77,7 +77,7 @@ func TestAllowlistConnectionVerifier(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := AllowlistConnectionVerifier(tt.authorized)(tt.state)
+			err := AllowlistConnectionVerifier(byCN(tt.authorized))(tt.state)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("got %v, want %v", err, tt.wantErr)
 			}
@@ -91,7 +91,7 @@ func TestAllowlistConnectionVerifier(t *testing.T) {
 func TestAllowlistConnectionVerifierReadsLiveState(t *testing.T) {
 	const cn = "SHA256:aaaa"
 	live := true
-	verify := AllowlistConnectionVerifier(func(string) bool { return live })
+	verify := AllowlistConnectionVerifier(byCN(func(string) bool { return live }))
 	state := connState(leafWithCN(cn))
 
 	if err := verify(state); err != nil {
@@ -127,7 +127,7 @@ func TestAllowlistConnectionVerifierRunsOnResumedHandshake(t *testing.T) {
 	}
 
 	csrDER, clientKey := p256CSR(t)
-	clientDER, err := ca.SignClientCSR(csrDER, testFingerprint, "shed", "cli", time.Hour)
+	clientDER, err := ca.SignClientCSR(csrDER, testFingerprint, "", "shed", "cli", time.Hour)
 	if err != nil {
 		t.Fatalf("sign client CSR: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestAllowlistConnectionVerifierRunsOnResumedHandshake(t *testing.T) {
 		calls       int
 		sawPeerCert []bool
 	)
-	verify := AllowlistConnectionVerifier(func(string) bool { return true })
+	verify := AllowlistConnectionVerifier(byCN(func(string) bool { return true }))
 	serverCfg := &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 		MinVersion:   tls.VersionTLS12,
@@ -229,4 +229,13 @@ func TestAllowlistConnectionVerifierRunsOnResumedHandshake(t *testing.T) {
 	if !peer[1] {
 		t.Error("resumed handshake had no PeerCertificates — the allowlist check would fail closed on every resumption")
 	}
+}
+
+// byCN adapts a predicate on a certificate's Subject CN (the key
+// fingerprint) to the verifiers' predicate on the whole leaf; nil stays nil.
+func byCN(f func(fingerprint string) bool) func(*x509.Certificate) bool {
+	if f == nil {
+		return nil
+	}
+	return func(leaf *x509.Certificate) bool { return f(leaf.Subject.CommonName) }
 }
