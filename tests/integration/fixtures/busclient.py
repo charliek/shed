@@ -64,6 +64,13 @@ class BusListener:
         self.namespace = namespace
         self.name = name
         self.events: list[dict] = []
+        # When (time.monotonic()) each event and each keepalive comment was
+        # read: what `alive_after` looks at.
+        self.event_times: list[float] = []
+        self.keepalive_times: list[float] = []
+        # Set when the stream broke, or ENDED: the server never ends a
+        # subscription on its own, so a stream that ends while the test still
+        # listens is a listener that hears nothing more, never a quiet one.
         self.error: Optional[str] = None
         self._cond = threading.Condition()
         self._conn: Optional[http.client.HTTPSConnection] = None
@@ -116,6 +123,10 @@ class BusListener:
             line = self._resp.readline()
             if not line:
                 return
+            if line.startswith(b":"):
+                with self._cond:
+                    self.keepalive_times.append(time.monotonic())
+                    self._cond.notify_all()
             yield line.decode("utf-8", errors="replace")
 
     def _read(self) -> None:
@@ -131,7 +142,10 @@ class BusListener:
                     continue
                 with self._cond:
                     self.events.append(env)
+                    self.event_times.append(time.monotonic())
                     self._cond.notify_all()
+            if not self._closing:
+                self.error = "the stream ended (the server closed the subscription)"
         except BaseException as e:  # noqa: BLE001 - see above
             if not self._closing:
                 self.error = f"{type(e).__name__}: {e}"
@@ -156,6 +170,25 @@ class BusListener:
     def matching(self, pred: Callable[[dict], bool]) -> list[dict]:
         with self._cond:
             return [e for e in self.events if pred(e)]
+
+    def alive_after(self, t: float, timeout: float) -> bool:
+        """Wait up to `timeout` seconds for the stream to show it is still
+        delivering after `t` (a `time.monotonic()` value): an event or a
+        keepalive comment read after it. False when none came or the stream
+        broke or ended first (`error`). Anything the server queued for this
+        listener before that point has been read by then, so a check of
+        `events` made after this returns True covers it."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                if self.error is not None:
+                    return False
+                if any(x > t for x in self.keepalive_times) or any(x > t for x in self.event_times):
+                    return True
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
 
     def close(self) -> None:
         self._closing = True

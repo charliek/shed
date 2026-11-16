@@ -213,27 +213,38 @@ def test_users_and_the_client_do_not_reach_each_others_sheds(svc, client_shed, f
     name, _ = client_shed
     alice, admin = fc_users.alice, fc_users.admin
 
-    status, body = alice.api().request("GET", f"/api/sheds/{name}")
-    assert (status, error_code(body)) == (404, "SHED_NOT_FOUND"), (status, body)
-    assert name not in {s["name"] for s in alice.list_sheds()}
-    marker = f"itest-entered-{uuid.uuid4().hex[:8]}"
-    r = alice.ssh(name, f"echo {marker}")
-    assert r.returncode != 0 and marker not in r.stdout, f"alice entered the client's shed: {r.stdout!r}"
-
-    marker = f"itest-entered-{uuid.uuid4().hex[:8]}"
-    r = admin.ssh(name, f"echo {marker}")
-    assert r.returncode == 0 and marker in r.stdout, f"an admin could not enter the client's shed: {r.stderr!r}"
-
     mine = f"itest-ucs-{uuid.uuid4().hex[:8]}"
     try:
         r = alice.cli("create", mine, "--image", "itest", "--no-sync", timeout=CREATE_TIMEOUT)
         assert r.returncode == 0, f"alice's create failed: {r.stderr[-800:]!r}"
+        # Control: alice enters her own shed through the same shim and
+        # known_hosts, so the refusal below is about whose shed it is.
+        marker = f"itest-entered-{uuid.uuid4().hex[:8]}"
+        r = alice.ssh(mine, f"echo {marker}")
+        assert r.returncode == 0 and marker in r.stdout, f"alice could not enter her own shed: {r.stderr!r}"
+
+        status, body = alice.api().request("GET", f"/api/sheds/{name}")
+        assert (status, error_code(body)) == (404, "SHED_NOT_FOUND"), (status, body)
+        assert name not in {s["name"] for s in alice.list_sheds()}
+        marker = f"itest-entered-{uuid.uuid4().hex[:8]}"
+        r = alice.ssh(name, f"echo {marker}")
+        assert r.returncode != 0 and marker not in r.stdout, f"alice entered the client's shed: {r.stdout!r}"
+        # The server's refusal (internal/sshd/wake.go), the same words as for
+        # a shed that does not exist: not an authentication or connection
+        # failure.
+        assert f"shed '{name}' not found" in r.stderr, f"not the server's refusal: {r.stderr!r}"
+
+        marker = f"itest-entered-{uuid.uuid4().hex[:8]}"
+        r = admin.ssh(name, f"echo {marker}")
+        assert r.returncode == 0 and marker in r.stdout, f"an admin could not enter the client's shed: {r.stderr!r}"
+
         status, body = svc.request("GET", f"/api/sheds/{mine}")
         assert (status, error_code(body)) == (404, "SHED_NOT_FOUND"), (status, body)
         status, body = svc.request("GET", "/api/sheds")
         assert status == 200 and mine not in {s["name"] for s in body["sheds"]}
     finally:
-        fc_server_dev.delete(mine, ignore_missing=True)
+        # Checked: fails naming the shed and server if it cannot be shown gone.
+        fc_server_dev.ensure_deleted(mine)
 
 
 def read_audit(fc_server_dev) -> tuple[str, list[dict]]:

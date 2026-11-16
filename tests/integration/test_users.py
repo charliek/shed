@@ -35,6 +35,11 @@ every shed is a billed cloud VM and at most two run at once, so only the
 cases that prove ownership run there (one shed per user); the rest carry
 `local_vm_only`.
 
+The module runs in any order: the one case that deletes a shared shed
+takes it out of the module's hands first, and the next case that wants one
+gets a new one. Every clean-up is checked: a shed or snapshot that cannot be
+shown gone fails the teardown with its name and server.
+
 Run only these cases:
 
     cd tests/integration && uv run pytest -v test_users.py
@@ -44,7 +49,9 @@ with the environment the README's "Named users" section lists.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+import threading
 import time
 import uuid
 from typing import Optional
@@ -58,6 +65,32 @@ from fixtures.tlsclient import error_code, error_message, pinned_request
 LOCAL = "the remote run is kept to one shed per user, which proves ownership"
 NOT_FOUND = "SHED_NOT_FOUND"
 ANOTHER_USER = "belongs to another user"
+# What a forwarded port to a shed the caller may not see is refused with: the
+# channel open's reason (internal/sshd/server.go, handleDirectTCPIP), which
+# OpenSSH prints as "open failed: connect failed: shed not found".
+FORWARD_NOT_FOUND = "shed not found"
+
+
+def _session_not_found(shed: str) -> str:
+    """What a session, sftp or scp into a shed the caller may not see writes
+    to stderr (internal/sshd/wake.go ensureRunning, as "Error: ..."): the
+    same words as for a shed that does not exist."""
+    return f"shed '{shed}' not found"
+
+
+# The credential bus round trip. The guest gives up on a request
+# publishTimeout after it sends it (cmd/shed-agent/http.go: 30 s), so every
+# step for one request, from starting it in the shed to the owner's answer,
+# fits inside that with margin. The clock starts before `shed exec` runs,
+# which is earlier than the guest's, so the margin is larger than it looks.
+GUEST_REQUEST_LIFETIME = 30
+DELIVERY_BUDGET = 14  # started in the shed -> the owner's listener has it
+FORGERY_TIMEOUT = 4  # each other user's answer (all sent side by side)
+ANSWER_BY = 22  # the owner's answer is sent by then ...
+ANSWER_TIMEOUT = 5  # ... and accepted within this: 27 s, inside 30 s
+# The server writes a keepalive on every subscription every 25 s
+# (internal/api/plugin_handlers.go: sseKeepaliveInterval).
+LIVENESS_TIMEOUT = 40
 
 
 # ----------------------------------------------------------------------------
@@ -82,26 +115,73 @@ def _create(env: UsersEnv, who: Identity, name: str) -> None:
 
 
 def _delete(env: UsersEnv, who: Identity, name: str) -> None:
-    """Best-effort clean-up: as the owner, then as the developer (user `dev`,
-    an admin, who may delete any shed)."""
+    """Clean-up that cannot pass quietly: the owner deletes the shed; if it
+    is still there, the developer does (user `dev`, an admin, who may delete
+    any shed); then it must be shown gone (`LocalServer.ensure_deleted`).
+    Otherwise this fails, naming the shed and the server: on [remote] a shed
+    left behind is a billed VM. A name never created is simply not there."""
+    earlier = []
     try:
-        who.cli("delete", name, "-f", timeout=_timeout(env))
+        r = who.cli("delete", name, "-f", timeout=_timeout(env))
+        if r.returncode != 0:
+            earlier.append(f"{who.user}'s `shed delete {name}` exited {r.returncode}: "
+                           f"{(r.stderr or r.stdout).strip()[-400:]!r}")
     except subprocess.TimeoutExpired:
-        pass
-    try:
-        env.server.delete(name, ignore_missing=True)
-    except Exception:  # noqa: BLE001 - clean-up must not mask the test's own failure
-        pass
+        earlier.append(f"{who.user}'s `shed delete {name}` timed out after {_timeout(env)} s")
+    env.server.ensure_deleted(name, earlier=earlier)
 
 
 def _shed_fixture(env: UsersEnv, who: Identity, prefix: str):
     name = f"{prefix}-{uuid.uuid4().hex[:8]}"
     try:
         _create(env, who, name)
-    except BaseException:
-        _delete(env, who, name)
+    except BaseException as e:
+        try:
+            _delete(env, who, name)
+        except AssertionError as cleanup:
+            e.add_note(str(cleanup))
         raise
     return name
+
+
+class _ShedSlot:
+    """One user's shed, made when a case first asks for it and shared by the
+    module's cases after that. A case that deletes it `take()`s it first: that
+    case then owns its clean-up, and the next case that asks gets a new shed.
+    So the module runs in any order, with never more than one such shed at a
+    time (on [remote], at most two cloud VMs: this and alice's)."""
+
+    def __init__(self, env: UsersEnv, who: Identity, prefix: str) -> None:
+        self.env, self.who, self.prefix = env, who, prefix
+        self.name: Optional[str] = None
+
+    def get(self) -> str:
+        if self.name is None:
+            self.name = _shed_fixture(self.env, self.who, self.prefix)
+        return self.name
+
+    def take(self) -> str:
+        name = self.get()
+        self.name = None
+        return name
+
+    def close(self) -> None:
+        if self.name is not None:
+            name, self.name = self.name, None
+            _delete(self.env, self.who, name)
+
+
+def _run_all(steps) -> None:
+    """Run every clean-up step even when one fails, then fail with all of
+    their failures."""
+    failures = []
+    for step in steps:
+        try:
+            step()
+        except Exception as e:  # noqa: BLE001 - reported below, with the rest
+            failures.append(f"{type(e).__name__}: {e}")
+    if failures:
+        raise AssertionError("clean-up failed:\n" + "\n".join(failures))
 
 
 def _get(who: Identity, name: str) -> tuple[int, Optional[dict]]:
@@ -145,10 +225,26 @@ def alice_shed(users_env):
 
 
 @pytest.fixture(scope="module")
-def bob_shed(users_env):
-    name = _shed_fixture(users_env, users_env.bob, "itest-ub")
-    yield name
-    _delete(users_env, users_env.bob, name)
+def bob_slot(users_env):
+    slot = _ShedSlot(users_env, users_env.bob, "itest-ub")
+    yield slot
+    slot.close()
+
+
+@pytest.fixture
+def bob_shed(bob_slot):
+    return bob_slot.get()
+
+
+@pytest.fixture
+def enrolled(tmp_path):
+    """Where a case enrols certificates (each with its private key) over
+    `_bootstrap`. Removed when the case ends, pass or fail: pytest keeps its
+    tmp_path directories, and these are live credentials until they expire."""
+    d = tmp_path / "enrolled"
+    d.mkdir(mode=0o700)
+    yield d
+    shutil.rmtree(d)
 
 
 # ----------------------------------------------------------------------------
@@ -195,24 +291,32 @@ def test_another_users_shed_is_not_found_over_the_api(users_env, alice_shed):
     assert status == 200 and got.get("user") == ALICE, got
 
 
-def test_another_user_cannot_open_a_session_or_exec(users_env, alice_shed):
+def test_another_user_cannot_open_a_session_or_exec(users_env, alice_shed, bob_shed):
     env = users_env
     _ensure_running(env, env.alice, alice_shed)
-    # Control: the owner's own session runs, through the same shim and
-    # known_hosts, so the refusals below are about who is asking.
-    marker = _marker()
-    r = env.alice.ssh(alice_shed, f"echo {marker}")
-    assert r.returncode == 0 and marker in r.stdout, f"the owner's session failed: {r.stdout!r} {r.stderr!r}"
+    _ensure_running(env, env.bob, bob_shed)
+    # Controls: each user's own session and `shed exec` run, through the same
+    # shim, known_hosts and CLI entry, so the refusals below are about whose
+    # shed it is.
+    for who, mine in ((env.alice, alice_shed), (env.bob, bob_shed)):
+        marker = _marker()
+        r = who.ssh(mine, f"echo {marker}")
+        assert r.returncode == 0 and marker in r.stdout, f"{who.user}'s own session failed: {r.stdout!r} {r.stderr!r}"
+        marker = _marker()
+        r = who.cli("exec", mine, "--", "echo", marker)
+        assert r.returncode == 0 and marker in r.stdout, f"{who.user}'s own shed exec failed: {r.stderr[-800:]!r}"
 
     marker = _marker()
     r = env.bob.ssh(alice_shed, f"echo {marker}")
     assert r.returncode != 0 and marker not in r.stdout, f"bob ran a command in alice's shed: {r.stdout!r}"
-    assert "not found" in r.stderr, r.stderr
+    assert _session_not_found(alice_shed) in r.stderr, r.stderr
 
+    # The CLI looks the shed up first (GET /api/sheds/<name>, a 404 for bob)
+    # and says so in its own words.
     marker = _marker()
     r = env.bob.cli("exec", alice_shed, "--", "echo", marker)
     assert r.returncode != 0 and marker not in r.stdout, f"bob's shed exec ran in alice's shed: {r.stdout!r}"
-    assert "not found" in (r.stdout + r.stderr), r.stderr
+    assert f'shed "{alice_shed}" not found' in (r.stdout + r.stderr), r.stdout + r.stderr
 
 
 def test_a_taken_name_is_the_same_conflict_for_everyone(users_env, alice_shed):
@@ -264,23 +368,31 @@ def test_an_admin_may_view_but_not_enter_another_users_shed(users_env, alice_she
 
 
 @pytest.mark.local_vm_only(LOCAL)
-def test_another_user_cannot_sftp_scp_or_forward(users_env, alice_shed, tmp_path):
+def test_another_user_cannot_sftp_scp_or_forward(users_env, alice_shed, bob_shed, tmp_path):
     env = users_env
     _ensure_running(env, env.alice, alice_shed)
+    _ensure_running(env, env.bob, bob_shed)
+    owners = ((env.alice, alice_shed), (env.bob, bob_shed))
 
     # Forwarded port (a direct-tcpip channel, as `ssh -L` opens): the guest's
-    # sshd speaks first, so a forward that reaches it reads "SSH-".
-    rc, first, err = env.alice.forward(alice_shed)
-    assert first.startswith(b"SSH-"), f"the owner's forward did not reach the guest: rc={rc} {first!r} {err!r}"
+    # sshd speaks first, so a forward that reaches it reads "SSH-". Controls:
+    # each user's forward to their own shed, bob's included, so bob's refusal
+    # below is about whose shed it is, not about bob.
+    for who, shed in owners:
+        rc, first, err = who.forward(shed)
+        assert first.startswith(b"SSH-"), f"{who.user}'s own forward did not reach the guest: rc={rc} {first!r} {err!r}"
     rc, first, err = env.bob.forward(alice_shed)
     assert not first.startswith(b"SSH-"), "bob's forwarded port reached alice's shed"
-    assert rc != 0, (rc, err)
+    assert rc != 0 and FORWARD_NOT_FOUND in err, f"not the server's refusal: rc={rc} {err!r}"
 
     # sftp.
-    r = env.alice.sftp(alice_shed, "pwd\n")
-    assert r.returncode == 0 and "Remote working directory" in r.stdout, f"the owner's sftp failed: {r.stdout!r} {r.stderr!r}"
+    for who, shed in owners:
+        r = who.sftp(shed, "pwd\n")
+        assert r.returncode == 0 and "Remote working directory" in r.stdout, \
+            f"{who.user}'s own sftp failed: {r.stdout!r} {r.stderr!r}"
     r = env.bob.sftp(alice_shed, "pwd\n")
     assert r.returncode != 0 and "Remote working directory" not in r.stdout, f"bob's sftp reached alice's shed: {r.stdout!r}"
+    assert _session_not_found(alice_shed) in r.stderr, f"not the server's refusal: {r.stderr!r}"
 
     # scp (the sftp protocol in current OpenSSH).
     token = uuid.uuid4().hex
@@ -289,8 +401,11 @@ def test_another_user_cannot_sftp_scp_or_forward(users_env, alice_shed, tmp_path
     mine, theirs = f"/tmp/itest-scp-alice-{token[:8]}", f"/tmp/itest-scp-bob-{token[:8]}"
     r = env.alice.scp_to(alice_shed, src, mine)
     assert r.returncode == 0, f"the owner's scp failed: {r.stderr!r}"
+    r = env.bob.scp_to(bob_shed, src, theirs)
+    assert r.returncode == 0, f"bob's scp into his own shed failed: {r.stderr!r}"
     r = env.bob.scp_to(alice_shed, src, theirs)
     assert r.returncode != 0, f"bob's scp into alice's shed succeeded: {r.stdout!r} {r.stderr!r}"
+    assert _session_not_found(alice_shed) in r.stderr, f"not the server's refusal: {r.stderr!r}"
     r = env.alice.ssh(alice_shed, f"cat {mine}; test -e {theirs} && echo bob-file-present || echo bob-file-absent")
     assert r.returncode == 0, r.stderr
     assert token in r.stdout and "bob-file-absent" in r.stdout, r.stdout
@@ -304,7 +419,7 @@ def test_a_stopped_shed_is_not_woken_by_someone_who_may_not_enter_it(users_env, 
         marker = _marker()
         r = env.bob.ssh(alice_shed, f"echo {marker}")
         assert r.returncode != 0 and marker not in r.stdout, r.stdout
-        assert "not found" in r.stderr, r.stderr
+        assert _session_not_found(alice_shed) in r.stderr, r.stderr
 
         marker = _marker()
         r = env.admin.ssh(alice_shed, f"echo {marker}")
@@ -320,11 +435,33 @@ def test_a_stopped_shed_is_not_woken_by_someone_who_may_not_enter_it(users_env, 
         _ensure_running(env, env.alice, alice_shed)
 
 
+def _delete_snapshot(env: UsersEnv, snap: str) -> None:
+    """Clean-up of a snapshot that cannot pass quietly: its owner (alice)
+    deletes it; if that fails, the admin (an admin may delete any snapshot);
+    then the admin must see it gone (404 SNAPSHOT_NOT_FOUND)."""
+    problems = []
+    for who in (env.alice, env.admin):
+        try:
+            status, resp = who.api().request("DELETE", f"/api/snapshots/{snap}", timeout=120)
+        except Exception as e:  # noqa: BLE001 - recorded; the admin tries next
+            problems.append(f"{who.user}: {type(e).__name__}: {e}")
+            continue
+        if status in (200, 204) or (status, error_code(resp)) == (404, "SNAPSHOT_NOT_FOUND"):
+            break
+        problems.append(f"{who.user}: {status} {resp!r}")
+    status, resp = env.admin.api().request("GET", f"/api/snapshots/{snap}")
+    if (status, error_code(resp)) != (404, "SNAPSHOT_NOT_FOUND"):
+        raise AssertionError(
+            f"CLEAN-UP FAILED: snapshot {snap!r} on server {env.server.name!r} is not gone "
+            f"(GET: {status} {resp!r}); attempts: {'; '.join(problems) or 'none failed'}"
+        )
+
+
 @pytest.mark.local_vm_only("the remote backend has no snapshots")
 def test_snapshots_belong_to_their_user(users_env, alice_shed):
     env = users_env
     snap = f"itest-us-{uuid.uuid4().hex[:8]}"
-    spawned = [f"itest-usb-{uuid.uuid4().hex[:6]}", f"itest-usa-{uuid.uuid4().hex[:6]}"]
+    as_bob, as_admin, as_alice = (f"itest-us{who}-{uuid.uuid4().hex[:6]}" for who in "bda")
     _ensure_stopped(env, env.alice, alice_shed)
     alice, bob, admin = env.alice.api(), env.bob.api(), env.admin.api()
     try:
@@ -339,24 +476,35 @@ def test_snapshots_belong_to_their_user(users_env, alice_shed):
         for method, path in (("GET", f"/api/snapshots/{snap}"), ("DELETE", f"/api/snapshots/{snap}")):
             status, resp = bob.request(method, path)
             assert (status, error_code(resp)) == (404, "SNAPSHOT_NOT_FOUND"), (method, status, resp)
-        status, resp = bob.request("POST", "/api/sheds", {"name": spawned[0], "from_snapshot": snap}, timeout=300)
-        assert status == 404, (status, resp)
+        status, resp = bob.request("POST", "/api/sheds", {"name": as_bob, "from_snapshot": snap}, timeout=300)
+        assert (status, error_code(resp)) == (404, "SNAPSHOT_NOT_FOUND"), (status, resp)
 
         # The admin: sees it with its user, may not use it.
         status, resp = admin.request("GET", "/api/snapshots")
         assert status == 200, resp
         mine = [s for s in resp.get("snapshots") or [] if s["name"] == snap]
         assert mine and mine[0].get("user") == ALICE, resp
-        status, resp = admin.request("POST", "/api/sheds", {"name": spawned[1], "from_snapshot": snap}, timeout=300)
+        status, resp = admin.request("POST", "/api/sheds", {"name": as_admin, "from_snapshot": snap}, timeout=300)
         assert (status, error_code(resp)) == (403, "FORBIDDEN"), (status, resp)
+
+        # Control: its owner may use it, so the refusals above are about
+        # whose snapshot it is (a server refusing every restore by a user who
+        # is not an admin would fail here). A third VM: local backends only.
+        status, resp = alice.request("POST", "/api/sheds", {"name": as_alice, "from_snapshot": snap}, timeout=900)
+        assert status == 201, f"alice could not create a shed from her own snapshot: {status} {resp!r}"
+        assert resp.get("user") == ALICE and resp.get("name") == as_alice, resp
 
         status, resp = alice.request("DELETE", f"/api/snapshots/{snap}", timeout=120)
         assert status in (200, 204), (status, resp)
     finally:
-        env.alice.api().request("DELETE", f"/api/snapshots/{snap}", timeout=120)
-        for name in spawned:
-            env.server.delete(name, ignore_missing=True)
-        _ensure_running(env, env.alice, alice_shed)
+        # Every step runs whatever the others do; then all failures together.
+        _run_all([
+            lambda: _delete(env, env.alice, as_alice),
+            lambda: env.server.ensure_deleted(as_bob),
+            lambda: env.server.ensure_deleted(as_admin),
+            lambda: _delete_snapshot(env, snap),
+            lambda: _ensure_running(env, env.alice, alice_shed),
+        ])
 
 
 @pytest.mark.local_vm_only(LOCAL)
@@ -396,15 +544,15 @@ def test_the_image_store_is_for_admins_only(users_env):
 
 
 @pytest.mark.local_vm_only(LOCAL)
-def test_a_script_key_never_holds_the_credentials_scope(users_env, alice_shed, bob_shed, tmp_path):
+def test_a_script_key_never_holds_the_credentials_scope(users_env, alice_shed, bob_shed, enrolled):
     env = users_env
     # Control: alice's normal key may take it.
-    env.alice.enrol("credentials", tmp_path / "alice-credentials")
+    env.alice.enrol("credentials", enrolled / "alice-credentials")
     with pytest.raises(AssertionError, match="script key cannot take the credentials scope"):
-        env.alice_script.enrol("credentials", tmp_path / "script-credentials")
+        env.alice_script.enrol("credentials", enrolled / "script-credentials")
 
     # The script key is alice: a control certificate, with her sheds only.
-    ctl = env.alice_script.enrol("control", tmp_path / "script-control")
+    ctl = env.alice_script.enrol("control", enrolled / "script-control")
     client = env.alice_script.pinned(ctl)
     status, body = client.request("GET", "/api/sheds")
     assert status == 200, body
@@ -416,7 +564,7 @@ def test_a_script_key_never_holds_the_credentials_scope(users_env, alice_shed, b
 
 
 @pytest.mark.local_vm_only(LOCAL)
-def test_an_expired_key_opens_nothing(users_env, bob_shed, tmp_path):
+def test_an_expired_key_opens_nothing(users_env, bob_shed, enrolled):
     env = users_env
     _ensure_running(env, env.bob, bob_shed)
     marker = _marker()
@@ -428,7 +576,7 @@ def test_an_expired_key_opens_nothing(users_env, bob_shed, tmp_path):
     assert r.returncode != 0 and marker not in r.stdout, r.stdout
     assert "Permission denied" in r.stderr, r.stderr
     with pytest.raises(AssertionError, match="Permission denied"):
-        env.bob_expired.enrol("control", tmp_path / "expired")
+        env.bob_expired.enrol("control", enrolled / "expired")
 
 
 # ----------------------------------------------------------------------------
@@ -436,27 +584,36 @@ def test_an_expired_key_opens_nothing(users_env, bob_shed, tmp_path):
 # ----------------------------------------------------------------------------
 
 
-def _round_trip(env: UsersEnv, sender: Identity, shed: str, ns: str, certs: dict, listeners: dict) -> None:
+def _round_trip(env: UsersEnv, sender: Identity, shed: str, ns: str, certs: dict, listeners: dict) -> str:
     """Send one bus request from `shed` (as its owner `sender`): it reaches
-    `sender`'s listener and no other; every other user's answer is refused;
-    the owner's answer reaches the shed."""
+    `sender`'s listener; every other user's answer is refused; the owner's
+    answer reaches the shed. All inside the guest's request lifetime (the
+    budget above). Returns the request's token, for the check that no other
+    listener ever got it (made by the caller, once every stream has shown it
+    is still alive after the last round trip)."""
     token = uuid.uuid4().hex
     proc: Optional[subprocess.Popen] = None
     request_env = None
     try:
         for _attempt in range(4):
+            started = time.monotonic()
             proc = sender.popen_cli("exec", shed, "--", *publish_argv(ns, {"itest_probe": token}))
-            deadline = time.monotonic() + 45
-            while request_env is None and time.monotonic() < deadline:
-                request_env = listeners[sender.user].wait_for(lambda e: payload_has(e, token), 1)
+            while request_env is None and time.monotonic() - started < DELIVERY_BUDGET:
+                request_env = listeners[sender.user].wait_for(lambda e: payload_has(e, token), 0.5)
                 if request_env is None and proc.poll() is not None:
                     break  # the request ended in the shed without reaching anyone
             if request_env is not None:
                 break
+            if proc.poll() is None:
+                raise AssertionError(
+                    f"a request from {shed} did not reach {sender.user}'s listener within {DELIVERY_BUDGET} s "
+                    f"(listener error: {listeners[sender.user].error}); this case must answer inside the guest's "
+                    f"{GUEST_REQUEST_LIFETIME} s request lifetime, so a server this slow fails it"
+                )
             out, err = proc.communicate(timeout=90)
             # The shed's message channel may not be up yet right after a
-            # create or start: the agent answers NO_CONNECTION. Anything else
-            # is the failure.
+            # create or start: the agent answers NO_CONNECTION at once.
+            # Anything else is the failure.
             assert "NO_CONNECTION" in out + err, (
                 f"a request from {shed} never reached {sender.user}'s listener "
                 f"(listener error: {listeners[sender.user].error}); in the shed: {out!r} {err!r}"
@@ -465,32 +622,49 @@ def _round_trip(env: UsersEnv, sender: Identity, shed: str, ns: str, certs: dict
         assert request_env is not None, f"{shed}'s bus connection never came up"
         assert (request_env.get("shed") or {}).get("name") == shed, request_env
 
-        time.sleep(2)  # past the owner's delivery, for anything misrouted
-        for user, listener in listeners.items():
-            assert listener.error is None, f"{user}'s stream broke: {listener.error}"
-            if user != sender.user:
-                got = listener.matching(lambda e: payload_has(e, token))
-                assert not got, f"{shed}'s request reached {user}'s listener: {got}"
+        # Every other user answers it at once, side by side; each is refused.
+        forged: dict = {}
 
-        for user, cert in certs.items():
-            if user == sender.user:
-                continue
-            status, body = pinned_request(
-                sender.host, cert.https_port, f"/api/plugins/listeners/{ns}/respond", cert.pin, cert.pair,
-                method="POST", body=response_body(request_env, {"itest_answer": f"forged-by-{user}"}),
-            )
-            assert status == 403, f"{user} answered {sender.user}'s request: {status} {body!r}"
+        def forge(user: str, cert) -> None:
+            try:
+                forged[user] = pinned_request(
+                    sender.host, cert.https_port, f"/api/plugins/listeners/{ns}/respond", cert.pin, cert.pair,
+                    method="POST", body=response_body(request_env, {"itest_answer": f"forged-by-{user}"}),
+                    timeout=FORGERY_TIMEOUT,
+                )
+            except Exception as e:  # noqa: BLE001 - reported by the assertion below
+                forged[user] = e
 
+        threads = [threading.Thread(target=forge, args=(u, c), daemon=True)
+                   for u, c in certs.items() if u != sender.user]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(FORGERY_TIMEOUT + 2)
+        for user in (u for u in certs if u != sender.user):
+            got = forged.get(user)
+            assert isinstance(got, tuple), f"{user}'s answer to {sender.user}'s request got no reply: {got!r}"
+            status, body = got
+            assert (status, error_code(body)) == (403, "FORBIDDEN"), \
+                f"{user} answered {sender.user}'s request: {status} {body!r}"
+            assert "does not match a pending request" in error_message(body), body
+
+        elapsed = time.monotonic() - started
+        assert elapsed < ANSWER_BY, (
+            f"{elapsed:.1f} s into the exchange before the owner could answer; the guest gives up at "
+            f"{GUEST_REQUEST_LIFETIME} s, so the answer could not be shown to arrive"
+        )
         answer = uuid.uuid4().hex
         cert = certs[sender.user]
         status, body = pinned_request(
             sender.host, cert.https_port, f"/api/plugins/listeners/{ns}/respond", cert.pin, cert.pair,
-            method="POST", body=response_body(request_env, {"itest_answer": answer}),
+            method="POST", body=response_body(request_env, {"itest_answer": answer}), timeout=ANSWER_TIMEOUT,
         )
         assert status == 204, f"{sender.user}'s own answer was refused: {status} {body!r}"
         out, err = proc.communicate(timeout=90)
         assert answer in out, f"the answer did not reach {shed}: {out!r} {err!r}"
         assert "forged-by-" not in out, out
+        return token
     finally:
         if proc is not None and proc.poll() is None:
             proc.kill()
@@ -498,12 +672,12 @@ def _round_trip(env: UsersEnv, sender: Identity, shed: str, ns: str, certs: dict
 
 
 @pytest.mark.local_vm_only("the remote backend's sheds carry no helper requests")
-def test_bus_requests_reach_only_their_users_listener(users_env, alice_shed, bob_shed, tmp_path):
+def test_bus_requests_reach_only_their_users_listener(users_env, alice_shed, bob_shed, enrolled):
     env = users_env
     _ensure_running(env, env.alice, alice_shed)
     _ensure_running(env, env.bob, bob_shed)
     ns = f"itest-users-{uuid.uuid4().hex[:8]}"
-    certs = {who.user: who.enrol("credentials", tmp_path / who.user) for who in env.people}
+    certs = {who.user: who.enrol("credentials", enrolled / who.user) for who in env.people}
     listeners: dict[str, BusListener] = {}
     try:
         for who in env.people:
@@ -536,8 +710,29 @@ def test_bus_requests_reach_only_their_users_listener(users_env, alice_shed, bob
         assert routed.get(alice_shed) == ALICE and bob_shed not in routed, routed
         assert set(routed.values()) == {ALICE}, routed
 
-        _round_trip(env, env.alice, alice_shed, ns, certs, listeners)
-        _round_trip(env, env.bob, bob_shed, ns, certs, listeners)
+        sent = {
+            _round_trip(env, env.alice, alice_shed, ns, certs, listeners): ALICE,
+            _round_trip(env, env.bob, bob_shed, ns, certs, listeners): BOB,
+        }
+
+        # Every listener stays under watch until it has shown, after both
+        # round trips, that its stream still delivers (a keepalive or an
+        # event read after that point). Anything misrouted to it earlier
+        # has been read by then; a stream that broke or ended fails here
+        # rather than passing as a listener that stayed quiet.
+        done = time.monotonic()
+        for user, listener in listeners.items():
+            assert listener.alive_after(done, LIVENESS_TIMEOUT), (
+                f"{user}'s stream showed no sign of life within {LIVENESS_TIMEOUT} s after the round trips "
+                f"({listener.error or 'no keepalive and no event'}), so its silence proves nothing"
+            )
+        for token, sender in sent.items():
+            for user, listener in listeners.items():
+                got = listener.matching(lambda e: payload_has(e, token))
+                if user == sender:
+                    assert got, f"{user}'s own request is missing from their listener"
+                else:
+                    assert not got, f"{sender}'s request reached {user}'s listener: {got}"
     finally:
         for listener in listeners.values():
             listener.close()
@@ -564,8 +759,12 @@ def test_assign_refuses_a_non_admin_an_unknown_user_and_an_assigned_shed(users_e
     status, resp = admin.request("POST", f"/api/sheds/itest-no-such-{uuid.uuid4().hex[:6]}/assign", {"user": BOB})
     assert (status, error_code(resp)) == (404, NOT_FOUND), (status, resp)
 
+    # The CLI says the server's refusal (internal/backend/assign.go): not a
+    # usage error, a missing command or a connection failure.
     r = env.admin.cli("assign", alice_shed, BOB)
+    out = r.stdout + r.stderr
     assert r.returncode != 0, f"shed assign moved alice's shed: {r.stdout!r}"
+    assert "SHED_ALREADY_ASSIGNED" in out and f"already belongs to user {ALICE}" in out, out
 
     # Still alice's.
     status, got = _get(env.alice, alice_shed)
@@ -573,19 +772,25 @@ def test_assign_refuses_a_non_admin_an_unknown_user_and_an_assigned_shed(users_e
 
 
 # ----------------------------------------------------------------------------
-# Last: an admin stops and deletes another user's shed (every backend)
+# An admin stops and deletes another user's shed (every backend)
 # ----------------------------------------------------------------------------
 
 
-def test_an_admin_stops_and_deletes_another_users_shed(users_env, bob_shed):
+def test_an_admin_stops_and_deletes_another_users_shed(users_env, bob_slot):
     env = users_env
-    _ensure_running(env, env.bob, bob_shed)
-    r = env.admin.cli("stop", bob_shed, timeout=_timeout(env))
-    assert r.returncode == 0, f"the admin could not stop bob's shed: {r.stderr[-800:]!r}"
-    assert _status(env.bob, bob_shed) == "stopped"
+    # This case deletes bob's shed, so it takes it out of the module's hands:
+    # its clean-up is this case's, and a later case gets a new one.
+    name = bob_slot.take()
+    try:
+        _ensure_running(env, env.bob, name)
+        r = env.admin.cli("stop", name, timeout=_timeout(env))
+        assert r.returncode == 0, f"the admin could not stop bob's shed: {r.stderr[-800:]!r}"
+        assert _status(env.bob, name) == "stopped"
 
-    r = env.admin.cli("delete", bob_shed, "-f", timeout=_timeout(env))
-    assert r.returncode == 0, f"the admin could not delete bob's shed: {r.stderr[-800:]!r}"
-    assert bob_shed not in _names(env.bob.list_sheds())
-    status, resp = env.admin.api().request("GET", f"/api/sheds/{bob_shed}")
-    assert (status, error_code(resp)) == (404, NOT_FOUND), (status, resp)
+        r = env.admin.cli("delete", name, "-f", timeout=_timeout(env))
+        assert r.returncode == 0, f"the admin could not delete bob's shed: {r.stderr[-800:]!r}"
+        assert name not in _names(env.bob.list_sheds())
+        status, resp = env.admin.api().request("GET", f"/api/sheds/{name}")
+        assert (status, error_code(resp)) == (404, NOT_FOUND), (status, resp)
+    finally:
+        _delete(env, env.bob, name)

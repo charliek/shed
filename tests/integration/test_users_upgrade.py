@@ -14,9 +14,12 @@ no user list removes the marker.
 
 These cases restart a server with another config, which the suite can do
 only to the Mac dev server (`devcontrol.dev_config()`, which always restores
-the committed base afterwards). They run on [vz] only; [fc] and [remote]
-have no case here (`vz_server_dev` skips when `SHED_VZ_DEV_SERVER` is
-empty).
+the committed base afterwards). They run on [vz] only, on macOS only (they
+skip on any other host before a fixture runs, even with a VZ entry
+configured); [fc] and [remote] have no case here (`vz_server_dev` skips when
+`SHED_VZ_DEV_SERVER` is empty). Each case checks that its target is a dev
+server it may restart (`devcontrol.assert_dev_target`) BEFORE it creates
+anything, so a dev entry name that points somewhere else gets no shed.
 
 **Side effect on the dev server.** The one-user restart hands EVERY shed on
 the Mac dev server that has no user (not only this module's) to the user
@@ -29,16 +32,43 @@ developer is `dev`.
 from __future__ import annotations
 
 import json
+import sys
 import uuid
 from typing import Optional
 
 import pytest
 
-from fixtures.devcontrol import dev_config
+from fixtures.devcontrol import assert_dev_target, dev_config
 from fixtures.identity import ADMIN, ALICE, BOB, DEV_USER, users_environment, with_itest_users
 from fixtures.tlsclient import error_code
 
-pytestmark = [pytest.mark.vz, pytest.mark.slow]
+pytestmark = [
+    pytest.mark.vz,
+    pytest.mark.slow,
+    # A mark, not a fixture, so it skips before any fixture runs.
+    pytest.mark.skipif(sys.platform != "darwin", reason="restarts the Mac dev server: macOS only"),
+]
+
+
+def _dev_target(server) -> None:
+    """Refuse (raise) unless `server` is a dev server these cases may
+    restart. Called first in every case, before its first create: the
+    restart's own check (inside dev_config) would come only after sheds were
+    made on whatever the entry points at."""
+    assert_dev_target(server.name)
+
+
+def _cleanup(server, *names: str) -> None:
+    """Delete every name (each verified gone, `ensure_deleted`), trying them
+    all before failing with every failure."""
+    failures = []
+    for name in names:
+        try:
+            server.ensure_deleted(name)
+        except AssertionError as e:
+            failures.append(str(e))
+    if failures:
+        raise AssertionError("\n".join(failures))
 
 
 def _create(server, name: str, *, mounts: Optional[str]) -> None:
@@ -66,6 +96,7 @@ def _only(names):
 
 def test_a_one_user_list_gives_that_user_the_sheds_that_had_none(vz_server_dev):
     server = vz_server_dev
+    _dev_target(server)
     plain, mounted = f"itest-uu1-{uuid.uuid4().hex[:6]}", f"itest-uu1m-{uuid.uuid4().hex[:6]}"
     try:
         _create(server, plain, mounts="none")
@@ -76,12 +107,12 @@ def test_a_one_user_list_gives_that_user_the_sheds_that_had_none(vz_server_dev):
             assert _user_of(server, plain) == DEV_USER
             assert _user_of(server, mounted) == DEV_USER
     finally:
-        server.delete(plain, ignore_missing=True)
-        server.delete(mounted, ignore_missing=True)
+        _cleanup(server, plain, mounted)
 
 
 def test_cutting_the_list_to_one_user_later_hands_out_nothing(vz_server_dev):
     server = vz_server_dev
+    _dev_target(server)
     name = f"itest-uu2-{uuid.uuid4().hex[:6]}"
     try:
         _create(server, name, mounts="none")
@@ -93,11 +124,12 @@ def test_cutting_the_list_to_one_user_later_hands_out_nothing(vz_server_dev):
             with dev_config({}, server.name, transform=_only([])):
                 assert _user_of(server, name) is None
     finally:
-        server.delete(name, ignore_missing=True)
+        _cleanup(server, name)
 
 
 def test_an_admin_assigns_a_shed_that_has_no_user(vz_server_dev):
     server = vz_server_dev
+    _dev_target(server)
     plain, mounted = f"itest-uu3-{uuid.uuid4().hex[:6]}", f"itest-uu3m-{uuid.uuid4().hex[:6]}"
     try:
         _create(server, plain, mounts="none")
@@ -145,5 +177,4 @@ def test_an_admin_assigns_a_shed_that_has_no_user(vz_server_dev):
                 # Control: alice, still listed, still does.
                 assert plain in {s["name"] for s in env.alice.list_sheds()}
     finally:
-        server.delete(plain, ignore_missing=True)
-        server.delete(mounted, ignore_missing=True)
+        _cleanup(server, plain, mounted)

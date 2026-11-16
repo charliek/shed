@@ -505,9 +505,11 @@ the shim with `-S`.
 
 **Starting a server with the user list.**
 
+From the repository root:
+
 ```sh
 make dev-itest-users                       # generate the keys (idempotent)
-cd tests/integration && uv run python -m fixtures.identity users-yaml   # print the itest users
+(cd tests/integration && uv run python -m fixtures.identity users-yaml)   # print the itest users
 
 # Any base config (adds the users, moves auth.ssh's sources under `dev`):
 scripts/render-dev-config.sh <base.yaml> <out.yaml> --users ~/.shed/dev/itest-users [--state-dir DIR]
@@ -537,12 +539,25 @@ cd tests/integration && PATH="$PWD/../../bin:$PATH" \
   uv run pytest -v -rs test_users.py test_service_client.py
 ```
 
+> **The upgrade cases change the Mac dev server for good.** On the Mac dev
+> server, `test_users_upgrade.py` makes every shed that has no user belong
+> to the user `dev`, permanently: not only its own sheds, every shed made
+> there before a user list. (On the committed base, with no user list, those
+> sheds stay reachable as before.)
+
 | Module | Covers | Where it runs |
 |---|---|---|
-| `test_users.py` | Each user lists and sees only their own sheds (`shed list`, `/api/overview`), an admin sees all with their users; another user's shed is 404 on every API route and refused for a session, `shed exec`, sftp, scp and a forwarded port, and a stopped one is not woken; a taken name is one 409 for everyone, naming nobody; an admin may view, stop and delete another user's shed and is refused entry with the message; a non-admin is refused `local_dir`, server mounts, an image that is not an alias and the image store; snapshots belong to their user; a script key cannot take the credentials scope; an expired key opens nothing; a bus request from a user's shed reaches only that user's listener and only that user may answer it (a synthetic listener, `fixtures/busclient.py`); `shed assign` refuses a non-admin, an unknown user and an assigned shed | `[vz]`, `[fc]`; on `[remote]` only the ownership cases (one shed per user, two VMs): listing, the API 404s, session and exec refusals, the 409, the admin's refusal to enter, and the admin's stop and delete. The rest are `local_vm_only` there. |
-| `test_users_upgrade.py` | Sheds made before a user list: with one user they become that user's at start; cutting a list from two users to one later hands out nothing (the one-time marker); with several users an admin assigns one with `shed assign`, a shed carrying server mounts is refused (409 `SHED_HOST_RESOURCES`), the user can then enter it and the admin no longer can; a key taken off the list opens nothing new | `[vz]` only: it restarts the server with other configs, which the suite can do only to the Mac dev server. The one-user restart gives every shed on the Mac dev server that has no user to `dev`, the developer. |
+| `test_users.py` | Each user lists and sees only their own sheds (`shed list`, `/api/overview`), an admin sees all with their users; another user's shed is 404 on every API route and refused for a session, `shed exec`, sftp, scp and a forwarded port, and a stopped one is not woken; a taken name is one 409 for everyone, naming nobody; an admin may view, stop and delete another user's shed and is refused entry with the message; a non-admin is refused `local_dir`, server mounts, an image that is not an alias and the image store; snapshots belong to their user (and the owner can make a shed from one, a third VM, local backends only); a script key cannot take the credentials scope; an expired key opens nothing; a bus request from a user's shed reaches only that user's listener and only that user may answer it (a synthetic listener, `fixtures/busclient.py`); `shed assign` refuses a non-admin, an unknown user and an assigned shed. Each refusal is checked against the server's own words or code, beside the same user doing the same thing to their own shed | `[vz]` (macOS only), `[fc]`; on `[remote]` only the ownership cases (one shed per user, two VMs): listing, the API 404s, session and exec refusals, the 409, the admin's refusal to enter, and the admin's stop and delete. The rest are `local_vm_only` there. |
+| `test_users_upgrade.py` | Sheds made before a user list: with one user they become that user's at start; cutting a list from two users to one later hands out nothing (the one-time marker); with several users an admin assigns one with `shed assign`, a shed carrying server mounts is refused (409 `SHED_HOST_RESOURCES`), the user can then enter it and the admin no longer can; a key taken off the list opens nothing new | `[vz]` on macOS only (it skips on any other host before a fixture runs): it restarts the server with other configs, which the suite can do only to the Mac dev server. Each case checks that its target is a dev server before it creates anything. The one-user restart gives every shed on the Mac dev server that has no user to `dev`, the developer, permanently (see the note above). |
 | `test_cred_bus.py::test_a_user_list_outside_its_rules_hard_fails` | A user list with an open server, or beside `auth.ssh` key sources, refuses to start (`run_preflight`, no running server) | Marked `vz` like the other preflight cases (they start `bin/shed-server` from the Mac dev config) |
 | `test_service_client.py::test_users_and_the_client_do_not_reach_each_others_sheds` | A user cannot see or enter a service client's shed, an admin can enter it, and the client cannot see the user's shed | `[fc]` with `SHED_ITEST_USERS=fc` |
+
+Clean-up in these modules is checked: a shed is deleted by its owner, then
+by the developer (`dev`, an admin) if it is still there, and must then be
+shown gone (`LocalServer.ensure_deleted`); a snapshot likewise, by its owner
+and then the admin. One that cannot be shown gone fails the teardown with
+its name and server (on `[remote]` it may be a billed VM). Certificates
+enrolled during a case are removed when the case ends.
 
 Not covered live: the server's `env_file` reaching only admins' sheds (it
 only feeds a `--repo` clone's environment, which a test cannot observe

@@ -554,6 +554,68 @@ class LocalServer:
                 f"shed delete failed: exit={r.returncode} stderr={r.stderr}"
             )
 
+    # How long a clean-up delete may take, and how long a deleted shed may
+    # still be listed (a remote delete settles asynchronously). CloudServer
+    # widens both.
+    CLEANUP_DELETE_TIMEOUT = 120
+    CLEANUP_GONE_TIMEOUT = 60
+    CLEANUP_POLL_INTERVAL = 2
+
+    def shed_listed(self, name: str) -> Optional[bool]:
+        """Whether `shed --json list` on this entry lists `name`; None when
+        the list itself failed (so nobody can say the shed is gone)."""
+        try:
+            r = self.cli("--json", "list", timeout=60)
+        except subprocess.TimeoutExpired:
+            return None
+        if r.returncode != 0:
+            return None
+        try:
+            sheds = json.loads(r.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(sheds, list):
+            return None
+        return any(isinstance(s, dict) and s.get("name") == name for s in sheds)
+
+    def ensure_deleted(self, name: str, *, earlier: Optional[list[str]] = None) -> None:
+        """Clean-up that cannot pass quietly: delete `name` through this CLI
+        entry (an admin's, or the implicit user's, so it may delete any
+        shed) unless it is already gone, then VERIFY that it is gone,
+        polling while a delete settles. Raises AssertionError naming the
+        shed and the server, with every failed attempt (`earlier` holds the
+        caller's own), when it is still listed or the list cannot be read:
+        a shed left behind may be a billed cloud VM.
+
+        A name that was never created is fine: it is simply not listed."""
+        problems = list(earlier or [])
+        if self.shed_listed(name) is not False:
+            try:
+                r = self.cli("delete", name, "-f", timeout=self.CLEANUP_DELETE_TIMEOUT)
+                if r.returncode != 0:
+                    problems.append(
+                        f"`shed -s {self.name} delete {name} -f` exited {r.returncode}: "
+                        f"{(r.stderr or r.stdout).strip()[-500:]!r}"
+                    )
+            except subprocess.TimeoutExpired:
+                problems.append(
+                    f"`shed -s {self.name} delete {name} -f` timed out after {self.CLEANUP_DELETE_TIMEOUT} s"
+                )
+        deadline = time.monotonic() + self.CLEANUP_GONE_TIMEOUT
+        while True:
+            listed = self.shed_listed(name)
+            if listed is False:
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self.CLEANUP_POLL_INTERVAL)
+        state = "is still listed" if listed else "could not be confirmed gone (`shed --json list` failed)"
+        raise AssertionError(
+            f"CLEAN-UP FAILED: shed {name!r} on server {self.name!r} {state}; it may still be running "
+            f"(and, on a remote backend, billed). Delete it by hand: shed -s {self.name} delete {name} -f. "
+            f"Attempts: {'; '.join(problems) or 'none failed'}"
+        )
+
     def list_shed_names(self) -> list[str]:
         """Return the list of shed names known to the server.
 
@@ -939,6 +1001,10 @@ class CloudServer(LocalServer):
     The log is the dev server's own file (`~/.shed/dev-remote/server.log`),
     read like any `LocalServer` log.
     """
+
+    # A cloud delete takes about a minute and settles asynchronously.
+    CLEANUP_DELETE_TIMEOUT = 600
+    CLEANUP_GONE_TIMEOUT = 300
 
     def __init__(
         self,

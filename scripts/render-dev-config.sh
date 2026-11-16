@@ -67,6 +67,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# On any failure from here, leave no <output> behind (not even the copy of
+# the base made below): a caller that went on regardless would otherwise find
+# a config without the overrides it asked for.
+trap 'rc=$?; [ "$rc" -eq 0 ] || rm -f "$out" "$out.users"' EXIT
+
 if [ ! -f "$base" ]; then
   echo "render-dev-config: base config not found: $base" >&2
   exit 1
@@ -151,6 +156,13 @@ fi
 if [ "${#applied[@]}" -eq 0 ]; then
   echo "render-dev-config: no overrides requested — the caller should have run" \
        "the committed base config directly" >&2
+  exit 1
+fi
+
+# The caller starts a server with what this wrote; an empty file there would
+# load shed-server's defaults instead. (The Makefile checks again.)
+if [ ! -s "$out" ]; then
+  echo "render-dev-config: $out is missing or empty after rendering" >&2
   exit 1
 fi
 

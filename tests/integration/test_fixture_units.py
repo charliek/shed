@@ -1452,7 +1452,8 @@ def sse_listener(tmp_path):
         protocol_version = "HTTP/1.1"
 
         def do_GET(self):
-            if self.path != "/api/plugins/listeners/ok/messages":
+            ns = self.path.removeprefix("/api/plugins/listeners/").removesuffix("/messages")
+            if ns not in ("ok", "ends", "ka") or not self.path.endswith("/messages"):
                 body = b'{"error":{"code":"FORBIDDEN","message":"no"}}'
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
@@ -1469,6 +1470,14 @@ def sse_listener(tmp_path):
                 self.wfile.write(b": keepalive\n\n")
                 self.wfile.write(b"event: message\ndata: " + json.dumps(env).encode() + b"\n\n")
                 self.wfile.flush()
+                if ns == "ends":
+                    return  # the server ends the stream (Connection: close)
+                if ns == "ka":
+                    # A keepalive every 0.2 s until the client goes.
+                    while not stop.wait(0.2):
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                    return
                 stop.wait(10)
             except OSError:
                 pass
@@ -1502,6 +1511,39 @@ def test_bus_listener_receives_events_and_closes(sse_listener):
     assert listener.error is None
 
 
+def test_bus_listener_counts_a_stream_that_ends_as_broken(sse_listener):
+    # A listener whose stream the server ended hears nothing more: it must
+    # not pass as a listener that stayed quiet.
+    s = sse_listener
+    with busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "ends") as listener:
+        assert listener.open() == (200, None)
+        assert listener.wait_for(lambda e: busclient.payload_has(e, "tok"), 10) is not None
+        deadline = time.monotonic() + 10
+        while listener.error is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert listener.error is not None and "ended" in listener.error, listener.error
+        assert not listener.alive_after(time.monotonic() - 60, 0.5), "an ended stream counted as alive"
+
+
+def test_bus_listener_alive_after_needs_activity_after_the_point(sse_listener):
+    s = sse_listener
+    with busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "ka") as live:
+        assert live.open() == (200, None)
+        assert live.wait_for(lambda e: True, 10) is not None
+        t = time.monotonic()
+        assert live.alive_after(t, 5), "keepalives after the point were not seen"
+        assert max(live.keepalive_times) > t
+    # The `ok` stream sends one keepalive and one event, then nothing: alive
+    # before that point, silent after it.
+    with busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "ok") as quiet:
+        assert quiet.open() == (200, None)
+        assert quiet.wait_for(lambda e: True, 10) is not None
+        before = min(quiet.keepalive_times) - 1
+        assert quiet.alive_after(before, 1)
+        assert not quiet.alive_after(time.monotonic(), 0.6)
+        assert quiet.error is None
+
+
 def test_bus_listener_reports_a_refused_subscribe(sse_listener):
     s = sse_listener
     listener = busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "refused")
@@ -1533,28 +1575,247 @@ def test_a_bad_dev_users_value_fails_before_anything_runs(tmp_path, target):
     assert not [c for c in calls if "kill" in c or "serve --config" in c or c.startswith(("scp ", "uname -s"))], calls
 
 
-def test_dev_users_renders_the_user_list_on_each_dev_target(tmp_path):
+# A stand-in for scripts/render-dev-config.sh (DEV_RENDER_SCRIPT) that records
+# its argv, one tab-separated line, and then does what RENDER_MODE says: fail,
+# write an empty file, write nothing and exit 0, or write a small config. And a
+# stand-in shed-server (DEV_SERVER_BIN) that records its argv and exits, so no
+# test here can start a real server whatever the Makefile does.
+_RENDER_STUB = """#!/bin/bash
+{ printf 'render'; for a in "$@"; do printf '\\t%s' "$a"; done; printf '\\n'; } >> "$STUB_LOG"
+case "$RENDER_MODE" in
+  fail) echo "stub renderer: failing on purpose" >&2; exit 1 ;;
+  empty) mkdir -p "$(dirname "$2")"; : > "$2"; exit 0 ;;
+  nothing) exit 0 ;;
+  *) mkdir -p "$(dirname "$2")"; printf 'auth:\\n  mode: mtls\\n' > "$2"; exit 0 ;;
+esac
+"""
+_DARWIN_UNAME = '#!/bin/bash\necho "uname $*" >> "$STUB_LOG"\necho Darwin\n'
+
+
+def _render_stubs(tmp_path: Path, *, darwin: bool = False) -> tuple[str, str]:
+    """Write the renderer and server stubs (and, for the Mac targets, a
+    `uname` that says Darwin) into the stubs dir `_make_with_stubs` uses.
+    Returns the make assignments that put them in place."""
+    stubs = tmp_path / "stubs"
+    stubs.mkdir(exist_ok=True)
+    render = stubs / "render-stub"
+    render.write_text(_RENDER_STUB)
+    render.chmod(0o755)
+    server = stubs / "shed-server"
+    server.write_text('#!/bin/bash\necho "shed-server $*" >> "$STUB_LOG"\nexit 0\n')
+    server.chmod(0o755)
+    if darwin:
+        (stubs / "uname").write_text(_DARWIN_UNAME)
+        (stubs / "uname").chmod(0o755)
+    return f"DEV_RENDER_SCRIPT={render}", f"DEV_SERVER_BIN={server}"
+
+
+def _renders(calls: list[str]) -> list[list[str]]:
+    return [c.split("\t")[1:] for c in calls if c.startswith("render\t")]
+
+
+def _launches(calls: list[str]) -> list[str]:
+    """Every start of a server: the Mac and remote launch (the stub), and the
+    FC upload and remote launch (the scp and ssh stubs)."""
+    return [c for c in calls if c.startswith("shed-server ") or "serve --config" in c or c.startswith("scp ")]
+
+
+def _remote_env(tmp_path: Path) -> tuple[str, str]:
     env = tmp_path / "remote.env"
     env.write_text("SHED_REMOTE_ENV=dev\n")
-    common = ("SHED_DEV_USERS=itest", "SHED_ITEST_USERS_DIR=/keys/here", f"SHED_REMOTE_ENV_FILE={env}",
-              "SHED_REMOTE_GITHUB_USER=someone")
-    for target in ("dev-server-up", "dev-server-up-fc", "dev-server-up-remote"):
-        r, _ = _make_with_stubs(tmp_path, target, *common, dry_run=True)
-        assert r.returncode == 0, (target, r.stdout + r.stderr)
-        out = r.stdout
-        m = re.search(r'render-dev-config\.sh [^\n]*--users "?/keys/here', out)
-        assert m, (target, out)
-        assert m.start() < out.index("serve --config"), target
-    # Unset, the render is skipped: its guard reads empty (the FC and remote
-    # recipes), or the Mac's render arguments carry no --users.
-    for target in ("dev-server-up-fc", "dev-server-up-remote"):
-        r, _ = _make_with_stubs(tmp_path, target, f"SHED_REMOTE_ENV_FILE={env}", "SHED_REMOTE_GITHUB_USER=someone",
-                                dry_run=True)
-        assert r.returncode == 0, r.stdout + r.stderr
-        assert 'if [ "" = itest ]; then' in r.stdout and 'if [ "itest" = itest ]' not in r.stdout, (target, r.stdout)
-    r, _ = _make_with_stubs(tmp_path, "dev-server-up", dry_run=True)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "--users" not in r.stdout, r.stdout
+    return f"SHED_REMOTE_ENV_FILE={env}", "SHED_REMOTE_GITHUB_USER=someone"
+
+
+@pytest.mark.parametrize("mode", ["fail", "empty", "nothing"])
+@pytest.mark.parametrize(
+    "target, assigns",
+    [
+        ("dev-server-up", ("SHED_DEV_USERS=itest",)),
+        # The same hole without --users: a state-dir render that fails.
+        ("dev-server-up", ("SHED_DEV_STATE_DIR={tmp}/state",)),
+        ("dev-server-up-fc", ("SHED_DEV_USERS=itest",)),
+        ("dev-server-up-remote", ("SHED_DEV_USERS=itest",)),
+    ],
+    ids=["mac-users", "mac-state-dir", "fc-users", "remote-users"],
+)
+def test_a_render_that_fails_never_starts_a_server(tmp_path, target, assigns, mode):
+    # Before the fix the Mac target went on to `serve --config ""` (shed-server's
+    # normal config search) when the render failed; the stub server records it.
+    stubs = _render_stubs(tmp_path, darwin=target == "dev-server-up")
+    r, calls = _make_with_stubs(
+        tmp_path, target, *stubs, *(a.format(tmp=tmp_path) for a in assigns), *_remote_env(tmp_path),
+        env_extra={"RENDER_MODE": mode},
+    )
+    out = r.stdout + r.stderr
+    assert _renders(calls), (calls, out)
+    assert r.returncode != 0, out
+    assert not _launches(calls), calls
+    assert "not starting shed-server" in out, out
+
+
+@pytest.mark.parametrize(
+    "target, assign",
+    [
+        ("dev-server-up", "DEV_CONFIG={empty}"),
+        ("dev-server-up-fc", "FC_DEV_LOCAL_CONFIG={empty}"),
+        ("dev-server-up-remote", "REMOTE_DEV_TEMPLATE={empty}"),
+    ],
+    ids=["mac", "fc", "remote"],
+)
+def test_an_empty_config_never_starts_a_server_without_users_either(tmp_path, target, assign):
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("")
+    stubs = _render_stubs(tmp_path, darwin=target == "dev-server-up")
+    r, calls = _make_with_stubs(tmp_path, target, *stubs, assign.format(empty=empty), *_remote_env(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert not _launches(calls), calls
+    assert "not starting shed-server" in out, out
+
+
+def test_the_dev_targets_start_with_the_config_they_rendered(tmp_path):
+    # The positive control for the two tests above: a render that works
+    # reaches the launch, with the rendered file, after the render.
+    home = tmp_path / "home"
+    for target, users, want_base, want_out, launch in (
+        ("dev-server-up", "itest", str(MAC_DEV_CONFIG), f"{home}/.shed/dev/server.generated.yaml", "shed-server serve"),
+        ("dev-server-up", "", None, None, "shed-server serve"),
+        ("dev-server-up-fc", "itest", "configs/server.dev-parallel.linux-fc.yaml",
+         f"{home}/.shed/dev/server.dev-fc.users.yaml", "scp "),
+        ("dev-server-up-fc", "", None, None, "scp "),
+        ("dev-server-up-remote", "itest", f"{home}/.shed/dev-remote/server.yaml",
+         f"{home}/.shed/dev-remote/server.yaml.users", "shed-server serve"),
+        ("dev-server-up-remote", "", None, None, "shed-server serve"),
+    ):
+        stubs = _render_stubs(tmp_path, darwin=target == "dev-server-up")
+        r, calls = _make_with_stubs(
+            tmp_path, target, *stubs, f"SHED_DEV_USERS={users}", "SHED_ITEST_USERS_DIR=/keys/here",
+            *_remote_env(tmp_path), env_extra={"RENDER_MODE": "ok"},
+        )
+        renders = _renders(calls)
+        if users:
+            assert renders == [[want_base, want_out, "--users", "/keys/here"]], (target, calls, r.stdout + r.stderr)
+        else:
+            assert renders == [], (target, calls)
+        started = [i for i, c in enumerate(calls) if c.startswith(launch)]
+        assert started, (target, users, calls, r.stdout + r.stderr)
+        if users:
+            first = next(i for i, c in enumerate(calls) if c.startswith("render\t"))
+            assert first < started[0], (target, calls)
+        if launch == "shed-server serve":
+            config = calls[started[0]].split("--config ", 1)[1]
+            want = {"dev-server-up": f"{home}/.shed/dev/server.generated.yaml" if users else str(MAC_DEV_CONFIG),
+                    "dev-server-up-remote": f"{home}/.shed/dev-remote/server.yaml"}[target]
+            assert config == want, (target, users, calls)
+            assert Path(config).stat().st_size > 0
+
+
+@pytest.mark.parametrize(
+    "target", ["dev-server-restart", "dev-server-restart-fc", "dev-server-restart-remote"],
+)
+def test_a_render_that_fails_stops_a_restart_before_the_stop(tmp_path, target):
+    pid_file, proc = _remote_home(tmp_path)
+    try:
+        stubs = _render_stubs(tmp_path, darwin=target == "dev-server-restart")
+        r, calls = _make_with_stubs(tmp_path, target, *stubs, "SHED_DEV_USERS=itest", *_remote_env(tmp_path),
+                                    env_extra={"RENDER_MODE": "fail"})
+        out = r.stdout + r.stderr
+        assert r.returncode != 0, out
+        assert _renders(calls), calls
+        # No stop ran: the Mac stop's `uname -s`, the FC stop's ssh kill, and
+        # the remote stop, which would have removed this pid file.
+        assert not [c for c in calls if c.startswith("uname -s") or "kill" in c], calls
+        assert not _launches(calls), calls
+        assert pid_file.exists() and proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize(
+    "target", ["dev-server-restart", "dev-server-restart-fc", "dev-server-restart-remote"],
+)
+def test_a_restart_with_a_render_that_works_does_stop_then_start(tmp_path, target):
+    # The control for the test above: the same restart with a working render
+    # reaches the stop and then the launch.
+    pid_file, proc = _remote_home(tmp_path)
+    try:
+        stubs = _render_stubs(tmp_path, darwin=target == "dev-server-restart")
+        r, calls = _make_with_stubs(tmp_path, target, *stubs, "SHED_DEV_USERS=itest", *_remote_env(tmp_path),
+                                    env_extra={"RENDER_MODE": "ok"})
+        stop = {"dev-server-restart": lambda c: c.startswith("uname -s"),
+                "dev-server-restart-fc": lambda c: "kill -TERM" in c,
+                "dev-server-restart-remote": None}[target]
+        launches = [i for i, c in enumerate(calls) if c.startswith("shed-server serve") or c.startswith("scp ")]
+        assert launches, (calls, r.stdout + r.stderr)
+        if stop is not None:
+            assert next(i for i, c in enumerate(calls) if stop(c)) < launches[0], calls
+        else:
+            # dev-server-down-remote removed the pid file of the "running"
+            # (not a shed-server, so unsignalled) process before the launch.
+            assert not pid_file.exists() or pid_file.read_text().strip() != str(proc.pid)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _half_pair(keys_dir: Path) -> Path:
+    (keys_dir / ident.BOB / "id_ed25519.pub").unlink()
+    return keys_dir
+
+
+def test_the_real_renderer_fails_on_a_half_key_pair_and_leaves_no_config(tmp_path, keys_dir):
+    if shutil.which("uv") is None:
+        pytest.skip("uv is not installed")
+    out = tmp_path / "out.yaml"
+    out.write_text("left from an earlier run\n")
+    r = _render(tmp_path, FC_DEV_CONFIG, "--users", str(_half_pair(keys_dir)))
+    assert r.returncode != 0 and "only one half" in r.stderr, r.stdout + r.stderr
+    assert not out.exists(), "a failed render left a config behind"
+
+
+def test_the_real_renderer_fails_without_uv_and_leaves_no_config(tmp_path, keys_dir):
+    path = "/usr/bin:/bin"
+    if shutil.which("uv", path=path) is not None:
+        pytest.skip("uv is installed system-wide; cannot run the renderer without it")
+    out = tmp_path / "out.yaml"
+    r = subprocess.run(["bash", str(RENDER), str(FC_DEV_CONFIG), str(out), "--users", str(keys_dir)],
+                       capture_output=True, text=True, timeout=30, env={**os.environ, "PATH": path})
+    assert r.returncode != 0 and "needs uv" in r.stderr, r.stdout + r.stderr
+    assert not out.exists()
+
+
+def test_the_fc_target_with_the_real_renderer_and_a_half_key_pair_uploads_nothing(tmp_path, keys_dir):
+    if shutil.which("uv") is None:
+        pytest.skip("uv is not installed")
+    r, calls = _make_with_stubs(tmp_path, "dev-server-up-fc", "SHED_DEV_USERS=itest",
+                                f"SHED_ITEST_USERS_DIR={_half_pair(keys_dir)}")
+    out = r.stdout + r.stderr
+    assert r.returncode != 0 and "only one half" in out, out
+    assert not _launches(calls), calls
+    assert not (tmp_path / "home" / ".shed" / "dev" / "server.dev-fc.users.yaml").exists()
+
+
+@pytest.mark.parametrize("target", ["dev-server-up", "dev-server-up-fc", "dev-server-up-remote", "dev-itest-users"])
+def test_the_users_dir_is_one_argument_and_never_code(tmp_path, target):
+    pwned = tmp_path / "pwned"
+    users_dir = f'{tmp_path}/keys dir"; touch {pwned}; echo "`touch {pwned}`'
+    stubs = _render_stubs(tmp_path, darwin=target == "dev-server-up")
+    extra = ()
+    if target == "dev-itest-users":
+        # dev-itest-users runs `uv run ... --dir DIR keys`; a uv stub records it.
+        uv = tmp_path / "stubs" / "uv"
+        uv.write_text('#!/bin/bash\n{ printf uv; for a in "$@"; do printf "\\t%s" "$a"; done; printf "\\n"; } >> "$STUB_LOG"\n')
+        uv.chmod(0o755)
+    r, calls = _make_with_stubs(tmp_path, target, *stubs, "SHED_DEV_USERS=itest", f"SHED_ITEST_USERS_DIR={users_dir}",
+                                *_remote_env(tmp_path), *extra, env_extra={"RENDER_MODE": "ok"})
+    assert not pwned.exists(), "a quote in the users dir ran as shell code"
+    if target == "dev-itest-users":
+        got = [c.split("\t")[1:] for c in calls if c.startswith("uv\t")]
+        assert got and got[0][got[0].index("--dir") + 1] == users_dir, calls
+    else:
+        renders = _renders(calls)
+        assert renders and renders[0][renders[0].index("--users") + 1] == users_dir, (calls, r.stdout + r.stderr)
 
 
 def test_the_test_targets_tell_the_suite_about_the_user_list():
@@ -1574,4 +1835,322 @@ def test_the_test_targets_tell_the_suite_about_the_user_list():
             assert "SHED_ITEST_USERS=" not in body, (target, body)
         else:
             assert f"SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),{backend},)" in body, (target, body)
-        assert "SHED_ITEST_USERS_DIR=$(SHED_ITEST_USERS_DIR)" in body, target
+        # Quoted, from the environment (the Makefile exports it): a path with
+        # a space stays one value.
+        assert 'SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR"' in body, target
+        assert "$(SHED_ITEST_USERS_DIR)" not in body, target
+
+
+# ----------------------------------------------------------------------------
+# The users cases' own helpers (test_users.py, test_users_upgrade.py,
+# conftest.py): checked clean-up, order independence, the platform skip, the
+# target check before any create, a forward that keeps stdin open, the bus
+# exchange's time budget, and the server's own words the refusals are matched
+# against. No server: the CLI and the API are fakes.
+# ----------------------------------------------------------------------------
+
+import sys  # noqa: E402
+
+import test_users as tu  # noqa: E402
+import test_users_upgrade as tuu  # noqa: E402
+
+
+class _CliServer(fx.LocalServer):
+    """A LocalServer whose `shed` CLI is a script: `listed` is what each
+    `--json list` says in turn (True, False, or None for a failed list; the
+    last value repeats), `delete_rc` what a delete exits with."""
+
+    CLEANUP_GONE_TIMEOUT = 0.3
+    CLEANUP_POLL_INTERVAL = 0.05
+
+    def __init__(self, listed, delete_rc=0, name="box-dev", shed="s1"):
+        super().__init__(name=name, backend="vz")
+        self.shed = shed
+        self.listed = list(listed)
+        self.delete_rc = delete_rc
+        self.calls: list[tuple] = []
+
+    def cli(self, *args, timeout=60):
+        self.calls.append(args)
+        if args[:2] == ("--json", "list"):
+            state = self.listed.pop(0) if len(self.listed) > 1 else self.listed[0]
+            if state is None:
+                return subprocess.CompletedProcess(args, 1, "", "connection refused")
+            return subprocess.CompletedProcess(args, 0, json.dumps([{"name": self.shed}] if state else []), "")
+        if args[0] == "delete":
+            if self.delete_rc == "timeout":
+                raise subprocess.TimeoutExpired(args, timeout)
+            return subprocess.CompletedProcess(args, self.delete_rc, "", "" if self.delete_rc == 0 else "boom")
+        raise AssertionError(f"unexpected cli {args}")
+
+
+def test_ensure_deleted_deletes_then_verifies_it_is_gone():
+    s = _CliServer([True, False])
+    s.ensure_deleted("s1")
+    assert ("delete", "s1", "-f") in s.calls
+    # A name that is not there: nothing to delete, and nothing fails.
+    s = _CliServer([False])
+    s.ensure_deleted("s1")
+    assert not [c for c in s.calls if c[0] == "delete"]
+
+
+@pytest.mark.parametrize(
+    "listed, delete_rc, want",
+    [
+        ([True], 1, "is still listed"),            # the delete failed and it is still there
+        ([True], 0, "is still listed"),            # the delete "worked" and it is still there
+        ([True], "timeout", "timed out"),          # the delete hung
+        ([None], 0, "could not be confirmed gone"),  # nobody can say it is gone
+    ],
+    ids=["delete-failed", "delete-lied", "delete-hung", "list-failed"],
+)
+def test_ensure_deleted_fails_loudly_naming_the_shed_and_server(listed, delete_rc, want):
+    s = _CliServer(listed, delete_rc)
+    with pytest.raises(AssertionError) as e:
+        s.ensure_deleted("s1", earlier=["the owner's delete exited 1"])
+    msg = str(e.value)
+    assert "CLEAN-UP FAILED" in msg and "'s1'" in msg and "'box-dev'" in msg and want in msg, msg
+    assert "the owner's delete exited 1" in msg
+
+
+class _Who:
+    """An identity whose `shed` CLI is a script (for test_users._delete)."""
+
+    def __init__(self, user, rc):
+        self.user, self.rc, self.calls = user, rc, []
+
+    def cli(self, *args, timeout=120):
+        self.calls.append(args)
+        if self.rc == "timeout":
+            raise subprocess.TimeoutExpired(args, timeout)
+        return subprocess.CompletedProcess(args, self.rc, "", "" if self.rc == 0 else "owner delete broke")
+
+
+class _Env:
+    def __init__(self, server, backend="fc"):
+        self.server, self.backend = server, backend
+
+
+def test_users_delete_falls_back_to_the_admin_and_verifies():
+    # The owner's delete fails; the developer's (an admin) works; it is gone.
+    server = _CliServer([True, False])
+    owner = _Who(ident.BOB, 1)
+    tu._delete(_Env(server), owner, "s1")
+    assert owner.calls == [("delete", "s1", "-f")]
+    assert ("delete", "s1", "-f") in server.calls
+
+
+@pytest.mark.parametrize("owner_rc", [1, "timeout"])
+def test_users_delete_fails_when_nobody_could_delete_it(owner_rc):
+    # Before the fix both deletes' failures were swallowed and the teardown
+    # passed with the VM still there.
+    server = _CliServer([True], delete_rc=1)
+    with pytest.raises(AssertionError) as e:
+        tu._delete(_Env(server), _Who(ident.BOB, owner_rc), "s1")
+    msg = str(e.value)
+    assert "'s1'" in msg and "'box-dev'" in msg and "itest-bob's `shed delete s1`" in msg, msg
+
+
+def test_a_failed_create_keeps_its_error_and_reports_a_failed_clean_up(monkeypatch):
+    monkeypatch.setattr(tu.uuid, "uuid4", lambda: type("U", (), {"hex": "0" * 32})())
+    server = _CliServer([True], delete_rc=1, shed="itest-x-00000000")
+
+    def create(env, who, name):
+        raise AssertionError("create failed")
+
+    monkeypatch.setattr(tu, "_create", create)
+    with pytest.raises(AssertionError, match="create failed") as e:
+        tu._shed_fixture(_Env(server), _Who(ident.ALICE, 1), "itest-x")
+    assert any("CLEAN-UP FAILED" in n for n in getattr(e.value, "__notes__", [])), e.value
+
+
+def test_the_shed_slot_lets_the_module_run_in_any_order(monkeypatch):
+    made, deleted = [], []
+    monkeypatch.setattr(tu, "_shed_fixture", lambda env, who, prefix: made.append(f"{prefix}-{len(made)}") or made[-1])
+    monkeypatch.setattr(tu, "_delete", lambda env, who, name: deleted.append(name))
+    slot = tu._ShedSlot(object(), object(), "itest-ub")
+    # The deleting case first: it gets a shed of its own to delete ...
+    taken = slot.take()
+    assert taken == "itest-ub-0" and slot.name is None
+    # ... and a later case gets a new one, never the deleted one.
+    assert slot.get() == "itest-ub-1" and slot.get() == "itest-ub-1"
+    slot.close()
+    assert deleted == ["itest-ub-1"], "the slot's own shed was not cleaned up, or the taken one was deleted twice"
+    slot.close()
+    assert deleted == ["itest-ub-1"]
+
+
+def test_run_all_runs_every_clean_up_step_and_reports_each_failure():
+    ran = []
+
+    def boom(msg):
+        def step():
+            ran.append(msg)
+            raise AssertionError(msg)
+        return step
+
+    with pytest.raises(AssertionError) as e:
+        tu._run_all([boom("snapshot"), lambda: ran.append("shed"), boom("restart")])
+    assert ran == ["snapshot", "shed", "restart"]
+    assert "snapshot" in str(e.value) and "restart" in str(e.value)
+
+
+class _Api:
+    def __init__(self, answers):
+        self.answers, self.calls = list(answers), []
+
+    def request(self, method, path, body=None, timeout=None):
+        self.calls.append((method, path))
+        a = self.answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+
+class _ApiWho:
+    def __init__(self, user, api):
+        self.user, self._api = user, api
+
+    def api(self):
+        return self._api
+
+
+_SNAP_GONE = (404, {"error": {"code": "SNAPSHOT_NOT_FOUND", "message": "x"}})
+
+
+def test_snapshot_clean_up_falls_back_to_the_admin_and_verifies():
+    alice = _ApiWho(ident.ALICE, _Api([TimeoutError("slow")]))
+    admin = _ApiWho(ident.ADMIN, _Api([(204, None), _SNAP_GONE]))
+    env = type("E", (), {"alice": alice, "admin": admin, "server": _CliServer([False])})()
+    tu._delete_snapshot(env, "snap1")
+    assert admin._api.calls == [("DELETE", "/api/snapshots/snap1"), ("GET", "/api/snapshots/snap1")]
+
+
+def test_snapshot_clean_up_fails_loudly_when_it_is_still_there():
+    alice = _ApiWho(ident.ALICE, _Api([(500, {"error": {"code": "BACKEND_ERROR", "message": "x"}})]))
+    admin = _ApiWho(ident.ADMIN, _Api([(500, None), (200, {"name": "snap1"})]))
+    env = type("E", (), {"alice": alice, "admin": admin, "server": _CliServer([False])})()
+    with pytest.raises(AssertionError, match="CLEAN-UP FAILED: snapshot 'snap1' on server 'box-dev'"):
+        tu._delete_snapshot(env, "snap1")
+
+
+@pytest.mark.parametrize("case", [
+    tuu.test_a_one_user_list_gives_that_user_the_sheds_that_had_none,
+    tuu.test_cutting_the_list_to_one_user_later_hands_out_nothing,
+    tuu.test_an_admin_assigns_a_shed_that_has_no_user,
+], ids=["one-user", "cut-to-one", "assign"])
+def test_upgrade_cases_check_the_target_before_creating_anything(case):
+    # An entry that is not a dev server (here, by name; assert_dev_target
+    # also refuses production ports): the case raises before any CLI call,
+    # so nothing is created on it.
+    class NotDev:
+        name = "my-server"
+
+        def cli(self, *args, **kw):
+            raise AssertionError(f"the case reached the server before checking it: shed {args}")
+
+        def ensure_deleted(self, name, **kw):
+            raise AssertionError(f"the case cleaned up on the server before checking it: {name}")
+
+    with pytest.raises(RuntimeError, match="refusing to reconfigure non-dev server"):
+        case(NotDev())
+
+
+def test_vz_users_cases_skip_off_macos_before_any_fixture(monkeypatch):
+    import conftest
+
+    class Item:
+        callspec = type("C", (), {"params": {"users_env": "vz"}})()
+
+        def get_closest_marker(self, name):
+            return None
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(pytest.skip.Exception, match="not macOS"):
+        conftest.pytest_runtest_setup(Item())
+    monkeypatch.setattr(sys, "platform", "darwin")
+    conftest.pytest_runtest_setup(Item())
+
+
+def test_upgrade_module_is_skipped_by_mark_on_this_platform():
+    # The mark's condition was evaluated at import, on this host.
+    (mark,) = [m for m in tuu.pytestmark if m.name == "skipif"]
+    assert mark.args[0] is (sys.platform != "darwin")
+
+
+# A stand-in for the identity's ssh shim on `ssh -W`: like a forward the far
+# side closes as soon as stdin reaches EOF, it prints its banner only if
+# stdin is still open after a moment, then copies until stdin closes.
+_FORWARD_SHIM = """#!/bin/bash
+read -t 0.5 -r _; rc=$?
+if [ "$rc" -le 128 ]; then echo "forward torn down: stdin reached EOF before the banner" >&2; exit 255; fi
+printf 'SSH-2.0-fake\\r\\n'
+cat >/dev/null
+exit 0
+"""
+
+
+def test_forward_keeps_stdin_open_until_the_banner_arrives(tmp_path, keys_dir):
+    if shutil.which("ssh") is None:
+        pytest.skip("ssh is not installed")
+    a = ident.Identity.create(ident.ALICE, "box-dev", "localhost", 12222, keys_dir=keys_dir)
+    try:
+        a.shim.write_text(_FORWARD_SHIM)
+        start = time.monotonic()
+        rc, first, err = a.forward("some-shed", timeout=10)
+        assert first.startswith(b"SSH-"), (rc, first, err)
+        assert rc == 0 and time.monotonic() - start < 8, "ssh was not let go once the banner was in"
+    finally:
+        a.remove()
+
+
+def test_forward_reports_a_refused_forward(tmp_path, keys_dir):
+    if shutil.which("ssh") is None:
+        pytest.skip("ssh is not installed")
+    a = ident.Identity.create(ident.BOB, "box-dev", "localhost", 12222, keys_dir=keys_dir)
+    try:
+        a.shim.write_text('#!/bin/bash\necho "channel 0: open failed: connect failed: shed not found" >&2\nexit 255\n')
+        rc, first, err = a.forward("some-shed", timeout=10)
+        assert (rc, first) == (255, b"") and tu.FORWARD_NOT_FOUND in err, (rc, first, err)
+    finally:
+        a.remove()
+
+
+def test_the_bus_exchange_fits_inside_the_guests_request_lifetime():
+    # The guest's lifetime, read from the agent's source, so a change there
+    # fails here rather than as a flaky live case.
+    src = (dc.REPO_ROOT / "cmd" / "shed-agent" / "http.go").read_text()
+    m = re.search(r"publishTimeout\s*=\s*(\d+)\s*\*\s*time\.Second", src)
+    assert m, "publishTimeout not found in cmd/shed-agent/http.go"
+    lifetime = int(m.group(1))
+    assert tu.GUEST_REQUEST_LIFETIME == lifetime
+    # Delivery, then the forged answers side by side, must leave the owner
+    # time to answer by ANSWER_BY, and the answer must land with margin.
+    assert tu.DELIVERY_BUDGET + tu.FORGERY_TIMEOUT + 2 <= tu.ANSWER_BY
+    assert tu.ANSWER_BY + tu.ANSWER_TIMEOUT <= lifetime - 3
+    # The liveness wait covers the server's keepalive interval.
+    api = (dc.REPO_ROOT / "internal" / "api" / "plugin_handlers.go").read_text()
+    k = re.search(r"sseKeepaliveInterval\s*=\s*(\d+)\s*\*\s*time\.Second", api)
+    assert k and tu.LIVENESS_TIMEOUT >= int(k.group(1)) + 10
+
+
+def test_the_refusals_the_live_cases_match_are_the_servers_own_words():
+    # Each string a users case matches a refusal against is the server's
+    # (a test that matched words the server never says could not fail for
+    # the right reason, and one that matched a general "not found" could
+    # pass on any failure).
+    root = dc.REPO_ROOT
+    sshd = (root / "internal" / "sshd" / "server.go").read_text()
+    assert f'newChan.Reject(gossh.ConnectionFailed, "{tu.FORWARD_NOT_FOUND}")' in sshd
+    wake = (root / "internal" / "sshd" / "wake.go").read_text()
+    assert "wakeErrorf(\"shed '%s' not found\", name)" in wake
+    assert tu._session_not_found("x") == "shed 'x' not found"
+    ident_go = (root / "internal" / "sshd" / "identity.go").read_text()
+    assert tu.ANOTHER_USER in ident_go
+    bus = (root / "internal" / "api" / "plugin_handlers.go").read_text()
+    assert '"FORBIDDEN", "response does not match a pending request for this namespace"' in bus
+    assign = (root / "internal" / "backend" / "assign.go").read_text()
+    assert "already belongs to user %s" in assign
+    assert '"SHED_ALREADY_ASSIGNED"' in (root / "internal" / "config" / "types.go").read_text()
+    cli = (root / "cmd" / "shed" / "shed.go").read_text()
+    assert 'fmt.Errorf("shed %q not found on %s", name, serverFlag)' in cli

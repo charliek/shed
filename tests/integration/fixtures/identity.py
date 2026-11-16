@@ -66,6 +66,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -474,18 +475,21 @@ class Identity:
 
     def forward(self, shed: str, port: int = 22, timeout: float = 20) -> tuple[Optional[int], bytes, str]:
         """Open one forwarded connection (a direct-tcpip channel, `ssh -W`) to
-        `localhost:<port>` in `shed`; return (exit code or None on timeout,
-        the first bytes the far side sent, stderr). The guest's sshd speaks
-        first, so a forward that reaches it reads `SSH-`."""
-        argv = [str(self.shim), "-p", str(self.ssh_port), *self._ssh_opts(),
-                "-W", f"localhost:{port}", f"{shed}@{self.host}"]
-        try:
-            r = subprocess.run(argv, capture_output=True, timeout=timeout, env=self.env(), input=b"")
-            return r.returncode, r.stdout[:64], r.stderr.decode("utf-8", errors="replace")
-        except subprocess.TimeoutExpired as e:
-            out = e.stdout or b""
-            err = e.stderr or b""
-            return None, out[:64], err.decode("utf-8", errors="replace") if isinstance(err, bytes) else err
+        `localhost:<port>` in `shed`; return (exit code, or None when ssh had
+        to be killed, the first line the far side sent (at most 64 bytes),
+        stderr). The guest's sshd speaks first, so a forward that reaches it
+        reads `SSH-`.
+
+        stdin stays OPEN until that first line arrives (or `timeout`): with
+        stdin at EOF from the start, ssh sends EOF down the channel at once
+        and the server closes the forward when either direction finishes, so
+        it could be torn down before the guest's banner is read. Once the
+        line is in, stdin is closed and ssh is given a few seconds to exit."""
+        return _first_line_over(
+            [str(self.shim), "-p", str(self.ssh_port), *self._ssh_opts(),
+             "-W", f"localhost:{port}", f"{shed}@{self.host}"],
+            env=self.env(), timeout=timeout,
+        )
 
     def sftp(self, shed: str, batch: str, timeout: float = 60) -> subprocess.CompletedProcess:
         """`sftp -b -` into `shed` with `batch` on stdin, over this identity's shim."""
@@ -499,6 +503,48 @@ class Identity:
                 str(local), f"{shed}@{self.host}:{remote}"]
         return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=self.env(),
                               stdin=subprocess.DEVNULL)
+
+
+def _first_line_over(argv: Sequence[str], *, env: Mapping[str, str], timeout: float,
+                     max_bytes: int = 64) -> tuple[Optional[int], bytes, str]:
+    """Run `argv` with its stdin held open; read its stdout until a newline,
+    `max_bytes`, EOF or `timeout`; then close stdin and reap it (killing it
+    after 5 s more). Returns (exit code or None when it was killed, what was
+    read, stderr). Split out of `Identity.forward` for its unit test."""
+    import selectors
+
+    proc = subprocess.Popen(list(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=dict(env))
+    got = b""
+    deadline = time.monotonic() + timeout
+    try:
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        try:
+            while b"\n" not in got and len(got) < max_bytes:
+                left = deadline - time.monotonic()
+                if left <= 0 or not sel.select(left):
+                    break
+                chunk = os.read(proc.stdout.fileno(), max_bytes)
+                if not chunk:
+                    break  # EOF: the forward was refused or closed
+                got += chunk
+        finally:
+            sel.close()
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        killed = False
+        try:
+            _, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            killed = True
+            proc.kill()
+            _, err = proc.communicate()
+    line = got.split(b"\n", 1)[0][:max_bytes]
+    return (None if killed else proc.returncode), line, err.decode("utf-8", errors="replace")
 
 
 # ----------------------------------------------------------------------------

@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -338,10 +339,20 @@ def shed_server_dev(request):
 #            before any fixture runs (pytest_runtest_setup below).
 
 
+def skip_vz_off_macos() -> None:
+    """The VZ dev server runs on macOS only, and the [vz] users cases
+    restart it (`make dev-server-restart`, macOS-only). On any other host they
+    skip, even when a VZ entry is configured and reachable (it would be
+    another machine's server, or a production one)."""
+    if sys.platform != "darwin":
+        pytest.skip(f"[vz] users cases restart the Mac dev server; this host is {sys.platform}, not macOS")
+
+
 @pytest.fixture(scope="module", params=["vz", "fc", "remote"])
 def users_env(request):
     backend = request.param
     if backend == "vz":
+        skip_vz_off_macos()
         server = request.getfixturevalue("vz_server_dev")
         reconfigure, image = True, "base"
     elif backend == "fc":
@@ -358,11 +369,17 @@ def users_env(request):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
-    """A users case marked `local_vm_only` skips on [remote] before any of its
-    fixtures run (a module-scoped shed fixture would otherwise create a billed
-    VM first). `shed_server` does the same for its own parameter."""
+    """Before any fixture of a users case runs: a [vz] case skips on a host
+    that is not macOS (`skip_vz_off_macos`), and a case marked
+    `local_vm_only` skips on [remote] (a module-scoped shed fixture would
+    otherwise create a billed VM first). `shed_server` does the same for its
+    own parameter."""
     callspec = getattr(item, "callspec", None)
-    if callspec is None or callspec.params.get("users_env") != "remote":
+    if callspec is None:
+        return
+    if callspec.params.get("users_env") == "vz":
+        skip_vz_off_macos()
+    if callspec.params.get("users_env") != "remote":
         return
     marker = item.get_closest_marker("local_vm_only")
     if marker is not None:

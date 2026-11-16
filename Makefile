@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -182,11 +182,59 @@ SHED_DEV_STATE_DIR ?=
 SHED_DEV_USERS ?=
 SHED_ITEST_USERS_DIR ?= $(HOME)/.shed/dev/itest-users
 
+# These reach the recipes through the environment and are read there as
+# quoted shell variables ("$$SHED_ITEST_USERS_DIR"), never pasted into recipe
+# text, so a directory with a space, a quote or a `$` in it is one argument
+# and is never run as code.
+export SHED_DEV_STATE_DIR SHED_DEV_USERS SHED_ITEST_USERS_DIR
+
+# The config renderer the dev targets run, and the shed-server binary the Mac
+# and remote dev targets launch. Variables only so the fixture unit tests
+# (tests/integration/test_fixture_units.py) can put stubs in their place.
+DEV_RENDER_SCRIPT ?= ./scripts/render-dev-config.sh
+DEV_SERVER_BIN ?= bin/shed-server
+
 # The rendered config, written whenever ANY override above is active. With no
 # overrides the targets run the committed $(DEV_CONFIG) directly — byte
 # identical to having no generation step at all.
 DEV_GENERATED_CONFIG := $(HOME)/.shed/dev/server.generated.yaml
-DEV_RENDER_ARGS := $(if $(SHED_DEV_STATE_DIR),--state-dir $(SHED_DEV_STATE_DIR),) $(if $(filter itest,$(SHED_DEV_USERS)),--users $(SHED_ITEST_USERS_DIR),)
+DEV_RENDER := $(if $(or $(SHED_DEV_STATE_DIR),$(filter itest,$(SHED_DEV_USERS))),yes,)
+
+# Every dev target that renders a config checks what it is about to start
+# with. A failed render must never fall through to a launch: shed-server
+# given `--config ""` (or an empty file) loads its normal config search
+# paths, so a dev target could start a server on the developer's own config
+# and state. This leaves the shell variable RUN_CONFIG set and exits the
+# shell unless it names a non-empty file. Each config snippet below removes
+# its output before rendering, so a renderer that fails, or "succeeds"
+# without writing, cannot leave an earlier file in place to pass this check.
+define dev-check-run-config
+if [ -z "$$RUN_CONFIG" ] || [ ! -f "$$RUN_CONFIG" ] || [ ! -s "$$RUN_CONFIG" ]; then \
+  echo "ERROR: no usable dev server config ('$$RUN_CONFIG' is unset, missing or empty); not starting shed-server."; \
+  exit 1; \
+fi
+endef
+
+# The Mac dev server's config: the committed $(DEV_CONFIG) with no override,
+# else $(DEV_GENERATED_CONFIG) rendered from it with --state-dir and/or
+# --users. Sets RUN_CONFIG; exits the shell on any failure.
+define dev-mac-config
+if [ -n "$(DEV_RENDER)" ]; then \
+  RUN_CONFIG="$(DEV_GENERATED_CONFIG)"; \
+  set --; \
+  if [ -n "$$SHED_DEV_STATE_DIR" ]; then set -- "$$@" --state-dir "$$SHED_DEV_STATE_DIR"; fi; \
+  if [ "$$SHED_DEV_USERS" = itest ]; then set -- "$$@" --users "$$SHED_ITEST_USERS_DIR"; fi; \
+  rm -f "$$RUN_CONFIG"; \
+  if ! $(DEV_RENDER_SCRIPT) "$(DEV_CONFIG)" "$$RUN_CONFIG" "$$@"; then \
+    rm -f "$$RUN_CONFIG"; \
+    echo "ERROR: rendering the dev server config failed (above); not starting shed-server."; \
+    exit 1; \
+  fi; \
+else \
+  RUN_CONFIG="$(DEV_CONFIG)"; \
+fi; \
+$(dev-check-run-config)
+endef
 
 # Refuse to start when SHED_DEV_STATE_DIR points somewhere unwritable — an
 # external volume that isn't mounted, typically. Without this the server
@@ -237,16 +285,16 @@ check-no-dev-auth-mode:
 # SHED_DEV_USERS takes '' or `itest`; anything else stops here, before
 # anything is stopped or started.
 check-dev-users:
-	@case "$(SHED_DEV_USERS)" in \
+	@case "$$SHED_DEV_USERS" in \
 	  ""|itest) ;; \
-	  *) echo "ERROR: SHED_DEV_USERS is '$(SHED_DEV_USERS)'; want empty (no user list) or itest."; exit 1 ;; \
+	  *) echo "ERROR: SHED_DEV_USERS is '$$SHED_DEV_USERS'; want empty (no user list) or itest."; exit 1 ;; \
 	esac
 
 # Generate the itest users' keys (idempotent; an existing key is never
 # replaced, since a running server may have been started with it).
 dev-itest-users:
 	@command -v uv >/dev/null 2>&1 || { echo "uv is required (https://docs.astral.sh/uv/)."; exit 1; }
-	cd tests/integration && uv run --quiet python -m fixtures.identity --dir "$(SHED_ITEST_USERS_DIR)" keys
+	cd tests/integration && uv run --quiet python -m fixtures.identity --dir "$$SHED_ITEST_USERS_DIR" keys
 
 # The Mac dev server's settings guard: the removed auth knob, SHED_DEV_USERS
 # and SHED_DEV_STATE_DIR. A prerequisite of dev-server-up and of
@@ -255,6 +303,13 @@ dev-itest-users:
 # which make starts only once this has succeeded, whatever -j is.)
 check-dev-settings: check-no-dev-auth-mode check-dev-users
 	$(call check-dev-state-dir)
+
+# Render (when an override is active) and check the Mac dev server's config.
+# A prerequisite of dev-server-restart, so a render that fails stops the
+# restart before the running server is stopped. dev-server-up renders again
+# in its launch shell and checks again there.
+check-dev-config: check-dev-settings
+	@$(dev-mac-config); echo "Dev server config: $$RUN_CONFIG"
 
 dev-server-up: check-dev-settings build
 	@case "$$(uname -s)" in \
@@ -274,9 +329,12 @@ dev-server-up: check-dev-settings build
 	fi
 	@# Select the config: with NO overrides (the default) the committed
 	@# $(DEV_CONFIG) runs untouched — no generation step at all. An override
-	@# (SHED_DEV_STATE_DIR) renders a throwaway variant first; the committed base is never edited. Combined into the
-	@# SAME shell invocation as the nohup launch below (Make starts a fresh
-	@# subshell per recipe line; RUN_CONFIG must survive into the launch line).
+	@# (SHED_DEV_STATE_DIR, SHED_DEV_USERS=itest) renders a throwaway variant
+	@# first; the committed base is never edited. A failed render, or a config
+	@# that is missing or empty, exits here before the launch (dev-mac-config).
+	@# Combined into the SAME shell invocation as the nohup launch below (Make
+	@# starts a fresh subshell per recipe line; RUN_CONFIG must survive into
+	@# the launch line).
 	@#
 	@# Inline env so we don't pollute the caller's launchctl domain
 	@# (and so the brew server's launchctl env is left alone). Note
@@ -284,14 +342,9 @@ dev-server-up: check-dev-settings build
 	@# Makefile-level variable that holds its value is named
 	@# RELEASE_BUILD_TOOLS_REF (because it points at the *release*
 	@# tooling image).
-	@if [ -n "$(strip $(DEV_RENDER_ARGS))" ]; then \
-	  ./scripts/render-dev-config.sh "$(DEV_CONFIG)" "$(DEV_GENERATED_CONFIG)" $(DEV_RENDER_ARGS) \
-	    && RUN_CONFIG="$(DEV_GENERATED_CONFIG)"; \
-	else \
-	  RUN_CONFIG="$(DEV_CONFIG)"; \
-	fi; \
+	@$(dev-mac-config); \
 	SHED_BUILD_TOOLS_REF="$(RELEASE_BUILD_TOOLS_REF)" \
-	  nohup bin/shed-server serve --config "$$RUN_CONFIG" \
+	  nohup $(DEV_SERVER_BIN) serve --config "$$RUN_CONFIG" \
 	    > "$(DEV_LOG_PATH)" 2>&1 & \
 	  echo $$! > "$(DEV_PID_PATH)"
 	@# Readiness probe: scripts/dev-server-probe.sh. Not a CLI probe, which
@@ -319,16 +372,16 @@ dev-server-up: check-dev-settings build
 	esac
 	@echo ""
 	@echo "Dev shed-server up: pid $$(cat $(DEV_PID_PATH))"
-	@if [ -n "$(strip $(DEV_RENDER_ARGS))" ]; then \
+	@if [ -n "$(DEV_RENDER)" ]; then \
 	  echo "  Config:  $(DEV_GENERATED_CONFIG) (generated from $(DEV_CONFIG))"; \
 	else \
 	  echo "  Config:  $(DEV_CONFIG)"; \
 	fi
-	@if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
-	  echo "  State:   $(SHED_DEV_STATE_DIR) (SHED_DEV_STATE_DIR)"; \
+	@if [ -n "$$SHED_DEV_STATE_DIR" ]; then \
+	  echo "  State:   $$SHED_DEV_STATE_DIR (SHED_DEV_STATE_DIR)"; \
 	fi
-	@if [ "$(SHED_DEV_USERS)" = itest ]; then \
-	  echo "  Users:   the itest user list (keys in $(SHED_ITEST_USERS_DIR)); you are user dev"; \
+	@if [ "$$SHED_DEV_USERS" = itest ]; then \
+	  echo "  Users:   the itest user list (keys in $$SHED_ITEST_USERS_DIR); you are user dev"; \
 	fi
 	@echo "  Log:     $(DEV_LOG_PATH)"
 	@echo "  CLI:     shed -s $(SHED_VZ_DEV_SERVER) list"
@@ -409,10 +462,11 @@ dev-server-logs:
 	@tail -F "$(DEV_LOG_PATH)"
 
 # Stop, then start, from the recipe rather than as sibling prerequisites:
-# make runs this recipe only after check-dev-settings has succeeded, so a
-# rejected setting never stops the running server, and the stop finishes
-# before the start begins, whatever -j is.
-dev-server-restart: check-dev-settings
+# make runs this recipe only after check-dev-settings and check-dev-config
+# have succeeded, so a rejected setting or a config that cannot be rendered
+# never stops the running server, and the stop finishes before the start
+# begins, whatever -j is.
+dev-server-restart: check-dev-config
 	@$(MAKE) --no-print-directory dev-server-down
 	@$(MAKE) --no-print-directory dev-server-up
 
@@ -464,7 +518,7 @@ test-integration-dev: check-no-dev-auth-mode build
 	  SHED_IMAGE_HAS_ROOST=vz \
 	  SHED_IMAGE_HAS_CRAZE=vz \
 	  SHED_IMAGE_HAS_HOME_DIRS=vz \
-	  SHED_ITEST_USERS_DIR=$(SHED_ITEST_USERS_DIR) \
+	  SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR" \
 	  $(MAKE) test-integration
 
 # Parallel dev shed-server lifecycle (FC remote).
@@ -532,6 +586,31 @@ FC_DEV_PROXY_PATH ?= /tmp/shed-egress-proxy
 FC_DEV_LOCAL_CONFIG := configs/server.dev-parallel.linux-fc.yaml
 FC_DEV_USERS_CONFIG := $(HOME)/.shed/dev/server.dev-fc.users.yaml
 
+# The local file the FC dev targets upload: the committed config, or, with
+# SHED_DEV_USERS=itest, $(FC_DEV_USERS_CONFIG) rendered from it. Sets
+# RUN_CONFIG; exits the shell when the render fails or the file is missing
+# or empty (dev-check-run-config).
+define dev-fc-config
+if [ "$$SHED_DEV_USERS" = itest ]; then \
+  RUN_CONFIG="$(FC_DEV_USERS_CONFIG)"; \
+  rm -f "$$RUN_CONFIG"; \
+  if ! $(DEV_RENDER_SCRIPT) "$(FC_DEV_LOCAL_CONFIG)" "$$RUN_CONFIG" --users "$$SHED_ITEST_USERS_DIR"; then \
+    rm -f "$$RUN_CONFIG"; \
+    echo "ERROR: rendering the FC dev server config failed (above); not starting shed-server."; \
+    exit 1; \
+  fi; \
+else \
+  RUN_CONFIG="$(FC_DEV_LOCAL_CONFIG)"; \
+fi; \
+$(dev-check-run-config)
+endef
+
+# Render and check the FC dev config. A prerequisite of dev-server-restart-fc,
+# so a render that fails stops the restart before the running server is
+# stopped; dev-server-up-fc renders and checks again before its upload.
+check-dev-config-fc: check-no-dev-auth-mode check-dev-users
+	@$(dev-fc-config); echo "FC dev server config: $$RUN_CONFIG"
+
 # Cross-compile shed-server for the remote host's GOARCH. Detects arch
 # at recipe time via `ssh <host> uname -m`; refuses to silently default
 # (a mismatch here produces a "cannot execute binary" failure later
@@ -578,20 +657,17 @@ dev-server-up-fc: check-no-dev-auth-mode check-dev-users build-fc-remote-server
 	  exit 1; \
 	fi
 	@# Upload the committed (mtls) config: untouched, or with the itest user
-	@# list when SHED_DEV_USERS=itest.
-	@LOCAL_CFG="$(FC_DEV_LOCAL_CONFIG)"; \
-	if [ "$(SHED_DEV_USERS)" = itest ]; then \
-	  ./scripts/render-dev-config.sh "$(FC_DEV_LOCAL_CONFIG)" "$(FC_DEV_USERS_CONFIG)" --users "$(SHED_ITEST_USERS_DIR)" || exit 1; \
-	  LOCAL_CFG="$(FC_DEV_USERS_CONFIG)"; \
-	fi; \
-	echo "Uploading $$LOCAL_CFG..."; \
-	MOUNT_SRCS=$$(grep -E '^[[:space:]]+source:[[:space:]]+/var/lib/shed-dev/mounts/' "$$LOCAL_CFG" | awk '{print $$2}' | tr '\n' ' '); \
+	@# list when SHED_DEV_USERS=itest. A failed render, or a config that is
+	@# missing or empty, exits here before anything is uploaded or started.
+	@$(dev-fc-config); \
+	echo "Uploading $$RUN_CONFIG..."; \
+	MOUNT_SRCS=$$(grep -E '^[[:space:]]+source:[[:space:]]+/var/lib/shed-dev/mounts/' "$$RUN_CONFIG" | awk '{print $$2}' | tr '\n' ' '); \
 	UPLOAD_BIN=/tmp/shed-server-dev.upload.$$$$; \
 	 UPLOAD_CFG=/tmp/shed-server-dev.upload.$$$$.yaml; \
 	 UPLOAD_PROXY=/tmp/shed-egress-proxy-dev.upload.$$$$; \
 	 scp bin/shed-server-fc-remote $(FC_REMOTE_HOST):$$UPLOAD_BIN && \
 	 scp bin/shed-egress-proxy-fc-remote $(FC_REMOTE_HOST):$$UPLOAD_PROXY && \
-	 scp "$$LOCAL_CFG" $(FC_REMOTE_HOST):$$UPLOAD_CFG && \
+	 scp "$$RUN_CONFIG" $(FC_REMOTE_HOST):$$UPLOAD_CFG && \
 	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "set -e; \
 	   sudo install -m 755 $$UPLOAD_BIN $(FC_DEV_BIN_PATH); \
 	   sudo install -m 755 $$UPLOAD_PROXY $(FC_DEV_PROXY_PATH); \
@@ -715,10 +791,11 @@ dev-server-logs-fc:
 	@ssh -t $(FC_REMOTE_HOST) "sudo -n tail -F $(FC_DEV_LOG_PATH)"
 
 # Stop, then start, from the recipe rather than as sibling prerequisites:
-# make runs this recipe only after check-no-dev-auth-mode has succeeded, so a
-# rejected setting never stops the running server, and the stop finishes
-# before the start begins, whatever -j is.
-dev-server-restart-fc: check-no-dev-auth-mode check-dev-users
+# make runs this recipe only after the settings guards and check-dev-config-fc
+# have succeeded, so a rejected setting or a config that cannot be rendered
+# never stops the running server, and the stop finishes before the start
+# begins, whatever -j is.
+dev-server-restart-fc: check-no-dev-auth-mode check-dev-users check-dev-config-fc
 	@$(MAKE) --no-print-directory dev-server-down-fc
 	@$(MAKE) --no-print-directory dev-server-up-fc
 
@@ -797,11 +874,51 @@ case "$$FW_MODE" in \
 esac
 endef
 
+# Render the remote dev server's config from the template, plus the itest
+# user list with SHED_DEV_USERS=itest, into $(REMOTE_DEV_CONFIG). Runs after
+# remote-dev-settings in the same shell (it reads what that sets). Sets
+# RUN_CONFIG; exits the shell when a step fails or the file is missing or
+# empty (dev-check-run-config), leaving no partial config behind.
+define remote-dev-config
+RUN_CONFIG="$(REMOTE_DEV_CONFIG)"; \
+mkdir -p "$(REMOTE_DEV_DIR)"; \
+rm -f "$$RUN_CONFIG" "$$RUN_CONFIG.users"; \
+if ! sed -e "s|@DEV_REMOTE_DIR@|$(REMOTE_DEV_DIR)|g" \
+    -e "s|@SHED_REMOTE_ENV@|$$SHED_REMOTE_ENV|g" \
+    -e "s|@GITHUB_USER@|$$GITHUB_USER|g" \
+    -e "s|@FIREWALL_MODE@|$$FW_MODE|g" \
+    -e "s|@FIREWALL_SETTING@|$$FW_SETTING|g" \
+    "$(REMOTE_DEV_TEMPLATE)" > "$$RUN_CONFIG"; then \
+  rm -f "$$RUN_CONFIG"; \
+  echo "ERROR: rendering $(REMOTE_DEV_TEMPLATE) failed; not starting shed-server."; \
+  exit 1; \
+fi; \
+if [ "$$SHED_DEV_USERS" = itest ]; then \
+  if ! $(DEV_RENDER_SCRIPT) "$$RUN_CONFIG" "$$RUN_CONFIG.users" --users "$$SHED_ITEST_USERS_DIR" \
+      || ! mv "$$RUN_CONFIG.users" "$$RUN_CONFIG"; then \
+    rm -f "$$RUN_CONFIG" "$$RUN_CONFIG.users"; \
+    echo "ERROR: rendering the itest user list into the remote dev config failed (above); not starting shed-server."; \
+    exit 1; \
+  fi; \
+fi; \
+$(dev-check-run-config)
+endef
+
 # The remote dev server's settings guard. A prerequisite of
 # dev-server-up-remote and of dev-server-restart-remote, so bad settings fail
 # before anything is stopped or started.
 check-remote-dev-settings: check-dev-users
 	@$(remote-dev-settings)
+
+# Render and check the remote dev config. A prerequisite of
+# dev-server-restart-remote, so a render that fails stops the restart before
+# the running server is stopped; dev-server-up-remote renders and checks
+# again in its launch shell.
+check-remote-dev-config: check-remote-dev-settings
+	@$(remote-dev-settings); \
+	umask 077; \
+	$(remote-dev-config); \
+	echo "Remote dev server config: $$RUN_CONFIG"
 
 dev-server-up-remote: check-remote-dev-settings build-server build-cli
 	@if [ -f "$(REMOTE_DEV_PID_PATH)" ] && kill -0 "$$(cat $(REMOTE_DEV_PID_PATH))" 2>/dev/null; then \
@@ -821,19 +938,10 @@ dev-server-up-remote: check-remote-dev-settings build-server build-cli
 	@# spaces, which the probe refuses (exit 64) as a malformed first-line.
 	@$(remote-dev-settings); \
 	umask 077; \
-	sed -e "s|@DEV_REMOTE_DIR@|$(REMOTE_DEV_DIR)|g" \
-	    -e "s|@SHED_REMOTE_ENV@|$$SHED_REMOTE_ENV|g" \
-	    -e "s|@GITHUB_USER@|$$GITHUB_USER|g" \
-	    -e "s|@FIREWALL_MODE@|$$FW_MODE|g" \
-	    -e "s|@FIREWALL_SETTING@|$$FW_SETTING|g" \
-	    "$(REMOTE_DEV_TEMPLATE)" > "$(REMOTE_DEV_CONFIG)" || exit 1; \
-	if [ "$(SHED_DEV_USERS)" = itest ]; then \
-	  ./scripts/render-dev-config.sh "$(REMOTE_DEV_CONFIG)" "$(REMOTE_DEV_CONFIG).users" --users "$(SHED_ITEST_USERS_DIR)" \
-	    && mv "$(REMOTE_DEV_CONFIG).users" "$(REMOTE_DEV_CONFIG)" || exit 1; \
-	fi; \
+	$(remote-dev-config); \
 	echo "=== dev-server-up-remote $$(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$(REMOTE_DEV_LOG_PATH)"; \
 	START_LINE=$$(wc -l < "$(REMOTE_DEV_LOG_PATH)" | tr -d '[:space:]'); \
-	nohup bin/shed-server serve --config "$(REMOTE_DEV_CONFIG)" \
+	nohup $(DEV_SERVER_BIN) serve --config "$$RUN_CONFIG" \
 	  >> "$(REMOTE_DEV_LOG_PATH)" 2>&1 & \
 	echo $$! > "$(REMOTE_DEV_PID_PATH)"; \
 	PID=$$(cat "$(REMOTE_DEV_PID_PATH)"); \
@@ -910,10 +1018,11 @@ dev-server-logs-remote:
 	@tail -F "$(REMOTE_DEV_LOG_PATH)"
 
 # Stop, then start, from the recipe rather than as sibling prerequisites: make
-# runs this recipe only after the settings guard and both builds have
-# succeeded, so bad settings or a broken build never stop the running server,
-# and the stop finishes before the start begins, whatever -j is.
-dev-server-restart-remote: check-remote-dev-settings build-server build-cli
+# runs this recipe only after the settings guard, the config render and both
+# builds have succeeded, so bad settings, a config that cannot be rendered or
+# a broken build never stop the running server, and the stop finishes before
+# the start begins, whatever -j is.
+dev-server-restart-remote: check-remote-dev-settings check-remote-dev-config build-server build-cli
 	@$(MAKE) --no-print-directory dev-server-down-remote
 	@$(MAKE) --no-print-directory dev-server-up-remote
 
@@ -941,7 +1050,7 @@ test-integration-remote: build-cli
 	  SHED_REMOTE_SERVER=$(SHED_REMOTE_DEV_SERVER) \
 	  SHED_REMOTE_LOG_PATH=$(REMOTE_DEV_LOG_PATH) \
 	  SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),remote,) \
-	  SHED_ITEST_USERS_DIR=$(SHED_ITEST_USERS_DIR) \
+	  SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR" \
 	  $(MAKE) test-integration
 
 # Root-only proof of the isolated network profile's nftables rules, run on
@@ -1017,7 +1126,7 @@ test-integration-dev-fc: check-no-dev-auth-mode
 	  SHED_IMAGE_HAS_CRAZE=fc \
 	  SHED_IMAGE_HAS_HOME_DIRS=fc \
 	  SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),fc,) \
-	  SHED_ITEST_USERS_DIR=$(SHED_ITEST_USERS_DIR) \
+	  SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR" \
 	  $(MAKE) test-integration
 
 # Cross-compile for release
