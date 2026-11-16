@@ -123,13 +123,48 @@
 //! - `string` reserved (any content, as OpenSSH ignores it);
 //! - `string` signature key: a plain (not certificate) public key passing "Key
 //!   validity";
-//! - `string` signature: exactly a `string` format and a non-empty `string` blob, the
-//!   format a signature algorithm of the signature key's type (`ssh-rsa`,
-//!   `rsa-sha2-256` or `rsa-sha2-512` for RSA; the key's own name otherwise), plus the
-//!   `byte` flags and `uint32` counter `PROTOCOL.u2f` appends for an `sk-` format (a
-//!   CA held on a security key produces those, so a genuine certificate can carry
-//!   them);
+//! - `string` signature: see "The certificate's signature";
 //! - no trailing bytes.
+//!
+//! # The certificate's signature
+//!
+//! The signature field must be exactly what OpenSSH's verifier for the CA key's type
+//! reads (`ssh_*_verify` in `ssh-ed25519.c`, `ssh-ed25519-sk.c`, `ssh-rsa.c`,
+//! `ssh-ecdsa.c`, `ssh-ecdsa-sk.c`, `ssh-dss.c` at `V_9_6_P1`, reached from
+//! `cert_parse` in `sshkey.c`), with nothing trailing anywhere:
+//!
+//! | CA key | `string` format | `string` body | then |
+//! |---|---|---|---|
+//! | `ssh-ed25519` | `ssh-ed25519` | exactly 64 bytes | — |
+//! | `ssh-rsa` | `ssh-rsa`, `rsa-sha2-256` or `rsa-sha2-512` | 1 byte up to the modulus length in bytes | — |
+//! | `ecdsa-sha2-nistp256/384/521` | the key's own name | `mpint r`, `mpint s`: each positive and at most the curve order's length (32, 48, 66 bytes) | — |
+//! | `ssh-dss` | `ssh-dss` | exactly 40 bytes | — |
+//! | `sk-ssh-ed25519@openssh.com` | the key's own name | exactly 64 bytes | `byte` flags, `uint32` counter |
+//! | `sk-ecdsa-sha2-nistp256@openssh.com` | the key's own name | as P-256 above | `byte` flags, `uint32` counter |
+//! | `sk-ecdsa-sha2-nistp256@openssh.com` | `webauthn-sk-ecdsa-sha2-nistp256@openssh.com` | as P-256 above | `byte` flags, `uint32` counter, `string` origin, `string` clientData, `string` extensions (`PROTOCOL.u2f`, "webauthn signatures") |
+//!
+//! Where OpenSSH's PARSER is more lenient than this, it is so only for values its
+//! verification then always fails, so no certificate OpenSSH accepts is refused here:
+//!
+//! - Ed25519 (plain and `sk-`): the parser refuses a body over 64 bytes; a shorter
+//!   one fails the length check after `crypto_sign_ed25519_open` (`mlen != dlen`,
+//!   `mlen != smlen - len`), which holds only for exactly 64.
+//! - RSA: the parser refuses a body longer than the modulus and left-pads a shorter
+//!   one (a genuine signature with leading zero bytes may be sent short, so a short
+//!   body is accepted here); an empty body pads to the value 0, which is never a
+//!   valid signature.
+//! - ECDSA: the mpint reader accepts 0 and values up to 16384 bits; OpenSSL's
+//!   `ECDSA_do_verify` fails unless `1 <= r, s < order`.
+//! - DSA: the parser itself requires exactly 40 bytes.
+//!
+//! The WebAuthn strings are checked as OpenSSH reads them: the origin is a C string
+//! (no NUL, except that `sshbuf_get_cstring` allows one at the very end), and
+//! `webauthn_check_prepare_hash` refuses, as a format error, an origin holding `"`,
+//! flags with attested credential data (`0x40`) set, and the extension-data flag
+//! (`0x80`) disagreeing with whether the extensions string is empty. clientData and
+//! the extensions are otherwise any bytes. Not checked: that clientData begins with
+//! the preamble naming the signed bytes (base64url) as its challenge, which ties the
+//! signature to the certificate and so is part of verifying it.
 //!
 //! **The CA signature is NOT verified.** The rule is that the field is a well-formed
 //! host key, not that it is trusted: the server already proved to the client that it
@@ -157,8 +192,11 @@
 //! - both bits set is refused in either shape (no genuine client sets both).
 //!
 //! Other bits are left alone, and for every other key type the flags pass through
-//! unchanged, as the broker passes them today (the backend refuses an RSA hash bit on
-//! a non-RSA key). A flags mismatch is refused as [`RefusalClass::UnparseableData`]:
+//! unchanged, as the broker passes them today. They cannot change what is signed with
+//! a non-RSA key: the local-keys backend refuses an RSA hash bit on one, and the
+//! agent-forward backend passes the flags on to the agent unchanged, where OpenSSH's
+//! `ssh-agent` ignores the RSA hash bits for a non-RSA key (`agent_decode_alg`). A
+//! flags mismatch is refused as [`RefusalClass::UnparseableData`]:
 //! the (data, flags) pair is not exactly one of the two shapes, which is what that
 //! class means; the detail names the rule.
 //!
@@ -234,6 +272,18 @@ const MAX_MPINT_BYTES: usize = 16384 / 8;
 /// OpenSSH's `SSHKEY_CERT_MAX_PRINCIPALS`.
 const MAX_CERT_PRINCIPALS: usize = 256;
 const CERT_SUFFIX: &[u8] = b"-cert-v01@openssh.com";
+/// `crypto_sign_ed25519_BYTES`.
+const ED25519_SIGNATURE_LEN: usize = 64;
+/// OpenSSH's DSA `SIGBLOB_LEN`: `r` and `s`, 20 bytes each.
+const DSA_SIGNATURE_LEN: usize = 40;
+/// The WebAuthn signature format of an `sk-ecdsa-sha2-nistp256@openssh.com` key
+/// (`PROTOCOL.u2f`, "webauthn signatures").
+const WEBAUTHN_SK_ECDSA: &[u8] = b"webauthn-sk-ecdsa-sha2-nistp256@openssh.com";
+/// WebAuthn authenticator-data flags OpenSSH's `webauthn_check_prepare_hash` reads:
+/// attested credential data (must be clear) and extension data (set exactly when
+/// the extensions string is non-empty).
+const WEBAUTHN_FLAG_AD: u8 = 0x40;
+const WEBAUTHN_FLAG_ED: u8 = 0x80;
 
 /// Why a sign request was refused — the class the audit records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -721,10 +771,20 @@ fn check_ecdsa_point(key_type: KeyType, point: &[u8]) -> KeyResult<()> {
     Ok(())
 }
 
+/// A key that passed "Key validity", with what its signatures' check needs.
+#[derive(Debug, Clone, Copy)]
+struct ValidKey {
+    key_type: KeyType,
+    /// For RSA, the modulus length in bytes (OpenSSH's `RSA_size`): the longest
+    /// signature the key makes. 0 for every other type.
+    rsa_modulus_len: usize,
+}
+
 /// Read and validate the fields of a `key_type` key that follow its type name (the
 /// same fields in a plain key and in a certificate, after the nonce). See the module
 /// doc's "Key validity".
-fn read_key_body(r: &mut Reader<'_>, key_type: KeyType) -> KeyResult<()> {
+fn read_key_body(r: &mut Reader<'_>, key_type: KeyType) -> KeyResult<ValidKey> {
+    let mut rsa_modulus_len = 0;
     match key_type {
         KeyType::Ed25519 | KeyType::SkEd25519 => {
             if read_string(r)?.len() != 32 {
@@ -740,6 +800,7 @@ fn read_key_body(r: &mut Reader<'_>, key_type: KeyType) -> KeyResult<()> {
             if bit_len(n) < RSA_MIN_MODULUS_BITS {
                 return Err("RSA modulus is under 1024 bits");
             }
+            rsa_modulus_len = n.len();
         }
         KeyType::EcdsaP256 | KeyType::EcdsaP384 | KeyType::EcdsaP521 | KeyType::SkEcdsaP256 => {
             let curve = read_string(r)?;
@@ -763,19 +824,22 @@ fn read_key_body(r: &mut Reader<'_>, key_type: KeyType) -> KeyResult<()> {
     {
         return Err("security-key application contains NUL");
     }
-    Ok(())
+    Ok(ValidKey {
+        key_type,
+        rsa_modulus_len,
+    })
 }
 
 /// Parse `blob` as a valid plain (not certificate) public key of any recognised
 /// type, with nothing trailing.
-fn parse_plain_key(blob: &[u8]) -> KeyResult<KeyType> {
+fn parse_plain_key(blob: &[u8]) -> KeyResult<ValidKey> {
     let mut r = Reader::new(blob);
     let key_type = KeyType::from_name(read_string(&mut r)?).ok_or("unknown key type")?;
-    read_key_body(&mut r, key_type)?;
+    let key = read_key_body(&mut r, key_type)?;
     if !r.exhausted() {
         return Err("trailing bytes");
     }
-    Ok(key_type)
+    Ok(key)
 }
 
 /// The key to sign with: valid, of a type the broker signs with, and decoded by
@@ -795,7 +859,8 @@ fn signing_key_type(public_key: &[u8]) -> Result<KeyType, Refusal> {
         }
     }
     let key_type = parse_plain_key(public_key)
-        .map_err(|why| Refusal::malformed_key(format!("invalid key: {why}")))?;
+        .map_err(|why| Refusal::malformed_key(format!("invalid key: {why}")))?
+        .key_type;
     let decoded = PublicKey::from_bytes(public_key)
         .map_err(|_| Refusal::malformed_key("not an SSH public key".to_string()))?;
     if decoded.to_bytes().ok().as_deref() != Some(public_key) {
@@ -842,20 +907,72 @@ fn name_data_pairs(field: &[u8]) -> KeyResult<()> {
     Ok(())
 }
 
-/// A certificate's signature field, made by a `ca` key: exactly a format the key
-/// produces and a non-empty blob, plus an `sk-` format's flags byte and counter.
-fn check_signature(blob: &[u8], ca: KeyType) -> KeyResult<()> {
+/// The body of an ECDSA signature (RFC 5656 §3.1.2): exactly `mpint r`, `mpint s`,
+/// each positive and no longer than the curve order (`order_len` bytes).
+fn check_ecdsa_signature(body: &[u8], order_len: usize) -> KeyResult<()> {
+    let mut r = Reader::new(body);
+    for _ in 0..2 {
+        if read_positive_mpint(&mut r)?.len() > order_len {
+            return Err("ECDSA signature value is longer than the curve order");
+        }
+    }
+    if !r.exhausted() {
+        return Err("trailing bytes in the ECDSA signature");
+    }
+    Ok(())
+}
+
+/// A certificate's signature field, made by the `ca` key (module doc, "The
+/// certificate's signature"): a format the key produces, a body of that format's
+/// encoding and size, the flags byte and counter of an `sk-` format, and the three
+/// WebAuthn strings of the WebAuthn format; nothing else. Not verified.
+fn check_signature(blob: &[u8], ca: ValidKey) -> KeyResult<()> {
     let mut r = Reader::new(blob);
     let format = read_string(&mut r)?;
-    if !ca.signs_as(format) {
+    let webauthn = ca.key_type == KeyType::SkEcdsaP256 && format == WEBAUTHN_SK_ECDSA;
+    if !webauthn && !ca.key_type.signs_as(format) {
         return Err("signature format does not fit the CA key");
     }
-    if read_string(&mut r)?.is_empty() {
-        return Err("empty signature");
+    let body = read_string(&mut r)?;
+    match ca.key_type {
+        KeyType::Ed25519 | KeyType::SkEd25519 => {
+            if body.len() != ED25519_SIGNATURE_LEN {
+                return Err("Ed25519 signature is not 64 bytes");
+            }
+        }
+        KeyType::Rsa => {
+            if body.is_empty() || body.len() > ca.rsa_modulus_len {
+                return Err("RSA signature is empty or longer than the modulus");
+            }
+        }
+        KeyType::EcdsaP256 | KeyType::SkEcdsaP256 => check_ecdsa_signature(body, 32)?,
+        KeyType::EcdsaP384 => check_ecdsa_signature(body, 48)?,
+        KeyType::EcdsaP521 => check_ecdsa_signature(body, 66)?,
+        KeyType::Dsa => {
+            if body.len() != DSA_SIGNATURE_LEN {
+                return Err("DSA signature is not 40 bytes");
+            }
+        }
     }
-    if matches!(ca, KeyType::SkEd25519 | KeyType::SkEcdsaP256) {
-        r.u8().map_err(|_| "truncated")?;
-        r.u32().map_err(|_| "truncated")?;
+    if matches!(ca.key_type, KeyType::SkEd25519 | KeyType::SkEcdsaP256) {
+        let flags = r.u8().map_err(|_| "truncated")?;
+        r.u32().map_err(|_| "truncated")?; // counter
+        if webauthn {
+            let origin = read_string(&mut r)?;
+            read_string(&mut r)?; // clientData
+            let extensions = read_string(&mut r)?;
+            // A C string, as `sshbuf_get_cstring` reads it: one NUL allowed at the end.
+            let origin = origin.strip_suffix(&[0]).unwrap_or(origin);
+            if origin.contains(&0) || origin.contains(&b'"') {
+                return Err("WebAuthn origin contains NUL or a quote");
+            }
+            if flags & WEBAUTHN_FLAG_AD != 0 {
+                return Err("WebAuthn flags claim attested credential data");
+            }
+            if (flags & WEBAUTHN_FLAG_ED != 0) == extensions.is_empty() {
+                return Err("WebAuthn extensions flag does not match the extensions");
+            }
+        }
     }
     if !r.exhausted() {
         return Err("trailing bytes in the signature");
@@ -875,7 +992,7 @@ fn parse_certificate(blob: &[u8]) -> KeyResult<KeyType> {
     let u32_ = |r: &mut Reader<'_>| r.u32().map_err(|_| "truncated");
     let u64_ = |r: &mut Reader<'_>| r.u64().map_err(|_| "truncated");
     read_string(&mut r)?; // nonce
-    read_key_body(&mut r, key_type)?;
+    read_key_body(&mut r, key_type)?; // the certified key
     u64_(&mut r)?; // serial
     if !matches!(u32_(&mut r)?, 1 | 2) {
         return Err("certificate type is not user or host");
@@ -1097,7 +1214,7 @@ mod tests {
     //! field layout. It shares the `Reader`, the production key decoder and the
     //! production host-key and certificate walk (`host_key_parses`), so it cannot catch
     //! a gap in those: key and certificate validity are covered by the targeted tests
-    //! under "key validity" and "the host key" instead.
+    //! under "key validity", "the host key" and "the certificate's signature" instead.
 
     use super::*;
     use crate::ssh_backend::SshKeyInfo;
@@ -2950,9 +3067,16 @@ mod tests {
     /// before, 9 critical options, 10 extensions, 11 reserved, 12 signature key,
     /// 13 signature.
     fn split_ed25519_cert(blob: &[u8]) -> Vec<F> {
+        split_cert(blob, 1)
+    }
+
+    /// Split a certificate whose certified key has `key_fields` fields (the
+    /// signature is always the last field).
+    fn split_cert(blob: &[u8], key_fields: usize) -> Vec<F> {
         let mut r = Reader::new(blob);
         let mut out = Vec::new();
-        for kind in "SSSQWSSQQSSSSS".bytes() {
+        let layout = format!("SS{}QWSSQQSSSSS", "S".repeat(key_fields));
+        for kind in layout.bytes() {
             out.push(match kind {
                 b'S' => F::S(r.string().unwrap().to_vec()),
                 b'Q' => F::Q(r.u64().unwrap()),
@@ -3177,6 +3301,1056 @@ mod tests {
         assert_eq!(host_key_verdict(&cert), None);
         cert[142] = 1;
         assert_eq!(host_key_verdict(&cert), UNPARSEABLE);
+    }
+
+    // ----- the certificate's signature: genuine certificates built here -----
+    //
+    // Every CA below is a THROWAWAY key made in this test from a fixed seed (or, for
+    // RSA, from a fixed-seed generator), never a real key, and each certificate is
+    // genuinely signed by it as OpenSSH signs and verifies (`ssh_*_sign`/`_verify`
+    // at `V_9_6_P1`). The parser does not verify signatures; they are genuine so
+    // that each malformation below is paired with a signature OpenSSH accepts.
+
+    /// The CA signature formats, one per CA key type and format.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum CaSig {
+        Ed25519,
+        Rsa(&'static str),
+        P256,
+        P384,
+        P521,
+        SkEd25519,
+        SkP256,
+        /// `webauthn-sk-ecdsa-sha2-nistp256@openssh.com` by the `SkP256` CA, with
+        /// these authenticator flags and extensions.
+        WebAuthn {
+            flags: u8,
+            extensions: &'static [u8],
+        },
+    }
+
+    const CA_SIGS: [CaSig; 11] = [
+        CaSig::Ed25519,
+        CaSig::Rsa("ssh-rsa"),
+        CaSig::Rsa("rsa-sha2-256"),
+        CaSig::Rsa("rsa-sha2-512"),
+        CaSig::P256,
+        CaSig::P384,
+        CaSig::P521,
+        CaSig::SkEd25519,
+        CaSig::SkP256,
+        CaSig::WebAuthn {
+            flags: 0x01,
+            extensions: b"",
+        },
+        CaSig::WebAuthn {
+            flags: 0x81,
+            extensions: b"\xa0",
+        },
+    ];
+
+    const SK_APPLICATION: &[u8] = b"ssh:";
+    const WEBAUTHN_ORIGIN: &[u8] = b"https://ca.example";
+
+    /// The throwaway RSA CA: 1025 bits, so its modulus is not a whole number of
+    /// bytes and its signatures are 129 bytes. Generated once per test process from
+    /// a fixed seed.
+    fn rsa_ca() -> &'static rsa::RsaPrivateKey {
+        static KEY: std::sync::OnceLock<rsa::RsaPrivateKey> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| rsa::RsaPrivateKey::new(&mut Rng(0x0035_c19b_5eed_0001), 1025).unwrap())
+    }
+
+    /// A throwaway Ed25519 key from a one-byte seed.
+    fn throwaway_ed25519(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn ed25519_ca() -> ed25519_dalek::SigningKey {
+        throwaway_ed25519(0x19)
+    }
+
+    fn p256_ca() -> p256::ecdsa::SigningKey {
+        p256::ecdsa::SigningKey::from_slice(&[0x25; 32]).unwrap()
+    }
+
+    /// A positive `mpint` for a big-endian magnitude (leading zeros dropped).
+    fn mpint_of(be: &[u8]) -> Vec<u8> {
+        let start = be.iter().position(|&b| b != 0).unwrap_or(be.len());
+        mpint(&be[start..])
+    }
+
+    fn rsa_public_blob(key: &rsa::RsaPrivateKey) -> Vec<u8> {
+        use rsa::traits::PublicKeyParts;
+        rsa_blob_raw(
+            &mpint_of(&key.e().to_bytes_be()),
+            &mpint_of(&key.n().to_bytes_be()),
+        )
+    }
+
+    fn ed25519_blob_of(
+        name: &[u8],
+        key: &ed25519_dalek::SigningKey,
+        app: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let mut b = Vec::new();
+        put_string(&mut b, name);
+        put_string(&mut b, key.verifying_key().as_bytes());
+        if let Some(app) = app {
+            put_string(&mut b, app);
+        }
+        b
+    }
+
+    /// An ECDSA signature body: `mpint r`, `mpint s` from their big-endian bytes.
+    fn ecdsa_body(r: &[u8], s: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        put_string(&mut b, &mpint_of(r));
+        put_string(&mut b, &mpint_of(s));
+        b
+    }
+
+    /// A CA signature, field by field: `string` format, `string` body, then the
+    /// rest (`sk-` flags and counter, WebAuthn strings).
+    #[derive(Clone, Debug)]
+    struct SigParts {
+        format: Vec<u8>,
+        body: Vec<u8>,
+        tail: Vec<u8>,
+    }
+
+    impl SigParts {
+        fn encode(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            put_string(&mut out, &self.format);
+            put_string(&mut out, &self.body);
+            out.extend_from_slice(&self.tail);
+            out
+        }
+    }
+
+    impl CaSig {
+        /// The CA's public key blob.
+        fn ca_blob(self) -> Vec<u8> {
+            match self {
+                CaSig::Ed25519 => ed25519_blob_of(b"ssh-ed25519", &ed25519_ca(), None),
+                CaSig::Rsa(_) => rsa_public_blob(rsa_ca()),
+                CaSig::P256 => ecdsa_blob_raw(
+                    "ecdsa-sha2-nistp256",
+                    "nistp256",
+                    p256_ca().verifying_key().to_encoded_point(false).as_bytes(),
+                ),
+                CaSig::P384 => ecdsa_blob_raw(
+                    "ecdsa-sha2-nistp384",
+                    "nistp384",
+                    p384_ca().verifying_key().to_encoded_point(false).as_bytes(),
+                ),
+                CaSig::P521 => ecdsa_blob_raw(
+                    "ecdsa-sha2-nistp521",
+                    "nistp521",
+                    p521::ecdsa::VerifyingKey::from(&p521_ca())
+                        .to_encoded_point(false)
+                        .as_bytes(),
+                ),
+                CaSig::SkEd25519 => ed25519_blob_of(
+                    b"sk-ssh-ed25519@openssh.com",
+                    &ed25519_ca(),
+                    Some(SK_APPLICATION),
+                ),
+                CaSig::SkP256 | CaSig::WebAuthn { .. } => sk_ecdsa_blob(
+                    p256_ca().verifying_key().to_encoded_point(false).as_bytes(),
+                    SK_APPLICATION,
+                ),
+            }
+        }
+
+        /// A genuine signature by this CA over `t` (the certificate up to its
+        /// signature field), as OpenSSH makes and verifies it.
+        fn sign(self, t: &[u8]) -> SigParts {
+            // One `signature::Signer` trait serves ed25519-dalek, p256/384/521 and rsa.
+            use ed25519_dalek::Signer as _;
+            use rsa::signature::SignatureEncoding as _;
+            let sha256 = |b: &[u8]| Sha256::digest(b).to_vec();
+            let p256_body = |msg: &[u8]| {
+                let sig: p256::ecdsa::Signature = p256_ca().sign(msg);
+                let (r, s) = sig.split_bytes();
+                ecdsa_body(&r, &s)
+            };
+            // `PROTOCOL.u2f`: an sk- key signs SHA-256(application) ‖ flags ‖
+            // counter ‖ [WebAuthn extensions] ‖ SHA-256(message).
+            let counter = 3u32.to_be_bytes();
+            let sk_signed = |flags: u8, extensions: &[u8], message_hash: &[u8]| {
+                let mut m = sha256(SK_APPLICATION);
+                m.push(flags);
+                m.extend_from_slice(&counter);
+                m.extend_from_slice(extensions);
+                m.extend_from_slice(message_hash);
+                m
+            };
+            let (format, body, tail): (&[u8], Vec<u8>, Vec<u8>) = match self {
+                CaSig::Ed25519 => (
+                    b"ssh-ed25519",
+                    ed25519_ca().sign(t).to_bytes().to_vec(),
+                    vec![],
+                ),
+                CaSig::Rsa(format) => {
+                    let key = rsa_ca().clone();
+                    let body = match format {
+                        "ssh-rsa" => rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(key)
+                            .sign(t)
+                            .to_vec(),
+                        "rsa-sha2-256" => rsa::pkcs1v15::SigningKey::<Sha256>::new(key)
+                            .sign(t)
+                            .to_vec(),
+                        _ => rsa::pkcs1v15::SigningKey::<sha2::Sha512>::new(key)
+                            .sign(t)
+                            .to_vec(),
+                    };
+                    (format.as_bytes(), body, vec![])
+                }
+                CaSig::P256 => (b"ecdsa-sha2-nistp256", p256_body(t), vec![]),
+                CaSig::P384 => {
+                    let sig: p384::ecdsa::Signature = p384_ca().sign(t);
+                    let (r, s) = sig.split_bytes();
+                    (b"ecdsa-sha2-nistp384", ecdsa_body(&r, &s), vec![])
+                }
+                CaSig::P521 => {
+                    let sig: p521::ecdsa::Signature = p521_ca().sign(t);
+                    let (r, s) = sig.split_bytes();
+                    (b"ecdsa-sha2-nistp521", ecdsa_body(&r, &s), vec![])
+                }
+                CaSig::SkEd25519 => {
+                    let flags = 0x01;
+                    let sig = ed25519_ca().sign(&sk_signed(flags, b"", &sha256(t)));
+                    let mut tail = vec![flags];
+                    tail.extend_from_slice(&counter);
+                    (b"sk-ssh-ed25519@openssh.com", sig.to_bytes().to_vec(), tail)
+                }
+                CaSig::SkP256 => {
+                    let flags = 0x01;
+                    let body = p256_body(&sk_signed(flags, b"", &sha256(t)));
+                    let mut tail = vec![flags];
+                    tail.extend_from_slice(&counter);
+                    (b"sk-ecdsa-sha2-nistp256@openssh.com", body, tail)
+                }
+                CaSig::WebAuthn { flags, extensions } => {
+                    let client_data = webauthn_client_data(t, WEBAUTHN_ORIGIN);
+                    let body = p256_body(&sk_signed(flags, extensions, &sha256(&client_data)));
+                    let mut tail = vec![flags];
+                    tail.extend_from_slice(&counter);
+                    put_string(&mut tail, WEBAUTHN_ORIGIN);
+                    put_string(&mut tail, &client_data);
+                    put_string(&mut tail, extensions);
+                    (WEBAUTHN_SK_ECDSA, body, tail)
+                }
+            };
+            SigParts {
+                format: format.to_vec(),
+                body,
+                tail,
+            }
+        }
+    }
+
+    fn p384_ca() -> p384::ecdsa::SigningKey {
+        p384::ecdsa::SigningKey::from_slice(&[0x38; 48]).unwrap()
+    }
+
+    fn p521_ca() -> p521::ecdsa::SigningKey {
+        p521::ecdsa::SigningKey::from_slice(&[0x01; 66]).unwrap()
+    }
+
+    /// The clientData a WebAuthn client signs for `t` (`webauthn_check_prepare_hash`'s
+    /// preamble, nothing after it).
+    fn webauthn_client_data(t: &[u8], origin: &[u8]) -> Vec<u8> {
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(t);
+        let mut c =
+            format!("{{\"type\":\"webauthn.get\",\"challenge\":\"{challenge}\",\"origin\":\"")
+                .into_bytes();
+        c.extend_from_slice(origin);
+        c.extend_from_slice(b"\"}");
+        c
+    }
+
+    /// The certificate of `certified` (a plain key blob) up to its signature field,
+    /// with `ca_blob` as the signature key: a host certificate, valid forever.
+    fn cert_tbs(certified: &[u8], ca_blob: &[u8]) -> Vec<u8> {
+        let name = Reader::new(certified).string().unwrap();
+        let base = name.strip_suffix(b"@openssh.com").unwrap_or(name);
+        let mut out = Vec::new();
+        put_string(&mut out, &[base, CERT_SUFFIX].concat());
+        put_string(&mut out, &[0x5a; 32]); // nonce
+        out.extend_from_slice(&certified[4 + name.len()..]); // the key's fields
+        out.extend_from_slice(&7u64.to_be_bytes()); // serial
+        out.extend_from_slice(&2u32.to_be_bytes()); // host
+        put_string(&mut out, b"throwaway host");
+        put_string(&mut out, &strings(&[b"host.example"]));
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(&u64::MAX.to_be_bytes());
+        put_string(&mut out, b""); // critical options
+        put_string(&mut out, b""); // extensions
+        put_string(&mut out, b""); // reserved
+        put_string(&mut out, ca_blob);
+        out
+    }
+
+    /// `tbs` with its signature field.
+    fn with_signature(tbs: &[u8], signature: &[u8]) -> Vec<u8> {
+        let mut out = tbs.to_vec();
+        put_string(&mut out, signature);
+        out
+    }
+
+    /// A genuine host certificate of `certified`, signed by `ca`.
+    fn genuine_cert(certified: &[u8], ca: CaSig) -> Vec<u8> {
+        let tbs = cert_tbs(certified, &ca.ca_blob());
+        with_signature(&tbs, &ca.sign(&tbs).encode())
+    }
+
+    /// A structurally valid `ssh-dss` key: `p` 1024 bits, `q` 160 bits, `g`, `y`
+    /// positive. (DSA cannot be generated here without a new dependency; DSA is
+    /// checked structurally only, so the values need not form a real group.)
+    fn dsa_blob() -> Vec<u8> {
+        let mut p = vec![0xc5; 128];
+        p[127] |= 1;
+        let mut q = vec![0xd3; 20];
+        q[19] |= 1;
+        let mut b = Vec::new();
+        put_string(&mut b, b"ssh-dss");
+        put_string(&mut b, &mpint(&p));
+        put_string(&mut b, &mpint(&q));
+        put_string(&mut b, &mpint(&[0x02; 128]));
+        put_string(&mut b, &mpint(&[0x03; 128]));
+        b
+    }
+
+    /// One plain key of every type, as the key a certificate certifies.
+    fn certified_keys() -> Vec<(&'static str, Vec<u8>)> {
+        let p256 = ec_point("nistp256");
+        vec![
+            (
+                "ssh-ed25519",
+                ed25519_blob_of(b"ssh-ed25519", &throwaway_ed25519(0x44), None),
+            ),
+            ("ssh-rsa (1025 bits, genuine)", rsa_public_blob(rsa_ca())),
+            ("ssh-dss", dsa_blob()),
+            ("ecdsa-sha2-nistp256", ecdsa_blob("nistp256")),
+            ("ecdsa-sha2-nistp384", ecdsa_blob("nistp384")),
+            ("ecdsa-sha2-nistp521", ecdsa_blob("nistp521")),
+            ("sk-ssh-ed25519", sk_ed25519_blob(SK_APPLICATION)),
+            (
+                "sk-ecdsa-sha2-nistp256",
+                sk_ecdsa_blob(&p256, SK_APPLICATION),
+            ),
+        ]
+    }
+
+    #[test]
+    fn genuine_certificates_of_every_key_type_by_every_ca_signature_are_host_keys() {
+        let mut checked = 0;
+        for (label, certified) in certified_keys() {
+            for ca in CA_SIGS {
+                let cert = genuine_cert(&certified, ca);
+                assert_eq!(host_key_verdict(&cert), None, "{label} by {ca:?}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 8 * 11);
+    }
+
+    #[test]
+    fn the_reviewers_65_byte_ed25519_signature_is_refused() {
+        // S("ssh-ed25519") || S(65 zero bytes) as the signature of the recorded host
+        // certificate, in the recorded host-bound login that carried it (its key and
+        // flags 0 kept), and of the security-key host certificate. OpenSSH: "invalid
+        // format".
+        let bad_sig = strings(&[b"ssh-ed25519", &[0; 65]]);
+        let v = logins()
+            .into_iter()
+            .find(|v| v.name == "login-ed25519-hostbound-hostcert")
+            .expect("the recorded certificate login");
+        assert_eq!(v.flags, 0);
+        let mut c = split_ed25519_cert(&host_certificate());
+        let mut l = Login::split(&v.data);
+        assert_eq!(l.extra, vec![host_certificate()]);
+        assert_eq!(verdict_flags(&git_and_deploy(), &v.key, &v.data, 0), None);
+        c[13] = F::S(bad_sig.clone());
+        l.extra = vec![encode_cert(&c)];
+        assert_eq!(
+            verdict_flags(&git_and_deploy(), &v.key, &l.encode(), 0),
+            UNPARSEABLE
+        );
+
+        // sk-ssh-ed25519: two key fields (the key, the application).
+        let mut sk = split_cert(&b64(SK_HOST_CERT_B64), 2);
+        assert_eq!(host_key_verdict(&encode_cert(&sk)), None);
+        *sk.last_mut().unwrap() = F::S(bad_sig);
+        assert_eq!(host_key_verdict(&encode_cert(&sk)), UNPARSEABLE);
+    }
+
+    type BodyMutation = (&'static str, fn(&mut SigParts), Option<RefusalClass>);
+
+    /// Malformations of an Ed25519 or `sk-ssh-ed25519` signature.
+    const ED25519_BODY_MUTATIONS: &[BodyMutation] = &[
+        ("genuine", |_| {}, None),
+        (
+            "63 bytes",
+            |s| {
+                s.body.pop();
+            },
+            UNPARSEABLE,
+        ),
+        ("65 bytes", |s| s.body.push(0), UNPARSEABLE),
+        ("empty", |s| s.body.clear(), UNPARSEABLE),
+        ("a trailing byte", |s| s.tail.push(0), UNPARSEABLE),
+    ];
+
+    /// Malformations of an ECDSA (or `sk-ecdsa`, WebAuthn) signature body.
+    const ECDSA_BODY_MUTATIONS: &[BodyMutation] = &[
+        ("genuine", |_| {}, None),
+        (
+            "r and s swapped (well formed, not verified)",
+            |s| {
+                let mut r = Reader::new(&s.body);
+                let (a, b) = (r.string().unwrap().to_vec(), r.string().unwrap().to_vec());
+                s.body = strings(&[&b, &a]);
+            },
+            None,
+        ),
+        (
+            "one mpint",
+            |s| {
+                let r = Reader::new(&s.body).string().unwrap().to_vec();
+                s.body = strings(&[&r]);
+            },
+            UNPARSEABLE,
+        ),
+        (
+            "three mpints",
+            |s| {
+                let r = Reader::new(&s.body).string().unwrap().to_vec();
+                put_string(&mut s.body, &r);
+            },
+            UNPARSEABLE,
+        ),
+        (
+            "a trailing byte in the body",
+            |s| s.body.push(1),
+            UNPARSEABLE,
+        ),
+        (
+            "the 65 zero bytes of the reviewer's case",
+            |s| s.body = vec![0; 65],
+            UNPARSEABLE,
+        ),
+        ("empty", |s| s.body.clear(), UNPARSEABLE),
+        (
+            "r zero (empty mpint)",
+            |s| {
+                let mut r = Reader::new(&s.body);
+                r.string().unwrap();
+                let sv = r.string().unwrap().to_vec();
+                s.body = strings(&[b"", &sv]);
+            },
+            UNPARSEABLE,
+        ),
+        (
+            "s zero (one zero byte)",
+            |s| {
+                let rv = Reader::new(&s.body).string().unwrap().to_vec();
+                s.body = strings(&[&rv, &[0]]);
+            },
+            UNPARSEABLE,
+        ),
+        (
+            "r negative",
+            |s| {
+                let mut r = Reader::new(&s.body);
+                r.string().unwrap();
+                let sv = r.string().unwrap().to_vec();
+                s.body = strings(&[&[0x80, 1], &sv]);
+            },
+            UNPARSEABLE,
+        ),
+        (
+            "r one byte longer than the curve order",
+            |s| {
+                let mut r = Reader::new(&s.body);
+                let rv = r.string().unwrap();
+                let sv = r.string().unwrap().to_vec();
+                let mut long = vec![1u8];
+                long.extend_from_slice(rv.strip_prefix(&[0]).unwrap_or(rv));
+                long.resize(order_len_of(&s.format) + 1, 7);
+                s.body = strings(&[&long, &sv]);
+            },
+            UNPARSEABLE,
+        ),
+        (
+            "r as long as the curve order",
+            |s| {
+                let mut r = Reader::new(&s.body);
+                r.string().unwrap();
+                let sv = r.string().unwrap().to_vec();
+                s.body = strings(&[&mpint(&vec![0x7f; order_len_of(&s.format)]), &sv]);
+            },
+            None,
+        ),
+    ];
+
+    /// The curve order's length in bytes for an ECDSA signature format.
+    fn order_len_of(format: &[u8]) -> usize {
+        match format {
+            b"ecdsa-sha2-nistp384" => 48,
+            b"ecdsa-sha2-nistp521" => 66,
+            _ => 32,
+        }
+    }
+
+    /// Malformations of the flags and counter of an `sk-` signature.
+    const SK_TAIL_MUTATIONS: &[BodyMutation] = &[
+        ("no counter", |s| s.tail.truncate(1), UNPARSEABLE),
+        ("no flags or counter", |s| s.tail.clear(), UNPARSEABLE),
+        (
+            "counter one byte short",
+            |s| s.tail.truncate(4),
+            UNPARSEABLE,
+        ),
+    ];
+
+    /// Every RSA signature format's malformations (the CA modulus is 1025 bits, so
+    /// a signature is at most 129 bytes).
+    const RSA_BODY_MUTATIONS: &[BodyMutation] = &[
+        ("genuine", |_| {}, None),
+        (
+            "one byte shorter (OpenSSH left-pads it)",
+            |s| {
+                s.body.remove(0);
+            },
+            None,
+        ),
+        ("one byte", |s| s.body.truncate(1), None),
+        (
+            "one byte longer than the modulus",
+            |s| s.body.insert(0, 0),
+            UNPARSEABLE,
+        ),
+        ("empty", |s| s.body.clear(), UNPARSEABLE),
+        ("a trailing byte", |s| s.tail.push(0), UNPARSEABLE),
+        (
+            "an sk- flags and counter",
+            |s| s.tail.extend_from_slice(&[1, 0, 0, 0, 3]),
+            UNPARSEABLE,
+        ),
+    ];
+
+    /// The verdict on a certificate of `certified` by `ca`, its genuine signature
+    /// changed by `mutate`.
+    fn signature_verdict(
+        certified: &[u8],
+        ca: CaSig,
+        mutate: fn(&mut SigParts),
+    ) -> Option<RefusalClass> {
+        let tbs = cert_tbs(certified, &ca.ca_blob());
+        let mut sig = ca.sign(&tbs);
+        mutate(&mut sig);
+        host_key_verdict(&with_signature(&tbs, &sig.encode()))
+    }
+
+    #[test]
+    fn signature_bodies_must_have_their_formats_encoding_and_size() {
+        let certified = ed25519_blob_of(b"ssh-ed25519", &throwaway_ed25519(0x44), None);
+        let mut ran = 0;
+        let mut run = |ca: CaSig, table: &[BodyMutation]| {
+            for (label, mutate, want) in table {
+                assert_eq!(
+                    signature_verdict(&certified, ca, *mutate),
+                    *want,
+                    "{ca:?}: {label}"
+                );
+                ran += 1;
+            }
+        };
+        run(CaSig::Ed25519, ED25519_BODY_MUTATIONS);
+        run(CaSig::SkEd25519, ED25519_BODY_MUTATIONS);
+        run(CaSig::SkEd25519, SK_TAIL_MUTATIONS);
+        for format in ["ssh-rsa", "rsa-sha2-256", "rsa-sha2-512"] {
+            run(CaSig::Rsa(format), RSA_BODY_MUTATIONS);
+        }
+        for ca in [CaSig::P256, CaSig::P384, CaSig::P521, CaSig::SkP256] {
+            run(ca, ECDSA_BODY_MUTATIONS);
+        }
+        run(CaSig::SkP256, SK_TAIL_MUTATIONS);
+        assert!(ran > 80, "{ran}");
+    }
+
+    #[test]
+    fn rsa_signatures_are_bounded_by_the_modulus_as_written_not_by_whole_bytes() {
+        // The 1025-bit CA's modulus is 129 bytes; a 2048-bit CA's is 256. The
+        // bound is the modulus length, so a 129-byte body passes under the first
+        // and a 257-byte one fails under the second.
+        use rsa::traits::PublicKeyParts;
+        assert_eq!(rsa_ca().n().bits(), 1025);
+        let certified = ecdsa_blob("nistp256");
+        let tbs = cert_tbs(&certified, &rsa_blob(2048));
+        for (len, want) in [(1, None), (256, None), (257, UNPARSEABLE)] {
+            let sig = strings(&[b"rsa-sha2-512", &vec![0x42; len]]);
+            assert_eq!(
+                host_key_verdict(&with_signature(&tbs, &sig)),
+                want,
+                "{len} bytes under a 2048-bit CA"
+            );
+        }
+        // The RSA CA's modulus with a superfluous leading zero (OpenSSH trims it)
+        // does not lengthen the bound.
+        let parts = rsa_parts(&rsa_public_blob(rsa_ca()));
+        let mut n = vec![0];
+        n.extend_from_slice(&parts[2]);
+        let padded_ca = rsa_blob_raw(&parts[1], &n);
+        let tbs = cert_tbs(&certified, &padded_ca);
+        for (len, want) in [(129, None), (130, UNPARSEABLE)] {
+            let sig = strings(&[b"rsa-sha2-256", &vec![0x42; len]]);
+            assert_eq!(
+                host_key_verdict(&with_signature(&tbs, &sig)),
+                want,
+                "{len} bytes under the padded 1025-bit CA"
+            );
+        }
+    }
+
+    #[test]
+    fn ecdsa_signature_formats_must_match_the_ca_curve() {
+        let certified = ed25519_blob_of(b"ssh-ed25519", &throwaway_ed25519(0x44), None);
+        let cases: [(CaSig, &[u8], Option<RefusalClass>); 10] = [
+            (CaSig::P256, b"ecdsa-sha2-nistp256", None),
+            (CaSig::P256, b"ecdsa-sha2-nistp384", UNPARSEABLE),
+            (CaSig::P256, b"ecdsa-sha2-nistp521", UNPARSEABLE),
+            (CaSig::P384, b"ecdsa-sha2-nistp384", None),
+            (CaSig::P384, b"ecdsa-sha2-nistp256", UNPARSEABLE),
+            (CaSig::P521, b"ecdsa-sha2-nistp521", None),
+            (CaSig::P521, b"ecdsa-sha2-nistp384", UNPARSEABLE),
+            (
+                CaSig::P256,
+                b"sk-ecdsa-sha2-nistp256@openssh.com",
+                UNPARSEABLE,
+            ),
+            (CaSig::SkP256, b"ecdsa-sha2-nistp256", UNPARSEABLE),
+            (CaSig::P256, WEBAUTHN_SK_ECDSA, UNPARSEABLE),
+        ];
+        for (ca, format, want) in cases {
+            let tbs = cert_tbs(&certified, &ca.ca_blob());
+            let mut sig = ca.sign(&tbs);
+            sig.format = format.to_vec();
+            // A WebAuthn format under a plain ECDSA CA gets a WebAuthn tail too, so
+            // only the CA's type refuses it.
+            if format == WEBAUTHN_SK_ECDSA {
+                sig.tail = CaSig::WebAuthn {
+                    flags: 1,
+                    extensions: b"",
+                }
+                .sign(&tbs)
+                .tail;
+            }
+            assert_eq!(
+                host_key_verdict(&with_signature(&tbs, &sig.encode())),
+                want,
+                "{ca:?} signing as {}",
+                String::from_utf8_lossy(format)
+            );
+        }
+        // A P-384 signature (48-byte values) under a P-256 CA's format: too long.
+        let tbs = cert_tbs(&certified, &CaSig::P256.ca_blob());
+        let mut sig = CaSig::P384.sign(&tbs);
+        sig.format = b"ecdsa-sha2-nistp256".to_vec();
+        let r = Reader::new(&sig.body).string().unwrap().len();
+        assert!(r > 32, "the P-384 r is {r} bytes");
+        assert_eq!(
+            host_key_verdict(&with_signature(&tbs, &sig.encode())),
+            UNPARSEABLE
+        );
+    }
+
+    /// The reviewer's WebAuthn host certificate: the recorded host certificate up to
+    /// its reserved field, the CA replaced by an `sk-ecdsa-sha2-nistp256` key whose
+    /// point is the P-256 generator (application `ssh:`), signed in the WebAuthn
+    /// format with flags 1, counter 0, origin `https://ca.example`, empty extensions
+    /// and this `r`, `s`. OpenSSH 9.6p1 parses it as a valid host certificate.
+    fn reviewers_webauthn_certificate() -> Vec<u8> {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        let generator = p256::SecretKey::from_slice(&one)
+            .unwrap()
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let fields = split_ed25519_cert(&host_certificate());
+        let mut tbs = encode_cert(&fields[..12]);
+        put_string(&mut tbs, &sk_ecdsa_blob(&generator, b"ssh:"));
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let r = hex("0cfd77346f3f06d497e008ea535dcc80244ada806df3ff74499b2707f855fdc8");
+        let s = hex("bc5428e3860548cf73579d589f254be617e1aeca57dc6f9d342a2dd19640c589");
+        let origin = b"https://ca.example";
+        let mut tail = vec![1];
+        tail.extend_from_slice(&0u32.to_be_bytes());
+        put_string(&mut tail, origin);
+        put_string(&mut tail, &webauthn_client_data(&tbs, origin));
+        put_string(&mut tail, b"");
+        let sig = SigParts {
+            format: WEBAUTHN_SK_ECDSA.to_vec(),
+            body: ecdsa_body(&r, &s),
+            tail,
+        };
+        with_signature(&tbs, &sig.encode())
+    }
+
+    #[test]
+    fn the_reviewers_webauthn_certificate_is_a_host_key() {
+        let cert = reviewers_webauthn_certificate();
+        assert_eq!(host_key_verdict(&cert), None);
+        // ... including in the recorded login that carried a certificate.
+        let v = logins()
+            .into_iter()
+            .find(|v| v.name == "login-ed25519-hostbound-hostcert")
+            .unwrap();
+        let mut l = Login::split(&v.data);
+        l.extra = vec![cert];
+        assert_eq!(
+            verdict_flags(&git_and_deploy(), &v.key, &l.encode(), 0),
+            None
+        );
+    }
+
+    /// Malformations of a WebAuthn signature's tail: flags (1), counter (4), then
+    /// `string` origin, `string` clientData, `string` extensions.
+    const WEBAUTHN_TAIL_MUTATIONS: &[BodyMutation] = &[
+        ("genuine", |_| {}, None),
+        (
+            "no extensions string",
+            |s| {
+                let n = s.tail.len();
+                s.tail.truncate(n - 4);
+            },
+            UNPARSEABLE,
+        ),
+        ("no WebAuthn strings", |s| s.tail.truncate(5), UNPARSEABLE),
+        (
+            "origin only",
+            |s| {
+                s.tail.truncate(5);
+                put_string(&mut s.tail, WEBAUTHN_ORIGIN);
+            },
+            UNPARSEABLE,
+        ),
+        ("a trailing byte", |s| s.tail.push(0), UNPARSEABLE),
+        (
+            "a fourth string",
+            |s| put_string(&mut s.tail, b""),
+            UNPARSEABLE,
+        ),
+        (
+            "origin with NUL inside",
+            |s| webauthn_retail(s, b"https://ca\0.example"),
+            UNPARSEABLE,
+        ),
+        (
+            "origin with NUL inside and at the end",
+            |s| webauthn_retail(s, b"https://ca\0.example\0"),
+            UNPARSEABLE,
+        ),
+        (
+            // `sshbuf_get_cstring` allows one NUL at the end of a C string.
+            "origin ending in one NUL",
+            |s| webauthn_retail(s, b"https://ca.example\0"),
+            None,
+        ),
+        (
+            "origin ending in two NULs",
+            |s| webauthn_retail(s, b"https://ca.example\0\0"),
+            UNPARSEABLE,
+        ),
+        (
+            "origin with a quote",
+            |s| webauthn_retail(s, b"https://ca\".example"),
+            UNPARSEABLE,
+        ),
+        (
+            "empty origin and clientData (only the challenge binds them)",
+            |s| {
+                let ext = webauthn_strings(s).2;
+                s.tail.truncate(5);
+                put_string(&mut s.tail, b"");
+                put_string(&mut s.tail, b"");
+                put_string(&mut s.tail, &ext);
+            },
+            None,
+        ),
+        (
+            "attested credential data flag set",
+            |s| s.tail[0] |= WEBAUTHN_FLAG_AD,
+            UNPARSEABLE,
+        ),
+        (
+            "extension flag flipped",
+            |s| s.tail[0] ^= WEBAUTHN_FLAG_ED,
+            UNPARSEABLE,
+        ),
+        (
+            "extensions changed to the other emptiness",
+            |s| {
+                let (origin, client_data, ext) = webauthn_strings(s);
+                s.tail.truncate(5);
+                put_string(&mut s.tail, &origin);
+                put_string(&mut s.tail, &client_data);
+                put_string(&mut s.tail, if ext.is_empty() { b"\xa0" } else { b"" });
+            },
+            UNPARSEABLE,
+        ),
+        ("no counter", |s| s.tail.truncate(1), UNPARSEABLE),
+    ];
+
+    /// A WebAuthn tail's three strings.
+    fn webauthn_strings(s: &SigParts) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut r = Reader::new(&s.tail[5..]);
+        let mut next = || r.string().unwrap().to_vec();
+        (next(), next(), next())
+    }
+
+    /// Rewrite a WebAuthn tail with another origin (and a placeholder clientData).
+    fn webauthn_retail(s: &mut SigParts, origin: &[u8]) {
+        let (_, _, ext) = webauthn_strings(s);
+        s.tail.truncate(5);
+        put_string(&mut s.tail, origin);
+        put_string(&mut s.tail, b"{}");
+        put_string(&mut s.tail, &ext);
+    }
+
+    #[test]
+    fn webauthn_signatures_need_their_three_strings_and_consistent_flags() {
+        let mut ran = 0;
+        for (label, certified) in certified_keys() {
+            for ca in CA_SIGS
+                .into_iter()
+                .filter(|c| matches!(c, CaSig::WebAuthn { .. }))
+            {
+                for (what, mutate, want) in WEBAUTHN_TAIL_MUTATIONS {
+                    assert_eq!(
+                        signature_verdict(&certified, ca, *mutate),
+                        *want,
+                        "{label} by {ca:?}: {what}"
+                    );
+                    ran += 1;
+                }
+                for (what, mutate, want) in ECDSA_BODY_MUTATIONS {
+                    assert_eq!(
+                        signature_verdict(&certified, ca, *mutate),
+                        *want,
+                        "{label} by {ca:?}: {what}"
+                    );
+                }
+            }
+        }
+        assert_eq!(ran, 8 * 2 * WEBAUTHN_TAIL_MUTATIONS.len());
+        // The WebAuthn format belongs to the sk-ecdsa CA only: not to an
+        // sk-ssh-ed25519 CA, even with a well-formed WebAuthn tail.
+        let certified = ecdsa_blob("nistp256");
+        let tbs = cert_tbs(&certified, &CaSig::SkEd25519.ca_blob());
+        let mut sig = CaSig::SkEd25519.sign(&tbs);
+        sig.format = WEBAUTHN_SK_ECDSA.to_vec();
+        assert_eq!(
+            host_key_verdict(&with_signature(&tbs, &sig.encode())),
+            UNPARSEABLE
+        );
+        sig.tail = CaSig::WebAuthn {
+            flags: 1,
+            extensions: b"",
+        }
+        .sign(&tbs)
+        .tail;
+        assert_eq!(
+            host_key_verdict(&with_signature(&tbs, &sig.encode())),
+            UNPARSEABLE
+        );
+    }
+
+    #[test]
+    fn dsa_cas_sign_40_bytes() {
+        // No genuine DSA signature can be made here (module doc of `dsa_blob`); the
+        // body is checked by size only, as OpenSSH's parser checks it.
+        let certified = ecdsa_blob("nistp384");
+        let tbs = cert_tbs(&certified, &dsa_blob());
+        for (len, want) in [
+            (40, None),
+            (39, UNPARSEABLE),
+            (41, UNPARSEABLE),
+            (0, UNPARSEABLE),
+        ] {
+            let sig = strings(&[b"ssh-dss", &vec![0x42; len]]);
+            assert_eq!(
+                host_key_verdict(&with_signature(&tbs, &sig)),
+                want,
+                "{len} bytes"
+            );
+        }
+        let mut sig = strings(&[b"ssh-dss", &[0x42; 40]]);
+        sig.push(0);
+        assert_eq!(host_key_verdict(&with_signature(&tbs, &sig)), UNPARSEABLE);
+        let sig = strings(&[b"ssh-ed25519", &[0x42; 64]]);
+        assert_eq!(host_key_verdict(&with_signature(&tbs, &sig)), UNPARSEABLE);
+    }
+
+    #[test]
+    fn plain_dsa_host_keys_are_checked_structurally_and_never_sign() {
+        let good = dsa_blob();
+        assert_eq!(host_key_verdict(&good), None);
+        assert_eq!(signing_key_verdict(&good), MALFORMED_KEY);
+        let parts = {
+            let mut r = Reader::new(&good);
+            (0..5)
+                .map(|_| r.string().unwrap().to_vec())
+                .collect::<Vec<_>>()
+        };
+        let rebuild = |p: &[Vec<u8>]| {
+            let mut b = Vec::new();
+            for f in p {
+                put_string(&mut b, f);
+            }
+            b
+        };
+        for i in 1..5 {
+            for (what, value) in [
+                ("zero", Vec::new()),
+                ("one zero byte", vec![0]),
+                ("negative", vec![0x80, 1]),
+            ] {
+                let mut p = parts.clone();
+                p[i] = value;
+                assert_eq!(
+                    host_key_verdict(&rebuild(&p)),
+                    UNPARSEABLE,
+                    "field {i} {what}"
+                );
+            }
+        }
+        assert_eq!(
+            host_key_verdict(&rebuild(&parts[..4])),
+            UNPARSEABLE,
+            "three mpints"
+        );
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert_eq!(host_key_verdict(&trailing), UNPARSEABLE, "a trailing byte");
+        let mut extra = parts.clone();
+        extra.push(vec![1]);
+        assert_eq!(
+            host_key_verdict(&rebuild(&extra)),
+            UNPARSEABLE,
+            "a fifth mpint"
+        );
+    }
+
+    #[test]
+    fn certified_key_bodies_of_every_type_are_validated() {
+        let ca = CaSig::Ed25519;
+        let mut point00 = vec![0x04];
+        point00.extend_from_slice(&[0; 64]);
+        let r = rsa_parts(&rsa_blob(2048));
+        let invalid: Vec<(&str, Vec<u8>)> = vec![
+            ("RSA exponent even", rsa_blob_raw(&mpint(&[1, 0, 0]), &r[2])),
+            ("RSA modulus 1023 bits", rsa_blob(1023)),
+            ("RSA exponent one zero byte", rsa_blob_raw(&[0], &r[2])),
+            ("DSA with a zero q", {
+                let mut b = Vec::new();
+                let dsa = dsa_blob();
+                let mut rr = Reader::new(&dsa);
+                for i in 0..5 {
+                    let f = rr.string().unwrap();
+                    put_string(&mut b, if i == 2 { &[][..] } else { f });
+                }
+                b
+            }),
+            ("P-256 off curve", off_curve_p256()),
+            (
+                "P-384 point under P-256",
+                ecdsa_blob_raw("ecdsa-sha2-nistp256", "nistp256", &ec_point("nistp384")),
+            ),
+            (
+                "P-521 curve name mismatch",
+                ecdsa_blob_raw("ecdsa-sha2-nistp521", "nistp384", &ec_point("nistp521")),
+            ),
+            (
+                "sk-ecdsa off curve",
+                sk_ecdsa_blob(&point00, SK_APPLICATION),
+            ),
+            (
+                "sk-ecdsa application with NUL",
+                sk_ecdsa_blob(&ec_point("nistp256"), b"ssh:\0"),
+            ),
+            ("sk-ecdsa without application", {
+                let mut b = Vec::new();
+                put_string(&mut b, b"sk-ecdsa-sha2-nistp256@openssh.com");
+                put_string(&mut b, b"nistp256");
+                put_string(&mut b, &ec_point("nistp256"));
+                b
+            }),
+        ];
+        for (label, certified) in invalid {
+            assert_eq!(
+                host_key_verdict(&genuine_cert(&certified, ca)),
+                UNPARSEABLE,
+                "{label}"
+            );
+        }
+        // And the valid body of each type, under the same CA.
+        for (label, certified) in certified_keys() {
+            assert_eq!(
+                host_key_verdict(&genuine_cert(&certified, ca)),
+                None,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn rsa_moduli_of_any_bit_length_and_large_odd_exponents_are_accepted() {
+        // The genuine 1025-bit key: not a whole number of bytes.
+        let genuine = rsa_public_blob(rsa_ca());
+        assert_eq!(host_key_verdict(&genuine), None);
+        assert_eq!(signing_key_verdict(&genuine), None);
+        let n = rsa_parts(&rsa_blob(2048))[2].clone();
+        // A large odd exponent (as wide as the modulus) and the widest one OpenSSH
+        // reads (2048 bytes): accepted as host keys.
+        for e_len in [256, MAX_MPINT_BYTES] {
+            let mut e = vec![0x5b; e_len];
+            e[e_len - 1] |= 1;
+            let key = rsa_blob_raw(&mpint(&e), &n);
+            assert_eq!(host_key_verdict(&key), None, "{e_len}-byte exponent");
+        }
+        // Over that: refused, and a one-byte zero mpint is zero.
+        let mut e = vec![0x5b; MAX_MPINT_BYTES + 1];
+        e[MAX_MPINT_BYTES] |= 1;
+        let key = rsa_blob_raw(&mpint(&e), &n);
+        assert_eq!(host_key_verdict(&key), UNPARSEABLE, "oversized exponent");
+        assert_eq!(
+            signing_key_verdict(&key),
+            MALFORMED_KEY,
+            "oversized exponent"
+        );
+        for (what, key) in [
+            ("exponent", rsa_blob_raw(&[0], &n)),
+            ("modulus", rsa_blob_raw(&mpint(&[1, 0, 1]), &[0])),
+        ] {
+            assert_eq!(host_key_verdict(&key), UNPARSEABLE, "one-byte zero {what}");
+            assert_eq!(
+                signing_key_verdict(&key),
+                MALFORMED_KEY,
+                "one-byte zero {what}"
+            );
+        }
     }
 
     // ----- the flags -----
@@ -3441,6 +4615,27 @@ mod tests {
             (0..n).map(|_| self.next() as u8).collect()
         }
     }
+
+    /// So the throwaway RSA CA is generated from a fixed seed (a failure then
+    /// reproduces). Test-only: it makes no real key.
+    impl rsa::rand_core::RngCore for Rng {
+        fn next_u32(&mut self) -> u32 {
+            (self.next() >> 32) as u32
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.next()
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for b in dest {
+                *b = (self.next() >> 56) as u8;
+            }
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+    impl rsa::rand_core::CryptoRng for Rng {}
 
     #[test]
     fn arbitrary_input_never_panics_and_is_never_accepted_outside_the_two_shapes() {
