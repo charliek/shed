@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{HostAgentConfig, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT};
+use crate::machine::MachineIdentity;
 use crate::sockets::desktop_socket_path;
 
 /// The version of the LiveStatus JSON contract. Bumped only on a breaking change;
@@ -39,6 +40,14 @@ pub struct LiveStatus {
     pub gate_namespaces: Vec<String>,
     pub approval_channel: ApprovalChannelStatus,
     pub servers: Vec<ServerHealth>,
+    /// This machine's identity ([`crate::machine`]). Additive (schema stays 1): absent
+    /// from an older daemon's snapshot, and absent when the identity could not be
+    /// loaded, in which case [`Self::machine_error`] says why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<MachineIdentity>,
+    /// Why there is no [`Self::machine`]; empty when there is one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub machine_error: String,
 }
 
 /// `ApprovalChannelStatus` describes the approval-channel socket and its current
@@ -76,7 +85,9 @@ pub struct NamespaceHealth {
 /// when an app is connected, `None` otherwise) — the desktop server's
 /// `consumer_info()`, or always `None` in the headless build with no desktop server.
 /// `servers` is the supervisor's per-server connection snapshot (`Supervisor::health()`),
-/// populated in BOTH modes (single-server shows one entry, `name:""`).
+/// populated in BOTH modes (single-server shows one entry, `name:""`). `machine` is the
+/// identity loaded at start ([`crate::machine::load_or_create`]) or the reason there is
+/// none.
 pub fn build_live_status(
     cfg: &HostAgentConfig,
     config_path: &str,
@@ -84,6 +95,7 @@ pub fn build_live_status(
     version: &str,
     consumer: Option<(String, String)>,
     servers: Vec<ServerHealth>,
+    machine: &Result<MachineIdentity, String>,
 ) -> LiveStatus {
     // Keyed by the fixed status/gate namespace order; the BTreeMap re-sorts on
     // insert, so the emitted JSON key order is identical regardless.
@@ -96,6 +108,10 @@ pub fn build_live_status(
     let (consumer_connected, client_name, client_version) = match consumer {
         Some((name, version)) => (true, name, version),
         None => (false, String::new(), String::new()),
+    };
+    let (machine, machine_error) = match machine {
+        Ok(identity) => (Some(identity.clone()), String::new()),
+        Err(e) => (None, e.clone()),
     };
     LiveStatus {
         schema: STATUS_SCHEMA_VERSION,
@@ -113,6 +129,8 @@ pub fn build_live_status(
             client_version,
         },
         servers,
+        machine,
+        machine_error,
     }
 }
 
@@ -355,6 +373,8 @@ mod tests {
                 url: "http://localhost:8080".to_string(),
                 namespaces: vec![ns("ssh-agent", "connected", "")],
             }],
+            machine: None,
+            machine_error: String::new(),
         }
     }
 
@@ -402,6 +422,8 @@ mod tests {
                 client_version: String::new(),
             },
             servers: vec![],
+            machine: None,
+            machine_error: String::new(),
         };
         let compact = serde_json::to_string(&ls).unwrap();
         assert!(!compact.contains("gate_namespaces"), "{compact}");
@@ -439,6 +461,8 @@ mod tests {
                 client_version: String::new(),
             },
             servers: vec![],
+            machine: None,
+            machine_error: String::new(),
         };
         let mut v: serde_json::Value = serde_json::to_value(&ls).unwrap();
         v.as_object_mut().unwrap().insert(
@@ -447,5 +471,49 @@ mod tests {
         );
         let back: LiveStatus = serde_json::from_value(v).expect("old snapshot decodes");
         assert_eq!(back, ls);
+    }
+
+    /// The machine block is additive under schema 1: an older daemon's snapshot (no
+    /// `machine`) still decodes, a new one round-trips, and an absent identity is
+    /// reported as an error string rather than an empty block.
+    #[test]
+    fn machine_block_is_additive_and_round_trips() {
+        let old = sample_status();
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("machine"), "{json}");
+        let back: LiveStatus = serde_json::from_str(&json).expect("old snapshot decodes");
+        assert_eq!(back.machine, None);
+        assert_eq!(back.machine_error, "");
+
+        let mut ls = sample_status();
+        ls.machine = Some(MachineIdentity {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            name: "laptop".into(),
+        });
+        let v = serde_json::to_value(&ls).unwrap();
+        assert_eq!(v["machine"]["id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(v["machine"]["name"], "laptop");
+        assert!(v.get("machine_error").is_none());
+        let back: LiveStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ls);
+    }
+
+    #[test]
+    fn build_live_status_reports_the_machine_or_why_not() {
+        let cfg = HostAgentConfig::parse("");
+        let identity = MachineIdentity {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            name: "laptop".into(),
+        };
+        let ok = build_live_status(&cfg, "/c", "", "v", None, vec![], &Ok(identity.clone()));
+        assert_eq!(ok.machine, Some(identity));
+        assert_eq!(ok.machine_error, "");
+
+        let err = build_live_status(&cfg, "/c", "", "v", None, vec![], &Err("no way".into()));
+        assert_eq!(err.machine, None);
+        assert_eq!(err.machine_error, "no way");
+        let v = serde_json::to_value(&err).unwrap();
+        assert!(v.get("machine").is_none());
+        assert_eq!(v["machine_error"], "no way");
     }
 }

@@ -254,6 +254,12 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         cfg.effective_policy(config::NS_DOCKER_CREDENTIALS),
     ));
 
+    // This machine's identity, before any socket binds so the first status snapshot
+    // already carries it. Like the credential store, an unusable file never stops the
+    // daemon: a corrupt one is replaced (loudly), and one that cannot be read or created
+    // leaves the daemon running WITHOUT an identity, the reason shown in `status`.
+    let machine = load_machine_identity(&mut log);
+
     // Resolve the SSH backend UNCONDITIONALLY at startup — after config load, BEFORE
     // any socket binds — mirroring Go's `main.go:114` (`ResolveSSHBackend` runs before
     // the desktop/status sockets). A resolve error (unknown `ssh.mode`, or an explicit
@@ -486,6 +492,7 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
                 &version,
                 consumer,
                 sup.health(),
+                &machine,
             )
         })
     };
@@ -582,6 +589,49 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
 
     log.info("stopped");
     0
+}
+
+/// Load (or create) this machine's identity and log how it was obtained. `Err` carries
+/// the reason there is none, for the status report.
+fn load_machine_identity(log: &mut Log) -> Result<shed_broker::MachineIdentity, String> {
+    use shed_broker::machine::{load_or_create_at, machine_state_path, LoadOutcome};
+    let path = machine_state_path();
+    match load_or_create_at(&path) {
+        Ok(loaded) => {
+            let id = &loaded.identity;
+            let where_ = path.display();
+            match &loaded.outcome {
+                LoadOutcome::Existing => log.info(&format!(
+                    "machine identity id={} name={:?} path={where_}",
+                    id.id, id.name
+                )),
+                LoadOutcome::Created => log.info(&format!(
+                    "machine identity created id={} name={:?} path={where_}",
+                    id.id, id.name
+                )),
+                LoadOutcome::Repaired { reason, written } => log.warn(&format!(
+                    "machine identity repaired; the id is kept id={} name={:?} \
+                     reason={reason} written={written} path={where_}",
+                    id.id, id.name
+                )),
+                LoadOutcome::Replaced { reason, old_file } => log.warn(&format!(
+                    "machine identity was unusable and has been REPLACED; servers will see \
+                     a new machine id={} name={:?} reason={reason} old_file={} path={where_}",
+                    id.id,
+                    id.name,
+                    old_file.display()
+                )),
+            }
+            Ok(loaded.identity)
+        }
+        Err(e) => {
+            log.error(&format!(
+                "machine identity unavailable; continuing without one path={} error={e}",
+                path.display()
+            ));
+            Err(e)
+        }
+    }
 }
 
 /// Resolve when the shared shutdown watch is flipped (or its sender is dropped).

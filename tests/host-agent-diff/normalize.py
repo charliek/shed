@@ -30,6 +30,16 @@ MASK_VERSION = "<version>"
 MASK_CONFIG_PATH = "<config_path>"
 MASK_ID = "<id>"
 MASK_EXPIRES = "<expires_at>"
+MASK_MACHINE_ID = "<machine_id>"
+MASK_MACHINE_NAME = "<machine_name>"
+
+# A machine id (plan 035 §3.4): 32 lowercase hex characters, no hyphens. Always used
+# with `fullmatch`: `$` also matches before a final newline, which would pass (and then
+# mask away) an id with a trailing `\n`.
+_MACHINE_ID = re.compile(r"[0-9a-f]{32}")
+# The text render's machine line: `machine:  <name> (<id>)`. The name may itself hold
+# parentheses, so the id is anchored at the end.
+_MACHINE_LINE = re.compile(r"machine:  (?P<name>.+) \((?P<id>[^()]*)\)")
 
 # RFC3339 with second precision and either a `Z` or a numeric offset. Both daemons
 # emit `...Z` (the daemon's std-only formatter; the retired Go twin's `time.RFC3339`
@@ -46,6 +56,20 @@ def assert_rfc3339(value: Any, field: str) -> None:
     malformed timestamp."""
     assert isinstance(value, str), f"{field}: expected an RFC3339 string, got {value!r}"
     assert _RFC3339.match(value), f"{field}: not RFC3339-shaped: {value!r}"
+
+
+def assert_machine_identity(machine_id: Any, name: Any) -> None:
+    """Assert a machine identity's shape before it is masked: the id is 32 lowercase
+    hex characters, the name 1 to 63 bytes of UTF-8 with no control character (the
+    host's name, derived from its hostname, so it varies by machine and is masked)."""
+    assert isinstance(machine_id, str) and _MACHINE_ID.fullmatch(machine_id), (
+        f"machine id not 32 lowercase hex characters: {machine_id!r}"
+    )
+    assert isinstance(name, str), f"machine name not a string: {name!r}"
+    assert 1 <= len(name.encode("utf-8")) <= 63, f"machine name not 1-63 bytes: {name!r}"
+    assert not any(
+        ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in name
+    ), f"machine name holds a control character: {name!r}"
 
 
 def canonical(obj: Any) -> Any:
@@ -65,7 +89,9 @@ def mask_live_status(obj: dict, socket_dir: str, config_path: str) -> dict:
 
     Masked (volatile): `version`, `pid`, `started_at`, `written_at`, `config_path`,
     `approval_channel.socket_path` (dir prefix only — the `host-agent.sock` basename
-    is kept), and every `servers[].namespaces[].since`.
+    is kept), every `servers[].namespaces[].since`, and `machine.id` / `machine.name`
+    (a fresh random id per run, a name from the host's hostname; both shape-asserted
+    first). The presence of the `machine` block, and of `machine_error`, is diffed.
 
     Diffed (stable): `schema`, `policies`, `gate_namespaces`,
     `approval_channel.consumer_connected`, and the `servers[]` structure.
@@ -130,6 +156,13 @@ def mask_live_status(obj: dict, socket_dir: str, config_path: str) -> dict:
         sv["namespaces"] = namespaces
         masked_servers.append(sv)
     out["servers"] = masked_servers
+
+    if "machine" in out:
+        machine = dict(out["machine"])
+        assert_machine_identity(machine.get("id"), machine.get("name"))
+        machine["id"] = MASK_MACHINE_ID
+        machine["name"] = MASK_MACHINE_NAME
+        out["machine"] = machine
 
     return out
 
@@ -338,8 +371,10 @@ def mask_not_running(stderr: str, socket_dir: str) -> str:
 def mask_status_text(text: str, socket_dir: str, config_path: str) -> str:
     """Mask the volatile lines of the human-readable `status` render so the two
     impls' text is equal: the `pid`/`version` header line, the `config:` line, the
-    `started:` line, and the approval-channel `socket` line. Everything else (the
-    policy table, gate annotations, consumer line, `Servers (N):` block) is diffed.
+    `started:` line, the approval-channel `socket` line, and the name and id on the
+    `machine:` line (shape-asserted first; a `machine:  unavailable: …` line is kept).
+    Everything else (the policy table, gate annotations, consumer line,
+    `Servers (N):` block) is diffed.
     """
     lines = text.split("\n")
     masked = []
@@ -350,6 +385,11 @@ def mask_status_text(text: str, socket_dir: str, config_path: str) -> str:
             masked.append("config:   <config_path>")
         elif line.startswith("started:"):
             masked.append("started:  <ts>")
+        elif line.startswith("machine:  ") and not line.startswith("machine:  unavailable: "):
+            m = _MACHINE_LINE.fullmatch(line)
+            assert m, f"machine line not `machine:  <name> (<id>)`: {line!r}"
+            assert_machine_identity(m.group("id"), m.group("name"))
+            masked.append(f"machine:  {MASK_MACHINE_NAME} ({MASK_MACHINE_ID})")
         elif line.startswith("  socket    "):
             masked.append("  socket    <dir>/" + os.path.basename(line.strip().split()[-1]))
         else:

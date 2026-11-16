@@ -12,8 +12,9 @@
 //! `ssh_backend_agent`, `aws_backend`, `docker_backend`, `egress`), the SSH-bootstrap
 //! **minter** + control-token provider (`minter`, `bootstrap`, `controltoken`), the
 //! **approval**/**audit** seams (`approval`, `audit`, `touchid`), the **config**
-//! reader (`config`), socket **path resolution + liveness probes** (`sockets`), and
-//! the **LiveStatus snapshot** builder + shared RFC3339 helpers (`status`).
+//! reader (`config`), socket **path resolution + liveness probes** (`sockets`), this
+//! machine's **identity** file (`machine`), and the **LiveStatus snapshot** builder +
+//! shared RFC3339 helpers (`status`).
 //!
 //! What stays in the `shed-host-agent` bin (daemon-only): `main` (CLI/signals/
 //! `run_daemon`/`Log`), the socket **bind ceremony** (`socket_bind`), the status UDS
@@ -52,6 +53,9 @@ pub mod discovery;
 pub mod docker_backend;
 // The always-on egress-audit SSE consumer — internal; the supervisor spawns it.
 mod egress;
+// This machine's stable id + display name (`<state>/host-agent/machine.json`), shared by
+// the daemon and the desktop's embedded broker (plan 035 §3.4).
+pub mod machine;
 pub mod minter;
 pub mod sockets;
 pub mod ssh_backend;
@@ -80,6 +84,7 @@ pub use controltoken::{
 };
 pub use credstore::CredStore;
 pub use discovery::{load_discovered_servers, ServerTarget};
+pub use machine::MachineIdentity;
 pub use sockets::{connect_unix_timeout, desktop_socket_path, socket_is_live, status_socket_path};
 pub use status::{build_live_status, LiveStatus, NamespaceHealth, ServerHealth};
 pub use supervisor::{SharedDeps, Supervisor};

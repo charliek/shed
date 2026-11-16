@@ -62,6 +62,7 @@ These vary run-to-run and MUST be masked. Grouped by channel.
 **Status (channels 4/5, `status.go`/`status_server.go`):**
 - `pid` (`os.Getpid()`), `started_at`, `written_at` (snapshot time), `version`, per-namespace `since` (RFC3339). All VOLATILE.
 - `config_path` — absolute path, env-dependent. VOLATILE.
+- `machine.id` (a random 32-hex id per state dir) and `machine.name` (from the host's hostname). VOLATILE; the harness asserts their shape (§4.1) before masking them to `<machine_id>` / `<machine_name>`, in the JSON and on the text render's `machine:` line.
 - `schema` — constant `1` (stable; a mismatch is a hard reject).
 
 **Bus response payloads (channel 1):**
@@ -183,13 +184,19 @@ Fan-out happens even when file logging is disabled (`audit.go:104` comment).
           "last_error": "",          // omitempty
           "since": "<RFC3339>" }     // VOLATILE
       ] }
-  ]
+  ],
+  "machine": {                       // omitted when absent (older daemon, or no identity)
+    "id": "0123456789abcdef0123456789abcdef",  // VOLATILE: 32 lowercase hex, no hyphens
+    "name": "laptop"                 // VOLATILE: 1-63 bytes UTF-8, no control characters
+  },
+  "machine_error": "..."             // omitempty; why there is no `machine`
 }
 ```
 
 - `policies` keys are always the 3 credential namespaces (`status_server.go:81`).
 - `state` ∈ `connected|reconnecting|stopped` (also `rejected` in the SDK), from `sdk/hostclient.go:28-34` `ConnConnected/ConnReconnecting/ConnStopped/ConnRejected` → the health snapshot maps `client.Status()` (`supervisor.go:243`).
 - `buildLiveStatus` (`status_server.go:65`) composes it: policies from `cfg.*.Approval.EffectivePolicy()`, gate list from `desktopGateNamespaces(cfg)`, approval-channel from `desktop.ConsumerInfo()`, servers from `sup.Health()`.
+- `machine` / `machine_error` (plan 035, Rust only — added after the Go daemon's retirement, additive under schema 1): this machine's identity from `<state dir>/host-agent/machine.json` (`shed_broker::machine`), the file the daemon and the desktop app's embedded broker share. Loaded once at start, before any socket binds. The id and the schema are read on their own first, so an id that can be read is never thrown away. Missing → created; a valid id with any other field missing, `null`, of the wrong type or malformed → the id kept and the rest repaired (a WARN line); a newer schema → never rewritten, moved or replaced: its id is used if it can be read, otherwise the daemon runs without one and `machine_error` names the schema; no readable id at all → copied to `machine.json.corrupt` and replaced in one atomic rename (a WARN line: servers will see a new machine); unreadable, impossible to create, or a write whose fsync (file, directory, or a directory it created) fails → the daemon runs without one and `machine_error` says why, and `machine.json` is never left missing by a failed replacement. Nothing here stops the daemon from starting, matching the credential store. No server sees the identity yet.
 
 ### 4.2 Status socket behavior (`status_server.go:97`, `sockets.go`)
 
@@ -202,7 +209,7 @@ Fan-out happens even when file logging is disabled (`audit.go:104` comment).
 - Decodes `LiveStatus`; `schema != 1` → stderr skew message + **exit 1** (`status.go:48`).
 - `--json`/`-json` → indented `LiveStatus` (exit 0). Else `renderStatus` text (exit 0).
 - Unknown arg or removed `--live` → stderr + **exit 2** (`main.go:61-66`).
-- `renderStatus` text landmarks (good for text golden, `status_test.go:108-122`): `shed-host-agent status (pid N, <ver>)`, `Approval policies:`, `(decided in shed-desktop)` for gated ns, `none connected (shed-desktop-policy requests fail closed)`, `Servers (N):`, `(none being watched)`, per-ns marks `ok`/`-`/`x` (`connMark`, `status.go:141`).
+- `renderStatus` text landmarks (good for text golden, `status_test.go:108-122`): `shed-host-agent status (pid N, <ver>)`, `machine:  <name> (<id>)` (or `machine:  unavailable: <error>`) right after `started:`, `Approval policies:`, `(decided in shed-desktop)` for gated ns, `none connected (shed-desktop-policy requests fail closed)`, `Servers (N):`, `(none being watched)`, per-ns marks `ok`/`-`/`x` (`connMark`, `status.go:141`).
 
 ---
 

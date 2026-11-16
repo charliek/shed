@@ -158,6 +158,13 @@ pub fn render_status(out: &mut dyn Write, ls: &LiveStatus) {
         let _ = writeln!(out, "config:   {}", ls.config_path);
     }
     let _ = writeln!(out, "started:  {}", ls.started_at);
+    // This machine's identity; an older daemon's snapshot carries neither field and
+    // prints no line.
+    if let Some(m) = &ls.machine {
+        let _ = writeln!(out, "machine:  {} ({})", m.name, m.id);
+    } else if !ls.machine_error.is_empty() {
+        let _ = writeln!(out, "machine:  unavailable: {}", ls.machine_error);
+    }
     let _ = writeln!(out);
 
     let gated: std::collections::HashSet<&str> =
@@ -365,6 +372,8 @@ mod tests {
                 url: "http://localhost:8080".to_string(),
                 namespaces: vec![ns("ssh-agent", "connected", "")],
             }],
+            machine: None,
+            machine_error: String::new(),
         }
     }
 
@@ -435,6 +444,8 @@ mod tests {
                     namespaces: vec![],
                 },
             ],
+            machine: None,
+            machine_error: String::new(),
         };
         let mut out: Vec<u8> = Vec::new();
         render_status(&mut out, &ls);
@@ -464,6 +475,42 @@ mod tests {
     }
 
     #[test]
+    fn render_status_shows_the_machine_after_started() {
+        let mut ls = sample_status();
+        ls.machine = Some(shed_broker::MachineIdentity {
+            id: "0123456789abcdef0123456789abcdef".to_string(),
+            name: "laptop (work)".to_string(),
+        });
+        let mut out: Vec<u8> = Vec::new();
+        render_status(&mut out, &ls);
+        let got = String::from_utf8(out).unwrap();
+        let head: Vec<&str> = got.lines().take(5).collect();
+        assert_eq!(
+            head,
+            [
+                "shed-host-agent status (pid 4242, v9)",
+                "config:   /opt/homebrew/etc/shed/extensions.yaml",
+                "started:  2026-06-11T00:00:00Z",
+                "machine:  laptop (work) (0123456789abcdef0123456789abcdef)",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn render_status_says_why_there_is_no_machine() {
+        let mut ls = sample_status();
+        ls.machine_error = "read machine identity /x/machine.json: Permission denied".into();
+        let mut out: Vec<u8> = Vec::new();
+        render_status(&mut out, &ls);
+        let got = String::from_utf8(out).unwrap();
+        assert_eq!(
+            got.lines().nth(3),
+            Some("machine:  unavailable: read machine identity /x/machine.json: Permission denied")
+        );
+    }
+
+    #[test]
     fn render_status_no_consumer_landmarks() {
         let ls = LiveStatus {
             schema: STATUS_SCHEMA_VERSION,
@@ -485,6 +532,8 @@ mod tests {
                 client_version: String::new(),
             },
             servers: vec![],
+            machine: None,
+            machine_error: String::new(),
         };
         let mut out: Vec<u8> = Vec::new();
         render_status(&mut out, &ls);
