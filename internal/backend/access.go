@@ -42,6 +42,11 @@ type Principal struct {
 	Implicit bool
 	// Client is the service client's name for PrincipalClient.
 	Client string
+	// Script marks a named user acting with a key listed as a script key
+	// (auth.users.<name>.keys[].script): automation, not a person. The
+	// access rule treats it as its user; the credential bus, the credentials
+	// certificate and the credential source refuse it.
+	Script bool
 }
 
 // ImplicitPrincipal is the implicit user: the caller every key and every
@@ -72,6 +77,8 @@ func (p Principal) String() string {
 		return "client " + p.Client
 	case p.Implicit:
 		return "the implicit user"
+	case p.Kind == PrincipalUser && p.Script:
+		return "user " + p.User + " (script key)"
 	case p.Kind == PrincipalUser:
 		return "user " + p.User
 	}

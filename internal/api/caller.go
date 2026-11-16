@@ -35,6 +35,9 @@ type Caller struct {
 	// Admin and Implicit describe the user (see users.User).
 	Admin    bool
 	Implicit bool
+	// Script is set when the user's certificate is for a script key
+	// (users.Key.Script): it may not use the credential bus.
+	Script bool
 	// Serial is the client certificate's serial (lowercase hex), when the
 	// request carried one.
 	Serial string
@@ -60,7 +63,9 @@ func (c Caller) principal() (backend.Principal, bool) {
 	case c.Kind == CallerUser && c.Implicit:
 		return backend.ImplicitPrincipal(), true
 	case c.Kind == CallerUser && c.User != "":
-		return backend.UserPrincipal(c.User, c.Admin), true
+		p := backend.UserPrincipal(c.User, c.Admin)
+		p.Script = c.Script
+		return p, true
 	}
 	return backend.Principal{}, false
 }
@@ -70,9 +75,10 @@ func implicitCaller() Caller {
 	return Caller{Kind: CallerUser, Admin: true, Implicit: true}
 }
 
-// userCaller is the caller a user's certificate (subject cn) stands for.
-func userCaller(u users.User, cn, serial string) Caller {
-	return Caller{Kind: CallerUser, Name: cn, User: u.Name, Admin: u.Admin, Implicit: u.Implicit, Serial: serial}
+// userCaller is the caller a user's certificate (subject cn, the fingerprint
+// of key k) stands for.
+func userCaller(u users.User, k users.Key, cn, serial string) Caller {
+	return Caller{Kind: CallerUser, Name: cn, User: u.Name, Admin: u.Admin, Implicit: u.Implicit, Script: k.Script, Serial: serial}
 }
 
 type callerKey struct{}

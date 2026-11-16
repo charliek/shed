@@ -51,6 +51,20 @@ func refuseBusCaller(w http.ResponseWriter) {
 	writeError(w, http.StatusForbidden, "FORBIDDEN", "the credential bus is for users")
 }
 
+// refuseScriptKey answers a request made with a script key's certificate on
+// a bus route that subscribes or answers, and reports whether it did. A
+// script key is automation: it never holds the user's credential source, so
+// it may neither receive the user's sheds' requests nor answer them. Read
+// from the live lookup on every request, so a key marked script since its
+// certificate was issued is refused at once.
+func refuseScriptKey(w http.ResponseWriter, r *http.Request) bool {
+	if !callerFrom(r.Context()).Script {
+		return false
+	}
+	writeError(w, http.StatusForbidden, "FORBIDDEN", "a script key cannot subscribe to or answer on the credential bus")
+	return true
+}
+
 // handleListListeners returns the caller's active plugin listeners, or every
 // user's for an admin.
 func (s *Server) handleListListeners(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +92,9 @@ func (s *Server) handlePluginSubscribe(w http.ResponseWriter, r *http.Request) {
 	user, _, ok := busCaller(r)
 	if !ok {
 		refuseBusCaller(w)
+		return
+	}
+	if refuseScriptKey(w, r) {
 		return
 	}
 	if s.plugins == nil {
@@ -177,6 +194,9 @@ func (s *Server) handlePluginRespond(w http.ResponseWriter, r *http.Request) {
 	user, _, ok := busCaller(r)
 	if !ok {
 		refuseBusCaller(w)
+		return
+	}
+	if refuseScriptKey(w, r) {
 		return
 	}
 	// The bridge and registry are wired together (NewBridge(registry)); require

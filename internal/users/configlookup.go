@@ -49,8 +49,15 @@ type ConfigOptions struct {
 	// memory only, for tests.
 	PinsPath string
 	// GitHubIDs pins logins (any case) to account ids from config. A
-	// configured id wins over the stored pin.
+	// configured id wins over the stored pin. A user's auth.users github_id
+	// is added to it.
 	GitHubIDs map[string]int64
+	// Users is auth.users. With any user the lookup has a user list: every
+	// key belongs to the named user it is listed under (a key by hand, or a
+	// key the user's GitHub login publishes), there is no implicit user, and
+	// SSH must be in enforce mode with none of auth.ssh's key sources set
+	// (config load refuses both; so does NewConfigLookup).
+	Users map[string]config.UserConfig
 	// Context bounds every GitHub fetch the lookup makes, the first one
 	// included: shed-server passes the context it cancels at shutdown, so a
 	// fetch in flight then ends at once. nil is context.Background().
@@ -66,9 +73,15 @@ type githubLogin struct {
 	configID int64
 }
 
-// ConfigLookup is the Lookup answered from the server's config file: the keys
-// in auth.ssh (inline keys, an authorized_keys file and GitHub users), every
-// one of which belongs to the implicit user.
+// ConfigLookup is the Lookup answered from the server's config file. With no
+// user list it holds the keys in auth.ssh (inline keys, an authorized_keys
+// file and GitHub users), every one of which belongs to the implicit user.
+// With a user list (auth.users) it holds each user's keys: those listed by
+// hand under the user, and those the user's GitHub login publishes. A key is
+// one user's only. A key listed by hand stays that user's even when another
+// user's GitHub login publishes it too (logged); a key the GitHub logins of
+// two users both publish belongs to neither and is refused for both (logged),
+// until only one publishes it.
 //
 // A GitHub login is pinned to its numeric account id (see github.go): its keys
 // are accepted only from a fetch that shows the login still names that
@@ -81,8 +94,13 @@ type ConfigLookup struct {
 	mode         string
 	maxAuthTries int
 
-	inline   []string
-	file     string
+	inline []string
+	file   string
+	// named is whether the server has a user list. users and adhoc are set
+	// once, at construction, and never change.
+	named    bool
+	users    map[string]User
+	adhoc    []keyEntry // keys listed by hand under a user, in config order
 	logins   []githubLogin
 	cacheDir string
 	pinsPath string
@@ -132,6 +150,10 @@ type ConfigLookup struct {
 	// login's pin key), which may never start an unknown-key fetch. Loaded
 	// from the pin store at start-up, so it survives a restart.
 	rejected map[string]string
+	// contested holds the fingerprints the GitHub logins of more than one
+	// user published at the last rebuild (to the users' names): refused for
+	// all of them, and never the reason for an unknown-key fetch.
+	contested map[string][]string
 
 	// flightMu guards running and queued: the fetch in progress and the one
 	// that starts after it (see request).
@@ -149,6 +171,17 @@ type ConfigLookup struct {
 type keyEntry struct {
 	user string
 	key  Key
+	// cert marks an SSH certificate rather than a plain key. On a server
+	// with a user list a certificate resolves to nobody (UserForKey): its
+	// fingerprint is not its key's, so it would be a second identity for
+	// whoever holds that key.
+	cert bool
+}
+
+// isCertificate reports whether key is an SSH certificate.
+func isCertificate(key gossh.PublicKey) bool {
+	_, ok := key.(*gossh.Certificate)
+	return ok
 }
 
 var (
@@ -194,6 +227,7 @@ func newConfigLookup(opts ConfigOptions, deps lookupDeps) (*ConfigLookup, error)
 		mode:        config.SSHAuthOff,
 		keys:        map[string]keyEntry{},
 		rejected:    map[string]string{},
+		contested:   map[string][]string{},
 		lastGitHub:  map[string][]byte{},
 		pins:        map[string]pinEntry{},
 		pendingPins: map[string]pinEntry{},
@@ -204,6 +238,11 @@ func newConfigLookup(opts ConfigOptions, deps lookupDeps) (*ConfigLookup, error)
 		writePins:   writePins,
 	}
 	cfg := opts.SSH
+	if len(opts.Users) > 0 {
+		if err := checkUserListSSH(cfg); err != nil {
+			return nil, err
+		}
+	}
 	if cfg == nil || cfg.Mode == "" || cfg.Mode == config.SSHAuthOff {
 		return l, nil // off: accept-all, nothing to resolve
 	}
@@ -216,18 +255,36 @@ func newConfigLookup(opts ConfigOptions, deps lookupDeps) (*ConfigLookup, error)
 	for login, id := range opts.GitHubIDs {
 		ids[pinKey(login)] = id
 	}
+	// Each GitHub login and the user its keys belong to: on a server with
+	// no user list, auth.ssh.github_users, all the implicit user's; with
+	// one, each user's login.
+	type loginOf struct{ login, user string }
+	var wanted []loginOf
+	for _, login := range cfg.GitHubUsers {
+		wanted = append(wanted, loginOf{login, ImplicitName})
+	}
+	if len(opts.Users) > 0 {
+		if err := l.loadUsers(opts.Users, ids); err != nil {
+			return nil, err
+		}
+		for _, name := range sortedNames(opts.Users) {
+			if login := opts.Users[name].GitHub; login != "" {
+				wanted = append(wanted, loginOf{login, name})
+			}
+		}
+	}
 	// GitHub logins are case-insensitive, and two spellings of one login
 	// share one pin: they are one login, followed once. (Config load refuses
 	// such a list; this holds for any caller.)
 	seen := map[string]bool{}
-	for _, login := range cfg.GitHubUsers {
-		if seen[pinKey(login)] {
-			log.Printf("auth.ssh: github login %q is listed more than once (logins are case-insensitive); following it once", login)
+	for _, w := range wanted {
+		if seen[pinKey(w.login)] {
+			log.Printf("auth.ssh: github login %q is listed more than once (logins are case-insensitive); following it once", w.login)
 			continue
 		}
-		seen[pinKey(login)] = true
+		seen[pinKey(w.login)] = true
 		l.logins = append(l.logins, githubLogin{
-			login: login, key: pinKey(login), user: ImplicitName, configID: ids[pinKey(login)],
+			login: w.login, key: pinKey(w.login), user: w.user, configID: ids[pinKey(w.login)],
 		})
 	}
 	l.cacheDir = opts.GitHubCacheDir
@@ -292,6 +349,10 @@ func (l *ConfigLookup) MaxAuthTries() int { return l.maxAuthTries }
 // being enforced": in off mode the set is empty and this finds nothing, so a
 // caller that must fail closed gets that for free, and a caller in a
 // non-enforcing posture must not use it as an authorization oracle.
+//
+// On a server with a user list an SSH certificate resolves to nobody, from
+// whatever source it came (config load refuses one listed by hand): a user's
+// key is the plain key.
 func (l *ConfigLookup) UserForKey(fp string) (User, Key, bool) {
 	if fp == "" {
 		return User{}, Key{}, false
@@ -299,7 +360,7 @@ func (l *ConfigLookup) UserForKey(fp string) (User, Key, bool) {
 	l.mu.RLock()
 	e, ok := l.keys[fp]
 	l.mu.RUnlock()
-	if !ok {
+	if !ok || (l.named && e.cert) {
 		return User{}, Key{}, false
 	}
 	u, ok := l.User(e.user)
@@ -310,17 +371,122 @@ func (l *ConfigLookup) UserForKey(fp string) (User, Key, bool) {
 }
 
 // User returns the user with this name. With no user list there is exactly
-// one, the implicit user.
+// one, the implicit user; with one, there is no implicit user.
 func (l *ConfigLookup) User(name string) (User, bool) {
+	if l.named {
+		u, ok := l.users[name]
+		return u, ok
+	}
 	if name == ImplicitName {
 		return Implicit(), true
 	}
 	return User{}, false
 }
 
-// Users lists every user: with no user list, the implicit user alone.
+// Users lists every user, sorted by name: with no user list, the implicit
+// user alone.
 func (l *ConfigLookup) Users() []User {
-	return []User{Implicit()}
+	if !l.named {
+		return []User{Implicit()}
+	}
+	out := make([]User, 0, len(l.users))
+	for _, name := range sortedNames(l.users) {
+		out = append(out, l.users[name])
+	}
+	return out
+}
+
+// checkUserListSSH refuses an SSH setup a user list cannot run under: keys
+// must be enforced (an unknown key is nobody's, so nothing may let one in),
+// and auth.ssh may name no key source of its own (its keys would belong to
+// no user). Config load refuses both first.
+func checkUserListSSH(cfg *config.SSHAuthConfig) error {
+	if cfg == nil || cfg.Mode != config.SSHAuthEnforce {
+		return errors.New("auth.users needs SSH keys enforced (auth.mode: mtls)")
+	}
+	if len(cfg.AuthorizedKeys) > 0 || cfg.AuthorizedKeysFile != "" || len(cfg.GitHubUsers) > 0 {
+		return errors.New("auth.users cannot be combined with auth.ssh.authorized_keys, authorized_keys_file or github_users")
+	}
+	return nil
+}
+
+// loadUsers records the user list and each user's keys listed by hand, and
+// adds each user's github_id to ids (by pin key). Config load has checked all
+// of it; a key that does not parse, or one listed twice, is still refused
+// here rather than given to anyone. A key whose expiry has passed is logged:
+// it stays known (so it never starts a GitHub fetch) and is not accepted.
+func (l *ConfigLookup) loadUsers(list map[string]config.UserConfig, ids map[string]int64) error {
+	l.named = true
+	l.users = make(map[string]User, len(list))
+	seen := map[string]string{}
+	now := l.clock.Now()
+	for _, name := range sortedNames(list) {
+		uc := list[name]
+		if !config.ValidUserName(name) {
+			return fmt.Errorf("auth.users: %q is not a valid user name", name)
+		}
+		l.users[name] = User{Name: name, Admin: bool(uc.Admin), GitHub: uc.GitHub}
+		if uc.GitHub != "" && uc.GitHubID != 0 {
+			ids[pinKey(uc.GitHub)] = uc.GitHubID
+		}
+		for _, kc := range uc.Keys {
+			pub, err := config.ParseUserKey(kc.Key)
+			if err != nil {
+				return fmt.Errorf("auth.users.%s key %q: %w", name, kc.Label, err)
+			}
+			expires, err := config.ParseKeyExpiry(kc.Expires)
+			if err != nil {
+				return fmt.Errorf("auth.users.%s key %q: %w", name, kc.Label, err)
+			}
+			fp := gossh.FingerprintSHA256(pub)
+			if other, dup := seen[fp]; dup {
+				return fmt.Errorf("auth.users: key %s is listed under %s and %s; a key belongs to one user", fp, other, name)
+			}
+			seen[fp] = name
+			k := Key{Fingerprint: fp, Source: SourceAdHoc, Label: kc.Label, Expires: expires, Script: bool(kc.Script)}
+			if k.Expired(now) {
+				log.Printf("auth.users: WARNING: key %q of user %s (%s) expired at %s and is not accepted", kc.Label, name, fp, expires.UTC().Format(time.RFC3339))
+			}
+			l.adhoc = append(l.adhoc, keyEntry{user: name, key: k, cert: isCertificate(pub)})
+		}
+	}
+	if !adminCanAct(list, now) {
+		log.Printf("auth.users: WARNING: no admin has a GitHub login or a key that is not marked script and has not expired; nobody can administer this server until one does")
+	}
+	return nil
+}
+
+// adminCanAct reports whether some admin in list has, at now, a credential a
+// person administers with: a GitHub login, or a key not marked script that has
+// not expired.
+func adminCanAct(list map[string]config.UserConfig, now time.Time) bool {
+	for _, uc := range list {
+		if !uc.Admin {
+			continue
+		}
+		if uc.GitHub != "" {
+			return true
+		}
+		for _, kc := range uc.Keys {
+			if kc.Script {
+				continue
+			}
+			if exp, err := config.ParseKeyExpiry(kc.Expires); err == nil && (exp == nil || now.Before(*exp)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sortedNames returns m's keys, sorted.
+func sortedNames[V any](m map[string]V) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (l *ConfigLookup) size() int {
@@ -388,10 +554,13 @@ func (l *ConfigLookup) RefetchForUnknownKey(ctx context.Context, fp string) bool
 	}
 	// Not logged: whoever holds a dropped key can offer it at connection
 	// rate, and the drop itself was logged.
+	// So is a key the GitHub logins of two users publish (contested): a
+	// fetch cannot make it one user's while both still list it.
 	l.mu.RLock()
 	_, rejected := l.rejected[fp]
+	_, contested := l.contested[fp]
 	l.mu.RUnlock()
-	if rejected {
+	if rejected || contested {
 		return false
 	}
 	// Not logged either: running out was logged once.
@@ -527,15 +696,20 @@ type loginPlan struct {
 // read error is fatal (a config error); every GitHub failure falls back to
 // the last known keys.
 //
-// When one key appears in more than one source, the first source wins, in the
-// order inline keys, the keys file, then GitHub logins in config order. Every
-// key belongs to the implicit user, so the order decides only the provenance
-// that is reported.
+// When one key appears in more than one source of one user, the first source
+// wins, in the order keys listed by hand (auth.users), inline keys, the keys
+// file, then GitHub logins in config order; the order decides only the
+// provenance that is reported (and, for a key listed by hand, its expiry and
+// script flag). Across users see ConfigLookup: a key listed by hand stays its
+// user's, and a key the GitHub logins of two users publish is refused.
 func (l *ConfigLookup) rebuildKind(kind fetchKind) (RefreshReport, error) {
 	l.rebuildMu.Lock()
 	defer l.rebuildMu.Unlock()
 
 	set := make(map[string]keyEntry)
+	for _, e := range l.adhoc {
+		set[e.key.Fingerprint] = e
+	}
 	addAuthorizedKeys(set, []byte(strings.Join(l.inline, "\n")), ImplicitName, SourceInline, "")
 	if l.file != "" {
 		data, err := os.ReadFile(l.file)
@@ -644,6 +818,7 @@ func (l *ConfigLookup) rebuildKind(kind fetchKind) (RefreshReport, error) {
 		rejected[fp] = login
 	}
 	l.mu.RUnlock()
+	contested := map[string][]string{}
 	report := RefreshReport{Logins: make([]LoginRefresh, 0, len(plans))}
 	for i := range plans {
 		p := &plans[i]
@@ -716,9 +891,8 @@ func (l *ConfigLookup) rebuildKind(kind fetchKind) (RefreshReport, error) {
 				l.observed[p.g.key] = keysDigest(p.detected)
 			}
 		}
-		addAuthorizedKeys(set, p.data, p.g.user, SourceGitHub, p.g.login)
+		addGitHubKeys(set, contested, p.data, p.g.user, p.g.login)
 		row.Added, row.Removed = diffFingerprints(p.prev, p.data)
-		row.Keys = len(fingerprintsOf(p.data))
 		for _, fp := range row.Added {
 			log.Printf("auth.ssh: github login %q (account %d): accepted new key %s", p.g.login, row.PinnedID, fp)
 		}
@@ -727,6 +901,14 @@ func (l *ConfigLookup) rebuildKind(kind fetchKind) (RefreshReport, error) {
 		}
 		report.Logins = append(report.Logins, row)
 	}
+	// Each row's count is of the login's keys that are accepted: those of
+	// another source of the user, or contested, are not counted.
+	for i := range plans {
+		if plans[i].status != RefreshInvalidLogin {
+			report.Logins[i].Keys = acceptedFrom(set, plans[i].data, plans[i].g)
+		}
+	}
+	l.logContested(contested)
 
 	// A failed GitHub fetch falls back to last-known-good, so the set never
 	// shrinks on a transient outage; a key leaves only when its source
@@ -737,8 +919,81 @@ func (l *ConfigLookup) rebuildKind(kind fetchKind) (RefreshReport, error) {
 	l.mu.Lock()
 	l.keys = set
 	l.rejected = rejected
+	l.contested = contested
 	l.mu.Unlock()
 	return report, nil
+}
+
+// addGitHubKeys adds the keys in data (authorized_keys format), published by
+// the GitHub login login of user, to set. A key already in set as the same
+// user's keeps its first provenance. A key listed by hand under another user
+// stays that user's (logged). A key another user's GitHub login published as
+// well belongs to neither: it leaves set and is recorded in contested with
+// every user whose login publishes it. Best-effort, like addAuthorizedKeys.
+func addGitHubKeys(set map[string]keyEntry, contested map[string][]string, data []byte, user, login string) {
+	rest := data
+	for len(rest) > 0 {
+		key, comment, _, next, err := gossh.ParseAuthorizedKey(rest)
+		if err != nil {
+			return
+		}
+		rest = next
+		fp := gossh.FingerprintSHA256(key)
+		cert := isCertificate(key)
+		if cert && user != ImplicitName {
+			log.Printf("auth.users: github login %q of user %s publishes an SSH certificate (%s); a user's key is the plain key, so it is not accepted", login, user, fp)
+		}
+		if claimants, ok := contested[fp]; ok {
+			if !slices.Contains(claimants, user) {
+				contested[fp] = append(claimants, user)
+			}
+			continue
+		}
+		e, seen := set[fp]
+		switch {
+		case !seen:
+			set[fp] = keyEntry{user: user, key: Key{Fingerprint: fp, Source: SourceGitHub, Origin: login, Label: comment}, cert: cert}
+		case e.user == user:
+			// The user's own key from an earlier source: first wins.
+		case e.key.Source == SourceGitHub:
+			delete(set, fp)
+			contested[fp] = []string{e.user, user}
+		default:
+			log.Printf("auth.users: github login %q of user %s publishes key %s, which is listed by hand under user %s; it stays %s's",
+				login, user, fp, e.user, e.user)
+		}
+	}
+}
+
+// acceptedFrom counts the keys in data that set holds as g's: published by
+// its login and given to its user.
+func acceptedFrom(set map[string]keyEntry, data []byte, g githubLogin) int {
+	n := 0
+	for _, fp := range fingerprintsOf(data) {
+		if e, ok := set[fp]; ok && e.user == g.user && e.key.Source == SourceGitHub && e.key.Origin == g.login {
+			n++
+		}
+	}
+	return n
+}
+
+// logContested logs each key that became contested in this rebuild, and each
+// that stopped being so, against the set the previous rebuild left.
+func (l *ConfigLookup) logContested(now map[string][]string) {
+	l.mu.RLock()
+	before := l.contested
+	l.mu.RUnlock()
+	for _, fp := range sortedNames(now) {
+		if _, was := before[fp]; !was {
+			log.Printf("auth.users: SECURITY: key %s is published by the GitHub logins of users %s; it belongs to none of them and is refused for each until only one publishes it",
+				fp, strings.Join(now[fp], ", "))
+		}
+	}
+	for _, fp := range sortedNames(before) {
+		if _, still := now[fp]; !still {
+			log.Printf("auth.users: key %s is no longer published by more than one user's GitHub login", fp)
+		}
+	}
 }
 
 // fetchAll fetches every valid login concurrently and returns one plan per
@@ -973,7 +1228,7 @@ func addAuthorizedKeys(set map[string]keyEntry, data []byte, user string, source
 				Source:      source,
 				Origin:      origin,
 				Label:       comment,
-			}}
+			}, cert: isCertificate(key)}
 		}
 		rest = next
 	}

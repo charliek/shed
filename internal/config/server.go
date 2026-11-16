@@ -436,7 +436,10 @@ func (c *ServerConfig) validateAuth() error {
 	if c.HTTPSPort > 0 && !enforced {
 		return fmt.Errorf("https_port requires auth.mode: mtls (an open-mode server serves plain http only)")
 	}
-	return c.validateClients()
+	if err := c.validateClients(); err != nil {
+		return err
+	}
+	return c.validateUsers()
 }
 
 // clientNamePattern is the shape of a service client's name (auth.clients
@@ -602,18 +605,22 @@ func (c *ServerConfig) HTTPSListenAddr() string {
 func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.BindAddress, c.SSHPort) }
 
 // PreflightAuth gates enforced-mode startup: it refuses to start when
-// auth.mode: mtls is set without any SSH key source (github_users /
-// authorized_keys / authorized_keys_file). mtls enforces the SSH allowlist, so
-// an empty allowlist would lock everyone out, and it needs a key source to
-// identify which client gets a certificate issued over the bootstrap channel.
-// Inert in open mode.
+// auth.mode: mtls is set without any SSH key source (auth.users, or
+// auth.ssh's github_users / authorized_keys / authorized_keys_file). mtls
+// enforces the SSH allowlist, so an empty allowlist would lock everyone out,
+// and it needs a key source to identify which client gets a certificate
+// issued over the bootstrap channel. Inert in open mode.
 func (c *ServerConfig) PreflightAuth() error {
 	if !c.AuthEnforced() {
 		return nil
 	}
+	if c.UsersConfigured() {
+		// Config load guarantees every user has a login or a key.
+		return nil
+	}
 	ssh := c.SSHAuth()
 	if ssh == nil || (len(ssh.GitHubUsers) == 0 && len(ssh.AuthorizedKeys) == 0 && ssh.AuthorizedKeysFile == "") {
-		return fmt.Errorf("auth.mode: %s requires at least one SSH key source (auth.ssh.github_users, authorized_keys, or authorized_keys_file)", c.Auth.Mode)
+		return fmt.Errorf("auth.mode: %s requires at least one SSH key source (auth.users, or auth.ssh.github_users, authorized_keys, or authorized_keys_file)", c.Auth.Mode)
 	}
 	return nil
 }

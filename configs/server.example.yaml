@@ -83,6 +83,38 @@ env_file: ~/.shed/env
 #         images: []                 # default: only the default image
 #         caps: {cpus: 4, memory_mb: 8192}
 
+# --- Users (mtls only) ---
+# Without auth.users every accepted key is one implicit user, an admin. With a
+# user list each key belongs to exactly one user, and each user reaches only
+# their own sheds; an admin may also list, stop and delete anyone's shed (never
+# enter it) and use what the host shares (host directories, server mounts, the
+# image store). auth.users replaces auth.ssh's key sources (authorized_keys,
+# authorized_keys_file, github_users): set one or the other, not both.
+# A user needs a github login, a key, or both; at least one admin needs a
+# github login or a key not marked script. admin and script take true or false.
+# A key is a plain public key (an SSH certificate is refused) and may appear
+# once in the whole list. A GitHub login is pinned to its numeric account id at
+# its first fetch; github_id pins it from config instead.
+# expires is an RFC 3339 time or a date (the key works through that day, UTC).
+# A script key (script: true) cannot take a credentials certificate or use the
+# credential bus.
+# auth:
+#   mode: mtls
+#   users:
+#     alice:
+#       github: alice-gh
+#       admin: true
+#     bob:
+#       github: bob-gh
+#       github_id: 1234567
+#       keys:
+#         - key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... bob@laptop
+#           label: laptop
+#           expires: 2027-06-30
+#         - key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... ci
+#           label: ci
+#           script: true
+
 # --- HTTPS exec limits (POST /api/sheds/{name}/exec) ---
 # See docs/reference/configuration.md#https-exec
 # exec:

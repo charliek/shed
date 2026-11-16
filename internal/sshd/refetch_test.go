@@ -76,9 +76,9 @@ func dialUser(t *testing.T, addr, user string, signer gossh.Signer) bool {
 // as any valid shed name asks the lookup to fetch again, and is admitted on
 // that same attempt when the fetch finds it (whether the shed exists is
 // decided per channel, after authentication). A name that is not a valid
-// shed name never asks, and a key the lookup knows (an expired one included)
-// never asks. Deciding never looks a shed up: nothing about sheds is read
-// for a peer that has not authenticated.
+// shed name never asks, and a key the lookup knows never asks: an expired one
+// is refused at the door without asking. Deciding never looks a shed up:
+// nothing about sheds is read for a peer that has not authenticated.
 func TestUnknownKeyRefetchAtTheDoor(t *testing.T) {
 	newcomer := testSigner(t)
 	stranger := testSigner(t)
@@ -96,14 +96,15 @@ func TestUnknownKeyRefetchAtTheDoor(t *testing.T) {
 		{"../../etc", newcomer, false, false},
 		{"Not_A_Shed", newcomer, false, false},
 		{"box", stranger, false, true},
-		{"box", expired, true, false}, // known: admitted here, refused per channel
+		{"box", expired, false, false}, // known but expired: refused here, and never asks
 	} {
 		t.Run(tc.user, func(t *testing.T) {
 			lookup := &refetchLookup{Fake: userstest.Implicit(), upstream: gossh.FingerprintSHA256(newcomer.PublicKey())}
+			hourAgo := time.Now().Add(-time.Hour)
 			lookup.AddKey(users.ImplicitName, users.Key{
 				Fingerprint: gossh.FingerprintSHA256(expired.PublicKey()),
 				Source:      users.SourceInline,
-				Expires:     time.Now().Add(-time.Hour),
+				Expires:     &hourAgo,
 			})
 			be := &countingBackend{identityBackend: &identityBackend{}}
 			_, addr := identityServer(t, be, lookup)

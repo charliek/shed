@@ -166,7 +166,8 @@ func (g *Guard) Type() Type { return g.inner.Type() }
 func (g *Guard) Close() error { return g.inner.Close() }
 
 // CreateShed stamps the shed's owner and user from the principal, never from
-// the request, and applies the rules for what is shared on the host: a user
+// the request (a service client sets owner, a user sets user, never both),
+// and applies the rules for what is shared on the host: a user
 // who is not an admin gets no host directories, no server mounts and none of
 // the server's env_file variables. A shed made from a snapshot needs the
 // right to use that snapshot, which is then bound like a shed.
@@ -193,7 +194,14 @@ func (g *Guard) CreateShed(ctx context.Context, req config.CreateShedRequest) (*
 		}
 	}
 	g.acting("CreateShed", req.Name)
-	return showFor(ctx)(g.inner.CreateShed(ctx, req))
+	shed, err := g.inner.CreateShed(ctx, req)
+	if err != nil && errors.Is(err, config.ErrShedAlreadyExistsSentinel) && !p.unrestricted() {
+		// Names are unique per server, across users. A taken name is the
+		// usual conflict, worded the same whoever holds it, so it tells the
+		// caller nothing of whose the shed is or what it is like.
+		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
+	}
+	return showFor(ctx)(shed, err)
 }
 
 // hostResourceAsked names the first thing a create asks for that is shared on

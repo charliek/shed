@@ -1200,6 +1200,64 @@ type AuthConfig struct {
 	// create, run commands in and delete only their own sheds, within their
 	// policy. Keyed by client name.
 	Clients map[string]ServiceClientConfig `yaml:"clients,omitempty"`
+	// Users are the server's named users (mtls mode only), keyed by user
+	// name. With none, every accepted key belongs to one implicit user, an
+	// admin. With a list, every key belongs to exactly one named user, keys
+	// come only from here (auth.ssh's key sources are refused beside it), and
+	// each user reaches only their own sheds (an admin may also list, stop
+	// and delete anyone's). Unknown keys are refused at config load.
+	Users map[string]UserConfig `yaml:"users,omitempty"`
+}
+
+// UserConfig is one user under auth.users. A user needs a GitHub login, a key,
+// or both.
+type UserConfig struct {
+	// GitHub is a GitHub login whose published keys are this user's. It is
+	// pinned to its numeric account id at its first good fetch.
+	GitHub string `yaml:"github,omitempty"`
+	// GitHubID, when set, is the account id the login must name. It wins over
+	// the pin the server stored.
+	GitHubID int64 `yaml:"github_id,omitempty"`
+	// Admin users may list, stop and delete any shed (never enter another
+	// user's), and use what is shared on the host: host directories, server
+	// mounts, the image store.
+	Admin StrictBool `yaml:"admin,omitempty"`
+	// Keys are this user's keys listed by hand (ad hoc keys).
+	Keys []UserKeyConfig `yaml:"keys,omitempty"`
+}
+
+// UserKeyConfig is one ad hoc key of a user.
+type UserKeyConfig struct {
+	// Key is one OpenSSH authorized_keys line with no options.
+	Key string `yaml:"key"`
+	// Label names the key (unique per user); it is shown in logs.
+	Label string `yaml:"label"`
+	// Expires, when set, is when the key stops being accepted: an RFC 3339
+	// time, or a date (YYYY-MM-DD), which means the end of that day in UTC.
+	Expires string `yaml:"expires,omitempty"`
+	// Script marks a key used by automation: it may not take a credentials
+	// certificate, use the credential bus, or move a credential source.
+	Script StrictBool `yaml:"script,omitempty"`
+}
+
+// ParseKeyExpiry parses a UserKeyConfig.Expires value: an RFC 3339 time, or a
+// date (YYYY-MM-DD) meaning the end of that day in UTC (the key is accepted
+// through that date). "" is no expiry, a nil time. Every value that parses is
+// an expiry, the earliest time Go can hold (0001-01-01T00:00:00Z, the zero
+// time) included: "no expiry" is never spelled as a time.
+func ParseKeyExpiry(s string) (*time.Time, error) {
+	if s == "" {
+		return nil, nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return &t, nil
+	}
+	d, err := time.Parse(time.DateOnly, s)
+	if err != nil {
+		return nil, fmt.Errorf("expires %q is neither an RFC 3339 time nor a date (YYYY-MM-DD)", s)
+	}
+	d = d.AddDate(0, 0, 1)
+	return &d, nil
 }
 
 // DefaultClientCertMaxTTL is auth.clients.<name>.cert_max_ttl when unset.

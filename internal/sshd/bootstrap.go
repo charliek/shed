@@ -158,8 +158,15 @@ func (s *Server) mintBootstrap(key gossh.PublicKey, rawCmd string) (bootstrapBun
 	if err != nil {
 		return bootstrapBundle{}, err
 	}
+	if req.scope == authtoken.ScopeCredentials && s.keyAuth.script(gossh.FingerprintSHA256(key)) {
+		return bootstrapBundle{}, errBootstrapScriptCredentials
+	}
 	return s.mintClientCert(key, req)
 }
+
+// errBootstrapScriptCredentials refuses a credentials certificate to a script
+// key: a key used by automation never holds its user's credential bus.
+var errBootstrapScriptCredentials = errors.New("bootstrap: a script key cannot take the credentials scope")
 
 // clientProtocolErrors are the CA errors that are part of the enrollment
 // protocol: each describes something the CLIENT can fix (regenerate the key,

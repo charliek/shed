@@ -7,11 +7,12 @@
 // The interface carries no SSH types so internal/api can depend on it without
 // importing internal/sshd.
 //
-// Today there is no user list. Every key the server accepts belongs to one
-// implicit user, spelled as the empty string, who is an admin and passes every
-// check. Each key still records where it came from (an inline key, the keys
-// file or a GitHub login), so a later user list can give keys to named users
-// without losing that.
+// A server with no user list (no auth.users) has one implicit user, spelled as
+// the empty string, who is an admin and passes every check: every key the
+// server accepts is theirs. A server with a user list has named users only:
+// each key belongs to exactly one of them, and an unknown key is nobody's.
+// Each key records where it came from (an inline key, the keys file, a GitHub
+// login or a key listed by hand under a user).
 package users
 
 import (
@@ -54,6 +55,8 @@ const (
 	SourceFile Source = "file"
 	// SourceGitHub is a key a GitHub login publishes.
 	SourceGitHub Source = "github"
+	// SourceAdHoc is a key listed by hand under a user in auth.users.
+	SourceAdHoc Source = "adhoc"
 )
 
 // Key is one accepted SSH public key and where it came from.
@@ -65,20 +68,25 @@ type Key struct {
 	// Source is where the key came from.
 	Source Source
 	// Origin names the place within Source: the GitHub login for
-	// SourceGitHub, the keys file's path for SourceFile, "" for SourceInline.
+	// SourceGitHub, the keys file's path for SourceFile, "" for SourceInline
+	// and SourceAdHoc.
 	Origin string
-	// Label is the key's comment from its authorized_keys line, if any.
+	// Label is the key's label in auth.users (SourceAdHoc), or its comment
+	// from its authorized_keys line, if any.
 	Label string
-	// Expires is when the key stops being accepted; zero means never.
-	Expires time.Time
-	// Script marks a key meant for automation rather than a person.
+	// Expires is when the key stops being accepted; nil means never. Any
+	// time it points at is an expiry, the zero time included.
+	Expires *time.Time
+	// Script marks a key meant for automation rather than a person. It may
+	// not take a credentials certificate, use the credential bus, or move a
+	// credential source.
 	Script bool
 }
 
 // Expired reports whether k has stopped being accepted at now: it has an
 // expiry, and now is not before it.
 func (k Key) Expired(now time.Time) bool {
-	return !k.Expires.IsZero() && !now.Before(k.Expires)
+	return k.Expires != nil && !now.Before(*k.Expires)
 }
 
 // Lookup is the user seam. Implementations must answer from live state (a key
@@ -179,13 +187,24 @@ type LoginRefresh struct {
 	Error string
 }
 
-// HasKey reports whether l resolves the fingerprint to a user. It is the one
-// "is this key accepted?" check every front door asks. A nil Lookup accepts
-// nothing.
+// HasKey reports whether l resolves the fingerprint to a user and the key has
+// not expired. It is the one "is this key accepted?" check every front door
+// asks. A nil Lookup accepts nothing.
 func HasKey(l Lookup, fingerprint string) bool {
 	if l == nil {
 		return false
 	}
-	_, _, ok := l.UserForKey(fingerprint)
-	return ok
+	_, k, ok := l.UserForKey(fingerprint)
+	return ok && !k.Expired(time.Now())
+}
+
+// HasUserList reports whether l has named users: a server whose lookup does
+// not answer for the implicit user. On such a server an unknown key is
+// nobody's, in every SSH mode, and never an admin. A nil Lookup has none.
+func HasUserList(l Lookup) bool {
+	if l == nil {
+		return false
+	}
+	u, ok := l.User(ImplicitName)
+	return !ok || !u.Implicit
 }

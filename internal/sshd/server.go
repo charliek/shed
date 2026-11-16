@@ -54,14 +54,44 @@ type KeyAuth struct {
 	Users users.Lookup
 }
 
-// enforced reports whether keys the lookup does not resolve are refused.
-func (k KeyAuth) enforced() bool { return k.Mode == config.SSHAuthEnforce }
+// enforced reports whether keys the lookup does not resolve are refused: in
+// enforce mode, and always on a server with a user list, where an unknown key
+// is nobody's whatever the mode says (config load allows a user list in mtls
+// only, which forces enforce; this holds for any caller).
+func (k KeyAuth) enforced() bool {
+	return k.Mode == config.SSHAuthEnforce || users.HasUserList(k.Users)
+}
 
-// off reports whether every key is accepted without a lookup.
-func (k KeyAuth) off() bool { return k.Mode == "" || k.Mode == config.SSHAuthOff }
+// off reports whether every key is accepted without a lookup: off mode, on a
+// server with no user list.
+func (k KeyAuth) off() bool {
+	return (k.Mode == "" || k.Mode == config.SSHAuthOff) && !users.HasUserList(k.Users)
+}
 
-// known reports whether the lookup resolves the key's fingerprint to a user.
+// known reports whether the lookup resolves the key's fingerprint to a user
+// and the key has not expired.
 func (k KeyAuth) known(fingerprint string) bool { return users.HasKey(k.Users, fingerprint) }
+
+// script reports whether the lookup resolves the key's fingerprint to a script
+// key (users.Key.Script).
+func (k KeyAuth) script(fingerprint string) bool {
+	if k.Users == nil {
+		return false
+	}
+	_, key, ok := k.Users.UserForKey(fingerprint)
+	return ok && key.Script
+}
+
+// expired reports whether the lookup resolves the key's fingerprint to a key
+// whose expiry has passed. Such a key is refused, and never makes the server
+// look for keys on GitHub.
+func (k KeyAuth) expired(fingerprint string) bool {
+	if k.Users == nil {
+		return false
+	}
+	_, key, ok := k.Users.UserForKey(fingerprint)
+	return ok && key.Expired(time.Now())
+}
 
 // NewServer creates a new SSH server. listenAddr is the TCP bind address
 // (e.g. "127.0.0.1:2222" for loopback (the default), "<tailnet-ip>:2222", or
@@ -259,9 +289,11 @@ func (s *Server) effectiveMaxAuthTries() int {
 }
 
 // handlePublicKey gates public-key auth through the user lookup: a key is
-// authorized when the lookup resolves its fingerprint to a user. With key auth
-// off (default), every key is accepted (legacy). In warn mode an unresolved key
-// is logged but accepted; in enforce mode it is rejected. The username (which
+// authorized when the lookup resolves its fingerprint to a user and it has not
+// expired (an expired key is refused in every mode the lookup is asked in). With
+// key auth off (default), every key is accepted (legacy). In warn mode an
+// unresolved key is logged but accepted; in enforce mode, and on any server
+// with a user list, it is rejected. The username (which
 // selects the shed) is unaffected — identity comes from the key, GitHub-style.
 // Applies uniformly to all usernames, including `_api`.
 //
@@ -282,6 +314,17 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 		return true
 	}
 
+	// On a server with a user list a user's key is the plain key: an SSH
+	// certificate would be a second identity for whoever holds the key in
+	// it (the lookup resolves none to a user either).
+	if _, cert := key.(*gossh.Certificate); cert && users.HasUserList(s.keyAuth.Users) {
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s (an SSH certificate; this server's users log in with plain keys)", user, fingerprint)
+		return false
+	}
+	if s.keyAuth.expired(fingerprint) {
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s (the key has expired)", user, fingerprint)
+		return false
+	}
 	authorized := s.keyAuth.known(fingerprint)
 	if !authorized && s.refetchUnknownKey(ctx, user, fingerprint) {
 		log.Printf("SSH auth: key %s is known after fetching the GitHub logins again", fingerprint)

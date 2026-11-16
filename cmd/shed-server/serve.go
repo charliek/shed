@@ -202,10 +202,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// The registry tracks pending requests in every mode, so a response is
 	// always delivered to the shed connection its request came from. The
 	// bridge routes each shed's requests to its user's listeners; a server
-	// with no user list (the only kind that loads today) routes every shed
-	// as the implicit user.
+	// with no user list (auth.users) routes every shed as the implicit user,
+	// whatever user its record carries.
 	pluginRegistry := plugin.NewRegistry()
-	pluginBridge := plugin.NewBridge(pluginRegistry, false)
+	pluginBridge := newPluginBridge(cfg, pluginRegistry)
 
 	// Initialize the configured backend. egressSocketDir + attachEgress are
 	// captured per-backend so the egress proxy (constructed once, below) can
@@ -390,24 +390,21 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	log.Printf("State dir: %s", stateDir)
 	hostKeyPath := filepath.Join(stateDir, "host_key")
-	githubCacheDir := filepath.Join(stateDir, "github_keys")
 	// Every GitHub fetch (the first, the scheduled refresh, `shed users
 	// refresh`, an unknown key's) is bound to refreshCtx, cancelled at
 	// shutdown so a fetch in flight ends then.
 	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
 	defer cancelRefresh()
-	// Each GitHub login is pinned to its numeric account id at its first good
-	// fetch, in the pin store next to the key cache.
-	userLookup, err := users.NewConfigLookup(users.ConfigOptions{
-		SSH:            cfg.EffectiveSSHAuth(),
-		GitHubCacheDir: githubCacheDir,
-		PinsPath:       filepath.Join(stateDir, users.PinsFileName),
-		Context:        refreshCtx,
-	})
+	userLookup, err := newUserLookup(refreshCtx, cfg, stateDir)
 	if err != nil {
 		return fmt.Errorf("ssh auth: %w", err)
 	}
 	log.Printf("SSH auth mode: %s", userLookup.Mode())
+	if names := cfg.UserNames(); len(names) > 0 {
+		log.Printf("Users: %s (each key belongs to one user; an unknown key is nobody's)", strings.Join(names, ", "))
+	} else {
+		log.Printf("Users: none configured (every accepted key is the implicit user, an admin)")
+	}
 
 	// Refresh GitHub-seeded keys in the background until shutdown.
 	userLookup.StartRefresh(refreshCtx)
@@ -631,6 +628,34 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	log.Printf("Shutdown complete")
 	return nil
+}
+
+// newPluginBridge builds the credential bus bridge over reg. It routes each
+// shed's requests to its user's listeners on a server with a user list
+// (auth.users); without one, every shed routes as the implicit user whatever
+// user its record carries.
+func newPluginBridge(cfg *config.ServerConfig, reg *plugin.Registry) *plugin.Bridge {
+	return plugin.NewBridge(reg, cfg.UsersConfigured())
+}
+
+// newUserLookup builds the user lookup both front doors ask: the SSH key
+// allowlist (auth.ssh, default off = accept all) with every key the implicit
+// user's, or, with auth.users, each user's keys. GitHub-seeded keys are cached
+// in stateDir/github_keys, and each GitHub login is pinned to its numeric
+// account id at its first good fetch, in the pin store next to the cache (a
+// user's github_id, when configured, wins). Every fetch is bound to ctx.
+func newUserLookup(ctx context.Context, cfg *config.ServerConfig, stateDir string) (*users.ConfigLookup, error) {
+	var list map[string]config.UserConfig
+	if cfg.UsersConfigured() {
+		list = cfg.Auth.Users
+	}
+	return users.NewConfigLookup(users.ConfigOptions{
+		SSH:            cfg.EffectiveSSHAuth(),
+		GitHubCacheDir: filepath.Join(stateDir, "github_keys"),
+		PinsPath:       filepath.Join(stateDir, users.PinsFileName),
+		Context:        ctx,
+		Users:          list,
+	})
 }
 
 // configWatchPath names the config file in a startup stall line: the --config

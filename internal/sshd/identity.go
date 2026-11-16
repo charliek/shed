@@ -63,7 +63,7 @@ func (s *Server) principalFor(ctx context.Context) (backend.Principal, error) {
 			if k.Expired(time.Now()) {
 				return backend.Principal{}, fmt.Errorf("key %s expired at %s", id.fingerprint, k.Expires.UTC().Format(time.RFC3339))
 			}
-			return principalOf(u), nil
+			return principalOf(u, k), nil
 		}
 	}
 	if s.keyAuth.enforced() {
@@ -78,12 +78,15 @@ func (s *Server) principalFor(ctx context.Context) (backend.Principal, error) {
 	return backend.Principal{}, fmt.Errorf("key %s belongs to no user", id.fingerprint)
 }
 
-// principalOf is the principal of user u.
-func principalOf(u users.User) backend.Principal {
+// principalOf is the principal of user u acting with key k: the user's admin
+// flag as configured now, and the key's script flag.
+func principalOf(u users.User, k users.Key) backend.Principal {
 	if u.Implicit {
 		return backend.ImplicitPrincipal()
 	}
-	return backend.UserPrincipal(u.Name, u.Admin)
+	p := backend.UserPrincipal(u.Name, u.Admin)
+	p.Script = k.Script
+	return p
 }
 
 // guard returns the access guard the server's backend calls go through.

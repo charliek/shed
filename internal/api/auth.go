@@ -148,7 +148,7 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 			refuseInvalid(w, r)
 			return
 		}
-		user, ok := s.certSubjectUser(leaf.Subject.CommonName)
+		user, key, ok := s.certSubjectUser(leaf.Subject.CommonName)
 		if !ok {
 			closeIdentityBoundConnection(w, r)
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is not authorized")
@@ -159,9 +159,10 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		// The caller is the user the certificate's key belongs to, read from
-		// the live lookup on every request like the check above. On a server
-		// with no user list that is the implicit user, an admin.
-		caller := userCaller(user, leaf.Subject.CommonName, certSerial(leaf))
+		// the live lookup on every request like the check above, with the
+		// user's admin flag and the key's script flag as configured now. On a
+		// server with no user list that is the implicit user, an admin.
+		caller := userCaller(user, key, leaf.Subject.CommonName, certSerial(leaf))
 		next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), caller)))
 	})
 }
@@ -256,18 +257,18 @@ func certScope(leaf *x509.Certificate) string {
 }
 
 // certSubjectUser returns the user a client certificate's Subject CN (an SSH
-// key fingerprint) still resolves to through the live user lookup. ok is false
-// for a key that resolves to nobody, an expired key, and with a nil lookup (no
-// SetUserLookup call) — fail closed.
-func (s *Server) certSubjectUser(cn string) (users.User, bool) {
+// key fingerprint) still resolves to through the live user lookup, and the
+// key. ok is false for a key that resolves to nobody, an expired key, and with
+// a nil lookup (no SetUserLookup call) — fail closed.
+func (s *Server) certSubjectUser(cn string) (users.User, users.Key, bool) {
 	if s.users == nil {
-		return users.User{}, false
+		return users.User{}, users.Key{}, false
 	}
 	u, k, ok := s.users.UserForKey(cn)
 	if !ok || k.Expired(time.Now()) {
-		return users.User{}, false
+		return users.User{}, users.Key{}, false
 	}
-	return u, true
+	return u, k, true
 }
 
 // isCredentialBusPath reports whether path is the credential bus (/api/plugins*),
