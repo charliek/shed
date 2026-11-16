@@ -1447,11 +1447,13 @@ def sse_listener(tmp_path):
     _openssl("x509", "-req", "-in", str(d / "client.csr"), "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
              "-CAcreateserial", "-days", "1", "-out", str(d / "client.pem"))
     stop = threading.Event()
+    seen_headers: list[dict] = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def do_GET(self):
+            seen_headers.append(dict(self.headers.items()))
             ns = self.path.removeprefix("/api/plugins/listeners/").removesuffix("/messages")
             if ns not in ("ok", "ends", "ka") or not self.path.endswith("/messages"):
                 body = b'{"error":{"code":"FORBIDDEN","message":"no"}}'
@@ -1495,7 +1497,8 @@ def sse_listener(tmp_path):
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     pin = tlsclient.fingerprint((d / "server.pem").read_text())
-    yield {"port": srv.server_address[1], "pin": pin, "pair": (str(d / "client.pem"), str(d / "client.key"))}
+    yield {"port": srv.server_address[1], "pin": pin, "pair": (str(d / "client.pem"), str(d / "client.key")),
+           "headers": seen_headers}
     stop.set()
     srv.shutdown()
     srv.server_close()
@@ -1542,6 +1545,41 @@ def test_bus_listener_alive_after_needs_activity_after_the_point(sse_listener):
         assert quiet.alive_after(before, 1)
         assert not quiet.alive_after(time.monotonic(), 0.6)
         assert quiet.error is None
+
+
+def test_machine_headers_are_stable_per_identity():
+    import re
+    import urllib.parse
+    a, a2, b = busclient.machine_headers("alice"), busclient.machine_headers("alice"), busclient.machine_headers("bob")
+    assert a == a2, "an identity's machine changed between calls"
+    assert a[busclient.MACHINE_ID_HEADER] != b[busclient.MACHINE_ID_HEADER], "two identities share a machine"
+    for h in (a, b):
+        assert re.fullmatch(r"[0-9a-f]{32}", h[busclient.MACHINE_ID_HEADER])
+        name = urllib.parse.unquote(h[busclient.MACHINE_NAME_HEADER])
+        assert 1 <= len(name.encode()) <= 63
+        assert all(0x20 <= ord(c) <= 0x7E for c in h[busclient.MACHINE_NAME_HEADER])
+
+
+def test_bus_listener_names_its_machine(sse_listener):
+    s = sse_listener
+    with busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "ok", name="alice") as listener:
+        assert listener.open() == (200, None)
+    with busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "ok", name="x", machine="bob") as listener:
+        assert listener.open() == (200, None)
+    sent = [{k.lower(): v for k, v in h.items()} for h in s["headers"][-2:]]
+    for got, who in zip(sent, ("alice", "bob")):
+        want = busclient.machine_headers(who)
+        assert got.get(busclient.MACHINE_ID_HEADER.lower()) == want[busclient.MACHINE_ID_HEADER], got
+        assert got.get(busclient.MACHINE_NAME_HEADER.lower()) == want[busclient.MACHINE_NAME_HEADER], got
+
+
+def test_pinned_request_sends_extra_headers(sse_listener):
+    s = sse_listener
+    status, body = tlsclient.pinned_request("127.0.0.1", s["port"], "/api/plugins/listeners/refused/messages",
+                                            s["pin"], s["pair"], headers=busclient.machine_headers("carol"))
+    assert status == 403, body
+    got = {k.lower(): v for k, v in s["headers"][-1].items()}
+    assert got.get(busclient.MACHINE_ID_HEADER.lower()) == busclient.machine_id("carol"), got
 
 
 def test_bus_listener_reports_a_refused_subscribe(sse_listener):

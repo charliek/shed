@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/source"
 )
 
 // SendFunc writes one response envelope into a shed's transport. It takes
@@ -511,11 +512,54 @@ type Response struct {
 // response that matched one of the user's own requests takes a slot, so
 // nobody else can use up a shed's slots. The caller calls Send, then End.
 func (b *Bridge) BeginResponse(user string, env *Envelope) (*Response, error) {
+	return b.BeginResponseFrom(user, "", env)
+}
+
+// respondGateHook, when set (tests only), runs in BeginResponseFrom with the
+// user's gate held, after the binding was checked and before the request is
+// matched.
+var respondGateHook func(user string)
+
+// BeginResponseFrom is BeginResponse for an answer sent by machine
+// machineID. On a registry with source bindings the answer is accepted only
+// from the user's bound machine, and matches only a request delivered to that
+// machine at the binding's current generation: it is checked, and the request
+// matched and its slot taken, under the user's gate, which a move holds
+// across its change of the binding and its clean-up. A machine that is not
+// the user's bound one gets a *NotBoundError; when the gate is not had by the
+// response's deadline, ErrResponseTimeout (retryable; nothing was matched).
+// With no source bindings machineID must be "" (the stamp every request has
+// there). Send then writes the answer only while the request's stamp is
+// still current (Response.Send).
+func (b *Bridge) BeginResponseFrom(user, machineID string, env *Envelope) (*Response, error) {
 	deadline := time.Now().Add(responseTimeout)
 	if b.registry == nil || env.Shed == nil {
 		return nil, ErrUnmatched
 	}
-	m := b.registry.match(user, env.Namespace, env.Shed.Name, env.InReplyTo)
+	st := stamp{machine: machineID}
+	if pin := b.registry.pin(); pin != nil {
+		g := b.registry.gate(user)
+		if !g.lockBy(deadline) {
+			return nil, ErrResponseTimeout
+		}
+		defer g.unlock()
+		bd, ok := pin.Get(user)
+		if !ok {
+			// No machine is the user's source, so none was sent a request:
+			// nothing can match.
+			return nil, ErrUnmatched
+		}
+		if bd.MachineID() != machineID {
+			bound := boundMachine(pin, user)
+			g.logRefusal(user, bd, source.Machine{ID: machineID}, "an answer", bound)
+			return nil, &NotBoundError{User: user, Bound: bound}
+		}
+		st.gen = bd.Generation
+		if respondGateHook != nil {
+			respondGateHook(user)
+		}
+	}
+	m := b.registry.matchFrom(user, st, env.Namespace, env.Shed.Name, env.InReplyTo)
 	if m == nil {
 		return nil, ErrUnmatched
 	}
@@ -543,7 +587,10 @@ func (r *Response) End() { r.e.responses.Add(-1) }
 // immediately before the write: it must still be pending, and the route it
 // was published on must still be its connection's, so a response that waited
 // for the write lock is not written after the shed's user changed, its route
-// was held or its connection was retired (ErrUnmatched). A final response
+// was held or its connection was retired (ErrUnmatched); and with source
+// bindings the machine it was delivered to must still be the user's binding
+// at the same generation, so an answer is never written after a move
+// (*NotBoundError). A final response
 // consumes its request once its frame has been written, and not before: when
 // the write lock is not had by the deadline (ErrResponseTimeout) nothing was
 // written and the request is still pending, so the response can be retried.
@@ -554,6 +601,11 @@ func (r *Response) Send() error {
 	return r.e.send(r.env, r.deadline,
 		func() error {
 			if !reg.admit(m) {
+				// A move of the binding since the match: the answering
+				// machine is no longer the user's source.
+				if pin := reg.pin(); pin != nil && !pin.Current(m.user, m.machine, m.gen) {
+					return &NotBoundError{User: m.user, Bound: boundMachine(pin, m.user)}
+				}
 				return fmt.Errorf("shed %q: %w", m.shed, ErrUnmatched)
 			}
 			return nil

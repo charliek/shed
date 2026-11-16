@@ -23,6 +23,7 @@ import (
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/internal/source"
 	"github.com/charliek/shed/internal/sshd"
 	"github.com/charliek/shed/internal/stallwatch"
 	"github.com/charliek/shed/internal/users"
@@ -57,6 +58,10 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 		ReadHeaderTimeout: httpReadHeaderTimeout,
 		ReadTimeout:       httpReadTimeout,
 		IdleTimeout:       httpIdleTimeout,
+		// Puts the connection on each request's context, so a
+		// credential-bus stream can bound how long data written to it may
+		// stay unacknowledged (a machine that went to sleep is reaped).
+		ConnContext: api.ConnContext,
 	}
 }
 
@@ -284,6 +289,32 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	defer be.Close()
 
+	// The credential bus pin: the store of each user's credential source,
+	// in the backend's persistent state directory (beside the audit logs;
+	// not the server state directory, which a parallel dev server may
+	// share). The server does not start without it: starting with none would
+	// let the next machine to connect become a user's source. The registry
+	// takes it now, before anything can register a listener; the start-up
+	// steps of the user list (stampUnassigned) act on it before the
+	// listeners start.
+	bindingsPath := filepath.Join(egressStateDir, source.FileName)
+	stopWatch = stallwatch.Watch("opening the credential source bindings", bindingsPath)
+	sourceBindings, created, err := source.OpenFileBindings(bindingsPath, source.Options{})
+	stopWatch()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := sourceBindings.Close(); err != nil {
+			log.Printf("credential source bindings: closing %s: %v", bindingsPath, err)
+		}
+	}()
+	if created {
+		log.Printf("WARNING: %s", source.StartedEmptyWarning(bindingsPath))
+	}
+	log.Printf("Credential source bindings: %s", bindingsPath)
+	pluginRegistry.SetBindings(sourceBindings)
+
 	// The host dials the guest, so nothing re-establishes a running shed's
 	// message channel on its own after a server restart — the plugin bridge
 	// would hold no registration and `shed list -vv` would report no
@@ -307,7 +338,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// cloud list has rebuilt its records, and moves the bus routes it
 	// resumed.
 	if waitBackendReady == nil {
-		stampUnassigned(cfg, be)
+		if _, _, err := stampUnassigned(cfg, be, sourceBindings); err != nil {
+			return err
+		}
 	}
 	resumeCtx, cancelResume := context.WithCancel(context.Background())
 	defer cancelResume()
@@ -323,7 +356,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		stampUnassigned(cfg, be)
+		if _, _, err := stampUnassigned(cfg, be, sourceBindings); err != nil {
+			return err
+		}
 	}
 
 	// Optional egress-control proxy child, started only when enabled. A start
@@ -614,6 +649,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
+	// Credential-bus streams never end on their own, so a graceful
+	// shutdown would wait out its whole timeout for them: close them (and
+	// refuse new subscriptions) first.
+	log.Printf("Closing credential bus streams...")
+	pluginRegistry.Close()
+
 	// Shutdown HTTP server (when serving — skipped in mtls mode)
 	if httpServer != nil {
 		log.Printf("Shutting down HTTP server...")
@@ -645,8 +686,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 // in time is logged and tried again at the next start.
 const upgradePassTimeout = 2 * time.Minute
 
-// stampUnassigned runs the start-up pass over sheds and snapshots made before
-// the server had a user list (backend.StampUnassigned) on the raw backend, as
+// stampUnassigned runs, first, the start-up step for the credential source
+// bindings (applySourceUpgrade), and then the start-up pass over sheds and
+// snapshots made before the server had a user list (backend.StampUnassigned) on the raw backend, as
 // a one-time upgrade step recorded by a marker in the server's state
 // directory (backend.OpenUsersUpgrade). With no user list it stamps nothing
 // and removes the marker. On the first start with a user list, with exactly
@@ -657,15 +699,22 @@ const upgradePassTimeout = 2 * time.Minute
 // anything, so a pass that then fails cannot lose it. On every later start nothing is
 // stamped. It logs how many sheds it found with no user, naming them when
 // log_level is debug. The returned UsersUpgrade carries the "first start
-// with a user list" decision for the other one-time steps of adding one.
-func stampUnassigned(cfg *config.ServerConfig, be backend.Backend) (backend.UpgradeReport, *backend.UsersUpgrade) {
-	return stampUnassignedIn(cfg, be, serverStateDir(cfg))
+// with a user list" decision for the other one-time steps of adding one. An
+// error (only from the source bindings' step) means the server must not
+// start: the marker has not been written, so the step runs again.
+func stampUnassigned(cfg *config.ServerConfig, be backend.Backend, bindings source.Bindings) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
+	return stampUnassignedIn(cfg, be, serverStateDir(cfg), bindings)
 }
 
 // stampUnassignedIn is stampUnassigned with the marker in stateDir.
-func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir string) (backend.UpgradeReport, *backend.UsersUpgrade) {
+func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir string, bindings source.Bindings) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
 	users := upgradeUsers(cfg)
 	upgrade := backend.OpenUsersUpgrade(stateDir, len(users) > 0, log.Printf)
+	// The source bindings' step runs before the marker can be written by
+	// either branch below, so a start that fails it records nothing.
+	if err := applySourceUpgrade(bindings, upgrade, cfg.UserNames()); err != nil {
+		return backend.UpgradeReport{}, upgrade, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), upgradePassTimeout)
 	defer cancel()
 	debugf := func(string, ...any) {}
@@ -699,7 +748,73 @@ func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir st
 			}
 		}
 	}
-	return rep, upgrade
+	return rep, upgrade, nil
+}
+
+// applySourceUpgrade is the start-up step for the credential source bindings
+// when a user list is added later, run before any listener can register:
+//
+//   - On the first start with a user list (the same one-time decision as
+//     the shed upgrade step, UsersUpgrade.FirstUserListStart): with exactly
+//     one configured user, the implicit user's binding and remembered
+//     machines become that user's (AdoptImplicit; when the user already has
+//     records of their own, the implicit ones are dropped instead); with
+//     several users they are dropped.
+//   - At every start, the records of every user that is not configured are
+//     dropped (RetainUsers with the configured names, or with the implicit
+//     user alone when there is no user list), so a name configured again
+//     later starts clean. With no user list nothing is adopted, and only
+//     named users' records (unreachable without a user list) are dropped.
+//
+// It runs before the one-time marker is written. A crash after the adoption
+// and before the marker leaves the adopted binding in place and no marker:
+// the next start is again the first with a user list, and its AdoptImplicit
+// finds no implicit records and changes nothing, so the step is safe to run
+// twice. A store that cannot be written fails the start (the marker is then
+// not written either), as a store that cannot be opened does.
+func applySourceUpgrade(b source.Bindings, upgrade *backend.UsersUpgrade, names []string) error {
+	if b == nil {
+		return nil
+	}
+	keep := names
+	if len(names) == 0 {
+		keep = []string{source.ImplicitUser}
+	} else if upgrade.FirstUserListStart() {
+		if len(names) == 1 {
+			ad, err := b.AdoptImplicit(names[0])
+			if err != nil {
+				return fmt.Errorf("credential source bindings: giving the server's credential source to user %q: %w", names[0], err)
+			}
+			switch {
+			case ad.Adopted && ad.Binding != nil:
+				log.Printf("Users: the credential source of the server before its user list (machine %s) is now user %s's, with %d remembered machine(s)", ad.Binding.MachineID(), names[0], ad.Machines)
+			case ad.Adopted:
+				log.Printf("Users: the %d machine(s) remembered before the user list are now user %s's", ad.Machines, names[0])
+			case ad.Dropped:
+				log.Printf("Users: user %s already has credential source records; those from before the user list (%d machine(s)) were dropped", names[0], ad.Machines)
+			}
+		} else {
+			dropped, err := b.Drop(source.ImplicitUser)
+			if err != nil {
+				return fmt.Errorf("credential source bindings: dropping the credential source from before the user list: %w", err)
+			}
+			if dropped {
+				log.Printf("Users: several users are configured, so the credential source from before the user list was dropped; each user's first machine to connect becomes theirs")
+			}
+		}
+	}
+	dropped, err := b.RetainUsers(keep)
+	if err != nil {
+		return fmt.Errorf("credential source bindings: dropping the records of users no longer configured: %w", err)
+	}
+	for _, u := range dropped {
+		if u == source.ImplicitUser {
+			log.Printf("Users: dropped the credential source records from before the user list")
+		} else {
+			log.Printf("Users: dropped the credential source records of %q, which is not a configured user", u)
+		}
+	}
+	return nil
 }
 
 // upgradeUsers is the configured user list (auth.users) as the start-up pass

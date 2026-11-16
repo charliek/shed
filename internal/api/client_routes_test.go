@@ -322,9 +322,13 @@ func do(h http.Handler, leaf *x509.Certificate, method, path, body string, hdr .
 	for i := 0; i+1 < len(hdr); i += 2 {
 		req.Header.Set(hdr[i], hdr[i+1])
 	}
+	fp := ""
 	if leaf != nil {
 		withClientCert(req, leaf)
+		fp = leaf.Subject.CommonName
 	}
+	// The key's own machine, for the credential bus (other routes ignore it).
+	withTestMachine(req, fp)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return apiResp{rec.Code, rec.Body.Bytes(), rec.Header()}

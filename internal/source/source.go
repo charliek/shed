@@ -86,7 +86,9 @@
 //     fails the operation and leaves the in-memory state as it was. Writes
 //     must not be called while holding a lock that a path without a deadline
 //     waits for (the registry's r.mu, the bridge's b.mu): they may wait for
-//     the disk.
+//     the disk. Seen changes only the in-memory last-seen time and never
+//     saves, but it takes the same mutex (so it cannot undo a concurrent
+//     change), and so it follows the same rule.
 //   - The store takes none of the caller's locks and calls nothing of the
 //     caller's, so the caller's own locks always come first.
 //
@@ -352,6 +354,15 @@ type Bindings interface {
 	// Current reports whether user's binding is still to machineID at
 	// generation.
 	Current(user, machineID string, generation uint64) bool
+	// Seen notes that user's machine machineID, which the store already
+	// remembers, presented itself now: its last-seen time (kept in memory
+	// only, and what eviction orders by) becomes now, and nothing else
+	// changes. It never saves, so it cannot fail and writes nothing to disk;
+	// it reports whether the store remembers the machine (when it does not,
+	// nothing changes). Unlike Admit it records nothing the machine presents
+	// (its name and key fingerprint stay as they were). It serializes with the
+	// writes, so the calling rule for writes applies to it.
+	Seen(user, machineID string) bool
 	// AdoptImplicit makes the implicit user's binding and machines the named
 	// user's, or drops them when that user already has records.
 	AdoptImplicit(user string) (Adoption, error)

@@ -33,15 +33,13 @@ func TestBusRespondRefusesBeyondTheShedsResponseBound(t *testing.T) {
 	s := busUsersServer(t)
 	box := &sendCounter{}
 	gen := s.bridge.RegisterShed("box", &plugin.ShedConn{User: "alice", CreatedAt: busT1, Send: box.send})
-	if _, err := s.plugins.Register(plugin.ListenerKey{User: "alice", Namespace: "ssh-agent"}); err != nil {
-		t.Fatal(err)
-	}
+	listen(t, s, "alice", "ssh-agent", aliceFP)
 	id := publishFromShed(t, s, "box", gen)
 
 	// Every response slot of box is taken by a delivery in progress.
 	var inFlight []*plugin.Response
 	for {
-		resp, err := s.bridge.BeginResponse("alice", answerEnvelope("box", id))
+		resp, err := s.bridge.BeginResponseFrom("alice", testMachineFor(aliceFP).ID, answerEnvelope("box", id))
 		if errors.Is(err, plugin.ErrTooManyResponses) {
 			break
 		}
@@ -102,9 +100,7 @@ func TestBusRespondNotWrittenInTimeCanBeRetried(t *testing.T) {
 			wrote()
 			return nil
 		}})
-	if _, err := s.plugins.Register(plugin.ListenerKey{User: "alice", Namespace: "ssh-agent"}); err != nil {
-		t.Fatal(err)
-	}
+	listen(t, s, "alice", "ssh-agent", aliceFP)
 	id := publishFromShed(t, s, "box", gen)
 	const path = "/api/plugins/listeners/ssh-agent/respond"
 
@@ -151,9 +147,7 @@ func TestBusRespondBodyIsCapped(t *testing.T) {
 	s := busUsersServer(t)
 	box := &sendCounter{}
 	gen := s.bridge.RegisterShed("box", &plugin.ShedConn{User: "alice", CreatedAt: busT1, Send: box.send})
-	if _, err := s.plugins.Register(plugin.ListenerKey{User: "alice", Namespace: "ssh-agent"}); err != nil {
-		t.Fatal(err)
-	}
+	listen(t, s, "alice", "ssh-agent", aliceFP)
 	id := publishFromShed(t, s, "box", gen)
 	const path = "/api/plugins/listeners/ssh-agent/respond"
 

@@ -710,6 +710,72 @@ func Run(t *testing.T, h Harness) {
 		}
 	})
 
+	t.Run("seen keeps a known machine fresh in memory and records nothing", func(t *testing.T) {
+		in, clk := newInst(t)
+		admit(t, in.Bindings, "alice", M(1))
+		admit(t, in.Bindings, "alice", M(2))
+		w := in.Writes()
+		before := snapshot(in.Bindings)
+		clk.Advance(time.Minute)
+		if !in.Bindings.Seen("alice", ID(2)) {
+			t.Fatal("Seen of a remembered machine = false")
+		}
+		if in.Writes() != w {
+			t.Fatalf("Seen wrote %d times; want 0", in.Writes()-w)
+		}
+		// A failing save would fail any write: Seen never saves.
+		in.FailWrites(errInjected)
+		clk.Advance(time.Minute)
+		if !in.Bindings.Seen("alice", ID(2)) {
+			t.Fatal("Seen with failing saves = false")
+		}
+		var got source.Machine
+		for _, m := range in.Bindings.Machines("alice") {
+			if m.ID == ID(2) {
+				got = m
+			}
+		}
+		if !got.LastSeen.Equal(clk.Now()) || got.Name != "machine-2" || got.KeyFingerprint != "SHA256:key2" {
+			t.Fatalf("after Seen machine 2 = %+v; want last seen %v and its name and key unchanged", got, clk.Now())
+		}
+		// Unknown machines and users: false, nothing changes.
+		after := snapshot(in.Bindings)
+		if in.Bindings.Seen("alice", ID(3)) || in.Bindings.Seen("bob", ID(1)) {
+			t.Fatal("Seen of a machine the store does not remember = true")
+		}
+		if snapshot(in.Bindings) != after {
+			t.Fatal("Seen of an unknown machine changed the store")
+		}
+		if in.Writes() != w {
+			t.Fatalf("Seen wrote %d times; want 0", in.Writes()-w)
+		}
+		in.FailWrites(nil)
+		// Nothing of it is kept across a restart.
+		if re := snapshot(in.Reopen(t).Bindings); re != stripLastSeen(before) {
+			t.Fatalf("after a reopen:\n%s\nwant:\n%s", re, stripLastSeen(before))
+		}
+	})
+
+	t.Run("a machine kept fresh by seen is not the one evicted", func(t *testing.T) {
+		in, clk := newInst(t)
+		admit(t, in.Bindings, "alice", M(1))
+		for n := 2; n <= source.MaxMachinesPerUser; n++ {
+			clk.Advance(time.Second)
+			admit(t, in.Bindings, "alice", M(n))
+		}
+		// Machine 2 is the oldest unbound one, but it is seen (not admitted)
+		// after every other; machine 3 is then the least recently seen.
+		clk.Advance(time.Second)
+		if !in.Bindings.Seen("alice", ID(2)) {
+			t.Fatal("Seen = false")
+		}
+		clk.Advance(time.Second)
+		d := admit(t, in.Bindings, "alice", M(500))
+		if len(d.Evicted) != 1 || d.Evicted[0].ID != ID(3) {
+			t.Fatalf("evicted = %+v; want machine 3", d.Evicted)
+		}
+	})
+
 	t.Run("adopt the implicit user's records", func(t *testing.T) {
 		in, _ := newInst(t)
 		d := admit(t, in.Bindings, source.ImplicitUser, M(1))

@@ -29,6 +29,7 @@ import pytest
 
 from fixtures.devcontrol import OPEN_MODE_OVERRIDES, bootstrap_cert, run_preflight
 from fixtures.server import resolve_server_entry
+from fixtures.busclient import machine_headers
 from fixtures.tlsclient import pinned_request
 
 
@@ -50,7 +51,7 @@ def test_cred_bus_forged_respond_dropped(shed_server_dev, tmp_path):
     status, resp = pinned_request(
         entry.get("host", "localhost"), creds.https_port,
         "/api/plugins/listeners/itest-ns/respond", creds.pin, creds.pair,
-        method="POST", body=body,
+        method="POST", body=body, headers=machine_headers("cred-bus"),
     )
     assert status == 403, f"forged respond: status {status}, body {resp!r}"
 

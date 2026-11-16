@@ -60,6 +60,7 @@ func busUsersServer(t *testing.T) *Server {
 		Egress: &config.EgressConfig{Enabled: true},
 	}, "", reg, plugin.NewBridge(reg, true))
 	s.SetUserLookup(userLookup())
+	pinBus(s)
 	return s
 }
 
@@ -93,6 +94,7 @@ func sseServer(t *testing.T, s *Server, certs map[string]*x509.Certificate) *htt
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if c, ok := certs[r.Header.Get("X-Test-Cert")]; ok {
 			withClientCert(r, c)
+			withTestMachine(r, c.Subject.CommonName)
 		}
 		router.ServeHTTP(w, r)
 	}))
@@ -177,8 +179,8 @@ func TestBusTwoUsersHoldTheSameNamespace(t *testing.T) {
 	waitListener(t, s, plugin.ListenerKey{User: "alice", Namespace: "ssh-agent"})
 	waitListener(t, s, plugin.ListenerKey{User: "bob", Namespace: "ssh-agent"})
 
-	if r := do(s.Router(), credsAs(aliceFP), http.MethodGet, path, ""); r.code != http.StatusConflict || r.errCode(t) != "NAMESPACE_ALREADY_REGISTERED" {
-		t.Fatalf("alice's second subscription = %d %s, want 409 NAMESPACE_ALREADY_REGISTERED", r.code, r.body)
+	if r := do(s.Router(), credsAs(aliceFP), http.MethodGet, path, ""); r.code != http.StatusConflict || r.errCode(t) != config.ErrSourceDuplicateStream {
+		t.Fatalf("alice's second subscription = %d %s, want 409 SOURCE_DUPLICATE_STREAM", r.code, r.body)
 	}
 
 	// box's request first, then bobs': bob's first message must be his own,
@@ -206,9 +208,7 @@ func TestBusRespondActsAsTheCallersUser(t *testing.T) {
 	router := s.Router()
 	box := &sendCounter{}
 	gen := s.bridge.RegisterShed("box", &plugin.ShedConn{User: "alice", CreatedAt: busT1, Send: box.send})
-	if _, err := s.plugins.Register(plugin.ListenerKey{User: "alice", Namespace: "ssh-agent"}); err != nil {
-		t.Fatal(err)
-	}
+	listen(t, s, "alice", "ssh-agent", aliceFP)
 	id := publishFromShed(t, s, "box", gen)
 	const path = "/api/plugins/listeners/ssh-agent/respond"
 
@@ -252,9 +252,7 @@ func TestBusRespondForAShedReplacedAfterValidation(t *testing.T) {
 			old := &sendCounter{}
 			replacement := &sendCounter{}
 			gen := s.bridge.RegisterShed("box", &plugin.ShedConn{User: "alice", CreatedAt: busT1, Send: old.send})
-			if _, err := s.plugins.Register(plugin.ListenerKey{User: "alice", Namespace: "ssh-agent"}); err != nil {
-				t.Fatal(err)
-			}
+			listen(t, s, "alice", "ssh-agent", aliceFP)
 			id := publishFromShed(t, s, "box", gen)
 
 			hooked := false
@@ -290,11 +288,8 @@ func TestBusListingsActAsTheCallersUser(t *testing.T) {
 	s.bridge.RegisterShed("box", &plugin.ShedConn{User: "alice", CreatedAt: busT1, Send: (&sendCounter{}).send})
 	s.bridge.RegisterShed("bobs", &plugin.ShedConn{User: "bob", CreatedAt: busT1, Send: (&sendCounter{}).send})
 	s.bridge.RegisterShed("loose", &plugin.ShedConn{CreatedAt: busT1, Send: (&sendCounter{}).send})
-	for _, u := range []string{"alice", "bob"} {
-		if _, err := s.plugins.Register(plugin.ListenerKey{User: u, Namespace: "ssh-agent"}); err != nil {
-			t.Fatal(err)
-		}
-	}
+	listen(t, s, "alice", "ssh-agent", aliceFP)
+	listen(t, s, "bob", "ssh-agent", bobFP)
 
 	sheds := func(fp string) string {
 		t.Helper()
@@ -342,25 +337,27 @@ func TestBusListingsActAsTheCallersUser(t *testing.T) {
 	}
 }
 
-// TestBusImplicitUserUnchanged: on an mtls server with no user list every
-// key is the implicit user: a second subscription to a namespace is 409 as
-// before, a response is answered by whichever machine holds the namespace,
-// and the listings show every row.
-func TestBusImplicitUserUnchanged(t *testing.T) {
+// TestBusImplicitUserPinned: on an mtls server with no user list every key is
+// the implicit user, and the implicit user has one credential source like
+// any other: the first machine to subscribe is bound, a second machine is
+// refused naming it (on subscribe and on respond, whichever key it uses), a
+// response is accepted from the bound machine whichever of the user's keys
+// it comes with (machines match on the id only), and the listings show every
+// row.
+func TestBusImplicitUserPinned(t *testing.T) {
 	reg := plugin.NewRegistry()
 	s := NewServer(nil, &config.ServerConfig{Name: "t", Auth: &config.AuthConfig{Mode: config.AuthModeMTLS}}, "", reg, plugin.NewBridge(reg, false))
 	fp1, fp2 := testFingerprint("one"), testFingerprint("two")
 	s.SetUserLookup(userstest.Implicit(fp1, fp2))
+	pinBus(s)
 	router := s.Router()
 	box := &sendCounter{}
 	gen := s.bridge.RegisterShed("box", &plugin.ShedConn{User: "alice", CreatedAt: busT1, Send: box.send}) // a record from a removed user list
-	l, err := reg.Register(plugin.ListenerKey{Namespace: "ssh-agent"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	l := listen(t, s, "", "ssh-agent", fp1)
 
-	if r := do(router, credsAs(fp2), http.MethodGet, "/api/plugins/listeners/ssh-agent/messages", ""); r.code != http.StatusConflict {
-		t.Fatalf("a second machine's subscription = %d %s, want 409", r.code, r.body)
+	if r := do(router, credsAs(fp2), http.MethodGet, "/api/plugins/listeners/ssh-agent/messages", ""); r.code != http.StatusForbidden || r.errCode(t) != config.ErrSourceNotBound ||
+		!strings.Contains(string(r.body), testMachineFor(fp1).ID) {
+		t.Fatalf("a second machine's subscription = %d %s, want 403 SOURCE_NOT_BOUND naming the first", r.code, r.body)
 	}
 	id := publishFromShed(t, s, "box", gen)
 	select {
@@ -371,8 +368,14 @@ func TestBusImplicitUserUnchanged(t *testing.T) {
 	default:
 		t.Fatalf("the implicit listener received nothing, want request %s", id)
 	}
-	if r := do(router, credsAs(fp2), http.MethodPost, "/api/plugins/listeners/ssh-agent/respond", respondBody("box", id)); r.code != http.StatusNoContent || box.count() != 1 {
-		t.Fatalf("respond = %d %s (sent %d), want 204 and one delivery", r.code, r.body, box.count())
+	if r := do(router, credsAs(fp2), http.MethodPost, "/api/plugins/listeners/ssh-agent/respond", respondBody("box", id)); r.code != http.StatusForbidden || r.errCode(t) != config.ErrSourceNotBound || box.count() != 0 {
+		t.Fatalf("respond from the second machine = %d %s (sent %d), want 403 SOURCE_NOT_BOUND and nothing delivered", r.code, r.body, box.count())
+	}
+	// The bound machine, presenting the other key: accepted.
+	m1 := testMachineFor(fp1)
+	if r := do(router, credsAs(fp2), http.MethodPost, "/api/plugins/listeners/ssh-agent/respond", respondBody("box", id),
+		HeaderMachineID, m1.ID, HeaderMachineName, m1.Name); r.code != http.StatusNoContent || box.count() != 1 {
+		t.Fatalf("respond from the bound machine = %d %s (sent %d), want 204 and one delivery", r.code, r.body, box.count())
 	}
 	if r := do(router, credsAs(fp1), http.MethodGet, "/api/plugins/sheds", ""); !strings.Contains(string(r.body), `"name":"box"`) || strings.Contains(string(r.body), `"user"`) {
 		t.Fatalf("implicit sheds listing = %s, want box with no user field", r.body)
@@ -444,9 +447,7 @@ func TestBusRespondAfterTheShedIsAssignedAway(t *testing.T) {
 	s := busUsersServer(t)
 	box := &sendCounter{}
 	gen := s.bridge.RegisterShed("box", &plugin.ShedConn{User: "alice", CreatedAt: busT1, Send: box.send})
-	if _, err := s.plugins.Register(plugin.ListenerKey{User: "alice", Namespace: "ssh-agent"}); err != nil {
-		t.Fatal(err)
-	}
+	listen(t, s, "alice", "ssh-agent", aliceFP)
 	id := publishFromShed(t, s, "box", gen)
 	respondValidatedHook = func() {
 		if !s.bridge.SetShedUser("box", busT1, "bob") {

@@ -286,6 +286,7 @@ func usersTestServer(t *testing.T, b backend.Backend) (*Server, http.Handler) {
 	reg := plugin.NewRegistry()
 	s := NewServer(b, cfg, "", reg, plugin.NewBridge(reg, true))
 	s.SetUserLookup(userLookup())
+	pinBus(s)
 	store, err := config.OpenUserProfileStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -320,6 +321,7 @@ func doRouteAs(h http.Handler, fp, route, method, path, body string) apiResp {
 	defer cancel()
 	req := httptest.NewRequest(method, path, nil).WithContext(ctx)
 	withClientCert(req, testClientCert(fp, scope, time.Hour))
+	withTestMachine(req, fp)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return apiResp{rec.Code, rec.Body.Bytes(), rec.Header()}
@@ -610,10 +612,7 @@ func walkBusRoute(t *testing.T, s *Server, router http.Handler, be *userFakeBack
 	method, path, body := routeRequest(route)
 	if action == "respond" {
 		// A request of alice's shed, sent to alice's machine.
-		l, err := s.plugins.Register(plugin.ListenerKey{User: "alice", Namespace: "ssh-agent"})
-		if err != nil {
-			t.Fatalf("%s: registering alice's listener: %v", route, err)
-		}
+		l := listen(t, s, "alice", "ssh-agent", aliceFP)
 		defer s.plugins.Unregister(l.Key(), l.Token)
 		body = respondBody("box", publishFromShed(t, s, "box", boxGen))
 	}

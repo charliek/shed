@@ -30,6 +30,12 @@ const (
 	// and the isolated profile (a Firecracker server). An older server
 	// ignores the field, so a client must not ask for isolation without it.
 	FeatureNetworkProfiles = config.FeatureNetworkProfiles
+	// FeatureSourceBinding signals the credential bus pin: one machine per
+	// user answers credential requests, every subscribe and respond must
+	// carry X-Shed-Machine-Id and X-Shed-Machine-Name, and the refusals are
+	// SOURCE_MACHINE_ID_REQUIRED, SOURCE_NOT_BOUND and
+	// SOURCE_DUPLICATE_STREAM. Advertised by a server with a credential bus.
+	FeatureSourceBinding = "source_binding"
 )
 
 // serverFeatures returns the feature-token set as a fresh slice, so the
@@ -46,6 +52,9 @@ func (s *Server) serverFeatures() []string {
 	}
 	if _, ok := backend.IsAsync(s.backend); ok {
 		features = append(features, FeatureAsyncLifecycle)
+	}
+	if s.plugins != nil {
+		features = append(features, FeatureSourceBinding)
 	}
 	return features
 }

@@ -207,6 +207,27 @@ func (s *Store) Current(user, machineID string, generation uint64) bool {
 		u.binding.MachineID() == machineID && u.binding.Generation == generation
 }
 
+// Seen implements Bindings.
+func (s *Store) Seen(user, machineID string) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	cur := s.cur.Load()
+	u := cur.users[user]
+	if u == nil {
+		return false
+	}
+	rec, ok := u.machines[machineID]
+	if !ok {
+		return false
+	}
+	rec.LastSeen = s.now().UTC()
+	st := cur.clone()
+	st.users[user].machines[machineID] = rec
+	s.cur.Store(st)
+	return true
+}
+
 // AdoptImplicit implements Bindings. The adopted binding keeps when and by
 // whom it was made and takes a new generation, as a bind for the named user.
 func (s *Store) AdoptImplicit(user string) (Adoption, error) {

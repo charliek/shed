@@ -44,6 +44,17 @@ func (b *listOnlyBackend) AssignUser(_ context.Context, name string, req config.
 	return &config.Shed{Name: name, User: req.User}, nil
 }
 
+// stampNoBindings is stampUnassignedIn with no source bindings (their step is
+// covered in source_upgrade_test.go).
+func stampNoBindings(t *testing.T, cfg *config.ServerConfig, be backend.Backend, stateDir string) (backend.UpgradeReport, *backend.UsersUpgrade) {
+	t.Helper()
+	rep, up, err := stampUnassignedIn(cfg, be, stateDir, nil)
+	if err != nil {
+		t.Fatalf("stampUnassignedIn: %v", err)
+	}
+	return rep, up
+}
+
 func newListOnlyBackend() *listOnlyBackend {
 	return &listOnlyBackend{sheds: []config.Shed{{Name: "legacy", Mounts: config.SelectedMounts(nil)}, {Name: "mine", User: "alice"}}, assigned: map[string]string{}}
 }
@@ -85,7 +96,7 @@ func TestServeStampsUnassignedSheds(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			be := newListOnlyBackend()
-			rep, _ := stampUnassignedIn(tc.cfg, be, t.TempDir())
+			rep, _ := stampNoBindings(t, tc.cfg, be, t.TempDir())
 			if !reflect.DeepEqual(be.assigned, tc.want) {
 				t.Errorf("assigned %v, want %v (report %+v)", be.assigned, tc.want, rep)
 			}
@@ -107,7 +118,7 @@ func TestServeStampIsAOneTimeStep(t *testing.T) {
 
 	// First start with a user list: two users. Nothing is stamped; the step
 	// is recorded.
-	if _, up := stampUnassignedIn(two, be, state); !up.FirstUserListStart() {
+	if _, up := stampNoBindings(t, two, be, state); !up.FirstUserListStart() {
 		t.Fatal("the first start with a user list was not taken as one")
 	}
 	if len(be.assigned) != 0 {
@@ -118,7 +129,7 @@ func TestServeStampIsAOneTimeStep(t *testing.T) {
 	}
 
 	// Bob is removed: one user left. The legacy shed stays unassigned.
-	rep, up := stampUnassignedIn(one, be, state)
+	rep, up := stampNoBindings(t, one, be, state)
 	if up.FirstUserListStart() {
 		t.Error("a later start was taken as the first with a user list")
 	}
@@ -128,7 +139,7 @@ func TestServeStampIsAOneTimeStep(t *testing.T) {
 
 	// The user list is removed, then the one user added again: the step
 	// runs again, and this time stamps.
-	if _, up := stampUnassignedIn(none, be, state); up.FirstUserListStart() {
+	if _, up := stampNoBindings(t, none, be, state); up.FirstUserListStart() {
 		t.Error("a start with no user list was taken as a first start")
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
@@ -137,14 +148,14 @@ func TestServeStampIsAOneTimeStep(t *testing.T) {
 
 	// A pass that fails writes no marker; the next start runs it again.
 	be.failAssign = errors.New("disk full")
-	if rep, _ := stampUnassignedIn(one, be, state); !rep.Incomplete {
+	if rep, _ := stampNoBindings(t, one, be, state); !rep.Incomplete {
 		t.Fatalf("the failing pass reported %+v", rep)
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a pass that did not finish wrote the marker: %v", err)
 	}
 	be.failAssign = nil
-	if _, up := stampUnassignedIn(one, be, state); !up.FirstUserListStart() {
+	if _, up := stampNoBindings(t, one, be, state); !up.FirstUserListStart() {
 		t.Error("the start after an unfinished pass was not a first start")
 	}
 	if !reflect.DeepEqual(be.assigned, map[string]string{"legacy": "alice"}) {
@@ -166,7 +177,7 @@ func TestServeSeveralUsersRecordedBeforeListing(t *testing.T) {
 	be := newListOnlyBackend()
 
 	be.failList = errors.New("instance directory unreadable")
-	rep, up := stampUnassignedIn(two, be, state)
+	rep, up := stampNoBindings(t, two, be, state)
 	if !up.FirstUserListStart() || !rep.Incomplete {
 		t.Fatalf("test set-up: first start %v, report %+v; want a first start whose pass did not finish", up.FirstUserListStart(), rep)
 	}
@@ -175,7 +186,7 @@ func TestServeSeveralUsersRecordedBeforeListing(t *testing.T) {
 	}
 
 	be.failList = nil
-	rep, up = stampUnassignedIn(one, be, state)
+	rep, up = stampNoBindings(t, one, be, state)
 	if up.FirstUserListStart() {
 		t.Error("the start after a two-user first start was taken as a first start")
 	}

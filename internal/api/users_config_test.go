@@ -74,6 +74,7 @@ func configServer(t *testing.T, be *userFakeBackend, body string) (*Server, http
 	reg := plugin.NewRegistry()
 	s := NewServer(be, cfg, "", reg, plugin.NewBridge(reg, cfg.UsersConfigured()))
 	s.SetUserLookup(lookup)
+	pinBus(s)
 	return s, s.Router(), cfg
 }
 
@@ -271,10 +272,7 @@ func TestConfigUsersScriptKey(t *testing.T) {
 
 	box := &sendCounter{}
 	gen := s.bridge.RegisterShed("crate", &plugin.ShedConn{User: "bob", CreatedAt: inner.sheds["crate"].CreatedAt, Send: box.send})
-	l, err := s.plugins.Register(plugin.ListenerKey{User: "bob", Namespace: "ssh-agent"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	l := listen(t, s, "bob", "ssh-agent", k.bob.fp)
 	id := publishFromShed(t, s, "crate", gen)
 
 	r := do(router, credsAs(k.bobScript.fp), http.MethodPost, "/api/plugins/listeners/ssh-agent/respond", respondBody("crate", id))
@@ -291,6 +289,7 @@ func TestConfigUsersScriptKey(t *testing.T) {
 	sub := func(fp string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/api/plugins/listeners/ssh-agent/messages", nil).WithContext(ctx)
 		withClientCert(req, testClientCert(fp, authtoken.ScopeCredentials, time.Hour))
+		withTestMachine(req, k.bob.fp) // bob's machine, whichever of his keys
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
 		return rec

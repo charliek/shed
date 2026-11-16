@@ -10,6 +10,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/source"
 	"github.com/charliek/shed/internal/users"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -62,6 +63,20 @@ type Server struct {
 	// (exec.max_concurrent_per_shed). The map is created on first use.
 	execMu       sync.Mutex
 	execInFlight map[string]int
+
+	// missingID logs a credential-bus request with no valid machine headers
+	// once per caller (a released broker retries every few seconds).
+	missingID missingIDLog
+}
+
+// SetSourceBindings gives the credential bus its source bindings (the pin):
+// shorthand for the registry's SetBindings, which shed-server calls itself at
+// start-up, before any listener can register. Without them the bus routes
+// that subscribe and answer refuse every request (fail closed).
+func (s *Server) SetSourceBindings(b source.Bindings) {
+	if s.plugins != nil {
+		s.plugins.SetBindings(b)
+	}
 }
 
 // SetEgressAudit attaches the durable egress audit log so `shed egress show`

@@ -58,7 +58,7 @@ from typing import Optional
 
 import pytest
 
-from fixtures.busclient import BusListener, payload_has, publish_argv, response_body
+from fixtures.busclient import BusListener, machine_headers, payload_has, publish_argv, response_body
 from fixtures.identity import ADMIN, ALICE, BOB, Identity, UsersEnv
 from fixtures.tlsclient import error_code, error_message, pinned_request
 
@@ -627,10 +627,12 @@ def _round_trip(env: UsersEnv, sender: Identity, shed: str, ns: str, certs: dict
 
         def forge(user: str, cert) -> None:
             try:
+                # Each user answers from their own machine (the one their
+                # listener subscribed as, so it is their bound source).
                 forged[user] = pinned_request(
                     sender.host, cert.https_port, f"/api/plugins/listeners/{ns}/respond", cert.pin, cert.pair,
                     method="POST", body=response_body(request_env, {"itest_answer": f"forged-by-{user}"}),
-                    timeout=FORGERY_TIMEOUT,
+                    timeout=FORGERY_TIMEOUT, headers=machine_headers(user),
                 )
             except Exception as e:  # noqa: BLE001 - reported by the assertion below
                 forged[user] = e
@@ -659,6 +661,7 @@ def _round_trip(env: UsersEnv, sender: Identity, shed: str, ns: str, certs: dict
         status, body = pinned_request(
             sender.host, cert.https_port, f"/api/plugins/listeners/{ns}/respond", cert.pin, cert.pair,
             method="POST", body=response_body(request_env, {"itest_answer": answer}), timeout=ANSWER_TIMEOUT,
+            headers=machine_headers(sender.user),
         )
         assert status == 204, f"{sender.user}'s own answer was refused: {status} {body!r}"
         out, err = proc.communicate(timeout=90)

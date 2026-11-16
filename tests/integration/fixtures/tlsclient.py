@@ -118,6 +118,7 @@ def pinned_request(
     method: str = "GET",
     body: Optional[dict] = None,
     timeout: float = 15,
+    headers: Optional[dict] = None,
 ) -> tuple[Optional[int], Optional[dict]]:
     """One HTTPS request to `host:port`, trusting only the certificate whose
     fingerprint is `pin` (`sha256:<hex>`, as `tls_cert_fingerprint` in a
@@ -128,8 +129,10 @@ def pinned_request(
     gives no HTTP response at all — which is what an mtls listener does to a
     request that presents no certificate, or one its CA did not issue. Raises
     `PinMismatch` when the server's certificate is not the pinned one, so a
-    wrong server can never pass as a refusal.
+    wrong server can never pass as a refusal. `headers` are sent with the
+    request (a credential-bus answer names its machine this way).
     """
+    extra = dict(headers or {})
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE  # verified below, by fingerprint
@@ -146,9 +149,10 @@ def pinned_request(
         if got != pin:
             raise PinMismatch(f"{host}:{port} presented {got}, pinned {pin}")
         data = json.dumps(body).encode() if body is not None else None
-        headers = {"Content-Type": "application/json"} if data is not None else {}
+        req_headers = {"Content-Type": "application/json"} if data is not None else {}
+        req_headers.update(extra)
         try:
-            conn.request(method, path, body=data, headers=headers)
+            conn.request(method, path, body=data, headers=req_headers)
             resp = conn.getresponse()
             raw = resp.read()
         except (ssl.SSLError, ConnectionError, http.client.HTTPException):

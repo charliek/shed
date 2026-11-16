@@ -20,10 +20,12 @@ import (
 func newTestServerWithPlugins() *Server {
 	reg := plugin.NewRegistry()
 	bridge := plugin.NewBridge(reg, false)
-	return NewServer(nil, &config.ServerConfig{
+	s := NewServer(nil, &config.ServerConfig{
 		Name:     "test-server",
 		HTTPPort: 8080,
 	}, "", reg, bridge)
+	pinBus(s)
+	return s
 }
 
 // unregisterImplicit ends the implicit user's listener for namespace, as its
@@ -54,7 +56,7 @@ func TestHandleListListenersEmpty(t *testing.T) {
 
 func TestHandleListListenersWithRegistered(t *testing.T) {
 	srv := newTestServerWithPlugins()
-	srv.plugins.Register(plugin.ListenerKey{Namespace: "op"})
+	listen(t, srv, "", "op", "")
 
 	r := httptest.NewRequest(http.MethodGet, "/api/plugins/listeners", nil)
 	w := httptest.NewRecorder()
@@ -86,14 +88,15 @@ func TestHandlePluginSubscribeSystemNamespace(t *testing.T) {
 
 func TestHandlePluginSubscribeDuplicate(t *testing.T) {
 	srv := newTestServerWithPlugins()
-	srv.plugins.Register(plugin.ListenerKey{Namespace: "op"})
+	listen(t, srv, "", "op", "")
 
 	r := httptest.NewRequest(http.MethodGet, "/api/plugins/listeners/op/messages", nil)
+	withTestMachine(r, "")
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, r)
 
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusConflict)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), config.ErrSourceDuplicateStream) {
+		t.Fatalf("status = %d %s, want 409 %s", w.Code, w.Body.String(), config.ErrSourceDuplicateStream)
 	}
 }
 
@@ -153,6 +156,7 @@ func subscribeInBackground(t *testing.T, srv *Server, namespace string, rec *str
 		defer close(done)
 		r := httptest.NewRequest(http.MethodGet, "/api/plugins/listeners/"+namespace+"/messages", nil)
 		r.Header.Set("Accept", "text/event-stream")
+		withTestMachine(r, "")
 		srv.Router().ServeHTTP(rec, r)
 	}()
 	waitListener(t, srv, plugin.ListenerKey{Namespace: namespace})
@@ -225,10 +229,7 @@ func TestSubscribeStreamSendsNothingDroppedSinceItWasQueued(t *testing.T) {
 	other := s.bridge.RegisterShed("alices", &plugin.ShedConn{User: "alice", CreatedAt: busT1, Send: (&sendCounter{}).send})
 	// alice's listener exists, and its stream is not reading yet: what is
 	// published now sits in its queue.
-	l, err := s.plugins.Register(plugin.ListenerKey{User: "alice", Namespace: "ssh-agent"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	l := listen(t, s, "alice", "ssh-agent", aliceFP)
 	dropped := publishFromShed(t, s, "box", gen)
 	if !s.bridge.SetShedUser("box", busT1, "bob") {
 		t.Fatal("SetShedUser refused")
@@ -251,6 +252,7 @@ func TestHandlePluginRespondMissingShed(t *testing.T) {
 	srv := newTestServerWithPlugins()
 	body := `{"namespace":"op","type":"response","payload":{}}`
 	r := httptest.NewRequest(http.MethodPost, "/api/plugins/listeners/op/respond", strings.NewReader(body))
+	withTestMachine(r, "")
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, r)
@@ -272,6 +274,7 @@ func TestHandlePluginRespondUnmatchedRefusedInOpenMode(t *testing.T) {
 	for _, shed := range []string{"unknown", "dev"} {
 		body := fmt.Sprintf(`{"namespace":"op","type":"response","in_reply_to":"abc","final":true,"shed":{"name":%q},"payload":{}}`, shed)
 		r := httptest.NewRequest(http.MethodPost, "/api/plugins/listeners/op/respond", strings.NewReader(body))
+		withTestMachine(r, "")
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		srv.Router().ServeHTTP(w, r)
@@ -298,9 +301,7 @@ func TestHandlePluginRespondSuccess(t *testing.T) {
 			return nil
 		},
 	})
-	if _, err := srv.plugins.Register(plugin.ListenerKey{Namespace: "op"}); err != nil {
-		t.Fatal(err)
-	}
+	listen(t, srv, "", "op", "")
 	req := plugin.NewEnvelope("op", plugin.MessageTypeRequest, nil)
 	guestID := req.ID
 	if err := srv.bridge.PublishToHost(context.Background(), "dev", gen, req); err != nil {
@@ -311,6 +312,7 @@ func TestHandlePluginRespondSuccess(t *testing.T) {
 	// req.ID); the shed is written the answer to the ID its guest chose.
 	body := fmt.Sprintf(`{"namespace":"op","type":"response","in_reply_to":%q,"final":true,"shed":{"name":"dev"},"payload":{"result":"ok"}}`, req.ID)
 	r := httptest.NewRequest(http.MethodPost, "/api/plugins/listeners/op/respond", strings.NewReader(body))
+	withTestMachine(r, "")
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, r)
@@ -337,13 +339,12 @@ func TestHandlePluginRespondOwnershipEnforced(t *testing.T) {
 		Name: "dev",
 		Send: func(*plugin.Envelope) error { return nil },
 	})
-	if _, err := srv.plugins.Register(plugin.ListenerKey{Namespace: "op"}); err != nil {
-		t.Fatal(err)
-	}
+	listen(t, srv, "", "op", "")
 
 	post := func(inReplyTo string) int {
 		body := fmt.Sprintf(`{"namespace":"op","type":"response","in_reply_to":%q,"final":true,"shed":{"name":"dev"}}`, inReplyTo)
 		r := httptest.NewRequest(http.MethodPost, "/api/plugins/listeners/op/respond", strings.NewReader(body))
+		withTestMachine(r, "")
 		withClientCert(r, creds)
 		w := httptest.NewRecorder()
 		srv.Router().ServeHTTP(w, r)
@@ -412,9 +413,7 @@ func TestHandleListPluginShedsWithConnected(t *testing.T) {
 func TestOpenModeTracksPendingRequests(t *testing.T) {
 	srv := newTestServerWithPlugins()
 	gen := srv.bridge.RegisterShed("dev", &plugin.ShedConn{Send: func(*plugin.Envelope) error { return nil }})
-	if _, err := srv.plugins.Register(plugin.ListenerKey{Namespace: "op"}); err != nil {
-		t.Fatal(err)
-	}
+	listen(t, srv, "", "op", "")
 	req := plugin.NewEnvelope("op", plugin.MessageTypeRequest, nil)
 	if err := srv.bridge.PublishToHost(context.Background(), "dev", gen, req); err != nil {
 		t.Fatal(err)
@@ -428,6 +427,7 @@ func TestOpenModeTracksPendingRequests(t *testing.T) {
 
 	body := fmt.Sprintf(`{"namespace":"op","type":"response","in_reply_to":%q,"final":true,"shed":{"name":"dev"}}`, req.ID)
 	r := httptest.NewRequest(http.MethodPost, "/api/plugins/listeners/op/respond", strings.NewReader(body))
+	withTestMachine(r, "")
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, r)
 	if w.Code != http.StatusForbidden {
@@ -442,6 +442,7 @@ func TestOpenModeTracksPendingRequests(t *testing.T) {
 	// delivering it by name to the replacement.
 	respondValidatedHook = nil
 	r = httptest.NewRequest(http.MethodPost, "/api/plugins/listeners/op/respond", strings.NewReader(body))
+	withTestMachine(r, "")
 	w = httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, r)
 	if w.Code != http.StatusForbidden {

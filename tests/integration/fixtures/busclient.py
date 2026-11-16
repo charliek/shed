@@ -4,7 +4,13 @@ The credential bus carries a shed's helper requests (the ssh-agent, the
 Docker and AWS helpers) to a machine that answers them. A machine subscribes
 with `GET /api/plugins/listeners/{namespace}/messages` (a server-sent event
 stream, credentials scope) and answers with
-`POST /api/plugins/listeners/{namespace}/respond`. The real machine is the
+`POST /api/plugins/listeners/{namespace}/respond`. A server pins each user's
+requests to one machine, named on every subscribe and respond by the
+`X-Shed-Machine-Id` and `X-Shed-Machine-Name` headers (`machine_headers`): the
+first machine of a user to subscribe is bound, and the others are refused.
+Each synthetic machine here has a stable id of its own, derived from the name
+of the identity it stands for, so a listener and its answers name the same
+machine and two identities never share one. The real machine is the
 Rust `shed-host-agent` (tested in tests/host-agent-diff); this suite never
 runs it. A test stands in for it with `BusListener`, over pinned mTLS with a
 credentials certificate enrolled over `_bootstrap`, and starts requests from
@@ -24,7 +30,32 @@ import socket
 import ssl
 import threading
 import time
+import urllib.parse
 from typing import Callable, Iterable, Optional
+
+
+MACHINE_ID_HEADER = "X-Shed-Machine-Id"
+MACHINE_NAME_HEADER = "X-Shed-Machine-Name"
+
+
+def machine_id(identity: str) -> str:
+    """The stable machine id (32 lowercase hex digits) of the synthetic
+    machine that stands for `identity`."""
+    return hashlib.sha256(f"shed-itest-machine:{identity}".encode()).hexdigest()[:32]
+
+
+def machine_name(identity: str) -> str:
+    """The display name of `identity`'s synthetic machine."""
+    return f"itest-{identity}"[:63]
+
+
+def machine_headers(identity: str) -> dict[str, str]:
+    """The machine headers a subscribe or respond from `identity`'s synthetic
+    machine carries (the name percent-encoded, as a broker sends it)."""
+    return {
+        MACHINE_ID_HEADER: machine_id(identity),
+        MACHINE_NAME_HEADER: urllib.parse.quote(machine_name(identity), safe=""),
+    }
 
 
 def parse_sse(lines: Iterable[str]) -> Iterable[tuple[str, str]]:
@@ -55,14 +86,19 @@ class BusListener:
     thread into `events` (decoded envelopes).
 
     `open()` sends the subscribe and returns `(status, error body)`: 200 means
-    the stream is up. `close()` ends it. Use as a context manager."""
+    the stream is up. `close()` ends it. Use as a context manager.
+
+    The subscribe names the synthetic machine of `machine` (default: `name`),
+    so listeners made for one identity are one machine, and its answers
+    should carry `machine_headers` of the same identity."""
 
     def __init__(self, host: str, port: int, pin: str, cert_pair: tuple[str, str], namespace: str,
-                 *, name: str = "listener") -> None:
+                 *, name: str = "listener", machine: Optional[str] = None) -> None:
         self.host, self.port, self.pin = host, int(port), pin
         self.cert_pair = cert_pair
         self.namespace = namespace
         self.name = name
+        self.machine = machine if machine is not None else name
         self.events: list[dict] = []
         # When (time.monotonic()) each event and each keepalive comment was
         # read: what `alive_after` looks at.
@@ -97,7 +133,7 @@ class BusListener:
             conn.close()
             raise AssertionError(f"{self.host}:{self.port} presented {got}, pinned {self.pin}")
         conn.request("GET", f"/api/plugins/listeners/{self.namespace}/messages",
-                     headers={"Accept": "text/event-stream"})
+                     headers={"Accept": "text/event-stream", **machine_headers(self.machine)})
         # Kept here: http.client lets go of conn.sock once a response says
         # "Connection: close", and close() needs the socket to end the read.
         sock = conn.sock

@@ -1183,6 +1183,28 @@ const (
 	// non-empty mounts, from_snapshot, egress profiles), 501 for a route
 	// (snapshot, reset, image and egress writes).
 	ErrFeatureUnsupported = "FEATURE_UNSUPPORTED"
+
+	// The credential bus pin (one machine answers per user per server).
+	// Each refusal body is the usual error shape, under 1024 bytes.
+	//
+	// ErrSourceMachineIDRequired (403) means a subscribe or respond carried
+	// no valid X-Shed-Machine-Id and X-Shed-Machine-Name: a broker released
+	// before the pin. Never 401 (a broker re-mints its certificate on 401)
+	// and never a 409 without a code (terminal for a released broker).
+	ErrSourceMachineIDRequired = "SOURCE_MACHINE_ID_REQUIRED"
+	// ErrSourceNotBound (403) means the machine is not its user's credential
+	// source on this server; the body's top-level "source" object
+	// ({"machine_id","machine_name"}) names the machine that is.
+	ErrSourceNotBound = "SOURCE_NOT_BOUND"
+	// ErrSourceDuplicateStream (409) means the user's source machine already
+	// holds a subscription to the namespace (another process with the same
+	// machine id, or a stream not yet reaped). Retryable for a broker that
+	// sends a machine id; only such a broker can get it.
+	ErrSourceDuplicateStream = "SOURCE_DUPLICATE_STREAM"
+	// ErrSourceRateLimited (429, with Retry-After) means the user has made
+	// too many admissions that change the source records (a new machine id,
+	// a changed name or key fingerprint) lately. Retryable.
+	ErrSourceRateLimited = "SOURCE_RATE_LIMITED"
 )
 
 // Backend type constants for Shed.Backend field.
