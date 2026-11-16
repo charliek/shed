@@ -33,6 +33,7 @@ from pathlib import Path
 
 import pytest
 
+from fixtures.identity import skip_unless_started_with_users, users_environment
 from fixtures.server import CloudServer, LocalServer, RemoteServer
 
 
@@ -308,6 +309,65 @@ def shed_server_dev(request):
     skips cleanly when the corresponding dev server isn't configured.
     """
     return request.getfixturevalue(f"{request.param}_server_dev")
+
+
+# ----------------------------------------------------------------------------
+# Named users (auth.users): several identities against one dev server
+# ----------------------------------------------------------------------------
+#
+# `users_env` is a dev server running with the itest user list plus the test
+# identities enrolled against it (fixtures/identity.py): `itest-alice` (user
+# A, with a script key and nothing else), `itest-bob` (user B, with an
+# expired second key), `itest-admin` (an admin), each with its own key, CLI
+# config directory and client certificate. Module-scoped, so one module's
+# cases share one enrolment (and, on vz, one restart).
+#
+#   [vz]     the Mac dev server (`SHED_VZ_DEV_SERVER`), always restarted with
+#            the user list through devcontrol.dev_config() and restored to
+#            the committed base afterwards. (Other modules' dev_config() calls
+#            restore the base too, so a Mac dev server started with the list
+#            would not still have it by the time this module runs.)
+#   [fc]     the FC dev server (`SHED_FC_DEV_SERVER`). The suite cannot
+#            reconfigure it: it must have been STARTED with the user list,
+#            and `SHED_ITEST_USERS` must list `fc`; otherwise it skips saying
+#            what to set.
+#   [remote] the remote dev server (`SHED_REMOTE_SERVER`), likewise with
+#            `remote` in `SHED_ITEST_USERS`. Every shed there is a billed VM:
+#            a users case the remote backend need not run carries
+#            `@pytest.mark.local_vm_only(reason)` and skips on [remote]
+#            before any fixture runs (pytest_runtest_setup below).
+
+
+@pytest.fixture(scope="module", params=["vz", "fc", "remote"])
+def users_env(request):
+    backend = request.param
+    if backend == "vz":
+        server = request.getfixturevalue("vz_server_dev")
+        reconfigure, image = True, "base"
+    elif backend == "fc":
+        server = request.getfixturevalue("fc_server_dev")
+        skip_unless_started_with_users("fc", server.name)
+        reconfigure, image = False, "base"
+    else:
+        server = request.getfixturevalue("remote_server")
+        skip_unless_started_with_users("remote", server.name)
+        reconfigure, image = False, server.image
+    with users_environment(backend, server, reconfigure=reconfigure, image=image) as env:
+        yield env
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """A users case marked `local_vm_only` skips on [remote] before any of its
+    fixtures run (a module-scoped shed fixture would otherwise create a billed
+    VM first). `shed_server` does the same for its own parameter."""
+    callspec = getattr(item, "callspec", None)
+    if callspec is None or callspec.params.get("users_env") != "remote":
+        return
+    marker = item.get_closest_marker("local_vm_only")
+    if marker is not None:
+        reason = marker.args[0] if marker.args else "not supported"
+        pytest.skip(f"not on the remote backend: {reason}")
 
 
 # ----------------------------------------------------------------------------

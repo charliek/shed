@@ -14,12 +14,16 @@ The second test asserts the config shapes shed-server no longer loads — the
 removed `public_exposure` / `auth.http.tokens` keys, the removed bearer-token
 mode under both its spellings, `allow_insecure_exposure`, and an open server
 bound beyond loopback — each refuse to start with a message naming the fix, and
-never come up open. The ownership logic is backend-agnostic Go covered by
+never come up open. The third does the same for a user list (`auth.users`)
+outside mtls or beside `auth.ssh` key sources. The ownership logic is
+backend-agnostic Go covered by
 internal/plugin + internal/api unit tests, and every refused shape has a Go
 config-load test in internal/config.
 """
 
 from __future__ import annotations
+
+import subprocess
 
 import pytest
 
@@ -96,4 +100,33 @@ def test_removed_config_shapes_hard_fail(overrides, needles):
     throwaway subprocess harness (not the running dev server): the server
     exits at config load, before any backend init or bind, so no VM is
     needed."""
+    _assert_refused(run_preflight(overrides), *needles)
+
+
+def _throwaway_key(tmp_path) -> str:
+    path = tmp_path / "k"
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", str(path)], check=True, timeout=30)
+    return " ".join((tmp_path / "k.pub").read_text().split()[:2])
+
+
+@pytest.mark.vz
+@pytest.mark.parametrize(
+    "shape, needles",
+    [
+        # A user list needs mtls; an open server cannot have one.
+        ("open", ("auth.users requires auth.mode: mtls",)),
+        # The committed base keeps its auth.ssh key sources: beside a user
+        # list they would belong to nobody, so the combination is refused.
+        ("beside-auth-ssh", ("auth.users cannot be combined with auth.ssh.github_users",)),
+    ],
+)
+def test_a_user_list_outside_its_rules_hard_fails(tmp_path, shape, needles):
+    """A config with `auth.users` and any mode but mtls, or with `auth.users`
+    beside `auth.ssh` key sources, refuses to start, naming the rule. (Every
+    other user-list rule has a Go config-load test in internal/config.)"""
+    users = {"itest-alice": {"admin": True, "keys": [{"key": _throwaway_key(tmp_path), "label": "itest"}]}}
+    if shape == "open":
+        overrides = {**OPEN_MODE_OVERRIDES, "auth": {"mode": "open", "users": users}}
+    else:
+        overrides = {"auth": {"users": users}}
     _assert_refused(run_preflight(overrides), *needles)

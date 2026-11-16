@@ -453,7 +453,11 @@ def test_render_refuses_a_mode_flag_or_nothing_to_do(tmp_path, args):
 
 
 def test_restart_argv_names_only_the_config():
-    assert dc._restart_argv(Path("/x/cfg.yaml")) == ["make", "dev-server-restart", "DEV_CONFIG=/x/cfg.yaml"]
+    # SHED_DEV_USERS is pinned empty: the written config says whether it has
+    # a user list, and a value left in the shell must not add a second one.
+    assert dc._restart_argv(Path("/x/cfg.yaml")) == [
+        "make", "dev-server-restart", "DEV_CONFIG=/x/cfg.yaml", "SHED_DEV_USERS=",
+    ]
 
 
 def _fake_dev_control(monkeypatch, tmp_path) -> dict:
@@ -1140,3 +1144,434 @@ def test_remote_start_line_survives_a_padded_wc(tmp_path):
         env={**os.environ, "PATH": f"{padded}:{os.environ['PATH']}"},
     )
     assert run.stdout == "[4]", run.stdout + run.stderr
+
+
+# ----------------------------------------------------------------------------
+# Named users: fixtures/identity.py (keys, the user list, an identity's ssh
+# shim), fixtures/busclient.py (the synthetic bus listener), render-dev-config
+# --users, and the Makefile's SHED_DEV_USERS knob. No server: keys are made
+# in tmp_path, configs are checked with `shed-server config-validate`, and the
+# bus listener talks to a local TLS server.
+# ----------------------------------------------------------------------------
+
+from fixtures import busclient  # noqa: E402
+from fixtures import identity as ident  # noqa: E402
+
+REMOTE_TEMPLATE = dc.REPO_ROOT / "configs" / "server.dev-remote.yaml.tmpl"
+
+
+@pytest.fixture
+def keys_dir(tmp_path):
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh-keygen is not installed")
+    return ident.ensure_keys(tmp_path / "keys")
+
+
+def test_ensure_keys_is_idempotent_and_never_replaces_a_key(keys_dir):
+    before = {p: p.read_bytes() for p in keys_dir.rglob("*_ed25519*")}
+    assert len(before) == 2 * len(ident.KEYS)
+    assert ident.ensure_keys(keys_dir) == keys_dir
+    assert {p: p.read_bytes() for p in keys_dir.rglob("*_ed25519*")} == before
+    # Half a pair is refused, never regenerated: a server may hold the other half.
+    (keys_dir / ident.BOB / "id_ed25519.pub").unlink()
+    with pytest.raises(RuntimeError, match="only one half"):
+        ident.ensure_keys(keys_dir)
+
+
+def test_itest_users_are_two_users_and_an_admin(keys_dir):
+    users = ident.itest_users(keys_dir)
+    assert set(users) == {ident.ADMIN, ident.ALICE, ident.BOB}
+    assert [users[u]["admin"] for u in (ident.ADMIN, ident.ALICE, ident.BOB)] == [True, False, False]
+    alice = {k["label"]: k for k in users[ident.ALICE]["keys"]}
+    bob = {k["label"]: k for k in users[ident.BOB]["keys"]}
+    assert alice["itest-script"]["script"] is True and "script" not in alice["itest"]
+    assert bob["itest-expired"]["expires"] == ident.EXPIRED_ON and "expires" not in bob["itest"]
+    keys = [k["key"] for u in users.values() for k in u["keys"]]
+    assert len(set(keys)) == len(ident.KEYS), "a key is listed twice"
+    assert all(k.startswith("ssh-ed25519 ") and len(k.split()) == 2 for k in keys), keys
+    assert alice["itest"]["key"] == ident.public_key(ident.ALICE, ident.PRIMARY_KEY, keys_dir)
+
+
+@pytest.mark.parametrize("path", [MAC_DEV_CONFIG, FC_DEV_CONFIG], ids=["mac", "fc"])
+def test_with_itest_users_moves_the_developer_key_sources_under_dev(path, keys_dir):
+    base = _load_yaml(path)
+    out = ident.with_itest_users(base, keys_dir)
+    assert base == _load_yaml(path), "the input config was changed"
+    auth = out["auth"]
+    assert auth["mode"] == "mtls"
+    # Config load refuses auth.ssh key sources beside auth.users.
+    assert not {"github_users", "authorized_keys", "authorized_keys_file"} & set(auth.get("ssh") or {})
+    users = auth["users"]
+    assert set(users) == {ident.DEV_USER, ident.ADMIN, ident.ALICE, ident.BOB}
+    dev = users[ident.DEV_USER]
+    assert dev["admin"] is True and dev["github"] == base["auth"]["ssh"]["github_users"][0]
+    for line in base["auth"]["ssh"].get("authorized_keys") or []:
+        assert " ".join(line.split()[:2]) in [k["key"] for k in dev["keys"]], line
+    assert auth.get("clients") == base["auth"].get("clients")
+    # Everything outside auth is untouched.
+    assert {k: v for k, v in out.items() if k != "auth"} == {k: v for k, v in base.items() if k != "auth"}
+
+
+def test_with_users_keeps_other_ssh_settings_and_refuses_what_it_cannot_do(keys_dir):
+    base = {"auth": {"mode": "mtls", "ssh": {"github_users": ["someone"], "max_auth_tries": 3}}}
+    out = ident.with_itest_users(base, keys_dir)
+    assert out["auth"]["ssh"] == {"max_auth_tries": 3}
+    with pytest.raises(ValueError, match="mtls"):
+        ident.with_itest_users({"auth": {"mode": "open", "ssh": {"github_users": ["x"]}}}, keys_dir)
+    with pytest.raises(ValueError, match="already has auth.users"):
+        ident.with_itest_users(out, keys_dir)
+    with pytest.raises(ValueError, match="no auth.ssh key source"):
+        ident.with_itest_users({"auth": {"mode": "mtls"}}, keys_dir)
+    clash = {"auth": {"mode": "mtls", "ssh": {"github_users": ["x"]}, "clients": {ident.ALICE: {}}}}
+    with pytest.raises(ValueError, match="service-client"):
+        ident.with_itest_users(clash, keys_dir)
+    # Only the named itest users beside `dev`.
+    assert set(ident.with_itest_users(base, keys_dir, names=())["auth"]["users"]) == {ident.DEV_USER}
+    assert set(ident.with_itest_users(base, keys_dir, names=(ident.ALICE,))["auth"]["users"]) == {
+        ident.DEV_USER, ident.ALICE,
+    }
+
+
+def _validate(cfg: Path) -> subprocess.CompletedProcess:
+    if not dc.SHED_SERVER_BIN.exists():
+        pytest.skip(f"{dc.SHED_SERVER_BIN} is not built; run 'make build'")
+    return subprocess.run([str(dc.SHED_SERVER_BIN), "config-validate", "--config", str(cfg)],
+                          capture_output=True, text=True, timeout=60)
+
+
+def _rendered_remote_template(tmp_path: Path) -> Path:
+    """The remote dev template with its placeholders filled the way
+    dev-server-up-remote fills them (dummy values; nothing private)."""
+    text = REMOTE_TEMPLATE.read_text(encoding="utf-8")
+    for k, v in {
+        "@DEV_REMOTE_DIR@": str(tmp_path / "dev-remote"), "@SHED_REMOTE_ENV@": "itest",
+        "@GITHUB_USER@": "someone", "@FIREWALL_MODE@": "static",
+        "@FIREWALL_SETTING@": "source_ranges_env: SHED_REMOTE_SOURCE_RANGES",
+    }.items():
+        text = text.replace(k, v)
+    out = tmp_path / "remote.yaml"
+    out.write_text(text, encoding="utf-8")
+    return out
+
+
+@pytest.mark.parametrize("which", ["mac", "fc", "remote"])
+def test_render_users_writes_a_config_the_server_loads(tmp_path, keys_dir, which):
+    if shutil.which("uv") is None:
+        pytest.skip("uv is not installed")
+    base = {"mac": MAC_DEV_CONFIG, "fc": FC_DEV_CONFIG}.get(which) or _rendered_remote_template(tmp_path)
+    r = _render(tmp_path, base, "--users", str(keys_dir))
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = tmp_path / "out.yaml"
+    got = _load_yaml(out)
+    assert set(got["auth"]["users"]) == {ident.DEV_USER, ident.ADMIN, ident.ALICE, ident.BOB}
+    assert got["auth"]["users"][ident.ALICE]["keys"][0]["key"] == ident.public_key(ident.ALICE, keys_dir=keys_dir)
+    assert not (tmp_path / "out.yaml.users").exists()
+    # The server loads it (a vz config loads on macOS only).
+    if which == "mac" and os.uname().sysname != "Darwin":
+        return
+    v = _validate(out)
+    assert v.returncode == 0, v.stdout + v.stderr
+    # Control: the same config with the developer's github_users put back
+    # beside the user list is refused, so the check above can fail.
+    got["auth"]["ssh"] = {"github_users": ["someone"]}
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(yaml.safe_dump(got), encoding="utf-8")
+    v = _validate(bad)
+    assert v.returncode != 0 and "auth.users cannot be combined" in v.stdout + v.stderr, v.stdout + v.stderr
+
+
+def test_render_users_and_state_dir_together(tmp_path, keys_dir):
+    if shutil.which("uv") is None:
+        pytest.skip("uv is not installed")
+    r = _render(tmp_path, FC_DEV_CONFIG, "--state-dir", "/var/lib/shed-x/firecracker", "--users", str(keys_dir))
+    assert r.returncode == 0, r.stderr
+    got = _load_yaml(tmp_path / "out.yaml")
+    assert got["firecracker"]["instance_dir"] == "/var/lib/shed-x/firecracker/instances"
+    assert ident.ALICE in got["auth"]["users"]
+
+
+def test_render_users_needs_a_directory(tmp_path):
+    r = _render(tmp_path, FC_DEV_CONFIG, "--users")
+    assert r.returncode != 0 and "usage" in r.stderr
+
+
+def test_dev_config_applies_a_transform_then_restores_the_base(monkeypatch, tmp_path, keys_dir):
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    with dc.dev_config({}, "my-server-dev", transform=lambda c: ident.with_itest_users(c, keys_dir)):
+        written = _load_yaml(tmp_path / "test-dev-config.yaml")
+        assert ident.ALICE in written["auth"]["users"] and "ssh" not in written["auth"]
+    assert calls["restarts"] == [tmp_path / "test-dev-config.yaml", dc.DEV_BASE_CONFIG]
+    assert "users" in calls["waits"][0]["auth"] and "users" not in calls["waits"][1]["auth"]
+
+
+def test_identity_shim_runs_ssh_with_only_its_key(tmp_path, keys_dir):
+    fake = tmp_path / "fake-ssh"
+    fake.write_text('#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done\necho "AGENT=${SSH_AUTH_SOCK:-none}"\n')
+    fake.chmod(0o755)
+    key = ident.key_path(ident.ALICE, keys_dir=keys_dir)
+    shim = tmp_path / "ssh"
+    shim.write_text(ident.shim_text(ident.ALICE, key, str(fake)))
+    shim.chmod(0o755)
+    r = subprocess.run([str(shim), "-T", "-p", "12222", "x@localhost", "echo hi"], capture_output=True, text=True,
+                       env={**os.environ, "SSH_AUTH_SOCK": "/tmp/an-agent"}, timeout=10)
+    assert r.returncode == 0, r.stderr
+    args = r.stdout.splitlines()
+    assert args[-1] == "AGENT=none", "the shim let the developer's agent through"
+    argv = args[:-1]
+    # Its own options first (the first value ssh sees for an option wins),
+    # then the caller's argv untouched.
+    assert argv[:4] == ["-F", "/dev/null", "-i", str(key)]
+    opts = {argv[i + 1] for i, a in enumerate(argv) if a == "-o"}
+    assert {"IdentitiesOnly=yes", "IdentityAgent=none", "BatchMode=yes"} <= opts
+    assert argv[-5:] == ["-T", "-p", "12222", "x@localhost", "echo hi"]
+
+
+def test_identity_home_and_teardown(keys_dir):
+    if shutil.which("ssh") is None:
+        pytest.skip("ssh is not installed")
+    a = ident.Identity.create(ident.ALICE, "box-dev", "localhost", 12222, keys_dir=keys_dir)
+    assert a.home == keys_dir / ident.ALICE / "home-box-dev" and a.home.is_dir()
+    assert os.access(a.shim, os.X_OK)
+    env = a.env()
+    assert env["HOME"] == str(a.home) and env["PATH"].startswith(str(a.shim.parent) + os.pathsep)
+    assert "SSH_AUTH_SOCK" not in env
+    argv = a.ssh_argv("some-shed", "true")
+    assert argv[0] == str(a.shim) and f"UserKnownHostsFile={a.known_hosts}" in argv
+    assert argv[-2:] == ["some-shed@localhost", "true"]
+    assert a.known_hosts == a.home / ".shed" / "known_hosts"
+
+    # Another key of the same user shares the HOME through its own shim.
+    s = a.with_key(ident.SCRIPT_KEY)
+    assert s.home == a.home and s.shim != a.shim and s.key.name == ident.SCRIPT_KEY
+    s.remove()
+    assert a.home.exists(), "removing a key variant removed the user's HOME"
+
+    # A leftover HOME from a crashed run is replaced, not reused.
+    (a.home / "stale").write_text("x")
+    a2 = ident.Identity.create(ident.ALICE, "box-dev", "localhost", 12222, keys_dir=keys_dir)
+    assert not (a2.home / "stale").exists()
+    a2.remove()
+    assert not a2.home.exists()
+    assert ident.key_path(ident.ALICE, keys_dir=keys_dir).exists(), "teardown removed the key"
+
+
+def test_identity_enrols_through_its_shim_and_known_hosts(monkeypatch, tmp_path, keys_dir):
+    if shutil.which("openssl") is None or shutil.which("ssh") is None:
+        pytest.skip("openssl or ssh is not installed")
+    a = ident.Identity.create(ident.BOB, "box-dev", "localhost", 12222, keys_dir=keys_dir)
+    sent = []
+    real_run = subprocess.run
+
+    def run(argv, **kw):
+        if argv[0] != str(a.shim):
+            return real_run(argv, **kw)
+        sent.append(argv)
+        return subprocess.CompletedProcess(argv, 255, stdout="", stderr="Permission denied (publickey).")
+
+    monkeypatch.setattr(dc, "assert_dev_target", lambda name: {"host": "localhost", "ssh_port": 12222})
+    monkeypatch.setattr(dc.subprocess, "run", run)
+    try:
+        with pytest.raises(AssertionError, match="Permission denied"):
+            a.enrol("control", tmp_path / "c")
+        assert len(sent) == 1 and f"UserKnownHostsFile={a.known_hosts}" in sent[0]
+    finally:
+        a.remove()
+
+
+@pytest.mark.parametrize(
+    "value, backend, want", [("fc", "fc", True), ("fc, remote", "remote", True), ("fc", "remote", False), ("", "fc", False)],
+)
+def test_started_with_users_reads_the_backend_list(monkeypatch, value, backend, want):
+    monkeypatch.setenv("SHED_ITEST_USERS", value)
+    assert ident.started_with_users(backend) is want
+    if not want:
+        with pytest.raises(pytest.skip.Exception, match=f"SHED_ITEST_USERS={backend}"):
+            ident.skip_unless_started_with_users(backend, "box-dev")
+
+
+def test_local_vm_only_users_cases_skip_on_remote_before_fixtures():
+    import conftest
+
+    class Item:
+        def __init__(self, param, marked):
+            self.callspec = type("C", (), {"params": {"users_env": param}})()
+            self._marked = marked
+
+        def get_closest_marker(self, name):
+            return pytest.mark.local_vm_only("why").mark if self._marked and name == "local_vm_only" else None
+
+    with pytest.raises(pytest.skip.Exception, match="not on the remote backend: why"):
+        conftest.pytest_runtest_setup(Item("remote", True))
+    conftest.pytest_runtest_setup(Item("remote", False))
+    conftest.pytest_runtest_setup(Item("fc", True))
+
+
+def test_parse_sse_reads_events_and_skips_keepalives():
+    lines = [": keepalive\n", "\n", "event: message\n", 'data: {"id":"1"}\n', "\n",
+             "data: a\n", "data: b\n", "\n", "event: message\n", "data: {}\n"]
+    # The last event has no blank line after it: the stream ended mid-event.
+    assert list(busclient.parse_sse(lines)) == [("message", '{"id":"1"}'), ("message", "a\nb")]
+
+
+def test_response_body_answers_the_request_by_its_server_id():
+    req = {"id": "srv-1", "namespace": "ns", "shed": {"name": "s1"}, "payload": {"x": 1}}
+    body = busclient.response_body(req, {"ok": True})
+    assert body == {"namespace": "ns", "type": "response", "in_reply_to": "srv-1", "final": True,
+                    "payload": {"ok": True}, "shed": {"name": "s1"}}
+    assert busclient.payload_has(req, "x")
+    argv = busclient.publish_argv("ns", {"itest_probe": "t"})
+    assert argv[-1] == "http://127.0.0.1:498/v1/publish"
+    assert json.loads(argv[argv.index("--data") + 1]) == {"namespace": "ns", "type": "request", "payload": {"itest_probe": "t"}}
+
+
+@pytest.fixture
+def sse_listener(tmp_path):
+    """A loopback HTTPS server requiring a client certificate that serves a
+    credential-bus subscribe: on /api/plugins/listeners/ok/messages a
+    keepalive, then one event, then it holds the stream until the client
+    goes; any other namespace is refused with a 403 JSON error."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not installed")
+    import http.server
+    import ssl
+    import threading
+
+    d = tmp_path / "pki"
+    d.mkdir()
+    for name in ("server", "ca", "client"):
+        _openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(d / f"{name}.key"))
+    for name in ("server", "ca"):
+        _openssl("req", "-new", "-x509", "-key", str(d / f"{name}.key"), "-subj", f"/CN={name}",
+                 "-days", "1", "-out", str(d / f"{name}.pem"))
+    _openssl("req", "-new", "-key", str(d / "client.key"), "-subj", "/CN=client", "-out", str(d / "client.csr"))
+    _openssl("x509", "-req", "-in", str(d / "client.csr"), "-CA", str(d / "ca.pem"), "-CAkey", str(d / "ca.key"),
+             "-CAcreateserial", "-days", "1", "-out", str(d / "client.pem"))
+    stop = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            if self.path != "/api/plugins/listeners/ok/messages":
+                body = b'{"error":{"code":"FORBIDDEN","message":"no"}}'
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            env = {"id": "srv-1", "namespace": "ok", "payload": {"itest_probe": "tok"}, "shed": {"name": "s1"}}
+            try:
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.write(b"event: message\ndata: " + json.dumps(env).encode() + b"\n\n")
+                self.wfile.flush()
+                stop.wait(10)
+            except OSError:
+                pass
+
+        def log_message(self, *a):
+            pass
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(d / "server.pem"), str(d / "server.key"))
+    ctx.load_verify_locations(str(d / "ca.pem"))
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    pin = tlsclient.fingerprint((d / "server.pem").read_text())
+    yield {"port": srv.server_address[1], "pin": pin, "pair": (str(d / "client.pem"), str(d / "client.key"))}
+    stop.set()
+    srv.shutdown()
+    srv.server_close()
+
+
+def test_bus_listener_receives_events_and_closes(sse_listener):
+    s = sse_listener
+    with busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "ok") as listener:
+        assert listener.open() == (200, None)
+        got = listener.wait_for(lambda e: busclient.payload_has(e, "tok"), 10)
+        assert got is not None and got["id"] == "srv-1", listener.events
+        assert listener.wait_for(lambda e: busclient.payload_has(e, "nothing-like-it"), 0.2) is None
+    assert listener.error is None
+
+
+def test_bus_listener_reports_a_refused_subscribe(sse_listener):
+    s = sse_listener
+    listener = busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "refused")
+    status, body = listener.open()
+    listener.close()
+    assert status == 403 and tlsclient.error_code(body) == "FORBIDDEN"
+
+
+def test_bus_listener_and_pinned_refuse_the_wrong_server(sse_listener):
+    s = sse_listener
+    with pytest.raises(AssertionError, match="pinned"):
+        busclient.BusListener("127.0.0.1", s["port"], "sha256:" + "00" * 32, s["pair"], "ok").open()
+    with pytest.raises(tlsclient.PinMismatch):
+        tlsclient.Pinned("127.0.0.1", s["port"], "sha256:" + "00" * 32, *s["pair"])
+    status, body = tlsclient.Pinned("127.0.0.1", s["port"], s["pin"], *s["pair"]).request("GET", "/api/x")
+    assert status == 403 and tlsclient.error_code(body) == "FORBIDDEN"
+
+
+@pytest.mark.parametrize(
+    "target", ["dev-server-restart", "dev-server-up-fc", "dev-server-restart-fc", "dev-server-restart-remote"],
+)
+def test_a_bad_dev_users_value_fails_before_anything_runs(tmp_path, target):
+    env = tmp_path / "remote.env"
+    env.write_text("SHED_REMOTE_ENV=dev\n")
+    r, calls = _make_with_stubs(tmp_path, target, "SHED_DEV_USERS=alice", f"SHED_REMOTE_ENV_FILE={env}",
+                                "SHED_REMOTE_GITHUB_USER=someone")
+    assert r.returncode != 0
+    assert "SHED_DEV_USERS is 'alice'" in r.stdout + r.stderr
+    assert not [c for c in calls if "kill" in c or "serve --config" in c or c.startswith(("scp ", "uname -s"))], calls
+
+
+def test_dev_users_renders_the_user_list_on_each_dev_target(tmp_path):
+    env = tmp_path / "remote.env"
+    env.write_text("SHED_REMOTE_ENV=dev\n")
+    common = ("SHED_DEV_USERS=itest", "SHED_ITEST_USERS_DIR=/keys/here", f"SHED_REMOTE_ENV_FILE={env}",
+              "SHED_REMOTE_GITHUB_USER=someone")
+    for target in ("dev-server-up", "dev-server-up-fc", "dev-server-up-remote"):
+        r, _ = _make_with_stubs(tmp_path, target, *common, dry_run=True)
+        assert r.returncode == 0, (target, r.stdout + r.stderr)
+        out = r.stdout
+        m = re.search(r'render-dev-config\.sh [^\n]*--users "?/keys/here', out)
+        assert m, (target, out)
+        assert m.start() < out.index("serve --config"), target
+    # Unset, the render is skipped: its guard reads empty (the FC and remote
+    # recipes), or the Mac's render arguments carry no --users.
+    for target in ("dev-server-up-fc", "dev-server-up-remote"):
+        r, _ = _make_with_stubs(tmp_path, target, f"SHED_REMOTE_ENV_FILE={env}", "SHED_REMOTE_GITHUB_USER=someone",
+                                dry_run=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert 'if [ "" = itest ]; then' in r.stdout and 'if [ "itest" = itest ]' not in r.stdout, (target, r.stdout)
+    r, _ = _make_with_stubs(tmp_path, "dev-server-up", dry_run=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--users" not in r.stdout, r.stdout
+
+
+def test_the_test_targets_tell_the_suite_about_the_user_list():
+    lines = _makefile_logical_lines()
+    for target, backend in (("test-integration-dev", None), ("test-integration-dev-fc", "fc"),
+                            ("test-integration-remote", "remote")):
+        start = next(i for i, l in enumerate(lines) if l.startswith(f"{target}:"))
+        recipe = []
+        for l in lines[start + 1:]:
+            if not l.startswith("\t"):
+                break
+            recipe.append(l)
+        body = "\n".join(recipe)
+        if backend is None:
+            # The [vz] cases restart the Mac dev server with the list
+            # themselves: nothing to tell them.
+            assert "SHED_ITEST_USERS=" not in body, (target, body)
+        else:
+            assert f"SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),{backend},)" in body, (target, body)
+        assert "SHED_ITEST_USERS_DIR=$(SHED_ITEST_USERS_DIR)" in body, target

@@ -13,7 +13,7 @@
 # script existed.
 #
 # Usage:
-#   render-dev-config.sh <base.yaml> <out.yaml> --state-dir DIR
+#   render-dev-config.sh <base.yaml> <out.yaml> [--state-dir DIR] [--users DIR]
 #
 # There is no auth-mode override: both committed dev-parallel configs run
 # auth.mode: mtls, the only enforced mode shed-server loads. (The --token and
@@ -33,10 +33,22 @@
 #               volume should fail as "no images" at startup rather than as a
 #               confusing mid-run socket error. The brew shed-server on this
 #               developer's machine is configured the same way.
+#
+# --users       SHED_DEV_USERS=itest. Gives the server the integration suite's
+#               itest user list (auth.users): itest-admin, itest-alice and
+#               itest-bob, with keys generated once under DIR (the suite's
+#               SHED_ITEST_USERS_DIR, default ~/.shed/dev/itest-users), and
+#               moves the base's auth.ssh key sources (github_users,
+#               authorized_keys) under a user named `dev`, an admin, because
+#               config load refuses auth.ssh key sources beside a user list.
+#               The developer's own entry keeps working, as user `dev`. Done
+#               by tests/integration/fixtures/identity.py through `uv run`, so
+#               it needs uv; the output is re-serialised YAML (comments go).
+#               Applied last, after --state-dir.
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <base-config.yaml> <output-config.yaml> --state-dir DIR" >&2
+  echo "usage: $0 <base-config.yaml> <output-config.yaml> [--state-dir DIR] [--users DIR]" >&2
   exit 1
 }
 
@@ -46,9 +58,11 @@ out="$2"
 shift 2
 
 state_dir=""
+users_dir=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --state-dir) [ "$#" -ge 2 ] || usage; state_dir="$2"; shift 2 ;;
+    --users) [ "$#" -ge 2 ] && [ -n "$2" ] || usage; users_dir="$2"; shift 2 ;;
     *) echo "render-dev-config: unknown argument: $1" >&2; usage ;;
   esac
 done
@@ -110,6 +124,28 @@ if [ -n "$state_dir" ]; then
 # path length limits; see the script header).
 EOF
   applied+=("state dir: $state_dir")
+fi
+
+# ---- --users ----------------------------------------------------------------
+if [ -n "$users_dir" ]; then
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "render-dev-config: --users needs uv (https://docs.astral.sh/uv/)" >&2
+    exit 1
+  fi
+  repo="$(cd "$(dirname "$0")/.." && pwd)"
+  abs_out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
+  mkdir -p "$users_dir"
+  abs_users="$(cd "$users_dir" && pwd)"
+  # Rendered next to the output, then moved over it, so a failure leaves no
+  # half-written config behind.
+  if ! (cd "$repo/tests/integration" && uv run --quiet python -m fixtures.identity --dir "$abs_users" \
+          render-users "$abs_out" "$abs_out.users") >&2; then
+    rm -f "$abs_out.users"
+    echo "render-dev-config: --users failed" >&2
+    exit 1
+  fi
+  mv "$abs_out.users" "$abs_out"
+  applied+=("itest user list: keys in $abs_users")
 fi
 
 if [ "${#applied[@]}" -eq 0 ]; then

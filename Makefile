@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -167,11 +167,26 @@ DEV_CONFIG   := $(CURDIR)/configs/server.dev-parallel.mac.yaml
 # image store on the mount point.
 SHED_DEV_STATE_DIR ?=
 
+# OPTIONAL: start a dev server with the integration suite's itest user list
+# (auth.users: itest-admin, itest-alice, itest-bob, and the config's own
+# auth.ssh key sources moved under the admin user `dev`), so the users cases
+# (tests/integration/test_users.py) can run against it. Empty (the default):
+# no user list, one implicit user. `itest`: dev-server-up, -up-fc and
+# -up-remote (and their restarts) render the config with
+# `scripts/render-dev-config.sh --users $(SHED_ITEST_USERS_DIR)`, and
+# test-integration-dev-fc and -remote tell the suite so
+# (SHED_ITEST_USERS=<backend>). The suite's [vz] users cases restart the Mac
+# dev server with the list themselves (and restore the committed base), so
+# test-integration-dev needs neither. The keys are generated once, outside
+# the repo (`make dev-itest-users`). Needs uv.
+SHED_DEV_USERS ?=
+SHED_ITEST_USERS_DIR ?= $(HOME)/.shed/dev/itest-users
+
 # The rendered config, written whenever ANY override above is active. With no
 # overrides the targets run the committed $(DEV_CONFIG) directly — byte
 # identical to having no generation step at all.
 DEV_GENERATED_CONFIG := $(HOME)/.shed/dev/server.generated.yaml
-DEV_RENDER_ARGS := $(if $(SHED_DEV_STATE_DIR),--state-dir $(SHED_DEV_STATE_DIR),)
+DEV_RENDER_ARGS := $(if $(SHED_DEV_STATE_DIR),--state-dir $(SHED_DEV_STATE_DIR),) $(if $(filter itest,$(SHED_DEV_USERS)),--users $(SHED_ITEST_USERS_DIR),)
 
 # Refuse to start when SHED_DEV_STATE_DIR points somewhere unwritable — an
 # external volume that isn't mounted, typically. Without this the server
@@ -219,12 +234,26 @@ check-no-dev-auth-mode:
 	  exit 1; \
 	fi
 
-# The Mac dev server's settings guard: the removed auth knob and
-# SHED_DEV_STATE_DIR. A prerequisite of dev-server-up and of
+# SHED_DEV_USERS takes '' or `itest`; anything else stops here, before
+# anything is stopped or started.
+check-dev-users:
+	@case "$(SHED_DEV_USERS)" in \
+	  ""|itest) ;; \
+	  *) echo "ERROR: SHED_DEV_USERS is '$(SHED_DEV_USERS)'; want empty (no user list) or itest."; exit 1 ;; \
+	esac
+
+# Generate the itest users' keys (idempotent; an existing key is never
+# replaced, since a running server may have been started with it).
+dev-itest-users:
+	@command -v uv >/dev/null 2>&1 || { echo "uv is required (https://docs.astral.sh/uv/)."; exit 1; }
+	cd tests/integration && uv run --quiet python -m fixtures.identity --dir "$(SHED_ITEST_USERS_DIR)" keys
+
+# The Mac dev server's settings guard: the removed auth knob, SHED_DEV_USERS
+# and SHED_DEV_STATE_DIR. A prerequisite of dev-server-up and of
 # dev-server-restart, so a bad value fails before anything is stopped or
 # started. (dev-server-restart runs its stop and start from its recipe,
 # which make starts only once this has succeeded, whatever -j is.)
-check-dev-settings: check-no-dev-auth-mode
+check-dev-settings: check-no-dev-auth-mode check-dev-users
 	$(call check-dev-state-dir)
 
 dev-server-up: check-dev-settings build
@@ -297,6 +326,9 @@ dev-server-up: check-dev-settings build
 	fi
 	@if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
 	  echo "  State:   $(SHED_DEV_STATE_DIR) (SHED_DEV_STATE_DIR)"; \
+	fi
+	@if [ "$(SHED_DEV_USERS)" = itest ]; then \
+	  echo "  Users:   the itest user list (keys in $(SHED_ITEST_USERS_DIR)); you are user dev"; \
 	fi
 	@echo "  Log:     $(DEV_LOG_PATH)"
 	@echo "  CLI:     shed -s $(SHED_VZ_DEV_SERVER) list"
@@ -432,6 +464,7 @@ test-integration-dev: check-no-dev-auth-mode build
 	  SHED_IMAGE_HAS_ROOST=vz \
 	  SHED_IMAGE_HAS_CRAZE=vz \
 	  SHED_IMAGE_HAS_HOME_DIRS=vz \
+	  SHED_ITEST_USERS_DIR=$(SHED_ITEST_USERS_DIR) \
 	  $(MAKE) test-integration
 
 # Parallel dev shed-server lifecycle (FC remote).
@@ -493,9 +526,11 @@ FC_DEV_PID_PATH  ?= /tmp/shed-server-dev.pid
 # resolves as its sibling. The dev server runs from /tmp, so install here.
 FC_DEV_PROXY_PATH ?= /tmp/shed-egress-proxy
 
-# The committed config the FC dev targets upload, untouched. It is mtls;
-# there is no rendering step for FC.
+# The committed config the FC dev targets upload. It is mtls. It is uploaded
+# untouched unless SHED_DEV_USERS=itest, which renders it with the itest
+# user list first (FC_DEV_USERS_CONFIG).
 FC_DEV_LOCAL_CONFIG := configs/server.dev-parallel.linux-fc.yaml
+FC_DEV_USERS_CONFIG := $(HOME)/.shed/dev/server.dev-fc.users.yaml
 
 # Cross-compile shed-server for the remote host's GOARCH. Detects arch
 # at recipe time via `ssh <host> uname -m`; refuses to silently default
@@ -524,7 +559,7 @@ build-fc-remote-server:
 # Any other developer using $(FC_REMOTE_HOST) won't see the deb
 # server change, but if they're also running their own dev server
 # on the same ports, this will conflict. Coordinate.
-dev-server-up-fc: check-no-dev-auth-mode build-fc-remote-server
+dev-server-up-fc: check-no-dev-auth-mode check-dev-users build-fc-remote-server
 	@if [ -z "$(RELEASE_BUILD_TOOLS_REF)" ]; then \
 	  echo "ERROR: RELEASE_BUILD_TOOLS_REF is empty; can't infer from git tag."; \
 	  echo "       Either tag this repo or override on the command line."; exit 1; \
@@ -542,8 +577,13 @@ dev-server-up-fc: check-no-dev-auth-mode build-fc-remote-server
 	  echo "       or 'make dev-server-down-fc' to stop it first."; \
 	  exit 1; \
 	fi
-	@# Upload the committed (mtls) config untouched.
+	@# Upload the committed (mtls) config: untouched, or with the itest user
+	@# list when SHED_DEV_USERS=itest.
 	@LOCAL_CFG="$(FC_DEV_LOCAL_CONFIG)"; \
+	if [ "$(SHED_DEV_USERS)" = itest ]; then \
+	  ./scripts/render-dev-config.sh "$(FC_DEV_LOCAL_CONFIG)" "$(FC_DEV_USERS_CONFIG)" --users "$(SHED_ITEST_USERS_DIR)" || exit 1; \
+	  LOCAL_CFG="$(FC_DEV_USERS_CONFIG)"; \
+	fi; \
 	echo "Uploading $$LOCAL_CFG..."; \
 	MOUNT_SRCS=$$(grep -E '^[[:space:]]+source:[[:space:]]+/var/lib/shed-dev/mounts/' "$$LOCAL_CFG" | awk '{print $$2}' | tr '\n' ' '); \
 	UPLOAD_BIN=/tmp/shed-server-dev.upload.$$$$; \
@@ -678,7 +718,7 @@ dev-server-logs-fc:
 # make runs this recipe only after check-no-dev-auth-mode has succeeded, so a
 # rejected setting never stops the running server, and the stop finishes
 # before the start begins, whatever -j is.
-dev-server-restart-fc: check-no-dev-auth-mode
+dev-server-restart-fc: check-no-dev-auth-mode check-dev-users
 	@$(MAKE) --no-print-directory dev-server-down-fc
 	@$(MAKE) --no-print-directory dev-server-up-fc
 
@@ -760,7 +800,7 @@ endef
 # The remote dev server's settings guard. A prerequisite of
 # dev-server-up-remote and of dev-server-restart-remote, so bad settings fail
 # before anything is stopped or started.
-check-remote-dev-settings:
+check-remote-dev-settings: check-dev-users
 	@$(remote-dev-settings)
 
 dev-server-up-remote: check-remote-dev-settings build-server build-cli
@@ -787,6 +827,10 @@ dev-server-up-remote: check-remote-dev-settings build-server build-cli
 	    -e "s|@FIREWALL_MODE@|$$FW_MODE|g" \
 	    -e "s|@FIREWALL_SETTING@|$$FW_SETTING|g" \
 	    "$(REMOTE_DEV_TEMPLATE)" > "$(REMOTE_DEV_CONFIG)" || exit 1; \
+	if [ "$(SHED_DEV_USERS)" = itest ]; then \
+	  ./scripts/render-dev-config.sh "$(REMOTE_DEV_CONFIG)" "$(REMOTE_DEV_CONFIG).users" --users "$(SHED_ITEST_USERS_DIR)" \
+	    && mv "$(REMOTE_DEV_CONFIG).users" "$(REMOTE_DEV_CONFIG)" || exit 1; \
+	fi; \
 	echo "=== dev-server-up-remote $$(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$(REMOTE_DEV_LOG_PATH)"; \
 	START_LINE=$$(wc -l < "$(REMOTE_DEV_LOG_PATH)" | tr -d '[:space:]'); \
 	nohup bin/shed-server serve --config "$(REMOTE_DEV_CONFIG)" \
@@ -896,6 +940,8 @@ test-integration-remote: build-cli
 	  SHED_FC_DEV_SERVER= \
 	  SHED_REMOTE_SERVER=$(SHED_REMOTE_DEV_SERVER) \
 	  SHED_REMOTE_LOG_PATH=$(REMOTE_DEV_LOG_PATH) \
+	  SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),remote,) \
+	  SHED_ITEST_USERS_DIR=$(SHED_ITEST_USERS_DIR) \
 	  $(MAKE) test-integration
 
 # Root-only proof of the isolated network profile's nftables rules, run on
@@ -970,6 +1016,8 @@ test-integration-dev-fc: check-no-dev-auth-mode
 	  SHED_IMAGE_HAS_ROOST=fc \
 	  SHED_IMAGE_HAS_CRAZE=fc \
 	  SHED_IMAGE_HAS_HOME_DIRS=fc \
+	  SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),fc,) \
+	  SHED_ITEST_USERS_DIR=$(SHED_ITEST_USERS_DIR) \
 	  $(MAKE) test-integration
 
 # Cross-compile for release

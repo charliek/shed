@@ -83,7 +83,7 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 from urllib.parse import urlparse
 
 import pytest
@@ -297,8 +297,13 @@ def _write_config(config: dict, path: Path) -> Path:
 
 def _restart_argv(dev_config: Path) -> list[str]:
     """The `make` command `_make_restart` runs (split out so the unit tests
-    can pin it without a server)."""
-    return ["make", "dev-server-restart", f"DEV_CONFIG={dev_config}"]
+    can pin it without a server).
+
+    `SHED_DEV_USERS=` is pinned empty on the command line (which beats the
+    environment): the config dev_config() writes already says whether it has
+    a user list, and a `SHED_DEV_USERS=itest` left in the developer's shell
+    would otherwise have the Makefile render a second user list onto it."""
+    return ["make", "dev-server-restart", f"DEV_CONFIG={dev_config}", "SHED_DEV_USERS="]
 
 
 def _make_restart(dev_config: Path) -> None:
@@ -373,6 +378,8 @@ def bootstrap_cert(
     client_kind: str = "cli",
     *,
     timeout: float = 25.0,
+    ssh: str = "ssh",
+    known_hosts: Optional[Path] = None,
 ) -> BootstrapCert:
     """Enrol a client certificate of `scope` over the reserved `_bootstrap`
     SSH channel, exactly as `shed server add` does (sdk/bootstrap): a fresh
@@ -387,6 +394,11 @@ def bootstrap_cert(
     identity, or the agent's) must be in the server's allowlist, as it is for
     every enrolled dev entry; the server must be mtls (an open server answers
     every bootstrap with its refusal). Needs the `openssl` CLI.
+
+    A test identity (`fixtures/identity.py`) enrols as itself by passing its
+    `ssh` shim (the system ssh with only the identity's key) and its own
+    `known_hosts` (the one its `shed server add` pinned). A refusal raises
+    AssertionError carrying ssh's stderr, where the server's reason is.
     """
     entry = assert_dev_target(server)
     host = entry.get("host", "localhost")
@@ -406,9 +418,9 @@ def bootstrap_cert(
     key_path.chmod(0o600)
     csr = base64.b64encode(csr_path.read_bytes()).decode("ascii")
     args = [
-        "ssh", "-T", "-p", str(ssh_port),
+        ssh, "-T", "-p", str(ssh_port),
         "-o", "BatchMode=yes",
-        "-o", f"UserKnownHostsFile={KNOWN_HOSTS_PATH}",
+        "-o", f"UserKnownHostsFile={known_hosts or KNOWN_HOSTS_PATH}",
         "-o", "StrictHostKeyChecking=yes",
         f"_bootstrap@{host}", scope, client_kind, f"csr={csr}",
     ]
@@ -486,6 +498,7 @@ def dev_config(
     server: str,
     *,
     ready_timeout: float = 90.0,
+    transform: Optional[Callable[[dict], dict]] = None,
 ) -> Iterator[str]:
     """Run the VZ dev server with `overrides` merged onto its base config.
 
@@ -494,6 +507,11 @@ def dev_config(
     the committed base config on exit (pinned explicitly, even if the test
     body raises) and waits for that too. Never edits the committed
     dev-parallel config.
+
+    `transform`, when given, is applied to the merged config before it is
+    written: for an edit a merge cannot express, such as removing keys
+    (`fixtures.identity.with_users` moves `auth.ssh`'s key sources under a
+    user list). The ports are checked on what it returns.
 
     Guarded by `assert_dev_target` (the target) and
     `_assert_config_ports_safe` (the merged config's ports), so it can
@@ -504,6 +522,8 @@ def dev_config(
     """
     assert_dev_target(server)
     merged = _merge_config(overrides or {})
+    if transform is not None:
+        merged = transform(merged)
     _assert_config_ports_safe(merged)
     temp = _write_config(merged, DEV_CONFIG_TMP)
     try:

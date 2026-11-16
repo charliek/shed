@@ -25,10 +25,18 @@ the server has no token mode any more.
     instead of by hostname, returning `(status, decoded JSON body)`, or
     `(None, None)` when no HTTP response arrives at all (an mtls listener
     refuses a request without a client certificate during the handshake).
+  - `Pinned(host, port, pin, cert_file, key_file)` — a reusable client with a
+    client certificate, trusting exactly the server certificate whose
+    fingerprint is `pin`: `request()` for JSON (and NDJSON) routes, `exec()`
+    for `POST /api/sheds/{name}/exec`. The CLI's own credential for an entry,
+    a service-client bundle and a test identity's enrolled certificate all
+    drive the API through it.
+  - `error_code(body)` — the `error.code` of an API error body, or None.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
@@ -155,3 +163,77 @@ def pinned_request(
         return resp.status, decoded
     finally:
         conn.close()
+
+
+def error_code(body: Optional[dict]) -> Optional[str]:
+    """The `error.code` of an API error body (`{"error": {"code", "message"}}`),
+    or None."""
+    return ((body or {}).get("error") or {}).get("code")
+
+
+def error_message(body: Optional[dict]) -> str:
+    """The `error.message` of an API error body, or ""."""
+    return str(((body or {}).get("error") or {}).get("message") or "")
+
+
+class Pinned:
+    """An HTTPS client with a client certificate, trusting exactly one server
+    certificate: the one whose fingerprint is `pin` (`sha256:<hex>`). The pin
+    replaces the hostname check, as it does in every shed client.
+
+    The server's certificate is fetched once, without trusting it, and checked
+    against the pin before any request is made, so a wrong server fails here
+    and can never pass as a refusal."""
+
+    def __init__(self, host: str, port: int, pin: str, cert_file: str, key_file: str) -> None:
+        self.host, self.port, self.pin = host, int(port), pin
+        pem = server_cert_pem(host, self.port)
+        if fingerprint(pem) != pin:
+            raise PinMismatch(f"{host}:{port} presented {fingerprint(pem)}, pinned {pin}")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.load_verify_locations(cadata=pem)
+        ctx.load_cert_chain(cert_file, key_file)
+        self.ctx = ctx
+        self.cert_pair = (cert_file, key_file)
+
+    def request(
+        self, method: str, path: str, body: Optional[dict] = None, timeout: float = 60,
+    ) -> tuple[int, Optional[dict]]:
+        """One request; returns `(status, decoded JSON body or None)`. An
+        NDJSON answer (`application/x-ndjson`, the exec route) comes back as
+        `{"frames": [...]}`."""
+        conn = http.client.HTTPSConnection(self.host, self.port, context=self.ctx, timeout=timeout)
+        try:
+            data = json.dumps(body).encode() if body is not None else None
+            headers = {"Content-Type": "application/json"} if data is not None else {}
+            conn.request(method, path, body=data, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            if resp.getheader("Content-Type", "").startswith("application/x-ndjson"):
+                return resp.status, {"frames": [json.loads(line) for line in raw.splitlines() if line.strip()]}
+            try:
+                return resp.status, (json.loads(raw) if raw.strip() else None)
+            except json.JSONDecodeError:
+                return resp.status, {"raw": raw.decode("utf-8", errors="replace")}
+        finally:
+            conn.close()
+
+    def exec(
+        self, shed: str, argv: list, timeout_seconds: int = 60,
+    ) -> tuple[int, bytes, Optional[int], Optional[dict]]:
+        """Run argv in a shed over HTTPS; returns (status, stdout, exit code,
+        error body)."""
+        status, body = self.request(
+            "POST", f"/api/sheds/{shed}/exec", {"argv": argv, "timeout_seconds": timeout_seconds},
+            timeout=timeout_seconds + 30,
+        )
+        if status != 200:
+            return status, b"", None, body
+        out, code = b"", None
+        for f in (body or {}).get("frames", []):
+            if f["t"] == "stdout":
+                out += base64.b64decode(f["d"])
+            elif f["t"] == "exit":
+                code = f["code"]
+        return status, out, code, None

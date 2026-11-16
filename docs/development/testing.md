@@ -159,6 +159,9 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
 | `SHED_FC_LOG_PATH` | _unset_ (uses journald) | Remote file path for `fc_server` fixture to read logs from. `test-integration-dev-fc` sets this to the dev server's log file so the existing tests find PhaseTimer lines (the dev server runs via `sudo nohup`, not systemd). |
 | `RELEASE_BUILD_TOOLS_REF` | latest `git tag` matching `v*` | shed-build-tools image ref injected into the dev binary so it uses release-shaped upper-template behavior. Pin to an older release if your source has drifted: `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7`. |
 | `SHED_DEV_STATE_DIR` | _unset_ | **Per-machine, optional.** Relocates the Mac dev server's blob-heavy state (`images_dir`, `instance_dir`, `snapshots_dir`, `uppers_dir`) under this directory — for a boot volume that cannot host a multi-GB dev image store. Unset means the committed default (`~/Library/Application Support/shed-dev/vz`), so no other developer is affected; set it in your shell profile (e.g. `export SHED_DEV_STATE_DIR=/Volumes/ext/shed-dev/vz`). `socket_dir` is deliberately NOT relocated (unix socket path length limits). `dev-server-up` refuses to start if the path is unmounted or unwritable, rather than silently building a second empty store on the mount point. |
+| `SHED_DEV_USERS` | _unset_ | Makefile only. `itest` starts the dev servers (`dev-server-up`, `dev-server-up-fc`, `dev-server-up-remote` and their restarts) with the integration suite's itest user list (`auth.users`; see [Named users](#named-users-authusers)) and has `test-integration-dev-fc` and `-remote` tell the suite so. Empty: no user list. Needs `uv`. |
+| `SHED_ITEST_USERS` | _unset_ | Suite only. A comma list of the backends (`fc`, `remote`) whose dev server was started with the itest user list. Without it the users cases skip on `[fc]` and `[remote]`, saying what to set; `[vz]` always restarts the Mac dev server with the list itself. |
+| `SHED_ITEST_USERS_DIR` | `~/.shed/dev/itest-users` | The itest users' keys (generated once by `make dev-itest-users`, or on first use) and each test identity's throwaway `$HOME`. The server's user list must have been rendered from the same directory. |
 
 #### Validating server-side changes — parallel dev server
 
@@ -404,6 +407,34 @@ against the *client entry's* cached `auth_mode` in `~/.shed/config.yaml`
 signal. The released-version gate (`LocalServer.server_version()`) reads
 `/api/info` with the entry's own client certificate, so it works against an
 mtls server too.
+
+#### Named users (`auth.users`)
+
+The users cases (`tests/integration/test_users.py`, `test_users_upgrade.py`,
+and one case in `test_service_client.py`) run one dev server as several
+people: `itest-alice` and `itest-bob` (users), `itest-admin` (an admin), each
+with its own key, CLI config directory and client certificate
+(`tests/integration/fixtures/identity.py`). An `ssh` shim pins each identity
+to its own key, so nothing authenticates with the developer's key by
+accident. The config's own `auth.ssh` key sources move under an admin user
+`dev` (config load refuses them beside a user list), so the developer's entry
+keeps working.
+
+```sh
+make dev-itest-users                                   # the keys, once (outside the repo)
+scripts/render-dev-config.sh <base.yaml> <out.yaml> --users ~/.shed/dev/itest-users
+SHED_DEV_USERS=itest make dev-server-restart-fc        # or -restart-remote: start with the list
+SHED_DEV_USERS=itest make test-integration-dev-fc      # sets SHED_ITEST_USERS=fc for the suite
+```
+
+On the Mac the module restarts the dev server with the list through
+`dev_config()` and restores the committed base, so `make test-integration-dev`
+runs the `[vz]` users cases with no setup; `test_users_upgrade.py` (sheds
+made before a user list, `shed assign`) runs there only, because it restarts
+the server with several configs. On `[remote]` only the ownership cases run
+(one shed per user, two VMs). Full details, the run line for a server
+started by hand and which case skips where: `tests/integration/README.md`,
+"Named users".
 
 #### Validating pre-release: build-tools image changes
 

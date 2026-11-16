@@ -87,6 +87,9 @@ tests they would have run, not the whole session.
 | `SHED_REMOTE_IMAGE`    | _unset_                                            | Image alias every `[remote]` create asks for. Unset, creates boot the server's `remote.default_image` (the vz/fc names `base` and `extensions` do not exist on a remote server). |
 | `SHED_REMOTE_MAX_RUNNING` | `2`                                             | The server's `remote.limits.max_running`, for `test_remote_lifecycle.py::test_create_past_running_limit_is_refused`. |
 | `SHED_IMAGE_HAS_HOME_DIRS` | _unset_                                            | Gates `test_smoke.py::test_home_dirs_owned_by_shed` — a comma list of the backends (`vz`, `fc`) whose `base` image was rebuilt with the shed-owned `~/.local`, `~/.config` and `~/.cache` dirs (#410). `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the other backend still boots the published image); unset for plain `test-integration` (published images carry these dirs only from the 0.9.1 tag). |
+| `SHED_ITEST_USERS`     | _unset_                                            | A comma list of the backends (`fc`, `remote`) whose dev server was STARTED with the itest user list (see [Named users](#named-users-authusers)). Gates the users cases on `[fc]` and `[remote]`, which skip saying what to set when it is missing; `[vz]` always restarts the Mac dev server with the list itself. `test-integration-dev-fc` and `-remote` set it from `SHED_DEV_USERS`. |
+| `SHED_ITEST_USERS_DIR` | `~/.shed/dev/itest-users`                          | Where the itest users' keys live (generated once; a server is started with their public halves) and where each identity's throwaway `$HOME` is made. Must be the same directory the server's user list was rendered from. |
+| `SHED_DEV_USERS`       | _unset_                                            | Makefile only. `itest` starts the dev servers (`dev-server-up`, `-up-fc`, `-up-remote` and their restarts) with the itest user list and tells `test-integration-dev-fc`/`-remote` so; empty means no user list (one implicit user). |
 
 ## Fixtures
 
@@ -101,6 +104,10 @@ tests they would have run, not the whole session.
   when the corresponding `SHED_*_DEV_SERVER` env var isn't set. New
   tests targeting server-side changes against the developer's source
   tree use this fixture.
+
+- `users_env` (module-scoped, params: `["vz", "fc", "remote"]`) — a dev
+  server with the itest user list and three test identities enrolled
+  against it (`fixtures/identity.py`; see [Named users](#named-users-authusers)).
 
 The `vz_server_dev` / `fc_server_dev` sub-fixtures are session-scoped
 mirrors of `vz_server` / `fc_server`, reading the `_DEV_` env vars.
@@ -136,10 +143,16 @@ tests/integration/
   test_service_client.py  # service clients end to end (FC dev server, mtls)
   test_create_mounts.py   # shed create --mounts (FC dev server)
   test_network_profiles.py # the isolated network profile (FC dev server, mtls)
+  test_users.py           # named users on the API, SSH and the bus (users_env)
+  test_users_upgrade.py   # sheds with no user: the upgrade step, shed assign (Mac dev server)
   fixtures/
     __init__.py
     server.py             # LocalServer + RemoteServer + ShedHandle
     timing.py             # PhaseTimer log-line parser
+    devcontrol.py         # dev_config(), run_preflight(), bootstrap_cert()
+    tlsclient.py          # pinned HTTPS: pinned_request, Pinned
+    identity.py           # itest users: keys, the user list, Identity, users_environment
+    busclient.py          # a synthetic credential-bus listener
 ```
 
 ## The MVP smoke tests
@@ -452,6 +465,89 @@ their real pass/fail signal. `LocalServer.server_version()` reads
 `/api/info` with the entry's own client certificate
 (`fixtures/server.py: client_cert_pair`), so the released-version gate works
 against an mtls server too.
+
+## Named users (`auth.users`)
+
+A server with a user list gives every key to one named user; each user sees
+and enters only their own sheds, and an admin may list, stop and delete any
+shed but not enter another user's. The users cases drive one dev server as
+several people at once, none of them with the developer's own key.
+
+**The identities** (`fixtures/identity.py`). Keys are generated once under
+`$SHED_ITEST_USERS_DIR` (default `~/.shed/dev/itest-users`, outside the
+repo), because the server must be started with their public halves:
+
+| Server user | Key | Role in the tests |
+|---|---|---|
+| `itest-alice` | `itest-alice/id_ed25519` | user A |
+| `itest-alice` | `itest-alice/script_ed25519` (`script: true`) | user A's script key |
+| `itest-bob` | `itest-bob/id_ed25519` | user B |
+| `itest-bob` | `itest-bob/expired_ed25519` (`expires: 2000-01-01`) | an expired key |
+| `itest-admin` | `itest-admin/id_ed25519` (`admin: true`) | an admin |
+| `dev` | the config's own `auth.ssh` key sources | the developer, an admin |
+
+Config load refuses `auth.ssh` key sources beside `auth.users`, so the user
+list moves them under the admin user `dev`: the developer's entry, its
+certificate and `dev_config()`'s readiness check keep working, as `dev`.
+
+Each identity gets its own `$HOME` at `$SHED_ITEST_USERS_DIR/<user>/home-<entry>`
+(its own `~/.shed/config.yaml`, client certificate and pinned `known_hosts`;
+created per run, removed at teardown; the keys stay) and enrols with
+`shed server add <host> --ssh-port <port> --name <entry> --trust-on-first-use`
+under the developer's entry name. An `ssh` shim first on its `PATH` runs the
+system ssh with `-F /dev/null -i <key> -o IdentitiesOnly=yes -o
+IdentityAgent=none` and no `SSH_AUTH_SOCK`: the CLI runs ssh with no `-i`, so
+without it the developer's agent or `~/.ssh/config` would offer the
+developer's key first and a refusal could pass as the wrong person. Because
+the shim drops `~/.ssh/config`, the dev entry's host must resolve without it
+(an identity skips with that reason otherwise). `sftp` and `scp` run through
+the shim with `-S`.
+
+**Starting a server with the user list.**
+
+```sh
+make dev-itest-users                       # generate the keys (idempotent)
+cd tests/integration && uv run python -m fixtures.identity users-yaml   # print the itest users
+
+# Any base config (adds the users, moves auth.ssh's sources under `dev`):
+scripts/render-dev-config.sh <base.yaml> <out.yaml> --users ~/.shed/dev/itest-users [--state-dir DIR]
+
+# The dev targets do it with SHED_DEV_USERS=itest, and tell the suite:
+SHED_DEV_USERS=itest make dev-server-restart-fc && SHED_DEV_USERS=itest make test-integration-dev-fc
+SHED_DEV_USERS=itest make dev-server-restart-remote && SHED_DEV_USERS=itest make test-integration-remote PYTEST_ARGS=test_users.py
+```
+
+**Which server each backend uses** (`users_env` in `conftest.py`):
+
+| Backend | Server | Needs |
+|---|---|---|
+| `[vz]` | the Mac dev server | nothing: the module restarts it with the user list through `dev_config()` and restores the committed base afterwards (always: other modules' `dev_config()` calls restore the base too, so a list the server was started with would be gone by then) |
+| `[fc]` | `$SHED_FC_DEV_SERVER` | the server STARTED with the user list and `SHED_ITEST_USERS=fc`; skips saying so otherwise |
+| `[remote]` | `$SHED_REMOTE_SERVER` | the server STARTED with the user list and `SHED_ITEST_USERS=remote`; skips saying so otherwise |
+
+To run only the users cases against an FC dev server started by hand (for
+example from a config rendered with `--users`):
+
+```sh
+cd tests/integration && PATH="$PWD/../../bin:$PATH" \
+  SHED_VZ_SERVER= SHED_VZ_DEV_SERVER= SHED_REMOTE_SERVER= \
+  SHED_FC_HOST=<host> SHED_FC_DEV_SERVER=<entry>-dev SHED_FC_DEV_LOG_PATH=<remote log> \
+  SHED_FC_DEV_BIN_PATH=<remote binary> SHED_FC_DEV_CONFIG=<remote config> \
+  SHED_ITEST_USERS=fc \
+  uv run pytest -v -rs test_users.py test_service_client.py
+```
+
+| Module | Covers | Where it runs |
+|---|---|---|
+| `test_users.py` | Each user lists and sees only their own sheds (`shed list`, `/api/overview`), an admin sees all with their users; another user's shed is 404 on every API route and refused for a session, `shed exec`, sftp, scp and a forwarded port, and a stopped one is not woken; a taken name is one 409 for everyone, naming nobody; an admin may view, stop and delete another user's shed and is refused entry with the message; a non-admin is refused `local_dir`, server mounts, an image that is not an alias and the image store; snapshots belong to their user; a script key cannot take the credentials scope; an expired key opens nothing; a bus request from a user's shed reaches only that user's listener and only that user may answer it (a synthetic listener, `fixtures/busclient.py`); `shed assign` refuses a non-admin, an unknown user and an assigned shed | `[vz]`, `[fc]`; on `[remote]` only the ownership cases (one shed per user, two VMs): listing, the API 404s, session and exec refusals, the 409, the admin's refusal to enter, and the admin's stop and delete. The rest are `local_vm_only` there. |
+| `test_users_upgrade.py` | Sheds made before a user list: with one user they become that user's at start; cutting a list from two users to one later hands out nothing (the one-time marker); with several users an admin assigns one with `shed assign`, a shed carrying server mounts is refused (409 `SHED_HOST_RESOURCES`), the user can then enter it and the admin no longer can; a key taken off the list opens nothing new | `[vz]` only: it restarts the server with other configs, which the suite can do only to the Mac dev server. The one-user restart gives every shed on the Mac dev server that has no user to `dev`, the developer. |
+| `test_cred_bus.py::test_a_user_list_outside_its_rules_hard_fails` | A user list with an open server, or beside `auth.ssh` key sources, refuses to start (`run_preflight`, no running server) | Marked `vz` like the other preflight cases (they start `bin/shed-server` from the Mac dev config) |
+| `test_service_client.py::test_users_and_the_client_do_not_reach_each_others_sheds` | A user cannot see or enter a service client's shed, an admin can enter it, and the client cannot see the user's shed | `[fc]` with `SHED_ITEST_USERS=fc` |
+
+Not covered live: the server's `env_file` reaching only admins' sheds (it
+only feeds a `--repo` clone's environment, which a test cannot observe
+without a private repository; the unit tests in `internal/backend`,
+`internal/api`, `internal/config` and `internal/vmutil` cover it).
 
 ## Remote backend (cloud sheds)
 
