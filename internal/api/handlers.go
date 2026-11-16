@@ -107,7 +107,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidShedName, "shed name is required")
 		return
 	}
-	if err := config.ValidateShedName(req.Name); err != nil {
+	if err := config.ValidateNewShedName(req.Name); err != nil {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidShedName, err.Error())
 		return
 	}

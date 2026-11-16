@@ -918,3 +918,22 @@ func TestRemoteBusRouteFollowsTheReportedUser(t *testing.T) {
 	e.idle()
 	waitShedUser(t, bridge, "box", "alice", true)
 }
+
+// TestCreateRefusesReservedName: a create named git is refused, with or
+// without a snapshot, and nothing reaches the cloud; a near name is created.
+func TestCreateRefusesReservedName(t *testing.T) {
+	e := newEnv(t)
+	for _, req := range []config.CreateShedRequest{
+		{Name: "git", NoProvision: true},
+		{Name: "git", FromSnapshot: "snap", NoProvision: true},
+	} {
+		_, err := e.b.CreateShed(ctxT(t), req)
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("CreateShed(%+v) error = %v, want a reserved-name refusal", req, err)
+		}
+	}
+	if ref := e.ref("git"); ref != "" {
+		t.Errorf("an instance %q exists for the reserved name", ref)
+	}
+	e.createFor("gitx", "")
+}

@@ -54,7 +54,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	if err := b.checkReady(); err != nil {
 		return nil, err
 	}
-	if err := config.ValidateShedName(req.Name); err != nil {
+	if err := config.ValidateNewShedName(req.Name); err != nil {
 		return nil, err
 	}
 	if err := config.ValidateShedOwnership(req.Owner, req.User); err != nil {

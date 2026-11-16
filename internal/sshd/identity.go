@@ -18,18 +18,35 @@ import (
 type connIdentityKey struct{}
 
 // connIdentity is the key a connection authenticated with: the key whose
-// signature was verified (setConnIdentity).
+// signature was verified (setConnIdentity), and the username that signature
+// was made for.
 type connIdentity struct {
 	key         gossh.PublicKey
 	fingerprint string
+	// user is the username the connection authenticated as. It selects the
+	// shed every channel addresses (shedNameFor); it never says who the
+	// caller is, which comes from key.
+	user string
 }
 
-// setConnIdentity records key as the key the connection authenticated with.
-// It is called from the VerifiedPublicKeyCallback, so only with a key whose
-// signature x/crypto has verified, never with one the client only asked
-// about (see handlePublicKey).
-func setConnIdentity(ctx ssh.Context, key gossh.PublicKey) {
-	ctx.SetValue(connIdentityKey{}, connIdentity{key: key, fingerprint: gossh.FingerprintSHA256(key)})
+// setConnIdentity records key as the key the connection authenticated with,
+// and user as the username it authenticated as. It is called from the
+// VerifiedPublicKeyCallback, so only with a key whose signature x/crypto has
+// verified, never with one the client only asked about (see handlePublicKey),
+// and with the username of that signed request (the connection's metadata
+// there), never the first-seen username ctx.User() keeps.
+func setConnIdentity(ctx ssh.Context, key gossh.PublicKey, user string) {
+	ctx.SetValue(connIdentityKey{}, connIdentity{key: key, fingerprint: gossh.FingerprintSHA256(key), user: user})
+}
+
+// authenticatedUser is the username the connection on ctx authenticated as,
+// or "" when it has none on record. Every channel routes by this, never by
+// ctx.User(): gliderlabs records the username of the connection's first
+// authentication request there, and a client may change usernames before it
+// signs.
+func authenticatedUser(ctx context.Context) string {
+	id, _ := connIdentityFrom(ctx)
+	return id.user
 }
 
 // connIdentityFrom returns the key the connection authenticated with.

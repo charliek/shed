@@ -784,3 +784,34 @@ func TestStopShed_DetachedFromClientCancellation(t *testing.T) {
 		t.Errorf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
 	}
 }
+
+// TestCreateShed_ReservedName: a create named git is a 400 INVALID_SHED_NAME
+// that says the name is reserved, and no backend is called; a near name goes
+// through to the backend.
+func TestCreateShed_ReservedName(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		wantCode int
+	}{
+		{"git", http.StatusBadRequest},
+		{"gitx", http.StatusCreated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			be := newClientFakeBackend()
+			srv := NewServer(be, &config.ServerConfig{Name: "test-server", HTTPPort: 8080}, "", nil, nil)
+			w := postCreateShed(t, srv, config.CreateShedRequest{Name: tc.name})
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tc.wantCode, w.Body.String())
+			}
+			if tc.wantCode == http.StatusBadRequest {
+				resp := parseErrorResponse(t, w)
+				if resp.Error.Code != config.ErrInvalidShedName || !strings.Contains(resp.Error.Message, "reserved") {
+					t.Errorf("error = %+v, want INVALID_SHED_NAME naming the reservation", resp.Error)
+				}
+				if n := len(be.createdSnapshot()); n != 0 {
+					t.Errorf("backend CreateShed called %d times", n)
+				}
+			}
+		})
+	}
+}

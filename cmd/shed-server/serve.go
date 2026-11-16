@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -361,6 +362,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	reportReservedSheds(be)
+
 	// Optional egress-control proxy child, started only when enabled. A start
 	// failure is a hard startup error — never a silent disable (AC-11).
 	var egressMgr *egress.Manager
@@ -704,6 +707,23 @@ const upgradePassTimeout = 2 * time.Minute
 // start: the marker has not been written, so the step runs again.
 func stampUnassigned(cfg *config.ServerConfig, be backend.Backend, bindings source.Bindings) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
 	return stampUnassignedIn(cfg, be, serverStateDir(cfg), bindings)
+}
+
+// reportReservedSheds warns when a shed already has the reserved name git:
+// SSH to it is refused now. Not found is silent; any other error is logged
+// and does not stop start-up. It asks as the server's own principal, on
+// whichever backend is running.
+func reportReservedSheds(be backend.Backend) {
+	ctx, cancel := context.WithTimeout(backend.WithPrincipal(context.Background(), backend.SystemPrincipal()), upgradePassTimeout)
+	defer cancel()
+	_, err := be.GetShed(ctx, config.ReservedShedName)
+	switch {
+	case err == nil:
+		log.Printf("WARNING: a shed named %q exists. %q is now reserved: SSH to it is refused. Snapshot it and recreate under another name, or delete it.", config.ReservedShedName, config.ReservedShedName)
+	case errors.Is(err, config.ErrShedNotFoundSentinel):
+	default:
+		log.Printf("Could not check for a shed named %q (a reserved name): %v", config.ReservedShedName, err)
+	}
 }
 
 // stampUnassignedIn is stampUnassigned with the marker in stateDir.

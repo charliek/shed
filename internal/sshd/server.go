@@ -130,12 +130,31 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 		ServerConfigCallback: func(ctx ssh.Context) *gossh.ServerConfig {
 			maxTries := s.effectiveMaxAuthTries()
 			cfg := &gossh.ServerConfig{MaxAuthTries: maxTries}
+			// x/crypto asks for the banner once, on the connection's first
+			// authentication request, with the connection's live metadata:
+			// kept so handlePublicKey can read each request's own username
+			// (requestUser). No banner is sent.
+			cfg.BannerCallback = func(conn gossh.ConnMetadata) string {
+				ctx.SetValue(authConnKey{}, conn)
+				return ""
+			}
 			// The connection's identity is the key whose signature x/crypto
 			// verified, recorded only then (connIdentity). It is never taken
 			// from a key the client merely asked about: a client may offer
 			// several keys, and have more than one accepted, before it signs.
-			cfg.VerifiedPublicKeyCallback = func(_ gossh.ConnMetadata, key gossh.PublicKey, perms *gossh.Permissions, _ string) (*gossh.Permissions, error) {
-				setConnIdentity(ctx, key)
+			//
+			// conn.User() here is the username the signature was made for,
+			// the one the connection authenticates as. It is the
+			// authoritative check of the reserved username: a client may ask
+			// about a key as another username and then sign as git on the same
+			// connection, and handlePublicKey alone cannot be relied on to see
+			// that switch (requestUser).
+			cfg.VerifiedPublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey, perms *gossh.Permissions, _ string) (*gossh.Permissions, error) {
+				if config.IsReservedShedName(conn.User()) {
+					log.Printf("SSH auth DENIED: user=%s fingerprint=%s (reserved username)", conn.User(), gossh.FingerprintSHA256(key))
+					return nil, errReservedUser
+				}
+				setConnIdentity(ctx, key, conn.User())
 				return perms, nil
 			}
 			// Best-effort diagnostic from the transport's authoritative per-attempt
@@ -249,8 +268,30 @@ func (s *Server) GetHostPublicKey() string {
 	return string(gossh.MarshalAuthorizedKey(s.hostKey.PublicKey()))
 }
 
+// errBannerConfigured refuses to serve with a login banner configured: see
+// checkNoBanner.
+var errBannerConfigured = errors.New("an SSH login banner (Banner or BannerHandler) is configured; it would replace the BannerCallback that gives each authentication request's own username to handlePublicKey (requestUser)")
+
+// checkNoBanner fails when a login banner is configured on the gliderlabs
+// server. gliderlabs installs its own BannerCallback for one, replacing the
+// one NewServer sets, and requestUser would then quietly fall back to the
+// connection's first-seen username: a signed login as git is still refused
+// (the VerifiedPublicKeyCallback), but the early refusal before any key
+// lookup and the rule that git never makes the server fetch GitHub keys would
+// be lost after a username change. A banner needs another way to see each
+// request's username first.
+func (s *Server) checkNoBanner() error {
+	if s.sshServer.Banner != "" || s.sshServer.BannerHandler != nil {
+		return errBannerConfigured
+	}
+	return nil
+}
+
 // Start begins listening for SSH connections.
 func (s *Server) Start() error {
+	if err := s.checkNoBanner(); err != nil {
+		return err
+	}
 	addr := s.listenAddr
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -288,14 +329,43 @@ func (s *Server) effectiveMaxAuthTries() int {
 	return defaultMaxAuthTries
 }
 
+// errReservedUser refuses a signed login as the reserved username git.
+var errReservedUser = errors.New("reserved username")
+
+// authConnKey is the connection-context key of the connection's live metadata
+// during authentication (set by the BannerCallback).
+type authConnKey struct{}
+
+// requestUser is the username of the authentication request being decided.
+// ctx.User() is not: gliderlabs records the username of the connection's
+// first request there and never updates it, while SSH lets a client change
+// usernames between requests. The live metadata the BannerCallback kept
+// gives the current one; without it (a banner configured on the gliderlabs
+// server, which replaces that callback and which Start refuses:
+// checkNoBanner) this falls back to ctx.User(), and the
+// VerifiedPublicKeyCallback still refuses a signed login as git.
+func requestUser(ctx ssh.Context) string {
+	if conn, ok := ctx.Value(authConnKey{}).(gossh.ConnMetadata); ok {
+		return conn.User()
+	}
+	return ctx.User()
+}
+
 // handlePublicKey gates public-key auth through the user lookup: a key is
 // authorized when the lookup resolves its fingerprint to a user and it has not
 // expired (an expired key is refused in every mode the lookup is asked in). With
 // key auth off (default), every key is accepted (legacy). In warn mode an
 // unresolved key is logged but accepted; in enforce mode, and on any server
 // with a user list, it is rejected. The username (which
-// selects the shed) is unaffected — identity comes from the key, GitHub-style.
-// Applies uniformly to all usernames, including `_api`.
+// selects the shed) does not change who the key is — identity comes from the
+// key, GitHub-style — except the reserved username git, which is refused
+// whatever the key (config.IsReservedShedName). Otherwise applies uniformly
+// to all usernames, including `_api`.
+//
+// This is the only way a connection authenticates: public key is the only
+// method configured, so "none" is never accepted. In off mode a login as a
+// username that names no shed is accepted here, through this handler, and is
+// told the shed does not exist when it opens a channel.
 //
 // It decides only: it records nothing. A client may ask about several keys
 // before it signs with one, so a key this accepts is not yet the connection's
@@ -307,7 +377,22 @@ func (s *Server) effectiveMaxAuthTries() int {
 // of a session or of a certificate at _bootstrap.
 func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	fingerprint := gossh.FingerprintSHA256(key)
-	user := ctx.User()
+	// The username of this request, not of the connection's first one: it
+	// decides the reserved-name refusal, the refetch eligibility and the logs.
+	user := requestUser(ctx)
+
+	// The username git is reserved (no shed may have that name), and it is
+	// refused here first: in every mode, with or without a user list, before
+	// any key lookup or GitHub key refetch. The VerifiedPublicKeyCallback
+	// checks it again on the username the signature was made for, and every
+	// channel refuses it once more where it turns the username into a shed
+	// (shedNameFor). The match is exact: the default signature the user's
+	// machine gives out is for exactly "git". A case variant ("Git") is not a
+	// valid shed name, and shedNameFor refuses it before any shed lookup.
+	if config.IsReservedShedName(user) {
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s (reserved username)", user, fingerprint)
+		return false
+	}
 
 	if s.keyAuth.off() {
 		log.Printf("SSH auth attempt: user=%s fingerprint=%s (allowlist off)", user, fingerprint)
@@ -386,7 +471,10 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 		return
 	}
 
-	user := ctx.User()
+	// The username the connection authenticated as, as on every other
+	// channel: ctx.User() is its first-seen username, which a client may
+	// have changed before it signed.
+	user := authenticatedUser(ctx)
 	log.Printf("Port forward: user=%s dest=%s:%d", user, d.DestAddr, d.DestPort)
 
 	// Only allow localhost destinations (security: prevent using shed as proxy)
@@ -406,8 +494,17 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 	}
 	bctx := backend.WithPrincipal(ctx, p)
 
+	// The username names the shed; one that cannot (git, a case variant, a
+	// special name) is answered as an unknown shed is, before any lookup.
+	name, ok := shedNameFor(user)
+	if !ok {
+		log.Printf("Port forward refused: user=%s is not a shed name", user)
+		_ = newChan.Reject(gossh.ConnectionFailed, "shed not found")
+		return
+	}
+
 	// Look up the shed and check the right to enter it.
-	shed, err := s.guard().Check(bctx, user, backend.ActionEnter)
+	shed, err := s.guard().Check(bctx, name, backend.ActionEnter)
 	if err != nil {
 		log.Printf("Port forward refused: user=%s principal=%s: %v", user, p, err)
 		if errors.Is(err, config.ErrForbiddenSentinel) {

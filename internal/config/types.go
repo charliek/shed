@@ -163,6 +163,35 @@ func ValidateShedName(name string) error {
 	return nil
 }
 
+// ReservedShedName is the one shed name no new shed may take: a shed's SSH
+// username on shed-server is its name, and the user's machine by default
+// signs SSH logins for the username git (so git over SSH keeps working). A
+// shed named git could be opened with a signature the machine gives out by
+// default.
+const ReservedShedName = "git"
+
+// IsReservedShedName reports whether name is reserved. The comparison is
+// exact and case-sensitive. A name differing only in case ("Git") is not a
+// valid shed name (shed names are lowercase), but a shed directory on a
+// case-insensitive volume would still answer to it: every path that turns a
+// name from outside into a shed must apply ValidateShedName first, as the SSH
+// server does (internal/sshd shedNameFor).
+func IsReservedShedName(name string) bool { return name == ReservedShedName }
+
+// ValidateNewShedName is ValidateShedName plus the reserved-name rule. It is
+// for creating a shed only: ValidateShedName stays the rule on every other
+// path, so a shed that already has a reserved name can still be listed,
+// stopped, snapshotted and deleted.
+func ValidateNewShedName(name string) error {
+	if err := ValidateShedName(name); err != nil {
+		return err
+	}
+	if IsReservedShedName(name) {
+		return fmt.Errorf("shed name %q is reserved", name)
+	}
+	return nil
+}
+
 // ValidateSnapshotName validates that a snapshot name is valid.
 // Snapshot names follow the same rules as shed names.
 func ValidateSnapshotName(name string) error {

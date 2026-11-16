@@ -15,9 +15,12 @@ import (
 )
 
 // serveForTest starts s on a loopback port and returns its address. The
-// listener closes with the test.
+// listener closes with the test. It makes the start-up check Start makes.
 func serveForTest(t *testing.T, s *Server) string {
 	t.Helper()
+	if err := s.checkNoBanner(); err != nil {
+		t.Fatal(err)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

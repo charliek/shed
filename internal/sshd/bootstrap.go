@@ -101,7 +101,7 @@ func (s *Server) SetBootstrap(info BootstrapInfo) {
 // bundle (the certificate plus the TLS pin + port) as a single JSON line. It never touches the shed routing or the shell wrap.
 //
 // The certificate is issued for the key the connection authenticated with,
-// as recorded by handlePublicKey (connIdentity), and only while that key
+// as recorded by the VerifiedPublicKeyCallback (connIdentity), and only while that key
 // still resolves to a user for this channel (principalFor).
 func (s *Server) handleBootstrap(sess ssh.Session) {
 	var key gossh.PublicKey

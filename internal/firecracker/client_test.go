@@ -1643,3 +1643,24 @@ func TestResumeRegistersTheRecordedUser(t *testing.T) {
 		t.Fatalf("bus sheds = %+v, want only alpha", got)
 	}
 }
+
+// TestCreateShedRefusesReservedName: a create named git (also from a
+// snapshot) is refused before anything is made.
+func TestCreateShedRefusesReservedName(t *testing.T) {
+	c := &Client{}
+	for _, req := range []config.CreateShedRequest{
+		{Name: "git"},
+		{Name: "git", FromSnapshot: "snap1"},
+	} {
+		_, err := c.CreateShed(context.Background(), req)
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("CreateShed(%+v) error = %v, want a reserved-name refusal", req, err)
+		}
+	}
+	// Negative control: a different name gets past the name rule (and is
+	// refused for the request's own exclusivity rule).
+	_, err := c.CreateShed(context.Background(), config.CreateShedRequest{Name: "gitx", FromSnapshot: "snap1", Image: "default"})
+	if err == nil || strings.Contains(err.Error(), "reserved") {
+		t.Errorf("gitx error = %v, want a refusal that is not about the name", err)
+	}
+}

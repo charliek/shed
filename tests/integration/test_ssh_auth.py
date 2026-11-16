@@ -10,6 +10,13 @@ so these probes don't need a real shed — `ssh -v` reports `Authenticated to`
 on success and `Permission denied (publickey)` on rejection. VZ-only (config
 mutation via the Phase 0.5 harness restarts the local VZ dev server).
 
+The reserved username `git` (no shed may be named git; the user's machine signs
+SSH logins for that name by default) is refused at the door in every mode, for a
+key that would otherwise authenticate, and a create of a shed named git answers
+400 (INVALID_SHED_NAME, "reserved"). A case variant (`Git`) authenticates, as
+any username does, and is then answered exactly as an unknown shed is: it is not
+a valid shed name, so it is refused before any shed lookup.
+
 SSH enforce is the mtls posture: `auth.ssh.mode: enforce` on an open-mode
 server is rejected at startup, and mtls forces enforce itself, so the enforce
 test reconfigures the (mtls) dev server's key list. Warn stays an open-mode
@@ -98,3 +105,72 @@ def test_warn_admits_offlist(vz_server_dev, tmp_path):
         # warn logs would-deny but still authenticates.
         assert "Authenticated to" in off, f"warn mode should admit off-list; stderr={off!r}"
         assert "Permission denied" not in off
+
+
+@pytest.mark.vz
+@pytest.mark.slow
+def test_enforce_refuses_reserved_username_for_onlist_key(vz_server_dev, tmp_path):
+    server = vz_server_dev.name
+    ssh_port = int(resolve_server_entry(server)["ssh_port"])
+
+    on_key, on_pub = _keygen(tmp_path, "onlist")
+
+    with dev_config({"auth": {"ssh": {"authorized_keys": [on_pub]}}}, server):
+        # Control: the same on-list key authenticates as another username.
+        ok = _ssh_auth_stderr(ssh_port, on_key)
+        assert "Authenticated to" in ok, f"on-list key should authenticate; stderr={ok!r}"
+
+        git = _ssh_auth_stderr(ssh_port, on_key, user="git")
+        assert "Permission denied (publickey)" in git, f"git@ must be refused; stderr={git!r}"
+        assert "Authenticated to" not in git
+
+
+@pytest.mark.vz
+@pytest.mark.slow
+def test_open_mode_refuses_reserved_username(vz_server_dev, tmp_path):
+    server = vz_server_dev.name
+    ssh_port = int(resolve_server_entry(server)["ssh_port"])
+
+    key, _ = _keygen(tmp_path, "anykey")
+
+    # An open server on loopback accepts every key, except for git.
+    with dev_config(OPEN_MODE_OVERRIDES, server):
+        ok = _ssh_auth_stderr(ssh_port, key)
+        assert "Authenticated to" in ok, f"open mode should admit any key; stderr={ok!r}"
+
+        git = _ssh_auth_stderr(ssh_port, key, user="git")
+        assert "Permission denied (publickey)" in git, f"git@ must be refused; stderr={git!r}"
+        assert "Authenticated to" not in git
+
+
+@pytest.mark.vz
+@pytest.mark.slow
+def test_case_variant_of_reserved_username_reaches_no_shed(vz_server_dev, tmp_path):
+    server = vz_server_dev.name
+    ssh_port = int(resolve_server_entry(server)["ssh_port"])
+
+    on_key, on_pub = _keygen(tmp_path, "onlist")
+
+    # `Git` is not the reserved name (the exact match is refused at the
+    # door), but it is not a valid shed name either: on a case-insensitive
+    # volume a lookup of it would find a shed stored as `git`. The server
+    # refuses it before any shed lookup, with exactly the answer an unknown
+    # shed gets, so it reveals nothing.
+    with dev_config({"auth": {"ssh": {"authorized_keys": [on_pub]}}}, server):
+        unknown = _ssh_auth_stderr(ssh_port, on_key, user="no-such-shed-zz")
+        assert "shed 'no-such-shed-zz' not found" in unknown, f"control: stderr={unknown!r}"
+
+        cap = _ssh_auth_stderr(ssh_port, on_key, user="Git")
+        assert "Error: shed 'Git' not found" in cap, f"Git@ must reach no shed; stderr={cap!r}"
+
+
+@pytest.mark.vz
+@pytest.mark.slow
+def test_create_of_reserved_name_is_refused(vz_server_dev):
+    r = subprocess.run(
+        ["shed", "-s", vz_server_dev.name, "create", "git", "--no-provision"],
+        capture_output=True, text=True, timeout=60,
+    )
+    out = (r.stdout or "") + (r.stderr or "")
+    assert r.returncode != 0, f"create of git should fail; output={out!r}"
+    assert "reserved" in out, f"the refusal should say the name is reserved; output={out!r}"

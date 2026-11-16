@@ -44,7 +44,17 @@ func wakeErrorf(format string, args ...any) error {
 // wakes it: a caller who may see the shed but not enter it (an admin and
 // another user's shed) is told so, and a caller who may not see it is told it
 // does not exist. Everything after acts on the incarnation that was checked.
-func (s *Server) ensureRunning(ctx context.Context, name string, stderr io.Writer, announce bool) (*config.Shed, error) {
+//
+// user is the username the connection authenticated as; it is turned into
+// the shed's name by shedNameFor, before any lookup, and one that names no
+// shed (git, a case variant, a special name) is told the shed does not exist,
+// as an unknown shed is.
+func (s *Server) ensureRunning(ctx context.Context, user string, stderr io.Writer, announce bool) (*config.Shed, error) {
+	name, ok := shedNameFor(user)
+	if !ok {
+		log.Printf("Refused shed lookup: user=%s is not a shed name", user)
+		return nil, wakeErrorf("shed '%s' not found", user)
+	}
 	shed, err := s.guard().Check(ctx, name, backend.ActionEnter)
 	if err != nil {
 		log.Printf("Failed to get shed %s: %v", name, err)

@@ -820,3 +820,27 @@ func TestVzMountArgv(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateShedRefusesReservedName: a create named git (also from a
+// snapshot) is refused before anything is made; a near name is not refused for
+// its name.
+func TestCreateShedRefusesReservedName(t *testing.T) {
+	client := &Client{
+		cfg:     &config.VZConfig{InstanceDir: t.TempDir()},
+		vms:     make(map[string]*VM),
+		credMgr: newTestCredMgr(),
+	}
+	for _, req := range []config.CreateShedRequest{
+		{Name: "git"},
+		{Name: "git", FromSnapshot: "snap1"},
+	} {
+		_, err := client.CreateShed(context.Background(), req)
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("CreateShed(%+v) error = %v, want a reserved-name refusal", req, err)
+		}
+	}
+	// Negative control: a different name gets past the name rule.
+	if _, err := client.CreateShed(context.Background(), config.CreateShedRequest{Name: "gitx", CPUs: config.MaxVZCPUs + 1}); err == nil || strings.Contains(err.Error(), "reserved") {
+		t.Errorf("gitx error = %v, want a refusal that is not about the name", err)
+	}
+}

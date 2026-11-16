@@ -354,7 +354,7 @@ func (c *Client) preserveConsoleLog(meta *Metadata) {
 // orchestrator.CreateShed. See `internal/backend/orchestrator/create.go`
 // for the BackendCreator contract.
 func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
-	if err := config.ValidateShedName(req.Name); err != nil {
+	if err := config.ValidateNewShedName(req.Name); err != nil {
 		return nil, err
 	}
 	if err := config.ValidateShedOwnership(req.Owner, req.User); err != nil {

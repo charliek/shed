@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/elliptic"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -113,28 +114,14 @@ func dialWith(t *testing.T, addr, user string, signers ...gossh.Signer) *gossh.C
 // and exit status. subsystem, when set, is requested instead of a command.
 func runOn(t *testing.T, client *gossh.Client, cmd, subsystem string) (string, int) {
 	t.Helper()
+	if subsystem != "" {
+		return runSubsystemOn(t, client, subsystem)
+	}
 	sess, err := client.NewSession()
 	if err != nil {
 		t.Fatalf("session: %v", err)
 	}
 	defer func() { _ = sess.Close() }()
-	if subsystem != "" {
-		// A subsystem session is never "started" on the client, so its
-		// exit status cannot be waited for: read its stderr to the end
-		// and report 0 when it is empty, 1 when the server wrote to it.
-		stderr, err := sess.StderrPipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := sess.RequestSubsystem(subsystem); err != nil {
-			t.Fatalf("subsystem: %v", err)
-		}
-		b, _ := io.ReadAll(stderr)
-		if len(b) > 0 {
-			return string(b), 1
-		}
-		return "", 0
-	}
 	var out, errOut bytes.Buffer
 	sess.Stdout = &out
 	sess.Stderr = &errOut
@@ -148,6 +135,47 @@ func runOn(t *testing.T, client *gossh.Client, cmd, subsystem string) (string, i
 	}
 	t.Fatalf("run: %v", err)
 	return "", -1
+}
+
+// runSubsystemOn requests subsystem on a new session channel on client and
+// returns its stderr and the exit status the server sent. A gossh.Session
+// cannot wait for a subsystem (Wait needs a command it started), so this
+// works on the session channel itself; a channel the server closes without
+// an exit status fails the test.
+func runSubsystemOn(t *testing.T, client *gossh.Client, subsystem string) (string, int) {
+	t.Helper()
+	ch, reqs, err := client.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	defer func() { _ = ch.Close() }()
+	status := make(chan int, 1)
+	go func() {
+		st := -1
+		for r := range reqs {
+			if r.Type == "exit-status" && len(r.Payload) == 4 {
+				st = int(binary.BigEndian.Uint32(r.Payload))
+			}
+			if r.WantReply {
+				_ = r.Reply(false, nil)
+			}
+		}
+		status <- st
+	}()
+	ok, err := ch.SendRequest("subsystem", true, gossh.Marshal(struct{ Name string }{subsystem}))
+	if err != nil || !ok {
+		t.Fatalf("subsystem %s: granted %v, %v", subsystem, ok, err)
+	}
+	stdout := make(chan struct{})
+	go func() { _, _ = io.Copy(io.Discard, ch); close(stdout) }()
+	var errOut bytes.Buffer
+	_, _ = io.Copy(&errOut, ch.Stderr())
+	<-stdout
+	st := <-status
+	if st < 0 {
+		t.Fatalf("subsystem %s: the server sent no exit status (stderr %q)", subsystem, errOut.String())
+	}
+	return errOut.String(), st
 }
 
 // TestSSHChannelsDecidedByTheGuard: a shell or command, sftp and a forwarded
