@@ -39,7 +39,7 @@ use std::sync::Arc;
 // against them (`config::HostAgentConfig`, `bus::FileBusLog`, `supervisor::…`, …) —
 // the same bare paths the pre-extraction single-crate daemon used.
 use shed_broker::config::HostAgentConfig;
-use shed_broker::status::{build_live_status, now_rfc3339, LiveStatus};
+use shed_broker::status::{build_live_status, now_rfc3339, LiveStatus, SshSigningStatus};
 use shed_broker::{
     approval, audit, aws_backend, bus, config, docker_backend, minter, sockets, ssh_backend,
     supervisor, watcher,
@@ -322,6 +322,7 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     if let Some(line) = filtered_ssh.startup_line() {
         log.info(&line);
     }
+    let ssh_mode = ssh_backend.mode().to_string();
 
     let version = full_info();
     let status_path = sockets::status_socket_path();
@@ -448,6 +449,8 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     let deps = supervisor::SharedDeps {
         ssh_backend,
         ssh_gate,
+        // Checked before the approval gate on every sign request; fixed at start.
+        ssh_sign_policy: Arc::new(ssh_sign_policy.clone()),
         aws,
         docker,
         audit,
@@ -498,6 +501,11 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         let started_at = started_at.clone();
         let version = version.clone();
         let sup = sup.clone();
+        // The signing block: the policy fixed at start, the resolved backend mode, and
+        // the key filter's counts from the last listing.
+        let ssh_mode = ssh_mode.clone();
+        let ssh_counts = filtered_ssh.counts();
+        let ssh_sign_policy = ssh_sign_policy.clone();
         #[cfg(feature = "desktop-forwarding")]
         let desktop_server = desktop_server.clone();
         Arc::new(move || {
@@ -513,6 +521,11 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
                 consumer,
                 sup.health(),
                 &machine,
+                Some(SshSigningStatus::new(
+                    &ssh_mode,
+                    &ssh_sign_policy,
+                    ssh_counts.get(),
+                )),
             )
         })
     };

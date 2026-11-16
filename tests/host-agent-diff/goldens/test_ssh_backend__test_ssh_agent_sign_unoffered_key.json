@@ -1,10 +1,12 @@
 {
   "audit": {
-    "approval": "approve-all",
-    "detail": "ssh-rsa",
+    "approval": "none",
+    "code": "SIGN_REFUSED",
+    "detail": "key SHA256:C8g1CapDe/kvnUMby6PfZBt8QpMmgr3/Xbqfn9ZwUx0",
     "ns": "ssh-agent",
     "op": "sign",
-    "result": "error",
+    "reason": "key_not_offered",
+    "result": "refused",
     "shed": "web",
     "ts": "<ts>"
   },

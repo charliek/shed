@@ -203,6 +203,14 @@ impl BrokerRuntime {
             Some(Err(e)) => (Value::Null, Value::from(e)),
             None => (Value::Null, Value::Null),
         };
+        // What the embedded broker signs for a shed (plan 035 §3.5) — the daemon status's
+        // `ssh` block, same shape; null outside embedded mode or before the bus started.
+        let ssh = self
+            .agent
+            .as_ref()
+            .and_then(|a| a.ssh_signing_status())
+            .and_then(|s| serde_json::to_value(s).ok())
+            .unwrap_or(Value::Null);
         json!({
             "effective_mode": self.effective_mode_str(),
             "pref": self.pref_str(),
@@ -217,6 +225,7 @@ impl BrokerRuntime {
             "servers": servers,
             "machine": machine,
             "machine_error": machine_error,
+            "ssh": ssh,
             "broker_error": self.error.lock().unwrap().clone().map_or(Value::Null, Value::from),
         })
     }
@@ -502,6 +511,8 @@ mod tests {
         // External mode runs no broker of its own, so it reports no identity of its own.
         assert_eq!(v["machine"], Value::Null);
         assert_eq!(v["machine_error"], Value::Null);
+        // Nor a signing block: the daemon reports its own.
+        assert_eq!(v["ssh"], Value::Null);
         assert_eq!(
             rt.identify_fragment(),
             json!({"effective": "external", "pref": "auto", "restart_required": false})

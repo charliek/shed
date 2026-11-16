@@ -116,10 +116,10 @@ JSONL, one object per line. Field order in the struct is the emission order
 | `shed` | Shed | no | shed instance name (may be `""`) |
 | `ns` | Namespace | no | `ssh-agent`/`aws-credentials`/`docker-credentials`/`egress` |
 | `op` | Operation | no | e.g. `sign`, `get_credentials`, `get`, `list`; egress uses the **protocol** (`https`/`tcp`) |
-| `result` | Result | no | `ok`/`error`/`denied`/`anonymous`; egress uses the **verdict** (`allow`/`deny`) |
+| `result` | Result | no | `ok`/`error`/`denied`/`anonymous`/`undelivered`/`refused` (a sign request the signing check declined, plan 035 §6.1); egress uses the **verdict** (`allow`/`deny`) |
 | `detail` | Detail | **yes** | free text (registry, key type, `N keys`, `expires:HH:MM`, `host:port (ip)`) |
-| `code` | Code | **yes** | protocol error code or audit-only `APPROVAL_DENIED`; empty on ok |
-| `reason` | Reason | **yes** | host-side human explanation; never raw helper stderr |
+| `code` | Code | **yes** | protocol error code or audit-only `APPROVAL_DENIED` / `SIGN_REFUSED`; empty on ok |
+| `reason` | Reason | **yes** | host-side human explanation; never raw helper stderr. On a `refused` sign: the refusal class (§6.1), or `audit_rate_limited` on a summary line |
 | `approval` | Approval | no | the policy method: `deny-all`/`approve-all`/`shed-desktop`/biometrics/`none` |
 | `decided_by` | DecidedBy | **yes** | gated ops: `user`/`touchid`/`policy`/`timeout` |
 | `scope` | Scope | **yes** | approval scope applied |
@@ -192,13 +192,21 @@ Fan-out happens even when file logging is disabled (`audit.go:104` comment).
     "id": "0123456789abcdef0123456789abcdef",  // VOLATILE: 32 lowercase hex, no hyphens
     "name": "laptop"                 // VOLATILE: 1-63 bytes UTF-8, no control characters
   },
-  "machine_error": "..."             // omitempty; why there is no `machine`
+  "machine_error": "...",            // omitempty; why there is no `machine`
+  "ssh": {                           // omitted by an older daemon (plan 035 §3.5)
+    "mode": "local-keys",            // the resolved SSH backend mode
+    "allow_users": ["git"],          // ssh.allow_users: the usernames a login is signed for
+    "key_filter": false,             // whether ssh.offer_keys is set
+    "keys_offered": 3,               // omitempty: absent until a listing has happened
+    "keys_available": 3              // omitempty: the backend's keys at that listing
+  }
 }
 ```
 
 - `policies` keys are always the 3 credential namespaces (`status_server.go:81`).
 - `state` ∈ `connected|reconnecting|stopped` (also `rejected` in the SDK), from `sdk/hostclient.go:28-34` `ConnConnected/ConnReconnecting/ConnStopped/ConnRejected` → the health snapshot maps `client.Status()` (`supervisor.go:243`). Plan 035 adds two non-terminal states, Rust only: `not-source` and `duplicate` (§9b).
 - `active_source` (plan 035, additive under schema 1, omitted otherwise so every pre-pin golden is unchanged): on a namespace, the machine a `403 SOURCE_NOT_BOUND` named as the active credential source, exactly as the server sent it (control and Unicode format characters dropped, at most 64 bytes each); on a server, the first such namespace's, so the server row reads as not the source when any of its namespaces is.
+- `ssh` (plan 035, Rust only, additive under schema 1): what this machine signs for a shed — the policy built once at start from `ssh.allow_users` and `ssh.offer_keys` (§5.2), the backend mode, and the key filter's counts from the LAST `list` (local keys are listed at start-up, so they are counted at once; a forwarded agent is not asked until a shed asks, so its counts are absent until then). The desktop app's embedded broker reports the same object as `broker.status.ssh` (null outside embedded mode or before the broker started).
 - `buildLiveStatus` (`status_server.go:65`) composes it: policies from `cfg.*.Approval.EffectivePolicy()`, gate list from `desktopGateNamespaces(cfg)`, approval-channel from `desktop.ConsumerInfo()`, servers from `sup.Health()`.
 - `machine` / `machine_error` (plan 035, Rust only — added after the Go daemon's retirement, additive under schema 1): this machine's identity from `<state dir>/host-agent/machine.json` (`shed_broker::machine`), the file the daemon and the desktop app's embedded broker share. Loaded once at start, before any socket binds. The id and the schema are read on their own first, so an id that can be read is never thrown away. Missing → created; a valid id with any other field missing, `null`, of the wrong type or malformed → the id kept and the rest repaired (a WARN line); a newer schema → never rewritten, moved or replaced: its id is used if it can be read, otherwise the daemon runs without one and `machine_error` names the schema; no readable id at all → copied to `machine.json.corrupt` and replaced in one atomic rename (a WARN line: servers will see a new machine); unreadable, impossible to create, or a write whose fsync (file, directory, or a directory it created) fails → the daemon runs without one and `machine_error` says why, and `machine.json` is never left missing by a failed replacement. Nothing here stops the daemon from starting, matching the credential store. Every bus request carries it (§9b).
 
@@ -213,7 +221,7 @@ Fan-out happens even when file logging is disabled (`audit.go:104` comment).
 - Decodes `LiveStatus`; `schema != 1` → stderr skew message + **exit 1** (`status.go:48`).
 - `--json`/`-json` → indented `LiveStatus` (exit 0). Else `renderStatus` text (exit 0).
 - Unknown arg or removed `--live` → stderr + **exit 2** (`main.go:61-66`).
-- `renderStatus` text landmarks (good for text golden, `status_test.go:108-122`): `shed-host-agent status (pid N, <ver>)`, `machine:  <name> (<id>)` (or `machine:  unavailable: <error>`) right after `started:`, `Approval policies:`, `(decided in shed-desktop)` for gated ns, `none connected (shed-desktop-policy requests fail closed)`, `Servers (N):`, `(none being watched)`, per-ns marks `ok`/`-`/`x` (`connMark`, `status.go:141`; `not-source` is `-`, `duplicate` is `x`). Under a server with any `not-source` namespace, two more lines (plan 035): `    this machine is not the credential source here; the active source is <name>` and `    to make this machine the source: shed [-s <server> ]source use -- <this machine's name>` (the server and name each one shell word: bare only when non-empty and made of ASCII letters, digits, `.`, `_` and `-`, single-quoted otherwise; `--` so a name beginning with `-` is not an option; `-s` omitted for the unnamed single-server target; the second line omitted when this machine has no identity). No new host-agent verb.
+- `renderStatus` text landmarks (good for text golden, `status_test.go:108-122`): `shed-host-agent status (pid N, <ver>)`, `machine:  <name> (<id>)` (or `machine:  unavailable: <error>`) right after `started:`, `Approval policies:`, `(decided in shed-desktop)` for gated ns, then (plan 035, when the snapshot has `ssh`) an `SSH signing:` block — `  mode   <mode>`, `  users  <a, b>` (`(none)` when empty), `  keys   N offered (no ssh.offer_keys filter)` / `N of M offered (ssh.offer_keys)` / `not listed yet (…)` — and a blank line before `Approval channel:`, `none connected (shed-desktop-policy requests fail closed)`, `Servers (N):`, `(none being watched)`, per-ns marks `ok`/`-`/`x` (`connMark`, `status.go:141`; `not-source` is `-`, `duplicate` is `x`). Under a server with any `not-source` namespace, two more lines (plan 035): `    this machine is not the credential source here; the active source is <name>` and `    to make this machine the source: shed [-s <server> ]source use -- <this machine's name>` (the server and name each one shell word: bare only when non-empty and made of ASCII letters, digits, `.`, `_` and `-`, single-quoted otherwise; `--` so a name beginning with `-` is not an option; `-s` omitted for the unnamed single-server target; the second line omitted when this machine has no identity). No new host-agent verb.
 
 ---
 
@@ -247,6 +255,17 @@ ssh:
     session_ttl: 4h      # biometric only; default 4h
 ```
 Auto mode (`ssh_backend.go:35`): `SSH_AUTH_SOCK` set + dialable → agent-forward, else local-keys. Unknown mode → **fatal** `unknown ssh mode: %q` (backend init, `main.go:118` exit 1).
+
+Plan 035 (Rust only) adds two machine-wide keys under `ssh:`, read once at start:
+
+```yaml
+ssh:
+  allow_users: [git]   # the usernames an SSH login is signed for; default [git]
+  offer_keys:          # optional: the only keys listed to sheds or used to sign
+    - "SHA256:..."     # a fingerprint as `ssh-add -l` prints it, or a public key line
+```
+
+A name beginning with `_` in `allow_users`, a list holding a name other than `git` with no `offer_keys`, or an `offer_keys` entry that does not parse or names a key the broker cannot sign with fails config load (exit 1). With `offer_keys` set, `list` returns only those keys and a sign with any other key is declined (§6.1).
 
 ### 5.3 AWS (`config.go:271`)
 ```yaml
@@ -367,10 +386,22 @@ namespace's `*ErrorResponse{error, code}`. A payload that won't parse as
 | op | success payload | error paths (`{error, code}`) | audit |
 |----|-----------------|-------------------------------|-------|
 | `list` | `SSHListResponse{keys:[{format,blob(b64 marshaled pubkey),comment}]}` | backend err → `{"key listing failed", INTERNAL_ERROR}` | ok `"N keys"` / error; approval `none` |
-| `sign` | `SSHSignResponse{format, blob(b64 sig), rest:""}` | gate deny → `{"approval denied", SIGN_FAILED}`; bad pubkey b64 → `{"invalid public key encoding", INTERNAL_ERROR}`; unparsable pubkey → `{"invalid public key", KEY_NOT_FOUND}`; bad data b64 → `{"invalid challenge data encoding", INTERNAL_ERROR}`; backend sign err → `{"sign operation failed", SIGN_FAILED}` | denied / ok / error; detail = `pubKey.Type()`; approval = method + decided_by/scope/ttl |
+| `sign` | `SSHSignResponse{format, blob(b64 sig), rest:""}` | undecodable request → `{"invalid sign request", INTERNAL_ERROR}`; bad pubkey b64 → `{"invalid public key encoding", INTERNAL_ERROR}`; bad data b64 → `{"invalid challenge data encoding", INTERNAL_ERROR}`; unparsable pubkey → `{"invalid public key", KEY_NOT_FOUND}`; any other refusal by the signing check → `{"sign operation failed", SIGN_FAILED}`; gate deny → `{"approval denied", SIGN_FAILED}`; backend sign err → `{"sign operation failed", SIGN_FAILED}` | refused / denied / ok / error; ok and error detail = the key type; approval = method + decided_by/scope/ttl (refused: `none`) |
 | `ping` | `SSHPingResponse{status:"ok"}` | — | none |
 | `status` | `SSHStatusResponse{connected:true, mode, key_count}` (mode = backend.Mode()) | — | none |
 | unknown | — | `{"unknown operation: <op>", INTERNAL_ERROR}` | none |
+
+**`sign` order (plan 035 §3.5, Rust only; the Go daemon ran the gate first):** decode the request → decode the key, then the data → **the signing check** (`shed_broker::sign_check::SignPolicy::check`, with the request's flags) → approval gate → sign through the check's `Approved`, which hands the backend exactly the decoded key and data buffers and the flags that were checked (the only path to the backend's `sign`). The check accepts only an exact SSH login request (RFC 4252 §7, or `publickey-hostbound-v00@openssh.com`) for a username on `ssh.allow_users`, never one beginning with `_`, naming the requested key, or an exact SSHSIG blob with namespace `git`; an RSA request's flags must name the hash its payload does. A request that fails to decode or that the check declines never reaches the gate — no approval prompt, no approval-cache entry read or written, no backend call — and is answered with the reply in the table (the shed cannot tell which rule declined it; a key that is not offered gets what an unknown key gets) and audited:
+
+| field | refused sign audit |
+|---|---|
+| `result` | `refused` |
+| `code` | `SIGN_REFUSED` (audit only, never sent to the shed) |
+| `reason` | the class: `malformed_request` (the request, the key's base64 or the data's base64 does not decode), `malformed_key`, `key_not_offered`, `username_not_allowed`, `reserved_username`, `wrong_namespace`, `unparseable_data` (neither shape, or RSA flags that disagree with the payload) |
+| `detail` | the check's bounded detail (at most 320 printable ASCII bytes; a shed-supplied value escaped and cut to 64 bytes): e.g. `login user=deploy`, `sshsig namespace=file`, `key SHA256:…`, `login: trailing bytes`; never the request |
+| `approval` | `none`; no `decided_by`/`scope`/`ttl` |
+
+Refusal lines are limited per shed, in fixed 60 s windows: the first 20 refusals get a line each, and after that the first refusal of each class not yet logged in the window still gets its own line (so every kind of refusal, with its username or namespace, is on record once per window). The rest are counted per class and written as ONE summary line (`result: refused`, `code: SIGN_REFUSED`, `reason: audit_rate_limited`, `detail: N more refused sign requests were not logged one by one (…): <class>=<count> …`, the classes counted in the §6.1 order) when the window ends, so every refused request is either logged or counted under its own class. The worst case per shed per window is 20 + 7 + 1 lines. At most 1024 windows are kept; a new shed past that writes out and drops ended windows, then the oldest open one. On shutdown every pending summary is written before the server group stops; a hard kill loses the counts of windows still open. Nothing else bounds them (the server does not limit a shed's bus requests and the audit file is never rotated). The ok, denied and error lines are unchanged and unlimited. A malformed key under a deny-all gate therefore answers the key error, not `approval denied`. The approval prompt's reason is still the fixed `SSH sign request`.
 
 Backend seam (`ssh_backend.go:14`): `List() []*agent.Key`, `Sign(pubkey,data,flags)`, `Mode()`.
 - **agent-forward** (`ssh_backend_agent.go`): fresh `net.Dial("unix", $SSH_AUTH_SOCK)` per op; `flags!=0` → `SignWithFlags`.

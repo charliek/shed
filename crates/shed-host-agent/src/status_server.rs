@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use shed_broker::sockets::{connect_unix_timeout, status_socket_path};
 use shed_broker::status::{
-    ApprovalChannelStatus, LiveStatus, ServerHealth, STATUS_NAMESPACES, STATUS_SCHEMA_VERSION,
+    ApprovalChannelStatus, LiveStatus, ServerHealth, SshSigningStatus, STATUS_NAMESPACES,
+    STATUS_SCHEMA_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -187,6 +188,13 @@ pub fn render_status(out: &mut dyn Write, ls: &LiveStatus) {
     tabwrite(out, &rows);
     let _ = writeln!(out);
 
+    // What this machine signs for a shed (plan 035 §3.5); an older daemon's snapshot
+    // has no block and prints nothing.
+    if let Some(ssh) = &ls.ssh {
+        render_ssh_signing(out, ssh);
+        let _ = writeln!(out);
+    }
+
     let _ = writeln!(out, "Approval channel:");
     let _ = writeln!(out, "  socket    {}", ls.approval_channel.socket_path);
     if ls.approval_channel.consumer_connected {
@@ -230,6 +238,34 @@ pub fn render_status(out: &mut dyn Write, ls: &LiveStatus) {
         tabwrite(out, &srows);
         render_source_hint(out, sv, ls);
     }
+}
+
+/// The `SSH signing:` block: the backend mode, the usernames a login is signed for, and
+/// the keys offered to sheds — `N offered` without a filter, `N of M offered` with one,
+/// `not listed yet` before the first listing (a forwarded agent is not asked until a shed
+/// asks).
+fn render_ssh_signing(out: &mut dyn Write, ssh: &SshSigningStatus) {
+    let users = if ssh.allow_users.is_empty() {
+        "(none)".to_string()
+    } else {
+        ssh.allow_users.join(", ")
+    };
+    let filter = if ssh.key_filter {
+        "(ssh.offer_keys)"
+    } else {
+        "(no ssh.offer_keys filter)"
+    };
+    let keys = match (ssh.keys_offered, ssh.keys_available) {
+        (Some(offered), Some(available)) if ssh.key_filter => {
+            format!("{offered} of {available} offered {filter}")
+        }
+        (Some(offered), _) => format!("{offered} offered {filter}"),
+        (None, _) => format!("not listed yet {filter}"),
+    };
+    let _ = writeln!(out, "SSH signing:");
+    let _ = writeln!(out, "  mode   {}", ssh.mode);
+    let _ = writeln!(out, "  users  {users}");
+    let _ = writeln!(out, "  keys   {keys}");
 }
 
 /// Under a server where any namespace is `not-source` (plan 035 §3.4): who the source is,
@@ -437,6 +473,7 @@ mod tests {
             }],
             machine: None,
             machine_error: String::new(),
+            ssh: None,
         }
     }
 
@@ -511,6 +548,7 @@ mod tests {
             ],
             machine: None,
             machine_error: String::new(),
+            ssh: None,
         };
         let mut out: Vec<u8> = Vec::new();
         render_status(&mut out, &ls);
@@ -537,6 +575,69 @@ mod tests {
             "    (no subscriptions yet)",
         ]);
         assert_eq!(got, want);
+    }
+
+    /// The `SSH signing:` block sits between the policies and the approval channel, one
+    /// line per keys state: counted without a filter, counted with one, not listed yet;
+    /// an empty allow list reads `(none)`. A snapshot without the block (an older daemon,
+    /// the cases above) prints nothing.
+    #[test]
+    fn render_status_ssh_signing_block_per_keys_state() {
+        let ssh = |users: &[&str], filter: bool, counts: Option<(usize, usize)>| SshSigningStatus {
+            mode: "agent-forward".to_string(),
+            allow_users: users.iter().map(|u| u.to_string()).collect(),
+            key_filter: filter,
+            keys_offered: counts.map(|c| c.0),
+            keys_available: counts.map(|c| c.1),
+        };
+        let cases = [
+            (
+                ssh(&["git"], false, Some((12, 12))),
+                "  users  git",
+                "  keys   12 offered (no ssh.offer_keys filter)",
+            ),
+            (
+                ssh(&["git", "deploy"], true, Some((2, 12))),
+                "  users  git, deploy",
+                "  keys   2 of 12 offered (ssh.offer_keys)",
+            ),
+            (
+                ssh(&["git"], false, None),
+                "  users  git",
+                "  keys   not listed yet (no ssh.offer_keys filter)",
+            ),
+            (
+                ssh(&[], true, None),
+                "  users  (none)",
+                "  keys   not listed yet (ssh.offer_keys)",
+            ),
+        ];
+        for (block, users, keys) in cases {
+            let mut ls = sample_status();
+            ls.ssh = Some(block);
+            let mut out: Vec<u8> = Vec::new();
+            render_status(&mut out, &ls);
+            let got = String::from_utf8(out).unwrap();
+            let lines: Vec<&str> = got.lines().collect();
+            let at = lines.iter().position(|l| *l == "SSH signing:").expect(&got);
+            assert_eq!(lines[at - 1], "", "{got}");
+            assert_eq!(
+                lines[at - 2],
+                "  docker-credentials  approve-all   ",
+                "{got}"
+            );
+            assert_eq!(
+                &lines[at + 1..at + 6],
+                [
+                    "  mode   agent-forward",
+                    users,
+                    keys,
+                    "",
+                    "Approval channel:"
+                ],
+                "{got}"
+            );
+        }
     }
 
     #[test]
@@ -742,6 +843,7 @@ mod tests {
             servers: vec![],
             machine: None,
             machine_error: String::new(),
+            ssh: None,
         };
         let mut out: Vec<u8> = Vec::new();
         render_status(&mut out, &ls);

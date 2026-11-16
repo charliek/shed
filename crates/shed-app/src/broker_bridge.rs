@@ -52,7 +52,8 @@ use shed_broker::controltoken::{
     ControlCredentialMinter, ControlTokenMinter, ControlTokenProvider, MintedControlCredential,
 };
 use shed_broker::machine::{self as broker_machine, LoadOutcome, MachineIdentity};
-use shed_broker::status::ServerHealth;
+use shed_broker::sign_check::SignPolicy;
+use shed_broker::status::{ServerHealth, SshSigningStatus};
 use shed_broker::supervisor::{SharedDeps, Supervisor};
 use shed_broker::{
     aws_backend, bus, desktop_socket_path, docker_backend, minter as broker_minter, socket_is_live,
@@ -703,6 +704,10 @@ pub struct EmbeddedHostAgent {
     /// at spawn; every listing a shed asks for records its counts. `None` until spawn
     /// got that far.
     ssh_filter: Mutex<Option<Arc<ssh_backend::FilteredSshBackend>>>,
+    /// What this machine signs for a shed (plan 035 §3.5), built from the config at
+    /// [`spawn`](Self::spawn) and fixed from then on; the bus checks every sign request
+    /// against it before the approval gate. `None` until spawn got that far.
+    ssh_sign_policy: Mutex<Option<Arc<SignPolicy>>>,
     /// Where the broker's lines go (the bus, the supervisor, the backends, the
     /// Responder's drop path) — the embedder's own log, injected at [`new`](Self::new).
     log: Arc<dyn bus::BusLog>,
@@ -782,6 +787,7 @@ impl EmbeddedHostAgent {
             supervisor: Mutex::new(None),
             resolved_ssh_mode: Mutex::new(None),
             ssh_filter: Mutex::new(None),
+            ssh_sign_policy: Mutex::new(None),
             log,
             machine_path: broker_machine::machine_state_path(),
             machine: Mutex::new(None),
@@ -831,6 +837,16 @@ impl EmbeddedHostAgent {
     /// is `None` until a shed first lists keys).
     pub fn ssh_offer_counts(&self) -> Option<Arc<ssh_backend::SshOfferCounts>> {
         self.ssh_filter.lock().unwrap().as_ref().map(|f| f.counts())
+    }
+
+    /// The `ssh` block of `broker.status` (the same shape as the daemon's status): the
+    /// resolved SSH mode, the usernames a login is signed for, whether a key filter is
+    /// set, and the last listing's counts. `None` until [`spawn`](Self::spawn) succeeds.
+    pub fn ssh_signing_status(&self) -> Option<SshSigningStatus> {
+        let policy = self.ssh_sign_policy.lock().unwrap().clone()?;
+        let mode = self.resolved_ssh_mode()?;
+        let counts = self.ssh_offer_counts().and_then(|c| c.get());
+        Some(SshSigningStatus::new(&mode, &policy, counts))
     }
 
     /// This machine's identity as loaded at [`spawn`](Self::spawn) — `Some(Err(why))`
@@ -890,9 +906,12 @@ impl EmbeddedHostAgent {
         // The `ssh.offer_keys` key filter (plan 035 §3.5), as in the daemon: sheds see
         // and can sign with only the offered keys; without the key everything passes.
         // It makes no call of its own, so nothing new happens at spawn.
+        // The policy is built once here and fixed for the broker's life: the same value
+        // installs the filter and checks every sign request before the approval gate.
+        let ssh_sign_policy = Arc::new(cfg.ssh_sign_policy());
         let filtered_ssh = ssh_backend::with_key_filter(
             ssh_backend,
-            cfg.ssh_sign_policy().offer_keys().cloned(),
+            ssh_sign_policy.offer_keys().cloned(),
             Some(bus_log.clone()),
         );
         if let Some(line) = filtered_ssh.startup_line() {
@@ -901,6 +920,7 @@ impl EmbeddedHostAgent {
         *self.ssh_filter.lock().unwrap() = Some(filtered_ssh.clone());
         let ssh_backend: Arc<dyn ssh_backend::SshBackend> = filtered_ssh;
         *self.resolved_ssh_mode.lock().unwrap() = Some(ssh_backend.mode().to_string());
+        *self.ssh_sign_policy.lock().unwrap() = Some(ssh_sign_policy.clone());
 
         // This machine's identity, from the file the daemon shares (plan 035 §3.4). As in
         // the daemon, an unusable file never stops the broker: it runs WITHOUT an
@@ -966,6 +986,7 @@ impl EmbeddedHostAgent {
         let deps = SharedDeps {
             ssh_backend,
             ssh_gate,
+            ssh_sign_policy,
             aws,
             docker,
             audit,
@@ -1347,9 +1368,10 @@ mod tests {
     // Drive the AppGate as the real ssh `shed-desktop` gate inside `spawn_server_group`:
     // subscribe → inject a `sign` request over SSE → the AppGate posts an approval-request
     // to the event stream → a fake Coordinator side responds → the bus `respond` POST +
-    // the audit outcome are asserted. A DENY keeps the flow crypto-free (handle_sign
-    // parses the public key only AFTER an approve); the approve outcome shape is pinned by
-    // the round-trip + fixture tests above.
+    // the audit outcome are asserted. A DENY keeps the flow crypto-free (nothing is
+    // signed); the request is a valid `git` login so the signing check, which runs before
+    // the gate, passes it on to the AppGate. The approve outcome shape is pinned by the
+    // round-trip + fixture tests above.
 
     use httpmock::prelude::*;
     use shed_broker::discovery::ServerTarget;
@@ -1383,9 +1405,18 @@ mod tests {
     #[tokio::test]
     async fn bus_sign_request_routes_through_appgate_and_responds() {
         let server = MockServer::start_async().await;
-        // One `sign` request over the ssh-agent SSE stream (arbitrary base64 — the deny
-        // path never decodes the key).
-        let sse = "data: {\"id\":\"sign-1\",\"namespace\":\"ssh-agent\",\"type\":\"request\",\"final\":true,\"timestamp\":\"t\",\"payload\":{\"operation\":\"sign\",\"public_key\":\"AAAA\",\"data\":\"YWJj\",\"flags\":0},\"shed\":{\"name\":\"web\",\"backend\":\"vz\",\"server\":\"mini2\"}}\n\n";
+        // One `sign` request over the ssh-agent SSE stream: a valid ed25519 key and a
+        // valid login for `git` with it, which the signing check passes to the gate (an
+        // arbitrary payload would now be declined before any prompt).
+        // The key is the host-agent harness's throwaway test key; the login is
+        // string(32 bytes of 7) || byte 50 || string("git") || string("ssh-connection") ||
+        // string("publickey") || bool true || string("ssh-ed25519") || string(key).
+        const KEY_B64: &str =
+            "AAAAC3NzaC1lZDI1NTE5AAAAILMdrPP0NLsfgrc8JIa6OWX1qhgyfW/UwJTSXdRuUsJJ";
+        const GIT_LOGIN_B64: &str = "AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHMgAAAANnaXQAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAAAtzc2gtZWQyNTUxOQAAADMAAAALc3NoLWVkMjU1MTkAAAAgsx2s8/Q0ux+Ctzwkhro5ZfWqGDJ9b9TAlNJd1G5Swkk=";
+        let sse = format!(
+            "data: {{\"id\":\"sign-1\",\"namespace\":\"ssh-agent\",\"type\":\"request\",\"final\":true,\"timestamp\":\"t\",\"payload\":{{\"operation\":\"sign\",\"public_key\":\"{KEY_B64}\",\"data\":\"{GIT_LOGIN_B64}\",\"flags\":0}},\"shed\":{{\"name\":\"web\",\"backend\":\"vz\",\"server\":\"mini2\"}}}}\n\n"
+        );
         let messages = server
             .mock_async(|w, t| {
                 w.method(GET)
@@ -1393,7 +1424,7 @@ mod tests {
                     .header("accept", "text/event-stream");
                 t.status(200)
                     .header("content-type", "text/event-stream")
-                    .body(sse);
+                    .body(&sse);
             })
             .await;
         // The respond POST must carry the request envelope id as `in_reply_to`.
@@ -1434,6 +1465,7 @@ mod tests {
             ssh_gate: Arc::new(AppGate {
                 inner: inner.clone(),
             }),
+            ssh_sign_policy: Arc::new(SignPolicy::default()),
             aws: None,
             docker: None,
             audit: audit.clone(),
@@ -1597,6 +1629,27 @@ mod tests {
                 Some(fp) => assert_eq!(fingerprints, [fp.to_string()], "{yaml}"),
                 None => assert!(wrapper.filter().is_none(), "no filter without the key"),
             }
+            // The bus checks sign requests against the config's policy, the very value
+            // the agent keeps for `broker.status`.
+            let installed_policy = agent
+                .supervisor
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ssh_sign_policy();
+            assert_eq!(*installed_policy, agent.cfg.ssh_sign_policy(), "{yaml}");
+            let kept = agent.ssh_sign_policy.lock().unwrap().clone().expect("kept");
+            assert!(
+                Arc::ptr_eq(&installed_policy, &kept),
+                "one policy, fixed at spawn"
+            );
+            let status = agent.ssh_signing_status().expect("status after spawn");
+            assert_eq!(status.allow_users, ["git".to_string()]);
+            assert_eq!(status.key_filter, want.is_some(), "{yaml}");
+            assert_eq!(Some(status.mode), agent.resolved_ssh_mode());
+            // Nothing has listed keys yet: no counts.
+            assert_eq!((status.keys_offered, status.keys_available), (None, None));
             let _ = agent.shutdown_handle().send(true);
         }
     }

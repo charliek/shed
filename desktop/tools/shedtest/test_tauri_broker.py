@@ -27,6 +27,7 @@ import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import tempfile
 import time
@@ -223,10 +224,32 @@ def _server_ns_states(status: dict) -> dict[str, str]:
     return {n["namespace"]: n["state"] for n in servers[0].get("namespaces", [])}
 
 
+def _ssh_string(b: bytes) -> bytes:
+    """RFC 4251 `string`: a big-endian uint32 length, then the bytes."""
+    return struct.pack(">I", len(b)) + b
+
+
+def _git_login(ssh_blob: str) -> bytes:
+    """An exact SSH `publickey` login request for user `git` with the ed25519 key whose
+    wire blob is `ssh_blob` (fixed session id). The broker signs only a login as an
+    allowed username (default `[git]`) or a `git` SSHSIG, and declines anything else
+    before any prompt (plan 035 §3.5), so this is what reaches the approval gate."""
+    return (
+        _ssh_string(bytes(range(32)))  # session id
+        + bytes([50])  # SSH_MSG_USERAUTH_REQUEST
+        + _ssh_string(b"git")
+        + _ssh_string(b"ssh-connection")
+        + _ssh_string(b"publickey")
+        + bytes([1])  # a signature follows
+        + _ssh_string(b"ssh-ed25519")
+        + _ssh_string(base64.b64decode(ssh_blob))
+    )
+
+
 def _sign_envelope(rid: str, ssh_blob: str, *, server: str = "mock", shed: str = "web") -> dict:
     """A `sign` request Envelope in the bus wire shape (mirrors the in-crate httpmock
     fixture + `sdk/envelope.go`): `payload.operation == "sign"`, `public_key` = the
-    wire pubkey blob, `data` = base64 challenge bytes."""
+    wire pubkey blob, `data` = base64 of a `git` login with that key."""
     return {
         "id": rid,
         "namespace": "ssh-agent",
@@ -236,7 +259,7 @@ def _sign_envelope(rid: str, ssh_blob: str, *, server: str = "mock", shed: str =
         "payload": {
             "operation": "sign",
             "public_key": ssh_blob,
-            "data": base64.b64encode(b"shed-embedded-e2e").decode(),
+            "data": base64.b64encode(_git_login(ssh_blob)).decode(),
             "flags": 0,
         },
         "shed": {"name": shed, "backend": "vz", "server": server},
@@ -407,6 +430,13 @@ def test_embedded_status_and_set_mode_round_trip():
         assert st["effective_mode"] == "embedded"
         assert set(_server_ns_states(st)) == {"ssh-agent", "docker-credentials"}, st
         assert client.identify()["broker_mode"]["effective"] == "embedded"
+        # What the embedded broker signs for a shed (plan 035 §3.5): the default allow
+        # list, no key filter, the resolved mode; no counts until a shed lists keys.
+        ssh = st["ssh"]
+        assert ssh["allow_users"] == ["git"], ssh
+        assert ssh["key_filter"] is False, ssh
+        assert ssh["mode"] == st["resolved_ssh_mode"], (ssh, st["resolved_ssh_mode"])
+        assert "keys_offered" not in ssh and "keys_available" not in ssh, ssh
 
         # set_mode round-trip. Launch pref was auto (effective embedded via the probe):
         # pinning embedded drifts the persisted pref ⇒ restart_required until relaunch.

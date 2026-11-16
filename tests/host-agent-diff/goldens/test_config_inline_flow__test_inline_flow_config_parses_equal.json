@@ -19,6 +19,15 @@
   },
   "schema": 1,
   "servers": [],
+  "ssh": {
+    "allow_users": [
+      "git"
+    ],
+    "key_filter": false,
+    "keys_available": 0,
+    "keys_offered": 0,
+    "mode": "local-keys"
+  },
   "started_at": "<ts>",
   "version": "<version>",
   "written_at": "<ts>"

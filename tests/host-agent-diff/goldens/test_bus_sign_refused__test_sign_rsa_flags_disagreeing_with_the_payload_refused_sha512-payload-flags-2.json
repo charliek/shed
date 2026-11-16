@@ -1,0 +1,46 @@
+{
+  "approval_requests": 0,
+  "audit": {
+    "approval": "none",
+    "code": "SIGN_REFUSED",
+    "detail": "login: RSA flags do not name the algorithm's hash",
+    "ns": "ssh-agent",
+    "op": "sign",
+    "reason": "unparseable_data",
+    "result": "refused",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "event": {
+    "approval": "none",
+    "code": "SIGN_REFUSED",
+    "detail": "login: RSA flags do not name the algorithm's hash",
+    "id": "<id>",
+    "kind": "audit",
+    "ns": "ssh-agent",
+    "op": "sign",
+    "reason": "unparseable_data",
+    "result": "refused",
+    "shed": "web",
+    "ts": "<ts>",
+    "type": "event",
+    "v": 2
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "sign-1",
+    "namespace": "ssh-agent",
+    "payload": {
+      "code": "SIGN_FAILED",
+      "error": "sign operation failed"
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

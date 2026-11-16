@@ -52,9 +52,10 @@
 //!     another host.
 //!
 //! Scope: the daemon subscribes only to `ssh-agent` and implements the full
-//! ssh-agent op set — the gated **`sign`** flow (decode → approval gate → backend →
-//! response + audit, wire-compatible with the Go `ssh_handler.go`), the ungated
-//! **`list`** (backend keys → `SSHListResponse` + a durable non-gated audit) and
+//! ssh-agent op set — the gated **`sign`** flow (decode → the signing check
+//! ([`crate::sign_check`], plan 035 §3.5) → approval gate → backend → response + audit;
+//! a request the check declines never reaches the gate and is audited `refused`), the
+//! ungated **`list`** (backend keys → `SSHListResponse` + a durable non-gated audit) and
 //! **`status`** (`{connected, mode, key_count}`) ops, and `ping` → `pong`. An unknown
 //! operation gets Go's exact `unknown operation: <op>` `INTERNAL_ERROR` envelope, and
 //! a payload that isn't a JSON object gets `{invalid payload, INTERNAL_ERROR}` — so the
@@ -63,7 +64,7 @@
 //! SSE consumer ([`crate::egress`]) runs as a side task per server — so the Go and Rust
 //! daemons now touch the same endpoint set (the endpoint asymmetry closed with this slice).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -89,6 +90,7 @@ use crate::docker_backend::{
     DockerBackend, DOCKER_CODE_INTERNAL, DOCKER_CODE_NOT_ALLOWED, DOCKER_CODE_NOT_FOUND,
 };
 use crate::machine::MachineIdentity;
+use crate::sign_check::{Refusal, RefusalClass, SignPolicy};
 use crate::ssh_backend::SshBackend;
 use crate::status::ActiveSource;
 
@@ -132,6 +134,27 @@ pub const AUDIT_RESULT_UNDELIVERED: &str = "undelivered";
 const SSH_CODE_KEY_NOT_FOUND: &str = "KEY_NOT_FOUND";
 const SSH_CODE_SIGN_FAILED: &str = "SIGN_FAILED";
 const SSH_CODE_INTERNAL: &str = "INTERNAL_ERROR";
+
+/// The audit `result` of a sign request the signing check declined (plan 035 §3.5): it
+/// never reached the approval gate or the backend.
+pub const AUDIT_RESULT_REFUSED: &str = "refused";
+/// The audit-only `code` of a refused sign request (like `APPROVAL_DENIED`, it is never
+/// sent to the shed, which gets the ordinary failure shape).
+pub const AUDIT_CODE_SIGN_REFUSED: &str = "SIGN_REFUSED";
+/// The `reason` of the summary line written for refusals that were counted rather than
+/// logged one by one ([`RefusalAuditLimiter`]).
+pub const AUDIT_REASON_RATE_LIMITED: &str = "audit_rate_limited";
+/// At most this many refusal lines per shed in one [`REFUSAL_AUDIT_WINDOW`] (plus the
+/// first refusal of each class not yet logged in the window); the rest are counted per
+/// class and written as one summary line when the window ends.
+const REFUSAL_AUDIT_BURST: u32 = 20;
+const REFUSAL_AUDIT_WINDOW: Duration = Duration::from_secs(60);
+/// The most per-shed refusal windows kept at once: a hard cap. A new shed past it first
+/// drops the windows that have ended, then evicts the oldest open one, writing out what
+/// either had counted.
+const REFUSAL_AUDIT_MAX_SHEDS: usize = 1024;
+/// The number of refusal classes, each counted on its own in a window.
+const REFUSAL_CLASSES: usize = RefusalClass::ALL.len();
 
 /// AWS protocol error codes (`internal/ext/protocol/aws.go`). `ASSUME_ROLE_FAILED` is
 /// scoped to `get_credentials` failures only (gate-deny / backend-error); the shared
@@ -1623,6 +1646,11 @@ pub struct BusHandlers {
     pub gate: Arc<dyn ApprovalGate>,
     pub audit: Arc<dyn AuditSink>,
     pub backend: Arc<dyn SshBackend>,
+    /// What this machine signs for a shed (`ssh.allow_users` + `ssh.offer_keys`, plan 035
+    /// §3.5), checked before the approval gate. Fixed at start.
+    pub sign_policy: Arc<SignPolicy>,
+    /// Bounds the refusal audit lines one shed can cause ([`RefusalAuditLimiter`]).
+    pub refusal_audits: Arc<RefusalAuditLimiter>,
     pub server_name: String,
     /// The aws-credentials handler's seams, present only when `aws.enabled()` and the
     /// backend constructed (Go main.go:166-173 — a nil AWS backend means no aws
@@ -1814,6 +1842,9 @@ pub fn spawn_server_group(
         gate: deps.ssh_gate.clone(),
         audit: deps.audit.clone(),
         backend: deps.ssh_backend.clone(),
+        sign_policy: deps.ssh_sign_policy.clone(),
+        // One per group: the windows are per shed of this server.
+        refusal_audits: Arc::new(RefusalAuditLimiter::default()),
         server_name: target.name.clone(),
         aws: deps.aws.clone(),
         docker: deps.docker.clone(),
@@ -1836,6 +1867,15 @@ pub fn spawn_server_group(
             log.clone(),
         )));
     }
+
+    // The refusal-summary writer: a group task, so on cancel it writes every pending
+    // summary before `done` resolves, and no timer outlives the group.
+    tasks.push(tokio::spawn(run_refusal_flusher(
+        handlers.refusal_audits.clone(),
+        handlers.audit.clone(),
+        handlers.server_name.clone(),
+        cancel_rx.clone(),
+    )));
 
     // Proactively re-mint the credentials token (jittered) for a secure server so an idle
     // server's bus token stays fresh and a reconnect never pays the mint latency inline.
@@ -1980,9 +2020,10 @@ async fn dispatch_bus_message(
 }
 
 /// Answer one inbound bus request, mirroring `ssh_handler.go:handleMessage`'s
-/// dispatch. `ping` → `{"status":"ok"}`; `sign` → the gated flow (approval gate →
-/// backend → response + audit); `list` → the ungated key listing + a durable
-/// non-gated audit; `status` → `{connected, mode, key_count}` (no audit). An unknown
+/// dispatch. `ping` → `{"status":"ok"}`; `sign` → the checked, gated flow
+/// ([`handle_sign`]: signing check → approval gate → backend → response + audit, a
+/// refusal's audit line passed through the per-shed [`RefusalAuditLimiter`]); `list` →
+/// the ungated key listing + a durable non-gated audit; `status` → `{connected, mode, key_count}` (no audit). An unknown
 /// operation → Go's exact `unknown operation: <op>` (`<op>` empty when the field is
 /// absent); a payload that is not a JSON object (or null) → `{invalid payload,
 /// INTERNAL_ERROR}` — both fail the shed's request cleanly instead of hanging. The
@@ -2012,11 +2053,12 @@ async fn handle_bus_message(
                     env,
                     &handlers.server_name,
                     shed_name,
+                    &handlers.sign_policy,
                     &handlers.gate,
                     &handlers.backend,
                 )
                 .await;
-                (payload, entry, "sign response")
+                (payload, admit_sign_audit(handlers, entry), "sign response")
             }
             "list" => {
                 let (payload, entry) =
@@ -2033,8 +2075,9 @@ async fn handle_bus_message(
         },
     };
     // The reply plumbing + audit-after-response tail is shared with the aws (and
-    // later docker) namespaces (`respond_and_audit`). A non-gated op or a
-    // parse-error path leaves `audit_entry` None (Go emits no audit for those).
+    // later docker) namespaces (`respond_and_audit`). `ping`/`status`, an unknown op
+    // and an undecodable payload leave `audit_entry` None (Go emits no audit for those);
+    // `sign` audits every outcome, a refusal included, unless the limiter counted it.
     respond_and_audit(
         client,
         namespace,
@@ -2313,6 +2356,447 @@ fn sign_audit(
     }
 }
 
+/// The audit entry for a sign request the signing check declined (plan 035 §3.5):
+/// `result: "refused"`, the audit-only code [`AUDIT_CODE_SIGN_REFUSED`], `reason` the
+/// refusal class's stable name, `detail` the refusal's own bounded, escaped detail (never
+/// the request), `approval: "none"` (the gate was never asked), and no
+/// decided_by/scope/ttl.
+fn sign_refused_audit(server_name: &str, shed_name: &str, refusal: &Refusal) -> AuditEntry {
+    AuditEntry {
+        server: server_name.to_string(),
+        shed: shed_name.to_string(),
+        ns: NS_SSH_AGENT.to_string(),
+        op: "sign".to_string(),
+        result: AUDIT_RESULT_REFUSED.to_string(),
+        detail: refusal.detail().to_string(),
+        code: AUDIT_CODE_SIGN_REFUSED.to_string(),
+        reason: refusal.class().as_str().to_string(),
+        approval: "none".to_string(),
+        ..Default::default()
+    }
+}
+
+/// The refusals one shed's window counted instead of logging one by one, per class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusalSummary {
+    pub shed: String,
+    /// The count per class, in [`RefusalClass::ALL`] order.
+    pub counts: [u64; REFUSAL_CLASSES],
+}
+
+impl RefusalSummary {
+    pub fn total(&self) -> u64 {
+        self.counts.iter().fold(0u64, |a, n| a.saturating_add(*n))
+    }
+
+    /// `class=count` for each class counted, in [`RefusalClass::ALL`] order: at most
+    /// seven short pairs, so the line stays bounded.
+    pub fn by_class(&self) -> String {
+        RefusalClass::ALL
+            .iter()
+            .zip(self.counts)
+            .filter(|(_, n)| *n > 0)
+            .map(|(class, n)| format!("{class}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// The time source and timer the refusal limiter runs on: the system clock in
+/// production ([`SystemRefusalClock`]), a hand-driven one in tests, so that no window
+/// test depends on how fast the machine is.
+pub trait RefusalClock: Send + Sync {
+    fn now(&self) -> Instant;
+    /// Resolve once [`RefusalClock::now`] has reached `at`.
+    fn sleep_until(
+        &self,
+        at: Instant,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+}
+
+/// The system clock and tokio's timer.
+pub struct SystemRefusalClock;
+
+impl RefusalClock for SystemRefusalClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn sleep_until(
+        &self,
+        at: Instant,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(at)))
+    }
+}
+
+/// Bounds the audit lines refused sign requests can write, per shed.
+///
+/// Nothing else bounds them: shed-server does not limit how many bus requests a shed
+/// sends, the broker answers a server's `ssh-agent` requests one at a time (so the only
+/// limit is the round trip), and the audit file is never rotated. A refusal costs the
+/// broker no prompt and no backend call, so a shed could otherwise grow the audit log
+/// (and the desktop's activity feed) as fast as it can send.
+///
+/// Per shed, in each fixed [`REFUSAL_AUDIT_WINDOW`] (a window opens at the shed's first
+/// refusal after the previous one ended):
+/// - the first [`REFUSAL_AUDIT_BURST`] refusals get their own line;
+/// - after that, the first refusal of each class not yet logged in the window still gets
+///   its own line, so the username or namespace behind each kind of refusal is on record
+///   once per class per window;
+/// - every other refusal is counted under its class, and the counts are written as one
+///   summary line ([`AUDIT_REASON_RATE_LIMITED`], each class with its count) once the
+///   window has ended.
+///
+/// So every refused request is either logged or counted under its own class, and the
+/// worst case for one shed in one window is `burst + 7 + 1` lines (the burst, one more
+/// line per class, one summary). The summary is written by the group's flusher task
+/// ([`run_refusal_flusher`]) at the window's end, or before the shed's next refusal if
+/// that comes first; both take the counts under one lock, so they are written once.
+///
+/// At most [`REFUSAL_AUDIT_MAX_SHEDS`] windows are kept. A new shed past that cap first
+/// drops the windows that have ended, then evicts the oldest open window; either way the
+/// counts a dropped window held are written as its summary then, never lost. (An evicted
+/// shed's next refusal opens a fresh window, so the per-window bound holds per window
+/// kept; eviction needs more sheds refusing at once than the cap.)
+///
+/// At shutdown the flusher writes every pending summary before the group's `done`
+/// resolves ([`RefusalAuditLimiter::close`]), and from then on every refusal is logged
+/// one by one. What a hard kill (SIGKILL, a crash, power loss) still loses: the counts of
+/// windows still open — at most one window's worth of counted refusals per shed — whose
+/// summary had not been written yet. Every line already written is kept.
+///
+/// Only refusals are limited: ok, denied and error lines each follow a prompt or a
+/// backend call, as before. The decisions are pure (the caller passes the time); the
+/// clock is only used by the callers ([`RefusalAuditLimiter::now`],
+/// [`run_refusal_flusher`]).
+pub struct RefusalAuditLimiter {
+    burst: u32,
+    window: Duration,
+    max_sheds: usize,
+    clock: Arc<dyn RefusalClock>,
+    /// Woken when a window opens, so the flusher learns of its deadline.
+    opened: tokio::sync::Notify,
+    state: Mutex<LimiterState>,
+}
+
+#[derive(Default)]
+struct LimiterState {
+    sheds: HashMap<String, RefusalWindow>,
+    /// Orders windows that opened at the same instant, for eviction.
+    next_seq: u64,
+    /// Set by [`RefusalAuditLimiter::close`]: every refusal is then logged.
+    closed: bool,
+}
+
+struct RefusalWindow {
+    start: Instant,
+    seq: u64,
+    /// Lines written from the burst.
+    logged: u32,
+    /// One bit per class (in [`RefusalClass::ALL`] order) that has had a line.
+    classes_logged: u8,
+    /// Refusals counted instead of logged, per class.
+    counted: [u64; REFUSAL_CLASSES],
+}
+
+impl RefusalWindow {
+    fn open(start: Instant, seq: u64) -> RefusalWindow {
+        RefusalWindow {
+            start,
+            seq,
+            logged: 0,
+            classes_logged: 0,
+            counted: [0; REFUSAL_CLASSES],
+        }
+    }
+
+    fn summary(&self, shed: &str) -> Option<RefusalSummary> {
+        self.counted.iter().any(|n| *n > 0).then(|| RefusalSummary {
+            shed: shed.to_string(),
+            counts: self.counted,
+        })
+    }
+}
+
+/// What to do with one refusal's audit line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RefusalAdmission {
+    /// Write the refusal's own line (otherwise it was counted).
+    pub log: bool,
+    /// Summaries to write first: this shed's ended window, or windows dropped to make
+    /// room for this shed.
+    pub summaries: Vec<RefusalSummary>,
+}
+
+fn class_index(class: RefusalClass) -> usize {
+    RefusalClass::ALL
+        .iter()
+        .position(|c| *c == class)
+        .expect("RefusalClass::ALL lists every class")
+}
+
+impl Default for RefusalAuditLimiter {
+    fn default() -> Self {
+        RefusalAuditLimiter::new(REFUSAL_AUDIT_BURST, REFUSAL_AUDIT_WINDOW)
+    }
+}
+
+impl RefusalAuditLimiter {
+    pub fn new(burst: u32, window: Duration) -> Self {
+        RefusalAuditLimiter::with_clock(
+            burst,
+            window,
+            REFUSAL_AUDIT_MAX_SHEDS,
+            Arc::new(SystemRefusalClock),
+        )
+    }
+
+    /// A limiter on `clock`, keeping at most `max_sheds` (at least one) windows.
+    pub fn with_clock(
+        burst: u32,
+        window: Duration,
+        max_sheds: usize,
+        clock: Arc<dyn RefusalClock>,
+    ) -> Self {
+        RefusalAuditLimiter {
+            burst,
+            window,
+            max_sheds: max_sheds.max(1),
+            clock,
+            opened: tokio::sync::Notify::new(),
+            state: Mutex::new(LimiterState::default()),
+        }
+    }
+
+    /// The limiter's clock's time.
+    pub fn now(&self) -> Instant {
+        self.clock.now()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LimiterState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Decide about one refusal of `class` from `shed` at `now`.
+    pub fn admit(&self, shed: &str, class: RefusalClass, now: Instant) -> RefusalAdmission {
+        let mut summaries = Vec::new();
+        let mut opened = false;
+        let log = {
+            let mut st = self.lock();
+            if st.closed {
+                return RefusalAdmission {
+                    log: true,
+                    summaries,
+                };
+            }
+            if !st.sheds.contains_key(shed) {
+                self.make_room(&mut st, now, &mut summaries);
+                let seq = st.next_seq;
+                st.next_seq = st.next_seq.wrapping_add(1);
+                st.sheds
+                    .insert(shed.to_string(), RefusalWindow::open(now, seq));
+                opened = true;
+            }
+            let window = self.window;
+            let LimiterState {
+                sheds, next_seq, ..
+            } = &mut *st;
+            let w = sheds.get_mut(shed).expect("inserted above");
+            if now.duration_since(w.start) >= window {
+                summaries.extend(w.summary(shed));
+                *w = RefusalWindow::open(now, *next_seq);
+                *next_seq = next_seq.wrapping_add(1);
+                opened = true;
+            }
+            let i = class_index(class);
+            let bit = 1u8 << i;
+            if w.logged < self.burst {
+                w.logged += 1;
+                w.classes_logged |= bit;
+                true
+            } else if w.classes_logged & bit == 0 {
+                w.classes_logged |= bit;
+                true
+            } else {
+                w.counted[i] = w.counted[i].saturating_add(1);
+                false
+            }
+        };
+        if opened {
+            self.opened.notify_one();
+        }
+        RefusalAdmission { log, summaries }
+    }
+
+    /// Make room for one more window: drop the windows that have ended, then, while
+    /// still at the cap, the oldest open one; the counts of each go to `out`.
+    fn make_room(&self, st: &mut LimiterState, now: Instant, out: &mut Vec<RefusalSummary>) {
+        if st.sheds.len() < self.max_sheds {
+            return;
+        }
+        let window = self.window;
+        st.sheds.retain(|shed, w| {
+            if now.duration_since(w.start) < window {
+                return true;
+            }
+            out.extend(w.summary(shed));
+            false
+        });
+        while st.sheds.len() >= self.max_sheds {
+            let Some(oldest) = st
+                .sheds
+                .iter()
+                .min_by_key(|(_, w)| (w.start, w.seq))
+                .map(|(shed, _)| shed.clone())
+            else {
+                break;
+            };
+            if let Some(w) = st.sheds.remove(&oldest) {
+                out.extend(w.summary(&oldest));
+            }
+        }
+    }
+
+    /// Take every window that has ended by `now`: the counts of those that counted any,
+    /// to be written once, and the windows themselves dropped.
+    pub fn flush_due(&self, now: Instant) -> Vec<RefusalSummary> {
+        let mut out = Vec::new();
+        let window = self.window;
+        self.lock().sheds.retain(|shed, w| {
+            if now.duration_since(w.start) < window {
+                return true;
+            }
+            out.extend(w.summary(shed));
+            false
+        });
+        out
+    }
+
+    /// When the earliest window still kept ends.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.lock()
+            .sheds
+            .values()
+            .map(|w| w.start + self.window)
+            .min()
+    }
+
+    /// Take every window's counts, ended or not, and stop counting: from now on every
+    /// refusal is logged one by one. Called once, at shutdown.
+    pub fn close(&self) -> Vec<RefusalSummary> {
+        let mut st = self.lock();
+        st.closed = true;
+        st.sheds
+            .drain()
+            .filter_map(|(shed, w)| w.summary(&shed))
+            .collect()
+    }
+
+    /// The summary line for `summary`, written for this limiter's limits.
+    pub fn summary_audit(&self, server_name: &str, summary: &RefusalSummary) -> AuditEntry {
+        AuditEntry {
+            server: server_name.to_string(),
+            shed: summary.shed.clone(),
+            ns: NS_SSH_AGENT.to_string(),
+            op: "sign".to_string(),
+            result: AUDIT_RESULT_REFUSED.to_string(),
+            detail: format!(
+                "{} more refused sign requests were not logged one by one \
+                 (at most {} per {}s per shed, plus the first of each class): {}",
+                summary.total(),
+                self.burst,
+                self.window.as_secs(),
+                summary.by_class()
+            ),
+            code: AUDIT_CODE_SIGN_REFUSED.to_string(),
+            reason: AUDIT_REASON_RATE_LIMITED.to_string(),
+            approval: "none".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn windows(&self) -> usize {
+        self.lock().sheds.len()
+    }
+}
+
+/// One server group's refusal-summary writer: sleeps until the earliest window ends
+/// (woken early when a window opens), writes the summaries of the windows that ended,
+/// and repeats until `shutdown`, when it writes every summary still pending
+/// ([`RefusalAuditLimiter::close`]) before returning. It is one of the group's tasks, so
+/// the group's `done` resolves only after that last write, and no timer outlives it.
+pub async fn run_refusal_flusher(
+    limiter: Arc<RefusalAuditLimiter>,
+    audit: Arc<dyn AuditSink>,
+    server_name: String,
+    shutdown: watch::Receiver<bool>,
+) {
+    let stop = wait_shutdown(shutdown);
+    tokio::pin!(stop);
+    loop {
+        for summary in limiter.flush_due(limiter.now()) {
+            audit.log(limiter.summary_audit(&server_name, &summary));
+        }
+        let next = limiter.next_deadline();
+        let timer = async {
+            match next {
+                Some(at) => limiter.clock.sleep_until(at).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = &mut stop => break,
+            _ = limiter.opened.notified() => {}
+            _ = timer => {}
+        }
+    }
+    for summary in limiter.close() {
+        audit.log(limiter.summary_audit(&server_name, &summary));
+    }
+}
+
+/// Pass a sign op's audit entry through the refusal limiter: anything but a refusal is
+/// returned as is; a refusal is returned to be written or counted (`None`), any
+/// summaries the admission produced written first.
+fn admit_sign_audit(handlers: &BusHandlers, entry: AuditEntry) -> Option<AuditEntry> {
+    if entry.result != AUDIT_RESULT_REFUSED {
+        return Some(entry);
+    }
+    // The reason of a refusal line is its class's name (`sign_refused_audit`).
+    let Some(class) = RefusalClass::ALL
+        .iter()
+        .copied()
+        .find(|c| c.as_str() == entry.reason)
+    else {
+        return Some(entry);
+    };
+    let limiter = &handlers.refusal_audits;
+    let admission = limiter.admit(&entry.shed, class, limiter.now());
+    for summary in &admission.summaries {
+        handlers
+            .audit
+            .log(limiter.summary_audit(&handlers.server_name, summary));
+    }
+    admission.log.then_some(entry)
+}
+
+/// What a shed is told when the signing check declines its request. The shed learns no
+/// more than it could before this check existed: a key that does not even parse gets
+/// the reply it always got (`invalid public key`, `KEY_NOT_FOUND`), and every other
+/// refusal — whatever its class — the reply a failed signature always got (`sign
+/// operation failed`, `SIGN_FAILED`), which is also what a key that is not offered got
+/// from the key filter. The class is in the machine's audit log only.
+fn sign_refusal_reply(refusal: &Refusal, public_key: &[u8]) -> serde_json::Value {
+    if refusal.class() == RefusalClass::MalformedKey
+        && ssh_key::public::PublicKey::from_bytes(public_key).is_err()
+    {
+        ssh_error("invalid public key", SSH_CODE_KEY_NOT_FOUND)
+    } else {
+        ssh_error("sign operation failed", SSH_CODE_SIGN_FAILED)
+    }
+}
+
 /// Standard-base64 decode that first strips `\r`/`\n`, matching Go's
 /// `base64.StdEncoding.DecodeString` (which silently skips CR/LF anywhere in the input,
 /// e.g. line-wrapped base64). The Rust `base64` engine rejects them, so a wrapped
@@ -2327,30 +2811,77 @@ fn decode_b64_lenient(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     }
 }
 
-/// The gated `sign` flow — a faithful port of `ssh_handler.go:handleSign`. Returns
-/// the response payload (a `SSHSignResponse` on success, else a `SSHErrorResponse`)
-/// plus the audit entry to write (only the gate-deny / backend-error / success paths
-/// audit; the parse-error paths do NOT, matching Go).
+/// The gated `sign` flow. Returns the response payload (a `SSHSignResponse` on success,
+/// else a `SSHErrorResponse`) plus the audit entry to write — every path audits.
 ///
-/// ORDER matches Go EXACTLY (catalog §6.1 lists gate-deny first): decode request →
-/// **approval gate** → decode+parse public key → decode challenge → backend sign.
+/// ORDER (plan 035 §3.5): decode the request → decode the key and the data → **the
+/// signing check** ([`SignPolicy::check`], with the request's flags) → approval gate →
+/// sign through the check's [`crate::sign_check::Approved`], which hands the backend
+/// exactly the buffers and flags that were checked. A request that fails to decode or
+/// that the check declines never reaches the gate: no prompt, no approval cache read or
+/// written, no backend call; it is audited `refused` with its class
+/// ([`sign_refused_audit`]) and answered with [`sign_refusal_reply`] (or, for a request
+/// that does not decode, the reply that step always gave). The ok, denied and error
+/// audits are as before (detail = the key type).
 async fn handle_sign(
     env: &Envelope,
     server_name: &str,
     shed_name: &str,
+    policy: &SignPolicy,
     gate: &Arc<dyn ApprovalGate>,
     backend: &Arc<dyn SshBackend>,
-) -> (serde_json::Value, Option<AuditEntry>) {
-    // 1. Decode the sign request (a wrong-typed field → invalid sign request; no audit).
+) -> (serde_json::Value, AuditEntry) {
+    let refused = |refusal: Refusal, reply: serde_json::Value| {
+        (reply, sign_refused_audit(server_name, shed_name, &refusal))
+    };
+
+    // 1. Decode the sign request (a wrong-typed field → invalid sign request).
     let req: SignRequestPayload =
         match serde_json::from_value(env.payload.clone().unwrap_or_default()) {
             Ok(r) => r,
-            Err(_) => return (ssh_error("invalid sign request", SSH_CODE_INTERNAL), None),
+            Err(_) => {
+                return refused(
+                    Refusal::malformed_request("invalid sign request"),
+                    ssh_error("invalid sign request", SSH_CODE_INTERNAL),
+                )
+            }
         };
 
-    // 2. Approval gate FIRST (deny-all default fails closed). The reason shown to the
-    //    app is the fixed "SSH sign request" (Go's desktopGate reason) — NOT the key
-    //    type, which isn't parsed until after the gate.
+    // 2. Decode the key and the data. These two buffers are the ones checked AND the
+    //    ones signed: the check borrows them and signing goes through what it returns.
+    let pub_bytes = match decode_b64_lenient(&req.public_key) {
+        Ok(b) => b,
+        Err(_) => {
+            return refused(
+                Refusal::malformed_request("invalid public key encoding"),
+                ssh_error("invalid public key encoding", SSH_CODE_INTERNAL),
+            )
+        }
+    };
+    let data = match decode_b64_lenient(&req.data) {
+        Ok(d) => d,
+        Err(_) => {
+            return refused(
+                Refusal::malformed_request("invalid challenge data encoding"),
+                ssh_error("invalid challenge data encoding", SSH_CODE_INTERNAL),
+            )
+        }
+    };
+
+    // 3. The signing check, BEFORE the gate: the key parses (exactly as `ssh_key` decodes
+    //    it), is offered, and the data is a login as an allowed username or a `git`
+    //    SSHSIG whose hash the flags agree with.
+    let approved = match policy.check(&pub_bytes, &data, req.flags) {
+        Ok(approved) => approved,
+        Err(refusal) => {
+            let reply = sign_refusal_reply(&refusal, &pub_bytes);
+            return refused(refusal, reply);
+        }
+    };
+    let key_type = approved.key_type();
+
+    // 4. The approval gate (deny-all default fails closed). The reason shown to the app
+    //    is the fixed "SSH sign request" (Go's desktopGate reason).
     let outcome = gate
         .approve(
             NS_SSH_AGENT,
@@ -2365,50 +2896,13 @@ async fn handle_sign(
         // Deny audit: result=denied, approval + decided_by/scope/ttl; NO detail, NO
         // code, NO reason (ssh_handler.go's deny path sets none of those).
         let entry = sign_audit(server_name, shed_name, "denied", "", approval, &outcome);
-        return (
-            ssh_error("approval denied", SSH_CODE_SIGN_FAILED),
-            Some(entry),
-        );
+        return (ssh_error("approval denied", SSH_CODE_SIGN_FAILED), entry);
     }
 
-    // 3. Decode + parse the public key (parse-error paths do NOT audit).
-    let pub_bytes = match decode_b64_lenient(&req.public_key) {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                ssh_error("invalid public key encoding", SSH_CODE_INTERNAL),
-                None,
-            )
-        }
-    };
-    // ssh_key::PublicKey::from_bytes == Go's ssh.ParsePublicKey (validates + rejects
-    // trailing bytes, so `pub_bytes` is the canonical marshaled form — the same bytes
-    // Go's keysEqual compares against the loaded key).
-    let pubkey = match ssh_key::public::PublicKey::from_bytes(&pub_bytes) {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                ssh_error("invalid public key", SSH_CODE_KEY_NOT_FOUND),
-                None,
-            )
-        }
-    };
-    let key_type = pubkey.algorithm().as_str().to_string();
-
-    // 4. Decode the challenge data.
-    let data = match decode_b64_lenient(&req.data) {
-        Ok(d) => d,
-        Err(_) => {
-            return (
-                ssh_error("invalid challenge data encoding", SSH_CODE_INTERNAL),
-                None,
-            )
-        }
-    };
-
-    // 5. Sign. Any backend error → {sign operation failed, SIGN_FAILED} + error audit
-    //    (detail = key type). Success → SSHSignResponse + ok audit (detail = key type).
-    match backend.sign(&pub_bytes, &data, req.flags) {
+    // 5. Sign the checked buffers under the checked flags — the only way to reach the
+    //    backend's `sign`. Any backend error → {sign operation failed, SIGN_FAILED} +
+    //    error audit (detail = key type). Success → SSHSignResponse + ok audit.
+    match approved.sign(backend.as_ref()) {
         Ok(sig) => {
             let resp = SshSignResponse {
                 format: sig.format,
@@ -2416,21 +2910,21 @@ async fn handle_sign(
                 rest: String::new(),
             };
             let payload = to_payload(&resp);
-            let entry = sign_audit(server_name, shed_name, "ok", &key_type, approval, &outcome);
-            (payload, Some(entry))
+            let entry = sign_audit(server_name, shed_name, "ok", key_type, approval, &outcome);
+            (payload, entry)
         }
         Err(_) => {
             let entry = sign_audit(
                 server_name,
                 shed_name,
                 "error",
-                &key_type,
+                key_type,
                 approval,
                 &outcome,
             );
             (
                 ssh_error("sign operation failed", SSH_CODE_SIGN_FAILED),
-                Some(entry),
+                entry,
             )
         }
     }
@@ -3110,6 +3604,8 @@ mod tests {
             gate,
             audit,
             backend,
+            sign_policy: Arc::new(SignPolicy::default()),
+            refusal_audits: Arc::new(RefusalAuditLimiter::default()),
             server_name: String::new(),
             aws: None,
             docker: None,
@@ -4368,133 +4864,490 @@ mod tests {
         }
     }
 
-    // ---- gated sign flow (mirrors ssh_handler.go:handleSign) ----
+    // ---- the sign flow: the signing check, then the gate, then the backend ----
+    //
+    // Plan 035 §3.5: the check runs before the gate, so a declined request costs no
+    // prompt, touches no approval cache (the cache lives inside the gate, which is never
+    // called) and never reaches the backend; it is audited `refused` with its class.
+
+    /// An approval gate that counts its calls and answers a fixed verdict.
+    struct CountingGate {
+        approve: bool,
+        calls: AtomicUsize,
+    }
+    impl CountingGate {
+        fn new(approve: bool) -> Arc<CountingGate> {
+            Arc::new(CountingGate {
+                approve,
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ApprovalGate for CountingGate {
+        async fn approve(
+            &self,
+            _ns: &str,
+            _op: &str,
+            _server: &str,
+            _shed: &str,
+            _detail: &str,
+        ) -> crate::approval::ApprovalOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            crate::approval::ApprovalOutcome {
+                approved: self.approve,
+                decided_by: String::new(),
+                scope: None,
+                ttl: None,
+                reason: String::new(),
+            }
+        }
+        fn method(&self) -> &str {
+            if self.approve {
+                "approve-all"
+            } else {
+                "deny-all"
+            }
+        }
+    }
+
+    /// One `sign` call: (key, data, flags).
+    type SignCall = (Vec<u8>, Vec<u8>, u32);
+
+    /// A backend that records every `sign` call's (key, data, flags) and answers `result`.
+    struct RecordingBackend {
+        result: Result<SshSignature, String>,
+        calls: Mutex<Vec<SignCall>>,
+    }
+    impl RecordingBackend {
+        fn signing() -> Arc<RecordingBackend> {
+            Arc::new(RecordingBackend {
+                result: Ok(SshSignature {
+                    format: "ssh-ed25519".to_string(),
+                    blob: vec![0xAB; 64],
+                }),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+        fn failing() -> Arc<RecordingBackend> {
+            Arc::new(RecordingBackend {
+                result: Err("key not found".to_string()),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+        fn calls(&self) -> Vec<SignCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    impl SshBackend for RecordingBackend {
+        fn list(&self) -> Result<Vec<SshKeyInfo>, String> {
+            Ok(Vec::new())
+        }
+        fn sign(&self, public_key: &[u8], data: &[u8], flags: u32) -> Result<SshSignature, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((public_key.to_vec(), data.to_vec(), flags));
+            self.result.clone()
+        }
+        fn mode(&self) -> &str {
+            "local-keys"
+        }
+    }
+
+    fn put(out: &mut Vec<u8>, bytes: &[u8]) {
+        crate::ssh_wire::put_string(out, bytes);
+    }
+
+    /// An exact `publickey` login request for `user`, naming `key` with `algorithm`.
+    fn login_as(user: &[u8], key: &[u8], algorithm: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        put(&mut d, &[7u8; 32]); // session id (SHA-256 sized)
+        d.push(50); // SSH_MSG_USERAUTH_REQUEST
+        put(&mut d, user);
+        put(&mut d, b"ssh-connection");
+        put(&mut d, b"publickey");
+        d.push(1); // a signature follows
+        put(&mut d, algorithm);
+        put(&mut d, key);
+        d
+    }
+
+    /// An exact login as `git` with the fixed ed25519 key.
+    fn git_login() -> Vec<u8> {
+        login_as(b"git", &fixed_ed25519_pub(), b"ssh-ed25519")
+    }
+
+    /// An exact SSHSIG signed-data blob for `namespace` (sha512 of a fixed message).
+    fn sshsig(namespace: &[u8]) -> Vec<u8> {
+        use sha2::Digest as _;
+        let mut d = b"SSHSIG".to_vec();
+        put(&mut d, namespace);
+        put(&mut d, b"");
+        put(&mut d, b"sha512");
+        put(&mut d, &sha2::Sha512::digest(b"commit"));
+        d
+    }
+
+    /// An `ssh-rsa` blob with exponent `e` and a 2048-bit odd modulus.
+    fn rsa_pub(e: &[u8]) -> Vec<u8> {
+        let mut n = vec![0u8; 1];
+        n.extend(std::iter::repeat_n(0xa5u8, 256));
+        n[1] |= 0x80;
+        *n.last_mut().unwrap() |= 1;
+        let mut b = Vec::new();
+        put(&mut b, b"ssh-rsa");
+        put(&mut b, e);
+        put(&mut b, &n);
+        b
+    }
+
+    /// Run `handle_sign` with counting doubles.
+    async fn run_sign(
+        env: &Envelope,
+        policy: &SignPolicy,
+        gate: &Arc<CountingGate>,
+        backend: &Arc<RecordingBackend>,
+    ) -> (serde_json::Value, AuditEntry) {
+        let gate_dyn: Arc<dyn ApprovalGate> = gate.clone();
+        let backend_dyn: Arc<dyn SshBackend> = backend.clone();
+        handle_sign(env, "", "web", policy, &gate_dyn, &backend_dyn).await
+    }
 
     #[tokio::test]
-    async fn sign_approve_returns_signresponse_and_ok_audit() {
-        let pub_bytes = fixed_ed25519_pub();
-        let backend: Arc<dyn SshBackend> = Arc::new(StubBackend {
-            pubkey: pub_bytes.clone(),
-            result: Ok(SshSignature {
-                format: "ssh-ed25519".to_string(),
-                blob: vec![0xAB; 64],
-            }),
-        });
-        let env = sign_env(&b64(&pub_bytes), &b64(b"challenge-bytes"), 0);
-        let (payload, entry) = handle_sign(&env, "", "web", &approve_gate(), &backend).await;
+    async fn an_accepted_login_signs_once_with_the_checked_buffers() {
+        let key = fixed_ed25519_pub();
+        let data = git_login();
+        let env = sign_env(&b64(&key), &b64(&data), 0);
+        let (gate, backend) = (CountingGate::new(true), RecordingBackend::signing());
+        let (payload, entry) = run_sign(&env, &SignPolicy::default(), &gate, &backend).await;
 
         // SSHSignResponse{format, blob(b64 sig), rest:""}.
         assert_eq!(payload["format"], "ssh-ed25519");
         assert_eq!(payload["blob"], b64(&[0xAB; 64]));
         assert_eq!(payload["rest"], "");
+        // Exactly one backend call, with exactly the decoded buffers and flags.
+        assert_eq!(backend.calls(), vec![(key, data, 0)]);
+        assert_eq!(gate.calls(), 1);
+        // Today's ok audit: detail=key type, approval=approve-all, nothing else.
+        assert_eq!(
+            entry,
+            AuditEntry {
+                shed: "web".into(),
+                ns: "ssh-agent".into(),
+                op: "sign".into(),
+                result: "ok".into(),
+                detail: "ssh-ed25519".into(),
+                approval: "approve-all".into(),
+                ..Default::default()
+            }
+        );
+    }
 
-        // ok audit: detail=key type, approval=approve-all, decided_by/scope/ttl empty.
-        let entry = entry.expect("ok path audits");
+    #[tokio::test]
+    async fn an_accepted_git_sshsig_signs_once_with_the_checked_buffers() {
+        let key = fixed_ed25519_pub();
+        let data = sshsig(b"git");
+        let env = sign_env(&b64(&key), &b64(&data), 0);
+        let (gate, backend) = (CountingGate::new(true), RecordingBackend::signing());
+        let (payload, entry) = run_sign(&env, &SignPolicy::default(), &gate, &backend).await;
+        assert_eq!(payload["format"], "ssh-ed25519");
+        assert_eq!(backend.calls(), vec![(key, data, 0)]);
+        assert_eq!(gate.calls(), 1);
         assert_eq!(entry.result, "ok");
         assert_eq!(entry.detail, "ssh-ed25519");
-        assert_eq!(entry.ns, "ssh-agent");
-        assert_eq!(entry.op, "sign");
-        assert_eq!(entry.approval, "approve-all");
-        assert_eq!(entry.server, ""); // single-server mode
-        assert_eq!(entry.shed, "web");
-        assert_eq!(entry.decided_by, "");
         assert_eq!(entry.code, "");
         assert_eq!(entry.reason, "");
+    }
+
+    /// An RSA login passes its flags through the check to the backend unchanged.
+    #[tokio::test]
+    async fn an_accepted_rsa_login_signs_with_the_checked_flags() {
+        let key = rsa_pub(&[1, 0, 1]);
+        let data = login_as(b"git", &key, b"rsa-sha2-512");
+        let env = sign_env(&b64(&key), &b64(&data), 4);
+        let (gate, backend) = (CountingGate::new(true), RecordingBackend::signing());
+        let (_, entry) = run_sign(&env, &SignPolicy::default(), &gate, &backend).await;
+        assert_eq!(backend.calls(), vec![(key, data, 4)]);
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.detail, "ssh-rsa");
     }
 
     #[tokio::test]
     async fn sign_deny_returns_error_and_denied_audit() {
-        let env = sign_env(&b64(&fixed_ed25519_pub()), &b64(b"data"), 0);
-        let (payload, entry) = handle_sign(&env, "", "web", &deny_gate(), &empty_backend()).await;
+        let env = sign_env(&b64(&fixed_ed25519_pub()), &b64(&git_login()), 0);
+        let (gate, backend) = (CountingGate::new(false), RecordingBackend::signing());
+        let (payload, entry) = run_sign(&env, &SignPolicy::default(), &gate, &backend).await;
         // {approval denied, SIGN_FAILED}.
         assert_eq!(payload["error"], "approval denied");
         assert_eq!(payload["code"], "SIGN_FAILED");
+        assert_eq!(gate.calls(), 1);
+        assert!(backend.calls().is_empty(), "a denial signs nothing");
         // denied audit: result=denied, approval=deny-all; NO detail, NO code, NO reason.
-        let entry = entry.expect("deny path audits");
-        assert_eq!(entry.result, "denied");
-        assert_eq!(entry.approval, "deny-all");
-        assert_eq!(entry.detail, "");
-        assert_eq!(entry.code, "");
-        assert_eq!(entry.reason, "");
-        assert_eq!(entry.decided_by, ""); // deny-all's empty outcome
-    }
-
-    #[tokio::test]
-    async fn sign_gate_runs_before_pubkey_decode() {
-        // A DENY policy + a BAD public key must return "approval denied" (gate first),
-        // NOT "invalid public key encoding" — this pins the ssh_handler.go ordering.
-        let env = sign_env("!!!not-base64!!!", &b64(b"data"), 0);
-        let (payload, entry) = handle_sign(&env, "", "web", &deny_gate(), &empty_backend()).await;
-        assert_eq!(payload["error"], "approval denied");
-        assert_eq!(payload["code"], "SIGN_FAILED");
-        assert_eq!(entry.expect("deny audits").result, "denied");
-    }
-
-    #[tokio::test]
-    async fn sign_bad_pubkey_b64_internal_error_no_audit() {
-        let env = sign_env("!!!not-base64!!!", &b64(b"data"), 0);
-        let (payload, entry) =
-            handle_sign(&env, "", "web", &approve_gate(), &empty_backend()).await;
-        assert_eq!(payload["error"], "invalid public key encoding");
-        assert_eq!(payload["code"], "INTERNAL_ERROR");
-        assert!(entry.is_none(), "parse-error paths do NOT audit");
-    }
-
-    #[tokio::test]
-    async fn sign_unparsable_pubkey_key_not_found_no_audit() {
-        // Valid base64, but not a valid SSH public key wire blob.
-        let env = sign_env(&b64(b"definitely not an ssh key"), &b64(b"data"), 0);
-        let (payload, entry) =
-            handle_sign(&env, "", "web", &approve_gate(), &empty_backend()).await;
-        assert_eq!(payload["error"], "invalid public key");
-        assert_eq!(payload["code"], "KEY_NOT_FOUND");
-        assert!(entry.is_none());
-    }
-
-    #[tokio::test]
-    async fn sign_bad_data_b64_internal_error_no_audit() {
-        let env = sign_env(&b64(&fixed_ed25519_pub()), "!!!bad!!!", 0);
-        let (payload, entry) =
-            handle_sign(&env, "", "web", &approve_gate(), &empty_backend()).await;
-        assert_eq!(payload["error"], "invalid challenge data encoding");
-        assert_eq!(payload["code"], "INTERNAL_ERROR");
-        assert!(entry.is_none());
+        assert_eq!(
+            entry,
+            AuditEntry {
+                shed: "web".into(),
+                ns: "ssh-agent".into(),
+                op: "sign".into(),
+                result: "denied".into(),
+                approval: "deny-all".into(),
+                ..Default::default()
+            }
+        );
     }
 
     #[tokio::test]
     async fn sign_backend_error_sign_failed_and_error_audit() {
-        // approve-all + a valid pubkey the (empty) backend doesn't hold -> key not
-        // found -> {sign operation failed, SIGN_FAILED} + error audit (detail=key type).
-        let env = sign_env(&b64(&fixed_ed25519_pub()), &b64(b"data"), 0);
-        let (payload, entry) =
-            handle_sign(&env, "", "web", &approve_gate(), &empty_backend()).await;
+        // A valid login with a key the backend does not hold -> key not found ->
+        // {sign operation failed, SIGN_FAILED} + error audit (detail=key type).
+        let env = sign_env(&b64(&fixed_ed25519_pub()), &b64(&git_login()), 0);
+        let (gate, backend) = (CountingGate::new(true), RecordingBackend::failing());
+        let (payload, entry) = run_sign(&env, &SignPolicy::default(), &gate, &backend).await;
         assert_eq!(payload["error"], "sign operation failed");
         assert_eq!(payload["code"], "SIGN_FAILED");
-        let entry = entry.expect("backend-error path audits");
+        assert_eq!(backend.calls().len(), 1);
         assert_eq!(entry.result, "error");
         assert_eq!(entry.detail, "ssh-ed25519");
         assert_eq!(entry.approval, "approve-all");
         assert_eq!(entry.code, ""); // ssh_handler.go's error audit sets no code
     }
 
+    /// One declined request per refusal class (and per envelope decode step): no gate
+    /// call, no backend call, the reply the shed could always get, and one `refused`
+    /// audit entry naming the class with a bounded detail that is not the request.
     #[tokio::test]
-    async fn sign_invalid_payload_internal_error_no_audit() {
-        // `flags` as a string fails the SSHSignRequest decode -> {invalid sign
-        // request, INTERNAL_ERROR}; the gate is never consulted, no audit.
-        let env = Envelope {
-            id: "sign-1".into(),
-            namespace: "ssh-agent".into(),
-            msg_type: "request".into(),
-            in_reply_to: String::new(),
-            is_final: true,
-            timestamp: "t".into(),
+    async fn every_refusal_class_skips_the_gate_and_the_backend_and_is_audited() {
+        let key = fixed_ed25519_pub();
+        let other = rsa_pub(&[1, 0, 1]);
+        let mut only_other = crate::sign_check::KeyFilter::new();
+        only_other.insert_key_blob(&other);
+        let filtered = SignPolicy::new(["git"], Some(only_other));
+        // `_bootstrap` listed on purpose: a reserved name is refused even when listed.
+        let listing_reserved = SignPolicy::new(["git", "_bootstrap"], None);
+        let default = SignPolicy::default();
+        let mut trailing = git_login();
+        trailing.push(0);
+        let rsa_512 = login_as(b"git", &other, b"rsa-sha2-512");
+        let even_e = rsa_pub(&[1, 0, 0]);
+        let bad_flags = Envelope {
             payload: Some(serde_json::json!({"operation":"sign","flags":"not-a-number"})),
-            shed: None,
+            ..sign_env("", "", 0)
         };
-        let (payload, entry) = handle_sign(&env, "", "", &approve_gate(), &empty_backend()).await;
-        assert_eq!(payload["error"], "invalid sign request");
+
+        let invalid_request = ("invalid sign request", "INTERNAL_ERROR");
+        let sign_failed = ("sign operation failed", "SIGN_FAILED");
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            Envelope,
+            &SignPolicy,
+            RefusalClass,
+            (&str, &str),
+            String,
+        )> = vec![
+            (
+                "envelope does not decode",
+                bad_flags,
+                &default,
+                RefusalClass::MalformedRequest,
+                invalid_request,
+                "invalid\\x20sign\\x20request".into(),
+            ),
+            (
+                "key is not base64",
+                sign_env("!!!not-base64!!!", &b64(&git_login()), 0),
+                &default,
+                RefusalClass::MalformedRequest,
+                ("invalid public key encoding", "INTERNAL_ERROR"),
+                "invalid\\x20public\\x20key\\x20encoding".into(),
+            ),
+            (
+                "data is not base64",
+                sign_env(&b64(&key), "!!!bad!!!", 0),
+                &default,
+                RefusalClass::MalformedRequest,
+                ("invalid challenge data encoding", "INTERNAL_ERROR"),
+                "invalid\\x20challenge\\x20data\\x20encoding".into(),
+            ),
+            (
+                "key does not parse",
+                sign_env(&b64(b"definitely not an ssh key"), &b64(&git_login()), 0),
+                &default,
+                RefusalClass::MalformedKey,
+                ("invalid public key", "KEY_NOT_FOUND"),
+                "not an SSH public key".into(),
+            ),
+            (
+                "key parses but is not a valid key (even RSA exponent)",
+                sign_env(
+                    &b64(&even_e),
+                    &b64(&login_as(b"git", &even_e, b"ssh-rsa")),
+                    0,
+                ),
+                &default,
+                RefusalClass::MalformedKey,
+                sign_failed,
+                "invalid key: RSA exponent is even".into(),
+            ),
+            (
+                "key not offered",
+                sign_env(&b64(&key), &b64(&git_login()), 0),
+                &filtered,
+                RefusalClass::KeyNotOffered,
+                sign_failed,
+                format!(
+                    "key {}",
+                    crate::sign_check::digest_fingerprint(&crate::sign_check::key_blob_digest(
+                        &key
+                    ))
+                ),
+            ),
+            (
+                "username not allowed",
+                sign_env(
+                    &b64(&key),
+                    &b64(&login_as(b"deploy", &key, b"ssh-ed25519")),
+                    0,
+                ),
+                &default,
+                RefusalClass::UsernameNotAllowed,
+                sign_failed,
+                "login user=deploy".into(),
+            ),
+            (
+                "reserved username, even when listed",
+                sign_env(
+                    &b64(&key),
+                    &b64(&login_as(b"_bootstrap", &key, b"ssh-ed25519")),
+                    0,
+                ),
+                &listing_reserved,
+                RefusalClass::ReservedUsername,
+                sign_failed,
+                "login user=_bootstrap".into(),
+            ),
+            (
+                "wrong SSHSIG namespace",
+                sign_env(&b64(&key), &b64(&sshsig(b"file")), 0),
+                &default,
+                RefusalClass::WrongNamespace,
+                sign_failed,
+                "sshsig namespace=file".into(),
+            ),
+            (
+                "arbitrary challenge bytes",
+                sign_env(&b64(&key), &b64(b"challenge-bytes"), 0),
+                &default,
+                RefusalClass::UnparseableData,
+                sign_failed,
+                String::new(),
+            ),
+            (
+                "a trailing byte after a valid login",
+                sign_env(&b64(&key), &b64(&trailing), 0),
+                &default,
+                RefusalClass::UnparseableData,
+                sign_failed,
+                String::new(),
+            ),
+            (
+                "RSA flags disagree with the payload",
+                sign_env(&b64(&other), &b64(&rsa_512), 2),
+                &default,
+                RefusalClass::UnparseableData,
+                sign_failed,
+                "login: RSA flags do not name the algorithm's hash".into(),
+            ),
+        ];
+        let mut classes = std::collections::HashSet::new();
+        for (name, env, policy, class, (error, code), detail) in cases {
+            for approve in [true, false] {
+                let (gate, backend) = (CountingGate::new(approve), RecordingBackend::signing());
+                let (payload, entry) = run_sign(&env, policy, &gate, &backend).await;
+                assert_eq!(gate.calls(), 0, "{name}: the gate was asked");
+                assert!(backend.calls().is_empty(), "{name}: the backend was asked");
+                assert_eq!(
+                    payload,
+                    serde_json::json!({"error": error, "code": code}),
+                    "{name}"
+                );
+                assert_eq!(entry.result, "refused", "{name}");
+                assert_eq!(entry.code, "SIGN_REFUSED", "{name}");
+                assert_eq!(entry.reason, class.as_str(), "{name}");
+                assert_eq!(entry.approval, "none", "{name}");
+                assert_eq!(
+                    (entry.ns.as_str(), entry.op.as_str()),
+                    ("ssh-agent", "sign")
+                );
+                assert_eq!(entry.shed, "web", "{name}");
+                assert!(
+                    entry.decided_by.is_empty() && entry.scope.is_empty() && entry.ttl.is_empty(),
+                    "{name}: {entry:?}"
+                );
+                if detail.is_empty() {
+                    assert!(!entry.detail.is_empty(), "{name}: no detail");
+                } else {
+                    assert_eq!(entry.detail, detail, "{name}");
+                }
+                assert!(
+                    entry.detail.len() <= crate::sign_check::MAX_DETAIL_BYTES,
+                    "{name}"
+                );
+                // Never the raw request: neither encoded field appears in the line.
+                let raw = env.payload.as_ref().unwrap();
+                for field in ["public_key", "data"] {
+                    if let Some(v) = raw.get(field).and_then(|v| v.as_str()) {
+                        if v.len() > 8 {
+                            assert!(!entry.detail.contains(v), "{name}: {field} in detail");
+                        }
+                    }
+                }
+            }
+            classes.insert(class);
+        }
+        // Every class the check (or the decode before it) can produce is covered.
+        assert_eq!(classes.len(), RefusalClass::ALL.len(), "{classes:?}");
+    }
+
+    /// The old order ran the gate first, so a malformed key under a deny-all gate answered
+    /// `approval denied`. Now the key is checked first: the key error, and no prompt.
+    #[tokio::test]
+    async fn a_malformed_key_under_a_deny_gate_answers_the_key_error() {
+        let gate = CountingGate::new(false);
+        let backend = RecordingBackend::signing();
+        let env = sign_env(&b64(b"definitely not an ssh key"), &b64(&git_login()), 0);
+        let (payload, entry) = run_sign(&env, &SignPolicy::default(), &gate, &backend).await;
+        assert_eq!(payload["error"], "invalid public key");
+        assert_eq!(payload["code"], "KEY_NOT_FOUND");
+        assert_eq!(entry.result, "refused");
+        assert_eq!(entry.reason, "malformed_key");
+        let env = sign_env("!!!not-base64!!!", &b64(&git_login()), 0);
+        let (payload, _) = run_sign(&env, &SignPolicy::default(), &gate, &backend).await;
+        assert_eq!(payload["error"], "invalid public key encoding");
         assert_eq!(payload["code"], "INTERNAL_ERROR");
-        assert!(entry.is_none());
+        assert_eq!(gate.calls(), 0, "no prompt for a malformed key");
+    }
+
+    /// The check runs before the gate: a declined request is never put to the gate (so no
+    /// prompt and no approval-cache entry read or written), an accepted one is, once.
+    #[tokio::test]
+    async fn sign_check_runs_before_gate() {
+        let gate = CountingGate::new(true);
+        let backend = RecordingBackend::signing();
+        let key = b64(&fixed_ed25519_pub());
+        let declined = sign_env(&key, &b64(b"shed-host-agent challenge"), 0);
+        let (payload, _) = run_sign(&declined, &SignPolicy::default(), &gate, &backend).await;
+        assert_eq!(payload["code"], "SIGN_FAILED");
+        assert_eq!(gate.calls(), 0);
+        let accepted = sign_env(&key, &b64(&git_login()), 0);
+        let (payload, _) = run_sign(&accepted, &SignPolicy::default(), &gate, &backend).await;
+        assert_eq!(payload["format"], "ssh-ed25519");
+        assert_eq!(gate.calls(), 1);
+        assert_eq!(backend.calls().len(), 1);
     }
 
     #[tokio::test]
@@ -4531,7 +5384,7 @@ mod tests {
         let audit_collector = Arc::new(CollectingAudit::default());
         let audit: Arc<dyn AuditSink> = audit_collector.clone();
         let gate = approve_gate();
-        let env = sign_env(&b64(&pub_bytes), &b64(b"data"), 0);
+        let env = sign_env(&b64(&pub_bytes), &b64(&git_login()), 0);
         handle_bus_message(
             &client,
             "ssh-agent",
@@ -4545,6 +5398,920 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].result, "ok");
         assert_eq!(entries[0].shed, "web"); // echoed from the request's shed
+    }
+
+    /// A refusal through the shared dispatch: the shed gets the ordinary failure shape
+    /// and the sink gets the `refused` line.
+    #[tokio::test]
+    async fn a_refusal_via_handle_bus_message_responds_sign_failed_and_audits() {
+        let server = MockServer::start_async().await;
+        let respond = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/plugins/listeners/ssh-agent/respond")
+                    .body_contains("\"in_reply_to\":\"sign-1\"")
+                    .body_contains("\"code\":\"SIGN_FAILED\"")
+                    .body_contains("\"error\":\"sign operation failed\"");
+                t.status(204);
+            })
+            .await;
+        let client = open_client(&server.base_url());
+        let audit_collector = Arc::new(CollectingAudit::default());
+        let gate = CountingGate::new(true);
+        let env = sign_env(
+            &b64(&fixed_ed25519_pub()),
+            &b64(&login_as(b"root", &fixed_ed25519_pub(), b"ssh-ed25519")),
+            0,
+        );
+        handle_bus_message(
+            &client,
+            "ssh-agent",
+            &env,
+            &never_shutdown(),
+            &test_handlers(gate.clone(), audit_collector.clone(), empty_backend()),
+        )
+        .await;
+        respond.assert_async().await;
+        assert_eq!(gate.calls(), 0);
+        let entries = audit_collector.entries.lock().unwrap();
+        assert_eq!(
+            *entries,
+            vec![AuditEntry {
+                shed: "web".into(),
+                ns: "ssh-agent".into(),
+                op: "sign".into(),
+                result: "refused".into(),
+                detail: "login user=root".into(),
+                code: "SIGN_REFUSED".into(),
+                reason: "username_not_allowed".into(),
+                approval: "none".into(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    // ---- the refusal audit limit ----
+
+    /// A hand-driven clock and timer for the limiter: time moves only on `advance`.
+    struct ManualClock {
+        now: watch::Sender<Instant>,
+    }
+    impl ManualClock {
+        fn new() -> Arc<ManualClock> {
+            Arc::new(ManualClock {
+                now: watch::channel(Instant::now()).0,
+            })
+        }
+        fn advance(&self, by: Duration) {
+            self.now.send_modify(|t| *t += by);
+        }
+    }
+    impl RefusalClock for ManualClock {
+        fn now(&self) -> Instant {
+            *self.now.borrow()
+        }
+        fn sleep_until(
+            &self,
+            at: Instant,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+            let mut rx = self.now.subscribe();
+            Box::pin(async move {
+                let _ = rx.wait_for(|t| *t >= at).await;
+            })
+        }
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    fn class_counts(pairs: &[(RefusalClass, u64)]) -> [u64; REFUSAL_CLASSES] {
+        let mut counts = [0; REFUSAL_CLASSES];
+        for (class, n) in pairs {
+            counts[class_index(*class)] += n;
+        }
+        counts
+    }
+
+    fn add_counts(into: &mut [u64; REFUSAL_CLASSES], from: &[u64; REFUSAL_CLASSES]) {
+        for (n, m) in into.iter_mut().zip(from) {
+            *n += m;
+        }
+    }
+
+    fn summary_of(shed: &str, pairs: &[(RefusalClass, u64)]) -> RefusalSummary {
+        RefusalSummary {
+            shed: shed.into(),
+            counts: class_counts(pairs),
+        }
+    }
+
+    fn logs(log: bool) -> RefusalAdmission {
+        RefusalAdmission {
+            log,
+            summaries: vec![],
+        }
+    }
+
+    /// Wait (on the scheduler, not on a deadline that matters) until `pred` holds for
+    /// the collected entries.
+    async fn wait_for_audit(audit: &CollectingAudit, pred: impl Fn(&[AuditEntry]) -> bool) {
+        for _ in 0..2000 {
+            if pred(&audit.entries.lock().unwrap()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("never reached: {:?}", audit.entries.lock().unwrap());
+    }
+
+    fn summaries_in(entries: &[AuditEntry]) -> Vec<AuditEntry> {
+        entries
+            .iter()
+            .filter(|e| e.reason == AUDIT_REASON_RATE_LIMITED)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn the_refusal_limiter_logs_a_burst_then_counts_per_class_and_reports_once() {
+        use RefusalClass::*;
+        let limiter = RefusalAuditLimiter::new(3, MINUTE);
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            assert_eq!(limiter.admit("web", UnparseableData, t0), logs(true));
+        }
+        // Past the burst: the same class is counted ...
+        assert_eq!(limiter.admit("web", UnparseableData, t0), logs(false));
+        // ... but the first of a class not yet logged in this window gets its line.
+        assert_eq!(limiter.admit("web", ReservedUsername, t0), logs(true));
+        assert_eq!(limiter.admit("web", ReservedUsername, t0), logs(false));
+        for _ in 0..3 {
+            assert_eq!(
+                limiter.admit("web", UnparseableData, t0 + Duration::from_secs(1)),
+                logs(false)
+            );
+        }
+        // Another shed has its own window.
+        assert_eq!(limiter.admit("db", ReservedUsername, t0), logs(true));
+        // Not before the window ends.
+        assert_eq!(limiter.flush_due(t0 + Duration::from_secs(59)), vec![]);
+        // At its end: the counts, per class, once; the windows are dropped.
+        assert_eq!(
+            limiter.flush_due(t0 + MINUTE),
+            vec![summary_of(
+                "web",
+                &[(ReservedUsername, 1), (UnparseableData, 4)]
+            )]
+        );
+        assert_eq!(limiter.flush_due(t0 + MINUTE * 2), vec![]);
+        assert_eq!(limiter.windows(), 0);
+        // A new window: logged again.
+        assert_eq!(
+            limiter.admit("web", UnparseableData, t0 + MINUTE),
+            logs(true)
+        );
+    }
+
+    /// The reviewer's case: a flood of one class spends the burst, then a well-formed
+    /// login as a reserved username still leaves a line of its own, and every request is
+    /// either logged or counted under its own class. Per window, at most burst + one line
+    /// per class + one summary.
+    #[test]
+    fn mixed_classes_under_suppression_keep_their_class_within_the_bound() {
+        let burst = 2;
+        let limiter = RefusalAuditLimiter::new(burst, MINUTE);
+        let t0 = Instant::now();
+        let mut logged = [0u64; REFUSAL_CLASSES];
+        let mut sent = [0u64; REFUSAL_CLASSES];
+        let mut summaries = Vec::new();
+        for window in 0..3u32 {
+            let at = t0 + MINUTE * window;
+            let mut lines = 0;
+            for _ in 0..100 {
+                for i in 0..REFUSAL_CLASSES {
+                    // Rotate which classes come first, so each window's burst differs.
+                    let class = RefusalClass::ALL[(i + window as usize) % REFUSAL_CLASSES];
+                    let a = limiter.admit("web", class, at);
+                    summaries.extend(a.summaries);
+                    sent[class_index(class)] += 1;
+                    if a.log {
+                        logged[class_index(class)] += 1;
+                        lines += 1;
+                    }
+                }
+            }
+            // The burst, then the first of each class not in the burst: 2 + 5.
+            assert_eq!(lines, burst as usize + REFUSAL_CLASSES - burst as usize);
+            assert!(lines <= burst as usize + REFUSAL_CLASSES);
+        }
+        summaries.extend(limiter.flush_due(t0 + MINUTE * 3));
+        // One summary per window, each naming every class.
+        assert_eq!(summaries.len(), 3);
+        for s in &summaries {
+            assert!(s.counts.iter().all(|n| *n > 0), "{s:?}");
+            assert_eq!(s.total(), 700 - 7);
+        }
+        for i in 0..REFUSAL_CLASSES {
+            let counted: u64 = summaries.iter().map(|s| s.counts[i]).sum();
+            assert_eq!(logged[i] + counted, sent[i], "class {i}");
+        }
+        // The summary line names each class with its count, in a stable order.
+        let line = limiter.summary_audit("srv", &summaries[0]);
+        assert_eq!(
+            line.detail,
+            "693 more refused sign requests were not logged one by one (at most 2 per 60s \
+             per shed, plus the first of each class): malformed_request=99 malformed_key=99 \
+             key_not_offered=99 username_not_allowed=99 reserved_username=99 \
+             wrong_namespace=99 unparseable_data=99"
+        );
+        assert_eq!(
+            (
+                line.server.as_str(),
+                line.shed.as_str(),
+                line.result.as_str(),
+                line.code.as_str(),
+                line.reason.as_str(),
+                line.approval.as_str()
+            ),
+            (
+                "srv",
+                "web",
+                "refused",
+                "SIGN_REFUSED",
+                AUDIT_REASON_RATE_LIMITED,
+                "none"
+            )
+        );
+    }
+
+    #[test]
+    fn a_refusal_after_the_window_reports_the_ended_windows_counts() {
+        use RefusalClass::*;
+        let limiter = RefusalAuditLimiter::new(1, MINUTE);
+        let t0 = Instant::now();
+        assert_eq!(limiter.admit("web", WrongNamespace, t0), logs(true));
+        assert_eq!(limiter.admit("web", WrongNamespace, t0), logs(false));
+        assert_eq!(limiter.admit("web", WrongNamespace, t0), logs(false));
+        assert_eq!(
+            limiter.admit("web", KeyNotOffered, t0 + MINUTE),
+            RefusalAdmission {
+                log: true,
+                summaries: vec![summary_of("web", &[(WrongNamespace, 2)])],
+            }
+        );
+        // The counts were taken: a late flush finds nothing.
+        assert_eq!(limiter.flush_due(t0 + MINUTE * 3), vec![]);
+    }
+
+    /// The window map is capped: a new shed past the cap drops ended windows, then the
+    /// oldest open one, and the counts of each come back as its summary.
+    #[test]
+    fn the_window_cap_evicts_the_oldest_and_keeps_its_counts() {
+        use RefusalClass::*;
+        let clock = ManualClock::new();
+        let limiter = RefusalAuditLimiter::with_clock(0, MINUTE, 3, clock.clone());
+        let t0 = clock.now();
+        for (i, shed) in ["a", "b", "c"].iter().enumerate() {
+            let at = t0 + Duration::from_secs(i as u64);
+            assert_eq!(limiter.admit(shed, UnparseableData, at), logs(true));
+            assert_eq!(limiter.admit(shed, UnparseableData, at), logs(false));
+            assert_eq!(limiter.admit(shed, UnparseableData, at), logs(false));
+        }
+        assert_eq!(limiter.windows(), 3);
+        // "d" evicts the oldest ("a"), whose two counted refusals are reported.
+        assert_eq!(
+            limiter.admit("d", ReservedUsername, t0 + Duration::from_secs(3)),
+            RefusalAdmission {
+                log: true,
+                summaries: vec![summary_of("a", &[(UnparseableData, 2)])],
+            }
+        );
+        assert_eq!(limiter.windows(), 3);
+        // Past every window's end, a new shed drops all the ended windows at once.
+        let mut got = limiter
+            .admit("e", ReservedUsername, t0 + MINUTE * 2)
+            .summaries;
+        got.sort_by(|x, y| x.shed.cmp(&y.shed));
+        assert_eq!(
+            got,
+            vec![
+                summary_of("b", &[(UnparseableData, 2)]),
+                summary_of("c", &[(UnparseableData, 2)]),
+            ]
+        );
+        assert_eq!(limiter.windows(), 1);
+    }
+
+    /// Many shed names against a small cap: the map never grows past it, and every
+    /// refusal is logged or counted under its class exactly once.
+    #[test]
+    fn many_shed_names_stay_under_the_cap_and_lose_no_count() {
+        let cap = 8;
+        let limiter = RefusalAuditLimiter::with_clock(1, MINUTE, cap, ManualClock::new());
+        let t0 = Instant::now();
+        let mut sent: HashMap<(String, usize), u64> = HashMap::new();
+        let mut seen: HashMap<(String, usize), u64> = HashMap::new();
+        fn account(summaries: Vec<RefusalSummary>, seen: &mut HashMap<(String, usize), u64>) {
+            for s in summaries {
+                for (i, n) in s.counts.iter().enumerate() {
+                    if *n > 0 {
+                        *seen.entry((s.shed.clone(), i)).or_default() += n;
+                    }
+                }
+            }
+        }
+        for round in 0..3u32 {
+            for n in 0..200u32 {
+                let shed = format!("shed-{n}");
+                let at = t0 + Duration::from_millis(u64::from(round * 200 + n));
+                for k in 0..5usize {
+                    let class = RefusalClass::ALL[k % 2];
+                    let i = class_index(class);
+                    *sent.entry((shed.clone(), i)).or_default() += 1;
+                    let a = limiter.admit(&shed, class, at);
+                    if a.log {
+                        *seen.entry((shed.clone(), i)).or_default() += 1;
+                    }
+                    account(a.summaries, &mut seen);
+                    assert!(limiter.windows() <= cap);
+                }
+            }
+        }
+        account(limiter.close(), &mut seen);
+        assert_eq!(limiter.windows(), 0);
+        assert_eq!(seen, sent);
+    }
+
+    /// Admissions and flushes racing from many threads (released together by a
+    /// barrier, with windows ending part-way through): no refusal is lost or counted
+    /// twice. Every decision is taken under the one lock, so whatever the interleaving,
+    /// logged + summarized = sent, per class.
+    #[test]
+    fn concurrent_admissions_and_flushes_lose_and_double_nothing() {
+        const THREADS: usize = 8;
+        const EACH: u64 = 3000;
+        let limiter = Arc::new(RefusalAuditLimiter::new(5, Duration::from_millis(50)));
+        let t0 = Instant::now();
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::new();
+        for t in 0..THREADS {
+            let (limiter, barrier) = (limiter.clone(), barrier.clone());
+            workers.push(std::thread::spawn(move || {
+                let mut logged = [0u64; REFUSAL_CLASSES];
+                let mut sent = [0u64; REFUSAL_CLASSES];
+                let mut summarized = [0u64; REFUSAL_CLASSES];
+                barrier.wait();
+                for k in 0..EACH {
+                    let class = RefusalClass::ALL[(t + k as usize) % REFUSAL_CLASSES];
+                    let shed = ["web", "db", "ci"][k as usize % 3];
+                    // Time moves on, so windows end while others are still admitting.
+                    let at = t0 + Duration::from_millis(k / 10);
+                    let a = limiter.admit(shed, class, at);
+                    sent[class_index(class)] += 1;
+                    if a.log {
+                        logged[class_index(class)] += 1;
+                    }
+                    for s in a.summaries {
+                        add_counts(&mut summarized, &s.counts);
+                    }
+                }
+                (logged, sent, summarized)
+            }));
+        }
+        let flusher = {
+            let (limiter, barrier, stop) = (limiter.clone(), barrier.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut summarized = [0u64; REFUSAL_CLASSES];
+                barrier.wait();
+                let mut k = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    for s in limiter.flush_due(t0 + Duration::from_millis(k / 10)) {
+                        add_counts(&mut summarized, &s.counts);
+                    }
+                    k = (k + 1) % (EACH + 1000);
+                }
+                summarized
+            })
+        };
+        let mut total = [[0u64; REFUSAL_CLASSES]; 3];
+        for w in workers {
+            let (logged, sent, summarized) = w.join().unwrap();
+            for i in 0..REFUSAL_CLASSES {
+                total[0][i] += logged[i];
+                total[1][i] += sent[i];
+                total[2][i] += summarized[i];
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        let flushed = flusher.join().unwrap();
+        let closed = limiter.close();
+        for i in 0..REFUSAL_CLASSES {
+            let at_close: u64 = closed.iter().map(|s| s.counts[i]).sum();
+            assert_eq!(
+                total[0][i] + total[2][i] + flushed[i] + at_close,
+                total[1][i],
+                "class {i}"
+            );
+        }
+        assert_eq!(total[1].iter().sum::<u64>(), THREADS as u64 * EACH);
+    }
+
+    /// The flusher writes a window's summary when the (injected) clock reaches the
+    /// window's end — no wall-clock wait — and then drops the window.
+    #[tokio::test]
+    async fn the_flusher_writes_the_summary_when_the_window_ends() {
+        use RefusalClass::*;
+        let clock = ManualClock::new();
+        let limiter = Arc::new(RefusalAuditLimiter::with_clock(
+            1,
+            MINUTE,
+            16,
+            clock.clone(),
+        ));
+        let audit = Arc::new(CollectingAudit::default());
+        let (stop_tx, stop_rx) = shutdown_pair();
+        let flusher = tokio::spawn(run_refusal_flusher(
+            limiter.clone(),
+            audit.clone(),
+            "srv".into(),
+            stop_rx,
+        ));
+        // Let the flusher run and park on its timer at each step (a current-thread
+        // runtime: yielding runs every task that is ready), so the summary below can
+        // only come from the timer firing at the window's end.
+        async fn settle() {
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        settle().await;
+        let t0 = clock.now();
+        assert!(limiter.admit("web", UsernameNotAllowed, t0).log);
+        for _ in 0..4 {
+            assert!(!limiter.admit("web", UsernameNotAllowed, t0).log);
+        }
+        assert_eq!(limiter.next_deadline(), Some(t0 + MINUTE));
+        settle().await;
+        clock.advance(Duration::from_secs(59));
+        settle().await;
+        assert!(summaries_in(&audit.entries.lock().unwrap()).is_empty());
+        clock.advance(Duration::from_secs(1));
+        wait_for_audit(&audit, |e| !summaries_in(e).is_empty()).await;
+        let lines = summaries_in(&audit.entries.lock().unwrap());
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].detail.starts_with("4 more refused sign requests")
+                && lines[0].detail.ends_with(": username_not_allowed=4"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            (lines[0].server.as_str(), lines[0].shed.as_str()),
+            ("srv", "web")
+        );
+        wait_for_audit(&audit, |_| limiter.windows() == 0).await;
+        // Shutdown stops the flusher; nothing was pending, so nothing more is written.
+        stop_tx.send(true).unwrap();
+        flusher.await.unwrap();
+        assert_eq!(audit.entries.lock().unwrap().len(), 1);
+    }
+
+    /// On shutdown the flusher writes every pending summary before it returns (the
+    /// group's `done` awaits it), and later refusals are logged, not counted.
+    #[tokio::test]
+    async fn shutdown_writes_every_pending_summary_then_logs_each_refusal() {
+        use RefusalClass::*;
+        let clock = ManualClock::new();
+        let limiter = Arc::new(RefusalAuditLimiter::with_clock(
+            0,
+            MINUTE,
+            16,
+            clock.clone(),
+        ));
+        let audit = Arc::new(CollectingAudit::default());
+        let (stop_tx, stop_rx) = shutdown_pair();
+        let flusher = tokio::spawn(run_refusal_flusher(
+            limiter.clone(),
+            audit.clone(),
+            String::new(),
+            stop_rx,
+        ));
+        let t0 = clock.now();
+        for shed in ["web", "db"] {
+            assert!(limiter.admit(shed, MalformedKey, t0).log);
+            assert!(!limiter.admit(shed, MalformedKey, t0).log);
+            assert!(!limiter.admit(shed, MalformedKey, t0).log);
+        }
+        stop_tx.send(true).unwrap();
+        flusher.await.unwrap();
+        let mut lines = summaries_in(&audit.entries.lock().unwrap());
+        lines.sort_by(|a, b| a.shed.cmp(&b.shed));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for (line, shed) in lines.iter().zip(["db", "web"]) {
+            assert_eq!(line.shed, shed);
+            assert!(line.detail.ends_with(": malformed_key=2"), "{line:?}");
+        }
+        assert_eq!(limiter.windows(), 0);
+        // After the last flush nothing is counted any more.
+        assert_eq!(limiter.admit("web", MalformedKey, t0), logs(true));
+        assert_eq!(limiter.admit("web", MalformedKey, t0), logs(true));
+        assert_eq!(limiter.windows(), 0);
+    }
+
+    /// End to end through the bus: a flood of refusals of two classes from one shed
+    /// writes the burst, the first line of the second class, and — at shutdown — one
+    /// summary with each class's count. Nothing here depends on how long it takes: the
+    /// clock never moves.
+    #[tokio::test]
+    async fn a_flood_of_refusals_writes_the_burst_then_one_summary() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/plugins/listeners/ssh-agent/respond");
+                t.status(204);
+            })
+            .await;
+        let client = open_client(&server.base_url());
+        let audit_collector = Arc::new(CollectingAudit::default());
+        let mut handlers = test_handlers(
+            CountingGate::new(true),
+            audit_collector.clone(),
+            empty_backend(),
+        );
+        handlers.refusal_audits = Arc::new(RefusalAuditLimiter::with_clock(
+            2,
+            MINUTE,
+            16,
+            ManualClock::new(),
+        ));
+        let (stop_tx, stop_rx) = shutdown_pair();
+        let flusher = tokio::spawn(run_refusal_flusher(
+            handlers.refusal_audits.clone(),
+            handlers.audit.clone(),
+            String::new(),
+            stop_rx,
+        ));
+        let key = fixed_ed25519_pub();
+        let junk = sign_env(&b64(&key), &b64(b"not a login"), 0);
+        let reserved = sign_env(
+            &b64(&key),
+            &b64(&login_as(b"_bootstrap", &key, b"ssh-ed25519")),
+            0,
+        );
+        for env in std::iter::repeat_n(&junk, 20).chain(std::iter::repeat_n(&reserved, 3)) {
+            handle_bus_message(&client, "ssh-agent", env, &never_shutdown(), &handlers).await;
+        }
+        {
+            let entries = audit_collector.entries.lock().unwrap();
+            let count = |reason: &str| entries.iter().filter(|e| e.reason == reason).count();
+            assert_eq!(count("unparseable_data"), 2);
+            assert_eq!(count("reserved_username"), 1, "{entries:?}");
+            let reserved_line = entries
+                .iter()
+                .find(|e| e.reason == "reserved_username")
+                .unwrap();
+            assert_eq!(reserved_line.detail, "login user=_bootstrap");
+            assert!(summaries_in(&entries).is_empty());
+        }
+        stop_tx.send(true).unwrap();
+        flusher.await.unwrap();
+        let entries = audit_collector.entries.lock().unwrap();
+        let summaries = summaries_in(&entries);
+        assert_eq!(summaries.len(), 1, "{entries:?}");
+        assert_eq!(entries.len(), 4);
+        let summary = &summaries[0];
+        assert!(
+            summary.detail.starts_with("20 more refused sign requests")
+                && summary
+                    .detail
+                    .ends_with(": reserved_username=2 unparseable_data=18"),
+            "{summary:?}"
+        );
+        assert_eq!(
+            (
+                summary.result.as_str(),
+                summary.code.as_str(),
+                summary.approval.as_str()
+            ),
+            ("refused", "SIGN_REFUSED", "none")
+        );
+        assert_eq!(summary.shed, "web");
+    }
+
+    // ---- the sign request's fields at their edges ----
+
+    /// Each field of a sign request at its edges: the numeric flags (0, the hash bits,
+    /// u32 max, one past it, negative, a string, a fraction), a missing or null key, data
+    /// or flags, and base64 with more after the padding. Each gets its class (or is
+    /// signed), the reply the shed always got, and its audit line; a refused one never
+    /// reaches the gate or the backend.
+    #[tokio::test]
+    async fn sign_request_field_edges_are_classified_and_answered() {
+        let ed = fixed_ed25519_pub();
+        let rsa = rsa_pub(&[1, 0, 1]);
+        let ed_login = git_login();
+        let rsa_login = login_as(b"git", &rsa, b"rsa-sha2-512");
+        let env = |fields: serde_json::Value| {
+            let mut payload = serde_json::json!({"operation": "sign"});
+            for (k, v) in fields.as_object().unwrap() {
+                payload[k] = v.clone();
+            }
+            Envelope {
+                payload: Some(payload),
+                ..sign_env("", "", 0)
+            }
+        };
+        let with_flags = |key: &[u8], data: &[u8], flags: serde_json::Value| {
+            env(serde_json::json!({"public_key": b64(key), "data": b64(data), "flags": flags}))
+        };
+        // The login's base64 ends in padding; more after it does not decode.
+        assert!(b64(&ed_login).ends_with('='));
+        let data_after_padding = format!("{}AAAA", b64(&ed_login));
+        let key_after_padding = format!("{}{}", b64(&ed[..50]), b64(&ed[50..]));
+        assert!(b64(&ed[..50]).ends_with('='));
+
+        enum Want {
+            Signed(u32),
+            Refused(RefusalClass, &'static str, &'static str),
+        }
+        use RefusalClass::*;
+        use Want::*;
+        let invalid = |class| Refused(class, "invalid sign request", "INTERNAL_ERROR");
+        let failed = |class| Refused(class, "sign operation failed", "SIGN_FAILED");
+        let max = u64::from(u32::MAX);
+        let cases: Vec<(&str, Envelope, Want)> = vec![
+            (
+                "ed25519 flags 0",
+                with_flags(&ed, &ed_login, 0.into()),
+                Signed(0),
+            ),
+            (
+                "ed25519 flags 2",
+                with_flags(&ed, &ed_login, 2.into()),
+                Signed(2),
+            ),
+            (
+                "ed25519 flags 4",
+                with_flags(&ed, &ed_login, 4.into()),
+                Signed(4),
+            ),
+            // Other key types pass the flags through untouched, every bit.
+            (
+                "ed25519 flags u32 max",
+                with_flags(&ed, &ed_login, max.into()),
+                Signed(u32::MAX),
+            ),
+            (
+                "rsa-sha2-512 flags 0",
+                with_flags(&rsa, &rsa_login, 0.into()),
+                failed(UnparseableData),
+            ),
+            (
+                "rsa-sha2-512 flags 2",
+                with_flags(&rsa, &rsa_login, 2.into()),
+                failed(UnparseableData),
+            ),
+            (
+                "rsa-sha2-512 flags 4",
+                with_flags(&rsa, &rsa_login, 4.into()),
+                Signed(4),
+            ),
+            (
+                "rsa-sha2-512 flags 6",
+                with_flags(&rsa, &rsa_login, 6.into()),
+                failed(UnparseableData),
+            ),
+            (
+                "rsa-sha2-512 flags u32 max",
+                with_flags(&rsa, &rsa_login, max.into()),
+                failed(UnparseableData),
+            ),
+            (
+                "flags one past u32 max",
+                with_flags(&ed, &ed_login, (max + 1).into()),
+                invalid(MalformedRequest),
+            ),
+            (
+                "flags negative",
+                with_flags(&ed, &ed_login, (-1).into()),
+                invalid(MalformedRequest),
+            ),
+            (
+                "flags a string",
+                with_flags(&ed, &ed_login, "4".into()),
+                invalid(MalformedRequest),
+            ),
+            (
+                "flags a fraction",
+                with_flags(&ed, &ed_login, 1.5.into()),
+                invalid(MalformedRequest),
+            ),
+            (
+                "flags null",
+                with_flags(&ed, &ed_login, serde_json::Value::Null),
+                invalid(MalformedRequest),
+            ),
+            (
+                "flags missing",
+                env(serde_json::json!({"public_key": b64(&ed), "data": b64(&ed_login)})),
+                Signed(0),
+            ),
+            (
+                "key missing",
+                env(serde_json::json!({"data": b64(&ed_login), "flags": 0})),
+                Refused(MalformedKey, "invalid public key", "KEY_NOT_FOUND"),
+            ),
+            (
+                "key null",
+                env(serde_json::json!({"public_key": null, "data": b64(&ed_login)})),
+                invalid(MalformedRequest),
+            ),
+            (
+                "data missing",
+                env(serde_json::json!({"public_key": b64(&ed), "flags": 0})),
+                failed(UnparseableData),
+            ),
+            (
+                "data null",
+                env(serde_json::json!({"public_key": b64(&ed), "data": null})),
+                invalid(MalformedRequest),
+            ),
+            (
+                "key base64 with more after the padding",
+                env(serde_json::json!({"public_key": key_after_padding, "data": b64(&ed_login)})),
+                Refused(
+                    MalformedRequest,
+                    "invalid public key encoding",
+                    "INTERNAL_ERROR",
+                ),
+            ),
+            (
+                "data base64 with more after the padding",
+                env(serde_json::json!({"public_key": b64(&ed), "data": data_after_padding})),
+                Refused(
+                    MalformedRequest,
+                    "invalid challenge data encoding",
+                    "INTERNAL_ERROR",
+                ),
+            ),
+        ];
+        for (name, env, want) in cases {
+            let (gate, backend) = (CountingGate::new(true), RecordingBackend::signing());
+            let (payload, entry) = run_sign(&env, &SignPolicy::default(), &gate, &backend).await;
+            match want {
+                Signed(flags) => {
+                    assert_eq!(payload["format"], "ssh-ed25519", "{name}: {payload}");
+                    assert_eq!(gate.calls(), 1, "{name}");
+                    let calls = backend.calls();
+                    assert_eq!(calls.len(), 1, "{name}");
+                    assert_eq!(calls[0].2, flags, "{name}");
+                    assert_eq!(entry.result, "ok", "{name}");
+                    assert_eq!(entry.approval, "approve-all", "{name}");
+                }
+                Refused(class, error, code) => {
+                    assert_eq!(
+                        payload,
+                        serde_json::json!({"error": error, "code": code}),
+                        "{name}"
+                    );
+                    assert_eq!(gate.calls(), 0, "{name}: the gate was asked");
+                    assert!(backend.calls().is_empty(), "{name}: the backend was asked");
+                    assert_eq!(
+                        (
+                            entry.result.as_str(),
+                            entry.code.as_str(),
+                            entry.reason.as_str(),
+                            entry.approval.as_str()
+                        ),
+                        ("refused", "SIGN_REFUSED", class.as_str(), "none"),
+                        "{name}"
+                    );
+                    assert!(!entry.detail.is_empty(), "{name}: no detail");
+                }
+            }
+        }
+    }
+
+    /// A declined request whose reply the shed server then refuses: the line becomes
+    /// `undelivered`, keeps its code and detail, and its class stays at the front of
+    /// the reason.
+    #[tokio::test]
+    async fn a_refusal_whose_reply_the_server_refuses_keeps_its_class_first() {
+        let srv = ScriptedServer::spawn(
+            vec![Answer(403, vec![], not_bound_body("desk"))],
+            Answer(204, vec![], String::new()),
+        )
+        .await;
+        let audit = Arc::new(CollectingAudit::default());
+        let gate = CountingGate::new(true);
+        let handlers = test_handlers(gate.clone(), audit.clone(), empty_backend());
+        let key = fixed_ed25519_pub();
+        let env = sign_env(
+            &b64(&key),
+            &b64(&login_as(b"root", &key, b"ssh-ed25519")),
+            0,
+        );
+        handle_bus_message(
+            &open_client(&srv.url()),
+            "ssh-agent",
+            &env,
+            &never_shutdown(),
+            &handlers,
+        )
+        .await;
+        assert_eq!(gate.calls(), 0);
+        assert_eq!(
+            *audit.entries.lock().unwrap(),
+            vec![AuditEntry {
+                shed: "web".into(),
+                ns: "ssh-agent".into(),
+                op: "sign".into(),
+                result: "undelivered".into(),
+                detail: "login user=root".into(),
+                code: "SIGN_REFUSED".into(),
+                reason: "username_not_allowed; result refused, but the server refused the \
+                         response (status 403 SOURCE_NOT_BOUND)"
+                    .into(),
+                approval: "none".into(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    /// A host-bound login recorded from a real OpenSSH client
+    /// (`fixtures/sign_check/vectors.json`) is signed through the whole bus path:
+    /// dispatch, the check, the gate once, the backend with exactly the recorded
+    /// buffers and flags, the signature POSTed back, and an ok line.
+    #[tokio::test]
+    async fn a_recorded_host_bound_login_is_signed_through_the_bus() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/sign_check/vectors.json")).unwrap();
+        let v = vectors["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| {
+                v["shape"] == "login"
+                    && v["expect"] == "accept"
+                    && v["user_key"] == "ed25519"
+                    && v["client"]
+                        .as_str()
+                        .unwrap()
+                        .contains("PubkeyAuthentication=host-bound")
+            })
+            .expect("a recorded host-bound ed25519 login");
+        let key = b64_decode(v["public_key_b64"].as_str().unwrap());
+        let data = b64_decode(v["data_b64"].as_str().unwrap());
+        let flags = v["flags"].as_u64().unwrap() as u32;
+        // It really is the host-bound method.
+        assert!(data
+            .windows(b"publickey-hostbound-v00@openssh.com".len())
+            .any(|w| w == b"publickey-hostbound-v00@openssh.com"));
+
+        let server = MockServer::start_async().await;
+        let respond = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/plugins/listeners/ssh-agent/respond")
+                    .body_contains("\"in_reply_to\":\"sign-1\"")
+                    .body_contains("\"format\":\"ssh-ed25519\"");
+                t.status(204);
+            })
+            .await;
+        let audit = Arc::new(CollectingAudit::default());
+        let gate = CountingGate::new(true);
+        let backend = RecordingBackend::signing();
+        let handlers = test_handlers(gate.clone(), audit.clone(), backend.clone());
+        let env = sign_env(
+            v["public_key_b64"].as_str().unwrap(),
+            v["data_b64"].as_str().unwrap(),
+            flags,
+        );
+        handle_bus_message(
+            &open_client(&server.base_url()),
+            "ssh-agent",
+            &env,
+            &never_shutdown(),
+            &handlers,
+        )
+        .await;
+        respond.assert_async().await;
+        assert_eq!(gate.calls(), 1);
+        assert_eq!(backend.calls(), vec![(key, data, flags)]);
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            (
+                entries[0].result.as_str(),
+                entries[0].detail.as_str(),
+                entries[0].reason.as_str()
+            ),
+            ("ok", "ssh-ed25519", "")
+        );
+    }
+
+    fn b64_decode(s: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
     }
 
     #[tokio::test]
@@ -4826,6 +6593,8 @@ mod tests {
             gate: deny_gate(), // ssh gate: deny-all
             audit: noop_audit(),
             backend: empty_backend(),
+            sign_policy: Arc::new(SignPolicy::default()),
+            refusal_audits: Arc::new(RefusalAuditLimiter::default()),
             server_name: String::new(),
             aws: Some(AwsHandlers {
                 backend: FakeAwsBackend::creds_ok(creds(None)), // aws gate: approve-all
@@ -4883,7 +6652,7 @@ mod tests {
         dispatch_bus_message(
             &ssh_client,
             "ssh-agent",
-            &sign_env(&b64(&fixed_ed25519_pub()), &b64(b"data"), 0),
+            &sign_env(&b64(&fixed_ed25519_pub()), &b64(&git_login()), 0),
             &never_shutdown(),
             &handlers,
         )
@@ -5321,6 +7090,8 @@ mod tests {
             gate: deny_gate(), // ssh gate: deny-all
             audit: noop_audit(),
             backend: empty_backend(),
+            sign_policy: Arc::new(SignPolicy::default()),
+            refusal_audits: Arc::new(RefusalAuditLimiter::default()),
             server_name: String::new(),
             aws: None,
             docker: Some(DockerHandlers {

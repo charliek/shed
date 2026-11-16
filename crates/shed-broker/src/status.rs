@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{HostAgentConfig, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT};
 use crate::machine::MachineIdentity;
+use crate::sign_check::SignPolicy;
 use crate::sockets::desktop_socket_path;
+use crate::ssh_backend::OfferCount;
 
 /// The version of the LiveStatus JSON contract. Bumped only on a breaking change;
 /// additive fields do not bump it. A mismatch is a hard reject in the client.
@@ -48,6 +50,41 @@ pub struct LiveStatus {
     /// Why there is no [`Self::machine`]; empty when there is one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub machine_error: String,
+    /// What this machine signs for a shed (plan 035 §3.5). Additive (schema stays 1):
+    /// absent from an older daemon's snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshSigningStatus>,
+}
+
+/// The `ssh` block of [`LiveStatus`] and of the desktop's `broker.status`: the SSH
+/// backend's mode, the usernames a login may be signed for (`ssh.allow_users`), whether
+/// an `ssh.offer_keys` filter is set, and — once a listing has happened — how many keys
+/// the last listing offered to sheds of how many the backend had. The counts are absent
+/// until then: the daemon lists local keys at start-up, but never asks a forwarded agent
+/// until a shed asks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshSigningStatus {
+    pub mode: String,
+    pub allow_users: Vec<String>,
+    pub key_filter: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys_offered: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys_available: Option<usize>,
+}
+
+impl SshSigningStatus {
+    /// The block for a backend in `mode` under `policy`, with the last listing's
+    /// `counts` (`None` before any).
+    pub fn new(mode: &str, policy: &SignPolicy, counts: Option<OfferCount>) -> SshSigningStatus {
+        SshSigningStatus {
+            mode: mode.to_string(),
+            allow_users: policy.allow_users().to_vec(),
+            key_filter: policy.offer_keys().is_some(),
+            keys_offered: counts.map(|c| c.offered),
+            keys_available: counts.map(|c| c.available),
+        }
+    }
 }
 
 /// `ApprovalChannelStatus` describes the approval-channel socket and its current
@@ -108,7 +145,8 @@ pub struct ActiveSource {
 /// `servers` is the supervisor's per-server connection snapshot (`Supervisor::health()`),
 /// populated in BOTH modes (single-server shows one entry, `name:""`). `machine` is the
 /// identity loaded at start ([`crate::machine::load_or_create`]) or the reason there is
-/// none.
+/// none. `ssh` is the signing block ([`SshSigningStatus`]).
+#[allow(clippy::too_many_arguments)]
 pub fn build_live_status(
     cfg: &HostAgentConfig,
     config_path: &str,
@@ -117,6 +155,7 @@ pub fn build_live_status(
     consumer: Option<(String, String)>,
     servers: Vec<ServerHealth>,
     machine: &Result<MachineIdentity, String>,
+    ssh: Option<SshSigningStatus>,
 ) -> LiveStatus {
     // Keyed by the fixed status/gate namespace order; the BTreeMap re-sorts on
     // insert, so the emitted JSON key order is identical regardless.
@@ -152,6 +191,7 @@ pub fn build_live_status(
         servers,
         machine,
         machine_error,
+        ssh,
     }
 }
 
@@ -441,6 +481,7 @@ mod tests {
             }],
             machine: None,
             machine_error: String::new(),
+            ssh: None,
         }
     }
 
@@ -490,6 +531,7 @@ mod tests {
             servers: vec![],
             machine: None,
             machine_error: String::new(),
+            ssh: None,
         };
         let compact = serde_json::to_string(&ls).unwrap();
         assert!(!compact.contains("gate_namespaces"), "{compact}");
@@ -529,6 +571,7 @@ mod tests {
             servers: vec![],
             machine: None,
             machine_error: String::new(),
+            ssh: None,
         };
         let mut v: serde_json::Value = serde_json::to_value(&ls).unwrap();
         v.as_object_mut().unwrap().insert(
@@ -571,15 +614,95 @@ mod tests {
             id: "0123456789abcdef0123456789abcdef".into(),
             name: "laptop".into(),
         };
-        let ok = build_live_status(&cfg, "/c", "", "v", None, vec![], &Ok(identity.clone()));
+        let ok = build_live_status(
+            &cfg,
+            "/c",
+            "",
+            "v",
+            None,
+            vec![],
+            &Ok(identity.clone()),
+            None,
+        );
         assert_eq!(ok.machine, Some(identity));
         assert_eq!(ok.machine_error, "");
 
-        let err = build_live_status(&cfg, "/c", "", "v", None, vec![], &Err("no way".into()));
+        let err = build_live_status(
+            &cfg,
+            "/c",
+            "",
+            "v",
+            None,
+            vec![],
+            &Err("no way".into()),
+            None,
+        );
         assert_eq!(err.machine, None);
         assert_eq!(err.machine_error, "no way");
         let v = serde_json::to_value(&err).unwrap();
         assert!(v.get("machine").is_none());
         assert_eq!(v["machine_error"], "no way");
+    }
+
+    /// The ssh signing block is additive under schema 1: an older snapshot (no `ssh`)
+    /// still decodes; a new one round-trips; the counts are omitted until a listing has
+    /// happened, and present (zeros included) after one.
+    #[test]
+    fn ssh_block_is_additive_and_round_trips() {
+        let old = sample_status();
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("\"ssh\""), "{json}");
+        let back: LiveStatus = serde_json::from_str(&json).expect("old snapshot decodes");
+        assert_eq!(back.ssh, None);
+
+        let policy = SignPolicy::default();
+        let mut ls = sample_status();
+        ls.ssh = Some(SshSigningStatus::new("agent-forward", &policy, None));
+        let v = serde_json::to_value(&ls).unwrap();
+        assert_eq!(
+            v["ssh"],
+            serde_json::json!({"mode": "agent-forward", "allow_users": ["git"], "key_filter": false})
+        );
+        let back: LiveStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ls);
+
+        let mut filter = crate::sign_check::KeyFilter::new();
+        filter.insert_key_blob(b"k");
+        let policy = SignPolicy::new(["git", "deploy"], Some(filter));
+        let counts = OfferCount {
+            offered: 0,
+            available: 3,
+        };
+        ls.ssh = Some(SshSigningStatus::new("local-keys", &policy, Some(counts)));
+        let v = serde_json::to_value(&ls).unwrap();
+        assert_eq!(
+            v["ssh"],
+            serde_json::json!({
+                "mode": "local-keys",
+                "allow_users": ["git", "deploy"],
+                "key_filter": true,
+                "keys_offered": 0,
+                "keys_available": 3,
+            })
+        );
+        let back: LiveStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ls);
+    }
+
+    #[test]
+    fn build_live_status_carries_the_ssh_block() {
+        let cfg = HostAgentConfig::parse("");
+        let ssh = SshSigningStatus::new("local-keys", &cfg.ssh_sign_policy(), None);
+        let ls = build_live_status(
+            &cfg,
+            "/c",
+            "",
+            "v",
+            None,
+            vec![],
+            &Err("x".into()),
+            Some(ssh.clone()),
+        );
+        assert_eq!(ls.ssh, Some(ssh));
     }
 }

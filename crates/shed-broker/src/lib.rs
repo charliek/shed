@@ -91,7 +91,9 @@ pub use credstore::CredStore;
 pub use discovery::{load_discovered_servers, ServerTarget};
 pub use machine::MachineIdentity;
 pub use sockets::{connect_unix_timeout, desktop_socket_path, socket_is_live, status_socket_path};
-pub use status::{build_live_status, ActiveSource, LiveStatus, NamespaceHealth, ServerHealth};
+pub use status::{
+    build_live_status, ActiveSource, LiveStatus, NamespaceHealth, ServerHealth, SshSigningStatus,
+};
 pub use supervisor::{SharedDeps, Supervisor};
 
 /// Serialize the tests that mutate process-global environment variables (Rust runs

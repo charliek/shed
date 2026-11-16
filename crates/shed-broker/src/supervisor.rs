@@ -29,6 +29,7 @@ use crate::bus::{
 use crate::discovery::ServerTarget;
 use crate::machine::MachineIdentity;
 use crate::minter::{CredentialSource, Minter};
+use crate::sign_check::SignPolicy;
 use crate::ssh_backend::SshBackend;
 use crate::status::{NamespaceHealth, ServerHealth};
 
@@ -79,6 +80,10 @@ impl TokenProvider for Arc<CredentialSource> {
 pub struct SharedDeps {
     pub ssh_backend: Arc<dyn SshBackend>,
     pub ssh_gate: Arc<dyn ApprovalGate>,
+    /// What this machine signs for a shed (plan 035 §3.5): every `sign` request is checked
+    /// against it before the approval gate. Built once from
+    /// [`crate::config::HostAgentConfig::ssh_sign_policy`] at start, by both hosts.
+    pub ssh_sign_policy: Arc<SignPolicy>,
     pub aws: Option<AwsHandlers>,
     pub docker: Option<DockerHandlers>,
     pub audit: Arc<dyn AuditSink>,
@@ -271,6 +276,12 @@ impl Supervisor {
         self.deps.ssh_backend.clone()
     }
 
+    /// The signing policy every group this supervisor starts checks `sign` requests
+    /// against (so a host can check which policy it installed).
+    pub fn ssh_sign_policy(&self) -> Arc<SignPolicy> {
+        self.deps.ssh_sign_policy.clone()
+    }
+
     /// The running daemon's per-server connection snapshot for `status`: each watched
     /// server with its per-namespace subscription state (incl. the 409 `Rejected`
     /// terminal), sorted by name (mirror Go's `Health`). The lock is released before
@@ -420,6 +431,7 @@ mod tests {
         SharedDeps {
             ssh_backend: Arc::new(NoopSshBackend),
             ssh_gate: Arc::new(crate::approval::DenyAllGate),
+            ssh_sign_policy: Arc::new(SignPolicy::default()),
             aws: None,
             docker: None,
             audit: Arc::new(NoopAuditSink),

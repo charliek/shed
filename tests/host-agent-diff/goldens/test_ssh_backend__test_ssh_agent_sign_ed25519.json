@@ -5,7 +5,7 @@
     "in_reply_to": "ed-1",
     "namespace": "ssh-agent",
     "payload": {
-      "blob": "tdXR3UG+f19oEjGP3qLCS3RYIaka9+WmoNoEQvBOWgzVbUZ1/OGk4rcq0terXqrdMvXwB7NfIMI8OvJMmnyACw==",
+      "blob": "6lRG1fs7BQ0Aw0o0eq8T5QYDCjUI9n0LjOSHpCd9VjavlQGEoc3NTaL5zolLah5mQJTtBYf5wRNGa1W7XN71Aw==",
       "format": "ssh-ed25519",
       "rest": ""
     },
@@ -19,7 +19,7 @@
   },
   "transcript": [
     {
-      "data_b64": "c2hlZC1ob3N0LWFnZW50IHNzaC1iYWNrZW5kIGRpZmZlcmVudGlhbCBjaGFsbGVuZ2UgdjE=",
+      "data_b64": "AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fMgAAAANnaXQAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAAAtzc2gtZWQyNTUxOQAAADMAAAALc3NoLWVkMjU1MTkAAAAgsx2s8/Q0ux+Ctzwkhro5ZfWqGDJ9b9TAlNJd1G5Swkk=",
       "flags": 0,
       "key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAILMdrPP0NLsfgrc8JIa6OWX1qhgyfW/UwJTSXdRuUsJJ",
       "type": 13

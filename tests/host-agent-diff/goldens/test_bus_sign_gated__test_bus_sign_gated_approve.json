@@ -40,7 +40,7 @@
     "in_reply_to": "sign-1",
     "namespace": "ssh-agent",
     "payload": {
-      "blob": "r5+/n2R3osYEEdZqWq+BBYbMDKAHG7ISLrEb5t7AirSoQwaE9s2t2p3/SICRw2+hEUWwf+9Lnt+asgFR21PYDQ==",
+      "blob": "6lRG1fs7BQ0Aw0o0eq8T5QYDCjUI9n0LjOSHpCd9VjavlQGEoc3NTaL5zolLah5mQJTtBYf5wRNGa1W7XN71Aw==",
       "format": "ssh-ed25519",
       "rest": ""
     },
