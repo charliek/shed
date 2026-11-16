@@ -144,6 +144,22 @@ func (b *recBackend) StopShed(ctx context.Context, name string) (*config.Shed, e
 	return nil, b.act(ctx, "StopShed", name)
 }
 
+// AssignUser applies the assignment rule to the shed it holds, as a real
+// backend does under its lock, and records the user.
+func (b *recBackend) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
+	sh, err := b.checked(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := CheckAssignable(&sh, req); err != nil {
+		return nil, err
+	}
+	sh.User = req.User
+	b.put(sh)
+	b.record(ctx, "AssignUser")
+	return &sh, nil
+}
+
 func (b *recBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	return nil, b.act(ctx, "ResetShed", name)
 }
@@ -308,6 +324,13 @@ func guardCases() map[string]guardCase {
 		"StartShed":  shed(ActionEnter, func(g *Guard, ctx context.Context) error { _, err := g.StartShed(ctx, "box"); return err }),
 		"StopShed":   shed(ActionManage, func(g *Guard, ctx context.Context) error { _, err := g.StopShed(ctx, "box"); return err }),
 		"ResetShed":  shed(ActionEnter, func(g *Guard, ctx context.Context) error { _, err := g.ResetShed(ctx, "box"); return err }),
+		// On "legacy", a shed with no user, put in place by the call itself
+		// (alice's "box" already has a user and cannot be assigned).
+		"AssignUser": {kind: "admin", call: func(g *Guard, ctx context.Context) error {
+			g.inner.(*recBackend).put(config.Shed{Name: "legacy", CreatedAt: t0, Mounts: config.SelectedMounts(nil)})
+			_, err := g.AssignUser(ctx, "legacy", config.AssignShedRequest{User: "bob"})
+			return err
+		}},
 		"ListSessions": shed(ActionEnter, func(g *Guard, ctx context.Context) error {
 			_, err := g.ListSessions(ctx, "box")
 			return err

@@ -241,6 +241,8 @@ func (s *Server) Router() chi.Router {
 				r.Delete("/", s.handleDeleteShed)
 				r.Post("/start", s.handleStartShed)
 				r.Post("/stop", s.handleStopShed)
+				// Give a shed with no user to a user (admin only).
+				r.Post("/assign", s.handleAssignShed)
 				r.With(s.requireCapability("reset", capReset)).Post("/reset", s.handleResetShed)
 
 				// HTTPS exec: one command, NDJSON output (control scope

@@ -68,6 +68,27 @@ func loadSnapshot(snapshotsDir, name string) (*config.Snapshot, error) {
 }
 
 func saveSnapshot(snapshotsDir string, snap *config.Snapshot) error {
+	snap.Version = config.SnapshotSchemaVersion
+	return writeSnapshot(snapshotsDir, snap)
+}
+
+// writeSnapshot writes snap's snapshot.json as it is, its schema version
+// included (saveSnapshot sets the current one first).
+func writeSnapshot(snapshotsDir string, snap *config.Snapshot) error {
+	return writeSnapshotFile(snapshotsDir, snap, false)
+}
+
+// writeSnapshotDurable is writeSnapshot that returns only once the new
+// snapshot.json survives a crash or a power loss: the file is synced before
+// the rename and the snapshot's directory after it. It is for a write that
+// must never be lost once acknowledged (stamping the snapshot with a user).
+// An error after the rename (the directory sync) leaves the new file in
+// place, perhaps not durable; the caller treats it as not written.
+func writeSnapshotDurable(snapshotsDir string, snap *config.Snapshot) error {
+	return writeSnapshotFile(snapshotsDir, snap, true)
+}
+
+func writeSnapshotFile(snapshotsDir string, snap *config.Snapshot, durable bool) error {
 	if err := config.ValidateSnapshotName(snap.Name); err != nil {
 		return err
 	}
@@ -76,8 +97,6 @@ func saveSnapshot(snapshotsDir string, snap *config.Snapshot) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("failed to create snapshot directory: %w", err)
 	}
-
-	snap.Version = config.SnapshotSchemaVersion
 
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -96,6 +115,13 @@ func saveSnapshot(snapshotsDir string, snap *config.Snapshot) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to write snapshot metadata: %w", err)
 	}
+	if durable {
+		if err := metadataFileSync(tmpFile); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to sync snapshot metadata: %w", err)
+		}
+	}
 	if err := tmpFile.Close(); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to close temp snapshot file: %w", err)
@@ -103,6 +129,11 @@ func saveSnapshot(snapshotsDir string, snap *config.Snapshot) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to rename snapshot metadata: %w", err)
+	}
+	if durable {
+		if err := metadataDirSync(dir); err != nil {
+			return fmt.Errorf("failed to sync the snapshot directory: %w", err)
+		}
 	}
 	return nil
 }

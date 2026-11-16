@@ -113,6 +113,7 @@ func Run(t *testing.T, h Harness) {
 		{"stop and start", testStopStart},
 		{"labels", testLabels},
 		{"user label", testUserLabel},
+		{"claim label", testClaimLabel},
 		{"metadata", testMetadata},
 		{"destroy", testDestroy},
 		{"missing instance", testMissing},
@@ -838,4 +839,35 @@ func refs(insts []provider.Instance) []provider.Ref {
 		out = append(out, i.Ref)
 	}
 	return out
+}
+
+// testClaimLabel: ClaimLabel writes a label that is empty, accepts one that
+// already has the value without a change, and refuses one that holds another
+// value with ErrLabelTaken, writing nothing. The labels that identify an
+// instance cannot be claimed.
+func testClaimLabel(t *testing.T, h Harness) {
+	p, _ := h.New(t)
+	ctx := h.ctx(t)
+	_, inst := mustCreate(t, h, p, "theta")
+	ref := inst.Ref
+	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "bob"); err != nil {
+		t.Fatalf("ClaimLabel(empty): %v", err)
+	}
+	if got, _ := p.Get(ctx, ref); got.Labels[provider.LabelUser] != "bob" || got.Labels[provider.LabelName] != "theta" {
+		t.Errorf("after ClaimLabel: %v", got.Labels)
+	}
+	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "bob"); err != nil {
+		t.Errorf("ClaimLabel(same): %v", err)
+	}
+	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "alice"); !errors.Is(err, provider.ErrLabelTaken) {
+		t.Errorf("ClaimLabel(other) = %v, want ErrLabelTaken", err)
+	}
+	if got, _ := p.Get(ctx, ref); got.Labels[provider.LabelUser] != "bob" {
+		t.Errorf("user = %q after a refused claim, want bob", got.Labels[provider.LabelUser])
+	}
+	for _, k := range []string{provider.LabelSchema, provider.LabelEnv, provider.LabelID} {
+		if err := p.ClaimLabel(ctx, ref, k, "changed1"); !errors.Is(err, provider.ErrInvalid) {
+			t.Errorf("ClaimLabel(%s) = %v, want ErrInvalid", k, err)
+		}
+	}
 }

@@ -197,6 +197,28 @@ func LoadMetadata(instanceDir, name string) (*Metadata, error) {
 // It writes to a temporary file and renames, which is atomic on Linux ext4
 // when source and dest are in the same directory.
 func (m *Metadata) Save(instanceDir string) error {
+	return m.save(instanceDir, false)
+}
+
+// SaveDurable is Save that returns only once the new metadata survives a
+// crash or a power loss: the file is synced before the rename and its
+// directory after it. It is for the writes that must never be lost once
+// acknowledged (an assignment of the shed to a user), not for the general
+// path (create, start, stop), which stays unsynced. An error after the rename
+// (the directory sync) leaves the new metadata in place, perhaps not durable;
+// the caller treats it as not written.
+func (m *Metadata) SaveDurable(instanceDir string) error {
+	return m.save(instanceDir, true)
+}
+
+// metadataFileSync and metadataDirSync are the syncs SaveDurable makes (tests
+// make them fail).
+var (
+	metadataFileSync = func(f *os.File) error { return f.Sync() }
+	metadataDirSync  = syncDir
+)
+
+func (m *Metadata) save(instanceDir string, durable bool) error {
 	if err := validateInstanceName(m.Name); err != nil {
 		return err
 	}
@@ -225,6 +247,13 @@ func (m *Metadata) Save(instanceDir string) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to write metadata: %w", err)
 	}
+	if durable {
+		if err := metadataFileSync(tmpFile); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to sync metadata: %w", err)
+		}
+	}
 	if err := tmpFile.Close(); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to close temp metadata file: %w", err)
@@ -233,6 +262,11 @@ func (m *Metadata) Save(instanceDir string) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to rename metadata: %w", err)
+	}
+	if durable {
+		if err := metadataDirSync(dir); err != nil {
+			return fmt.Errorf("failed to sync the metadata directory: %w", err)
+		}
 	}
 
 	return nil

@@ -18,6 +18,12 @@ import (
 // Compile-time check that VZBackend implements backend.Backend.
 var _ backend.Backend = (*VZBackend)(nil)
 
+// Compile-time check that VZBackend stamps snapshots for the start-up pass.
+var _ backend.SnapshotStamper = (*VZBackend)(nil)
+
+// Compile-time check that VZBackend counts the records its listing skips.
+var _ backend.CountingLister = (*VZBackend)(nil)
+
 // VZBackend implements backend.Backend using Apple Virtualization.framework VMs via vfkit.
 type VZBackend struct {
 	client *Client
@@ -62,6 +68,12 @@ func (b *VZBackend) ListSheds(ctx context.Context) ([]config.Shed, error) {
 	return b.client.ListSheds(ctx)
 }
 
+// ListShedsCounting is ListSheds that also says how many shed records it
+// could not read and left out (see backend.CountingLister).
+func (b *VZBackend) ListShedsCounting(ctx context.Context) ([]config.Shed, int, error) {
+	return b.client.listSheds(ctx)
+}
+
 // DeleteShed removes a shed (destroy semantics — see backend.DeleteShed).
 func (b *VZBackend) DeleteShed(ctx context.Context, name string) error {
 	return b.client.DeleteShed(ctx, name)
@@ -75,6 +87,17 @@ func (b *VZBackend) StartShed(ctx context.Context, name string) (*config.Shed, e
 // StopShed stops a running shed.
 func (b *VZBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	return b.client.StopShed(ctx, name)
+}
+
+// AssignUser gives a shed with no user and no service client to a user.
+func (b *VZBackend) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
+	return b.client.AssignUser(ctx, name, req)
+}
+
+// StampSnapshotUser records the user of a snapshot with none (the start-up
+// pass of a server with one user; see backend.SnapshotStamper).
+func (b *VZBackend) StampSnapshotUser(ctx context.Context, name, user string) (*config.Snapshot, error) {
+	return b.client.StampSnapshotUser(ctx, name, user)
 }
 
 // ResetShed wipes and recreates a stopped shed's writable upper layer.

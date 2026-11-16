@@ -89,6 +89,11 @@ func (b *VZBackend) StopShed(ctx context.Context, name string) (*config.Shed, er
 	return nil, errNonDarwin
 }
 
+// AssignUser returns an error on this platform.
+func (b *VZBackend) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
+	return nil, errNonDarwin
+}
+
 // ResetShed returns an error on non-darwin platforms.
 func (b *VZBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	return nil, errNonDarwin

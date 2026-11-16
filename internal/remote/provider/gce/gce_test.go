@@ -615,6 +615,39 @@ func TestFingerprintRetry(t *testing.T) {
 	}
 }
 
+// TestClaimLabelRechecksOnEveryAttempt: another writer sets shed_user after
+// ClaimLabel read the instance and before its write lands. The cloud refuses
+// the write (the fingerprint changed); the next attempt reads the instance
+// again, finds the other value and refuses with ErrLabelTaken, writing
+// nothing. A plain retry would have overwritten it.
+func TestClaimLabelRechecksOnEveryAttempt(t *testing.T) {
+	f := newFakeCompute(t)
+	c := testClient(t, f)
+	ctx := context.Background()
+	ref := seedMine(f, "claim", "RUNNING")
+	raced := false
+	f.beforeSetLabels = func(in *fInst) {
+		if raced {
+			return
+		}
+		raced = true
+		in.labels[provider.LabelUser] = "alice"
+		in.labelFP = f.fingerprint()
+	}
+	if err := c.ClaimLabel(ctx, ref, provider.LabelUser, "bob"); !errors.Is(err, provider.ErrLabelTaken) {
+		t.Fatalf("ClaimLabel after another writer = %v, want ErrLabelTaken", err)
+	}
+	if !raced {
+		t.Fatal("the other writer never ran")
+	}
+	if v := f.instance(mustName(ref)).labels[provider.LabelUser]; v != "alice" {
+		t.Errorf("shed_user = %q, want alice", v)
+	}
+	if n := len(f.requestsFor("POST", `/setLabels$`)); n != 1 {
+		t.Errorf("setLabels calls = %d, want 1 (the one the cloud refused)", n)
+	}
+}
+
 func TestImages(t *testing.T) {
 	f := newFakeCompute(t)
 	addImages(f)

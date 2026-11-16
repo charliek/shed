@@ -94,6 +94,11 @@ func (b *FirecrackerBackend) StopShed(ctx context.Context, name string) (*config
 	return nil, errNonLinux()
 }
 
+// AssignUser returns an error on this platform.
+func (b *FirecrackerBackend) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
+	return nil, errNonLinux()
+}
+
 // ResetShed returns an error on non-linux platforms.
 func (b *FirecrackerBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	return nil, errNonLinux()

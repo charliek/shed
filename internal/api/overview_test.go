@@ -48,6 +48,10 @@ func (f *overviewFakeBackend) StartShed(_ context.Context, name string) (*config
 func (f *overviewFakeBackend) StopShed(_ context.Context, name string) (*config.Shed, error) {
 	return &config.Shed{Name: name, Status: config.StatusStopped}, nil
 }
+func (f *overviewFakeBackend) AssignUser(_ context.Context, _ string, _ config.AssignShedRequest) (*config.Shed, error) {
+	return nil, config.ErrShedNotFoundSentinel
+}
+
 func (f *overviewFakeBackend) ResetShed(_ context.Context, name string) (*config.Shed, error) {
 	return &config.Shed{Name: name, Status: config.StatusStopped}, nil
 }

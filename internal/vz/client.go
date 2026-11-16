@@ -523,22 +523,34 @@ func (c *Client) recordStaleStopped(name string, seen *Metadata, held bool) {
 
 // ListSheds returns all sheds.
 func (c *Client) ListSheds(ctx context.Context) ([]config.Shed, error) {
+	sheds, _, err := c.listSheds(ctx)
+	return sheds, err
+}
+
+// listSheds returns all sheds it can read, and how many shed records it
+// could not read and skipped (each is logged; a shed deleted since the
+// directory was read is not counted).
+func (c *Client) listSheds(ctx context.Context) ([]config.Shed, int, error) {
 	names, err := ListInstances(c.cfg.InstanceDir)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var sheds []config.Shed
+	skipped := 0
 	for _, name := range names {
 		shed, err := c.GetShed(ctx, name)
 		if err != nil {
 			log.Printf("Warning: skipping invalid shed %q: %v", name, err)
+			if !errors.Is(err, config.ErrShedNotFoundSentinel) {
+				skipped++ // not one deleted since the directory was read
+			}
 			continue
 		}
 		sheds = append(sheds, *shed)
 	}
 
-	return sheds, nil
+	return sheds, skipped, nil
 }
 
 // DeleteShed removes a shed.

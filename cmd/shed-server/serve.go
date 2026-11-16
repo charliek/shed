@@ -300,6 +300,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 		startNetPolicy(netPolicyCtx)
 	}
 
+	// Sheds made before the server had a user list get their user (on a
+	// server with one user) before anyone can reach them. A local backend's
+	// pass runs before the resume walk, so a running shed's message channel
+	// starts with its new user; the remote backend's runs once its first
+	// cloud list has rebuilt its records, and moves the bus routes it
+	// resumed.
+	if waitBackendReady == nil {
+		stampUnassigned(cfg, be)
+	}
 	resumeCtx, cancelResume := context.WithCancel(context.Background())
 	defer cancelResume()
 	log.Printf("Resuming message channels for already-running sheds in the background")
@@ -314,6 +323,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+		stampUnassigned(cfg, be)
 	}
 
 	// Optional egress-control proxy child, started only when enabled. A start
@@ -628,6 +638,67 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	log.Printf("Shutdown complete")
 	return nil
+}
+
+// upgradePassTimeout bounds the start-up pass over sheds with no user. On the
+// remote backend each stamp is a cloud label write; one that does not finish
+// in time is logged and tried again at the next start.
+const upgradePassTimeout = 2 * time.Minute
+
+// stampUnassigned runs the start-up pass over sheds and snapshots made before
+// the server had a user list (backend.StampUnassigned) on the raw backend, as
+// a one-time upgrade step recorded by a marker in the server's state
+// directory (backend.OpenUsersUpgrade). With no user list it stamps nothing
+// and removes the marker. On the first start with a user list, with exactly
+// one user, it gives them every shed and snapshot with no user (and logs
+// each); with several it stamps nothing; either way the marker is written
+// once the pass has finished without a failure, and a pass that did not
+// finish runs again at the next start. On every later start nothing is
+// stamped. It logs how many sheds it found with no user, naming them when
+// log_level is debug. The returned UsersUpgrade carries the "first start
+// with a user list" decision for the other one-time steps of adding one.
+func stampUnassigned(cfg *config.ServerConfig, be backend.Backend) (backend.UpgradeReport, *backend.UsersUpgrade) {
+	return stampUnassignedIn(cfg, be, serverStateDir(cfg))
+}
+
+// stampUnassignedIn is stampUnassigned with the marker in stateDir.
+func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir string) (backend.UpgradeReport, *backend.UsersUpgrade) {
+	users := upgradeUsers(cfg)
+	upgrade := backend.OpenUsersUpgrade(stateDir, len(users) > 0, log.Printf)
+	ctx, cancel := context.WithTimeout(context.Background(), upgradePassTimeout)
+	defer cancel()
+	debugf := func(string, ...any) {}
+	if cfg.LogLevel == "debug" {
+		debugf = func(format string, args ...any) { log.Printf("DEBUG: "+format, args...) }
+	}
+	rep := backend.StampUnassigned(ctx, be, users, upgrade.FirstUserListStart(), backend.UpgradeLog{Infof: log.Printf, Debugf: debugf})
+	if upgrade.FirstUserListStart() {
+		switch {
+		case rep.Incomplete:
+			log.Printf("Users: the one-time upgrade step for the user list did not finish; it runs again at the next start")
+		default:
+			if err := upgrade.MarkDone(time.Now()); err != nil {
+				log.Printf("Users: the one-time upgrade step for the user list finished, but its marker could not be written (it runs again at the next start): %v", err)
+			} else {
+				log.Printf("Users: the one-time upgrade step for the user list is done and recorded; from now on a shed with no user is given one only by 'shed assign'")
+			}
+		}
+	}
+	return rep, upgrade
+}
+
+// upgradeUsers is the configured user list (auth.users) as the start-up pass
+// takes it, sorted by name; nil with no user list.
+func upgradeUsers(cfg *config.ServerConfig) []backend.UpgradeUser {
+	names := cfg.UserNames()
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]backend.UpgradeUser, 0, len(names))
+	for _, name := range names {
+		out = append(out, backend.UpgradeUser{Name: name, Admin: bool(cfg.Auth.Users[name].Admin)})
+	}
+	return out
 }
 
 // newPluginBridge builds the credential bus bridge over reg. It routes each

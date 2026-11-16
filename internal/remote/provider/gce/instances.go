@@ -723,6 +723,54 @@ func (c *Client) SetLabels(ctx context.Context, ref provider.Ref, labels map[str
 	}
 }
 
+// ClaimLabel implements provider.Provider. The label's current value is read
+// from the same instance read whose fingerprint the write carries, so the
+// check and the write are one: a write that another writer beat is refused by
+// the cloud (the fingerprint has changed), and the next attempt reads the
+// instance, and checks the label, again.
+func (c *Client) ClaimLabel(ctx context.Context, ref provider.Ref, key, value string) error {
+	if key == "" || !provider.ValidLabelValue(key) || key[0] < 'a' || key[0] > 'z' {
+		return provider.Errorf(provider.ErrInvalid, "claim_label", "label key %q is not valid", key)
+	}
+	switch key {
+	case provider.LabelSchema, provider.LabelEnv, provider.LabelID:
+		return provider.Errorf(provider.ErrInvalid, "claim_label", "label %s cannot be claimed", key)
+	}
+	if value == "" || !provider.ValidLabelValue(value) {
+		return provider.Errorf(provider.ErrInvalid, "claim_label", "label %s has an invalid value %q", key, value)
+	}
+	for attempt := 0; ; attempt++ {
+		zone, g, err := c.mine(ctx, "claim_label", ref)
+		if err != nil {
+			return err
+		}
+		switch cur := g.Labels[key]; cur {
+		case value:
+			return nil
+		case "":
+		default:
+			return provider.Errorf(provider.ErrLabelTaken, "claim_label", "%s has %s=%q", ref, key, cur)
+		}
+		merged := maps.Clone(g.Labels)
+		if merged == nil {
+			merged = map[string]string{}
+		}
+		merged[key] = value
+		if len(merged) > 64 {
+			return provider.Errorf(provider.ErrInvalid, "claim_label", "an instance takes at most 64 labels")
+		}
+		body := map[string]any{"labels": merged, "labelFingerprint": g.LabelFingerprint}
+		o, err := c.mutate(ctx, "claim_label", http.MethodPost, c.instancePath(zone, g.Name)+"/setLabels", nil, body)
+		if err == nil {
+			err = c.runOperation(ctx, "claim_label", o)
+		}
+		if errors.Is(err, errFingerprint) && attempt < fingerprintRetries {
+			continue
+		}
+		return err
+	}
+}
+
 // SetMetadata implements provider.Provider. Keys that do not begin "shed-"
 // are refused, and the instance's other keys (the GCE switches) are kept.
 func (c *Client) SetMetadata(ctx context.Context, ref provider.Ref, md map[string]string) error {

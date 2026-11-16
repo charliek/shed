@@ -49,6 +49,10 @@ var (
 	// cannot be set). Nothing was sent to the cloud.
 	ErrInvalid = errors.New("invalid request")
 
+	// ErrLabelTaken: ClaimLabel found the label holding another non-empty
+	// value. Nothing was changed.
+	ErrLabelTaken = errors.New("label already holds another value")
+
 	// ErrUnexpectedState: Wait saw the instance settle in a state other
 	// than the one asked for. The instance is returned alongside.
 	ErrUnexpectedState = errors.New("instance settled in an unexpected state")

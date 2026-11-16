@@ -926,6 +926,12 @@ func mapBackendError(err error) (int, string, string) {
 		return status, code, msg
 	}
 	// Check sentinel errors
+	if errors.Is(err, config.ErrShedAssignedSentinel) {
+		return http.StatusConflict, config.ErrShedAlreadyAssigned, err.Error()
+	}
+	if errors.Is(err, config.ErrShedHostResourcesSentinel) {
+		return http.StatusConflict, config.ErrShedHostResources, err.Error()
+	}
 	if errors.Is(err, config.ErrShedAlreadyExistsSentinel) {
 		return http.StatusConflict, config.ErrShedAlreadyExists, err.Error()
 	}

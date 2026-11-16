@@ -145,6 +145,27 @@ func (b *userFakeBackend) StopShed(ctx context.Context, name string) (*config.Sh
 	return b.GetShed(ctx, name)
 }
 
+// AssignUser applies the assignment rule under the fake's lock, as a real
+// backend does, to the incarnation required on its context.
+func (b *userFakeBackend) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.sheds[name]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+	}
+	if err := backend.CheckCreatedAt(ctx, name, s.CreatedAt); err != nil {
+		return nil, err
+	}
+	if err := backend.CheckAssignable(&s, req); err != nil {
+		return nil, err
+	}
+	s.User = req.User
+	b.sheds[name] = s
+	b.acted = append(b.acted, "assign "+name)
+	return &s, nil
+}
+
 func (b *userFakeBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	if err := b.act(ctx, "reset", name); err != nil {
 		return nil, err
@@ -359,6 +380,7 @@ var userRouteClasses = map[string]string{
 	"DELETE /api/sheds/{name}":                        "shed:manage",
 	"POST /api/sheds/{name}/start":                    "shed:enter",
 	"POST /api/sheds/{name}/stop":                     "shed:manage",
+	"POST /api/sheds/{name}/assign":                   "admin",
 	"POST /api/sheds/{name}/reset":                    "shed:enter",
 	"POST /api/sheds/{name}/exec":                     "shed:enter",
 	"GET /api/sheds/{name}/sessions":                  "shed:enter",
@@ -388,6 +410,8 @@ func routeRequest(route string) (method, path, body string) {
 		body = `{"name":"s2","source_shed":"box"}`
 	case "POST /api/sheds":
 		body = `{"name":"fresh"}`
+	case "POST /api/sheds/{name}/assign":
+		body = `{"user":"bob"}`
 	case "POST /api/images/tag":
 		body = `{"source":"a","target":"b"}`
 	case "POST /api/images/pull":
@@ -445,11 +469,14 @@ var userRouteAllowed = map[string]int{
 	"DELETE /api/sheds/{name}":                        http.StatusNoContent,
 	"POST /api/sheds/{name}/start":                    http.StatusOK,
 	"POST /api/sheds/{name}/stop":                     http.StatusOK,
-	"POST /api/sheds/{name}/reset":                    http.StatusOK,
-	"POST /api/sheds/{name}/exec":                     http.StatusOK,
-	"GET /api/sheds/{name}/sessions":                  http.StatusOK,
-	"DELETE /api/sheds/{name}/sessions/{session}":     http.StatusNoContent,
-	"GET /api/sheds/{name}/connect/{port}":            http.StatusServiceUnavailable,
+	// The admin passes the access rule and reaches the assignment rule:
+	// "box" is alice's already (TestAssignShedRoute assigns one with none).
+	"POST /api/sheds/{name}/assign":               http.StatusConflict,
+	"POST /api/sheds/{name}/reset":                http.StatusOK,
+	"POST /api/sheds/{name}/exec":                 http.StatusOK,
+	"GET /api/sheds/{name}/sessions":              http.StatusOK,
+	"DELETE /api/sheds/{name}/sessions/{session}": http.StatusNoContent,
+	"GET /api/sheds/{name}/connect/{port}":        http.StatusServiceUnavailable,
 }
 
 // TestUserRouteWalk walks every registered route and proves each is guarded

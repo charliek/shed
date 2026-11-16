@@ -38,6 +38,9 @@ func (routesFakeBackend) StartShed(_ context.Context, _ string) (*config.Shed, e
 func (routesFakeBackend) StopShed(_ context.Context, _ string) (*config.Shed, error) {
 	return nil, config.ErrShedNotFoundSentinel
 }
+func (routesFakeBackend) AssignUser(_ context.Context, _ string, _ config.AssignShedRequest) (*config.Shed, error) {
+	return nil, config.ErrShedNotFoundSentinel
+}
 func (routesFakeBackend) ResetShed(_ context.Context, _ string) (*config.Shed, error) {
 	return nil, config.ErrShedNotFoundSentinel
 }

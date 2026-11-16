@@ -18,6 +18,12 @@ import (
 // Compile-time check that FirecrackerBackend implements backend.Backend.
 var _ backend.Backend = (*FirecrackerBackend)(nil)
 
+// Compile-time check that FirecrackerBackend stamps snapshots for the start-up pass.
+var _ backend.SnapshotStamper = (*FirecrackerBackend)(nil)
+
+// Compile-time check that FirecrackerBackend counts the records its listing skips.
+var _ backend.CountingLister = (*FirecrackerBackend)(nil)
+
 // FirecrackerBackend implements backend.Backend using Firecracker VMs.
 type FirecrackerBackend struct {
 	client *Client
@@ -62,6 +68,12 @@ func (b *FirecrackerBackend) ListSheds(ctx context.Context) ([]config.Shed, erro
 	return b.client.ListSheds(ctx)
 }
 
+// ListShedsCounting is ListSheds that also says how many shed records it
+// could not read and left out (see backend.CountingLister).
+func (b *FirecrackerBackend) ListShedsCounting(ctx context.Context) ([]config.Shed, int, error) {
+	return b.client.listSheds(ctx)
+}
+
 // DeleteShed removes a shed (destroy semantics — see backend.DeleteShed).
 func (b *FirecrackerBackend) DeleteShed(ctx context.Context, name string) error {
 	return b.client.DeleteShed(ctx, name)
@@ -75,6 +87,17 @@ func (b *FirecrackerBackend) StartShed(ctx context.Context, name string) (*confi
 // StopShed stops a running shed.
 func (b *FirecrackerBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	return b.client.StopShed(ctx, name)
+}
+
+// AssignUser gives a shed with no user and no service client to a user.
+func (b *FirecrackerBackend) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
+	return b.client.AssignUser(ctx, name, req)
+}
+
+// StampSnapshotUser records the user of a snapshot with none (the start-up
+// pass of a server with one user; see backend.SnapshotStamper).
+func (b *FirecrackerBackend) StampSnapshotUser(ctx context.Context, name, user string) (*config.Snapshot, error) {
+	return b.client.StampSnapshotUser(ctx, name, user)
 }
 
 // ResetShed wipes and recreates a stopped shed's writable upper layer.

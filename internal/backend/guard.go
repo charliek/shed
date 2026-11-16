@@ -272,6 +272,34 @@ func (g *Guard) StopShed(ctx context.Context, name string) (*config.Shed, error)
 	return showFor(ctx)(g.inner.StopShed(bctx, name))
 }
 
+// AssignUser is admin-only. The admin is checked before the shed is looked
+// up, so a caller who is not one learns nothing about the name. The shed is
+// then bound like any (by name and incarnation, see Guard), so a shed deleted
+// and created again under the name since this lookup is not assigned. Whose
+// it is, its host resources and the target's name are decided by the backend
+// under its lock (CheckAssignable); the admin's own right lasts only for this
+// call (nothing records who assigned a shed). AllowHostResources is never
+// taken from a caller: only the server's start-up pass, on the raw backend,
+// sets it.
+func (g *Guard) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
+	p, err := principal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := AuthorizeAdmin(p, "assigning a shed to a user"); err != nil {
+		return nil, err
+	}
+	if err := ValidateAssignee(req); err != nil {
+		return nil, err
+	}
+	req.AllowHostResources = false
+	bctx, _, err := g.bind(ctx, "AssignUser", name, ActionManage)
+	if err != nil {
+		return nil, err
+	}
+	return showFor(ctx)(g.inner.AssignUser(bctx, name, req))
+}
+
 // ResetShed needs the right to enter the shed.
 func (g *Guard) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	bctx, _, err := g.bind(ctx, "ResetShed", name, ActionEnter)

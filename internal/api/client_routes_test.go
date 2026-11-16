@@ -72,6 +72,7 @@ var clientForbiddenList = []string{
 	"POST /api/plugins/listeners/{namespace}/respond",
 	"GET /api/plugins/sheds",
 	"POST /api/sheds/{name}/reset",
+	"POST /api/sheds/{name}/assign",
 	"GET /api/sheds/{name}/sessions",
 	"DELETE /api/sheds/{name}/sessions/{session}",
 	"GET /api/sheds/{name}/connect/{port}",

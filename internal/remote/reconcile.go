@@ -440,13 +440,18 @@ func (b *Backend) runBusSyncLocked(name string, s *busSync) {
 // change since makes a new epoch and another round), and only while no
 // channel start is in progress (a start reads the record before it
 // registers, so it could register the previous user; its end runs the
-// worker again).
+// worker again). Each round runs under busApplyMu, so it cannot interleave
+// with applyBusRoute; the test hook runs before it is taken.
 func (b *Backend) busSyncWorker(name string, s *busSync) {
 	defer b.wg.Done()
 	if busSyncDoneHook != nil {
 		defer busSyncDoneHook(name)
 	}
 	for {
+		if busSyncHook != nil {
+			busSyncHook(name)
+		}
+		b.busApplyMu.Lock()
 		b.mu.Lock()
 		s.again = false
 		epoch := s.epoch
@@ -458,9 +463,6 @@ func (b *Backend) busSyncWorker(name string, s *busSync) {
 		}
 		b.mu.Unlock()
 
-		if busSyncHook != nil {
-			busSyncHook(name)
-		}
 		if have && !id.Owned && b.credMgr.SetShedUser(name, id.CreatedAt, id.User) {
 			b.logf("remote: shed %s now routes credential requests as user %q", name, id.User)
 		}
@@ -468,6 +470,7 @@ func (b *Backend) busSyncWorker(name string, s *busSync) {
 		b.mu.Lock()
 		if s.again && !b.closed {
 			b.mu.Unlock()
+			b.busApplyMu.Unlock()
 			continue
 		}
 		s.running = false
@@ -478,7 +481,44 @@ func (b *Backend) busSyncWorker(name string, s *busSync) {
 			}
 		}
 		b.mu.Unlock()
+		b.busApplyMu.Unlock()
 		return
+	}
+}
+
+// applyBusRoute applies the shed name's reported user to its message channel
+// at once, in the caller's goroutine, and lifts the route hold the change
+// made, so the route is usable when it returns (AssignUser), whatever the
+// shed's bus-route worker is doing. It is one round of that worker under
+// busApplyMu: it reads the record and the newest hold's epoch, applies the
+// user, and lifts the hold only if no change has come since (its epoch is
+// still the newest) and no channel start is in progress; otherwise the
+// worker, which a change always runs again, applies the newer user after it.
+// It leaves the worker's own state (running, again) alone: a worker that
+// runs later finds the user applied and the hold gone, and only tidies up.
+// The caller holds no lock.
+func (b *Backend) applyBusRoute(name string) {
+	b.busApplyMu.Lock()
+	defer b.busApplyMu.Unlock()
+	b.mu.Lock()
+	s := b.busSyncs[name]
+	r := b.records[name]
+	if s == nil || r == nil || b.closed {
+		b.mu.Unlock()
+		return
+	}
+	epoch := s.epoch
+	id := busIdentity(r)
+	b.mu.Unlock()
+
+	if !id.Owned && b.credMgr.SetShedUser(name, id.CreatedAt, id.User) {
+		b.logf("remote: shed %s now routes credential requests as user %q", name, id.User)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.busSyncs[name] == s && s.epoch == epoch && b.busStarting[name] == 0 && !b.closed {
+		b.credMgr.ResumeShedRoute(name, epoch)
 	}
 }
 

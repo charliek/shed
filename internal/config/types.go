@@ -118,6 +118,21 @@ var (
 	// API answers 403 FORBIDDEN. A caller who may not see the thing at all
 	// gets the not-found sentinel instead.
 	ErrForbiddenSentinel = errors.New("forbidden")
+
+	// ErrShedAssignedSentinel is returned by an assignment (AssignShedRequest)
+	// of a shed that already belongs to someone: a user, a service client, or
+	// both at once (a record reported with UserUnresolved). Only a shed with
+	// no user and no service client can be assigned; a shed is never moved
+	// between users. The API answers 409 SHED_ALREADY_ASSIGNED.
+	ErrShedAssignedSentinel = errors.New("shed is already assigned")
+
+	// ErrShedHostResourcesSentinel is returned by an assignment of a shed
+	// that carries what is shared on the host (Shed.HostResources: host
+	// directories or server mounts). Giving it to a user would hand that
+	// user the host's directories and the server's credentials; an admin
+	// recreates it without them instead. The API answers 409
+	// SHED_HOST_RESOURCES.
+	ErrShedHostResourcesSentinel = errors.New("shed carries host resources")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -864,6 +879,22 @@ type SystemPruneResponse struct {
 	Servers []PruneReportOrError `json:"servers"`
 }
 
+// AssignShedRequest is the request body for POST /api/sheds/{name}/assign
+// (`shed assign <shed> <user>`): give a shed that has no user and no service
+// client to the user named User. Only an admin may; the user must be a
+// configured one. A shed that already belongs to someone is refused
+// (ErrShedAssignedSentinel), and so is one that carries host directories or
+// server mounts (ErrShedHostResourcesSentinel) unless AllowHostResources is
+// set, which only the server's own start-up pass does.
+type AssignShedRequest struct {
+	User string `json:"user"`
+	// AllowHostResources lets the assignment through for a shed that carries
+	// host directories or server mounts. Never read from the request body:
+	// only the start-up pass of a server with exactly one user, who is an
+	// admin, sets it (an admin may use those anyway).
+	AllowHostResources bool `json:"-"`
+}
+
 // CreateShedRequest is the request body for POST /api/sheds.
 type CreateShedRequest struct {
 	Name string `json:"name"`
@@ -1103,6 +1134,12 @@ const (
 	// route (a scope mismatch, or a route outside a service client's
 	// allowlist).
 	ErrForbidden = "FORBIDDEN"
+	// ErrShedAlreadyAssigned (409) means an assignment named a shed that
+	// already has a user or a service client.
+	ErrShedAlreadyAssigned = "SHED_ALREADY_ASSIGNED"
+	// ErrShedHostResources (409) means an assignment named a shed that
+	// carries host directories or server mounts.
+	ErrShedHostResources = "SHED_HOST_RESOURCES"
 	// ErrUnauthorized (401) means no valid credential was presented.
 	ErrUnauthorized = "UNAUTHORIZED"
 	// ErrInvalidNetworkProfile (400) means a create request's network is not

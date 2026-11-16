@@ -163,6 +163,16 @@ type Backend struct {
 	readyOnce sync.Once
 	sweepOnce sync.Once
 
+	// assignMu serializes AssignUser, which writes a label and then the
+	// record without holding mu across the cloud call.
+	assignMu sync.Mutex
+	// busApplyMu serializes every application of a shed's reported user to
+	// its bus route (applyBusRoute and busSyncWorker): each reads the record
+	// and the hold's epoch, applies the user and lifts the hold as one, so
+	// a stale user is never applied after a newer one. Taken before mu,
+	// never under it.
+	busApplyMu sync.Mutex
+
 	mu      sync.Mutex
 	closed  bool
 	records map[string]*state.Record // by shed name

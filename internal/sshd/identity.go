@@ -95,12 +95,16 @@ func (s *Server) guard() *backend.Guard {
 }
 
 // forbiddenMessage is what a caller who may see a shed but not enter it is
-// told, for the guard's refusal err: an admin and another user's shed, or a
-// user who is not an admin and a shed that carries host directories or server
-// mounts (backend.ErrHostResources).
+// told, for the guard's refusal err: an admin and another user's shed, an
+// admin and a shed with no user (backend.ErrUnassigned), or a user who is not
+// an admin and a shed that carries host directories or server mounts
+// (backend.ErrHostResources).
 func forbiddenMessage(name string, err error) string {
 	if errors.Is(err, backend.ErrHostResources) {
 		return fmt.Sprintf("shed '%s' carries host directories or server mounts; only an admin can enter or start it (you may still stop or delete it)", name)
+	}
+	if errors.Is(err, backend.ErrUnassigned) {
+		return fmt.Sprintf("shed '%s' has no user; nobody can enter it until an admin gives it to a user with 'shed assign %s <user>'", name, name)
 	}
 	return fmt.Sprintf("shed '%s' belongs to another user; an admin can list, stop and delete it but not enter it", name)
 }

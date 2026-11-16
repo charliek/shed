@@ -138,6 +138,12 @@ var ErrNoPrincipal = errors.New("no caller identity on the request")
 // is always wrapped together with config.ErrForbiddenSentinel.
 var ErrHostResources = errors.New("the shed carries host directories or server mounts")
 
+// ErrUnassigned marks the refusal of an admin to enter a shed that has no
+// user and no service client: one made before the server had a user list,
+// which nobody may enter until an admin assigns it (`shed assign`). It is
+// always wrapped together with config.ErrForbiddenSentinel.
+var ErrUnassigned = errors.New("the shed has no user")
+
 // Action is what a caller asks to do to a shed or a snapshot.
 type Action int
 
@@ -250,6 +256,9 @@ func AuthorizeShed(p Principal, shed *config.Shed, a Action) error {
 		return fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, shed.Name)
 	case errors.Is(err, config.ErrForbiddenSentinel) && a == ActionAdmin:
 		return fmt.Errorf("%w: only an admin can do this", config.ErrForbiddenSentinel)
+	case errors.Is(err, config.ErrForbiddenSentinel) && shed.Owner == "" && shed.User == "":
+		return fmt.Errorf("%w: %w: shed %s has no user; nobody can enter it until an admin gives it to a user with 'shed assign %s <user>'",
+			config.ErrForbiddenSentinel, ErrUnassigned, shed.Name, shed.Name)
 	case errors.Is(err, config.ErrForbiddenSentinel):
 		return fmt.Errorf("%w: shed %s belongs to another user; an admin can list, stop and delete it but not enter it", config.ErrForbiddenSentinel, shed.Name)
 	}
