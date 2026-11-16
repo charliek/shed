@@ -278,6 +278,24 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     for warning in &ssh_warnings {
         log.warn(warning);
     }
+
+    // The bus log sink — shared across every watcher group, the backend-construction
+    // warnings below, and the key filter's one-time unmatched-entry warning.
+    let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(log_file));
+
+    // The `ssh.offer_keys` key filter (plan 035 §3.5), around whichever backend
+    // resolved: sheds see and can sign with only the offered keys. Without the key it
+    // passes everything through. It asks the backend nothing itself, so the
+    // agent-forward backend still makes no start-up call.
+    let ssh_sign_policy = cfg.ssh_sign_policy();
+    let filtered_ssh = ssh_backend::with_key_filter(
+        ssh_backend,
+        ssh_sign_policy.offer_keys().cloned(),
+        Some(bus_log.clone()),
+    );
+    // Every listing records its counts in `filtered_ssh.counts()` (for the status block).
+    let ssh_backend: Arc<dyn ssh_backend::SshBackend> = filtered_ssh.clone();
+
     // Enumerate keys at startup ONLY for local-keys (a free local file read, matching
     // Go's `newLocalKeysBackend`, which logs each loaded file). For agent-forward, Go
     // NEVER probes the forwarded agent at startup — it only logs "auto-detected …
@@ -301,6 +319,9 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         ssh_backend.mode(),
         ssh_keys.len()
     ));
+    if let Some(line) = filtered_ssh.startup_line() {
+        log.info(&line);
+    }
 
     let version = full_info();
     let status_path = sockets::status_socket_path();
@@ -350,10 +371,6 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         let listener = bind_unix_socket("desktop", &path, &mut log);
         (server, listener, path)
     };
-
-    // The bus log sink — shared across every watcher group and the backend-construction
-    // warnings below.
-    let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(log_file));
 
     // Select each namespace's approval gate from its own effective policy (empty → deny-all,
     // fail-closed). The built-in policy→gate routing (approve-all / biometrics / unknown →

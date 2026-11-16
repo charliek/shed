@@ -265,6 +265,12 @@ impl Supervisor {
         }
     }
 
+    /// The SSH backend every group this supervisor starts answers `ssh-agent` requests
+    /// with (so a host can check which backend it installed).
+    pub fn ssh_backend(&self) -> Arc<dyn SshBackend> {
+        self.deps.ssh_backend.clone()
+    }
+
     /// The running daemon's per-server connection snapshot for `status`: each watched
     /// server with its per-namespace subscription state (incl. the 409 `Rejected`
     /// terminal), sorted by name (mirror Go's `Health`). The lock is released before

@@ -16,6 +16,14 @@ Two modes:
   (msg type / keyblob / data / flags) is pinned too, so the exact wire requests the
   daemon issues are frozen.
 
+**The `ssh.offer_keys` key filter** (plan 035 §3.5) has its own cells in each mode:
+a filtered `list` (the ed25519 key named by fingerprint, the ECDSA key by public key
+line, the RSA key left out) and a `sign` with the RSA key, which the daemon holds but
+does not offer — it fails exactly as an unknown key does, and in agent-forward mode
+never reaches the agent (an empty transcript), and a `status` whose guest-visible
+`key_count` is the offered count. The unfiltered cells above are
+unchanged by the filter.
+
 **Gate policy — `approve-all`, deliberately.** These cells prove the *backend signing
 and wire behavior*, not the approval gate — the gated (shed-desktop delegate →
 approve/deny) `sign` path is already covered by `test_bus_sign_gated.py`
@@ -95,6 +103,23 @@ def _local_config(bus_url: str) -> str:
 
 def _agent_config(bus_url: str) -> str:
     return AGENT_FORWARD_CONFIG.replace("{server}", bus_url)
+
+
+# `ssh.offer_keys` (plan 035 §3.5): the ed25519 key by its fingerprint (as
+# `ssh-keygen -lf test_ed25519.pub` prints it) and the ECDSA key by its public key
+# line, so both entry forms are on the wire path. The RSA key is NOT offered.
+ED25519_FINGERPRINT = "SHA256:QSbP+oRmKHQkEp2CsJn72x/5Qxyq5lsK6sib0fK1mr0"
+ECDSA_PUB_LINE = (FIXTURES_DIR / "test_ecdsa.pub").read_text().strip()
+OFFER_KEYS_BLOCK = (
+    "  offer_keys:\n"
+    f'    - "{ED25519_FINGERPRINT}"\n'
+    f'    - "{ECDSA_PUB_LINE}"\n'
+)
+
+
+def _with_offer_keys(config: str) -> str:
+    # Insert the filter under `ssh:` (both templates open the block with `ssh:\n`).
+    return config.replace("ssh:\n", "ssh:\n" + OFFER_KEYS_BLOCK, 1)
 
 
 # --- request builders ----------------------------------------------------------------
@@ -247,6 +272,77 @@ def test_ssh_local_status(daemon, differential):
     assert result == {"connected": True, "mode": "local-keys", "key_count": 3}
 
 
+# --- the ssh.offer_keys key filter (plan 035 §3.5) ------------------------------------
+
+# A sign the backend cannot perform (an unknown key — or, with a filter, a key that is
+# not offered: the two are indistinguishable to a shed, by design).
+SIGN_FAILED = {"error": "sign operation failed", "code": "SIGN_FAILED"}
+
+
+@pytest.mark.differential
+def test_ssh_local_list_filtered(daemon, differential):
+    def scenario(impl):
+        with SyntheticBus() as bus:
+            config = _with_offer_keys(_local_config(bus.url))
+            with daemon(impl, config, install_ssh_keys=THREE_KEYS) as d:
+                bus.wait_for_subscribe("ssh-agent", timeout=10.0)
+                bus.push_request("ssh-agent", _req("list-1", {"operation": "list"}))
+                resp = bus.await_response("ssh-agent", timeout=10.0)
+                audit = d.read_audit_jsonl(expect=1, timeout=10.0)[0]
+                return {
+                    "response": canonical(mask_bus_response(resp)),
+                    "audit": canonical(mask_audit_entry(audit)),
+                }
+
+    result = differential(scenario)
+    keys = result["response"]["payload"]["keys"]
+    # Only the two offered keys, in load order; the RSA key is not listed.
+    assert [k["comment"] for k in keys] == ["id_ed25519", "id_ecdsa"]
+    assert [k["blob"] for k in keys] == [ED25519_PUB_B64, ECDSA_PUB_B64]
+    assert result["audit"]["result"] == "ok"
+    assert result["audit"]["detail"] == "2 keys"
+
+
+@pytest.mark.differential
+def test_ssh_local_sign_unoffered_key(daemon, differential):
+    def scenario(impl):
+        with SyntheticBus() as bus:
+            config = _with_offer_keys(_local_config(bus.url))
+            with daemon(impl, config, install_ssh_keys=THREE_KEYS) as d:
+                bus.wait_for_subscribe("ssh-agent", timeout=10.0)
+                # The RSA key is on disk and loaded, but not offered.
+                bus.push_request("ssh-agent", _sign_req("rsa-1", RSA_PUB_B64, 2))
+                resp = bus.await_response("ssh-agent", timeout=10.0)
+                audit = d.read_audit_jsonl(expect=1, timeout=10.0)[0]
+                return {
+                    "response": canonical(mask_bus_response(resp)),
+                    "audit": canonical(mask_audit_entry(audit)),
+                }
+
+    result = differential(scenario)
+    assert result["response"]["in_reply_to"] == "rsa-1"
+    assert result["response"]["payload"] == SIGN_FAILED
+    assert result["audit"]["op"] == "sign"
+    assert result["audit"]["result"] == "error"
+    assert result["audit"]["detail"] == "ssh-rsa"
+
+
+@pytest.mark.differential
+def test_ssh_local_status_filtered(daemon, differential):
+    def scenario(impl):
+        with SyntheticBus() as bus:
+            config = _with_offer_keys(_local_config(bus.url))
+            with daemon(impl, config, install_ssh_keys=THREE_KEYS) as d:
+                bus.wait_for_subscribe("ssh-agent", timeout=10.0)
+                bus.push_request("ssh-agent", _req("st-1", {"operation": "status"}))
+                resp = bus.await_response("ssh-agent", timeout=10.0)
+                return canonical(mask_bus_response(resp)["payload"])
+
+    result = differential(scenario)
+    # The guest-visible count is the offered keys, not the three on disk.
+    assert result == {"connected": True, "mode": "local-keys", "key_count": 2}
+
+
 # =====================================================================================
 # agent-forward mode (auto-detect via a fake ssh-agent)
 # =====================================================================================
@@ -363,4 +459,77 @@ def test_ssh_agent_status(daemon, differential):
     result = differential(scenario)
     assert result["payload"] == {"connected": True, "mode": "agent-forward", "key_count": 3}
     # status → the backend List → the extra REQUEST_IDENTITIES on the wire.
+    assert result["transcript"] == [{"type": 11}]
+
+
+@pytest.mark.differential
+def test_ssh_agent_list_filtered(daemon, differential):
+    def scenario(impl):
+        with FakeSshAgent() as agent:
+            with SyntheticBus() as bus:
+                config = _with_offer_keys(_agent_config(bus.url))
+                with daemon(impl, config, ssh_auth_sock=agent.path) as d:
+                    bus.wait_for_subscribe("ssh-agent", timeout=10.0)
+                    bus.push_request("ssh-agent", _req("list-1", {"operation": "list"}))
+                    resp = bus.await_response("ssh-agent", timeout=10.0)
+                    audit = d.read_audit_jsonl(expect=1, timeout=10.0)[0]
+                    return {
+                        "response": canonical(mask_bus_response(resp)),
+                        "audit": canonical(mask_audit_entry(audit)),
+                        "transcript": agent.transcript(),
+                    }
+
+    result = differential(scenario)
+    keys = result["response"]["payload"]["keys"]
+    assert [k["comment"] for k in keys] == ["id_ed25519", "id_ecdsa"]
+    assert [k["blob"] for k in keys] == [ED25519_PUB_B64, ECDSA_PUB_B64]
+    assert result["audit"]["detail"] == "2 keys"
+    # Still exactly one wire request: the filter asks the agent nothing at start-up
+    # and lists through the same single REQUEST_IDENTITIES.
+    assert result["transcript"] == [{"type": 11}]
+
+
+@pytest.mark.differential
+def test_ssh_agent_sign_unoffered_key(daemon, differential):
+    def scenario(impl):
+        with FakeSshAgent() as agent:
+            with SyntheticBus() as bus:
+                config = _with_offer_keys(_agent_config(bus.url))
+                with daemon(impl, config, ssh_auth_sock=agent.path) as d:
+                    bus.wait_for_subscribe("ssh-agent", timeout=10.0)
+                    bus.push_request("ssh-agent", _sign_req("rsa-1", RSA_PUB_B64, 2))
+                    resp = bus.await_response("ssh-agent", timeout=10.0)
+                    audit = d.read_audit_jsonl(expect=1, timeout=10.0)[0]
+                    return {
+                        "response": canonical(mask_bus_response(resp)),
+                        "audit": canonical(mask_audit_entry(audit)),
+                        "transcript": agent.transcript(),
+                    }
+
+    result = differential(scenario)
+    assert result["response"]["payload"] == SIGN_FAILED
+    assert result["audit"]["result"] == "error"
+    assert result["audit"]["detail"] == "ssh-rsa"
+    # The agent holds the RSA key, but the request never reached it.
+    assert result["transcript"] == []
+
+
+@pytest.mark.differential
+def test_ssh_agent_status_filtered(daemon, differential):
+    def scenario(impl):
+        with FakeSshAgent() as agent:
+            with SyntheticBus() as bus:
+                config = _with_offer_keys(_agent_config(bus.url))
+                with daemon(impl, config, ssh_auth_sock=agent.path) as d:
+                    bus.wait_for_subscribe("ssh-agent", timeout=10.0)
+                    bus.push_request("ssh-agent", _req("st-1", {"operation": "status"}))
+                    resp = bus.await_response("ssh-agent", timeout=10.0)
+                    return {
+                        "payload": canonical(mask_bus_response(resp)["payload"]),
+                        "transcript": agent.transcript(),
+                    }
+
+    result = differential(scenario)
+    # The guest-visible count is the offered keys, not the three the agent holds.
+    assert result["payload"] == {"connected": True, "mode": "agent-forward", "key_count": 2}
     assert result["transcript"] == [{"type": 11}]

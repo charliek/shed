@@ -67,6 +67,24 @@ ssh:
     scope: per-session
     session_ttl: 1h
 
+  # What this machine signs for a shed (machine-wide). A shed's SSH logins are
+  # signed only as these usernames; git commit signing is unaffected. Default
+  # [git]; a list here replaces it, and [] signs no logins at all. A name
+  # beginning with "_" is never allowed. Names are compared exactly, with no
+  # trimming: case, spaces and every character count.
+  # allow_users: [git]
+
+  # The keys sheds may see and use, as SHA256 fingerprints (as `ssh-add -l`
+  # prints them) or public key lines (as in a .pub file). Absent: every key the
+  # backend holds is offered; [] offers none. Certificates and sk- keys cannot
+  # be listed (the broker never signs with them).
+  # Any username besides git in allow_users requires offer_keys, so the machine
+  # never signs logins as other users with every key in its agent.
+  # (The two entries below are the same key, named each way.)
+  # offer_keys:
+  #   - SHA256:QSbP+oRmKHQkEp2CsJn72x/5Qxyq5lsK6sib0fK1mr0
+  #   - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILMdrPP0NLsfgrc8JIa6OWX1qhgyfW/UwJTSXdRuUsJJ work-laptop
+
 # ---------------------------------------------------------------------------
 # AWS credential vending
 # ---------------------------------------------------------------------------

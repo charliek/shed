@@ -699,6 +699,10 @@ pub struct EmbeddedHostAgent {
     /// The SSH mode the backend resolved to at spawn (env-dependent for `ssh.mode: ""`);
     /// surfaced in `broker.status`.
     resolved_ssh_mode: Mutex<Option<String>>,
+    /// The `ssh.offer_keys` key filter (plan 035 §3.5) installed around the SSH backend
+    /// at spawn; every listing a shed asks for records its counts. `None` until spawn
+    /// got that far.
+    ssh_filter: Mutex<Option<Arc<ssh_backend::FilteredSshBackend>>>,
     /// Where the broker's lines go (the bus, the supervisor, the backends, the
     /// Responder's drop path) — the embedder's own log, injected at [`new`](Self::new).
     log: Arc<dyn bus::BusLog>,
@@ -777,6 +781,7 @@ impl EmbeddedHostAgent {
             spawned: AtomicBool::new(false),
             supervisor: Mutex::new(None),
             resolved_ssh_mode: Mutex::new(None),
+            ssh_filter: Mutex::new(None),
             log,
             machine_path: broker_machine::machine_state_path(),
             machine: Mutex::new(None),
@@ -819,6 +824,13 @@ impl EmbeddedHostAgent {
     /// The SSH backend mode resolved at spawn (`None` until [`spawn`] succeeds).
     pub fn resolved_ssh_mode(&self) -> Option<String> {
         self.resolved_ssh_mode.lock().unwrap().clone()
+    }
+
+    /// The key filter's counts: how many keys the last listing offered of how many the
+    /// backend had (`None` until [`spawn`](Self::spawn) succeeds; the handle's own value
+    /// is `None` until a shed first lists keys).
+    pub fn ssh_offer_counts(&self) -> Option<Arc<ssh_backend::SshOfferCounts>> {
+        self.ssh_filter.lock().unwrap().as_ref().map(|f| f.counts())
     }
 
     /// This machine's identity as loaded at [`spawn`](Self::spawn) — `Some(Err(why))`
@@ -875,6 +887,19 @@ impl EmbeddedHostAgent {
         for w in &ssh_warnings {
             bus_log.warn(w);
         }
+        // The `ssh.offer_keys` key filter (plan 035 §3.5), as in the daemon: sheds see
+        // and can sign with only the offered keys; without the key everything passes.
+        // It makes no call of its own, so nothing new happens at spawn.
+        let filtered_ssh = ssh_backend::with_key_filter(
+            ssh_backend,
+            cfg.ssh_sign_policy().offer_keys().cloned(),
+            Some(bus_log.clone()),
+        );
+        if let Some(line) = filtered_ssh.startup_line() {
+            bus_log.info(&line);
+        }
+        *self.ssh_filter.lock().unwrap() = Some(filtered_ssh.clone());
+        let ssh_backend: Arc<dyn ssh_backend::SshBackend> = filtered_ssh;
         *self.resolved_ssh_mode.lock().unwrap() = Some(ssh_backend.mode().to_string());
 
         // This machine's identity, from the file the daemon shares (plan 035 §3.4). As in
@@ -1503,6 +1528,10 @@ mod tests {
         }
         // Populated post-spawn (surfaced in broker.status).
         assert!(agent.resolved_ssh_mode().is_some());
+        // The key filter wraps the backend at spawn and keeps its counts handle, which
+        // stays empty: the wrapper asks the backend nothing until a shed lists keys.
+        let counts = agent.ssh_offer_counts().expect("set at spawn");
+        assert_eq!(counts.get(), None, "no listing happens at spawn");
         // The identity the daemon would load from the same file: created here, and the
         // file on disk says the same id.
         let machine = agent
@@ -1515,6 +1544,61 @@ mod tests {
         agent.retry_now(); // reaches the running supervisor without panicking
                            // Best-effort drain (the watch loop returns on the flip, then drains groups).
         let _ = agent.shutdown_handle().send(true);
+    }
+
+    /// The backend the bus actually runs with is the filtered one: the supervisor's
+    /// `ssh-agent` backend IS the wrapper spawn kept, and that wrapper carries the
+    /// config's `ssh.offer_keys` (one key here) — or no filter when the key is absent.
+    #[tokio::test]
+    async fn spawn_installs_the_configured_key_filter() {
+        const FP: &str = "SHA256:QSbP+oRmKHQkEp2CsJn72x/5Qxyq5lsK6sib0fK1mr0";
+        for (offer_keys, want) in [
+            (format!("  offer_keys: [\"{FP}\"]\n"), Some(FP)),
+            (String::new(), None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("config.yaml");
+            std::fs::write(&src, "servers: {}\n").unwrap();
+            let yaml = format!(
+                "ssh:\n  approval:\n    policy: shed-desktop\n{offer_keys}discovery:\n  source: {}\n  watch: off\n",
+                src.display()
+            );
+            let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
+            cfg.validate().unwrap();
+            let (mut agent, _events) =
+                EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
+            agent.machine_path = dir.path().join("state/host-agent/machine.json");
+            agent.spawn().await.expect("spawn ok");
+
+            let installed = agent
+                .supervisor
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("supervisor built")
+                .ssh_backend();
+            let wrapper = agent.ssh_filter.lock().unwrap().clone().expect("kept");
+            assert!(
+                std::ptr::eq(
+                    Arc::as_ptr(&installed) as *const (),
+                    Arc::as_ptr(&wrapper) as *const ()
+                ),
+                "the bus's ssh backend is the filter wrapper"
+            );
+            let fingerprints: Vec<String> = wrapper
+                .filter()
+                .map(|f| {
+                    f.digests()
+                        .map(shed_broker::sign_check::digest_fingerprint)
+                        .collect()
+                })
+                .unwrap_or_default();
+            match want {
+                Some(fp) => assert_eq!(fingerprints, [fp.to_string()], "{yaml}"),
+                None => assert!(wrapper.filter().is_none(), "no filter without the key"),
+            }
+            let _ = agent.shutdown_handle().send(true);
+        }
     }
 
     /// Following the daemon: an identity that cannot be loaded does NOT fail the broker.
@@ -1988,6 +2072,45 @@ mod tests {
         assert_eq!(cfg.effective_policy(NS_DOCKER_CREDENTIALS), "deny-all");
         // ssh.mode "" → auto-detect.
         assert_eq!(cfg.ssh_mode(), "");
+        // The signing check's machine-wide policy (plan 035 §3.5): the default allow
+        // list `[git]` and no `ssh.offer_keys` filter.
+        let policy = cfg.ssh_sign_policy();
+        assert_eq!(policy.allow_users(), ["git".to_string()]);
+        assert!(policy.offer_keys().is_none(), "no key filter by default");
+    }
+
+    /// A loaded config's `ssh.offer_keys` reaches the embedded broker's policy: the same
+    /// accessor the bridge wraps its SSH backend with at spawn.
+    #[test]
+    fn load_or_synthesize_carries_the_signing_settings() {
+        let (_d, path) = write_tmp(
+            "extensions.yaml",
+            "ssh:\n  approval:\n    policy: approve-all\n  allow_users: [git, deploy]\n  \
+             offer_keys: [\"SHA256:QSbP+oRmKHQkEp2CsJn72x/5Qxyq5lsK6sib0fK1mr0\"]\n",
+        );
+        let cfg = match load_or_synthesize(&path).unwrap() {
+            BrokerConfig::Loaded(c) => c,
+            other => panic!("expected Loaded, got {other:?}"),
+        };
+        let policy = cfg.ssh_sign_policy();
+        assert_eq!(
+            policy.allow_users(),
+            ["git".to_string(), "deploy".to_string()]
+        );
+        assert_eq!(policy.offer_keys().map(|f| f.len()), Some(1));
+
+        // ...and a widened allow list without a filter is a config error, so the
+        // broker is not started on it.
+        let (_d2, bad) = write_tmp(
+            "extensions.yaml",
+            "ssh:\n  approval:\n    policy: approve-all\n  allow_users: [deploy]\n",
+        );
+        match load_or_synthesize(&bad) {
+            Err(BrokerError::Config(msg)) => {
+                assert!(msg.contains("ssh.offer_keys is required"), "{msg}")
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -25,6 +25,10 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::sign_check::{
+    check_signing_key, key_blob_digest, KeyFilter, SignPolicy, DEFAULT_ALLOW_USERS,
+};
+
 /// The three credential namespaces, in the fixed status/gate order.
 pub const NS_SSH_AGENT: &str = "ssh-agent";
 pub const NS_AWS_CREDENTIALS: &str = "aws-credentials";
@@ -334,6 +338,157 @@ fn parse_go_duration_strict(s: &str) -> Result<i128, String> {
     Ok(if neg { -total } else { total })
 }
 
+/// A config key that holds a list, as written (the signing check's
+/// `ssh.allow_users` and `ssh.offer_keys`). Absent and an explicit null are the same:
+/// both mean "not set".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigList {
+    /// Absent, or a YAML null (a bare `key:`).
+    Absent,
+    /// Present but not a sequence (a scalar or a map) — a validate error.
+    NotList,
+    /// A sequence (flow `[a, b]` or block `- a`), entry by entry.
+    Items(Vec<ListItem>),
+}
+
+/// One entry of a [`ConfigList`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListItem {
+    /// A non-empty string.
+    Text(String),
+    /// `""`, or a null entry (a bare `-`).
+    Empty,
+    /// A map or a nested list.
+    NotString,
+}
+
+impl ConfigList {
+    fn read(node: Option<&yaml_lite::Node>) -> ConfigList {
+        match node {
+            None | Some(yaml_lite::Node::Null) => ConfigList::Absent,
+            Some(yaml_lite::Node::Sequence(items)) => ConfigList::Items(
+                items
+                    .iter()
+                    .map(|item| match item {
+                        yaml_lite::Node::Scalar(s) if !s.is_empty() => ListItem::Text(s.clone()),
+                        yaml_lite::Node::Scalar(_) | yaml_lite::Node::Null => ListItem::Empty,
+                        yaml_lite::Node::Map(_) | yaml_lite::Node::Sequence(_) => {
+                            ListItem::NotString
+                        }
+                    })
+                    .collect(),
+            ),
+            Some(_) => ConfigList::NotList,
+        }
+    }
+
+    /// The entries (none when absent), or `<key> must be a list`.
+    fn items(&self, key: &str) -> Result<&[ListItem], String> {
+        match self {
+            ConfigList::Absent => Ok(&[]),
+            ConfigList::NotList => Err(format!("{key} must be a list")),
+            ConfigList::Items(items) => Ok(items),
+        }
+    }
+}
+
+impl ListItem {
+    fn as_text(&self) -> Option<&str> {
+        match self {
+            ListItem::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The entry's text, or `<key> entry is empty` / `<key> entry is not a string`.
+    fn text(&self, key: &str) -> Result<&str, String> {
+        match self {
+            ListItem::Text(s) => Ok(s),
+            ListItem::Empty => Err(format!("{key} entry is empty")),
+            ListItem::NotString => Err(format!("{key} entry is not a string")),
+        }
+    }
+}
+
+/// A config entry for an error message: double-quoted with control characters escaped
+/// (Rust's `{:?}`), and cut to its first 48 characters with `...` (a public key line
+/// is long, and only its start identifies it to a reader).
+fn quote_entry(entry: &str) -> String {
+    const MAX_CHARS: usize = 48;
+    match entry.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => format!("{:?}", format!("{}...", &entry[..cut])),
+        None => format!("{entry:?}"),
+    }
+}
+
+/// The [`key_blob_digest`] an `ssh.offer_keys` entry names — exactly the digest
+/// [`KeyFilter`] compares a requested key against (SHA-256 of the whole SSH-wire key
+/// blob), so both forms of one key select the same key. An entry is one of:
+///
+/// - a fingerprint, `SHA256:` then the unpadded base64 of the digest, exactly as
+///   `ssh-keygen -l` and `ssh-add -l` print it (one trailing `=` is tolerated);
+/// - an OpenSSH public key line (`<type> <base64> [comment]`, as in a `.pub` file or
+///   `ssh-add -L`), digested over its re-encoded key blob.
+///
+/// A key line must be a key the broker signs with ([`sign_check`](crate::sign_check)'s
+/// rule for the requested key): a certificate, a security-key (`sk-`) key, a DSA key or
+/// an invalid key is refused here, since offering one could never produce a signature
+/// and the config would only appear to offer it. (A fingerprint cannot be judged this
+/// way; one that names such a key simply never matches a key the broker signs with.)
+/// Surrounding whitespace is ignored, and a key line's fields may be separated by any
+/// run of spaces and tabs. The error is the full config-load message.
+fn parse_offer_key(entry: &str) -> Result<[u8; 32], String> {
+    use base64::Engine as _;
+    const KEYS: &str = "ssh.offer_keys";
+    let not_either = || {
+        format!(
+            "{KEYS} entry {} is not a SHA256 fingerprint or an OpenSSH public key",
+            quote_entry(entry)
+        )
+    };
+    let text = entry.trim();
+    if let Some(b64) = text.strip_prefix("SHA256:") {
+        let b64 = b64.strip_suffix('=').unwrap_or(b64);
+        return base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(b64)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .ok_or_else(not_either);
+    }
+    // A key line's fields are separated by any run of spaces and tabs, as `ssh-keygen`
+    // reads them; the parser below takes exactly one space. Only the type and the key
+    // blob are passed on (the comment is no part of the digest), so a comment of any
+    // spacing is fine. A line with authorized_keys options in front (`no-pty ...`,
+    // `command="..." ...`) has an option where the type belongs and fails to parse.
+    let mut fields = text.split([' ', '\t']).filter(|f| !f.is_empty());
+    let key_type = fields.next().unwrap_or_default();
+    let key_b64 = fields.next().unwrap_or_default();
+    if key_type.ends_with("-cert-v01@openssh.com") {
+        return Err(format!(
+            "{KEYS} entry {} is an OpenSSH certificate, which the broker never signs with; \
+             name the plain key or its SHA256 fingerprint",
+            quote_entry(entry)
+        ));
+    }
+    if key_type.starts_with("sk-") {
+        return Err(format!(
+            "{KEYS} entry {} is a security-key (sk-) key, which the broker never signs with",
+            quote_entry(entry)
+        ));
+    }
+    let blob = ssh_key::PublicKey::from_openssh(&format!("{key_type} {key_b64}"))
+        .ok()
+        .and_then(|key| key.to_bytes().ok())
+        .ok_or_else(not_either)?;
+    check_signing_key(&blob).map_err(|why| {
+        format!(
+            "{KEYS} entry {} is not a key the broker signs with: {why}",
+            quote_entry(entry)
+        )
+    })?;
+    Ok(key_blob_digest(&blob))
+}
+
 /// The slice-0/1 view of the host-agent config: the fields LiveStatus needs plus
 /// `approval_timeout` (the delegated-approval budget the desktop server enforces).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +512,15 @@ pub struct HostAgentConfig {
     /// text (`out.TTL = cfg.SessionTTL`). Same null-aware defaulting as `ssh_scope`.
     /// Mirrors Go's `ApprovalConfig.SessionTTL`.
     ssh_session_ttl_raw: String,
+    /// `ssh.allow_users` as written (plan 035 §3.5): the usernames this machine signs a
+    /// login for. Absent or null → `[git]`; a present list replaces that default; `[]`
+    /// signs no login at all (commit signing only). Checked by
+    /// [`HostAgentConfig::validate`], read through [`HostAgentConfig::ssh_sign_policy`].
+    ssh_allow_users: ConfigList,
+    /// `ssh.offer_keys` as written: the keys offered to sheds, as `SHA256:` fingerprints
+    /// or OpenSSH public key lines. Absent or null → no filter; a present list, even an
+    /// empty one, IS the filter (`[]` offers nothing).
+    ssh_offer_keys: ConfigList,
     pub logging_enabled: bool,
     pub logging_path: String,
     /// Log lines for deprecated keys that are still set and are IGNORED, collected at
@@ -465,7 +629,82 @@ impl HostAgentConfig {
         validate_policy("docker", &self.docker_policy, CRED_ALLOWED)?;
         self.aws.validate()?;
         validate_approval_timeout(&self.approval_timeout_raw)?;
+        // Last, so no earlier rule's first error changes.
+        self.validate_ssh_signing()?;
         Ok(())
+    }
+
+    /// The `ssh.allow_users` / `ssh.offer_keys` rules (plan 035 §3.5), in this order:
+    /// each key must be a list; every `allow_users` entry a non-empty string with no
+    /// control character that does not begin with `_`; every `offer_keys` entry a key
+    /// the broker signs with, named by fingerprint or public key line
+    /// ([`parse_offer_key`]); and any username besides `git` requires `offer_keys`, so
+    /// a machine cannot be made to sign logins as other usernames with every key in its
+    /// agent. A duplicate entry is not an error.
+    fn validate_ssh_signing(&self) -> Result<(), String> {
+        const USERS: &str = "ssh.allow_users";
+        const KEYS: &str = "ssh.offer_keys";
+        let mut wider: Vec<&str> = Vec::new();
+        for item in self.ssh_allow_users.items(USERS)? {
+            let name = item.text(USERS)?;
+            if name.starts_with('_') {
+                return Err(format!(
+                    "{USERS} entry {} is not allowed: usernames beginning with \"_\" are never signed",
+                    quote_entry(name)
+                ));
+            }
+            if name.chars().any(char::is_control) {
+                return Err(format!(
+                    "{USERS} entry {} contains a control character",
+                    quote_entry(name)
+                ));
+            }
+            if !DEFAULT_ALLOW_USERS.contains(&name) && !wider.contains(&name) {
+                wider.push(name);
+            }
+        }
+        for item in self.ssh_offer_keys.items(KEYS)? {
+            parse_offer_key(item.text(KEYS)?)?;
+        }
+        if !wider.is_empty() && self.ssh_offer_keys == ConfigList::Absent {
+            return Err(format!(
+                "{KEYS} is required when {USERS} lists users other than \"git\" (found: {})",
+                wider.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    /// What this machine signs for a shed: `ssh.allow_users` (default `[git]`) and the
+    /// `ssh.offer_keys` filter (none when absent), as one [`SignPolicy`]. It runs the
+    /// signing settings' own validation itself, so a config that was never validated
+    /// cannot widen anything: when those settings do not pass, the policy allows no
+    /// username and offers no key.
+    pub fn ssh_sign_policy(&self) -> SignPolicy {
+        if self.validate_ssh_signing().is_err() {
+            return SignPolicy::new(Vec::<String>::new(), Some(KeyFilter::new()));
+        }
+        // Validated: both keys are absent or a list of text entries that all parse.
+        let allow_users: Vec<String> = match &self.ssh_allow_users {
+            ConfigList::Absent => DEFAULT_ALLOW_USERS.iter().map(|u| u.to_string()).collect(),
+            ConfigList::NotList => Vec::new(),
+            ConfigList::Items(items) => items
+                .iter()
+                .filter_map(ListItem::as_text)
+                .map(str::to_string)
+                .collect(),
+        };
+        let offer_keys = match &self.ssh_offer_keys {
+            ConfigList::Absent => None,
+            ConfigList::NotList => Some(KeyFilter::new()),
+            ConfigList::Items(items) => Some(KeyFilter::from_digests(
+                items
+                    .iter()
+                    .filter_map(ListItem::as_text)
+                    .filter_map(|entry| parse_offer_key(entry).ok()),
+            )),
+        };
+        SignPolicy::new(allow_users, offer_keys)
     }
 
     /// Parse config text, returning an error on malformed YAML. Missing keys take
@@ -546,6 +785,12 @@ impl HostAgentConfig {
                 _ => d.to_string(),
             }
         };
+        // The two signing-check lists, read as written; `validate` judges them.
+        let ssh_map = root
+            .as_map()
+            .and_then(|m| m.get("ssh"))
+            .and_then(yaml_lite::Node::as_map);
+        let ssh_list = |key: &str| ConfigList::read(ssh_map.and_then(|m| m.get(key)));
         // A `discovery:` key PRESENT and NON-NULL flips to multi-server mode. A bare
         // `discovery:` (YAML null) must read as ABSENT: Go unmarshals a null into
         // `*DiscoveryConfig` as nil, and every discovery path gates on `cfg.Discovery
@@ -619,6 +864,8 @@ impl HostAgentConfig {
                 .to_string(),
             ssh_scope: ssh_scalar_or_default("scope", "per-session"),
             ssh_session_ttl_raw: ssh_scalar_or_default("session_ttl", "4h"),
+            ssh_allow_users: ssh_list("allow_users"),
+            ssh_offer_keys: ssh_list("offer_keys"),
             logging_enabled,
             logging_path,
             deprecated_warnings,
@@ -2951,6 +3198,18 @@ aws:
         );
         assert_eq!(cfg.ssh_scope(), "per-session");
         assert_eq!(cfg.ssh_session_ttl(), "1h");
+        // The signing settings ship commented out: the defaults apply.
+        let policy = cfg.ssh_sign_policy();
+        assert_eq!(policy.allow_users(), ["git".to_string()]);
+        assert!(policy.offer_keys().is_none());
+        // ...and the commented example parses as written once uncommented.
+        let uncommented = text
+            .replace("  # allow_users: [git]", "  allow_users: [git]")
+            .replace("  # offer_keys:", "  offer_keys:")
+            .replace("  #   - ", "    - ");
+        let cfg = HostAgentConfig::try_parse(&uncommented).expect("uncommented example parses");
+        cfg.validate().expect("uncommented example validates");
+        assert_eq!(cfg.ssh_sign_policy().offer_keys().map(|f| f.len()), Some(1));
     }
 
     /// The native-biometric knobs default null-aware (Go's `DefaultConfig`-then-
@@ -3305,5 +3564,492 @@ aws:
             .expect("a config carrying the retired rc_hub key still loads");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(cfg.server, "http://localhost:8080");
+    }
+
+    // ---- ssh.allow_users / ssh.offer_keys (plan 035 §3.5) ------------------------
+
+    /// The harness's three fixture public key lines (`tests/host-agent-diff/fixtures`).
+    fn fixture_pub_line(stem: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/host-agent-diff/fixtures")
+            .join(format!("{stem}.pub"));
+        std::fs::read_to_string(path)
+            .expect("read fixture pub")
+            .trim()
+            .to_string()
+    }
+
+    /// The SSH-wire key blob of a public key line (its second field, base64-decoded).
+    fn blob_of(line: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(line.split_whitespace().nth(1).unwrap())
+            .unwrap()
+    }
+
+    /// Each fixture key with the fingerprint `ssh-keygen -lf <stem>.pub` (OpenSSH 9.6p1)
+    /// printed for it — an oracle independent of this code.
+    const FIXTURE_FINGERPRINTS: [(&str, &str); 3] = [
+        (
+            "test_ed25519",
+            "SHA256:QSbP+oRmKHQkEp2CsJn72x/5Qxyq5lsK6sib0fK1mr0",
+        ),
+        (
+            "test_rsa",
+            "SHA256:C8g1CapDe/kvnUMby6PfZBt8QpMmgr3/Xbqfn9ZwUx0",
+        ),
+        (
+            "test_ecdsa",
+            "SHA256:6PPi6Jlb3G0MMh1vRdHiX8FMsvRGnJwkJwTnLArw1to",
+        ),
+    ];
+
+    fn ssh_config(body: &str) -> HostAgentConfig {
+        HostAgentConfig::try_parse(&format!("ssh:\n{body}")).expect("yaml parses")
+    }
+
+    fn validate_ssh(body: &str) -> Result<(), String> {
+        ssh_config(body).validate()
+    }
+
+    #[test]
+    fn signing_settings_default_when_absent_or_null() {
+        for yaml in [
+            "",
+            "ssh:\n  mode: \"\"\n",
+            "ssh:\n  allow_users:\n  offer_keys:\n",
+            "ssh:\n  allow_users: null\n  offer_keys: ~\n",
+        ] {
+            let cfg = HostAgentConfig::try_parse(yaml).unwrap();
+            cfg.validate().unwrap_or_else(|e| panic!("{yaml:?}: {e}"));
+            let policy = cfg.ssh_sign_policy();
+            assert_eq!(policy.allow_users(), ["git".to_string()], "{yaml:?}");
+            assert!(policy.offer_keys().is_none(), "{yaml:?}: no filter");
+        }
+    }
+
+    #[test]
+    fn allow_users_present_list_replaces_the_default() {
+        let fp = FIXTURE_FINGERPRINTS[0].1;
+        let cfg = ssh_config(&format!(
+            "  allow_users: [deploy]\n  offer_keys: [\"{fp}\"]\n"
+        ));
+        cfg.validate().unwrap();
+        // `git` is NOT kept: a present list replaces the default.
+        assert_eq!(cfg.ssh_sign_policy().allow_users(), ["deploy".to_string()]);
+    }
+
+    #[test]
+    fn empty_lists_mean_no_logins_and_no_keys() {
+        // allow_users: [] — commit signing only; needs no filter.
+        let cfg = ssh_config("  allow_users: []\n");
+        cfg.validate().unwrap();
+        let policy = cfg.ssh_sign_policy();
+        assert!(policy.allow_users().is_empty());
+        assert!(policy.offer_keys().is_none());
+        // offer_keys: [] — a filter that offers nothing (not "no filter").
+        let cfg = ssh_config("  offer_keys: []\n");
+        cfg.validate().unwrap();
+        let policy = cfg.ssh_sign_policy();
+        assert_eq!(policy.allow_users(), ["git".to_string()]);
+        let filter = policy.offer_keys().expect("an empty list IS a filter");
+        assert!(filter.is_empty());
+    }
+
+    #[test]
+    fn flow_and_block_lists_read_the_same() {
+        let (ed, rsa) = (FIXTURE_FINGERPRINTS[0].1, FIXTURE_FINGERPRINTS[1].1);
+        let ecdsa_line = fixture_pub_line("test_ecdsa");
+        let flow = ssh_config(&format!(
+            "  allow_users: [git, deploy]\n  offer_keys: [\"{ed}\", \"{rsa}\", \"{ecdsa_line}\"]\n"
+        ));
+        let block = ssh_config(&format!(
+            "  allow_users:\n    - git\n    - deploy\n  offer_keys:\n    - {ed}\n    - {rsa}\n    - {ecdsa_line}\n"
+        ));
+        flow.validate().unwrap();
+        block.validate().unwrap();
+        assert_eq!(flow.ssh_sign_policy(), block.ssh_sign_policy());
+        let policy = block.ssh_sign_policy();
+        assert_eq!(
+            policy.allow_users(),
+            ["git".to_string(), "deploy".to_string()]
+        );
+        let filter = policy.offer_keys().unwrap();
+        assert_eq!(filter.len(), 3);
+        for stem in ["test_ed25519", "test_rsa", "test_ecdsa"] {
+            assert!(
+                filter.contains_key_blob(&blob_of(&fixture_pub_line(stem))),
+                "{stem} offered"
+            );
+        }
+    }
+
+    /// The two forms of one key name the same digest, the one `KeyFilter` compares a
+    /// requested key against — checked against `ssh-keygen`'s own fingerprints.
+    #[test]
+    fn fingerprint_and_key_line_select_the_same_key() {
+        for (stem, fp) in FIXTURE_FINGERPRINTS {
+            let line = fixture_pub_line(stem);
+            let blob = blob_of(&line);
+            let want = key_blob_digest(&blob);
+            assert_eq!(parse_offer_key(fp), Ok(want), "{stem} fingerprint");
+            assert_eq!(parse_offer_key(&line), Ok(want), "{stem} key line");
+            // Without its comment, with surrounding whitespace, and with one `=` pad.
+            let bare: Vec<&str> = line.split_whitespace().take(2).collect();
+            assert_eq!(parse_offer_key(&bare.join(" ")), Ok(want), "{stem} bare");
+            assert_eq!(parse_offer_key(&format!("  {fp}  ")), Ok(want), "{stem} ws");
+            assert_eq!(parse_offer_key(&format!("{fp}=")), Ok(want), "{stem} pad");
+            // And through the config: either form alone offers exactly this key.
+            for entry in [fp.to_string(), line.clone()] {
+                let cfg = ssh_config(&format!("  offer_keys:\n    - {entry}\n"));
+                cfg.validate().unwrap();
+                let filter = cfg.ssh_sign_policy().offer_keys().cloned().unwrap();
+                assert!(filter.contains_key_blob(&blob), "{stem}: {entry}");
+                for (other, _) in FIXTURE_FINGERPRINTS.iter().filter(|(s, _)| *s != stem) {
+                    assert!(
+                        !filter.contains_key_blob(&blob_of(&fixture_pub_line(other))),
+                        "{stem} filter must not offer {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signing_settings_validation_errors() {
+        let ed_line = fixture_pub_line("test_ed25519");
+        let ed_b64 = ed_line.split_whitespace().nth(1).unwrap().to_string();
+        // A DSA key line and a 512-bit RSA key line: well-formed lines the broker never
+        // signs with.
+        let mut dsa = Vec::new();
+        crate::ssh_wire::put_string(&mut dsa, b"ssh-dss");
+        for _ in 0..4 {
+            crate::ssh_wire::put_string(&mut dsa, &[0x01]);
+        }
+        let mut rsa512 = Vec::new();
+        crate::ssh_wire::put_string(&mut rsa512, b"ssh-rsa");
+        crate::ssh_wire::put_string(&mut rsa512, &[0x01, 0x00, 0x01]);
+        let mut n = vec![0x00, 0xc1];
+        n.extend([0x55; 63]);
+        crate::ssh_wire::put_string(&mut rsa512, &n);
+        let b64 = |b: &[u8]| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(b)
+        };
+        let cases: Vec<(String, String)> = vec![
+            // allow_users: shape, empty, non-string, reserved, control characters.
+            ("  allow_users: git\n".into(), "ssh.allow_users must be a list".into()),
+            (
+                "  allow_users:\n    git: true\n".into(),
+                "ssh.allow_users must be a list".into(),
+            ),
+            ("  allow_users: [\"\"]\n".into(), "ssh.allow_users entry is empty".into()),
+            ("  allow_users:\n    -\n".into(), "ssh.allow_users entry is empty".into()),
+            (
+                "  allow_users:\n    - {a: b}\n".into(),
+                "ssh.allow_users entry is not a string".into(),
+            ),
+            (
+                "  allow_users: [[git]]\n".into(),
+                "ssh.allow_users entry is not a string".into(),
+            ),
+            (
+                "  allow_users: [_bootstrap]\n  offer_keys: []\n".into(),
+                "ssh.allow_users entry \"_bootstrap\" is not allowed: usernames beginning with \"_\" are never signed".into(),
+            ),
+            (
+                "  allow_users: [git, _x]\n".into(),
+                "ssh.allow_users entry \"_x\" is not allowed: usernames beginning with \"_\" are never signed".into(),
+            ),
+            (
+                "  allow_users: [\"de\\tploy\"]\n  offer_keys: []\n".into(),
+                "ssh.allow_users entry \"de\\tploy\" contains a control character".into(),
+            ),
+            (
+                "  allow_users: [\"git\\0\"]\n  offer_keys: []\n".into(),
+                "ssh.allow_users entry \"git\\0\" contains a control character".into(),
+            ),
+            // offer_keys: shape, empty, non-string, neither form.
+            ("  offer_keys: SHA256:abc\n".into(), "ssh.offer_keys must be a list".into()),
+            ("  offer_keys: [\"\"]\n".into(), "ssh.offer_keys entry is empty".into()),
+            (
+                "  offer_keys:\n    - [a]\n".into(),
+                "ssh.offer_keys entry is not a string".into(),
+            ),
+            (
+                "  offer_keys: [id_ed25519]\n".into(),
+                "ssh.offer_keys entry \"id_ed25519\" is not a SHA256 fingerprint or an OpenSSH public key".into(),
+            ),
+            (
+                // A fingerprint of the wrong length.
+                "  offer_keys: [\"SHA256:QSbP+oRmKHQkEp2CsJn72x\"]\n".into(),
+                "ssh.offer_keys entry \"SHA256:QSbP+oRmKHQkEp2CsJn72x\" is not a SHA256 fingerprint or an OpenSSH public key".into(),
+            ),
+            (
+                "  offer_keys: [\"MD5:16:27:ac:a5:76:28:2d:36:63:1b:56:4d:eb:df:a6:48\"]\n".into(),
+                "is not a SHA256 fingerprint or an OpenSSH public key".into(),
+            ),
+            (
+                // A key line whose type does not match its blob.
+                format!("  offer_keys: [\"ssh-rsa {ed_b64}\"]\n"),
+                "is not a SHA256 fingerprint or an OpenSSH public key".into(),
+            ),
+            // Key lines the broker never signs with.
+            (
+                format!("  offer_keys: [\"ssh-ed25519-cert-v01@openssh.com {ed_b64} c\"]\n"),
+                "is an OpenSSH certificate, which the broker never signs with".into(),
+            ),
+            (
+                format!("  offer_keys: [\"sk-ssh-ed25519@openssh.com {ed_b64}\"]\n"),
+                "is a security-key (sk-) key, which the broker never signs with".into(),
+            ),
+            (
+                format!("  offer_keys: [\"ssh-dss {}\"]\n", b64(&dsa)),
+                "is not a key the broker signs with: unsupported key type ssh-dss".into(),
+            ),
+            (
+                format!("  offer_keys: [\"ssh-rsa {}\"]\n", b64(&rsa512)),
+                "is not a key the broker signs with: invalid key: RSA modulus is under 1024 bits"
+                    .into(),
+            ),
+            // The widening rule.
+            (
+                "  allow_users: [git, deploy]\n".into(),
+                "ssh.offer_keys is required when ssh.allow_users lists users other than \"git\" (found: deploy)".into(),
+            ),
+            (
+                "  allow_users: [deploy, ci, deploy, git]\n".into(),
+                "ssh.offer_keys is required when ssh.allow_users lists users other than \"git\" (found: deploy, ci)".into(),
+            ),
+            (
+                // Byte-exact: `Git` is another username.
+                "  allow_users: [Git]\n".into(),
+                "(found: Git)".into(),
+            ),
+        ];
+        for (body, want) in &cases {
+            let err = validate_ssh(body).expect_err(body);
+            assert!(
+                err.contains(want.as_str()),
+                "{body:?}: {err:?} lacks {want:?}"
+            );
+        }
+    }
+
+    /// The widening rule in the other direction: `git` alone or nothing needs no
+    /// filter; any other name is fine once `offer_keys` is present, even empty; a
+    /// duplicate entry is not an error.
+    #[test]
+    fn widening_rule_is_satisfied_by_any_present_filter() {
+        for body in [
+            "  allow_users: [git]\n",
+            "  allow_users: [git, git]\n",
+            "  allow_users: []\n",
+            "  allow_users: [git, deploy]\n  offer_keys: []\n",
+            "  allow_users: [deploy, deploy]\n  offer_keys: [\"SHA256:QSbP+oRmKHQkEp2CsJn72x/5Qxyq5lsK6sib0fK1mr0\"]\n",
+            "  offer_keys: [\"SHA256:QSbP+oRmKHQkEp2CsJn72x/5Qxyq5lsK6sib0fK1mr0\", \"SHA256:QSbP+oRmKHQkEp2CsJn72x/5Qxyq5lsK6sib0fK1mr0\"]\n",
+        ] {
+            validate_ssh(body).unwrap_or_else(|e| panic!("{body:?}: {e}"));
+        }
+        // A null offer_keys is absent, so it does not satisfy the rule.
+        let err = validate_ssh("  allow_users: [deploy]\n  offer_keys:\n").unwrap_err();
+        assert!(err.contains("ssh.offer_keys is required"), "{err}");
+    }
+
+    /// The new rules run last: a config that is also wrong somewhere older reports
+    /// the older error, as before.
+    #[test]
+    fn signing_settings_validate_after_every_older_rule() {
+        let err = validate_yaml(
+            "ssh:\n  approval:\n    policy: maybe\n  allow_users: [_x]\napproval_timeout: 0s\n",
+        )
+        .unwrap_err();
+        assert!(err.starts_with("ssh.approval.policy"), "{err}");
+        let err = validate_yaml("ssh:\n  allow_users: [_x]\napproval_timeout: 0s\n").unwrap_err();
+        assert!(err.starts_with("approval_timeout"), "{err}");
+    }
+
+    /// An entry in an error message is quoted, escaped and cut, so a long key line or a
+    /// control character cannot sprawl over (or forge) a log line.
+    #[test]
+    fn quoted_entries_are_escaped_and_bounded() {
+        assert_eq!(quote_entry("deploy"), "\"deploy\"");
+        assert_eq!(quote_entry("a\nb"), "\"a\\nb\"");
+        let long = "x".repeat(100);
+        assert_eq!(quote_entry(&long), format!("\"{}...\"", "x".repeat(48)));
+    }
+
+    /// The accessor fails closed on a config that was never validated.
+    #[test]
+    fn sign_policy_of_an_unvalidated_config_fails_closed() {
+        let fp = FIXTURE_FINGERPRINTS[0].1;
+        for body in [
+            // Not lists.
+            "  allow_users: deploy\n  offer_keys: SHA256:x\n".to_string(),
+            // The widening rule: a login as `deploy` with no filter would let any key
+            // in the agent sign it.
+            "  allow_users: [deploy]\n".to_string(),
+            "  allow_users: [git, deploy]\n  offer_keys:\n".to_string(),
+            // A control character in a name, even with a filter.
+            format!("  allow_users: [\"de\\tploy\"]\n  offer_keys: [\"{fp}\"]\n"),
+            // A reserved name.
+            format!("  allow_users: [_bootstrap]\n  offer_keys: [\"{fp}\"]\n"),
+            // A bad key entry beside a good one.
+            format!("  offer_keys: [junk, \"{fp}\"]\n"),
+        ] {
+            let cfg = ssh_config(&body);
+            assert!(cfg.validate().is_err(), "{body:?} must not validate");
+            let policy = cfg.ssh_sign_policy();
+            assert!(
+                policy.allow_users().is_empty(),
+                "{body:?}: no username, got {:?}",
+                policy.allow_users()
+            );
+            let filter = policy.offer_keys().expect("a filter, offering nothing");
+            assert!(filter.is_empty(), "{body:?}: no key offered");
+        }
+    }
+
+    /// A key line whose fields are separated by tabs or several spaces (which
+    /// `ssh-keygen -lf` accepts), with whitespace around it, or with a comment of any
+    /// spacing, names the same key as its fingerprint.
+    #[test]
+    fn key_line_field_spacing_is_normalized() {
+        for (stem, fp) in FIXTURE_FINGERPRINTS {
+            let line = fixture_pub_line(stem);
+            let mut fields = line.split_whitespace();
+            let (ty, b64) = (fields.next().unwrap(), fields.next().unwrap());
+            let want = parse_offer_key(fp).unwrap();
+            for variant in [
+                format!("{ty}\t{b64}"),
+                format!("{ty}  {b64}"),
+                format!("{ty} \t {b64}\tcomment"),
+                format!("  \t{ty} {b64} comment \t "),
+                format!("{ty} {b64} my   work  laptop"),
+                format!("{ty}\t\t{b64}  \t my   work  laptop"),
+            ] {
+                assert_eq!(parse_offer_key(&variant), Ok(want), "{stem}: {variant:?}");
+            }
+            // ...and through the config (a YAML double-quoted `\t` is a tab).
+            let cfg = ssh_config(&format!(
+                "  offer_keys: [\"{ty}\\t{b64}  my   work  laptop\"]\n"
+            ));
+            cfg.validate().unwrap();
+            let filter = cfg.ssh_sign_policy().offer_keys().cloned().unwrap();
+            assert_eq!(filter.len(), 1);
+            assert!(filter.contains_key_blob(&blob_of(&line)), "{stem}");
+        }
+    }
+
+    /// Key lines that name a key but carry more than one: authorized_keys options in
+    /// front (whatever the spacing), and a base64 blob with bytes after the key.
+    #[test]
+    fn key_lines_with_options_or_trailing_bytes_are_refused() {
+        let line = fixture_pub_line("test_ed25519");
+        let mut fields = line.split_whitespace();
+        let (ty, b64) = (fields.next().unwrap(), fields.next().unwrap());
+        let mut trailing = blob_of(&line);
+        trailing.extend([0, 0, 0, 0]);
+        let trailing_b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&trailing)
+        };
+        for entry in [
+            format!("no-pty {ty} {b64}"),
+            format!("restrict\t{ty} {b64} c"),
+            format!("command=\"echo hi\" {ty} {b64}"),
+            format!("command=\"true\",no-pty {ty} {b64} c"),
+            format!("{ty} {trailing_b64}"),
+            format!("{ty} {trailing_b64} c"),
+        ] {
+            let err = parse_offer_key(&entry).unwrap_err();
+            assert!(
+                err.contains("is not a SHA256 fingerprint or an OpenSSH public key"),
+                "{entry:?}: {err}"
+            );
+        }
+    }
+
+    /// Fingerprints are exactly `SHA256:` (case-sensitive) and the base64 of 32 bytes,
+    /// with at most one `=` of padding.
+    #[test]
+    fn malformed_fingerprints_are_refused() {
+        use base64::Engine as _;
+        let fp = FIXTURE_FINGERPRINTS[0].1;
+        let b64 = fp.strip_prefix("SHA256:").unwrap();
+        let sha512 = base64::engine::general_purpose::STANDARD_NO_PAD.encode([7u8; 64]);
+        let sha1 = base64::engine::general_purpose::STANDARD_NO_PAD.encode([7u8; 20]);
+        for entry in [
+            format!("SHA-256:{b64}"),
+            format!("SHA256{b64}"),
+            format!("SHA256 {b64}"),
+            format!("sha256:{b64}"),
+            format!("Sha256:{b64}"),
+            format!("SHA512:{sha512}"),
+            format!("SHA1:{sha1}"),
+            format!("MD5:{b64}"),
+            format!("{fp}=="),
+            format!("{fp}==="),
+            format!("SHA256:{sha512}"),
+        ] {
+            let err = parse_offer_key(&entry).unwrap_err();
+            assert!(
+                err.contains("is not a SHA256 fingerprint or an OpenSSH public key"),
+                "{entry:?}: {err}"
+            );
+        }
+    }
+
+    /// YAML reads `123`, `yes` and `true` as text with that spelling: as usernames they
+    /// are names besides `git` (so they need a filter); as key entries they name no key.
+    #[test]
+    fn numeric_and_boolean_entries_are_text() {
+        for (body, found) in [
+            ("  allow_users: [123]\n", "(found: 123)"),
+            ("  allow_users: [yes]\n", "(found: yes)"),
+            ("  allow_users:\n    - true\n    - 0\n", "(found: true, 0)"),
+        ] {
+            let err = validate_ssh(body).unwrap_err();
+            assert!(
+                err.contains("ssh.offer_keys is required"),
+                "{body:?}: {err}"
+            );
+            assert!(err.contains(found), "{body:?}: {err}");
+        }
+        let cfg = ssh_config("  allow_users: [123, yes, true, \"null\"]\n  offer_keys: []\n");
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.ssh_sign_policy().allow_users(),
+            ["123", "yes", "true", "null"].map(String::from)
+        );
+        for entry in ["123", "yes", "true", "1.5"] {
+            let err = validate_ssh(&format!("  offer_keys: [{entry}]\n")).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "ssh.offer_keys entry \"{entry}\" is not a SHA256 fingerprint or an \
+                     OpenSSH public key"
+                )
+            );
+        }
+    }
+
+    /// Usernames are compared byte-exactly and kept as written: non-ASCII text, inner
+    /// and surrounding spaces and a very long name are accepted unchanged.
+    #[test]
+    fn usernames_are_kept_byte_exact() {
+        let long = "u".repeat(10_000);
+        let names = ["dévelop", "用户", "de ploy", " deploy ", long.as_str()];
+        let mut yaml = String::from("  offer_keys: []\n  allow_users:\n");
+        for name in names {
+            yaml.push_str(&format!("    - \"{name}\"\n"));
+        }
+        let cfg = ssh_config(&yaml);
+        cfg.validate().unwrap();
+        let policy = cfg.ssh_sign_policy();
+        assert_eq!(policy.allow_users(), names.map(String::from));
+        // Without the filter, each is a name besides `git`, quoted as written.
+        let err = validate_ssh("  allow_users: [\" deploy \"]\n").unwrap_err();
+        assert!(err.contains("(found:  deploy )"), "{err}");
     }
 }

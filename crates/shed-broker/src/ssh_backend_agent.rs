@@ -168,6 +168,12 @@ impl SshBackend for AgentForwardBackend {
     fn mode(&self) -> &str {
         "agent-forward"
     }
+
+    /// An agent refuses a key it does not hold with `SSH_AGENT_FAILURE`, which `sign`
+    /// reads as this.
+    fn unknown_key_error(&self) -> String {
+        "agent: failed to sign challenge".to_string()
+    }
 }
 
 /// Frame and send a request: `uint32-BE len ‖ payload` (Go's `serialCall`). Agent
@@ -668,6 +674,184 @@ mod tests {
         let be = AgentForwardBackend::from_sock(Some(OsString::from("/nonexistent/agent.sock")))
             .unwrap();
         assert_eq!(be.mode(), "agent-forward");
+    }
+
+    /// The `ssh.offer_keys` filter through the agent-forward backend: wrapping asks the
+    /// agent nothing; `list` returns only the offered identities; `sign` with an
+    /// identity the agent holds but is not offered fails exactly as a key the agent
+    /// does not hold (its `SSH_AGENT_FAILURE` reading), and never reaches the agent.
+    #[test]
+    fn key_filter_through_the_agent() {
+        use crate::sign_check::KeyFilter;
+        use crate::ssh_backend::{with_key_filter, OfferCount};
+        let (a, b, c) = (ed25519_blob(11), ed25519_blob(12), ed25519_blob(13));
+        let fake = FakeAgent::start(Behavior::Serve {
+            identities: vec![
+                (a.clone(), "a".to_string()),
+                (b.clone(), "b".to_string()),
+                (c.clone(), "c".to_string()),
+            ],
+            sig_format: "ssh-ed25519".to_string(),
+            sig_blob: vec![9u8; 64],
+        });
+        let mut filter = KeyFilter::new();
+        filter.insert_key_blob(&a);
+        filter.insert_key_blob(&c);
+        let filtered = with_key_filter(
+            Arc::new(fake.backend(DEFAULT_IO_TIMEOUT)),
+            Some(filter),
+            None,
+        );
+        assert_eq!(fake.conn_count(), 0, "wrapping makes no call to the agent");
+        assert_eq!(filtered.mode(), "agent-forward");
+
+        let listed: Vec<(Vec<u8>, String)> = filtered
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|k| (k.blob, k.comment))
+            .collect();
+        assert_eq!(
+            listed,
+            [(a.clone(), "a".to_string()), (c.clone(), "c".into())]
+        );
+        assert_eq!(
+            filtered.counts().get(),
+            Some(OfferCount {
+                offered: 2,
+                available: 3
+            })
+        );
+
+        // The unoffered key: the agent's own refusal text, with no request sent.
+        assert_eq!(
+            filtered.sign(&b, b"d", 0).unwrap_err(),
+            "agent: failed to sign challenge"
+        );
+        let failing = FakeAgent::start(Behavior::Failure);
+        assert_eq!(
+            failing
+                .backend(DEFAULT_IO_TIMEOUT)
+                .sign(&b, b"d", 0)
+                .unwrap_err(),
+            filtered.sign(&b, b"d", 0).unwrap_err(),
+            "not offered reads exactly as not held"
+        );
+        assert_eq!(
+            fake.requests().len(),
+            1,
+            "only the listing reached the agent"
+        );
+
+        // An offered key goes through to the agent.
+        let sig = filtered.sign(&c, b"d", 0).unwrap();
+        assert_eq!(sig.blob, vec![9u8; 64]);
+        let reqs = fake.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(decode_sign_request(&reqs[1]).0, c);
+    }
+
+    /// An empty `ssh.offer_keys` through the agent-forward backend: the listing still
+    /// asks the agent (once) and offers nothing; a sign with a key the agent holds is
+    /// refused with the agent's refusal text and never reaches the agent.
+    #[test]
+    fn empty_key_filter_through_the_agent() {
+        use crate::sign_check::KeyFilter;
+        use crate::ssh_backend::{with_key_filter, OfferCount};
+        let (a, b) = (ed25519_blob(21), ed25519_blob(22));
+        let fake = FakeAgent::start(Behavior::Serve {
+            identities: vec![(a.clone(), "a".to_string()), (b.clone(), "b".to_string())],
+            sig_format: "ssh-ed25519".to_string(),
+            sig_blob: vec![9u8; 64],
+        });
+        let filtered = with_key_filter(
+            Arc::new(fake.backend(DEFAULT_IO_TIMEOUT)),
+            Some(KeyFilter::new()),
+            None,
+        );
+        assert!(filtered.list().unwrap().is_empty());
+        assert_eq!(
+            filtered.counts().get(),
+            Some(OfferCount {
+                offered: 0,
+                available: 2
+            })
+        );
+        for key in [&a, &b] {
+            assert_eq!(
+                filtered.sign(key, b"d", 0).unwrap_err(),
+                "agent: failed to sign challenge"
+            );
+        }
+        let reqs = fake.requests();
+        assert_eq!(reqs.len(), 1, "only the listing reached the agent");
+        assert_eq!(reqs[0], [SSH_AGENTC_REQUEST_IDENTITIES]);
+    }
+
+    /// The counts follow the agent: when its key set changes between two listings,
+    /// the second listing's counts replace the first's.
+    #[test]
+    fn key_filter_counts_follow_the_agents_key_set() {
+        use crate::sign_check::KeyFilter;
+        use crate::ssh_backend::{with_key_filter, OfferCount};
+        let (a, b, c, d) = (
+            ed25519_blob(31),
+            ed25519_blob(32),
+            ed25519_blob(33),
+            ed25519_blob(34),
+        );
+        let serve = |ids: &[&Vec<u8>]| Behavior::Serve {
+            identities: ids
+                .iter()
+                .map(|k| ((*k).clone(), "k".to_string()))
+                .collect(),
+            sig_format: "ssh-ed25519".to_string(),
+            sig_blob: vec![9u8; 64],
+        };
+        // The agent before (a, b, c) and after (c, d: a and b removed, d added).
+        let before = FakeAgent::start(serve(&[&a, &b, &c]));
+        let after = FakeAgent::start(serve(&[&c, &d]));
+        // One socket path that is re-pointed from the first agent to the second.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("agent.sock");
+        std::os::unix::fs::symlink(&before.path, &link).unwrap();
+        let backend = AgentForwardBackend {
+            socket_path: link.clone(),
+            io_timeout: DEFAULT_IO_TIMEOUT,
+        };
+        let mut filter = KeyFilter::new();
+        for key in [&a, &b, &d] {
+            filter.insert_key_blob(key);
+        }
+        let filtered = with_key_filter(Arc::new(backend), Some(filter), None);
+
+        assert_eq!(filtered.list().unwrap().len(), 2);
+        assert_eq!(
+            filtered.counts().get(),
+            Some(OfferCount {
+                offered: 2,
+                available: 3
+            })
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&after.path, &link).unwrap();
+        let listed: Vec<Vec<u8>> = filtered
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|k| k.blob)
+            .collect();
+        assert_eq!(listed, std::slice::from_ref(&d));
+        assert_eq!(
+            filtered.counts().get(),
+            Some(OfferCount {
+                offered: 1,
+                available: 2
+            })
+        );
+        assert_eq!(before.requests().len(), 1);
+        assert_eq!(after.requests().len(), 1);
     }
 
     #[test]

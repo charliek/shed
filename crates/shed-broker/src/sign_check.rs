@@ -451,6 +451,11 @@ impl KeyFilter {
         self.digests.contains(&key_blob_digest(blob))
     }
 
+    /// The digests in the filter, in no particular order.
+    pub fn digests(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.digests.iter()
+    }
+
     pub fn len(&self) -> usize {
         self.digests.len()
     }
@@ -1042,10 +1047,26 @@ pub(crate) fn parse_sshsig(data: &[u8]) -> Result<SshSigFields<'_>, Refusal> {
 
 /// `SHA256:<unpadded base64>` of a key blob, as `ssh-add -l` prints it.
 fn fingerprint(blob: &[u8]) -> String {
+    digest_fingerprint(&key_blob_digest(blob))
+}
+
+/// `SHA256:<unpadded base64>` of a [`key_blob_digest`], as `ssh-add -l` and
+/// `ssh-keygen -l` print it.
+pub fn digest_fingerprint(digest: &[u8; 32]) -> String {
     format!(
         "SHA256:{}",
-        base64::engine::general_purpose::STANDARD_NO_PAD.encode(key_blob_digest(blob))
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)
     )
+}
+
+/// Whether `blob` is a key the broker signs with — the exact rule [`SignPolicy::check`]
+/// applies to the key a request names (module doc, "The key"). The config uses it so an
+/// `ssh.offer_keys` entry that could never sign is refused at load rather than offered
+/// in vain. On a refusal, the error is its [`Refusal::detail`].
+pub(crate) fn check_signing_key(blob: &[u8]) -> Result<(), String> {
+    signing_key_type(blob)
+        .map(|_| ())
+        .map_err(|r| r.detail().to_string())
 }
 
 /// A shed-supplied value for a refusal detail: its first 64 bytes, every byte
