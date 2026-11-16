@@ -1,0 +1,187 @@
+{
+  "comment": "Real ssh-agent sign requests recorded by capture.py (see README.md). Keys are throwaway, generated for the capture. Do not edit by hand.",
+  "versions": {
+    "client": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13 30 Jan 2024",
+    "server": "1:9.6p1-3ubuntu13.20",
+    "image": "Ubuntu 24.04.5 LTS"
+  },
+  "host_certificate_b64": "AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIG7JGvdYHLO4YFjAh0gzBz7d+M4px+5VfFYQuLRh+9j0AAAAIF7v9Es4odHHgdcMF0Dy0bkXIiniKoQGvSV4+huzGCfuAAAAAAAAAAAAAAACAAAADnRocm93YXdheS1ob3N0AAAADQAAAAkxMjcuMC4wLjEAAAAAAAAAAP//////////AAAAAAAAAAAAAAAAAAAAMwAAAAtzc2gtZWQyNTUxOQAAACBgcdLSkF6tbssJGSm1hY2Z0Sczq+tm3s71XBXxD46iqwAAAFMAAAALc3NoLWVkMjU1MTkAAABAT4dzsSr9DN7Xfke8oeGf0v+2ge1RjAiMoLwPM5FKiEfz+Tgeeaq2BLfAPhzFiz80Nzw4S+Tz+ahhGtvVBMA6Bg==",
+  "vectors": [
+    {
+      "name": "login-ed25519-hostbound-sntrup",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=host-bound git@127.0.0.1",
+      "user_key": "ed25519",
+      "username": "git",
+      "expect": "accept",
+      "flags": 0,
+      "public_key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yL",
+      "data_b64": "AAAAQLyCDoSLVRVdBnMyQjlU7UYHHzbpA0V1r9rPDV5mOt4446UnTzf7fIkx4290Rk0B4MZaPTa5vJEN0PcaGcu4KaQyAAAAA2dpdAAAAA5zc2gtY29ubmVjdGlvbgAAACNwdWJsaWNrZXktaG9zdGJvdW5kLXYwMEBvcGVuc3NoLmNvbQEAAAALc3NoLWVkMjU1MTkAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yLAAAAMwAAAAtzc2gtZWQyNTUxOQAAACBe7/RLOKHRx4HXDBdA8tG5FyIp4iqEBr0lePobsxgn7g=="
+    },
+    {
+      "name": "login-ed25519-publickey-curve25519",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=unbound -o KexAlgorithms=curve25519-sha256 git@127.0.0.1",
+      "user_key": "ed25519",
+      "username": "git",
+      "expect": "accept",
+      "flags": 0,
+      "public_key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yL",
+      "data_b64": "AAAAIGs4M7kEMXaMQC2MefgpOfehBma46uLzZDo7bACfeNb7MgAAAANnaXQAAAAOc3NoLWNvbm5lY3Rpb24AAAAJcHVibGlja2V5AQAAAAtzc2gtZWQyNTUxOQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqeUNWSEhg9Dkl8k10gYHNMgRZBZsQa5Q/zoN71YH/Is="
+    },
+    {
+      "name": "login-ed25519-hostbound-nistp384-ecdsahost",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=host-bound -o KexAlgorithms=ecdh-sha2-nistp384 -o HostKeyAlgorithms=ecdsa-sha2-nistp256 git@127.0.0.1",
+      "user_key": "ed25519",
+      "username": "git",
+      "expect": "accept",
+      "flags": 0,
+      "public_key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yL",
+      "data_b64": "AAAAMOD0B+riw0jm8p92zBoWvYuJm6ND3jMGP2YOSdcdrtCCSEAA9pm6tNrZtI/kzMhYuDIAAAADZ2l0AAAADnNzaC1jb25uZWN0aW9uAAAAI3B1YmxpY2tleS1ob3N0Ym91bmQtdjAwQG9wZW5zc2guY29tAQAAAAtzc2gtZWQyNTUxOQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqeUNWSEhg9Dkl8k10gYHNMgRZBZsQa5Q/zoN71YH/IsAAABoAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOj8Xgk/DLQHx61g2A52N1xdGCWtlyOnf9m/oGzkiiosZpuVh0nYap2msisFR+vKbD2ccDHAGEbDuXvMizby5fc="
+    },
+    {
+      "name": "login-ed25519-hostbound-group14sha1-rsahost",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=host-bound -o KexAlgorithms=diffie-hellman-group14-sha1 -o HostKeyAlgorithms=rsa-sha2-512 git@127.0.0.1",
+      "user_key": "ed25519",
+      "username": "git",
+      "expect": "accept",
+      "flags": 0,
+      "public_key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yL",
+      "data_b64": "AAAAFBucfXg0Sx/anWxZxd0H2///Y9w0MgAAAANnaXQAAAAOc3NoLWNvbm5lY3Rpb24AAAAjcHVibGlja2V5LWhvc3Rib3VuZC12MDBAb3BlbnNzaC5jb20BAAAAC3NzaC1lZDI1NTE5AAAAMwAAAAtzc2gtZWQyNTUxOQAAACCp5Q1ZISGD0OSXyTXSBgc0yBFkFmxBrlD/Og3vVgf8iwAAAZcAAAAHc3NoLXJzYQAAAAMBAAEAAAGBAMOTqZfTzQCAA8Yc6gz/Yzt18TdFzl+TwJ18sVpeVQ+mNdOfBpjnURUlPWFRDneHO6cAnspTeFPmGde0ujCJ7ULWfQwJ12Bhl6s3Lv18umK1wkGxr0vyigidZ/kDQ4FC7Xn4El/kJJhGgTdrQ3P1BWQhtHU3oxUeGfx0kwP9Yo6v6JC1O4NthSmtkZ9PTAV56rOEVvDUh1Y4yxH8UcqMyEUVXWgrj5MLb5E8VHq572G1GxhFKtdGO8je2YuYluxwT5a+7MA3LmAoAAFbt+NhZL1bJrrLVIqjNfyWKzv/pvBOfzmQTYGAb0JJFHPwBcLqeMG7tTd8yTMxtdixKNYt6vVtb8T/kIXdSybhuBMYFmLw9jRlAocR9ntD1JHG+Dj9JtkDM7h6jjmI6pkeJ29ulfAqMGZR+JqdscPiBFmijPOUsqMe21c85J5NOfT0z4E/6fa7fYFDwa02RJv5qRNqx0amMTMbfvIS6nmMuD30gkkCt9a9ihSbu1+DNbx42t6ZOw=="
+    },
+    {
+      "name": "login-rsa-sha2-512-hostbound",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=host-bound git@127.0.0.1",
+      "user_key": "rsa",
+      "username": "git",
+      "expect": "accept",
+      "flags": 4,
+      "public_key_b64": "AAAAB3NzaC1yc2EAAAADAQABAAABgQCjNkiAjBjmaO+0LlBcSpu6gnanmBfySSAzRvDNYHe7A3jWbxSye/xuwOAweZFnR3WsQbLpZ66UauKBG1Duk9DjrKMJFqRaXSO2k51+LEwwWpxVhtjnwgxXxXgDJyZFhvqxgE2/myd9MmUmoY5A/6alksr1VQLZJvXIC/fJtxTPTXpdQ1B8dcSxE2G+A0JpH2gsNRP4+bqc6LHxfiQLRJlDq7SJH0kyBi9JntI8NqOfBelEg8NKP463DzFRCZFaIZNMV3qUJEKyDLEVrlTa50xAeenYuNe1TmLUGTD03Iksalt1R3EZkHiJwCMMYQlrWkxnO+1kqGu+7acO+6PmMNdSMWCcHTN1Iy9ztZb4KUWzhottIBLnxX1rGaQi125MKQ26HHaDgb7BXRSIODActNCNe7u1ys8JnaQeEjk1w/KmzhLVND1cjrPHg5c0DhhfoZFiCcrkanFR4Tw5XbUHWnNVYacav4cbDJRr/uDFC0wLxId/WFQetbcj7Vi+RPCHpys=",
+      "data_b64": "AAAAQOvnQnXEfCXg60brJN+y3mVpLyNBJR3buHAh6Q9bVoriksG3jBDJ55r47O7R0t3KYefwHeslWHdOXjw7vqaE214yAAAAA2dpdAAAAA5zc2gtY29ubmVjdGlvbgAAACNwdWJsaWNrZXktaG9zdGJvdW5kLXYwMEBvcGVuc3NoLmNvbQEAAAAMcnNhLXNoYTItNTEyAAABlwAAAAdzc2gtcnNhAAAAAwEAAQAAAYEAozZIgIwY5mjvtC5QXEqbuoJ2p5gX8kkgM0bwzWB3uwN41m8Usnv8bsDgMHmRZ0d1rEGy6WeulGrigRtQ7pPQ46yjCRakWl0jtpOdfixMMFqcVYbY58IMV8V4AycmRYb6sYBNv5snfTJlJqGOQP+mpZLK9VUC2Sb1yAv3ybcUz016XUNQfHXEsRNhvgNCaR9oLDUT+Pm6nOix8X4kC0SZQ6u0iR9JMgYvSZ7SPDajnwXpRIPDSj+Otw8xUQmRWiGTTFd6lCRCsgyxFa5U2udMQHnp2LjXtU5i1Bkw9NyJLGpbdUdxGZB4icAjDGEJa1pMZzvtZKhrvu2nDvuj5jDXUjFgnB0zdSMvc7WW+ClFs4aLbSAS58V9axmkItduTCkNuhx2g4G+wV0UiDgwHLTQjXu7tcrPCZ2kHhI5NcPyps4S1TQ9XI6zx4OXNA4YX6GRYgnK5GpxUeE8OV21B1pzVWGnGr+HGwyUa/7gxQtMC8SHf1hUHrW3I+1YvkTwh6crAAAAMwAAAAtzc2gtZWQyNTUxOQAAACBe7/RLOKHRx4HXDBdA8tG5FyIp4iqEBr0lePobsxgn7g=="
+    },
+    {
+      "name": "login-rsa-sha2-256-publickey",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=unbound -o PubkeyAcceptedAlgorithms=rsa-sha2-256 git@127.0.0.1",
+      "user_key": "rsa",
+      "username": "git",
+      "expect": "accept",
+      "flags": 2,
+      "public_key_b64": "AAAAB3NzaC1yc2EAAAADAQABAAABgQCjNkiAjBjmaO+0LlBcSpu6gnanmBfySSAzRvDNYHe7A3jWbxSye/xuwOAweZFnR3WsQbLpZ66UauKBG1Duk9DjrKMJFqRaXSO2k51+LEwwWpxVhtjnwgxXxXgDJyZFhvqxgE2/myd9MmUmoY5A/6alksr1VQLZJvXIC/fJtxTPTXpdQ1B8dcSxE2G+A0JpH2gsNRP4+bqc6LHxfiQLRJlDq7SJH0kyBi9JntI8NqOfBelEg8NKP463DzFRCZFaIZNMV3qUJEKyDLEVrlTa50xAeenYuNe1TmLUGTD03Iksalt1R3EZkHiJwCMMYQlrWkxnO+1kqGu+7acO+6PmMNdSMWCcHTN1Iy9ztZb4KUWzhottIBLnxX1rGaQi125MKQ26HHaDgb7BXRSIODActNCNe7u1ys8JnaQeEjk1w/KmzhLVND1cjrPHg5c0DhhfoZFiCcrkanFR4Tw5XbUHWnNVYacav4cbDJRr/uDFC0wLxId/WFQetbcj7Vi+RPCHpys=",
+      "data_b64": "AAAAQAS7uPTASC9qimhvdiOA77lGfTbN4GssWscc3pWxnj2CSmUsUBk9/j+1Ic3/jVfHU3DzXOynQ9qtnYILMQvmTkwyAAAAA2dpdAAAAA5zc2gtY29ubmVjdGlvbgAAAAlwdWJsaWNrZXkBAAAADHJzYS1zaGEyLTI1NgAAAZcAAAAHc3NoLXJzYQAAAAMBAAEAAAGBAKM2SICMGOZo77QuUFxKm7qCdqeYF/JJIDNG8M1gd7sDeNZvFLJ7/G7A4DB5kWdHdaxBsulnrpRq4oEbUO6T0OOsowkWpFpdI7aTnX4sTDBanFWG2OfCDFfFeAMnJkWG+rGATb+bJ30yZSahjkD/pqWSyvVVAtkm9cgL98m3FM9Nel1DUHx1xLETYb4DQmkfaCw1E/j5upzosfF+JAtEmUOrtIkfSTIGL0me0jw2o58F6USDw0o/jrcPMVEJkVohk0xXepQkQrIMsRWuVNrnTEB56di417VOYtQZMPTciSxqW3VHcRmQeInAIwxhCWtaTGc77WSoa77tpw77o+Yw11IxYJwdM3UjL3O1lvgpRbOGi20gEufFfWsZpCLXbkwpDbocdoOBvsFdFIg4MBy00I17u7XKzwmdpB4SOTXD8qbOEtU0PVyOs8eDlzQOGF+hkWIJyuRqcVHhPDldtQdac1Vhpxq/hxsMlGv+4MULTAvEh39YVB61tyPtWL5E8IenKw=="
+    },
+    {
+      "name": "login-ssh-rsa-hostbound",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=host-bound -o PubkeyAcceptedAlgorithms=ssh-rsa git@127.0.0.1",
+      "user_key": "rsa",
+      "username": "git",
+      "expect": "accept",
+      "flags": 0,
+      "public_key_b64": "AAAAB3NzaC1yc2EAAAADAQABAAABgQCjNkiAjBjmaO+0LlBcSpu6gnanmBfySSAzRvDNYHe7A3jWbxSye/xuwOAweZFnR3WsQbLpZ66UauKBG1Duk9DjrKMJFqRaXSO2k51+LEwwWpxVhtjnwgxXxXgDJyZFhvqxgE2/myd9MmUmoY5A/6alksr1VQLZJvXIC/fJtxTPTXpdQ1B8dcSxE2G+A0JpH2gsNRP4+bqc6LHxfiQLRJlDq7SJH0kyBi9JntI8NqOfBelEg8NKP463DzFRCZFaIZNMV3qUJEKyDLEVrlTa50xAeenYuNe1TmLUGTD03Iksalt1R3EZkHiJwCMMYQlrWkxnO+1kqGu+7acO+6PmMNdSMWCcHTN1Iy9ztZb4KUWzhottIBLnxX1rGaQi125MKQ26HHaDgb7BXRSIODActNCNe7u1ys8JnaQeEjk1w/KmzhLVND1cjrPHg5c0DhhfoZFiCcrkanFR4Tw5XbUHWnNVYacav4cbDJRr/uDFC0wLxId/WFQetbcj7Vi+RPCHpys=",
+      "data_b64": "AAAAQO8OU54v4YD6uXUuj5fHLkE6uUpBKU02awbAvpiKCPG6Ji2ENXe3pyFDC0cPr6uU+DBZ9pPZidUucA9Ylzhi33YyAAAAA2dpdAAAAA5zc2gtY29ubmVjdGlvbgAAACNwdWJsaWNrZXktaG9zdGJvdW5kLXYwMEBvcGVuc3NoLmNvbQEAAAAHc3NoLXJzYQAAAZcAAAAHc3NoLXJzYQAAAAMBAAEAAAGBAKM2SICMGOZo77QuUFxKm7qCdqeYF/JJIDNG8M1gd7sDeNZvFLJ7/G7A4DB5kWdHdaxBsulnrpRq4oEbUO6T0OOsowkWpFpdI7aTnX4sTDBanFWG2OfCDFfFeAMnJkWG+rGATb+bJ30yZSahjkD/pqWSyvVVAtkm9cgL98m3FM9Nel1DUHx1xLETYb4DQmkfaCw1E/j5upzosfF+JAtEmUOrtIkfSTIGL0me0jw2o58F6USDw0o/jrcPMVEJkVohk0xXepQkQrIMsRWuVNrnTEB56di417VOYtQZMPTciSxqW3VHcRmQeInAIwxhCWtaTGc77WSoa77tpw77o+Yw11IxYJwdM3UjL3O1lvgpRbOGi20gEufFfWsZpCLXbkwpDbocdoOBvsFdFIg4MBy00I17u7XKzwmdpB4SOTXD8qbOEtU0PVyOs8eDlzQOGF+hkWIJyuRqcVHhPDldtQdac1Vhpxq/hxsMlGv+4MULTAvEh39YVB61tyPtWL5E8IenKwAAADMAAAALc3NoLWVkMjU1MTkAAAAgXu/0Szih0ceB1wwXQPLRuRciKeIqhAa9JXj6G7MYJ+4="
+    },
+    {
+      "name": "login-ecdsa-p256-hostbound",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=host-bound git@127.0.0.1",
+      "user_key": "ecdsa",
+      "username": "git",
+      "expect": "accept",
+      "flags": 0,
+      "public_key_b64": "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLkoMy2mqDwmMS5C6V57QqO6v8vhi7dj3b+OK/Y3jwxeaIM6nU9vWg/zbXvfvO5nsMOB7/Xt9W1prlUo8Dic/rk=",
+      "data_b64": "AAAAQEo9b4iWiqEUtlYRr5pfv/w1X6t6s0nYmYE/gTDdrMO0zAdJU6dk5/biAh6qITrhfBPlxjp7DZCoKZf/GhXxCrUyAAAAA2dpdAAAAA5zc2gtY29ubmVjdGlvbgAAACNwdWJsaWNrZXktaG9zdGJvdW5kLXYwMEBvcGVuc3NoLmNvbQEAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEEuSgzLaaoPCYxLkLpXntCo7q/y+GLt2Pdv44r9jePDF5ogzqdT29aD/Nte9+87meww4Hv9e31bWmuVSjwOJz+uQAAADMAAAALc3NoLWVkMjU1MTkAAAAgXu/0Szih0ceB1wwXQPLRuRciKeIqhAa9JXj6G7MYJ+4="
+    },
+    {
+      "name": "login-ed25519-hostbound-user-deploy",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=host-bound deploy@127.0.0.1",
+      "user_key": "ed25519",
+      "username": "deploy",
+      "expect": "refuse:username_not_allowed",
+      "flags": 0,
+      "public_key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yL",
+      "data_b64": "AAAAQLfsUzme+oPmQ7VZ/qYpgad7zM6O0zXFqZ2l9PKH4q53mnd29JQTyI6NEDsfWcM4vp8ZHxOaw9lX68Ctmgnx83syAAAABmRlcGxveQAAAA5zc2gtY29ubmVjdGlvbgAAACNwdWJsaWNrZXktaG9zdGJvdW5kLXYwMEBvcGVuc3NoLmNvbQEAAAALc3NoLWVkMjU1MTkAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yLAAAAMwAAAAtzc2gtZWQyNTUxOQAAACBe7/RLOKHRx4HXDBdA8tG5FyIp4iqEBr0lePobsxgn7g=="
+    },
+    {
+      "name": "login-rsa-publickey-user-deploy",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=unbound deploy@127.0.0.1",
+      "user_key": "rsa",
+      "username": "deploy",
+      "expect": "refuse:username_not_allowed",
+      "flags": 4,
+      "public_key_b64": "AAAAB3NzaC1yc2EAAAADAQABAAABgQCjNkiAjBjmaO+0LlBcSpu6gnanmBfySSAzRvDNYHe7A3jWbxSye/xuwOAweZFnR3WsQbLpZ66UauKBG1Duk9DjrKMJFqRaXSO2k51+LEwwWpxVhtjnwgxXxXgDJyZFhvqxgE2/myd9MmUmoY5A/6alksr1VQLZJvXIC/fJtxTPTXpdQ1B8dcSxE2G+A0JpH2gsNRP4+bqc6LHxfiQLRJlDq7SJH0kyBi9JntI8NqOfBelEg8NKP463DzFRCZFaIZNMV3qUJEKyDLEVrlTa50xAeenYuNe1TmLUGTD03Iksalt1R3EZkHiJwCMMYQlrWkxnO+1kqGu+7acO+6PmMNdSMWCcHTN1Iy9ztZb4KUWzhottIBLnxX1rGaQi125MKQ26HHaDgb7BXRSIODActNCNe7u1ys8JnaQeEjk1w/KmzhLVND1cjrPHg5c0DhhfoZFiCcrkanFR4Tw5XbUHWnNVYacav4cbDJRr/uDFC0wLxId/WFQetbcj7Vi+RPCHpys=",
+      "data_b64": "AAAAQGYbsi/GocWjCoA7sElBk5b/72ZmSCzFeUE3J48I+NCiGAbHB7a2tk9LCxTzXQVKV5WJtBI2g54aeDOq7AkgnlIyAAAABmRlcGxveQAAAA5zc2gtY29ubmVjdGlvbgAAAAlwdWJsaWNrZXkBAAAADHJzYS1zaGEyLTUxMgAAAZcAAAAHc3NoLXJzYQAAAAMBAAEAAAGBAKM2SICMGOZo77QuUFxKm7qCdqeYF/JJIDNG8M1gd7sDeNZvFLJ7/G7A4DB5kWdHdaxBsulnrpRq4oEbUO6T0OOsowkWpFpdI7aTnX4sTDBanFWG2OfCDFfFeAMnJkWG+rGATb+bJ30yZSahjkD/pqWSyvVVAtkm9cgL98m3FM9Nel1DUHx1xLETYb4DQmkfaCw1E/j5upzosfF+JAtEmUOrtIkfSTIGL0me0jw2o58F6USDw0o/jrcPMVEJkVohk0xXepQkQrIMsRWuVNrnTEB56di417VOYtQZMPTciSxqW3VHcRmQeInAIwxhCWtaTGc77WSoa77tpw77o+Yw11IxYJwdM3UjL3O1lvgpRbOGi20gEufFfWsZpCLXbkwpDbocdoOBvsFdFIg4MBy00I17u7XKzwmdpB4SOTXD8qbOEtU0PVyOs8eDlzQOGF+hkWIJyuRqcVHhPDldtQdac1Vhpxq/hxsMlGv+4MULTAvEh39YVB61tyPtWL5E8IenKw=="
+    },
+    {
+      "name": "login-ed25519-hostbound-hostcert",
+      "shape": "login",
+      "client": "ssh -o PubkeyAuthentication=host-bound -o HostKeyAlgorithms=ssh-ed25519-cert-v01@openssh.com git@127.0.0.1",
+      "user_key": "ed25519",
+      "username": "git",
+      "expect": "accept",
+      "flags": 0,
+      "public_key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yL",
+      "data_b64": "AAAAQFBSz0l35kKAUT+D+QObCAWM34fv4uByn2AqQ9RBEQStlm8fuc3+W8rR6QReRNNR9xGbxLcn+dET+c7qL9dn4WwyAAAAA2dpdAAAAA5zc2gtY29ubmVjdGlvbgAAACNwdWJsaWNrZXktaG9zdGJvdW5kLXYwMEBvcGVuc3NoLmNvbQEAAAALc3NoLWVkMjU1MTkAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yLAAABRQAAACBzc2gtZWQyNTUxOS1jZXJ0LXYwMUBvcGVuc3NoLmNvbQAAACBuyRr3WByzuGBYwIdIMwc+3fjOKcfuVXxWELi0YfvY9AAAACBe7/RLOKHRx4HXDBdA8tG5FyIp4iqEBr0lePobsxgn7gAAAAAAAAAAAAAAAgAAAA50aHJvd2F3YXktaG9zdAAAAA0AAAAJMTI3LjAuMC4xAAAAAAAAAAD//////////wAAAAAAAAAAAAAAAAAAADMAAAALc3NoLWVkMjU1MTkAAAAgYHHS0pBerW7LCRkptYWNmdEnM6vrZt7O9VwV8Q+OoqsAAABTAAAAC3NzaC1lZDI1NTE5AAAAQE+Hc7Eq/Qze135HvKHhn9L/toHtUYwIjKC8DzORSohH8/k4HnmqtgS3wD4cxYs/NDc8OEvk8/moYRrb1QTAOgY="
+    },
+    {
+      "name": "sshsig-ed25519-git-sha512",
+      "shape": "sshsig",
+      "client": "ssh-keygen -Y sign -n git ",
+      "user_key": "ed25519",
+      "namespace": "git",
+      "expect": "accept",
+      "flags": 0,
+      "public_key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yL",
+      "data_b64": "U1NIU0lHAAAAA2dpdAAAAAAAAAAGc2hhNTEyAAAAQGz4ZYxB9ydlkAZH3bBywyDvsjvyeEx3wYItD57+J7KwZExjBgEBmIV/jFYinwGDD9BOD0lxqZYsl7Jji6++aRE="
+    },
+    {
+      "name": "sshsig-ed25519-git-sha256",
+      "shape": "sshsig",
+      "client": "ssh-keygen -Y sign -n git -O hashalg=sha256",
+      "user_key": "ed25519",
+      "namespace": "git",
+      "expect": "accept",
+      "flags": 0,
+      "public_key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yL",
+      "data_b64": "U1NIU0lHAAAAA2dpdAAAAAAAAAAGc2hhMjU2AAAAIPgB9vJTPmJar0mOzYLJMcpxncOSsQ9UHusRra1tDwVW"
+    },
+    {
+      "name": "sshsig-rsa-git-sha512",
+      "shape": "sshsig",
+      "client": "ssh-keygen -Y sign -n git ",
+      "user_key": "rsa",
+      "namespace": "git",
+      "expect": "accept",
+      "flags": 4,
+      "public_key_b64": "AAAAB3NzaC1yc2EAAAADAQABAAABgQCjNkiAjBjmaO+0LlBcSpu6gnanmBfySSAzRvDNYHe7A3jWbxSye/xuwOAweZFnR3WsQbLpZ66UauKBG1Duk9DjrKMJFqRaXSO2k51+LEwwWpxVhtjnwgxXxXgDJyZFhvqxgE2/myd9MmUmoY5A/6alksr1VQLZJvXIC/fJtxTPTXpdQ1B8dcSxE2G+A0JpH2gsNRP4+bqc6LHxfiQLRJlDq7SJH0kyBi9JntI8NqOfBelEg8NKP463DzFRCZFaIZNMV3qUJEKyDLEVrlTa50xAeenYuNe1TmLUGTD03Iksalt1R3EZkHiJwCMMYQlrWkxnO+1kqGu+7acO+6PmMNdSMWCcHTN1Iy9ztZb4KUWzhottIBLnxX1rGaQi125MKQ26HHaDgb7BXRSIODActNCNe7u1ys8JnaQeEjk1w/KmzhLVND1cjrPHg5c0DhhfoZFiCcrkanFR4Tw5XbUHWnNVYacav4cbDJRr/uDFC0wLxId/WFQetbcj7Vi+RPCHpys=",
+      "data_b64": "U1NIU0lHAAAAA2dpdAAAAAAAAAAGc2hhNTEyAAAAQGz4ZYxB9ydlkAZH3bBywyDvsjvyeEx3wYItD57+J7KwZExjBgEBmIV/jFYinwGDD9BOD0lxqZYsl7Jji6++aRE="
+    },
+    {
+      "name": "sshsig-ecdsa-git-sha256",
+      "shape": "sshsig",
+      "client": "ssh-keygen -Y sign -n git -O hashalg=sha256",
+      "user_key": "ecdsa",
+      "namespace": "git",
+      "expect": "accept",
+      "flags": 0,
+      "public_key_b64": "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLkoMy2mqDwmMS5C6V57QqO6v8vhi7dj3b+OK/Y3jwxeaIM6nU9vWg/zbXvfvO5nsMOB7/Xt9W1prlUo8Dic/rk=",
+      "data_b64": "U1NIU0lHAAAAA2dpdAAAAAAAAAAGc2hhMjU2AAAAIPgB9vJTPmJar0mOzYLJMcpxncOSsQ9UHusRra1tDwVW"
+    },
+    {
+      "name": "sshsig-ed25519-file-sha512",
+      "shape": "sshsig",
+      "client": "ssh-keygen -Y sign -n file ",
+      "user_key": "ed25519",
+      "namespace": "file",
+      "expect": "refuse:wrong_namespace",
+      "flags": 0,
+      "public_key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIKnlDVkhIYPQ5JfJNdIGBzTIEWQWbEGuUP86De9WB/yL",
+      "data_b64": "U1NIU0lHAAAABGZpbGUAAAAAAAAABnNoYTUxMgAAAEBs+GWMQfcnZZAGR92wcsMg77I78nhMd8GCLQ+e/ieysGRMYwYBAZiFf4xWIp8Bgw/QTg9JcamWLJeyY4uvvmkR"
+    }
+  ]
+}

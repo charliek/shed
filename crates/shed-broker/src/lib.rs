@@ -57,12 +57,17 @@ mod egress;
 // the daemon and the desktop's embedded broker (plan 035 §3.4).
 pub mod machine;
 pub mod minter;
+// What the broker will sign for a shed: the pure sign-request parser and policy (plan
+// 035 §3.5). Nothing calls it from the signing path yet.
+pub mod sign_check;
 pub mod sockets;
 pub mod ssh_backend;
 #[cfg(test)]
 mod testalert;
 // The agent-forward SSH backend — internal; `ssh_backend` resolves into it.
 mod ssh_backend_agent;
+// The hand-rolled SSH-wire reader shared by the agent-forward backend and `sign_check`.
+mod ssh_wire;
 pub mod status;
 // The native macOS Touch-ID / biometrics approval gate (`#[cfg(target_os="macos")]`
 // inside; off-mac the biometric policies fail closed to deny-all).

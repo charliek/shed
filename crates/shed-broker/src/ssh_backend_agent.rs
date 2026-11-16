@@ -60,6 +60,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::ssh_backend::{SshBackend, SshKeyInfo, SshSignature};
+use crate::ssh_wire::{put_string, Reader, Truncated};
 
 // ssh-agent protocol message types (draft-miller-ssh-agent §5.1 / x/crypto/ssh/agent
 // client.go constants).
@@ -152,8 +153,8 @@ impl SshBackend for AgentForwardBackend {
         // SIGN_REQUEST(13): type ‖ string(keyblob) ‖ string(data) ‖ uint32(flags).
         let mut payload = Vec::with_capacity(1 + 8 + public_key.len() + data.len() + 4);
         payload.push(SSH_AGENTC_SIGN_REQUEST);
-        write_string(&mut payload, public_key);
-        write_string(&mut payload, data);
+        put_string(&mut payload, public_key);
+        put_string(&mut payload, data);
         payload.extend_from_slice(&flags.to_be_bytes());
 
         let reply = self.round_trip(&payload)?;
@@ -279,12 +280,6 @@ fn parse_signature(reply: &[u8]) -> Result<SshSignature, String> {
     Ok(SshSignature { format, blob })
 }
 
-/// Append an SSH `string` (RFC 4251: `uint32-BE len ‖ bytes`) to `out`.
-fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(bytes);
-}
-
 /// Format an `io::Error` the way Go's `clientErr` wraps a transport error
 /// (`fmt.Errorf("agent: client error: %v", err)`, client.go:248). The exact OS text
 /// differs Go-vs-Rust (op-log only).
@@ -292,48 +287,17 @@ fn io_err(e: &std::io::Error) -> String {
     format!("agent: client error: {e}")
 }
 
-/// A minimal SSH-wire reader over a byte slice (RFC 4251 `byte`/`uint32`/`string`).
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Reader<'a> {
-        Reader { buf, pos: 0 }
-    }
-
-    fn u8(&mut self) -> Result<u8, String> {
-        let b = *self.buf.get(self.pos).ok_or_else(truncated)?;
-        self.pos += 1;
-        Ok(b)
-    }
-
-    fn u32(&mut self) -> Result<u32, String> {
-        let end = self.pos.checked_add(4).ok_or_else(truncated)?;
-        let slice = self.buf.get(self.pos..end).ok_or_else(truncated)?;
-        self.pos = end;
-        Ok(u32::from_be_bytes(slice.try_into().unwrap()))
-    }
-
-    fn string(&mut self) -> Result<&'a [u8], String> {
-        let len = self.u32()? as usize;
-        let end = self.pos.checked_add(len).ok_or_else(truncated)?;
-        let slice = self.buf.get(self.pos..end).ok_or_else(truncated)?;
-        self.pos = end;
-        Ok(slice)
-    }
-
-    /// True when every byte has been consumed (Go's `ssh.Unmarshal` errors on
-    /// top-level trailing data; callers use this to mirror that).
-    fn exhausted(&self) -> bool {
-        self.pos == self.buf.len()
-    }
-}
-
 /// The parse-underrun error (Go's `ssh.Unmarshal` failures flow through `clientErr`).
 fn truncated() -> String {
     "agent: client error: malformed agent response".to_string()
+}
+
+/// A short read in a shared [`Reader`] is this backend's parse-underrun error, so `?`
+/// on a read keeps the agent's error text.
+impl From<Truncated> for String {
+    fn from(_: Truncated) -> String {
+        truncated()
+    }
 }
 
 #[cfg(test)]
@@ -500,8 +464,8 @@ mod tests {
         let mut out = vec![SSH_AGENT_IDENTITIES_ANSWER];
         out.extend_from_slice(&(identities.len() as u32).to_be_bytes());
         for (blob, comment) in identities {
-            write_string(&mut out, blob);
-            write_string(&mut out, comment.as_bytes());
+            put_string(&mut out, blob);
+            put_string(&mut out, comment.as_bytes());
         }
         out
     }
@@ -509,10 +473,10 @@ mod tests {
     fn encode_signature(format: &str, blob: &[u8]) -> Vec<u8> {
         // sigblob = string(format) ‖ string(blob); reply = type ‖ string(sigblob).
         let mut inner = Vec::new();
-        write_string(&mut inner, format.as_bytes());
-        write_string(&mut inner, blob);
+        put_string(&mut inner, format.as_bytes());
+        put_string(&mut inner, blob);
         let mut out = vec![SSH_AGENT_SIGN_RESPONSE];
-        write_string(&mut out, &inner);
+        put_string(&mut out, &inner);
         out
     }
 
@@ -520,8 +484,8 @@ mod tests {
     /// bytes)`) — enough for `parse_key_format` to read `"ssh-ed25519"`.
     fn ed25519_blob(seed: u8) -> Vec<u8> {
         let mut out = Vec::new();
-        write_string(&mut out, b"ssh-ed25519");
-        write_string(&mut out, &[seed; 32]);
+        put_string(&mut out, b"ssh-ed25519");
+        put_string(&mut out, &[seed; 32]);
         out
     }
 
@@ -599,10 +563,10 @@ mod tests {
         // after the sigblob string; trailing bytes INSIDE the sigblob are the
         // `ssh:"rest"` field and stay accepted.
         let mut sigblob = Vec::new();
-        write_string(&mut sigblob, b"ssh-ed25519");
-        write_string(&mut sigblob, &[7u8; 64]);
+        put_string(&mut sigblob, b"ssh-ed25519");
+        put_string(&mut sigblob, &[7u8; 64]);
         let mut ok_reply = vec![SSH_AGENT_SIGN_RESPONSE];
-        write_string(&mut ok_reply, &sigblob);
+        put_string(&mut ok_reply, &sigblob);
         assert!(parse_signature(&ok_reply).is_ok());
 
         // Trailing junk after the sigblob string → Err (the cursor-review fix).
@@ -614,7 +578,7 @@ mod tests {
         let mut sigblob_rest = sigblob.clone();
         sigblob_rest.extend_from_slice(b"rest-bytes");
         let mut rest_reply = vec![SSH_AGENT_SIGN_RESPONSE];
-        write_string(&mut rest_reply, &sigblob_rest);
+        put_string(&mut rest_reply, &sigblob_rest);
         let sig = parse_signature(&rest_reply).unwrap();
         assert_eq!(sig.format, "ssh-ed25519");
         assert_eq!(sig.blob, vec![7u8; 64]);
