@@ -39,9 +39,11 @@ async fn this_machine(rt: Option<&BrokerRuntime>) -> Result<shed_app::MachineIde
 /// `source.status` → `{rows, this_machine, this_machine_error, broker_mode}`.
 ///
 /// `rows` is one per configured server ([`shed_app::HostSource`]: `host`, `supported`,
-/// `source` `{id, name}` or null, `this_machine`, `connected`, `error`); a server older
-/// than the route is `supported: false` with no error. `this_machine` is `{id, name}`
-/// or null, with `this_machine_error` saying why it is null.
+/// `source` `{id, name}` or null, `this_machine`, `connected`, `busy`, `unreachable`,
+/// `error`); a server older than the route is `supported: false` with no error, and one
+/// that could not be reached or read is `unreachable` (unknown, not unsupported).
+/// `this_machine` is `{id, name}` or null, with `this_machine_error` saying why it is
+/// null.
 pub async fn status(backend: &Backend, rt: Option<&BrokerRuntime>) -> Value {
     let me = this_machine(rt).await;
     let rows = backend

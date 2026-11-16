@@ -41,6 +41,34 @@ the older `conflict=` set. A respond can be told to answer a script of statuses 
 `Retry-After` when one is given. The server sends one only with 503 and 429; a cell may
 attach one to a 403 or 413 to prove the status alone stops the retry.
 
+Responds are matched as the server matches them (`internal/api/plugin_handlers.go`,
+`internal/plugin/bridge.go`): a request is PENDING from the moment its frame is written
+on a stream, an answer must name a pending request of its namespace and shed by
+`in_reply_to` (else `403 FORBIDDEN`), and a final answer consumes it. A namespace that
+turns `not-source` live (`refuse(ns, "not-source")`: the source moved away) ends its live
+streams and drops the requests pending on it, as a move does, and answers its responds
+`403 SOURCE_NOT_BOUND`. `restart()` is a server restart: every live stream ends and every
+pending request is gone (the server keeps them in memory only). `drop_streams()` ends
+every live stream and KEEPS the pending requests. As the server does
+(`internal/plugin/registry.go`, `pendingForLocked`), a new stream is first sent every
+request still pending on its namespace that was delivered to the SAME machine (the
+`X-Shed-Machine-Id` it subscribed with) at the SAME binding generation (bumped by every
+move, away or back), in the order they were first delivered: a lost connection's
+reconnect, or another process of the same machine (the daemon and the desktop app's
+embedded broker share one id), is handed what was in flight. A stream that has ended (a
+move, a restart, `drop_streams`) never delivers a frame it takes after that: the frame
+goes back on the queue for the next stream.
+
+`single_holder=True` adds the duplicate rule of a pinning server for this one bound
+machine: at most one live stream per namespace, and a subscribe for a held namespace is
+`409 SOURCE_DUPLICATE_STREAM` — two processes sharing one machine id (the daemon and the
+desktop's embedded broker, two daemons on a copied state directory); `holders()` and
+`attempts()` say who holds and who asked. `StandInBroker` is a minimal subscriber
+(retrying a refusal or a dropped stream after a fixed second; given `answer`, it also
+answers each request it is sent), the embedded broker's part in those cells; the lock that
+makes the daemon stand by for it is taken by the cell itself, from Python, on the daemon's
+real lock file.
+
 Threading model mirrors the plain-`socket`/blocking style of `desktop_client.py`:
 a `ThreadingHTTPServer` on a background thread, one handler thread per connection
 (the long-lived SSE GET, the egress GET, and the respond POST each get their own),
@@ -54,9 +82,12 @@ deadline (never a fixed sleep), so a slow daemon connect can't flake the test.
 
 from __future__ import annotations
 
+import http.client
 import json
 import queue
 import re
+import select
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -121,7 +152,9 @@ _REFUSALS: dict[str, tuple[int, object]] = {
 _RESPOND_REFUSALS: dict[int, dict] = {
     503: {"error": {"code": "RESPONSE_NOT_DELIVERED", "message": "not delivered; try again"}},
     429: {"error": {"code": "TOO_MANY_RESPONSES", "message": "too many answers in flight"}},
-    413: {"error": {"code": "RESPONSE_TOO_LARGE", "message": "response too large"}},
+    # The server's own code and words for a respond body over its limit
+    # (`plugin_handlers.go`: `config.ErrRequestTooLarge`, `maxRespondBody`).
+    413: {"error": {"code": "REQUEST_TOO_LARGE", "message": "response body is over 16777216 bytes"}},
     403: {
         "error": {
             "code": "FORBIDDEN",
@@ -130,8 +163,22 @@ _RESPOND_REFUSALS: dict[int, dict] = {
     },
 }
 
+# What the server answers a respond that matches no pending request.
+_UNMATCHED = {
+    "error": {
+        "code": "FORBIDDEN",
+        "message": "response does not match a pending request for this namespace",
+    }
+}
+
 # How often an idle SSE loop re-checks the shutdown flag while waiting to push.
 _SSE_POLL = 0.1
+
+
+# What `SyntheticBus._deliver` decides about a frame a stream is about to write.
+DELIVER_WRITE = "write"
+DELIVER_SKIP = "skip"
+DELIVER_ENDED = "ended"
 
 
 class SyntheticBus:
@@ -150,6 +197,7 @@ class SyntheticBus:
         tls_key: str | None = None,
         unauthorized: set[str] | None = None,
         refuse: dict[str, str] | None = None,
+        single_holder: bool = False,
     ) -> None:
         assert egress in ("unavailable", "events"), f"bad egress mode {egress!r}"
         self.url: str | None = None
@@ -183,6 +231,21 @@ class SyntheticBus:
         self._respond_identities: dict[str, list[tuple[str | None, str | None]]] = {}
         # ns -> the statuses its next responds answer, in order ([(status, retry_after)]).
         self._respond_script: dict[str, list[tuple[int, str | None]]] = {}
+        # (ns, request id) -> (shed name, frame, machine id, generation, order) of a request
+        # written on a stream and not yet answered finally (the server's pending set,
+        # stamped with the machine and binding generation it was delivered to).
+        self._pending: dict[tuple[str, str], tuple] = {}
+        # The binding generation: bumped by every move (away, `refuse(ns, "not-source")`,
+        # and back, `accept`). Pending requests are re-delivered only at their own.
+        self._generation = 1
+        self._delivered_seq = 0
+        # The duplicate rule (`single_holder`): ns -> (stream token, machine name, end).
+        self._single_holder = single_holder
+        self._holders: dict[str, tuple[object, str | None, threading.Event]] = {}
+        # Every live namespace stream, in every mode: token -> (ns, end event).
+        self._live: dict[object, tuple[str, threading.Event, str | None]] = {}
+        # Every subscribe: (ns, machine name, monotonic time, accepted).
+        self._attempts: list[tuple[str, str | None, float, bool]] = []
 
         # One Condition guards all cross-thread state below (subscribe/respond
         # records + the per-namespace push queues + the SSE thread registry).
@@ -314,16 +377,25 @@ class SyntheticBus:
     # -- the machine pin (plan 035 §3.4) ---------------------------------------
 
     def refuse(self, ns: str, kind: str) -> None:
-        """From now on, answer `{ns}`'s subscribe with the pinned refusal `kind`."""
+        """From now on, answer `{ns}`'s subscribe with the pinned refusal `kind`. A move
+        away (`"not-source"`) also drops the requests pending on `{ns}`, as the server's
+        move drops those delivered to the old machine."""
         assert kind in _REFUSALS, f"unknown refusal kind {kind!r}"
         with self._cond:
             self._refuse[ns] = kind
+            if kind == "not-source":
+                self._generation += 1
+                self._end_streams_locked(ns)
+                for key in [k for k in self._pending if k[0] == ns]:
+                    del self._pending[key]
+            self._cond.notify_all()
 
     def accept(self, ns: str) -> None:
         """Lift `{ns}`'s refusal: its next subscribe is served (the move to this
         machine, as the server sees it)."""
         with self._cond:
-            self._refuse.pop(ns, None)
+            if self._refuse.pop(ns, None) == "not-source":
+                self._generation += 1
 
     def respond_script(self, ns: str, script: list[tuple[int, str | None]]) -> None:
         """Answer `{ns}`'s next responds with these `(status, retry_after)` first (a
@@ -337,6 +409,75 @@ class SyntheticBus:
     def subscribe_count(self, ns: str) -> int:
         with self._cond:
             return len(self._subscribe_auths.get(ns, []))
+
+    def live_streams(self) -> int:
+        """How many stream handlers are running (a closed client's ends within a poll)."""
+        with self._cond:
+            return len(self._sse_threads)
+
+    def pending(self) -> list[tuple[str, str]]:
+        """The (ns, request id) of every request delivered and not yet answered finally."""
+        with self._cond:
+            return sorted(self._pending)
+
+    # -- the duplicate rule (`single_holder`) --------------------------------
+
+    def _end_streams_locked(self, ns: str | None = None) -> None:
+        """End every live stream (of `ns` only, when given). Caller holds _cond."""
+        for token, (s_ns, end, _machine) in list(self._live.items()):
+            if ns is None or s_ns == ns:
+                end.set()
+                del self._live[token]
+                held = self._holders.get(s_ns)
+                if held is not None and held[0] is token:
+                    del self._holders[s_ns]
+
+    def drop_streams(self) -> float:
+        """End every live stream at once, the server staying up and KEEPING its pending
+        requests (a lost connection: the same machine's reconnect is re-delivered them).
+        Returns the monotonic time it happened."""
+        with self._cond:
+            at = time.monotonic()
+            self._end_streams_locked()
+            self._cond.notify_all()
+            return at
+
+    def restart(self) -> float:
+        """A server restart, as the app and the daemon see it: every live stream ends
+        and every pending request is gone (the server holds them in memory only), so an
+        answer to one delivered before is `403 FORBIDDEN`. Returns the monotonic time."""
+        with self._cond:
+            at = time.monotonic()
+            self._end_streams_locked()
+            self._pending.clear()
+            self._cond.notify_all()
+            return at
+
+    def holders(self) -> dict[str, str | None]:
+        """ns -> the machine name holding its live stream."""
+        with self._cond:
+            return {ns: name for ns, (_t, name, _e) in self._holders.items()}
+
+    def attempts(self, ns: str, since: float = 0.0) -> list[tuple[str | None, bool]]:
+        """Every subscribe for `{ns}` since `since`: (machine name, accepted)."""
+        with self._cond:
+            return [(n, ok) for a_ns, n, at, ok in self._attempts if a_ns == ns and at >= since]
+
+    def attempt_times(self, ns: str, since: float = 0.0) -> list[tuple[float, str | None, bool]]:
+        """Every subscribe for `{ns}` since `since`: (monotonic time, machine name,
+        accepted)."""
+        with self._cond:
+            return [(at, n, ok) for a_ns, n, at, ok in self._attempts if a_ns == ns and at >= since]
+
+    def wait_for(self, predicate, what: str, timeout: float) -> None:
+        """Block until `predicate(self)` holds (re-checked on every recorded change)."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while not predicate(self):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(f"never within {timeout}s: {what}")
+                self._cond.wait(min(remaining, _SSE_POLL))
 
     def subscribe_identities(self, ns: str) -> list[tuple[str | None, str | None]]:
         """Every (machine id, decoded machine name) `{ns}`'s subscribes carried."""
@@ -419,15 +560,108 @@ class SyntheticBus:
             self._cond.notify_all()
             return self._refuse.get(ns)
 
+    def _claim(
+        self, ns: str, name: str | None, machine: str | None = None
+    ) -> tuple[object, threading.Event, list[str]] | None:
+        """The duplicate rule: claim `{ns}`'s one live stream (its token, end event, and
+        the frames to re-deliver on it first), or None when a stream holds it. Without
+        `single_holder` every claim succeeds. Every stream claimed is live (`drop_streams`,
+        `restart` and a move end it) until it is released. The re-delivered frames are
+        the requests pending on `{ns}` that were delivered to `machine` at the current
+        generation, in their first delivery's order (`pendingForLocked`)."""
+        with self._cond:
+            held = self._single_holder and ns in self._holders
+            self._attempts.append((ns, name, time.monotonic(), not held))
+            self._cond.notify_all()
+            if held:
+                return None
+            token, end = object(), threading.Event()
+            if self._single_holder:
+                self._holders[ns] = (token, name, end)
+            self._live[token] = (ns, end, machine)
+            redeliver = sorted(
+                (order, frame)
+                for (p_ns, _id), (_shed, frame, p_machine, gen, order) in self._pending.items()
+                if p_ns == ns and p_machine == machine and gen == self._generation
+            )
+            return token, end, [frame for _order, frame in redeliver]
+
+    def _release(self, ns: str, token: object) -> None:
+        with self._cond:
+            self._live.pop(token, None)
+            held = self._holders.get(ns)
+            if held is not None and held[0] is token:
+                del self._holders[ns]
+            self._cond.notify_all()
+
+    def _deliver(self, ns: str, token: object, frame: str, q: queue.Queue | None) -> str:
+        """A request frame is about to be written on `{ns}`'s stream `token`: it is pending
+        now, stamped with the stream's machine and the current generation (a re-delivered
+        one keeps its first order). Returns what to do with it, as the server's
+        `Listener.Take` decides under its lock:
+
+        * `DELIVER_ENDED` when the stream has ended since it took the frame (a move, a
+          restart, `drop_streams`): nothing is written, and a frame taken from the queue
+          (`q`) goes back on it for the next stream (Take sends nothing for an
+          unregistered listener);
+        * `DELIVER_SKIP` for a re-delivered frame (`q` is None: taken from the stream's
+          backlog) whose request is no longer pending (answered finally since the backlog
+          was copied, or dropped by a move): nothing is written and nothing becomes
+          pending again (Take frees a message that is no longer live and sends nothing);
+        * `DELIVER_WRITE` otherwise."""
+        with self._cond:
+            live = self._live.get(token)
+            if live is None:
+                if q is not None:
+                    q.put(frame)
+                return DELIVER_ENDED
+            machine = live[2]
+            try:
+                env = json.loads(frame)
+            except ValueError:
+                return DELIVER_WRITE
+            if isinstance(env, dict) and isinstance(env.get("id"), str):
+                shed = (env.get("shed") or {}).get("name")
+                key = (ns, env["id"])
+                old = self._pending.get(key)
+                if q is None and old is None:
+                    return DELIVER_SKIP
+                if old is None:
+                    self._delivered_seq += 1
+                    order = self._delivered_seq
+                else:
+                    order = old[4]
+                self._pending[key] = (shed, frame, machine, self._generation, order)
+            return DELIVER_WRITE
+
     def _next_respond_answer(
-        self, ns: str, identity: tuple[str | None, str | None]
-    ) -> tuple[int, str | None] | None:
+        self, ns: str, identity: tuple[str | None, str | None], env: dict
+    ) -> tuple[int, dict, str | None] | None:
+        """Record a respond; return `(status, body, retry_after)` to refuse it with, or
+        None to deliver it. In the server's order: a body over the limit (a scripted
+        413) before anything else; a namespace whose source moved away
+        (SOURCE_NOT_BOUND); an answer matching no pending request (403 FORBIDDEN); then
+        the scripted retryable refusals; else delivered, a final answer consuming its
+        request."""
         with self._cond:
             self._respond_identities.setdefault(ns, []).append(identity)
             self._cond.notify_all()
             script = self._respond_script.get(ns)
+            if script and script[0][0] == 413:
+                status, retry_after = script.pop(0)
+                return status, _RESPOND_REFUSALS[status], retry_after
+            if self._refuse.get(ns) == "not-source":
+                status, body = _REFUSALS["not-source"]
+                return status, body, None
+            key = (ns, env.get("in_reply_to"))
+            shed = (env.get("shed") or {}).get("name")
+            if key not in self._pending or self._pending[key][0] != shed:
+                return 403, _UNMATCHED, None
             if script:
-                return script.pop(0)
+                status, retry_after = script.pop(0)
+                return status, _RESPOND_REFUSALS[status], retry_after
+            if env.get("final"):
+                del self._pending[key]
             return None
 
     def _should_401(self, ns: str) -> bool:
@@ -509,7 +743,8 @@ class _BusHandler(BaseHTTPRequestHandler):
         answers 401 on its FIRST subscribe (token rejected → the client invalidates +
         re-mints, then reconnects and succeeds)."""
         bus = self._bus
-        refusal = bus._record_subscribe(ns, self.headers.get("Authorization"), self._identity())
+        identity = self._identity()
+        refusal = bus._record_subscribe(ns, self.headers.get("Authorization"), identity)
         if refusal is not None:
             status, body = _REFUSALS[refusal]
             self._send_body(status, body)
@@ -520,13 +755,32 @@ class _BusHandler(BaseHTTPRequestHandler):
         if bus._should_401(ns):
             self._send_empty(401)
             return
-        self._stream_sse(bus._queue_for(ns))
+        claim = bus._claim(ns, identity[1], identity[0])
+        if claim is None:
+            status, body = _REFUSALS["duplicate"]
+            self._send_body(status, body)
+            return
+        token, end, redeliver = claim
+        try:
+            self._stream_sse(
+                bus._queue_for(ns), ns=ns, end=end, token=token, redeliver=redeliver
+            )
+        finally:
+            bus._release(ns, token)
 
-    def _stream_sse(self, q: queue.Queue) -> None:
+    def _stream_sse(
+        self,
+        q: queue.Queue,
+        ns: str | None = None,
+        end: threading.Event | None = None,
+        token: object = None,
+        redeliver: list[str] | None = None,
+    ) -> None:
         """Send the 200 SSE handshake, then hold the connection and drain `q`, pushing
         each frame as a `data:` line, until shutdown / `None` sentinel / client
-        disconnect. The shared streaming body of `_serve_sse` (per-namespace queue) and
-        `_serve_egress` events mode (the egress decision queue)."""
+        disconnect / `end` (the bus dropped the stream). The shared streaming body of
+        `_serve_sse` (per-namespace queue; each frame written is a pending request of
+        `ns`) and `_serve_egress` events mode (the egress decision queue)."""
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -540,14 +794,29 @@ class _BusHandler(BaseHTTPRequestHandler):
 
         bus = self._bus
         bus._register_sse_thread()
+        backlog = list(redeliver or [])
         try:
-            while not bus._shutdown.is_set():
-                try:
-                    frame = q.get(timeout=_SSE_POLL)
-                except queue.Empty:
-                    continue
-                if frame is None:  # teardown sentinel
-                    break
+            while not bus._shutdown.is_set() and not (end is not None and end.is_set()):
+                if end is not None and self._peer_gone():
+                    break  # the holder went away: its namespace is free again
+                if backlog:
+                    frame, source = backlog.pop(0), None
+                else:
+                    try:
+                        frame, source = q.get(timeout=_SSE_POLL), q
+                    except queue.Empty:
+                        continue
+                    if frame is None:  # teardown sentinel
+                        break
+                # Pending from its write on (before it, so an answer can never arrive
+                # first) — unless the stream ended while it waited for the frame, or a
+                # re-delivered request was answered meanwhile.
+                if ns is not None:
+                    outcome = bus._deliver(ns, token, frame, source)
+                    if outcome == DELIVER_ENDED:
+                        break
+                    if outcome == DELIVER_SKIP:
+                        continue
                 try:
                     self.wfile.write(("data: " + frame + "\n\n").encode("utf-8"))
                     self.wfile.flush()
@@ -555,6 +824,16 @@ class _BusHandler(BaseHTTPRequestHandler):
                     break  # client disconnected
         finally:
             bus._unregister_sse_thread()
+
+    def _peer_gone(self) -> bool:
+        """Whether the client closed its side (EOF readable), without consuming data."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            if not readable:
+                return False
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return False
 
     def _serve_respond(self, ns: str) -> None:
         """Read a response Envelope body, record it for `ns`, return 204."""
@@ -565,11 +844,13 @@ class _BusHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._send_empty(400)
             return
-        scripted = self._bus._next_respond_answer(ns, self._identity())
-        if scripted is not None:
-            status, retry_after = scripted
+        refused = self._bus._next_respond_answer(
+            ns, self._identity(), env if isinstance(env, dict) else {}
+        )
+        if refused is not None:
+            status, body, retry_after = refused
             headers = {"Retry-After": retry_after} if retry_after is not None else {}
-            self._send_body(status, _RESPOND_REFUSALS[status], headers)
+            self._send_body(status, body, headers)
             return
         self._bus._record_response(ns, env)
         self._send_empty(204)
@@ -613,3 +894,138 @@ class _BusHandler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:
         """Silence the default per-request stderr logging (keeps pytest output clean;
         the bus runs in-process, so there's no daemon DEVNULL to swallow it)."""
+
+
+class StandInBroker:
+    """A minimal subscriber that never yields — the desktop's embedded broker in the
+    two-brokers-on-one-machine cells. One thread per namespace subscribes with the given
+    machine id and name, holds the stream while it is served, and on a refusal or a
+    dropped stream asks again after `retry` seconds (fixed: the embedded broker's first
+    backoff). Every request envelope it is sent is kept (`received()`); with `answer`
+    (`envelope -> payload or None`) it also POSTs a final response carrying that payload,
+    with the same identity headers. `stop()` ends every stream and thread."""
+
+    def __init__(
+        self,
+        url: str,
+        namespaces,
+        machine_id: str,
+        name: str,
+        retry: float = 1.0,
+        answer=None,
+    ):
+        u = urlsplit(url)
+        assert u.scheme == "http", url
+        self._host, self._port = u.hostname, u.port
+        self._headers = {
+            "Accept": "text/event-stream",
+            MACHINE_ID_HEADER: machine_id,
+            MACHINE_NAME_HEADER: name,
+        }
+        self._retry = retry
+        self._answer = answer
+        self._received: list[dict] = []
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        # The live sockets (kept apart from their connections: http.client hands a
+        # `Connection: close` stream's socket to the response and forgets it).
+        self._socks: set[socket.socket] = set()
+        self._threads = [
+            threading.Thread(target=self._run, args=(ns,), name=f"stand-in-{ns}", daemon=True)
+            for ns in namespaces
+        ]
+        for t in self._threads:
+            t.start()
+
+    def _run(self, ns: str) -> None:
+        while not self._stop.is_set():
+            conn = http.client.HTTPConnection(self._host, self._port, timeout=60)
+            sock = None
+            try:
+                conn.connect()
+                sock = conn.sock
+                with self._lock:
+                    if self._stop.is_set():
+                        break
+                    self._socks.add(sock)
+                conn.request("GET", f"/api/plugins/listeners/{ns}/messages", headers=self._headers)
+                resp = conn.getresponse()
+                try:
+                    buf = b""
+                    while True:  # held until the bus ends it
+                        chunk = resp.read1(1024) if resp.status == 200 else resp.read(1024)
+                        if not chunk:
+                            break
+                        if resp.status != 200:
+                            continue
+                        buf += chunk
+                        while b"\n\n" in buf:
+                            event, buf = buf.split(b"\n\n", 1)
+                            self._on_event(ns, event)
+                finally:
+                    resp.close()
+            except (OSError, http.client.HTTPException):
+                pass
+            finally:
+                with self._lock:
+                    self._socks.discard(sock)
+                conn.close()
+                if sock is not None:
+                    sock.close()
+            self._stop.wait(self._retry)
+
+    def _on_event(self, ns: str, event: bytes) -> None:
+        data = b"".join(
+            line[len(b"data: "):] for line in event.split(b"\n") if line.startswith(b"data: ")
+        )
+        try:
+            env = json.loads(data)
+        except ValueError:
+            return
+        if not isinstance(env, dict):
+            return
+        with self._lock:
+            self._received.append(env)
+        if self._answer is None:
+            return
+        payload = self._answer(env)
+        if payload is None:
+            return
+        body = json.dumps(
+            {
+                "id": f"stand-in-{env.get('id')}",
+                "namespace": ns,
+                "type": "response",
+                "in_reply_to": env.get("id"),
+                "final": True,
+                "timestamp": "2026-11-16T00:00:00Z",
+                "payload": payload,
+                "shed": env.get("shed"),
+            }
+        ).encode("utf-8")
+        headers = dict(self._headers, **{"Content-Type": "application/json"})
+        headers.pop("Accept", None)
+        post = http.client.HTTPConnection(self._host, self._port, timeout=10)
+        try:
+            post.request("POST", f"/api/plugins/listeners/{ns}/respond", body=body, headers=headers)
+            post.getresponse().read()
+        except (OSError, http.client.HTTPException):
+            pass
+        finally:
+            post.close()
+
+    def received(self) -> list[dict]:
+        """Every request envelope this stand-in was sent, in arrival order."""
+        with self._lock:
+            return list(self._received)
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._lock:
+            for sock in self._socks:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        for t in self._threads:
+            t.join(timeout=5.0)

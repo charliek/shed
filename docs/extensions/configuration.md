@@ -321,8 +321,9 @@ Servers (1):
 |---|---|---|
 | `connected` | `ok` | Subscribed; requests are served |
 | `reconnecting` | `x` | Not subscribed; retrying on a 1–30 s backoff. `last_error` says why, such as `unexpected status 403: …` with the server's message when this machine has no identity and the server requires one |
-| `not-source` | `-` | Another of your machines is the [credential source](source-binding.md) on this server; retrying. Two more lines name the source and print the `shed source use` command that moves it here |
+| `not-source` | `-` | Another of your machines is the [credential source](source-binding.md) on this server; retrying. Two more lines name the source and print the `shed source use` command that moves it here (naming this machine by its full id, its name alongside) |
 | `duplicate` | `x` | Another process with this machine's id already holds the namespace on this server; retrying |
+| `yielding` | `-` | The desktop app's embedded broker is running on this machine and answers; the daemon subscribes nothing until the app quits, then takes over within a few seconds. See [Credential source](source-binding.md#the-daemon-and-the-desktop-app-on-one-machine) |
 | `rejected` | `x` | The server refused a second listener (a `409` from a server older than credential sources); not retried |
 | `stopped` | `-` | The subscription ended (shutdown) |
 

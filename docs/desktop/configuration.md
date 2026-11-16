@@ -48,7 +48,15 @@ Preferences shows:
   shows no row): the server's name, `Source: <machine>` (with `· not connected` when that
   machine holds no subscription), or `No source yet — the first machine to connect becomes
   it.`. A server that answered `503 SOURCE_BUSY` on every retry shows the last source it
-  knew, or `Checking the source — the server is busy, retrying…`.
+  knew, or `Checking the source — the server is busy, retrying…`. A server that could not be
+  reached (it is restarting, or the network is down) keeps the row it last showed, with
+  `· cannot reach the server`; the window reads it again after 2, 4, 8 and 16 seconds, then
+  waits until it is shown, focused or reloaded; a server that answers busy after that shows
+  `· server busy, retrying`, no longer `· cannot reach the server`. A server that answers a
+  plain `404` (older than credential sources) has no row, and nor does one that has not been
+  reached since the window opened (there is no last row to keep). The window makes one
+  read at a time: a read asked for while one is in flight (a focus, a reload, a move's
+  read-back) is made once, right after it.
 - On the row of a server where this machine is the source, `this machine`; on any other row,
   **Use this machine**.
 
@@ -65,7 +73,8 @@ retry, within about 30 seconds. Nothing fails over by itself: if the source is o
 answers until you choose another.
 
 The window reads the sources when it opens and again whenever it is shown or focused, at most
-once every five seconds. The same reads and the move are available over IPC as
+once every five seconds. After a move whose read-back shows this machine `· not connected`
+(its broker had not connected yet), it reads once more a few seconds later. The same reads and the move are available over IPC as
 [`source.status` and `source.use`](ipc.md#approval-ops).
 
 ## Host list (`~/.shed/config.yaml`)

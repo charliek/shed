@@ -23,9 +23,9 @@ import {
   type PrefsReport, type BrokerMode, type BrokerStatus,
 } from "@/lib/bridge";
 import {
-  EMPTY_SOURCES, SOURCE_RETRY_MS,
-  applyRead, beginMove, canUse, moveConfirmed, moveFailed, refreshDelay, shownRows,
-  type SourcesState,
+  EMPTY_SOURCES,
+  beginMove, canUse, createSourceReader, moveConfirmed, moveFailed, shownRows,
+  type SourceReader, type SourcesState,
 } from "@/lib/sources";
 
 /* The credential namespaces the host agent can delegate (mac CredentialNamespace). */
@@ -138,41 +138,41 @@ export default function PreferencesWindow() {
   const srcRef = useRef<SourcesState>(EMPTY_SOURCES);
   const [src, setSrc] = useState<SourcesState>(EMPTY_SOURCES);
   const srcSeq = useRef(0); // every read (at issue) and move answer (at arrival) takes one
-  const lastSourceRead = useRef(0); // when the newest read started (ms)
-  const sourceTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // The reads, their one pending later read, and their lifetimes (`createSourceReader`):
+  // made per mount by the effect below (StrictMode mounts, cleans up and mounts again),
+  // disposed at unmount, so a read or a timer that lands after it does nothing.
+  const sourceReader = useRef<SourceReader | null>(null);
   const sourceOps = useMemo(() => {
     const commit = (next: SourcesState) => {
       srcRef.current = next;
       setSrc(next);
     };
-    // One later read at most is ever pending: a busy row, a read-back that said
-    // nothing for a confirmed move, and a throttled refresh all share it.
-    const schedule = (delayMs: number) => {
-      if (sourceTimer.current !== undefined) return;
-      sourceTimer.current = setTimeout(() => {
-        sourceTimer.current = undefined;
-        read();
-      }, delayMs);
+    return {
+      commit,
+      // `hold`: the host whose move was just confirmed (see `applyRead`).
+      read: (hold?: string) => sourceReader.current?.read(hold),
+      // The window was shown again or gained focus (throttled).
+      refresh: () => sourceReader.current?.refresh(),
+      // A (re)load of the whole window (mount, `prefs-changed`): a new generation.
+      reload: () => sourceReader.current?.reload(),
     };
-    // `hold`: the host whose move was just confirmed (see `applyRead`).
-    const read = (hold?: string) => {
-      const seq = ++srcSeq.current;
-      lastSourceRead.current = Date.now();
-      void getSourceStatus().then((status) => {
-        const { state, retry } = applyRead(srcRef.current, seq, status, hold);
-        commit(state);
-        if (retry) schedule(SOURCE_RETRY_MS);
-      });
-    };
-    // The window was shown again or gained focus: read, unless one started within
-    // SOURCE_REFRESH_MIN_MS — then one read when that interval ends.
-    const refresh = () => {
-      const wait = refreshDelay(Date.now(), lastSourceRead.current);
-      if (wait === 0) read();
-      else schedule(wait);
-    };
-    return { commit, read, refresh };
   }, []);
+  useEffect(() => {
+    const reader = createSourceReader({
+      fetch: getSourceStatus,
+      get: () => srcRef.current,
+      commit: sourceOps.commit,
+      nextSeq: () => ++srcSeq.current,
+      now: () => Date.now(),
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+    });
+    sourceReader.current = reader;
+    return () => {
+      reader.dispose();
+      if (sourceReader.current === reader) sourceReader.current = null;
+    };
+  }, [sourceOps]);
   const sshGen = useRef(0);
   const reloadGen = useRef(0); // bumped per reloadAll; guards every fetch's application
   const ttlAtFocus = useRef(""); // the Duration value when the field gained focus
@@ -244,7 +244,7 @@ export default function PreferencesWindow() {
       }
     });
     // Ordered per server by its own sequence (`lib/sources.ts`), not by `fresh()`.
-    sourceOps.read();
+    sourceOps.reload();
     // SSH keeps its own guard on top: applySsh bumps sshGen on an optimistic
     // edit, so a slow load must not clobber a newer edit (not just a newer reload).
     const mine = ++sshGen.current;
@@ -430,10 +430,6 @@ export default function PreferencesWindow() {
       unlisten?.();
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onVisible);
-      if (sourceTimer.current !== undefined) {
-        clearTimeout(sourceTimer.current);
-        sourceTimer.current = undefined;
-      }
     };
   }, [sourceOps]);
 
@@ -515,6 +511,7 @@ export default function PreferencesWindow() {
         connected: r.connected,
         busy: !!src.moving[r.host],
         retrying: r.busy,
+        unreachable: !!r.unreachable,
         // `canUse` is the one rule behind the button: no button (this machine is
         // the source) is never reported as usable.
         can_use: canUse(src, r.host),
@@ -635,8 +632,17 @@ export default function PreferencesWindow() {
                       {r.source ? (
                         <>
                           Source: <span className="text-shed-text">{r.source.name || "an unnamed machine"}</span>
-                          {r.busy ? " · server busy, retrying" : !r.connected && " · not connected"}
+                          {r.unreachable ? (
+                            <span data-source-unreachable> · cannot reach the server</span>
+                          ) : r.busy ? (
+                            " · server busy, retrying"
+                          ) : (
+                            !r.connected && " · not connected"
+                          )}
                         </>
+                      ) : r.unreachable ? (
+                        // Unreachable is unknown, never "no source".
+                        <span data-source-unreachable>Cannot reach the server</span>
                       ) : r.busy ? (
                         // Busy is unknown, never "no source".
                         <span data-source-retrying>Checking the source — the server is busy, retrying…</span>

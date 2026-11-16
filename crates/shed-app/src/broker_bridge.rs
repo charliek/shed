@@ -56,8 +56,8 @@ use shed_broker::sign_check::SignPolicy;
 use shed_broker::status::{ServerHealth, SshSigningStatus};
 use shed_broker::supervisor::{SharedDeps, Supervisor};
 use shed_broker::{
-    aws_backend, bus, desktop_socket_path, docker_backend, minter as broker_minter, socket_is_live,
-    ssh_backend, status_socket_path, watcher,
+    aws_backend, bus, desktop_socket_path, docker_backend, minter as broker_minter, presence,
+    socket_is_live, ssh_backend, status_socket_path, watcher,
 };
 
 use crate::host_agent::HostAgentEvent;
@@ -86,6 +86,11 @@ const KNOWN_HOSTS_PATH: &str = "~/.shed/known_hosts";
 /// (see [`BridgeResponder::respond`]) so an audited approve that never reached the gate
 /// stays diagnosable.
 const RESPOND_QUEUE_CAP: usize = 64;
+
+/// How long `spawn` waits for the presence lock before starting the broker without it
+/// (the holder keeps trying). A daemon's look costs one retry of 50 ms; a second while
+/// another instance of the app holds the lock is all the start-up should give it.
+const EMBEDDED_LOCK_WAIT: Duration = Duration::from_secs(1);
 
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -983,6 +988,44 @@ impl EmbeddedHostAgent {
             }
         };
 
+        // Say "an embedded broker runs here" before anything subscribes (the supervisor
+        // subscribes from the reconcile task spawned below): the lock beside the machine
+        // identity file the daemon shares (`shed_broker::presence`), held for as long as
+        // this broker runs — released once the supervisor has drained at shutdown, or by
+        // the kernel when the app exits however it exits.
+        //
+        // Only with a usable machine identity: without one this broker's subscribes are
+        // refused by a pinning server (`SOURCE_MACHINE_ID_REQUIRED`), so holding the lock
+        // would silence a daemon that can still answer. A restart that loads the identity
+        // takes the lock then.
+        //
+        // The holder never gives up (a daemon's momentary look, another instance of this
+        // app, a path that is not usable yet): the broker starts once it holds the lock,
+        // or after a short wait without it, the holder taking it in the background as
+        // soon as it can.
+        let lock_path = presence::lock_path_beside(&self.machine_path);
+        let machine = machine.ok();
+        let holder = if machine.is_some() {
+            let holder = presence::Holder::spawn(lock_path.clone(), bus_log.clone());
+            if !holder.wait_held(EMBEDDED_LOCK_WAIT).await {
+                bus_log.warn(&format!(
+                    "embedded broker lock not held after {EMBEDDED_LOCK_WAIT:?} path={}; \
+                     starting the broker now and taking the lock as soon as it can be taken \
+                     (until then a shed-host-agent daemon on this machine may hold request \
+                     types too)",
+                    lock_path.display()
+                ));
+            }
+            Some(holder)
+        } else {
+            bus_log.warn(&format!(
+                "no machine identity, so not taking the embedded broker lock path={}; a \
+                 shed-host-agent daemon on this machine, if one runs, keeps answering",
+                lock_path.display()
+            ));
+            None
+        };
+
         let deps = SharedDeps {
             ssh_backend,
             ssh_gate,
@@ -992,7 +1035,14 @@ impl EmbeddedHostAgent {
             audit,
             minter: Some(self.minter.clone()),
             log: bus_log.clone(),
-            machine: machine.ok(),
+            machine,
+            // Never stands by: this broker is the one that answers while it runs. It
+            // holds the lock above instead, which a shed-host-agent daemon on this machine
+            // (same machine id) sees and stands by for.
+            embedded_presence: None,
+            // When it took that lock: an older server's terminal 409 is retried for a
+            // short while after it (`bus::OLD_SERVER_CONFLICT_GRACE`).
+            presence_lock: holder.as_ref().map(|h| h.held_since()),
         };
         let sup = Arc::new(Supervisor::new(self.shutdown_rx.clone(), deps));
         *self.supervisor.lock().unwrap() = Some(sup.clone());
@@ -1031,6 +1081,9 @@ impl EmbeddedHostAgent {
             };
             watcher::run_watch_loop(watch_cfg, reconcile, shutdown, loop_log).await;
             sup.shutdown().await;
+            // Every stream is closed: let a daemon on this machine take over (or stop
+            // trying to take the lock).
+            drop(holder);
         });
 
         // Synthesize the Connected(HelloAck) so the approvals UI sections light up exactly
@@ -1481,6 +1534,8 @@ mod tests {
             minter: None,
             log: Arc::new(bus::FileBusLog::new("")),
             machine: None,
+            embedded_presence: None,
+            presence_lock: None,
         };
         let target = ServerTarget {
             name: String::new(), // single-server unnamed target (open http)
@@ -1527,6 +1582,136 @@ mod tests {
         assert_eq!(denied.approval, "shed-desktop");
         assert_eq!(denied.decided_by, "user");
         assert_eq!(denied.scope, "per-request");
+    }
+
+    /// A sign request the signing check declines — a login as `root`, a username not on
+    /// `ssh.allow_users` — never reaches the embedded broker's approval channel: the
+    /// Coordinator side sees no approval request at all, the shed gets the ordinary sign
+    /// failure, and the audit says `refused` with the class. The daemon cells
+    /// (`tests/host-agent-diff/test_bus_sign_refused.py`) pin the same for the daemon;
+    /// this is the embedded broker's own path (AppGate, its Coordinator channel).
+    #[tokio::test]
+    async fn a_declined_sign_request_never_prompts_through_the_embedded_coordinator() {
+        let server = MockServer::start_async().await;
+        // The key of the test above, and a login for `root` with it:
+        // string(32 bytes of 7) || byte 50 || string("root") || string("ssh-connection") ||
+        // string("publickey") || bool true || string("ssh-ed25519") || string(key).
+        const KEY_B64: &str =
+            "AAAAC3NzaC1lZDI1NTE5AAAAILMdrPP0NLsfgrc8JIa6OWX1qhgyfW/UwJTSXdRuUsJJ";
+        const ROOT_LOGIN_B64: &str = "AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHMgAAAARyb290AAAADnNzaC1jb25uZWN0aW9uAAAACXB1YmxpY2tleQEAAAALc3NoLWVkMjU1MTkAAAAzAAAAC3NzaC1lZDI1NTE5AAAAILMdrPP0NLsfgrc8JIa6OWX1qhgyfW/UwJTSXdRuUsJJ";
+        let sse = format!(
+            "data: {{\"id\":\"sign-root\",\"namespace\":\"ssh-agent\",\"type\":\"request\",\"final\":true,\"timestamp\":\"t\",\"payload\":{{\"operation\":\"sign\",\"public_key\":\"{KEY_B64}\",\"data\":\"{ROOT_LOGIN_B64}\",\"flags\":0}},\"shed\":{{\"name\":\"web\",\"backend\":\"vz\",\"server\":\"mini2\"}}}}\n\n"
+        );
+        server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/plugins/listeners/ssh-agent/messages");
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(&sse);
+            })
+            .await;
+        // The shed gets the ordinary failure shape, never a signature.
+        let respond = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/plugins/listeners/ssh-agent/respond")
+                    .body_contains("\"in_reply_to\":\"sign-root\"")
+                    .body_contains("\"code\":\"SIGN_FAILED\"");
+                t.status(204);
+            })
+            .await;
+
+        // The Coordinator side counts every approval request it is shown (and would
+        // approve it, so a prompt that slipped through would also sign).
+        let (inner, responder, mut events) = channel_only(Duration::from_secs(10));
+        let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = prompts.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                if let HostAgentEvent::Frame(f) = ev {
+                    if let HostAgentInbound::ApprovalRequest(req) = *f {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        responder.respond(
+                            &req.id,
+                            ApprovalDecision::Approve,
+                            DecidedBy::User,
+                            Some("per-request"),
+                            None,
+                        );
+                    }
+                }
+            }
+        });
+
+        let audit = Arc::new(CollectingAudit::default());
+        let deps = SharedDeps {
+            ssh_backend: Arc::new(NoSignBackend),
+            ssh_gate: Arc::new(AppGate {
+                inner: inner.clone(),
+            }),
+            // The default policy: `git` only.
+            ssh_sign_policy: Arc::new(SignPolicy::default()),
+            aws: None,
+            docker: None,
+            audit: audit.clone(),
+            minter: None,
+            log: Arc::new(bus::FileBusLog::new("")),
+            machine: None,
+            embedded_presence: None,
+            presence_lock: None,
+        };
+        let target = ServerTarget {
+            name: String::new(),
+            url: server.base_url(),
+            token: String::new(),
+            tls_fingerprint: String::new(),
+            ssh_host: String::new(),
+            ssh_port: 0,
+            auth_mode: String::new(),
+        };
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let group = bus::spawn_server_group(shutdown_rx, &target, &deps);
+
+        let mut ok = false;
+        for _ in 0..100 {
+            if respond.hits_async().await >= 1
+                && audit
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.op == "sign" && e.result == "refused")
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = group.cancel.send(true);
+        let _ = group.done.await;
+
+        assert!(ok, "expected the failure response + a refused sign audit");
+        assert_eq!(
+            prompts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a declined request never reaches the Coordinator"
+        );
+        let entries = audit.entries.lock().unwrap();
+        let refused = entries
+            .iter()
+            .find(|e| e.op == "sign" && e.result == "refused")
+            .expect("refused sign audit");
+        assert_eq!(refused.shed, "web");
+        assert_eq!(refused.code, "SIGN_REFUSED");
+        assert_eq!(refused.reason, "username_not_allowed");
+        assert_eq!(refused.approval, "none", "no approval was asked for");
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.result == "approved" || e.result == "ok"),
+            "{entries:?}"
+        );
     }
 
     // ---- spawn() wiring smoke (hermetic: watch off, empty temp discovery source) -----
@@ -1585,6 +1770,158 @@ mod tests {
         agent.retry_now(); // reaches the running supervisor without panicking
                            // Best-effort drain (the watch loop returns on the flip, then drains groups).
         let _ = agent.shutdown_handle().send(true);
+    }
+
+    /// While the embedded broker runs it holds the lock beside the machine identity file
+    /// that a shed-host-agent daemon on this machine stands by for (plan 035 §3.4): taken
+    /// by `spawn` before anything subscribes — the reconcile task that subscribes has not
+    /// run yet when `spawn` returns on this single-threaded runtime — and released once
+    /// the broker has stopped.
+    #[tokio::test]
+    async fn the_embedded_broker_holds_the_presence_lock_while_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("config.yaml");
+        std::fs::write(&src, "servers: {}\n").unwrap();
+        let yaml = format!("discovery:\n  source: {}\n  watch: off\n", src.display());
+        let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
+        let (mut agent, _events) = EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        agent.machine_path = dir.path().join("state/host-agent/machine.json");
+        let lock = presence::lock_path_beside(&agent.machine_path);
+        assert!(!presence::present(&lock), "nothing holds it before spawn");
+
+        agent.spawn().await.expect("spawn ok");
+        assert!(
+            presence::present(&lock),
+            "held from spawn on, before the first subscribe"
+        );
+        // A second instance of the app is told someone else holds it.
+        assert!(matches!(
+            presence::hold(&lock),
+            presence::Hold::HeldElsewhere
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(presence::present(&lock), "held while the broker runs");
+
+        let _ = agent.shutdown_handle().send(true);
+        let mut released = false;
+        for _ in 0..100 {
+            if !presence::present(&lock) {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(released, "released once the broker has stopped");
+    }
+
+    /// A log that keeps its lines, for the lock cells below.
+    #[derive(Default)]
+    struct KeptLog(std::sync::Mutex<Vec<String>>);
+    impl KeptLog {
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+    impl bus::BusLog for KeptLog {
+        fn info(&self, m: &str) {
+            self.0.lock().unwrap().push(m.to_string());
+        }
+        fn warn(&self, m: &str) {
+            self.0.lock().unwrap().push(m.to_string());
+        }
+        fn debug(&self, _m: &str) {}
+        fn error(&self, m: &str) {
+            self.0.lock().unwrap().push(m.to_string());
+        }
+    }
+
+    fn lock_cell_agent(
+        dir: &tempfile::TempDir,
+        log: Arc<KeptLog>,
+    ) -> (EmbeddedHostAgent, std::path::PathBuf) {
+        let src = dir.path().join("config.yaml");
+        std::fs::write(&src, "servers: {}\n").unwrap();
+        let yaml = format!("discovery:\n  source: {}\n  watch: off\n", src.display());
+        let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
+        let (mut agent, _events) = EmbeddedHostAgent::new(cfg, log);
+        agent.machine_path = dir.path().join("state/host-agent/machine.json");
+        let lock = presence::lock_path_beside(&agent.machine_path);
+        (agent, lock)
+    }
+
+    /// An app that could not load its machine identity does not take the lock (a
+    /// pinning server refuses its subscribes, so holding it would silence a daemon that
+    /// can still answer), and says so. Here `machine.json` is a directory: the identity
+    /// cannot be read, while the directory the lock lives in is perfectly usable.
+    #[tokio::test]
+    async fn without_a_machine_identity_the_embedded_broker_takes_no_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(KeptLog::default());
+        let (agent, lock) = lock_cell_agent(&dir, log.clone());
+        std::fs::create_dir_all(&agent.machine_path).unwrap(); // unreadable as a file
+        agent.spawn().await.expect("spawn ok without an identity");
+        assert!(agent.machine.lock().unwrap().as_ref().unwrap().is_err());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!presence::present(&lock), "no lock without an identity");
+        assert!(
+            matches!(presence::hold(&lock), presence::Hold::Held(_)),
+            "free for anyone"
+        );
+        assert!(
+            log.lines()
+                .iter()
+                .any(|l| l.contains("no machine identity, so not taking the embedded broker lock")),
+            "{:?}",
+            log.lines()
+        );
+        let _ = agent.shutdown_handle().send(true);
+    }
+
+    /// The lock is held elsewhere when the app starts (a first instance of the app):
+    /// `spawn` waits a second, starts the broker without it and says so, and takes it
+    /// as soon as the other lets go — no restart — until the broker stops.
+    #[tokio::test]
+    async fn an_embedded_broker_that_started_without_the_lock_takes_it_when_it_frees() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(KeptLog::default());
+        let (agent, lock) = lock_cell_agent(&dir, log.clone());
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        let presence::Hold::Held(first) = presence::hold(&lock) else {
+            panic!("hold");
+        };
+        let started = std::time::Instant::now();
+        agent.spawn().await.expect("spawn ok");
+        assert!(
+            started.elapsed() >= EMBEDDED_LOCK_WAIT,
+            "waited for the lock before starting"
+        );
+        assert!(
+            log.lines()
+                .iter()
+                .any(|l| l.contains("embedded broker lock not held after")),
+            "{:?}",
+            log.lines()
+        );
+        drop(first); // the first instance exits
+        let mut retaken = false;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if presence::present(&lock) {
+                retaken = true;
+                break;
+            }
+        }
+        assert!(retaken, "taken by this broker once free");
+        let _ = agent.shutdown_handle().send(true);
+        let mut released = false;
+        for _ in 0..100 {
+            if !presence::present(&lock) {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(released, "released once the broker has stopped");
     }
 
     /// The backend the bus actually runs with is the filtered one: the supervisor's

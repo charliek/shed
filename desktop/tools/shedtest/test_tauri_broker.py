@@ -23,6 +23,7 @@ cell shells real `ssh` (hermetic token handling, §C4.2).
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import os
 import shutil
@@ -467,20 +468,27 @@ def test_embedded_status_and_set_mode_round_trip():
 # ---------------------------------------------------------------------------
 
 def test_split_namespace_409_surfaced_in_status():
-    """A namespace already owned by a competing listener answers 409
-    NAMESPACE_ALREADY_REGISTERED — terminal `rejected` (no retry) — while the others
-    connect. The startup-race split state is safe (no double prompts) and surfaced."""
+    """A namespace already owned by a competing listener answers an older server's 409
+    NAMESPACE_ALREADY_REGISTERED while the others connect. The embedded broker, which
+    holds the presence lock, retries it on its backoff for the older-server grace (15 s:
+    on such a server a daemon on the same machine may hold the type for a moment after
+    the app took its lock — `bus.rs` OLD_SERVER_CONFLICT_GRACE), then reads terminal
+    `rejected` and asks no more. Surfaced in status."""
     with _broker_app(discovery_mock=True, conflict_namespaces=("ssh-agent",)) as (client, mock, info):
         client.wait_until(
             lambda: _server_ns_states(client.broker_status()).get("ssh-agent") == "rejected"
             and _server_ns_states(client.broker_status()).get("docker-credentials") == "connected",
-            timeout=20, what="ssh-agent rejected while docker-credentials connects")
+            timeout=40, what="ssh-agent rejected (after the grace) while docker-credentials connects")
         states = _server_ns_states(client.broker_status())
         assert states["ssh-agent"] == "rejected", states
         assert states["docker-credentials"] == "connected", states
-        # 409 NAMESPACE_ALREADY_REGISTERED is terminal client-side: the bus must not
-        # hot-retry a rejected namespace — exactly one subscribe attempt.
-        assert mock.subscribe_count("ssh-agent") == 1, mock.subscribe_count("ssh-agent")
+        # Retried inside the grace (at least once: a broker without the grace stops at its
+        # first refusal), only on the backoff (1, 2, 4, 8 s: at most five attempts), never
+        # hot; and terminal after it: no further attempt.
+        attempts = mock.subscribe_count("ssh-agent")
+        assert 2 <= attempts <= 5, attempts
+        time.sleep(3.0)
+        assert mock.subscribe_count("ssh-agent") == attempts, "no retry once rejected"
         # And the app's log file says which server refused it (#414).
         log = ui.app_log_path(info["runtime_dir"])
         client.wait_until(
@@ -494,9 +502,9 @@ def test_split_namespace_409_surfaced_in_status():
 # refusals, and the respond retries, through the EMBEDDED broker
 # ---------------------------------------------------------------------------
 
-# The broker's respond deadline (`bus.rs` RESPOND_RETRY_BUDGET): nothing of a respond
-# outlives it.
-_RESPOND_DEADLINE_S = 5.0
+# The broker's respond deadline (`bus.rs` RESPOND_RETRY_BUDGET: two 8 s attempts and the
+# server's 1 s Retry-After): nothing of a respond outlives it.
+_RESPOND_DEADLINE_S = 17.0
 
 
 def _ns_row(status: dict, ns: str) -> dict:
@@ -594,8 +602,8 @@ def test_respond_503_with_retry_after_is_resent():
         mock.push_request("ssh-agent", _ping("ping-403"))
         client.wait_until(lambda: len(mock.respond_identities("ssh-agent")) >= 3,
                           timeout=10, what="the refused respond")
-        # Read the count only after the respond's whole deadline (5 s from its first
-        # send, which came before this point) has passed: a retry cannot merely be late.
+        # Read the count only after the respond's whole deadline (from its first send,
+        # which came before this point) has passed: a retry cannot merely be late.
         time.sleep(_RESPOND_DEADLINE_S + 0.5)
         assert len(mock.respond_identities("ssh-agent")) == 3, "a 403 is never re-sent"
 
@@ -647,6 +655,40 @@ def _machine_json(info) -> Path:
     return Path(info["runtime_dir"]) / "host-agent-state" / "host-agent" / "machine.json"
 
 
+def _lock_is_held(lock: Path) -> bool:
+    """Whether another process holds `lock` (the presence lock a shed-host-agent daemon
+    looks at): a non-blocking exclusive `flock` on a descriptor of our own."""
+    try:
+        f = open(lock, "rb")  # noqa: SIM115 — closed below on every path
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        f.close()
+    return False
+
+
+def test_the_embedded_broker_holds_the_presence_lock_until_the_app_quits():
+    """The real app, in embedded mode, holds `embedded-broker.lock` beside `machine.json`
+    while its broker runs — what a shed-host-agent daemon on this machine stands by for
+    (`shed_broker::presence`) — and an orderly quit releases it."""
+    with _broker_app(discovery_mock=True) as (client, _mock, info):
+        lock = _machine_json(info).parent / "embedded-broker.lock"
+        client.wait_until(lambda: client.broker_status().get("effective_mode") == "embedded",
+                          timeout=20, what="the embedded broker running")
+        client.wait_until(lambda: _lock_is_held(lock), timeout=20,
+                          what="the embedded broker holding its presence lock")
+        assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+        client.call("app.quit")
+        code = info["proc"].wait(timeout=scaled_timeout(20))
+        assert code == 0, code
+        assert not _lock_is_held(lock), "released with the app"
+        assert lock.exists(), "the lock file is never removed"
+
+
 def test_not_source_until_use_this_machine_then_connected_at_once():
     """Armed with another machine as the source, the embedded broker reads
     `not-source` naming it and keeps retrying on its backoff. `source.use` sends THIS
@@ -677,7 +719,7 @@ def test_not_source_until_use_this_machine_then_connected_at_once():
         assert row == {"host": "mock", "supported": True,
                        "source": {"id": OTHER_MACHINE, "name": "desk"},
                        "this_machine": False, "connected": True, "busy": False,
-                       "error": None}, row
+                       "unreachable": False, "error": None}, row
 
         before = mock.subscribe_times("ssh-agent")
         used = client.source_use("mock")
@@ -748,7 +790,8 @@ def test_unarmed_server_has_no_source_rows():
         status = client.source_status()
         assert status["rows"] == [{"host": "mock", "supported": False, "source": None,
                                    "this_machine": False, "connected": False,
-                                   "busy": False, "error": None}], status
+                                   "busy": False, "unreachable": False,
+                                   "error": None}], status
         assert status["this_machine"] is not None, status
         with pytest.raises(ShedError) as e:
             client.source_use("mock")
@@ -820,7 +863,7 @@ def test_refused_moves_show_their_messages():
         client.wait_until(lambda: (_prefs_source(client) or {}).get("error"),
                           timeout=15, what="the refusal under the row")
         row = _prefs_source(client)
-        assert "refused the move: a key marked script may not move the credential source" \
+        assert "refused the move: a script key cannot see or move a credential source" \
             in row["error"], row
         assert row["this_machine"] is False and row["busy"] is False, row
         assert len(mock.source_use_requests()) == 1
@@ -914,7 +957,7 @@ def test_busy_source_read_keeps_the_last_known_source_and_recovers():
         row = _source_row(client)
         assert row == {"host": "mock", "supported": True, "source": None,
                        "this_machine": False, "connected": False, "busy": True,
-                       "error": None}, row
+                       "unreachable": False, "error": None}, row
 
         _open_prefs(client)
         client.wait_until(lambda: (_prefs_source(client) or {}).get("source_name") == "desk",
@@ -932,6 +975,43 @@ def test_busy_source_read_keeps_the_last_known_source_and_recovers():
             lambda: (lambda r: r and r["source_name"] == "lab" and not r["retrying"])(
                 _prefs_source(client)),
             timeout=20, what="the later read naming lab")
+
+
+def test_source_row_survives_a_server_restart_and_recovers():
+    """A read while the server is down (a restart) keeps the source row Preferences
+    showed — the last known source, noted "cannot reach the server" — instead of
+    dropping it, and the window reads again on its own: once the server is back the
+    row is current again, with nothing shown, focused or reloaded meanwhile. Over IPC
+    the same read is `unreachable`, never `supported: false` with nothing to show."""
+    with _broker_app(discovery_mock=True, source={}) as (client, mock, _i):
+        client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
+                          what="the source row")
+        _open_prefs(client)
+        client.wait_until(lambda: (_prefs_source(client) or {}).get("source_name") == "desk",
+                          timeout=20, what="the source row naming desk")
+        mock.pause()
+        try:
+            row = _source_row(client)
+            assert row["unreachable"] is True and row["error"], row
+            # Any prefs change reloads the window: its source read finds the server down.
+            prefs = client.prefs_get()
+            client.prefs_set_terminal(prefs["terminal_preset"], prefs.get("terminal_template"))
+            client.wait_until(lambda: (_prefs_source(client) or {}).get("unreachable") is True,
+                              timeout=20, what="the row kept, marked unreachable")
+            row = _prefs_source(client)
+            assert row["source_name"] == "desk", f"the last known source, never gone: {row}"
+            assert row["error"] is None, row
+            # Another machine takes the source while the server is down; the window must
+            # learn it by itself once the server is back.
+            mock.move_source(LAB_MACHINE, "lab")
+            _holds(lambda: (_prefs_source(client) or {}).get("source_name") == "desk",
+                   1.0, "the row stays while the server is down")
+        finally:
+            mock.resume()
+        client.wait_until(
+            lambda: (lambda r: r and r["source_name"] == "lab" and not r["unreachable"])(
+                _prefs_source(client)),
+            timeout=30, what="the row current again once the server is back")
 
 
 def test_reopening_preferences_reads_a_source_taken_elsewhere():

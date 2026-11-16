@@ -376,6 +376,13 @@ fn tolerate_unsupported_sync(r: std::io::Result<()>) -> std::io::Result<()> {
     }
 }
 
+/// Create the identity file's directory as a create of the file itself does
+/// ([`ensure_dir_durable`] with the real directory sync), for another file kept beside
+/// it ([`crate::presence`]'s lock).
+pub(crate) fn ensure_state_dir(dir: &Path) -> Result<(), String> {
+    ensure_dir_durable(dir, &sync_dir)
+}
+
 /// [`ensure_dir`] (create, tighten to 0700), and then make every directory it CREATED
 /// durable by syncing that directory's parent, where its entry lives. The file's own
 /// directory is synced by the write that follows.

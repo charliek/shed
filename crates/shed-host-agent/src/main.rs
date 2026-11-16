@@ -446,6 +446,12 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     // separate single-server path — single-server is just a discovery config that reconciles
     // once and never reloads, and the single unnamed target has `ssh_host=""` → `should_mint`
     // false → open/no-pin (why the existing single-server bus surface survives unchanged).
+    // The one lock watcher of this process (started in the runtime below, before anything
+    // subscribes).
+    let presence_watcher = shed_broker::presence::LockWatcher::new(
+        shed_broker::presence::lock_path(),
+        bus_log.clone(),
+    );
     let deps = supervisor::SharedDeps {
         ssh_backend,
         ssh_gate,
@@ -459,6 +465,20 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         // Sent on every bus request; with no identity the bus sends no identity headers
         // and behaves exactly as before (status says why there is none).
         machine: machine.as_ref().ok().cloned(),
+        // The daemon stands by while the desktop app's embedded broker runs on this
+        // machine: the app holds an exclusive lock beside the machine identity file the
+        // two share (`shed_broker::presence`), and ONE watcher in this process looks at it
+        // (a shared lock, off the async workers) every couple of seconds and publishes
+        // what it finds on this channel, which every subscription reads. While the lock is
+        // held the daemon subscribes nothing and answers nothing (the app answers, its
+        // prompts have a consumer there); once the app quits, however it quits, the
+        // kernel drops the lock and the daemon subscribes at once. Without this the two,
+        // sharing one machine id, could each win a type after a server restart, and a
+        // daemon delegating approval to an app running its own broker would deny every
+        // sign request.
+        embedded_presence: Some(presence_watcher.subscribe()),
+        // Only the embedded broker holds the lock.
+        presence_lock: None,
     };
     let sup = Arc::new(supervisor::Supervisor::new(shutdown_rx.clone(), deps));
 
@@ -551,6 +571,11 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         });
 
         let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        // The presence watcher's first look (bounded: a slow filesystem cannot hold the
+        // start up) is in before the watch loop below makes the first subscription; its
+        // task then runs until shutdown, never waiting for a look that stalled.
+        tasks.push(presence_watcher.start(shutdown_rx.clone()).await);
 
         // The status + desktop listeners race `listener_shutdown` (flipped after the groups
         // drain), NOT the raw SIGTERM watch — so their sockets outlive the group teardown.

@@ -585,7 +585,7 @@ function cleanMachine(m: SourceMachine | null | undefined): SourceMachine | null
 }
 
 function cleanRow(r: SourceRow): SourceRow {
-  return { ...r, source: cleanMachine(r.source), busy: !!r.busy };
+  return { ...r, source: cleanMachine(r.source), busy: !!r.busy, unreachable: !!r.unreachable };
 }
 
 /** The source rows (swallowing, like `getBrokerStatus`: `undefined` on any failure). */
@@ -851,6 +851,9 @@ export type PrefsReport = {
       busy: boolean;
       /** The server was busy at the last read; a later read is scheduled. */
       retrying: boolean;
+      /** The server could not be reached at the last read: the row is the last one
+       *  known, and a few later reads are scheduled. */
+      unreachable: boolean;
       can_use: boolean;
       error: string | null;
     }[];

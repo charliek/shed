@@ -293,22 +293,25 @@ fn render_source_hint(out: &mut dyn Write, sv: &ServerHealth, ls: &LiveStatus) {
     if let Some(m) = &ls.machine {
         let _ = writeln!(
             out,
-            "    to make this machine the source: {}",
-            source_use_command(&sv.name, &m.name)
+            "    to make this machine ({}) the source: {}",
+            m.name,
+            source_use_command(&sv.name, &m.id)
         );
     }
 }
 
 /// The command that makes this machine the source on `server` (empty: the unnamed
-/// single-server target, no `-s`): `shed [-s <server>] source use -- <name>`. The `--`
-/// ends option parsing, so a name beginning with `-` is never read as an option.
-fn source_use_command(server: &str, name: &str) -> String {
+/// single-server target, no `-s`): `shed [-s <server>] source use -- <id>`. It names the
+/// machine by its full id, never its name: two of a user's machines can share a name
+/// (the same hostname), and the CLI refuses a name that matches more than one. The `--`
+/// ends option parsing.
+fn source_use_command(server: &str, machine_id: &str) -> String {
     let server = if server.is_empty() {
         String::new()
     } else {
         format!("-s {} ", shell_word(server))
     };
-    format!("shed {server}source use -- {}", shell_word(name))
+    format!("shed {server}source use -- {}", shell_word(machine_id))
 }
 
 /// `s` as one shell word: bare only when it is non-empty and made only of ASCII letters,
@@ -385,8 +388,9 @@ fn server_label(name: &str) -> &str {
 fn conn_mark(state: &str) -> &'static str {
     match state {
         "connected" => "ok",
-        // Waiting for another machine to stop being the source is not a fault.
-        "stopped" | "not-source" => "-",
+        // Waiting for another machine to stop being the source is not a fault, and nor
+        // is standing by while the desktop app's embedded broker answers.
+        "stopped" | "not-source" | "yielding" => "-",
         _ => "x",
     }
 }
@@ -677,9 +681,12 @@ mod tests {
     }
 
     /// A server with a `not-source` namespace reads as not the source: an idle `-` mark,
-    /// the active machine in the row and in a hint, and the exact command (this machine's
-    /// name quoted as one shell word) that moves the source here. A `duplicate`
-    /// namespace is a fault mark and adds no hint.
+    /// the active machine in the row and in a hint, and the exact command that moves the
+    /// source here — naming this machine by its full id (a name can be shared by two
+    /// machines; the CLI refuses an ambiguous one), with the name on the same line so a
+    /// person sees which machine it is. A `duplicate` namespace is a fault mark and adds
+    /// no hint; a `yielding` one (the desktop app's embedded broker answers) is idle and
+    /// adds no hint either.
     #[test]
     fn render_status_not_source_hint_names_the_command() {
         let src = shed_broker::ActiveSource {
@@ -707,7 +714,10 @@ mod tests {
             ServerHealth {
                 name: String::new(),
                 url: "http://localhost:8080".into(),
-                namespaces: vec![ns("ssh-agent", "duplicate", "another process")],
+                namespaces: vec![
+                    ns("ssh-agent", "duplicate", "another process"),
+                    ns("docker-credentials", "yielding", "the desktop app answers"),
+                ],
                 active_source: None,
             },
         ];
@@ -726,9 +736,10 @@ mod tests {
                 "    ok  docker-credentials  connected",
                 "    -   ssh-agent           not-source: not the credential source for this server; the active source is desk (0123456789abcdef0123456789abcdef)",
                 "    this machine is not the credential source here; the active source is desk",
-                "    to make this machine the source: shed -s alpha source use -- 'laptop (work)'",
+                "    to make this machine (laptop (work)) the source: shed -s alpha source use -- fedcba9876543210fedcba9876543210",
                 "  (default)  (http://localhost:8080)",
-                "    x  ssh-agent  duplicate: another process",
+                "    x  ssh-agent           duplicate: another process",
+                "    -  docker-credentials  yielding: the desktop app answers",
             ]
         );
     }

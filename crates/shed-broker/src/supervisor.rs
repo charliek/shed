@@ -95,6 +95,20 @@ pub struct SharedDeps {
     /// pinning server can tell this machine from another of the same user's. `None` when
     /// it could not be loaded: the bus then sends no identity headers, exactly as before.
     pub machine: Option<MachineIdentity>,
+    /// Whether the desktop app's embedded broker runs on this machine
+    /// ([`crate::presence`]): the channel the daemon's one lock watcher
+    /// ([`crate::presence::LockWatcher`]) publishes on. While it reads present every bus
+    /// client stands by: it subscribes nothing and answers nothing, and work it received
+    /// before a start of the app (an older yield epoch) is never answered by it
+    /// ([`crate::bus::BusClient::with_presence`]). `Some` in the shed-host-agent daemon;
+    /// `None` in the embedded broker itself, which holds that lock and never stands by,
+    /// and in every other host.
+    pub embedded_presence: Option<tokio::sync::watch::Receiver<crate::presence::Presence>>,
+    /// When this process took the presence lock (`None` until it has): set only by the
+    /// desktop's embedded broker, which holds it ([`crate::presence::Holder`]); every
+    /// other host leaves it `None`. Its one use: the older-server grace
+    /// ([`crate::bus::BusClient::with_presence_lock`]).
+    pub presence_lock: Option<tokio::sync::watch::Receiver<Option<tokio::time::Instant>>>,
 }
 
 /// Whether the agent should self-mint a token for `target` (attaching a token provider +
@@ -375,6 +389,7 @@ fn conn_state_str(state: ConnState) -> &'static str {
         ConnState::Rejected => "rejected",
         ConnState::NotSource => "not-source",
         ConnState::Duplicate => "duplicate",
+        ConnState::Yielding => "yielding",
     }
 }
 
@@ -438,6 +453,8 @@ mod tests {
             minter,
             log: test_log(),
             machine: None,
+            embedded_presence: None,
+            presence_lock: None,
         }
     }
 
@@ -765,7 +782,7 @@ mod tests {
         }))
     }
 
-    /// `health()` reports the two plan 035 states by their wire names, carries the
+    /// `health()` reports the three plan 035 states by their wire names, carries the
     /// active machine per namespace, and marks the SERVER as not the source when any of
     /// its namespaces is — and not otherwise.
     #[tokio::test]
@@ -784,7 +801,10 @@ mod tests {
             ),
             (
                 "twice".to_string(),
-                vec![sub_status("ssh-agent", ConnState::Duplicate, None)],
+                vec![
+                    sub_status("ssh-agent", ConnState::Duplicate, None),
+                    sub_status("docker-credentials", ConnState::Yielding, None),
+                ],
             ),
         ]);
         let (_tx, rx) = watch::channel(false);
@@ -818,8 +838,13 @@ mod tests {
             "any not-source namespace marks the server"
         );
         assert_eq!(h[1].name, "twice");
-        assert_eq!(h[1].namespaces[0].state, "duplicate");
-        assert_eq!(h[1].active_source, None, "a duplicate is not a not-source");
+        // Sorted by namespace: docker-credentials, then ssh-agent.
+        assert_eq!(h[1].namespaces[0].state, "yielding");
+        assert_eq!(h[1].namespaces[1].state, "duplicate");
+        assert_eq!(
+            h[1].active_source, None,
+            "a duplicate or a yielding namespace is not a not-source"
+        );
     }
 
     /// `retry_now` reaches every running group's wake.

@@ -683,6 +683,13 @@ pub struct HostSource {
     /// `error` is `None`; whoever shows the row keeps what it last knew for this host
     /// and reads again later.
     pub busy: bool,
+    /// The server could not be reached, or its answer could not be read (a transport
+    /// failure, an undecodable body, a 5xx with no API error body — what a server
+    /// restart looks like): whether it supports sources, and which machine answers, are
+    /// UNKNOWN for now — never "not supported". `supported` is false and `error` says
+    /// why; whoever shows the row keeps what it last knew for this host, notes that the
+    /// server cannot be reached, and reads again later.
+    pub unreachable: bool,
     pub error: Option<String>,
 }
 
@@ -714,12 +721,15 @@ impl HostSource {
             connected: entry.is_some_and(|m| m.connected),
             source,
             busy: false,
+            unreachable: false,
             error: None,
         }
     }
 
-    /// The row for a host whose source could not be read. An older server is
-    /// `supported: false` with no error: it simply has none to show.
+    /// The row for a host whose source could not be read. Only an older server (a
+    /// plain 404) is `supported: false` with no error: it simply has none to show. A
+    /// server that could not be reached or read is `unreachable` — unknown, not
+    /// unsupported.
     pub fn from_error(host: String, e: &SourceError) -> Self {
         let (supported, error) = match e {
             SourceError::Unsupported => (false, None),
@@ -737,9 +747,20 @@ impl HostSource {
             this_machine: false,
             connected: false,
             busy: matches!(e, SourceError::Busy { .. }),
+            unreachable: is_unreachable(e),
             error,
         }
     }
+}
+
+/// Whether a failed source read says nothing about the server but that it could not be
+/// reached or read just now: a transport failure, an answer that could not be decoded,
+/// or a 5xx with no API error body (a restarting server, a proxy in front of one).
+fn is_unreachable(e: &SourceError) -> bool {
+    matches!(
+        e,
+        SourceError::Shed(ShedError::Transport(_) | ShedError::Decode(_))
+    ) || matches!(e, SourceError::Shed(ShedError::BadStatus(s)) if *s >= 500)
 }
 
 #[cfg(test)]
@@ -1143,12 +1164,66 @@ mod tests {
 
         let d = row("down");
         assert!(!d.supported && d.error.is_some());
+        assert!(
+            d.unreachable,
+            "a transport failure is unknown, never unsupported: {d:?}"
+        );
+        // Only those that could not be reached or read are unreachable.
+        for h in ["pinning", "mine", "old", "refusing", "busy"] {
+            assert!(!row(h).unreachable, "{h}: {:?}", row(h));
+        }
 
         // Without this machine's id, no row is "this machine".
         let rows = backend_with(vec![client_at("mine", mine.base_url())])
             .source_status(None)
             .await;
         assert!(!rows[0].this_machine);
+    }
+
+    /// Only a plain 404 means "not supported". A server that cannot be reached or read
+    /// right now — a refused connection, a 502 or 503 page with no API error body (a
+    /// restarting server behind a proxy), a 200 whose body is not the document — is
+    /// `unreachable`: unknown, so whoever shows the row keeps what it last knew and reads
+    /// again. Anything else with no API body (a bare 401) stays a plain error row.
+    #[tokio::test]
+    async fn an_unreachable_server_is_unknown_never_unsupported() {
+        let answering = |status: u16, body: &'static str| async move {
+            let s = MockServer::start_async().await;
+            s.mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(status).body(body);
+            })
+            .await;
+            s
+        };
+        let gateway = answering(502, "<html>Bad Gateway</html>").await;
+        let restarting = answering(503, "").await;
+        let garbled = answering(200, "{not the document").await;
+        let bare_401 = answering(401, "").await;
+        let old = answering(404, "404 page not found\n").await;
+        let rows = backend_with(vec![
+            client_at("refused", "http://127.0.0.1:1".to_string()),
+            client_at("gateway", gateway.base_url()),
+            client_at("restarting", restarting.base_url()),
+            client_at("garbled", garbled.base_url()),
+            client_at("bare-401", bare_401.base_url()),
+            client_at("old", old.base_url()),
+        ])
+        .source_status(Some(THIS_ID))
+        .await;
+        let row = |h: &str| rows.iter().find(|r| r.host == h).unwrap().clone();
+        for h in ["refused", "gateway", "restarting", "garbled"] {
+            let r = row(h);
+            assert!(r.unreachable, "{h}: {r:?}");
+            assert!(
+                r.error.is_some() && r.source.is_none() && !r.busy,
+                "{h}: {r:?}"
+            );
+        }
+        let r = row("bare-401");
+        assert!(!r.unreachable && r.error.is_some(), "{r:?}");
+        let r = row("old");
+        assert!(!r.unreachable && !r.supported && r.error.is_none(), "{r:?}");
     }
 
     #[tokio::test]

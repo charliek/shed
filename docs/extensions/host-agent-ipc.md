@@ -84,7 +84,7 @@ load).
 | `policies` | Effective approval policy per namespace (after defaulting empty → `deny-all`). |
 | `gate_namespaces` | Namespaces whose policy is `shed-desktop` (decided in the app). Omitted when empty. |
 | `approval_channel` | The approval socket path and its current consumer, if any. |
-| `servers[].namespaces[].state` | `connected`, `reconnecting` (with `last_error`), `not-source`, `duplicate`, `rejected` (terminal), or `stopped`. See [Configuration → `shed-host-agent status`](configuration.md#shed-host-agent-status). |
+| `servers[].namespaces[].state` | `connected`, `reconnecting` (with `last_error`), `not-source`, `duplicate`, `yielding` (the desktop app's embedded broker runs on this machine and answers; the daemon subscribes nothing until it quits; see [Credential source](source-binding.md#the-daemon-and-the-desktop-app-on-one-machine)), `rejected` (terminal), or `stopped`. See [Configuration → `shed-host-agent status`](configuration.md#shed-host-agent-status). |
 | `servers[].namespaces[].active_source` | Only in `not-source`: the machine the server named as the user's [credential source](source-binding.md), `{machine_id, machine_name}` as the server sent them (control and format characters removed, at most 64 bytes each). |
 | `servers[].active_source` | Set when any namespace of the server is `not-source`: the first such namespace's `active_source`. |
 | `machine` | This machine's identity, `{id, name}`, from `machine.json`. Omitted when the broker has none. |
@@ -93,7 +93,7 @@ load).
 
 **Compatibility:** new fields may be added without bumping `schema`; clients
 should ignore unknown fields. A field's removal or a meaning change bumps
-`schema`. `machine`, `machine_error`, `ssh` and `active_source` were added this way; an older
+`schema`. `machine`, `machine_error`, `ssh`, `active_source` and the `yielding` state were added this way; an older
 daemon's report has none of them.
 
 ## Approval channel

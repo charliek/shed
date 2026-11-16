@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import queue
 import re
+import select
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -170,7 +172,9 @@ _REFUSALS: dict[str, tuple[int, object]] = {
 _RESPOND_REFUSALS: dict[int, dict] = {
     503: {"error": {"code": "RESPONSE_NOT_DELIVERED", "message": "not delivered; try again"}},
     429: {"error": {"code": "TOO_MANY_RESPONSES", "message": "too many answers in flight"}},
-    413: {"error": {"code": "RESPONSE_TOO_LARGE", "message": "response too large"}},
+    # The server's own code and words for a respond body over its limit
+    # (`internal/api/plugin_handlers.go`: `config.ErrRequestTooLarge`, `maxRespondBody`).
+    413: {"error": {"code": "REQUEST_TOO_LARGE", "message": "response body is over 16777216 bytes"}},
     403: {
         "error": {
             "code": "FORBIDDEN",
@@ -193,13 +197,20 @@ _PLAIN_404 = "404 page not found\n"
 # Used with `fullmatch` only: `$` also matches before a final newline, so an id with
 # one appended would pass a `match` (the real server refuses it 400).
 _MACHINE_ID_RE = re.compile(r"[0-9a-f]{32}")
-# The answers a scripted move (`source_use_script`) gives, by status.
+# The answers a scripted move (`source_use_script`) gives, by status — the codes the
+# server's `handleUseSource` (`internal/api/source_handlers.go`) writes.
 _SOURCE_USE_REFUSALS: dict[int, dict] = {
     403: {"error": {"code": "FORBIDDEN",
-                    "message": "a key marked script may not move the credential source"}},
-    500: {"error": {"code": "SOURCE_MOVE_UNCONFIRMED",
-                    "message": "the move could not be confirmed"}},
+                    "message": "a script key cannot see or move a credential source"}},
+    500: {"error": {"code": "INTERNAL_ERROR",
+                    "message": "the move was not confirmed: the server could not save it. The "
+                               "current credential source stays in use for now, but the move "
+                               "may still take effect when the server restarts; check with "
+                               "'shed source ls' before retrying"}},
 }
+# A respond that matches no pending request (`writeRespondError`, `plugin.ErrUnmatched`).
+_UNMATCHED = {"error": {"code": "FORBIDDEN",
+                        "message": "response does not match a pending request for this namespace"}}
 
 
 def _not_source_body(machine_id: str, machine_name: str) -> dict:
@@ -294,6 +305,22 @@ class MockShedServer:
         # ns -> the monotonic time of each subscribe (what proves a woken retry came
         # sooner than its backoff would have allowed).
         self._bus_subscribe_times: dict[str, list[float]] = {}
+        # (ns, request id) -> {"shed", "machine", "gen"}: a request written on a stream
+        # and not yet answered finally — the server's pending set, stamped with the
+        # machine it went to and the binding generation then. A move drops every entry
+        # not stamped with the new binding (`plugin.Registry.Move`).
+        #
+        # NOT modelled here: re-delivery. The server hands a new stream of the same
+        # machine, at the same generation, every request still pending on its namespace
+        # (`plugin.Registry` `pendingForLocked`); this mock never re-sends a pending
+        # request on a later stream, so no cell here can see the daemon/app handoff of an
+        # in-flight request. That handoff is exercised against the host-agent harness's
+        # synthetic bus, which does model it (`tests/host-agent-diff/synthetic_bus.py`,
+        # `test_source_pin.py`).
+        self._bus_pending: dict[tuple[str, str], dict] = {}
+        # Set while `pause()` has the server down; the port it serves (kept across one).
+        self._paused = False
+        self._port = 0
         # ---- credential sources (plan 035 §3.4); all under _bus_cond ----
         self._src_armed = False
         self._src_bound: str | None = None  # the bound machine's id
@@ -314,9 +341,8 @@ class MockShedServer:
 
     @property
     def base_url(self) -> str:
-        assert self._httpd is not None
-        host, port = self._httpd.server_address[0], self._httpd.server_address[1]
-        return f"http://{host}:{port}"
+        assert self._port, "start() first"
+        return f"http://127.0.0.1:{self._port}"
 
     def snapshot(self) -> tuple[dict, list | None]:
         # Deep-copy the shed dicts under the lock so a GET never encodes a
@@ -574,6 +600,9 @@ class MockShedServer:
             if live != mid:
                 end.set()
                 del self._bus_live[ns]
+        for key, p in list(self._bus_pending.items()):
+            if p["machine"] != mid or p["gen"] != self._src_generation:
+                del self._bus_pending[key]
         self._bus_cond.notify_all()
 
     def _src_get(self) -> tuple[str, object, float] | None:
@@ -612,8 +641,10 @@ class MockShedServer:
                 return status, _SOURCE_USE_REFUSALS[status]
             mid = body.get("machine_id")
             if not isinstance(mid, str) or not _MACHINE_ID_RE.fullmatch(mid):
-                return 400, {"error": {"code": "BAD_REQUEST",
-                                       "message": "machine_id must be 32 lowercase hex"}}
+                return 400, {"error": {"code": "INVALID_REQUEST",
+                                       "message": "machine_id must be a machine's full id, 32 "
+                                                  "lowercase hex digits ('shed source ls --json' "
+                                                  "lists them)"}}
             if mid not in self._src_machines:
                 return 404, {"error": {"code": "SOURCE_MACHINE_NOT_FOUND",
                                        "message": "this server has not seen that machine"}}
@@ -735,35 +766,94 @@ class MockShedServer:
             kind = self._bus_refuse.get(ns)
             return _REFUSALS[kind] if kind is not None else None
 
+    def pending(self) -> list[tuple[str, str]]:
+        """The (ns, request id) of every request delivered and not yet answered finally."""
+        with self._bus_cond:
+            return sorted(self._bus_pending)
+
+    def _bus_take(self, ns: str, frame: str, machine_id: str | None, gen: int,
+                  end: threading.Event, q: queue.Queue) -> bool:
+        """A stream's handler took `frame` off `{ns}`'s queue: may it write it? Only a
+        stream still live — not ended by a move, and (armed) admitted at the binding
+        generation now current — takes a request, as the server's `Listener.Take` refuses
+        an unregistered listener. A stream that may not puts the frame back at the head
+        of the queue for the next stream and ends (`False`). One that may stamps the
+        request pending with ITS machine and generation (`True`)."""
+        with self._bus_cond:
+            stale = end.is_set() or (self._src_armed and gen != self._src_generation)
+            if stale:
+                with q.mutex:
+                    q.queue.appendleft(frame)
+                    q.not_empty.notify()
+                return False
+            try:
+                env = json.loads(frame)
+            except ValueError:
+                return True
+            if isinstance(env, dict) and isinstance(env.get("id"), str):
+                self._bus_pending[(ns, env["id"])] = {
+                    "shed": (env.get("shed") or {}).get("name"),
+                    "machine": machine_id,
+                    "gen": gen,
+                }
+            return True
+
     def _bus_next_respond_answer(
-        self, ns: str, identity: tuple[str | None, str | None]
+        self, ns: str, identity: tuple[str | None, str | None], env: dict
     ) -> tuple[int, object, str | None] | None:
         """Record a respond; return `(status, body, retry_after)` to refuse it with
-        (None: accept). An armed binding refuses first, then the scripted answers."""
+        (None: accept). In the server's order — the machine headers' shape, the body's
+        size, then the binding: an armed mock refuses an answer without a machine id;
+        a body over the limit (a scripted 413); an armed binding refuses an answer from
+        another machine; an answer that matches no pending request of its namespace and
+        shed — armed: one delivered to this machine at the current generation — is
+        403 FORBIDDEN; then the scripted retryable answers; else delivered, a final
+        answer consuming its request."""
         with self._bus_cond:
             self._bus_respond_identities.setdefault(ns, []).append(identity)
             self._bus_cond.notify_all()
+            # The server's order: the machine headers' shape, then the body's size,
+            # then the binding.
+            if self._src_armed and not identity[0]:
+                return (*_REFUSALS["machine-id-required"], None)
+            script = self._bus_respond_script.get(ns)
+            if script and script[0][0] == 413:
+                status, retry_after = script.pop(0)
+                return status, _RESPOND_REFUSALS[status], retry_after
             pinned = self._src_respond_refusal(identity)
             if pinned is not None:
                 return pinned[0], pinned[1], None
-            script = self._bus_respond_script.get(ns)
-            if not script:
-                return None
-            status, retry_after = script.pop(0)
-            return status, _RESPOND_REFUSALS[status], retry_after
+            key = (ns, env.get("in_reply_to"))
+            p = self._bus_pending.get(key)
+            shed = (env.get("shed") or {}).get("name")
+            if p is None or p["shed"] != shed or (self._src_armed and (
+                    p["machine"] != identity[0] or p["gen"] != self._src_generation)):
+                return 403, _UNMATCHED, None
+            if script:
+                status, retry_after = script.pop(0)
+                return status, _RESPOND_REFUSALS[status], retry_after
+            if env.get("final"):
+                del self._bus_pending[key]
+            return None
 
     def _bus_try_claim(self, ns: str, machine_id: str | None
-                       ) -> tuple[object, threading.Event] | None:
-        """Claim `{ns}`'s single live-listener slot for `machine_id`: its release token
-        and end event, or None (→ 409) if it's a pre-marked conflict or already has a
-        live listener."""
+                       ) -> tuple[object, threading.Event, int] | str:
+        """Claim `{ns}`'s single live-listener slot for `machine_id`: its release token,
+        end event and the binding generation it was admitted at (bound to the stream for
+        its whole life, as the server's listener carries its generation), or why not:
+        `"duplicate"` when armed (the bound machine already holds it: the server's
+        retryable 409 SOURCE_DUPLICATE_STREAM), else `"conflict"` (a pre-marked
+        conflict, or an older server's terminal 409)."""
         with self._bus_cond:
-            if ns in self._bus_conflict or ns in self._bus_live:
-                return None
+            if ns in self._bus_conflict:
+                return "conflict"
+            if ns in self._bus_live:
+                return "duplicate" if self._src_armed else "conflict"
             token, end = object(), threading.Event()
             self._bus_live[ns] = (token, machine_id, end)
+            gen = self._src_generation
             self._bus_cond.notify_all()
-            return token, end
+            return token, end, gen
 
     def _bus_release(self, ns: str, token: object) -> None:
         """Release `{ns}`'s slot if `token` still holds it (a move may already have
@@ -794,6 +884,7 @@ class MockShedServer:
 
     def start(self) -> None:
         state = self
+        assert not self._paused
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_args):  # silence default stderr logging
@@ -921,14 +1012,19 @@ class MockShedServer:
                     self._send_raw(status, body)
                     return
                 claim = state._bus_try_claim(ns, identity[0])
-                if claim is None:
+                if claim == "duplicate":
+                    status, body = _REFUSALS["duplicate"]
+                    self._send_raw(status, body)
+                    return
+                if claim == "conflict":
                     # NAMESPACE_ALREADY_REGISTERED — a second listener is terminal.
                     self._send(409, {"error": "namespace already registered",
                                      "code": "NAMESPACE_ALREADY_REGISTERED"})
                     return
-                token, end = claim
+                token, end, gen = claim
                 try:
-                    self._stream_sse(state._bus_queue_for(ns), end)
+                    self._stream_sse(state._bus_queue_for(ns), end, ns=ns,
+                                     machine_id=identity[0], gen=gen)
                 finally:
                     state._bus_release(ns, token)
 
@@ -939,10 +1035,14 @@ class MockShedServer:
                 state._bus_record_egress()
                 self._send(501, {"error": "egress unavailable"})
 
-            def _stream_sse(self, q, end: threading.Event):
+            def _stream_sse(self, q, end: threading.Event, ns: str | None = None,
+                            machine_id: str | None = None, gen: int = 0):
                 """Send the 200 SSE handshake, then hold the connection and drain `q`,
                 writing each frame as a `data:` line, until shutdown / a `None` sentinel
-                / client disconnect / `end` (a source move closed this stream)."""
+                / client disconnect / `end` (a source move closed this stream). Each
+                frame written is a pending request of `ns`, stamped with `machine_id` and
+                the generation `gen` this stream was admitted at; a frame taken after the
+                stream stopped being live goes back for the next stream."""
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -954,11 +1054,16 @@ class MockShedServer:
                 state._bus_register_sse_thread()
                 try:
                     while not state._bus_shutdown.is_set() and not end.is_set():
+                        if self._peer_gone():
+                            break  # the client went away: its slot is free again
                         try:
                             frame = q.get(timeout=_SSE_POLL)
                         except queue.Empty:
                             continue
                         if frame is None:  # teardown sentinel
+                            break
+                        if ns is not None and not state._bus_take(
+                                ns, frame, machine_id, gen, end, q):
                             break
                         try:
                             self.wfile.write(("data: " + frame + "\n\n").encode())
@@ -967,6 +1072,16 @@ class MockShedServer:
                             break  # client disconnected
                 finally:
                     state._bus_unregister_sse_thread()
+
+            def _peer_gone(self) -> bool:
+                """Whether the client closed its side (EOF readable), consuming nothing."""
+                try:
+                    readable, _, _ = select.select([self.connection], [], [], 0)
+                    if not readable:
+                        return False
+                    return self.connection.recv(1, socket.MSG_PEEK) == b""
+                except (OSError, ValueError):
+                    return False
 
             def _serve_respond(self, ns: str):
                 """Read a response Envelope body, record it for `ns`, return 204."""
@@ -977,7 +1092,8 @@ class MockShedServer:
                 except ValueError:
                     self._send(400, {"error": "bad response body"})
                     return
-                refused = state._bus_next_respond_answer(ns, self._identity())
+                refused = state._bus_next_respond_answer(
+                    ns, self._identity(), env if isinstance(env, dict) else {})
                 if refused is not None:
                     status, refusal, retry_after = refused
                     self._send_raw(
@@ -1066,9 +1182,42 @@ class MockShedServer:
                 state._add(shed)
                 frame("complete", shed)
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._handler = Handler
+        self._serve(0)
+
+    def _serve(self, port: int) -> None:
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", port), self._handler)
+        self._port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
+
+    def pause(self) -> None:
+        """Take the server down — its port refuses connections and every live stream
+        ends — keeping what a real server keeps on disk (sheds, the binding) and losing
+        what it keeps in memory (the pending requests): what a shed-server restart looks
+        like to the app. `resume()` brings it back on the same port."""
+        assert self._httpd is not None and not self._paused
+        self._paused = True
+        self._httpd.shutdown()  # no new connection is served
+        self._httpd.server_close()  # the port refuses
+        self._bus_shutdown.set()  # every held stream ends
+        with self._bus_cond:
+            threads = list(self._bus_sse_threads)
+        for t in threads:
+            t.join(timeout=2)
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        self._httpd = None
+        self._thread = None
+        self._bus_shutdown.clear()
+        with self._bus_cond:
+            self._bus_pending.clear()
+
+    def resume(self) -> None:
+        """Serve again, on the port `pause()` closed."""
+        assert self._paused
+        self._paused = False
+        self._serve(self._port)
 
     def stop(self) -> None:
         # Unblock + join any live SSE handler threads first (a broker cell's held
