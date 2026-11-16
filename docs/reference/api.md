@@ -1257,8 +1257,9 @@ After the 101 response, the connection becomes a bidirectional byte stream to th
 |--------|------|-------------|
 | 400 | `INVALID_PORT` | Port must be 1-65535 |
 | 404 | `SHED_NOT_FOUND` | Shed does not exist |
+| 409 | `SHED_NOT_RUNNING` | Shed is not running, on the [remote backend](remote-backend.md#calls-and-statuses) (a shed there may be starting or stopping, a state conflict as for exec) |
 | 502 | `CONNECT_FAILED` | Could not connect to the port (service not running) |
-| 503 | `SHED_NOT_RUNNING` | Shed is not running |
+| 503 | `SHED_NOT_RUNNING` | Shed is not running, on Firecracker and VZ |
 
 **Security:** In `open` mode (loopback only) the Connect API, like the rest of the API, has no credential; in `mtls` mode it requires a client certificate of the `control` **or** `credentials` scope over pinned TLS. The caller must be allowed to enter the shed (see [Ownership](#ownership)). It connects to the VM's loopback interface and does not support arbitrary destinations.
 

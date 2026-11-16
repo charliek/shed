@@ -186,7 +186,8 @@ does not take over. Move the source with `shed source use` or the desktop button
 
 ## Upgrading
 
-Upgrade machines **before** servers:
+Upgrade machines **before** servers (the whole procedure is in the [v0.9.1 → v0.10.0
+upgrade guide](../upgrades/v0.9.1-to-v0.10.0.md)):
 
 - A broker that sends the headers works against an older server, which ignores them. (On a
   server older than the pin, a second listener for a namespace still gets the old terminal

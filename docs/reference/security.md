@@ -322,6 +322,24 @@ or move a credential source.
 An open server answers every `_bootstrap` request with `bootstrap requires
 auth.ssh.mode: enforce`; the CLI then adds it over plain HTTP.
 
+There is no static credential to copy between machines. A certificate is
+issued to one client over SSH and its private key stays with that client, so a
+`~/.shed/config.yaml` entry written by hand cannot reach an mtls server: the
+entry comes from `shed server add`, or from a client re-enrolling on its own.
+`shed server add` therefore needs an allowed key at add time, and fails at once
+with `your SSH key is not in this server's allowlist` when it does not have
+one (see [CLI › shed server add](cli.md#shed-server-add)).
+
+**Clients older than v0.8.1** have no way to obtain a certificate. A CLI that
+sends no CSR is answered `this server requires auth.mode: mtls; upgrade shed
+(client certificate support)`. The desktop app, when it gets its credential
+through a `shed-host-agent` daemon, needs a daemon that answers
+`credential.get`: with an older daemon every request to an mtls server fails
+with `upgrade shed-host-agent — it is too old to obtain a client certificate
+for <server>`, and an app older than the daemon's protocol is told `this
+shed-desktop is too old to use one — upgrade the app`. Upgrade
+`shed-host-agent` before, or with, the desktop app.
+
 ### Short TTL, transparent renewal
 
 Certificates are short-lived: `auth.token_ttl`, default **24h** (the name is
@@ -850,7 +868,8 @@ fails config load (before, `auth: {Mode: mtls}` was ignored and the server
 started open), and so does a top-level key that matches a known one only when
 case is ignored (`Auth:`, `Bind_Address:`). The server holds no bearer-token
 code: an `Authorization` header is never read. The clients still speak the
-token protocol to servers older than v0.10.0.
+token protocol to servers older than v0.10.0. The [v0.9.1 → v0.10.0 upgrade
+guide](../upgrades/v0.9.1-to-v0.10.0.md) takes a server of any mode across.
 
 ## Removed earlier
 

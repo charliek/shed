@@ -170,10 +170,10 @@ process and a different tradeoff (see the credential-ownership table in
 `~/.claude/plans/shed/001-mtls-mode.md` §3 D6 if working in this area).
 
 A desktop app newer than its `shed-host-agent` install can't use mTLS at all
-until the agent is upgraded — see the [Upgrading to
-mTLS](../docs/upgrades/token-to-mtls.md) guide's "desktop users" section for
-the exact failure mode and the required upgrade order (agent before/with the
-app; they're separate release selectors).
+until the agent is upgraded — see [Security › Enrollment over
+SSH](../docs/reference/security.md#enrollment-over-ssh) ("Clients older than
+v0.8.1") for the exact failure messages and the required upgrade order (agent
+before/with the app; they're separate release selectors).
 
 ## Socket paths
 
