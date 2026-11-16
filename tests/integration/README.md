@@ -145,6 +145,7 @@ tests/integration/
   test_network_profiles.py # the isolated network profile (FC dev server, mtls)
   test_users.py           # named users on the API, SSH and the bus (users_env)
   test_users_upgrade.py   # sheds with no user: the upgrade step, shed assign (Mac dev server)
+  test_source_pin.py      # the pin: one machine per user answers credential requests (users_env)
   fixtures/
     __init__.py
     server.py             # LocalServer + RemoteServer + ShedHandle
@@ -152,7 +153,7 @@ tests/integration/
     devcontrol.py         # dev_config(), run_preflight(), bootstrap_cert()
     tlsclient.py          # pinned HTTPS: pinned_request, Pinned
     identity.py           # itest users: keys, the user list, Identity, users_environment
-    busclient.py          # a synthetic credential-bus listener
+    busclient.py          # synthetic credential-bus listeners and machines (FakeMachine), ensure_source
 ```
 
 ## The MVP smoke tests
@@ -431,7 +432,20 @@ environment makes the dev targets stop with one line saying so.
 **Reconfiguring the Mac dev server.** Tests that need a different server
 config go through `fixtures/devcontrol.py: dev_config()`, which restarts the
 VZ dev server against the committed base merged with the test's overrides,
-and always restores the base. After each restart it waits on
+and always restores the base. The server's credential source bindings
+(`source-bindings.json`, beside the dev server's instance directory: under
+`~/Library/Application Support/shed-dev/vz/`, or `$SHED_DEV_STATE_DIR`) are
+kept across that detour, because a start with another user list rewrites
+them: with the server stopped, the store is moved aside (to
+`source-bindings.json.itest-saved`) before the test's config starts, and put
+back, with the server stopped again, before the base starts; the store the
+test's server wrote is discarded. Only that file moves. A run killed in the
+middle leaves the developer's store at `.itest-saved`; the next run that
+restarts the Mac dev server puts it back first and never overwrites it (by
+hand: stop the dev server and rename it back; a
+`source-bindings.json.itest-saved-absent` marker means there was none, so
+delete the store and the marker). `dev_config()` refuses, before stopping
+anything, when it cannot tell where the store is. After each restart it waits on
 `scripts/dev-server-probe.sh` (the same probe `make dev-server-up` polls; it
 needs no credential) and then one real `GET /api/info` in the config's own
 mode: plain HTTP for an open config, and for an mtls config over the pinned
@@ -523,7 +537,7 @@ SHED_DEV_USERS=itest make dev-server-restart-remote && SHED_DEV_USERS=itest make
 
 | Backend | Server | Needs |
 |---|---|---|
-| `[vz]` | the Mac dev server | nothing: the module restarts it with the user list through `dev_config()` and restores the committed base afterwards (always: other modules' `dev_config()` calls restore the base too, so a list the server was started with would be gone by then) |
+| `[vz]` | the Mac dev server | nothing: the module restarts it with the user list through `dev_config()` and restores the committed base afterwards (always: other modules' `dev_config()` calls restore the base too, so a list the server was started with would be gone by then). The developer's credential source bindings are kept aside for the detour and put back (see "Reconfiguring the Mac dev server" above) |
 | `[fc]` | `$SHED_FC_DEV_SERVER` | the server STARTED with the user list and `SHED_ITEST_USERS=fc`; skips saying so otherwise |
 | `[remote]` | `$SHED_REMOTE_SERVER` | the server STARTED with the user list and `SHED_ITEST_USERS=remote`; skips saying so otherwise |
 
@@ -551,6 +565,7 @@ cd tests/integration && PATH="$PWD/../../bin:$PATH" \
 | `test_users_upgrade.py` | Sheds made before a user list: with one user they become that user's at start; cutting a list from two users to one later hands out nothing (the one-time marker); with several users an admin assigns one with `shed assign`, a shed carrying server mounts is refused (409 `SHED_HOST_RESOURCES`), the user can then enter it and the admin no longer can; a key taken off the list opens nothing new | `[vz]` on macOS only (it skips on any other host before a fixture runs): it restarts the server with other configs, which the suite can do only to the Mac dev server. Each case checks that its target is a dev server before it creates anything. The one-user restart gives every shed on the Mac dev server that has no user to `dev`, the developer, permanently (see the note above). |
 | `test_cred_bus.py::test_a_user_list_outside_its_rules_hard_fails` | A user list with an open server, or beside `auth.ssh` key sources, refuses to start (`run_preflight`, no running server) | Marked `vz` like the other preflight cases (they start `bin/shed-server` from the Mac dev config) |
 | `test_service_client.py::test_users_and_the_client_do_not_reach_each_others_sheds` | A user cannot see or enter a service client's shed, an admin can enter it, and the client cannot see the user's shed | `[fc]` with `SHED_ITEST_USERS=fc` |
+| `test_source_pin.py` | The pin: one machine per user answers credential requests (see [The pin](#the-pin-test_source_pinpy)) | `[vz]` (macOS only), `[fc]`; the whole module skips on `[remote]` |
 
 Clean-up in these modules is checked: a shed is deleted by its owner, then
 by the developer (`dev`, an admin) if it is still there, and must then be
@@ -563,6 +578,107 @@ Not covered live: the server's `env_file` reaching only admins' sheds (it
 only feeds a `--repo` clone's environment, which a test cannot observe
 without a private repository; the unit tests in `internal/backend`,
 `internal/api`, `internal/config` and `internal/vmutil` cover it).
+
+## The pin (`test_source_pin.py`)
+
+A server sends each user's credential requests to one machine of that user,
+its credential source: the first machine to connect is bound, any other
+machine of the user is refused (403 `SOURCE_NOT_BOUND`, naming the bound
+one), and the user or an admin moves the binding with `shed source use`.
+`test_source_pin.py` drives this on a dev server with the itest user list
+through synthetic machines (`fixtures/busclient.py: FakeMachine`): a test
+identity's credentials certificate plus a machine id and name, subscribing
+and answering as a broker does. No real host agent runs (the broker side is
+`tests/host-agent-diff`).
+
+| Case | Shows |
+|---|---|
+| `test_the_server_advertises_the_pin` | `GET /api/info` lists `source_binding` |
+| `test_one_machine_is_the_source_and_another_is_refused_by_name` | alice's machine A subscribes; her machine B, same certificate, gets 403 `SOURCE_NOT_BOUND` with `source` naming A (never 401 or a bare 409), and the refusal changes nothing |
+| `test_a_subscribe_or_answer_without_a_machine_id_is_refused` | a subscribe with no machine headers, no name or a malformed id: 403 `SOURCE_MACHINE_ID_REQUIRED` naming the versions to upgrade to; with the headers it is admitted. Then a real request from alice's shed pending on A: A's answer with no headers, or a malformed id, is refused the same way, and A's proper answer to the same request is accepted and reaches the shed |
+| `test_the_source_subscribing_twice_is_refused_as_a_duplicate` | A subscribing twice to one request type is 409 `SOURCE_DUPLICATE_STREAM`; the first stream is still the one registered and still delivers a request |
+| `test_a_request_reaches_only_the_source` | a request from alice's shed reaches A; B's answer is refused naming A; bob's machine, subscribed to the same request type, receives nothing and its answer is refused; A's answer reaches the shed |
+| `test_moving_the_source_ends_the_old_stream_and_drops_its_requests` | with a request pending on A, `shed source use -- <B>`: A's stream ends, A's late answer and next subscribe are refused naming B, B receives the next request and never the pending one, which the guest gives up on (checked after B's stream shows it still delivers). Nothing fails back: with B disconnected, A is still refused naming B and the binding and its generation are unchanged; B, reconnected, answers again |
+| `test_shed_source_as_the_user` | `shed source ls`, `status` and `use` as alice, text and `--json`; `use` by name after `--`, by an 8-digit id prefix, and `--json` by full id (a real move, checked through the API with its generation); "already the source"; a machine that is not hers is refused and nothing changes |
+| `test_an_admin_reads_and_moves_another_users_source` | the admin's `--user itest-alice` on `ls`, `status` and `use`; the binding records `admin itest-admin`; only alice's machines can be chosen (bob's is 404 `SOURCE_MACHINE_NOT_FOUND`); an unknown user is 400 |
+| `test_another_user_a_script_key_and_a_machine_cannot_read_or_move_a_source` | bob naming alice gets one fixed 403, the same as for a user that does not exist; alice's script key is refused both routes; a credentials certificate cannot reach them (control scope); nothing moved. Control: alice's own key moves her source to B and back, each read back with a new generation |
+| `test_the_developers_own_source_is_readable` | on the developer's own entry (`shed_server_dev`, with or without a user list): the feature, `GET /api/sources` and `shed source status` read. Read only |
+
+**What it needs.** The same as the users cases (see [Named users](#named-users-authusers)):
+`[vz]` restarts the Mac dev server with the user list itself; `[fc]` needs
+the FC dev server STARTED with the itest user list and `SHED_ITEST_USERS=fc`,
+and skips saying so otherwise. The server must be built from a tree with the
+pin (shed-server 0.10.0), and the `shed` first on `PATH` must have `shed
+source` (the module fails at once, saying so, when it does not: put the
+repository's `bin/` first). The whole module skips on `[remote]`, whose
+sheds carry no helper requests. It creates one shed per backend (alice's,
+image `base`), and the request cases take up to about 40 s each (the guest
+gives up on a request after 30 s, and silence is only trusted after a
+keepalive, which comes every 25 s).
+
+Run only these cases against an FC dev server started by hand with the user
+list:
+
+```sh
+cd tests/integration && PATH="$PWD/../../bin:$PATH" \
+  SHED_VZ_SERVER= SHED_VZ_DEV_SERVER= SHED_REMOTE_SERVER= \
+  SHED_FC_HOST=<host> SHED_FC_SERVER=<entry>-dev SHED_FC_DEV_SERVER=<entry>-dev \
+  SHED_FC_LOG_PATH=<remote log> SHED_FC_DEV_LOG_PATH=<remote log> \
+  SHED_FC_DEV_BIN_PATH=<remote binary> SHED_FC_DEV_CONFIG=<remote config> \
+  SHED_ITEST_USERS=fc \
+  uv run pytest -v -rs test_source_pin.py
+```
+
+**State it meets and leaves.** A server keeps its bindings in its state
+directory, across restarts, so a second run (or a run after `test_users.py`)
+starts with bindings in place. No case assumes a fresh server: each moves the
+binding to where it needs it (`busclient.ensure_source`, through `GET
+/api/sources` and `POST /api/sources/use`), and the cases run in any order.
+The cases bind and move only the throwaway itest users, never the
+developer's own user, whose real host agent may be the source on that server
+(the developer's entry is only read). A correct server may answer `GET
+/api/sources` with 503 `SOURCE_BUSY` for a moment, and a set-up subscribe
+with 429 `SOURCE_RATE_LIMITED`: the helpers and the `shed source` wrappers
+wait those out a bounded number of times, honouring `Retry-After`, and then
+fail saying so.
+
+When the module ends, every stream is closed, alice's shed is deleted and
+shown gone, the certificates it enrolled are removed, and each itest user's
+source is again their default machine (`itest-itest-alice`,
+`itest-itest-bob`). Each user is put back on their own as soon as their
+certificate exists, so a set-up that fails part-way still repairs what it
+can; the teardown fails, naming the user, when it cannot. `test_users.py`'s
+bus case does not depend on this: it sets each identity's source to the
+machine it subscribes as (`ensure_source`), so the two modules run in either
+order from any state, a run killed in the middle of a move included. On a
+server that had no binding for a user, the module leaves one (its default
+machine, bound by its first connect), as `test_users.py` does.
+
+**On `[vz]`** `users_env` restarts the Mac dev server with the user list for
+the module and restores the committed base afterwards (`dev_config()`), so
+what the server keeps differs:
+
+- preserved: the developer's own bindings. The store is moved aside, with
+  the server stopped, before the user-list server starts, and put back, with
+  the server stopped again, before the base starts (see "Reconfiguring the
+  Mac dev server"). Without that, the user-list start would drop the
+  developer's binding (the implicit user's) and the base start would drop
+  every named user's, so whichever real machine connected first would
+  become the source.
+- not preserved: everything the itest users get in the user-list server's
+  store (their bindings and machine records) is discarded with it, so each
+  `[vz]` run starts them afresh.
+- not preserved either, as documented under `test_users_upgrade.py`: sheds
+  with no user that a one-user start hands to `dev`.
+
+**Elsewhere** (`[fc]`, a server started with the list) the machines the cases
+introduce stay in the server's list of each user's machines: there is no
+route to forget one. They are three, with obvious test
+names: `itest-itest-alice` and `itest-itest-alice-b` (alice), and
+`itest-itest-bob` (bob); `test_users.py` adds `itest-itest-admin`. Keeping
+the number of new machine ids small also keeps a run inside the server's
+per-user admission limit (8 admissions that write its store, then one every
+15 s): a run against a server that already knows them writes nothing.
 
 ## Remote backend (cloud sheds)
 

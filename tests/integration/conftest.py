@@ -325,7 +325,10 @@ def shed_server_dev(request):
 #
 #   [vz]     the Mac dev server (`SHED_VZ_DEV_SERVER`), always restarted with
 #            the user list through devcontrol.dev_config() and restored to
-#            the committed base afterwards. (Other modules' dev_config() calls
+#            the committed base afterwards; the developer's credential
+#            source bindings are moved aside, with the server down, for the
+#            detour and put back before the base starts (devcontrol:
+#            BindingsDetour). (Other modules' dev_config() calls
 #            restore the base too, so a Mac dev server started with the list
 #            would not still have it by the time this module runs.)
 #   [fc]     the FC dev server (`SHED_FC_DEV_SERVER`). The suite cannot

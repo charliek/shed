@@ -396,6 +396,17 @@ the scope they need (`test_http_auth.py`, `test_cred_bus.py`,
 Mac-only: an open server is loopback only, and the FC dev server runs on
 another host.
 
+`dev_config()` keeps the dev server's credential source bindings
+(`source-bindings.json`, beside its instance directory, which
+`SHED_DEV_STATE_DIR` moves) across the detour, because a start with another
+user list rewrites them. With the server stopped it moves that file, and
+nothing else, aside to `source-bindings.json.itest-saved` before the test's
+config starts, and with the server stopped again puts it back before the base
+starts, discarding the store the test's server wrote. A run killed in the
+middle leaves the developer's store at `.itest-saved`; the next run that
+restarts the Mac dev server puts it back first and never overwrites it. It
+refuses, before stopping anything, when it cannot tell where the store is.
+
 **Detection.** The test module cannot probe `GET /api/info` unauthenticated to
 tell whether a server is in mtls mode — under mtls that endpoint is unreachable
 outright (the TLS listener refuses an uncertificated handshake before any HTTP
@@ -435,6 +446,35 @@ the server with several configs. On `[remote]` only the ownership cases run
 (one shed per user, two VMs). Full details, the run line for a server
 started by hand and which case skips where: `tests/integration/README.md`,
 "Named users".
+
+**The pin** (`tests/integration/test_source_pin.py`) runs on the same
+servers with the same setup: one machine per user answers credential
+requests. Synthetic machines (`fixtures/busclient.py: FakeMachine`, a test
+identity's credentials certificate plus a machine id and name) show the
+refusals (`SOURCE_NOT_BOUND` naming the source, `SOURCE_MACHINE_ID_REQUIRED`,
+`SOURCE_DUPLICATE_STREAM`), that a request reaches the source only, a move
+with `shed source use` (the old stream ends, a request pending on it is
+never handed to the new machine), the admin's `--user`, and the refusals of
+another user, a script key and a credentials certificate. Run only these
+cases with `uv run pytest -v -rs test_source_pin.py` and the environment of
+the users cases; the whole module skips on `[remote]` (no helper requests
+there). Bindings outlive a server restart, so every case moves the binding
+where it needs it rather than assuming a fresh server, and the cases bind and
+move only the itest users, never the developer's. The module leaves each
+itest user's source on their default machine, putting each user back on
+their own as soon as their certificate exists; `test_users.py`'s bus case
+sets the sources it needs itself, so the two modules run in either order
+from any state. A momentary 503 `SOURCE_BUSY` on `GET /api/sources` or 429
+`SOURCE_RATE_LIMITED` on a set-up subscribe is waited out a bounded number
+of times, honouring `Retry-After`. On `[fc]` the three machines it introduces
+(`itest-itest-alice`, `itest-itest-alice-b`, `itest-itest-bob`) stay in the
+server's list, since there is no route to forget a machine. On `[vz]` the
+user-list detour preserves the developer's own bindings (see above) and
+discards what the itest users got; the upgrade cases still give user-less
+sheds to `dev`, as documented for `test_users_upgrade.py`. On a server with
+no user list the only user is the developer's, so there the module only
+reads (`shed source status` and the `source_binding` feature). Details:
+`tests/integration/README.md`, "The pin".
 
 #### Validating pre-release: build-tools image changes
 

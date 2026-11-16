@@ -207,6 +207,14 @@ class Pinned:
         """One request; returns `(status, decoded JSON body or None)`. An
         NDJSON answer (`application/x-ndjson`, the exec route) comes back as
         `{"frames": [...]}`."""
+        status, decoded, _ = self.request_full(method, path, body, timeout)
+        return status, decoded
+
+    def request_full(
+        self, method: str, path: str, body: Optional[dict] = None, timeout: float = 60,
+    ) -> tuple[int, Optional[dict], dict[str, str]]:
+        """`request`, plus the response's headers (names lowercased): for an
+        answer whose `Retry-After` the caller honours."""
         conn = http.client.HTTPSConnection(self.host, self.port, context=self.ctx, timeout=timeout)
         try:
             data = json.dumps(body).encode() if body is not None else None
@@ -214,12 +222,13 @@ class Pinned:
             conn.request(method, path, body=data, headers=headers)
             resp = conn.getresponse()
             raw = resp.read()
+            got = {k.lower(): v for k, v in resp.getheaders()}
             if resp.getheader("Content-Type", "").startswith("application/x-ndjson"):
-                return resp.status, {"frames": [json.loads(line) for line in raw.splitlines() if line.strip()]}
+                return resp.status, {"frames": [json.loads(line) for line in raw.splitlines() if line.strip()]}, got
             try:
-                return resp.status, (json.loads(raw) if raw.strip() else None)
+                return resp.status, (json.loads(raw) if raw.strip() else None), got
             except json.JSONDecodeError:
-                return resp.status, {"raw": raw.decode("utf-8", errors="replace")}
+                return resp.status, {"raw": raw.decode("utf-8", errors="replace")}, got
         finally:
             conn.close()
 

@@ -58,7 +58,15 @@ from typing import Optional
 
 import pytest
 
-from fixtures.busclient import BusListener, machine_headers, payload_has, publish_argv, response_body
+from fixtures.busclient import (
+    BusListener,
+    FakeMachine,
+    ensure_source,
+    machine_headers,
+    payload_has,
+    publish_argv,
+    response_body,
+)
 from fixtures.identity import ADMIN, ALICE, BOB, Identity, UsersEnv
 from fixtures.tlsclient import error_code, error_message, pinned_request
 
@@ -681,6 +689,13 @@ def test_bus_requests_reach_only_their_users_listener(users_env, alice_shed, bob
     _ensure_running(env, env.bob, bob_shed)
     ns = f"itest-users-{uuid.uuid4().hex[:8]}"
     certs = {who.user: who.enrol("credentials", enrolled / who.user) for who in env.people}
+    # Each listener subscribes as its user's default synthetic machine, which
+    # must be that user's credential source (the pin). Bindings outlive a
+    # restart and test_source_pin.py moves them, so set them here, from
+    # whatever state the server is in (a run killed mid-move included).
+    for who in env.people:
+        ensure_source(who.api(), FakeMachine(who.user, who.host, certs[who.user]),
+                      f"itest-users-setup-{uuid.uuid4().hex[:8]}")
     listeners: dict[str, BusListener] = {}
     try:
         for who in env.people:

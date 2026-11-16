@@ -24,6 +24,7 @@ import subprocess
 import time
 import urllib.error
 from pathlib import Path
+from typing import Optional
 
 import pytest
 import yaml
@@ -460,13 +461,31 @@ def test_restart_argv_names_only_the_config():
     ]
 
 
+def _store_state(store: Path) -> Optional[str]:
+    """The bindings store's content, or None when there is none."""
+    return store.read_text() if store.exists() else None
+
+
 def _fake_dev_control(monkeypatch, tmp_path) -> dict:
-    """Stub every side effect of dev_config(): no server, no make."""
-    calls = {"restarts": [], "waits": [], "targets": []}
+    """Stub every side effect of dev_config(): no server, no make. The
+    credential source bindings store is a file under tmp_path (`store`);
+    `events` records each stop ("down") and each start ("up", config, the
+    store's content as that server starts with it)."""
+    state = tmp_path / "vz-state"
+    state.mkdir(exist_ok=True)
+    store = state / dc.BINDINGS_FILE
+    calls = {"restarts": [], "waits": [], "targets": [], "events": [], "store": store}
+
+    def restart(cfg):
+        calls["restarts"].append(cfg)
+        calls["events"].append(("up", cfg, _store_state(store)))
+
     monkeypatch.setattr(dc, "DEV_CONFIG_TMP", tmp_path / "test-dev-config.yaml")
     monkeypatch.setattr(dc, "DEV_SCRATCH_DIR", tmp_path)
     monkeypatch.setattr(dc, "assert_dev_target", lambda name: calls["targets"].append(name) or {})
-    monkeypatch.setattr(dc, "_make_restart", lambda cfg: calls["restarts"].append(cfg))
+    monkeypatch.setattr(dc, "dev_bindings_store", lambda config, environ=None: store)
+    monkeypatch.setattr(dc, "_make_down", lambda: calls["events"].append("down"))
+    monkeypatch.setattr(dc, "_make_restart", restart)
     monkeypatch.setattr(dc, "_wait_ready", lambda server, timeout, *, config: calls["waits"].append(config))
     return calls
 
@@ -510,6 +529,185 @@ def test_dev_config_refuses_a_production_port_before_any_restart(monkeypatch, tm
         with dc.dev_config({"ssh_port": 2222}, "my-server-dev"):
             pass
     assert calls["restarts"] == [] and calls["waits"] == []
+
+
+# ----------------------------------------------------------------------------
+# dev_config() keeps the developer's credential source bindings: moved aside,
+# with the server down, for the detour and put back, with the server down,
+# before the base starts. Server control stubbed; the store is a temp file.
+# This logic runs only on macOS for real: the Mac run proves it there.
+# ----------------------------------------------------------------------------
+
+
+def _leftovers(store: Path) -> list[str]:
+    return sorted(p.name for p in store.parent.iterdir() if p.name.startswith(store.name + ".itest"))
+
+
+def test_dev_config_keeps_the_developers_bindings_across_the_detour(monkeypatch, tmp_path, keys_dir):
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    store = calls["store"]
+    store.write_text("DEVELOPER")
+    with dc.dev_config({}, "my-server-dev", transform=lambda c: ident.with_itest_users(c, keys_dir)):
+        # The user-list server writes a store of its own.
+        store.write_text("DETOUR")
+    temp = tmp_path / "test-dev-config.yaml"
+    # Stopped before each move: the detour's server starts with no store,
+    # the base's with the developer's, the detour's discarded.
+    assert calls["events"] == ["down", ("up", temp, None), "down", ("up", dc.DEV_BASE_CONFIG, "DEVELOPER")]
+    assert _store_state(store) == "DEVELOPER" and _leftovers(store) == []
+
+
+def test_dev_config_keeps_a_missing_store_missing(monkeypatch, tmp_path):
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    store = calls["store"]
+    with dc.dev_config({}, "my-server-dev"):
+        assert _leftovers(store) == [store.name + dc.BINDINGS_ABSENT_SUFFIX]
+        store.write_text("DETOUR")
+    assert calls["events"][-1] == ("up", dc.DEV_BASE_CONFIG, None)
+    assert _store_state(store) is None and _leftovers(store) == []
+
+
+def test_dev_config_puts_the_bindings_back_when_the_body_raises(monkeypatch, tmp_path):
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    store = calls["store"]
+    store.write_text("DEVELOPER")
+    with pytest.raises(RuntimeError, match="test body"):
+        with dc.dev_config({}, "my-server-dev"):
+            store.write_text("DETOUR")
+            raise RuntimeError("test body")
+    assert calls["events"][-2:] == ["down", ("up", dc.DEV_BASE_CONFIG, "DEVELOPER")]
+    assert _store_state(store) == "DEVELOPER" and _leftovers(store) == []
+
+
+@pytest.mark.parametrize(
+    "killed_at",
+    ["during-the-detour", "between-link-and-unlink", "during-the-detour-with-no-store"],
+)
+def test_dev_config_recovers_a_run_killed_mid_detour(monkeypatch, tmp_path, killed_at):
+    # A run killed mid-detour left the developer's store aside and the
+    # detour's in its place. The next dev_config() puts the developer's back
+    # first, never overwriting the kept copy with the detour's, and the run
+    # ends with it in place.
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    store = calls["store"]
+    detour = dc.BindingsDetour(store)
+    if killed_at == "during-the-detour":
+        detour.saved.write_text("DEVELOPER")
+        store.write_text("DETOUR OF THE KILLED RUN")
+        want = "DEVELOPER"
+    elif killed_at == "between-link-and-unlink":
+        store.write_text("DEVELOPER")
+        os.link(store, detour.saved)
+        want = "DEVELOPER"
+    else:
+        detour.absent.write_text("")
+        store.write_text("DETOUR OF THE KILLED RUN")
+        want = None
+    with dc.dev_config({}, "my-server-dev"):
+        assert _store_state(store) is None, "the detour's server started with a store"
+        store.write_text("DETOUR")
+    assert calls["events"][1] == ("up", tmp_path / "test-dev-config.yaml", None)
+    assert _store_state(store) == want and _leftovers(store) == []
+
+
+def test_bindings_detour_restore_recovers_and_reports(tmp_path):
+    store = tmp_path / dc.BINDINGS_FILE
+    d = dc.BindingsDetour(store)
+    assert d.restore() is False  # nothing kept: nothing to do
+    store.write_text("DEVELOPER")
+    assert d.save() is False and _store_state(store) is None and d.saved.read_text() == "DEVELOPER"
+    store.write_text("DETOUR")
+    assert d.restore() is True and _store_state(store) == "DEVELOPER" and _leftovers(store) == []
+
+
+def test_dev_config_moves_the_store_only_in_the_outermost_call(monkeypatch, tmp_path):
+    # test_users_upgrade.py restarts inside a users detour: the inner call
+    # neither keeps nor puts back anything.
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    store = calls["store"]
+    store.write_text("DEVELOPER")
+    temp = tmp_path / "test-dev-config.yaml"
+    with dc.dev_config({}, "my-server-dev"):
+        store.write_text("OUTER")
+        with dc.dev_config({"name": "inner"}, "my-server-dev"):
+            store.write_text("INNER")
+        assert _store_state(store) == "INNER"
+    assert calls["events"] == [
+        "down", ("up", temp, None),
+        ("up", temp, "OUTER"), ("up", dc.DEV_BASE_CONFIG, "INNER"),
+        "down", ("up", dc.DEV_BASE_CONFIG, "DEVELOPER"),
+    ]
+    assert _store_state(store) == "DEVELOPER" and _leftovers(store) == [] and dc._detour_depth == 0
+
+
+def test_dev_config_moves_nothing_while_a_server_holds_the_store(monkeypatch, tmp_path):
+    import fcntl
+
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    store = calls["store"]
+    store.write_text("DEVELOPER")
+    monkeypatch.setattr(dc, "BINDINGS_UNLOCK_TIMEOUT", 0.3)
+    fd = os.open(store.with_name(store.name + dc.BINDINGS_LOCK_SUFFIX), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a server that did not stop
+        with pytest.raises(RuntimeError, match="still holds"):
+            with dc.dev_config({}, "my-server-dev"):
+                pytest.fail("the detour ran")
+    finally:
+        os.close(fd)
+    assert _store_state(store) == "DEVELOPER" and _leftovers(store) == []
+    assert calls["restarts"] == [dc.DEV_BASE_CONFIG]  # the base is started again all the same
+
+
+def test_dev_bindings_store_follows_the_dev_servers_instance_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    base = dc._merge_config({})
+    # The committed base: beside ~/Library/Application Support/shed-dev/vz/instances.
+    assert dc.dev_bindings_store(base, {}) == tmp_path / "Library/Application Support/shed-dev/vz/source-bindings.json"
+    # SHED_DEV_STATE_DIR: the renderer puts instance_dir at <dir>/instances.
+    assert dc.dev_bindings_store(base, {"SHED_DEV_STATE_DIR": "/Volumes/ext/shed-dev/vz/"}) == \
+        Path("/Volumes/ext/shed-dev/vz/source-bindings.json")
+    assert dc.dev_bindings_store(base, {"SHED_DEV_STATE_DIR": "~/elsewhere"}) == tmp_path / "elsewhere/source-bindings.json"
+    # An empty SHED_DEV_STATE_DIR is unset (the Makefile renders nothing).
+    assert dc.dev_bindings_store(base, {"SHED_DEV_STATE_DIR": ""}) == dc.dev_bindings_store(base, {})
+
+
+@pytest.mark.parametrize(
+    "config, environ, match",
+    [
+        ({"default_backend": "firecracker", "vz": {"instance_dir": "/x/instances"}}, {}, "not 'vz'"),
+        ({"default_backend": "vz", "vz": {}}, {}, "no vz.instance_dir"),
+        ({"default_backend": "vz", "vz": {"instance_dir": "rel/instances"}}, {}, "not absolute"),
+        ({"default_backend": "vz", "vz": {"instance_dir": "/x/instances"}}, {"SHED_DEV_STATE_DIR": "rel"}, "not absolute"),
+        ({"default_backend": "vz", "vz": {"instance_dir": "/x/instances"}}, {"SHED_DEV_STATE_DIR": "/a|b"}, "renderer"),
+        ({"default_backend": "vz", "vz": {"instance_dir": "/x/instances"}}, {"SHED_DEV_STATE_DIR": " /a"}, "renderer"),
+    ],
+    ids=["not-vz", "no-instance-dir", "relative", "relative-state-dir", "unsafe-state-dir", "padded-state-dir"],
+)
+def test_dev_bindings_store_refuses_to_guess(config, environ, match):
+    with pytest.raises(RuntimeError, match=match):
+        dc.dev_bindings_store(config, environ)
+
+
+_REAL_DEV_BINDINGS_STORE = dc.dev_bindings_store
+
+
+def test_dev_config_refuses_before_stopping_when_the_store_cannot_be_kept(monkeypatch, tmp_path):
+    calls = _fake_dev_control(monkeypatch, tmp_path)
+    # The real location rule, on a home under tmp_path.
+    monkeypatch.setattr(dc, "dev_bindings_store", _REAL_DEV_BINDINGS_STORE)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("SHED_DEV_STATE_DIR", raising=False)
+    # The state directory does not exist: where the store is cannot be told.
+    with pytest.raises(RuntimeError, match="does not exist"):
+        with dc.dev_config({}, "my-server-dev"):
+            pytest.fail("the detour ran")
+    # An override that moves instance_dir moves the store: refused.
+    (tmp_path / "Library/Application Support/shed-dev/vz").mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="moves its source bindings"):
+        with dc.dev_config({"vz": {"instance_dir": str(tmp_path / "other/instances")}}, "my-server-dev"):
+            pytest.fail("the detour ran")
+    assert calls["events"] == [] and calls["restarts"] == []
 
 
 def test_api_info_open_mode_is_plain_http(monkeypatch):
@@ -1429,7 +1627,14 @@ def sse_listener(tmp_path):
     """A loopback HTTPS server requiring a client certificate that serves a
     credential-bus subscribe: on /api/plugins/listeners/ok/messages a
     keepalive, then one event, then it holds the stream until the client
-    goes; any other namespace is refused with a 403 JSON error."""
+    goes; any other namespace is refused with a 403 JSON error. `hang` never
+    answers (for 5 s); `limited` is 429 SOURCE_RATE_LIMITED, Retry-After 7.
+
+    The namespace `pin` answers as a pinning server does, for the machine id
+    in `state["bound"]`: no machine id is 403 SOURCE_MACHINE_ID_REQUIRED,
+    another machine 403 SOURCE_NOT_BOUND naming the bound one, the bound one
+    is served like `ok`. A POST (an answer) is recorded in `posts` and is 204
+    from the bound machine, the same refusals otherwise."""
     if shutil.which("openssl") is None:
         pytest.skip("openssl is not installed")
     import http.server
@@ -1448,20 +1653,64 @@ def sse_listener(tmp_path):
              "-CAcreateserial", "-days", "1", "-out", str(d / "client.pem"))
     stop = threading.Event()
     seen_headers: list[dict] = []
+    state = {"bound": busclient.machine_id(ident.ALICE), "bound_name": busclient.machine_name(ident.ALICE)}
+    posts: list[dict] = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
+        def _json(self, status, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _pin_refusal(self):
+            """The pin's refusal for this request's machine, or None for the
+            bound machine."""
+            mid = self.headers.get(busclient.MACHINE_ID_HEADER)
+            if not mid or not re.fullmatch(r"[0-9a-f]{32}", mid) or not self.headers.get(busclient.MACHINE_NAME_HEADER):
+                return 403, {"error": {"code": "SOURCE_MACHINE_ID_REQUIRED", "message": "upgrade to 0.10.0"}}
+            if mid != state["bound"]:
+                return 403, {"error": {"code": "SOURCE_NOT_BOUND", "message": f"only {state['bound_name']}"},
+                             "source": {"machine_id": state["bound"], "machine_name": state["bound_name"]}}
+            return None
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            posts.append({"path": self.path, "headers": dict(self.headers.items()), "body": json.loads(raw or b"null")})
+            refusal = self._pin_refusal()
+            if refusal is not None:
+                self._json(*refusal)
+                return
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self):
             seen_headers.append(dict(self.headers.items()))
             ns = self.path.removeprefix("/api/plugins/listeners/").removesuffix("/messages")
-            if ns not in ("ok", "ends", "ka") or not self.path.endswith("/messages"):
-                body = b'{"error":{"code":"FORBIDDEN","message":"no"}}'
-                self.send_response(403)
+            if ns == "hang":
+                stop.wait(5)  # never answers while the client waits
+                return
+            if ns == "limited":
+                body = json.dumps({"error": {"code": "SOURCE_RATE_LIMITED", "message": "retry in 7 s"}}).encode()
+                self.send_response(429)
+                self.send_header("Retry-After", "7")
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            if ns == "pin":
+                refusal = self._pin_refusal()
+                if refusal is not None:
+                    self._json(*refusal)
+                    return
+            elif ns not in ("ok", "ends", "ka") or not self.path.endswith("/messages"):
+                self._json(403, {"error": {"code": "FORBIDDEN", "message": "no"}})
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -1498,7 +1747,7 @@ def sse_listener(tmp_path):
     t.start()
     pin = tlsclient.fingerprint((d / "server.pem").read_text())
     yield {"port": srv.server_address[1], "pin": pin, "pair": (str(d / "client.pem"), str(d / "client.key")),
-           "headers": seen_headers}
+           "headers": seen_headers, "state": state, "posts": posts}
     stop.set()
     srv.shutdown()
     srv.server_close()
@@ -2192,3 +2441,481 @@ def test_the_refusals_the_live_cases_match_are_the_servers_own_words():
     assert '"SHED_ALREADY_ASSIGNED"' in (root / "internal" / "config" / "types.go").read_text()
     cli = (root / "cmd" / "shed" / "shed.go").read_text()
     assert 'fmt.Errorf("shed %q not found on %s", name, serverFlag)' in cli
+
+
+# ----------------------------------------------------------------------------
+# The pin cases' own helpers (test_source_pin.py, fixtures/busclient.py:
+# FakeMachine, ensure_source, ensure_known): the machines, what a subscribe
+# and an answer report, setting a binding up from any server state, the
+# timing budget and the server's own words. No server: a local TLS server
+# and a scripted binding store.
+# ----------------------------------------------------------------------------
+
+import test_source_pin as tsp  # noqa: E402
+
+
+class _Cert:
+    def __init__(self, s):
+        self.https_port, self.pin, self.pair = s["port"], s["pin"], s["pair"]
+
+
+def test_fake_machines_default_is_the_listeners_machine_and_tagged_ones_differ():
+    cert = type("C", (), {"https_port": 1, "pin": "sha256:00", "pair": ("c", "k")})()
+    a = busclient.FakeMachine(ident.ALICE, "h", cert)
+    b = busclient.FakeMachine(ident.ALICE, "h", cert, tag="b")
+    bob = busclient.FakeMachine(ident.BOB, "h", cert)
+    # alice's default machine is the one test_users.py's bus case subscribes
+    # as (BusListener(name=user)), so the two modules share it.
+    assert a.id == busclient.machine_id(ident.ALICE) and a.headers == busclient.machine_headers(ident.ALICE)
+    assert b.name == "itest-itest-alice-b" and a.name == "itest-itest-alice"
+    for m in (a, b, bob):
+        assert re.fullmatch(r"[0-9a-f]{32}", m.id) and 1 <= len(m.name.encode()) <= 63 and m.name.startswith("itest-")
+    # Every id prefix the cases name a machine by is that machine's alone.
+    for n in (8, 12):
+        assert len({m.id[:n] for m in (a, b, bob)}) == 3, n
+    assert len({m.name for m in (a, b, bob)}) == 3
+
+
+def test_bus_listener_sends_the_headers_it_is_given(sse_listener):
+    s = sse_listener
+    with busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "ok", name="alice", headers={}) as listener:
+        assert listener.open() == (200, None)
+    got = {k.lower() for k in s["headers"][-1]}
+    assert busclient.MACHINE_ID_HEADER.lower() not in got and busclient.MACHINE_NAME_HEADER.lower() not in got, got
+
+
+def test_bus_listener_wait_ended_sees_the_server_end_the_stream(sse_listener):
+    s = sse_listener
+    with busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "ends") as ended:
+        assert ended.open() == (200, None)
+        assert ended.wait_ended(10) and "ended" in ended.error
+    with busclient.BusListener("127.0.0.1", s["port"], s["pin"], s["pair"], "ok") as held:
+        assert held.open() == (200, None)
+        assert not held.wait_ended(0.3), "a stream the server holds counted as ended"
+        held.close()
+        assert not held.wait_ended(0.1), "a stream the test closed counted as ended by the server"
+
+
+def test_fake_machine_reports_how_the_server_answered(sse_listener):
+    s = sse_listener
+    cert = _Cert(s)
+    a = busclient.FakeMachine(ident.ALICE, "127.0.0.1", cert)
+    b = busclient.FakeMachine(ident.ALICE, "127.0.0.1", cert, tag="b")
+
+    sub = a.subscribe("pin")
+    assert (sub.status, sub.code, sub.source) == (200, None, None) and sub.listener is a.streams[0]
+    assert sub.listener.wait_for(lambda e: busclient.payload_has(e, "tok"), 10) is not None
+
+    refused = b.subscribe("pin")
+    assert (refused.status, refused.code) == (403, busclient.SOURCE_NOT_BOUND), refused
+    assert refused.source == {"machine_id": a.id, "machine_name": a.name}
+    assert refused.listener is None and b.streams == [] and a.name in str(refused)
+
+    no_id = a.subscribe("pin", headers={})
+    assert (no_id.status, no_id.code, no_id.source) == (403, busclient.SOURCE_MACHINE_ID_REQUIRED, None)
+    assert "0.10.0" in no_id.message and len(a.streams) == 1
+
+    held = a.streams[0]
+    a.close()
+    assert a.streams == [] and held.error is None
+
+
+def test_fake_machine_answers_as_itself(sse_listener):
+    s = sse_listener
+    cert = _Cert(s)
+    a = busclient.FakeMachine(ident.ALICE, "127.0.0.1", cert)
+    b = busclient.FakeMachine(ident.ALICE, "127.0.0.1", cert, tag="b")
+    req = {"id": "srv-9", "namespace": "ns-1", "shed": {"name": "s1"}, "payload": {}}
+
+    assert a.answer(req, {"ok": 1}) == (204, None)
+    post = s["posts"][-1]
+    assert post["path"] == "/api/plugins/listeners/ns-1/respond"
+    assert post["body"] == busclient.response_body(req, {"ok": 1})
+    got = {k.lower(): v for k, v in post["headers"].items()}
+    assert got[busclient.MACHINE_ID_HEADER.lower()] == a.id
+    assert got[busclient.MACHINE_NAME_HEADER.lower()] == a.headers[busclient.MACHINE_NAME_HEADER]
+
+    status, body = b.answer(req, {"ok": 1})
+    assert (status, body["error"]["code"], body["source"]["machine_id"]) == (403, busclient.SOURCE_NOT_BOUND, a.id)
+    status, body = a.answer(req, {"ok": 1}, headers={})
+    assert (status, body["error"]["code"]) == (403, busclient.SOURCE_MACHINE_ID_REQUIRED)
+    assert busclient.MACHINE_ID_HEADER.lower() not in {k.lower() for k in s["posts"][-1]["headers"]}
+
+
+class _PinStore:
+    """A user's binding as the server keeps it, behind the two routes
+    (`request`) and a machine's subscribe (`admit`). `lie` makes the move
+    route answer 200 without moving."""
+
+    def __init__(self, bound=None, known=(), lie=False):
+        self.bound, self.lie = bound, lie
+        self.known = list(known) + ([bound] if bound and bound not in known else [])
+        self.gen = 1 if bound else 0
+        self.calls: list[tuple] = []
+
+    def view(self):
+        ref = [{"kind": "machine", "id": self.bound}]
+        binding = None if self.bound is None else {
+            "delivery": ref, "signing": ref, "generation": self.gen, "bound_by": "x", "bound_at": "t"}
+        return {"user": ident.ALICE, "binding": binding,
+                "machines": [{"id": m, "name": m, "connected": False, "namespaces": []} for m in self.known]}
+
+    def request(self, method, path, body=None, timeout=None):
+        self.calls.append((method, path, body))
+        if method == "GET":
+            return 200, self.view()
+        if body["machine_id"] not in self.known:
+            return 404, {"error": {"code": busclient.SOURCE_MACHINE_NOT_FOUND, "message": "x"}}
+        if not self.lie:
+            self.bound, self.gen = body["machine_id"], self.gen + 1
+        return 200, self.view()
+
+    def admit(self, mid):
+        self.calls.append(("subscribe", mid))
+        if mid not in self.known:
+            self.known.append(mid)
+        if self.bound is None:
+            self.bound, self.gen = mid, self.gen + 1
+        if mid == self.bound:
+            return 200, None
+        return 403, {"error": {"code": busclient.SOURCE_NOT_BOUND, "message": "x"},
+                     "source": {"machine_id": self.bound, "machine_name": self.bound}}
+
+
+class _StoreMachine:
+    """A machine of a `_PinStore`. `answer` fixes what its subscribes get;
+    `answers` is a list of them, used up one per subscribe (then the store
+    decides); each is `(status, body)` or `(status, body, retry_after)`."""
+
+    def __init__(self, store, mid, answer=None, answers=None):
+        self.store, self.id, self.name = store, mid, mid
+        self._answer, self._answers = answer, list(answers or [])
+
+    def __repr__(self):
+        return f"machine {self.id}"
+
+    def subscribe(self, ns):
+        fixed = self._answers.pop(0) if self._answers else self._answer
+        if fixed:
+            self.store.calls.append(("subscribe", self.id))
+            status, body, *rest = fixed
+            return busclient.Subscription(self.name, ns, status, body, None, rest[0] if rest else None)
+        status, body = self.store.admit(self.id)
+        return busclient.Subscription(self.name, ns, status, body, None)
+
+
+def _moves(store):
+    return [c for c in store.calls if c[0] == "POST"]
+
+
+def _subscribes(store):
+    return [c for c in store.calls if c[0] == "subscribe"]
+
+
+def test_ensure_source_from_every_state_the_server_can_be_in():
+    # Already the source: nothing is asked of the server but a read.
+    s = _PinStore(bound="a")
+    assert busclient.ensure_source(s, _StoreMachine(s, "a"), "ns") == "already"
+    assert not _moves(s) and not _subscribes(s)
+    # A fresh server: the machine's one subscribe binds it; no move.
+    s = _PinStore()
+    assert busclient.ensure_source(s, _StoreMachine(s, "a"), "ns") == "first-connect"
+    assert s.bound == "a" and not _moves(s) and len(_subscribes(s)) == 1
+    # Another machine bound, this one never seen: it is presented (refused,
+    # recorded), then the binding is moved to it.
+    s = _PinStore(bound="b")
+    assert busclient.ensure_source(s, _StoreMachine(s, "a"), "ns") == "moved"
+    assert s.bound == "a" and len(_subscribes(s)) == 1 and _moves(s) == [("POST", "/api/sources/use", {"machine_id": "a"})]
+    # Another machine bound, this one known (a later run): moved, no subscribe.
+    s = _PinStore(bound="b", known=["a"])
+    assert busclient.ensure_source(s, _StoreMachine(s, "a"), "ns") == "moved"
+    assert s.bound == "a" and not _subscribes(s)
+
+
+@pytest.mark.parametrize(
+    "store, answer, match",
+    [
+        # The presenting subscribe was admitted although another machine is bound.
+        (lambda: _PinStore(bound="b"), (200, None), "presenting"),
+        # It was refused for some other reason.
+        (lambda: _PinStore(bound="b"), (403, {"error": {"code": "FORBIDDEN"}}), "presenting"),
+        # Refused as not bound, but naming a machine that is not the source.
+        (lambda: _PinStore(bound="b"), (403, {"error": {"code": busclient.SOURCE_NOT_BOUND},
+                                              "source": {"machine_id": "c", "machine_name": "c"}}), "presenting"),
+        # ... or naming the source by another name.
+        (lambda: _PinStore(bound="b"), (403, {"error": {"code": busclient.SOURCE_NOT_BOUND},
+                                              "source": {"machine_id": "b", "machine_name": "not-b"}}), "presenting"),
+        # The move route said it moved and did not.
+        (lambda: _PinStore(bound="b", known=["a"], lie=True), None, "is not the source after moved"),
+    ],
+    ids=["admitted-beside-a-binding", "refused-otherwise", "not-bound-naming-another-machine",
+         "not-bound-naming-the-source-by-another-name", "move-did-not-land"],
+)
+def test_ensure_source_fails_loudly_when_the_server_does_not_do_it(store, answer, match):
+    s = store()
+    with pytest.raises(AssertionError, match=match):
+        busclient.ensure_source(s, _StoreMachine(s, "a", answer), "ns")
+
+
+def test_ensure_source_reports_a_refused_move():
+    s = _PinStore(bound="b")
+    # Refused naming the source, but never recorded.
+    m = _StoreMachine(s, "a", (403, {"error": {"code": busclient.SOURCE_NOT_BOUND},
+                                     "source": {"machine_id": "b", "machine_name": "b"}}))
+    with pytest.raises(AssertionError, match="moving the source to machine a: 404"):
+        busclient.ensure_source(s, m, "ns")
+
+
+def test_ensure_known_records_a_machine_without_moving_the_source():
+    s = _PinStore(bound="a")
+    assert busclient.ensure_known(s, _StoreMachine(s, "b"), "ns") == "presented"
+    assert s.bound == "a" and s.gen == 1 and "b" in s.known and not _moves(s)
+    assert busclient.ensure_known(s, _StoreMachine(s, "b"), "ns") == "known"
+    assert len(_subscribes(s)) == 1
+    # With no source yet, presenting it would bind it: refused, nothing sent.
+    s = _PinStore()
+    with pytest.raises(AssertionError, match="no source yet"):
+        busclient.ensure_known(s, _StoreMachine(s, "b"), "ns")
+    assert not _subscribes(s) and s.bound is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [None, {"machine_id": "c", "machine_name": "c"}, {"machine_id": "a", "machine_name": "not-a"}],
+    ids=["names-nothing", "names-another-machine", "names-the-source-by-another-name"],
+)
+def test_ensure_known_wants_the_refusal_to_name_the_source(source):
+    s = _PinStore(bound="a")
+    body = {"error": {"code": busclient.SOURCE_NOT_BOUND}, **({"source": source} if source else {})}
+    with pytest.raises(AssertionError, match="naming the bound machine"):
+        busclient.ensure_known(s, _StoreMachine(s, "b", (403, body)), "ns")
+
+
+@pytest.fixture
+def waits(monkeypatch):
+    """What the busclient helpers wait for, recorded instead of slept."""
+    got: list[float] = []
+    monkeypatch.setattr(busclient, "_sleep", got.append)
+    return got
+
+
+_LIMITED = (429, {"error": {"code": busclient.SOURCE_RATE_LIMITED, "message": "retry"}}, "7")
+
+
+def test_a_set_up_subscribe_waits_out_the_rate_limit(waits):
+    # Refused twice by the admission limit, then admitted: each Retry-After
+    # waited, and the machine is presented.
+    s = _PinStore(bound="a")
+    assert busclient.ensure_known(s, _StoreMachine(s, "b", answers=[_LIMITED, _LIMITED]), "ns") == "presented"
+    assert waits == [7.0, 7.0] and len(_subscribes(s)) == 3 and "b" in s.known
+    # A Retry-After that is missing or not a number of seconds: the limit's own 15 s.
+    waits.clear()
+    s = _PinStore()
+    assert busclient.ensure_source(s, _StoreMachine(s, "a", answers=[(*_LIMITED[:2], None)]), "ns") == "first-connect"
+    assert waits == [busclient.RATE_LIMIT_WAIT]
+
+
+def test_a_set_up_subscribe_still_rate_limited_fails_saying_so(waits):
+    s = _PinStore(bound="a")
+    with pytest.raises(AssertionError, match="still 429 SOURCE_RATE_LIMITED after waiting out its Retry-After 2 times"):
+        busclient.ensure_known(s, _StoreMachine(s, "b", _LIMITED), "ns")
+    assert waits == [7.0, 7.0] and len(_subscribes(s)) == 3
+
+
+class _BusyApi:
+    """GET /api/sources answering 503 SOURCE_BUSY `busy` times (with
+    `retry_after`), then 200; it has `request_full`, as tlsclient.Pinned
+    does."""
+
+    def __init__(self, busy, retry_after="1", then=(200, {"user": "u", "binding": None, "machines": []})):
+        self.busy, self.retry_after, self.then, self.calls = busy, retry_after, then, 0
+
+    def request_full(self, method, path, body=None):
+        self.calls += 1
+        if self.calls <= self.busy:
+            headers = {} if self.retry_after is None else {"retry-after": self.retry_after}
+            return 503, {"error": {"code": busclient.SOURCE_BUSY, "message": "busy"}}, headers
+        return (*self.then, {})
+
+
+def test_sources_waits_out_source_busy(waits):
+    api = _BusyApi(busy=2, retry_after="3")
+    assert busclient.sources(api)["user"] == "u"
+    assert api.calls == 3 and waits == [3.0, 3.0]
+    # No Retry-After: one second, what the server sends.
+    waits.clear()
+    assert busclient.sources(_BusyApi(busy=1, retry_after=None))["user"] == "u" and waits == [1.0]
+    # An absurd Retry-After is capped.
+    waits.clear()
+    busclient.sources(_BusyApi(busy=1, retry_after="9999"))
+    assert waits == [busclient.MAX_RETRY_AFTER]
+
+
+def test_sources_fails_clearly_when_it_stays_busy(waits):
+    api = _BusyApi(busy=99)
+    with pytest.raises(AssertionError, match="503 SOURCE_BUSY 5 times in a row"):
+        busclient.sources(api)
+    assert api.calls == busclient.SOURCE_BUSY_ATTEMPTS and len(waits) == busclient.SOURCE_BUSY_ATTEMPTS - 1
+
+
+def test_sources_does_not_retry_any_other_answer(waits):
+    for then in ((503, {"error": {"code": "PLUGINS_DISABLED"}}), (403, {"error": {"code": "FORBIDDEN"}})):
+        api = _BusyApi(busy=0, then=then)
+        with pytest.raises(AssertionError, match=f"GET /api/sources: {then[0]}"):
+            busclient.sources(api)
+        assert api.calls == 1 and waits == []
+
+
+def test_pinned_request_full_returns_the_headers(monkeypatch):
+    # sources() reads Retry-After through Pinned.request_full; request() is
+    # the same call without them.
+    class Resp:
+        status = 503
+
+        def read(self):
+            return b'{"error":{"code":"SOURCE_BUSY"}}'
+
+        def getheaders(self):
+            return [("Retry-After", "1"), ("Content-Type", "application/json")]
+
+        def getheader(self, name, default=None):
+            return dict(self.getheaders()).get(name, default)
+
+    class Conn:
+        def __init__(self, *a, **k):
+            pass
+
+        def request(self, *a, **k):
+            pass
+
+        def getresponse(self):
+            return Resp()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tlsclient.http.client, "HTTPSConnection", Conn)
+    p = tlsclient.Pinned.__new__(tlsclient.Pinned)
+    p.host, p.port, p.ctx = "h", 1, None
+    status, body, headers = p.request_full("GET", "/api/sources")
+    assert (status, body["error"]["code"], headers["retry-after"]) == (503, "SOURCE_BUSY", "1")
+    assert p.request("GET", "/api/sources") == (status, body)
+
+
+def _proc(rc, out="", err=""):
+    return subprocess.CompletedProcess(["shed"], rc, out, err)
+
+
+def test_cli_retrying_busy_runs_again_only_on_source_busy(waits):
+    runs = iter([_proc(1, err="Error: SOURCE_BUSY: retry in a moment"), _proc(0, out="ok")])
+    assert busclient.cli_retrying_busy(lambda: next(runs), "shed source ls").stdout == "ok"
+    assert waits == [busclient.SOURCE_BUSY_WAIT]
+    # Any other failure is the command's answer, returned at once.
+    waits.clear()
+    refused = _proc(1, err="Error: FORBIDDEN: only an admin")
+    assert busclient.cli_retrying_busy(lambda: refused, "shed source ls") is refused and waits == []
+
+
+def test_cli_retrying_busy_fails_clearly_when_it_stays_busy(waits):
+    calls = []
+    with pytest.raises(AssertionError, match="shed source status: the server answered 503 SOURCE_BUSY 5 times"):
+        busclient.cli_retrying_busy(lambda: calls.append(1) or _proc(1, err="SOURCE_BUSY: x"), "shed source status")
+    assert len(calls) == busclient.SOURCE_BUSY_ATTEMPTS
+
+
+def test_bus_listener_keeps_a_refusals_retry_after(sse_listener):
+    s = sse_listener
+    m = busclient.FakeMachine(ident.ALICE, "127.0.0.1", _Cert(s))
+    sub = m.subscribe("limited")
+    assert (sub.status, sub.code, sub.retry_after) == (429, busclient.SOURCE_RATE_LIMITED, "7") and m.streams == []
+
+
+def test_bus_listener_open_closes_its_connection_when_it_raises(sse_listener, monkeypatch):
+    # A subscribe the server never answers times out inside open(): the
+    # connection is closed before the exception leaves, with nothing tracking
+    # it (FakeMachine keeps only listeners that opened).
+    s = sse_listener
+    made = []
+    cls = busclient.http.client.HTTPSConnection
+    connect = cls.connect
+
+    def recording(self):
+        connect(self)
+        made.append((self, self.sock))
+
+    monkeypatch.setattr(cls, "connect", recording)
+    m = busclient.FakeMachine(ident.ALICE, "127.0.0.1", _Cert(s))
+    with pytest.raises(TimeoutError) as raised:
+        m.subscribe("hang", timeout=0.5)
+    (conn, sock), = made
+    assert sock.fileno() == -1, "the subscribe's socket is still open after open() raised"
+    assert conn.sock is None and m.streams == []
+    del raised
+
+
+def test_bound_id_reads_one_machine_and_refuses_a_split_binding():
+    assert busclient.bound_id({"binding": None}) is None
+    one = [{"kind": "machine", "id": "a"}]
+    assert busclient.bound_id({"binding": {"delivery": one, "signing": one}}) == "a"
+    with pytest.raises(AssertionError, match="not one machine"):
+        busclient.bound_id({"binding": {"delivery": one, "signing": [{"kind": "machine", "id": "b"}]}})
+    view = _PinStore(bound="a", known=["b"]).view()
+    assert busclient.known_ids(view) == {"a", "b"} and "bound a" in busclient.describe_sources(view)
+
+
+def test_the_pin_module_skips_on_remote_before_any_fixture():
+    # The whole module is local_vm_only, so conftest's runtest hook skips each
+    # of its [remote] cases before users_env (or any shed) is set up.
+    import conftest
+
+    assert tsp.pytestmark.name == "local_vm_only"
+
+    class Item:
+        callspec = type("C", (), {"params": {"users_env": "remote"}})()
+
+        def get_closest_marker(self, name):
+            return tsp.pytestmark.mark if name == "local_vm_only" else None
+
+    with pytest.raises(pytest.skip.Exception, match="no helper requests"):
+        conftest.pytest_runtest_setup(Item())
+
+
+def test_the_pin_exchanges_fit_inside_the_guests_request_lifetime():
+    src = (dc.REPO_ROOT / "cmd" / "shed-agent" / "http.go").read_text()
+    m = re.search(r"publishTimeout\s*=\s*(\d+)\s*\*\s*time\.Second", src)
+    assert m and tsp.GUEST_REQUEST_LIFETIME == int(m.group(1))
+    assert tsp.DELIVERY_BUDGET + tsp.REFUSAL_TIMEOUT + 2 <= tsp.ANSWER_BY
+    assert tsp.ANSWER_BY + tsp.ANSWER_TIMEOUT <= tsp.GUEST_REQUEST_LIFETIME - 3
+    api = (dc.REPO_ROOT / "internal" / "api" / "plugin_handlers.go").read_text()
+    k = re.search(r"sseKeepaliveInterval\s*=\s*(\d+)\s*\*\s*time\.Second", api)
+    assert k and tsp.LIVENESS_TIMEOUT >= int(k.group(1)) + 10
+
+
+def test_the_pin_cases_match_the_servers_and_the_clis_own_words():
+    root = dc.REPO_ROOT
+    types = (root / "internal" / "config" / "types.go").read_text()
+    for code in (busclient.SOURCE_MACHINE_ID_REQUIRED, busclient.SOURCE_NOT_BOUND, busclient.SOURCE_DUPLICATE_STREAM,
+                 busclient.SOURCE_RATE_LIMITED, busclient.SOURCE_MACHINE_NOT_FOUND):
+        assert f'= "{code}"' in types, code
+    handlers = (root / "internal" / "api" / "source_handlers.go").read_text()
+    assert f'"{tsp.NOT_ADMIN}"' in handlers and f'"{tsp.SCRIPT_KEY}"' in handlers
+    assert 'who := "user " + c.User' in handlers and 'who = "admin " + c.User' in handlers
+    assert f'return "{tsp.CONTROL_SCOPE}", false' in (root / "internal" / "api" / "auth.go").read_text()
+    machine = (root / "internal" / "api" / "source_machine.go").read_text()
+    assert tsp.DUPLICATE in machine and f"{tsp.MINIMUM_VERSION} and the shed desktop app" in machine
+    assert 'MachineID   string `json:"machine_id"`' in machine and 'MachineName string `json:"machine_name"`' in machine
+    assert f'FeatureSourceBinding = "{tsp.FEATURE}"' in (root / "internal" / "api" / "overview.go").read_text()
+    assert f'"FORBIDDEN", "{tsp.UNMATCHED}"' in (root / "internal" / "api" / "plugin_handlers.go").read_text()
+    assert 'BoundByFirstConnect = "first-connect"' in (root / "internal" / "source" / "source.go").read_text()
+    cli = (root / "cmd" / "shed" / "source.go").read_text()
+    for words in ('"Machine %s is now the credential source for %s on %s.\\n"',
+                  '"Machine %s is already the credential source for %s on %s.\\n"',
+                  '"Machine %s no longer answers. "',
+                  '"Credential source for %s on %s: %s, connected (%s).\\n"',
+                  '"No credential source for %s on %s yet: ',
+                  '"%w\\nnothing changed on %s"',
+                  'return fmt.Sprintf("\\"%s\\" (%s)", termSafe(m.Name), shortSourceID(m.ID))',
+                  'return "user " + sourceUserFlag',
+                  '"MACHINE\\tID\\tKEY\\tBOUND\\tCONNECTED\\tFIRST SEEN"'):
+        assert words in cli, words
+    assert tsp._label(busclient.FakeMachine(ident.ALICE, "h", None)) == f'"itest-itest-alice" ({busclient.machine_id(ident.ALICE)[:8]})'

@@ -30,7 +30,10 @@ The primitives:
     config merged from the committed dev-parallel base, restart the VZ
     dev server against it, wait until it is ready, yield, then **always**
     restore the base config (pinned explicitly) and wait for that too.
-    Never edits the committed `configs/server.dev-parallel.*.yaml`.
+    Never edits the committed `configs/server.dev-parallel.*.yaml`. The
+    developer's credential source bindings (`source-bindings.json`) are
+    moved aside with the server down for the detour and put back, with the
+    server down again, before the base starts (`BindingsDetour`).
   - `run_preflight(overrides)` — launch `bin/shed-server serve` as a
     throwaway subprocess against a merged temp config, with a timeout,
     and return a `PreflightResult` so a test can assert a non-zero exit
@@ -73,6 +76,7 @@ import base64
 import copy
 import json
 import os
+import re
 import signal
 import ssl
 import subprocess
@@ -306,6 +310,17 @@ def _restart_argv(dev_config: Path) -> list[str]:
     return ["make", "dev-server-restart", f"DEV_CONFIG={dev_config}", "SHED_DEV_USERS="]
 
 
+def _make_down() -> None:
+    """`make dev-server-down`: stop the Mac dev server (idempotent: no
+    server running is fine). Split out so the unit tests can stub it."""
+    r = subprocess.run(["make", "dev-server-down"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise AssertionError(
+            f"dev-server-down failed (exit {r.returncode}): "
+            f"stdout={r.stdout[-2000:]!r} stderr={r.stderr[-2000:]!r}"
+        )
+
+
 def _make_restart(dev_config: Path) -> None:
     """`make dev-server-restart DEV_CONFIG=<path>` — always with an explicit
     config, so the restart never inherits a stale/foreign value from a parent
@@ -492,6 +507,199 @@ def _wait_ready(server: str, timeout: float, *, config: dict) -> None:
             time.sleep(1)
 
 
+# ----------------------------------------------------------------------------
+# The developer's credential source bindings across a dev_config() detour
+# ----------------------------------------------------------------------------
+#
+# shed-server keeps each user's credential source (the machine that answers
+# that user's credential requests) in `source-bindings.json` beside the
+# backend's instance directory (cmd/shed-server/serve.go: the parent of
+# vz.instance_dir; internal/source/file.go: FileName), and acts on it at
+# start: a start with several users drops the implicit user's binding (the
+# developer's real machine on the Mac dev server), and a start with no user
+# list drops every named user's. So a detour through another config would
+# leave the developer with no source, or with whichever machine connects
+# first. dev_config() therefore moves the store aside, with the server DOWN,
+# before the detour's server starts, and puts it back, with the server down
+# again, before the base config's server starts, discarding the store the
+# detour's server wrote. Only that file moves: never the lock file beside it,
+# the logs, the instances or anything else.
+#
+# Crash safety: the developer's store is kept at `<store>.itest-saved` (or, if
+# there was none, the marker `<store>.itest-saved-absent`), in the same
+# directory, so every move is a rename on one file system. Every outermost
+# dev_config() puts back a copy it finds BEFORE saving anything, so a run
+# killed mid-detour is repaired by the next run that restarts the Mac dev
+# server, and a saved copy is never overwritten. By hand: stop the dev server
+# and rename `<store>.itest-saved` to `<store>` (or, with the `-absent`
+# marker, delete `<store>` and the marker).
+#
+# Nested dev_config() calls (test_users_upgrade.py restarts inside a users
+# detour) move nothing: only the outermost one does.
+
+BINDINGS_FILE = "source-bindings.json"  # internal/source/file.go: FileName
+BINDINGS_LOCK_SUFFIX = ".lock"  # internal/source/file.go: LockSuffix
+BINDINGS_SAVED_SUFFIX = ".itest-saved"
+BINDINGS_ABSENT_SUFFIX = ".itest-saved-absent"
+# How long to wait for a stopped server's hold on the store to go.
+BINDINGS_UNLOCK_TIMEOUT = 15.0
+# A SHED_DEV_STATE_DIR that the renderer (scripts/render-dev-config.sh: a
+# sed substitution written into YAML) is known to carry through unchanged.
+_STATE_DIR_SAFE = re.compile(r"[A-Za-z0-9_./~+,-][A-Za-z0-9_ ./~+,-]*")
+
+# dev_config() nesting depth: only the outermost call moves the store.
+_detour_depth = 0
+
+
+def _go_expand(path: str) -> str:
+    """config.ExpandPath: `~/x` is `$HOME/x` (joined, so cleaned); anything
+    else as written."""
+    if path.startswith("~/"):
+        return os.path.normpath(os.path.join(str(Path.home()), path[2:]))
+    return path
+
+
+def dev_bindings_store(config: dict, environ: Optional[dict] = None) -> Path:
+    """The `source-bindings.json` the Mac dev server keeps when started by
+    `make dev-server-restart DEV_CONFIG=<config written from config>`: beside
+    `vz.instance_dir`, which the Makefile re-renders under
+    `$SHED_DEV_STATE_DIR/instances` when that is set. Raises RuntimeError
+    rather than guess when it cannot be told exactly."""
+    env = os.environ if environ is None else environ
+    if config.get("default_backend") != "vz":
+        raise RuntimeError(f"cannot tell where the dev server keeps its source bindings: default_backend is "
+                           f"{config.get('default_backend')!r}, not 'vz'")
+    declared = (config.get("vz") or {}).get("instance_dir")
+    if not isinstance(declared, str) or not declared.strip():
+        raise RuntimeError("cannot tell where the dev server keeps its source bindings: the config declares no "
+                           "vz.instance_dir")
+    instance_dir = declared
+    state = env.get("SHED_DEV_STATE_DIR", "")
+    if state:
+        if not _STATE_DIR_SAFE.fullmatch(state) or state != state.strip():
+            raise RuntimeError(f"cannot tell where the dev server keeps its source bindings: SHED_DEV_STATE_DIR="
+                               f"{state!r} has characters the config renderer may not carry through unchanged")
+        instance_dir = (state[:-1] if state.endswith("/") else state) + "/instances"
+    expanded = _go_expand(instance_dir)
+    if not os.path.isabs(expanded):
+        raise RuntimeError(f"cannot tell where the dev server keeps its source bindings: instance_dir "
+                           f"{instance_dir!r} is not absolute")
+    return Path(os.path.normpath(os.path.dirname(expanded))) / BINDINGS_FILE
+
+
+@contextmanager
+def _bindings_unlocked(store: Path) -> Iterator[None]:
+    """Hold the store's own lock (the flock a running shed-server holds on
+    `<store>.lock` for as long as it has the store open) while the store is
+    moved: proof that no server has it open, and no server can open it
+    meanwhile. Raises RuntimeError when a server still holds it after
+    BINDINGS_UNLOCK_TIMEOUT."""
+    import fcntl
+
+    timeout = BINDINGS_UNLOCK_TIMEOUT
+    lock_path = store.with_name(store.name + BINDINGS_LOCK_SUFFIX)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"a shed-server still holds {lock_path} {timeout:.0f} s after the dev server was stopped; "
+                        f"not moving its credential source bindings"
+                    ) from None
+                time.sleep(0.2)
+        yield
+    finally:
+        os.close(fd)  # releases the flock
+
+
+def _sync_dir(d: Path) -> None:
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+class BindingsDetour:
+    """The developer's credential source bindings (`store`) kept aside while
+    a dev_config() detour runs. Every method expects the server stopped and
+    checks it (`_bindings_unlocked`)."""
+
+    def __init__(self, store: Path) -> None:
+        self.store = store
+        self.saved = store.with_name(store.name + BINDINGS_SAVED_SUFFIX)
+        self.absent = store.with_name(store.name + BINDINGS_ABSENT_SUFFIX)
+
+    def _put_back(self) -> bool:
+        """Put a kept copy back over whatever store is there now; False when
+        none was kept. A store the copy replaces is a detour's, discarded."""
+        if self.saved.exists():
+            if self.store.exists() and os.path.samefile(self.saved, self.store):
+                # Stopped between save()'s link and unlink: one file, two
+                # names (a rename between them would do nothing).
+                self.saved.unlink()
+            else:
+                os.replace(self.saved, self.store)
+            self.absent.unlink(missing_ok=True)
+        elif self.absent.exists():
+            self.store.unlink(missing_ok=True)
+            self.absent.unlink()
+        else:
+            return False
+        _sync_dir(self.store.parent)
+        return True
+
+    def restore(self) -> bool:
+        """Put the developer's store back (and recover one an interrupted run
+        kept). True when there was one to put back."""
+        with _bindings_unlocked(self.store):
+            return self._put_back()
+
+    def save(self) -> bool:
+        """Keep the developer's store aside, so the next server starts with
+        none. A copy an interrupted run kept is put back first, never
+        overwritten. Returns whether one was recovered that way."""
+        with _bindings_unlocked(self.store):
+            recovered = self._put_back()
+            if self.store.exists():
+                # A hard link, then the unlink: link refuses to overwrite, and
+                # a stop between the two leaves both names on one file, which
+                # _put_back resolves.
+                os.link(self.store, self.saved)
+                self.store.unlink()
+            else:
+                os.close(os.open(self.absent, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            _sync_dir(self.store.parent)
+            return recovered
+
+
+def _bindings_detour(merged: dict) -> BindingsDetour:
+    """The detour for a dev_config() run of `merged`: the store must be the
+    same file for it and for the committed base (the restore starts the
+    base), and its directory must exist. Raises RuntimeError otherwise,
+    before anything is stopped."""
+    store = dev_bindings_store(merged)
+    base = dev_bindings_store(_merge_config({}))
+    if store != base:
+        raise RuntimeError(f"refusing to restart the dev server: the override moves its source bindings from "
+                           f"{base} to {store}, so they could not be kept across the detour")
+    if not store.parent.is_dir():
+        raise RuntimeError(f"refusing to restart the dev server: its state directory {store.parent} does not exist, "
+                           f"so where it keeps its source bindings is unknown (is SHED_DEV_STATE_DIR the same as "
+                           f"when it was started?)")
+    return BindingsDetour(store)
+
+
 @contextmanager
 def dev_config(
     overrides: dict,
@@ -508,6 +716,13 @@ def dev_config(
     body raises) and waits for that too. Never edits the committed
     dev-parallel config.
 
+    The developer's credential source bindings survive the detour (see
+    "The developer's credential source bindings" above): the outermost call
+    stops the server, moves the store aside, then starts the detour's config;
+    on exit it stops the server, puts the store back (discarding the one the
+    detour wrote) and starts the base. It refuses, before stopping anything,
+    when it cannot tell where the store is.
+
     `transform`, when given, is applied to the merged config before it is
     written: for an edit a merge cannot express, such as removing keys
     (`fixtures.identity.with_users` moves `auth.ssh`'s key sources under a
@@ -520,23 +735,36 @@ def dev_config(
     override names: the base is mtls, and `OPEN_MODE_OVERRIDES` gives an
     open server on loopback.
     """
+    global _detour_depth
     assert_dev_target(server)
     merged = _merge_config(overrides or {})
     if transform is not None:
         merged = transform(merged)
     _assert_config_ports_safe(merged)
+    detour = _bindings_detour(merged) if _detour_depth == 0 else None
     temp = _write_config(merged, DEV_CONFIG_TMP)
+    _detour_depth += 1
     try:
+        if detour is not None:
+            _make_down()
+            detour.save()
         _make_restart(temp)
         # The merged config (not the client entry) says which ports/mode the
         # restart just bound.
         _wait_ready(server, ready_timeout, config=merged)
         yield server
     finally:
+        _detour_depth -= 1
         try:
-            # Restore, base config pinned.
-            _make_restart(DEV_BASE_CONFIG)
-            _wait_ready(server, ready_timeout, config=_merge_config({}))
+            try:
+                if detour is not None:
+                    _make_down()
+                    detour.restore()
+            finally:
+                # Restore, base config pinned (also when putting the store
+                # back failed: it stays aside, and the next run puts it back).
+                _make_restart(DEV_BASE_CONFIG)
+                _wait_ready(server, ready_timeout, config=_merge_config({}))
         finally:
             try:
                 temp.unlink()
