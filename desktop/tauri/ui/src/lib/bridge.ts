@@ -5,6 +5,7 @@ import type { CrazeCreateOptions } from "@/lib/crazeCreate";
 import type { CrazeSavedList } from "@/lib/crazeResume";
 import { killTarget } from "@/lib/crazeRows";
 import { initialReport } from "@/lib/report";
+import type { SourceMachine, SourceRow, SourceStatus } from "@/lib/sources";
 
 export type Pane = "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system";
 
@@ -565,6 +566,48 @@ export async function setBrokerMode(
   return core.invoke("broker_set_mode", { mode });
 }
 
+/* ---- credential sources (plan 035 §3.4) ------------------------------------ */
+
+/* The row types and how reads and moves are reconciled live in `sources.ts` (pure,
+ * unit-tested); the calls live here. A machine's name came from ANOTHER machine by
+ * way of the server: Rust has already cleaned it, and `cleanMachineText` cleans it
+ * again here; render it only as a text node, never into HTML, a title or a tooltip. */
+export type { SourceMachine, SourceRow, SourceStatus };
+
+/** Control and Unicode format characters (bidirectional overrides, zero-widths) out:
+ *  a second line of defence behind the Rust cleaner for text from other machines. */
+export function cleanMachineText(s: string): string {
+  return s.replace(/[\p{Cc}\p{Cf}]/gu, "");
+}
+
+function cleanMachine(m: SourceMachine | null | undefined): SourceMachine | null {
+  return m ? { id: cleanMachineText(m.id), name: cleanMachineText(m.name) } : null;
+}
+
+function cleanRow(r: SourceRow): SourceRow {
+  return { ...r, source: cleanMachine(r.source), busy: !!r.busy };
+}
+
+/** The source rows (swallowing, like `getBrokerStatus`: `undefined` on any failure). */
+export async function getSourceStatus(): Promise<SourceStatus | undefined> {
+  const s = await invoke<SourceStatus>("source_status");
+  if (!s) return undefined;
+  return {
+    ...s,
+    rows: (s.rows ?? []).map(cleanRow),
+    this_machine: cleanMachine(s.this_machine),
+  };
+}
+
+/** "Use this machine": make this machine the source on `host`, answering that host's
+ *  row as the server left it after the move. THROWS the refusal in plain words
+ *  (unlike the swallowing `invoke`), which the row shows. */
+export async function makeThisMachineSource(host: string): Promise<{ row: SourceRow; woke_broker: boolean }> {
+  const core = await import("@tauri-apps/api/core");
+  const res = await core.invoke<{ row: SourceRow; woke_broker: boolean }>("source_use", { host });
+  return { ...res, row: cleanRow(res.row) };
+}
+
 /** Open a shed in the user's chosen terminal (best-effort; a no-op in a browser
  *  and disabled server-side under test mode). A non-empty `session` attaches that
  *  tmux session (the Agents console button → `tmux attach -t rc-<slug>`). */
@@ -798,6 +841,21 @@ export type PrefsReport = {
     broker_pref: BrokerMode;
     broker_effective: BrokerEffective;
     broker_error: string | null;
+    /** The credential-source rows as rendered (supporting servers only), plan 035. */
+    sources: {
+      host: string;
+      source_name: string | null;
+      this_machine: boolean;
+      connected: boolean;
+      /** A move of this row is in flight. */
+      busy: boolean;
+      /** The server was busy at the last read; a later read is scheduled. */
+      retrying: boolean;
+      can_use: boolean;
+      error: string | null;
+    }[];
+    this_machine_name: string | null;
+    this_machine_error: string | null;
   };
   mode: string;
 };

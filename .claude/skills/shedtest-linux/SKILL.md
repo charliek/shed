@@ -110,6 +110,35 @@ make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; 
   `prefs.remove_shed_rule {server, shed}` (the per-shed override row's remove button). Note
   `ui.modal` now only ever reports `create` | `launch` | `null` — Preferences is never a
   modal value.
+- **Credential sources (plan 035 §3.4).** `source.status` → `{rows, this_machine,
+  this_machine_error, broker_mode}` (one row per configured server: `host`, `supported`,
+  `source {id,name}|null`, `this_machine`, `connected`, `error`) and `source.use {host}` (makes
+  THIS machine the source; `{row, woke_broker}`; refusals come back as `bad_request`,
+  `machine_identity_unavailable`, `source_machine_not_found`, `forbidden`, `unsupported`,
+  `action_failed`). The Preferences rows live INSIDE the "Credential broker" section (no new
+  section id: `prefs.dump`'s `values.sources` / `this_machine_name` / `this_machine_error`
+  carry them). The button is pressed through `ui.press_source_use {host}` (test mode only): the
+  open window clicks its OWN `button[data-source-use="<host>"]`, so a disabled button takes no
+  press — the dump's `can_use` and the DOM's `disabled` come from one rule. The mock is
+  UNARMED by default (`/api/sources` answers chi's plain 404 = an older server; subscribes
+  unchanged); `MockShedServer.arm_source(...)` (or `_broker_app(source={...})`) makes it
+  pin: another machine's subscribe gets 403 SOURCE_NOT_BOUND naming the bound machine, a
+  move needs a machine the mock has SEEN (a subscribe, or `know_machine` for external mode,
+  where nothing subscribes), and `source_use_script([403, 500])` scripts refusals. Like the
+  real server, a move (`POST /api/sources/use` or `mock.move_source(id, name)`, another
+  machine taking it) releases every slot the old machine holds and ends its streams, and the
+  old machine's later responds get 403 SOURCE_NOT_BOUND. More knobs: `source_busy(n,
+  retry_after)` (next n reads 503 SOURCE_BUSY — the core asks 3 times per read),
+  `source_reads_late(secs)` (a read that takes its document on arrival and answers late —
+  an overtaken read), `delay_source_use(secs)` (two moves in flight at once). The mock's own
+  contract is pinned without the app in `test_mockserver_sources.py`. The cells are
+  `test_tauri_broker.py`'s "(d1b)" block; the "connected at once" cell waits for four
+  refusals (next backoff 8 s, no jitter) and asserts the accepted subscribe came within
+  `_WAKE_BUDGET_S` of the last one (`mock.subscribe_times`): 6 s at scale 1, scaled with
+  `SHED_TAURI_TEST_TIMEOUT_SCALE` but capped 0.5 s under the backoff — without the wake it
+  lands at exactly +8 s. Preferences re-reads the rows when a hidden window is shown again
+  (the native `prefs-shown` event, plus the DOM `focus`/`visibilitychange`, throttled to
+  one read per 5 s); under Xvfb either path alone refreshes a reopen.
 - **Updater ops on Linux report `linux_apt`.** `updater.status` → `{os, enabled, reason,
   instantiated}` and `updater.check` exist on both targets (the Sparkle updater is macOS-only;
   Linux ships via apt). On the Linux render gate `updater.status` is
@@ -772,6 +801,12 @@ deliver — neither of which a screenshot can be made to fail on.
   `git show HEAD:desktop/tauri/src-tauri/src/<f>.rs > /tmp/base.rs && rustfmt --check --edition
   2021 /tmp/base.rs` — if that is silent the file was clean, so format just yours with
   `rustfmt --edition 2021 src/<f>.rs`.
+- **Bidirectional and zero-width characters in test strings must be ESCAPES.** rustc denies a
+  literal U+202A–U+202E / U+2066–U+2069 in a string (`text_direction_codepoint_in_literal`),
+  and some editors and tools turn a typed `\u202e` into the literal character on save. Write
+  them as `\u{202E}` in Rust and `\N{RIGHT-TO-LEFT OVERRIDE}` in Python, and check with
+  `grep -nP '[\x{202a}-\x{202e}\x{200b}\x{2066}-\x{2069}]' <files>` before building
+  (the machine-name cleaning cells need such strings).
 - **Adding or dropping a `crates/` dependency moves TWO lockfiles** — the same trap as the
   `roost-ipc` rev bump above, for a different reason. The Tauri crate path-depends on
   `crates/*`, so a dep added to (or removed from) any of those crates changes

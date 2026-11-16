@@ -38,7 +38,7 @@ from urllib.parse import urlsplit
 import pytest
 
 import ui
-from client import TauriClient, scaled_timeout
+from client import ShedError, TauriClient, scaled_timeout
 from fake_host_agent import FakeHostAgent
 from mockserver import MockShedServer
 
@@ -94,6 +94,8 @@ def _broker_app(
     respond_script: dict[str, list] | None = None,
     clear_ssh_auth_sock: bool = True,
     shed_config_path: Path = CONFIG,
+    source: dict | None = None,
+    block_state_dir: bool = False,
 ):
     """Launch a self-managed tauri instance with a PRIVATE mock shed-server, yield
     `(client, mock, info)`, and tear both down. `info` carries `ssh_blob`, `audit_path`,
@@ -120,6 +122,10 @@ def _broker_app(
       i.e. what `hosts.auth` seeds its per-server credential modes from. Distinct from
       `discovery_mock`, which writes the config the embedded BROKER discovers servers
       through.
+    * `source` — arm the mock's credential-source binding (plan 035 §3.4) with these
+      `MockShedServer.arm_source` kwargs (`{}` binds the default other machine, "desk").
+    * `block_state_dir` — make the broker state dir (`SHED_HOST_AGENT_STATE_DIR`) a
+      regular FILE, so no machine identity can be loaded or created.
     """
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
@@ -137,6 +143,8 @@ def _broker_app(
         mock.refuse(ns, kind)
     for ns, script in (respond_script or {}).items():
         mock.respond_script(ns, script)
+    if source is not None:
+        mock.arm_source(**source)
 
     info: dict = {"ssh_blob": None, "audit_path": None, "runtime_dir": None}
     runtime_dir = Path(tempfile.mkdtemp(prefix="shed-brk-"))
@@ -158,6 +166,10 @@ def _broker_app(
             ext_dir.mkdir(parents=True, exist_ok=True)
             ext_path = ext_dir / "extensions.yaml"
             ext_path.write_text(extensions_yaml)
+
+        if block_state_dir:
+            # `ui.subproc_env` points SHED_HOST_AGENT_STATE_DIR here.
+            (runtime_dir / "host-agent-state").write_text("not a directory\n")
 
         if gen_ssh_key:
             ssh_dir = runtime_dir / ".ssh"
@@ -586,6 +598,424 @@ def test_respond_503_with_retry_after_is_resent():
         # send, which came before this point) has passed: a retry cannot merely be late.
         time.sleep(_RESPOND_DEADLINE_S + 0.5)
         assert len(mock.respond_identities("ssh-agent")) == 3, "a 403 is never re-sent"
+
+
+# ---------------------------------------------------------------------------
+# Cell (d1b) — credential sources (plan 035 §3.4): the source rows, "Use this
+# machine" over IPC and through the Preferences button, in embedded and external mode
+# ---------------------------------------------------------------------------
+
+# The machine the armed mock binds by default (`mockserver.NOT_SOURCE_ACTIVE`).
+OTHER_MACHINE = "fedcba9876543210fedcba9876543210"
+# A third machine that takes the source behind the app's back.
+LAB_MACHINE = "abcdefabcdefabcdefabcdefabcdef01"
+
+# The embedded broker's backoff after its fourth refusal (1, 2, 4, then 8 s; no
+# jitter): with no wake, the next subscribe lands exactly this long after it.
+_BACKOFF_AFTER_FOUR_S = 8.0
+# How soon after that fourth refusal the WOKEN subscribe must come. 2 s inside the
+# backoff at scale 1, and scaled with SHED_TAURI_TEST_TIMEOUT_SCALE for a loaded
+# machine — but never closer than 0.5 s to the backoff itself, where a wake and the
+# backoff could no longer be told apart (a larger scale cannot make the check vacuous).
+_WAKE_BUDGET_S = min(scaled_timeout(6.0), _BACKOFF_AFTER_FOUR_S - 0.5)
+
+
+def _source_row(client, host: str = "mock") -> dict:
+    return next(r for r in client.source_status()["rows"] if r["host"] == host)
+
+
+def _prefs_report(client) -> dict:
+    return client.prefs_dump().get("prefs") or {}
+
+
+def _prefs_source(client, host: str = "mock") -> dict | None:
+    for row in (_prefs_report(client).get("values") or {}).get("sources") or []:
+        if row["host"] == host:
+            return row
+    return None
+
+
+def _open_prefs(client) -> None:
+    client.show_preferences()
+    client.wait_until(lambda: client.prefs_dump()["visible"] and _prefs_report(client),
+                      timeout=20, what="preferences window visible + reported")
+
+
+def _machine_json(info) -> Path:
+    """Where the app reads this machine's identity: `ui.subproc_env` points
+    SHED_HOST_AGENT_STATE_DIR at `<runtime>/host-agent-state`."""
+    return Path(info["runtime_dir"]) / "host-agent-state" / "host-agent" / "machine.json"
+
+
+def test_not_source_until_use_this_machine_then_connected_at_once():
+    """Armed with another machine as the source, the embedded broker reads
+    `not-source` naming it and keeps retrying on its backoff. `source.use` sends THIS
+    machine's id (the one `broker.status` reports and every subscribe carried), wakes
+    the broker, and both namespaces connect with no relaunch — sooner than the backoff
+    the refusals had built up would have allowed."""
+    with _broker_app(discovery_mock=True, source={}) as (client, mock, _i):
+        client.wait_until(
+            lambda: (lambda st: _ns_row(st, "ssh-agent").get("state") == "not-source"
+                     and _ns_row(st, "docker-credentials").get("state") == "not-source")(
+                         client.broker_status()),
+            timeout=20, what="both namespaces not-source")
+        st = client.broker_status()
+        assert _ns_row(st, "ssh-agent")["active_source"] == {
+            "machine_id": OTHER_MACHINE, "machine_name": "desk"}, st
+        machine = st["machine"]
+        assert machine and len(machine["id"]) == 32, st
+        # It keeps retrying: four refusals, so the next backoff is 8 s.
+        client.wait_until(lambda: mock.subscribe_count("ssh-agent") >= 4,
+                          timeout=30, what="four not-source attempts")
+        for ident in mock.subscribe_identities("ssh-agent"):
+            assert ident == (machine["id"], machine["name"]), ident
+
+        status = client.source_status()
+        assert status["this_machine"] == {"id": machine["id"], "name": machine["name"]}, status
+        assert status["broker_mode"] == "embedded", status
+        row = _source_row(client)
+        assert row == {"host": "mock", "supported": True,
+                       "source": {"id": OTHER_MACHINE, "name": "desk"},
+                       "this_machine": False, "connected": True, "busy": False,
+                       "error": None}, row
+
+        before = mock.subscribe_times("ssh-agent")
+        used = client.source_use("mock")
+        assert mock.source_use_requests() == [{"machine_id": machine["id"]}]
+        assert used["woke_broker"] is True, used
+        assert used["row"]["this_machine"] is True, used
+        assert used["row"]["source"] == {"id": machine["id"], "name": machine["name"]}, used
+        assert mock.source_bound() == machine["id"]
+        client.wait_until(
+            lambda: (lambda st: _ns_row(st, "ssh-agent").get("state") == "connected"
+                     and _ns_row(st, "docker-credentials").get("state") == "connected")(
+                         client.broker_status()),
+            timeout=30, what="both namespaces connected after source.use")
+        st = client.broker_status()
+        assert "active_source" not in _ns_row(st, "ssh-agent"), st
+        # The accepted subscribe came well inside the 8 s the broker would otherwise
+        # have slept after its fourth refusal: the wake, not the backoff, brought it.
+        after = mock.subscribe_times("ssh-agent")[len(before):]
+        assert after, "no subscribe after the move"
+        assert after[0] - before[-1] < _WAKE_BUDGET_S, (_WAKE_BUDGET_S, before, after)
+        assert _source_row(client)["this_machine"] is True
+
+
+def test_preferences_source_row_flips_after_use_this_machine():
+    """Preferences shows one row per supporting server: the other machine's name with
+    a "Use this machine" button, and a line naming this machine. Pressing the REAL
+    button (its `data-source-use` element, clicked by the harness door) sends this
+    machine's id; the row then reads "this machine" and the broker connects."""
+    with _broker_app(discovery_mock=True, source={}) as (client, mock, _i):
+        client.wait_until(
+            lambda: _ns_row(client.broker_status(), "ssh-agent").get("state") == "not-source",
+            timeout=20, what="ssh-agent not-source")
+        machine = client.broker_status()["machine"]
+        _open_prefs(client)
+        client.wait_until(lambda: (_prefs_source(client) or {}).get("source_name") == "desk",
+                          timeout=20, what="the source row naming desk")
+        row = _prefs_source(client)
+        assert row["this_machine"] is False and row["can_use"] is True, row
+        assert row["busy"] is False and row["error"] is None, row
+        values = _prefs_report(client)["values"]
+        assert values["this_machine_name"] == machine["name"], values
+        assert values["this_machine_error"] is None, values
+        assert "broker" in _prefs_report(client)["sections"]
+
+        client.press_source_use("mock")
+        client.wait_until(lambda: mock.source_use_requests(),
+                          timeout=15, what="the button's move request")
+        assert mock.source_use_requests() == [{"machine_id": machine["id"]}]
+        client.wait_until(
+            lambda: (lambda r: r and r["this_machine"] and not r["busy"])(_prefs_source(client)),
+            timeout=15, what="the row flipped to this machine")
+        row = _prefs_source(client)
+        assert row["source_name"] == machine["name"], row
+        assert row["error"] is None, row
+        # No button where this machine already is the source, and none reported.
+        assert row["can_use"] is False, row
+        client.wait_until(
+            lambda: _ns_row(client.broker_status(), "ssh-agent").get("state") == "connected",
+            timeout=30, what="ssh-agent connected after the button")
+
+
+def test_unarmed_server_has_no_source_rows():
+    """A server older than the feature (the unarmed mock: a plain 404 on
+    `/api/sources`) is `supported: false` with no error, Preferences shows no source
+    row and no new section, and a move is refused as unsupported."""
+    with _broker_app(discovery_mock=True) as (client, mock, _i):
+        mock.wait_for_subscribe("ssh-agent")
+        status = client.source_status()
+        assert status["rows"] == [{"host": "mock", "supported": False, "source": None,
+                                   "this_machine": False, "connected": False,
+                                   "busy": False, "error": None}], status
+        assert status["this_machine"] is not None, status
+        with pytest.raises(ShedError) as e:
+            client.source_use("mock")
+        assert e.value.code == "unsupported", e.value
+        assert "does not support credential sources" in e.value.message
+        _open_prefs(client)
+        client.wait_until(lambda: "ssh" in (_prefs_report(client).get("sections") or []),
+                          timeout=20, what="the gated ssh section")
+        report = _prefs_report(client)
+        assert report["sections"] == ["general", "terminal", "broker", "ssh"], report
+        assert report["values"]["sources"] == [], report
+        assert report["values"]["this_machine_name"] is None, report
+
+
+def test_external_mode_rows_and_use_this_machine():
+    """External mode (a shed-host-agent daemon brokers; here the fake): the app still
+    shows the rows and moves the source, naming this machine by the identity file the
+    daemon shares. A machine the server has never seen is refused in plain words that
+    name the daemon, once; after its broker has reached the server the same move
+    works."""
+    fake = FakeHostAgent()
+    fake.start()
+    try:
+        with _broker_app(host_agent_socket=fake.socket_path, source={}) as (client, mock, info):
+            assert fake.wait_connected()
+            assert client.broker_status()["effective_mode"] == "external"
+            status = client.source_status()
+            me = status["this_machine"]
+            assert me and status["this_machine_error"] is None, status
+            on_disk = json.loads(_machine_json(info).read_text())
+            assert on_disk["id"] == me["id"] and on_disk["name"] == me["name"], on_disk
+            row = _source_row(client)
+            assert row["supported"] and row["source"]["name"] == "desk", row
+            assert row["this_machine"] is False, row
+
+            with pytest.raises(ShedError) as e:
+                client.source_use("mock")
+            assert e.value.code == "source_machine_not_found", e.value
+            assert e.value.message.startswith("mock has not seen this machine yet"), e.value
+            assert "shed-host-agent daemon" in e.value.message, e.value
+            assert mock.source_use_requests() == [{"machine_id": me["id"]}], "sent once"
+
+            # What the daemon's first subscribe does on the real server.
+            mock.know_machine(me["id"], me["name"])
+            used = client.source_use("mock")
+            assert used["woke_broker"] is False, used
+            assert used["row"]["this_machine"] is True, used
+            assert mock.source_use_requests()[-1] == {"machine_id": me["id"]}
+            _open_prefs(client)
+            client.wait_until(lambda: (_prefs_source(client) or {}).get("this_machine") is True,
+                              timeout=20, what="the Preferences row reads this machine")
+    finally:
+        fake.stop()
+
+
+def test_refused_moves_show_their_messages():
+    """A move the server refuses is reported in its words: a 403 under the
+    Preferences row (pressed through the real button, the row flips back), a 500 as
+    "could not confirm", an unknown server as a bad request — each one request, never
+    retried."""
+    with _broker_app(discovery_mock=True, source={}) as (client, mock, _i):
+        client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
+                          what="the source row")
+        mock.source_use_script([403, 500])
+        _open_prefs(client)
+        client.wait_until(lambda: (_prefs_source(client) or {}).get("can_use") is True,
+                          timeout=20, what="an enabled Use this machine button")
+        client.press_source_use("mock")
+        client.wait_until(lambda: (_prefs_source(client) or {}).get("error"),
+                          timeout=15, what="the refusal under the row")
+        row = _prefs_source(client)
+        assert "refused the move: a key marked script may not move the credential source" \
+            in row["error"], row
+        assert row["this_machine"] is False and row["busy"] is False, row
+        assert len(mock.source_use_requests()) == 1
+
+        with pytest.raises(ShedError) as e:
+            client.source_use("mock")
+        assert e.value.code == "action_failed", e.value
+        assert "could not confirm the move" in e.value.message, e.value
+        assert len(mock.source_use_requests()) == 2
+
+        with pytest.raises(ShedError) as e:
+            client.source_use("no-such-server")
+        assert e.value.code == "bad_request", e.value
+        assert len(mock.source_use_requests()) == 2
+        assert mock.source_bound() == OTHER_MACHINE
+
+
+def test_machine_name_with_control_and_bidi_characters_is_shown_cleaned():
+    """A machine name is text from another machine: its control and Unicode format
+    characters (a bell, a newline, a right-to-left override, a zero-width space) are
+    gone wherever it is shown — the source row, Preferences, and the broker's own
+    not-source status."""
+    dirty = "desk\N{RIGHT-TO-LEFT OVERRIDE}\u0007\n\N{ZERO WIDTH SPACE}evil"
+    with _broker_app(discovery_mock=True, source={"machine_name": dirty}) as (client, _m, _i):
+        client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
+                          what="the source row")
+        assert _source_row(client)["source"] == {"id": OTHER_MACHINE, "name": "deskevil"}
+        client.wait_until(
+            lambda: _ns_row(client.broker_status(), "ssh-agent").get("state") == "not-source",
+            timeout=20, what="ssh-agent not-source")
+        assert _ns_row(client.broker_status(), "ssh-agent")["active_source"]["machine_name"] \
+            == "deskevil"
+        _open_prefs(client)
+        client.wait_until(lambda: (_prefs_source(client) or {}).get("source_name") == "deskevil",
+                          timeout=20, what="the cleaned name in Preferences")
+
+
+def test_no_machine_identity_disables_use_this_machine():
+    """With no machine identity (the state dir cannot hold one) a move is refused
+    with the reason and nothing is sent, and Preferences disables the button and says
+    why."""
+    with _broker_app(discovery_mock=True, source={}, block_state_dir=True) as (client, mock, _i):
+        client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
+                          what="the source row")
+        status = client.source_status()
+        assert status["this_machine"] is None, status
+        assert status["this_machine_error"], status
+        with pytest.raises(ShedError) as e:
+            client.source_use("mock")
+        assert e.value.code == "machine_identity_unavailable", e.value
+        assert e.value.message.startswith("this machine has no identity"), e.value
+        assert mock.source_use_requests() == []
+        _open_prefs(client)
+        client.wait_until(lambda: _prefs_source(client) is not None,
+                          timeout=20, what="the source row in Preferences")
+        assert _prefs_source(client)["can_use"] is False
+        values = _prefs_report(client)["values"]
+        assert values["this_machine_error"] == status["this_machine_error"], values
+
+
+def _close_prefs(client) -> None:
+    client.prefs_close()
+    client.wait_until(lambda: not client.prefs_dump()["visible"],
+                      timeout=10, what="preferences window hidden")
+
+
+def _holds(pred, seconds: float, what: str) -> None:
+    """`pred` stays true for `seconds` (a stale answer must not land at any point)."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        assert pred(), f"no longer holds: {what}"
+        time.sleep(0.1)
+
+
+def test_busy_source_read_keeps_the_last_known_source_and_recovers():
+    """`503 SOURCE_BUSY` is transient. Over IPC: two busy answers are retried away
+    inside one read; busy on every ask is a `busy` row — supported, no error, the
+    source unknown rather than absent. In Preferences, reopened after another machine
+    took the source while the server is busy: the row keeps the source it last showed,
+    marked retrying (never "no source"), and the one later read brings the new one."""
+    with _broker_app(discovery_mock=True, source={}) as (client, mock, _i):
+        client.wait_until(lambda: _source_row(client)["supported"], timeout=20,
+                          what="the source row")
+        gets = mock.source_gets()
+        mock.source_busy(2, retry_after="0")
+        row = _source_row(client)
+        assert row["busy"] is False and row["source"]["name"] == "desk", row
+        assert mock.source_gets() - gets == 3, "two busy asks, then the answer"
+
+        mock.source_busy(3, retry_after="0")
+        row = _source_row(client)
+        assert row == {"host": "mock", "supported": True, "source": None,
+                       "this_machine": False, "connected": False, "busy": True,
+                       "error": None}, row
+
+        _open_prefs(client)
+        client.wait_until(lambda: (_prefs_source(client) or {}).get("source_name") == "desk",
+                          timeout=20, what="the source row naming desk")
+        _close_prefs(client)
+        mock.move_source(LAB_MACHINE, "lab")
+        mock.source_busy(3, retry_after="0")
+        client.show_preferences()
+        client.wait_until(lambda: (_prefs_source(client) or {}).get("retrying") is True,
+                          timeout=20, what="the row marked busy, retrying")
+        row = _prefs_source(client)
+        assert row["source_name"] == "desk", f"the last known source, never none: {row}"
+        assert row["error"] is None, row
+        client.wait_until(
+            lambda: (lambda r: r and r["source_name"] == "lab" and not r["retrying"])(
+                _prefs_source(client)),
+            timeout=20, what="the later read naming lab")
+
+
+def test_reopening_preferences_reads_a_source_taken_elsewhere():
+    """Closing Preferences only hides it, so a reopen must read the sources again:
+    this machine was the source when it closed, another machine took it meanwhile,
+    and the reopened window says so and offers the button again."""
+    with _broker_app(discovery_mock=True, source={}) as (client, mock, _i):
+        client.wait_until(
+            lambda: _ns_row(client.broker_status(), "ssh-agent").get("state") == "not-source",
+            timeout=20, what="ssh-agent not-source")
+        client.source_use("mock")
+        _open_prefs(client)
+        client.wait_until(lambda: (_prefs_source(client) or {}).get("this_machine") is True,
+                          timeout=20, what="the row reading this machine")
+        assert _prefs_source(client)["can_use"] is False
+        _close_prefs(client)
+        mock.move_source(OTHER_MACHINE, "desk")
+        client.show_preferences()
+        client.wait_until(
+            lambda: (lambda r: r and r["source_name"] == "desk" and not r["this_machine"]
+                     and r["can_use"])(_prefs_source(client)),
+            timeout=20, what="the reopened window naming desk with the button back")
+
+
+def test_a_read_overtaken_by_a_move_never_lands_over_it():
+    """A read the window started BEFORE a move, answered after the move's own answer
+    and read-back (the server took its document first), is older: it must not put
+    the other machine back on the row."""
+    with _broker_app(discovery_mock=True, source={}) as (client, mock, _i):
+        client.wait_until(
+            lambda: _ns_row(client.broker_status(), "ssh-agent").get("state") == "not-source",
+            timeout=20, what="ssh-agent not-source")
+        machine = client.broker_status()["machine"]
+        _open_prefs(client)
+        client.wait_until(lambda: (_prefs_source(client) or {}).get("can_use") is True,
+                          timeout=20, what="an enabled Use this machine button")
+        gets = mock.source_gets()
+        mock.source_reads_late(3.0)
+        # Any prefs change reloads the window: its source read is the late one.
+        prefs = client.prefs_get()
+        client.prefs_set_terminal(prefs["terminal_preset"], prefs.get("terminal_template"))
+        client.wait_until(lambda: mock.source_gets() > gets, timeout=10,
+                          what="the window's read reaching the server (desk)")
+        client.press_source_use("mock")
+        client.wait_until(
+            lambda: (lambda r: r and r["this_machine"] and not r["busy"])(_prefs_source(client)),
+            timeout=15, what="the move confirmed")
+        client.wait_until(lambda: mock.source_late_answered() >= 1, timeout=15,
+                          what="the overtaken read answered")
+        _holds(lambda: (_prefs_source(client) or {}).get("source_name") == machine["name"],
+               1.5, "the row still names this machine after the stale answer")
+
+
+def test_moves_on_two_servers_at_once_and_a_second_press_lands_nowhere(tmp_path):
+    """Two servers' buttons pressed back to back are both in flight at once (a move
+    on one server never disables another's); a second press on a row whose move is
+    in flight lands nowhere; both settle on this machine."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(CONFIG.read_text().replace(
+        "default_server: mock",
+        "    mock2:\n        host: 127.0.0.1\n        http_port: 8081\n"
+        "        ssh_port: 2222\ndefault_server: mock"))
+    with _broker_app(discovery_mock=True, source={}, shed_config_path=cfg) as (client, mock, _i):
+        client.wait_until(
+            lambda: _ns_row(client.broker_status(), "ssh-agent").get("state") == "not-source",
+            timeout=20, what="ssh-agent not-source")
+        _open_prefs(client)
+        both = ("mock", "mock2")
+        client.wait_until(
+            lambda: all((_prefs_source(client, h) or {}).get("can_use") for h in both),
+            timeout=20, what="both servers' buttons enabled")
+        mock.delay_source_use(1.5)
+        client.press_source_use("mock")
+        client.press_source_use("mock2")
+        client.wait_until(
+            lambda: all((_prefs_source(client, h) or {}).get("busy") for h in both),
+            timeout=5, what="both moves in flight at once")
+        client.press_source_use("mock")  # the row's move is in flight: no button
+        client.wait_until(
+            lambda: all((lambda r: r and r["this_machine"] and not r["busy"])(
+                _prefs_source(client, h)) for h in both),
+            timeout=20, what="both rows reading this machine")
+        assert len(mock.source_use_requests()) == 2, mock.source_use_requests()
+        assert not any(_prefs_source(client, h)["can_use"] for h in both)
 
 
 # ---------------------------------------------------------------------------

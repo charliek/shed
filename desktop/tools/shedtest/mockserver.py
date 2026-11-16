@@ -179,6 +179,42 @@ _RESPOND_REFUSALS: dict[int, dict] = {
     },
 }
 
+# Credential sources (plan 035 §3.4): `GET /api/sources` and `POST /api/sources/use`.
+# Unarmed (the default) the mock is a server older than the feature: both routes answer
+# chi's plain 404 for an unrouted path (labelled JSON by the server's middleware, no API
+# error body) and subscribes are served as before, so every cell that does not arm it is
+# unchanged. Armed (`arm_source`) it holds one binding: a subscribe whose machine id is
+# not the bound one is refused 403 SOURCE_NOT_BOUND naming the bound machine, a matching
+# one is served, and a move answers the document — the server's contract as the desktop
+# is built against it.
+_SOURCES_PATH = "/api/sources"
+_SOURCES_USE_PATH = "/api/sources/use"
+_PLAIN_404 = "404 page not found\n"
+# Used with `fullmatch` only: `$` also matches before a final newline, so an id with
+# one appended would pass a `match` (the real server refuses it 400).
+_MACHINE_ID_RE = re.compile(r"[0-9a-f]{32}")
+# The answers a scripted move (`source_use_script`) gives, by status.
+_SOURCE_USE_REFUSALS: dict[int, dict] = {
+    403: {"error": {"code": "FORBIDDEN",
+                    "message": "a key marked script may not move the credential source"}},
+    500: {"error": {"code": "SOURCE_MOVE_UNCONFIRMED",
+                    "message": "the move could not be confirmed"}},
+}
+
+
+def _not_source_body(machine_id: str, machine_name: str) -> dict:
+    """The 403 SOURCE_NOT_BOUND body naming the bound machine (the `_REFUSALS`
+    "not-source" shape, with this binding's machine in it)."""
+    return {
+        "error": {
+            "code": "SOURCE_NOT_BOUND",
+            "message": f'credential source for this server is "{machine_name}"; '
+            "run 'shed source use <this machine>' to move it",
+        },
+        "source": {"machine_id": machine_id, "machine_name": machine_name},
+    }
+
+
 # How often an idle SSE loop re-checks the shutdown flag while waiting to push
 # (matches synthetic_bus `_SSE_POLL`).
 _SSE_POLL = 0.1
@@ -230,10 +266,14 @@ class MockShedServer:
         # ns -> total subscribe attempts seen (latest-wins above loses the count of a
         # 409-terminal namespace never retrying vs. one that legitimately reconnects).
         self._bus_subscribe_counts: dict[str, int] = {}
-        # namespaces with a currently-LIVE SSE listener — a second concurrent subscribe
-        # gets 409 NAMESPACE_ALREADY_REGISTERED (the real server's one-listener-per-ns
-        # invariant), released on disconnect so a later cell can re-subscribe cleanly.
-        self._bus_live: set[str] = set()
+        # ns -> its currently-LIVE SSE listener `(token, machine id, end event)` — a
+        # second concurrent subscribe gets 409 NAMESPACE_ALREADY_REGISTERED (the real
+        # server's one-listener-per-ns invariant), released on disconnect so a later
+        # cell can re-subscribe cleanly. A source move releases the old machine's
+        # slots and sets their end events (its streams close), as the real server
+        # does; a stream's own release is by token, so it never frees a slot a newer
+        # listener holds.
+        self._bus_live: dict[str, tuple[object, str | None, threading.Event]] = {}
         # namespaces pre-registered as conflicting → their FIRST subscribe already 409s
         # (a competing listener owns them): the split-namespace 409 race cell.
         self._bus_conflict: set[str] = set()
@@ -251,6 +291,26 @@ class MockShedServer:
         self._bus_respond_identities: dict[str, list[tuple[str | None, str | None]]] = {}
         # ns -> the statuses its next responds answer first ([(status, retry_after)]).
         self._bus_respond_script: dict[str, list[tuple[int, str | None]]] = {}
+        # ns -> the monotonic time of each subscribe (what proves a woken retry came
+        # sooner than its backoff would have allowed).
+        self._bus_subscribe_times: dict[str, list[float]] = {}
+        # ---- credential sources (plan 035 §3.4); all under _bus_cond ----
+        self._src_armed = False
+        self._src_bound: str | None = None  # the bound machine's id
+        self._src_generation = 0
+        # id -> {"name", "first_seen", "connected" (None: its live slots decide)}
+        self._src_machines: dict[str, dict] = {}
+        self._src_use_requests: list[dict] = []  # every POST /api/sources/use body
+        self._src_use_script: list[int] = []  # statuses the next moves answer first
+        self._src_use_delay = 0.0  # seconds every move waits before it is applied
+        # The next GETs answer 503 SOURCE_BUSY (with this Retry-After) this many times.
+        self._src_busy_left = 0
+        self._src_busy_retry_after = "1"
+        # The next GETs that take their document on arrival and answer it this many
+        # seconds later (a read overtaken in transit), one entry per GET.
+        self._src_late_reads: list[float] = []
+        self._src_gets = 0  # GET /api/sources answered (busy and late ones included)
+        self._src_late_answered = 0  # late GETs whose (old) answer has been written
 
     @property
     def base_url(self) -> str:
@@ -397,6 +457,199 @@ class MockShedServer:
         with self._bus_cond:
             self._bus_respond_script[ns] = list(script)
 
+    # -- credential sources (plan 035 §3.4) --------------------------------
+    def arm_source(self, machine_id: str = NOT_SOURCE_ACTIVE["machine_id"],
+                   machine_name: str = NOT_SOURCE_ACTIVE["machine_name"],
+                   connected: bool = True) -> None:
+        """Become a pinning server whose binding names `machine_id` (shown as
+        `machine_name`, `connected` as given). Call before the app launches."""
+        assert _MACHINE_ID_RE.fullmatch(machine_id), machine_id
+        with self._bus_cond:
+            self._src_armed = True
+            self._src_bound = machine_id
+            self._src_generation = 1
+            self._src_machines[machine_id] = {
+                "name": machine_name, "first_seen": "2026-11-16T09:00:00Z",
+                "connected": connected}
+
+    def know_machine(self, machine_id: str, machine_name: str) -> None:
+        """Record a machine as seen for this user — what a subscribe from its broker
+        does on the real server (a move to an unseen machine is 404)."""
+        with self._bus_cond:
+            self._src_machines.setdefault(machine_id, {
+                "name": machine_name, "first_seen": "2026-11-16T09:30:00Z",
+                "connected": None})
+
+    def move_source(self, machine_id: str, machine_name: str) -> None:
+        """Another machine takes the source (what its `shed source use` does on the
+        real server): the binding moves, and this machine's streams end."""
+        assert _MACHINE_ID_RE.fullmatch(machine_id), machine_id
+        with self._bus_cond:
+            assert self._src_armed, "arm_source first"
+            self._src_machines.setdefault(machine_id, {
+                "name": machine_name, "first_seen": "2026-11-16T09:45:00Z",
+                "connected": True})
+            self._src_move_locked(machine_id)
+
+    def source_busy(self, times: int, retry_after: str = "1") -> None:
+        """Answer the next `times` source reads 503 SOURCE_BUSY with `Retry-After`."""
+        with self._bus_cond:
+            self._src_busy_left = times
+            self._src_busy_retry_after = retry_after
+
+    def source_reads_late(self, *delays: float) -> None:
+        """The next source reads each take the document as they arrive and answer it
+        `delay` seconds later — a read overtaken by newer ones in transit."""
+        with self._bus_cond:
+            self._src_late_reads = list(delays)
+
+    def source_gets(self) -> int:
+        with self._bus_cond:
+            return self._src_gets
+
+    def source_late_answered(self) -> int:
+        with self._bus_cond:
+            return self._src_late_answered
+
+    def delay_source_use(self, seconds: float) -> None:
+        """Every following move waits this long (outside the lock) before it is
+        applied — so two can be in flight at once."""
+        with self._bus_cond:
+            self._src_use_delay = seconds
+
+    def bus_live(self) -> dict[str, str | None]:
+        """ns -> the machine id holding its live slot."""
+        with self._bus_cond:
+            return {ns: mid for ns, (_t, mid, _e) in self._bus_live.items()}
+
+    def source_bound(self) -> str | None:
+        with self._bus_cond:
+            return self._src_bound
+
+    def source_use_requests(self) -> list[dict]:
+        """Every `POST /api/sources/use` body received, refused ones included."""
+        with self._bus_cond:
+            return [dict(b) for b in self._src_use_requests]
+
+    def source_use_script(self, statuses: list[int]) -> None:
+        """Answer the next moves with these statuses (pinned bodies) first."""
+        for status in statuses:
+            assert status in _SOURCE_USE_REFUSALS, f"no pinned body for {status}"
+        with self._bus_cond:
+            self._src_use_script = list(statuses)
+
+    def subscribe_times(self, ns: str) -> list[float]:
+        with self._bus_cond:
+            return list(self._bus_subscribe_times.get(ns, []))
+
+    def _src_document(self) -> dict:
+        """The GET/POST answer (caller holds _bus_cond)."""
+        binding = None
+        if self._src_bound is not None:
+            ref = [{"kind": "machine", "id": self._src_bound}]
+            binding = {"delivery": ref, "signing": list(ref),
+                       "bound_at": "2026-11-16T10:00:00Z", "bound_by": "mock-user",
+                       "generation": self._src_generation}
+        machines = []
+        for mid, m in self._src_machines.items():
+            held = sorted(ns for ns, (_t, live, _e) in self._bus_live.items() if live == mid)
+            connected = m["connected"]
+            if connected is None:
+                connected = bool(held)
+            machines.append({"id": mid, "name": m["name"], "key_fingerprint": "SHA256:mock",
+                             "first_seen": m["first_seen"], "connected": connected,
+                             "namespaces": held})
+        return {"user": "mock-user", "binding": binding, "machines": machines}
+
+    def _src_move_locked(self, mid: str) -> None:
+        """Bind `mid` (caller holds _bus_cond). As the real server's move: every slot
+        another machine holds is released and its stream told to end, so the new
+        source's subscribe is admitted and claims it, and the old machine's later
+        answers are refused (`_src_respond_refusal`)."""
+        if mid == self._src_bound:
+            return
+        self._src_bound = mid
+        self._src_generation += 1
+        for ns, (_t, live, end) in list(self._bus_live.items()):
+            if live != mid:
+                end.set()
+                del self._bus_live[ns]
+        self._bus_cond.notify_all()
+
+    def _src_get(self) -> tuple[str, object, float] | None:
+        """A read: None when unarmed (a plain 404), else `("busy", retry_after, 0)` or
+        `("doc", document, delay)` — the document as it stands NOW, to be answered
+        after `delay` seconds."""
+        with self._bus_cond:
+            if not self._src_armed:
+                return None
+            self._src_gets += 1
+            self._bus_cond.notify_all()
+            if self._src_busy_left > 0:
+                self._src_busy_left -= 1
+                return "busy", self._src_busy_retry_after, 0.0
+            delay = self._src_late_reads.pop(0) if self._src_late_reads else 0.0
+            return "doc", self._src_document(), delay
+
+    def _src_late_done(self) -> None:
+        with self._bus_cond:
+            self._src_late_answered += 1
+            self._bus_cond.notify_all()
+
+    def _src_use(self, body: dict) -> tuple[int, dict] | None:
+        """A move: (status, body), or None when unarmed (a plain 404)."""
+        with self._bus_cond:
+            if not self._src_armed:
+                return None
+            self._src_use_requests.append(dict(body))
+            self._bus_cond.notify_all()
+            delay = self._src_use_delay
+        if delay:
+            time.sleep(delay)
+        with self._bus_cond:
+            if self._src_use_script:
+                status = self._src_use_script.pop(0)
+                return status, _SOURCE_USE_REFUSALS[status]
+            mid = body.get("machine_id")
+            if not isinstance(mid, str) or not _MACHINE_ID_RE.fullmatch(mid):
+                return 400, {"error": {"code": "BAD_REQUEST",
+                                       "message": "machine_id must be 32 lowercase hex"}}
+            if mid not in self._src_machines:
+                return 404, {"error": {"code": "SOURCE_MACHINE_NOT_FOUND",
+                                       "message": "this server has not seen that machine"}}
+            self._src_move_locked(mid)
+            return 200, self._src_document()
+
+    def _src_admit(self, identity: tuple[str | None, str | None]) -> tuple[int, object] | None:
+        """The pin on a subscribe (caller holds _bus_cond): None to serve it, else the
+        refusal. Unarmed: always None."""
+        if not self._src_armed:
+            return None
+        mid, name = identity
+        if not mid:
+            return _REFUSALS["machine-id-required"]
+        if mid not in self._src_machines:
+            self._src_machines[mid] = {"name": name or "", "connected": None,
+                                       "first_seen": "2026-11-16T09:30:00Z"}
+        if mid != self._src_bound:
+            bound = self._src_machines.get(self._src_bound or "", {})
+            return 403, _not_source_body(self._src_bound or "", bound.get("name", ""))
+        return None
+
+    def _src_respond_refusal(self, identity: tuple[str | None, str | None]) -> tuple[int, dict] | None:
+        """The pin on a respond (caller holds _bus_cond): an armed mock accepts an
+        answer only from the bound machine — after a move the old machine's answers,
+        one in flight across the move included, are refused SOURCE_NOT_BOUND."""
+        if not self._src_armed:
+            return None
+        mid, _name = identity
+        if not mid:
+            return _REFUSALS["machine-id-required"]
+        if mid != self._src_bound:
+            bound = self._src_machines.get(self._src_bound or "", {})
+            return 403, _not_source_body(self._src_bound or "", bound.get("name", ""))
+        return None
+
     def subscribe_identities(self, ns: str) -> list[tuple[str | None, str | None]]:
         with self._bus_cond:
             return list(self._bus_subscribe_identities.get(ns, []))
@@ -467,36 +720,59 @@ class MockShedServer:
 
     def _bus_record_subscribe(
         self, ns: str, auth: str | None, identity: tuple[str | None, str | None]
-    ) -> str | None:
-        """Record a subscribe; return the refusal kind to answer it with (None: serve)."""
+    ) -> tuple[int, object] | None:
+        """Record a subscribe; return the refusal `(status, body)` to answer it with
+        (None: serve). An armed binding refuses first, then any `refuse(ns)`."""
         with self._bus_cond:
             self._bus_subscribed[ns] = auth
             self._bus_subscribe_counts[ns] = self._bus_subscribe_counts.get(ns, 0) + 1
             self._bus_subscribe_identities.setdefault(ns, []).append(identity)
+            self._bus_subscribe_times.setdefault(ns, []).append(time.monotonic())
             self._bus_cond.notify_all()
-            return self._bus_refuse.get(ns)
+            pinned = self._src_admit(identity)
+            if pinned is not None:
+                return pinned
+            kind = self._bus_refuse.get(ns)
+            return _REFUSALS[kind] if kind is not None else None
 
     def _bus_next_respond_answer(
         self, ns: str, identity: tuple[str | None, str | None]
-    ) -> tuple[int, str | None] | None:
+    ) -> tuple[int, object, str | None] | None:
+        """Record a respond; return `(status, body, retry_after)` to refuse it with
+        (None: accept). An armed binding refuses first, then the scripted answers."""
         with self._bus_cond:
             self._bus_respond_identities.setdefault(ns, []).append(identity)
             self._bus_cond.notify_all()
+            pinned = self._src_respond_refusal(identity)
+            if pinned is not None:
+                return pinned[0], pinned[1], None
             script = self._bus_respond_script.get(ns)
-            return script.pop(0) if script else None
+            if not script:
+                return None
+            status, retry_after = script.pop(0)
+            return status, _RESPOND_REFUSALS[status], retry_after
 
-    def _bus_try_claim(self, ns: str) -> bool:
-        """Claim `{ns}`'s single live-listener slot; False (→ 409) if it's a pre-marked
-        conflict or already has a live listener."""
+    def _bus_try_claim(self, ns: str, machine_id: str | None
+                       ) -> tuple[object, threading.Event] | None:
+        """Claim `{ns}`'s single live-listener slot for `machine_id`: its release token
+        and end event, or None (→ 409) if it's a pre-marked conflict or already has a
+        live listener."""
         with self._bus_cond:
             if ns in self._bus_conflict or ns in self._bus_live:
-                return False
-            self._bus_live.add(ns)
-            return True
+                return None
+            token, end = object(), threading.Event()
+            self._bus_live[ns] = (token, machine_id, end)
+            self._bus_cond.notify_all()
+            return token, end
 
-    def _bus_release(self, ns: str) -> None:
+    def _bus_release(self, ns: str, token: object) -> None:
+        """Release `{ns}`'s slot if `token` still holds it (a move may already have
+        released it, and a newer listener may hold it now)."""
         with self._bus_cond:
-            self._bus_live.discard(ns)
+            live = self._bus_live.get(ns)
+            if live is not None and live[0] is token:
+                del self._bus_live[ns]
+                self._bus_cond.notify_all()
 
     def _bus_record_response(self, ns: str, env: dict) -> None:
         with self._bus_cond:
@@ -551,6 +827,16 @@ class MockShedServer:
                 self.end_headers()
                 self.wfile.write(raw)
 
+            def _plain_404(self):
+                """What a shed-server older than a route answers: chi's NotFound text,
+                labelled JSON by the server's middleware — no API error body."""
+                raw = _PLAIN_404.encode()
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
             def _unauthorized(self) -> bool:
                 """A secure-server 401 for an unauthenticated /api request (the
                 mock's whole auth model: presented something, or did not)."""
@@ -581,6 +867,24 @@ class MockShedServer:
                 if m:
                     self._serve_sse(unquote(m.group(1)))
                     return
+                if path == _SOURCES_PATH:
+                    read = state._src_get()
+                    if read is None:
+                        self._plain_404()
+                    elif read[0] == "busy":
+                        self._send_raw(503, {"error": {
+                            "code": "SOURCE_BUSY",
+                            "message": "the credential source is being changed or saved "
+                                       "right now; retry in a moment"}},
+                            {"Retry-After": read[1]})
+                    else:
+                        _kind, doc, delay = read
+                        if delay:
+                            time.sleep(delay)
+                        self._send(200, doc)
+                        if delay:
+                            state._src_late_done()
+                    return
                 if self.path == "/api/sheds":
                     state._await_sheds_release()
                 info, sheds = state.snapshot()
@@ -609,21 +913,24 @@ class MockShedServer:
                 pre-marked conflict — terminal `rejected`, no retry) or hold a 200
                 `text/event-stream` and push queued request frames until teardown /
                 client disconnect."""
+                identity = self._identity()
                 refusal = state._bus_record_subscribe(
-                    ns, self.headers.get("Authorization"), self._identity())
+                    ns, self.headers.get("Authorization"), identity)
                 if refusal is not None:
-                    status, body = _REFUSALS[refusal]
+                    status, body = refusal
                     self._send_raw(status, body)
                     return
-                if not state._bus_try_claim(ns):
+                claim = state._bus_try_claim(ns, identity[0])
+                if claim is None:
                     # NAMESPACE_ALREADY_REGISTERED — a second listener is terminal.
                     self._send(409, {"error": "namespace already registered",
                                      "code": "NAMESPACE_ALREADY_REGISTERED"})
                     return
+                token, end = claim
                 try:
-                    self._stream_sse(state._bus_queue_for(ns))
+                    self._stream_sse(state._bus_queue_for(ns), end)
                 finally:
-                    state._bus_release(ns)
+                    state._bus_release(ns, token)
 
             def _serve_egress(self):
                 """The always-on egress-audit consumer route. Record the hit and 501
@@ -632,10 +939,10 @@ class MockShedServer:
                 state._bus_record_egress()
                 self._send(501, {"error": "egress unavailable"})
 
-            def _stream_sse(self, q):
+            def _stream_sse(self, q, end: threading.Event):
                 """Send the 200 SSE handshake, then hold the connection and drain `q`,
                 writing each frame as a `data:` line, until shutdown / a `None` sentinel
-                / client disconnect."""
+                / client disconnect / `end` (a source move closed this stream)."""
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -646,7 +953,7 @@ class MockShedServer:
                     return
                 state._bus_register_sse_thread()
                 try:
-                    while not state._bus_shutdown.is_set():
+                    while not state._bus_shutdown.is_set() and not end.is_set():
                         try:
                             frame = q.get(timeout=_SSE_POLL)
                         except queue.Empty:
@@ -670,11 +977,11 @@ class MockShedServer:
                 except ValueError:
                     self._send(400, {"error": "bad response body"})
                     return
-                scripted = state._bus_next_respond_answer(ns, self._identity())
-                if scripted is not None:
-                    status, retry_after = scripted
+                refused = state._bus_next_respond_answer(ns, self._identity())
+                if refused is not None:
+                    status, refusal, retry_after = refused
                     self._send_raw(
-                        status, _RESPOND_REFUSALS[status],
+                        status, refusal,
                         {"Retry-After": retry_after} if retry_after is not None else None)
                     return
                 state._bus_record_response(ns, env)
@@ -691,6 +998,17 @@ class MockShedServer:
                 m = _RESPOND_RE.match(path)
                 if m:
                     self._serve_respond(unquote(m.group(1)))
+                    return
+                if path == _SOURCES_USE_PATH:
+                    try:
+                        body = self._body()
+                    except ValueError:
+                        body = {}
+                    answer = state._src_use(body if isinstance(body, dict) else {})
+                    if answer is None:
+                        self._plain_404()
+                    else:
+                        self._send(*answer)
                     return
                 parts = self.path.strip("/").split("/")  # api/sheds[/name/action]
                 if self.path == "/api/sheds":

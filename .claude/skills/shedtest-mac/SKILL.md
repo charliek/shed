@@ -114,6 +114,14 @@ holds.
   shown under the harness — the gate is exercised through the fake host-agent and the
   in-process broker. The native `LAContext` error mapping is covered by the Tauri crate's unit tests
   (`approval.rs`, macOS-only).
+- **Credential sources** (`test_tauri_broker.py`, the "(d1b)" cells, plan 035 §3.4): the
+  Preferences source rows and "Use this machine", driven through `source.status`/`source.use`
+  and the test-mode `ui.press_source_use {host}` door (the window clicks its own
+  `button[data-source-use]`), against the mock armed with `arm_source`. Nothing here is
+  macOS-specific, but the machine identity file lives under the harness's
+  `SHED_HOST_AGENT_STATE_DIR` (`<runtime>/host-agent-state`), never `~/Library/Application
+  Support/shed` — a run that finds a real `machine.json` there has lost its hermeticity. The
+  shedtest-linux skill has the op and mock details.
 
 ## The bundle + DMG (the shipped artifact)
 

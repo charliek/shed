@@ -27,7 +27,7 @@ use thiserror::Error;
 
 use crate::models::{
     CreateShedRequest, EgressProfileInfo, ImageList, Overview, ServerInfo, SessionsResponse, Shed,
-    ShedImage, ShedList, SystemDiskUsage,
+    ShedImage, ShedList, SourceDocument, SystemDiskUsage,
 };
 use crate::sse::SseParser;
 use crate::token::{ControlTokenProvider, TokenMinter};
@@ -54,6 +54,140 @@ pub enum ShedError {
     /// consumer truncates the context, never the action.
     #[error("upgrade shed-host-agent — it is too old to obtain a client certificate for {server} ({detail})")]
     AgentUpgradeRequired { server: String, detail: String },
+}
+
+/// Why a credential-source call (`GET /api/sources`, `POST /api/sources/use`) did not
+/// answer with the source document (plan 035 §3.4). Its own type, not new [`ShedError`]
+/// variants, so no existing match over `ShedError` (here, in the desktop, in
+/// shed-mobile) has to learn a case it never sees.
+#[derive(Debug, Error)]
+pub enum SourceError {
+    /// The server predates credential sources: the route answered a plain 404 with no
+    /// API error body. Such a server has nothing to show and nothing to move.
+    #[error("this server does not support credential sources")]
+    Unsupported,
+    /// The server refused with its API error body. `code` and `message` are the
+    /// server's, already cleaned for display ([`crate::models::display_source_text`]).
+    #[error("{message} ({code}, HTTP {status})")]
+    Api {
+        status: u16,
+        code: String,
+        message: String,
+    },
+    /// `503 SOURCE_BUSY`: the read waited behind a move or a save of the user's records
+    /// and gave up rather than answer a view that mixes the two. Transient, never "no
+    /// source": [`Client::source_status`] has already retried it
+    /// ([`SOURCE_BUSY_ATTEMPTS`]), so whoever shows it keeps what it last knew and reads
+    /// again later. `retry_after` is the server's `Retry-After`, capped
+    /// ([`SOURCE_BUSY_DELAY_CAP`]).
+    #[error("{message} ({SOURCE_BUSY}, retrying)")]
+    Busy {
+        retry_after: Option<Duration>,
+        message: String,
+    },
+    /// Anything else: the transport, an auth failure, a status with no API error body,
+    /// a 2xx body that is not a document.
+    #[error(transparent)]
+    Shed(#[from] ShedError),
+}
+
+/// The API error code for a machine the server has never seen for this user: its broker
+/// has not tried to subscribe to that server yet.
+pub const SOURCE_MACHINE_NOT_FOUND: &str = "SOURCE_MACHINE_NOT_FOUND";
+
+/// The API error code of a read that waited too long behind a move or a save (503, with
+/// `Retry-After`): transient, see [`SourceError::Busy`].
+pub const SOURCE_BUSY: &str = "SOURCE_BUSY";
+
+/// The most of an error body a source call reads: the server's are a few hundred bytes.
+/// Enforced while reading; the rest is left unread.
+const SOURCE_ERROR_BODY_MAX: usize = 4096;
+/// The most of a source document a source call reads. A real one is a few hundred bytes
+/// per machine; anything past this is refused while reading, never buffered whole.
+pub const SOURCE_DOCUMENT_MAX: usize = 256 * 1024;
+/// The most of a server's error message a source call keeps.
+const SOURCE_MESSAGE_MAX_BYTES: usize = 300;
+/// The most of a decode failure's text a source call keeps: serde quotes the offending
+/// input, which can be as long as the document.
+const SOURCE_DECODE_ERROR_MAX_BYTES: usize = 200;
+/// How many times [`Client::source_status`] asks while the server answers
+/// [`SOURCE_BUSY`] (the first ask included).
+pub const SOURCE_BUSY_ATTEMPTS: usize = 3;
+/// The longest a busy read waits before asking again, whatever `Retry-After` says.
+pub const SOURCE_BUSY_DELAY_CAP: Duration = Duration::from_secs(2);
+/// The wait before asking again when a busy answer carries no usable `Retry-After`.
+const SOURCE_BUSY_DELAY_DEFAULT: Duration = Duration::from_secs(1);
+
+/// A `Retry-After` in whole seconds (the only form the server sends), capped at
+/// [`SOURCE_BUSY_DELAY_CAP`]; anything else (an HTTP date, garbage) is `None`.
+fn source_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
+    let secs: u64 = value?.to_str().ok()?.trim().parse().ok()?;
+    Some(Duration::from_secs(secs).min(SOURCE_BUSY_DELAY_CAP))
+}
+
+/// How long to wait before asking again after a busy answer.
+fn source_busy_delay(retry_after: Option<Duration>) -> Duration {
+    retry_after
+        .unwrap_or(SOURCE_BUSY_DELAY_DEFAULT)
+        .min(SOURCE_BUSY_DELAY_CAP)
+}
+
+/// Read a non-2xx answer to a source call: the server's API error when the body is one
+/// (`{"error":{"code":"…","message":"…"}}` with a non-empty code), else `None`.
+fn source_api_error(body: &[u8]) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let err = v.get("error")?.as_object()?;
+    let code = err.get("code")?.as_str()?;
+    let code = crate::models::display_source_text(code, crate::models::SOURCE_TEXT_MAX_BYTES);
+    if code.is_empty() {
+        return None;
+    }
+    let message = err
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(|m| crate::models::display_source_text(m, SOURCE_MESSAGE_MAX_BYTES))
+        .unwrap_or_default();
+    Some((code, message))
+}
+
+/// Classify an answer to a source call (see [`Client::source_status`]).
+fn source_answer(answer: SourceAnswer) -> Result<SourceDocument, SourceError> {
+    let SourceAnswer {
+        status,
+        retry_after,
+        body,
+    } = answer;
+    if (200..300).contains(&status) {
+        // Bounded: serde's message quotes the input it choked on, and a 200 whose body
+        // is one huge string would otherwise carry all of it to the UI.
+        return serde_json::from_slice(&body).map_err(|e| {
+            SourceError::Shed(ShedError::Decode(crate::models::display_source_text(
+                &e.to_string(),
+                SOURCE_DECODE_ERROR_MAX_BYTES,
+            )))
+        });
+    }
+    match source_api_error(&body) {
+        Some((code, message)) if status == 503 && code == SOURCE_BUSY => Err(SourceError::Busy {
+            retry_after,
+            message,
+        }),
+        Some((code, message)) => Err(SourceError::Api {
+            status,
+            code,
+            message,
+        }),
+        None if status == 404 => Err(SourceError::Unsupported),
+        None => Err(SourceError::Shed(ShedError::BadStatus(status))),
+    }
+}
+
+/// One answer to a source call, read within its bounds ([`Client::request_with_status`]).
+struct SourceAnswer {
+    status: u16,
+    /// `Retry-After`, whole seconds, capped ([`source_retry_after`]).
+    retry_after: Option<Duration>,
+    body: Vec<u8>,
 }
 
 const GET_TIMEOUT: Duration = Duration::from_secs(8);
@@ -811,6 +945,59 @@ impl Client {
             .to_vec())
     }
 
+    /// [`Self::request`] for a route whose ERROR bodies carry meaning: the status, its
+    /// `Retry-After` and the body whatever the status. Both bodies are bounded WHILE
+    /// READING: a non-2xx body is read to at most `max_error_body` bytes (the rest is
+    /// left unread), and a 2xx body past `max_body` is refused (a decode error) as soon
+    /// as it is known to be, from its `Content-Length` or from the bytes read so far.
+    /// The same re-auth path and the same bound.
+    async fn request_with_status(
+        &self,
+        method: reqwest::Method,
+        url: &reqwest::Url,
+        timeout: Duration,
+        body: Option<&serde_json::Value>,
+        max_body: usize,
+        max_error_body: usize,
+    ) -> Result<SourceAnswer, ShedError> {
+        let sent = self
+            .send_resolved(timeout, |http| {
+                let mut req = http.request(method.clone(), url.clone()).timeout(timeout);
+                if let Some(b) = body {
+                    req = req.json(b);
+                }
+                req
+            })
+            .await?;
+        let mut resp = sent.resp;
+        let status = resp.status().as_u16();
+        let retry_after = source_retry_after(resp.headers().get(reqwest::header::RETRY_AFTER));
+        let flatten = |e: reqwest::Error| ShedError::Transport(crate::authfail::flatten(&e));
+        let success = (200..300).contains(&status);
+        let cap = if success { max_body } else { max_error_body };
+        let too_large = || ShedError::Decode(format!("the answer is larger than {max_body} bytes"));
+        if success && resp.content_length().is_some_and(|n| n > cap as u64) {
+            return Err(too_large());
+        }
+        let mut out = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(flatten)? {
+            let room = cap - out.len();
+            if chunk.len() > room {
+                if success {
+                    return Err(too_large());
+                }
+                out.extend_from_slice(&chunk[..room]);
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(SourceAnswer {
+            status,
+            retry_after,
+            body: out,
+        })
+    }
+
     /// GET the segment-built URL ([`Self::build_url`]) and decode JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
@@ -866,6 +1053,74 @@ impl Client {
     /// `GET /api/egress/profiles`.
     pub async fn egress_profiles(&self) -> Result<Vec<EgressProfileInfo>, ShedError> {
         self.get_json(&["api", "egress", "profiles"], &[]).await
+    }
+
+    /// `GET /api/sources` — which machine answers credential requests for the caller's
+    /// user on this server, and every machine the server has seen for that user (plan
+    /// 035 §3.4). Sent with this client's ordinary control-scope credential.
+    ///
+    /// A server older than the route answers a plain 404 (no API error body):
+    /// [`SourceError::Unsupported`]. A 404 that carries an API error is the server's
+    /// refusal ([`SourceError::Api`]), never "unsupported".
+    ///
+    /// `503 SOURCE_BUSY` (the read waited behind a move or a save) is transient: it is
+    /// asked again, after the server's `Retry-After` (whole seconds, capped at
+    /// [`SOURCE_BUSY_DELAY_CAP`]), up to [`SOURCE_BUSY_ATTEMPTS`] asks in all, and only
+    /// then answered as [`SourceError::Busy`]. A 503 with any other code is not retried.
+    pub async fn source_status(&self) -> Result<SourceDocument, SourceError> {
+        let url = self.build_url(&["api", "sources"], &[])?;
+        let mut attempt = 1;
+        loop {
+            let answer = self
+                .request_with_status(
+                    reqwest::Method::GET,
+                    &url,
+                    GET_TIMEOUT,
+                    None,
+                    SOURCE_DOCUMENT_MAX,
+                    SOURCE_ERROR_BODY_MAX,
+                )
+                .await?;
+            match source_answer(answer) {
+                Err(SourceError::Busy { retry_after, .. }) if attempt < SOURCE_BUSY_ATTEMPTS => {
+                    attempt += 1;
+                    tokio::time::sleep(source_busy_delay(retry_after)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// `POST /api/sources/use` with `{"machine_id": …}` — make that machine the one that
+    /// answers for the caller's user on this server; answers the document after the
+    /// move. `machine_id` must be a machine id (32 lowercase hex); anything else is
+    /// refused here, before any request. The server answers 404
+    /// [`SOURCE_MACHINE_NOT_FOUND`] for a machine whose broker has never tried to
+    /// subscribe to it, 400 for a malformed id, 403 for a caller that may not move the
+    /// source, and 500 when it could not confirm the move.
+    pub async fn source_use(&self, machine_id: &str) -> Result<SourceDocument, SourceError> {
+        if !crate::models::valid_machine_id(machine_id) {
+            return Err(SourceError::Shed(ShedError::Config(format!(
+                "not a machine id (want 32 lowercase hex characters): {:?}",
+                crate::models::display_source_text(
+                    machine_id,
+                    crate::models::SOURCE_TEXT_MAX_BYTES
+                )
+            ))));
+        }
+        let url = self.build_url(&["api", "sources", "use"], &[])?;
+        let body = serde_json::json!({ "machine_id": machine_id });
+        let answer = self
+            .request_with_status(
+                reqwest::Method::POST,
+                &url,
+                WRITE_TIMEOUT,
+                Some(&body),
+                SOURCE_DOCUMENT_MAX,
+                SOURCE_ERROR_BODY_MAX,
+            )
+            .await?;
+        source_answer(answer)
     }
 
     // Path-building note: every method below hands `shed`/`session`/`slug`
@@ -1106,6 +1361,379 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    // ---- credential sources (plan 035 §3.4) ----
+
+    const THIS_ID: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER_ID: &str = "fedcba9876543210fedcba9876543210";
+
+    fn source_doc(source: &str) -> String {
+        format!(
+            r#"{{"user":"ada","binding":{{"delivery":[{{"kind":"machine","id":"{source}"}}],
+                 "signing":[{{"kind":"machine","id":"{source}"}}],
+                 "bound_at":"2026-11-16T10:00:00Z","bound_by":"ada","generation":2}},
+                 "machines":[{{"id":"{source}","name":"desk","key_fingerprint":"SHA256:x",
+                 "first_seen":"2026-11-16T09:00:00Z","connected":true,"namespaces":["ssh-agent"]}}]}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn source_status_decodes_the_document() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(200).body(source_doc(OTHER_ID));
+            })
+            .await;
+        let doc = client(&server).source_status().await.unwrap();
+        assert_eq!(doc.source_machine_id(), Some(OTHER_ID));
+        assert_eq!(doc.machine(OTHER_ID).unwrap().name, "desk");
+    }
+
+    /// An older server: chi's plain-text 404 for an unrouted path (labelled JSON by the
+    /// server's middleware) — or any 404 whose body is not an API error — is
+    /// "unsupported", never an error row.
+    #[tokio::test]
+    async fn source_status_plain_404_is_unsupported() {
+        for body in ["404 page not found\n", r#"{"error":"not found"}"#, ""] {
+            let server = MockServer::start_async().await;
+            server
+                .mock_async(|w, t| {
+                    w.method(GET).path("/api/sources");
+                    t.status(404)
+                        .header("content-type", "application/json")
+                        .body(body);
+                })
+                .await;
+            let e = client(&server).source_status().await.unwrap_err();
+            assert!(matches!(e, SourceError::Unsupported), "{body:?}: {e:?}");
+        }
+    }
+
+    /// A refusal carries the server's code and message, cleaned; a 404 WITH an API
+    /// error is that refusal, not "unsupported"; a status with no API body stays a
+    /// plain status.
+    #[tokio::test]
+    async fn source_status_refusals_keep_the_servers_code_and_message() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(403).body(
+                    "{\"error\":{\"code\":\"FORBIDDEN\",\"message\":\"a script key\\u0007 may not\\u202e\"}}",
+                );
+            })
+            .await;
+        match client(&server).source_status().await.unwrap_err() {
+            SourceError::Api {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(status, 403);
+                assert_eq!(code, "FORBIDDEN");
+                assert_eq!(message, "a script key may not");
+            }
+            e => panic!("want Api, got {e:?}"),
+        }
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(500).body("boom");
+            })
+            .await;
+        let e = client(&server).source_status().await.unwrap_err();
+        assert!(
+            matches!(e, SourceError::Shed(ShedError::BadStatus(500))),
+            "{e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_use_sends_the_machine_id_and_decodes_the_move() {
+        let server = MockServer::start_async().await;
+        let moved = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sources/use")
+                    .json_body(serde_json::json!({ "machine_id": THIS_ID }));
+                t.status(200).body(source_doc(THIS_ID));
+            })
+            .await;
+        let doc = client(&server).source_use(THIS_ID).await.unwrap();
+        moved.assert_async().await;
+        assert_eq!(doc.source_machine_id(), Some(THIS_ID));
+    }
+
+    #[tokio::test]
+    async fn source_use_machine_not_found_is_the_servers_refusal() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sources/use");
+                t.status(404).body(
+                    r#"{"error":{"code":"SOURCE_MACHINE_NOT_FOUND","message":"no such machine for this user"}}"#,
+                );
+            })
+            .await;
+        match client(&server).source_use(THIS_ID).await.unwrap_err() {
+            SourceError::Api { status, code, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(code, SOURCE_MACHINE_NOT_FOUND);
+            }
+            e => panic!("want Api, got {e:?}"),
+        }
+    }
+
+    /// A malformed id is refused before anything is sent.
+    #[tokio::test]
+    async fn source_use_refuses_a_malformed_id_without_a_request() {
+        let server = MockServer::start_async().await;
+        let any = server
+            .mock_async(|w, t| {
+                w.path_contains("/api/");
+                t.status(200);
+            })
+            .await;
+        for bad in ["", "XYZ", &THIS_ID.to_uppercase(), &format!("{THIS_ID}0")] {
+            let e = client(&server).source_use(bad).await.unwrap_err();
+            assert!(
+                matches!(e, SourceError::Shed(ShedError::Config(_))),
+                "{bad:?}: {e:?}"
+            );
+        }
+        any.assert_hits_async(0).await;
+    }
+
+    /// A scripted HTTP/1.1 server on a raw socket, for the answers httpmock cannot give
+    /// (a body that never ends, a sequence of different answers to one route). Each
+    /// accepted connection reads one request head and is answered by the next script
+    /// entry: `Some(bytes)` written whole then closed, `None` a 200 whose chunked body
+    /// streams until the client goes away. Returns the base URL and the request count.
+    async fn scripted_server(
+        script: Vec<Option<Vec<u8>>>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            let mut script = script.into_iter();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if sock.read(&mut byte).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                match script.next() {
+                    Some(Some(answer)) => {
+                        let _ = sock.write_all(&answer).await;
+                        let _ = sock.shutdown().await;
+                    }
+                    Some(None) => {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                  transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                        let chunk = format!("4000\r\n{}\r\n", " ".repeat(0x4000));
+                        while sock.write_all(chunk.as_bytes()).await.is_ok() {}
+                    }
+                    None => return,
+                }
+            }
+        });
+        (base, count)
+    }
+
+    fn answer(status: &str, headers: &str, body: &str) -> Option<Vec<u8>> {
+        Some(
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{headers}\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        )
+    }
+
+    fn client_at(base: String) -> Client {
+        Client::new(base, "mini2".to_string(), String::new(), None, None).unwrap()
+    }
+
+    const BUSY_BODY: &str = r#"{"error":{"code":"SOURCE_BUSY","message":"being saved"}}"#;
+
+    /// A 200 that never ends is refused once it passes the cap, while reading — not
+    /// buffered whole, and not left to the request timeout.
+    #[tokio::test]
+    async fn source_status_refuses_an_endless_document_while_reading() {
+        let (base, _) = scripted_server(vec![None]).await;
+        let e = tokio::time::timeout(Duration::from_secs(5), client_at(base).source_status())
+            .await
+            .expect("the read must stop at the cap, not run to the request timeout")
+            .unwrap_err();
+        match e {
+            SourceError::Shed(ShedError::Decode(m)) => {
+                assert!(m.contains("larger than"), "{m}")
+            }
+            e => panic!("want a too-large decode error, got {e:?}"),
+        }
+    }
+
+    /// A 200 whose Content-Length is past the cap is refused before its body is read.
+    #[tokio::test]
+    async fn source_status_refuses_a_document_past_the_cap() {
+        let server = MockServer::start_async().await;
+        let big = format!(r#"{{"user":"{}"}}"#, "x".repeat(SOURCE_DOCUMENT_MAX));
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(200).body(big);
+            })
+            .await;
+        match client(&server).source_status().await.unwrap_err() {
+            SourceError::Shed(ShedError::Decode(m)) => assert!(m.contains("larger than"), "{m}"),
+            e => panic!("want a too-large decode error, got {e:?}"),
+        }
+    }
+
+    /// A 200 that is one huge JSON string fails to decode, and the failure's text —
+    /// which serde makes by quoting the input — stays short.
+    #[tokio::test]
+    async fn a_decode_failure_quotes_a_bounded_amount() {
+        let server = MockServer::start_async().await;
+        let huge = format!("\"{}\"", "y".repeat(100_000));
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(200).body(huge);
+            })
+            .await;
+        let e = client(&server).source_status().await.unwrap_err();
+        let text = e.to_string();
+        assert!(
+            matches!(e, SourceError::Shed(ShedError::Decode(_))),
+            "{e:?}"
+        );
+        assert!(text.len() < 300, "{} bytes: {text:.120}", text.len());
+    }
+
+    /// An error body that never ends is read to its cap and no further.
+    #[tokio::test]
+    async fn an_endless_error_body_is_read_to_its_cap() {
+        let mut head = b"HTTP/1.1 500 Internal Server Error\r\ntransfer-encoding: chunked\r\n\
+                         connection: close\r\n\r\n"
+            .to_vec();
+        // One chunk far past the cap, then a well-formed end: the client keeps none
+        // of it past the cap and still answers the plain status.
+        let chunk = "z".repeat(64 * 1024);
+        head.extend_from_slice(format!("{:x}\r\n{chunk}\r\n0\r\n\r\n", chunk.len()).as_bytes());
+        let (base, _) = scripted_server(vec![Some(head)]).await;
+        let e = tokio::time::timeout(Duration::from_secs(5), client_at(base).source_status())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(e, SourceError::Shed(ShedError::BadStatus(500))),
+            "{e:?}"
+        );
+    }
+
+    /// `503 SOURCE_BUSY` is asked again after its Retry-After, and a later answer wins.
+    #[tokio::test]
+    async fn a_busy_read_is_retried_and_recovers() {
+        let (base, count) = scripted_server(vec![
+            answer("503 Service Unavailable", "retry-after: 0\r\n", BUSY_BODY),
+            answer("200 OK", "", &source_doc(OTHER_ID)),
+        ])
+        .await;
+        let doc = client_at(base).source_status().await.unwrap();
+        assert_eq!(doc.source_machine_id(), Some(OTHER_ID));
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    /// Still busy after every ask: [`SourceError::Busy`], after exactly
+    /// [`SOURCE_BUSY_ATTEMPTS`] asks — never "no source", never an endless loop.
+    #[tokio::test]
+    async fn a_read_still_busy_is_reported_busy_after_bounded_asks() {
+        let busy = answer("503 Service Unavailable", "retry-after: 0\r\n", BUSY_BODY);
+        let (base, count) = scripted_server(vec![busy; SOURCE_BUSY_ATTEMPTS + 2]).await;
+        match client_at(base).source_status().await.unwrap_err() {
+            SourceError::Busy {
+                retry_after,
+                message,
+            } => {
+                assert_eq!(retry_after, Some(Duration::ZERO));
+                assert_eq!(message, "being saved");
+            }
+            e => panic!("want Busy, got {e:?}"),
+        }
+        assert_eq!(count.load(Ordering::SeqCst), SOURCE_BUSY_ATTEMPTS);
+    }
+
+    /// The wait honours Retry-After's whole seconds.
+    #[tokio::test]
+    async fn a_busy_read_waits_its_retry_after() {
+        let (base, _) = scripted_server(vec![
+            answer("503 Service Unavailable", "retry-after: 1\r\n", BUSY_BODY),
+            answer("200 OK", "", &source_doc(OTHER_ID)),
+        ])
+        .await;
+        let started = std::time::Instant::now();
+        client_at(base).source_status().await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(950),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A 503 with another code is today's ordinary refusal: asked once, not busy.
+    #[tokio::test]
+    async fn a_503_without_source_busy_is_not_retried() {
+        let (base, count) = scripted_server(vec![
+            answer(
+                "503 Service Unavailable",
+                "retry-after: 0\r\n",
+                r#"{"error":{"code":"PLUGINS_DISABLED","message":"no bus"}}"#,
+            ),
+            answer("200 OK", "", &source_doc(OTHER_ID)),
+        ])
+        .await;
+        match client_at(base).source_status().await.unwrap_err() {
+            SourceError::Api { status, code, .. } => {
+                assert_eq!((status, code.as_str()), (503, "PLUGINS_DISABLED"));
+            }
+            e => panic!("want Api, got {e:?}"),
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Retry-After is whole seconds, capped; anything else is not a delay.
+    #[test]
+    fn retry_after_is_whole_seconds_and_capped() {
+        use reqwest::header::HeaderValue;
+        let ra = |v: &str| source_retry_after(Some(&HeaderValue::from_str(v).unwrap()));
+        assert_eq!(ra("1"), Some(Duration::from_secs(1)));
+        assert_eq!(ra(" 0 "), Some(Duration::ZERO));
+        assert_eq!(ra("3600"), Some(SOURCE_BUSY_DELAY_CAP));
+        assert_eq!(ra("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(ra("-1"), None);
+        assert_eq!(source_retry_after(None), None);
+        assert_eq!(source_busy_delay(None), SOURCE_BUSY_DELAY_DEFAULT);
+        assert_eq!(
+            source_busy_delay(Some(Duration::from_secs(60))),
+            SOURCE_BUSY_DELAY_CAP
+        );
     }
 
     #[tokio::test]

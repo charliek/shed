@@ -134,7 +134,9 @@ Test pointers:
   round-trip via the mock server's plugin-bus endpoints, split-namespace `409`,
   malformed-config fail-closed, the synthesized fresh-install namespace set, and the
   plan 035 machine pin: `not-source` then accepted, `duplicate`, other 403s, the respond
-  `503` retry).
+  `503` retry; and the credential-source rows: `source.status`/`source.use`, the
+  Preferences "Use this machine" button via the test-mode `ui.press_source_use` door, in
+  embedded and external mode, against the mock's `arm_source` binding).
 - The mock server's plugin-bus routes live in `desktop/tools/shedtest/mockserver.py`
   (`GET /api/plugins/listeners/{ns}/messages` SSE + `POST
   /api/plugins/listeners/{ns}/respond`), shape-pinned against

@@ -1058,6 +1058,15 @@ impl EmbeddedHostAgent {
     }
 }
 
+/// This machine's identity (plan 035 §3.4): the one the `shed-host-agent` daemon and the
+/// embedded broker present, read from the file they share
+/// (`<state>/host-agent/machine.json`, created on first use) — so an embedder knows the
+/// id whichever of them is brokering, the daemon included. Blocking file I/O under an
+/// advisory lock: call it off an async worker. `Err` says why there is none.
+pub fn machine_identity() -> Result<MachineIdentity, String> {
+    broker_machine::load_or_create().map(|loaded| loaded.identity)
+}
+
 /// Log how the machine identity was obtained (the daemon's lines, word for word, so one
 /// grep finds either) and reduce the outcome to the identity or why there is none.
 fn log_machine_identity(

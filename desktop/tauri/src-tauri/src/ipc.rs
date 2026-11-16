@@ -449,6 +449,24 @@ fn craze_create_door(
     }
 }
 
+/// The gate + reader behind `ui.press_source_use {host}` (plan 035 §3.4): the payload
+/// to emit, or the refusal.
+///
+/// **TEST-MODE ONLY**, [`pick_setting_door`]'s rule. The open Preferences window finds
+/// ITS OWN "Use this machine" button for `host` (`[data-source-use]`) and clicks it, so
+/// the press runs the button's handler and honours its disabled state exactly as a
+/// pointer would; a host with no enabled button is a press that lands nowhere.
+fn press_source_use_door(env: &Env, params: &Value) -> Result<Value, (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", "ui.press_source_use requires test mode"));
+    }
+    let host = req_str(params, "host")?;
+    if host.is_empty() {
+        return Err(err("bad_request", "'host' names a server"));
+    }
+    Ok(json!({ "host": host }))
+}
+
 /// The gate + reader behind the settings sheet's one driver door,
 /// `ui.pick_lane_setting {row, value}` (plan 025 §3.10, C11): the payload to
 /// emit, or the refusal.
@@ -761,6 +779,10 @@ pub fn present_main_window<R: tauri::Runtime>(app: &AppHandle<R>) {
 /// open). Its snapshot is keyed under this label, read by `prefs.dump`.
 pub const PREFERENCES_ID: &str = "preferences";
 
+/// Emitted when an already-built Preferences window is shown again (see
+/// [`show_preferences_window`]); `PreferencesWindow.tsx` listens for it.
+pub const PREFS_SHOWN_EVENT: &str = "prefs-shown";
+
 /// The Preferences window's fixed content size. The mac window is 460×560; this
 /// carries the same grouped form with the Plex kit's roomier spacing. Fixed —
 /// the window is not resizable (mac parity).
@@ -790,6 +812,14 @@ pub fn show_preferences_window(app: &AppHandle) {
             let _ = w.unminimize();
             let _ = w.set_focus();
             set_activation_policy_prod(&handle, true);
+            // A reopen does not remount the page (close only hid it), so tell it it is
+            // on screen again: it re-reads what can change behind a hidden window (the
+            // credential source rows), throttled on its side. Sent from this one native
+            // path, so it fires the same under WKWebView and WebKitGTK; the webviews'
+            // own focus and visibility events also reach the page, but whether they
+            // fire for a programmatic show depends on the webview and the window
+            // manager, and this does not.
+            let _ = handle.emit(PREFS_SHOWN_EVENT, ());
             return;
         }
         if let Err(e) = tauri::WebviewWindowBuilder::new(
@@ -1241,6 +1271,19 @@ impl Handler {
             "broker.status" => Ok(self.broker_status()),
             "broker.mode" => Ok(self.broker_mode()),
             "broker.set_mode" => self.broker_set_mode(params),
+            // -- credential sources (plan 035 §3.4) --
+            "source.status" => {
+                let rt = self.app.try_state::<crate::broker::BrokerRuntime>();
+                Ok(crate::source::status(&self.backend, rt.as_deref()).await)
+            }
+            "source.use" => self.source_use(params).await,
+            // The Preferences row's "Use this machine" press — TEST-MODE ONLY, see
+            // [`press_source_use_door`]. Acts on a Preferences window already open.
+            "ui.press_source_use" => {
+                let payload = press_source_use_door(&self.env, params)?;
+                let _ = self.app.emit("press-source-use", payload);
+                Ok(json!({}))
+            }
             // The mac popover's hermetic drive path — OS tray clicks aren't drivable,
             // so these run the EXACT Rust path the tray-icon left-click runs.
             "tray.show" => {
@@ -2622,6 +2665,20 @@ impl Handler {
         Ok(json!({ "pref": mode, "effective": effective, "restart_required": restart_required }))
     }
 
+    /// `source.use {host}` → make THIS machine the credential source on `host` (the
+    /// same path as the Preferences "Use this machine" button), wake the embedded
+    /// broker, and tell an open Preferences window to read the rows again. See
+    /// [`crate::source::use_this_machine`] for the refusals.
+    async fn source_use(&self, params: &Value) -> Result<Value, (String, String)> {
+        let host = req_str(params, "host")?;
+        let rt = self.app.try_state::<crate::broker::BrokerRuntime>();
+        let res = crate::source::use_this_machine(&self.backend, rt.as_deref(), host).await;
+        if res.is_ok() {
+            self.emit_prefs_changed();
+        }
+        res
+    }
+
     /// `app.screenshot` → shell out to a platform tool and return `{png (base64),
     /// width, height}`. The capture is blocking, so run it off the async worker.
     async fn screenshot(&self) -> Result<Value, (String, String)> {
@@ -3565,6 +3622,30 @@ mod tests {
         ] {
             assert_eq!(
                 pick_setting_door(&test, &bad).expect_err("not a press").0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+    }
+
+    /// **The "Use this machine" press door is test-mode only** (plan 035 §3.4): a
+    /// shipped app answers `not_enabled`; in test mode it carries the named server, and
+    /// a missing, empty or non-string host is a bad request.
+    #[test]
+    fn the_source_use_press_door_is_test_mode_only() {
+        let press = json!({ "host": "mock" });
+        let mut prod = env(None);
+        prod.test_mode = false;
+        let (code, message) = press_source_use_door(&prod, &press)
+            .expect_err("a driver door must not be reachable in a shipped app");
+        assert_eq!(code, "not_enabled");
+        assert!(message.contains("ui.press_source_use"), "{message}");
+        assert_eq!(press_source_use_door(&env(None), &press).unwrap(), press);
+        for bad in [json!({}), json!({ "host": "" }), json!({ "host": 3 })] {
+            assert_eq!(
+                press_source_use_door(&env(None), &bad)
+                    .expect_err("not a press")
+                    .0,
                 "bad_request",
                 "{bad}"
             );
