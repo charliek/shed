@@ -52,7 +52,7 @@ func wakeErrorf(format string, args ...any) error {
 func (s *Server) ensureRunning(ctx context.Context, user string, stderr io.Writer, announce bool) (*config.Shed, error) {
 	name, ok := shedNameFor(user)
 	if !ok {
-		log.Printf("Refused shed lookup: user=%s is not a shed name", user)
+		log.Printf("Refused shed lookup: user=%s is not a shed name", logUser(user))
 		return nil, wakeErrorf("shed '%s' not found", user)
 	}
 	shed, err := s.guard().Check(ctx, name, backend.ActionEnter)

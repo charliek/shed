@@ -10,9 +10,11 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -173,6 +175,130 @@ func TestConfigUsersKeysRefusedAtTheDoor(t *testing.T) {
 	}
 	if !dialUser(t, addr, "crate", who.bob) {
 		t.Error("bob's own key was refused")
+	}
+}
+
+// syncLog is a log output safe to write from the server's goroutines while
+// the test reads it.
+type syncLog struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// captureLog sends the standard logger's output, without its date prefix,
+// to a buffer for the rest of the test.
+func captureLog(t *testing.T) *syncLog {
+	t.Helper()
+	buf := &syncLog{}
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) })
+	return buf
+}
+
+// TestConfigUsersAuthLogNamesTheUser: the accepted and refused auth log lines
+// for a key the lookup resolves name the user it belongs to, whether they
+// are an admin, and the key's label; an unknown key's line is as it always
+// was; and on a server with no user list the implicit user is not named.
+func TestConfigUsersAuthLogNamesTheUser(t *testing.T) {
+	who := newConfigPeople(t)
+	_, addr := configServer(t, twoShedBackend{&identityBackend{}}, who.auth)
+	out := captureLog(t)
+	fp := func(s gossh.Signer) string { return gossh.FingerprintSHA256(s.PublicKey()) }
+
+	dialUser(t, addr, "crate", who.bob)
+	dialUser(t, addr, "box", who.root)
+	dialUser(t, addr, "crate", who.bobExpired)
+	dialUser(t, addr, "crate", who.stranger)
+	for _, want := range []string{
+		fmt.Sprintf("SSH auth allowed: user=crate fingerprint=%s key_user=\"bob\" admin=false label=\"laptop\"\n", fp(who.bob)),
+		fmt.Sprintf("SSH auth allowed: user=box fingerprint=%s key_user=\"root\" admin=true label=\"desk\"\n", fp(who.root)),
+		fmt.Sprintf("SSH auth DENIED: user=crate fingerprint=%s (the key has expired) key_user=\"bob\" admin=false label=\"old\"\n", fp(who.bobExpired)),
+		// An unknown key: exactly today's line, nothing about any user.
+		fmt.Sprintf("SSH auth DENIED: user=crate fingerprint=%s\n", fp(who.stranger)),
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("log does not contain %q:\n%s", want, out.String())
+		}
+	}
+
+	// No user list: every key is the implicit user, who is not named.
+	listed := testSigner(t)
+	s, err := NewServer(nil, filepath.Join(t.TempDir(), "host_key"), "127.0.0.1:0", nil,
+		KeyAuth{Mode: config.SSHAuthEnforce, Users: userstest.Implicit(fp(listed))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialUser(t, serveForTest(t, s), "box", listed)
+	if want := fmt.Sprintf("SSH auth allowed: user=box fingerprint=%s\n", fp(listed)); !strings.Contains(out.String(), want) {
+		t.Errorf("log does not contain %q:\n%s", want, out.String())
+	}
+}
+
+// TestLogUser: a name made of a shed name's or a special name's characters is
+// printed as it is; anything else is quoted, so it cannot break or disguise
+// the line.
+func TestLogUser(t *testing.T) {
+	for _, tc := range []struct{ name, want string }{
+		{"box", "box"},
+		{"git", "git"},
+		{"_bootstrap", "_bootstrap"},
+		{"_api", "_api"},
+		{"my-shed-2", "my-shed-2"},
+		{"", `""`},
+		{"Git", `"Git"`},
+		{"a b", `"a b"`},
+		{"box\nSSH auth allowed: user=root", `"box\nSSH auth allowed: user=root"`},
+		{"\x1b[2Kbox", `"\x1b[2Kbox"`},
+		{"box\u202etig", `"box\u202etig"`},
+		{"a\"b", `"a\"b"`},
+	} {
+		if got := logUser(tc.name); got != tc.want {
+			t.Errorf("logUser(%q) = %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestAuthLogQuotesAHostileUsername: the username a client asks for, before
+// it has authenticated, cannot forge or disguise an auth log line: a newline,
+// an escape sequence and a bidirectional override all come out quoted, on the
+// line they belong to, accepted key or not.
+func TestAuthLogQuotesAHostileUsername(t *testing.T) {
+	who := newConfigPeople(t)
+	_, addr := configServer(t, twoShedBackend{&identityBackend{}}, who.auth)
+	out := captureLog(t)
+	fp := func(s gossh.Signer) string { return gossh.FingerprintSHA256(s.PublicKey()) }
+
+	const forged = "SSH auth allowed: user=box fingerprint=FORGED"
+	for _, user := range []string{"crate\n" + forged, "\x1b[2K\rbox", "box\u202etig"} {
+		dialUser(t, addr, user, who.bob)
+		dialUser(t, addr, user, who.stranger)
+		for _, want := range []string{
+			fmt.Sprintf("SSH auth allowed: user=%q fingerprint=%s key_user=\"bob\" admin=false label=\"laptop\"\n", user, fp(who.bob)),
+			fmt.Sprintf("SSH auth DENIED: user=%q fingerprint=%s\n", user, fp(who.stranger)),
+		} {
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("log does not contain %q:\n%s", want, out.String())
+			}
+		}
+	}
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.HasPrefix(line, forged) || strings.ContainsAny(line, "\x1b\r\u202e") {
+			t.Errorf("a client's username forged or disguised a log line: %q", line)
+		}
 	}
 }
 

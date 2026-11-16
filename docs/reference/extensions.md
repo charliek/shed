@@ -340,7 +340,7 @@ The `github.com/charliek/shed/sdk` Go module provides shared types and clients f
 
 - `sdk.Envelope` — Universal message format
 - `sdk.BusClient` — Guest-side HTTP publisher to shed-agent
-- `sdk.HostClient` — Host-side SSE subscriber to shed-server. It does not send the machine headers, so a server with credential sources refuses it (`403 SOURCE_MACHINE_ID_REQUIRED`); the Rust broker in `crates/shed-broker` is the maintained host-side client
+- `sdk.HostClient` — Host-side SSE subscriber to shed-server. The Rust broker in `crates/shed-broker` is the maintained host-side client
 
 ```go
 import "github.com/charliek/shed/sdk"
@@ -349,14 +349,32 @@ import "github.com/charliek/shed/sdk"
 bus := sdk.NewBusClient(sdk.DefaultPublishURL, sdk.DefaultBusTimeout)
 resp, err := bus.Publish(ctx, "my-namespace", payload)
 
-// Host-side: subscribe to messages
-host := sdk.NewHostClient(sdk.WithServerURL("http://localhost:8080"))
+// Host-side: subscribe to messages, as this machine
+host := sdk.NewHostClient(
+    sdk.WithServerURL("http://localhost:8080"),
+    sdk.WithMachine("0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60", "laptop"),
+)
 ch := host.Subscribe(ctx, "my-namespace")
 for env := range ch {
     // handle message, send response
     host.Respond(ctx, "my-namespace", responseEnv)
 }
 ```
+
+`sdk.WithMachine(id, name)` gives the client its machine identity, sent on every subscribe and respond in `X-Shed-Machine-Id` and `X-Shed-Machine-Name` (the name percent-encoded the same way the Rust broker encodes it). The id is 32 lowercase hexadecimal characters and must stay the same for the machine: a new id is a new machine to the server, so store it rather than generating one per process. The name is 1 to 63 bytes of UTF-8 with no control characters. `sdk.ValidateMachine(id, name)` applies the server's rules. A client built with an identity that breaks them sends nothing: `Respond` returns an error wrapping `sdk.ErrInvalidMachine`, and the subscription stops with state `rejected`. Without `WithMachine` the client sends neither header, and a server with credential sources refuses it with `403 SOURCE_MACHINE_ID_REQUIRED`. The client never invents an identity, because the caller decides which machine answers for its user.
+
+The server's credential-source refusals come back as `*sdk.SourceError`. `Respond` returns it, and a subscription reports it in `Status()` (field `Err`). Match each refusal with `errors.Is`, and read its fields with `errors.As`:
+
+| Sentinel | Status and code | Fields | Subscription |
+|----------|-----------------|--------|--------------|
+| `sdk.ErrSourceNotBound` | 403 `SOURCE_NOT_BOUND` | `MachineID`, `MachineName`: the user's credential source (empty when there is none) | retried on the backoff |
+| `sdk.ErrSourceMachineIDRequired` | 403 `SOURCE_MACHINE_ID_REQUIRED` | | retried on the backoff |
+| `sdk.ErrSourceDuplicateStream` | 409 `SOURCE_DUPLICATE_STREAM` | | retried on the backoff (any other 409 still ends the subscription as `rejected`) |
+| `sdk.ErrSourceRateLimited` | 429 `SOURCE_RATE_LIMITED` | `RetryAfter`, from the `Retry-After` header in whole seconds, at most 10 minutes | retried after `RetryAfter` (at most 10 minutes) or the backoff, whichever is longer |
+
+A refusal is recognised only from a complete body of at most 1024 bytes, that ends within 3 seconds, whose status and `error.code` match a row above. A subscribe's other 409, a legacy one without a code included, is the separate terminal error that ends the subscription as `rejected`. Any other non-success answer is reported as before, as an `unexpected status` error.
+
+The client follows a redirect only within the configured server's origin (the same scheme, host name and port, so never from `https` to `http`), at most three times, whatever the `CheckRedirect` of a client passed with `sdk.WithHTTPClient` allows. Any other redirect is reported as an `unexpected status` error, and nothing is sent to where it points.
 
 ## Credential extensions
 

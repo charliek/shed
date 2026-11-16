@@ -207,8 +207,28 @@ func (g *userGate) logRefusal(user string, b source.Binding, m source.Machine, w
 		g.refused = map[string]bool{}
 	}
 	g.refused[m.ID] = true
-	log.Printf("credential bus: refused %s from machine %s (%q)%s: the user's credential source is machine %s (%q); logged once until the binding changes",
-		what, m.ID, m.Name, forUser(user), bound.ID, bound.Name)
+	log.Printf("credential bus: refused %s from %s%s: the user's credential source is %s; logged once until the binding changes",
+		what, machineLabel(m), forUser(user), machineLabel(bound))
+}
+
+// machineLabel names m in a log line: its id, and its name when known.
+func machineLabel(m source.Machine) string {
+	if m.Name == "" {
+		return "machine " + m.ID
+	}
+	return fmt.Sprintf("machine %s (%q)", m.ID, m.Name)
+}
+
+// knownMachine is user's machine id as the store remembers it (with its
+// name), or just the id when the store has no record of it. The store's
+// reads take no lock, so it may be called under the user's gate or r.mu.
+func knownMachine(b source.Bindings, user, id string) source.Machine {
+	for _, m := range b.Machines(user) {
+		if m.ID == id {
+			return m
+		}
+	}
+	return source.Machine{ID: id}
 }
 
 // SetBindings gives the registry its source bindings: from then on a
@@ -245,13 +265,7 @@ func boundMachine(b source.Bindings, user string) source.Machine {
 	if !ok {
 		return source.Machine{}
 	}
-	id := bd.MachineID()
-	for _, m := range b.Machines(user) {
-		if m.ID == id {
-			return m
-		}
-	}
-	return source.Machine{ID: id}
+	return knownMachine(b, user, bd.MachineID())
 }
 
 // wouldWrite reports whether admitting m for user writes the store: the user

@@ -64,8 +64,8 @@ func (s *Server) handleSession(sess ssh.Session) {
 	user := authenticatedUser(sess.Context())
 	remoteAddr := sess.RemoteAddr()
 
-	log.Printf("SSH session started: user=%s remote=%s", user, remoteAddr)
-	defer log.Printf("SSH session ended: user=%s remote=%s", user, remoteAddr)
+	log.Printf("SSH session started: user=%s remote=%s", logUser(user), remoteAddr)
+	defer log.Printf("SSH session ended: user=%s remote=%s", logUser(user), remoteAddr)
 
 	// Reserved bootstrap user: issue + return a client-certificate bundle over
 	// the authenticated SSH channel (or the open-server refusal), before any
@@ -77,7 +77,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 
 	// Check for reserved usernames.
 	if user == reservedAPIUser {
-		log.Printf("Rejected reserved username: %s", user)
+		log.Printf("Rejected reserved username: %s", logUser(user))
 		fmt.Fprintf(sess.Stderr(), "Error: username '%s' is reserved for API access\n", user)
 		_ = sess.Exit(1)
 		return
@@ -87,7 +87,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 	// with, resolved again for this channel.
 	p, err := s.principalFor(sess.Context())
 	if err != nil {
-		log.Printf("SSH session refused: user=%s: %v", user, err)
+		log.Printf("SSH session refused: user=%s: %v", logUser(user), err)
 		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
 		_ = sess.Exit(1)
 		return

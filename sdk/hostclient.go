@@ -11,10 +11,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charliek/shed/sdk/authfail"
 )
@@ -23,6 +27,9 @@ const (
 	defaultServerURL    = "http://localhost:8080"
 	maxReconnectBackoff = 30 * time.Second
 	initialBackoff      = 1 * time.Second
+	// maxRetryAfterWait bounds how long a subscription waits on a server's
+	// Retry-After before trying again.
+	maxRetryAfterWait = 10 * time.Minute
 )
 
 // Subscription connection states reported by HostClient.Status.
@@ -39,21 +46,259 @@ const (
 // errSubscribeConflict is returned by streamMessages when the server answers the
 // subscribe with 409 Conflict — the namespace already has an active listener.
 // subscribeLoop treats it as terminal: a second broker must be observably
-// rejected, not silently retry forever.
+// rejected, not silently retry forever. A 409 with the code
+// SOURCE_DUPLICATE_STREAM is not this: it is a *SourceError, and retried.
 var errSubscribeConflict = errors.New("namespace already has an active subscriber")
 
 // SubStatus is a snapshot of one namespace subscription's connection state, so
 // callers can report health (e.g. `shed-host-agent status --live`) without
 // scraping logs.
+//
+// Fields may be added to SubStatus: build one with field names, since a
+// positional literal of it is not something this module keeps compiling.
 type SubStatus struct {
 	Namespace string
-	State     string    // ConnConnected | ConnReconnecting | ConnStopped
+	State     string    // ConnConnected | ConnReconnecting | ConnStopped | ConnRejected
 	LastError string    // last connection error (empty while connected)
 	Since     time.Time // when the current state began
+	// Err is the last connection error as a value (nil while connected), so
+	// a caller can tell a credential-source refusal apart with errors.Is or
+	// errors.As (see SourceError). It is not part of the JSON encoding
+	// (LastError carries its text there).
+	Err error `json:"-"`
+}
+
+// Machine identity on the credential bus. A server with credential sources
+// (shed-server 0.10.0 and newer) takes each user's credential requests from
+// one machine of that user, and requires every subscribe and respond to name
+// the machine it comes from in two headers.
+const (
+	// HeaderMachineID carries the machine's id: 32 lowercase hexadecimal
+	// digits, stable for the machine.
+	HeaderMachineID = "X-Shed-Machine-Id"
+	// HeaderMachineName carries the machine's display name, percent-encoded
+	// UTF-8.
+	HeaderMachineName = "X-Shed-Machine-Name"
+	// MaxMachineNameBytes is the longest machine name, in bytes of UTF-8.
+	MaxMachineNameBytes = 63
+)
+
+// The error codes of a server's credential-source refusals (error.code in
+// the response body).
+const (
+	// CodeSourceNotBound (403): another machine is the user's credential
+	// source; the refusal names it.
+	CodeSourceNotBound = "SOURCE_NOT_BOUND"
+	// CodeSourceMachineIDRequired (403): the request named no machine, or
+	// named one the server could not read.
+	CodeSourceMachineIDRequired = "SOURCE_MACHINE_ID_REQUIRED"
+	// CodeSourceDuplicateStream (409): this machine already holds the
+	// namespace's subscription for its user.
+	CodeSourceDuplicateStream = "SOURCE_DUPLICATE_STREAM"
+	// CodeSourceRateLimited (429, with Retry-After): too many new or changed
+	// machines for the user lately.
+	CodeSourceRateLimited = "SOURCE_RATE_LIMITED"
+)
+
+// Sentinels for errors.Is on a *SourceError, one per refusal code.
+var (
+	ErrSourceNotBound          = errors.New("another machine is the credential source")
+	ErrSourceMachineIDRequired = errors.New("the server requires a machine identity")
+	ErrSourceDuplicateStream   = errors.New("this machine already holds the subscription")
+	ErrSourceRateLimited       = errors.New("too many new or changed machines lately")
+)
+
+// ErrInvalidMachine is returned (wrapped, with the reason) by ValidateMachine,
+// and by Subscribe's loop and Respond for a client built with an invalid
+// WithMachine identity: nothing is sent.
+var ErrInvalidMachine = errors.New("invalid machine identity")
+
+// SourceError is a server's credential-source refusal of a subscribe or a
+// respond, read from a complete response body of at most 1024 bytes. Use
+// errors.Is with ErrSourceNotBound, ErrSourceMachineIDRequired,
+// ErrSourceDuplicateStream or ErrSourceRateLimited to tell them apart, and
+// errors.As for the fields. Any other non-success answer is reported as
+// before: an "unexpected status" error, except that a subscribe's other 409
+// (a legacy namespace conflict) ends the subscription as ConnRejected.
+type SourceError struct {
+	StatusCode int    // 403, 409 or 429
+	Code       string // one of the CodeSource* constants
+	Message    string // the server's error.message
+	// MachineID and MachineName name the user's credential source, for
+	// CodeSourceNotBound; both are empty when no machine is the source.
+	MachineID   string
+	MachineName string
+	// RetryAfter is the server's Retry-After, for CodeSourceRateLimited, at
+	// most ten minutes (zero when absent, negative, or not a whole number of
+	// seconds that fits an int).
+	RetryAfter time.Duration
+}
+
+// Error implements error.
+func (e *SourceError) Error() string {
+	s := fmt.Sprintf("credential source refusal (status %d, %s)", e.StatusCode, e.Code)
+	if e.Message != "" {
+		s += ": " + e.Message
+	}
+	return s
+}
+
+// Is matches the sentinel of e's code.
+func (e *SourceError) Is(target error) bool {
+	switch e.Code {
+	case CodeSourceNotBound:
+		return target == ErrSourceNotBound
+	case CodeSourceMachineIDRequired:
+		return target == ErrSourceMachineIDRequired
+	case CodeSourceDuplicateStream:
+		return target == ErrSourceDuplicateStream
+	case CodeSourceRateLimited:
+		return target == ErrSourceRateLimited
+	}
+	return false
+}
+
+// maxErrorBody is how much of an error response body is read and reported.
+const maxErrorBody = 1024
+
+// errorBodyReadTimeout bounds the time a non-success body may take to arrive
+// (subscribe and respond alike, as the Rust broker's ERROR_BODY_READ_TIMEOUT):
+// a body that never ends must not hold a subscription or a respond for ever.
+// A variable so tests can shorten it.
+var errorBodyReadTimeout = 3 * time.Second
+
+// errorBodyAbortGrace bounds the wait, after an aborted read, for the read
+// to give back what it had.
+const errorBodyAbortGrace = time.Second
+
+// readErrorBody reads at most maxErrorBody bytes of a non-success body, for
+// at most errorBodyReadTimeout, and reports whether that is the whole body
+// (only a complete body is classified as a refusal). A read that runs out of
+// time is ended by abort (the request's context) and by closing the body,
+// and is never complete.
+func readErrorBody(body io.ReadCloser, abort context.CancelFunc) (raw []byte, complete bool) {
+	type result struct {
+		raw []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		raw, err := io.ReadAll(io.LimitReader(body, maxErrorBody+1))
+		done <- result{raw, err}
+	}()
+	timer := time.NewTimer(errorBodyReadTimeout)
+	defer timer.Stop()
+	var r result
+	select {
+	case r = <-done:
+	case <-timer.C:
+		abort()
+		_ = body.Close()
+		select {
+		case r = <-done:
+		case <-time.After(errorBodyAbortGrace):
+		}
+		r.err = errors.New("the body did not end in time")
+	}
+	if len(r.raw) > maxErrorBody {
+		return r.raw[:maxErrorBody], false
+	}
+	return r.raw, r.err == nil
+}
+
+// sourceRefusal returns the credential-source refusal a non-success answer
+// carries, or nil: the status and error.code must be one of the pairs the
+// server sends (403 SOURCE_NOT_BOUND, 403 SOURCE_MACHINE_ID_REQUIRED, 409
+// SOURCE_DUPLICATE_STREAM, 429 SOURCE_RATE_LIMITED) and the body complete.
+func sourceRefusal(resp *http.Response, body []byte, complete bool) *SourceError {
+	if !complete {
+		return nil
+	}
+	var parsed struct {
+		Error  map[string]json.RawMessage `json:"error"`
+		Source map[string]json.RawMessage `json:"source"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return nil
+	}
+	str := func(m map[string]json.RawMessage, key string) string {
+		var s string
+		if raw, ok := m[key]; ok && json.Unmarshal(raw, &s) == nil {
+			return s
+		}
+		return ""
+	}
+	e := &SourceError{StatusCode: resp.StatusCode, Code: str(parsed.Error, "code"), Message: str(parsed.Error, "message")}
+	switch {
+	case resp.StatusCode == http.StatusForbidden && e.Code == CodeSourceNotBound:
+		e.MachineID, e.MachineName = str(parsed.Source, "machine_id"), str(parsed.Source, "machine_name")
+	case resp.StatusCode == http.StatusForbidden && e.Code == CodeSourceMachineIDRequired,
+		resp.StatusCode == http.StatusConflict && e.Code == CodeSourceDuplicateStream:
+	case resp.StatusCode == http.StatusTooManyRequests && e.Code == CodeSourceRateLimited:
+		// Clamped to the cap in seconds before it becomes a Duration: a huge
+		// value must not overflow into a negative or tiny wait. A value Atoi
+		// cannot read (an HTTP date, garbage, or one too large for an int)
+		// is absent.
+		if secs, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && secs >= 0 {
+			e.RetryAfter = time.Duration(min(secs, int(maxRetryAfterWait/time.Second))) * time.Second
+		}
+	default:
+		return nil
+	}
+	return e
+}
+
+// ValidateMachine checks a machine identity by the rules a server applies:
+// the id is 32 lowercase hexadecimal digits; the name is 1 to
+// MaxMachineNameBytes bytes of valid UTF-8 with no control character. It
+// returns nil or an error wrapping ErrInvalidMachine.
+func ValidateMachine(id, name string) error {
+	if len(id) != 32 || strings.Trim(id, "0123456789abcdef") != "" {
+		return fmt.Errorf("%w: the id must be 32 lowercase hexadecimal digits", ErrInvalidMachine)
+	}
+	if name == "" || len(name) > MaxMachineNameBytes {
+		return fmt.Errorf("%w: the name must be 1 to %d bytes", ErrInvalidMachine, MaxMachineNameBytes)
+	}
+	if !utf8.ValidString(name) {
+		return fmt.Errorf("%w: the name must be valid UTF-8", ErrInvalidMachine)
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%w: the name must not contain a control character", ErrInvalidMachine)
+		}
+	}
+	return nil
+}
+
+// encodeMachineName is name as it travels in HeaderMachineName: its UTF-8
+// bytes, every byte that is not an RFC 3986 unreserved character
+// (A-Z a-z 0-9 - . _ ~) written %XX (uppercase hex). The same encoding as
+// the Rust broker's (crates/shed-broker/src/bus.rs: percent_encode_name), and
+// the server decodes it with a path unescape.
+func encodeMachineName(name string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-' || c == '.' || c == '_' || c == '~' {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(hex[c>>4])
+		b.WriteByte(hex[c&0x0f])
+	}
+	return b.String()
 }
 
 // HostClient connects to shed-server's plugin API to receive and respond to messages.
 // Used by host-side extension binaries.
+//
+// A server with credential sources (shed-server 0.10.0 and newer) needs to
+// know which machine is subscribing and answering: give the client one with
+// WithMachine. Without it the client sends no machine headers, and such a
+// server refuses every subscribe and respond with 403
+// SOURCE_MACHINE_ID_REQUIRED (ErrSourceMachineIDRequired).
 type HostClient struct {
 	serverURL  string
 	httpClient *http.Client
@@ -74,6 +319,14 @@ type HostClient struct {
 	// (which needs a pin — see applyTLSPin). A provider that was configured but
 	// never installed leaves the token path exactly as it was.
 	certAuth bool
+
+	// The machine this client answers from (WithMachine): sent in
+	// HeaderMachineID and HeaderMachineName when machineSet, unless
+	// machineErr says the identity is invalid, in which case nothing is sent.
+	machineSet  bool
+	machineID   string
+	machineName string
+	machineErr  error
 
 	mu     sync.Mutex
 	states map[string]SubStatus
@@ -118,7 +371,11 @@ func WithServerURL(url string) HostClientOption {
 	}
 }
 
-// WithHTTPClient sets a custom HTTP client.
+// WithHTTPClient sets a custom HTTP client. The client is copied, never
+// changed. Whatever its own CheckRedirect allows, the HostClient follows a
+// redirect only within the configured server's origin (scheme, host name and
+// effective port; never from https to http) and at most three times; the
+// client's CheckRedirect is then asked about each redirect that rule allows.
 func WithHTTPClient(hc *http.Client) HostClientOption {
 	return func(c *HostClient) {
 		if hc != nil {
@@ -200,6 +457,34 @@ func WithClientCertificates(p ClientCertProvider) HostClientOption {
 	}
 }
 
+// WithMachine names the machine this client subscribes and answers from: id
+// is 32 lowercase hexadecimal digits that stay the same for the machine, and
+// name is its display name (1 to MaxMachineNameBytes bytes of UTF-8, no
+// control character). Both are sent on every subscribe and respond, the name
+// percent-encoded. The server takes a user's credential requests from one
+// machine, the first to connect, until the user moves it (`shed source use`);
+// another machine is refused with a *SourceError naming the one that is.
+//
+// Which machine answers for a user is the caller's decision: keep the id
+// stable (stored with the machine's other state), since a new id is a new
+// machine to the server. An invalid identity (see ValidateMachine) is not
+// sent: Subscribe's loop stops with ConnRejected and Respond returns an error
+// wrapping ErrInvalidMachine.
+func WithMachine(id, name string) HostClientOption {
+	return func(c *HostClient) {
+		c.machineSet, c.machineID, c.machineName = true, id, name
+		c.machineErr = ValidateMachine(id, name)
+	}
+}
+
+// setMachine adds the machine headers when the client has an identity.
+func (c *HostClient) setMachine(req *http.Request) {
+	if c.machineSet && c.machineErr == nil {
+		req.Header.Set(HeaderMachineID, c.machineID)
+		req.Header.Set(HeaderMachineName, encodeMachineName(c.machineName))
+	}
+}
+
 // applyTLSPin installs cert pinning on the resolved HTTP client's transport.
 // Called once after all options so it composes with WithHTTPClient regardless
 // of option order.
@@ -275,6 +560,70 @@ func (c *HostClient) applyTLSPin() {
 		CheckRedirect: c.httpClient.CheckRedirect,
 		Jar:           c.httpClient.Jar,
 	}
+}
+
+// maxRedirects is the most redirects the client follows in one request, and
+// only within the configured server's origin (the Rust broker's
+// MAX_REDIRECTS).
+const maxRedirects = 3
+
+// effectivePort is u's port, or its scheme's default when it names none.
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
+}
+
+// redirectAllowed reports whether the client follows a redirect to next,
+// hops redirects into the request: only to the configured server's own
+// origin (scheme, host name and effective port), so never from https to
+// http, and at most maxRedirects times. Every request carries this machine's
+// identity headers and the bearer credential, and may present a client
+// certificate: none of them may reach another origin. A nil configured URL
+// (one that did not parse) follows nothing. As the Rust broker's
+// redirect_allowed (crates/shed-broker/src/bus.rs).
+func redirectAllowed(configured, next *url.URL, hops int) bool {
+	if configured == nil || next == nil || hops > maxRedirects {
+		return false
+	}
+	if configured.Scheme != "http" && configured.Scheme != "https" {
+		return false
+	}
+	return next.Scheme == configured.Scheme &&
+		strings.EqualFold(next.Hostname(), configured.Hostname()) &&
+		effectivePort(next) == effectivePort(configured)
+}
+
+// restrictRedirects makes the resolved HTTP client follow only the
+// redirects redirectAllowed allows. Any other redirect response is the
+// answer (http.ErrUseLastResponse), reported as an unexpected status, and
+// nothing is sent to its target. A CheckRedirect the caller's client had
+// runs after this rule, on a redirect the rule allows, and can only refuse
+// more. The caller's client is copied, never changed.
+func (c *HostClient) restrictRedirects() {
+	configured, err := url.Parse(c.serverURL)
+	if err != nil {
+		configured = nil
+	}
+	hc := *c.httpClient
+	theirs := hc.CheckRedirect
+	hc.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !redirectAllowed(configured, req.URL, len(via)) {
+			return http.ErrUseLastResponse
+		}
+		if theirs != nil {
+			return theirs(req, via)
+		}
+		return nil
+	}
+	c.httpClient = &hc
 }
 
 // invalidateOnAuthFailure asks the credential provider to re-mint when the
@@ -373,6 +722,7 @@ func NewHostClient(opts ...HostClientOption) *HostClient {
 		opt(c)
 	}
 	c.applyTLSPin()
+	c.restrictRedirects()
 	return c
 }
 
@@ -409,11 +759,11 @@ func (c *HostClient) setState(namespace, state string, cause error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if prev, ok := c.states[namespace]; ok && prev.State == state {
-		prev.LastError = es
+		prev.LastError, prev.Err = es, cause
 		c.states[namespace] = prev
 		return
 	}
-	c.states[namespace] = SubStatus{Namespace: namespace, State: state, LastError: es, Since: time.Now()}
+	c.states[namespace] = SubStatus{Namespace: namespace, State: state, LastError: es, Since: time.Now(), Err: cause}
 }
 
 func (c *HostClient) subscribeLoop(ctx context.Context, namespace string, ch chan<- *Envelope) {
@@ -447,6 +797,14 @@ func (c *HostClient) subscribeLoop(ctx context.Context, namespace string, ch cha
 				"namespace", namespace, "error", err)
 			return
 		}
+		// An invalid machine identity never becomes valid: nothing was sent,
+		// and retrying would send nothing either.
+		if errors.Is(err, ErrInvalidMachine) {
+			stopState, stopCause = ConnRejected, err
+			c.logger.Error("SSE subscription not started; the machine identity is invalid — not retrying",
+				"namespace", namespace, "error", err)
+			return
+		}
 		c.setState(namespace, ConnReconnecting, err)
 
 		// Reset backoff only after a connection that held for a while, so a
@@ -466,22 +824,37 @@ func (c *HostClient) subscribeLoop(ctx context.Context, namespace string, ch cha
 			c.logger.Debug("SSE still down, retrying",
 				"namespace", namespace, "error", err, "backoff", backoff)
 		}
+		// A rate-limit refusal says when to come back: wait at least that
+		// long (bounded), and otherwise the backoff.
+		wait := backoff
+		var se *SourceError
+		if errors.As(err, &se) && se.RetryAfter > wait {
+			wait = min(se.RetryAfter, maxRetryAfterWait)
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
 		backoff = min(backoff*2, maxReconnectBackoff)
 	}
 }
 
 func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch chan<- *Envelope, onConnect func()) error {
+	if c.machineErr != nil {
+		return c.machineErr
+	}
 	url := fmt.Sprintf("%s/api/plugins/listeners/%s/messages", c.serverURL, namespace)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// reqCtx ends this request alone: readErrorBody cancels it when a
+	// non-success body does not end in time.
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	defer cancelReq()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	c.setMachine(req)
 	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
@@ -497,7 +870,12 @@ func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch ch
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		body, complete := readErrorBody(resp.Body, cancelReq)
+		// A credential-source refusal is retried on the backoff (a 409
+		// SOURCE_DUPLICATE_STREAM included); none is a reason to re-mint.
+		if se := sourceRefusal(resp, body, complete); se != nil {
+			return se
+		}
 		if resp.StatusCode == http.StatusConflict {
 			return fmt.Errorf("%w: %s", errSubscribeConflict, strings.TrimSpace(string(body)))
 		}
@@ -556,7 +934,17 @@ func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch ch
 
 // Respond sends a response envelope back to shed-server for routing to the
 // originating shed.
+//
+// A server with credential sources accepts an answer only from the machine the
+// request was sent to; its refusals are returned as a *SourceError.
 func (c *HostClient) Respond(ctx context.Context, namespace string, env *Envelope) error {
+	if c.machineErr != nil {
+		return c.machineErr
+	}
+	// cancel ends this respond's requests: readErrorBody uses it when a
+	// non-success body does not end in time.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	url := fmt.Sprintf("%s/api/plugins/listeners/%s/respond", c.serverURL, namespace)
 
 	body, err := json.Marshal(env)
@@ -570,6 +958,7 @@ func (c *HostClient) Respond(ctx context.Context, namespace string, env *Envelop
 			return nil, fmt.Errorf("creating request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
+		c.setMachine(req)
 		c.setAuth(req)
 		return c.httpClient.Do(req)
 	}
@@ -601,7 +990,10 @@ func (c *HostClient) Respond(ctx context.Context, namespace string, env *Envelop
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		respBody, complete := readErrorBody(resp.Body, cancel)
+		if se := sourceRefusal(resp, respBody, complete); se != nil {
+			return se
+		}
 		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil

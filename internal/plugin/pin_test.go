@@ -250,6 +250,40 @@ func respondFrom(b *Bridge, user, machine string, env *Envelope) error {
 	return resp.Send()
 }
 
+// TestPinRefusedAnswerLogsTheMachine: an answer from a machine that is not
+// the user's source is logged with the machine's name as the store remembers
+// it (the answer itself carries only the id), and a machine the store has no
+// record of is logged by its id alone, never with an empty name.
+func TestPinRefusedAnswerLogsTheMachine(t *testing.T) {
+	reg, br, _ := pinned(t)
+	old, cur, stranger := mach(1), mach(2), mach(3)
+	sub(t, reg, uk("alice", "ssh-agent"), old)
+	if _, err := reg.Subscribe(context.Background(), uk("alice", "ssh-agent"), cur); err == nil {
+		t.Fatal("test set-up: the second machine was admitted")
+	}
+	if _, err := reg.Move(context.Background(), "alice", cur.ID, "SHA256:mover"); err != nil {
+		t.Fatal(err)
+	}
+	out := logged(t)
+
+	_, err := br.BeginResponseFrom("alice", old.ID, answer("ssh-agent", "box", "req"))
+	notBound(t, "the old machine's answer", err, cur)
+	want := fmt.Sprintf(`credential bus: refused an answer from machine %s ("machine-1") for user "alice": the user's credential source is machine %s ("machine-2")`, old.ID, cur.ID)
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("log = %q, want a line containing %q", out.String(), want)
+	}
+
+	_, err = br.BeginResponseFrom("alice", stranger.ID, answer("ssh-agent", "box", "req"))
+	notBound(t, "an unknown machine's answer", err, cur)
+	want = fmt.Sprintf(`refused an answer from machine %s for user "alice"`, stranger.ID)
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("log = %q, want a line containing %q", out.String(), want)
+	}
+	if strings.Contains(out.String(), `("")`) {
+		t.Fatalf("a refusal was logged with an empty machine name: %q", out.String())
+	}
+}
+
 // TestPinMoveLeavesOtherUsersAlone: a move of alice's binding closes her old
 // machine's listeners and drops its requests; bob's listener and request
 // are untouched and he can still answer.

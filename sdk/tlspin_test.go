@@ -81,10 +81,17 @@ func TestWithTLSPinComposesWithHTTPClient(t *testing.T) {
 }
 
 func TestNoPinLeavesClientUnchanged(t *testing.T) {
-	custom := &http.Client{Timeout: 7 * time.Second}
+	// Without a pin the supplied client's transport and timeout are used as
+	// they are; the client itself is copied to carry the redirect rule, and
+	// never changed.
+	transport := &http.Transport{}
+	custom := &http.Client{Timeout: 7 * time.Second, Transport: transport}
 	c := NewHostClient(WithHTTPClient(custom))
-	if c.httpClient != custom {
-		t.Error("without WithTLSPin the supplied client should be used as-is")
+	if c.httpClient.Transport != transport || c.httpClient.Timeout != 7*time.Second {
+		t.Error("without WithTLSPin the supplied client's transport and timeout should be used as-is")
+	}
+	if custom.CheckRedirect != nil || custom.Transport != transport {
+		t.Error("NewHostClient changed the caller's *http.Client")
 	}
 }
 

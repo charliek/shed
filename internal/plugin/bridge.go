@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/config"
-	"github.com/charliek/shed/internal/source"
 )
 
 // SendFunc writes one response envelope into a shed's transport. It takes
@@ -551,7 +550,7 @@ func (b *Bridge) BeginResponseFrom(user, machineID string, env *Envelope) (*Resp
 		}
 		if bd.MachineID() != machineID {
 			bound := boundMachine(pin, user)
-			g.logRefusal(user, bd, source.Machine{ID: machineID}, "an answer", bound)
+			g.logRefusal(user, bd, knownMachine(pin, user, machineID), "an answer", bound)
 			return nil, &NotBoundError{User: user, Bound: bound}
 		}
 		st.gen = bd.Generation

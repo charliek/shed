@@ -18,14 +18,14 @@ func (s *Server) handleSFTP(sess ssh.Session) {
 	user := authenticatedUser(sess.Context())
 	remoteAddr := sess.RemoteAddr()
 
-	log.Printf("SFTP session started: user=%s remote=%s", user, remoteAddr)
-	defer log.Printf("SFTP session ended: user=%s remote=%s", user, remoteAddr)
+	log.Printf("SFTP session started: user=%s remote=%s", logUser(user), remoteAddr)
+	defer log.Printf("SFTP session ended: user=%s remote=%s", logUser(user), remoteAddr)
 
 	// The channel's principal, from the key the connection authenticated
 	// with, resolved again for this channel.
 	p, err := s.principalFor(sess.Context())
 	if err != nil {
-		log.Printf("SFTP session refused: user=%s: %v", user, err)
+		log.Printf("SFTP session refused: user=%s: %v", logUser(user), err)
 		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
 		_ = sess.Exit(1)
 		return
