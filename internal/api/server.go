@@ -229,6 +229,11 @@ func (s *Server) Router() chi.Router {
 				r.With(egressWrite).Delete("/", s.handleDeleteProfile)
 			})
 			r.Route("/{name}", func(r chi.Router) {
+				// {name} is a shed: an invalid one is an unknown shed and
+				// reaches no backend (see requireShedName). With, not Use:
+				// the check runs on the routes below once chi has matched
+				// one, so an unrouted method or path answers as before.
+				r = r.With(requireShedName(false))
 				r.Get("/", s.handleEgressShow)
 				r.With(egressWrite).Post("/", s.handleEgressSet)
 				r.With(egressWrite).Delete("/", s.handleEgressOff)
@@ -258,6 +263,12 @@ func (s *Server) Router() chi.Router {
 			r.Get("/", s.handleListSheds)
 			r.Post("/", s.handleCreateShed)
 			r.Route("/{name}", func(r chi.Router) {
+				// Every route below takes the shed's name from here: an
+				// invalid one is an unknown shed and reaches no backend (see
+				// requireShedName). With, not Use: the check runs on the
+				// routes below once chi has matched one, so an unrouted
+				// method or path answers as before.
+				r = r.With(requireShedName(true))
 				r.Get("/", s.handleGetShed)
 				r.Delete("/", s.handleDeleteShed)
 				r.Post("/start", s.handleStartShed)

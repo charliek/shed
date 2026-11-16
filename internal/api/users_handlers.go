@@ -82,8 +82,10 @@ const assignBodyLimit = 4 << 10
 //	                           mounts: recreate it without them
 //
 // The admin check comes first, so a caller who is not one learns nothing of
-// the user list or the shed. The guard checks it again and binds the shed's
-// incarnation; the backend decides the rest under its lock.
+// the user list or the shed. (Only a name that cannot be a shed is answered
+// before it, 404 SHED_NOT_FOUND by the router's requireShedName: no shed has
+// such a name, so that tells nobody anything.) The guard checks it again and
+// binds the shed's incarnation; the backend decides the rest under its lock.
 func (s *Server) handleAssignShed(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r, "assigning a shed to a user") {
 		return
