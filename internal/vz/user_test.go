@@ -26,7 +26,7 @@ func newUserTestClient(t *testing.T, instanceDir string) *Client {
 	return &Client{
 		cfg:     &config.VZConfig{InstanceDir: instanceDir, SnapshotsDir: filepath.Join(instanceDir, "..", "snapshots")},
 		vms:     make(map[string]*VM),
-		credMgr: vmutil.NewCredentialManager(nil, plugin.NewBridge(plugin.NewRegistry()), string(config.BackendVZ), vmutil.NewHealthTracker()),
+		credMgr: vmutil.NewCredentialManager(nil, plugin.NewBridge(plugin.NewRegistry(), false), string(config.BackendVZ), vmutil.NewHealthTracker()),
 	}
 }
 

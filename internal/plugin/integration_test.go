@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"sync"
@@ -17,7 +18,7 @@ import (
 // Uses net.Pipe to simulate vsock without requiring a real VM.
 func TestEndToEndMessageFlow(t *testing.T) {
 	registry := NewRegistry()
-	bridge := NewBridge(registry)
+	bridge := NewBridge(registry, false)
 
 	// Use two separate pipes for the two directions:
 	// agentToHost: agent writes, host reads (guest→host messages)
@@ -30,7 +31,7 @@ func TestEndToEndMessageFlow(t *testing.T) {
 	defer hostToAgentW.Close()
 
 	// Register a shed — Send writes to the host→agent pipe
-	bridge.RegisterShed("dev", &ShedConn{
+	gen := bridge.RegisterShed("dev", &ShedConn{
 		Name:    "dev",
 		Backend: "vz",
 		Server:  "mini",
@@ -45,11 +46,11 @@ func TestEndToEndMessageFlow(t *testing.T) {
 	defer bridge.UnregisterShed("dev")
 
 	// Register a host-side listener
-	listener, err := registry.Register("op")
+	listener, err := registry.Register(k("op"))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	defer registry.Unregister("op")
+	defer registry.Unregister(listener.Key(), listener.Token)
 
 	// === STEP 1: Agent sends a request via agent→host pipe ===
 	requestEnv := NewEnvelope("op", MessageTypeRequest, json.RawMessage(`{"cmd":"read","item":"github"}`))
@@ -73,7 +74,7 @@ func TestEndToEndMessageFlow(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if err := bridge.PublishToHost("dev", &receivedEnv); err != nil {
+	if err := bridge.PublishToHost(context.Background(), "dev", gen, &receivedEnv); err != nil {
 		t.Fatalf("PublishToHost: %v", err)
 	}
 
@@ -91,29 +92,26 @@ func TestEndToEndMessageFlow(t *testing.T) {
 	}()
 
 	// === STEP 3: Listener receives the message ===
-	select {
-	case msg := <-listener.Messages:
-		if msg.ID != requestEnv.ID {
-			t.Errorf("listener got wrong ID: %q != %q", msg.ID, requestEnv.ID)
-		}
-		if msg.Namespace != "op" {
-			t.Errorf("namespace = %q, want %q", msg.Namespace, "op")
-		}
-		if msg.Shed == nil || msg.Shed.Name != "dev" {
-			t.Errorf("shed info not enriched: %+v", msg.Shed)
-		}
-		if string(msg.Payload) != `{"cmd":"read","item":"github"}` {
-			t.Errorf("payload = %s", msg.Payload)
-		}
+	// It carries the ID the server gave the request, not the agent's.
+	msg := recv(t, listener)
+	if msg.ID == requestEnv.ID || msg.ID == "" {
+		t.Errorf("listener got the agent's own ID %q, want the server's", msg.ID)
+	}
+	if msg.Namespace != "op" {
+		t.Errorf("namespace = %q, want %q", msg.Namespace, "op")
+	}
+	if msg.Shed == nil || msg.Shed.Name != "dev" {
+		t.Errorf("shed info not enriched: %+v", msg.Shed)
+	}
+	if string(msg.Payload) != `{"cmd":"read","item":"github"}` {
+		t.Errorf("payload = %s", msg.Payload)
+	}
 
-		// === STEP 4: Listener responds via bridge ===
-		resp := NewResponse(msg.ID, "op", json.RawMessage(`{"token":"secret123"}`))
-		if err := bridge.SendToShed("dev", resp); err != nil {
-			t.Fatalf("SendToShed: %v", err)
-		}
-
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for message on listener")
+	// === STEP 4: Listener responds via bridge ===
+	resp := NewResponse(msg.ID, "op", json.RawMessage(`{"token":"secret123"}`))
+	resp.Shed = msg.Shed
+	if err := bridge.Respond("", resp); err != nil {
+		t.Fatalf("Respond: %v", err)
 	}
 
 	// === STEP 5: Agent reads response from host→agent pipe ===
@@ -149,14 +147,15 @@ func TestEndToEndMessageFlow(t *testing.T) {
 // VMs are correctly routed to the right namespace listener.
 func TestConcurrentPublishFromMultipleSheds(t *testing.T) {
 	registry := NewRegistry()
-	bridge := NewBridge(registry)
+	bridge := NewBridge(registry, false)
 
-	listener, _ := registry.Register("op")
-	defer registry.Unregister("op")
+	listener, _ := registry.Register(k("op"))
+	defer registry.Unregister(listener.Key(), listener.Token)
 
 	shedNames := []string{"dev1", "dev2", "dev3", "dev4", "dev5"}
+	gens := map[string]uint64{}
 	for _, name := range shedNames {
-		bridge.RegisterShed(name, &ShedConn{
+		gens[name] = bridge.RegisterShed(name, &ShedConn{
 			Name:    name,
 			Backend: "vz",
 			Server:  "mini",
@@ -173,7 +172,7 @@ func TestConcurrentPublishFromMultipleSheds(t *testing.T) {
 			defer wg.Done()
 			for range messagesPerShed {
 				env := NewEnvelope("op", MessageTypeEvent, json.RawMessage(`{}`))
-				if err := bridge.PublishToHost(name, env); err != nil {
+				if err := bridge.PublishToHost(context.Background(), name, gens[name], env); err != nil {
 					t.Errorf("PublishToHost from %s: %v", name, err)
 				}
 			}
@@ -190,7 +189,11 @@ func TestConcurrentPublishFromMultipleSheds(t *testing.T) {
 		defer close(done)
 		for range expected {
 			select {
-			case msg := <-listener.Messages:
+			case m := <-listener.Messages:
+				msg := listener.Take(m)
+				if msg == nil {
+					continue
+				}
 				received++
 				if msg.Shed != nil {
 					shedCounts[msg.Shed.Name]++
@@ -220,21 +223,21 @@ func TestConcurrentPublishFromMultipleSheds(t *testing.T) {
 func TestSSEDisconnectCleansUp(t *testing.T) {
 	registry := NewRegistry()
 
-	_, err := registry.Register("op")
+	l, err := registry.Register(k("op"))
 	if err != nil {
 		t.Fatalf("first register: %v", err)
 	}
 
 	// Duplicate should fail
-	if _, err := registry.Register("op"); err == nil {
+	if _, err := registry.Register(k("op")); err == nil {
 		t.Fatal("expected duplicate registration to fail")
 	}
 
 	// Simulate SSE disconnect
-	registry.Unregister("op")
+	registry.Unregister(l.Key(), l.Token)
 
 	// Should be available again
-	if _, err := registry.Register("op"); err != nil {
+	if _, err := registry.Register(k("op")); err != nil {
 		t.Fatalf("re-register after unregister: %v", err)
 	}
 }

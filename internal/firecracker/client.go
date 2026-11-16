@@ -231,7 +231,7 @@ func (c *Client) resumeInstance(ctx context.Context, name string) {
 		return
 	}
 
-	c.credMgr.ResumeMessageChannel(name, c.newAgentClient(name), meta.Owner != "")
+	c.credMgr.ResumeMessageChannel(name, c.newAgentClient(name), vmutil.BusIdentityOf(meta.Owner, meta.User, meta.CreatedAt))
 }
 
 // vmmServesInstance reports whether pid is a live Firecracker VMM serving

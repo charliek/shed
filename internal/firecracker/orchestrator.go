@@ -453,7 +453,7 @@ func (b *fcCreator) SetupCredentials(ctx context.Context, req config.CreateShedR
 		backend.Status(ctx, "Setting up credentials...")
 	}
 	agent := b.c.newAgentClient(meta.Name)
-	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mount9PCredentialFunc(req.Name), meta.Owner != "")
+	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mount9PCredentialFunc(req.Name), vmutil.BusIdentityOf(meta.Owner, meta.User, meta.CreatedAt))
 }
 
 // ConfigureEgressProxy opens this shed's egress proxy listener and injects the
@@ -797,7 +797,7 @@ func (b *fcStarter) SetupCredentials(ctx context.Context, metaRaw orchestrator.M
 	meta := metaRaw.(*fcMetaHandle).meta
 	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	agent := b.c.newAgentClient(meta.Name)
-	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mount9PCredentialFunc(meta.Name), meta.Owner != "")
+	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mount9PCredentialFunc(meta.Name), vmutil.BusIdentityOf(meta.Owner, meta.User, meta.CreatedAt))
 }
 
 // ConfigureEgressProxy re-opens this shed's egress proxy listener on the

@@ -12,6 +12,7 @@ import (
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/state"
 	"github.com/charliek/shed/internal/remote/transport"
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 // listRetry is the pause between attempts at the first cloud list.
@@ -298,7 +299,9 @@ func (b *Backend) reconcile(ctx context.Context, insts []provider.Instance) {
 			b.logf("remote: reconcile: no link to shed %s: %v", rec.Shed.Name, err)
 			continue
 		}
-		b.credMgr.ResumeMessageChannel(rec.Shed.Name, agent, rec.Shed.Owner != "")
+		b.joinBus(rec.Shed.Name, rec.Shed.ID, func(id vmutil.BusIdentity) {
+			b.credMgr.ResumeMessageChannel(rec.Shed.Name, agent, id)
+		})
 	}
 }
 
@@ -342,6 +345,12 @@ func (b *Backend) abandonedCreate(inst provider.Instance) bool {
 // leaves the record in memory as decided, and the next read decides again
 // from the label.
 func (b *Backend) reconcileUserLocked(r *state.Record, label string, note func(string, ...any)) bool {
+	before := busIdentity(r)
+	defer func() {
+		if after := busIdentity(r); after.User != before.User {
+			b.busUserChangedLocked(r)
+		}
+	}()
 	conflict := ""
 	changed := false
 	switch {
@@ -368,6 +377,138 @@ func (b *Backend) reconcileUserLocked(r *state.Record, label string, note func(s
 		changed = true
 	}
 	return changed
+}
+
+// busSync is the application of a shed's reported user to its bus route,
+// after a change of that user held the route (busUserChangedLocked).
+type busSync struct {
+	epoch   uint64 // the newest hold on the route, lifted once applied
+	running bool   // a worker is applying it
+	again   bool   // the reported user changed while the worker ran
+}
+
+// Test hooks (nil in production): busSyncHook runs in a bus-route worker
+// just before it applies the user it read, busSyncDoneHook when the worker
+// ends.
+var (
+	busSyncHook     func(name string)
+	busSyncDoneHook func(name string)
+)
+
+// busUserChangedLocked is called, under b.mu, the moment a record's reported
+// user changes (a label conflict that makes it unresolved, a heal, a
+// conflict that clears; every such change goes through reconcileUserLocked).
+// The shed's bus route is held at once, without waiting for anything: from
+// this instant no request of the shed, queued ones included, reaches the
+// previous user's machine and no answer of that machine begins to be written
+// into the shed, and the shed's pending requests are dropped. A frame
+// already being written finishes within its own bound. The new user is then
+// applied out of line by a worker for this shed alone (it takes the
+// credential manager's locks, which are never taken under b.mu), and the
+// hold is lifted when it has been applied.
+func (b *Backend) busUserChangedLocked(r *state.Record) {
+	name := r.Shed.Name
+	epoch := b.credMgr.SuspendShedRoute(name, r.Shed.CreatedAt)
+	s := b.busSyncs[name]
+	if s == nil {
+		s = &busSync{}
+		b.busSyncs[name] = s
+	}
+	s.epoch = epoch
+	b.runBusSyncLocked(name, s)
+}
+
+// runBusSyncLocked starts s's worker, or, when it is running, has it go
+// round again. The caller holds b.mu.
+func (b *Backend) runBusSyncLocked(name string, s *busSync) {
+	if s.running {
+		s.again = true
+		return
+	}
+	if b.closed {
+		return
+	}
+	s.running = true
+	b.wg.Add(1)
+	go b.busSyncWorker(name, s)
+}
+
+// busSyncWorker applies the shed name's reported user to its message
+// channel (CredentialManager.SetShedUser), reading the record afresh each
+// round, and then lifts the route hold. Each shed has at most one
+// worker. The hold is lifted only with the epoch read with the record (a
+// change since makes a new epoch and another round), and only while no
+// channel start is in progress (a start reads the record before it
+// registers, so it could register the previous user; its end runs the
+// worker again).
+func (b *Backend) busSyncWorker(name string, s *busSync) {
+	defer b.wg.Done()
+	if busSyncDoneHook != nil {
+		defer busSyncDoneHook(name)
+	}
+	for {
+		b.mu.Lock()
+		s.again = false
+		epoch := s.epoch
+		r := b.records[name]
+		have := r != nil && !b.closed
+		var id vmutil.BusIdentity
+		if have {
+			id = busIdentity(r)
+		}
+		b.mu.Unlock()
+
+		if busSyncHook != nil {
+			busSyncHook(name)
+		}
+		if have && !id.Owned && b.credMgr.SetShedUser(name, id.CreatedAt, id.User) {
+			b.logf("remote: shed %s now routes credential requests as user %q", name, id.User)
+		}
+
+		b.mu.Lock()
+		if s.again && !b.closed {
+			b.mu.Unlock()
+			continue
+		}
+		s.running = false
+		if b.busStarting[name] == 0 {
+			b.credMgr.ResumeShedRoute(name, epoch)
+			if b.busSyncs[name] == s {
+				delete(b.busSyncs, name)
+			}
+		}
+		b.mu.Unlock()
+		return
+	}
+}
+
+// joinBus opens (or resumes) the shed incarnation (name, shedID)'s message
+// channel with start, passing the bus identity its record reports now. It
+// counts the start as in progress, so a route held meanwhile is not lifted
+// before the channel is registered, and then runs the shed's pending
+// bus-route worker, if any, so the channel ends up with the newest user. A
+// shed whose record is gone, or is another incarnation now, is left alone.
+func (b *Backend) joinBus(name, shedID string, start func(vmutil.BusIdentity)) {
+	b.mu.Lock()
+	r := b.currentLocked(name, shedID)
+	if r == nil {
+		b.mu.Unlock()
+		return
+	}
+	id := busIdentity(r)
+	b.busStarting[name]++
+	b.mu.Unlock()
+
+	start(id)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.busStarting[name]--; b.busStarting[name] <= 0 {
+		delete(b.busStarting, name)
+	}
+	if s := b.busSyncs[name]; s != nil {
+		b.runBusSyncLocked(name, s)
+	}
 }
 
 // reconcileUserFromLocked is reconcileUserLocked from an instance a job or the
@@ -522,7 +663,9 @@ func (b *Backend) runProbe(ctx context.Context, j *job) error {
 		return errSuperseded
 	}
 	if agent, err := b.agentFor(rec); err == nil {
-		b.credMgr.ResumeMessageChannel(j.name, agent, rec.Shed.Owner != "")
+		b.joinBus(j.name, j.id, func(id vmutil.BusIdentity) {
+			b.credMgr.ResumeMessageChannel(j.name, agent, id)
+		})
 	}
 	if !b.update(j.name, j.id, func(r *state.Record) {
 		r.Shed.Status = config.StatusRunning

@@ -507,7 +507,7 @@ func TestCreateShedFromSnapshotMutualExclusionWrapsSentinel(t *testing.T) {
 // lose for every running shed.
 func newResumeTestClient(t *testing.T, cfg *config.VZConfig, inspect func(context.Context, int) (string, error)) (*Client, *plugin.Bridge) {
 	t.Helper()
-	bridge := plugin.NewBridge(plugin.NewRegistry())
+	bridge := plugin.NewBridge(plugin.NewRegistry(), false)
 	c := &Client{
 		cfg:         cfg,
 		vms:         make(map[string]*VM),
@@ -563,7 +563,7 @@ func vfkitCmdlineFrom(argv0 string, cfg *config.VZConfig, name string) string {
 // bridge — the observable these tests assert on rather than spying on the
 // walk itself.
 func resumedNames(b *plugin.Bridge) []string {
-	infos := b.ListSheds()
+	infos := b.ListSheds("", true)
 	names := make([]string, 0, len(infos))
 	for _, i := range infos {
 		names = append(names, i.Name)

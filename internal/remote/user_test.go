@@ -11,9 +11,11 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/remote/provider"
 	"github.com/charliek/shed/internal/remote/provider/fake"
 	"github.com/charliek/shed/internal/remote/state"
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 // createFor creates a shed for a user and waits for it to settle running.
@@ -823,4 +825,96 @@ func TestStopJobReconcilesTheUserLabel(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRemoteShedsJoinTheBusAsTheirUser: a remote shed is registered on the
+// credential bus with the user and incarnation of the server's own record,
+// and a service client's shed stays off it.
+func TestRemoteShedsJoinTheBusAsTheirUser(t *testing.T) {
+	bridge := plugin.NewBridge(plugin.NewRegistry(), true)
+	e := newEnv(t, func(e *env, _ *fake.Options) { e.tune = func(o *Options) { o.Bridge = bridge } })
+
+	e.createFor("box", "alice")
+	box := e.settled("box")
+	if u, ok := bridge.ShedUser("box"); !ok || u != "alice" {
+		t.Fatalf("ShedUser(box) = (%q, %v), want alice", u, ok)
+	}
+	if u, ok := bridge.IncarnationUser("box", box.CreatedAt); !ok || u != "alice" {
+		t.Fatalf("IncarnationUser(box) = (%q, %v), want alice", u, ok)
+	}
+
+	if _, err := e.b.CreateShed(ctxT(t), config.CreateShedRequest{Name: "svc", NoProvision: true, Owner: "nocturn"}); err != nil {
+		t.Fatal(err)
+	}
+	e.settled("svc")
+	if u, ok := bridge.ShedUser("svc"); ok {
+		t.Fatalf("a service client's shed is on the bus as %q", u)
+	}
+}
+
+// TestRemoteBusIdentity: the bus identity of a remote record is the reported
+// one: a stored owner keeps it off the bus, and a record whose instance
+// label names another user routes nowhere (unresolved).
+func TestRemoteBusIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		rec  state.Record
+		want vmutil.BusIdentity
+	}{
+		{"user", state.Record{Shed: config.Shed{User: "alice", CreatedAt: time.Unix(1, 0)}}, vmutil.BusIdentity{User: "alice", CreatedAt: time.Unix(1, 0)}},
+		{"client", state.Record{Shed: config.Shed{Owner: "nocturn"}}, vmutil.BusIdentity{Owned: true}},
+		{"both", state.Record{Shed: config.Shed{Owner: "nocturn", User: "alice"}}, vmutil.BusIdentity{Owned: true, User: config.UserUnresolved}},
+		{"label conflict", state.Record{Shed: config.Shed{User: "alice"}, UserConflict: "bob"}, vmutil.BusIdentity{User: config.UserUnresolved}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := busIdentity(&tc.rec)
+			if got.Owned != tc.want.Owned || got.User != tc.want.User || !got.CreatedAt.Equal(tc.want.CreatedAt) {
+				t.Fatalf("busIdentity = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// waitShedUser waits until the bridge routes the running shed name as want
+// (ok false: routed nowhere).
+func waitShedUser(t *testing.T, bridge *plugin.Bridge, name, want string, wantOK bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		u, ok := bridge.ShedUser(name)
+		if u == want && ok == wantOK {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bridge routes %s as (%q, %v), want (%q, %v)", name, u, ok, want, wantOK)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestRemoteBusRouteFollowsTheReportedUser: a running shed's bus route
+// follows every change of its reported ownership that a read of its instance
+// makes. A label naming another user makes it unresolved, so its requests
+// stop going to the previous user's machine; the label put back in line
+// routes it to its user again.
+func TestRemoteBusRouteFollowsTheReportedUser(t *testing.T) {
+	reg := plugin.NewRegistry()
+	bridge := plugin.NewBridge(reg, true)
+	e := newEnv(t, func(e *env, _ *fake.Options) { e.tune = func(o *Options) { o.Bridge = bridge } })
+	e.createFor("box", "alice")
+	waitShedUser(t, bridge, "box", "alice", true)
+
+	e.setUserLabel("box", "bob")
+	e.sweep()
+	e.idle()
+	if got := e.userOf("box"); got != config.UserUnresolved {
+		t.Fatalf("test set-up: box reported as %q, want %q", got, config.UserUnresolved)
+	}
+	waitShedUser(t, bridge, "box", "", false)
+
+	e.setUserLabel("box", "alice")
+	e.sweep()
+	e.idle()
+	waitShedUser(t, bridge, "box", "alice", true)
 }

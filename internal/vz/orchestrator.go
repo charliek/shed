@@ -422,7 +422,7 @@ func (b *vzCreator) SetupCredentials(ctx context.Context, req config.CreateShedR
 	meta := metaRaw.(*vzMetaHandle).meta
 	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	agent := b.c.newAgentClient(meta.Name)
-	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mountVirtioFSCredential, meta.Owner != "")
+	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mountVirtioFSCredential, vmutil.BusIdentityOf(meta.Owner, meta.User, meta.CreatedAt))
 }
 
 // ConfigureEgressProxy opens this shed's egress proxy listener and injects the
@@ -670,7 +670,7 @@ func (b *vzStarter) SetupCredentials(ctx context.Context, metaRaw orchestrator.M
 	meta := metaRaw.(*vzMetaHandle).meta
 	dirCreds := vmutil.SelectMounts(b.c.serverCfg, meta.MountSelection)
 	agent := b.c.newAgentClient(meta.Name)
-	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mountVirtioFSCredential, meta.Owner != "")
+	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mountVirtioFSCredential, vmutil.BusIdentityOf(meta.Owner, meta.User, meta.CreatedAt))
 }
 
 // ConfigureEgressProxy re-opens this shed's egress proxy listener on the

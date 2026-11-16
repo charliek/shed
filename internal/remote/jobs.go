@@ -502,7 +502,9 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		return b.failCreate(j, err, config.StatusReasonCreateFailed)
 	}
 	owned := rec.Shed.Owner != ""
-	b.credMgr.SetupCredentials(ctx, agent, j.name, nil, nil, owned)
+	b.joinBus(j.name, j.id, func(id vmutil.BusIdentity) {
+		b.credMgr.SetupCredentials(ctx, agent, j.name, nil, nil, id)
+	})
 
 	if rec.Shed.Repo != "" && !rec.Cloned {
 		repo := j.repoURL
@@ -876,7 +878,9 @@ func (b *Backend) runStart(ctx context.Context, j *job) error {
 	if err != nil {
 		return b.failStart(j, err, config.StatusReasonUnreachable, true)
 	}
-	b.credMgr.SetupCredentials(ctx, agent, j.name, nil, nil, rec.Shed.Owner != "")
+	b.joinBus(j.name, j.id, func(id vmutil.BusIdentity) {
+		b.credMgr.SetupCredentials(ctx, agent, j.name, nil, nil, id)
+	})
 	if !rec.NoProvision {
 		backend.Phase(ctx, "provision")
 		b.provision(ctx, agent, rec, false)

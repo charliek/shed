@@ -163,15 +163,20 @@ type Backend struct {
 	readyOnce sync.Once
 	sweepOnce sync.Once
 
-	mu       sync.Mutex
-	closed   bool
-	records  map[string]*state.Record // by shed name
-	jobs     map[string]*job          // lifecycle job in flight, by shed name
-	deletes  map[string]*job          // delete job in flight, by shed ID
-	pending  map[string]time.Time     // delete markers on disk: shed ID -> when acknowledged
-	conns    map[string]*shedLink     // by shed ID
-	idle     chan struct{}            // closed and replaced whenever a job ends
-	reported []string                 // what the last reconcile pass reported
+	mu      sync.Mutex
+	closed  bool
+	records map[string]*state.Record // by shed name
+	// busSyncs are the bus routes held for a change of the shed's reported
+	// user and not yet lifted; busStarting counts the message-channel starts
+	// in progress. Both by shed name (see busUserChangedLocked).
+	busSyncs    map[string]*busSync
+	busStarting map[string]int
+	jobs        map[string]*job      // lifecycle job in flight, by shed name
+	deletes     map[string]*job      // delete job in flight, by shed ID
+	pending     map[string]time.Time // delete markers on disk: shed ID -> when acknowledged
+	conns       map[string]*shedLink // by shed ID
+	idle        chan struct{}        // closed and replaced whenever a job ends
+	reported    []string             // what the last reconcile pass reported
 }
 
 var (
@@ -256,25 +261,27 @@ func New(opts Options) (*Backend, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Backend{
-		opts:       opts,
-		cfg:        opts.Config,
-		prov:       opts.Provider,
-		links:      opts.Links,
-		fw:         fw,
-		store:      store,
-		credMgr:    vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
-		logf:       opts.Logf,
-		now:        opts.Now,
-		clone:      vmutil.CloneRepo,
-		rootCtx:    ctx,
-		rootCancel: cancel,
-		ready:      make(chan struct{}),
-		records:    make(map[string]*state.Record),
-		jobs:       make(map[string]*job),
-		deletes:    make(map[string]*job),
-		pending:    make(map[string]time.Time),
-		conns:      make(map[string]*shedLink),
-		idle:       make(chan struct{}),
+		opts:        opts,
+		cfg:         opts.Config,
+		prov:        opts.Provider,
+		links:       opts.Links,
+		fw:          fw,
+		store:       store,
+		credMgr:     vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
+		logf:        opts.Logf,
+		now:         opts.Now,
+		clone:       vmutil.CloneRepo,
+		rootCtx:     ctx,
+		rootCancel:  cancel,
+		ready:       make(chan struct{}),
+		records:     make(map[string]*state.Record),
+		busSyncs:    make(map[string]*busSync),
+		busStarting: make(map[string]int),
+		jobs:        make(map[string]*job),
+		deletes:     make(map[string]*job),
+		pending:     make(map[string]time.Time),
+		conns:       make(map[string]*shedLink),
+		idle:        make(chan struct{}),
 	}
 	for _, r := range records {
 		b.records[r.Shed.Name] = r
@@ -415,6 +422,14 @@ func ownership(r *state.Record) (owner, user string) {
 		return "", config.UserUnresolved
 	}
 	return config.ShedOwnership(r.Shed.Owner, r.Shed.User)
+}
+
+// busIdentity is the credential-bus identity of a record's shed: a service
+// client's shed (any stored owner) stays off the bus, and the user is the
+// reported one, so a record whose user is in conflict routes nowhere.
+func busIdentity(r *state.Record) vmutil.BusIdentity {
+	_, user := ownership(r)
+	return vmutil.BusIdentity{Owned: r.Shed.Owner != "", User: user, CreatedAt: r.Shed.CreatedAt}
 }
 
 // saveLocked writes a record to disk. A failure is logged: the record in

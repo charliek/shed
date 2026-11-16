@@ -19,6 +19,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
+	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/users"
 	"github.com/charliek/shed/internal/users/userstest"
 )
@@ -261,7 +262,8 @@ func usersTestServer(t *testing.T, b backend.Backend) (*Server, http.Handler) {
 		Egress: &config.EgressConfig{Enabled: true},
 		Auth:   &config.AuthConfig{Mode: config.AuthModeMTLS},
 	}
-	s := NewServer(b, cfg, "", nil, nil)
+	reg := plugin.NewRegistry()
+	s := NewServer(b, cfg, "", reg, plugin.NewBridge(reg, true))
 	s.SetUserLookup(userLookup())
 	store, err := config.OpenUserProfileStore(t.TempDir())
 	if err != nil {
@@ -281,16 +283,22 @@ func doAs(h http.Handler, fp, method, path, body string) apiResp {
 	return do(h, testClientCert(fp, "control", time.Hour), method, path, body)
 }
 
-// doRouteAs is doAs for one route of the walk. The egress stream does not
-// end on its own, so it is served on a context that ends shortly.
+// doRouteAs is doAs for one route of the walk, with a credentials
+// certificate on the credential bus. The egress stream and a bus
+// subscription do not end on their own, so they are served on a context that
+// ends shortly.
 func doRouteAs(h http.Handler, fp, route, method, path, body string) apiResp {
-	if route != "GET /api/egress/stream" {
-		return doAs(h, fp, method, path, body)
+	scope := "control"
+	if strings.HasPrefix(userRouteClasses[route], "bus") {
+		scope = "credentials"
+	}
+	if route != "GET /api/egress/stream" && route != "GET /api/plugins/listeners/{namespace}/messages" {
+		return do(h, testClientCert(fp, scope, time.Hour), method, path, body)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	req := httptest.NewRequest(method, path, nil).WithContext(ctx)
-	withClientCert(req, testClientCert(fp, "control", time.Hour))
+	withClientCert(req, testClientCert(fp, scope, time.Hour))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return apiResp{rec.Code, rec.Body.Bytes(), rec.Header()}
@@ -304,8 +312,12 @@ func doRouteAs(h http.Handler, fp, route, method, path, body string) apiResp {
 //	create                   POST /api/sheds
 //	admin                    server-wide state with no owner: admin only
 //	any                      any user (lists are filtered by the guard)
-//	bus                      the credential bus: no shed here; routed by
-//	                         user in a later commit (plan 035, C7)
+//	bus:list                 a credential-bus listing: any user, filtered to
+//	                         the caller's own rows (an admin sees all)
+//	bus:subscribe            a credential-bus subscription: any user, as
+//	                         themselves
+//	bus:respond              an answer to a request of alice's shed "box":
+//	                         alice only (no admin exception), 403 otherwise
 //
 // A route added to Router() fails TestUserRouteWalk until it is classified.
 var userRouteClasses = map[string]string{
@@ -337,10 +349,10 @@ var userRouteClasses = map[string]string{
 	"POST /api/egress/{name}":                         "shed:enter",
 	"DELETE /api/egress/{name}":                       "shed:enter",
 	"POST /api/users/refresh":                         "admin",
-	"GET /api/plugins/listeners":                      "bus",
-	"GET /api/plugins/listeners/{namespace}/messages": "bus",
-	"POST /api/plugins/listeners/{namespace}/respond": "bus",
-	"GET /api/plugins/sheds":                          "bus",
+	"GET /api/plugins/listeners":                      "bus:list",
+	"GET /api/plugins/listeners/{namespace}/messages": "bus:subscribe",
+	"POST /api/plugins/listeners/{namespace}/respond": "bus:respond",
+	"GET /api/plugins/sheds":                          "bus:list",
 	"GET /api/sheds":                                  "any",
 	"POST /api/sheds":                                 "create",
 	"GET /api/sheds/{name}":                           "shed:view",
@@ -395,45 +407,49 @@ func routeRequest(route string) (method, path, body string) {
 // not running (503): a hijacked stream cannot be served by the recorder, and
 // the walk also checks that the dial reached the backend.
 var userRouteAllowed = map[string]int{
-	"GET /api/info":                               http.StatusOK,
-	"GET /api/ssh-host-key":                       http.StatusOK,
-	"GET /api/sessions":                           http.StatusOK,
-	"GET /api/overview":                           http.StatusOK,
-	"GET /api/images":                             http.StatusOK,
-	"GET /api/images/inspect":                     http.StatusOK,
-	"GET /api/images/inspect/{name}":              http.StatusOK,
-	"DELETE /api/images":                          http.StatusNoContent,
-	"DELETE /api/images/{name}":                   http.StatusNoContent,
-	"POST /api/images/prune":                      http.StatusOK,
-	"POST /api/images/pull":                       http.StatusOK,
-	"POST /api/images/push":                       http.StatusOK,
-	"POST /api/images/tag":                        http.StatusNoContent,
-	"GET /api/system/df":                          http.StatusOK,
-	"POST /api/system/prune":                      http.StatusOK,
-	"GET /api/snapshots":                          http.StatusOK,
-	"POST /api/snapshots":                         http.StatusCreated,
-	"GET /api/snapshots/{name}":                   http.StatusOK,
-	"DELETE /api/snapshots/{name}":                http.StatusNoContent,
-	"GET /api/egress/stream":                      http.StatusOK,
-	"GET /api/egress/profiles":                    http.StatusOK,
-	"GET /api/egress/profiles/{name}":             http.StatusOK,
-	"PUT /api/egress/profiles/{name}":             http.StatusOK,
-	"DELETE /api/egress/profiles/{name}":          http.StatusOK,
-	"GET /api/egress/{name}":                      http.StatusOK,
-	"POST /api/egress/{name}":                     http.StatusOK,
-	"DELETE /api/egress/{name}":                   http.StatusOK,
-	"POST /api/users/refresh":                     http.StatusOK,
-	"GET /api/sheds":                              http.StatusOK,
-	"POST /api/sheds":                             http.StatusCreated,
-	"GET /api/sheds/{name}":                       http.StatusOK,
-	"DELETE /api/sheds/{name}":                    http.StatusNoContent,
-	"POST /api/sheds/{name}/start":                http.StatusOK,
-	"POST /api/sheds/{name}/stop":                 http.StatusOK,
-	"POST /api/sheds/{name}/reset":                http.StatusOK,
-	"POST /api/sheds/{name}/exec":                 http.StatusOK,
-	"GET /api/sheds/{name}/sessions":              http.StatusOK,
-	"DELETE /api/sheds/{name}/sessions/{session}": http.StatusNoContent,
-	"GET /api/sheds/{name}/connect/{port}":        http.StatusServiceUnavailable,
+	"GET /api/info":                                   http.StatusOK,
+	"GET /api/ssh-host-key":                           http.StatusOK,
+	"GET /api/sessions":                               http.StatusOK,
+	"GET /api/overview":                               http.StatusOK,
+	"GET /api/images":                                 http.StatusOK,
+	"GET /api/images/inspect":                         http.StatusOK,
+	"GET /api/images/inspect/{name}":                  http.StatusOK,
+	"DELETE /api/images":                              http.StatusNoContent,
+	"DELETE /api/images/{name}":                       http.StatusNoContent,
+	"POST /api/images/prune":                          http.StatusOK,
+	"POST /api/images/pull":                           http.StatusOK,
+	"POST /api/images/push":                           http.StatusOK,
+	"POST /api/images/tag":                            http.StatusNoContent,
+	"GET /api/system/df":                              http.StatusOK,
+	"POST /api/system/prune":                          http.StatusOK,
+	"GET /api/snapshots":                              http.StatusOK,
+	"POST /api/snapshots":                             http.StatusCreated,
+	"GET /api/snapshots/{name}":                       http.StatusOK,
+	"DELETE /api/snapshots/{name}":                    http.StatusNoContent,
+	"GET /api/egress/stream":                          http.StatusOK,
+	"GET /api/egress/profiles":                        http.StatusOK,
+	"GET /api/egress/profiles/{name}":                 http.StatusOK,
+	"PUT /api/egress/profiles/{name}":                 http.StatusOK,
+	"DELETE /api/egress/profiles/{name}":              http.StatusOK,
+	"GET /api/egress/{name}":                          http.StatusOK,
+	"POST /api/egress/{name}":                         http.StatusOK,
+	"DELETE /api/egress/{name}":                       http.StatusOK,
+	"POST /api/users/refresh":                         http.StatusOK,
+	"GET /api/plugins/listeners":                      http.StatusOK,
+	"GET /api/plugins/listeners/{namespace}/messages": http.StatusOK,
+	"POST /api/plugins/listeners/{namespace}/respond": http.StatusNoContent,
+	"GET /api/plugins/sheds":                          http.StatusOK,
+	"GET /api/sheds":                                  http.StatusOK,
+	"POST /api/sheds":                                 http.StatusCreated,
+	"GET /api/sheds/{name}":                           http.StatusOK,
+	"DELETE /api/sheds/{name}":                        http.StatusNoContent,
+	"POST /api/sheds/{name}/start":                    http.StatusOK,
+	"POST /api/sheds/{name}/stop":                     http.StatusOK,
+	"POST /api/sheds/{name}/reset":                    http.StatusOK,
+	"POST /api/sheds/{name}/exec":                     http.StatusOK,
+	"GET /api/sheds/{name}/sessions":                  http.StatusOK,
+	"DELETE /api/sheds/{name}/sessions/{session}":     http.StatusNoContent,
+	"GET /api/sheds/{name}/connect/{port}":            http.StatusServiceUnavailable,
 }
 
 // TestUserRouteWalk walks every registered route and proves each is guarded
@@ -467,7 +483,7 @@ func TestUserRouteWalk(t *testing.T) {
 		if !walkedSet[k] {
 			t.Errorf("classified route %s is not registered (stale list)", k)
 		}
-		if _, ok := userRouteAllowed[k]; !ok && userRouteClasses[k] != "bus" {
+		if _, ok := userRouteAllowed[k]; !ok {
 			t.Errorf("route %s has no expected status for an allowed caller", k)
 		}
 	}
@@ -490,13 +506,18 @@ func TestUserRouteWalk(t *testing.T) {
 			}
 		}
 	}
+	// alice's shed "box" is connected to the credential bus.
+	box := &sendCounter{}
+	boxGen := s.bridge.RegisterShed("box", &plugin.ShedConn{User: "alice", CreatedAt: be.sheds["box"].CreatedAt, Send: box.send})
+
 	for _, route := range walked {
 		class := userRouteClasses[route]
-		if class == "bus" {
-			continue
-		}
 		method, path, body := routeRequest(route)
 		kind, action, _ := strings.Cut(class, ":")
+		if kind == "bus" {
+			walkBusRoute(t, s, router, be, route, action, box, boxGen)
+			continue
+		}
 
 		be.reset()
 		seed()
@@ -549,6 +570,58 @@ func TestUserRouteWalk(t *testing.T) {
 		default:
 			allowed("alice", route, kind, action, alice)
 		}
+	}
+}
+
+// walkBusRoute checks one credential-bus route of the walk for bob, root
+// and alice: the bus reaches no shed through the backend; a listing or a
+// subscription is allowed to every user, as themselves (a listing shows bob
+// nothing of alice's); an answer to a request of alice's shed is alice's
+// alone, refused to bob and to the admin with the forged-response 403.
+func walkBusRoute(t *testing.T, s *Server, router http.Handler, be *userFakeBackend, route, action string, box *sendCounter, boxGen uint64) {
+	t.Helper()
+	method, path, body := routeRequest(route)
+	if action == "respond" {
+		// A request of alice's shed, sent to alice's machine.
+		l, err := s.plugins.Register(plugin.ListenerKey{User: "alice", Namespace: "ssh-agent"})
+		if err != nil {
+			t.Fatalf("%s: registering alice's listener: %v", route, err)
+		}
+		defer s.plugins.Unregister(l.Key(), l.Token)
+		body = respondBody("box", publishFromShed(t, s, "box", boxGen))
+	}
+	before := box.count()
+	for _, who := range []struct{ name, fp string }{{"bob", bobFP}, {"admin", rootFP}, {"alice", aliceFP}} {
+		be.reset()
+		r := doRouteAs(router, who.fp, route, method, path, body)
+		if got := be.actedSnapshot(); len(got) != 0 {
+			t.Errorf("%s %s reached the backend: %v", who.name, route, got)
+		}
+		if action == "respond" && who.name != "alice" {
+			if r.code != http.StatusForbidden || r.errCode(t) != config.ErrForbidden {
+				t.Errorf("%s %s = %d %s, want 403 FORBIDDEN", who.name, route, r.code, r.body)
+			}
+			if n := box.count(); n != before {
+				t.Errorf("%s %s delivered a response to alice's shed", who.name, route)
+			}
+			continue
+		}
+		if want := userRouteAllowed[route]; r.code != want {
+			t.Errorf("%s %s = %d %s, want allowed with %d", who.name, route, r.code, r.body, want)
+			continue
+		}
+		if action == "list" {
+			mentions := strings.Contains(string(r.body), `"box"`) || strings.Contains(string(r.body), `"alice"`)
+			if who.name == "bob" && mentions {
+				t.Errorf("bob %s lists alice's rows: %s", route, r.body)
+			}
+			if who.name != "bob" && route == "GET /api/plugins/sheds" && !mentions {
+				t.Errorf("%s %s does not list alice's shed: %s", who.name, route, r.body)
+			}
+		}
+	}
+	if action == "respond" && box.count() != before+1 {
+		t.Errorf("alice %s: box was sent %d responses, want 1", route, box.count()-before)
 	}
 }
 

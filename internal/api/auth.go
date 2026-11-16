@@ -225,9 +225,10 @@ func authorizeScope(method, path, scope string) (detail string, ok bool) {
 	case isConnectRoute(path) || isEgressStreamPath(method, path):
 		// Neither is the credential bus. The Connect tunnel is a data-plane
 		// port-forward (`shed forward` uses control; the host-agent's reverse
-		// proxy uses credentials); the egress stream is fleet-global audit
-		// metadata (host-agent subscriber uses credentials; a control credential
-		// may tail it too). Both accept either scope.
+		// proxy uses credentials); the egress stream is audit metadata,
+		// filtered to the caller's own sheds unless the caller is an admin
+		// (host-agent subscriber uses credentials; a control credential may
+		// tail it too). Both accept either scope.
 		if scope != authtoken.ScopeControl && scope != authtoken.ScopeCredentials {
 			return "control or credentials scope required", false
 		}
@@ -269,13 +270,6 @@ func (s *Server) certSubjectUser(cn string) (users.User, bool) {
 	return u, true
 }
 
-// busOwnershipEnforced reports whether credential-bus /respond ownership is
-// validated against the registry's pending set. It is gated on auth being
-// enforced (mtls), so the default open-mode server keeps today's bus behavior.
-func (s *Server) busOwnershipEnforced() bool {
-	return s.cfg.AuthEnforced()
-}
-
 // isCredentialBusPath reports whether path is the credential bus (/api/plugins*),
 // which requires a credentials-scoped credential so a leaked control one can't
 // subscribe to the live-secret bus.
@@ -299,8 +293,8 @@ func isConnectRoute(path string) bool {
 	return len(parts) == 3 && parts[1] == "connect" && parts[0] != "" && parts[2] != ""
 }
 
-// isEgressStreamPath reports whether r targets the fleet-global egress audit SSE
-// stream (GET /api/egress/stream), consumed by the host-agent (credentials) and
+// isEgressStreamPath reports whether r targets the egress audit SSE stream
+// (GET /api/egress/stream, filtered per user), consumed by the host-agent (credentials) and
 // tailable by the CLI (control). It is method-scoped to GET on purpose: the
 // sibling POST/DELETE /api/egress/{name} mutators (handleEgressSet/Off) are
 // control-only, so a shed named "stream" must not let a credentials credential

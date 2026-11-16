@@ -564,9 +564,11 @@ func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 // handleEgressStream streams egress decisions as Server-Sent Events for the
 // host-agent subscriber (shed-extensions). GET /api/egress/stream
 //
-// In secure mode this route accepts a control OR credentials token (the
-// host-agent holds credentials; a control token may tail it) — see
-// authMiddleware. It is fleet-global: a subscriber sees every shed's decisions.
+// In mtls mode this route accepts a control OR credentials certificate (the
+// host-agent holds credentials; a control certificate may tail it) — see
+// authMiddleware. It is per user: an admin (and the implicit user of a server
+// with no user list) sees every shed's decisions; any other user sees only
+// those of their own sheds (egressRecordVisible).
 func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
 	if s.egressAudit == nil {
 		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not enabled")
@@ -578,8 +580,12 @@ func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	caller := callerFrom(r.Context())
 	events := make(chan egress.AuditRecord, 256)
 	unsub := s.egressAudit.Subscribe(func(rec egress.AuditRecord) {
+		if !s.egressRecordVisible(caller, rec) {
+			return
+		}
 		select {
 		case events <- rec:
 		default: // drop on overflow; never block the data path
@@ -602,6 +608,27 @@ func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// egressRecordVisible reports whether caller may see rec on the egress
+// stream. An admin, and the implicit user, see every record. Any other user
+// sees a record only when the shed incarnation it came from (its name and
+// creation time, which every live record carries) is connected now and
+// belongs to them; it is decided afresh for every record and never cached by
+// shed name, so a shed deleted and created again under its name by another
+// user shows that user's records to that user only. A record of a service
+// client's shed, of a shed with no user, of an unresolved one, or of an
+// incarnation that is not connected reaches admins only. A service client
+// sees nothing.
+func (s *Server) egressRecordVisible(caller Caller, rec egress.AuditRecord) bool {
+	if caller.IsAdmin() {
+		return true
+	}
+	if caller.Kind != CallerUser || caller.User == "" || s.bridge == nil {
+		return false
+	}
+	user, ok := s.bridge.IncarnationUser(rec.Shed, rec.ShedCreatedAt)
+	return ok && user == caller.User
 }
 
 // handleEgressOff turns egress off for a shed.

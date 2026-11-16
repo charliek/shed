@@ -199,14 +199,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	probeStateDirs(cfg)
 
 	// Initialize plugin system (before backends, since backends use the bridge)
+	// The registry tracks pending requests in every mode, so a response is
+	// always delivered to the shed connection its request came from. The
+	// bridge routes each shed's requests to its user's listeners; a server
+	// with no user list (the only kind that loads today) routes every shed
+	// as the implicit user.
 	pluginRegistry := plugin.NewRegistry()
-	// Track pending requests only when auth is enforced (mtls) — the
-	// /respond ownership gate is consulted only then, so an unauthenticated
-	// open-mode server does no bookkeeping.
-	if cfg.AuthEnforced() {
-		pluginRegistry.EnableOwnershipTracking()
-	}
-	pluginBridge := plugin.NewBridge(pluginRegistry)
+	pluginBridge := plugin.NewBridge(pluginRegistry, false)
 
 	// Initialize the configured backend. egressSocketDir + attachEgress are
 	// captured per-backend so the egress proxy (constructed once, below) can
