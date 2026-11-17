@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-zero",
+  "description": "429 with Retry-After: 0: one digit, a wait of at least zero seconds (rule 2); the client's own retry schedule applies.",
+  "response": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "0"
+    },
+    "body": {
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": 0
+  }
+}

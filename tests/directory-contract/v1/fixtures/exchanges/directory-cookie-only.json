@@ -1,0 +1,29 @@
+{
+  "name": "directory-cookie-only",
+  "description": "A cookie and no bearer token: /v1 never reads cookies, so this is a request with no credential, 401 invalid_token.",
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {
+      "Cookie": "__Host-session=opaque-test-value"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

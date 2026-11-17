@@ -1,0 +1,35 @@
+{
+  "name": "directory-insufficient-scope",
+  "description": "A token signed with the service's own key for the live server srv-a, but whose scope is not directory:read (the token endpoint issues only directory:read in this version; the harness signs this one itself, see `token`): 403 INSUFFICIENT_SCOPE.",
+  "token": {
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "scope": [
+      "other:read"
+    ]
+  },
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {
+      "Authorization": "Bearer {{access_token}}"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 403,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "error": {
+        "code": "INSUFFICIENT_SCOPE",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

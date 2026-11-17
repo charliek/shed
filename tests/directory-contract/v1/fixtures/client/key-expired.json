@@ -1,0 +1,158 @@
+{
+  "name": "key-expired",
+  "description": "Classification never depends on the clock. A key whose expires is already past (2026-11-01, before the world's clock) stays in its user's keys and is counted for duplicates; it opens no connection. bob, whose only key has expired, is still a listed user; carol keeps both her expired and her current key; dave's expired key is the key erin lists, so both are skipped (rule 7).",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "contract": 1,
+      "organization": "example",
+      "version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "generated_at": "2026-11-16T06:00:00Z",
+      "rules": {
+        "version": 0
+      },
+      "users": [
+        {
+          "name": "ada",
+          "admin": true,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+              "label": "laptop"
+            },
+            {
+              "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+              "label": "yubikey"
+            }
+          ]
+        },
+        {
+          "name": "bob",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+              "label": "laptop",
+              "expires": "2026-11-01T00:00:00Z"
+            }
+          ]
+        },
+        {
+          "name": "carol",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO8fd5tNsoV/rj9hOkas4nY6UkrUTJ5sYB5U4uqCxtlR",
+              "label": "desk",
+              "expires": "2026-11-01T00:00:00Z"
+            },
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDGGt3mM1CzzhTeoSaXhz5LTrMGKtctoIugKBssGGpKi",
+              "label": "laptop"
+            }
+          ]
+        },
+        {
+          "name": "dave",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKYXkBjz6tqlFzJhkm2QLBRr5EsaUYsMJcFRaF9U5hBB",
+              "label": "laptop",
+              "expires": "2026-11-01T00:00:00Z"
+            }
+          ]
+        },
+        {
+          "name": "erin",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKYXkBjz6tqlFzJhkm2QLBRr5EsaUYsMJcFRaF9U5hBB",
+              "label": "key-1"
+            }
+          ]
+        },
+        {
+          "name": "turing",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIERf1v1GIX0HaSB21SvWXsjbjLpQw4bbLwkBKozSaD4K",
+              "label": "laptop"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          },
+          {
+            "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+            "label": "yubikey"
+          }
+        ]
+      },
+      {
+        "name": "bob",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+            "label": "laptop",
+            "expires": "2026-11-01T00:00:00Z"
+          }
+        ]
+      },
+      {
+        "name": "carol",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO8fd5tNsoV/rj9hOkas4nY6UkrUTJ5sYB5U4uqCxtlR",
+            "label": "desk",
+            "expires": "2026-11-01T00:00:00Z"
+          },
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDGGt3mM1CzzhTeoSaXhz5LTrMGKtctoIugKBssGGpKi",
+            "label": "laptop"
+          }
+        ]
+      },
+      {
+        "name": "turing",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIERf1v1GIX0HaSB21SvWXsjbjLpQw4bbLwkBKozSaD4K",
+            "label": "laptop"
+          }
+        ]
+      }
+    ],
+    "skipped": [
+      {
+        "entry": 3,
+        "reason": "duplicate-key"
+      },
+      {
+        "entry": 4,
+        "reason": "duplicate-key"
+      }
+    ]
+  }
+}

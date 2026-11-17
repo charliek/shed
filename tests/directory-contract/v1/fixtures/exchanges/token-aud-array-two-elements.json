@@ -1,0 +1,35 @@
+{
+  "name": "token-aud-array-two-elements",
+  "description": "An assertion whose aud is an array of two elements, the issuer string and another audience: only the string or a one-element array holding it is accepted, so invalid_client (rule 10).",
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "aud": [
+      "https://accounts.example.test",
+      "https://other.example.test"
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}"
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "error": "invalid_client",
+      "error_description": "{{description}}"
+    }
+  }
+}

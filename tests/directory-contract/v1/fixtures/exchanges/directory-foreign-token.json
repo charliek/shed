@@ -1,0 +1,29 @@
+{
+  "name": "directory-foreign-token",
+  "description": "An access token another issuer (a sign-in provider) issued a person (another issuer, another key, audience accounts, unexpired): refused, 401 invalid_token. Only a server's token from the service's own token endpoint opens /v1.",
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {
+      "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6ImZvcmVpZ24tdGVzdC0xIn0.eyJhdWQiOlsiYWNjb3VudHMiXSwiY2xpZW50X2lkIjoiYWNjb3VudHMiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTc5NDgwODgwMCwiaXNzIjoiaHR0cHM6Ly9zaWduaW4uZXhhbXBsZS50ZXN0IiwianRpIjoiZm9yZWlnbi1hY2Nlc3MtdG9rZW4iLCJuYmYiOjE3OTQ4MDg4MDAsInJvbGVzIjpbImFkbWluIl0sInNjb3BlIjoib3BlbmlkIGVtYWlsIHByb2ZpbGUiLCJzdWIiOiJzdWJqZWN0LWFkYSJ9.kXaaDyjazqVIct2EVEqRxfiMh5M-2lBM-zr07lmyMu5rOcOLM1mw1NiZ7csVO-X_mxfFQ2f3qv1yPBEWN-nsr-sfNuGZREWzd-3ZS2wJf-4oq7Xmuqmh6JCboKYGtGAEGse0vELOqEPjUZeU9tLebpb9l2mBMhBkqLASrpxcze7tpjXxkfZCFAZ6rbmOtmnAaLnyIEAxxLVmtqLotOtMwiLdhDxeZXdS83_jpZ0J0betBAd2FhTdFEbqXu7OL2aZ0DaCgSXj_bovqlcLCGsH0YyhxBz2MF3dDzdPAcd8Jgy65N5_dbWgbKg9z2T7HMAdyGHy_8ImlrBE__9mMK8y3Q"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

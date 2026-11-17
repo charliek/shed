@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-huge",
+  "description": "429 with a Retry-After of 23 digits, more than any integer type a client may parse into holds: still one or more ASCII digits, so a value over an hour, treated as one hour, never as absent (rule 2).",
+  "response": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "99999999999999999999999"
+    },
+    "body": {
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": 3600
+  }
+}

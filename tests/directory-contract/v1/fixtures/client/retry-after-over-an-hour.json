@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-over-an-hour",
+  "description": "429 with Retry-After: 7200: waited at most one hour (rule 2).",
+  "response": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "7200"
+    },
+    "body": {
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": 3600
+  }
+}

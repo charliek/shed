@@ -1,0 +1,5 @@
+{
+  "line": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBP/////////////////////////////////////////+/////wAAAAAAAAABAAAAAYzerbvQSRGjwZMeJt8/pkOdypx+sob71G/DGfDiu3gCMrr1eCX8DBkSraL+/oQCTA==",
+  "code": "EC_POINT_NOT_ON_CURVE",
+  "shed_also_refuses": true
+}

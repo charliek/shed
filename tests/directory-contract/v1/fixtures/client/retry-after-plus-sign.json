@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-plus-sign",
+  "description": "429 with Retry-After: +30: a sign is not a digit, so treated as absent, though a signed-integer parser would read 30 (rule 2).",
+  "response": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "+30"
+    },
+    "body": {
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

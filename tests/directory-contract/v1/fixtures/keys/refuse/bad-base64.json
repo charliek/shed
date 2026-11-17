@@ -1,0 +1,5 @@
+{
+  "line": "ssh-ed25519 AAAA!!!! corpus",
+  "code": "BAD_BASE64",
+  "shed_also_refuses": true
+}

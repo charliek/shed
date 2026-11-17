@@ -1,0 +1,5 @@
+{
+  "line": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAzODQAAABhBBOqMDNBkhtv3EBmGdhNK8V9vUlG2b/sZHV6gZpGoJWLL5AJI9dadjvHN5RBxZsqoV01KEqL3OFHmkMtpeLdXKHvZsvax8BsSFuj+HTJbd3JsFPn0Kmz5E1I96ullcNMDA==",
+  "code": "CURVE_MISMATCH",
+  "shed_also_refuses": true
+}

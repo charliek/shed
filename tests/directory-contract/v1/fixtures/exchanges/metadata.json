@@ -1,0 +1,39 @@
+{
+  "name": "metadata",
+  "description": "The service's RFC 8414 authorization server metadata: the issuer, the token endpoint, the JWKS, the one grant (client_credentials), the one client authentication method (private_key_jwt) with its two algorithms, and the one scope. Nothing a person would use.",
+  "request": {
+    "method": "GET",
+    "path": "/.well-known/oauth-authorization-server",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": null,
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "grant_types_supported": [
+        "client_credentials"
+      ],
+      "issuer": "https://accounts.example.test",
+      "jwks_uri": "https://accounts.example.test/.well-known/jwks.json",
+      "scopes_supported": [
+        "directory:read"
+      ],
+      "token_endpoint": "https://accounts.example.test/oauth2/token",
+      "token_endpoint_auth_methods_supported": [
+        "private_key_jwt"
+      ],
+      "token_endpoint_auth_signing_alg_values_supported": [
+        "ES256",
+        "EdDSA"
+      ]
+    }
+  }
+}

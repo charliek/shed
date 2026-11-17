@@ -1,0 +1,5 @@
+{
+  "line": "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAMoEw2dhSbScXBR6PEB4tmDp7ETCpBH7fa8qTTL6jx2kio6TmwS0ajmvSyfGmQulDffnExcYUag6d2ogqtyNoYQawEyBPNlDV641OiPnLLFHEERPtKsClmjR+s8XPIok3y26KxlA6rK25X58hqPcR7XHFQbGr1y0cyIHMHepMcQ8jx4FA==",
+  "code": "EC_POINT_NOT_ON_CURVE",
+  "shed_also_refuses": true
+}

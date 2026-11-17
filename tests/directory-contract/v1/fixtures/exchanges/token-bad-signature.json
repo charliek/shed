@@ -1,0 +1,31 @@
+{
+  "name": "token-bad-signature",
+  "description": "An assertion naming srv-a but signed with a key srv-a never enrolled (enrol-ed25519): invalid_client, as a 401 with the one fixed description and no WWW-Authenticate.",
+  "assertion": {
+    "key": "enrol-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}"
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "error": "invalid_client",
+      "error_description": "{{description}}"
+    }
+  }
+}

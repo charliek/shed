@@ -1,0 +1,5 @@
+{
+  "line": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQACAAABAQC+v+O1P/GWE9DAIs2GVWxS1WETOrUilTFP3NCGInkIvruB5qpnzkJjD7dQE3ytcjmJ85OCowUHQwprQx0m/9q4x/wFD6oxIR+ItTZYrptqIt2GPKJ1hTSrhU8hQodVAz9vPapFbb+Ny9+W0iITSIhytvPFgtF+9dTGitmjHeXGgeztMjMjecixp54hNsqpgQMCBIgpWZqvoI82VmNtE71oxe2e2bYUlGaSF27K28znEsMU3G4nrgEqRlFeDP2VyAjxBxl7QjOGIocCQ0IFywkBumbzKZQrwVmeON/z3EpFotguWWC53sy8qgThBHsKPqY1WJgRDTS1iID9t0dHN9Ip",
+  "code": "RSA_BAD_EXPONENT",
+  "shed_also_refuses": true
+}

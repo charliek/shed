@@ -1,0 +1,5 @@
+{
+  "line": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAAA==",
+  "code": "RSA_NOT_POSITIVE",
+  "shed_also_refuses": false
+}

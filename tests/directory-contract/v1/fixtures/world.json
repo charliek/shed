@@ -1,0 +1,101 @@
+{
+  "contract": 1,
+  "organization": "example",
+  "issuer": "https://accounts.example.test",
+  "clock": "2026-11-16T06:00:00Z",
+  "users": [
+    {
+      "name": "ada",
+      "admin": true,
+      "keys": [
+        {
+          "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+          "label": "laptop"
+        },
+        {
+          "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+          "label": "yubikey"
+        }
+      ]
+    },
+    {
+      "name": "linus",
+      "admin": false,
+      "keys": [
+        {
+          "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEeWBu3C9yakpSruddaMXyxBJe9M+Ykumvj49G+jJxeX",
+          "label": "desk",
+          "expires": "2027-01-01T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "name": "turing",
+      "admin": false,
+      "keys": [
+        {
+          "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIERf1v1GIX0HaSB21SvWXsjbjLpQw4bbLwkBKozSaD4K",
+          "label": "laptop"
+        }
+      ]
+    }
+  ],
+  "servers": [
+    {
+      "name": "srv-a",
+      "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "key": "server-ed25519",
+      "enrolled_at": "2026-11-01T00:00:00Z",
+      "note": "live, enrolled with test-keys/server-ed25519"
+    },
+    {
+      "name": "srv-b",
+      "client_id": "srv_0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "key": "server-p256",
+      "enrolled_at": "2026-11-01T00:00:00Z",
+      "disabled_at": "2026-11-10T00:00:00Z",
+      "note": "disabled, enrolled with test-keys/server-p256"
+    }
+  ],
+  "codes": [
+    {
+      "code": "pending-code-for-srv-c-0000000000000",
+      "server_name": "srv-c",
+      "created_at": "2026-11-16T05:50:00Z",
+      "expires_at": "2026-11-16T06:20:00Z",
+      "state": "pending"
+    },
+    {
+      "code": "pending-code-for-srv-a-0000000000000",
+      "server_name": "srv-a",
+      "created_at": "2026-11-16T05:50:00Z",
+      "expires_at": "2026-11-16T06:20:00Z",
+      "state": "pending",
+      "note": "for the name a live server holds"
+    },
+    {
+      "code": "spent-code-of-srv-a-0000000000000000",
+      "server_name": "srv-a",
+      "created_at": "2026-10-31T23:50:00Z",
+      "expires_at": "2026-11-01T00:20:00Z",
+      "state": "spent",
+      "server": "srv-a"
+    },
+    {
+      "code": "cancelled-code-for-srv-d-00000000000",
+      "server_name": "srv-d",
+      "created_at": "2026-11-16T05:30:00Z",
+      "expires_at": "2026-11-16T06:30:00Z",
+      "state": "cancelled",
+      "cancelled_at": "2026-11-16T05:40:00Z"
+    },
+    {
+      "code": "expired-code-for-srv-e-0000000000000",
+      "server_name": "srv-e",
+      "created_at": "2026-11-16T05:00:00Z",
+      "expires_at": "2026-11-16T05:30:00Z",
+      "state": "pending",
+      "note": "unspent and past its expiry"
+    }
+  ]
+}

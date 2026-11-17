@@ -64,6 +64,9 @@ vendor/
 # so a fixed pair is committed for a stable leaf-DER pin). See tests/host-agent-diff/README.
 !tests/host-agent-diff/fixtures/synthetic_bus_cert.pem
 !tests/host-agent-diff/fixtures/synthetic_bus_key.pem
+# Exception: the directory contract's throwaway test keys (non-secret; made for the
+# fixtures and listed in its manifest). See tests/directory-contract/README.md.
+!tests/directory-contract/v1/fixtures/test-keys/*.pem
 
 # Desktop app local secrets (Sparkle private key, notarization creds)
 desktop/.secrets/

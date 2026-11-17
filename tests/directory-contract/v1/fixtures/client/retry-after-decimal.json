@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-decimal",
+  "description": "429 with Retry-After: 30.0: a decimal point is not a digit, so treated as absent (rule 2).",
+  "response": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "30.0"
+    },
+    "body": {
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

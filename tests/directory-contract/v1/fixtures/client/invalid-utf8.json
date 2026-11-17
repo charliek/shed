@@ -1,0 +1,16 @@
+{
+  "name": "invalid-utf8",
+  "description": "The body holds one byte (0xFF) that is not UTF-8, inside a member a reader ignores: the whole answer is refused (rule 6). It is never repaired, by a replacement character or otherwise. The body is given as body_base64 because a JSON string cannot carry it.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body_base64": "eyJjb250cmFjdCI6MSwib3JnYW5pemF0aW9uIjoiZXhhbXBsZSIsInZlcnNpb24iOiIwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwiZ2VuZXJhdGVkX2F0IjoiMjAyNi0xMS0xNlQwNjowMDowMFoiLCJydWxlcyI6eyJ2ZXJzaW9uIjowfSwidXNlcnMiOlt7Im5hbWUiOiJhZGEiLCJhZG1pbiI6dHJ1ZSwia2V5cyI6W3sia2V5Ijoic3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUJ5N2JRdEs3SEtMZzI0SmRhL3lwTzVNSzZEWWFwVUU3c3pseWUydzRQaGUiLCJsYWJlbCI6ImxhcHRvcCJ9LHsia2V5IjoiZWNkc2Etc2hhMi1uaXN0cDI1NiBBQUFBRTJWalpITmhMWE5vWVRJdGJtbHpkSEF5TlRZQUFBQUlibWx6ZEhBeU5UWUFBQUJCQkpzZ1A3Zk1vd29SOWVjeFEwMHp2anZLVitQT2VDSG0rdi9ESGtKL1ZFUGhRcy9RazJ1TmpqeHRTYVBDdHJxcmhQTUFpeWFsY09oNHVWZFVieW5iSFR3PSIsImxhYmVsIjoieXViaWtleSJ9XSwiZGlzcGxheSI6IkFk/2EifSx7Im5hbWUiOiJ0dXJpbmciLCJhZG1pbiI6ZmFsc2UsImtleXMiOlt7ImtleSI6InNzaC1lZDI1NTE5IEFBQUFDM056YUMxbFpESTFOVEU1QUFBQUlFUmYxdjFHSVgwSGFTQjIxU3ZXWHNqYmpMcFF3NGJiTHdrQktvelNhRDRLIiwibGFiZWwiOiJsYXB0b3AifV19XX0="
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

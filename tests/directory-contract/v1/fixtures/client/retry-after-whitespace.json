@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-whitespace",
+  "description": "503 with Retry-After \" 45\\t\": optional whitespace around the digits is trimmed, so 45 seconds (rule 2).",
+  "response": {
+    "status": 503,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": " 45\t"
+    },
+    "body": {
+      "error": {
+        "code": "UNAVAILABLE",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": 45
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "line": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOVzZKKwOmTO0hU1SOKYkhX1xXdv5o1do9QKlxN4ibbxAAAAAA==",
+  "code": "TRAILING_BYTES",
+  "shed_also_refuses": true
+}

@@ -1,0 +1,65 @@
+{
+  "name": "all-skipped",
+  "description": "Every user skipped (two named bob, and carol with no key): a good answer, as authoritative as an empty list.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "contract": 1,
+      "organization": "example",
+      "version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "generated_at": "2026-11-16T06:00:00Z",
+      "rules": {
+        "version": 0
+      },
+      "users": [
+        {
+          "name": "bob",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+              "label": "key-1"
+            }
+          ]
+        },
+        {
+          "name": "bob",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO8fd5tNsoV/rj9hOkas4nY6UkrUTJ5sYB5U4uqCxtlR",
+              "label": "key-1"
+            }
+          ]
+        },
+        {
+          "name": "carol",
+          "admin": false,
+          "keys": []
+        }
+      ]
+    }
+  },
+  "expect": {
+    "result": "good",
+    "users": [],
+    "skipped": [
+      {
+        "entry": 0,
+        "reason": "duplicate-name"
+      },
+      {
+        "entry": 1,
+        "reason": "duplicate-name"
+      },
+      {
+        "entry": 2,
+        "reason": "no-usable-key"
+      }
+    ]
+  }
+}

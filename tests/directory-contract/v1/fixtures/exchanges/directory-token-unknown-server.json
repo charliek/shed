@@ -1,0 +1,35 @@
+{
+  "name": "directory-token-unknown-server",
+  "description": "A token signed with the service's own key, well formed in every claim, for a client id no server has: 401 invalid_token, as for a server that no longer exists.",
+  "token": {
+    "client_id": "srv_0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+    "scope": [
+      "directory:read"
+    ]
+  },
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {
+      "Authorization": "Bearer {{access_token}}"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

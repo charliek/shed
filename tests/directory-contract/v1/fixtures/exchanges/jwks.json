@@ -1,0 +1,33 @@
+{
+  "name": "jwks",
+  "description": "The service's token verification keys: its one RS256 signing key, under its key id. A client never needs them; they are public.",
+  "request": {
+    "method": "GET",
+    "path": "/.well-known/jwks.json",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": null,
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "keys": [
+        {
+          "alg": "RS256",
+          "e": "AQAB",
+          "kid": "test-signing-1",
+          "kty": "RSA",
+          "n": "3BxPYbEedUiBvngoIlqrZExulGO2bxBLnErnAe7fcH_2JrxdA0ci3vdprQAWFYsdztuRh7A0YRm2oX8rTrvIHEIc_5p1xnO8L7hDQbEaqezlKON4yzg3mAoEyUch6b2nwvFpmPZsNFZ5IRyLKPoZJf5BeKFn_LGDa1vLXjib8hf3bVHd6UaVZ00vy_Z412nN1BpCv0MzFSgQ3J6x-YAFV3TdORAkqvX1cElReM36HiuXgNKLe10NXRa_9xDuEStj07HWOfZF1yEF24Lgkv__3UWu8_81g8fnaFdocQYrbeMRtEsM5oQZ_Y0_jmX5ZnkzB4xamjVsYH5w7266xBtAoQ",
+          "use": "sig"
+        }
+      ]
+    }
+  }
+}

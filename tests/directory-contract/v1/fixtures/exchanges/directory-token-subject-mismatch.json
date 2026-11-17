@@ -1,0 +1,36 @@
+{
+  "name": "directory-token-subject-mismatch",
+  "description": "A token signed with the service's own key whose client_id is the live server srv-a and whose sub is another server (srv-b): sub must equal client_id, so 401 invalid_token, before any server is looked up.",
+  "token": {
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "scope": [
+      "directory:read"
+    ],
+    "sub": "srv_0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {
+      "Authorization": "Bearer {{access_token}}"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

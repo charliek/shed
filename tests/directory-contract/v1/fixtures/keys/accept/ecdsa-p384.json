@@ -1,0 +1,6 @@
+{
+  "line": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBBOqMDNBkhtv3EBmGdhNK8V9vUlG2b/sZHV6gZpGoJWLL5AJI9dadjvHN5RBxZsqoV01KEqL3OFHmkMtpeLdXKHvZsvax8BsSFuj+HTJbd3JsFPn0Kmz5E1I96ullcNMDA== corpus-ecdsa-p384",
+  "canonical": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBBOqMDNBkhtv3EBmGdhNK8V9vUlG2b/sZHV6gZpGoJWLL5AJI9dadjvHN5RBxZsqoV01KEqL3OFHmkMtpeLdXKHvZsvax8BsSFuj+HTJbd3JsFPn0Kmz5E1I96ullcNMDA==",
+  "fingerprint": "SHA256:iUJc/m44urxZU9WjTLFAn3PMSlwNHtozM7sy1rdaowY",
+  "algorithm": "ecdsa-sha2-nistp384"
+}

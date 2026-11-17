@@ -1,0 +1,25 @@
+{
+  "name": "retry-after-repeated",
+  "description": "429 with Retry-After given twice, as two header lines (each 30): a client reads it only when given once, so treated as absent (rule 2).",
+  "response": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": [
+        "30",
+        "30"
+      ]
+    },
+    "body": {
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}
