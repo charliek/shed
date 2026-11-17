@@ -439,7 +439,10 @@ func (c *ServerConfig) validateAuth() error {
 	if err := c.validateClients(); err != nil {
 		return err
 	}
-	return c.validateUsers()
+	if err := c.validateUsers(); err != nil {
+		return err
+	}
+	return c.validateDirectory()
 }
 
 // clientNamePattern is the shape of a service client's name (auth.clients

@@ -184,7 +184,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Load configuration. Validation stats kernel_path, initrd_path and
 	// local image paths, so an unreadable volume can stall it (#304).
 	stopWatch := stallwatch.Watch("loading the config, which also checks kernel_path, initrd_path and local image paths", configWatchPath())
-	cfg, err := loadConfig()
+	// loadServeConfig also refuses auth.directory, which this build cannot
+	// serve.
+	cfg, err := loadServeConfig()
 	stopWatch()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)

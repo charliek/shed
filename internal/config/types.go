@@ -1372,7 +1372,64 @@ type AuthConfig struct {
 	// come only from here (auth.ssh's key sources are refused beside it), and
 	// each user reaches only their own sheds (an admin may also list, stop
 	// and delete anyone's). Unknown keys are refused at config load.
+	//
+	// Beside Directory, Users holds the local admins only: admin-only,
+	// key-only identities that work whatever state the directory is in.
 	Users map[string]UserConfig `yaml:"users,omitempty"`
+	// Directory, when set, takes the server's users from an account service
+	// that serves a user list over the directory contract
+	// (tests/directory-contract/). It needs mtls and at least one local admin
+	// in Users. See DirectoryConfig.
+	Directory *DirectoryConfig `yaml:"directory,omitempty"`
+}
+
+// Directory refresh and trust bounds and defaults (auth.directory).
+const (
+	// DefaultDirectoryRefresh is auth.directory.refresh when unset: how
+	// long after a good pull the next one is due.
+	DefaultDirectoryRefresh = 24 * time.Hour
+	// DefaultDirectoryTrust is auth.directory.trust when unset: how long
+	// after a good pull the server keeps honouring that list while it
+	// cannot get a newer one.
+	DefaultDirectoryTrust = 72 * time.Hour
+	// MinDirectoryRefresh and MaxDirectoryRefresh bound refresh.
+	MinDirectoryRefresh = time.Minute
+	MaxDirectoryRefresh = 7 * 24 * time.Hour
+	// MaxDirectoryTrust bounds trust from above; refresh bounds it from
+	// below.
+	MaxDirectoryTrust = 30 * 24 * time.Hour
+)
+
+// DirectoryConfig is auth.directory: where the server's user list comes
+// from. The service's URL is its issuer; the server enrols with it once
+// (shed-server directory enroll), then pulls the list on a schedule and keeps
+// a copy, honoured for Trust after the pull that fetched it.
+//
+// The block is decoded by its own UnmarshalYAML (directory.go), so that an
+// omitted refresh or trust is told apart from one written as zero, and every
+// refusal names its field.
+type DirectoryConfig struct {
+	// URL is the service's issuer: an origin (scheme, host and optional
+	// port; no path, query, fragment or user info), the host written plainly
+	// (ASCII letters, digits, '-' and '.', or an IPv6 address in brackets).
+	// One trailing "/" is dropped; the result is the issuer the server
+	// checks and the audience of its sign-in, byte for byte. https, or http
+	// only with AllowPlainHTTP on a loopback host.
+	URL string `yaml:"url"`
+	// Organization, when set, is the organization every answer must name.
+	// Unset, the server accepts the organization its enrolment answer named.
+	Organization string `yaml:"organization,omitempty"`
+	// Refresh is how long after a good pull the next one is due (from 1m to
+	// 7d). Nil (omitted) is the default, 24h; a written zero is out of range.
+	Refresh *Duration `yaml:"refresh,omitempty"`
+	// Trust is how long after a good pull its list is honoured while no
+	// newer one arrives (from Refresh to 30d). Nil (omitted) is the default,
+	// 72h; a written zero is out of range. After it only the local admins
+	// can log in until a good pull.
+	Trust *Duration `yaml:"trust,omitempty"`
+	// AllowPlainHTTP permits an http:// URL, and only on a loopback host
+	// (localhost, 127.0.0.0/8, ::1). For tests.
+	AllowPlainHTTP StrictBool `yaml:"allow_plain_http,omitempty"`
 }
 
 // UserConfig is one user under auth.users. A user needs a GitHub login, a key,
