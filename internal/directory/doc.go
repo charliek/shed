@@ -31,5 +31,7 @@
 //   - The state files (enrolment.json, users.json) are read only after
 //     checks of their directory and themselves (ReadStateFile), written
 //     durably (WriteStateFile) or once (CreateStateFileOnce), always through
-//     the directory checked, opened once.
+//     the directory checked, opened once. A caller with several steps to do
+//     (a lock, a listing, reads, removals, a create) opens the directory
+//     once (OpenStateDir, MakeStateDir) and does each through that StateDir.
 package directory

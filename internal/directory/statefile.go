@@ -8,6 +8,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 )
 
@@ -30,12 +32,18 @@ const (
 )
 
 // Test hooks, nil outside tests: run between the directory's check by name
-// and its opening, and between the opened directory's check and the first
-// operation on a file in it.
+// and its opening, between the opened directory's check and the first
+// operation on a file in it, and in CreateOnce after the link (an error it
+// returns is the error of a step after the link).
 var (
 	hookBeforeDirOpen   func()
 	hookAfterDirChecked func()
+	hookAfterLink       func() error
 )
+
+// ErrLocked is the error of StateDir.Lock when another process holds the
+// lock.
+var ErrLocked = errors.New("held by another process")
 
 // FileCheckError is a state directory or file that failed a check: the path
 // and the check, in words.
@@ -58,31 +66,73 @@ func checkOwner(path string, fi fs.FileInfo) error {
 	return nil
 }
 
-// EnsureStateDir creates dir with mode 0700 when it does not exist (its
-// parent must), then checks it (CheckStateDir). A directory it creates is
-// given mode 0700 explicitly, whatever the umask took away; an existing
-// directory is never changed.
-func EnsureStateDir(dir string) error {
+// StateDir is the state directory opened once and checked: a directory,
+// not a symbolic link, owned by the user the server runs as, with mode 0700
+// exactly. Every operation on a file in it goes through the directory
+// opened, so a directory put in its place by name afterwards is neither
+// read from nor written into, and a caller that does several steps (a
+// lock, a listing, reads, a removal, a create) does them all in the one
+// directory it checked. Close it when done.
+type StateDir struct {
+	path string
+	root *os.Root
+}
+
+// OpenStateDir opens dir and checks it (see StateDir). dir's last
+// component is never followed through a symbolic link: it is refused when
+// Lstat shows one, and the directory opened must be the very directory
+// that Lstat saw (one swapped for a link in between is refused).
+func OpenStateDir(dir string) (*StateDir, error) {
+	root, err := openStateDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	return &StateDir{path: dir, root: root}, nil
+}
+
+// MakeStateDir creates dir with mode 0700 when it does not exist (its
+// parent must), then opens and checks it (OpenStateDir). A directory it
+// creates is given mode 0700 explicitly, whatever the umask took away; an
+// existing directory is never changed.
+func MakeStateDir(dir string) (*StateDir, error) {
 	err := os.Mkdir(dir, stateDirMode)
 	switch {
 	case err == nil:
 		if err := os.Chmod(dir, stateDirMode); err != nil {
-			return err
+			return nil, err
 		}
 	case !errors.Is(err, fs.ErrExist):
+		return nil, err
+	}
+	return OpenStateDir(dir)
+}
+
+// Path is the directory's path, as opened.
+func (d *StateDir) Path() string { return d.path }
+
+// Join is the path of name in the directory, for messages.
+func (d *StateDir) Join(name string) string { return filepath.Join(d.path, name) }
+
+// Close closes the directory.
+func (d *StateDir) Close() error { return d.root.Close() }
+
+// EnsureStateDir is MakeStateDir, closing the directory.
+func EnsureStateDir(dir string) error {
+	d, err := MakeStateDir(dir)
+	if err != nil {
 		return err
 	}
-	return CheckStateDir(dir)
+	return d.Close()
 }
 
 // CheckStateDir checks dir is a directory, not a symbolic link, owned by the
 // user the server runs as, with mode 0700 exactly.
 func CheckStateDir(dir string) error {
-	root, err := openStateDir(dir)
+	d, err := OpenStateDir(dir)
 	if err != nil {
 		return err
 	}
-	return root.Close()
+	return d.Close()
 }
 
 // checkDirInfo checks fi, the Lstat of dir or the Stat of the directory
@@ -104,13 +154,8 @@ func checkDirInfo(dir string, fi fs.FileInfo) error {
 	return nil
 }
 
-// openStateDir opens dir and checks the directory opened, and returns it
-// as an os.Root: every operation on a state file then goes through that
-// open directory, so a directory put in dir's place after the check is
-// neither read from nor written into. dir's last component is never
-// followed through a symbolic link: it is refused when Lstat shows one, and
-// the directory opened must be the very directory that Lstat saw (one
-// swapped for a link in between is refused).
+// openStateDir opens dir, checks the directory opened, and returns it as an
+// os.Root (see OpenStateDir).
 func openStateDir(dir string) (*os.Root, error) {
 	before, err := os.Lstat(dir)
 	if err != nil {
@@ -166,27 +211,31 @@ func checkStateFile(path string, fi fs.FileInfo, limit int64) error {
 	return nil
 }
 
-// ReadStateFile reads dir/name after checking both: the directory as
-// CheckStateDir says (the file is then read through the directory checked),
-// and the file a regular file (never followed through a symbolic link),
-// owned by the server's user, with no group or other permission, of at most
-// limit bytes. A missing file is an error satisfying errors.Is(err,
-// fs.ErrNotExist); a failed check is a *FileCheckError.
+// ReadStateFile reads dir/name after checking both (StateDir.ReadFile).
 func ReadStateFile(dir, name string, limit int64) ([]byte, error) {
-	root, err := openStateDir(dir)
+	d, err := OpenStateDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	defer root.Close()
-	path := filepath.Join(dir, name)
-	before, err := root.Lstat(name)
+	defer d.Close()
+	return d.ReadFile(name, limit)
+}
+
+// ReadFile reads name, checked: a regular file (never followed through a
+// symbolic link, never opened when it is a FIFO or a device), owned by the
+// server's user, with no group or other permission, of at most limit bytes.
+// A missing file is an error satisfying errors.Is(err, fs.ErrNotExist); a
+// failed check is a *FileCheckError.
+func (d *StateDir) ReadFile(name string, limit int64) ([]byte, error) {
+	path := d.Join(name)
+	before, err := d.root.Lstat(name)
 	if err != nil {
 		return nil, err
 	}
 	if err := checkStateFile(path, before, limit); err != nil {
 		return nil, err
 	}
-	f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	f, err := d.root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -209,89 +258,183 @@ func ReadStateFile(dir, name string, limit int64) ([]byte, error) {
 	return data, err
 }
 
-// WriteStateFile replaces dir/name with data, mode 0600, durably: a
-// temporary file in dir is written and synced, renamed over the name, and
-// dir is synced, all through the directory checked (CheckStateDir). An
-// error before the rename leaves the old file as it was; an error syncing
-// dir leaves the new content in place, perhaps not durable: a caller treats
-// both as not written.
+// WriteStateFile replaces dir/name with data (StateDir.WriteFile).
 func WriteStateFile(dir, name string, data []byte) error {
-	root, err := openStateDir(dir)
+	d, err := OpenStateDir(dir)
 	if err != nil {
 		return err
 	}
-	defer root.Close()
-	tmp, err := writeTemp(root, name, data)
-	if err != nil {
-		return err
-	}
-	if err := root.Rename(tmp, name); err != nil {
-		_ = root.Remove(tmp)
-		return err
-	}
-	return syncDir(root, dir)
+	defer d.Close()
+	return d.WriteFile(name, data)
 }
 
-// CreateStateFileOnce creates dir/name holding data, mode 0600, only if it
-// does not exist: a temporary file in dir is written and synced, then
-// linked to the name (so a second writer fails rather than replacing it),
-// the temporary name removed, and dir synced, all through the directory
-// checked (CheckStateDir). An existing file is an error satisfying
-// errors.Is(err, fs.ErrExist), and is left as it was.
+// WriteFile replaces name with data, mode 0600, durably: a temporary file
+// is written and synced, renamed over the name, and the directory synced.
+// An error before the rename leaves the old file as it was; an error
+// syncing the directory leaves the new content in place, perhaps not
+// durable: a caller treats both as not written.
+func (d *StateDir) WriteFile(name string, data []byte) error {
+	tmp, err := writeTemp(d.root, name, data)
+	if err != nil {
+		return err
+	}
+	if err := d.root.Rename(tmp, name); err != nil {
+		_ = d.root.Remove(tmp)
+		return err
+	}
+	return syncDir(d.root, d.path)
+}
+
+// CreateStateFileOnce creates dir/name holding data, only if it does not
+// exist (StateDir.CreateOnce).
+func CreateStateFileOnce(dir, name string, data []byte) (linked bool, err error) {
+	d, err := OpenStateDir(dir)
+	if err != nil {
+		return false, err
+	}
+	defer d.Close()
+	return d.CreateOnce(name, data)
+}
+
+// CreateOnce creates name holding data, mode 0600, only if it does not
+// exist: a temporary file is written and synced, then linked to the name
+// (so a second writer fails rather than replacing it), the temporary name
+// removed, and the directory synced. An existing file is an error
+// satisfying errors.Is(err, fs.ErrExist), and is left as it was.
 //
-// An error from any step up to and including the link means dir/name was
-// not created by this call. An error after a successful link (removing the
-// temporary name, or syncing dir) means dir/name now exists holding data,
-// perhaps not yet durable, and the temporary name may remain beside it
-// holding the same data: the caller must not report that nothing was
-// written (for an enrolment, the key is installed and the client id is the
-// one to report). Telling the two apart is the caller's: after an error
-// other than fs.ErrExist, dir/name holding exactly data means this call
-// created it.
-func CreateStateFileOnce(dir, name string, data []byte) error {
-	root, err := openStateDir(dir)
+// linked reports whether the link happened, apart from err: when it is
+// true, name now exists holding data, whatever err says. An error with
+// linked true is from a step after the link (removing the temporary name,
+// which may then remain beside name holding the same data, or syncing the
+// directory, so the file may not yet be durable): the caller must not
+// report that nothing was written (for an enrolment, the key is installed).
+// An error with linked false means name was not created by this call.
+func (d *StateDir) CreateOnce(name string, data []byte) (linked bool, err error) {
+	tmp, err := writeTemp(d.root, name, data)
 	if err != nil {
-		return err
+		return false, err
 	}
-	defer root.Close()
-	tmp, err := writeTemp(root, name, data)
-	if err != nil {
-		return err
+	if err := d.root.Link(tmp, name); err != nil {
+		_ = d.root.Remove(tmp)
+		return false, err
 	}
-	linkErr := root.Link(tmp, name)
-	rmErr := root.Remove(tmp)
-	if linkErr != nil {
-		return linkErr
+	if hookAfterLink != nil {
+		if err := hookAfterLink(); err != nil {
+			return true, err
+		}
 	}
-	if rmErr != nil {
-		return rmErr
+	if err := d.root.Remove(tmp); err != nil {
+		return true, err
 	}
-	return syncDir(root, dir)
+	return true, syncDir(d.root, d.path)
 }
 
-// RemoveStateFile removes dir/name durably, through the directory checked
-// (CheckStateDir): unlinked, then dir synced. A file already absent is not
-// an error.
+// RemoveStateFile removes dir/name durably (StateDir.Remove).
 func RemoveStateFile(dir, name string) error {
-	root, err := openStateDir(dir)
+	d, err := OpenStateDir(dir)
 	if err != nil {
 		return err
 	}
-	defer root.Close()
-	if err := root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	defer d.Close()
+	return d.Remove(name)
+}
+
+// Remove removes name durably: unlinked, then the directory synced. A file
+// already absent is not an error.
+func (d *StateDir) Remove(name string) error {
+	if err := d.root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	return syncDir(root, dir)
+	return syncDir(d.root, d.path)
+}
+
+// Names lists the names in the directory, sorted.
+func (d *StateDir) Names() ([]string, error) {
+	f, err := d.root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	entries, err := f.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
+// Lock takes an exclusive lock (flock) on the file name in the directory,
+// made mode 0600 when absent, without waiting: when another process holds
+// it, the error satisfies errors.Is(err, ErrLocked). The file must be a
+// regular file (never followed through a symbolic link, never opened
+// blocking when it is a FIFO). The returned function releases the lock.
+func (d *StateDir) Lock(name string) (unlock func(), err error) {
+	path := d.Join(name)
+	f, err := d.root.OpenFile(name, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, stateFileMode)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	switch {
+	case err != nil:
+	case !fi.Mode().IsRegular():
+		err = &FileCheckError{path, "is not a regular file"}
+	default:
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			err = fmt.Errorf("%s: %w", path, ErrLocked)
+		} else if err != nil {
+			err = fmt.Errorf("lock %s: %w", path, err)
+		}
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	// Closing the file releases the lock.
+	return func() { _ = f.Close() }, nil
+}
+
+// tempSuffixBytes is the random part of a temporary file's name, in bytes
+// (written as twice as many lowercase hex digits).
+const tempSuffixBytes = 8
+
+// tempName is the temporary file's name for name: "." + name + "." + the
+// suffix in lowercase hex + ".tmp".
+func tempName(name string, suffix []byte) string {
+	return "." + name + "." + hex.EncodeToString(suffix) + ".tmp"
+}
+
+// IsTempFileOf reports whether file has the name WriteFile and CreateOnce
+// give their temporary file for name. A process that stops between writing
+// the temporary file and removing it (a crash, a kill) leaves it behind,
+// mode 0600, holding the data meant for name: for enrolment.json, a key.
+func IsTempFileOf(file, name string) bool {
+	prefix, suffix := "."+name+".", ".tmp"
+	if !strings.HasPrefix(file, prefix) || !strings.HasSuffix(file, suffix) ||
+		len(file) != len(prefix)+2*tempSuffixBytes+len(suffix) {
+		return false
+	}
+	for _, c := range []byte(file[len(prefix) : len(file)-len(suffix)]) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // writeTemp writes data to a new temporary file in root, mode 0600, synced
 // and closed, and returns its name. On an error nothing is left behind.
 func writeTemp(root *os.Root, name string, data []byte) (string, error) {
-	var suffix [8]byte
+	var suffix [tempSuffixBytes]byte
 	if _, err := rand.Read(suffix[:]); err != nil {
 		return "", err
 	}
-	tmp := "." + name + "." + hex.EncodeToString(suffix[:]) + ".tmp"
+	tmp := tempName(name, suffix[:])
 	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, stateFileMode)
 	if err != nil {
 		return "", err

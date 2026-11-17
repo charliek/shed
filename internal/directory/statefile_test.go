@@ -5,10 +5,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // stateDir is a fresh <state>/directory, mode 0700.
@@ -198,8 +200,8 @@ func TestStateDirSwappedAfterItsCheck(t *testing.T) {
 					t.Errorf("the checked directory holds %q, want the write", got)
 				}
 			case "create":
-				if err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("new")); err != nil {
-					t.Fatal(err)
+				if linked, err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("new")); err != nil || !linked {
+					t.Fatal(linked, err)
 				}
 				if got, _ := os.ReadFile(filepath.Join(moved, EnrolmentFileName)); string(got) != "new" {
 					t.Errorf("the checked directory holds %q, want the file created", got)
@@ -361,8 +363,8 @@ func TestWriteStateFile(t *testing.T) {
 	if err := WriteStateFile(dir, CopyFileName, []byte("x")); err == nil {
 		t.Error("written into a directory with mode 0755")
 	}
-	if err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("x")); err == nil {
-		t.Error("created in a directory with mode 0755")
+	if linked, err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("x")); err == nil || linked {
+		t.Errorf("created in a directory with mode 0755: linked %v, %v", linked, err)
 	}
 }
 
@@ -371,11 +373,11 @@ func TestWriteStateFile(t *testing.T) {
 // exactly one wins.
 func TestCreateStateFileOnce(t *testing.T) {
 	dir := stateDir(t)
-	if err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("first")); err != nil {
-		t.Fatal(err)
+	if linked, err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("first")); err != nil || !linked {
+		t.Fatal(linked, err)
 	}
-	if err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("second")); !errors.Is(err, fs.ErrExist) {
-		t.Fatalf("a second create: %v", err)
+	if linked, err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("second")); !errors.Is(err, fs.ErrExist) || linked {
+		t.Fatalf("a second create: linked %v, %v", linked, err)
 	}
 	got, err := ReadStateFile(dir, EnrolmentFileName, MaxEnrolmentFileSize)
 	if err != nil || string(got) != "first" {
@@ -392,11 +394,12 @@ func TestCreateStateFileOnce(t *testing.T) {
 	const n = 16
 	var wg sync.WaitGroup
 	errs := make([]error, n)
+	linked := make([]bool, n)
 	for i := range n {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = CreateStateFileOnce(dir, EnrolmentFileName, []byte{byte('a' + i)})
+			linked[i], errs[i] = CreateStateFileOnce(dir, EnrolmentFileName, []byte{byte('a' + i)})
 		}()
 	}
 	wg.Wait()
@@ -410,6 +413,9 @@ func TestCreateStateFileOnce(t *testing.T) {
 		case !errors.Is(err, fs.ErrExist):
 			t.Errorf("writer %d: %v", i, err)
 		}
+		if linked[i] != (err == nil) {
+			t.Errorf("writer %d: linked %v with %v", i, linked[i], err)
+		}
 	}
 	got, _ = ReadStateFile(dir, EnrolmentFileName, MaxEnrolmentFileSize)
 	if won < 0 || string(got) != string([]byte{byte('a' + won)}) {
@@ -417,5 +423,217 @@ func TestCreateStateFileOnce(t *testing.T) {
 	}
 	if extra := leftovers(t, dir, EnrolmentFileName); len(extra) != 0 {
 		t.Errorf("left behind: %v", extra)
+	}
+}
+
+// TestIsTempFileOf: the name the writers give their temporary file is
+// recognised as name's, and nothing else is: another file's temporary
+// file, a suffix of another length or with an upper-case or non-hex digit,
+// the file itself, and names that only resemble one.
+func TestIsTempFileOf(t *testing.T) {
+	dir := stateDir(t)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	tmp, err := writeTemp(root, EnrolmentFileName, []byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsTempFileOf(tmp, EnrolmentFileName) {
+		t.Errorf("writeTemp's %q is not recognised", tmp)
+	}
+	if IsTempFileOf(tmp, CopyFileName) {
+		t.Errorf("%q is recognised as %s's", tmp, CopyFileName)
+	}
+	for _, name := range []string{
+		".enrolment.json.0123456789abcdef.tmp",
+	} {
+		if !IsTempFileOf(name, EnrolmentFileName) {
+			t.Errorf("%q is not recognised", name)
+		}
+	}
+	for _, name := range []string{
+		EnrolmentFileName,
+		".users.json.0123456789abcdef.tmp",
+		".enrolment.json.0123456789abcde.tmp",
+		".enrolment.json.0123456789abcdef0.tmp",
+		".enrolment.json.0123456789ABCDEF.tmp",
+		".enrolment.json.0123456789abcdeg.tmp",
+		".enrolment.json.0123456789abcdef.tmp.x",
+		"enrolment.json.0123456789abcdef.tmp",
+		"x.enrolment.json.0123456789abcdef.tmp",
+		".enrolment.json..tmp",
+		".enrolment.json.0123456789abcdef",
+	} {
+		if IsTempFileOf(name, EnrolmentFileName) {
+			t.Errorf("%q is recognised", name)
+		}
+	}
+}
+
+// TestCreateOnceReportsTheLink: an error from a step after the link comes
+// with linked true and the file in place holding the data; an error from
+// the link (the file exists) comes with linked false and leaves nothing.
+func TestCreateOnceReportsTheLink(t *testing.T) {
+	t.Run("a step after the link fails", func(t *testing.T) {
+		dir := stateDir(t)
+		injected := errors.New("sync directory: input/output error")
+		setAfterLink(t, func() error { return injected })
+		linked, err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("data"))
+		if !errors.Is(err, injected) || !linked {
+			t.Fatalf("linked %v, %v; want linked with the error", linked, err)
+		}
+		if got, err := ReadStateFile(dir, EnrolmentFileName, 16); err != nil || string(got) != "data" {
+			t.Errorf("the file holds %q, %v; want the data", got, err)
+		}
+	})
+	t.Run("removing the temporary name fails", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("this case does not run as root: root may remove a file from a directory it cannot write")
+		}
+		dir := stateDir(t)
+		setAfterLink(t, func() error { return os.Chmod(dir, 0o500) })
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		linked, err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("data"))
+		if err == nil || !linked {
+			t.Fatalf("linked %v, %v; want linked with the error", linked, err)
+		}
+		if got, err := os.ReadFile(filepath.Join(dir, EnrolmentFileName)); err != nil || string(got) != "data" {
+			t.Errorf("the file holds %q, %v; want the data", got, err)
+		}
+	})
+	t.Run("the file exists", func(t *testing.T) {
+		dir := stateDir(t)
+		if err := os.WriteFile(filepath.Join(dir, EnrolmentFileName), []byte("other"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		linked, err := CreateStateFileOnce(dir, EnrolmentFileName, []byte("data"))
+		if !errors.Is(err, fs.ErrExist) || linked {
+			t.Fatalf("linked %v, %v; want not linked, fs.ErrExist", linked, err)
+		}
+		if extra := leftovers(t, dir, EnrolmentFileName); len(extra) != 0 {
+			t.Errorf("left behind: %v", extra)
+		}
+	})
+}
+
+func setAfterLink(t *testing.T, f func() error) {
+	t.Helper()
+	hookAfterLink = f
+	t.Cleanup(func() { hookAfterLink = nil })
+}
+
+// TestStateDirOpenedOnce: every step through one StateDir (a lock, a
+// listing, a read, a create, a removal) goes to the directory opened and
+// checked, even after a symbolic link to another good-looking directory
+// is put in its place by name.
+func TestStateDirOpenedOnce(t *testing.T) {
+	dir := stateDir(t)
+	if err := WriteStateFile(dir, CopyFileName, []byte("good")); err != nil {
+		t.Fatal(err)
+	}
+	d, err := OpenStateDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	evil := swapDir(t, dir, CopyFileName)
+	moved := dir + ".moved"
+
+	unlock, err := d.Lock("test.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	names, err := d.Names()
+	if err != nil || !slices.Equal(names, []string{"test.lock", CopyFileName}) {
+		t.Errorf("names %v, %v; want the checked directory's", names, err)
+	}
+	if got, err := d.ReadFile(CopyFileName, 16); err != nil || string(got) != "good" {
+		t.Errorf("read %q, %v; want the checked directory's file", got, err)
+	}
+	if linked, err := d.CreateOnce(EnrolmentFileName, []byte("new")); err != nil || !linked {
+		t.Fatal(linked, err)
+	}
+	if err := d.Remove(CopyFileName); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(moved, EnrolmentFileName)); string(got) != "new" {
+		t.Errorf("the checked directory holds %q, want the file created", got)
+	}
+	if extra := leftovers(t, moved, EnrolmentFileName, "test.lock"); len(extra) != 0 {
+		t.Errorf("the checked directory holds %v besides", extra)
+	}
+	if got, _ := os.ReadFile(filepath.Join(evil, CopyFileName)); string(got) != "evil" {
+		t.Errorf("the directory behind the link was changed: %q", got)
+	}
+	if extra := leftovers(t, evil, CopyFileName); len(extra) != 0 {
+		t.Errorf("left in the directory behind the link: %v", extra)
+	}
+}
+
+// TestStateDirLock: a lock held is refused to a second taker with
+// ErrLocked, and free again once released; a lock name that is a symbolic
+// link, a directory or a FIFO is refused at once (never followed, never
+// waited on).
+func TestStateDirLock(t *testing.T) {
+	dir := stateDir(t)
+	open := func() *StateDir {
+		d, err := OpenStateDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { d.Close() })
+		return d
+	}
+	unlock, err := open().Lock("a.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := open().Lock("a.lock"); !errors.Is(err, ErrLocked) {
+		t.Fatalf("a second taker: %v; want ErrLocked", err)
+	}
+	unlock()
+	again, err := open().Lock("a.lock")
+	if err != nil {
+		t.Fatalf("after the release: %v", err)
+	}
+	again()
+	if m := mode(t, filepath.Join(dir, "a.lock")); m != 0o600 {
+		t.Errorf("the lock file has mode %04o", m)
+	}
+
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "link.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "dir.lock"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(dir, "fifo.lock"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"link.lock", "dir.lock", "fifo.lock"} {
+		done := make(chan error, 1)
+		go func() {
+			unlock, err := open().Lock(name)
+			if err == nil {
+				unlock()
+			}
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Errorf("%s was taken as a lock", name)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("taking %s as a lock did not return", name)
+		}
 	}
 }
