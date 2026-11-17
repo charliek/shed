@@ -1125,7 +1125,10 @@ func TestDirectoryEnrollRemovesLeftovers(t *testing.T) {
 	r := newRefService(t, refOptions{})
 	r.write("codes", "build-1 "+code+"\n")
 	left := ".enrolment.json.0123456789abcdef.tmp"
-	alike := ".enrolment.json.0123456789ABCDEF.tmp"
+	// The look-alike differs by a digit that is not hex, not by case: on a
+	// file system that ignores case (macOS by default) an upper-case spelling
+	// of the leftover's name is the leftover itself.
+	alike := ".enrolment.json.0123456789abcdeg.tmp"
 
 	// Before a first enrolment: a leftover holding an enrolment (the run
 	// stopped after the service answered) and a look-alike.
