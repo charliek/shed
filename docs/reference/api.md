@@ -142,7 +142,8 @@ the route's own `403`, `400` or `501` never appears.
 | GET | `/api/system/df` | Disk usage report (image cache, sheds, orphans) |
 | POST | `/api/system/prune` | Scoped disk cleanup (dry-run, images/instances/logs/orphans) |
 | GET | `/api/sheds/{name}/connect/{port}` | TCP tunnel via HTTP upgrade |
-| POST | `/api/users/refresh` | Fetch the GitHub logins again (admin) |
+| POST | `/api/users/refresh` | Fetch the GitHub logins again, or pull the directory's list (admin) |
+| GET | `/api/users/status` | Where the server's users come from, and the directory's state (admin) |
 | GET | `/api/sources` | A user's credential source and machines |
 | POST | `/api/sources/use` | Move a user's credential source |
 | GET | `/api/plugins/listeners` | List active extension listeners |
@@ -1309,6 +1310,79 @@ for the fetch for up to 60 s.
 |------|-------|-------------|
 | 403 | `FORBIDDEN` | The caller is not an admin |
 | 504 | `INTERNAL_ERROR` | The fetch was still running after 60 s; its result applies when it ends |
+
+On a server whose users come from an account service
+([`auth.directory`](configuration.md#users-from-an-account-service)) the route
+pulls the service's list now, ignoring a pending `Retry-After`, and the answer
+gains a `directory` member, the pull's row. A failed pull is a row, not an
+error: the status is still `200`. Only the request's own deadline is an error
+(`504`, `the directory pull is still running; its result applies when it
+ends`).
+
+```json
+{
+  "logins": [],
+  "directory": {"status": "failed", "list": "in-force", "version": "0f1e…", "users": 2, "skipped": 0,
+                "error": "directory: unavailable (HTTP 503) \"UNAVAILABLE\": \"try later\""}
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `status` | `good` or `failed` |
+| `list` | Whether a list is in force after the pull: `in-force`, `trust-ended` (its trust time ended), `withdrawn` (the pull found the server not enrolled, or its enrolment unusable, and withdrew the list) or `none`. Unless `in-force`, only the local admins are admitted |
+| `version` | The version of the list in force (omitted: none) |
+| `users`, `skipped` | How many of that list's users the server admits, and how many entries it skips; local admins are not counted |
+| `error` | Why the pull failed. Text from the account service in it is quoted |
+
+### GET /api/users/status
+
+Where the server's users come from, who they are, and on a directory server
+the state of its list. Admin only, and refused to a script key even when its
+user is an admin; `shed users status` calls it. It never holds a key, label or
+fingerprint.
+
+```json
+{
+  "source": "directory",
+  "directory": {
+    "url": "https://accounts.example.test",
+    "organization": "example",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "state": "trusted",
+    "last_good_pull": "2026-11-17T09:00:00Z",
+    "version": "0f1e…",
+    "trusted_until": "2026-11-20T09:00:00Z",
+    "last_attempt": "2026-11-17T09:00:00Z",
+    "next_attempt": "2026-11-18T09:00:00Z",
+    "copy": "kept",
+    "skipped": [{"name": "ops", "reason": "local-admin-name",
+                 "description": "its name is a local admin's (the local admin is a separate, local-only identity)"}]
+  },
+  "users": [
+    {"name": "ada", "admin": true, "source": "directory"},
+    {"name": "ops", "admin": true, "source": "local"}
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `source` | `directory`, `config` (`auth.users`) or `none` (no user list; `users` is empty) |
+| `users[]` | `name`, `admin` and `source`: `config`, `local` (a local admin) or `directory`. A name from the account service is its text: print it quoted |
+| `directory` | Present only when `source` is `directory` |
+| `directory.state` | `trusted`, `expired`, `no-copy`, `not-enrolled` or `enrolment-unusable`, with `reason` beside every state but `trusted` |
+| `directory.last_good_pull`, `version`, `trusted_until` | The last list held: when its answer arrived, its version, and the end of its trust time |
+| `directory.last_attempt`, `last_error`, `next_attempt` | The last pull, why it failed (omitted when it was good), and when the next is due (omitted: at once) |
+| `directory.copy`, `copy_error` | The kept copy: `none`, `kept`, `unused`, `not-written` or `stale-on-disk`, and why it is not kept |
+| `directory.skipped[]` | Entries the server does not answer for: `name` (the service's text), `reason` (a code: `duplicate-member`, `malformed`, `invalid-name`, `duplicate-name`, `duplicate-key`, `no-usable-key`, `local-admin-name`, `local-admin-key`, `service-client-name`) and `description` |
+| `directory.expired_local_admins` | Present when every key of every local admin has expired: their names |
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 403 | `FORBIDDEN` | The caller is not an admin, or uses a script key |
 
 ## Credential sources
 

@@ -38,7 +38,8 @@ Linux, `~/.config/shed/server.yaml` on macOS). Client settings live per server
 entry in `~/.shed/config.yaml`.
 
 Beyond the posture, this page covers who a caller is and what they may reach:
-[users and keys](#users-and-keys), [ownership](#ownership) of sheds and
+[users and keys](#users-and-keys), [users from an account
+service](#users-from-an-account-service), [ownership](#ownership) of sheds and
 snapshots, the [credential bus](#credential-bus) and the one machine that
 answers it for each user, [service clients](#service-clients) (orchestrators
 limited to their own sheds), [mount selection](#mount-selection) (which host
@@ -56,15 +57,17 @@ never says who the caller is.
 A server either has **no user list**, and then every accepted key is one
 **implicit user**, an admin, exactly as before users existed, or it has a list
 under [`auth.users`](configuration.md#users), and then every key belongs to
-exactly one named user.
+exactly one named user, or it takes its list from an account service
+([`auth.directory`](configuration.md#users-from-an-account-service)), beside
+local admins listed in `auth.users`.
 
-| | No user list | `auth.users` |
-|---|---|---|
-| Key sources | `auth.ssh`: `github_users`, `authorized_keys`, `authorized_keys_file` | `auth.users.<name>.github` and `.keys`; `auth.ssh` key sources are refused beside it |
-| Modes | `open` or `mtls` | `mtls` only |
-| Who a key is | the implicit user, an admin | the user it is listed under, with that user's `admin` flag |
-| Sheds a caller reaches | every shed | their own; an admin also lists, stops and deletes others' (see [Ownership](#ownership)) |
-| Unknown key | refused in `enforce`, let in as the implicit user in `off` and `warn` | refused in every SSH mode |
+| | No user list | `auth.users` | `auth.directory` |
+|---|---|---|---|
+| Key sources | `auth.ssh`: `github_users`, `authorized_keys`, `authorized_keys_file` | `auth.users.<name>.github` and `.keys`; `auth.ssh` key sources are refused beside it | the account service's list, and the local admins' `keys` in `auth.users`; no GitHub logins |
+| Modes | `open` or `mtls` | `mtls` only | `mtls` only |
+| Who a key is | the implicit user, an admin | the user it is listed under, with that user's `admin` flag | a local admin, or the list's user, with the list's `admin` flag |
+| Sheds a caller reaches | every shed | their own; an admin also lists, stops and deletes others' (see [Ownership](#ownership)) | as with `auth.users` |
+| Unknown key | refused in `enforce`, let in as the implicit user in `off` and `warn` | refused in every SSH mode | refused, after at most one pull of the list (see [A new person](#a-new-person)) |
 
 With a user list a user's key is a plain public key: a client that presents an
 SSH certificate is refused, and a certificate listed as a key fails config
@@ -167,6 +170,199 @@ API request**, against the live key set. A key that is removed from the
 config or a GitHub account, expires, or loses its pin therefore opens no new
 channel and makes no new request. Channels, SSE streams and Connect tunnels
 that are already open stay open until they end.
+
+## Users from an account service
+
+With [`auth.directory`](configuration.md#users-from-an-account-service) a
+server takes its users from an **account service**: a service that holds
+people and their SSH login keys. People sign in to the service, and register
+their keys there, by whatever means it offers; shed takes no part in that. The
+server and the service speak the [directory contract](directory-contract.md),
+and any implementation of the contract's service side works. The [User
+Directory guide](../guides/user-directory.md) covers the operator's steps.
+
+### How the server signs in and pulls
+
+- **Enrolment, once.** `shed-server directory enroll` makes an Ed25519 key
+  pair, sends the public key with a one-time code the service's operator
+  issued, and keeps the private key in `{state_dir}/directory/enrolment.json`.
+  The key never leaves the host. The code is read from standard input only,
+  and is written to no file or log.
+- **Sign-in.** OAuth 2.0 client credentials with a JWT client assertion
+  signed by that key: a new assertion for every token request, none sent
+  twice. The access token is kept in memory only.
+- **The pull.** `GET <url>/v1/directory` with the access token returns the
+  list: users, each a name, an admin flag and keys. A pull is due at start,
+  `auth.directory.refresh` after each good pull, 15 minutes after a failed one
+  (or at the end of the service's `Retry-After`, in seconds, when that is
+  later, up to one hour), on `shed users refresh`, and on a new person's
+  first login.
+- **Transport.** HTTPS with the system's certificate checks; the environment's
+  proxy settings apply. No redirect is followed. Plain HTTP only with
+  `allow_plain_http`, and only to a loopback address (checked on the address
+  actually dialled), with no proxy. Every answer is read up to the contract's
+  size limits.
+- **What a failed pull changes: nothing.** A refused login, a disabled
+  server, a rate limit, an outage, a timeout, a redirect, another contract
+  number or organization, or an answer that breaks the contract's rules
+  leaves the list the server holds, and its kept copy, as they were.
+
+### Which entries become users
+
+Each entry of the list is decoded on its own, so one bad entry is skipped and
+the rest stand. An entry is skipped when it breaks the contract's rules (rule
+7 of the [contract](directory-contract.md)) or one of shed's:
+
+- its name is not a valid user name (`^[a-z][a-z0-9-]{0,62}$`), or is listed
+  twice;
+- it has no key this server can use. A key is one plain OpenSSH public key
+  (an SSH certificate is refused) with a label that is not empty and unique
+  within the user. Its `expires`, when present, is an **RFC 3339 instant**
+  (`2027-06-30T23:59:59Z`); a bare date, which `auth.users` accepts, is not
+  accepted in the list, and a key whose `expires` does not read as an instant
+  is not used;
+- it lists a key that the list holds twice, under this entry or another
+  (every entry that lists it is skipped);
+- its name is a local admin's, or it lists a key a local admin holds, or its
+  name is an `auth.clients` name.
+
+A key's identity is its **blob**, not its text: the same key with another
+comment is the same key. Every skipped entry is logged with its reason and
+shown, by name, in `shed users status`. An entry with a local admin's name is
+logged at every pull; the others once per version of the list. An empty list,
+and a list whose every entry is skipped, leave only the local admins. A list
+with no admin loads.
+
+### Local admins
+
+The `auth.users` entries beside `auth.directory` are the **local admins**: a
+separate, local-only identity, always an admin, with keys from the config
+only (no GitHub login, no script key). They log in with the service
+unreachable, before enrolment and after the trust time; the trust time never
+applies to them, while each key's own `expires` does. The service cannot
+change them: a list entry with a local admin's name or key is skipped, and
+the local admin keeps its name and keys whole. The server warns at start and
+in `shed users status` when every local admin key has expired, since then no
+local admin can log in.
+
+### A list admin controls the host
+
+A list admin has an admin's powers on the server, host directories and server
+mounts included, so **whoever controls the account service controls the
+host**. Whoever can add a key to a person there enters every enrolled server
+as that person, and whoever can set the admin flag gets every enrolled
+server's host. Run the service with the care that implies; the local admins
+are outside its reach.
+
+### The kept copy and the trust time
+
+- **Write, then publish.** A good pull's answer is written durably to
+  `{state_dir}/directory/users.json` before its list is published, so the copy
+  on disk is never older than the list in force. When it cannot be written
+  the old copy is removed, so a restart cannot bring back someone the new list
+  removed, and the new list is used in memory only (`shed users status`:
+  `Kept copy: not-written`). If the old copy cannot be removed either, status
+  shows `stale-on-disk` and the log warns at every pull: this is the one case
+  in which a restart brings back the old list, for what remains of its trust
+  time.
+- **The trust time** is `auth.directory.trust` counted from when the good
+  answer arrived, on the wall clock (a host that sleeps past it stops
+  honouring the list when it wakes). From its end the server answers for the
+  local admins only; within 30 seconds it also closes the listed users' SSH
+  connections and logs `directory: TRUST ENDED: ...`, once. The end holds even
+  if the clock moves back; only a good pull restores the list.
+- **The end of the trust time is durable.** When it ends, the kept copy is
+  removed, so a restart after it starts with only the local admins, whatever
+  the clock says then. A removal that fails is tried again at each turn of the
+  schedule, and status shows `stale-on-disk` meanwhile.
+- **At start** the kept copy is used only when it passes the file checks
+  below, names the current enrolment's issuer and client id and an accepted
+  organization, was fetched no later than the current wall clock, passes
+  today's rules, and is inside its trust time counted with today's
+  `auth.directory.trust`. Otherwise only the local admins can log in until the
+  first good pull, which starts at once. The listeners do not wait for it.
+- **The trust time bounds only how long a server keeps honouring a list it
+  cannot refresh.** It does not bound a compromised service that keeps
+  answering.
+- **An accurate host clock is a prerequisite.** A clock set back before the
+  trust time ends extends it. The server warns when an answer's `Date` is more
+  than 30 seconds from its own clock.
+- **Backups.** Restoring an old state directory from a backup restores its
+  users for what remains of that copy's trust time.
+
+### The state directory is a security boundary
+
+`{state_dir}/directory/` holds this server's private key for the service and
+the kept copy, which is not signed: whoever can write it can add users (a
+forged copy) or replace the server's key. Its integrity is a security boundary
+beside the CA key (`ca_key.pem`, which can issue client certificates). The
+server checks before every read: the directory is a directory owned by the
+server's user with mode `0700`, not a symbolic link; each file is a regular
+file owned by that user with no group or other permission bits, not a
+symbolic link, within its size limit (16 KiB for `enrolment.json`, 12 MiB for
+`users.json`), and decodes strictly. An `enrolment.json` that fails a check
+makes the enrolment unusable: nothing is sent and only the local admins can
+log in. A `users.json` that fails one is not used.
+
+**The enrolment is read before every pull.** A first enrolment needs no
+restart. An enrolment that is missing, unusable, or names another issuer or
+organization than the config's, found while the server runs, **withdraws the
+list at once**: only the local admins can log in, and the listed users' SSH
+connections are closed.
+
+### When the list changes
+
+- **One snapshot per decision.** A request or a new SSH channel is authorized
+  against one snapshot of the users at admission; the list never changes
+  halfway through one decision. Work already admitted may continue, except as
+  follows.
+- **A person removed** from the list (or every listed person, when the trust
+  time ends or the list is withdrawn): when the new list is published, every
+  SSH connection of a user no longer in it is closed, with all its channels,
+  and the server logs `SSH: closed <n> connection(s) of user "<name>": no
+  longer a user of this server`. Their next SSH login and API request are
+  refused.
+- **Not tracked:** open API streams (create and pull progress, the egress
+  audit stream) and Connect tunnels end by themselves; their next request is
+  refused.
+- **The credential bus.** A subscription stream checks its certificate again
+  before each message, and ends when the certificate no longer authenticates
+  its user; the message is not sent. A credential-bus request already
+  delivered is not recalled.
+- **An admin flag change** applies at the next SSH channel and the next
+  request, with the same certificate.
+- **A key that moves** from one person to another: channels already open on
+  the first person's connections stay open, a new channel on those
+  connections is refused, a new connection is the second person's, and a
+  certificate bound to the first person is refused.
+- **Their sheds and snapshots** keep their user; an admin sees them and may
+  stop or delete them.
+- **A change of issuer or organization** is a change of trust domain: the
+  same names may then mean other people. Treat it as a new server, with a
+  fresh state directory.
+
+### A new person
+
+A person the server does not know yet logs in over SSH (`shed server add`)
+with a key the list does not hold yet. The server then pulls the list, at most
+**once a minute** while pulls succeed and **once per 15 minutes** while they
+fail, and never inside a pending `Retry-After`. Only the login that takes that
+slot waits, for up to 20 seconds (the `shed` CLI of this version waits up to 25
+seconds for it; a client with a shorter bound may give up first, and trying
+again succeeds); every other unknown key at that moment is
+refused at once. A local admin's login never waits for a pull.
+
+The server holds **one outstanding `Retry-After`** for itself: neither the
+schedule nor an unknown key pulls before it ends. Only an admin's `shed users
+refresh` may pull before it.
+
+### Certificates
+
+A client certificate issued before certificates named their user (by a server
+older than v0.10.0) is refused on a directory server, since the list can
+change under it; the client enrolls again (the CLI does so on the auth
+failure and retries). Certificates that name their user are checked against
+the list on every request, as on any server with users.
 
 ## Ownership
 

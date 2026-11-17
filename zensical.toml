@@ -51,6 +51,7 @@ nav = [
   { "Guides" = [
     { "Security Configuration" = "guides/security-configuration.md" },
     { "Multi-user Server" = "guides/multi-user-server.md" },
+    { "User Directory" = "guides/user-directory.md" },
     { "Public VPS Deployment" = "guides/vps-deployment.md" },
     { "Orchestrated Sheds" = "guides/orchestrated-sheds.md" },
   ] },
@@ -58,6 +59,7 @@ nav = [
     { "CLI" = "reference/cli.md" },
     { "Configuration" = "reference/configuration.md" },
     { "Security" = "reference/security.md" },
+    { "Directory Contract" = "reference/directory-contract.md" },
     { "Egress Control" = "reference/egress.md" },
     { "Snapshots" = "reference/snapshots.md" },
     { "Disk Management" = "reference/disk-management.md" },
