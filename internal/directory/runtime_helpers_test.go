@@ -28,10 +28,15 @@ import (
 // lookup and the reference server share: nothing waits for real time to
 // pass.
 
-// fakeClock is a wall clock a test moves, and timers on it.
+// fakeClock is a wall clock a test moves, timers on it, and the elapsed time
+// the runtime's waits are measured on (Elapsed). set and advance move the
+// wall clock and, when it moves forward, elapsed time by as much (as a host
+// whose clock is not stepped); stepWall moves the wall clock alone (a clock
+// set) and elapse elapsed time alone. Timers follow set and advance only.
 type fakeClock struct {
 	mu     sync.Mutex
 	t      time.Time
+	mono   time.Time
 	timers []*fakeTimer
 }
 
@@ -41,12 +46,40 @@ type fakeTimer struct {
 	stopped bool
 }
 
-func newFakeClock(t0 time.Time) *fakeClock { return &fakeClock{t: t0} }
+// fakeElapsedBase is where the fake elapsed clock starts: far from any wall
+// time a test uses, so a wait measured by mixing the two clocks shows.
+var fakeElapsedBase = time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func newFakeClock(t0 time.Time) *fakeClock { return &fakeClock{t: t0, mono: fakeElapsedBase} }
 
 func (c *fakeClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.t
+}
+
+// Elapsed is the elapsed-time reading (RuntimeOptions.Elapsed): only the
+// difference of two readings means anything.
+func (c *fakeClock) Elapsed() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mono
+}
+
+// stepWall moves the wall clock by d, forward or back, and nothing else: no
+// time elapses and no timer fires.
+func (c *fakeClock) stepWall(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+// elapse lets d pass on the elapsed clock alone: the wall clock stays where
+// it is and no timer fires.
+func (c *fakeClock) elapse(d time.Duration) {
+	c.mu.Lock()
+	c.mono = c.mono.Add(d)
+	c.mu.Unlock()
 }
 
 // Timer is a timer of d on the clock: it fires when the clock reaches now+d
@@ -71,6 +104,9 @@ func (c *fakeClock) Timer(d time.Duration) (<-chan time.Time, func()) {
 func (c *fakeClock) set(t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if t.After(c.t) {
+		c.mono = c.mono.Add(t.Sub(c.t))
+	}
 	c.t = t
 	kept := c.timers[:0]
 	for _, tm := range c.timers {
@@ -221,11 +257,15 @@ type rtService struct {
 	retryAfter string
 	// gate, when set, holds every directory answer (made by the reference
 	// server when the request arrived) until it is closed.
-	gate       chan struct{}
-	directory  int
-	tokenReqs  int
-	tokens     []string
-	assertions []string
+	gate chan struct{}
+	// gateMode and gateRetryAfter, when gateMode is set, replace each answer
+	// the gate held (setGateAnswer).
+	gateMode       faultMode
+	gateRetryAfter string
+	directory      int
+	tokenReqs      int
+	tokens         []string
+	assertions     []string
 	// inflight is how many directory requests are being answered now, and
 	// maxInflight the most there have been at once.
 	inflight, maxInflight int
@@ -325,14 +365,7 @@ func (s *rtService) wrap(next http.Handler) http.Handler {
 				<-r.Context().Done()
 				return
 			case faultRetryAfter, fault429:
-				status := http.StatusServiceUnavailable
-				if mode == fault429 {
-					status = http.StatusTooManyRequests
-				}
-				w.Header().Set("Retry-After", retryAfter)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				_, _ = io.WriteString(w, `{"error":{"code":"UNAVAILABLE","message":"try later"}}`)
+				writeTryLater(w, mode, retryAfter)
 				return
 			case faultContract2:
 				w.Header().Set("Content-Type", "application/json")
@@ -347,12 +380,43 @@ func (s *rtService) wrap(next http.Handler) http.Handler {
 			}
 			if gate != nil {
 				<-gate
+				s.mu.Lock()
+				gm, gra := s.gateMode, s.gateRetryAfter
+				s.mu.Unlock()
+				if gm != faultNone {
+					writeTryLater(w, gm, gra)
+					return
+				}
 			}
 			replay(w, rec)
 		default:
 			next.ServeHTTP(w, r)
 		}
 	})
+}
+
+// writeTryLater answers 503 (faultRetryAfter) or 429 (fault429), with
+// retryAfter as the Retry-After, or with none when it is "".
+func writeTryLater(w http.ResponseWriter, mode faultMode, retryAfter string) {
+	status := http.StatusServiceUnavailable
+	if mode == fault429 {
+		status = http.StatusTooManyRequests
+	}
+	if retryAfter != "" {
+		w.Header().Set("Retry-After", retryAfter)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, `{"error":{"code":"UNAVAILABLE","message":"try later"}}`)
+}
+
+// setGateAnswer makes every directory answer the gate holds, once the gate
+// opens, a 503 (faultRetryAfter) or 429 (fault429) with retryAfter ("": no
+// header) in place of the reference server's; faultNone undoes it.
+func (s *rtService) setGateAnswer(m faultMode, retryAfter string) {
+	s.mu.Lock()
+	s.gateMode, s.gateRetryAfter = m, retryAfter
+	s.mu.Unlock()
 }
 
 func replay(w http.ResponseWriter, rec *httptest.ResponseRecorder) {
@@ -509,7 +573,7 @@ func startRT(t *testing.T, svc *rtService, stateDir, opsLine string, adjust func
 	// The pull's bound is the default (PullTimeout), on the fake clock.
 	rt, err := NewRuntime(RuntimeOptions{
 		Lookup: l, StateDir: stateDir, Issuer: svc.issuer, AllowPlainHTTP: true,
-		Refresh: rtRefresh, Trust: rtTrust, Timer: svc.clock.Timer, Logf: log.logf,
+		Refresh: rtRefresh, Trust: rtTrust, Timer: svc.clock.Timer, Elapsed: svc.clock.Elapsed, Logf: log.logf,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -61,14 +61,56 @@ func e2eKey(t *testing.T) (gossh.Signer, string) {
 }
 
 // e2eRecorder keeps every assertion sent to the token endpoint and every
-// access token it gave out, to search the logs for.
+// access token it gave out, to search the logs for. It can also hold the
+// directory's answers (setHold).
 type e2eRecorder struct {
 	mu      sync.Mutex
 	secrets []string
+	// hold, when set, holds every directory request until it is closed (or
+	// the request ends); held is told of each one it holds.
+	hold, held chan struct{}
+	// pulls counts the directory requests.
+	pulls int
+}
+
+// setHold makes the directory's answers wait until hold is closed (nil: no
+// wait); held is told of each request held.
+func (r *e2eRecorder) setHold(hold, held chan struct{}) {
+	r.mu.Lock()
+	r.hold, r.held = hold, held
+	r.mu.Unlock()
+}
+
+// pullCount is how many directory requests the service has had.
+func (r *e2eRecorder) pullCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pulls
 }
 
 func (r *e2eRecorder) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/v1/directory" {
+			r.mu.Lock()
+			r.pulls++
+			hold, held := r.hold, r.held
+			r.mu.Unlock()
+			if hold != nil {
+				// Neither the telling nor the wait can block past the hold's
+				// release or the request's end.
+				select {
+				case held <- struct{}{}:
+				case <-hold:
+				case <-req.Context().Done():
+					return
+				}
+				select {
+				case <-hold:
+				case <-req.Context().Done():
+					return
+				}
+			}
+		}
 		if req.URL.Path != "/oauth2/token" {
 			next.ServeHTTP(w, req)
 			return

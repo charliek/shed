@@ -39,7 +39,8 @@ func writeServeConfig(t *testing.T, auth string) {
 // TestServeBuildsTheLookupByConfig: serve's config load (loadConfig) takes a
 // config with auth.directory, and serve's lookup is then the directory's
 // (its local admin a user, no implicit user, every connection tracked by its
-// user, unbound certificates refused). Without the block it is the config
+// user, unbound certificates refused, an unknown key's login a pull). Without
+// the block it is the config
 // lookup, as before.
 func TestServeBuildsTheLookupByConfig(t *testing.T) {
 	adminLine, adminFP := wiringKey(t)
@@ -61,8 +62,8 @@ func TestServeBuildsTheLookupByConfig(t *testing.T) {
 	if _, bound := l.(users.BoundCredentialsOnly); !bound {
 		t.Error("the directory's lookup does not refuse unbound certificates")
 	}
-	if _, refetch := l.(users.UnknownKeyRefetcher); refetch {
-		t.Error("the directory's lookup fetches for unknown keys in this commit")
+	if _, refetch := l.(users.UnknownKeyRefetcher); !refetch {
+		t.Error("the directory's lookup does not pull for an unknown key (a new person's first SSH login)")
 	}
 	if u, k, ok := l.UserForKey(adminFP); !ok || u.Name != "admin" || !u.Admin || k.Source != users.SourceAdHoc || k.Label != "laptop" {
 		t.Errorf("the local admin's key resolves to %+v %+v %v", u, k, ok)

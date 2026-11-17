@@ -494,7 +494,13 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	}
 	authorized := s.keyAuth.known(fingerprint)
 	if !authorized && s.refetchUnknownKey(ctx, user, fingerprint) {
-		log.Printf("SSH auth: key %s is known after fetching the GitHub logins again", fingerprint)
+		// A lookup whose users change while the server runs (a directory's
+		// list) pulled its list; any other fetched GitHub logins.
+		if _, live := s.keyAuth.Users.(users.BoundCredentialsOnly); live {
+			log.Printf("SSH auth: key %s is known after pulling the directory again", fingerprint)
+		} else {
+			log.Printf("SSH auth: key %s is known after fetching the GitHub logins again", fingerprint)
+		}
 		authorized = true
 	}
 	if s.keyAuth.enforced() && !authorized {
@@ -510,17 +516,21 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	return true
 }
 
-// refetchUnknownKey asks the user lookup to look for a key it does not know on
-// GitHub, and reports whether the key is known afterwards. Only in enforce
-// mode (warn lets the key in anyway; off looks nothing up), only when the
-// lookup can fetch (a users.UnknownKeyRefetcher), and only when the login is
-// `_bootstrap` (`shed server add`) or a valid shed name. That check is on the
-// name's syntax alone: nothing about sheds is looked up for a peer that has
-// not authenticated. The lookup then allows one fetch a minute for the whole
-// server, checked before it does anything else; only the login that takes
-// that slot waits for the fetch (up to five seconds), every other returns at
-// once. A key the lookup knows (an expired one included) never gets here, and
-// the lookup refuses a key it dropped for a GitHub account mismatch.
+// refetchUnknownKey asks the user lookup to look for a key it does not know
+// (on GitHub, or in a directory's list), and reports whether the key is known
+// afterwards. Only in enforce mode (warn lets the key in anyway; off looks
+// nothing up), only when the lookup can fetch (a users.UnknownKeyRefetcher),
+// and only when the login is `_bootstrap` (`shed server add`) or a valid shed
+// name. That check is on the name's syntax alone: nothing about sheds is
+// looked up for a peer that has not authenticated. The lookup then takes a
+// server-wide slot, checked before it does anything else; only the login that
+// takes it waits for the fetch, every other returns at once. With GitHub
+// logins (auth.users) the slot is one fetch a minute and the wait up to five
+// seconds, and the lookup refuses a key it dropped for a GitHub account
+// mismatch; with a directory's list (auth.directory) the slot is one pull a
+// minute while pulls succeed, one per retry interval while they fail, none
+// inside a pending Retry-After, and the wait one 20-second deadline. A key
+// the lookup knows (an expired one included) never gets here.
 func (s *Server) refetchUnknownKey(ctx ssh.Context, user, fingerprint string) bool {
 	if !s.keyAuth.enforced() {
 		return false

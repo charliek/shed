@@ -40,6 +40,15 @@ const (
 	// it reads the wall clock again: a timer does not count the time a host
 	// spends asleep, the wall clock does.
 	maxScheduleWait = time.Minute
+	// UnknownKeyEvery is how often an unknown key may start a pull while the
+	// last pull succeeded (RefetchForUnknownKey). While the server is in the
+	// failed state, it is RetryInterval.
+	UnknownKeyEvery = time.Minute
+	// UnknownKeyWait is the one deadline the login that takes the unknown-key
+	// slot waits under: queueing behind a pull already running, the token
+	// request, the directory request and the one new login after a refused
+	// token, together. Measured on the runtime's timer.
+	UnknownKeyWait = 20 * time.Second
 )
 
 // SourceState is the state of a directory server's user source.
@@ -117,6 +126,14 @@ type RuntimeOptions struct {
 	// channel and how to stop it; nil uses time.NewTimer. The schedule and
 	// each pull's bound (PullTimeout) run on it. For tests.
 	Timer func(d time.Duration) (<-chan time.Time, func())
+	// Elapsed reads the clock the runtime's waits are measured on (a pending
+	// Retry-After, the unknown-key slot's intervals): the
+	// difference of two readings is the time elapsed between them, whatever
+	// the wall clock was set to meanwhile. nil is the lookup's clock as it
+	// reads, unrounded: in production time.Now, whose monotonic reading makes
+	// the difference elapsed time. For tests, which move the wall clock and
+	// elapsed time apart.
+	Elapsed func() time.Time
 	// PullTimeout bounds one pull's network work; 0 is PullTimeout. For
 	// tests.
 	PullTimeout time.Duration
@@ -130,8 +147,9 @@ type RuntimeOptions struct {
 // each good pull (written before the list is published), starts from that
 // copy, and schedules the next pull.
 //
-// It is the users.Refresher of a directory server (`shed users refresh`).
-// Its Status is what an admin is shown.
+// It is the users.Refresher of a directory server (`shed users refresh`), and
+// its users.UnknownKeyRefetcher (a new person's first SSH login). Its Status
+// is what an admin is shown.
 type Runtime struct {
 	*Lookup
 
@@ -143,6 +161,7 @@ type Runtime struct {
 	refresh, trust time.Duration
 	pullTimeout    time.Duration
 	timer          func(time.Duration) (<-chan time.Time, func())
+	elapsed        func() time.Time
 	logf           func(string, ...any)
 
 	// ctx bounds every pull; cancelled when StartRefresh's context ends.
@@ -159,6 +178,8 @@ type Runtime struct {
 	fmu              sync.Mutex
 	running, pending *flight
 	stopped          bool
+	// asked counts the pulls asked for (PullsAsked).
+	asked uint64
 
 	// copyMu orders the work on the kept copy on disk: a good pull holds it
 	// from the write through the publication (so the copy is never removed
@@ -193,6 +214,17 @@ type Runtime struct {
 	lastAttempt time.Time
 	lastErr     string
 	next        time.Time
+	// retryEnd is the end of the pending Retry-After (zero: none), on the
+	// elapsed clock (RuntimeOptions.Elapsed): the runtime's one outstanding
+	// Retry-After. Neither the schedule nor an unknown key starts a pull
+	// before it; only an admin's refresh may. A later failure never moves it
+	// earlier; a good pull, a read of the enrolment that finds the server not
+	// enrolled, or its own end clears it.
+	retryEnd time.Time
+	// unknownAt is when an unknown key last took the unknown-key slot (zero:
+	// never), on the elapsed clock: a wall clock set forward does not free
+	// the slot early, nor one set back hold it.
+	unknownAt time.Time
 
 	// What has been logged, for the lines logged once per change of state.
 	failClass   string
@@ -213,7 +245,10 @@ type Runtime struct {
 	afterDone func()
 }
 
-var _ users.Refresher = (*Runtime)(nil)
+var (
+	_ users.Refresher           = (*Runtime)(nil)
+	_ users.UnknownKeyRefetcher = (*Runtime)(nil)
+)
 
 // enrolState is what a read of the enrolment found: state "" when the
 // server is enrolled with the configured service.
@@ -230,7 +265,38 @@ type enrolState struct {
 type flight struct {
 	done chan struct{}
 	row  users.DirectoryRefresh
+	// unknownOnly: the pull exists only for an unknown key (made by
+	// RefetchForUnknownKey, joined by no admin's refresh and not by the
+	// schedule); prevUnknown is when the unknown-key slot had been taken
+	// before the take that made it (zero: never). Such a pull is checked
+	// again against the unknown-key policy when it would start
+	// (unknownMayStart). Both are written under fmu, and read by the pull
+	// goroutine once the pull is the running one, after which nobody joins
+	// it.
+	unknownOnly bool
+	prevUnknown time.Time
+	// admin: an admin's refresh asked for the pull, or joined it. A pull no
+	// admin asked for (the schedule's) is not sent while a Retry-After is
+	// pending when it would start (scheduleMayStart). Written under fmu,
+	// read as unknownOnly is.
+	admin bool
 }
+
+// asker is who asks for a pull (ask).
+type asker int
+
+const (
+	// askAdmin is an admin's refresh (Refresh): its pull is sent whatever
+	// Retry-After is pending.
+	askAdmin asker = iota
+	// askSchedule is the schedule: its pull is not sent while a Retry-After
+	// is pending.
+	askSchedule
+	// askUnknown is an unknown key that took the unknown-key slot: its pull,
+	// while nobody else joins it, is checked against the unknown-key policy
+	// when it would start.
+	askUnknown
+)
 
 // NewRuntime builds the runtime over opts.Lookup. Nothing is read and no
 // pull starts until Load and StartRefresh.
@@ -277,6 +343,10 @@ func NewRuntime(opts RuntimeOptions) (*Runtime, error) {
 	}
 	if r.logf == nil {
 		r.logf = log.Printf
+	}
+	r.elapsed = opts.Elapsed
+	if r.elapsed == nil {
+		r.elapsed = r.clock
 	}
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 	context.AfterFunc(r.ctx, r.stopping)
@@ -447,13 +517,126 @@ func (r *Runtime) Refresh(ctx context.Context) (users.RefreshReport, error) {
 	}
 }
 
-// request is the pull a caller waits for: the one asked for and not yet
+// RefetchForUnknownKey is a new person's first SSH login (asked by the SSH
+// server, in enforce mode, for a key the lookup does not know): it pulls the
+// list, at most at the unknown-key rate, and reports whether the key is
+// known, and not expired, afterwards.
+//
+// It first takes the unknown-key slot (takeUnknownKeySlot), atomically and
+// before anything else; every caller that does not get it returns false at
+// once, having started nothing and waited for nothing. The caller that gets
+// it joins the single flight (a pull asked for and not yet started, or one
+// queued behind the pull running) and waits for it under one deadline,
+// UnknownKeyWait on the runtime's timer, started before it joins, so it
+// covers the queueing as well as the pull's own requests; or until ctx ends.
+// It then answers from the newest snapshot. A pull it stops waiting for
+// carries on under its own bound (PullTimeout), and its result applies when
+// it ends, as an admin's refresh whose caller gave up.
+//
+// A pull that exists only for the unknown key (no admin's refresh and not
+// the schedule joined it) is checked against the policy again when it would
+// start (unknownMayStart): queued behind a pull that was then answered with
+// a Retry-After, or that failed, it may end without sending anything, and
+// the caller is answered from the snapshot it has.
+//
+// A local admin's login never comes here (their keys are always known), and
+// no reader of the lookup waits for a pull: a login that does not take the
+// slot, or whose key is known, is never held by one, hung or not. An admin's
+// refresh (Refresh) is not limited by the slot and does not take it.
+func (r *Runtime) RefetchForUnknownKey(ctx context.Context, fingerprint string) bool {
+	if fingerprint == "" {
+		return false
+	}
+	prev, ok := r.takeUnknownKeySlot()
+	if !ok {
+		return false
+	}
+	r.logf("directory: unknown key %s: pulling the list (at most once a minute while pulls succeed, once every %s while they fail)", fingerprint, RetryInterval)
+	deadline, stop := r.timer(UnknownKeyWait)
+	defer stop()
+	f := r.ask(askUnknown, prev)
+	select {
+	case <-f.done:
+	case <-deadline:
+	case <-ctx.Done():
+	}
+	_, k, known := r.UserForKey(fingerprint)
+	return known && !k.Expired(r.now())
+}
+
+// takeUnknownKeySlot takes the unknown-key slot, and reports whether it did,
+// and when it had been taken before (prev; zero: never). It is taken only
+// when the runtime is not stopping, the last read of the enrolment found the
+// server enrolled with the configured service, no Retry-After is pending,
+// and the slot was last taken at least UnknownKeyEvery ago while the last
+// pull succeeded (or none has ended yet), or at least RetryInterval ago while
+// the server is in the failed state. Every check and the taking are done
+// under one lock, so of callers at once one at most gets it. The waits are
+// measured as elapsed time (RuntimeOptions.Elapsed), not on the wall clock.
+func (r *Runtime) takeUnknownKeySlot() (prev time.Time, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ctx.Err() != nil || r.enrol.state != "" || r.enrol.clientID == "" {
+		return time.Time{}, false
+	}
+	now := r.elapsed()
+	if now.Before(r.retryEnd) {
+		return time.Time{}, false
+	}
+	every := UnknownKeyEvery
+	if r.lastErr != "" {
+		every = RetryInterval
+	}
+	if !r.unknownAt.IsZero() && now.Sub(r.unknownAt) < every {
+		return time.Time{}, false
+	}
+	prev, r.unknownAt = r.unknownAt, now
+	return prev, true
+}
+
+// unknownMayStart reports whether a pull that exists only for an unknown key
+// (made when the slot was taken, prev the take before that one) may start
+// now, and if not, why: not while a Retry-After is pending, and not while
+// the last pull failed and the slot had been taken less than RetryInterval
+// before (the failed state's rate, counted as when the slot is taken). It
+// is the slot's own policy, read again at the start: the pull it was made
+// for may have queued behind one that ended since.
+func (r *Runtime) unknownMayStart(prev time.Time) (bool, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.elapsed()
+	if now.Before(r.retryEnd) {
+		return false, fmt.Sprintf("the account service asked for no request for another %s (Retry-After)", r.retryEnd.Sub(now).Round(time.Second))
+	}
+	if r.lastErr != "" && !prev.IsZero() && now.Sub(prev) < RetryInterval {
+		return false, fmt.Sprintf("the last pull failed, and while pulls fail an unknown key pulls at most once every %s", RetryInterval)
+	}
+	return true, ""
+}
+
+// PullsAsked is how many pulls have been asked for since the runtime was
+// made: each pull counted once, when it is made (started at once, or queued
+// behind the one running); a caller that joins a pull already asked for
+// adds nothing, and nothing is made once the runtime is stopping. An unknown
+// key refused at once asks for none.
+func (r *Runtime) PullsAsked() uint64 {
+	r.fmu.Lock()
+	defer r.fmu.Unlock()
+	return r.asked
+}
+
+// request is the pull an admin's refresh waits for (ask).
+func (r *Runtime) request() *flight { return r.ask(askAdmin, time.Time{}) }
+
+// ask is the pull a caller waits for: the one asked for and not yet
 // started, if there is one; otherwise a new one, started now when none is
-// running, or else started when the running one ends.
+// running, or else started when the running one ends. by says who asks;
+// for an unknown key that took the slot, prev is the take before its own: a
+// pull it makes exists only for it until another caller joins it.
 //
 // Once the runtime is stopping (its context ended), it starts nothing: the
 // pull it returns has already ended, as "the server is stopping".
-func (r *Runtime) request() *flight {
+func (r *Runtime) ask(by asker, prev time.Time) *flight {
 	r.fmu.Lock()
 	defer r.fmu.Unlock()
 	if r.stopped || r.ctx.Err() != nil {
@@ -461,10 +644,17 @@ func (r *Runtime) request() *flight {
 		close(f.done)
 		return f
 	}
-	if r.pending != nil {
-		return r.pending
+	if f := r.pending; f != nil {
+		if by != askUnknown {
+			f.unknownOnly = false
+		}
+		if by == askAdmin {
+			f.admin = true
+		}
+		return f
 	}
-	f := &flight{done: make(chan struct{})}
+	r.asked++
+	f := &flight{done: make(chan struct{}), unknownOnly: by == askUnknown, prevUnknown: prev, admin: by == askAdmin}
 	if r.running == nil {
 		r.running = f
 		r.wg.Add(1)
@@ -476,11 +666,18 @@ func (r *Runtime) request() *flight {
 }
 
 // run runs f, then each pull asked for while it ran, one at a time. When
-// the last ends with the runtime stopping, it forgets the client.
+// the last ends with the runtime stopping, it forgets the client. A pull
+// that exists only for an unknown key is sent only when the unknown-key
+// policy still allows it (unknownMayStart), and one no admin asked for only
+// when no Retry-After is pending (scheduleMayStart); otherwise it ends at
+// once, having sent nothing.
 func (r *Runtime) run(f *flight) {
 	defer r.wg.Done()
+	// f is the running pull: nobody joins it, so what it was asked for is
+	// settled.
+	unknownOnly, admin, prev := f.unknownOnly, f.admin, f.prevUnknown
 	for f != nil {
-		f.row = r.attempt()
+		f.row = r.startPull(unknownOnly, admin, prev)
 		close(f.done)
 		if r.afterDone != nil {
 			r.afterDone()
@@ -488,6 +685,9 @@ func (r *Runtime) run(f *flight) {
 		r.fmu.Lock()
 		f, r.pending = r.pending, nil
 		r.running = f
+		if f != nil {
+			unknownOnly, admin, prev = f.unknownOnly, f.admin, f.prevUnknown
+		}
 		forget := f == nil && r.stopped
 		r.fmu.Unlock()
 		if forget {
@@ -500,21 +700,83 @@ func (r *Runtime) run(f *flight) {
 	}
 }
 
+// startPull is the running pull's attempt, unless the pull exists only for
+// an unknown key (prev: the slot's take before the one that made it) and the
+// unknown-key policy no longer allows it, or no admin asked for it (the
+// schedule's) and a Retry-After is pending: then it ends at once, failed,
+// having sent nothing.
+func (r *Runtime) startPull(unknownOnly, admin bool, prev time.Time) users.DirectoryRefresh {
+	switch {
+	case admin:
+	case unknownOnly:
+		if ok, why := r.unknownMayStart(prev); !ok {
+			r.logf("directory: the pull asked for by an unknown key is not sent: %s", why)
+			return r.row(false, "not sent: "+why)
+		}
+	default:
+		if left := r.retryLeft(); left > 0 {
+			why := fmt.Sprintf("the account service asked for no request for another %s (Retry-After)", left.Round(time.Second))
+			r.logf("directory: the scheduled pull is not sent: %s", why)
+			return r.row(false, "not sent: "+why)
+		}
+	}
+	return r.attempt()
+}
+
+// retryLeft is how long the pending Retry-After has still to run, as
+// elapsed time (0: none pending).
+func (r *Runtime) retryLeft() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.retryLeftLocked(r.elapsed())
+}
+
+// retryLeftLocked is retryLeft at el, a reading of the elapsed clock; r.mu
+// is held.
+func (r *Runtime) retryLeftLocked(el time.Time) time.Duration {
+	if r.retryEnd.IsZero() || !el.Before(r.retryEnd) {
+		return 0
+	}
+	return r.retryEnd.Sub(el)
+}
+
+// nextAttempt is when the schedule's next attempt is due, read at now on
+// the wall clock: the next attempt recorded, put off (and recorded, so
+// status shows it) to the end of the pending Retry-After when that is
+// later. The Retry-After's end is measured as elapsed time, so a wall clock
+// set forward while it runs does not bring a scheduled pull inside it.
+func (r *Runtime) nextAttempt(now time.Time) time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.next = r.nextAttemptLocked(now)
+	return r.next
+}
+
+// nextAttemptLocked is nextAttempt without recording it; r.mu is held.
+func (r *Runtime) nextAttemptLocked(now time.Time) time.Time {
+	next := r.next
+	if left := r.retryLeftLocked(r.elapsed()); left > 0 {
+		if at := now.Add(left); at.After(next) {
+			next = at
+		}
+	}
+	return next
+}
+
 // schedule starts a pull whenever the next attempt is due, until the
 // runtime's context ends: the first at once, then the last good pull plus
-// refresh, or after a failure 15 minutes (or the Retry-After, when later).
+// refresh, or after a failure 15 minutes, or the end of the pending
+// Retry-After when later (nextAttempt).
 func (r *Runtime) schedule() {
 	for r.ctx.Err() == nil {
 		// At each turn: when the trust time has ended and the kept copy is
 		// not yet removed (or its removal failed), remove it.
 		r.removeExpiredCopy()
-		r.mu.Lock()
-		next := r.next
-		r.mu.Unlock()
 		now := r.now()
+		next := r.nextAttempt(now)
 		wait := next.Sub(now)
 		if wait <= 0 {
-			f := r.request()
+			f := r.ask(askSchedule, time.Time{})
 			select {
 			case <-f.done:
 			case <-r.ctx.Done():
@@ -736,7 +998,7 @@ func (r *Runtime) notEnrolled(seq uint64, es enrolState, start time.Time) users.
 	r.mu.Lock()
 	r.enrol = es
 	r.dropClientLocked()
-	r.lastAttempt, r.lastErr, r.next = start, es.describe(), next
+	r.lastAttempt, r.lastErr, r.next, r.retryEnd = start, es.describe(), next, time.Time{}
 	logIt := r.enrolLogged != es.key()
 	r.enrolLogged = es.key()
 	r.failClass, r.goodLogged = "", ""
@@ -814,7 +1076,7 @@ func (r *Runtime) good(seq uint64, start time.Time, d *StateDir, e *Enrolment, p
 	r.lastGood, r.version = p.FetchedAt.Round(0), p.List.Version
 	r.pastTrust = time.Time{}
 	r.copyCond, r.copyErr, r.copyEnd, r.endLogged = cond, why, time.Time{}, ""
-	r.lastAttempt, r.lastErr = start, ""
+	r.lastAttempt, r.lastErr, r.retryEnd = start, "", time.Time{}
 	r.next = p.FetchedAt.Round(0).Add(r.refresh)
 	r.failClass = ""
 	logGood := r.goodLogged != p.List.Version
@@ -954,20 +1216,31 @@ func (r *Runtime) endedCopy(end time.Time, err error) {
 	}
 }
 
-// failed records a failed pull: the list and the copy stay as they were, and
-// the next attempt is 15 minutes away, or the Retry-After when later (at
-// most MaxRetryAfter).
+// failed records a failed pull: the list and the copy stay as they were. Its
+// Retry-After (at most MaxRetryAfter) is kept, as elapsed time, as the
+// runtime's one outstanding Retry-After (retryEnd): a later failure never
+// ends a pending one sooner, with no Retry-After or a shorter one; the later
+// end is kept. The next attempt is 15 minutes away, or the end of that
+// outstanding Retry-After when later, whatever this failure's own answer
+// carried: an admin's refresh that fails inside it does not bring the
+// schedule closer.
 func (r *Runtime) failed(start time.Time, err error) users.DirectoryRefresh {
 	now := r.now()
 	var f *Failure
 	errors.As(err, &f)
-	wait := RetryInterval
-	if f != nil && f.HasRetryAfter && f.RetryAfter > wait {
-		wait = min(f.RetryAfter, MaxRetryAfter)
+	var retryFor time.Duration
+	if f != nil && f.HasRetryAfter {
+		retryFor = min(f.RetryAfter, MaxRetryAfter)
 	}
-	next := now.Add(wait)
-	class, line, everyAttempt := describeFailure(f, err, next)
 	r.mu.Lock()
+	el := r.elapsed()
+	if retryFor > 0 {
+		if end := el.Add(retryFor); end.After(r.retryEnd) {
+			r.retryEnd = end
+		}
+	}
+	next := now.Add(max(RetryInterval, r.retryLeftLocked(el)))
+	class, line, everyAttempt := describeFailure(f, err, next)
 	r.lastAttempt, r.lastErr, r.next = start, err.Error(), next
 	logIt := everyAttempt || r.failClass != class
 	r.failClass, r.goodLogged = class, ""
@@ -1144,7 +1417,9 @@ type Status struct {
 	// failed ("" when it was good).
 	LastAttempt time.Time
 	LastError   string
-	// NextAttempt is when the next scheduled pull is due (zero: at once).
+	// NextAttempt is when the next scheduled pull is due (zero: at once):
+	// never inside the pending Retry-After, whatever the wall clock was set
+	// to while it runs.
 	NextAttempt time.Time
 	// Copy is the kept copy's condition, and CopyError why it is not kept.
 	Copy      CopyCondition
@@ -1160,6 +1435,7 @@ type Status struct {
 func (r *Runtime) Status() Status {
 	ls := r.State()
 	us := r.statusUsers()
+	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := Status{
@@ -1171,7 +1447,7 @@ func (r *Runtime) Status() Status {
 		TrustedUntil: ls.Deadline,
 		LastAttempt:  r.lastAttempt,
 		LastError:    r.lastErr,
-		NextAttempt:  r.next,
+		NextAttempt:  r.nextAttemptLocked(now),
 		Copy:         r.copyCond,
 		CopyError:    r.copyErr,
 		Users:        us,

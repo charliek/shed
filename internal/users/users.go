@@ -122,19 +122,22 @@ type Refresher interface {
 	Refresh(ctx context.Context) (RefreshReport, error)
 }
 
-// UnknownKeyRefetcher is a Lookup that can look for a key it does not know
-// on GitHub, at most once a minute for the whole server. The SSH front door
-// asks it, in enforce mode only, when an unknown key logs in as `_bootstrap`
-// or as a name that is a valid shed name.
+// UnknownKeyRefetcher is a Lookup that can fetch its users again for a key
+// it does not know (from GitHub logins, or a directory's list), at a bounded
+// rate for the whole server. The SSH front door asks it, in enforce mode
+// only, when an unknown key logs in as `_bootstrap` or as a name that is a
+// valid shed name.
 type UnknownKeyRefetcher interface {
-	// RefetchForUnknownKey takes the server-wide slot (one a minute) before
-	// doing anything else; when it gets it, it starts a fetch on behalf of
-	// the unknown key with this fingerprint, waits up to five seconds for
-	// it, and reports whether the key is known (and not expired)
-	// afterwards. Every other call returns false at once, having started
-	// nothing and waited for nothing: while the slot is used, for a key
-	// dropped because its GitHub login no longer names its pinned account,
-	// and outside enforce mode.
+	// RefetchForUnknownKey takes a server-wide slot before doing anything
+	// else; when it gets it, it starts (or joins) a fetch on behalf of the
+	// unknown key with this fingerprint, waits for it up to a bounded time,
+	// and reports whether the key is known (and not expired) afterwards.
+	// Every other call returns false at once, having started nothing and
+	// waited for nothing. How often the slot may be taken, how long the
+	// wait is, and when else a call is refused are each implementation's,
+	// stated on it (ConfigLookup: one a minute, a five-second wait;
+	// directory.Runtime: by the state of its last pull, one 20-second
+	// deadline). ctx ending ends the wait, not the fetch.
 	RefetchForUnknownKey(ctx context.Context, fingerprint string) bool
 }
 

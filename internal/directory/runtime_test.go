@@ -696,8 +696,9 @@ func TestRuntimeSchedule(t *testing.T) {
 	none("15 minutes into a 30-minute Retry-After")
 
 	// An admin's refresh ignores the pending Retry-After. Its Retry-After
-	// of two hours is held to one hour; one of a minute gives way to the
-	// 15 minutes.
+	// of two hours is held to one hour; one of a minute, arriving inside
+	// that hour, leaves the next attempt at the hour's end: the schedule
+	// never pulls inside the outstanding Retry-After.
 	svc.setMode(faultRetryAfter, "7200")
 	adminAt := clock.Now()
 	if row := srv.refresh(t); row.Status != users.DirectoryRefreshFailed {
@@ -710,7 +711,7 @@ func TestRuntimeSchedule(t *testing.T) {
 		t.Fatalf("admin refresh: %+v", row)
 	}
 	next()
-	wantNext(adminAt.Add(RetryInterval))
+	wantNext(adminAt.Add(time.Hour))
 
 	// A good admin refresh: the schedule follows it.
 	svc.setMode(faultNone, "")
@@ -721,8 +722,8 @@ func TestRuntimeSchedule(t *testing.T) {
 	}
 	next()
 	wantNext(goodAt.Add(rtRefresh))
-	clock.set(adminAt.Add(RetryInterval)) // the old next attempt
-	idleAt(adminAt.Add(RetryInterval))
+	clock.set(adminAt.Add(time.Hour)) // the old next attempt
+	idleAt(adminAt.Add(time.Hour))
 	none("at the next attempt the good refresh replaced")
 	clock.set(goodAt.Add(rtRefresh))
 	if row := next(); row.Status != users.DirectoryRefreshGood {
