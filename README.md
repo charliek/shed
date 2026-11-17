@@ -81,13 +81,14 @@ pulled registry-direct from `ghcr.io`. See
 
 Shed is local-development-first: out of the box `bind_address` defaults to
 loopback (`127.0.0.1`), so the server is reachable only on the machine it runs
-on. Facing the network is opt-in, and **token mode** (pinned TLS + minted
-bearer tokens + an SSH key allowlist) is the preferred posture for anything
-networked — it works locally too. Open mode (plain HTTP, no tokens) stays
-available for a trusted private network (e.g. Tailscale), but exposing it
-off-loopback is explicit. Workloads run as a non-root `shed` user (UID 1000) with
-passwordless sudo. Shed targets single-user setups and is **not** built for
-multi-tenant use. In mtls mode an orchestrator can be a
+on. Facing the network is opt-in and takes **mtls mode** (pinned TLS + a
+client certificate enrolled over SSH + an SSH key allowlist); it works
+locally too. Open mode (plain HTTP, no credential) is loopback only. Workloads
+run as a non-root `shed` user (UID 1000) with passwordless sudo. In mtls mode
+a server can have [named users](https://charliek.github.io/shed/guides/multi-user-server/),
+each reaching only their own sheds; that separates people who trust the host
+and its admins, and shed is **not** built for multi-tenant use by parties that
+do not. In mtls mode an orchestrator can be a
 [service client](https://charliek.github.io/shed/reference/security/#service-clients) with a
 policy, which narrows what it can reach through the API; that is a narrow identity, not tenant
 isolation (Firecracker runs without its jailer, for one). Each shed can also be hardened on its

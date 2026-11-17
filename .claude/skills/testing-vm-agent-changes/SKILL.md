@@ -51,8 +51,10 @@ GOOS=linux golangci-lint run ./cmd/shed-agent/...
 ## End-to-end on a real VZ VM (the parallel dev server)
 
 Prereqs (see CLAUDE.md "Server-side changes — parallel dev server"): a
-`my-server-dev` entry in `~/.shed/config.yaml` on ports 18080/12222, and the
-dev config `configs/server.dev-parallel.mac.yaml`.
+`my-server-dev` entry made with
+`shed server add localhost --ssh-port 12222 --name my-server-dev` (the dev
+server runs mtls on HTTPS 18443, so a hand-written entry cannot reach it), and
+the dev config `configs/server.dev-parallel.mac.yaml`.
 
 ### 1. Build + codesign the host server
 
@@ -345,13 +347,15 @@ proxy half-close). What bit, by backend:
   called `remote_unsupported`) and created sheds on the installed server.
   Empty the variables of every backend you do not want instead
   (`make test-integration-remote` and `-dev-fc` do this).
-- **Two VZ cases fail in token mode for harness reasons**, not the change under
-  test: `test_network_surface.py::test_bus_and_connect_on_single_listener`
-  (`KeyError: 'http_port'`: an SSH-first `shed server add` writes no
-  `http_port` into the entry) and `test_ssh_auth.py::test_warn_admits_offlist`
-  (the restarted server refuses its config: `auth.mode: token forces
-  auth.ssh.mode: enforce`). Compare against a baseline before blaming the
-  branch.
+- **The dev servers run mtls, the only enforced mode.** shed-server no
+  longer loads `auth.mode: token`/`secure` or `allow_insecure_exposure`, and
+  `SHED_DEV_AUTH_MODE` is gone (a leftover value stops the dev targets with
+  one line). The reconfiguring cases (`fixtures/devcontrol.py: dev_config`)
+  run in the default run on the Mac: their readiness check is
+  `scripts/dev-server-probe.sh` plus one `/api/info` with a freshly enrolled
+  certificate, and the open-mode ones run the dev server as an open server on
+  loopback. Their first live runs were after the token removal; if one fails
+  for a harness reason, compare against a baseline before blaming the branch.
 - **`make dev-server-down` can need SIGKILL** after its 5 s grace even with
   zero sheds. Not a sign of a stuck VM by itself.
 - **A scratch copy of the repo needs its tags.** Make it with
@@ -380,8 +384,10 @@ proxy half-close). What bit, by backend:
   sheds first (`make dev-server-status[-fc]`, `shed -s <dev> list`); if it is
   busy, run a third server as above instead of `dev-server-restart`.
 - **The mtls-only modules** (`test_http_exec`, `test_service_client`,
-  `test_mtls`, `test_create_mounts`) need the target restarted in mtls mode;
-  run them as a second pass.
+  `test_mtls`, `test_create_mounts`) run in the normal pass now that the FC
+  dev server is mtls (its only mode). A third server needs an mtls config with
+  the `itest` client too (copy the committed FC dev config's `auth:` block) and
+  an entry made with `shed server add <host> --ssh-port <its ssh port>`.
 - **Half-close does not cross FC vsock** in either direction (measured on
   firecracker v1.14.1, old and new agent alike), so a test that expects a
   guest `CloseWrite` to reach the host as EOF holds on VZ and fails on FC by

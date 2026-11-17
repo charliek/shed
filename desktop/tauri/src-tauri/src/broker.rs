@@ -28,7 +28,7 @@ use shed_app::traits::{ClockRef, Responder, ResponderRef};
 use shed_app::{
     load_or_synthesize, resolve_mode, AuthModeRegistry, BrokerConfig, EffectiveMode,
     EmbeddedHostAgent, HelloClientInfo, HostAgentClient, HostAgentEvent, HostAgentTokenMinter,
-    ModePref, ModeProbe,
+    MachineIdentity, ModePref, ModeProbe,
 };
 use shed_core::approval::{ApprovalDecision, DecidedBy};
 use shed_core::token::TokenMinter;
@@ -90,6 +90,10 @@ pub struct BrokerRuntime {
     /// A broker-startup failure (config error or ssh-resolve failure at spawn) — the
     /// single "broker is broken" signal `broker.status` + the tray/Preferences read.
     error: Mutex<Option<String>>,
+    /// This machine's identity once read from the shared file outside embedded mode
+    /// (see [`this_machine`](Self::this_machine)). Only a success is kept: a failed read
+    /// is tried again next time.
+    machine_cache: Mutex<Option<MachineIdentity>>,
 }
 
 impl BrokerRuntime {
@@ -121,6 +125,49 @@ impl BrokerRuntime {
         if let Some(agent) = &self.agent {
             let _ = agent.shutdown_handle().send(true);
         }
+    }
+
+    /// This machine's identity (plan 035 §3.4) — the id a "Use this machine" sends.
+    ///
+    /// In embedded mode it is the identity the running broker loaded at spawn, so the id
+    /// the server is asked to bind is exactly the one on the broker's own requests (and
+    /// the broker's load error, when it had none). Otherwise (external, headless-coexist,
+    /// a broker that never spawned) it is read from the file the daemon shares, so the
+    /// app names the machine the daemon brokers as. A success is cached; the read is
+    /// file I/O under an advisory lock, so it runs off the async worker.
+    pub async fn this_machine(&self) -> Result<MachineIdentity, String> {
+        if let Some(loaded) = self.agent.as_ref().and_then(|a| a.machine_identity()) {
+            return loaded;
+        }
+        if let Some(cached) = self.machine_cache.lock().unwrap().clone() {
+            return Ok(cached);
+        }
+        let loaded = tokio::task::spawn_blocking(shed_app::machine_identity)
+            .await
+            .unwrap_or_else(|e| Err(format!("machine identity load task failed: {e}")));
+        if let Ok(m) = &loaded {
+            *self.machine_cache.lock().unwrap() = Some(m.clone());
+        }
+        loaded
+    }
+
+    /// Wake the embedded broker's waiting subscriptions so a machine just made the
+    /// source connects at once rather than on its next backoff. `false` when there is
+    /// no running embedded bus to wake (external / headless-coexist: the daemon retries
+    /// on its own backoff).
+    pub fn retry_now(&self) -> bool {
+        match &self.agent {
+            Some(agent) if self.should_spawn => {
+                agent.retry_now();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the embedded broker failed to start (config or spawn), for wording.
+    pub fn broker_failed(&self) -> bool {
+        self.error.lock().unwrap().is_some()
     }
 
     /// The effective mode's wire string.
@@ -195,6 +242,22 @@ impl BrokerRuntime {
             ),
             None => (Value::Null, json!([]), json!([])),
         };
+        // This machine's identity as the embedded broker loaded it (plan 035 §3.4), or
+        // why there is none; both null outside embedded mode or before the bus started.
+        let (machine, machine_error) = match self.agent.as_ref().and_then(|a| a.machine_identity())
+        {
+            Some(Ok(m)) => (serde_json::to_value(m).unwrap_or(Value::Null), Value::Null),
+            Some(Err(e)) => (Value::Null, Value::from(e)),
+            None => (Value::Null, Value::Null),
+        };
+        // What the embedded broker signs for a shed (plan 035 §3.5) — the daemon status's
+        // `ssh` block, same shape; null outside embedded mode or before the bus started.
+        let ssh = self
+            .agent
+            .as_ref()
+            .and_then(|a| a.ssh_signing_status())
+            .and_then(|s| serde_json::to_value(s).ok())
+            .unwrap_or(Value::Null);
         json!({
             "effective_mode": self.effective_mode_str(),
             "pref": self.pref_str(),
@@ -207,6 +270,9 @@ impl BrokerRuntime {
             "resolved_ssh_mode": resolved_ssh_mode,
             "gate_namespaces": gate_namespaces,
             "servers": servers,
+            "machine": machine,
+            "machine_error": machine_error,
+            "ssh": ssh,
             "broker_error": self.error.lock().unwrap().clone().map_or(Value::Null, Value::from),
         })
     }
@@ -287,6 +353,7 @@ fn build_external(
             agent: None,
             should_spawn: false,
             error: Mutex::new(None),
+            machine_cache: Mutex::new(None),
         },
     }
 }
@@ -341,6 +408,7 @@ fn build_embedded(
                     agent: Some(agent),
                     should_spawn: spawn,
                     error: Mutex::new(None),
+                    machine_cache: Mutex::new(None),
                 },
             }
         }
@@ -363,6 +431,7 @@ fn build_embedded(
                     agent: None,
                     should_spawn: false,
                     error: Mutex::new(Some(msg)),
+                    machine_cache: Mutex::new(None),
                 },
             }
         }
@@ -480,6 +549,7 @@ mod tests {
             agent: None,
             should_spawn: false,
             error: Mutex::new(None),
+            machine_cache: Mutex::new(None),
         };
         let v = rt.status();
         assert_eq!(v["effective_mode"], "external");
@@ -489,6 +559,11 @@ mod tests {
         assert_eq!(v["config"]["source"], Value::Null);
         assert_eq!(v["servers"], json!([]));
         assert_eq!(v["broker_error"], Value::Null);
+        // External mode runs no broker of its own, so it reports no identity of its own.
+        assert_eq!(v["machine"], Value::Null);
+        assert_eq!(v["machine_error"], Value::Null);
+        // Nor a signing block: the daemon reports its own.
+        assert_eq!(v["ssh"], Value::Null);
         assert_eq!(
             rt.identify_fragment(),
             json!({"effective": "external", "pref": "auto", "restart_required": false})
@@ -511,6 +586,7 @@ mod tests {
             agent: None,
             should_spawn: false,
             error: Mutex::new(Some("bad policy".into())),
+            machine_cache: Mutex::new(None),
         };
         let v = rt.status();
         assert_eq!(v["effective_mode"], "embedded");
@@ -537,6 +613,7 @@ mod tests {
             agent: None,
             should_spawn: false,
             error: Mutex::new(None),
+            machine_cache: Mutex::new(None),
         };
         // Persisted == launch ⟹ pref echoes it, no restart needed.
         assert_eq!(rt.pref_str(), "auto");

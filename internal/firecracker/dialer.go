@@ -13,8 +13,12 @@ import (
 	"github.com/charliek/shed/internal/vmutil"
 )
 
-// Compile-time check that FirecrackerDialer implements vmutil.Dialer.
-var _ vmutil.Dialer = (*FirecrackerDialer)(nil)
+// Compile-time checks that FirecrackerDialer implements vmutil.Dialer and
+// vmutil.CheckedDialer.
+var (
+	_ vmutil.Dialer        = (*FirecrackerDialer)(nil)
+	_ vmutil.CheckedDialer = (*FirecrackerDialer)(nil)
+)
 
 // FirecrackerDialer implements vmutil.Dialer using Firecracker's vsock UDS protocol.
 type FirecrackerDialer struct {
@@ -33,10 +37,24 @@ func NewFirecrackerDialer(socketPath string) *FirecrackerDialer {
 // 3. Read response "OK <port>\n"
 // 4. Then the connection is bridged to the guest
 func (d *FirecrackerDialer) Dial(ctx context.Context, port uint32) (net.Conn, error) {
+	return d.DialChecked(ctx, port, nil)
+}
+
+// DialChecked is Dial with check run once the Unix domain socket is connected
+// and before the CONNECT line, or anything else, is written on it. When check
+// returns an error the connection is closed and that error returned
+// (vmutil.CheckedDialer).
+func (d *FirecrackerDialer) DialChecked(ctx context.Context, port uint32, check func() error) (net.Conn, error) {
 	// Use context-aware dialing so cancellation unblocks the connect.
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", d.socketPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to vsock socket: %w", err)
+	}
+	if check != nil {
+		if err := check(); err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
 
 	// Close conn on ctx cancel so handshake I/O is bounded.

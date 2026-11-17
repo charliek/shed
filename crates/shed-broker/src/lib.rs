@@ -12,8 +12,9 @@
 //! `ssh_backend_agent`, `aws_backend`, `docker_backend`, `egress`), the SSH-bootstrap
 //! **minter** + control-token provider (`minter`, `bootstrap`, `controltoken`), the
 //! **approval**/**audit** seams (`approval`, `audit`, `touchid`), the **config**
-//! reader (`config`), socket **path resolution + liveness probes** (`sockets`), and
-//! the **LiveStatus snapshot** builder + shared RFC3339 helpers (`status`).
+//! reader (`config`), socket **path resolution + liveness probes** (`sockets`), this
+//! machine's **identity** file (`machine`), and the **LiveStatus snapshot** builder +
+//! shared RFC3339 helpers (`status`).
 //!
 //! What stays in the `shed-host-agent` bin (daemon-only): `main` (CLI/signals/
 //! `run_daemon`/`Log`), the socket **bind ceremony** (`socket_bind`), the status UDS
@@ -52,13 +53,25 @@ pub mod discovery;
 pub mod docker_backend;
 // The always-on egress-audit SSE consumer — internal; the supervisor spawns it.
 mod egress;
+// This machine's stable id + display name (`<state>/host-agent/machine.json`), shared by
+// the daemon and the desktop's embedded broker (plan 035 §3.4).
+pub mod machine;
 pub mod minter;
+// Whether the desktop app's embedded broker runs on this machine: a lock beside
+// `machine.json` it holds while it brokers, which the daemon checks before subscribing
+// (plan 035 §3.4).
+pub mod presence;
+// What the broker will sign for a shed: the pure sign-request parser and policy (plan
+// 035 §3.5). Nothing calls it from the signing path yet.
+pub mod sign_check;
 pub mod sockets;
 pub mod ssh_backend;
 #[cfg(test)]
 mod testalert;
 // The agent-forward SSH backend — internal; `ssh_backend` resolves into it.
 mod ssh_backend_agent;
+// The hand-rolled SSH-wire reader shared by the agent-forward backend and `sign_check`.
+mod ssh_wire;
 pub mod status;
 // The native macOS Touch-ID / biometrics approval gate (`#[cfg(target_os="macos")]`
 // inside; off-mac the biometric policies fail closed to deny-all).
@@ -80,8 +93,11 @@ pub use controltoken::{
 };
 pub use credstore::CredStore;
 pub use discovery::{load_discovered_servers, ServerTarget};
+pub use machine::MachineIdentity;
 pub use sockets::{connect_unix_timeout, desktop_socket_path, socket_is_live, status_socket_path};
-pub use status::{build_live_status, LiveStatus, NamespaceHealth, ServerHealth};
+pub use status::{
+    build_live_status, ActiveSource, LiveStatus, NamespaceHealth, ServerHealth, SshSigningStatus,
+};
 pub use supervisor::{SharedDeps, Supervisor};
 
 /// Serialize the tests that mutate process-global environment variables (Rust runs

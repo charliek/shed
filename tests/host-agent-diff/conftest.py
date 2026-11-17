@@ -195,11 +195,20 @@ class CliResult:
     home: str
 
 
-def _clean_env(socket_dir, home, path_prepend=None, ssh_auth_sock=None) -> dict:
+def _clean_env(
+    socket_dir, home, path_prepend=None, ssh_auth_sock=None, state_dir=None
+) -> dict:
     """A hermetic environment: real PATH (so system tools resolve) but an isolated
-    HOME + socket dir, and no ambient ssh-agent. `path_prepend` (a dir) goes on the
-    FRONT of PATH so a shim binary (e.g. a fake `ssh`) is resolved before the real
-    one — the daemon uses `look_ssh` on PATH.
+    HOME + socket dir + state dir, and no ambient ssh-agent. `path_prepend` (a dir)
+    goes on the FRONT of PATH so a shim binary (e.g. a fake `ssh`) is resolved before
+    the real one — the daemon uses `look_ssh` on PATH.
+
+    The state dir (`SHED_HOST_AGENT_STATE_DIR`: the machine identity file and the
+    credential store) defaults to `<home>/state`. It is set explicitly because an
+    isolated HOME alone does not isolate it on Linux: the daemon prefers
+    `$XDG_DATA_HOME`, so a developer with that exported would otherwise have the
+    daemon write `machine.json` into their real data dir. Pass `state_dir` to share
+    one across several daemon runs (the machine-identity restart cell).
 
     `SSH_AUTH_SOCK` is stripped by default (so the local-keys backend is the
     auto-detect result); pass `ssh_auth_sock` to point the agent-forward backend at a
@@ -207,6 +216,9 @@ def _clean_env(socket_dir, home, path_prepend=None, ssh_auth_sock=None) -> dict:
     env = dict(os.environ)
     env["SHED_HOST_AGENT_SOCKET_DIR"] = str(socket_dir)
     env["HOME"] = str(home)
+    env["SHED_HOST_AGENT_STATE_DIR"] = str(
+        state_dir if state_dir is not None else Path(home) / "state"
+    )
     env.pop("SSH_AUTH_SOCK", None)
     env.pop("XDG_RUNTIME_DIR", None)
     # Strip DOCKER_CONFIG so `find_docker_config` resolves the isolated
@@ -452,6 +464,7 @@ def daemon(binaries, tmp_path_factory):
         install_docker_config: str | None = None,
         docker_helper_bundle: str | None = None,
         pre_launch=None,
+        state_dir=None,
     ):
         root = tmp_path_factory.mktemp(f"daemon-{impl}")
         home = root / "home"
@@ -579,7 +592,11 @@ def daemon(binaries, tmp_path_factory):
         proc = subprocess.Popen(
             [binaries[impl], "-config", str(config_path), "-log-file", str(log_path)],
             env=_clean_env(
-                socket_dir, home, path_prepend=path_prepend, ssh_auth_sock=ssh_auth_sock
+                socket_dir,
+                home,
+                path_prepend=path_prepend,
+                ssh_auth_sock=ssh_auth_sock,
+                state_dir=state_dir,
             ),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

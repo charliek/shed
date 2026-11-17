@@ -59,6 +59,48 @@ func (s *Server) clientCreateRefusal(c Caller, req *config.CreateShedRequest) st
 	return ""
 }
 
+// userCreateRefusal names the first field of a create request that a user who
+// is not an admin may not use, or "" when there is none (and always for an
+// admin and the implicit user). What is shared on the host is admin-only on a
+// server with users: host directories (local_dir, add_dirs), the server's
+// mounts (any named one; omitting mounts gives none, see
+// resolveMountSelection), and any image but the server default or one of the
+// active backend's image_aliases (an arbitrary ref pulls into the shared
+// image store, and a path reads the server's filesystem). It runs before any
+// check that reads the host, so a refused caller learns nothing of the
+// server's filesystem. The access guard refuses the host directories and
+// mounts again.
+func (s *Server) userCreateRefusal(c Caller, req *config.CreateShedRequest) string {
+	if c.IsAdmin() {
+		return ""
+	}
+	switch {
+	case req.LocalDir != "":
+		return "local_dir"
+	case len(req.AddDirs) > 0:
+		return "add_dirs"
+	case req.Mounts != nil && len(*req.Mounts) > 0:
+		return "mounts"
+	case req.Image != "":
+		if _, ok := s.cfg.ActiveImageAliases()[req.Image]; !ok {
+			return fmt.Sprintf("image %q (only the server default image or an image alias)", req.Image)
+		}
+	}
+	return ""
+}
+
+// requireAdmin writes a 403 FORBIDDEN and returns false when the request's
+// caller may not change server-wide state (what), which has no owner: anyone
+// but an admin and the implicit user. A service client never reaches such a
+// route (its allowlist), and is refused here too.
+func requireAdmin(w http.ResponseWriter, r *http.Request, what string) bool {
+	if callerFrom(r.Context()).IsAdmin() {
+		return true
+	}
+	writeError(w, http.StatusForbidden, config.ErrForbidden, "admin only: "+what)
+	return false
+}
+
 // resolveNetworkProfile returns the network profile a create gets. Admin:
 // the request's (a known profile, else 400 INVALID_NETWORK_PROFILE), or the
 // server's network.default_profile when omitted. Service client: its pinned
@@ -90,7 +132,9 @@ func (s *Server) resolveNetworkProfile(w http.ResponseWriter, c Caller, req *con
 
 // resolveMountSelection turns a create request's mounts field into the
 // selection the shed stores. Admin: omitted is every server mount, a list must
-// name configured mounts (else 400) and is exactly those ([] = none). Service
+// name configured mounts (else 400) and is exactly those ([] = none). A user
+// who is not an admin: none (a named mount was already refused by
+// userCreateRefusal). Service
 // client: omitted is its policy's server_mounts; a list was already checked
 // against them by clientCreateRefusal. ok=false means a refusal was written.
 func (s *Server) resolveMountSelection(w http.ResponseWriter, c Caller, req *config.CreateShedRequest) (*config.MountSelection, bool) {
@@ -102,8 +146,9 @@ func (s *Server) resolveMountSelection(w http.ResponseWriter, c Caller, req *con
 	}
 	if req.Mounts == nil {
 		// A backend without host mounts stores "none", so nothing later reads
-		// the selection as every server mount.
-		if !s.capabilities().Mounts {
+		// the selection as every server mount. Nor does a user who is not an
+		// admin get the server's mounts by omitting the field.
+		if !s.capabilities().Mounts || !c.IsAdmin() {
 			return config.SelectedMounts(nil), true
 		}
 		return config.AllMounts(), true

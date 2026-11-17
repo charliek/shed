@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/go-chi/chi/v5"
 )
@@ -96,7 +97,7 @@ func (s *Server) handleGetProfile(w http.ResponseWriter, r *http.Request) {
 // handlePutProfile creates or replaces a user profile (whole document), then
 // live-re-pushes running sheds that reference it. PUT /api/egress/profiles/{name}
 func (s *Server) handlePutProfile(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEgressProfiles(w) {
+	if !s.requireEgressProfiles(w) || !requireAdmin(w, r, "egress profile changes") {
 		return
 	}
 	name := chi.URLParam(r, "name")
@@ -129,7 +130,7 @@ func (s *Server) handlePutProfile(w http.ResponseWriter, r *http.Request) {
 // handleDeleteProfile removes a user profile, rejecting the delete if any shed
 // still references it. DELETE /api/egress/profiles/{name}
 func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEgressProfiles(w) {
+	if !s.requireEgressProfiles(w) || !requireAdmin(w, r, "egress profile changes") {
 		return
 	}
 	name := chi.URLParam(r, "name")
@@ -162,8 +163,11 @@ func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 // profileReferencedBy returns the sorted names of sheds whose egress profile list
 // includes name (running OR stopped — a stopped shed would fail to resolve on
 // next start if its profile vanished).
+//
+// It looks at every shed, whoever asks: a profile in use by any shed must not
+// be deleted.
 func (s *Server) profileReferencedBy(ctx context.Context, name string) ([]string, error) {
-	sheds, err := s.backend.ListSheds(ctx)
+	sheds, err := s.backend.ListSheds(systemContext(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -184,11 +188,13 @@ func (s *Server) profileReferencedBy(ctx context.Context, name string) ([]string
 // so a client disconnect can't leave running sheds stale. Stopped sheds
 // re-resolve on next start, so they need no fan-out.
 func (s *Server) rePushProfile(name string) []string {
-	ec, ok := s.backend.(egressController)
+	ec, ok := backend.AsEgressController(s.backend)
 	if !ok {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), rePushTimeout)
+	// The re-push acts for the server itself: a saved profile applies to
+	// every running shed that names it, whoever saved it.
+	ctx, cancel := context.WithTimeout(systemContext(context.Background()), rePushTimeout)
 	defer cancel()
 	sheds, err := s.backend.ListSheds(ctx)
 	if err != nil {
@@ -200,7 +206,11 @@ func (s *Server) rePushProfile(name string) []string {
 		if sh.Status != config.StatusRunning || !shedReferencesProfile(sh, name) {
 			continue
 		}
-		if _, err := ec.SetShedEgress(ctx, sh.Name, sh.EgressProfiles); err != nil {
+		// The listed incarnation is pinned: the profiles pushed are the ones
+		// this listing read from it, so a shed deleted and created again
+		// under the name since (by anyone, with its own profiles) is refused
+		// as not found rather than given the old shed's selection.
+		if _, err := ec.SetShedEgress(backend.PinCreatedAt(ctx, sh.CreatedAt), sh.Name, sh.EgressProfiles); err != nil {
 			warnings = append(warnings, fmt.Sprintf("%s: %v", sh.Name, err))
 		}
 	}

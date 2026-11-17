@@ -3,6 +3,7 @@ package egress
 import (
 	"net"
 	"testing"
+	"time"
 )
 
 // managerWithProxy returns a Manager backed by an in-process ProxyServer (no
@@ -45,7 +46,7 @@ func TestManager_ConfigureAllocatesAndOpens(t *testing.T) {
 	lo := freePort(t)
 	m := managerWithProxy(t, lo, lo) // single-port range ⇒ deterministic allocation
 
-	port, token, err := m.Configure("web", 0, "", "", []ProfileSpec{{}})
+	port, token, err := m.Configure("web", time.Time{}, 0, "", "", []ProfileSpec{{}})
 	if err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -62,7 +63,7 @@ func TestManager_ConfigureReusesProvidedPortAndToken(t *testing.T) {
 	m := managerWithProxy(t, 1, 65535)
 	p := freePort(t)
 
-	port, token, err := m.Configure("web", p, "tok-123", "", []ProfileSpec{{}})
+	port, token, err := m.Configure("web", time.Time{}, p, "tok-123", "", []ProfileSpec{{}})
 	if err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -78,7 +79,7 @@ func TestManager_ReleaseFreesPort(t *testing.T) {
 	lo := freePort(t)
 	m := managerWithProxy(t, lo, lo)
 
-	port, _, err := m.Configure("web", 0, "", "", []ProfileSpec{{}})
+	port, _, err := m.Configure("web", time.Time{}, 0, "", "", []ProfileSpec{{}})
 	if err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestManager_ReleaseFreesPort(t *testing.T) {
 		t.Error("shed still tracked after Release")
 	}
 	// Release freed the port; a second Configure (single-port range) reuses it.
-	port2, _, err := m.Configure("web2", 0, "", "", []ProfileSpec{{}})
+	port2, _, err := m.Configure("web2", time.Time{}, 0, "", "", []ProfileSpec{{}})
 	if err != nil {
 		t.Fatalf("re-Configure after Release: %v", err)
 	}
@@ -105,7 +106,7 @@ func TestManager_RemoveKeepsPort(t *testing.T) {
 	lo := freePort(t)
 	m := managerWithProxy(t, lo, lo+1) // two-port range
 
-	port, _, err := m.Configure("web", 0, "", "", []ProfileSpec{{}})
+	port, _, err := m.Configure("web", time.Time{}, 0, "", "", []ProfileSpec{{}})
 	if err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -120,7 +121,7 @@ func TestManager_RemoveKeepsPort(t *testing.T) {
 		t.Error("Remove (stop) should KEEP the port reserved for restart")
 	}
 	// Another shed must NOT be allocated web's reserved port while web is stopped.
-	port2, _, err := m.Configure("web2", 0, "", "", []ProfileSpec{{}})
+	port2, _, err := m.Configure("web2", time.Time{}, 0, "", "", []ProfileSpec{{}})
 	if err != nil {
 		t.Fatalf("Configure web2: %v", err)
 	}
@@ -128,7 +129,7 @@ func TestManager_RemoveKeepsPort(t *testing.T) {
 		t.Errorf("web2 got web's reserved port %d while web is only stopped", port)
 	}
 	// web restarts on the SAME reserved port.
-	port3, _, err := m.Configure("web", port, "", "", []ProfileSpec{{}})
+	port3, _, err := m.Configure("web", time.Time{}, port, "", "", []ProfileSpec{{}})
 	if err != nil {
 		t.Fatalf("restart Configure web: %v", err)
 	}
@@ -140,11 +141,11 @@ func TestManager_RemoveKeepsPort(t *testing.T) {
 func TestManager_RejectsPortOwnedByAnother(t *testing.T) {
 	m := managerWithProxy(t, 1, 65535)
 	p := freePort(t)
-	if _, _, err := m.Configure("a", p, "", "", []ProfileSpec{{}}); err != nil {
+	if _, _, err := m.Configure("a", time.Time{}, p, "", "", []ProfileSpec{{}}); err != nil {
 		t.Fatalf("Configure a: %v", err)
 	}
 	// b claims a's port (e.g. hand-edited metadata) → rejected, not corrupting.
-	if _, _, err := m.Configure("b", p, "", "", []ProfileSpec{{}}); err == nil {
+	if _, _, err := m.Configure("b", time.Time{}, p, "", "", []ProfileSpec{{}}); err == nil {
 		t.Error("expected Configure to reject a port owned by another shed")
 	}
 	m.mu.Lock()
@@ -167,7 +168,7 @@ func TestManager_ConfigureFailureReleasesPort(t *testing.T) {
 	defer occupied.Close()
 	p := occupied.Addr().(*net.TCPAddr).Port
 
-	if _, _, err := m.Configure("web", p, "", "", []ProfileSpec{{}}); err == nil {
+	if _, _, err := m.Configure("web", time.Time{}, p, "", "", []ProfileSpec{{}}); err == nil {
 		t.Fatalf("expected Configure to fail on occupied port %d", p)
 	}
 	m.mu.Lock()

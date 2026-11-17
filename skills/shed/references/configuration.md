@@ -10,9 +10,13 @@ Written and updated by `shed server add` / `shed create`; you rarely edit it by 
 default_server: my-server          # used when -s/--server is not passed
 servers:
   my-server:
-    host: my-server.tailnet.ts.net # hostname/IP on the private network (Tailscale)
-    http_port: 8080                # API port (default 8080)
-    ssh_port: 2222                 # auto-discovered from the server's /api/info
+    host: my-server.example.com    # hostname/IP
+    ssh_port: 2222                 # first contact is over SSH (shed server add --ssh-port)
+    api_url: https://my-server.example.com:8443   # an mtls server: HTTPS only
+    tls_cert_fingerprint: sha256:...              # the server's pinned TLS cert
+    auth_mode: mtls
+    client_cert_file: ~/.shed/creds/my-server/client.pem   # enrolled over SSH, renewed automatically
+    client_key_file: ~/.shed/creds/my-server/client.key
 sheds:                             # local cache of where each shed lives
   myproj:
     server: my-server
@@ -20,7 +24,7 @@ sheds:                             # local cache of where each shed lives
 create_timeout: 10m                # optional; default create timeout
 ```
 
-Auth is SSH-key based (keys from `~/.ssh`); there is no token/login field. The server's SSH host key is fetched and cached on first `shed server add`.
+An open (local-only) server's entry has `http_port: 8080` instead of the TLS and certificate fields. Auth is SSH-key based (keys from `~/.ssh`): `shed server add` pins the SSH host key in `~/.shed/known_hosts` and, for an mtls server, enrolls a client certificate over SSH; the CLI renews it near expiry. There is no token/login field to set by hand.
 
 ## `~/.shed/sync.yaml` — file sync profiles
 

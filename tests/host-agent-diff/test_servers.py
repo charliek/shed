@@ -21,6 +21,8 @@ Two cells:
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from normalize import canonical, mask_live_status
@@ -108,6 +110,13 @@ def test_servers_409_rejected_masked_equal(daemon, single_server_config, differe
                     lambda s: _state_of(s, _SSH) == "rejected"
                     and _state_of(s, _DOCKER) == "connected",
                 )
+                # Terminal: no retry. `rejected` is written only once the subscribe loop
+                # has exited, and the count is read after the first TWO backoff steps
+                # (1 s, then 2 s) have passed, so a retry could not merely be late. The
+                # pin's retryable 409 (`SOURCE_DUPLICATE_STREAM`) must not have made every
+                # 409 retryable (test_source_pin.py has the duplicate cell).
+                time.sleep(3.5)
+                assert bus.subscribe_count(_SSH) == 1, bus.subscribe_count(_SSH)
                 masked = mask_live_status(obj, d.socket_dir, d.config_path)
                 return canonical(_normalize_url(masked["servers"], bus.url))
 

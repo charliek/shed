@@ -7,7 +7,8 @@
     "shed_name": "web-app",
     "shed_owner": "nocturn",
     "shed_schema": "1",
-    "shed_state": "creating"
+    "shed_state": "creating",
+    "shed_user": ""
   },
   "tags": {
     "items": [
@@ -60,7 +61,8 @@
           "shed_id": "abcdefghij0123456789klmnop",
           "shed_name": "web-app",
           "shed_owner": "nocturn",
-          "shed_schema": "1"
+          "shed_schema": "1",
+          "shed_user": ""
         }
       }
     }

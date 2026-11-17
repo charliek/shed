@@ -116,13 +116,16 @@ daemon's `main.rs` wraps) via `shed-app`'s non-default `broker` feature
 (`crates/shed-app/src/broker_bridge.rs`), wired into the setup hook by
 `desktop/tauri/src-tauri/src/broker.rs`. Full behavior is documented user-facing in
 [docs/desktop/architecture.md § The embedded credential
-broker](../docs/desktop/architecture.md#the-embedded-credential-broker-tauri).
+broker](../docs/desktop/architecture.md#the-embedded-credential-broker).
 
 Three modes, resolved once at startup from a persisted `broker_mode` pref (`auto`
 default) overlaid on a probe of both daemon sockets — `external` (a full daemon is
 running, dial it as before), `headless-coexist` (only a headless daemon's status
 socket is live — mint-only, no in-app approvals), `embedded` (neither socket live —
-start the in-process broker).
+start the in-process broker). Whatever the mode, the app and the daemon share one machine
+identity (`<state>/host-agent/machine.json`, `shed_broker::machine`): `BrokerRuntime::this_machine`
+is the embedded broker's loaded identity, else the shared file, and it is the only id
+`source.use` ever sends.
 
 Test pointers:
 
@@ -132,7 +135,11 @@ Test pointers:
   retired `rc` with the RC hub, so there is no `broker,rc` pair left to run.
 - `desktop/tools/shedtest/test_tauri_broker.py` — the hermetic e2e cells (three-way auto-detect, the bus → AppGate → Coordinator → respond
   round-trip via the mock server's plugin-bus endpoints, split-namespace `409`,
-  malformed-config fail-closed, the synthesized fresh-install namespace set).
+  malformed-config fail-closed, the synthesized fresh-install namespace set, and the
+  plan 035 machine pin: `not-source` then accepted, `duplicate`, other 403s, the respond
+  `503` retry; and the credential-source rows: `source.status`/`source.use`, the
+  Preferences "Use this machine" button via the test-mode `ui.press_source_use` door, in
+  embedded and external mode, against the mock's `arm_source` binding).
 - The mock server's plugin-bus routes live in `desktop/tools/shedtest/mockserver.py`
   (`GET /api/plugins/listeners/{ns}/messages` SSE + `POST
   /api/plugins/listeners/{ns}/respond`), shape-pinned against
@@ -163,10 +170,10 @@ process and a different tradeoff (see the credential-ownership table in
 `~/.claude/plans/shed/001-mtls-mode.md` §3 D6 if working in this area).
 
 A desktop app newer than its `shed-host-agent` install can't use mTLS at all
-until the agent is upgraded — see the [Upgrading to
-mTLS](../docs/upgrades/token-to-mtls.md) guide's "desktop users" section for
-the exact failure mode and the required upgrade order (agent before/with the
-app; they're separate release selectors).
+until the agent is upgraded — see [Security › Enrollment over
+SSH](../docs/reference/security.md#enrollment-over-ssh) ("Clients older than
+v0.8.1") for the exact failure messages and the required upgrade order (agent
+before/with the app; they're separate release selectors).
 
 ## Socket paths
 

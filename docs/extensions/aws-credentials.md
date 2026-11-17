@@ -32,6 +32,15 @@ sequenceDiagram
     Proxy->>SDK: {AccessKeyId, SecretAccessKey, Token, Expiration}
 ```
 
+## Which machine answers
+
+A shed's `aws-credentials` requests go to its user's [credential source](source-binding.md) on that
+server, the one machine the server has bound for that user, and to no other machine. If the
+source is not connected, the server drops the request and the helper in the shed fails at its
+own timeout (below); nothing fails over to another machine. The machine's own configuration
+(roles or registries, and the approval policy) decides the answer. The
+[SSH signing check](ssh-agent.md#what-the-machine-signs) does not apply to this namespace.
+
 ## AWS SDK Integration
 
 The AWS SDK credential chain checks `AWS_CONTAINER_CREDENTIALS_FULL_URI` automatically across all languages (Java, Python, Go, Node, Kotlin). No application code changes needed.
@@ -63,7 +72,7 @@ aws:
   default_role: arn:aws:iam::123456789012:role/acmeco-dev
 
   servers:
-    mini2:
+    devbox:
       sheds:
         my-service:
           role: arn:aws:iam::123456789012:role/acmeco-dev
@@ -92,7 +101,7 @@ aws:
   source_profile: default
   default_role: arn:aws:iam::111111111111:role/dev   # assume-role default
   servers:
-    mini2:
+    devbox:
       sheds:
         sso-app:    { mode: passthrough }
         scoped-app: { role: arn:aws:iam::111111111111:role/scoped }

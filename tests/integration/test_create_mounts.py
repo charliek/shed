@@ -7,9 +7,9 @@ stored selection holds across stop/start. A default create next to it is the
 positive control (it gets every server mount and lists as `all`).
 
 Firecracker only (the `fc_server_dev` fixture, so it can only reach the dev
-entry). Mode-independent, but run in mtls mode like the rest of plan 034:
-`make build && make dev-server-restart-fc SHED_DEV_AUTH_MODE=mtls &&
-make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls PYTEST_ARGS="test_create_mounts.py"`.
+entry). Mode-independent; the FC dev server runs mtls:
+`make build && make dev-server-restart-fc &&
+make test-integration-dev-fc PYTEST_ARGS="test_create_mounts.py"`.
 """
 
 from __future__ import annotations

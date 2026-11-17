@@ -361,3 +361,59 @@ func TestPruneRespectsCreatingMarker(t *testing.T) {
 		t.Errorf("expected dangling-v2 blob to be swept too")
 	}
 }
+
+// TestListSnapshotsCountsUnreadable: a snapshot whose metadata cannot be
+// parsed, or cannot be looked at, is left out of the listing and counted
+// (the start-up pass must not take such a record as having a user), never
+// silently skipped; a readable one is listed.
+func TestListSnapshotsCountsUnreadable(t *testing.T) {
+	snapshotsDir := t.TempDir()
+	c := &Client{cfg: &config.FirecrackerConfig{SnapshotsDir: snapshotsDir}, serverCfg: &config.ServerConfig{Name: "test"}}
+	if err := saveSnapshot(snapshotsDir, &config.Snapshot{Name: "good", Backend: config.BackendFirecracker}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(snapshotsDir, "garbled"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(SnapshotMetadataPath(snapshotsDir, "garbled"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A directory with no metadata yet (a snapshot being taken) is not a
+	// record, and is not counted.
+	if err := os.MkdirAll(filepath.Join(snapshotsDir, "pending"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A directory whose metadata cannot be looked at.
+	locked := filepath.Join(snapshotsDir, "locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(SnapshotMetadataPath(snapshotsDir, "locked"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantUnreadable := 1
+	if os.Geteuid() != 0 {
+		if err := os.Chmod(locked, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+		wantUnreadable = 2
+	} else {
+		_ = os.RemoveAll(locked) // root reads through any mode
+	}
+
+	snaps, unreadable, err := c.ListSnapshotsCounting(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) != 1 || snaps[0].Name != "good" {
+		t.Errorf("listed %+v, want only good", snaps)
+	}
+	if unreadable != wantUnreadable {
+		t.Errorf("unreadable = %d, want %d", unreadable, wantUnreadable)
+	}
+	plain, err := c.ListSnapshots(context.Background())
+	if err != nil || len(plain) != 1 {
+		t.Errorf("ListSnapshots = %+v %v", plain, err)
+	}
+}

@@ -20,6 +20,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 // clientAllowedList is the service-client allowlist as this test states it.
@@ -65,11 +66,15 @@ var clientForbiddenList = []string{
 	"GET /api/egress/{name}",
 	"POST /api/egress/{name}",
 	"DELETE /api/egress/{name}",
+	"POST /api/users/refresh",
+	"GET /api/sources",
+	"POST /api/sources/use",
 	"GET /api/plugins/listeners",
 	"GET /api/plugins/listeners/{namespace}/messages",
 	"POST /api/plugins/listeners/{namespace}/respond",
 	"GET /api/plugins/sheds",
 	"POST /api/sheds/{name}/reset",
+	"POST /api/sheds/{name}/assign",
 	"GET /api/sheds/{name}/sessions",
 	"DELETE /api/sheds/{name}/sessions/{session}",
 	"GET /api/sheds/{name}/connect/{port}",
@@ -257,7 +262,7 @@ func clientTestServer(t *testing.T, b backend.Backend, policy config.ServiceClie
 		},
 	}
 	s := NewServer(b, cfg, "", nil, nil)
-	s.SetClientCertAuthorizer(func(fp string) bool { return fp == testAdminFP })
+	s.SetUserLookup(userstest.Implicit(testAdminFP))
 	return s, s.Router()
 }
 
@@ -319,9 +324,13 @@ func do(h http.Handler, leaf *x509.Certificate, method, path, body string, hdr .
 	for i := 0; i+1 < len(hdr); i += 2 {
 		req.Header.Set(hdr[i], hdr[i+1])
 	}
+	fp := ""
 	if leaf != nil {
 		withClientCert(req, leaf)
+		fp = leaf.Subject.CommonName
 	}
+	// The key's own machine, for the credential bus (other routes ignore it).
+	withTestMachine(req, fp)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return apiResp{rec.Code, rec.Body.Bytes(), rec.Header()}

@@ -168,7 +168,7 @@ func (m *mtlsServer) issue(t *testing.T, label string, ttl time.Duration) (certP
 	if err != nil {
 		t.Fatal(err)
 	}
-	certDER, err := m.ca.SignClientCSR(csrDER, sshFingerprint(label), "control", "cli", ttl)
+	certDER, err := m.ca.SignClientCSR(csrDER, sshFingerprint(label), "", "control", "cli", ttl)
 	if err != nil {
 		t.Fatalf("sign client CSR: %v", err)
 	}

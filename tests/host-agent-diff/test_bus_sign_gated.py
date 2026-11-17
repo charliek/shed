@@ -1,8 +1,8 @@
 """The gated cross-surface (A+B) **sign** flow — the capstone scenario.
 
 A single bus `sign` request (surface B) drives a delegated `approval_request` to the
-connected desktop consumer (surface A); on **approve** the daemon signs the challenge
-with the committed ed25519 key and returns an `SSHSignResponse` on the bus PLUS an
+connected desktop consumer (surface A); on **approve** the daemon signs the request's
+data with the committed ed25519 key and returns an `SSHSignResponse` on the bus PLUS an
 audit `event` to the desktop and a durable JSONL line; on **deny** it returns
 `{approval denied, SIGN_FAILED}` and a `denied` audit. All of that wire-visible
 output is golden-pinned under the harness's canonicalization (`differential`).
@@ -15,7 +15,13 @@ shed-desktop`.
 **Deterministic ed25519 → the signature blob is pinned UNMASKED.** ed25519 signing
 is deterministic (RFC 8032: the nonce is derived from key+message, not randomness),
 so the `ed25519-dalek` backend, loading the committed `~/.ssh/id_ed25519` and signing
-the fixed challenge, always produces the SAME 64 bytes. The `mask_bus_response` mask
+the fixed data, always produces the SAME 64 bytes.
+
+**The data is a login request for `git`** (plan 035 §3.5): the daemon signs only an SSH
+login as an allowed username (default `[git]`) or a `git` SSHSIG, and declines anything
+else before any prompt (`test_bus_sign_refused.py`). The data here is an exact login for
+`git` with the committed key and a fixed session id (`sign_payloads.py`), so it passes
+the check and reaches the approval gate, and its signature stays deterministic. The `mask_bus_response` mask
 leaves `payload` (hence `blob`) unmasked, so the golden carries the signature
 byte-for-byte — and we additionally pin it inline (`EXPECTED_SIGN_BLOB_B64`) as an
 absolute constant.
@@ -34,6 +40,7 @@ from pathlib import Path
 import pytest
 
 from desktop_client import DesktopClient, wait_for_consumer
+from sign_payloads import b64, login_request
 from normalize import (
     canonical,
     mask_approval_request,
@@ -61,22 +68,23 @@ TEST_ED25519_PUB_BLOB = (FIXTURES_DIR / "test_ed25519.pub").read_text().split()[
 # ever regenerated (see `test_committed_key_pubkey_blob_is_pinned`).
 PINNED_PUB_BLOB = "AAAAC3NzaC1lZDI1NTE5AAAAILMdrPP0NLsfgrc8JIa6OWX1qhgyfW/UwJTSXdRuUsJJ"
 
-# A FIXED challenge → base64 for the sign request's `data`. Fixed so the deterministic
-# ed25519 signature (and thus the pinned blob) is stable.
-CHALLENGE = b"shed-host-agent gated-sign differential challenge v1"
-CHALLENGE_B64 = base64.b64encode(CHALLENGE).decode("ascii")
+# The FIXED data for the sign request: an exact `publickey` login request for `git`
+# with the committed key (fixed session id), so the signing check passes it and the
+# deterministic ed25519 signature (and thus the pinned blob) is stable.
+LOGIN = login_request(b"git", TEST_ED25519_PUB_BLOB, b"ssh-ed25519")
+LOGIN_B64 = b64(LOGIN)
 
-# The deterministic ed25519 signature (RFC 8032) of CHALLENGE by the committed key —
-# base64(raw 64-byte sig). Byte-identical across Go `x/crypto/ssh` and Rust
-# `ed25519-dalek` (the whole point). Pinned so the approve test is an absolute golden,
-# not just a Go-agrees-with-Rust check; regenerate ONLY if the key or challenge change.
+# The deterministic ed25519 signature (RFC 8032) of LOGIN by the committed key —
+# base64(raw 64-byte sig), as Python's `cryptography` computes it from the committed
+# private key. Pinned so the approve test is an absolute golden; regenerate ONLY if the
+# key or the login data change.
 EXPECTED_SIGN_BLOB_B64 = (
-    "r5+/n2R3osYEEdZqWq+BBYbMDKAHG7ISLrEb5t7AirSoQwaE9s2t2p3/SICRw2+hEUWwf+9"
-    "Lnt+asgFR21PYDQ=="
+    "6lRG1fs7BQ0Aw0o0eq8T5QYDCjUI9n0LjOSHpCd9VjavlQGEoc3NTaL5zolLah5mQJTtBYf5wRNG"
+    "a1W7XN71Aw=="
 )
 
 # The request Envelope shed-server would deliver to the ssh-agent listener: a `sign`
-# op carrying the committed pubkey blob + the fixed challenge, with a fixed id + shed
+# op carrying the committed pubkey blob + the fixed login, with a fixed id + shed
 # so the correlation (`in_reply_to`), the echoed `shed`, and the audit/approval `shed`
 # are pinned constants the flow must reproduce.
 SIGN_REQUEST = {
@@ -88,7 +96,7 @@ SIGN_REQUEST = {
     "payload": {
         "operation": "sign",
         "public_key": TEST_ED25519_PUB_BLOB,
-        "data": CHALLENGE_B64,
+        "data": LOGIN_B64,
         "flags": 0,
     },
     "shed": {"name": "web", "backend": "vz", "server": "mini2"},
@@ -165,8 +173,7 @@ def test_bus_sign_gated_approve(daemon, sign_config, differential):
     assert ar["namespace"] == "ssh-agent"
     assert ar["op"] == "sign"
     assert ar["shed"] == "web"
-    # The reason shown to the app is the fixed "SSH sign request" — the gate runs
-    # FIRST, before the key type is parsed, so the detail is NOT the key type.
+    # The reason shown to the app is the fixed "SSH sign request", not the key type.
     assert ar["detail"] == "SSH sign request"
     assert "server" not in ar, "single-server mode omits approval_request.server"
     # Volatile fields masked (shape-asserted inside mask_approval_request).
@@ -241,7 +248,7 @@ def test_bus_sign_gated_deny(daemon, sign_config, differential):
     assert resp["in_reply_to"] == "sign-1"
     assert resp["namespace"] == "ssh-agent"
     assert resp["shed"] == EXPECTED_SHED
-    # The guest gets {approval denied, SIGN_FAILED}; the challenge is never signed.
+    # The guest gets {approval denied, SIGN_FAILED}; the data is never signed.
     assert resp["payload"] == {"error": "approval denied", "code": "SIGN_FAILED"}
     assert resp["id"] == "<id>"
     assert resp["timestamp"] == "<ts>"

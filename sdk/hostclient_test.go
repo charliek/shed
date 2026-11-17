@@ -352,8 +352,13 @@ func TestNewHostClientOptionOverrides(t *testing.T) {
 	if client.serverURL != "http://custom:9090" {
 		t.Errorf("serverURL = %q, want %q", client.serverURL, "http://custom:9090")
 	}
-	if client.httpClient != customHTTP {
-		t.Error("expected custom HTTP client")
+	// The custom client is used as a copy (its redirect rule is installed on
+	// the copy, never on the caller's client).
+	if client.httpClient.Timeout != 42*time.Second {
+		t.Errorf("custom HTTP client Timeout = %v, want 42s", client.httpClient.Timeout)
+	}
+	if customHTTP.CheckRedirect != nil {
+		t.Error("NewHostClient changed the caller's *http.Client")
 	}
 	if client.logger != customLogger {
 		t.Error("expected custom logger")

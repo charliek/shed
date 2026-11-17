@@ -18,8 +18,8 @@ ssh_port: 2222
 # Defaults to loopback (127.0.0.1): shed is a local-development tool unless
 # explicitly exposed. Set a routable address ("0.0.0.0"/"*" = all IPv4,
 # "::" = all interfaces, or a specific LAN/tailnet IP) to reach it off-box.
-# In OPEN mode (no TLS) a non-loopback bind also requires
-# allow_insecure_exposure: true; token mode (auth.mode: token) needs no ack.
+# Only auth.mode: mtls may bind beyond loopback; an OPEN server (no TLS, no
+# client authentication) is loopback only.
 bind_address: 127.0.0.1
 
 # Backend configuration
@@ -54,13 +54,16 @@ mounts:
 # to sessions or hooks), and never to a service client's sheds.
 env_file: ~/.shed/env
 
-# Identity directory: SSH host key, TLS cert, mtls client CA, GitHub key cache.
+# Identity directory: SSH host key, TLS cert, mtls client CA, GitHub key cache
+# and account pins (github_pins.json), the users upgrade marker.
 # Default /etc/shed as root, ~/.shed otherwise; set it for a second server on
 # the same host. See docs/reference/configuration.md#tls-and-network-surface
 # state_dir: /etc/shed
 
 # --- Authentication and service clients ---
-# auth.mode: open (default) | token | mtls. See docs/guides/security-configuration.md.
+# auth.mode: open (default, loopback only) | mtls. See docs/guides/security-configuration.md.
+# (auth.mode: token and its old spelling secure were removed in v0.10.0 and fail
+# config load; use mtls.)
 # Service clients (orchestrators that create, exec in and delete only their own
 # sheds) need mtls. Issue a client's certificate on this host with
 # `shed-server client issue <name>`. See docs/guides/orchestrated-sheds.md and
@@ -80,6 +83,41 @@ env_file: ~/.shed/env
 #         server_mounts: []          # default: no server mounts
 #         images: []                 # default: only the default image
 #         caps: {cpus: 4, memory_mb: 8192}
+
+# --- Users (mtls only) ---
+# Without auth.users every accepted key is one implicit user, an admin. With a
+# user list each key belongs to exactly one user, and each user reaches only
+# their own sheds; an admin may also list, stop and delete anyone's shed (never
+# enter another user's) and use what the host shares (host directories, server
+# mounts, images that are not the default or an alias, the image store). auth.users replaces auth.ssh's key sources (authorized_keys,
+# authorized_keys_file, github_users): set one or the other, not both.
+# A user needs a github login, a key, or both; at least one admin needs a
+# github login or a key not marked script. admin and script take true or false.
+# A key is a plain public key (an SSH certificate is refused) and may appear
+# once in the whole list. A GitHub login is pinned to its numeric account id at
+# its first fetch; github_id pins it from config instead.
+# expires is an RFC 3339 time or a date (the key works through that day, UTC).
+# A script key (script: true) cannot take a credentials certificate, use the
+# credential bus, or see or move the user's credential source.
+# Write the whole list before the first start with it: on that start a server
+# with exactly one user gives that user every shed that has no user. See
+# docs/guides/multi-user-server.md.
+# auth:
+#   mode: mtls
+#   users:
+#     alice:
+#       github: alice-gh
+#       admin: true
+#     bob:
+#       github: bob-gh
+#       github_id: 1234567
+#       keys:
+#         - key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... bob@laptop
+#           label: laptop
+#           expires: 2027-06-30
+#         - key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... ci
+#           label: ci
+#           script: true
 
 # --- HTTPS exec limits (POST /api/sheds/{name}/exec) ---
 # See docs/reference/configuration.md#https-exec

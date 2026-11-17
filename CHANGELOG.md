@@ -339,6 +339,166 @@ All notable changes to this project will be documented in this file.
   time on the first start after this upgrade, because the identity changed; after that,
   upgrades don't ask again. (#304)
 
+<!--
+  Two releases' notes share this Unreleased section. Everything ABOVE this
+  comment is the curated 0.9.1 entry (a fix release, no config change needed).
+  Everything BELOW the rule that follows is the breaking work for 0.10.0
+  (users, the credential source, the signing check, the removed token mode),
+  which ships server, host-agent and desktop. At release time either tag 0.9.1
+  from the notes above and move the block below under a fresh `## Unreleased`
+  (it then becomes the 0.10.0 entry, its `###` headings in place of the
+  `####` ones), or fold both into one v0.10.0 entry. Nothing below may start a
+  line with `## Unreleased` or `## v<digit>` (RELEASING.md).
+-->
+
+---
+
+### Users, the credential source and the signing check (0.10.0, breaking)
+
+A shed server can now have named users, each of whom sees and enters only their own sheds;
+each user's credential requests go to one machine of theirs; and that machine signs only what
+git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
+
+> **Breaking: move token-mode servers to `mtls` first, then upgrade machines before
+> servers.** `auth.mode: token` and `secure`, and `allow_insecure_exposure`, no longer load. A
+> `shed-host-agent` or desktop app older than 0.10.0 is refused by a 0.10.0 server, and a
+> 0.10.0 machine signs only SSH logins as `git` and git signatures unless told otherwise.
+> Read the [v0.9.1 to v0.10.0 upgrade
+> guide](https://charliek.github.io/shed/upgrades/v0.9.1-to-v0.10.0/) before upgrading
+> anything; it includes the order, the user-list decision and a rollback procedure.
+
+#### Upgrade notes
+
+- **`auth.mode: token`, `secure` and `allow_insecure_exposure` fail config load** with a
+  message naming `mtls`; nothing falls back to open, and an `open` server binds loopback only.
+  Switch such a server to `mtls` while it still runs 0.9.x: clients since v0.8.1 re-enroll with
+  a certificate on their next request. A config left unmigrated makes the apt package skip
+  the restart and leave the old process running, and leaves a Homebrew service down after
+  its restart.
+- **An unknown or differently cased key under `auth:` fails config load** (`auth: {Mode:
+  mtls}` used to be ignored, starting the server open), and so does a top-level key that
+  matches a known one only when case is ignored (`Auth:`, `Bind_Address:`).
+- **Upgrade machines before servers.** A new broker works against a 0.9.x server; a released
+  broker gets `403 SOURCE_MACHINE_ID_REQUIRED` from a 0.10.0 server and brokers nothing until
+  upgraded.
+- **The first machine to connect for each user becomes its credential source** (on a server
+  with no user list, the one source for every shed). Start the intended machine first, or move
+  it with `shed source use`. Nothing fails over by itself.
+- **`ssh`, `scp` or `rsync` from a shed as a username other than `git` is refused** by the
+  machine once it is upgraded. Allow a name with `ssh.allow_users`, which then needs
+  `ssh.offer_keys`.
+- **`git` is reserved as a shed name.** Delete or recreate a shed named `git` before upgrading
+  machines.
+- **A user list is decided once.** On a server with existing sheds, start the first time with
+  only yourself listed (as an admin), then add the others: with several users nothing is
+  given away, and most existing Firecracker and VZ sheds cannot be assigned.
+- **`api.github.com` is a new outbound dependency** for every server that follows a GitHub
+  login.
+- **Development:** the Firecracker dev entry from when that server ran open is plain HTTP and
+  does not heal: remove it and add it again with `shed server add <host> --ssh-port 12222
+  --name <host>-dev`.
+
+#### Added
+
+- **Server: named users.** `auth.users.<name>` with `github` (keys pinned to the account id),
+  optional `github_id`, `admin`, and hand-listed `keys` with a `label`, an optional `expires`
+  and `script: true` for automation. Requires `mtls` and replaces `auth.ssh`'s key sources.
+  Each user reaches only their own sheds and snapshots; an admin may also list, stop and delete
+  anyone's but not enter them. Host directories, server mounts, `env_file`, images other than
+  the default or an alias, the image store and prune are admin-only. Shed and snapshot records
+  carry `user` (`shed list` gains a `USER` column, `--json` a `user` field). A server with no
+  user list behaves as before. See the [Multi-user Server
+  guide](https://charliek.github.io/shed/guides/multi-user-server/).
+- **Server and CLI: `shed assign <shed> <user>`** (`POST /api/sheds/{name}/assign`, admin)
+  gives a shed with no user to a user, and a one-time start-up step, recorded in
+  `{state_dir}/users-upgrade.json`, gives every such shed to the only user when exactly one is
+  listed. `409 SHED_ALREADY_ASSIGNED` and `409 SHED_HOST_RESOURCES` refuse the rest.
+- **Server and CLI: `shed users refresh`** (`POST /api/users/refresh`, admin) fetches every
+  GitHub login's keys now.
+- **Server, CLI and desktop: the credential source.** One machine answers each user's
+  credential requests on a server: the first to connect, until moved. Each broker has a machine
+  identity (`machine.json`, shown by `shed-host-agent status`) and sends it as
+  `X-Shed-Machine-Id` and `X-Shed-Machine-Name`. `shed source ls|status|use` and `GET
+  /api/sources` / `POST /api/sources/use` show and move it; the desktop's Preferences show
+  the source per server with a **Use this machine** button. Another machine shows `not-source`
+  and names the source; a second process with the same id shows `duplicate`; both keep
+  retrying. `GET /api/info` lists `source_binding`. See [Credential
+  Source](https://charliek.github.io/shed/extensions/source-binding/).
+- **Host-agent and desktop: the signing check, `ssh.allow_users` and `ssh.offer_keys`.** A
+  machine signs an SSH login only for a username in `ssh.allow_users` (default `git`) with an
+  offered key, and an SSH signature only in the namespace `git`, before any approval prompt.
+  `ssh.offer_keys` (fingerprints or key lines) limits the keys sheds can list and use. Every
+  refusal is audited (`SIGN_REFUSED` with its class), and status gains an `ssh` block. See [SSH
+  Agent › What the machine
+  signs](https://charliek.github.io/shed/extensions/ssh-agent/#what-the-machine-signs).
+- **Remote backend: an additive `shed_user` instance label** (no label schema change), from
+  which a VM adopted at start-up takes its user.
+- **Development:** `SHED_DEV_USERS=itest` starts the dev servers with the suite's user list;
+  the suite gains `test_users.py`, `test_users_upgrade.py` and `test_source_pin.py`, with
+  `SHED_ITEST_USERS` and `SHED_ITEST_USERS_DIR`.
+
+#### Changed
+
+- **The credential bus is routed by user.** A machine receives only its user's sheds'
+  requests, and only that user's source may answer them. The server mints its own id for
+  each request, an answer that matches no pending request is refused in every mode (open
+  mode delivered it by shed name), and a request held for a machine is never handed to another.
+  Respond can answer `413 REQUEST_TOO_LARGE`, `429 TOO_MANY_RESPONSES` and `503
+  RESPONSE_NOT_DELIVERED` (with `Retry-After`). A second subscriber now gets `403
+  SOURCE_NOT_BOUND`, or `409 SOURCE_DUPLICATE_STREAM` from the same machine; `409
+  NAMESPACE_ALREADY_REGISTERED` is gone. A subscription stream that cannot be written for 15 s
+  is closed.
+- **GitHub keys are read by account id** from `api.github.com/user/<id>/keys`, after the login
+  is pinned to its numeric id in `{state_dir}/github_pins.json`. When GitHub is unreachable
+  the last known keys stay and no new key is accepted.
+- **SSH picks the shed by the username that authenticated**, in every channel type: a client
+  that changed username between authentication requests could have its port forwards routed by
+  the first one. An empty username gets the unknown-shed answer.
+- **API: a path whose `{name}` is not a valid shed name answers `404 SHED_NOT_FOUND`** before
+  any other check, on every `/api/sheds/{name}` and `/api/egress/{name}` route.
+- **Egress history and the live stream are filtered by user and by shed incarnation**: a shed
+  recreated under an earlier name no longer shows the earlier shed's records.
+- **Host-agent and desktop: the bus follows a redirect only to the server's own origin**, and
+  an answer the server refused is audited as `undelivered`.
+- **Development: both parallel dev servers and the integration suite run `mtls`.**
+
+#### Removed
+
+- **Server: `auth.mode: token`, its spelling `secure`, and `allow_insecure_exposure`.** The
+  server's bearer-token code is gone: it never issues or reads a bearer token. The CLI,
+  host-agent and desktop keep their token code so they still reach 0.9.x servers.
+- **Docs: the "Upgrading to mTLS" page.** Its copy at the
+  [v0.9.0 tag](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/token-to-mtls.md)
+  stays; what is still true moved to [Security › Enrollment over
+  SSH](https://charliek.github.io/shed/reference/security/#enrollment-over-ssh). The status
+  CLI page is gone too: the `shed-ext status` command it described does not exist.
+- **Development: `SHED_DEV_AUTH_MODE`** and `render-dev-config.sh`'s `--mtls` flag.
+
+#### Fixed
+
+- **Firecracker and VZ: reading a shed whose VM had died could save that stale record over a
+  shed deleted and recreated under the same name in the meantime.** The save is now made under
+  the shed's lock, and only for the same shed.
+- **VZ: on a case-insensitive volume, a differently cased name in an API path reached the shed
+  stored under the lowercase name** (access checks still applied).
+- **Docs: the Connect API's status for a stopped shed** is `503 SHED_NOT_RUNNING` on
+  Firecracker and VZ and `409` on the remote backend, and `default_backend` lists `remote`.
+
+#### Security
+
+- **The machine no longer signs whatever a shed hands it.** Code in a shed could obtain a
+  signature that logged in to any SSH server as any username with the user's key, the shed
+  server's own `_bootstrap` channel included. A username beginning with `_` is now always
+  refused.
+- **A shed's credential requests no longer reach every subscriber.** Any allowed key could
+  subscribe to the bus and receive every shed's requests, and two machines raced to answer.
+- **A GitHub login renamed away, or deleted and registered again, no longer contributes the
+  newcomer's keys.**
+- **`auth: {Mode: mtls}` and other re-cased keys no longer leave a server open.**
+- **A shed named `git` can no longer be opened by the signature machines give out for git.**
+- **Script keys** cannot take a `credentials` certificate or use the bus, and **expired keys**
+  are refused at the SSH and TLS handshakes and on every request.
+
 ## v0.9.0 — 2026-10-10
 
 **Ships:** server, host-agent, desktop
@@ -855,7 +1015,7 @@ release rather than forcing a DMG/appcast cycle here.
   all cover the mtls posture end-to-end, including the precise (not
   overclaimed) exposure guarantee, per-request re-validation, revocation
   coarseness, and the accepted limitations. A new [Upgrading to
-  mTLS](https://charliek.github.io/shed/upgrades/token-to-mtls/) guide covers
+  mTLS](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/token-to-mtls.md) guide covers
   the client-then-server rollout order, the SSH-first `shed server add`
   behavior change, the desktop component-upgrade ordering, and the
   fleet-wide-but-self-healing CA rotation story.

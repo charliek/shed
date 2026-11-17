@@ -28,6 +28,15 @@ sequenceDiagram
     Helper->>Docker: stdout: {ServerURL, Username, Secret}
 ```
 
+## Which machine answers
+
+A shed's `docker-credentials` requests go to its user's [credential source](source-binding.md) on that
+server, the one machine the server has bound for that user, and to no other machine. If the
+source is not connected, the server drops the request and the helper in the shed fails at its
+own timeout (below); nothing fails over to another machine. The machine's own configuration
+(roles or registries, and the approval policy) decides the answer. The
+[SSH signing check](ssh-agent.md#what-the-machine-signs) does not apply to this namespace.
+
 ## Docker Integration
 
 The guest VM's `~/.docker/config.json` is configured with:
@@ -140,4 +149,4 @@ No caching on either side. Each `docker pull` triggers a fresh credential lookup
 
 ## Timeouts
 
-Credential requests use a 5-second timeout. A timeout is treated as a genuine fault, not a missing credential: the binary writes the error to stderr and exits non-zero with empty stdout, which aborts the pull. This is deliberate — a broker that is unreachable should surface loudly rather than silently degrade to an anonymous pull (which would then fail confusingly on any private image). Only an explicit "no credential to serve" response from the host (see [Public Images and Anonymous Pulls](#public-images-and-anonymous-pulls)) triggers Docker's anonymous-pull fallback.
+A credential request gives up after 3 seconds (the bus client's limit, inside the helper's own 5-second deadline). A timeout is treated as a genuine fault, not a missing credential: the binary writes the error to stderr and exits non-zero with empty stdout, which aborts the pull. This is deliberate — a broker that is unreachable should surface loudly rather than silently degrade to an anonymous pull (which would then fail confusingly on any private image). Only an explicit "no credential to serve" response from the host (see [Public Images and Anonymous Pulls](#public-images-and-anonymous-pulls)) triggers Docker's anonymous-pull fallback.

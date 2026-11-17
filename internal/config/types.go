@@ -111,6 +111,28 @@ var (
 	// mounts, server mounts, snapshots, reset, image management, egress
 	// profiles). The API answers 422 for a create field and 501 for a route.
 	ErrFeatureUnsupportedSentinel = errors.New("feature is not supported by this backend")
+
+	// ErrForbiddenSentinel is returned when the caller may see a shed or a
+	// resource but not do what was asked: an admin entering another user's
+	// shed, or a user who is not an admin asking for an admin-only one. The
+	// API answers 403 FORBIDDEN. A caller who may not see the thing at all
+	// gets the not-found sentinel instead.
+	ErrForbiddenSentinel = errors.New("forbidden")
+
+	// ErrShedAssignedSentinel is returned by an assignment (AssignShedRequest)
+	// of a shed that already belongs to someone: a user, a service client, or
+	// both at once (a record reported with UserUnresolved). Only a shed with
+	// no user and no service client can be assigned; a shed is never moved
+	// between users. The API answers 409 SHED_ALREADY_ASSIGNED.
+	ErrShedAssignedSentinel = errors.New("shed is already assigned")
+
+	// ErrShedHostResourcesSentinel is returned by an assignment of a shed
+	// that carries what is shared on the host (Shed.HostResources: host
+	// directories or server mounts). Giving it to a user would hand that
+	// user the host's directories and the server's credentials; an admin
+	// recreates it without them instead. The API answers 409
+	// SHED_HOST_RESOURCES.
+	ErrShedHostResourcesSentinel = errors.New("shed carries host resources")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -141,6 +163,35 @@ func ValidateShedName(name string) error {
 	return nil
 }
 
+// ReservedShedName is the one shed name no new shed may take: a shed's SSH
+// username on shed-server is its name, and the user's machine by default
+// signs SSH logins for the username git (so git over SSH keeps working). A
+// shed named git could be opened with a signature the machine gives out by
+// default.
+const ReservedShedName = "git"
+
+// IsReservedShedName reports whether name is reserved. The comparison is
+// exact and case-sensitive. A name differing only in case ("Git") is not a
+// valid shed name (shed names are lowercase), but a shed directory on a
+// case-insensitive volume would still answer to it: every path that turns a
+// name from outside into a shed must apply ValidateShedName first, as the SSH
+// server does (internal/sshd shedNameFor).
+func IsReservedShedName(name string) bool { return name == ReservedShedName }
+
+// ValidateNewShedName is ValidateShedName plus the reserved-name rule. It is
+// for creating a shed only: ValidateShedName stays the rule on every other
+// path, so a shed that already has a reserved name can still be listed,
+// stopped, snapshotted and deleted.
+func ValidateNewShedName(name string) error {
+	if err := ValidateShedName(name); err != nil {
+		return err
+	}
+	if IsReservedShedName(name) {
+		return fmt.Errorf("shed name %q is reserved", name)
+	}
+	return nil
+}
+
 // ValidateSnapshotName validates that a snapshot name is valid.
 // Snapshot names follow the same rules as shed names.
 func ValidateSnapshotName(name string) error {
@@ -157,6 +208,48 @@ func ValidateSnapshotName(name string) error {
 	}
 
 	return nil
+}
+
+// userNameRegex is the form of a user's name: a lowercase letter, then up to
+// 62 lowercase letters, digits and hyphens. It fits a cloud label value.
+var userNameRegex = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+
+// ValidUserName reports whether s can name a user. The implicit user's name,
+// the empty string, is not one.
+func ValidUserName(s string) bool { return userNameRegex.MatchString(s) }
+
+// UserUnresolved is the user a shed is reported with when its records do not
+// agree about whose it is: a stored record that names both a service client
+// and a user, or (on the remote backend) a local record and an instance label
+// that name two different users. It is not a valid user name, so no caller's
+// user can ever equal it: only an admin can reach such a shed. Nothing stores
+// it; it is computed where a record is read.
+const UserUnresolved = "!unresolved"
+
+// ValidateShedOwnership checks the service client (owner) and person (user) a
+// new shed or snapshot is to be recorded with. A user is "" (the implicit
+// user) or a valid user name, and a shed belongs to a service client or to a
+// person, never both. The error wraps ErrInvalidShedRequestSentinel.
+func ValidateShedOwnership(owner, user string) error {
+	if user != "" && !ValidUserName(user) {
+		return fmt.Errorf("%w: %q is not a valid user name", ErrInvalidShedRequestSentinel, user)
+	}
+	if owner != "" && user != "" {
+		return fmt.Errorf("%w: a shed belongs to a service client or to a user, not both", ErrInvalidShedRequestSentinel)
+	}
+	return nil
+}
+
+// ShedOwnership returns the owner and user a stored shed is reported with. A
+// record that names both a service client and a user is invalid, and fails
+// closed: it is reported with no owner (so the service client does not reach
+// it) and with UserUnresolved (so no user does). Any other record is reported
+// as stored.
+func ShedOwnership(owner, user string) (string, string) {
+	if owner != "" && user != "" {
+		return "", UserUnresolved
+	}
+	return owner, user
 }
 
 // Shed represents a development environment container.
@@ -207,6 +300,13 @@ type Shed struct {
 	// Empty for a shed an admin created, and for every shed created before
 	// service clients existed: those are admin-only.
 	Owner string `json:"owner,omitempty" yaml:"owner,omitempty"`
+	// User is the person (a user of the server) the shed belongs to. Empty
+	// is the implicit user of a server with no user list, and every shed
+	// created before users existed. A shed belongs to a service client
+	// (Owner) or to a person (User), never both; a stored record that names
+	// both is reported through ShedOwnership. UserUnresolved marks a shed
+	// whose records disagree about its user.
+	User string `json:"user,omitempty" yaml:"user,omitempty"`
 	// Mounts is the server-mount selection this shed starts with (top-level
 	// `mounts:`). A shed created before mount selection existed reports
 	// {"mode":"all"}.
@@ -215,6 +315,31 @@ type Shed struct {
 	// fixed at create. A shed created before network profiles existed
 	// reports "open".
 	NetworkProfile string `json:"network_profile,omitempty" yaml:"network_profile,omitempty"`
+}
+
+// HostResources names what the shed, as its backend reports it, reaches that
+// is shared on the host and so is for admins only: "host directories" (its
+// --local-dir / --add-dir mounts, ProjectMounts) and "server mounts" (a
+// server-mount selection, Mounts, that is not explicitly empty: mode "all",
+// any named mount, or a mode this server does not know). The server mounts
+// are how server credentials (~/.config/gh and the like) reach a shed. It
+// returns nil for a shed that reaches none of them.
+//
+// Firecracker and VZ always report a selection (a shed created before
+// selection existed reports {mode: all}, so it counts); the remote backend
+// cannot mount anything and reports none (nil), which counts as nothing.
+// The access rule refuses a user who is not an admin entry to (and a start
+// of) a shed that carries any of these, and assigning such a shed to a user
+// is refused for the same reason.
+func (s *Shed) HostResources() []string {
+	var out []string
+	if len(s.ProjectMounts) > 0 {
+		out = append(out, "host directories")
+	}
+	if m := s.Mounts; m != nil && (m.Mode != MountModeSelected || len(m.Names) > 0) {
+		out = append(out, "server mounts")
+	}
+	return out
 }
 
 // Network profiles (CreateShedRequest.Network, Shed.NetworkProfile,
@@ -406,19 +531,16 @@ type ServerInfo struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
 	SSHPort int    `json:"ssh_port"`
-	// HTTPPort is the plain-HTTP port (open mode). Omitted in token mode, which
-	// serves no plain HTTP — clients use the HTTPS endpoint there.
+	// HTTPPort is the plain-HTTP port (open mode). Omitted in an enforced
+	// mode, which serves no plain HTTP — clients use the HTTPS endpoint there.
 	HTTPPort int    `json:"http_port,omitempty"`
 	Backend  string `json:"backend"`
 	// AuthMode is the server's auth.mode, so `shed server add` knows whether
-	// to bootstrap an HTTP token (or, in mtls mode, a client certificate)
-	// over SSH. WIRE CONTRACT: on /api/info token mode travels as the legacy
-	// "secure" spelling — released clients gate their bootstrap on that exact
-	// string (LegacyWireAuthMode) — and the decode boundary normalizes it back
-	// to "token" (NormalizeAuthMode, applied in the CLI's GetInfo), so
-	// in-process consumers only ever see "open", "token", or "mtls".
-	// Reported on the unauthenticated /api/info in open/token mode — the mode
-	// is observable from behavior anyway.
+	// to bootstrap a credential over SSH. This server reports "open" or (behind
+	// a client certificate) "mtls". A 0.9.x server in token mode reports the
+	// legacy "secure" spelling, which the decode boundary normalizes to "token"
+	// (NormalizeAuthMode, applied in the CLI's GetInfo), so in-process
+	// consumers only ever see "open", "token", or "mtls".
 	AuthMode string `json:"auth_mode,omitempty"`
 	// DefaultImage is the resolved default_image for the active backend
 	// (after ${shed.version} expansion / version synthesis at load). Exposed
@@ -426,9 +548,9 @@ type ServerInfo struct {
 	// use — useful when the ref is synthesized and never written in config.
 	DefaultImage string `json:"default_image,omitempty"`
 
-	// HTTPSPort is the pinned-TLS listener port in token mode (auth.mode:
-	// token), so a client adding a token-mode server can learn the TLS
-	// endpoint. 0/omitted in open mode (no HTTPS listener).
+	// HTTPSPort is the pinned-TLS listener port in mtls mode, so a client can
+	// learn the TLS endpoint (0.9.x servers reported it in token mode too).
+	// 0/omitted in open mode (no HTTPS listener).
 	HTTPSPort int `json:"https_port,omitempty"`
 
 	// CAFingerprint is the "sha256:<hex>" pin of the internal CA that signs
@@ -436,12 +558,12 @@ type ServerInfo struct {
 	// visibility, not a trust anchor: a client never needs it (it authenticates
 	// the SERVER by the tls_cert_fingerprint pin and proves itself with the cert
 	// the SSH bootstrap handed it), but an operator comparing two servers, or
-	// confirming a CA rotation landed, does. Omitted in open/token mode.
+	// confirming a CA rotation landed, does. Omitted in open mode.
 	CAFingerprint string `json:"ca_fingerprint,omitempty"`
 	// CANotAfter is the client CA's expiry (RFC 3339), reported only in mtls
 	// mode. Rotating the CA invalidates every issued client certificate
 	// fleet-wide and must be scheduled, so the deadline is worth surfacing
-	// somewhere a human or a monitor can read it. Omitted in open/token mode.
+	// somewhere a human or a monitor can read it. Omitted in open mode.
 	//
 	// A string rather than time.Time so the field can be omitted when unset —
 	// encoding/json's omitempty does not apply to struct values.
@@ -489,6 +611,104 @@ type SSHHostKeyResponse struct {
 // ShedsResponse is returned by GET /api/sheds.
 type ShedsResponse struct {
 	Sheds []Shed `json:"sheds"`
+}
+
+// UsersRefreshResponse is returned by POST /api/users/refresh: one row per
+// GitHub login whose keys the server follows.
+type UsersRefreshResponse struct {
+	Logins []GitHubLoginRefresh `json:"logins"`
+}
+
+// GitHubLoginRefresh is one GitHub login's row in UsersRefreshResponse.
+type GitHubLoginRefresh struct {
+	// User is the user the login's keys belong to ("" for the implicit user
+	// of a server with no user list).
+	User string `json:"user"`
+	// Login is the GitHub login as configured.
+	Login string `json:"login"`
+	// Status is ok, pinned, unchanged, unreachable, mismatch, gone,
+	// pin-write-failed or invalid-login.
+	Status string `json:"status"`
+	// GitHubID is the account id the login is pinned to (0: none yet).
+	GitHubID int64 `json:"github_id,omitempty"`
+	// SeenID is, on a mismatch, the account the login names instead.
+	SeenID int64 `json:"seen_id,omitempty"`
+	// Keys is how many of the login's keys are accepted now.
+	Keys int `json:"keys"`
+	// Added and Removed are the key fingerprints this fetch added and removed.
+	Added   []string `json:"added,omitempty"`
+	Removed []string `json:"removed,omitempty"`
+	// Error says why the login is not ok, when it is not.
+	Error string `json:"error,omitempty"`
+}
+
+// SourcesResponse is returned by GET /api/sources and POST /api/sources/use
+// (`shed source ls|use|status`): one user's credential source on this server
+// (the machine that answers that user's credential requests) and the
+// machines that have presented themselves for that user. Only that user's
+// machines are ever listed. Machine names come from the machines themselves:
+// show them escaped.
+type SourcesResponse struct {
+	// User is the user the response is for ("" for the implicit user of a
+	// server with no user list).
+	User string `json:"user"`
+	// Binding is the user's binding; null when no machine is the source yet
+	// (the first machine to connect becomes it).
+	Binding *SourceBinding `json:"binding"`
+	// Machines are the machines remembered for the user, oldest first.
+	Machines []SourceMachine `json:"machines"`
+}
+
+// SourceBinding is a user's credential source. Delivery (the machine the
+// user's requests are sent to) and Signing (the machine whose answers are
+// accepted) each name exactly one machine, the same one, in this version.
+type SourceBinding struct {
+	Delivery []SourceRef `json:"delivery"`
+	Signing  []SourceRef `json:"signing"`
+	BoundAt  time.Time   `json:"bound_at"`
+	// BoundBy is "first-connect", or who moved the binding last.
+	BoundBy string `json:"bound_by"`
+	// Generation increases on every bind and move.
+	Generation uint64 `json:"generation"`
+}
+
+// MachineID is the id of the bound machine ("" for a malformed binding).
+func (b *SourceBinding) MachineID() string {
+	if b == nil || len(b.Signing) == 0 {
+		return ""
+	}
+	return b.Signing[0].ID
+}
+
+// SourceRef names what a binding slot points at: a machine, by its id.
+type SourceRef struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+}
+
+// SourceMachine is one machine that has presented itself for a user.
+type SourceMachine struct {
+	// ID is 32 lowercase hex digits.
+	ID string `json:"id"`
+	// Name is the machine's own display name (UTF-8, from the machine).
+	Name string `json:"name"`
+	// KeyFingerprint is the key the machine's credential was enrolled with:
+	// for the bound machine, that of its last accepted subscription; for any
+	// other, as first seen. Empty in open mode.
+	KeyFingerprint string    `json:"key_fingerprint"`
+	FirstSeen      time.Time `json:"first_seen"`
+	// Connected is whether the machine holds a subscription now, and
+	// Namespaces the request types it holds.
+	Connected  bool     `json:"connected"`
+	Namespaces []string `json:"namespaces"`
+}
+
+// SourceUseRequest is the body of POST /api/sources/use: make MachineID (a
+// machine that has presented itself for the user) the user's credential
+// source. User names another user; only an admin may.
+type SourceUseRequest struct {
+	MachineID string `json:"machine_id"`
+	User      string `json:"user,omitempty"`
 }
 
 // SessionsResponse is returned by GET /api/sheds/{name}/sessions and GET /api/sessions.
@@ -645,6 +865,13 @@ type ShedDiskEntry struct {
 	ConsoleLog *FileEntry  `json:"console_log,omitempty"` // nil for Firecracker
 	OtherFiles []FileEntry `json:"other_files,omitempty"`
 	Total      DiskSize    `json:"total"`
+	// Owner, User and CreatedAt are whose the shed is (as ShedOwnership
+	// reports it) and its incarnation, read from the same record as the
+	// sizes above. The access guard decides who sees the entry from them,
+	// never from a later listing by name. Server-side only (json:"-").
+	Owner     string    `json:"-"`
+	User      string    `json:"-"`
+	CreatedAt time.Time `json:"-"`
 }
 
 // DiskUsageTotals aggregates bytes across df sections.
@@ -750,6 +977,22 @@ type SystemPruneResponse struct {
 	Servers []PruneReportOrError `json:"servers"`
 }
 
+// AssignShedRequest is the request body for POST /api/sheds/{name}/assign
+// (`shed assign <shed> <user>`): give a shed that has no user and no service
+// client to the user named User. Only an admin may; the user must be a
+// configured one. A shed that already belongs to someone is refused
+// (ErrShedAssignedSentinel), and so is one that carries host directories or
+// server mounts (ErrShedHostResourcesSentinel) unless AllowHostResources is
+// set, which only the server's own start-up pass does.
+type AssignShedRequest struct {
+	User string `json:"user"`
+	// AllowHostResources lets the assignment through for a shed that carries
+	// host directories or server mounts. Never read from the request body:
+	// only the start-up pass of a server with exactly one user, who is an
+	// admin, sets it (an admin may use those anyway).
+	AllowHostResources bool `json:"-"`
+}
+
 // CreateShedRequest is the request body for POST /api/sheds.
 type CreateShedRequest struct {
 	Name string `json:"name"`
@@ -815,6 +1058,23 @@ type CreateShedRequest struct {
 	// nil ResolvedMounts (a non-API caller) stores {mode: all}.
 	Owner          string          `json:"-"`
 	ResolvedMounts *MountSelection `json:"-"`
+	// User is the person the shed is created for ("" for the implicit
+	// user). Like Owner it never comes from the wire (json:"-"), and the
+	// two are never both set (ValidateShedOwnership).
+	User string `json:"-"`
+	// NoServerEnv keeps the server's env_file variables (its own
+	// credentials) out of the shed's repo clone, as for a service client's
+	// shed. The access guard sets it for a user who is not an admin; it
+	// never comes from the wire.
+	NoServerEnv bool `json:"-"`
+}
+
+// ServerEnvWithheld reports whether the server's env_file variables are kept
+// out of the clone of a shed created by r and recorded with the service
+// client owner: for a service client's shed, and for a shed of a user who is
+// not an admin (NoServerEnv).
+func (r CreateShedRequest) ServerEnvWithheld(owner string) bool {
+	return owner != "" || r.NoServerEnv
 }
 
 // SnapshotSchemaVersion is the current snapshot schema version. Bumped
@@ -863,6 +1123,13 @@ type Snapshot struct {
 	// false, `shed create --from-snapshot` will fail until the lower
 	// image is pulled or rebuilt; surfaced by `shed snapshot info`.
 	LowerCached bool `json:"lower_cached,omitempty"`
+
+	// User is the person the snapshot belongs to: the user its source shed
+	// was reported with when it was taken (config.ShedOwnership), so a
+	// snapshot of a service client's shed has none. Empty is also the
+	// implicit user, and every snapshot written before users existed.
+	// Additive: the schema version is unchanged.
+	User string `json:"user,omitempty"`
 }
 
 // SnapshotCreateRequest is the request body for POST /api/snapshots.
@@ -870,6 +1137,8 @@ type SnapshotCreateRequest struct {
 	Name       string `json:"name"`
 	SourceShed string `json:"source_shed"`
 	Comment    string `json:"comment,omitempty"`
+	// There is no User here: a snapshot records the user its source shed
+	// is reported with, never one a request names.
 }
 
 // SnapshotsResponse is returned by GET /api/snapshots.
@@ -896,6 +1165,11 @@ type SnapshotDiskEntry struct {
 	Rootfs     FileEntry   `json:"rootfs"`
 	OtherFiles []FileEntry `json:"other_files,omitempty"`
 	Total      DiskSize    `json:"total"`
+	// User and CreatedAt are the snapshot's user and incarnation, read from
+	// the same snapshot.json as the entry. The access guard decides who sees
+	// the entry from them. Server-side only (json:"-").
+	User      string    `json:"-"`
+	CreatedAt time.Time `json:"-"`
 }
 
 // APIError represents an error response from the API.
@@ -958,6 +1232,12 @@ const (
 	// route (a scope mismatch, or a route outside a service client's
 	// allowlist).
 	ErrForbidden = "FORBIDDEN"
+	// ErrShedAlreadyAssigned (409) means an assignment named a shed that
+	// already has a user or a service client.
+	ErrShedAlreadyAssigned = "SHED_ALREADY_ASSIGNED"
+	// ErrShedHostResources (409) means an assignment named a shed that
+	// carries host directories or server mounts.
+	ErrShedHostResources = "SHED_HOST_RESOURCES"
 	// ErrUnauthorized (401) means no valid credential was presented.
 	ErrUnauthorized = "UNAUTHORIZED"
 	// ErrInvalidNetworkProfile (400) means a create request's network is not
@@ -1001,6 +1281,37 @@ const (
 	// non-empty mounts, from_snapshot, egress profiles), 501 for a route
 	// (snapshot, reset, image and egress writes).
 	ErrFeatureUnsupported = "FEATURE_UNSUPPORTED"
+
+	// The credential bus pin (one machine answers per user per server).
+	// Each refusal body is the usual error shape, under 1024 bytes.
+	//
+	// ErrSourceMachineIDRequired (403) means a subscribe or respond carried
+	// no valid X-Shed-Machine-Id and X-Shed-Machine-Name: a broker released
+	// before the pin. Never 401 (a broker re-mints its certificate on 401)
+	// and never a 409 without a code (terminal for a released broker).
+	ErrSourceMachineIDRequired = "SOURCE_MACHINE_ID_REQUIRED"
+	// ErrSourceNotBound (403) means the machine is not its user's credential
+	// source on this server; the body's top-level "source" object
+	// ({"machine_id","machine_name"}) names the machine that is.
+	ErrSourceNotBound = "SOURCE_NOT_BOUND"
+	// ErrSourceDuplicateStream (409) means the user's source machine already
+	// holds a subscription to the namespace (another process with the same
+	// machine id, or a stream not yet reaped). Retryable for a broker that
+	// sends a machine id; only such a broker can get it.
+	ErrSourceDuplicateStream = "SOURCE_DUPLICATE_STREAM"
+	// ErrSourceRateLimited (429, with Retry-After) means the user has made
+	// too many admissions that change the source records (a new machine id,
+	// a changed name or key fingerprint) lately. Retryable.
+	ErrSourceRateLimited = "SOURCE_RATE_LIMITED"
+	// ErrSourceMachineNotFound (404) means POST /api/sources/use named a
+	// machine that has never presented itself for the user (or was forgotten
+	// since).
+	ErrSourceMachineNotFound = "SOURCE_MACHINE_NOT_FOUND"
+	// ErrSourceBusy (503, with Retry-After) means GET /api/sources waited its
+	// bounded time for the user's records while a move or a machine's
+	// admission was saving them, and answered nothing rather than a mixed
+	// view. Retryable.
+	ErrSourceBusy = "SOURCE_BUSY"
 )
 
 // Backend type constants for Shed.Backend field.
@@ -1020,34 +1331,33 @@ const (
 	SSHAuthEnforce = "enforce" // reject keys not in the allowlist
 )
 
-// Auth modes for AuthConfig.Mode — the secure-by-default switch.
-// "secure" is the pre-rename spelling of AuthModeToken, kept as a deprecated
-// alias that config load normalizes to AuthModeToken (see normalizeAuthMode
-// in server.go) — downstream code only ever observes AuthModeToken.
+// Auth modes for AuthConfig.Mode. A server config accepts open and mtls only.
 const (
-	AuthModeOpen  = "open"  // default: no enforcement (tailnet/LAN posture)
-	AuthModeToken = "token" // SSH allowlist + HTTP tokens + TLS, all enforced
+	AuthModeOpen = "open" // default: no enforcement, loopback only
+	// AuthModeToken is the removed bearer-token server mode ("secure" before
+	// its rename). A server config naming it fails to load. The constant stays
+	// for clients: a client entry records it for a 0.9.x token-mode server,
+	// and the CLI still bootstraps bearer tokens from such servers.
+	AuthModeToken = "token"
 	// AuthModeMTLS: the client credential is a short-lived certificate issued
-	// over the SSH bootstrap channel; no bearer tokens exist in this mode.
-	// Shares every other token-mode invariant (SSH allowlist enforce, TLS-only,
-	// https_port default) — see AuthEnforced in server.go.
+	// over the SSH bootstrap channel, with the SSH allowlist enforced, TLS-only
+	// serving and an https_port default — see AuthEnforced in server.go.
 	AuthModeMTLS = "mtls"
 )
 
 // AuthConfig configures authentication. The headline control is Mode (the
-// open|token|mtls switch). The SSH sub-block carries key sources and the
-// advanced SSH mode override. HTTP bearer-token enforcement is derived purely
-// from token mode — there is no HTTP sub-block.
+// open|mtls switch). The SSH sub-block carries key sources and the advanced SSH
+// mode override. There is no HTTP sub-block: HTTP authentication is derived
+// from the mode.
 type AuthConfig struct {
-	// Mode is open | token | mtls (default open; the deprecated "secure"
-	// spelling is normalized to "token" at config load, with one startup
-	// deprecation warning). token derives: SSH allowlist enforce, HTTP
-	// bearer-token enforce, and TLS on (the server serves the TLS listener
-	// only). mtls derives the same SSH-allowlist-enforce and TLS-only posture,
-	// but the client credential is a short-lived certificate rather than a
-	// bearer token. Both require at least one SSH key source.
+	// Mode is open | mtls (default open). mtls derives SSH allowlist enforce,
+	// TLS-only serving, and a short-lived client certificate issued over the
+	// SSH bootstrap channel as the HTTP credential; it requires at least one
+	// SSH key source. Open is loopback only. The removed bearer-token mode
+	// ("token", formerly "secure") fails config load.
 	Mode string `yaml:"mode,omitempty"`
-	// TokenTTL is the lifetime of a bootstrap-minted HTTP token (default 24h).
+	// TokenTTL is the lifetime of a bootstrap-issued client certificate
+	// (default 24h). The name is kept from the removed bearer-token mode.
 	TokenTTL Duration `yaml:"token_ttl,omitempty"`
 	// SSH configures the SSH public-key allowlist (key sources + advanced mode).
 	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`
@@ -1056,6 +1366,64 @@ type AuthConfig struct {
 	// create, run commands in and delete only their own sheds, within their
 	// policy. Keyed by client name.
 	Clients map[string]ServiceClientConfig `yaml:"clients,omitempty"`
+	// Users are the server's named users (mtls mode only), keyed by user
+	// name. With none, every accepted key belongs to one implicit user, an
+	// admin. With a list, every key belongs to exactly one named user, keys
+	// come only from here (auth.ssh's key sources are refused beside it), and
+	// each user reaches only their own sheds (an admin may also list, stop
+	// and delete anyone's). Unknown keys are refused at config load.
+	Users map[string]UserConfig `yaml:"users,omitempty"`
+}
+
+// UserConfig is one user under auth.users. A user needs a GitHub login, a key,
+// or both.
+type UserConfig struct {
+	// GitHub is a GitHub login whose published keys are this user's. It is
+	// pinned to its numeric account id at its first good fetch.
+	GitHub string `yaml:"github,omitempty"`
+	// GitHubID, when set, is the account id the login must name. It wins over
+	// the pin the server stored.
+	GitHubID int64 `yaml:"github_id,omitempty"`
+	// Admin users may list, stop and delete any shed (never enter another
+	// user's), and use what is shared on the host: host directories, server
+	// mounts, the image store.
+	Admin StrictBool `yaml:"admin,omitempty"`
+	// Keys are this user's keys listed by hand (ad hoc keys).
+	Keys []UserKeyConfig `yaml:"keys,omitempty"`
+}
+
+// UserKeyConfig is one ad hoc key of a user.
+type UserKeyConfig struct {
+	// Key is one OpenSSH authorized_keys line with no options.
+	Key string `yaml:"key"`
+	// Label names the key (unique per user); it is shown in logs.
+	Label string `yaml:"label"`
+	// Expires, when set, is when the key stops being accepted: an RFC 3339
+	// time, or a date (YYYY-MM-DD), which means the end of that day in UTC.
+	Expires string `yaml:"expires,omitempty"`
+	// Script marks a key used by automation: it may not take a credentials
+	// certificate, use the credential bus, or move a credential source.
+	Script StrictBool `yaml:"script,omitempty"`
+}
+
+// ParseKeyExpiry parses a UserKeyConfig.Expires value: an RFC 3339 time, or a
+// date (YYYY-MM-DD) meaning the end of that day in UTC (the key is accepted
+// through that date). "" is no expiry, a nil time. Every value that parses is
+// an expiry, the earliest time Go can hold (0001-01-01T00:00:00Z, the zero
+// time) included: "no expiry" is never spelled as a time.
+func ParseKeyExpiry(s string) (*time.Time, error) {
+	if s == "" {
+		return nil, nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return &t, nil
+	}
+	d, err := time.Parse(time.DateOnly, s)
+	if err != nil {
+		return nil, fmt.Errorf("expires %q is neither an RFC 3339 time nor a date (YYYY-MM-DD)", s)
+	}
+	d = d.AddDate(0, 0, 1)
+	return &d, nil
 }
 
 // DefaultClientCertMaxTTL is auth.clients.<name>.cert_max_ttl when unset.
@@ -1209,8 +1577,11 @@ type SSHAuthConfig struct {
 	AuthorizedKeys []string `yaml:"authorized_keys,omitempty"`
 	// AuthorizedKeysFile is a path to an authorized_keys-format file.
 	AuthorizedKeysFile string `yaml:"authorized_keys_file,omitempty"`
-	// GitHubUsers seeds the allowlist from https://github.com/<user>.keys,
-	// cached to disk and failing closed to the last-known-good cache.
+	// GitHubUsers seeds the allowlist from each login's GitHub account: the
+	// login is pinned to its numeric account id at its first good fetch, and
+	// keys come only from that id's key list on the GitHub REST API, cached
+	// to disk and failing closed to the last-known-good keys. Logins are
+	// case-insensitive; a login listed twice fails config load.
 	GitHubUsers []string `yaml:"github_users,omitempty"`
 	// GitHubRefresh is how often to re-fetch GitHub keys (default 1h).
 	GitHubRefresh Duration `yaml:"github_refresh,omitempty"`
@@ -1226,7 +1597,7 @@ type SSHAuthConfig struct {
 var githubUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
 
 // ValidGitHubUsername reports whether s is a syntactically valid GitHub
-// username (and, by construction, safe to interpolate into the .keys URL).
+// username (and, by construction, safe to interpolate into a GitHub URL).
 func ValidGitHubUsername(s string) bool { return githubUsernamePattern.MatchString(s) }
 
 // HomePath is the shed user's home directory inside the VM. Repos, --local-dir,

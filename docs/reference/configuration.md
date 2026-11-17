@@ -43,10 +43,10 @@ sheds:
 | `servers.<name>.http_port` | int | HTTP API port |
 | `servers.<name>.ssh_port` | int | SSH server port |
 | `servers.<name>.api_url` | string | HTTPS control-plane URL (e.g. `https://host:8443`); overrides scheme+host+port. Set by `shed server add --https-port`. |
-| `servers.<name>.tls_cert_fingerprint` | string | Pinned TLS cert fingerprint (`sha256:...`) — the server's own leaf, pinned in every enforced mode. |
-| `servers.<name>.control_token` | string | Control-scoped bearer token for the CLI/desktop. Auto-written and refreshed by `shed server add` in token mode. Absent in mtls mode. |
+| `servers.<name>.tls_cert_fingerprint` | string | Pinned TLS cert fingerprint (`sha256:...`) — the server's own leaf, pinned for an mtls server. |
+| `servers.<name>.control_token` | string | Control-scoped bearer token for the CLI/desktop, from a server older than v0.10.0 running token mode. Auto-written and refreshed by `shed server add`. Absent for an mtls server. |
 | `servers.<name>.control_token_expires_at` | timestamp | Expiry of `control_token`; the CLI refreshes near this and on a 401. Auto-managed. |
-| `servers.<name>.auth_mode` | string | The credential shape the server last issued at bootstrap: `token` or `mtls`. **Absent means `token`** (every entry written before certificate support existed predates this field). Not a setting — it's a cache of what the server last said; a bootstrap that comes back in the other mode rewrites it, which is how an operator can flip a server's `auth.mode` without re-adding every client. |
+| `servers.<name>.auth_mode` | string | The credential shape the server last issued at bootstrap: `mtls`, or `token` from a server older than v0.10.0. **Absent means `token`** (every entry written before certificate support existed predates this field). Not a setting — it's a cache of what the server last said; a bootstrap that comes back in the other mode rewrites it, which is how a server moved from token to mtls is picked up without re-adding every client. |
 | `servers.<name>.client_cert_file` / `client_key_file` | string | Paths (under `~/.shed/creds/<server>/`, mode 0700/0600) to this entry's client certificate and private key. Set only in mtls mode. |
 | `servers.<name>.client_cert_expires_at` | timestamp | Expiry of the client certificate; the CLI re-enrolls before a request would race expiry. Set only in mtls mode. |
 | `default_server` | string | Default server for commands |
@@ -81,12 +81,11 @@ log_level: info
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | `shed-server` | Server identifier. Also names this server's nftables tables for the [`isolated` profile](#network-profiles) (`bridge`/`inet shed_<name>`, every character outside `[A-Za-z0-9_]` as `_`), so two servers on one host need names that still differ after that. |
-| `http_port` | int | `8080` | Plain-HTTP API port. **Required in open mode; optional in token/mtls mode** (an enforced mode serves no plain HTTP, so it is omitted from `/api/info` and the written client config entry). |
+| `http_port` | int | `8080` | Plain-HTTP API port. **Required in open mode; optional in mtls mode** (mtls serves no plain HTTP, so it is omitted from `/api/info` and the written client config entry). |
 | `ssh_port` | int | `2222` | SSH server port |
-| `bind_address` | string | `127.0.0.1` | Interface every listener (HTTP, HTTPS, SSH) binds to. **Defaults to loopback in every mode** — shed is local-first. Set a specific IP (LAN/tailnet), `0.0.0.0` or `*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`; token/mtls mode needs no acknowledgment. |
-| `allow_insecure_exposure` | bool | `false` | Acknowledge binding a **non-loopback** `bind_address` in **open** mode (no transport security). Required there, ignored in token/mtls mode and for loopback binds. |
+| `bind_address` | string | `127.0.0.1` | Interface every listener (HTTP, HTTPS, SSH) binds to. **Defaults to loopback in every mode** — shed is local-first. In mtls mode set a specific IP (LAN/tailnet), `0.0.0.0` or `*` (all IPv4), or `::` (all interfaces) to face the network. **An open-mode server is loopback only**: a non-loopback bind fails config load (the old `allow_insecure_exposure` acknowledgment was removed in v0.10.0 and is itself refused). |
 | `trusted_proxy` | bool | `false` | Trust the client-supplied `X-Forwarded-For` header for the request source IP. Only enable behind a reverse proxy that overwrites that header; the default uses the real TCP peer address. |
-| `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
+| `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`, `remote`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux; it never picks `remote`. `remote` runs each shed as a cloud VM and needs a `remote:` block (a `remote:` block with any other backend fails config load); see [Remote Backend](remote-backend.md#configuration). |
 | `mounts` | map | `{}` | Host directories to mount into sheds (formerly `credentials`) |
 | `env_file` | string | - | Path to a `KEY=value` file whose variables are passed to the in-VM `git clone` of `repo` (git settings and credentials such as `GIT_SSH_COMMAND`); see [Environment File](#environment-file) |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
@@ -94,7 +93,7 @@ log_level: info
 | `git` | object | - | Git behaviour for in-VM clones (see [Git](#git)) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
 | `vz` | object | - | VZ-specific configuration (see below) |
-| `auth` | object | - | Optional authentication (see [SSH authentication](#ssh-authentication)) and, in mtls mode, [service clients](#service-clients) |
+| `auth` | object | - | Optional authentication: the [mode](#authentication-mode), [SSH key sources](#ssh-authentication), and in mtls mode [users](#users) and [service clients](#service-clients) |
 | `state_dir` | string | `/etc/shed` as root, `~/.shed` otherwise | Identity material (see [TLS and network surface](#tls-and-network-surface)). A second server on the same host needs its own `state_dir` and a distinct `name`. |
 | `exec` | object | - | Limits for the HTTPS exec endpoint (see [HTTPS exec](#https-exec)) |
 | `audit` | object | - | The audit log (see [Audit log](#audit-log)) |
@@ -104,86 +103,159 @@ log_level: info
 
 ### Authentication mode
 
-`auth.mode` is the headline switch. The default `open` posture is unchanged —
-ideal on a tailnet or trusted LAN (plain HTTP, no credential, no TLS); the SSH
-allowlist (`auth.ssh`) is the one independently-tunable layer there. `token`
-and `mtls` are the internet-facing postures: both derive the same hardened
-bundle (SSH enforce + HTTP credential enforce + TLS-only) and refuse to start
-without an SSH key source; they differ only in the shape of the HTTP
-credential — a bearer token minted over SSH (`token`) versus a client
-certificate, bound to a key that never leaves the client, issued over SSH
-(`mtls`). Two invariants hold for both enforced modes: **credential ⟺ TLS ⟺
-enforced mode** and **https ⟺ enforced mode**. `mtls` is the **recommended
-posture for anything internet-facing**; `token` is retained (not deprecated)
-because `curl`/scripts/CI/third-party callers that need admin access can't
-present a client certificate. An orchestrator that needs only its own sheds
-can instead be a [service client](#service-clients) of an mtls server. See [Security](security.md) — in particular [mTLS
-mode](security.md#mtls-mode) — and the [Security Configuration
-guide](../guides/security-configuration.md).
+`auth.mode` is the headline switch, and it has two values. The default `open`
+is a local posture: plain HTTP, no credential, no TLS, **loopback only**; the
+SSH allowlist (`auth.ssh`) is the one independently-tunable layer there. `mtls`
+is the posture for anything reachable from another host: it derives a hardened
+bundle (SSH enforce + client-certificate enforce + TLS-only) and refuses to
+start without an SSH key source. The client credential is a short-lived
+certificate, bound to a key that never leaves the client, issued over SSH. Two
+invariants hold: **credential ⟺ TLS ⟺ mtls** and **https ⟺ mtls**. An
+orchestrator that needs only its own sheds can be a
+[service client](#service-clients) of an mtls server. See
+[Security](security.md) — in particular [mTLS mode](security.md#mtls-mode) —
+and the [Security Configuration guide](../guides/security-configuration.md).
+
+The bearer-token mode (`auth.mode: token`, and its older spelling `secure`)
+was **removed in v0.10.0**: a config that names it fails to load with a message
+naming `mtls`, and so does `allow_insecure_exposure` and an open server bound
+beyond loopback. Nothing falls back to open. Switch such a server to
+`auth.mode: mtls`; clients re-enroll with a certificate on their next request.
+Current clients still speak the token protocol to servers older than v0.10.0.
 
 | `auth.mode` | HTTP credential | SSH allowlist | Notes |
 |-------------|------------------|----------------|-------|
-| `open` (default) | none | as configured (`auth.ssh.mode: off`/`warn`) | Plain HTTP; `https_port` rejected. |
-| `token` | bearer token, minted over the `_bootstrap` SSH channel | forced `enforce` | TLS-only; `curl`/scripts can present the token directly. `secure` is a permanent deprecated alias, normalized at load with a one-time stderr warning. |
-| `mtls` | client certificate, issued over the `_bootstrap` SSH channel (CSR in, signed cert out); revalidated on every request | forced `enforce` | TLS-only; recommended for internet-facing deployments. Revocation removes the SSH key (coarser than token's per-token revoke). `curl`/scripts cannot authenticate as an admin; a [service client](#service-clients)'s bundle works with `curl --cert`. |
+| `open` (default) | none | as configured (`auth.ssh.mode: off`/`warn`) | Plain HTTP on loopback only; `https_port` and a non-loopback `bind_address` rejected. |
+| `mtls` | client certificate, issued over the `_bootstrap` SSH channel (CSR in, signed cert out); revalidated on every request | forced `enforce` | TLS-only. Revocation removes the SSH key. `curl`/scripts cannot authenticate as an admin; a [service client](#service-clients)'s bundle works with `curl --cert`. |
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `auth.mode` | string | `open` | `open` enforces nothing (plain HTTP only); `token`/`mtls` both derive SSH-allowlist enforce + HTTP-credential enforce + TLS-only (`https_port` defaults to `8443`; **no plain-HTTP listener is served**), and **fail to start without a key source**. `secure` is accepted as a deprecated alias for `token`, normalized at load with a one-time stderr warning. |
-| `auth.token_ttl` | duration | `24h` | Lifetime of a bootstrap-minted HTTP token (`token` mode) or issued client certificate (`mtls` mode). Clients refresh/re-enroll transparently near expiry / on an auth failure. |
+| `auth.mode` | string | `open` | `open` enforces nothing (plain HTTP, loopback only); `mtls` derives SSH-allowlist enforce + client-certificate enforce + TLS-only (`https_port` defaults to `8443`; **no plain-HTTP listener is served**), and **fails to start without a key source**. `token` and `secure` were removed in v0.10.0 and fail config load. |
+| `auth.token_ttl` | duration | `24h` | Lifetime of an issued client certificate (the name is kept from the removed token mode). Clients re-enroll transparently near expiry / on an auth failure. |
+| `auth.users` | map | `{}` | Named users, keyed by name. **Requires `auth.mode: mtls`**, and replaces `auth.ssh`'s key sources. See [Users](#users). |
 | `auth.clients` | map | `{}` | Service clients, keyed by name. **Requires `auth.mode: mtls`** (refused at load otherwise). See [Service clients](#service-clients). |
 
-The pre-v0.7.1 `public_exposure` flag and `auth.http.tokens` list are removed and
-**rejected at startup** — set `auth.mode: token` (or `mtls`) and let
-`shed server add` obtain a credential over SSH. As of v0.7.2 the whole
-`auth.http` block is gone (HTTP enforcement derives from `auth.mode`), and
-`https_port` / `auth.ssh.mode: enforce` are valid only in an enforced mode —
-see [Upgrading v0.7.1 → v0.7.2](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md). As of v0.7.4
-`http_bind`/`ssh_bind`/`internal_http_port` are removed in favour of a single
-`bind_address` (loopback by default), and `http_port` is optional in an
-enforced mode — see
-[Upgrading v0.7.3 → v0.7.4](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md). `mtls` mode was
-added afterward — see [Upgrading to mTLS](../upgrades/token-to-mtls.md).
+Keys removed in earlier releases (`public_exposure`, `auth.http`,
+`internal_http_port`, `http_bind`, `ssh_bind`) are still **rejected at
+startup** with a message naming them; see [Security › Removed
+earlier](security.md#removed-earlier).
 
 ### SSH authentication
 
-`auth.ssh` gates SSH public-key access against an allowlist. The default (omitted, or `mode: off`) accepts all keys — the legacy behavior. Identity comes from the offered key, GitHub-style; the username still selects the shed.
+`auth.ssh` gates SSH public-key access against an allowlist on a server with
+**no user list**, where every accepted key is the implicit user, an admin. The
+default (omitted, or `mode: off`) accepts all keys. Identity comes from the
+offered key, GitHub-style; the username selects the shed. On a server with
+[users](#users), keys come from `auth.users` instead: the three key sources
+below are refused beside it, while `github_refresh` and `max_auth_tries` still
+apply.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `auth.ssh.mode` | string | `off` | `off` accepts all keys; `warn` logs would-deny attempts but still accepts (use to roll out safely); `enforce` rejects keys not in the allowlist. |
+| `auth.ssh.mode` | string | `off` | `off` accepts all keys; `warn` logs `SSH auth WOULD DENY` for a key not on the list but still accepts it (open mode only; use it to roll out safely); `enforce` rejects keys not on the list (forced in mtls mode, and valid only there). |
 | `auth.ssh.authorized_keys` | list | `[]` | Inline OpenSSH `authorized_keys` lines. |
 | `auth.ssh.authorized_keys_file` | string | - | Path to an `authorized_keys`-format file. |
-| `auth.ssh.github_users` | list | `[]` | Seed the allowlist from `https://github.com/<user>.keys`. Keys are cached to disk and fail closed to the last-known-good cache if GitHub is unreachable. |
-| `auth.ssh.github_refresh` | duration | `1h` | How often to re-fetch GitHub keys. |
+| `auth.ssh.github_users` | list | `[]` | GitHub logins whose keys are allowed. Each login is pinned to its numeric account id at its first fetch, and its keys are read from the GitHub REST API (`api.github.com`) by that id; see [Security › GitHub logins are pinned](security.md#github-logins-are-pinned-to-their-account-id). The last known keys are kept when GitHub is unreachable. Logins that differ only in case are refused. |
+| `auth.ssh.github_refresh` | duration | `1h` | How often to re-fetch GitHub keys (for `auth.users` logins too). |
 | `auth.ssh.max_auth_tries` | int | `10` | Public-key attempts allowed per connection. Raise it when a client's agent (1Password, Secretive) holds many keys, so the allowlisted key is tried before the server gives up. |
 
 With `mode: enforce`, the server refuses to start if no keys resolve (empty inline/file and a failed GitHub fetch with no cache) — use `warn` for first boot, or provide inline keys.
 
+mtls needs a key source: `auth.users`, or one of `github_users`,
+`authorized_keys` and `authorized_keys_file`. Without one the server exits
+with `auth.mode: mtls requires at least one SSH key source (auth.users, or
+auth.ssh.github_users, authorized_keys, or authorized_keys_file)`.
+
 ```yaml
 auth:
-  mode: token                # open (default) | token | mtls — both enforced modes force ssh enforce
+  mode: mtls                 # open (default, loopback only) | mtls — mtls forces ssh enforce
   ssh:
-    github_users: [charliek]  # a key source is required in an enforced mode
+    github_users: [alice-gh]  # a key source is required in mtls mode
 ```
+
+Keys are case-sensitive. An unknown key anywhere under `auth` (`auth.ssh` and
+`auth.clients` included) fails config load, so `Mode: mtls` or a misspelt key
+cannot leave the server open. A top-level key that matches a known one only
+when case is ignored (`Auth:`, `Bind_Address:`) fails load too; other unknown
+top-level keys are ignored.
+
+### Users
+
+`auth.users` gives a server **named users**. Without it every accepted key is
+one implicit user, an admin, and every caller reaches every shed. With it
+every key belongs to exactly one user, each user reaches only their own sheds
+and snapshots, and an admin may also list, stop and delete anyone's (never
+enter another user's). The rules are in [Security ›
+Ownership](security.md#ownership); the [Multi-user server
+guide](../guides/multi-user-server.md) walks through adding a list.
+
+```yaml
+auth:
+  mode: mtls                       # required with auth.users
+  users:
+    alice:
+      github: alice-gh             # her GitHub keys, pinned to the account id
+      admin: true
+    bob:
+      github: bob-gh
+      github_id: 1234567           # optional: the account id the login must name
+      keys:
+        - key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... bob@laptop
+          label: laptop
+          expires: 2027-06-30      # accepted through that day, UTC
+        - key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... ci
+          label: ci
+          script: true             # automation: no credential bus
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth.users.<name>` | object | - | One user. The name matches `^[a-z][a-z0-9-]{0,62}$` and may not also be an `auth.clients` name. It is recorded on the user's sheds and snapshots. |
+| `auth.users.<name>.github` | string | - | A GitHub login whose published keys are this user's, pinned to its numeric account id at the first fetch (see [Security › GitHub logins are pinned](security.md#github-logins-are-pinned-to-their-account-id)). A login belongs to one user (compared without case). |
+| `auth.users.<name>.github_id` | int | - | The account id the login must name. Needs `github`. When set it wins over the pin the server stored, which is how to follow an account that was deleted and created again on purpose. |
+| `auth.users.<name>.admin` | bool | `false` | An admin may list, stop and delete any shed (and enter a service client's), and use what the host shares: host directories, server mounts, images that are not the default or an alias, the image store, `system prune`, egress profile changes. `true` or `false` only, unquoted. |
+| `auth.users.<name>.keys` | list | `[]` | Keys listed by hand (a phone, a CI key, a key not on GitHub). |
+| `auth.users.<name>.keys[].key` | string | required | One OpenSSH public key line, with no `authorized_keys` options (`from=`, `command=` and the like are refused) and nothing after it. An SSH certificate is refused: list the public key itself. A key may appear once in the whole list. |
+| `auth.users.<name>.keys[].label` | string | required | Names the key in logs and as the mover of a credential source. Unique per user. |
+| `auth.users.<name>.keys[].expires` | string | - | When the key stops being accepted: an RFC 3339 time, or a date (`YYYY-MM-DD`), meaning the end of that day in UTC. An expired key is refused at the SSH and TLS handshakes and on every request; open channels stay open. |
+| `auth.users.<name>.keys[].script` | bool | `false` | A key used by automation: it reaches the user's sheds, but cannot take a `credentials` certificate, use the credential bus, or see or move the user's credential source. `true` or `false` only. |
+
+Config load refuses, naming the field:
+
+- `auth.users` with any `auth.mode` but `mtls` (`auth.users requires auth.mode: mtls`);
+- `auth.users` beside `auth.ssh.authorized_keys`, `authorized_keys_file` or
+  `github_users` (list each key or login under its user instead);
+- a user with neither `github` nor a key;
+- a name that is not valid, or that is also a service client's;
+- the same GitHub login for two users, or the same key twice (under one user
+  or two);
+- a key line that is not one plain public key, carries options, or is an SSH
+  certificate; a missing or repeated `label`; an `expires` that is neither an
+  RFC 3339 time nor a date;
+- `github_id` without `github`, or a negative `github_id`;
+- `admin` or `script` set to anything but an unquoted `true` or `false` (`yes`
+  and `on` included);
+- a list with no admin who has a GitHub login or a key not marked `script`.
+
+`auth.users: {}` is the same as no user list. An expired key is not a load
+error: it is simply not accepted, and the server logs it at start.
 
 ### TLS and network surface
 
 TLS and network-surface fields. HTTP credential enforcement is **not** an
-independent field — it is derived from `auth.mode: token`/`mtls` (there is no
-`auth.http` block). Either enforced mode turns on TLS for you, and
-`https_port` is valid only in an enforced mode. See
+independent field — it is derived from `auth.mode: mtls` (there is no
+`auth.http` block). mtls turns on TLS for you, and `https_port` is valid only
+in mtls mode. See
 [Security](security.md) and the
 [Security Configuration guide](../guides/security-configuration.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `https_port` | int | `8443` in an enforced mode | Serve HTTPS with a self-signed, client-pinned cert, bound to `bind_address`. **Requires `auth.mode: token` or `mtls`** (rejected in open mode); defaults to `8443` there. In `token`/`mtls` mode this is the *only* listener — no plain HTTP is served. In `mtls` mode the listener also runs `RequireAndVerifyClientCert` against the internal CA (see [mTLS mode](security.md#mtls-mode)). |
+| `https_port` | int | `8443` in mtls mode | Serve HTTPS with a self-signed, client-pinned cert, bound to `bind_address`. **Requires `auth.mode: mtls`** (rejected in open mode); defaults to `8443` there. It is the *only* listener — no plain HTTP is served — and it runs `RequireAndVerifyClientCert` against the internal CA (see [mTLS mode](security.md#mtls-mode)). |
 | `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs (on the server's own leaf; unrelated to the mtls client-CA). `localhost`, `127.0.0.1`, `::1` are always included. |
 | `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
-| `state_dir` | string | `/etc/shed` as root, `~/.shed` otherwise | Directory for the server's identity material: the SSH host key, the TLS cert + key (unless overridden above), the mtls client CA and the GitHub key cache. Absolute or `~/`-relative; created `0700` at start. Set it when a second server runs on the same host, and give that server a `name` that differs from the first's after sanitization (the `name` also names its nftables tables). |
-| `bind_address` | string | `127.0.0.1` | Interface every listener binds to (loopback by default in every mode). Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`. |
-| `allow_insecure_exposure` | bool | `false` | Acknowledge a non-loopback `bind_address` in **open** mode (no transport security). Ignored in token/mtls mode. |
+| `state_dir` | string | `/etc/shed` as root, `~/.shed` otherwise | Directory for the server's identity material: the SSH host key, the TLS cert + key (unless overridden above), the mtls client CA, the GitHub key cache (`github_keys/`), the GitHub account pins (`github_pins.json`) and the users upgrade marker (`users-upgrade.json`). Absolute or `~/`-relative; created `0700` at start. Set it when a second server runs on the same host, and give that server a `name` that differs from the first's after sanitization (the `name` also names its nftables tables). |
+| `bind_address` | string | `127.0.0.1` | Interface every listener binds to (loopback by default in every mode). In mtls mode set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. An **open** server is loopback only; a non-loopback bind fails config load. |
 | `trusted_proxy` | bool | `false` | Trust `X-Forwarded-For` (only behind a proxy that overwrites it). |
 
 `mtls` mode additionally persists a small internal CA (`ca_cert.pem` /
@@ -206,7 +278,7 @@ clients](security.md#service-clients) says what a client can and cannot do.
 auth:
   mode: mtls
   ssh:
-    github_users: [charliek]
+    github_users: [alice-gh]
   clients:
     nocturn:
       cert_max_ttl: 2160h            # default 90 days
@@ -310,7 +382,9 @@ mounts:
 
 **Missing sources:** If a mount's source path does not exist on the host, it is skipped with a log warning. Create the source directory on the host before starting the shed.
 
-**Per-shed selection:** by default every shed gets every mount, as before. A
+**Per-shed selection:** by default every shed gets every mount, as before. On a
+server with [users](#users), server mounts are for admins: a user who is not
+an admin gets none and is refused a named one. A
 shed can be created with fewer: `shed create --mounts none` or
 `--mounts claude,gh` (the API's `mounts` field). The selection is stored with
 the shed and applies on every start, including an SSH auto-start; a selected
@@ -666,7 +740,9 @@ See [VZ Setup](../getting-started/vz-setup.md) for setup details.
 settings and credentials from the host (see [Firecracker Operations › Private
 Repository Access](fc-operations.md#private-repository-access)). They are not
 set in shell sessions, `shed exec`, or provisioning hooks, and a [service
-client](#service-clients)'s sheds never get them.
+client](#service-clients)'s sheds never get them. On a server with
+[users](#users) only an admin's sheds get them; a user who is not an admin is
+not refused, the clone simply runs without them.
 
 ```bash
 GIT_SSH_COMMAND=ssh -i /home/shed/.ssh/id_ed25519

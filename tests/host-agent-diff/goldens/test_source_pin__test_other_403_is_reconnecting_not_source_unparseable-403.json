@@ -1,0 +1,19 @@
+[
+  {
+    "name": "",
+    "namespaces": [
+      {
+        "namespace": "docker-credentials",
+        "since": "<ts>",
+        "state": "connected"
+      },
+      {
+        "last_error": "unexpected status 403: {\"error\": {\"code\": \"SOURCE_NOT_BOUND\"",
+        "namespace": "ssh-agent",
+        "since": "<ts>",
+        "state": "reconnecting"
+      }
+    ],
+    "url": "<bus>"
+  }
+]

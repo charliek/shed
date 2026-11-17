@@ -52,7 +52,8 @@ through apt.
 ## Preferences
 
 **Preferences…** (in the menu) covers launch-at-login, the terminal, the credential broker
-mode, and the approval policy (SSH policy and method, AWS/Docker modes, per-shed overrides). The full set of
+mode and which of your machines is the credential source on each server (with
+**Use this machine**), and the approval policy (SSH policy and method, AWS/Docker modes, per-shed overrides). The full set of
 settings — and the environment-variable overrides — is in
 [Configuration](configuration.md).
 

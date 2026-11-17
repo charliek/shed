@@ -29,10 +29,12 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
+from fixtures.identity import skip_unless_started_with_users, users_environment
 from fixtures.server import CloudServer, LocalServer, RemoteServer
 
 
@@ -308,6 +310,84 @@ def shed_server_dev(request):
     skips cleanly when the corresponding dev server isn't configured.
     """
     return request.getfixturevalue(f"{request.param}_server_dev")
+
+
+# ----------------------------------------------------------------------------
+# Named users (auth.users): several identities against one dev server
+# ----------------------------------------------------------------------------
+#
+# `users_env` is a dev server running with the itest user list plus the test
+# identities enrolled against it (fixtures/identity.py): `itest-alice` (user
+# A, with a script key and nothing else), `itest-bob` (user B, with an
+# expired second key), `itest-admin` (an admin), each with its own key, CLI
+# config directory and client certificate. Module-scoped, so one module's
+# cases share one enrolment (and, on vz, one restart).
+#
+#   [vz]     the Mac dev server (`SHED_VZ_DEV_SERVER`), always restarted with
+#            the user list through devcontrol.dev_config() and restored to
+#            the committed base afterwards; the developer's credential
+#            source bindings are moved aside, with the server down, for the
+#            detour and put back before the base starts (devcontrol:
+#            BindingsDetour). (Other modules' dev_config() calls
+#            restore the base too, so a Mac dev server started with the list
+#            would not still have it by the time this module runs.)
+#   [fc]     the FC dev server (`SHED_FC_DEV_SERVER`). The suite cannot
+#            reconfigure it: it must have been STARTED with the user list,
+#            and `SHED_ITEST_USERS` must list `fc`; otherwise it skips saying
+#            what to set.
+#   [remote] the remote dev server (`SHED_REMOTE_SERVER`), likewise with
+#            `remote` in `SHED_ITEST_USERS`. Every shed there is a billed VM:
+#            a users case the remote backend need not run carries
+#            `@pytest.mark.local_vm_only(reason)` and skips on [remote]
+#            before any fixture runs (pytest_runtest_setup below).
+
+
+def skip_vz_off_macos() -> None:
+    """The VZ dev server runs on macOS only, and the [vz] users cases
+    restart it (`make dev-server-restart`, macOS-only). On any other host they
+    skip, even when a VZ entry is configured and reachable (it would be
+    another machine's server, or a production one)."""
+    if sys.platform != "darwin":
+        pytest.skip(f"[vz] users cases restart the Mac dev server; this host is {sys.platform}, not macOS")
+
+
+@pytest.fixture(scope="module", params=["vz", "fc", "remote"])
+def users_env(request):
+    backend = request.param
+    if backend == "vz":
+        skip_vz_off_macos()
+        server = request.getfixturevalue("vz_server_dev")
+        reconfigure, image = True, "base"
+    elif backend == "fc":
+        server = request.getfixturevalue("fc_server_dev")
+        skip_unless_started_with_users("fc", server.name)
+        reconfigure, image = False, "base"
+    else:
+        server = request.getfixturevalue("remote_server")
+        skip_unless_started_with_users("remote", server.name)
+        reconfigure, image = False, server.image
+    with users_environment(backend, server, reconfigure=reconfigure, image=image) as env:
+        yield env
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """Before any fixture of a users case runs: a [vz] case skips on a host
+    that is not macOS (`skip_vz_off_macos`), and a case marked
+    `local_vm_only` skips on [remote] (a module-scoped shed fixture would
+    otherwise create a billed VM first). `shed_server` does the same for its
+    own parameter."""
+    callspec = getattr(item, "callspec", None)
+    if callspec is None:
+        return
+    if callspec.params.get("users_env") == "vz":
+        skip_vz_off_macos()
+    if callspec.params.get("users_env") != "remote":
+        return
+    marker = item.get_closest_marker("local_vm_only")
+    if marker is not None:
+        reason = marker.args[0] if marker.args else "not supported"
+        pytest.skip(f"not on the remote backend: {reason}")
 
 
 # ----------------------------------------------------------------------------

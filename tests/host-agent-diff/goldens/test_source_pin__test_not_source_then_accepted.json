@@ -1,0 +1,48 @@
+{
+  "accepted": [
+    {
+      "name": "",
+      "namespaces": [
+        {
+          "namespace": "docker-credentials",
+          "since": "<ts>",
+          "state": "connected"
+        },
+        {
+          "namespace": "ssh-agent",
+          "since": "<ts>",
+          "state": "connected"
+        }
+      ],
+      "url": "<bus>"
+    }
+  ],
+  "refused": [
+    {
+      "active_source": {
+        "machine_id": "fedcba9876543210fedcba9876543210",
+        "machine_name": "desk"
+      },
+      "name": "",
+      "namespaces": [
+        {
+          "namespace": "docker-credentials",
+          "since": "<ts>",
+          "state": "connected"
+        },
+        {
+          "active_source": {
+            "machine_id": "fedcba9876543210fedcba9876543210",
+            "machine_name": "desk"
+          },
+          "last_error": "not the credential source for this server; the active source is desk (fedcba9876543210fedcba9876543210)",
+          "namespace": "ssh-agent",
+          "since": "<ts>",
+          "state": "not-source"
+        }
+      ],
+      "url": "<bus>"
+    }
+  ],
+  "refused_text": "Servers (1):\n  (default)  (<bus>)\n    ok  docker-credentials  connected\n    -   ssh-agent           not-source: not the credential source for this server; the active source is desk (fedcba9876543210fedcba9876543210)\n    this machine is not the credential source here; the active source is desk\n    to make this machine (<machine_name>) the source: shed source use -- <machine_id>\n"
+}

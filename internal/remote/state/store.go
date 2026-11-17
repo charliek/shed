@@ -77,6 +77,11 @@ type Record struct {
 	Provisioned bool `json:"provisioned,omitempty"`
 	// NoProvision is the create request's no_provision.
 	NoProvision bool `json:"no_provision,omitempty"`
+	// NoServerEnv is the create request's NoServerEnv: the server's env_file
+	// variables are kept out of the shed's repo clone (a shed of a user who
+	// is not an admin). It is kept so a create resumed after a restart
+	// withholds them too.
+	NoServerEnv bool `json:"no_server_env,omitempty"`
 
 	// Address is the last address the cloud reported; AddressAt is when.
 	Address   string    `json:"address,omitempty"`
@@ -90,6 +95,14 @@ type Record struct {
 	DiskGB int    `json:"disk_gb,omitempty"`
 	// MaxRun is the run limit applied at each start.
 	MaxRun time.Duration `json:"max_run,omitempty"`
+
+	// UserConflict is the shed_user label a read of the shed's instance
+	// found when it named a user other than the one Shed.User (or
+	// Shed.Owner) records, or was not a valid user name at all. While it is
+	// set the shed is reported with config.UserUnresolved, so only an admin
+	// can reach it. A later read that finds the label in line with the
+	// record clears it.
+	UserConflict string `json:"user_conflict,omitempty"`
 }
 
 // Clone returns a deep copy.
@@ -133,6 +146,10 @@ type Marker struct {
 	At time.Time `json:"at"`
 	// Owner and CreatedAt are the deleted shed's, so a caller waiting for
 	// the VM to go can be checked against them once the record is gone.
+	// Owner is the service client the shed was reported with
+	// (config.ShedOwnership), not the raw stored one, so a record that
+	// named both a client and a user is reached by no client here either.
+	// Markers written before this carry the raw owner.
 	Owner     string    `json:"owner,omitempty"`
 	CreatedAt time.Time `json:"created_at,omitempty"`
 	// KeepRecord marks the clean-up of a failed create: the VM is to be

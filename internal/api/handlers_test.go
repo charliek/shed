@@ -241,8 +241,11 @@ func (f *createShedFakeBackend) Close() error       { return nil }
 func (f *createShedFakeBackend) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 	return f.createFn(ctx, req)
 }
-func (f *createShedFakeBackend) GetShed(_ context.Context, _ string) (*config.Shed, error) {
-	panic("unexpected")
+
+// GetShed reports every name as an existing shed: the access guard loads a
+// shed before it lets a delete through.
+func (f *createShedFakeBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
+	return &config.Shed{Name: name}, nil
 }
 func (f *createShedFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
 	panic("unexpected")
@@ -259,6 +262,10 @@ func (f *createShedFakeBackend) StartShed(_ context.Context, _ string) (*config.
 func (f *createShedFakeBackend) StopShed(_ context.Context, _ string) (*config.Shed, error) {
 	panic("unexpected")
 }
+func (f *createShedFakeBackend) AssignUser(_ context.Context, _ string, _ config.AssignShedRequest) (*config.Shed, error) {
+	return nil, config.ErrShedNotFoundSentinel
+}
+
 func (f *createShedFakeBackend) ResetShed(_ context.Context, _ string) (*config.Shed, error) {
 	panic("unexpected")
 }
@@ -718,6 +725,11 @@ type stopDetachBackend struct {
 	ctxErr          chan error
 }
 
+// GetShed reports the shed: the access guard loads it before a stop.
+func (b *stopDetachBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
+	return &config.Shed{Name: name, Status: config.StatusRunning}, nil
+}
+
 func (b *stopDetachBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	close(b.entered)
 	<-b.release
@@ -770,5 +782,36 @@ func TestStopShed_DetachedFromClientCancellation(t *testing.T) {
 	}
 	if w.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// TestCreateShed_ReservedName: a create named git is a 400 INVALID_SHED_NAME
+// that says the name is reserved, and no backend is called; a near name goes
+// through to the backend.
+func TestCreateShed_ReservedName(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		wantCode int
+	}{
+		{"git", http.StatusBadRequest},
+		{"gitx", http.StatusCreated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			be := newClientFakeBackend()
+			srv := NewServer(be, &config.ServerConfig{Name: "test-server", HTTPPort: 8080}, "", nil, nil)
+			w := postCreateShed(t, srv, config.CreateShedRequest{Name: tc.name})
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tc.wantCode, w.Body.String())
+			}
+			if tc.wantCode == http.StatusBadRequest {
+				resp := parseErrorResponse(t, w)
+				if resp.Error.Code != config.ErrInvalidShedName || !strings.Contains(resp.Error.Message, "reserved") {
+					t.Errorf("error = %+v, want INVALID_SHED_NAME naming the reservation", resp.Error)
+				}
+				if n := len(be.createdSnapshot()); n != 0 {
+					t.Errorf("backend CreateShed called %d times", n)
+				}
+			}
+		})
 	}
 }

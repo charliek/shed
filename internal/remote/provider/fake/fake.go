@@ -44,6 +44,7 @@ const (
 	OpGet          Op = "get"
 	OpList         Op = "list"
 	OpSetLabels    Op = "set_labels"
+	OpClaimLabel   Op = "claim_label"
 	OpSetMetadata  Op = "set_metadata"
 	OpGuestHostKey Op = "guest_host_key"
 	OpResolveImage Op = "resolve_image"
@@ -125,10 +126,14 @@ type Provider struct {
 	instances map[provider.Ref]*instance
 	ops       map[string]*operation
 	failCall  map[Op][]error
+	failAfter map[Op][]error
 	failOp    map[Op][]error
 	calls     []Call
 	nextOp    int
 	nextAddr  int
+	// labelWrites counts the SetLabels and ClaimLabel calls that changed a
+	// label.
+	labelWrites int
 
 	// rules is the whole cloud firewall: every rule on every network.
 	rules      []provider.FirewallRule
@@ -158,6 +163,7 @@ func New(opts Options) *Provider {
 		instances: make(map[provider.Ref]*instance),
 		ops:       make(map[string]*operation),
 		failCall:  make(map[Op][]error),
+		failAfter: make(map[Op][]error),
 		failOp:    make(map[Op][]error),
 	}
 	if opts.Env != "" {
@@ -350,6 +356,33 @@ func (p *Provider) FailNext(op Op, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.failCall[op] = append(p.failCall[op], err)
+}
+
+// FailNextApplied makes the next call of the given kind (OpSetLabels or
+// OpClaimLabel) take effect and then return err, as a cloud
+// call whose answer is lost after the change was made. Calls queue.
+func (p *Provider) FailNextApplied(op Op, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failAfter[op] = append(p.failAfter[op], err)
+}
+
+// LabelWrites returns how many SetLabels and ClaimLabel calls changed a
+// label so far.
+func (p *Provider) LabelWrites() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.labelWrites
+}
+
+// appliedErrLocked returns the error injected with FailNextApplied for a call
+// of kind op that has just taken effect, if there is one.
+func (p *Provider) appliedErrLocked(op Op) error {
+	if queue := p.failAfter[op]; len(queue) > 0 {
+		p.failAfter[op] = queue[1:]
+		return queue[0]
+	}
+	return nil
 }
 
 // FailOperation makes the next accepted operation of the given kind
@@ -706,8 +739,58 @@ func (p *Provider) SetLabels(ctx context.Context, ref provider.Ref, labels map[s
 	if in.inst.Labels == nil {
 		in.inst.Labels = make(map[string]string)
 	}
+	for k, v := range labels {
+		if cur, ok := in.inst.Labels[k]; !ok || cur != v {
+			p.labelWrites++
+			break
+		}
+	}
 	maps.Copy(in.inst.Labels, labels)
-	return nil
+	return p.appliedErrLocked(OpSetLabels)
+}
+
+// ClaimLabel implements provider.Provider. The check and the write are made
+// under the fake's lock, so they are one.
+func (p *Provider) ClaimLabel(ctx context.Context, ref provider.Ref, key, value string) error {
+	// The same validation as the gce client's, made before anything is read
+	// as it is there: a key that is a valid label (lowercase first), never an
+	// identity label, a non-empty valid value; and, below, at most 64 labels
+	// on the instance after the write.
+	if key == "" || !provider.ValidLabelValue(key) || key[0] < 'a' || key[0] > 'z' {
+		return provider.Errorf(provider.ErrInvalid, string(OpClaimLabel), "label key %q is not valid", key)
+	}
+	switch key {
+	case provider.LabelSchema, provider.LabelEnv, provider.LabelID:
+		return provider.Errorf(provider.ErrInvalid, string(OpClaimLabel), "label %s cannot be claimed", key)
+	}
+	if value == "" || !provider.ValidLabelValue(value) {
+		return provider.Errorf(provider.ErrInvalid, string(OpClaimLabel), "label %s has an invalid value %q", key, value)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.enterLocked(ctx, OpClaimLabel, ref); err != nil {
+		return err
+	}
+	in, err := p.mineLocked(OpClaimLabel, ref)
+	if err != nil {
+		return err
+	}
+	switch cur := in.inst.Labels[key]; cur {
+	case value:
+		return nil
+	case "":
+	default:
+		return provider.Errorf(provider.ErrLabelTaken, string(OpClaimLabel), "%s has %s=%q", ref, key, cur)
+	}
+	if _, ok := in.inst.Labels[key]; !ok && len(in.inst.Labels)+1 > 64 {
+		return provider.Errorf(provider.ErrInvalid, string(OpClaimLabel), "an instance takes at most 64 labels")
+	}
+	if in.inst.Labels == nil {
+		in.inst.Labels = make(map[string]string)
+	}
+	in.inst.Labels[key] = value
+	p.labelWrites++
+	return p.appliedErrLocked(OpClaimLabel)
 }
 
 // SetMetadata implements provider.Provider.

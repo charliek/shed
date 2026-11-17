@@ -31,8 +31,8 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Dial into the VM via DialService.
 	vmConn, err := s.backend.DialService(r.Context(), shedName, uint16(port))
 	if err != nil {
-		if errors.Is(err, config.ErrShedNotFoundSentinel) {
-			writeError(w, http.StatusNotFound, config.ErrShedNotFound, err.Error())
+		if status, code, msg, ok := mapAccessError(err); ok {
+			writeError(w, status, code, msg)
 			return
 		}
 		if errors.Is(err, config.ErrShedNotRunningSentinel) {

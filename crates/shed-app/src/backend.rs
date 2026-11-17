@@ -15,8 +15,11 @@ use tokio::runtime::Handle;
 
 use shed_core::config::ShedConfig;
 use shed_core::create::{CreateProgress, CreateStore};
-use shed_core::http::{Client, ShedError};
-use shed_core::models::{CreateShedRequest, EgressProfileInfo, Shed, ShedStatus, SystemDiskUsage};
+use shed_core::http::{Client, ShedError, SourceError};
+use shed_core::models::{
+    display_source_text, CreateShedRequest, EgressProfileInfo, Shed, ShedStatus, SourceDocument,
+    SystemDiskUsage, SOURCE_TEXT_MAX_BYTES,
+};
 use shed_core::terminal::{self, TerminalCommand};
 use shed_core::token::{ControlTokenProvider, CredentialObserver, TokenMinter};
 
@@ -427,6 +430,44 @@ impl Backend {
             .collect()
     }
 
+    // -- credential sources (plan 035 §3.4) -------------------------------
+
+    /// Per-host credential source (`GET /api/sources`): which machine answers for this
+    /// user on each configured server. Like [`system_df`](Self::system_df), a per-host
+    /// failure is KEPT as an error row; a server older than the route is a row with
+    /// `supported: false` and no error. `this_machine` is this machine's id when known,
+    /// so each row can say whether the source is the machine the caller runs on.
+    /// Concurrent.
+    pub async fn source_status(&self, this_machine: Option<&str>) -> Vec<HostSource> {
+        self.per_host(async |c: &Client| Ok(c.source_status().await))
+            .await
+            .into_iter()
+            .map(|(host, result)| match result {
+                Ok(Ok(doc)) => HostSource::from_document(host, &doc, this_machine),
+                Ok(Err(e)) => HostSource::from_error(host, &e),
+                Err(e) => HostSource::from_error(host, &SourceError::Shed(e)),
+            })
+            .collect()
+    }
+
+    /// Make `machine_id` the machine that answers for this user on `host`
+    /// (`POST /api/sources/use`), and return that host's row as the server answered it.
+    /// `host` names a configured server exactly; there is no default for a move.
+    pub async fn source_use(
+        &self,
+        host: &str,
+        machine_id: &str,
+    ) -> Result<HostSource, SourceError> {
+        let client = resolve(&self.clients, None, Some(host))
+            .ok_or_else(|| SourceError::Shed(no_configured_host(Some(host))))?;
+        let doc = client.source_use(machine_id).await?;
+        Ok(HostSource::from_document(
+            host.to_string(),
+            &doc,
+            Some(machine_id),
+        ))
+    }
+
     // -- terminal (A1c-2) -------------------------------------------------
 
     /// Resolve the ssh command that opens a shell in `shed` on `host` (host-less →
@@ -618,6 +659,108 @@ pub struct HostEgressProfiles {
     pub host: String,
     pub profiles: Vec<EgressProfileInfo>,
     pub error: Option<String>,
+}
+
+/// One host's credential source, in presentation shape (plan 035 §3.4): whether the
+/// server supports sources at all, which machine answers (its id and name, cleaned for
+/// display), whether that is the machine the caller runs on, and whether it is connected
+/// now — or why the server could not say.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HostSource {
+    pub host: String,
+    /// False for a server older than the route (a plain 404), and for a host that
+    /// could not be asked at all (then `error` says why).
+    pub supported: bool,
+    /// The machine that answers, or `None` when no machine is bound yet (or the server
+    /// could not be read).
+    pub source: Option<SourceMachineRow>,
+    /// Whether `source` is this machine.
+    pub this_machine: bool,
+    /// Whether `source` holds a live subscription right now.
+    pub connected: bool,
+    /// The server was busy (`503 SOURCE_BUSY`, still so after the core's bounded
+    /// retries): the source is UNKNOWN for now, not absent. `source` is `None` and
+    /// `error` is `None`; whoever shows the row keeps what it last knew for this host
+    /// and reads again later.
+    pub busy: bool,
+    /// The server could not be reached, or its answer could not be read (a transport
+    /// failure, an undecodable body, a 5xx with no API error body — what a server
+    /// restart looks like): whether it supports sources, and which machine answers, are
+    /// UNKNOWN for now — never "not supported". `supported` is false and `error` says
+    /// why; whoever shows the row keeps what it last knew for this host, notes that the
+    /// server cannot be reached, and reads again later.
+    pub unreachable: bool,
+    pub error: Option<String>,
+}
+
+/// A machine as a source row shows it. Both strings came from other machines by way of
+/// the server and are cleaned ([`display_source_text`]); `name` is empty when the
+/// server did not list the bound machine.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SourceMachineRow {
+    pub id: String,
+    pub name: String,
+}
+
+impl HostSource {
+    /// The row a source document gives, as seen from the machine whose id is
+    /// `this_machine` (`None`: not known, so no row is "this machine").
+    pub fn from_document(host: String, doc: &SourceDocument, this_machine: Option<&str>) -> Self {
+        let source_id = doc.source_machine_id();
+        let entry = source_id.and_then(|id| doc.machine(id));
+        let source = source_id.map(|id| SourceMachineRow {
+            id: display_source_text(id, SOURCE_TEXT_MAX_BYTES),
+            name: entry
+                .map(|m| display_source_text(&m.name, SOURCE_TEXT_MAX_BYTES))
+                .unwrap_or_default(),
+        });
+        Self {
+            host,
+            supported: true,
+            this_machine: source_id.is_some() && source_id == this_machine,
+            connected: entry.is_some_and(|m| m.connected),
+            source,
+            busy: false,
+            unreachable: false,
+            error: None,
+        }
+    }
+
+    /// The row for a host whose source could not be read. Only an older server (a
+    /// plain 404) is `supported: false` with no error: it simply has none to show. A
+    /// server that could not be reached or read is `unreachable` — unknown, not
+    /// unsupported.
+    pub fn from_error(host: String, e: &SourceError) -> Self {
+        let (supported, error) = match e {
+            SourceError::Unsupported => (false, None),
+            // Transient: it has sources, and could not say which right now.
+            SourceError::Busy { .. } => (true, None),
+            // The server answered the route with a refusal: it has sources, and said
+            // why this caller cannot see them.
+            SourceError::Api { .. } => (true, Some(e.to_string())),
+            SourceError::Shed(_) => (false, Some(e.to_string())),
+        };
+        Self {
+            host,
+            supported,
+            source: None,
+            this_machine: false,
+            connected: false,
+            busy: matches!(e, SourceError::Busy { .. }),
+            unreachable: is_unreachable(e),
+            error,
+        }
+    }
+}
+
+/// Whether a failed source read says nothing about the server but that it could not be
+/// reached or read just now: a transport failure, an answer that could not be decoded,
+/// or a 5xx with no API error body (a restarting server, a proxy in front of one).
+fn is_unreachable(e: &SourceError) -> bool {
+    matches!(
+        e,
+        SourceError::Shed(ShedError::Transport(_) | ShedError::Decode(_))
+    ) || matches!(e, SourceError::Shed(ShedError::BadStatus(s)) if *s >= 500)
 }
 
 #[cfg(test)]
@@ -906,6 +1049,217 @@ mod tests {
         let b = rows.iter().find(|r| r.host == "bad").unwrap();
         assert!(b.profiles.is_empty());
         assert!(b.error.is_some());
+    }
+
+    const THIS_ID: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER_ID: &str = "fedcba9876543210fedcba9876543210";
+
+    fn sources_body(source: &str, name: &str, connected: bool) -> String {
+        serde_json::json!({
+            "user": "ada",
+            "binding": {
+                "delivery": [{"kind": "machine", "id": source}],
+                "signing": [{"kind": "machine", "id": source}],
+                "bound_at": "2026-11-16T10:00:00Z", "bound_by": "ada", "generation": 1,
+            },
+            "machines": [{"id": source, "name": name, "connected": connected}],
+        })
+        .to_string()
+    }
+
+    /// One row per host, whatever each answered: a pinning server's row names its
+    /// source (cleaned) and says whether it is this machine; an older server is
+    /// unsupported with no error; a down host and a refusing one keep their error.
+    #[tokio::test]
+    async fn source_status_keeps_a_row_per_host() {
+        let pinning = MockServer::start_async().await;
+        pinning
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(200)
+                    .body(sources_body(OTHER_ID, "desk\u{202E}\u{7}", true));
+            })
+            .await;
+        let mine = MockServer::start_async().await;
+        mine.mock_async(|w, t| {
+            w.method(GET).path("/api/sources");
+            t.status(200).body(sources_body(THIS_ID, "box", false));
+        })
+        .await;
+        let old = MockServer::start_async().await;
+        old.mock_async(|w, t| {
+            w.method(GET).path("/api/sources");
+            t.status(404).body("404 page not found\n");
+        })
+        .await;
+        let refusing = MockServer::start_async().await;
+        refusing
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(403)
+                    .body(r#"{"error":{"code":"FORBIDDEN","message":"service clients may not"}}"#);
+            })
+            .await;
+        // Busy on every ask (Retry-After 0 keeps the core's retries instant).
+        let busy = MockServer::start_async().await;
+        let busy_asks = busy
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(503).header("retry-after", "0").body(
+                    r#"{"error":{"code":"SOURCE_BUSY","message":"being saved; retry in a moment"}}"#,
+                );
+            })
+            .await;
+        let rows = backend_with(vec![
+            client_at("pinning", pinning.base_url()),
+            client_at("mine", mine.base_url()),
+            client_at("old", old.base_url()),
+            client_at("refusing", refusing.base_url()),
+            client_at("down", "http://127.0.0.1:1".to_string()),
+            client_at("busy", busy.base_url()),
+        ])
+        .source_status(Some(THIS_ID))
+        .await;
+        let row = |h: &str| rows.iter().find(|r| r.host == h).unwrap().clone();
+        assert_eq!(rows.len(), 6);
+
+        // Busy is transient: supported, unknown (not "no source"), no error row, and
+        // asked the bounded number of times.
+        let b = row("busy");
+        assert!(b.supported && b.busy, "{b:?}");
+        assert!(b.error.is_none() && b.source.is_none(), "{b:?}");
+        busy_asks
+            .assert_hits_async(shed_core::http::SOURCE_BUSY_ATTEMPTS)
+            .await;
+        assert!(!row("pinning").busy && !row("refusing").busy && !row("down").busy);
+
+        let p = row("pinning");
+        assert!(p.supported && p.error.is_none());
+        assert_eq!(
+            p.source,
+            Some(SourceMachineRow {
+                id: OTHER_ID.into(),
+                name: "desk".into()
+            })
+        );
+        assert!(!p.this_machine);
+        assert!(p.connected);
+
+        let m = row("mine");
+        assert!(m.this_machine);
+        assert!(!m.connected);
+
+        let o = row("old");
+        assert!(!o.supported && o.error.is_none() && o.source.is_none());
+
+        let r = row("refusing");
+        assert!(r.supported);
+        assert!(
+            r.error
+                .as_deref()
+                .unwrap()
+                .contains("service clients may not"),
+            "{r:?}"
+        );
+
+        let d = row("down");
+        assert!(!d.supported && d.error.is_some());
+        assert!(
+            d.unreachable,
+            "a transport failure is unknown, never unsupported: {d:?}"
+        );
+        // Only those that could not be reached or read are unreachable.
+        for h in ["pinning", "mine", "old", "refusing", "busy"] {
+            assert!(!row(h).unreachable, "{h}: {:?}", row(h));
+        }
+
+        // Without this machine's id, no row is "this machine".
+        let rows = backend_with(vec![client_at("mine", mine.base_url())])
+            .source_status(None)
+            .await;
+        assert!(!rows[0].this_machine);
+    }
+
+    /// Only a plain 404 means "not supported". A server that cannot be reached or read
+    /// right now — a refused connection, a 502 or 503 page with no API error body (a
+    /// restarting server behind a proxy), a 200 whose body is not the document — is
+    /// `unreachable`: unknown, so whoever shows the row keeps what it last knew and reads
+    /// again. Anything else with no API body (a bare 401) stays a plain error row.
+    #[tokio::test]
+    async fn an_unreachable_server_is_unknown_never_unsupported() {
+        let answering = |status: u16, body: &'static str| async move {
+            let s = MockServer::start_async().await;
+            s.mock_async(|w, t| {
+                w.method(GET).path("/api/sources");
+                t.status(status).body(body);
+            })
+            .await;
+            s
+        };
+        let gateway = answering(502, "<html>Bad Gateway</html>").await;
+        let restarting = answering(503, "").await;
+        let garbled = answering(200, "{not the document").await;
+        let bare_401 = answering(401, "").await;
+        let old = answering(404, "404 page not found\n").await;
+        let rows = backend_with(vec![
+            client_at("refused", "http://127.0.0.1:1".to_string()),
+            client_at("gateway", gateway.base_url()),
+            client_at("restarting", restarting.base_url()),
+            client_at("garbled", garbled.base_url()),
+            client_at("bare-401", bare_401.base_url()),
+            client_at("old", old.base_url()),
+        ])
+        .source_status(Some(THIS_ID))
+        .await;
+        let row = |h: &str| rows.iter().find(|r| r.host == h).unwrap().clone();
+        for h in ["refused", "gateway", "restarting", "garbled"] {
+            let r = row(h);
+            assert!(r.unreachable, "{h}: {r:?}");
+            assert!(
+                r.error.is_some() && r.source.is_none() && !r.busy,
+                "{h}: {r:?}"
+            );
+        }
+        let r = row("bare-401");
+        assert!(!r.unreachable && r.error.is_some(), "{r:?}");
+        let r = row("old");
+        assert!(!r.unreachable && !r.supported && r.error.is_none(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn source_use_targets_the_named_host_only() {
+        let a = MockServer::start_async().await;
+        let moved = a
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sources/use")
+                    .json_body(serde_json::json!({ "machine_id": THIS_ID }));
+                t.status(200).body(sources_body(THIS_ID, "box", true));
+            })
+            .await;
+        let b = MockServer::start_async().await;
+        let untouched = b
+            .mock_async(|w, t| {
+                w.path_contains("/api/");
+                t.status(200);
+            })
+            .await;
+        let backend = backend_with(vec![
+            client_at("a", a.base_url()),
+            client_at("b", b.base_url()),
+        ]);
+        let row = backend.source_use("a", THIS_ID).await.unwrap();
+        moved.assert_async().await;
+        untouched.assert_hits_async(0).await;
+        assert_eq!(row.host, "a");
+        assert!(row.this_machine && row.connected);
+        assert_eq!(row.source.unwrap().name, "box");
+        // An unknown host is an error, never the default server.
+        let e = backend.source_use("nope", THIS_ID).await.unwrap_err();
+        assert!(
+            matches!(e, SourceError::Shed(ShedError::Config(_))),
+            "{e:?}"
+        );
     }
 
     #[tokio::test]

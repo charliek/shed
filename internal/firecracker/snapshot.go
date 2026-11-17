@@ -68,6 +68,27 @@ func loadSnapshot(snapshotsDir, name string) (*config.Snapshot, error) {
 }
 
 func saveSnapshot(snapshotsDir string, snap *config.Snapshot) error {
+	snap.Version = config.SnapshotSchemaVersion
+	return writeSnapshot(snapshotsDir, snap)
+}
+
+// writeSnapshot writes snap's snapshot.json as it is, its schema version
+// included (saveSnapshot sets the current one first).
+func writeSnapshot(snapshotsDir string, snap *config.Snapshot) error {
+	return writeSnapshotFile(snapshotsDir, snap, false)
+}
+
+// writeSnapshotDurable is writeSnapshot that returns only once the new
+// snapshot.json survives a crash or a power loss: the file is synced before
+// the rename and the snapshot's directory after it. It is for a write that
+// must never be lost once acknowledged (stamping the snapshot with a user).
+// An error after the rename (the directory sync) leaves the new file in
+// place, perhaps not durable; the caller treats it as not written.
+func writeSnapshotDurable(snapshotsDir string, snap *config.Snapshot) error {
+	return writeSnapshotFile(snapshotsDir, snap, true)
+}
+
+func writeSnapshotFile(snapshotsDir string, snap *config.Snapshot, durable bool) error {
 	if err := config.ValidateSnapshotName(snap.Name); err != nil {
 		return err
 	}
@@ -76,8 +97,6 @@ func saveSnapshot(snapshotsDir string, snap *config.Snapshot) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("failed to create snapshot directory: %w", err)
 	}
-
-	snap.Version = config.SnapshotSchemaVersion
 
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -96,6 +115,13 @@ func saveSnapshot(snapshotsDir string, snap *config.Snapshot) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to write snapshot metadata: %w", err)
 	}
+	if durable {
+		if err := metadataFileSync(tmpFile); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to sync snapshot metadata: %w", err)
+		}
+	}
 	if err := tmpFile.Close(); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to close temp snapshot file: %w", err)
@@ -104,29 +130,48 @@ func saveSnapshot(snapshotsDir string, snap *config.Snapshot) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to rename snapshot metadata: %w", err)
 	}
+	if durable {
+		if err := metadataDirSync(dir); err != nil {
+			return fmt.Errorf("failed to sync the snapshot directory: %w", err)
+		}
+	}
 	return nil
 }
 
 func listSnapshotNames(snapshotsDir string) ([]string, error) {
+	names, _, err := listSnapshotNamesCounting(snapshotsDir)
+	return names, err
+}
+
+// listSnapshotNamesCounting is listSnapshotNames that also counts the
+// snapshot directories whose metadata cannot be looked at (a stat that fails
+// for a reason other than the file being absent): each is left out and
+// logged, never silently.
+func listSnapshotNamesCounting(snapshotsDir string) ([]string, int, error) {
 	entries, err := os.ReadDir(snapshotsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return nil, fmt.Errorf("failed to read snapshots directory: %w", err)
+		return nil, 0, fmt.Errorf("failed to read snapshots directory: %w", err)
 	}
 
 	var names []string
+	unreadable := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		metaPath := SnapshotMetadataPath(snapshotsDir, entry.Name())
-		if _, err := os.Stat(metaPath); err == nil {
+		switch _, err := os.Stat(metaPath); {
+		case err == nil:
 			names = append(names, entry.Name())
+		case !os.IsNotExist(err):
+			log.Printf("Warning: skipping snapshot %q: its metadata cannot be read: %v", entry.Name(), err)
+			unreadable++
 		}
 	}
-	return names, nil
+	return names, unreadable, nil
 }
 
 // acquireSnapshotLock returns an unlock closure after taking the per-name
@@ -151,8 +196,14 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	defer c.acquireSnapshotLock(req.Name)()
 	defer c.acquireCreateLock(req.SourceShed)()
 
+	// Only a definitive "no such snapshot" frees the name. A snapshot.json
+	// that cannot be read or parsed is still someone's snapshot (whose, it
+	// does not say): it is never treated as absent and overwritten.
 	if _, err := loadSnapshot(c.cfg.SnapshotsDir, req.Name); err == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrSnapshotAlreadyExistsSentinel, req.Name)
+	} else if !errors.Is(err, config.ErrSnapshotNotFoundSentinel) {
+		log.Printf("snapshot %s: refusing to create over an existing snapshot whose metadata cannot be read: %v", req.Name, err)
+		return nil, fmt.Errorf("%w: %s (its metadata cannot be read, so it is left alone)", config.ErrSnapshotAlreadyExistsSentinel, req.Name)
 	}
 
 	srcMeta, err := LoadMetadata(c.cfg.InstanceDir, req.SourceShed)
@@ -161,6 +212,22 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, req.SourceShed)
 		}
 		return nil, err
+	}
+	// Checked under the source's lock, against the shed being snapshotted:
+	// the incarnation the caller was authorized to enter.
+	if err := checkIdentity(ctx, req.SourceShed, srcMeta); err != nil {
+		return nil, err
+	}
+
+	// The snapshot is its source's user's: the user the source is
+	// reported with, never one the request names. A source whose record
+	// names both a service client and a user is reported unresolved; it is
+	// refused rather than snapshotted, so no snapshot record ever carries
+	// config.UserUnresolved or an ownership the source does not have.
+	_, srcUser := config.ShedOwnership(srcMeta.Owner, srcMeta.User)
+	if srcUser == config.UserUnresolved {
+		return nil, fmt.Errorf("%w: source shed %s names both a service client and a user; its ownership must be resolved before it can be snapshotted",
+			config.ErrInvalidShedRequestSentinel, req.SourceShed)
 	}
 
 	if srcMeta.Status == config.StatusRunning {
@@ -255,6 +322,7 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 		CreatedAt:       time.Now(),
 		SizeBytes:       sizeBytes,
 		LowerDigest:     srcMeta.LowerDigest,
+		User:            srcUser,
 	}
 
 	backend.Phase(ctx, "snapshot")
@@ -276,22 +344,33 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 }
 
 // ListSnapshots returns all snapshots stored on this server.
-func (c *Client) ListSnapshots(_ context.Context) ([]config.Snapshot, error) {
-	names, err := listSnapshotNames(c.cfg.SnapshotsDir)
+func (c *Client) ListSnapshots(ctx context.Context) ([]config.Snapshot, error) {
+	snaps, _, err := c.ListSnapshotsCounting(ctx)
+	return snaps, err
+}
+
+// ListSnapshotsCounting is ListSnapshots that also says how many snapshot
+// records it could not read and left out (backend.CountingSnapshotLister).
+// A snapshot deleted since the directory was read is not counted.
+func (c *Client) ListSnapshotsCounting(_ context.Context) ([]config.Snapshot, int, error) {
+	names, unreadable, err := listSnapshotNamesCounting(c.cfg.SnapshotsDir)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	out := make([]config.Snapshot, 0, len(names))
 	for _, name := range names {
 		snap, err := loadSnapshot(c.cfg.SnapshotsDir, name)
 		if err != nil {
 			log.Printf("Warning: skipping invalid snapshot %q: %v", name, err)
+			if !errors.Is(err, config.ErrSnapshotNotFoundSentinel) {
+				unreadable++
+			}
 			continue
 		}
 		c.augmentSnapshot(snap)
 		out = append(out, *snap)
 	}
-	return out, nil
+	return out, unreadable, nil
 }
 
 // GetSnapshot returns a single snapshot by name.
@@ -314,14 +393,20 @@ func (c *Client) augmentSnapshot(snap *config.Snapshot) {
 }
 
 // DeleteSnapshot removes a snapshot from disk.
-func (c *Client) DeleteSnapshot(_ context.Context, name string) error {
+func (c *Client) DeleteSnapshot(ctx context.Context, name string) error {
 	if err := config.ValidateSnapshotName(name); err != nil {
 		return err
 	}
 
 	defer c.acquireSnapshotLock(name)()
 
-	if _, err := loadSnapshot(c.cfg.SnapshotsDir, name); err != nil {
+	snap, err := loadSnapshot(c.cfg.SnapshotsDir, name)
+	if err != nil {
+		return err
+	}
+	// Checked under the snapshot lock, against the snapshot being deleted:
+	// the one the caller was authorized for (backend.WithRequiredSnapshot).
+	if err := backend.CheckSnapshot(ctx, name, snap); err != nil {
 		return err
 	}
 

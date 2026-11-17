@@ -43,7 +43,7 @@ func issueTunnelCert(t *testing.T, ca servertls.CA, label string, ttl time.Durat
 	}
 	sum := sha256.Sum256([]byte(label))
 	fp := "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:])
-	certDER, err := ca.SignClientCSR(csrDER, fp, "control", "cli", ttl)
+	certDER, err := ca.SignClientCSR(csrDER, fp, "", "control", "cli", ttl)
 	if err != nil {
 		t.Fatalf("sign client CSR: %v", err)
 	}

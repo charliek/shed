@@ -1,5 +1,7 @@
 # Auth & Transport Security: Optional, Iterative Hardening
 
+> **Status (v0.10.0):** the bearer-token mode this document designs (`auth.mode: token`, also spelled `secure`) was removed in v0.10.0; `mtls` is the networked mode and `open` is loopback only. This document is kept as history; see [Security](../reference/security.md) for the current model.
+
 Discovery document for adding authentication and encryption to shed-server — SSH client auth, HTTP auth, transport encryption, and server identity — as **optional layers** that default off, scale from today's single-user LAN/Tailscale deployment up to a multi-user org and (eventually) a cloud-proxied fleet, and never break the ecosystem (raw `ssh`, IDE remoting, shed-desktop, shed-extensions).
 
 > **Status.** Discovery only — nothing here is decided or built. The current

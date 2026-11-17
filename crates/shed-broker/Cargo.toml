@@ -153,6 +153,12 @@ objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
 objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError", "block2"] }
 
 [dev-dependencies]
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs: the daemon standing by
+# for the desktop app's embedded broker, and the reconnect backoff (bus.rs), are proven
+# over minutes of retries with the real backoff and presence-check constants on a PAUSED
+# clock. tokio's own feature: no package joins the lock, and it changes nothing unless a
+# test pauses time.
+tokio = { workspace = true, features = ["test-util"] }
 # Throwaway socket dirs + config files for the sockets/controltoken/audit unit tests.
 tempfile = "3"
 # Hermetic mock shed-server for the bus unit tests (subscribe/respond/409/401),

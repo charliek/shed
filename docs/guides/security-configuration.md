@@ -1,184 +1,101 @@
 # Security Configuration
 
 shed is **local-development-first**: out of the box (the brew/apt install) it
-runs localhost-only. Networked access is opt-in. Its network security is two
-independent choices:
+runs localhost-only. Networked access is opt-in. Its network security is three
+choices:
 
-1. **Posture** — `auth.mode: open | token | mtls`. *Open* trusts the network
-   (plain HTTP, no credential, no TLS). *Token* trusts nothing (pinned TLS +
-   bearer tokens + an SSH key allowlist), and is **TLS-only** — it serves no
-   plain-HTTP listener at all. *mtls* is the same hardened bundle with the
-   bearer token replaced by a client certificate bound to a key that never
-   leaves the client's device — the **recommended posture for anything
-   internet-facing**. (`secure` is accepted as a deprecated alias for `token`.)
-2. **Where listeners bind** — `bind_address` governs every listener (HTTP,
-   HTTPS, SSH). It **defaults to loopback (`127.0.0.1`)** in every mode, so the
-   server is reachable only on this machine until you set it to a routable
-   address.
+1. **Posture**: `auth.mode: open | mtls`. *Open* trusts the machine it runs on
+   (plain HTTP, no credential, no TLS) and **binds loopback only**. *mtls*
+   trusts nothing: pinned TLS, an SSH key allowlist, and a client certificate
+   bound to a key that never leaves the client's device. It is **TLS-only**
+   and the one posture that may face the network.
+2. **Where listeners bind**: `bind_address` governs every listener (HTTP,
+   HTTPS, SSH). It **defaults to loopback (`127.0.0.1`)** in both modes; in
+   mtls mode you set it to a routable address to face the network.
+3. **Who the callers are**: with no user list every accepted key is one
+   implicit user, an admin. With [`auth.users`](../reference/configuration.md#users)
+   (mtls only) each key belongs to a named user, who reaches only their own
+   sheds. See the [Multi-user server guide](multi-user-server.md).
 
-Separately from both, you can limit what each **shed** reaches: no server
+Separately from all three, you can limit what each **shed** reaches: no server
 mounts, and on Firecracker an internet-only network. That works in every
 posture, a localhost-only laptop included; see [Hardening the sheds
 themselves](#hardening-the-sheds-themselves).
 
-Think of it as two deployment shapes:
-
-- **Local development** (the default) — localhost-only, open (the installed
-  default), token, or mtls. Cases 1 and 2 below.
-- **Remote-facing** — reachable across the network. mtls or token is the
-  preferred posture (TLS + a credential); open is allowed only with an
-  explicit `bind_address` *and* `allow_insecure_exposure: true`. Cases 3, 3b,
-  and 4 below.
-
-This guide walks the common shapes those two choices produce. For the underlying
-model — the invariants, the credential bus, and the exact connection flow — see
-the [Security reference](../reference/security.md). For a full internet-facing
-walkthrough, see [Public VPS Deployment](vps-deployment.md). Upgrading an
-existing token-mode server to mtls, or upgrading from a pre-v0.7.4 server (the
-loopback default is new)? See [Upgrading to mTLS](../upgrades/token-to-mtls.md)
-and [Upgrading v0.7.3 → v0.7.4](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md).
+This guide walks the common shapes these choices produce. For the underlying
+model (the invariants, ownership, the credential bus and the exact connection
+flow) see the [Security reference](../reference/security.md). For a full
+internet-facing walkthrough, see [Public VPS Deployment](vps-deployment.md).
 
 Server settings live in `server.yaml` (`/etc/shed/server.yaml` on Linux,
 `~/.config/shed/server.yaml` or the Homebrew `…/etc/shed/server.yaml` on macOS).
 Client settings are written per server into `~/.shed/config.yaml` by
 `shed server add`.
 
+!!! note "Removed in v0.10.0"
+    The bearer-token mode (`auth.mode: token`, also spelled `secure`) and
+    `allow_insecure_exposure` (an open server off loopback) were removed in
+    v0.10.0. A config that names either fails to load with a message naming
+    `mtls`, rather than starting open. Switch such a server to
+    `auth.mode: mtls` (Case 2 or 3): every client since v0.8.1 re-enrolls with
+    a certificate on its next request. A caller that used a bearer token
+    directly (`curl`, a script, CI) needs a client certificate, or can become a
+    [service client](orchestrated-sheds.md).
+
 ## Choosing a posture
 
 | Question | If yes |
 |----------|--------|
-| Is everything on **one machine**, and do you want zero auth ceremony? | **Open + loopback** (Case 1) — the installed default |
-| One machine, but you want TLS + key checking anyway (shared box, or mirror prod locally)? | **Token + loopback** (Case 2) |
-| Reachable **over the network** / internet-facing, and `curl`/scripts/CI need **admin** access to the API with a bearer header? | **Token, all interfaces** (Case 3) |
-| Reachable **over the network** / internet-facing, and every caller is part of the shed client fleet (CLI, desktop, host-agent, mobile)? | **mtls, all interfaces** (Case 3b) — the **recommended** networked posture |
-| Reachable over the network, and an orchestrator (CI, an agent runner) needs to create and drive **only its own sheds**? | **mtls** (Case 3b) with a [service client](orchestrated-sheds.md) |
-| Reachable over the network, but a **trusted private network only** and you accept plaintext? | **Open on a LAN** (Case 4) — needs `allow_insecure_exposure: true` |
+| Is everything on **one machine**, and do you want zero auth ceremony? | **Open** (Case 1), the installed default |
+| One machine, but you want TLS and key checking anyway (a shared box, or to mirror a networked server locally)? | **mtls on loopback** (Case 2) |
+| Reachable **over the network**, a LAN, a tailnet or the internet? | **mtls, facing the network** (Case 3) |
+| Several **people** use the server, each with their own sheds? | **mtls with users** (Case 4) |
+| An orchestrator (CI, an agent runner) needs to create and drive **only its own sheds**? | **mtls** (Case 3) with a [service client](orchestrated-sheds.md) |
 
-Two invariants hold across every token- and mtls-mode deployment, and explain
-the startup rejections you may hit (see
+Two invariants hold, and explain the startup rejections you may hit (see
 [Troubleshooting](#troubleshooting-startup-rejections)):
 
-- **credential ⟺ TLS ⟺ enforced mode** — HTTP credential enforcement (a bearer
-  token in `token` mode, a client certificate in `mtls` mode) only exists in an
-  enforced mode, and an enforced mode is always TLS.
-- **https ⟺ enforced mode** — `https_port` is valid only in `token`/`mtls`
-  mode. So a client (or the host-agent) can treat an `https://` `api_url` as
-  proof the server enforces a credential.
+- **credential ⟺ TLS ⟺ mtls**: HTTP credential enforcement (a client
+  certificate) exists only in mtls mode, and mtls is always TLS.
+- **https ⟺ mtls**: `https_port` is valid only in mtls mode. So a client (or
+  the host-agent) can treat an `https://` `api_url` as proof the server
+  requires a credential.
 
 ---
 
-## Case 1 — Local only, simplest (open + loopback)
+## Case 1: Local only, simplest (open)
 
 **For:** a developer running shed-server and the CLI on the same machine, who
-wants nothing exposed to the LAN and no SSH allowlist / token / TLS ceremony.
+wants nothing exposed and no SSH allowlist, certificate or TLS ceremony.
 
 `server.yaml`:
 
 ```yaml
 auth:
-  mode: open             # the default — may be omitted
-bind_address: 127.0.0.1  # the default — every listener (HTTP + SSH) binds loopback only
+  mode: open             # the default; may be omitted
+bind_address: 127.0.0.1  # the default; an open server may bind nothing else
 ```
 
-`bind_address: 127.0.0.1` is the default, so this is also what you get with an
-empty `server.yaml`. Add the server (plain HTTP — no flags):
+This is also what you get with an empty `server.yaml`. Add the server (plain
+HTTP, no flags):
 
 ```bash
 shed server add localhost
 ```
 
 **You get:** plain HTTP + SSH bound to loopback. Nothing reaches the LAN; no
-tokens, no TLS, no key allowlist. **Trade-off:** any local user on the box can
-reach the API — loopback *is* the trust boundary. Right for a single-user laptop.
+credential, no TLS, no key allowlist. **Trade-off:** any local user on the box
+can reach the API, and every caller is the implicit user, an admin: loopback
+*is* the trust boundary. Right for a single-user laptop. An open server with a
+non-loopback `bind_address` fails to load.
 
 ---
 
-## Case 2 — Local only, hardened (token + loopback)
+## Case 2: Local only, hardened (mtls on loopback)
 
-**For:** one machine, but you want full TLS and an SSH key allowlist even locally
-— a shared/multi-user host where loopback isn't a sufficient boundary, or to
-mirror a production token-mode config on your laptop.
-
-`server.yaml`:
-
-```yaml
-auth:
-  mode: token
-  ssh:
-    authorized_keys:
-      - ssh-ed25519 AAAA…your-key… you@laptop   # the key you SSH/​bootstrap with
-bind_address: 127.0.0.1   # the default — HTTPS + SSH bind loopback only
-# https_port defaults to 8443 in token mode
-```
-
-Add the server over TLS (pins the self-signed cert, mints a token over SSH):
-
-```bash
-shed server add localhost --https-port 8443
-```
-
-**You get:** TLS-only on `127.0.0.1:8443`, SSH allowlist enforced, bearer tokens
-enforced — nothing plaintext, nothing on the LAN. **Trade-off:** token mode
-**requires** an SSH key source, so you must list your key (`authorized_keys`
-here, or `github_users: [you]`); clients pin the cert. More setup than Case 1,
-in exchange for defense-in-depth on the box itself.
-
----
-
-## Case 3 — Remote, internet-facing (token, all interfaces)
-
-**For:** a VPS or remote host reachable over the network — only your keys may
-connect, and all traffic is encrypted.
-
-`server.yaml`:
-
-```yaml
-auth:
-  mode: token
-  ssh:
-    github_users: [charliek]   # only these GitHub keys may SSH in (and mint tokens)
-tls_names:
-  - shed.example.com           # your public hostname / IP (extra cert SANs)
-bind_address: 0.0.0.0          # token mode defaults to loopback too — set this to face the network
-# https_port defaults to 8443
-```
-
-Token mode defaults to loopback like every other posture, so a remote server
-**must set `bind_address`** explicitly (`0.0.0.0`/`*` for all IPv4, `::` for all
-interfaces, or a specific public/tailnet IP) — otherwise it is unreachable.
-Token mode needs **no** `allow_insecure_exposure` ack to bind the network: TLS +
-tokens already make it safe.
-
-From your laptop:
-
-```bash
-shed server add shed.example.com --https-port 8443
-```
-
-This fetches the cert + SSH host key, shows both fingerprints for confirmation,
-pins them, then mints a token over the `_bootstrap` SSH channel — no token to
-paste. **You get:** HTTPS on all interfaces (`8443`), SSH allowlist, tokens; no
-plaintext anywhere. A co-located host-agent (one running on the same box) reaches
-the credential bus over the same pinned-TLS listener at
-`https://127.0.0.1:8443`, gated by the `credentials` scope. See
-[Public VPS Deployment](vps-deployment.md) for the full flow, out-of-band
-fingerprint verification, and rotation.
-
-**When to prefer Case 3b instead:** token mode is the right call whenever
-`curl`, a CI runner, or any third-party integration needs **admin** access to
-the API with a bearer header — an mtls server has no bearer credential. An
-orchestrator that needs only its own sheds does not need token mode: on an
-mtls server it can be a [service client](orchestrated-sheds.md), whose
-certificate bundle works with `curl --cert`.
-
----
-
-## Case 3b — Remote, internet-facing, mtls (recommended)
-
-**For:** the same VPS/remote-host shape as Case 3, but every caller is part of
-the shed client fleet (CLI, desktop, host-agent, mobile) and you want the
-credential itself to be a key-bound certificate rather than a bearer
-instrument. This is the **recommended posture for anything internet-facing**.
+**For:** one machine, but you want full TLS and an SSH key allowlist even
+locally: a shared host where loopback isn't a sufficient boundary, or to
+mirror a networked config on your laptop.
 
 `server.yaml`:
 
@@ -186,69 +103,114 @@ instrument. This is the **recommended posture for anything internet-facing**.
 auth:
   mode: mtls
   ssh:
-    github_users: [charliek]   # only these GitHub keys may SSH in (and enroll certificates)
-tls_names:
-  - shed.example.com           # your public hostname / IP (extra cert SANs)
-bind_address: 0.0.0.0          # mtls mode defaults to loopback too — set this to face the network
-# https_port defaults to 8443
+    authorized_keys:
+      - ssh-ed25519 AAAA…your-key… you@laptop   # the key you SSH and enroll with
+bind_address: 127.0.0.1   # the default: HTTPS + SSH bind loopback only
+# https_port defaults to 8443 in mtls mode
 ```
 
-Every invariant from Case 3 holds identically (loopback-by-default, no
-`allow_insecure_exposure` ack needed, `github_users`/`authorized_keys`
-required). What's different is what a client presents: instead of a bearer
-token, `shed server add` generates a private key locally, sends a certificate
-signing request over the `_bootstrap` SSH channel, and the server's small
-internal CA signs it. The private key never leaves the client:
+Add the server. First contact is over SSH: it pins the host key, enrolls a
+client certificate over the `_bootstrap` channel and learns the HTTPS port:
 
 ```bash
-shed server add shed.example.com --ssh-port 2222 --trust-on-first-use
+shed server add localhost --name local
 ```
 
-**You get:** the same TLS-only, SSH-allowlisted surface as Case 3, but an
-unauthenticated peer cannot even complete the HTTPS handshake — the server
-demands a client certificate as part of `RequireAndVerifyClientCert`
-(`curl -k` with no certificate gets no HTTP response at all, not even a 401).
-**Trade-off:** revoking access means removing the SSH key (coarser than
-token mode's per-token revoke — it also cuts SSH/SFTP), and `curl`/scripts
-cannot reach the server as an admin. A script or orchestrator that needs only
-its own sheds can be a [service client](orchestrated-sheds.md) instead. See
-[mTLS mode](../reference/security.md#mtls-mode) for the full guarantee, the
-per-request re-validation, and the accepted limitations, and
-[Upgrading to mTLS](../upgrades/token-to-mtls.md) for flipping an existing
-token-mode server over.
+**You get:** TLS-only on `127.0.0.1:8443`, the SSH allowlist enforced, a
+client certificate required on every request: nothing plaintext, nothing on
+the LAN. **Trade-off:** mtls **requires** an SSH key source, so you must list
+your key (`authorized_keys` here, or `github_users: [you]`).
 
 ---
 
-## Case 4 — Remote, open on a trusted LAN (open + `allow_insecure_exposure`)
+## Case 3: Networked (mtls facing the network)
 
-**For:** a server reachable across a **trusted private network only** (a
-Tailscale tailnet or a closed LAN), where you accept plaintext and want no
-credential / TLS ceremony. **Prefer mtls (Case 3b) or token (Case 3) mode for
-anything networked** — this case has no transport security, so use it only
-when the network itself is the trust boundary.
+**For:** a VPS, a LAN box or a tailnet host reachable from other machines.
+Only your keys may connect, and all traffic is encrypted.
 
 `server.yaml`:
 
 ```yaml
 auth:
-  mode: open               # plain HTTP, no tokens, no TLS
-bind_address: 0.0.0.0      # face the network (or a specific tailnet/LAN IP)
-allow_insecure_exposure: true   # required: acknowledge a non-loopback bind with no transport security
+  mode: mtls
+  ssh:
+    github_users: [alice-gh]   # only these GitHub keys may SSH in (and enroll certificates)
+tls_names:
+  - shed.example.com           # your public hostname / IP (extra cert SANs)
+bind_address: 0.0.0.0          # mtls defaults to loopback too: set this to face the network
+# https_port defaults to 8443
 ```
 
-Binding a non-loopback interface in **open** mode requires
-`allow_insecure_exposure: true` — without it the server refuses to start, because
-open mode would otherwise put plaintext on the network silently. (Token mode
-needs no such ack.) Add the server (plain HTTP — no flags):
+mtls defaults to loopback like open mode, so a networked server **must set
+`bind_address`** explicitly (`0.0.0.0`/`*` for all IPv4, `::` for all
+interfaces, or a specific public or tailnet IP); otherwise it is unreachable.
+mtls needs no acknowledgment to bind the network: TLS plus a required
+certificate make it safe.
+
+From your laptop:
 
 ```bash
-shed server add my-host.tailnet.ts.net --name my-host
+shed server add shed.example.com --name work
 ```
 
-**You get:** plain HTTP + SSH on the LAN, no tokens, no TLS. **Trade-off:**
-everything is plaintext and any host that can reach the address can reach the
-API — the private network *is* the trust boundary. Move to mtls (Case 3b) or
-token mode (Case 3) the moment the server faces anything wider.
+This pins the SSH host key (showing its fingerprint for confirmation),
+enrolls a client certificate over the `_bootstrap` SSH channel (the private
+key never leaves the client), and pins the TLS cert from the bundle; there is
+no credential to paste. Add `--ssh-port` when the server's SSH port is not
+`2222`.
+
+**You get:** HTTPS on the chosen interfaces (`8443`), the SSH allowlist, and a
+certificate checked on every request. An unauthenticated peer cannot complete
+the HTTPS handshake (`curl -k` with no certificate gets no HTTP response at
+all, not even a `401`). A co-located host-agent reaches the credential bus
+over the same pinned-TLS listener at `https://127.0.0.1:8443`, gated by the
+`credentials` scope. **Trade-off:** revoking access means removing the SSH key
+(it also cuts SSH and SFTP), and `curl` or a script needs a client
+certificate. A script or orchestrator that needs only its own sheds can be a
+[service client](orchestrated-sheds.md). See [Public VPS
+Deployment](vps-deployment.md) for the full flow, out-of-band fingerprint
+verification and rotation, and [mTLS
+mode](../reference/security.md#mtls-mode) for the guarantee and its limits.
+
+---
+
+## Case 4: Several people (mtls with users)
+
+**For:** a server shared by several people, each of whom should see and enter
+only their own sheds.
+
+`server.yaml`:
+
+```yaml
+auth:
+  mode: mtls                 # required with auth.users
+  users:
+    alice:
+      github: alice-gh
+      admin: true            # lists, stops and deletes anyone's sheds; uses host directories
+    bob:
+      github: bob-gh
+tls_names:
+  - shed.example.com
+bind_address: 0.0.0.0
+```
+
+`auth.users` replaces `auth.ssh`'s key sources: a key is listed under its user
+(a GitHub login, keys by hand, or both), and config load refuses
+`github_users` or `authorized_keys` beside it. Each person adds the server
+with their own key, as in Case 3.
+
+**You get:** each user lists and enters only their own sheds; another user's
+shed answers as if it did not exist. An admin may also list, stop and delete
+anyone's shed, but not enter it. Host directories, server mounts, images that
+are not the default or an alias, and the image store are for admins. Each
+user's credential requests go to one machine of theirs. **Trade-off:** a
+server with users is not isolation between hostile tenants: the admins control
+the host, and Firecracker runs without its jailer. Write the full user list
+before the first start with it: on that start, a server with exactly one user
+gives every existing shed to that user. The [Multi-user server
+guide](multi-user-server.md) covers the whole setup, including sheds made
+before the list existed.
 
 ---
 
@@ -264,8 +226,9 @@ shed list -v      # the MOUNTS column shows none, NETWORK shows isolated
 ```
 
 - **`--mounts none`** (or `--mounts claude,gh`) picks which of the server's
-  `mounts:` the shed gets. Without the flag it gets all of them, as before. The
-  choice is stored and applied on every start. See [Security › Mount
+  `mounts:` the shed gets. Without the flag it gets all of them, as before
+  (none for a user who is not an admin, on a server with users). The choice
+  is stored and applied on every start. See [Security › Mount
   selection](../reference/security.md#mount-selection).
 - **`--network isolated`** (Firecracker only) lets the shed reach the internet
   and nothing else: not the host on any of its addresses (except the shed's own
@@ -279,13 +242,13 @@ shed list -v      # the MOUNTS column shows none, NETWORK shows isolated
 - **Use both.** On Firecracker, an `open` shed with no mounts can still reach
   another running shed's 9P port on the bridge, so leaving out mounts is not a
   boundary by itself.
-- **Neither flag turns off the credential bus.** While a host-agent brokers for
-  this server, code in the shed can request SSH signatures and the cloud and
-  registry credentials configured for it, like any shed (see [Credential
-  isolation › Compromised VM](../extensions/security-posture.md#compromised-vm)).
-  For untrusted code, stop the host-agent while the shed runs, or have a
-  [service client](../reference/security.md#service-clients) own the shed: the
-  bus is always off for an owned shed.
+- **Neither flag turns off the credential bus.** While a machine of the shed's
+  user answers for this server, code in the shed can request SSH signatures
+  and the cloud and registry credentials configured for it, like any shed (see
+  [Credential isolation](../extensions/security-posture.md)). For untrusted
+  code, stop the host-agent while the shed runs, or have a [service
+  client](../reference/security.md#service-clients) own the shed: the bus is
+  always off for an owned shed.
 - **Neither flag stops the create's sync.** `shed create` still syncs your
   `default` [sync profile](../reference/sync.md#auto-sync-on-create) into the
   shed; add `--no-sync` when it copies anything the code should not see.
@@ -322,61 +285,67 @@ network profile](../reference/egress.md#with-the-isolated-network-profile).
 
 ## Staging the SSH allowlist with `warn` (avoid locking yourself out)
 
-`auth.mode: token`/`mtls` force the SSH allowlist to `enforce` — and a wrong or
+`auth.mode: mtls` forces the SSH allowlist to `enforce`, and a wrong or
 incomplete allowlist on a remote host locks you out (recovery means editing
 `server.yaml` from the provider's console). The safe rollout uses `warn` as a
-**pre-flight**, in open mode, before you commit:
+**pre-flight**, in open mode, on the box itself, before you commit:
 
 ```yaml
 auth:
   mode: open
   ssh:
-    mode: warn                 # consult the allowlist, LOG would-deny, but still accept
-    github_users: [charliek]
+    mode: warn                 # consult the allowlist, log would-deny, but still accept
+    github_users: [alice-gh]
 ```
 
-Restart, then watch the log for `would-deny` lines while you (and your CI, and
-the host-agent) connect. Once nothing legitimate is denied, switch to
-`auth.mode: token` or `auth.mode: mtls` (either forces `enforce`). This is the
-same pattern as SELinux `permissive` or CSP report-only — a dry run that
-proves the policy before it blocks. `warn` is valid only in open mode; token
-and mtls mode always enforce.
+Restart, then watch the log for `SSH auth WOULD DENY (warn mode)` lines while
+you (and the host-agent) connect. Once nothing legitimate is denied, switch to
+`auth.mode: mtls`, which forces `enforce`. `warn` is valid only in open mode,
+and a server with `auth.users` (mtls only) always enforces.
 
-## Is anything plaintext in token or mtls mode?
+## Is anything plaintext in mtls mode?
 
-No — nothing, anywhere. Both modes serve **no** plain-HTTP listener at all (not
-even on loopback): a single pinned-TLS listener faces clients, and a client
-that holds a pin but is handed a non-`https` URL fails closed rather than send
-plaintext. The SSH channel (shed sessions and the credential issuance channel)
-is encrypted with the host key pinned in `known_hosts`. The only
-trust-on-first-use moment is `shed server add` showing you the cert
-fingerprint(s) to confirm (or pass `--tls-fingerprint` / `--fingerprint` to
-verify out-of-band). See the
+No. mtls serves **no** plain-HTTP listener at all (not even on loopback): a
+single pinned-TLS listener faces clients, and a client that holds a pin but
+is handed a non-`https` URL fails closed rather than send plaintext. The SSH
+channel (shed sessions and the certificate issuance channel) is encrypted
+with the host key pinned in `~/.shed/known_hosts`. The only trust-on-first-use
+moment is `shed server add` showing you the fingerprints to confirm (or pass
+`--fingerprint` / `--tls-fingerprint` to verify out-of-band). See the
 [connection-flow table](../reference/security.md#connection-flow-whats-encrypted-where).
 
 The credential bus (`credentials` scope) and Connect tunnel (`control` or
-`credentials`) ride that same TLS listener — so a co-located host-agent reaches
-them over `https://127.0.0.1:8443` with the pinned cert (in mtls mode, its own
-client certificate). There is no plaintext channel, implicit or opt-in.
+`credentials`) ride that same TLS listener, so a co-located host-agent reaches
+them over `https://127.0.0.1:8443` with the pinned cert and its own client
+certificate. There is no plaintext channel, implicit or opt-in.
 
 ## Troubleshooting startup rejections
 
-Token and mtls mode refuse to start half-configured, and the simplification
-removed the footgun states — so these configs are **rejected at startup** (the
-server names the gap and exits):
+mtls refuses to start half-configured, and removed settings are refused by
+name, so these configs are **rejected at startup** (the server names the gap
+and exits):
 
 | Message names… | Cause | Fix |
 |----------------|-------|-----|
-| `auth.mode: token requires … an SSH key source` (or `auth.mode: mtls requires …`) | token/mtls mode with no `github_users` / `authorized_keys` / `authorized_keys_file` | Add a key source (Cases 2–4). |
-| `https_port requires auth.mode: token or mtls` | `https_port` set under `open` | Use `token`/`mtls` (either defaults `https_port` to 8443), or drop `https_port`. |
-| `auth.ssh.mode: enforce requires auth.mode: token or mtls` | enforcing the allowlist without an enforced mode | Use `token`/`mtls`, or `warn` to stage (above). |
-| `auth.mode: token forces auth.ssh.mode: enforce` (or `auth.mode: mtls forces …`) | an explicit `off`/`warn` under an enforced mode | Remove `auth.ssh.mode` — token/mtls mode derives `enforce`. |
-| `config key "auth.http" was removed` | a leftover `auth.http` block | Delete it — token enforcement derives from `auth.mode: token`. |
-| `config key "http_bind"/"ssh_bind" was removed` | a leftover `http_bind`/`ssh_bind` | Replace both with a single `bind_address`. |
-| `config key "internal_http_port" was removed` | a leftover `internal_http_port` | Delete it — the bus + Connect tunnel ride the single listener (Case 3/3b). |
-| `bind_address … requires allow_insecure_exposure` | a non-loopback `bind_address` in **open** mode | Add `allow_insecure_exposure: true` (Case 4), or switch to `token`/`mtls` mode (Case 3/3b). |
-| `invalid auth.mode: … (must be open, token, or mtls)` | a typo or unsupported value in `auth.mode` | Use `open`, `token`, or `mtls` (`secure` is also accepted, as a deprecated alias for `token`). |
-| `auth.clients requires auth.mode: mtls` | [service clients](orchestrated-sheds.md) declared in `open` or `token` mode | Switch to `auth.mode: mtls` (Case 3b), or remove `auth.clients`. |
+| `auth.mode: "token" was removed in v0.10.0; use auth.mode: mtls …` (or `"secure"`) | the removed bearer-token mode | Set `auth.mode: mtls` (Case 2 or 3), or remove `auth.mode` for an open server on loopback. |
+| `config key "allow_insecure_exposure" was removed in v0.10.0 …` | the removed open-off-loopback acknowledgment, with any value | Delete it, and use `auth.mode: mtls` (Case 3) to reach the server from other hosts. |
+| `bind_address "…" exposes an open-mode server beyond loopback …` | a non-loopback `bind_address` in open mode | Switch to `auth.mode: mtls` (Case 3), or bind loopback (Case 1). |
+| `auth.mode: mtls requires at least one SSH key source (auth.users, or auth.ssh.github_users, authorized_keys, or authorized_keys_file)` | mtls with no key source | Add a key source (Cases 2 to 4). |
+| `https_port requires auth.mode: mtls …` | `https_port` set under `open` | Use `mtls` (it defaults `https_port` to 8443), or drop `https_port`. |
+| `auth.ssh.mode: enforce requires auth.mode: mtls …` | enforcing the allowlist in open mode | Use `mtls`, or `warn` to stage (above). |
+| `auth.mode: mtls forces auth.ssh.mode: enforce …` | an explicit `off`/`warn` under mtls | Remove `auth.ssh.mode`: mtls derives `enforce`. |
+| `invalid auth.mode: … (must be open or mtls)` | a typo or unsupported value in `auth.mode` | Use `open` or `mtls`. |
+| `auth: … (keys are case-sensitive)`, or `config key "…" is not recognised; keys are case-sensitive, did you mean "…"?` | an unknown or differently cased key under `auth` (`Mode:`), or a top-level key that differs from a known one only in case (`Auth:`) | Correct the key the message names. |
+| `auth.users requires auth.mode: mtls` | a user list in open mode | Set `auth.mode: mtls` (Case 4). |
+| `auth.users cannot be combined with auth.ssh.github_users …` (or `authorized_keys`, `authorized_keys_file`) | key sources under both `auth.ssh` and `auth.users` | List each key or login under its user, and remove the `auth.ssh` source. |
+| `auth.users.<name> needs a github login or at least one key`, `… label is required`, `key … is listed under … and …`, `… name the same GitHub login …`, `… is an SSH certificate …` | a user with no credential, a key without a `label`, a key or login listed twice, or a certificate as a key | Fix the entry the message names (see [Configuration › Users](../reference/configuration.md#users)). |
+| `auth.users needs at least one admin (admin: true) with a github login or a key that is not marked script` | no admin who can act as a person | Mark a user `admin: true` who has a GitHub login or a key without `script: true`. |
+| `"…" is not a boolean; write true or false, unquoted` | `admin` or `script` set to `yes`, `on` or a quoted string | Write `true` or `false`. |
+| `github pin store …/github_pins.json is unreadable …` | a damaged GitHub pin file | Restore it, or move it aside to pin every login again at its next fetch. |
+| `config key "auth.http" was removed` | a leftover `auth.http` block | Delete it: enforcement derives from `auth.mode: mtls`. |
+| `config key "http_bind"/"ssh_bind" was unified into "bind_address" …` | a leftover `http_bind`/`ssh_bind` | Replace both with a single `bind_address`. |
+| `config key "internal_http_port" was removed` | a leftover `internal_http_port` | Delete it: the bus and Connect tunnel ride the single listener. |
+| `auth.clients requires auth.mode: mtls` | [service clients](orchestrated-sheds.md) declared in open mode | Switch to `auth.mode: mtls` (Case 3), or remove `auth.clients`. |
 | `invalid auth.clients name …`, or `auth.clients.<name>.policy.name_prefix is required` (likewise `max_sheds is required and must be at least 1`, `max_age is required and must be positive`) | a client name that is not lowercase letters, digits and hyphens, or a required policy field missing or zero | Fix the name, or set the field (see [Configuration › Service clients](../reference/configuration.md#service-clients)). |
 | `auth.clients.<name>.policy.server_mounts names "…", which is not in mounts` (or `policy.images names "…", which is not an image alias of the … backend`) | a policy that names a mount or an image alias the server does not define | Add it to `mounts:` or the backend's `image_aliases`, or remove it from the policy. |
 | `auth.clients: … field … not found` (or `network: … field … not found`) | an unknown key, usually a typo, under `auth.clients` or `network:` | Correct the key the message names. |
@@ -391,8 +360,7 @@ server names the gap and exits):
 
 | Case | `auth.mode` | `bind_address` | TLS | `shed server add` |
 |------|-------------|----------------|-----|-------------------|
-| 1 — local simple | `open` | `127.0.0.1` (default) | none | `shed server add localhost` |
-| 2 — local hardened | `token` | `127.0.0.1` (default) | loopback `:8443` | `shed server add localhost --https-port 8443` |
-| 3 — remote, bearer-token admin scripts | `token` | `0.0.0.0` | all ifaces `:8443` | `shed server add <host> --https-port 8443` |
-| 3b — remote (recommended) | `mtls` | `0.0.0.0` | all ifaces `:8443`, client cert required | `shed server add <host> --ssh-port <port>` |
-| 4 — remote open on LAN | `open` + `allow_insecure_exposure` | `0.0.0.0` | none | `shed server add <host>` |
+| 1: local, simple | `open` | `127.0.0.1` (the only choice) | none | `shed server add localhost` |
+| 2: local, hardened | `mtls` | `127.0.0.1` (default) | loopback `:8443`, client cert required | `shed server add localhost --name local` |
+| 3: networked | `mtls` | `0.0.0.0` or an address | `:8443`, client cert required | `shed server add <host> [--ssh-port <port>]` |
+| 4: several people | `mtls` + `auth.users` | `0.0.0.0` or an address | `:8443`, client cert required | each person: `shed server add <host>` |

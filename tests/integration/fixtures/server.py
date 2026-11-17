@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 import pytest
+import yaml
 
 from .timing import PhaseTimings, parse_timing_line
 
@@ -129,6 +130,29 @@ def resolve_server_entry(name: str, timeout: int = 10) -> Optional[dict]:
         if isinstance(e, dict) and e.get("name") == name:
             return e
     return None
+
+
+def client_cert_pair(name: str, config_path: Optional[Path] = None) -> Optional[tuple[str, str]]:
+    """The `(cert, key)` file pair the CLI keeps for an mtls entry, or None.
+
+    Read straight from the CLI's config file (`~/.shed/config.yaml`, honouring
+    `$HOME`), because `shed --json server list` does not report the
+    certificate paths. None when the file, the entry or either path is
+    missing: a token or open entry has no certificate.
+    """
+    path = config_path if config_path is not None else Path.home() / ".shed" / "config.yaml"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    servers = data.get("servers") if isinstance(data, dict) else None
+    entry = servers.get(name) if isinstance(servers, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    cert, key = entry.get("client_cert_file"), entry.get("client_key_file")
+    if not cert or not key:
+        return None
+    return str(cert), str(key)
 
 
 # A shed-server version string, as `GET /api/info` reports it: goreleaser's
@@ -255,12 +279,13 @@ class LocalServer:
         """The server's version string from `GET /api/info`, or None.
 
         Reads the endpoint the CLI itself uses (the entry's `endpoint` in
-        `shed --json server list`). `/api/info` is unauthenticated in open and
-        token mode; a token-mode server's TLS certificate is pinned by the CLI,
-        not by a CA, so the read skips verification — it only needs the
-        version string. Under mtls the handshake needs a client certificate
-        and fails, so the version is unknown (None) there, as it is for any
-        unreachable server.
+        `shed --json server list`). A TLS server's certificate is pinned by the
+        CLI, not by a CA, so the read skips verification — it only needs the
+        version string. An mtls listener refuses a handshake without a client
+        certificate, so the entry's own certificate (`client_cert_pair`) is
+        presented when it has one; the `available()` probe has just renewed it
+        if it was near expiry. Without one the version is unknown (None), as it
+        is for any unreachable server.
         """
         entry = resolve_server_entry(self.name)
         endpoint = entry.get("endpoint") if entry else None
@@ -272,6 +297,14 @@ class LocalServer:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            pair = client_cert_pair(self.name)
+            if pair is not None:
+                try:
+                    ctx.load_cert_chain(*pair)
+                except OSError:
+                    # Unreadable or mismatched files: try without, which an
+                    # open or token server still answers.
+                    pass
         try:
             with urllib.request.urlopen(url, timeout=timeout, context=ctx) as resp:
                 info = json.loads(resp.read().decode("utf-8"))
@@ -520,6 +553,68 @@ class LocalServer:
             raise AssertionError(
                 f"shed delete failed: exit={r.returncode} stderr={r.stderr}"
             )
+
+    # How long a clean-up delete may take, and how long a deleted shed may
+    # still be listed (a remote delete settles asynchronously). CloudServer
+    # widens both.
+    CLEANUP_DELETE_TIMEOUT = 120
+    CLEANUP_GONE_TIMEOUT = 60
+    CLEANUP_POLL_INTERVAL = 2
+
+    def shed_listed(self, name: str) -> Optional[bool]:
+        """Whether `shed --json list` on this entry lists `name`; None when
+        the list itself failed (so nobody can say the shed is gone)."""
+        try:
+            r = self.cli("--json", "list", timeout=60)
+        except subprocess.TimeoutExpired:
+            return None
+        if r.returncode != 0:
+            return None
+        try:
+            sheds = json.loads(r.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(sheds, list):
+            return None
+        return any(isinstance(s, dict) and s.get("name") == name for s in sheds)
+
+    def ensure_deleted(self, name: str, *, earlier: Optional[list[str]] = None) -> None:
+        """Clean-up that cannot pass quietly: delete `name` through this CLI
+        entry (an admin's, or the implicit user's, so it may delete any
+        shed) unless it is already gone, then VERIFY that it is gone,
+        polling while a delete settles. Raises AssertionError naming the
+        shed and the server, with every failed attempt (`earlier` holds the
+        caller's own), when it is still listed or the list cannot be read:
+        a shed left behind may be a billed cloud VM.
+
+        A name that was never created is fine: it is simply not listed."""
+        problems = list(earlier or [])
+        if self.shed_listed(name) is not False:
+            try:
+                r = self.cli("delete", name, "-f", timeout=self.CLEANUP_DELETE_TIMEOUT)
+                if r.returncode != 0:
+                    problems.append(
+                        f"`shed -s {self.name} delete {name} -f` exited {r.returncode}: "
+                        f"{(r.stderr or r.stdout).strip()[-500:]!r}"
+                    )
+            except subprocess.TimeoutExpired:
+                problems.append(
+                    f"`shed -s {self.name} delete {name} -f` timed out after {self.CLEANUP_DELETE_TIMEOUT} s"
+                )
+        deadline = time.monotonic() + self.CLEANUP_GONE_TIMEOUT
+        while True:
+            listed = self.shed_listed(name)
+            if listed is False:
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self.CLEANUP_POLL_INTERVAL)
+        state = "is still listed" if listed else "could not be confirmed gone (`shed --json list` failed)"
+        raise AssertionError(
+            f"CLEAN-UP FAILED: shed {name!r} on server {self.name!r} {state}; it may still be running "
+            f"(and, on a remote backend, billed). Delete it by hand: shed -s {self.name} delete {name} -f. "
+            f"Attempts: {'; '.join(problems) or 'none failed'}"
+        )
 
     def list_shed_names(self) -> list[str]:
         """Return the list of shed names known to the server.
@@ -906,6 +1001,10 @@ class CloudServer(LocalServer):
     The log is the dev server's own file (`~/.shed/dev-remote/server.log`),
     read like any `LocalServer` log.
     """
+
+    # A cloud delete takes about a minute and settles asynchronously.
+    CLEANUP_DELETE_TIMEOUT = 600
+    CLEANUP_GONE_TIMEOUT = 300
 
     def __init__(
         self,

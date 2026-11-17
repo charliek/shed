@@ -1,70 +1,87 @@
 # Security
 
-shed-server has three postures, selected by a single switch:
+shed-server has two postures, selected by a single switch:
 
 ```yaml
 auth:
-  mode: open      # open (default) | token | mtls
+  mode: open      # open (default, loopback only) | mtls
 ```
 
-!!! note "`secure` is a deprecated alias"
-    The mode value `secure` is still accepted and normalized to `token` at load
-    time, with a one-time stderr deprecation warning. New configs should write
-    `token`.
+- **`open`** (the default) serves plain HTTP only, with no HTTP credential and
+  no TLS, and **binds loopback only**: it is a local-development posture. A
+  non-loopback `bind_address` in open mode fails config load. The SSH allowlist
+  is the one tunable layer here (`auth.ssh.mode: off|warn`, where `warn` stages
+  an allowlist before you enforce it).
+- **`mtls`** is the posture for anything reachable from another host. It
+  derives the whole hardening bundle (SSH allowlist enforced, a client
+  certificate required on every request, TLS-only with no plain-HTTP listener)
+  and **refuses to start** without an SSH key source, so a server is never
+  half-hardened on a network address. The client credential is a short-lived
+  certificate bound to a private key that never leaves the client's device,
+  issued over SSH. See [mTLS mode](#mtls-mode).
 
-- **`open`** (the default) serves plain HTTP only — no HTTP token, no TLS — and
-  binds loopback by default, so out of the box it is **local-development-only**.
-  It is also fine on a private network (a Tailscale tailnet or trusted LAN) where
-  the network is the security boundary, but exposing it there is explicit: set a
-  routable `bind_address` *and* `allow_insecure_exposure: true`. The SSH allowlist
-  is the one independently-tunable layer here (`auth.ssh.mode: off|warn`, where
-  `warn` stages an allowlist before you commit to enforcing it).
-- **`token`** is for an internet-facing deployment. It derives the whole
-  hardening bundle (SSH allowlist enforced + HTTP tokens enforced + TLS-only,
-  with no plain-HTTP listener) and **refuses to start** without an SSH key
-  source, so a server is never half-hardened on a public address. Two invariants
-  hold: **tokens ⟺ TLS ⟺ token** and **https ⟺ token**.
-- **`mtls`** replaces the bearer token with a client certificate bound to a
-  private key that never leaves the client's device. It inherits every `token`
-  invariant (SSH enforce, key source at preflight, TLS-only, `https_port`
-  default) and is the **recommended posture for anything internet-facing** — see
-  [mTLS mode](#mtls-mode) below.
+| `auth.mode` | SSH allowlist | HTTP credential | Plain-HTTP listener | TLS | `bind_address` |
+|-------------|---------------|-----------------|---------------------|-----|----------------|
+| `open` | as configured (`auth.ssh`: `off`/`warn`) | none | served | none (`https_port` is refused) | loopback only |
+| `mtls` | **forced `enforce`** (needs a key source) | client certificate, issued over SSH | **none: TLS-only** | **on, `RequireAndVerifyClientCert`** (`https_port` defaults to 8443) | loopback by default; any address you set |
 
-| `auth.mode` | SSH allowlist | HTTP credential | Plain-HTTP listener | TLS |
-|-------------|---------------|-------------|---------------------|-----|
-| `open` | as configured (`auth.ssh`: `off`/`warn`) | none | served (bound to `bind_address`) | none (`https_port` requires `token`/`mtls`) |
-| `token` | **forced `enforce`** (needs a key source) | bearer token, minted over SSH | **none — TLS-only** | **on** (`https_port` defaults to 8443) |
-| `mtls` | **forced `enforce`** (needs a key source) | client certificate, issued over SSH | **none — TLS-only** | **on, `RequireAndVerifyClientCert`** (`https_port` defaults to 8443) |
+Two invariants hold: **credential ⟺ TLS ⟺ mtls** and **https ⟺ mtls**. A
+client can therefore treat an `https://` `api_url` as proof that the server
+requires a credential.
 
-Every listener (plain HTTP, HTTPS, SSH) binds the single `bind_address`, which
-**defaults to loopback (`127.0.0.1`) in every mode** — shed is local-first.
-Facing the network is opt-in: set `bind_address` to a routable address, and in
-**open** mode also set `allow_insecure_exposure: true` (open has no transport
-security). Token and mtls modes need no acknowledgment to bind the network.
+The bearer-token mode (`auth.mode: token`, also spelled `secure`) and
+`allow_insecure_exposure` were removed in v0.10.0 and now fail config load;
+see [Removed in v0.10.0](#removed-in-v0100).
 
 All server settings live in the server config (`/etc/shed/server.yaml` on
 Linux, `~/.config/shed/server.yaml` on macOS). Client settings live per server
 entry in `~/.shed/config.yaml`.
 
-Beyond the posture, this page covers what a shed itself can reach and who can
-drive it: [service clients](#service-clients) (orchestrators limited to their
-own sheds, in mtls mode), [mount selection](#mount-selection) (which host
+Beyond the posture, this page covers who a caller is and what they may reach:
+[users and keys](#users-and-keys), [ownership](#ownership) of sheds and
+snapshots, the [credential bus](#credential-bus) and the one machine that
+answers it for each user, [service clients](#service-clients) (orchestrators
+limited to their own sheds), [mount selection](#mount-selection) (which host
 directories a shed gets) and [network profiles](#network-profiles) (on
 Firecracker, an `isolated` shed reaches the internet and, beyond it, only its
 own ports on the gateway, any `network.allow_cidrs`, and what its egress proxy
 dials for it).
 
-## SSH key allowlist
+## Users and keys
 
-By default any public key is accepted (the username still selects the shed).
-`auth.ssh` restricts which keys may connect; `auth.mode: token` forces
+Identity comes from the SSH key a client authenticates with, GitHub-style. The
+SSH username only selects the shed (or the reserved `_bootstrap` channel); it
+never says who the caller is.
+
+A server either has **no user list**, and then every accepted key is one
+**implicit user**, an admin, exactly as before users existed, or it has a list
+under [`auth.users`](configuration.md#users), and then every key belongs to
+exactly one named user.
+
+| | No user list | `auth.users` |
+|---|---|---|
+| Key sources | `auth.ssh`: `github_users`, `authorized_keys`, `authorized_keys_file` | `auth.users.<name>.github` and `.keys`; `auth.ssh` key sources are refused beside it |
+| Modes | `open` or `mtls` | `mtls` only |
+| Who a key is | the implicit user, an admin | the user it is listed under, with that user's `admin` flag |
+| Sheds a caller reaches | every shed | their own; an admin also lists, stops and deletes others' (see [Ownership](#ownership)) |
+| Unknown key | refused in `enforce`, let in as the implicit user in `off` and `warn` | refused in every SSH mode |
+
+With a user list a user's key is a plain public key: a client that presents an
+SSH certificate is refused, and a certificate listed as a key fails config
+load. The [Multi-user server guide](../guides/multi-user-server.md) walks through
+adding a user list.
+
+### SSH key allowlist (no user list)
+
+By default (open mode) any public key is accepted and is the implicit user.
+`auth.ssh` restricts which keys may connect; `auth.mode: mtls` forces
 `enforce`.
 
 ```yaml
 auth:
   ssh:
     mode: enforce            # off | warn | enforce
-    github_users: [charliek] # seed from https://github.com/<user>.keys
+    github_users: [alice-gh] # each login's keys, pinned to its GitHub account id
     authorized_keys:         # inline OpenSSH authorized_keys lines
       - ssh-ed25519 AAAA... laptop
     authorized_keys_file: ~/.shed/authorized_keys
@@ -75,394 +92,332 @@ auth:
 | Mode | Behavior |
 |------|----------|
 | `off` | Accept every key (the `open`-mode default). |
-| `warn` | Log would-deny attempts but still accept — useful while building the list. |
-| `enforce` | Reject keys not in the allowlist (forced in `token` mode). |
+| `warn` | Log `SSH auth WOULD DENY (warn mode)` for a key not on the list, but still accept it. Open mode only; useful while building the list. |
+| `enforce` | Reject keys not on the list. Forced in `mtls` mode, and valid only there. |
 
-GitHub-seeded keys are fetched at startup and on `github_refresh`, cached to
-`{state_dir}/github_keys/<user>`, and kept as last-known-good if GitHub is
-unreachable. **`enforce` with no resolvable keys fails startup** — the server
-never starts with an empty allowlist (which would lock everyone out) and never
-silently falls back to accept-all.
+**`enforce` with no resolvable keys fails startup**: the server never starts
+with an empty allowlist (which would lock everyone out) and never falls back
+to accept-all. `github_refresh` and `max_auth_tries` also apply to a server
+with a user list.
 
-`github_users` is the recommended identity source: it ties shed access to your
-GitHub keys, which you already rotate — and, as below, the same allowlist is
-what mints and revokes HTTP tokens.
+### GitHub logins are pinned to their account id
 
-## HTTP tokens are minted over SSH
+A GitHub login (`auth.ssh.github_users`, or `auth.users.<name>.github`) is
+followed by its **numeric account id**, not its name: a login can be renamed,
+deleted and registered again by someone else, and the id cannot. At the
+login's first successful fetch the server records the id in
+`{state_dir}/github_pins.json` and from then on accepts the login's keys only
+from a fetch that shows the login still names that id.
 
-This section describes **token** mode. In **mtls** mode there are no bearer
-tokens at all — skip ahead to [mTLS mode](#mtls-mode).
+- **What a fetch does.** It asks `api.github.com` for the login's account id
+  (`GET /users/<login>`), compares it with the pin, and reads the keys of that
+  id (`GET /user/<id>/keys`, every page). This happens at start, every
+  `github_refresh` (default 1h), and on `shed users refresh`. `api.github.com`
+  is an outbound dependency of a server that follows GitHub logins; the
+  requests are unauthenticated and send the User-Agent `shed-server`.
+- **The pin is written first.** It is written durably before any key from that
+  fetch is accepted, and a failed pin write accepts nothing new.
+- **A mismatch drops the login's keys.** A login that now names another
+  account, or no account (a 404 for a pinned login), contributes no keys; they
+  are logged and do not come back from memory or the key cache. To follow a
+  re-created account on purpose, set `auth.users.<name>.github_id` (it wins
+  over the stored pin), or remove the login's entry from `github_pins.json`.
+- **GitHub unreachable or rate-limited.** The last known keys stay and no new
+  key is accepted.
+- **A damaged `github_pins.json` stops the server from starting.** The message
+  names the file: restore it, or move it aside to pin every login again at its
+  next fetch.
+- **A new key on the account** is accepted at the next fetch and logged.
+- **An unknown key.** In `enforce` mode, an unknown key offered for
+  `_bootstrap` or for a validly formed shed name triggers at most one refetch a
+  minute for the whole server; the login that takes that slot waits up to 5 s.
+  The refetch reads `github.com/<login>.keys` only to notice a change, and
+  accepts nothing from it; the REST API requests it leads to have their own
+  budget of 20 an hour, so strangers cannot spend the scheduled refreshes'
+  allowance. An expired key, a key dropped for a mismatch and the username
+  `git` never trigger it.
 
-There is no `shed-server token new` and no static `auth.http.tokens` list.
-Instead, a client that already holds an allowlisted SSH key mints a token over a
-reserved **`_bootstrap`** SSH channel, and the server tracks it:
+The per-login key cache, `{state_dir}/github_keys/<login>.keys`, keeps its
+name and format, and is trusted only when it matches the hash stored with the
+pin.
 
-```bash
-shed server add shed.example.com --https-port 8443
-#  → pins the SSH host key + TLS cert, then SSHes as _bootstrap@host with your
-#    key and writes the minted control token into ~/.shed/config.yaml.
-```
+### Expired keys and script keys
 
-Under the hood `shed server add` connects as `_bootstrap@<host>` over the pinned
-host key. The server **re-verifies the allowlist** for that key (the bootstrap
-channel requires `auth.ssh.mode: enforce`), mints a scoped token, and returns a
-bundle the CLI persists:
+On a server with users, each key listed under `auth.users.<name>.keys` has a
+`label` and may also have:
 
-```json
-{ "http_port": 8080, "https_port": 8443, "tls_cert_fingerprint": "sha256:…",
-  "token": "shed_control_…", "scope": "control",
-  "token_id": "…", "expires_at": "2026-06-15T00:00:00Z" }
-```
+- **`expires`**: an RFC 3339 time, or a date (`2027-06-30`, which means the
+  end of that day in UTC). From then on the key is refused at the SSH
+  handshake, at the TLS handshake and on every API request. Channels and
+  streams already open when it expires stay open. A server that starts with an
+  expired key logs it.
+- **`script: true`**: the key belongs to automation, not a person. It reaches
+  the user's sheds like any of the user's keys, but it cannot take a
+  `credentials` certificate at `_bootstrap` (`bootstrap: a script key cannot
+  take the credentials scope`), subscribe to or answer on the credential bus
+  (`403 FORBIDDEN`), or see or move the user's [credential
+  source](#one-machine-answers-for-each-user) (`403 FORBIDDEN`, the read
+  included).
 
-Tokens have the shape `shed_<scope>_<base64url-random>`. They are **opaque and
-server-tracked**: the server stores only a SHA-256 hash (the plaintext never
-touches disk), alongside a non-secret `token_id`, the subject key fingerprint,
-the scope, and an expiry.
+### When a key is checked
 
-| Scope | Grants |
-|-------|--------|
-| `control` | The control plane (lifecycle, images, sessions, snapshots), the Connect tunnel for `shed forward`, and the egress audit stream. |
-| `credentials` | The credential bus (`/api/plugins/*`) — live SSH signatures and cloud credentials — plus the Connect tunnel and the egress audit stream (used by the host-agent's reverse proxy / egress subscriber). |
+The key's identity is resolved again for **every new SSH channel** (a session,
+sftp, a forwarded port, a wake, `_bootstrap`) and, in mtls mode, on **every
+API request**, against the live key set. A key that is removed from the
+config or a GitHub account, expires, or loses its pin therefore opens no new
+channel and makes no new request. Channels, SSE streams and Connect tunnels
+that are already open stay open until they end.
 
-(The pre-v0.7.1 `admin` scope is removed.) Under `token` mode every request needs
-a matching `Authorization: Bearer` token of the required scope. The bus requires
-`credentials`, so a leaked `control` token cannot reach the live-secret bus; the
-Connect tunnel and the egress audit stream accept **either** scope (the CLI uses
-`control`, the host-agent's proxy / egress subscriber uses `credentials`).
-`GET /api/info` stays reachable without a
-token so `shed server add` can read the auth mode and ports before the operator
-holds one.
+## Ownership
 
-### Short TTL, transparent refresh
+Every shed and snapshot records a `user`: the person it belongs to, or none.
+Separately, a shed a [service client](#service-clients) creates records that
+client as its `owner`. A shed has a user or an owner, never both.
 
-Minted tokens are short-lived — `auth.token_ttl`, default **24h**:
+On a server with **no user list** every caller is the implicit user and may do
+everything to every shed, whatever its record says. The rest of this section
+applies to a server with `auth.users`.
 
-```yaml
-auth:
-  mode: token
-  token_ttl: 24h
-```
+### Who may do what
 
-Every client refreshes transparently, so the TTL is invisible in normal use:
+| Caller | Their own shed | Another user's shed | A service client's shed | A shed with no user |
+|---|---|---|---|---|
+| A user | everything | invisible: `404` | invisible: `404` | invisible: `404` |
+| An admin | everything | list, view, stop, delete; **not** enter | everything | list, view, stop, delete; **not** enter |
+| A service client | n/a | invisible: `404` | its own only | invisible: `404` |
 
-- **CLI** — re-bootstraps when the stored token is near expiry, and on a `401`
-  it refreshes and retries the request once. The expiry is tracked in the
-  client config as `control_token_expires_at`.
-- **host-agent** — mints its **own** `credentials` token over the same SSH
-  bootstrap channel using its identity key, and refreshes on a jittered ~50% of
-  the TTL. It no longer reads a static `credentials_token` from config.
-- **shed-desktop** — requests a `control` token from the local host-agent (over
-  the host-agent's Unix socket) and refreshes near expiry / on `401`.
-- **background tunnels** (`shed tunnels start -d`) — the detached daemon re-mints
-  its `control` token the same way (proactively near expiry, reactively on a
-  `401`); once running those re-mints are **in memory only**, so a multi-day daemon
-  never rewrites `~/.shed/config.yaml` and can't clobber a concurrent foreground
-  edit. It re-mints non-interactively (SSH `BatchMode`), so it needs SSH access
-  without a prompt — an agent that outlives the launching terminal, or a
-  passphrase-less / agent-loaded key.
+**Enter** means start, exec, a shell, sftp, a forwarded port or tunnel,
+sessions, reset, egress set and off, and a snapshot of the shed. An admin who
+may view but not enter a shed gets `403 FORBIDDEN` with a message saying so,
+and over SSH the line `shed '<name>' belongs to another user; an admin can
+list, stop and delete it but not enter it`. A record an admin views this way
+has no `repo` and no `landing_dir`, since a clone URL can carry a token.
 
-### Revocation follows the allowlist
+"An admin cannot enter" guards against a stolen admin credential, not against
+the admin, who controls the host directories, server mounts and images every
+shed runs on.
 
-You do not revoke tokens by hand. When a key leaves the SSH allowlist — removed
-from `authorized_keys`, or dropped from a `github_users` account on the next
-`github_refresh` — the server purges every token minted for that subject. The
-revocation latency is therefore the allowlist's own refresh latency
-(`github_refresh` + TTL for GitHub-sourced keys); it is not instantaneous, and
-it never fires on a transient GitHub fetch failure (the last-known-good
-allowlist is retained, so a network blip cannot mass-revoke valid tokens).
+**Invisible** means the same answer as a shed that does not exist: `404
+SHED_NOT_FOUND` on the API and `Error: shed '<name>' not found` over SSH, so
+nobody learns which names other users hold. A list holds only the sheds the
+caller may view. An SSH connection to a shed the caller may not enter does not
+start it.
 
-Clients carry their (auto-managed) token in `~/.shed/config.yaml`:
+**Names are unique per server, across users.** Creating a shed under a name
+someone else holds answers the usual `409 SHED_ALREADY_EXISTS`, worded the same
+whoever holds it.
 
-```yaml
-servers:
-  my-server:
-    api_url: https://shed.example.com:8443
-    tls_cert_fingerprint: sha256:<hex>
-    control_token:            shed_control_xxxxx   # written by `server add`
-    control_token_expires_at: 2026-06-15T00:00:00Z # refresh hint
-```
+**Snapshots** belong to their user. A snapshot records the user of the shed it
+was taken from, and a shed created from a snapshot belongs to whoever creates
+it. A user sees and uses only their own snapshots (another's answers `404
+SNAPSHOT_NOT_FOUND`). An admin may list, view and delete any snapshot and
+create a shed from one with no user, but not from another user's. A service
+client reaches no snapshot.
 
-There is no client `credentials_token`: the host-agent mints its own.
+### Admin-only resources
 
-## Native pinned TLS
+What the host shares belongs to admins. A user who is not an admin may not:
 
-shed uses **pinned self-signed TLS** for the *server's* identity — no public
-CA, no domain, no ACME. The server generates a self-signed certificate on
-first start (the same lifecycle as the SSH host key) and clients pin it by
-the SHA-256 fingerprint of its DER encoding, exactly the trust model SSH host
-keys use. `auth.mode: token` and `auth.mode: mtls` both turn this on by
-default (`https_port` defaults to `8443`).
+| Resource | What happens |
+|---|---|
+| Host directories (`local_dir`, `add_dirs`; `--local-dir`, `--add-dir`) | `403 FORBIDDEN` (`admin only: local_dir`) |
+| Server mounts (a named `mounts` entry) | `403 FORBIDDEN`; a create that omits `mounts` gets none |
+| An image other than the server default or an `image_aliases` name | `403 FORBIDDEN` |
+| The image store (tag, pull, push, delete, prune) and `system prune` | `403 FORBIDDEN` |
+| Egress profile changes | `403 FORBIDDEN` |
+| `env_file` | not refused: the user's `repo` clone simply never gets the variables |
 
-This is a **separate mechanism from the small internal CA** mtls mode uses to
-sign *client* certificates (see [mTLS mode](#mtls-mode)) — the server's own
-leaf and how clients pin it are unchanged by mtls; only the client-credential
-side changes from a bearer token to a certificate.
+A user who is not an admin also may not **enter or start** a shed that carries
+host directories or server mounts, even their own (one made while they were an
+admin): they may still stop and delete it. On Firecracker and VZ a shed stored
+before mount selection existed counts as carrying server mounts.
 
-```yaml
-https_port: 8443                 # the pinned-TLS listener (token/mtls mode serves HTTPS only)
-tls_names:                       # extra SANs so hostname verification passes
-  - shed.example.com
-  - 203.0.113.10
-# localhost, 127.0.0.1, ::1 are always included.
-```
+`GET /api/system/df` shows a user who is not an admin only their own sheds and
+snapshots and no orphans; the totals are the server's.
 
-`shed server add` pins the fingerprint automatically (it is in the bootstrap
-bundle). All clients verify by pin: the Go CLI and sdk via
-`VerifyPeerCertificate`, the desktop via `URLSessionDelegate`, and `curl` via
-`--pinnedpubkey` alongside the cert handed in with `--cacert` (with OpenSSL,
-`--cacert` alone can leave the system CA directory trusted; see the
-[orchestrated sheds guide](../guides/orchestrated-sheds.md#4-call-the-api)).
-A client that configures a pin but a
-non-`https` URL **fails closed** rather than sending plaintext.
+### Sheds with no user
 
-**Rotation.** Changing `tls_names` regenerates the certificate (new
-fingerprint). Re-pin clients with:
+Sheds and snapshots created before the server had a user list have no user.
+On the first start with a user list, a server with **exactly one** user gives
+them all to that user (a shed with host directories or server mounts only if
+that user is an admin) and logs each. With several users nothing is given
+away: only an admin sees such a shed, nobody enters it, and an admin gives it
+to a user with [`shed assign`](cli.md#shed-assign). A marker,
+`{state_dir}/users-upgrade.json`, records that this one-time step ran. The
+[Multi-user server guide](../guides/multi-user-server.md#sheds-with-no-user)
+has the details.
 
-```bash
-shed server update my-server --tls-fingerprint sha256:<new>   # pin out-of-band
-shed server update my-server --refetch                        # fetch + re-pin (TOFU)
-```
+### The reserved name `git`
 
-Rotating an existing pin in a non-interactive session requires
-`--trust-on-first-use`, so a re-pin is never silently accepted.
+A shed's SSH username on shed-server is its name, and a user's machine signs
+SSH logins for the username `git` by default so that git over SSH keeps
+working. So `git` cannot name a shed:
 
-## Network surface
+- Creating a shed named `git` answers `400 INVALID_SHED_NAME` (`shed name
+  "git" is reserved`), on every backend and from a snapshot too.
+- An SSH login as `git` is refused, in every SSH mode, before any key lookup.
+- A shed named `git` made before this can still be listed, stopped,
+  snapshotted and deleted over the API; SSH to it is refused, and the server
+  warns at start. Snapshot it and recreate it under another name, or delete it.
 
-There is **one HTTP listener per mode** (SSH always listens separately on
-`ssh_port`): a single plain-HTTP listener in open mode, or a single pinned-TLS
-(`https_port`) listener in `token`/`mtls` mode — in either enforced mode there
-is **no plain-HTTP listener at all**. The credential bus (`/api/plugins/*`)
-and the Connect tunnel (`/api/sheds/*/connect/*`) ride that same listener; in
-an enforced mode the bus is gated by the `credentials` scope (so a leaked
-`control` credential can't reach it) while the Connect tunnel accepts control
-or credentials, and both travel over TLS. A co-located host-agent reaches the
-bus over `https://127.0.0.1:8443` with the pinned cert (in mtls mode, its own
-credentials-scope client certificate). There is no separate internal/loopback
-listener. These knobs shape what is reachable where:
+### Shed names on the wire
 
-| Field | Effect |
-|-------|--------|
-| `bind_address` | Interface every listener (plain HTTP, HTTPS, SSH) binds to. **Defaults to loopback (`127.0.0.1`) in every mode.** Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. |
-| `allow_insecure_exposure` | Required to bind a **non-loopback** `bind_address` in **open** mode (no transport security). Ignored in token/mtls mode and for loopback binds. |
-| `https_port` | The HTTPS listener (bound to `bind_address`) serving the control plane, credential bus, and Connect tunnel over pinned TLS. **Requires `token` or `mtls` mode**; defaults to `8443` there. |
-| `trusted_proxy` | Trust `X-Forwarded-For` (only safe behind a proxy that overwrites it). Default false uses the real TCP peer, so a source IP can't be forged to evade per-IP controls. |
-
-## Connection flow — what's encrypted where
-
-| Hop | open mode | token mode | mtls mode |
-|-----|-----------|-------------|-----------|
-| Control-plane / bus HTTP | plain `http://` (the network is the trust boundary) | pinned `https://` only — a client that holds a pin but is given a non-`https` URL **fails closed** rather than sending plaintext | pinned `https://`, client presents a certificate at the handshake; a peer with no cert never completes the handshake |
-| SSH (shed sessions + the `_bootstrap` issuance channel) | encrypted; host key pinned in `known_hosts` | same | same |
-| Credential mint/issuance | n/a (no credential) | bearer token, over the pinned-host-key SSH `_bootstrap` channel | client certificate, over the same `_bootstrap` channel (CSR in, signed cert out) |
-
-In token and mtls modes **nothing plaintext faces the network**: there is no
-plain-HTTP listener at all (see [Network surface](#network-surface)), and the
-only trust-on-first-use moment is `shed server add` fetching the SSH host key
-and TLS/CA fingerprints to show you for confirmation (or pass
-`--tls-fingerprint` / `--fingerprint` to verify out-of-band). After that, every
-byte travels over pinned TLS or pinned-host-key SSH — the flow never depends on
-an unverified or plaintext response.
-
-## Credential bus
-
-The credential bus brokers live secrets (SSH signatures, AWS/Docker
-credentials) between a shed VM and a host-side agent. Beyond the
-`credentials`-scope gate, the server defends against **response injection** at
-the registry, below the HTTP handler.
-
-When a request is dispatched to the registered listener, the registry records it
-as pending, keyed by `(namespace, shed, requestID)` — and the requestID (a
-UUIDv7) is delivered **only** to that listener over its SSE stream. A
-`POST /respond` is honored only if it matches an outstanding pending request:
-
-- A forged response (a made-up requestID) has no pending entry → **dropped**.
-- A response is consumed on its final reply → a **replay** is dropped.
-- When the listener disconnects, its un-acked pending requests are **retained**
-  and **re-delivered** when a listener re-subscribes, so a host-agent that
-  reconnects across a blip doesn't strand an in-flight credential request.
-  Re-subscribing requires the `credentials` token and the namespace allows only
-  one listener at a time (a second subscriber is rejected `409`), so only the
-  same credential holder can ever receive the re-delivery; stale pending is
-  swept after a retention TTL.
-
-This ownership tracking is enforced whenever HTTP auth is on (i.e. `token`
-mode); with auth off (the `open` default) the bus behaves exactly as before, and
-without re-delivery.
-
-The bus is **always off for a shed a [service client](#service-clients) owns**
-(not a policy option): the server drops that shed's plugin messages before they
-reach a listener, refuses to send it any, and leaves it out of
-`GET /api/plugins/sheds`. An owned shed can never ask the host for an SSH
-signature or a cloud credential.
-
-## Token mode
-
-`auth.mode: token` is the internet-facing posture. It derives the full bundle
-and **refuses to start** if a piece is missing, naming the first gap — so you
-can't half-deploy to a public address.
-
-```yaml
-auth:
-  mode: token
-  ssh:
-    github_users: [charliek]   # an SSH key source is required
-```
-
-What `token` derives:
-
-| Derived | Why |
-|---------|-----|
-| `auth.ssh.mode: enforce` | Only allowlisted keys may SSH in — and that allowlist is what mints/revokes HTTP tokens. **Requires** a key source (`github_users`, `authorized_keys`, or `authorized_keys_file`), else startup fails. |
-| HTTP auth enforced | Every HTTP request needs a bearer token; the credential bus is gated by the `credentials` scope. |
-| `https_port: 8443` | The network-facing API is pinned TLS. |
-| no plain-HTTP listener | Token mode serves **no** plain-HTTP listener at all (not even on loopback) — only the pinned-TLS listener faces clients. On-box tooling (a co-located host-agent) reaches the control plane and credential bus over `https://127.0.0.1:8443` with the pinned cert; there is no plaintext channel. |
-
-The whole flow is hands-off: enable `token`, list your `github_users`, and a
-client runs one `shed server add` to pin TLS and mint its token. See the
-[Public VPS Deployment](../guides/vps-deployment.md) guide for a complete
-walkthrough.
-
-### Removed in v0.7.1
-
-These pre-v0.7.1 keys are **rejected at startup** (the server names them and
-exits) so an old config can't silently weaken a deployment:
-
-| Removed | Replacement |
-|---------|-------------|
-| `public_exposure: true` | `auth.mode: token` (derives the same bundle). |
-| `auth.http.tokens` (static list) + `shed-server token new` | Tokens minted over the `_bootstrap` SSH channel by `shed server add`. |
-| `admin` scope | `control` + `credentials` only. |
-| client `credentials_token` | The host-agent mints its own `credentials` token. |
-
-See [Upgrading v0.7.0 → v0.7.1](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.0-to-v0.7.1.md) for the migration.
-
-### Removed/changed in v0.7.2
-
-v0.7.2 collapses the intermediate states beneath `auth.mode` so that
-`tokens ⟺ TLS ⟺ token` and `https ⟺ token` always hold. These are **rejected
-at startup**:
-
-| Removed / invalid | Replacement |
-|-------------------|-------------|
-| `auth.http.mode` (the whole `auth.http` block) | HTTP enforcement derives from `auth.mode: token`. |
-| `https_port` under `auth.mode: open` | Use `token` (defaults `https_port` to 8443), or drop it. |
-| `auth.ssh.mode: enforce` under `open` | Use `token`, or `warn` to stage. |
-| `auth.ssh.mode: off`/`warn` under `token` | Remove it — token forces `enforce`. |
-
-Plus a behavior change: **token mode no longer serves a loopback plain-HTTP
-listener** (TLS-only). See [Upgrading v0.7.1 → v0.7.2](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md).
-
-### Removed/changed in v0.7.4
-
-v0.7.4 collapses to a single listener per mode and makes shed local-first. These
-are **rejected at startup**:
-
-| Removed / renamed | Replacement |
-|-------------------|-------------|
-| `internal_http_port` | Removed — the credential bus (credentials scope) and Connect tunnel (control or credentials) ride the single listener in token mode; a co-located host-agent reaches them over `https://127.0.0.1:8443`. |
-| `http_bind` / `ssh_bind` | A single `bind_address` governs every listener (HTTP, HTTPS, SSH). |
-
-Plus a behavior change: **`bind_address` defaults to loopback (`127.0.0.1`) in
-both modes** (previously unset = all interfaces), and `http_port` is optional in
-token mode. A non-loopback bind in open mode now requires
-`allow_insecure_exposure: true`; token mode binds the network without an ack.
-See [Upgrading v0.7.3 → v0.7.4](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md).
+Apart from the reserved `_bootstrap` enrollment channel, an SSH username must
+be a valid shed name (lowercase letters, digits and hyphens, starting with a
+letter); anything else, an empty username or a differently cased name such as
+`Git` included, gets the unknown-shed answer. Every channel of a
+connection (a session, sftp, a port forward) is routed by the username the
+connection authenticated with. The same holds on the API: a route under
+`/api/sheds/{name}` or `/api/egress/{name}` whose name is not a valid shed name
+answers `404 SHED_NOT_FOUND` before anything else is checked, so a
+case-insensitive macOS volume cannot be used to reach a shed under a second
+spelling.
 
 ## mTLS mode
 
-`auth.mode: mtls` is the **recommended posture for anything internet-facing**
-(and the intended eventual default). It inherits every `token`-mode invariant
-— SSH allowlist forced to `enforce`, an SSH key source required at preflight,
-TLS-only serving, `https_port` defaulting to `8443`, no acknowledgment needed
-to bind the network — and replaces the bearer token with a **client
-certificate bound to a private key that never leaves the client's device**,
-issued over the same already-authenticated `_bootstrap` SSH channel that mints
-tokens in `token` mode.
+`auth.mode: mtls` is the posture for anything reachable from another host.
+It forces the SSH allowlist to `enforce`, requires an SSH key source at
+startup (`auth.users`, or one of `auth.ssh`'s), serves TLS only with
+`https_port` defaulting to `8443`, needs no acknowledgment to bind the
+network, and authenticates every request with a **client certificate bound
+to a private key that never leaves the client's device**.
 
 ```yaml
 auth:
   mode: mtls
   ssh:
-    github_users: [charliek]   # an SSH key source is required, same as token mode
+    github_users: [alice-gh]   # a key source is required (or auth.users)
 ```
 
-### What it guarantees — precisely
+### Enrollment over SSH
+
+There is no `shed-server cert new` and no static credential list. A client
+that already holds an allowed SSH key enrolls over a reserved **`_bootstrap`**
+SSH channel:
+
+```bash
+shed server add shed.example.com
+#  → pins the SSH host key, then SSHes as _bootstrap@host with your key,
+#    sends a CSR, and writes the issued certificate under ~/.shed/creds/.
+```
+
+The server re-checks the key for that channel, signs the CSR with a small
+internal CA and returns a bundle the CLI persists:
+
+```json
+{ "auth_mode": "mtls", "https_port": 8443, "tls_cert_fingerprint": "sha256:…",
+  "client_cert": "-----BEGIN CERTIFICATE-----\n…", "scope": "control",
+  "cert_serial": "…", "expires_at": "2026-06-15T00:00:00Z" }
+```
+
+| Scope | Grants |
+|-------|--------|
+| `control` | The control plane (lifecycle, images, sessions, snapshots, users, credential sources), the Connect tunnel for `shed forward`, and the egress audit stream. |
+| `credentials` | The credential bus (`/api/plugins/*`), plus the Connect tunnel and the egress audit stream (used by the host-agent's reverse proxy and egress subscriber). |
+
+The bus requires `credentials`, so a leaked `control` certificate cannot reach
+the live-secret bus, and a `credentials` certificate cannot manage the fleet
+or move a credential source.
+
+An open server answers every `_bootstrap` request with `bootstrap requires
+auth.ssh.mode: enforce`; the CLI then adds it over plain HTTP.
+
+There is no static credential to copy between machines. A certificate is
+issued to one client over SSH and its private key stays with that client, so a
+`~/.shed/config.yaml` entry written by hand cannot reach an mtls server: the
+entry comes from `shed server add`, or from a client re-enrolling on its own.
+`shed server add` therefore needs an allowed key at add time, and fails at once
+with `your SSH key is not in this server's allowlist` when it does not have
+one (see [CLI › shed server add](cli.md#shed-server-add)).
+
+**Clients older than v0.8.1** have no way to obtain a certificate. A CLI that
+sends no CSR is answered `this server requires auth.mode: mtls; upgrade shed
+(client certificate support)`. The desktop app, when it gets its credential
+through a `shed-host-agent` daemon, needs a daemon that answers
+`credential.get`: with an older daemon every request to an mtls server fails
+with `upgrade shed-host-agent — it is too old to obtain a client certificate
+for <server>`, and an app older than the daemon's protocol is told `this
+shed-desktop is too old to use one — upgrade the app`. Upgrade
+`shed-host-agent` before, or with, the desktop app.
+
+### Short TTL, transparent renewal
+
+Certificates are short-lived: `auth.token_ttl`, default **24h** (the name is
+kept from the removed token mode). Every client renews transparently, so the
+TTL is invisible in normal use:
+
+- **CLI**: re-enrolls when the stored certificate is near expiry, and on an
+  auth failure retries the request once after re-enrolling. The expiry is kept
+  in the client config as `client_cert_expires_at`.
+- **host-agent**: enrolls its **own** `credentials` certificate over the same
+  SSH channel with its identity key.
+- **background tunnels** (`shed tunnels start -d`): the detached daemon
+  re-enrolls the same way, **in memory only**, so a multi-day daemon never
+  rewrites `~/.shed/config.yaml`. It re-enrolls non-interactively (SSH
+  `BatchMode`), so it needs SSH access without a prompt.
+
+### What it guarantees, precisely
 
 The server's HTTPS listener runs `RequireAndVerifyClientCert` against a small
 internal CA (`ca_cert.pem` / `ca_key.pem`, generated on first mtls startup and
-persisted next to the SSH host key / TLS cert). The precise claim, stated
-carefully rather than oversold:
+persisted next to the SSH host key and TLS cert). The precise claim:
 
 - **An unauthenticated peer can never send an HTTP byte or reach the
-  router.** The TLS handshake itself enforces the certificate — Go's
+  router.** The TLS handshake itself enforces the certificate: Go's
   `net/http` never invokes a handler until `RequireAndVerifyClientCert`
-  passes, so there is no code path from "no cert" to a parsed request.
+  passes, so there is no code path from "no cert" to a parsed request. mtls
+  mode has no unauthenticated routes, `/api/info` included.
 - **The listener and the TLS `CertificateRequest` remain observable to a
   scanner.** A port scan still finds the port open, and `openssl s_client`
   still completes a TCP connection and sees the server ask for a client
-  certificate. Nothing about mtls mode makes the port *invisible* — the
-  guarantee is about what happens *after* the handshake starts, not whether
-  the port exists. Docs and error messages avoid the word "invisible" for
-  exactly this reason.
+  certificate. The guarantee is about what happens after the handshake
+  starts, not whether the port exists.
 
-Live-verified behavior (see the branch's validation transcripts): `curl -k`
-with no client certificate against an mtls server gets `http_code=000` and
-curl exit 56 — **no HTTP status is ever obtained**. `openssl s_client` shows
-the server send `Acceptable client certificate CA names` (the
-`CertificateRequest`) and then terminate with `tlsv13 alert certificate
-required` — the connection dies at the TLS layer, before any HTTP parsing.
-With the enrolled certificate, the same request returns `200`.
+`curl -k` with no client certificate against an mtls server gets
+`http_code=000` and curl exit 56: no HTTP status is ever obtained. `openssl
+s_client` shows the server send `Acceptable client certificate CA names` and
+then terminate with `tlsv13 alert certificate required`. With an enrolled
+certificate the same request returns `200`.
 
-### The certificate IS the credential
+### The certificate is the credential
 
-There are no bearer tokens in mtls mode: nothing mints them, the
-`Authorization` header is ignored (it cannot augment or substitute for a
-certificate's scope), and the token store is not wired. The certificate's
-subject carries the principal, composed entirely server-side from
-authenticated knowledge — a client cannot request an identity it doesn't
-hold:
+The `Authorization` header is never read: a bearer token can neither stand in
+for a certificate nor widen its scope. The certificate's subject carries the
+principal, composed entirely server-side from authenticated knowledge, so a
+client cannot request an identity it doesn't hold:
 
-- **CN** = the SSH key fingerprint (`SHA256:...`), the same subject string
-  tokens use today.
+- **CN** = the SSH key fingerprint (`SHA256:...`).
 - **OU** = scope (`control` or `credentials`), one scope per certificate.
 - **O** = client kind (`cli`, `host-agent`, `desktop`, `mobile`).
-- TTL = `auth.token_ttl` (default 24h), extended-key-usage
-  `ClientAuth` only.
+- TTL = `auth.token_ttl` (default 24h), extended-key-usage `ClientAuth` only.
+
+The server ignores every requested subject field, SAN or extension in the
+CSR. The user a request acts as is whoever the CN's key belongs to **now**.
 
 This describes a user's certificate. A [service client](#service-clients)'s
 certificate has a different shape (CN = the client name, OU = `service`, a
 `shed-client://` URI SAN), is signed by `shed-server client issue` on the shed
-host, and is checked against `auth.clients` rather than the SSH allowlist.
-
-Enrollment rides the `_bootstrap` channel exactly like a token mint, with a
-CSR appended to the request line: the client generates a P-256 keypair
-locally, sends the CSR, and the server signs it — ignoring every requested
-subject field, SAN, or extension in the CSR itself.
+host, and is checked against `auth.clients` rather than the key set.
 
 ### Per-request re-validation
 
 A TLS handshake happens once per connection, but a pooled keep-alive
-connection can carry many requests — so the mtls auth middleware
-**re-validates on every request**, not just at the handshake: certificate
-`NotBefore`/`NotAfter` against the current time, the CN against the *live*
-SSH allowlist, and the OU against the route's required scope. This gives mtls
-the same "revocation/expiry lands on the next request" property token mode
-has always had, rather than a weaker "only checked once per TCP connection"
-guarantee.
+connection can carry many requests, so the mtls middleware **re-validates
+every request**: the certificate's `NotBefore`/`NotAfter` against the current
+time, the CN against the *live* key set (and, with a user list, the key's
+expiry and its user's current admin flag), and the OU against the route's
+required scope. A certificate that fails is answered `401` and its connection
+is closed, so the client's retry dials afresh; a scope failure is `403` and
+keeps the connection.
 
 ### Revocation
 
-Revoking a client certificate means **removing its SSH key from the
-allowlist** — there is no separate `RevokeBySubject` for certificates (that
-mechanism still exists for tokens). The next request on any connection
-presenting that certificate is rejected by the per-request re-validation
-above; a new connection is rejected at the handshake itself.
-
-This is a **deliberate, coarser tradeoff than token mode**: removing a key in
-mtls mode also cuts off shell/SFTP access (the SSH allowlist is now the one
-lever for both), where token mode can revoke an HTTP credential independently
-via `RevokeBySubject`. Documented and accepted — an mtls deployment that wants
-per-purpose revocation without cutting SSH access should stay on `token` mode.
+Revoking a client certificate means **removing its SSH key** (from
+`auth.users`, `auth.ssh`, or the GitHub account). The next request on any
+connection presenting that certificate is refused by the per-request check,
+and a new connection is refused at the handshake. Removing the key also cuts
+the key's SSH access: one lever covers both. A key with an `expires` date
+revokes itself.
 
 A service client's certificates are revoked differently: remove the client
 from `auth.clients` and restart `serve` (see [Service
@@ -472,36 +427,221 @@ clients](#service-clients)).
 
 - **Already-established streams survive revocation until they close.** An SSE
   subscription or a `shed forward` tunnel opened before a certificate is
-  revoked or expires keeps running until it ends — identical to token mode's
-  behavior (tokens are also only checked at request time, not mid-stream).
-  Revocation and expiry bind on the *next* request/dial, not on
-  already-hijacked byte-copy loops.
-- **`curl` and ad-hoc scripts cannot reach an mtls server as an admin.** There
-  is no way to hand a script a bearer header and have it work — it needs a
-  client certificate and the private key that signed its CSR. **This is
-  exactly why `token` mode is retained and not deprecated**: anything that
-  needs admin HTTP access without the shed client fleet (CI runners,
-  third-party integrations, `curl` debugging) stays on `token`. An
-  orchestrator that only needs its own sheds can instead be a
-  [service client](#service-clients), whose bundle works with `curl --cert`.
+  revoked or expires keeps running until it ends. Revocation and expiry bind
+  on the *next* request or dial, not on an already-hijacked byte-copy loop.
+- **`curl` and ad-hoc scripts need a client certificate.** There is no bearer
+  header to hand a script. A script that acts as a person can use a
+  certificate enrolled with that person's key (a [`script:
+  true`](#expired-keys-and-script-keys) key keeps it off the credential bus);
+  an orchestrator that only needs its own sheds can be a [service
+  client](#service-clients), whose bundle works with `curl --cert`.
 - **CA rotation is manual.** Deleting `ca_cert.pem` + `ca_key.pem` and
-  restarting the server invalidates every previously-issued client
-  certificate at once — a fleet-wide re-enrollment. Every well-behaved client
-  recovers automatically (one silent SSH round-trip on its next command, via
-  the same adaptive-transport mechanism that handles ordinary renewal and
-  mode flips), so the operator-facing cost is "every client pays one extra
-  SSH round-trip," not an outage requiring per-client intervention. A
+  restarting the server invalidates every previously issued client
+  certificate at once: a fleet-wide re-enrollment. Every well-behaved client
+  recovers automatically (one silent SSH round-trip on its next command). A
   [service client](#service-clients) is the exception: its certificate comes
-  from `shed-server client issue`, not `_bootstrap`, so after a rotation it is
-  refused until you issue and deliver a new bundle. There is
-  no `shed server ca rotate` / `ca status` command yet — a full CLI story is
-  future work. The server logs the CA fingerprint and expiry at startup (like
-  the TLS cert fingerprint) and **warns when the CA is within 90 days of
-  expiry**; `/api/info` also carries `ca_fingerprint` + `ca_not_after` in mtls
-  mode (see [API › GET /api/info](api.md#get-apiinfo)).
+  from `shed-server client issue`, so after a rotation it is refused until you
+  issue and deliver a new bundle. There is no `shed server ca rotate` command
+  yet. The server logs the CA fingerprint and expiry at startup and **warns
+  when the CA is within 90 days of expiry**; `/api/info` carries
+  `ca_fingerprint` and `ca_not_after` (see [API › GET
+  /api/info](api.md#get-apiinfo)).
 
-See [Upgrading to mTLS](../upgrades/token-to-mtls.md) for the client-then-server
-rollout order and the desktop component-upgrade ordering.
+## Native pinned TLS
+
+shed uses **pinned self-signed TLS** for the *server's* identity: no public
+CA, no domain, no ACME. The server generates a self-signed certificate on
+first start (the same lifecycle as the SSH host key) and clients pin it by the
+SHA-256 fingerprint of its DER encoding, the trust model SSH host keys use.
+`auth.mode: mtls` turns it on (`https_port` defaults to `8443`).
+
+This is a **separate mechanism from the small internal CA** mtls mode uses to
+sign *client* certificates: the server's own leaf and how clients pin it do
+not depend on that CA.
+
+```yaml
+https_port: 8443                 # the pinned-TLS listener (mtls serves HTTPS only)
+tls_names:                       # extra SANs so hostname verification passes
+  - shed.example.com
+  - 203.0.113.10
+# localhost, 127.0.0.1, ::1 are always included.
+```
+
+`shed server add` pins the fingerprint automatically (it is in the bootstrap
+bundle). All clients verify by pin: the Go CLI and sdk via
+`VerifyPeerCertificate`, and `curl` via `--pinnedpubkey` alongside the cert
+handed in with `--cacert` (with OpenSSL, `--cacert` alone can leave the system
+CA directory trusted; see the [orchestrated sheds
+guide](../guides/orchestrated-sheds.md#4-call-the-api)). A client that
+configures a pin but a non-`https` URL **fails closed** rather than sending
+plaintext.
+
+**Rotation.** Changing `tls_names` regenerates the certificate (new
+fingerprint). Re-pin clients with:
+
+```bash
+shed server update my-server --tls-fingerprint sha256:<new>   # pin out-of-band
+shed server update my-server --refetch                        # fetch + re-pin over SSH
+```
+
+Rotating an existing pin in a non-interactive session requires
+`--trust-on-first-use`, so a re-pin is never silently accepted.
+
+## Network surface
+
+There is **one HTTP listener per mode** (SSH always listens separately on
+`ssh_port`): a single plain-HTTP listener on loopback in open mode, or a
+single pinned-TLS (`https_port`) listener in mtls mode, with **no plain-HTTP
+listener at all**. The credential bus (`/api/plugins/*`) and the Connect
+tunnel (`/api/sheds/*/connect/*`) ride that same listener; in mtls mode the
+bus needs the `credentials` scope while the Connect tunnel accepts `control`
+or `credentials`, and both travel over TLS. A co-located host-agent reaches
+the bus over `https://127.0.0.1:8443` with the pinned cert and its own
+`credentials` certificate. These knobs shape what is reachable where:
+
+| Field | Effect |
+|-------|--------|
+| `bind_address` | Interface every listener (plain HTTP, HTTPS, SSH) binds to. **Defaults to loopback (`127.0.0.1`).** In mtls mode set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. An open server is loopback only: any other value fails config load. |
+| `https_port` | The HTTPS listener (bound to `bind_address`) serving the control plane, credential bus, and Connect tunnel over pinned TLS. **Requires `mtls` mode**; defaults to `8443` there. |
+| `trusted_proxy` | Trust `X-Forwarded-For` (only safe behind a proxy that overwrites it). Default false uses the real TCP peer, so a source IP can't be forged to evade per-IP controls. |
+
+## Connection flow: what's encrypted where
+
+| Hop | open mode (loopback) | mtls mode |
+|-----|----------------------|-----------|
+| Control-plane / bus HTTP | plain `http://` on loopback | pinned `https://`; the client presents a certificate at the handshake, and a peer with none never completes it |
+| SSH (shed sessions + the `_bootstrap` issuance channel) | encrypted; host key pinned in `~/.shed/known_hosts` | same |
+| Credential issuance | none | client certificate over the pinned-host-key SSH `_bootstrap` channel (CSR in, signed cert out) |
+
+In mtls mode **nothing plaintext faces the network**, and the only
+trust-on-first-use moment is `shed server add` showing you the SSH host key
+and TLS fingerprints for confirmation (or pass `--fingerprint` /
+`--tls-fingerprint` to verify out-of-band). After that, every byte travels
+over pinned TLS or pinned-host-key SSH.
+
+## Credential bus
+
+The credential bus carries live secrets (SSH signatures, AWS and Docker
+credentials) between a shed and a machine's host-agent or desktop app, which
+subscribe to it with a `credentials` certificate. What the machine will sign
+is decided on the machine: see the [SSH agent](../extensions/ssh-agent.md)
+extension.
+
+### Routed by user
+
+A shed's requests go to its **user's** machine only, and an answer is accepted
+only from that user. The shed's user comes from the server's own record of the
+shed, never from the guest. Subscribe, respond, `GET /api/plugins/listeners`,
+`GET /api/plugins/sheds` and the egress audit stream all act as the caller's
+user; an admin sees every user's rows in the two listings but still cannot
+subscribe or answer for another user. On a server with no user list there is
+one user, so one machine answers every shed.
+
+- The server mints its own id for each request it forwards and maps it back
+  on the answer, so an id a guest chose never identifies anything on the
+  server. An answer that matches no request it holds (forged, replayed,
+  already answered, another user's, for a connection that is gone, or from
+  before a restart) is refused with `403 FORBIDDEN`, in every auth mode.
+- An answer is written only into the shed connection its request arrived on,
+  while that connection still routes to the same user: a shed deleted and
+  created again under the name, or a transport that reconnected, is never
+  sent it.
+- A request whose user has no machine subscribed for its type is refused at
+  once; nothing is kept for a machine that connects later.
+
+### One machine answers for each user
+
+Each user has one **credential source** per server: the machine whose
+subscriptions the server takes and whose answers it accepts. The **first
+machine to connect for a user becomes it.** Any other machine of that user is
+refused, told which machine is the source, and keeps retrying on its usual
+backoff; it never takes over by itself. A move is explicit, with [`shed source
+use`](cli.md#shed-source) or the desktop app's "Use this machine".
+
+A machine names itself on every subscribe and respond with two headers:
+
+| Header | Value |
+|---|---|
+| `X-Shed-Machine-Id` | 32 lowercase hex digits, the machine's stable id |
+| `X-Shed-Machine-Name` | its display name, percent-encoded UTF-8; 1 to 63 bytes decoded, no control characters |
+
+shed-host-agent and the desktop app 0.10.0 or newer send them. A broker
+released earlier sends neither and is refused until it is upgraded, so
+upgrade machines before servers.
+
+- **Who may move it.** A user moves their own source from any of their keys
+  that is not a script key. An admin may name another configured user
+  (`--user`) and choose among that user's own machines. A machine is known to
+  the server only after its broker has tried to connect.
+- **What a move does.** It takes effect at once: the old machine's streams
+  end, its requests in flight are dropped, and its answers are refused
+  (`SOURCE_NOT_BOUND`). The new machine starts answering when its broker next
+  connects (within about 30 s, or at once from the desktop app's button).
+  Nothing fails over: if the source is off or asleep, its user's credential
+  requests get no answer until it reconnects or the source is moved.
+- **A request in flight** belongs to the machine it was delivered to: a
+  reconnect of that machine gets it back, and no other machine inherits it.
+- **Where it is kept.** `source-bindings.json` in the backend's state
+  directory (the parent of `instance_dir` on Firecracker and VZ), mode `0600`.
+  The server does not start if it cannot read the file. A missing file is a
+  first start: the server creates an empty one and warns that the first
+  machine to connect for each user becomes that user's source. Up to 32
+  machines are remembered per user.
+- **Adding a user list later.** On the first start with a user list, a server
+  with exactly one user gives that user the source it had before; with several
+  users it is dropped. At every start the records of users no longer
+  configured are removed.
+
+`GET /api/info` lists the feature `source_binding` on a server that pins. The
+routes are [`GET /api/sources`](api.md#get-apisources) and [`POST
+/api/sources/use`](api.md#post-apisourcesuse) (control scope).
+
+### Refusals on the bus
+
+Subscribe (`GET /api/plugins/listeners/{ns}/messages`) and respond (`POST
+/api/plugins/listeners/{ns}/respond`) answer, besides `200`/`204`:
+
+| Status | `error.code` | When |
+|---|---|---|
+| `403` | `FORBIDDEN` | A service client, or a script key (subscribe and respond); on respond, also an answer that matches no pending request |
+| `403` | `SOURCE_MACHINE_ID_REQUIRED` | The machine headers are missing or invalid (a broker released before v0.10.0). The message names the minimum versions |
+| `403` | `SOURCE_NOT_BOUND` | Another machine is this user's source. The body also carries `source.machine_id` and `source.machine_name` |
+| `409` | `SOURCE_DUPLICATE_STREAM` | The source machine already holds this request type (a second process with the same machine id, or a stream that has not ended yet). Retryable; nothing is replaced |
+| `429` | `SOURCE_RATE_LIMITED` | Too many new or changed machines for this user lately (8 at once, then one every 15 s). With `Retry-After` |
+| `429` | `TOO_MANY_RESPONSES` | Respond only: more than 8 answers in flight to one shed connection. With `Retry-After: 1` |
+| `413` | `REQUEST_TOO_LARGE` | Respond only: a body over the guest framing limit |
+| `503` | `RESPONSE_NOT_DELIVERED` | Respond only: the shed did not take the answer within 5 s; nothing was written and the request is still pending. With `Retry-After: 1` |
+| `404` | `SHED_NOT_CONNECTED` | Respond only: the write into the shed failed part-way; not retryable |
+| `500` | `INTERNAL_ERROR` | The bindings store could not be saved; nothing was registered |
+
+None of the pin refusals is ever a `401`, and each body is under 1024 bytes:
+
+```json
+{"error":{"code":"SOURCE_NOT_BOUND","message":"this server takes your credential requests only from your machine \"laptop\"; to use this machine instead, run 'shed source use' naming this machine"},
+ "source":{"machine_id":"0123456789abcdef0123456789abcdef","machine_name":"laptop"}}
+```
+
+### Limits
+
+| Limit | Value |
+|---|---|
+| Messages held per shed connection | 128, and 4 MiB |
+| Messages held by the server | 64 MiB |
+| A guest-chosen identifier | 128 bytes |
+| Answers in flight per shed connection | 8, each written within 5 s |
+| Wait for room in a full listener queue | 1 s; then the message is dropped |
+| An unanswered request | answerable for 1 hour |
+| A write to a subscription stream | 15 s, then the stream is closed |
+| Keepalive on an idle subscription | every 25 s |
+| Unacknowledged data on a subscription's connection | 40 s (the kernel then fails it, so a machine that went to sleep is dropped and its own reconnect succeeds) |
+
+### Service-client sheds
+
+The bus is **always off for a shed a [service client](#service-clients)
+owns** (not a policy option): the server drops that shed's plugin messages
+before they reach a listener, refuses to send it any, and leaves it out of
+`GET /api/plugins/sheds`. An owned shed can never ask for an SSH signature or a
+cloud credential.
 
 ## Service clients
 
@@ -525,8 +665,9 @@ it can never be confused with a user's (whose CN is an SSH key fingerprint):
 - A certificate with either service marker is judged as a service certificate
   only. If its shape is wrong, it is refused, never treated as a user's.
 - It is accepted only while `<name>` is in `auth.clients`, at the TLS
-  handshake and again on every request. It is **never checked against the SSH
-  allowlist**, and it carries no SSH access.
+  handshake and again on every request. It is **never checked against the
+  key set**, and it carries no SSH access.
+- A client name may not also be an `auth.users` name (config load refuses it).
 - A user's certificate (from `shed server add`) is never treated as a client,
   whatever its CSR asked for, because the server composes its subject itself.
 
@@ -551,9 +692,11 @@ network profile other than the pinned one, and server mounts outside
 Ownership is the `owner` field in the shed's metadata and JSON. It is bound to
 the shed an operation acts on: the backend re-checks the owner under its
 per-shed lock, so a request cannot act on a shed someone else recreated under
-the same name in the meantime. Sheds created before service clients existed
-have no owner and are admin-only. **Admins see and control every shed**, owned
-or not.
+the same name in the meantime. A client's shed has no `user`. **An admin may
+list, stop, delete and enter a client's shed**; a user who is not an admin
+cannot see it (see [Ownership](#ownership)). Users are unchanged for a
+client: its certificate, routes and policy are the same on a server with or
+without a user list.
 
 Each owned shed:
 
@@ -579,7 +722,7 @@ never the arguments).
   certificate and key can do everything the client can: create sheds within its
   policy, run any command as root (through `sudo`) in its live sheds, read
   whatever the orchestrator put there (a clone, a token passed to a command),
-  and delete them. Through the API it cannot touch an admin's shed or another
+  and delete them. Through the API it cannot touch a user's shed or another
   client's, and the certificate gives no admin route and no SSH. What a command
   run in its sheds can reach is a separate question, answered by the shed's
   network profile and mounts: with the default `isolated` profile, only the
@@ -607,8 +750,9 @@ never the arguments).
 
 ## Mount selection
 
-Every shed gets every server mount (`mounts:`) by default, as before. A shed
-can be created with fewer, through `shed create --mounts none|a,b` or the
+Every shed gets every server mount (`mounts:`) by default, as before; on a
+server with users, a user who is not an admin gets none (server mounts are
+[admin-only](#admin-only-resources)). A shed can be created with fewer, through `shed create --mounts none|a,b` or the
 API's `mounts` field, and a service client's sheds get only its
 `server_mounts`. The choice is stored with the shed as an explicit mode
 (`all`, or `selected` plus names; a stored selection with no names is none,
@@ -708,13 +852,54 @@ installs nothing and does not need `nft`.
 - **Not in this release:** a proxy-only or no-network profile, and MSS
   clamping.
 
+## Removed in v0.10.0
+
+These fail config load with a message naming `mtls`; nothing falls back to
+open:
+
+| Removed | Replacement |
+|---------|-------------|
+| `auth.mode: token` (bearer tokens minted over `_bootstrap`) | `auth.mode: mtls`. Every client since v0.8.1 re-enrolls with a certificate on its next request. |
+| `auth.mode: secure` (the older spelling of `token`) | `auth.mode: mtls`. |
+| `allow_insecure_exposure` (an open server off loopback), with any value | An open server is loopback only; use `auth.mode: mtls` to reach the server from other hosts. |
+
+Also new in v0.10.0: an unknown or differently cased key anywhere under `auth`
+fails config load (before, `auth: {Mode: mtls}` was ignored and the server
+started open), and so does a top-level key that matches a known one only when
+case is ignored (`Auth:`, `Bind_Address:`). The server holds no bearer-token
+code: an `Authorization` header is never read. The clients still speak the
+token protocol to servers older than v0.10.0. The [v0.9.1 → v0.10.0 upgrade
+guide](../upgrades/v0.9.1-to-v0.10.0.md) takes a server of any mode across.
+
+## Removed earlier
+
+These keys are **rejected at startup** with a message naming them, so an old
+config cannot silently weaken a deployment:
+
+| Removed | In | Replacement today |
+|---------|----|-------------------|
+| `public_exposure: true` | v0.7.1 | `auth.mode: mtls` |
+| `auth.http.tokens` (static list) + `shed-server token new` | v0.7.1 | Certificates enrolled over the `_bootstrap` SSH channel by `shed server add` |
+| `auth.http` (the whole block) | v0.7.2 | HTTP enforcement derives from `auth.mode: mtls` |
+| `internal_http_port` | v0.7.4 | The bus and Connect tunnel ride the single listener |
+| `http_bind` / `ssh_bind` | v0.7.4 | One `bind_address` for every listener |
+
+`https_port` and `auth.ssh.mode: enforce` are valid only in mtls mode, and an
+explicit `auth.ssh.mode: off` or `warn` under mtls is refused. See the
+[v0.7.0 → v0.7.1](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.0-to-v0.7.1.md),
+[v0.7.1 → v0.7.2](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.1-to-v0.7.2.md)
+and [v0.7.3 → v0.7.4](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/v0.7.3-to-v0.7.4.md)
+upgrade guides.
+
 ## Deferred
 
 An **enrollment secret** (a transport-layer HMAC over the bootstrap handshake,
-to gate issuance even tighter than the SSH allowlist) remains out of scope.
-Mutual TLS itself is no longer deferred — see [mTLS mode](#mtls-mode) above.
+to gate issuance even tighter than the SSH key set) remains out of scope.
 
 Also not built yet (see the [Roadmap](../ROADMAP.md)):
+
+- **Listing users** (`shed users ls`), **moving a shed between users** (only a
+  shed with no user can be assigned), and **assigning snapshots**.
 
 - **Per-certificate revocation** for service clients (by serial); today a
   client is revoked as a whole.

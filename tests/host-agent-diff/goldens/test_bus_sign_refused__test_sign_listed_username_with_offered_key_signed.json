@@ -1,0 +1,45 @@
+{
+  "approval_requests": 1,
+  "audit": {
+    "approval": "shed-desktop",
+    "decided_by": "user",
+    "detail": "ssh-ed25519",
+    "ns": "ssh-agent",
+    "op": "sign",
+    "result": "ok",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "event": {
+    "approval": "shed-desktop",
+    "decided_by": "user",
+    "detail": "ssh-ed25519",
+    "id": "<id>",
+    "kind": "audit",
+    "ns": "ssh-agent",
+    "op": "sign",
+    "result": "ok",
+    "shed": "web",
+    "ts": "<ts>",
+    "type": "event",
+    "v": 2
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "sign-1",
+    "namespace": "ssh-agent",
+    "payload": {
+      "blob": "dbnC630OC/QPSf3IRlJmVARIixhCYthjmBTjDuIZbhB+SQ9AQ7VRz1iuWsYm7vUDad1bFSiYU0bzIWFoujWxAA==",
+      "format": "ssh-ed25519",
+      "rest": ""
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

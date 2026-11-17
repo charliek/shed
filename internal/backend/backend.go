@@ -53,6 +53,17 @@ type Backend interface {
 	// StopShed stops a running shed.
 	StopShed(ctx context.Context, name string) (*config.Shed, error)
 
+	// AssignUser gives a shed that has no user and no service client to the
+	// user req.User, under the backend's per-shed lock and checked against
+	// the incarnation its context requires (WithRequiredCreatedAt), so a shed
+	// deleted and created again under the name since the caller looked it
+	// up is not assigned. It refuses, with CheckAssignable's errors, a shed
+	// that already belongs to someone and (unless req.AllowHostResources) one
+	// that carries host directories or server mounts. A running shed's
+	// credential-bus route follows the new user without a reconnect. It is
+	// how sheds made before a server had a user list get one.
+	AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error)
+
 	// ResetShed deletes the per-shed writable upper layer and recreates
 	// it as a fresh empty sparse file. The shed must be stopped. The
 	// workspace (mounted post-boot via 9P/VirtioFS from outside the

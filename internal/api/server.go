@@ -6,17 +6,20 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/audit"
-	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/source"
+	"github.com/charliek/shed/internal/users"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
 // Server is the HTTP API server for shed.
 type Server struct {
+	// backend is always a *backend.Guard (or nil): every call is decided by
+	// the access rule for the principal on the request's context.
 	backend     backend.Backend
 	cfg         *config.ServerConfig
 	sshHostKey  string
@@ -24,14 +27,13 @@ type Server struct {
 	bridge      *plugin.Bridge
 	egressAudit *egress.AuditLog         // nil when egress is disabled
 	egressStore *config.UserProfileStore // nil when egress is disabled
-	tokens      *authtoken.Store         // nil until SetTokenStore; consulted only in token mode (auth.mode: token)
-	// certAuthorized answers "is this SSH key fingerprint still allowlisted?"
-	// for the mtls middleware, which re-checks a presented client certificate's
-	// Subject CN on every request. It is a plain predicate rather than the
-	// sshd.KeyAllowlist itself so this package never imports internal/sshd (and
-	// so tests can drive revocation with a closure). nil until
-	// SetClientCertAuthorizer; nil authorizes nothing.
-	certAuthorized func(fingerprint string) bool
+	// users answers "which user owns this SSH key fingerprint?" for the mtls
+	// middleware, which re-checks a presented client certificate's Subject CN
+	// on every request. nil until SetUserLookup; nil authorizes nothing.
+	users users.Lookup
+	// keyRefresher fetches the GitHub logins again for POST
+	// /api/users/refresh. nil until SetKeyRefresher.
+	keyRefresher users.Refresher
 	// caFingerprint / caNotAfter describe the internal client CA, reported on
 	// /api/info in mtls mode so an operator can confirm which CA this server
 	// trusts and when it must be rotated. Zero values in every other mode.
@@ -61,6 +63,20 @@ type Server struct {
 	// (exec.max_concurrent_per_shed). The map is created on first use.
 	execMu       sync.Mutex
 	execInFlight map[string]int
+
+	// missingID logs a credential-bus request with no valid machine headers
+	// once per caller (a released broker retries every few seconds).
+	missingID missingIDLog
+}
+
+// SetSourceBindings gives the credential bus its source bindings (the pin):
+// shorthand for the registry's SetBindings, which shed-server calls itself at
+// start-up, before any listener can register. Without them the bus routes
+// that subscribe and answer refuse every request (fail closed).
+func (s *Server) SetSourceBindings(b source.Bindings) {
+	if s.plugins != nil {
+		s.plugins.SetBindings(b)
+	}
 }
 
 // SetEgressAudit attaches the durable egress audit log so `shed egress show`
@@ -74,19 +90,13 @@ func (s *Server) SetEgressAudit(a *egress.AuditLog) { s.egressAudit = a }
 // config profiles (and PUT/DELETE returning 501).
 func (s *Server) SetEgressUserStore(st *config.UserProfileStore) { s.egressStore = st }
 
-// SetTokenStore attaches the HTTP bearer-token store. The same store is shared
-// with the SSH bootstrap handler (which mints into it); the auth middleware
-// validates against it. Constructed once in shed-server.
-func (s *Server) SetTokenStore(t *authtoken.Store) { s.tokens = t }
-
-// SetClientCertAuthorizer attaches the live SSH-allowlist predicate the mtls
-// middleware re-checks a client certificate's Subject CN against on every
-// request. In shed-server this is sshd.KeyAllowlist.IsAuthorizedFingerprint;
-// passing a function rather than the allowlist keeps internal/api free of an
-// internal/sshd import. It MUST read live state — a snapshot would make
-// certificates unrevokable. Called once at startup in mtls mode; leaving it nil
-// makes the mtls path authorize nothing.
-func (s *Server) SetClientCertAuthorizer(fn func(fingerprint string) bool) { s.certAuthorized = fn }
+// SetUserLookup attaches the user lookup the mtls middleware re-checks a
+// client certificate's Subject CN (an SSH key fingerprint) against on every
+// request. In shed-server this is the same users.ConfigLookup the SSH server
+// asks. It MUST read live state — a snapshot would make certificates
+// unrevokable. Called once at startup in mtls mode; leaving it nil makes the
+// mtls path authorize nothing.
+func (s *Server) SetUserLookup(l users.Lookup) { s.users = l }
 
 // SetClientCAInfo records the internal client CA's fingerprint and expiry for
 // /api/info reporting in mtls mode. Two scalars rather than the CA itself: the
@@ -96,10 +106,16 @@ func (s *Server) SetClientCAInfo(fingerprint string, notAfter time.Time) {
 	s.caNotAfter = notAfter
 }
 
-// NewServer creates a new API server.
+// NewServer creates a new API server. Every backend call it makes goes
+// through the access guard: b is wrapped in a backend.Guard unless it is one
+// already (shed-server passes the one Guard the SSH server shares).
 func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, plugins *plugin.Registry, bridge *plugin.Bridge) *Server {
+	var guarded backend.Backend
+	if b != nil {
+		guarded = backend.Guarded(b)
+	}
 	return &Server{
-		backend:    b,
+		backend:    guarded,
 		cfg:        cfg,
 		sshHostKey: sshHostKey,
 		plugins:    plugins,
@@ -128,23 +144,21 @@ func (s *Server) useCommonMiddleware(r chi.Router) {
 }
 
 // Router returns the chi router for the HTTP API — served over pinned TLS in
-// an enforced mode (token or mtls), plain HTTP in open mode. It registers the
-// full route surface on a single listener: the control plane (info, lifecycle,
-// images, system, snapshots, sessions, egress) plus the credential bus
-// (/api/plugins/*) and the Connect tunnel (/api/sheds/*/connect/*). In either
-// enforced mode the bus requires a credentials-scoped credential, the Connect
-// tunnel accepts control or credentials, and everything else requires control
-// — identically whether that credential is a bearer token or a client
-// certificate (see authMiddleware).
+// mtls mode, plain HTTP in open mode. It registers the full route surface on a
+// single listener: the control plane (info, lifecycle, images, system,
+// snapshots, sessions, egress) plus the credential bus (/api/plugins/*) and the
+// Connect tunnel (/api/sheds/*/connect/*). In mtls mode the bus requires a
+// credentials-scoped certificate, the Connect tunnel accepts control or
+// credentials, and everything else requires control (see authMiddleware).
 func (s *Server) Router() chi.Router {
 	r := chi.NewRouter()
 	s.mux = r
 	s.useCommonMiddleware(r)
 
 	r.Route("/api", func(r chi.Router) {
-		// Server info (in open and token mode also the unauthenticated
-		// bootstrap endpoints used by `shed server add`; mtls has no
-		// exemptions — see authMiddleware).
+		// Server info and the SSH host key. Unauthenticated only in open
+		// mode, where nothing is; mtls has no exemptions — see
+		// authMiddleware.
 		r.Get("/info", s.handleGetInfo)
 		r.Get("/ssh-host-key", s.handleGetSSHHostKey)
 
@@ -215,11 +229,25 @@ func (s *Server) Router() chi.Router {
 				r.With(egressWrite).Delete("/", s.handleDeleteProfile)
 			})
 			r.Route("/{name}", func(r chi.Router) {
+				// {name} is a shed: an invalid one is an unknown shed and
+				// reaches no backend (see requireShedName). With, not Use:
+				// the check runs on the routes below once chi has matched
+				// one, so an unrouted method or path answers as before.
+				r = r.With(requireShedName(false))
 				r.Get("/", s.handleEgressShow)
 				r.With(egressWrite).Post("/", s.handleEgressSet)
 				r.With(egressWrite).Delete("/", s.handleEgressOff)
 			})
 		})
+
+		// Users: fetch the GitHub logins again (admin only; control scope).
+		r.Post("/users/refresh", s.handleUsersRefresh)
+
+		// Credential sources: which of a user's machines answers their
+		// credential requests, and moving that (control scope: outside
+		// /api/plugins, so a credentials certificate cannot reach them).
+		r.Get("/sources", s.handleListSources)
+		r.Post("/sources/use", s.handleUseSource)
 
 		// Plugins / Extensions (the credential bus)
 		r.Route("/plugins", func(r chi.Router) {
@@ -235,10 +263,18 @@ func (s *Server) Router() chi.Router {
 			r.Get("/", s.handleListSheds)
 			r.Post("/", s.handleCreateShed)
 			r.Route("/{name}", func(r chi.Router) {
+				// Every route below takes the shed's name from here: an
+				// invalid one is an unknown shed and reaches no backend (see
+				// requireShedName). With, not Use: the check runs on the
+				// routes below once chi has matched one, so an unrouted
+				// method or path answers as before.
+				r = r.With(requireShedName(true))
 				r.Get("/", s.handleGetShed)
 				r.Delete("/", s.handleDeleteShed)
 				r.Post("/start", s.handleStartShed)
 				r.Post("/stop", s.handleStopShed)
+				// Give a shed with no user to a user (admin only).
+				r.Post("/assign", s.handleAssignShed)
 				r.With(s.requireCapability("reset", capReset)).Post("/reset", s.handleResetShed)
 
 				// HTTPS exec: one command, NDJSON output (control scope

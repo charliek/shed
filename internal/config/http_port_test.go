@@ -7,10 +7,8 @@ import (
 )
 
 // TestValidateHTTPPort covers the mode-gated range check: http_port is required
-// (1..65535) in open mode and optional (0 = unset) in an enforced mode (token
-// or mtls).
+// (1..65535) in open mode and optional (0 = unset) in mtls mode.
 func TestValidateHTTPPort(t *testing.T) {
-	tokenAuth := &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}
 	mtlsAuth := &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}
 	tests := []struct {
 		name     string
@@ -21,13 +19,10 @@ func TestValidateHTTPPort(t *testing.T) {
 		{"open requires http_port (0 invalid)", nil, 0, true},
 		{"open valid http_port", nil, 8080, false},
 		{"open out of range", nil, 70000, true},
-		{"token allows unset http_port (0)", tokenAuth, 0, false},
-		{"token allows a set http_port", tokenAuth, 8080, false},
-		{"token out of range rejected", tokenAuth, 70000, true},
-		{"token negative rejected", tokenAuth, -1, true},
 		{"mtls allows unset http_port (0)", mtlsAuth, 0, false},
 		{"mtls allows a set http_port", mtlsAuth, 8080, false},
 		{"mtls out of range rejected", mtlsAuth, 70000, true},
+		{"mtls negative rejected", mtlsAuth, -1, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -40,10 +35,8 @@ func TestValidateHTTPPort(t *testing.T) {
 }
 
 // TestLoadServerConfigHTTPPortByMode verifies the loader defaults http_port to
-// 8080 in open mode and drops it to 0 in token mode (where no plain-HTTP
-// listener is served), so /api/info and the written client entry omit it. It
-// also covers the deprecated "secure" spelling: the loader must normalize it
-// to token mode and behave identically to the canonical "token" spelling.
+// 8080 in open mode and drops it to 0 in mtls mode (where no plain-HTTP
+// listener is served), so /api/info and the written client entry omit it.
 func TestLoadServerConfigHTTPPortByMode(t *testing.T) {
 	backend, bcfg := platformTestBackend(t)
 	backendYAML := ""
@@ -53,9 +46,7 @@ func TestLoadServerConfigHTTPPortByMode(t *testing.T) {
 	if bcfg.fc != nil {
 		backendYAML = "firecracker:\n  kernel_path: /dev/null\n  default_image: /dev/null\n  instance_dir: /tmp/ti\n  socket_dir: /tmp/ts\n  default_cpus: 2\n  default_memory_mb: 4096\n  default_disk_gb: 20\n  vsock_base_cid: 100\n  console_port: 1024\n  notify_port: 1026\n  bridge_name: shed-br0\n  bridge_cidr: 172.30.0.1/24\n  tap_prefix: shed-tap\n"
 	}
-	tokenAuthYAML := "auth:\n  mode: token\n  ssh:\n    github_users: [charliek]\n"
 	mtlsAuthYAML := "auth:\n  mode: mtls\n  ssh:\n    github_users: [charliek]\n"
-	secureAliasAuthYAML := "auth:\n  mode: secure\n  ssh:\n    github_users: [charliek]\n"
 	tests := []struct {
 		name         string
 		extra        string
@@ -63,12 +54,8 @@ func TestLoadServerConfigHTTPPortByMode(t *testing.T) {
 	}{
 		{"open keeps a set http_port", "http_port: 8080\n", 8080},
 		{"open defaults http_port when unset", "", 8080},
-		{"token zeroes a set http_port", "http_port: 8080\n" + tokenAuthYAML, 0},
-		{"token leaves http_port unset", tokenAuthYAML, 0},
 		{"mtls zeroes a set http_port", "http_port: 8080\n" + mtlsAuthYAML, 0},
 		{"mtls leaves http_port unset", mtlsAuthYAML, 0},
-		{"deprecated secure alias zeroes a set http_port", "http_port: 8080\n" + secureAliasAuthYAML, 0},
-		{"deprecated secure alias leaves http_port unset", secureAliasAuthYAML, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -89,10 +76,10 @@ func TestLoadServerConfigHTTPPortByMode(t *testing.T) {
 }
 
 // TestLoadServerConfigHTTPSPortByMode verifies the loader defaults https_port
-// to 8443 in an enforced mode (token or mtls) when unset, leaves it unset (0)
+// to 8443 in mtls mode when unset, leaves it unset (0)
 // in open mode (open + an explicit https_port is rejected by validateAuth, so
 // it is not exercised via the loader here — see TestCrossFieldAuthValidation),
-// and preserves an explicit override in every enforced mode.
+// and preserves an explicit override in mtls mode.
 func TestLoadServerConfigHTTPSPortByMode(t *testing.T) {
 	backend, bcfg := platformTestBackend(t)
 	backendYAML := ""
@@ -102,7 +89,6 @@ func TestLoadServerConfigHTTPSPortByMode(t *testing.T) {
 	if bcfg.fc != nil {
 		backendYAML = "firecracker:\n  kernel_path: /dev/null\n  default_image: /dev/null\n  instance_dir: /tmp/ti\n  socket_dir: /tmp/ts\n  default_cpus: 2\n  default_memory_mb: 4096\n  default_disk_gb: 20\n  vsock_base_cid: 100\n  console_port: 1024\n  notify_port: 1026\n  bridge_name: shed-br0\n  bridge_cidr: 172.30.0.1/24\n  tap_prefix: shed-tap\n"
 	}
-	tokenAuthYAML := "auth:\n  mode: token\n  ssh:\n    github_users: [charliek]\n"
 	mtlsAuthYAML := "auth:\n  mode: mtls\n  ssh:\n    github_users: [charliek]\n"
 	tests := []struct {
 		name          string
@@ -110,8 +96,6 @@ func TestLoadServerConfigHTTPSPortByMode(t *testing.T) {
 		wantHTTPSPort int
 	}{
 		{"open leaves https_port unset", "", 0},
-		{"token defaults https_port to 8443", tokenAuthYAML, 8443},
-		{"token preserves an explicit https_port", "https_port: 9443\n" + tokenAuthYAML, 9443},
 		{"mtls defaults https_port to 8443", mtlsAuthYAML, 8443},
 		{"mtls preserves an explicit https_port", "https_port: 9443\n" + mtlsAuthYAML, 9443},
 	}

@@ -242,24 +242,33 @@ func (b *Backend) nextStep(j *job) string {
 // verify checks, against the cloud's current labels, that the instance is
 // this shed's. Every job calls it before each mutating cloud call.
 func (b *Backend) verify(ctx context.Context, ref provider.Ref, id string) error {
+	_, err := b.verified(ctx, ref, id)
+	return err
+}
+
+// verified is verify, also returning the instance it read.
+func (b *Backend) verified(ctx context.Context, ref provider.Ref, id string) (provider.Instance, error) {
 	inst, err := b.prov.Get(ctx, ref)
 	if err != nil {
 		if unread(err) {
-			return &unreadError{err}
+			return provider.Instance{}, &unreadError{err}
 		}
-		return err
+		return provider.Instance{}, err
 	}
 	if got := inst.Labels[provider.LabelID]; got != id {
-		return fmt.Errorf("%w: instance %s carries shed id %q, not %q", provider.ErrForeign, inst.Name, got, id)
+		return provider.Instance{}, fmt.Errorf("%w: instance %s carries shed id %q, not %q", provider.ErrForeign, inst.Name, got, id)
 	}
 	if got := inst.Labels[provider.LabelEnv]; got != b.cfg.Environment {
-		return fmt.Errorf("%w: instance %s is in environment %q", provider.ErrForeign, inst.Name, got)
+		return provider.Instance{}, fmt.Errorf("%w: instance %s is in environment %q", provider.ErrForeign, inst.Name, got)
 	}
 	// An instance labelled by another version of the label set is reported
 	// and never touched (provider.LabelSchema). The error is not ErrForeign:
 	// the instance is this shed's, so a delete keeps its marker and is tried
 	// again by a server that can read the labels.
-	return schemaOf(inst)
+	if err := schemaOf(inst); err != nil {
+		return provider.Instance{}, err
+	}
+	return inst, nil
 }
 
 // otherSchemaError says that an instance carries this shed's ID in a label
@@ -369,9 +378,19 @@ func (b *Backend) answered(j *job) {
 // shed ID re-checked first. On provider.ErrBusy it waits for the transition
 // in progress to end and calls again.
 func (b *Backend) mutate(ctx context.Context, ref provider.Ref, id string, call func() (provider.Pending, error)) (provider.Pending, error) {
+	return b.mutateSeeing(ctx, ref, id, nil, call)
+}
+
+// mutateSeeing is mutate, handing seen (when set) each instance its
+// verification reads find.
+func (b *Backend) mutateSeeing(ctx context.Context, ref provider.Ref, id string, seen func(provider.Instance), call func() (provider.Pending, error)) (provider.Pending, error) {
 	for attempt := 0; ; attempt++ {
-		if err := b.verify(ctx, ref, id); err != nil {
+		inst, err := b.verified(ctx, ref, id)
+		if err != nil {
 			return provider.Pending{}, err
+		}
+		if seen != nil {
+			seen(inst)
 		}
 		p, err := call()
 		if !errors.Is(err, provider.ErrBusy) || attempt >= maxBusyRetries {
@@ -483,7 +502,9 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		return b.failCreate(j, err, config.StatusReasonCreateFailed)
 	}
 	owned := rec.Shed.Owner != ""
-	b.credMgr.SetupCredentials(ctx, agent, j.name, nil, nil, owned)
+	b.joinBus(j.name, j.id, func(id vmutil.BusIdentity) {
+		b.credMgr.SetupCredentials(ctx, agent, j.name, nil, nil, id)
+	})
 
 	if rec.Shed.Repo != "" && !rec.Cloned {
 		repo := j.repoURL
@@ -492,7 +513,11 @@ func (b *Backend) runCreate(ctx context.Context, j *job) error {
 		}
 		backend.Phase(ctx, "repo")
 		backend.Status(ctx, "Cloning repository...")
-		if err := b.cloneRepo(ctx, agent, rec, repo, owned); err != nil {
+		// The server's env_file variables stay out of the clone of a
+		// service client's shed and of a shed of a user who is not an admin
+		// (the record keeps that from the create, across a restart).
+		withheld := owned || rec.NoServerEnv
+		if err := b.cloneRepo(ctx, agent, rec, repo, withheld); err != nil {
 			if ctx.Err() != nil {
 				return errSuperseded
 			}
@@ -594,7 +619,8 @@ func (b *Backend) resumeCommitted(ctx context.Context, j *job, inst provider.Ins
 		b.mu.Unlock()
 		return errSuperseded
 	}
-	b.commitCreatedLocked(r, inst)
+	b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], b.logNote)
+	b.commitCreatedLocked(r, inst) // saves r
 	status := r.Shed.Status
 	b.mu.Unlock()
 	b.logf("remote: create of shed %s had finished in the cloud (%s=%s); recording it %s", j.name, provider.LabelState, provider.ShedStateReady, status)
@@ -640,9 +666,10 @@ func (b *Backend) failCreate(j *job, cause error, reason string) error {
 	}
 	var marker *state.Marker
 	if !b.opts.KeepFailedCreate && (ref != "" || !refused) {
+		reportedOwner, _ := ownership(rec)
 		marker = &state.Marker{
 			ID: j.id, Name: j.name, Env: rec.Env, Ref: ref, At: b.now().UTC(),
-			Owner: rec.Shed.Owner, CreatedAt: rec.Shed.CreatedAt, KeepRecord: !removed,
+			Owner: reportedOwner, CreatedAt: rec.Shed.CreatedAt, KeepRecord: !removed,
 		}
 		if err := b.saveMarkerLocked(marker); err != nil {
 			b.logf("remote: create of shed %s failed and its clean-up could not be recorded: %v", j.name, err)
@@ -670,7 +697,8 @@ func (b *Backend) failCreate(j *job, cause error, reason string) error {
 }
 
 // noteInstance copies what the cloud reported about a started instance into
-// the record.
+// the record, and brings the record's user into line with the instance's
+// shed_user label (reconcileUserLocked), as every read of an instance does.
 func (b *Backend) noteInstance(j *job, inst provider.Instance) {
 	now := b.now()
 	b.update(j.name, j.id, func(r *state.Record) {
@@ -681,6 +709,7 @@ func (b *Backend) noteInstance(j *job, inst provider.Instance) {
 		}
 		r.Address = inst.Address
 		r.AddressAt = now
+		b.reconcileUserLocked(r, inst.Labels[provider.LabelUser], b.logNote)
 	})
 }
 
@@ -849,7 +878,9 @@ func (b *Backend) runStart(ctx context.Context, j *job) error {
 	if err != nil {
 		return b.failStart(j, err, config.StatusReasonUnreachable, true)
 	}
-	b.credMgr.SetupCredentials(ctx, agent, j.name, nil, nil, rec.Shed.Owner != "")
+	b.joinBus(j.name, j.id, func(id vmutil.BusIdentity) {
+		b.credMgr.SetupCredentials(ctx, agent, j.name, nil, nil, id)
+	})
 	if !rec.NoProvision {
 		backend.Phase(ctx, "provision")
 		b.provision(ctx, agent, rec, false)
@@ -966,10 +997,14 @@ func (b *Backend) runStop(ctx context.Context, j *job) error {
 	backend.Status(ctx, "Stopping the cloud instance...")
 	b.credMgr.StopListener(j.name)
 
-	pend, err := b.mutate(ctx, rec.Ref, j.id, func() (provider.Pending, error) { return b.prov.Stop(ctx, rec.Ref) })
+	// Each read of the instance brings the shed's user into line with its
+	// shed_user label, as every read does (reconcileUserLocked).
+	seen := func(inst provider.Instance) { b.reconcileUserRead(j.name, j.id, inst) }
+	pend, err := b.mutateSeeing(ctx, rec.Ref, j.id, seen, func() (provider.Pending, error) { return b.prov.Stop(ctx, rec.Ref) })
+	var inst provider.Instance
 	if err == nil {
 		b.update(j.name, j.id, func(r *state.Record) { r.Pending = &pend })
-		_, err = b.prov.Wait(ctx, pend)
+		inst, err = b.prov.Wait(ctx, pend)
 	}
 	if err != nil {
 		return b.failStop(j, rec.Ref, err)
@@ -981,6 +1016,7 @@ func (b *Backend) runStop(ctx context.Context, j *job) error {
 		r.Job = ""
 		r.Pending = nil
 		r.Address = ""
+		b.reconcileUserFromLocked(r, inst)
 	}) {
 		return errSuperseded
 	}
@@ -1010,6 +1046,7 @@ func (b *Backend) failStop(j *job, ref provider.Ref, cause error) error {
 	}
 	b.update(j.name, j.id, func(r *state.Record) {
 		r.Pending = nil
+		b.reconcileUserFromLocked(r, inst)
 		switch inst.State {
 		case provider.StateStopped:
 			r.Shed.Status = config.StatusStopped

@@ -17,13 +17,14 @@ graph TB
         AWP --> BUS
         DCS --> BUS
     end
-    BUS -->|vsock| SRV[shed-server<br/>Plugin message bus]
-    SRV -->|SSE| HA[shed-host-agent]
-    subgraph "Host macOS"
-        HA --> BE[SSH Backend<br/>agent-forward / local-keys]
+    BUS -->|vsock| SRV[shed-server<br/>Plugin message bus<br/>routed by user]
+    SRV -->|SSE, to the user's<br/>credential source only| HA[shed-host-agent<br/>or the desktop app's<br/>embedded broker]
+    subgraph "The user's machine (macOS or Linux)"
+        HA --> SC[Signing check]
+        SC --> AG[Approval gate<br/>policy / Touch ID / shed-desktop]
+        AG --> BE[SSH Backend<br/>agent-forward / local-keys]
         HA --> STS[AWS STS<br/>AssumeRole + cache]
         HA --> DCB[Docker Backend<br/>credential helpers + config]
-        HA --> TID[Touch ID gate]
         HA --> AL[Audit log]
     end
 ```
@@ -36,10 +37,17 @@ graph TB
 2. `shed-ext-ssh-agent` translates the SSH agent protocol `Sign()` call into a JSON envelope
 3. Envelope is POSTed to `http://127.0.0.1:498/v1/publish` (shed-agent's HTTP endpoint)
 4. shed-agent sends the message over vsock to shed-server
-5. shed-server routes the message to the `ssh-agent` namespace listener via SSE
-6. `shed-host-agent` receives the envelope, dispatches to the SSH backend
-7. SSH backend performs the signing operation using host keys
-8. Response envelope flows back: host-agent -> shed-server -> shed-agent -> shed-ext-ssh-agent
+5. shed-server stamps the envelope with its own record of the shed, replaces the guest's
+   request id with one it mints, and routes it to the `ssh-agent` listener of the **shed's
+   user**. That listener exists only on the user's [credential source](source-binding.md);
+   with no listener the request is dropped and logged
+6. The broker (`shed-host-agent`, or the desktop app's embedded broker) decodes the request
+   and runs the [signing check](ssh-agent.md#what-the-machine-signs). A refused request is
+   audited and answered at once, with no prompt
+7. A request that passes goes to the approval gate, then to the SSH backend, which signs
+   exactly the checked bytes
+8. Response envelope flows back: broker -> shed-server (accepted only from the bound machine,
+   for a request it was sent) -> shed-agent -> shed-ext-ssh-agent
 9. `shed-ext-ssh-agent` returns the signature to the SSH client
 
 ### AWS Credential Request
@@ -47,8 +55,8 @@ graph TB
 1. AWS SDK calls `GET http://127.0.0.1:499/credentials` (via `AWS_CONTAINER_CREDENTIALS_FULL_URI`)
 2. `shed-ext-aws-credentials` translates the HTTP request into a JSON envelope
 3. Envelope is POSTed to the shed-agent publish endpoint
-4. shed-server routes the message to the `aws-credentials` namespace listener via SSE
-5. `shed-host-agent` receives the envelope, checks its credential cache
+4. shed-server routes the message to the `aws-credentials` listener of the shed's user (its credential source) via SSE
+5. The broker receives the envelope, applies the AWS approval policy, and checks its credential cache
 6. If cached credentials are still valid (>5 min remaining), return immediately
 7. If stale, call `sts:AssumeRole` with the configured role and cache the result — or, in passthrough mode, re-read and vend the source profile's session credentials directly (no AssumeRole, no caching)
 8. Response flows back to `shed-ext-aws-credentials`, which returns the AWS SDK-expected format
@@ -83,8 +91,8 @@ sequenceDiagram
 
 1. Docker CLI execs `docker-credential-shed get` with the registry hostname on stdin
 2. `docker-credential-shed` translates the request into a JSON envelope and POSTs to the shed-agent publish endpoint
-3. shed-server routes the message to the `docker-credentials` namespace listener via SSE
-4. `shed-host-agent` checks the registry allowlist, reads `~/.docker/config.json`, and shells out to the appropriate credential helper (gcloud, osxkeychain, ecr-login, etc.)
+3. shed-server routes the message to the `docker-credentials` listener of the shed's user (its credential source) via SSE
+4. The broker applies the Docker approval policy, checks the registry allowlist, reads `~/.docker/config.json`, and shells out to the appropriate credential helper (gcloud, osxkeychain, ecr-login, etc.)
 5. Response flows back to `docker-credential-shed`, which writes credentials to stdout and exits
 
 ## Package Structure
@@ -120,7 +128,11 @@ so guest and host still agree on the wire even though they no longer share Go so
 
 ### Shared
 
-- **`internal/ext/protocol/`** — Envelope and payload types. The JSON wire format matches shed's `internal/plugin` types.
+- **`sdk/envelope.go`** — The envelope (`sdk.Envelope`, `sdk.ShedInfo`) and message types.
+  `internal/plugin` uses the same types as aliases, so the server and the guest share one
+  definition.
+- **`internal/ext/protocol/`** — Per-namespace payload types (`ssh.go`, `aws.go`,
+  `docker.go`): namespaces, operations, error codes and request/response field names.
 
 ## SSH Backend Selection
 
@@ -145,7 +157,7 @@ The caching strategy is asymmetric:
 - **Host handler (assume-role mode)**: Caches STS credentials per shed, keyed by server/shed.
 - **Host handler (passthrough mode)**: No caching — the shared credentials file is re-read on every request so a fresh SSO/SAML login is picked up immediately.
 
-This avoids cache coherence complexity. The bus round trip is sub-millisecond (vsock, same machine), and the SDK only fetches credentials when its in-memory cache is stale (~once per hour).
+This avoids cache coherence complexity. Each request makes a round trip from the shed to its server and on to the user's machine, but the SDK only fetches credentials when its in-memory cache is stale (~once per hour).
 
 ## Distribution
 
@@ -168,7 +180,7 @@ byte-identical staging logic. See
 
 | Boundary | What crosses | What doesn't |
 |----------|-------------|--------------|
-| VM -> Host (SSH sign) | Challenge data, public key reference | Private keys |
+| VM -> Host (SSH sign) | Data to sign, public key reference (signed only if it is a login as an allowed username or a `git` signature) | Private keys |
 | Host -> VM (SSH response) | Signature blob | Private keys |
 | VM -> Host (AWS request) | Operation type only | Role ARN, source credentials |
 | Host -> VM (AWS response) | Short-lived STS token (1h) | Long-lived AWS credentials |

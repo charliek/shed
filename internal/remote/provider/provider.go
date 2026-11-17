@@ -138,8 +138,8 @@ type Selector struct {
 // error that wraps ctx.Err(), and the cloud-side work, if already accepted,
 // carries on.
 //
-// A provider is built for one environment. Start, Stop, Destroy, SetLabels
-// and SetMetadata refuse an instance whose shed_env label names another
+// A provider is built for one environment. Start, Stop, Destroy, SetLabels,
+// ClaimLabel and SetMetadata refuse an instance whose shed_env label names another
 // environment with ErrForeign, checked against the cloud's current labels,
 // not a cached copy.
 type Provider interface {
@@ -238,6 +238,17 @@ type Provider interface {
 	// success. It completes before it returns. Disk labels are not
 	// changed.
 	SetLabels(ctx context.Context, ref Ref, labels map[string]string) error
+
+	// ClaimLabel sets the label key to value only when the instance's
+	// current value of key is empty (or absent) or already value, and
+	// leaves its other labels alone. The check is made against the
+	// instance as read for the write, on every attempt (a write that loses
+	// a race with another writer reads the instance again and checks
+	// again), so no other value is ever overwritten. A different non-empty
+	// value is ErrLabelTaken and nothing is written. A value it already has
+	// is success with nothing written. LabelSchema, LabelEnv and LabelID
+	// cannot be claimed (ErrInvalid). It completes before it returns.
+	ClaimLabel(ctx context.Context, ref Ref, key, value string) error
 
 	// SetMetadata sets the given instance metadata keys and leaves the
 	// others alone. An empty value removes the key. It completes before it

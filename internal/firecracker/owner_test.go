@@ -12,6 +12,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 // TestRequiredOwnerIsCheckedAgainstTheLoadedShed: with a required owner in
@@ -110,7 +111,7 @@ func TestDeleteStoppedShedStopsItsMessageChannel(t *testing.T) {
 	}
 	c.netMgr = nm
 	writeResumeInstance(t, cfg.InstanceDir, "alpha", config.StatusStopped, 0)
-	c.credMgr.ResumeMessageChannel("alpha", c.newAgentClient("alpha"), false)
+	c.credMgr.ResumeMessageChannel("alpha", c.newAgentClient("alpha"), vmutil.BusIdentity{})
 	if got := resumedNames(bridge); len(got) != 1 {
 		t.Fatalf("fixture: bridge sheds = %v, want [alpha]", got)
 	}

@@ -209,6 +209,10 @@ Configuration types and loading for both client and server configs.
 
 SSH server implementation using `gliderlabs/ssh`. Routes connections to VMs based on username.
 
+### `internal/users`
+
+The user seam, `users.Lookup`: which user owns an SSH key (by fingerprint) and the list of users. Both the SSH server and the mtls API middleware ask it. `ConfigLookup` answers from the `auth.ssh` keys (inline, keys file, GitHub logins, refreshed and cached under `{state_dir}/github_keys/`), keeping where each key came from; with no user list every key belongs to one implicit user, named `""`. `userstest` holds the test doubles.
+
 ### `internal/sshconfig`
 
 Parses and generates SSH config files. Manages the shed-specific block in `~/.ssh/config`.

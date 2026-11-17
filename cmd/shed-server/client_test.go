@@ -140,13 +140,13 @@ func TestIssueClientBundleRefusals(t *testing.T) {
 		t.Error("an unknown client was issued a certificate")
 	}
 
-	token := clientTestConfig(t)
-	token.Auth.Mode = config.AuthModeToken
-	if _, err := issueClientBundle(token, "nocturn", 0); err == nil || !strings.Contains(err.Error(), "mtls") {
-		t.Errorf("token mode = %v, want a refusal naming mtls", err)
+	open := clientTestConfig(t)
+	open.Auth.Mode = config.AuthModeOpen
+	if _, err := issueClientBundle(open, "nocturn", 0); err == nil || !strings.Contains(err.Error(), "mtls") {
+		t.Errorf("open mode = %v, want a refusal naming mtls", err)
 	}
 	// Nothing was written for a refused issue.
-	entries, _ := os.ReadDir(token.StateDir)
+	entries, _ := os.ReadDir(open.StateDir)
 	if len(entries) != 0 {
 		t.Errorf("a refused issue wrote %d files into the state dir", len(entries))
 	}

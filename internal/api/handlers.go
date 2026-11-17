@@ -28,19 +28,16 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		SSHPort:  s.cfg.SSHPort,
 		HTTPPort: s.cfg.HTTPPort,
 		Backend:  s.cfg.DefaultBackend,
-		// Token mode reports the legacy "secure" spelling: released clients
-		// gate their credential bootstrap on that exact string, and reporting
-		// "token" would make them save an entry with no credential (see
-		// config.LegacyWireAuthMode). Current clients normalize on decode.
-		AuthMode:     config.LegacyWireAuthMode(s.cfg.AuthModeValue()),
+		// open, or mtls (readable only behind a client certificate).
+		AuthMode:     s.cfg.AuthModeValue(),
 		DefaultImage: s.cfg.ActiveDefaultImage(),
 		HTTPSPort:    s.cfg.HTTPSPort,
 		Features:     s.serverFeatures(),
 	}
 	// Only a backend that reports its own capabilities (remote) states its
 	// isolation kind; Firecracker and VZ answer exactly as before.
-	if r, ok := s.backend.(backend.CapabilityReporter); ok {
-		info.Isolation = r.Capabilities().Isolation
+	if caps, ok := backend.ReportedCapabilities(s.backend); ok {
+		info.Isolation = caps.Isolation
 	}
 	// Client-CA visibility, mtls only. Reaching /api/info in mtls mode already
 	// required a valid client certificate (that mode has no bootstrap
@@ -74,7 +71,8 @@ func (s *Server) handleListSheds(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A service client sees only the sheds it owns.
+	// The access guard lists only the sheds the caller may view; a service
+	// client's list is filtered again here, by owner, as before the guard.
 	if c := callerFrom(r.Context()); c.IsClient() {
 		owned := make([]config.Shed, 0, len(sheds))
 		for _, sh := range sheds {
@@ -109,14 +107,18 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidShedName, "shed name is required")
 		return
 	}
-	if err := config.ValidateShedName(req.Name); err != nil {
+	if err := config.ValidateNewShedName(req.Name); err != nil {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidShedName, err.Error())
 		return
 	}
 
-	// Owner and ResolvedMounts are server-set (json:"-" already keeps them
-	// off the wire); start from zero whatever the decoder did.
+	// Owner, User, NoServerEnv and ResolvedMounts are server-set
+	// (json:"-" already keeps them off the wire); start from zero whatever
+	// the decoder did. The access guard stamps the owner and user from the
+	// caller's principal.
 	req.Owner = ""
+	req.User = ""
+	req.NoServerEnv = false
 	req.ResolvedMounts = nil
 	// The shed ID is server-minted, like Owner. Only an asynchronous backend
 	// (remote) stores it today; Firecracker and VZ get none.
@@ -154,6 +156,11 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 			writePolicyViolation(w, caller, rule)
 			return
 		}
+	} else if field := s.userCreateRefusal(caller, &req); field != "" {
+		// A user who is not an admin may not use what is shared on the host.
+		// Like the client policy this runs before anything reads the host.
+		writeError(w, http.StatusForbidden, config.ErrForbidden, "admin only: "+field)
+		return
 	}
 
 	// Fields the backend cannot honour are refused here, before any check
@@ -504,23 +511,38 @@ func (s *Server) handleEgressShow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.egressAudit != nil {
-		status.Recent = s.egressAudit.Recent(name, 50)
+		status.Recent = recentForShed(s.egressAudit.Recent(name, 0), shed, 50)
 	}
 	writeJSON(w, http.StatusOK, status)
 }
 
-// egressController is the optional backend capability for live egress changes.
-// The native vz/fc backends implement it; a backend that doesn't yields a 501.
-type egressController interface {
-	SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error)
-	ClearShedEgress(ctx context.Context, name string) (*config.Shed, error)
+// recentForShed returns up to limit of recs (oldest first) that belong to
+// shed's incarnation and not to an earlier shed of the same name: a record
+// stamped with an incarnation must carry shed's creation time, and one with
+// none (written before records carried it) must not be older than shed.
+func recentForShed(recs []egress.AuditRecord, shed *config.Shed, limit int) []egress.AuditRecord {
+	out := recs[:0] // recs is the caller's own copy: filter it in place
+	for _, rec := range recs {
+		if !rec.ShedCreatedAt.IsZero() {
+			if !rec.ShedCreatedAt.Equal(shed.CreatedAt) {
+				continue
+			}
+		} else if rec.Time.Before(shed.CreatedAt) {
+			continue
+		}
+		out = append(out, rec)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out
 }
 
 // handleEgressSet applies a profile selection to a shed (live on a running one).
 // POST /api/egress/{name}  body: {"profiles":["base","github"]}
 func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
-	ec, ok := s.backend.(egressController)
+	ec, ok := backend.AsEgressController(s.backend)
 	if !ok {
 		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not supported by this backend")
 		return
@@ -542,9 +564,11 @@ func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 // handleEgressStream streams egress decisions as Server-Sent Events for the
 // host-agent subscriber (shed-extensions). GET /api/egress/stream
 //
-// In secure mode this route accepts a control OR credentials token (the
-// host-agent holds credentials; a control token may tail it) — see
-// authMiddleware. It is fleet-global: a subscriber sees every shed's decisions.
+// In mtls mode this route accepts a control OR credentials certificate (the
+// host-agent holds credentials; a control certificate may tail it) — see
+// authMiddleware. It is per user: an admin (and the implicit user of a server
+// with no user list) sees every shed's decisions; any other user sees only
+// those of their own sheds (egressRecordVisible).
 func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
 	if s.egressAudit == nil {
 		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not enabled")
@@ -556,8 +580,12 @@ func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	caller := callerFrom(r.Context())
 	events := make(chan egress.AuditRecord, 256)
 	unsub := s.egressAudit.Subscribe(func(rec egress.AuditRecord) {
+		if !s.egressRecordVisible(caller, rec) {
+			return
+		}
 		select {
 		case events <- rec:
 		default: // drop on overflow; never block the data path
@@ -582,11 +610,32 @@ func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// egressRecordVisible reports whether caller may see rec on the egress
+// stream. An admin, and the implicit user, see every record. Any other user
+// sees a record only when the shed incarnation it came from (its name and
+// creation time, which every live record carries) is connected now and
+// belongs to them; it is decided afresh for every record and never cached by
+// shed name, so a shed deleted and created again under its name by another
+// user shows that user's records to that user only. A record of a service
+// client's shed, of a shed with no user, of an unresolved one, or of an
+// incarnation that is not connected reaches admins only. A service client
+// sees nothing.
+func (s *Server) egressRecordVisible(caller Caller, rec egress.AuditRecord) bool {
+	if caller.IsAdmin() {
+		return true
+	}
+	if caller.Kind != CallerUser || caller.User == "" || s.bridge == nil {
+		return false
+	}
+	user, ok := s.bridge.IncarnationUser(rec.Shed, rec.ShedCreatedAt)
+	return ok && user == caller.User
+}
+
 // handleEgressOff turns egress off for a shed.
 // DELETE /api/egress/{name}
 func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
-	ec, ok := s.backend.(egressController)
+	ec, ok := backend.AsEgressController(s.backend)
 	if !ok {
 		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not supported by this backend")
 		return
@@ -797,6 +846,11 @@ func (s *Server) handleListAllSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		sessions, err := s.backend.ListSessions(r.Context(), shed.Name)
 		if err != nil {
+			// A shed the caller may list but not enter (an admin and
+			// another user's shed) is left out without a warning.
+			if errors.Is(err, config.ErrForbiddenSentinel) {
+				continue
+			}
 			// Record warning for sheds where we can't list sessions
 			if errors.Is(err, config.ErrTmuxNotAvailableSentinel) {
 				warnings = append(warnings, "shed "+shed.Name+": tmux not available")
@@ -851,11 +905,32 @@ func backendErrorFor(ctx context.Context, err error) (int, string, string) {
 	return status, code, msg
 }
 
+// mapAccessError maps the access guard's refusals (no principal, forbidden, a
+// shed the caller may not see) to an HTTP status code, error code, and
+// message. ok is false for any other error.
+func mapAccessError(err error) (status int, code, msg string, ok bool) {
+	switch {
+	case errors.Is(err, backend.ErrNoPrincipal):
+		return http.StatusInternalServerError, config.ErrInternalError, err.Error(), true
+	case errors.Is(err, config.ErrForbiddenSentinel):
+		return http.StatusForbidden, config.ErrForbidden, err.Error(), true
+	case errors.Is(err, config.ErrShedNotFoundSentinel):
+		return http.StatusNotFound, config.ErrShedNotFound, err.Error(), true
+	}
+	return 0, "", "", false
+}
+
 // mapBackendError maps a backend error to an HTTP status code, error code, and message.
 func mapBackendError(err error) (int, string, string) {
+	if status, code, msg, ok := mapAccessError(err); ok {
+		return status, code, msg
+	}
 	// Check sentinel errors
-	if errors.Is(err, config.ErrShedNotFoundSentinel) {
-		return http.StatusNotFound, config.ErrShedNotFound, err.Error()
+	if errors.Is(err, config.ErrShedAssignedSentinel) {
+		return http.StatusConflict, config.ErrShedAlreadyAssigned, err.Error()
+	}
+	if errors.Is(err, config.ErrShedHostResourcesSentinel) {
+		return http.StatusConflict, config.ErrShedHostResources, err.Error()
 	}
 	if errors.Is(err, config.ErrShedAlreadyExistsSentinel) {
 		return http.StatusConflict, config.ErrShedAlreadyExists, err.Error()
@@ -955,6 +1030,9 @@ func mapBackendError(err error) (int, string, string) {
 
 // mapSessionError maps a session-related error to an HTTP status code, error code, and message.
 func mapSessionError(err error) (int, string, string) {
+	if status, code, msg, ok := mapAccessError(err); ok {
+		return status, code, msg
+	}
 	// Check for specific sentinel errors using errors.Is
 	if errors.Is(err, config.ErrSessionNotFoundSentinel) {
 		return http.StatusNotFound, config.ErrSessionNotFound, err.Error()

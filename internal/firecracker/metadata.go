@@ -135,6 +135,11 @@ type Metadata struct {
 	// An owned shed has the credential bus off.
 	Owner string `json:"owner,omitempty"`
 
+	// User is the person the shed belongs to ("" for the implicit user,
+	// and for every shed created before users existed). Additive: the
+	// metadata version is unchanged. Never set together with Owner.
+	User string `json:"user,omitempty"`
+
 	// MountSelection is the server-mount selection the shed starts with,
 	// honoured on every start. New sheds always store it explicitly; a
 	// missing value (an older shed) means every mount.
@@ -192,6 +197,28 @@ func LoadMetadata(instanceDir, name string) (*Metadata, error) {
 // It writes to a temporary file and renames, which is atomic on Linux ext4
 // when source and dest are in the same directory.
 func (m *Metadata) Save(instanceDir string) error {
+	return m.save(instanceDir, false)
+}
+
+// SaveDurable is Save that returns only once the new metadata survives a
+// crash or a power loss: the file is synced before the rename and its
+// directory after it. It is for the writes that must never be lost once
+// acknowledged (an assignment of the shed to a user), not for the general
+// path (create, start, stop), which stays unsynced. An error after the rename
+// (the directory sync) leaves the new metadata in place, perhaps not durable;
+// the caller treats it as not written.
+func (m *Metadata) SaveDurable(instanceDir string) error {
+	return m.save(instanceDir, true)
+}
+
+// metadataFileSync and metadataDirSync are the syncs SaveDurable makes (tests
+// make them fail).
+var (
+	metadataFileSync = func(f *os.File) error { return f.Sync() }
+	metadataDirSync  = syncDir
+)
+
+func (m *Metadata) save(instanceDir string, durable bool) error {
 	if err := validateInstanceName(m.Name); err != nil {
 		return err
 	}
@@ -220,6 +247,13 @@ func (m *Metadata) Save(instanceDir string) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to write metadata: %w", err)
 	}
+	if durable {
+		if err := metadataFileSync(tmpFile); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("failed to sync metadata: %w", err)
+		}
+	}
 	if err := tmpFile.Close(); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to close temp metadata file: %w", err)
@@ -228,6 +262,11 @@ func (m *Metadata) Save(instanceDir string) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to rename metadata: %w", err)
+	}
+	if durable {
+		if err := metadataDirSync(dir); err != nil {
+			return fmt.Errorf("failed to sync the metadata directory: %w", err)
+		}
 	}
 
 	return nil
@@ -264,24 +303,45 @@ func validateInstanceName(name string) error {
 
 // ListInstances returns the names of all instances in the instance directory.
 func ListInstances(instanceDir string) ([]string, error) {
+	names, _, err := listInstancesCounting(instanceDir)
+	return names, err
+}
+
+// unreadableInstance is an instance directory whose metadata file could not
+// be looked at for a reason other than its not existing.
+type unreadableInstance struct {
+	name string
+	err  error
+}
+
+// listInstancesCounting is ListInstances that also returns the instance
+// directories it left out because their metadata file could not be looked
+// at (a Stat that failed with anything other than not-exist: no search
+// permission on the directory, an I/O error). A directory with no metadata
+// file is left out and not returned.
+func listInstancesCounting(instanceDir string) ([]string, []unreadableInstance, error) {
 	entries, err := os.ReadDir(instanceDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("failed to read instance directory: %w", err)
+		return nil, nil, fmt.Errorf("failed to read instance directory: %w", err)
 	}
 
 	var names []string
+	var unreadable []unreadableInstance
 	for _, entry := range entries {
 		if entry.IsDir() {
 			// Check if metadata exists
 			metaPath := MetadataPath(instanceDir, entry.Name())
-			if _, err := os.Stat(metaPath); err == nil {
+			switch _, err := os.Stat(metaPath); {
+			case err == nil:
 				names = append(names, entry.Name())
+			case !errors.Is(err, os.ErrNotExist):
+				unreadable = append(unreadable, unreadableInstance{name: entry.Name(), err: err})
 			}
 		}
 	}
 
-	return names, nil
+	return names, unreadable, nil
 }

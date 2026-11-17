@@ -1140,6 +1140,67 @@ func (c *APIClient) EgressProfileDelete(name string) error {
 	return c.doRequest(http.MethodDelete, "/api/egress/profiles/"+name, nil, nil)
 }
 
+// errSourcesUnsupported is a server without the credential source routes
+// (older than the pin): a 404 that carries no API error code.
+var errSourcesUnsupported = errors.New("the server does not support credential sources")
+
+// ListSources returns the caller's credential source and machines (GET
+// /api/sources), or user's when user is set (admin only).
+func (c *APIClient) ListSources(user string) (*config.SourcesResponse, error) {
+	path := "/api/sources"
+	if user != "" {
+		path += "?user=" + url.QueryEscape(user)
+	}
+	var resp config.SourcesResponse
+	if err := c.doSourcesRequest(http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// UseSource makes machineID (a full machine id) the credential source of the
+// caller, or of user when user is set (admin only), and returns the sources
+// after the move (POST /api/sources/use).
+func (c *APIClient) UseSource(machineID, user string) (*config.SourcesResponse, error) {
+	var resp config.SourcesResponse
+	req := config.SourceUseRequest{MachineID: machineID, User: user}
+	if err := c.doSourcesRequest(http.MethodPost, "/api/sources/use", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// doSourcesRequest is doRequest for the credential source routes, which also
+// tells a server without them (errSourcesUnsupported) from a 404 the routes
+// answer themselves (SOURCE_MACHINE_NOT_FOUND).
+func (c *APIClient) doSourcesRequest(method, path string, body, result any) error {
+	resp, err := c.sendWithReauth(
+		func(cred clienttoken.Credential) (*http.Response, error) {
+			return c.sendRequest(method, path, body, cred)
+		},
+		connectFailure)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		var apiErr config.APIError
+		if json.Unmarshal(data, &apiErr) != nil || apiErr.Error.Code == "" {
+			return errSourcesUnsupported
+		}
+		return fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
+	default:
+		return c.parseError(resp)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	return nil
+}
+
 // DeleteShedWithProgress deletes a shed and streams teardown progress via SSE.
 // It uses no client-level timeout (context deadline only, like create), so an
 // active event stream never trips the 30s quick-op timeout while a delete runs.
@@ -1427,6 +1488,15 @@ func (c *APIClient) CreateSnapshot(req *config.SnapshotCreateRequest) (*config.S
 // DeleteSnapshot removes a snapshot from the server.
 func (c *APIClient) DeleteSnapshot(name string) error {
 	return c.doRequest(http.MethodDelete, "/api/snapshots/"+name, nil, nil, http.StatusNoContent, http.StatusOK)
+}
+
+// RefreshUsers asks the server to fetch its GitHub logins again (admin only).
+func (c *APIClient) RefreshUsers() (*config.UsersRefreshResponse, error) {
+	var resp config.UsersRefreshResponse
+	if err := c.doRequest(http.MethodPost, "/api/users/refresh", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 // GetSystemDF retrieves disk usage information for the server.

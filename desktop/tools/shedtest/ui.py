@@ -267,6 +267,12 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     # The app's log file (#414) lands under here on Linux (macOS: under HOME's
     # ~/Library/Logs) — never in the developer's own ~/.local/state.
     env["XDG_STATE_HOME"] = str(runtime_dir / "state")
+    # The embedded broker's persistent state (its machine identity file and its
+    # credential store, plan 035 §3.4). Set explicitly: on Linux it otherwise follows
+    # `$XDG_DATA_HOME`, which an isolated HOME does not redirect, so a developer with
+    # that exported would have a hermetic run write `machine.json` into their real data
+    # dir (and two cells would share one identity).
+    env["SHED_HOST_AGENT_STATE_DIR"] = str(runtime_dir / "host-agent-state")
     env[f"{cfg.env_prefix}_TEST_MODE"] = "1"
     env[f"{cfg.env_prefix}_MOCK_BASE_URL"] = mock_base_url
     env[f"{cfg.env_prefix}_SHED_CONFIG"] = str(config_path)

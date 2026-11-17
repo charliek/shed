@@ -47,6 +47,24 @@ shed snapshot delete <snapshot-name>
 shed create <new-name> --from-snapshot <snapshot-name> [--local-dir ...]
 ```
 
+## Ownership
+
+On a server with [users](configuration.md#users) a snapshot belongs to a user:
+the user of the shed it was taken from. Taking one counts as entering the
+source shed, so only someone who may enter it can. A shed created from a
+snapshot belongs to whoever creates it.
+
+| Caller | Their own snapshot | Another user's | One with no user |
+|---|---|---|---|
+| A user | list, inspect, delete, create a shed from it | invisible (`404 SNAPSHOT_NOT_FOUND`) | invisible |
+| An admin | everything | list, inspect, delete; **not** create a shed from it (`403 FORBIDDEN`) | everything |
+| A service client | no snapshots at all | | |
+
+Snapshots taken before the server had a user list have no user. On the first
+start with exactly one user they become that user's; otherwise they stay with
+no user, and no command assigns a snapshot (an admin can still use or delete
+it). On a server with no user list every caller reaches every snapshot.
+
 ## Identity regeneration
 
 Each spawned shed gets a fresh `/etc/machine-id`, fresh SSH host keys, and the
@@ -171,9 +189,11 @@ shed create my-new-shed --from-snapshot <snap>
 ## Known caveats
 
 - **A snapshot keeps the disk, not the shed's settings.** It records no
-  network profile, mount selection or owner. `shed create --from-snapshot`
-  takes `--network` and `--mounts` from its own flags, which default to the
-  server's `network.default_profile` and every server mount. Spawning from a
+  network profile, mount selection or service-client owner (only the user, see
+  [Ownership](#ownership)). `shed create --from-snapshot` takes `--network` and
+  `--mounts` from its own flags, which default to the server's
+  `network.default_profile` and every server mount (none for a user who is not
+  an admin). Spawning from a
   snapshot of an isolated shed with no mounts therefore gives an open shed with
   every mount unless you pass them again:
 

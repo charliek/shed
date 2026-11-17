@@ -13,23 +13,11 @@
 # script existed.
 #
 # Usage:
-#   render-dev-config.sh <base.yaml> <out.yaml> [--mtls] [--state-dir DIR]
+#   render-dev-config.sh <base.yaml> <out.yaml> [--state-dir DIR] [--users DIR]
 #
-# --mtls        SHED_DEV_AUTH_MODE=mtls. The two committed dev-parallel
-#               configs start from different auth postures:
-#                 - server.dev-parallel.mac.yaml already carries an `auth:`
-#                   block with `mode: token` (plus the https_port + auth.ssh
-#                   key source mtls also needs) — a one-line substitution.
-#                 - server.dev-parallel.linux-fc.yaml carries NO `auth:` block
-#                   (it runs open, network-facing, for direct FC dev testing)
-#                   — mtls needs an `auth:` block AND an https_port appended,
-#                   both invariants that base config lacks (see
-#                   internal/config/server.go: AuthEnforced).
-#               Either way the SSH key source is `github_users: [charliek]` —
-#               the identity the mac config already allowlists, so a developer
-#               whose default SSH key is on that GitHub account needs no extra
-#               manual step to drive the mtls dev server (tests/integration/
-#               test_mtls.py).
+# There is no auth-mode override: both committed dev-parallel configs run
+# auth.mode: mtls, the only enforced mode shed-server loads. (The --token and
+# --mtls flags of earlier versions are gone and are refused as unknown.)
 #
 # --state-dir   SHED_DEV_STATE_DIR. Relocates the dev server's BLOB-HEAVY
 #               state — images_dir, instance_dir, snapshots_dir, uppers_dir —
@@ -45,10 +33,28 @@
 #               volume should fail as "no images" at startup rather than as a
 #               confusing mid-run socket error. The brew shed-server on this
 #               developer's machine is configured the same way.
+#
+#               The server's identity directory (state_dir: host key, TLS
+#               certificate, client CA, upgrade marker, pins) is NOT
+#               relocated either: the base's state_dir is carried through
+#               unchanged, so identity material never follows the image store
+#               onto another volume.
+#
+# --users       SHED_DEV_USERS=itest. Gives the server the integration suite's
+#               itest user list (auth.users): itest-admin, itest-alice and
+#               itest-bob, with keys generated once under DIR (the suite's
+#               SHED_ITEST_USERS_DIR, default ~/.shed/dev/itest-users), and
+#               moves the base's auth.ssh key sources (github_users,
+#               authorized_keys) under a user named `dev`, an admin, because
+#               config load refuses auth.ssh key sources beside a user list.
+#               The developer's own entry keeps working, as user `dev`. Done
+#               by tests/integration/fixtures/identity.py through `uv run`, so
+#               it needs uv; the output is re-serialised YAML (comments go).
+#               Applied last, after --state-dir.
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <base-config.yaml> <output-config.yaml> [--mtls] [--state-dir DIR]" >&2
+  echo "usage: $0 <base-config.yaml> <output-config.yaml> [--state-dir DIR] [--users DIR]" >&2
   exit 1
 }
 
@@ -57,15 +63,20 @@ base="$1"
 out="$2"
 shift 2
 
-mtls=0
 state_dir=""
+users_dir=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --mtls) mtls=1; shift ;;
     --state-dir) [ "$#" -ge 2 ] || usage; state_dir="$2"; shift 2 ;;
+    --users) [ "$#" -ge 2 ] && [ -n "$2" ] || usage; users_dir="$2"; shift 2 ;;
     *) echo "render-dev-config: unknown argument: $1" >&2; usage ;;
   esac
 done
+
+# On any failure from here, leave no <output> behind (not even the copy of
+# the base made below): a caller that went on regardless would otherwise find
+# a config without the overrides it asked for.
+trap 'rc=$?; [ "$rc" -eq 0 ] || rm -f "$out" "$out.users"' EXIT
 
 if [ ! -f "$base" ]; then
   echo "render-dev-config: base config not found: $base" >&2
@@ -85,62 +96,6 @@ sed_inplace() {
 mkdir -p "$(dirname "$out")"
 cp "$base" "$out"
 applied=()
-
-# ---- --mtls -----------------------------------------------------------------
-if [ "$mtls" = "1" ]; then
-  if grep -qE '^auth:[[:space:]]*$' "$out"; then
-    # Base already has an `auth:` block (today: the mac config, mode: token).
-    # Flip the mode in place; https_port + auth.ssh are already there.
-    if ! grep -qE '^[[:space:]]*mode:[[:space:]]*token[[:space:]]*$' "$out"; then
-      echo "render-dev-config: $base has an 'auth:' block but no" \
-           "'mode: token' line to flip; refusing to guess at its shape" >&2
-      exit 1
-    fi
-    sed_inplace 's/^([[:space:]]*mode:[[:space:]]*)token[[:space:]]*$/\1mtls/' "$out"
-  else
-    # No `auth:` block at all (today: the FC config, open mode). Append a
-    # top-level `https_port` + `auth:` block. Appending at end-of-file is valid
-    # YAML here — these are new top-level (zero-indent) keys, and a mapping key
-    # can appear anywhere in the document regardless of what nested block
-    # precedes it.
-    cat >> "$out" <<'EOF'
-
-# --- Generated by scripts/render-dev-config.sh for SHED_DEV_AUTH_MODE=mtls ---
-# Not committed; regenerated on every dev-server-up/-restart run with
-# SHED_DEV_AUTH_MODE=mtls. https_port + auth.ssh are the mtls-mode invariants
-# this base config doesn't otherwise carry (see internal/config/server.go).
-https_port: 18443
-auth:
-  mode: mtls
-  ssh:
-    github_users: [charliek]
-  # A service client for tests/integration/test_service_client.py. Its bundle
-  # is issued on the dev host with `shed-server client issue itest`.
-  clients:
-    itest:
-      cert_max_ttl: 24h
-      policy:
-        name_prefix: "itest-svc-"
-        max_sheds: 3
-        max_age: 2h
-        images: [itest]
-    # The client a development Nocturn (the shed-craze Agent Provider) uses
-    # against this dev server. Isolated network, no server mounts. It may use
-    # the `itest` alias because the v0.5.9 default image predates the exec
-    # fixes (process-group cleanup, a separate stderr stream). Issue its bundle
-    # on the dev host with `shed-server client issue nocturn`.
-    nocturn:
-      policy:
-        name_prefix: "nocturn-"
-        max_sheds: 4
-        max_age: 30h
-        network: isolated
-        server_mounts: []
-        images: [itest]
-EOF
-  fi
-  applied+=("auth.mode: mtls")
-fi
 
 # ---- --state-dir ------------------------------------------------------------
 if [ -n "$state_dir" ]; then
@@ -182,9 +137,38 @@ EOF
   applied+=("state dir: $state_dir")
 fi
 
+# ---- --users ----------------------------------------------------------------
+if [ -n "$users_dir" ]; then
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "render-dev-config: --users needs uv (https://docs.astral.sh/uv/)" >&2
+    exit 1
+  fi
+  repo="$(cd "$(dirname "$0")/.." && pwd)"
+  abs_out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
+  mkdir -p "$users_dir"
+  abs_users="$(cd "$users_dir" && pwd)"
+  # Rendered next to the output, then moved over it, so a failure leaves no
+  # half-written config behind.
+  if ! (cd "$repo/tests/integration" && uv run --quiet python -m fixtures.identity --dir "$abs_users" \
+          render-users "$abs_out" "$abs_out.users") >&2; then
+    rm -f "$abs_out.users"
+    echo "render-dev-config: --users failed" >&2
+    exit 1
+  fi
+  mv "$abs_out.users" "$abs_out"
+  applied+=("itest user list: keys in $abs_users")
+fi
+
 if [ "${#applied[@]}" -eq 0 ]; then
   echo "render-dev-config: no overrides requested — the caller should have run" \
        "the committed base config directly" >&2
+  exit 1
+fi
+
+# The caller starts a server with what this wrote; an empty file there would
+# load shed-server's defaults instead. (The Makefile checks again.)
+if [ ! -s "$out" ]; then
+  echo "render-dev-config: $out is missing or empty after rendering" >&2
   exit 1
 fi
 

@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use shed_broker::sockets::{connect_unix_timeout, status_socket_path};
 use shed_broker::status::{
-    ApprovalChannelStatus, LiveStatus, STATUS_NAMESPACES, STATUS_SCHEMA_VERSION,
+    ApprovalChannelStatus, LiveStatus, ServerHealth, SshSigningStatus, STATUS_NAMESPACES,
+    STATUS_SCHEMA_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -158,6 +159,13 @@ pub fn render_status(out: &mut dyn Write, ls: &LiveStatus) {
         let _ = writeln!(out, "config:   {}", ls.config_path);
     }
     let _ = writeln!(out, "started:  {}", ls.started_at);
+    // This machine's identity; an older daemon's snapshot carries neither field and
+    // prints no line.
+    if let Some(m) = &ls.machine {
+        let _ = writeln!(out, "machine:  {} ({})", m.name, m.id);
+    } else if !ls.machine_error.is_empty() {
+        let _ = writeln!(out, "machine:  unavailable: {}", ls.machine_error);
+    }
     let _ = writeln!(out);
 
     let gated: std::collections::HashSet<&str> =
@@ -179,6 +187,13 @@ pub fn render_status(out: &mut dyn Write, ls: &LiveStatus) {
     }
     tabwrite(out, &rows);
     let _ = writeln!(out);
+
+    // What this machine signs for a shed (plan 035 §3.5); an older daemon's snapshot
+    // has no block and prints nothing.
+    if let Some(ssh) = &ls.ssh {
+        render_ssh_signing(out, ssh);
+        let _ = writeln!(out);
+    }
 
     let _ = writeln!(out, "Approval channel:");
     let _ = writeln!(out, "  socket    {}", ls.approval_channel.socket_path);
@@ -221,6 +236,97 @@ pub fn render_status(out: &mut dyn Write, ls: &LiveStatus) {
             ]);
         }
         tabwrite(out, &srows);
+        render_source_hint(out, sv, ls);
+    }
+}
+
+/// The `SSH signing:` block: the backend mode, the usernames a login is signed for, and
+/// the keys offered to sheds — `N offered` without a filter, `N of M offered` with one,
+/// `not listed yet` before the first listing (a forwarded agent is not asked until a shed
+/// asks).
+fn render_ssh_signing(out: &mut dyn Write, ssh: &SshSigningStatus) {
+    let users = if ssh.allow_users.is_empty() {
+        "(none)".to_string()
+    } else {
+        ssh.allow_users.join(", ")
+    };
+    let filter = if ssh.key_filter {
+        "(ssh.offer_keys)"
+    } else {
+        "(no ssh.offer_keys filter)"
+    };
+    let keys = match (ssh.keys_offered, ssh.keys_available) {
+        (Some(offered), Some(available)) if ssh.key_filter => {
+            format!("{offered} of {available} offered {filter}")
+        }
+        (Some(offered), _) => format!("{offered} offered {filter}"),
+        (None, _) => format!("not listed yet {filter}"),
+    };
+    let _ = writeln!(out, "SSH signing:");
+    let _ = writeln!(out, "  mode   {}", ssh.mode);
+    let _ = writeln!(out, "  users  {users}");
+    let _ = writeln!(out, "  keys   {keys}");
+}
+
+/// Under a server where any namespace is `not-source` (plan 035 §3.4): who the source is,
+/// and the exact command that makes THIS machine the source. Nothing for any other
+/// server, so an existing report is unchanged.
+fn render_source_hint(out: &mut dyn Write, sv: &ServerHealth, ls: &LiveStatus) {
+    let source = sv.active_source.clone().or_else(|| {
+        sv.namespaces
+            .iter()
+            .find(|n| n.state == "not-source")
+            .map(|n| n.active_source.clone().unwrap_or_default())
+    });
+    let Some(source) = source else {
+        return;
+    };
+    let who = match (source.machine_name.is_empty(), source.machine_id.is_empty()) {
+        (false, _) => source.machine_name.clone(),
+        (true, false) => source.machine_id.clone(),
+        (true, true) => "another machine".to_string(),
+    };
+    let _ = writeln!(
+        out,
+        "    this machine is not the credential source here; the active source is {who}"
+    );
+    if let Some(m) = &ls.machine {
+        let _ = writeln!(
+            out,
+            "    to make this machine ({}) the source: {}",
+            m.name,
+            source_use_command(&sv.name, &m.id)
+        );
+    }
+}
+
+/// The command that makes this machine the source on `server` (empty: the unnamed
+/// single-server target, no `-s`): `shed [-s <server>] source use -- <id>`. It names the
+/// machine by its full id, never its name: two of a user's machines can share a name
+/// (the same hostname), and the CLI refuses a name that matches more than one. The `--`
+/// ends option parsing.
+fn source_use_command(server: &str, machine_id: &str) -> String {
+    let server = if server.is_empty() {
+        String::new()
+    } else {
+        format!("-s {} ", shell_word(server))
+    };
+    format!("shed {server}source use -- {}", shell_word(machine_id))
+}
+
+/// `s` as one shell word: bare only when it is non-empty and made only of ASCII letters,
+/// digits, `.`, `_` and `-`; otherwise single-quoted (an embedded `'` closed, escaped
+/// and reopened). Anything else is quoted: `=` alone begins a zsh filename expansion
+/// (`=sh` becomes `/usr/bin/sh`), and a short allow-list is easier to trust than a list
+/// of what each shell treats specially.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
@@ -282,7 +388,9 @@ fn server_label(name: &str) -> &str {
 fn conn_mark(state: &str) -> &'static str {
     match state {
         "connected" => "ok",
-        "stopped" => "-",
+        // Waiting for another machine to stop being the source is not a fault, and nor
+        // is standing by while the desktop app's embedded broker answers.
+        "stopped" | "not-source" | "yielding" => "-",
         _ => "x",
     }
 }
@@ -306,6 +414,7 @@ mod tests {
             state: state.to_string(),
             last_error: last_error.to_string(),
             since: String::new(),
+            active_source: None,
         }
     }
 
@@ -364,7 +473,11 @@ mod tests {
                 name: "mac".to_string(),
                 url: "http://localhost:8080".to_string(),
                 namespaces: vec![ns("ssh-agent", "connected", "")],
+                active_source: None,
             }],
+            machine: None,
+            machine_error: String::new(),
+            ssh: None,
         }
     }
 
@@ -428,13 +541,18 @@ mod tests {
                         ),
                         ns("docker-credentials", "stopped", ""),
                     ],
+                    active_source: None,
                 },
                 ServerHealth {
                     name: "mini2".to_string(),
                     url: "https://mini2:8443".to_string(),
                     namespaces: vec![],
+                    active_source: None,
                 },
             ],
+            machine: None,
+            machine_error: String::new(),
+            ssh: None,
         };
         let mut out: Vec<u8> = Vec::new();
         render_status(&mut out, &ls);
@@ -463,6 +581,255 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// The `SSH signing:` block sits between the policies and the approval channel, one
+    /// line per keys state: counted without a filter, counted with one, not listed yet;
+    /// an empty allow list reads `(none)`. A snapshot without the block (an older daemon,
+    /// the cases above) prints nothing.
+    #[test]
+    fn render_status_ssh_signing_block_per_keys_state() {
+        let ssh = |users: &[&str], filter: bool, counts: Option<(usize, usize)>| SshSigningStatus {
+            mode: "agent-forward".to_string(),
+            allow_users: users.iter().map(|u| u.to_string()).collect(),
+            key_filter: filter,
+            keys_offered: counts.map(|c| c.0),
+            keys_available: counts.map(|c| c.1),
+        };
+        let cases = [
+            (
+                ssh(&["git"], false, Some((12, 12))),
+                "  users  git",
+                "  keys   12 offered (no ssh.offer_keys filter)",
+            ),
+            (
+                ssh(&["git", "deploy"], true, Some((2, 12))),
+                "  users  git, deploy",
+                "  keys   2 of 12 offered (ssh.offer_keys)",
+            ),
+            (
+                ssh(&["git"], false, None),
+                "  users  git",
+                "  keys   not listed yet (no ssh.offer_keys filter)",
+            ),
+            (
+                ssh(&[], true, None),
+                "  users  (none)",
+                "  keys   not listed yet (ssh.offer_keys)",
+            ),
+        ];
+        for (block, users, keys) in cases {
+            let mut ls = sample_status();
+            ls.ssh = Some(block);
+            let mut out: Vec<u8> = Vec::new();
+            render_status(&mut out, &ls);
+            let got = String::from_utf8(out).unwrap();
+            let lines: Vec<&str> = got.lines().collect();
+            let at = lines.iter().position(|l| *l == "SSH signing:").expect(&got);
+            assert_eq!(lines[at - 1], "", "{got}");
+            assert_eq!(
+                lines[at - 2],
+                "  docker-credentials  approve-all   ",
+                "{got}"
+            );
+            assert_eq!(
+                &lines[at + 1..at + 6],
+                [
+                    "  mode   agent-forward",
+                    users,
+                    keys,
+                    "",
+                    "Approval channel:"
+                ],
+                "{got}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_status_shows_the_machine_after_started() {
+        let mut ls = sample_status();
+        ls.machine = Some(shed_broker::MachineIdentity {
+            id: "0123456789abcdef0123456789abcdef".to_string(),
+            name: "laptop (work)".to_string(),
+        });
+        let mut out: Vec<u8> = Vec::new();
+        render_status(&mut out, &ls);
+        let got = String::from_utf8(out).unwrap();
+        let head: Vec<&str> = got.lines().take(5).collect();
+        assert_eq!(
+            head,
+            [
+                "shed-host-agent status (pid 4242, v9)",
+                "config:   /opt/homebrew/etc/shed/extensions.yaml",
+                "started:  2026-06-11T00:00:00Z",
+                "machine:  laptop (work) (0123456789abcdef0123456789abcdef)",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn render_status_says_why_there_is_no_machine() {
+        let mut ls = sample_status();
+        ls.machine_error = "read machine identity /x/machine.json: Permission denied".into();
+        let mut out: Vec<u8> = Vec::new();
+        render_status(&mut out, &ls);
+        let got = String::from_utf8(out).unwrap();
+        assert_eq!(
+            got.lines().nth(3),
+            Some("machine:  unavailable: read machine identity /x/machine.json: Permission denied")
+        );
+    }
+
+    /// A server with a `not-source` namespace reads as not the source: an idle `-` mark,
+    /// the active machine in the row and in a hint, and the exact command that moves the
+    /// source here — naming this machine by its full id (a name can be shared by two
+    /// machines; the CLI refuses an ambiguous one), with the name on the same line so a
+    /// person sees which machine it is. A `duplicate` namespace is a fault mark and adds
+    /// no hint; a `yielding` one (the desktop app's embedded broker answers) is idle and
+    /// adds no hint either.
+    #[test]
+    fn render_status_not_source_hint_names_the_command() {
+        let src = shed_broker::ActiveSource {
+            machine_id: "0123456789abcdef0123456789abcdef".into(),
+            machine_name: "desk".into(),
+        };
+        let mut ls = sample_status();
+        ls.machine = Some(shed_broker::MachineIdentity {
+            id: "fedcba9876543210fedcba9876543210".into(),
+            name: "laptop (work)".into(),
+        });
+        let mut not_source = ns(
+            "ssh-agent",
+            "not-source",
+            "not the credential source for this server; the active source is desk (0123456789abcdef0123456789abcdef)",
+        );
+        not_source.active_source = Some(src.clone());
+        ls.servers = vec![
+            ServerHealth {
+                name: "alpha".into(),
+                url: "https://alpha.example:8443".into(),
+                namespaces: vec![ns("docker-credentials", "connected", ""), not_source],
+                active_source: Some(src),
+            },
+            ServerHealth {
+                name: String::new(),
+                url: "http://localhost:8080".into(),
+                namespaces: vec![
+                    ns("ssh-agent", "duplicate", "another process"),
+                    ns("docker-credentials", "yielding", "the desktop app answers"),
+                ],
+                active_source: None,
+            },
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        render_status(&mut out, &ls);
+        let got = String::from_utf8(out).unwrap();
+        let tail: Vec<&str> = got
+            .lines()
+            .skip_while(|l| !l.starts_with("Servers"))
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "Servers (2):",
+                "  alpha  (https://alpha.example:8443)",
+                "    ok  docker-credentials  connected",
+                "    -   ssh-agent           not-source: not the credential source for this server; the active source is desk (0123456789abcdef0123456789abcdef)",
+                "    this machine is not the credential source here; the active source is desk",
+                "    to make this machine (laptop (work)) the source: shed -s alpha source use -- fedcba9876543210fedcba9876543210",
+                "  (default)  (http://localhost:8080)",
+                "    x  ssh-agent           duplicate: another process",
+                "    -  docker-credentials  yielding: the desktop app answers",
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_word_quotes_only_when_needed() {
+        assert_eq!(shell_word("box-2.lan_x"), "box-2.lan_x");
+        assert_eq!(shell_word("-rf"), "-rf");
+        for (raw, want) in [
+            ("", "''"),
+            ("=sh", "'=sh'"),
+            ("laptop (work)", "'laptop (work)'"),
+            ("it's", "'it'\\''s'"),
+            ("a$(id)b", "'a$(id)b'"),
+            ("`id`", "'`id`'"),
+            ("x;rm", "'x;rm'"),
+            ("two\nlines", "'two\nlines'"),
+            ("büro", "'büro'"),
+            ("~root", "'~root'"),
+            ("a@b:c/d", "'a@b:c/d'"),
+        ] {
+            assert_eq!(shell_word(raw), want, "{raw:?}");
+        }
+        assert_eq!(
+            source_use_command("", "laptop"),
+            "shed source use -- laptop"
+        );
+        assert_eq!(
+            source_use_command("=sh", "-rf"),
+            "shed -s '=sh' source use -- -rf"
+        );
+    }
+
+    /// The printed command, run by a real shell, gives `shed` exactly the intended
+    /// arguments — every awkward name and server arrives as ONE literal word, `--` before
+    /// the name. Run under `sh` and, where installed, `bash` and `zsh` (where a bare
+    /// `=sh` would have become `/usr/bin/sh`).
+    #[test]
+    fn source_use_command_round_trips_through_real_shells() {
+        let words = [
+            "=sh",
+            "-rf",
+            "--help",
+            "laptop (work)",
+            "it's here",
+            "\"quoted\"",
+            "a$(echo pwned)b",
+            "`echo pwned`",
+            "x; echo pwned",
+            "two\nlines",
+            "tab\there",
+            "büro 日本",
+            "~root",
+            "*",
+            "!!",
+            "",
+        ];
+        let shells: Vec<&str> = ["/bin/sh", "/bin/bash", "/bin/zsh", "/usr/bin/zsh"]
+            .into_iter()
+            .filter(|p| std::path::Path::new(p).exists())
+            .collect();
+        assert!(!shells.is_empty());
+        for shell in shells {
+            for server in ["", "alpha", "=sh", "-x", "my server"] {
+                for name in words {
+                    let line = source_use_command(server, name);
+                    // `shed` is a shell function printing each argument NUL-terminated.
+                    let script = format!("shed() {{ printf '%s\\0' \"$@\"; }}\n{line}\n");
+                    let out = std::process::Command::new(shell)
+                        .arg("-c")
+                        .arg(&script)
+                        .output()
+                        .unwrap();
+                    assert!(out.status.success(), "{shell}: {line:?}: {out:?}");
+                    let got: Vec<String> = String::from_utf8(out.stdout)
+                        .unwrap()
+                        .split_terminator('\0')
+                        .map(str::to_string)
+                        .collect();
+                    let mut want: Vec<String> = Vec::new();
+                    if !server.is_empty() {
+                        want.extend(["-s".to_string(), server.to_string()]);
+                    }
+                    want.extend(["source", "use", "--", name].map(str::to_string));
+                    assert_eq!(got, want, "{shell}: {line:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn render_status_no_consumer_landmarks() {
         let ls = LiveStatus {
@@ -485,6 +852,9 @@ mod tests {
                 client_version: String::new(),
             },
             servers: vec![],
+            machine: None,
+            machine_error: String::new(),
+            ssh: None,
         };
         let mut out: Vec<u8> = Vec::new();
         render_status(&mut out, &ls);

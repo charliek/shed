@@ -22,6 +22,12 @@ type testBackend struct {
 	dialFunc        func(ctx context.Context, shedName string, port uint16) (net.Conn, error)
 }
 
+// GetShed reports every name as an existing shed: the access guard loads a
+// shed before it lets a dial through. The dial decides the rest.
+func (b *testBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
+	return &config.Shed{Name: name, Status: config.StatusRunning}, nil
+}
+
 func (b *testBackend) DialService(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
 	return b.dialFunc(ctx, shedName, port)
 }

@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -128,9 +128,13 @@ test-machine-transport:
 #   4. make build && make dev-server-restart  # pick up the new binary
 #   5. make dev-server-down              # when done
 #
-# Setup (one-time per developer):
-#   - Add a ~/.shed/config.yaml entry for $(SHED_VZ_DEV_SERVER); see
-#     CLAUDE.md or tests/integration/README.md for the snippet.
+# Setup (one-time per developer), after the first `make dev-server-up`:
+#   shed server add localhost --ssh-port 12222 --name $(SHED_VZ_DEV_SERVER)
+#   (first contact is over SSH and enrols an mtls client certificate; see
+#   CLAUDE.md or tests/integration/README.md). The dev server keeps its
+#   identity in its own state_dir (~/.shed/dev/state), not the brew server's
+#   ~/.shed; dev-server-up says when a start made a new one and how to re-add
+#   the entry.
 #
 # Why no launchd plist:
 #   The dev server is intentionally ephemeral — no auto-restart on
@@ -150,15 +154,6 @@ DEV_LOG_PATH := $(HOME)/.shed/dev/server.log
 DEV_PID_PATH := $(HOME)/.shed/dev/server.pid
 DEV_CONFIG   := $(CURDIR)/configs/server.dev-parallel.mac.yaml
 
-# auth.mode for the dev server: "token" (default) or "mtls". "token" needs no
-# override at all; "mtls" renders a throwaway copy with auth.mode: mtls (see
-# DEV_GENERATED_CONFIG below). Honored by dev-server-up / dev-server-restart
-# (and the -fc variants below). Forwarded to `make test-integration-dev[-fc]`
-# so tests/integration/test_mtls.py can detect which mode the running dev
-# server is actually in (it skips cleanly unless this is "mtls" — see that
-# module's docstring for the detection mechanism).
-SHED_DEV_AUTH_MODE ?= token
-
 # OPTIONAL, per-machine: relocate the dev server's blob-heavy state (images,
 # instances, snapshots, uppers) off the boot volume. Unset by default, which
 # is the committed config's `~/Library/Application Support/shed-dev/vz` — so
@@ -170,17 +165,81 @@ SHED_DEV_AUTH_MODE ?= token
 #   export SHED_DEV_STATE_DIR=/Volumes/miniext/shed-dev/vz
 #
 # socket_dir is deliberately NOT relocated (unix socket path length limits) —
-# see scripts/render-dev-config.sh. The volume must be mounted; dev-server-up
-# refuses to start otherwise rather than silently building a second, empty
-# image store on the mount point.
+# see scripts/render-dev-config.sh — and neither is the dev server's identity
+# directory (state_dir: ~/.shed/dev/state in $(DEV_CONFIG): host key, TLS
+# certificate, client CA, upgrade marker, pins). The volume must be mounted;
+# dev-server-up refuses to start otherwise rather than silently building a
+# second, empty image store on the mount point.
 SHED_DEV_STATE_DIR ?=
+
+# OPTIONAL: start a dev server with the integration suite's itest user list
+# (auth.users: itest-admin, itest-alice, itest-bob, and the config's own
+# auth.ssh key sources moved under the admin user `dev`), so the users cases
+# (tests/integration/test_users.py) can run against it. Empty (the default):
+# no user list, one implicit user. `itest`: dev-server-up, -up-fc and
+# -up-remote (and their restarts) render the config with
+# `scripts/render-dev-config.sh --users $(SHED_ITEST_USERS_DIR)`, and
+# test-integration-dev-fc and -remote tell the suite so
+# (SHED_ITEST_USERS=<backend>). The suite's [vz] users cases restart the Mac
+# dev server with the list themselves (and restore the committed base), so
+# test-integration-dev needs neither. The keys are generated once, outside
+# the repo (`make dev-itest-users`). Needs uv.
+SHED_DEV_USERS ?=
+SHED_ITEST_USERS_DIR ?= $(HOME)/.shed/dev/itest-users
+
+# These reach the recipes through the environment and are read there as
+# quoted shell variables ("$$SHED_ITEST_USERS_DIR"), never pasted into recipe
+# text, so a directory with a space, a quote or a `$` in it is one argument
+# and is never run as code.
+export SHED_DEV_STATE_DIR SHED_DEV_USERS SHED_ITEST_USERS_DIR
+
+# The config renderer the dev targets run, and the shed-server binary the Mac
+# and remote dev targets launch. Variables only so the fixture unit tests
+# (tests/integration/test_fixture_units.py) can put stubs in their place.
+DEV_RENDER_SCRIPT ?= ./scripts/render-dev-config.sh
+DEV_SERVER_BIN ?= bin/shed-server
 
 # The rendered config, written whenever ANY override above is active. With no
 # overrides the targets run the committed $(DEV_CONFIG) directly — byte
 # identical to having no generation step at all.
 DEV_GENERATED_CONFIG := $(HOME)/.shed/dev/server.generated.yaml
-DEV_RENDER_ARGS := $(if $(filter mtls,$(SHED_DEV_AUTH_MODE)),--mtls,) \
-                   $(if $(SHED_DEV_STATE_DIR),--state-dir $(SHED_DEV_STATE_DIR),)
+DEV_RENDER := $(if $(or $(SHED_DEV_STATE_DIR),$(filter itest,$(SHED_DEV_USERS))),yes,)
+
+# Every dev target that renders a config checks what it is about to start
+# with. A failed render must never fall through to a launch: shed-server
+# given `--config ""` (or an empty file) loads its normal config search
+# paths, so a dev target could start a server on the developer's own config
+# and state. This leaves the shell variable RUN_CONFIG set and exits the
+# shell unless it names a non-empty file. Each config snippet below removes
+# its output before rendering, so a renderer that fails, or "succeeds"
+# without writing, cannot leave an earlier file in place to pass this check.
+define dev-check-run-config
+if [ -z "$$RUN_CONFIG" ] || [ ! -f "$$RUN_CONFIG" ] || [ ! -s "$$RUN_CONFIG" ]; then \
+  echo "ERROR: no usable dev server config ('$$RUN_CONFIG' is unset, missing or empty); not starting shed-server."; \
+  exit 1; \
+fi
+endef
+
+# The Mac dev server's config: the committed $(DEV_CONFIG) with no override,
+# else $(DEV_GENERATED_CONFIG) rendered from it with --state-dir and/or
+# --users. Sets RUN_CONFIG; exits the shell on any failure.
+define dev-mac-config
+if [ -n "$(DEV_RENDER)" ]; then \
+  RUN_CONFIG="$(DEV_GENERATED_CONFIG)"; \
+  set --; \
+  if [ -n "$$SHED_DEV_STATE_DIR" ]; then set -- "$$@" --state-dir "$$SHED_DEV_STATE_DIR"; fi; \
+  if [ "$$SHED_DEV_USERS" = itest ]; then set -- "$$@" --users "$$SHED_ITEST_USERS_DIR"; fi; \
+  rm -f "$$RUN_CONFIG"; \
+  if ! $(DEV_RENDER_SCRIPT) "$(DEV_CONFIG)" "$$RUN_CONFIG" "$$@"; then \
+    rm -f "$$RUN_CONFIG"; \
+    echo "ERROR: rendering the dev server config failed (above); not starting shed-server."; \
+    exit 1; \
+  fi; \
+else \
+  RUN_CONFIG="$(DEV_CONFIG)"; \
+fi; \
+$(dev-check-run-config)
+endef
 
 # Refuse to start when SHED_DEV_STATE_DIR points somewhere unwritable — an
 # external volume that isn't mounted, typically. Without this the server
@@ -218,7 +277,46 @@ endef
 # to pin to a non-latest release.
 RELEASE_BUILD_TOOLS_REF ?= $(shell git tag --list 'v*' --sort=-version:refname | head -1 | sed 's|^|ghcr.io/charliek/shed-build-tools:|')
 
-dev-server-up: build
+# SHED_DEV_AUTH_MODE was removed: both parallel dev servers run their
+# committed configs, which are mtls, and shed-server no longer loads a token
+# config at all. A value left in the environment fails here with one line,
+# before anything is stopped or started, rather than being silently ignored.
+check-no-dev-auth-mode:
+	@if [ -n "$(SHED_DEV_AUTH_MODE)" ]; then \
+	  echo "ERROR: SHED_DEV_AUTH_MODE was removed; the dev servers run mtls only. Unset it (got '$(SHED_DEV_AUTH_MODE)')."; \
+	  exit 1; \
+	fi
+
+# SHED_DEV_USERS takes '' or `itest`; anything else stops here, before
+# anything is stopped or started.
+check-dev-users:
+	@case "$$SHED_DEV_USERS" in \
+	  ""|itest) ;; \
+	  *) echo "ERROR: SHED_DEV_USERS is '$$SHED_DEV_USERS'; want empty (no user list) or itest."; exit 1 ;; \
+	esac
+
+# Generate the itest users' keys (idempotent; an existing key is never
+# replaced, since a running server may have been started with it).
+dev-itest-users:
+	@command -v uv >/dev/null 2>&1 || { echo "uv is required (https://docs.astral.sh/uv/)."; exit 1; }
+	cd tests/integration && uv run --quiet python -m fixtures.identity --dir "$$SHED_ITEST_USERS_DIR" keys
+
+# The Mac dev server's settings guard: the removed auth knob, SHED_DEV_USERS
+# and SHED_DEV_STATE_DIR. A prerequisite of dev-server-up and of
+# dev-server-restart, so a bad value fails before anything is stopped or
+# started. (dev-server-restart runs its stop and start from its recipe,
+# which make starts only once this has succeeded, whatever -j is.)
+check-dev-settings: check-no-dev-auth-mode check-dev-users
+	$(call check-dev-state-dir)
+
+# Render (when an override is active) and check the Mac dev server's config.
+# A prerequisite of dev-server-restart, so a render that fails stops the
+# restart before the running server is stopped. dev-server-up renders again
+# in its launch shell and checks again there.
+check-dev-config: check-dev-settings
+	@$(dev-mac-config); echo "Dev server config: $$RUN_CONFIG"
+
+dev-server-up: check-dev-settings build
 	@case "$$(uname -s)" in \
 	  Darwin) ;; \
 	  *) echo "ERROR: dev-server-up targets the local Mac VZ shed-server."; \
@@ -234,17 +332,14 @@ dev-server-up: build
 	  echo "       or 'make dev-server-down' to stop it first."; \
 	  exit 1; \
 	fi
-	@case "$(SHED_DEV_AUTH_MODE)" in \
-	  token|mtls) ;; \
-	  *) echo "ERROR: SHED_DEV_AUTH_MODE must be 'token' or 'mtls' (got '$(SHED_DEV_AUTH_MODE)')"; exit 1 ;; \
-	esac
-	$(call check-dev-state-dir)
 	@# Select the config: with NO overrides (the default) the committed
-	@# $(DEV_CONFIG) runs untouched — no generation step at all. Any override
-	@# (SHED_DEV_AUTH_MODE=mtls and/or SHED_DEV_STATE_DIR) renders a throwaway
-	@# variant first; the committed base is never edited. Combined into the
-	@# SAME shell invocation as the nohup launch below (Make starts a fresh
-	@# subshell per recipe line; RUN_CONFIG must survive into the launch line).
+	@# $(DEV_CONFIG) runs untouched — no generation step at all. An override
+	@# (SHED_DEV_STATE_DIR, SHED_DEV_USERS=itest) renders a throwaway variant
+	@# first; the committed base is never edited. A failed render, or a config
+	@# that is missing or empty, exits here before the launch (dev-mac-config).
+	@# Combined into the SAME shell invocation as the nohup launch below (Make
+	@# starts a fresh subshell per recipe line; RUN_CONFIG must survive into
+	@# the launch line).
 	@#
 	@# Inline env so we don't pollute the caller's launchctl domain
 	@# (and so the brew server's launchctl env is left alone). Note
@@ -252,46 +347,69 @@ dev-server-up: build
 	@# Makefile-level variable that holds its value is named
 	@# RELEASE_BUILD_TOOLS_REF (because it points at the *release*
 	@# tooling image).
-	@if [ -n "$(strip $(DEV_RENDER_ARGS))" ]; then \
-	  ./scripts/render-dev-config.sh "$(DEV_CONFIG)" "$(DEV_GENERATED_CONFIG)" $(DEV_RENDER_ARGS) \
-	    && RUN_CONFIG="$(DEV_GENERATED_CONFIG)"; \
-	else \
-	  RUN_CONFIG="$(DEV_CONFIG)"; \
-	fi; \
+	@$(dev-mac-config); \
 	SHED_BUILD_TOOLS_REF="$(RELEASE_BUILD_TOOLS_REF)" \
-	  nohup bin/shed-server serve --config "$$RUN_CONFIG" \
+	  nohup $(DEV_SERVER_BIN) serve --config "$$RUN_CONFIG" \
 	    > "$(DEV_LOG_PATH)" 2>&1 & \
 	  echo $$! > "$(DEV_PID_PATH)"
-	@# Readiness probe. Reads the server's OWN readiness line rather than
-	@# probing with the CLI: a CLI probe needs an enrolled client entry, which
-	@# under auth.mode: mtls does not exist until `shed server add` has run —
-	@# so a CLI probe reports a perfectly healthy mtls server as "not
-	@# reachable". The log line is mode-independent and needs no credential.
-	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-	  if grep -q "Shed server is ready" "$(DEV_LOG_PATH)" 2>/dev/null; then \
-	    echo "Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) ready after $${i}s."; \
-	    break; \
-	  fi; \
-	  if [ "$$i" = "15" ]; then \
-	    echo "WARNING: Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) did not report ready after 15 s."; \
-	    echo "  - Tail the log:  make dev-server-logs   (or 'tail $(DEV_LOG_PATH)')"; \
-	    echo "  - Brew server:   should be unaffected; 'shed -s $(SHED_VZ_SERVER) list' still works"; \
-	  fi; \
-	  sleep 1; \
-	done
+	@# Readiness probe: scripts/dev-server-probe.sh. Not a CLI probe, which
+	@# needs an enrolled client entry that under auth.mode: mtls does not
+	@# exist until `shed server add` has run. Not the readiness log line
+	@# alone either: serve.go logs it before it reads its listeners' errors,
+	@# so a server that cannot bind its port logs "ready" and then exits. The
+	@# script also wants the process alive, every logged listener accepting a
+	@# TCP connection, and no "Server error:" a second later. A server that
+	@# died fails this target rather than being reported up. The polling is
+	@# scripts/dev-server-wait.sh, shared by all three dev-server-up targets:
+	@# 0 ready, 1 still not ready after the tries, anything else failed (a
+	@# probe that refuses its arguments is a failure, never "not yet").
+	@PID=$$(cat "$(DEV_PID_PATH)"); \
+	STATE=$$(bash ./scripts/dev-server-wait.sh 15 -- bash ./scripts/dev-server-probe.sh "$(DEV_LOG_PATH)" "$$PID"); RC=$$?; \
+	case "$$RC" in \
+	  0) echo "Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) ready: $$STATE." ;; \
+	  1) echo "WARNING: Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) not ready after 15 s ($$STATE)."; \
+	     echo "  - Tail the log:  make dev-server-logs   (or 'tail $(DEV_LOG_PATH)')"; \
+	     echo "  - Brew server:   should be unaffected; 'shed -s $(SHED_VZ_SERVER) list' still works" ;; \
+	  *) echo "ERROR: Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) did not start: $$STATE"; \
+	     echo "  Last lines of $(DEV_LOG_PATH):"; \
+	     tail -n 20 "$(DEV_LOG_PATH)"; \
+	     exit 1 ;; \
+	esac
 	@echo ""
 	@echo "Dev shed-server up: pid $$(cat $(DEV_PID_PATH))"
-	@echo "  Auth mode: $(SHED_DEV_AUTH_MODE)"
-	@if [ -n "$(strip $(DEV_RENDER_ARGS))" ]; then \
+	@if [ -n "$(DEV_RENDER)" ]; then \
 	  echo "  Config:  $(DEV_GENERATED_CONFIG) (generated from $(DEV_CONFIG))"; \
 	else \
 	  echo "  Config:  $(DEV_CONFIG)"; \
 	fi
-	@if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
-	  echo "  State:   $(SHED_DEV_STATE_DIR) (SHED_DEV_STATE_DIR)"; \
+	@if [ -n "$$SHED_DEV_STATE_DIR" ]; then \
+	  echo "  State:   $$SHED_DEV_STATE_DIR (SHED_DEV_STATE_DIR)"; \
+	fi
+	@if [ "$$SHED_DEV_USERS" = itest ]; then \
+	  echo "  Users:   the itest user list (keys in $$SHED_ITEST_USERS_DIR); you are user dev"; \
 	fi
 	@echo "  Log:     $(DEV_LOG_PATH)"
 	@echo "  CLI:     shed -s $(SHED_VZ_DEV_SERVER) list"
+	@# Its identity directory (the config's own state_dir, never the brew
+	@# server's ~/.shed), as the server logged it. A start that made a new SSH
+	@# host key there (its first start in that directory) also made a new TLS
+	@# certificate and client CA, so a CLI entry added before no longer
+	@# matches: say how to re-add that one entry. Nothing here edits
+	@# ~/.shed/config.yaml or ~/.shed/known_hosts.
+	@STATE=$$(sed -n 's/.*State dir: //p' "$(DEV_LOG_PATH)" 2>/dev/null | head -n 1); \
+	if [ -n "$$STATE" ]; then echo "  Identity: $$STATE (host key, TLS certificate, client CA, pins)"; fi; \
+	if grep -qF 'Generated new host key:' "$(DEV_LOG_PATH)" 2>/dev/null; then \
+	  echo ""; \
+	  echo "NOTE: this start made a new SSH host key in $${STATE:-the dev server state directory}"; \
+	  echo "  (on a first start there, a new TLS certificate and client CA too). A"; \
+	  echo "  $(SHED_VZ_DEV_SERVER) entry added before this no longer matches it. Remove only that"; \
+	  echo "  entry and its host key line, then add it again:"; \
+	  echo "    shed server remove $(SHED_VZ_DEV_SERVER)"; \
+	  echo "    ssh-keygen -R '[localhost]:12222' -f ~/.shed/known_hosts"; \
+	  echo "    shed server add localhost --ssh-port 12222 --name $(SHED_VZ_DEV_SERVER)"; \
+	  echo "  Leave every other entry, and default_server, alone. With no entry yet, only the add."; \
+	  echo ""; \
+	fi
 	@echo "Run 'make test-integration-dev' to run the suite against it."
 
 dev-server-down:
@@ -351,12 +469,11 @@ dev-server-status:
 	  fi; \
 	  echo "Log:        $(DEV_LOG_PATH)"; \
 	  echo "Config:     $(DEV_CONFIG)"; \
+	  STATE=$$(sed -n 's/.*State dir: //p' "$(DEV_LOG_PATH)" 2>/dev/null | head -n 1); \
+	  if [ -n "$$STATE" ]; then echo "Identity:   $$STATE"; fi; \
 	  if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
 	    echo "State dir:  $(SHED_DEV_STATE_DIR) (SHED_DEV_STATE_DIR now in effect)"; \
 	  fi; \
-	  echo "Auth mode:  $(SHED_DEV_AUTH_MODE) (the SHED_DEV_AUTH_MODE value now in effect;"; \
-	  echo "            not introspected from the running process — rerun with the"; \
-	  echo "            same value used at 'dev-server-up'/'-restart' time)"; \
 	else \
 	  echo "Dev server: NOT running"; \
 	  if [ -f "$(DEV_PID_PATH)" ]; then \
@@ -371,7 +488,14 @@ dev-server-logs:
 	fi
 	@tail -F "$(DEV_LOG_PATH)"
 
-dev-server-restart: dev-server-down dev-server-up
+# Stop, then start, from the recipe rather than as sibling prerequisites:
+# make runs this recipe only after check-dev-settings and check-dev-config
+# have succeeded, so a rejected setting or a config that cannot be rendered
+# never stops the running server, and the stop finishes before the start
+# begins, whatever -j is.
+dev-server-restart: check-dev-config
+	@$(MAKE) --no-print-directory dev-server-down
+	@$(MAKE) --no-print-directory dev-server-up
 
 # Run the integration suite against the parallel dev shed-server.
 # Auto-starts the dev server if it isn't already running. Doesn't
@@ -388,7 +512,7 @@ dev-server-restart: dev-server-down dev-server-up
 #
 # If you rebuilt the source but the dev server is still running the
 # old binary, run 'make dev-server-restart' before this target.
-test-integration-dev: build
+test-integration-dev: check-no-dev-auth-mode build
 	@case "$$(uname -s)" in \
 	  Darwin) ;; \
 	  *) echo "ERROR: test-integration-dev targets the local Mac VZ dev server."; \
@@ -406,10 +530,6 @@ test-integration-dev: build
 	@# dev-specific meta-tests can use `shed_server_dev` without needing
 	@# a different Make target.
 	@#
-	@# SHED_DEV_AUTH_MODE is forwarded explicitly (not just relied on to be
-	@# inherited) so `tests/integration/test_mtls.py` sees the exact value
-	@# the dev server was last started/restarted with, regardless of how
-	@# this target was invoked (env var vs. `make ... SHED_DEV_AUTH_MODE=`).
 	@# PATH puts THIS tree's freshly built bin/ first, so the suite drives the
 	@# branch's `shed` rather than the brew-installed release. Without it the
 	@# fixtures resolve `shed` via shutil.which() to /opt/homebrew/bin/shed and
@@ -422,10 +542,10 @@ test-integration-dev: build
 	  SHED_VZ_LOG_PATH=$(DEV_LOG_PATH) \
 	  SHED_VZ_DEV_SERVER=$(SHED_VZ_DEV_SERVER) \
 	  SHED_VZ_DEV_LOG_PATH=$(DEV_LOG_PATH) \
-	  SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE) \
 	  SHED_IMAGE_HAS_ROOST=vz \
 	  SHED_IMAGE_HAS_CRAZE=vz \
 	  SHED_IMAGE_HAS_HOME_DIRS=vz \
+	  SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR" \
 	  $(MAKE) test-integration
 
 # Parallel dev shed-server lifecycle (FC remote).
@@ -442,11 +562,12 @@ test-integration-dev: build
 # matching the intentionally-ephemeral lifecycle of the Mac dev
 # server (crashes visible, no survives-reboot).
 #
-# Setup (one-time per dev workstation):
-#   1. Add a ~/.shed/config.yaml entry for $(SHED_FC_DEV_SERVER)
-#      (snippet in CLAUDE.md / tests/integration/README.md), OR run
-#      `shed server add $(FC_REMOTE_HOST) --port 18080 --ssh-port 12222 --name $(SHED_FC_DEV_SERVER)`
-#      after the first `make dev-server-up-fc`.
+# Setup (one-time per dev workstation), after the first
+# `make dev-server-up-fc`:
+#   shed server add $(FC_REMOTE_HOST) --ssh-port 12222 --name $(SHED_FC_DEV_SERVER)
+#   (first contact is over SSH and enrols an mtls client certificate. An
+#   entry left from when this server ran open is plain HTTP and does not
+#   heal itself: `shed server remove $(SHED_FC_DEV_SERVER)` first.)
 #
 # Assumed infrastructure (same as today's deb install):
 #   - Passwordless SSH from this host to $(FC_REMOTE_HOST).
@@ -456,7 +577,7 @@ test-integration-dev: build
 #     already requires).
 #
 # FC isolation notes:
-#   - Different ports (18080/12222 vs deb's 8080/2222).
+#   - Different ports (mtls HTTPS 18443 + SSH 12222 vs deb's 8080/2222).
 #   - Separate state-dirs under /var/lib/shed-dev/firecracker/.
 #   - Offset vsock_base_cid=600 (deb default is 100) to avoid CID
 #     collision. See configs/server.dev-parallel.linux-fc.yaml.
@@ -486,12 +607,36 @@ FC_DEV_PID_PATH  ?= /tmp/shed-server-dev.pid
 # resolves as its sibling. The dev server runs from /tmp, so install here.
 FC_DEV_PROXY_PATH ?= /tmp/shed-egress-proxy
 
-# Local (this workstation) staging path for the rendered mtls variant of
-# configs/server.dev-parallel.linux-fc.yaml, used when SHED_DEV_AUTH_MODE=mtls
-# (see the SHED_DEV_AUTH_MODE comment above the Mac dev-server-up target).
-# Rendered here, then scp'd to the remote in place of the static committed
-# config — the committed file is never edited.
-FC_DEV_LOCAL_MTLS_CONFIG ?= $(HOME)/.shed/dev/server.fc-mtls-generated.yaml
+# The committed config the FC dev targets upload. It is mtls. It is uploaded
+# untouched unless SHED_DEV_USERS=itest, which renders it with the itest
+# user list first (FC_DEV_USERS_CONFIG).
+FC_DEV_LOCAL_CONFIG := configs/server.dev-parallel.linux-fc.yaml
+FC_DEV_USERS_CONFIG := $(HOME)/.shed/dev/server.dev-fc.users.yaml
+
+# The local file the FC dev targets upload: the committed config, or, with
+# SHED_DEV_USERS=itest, $(FC_DEV_USERS_CONFIG) rendered from it. Sets
+# RUN_CONFIG; exits the shell when the render fails or the file is missing
+# or empty (dev-check-run-config).
+define dev-fc-config
+if [ "$$SHED_DEV_USERS" = itest ]; then \
+  RUN_CONFIG="$(FC_DEV_USERS_CONFIG)"; \
+  rm -f "$$RUN_CONFIG"; \
+  if ! $(DEV_RENDER_SCRIPT) "$(FC_DEV_LOCAL_CONFIG)" "$$RUN_CONFIG" --users "$$SHED_ITEST_USERS_DIR"; then \
+    rm -f "$$RUN_CONFIG"; \
+    echo "ERROR: rendering the FC dev server config failed (above); not starting shed-server."; \
+    exit 1; \
+  fi; \
+else \
+  RUN_CONFIG="$(FC_DEV_LOCAL_CONFIG)"; \
+fi; \
+$(dev-check-run-config)
+endef
+
+# Render and check the FC dev config. A prerequisite of dev-server-restart-fc,
+# so a render that fails stops the restart before the running server is
+# stopped; dev-server-up-fc renders and checks again before its upload.
+check-dev-config-fc: check-no-dev-auth-mode check-dev-users
+	@$(dev-fc-config); echo "FC dev server config: $$RUN_CONFIG"
 
 # Cross-compile shed-server for the remote host's GOARCH. Detects arch
 # at recipe time via `ssh <host> uname -m`; refuses to silently default
@@ -513,14 +658,14 @@ build-fc-remote-server:
 
 # Launch the parallel dev shed-server on the remote via sudo nohup.
 # Refuses to start if a dev server is already running there (PID file
-# check, with comm verification). Polls `shed -s $(SHED_FC_DEV_SERVER)
-# list` for readiness (15 s).
+# check, with comm verification). Polls scripts/dev-server-probe.sh on
+# the remote for readiness (15 s); fails if the server dies starting up.
 #
 # WARNING: this starts a SECOND shed-server on the shared FC host.
 # Any other developer using $(FC_REMOTE_HOST) won't see the deb
 # server change, but if they're also running their own dev server
 # on the same ports, this will conflict. Coordinate.
-dev-server-up-fc: build-fc-remote-server
+dev-server-up-fc: check-no-dev-auth-mode check-dev-users build-fc-remote-server
 	@if [ -z "$(RELEASE_BUILD_TOOLS_REF)" ]; then \
 	  echo "ERROR: RELEASE_BUILD_TOOLS_REF is empty; can't infer from git tag."; \
 	  echo "       Either tag this repo or override on the command line."; exit 1; \
@@ -538,24 +683,18 @@ dev-server-up-fc: build-fc-remote-server
 	  echo "       or 'make dev-server-down-fc' to stop it first."; \
 	  exit 1; \
 	fi
-	@# Select the config to upload: SHED_DEV_AUTH_MODE=token (default) uploads
-	@# the committed configs/server.dev-parallel.linux-fc.yaml untouched; =mtls
-	@# renders a throwaway mtls variant locally first (never edits the
-	@# committed base) and uploads that instead. Same pattern as the Mac
-	@# dev-server-up target; see the SHED_DEV_AUTH_MODE comment there.
-	@case "$(SHED_DEV_AUTH_MODE)" in \
-	  token) LOCAL_CFG="configs/server.dev-parallel.linux-fc.yaml" ;; \
-	  mtls) ./scripts/render-dev-config.sh configs/server.dev-parallel.linux-fc.yaml "$(FC_DEV_LOCAL_MTLS_CONFIG)" --mtls && LOCAL_CFG="$(FC_DEV_LOCAL_MTLS_CONFIG)" ;; \
-	  *) echo "ERROR: SHED_DEV_AUTH_MODE must be 'token' or 'mtls' (got '$(SHED_DEV_AUTH_MODE)')"; exit 1 ;; \
-	esac; \
-	echo "Uploading $$LOCAL_CFG (SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE))..."; \
-	MOUNT_SRCS=$$(grep -E '^[[:space:]]+source:[[:space:]]+/var/lib/shed-dev/mounts/' "$$LOCAL_CFG" | awk '{print $$2}' | tr '\n' ' '); \
+	@# Upload the committed (mtls) config: untouched, or with the itest user
+	@# list when SHED_DEV_USERS=itest. A failed render, or a config that is
+	@# missing or empty, exits here before anything is uploaded or started.
+	@$(dev-fc-config); \
+	echo "Uploading $$RUN_CONFIG..."; \
+	MOUNT_SRCS=$$(grep -E '^[[:space:]]+source:[[:space:]]+/var/lib/shed-dev/mounts/' "$$RUN_CONFIG" | awk '{print $$2}' | tr '\n' ' '); \
 	UPLOAD_BIN=/tmp/shed-server-dev.upload.$$$$; \
 	 UPLOAD_CFG=/tmp/shed-server-dev.upload.$$$$.yaml; \
 	 UPLOAD_PROXY=/tmp/shed-egress-proxy-dev.upload.$$$$; \
 	 scp bin/shed-server-fc-remote $(FC_REMOTE_HOST):$$UPLOAD_BIN && \
 	 scp bin/shed-egress-proxy-fc-remote $(FC_REMOTE_HOST):$$UPLOAD_PROXY && \
-	 scp "$$LOCAL_CFG" $(FC_REMOTE_HOST):$$UPLOAD_CFG && \
+	 scp "$$RUN_CONFIG" $(FC_REMOTE_HOST):$$UPLOAD_CFG && \
 	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "set -e; \
 	   sudo install -m 755 $$UPLOAD_BIN $(FC_DEV_BIN_PATH); \
 	   sudo install -m 755 $$UPLOAD_PROXY $(FC_DEV_PROXY_PATH); \
@@ -567,28 +706,38 @@ dev-server-up-fc: build-fc-remote-server
 	     nohup $(FC_DEV_BIN_PATH) serve --config $(FC_DEV_CONFIG) \
 	     >> $(FC_DEV_LOG_PATH) 2>&1 < /dev/null & \
 	     echo \$$! > $(FC_DEV_PID_PATH)'"
-	@# Readiness probe — same shape as the Mac local dev-server-up's.
-	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-	  if shed -s $(SHED_FC_DEV_SERVER) list >/dev/null 2>&1; then \
-	    echo "Remote FC dev shed-server ($(SHED_FC_DEV_SERVER) on $(FC_REMOTE_HOST)) ready after $${i}s."; \
-	    break; \
-	  fi; \
-	  if [ "$$i" = "15" ]; then \
-	    echo "WARNING: FC dev shed-server ($(SHED_FC_DEV_SERVER) on $(FC_REMOTE_HOST)) not reachable after 15 s."; \
-	    echo "  - Tail the remote log:  make dev-server-logs-fc"; \
-	    echo "  - CLI entry:            verify ~/.shed/config.yaml has '$(SHED_FC_DEV_SERVER)' on $(FC_REMOTE_HOST):18080"; \
-	    echo "  - Deb server:           should be unaffected; 'shed -s $(SHED_FC_SERVER) list' still works"; \
-	  fi; \
-	  sleep 1; \
-	done
+	@# Readiness probe — the Mac dev-server-up's scripts/dev-server-probe.sh,
+	@# piped over ssh and run on the remote against its log (emptied just
+	@# before the launch above, so nothing in it is from an earlier run) and
+	@# the launched pid. Not a CLI probe, which needs an enrolled mtls entry
+	@# that does not exist until `shed server add` has run; not the readiness
+	@# line alone, which serve.go logs before it reads its listeners' errors
+	@# (a server that cannot bind logs "ready", then exits). A server that
+	@# died fails this target. Polled by scripts/dev-server-wait.sh, as the
+	@# Mac target is: an ssh failure (exit 255) is "not yet", the probe's own
+	@# 1 is "not yet", and any other status (the probe refusing its arguments,
+	@# say) is a failure.
+	@STATE=$$(bash ./scripts/dev-server-wait.sh --stdin scripts/dev-server-probe.sh --retry 255 15 -- \
+	    ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) \
+	    "bash -s -- $(FC_DEV_LOG_PATH) \"\$$(sudo -n cat $(FC_DEV_PID_PATH) 2>/dev/null || cat $(FC_DEV_PID_PATH) 2>/dev/null)\""); RC=$$?; \
+	case "$$RC" in \
+	  0) echo "Remote FC dev shed-server ($(SHED_FC_DEV_SERVER) on $(FC_REMOTE_HOST)) ready: $$STATE." ;; \
+	  1) echo "WARNING: FC dev shed-server ($(SHED_FC_DEV_SERVER) on $(FC_REMOTE_HOST)) not ready after 15 s ($$STATE)."; \
+	     echo "  - Tail the remote log:  make dev-server-logs-fc"; \
+	     echo "  - Deb server:           should be unaffected; 'shed -s $(SHED_FC_SERVER) list' still works" ;; \
+	  *) echo "ERROR: FC dev shed-server ($(SHED_FC_DEV_SERVER) on $(FC_REMOTE_HOST)) did not start: $$STATE"; \
+	     echo "  - Read the remote log:  ssh $(FC_REMOTE_HOST) sudo -n tail -n 40 $(FC_DEV_LOG_PATH)"; \
+	     exit 1 ;; \
+	esac
 	@echo ""
 	@echo "Dev FC shed-server up on $(FC_REMOTE_HOST):"
-	@echo "  Auth mode: $(SHED_DEV_AUTH_MODE)"
+	@echo "  Auth mode: mtls"
 	@echo "  Binary:  $(FC_DEV_BIN_PATH)"
-	@echo "  Config:  $(FC_DEV_CONFIG) (remote path; rendered from $(SHED_DEV_AUTH_MODE) mode locally, then uploaded)"
+	@echo "  Config:  $(FC_DEV_CONFIG) (remote path; uploaded from $(FC_DEV_LOCAL_CONFIG))"
 	@echo "  Log:     $(FC_DEV_LOG_PATH)"
 	@echo "  PID:     $(FC_DEV_PID_PATH)"
 	@echo "  CLI:     shed -s $(SHED_FC_DEV_SERVER) list"
+	@echo "           (register once: shed server add $(FC_REMOTE_HOST) --ssh-port 12222 --name $(SHED_FC_DEV_SERVER))"
 	@echo "Build-tools ref (via SHED_BUILD_TOOLS_REF env): $(RELEASE_BUILD_TOOLS_REF)"
 	@echo "Run 'make test-integration-dev-fc' to run the suite against it."
 
@@ -663,14 +812,19 @@ dev-server-status-fc:
 	fi
 	@echo "Log:           $(FC_REMOTE_HOST):$(FC_DEV_LOG_PATH)"
 	@echo "Config:        $(FC_REMOTE_HOST):$(FC_DEV_CONFIG)"
-	@echo "Auth mode:     $(SHED_DEV_AUTH_MODE) (the SHED_DEV_AUTH_MODE value now in effect;"
-	@echo "               not introspected from the running process — rerun with the"
-	@echo "               same value used at 'dev-server-up-fc'/'-restart-fc' time)"
+	@echo "Auth mode:     mtls (the committed config; the FC dev server has no other mode)"
 
 dev-server-logs-fc:
 	@ssh -t $(FC_REMOTE_HOST) "sudo -n tail -F $(FC_DEV_LOG_PATH)"
 
-dev-server-restart-fc: dev-server-down-fc dev-server-up-fc
+# Stop, then start, from the recipe rather than as sibling prerequisites:
+# make runs this recipe only after the settings guards and check-dev-config-fc
+# have succeeded, so a rejected setting or a config that cannot be rendered
+# never stops the running server, and the stop finishes before the start
+# begins, whatever -j is.
+dev-server-restart-fc: check-no-dev-auth-mode check-dev-users check-dev-config-fc
+	@$(MAKE) --no-print-directory dev-server-down-fc
+	@$(MAKE) --no-print-directory dev-server-up-fc
 
 # Parallel dev shed-server lifecycle (remote backend).
 #
@@ -708,13 +862,92 @@ REMOTE_DEV_LOG_PATH     := $(REMOTE_DEV_DIR)/server.log
 REMOTE_DEV_PID_PATH     := $(REMOTE_DEV_DIR)/server.pid
 REMOTE_DEV_AGENT        := $(REMOTE_DEV_DIR)/agent/shed-agent-linux-amd64
 
-dev-server-up-remote: build-server build-cli
-	@if [ ! -f "$(SHED_REMOTE_ENV_FILE)" ]; then \
-	  echo "ERROR: no env file at $(SHED_REMOTE_ENV_FILE)."; \
-	  echo "       It holds the cloud settings (see the comment above this target);"; \
-	  echo "       point SHED_REMOTE_ENV_FILE at yours."; \
-	  exit 1; \
-	fi
+# Source the env file and validate the settings the config is rendered from,
+# leaving GITHUB_USER, FW_MODE and FW_SETTING set for the caller's shell. One
+# shell snippet, used by check-remote-dev-settings (so a restart refuses bad
+# settings before it stops anything) and by dev-server-up-remote (which renders
+# from the same values).
+define remote-dev-settings
+if [ ! -f "$(SHED_REMOTE_ENV_FILE)" ]; then \
+  echo "ERROR: no env file at $(SHED_REMOTE_ENV_FILE)."; \
+  echo "       It holds the cloud settings (see the comment above dev-server-up-remote);"; \
+  echo "       point SHED_REMOTE_ENV_FILE at yours."; \
+  exit 1; \
+fi; \
+set -a; . "$(SHED_REMOTE_ENV_FILE)"; set +a; \
+if [ -z "$$SHED_REMOTE_ENV" ]; then \
+  echo "ERROR: $(SHED_REMOTE_ENV_FILE) does not set SHED_REMOTE_ENV (the environment name)."; \
+  exit 1; \
+fi; \
+GITHUB_USER="$${SHED_REMOTE_GITHUB_USER:-$(SHED_REMOTE_GITHUB_USER)}"; \
+if [ -z "$$GITHUB_USER" ]; then \
+  echo "ERROR: set SHED_REMOTE_GITHUB_USER (the GitHub account whose SSH keys may enrol a CLI)."; \
+  exit 1; \
+fi; \
+FW_MODE="$${SHED_REMOTE_FIREWALL_MODE:-static}"; \
+case "$$FW_MODE" in \
+  static) FW_SETTING="source_ranges_env: SHED_REMOTE_SOURCE_RANGES" ;; \
+  auto) \
+    case "$$SHED_REMOTE_ECHO_URLS" in \
+      ""|*[!A-Za-z0-9:/._,-]*) \
+        echo "ERROR: SHED_REMOTE_FIREWALL_MODE=auto needs SHED_REMOTE_ECHO_URLS in $(SHED_REMOTE_ENV_FILE):"; \
+        echo "       two or more https echo services on different hosts, comma-separated, no spaces."; \
+        exit 1 ;; \
+    esac; \
+    FW_SETTING="echo_urls: [$$(printf '%s' "$$SHED_REMOTE_ECHO_URLS" | sed 's/,/, /g')]" ;; \
+  *) \
+    echo "ERROR: SHED_REMOTE_FIREWALL_MODE is '$$FW_MODE'; want static or auto."; \
+    exit 1 ;; \
+esac
+endef
+
+# Render the remote dev server's config from the template, plus the itest
+# user list with SHED_DEV_USERS=itest, into $(REMOTE_DEV_CONFIG). Runs after
+# remote-dev-settings in the same shell (it reads what that sets). Sets
+# RUN_CONFIG; exits the shell when a step fails or the file is missing or
+# empty (dev-check-run-config), leaving no partial config behind.
+define remote-dev-config
+RUN_CONFIG="$(REMOTE_DEV_CONFIG)"; \
+mkdir -p "$(REMOTE_DEV_DIR)"; \
+rm -f "$$RUN_CONFIG" "$$RUN_CONFIG.users"; \
+if ! sed -e "s|@DEV_REMOTE_DIR@|$(REMOTE_DEV_DIR)|g" \
+    -e "s|@SHED_REMOTE_ENV@|$$SHED_REMOTE_ENV|g" \
+    -e "s|@GITHUB_USER@|$$GITHUB_USER|g" \
+    -e "s|@FIREWALL_MODE@|$$FW_MODE|g" \
+    -e "s|@FIREWALL_SETTING@|$$FW_SETTING|g" \
+    "$(REMOTE_DEV_TEMPLATE)" > "$$RUN_CONFIG"; then \
+  rm -f "$$RUN_CONFIG"; \
+  echo "ERROR: rendering $(REMOTE_DEV_TEMPLATE) failed; not starting shed-server."; \
+  exit 1; \
+fi; \
+if [ "$$SHED_DEV_USERS" = itest ]; then \
+  if ! $(DEV_RENDER_SCRIPT) "$$RUN_CONFIG" "$$RUN_CONFIG.users" --users "$$SHED_ITEST_USERS_DIR" \
+      || ! mv "$$RUN_CONFIG.users" "$$RUN_CONFIG"; then \
+    rm -f "$$RUN_CONFIG" "$$RUN_CONFIG.users"; \
+    echo "ERROR: rendering the itest user list into the remote dev config failed (above); not starting shed-server."; \
+    exit 1; \
+  fi; \
+fi; \
+$(dev-check-run-config)
+endef
+
+# The remote dev server's settings guard. A prerequisite of
+# dev-server-up-remote and of dev-server-restart-remote, so bad settings fail
+# before anything is stopped or started.
+check-remote-dev-settings: check-dev-users
+	@$(remote-dev-settings)
+
+# Render and check the remote dev config. A prerequisite of
+# dev-server-restart-remote, so a render that fails stops the restart before
+# the running server is stopped; dev-server-up-remote renders and checks
+# again in its launch shell.
+check-remote-dev-config: check-remote-dev-settings
+	@$(remote-dev-settings); \
+	umask 077; \
+	$(remote-dev-config); \
+	echo "Remote dev server config: $$RUN_CONFIG"
+
+dev-server-up-remote: check-remote-dev-settings build-server build-cli
 	@if [ -f "$(REMOTE_DEV_PID_PATH)" ] && kill -0 "$$(cat $(REMOTE_DEV_PID_PATH))" 2>/dev/null; then \
 	  echo "ERROR: remote dev server already running (pid $$(cat $(REMOTE_DEV_PID_PATH)))."; \
 	  echo "       Use 'make dev-server-restart-remote' to pick up a rebuild,"; \
@@ -728,60 +961,28 @@ dev-server-up-remote: build-server build-cli
 	@# Render, then launch, in ONE shell: the sourced env file must reach both
 	@# the render (the environment name) and the server process (everything
 	@# else). The log is appended to, so a restart keeps the earlier run.
-	@set -a; . "$(SHED_REMOTE_ENV_FILE)"; set +a; \
-	if [ -z "$$SHED_REMOTE_ENV" ]; then \
-	  echo "ERROR: $(SHED_REMOTE_ENV_FILE) does not set SHED_REMOTE_ENV (the environment name)."; \
-	  exit 1; \
-	fi; \
-	GITHUB_USER="$${SHED_REMOTE_GITHUB_USER:-$(SHED_REMOTE_GITHUB_USER)}"; \
-	if [ -z "$$GITHUB_USER" ]; then \
-	  echo "ERROR: set SHED_REMOTE_GITHUB_USER (the GitHub account whose SSH keys may enrol a CLI)."; \
-	  exit 1; \
-	fi; \
-	FW_MODE="$${SHED_REMOTE_FIREWALL_MODE:-static}"; \
-	case "$$FW_MODE" in \
-	  static) FW_SETTING="source_ranges_env: SHED_REMOTE_SOURCE_RANGES" ;; \
-	  auto) \
-	    case "$$SHED_REMOTE_ECHO_URLS" in \
-	      ""|*[!A-Za-z0-9:/._,-]*) \
-	        echo "ERROR: SHED_REMOTE_FIREWALL_MODE=auto needs SHED_REMOTE_ECHO_URLS in $(SHED_REMOTE_ENV_FILE):"; \
-	        echo "       two or more https echo services on different hosts, comma-separated, no spaces."; \
-	        exit 1 ;; \
-	    esac; \
-	    FW_SETTING="echo_urls: [$$(printf '%s' "$$SHED_REMOTE_ECHO_URLS" | sed 's/,/, /g')]" ;; \
-	  *) \
-	    echo "ERROR: SHED_REMOTE_FIREWALL_MODE is '$$FW_MODE'; want static or auto."; \
-	    exit 1 ;; \
-	esac; \
+	@# START_LINE is stripped of whitespace: macOS wc pads the count with
+	@# spaces, which the probe refuses (exit 64) as a malformed first-line.
+	@$(remote-dev-settings); \
 	umask 077; \
-	sed -e "s|@DEV_REMOTE_DIR@|$(REMOTE_DEV_DIR)|g" \
-	    -e "s|@SHED_REMOTE_ENV@|$$SHED_REMOTE_ENV|g" \
-	    -e "s|@GITHUB_USER@|$$GITHUB_USER|g" \
-	    -e "s|@FIREWALL_MODE@|$$FW_MODE|g" \
-	    -e "s|@FIREWALL_SETTING@|$$FW_SETTING|g" \
-	    "$(REMOTE_DEV_TEMPLATE)" > "$(REMOTE_DEV_CONFIG)" || exit 1; \
+	$(remote-dev-config); \
 	echo "=== dev-server-up-remote $$(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$(REMOTE_DEV_LOG_PATH)"; \
-	START_LINE=$$(wc -l < "$(REMOTE_DEV_LOG_PATH)"); \
-	nohup bin/shed-server serve --config "$(REMOTE_DEV_CONFIG)" \
+	START_LINE=$$(wc -l < "$(REMOTE_DEV_LOG_PATH)" | tr -d '[:space:]'); \
+	nohup $(DEV_SERVER_BIN) serve --config "$$RUN_CONFIG" \
 	  >> "$(REMOTE_DEV_LOG_PATH)" 2>&1 & \
 	echo $$! > "$(REMOTE_DEV_PID_PATH)"; \
-	for i in $$(seq 1 150); do \
-	  if tail -n +$$START_LINE "$(REMOTE_DEV_LOG_PATH)" | grep -q "Shed server is ready"; then \
-	    echo "Remote dev shed-server ready after $${i}s."; \
-	    break; \
-	  fi; \
-	  if ! kill -0 "$$(cat $(REMOTE_DEV_PID_PATH))" 2>/dev/null; then \
-	    echo "ERROR: remote dev shed-server exited during start-up:"; \
-	    tail -n 20 "$(REMOTE_DEV_LOG_PATH)"; \
-	    rm -f "$(REMOTE_DEV_PID_PATH)"; \
-	    exit 1; \
-	  fi; \
-	  if [ "$$i" = "150" ]; then \
-	    echo "WARNING: remote dev shed-server did not report ready after 150 s."; \
-	    echo "  - Tail the log:  make dev-server-logs-remote"; \
-	  fi; \
-	  sleep 1; \
-	done
+	PID=$$(cat "$(REMOTE_DEV_PID_PATH)"); \
+	STATE=$$(bash ./scripts/dev-server-wait.sh 150 -- \
+	  bash ./scripts/dev-server-probe.sh "$(REMOTE_DEV_LOG_PATH)" "$$PID" 1 "$$START_LINE"); RC=$$?; \
+	case "$$RC" in \
+	  0) echo "Remote dev shed-server ready: $$STATE." ;; \
+	  1) echo "WARNING: remote dev shed-server not ready after 150 s ($$STATE)."; \
+	     echo "  - Tail the log:  make dev-server-logs-remote" ;; \
+	  *) echo "ERROR: remote dev shed-server did not start: $$STATE"; \
+	     tail -n 20 "$(REMOTE_DEV_LOG_PATH)"; \
+	     if ! kill -0 "$$PID" 2>/dev/null; then rm -f "$(REMOTE_DEV_PID_PATH)"; fi; \
+	     exit 1 ;; \
+	esac
 	@echo ""
 	@echo "Remote dev shed-server up: pid $$(cat $(REMOTE_DEV_PID_PATH))"
 	@echo "  Config:  $(REMOTE_DEV_CONFIG) (rendered from $(REMOTE_DEV_TEMPLATE))"
@@ -843,7 +1044,14 @@ dev-server-logs-remote:
 	fi
 	@tail -F "$(REMOTE_DEV_LOG_PATH)"
 
-dev-server-restart-remote: dev-server-down-remote dev-server-up-remote
+# Stop, then start, from the recipe rather than as sibling prerequisites: make
+# runs this recipe only after the settings guard, the config render and both
+# builds have succeeded, so bad settings, a config that cannot be rendered or
+# a broken build never stop the running server, and the stop finishes before
+# the start begins, whatever -j is.
+dev-server-restart-remote: check-remote-dev-settings check-remote-dev-config build-server build-cli
+	@$(MAKE) --no-print-directory dev-server-down-remote
+	@$(MAKE) --no-print-directory dev-server-up-remote
 
 # Run the integration suite's [remote] cases against the remote dev server.
 # MANUAL ONLY: every case that creates a shed creates a billed cloud VM (a full
@@ -868,6 +1076,8 @@ test-integration-remote: build-cli
 	  SHED_FC_DEV_SERVER= \
 	  SHED_REMOTE_SERVER=$(SHED_REMOTE_DEV_SERVER) \
 	  SHED_REMOTE_LOG_PATH=$(REMOTE_DEV_LOG_PATH) \
+	  SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),remote,) \
+	  SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR" \
 	  $(MAKE) test-integration
 
 # Root-only proof of the isolated network profile's nftables rules, run on
@@ -915,7 +1125,7 @@ test-netns-remote:
 # Mac dev env vars; the typical dev workflow runs test-integration-dev
 # OR test-integration-dev-fc depending on which backend you're
 # changing.
-test-integration-dev-fc:
+test-integration-dev-fc: check-no-dev-auth-mode
 	@# Auto-up if not running on the remote (`ps -p PID` check; the
 	@# dev server runs as root and the SSH user's `kill -0` can't
 	@# signal a root-owned process).
@@ -924,9 +1134,6 @@ test-integration-dev-fc:
 	  echo "Dev FC server not running on $(FC_REMOTE_HOST); starting via dev-server-up-fc..."; \
 	  $(MAKE) dev-server-up-fc; \
 	fi
-	@# SHED_DEV_AUTH_MODE is forwarded explicitly for the same reason as in
-	@# test-integration-dev: tests/integration/test_mtls.py needs to see the
-	@# exact value the remote dev server was last (re)started with.
 	@# Same PATH reasoning as test-integration-dev: drive the branch's `shed`,
 	@# not the brew-installed release.
 	@# SHED_VZ_SERVER and SHED_VZ_DEV_SERVER are set EMPTY so every [vz] case
@@ -942,10 +1149,11 @@ test-integration-dev-fc:
 	  SHED_FC_LOG_PATH=$(FC_DEV_LOG_PATH) \
 	  SHED_FC_DEV_SERVER=$(SHED_FC_DEV_SERVER) \
 	  SHED_FC_DEV_LOG_PATH=$(FC_DEV_LOG_PATH) \
-	  SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE) \
 	  SHED_IMAGE_HAS_ROOST=fc \
 	  SHED_IMAGE_HAS_CRAZE=fc \
 	  SHED_IMAGE_HAS_HOME_DIRS=fc \
+	  SHED_ITEST_USERS=$(if $(filter itest,$(SHED_DEV_USERS)),fc,) \
+	  SHED_ITEST_USERS_DIR="$$SHED_ITEST_USERS_DIR" \
 	  $(MAKE) test-integration
 
 # Cross-compile for release

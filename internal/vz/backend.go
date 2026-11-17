@@ -18,6 +18,12 @@ import (
 // Compile-time check that VZBackend implements backend.Backend.
 var _ backend.Backend = (*VZBackend)(nil)
 
+// Compile-time check that VZBackend stamps snapshots for the start-up pass.
+var _ backend.SnapshotStamper = (*VZBackend)(nil)
+
+// Compile-time check that VZBackend counts the records its listing skips.
+var _ backend.CountingLister = (*VZBackend)(nil)
+
 // VZBackend implements backend.Backend using Apple Virtualization.framework VMs via vfkit.
 type VZBackend struct {
 	client *Client
@@ -62,6 +68,12 @@ func (b *VZBackend) ListSheds(ctx context.Context) ([]config.Shed, error) {
 	return b.client.ListSheds(ctx)
 }
 
+// ListShedsCounting is ListSheds that also says how many shed records it
+// could not read and left out (see backend.CountingLister).
+func (b *VZBackend) ListShedsCounting(ctx context.Context) ([]config.Shed, int, error) {
+	return b.client.listSheds(ctx)
+}
+
 // DeleteShed removes a shed (destroy semantics — see backend.DeleteShed).
 func (b *VZBackend) DeleteShed(ctx context.Context, name string) error {
 	return b.client.DeleteShed(ctx, name)
@@ -77,20 +89,25 @@ func (b *VZBackend) StopShed(ctx context.Context, name string) (*config.Shed, er
 	return b.client.StopShed(ctx, name)
 }
 
+// AssignUser gives a shed with no user and no service client to a user.
+func (b *VZBackend) AssignUser(ctx context.Context, name string, req config.AssignShedRequest) (*config.Shed, error) {
+	return b.client.AssignUser(ctx, name, req)
+}
+
+// StampSnapshotUser records the user of a snapshot with none (the start-up
+// pass of a server with one user; see backend.SnapshotStamper).
+func (b *VZBackend) StampSnapshotUser(ctx context.Context, name, user string) (*config.Snapshot, error) {
+	return b.client.StampSnapshotUser(ctx, name, user)
+}
+
 // ResetShed wipes and recreates a stopped shed's writable upper layer.
 func (b *VZBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	return b.client.ResetShed(ctx, name)
 }
 
-// newAgentClient creates a vmutil.AgentClient for the given instance name.
-func (b *VZBackend) newAgentClient(name string) *vmutil.AgentClient {
-	dialer := NewVZDialer(b.client.cfg.SocketDir, name)
-	return vmutil.NewAgentClient(dialer, b.client.cfg.ConsolePort, b.client.cfg.NotifyPort)
-}
-
 // ListSessions returns all tmux sessions in a shed.
 func (b *VZBackend) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
-	meta, err := LoadMetadata(b.client.cfg.InstanceDir, shedName)
+	meta, err := b.loadChecked(ctx, shedName)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +116,7 @@ func (b *VZBackend) ListSessions(ctx context.Context, shedName string) ([]config
 		return nil, config.ErrShedNotRunningSentinel
 	}
 
-	agent := b.newAgentClient(meta.Name)
+	agent := b.client.newCheckedAgentClient(meta)
 
 	var output strings.Builder
 	opts := backend.ExecOptions{
@@ -142,7 +159,7 @@ func (b *VZBackend) ListSessions(ctx context.Context, shedName string) ([]config
 
 // KillSession terminates a tmux session in a shed.
 func (b *VZBackend) KillSession(ctx context.Context, shedName, sessionName string) error {
-	meta, err := LoadMetadata(b.client.cfg.InstanceDir, shedName)
+	meta, err := b.loadChecked(ctx, shedName)
 	if err != nil {
 		return err
 	}
@@ -151,7 +168,7 @@ func (b *VZBackend) KillSession(ctx context.Context, shedName, sessionName strin
 		return config.ErrShedNotRunningSentinel
 	}
 
-	agent := b.newAgentClient(meta.Name)
+	agent := b.client.newCheckedAgentClient(meta)
 
 	opts := backend.ExecOptions{
 		Cmd: []string{"tmux", "kill-session", "-t", sessionName},
@@ -173,14 +190,11 @@ func (b *VZBackend) KillSession(ctx context.Context, shedName, sessionName strin
 
 // Exec executes a command in a shed with the given options.
 func (b *VZBackend) Exec(ctx context.Context, shedName string, opts backend.ExecOptions) error {
-	meta, err := LoadMetadata(b.client.cfg.InstanceDir, shedName)
-	if err != nil {
-		return err
-	}
 	// The shed actually dialed is the one checked: the API server's earlier
 	// lookups may have seen a shed since deleted and recreated by another
 	// caller under this name.
-	if err := backend.CheckOwner(ctx, shedName, meta.Owner); err != nil {
+	meta, err := b.loadChecked(ctx, shedName)
+	if err != nil {
 		return err
 	}
 
@@ -204,8 +218,26 @@ func (b *VZBackend) Exec(ctx context.Context, shedName string, opts backend.Exec
 		opts.Cmd = []string{"/bin/bash", "--login"}
 	}
 
-	agent := b.newAgentClient(meta.Name)
+	agent := b.client.newCheckedAgentClient(meta)
 	return agent.Exec(ctx, opts)
+}
+
+// loadChecked loads a shed's metadata for an operation that reaches into its
+// running VM (exec, sessions) and checks it against the identity the context
+// requires (checkIdentity): the agent dialed afterwards is that shed's. A
+// missing shed is config.ErrShedNotFoundSentinel.
+func (b *VZBackend) loadChecked(ctx context.Context, name string) (*Metadata, error) {
+	meta, err := LoadMetadata(b.client.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+	if err := checkIdentity(ctx, name, meta); err != nil {
+		return nil, err
+	}
+	return meta, nil
 }
 
 // DialService opens a TCP connection to a port inside a running shed's VM.
@@ -266,6 +298,12 @@ func (b *VZBackend) CreateSnapshot(ctx context.Context, req config.SnapshotCreat
 // ListSnapshots returns all snapshots stored on this server.
 func (b *VZBackend) ListSnapshots(ctx context.Context) ([]config.Snapshot, error) {
 	return b.client.ListSnapshots(ctx)
+}
+
+// ListSnapshotsCounting is ListSnapshots that also says how many snapshot
+// records it could not read and left out (see backend.CountingSnapshotLister).
+func (b *VZBackend) ListSnapshotsCounting(ctx context.Context) ([]config.Snapshot, int, error) {
+	return b.client.ListSnapshotsCounting(ctx)
 }
 
 // GetSnapshot returns a snapshot by name.

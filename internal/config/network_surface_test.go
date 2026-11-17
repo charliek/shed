@@ -56,41 +56,50 @@ func TestListenAddrHelpers(t *testing.T) {
 }
 
 func TestValidateBindAddress(t *testing.T) {
-	// Open mode requires allow_insecure_exposure to bind a non-loopback
-	// interface; an enforced mode (token or mtls; TLS + client auth) needs no
-	// acknowledgment.
-	tokenAuth := &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}
+	// Open mode is loopback only: no acknowledgment widens it. Only mtls (TLS +
+	// client certificates) may bind a routable interface.
 	mtlsAuth := &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}
 	tests := []struct {
 		name    string
 		cfg     ServerConfig
-		wantErr bool
+		wantErr string // substring the error must contain; "" means expect no error
 	}{
-		{"open unset is loopback (ok)", ServerConfig{}, false},
-		{"open explicit loopback ok", ServerConfig{BindAddress: "127.0.0.1"}, false},
-		{"open localhost ok", ServerConfig{BindAddress: "localhost"}, false},
-		{"open ::1 ok", ServerConfig{BindAddress: "::1"}, false},
-		{"open 0.0.0.0 without ack rejected", ServerConfig{BindAddress: "0.0.0.0"}, true},
-		{"open star without ack rejected", ServerConfig{BindAddress: "*"}, true},
-		{"open :: without ack rejected", ServerConfig{BindAddress: "::"}, true},
-		{"open tailnet ip without ack rejected", ServerConfig{BindAddress: "100.64.0.1"}, true},
-		{"open 0.0.0.0 with ack ok", ServerConfig{BindAddress: "0.0.0.0", AllowInsecureExposure: true}, false},
-		{"open tailnet ip with ack ok", ServerConfig{BindAddress: "100.64.0.1", AllowInsecureExposure: true}, false},
-		{"token mode 0.0.0.0 ok without ack", ServerConfig{BindAddress: "0.0.0.0", Auth: tokenAuth}, false},
-		{"token mode tailnet ip ok without ack", ServerConfig{BindAddress: "100.64.0.1", Auth: tokenAuth}, false},
-		{"mtls mode 0.0.0.0 ok without ack", ServerConfig{BindAddress: "0.0.0.0", Auth: mtlsAuth}, false},
-		{"mtls mode tailnet ip ok without ack", ServerConfig{BindAddress: "100.64.0.1", Auth: mtlsAuth}, false},
-		// Format validation runs before the mode/ack gate, so a malformed bind is
+		{"open unset is loopback (ok)", ServerConfig{}, ""},
+		{"open explicit loopback ok", ServerConfig{BindAddress: "127.0.0.1"}, ""},
+		{"open other 127/8 address ok", ServerConfig{BindAddress: "127.0.0.2"}, ""},
+		{"open localhost ok", ServerConfig{BindAddress: "localhost"}, ""},
+		{"open ::1 ok", ServerConfig{BindAddress: "::1"}, ""},
+		{"explicit open mode on loopback ok", ServerConfig{BindAddress: "127.0.0.1", Auth: &AuthConfig{Mode: AuthModeOpen}}, ""},
+		{"open 0.0.0.0 rejected", ServerConfig{BindAddress: "0.0.0.0"}, "mtls"},
+		{"open star rejected", ServerConfig{BindAddress: "*"}, "mtls"},
+		{"open :: rejected", ServerConfig{BindAddress: "::"}, "mtls"},
+		{"open tailnet ip rejected", ServerConfig{BindAddress: "100.64.0.1"}, "mtls"},
+		{"open LAN ip rejected", ServerConfig{BindAddress: "192.168.1.20"}, "mtls"},
+		{"explicit open mode 0.0.0.0 rejected", ServerConfig{BindAddress: "0.0.0.0", Auth: &AuthConfig{Mode: AuthModeOpen}}, "mtls"},
+		{"mtls mode 0.0.0.0 ok", ServerConfig{BindAddress: "0.0.0.0", Auth: mtlsAuth}, ""},
+		{"mtls mode :: ok", ServerConfig{BindAddress: "::", Auth: mtlsAuth}, ""},
+		{"mtls mode tailnet ip ok", ServerConfig{BindAddress: "100.64.0.1", Auth: mtlsAuth}, ""},
+		// A hand-built config naming the removed token mode is not enforced,
+		// so it gets the open-mode rule (validateAuth refuses the mode itself).
+		{"removed token mode 0.0.0.0 rejected", ServerConfig{BindAddress: "0.0.0.0", Auth: &AuthConfig{Mode: AuthModeToken}}, "mtls"},
+		// Format validation runs before the mode gate, so a malformed bind is
 		// rejected in every mode (it would otherwise fail cryptically at net.Listen).
-		{"malformed ip rejected", ServerConfig{BindAddress: "127.0.0.l"}, true},
-		{"hostname rejected", ServerConfig{BindAddress: "box.example"}, true},
-		{"over-long ipv4 rejected", ServerConfig{BindAddress: "0.0.0.0.0"}, true},
-		{"malformed rejected even in token mode", ServerConfig{BindAddress: "nope", Auth: tokenAuth}, true},
+		{"malformed ip rejected", ServerConfig{BindAddress: "127.0.0.l"}, "invalid bind_address"},
+		{"hostname rejected", ServerConfig{BindAddress: "box.example"}, "invalid bind_address"},
+		{"over-long ipv4 rejected", ServerConfig{BindAddress: "0.0.0.0.0"}, "invalid bind_address"},
+		{"malformed rejected even in mtls mode", ServerConfig{BindAddress: "nope", Auth: mtlsAuth}, "invalid bind_address"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.cfg.validateBindAddress(); (err != nil) != tt.wantErr {
-				t.Errorf("validateBindAddress() error = %v, wantErr %v", err, tt.wantErr)
+			err := tt.cfg.validateBindAddress()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("validateBindAddress() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("validateBindAddress() = %v, want an error containing %q", err, tt.wantErr)
 			}
 		})
 	}
@@ -121,7 +130,8 @@ func TestValidateNetworkSurface(t *testing.T) {
 
 func TestRejectRemovedAuthKeys(t *testing.T) {
 	// The removed-key scan must fail loudly on a stale public_exposure /
-	// auth.http.tokens — silently ignoring public_exposure would un-loopback an
+	// auth.http.tokens / token-mode config — silently ignoring public_exposure
+	// would un-loopback an
 	// internet-facing plaintext listener (the v0.6.0 image-key silent-drift bug
 	// this pattern exists to prevent).
 	tests := []struct {
@@ -129,9 +139,13 @@ func TestRejectRemovedAuthKeys(t *testing.T) {
 		yaml string
 		want string // substring the error must contain; "" means expect no error
 	}{
-		{"clean token config ok", "name: x\nauth:\n  mode: token\n", ""},
-		{"clean deprecated secure-alias config ok", "name: x\nauth:\n  mode: secure\n", ""},
+		{"token mode rejected naming mtls", "name: x\nauth:\n  mode: token\n", "use auth.mode: mtls"},
+		{"secure alias rejected naming mtls", "name: x\nauth:\n  mode: secure\n", "use auth.mode: mtls"},
+		{"token mode with key sources rejected", "name: x\nauth:\n  mode: token\n  ssh:\n    github_users: [charliek]\n", `auth.mode: "token" was removed`},
+		{"secure alias error names the spelling used", "name: x\nauth:\n  mode: secure\n", `auth.mode: "secure" was removed`},
 		{"open config ok", "name: x\nauth:\n  mode: open\n", ""},
+		{"mtls config ok", "name: x\nauth:\n  mode: mtls\n", ""},
+		{"misspelled mode left to validateAuth", "name: x\nauth:\n  mode: tokn\n", ""},
 		{"no auth block ok", "name: x\n", ""},
 		{"public_exposure rejected", "name: x\npublic_exposure: true\n", "public_exposure"},
 		{"auth.http.tokens rejected", "name: x\nauth:\n  http:\n    tokens:\n      - {scope: control, token: abc}\n", "auth.http.tokens"},
@@ -155,9 +169,10 @@ func TestRejectRemovedAuthKeys(t *testing.T) {
 }
 
 func TestRejectRemovedNetworkKeys(t *testing.T) {
-	// internal_http_port was removed in v0.7.4 — a config still carrying it must
-	// fail loudly rather than be silently ignored (it would otherwise imply a
-	// loopback bus listener the new binary never starts).
+	// internal_http_port was removed in v0.7.4 and allow_insecure_exposure in
+	// v0.10.0 — a config still carrying either must fail loudly rather than be
+	// silently ignored (the first would imply a loopback bus listener the new
+	// binary never starts; the second an open server reachable off-box).
 	tests := []struct {
 		name string
 		yaml string
@@ -168,6 +183,9 @@ func TestRejectRemovedNetworkKeys(t *testing.T) {
 		{"internal_http_port rejected", "name: x\ninternal_http_port: 8081\n", "internal_http_port"},
 		{"http_bind rejected (renamed to bind_address)", "name: x\nhttp_bind: 0.0.0.0\n", "bind_address"},
 		{"ssh_bind rejected (renamed to bind_address)", "name: x\nssh_bind: 0.0.0.0\n", "bind_address"},
+		{"allow_insecure_exposure true rejected", "name: x\nallow_insecure_exposure: true\n", "auth.mode: mtls"},
+		{"allow_insecure_exposure false rejected", "name: x\nallow_insecure_exposure: false\n", "allow_insecure_exposure"},
+		{"allow_insecure_exposure with a wide bind rejected", "name: x\nbind_address: 0.0.0.0\nallow_insecure_exposure: true\n", "loopback only"},
 		{"malformed yaml deferred to typed unmarshal", "name: [unterminated", ""},
 	}
 	for _, tt := range tests {
@@ -188,7 +206,7 @@ func TestRejectRemovedNetworkKeys(t *testing.T) {
 
 func TestValidateAuth(t *testing.T) {
 	// validateAuth is the config gate that rejects a malformed auth block before
-	// the server ever binds — an invalid mode, an empty token, a bad scope, or a
+	// the server ever binds — an invalid or removed mode, a bad scope, or a
 	// malformed GitHub username must fail loudly at load, not silently disable a
 	// control the operator believes is on.
 	tests := []struct {
@@ -200,14 +218,15 @@ func TestValidateAuth(t *testing.T) {
 		{"empty ssh mode defaults ok", &AuthConfig{SSH: &SSHAuthConfig{}}, ""},
 		{"ssh off ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthOff}}, ""},
 		{"ssh warn ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthWarn}}, ""},
-		{"token + ssh enforce ok", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}, ""},
 		{"invalid ssh mode rejected", &AuthConfig{SSH: &SSHAuthConfig{Mode: "enfore"}}, "auth.ssh.mode"},
-		{"negative max_auth_tries rejected", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: -1}}, "max_auth_tries"},
-		{"zero max_auth_tries ok", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: 0}}, ""},
-		{"valid github user ok", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}}}, ""},
-		{"malformed github user rejected", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"bad user!"}}}, "github_users"},
-		{"invalid auth.mode rejected", &AuthConfig{Mode: "secur"}, "auth.mode"},
-		{"token auth.mode ok", &AuthConfig{Mode: AuthModeToken}, ""},
+		{"negative max_auth_tries rejected", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: -1}}, "max_auth_tries"},
+		{"zero max_auth_tries ok", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: 0}}, ""},
+		{"valid github user ok", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}}}, ""},
+		{"malformed github user rejected", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"bad user!"}}}, "github_users"},
+		{"invalid auth.mode rejected", &AuthConfig{Mode: "secur"}, "must be open or mtls"},
+		{"removed token auth.mode rejected", &AuthConfig{Mode: AuthModeToken}, "use auth.mode: mtls"},
+		{"removed secure auth.mode rejected", &AuthConfig{Mode: "secure"}, "use auth.mode: mtls"},
+		{"open auth.mode ok", &AuthConfig{Mode: AuthModeOpen}, ""},
 		{"mtls + ssh enforce ok", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}, ""},
 		{"mtls auth.mode ok", &AuthConfig{Mode: AuthModeMTLS}, ""},
 		{"mtls + invalid ssh mode rejected", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{Mode: "enfore"}}, "auth.ssh.mode"},

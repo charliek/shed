@@ -515,68 +515,7 @@ func runList(cmd *cobra.Command, args []string) error {
 	})
 
 	if jsonFlag {
-		type shedJSON struct {
-			Name           string                                `json:"name"`
-			ID             string                                `json:"id,omitempty"`
-			Server         string                                `json:"server"`
-			Status         string                                `json:"status"`
-			StatusReason   string                                `json:"status_reason,omitempty"`
-			CreatedAt      time.Time                             `json:"created_at"`
-			Backend        string                                `json:"backend,omitempty"`
-			IPAddress      string                                `json:"ip_address,omitempty"`
-			CPUs           int                                   `json:"cpus,omitempty"`
-			MemoryMB       int                                   `json:"memory_mb,omitempty"`
-			Repo           string                                `json:"repo,omitempty"`
-			PID            int                                   `json:"pid,omitempty"`
-			RootfsPath     string                                `json:"rootfs_path,omitempty"`
-			ProjectMounts  []config.MountConfig                  `json:"project_mounts,omitempty"`
-			LandingDir     string                                `json:"landing_dir,omitempty"`
-			SSH            string                                `json:"ssh,omitempty"`
-			Uptime         string                                `json:"uptime,omitempty"`
-			LastHealthy    *time.Time                            `json:"last_healthy,omitempty"`
-			StartedAt      *time.Time                            `json:"started_at,omitempty"`
-			Extensions     map[string]config.ExtensionHealthInfo `json:"extensions,omitempty"`
-			Owner          string                                `json:"owner,omitempty"`
-			Mounts         *config.MountSelection                `json:"mounts,omitempty"`
-			NetworkProfile string                                `json:"network_profile,omitempty"`
-		}
-		result := make([]shedJSON, 0, len(allSheds))
-		for _, s := range allSheds {
-			sj := shedJSON{
-				Name:           s.shed.Name,
-				ID:             s.shed.ID,
-				Server:         s.server,
-				Status:         s.shed.Status,
-				StatusReason:   s.shed.StatusReason,
-				CreatedAt:      s.shed.CreatedAt,
-				Backend:        s.shed.Backend,
-				IPAddress:      s.shed.IPAddress,
-				CPUs:           s.shed.CPUs,
-				MemoryMB:       s.shed.MemoryMB,
-				Repo:           s.shed.Repo,
-				PID:            s.shed.PID,
-				RootfsPath:     s.shed.RootfsPath,
-				ProjectMounts:  s.shed.ProjectMounts,
-				LandingDir:     s.shed.LandingDir,
-				Owner:          s.shed.Owner,
-				Mounts:         s.shed.Mounts,
-				NetworkProfile: s.shed.NetworkProfile,
-			}
-			if s.shed.Status == config.StatusRunning {
-				sj.SSH = shedSSHString(s.shed.Name, s.server)
-				sj.LastHealthy = s.shed.LastHealthy
-				sj.StartedAt = s.shed.StartedAt
-				sj.Extensions = s.shed.Extensions
-				// Use agent boot time for uptime if available, fall back to creation time
-				if s.shed.StartedAt != nil {
-					sj.Uptime = formatUptime(*s.shed.StartedAt)
-				} else {
-					sj.Uptime = formatUptime(s.shed.CreatedAt)
-				}
-			}
-			result = append(result, sj)
-		}
-		return outputJSON(result)
+		return outputJSON(shedListJSON(allSheds))
 	}
 
 	if len(allSheds) == 0 {
@@ -599,29 +538,7 @@ func runList(cmd *cobra.Command, args []string) error {
 	}
 
 	// Tier 1: default table
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	if listAll {
-		fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tCREATED")
-	} else {
-		fmt.Fprintln(w, "NAME\tBACKEND\tSTATUS\tSSH\tCREATED")
-	}
-
-	for _, s := range allSheds {
-		created := s.shed.CreatedAt.Format("2006-01-02 15:04")
-		ssh := "-"
-		if s.shed.Status == config.StatusRunning {
-			ssh = shedSSHString(s.shed.Name, s.server)
-		}
-		if listAll {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-				s.shed.Name, s.server, valueOrDash(s.shed.Backend), s.shed.Status, ssh, created)
-		} else {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-				s.shed.Name, valueOrDash(s.shed.Backend), s.shed.Status, ssh, created)
-		}
-	}
-
-	w.Flush()
+	renderShedTable(os.Stdout, allSheds, listAll)
 	return nil
 }
 
@@ -631,24 +548,154 @@ type listedShed struct {
 	server string
 }
 
+// shedJSON is one shed in `shed list --json`.
+type shedJSON struct {
+	Name           string                                `json:"name"`
+	ID             string                                `json:"id,omitempty"`
+	Server         string                                `json:"server"`
+	Status         string                                `json:"status"`
+	StatusReason   string                                `json:"status_reason,omitempty"`
+	CreatedAt      time.Time                             `json:"created_at"`
+	Backend        string                                `json:"backend,omitempty"`
+	IPAddress      string                                `json:"ip_address,omitempty"`
+	CPUs           int                                   `json:"cpus,omitempty"`
+	MemoryMB       int                                   `json:"memory_mb,omitempty"`
+	Repo           string                                `json:"repo,omitempty"`
+	PID            int                                   `json:"pid,omitempty"`
+	RootfsPath     string                                `json:"rootfs_path,omitempty"`
+	ProjectMounts  []config.MountConfig                  `json:"project_mounts,omitempty"`
+	LandingDir     string                                `json:"landing_dir,omitempty"`
+	SSH            string                                `json:"ssh,omitempty"`
+	Uptime         string                                `json:"uptime,omitempty"`
+	LastHealthy    *time.Time                            `json:"last_healthy,omitempty"`
+	StartedAt      *time.Time                            `json:"started_at,omitempty"`
+	Extensions     map[string]config.ExtensionHealthInfo `json:"extensions,omitempty"`
+	Owner          string                                `json:"owner,omitempty"`
+	User           string                                `json:"user,omitempty"`
+	Mounts         *config.MountSelection                `json:"mounts,omitempty"`
+	NetworkProfile string                                `json:"network_profile,omitempty"`
+}
+
+// shedListJSON is the `shed list --json` document.
+func shedListJSON(sheds []listedShed) []shedJSON {
+	result := make([]shedJSON, 0, len(sheds))
+	for _, s := range sheds {
+		sj := shedJSON{
+			Name:           s.shed.Name,
+			ID:             s.shed.ID,
+			Server:         s.server,
+			Status:         s.shed.Status,
+			StatusReason:   s.shed.StatusReason,
+			CreatedAt:      s.shed.CreatedAt,
+			Backend:        s.shed.Backend,
+			IPAddress:      s.shed.IPAddress,
+			CPUs:           s.shed.CPUs,
+			MemoryMB:       s.shed.MemoryMB,
+			Repo:           s.shed.Repo,
+			PID:            s.shed.PID,
+			RootfsPath:     s.shed.RootfsPath,
+			ProjectMounts:  s.shed.ProjectMounts,
+			LandingDir:     s.shed.LandingDir,
+			Owner:          s.shed.Owner,
+			User:           s.shed.User,
+			Mounts:         s.shed.Mounts,
+			NetworkProfile: s.shed.NetworkProfile,
+		}
+		if s.shed.Status == config.StatusRunning {
+			sj.SSH = shedSSHString(s.shed.Name, s.server)
+			sj.LastHealthy = s.shed.LastHealthy
+			sj.StartedAt = s.shed.StartedAt
+			sj.Extensions = s.shed.Extensions
+			// Use agent boot time for uptime if available, fall back to creation time
+			if s.shed.StartedAt != nil {
+				sj.Uptime = formatUptime(*s.shed.StartedAt)
+			} else {
+				sj.Uptime = formatUptime(s.shed.CreatedAt)
+			}
+		}
+		result = append(result, sj)
+	}
+	return result
+}
+
+// mixedUsers reports whether users holds more than one distinct value, the
+// implicit user ("") counting as one. Only then does a default listing get a
+// USER column: on a server with no user list every shed has the implicit
+// user and the listing is as it was, and a user sees only their own sheds.
+func mixedUsers(users []string) bool {
+	for _, u := range users[min(1, len(users)):] {
+		if u != users[0] {
+			return true
+		}
+	}
+	return false
+}
+
+// renderShedTable is the default `shed list` table.
+func renderShedTable(out io.Writer, sheds []listedShed, listAll bool) {
+	users := make([]string, len(sheds))
+	for i, s := range sheds {
+		users[i] = s.shed.User
+	}
+	withUser := mixedUsers(users)
+
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	header := []string{"NAME"}
+	if listAll {
+		header = append(header, "SERVER")
+	}
+	header = append(header, "BACKEND", "STATUS", "SSH")
+	if withUser {
+		header = append(header, "USER")
+	}
+	header = append(header, "CREATED")
+	fmt.Fprintln(w, strings.Join(header, "\t"))
+
+	for _, s := range sheds {
+		ssh := "-"
+		if s.shed.Status == config.StatusRunning {
+			ssh = shedSSHString(s.shed.Name, s.server)
+		}
+		row := []string{s.shed.Name}
+		if listAll {
+			row = append(row, s.server)
+		}
+		row = append(row, valueOrDash(s.shed.Backend), s.shed.Status, ssh)
+		if withUser {
+			row = append(row, valueOrDash(s.shed.User))
+		}
+		row = append(row, s.shed.CreatedAt.Format("2006-01-02 15:04"))
+		fmt.Fprintln(w, strings.Join(row, "\t"))
+	}
+	w.Flush()
+}
+
 // renderShedTableVerbose is `shed list -v`: one wide table row per shed.
 func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	// The ID column appears only when a listed shed has one (remote sheds
 	// do; Firecracker and VZ sheds do not, and their table is unchanged).
-	withID := false
+	// USER, beside OWNER, likewise only when a listed shed has a user: on a
+	// server with no user list every shed has the implicit user and the
+	// table is as it was.
+	withID, withUser := false, false
 	for _, s := range sheds {
 		withID = withID || s.shed.ID != ""
+		withUser = withUser || s.shed.User != ""
 	}
-	idHeader := ""
-	if withID {
-		idHeader = "\tID"
-	}
+	header := []string{"NAME"}
 	if listAll {
-		fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tOWNER\tMOUNTS\tNETWORK\tUPTIME"+idHeader)
-	} else {
-		fmt.Fprintln(w, "NAME\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tOWNER\tMOUNTS\tNETWORK\tUPTIME"+idHeader)
+		header = append(header, "SERVER")
 	}
+	header = append(header, "BACKEND", "STATUS", "SSH", "IP", "RESOURCES", "SOURCE", "OWNER")
+	if withUser {
+		header = append(header, "USER")
+	}
+	header = append(header, "MOUNTS", "NETWORK", "UPTIME")
+	if withID {
+		header = append(header, "ID")
+	}
+	fmt.Fprintln(w, strings.Join(header, "\t"))
 	for _, s := range sheds {
 		ssh := "-"
 		uptime := "-"
@@ -660,7 +707,6 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 				uptime = formatUptime(s.shed.CreatedAt)
 			}
 		}
-		ip := valueOrDash(s.shed.IPAddress)
 		resources := "-"
 		if s.shed.CPUs > 0 && s.shed.MemoryMB > 0 {
 			resources = fmt.Sprintf("%dc/%dMB", s.shed.CPUs, s.shed.MemoryMB)
@@ -676,19 +722,19 @@ func renderShedTableVerbose(out io.Writer, sheds []listedShed, listAll bool) {
 				source = fmt.Sprintf("%s (+%d)", source, len(s.shed.ProjectMounts)-1)
 			}
 		}
-		owner, mounts, network := valueOrDash(s.shed.Owner), formatShedMounts(s.shed.Mounts), formatNetworkProfile(s.shed.NetworkProfile)
-		status := statusWithReason(s.shed)
-		idCell := ""
-		if withID {
-			idCell = "\t" + valueOrDash(s.shed.ID)
-		}
+		row := []string{s.shed.Name}
 		if listAll {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n",
-				s.shed.Name, s.server, valueOrDash(s.shed.Backend), status, ssh, ip, resources, source, owner, mounts, network, uptime, idCell)
-		} else {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n",
-				s.shed.Name, valueOrDash(s.shed.Backend), status, ssh, ip, resources, source, owner, mounts, network, uptime, idCell)
+			row = append(row, s.server)
 		}
+		row = append(row, valueOrDash(s.shed.Backend), statusWithReason(s.shed), ssh, valueOrDash(s.shed.IPAddress), resources, source, valueOrDash(s.shed.Owner))
+		if withUser {
+			row = append(row, valueOrDash(s.shed.User))
+		}
+		row = append(row, formatShedMounts(s.shed.Mounts), formatNetworkProfile(s.shed.NetworkProfile), uptime)
+		if withID {
+			row = append(row, valueOrDash(s.shed.ID))
+		}
+		fmt.Fprintln(w, strings.Join(row, "\t"))
 	}
 	w.Flush()
 }
@@ -710,6 +756,9 @@ func renderShedDetails(out io.Writer, sheds []listedShed, listAll bool) {
 		}
 		fmt.Fprintf(out, "Created:        %s\n", s.shed.CreatedAt.Format("2006-01-02 15:04:05"))
 		fmt.Fprintf(out, "Owner:          %s\n", valueOrDash(s.shed.Owner))
+		if s.shed.User != "" {
+			fmt.Fprintf(out, "User:           %s\n", s.shed.User)
+		}
 		fmt.Fprintf(out, "Server Mounts:  %s\n", formatShedMounts(s.shed.Mounts))
 		fmt.Fprintf(out, "Network:        %s\n", formatNetworkProfile(s.shed.NetworkProfile))
 		if img := formatShedImage(s.shed); img != "" {
@@ -1064,6 +1113,28 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		return serverFlag, entry, nil
 	}
 
+	if server, entry, ok := searchShedServer(name); ok {
+		return server, entry, nil
+	}
+
+	// Not found anywhere
+	defaultServer := clientConfig.DefaultServer
+	if defaultServer == "" {
+		defaultServer = "any configured server"
+	}
+	printError(fmt.Sprintf("shed %q not found on %s", name, defaultServer),
+		"shed list --all       # Find which server has it",
+		"shed create "+name+"  # Create a new shed")
+	return "", nil, fmt.Errorf("shed %q not found", name)
+}
+
+// searchShedServer looks for the server that hosts a shed, without the
+// --server flag and without printing anything: the shed-name cache first
+// (dropping a stale entry), then the default server, then every configured
+// server. It reports false when no server answers for the shed (a server
+// hides a shed the caller may not see, so "not found" can also mean "not
+// yours").
+func searchShedServer(name string) (string, *config.ServerEntry, bool) {
 	// Check cache first (unqualified form only)
 	if cachedServer, err := clientConfig.GetShedServer(name); err == nil {
 		entry, err := clientConfig.GetServer(cachedServer)
@@ -1071,7 +1142,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 			// Verify the shed still exists
 			client := NewAPIClientFromNamedEntry(cachedServer, entry, DefaultTimeout)
 			if _, err := client.GetShed(name); err == nil {
-				return cachedServer, entry, nil
+				return cachedServer, entry, true
 			}
 			// Shed not found on cached server, clear cache and search
 			clientConfig.RemoveShedCache(name)
@@ -1085,7 +1156,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 			client := NewAPIClientFromNamedEntry(clientConfig.DefaultServer, entry, DefaultTimeout)
 			if _, err := client.GetShed(name); err == nil {
 				clientConfig.CacheShed(name, clientConfig.DefaultServer, "")
-				return clientConfig.DefaultServer, entry, nil
+				return clientConfig.DefaultServer, entry, true
 			}
 		}
 	}
@@ -1100,19 +1171,11 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 			// Update cache
 			clientConfig.CacheShed(name, serverName, "")
 			entryCopy := entry
-			return serverName, &entryCopy, nil
+			return serverName, &entryCopy, true
 		}
 	}
 
-	// Not found anywhere
-	defaultServer := clientConfig.DefaultServer
-	if defaultServer == "" {
-		defaultServer = "any configured server"
-	}
-	printError(fmt.Sprintf("shed %q not found on %s", name, defaultServer),
-		"shed list --all       # Find which server has it",
-		"shed create "+name+"  # Create a new shed")
-	return "", nil, fmt.Errorf("shed %q not found", name)
+	return "", nil, false
 }
 
 // autoSyncAfterCreate syncs files after shed creation.

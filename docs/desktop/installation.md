@@ -123,8 +123,8 @@ shared across tools. A **Preferences → Credential broker** setting (`Automatic
 
 | Mode | Behavior |
 |---|---|
-| `Automatic` (default) | Probes for a running `shed-host-agent` at startup: a full daemon present ⇒ **external** (dials it, unchanged from today); a *headless* daemon (status socket only, no desktop socket) ⇒ **coexist** (the app doesn't start its own broker — no namespace conflicts — and mints its own secure-server tokens, but gets no in-app approvals, since the headless daemon owns those); neither present ⇒ **embedded**. |
-| `In-app (embedded)` | Always starts the in-process broker, regardless of any running daemon. If a daemon is also running, the two race for each server's credential-bus namespace — the loser gets a per-namespace `409`, surfaced (not hidden) in `broker.status`; no double approval prompts. |
+| `Automatic` (default) | Probes for a running `shed-host-agent` at startup: a full daemon present ⇒ **external** (dials it, unchanged from today); a *headless* daemon (status socket only, no desktop socket) ⇒ **coexist** (the app doesn't start its own broker — no namespace conflicts — and obtains its own control credentials for secure servers, but gets no in-app approvals, since the headless daemon owns those); neither present ⇒ **embedded**. |
+| `In-app (embedded)` | Always starts the in-process broker, regardless of any running daemon. If a daemon is also running, both present this machine's identity. While the app's broker holds its lock (it takes it when it has a machine identity and the lock can be taken; see [Credential source](../extensions/source-binding.md#the-daemon-and-the-desktop-app-on-one-machine)), the daemon stands by (`yielding`) and answers nothing, and the app answers; without the lock either may hold a request type. In the moment before the daemon lets go, the second to subscribe is refused with a `409` (`duplicate`, retried, on a server with credential sources; on an older server the app retries it for 15 seconds, then `rejected`), surfaced (not hidden) in `broker.status`. |
 | `External daemon` | Always dials the standalone daemon, never starts an in-process broker. |
 
 If the daemon `Automatic` chose at launch is stopped or uninstalled while the app runs, the
@@ -136,7 +136,10 @@ daemon, or pin `In-app (embedded)`. A runtime fallback is tracked in
 The resolved mode is **fixed for the app's process lifetime** — changing the preference
 takes effect on the **next launch**, not live. The active mode, the probe evidence that
 produced it, and (for embedded) the resolved SSH backend and per-server connection state
-are visible in Preferences and over IPC (`broker.status`, `identify.broker_mode`). Full
+are visible in Preferences and over IPC (`broker.status`, `identify.broker_mode`). Whichever
+mode runs, the app and the daemon share one machine identity, so a server sees one machine;
+Preferences shows which of your machines is the [credential source](../extensions/source-binding.md)
+on each server. Full
 mechanics — `extensions.yaml` handling, the synthesized fresh-install default, and the
 fail-closed behaviors — are documented in
 [Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker).

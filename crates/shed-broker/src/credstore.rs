@@ -39,7 +39,7 @@
 //! mismatch as "no credential" (re-enroll) rather than as corruption to report.
 
 use std::fs;
-use std::io::Write as _;
+use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
@@ -239,11 +239,12 @@ impl CredStore {
 }
 
 /// An exclusive `flock(2)` held for the lifetime of the guard. A lock file is never
-/// removed once created (see [`LOCK_DIR_NAME`]).
-struct FileLock(fs::File);
+/// removed once created (see [`LOCK_DIR_NAME`]). `pub(crate)` because the machine
+/// identity file ([`crate::machine`]) serializes its create the same way.
+pub(crate) struct FileLock(fs::File);
 
 impl FileLock {
-    fn acquire(path: &Path) -> Result<Self, String> {
+    pub(crate) fn acquire(path: &Path) -> Result<Self, String> {
         let file = fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -251,11 +252,11 @@ impl FileLock {
             .truncate(false)
             .mode(FILE_PERM)
             .open(path)
-            .map_err(|e| format!("open credentials lock {}: {e}", path.display()))?;
+            .map_err(|e| format!("open lock {}: {e}", path.display()))?;
         // SAFETY: `file` owns a live descriptor for the whole call.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(format!(
-                "lock credentials {}: {}",
+                "lock {}: {}",
                 path.display(),
                 std::io::Error::last_os_error()
             ));
@@ -277,7 +278,7 @@ impl Drop for FileLock {
 /// that already exists, so a root left group- or world-readable by an older build, a
 /// careless restore, or a permissive umask would keep those permissions forever — and
 /// every private key in the store sits under it.
-fn ensure_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn ensure_dir(dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("create dir {}: {e}", dir.display()))?;
     fs::set_permissions(dir, fs::Permissions::from_mode(DIR_PERM))
         .map_err(|e| format!("tighten dir {}: {e}", dir.display()))
@@ -292,7 +293,41 @@ fn read_to_string(path: &Path) -> Result<String, String> {
 /// The temp file is created with the final permissions before any bytes are written, so a
 /// key is never briefly world-readable, and `O_EXCL` means a hostile pre-created temp path
 /// fails the write rather than being followed.
-fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
+    let dir = rename_into_place(path, &mut &data[..])?;
+    // Persist the rename itself. Best effort: some filesystems reject fsync on a directory
+    // handle, and the rename has already succeeded.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// [`atomic_write`] with the rename's directory sync made PART of the write: `sync_dir`
+/// is called on the directory after the rename and its error fails the write. The
+/// credential store keeps the best-effort [`atomic_write`] for its own files; this is for
+/// a caller (the machine identity, [`crate::machine`]) that must not report a write as
+/// done when a power loss could still undo it. `src` is streamed, so a large file can be
+/// copied without holding it in memory.
+pub(crate) fn atomic_write_durable(
+    path: &Path,
+    src: &mut dyn Read,
+    sync_dir: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let dir = rename_into_place(path, src)?;
+    sync_dir(dir).map_err(|e| {
+        format!(
+            "sync dir {} after renaming into {}: {e}",
+            dir.display(),
+            path.display()
+        )
+    })
+}
+
+/// The shared body of the two writers: stream `src` into a fresh 0600 temp file beside
+/// `path`, fsync it, and rename it over `path`. Returns the directory the rename landed
+/// in, for the caller's directory sync.
+fn rename_into_place<'p>(path: &'p Path, src: &mut dyn Read) -> Result<&'p Path, String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = dir.join(temp_name(path));
     let mut f = fs::OpenOptions::new()
@@ -302,22 +337,17 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
         .open(&tmp)
         .map_err(|e| format!("create temp file {}: {e}", tmp.display()))?;
     let commit = (|| -> Result<(), String> {
-        f.write_all(data)
+        std::io::copy(src, &mut f)
             .map_err(|e| format!("write temp file {}: {e}", tmp.display()))?;
         f.sync_all()
             .map_err(|e| format!("fsync temp file {}: {e}", tmp.display()))?;
         fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))
     })();
-    if commit.is_err() {
+    if let Err(e) = commit {
         let _ = fs::remove_file(&tmp);
-        return commit;
+        return Err(e);
     }
-    // Persist the rename itself. Best effort: some filesystems reject fsync on a directory
-    // handle, and the rename has already succeeded.
-    if let Ok(d) = fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    Ok(dir)
 }
 
 /// A collision-resistant temp basename beside `path`: pid + a process-local counter + the

@@ -1004,3 +1004,45 @@ func TestFirecrackerConfigApplyDefaults(t *testing.T) {
 		t.Errorf("TCPProxyPort = %d after applyDefaults, want 2002", cfg2.TCPProxyPort)
 	}
 }
+
+func TestValidateNewShedName(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"git is reserved", "git", true},
+		{"prefix is fine", "gitx", false},
+		{"suffix is fine", "my-git", false},
+		{"git- is not a name", "git-", true},
+		{"uppercase is not a name", "Git", true},
+		{"ordinary", "myapp", false},
+		{"empty", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ValidateNewShedName(tt.input); (err != nil) != tt.wantErr {
+				t.Errorf("ValidateNewShedName(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+	if err := ValidateNewShedName("git"); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Errorf("error for git = %v, want it to say the name is reserved", err)
+	}
+}
+
+// TestValidateShedNameAllowsGit: the non-create rule is unchanged, so an
+// existing shed named git can still be listed, stopped, snapshotted and deleted.
+func TestValidateShedNameAllowsGit(t *testing.T) {
+	if err := ValidateShedName("git"); err != nil {
+		t.Errorf("ValidateShedName(git) = %v, want nil", err)
+	}
+}
+
+func TestIsReservedShedName(t *testing.T) {
+	for name, want := range map[string]bool{"git": true, "Git": false, "GIT": false, "gitx": false, "": false, "git ": false} {
+		if got := IsReservedShedName(name); got != want {
+			t.Errorf("IsReservedShedName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -27,8 +28,19 @@ type egressFakeBackend struct {
 	cleared       bool
 }
 
-func (f *egressFakeBackend) GetShed(_ context.Context, _ string) (*config.Shed, error) {
-	return f.shed, nil
+// GetShed returns the configured shed, or the listed one of that name: the
+// access guard loads a shed before every egress change.
+func (f *egressFakeBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
+	if f.shed != nil {
+		return f.shed, nil
+	}
+	for i := range f.sheds {
+		if f.sheds[i].Name == name {
+			sh := f.sheds[i]
+			return &sh, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 }
 
 func (f *egressFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
@@ -44,6 +56,41 @@ func (f *egressFakeBackend) SetShedEgress(_ context.Context, name string, profil
 func (f *egressFakeBackend) ClearShedEgress(_ context.Context, name string) (*config.Shed, error) {
 	f.cleared = true
 	return &config.Shed{Name: name}, nil
+}
+
+// TestHandleEgressShowDropsEarlierIncarnations: a name can be reused, and
+// `shed egress show` reports only the shed that has it now: a record stamped
+// with another incarnation is dropped, and an unstamped one (written before
+// records carried it) is dropped when it is older than the shed.
+func TestHandleEgressShowDropsEarlierIncarnations(t *testing.T) {
+	created := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	cfg := &config.ServerConfig{Name: "t", Egress: &config.EgressConfig{Enabled: true}}
+	be := &egressFakeBackend{shed: &config.Shed{Name: "web", CreatedAt: created, EgressPort: 20001}}
+	srv := NewServer(be, cfg, "", nil, nil)
+	a, err := egress.OpenAuditLog(filepath.Join(t.TempDir(), "a.jsonl"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	a.Record(egress.AuditRecord{Shed: "web", Host: "old-unstamped", Time: created.Add(-time.Minute)})
+	a.Record(egress.AuditRecord{Shed: "web", Host: "old-stamped", Time: created.Add(time.Minute), ShedCreatedAt: created.Add(-time.Hour)})
+	a.Record(egress.AuditRecord{Shed: "web", Host: "new-unstamped", Time: created.Add(time.Minute)})
+	a.Record(egress.AuditRecord{Shed: "web", Host: "new-stamped", Time: created.Add(2 * time.Minute), ShedCreatedAt: created})
+	srv.SetEgressAudit(a)
+
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/egress/web", nil))
+	var got config.EgressStatus
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var hosts []string
+	for _, rec := range got.Recent {
+		hosts = append(hosts, rec.Host)
+	}
+	if strings.Join(hosts, ",") != "new-unstamped,new-stamped" {
+		t.Errorf("recent = %v, want only this incarnation's", hosts)
+	}
 }
 
 func TestHandleEgressShow(t *testing.T) {

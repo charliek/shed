@@ -99,11 +99,8 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve the shed first so a missing shed is always 404 SHED_NOT_FOUND
 	// with that code, and a stopped one is refused before anything dials.
-	// A name that can't be a shed is missing, not a path to load.
-	if err := config.ValidateShedName(name); err != nil {
-		writeError(w, http.StatusNotFound, config.ErrShedNotFound, "shed not found: "+name)
-		return
-	}
+	// A name that can't be a shed never gets here: the router's
+	// requireShedName answers it as an unknown shed.
 	shed, err := s.backend.GetShed(r.Context(), name)
 	if err != nil {
 		code, errCode, msg := backendErrorFor(r.Context(), err)

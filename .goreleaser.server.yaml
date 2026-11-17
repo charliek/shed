@@ -193,11 +193,10 @@ brews:
             ssh_port: 2222
 
             # bind_address: which interface every listener (HTTP/SSH) uses.
-            # Default loopback (127.0.0.1) = reachable on this machine only. To
-            # reach it from other hosts, prefer secure mode (auth.mode: secure;
-            # see the reference above) with bind_address: 0.0.0.0; or, for an
-            # OPEN server on a trusted private network, set bind_address: 0.0.0.0
-            # and allow_insecure_exposure: true.
+            # Default loopback (127.0.0.1) = reachable on this machine only.
+            # This config runs open mode, which is loopback only. To reach the
+            # server from other hosts, set auth.mode: mtls with an SSH key
+            # source and bind_address: 0.0.0.0 (see the reference above).
             bind_address: 127.0.0.1
 
             default_backend: vz
@@ -270,11 +269,10 @@ brews:
             ssh_port: 2222
 
             # bind_address: which interface every listener (HTTP/SSH) uses.
-            # Default loopback (127.0.0.1) = reachable on this machine only. To
-            # reach it from other hosts, prefer secure mode (auth.mode: secure;
-            # see the reference above) with bind_address: 0.0.0.0; or, for an
-            # OPEN server on a trusted private network, set bind_address: 0.0.0.0
-            # and allow_insecure_exposure: true.
+            # Default loopback (127.0.0.1) = reachable on this machine only.
+            # This config runs open mode, which is loopback only. To reach the
+            # server from other hosts, set auth.mode: mtls with an SSH key
+            # source and bind_address: 0.0.0.0 (see the reference above).
             bind_address: 127.0.0.1
 
             default_backend: firecracker
@@ -356,9 +354,11 @@ brews:
       then start shed-server as a background service:
         brew services start shed
 
-      By default shed-server listens on 127.0.0.1 only (the local-development
-      default). To reach it from other machines set bind_address in the config —
-      prefer auth.mode: secure for anything exposed on a network.
+      By default shed-server listens on 127.0.0.1 only, in open mode (the
+      local-development default; open mode is loopback only). To reach it from
+      other machines set auth.mode: mtls with an SSH key source and
+      bind_address in the config. auth.mode: token and secure, and
+      allow_insecure_exposure, were removed in v0.10.0 and fail to load.
 
       To enable extensions (SSH agent forwarding, AWS credentials,
       Docker credentials), also install the host agent:

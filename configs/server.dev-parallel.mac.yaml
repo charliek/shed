@@ -1,7 +1,8 @@
 # Shed Server — Parallel Dev Configuration (macOS / VZ)
 #
 # Runs ALONGSIDE the brew-installed `my-server` shed-server on the same
-# host. Different ports, different state-dirs, separate images_dir.
+# host. Different ports, different state-dirs (its own state_dir for its
+# identity, below), separate images_dir.
 # Used by `make dev-server-up` + `make test-integration-dev` for testing
 # server-side changes against the developer's source tree without
 # restarting (and disrupting) the brew shed-server.
@@ -9,21 +10,20 @@
 # Launch directly:
 #   bin/shed-server serve --config configs/server.dev-parallel.mac.yaml
 #
-# Add this entry to ~/.shed/config.yaml so the CLI can reach it:
-#   servers:
-#     my-server-dev:
-#       host: localhost
-#       http_port: 18080
-#       ssh_port: 12222
+# Register it with the CLI once, after the first `make dev-server-up`
+# (first contact is over SSH, which enrols a client certificate):
+#   shed server add localhost --ssh-port 12222 --name my-server-dev
 #
 # See docs/development/testing.md for the full workflow.
 
 name: my-server-dev
 
-# Offset from brew's 8080/2222 so both can run simultaneously.
+# Offset from brew's 8080/2222 so both can run simultaneously. http_port is
+# not served in mtls mode; it is kept so a reconfigured open-mode run
+# (tests/integration/fixtures/devcontrol.py: dev_config) stays off 8080.
 http_port: 18080
 ssh_port: 12222
-# Token-mode TLS listener; offset from brew's default 8443.
+# The mtls listener (the only one serving clients); offset from brew's 8443.
 https_port: 18443
 
 # Loopback (also the v0.7.4 default) — the suite drives this dev server over
@@ -33,14 +33,30 @@ bind_address: 127.0.0.1
 default_backend: vz
 log_level: debug
 
-# LOCAL (uncommitted) mobile-testing overrides: token mode + the shed-mobile
-# app key so the pinned-HTTPS mobile client can mint tokens and connect.
+# mtls, the one enforced mode shed-server has; the dev servers and the
+# integration suite run it. The shed-mobile app key is allowlisted so the
+# mobile client can enrol too.
 auth:
-  mode: token
+  mode: mtls
   ssh:
     github_users: [charliek]
     authorized_keys:
       - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBaqTm38OGnpaLoZdZGDEBupr/2C0lcFmdcxevD+wUJI shed-mobile
+
+# The dev server's OWN identity directory: its SSH host key (host_key), TLS
+# certificate and key (tls_cert.pem, tls_key.pem), the mtls client CA
+# (ca_cert.pem, ca_key.pem), the user-list upgrade marker (users-upgrade.json),
+# the GitHub account-id pins (github_pins.json) and the GitHub key cache
+# (github_keys/). Without it the dev server resolves the default, ~/.shed --
+# the brew-installed server's directory on the same Mac -- and shares its host
+# key and TLS pin, signs client certificates with its CA, and removes or writes
+# its upgrade marker and pins. It sits in ~/.shed/dev/ (the dev targets'
+# scratch area) and NOT under the blob directories in the vz block below, so
+# SHED_DEV_STATE_DIR, which moves those to another volume, never moves it.
+# shed-server creates it (mode 0700) on first start. The first start with it
+# makes a new host key, TLS certificate and client CA: re-add the
+# my-server-dev CLI entry once (docs/development/testing.md).
+state_dir: ~/.shed/dev/state
 
 # LOCAL (uncommitted) mounts for mobile testing so agent logins persist across
 # dev-server sheds. CAVEAT: these are the SAME host dirs the brew server

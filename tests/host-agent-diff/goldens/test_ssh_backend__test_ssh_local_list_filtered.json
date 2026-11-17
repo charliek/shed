@@ -1,0 +1,38 @@
+{
+  "audit": {
+    "approval": "none",
+    "detail": "2 keys",
+    "ns": "ssh-agent",
+    "op": "list",
+    "result": "ok",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "list-1",
+    "namespace": "ssh-agent",
+    "payload": {
+      "keys": [
+        {
+          "blob": "AAAAC3NzaC1lZDI1NTE5AAAAILMdrPP0NLsfgrc8JIa6OWX1qhgyfW/UwJTSXdRuUsJJ",
+          "comment": "id_ed25519",
+          "format": "ssh-ed25519"
+        },
+        {
+          "blob": "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEM4urryzyzBoSteEYV1VRkKaVn85MkuZd6h+U8JrVtbLXToSv3n1XQlWXqhPARxghMG4iiuP5udvFeahgPrkpo=",
+          "comment": "id_ecdsa",
+          "format": "ecdsa-sha2-nistp256"
+        }
+      ]
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

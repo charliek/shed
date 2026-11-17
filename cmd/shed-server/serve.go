@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,15 +19,16 @@ import (
 
 	"github.com/charliek/shed/internal/api"
 	"github.com/charliek/shed/internal/audit"
-	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/internal/source"
 	"github.com/charliek/shed/internal/sshd"
 	"github.com/charliek/shed/internal/stallwatch"
+	"github.com/charliek/shed/internal/users"
 	"github.com/charliek/shed/internal/vz"
 )
 
@@ -43,10 +46,6 @@ const (
 	httpReadTimeout       = 60 * time.Second
 	httpIdleTimeout       = 120 * time.Second
 
-	// tokenSweepInterval is how often expired HTTP bearer tokens are reaped
-	// from the in-memory store (expired tokens are also dropped on validate).
-	tokenSweepInterval = 10 * time.Minute
-
 	// caExpiryWarnWindow is how much remaining client-CA lifetime triggers a
 	// startup warning. Rotation is a manual, fleet-wide re-enrollment, so the
 	// notice has to arrive long before issuance actually stops.
@@ -61,6 +60,10 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 		ReadHeaderTimeout: httpReadHeaderTimeout,
 		ReadTimeout:       httpReadTimeout,
 		IdleTimeout:       httpIdleTimeout,
+		// Puts the connection on each request's context, so a
+		// credential-bus stream can bound how long data written to it may
+		// stay unacknowledged (a machine that went to sleep is reaped).
+		ConnContext: api.ConnContext,
 	}
 }
 
@@ -72,8 +75,9 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 //
 // clientCA is non-nil only in mtls mode (runServe loads it there and nowhere
 // else, and aborts startup if the load fails); authorized is the live
-// SSH-allowlist predicate. In token and open mode the result is a plain
-// server-auth-only config: no ClientAuth, no ClientCAs.
+// SSH-allowlist predicate (users.HasKey over the user lookup). Outside mtls the
+// result is a plain server-auth-only config: no ClientAuth, no ClientCAs (open
+// mode serves no HTTPS today, so this is the defensive case).
 //
 // Both conditions are required deliberately, and the belt-and-braces costs
 // nothing: an mtls server that somehow reached here with no CA would produce a
@@ -83,8 +87,9 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 //
 // mtls adds three things: trust only the internal CA, require a client
 // certificate that verifies against it, and refuse the handshake outright when
-// the identity that certificate names has left the SSH allowlist (a user
-// certificate) or is not a configured auth.clients entry (a service
+// the identity that certificate names has left the SSH allowlist or now
+// belongs to another user than the one it was issued to (a user certificate:
+// api.CertificateUser), or is not a configured auth.clients entry (a service
 // certificate, which is never checked against the allowlist).
 //
 // The allowlist check is the FIRST of two, not the only one. A TLS peer's
@@ -96,7 +101,7 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 // turned away at the door rather than allowed to open connections and collect
 // 401s. It is installed as VerifyConnection specifically because crypto/tls
 // skips VerifyPeerCertificate on RESUMED sessions (see servertls/clientauth.go).
-func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientCA *servertls.CA, authorized func(string) bool) *tls.Config {
+func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientCA *servertls.CA, authorized func(*x509.Certificate) bool) *tls.Config {
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
@@ -114,6 +119,17 @@ func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientC
 		tlsCfg.VerifyConnection = servertls.ClientConnectionVerifier(authorized, clientKnown)
 	}
 	return tlsCfg
+}
+
+// certificateAuthorized is the HTTPS listener's handshake check of a user's
+// client certificate, against the live user lookup l: its key still resolves
+// to the user it was issued to (api.CertificateUser, the rule the API
+// middleware applies again on every request).
+func certificateAuthorized(l users.Lookup) func(*x509.Certificate) bool {
+	return func(leaf *x509.Certificate) bool {
+		_, _, ok := api.CertificateUser(l, leaf, time.Now())
+		return ok
+	}
 }
 
 // serverStateDir returns the directory that holds the server's identity
@@ -174,8 +190,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Enforced-mode preflight: refuse to start `auth.mode: token` or `mtls`
-	// without an SSH key source (an empty enforced allowlist would lock
+	// Enforced-mode preflight: refuse to start `auth.mode: mtls` without an
+	// SSH key source (an empty enforced allowlist would lock
 	// everyone out). Runs before anything binds; inert in open mode.
 	if err := cfg.PreflightAuth(); err != nil {
 		return fmt.Errorf("auth preflight: %w", err)
@@ -202,24 +218,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	probeStateDirs(cfg)
 
 	// Initialize plugin system (before backends, since backends use the bridge)
+	// The registry tracks pending requests in every mode, so a response is
+	// always delivered to the shed connection its request came from. The
+	// bridge routes each shed's requests to its user's listeners; a server
+	// with no user list (auth.users) routes every shed as the implicit user,
+	// whatever user its record carries.
 	pluginRegistry := plugin.NewRegistry()
-	// Track pending requests only when auth is enforced (token or mtls) — the
-	// /respond ownership gate is consulted only then, so an unauthenticated
-	// open-mode server does no bookkeeping.
-	if cfg.AuthEnforced() {
-		pluginRegistry.EnableOwnershipTracking()
-	}
-	pluginBridge := plugin.NewBridge(pluginRegistry)
-
-	// HTTP bearer-token store: short-lived, scoped tokens minted over the SSH
-	// bootstrap channel and validated by the auth middleware. In-memory by
-	// design — a restart drops tokens and clients transparently re-mint over
-	// SSH. Shared with the SSH server (bootstrap mint) and the API server
-	// (validate).
-	tokenStore := authtoken.NewStore()
-	tokenCtx, cancelTokens := context.WithCancel(context.Background())
-	defer cancelTokens()
-	tokenStore.StartSweeper(tokenCtx, tokenSweepInterval)
+	pluginBridge := newPluginBridge(cfg, pluginRegistry)
 
 	// Initialize the configured backend. egressSocketDir + attachEgress are
 	// captured per-backend so the egress proxy (constructed once, below) can
@@ -298,6 +303,32 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	defer be.Close()
 
+	// The credential bus pin: the store of each user's credential source,
+	// in the backend's persistent state directory (beside the audit logs;
+	// not the server state directory, which a parallel dev server may
+	// share). The server does not start without it: starting with none would
+	// let the next machine to connect become a user's source. The registry
+	// takes it now, before anything can register a listener; the start-up
+	// steps of the user list (stampUnassigned) act on it before the
+	// listeners start.
+	bindingsPath := filepath.Join(egressStateDir, source.FileName)
+	stopWatch = stallwatch.Watch("opening the credential source bindings", bindingsPath)
+	sourceBindings, created, err := source.OpenFileBindings(bindingsPath, source.Options{})
+	stopWatch()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := sourceBindings.Close(); err != nil {
+			log.Printf("credential source bindings: closing %s: %v", bindingsPath, err)
+		}
+	}()
+	if created {
+		log.Printf("WARNING: %s", source.StartedEmptyWarning(bindingsPath))
+	}
+	log.Printf("Credential source bindings: %s", bindingsPath)
+	pluginRegistry.SetBindings(sourceBindings)
+
 	// The host dials the guest, so nothing re-establishes a running shed's
 	// message channel on its own after a server restart — the plugin bridge
 	// would hold no registration and `shed list -vv` would report no
@@ -314,6 +345,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 		startNetPolicy(netPolicyCtx)
 	}
 
+	// Sheds made before the server had a user list get their user (on a
+	// server with one user) before anyone can reach them. A local backend's
+	// pass runs before the resume walk, so a running shed's message channel
+	// starts with its new user; the remote backend's runs once its first
+	// cloud list has rebuilt its records, and moves the bus routes it
+	// resumed.
+	if waitBackendReady == nil {
+		if _, _, err := stampUnassigned(cfg, be, sourceBindings); err != nil {
+			return err
+		}
+	}
 	resumeCtx, cancelResume := context.WithCancel(context.Background())
 	defer cancelResume()
 	log.Printf("Resuming message channels for already-running sheds in the background")
@@ -328,7 +370,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+		if _, _, err := stampUnassigned(cfg, be, sourceBindings); err != nil {
+			return err
+		}
 	}
+
+	reportReservedSheds(be)
 
 	// Optional egress-control proxy child, started only when enabled. A start
 	// failure is a hard startup error — never a silent disable (AC-11).
@@ -393,40 +440,50 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Initialized egress-control proxy (proxy %s, ports %d-%d, socket %s, audit %s, profiles %s)", proxyBin, lo, hi, sockPath, auditPath, storeDir)
 	}
 
-	// Build the SSH key allowlist (default off = accept all). GitHub-seeded
-	// keys are cached next to the host key. Fails closed (returns an error)
-	// when mode=enforce but no keys resolved.
+	// Build the user lookup: the SSH key allowlist (default off = accept all),
+	// each key belonging to a user with where it came from. Both the SSH
+	// server and the mtls API ask it. GitHub-seeded keys are cached next to
+	// the host key. Fails closed (returns an error) when mode=enforce but no
+	// keys resolved.
 	stateDir := serverStateDir(cfg)
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return fmt.Errorf("state dir %s: %w", stateDir, err)
 	}
 	log.Printf("State dir: %s", stateDir)
 	hostKeyPath := filepath.Join(stateDir, "host_key")
-	githubCacheDir := filepath.Join(stateDir, "github_keys")
-	sshAllowlist, err := sshd.NewKeyAllowlist(cfg.EffectiveSSHAuth(), githubCacheDir)
+	// Every GitHub fetch (the first, the scheduled refresh, `shed users
+	// refresh`, an unknown key's) is bound to refreshCtx, cancelled at
+	// shutdown so a fetch in flight ends then.
+	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
+	defer cancelRefresh()
+	userLookup, err := newUserLookup(refreshCtx, cfg, stateDir)
 	if err != nil {
 		return fmt.Errorf("ssh auth: %w", err)
 	}
-	log.Printf("SSH auth mode: %s", sshAllowlist.Mode())
-
-	// Revoke a key's HTTP tokens when it leaves the allowlist (removed from
-	// github_users or the user's GitHub keys). Authoritative diff only — a failed
-	// refetch falls back to last-known-good, so a transient outage never revokes.
-	sshAllowlist.SetRevokeHook(func(subjects []string) {
-		for _, s := range subjects {
-			if n := tokenStore.RevokeBySubject(s); n > 0 {
-				log.Printf("auth: revoked %d HTTP token(s) for removed key %s", n, s)
-			}
-		}
-	})
+	log.Printf("SSH auth mode: %s", userLookup.Mode())
+	if names := cfg.UserNames(); len(names) > 0 {
+		log.Printf("Users: %s (each key belongs to one user; an unknown key is nobody's)", strings.Join(names, ", "))
+	} else {
+		log.Printf("Users: none configured (every accepted key is the implicit user, an admin)")
+	}
 
 	// Refresh GitHub-seeded keys in the background until shutdown.
-	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
-	defer cancelRefresh()
-	sshAllowlist.StartRefresh(refreshCtx)
+	userLookup.StartRefresh(refreshCtx)
+
+	// The access guard: the one door both front doors call the backend
+	// through. It applies the access rule (internal/backend/access.go) for
+	// the principal each request or channel carries, and binds every
+	// operation on a named shed to the incarnation it authorized. The
+	// backend's own internal work (start-up resume, reconcile, the credential
+	// bus) keeps the raw backend.
+	guard := backend.NewGuard(be)
 
 	// Initialize SSH server
-	sshServer, err := sshd.NewServer(be, hostKeyPath, cfg.SSHListenAddr(), cfg.Terminal, sshAllowlist)
+	sshServer, err := sshd.NewServer(guard, hostKeyPath, cfg.SSHListenAddr(), cfg.Terminal, sshd.KeyAuth{
+		Mode:         userLookup.Mode(),
+		MaxAuthTries: userLookup.MaxAuthTries(),
+		Users:        userLookup,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create SSH server: %w", err)
 	}
@@ -471,17 +528,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Initialize HTTP API server
-	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
+	apiServer := api.NewServer(guard, cfg, hostKey, pluginRegistry, pluginBridge)
 	apiServer.SetAuditLog(auditLog)               // nil-safe: records nothing when audit is off
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
-	apiServer.SetTokenStore(tokenStore)           // shared with the SSH bootstrap handler (1c)
+	apiServer.SetKeyRefresher(userLookup)         // `shed users refresh`, in every mode
 	if clientCA != nil {
 		// mtls: the middleware re-validates every request's client certificate
-		// against the LIVE allowlist, so removing an SSH key de-authorizes its
-		// certificates on the next request — the same "revocation lands
-		// immediately" property the token store gets from RevokeBySubject.
-		apiServer.SetClientCertAuthorizer(sshAllowlist.IsAuthorizedFingerprint)
+		// against the LIVE user lookup, so removing an SSH key de-authorizes its
+		// certificates on the next request.
+		apiServer.SetUserLookup(userLookup)
 		apiServer.SetClientCAInfo(clientCA.Fingerprint(), clientCA.NotAfter())
 	}
 
@@ -492,9 +548,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// resolved addresses separately below.
 	if cfg.BindAddress == "" {
 		if cfg.PlainHTTPEnabled() {
-			log.Printf("WARNING: bind_address is unset — binding loopback (127.0.0.1) only. This was all-interfaces before v0.7.4. To reach this open-mode server off-box, set bind_address (e.g. 0.0.0.0) + allow_insecure_exposure: true, or switch to auth.mode: token.")
+			log.Printf("WARNING: bind_address is unset — binding loopback (127.0.0.1) only. This was all-interfaces before v0.7.4. An open-mode server is loopback only; to reach it off-box, switch to auth.mode: mtls and set bind_address (e.g. 0.0.0.0).")
 		} else {
-			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this token/mtls-mode server off-box.")
+			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this mtls-mode server off-box.")
 		}
 	}
 
@@ -502,8 +558,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// listeners share this single handler.
 	publicHandler := apiServer.Router()
 
-	// Plain-HTTP listener. In an enforced mode (token or mtls) it is not
-	// started — only the pinned-TLS (https_port) listener faces clients.
+	// Plain-HTTP listener. In mtls mode it is not started — only the pinned-TLS (https_port) listener faces clients.
 	var httpServer *http.Server
 	if cfg.PlainHTTPEnabled() {
 		httpServer = newHTTPServer(cfg.HTTPListenAddr(), publicHandler)
@@ -522,32 +577,26 @@ func runServe(cmd *cobra.Command, args []string) error {
 		tlsFingerprint = servertls.Fingerprint(der)
 		log.Printf("TLS cert fingerprint: %s", tlsFingerprint)
 		httpsServer = newHTTPServer(cfg.HTTPSListenAddr(), publicHandler)
-		httpsServer.TLSConfig = buildHTTPSTLSConfig(cfg, cert, clientCA, sshAllowlist.IsAuthorizedFingerprint)
+		httpsServer.TLSConfig = buildHTTPSTLSConfig(cfg, cert, clientCA, certificateAuthorized(userLookup))
 	}
 
-	// Wire the SSH bootstrap handler: it issues an HTTP credential over the
-	// authenticated SSH channel and returns it (with the TLS pin + ports), so
-	// `shed server add` needs no manual token/pin step. In token mode that is a
-	// bearer token minted into the shared store; in mtls mode it is a client
-	// certificate signed by clientCA, and the token store is deliberately NOT
-	// handed over — that path must never mint a bearer token.
-	bootstrapTokens := tokenStore
-	if cfg.MTLSMode() {
-		bootstrapTokens = nil
-	}
-	sshServer.SetBootstrap(bootstrapTokens, sshd.BootstrapInfo{
-		HTTPPort:       cfg.HTTPPort,
+	// Wire the SSH bootstrap handler: in mtls mode it issues a client
+	// certificate signed by clientCA over the authenticated SSH channel and
+	// returns it (with the TLS pin + port), so `shed server add` needs no
+	// manual pin step. An open server's allowlist is never enforced, so every
+	// request gets the open-server refusal that released clients recognise.
+	// The server issues no other credential: it holds no bearer-token code.
+	sshServer.SetBootstrap(sshd.BootstrapInfo{
 		HTTPSPort:      cfg.HTTPSPort,
 		TLSFingerprint: tlsFingerprint,
 		TokenTTL:       cfg.TokenTTL(),
-		AuthMode:       cfg.AuthModeValue(),
 		CA:             clientCA,
 	})
 
 	// Channel to collect errors from servers (HTTP, HTTPS, SSH).
 	errChan := make(chan error, 3)
 
-	// Start HTTP server in goroutine (skipped in token mode — TLS-only)
+	// Start HTTP server in goroutine (skipped in mtls mode — TLS-only)
 	if httpServer != nil {
 		go func() {
 			log.Printf("HTTP server listening on %s", httpServer.Addr)
@@ -608,11 +657,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Stopping the max_age reaper...")
 	}
 	stopReaper()
+	// GitHub key fetches end now: none in flight outlives the shutdown.
+	cancelRefresh()
 
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	// Shutdown HTTP server (when serving — skipped in token mode)
+	// Credential-bus streams never end on their own, so a graceful
+	// shutdown would wait out its whole timeout for them: close them (and
+	// refuse new subscriptions) first.
+	log.Printf("Closing credential bus streams...")
+	pluginRegistry.Close()
+
+	// Shutdown HTTP server (when serving — skipped in mtls mode)
 	if httpServer != nil {
 		log.Printf("Shutting down HTTP server...")
 		if err := httpServer.Shutdown(ctx); err != nil {
@@ -636,6 +693,193 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	log.Printf("Shutdown complete")
 	return nil
+}
+
+// upgradePassTimeout bounds the start-up pass over sheds with no user. On the
+// remote backend each stamp is a cloud label write; one that does not finish
+// in time is logged and tried again at the next start.
+const upgradePassTimeout = 2 * time.Minute
+
+// stampUnassigned runs the one-time upgrade step for a user list, recorded
+// by a marker in the server's state directory (backend.OpenUsersUpgrade),
+// and the start-up report of sheds and snapshots with no user. First the
+// step's decision for this start is taken and recorded
+// (backend.UsersUpgrade.Begin): with several users on the first start, done
+// before anything is listed; with exactly one user on the first start, begun
+// for that user (a pending marker naming them) before anything is given to
+// anyone; an unfinished step is resumed only for the user it was begun for,
+// while they are still the only configured user, and is otherwise abandoned
+// (marked done, nothing given). Then the credential source bindings follow
+// that decision (applySourceUpgrade), then the pass over sheds and snapshots
+// runs on the raw backend (backend.StampUnassigned), stamping only for the
+// decided user, and the step is marked done once a stamping pass finishes
+// (backend.UsersUpgrade.Finish). With no user list it stamps nothing and
+// removes the marker. It logs how many sheds it found with no user, naming
+// them when log_level is debug. An error (only from the source bindings'
+// step) means the server must not start; the marker then still says what
+// the next start resumes.
+func stampUnassigned(cfg *config.ServerConfig, be backend.Backend, bindings source.Bindings) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
+	return stampUnassignedIn(cfg, be, serverStateDir(cfg), bindings)
+}
+
+// reportReservedSheds warns when a shed already has the reserved name git:
+// SSH to it is refused now. Not found is silent; any other error is logged
+// and does not stop start-up. It asks as the server's own principal, on
+// whichever backend is running.
+func reportReservedSheds(be backend.Backend) {
+	ctx, cancel := context.WithTimeout(backend.WithPrincipal(context.Background(), backend.SystemPrincipal()), upgradePassTimeout)
+	defer cancel()
+	_, err := be.GetShed(ctx, config.ReservedShedName)
+	switch {
+	case err == nil:
+		log.Printf("WARNING: a shed named %q exists. %q is now reserved: SSH to it is refused. Snapshot it and recreate under another name, or delete it.", config.ReservedShedName, config.ReservedShedName)
+	case errors.Is(err, config.ErrShedNotFoundSentinel):
+	default:
+		log.Printf("Could not check for a shed named %q (a reserved name): %v", config.ReservedShedName, err)
+	}
+}
+
+// stampUnassignedIn is stampUnassigned with the marker in stateDir.
+func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir string, bindings source.Bindings) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
+	users := upgradeUsers(cfg)
+	upgrade := backend.OpenUsersUpgrade(stateDir, len(users) > 0, log.Printf)
+	// The decision is recorded before anything acts on it, so the source
+	// bindings' step and the pass below follow the same recipient at every
+	// start until the step is done.
+	plan := upgrade.Begin(users, time.Now())
+	if err := applySourceUpgrade(bindings, plan, cfg.UserNames()); err != nil {
+		return backend.UpgradeReport{}, upgrade, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), upgradePassTimeout)
+	defer cancel()
+	debugf := func(string, ...any) {}
+	if cfg.LogLevel == "debug" {
+		debugf = func(format string, args ...any) { log.Printf("DEBUG: "+format, args...) }
+	}
+	passUsers, stamp := users, false
+	if plan.StampFor != nil {
+		passUsers, stamp = []backend.UpgradeUser{*plan.StampFor}, true
+	}
+	rep := backend.StampUnassigned(ctx, be, passUsers, stamp, backend.UpgradeLog{Infof: log.Printf, Debugf: debugf})
+	upgrade.Finish(plan, rep, time.Now())
+	return rep, upgrade, nil
+}
+
+// applySourceUpgrade is the start-up step for the credential source bindings
+// when a user list is added later, run before any listener can register. It
+// follows the one-time step's decision for this start
+// (backend.UsersUpgrade.Begin), already recorded:
+//
+//   - When the step gives sheds to one user (plan.StampFor: the first start
+//     with exactly one user, or a resumed step for that same user), the
+//     implicit user's binding and remembered machines become that user's
+//     (AdoptImplicit; when the user already has records of their own, the
+//     implicit ones are dropped instead). Because the pending marker naming
+//     the user is written before this, a start that ends between the two
+//     resumes for the same user only, and AdoptImplicit run again finds no
+//     implicit records (or the ones a crash left) and adopts them for that
+//     same user: the adoption happens once, for the recipient recorded, and
+//     is never redirected. An abandoned step adopts nothing.
+//   - On the first start with several users (plan.SeveralUsers) they are
+//     dropped.
+//   - When the step could not begin (plan.Deferred: its pending marker
+//     could not be written) the implicit user's records are kept for the
+//     start that takes it.
+//   - At every start, the records of every user that is not configured are
+//     dropped (RetainUsers with the configured names, or with the implicit
+//     user alone when there is no user list), so a name configured again
+//     later starts clean. With no user list nothing is adopted, and only
+//     named users' records (unreachable without a user list) are dropped.
+//
+// A store that cannot be written fails the start; the marker still says what
+// the next start does.
+func applySourceUpgrade(b source.Bindings, plan backend.UpgradePlan, names []string) error {
+	if b == nil {
+		return nil
+	}
+	keep := names
+	switch {
+	case len(names) == 0:
+		keep = []string{source.ImplicitUser}
+	case plan.StampFor != nil:
+		name := plan.StampFor.Name
+		ad, err := b.AdoptImplicit(name)
+		if err != nil {
+			return fmt.Errorf("credential source bindings: giving the server's credential source to user %q: %w", name, err)
+		}
+		switch {
+		case ad.Adopted && ad.Binding != nil:
+			log.Printf("Users: the credential source of the server before its user list (machine %s) is now user %s's, with %d remembered machine(s)", ad.Binding.MachineID(), name, ad.Machines)
+		case ad.Adopted:
+			log.Printf("Users: the %d machine(s) remembered before the user list are now user %s's", ad.Machines, name)
+		case ad.Dropped:
+			log.Printf("Users: user %s already has credential source records; those from before the user list (%d machine(s)) were dropped", name, ad.Machines)
+		}
+	case plan.SeveralUsers:
+		dropped, err := b.Drop(source.ImplicitUser)
+		if err != nil {
+			return fmt.Errorf("credential source bindings: dropping the credential source from before the user list: %w", err)
+		}
+		if dropped {
+			log.Printf("Users: several users are configured, so the credential source from before the user list was dropped; each user's first machine to connect becomes theirs")
+		}
+	case plan.Deferred:
+		keep = append(append([]string(nil), names...), source.ImplicitUser)
+	}
+	dropped, err := b.RetainUsers(keep)
+	if err != nil {
+		return fmt.Errorf("credential source bindings: dropping the records of users no longer configured: %w", err)
+	}
+	for _, u := range dropped {
+		if u == source.ImplicitUser {
+			log.Printf("Users: dropped the credential source records from before the user list")
+		} else {
+			log.Printf("Users: dropped the credential source records of %q, which is not a configured user", u)
+		}
+	}
+	return nil
+}
+
+// upgradeUsers is the configured user list (auth.users) as the start-up pass
+// takes it, sorted by name; nil with no user list.
+func upgradeUsers(cfg *config.ServerConfig) []backend.UpgradeUser {
+	names := cfg.UserNames()
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]backend.UpgradeUser, 0, len(names))
+	for _, name := range names {
+		out = append(out, backend.UpgradeUser{Name: name, Admin: bool(cfg.Auth.Users[name].Admin)})
+	}
+	return out
+}
+
+// newPluginBridge builds the credential bus bridge over reg. It routes each
+// shed's requests to its user's listeners on a server with a user list
+// (auth.users); without one, every shed routes as the implicit user whatever
+// user its record carries.
+func newPluginBridge(cfg *config.ServerConfig, reg *plugin.Registry) *plugin.Bridge {
+	return plugin.NewBridge(reg, cfg.UsersConfigured())
+}
+
+// newUserLookup builds the user lookup both front doors ask: the SSH key
+// allowlist (auth.ssh, default off = accept all) with every key the implicit
+// user's, or, with auth.users, each user's keys. GitHub-seeded keys are cached
+// in stateDir/github_keys, and each GitHub login is pinned to its numeric
+// account id at its first good fetch, in the pin store next to the cache (a
+// user's github_id, when configured, wins). Every fetch is bound to ctx.
+func newUserLookup(ctx context.Context, cfg *config.ServerConfig, stateDir string) (*users.ConfigLookup, error) {
+	var list map[string]config.UserConfig
+	if cfg.UsersConfigured() {
+		list = cfg.Auth.Users
+	}
+	return users.NewConfigLookup(users.ConfigOptions{
+		SSH:            cfg.EffectiveSSHAuth(),
+		GitHubCacheDir: filepath.Join(stateDir, "github_keys"),
+		PinsPath:       filepath.Join(stateDir, users.PinsFileName),
+		Context:        ctx,
+		Users:          list,
+	})
 }
 
 // configWatchPath names the config file in a startup stall line: the --config

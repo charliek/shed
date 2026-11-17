@@ -5,45 +5,30 @@
 `RequireAndVerifyClientCert` with per-request re-validation (see
 `internal/config/server.go`, `internal/servertls/ca.go`,
 `internal/sshd/bootstrap.go`). This module drives that live, against the
-parallel dev server, in `SHED_DEV_AUTH_MODE=mtls` (see the Makefile knob added
-alongside this module and documented in `docs/development/testing.md` /
-`tests/integration/README.md`).
+parallel dev server, which runs mtls by default (both committed
+`configs/server.dev-parallel.*.yaml` are mtls; see
+`docs/development/testing.md` / `tests/integration/README.md`).
 
-**Detection.** The suite cannot probe `GET /api/info` to find out whether a
-server is in mtls mode — that endpoint is bootstrap-exempt at the HTTP layer,
-but mtls enforces `RequireAndVerifyClientCert` on the whole TLS listener, so an
-uncredentialed client never gets far enough to receive ANY HTTP response,
-including from bootstrap-exempt routes (this is exactly what
+**Detection.** mtls is the only enforced mode shed-server has, and both
+committed dev configs run it, so this module needs no mode gate. The suite
+cannot probe `GET /api/info` unauthenticated to confirm it — mtls enforces
+`RequireAndVerifyClientCert` on the whole TLS listener, so an uncredentialed
+client never gets far enough to receive ANY HTTP response (exactly what
 `test_bare_tls_probe_without_client_cert_fails_before_http` below asserts).
-Instead, this module gates on the `SHED_DEV_AUTH_MODE` environment variable
-(set by `make test-integration-dev[-fc]`, forwarded from the same knob that
-picked the dev server's config — see the Makefile) — the whole module skips
-unless it is exactly `"mtls"`. Individual tests additionally assert against the
-*client entry's* cached `auth_mode` in `~/.shed/config.yaml` (or a throwaway
-`$HOME`'s copy of it) as their actual pass/fail signal, per
+Individual tests assert against the *client entry's* cached `auth_mode` in
+`~/.shed/config.yaml` (or a throwaway `$HOME`'s copy of it), per
 `internal/config/client.go: ServerEntry.AuthMode` — that field is populated by
 a real bootstrap exchange, not probed unauthenticated.
 
-**Two-config choreography** (see docs/development/testing.md for the full
-version): run the suite once against the dev server in `token` mode (today's
-default — the existing modules, unaffected by this one), then flip the dev
-server to mtls and run this module:
+**One run.** `make test-integration-dev` (or `-dev-fc`) runs this module
+with the rest of the suite:
 
-    make dev-server-restart SHED_DEV_AUTH_MODE=mtls        # (or -fc)
-    SHED_DEV_AUTH_MODE=mtls make test-integration-dev       # (or -fc)
+    make dev-server-restart && make test-integration-dev    # (or -fc)
 
-**Mode-flip test.** `test_mode_flip_migrates_live` restarts the *actual*
-parallel-dev server mid-test (via the Makefile's `SHED_DEV_AUTH_MODE` knob,
-never a hand-built override config) to prove the live migration in both
-directions. That is more invasive than every other test in this module (and
-than the existing `dev_config()`-based auth tests, which restart against a
-merged-but-still-static config) — restarting the dev server the *rest of this
-module's run* depends on being in mtls mode is a real footgun if the test
-fails halfway. It is therefore VZ-only (mirroring `fixtures/devcontrol.py`'s
-documented FC-config-mutation-is-out-of-scope stance) and gated behind an
-explicit opt-in env var, `SHED_MTLS_FLIP_TEST=1`, so a plain
-`SHED_DEV_AUTH_MODE=mtls make test-integration-dev` run never restarts the
-server out from under itself.
+(The live token-to-mtls mode-flip test that used to live here went with the
+token mode: a server no longer loads a token config to flip from. A client
+entry recorded against a 0.9.x token server still migrates on its next
+request; that is client code, covered by `cmd/shed` unit tests.)
 """
 
 from __future__ import annotations
@@ -53,48 +38,17 @@ import socket
 import ssl
 import stat
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
 import pytest
 import yaml
 
-from fixtures.devcontrol import DEV_AUTH_MODE, KNOWN_HOSTS_PATH, REPO_ROOT
+from fixtures.devcontrol import KNOWN_HOSTS_PATH, isolated_home_with_identity
 from fixtures.server import resolve_server_entry
-
-# Single source of truth for SHED_DEV_AUTH_MODE detection lives in
-# fixtures/devcontrol.py (DEV_AUTH_MODE) — imported here so this module and
-# every mtls-aware skip elsewhere in the suite (skip_mtls_reconfigure /
-# skip_mtls_token_semantics) can never disagree about what "mtls mode" means.
-SHED_DEV_AUTH_MODE = DEV_AUTH_MODE
-
-pytestmark = pytest.mark.skipif(
-    SHED_DEV_AUTH_MODE != "mtls",
-    reason=(
-        f"SHED_DEV_AUTH_MODE={SHED_DEV_AUTH_MODE!r} (want 'mtls'): this module "
-        "only runs against a dev server started with SHED_DEV_AUTH_MODE=mtls. "
-        "Run `make dev-server-restart SHED_DEV_AUTH_MODE=mtls` (or `-fc`), then "
-        "`SHED_DEV_AUTH_MODE=mtls make test-integration-dev` (or `-fc`). "
-        "See docs/development/testing.md."
-    ),
-)
-
-FLIP_TEST_ENV = "SHED_MTLS_FLIP_TEST"
-
-# The identity copied into a throwaway $HOME for the SSH-first `server add`
-# test (see `_isolated_home_with_identity`). Must already be allowlisted by
-# the dev server's `auth.ssh` — today `github_users: [charliek]` on both
-# configs/server.dev-parallel.mac.yaml and .linux-fc.yaml (see
-# scripts/render-dev-mtls-config.sh) — which is the "allowlisted SSH key"
-# precondition this module's docstring and the plan both refer to; nothing
-# here sets that allowlisting up.
-_REAL_SSH_DIR = Path.home() / ".ssh"
-_DEFAULT_IDENTITY = "id_ed25519"
 
 # The exact upgrade-error string a pre-mtls-aware client gets from an mtls
 # server (internal/sshd/bootstrap.go: errBootstrapNeedsCSR). Part of the wire
@@ -125,37 +79,6 @@ def _load_client_entry(config_path: Path, name: str) -> Optional[dict]:
     return (data.get("servers") or {}).get(name)
 
 
-@contextmanager
-def _isolated_home_with_identity():
-    """A throwaway `$HOME` carrying a copy of the developer's real default SSH
-    identity, so system `ssh`'s default identity-file resolution (which honors
-    the `HOME` env var for `~/.ssh/id_ed25519`) finds a usable key without
-    depending on an ssh-agent being loaded. `shed server add`'s SSH-first
-    bootstrap shells out to the real `ssh` binary
-    (`sdk/bootstrap/bootstrap.go`), so this is what lets the add run against a
-    config- and creds-isolated `$HOME` (never the developer's real
-    `~/.shed/config.yaml`) while still authenticating as a key the dev server
-    allowlists.
-
-    Skips the calling test if no default identity exists to copy — this
-    module assumes the same one-time developer setup every other auth test in
-    this suite already assumes (see e.g. `test_bootstrap.py`,
-    `test_http_auth.py`, which read `~/.ssh/id_ed25519.pub` directly).
-    """
-    priv = _REAL_SSH_DIR / _DEFAULT_IDENTITY
-    pub = _REAL_SSH_DIR / f"{_DEFAULT_IDENTITY}.pub"
-    if not priv.exists() or not pub.exists():
-        pytest.skip(f"no default SSH identity at {priv} to copy into a throwaway $HOME")
-    with tempfile.TemporaryDirectory() as home:
-        ssh_dir = Path(home) / ".ssh"
-        ssh_dir.mkdir(mode=0o700)
-        for src in (priv, pub):
-            dst = ssh_dir / src.name
-            dst.write_bytes(src.read_bytes())
-            dst.chmod(0o600)
-        yield home
-
-
 def _shed(args: list[str], home: str, timeout: float = 60) -> subprocess.CompletedProcess:
     env = dict(os.environ, HOME=home)
     return subprocess.run(["shed", *args], capture_output=True, text=True, timeout=timeout, env=env)
@@ -170,44 +93,6 @@ def _free_local_port() -> int:
         s.close()
 
 
-def _wait_tcp_open(host: str, port: int, timeout: float) -> None:
-    """Poll a raw TCP connect (no TLS, no HTTP) until it succeeds.
-
-    Used as the post-restart readiness probe for the mode-flip test: a
-    connect-only probe works identically for BOTH auth modes, unlike an
-    `/api/info` fetch (unreachable under mtls — see the module docstring).
-    Proves the process is listening again; the actual functional assertion is
-    the `shed -s <name> list` call that follows.
-    """
-    deadline = time.monotonic() + timeout
-    last_err: Optional[Exception] = None
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=3):
-                return
-        except OSError as e:
-            last_err = e
-            time.sleep(0.5)
-    raise AssertionError(f"{host}:{port} not accepting connections within {timeout:.0f}s ({last_err})")
-
-
-def _shed_list_ok(server: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    """Retry `shed -s <server> list` for a bit after a restart.
-
-    A single attempt right after `_wait_tcp_open` can still race the Go
-    process finishing its own startup (SSH server, allowlist refresh, etc.);
-    this absorbs that without masking a genuine failure — it returns the
-    LAST attempt's result once the deadline passes, so a real failure still
-    reports real stdout/stderr.
-    """
-    deadline = time.monotonic() + timeout
-    r = subprocess.run(["shed", "-s", server, "list"], capture_output=True, text=True, timeout=30)
-    while r.returncode != 0 and time.monotonic() < deadline:
-        time.sleep(1)
-        r = subprocess.run(["shed", "-s", server, "list"], capture_output=True, text=True, timeout=30)
-    return r
-
-
 # ----------------------------------------------------------------------------
 # SSH-first `server add` against an mtls server
 # ----------------------------------------------------------------------------
@@ -216,7 +101,7 @@ def _shed_list_ok(server: str, timeout: float = 30.0) -> subprocess.CompletedPro
 def test_ssh_first_add_produces_mtls_entry(shed_server_dev):
     """`shed server add <host> --ssh-port <port> --trust-on-first-use` against
     the mtls dev server, with no manual step beyond the allowlisted SSH key
-    (see `_isolated_home_with_identity`): the resulting entry records
+    (see `fixtures.devcontrol.isolated_home_with_identity`): the resulting entry records
     `auth_mode: mtls`, and the issued credential lands on disk exactly per
     `internal/config/clientcreds.go`'s documented layout — a 0700 per-server
     dir containing 0600 `client.pem` / `client.key`.
@@ -227,7 +112,7 @@ def test_ssh_first_add_produces_mtls_entry(shed_server_dev):
     host = entry.get("host", "localhost")
     ssh_port = int(entry["ssh_port"])
 
-    with _isolated_home_with_identity() as home:
+    with isolated_home_with_identity() as home:
         name = "itest-mtls-add"
         r = _shed(
             ["server", "add", host, "--ssh-port", str(ssh_port),
@@ -404,97 +289,3 @@ def test_old_style_bootstrap_without_csr_gets_upgrade_error(shed_server_dev):
         f"got {r.returncode}: stdout={r.stdout!r} stderr={r.stderr!r}"
     )
     assert _UPGRADE_ERROR in r.stderr, f"unexpected bootstrap error: {r.stderr!r}"
-
-
-# ----------------------------------------------------------------------------
-# Mode-flip migration, live, both directions (opt-in — see module docstring)
-# ----------------------------------------------------------------------------
-
-
-@pytest.mark.vz
-@pytest.mark.slow
-@pytest.mark.skipif(
-    os.environ.get(FLIP_TEST_ENV) != "1",
-    reason=(
-        f"opt-in only: set {FLIP_TEST_ENV}=1 to run. This test restarts the "
-        "real parallel-dev VZ server via the Makefile's SHED_DEV_AUTH_MODE "
-        "knob, twice (token, then back to mtls) — more invasive than every "
-        "other test in this module, which only ever read the already-running "
-        "dev server. See the module docstring for why this is VZ-only and "
-        "opt-in rather than always-on."
-    ),
-)
-def test_mode_flip_migrates_live(vz_server_dev):
-    server = vz_server_dev.name
-    entry = resolve_server_entry(server)
-    assert entry is not None, f"{server!r} not found in ~/.shed/config.yaml"
-    https_port = int(entry.get("https_port") or 18443)
-    real_cfg = Path.home() / ".shed" / "config.yaml"
-
-    def auth_mode() -> str:
-        e = _load_client_entry(real_cfg, server)
-        assert e is not None, f"{server!r} missing from {real_cfg}"
-        # ABSENT MEANS TOKEN (internal/config/client.go: ServerEntry.AuthMode).
-        return e.get("auth_mode") or "token"
-
-    def restart(mode: str) -> None:
-        r = subprocess.run(
-            ["make", "dev-server-restart", f"SHED_DEV_AUTH_MODE={mode}"],
-            cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
-        )
-        assert r.returncode == 0, (
-            f"dev-server-restart SHED_DEV_AUTH_MODE={mode} failed: "
-            f"stdout={r.stdout[-2000:]!r} stderr={r.stderr[-2000:]!r}"
-        )
-        # TCP-connect-only probe: valid under EITHER auth mode, unlike an
-        # /api/info fetch (unreachable under mtls — see module docstring).
-        _wait_tcp_open("localhost", https_port, timeout=90)
-
-    assert auth_mode() == "mtls", (
-        "this module only runs with SHED_DEV_AUTH_MODE=mtls; the dev server "
-        "should already be in mtls mode at the start of this test"
-    )
-
-    try:
-        # --- mtls -> token ---
-        restart("token")
-        r = _shed_list_ok(server)
-        assert r.returncode == 0, (
-            f"shed -s {server} list failed after the server flipped to token "
-            f"(no manual re-add should be needed): {r.stdout!r} {r.stderr!r}"
-        )
-        assert auth_mode() == "token", (
-            f"entry auth_mode did not migrate to 'token' after the server "
-            f"flipped modes (still {auth_mode()!r})"
-        )
-
-        # --- token -> mtls ---
-        restart("mtls")
-        r = _shed_list_ok(server)
-        assert r.returncode == 0, (
-            f"shed -s {server} list failed after the server flipped back to "
-            f"mtls (no manual re-add should be needed): {r.stdout!r} {r.stderr!r}"
-        )
-        assert auth_mode() == "mtls", (
-            f"entry auth_mode did not migrate back to 'mtls' after the "
-            f"server flipped back (still {auth_mode()!r})"
-        )
-    finally:
-        # Leave the dev server in mtls: the rest of this module (and a
-        # developer's next SHED_DEV_AUTH_MODE=mtls test-integration-dev run)
-        # assumes that's what's actually running. Best-effort — a failure
-        # here is reported but doesn't mask the real assertion above.
-        r = subprocess.run(
-            ["make", "dev-server-restart", "SHED_DEV_AUTH_MODE=mtls"],
-            cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
-        )
-        if r.returncode == 0:
-            try:
-                _wait_tcp_open("localhost", https_port, timeout=90)
-            except AssertionError as e:
-                print(f"[test_mtls] WARNING: dev server not reachable after final mtls restore: {e}")
-        else:
-            print(
-                f"[test_mtls] WARNING: failed to restore dev server to mtls: "
-                f"stdout={r.stdout[-1000:]!r} stderr={r.stderr[-1000:]!r}"
-            )

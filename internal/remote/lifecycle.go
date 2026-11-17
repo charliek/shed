@@ -54,7 +54,10 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	if err := b.checkReady(); err != nil {
 		return nil, err
 	}
-	if err := config.ValidateShedName(req.Name); err != nil {
+	if err := config.ValidateNewShedName(req.Name); err != nil {
+		return nil, err
+	}
+	if err := config.ValidateShedOwnership(req.Owner, req.User); err != nil {
 		return nil, err
 	}
 	switch {
@@ -140,7 +143,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	maxRun := b.runLimit(req.Owner)
 
 	spec, err := provider.NewSpec(
-		provider.Identity{Env: b.cfg.Environment, ID: id, Name: req.Name, Owner: req.Owner},
+		provider.Identity{Env: b.cfg.Environment, ID: id, Name: req.Name, Owner: req.Owner, User: req.User},
 		provider.ShedSpec{CreatedAt: createdAt, Repo: storedRepo, Network: network, LandingDir: landingDir},
 		b.opts.AuthorizedKeys, size, diskGB, image, maxRun,
 	)
@@ -161,12 +164,14 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 			LandingDir:     landingDir,
 			Image:          image,
 			Owner:          req.Owner,
+			User:           req.User,
 			NetworkProfile: network,
 		},
 		Env:         b.cfg.Environment,
 		Spec:        &spec,
 		Job:         state.JobCreate,
 		NoProvision: req.NoProvision,
+		NoServerEnv: req.NoServerEnv,
 		Size:        size.Name,
 		DiskGB:      diskGB,
 		MaxRun:      maxRun,
@@ -423,9 +428,13 @@ func (b *Backend) DeleteShed(ctx context.Context, name string) error {
 		b.mu.Unlock()
 		return err
 	}
+	// The marker carries the owner the shed was reported with
+	// (ownership), never the raw stored one: a wait that follows the delete
+	// through the marker is bound to what its caller was authorized on.
+	reportedOwner, _ := ownership(r)
 	marker := &state.Marker{
 		ID: r.Shed.ID, Name: name, Env: r.Env, Ref: r.Ref, At: b.now().UTC(),
-		Owner: r.Shed.Owner, CreatedAt: r.Shed.CreatedAt,
+		Owner: reportedOwner, CreatedAt: r.Shed.CreatedAt,
 	}
 	cleanup := b.deletes[marker.ID]
 	if cleanup != nil && cleanup.marker != nil {
@@ -567,14 +576,14 @@ func (b *Backend) WaitSettled(ctx context.Context, name string) (*config.Shed, e
 }
 
 // deletingLocked returns the delete job in flight for a shed of this name that
-// the caller was allowed to see, or nil. A name with no record is all the
-// caller has; the marker carries the deleted shed's owner and creation time,
-// so another client's shed is as invisible while it is destroyed as it was
-// before.
+// the caller was allowed to see, or nil. The marker carries the deleted shed's
+// owner and creation time, so another client's shed is as invisible while it
+// is destroyed as it was before, and a wait bound to the deleted incarnation
+// (backend.WithRequiredCreatedAt) finds that one's job by them. It looks
+// whether or not a record holds the name now: the caller has already found
+// that record is not the shed it asks after, and a shed created again under
+// the name (by anyone) must not hide the old one's unfinished delete.
 func (b *Backend) deletingLocked(ctx context.Context, name string) *job {
-	if b.records[name] != nil {
-		return nil
-	}
 	for _, d := range b.deletes {
 		if d.name != name || d.marker == nil || d.marker.KeepRecord {
 			continue
@@ -605,14 +614,15 @@ func deleteOwed(name string) error { return fmt.Errorf("shed %s: %w", name, ErrD
 // deleteOwedLocked reports whether a delete marker stands, with no delete job
 // in flight, for a shed of this name that the caller was allowed to see. The
 // marker is removed in the critical section in which its job leaves
-// Backend.deletes, so such a marker is a destroy that did not happen.
+// Backend.deletes, so such a marker is a destroy that did not happen. Like
+// deletingLocked it looks whether or not a record holds the name now.
 //
 // Markers are read from disk only when one is known to stand (Backend.pending).
 // A read that fails, of the directory or of one marker known to stand, is
 // returned as an error, never as "no marker": the marker is then the only
 // evidence of the unfinished delete.
 func (b *Backend) deleteOwedLocked(ctx context.Context, name string) (bool, error) {
-	if b.records[name] != nil || len(b.pending) == 0 {
+	if len(b.pending) == 0 {
 		return false, nil
 	}
 	markers, err := b.store.Markers()

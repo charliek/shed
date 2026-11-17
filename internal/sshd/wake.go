@@ -39,12 +39,31 @@ func wakeErrorf(format string, args ...any) error {
 // backend is waited on through WaitSettled for at most asyncWakeTimeout, with
 // the job's progress written to stderr; a stopping shed is waited on until it
 // is stopped and then started.
-func (s *Server) ensureRunning(ctx context.Context, name string, stderr io.Writer, announce bool) (*config.Shed, error) {
-	shed, err := s.backend.GetShed(ctx, name)
+//
+// The right to enter the shed is checked first, before anything waits or
+// wakes it: a caller who may see the shed but not enter it (an admin and
+// another user's shed) is told so, and a caller who may not see it is told it
+// does not exist. Everything after acts on the incarnation that was checked.
+//
+// user is the username the connection authenticated as; it is turned into
+// the shed's name by shedNameFor, before any lookup, and one that names no
+// shed (git, a case variant, a special name) is told the shed does not exist,
+// as an unknown shed is.
+func (s *Server) ensureRunning(ctx context.Context, user string, stderr io.Writer, announce bool) (*config.Shed, error) {
+	name, ok := shedNameFor(user)
+	if !ok {
+		log.Printf("Refused shed lookup: user=%s is not a shed name", logUser(user))
+		return nil, wakeErrorf("shed '%s' not found", user)
+	}
+	shed, err := s.guard().Check(ctx, name, backend.ActionEnter)
 	if err != nil {
 		log.Printf("Failed to get shed %s: %v", name, err)
+		if errors.Is(err, config.ErrForbiddenSentinel) {
+			return nil, &wakeError{msg: forbiddenMessage(name, err)}
+		}
 		return nil, wakeErrorf("shed '%s' not found", name)
 	}
+	ctx = backend.PinCreatedAt(ctx, shed.CreatedAt)
 	if al, ok := backend.IsAsync(s.backend); ok {
 		return s.ensureRunningAsync(ctx, al, shed, stderr, announce)
 	}

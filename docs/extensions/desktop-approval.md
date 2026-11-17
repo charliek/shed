@@ -1,8 +1,9 @@
 # shed-desktop Approval Channel
 
 `shed-host-agent` can delegate approval decisions to the
-[shed-desktop](https://github.com/charliek/shed-desktop) menu-bar app over a
-local Unix-domain socket, instead of approving inline. The same socket also
+[shed-desktop](../desktop/index.md) app over a local Unix-domain socket, instead of
+approving inline. (The desktop app can also run the same broker in-process; then no
+socket is involved. See [Desktop architecture](../desktop/architecture.md#the-embedded-credential-broker).) The same socket also
 carries an all-namespace audit/event stream that the app renders as a live
 activity feed.
 
@@ -57,14 +58,21 @@ canonical reference). In short:
 | Direction | type | Fields |
 |-----------|------|--------|
 | app → agent | `hello` | `client{name,version,pid}`, `capabilities[]`, `replay_events` |
-| agent → app | `hello_ack` | `agent{version,approval_method}`, `namespaces[]`, `gate_namespaces[]`, `request_timeout_ms`, `accepted` |
-| agent → app | `approval_request` | `id`, `namespace`, `op`, `shed`, `detail`, `expires_at` |
+| agent → app | `hello_ack` | `agent{version,approval_method}`, `namespaces[]`, `gate_namespaces[]`, `agent_capabilities[]` (omitted by an older agent), `request_timeout_ms`, `accepted` |
+| agent → app | `approval_request` | `id`, `namespace`, `op`, `server` (omitted in single-server mode), `shed`, `detail`, `expires_at` |
 | app → agent | `approval_response` | `request_id`, `decision` (approve\|deny), `decided_by`, `scope`, `ttl` |
-| agent → app | `event` | `kind`, `shed`, `ns`, `op`, `result`, `detail`, `approval`, `decided_by`, `scope`, `ttl` (audit superset, all namespaces) |
+| agent → app | `event` | `kind`, `server`, `shed`, `ns`, `op`, `result`, `detail`, `code`, `reason`, `approval`, `decided_by`, `scope`, `ttl` (one per audit entry, all namespaces) |
+| app → agent | `credential.get` / `token.get` | `id`, `server` (and `csr` for `credential.get`): a control-scope credential for the app |
+| agent → app | `credential.response` / `token.response` | `in_reply_to`, `server`, the credential or an `error` |
 | agent → app | `ping` / app → agent `pong` | liveness |
 
-`approval_request.detail` carries only metadata (the key type for SSH). The app
-never sees key material or secrets.
+`approval_request.detail` is a fixed description (`SSH sign request`, `AWS credentials
+request`, `Docker credentials for <registry URL>`). It does not name the username or host an
+SSH signature is for. The app never sees key material or secrets.
+
+An SSH sign request reaches the app only after it has passed the
+[signing check](ssh-agent.md#what-the-machine-signs). A request the check refuses never
+produces an `approval_request`; it appears only as an `event` with `result: "refused"`.
 
 When the app approves, it returns `decided_by` (`user`/`touchid`/`policy`),
 `scope`, and `ttl`; the agent records these in its **durable audit log**, so the

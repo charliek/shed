@@ -17,9 +17,9 @@ server: http://localhost:8080
 
 # Multi-server mode (optional): broker for many shed servers from one process,
 # discovered from shed's own CLI config. Uncomment to enable; `server:` above is
-# then ignored. See docs/reference/configuration.md.
+# then ignored. See docs/extensions/configuration.md.
 # discovery:
-#   servers: all          # "all" (default) or a list: [mini2, mini3]
+#   servers: all          # "all" (default) or a list: [devbox, buildbox]
 #   watch: fsnotify        # fsnotify (default) | poll | off
 
 # ---------------------------------------------------------------------------
@@ -37,7 +37,8 @@ server: http://localhost:8080
 #                          Preferences own the method/scope/TTL. If the app isn't
 #                          running, requests fail closed (deny).
 #
-#   SSH only — native macOS Touch ID (works with no app running):
+#   SSH only — native macOS Touch ID (works with no app running; off macOS
+#   these two deny every request):
 #   biometrics             Touch ID only. Fails when no biometric is available.
 #   biometrics-or-password Touch ID, Apple Watch, OR account password. Works in
 #                          clamshell mode and on Macs without a sensor.
@@ -56,7 +57,8 @@ ssh:
 
   approval:
     # Native Touch ID with password fallback — prompts in macOS, no app needed.
-    # Switch to `shed-desktop` to approve in the app instead (enable desktop:).
+    # Switch to `shed-desktop` to approve in the app instead (no other setting
+    # needed). Only requests that pass the signing check below are asked about.
     policy: biometrics-or-password
 
     # scope + session_ttl apply ONLY to the native biometric policies (they
@@ -66,6 +68,28 @@ ssh:
     #   per-shed     Prompt once per shed, cached for session_ttl.
     scope: per-session
     session_ttl: 1h
+
+  # What this machine signs for a shed (machine-wide). Only two things are
+  # ever signed: an SSH login as one of these usernames, and a git commit or
+  # tag signature (SSH signature namespace `git`). Everything else is refused
+  # before any approval prompt and recorded in the audit log. Default [git]; a
+  # list here replaces it, and [] signs no logins at all (commit signing
+  # only). A name beginning with "_" is never allowed. Names are compared
+  # exactly, with no trimming: case, spaces and every character count. See
+  # docs/extensions/ssh-agent.md ("What the machine signs").
+  # allow_users: [git]
+
+  # The keys sheds may see and use, as SHA256 fingerprints (as `ssh-add -l`
+  # prints them) or public key lines (as in a .pub file). Absent: every key the
+  # backend holds is offered; [] offers none. A key a shed may not use is
+  # neither listed nor signed with. A certificate, an sk- key or a DSA key
+  # cannot be named here (the broker never signs with them).
+  # Any username besides git in allow_users requires offer_keys, so the machine
+  # never signs logins as other users with every key in its agent.
+  # (The two entries below are the same key, named each way.)
+  # offer_keys:
+  #   - SHA256:QSbP+oRmKHQkEp2CsJn72x/5Qxyq5lsK6sib0fK1mr0
+  #   - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILMdrPP0NLsfgrc8JIa6OWX1qhgyfW/UwJTSXdRuUsJJ work-laptop
 
 # ---------------------------------------------------------------------------
 # AWS credential vending
@@ -96,8 +120,8 @@ aws:
 
   # Per-server / per-shed role and mode overrides (most specific wins). See docs.
   # servers:
-  #   mini2:
-  #     default_role: arn:aws:iam::123456789012:role/acmeco-mini2
+  #   devbox:
+  #     default_role: arn:aws:iam::123456789012:role/acmeco-devbox
   #     sheds:
   #       web:
   #         role: arn:aws:iam::123456789012:role/acmeco-web
@@ -129,7 +153,7 @@ docker:
 
   # Per-server / per-shed registry overrides (most specific wins). See docs.
   # servers:
-  #   mini2:
+  #   devbox:
   #     allow_all: true
   #     sheds:
   #       web:
@@ -139,7 +163,9 @@ docker:
 # Audit logging (durable, independent of shed-desktop)
 # ---------------------------------------------------------------------------
 # Every credential operation is appended here as JSON, whether or not the
-# shed-desktop app is connected. This is the authoritative record.
+# shed-desktop app is connected. This is the authoritative record. Sign
+# requests the signing check refuses are recorded too (result: refused). The
+# file is never rotated by the agent.
 logging:
   enabled: true
   path: ~/.local/share/shed/extensions-audit.log
@@ -150,8 +176,20 @@ logging:
 # No configuration needed: the agent always serves a local approval socket at a
 # fixed path that the shed-desktop app connects to (it receives the audit/event
 # stream and decides any extension whose policy is `shed-desktop`). See
-# docs/reference/host-agent-ipc.md. Tune the approval budget with the top-level
+# docs/extensions/host-agent-ipc.md. Tune the approval budget with the top-level
 # `approval_timeout` above.
+
+# ---------------------------------------------------------------------------
+# Machine identity
+# ---------------------------------------------------------------------------
+# Not configured here. The agent keeps this machine's id and name in
+# host-agent/machine.json under its state directory (macOS:
+# ~/Library/Application Support/shed/, Linux: $XDG_DATA_HOME/shed/ or
+# ~/.local/share/shed/), shared
+# with the desktop app's embedded broker. A shed server lets one machine per
+# user answer credential requests and tells machines apart by that id; see
+# docs/extensions/source-binding.md. On a machine restored from another's
+# backup, delete machine.json so it gets an id of its own.
 
 # ---------------------------------------------------------------------------
 # Retired keys

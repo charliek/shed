@@ -39,7 +39,7 @@ use std::sync::Arc;
 // against them (`config::HostAgentConfig`, `bus::FileBusLog`, `supervisor::…`, …) —
 // the same bare paths the pre-extraction single-crate daemon used.
 use shed_broker::config::HostAgentConfig;
-use shed_broker::status::{build_live_status, now_rfc3339, LiveStatus};
+use shed_broker::status::{build_live_status, now_rfc3339, LiveStatus, SshSigningStatus};
 use shed_broker::{
     approval, audit, aws_backend, bus, config, docker_backend, minter, sockets, ssh_backend,
     supervisor, watcher,
@@ -254,6 +254,12 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         cfg.effective_policy(config::NS_DOCKER_CREDENTIALS),
     ));
 
+    // This machine's identity, before any socket binds so the first status snapshot
+    // already carries it. Like the credential store, an unusable file never stops the
+    // daemon: a corrupt one is replaced (loudly), and one that cannot be read or created
+    // leaves the daemon running WITHOUT an identity, the reason shown in `status`.
+    let machine = load_machine_identity(&mut log);
+
     // Resolve the SSH backend UNCONDITIONALLY at startup — after config load, BEFORE
     // any socket binds — mirroring Go's `main.go:114` (`ResolveSSHBackend` runs before
     // the desktop/status sockets). A resolve error (unknown `ssh.mode`, or an explicit
@@ -272,6 +278,24 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     for warning in &ssh_warnings {
         log.warn(warning);
     }
+
+    // The bus log sink — shared across every watcher group, the backend-construction
+    // warnings below, and the key filter's one-time unmatched-entry warning.
+    let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(log_file));
+
+    // The `ssh.offer_keys` key filter (plan 035 §3.5), around whichever backend
+    // resolved: sheds see and can sign with only the offered keys. Without the key it
+    // passes everything through. It asks the backend nothing itself, so the
+    // agent-forward backend still makes no start-up call.
+    let ssh_sign_policy = cfg.ssh_sign_policy();
+    let filtered_ssh = ssh_backend::with_key_filter(
+        ssh_backend,
+        ssh_sign_policy.offer_keys().cloned(),
+        Some(bus_log.clone()),
+    );
+    // Every listing records its counts in `filtered_ssh.counts()` (for the status block).
+    let ssh_backend: Arc<dyn ssh_backend::SshBackend> = filtered_ssh.clone();
+
     // Enumerate keys at startup ONLY for local-keys (a free local file read, matching
     // Go's `newLocalKeysBackend`, which logs each loaded file). For agent-forward, Go
     // NEVER probes the forwarded agent at startup — it only logs "auto-detected …
@@ -295,6 +319,10 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         ssh_backend.mode(),
         ssh_keys.len()
     ));
+    if let Some(line) = filtered_ssh.startup_line() {
+        log.info(&line);
+    }
+    let ssh_mode = ssh_backend.mode().to_string();
 
     let version = full_info();
     let status_path = sockets::status_socket_path();
@@ -344,10 +372,6 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         let listener = bind_unix_socket("desktop", &path, &mut log);
         (server, listener, path)
     };
-
-    // The bus log sink — shared across every watcher group and the backend-construction
-    // warnings below.
-    let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(log_file));
 
     // Select each namespace's approval gate from its own effective policy (empty → deny-all,
     // fail-closed). The built-in policy→gate routing (approve-all / biometrics / unknown →
@@ -422,14 +446,39 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     // separate single-server path — single-server is just a discovery config that reconciles
     // once and never reloads, and the single unnamed target has `ssh_host=""` → `should_mint`
     // false → open/no-pin (why the existing single-server bus surface survives unchanged).
+    // The one lock watcher of this process (started in the runtime below, before anything
+    // subscribes).
+    let presence_watcher = shed_broker::presence::LockWatcher::new(
+        shed_broker::presence::lock_path(),
+        bus_log.clone(),
+    );
     let deps = supervisor::SharedDeps {
         ssh_backend,
         ssh_gate,
+        // Checked before the approval gate on every sign request; fixed at start.
+        ssh_sign_policy: Arc::new(ssh_sign_policy.clone()),
         aws,
         docker,
         audit,
         minter: Some(minter),
         log: bus_log.clone(),
+        // Sent on every bus request; with no identity the bus sends no identity headers
+        // and behaves exactly as before (status says why there is none).
+        machine: machine.as_ref().ok().cloned(),
+        // The daemon stands by while the desktop app's embedded broker runs on this
+        // machine: the app holds an exclusive lock beside the machine identity file the
+        // two share (`shed_broker::presence`), and ONE watcher in this process looks at it
+        // (a shared lock, off the async workers) every couple of seconds and publishes
+        // what it finds on this channel, which every subscription reads. While the lock is
+        // held the daemon subscribes nothing and answers nothing (the app answers, its
+        // prompts have a consumer there); once the app quits, however it quits, the
+        // kernel drops the lock and the daemon subscribes at once. Without this the two,
+        // sharing one machine id, could each win a type after a server restart, and a
+        // daemon delegating approval to an app running its own broker would deny every
+        // sign request.
+        embedded_presence: Some(presence_watcher.subscribe()),
+        // Only the embedded broker holds the lock.
+        presence_lock: None,
     };
     let sup = Arc::new(supervisor::Supervisor::new(shutdown_rx.clone(), deps));
 
@@ -472,6 +521,11 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         let started_at = started_at.clone();
         let version = version.clone();
         let sup = sup.clone();
+        // The signing block: the policy fixed at start, the resolved backend mode, and
+        // the key filter's counts from the last listing.
+        let ssh_mode = ssh_mode.clone();
+        let ssh_counts = filtered_ssh.counts();
+        let ssh_sign_policy = ssh_sign_policy.clone();
         #[cfg(feature = "desktop-forwarding")]
         let desktop_server = desktop_server.clone();
         Arc::new(move || {
@@ -486,6 +540,12 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
                 &version,
                 consumer,
                 sup.health(),
+                &machine,
+                Some(SshSigningStatus::new(
+                    &ssh_mode,
+                    &ssh_sign_policy,
+                    ssh_counts.get(),
+                )),
             )
         })
     };
@@ -511,6 +571,11 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         });
 
         let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        // The presence watcher's first look (bounded: a slow filesystem cannot hold the
+        // start up) is in before the watch loop below makes the first subscription; its
+        // task then runs until shutdown, never waiting for a look that stalled.
+        tasks.push(presence_watcher.start(shutdown_rx.clone()).await);
 
         // The status + desktop listeners race `listener_shutdown` (flipped after the groups
         // drain), NOT the raw SIGTERM watch — so their sockets outlive the group teardown.
@@ -582,6 +647,49 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
 
     log.info("stopped");
     0
+}
+
+/// Load (or create) this machine's identity and log how it was obtained. `Err` carries
+/// the reason there is none, for the status report.
+fn load_machine_identity(log: &mut Log) -> Result<shed_broker::MachineIdentity, String> {
+    use shed_broker::machine::{load_or_create_at, machine_state_path, LoadOutcome};
+    let path = machine_state_path();
+    match load_or_create_at(&path) {
+        Ok(loaded) => {
+            let id = &loaded.identity;
+            let where_ = path.display();
+            match &loaded.outcome {
+                LoadOutcome::Existing => log.info(&format!(
+                    "machine identity id={} name={:?} path={where_}",
+                    id.id, id.name
+                )),
+                LoadOutcome::Created => log.info(&format!(
+                    "machine identity created id={} name={:?} path={where_}",
+                    id.id, id.name
+                )),
+                LoadOutcome::Repaired { reason, written } => log.warn(&format!(
+                    "machine identity repaired; the id is kept id={} name={:?} \
+                     reason={reason} written={written} path={where_}",
+                    id.id, id.name
+                )),
+                LoadOutcome::Replaced { reason, old_file } => log.warn(&format!(
+                    "machine identity was unusable and has been REPLACED; servers will see \
+                     a new machine id={} name={:?} reason={reason} old_file={} path={where_}",
+                    id.id,
+                    id.name,
+                    old_file.display()
+                )),
+            }
+            Ok(loaded.identity)
+        }
+        Err(e) => {
+            log.error(&format!(
+                "machine identity unavailable; continuing without one path={} error={e}",
+                path.display()
+            ));
+            Err(e)
+        }
+    }
 }
 
 /// Resolve when the shared shutdown watch is flipped (or its sender is dropped).

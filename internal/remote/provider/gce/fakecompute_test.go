@@ -59,6 +59,10 @@ type fakeCompute struct {
 	failCalls []fFail
 	// failOps: the next operation of a type finishes with these codes.
 	failOps map[string][]fOpErr
+	// beforeSetLabels, when set, runs (under mu) as a setLabels request
+	// arrives, before its fingerprint is checked: another writer's change
+	// landing between the client's read and its write.
+	beforeSetLabels func(in *fInst)
 
 	// tokens: issued access tokens, and the ones the API now rejects.
 	tokenTTL  int
@@ -778,6 +782,9 @@ func (f *fakeCompute) action(w http.ResponseWriter, r *http.Request, name, verb 
 			in.stopped = time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
 		}, func() { in.status = "RUNNING" })
 	case "setLabels":
+		if f.beforeSetLabels != nil {
+			f.beforeSetLabels(in)
+		}
 		var req struct {
 			Labels           map[string]string `json:"labels"`
 			LabelFingerprint string            `json:"labelFingerprint"`

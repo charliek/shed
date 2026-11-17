@@ -133,7 +133,7 @@ pub struct MinterError {
 }
 
 impl MinterError {
-    fn new(message: String) -> Self {
+    pub(crate) fn new(message: String) -> Self {
         Self {
             message,
             terminal: false,
@@ -686,6 +686,23 @@ impl CredentialSource {
     pub fn holds_certificate(&self) -> bool {
         let st = self.state.lock().unwrap();
         st.terminal_err.is_none() && matches!(st.cred, Some(Held::Certificate { .. }))
+    }
+
+    /// Whether [`Self::token`] would now start or join a mint instead of serving the held
+    /// credential — the same test `obtain` makes: a mint is in flight, nothing usable is
+    /// held, it is stale, or the server REFUSED it (the `rejected` flag, which stays set
+    /// until a mint succeeds — so after a failed re-mint every call mints again). The
+    /// terminal state fails at once without minting. Lets a caller bound its mint
+    /// attempts (a bus respond makes at most one).
+    pub fn would_mint(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        if st.terminal_err.is_some() {
+            return false;
+        }
+        if st.inflight.is_some() {
+            return true;
+        }
+        !matches!(&st.cred, Some(c) if c.usable() && !stale(st.expiry) && !st.rejected)
     }
 
     /// Proactively re-mint, best-effort (errors surface on the next obtain). Driven by

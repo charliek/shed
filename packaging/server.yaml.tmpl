@@ -7,10 +7,10 @@ http_port: 8080
 ssh_port: 2222
 
 # bind_address: which interface every listener (HTTP/SSH) uses. Default
-# loopback (127.0.0.1) = reachable on this machine only. To reach it from
-# other hosts, prefer secure mode (auth.mode: secure) with bind_address:
-# 0.0.0.0; or, for an OPEN server on a trusted private network, set
-# bind_address: 0.0.0.0 and allow_insecure_exposure: true.
+# loopback (127.0.0.1) = reachable on this machine only. This config runs
+# open mode, which is loopback only. To reach the server from other hosts,
+# set auth.mode: mtls with an SSH key source (auth.ssh.github_users or
+# authorized_keys) and bind_address: 0.0.0.0 (see the reference above).
 bind_address: 127.0.0.1
 
 default_backend: firecracker

@@ -638,7 +638,7 @@ func TestCreateShedFromSnapshotMutualExclusionWrapsSentinel(t *testing.T) {
 // lose for every running shed.
 func newResumeTestClient(t *testing.T, cfg *config.FirecrackerConfig, inspect func(context.Context, int) (string, error)) (*Client, *plugin.Bridge) {
 	t.Helper()
-	bridge := plugin.NewBridge(plugin.NewRegistry())
+	bridge := plugin.NewBridge(plugin.NewRegistry(), false)
 	c := &Client{
 		cfg:         cfg,
 		vms:         make(map[string]*VM),
@@ -680,7 +680,7 @@ func fcCmdline(cfg *config.FirecrackerConfig, name string) string {
 // bridge — the observable these tests assert on rather than spying on the
 // walk itself.
 func resumedNames(b *plugin.Bridge) []string {
-	infos := b.ListSheds()
+	infos := b.ListSheds("", true)
 	names := make([]string, 0, len(infos))
 	for _, i := range infos {
 		names = append(names, i.Name)
@@ -1595,5 +1595,72 @@ func TestMount9PArgv(t *testing.T) {
 				t.Fatalf("mount9PArgv(%q, %q, %q, %v):\n got %q\nwant %q", tc.addr, tc.target, tc.tag, tc.readOnly, got, want)
 			}
 		})
+	}
+}
+
+// TestResumeRegistersTheRecordedUser: a running shed resumed after a server
+// restart joins the credential bus as the user and incarnation its metadata
+// records; a record naming both a service client and a user stays off it.
+func TestResumeRegistersTheRecordedUser(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := testFirecrackerConfig(tmpDir)
+	pids := map[string]int{"alpha": 101, "both": 102}
+	metas := map[string]*Metadata{}
+	for name, pid := range pids {
+		meta := createTestInstance(t, tmpDir, name)
+		meta.Status, meta.PID, meta.User = config.StatusRunning, pid, "alice"
+		if name == "both" {
+			meta.Owner = "nocturn"
+		}
+		if err := meta.Save(tmpDir); err != nil {
+			t.Fatal(err)
+		}
+		metas[name] = meta
+	}
+	inspect := func(_ context.Context, pid int) (string, error) {
+		for name, p := range pids {
+			if p == pid {
+				return fcCmdline(cfg, name), nil
+			}
+		}
+		return "", os.ErrNotExist
+	}
+	c, _ := newResumeTestClient(t, cfg, inspect)
+	bridge := plugin.NewBridge(plugin.NewRegistry(), true)
+	c.credMgr = vmutil.NewCredentialManager(nil, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker())
+	c.ResumeRunningInstances(context.Background())
+
+	if u, ok := bridge.ShedUser("alpha"); !ok || u != "alice" {
+		t.Fatalf("ShedUser(alpha) = (%q, %v), want alice", u, ok)
+	}
+	if u, ok := bridge.IncarnationUser("alpha", metas["alpha"].CreatedAt); !ok || u != "alice" {
+		t.Fatalf("IncarnationUser(alpha) = (%q, %v), want alice", u, ok)
+	}
+	if u, ok := bridge.ShedUser("both"); ok {
+		t.Fatalf("a record naming a service client and a user is on the bus as %q", u)
+	}
+	if got := bridge.ListSheds("root", true); len(got) != 1 || got[0].Name != "alpha" {
+		t.Fatalf("bus sheds = %+v, want only alpha", got)
+	}
+}
+
+// TestCreateShedRefusesReservedName: a create named git (also from a
+// snapshot) is refused before anything is made.
+func TestCreateShedRefusesReservedName(t *testing.T) {
+	c := &Client{}
+	for _, req := range []config.CreateShedRequest{
+		{Name: "git"},
+		{Name: "git", FromSnapshot: "snap1"},
+	} {
+		_, err := c.CreateShed(context.Background(), req)
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("CreateShed(%+v) error = %v, want a reserved-name refusal", req, err)
+		}
+	}
+	// Negative control: a different name gets past the name rule (and is
+	// refused for the request's own exclusivity rule).
+	_, err := c.CreateShed(context.Background(), config.CreateShedRequest{Name: "gitx", FromSnapshot: "snap1", Image: "default"})
+	if err == nil || strings.Contains(err.Error(), "reserved") {
+		t.Errorf("gitx error = %v, want a refusal that is not about the name", err)
 	}
 }

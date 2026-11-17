@@ -1,9 +1,9 @@
 """Service clients (`auth.clients`) against the parallel FC dev server.
 
-Firecracker only, and only against a dev server started in mtls mode
-(`SHED_DEV_AUTH_MODE=mtls`), whose rendered config carries the `itest` service
-client (`scripts/render-dev-config.sh --mtls`: prefix `itest-svc-`,
-`max_sheds: 3`, images `[itest]`, no server mounts).
+Firecracker only, against the FC dev server, which runs mtls: its committed
+config (`configs/server.dev-parallel.linux-fc.yaml`) carries the `itest`
+service client (prefix `itest-svc-`, `max_sheds: 3`, images `[itest]`, no
+server mounts).
 
 The bundle is issued the way an operator would, on the dev host:
 `sudo -n /tmp/shed-server-dev client issue itest --config /tmp/shed-server-dev.yaml`
@@ -20,37 +20,27 @@ has the client's api lines and an exec.end line with argv[0] and the count,
 never the arguments. An admin create with `"mounts": []` also boots with
 no 9P mounts, before and after stop/start.
 
-Run: `make build && make dev-server-restart-fc SHED_DEV_AUTH_MODE=mtls &&
-make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls PYTEST_ARGS="test_service_client.py"`.
+Run: `make build && make dev-server-restart-fc &&
+make test-integration-dev-fc PYTEST_ARGS="test_service_client.py"`.
 """
 
 from __future__ import annotations
 
-import base64
-import http.client
 import json
 import os
-import ssl
 import stat
 import uuid
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 
 import pytest
 import yaml
 
-from fixtures.devcontrol import DEV_AUTH_MODE
-from fixtures.tlsclient import fingerprint, server_cert_pem
+from fixtures.identity import skip_unless_started_with_users, users_environment
+from fixtures.tlsclient import Pinned, error_code
 
-pytestmark = pytest.mark.skipif(
-    DEV_AUTH_MODE != "mtls",
-    reason=(
-        f"SHED_DEV_AUTH_MODE={DEV_AUTH_MODE!r} (want 'mtls'): service clients "
-        "exist only in mtls mode. Run "
-        "`make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls`."
-    ),
-)
+# No auth-mode gate: the FC dev server is always mtls, and `_load_entry`
+# skips cleanly when the dev entry has no mtls client certificate.
 
 DEV_BIN = os.environ.get("SHED_FC_DEV_BIN_PATH", "/tmp/shed-server-dev")
 DEV_CONFIG = os.environ.get("SHED_FC_DEV_CONFIG", "/tmp/shed-server-dev.yaml")
@@ -60,55 +50,6 @@ CREATE_TIMEOUT = 300
 # The audit log sits in the FC backend's state dir, the parent of the dev
 # config's instance_dir (/var/lib/shed-dev/firecracker/instances).
 AUDIT_LOG = os.environ.get("SHED_FC_DEV_AUDIT_LOG", "/var/lib/shed-dev/firecracker/audit.jsonl")
-
-
-class Pinned:
-    """An HTTPS client with a client certificate, trusting exactly one
-    server certificate (the pin replaces the hostname check)."""
-
-    def __init__(self, host: str, port: int, pin: str, cert_file: str, key_file: str) -> None:
-        self.host, self.port = host, port
-        pem = server_cert_pem(host, port)
-        assert fingerprint(pem) == pin, "the dev server's certificate does not match the pin"
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.load_verify_locations(cadata=pem)
-        ctx.load_cert_chain(cert_file, key_file)
-        self.ctx = ctx
-
-    def request(self, method: str, path: str, body: Optional[dict] = None, timeout: float = 60) -> tuple[int, dict | None]:
-        conn = http.client.HTTPSConnection(self.host, self.port, context=self.ctx, timeout=timeout)
-        try:
-            data = json.dumps(body).encode() if body is not None else None
-            headers = {"Content-Type": "application/json"} if data is not None else {}
-            conn.request(method, path, body=data, headers=headers)
-            resp = conn.getresponse()
-            raw = resp.read()
-            if resp.getheader("Content-Type", "").startswith("application/x-ndjson"):
-                return resp.status, {"frames": [json.loads(line) for line in raw.splitlines() if line.strip()]}
-            return resp.status, (json.loads(raw) if raw.strip() else None)
-        finally:
-            conn.close()
-
-    def exec(self, shed: str, argv: list, timeout_seconds: int = 60) -> tuple[int, bytes, Optional[int], dict | None]:
-        """Run argv; returns (status, stdout, exit code, error body)."""
-        status, body = self.request(
-            "POST", f"/api/sheds/{shed}/exec", {"argv": argv, "timeout_seconds": timeout_seconds},
-            timeout=timeout_seconds + 30,
-        )
-        if status != 200:
-            return status, b"", None, body
-        out, code = b"", None
-        for f in body["frames"]:
-            if f["t"] == "stdout":
-                out += base64.b64decode(f["d"])
-            elif f["t"] == "exit":
-                code = f["code"]
-        return status, out, code, None
-
-
-def error_code(body: dict | None) -> Optional[str]:
-    return ((body or {}).get("error") or {}).get("code")
 
 
 def _load_entry(name: str) -> dict:
@@ -253,6 +194,57 @@ def test_admin_sees_owner_and_can_exec(admin, client_shed):
     assert mine and mine[0]["owner"] == CLIENT
     status, out, code, _ = admin.exec(name, ["echo", "admin-here"])
     assert (status, code, out) == (200, 0, b"admin-here\n")
+
+
+@pytest.fixture(scope="module")
+def fc_users(fc_server_dev):
+    """The itest identities, when the FC dev server was started with the
+    itest user list (`SHED_ITEST_USERS=fc`); skips otherwise. See
+    `fixtures/identity.py`."""
+    skip_unless_started_with_users("fc", fc_server_dev.name)
+    with users_environment("fc", fc_server_dev, reconfigure=False, image="itest") as env:
+        yield env
+
+
+def test_users_and_the_client_do_not_reach_each_others_sheds(svc, client_shed, fc_users, fc_server_dev):
+    """With a user list, the client's shed is no user's: a user who is not an
+    admin cannot see or enter it, and an admin may enter it (admins may enter
+    a service client's sheds). The client cannot see a user's shed."""
+    name, _ = client_shed
+    alice, admin = fc_users.alice, fc_users.admin
+
+    mine = f"itest-ucs-{uuid.uuid4().hex[:8]}"
+    try:
+        r = alice.cli("create", mine, "--image", "itest", "--no-sync", timeout=CREATE_TIMEOUT)
+        assert r.returncode == 0, f"alice's create failed: {r.stderr[-800:]!r}"
+        # Control: alice enters her own shed through the same shim and
+        # known_hosts, so the refusal below is about whose shed it is.
+        marker = f"itest-entered-{uuid.uuid4().hex[:8]}"
+        r = alice.ssh(mine, f"echo {marker}")
+        assert r.returncode == 0 and marker in r.stdout, f"alice could not enter her own shed: {r.stderr!r}"
+
+        status, body = alice.api().request("GET", f"/api/sheds/{name}")
+        assert (status, error_code(body)) == (404, "SHED_NOT_FOUND"), (status, body)
+        assert name not in {s["name"] for s in alice.list_sheds()}
+        marker = f"itest-entered-{uuid.uuid4().hex[:8]}"
+        r = alice.ssh(name, f"echo {marker}")
+        assert r.returncode != 0 and marker not in r.stdout, f"alice entered the client's shed: {r.stdout!r}"
+        # The server's refusal (internal/sshd/wake.go), the same words as for
+        # a shed that does not exist: not an authentication or connection
+        # failure.
+        assert f"shed '{name}' not found" in r.stderr, f"not the server's refusal: {r.stderr!r}"
+
+        marker = f"itest-entered-{uuid.uuid4().hex[:8]}"
+        r = admin.ssh(name, f"echo {marker}")
+        assert r.returncode == 0 and marker in r.stdout, f"an admin could not enter the client's shed: {r.stderr!r}"
+
+        status, body = svc.request("GET", f"/api/sheds/{mine}")
+        assert (status, error_code(body)) == (404, "SHED_NOT_FOUND"), (status, body)
+        status, body = svc.request("GET", "/api/sheds")
+        assert status == 200 and mine not in {s["name"] for s in body["sheds"]}
+    finally:
+        # Checked: fails naming the shed and server if it cannot be shown gone.
+        fc_server_dev.ensure_deleted(mine)
 
 
 def read_audit(fc_server_dev) -> tuple[str, list[dict]]:

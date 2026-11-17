@@ -20,6 +20,7 @@ func TestIdentityLabelsRoundTrip(t *testing.T) {
 	}{
 		{"owned", testIdentity()},
 		{"admin shed has an empty owner", Identity{Env: "prod", ID: "a1b2c3d4", Name: "x"}},
+		{"a user's shed", Identity{Env: "prod", ID: "a1b2c3d4", Name: "x", User: "alice"}},
 		{"longest names", Identity{
 			Env:   "e" + strings.Repeat("n", 19),
 			ID:    strings.Repeat("7", 32),
@@ -38,6 +39,9 @@ func TestIdentityLabelsRoundTrip(t *testing.T) {
 			}
 			if _, ok := labels[LabelOwner]; !ok {
 				t.Errorf("label %s must be present even when empty", LabelOwner)
+			}
+			if got, ok := labels[LabelUser]; !ok || got != tt.id.User {
+				t.Errorf("label %s = %q (present %v), want %q and present even when empty", LabelUser, got, ok, tt.id.User)
 			}
 			if _, ok := labels[LabelLayout]; ok {
 				t.Errorf("label %s must not be set at create", LabelLayout)
@@ -71,6 +75,8 @@ func TestIdentityRejects(t *testing.T) {
 		{"empty name", func(i *Identity) { i.Name = "" }},
 		{"name with a dot", func(i *Identity) { i.Name = "a.b" }},
 		{"owner with a space", func(i *Identity) { i.Owner = "a b" }},
+		{"user with a space", func(i *Identity) { i.User = "a b" }},
+		{"user in upper case", func(i *Identity) { i.User = "Alice" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -103,6 +109,53 @@ func TestIdentityFromLabelsSchema(t *testing.T) {
 				t.Errorf("IdentityFromLabels = %v, want ErrInvalid", err)
 			}
 		})
+	}
+}
+
+// shed_user was added to label schema 1 without a bump: an instance labelled
+// before it existed carries no such key and still reads, as a shed with no
+// user. Present and empty reads the same way.
+func TestIdentityFromLabelsWithoutUser(t *testing.T) {
+	id := Identity{Env: "prod", ID: "a1b2c3d4", Name: "x"}
+	labels := id.Labels(ShedStateReady)
+	delete(labels, LabelUser)
+	got, err := IdentityFromLabels(labels)
+	if err != nil {
+		t.Fatalf("a schema-1 label set without %s: IdentityFromLabels = %v", LabelUser, err)
+	}
+	if got.User != "" {
+		t.Errorf("user = %q, want none", got.User)
+	}
+	labels[LabelUser] = ""
+	if got, err := IdentityFromLabels(labels); err != nil || got.User != "" {
+		t.Errorf("an empty %s: %+v, %v; want no user", LabelUser, got, err)
+	}
+	labels[LabelUser] = "a b"
+	if _, err := IdentityFromLabels(labels); !errors.Is(err, ErrInvalid) {
+		t.Errorf("an invalid %s: IdentityFromLabels = %v, want ErrInvalid", LabelUser, err)
+	}
+	if SchemaVersion != "1" {
+		t.Errorf("SchemaVersion = %q: adding %s must not bump it", SchemaVersion, LabelUser)
+	}
+}
+
+// A shed belongs to a service client or to a user: a create spec that labels
+// both is refused before anything reaches a cloud.
+func TestNewSpecRefusesOwnerAndUser(t *testing.T) {
+	id := testIdentity() // owned by nocturn
+	id.User = "alice"
+	shed := ShedSpec{CreatedAt: time.Unix(1700000000, 0), Network: "open"}
+	const key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample shed-server"
+	if _, err := NewSpec(id, shed, []string{key}, DefaultSizes()[0], DefaultDiskGB, "img", 0); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("NewSpec with an owner and a user = %v, want ErrInvalid", err)
+	}
+	id.Owner = ""
+	spec, err := NewSpec(id, shed, []string{key}, DefaultSizes()[0], DefaultDiskGB, "img", 0)
+	if err != nil {
+		t.Fatalf("NewSpec for a user's shed: %v", err)
+	}
+	if spec.Labels[LabelUser] != "alice" {
+		t.Errorf("spec labels %v carry no %s", spec.Labels, LabelUser)
 	}
 }
 

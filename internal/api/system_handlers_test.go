@@ -44,6 +44,10 @@ func (f *fakeBackend) StartShed(ctx context.Context, name string) (*config.Shed,
 func (f *fakeBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	panic("unexpected")
 }
+func (f *fakeBackend) AssignUser(_ context.Context, _ string, _ config.AssignShedRequest) (*config.Shed, error) {
+	return nil, config.ErrShedNotFoundSentinel
+}
+
 func (f *fakeBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	panic("unexpected")
 }

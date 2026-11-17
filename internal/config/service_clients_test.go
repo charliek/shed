@@ -40,7 +40,6 @@ func TestValidateClients(t *testing.T) {
 			c.Policy.Caps = ServiceClientCaps{CPUs: 4, MemoryMB: 8192}
 			c.CertMaxTTL = Duration(time.Hour)
 		})}), ""},
-		{"token mode", &ServerConfig{Auth: &AuthConfig{Mode: AuthModeToken, Clients: map[string]ServiceClientConfig{"nocturn": validClient()}}}, "auth.clients requires auth.mode: mtls"},
 		{"open mode", &ServerConfig{Auth: &AuthConfig{Clients: map[string]ServiceClientConfig{"nocturn": validClient()}}}, "auth.clients requires auth.mode: mtls"},
 		{"bad name uppercase", mtlsWithClients(map[string]ServiceClientConfig{"Nocturn": validClient()}), "invalid auth.clients name"},
 		{"bad name colon", mtlsWithClients(map[string]ServiceClientConfig{"a:b": validClient()}), "invalid auth.clients name"},
@@ -130,14 +129,14 @@ func TestServiceClientAccessors(t *testing.T) {
 	if _, ok := cfg.ServiceClient("other"); ok {
 		t.Error("unknown client found")
 	}
-	// The same clients in token mode are not usable (validation refuses the
+	// The same clients in open mode are not usable (validation refuses the
 	// config anyway; the accessor fails closed on its own).
-	cfg.Auth.Mode = AuthModeToken
+	cfg.Auth.Mode = AuthModeOpen
 	if cfg.ServiceClientsEnabled() {
-		t.Error("token mode: service clients enabled")
+		t.Error("open mode: service clients enabled")
 	}
 	if _, ok := cfg.ServiceClient("nocturn"); ok {
-		t.Error("token mode: client found")
+		t.Error("open mode: client found")
 	}
 }
 
@@ -182,8 +181,13 @@ func TestServiceClientsFromYAML(t *testing.T) {
 		}
 	}
 
+	openAuth := strings.Replace(good, "mode: mtls", "mode: open", 1)
+	if _, err := LoadServerConfigForCLI(write(base + openAuth)); err == nil || !strings.Contains(err.Error(), "requires auth.mode: mtls") {
+		t.Errorf("open mode with clients: %v", err)
+	}
+	// The removed token mode is refused before the clients check runs.
 	tokenAuth := strings.Replace(good, "mode: mtls", "mode: token", 1)
-	if _, err := LoadServerConfigForCLI(write(base + tokenAuth)); err == nil || !strings.Contains(err.Error(), "requires auth.mode: mtls") {
+	if _, err := LoadServerConfigForCLI(write(base + tokenAuth)); err == nil || !strings.Contains(err.Error(), "use auth.mode: mtls") {
 		t.Errorf("token mode with clients: %v", err)
 	}
 }

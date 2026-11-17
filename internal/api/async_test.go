@@ -15,6 +15,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/users/userstest"
 )
 
 // asyncFakeBackend is a fake remote backend: create, start and delete save
@@ -198,7 +199,7 @@ func remoteTestServer(t *testing.T, b backend.Backend, policy config.ServiceClie
 		},
 	}
 	s := NewServer(b, cfg, "", nil, nil)
-	s.SetClientCertAuthorizer(func(fp string) bool { return fp == testAdminFP })
+	s.SetUserLookup(userstest.Implicit(testAdminFP))
 	return s.Router()
 }
 
@@ -631,7 +632,7 @@ func TestFirewallRefusalHidesDetailsFromClients(t *testing.T) {
 		ctx        context.Context
 		wantDetail bool
 	}{
-		{"admin", withCaller(context.Background(), Caller{Kind: CallerAdmin}), true},
+		{"admin", withCaller(context.Background(), implicitCaller()), true},
 		{"no caller (a unit test, an admin)", context.Background(), true},
 		{"service client", withCaller(context.Background(), Caller{Kind: CallerClient, Name: "nocturn"}), false},
 	}
@@ -654,5 +655,58 @@ func TestFirewallRefusalHidesDetailsFromClients(t *testing.T) {
 	_, _, client := backendErrorFor(withCaller(context.Background(), Caller{Kind: CallerClient}), other)
 	if admin != client {
 		t.Errorf("a limit refusal differs by caller: %q and %q", admin, client)
+	}
+}
+
+// hidingAsyncBackend is an async backend whose delete hides the record at
+// once, as the remote backend does, and leaves a tombstone for the deleted
+// incarnation; its destroy fails. A wait bound to that incarnation follows
+// the tombstone and reports the failure. A wait by name alone finds nothing.
+type hidingAsyncBackend struct {
+	asyncFakeBackend
+	tomb time.Time
+}
+
+var errDestroyFailed = errors.New("the VM could not be destroyed yet")
+
+func (b *hidingAsyncBackend) DeleteShed(ctx context.Context, name string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.sheds[name]
+	if !ok {
+		return config.ErrShedNotFoundSentinel
+	}
+	if err := backend.CheckCreatedAt(ctx, name, s.CreatedAt); err != nil {
+		return err
+	}
+	delete(b.sheds, name)
+	b.tomb = s.CreatedAt
+	return nil
+}
+
+func (b *hidingAsyncBackend) WaitSettled(ctx context.Context, name string) (*config.Shed, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s, ok := b.sheds[name]; ok {
+		return &s, nil
+	}
+	if want, ok := backend.RequiredCreatedAt(ctx); ok && want.Equal(b.tomb) {
+		return nil, errDestroyFailed
+	}
+	return nil, config.ErrShedNotFoundSentinel
+}
+
+// TestAsyncStreamedDeleteReportsAFailedDestroy: a streamed delete on a
+// backend that hides the record at once still reports a destroy that
+// failed. The wait is authorized with the delete and bound to the deleted
+// incarnation; it never reads "the record is gone" as "deleted".
+func TestAsyncStreamedDeleteReportsAFailedDestroy(t *testing.T) {
+	created := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	b := &hidingAsyncBackend{asyncFakeBackend: *newAsyncFakeBackend(config.Shed{Name: "a1", Status: config.StatusRunning, CreatedAt: created})}
+	h := remoteTestServer(t, b, remotePolicy())
+	resp := doCtx(context.Background(), h, http.MethodDelete, "/api/sheds/a1", "", "Accept", "text/event-stream")
+	names, last := sseEvents(t, resp.body)
+	if len(names) == 0 || names[len(names)-1] != "error" || !strings.Contains(last, errDestroyFailed.Error()) {
+		t.Fatalf("streamed delete with a failed destroy: events %v last %s, want an error naming it", names, last)
 	}
 }

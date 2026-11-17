@@ -158,7 +158,7 @@ func TestUserCertIsNeverServiceShaped(t *testing.T) {
 	ca := newServiceTestCA(t)
 	csr, _ := p256CSR(t)
 	for _, scope := range []string{"control", "credentials", ""} {
-		der, err := ca.SignClientCSR(csr, testFingerprint, scope, "cli", time.Hour)
+		der, err := ca.SignClientCSR(csr, testFingerprint, "", scope, "cli", time.Hour)
 		if err != nil {
 			t.Fatalf("SignClientCSR: %v", err)
 		}
@@ -175,7 +175,7 @@ func TestUserCertIsNeverServiceShaped(t *testing.T) {
 		URIs:               []*url.URL{u},
 		SignatureAlgorithm: x509.ECDSAWithSHA256,
 	}, key)
-	der, err := ca.SignClientCSR(hostile, testFingerprint, "control", "cli", time.Hour)
+	der, err := ca.SignClientCSR(hostile, testFingerprint, "", "control", "cli", time.Hour)
 	if err != nil {
 		t.Fatalf("SignClientCSR(hostile): %v", err)
 	}
@@ -188,7 +188,7 @@ func TestClientConnectionVerifier(t *testing.T) {
 	ca := newServiceTestCA(t)
 	svc := signService(t, ca, "nocturn", time.Hour)
 	csr, _ := p256CSR(t)
-	userDER, err := ca.SignClientCSR(csr, testFingerprint, "control", "cli", time.Hour)
+	userDER, err := ca.SignClientCSR(csr, testFingerprint, "", "control", "cli", time.Hour)
 	if err != nil {
 		t.Fatalf("SignClientCSR: %v", err)
 	}
@@ -199,31 +199,31 @@ func TestClientConnectionVerifier(t *testing.T) {
 	known := func(name string) bool { return name == "nocturn" }
 
 	t.Run("known client accepted without consulting the allowlist", func(t *testing.T) {
-		v := ClientConnectionVerifier(func(string) bool {
+		v := ClientConnectionVerifier(byCN(func(string) bool {
 			t.Fatal("the SSH allowlist was consulted for a service certificate")
 			return true
-		}, known)
+		}), known)
 		if err := v(state(svc)); err != nil {
 			t.Fatalf("known client refused: %v", err)
 		}
 	})
 	t.Run("unknown client refused without consulting the allowlist", func(t *testing.T) {
-		v := ClientConnectionVerifier(func(string) bool {
+		v := ClientConnectionVerifier(byCN(func(string) bool {
 			t.Fatal("the SSH allowlist was consulted for a service certificate")
 			return true
-		}, func(string) bool { return false })
+		}), func(string) bool { return false })
 		if err := v(state(svc)); !errors.Is(err, ErrUnknownServiceClient) {
 			t.Fatalf("unknown client = %v, want ErrUnknownServiceClient", err)
 		}
 	})
 	t.Run("nil clientKnown refuses every service cert", func(t *testing.T) {
-		v := ClientConnectionVerifier(func(string) bool { return true }, nil)
+		v := ClientConnectionVerifier(byCN(func(string) bool { return true }), nil)
 		if err := v(state(svc)); !errors.Is(err, ErrUnknownServiceClient) {
 			t.Fatalf("service cert with no clients = %v, want ErrUnknownServiceClient", err)
 		}
 	})
 	t.Run("malformed service cert refused", func(t *testing.T) {
-		v := ClientConnectionVerifier(func(string) bool { return true }, func(string) bool { return true })
+		v := ClientConnectionVerifier(byCN(func(string) bool { return true }), func(string) bool { return true })
 		bad := serviceLeaf("nocturn", []string{"control"}, []string{"shed-client://nocturn"})
 		if err := v(state(bad)); !errors.Is(err, ErrMalformedServiceCert) {
 			t.Fatalf("malformed = %v, want ErrMalformedServiceCert", err)
@@ -234,17 +234,17 @@ func TestClientConnectionVerifier(t *testing.T) {
 			t.Fatal("clientKnown was consulted for a user certificate")
 			return true
 		}
-		allow := ClientConnectionVerifier(func(fp string) bool { return fp == testFingerprint }, noClients)
+		allow := ClientConnectionVerifier(byCN(func(fp string) bool { return fp == testFingerprint }), noClients)
 		if err := allow(state(user)); err != nil {
 			t.Fatalf("allowlisted user refused: %v", err)
 		}
-		deny := ClientConnectionVerifier(func(string) bool { return false }, noClients)
+		deny := ClientConnectionVerifier(byCN(func(string) bool { return false }), noClients)
 		if err := deny(state(user)); !errors.Is(err, ErrClientCertNotAuthorized) {
 			t.Fatalf("de-allowlisted user = %v, want ErrClientCertNotAuthorized", err)
 		}
 	})
 	t.Run("no peer certificate", func(t *testing.T) {
-		v := ClientConnectionVerifier(func(string) bool { return true }, known)
+		v := ClientConnectionVerifier(byCN(func(string) bool { return true }), known)
 		if err := v(tls.ConnectionState{}); !errors.Is(err, ErrClientCertMissing) {
 			t.Fatalf("no cert = %v, want ErrClientCertMissing", err)
 		}

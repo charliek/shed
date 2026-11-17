@@ -14,29 +14,58 @@
 # Launch directly on the remote (run as root for CAP_NET_ADMIN):
 #   sudo /tmp/shed-server-dev serve --config /tmp/shed-server-dev.yaml
 #
-# Add this entry to ~/.shed/config.yaml on the dev workstation:
-#   servers:
-#     mini3-dev:                # or whatever your remote is called
-#       host: mini3
-#       http_port: 18080
-#       ssh_port: 12222
+# Register it with the CLI on the dev workstation once, after the first
+# `make dev-server-up-fc` (first contact is over SSH, which enrols a client
+# certificate; substitute your remote's name):
+#   shed server add mini3 --ssh-port 12222 --name mini3-dev
 #
 # See docs/development/testing.md for the full workflow.
 
 name: mini3-dev
 
-# Offset from deb's 8080/2222 so both can run simultaneously.
+# Offset from deb's 8080/2222 so both can run simultaneously. http_port is
+# not served in mtls mode; the mtls listener is https_port.
 http_port: 18080
 ssh_port: 12222
+https_port: 18443
 
 # This FC dev server runs on the remote (mini3) and is driven from the dev
 # workstation, so it must face the network. As of v0.7.4 every posture defaults
-# to loopback, so bind explicitly; open mode also requires the exposure ack.
+# to loopback, so bind explicitly. mtls is what makes that safe: every API
+# request presents a client certificate enrolled over SSH.
 bind_address: 0.0.0.0
-allow_insecure_exposure: true
 
 default_backend: firecracker
 log_level: debug
+
+# mtls, the one enforced mode the dev servers and the integration suite run.
+auth:
+  mode: mtls
+  ssh:
+    github_users: [charliek]
+  # A service client for tests/integration/test_service_client.py. Its bundle
+  # is issued on the dev host with `shed-server client issue itest`.
+  clients:
+    itest:
+      cert_max_ttl: 24h
+      policy:
+        name_prefix: "itest-svc-"
+        max_sheds: 3
+        max_age: 2h
+        images: [itest]
+    # The client a development Nocturn (the shed-craze Agent Provider) uses
+    # against this dev server. Isolated network, no server mounts. It may use
+    # the `itest` alias because the v0.5.9 default image predates the exec
+    # fixes (process-group cleanup, a separate stderr stream). Issue its bundle
+    # on the dev host with `shed-server client issue nocturn`.
+    nocturn:
+      policy:
+        name_prefix: "nocturn-"
+        max_sheds: 4
+        max_age: 30h
+        network: isolated
+        server_mounts: []
+        images: [itest]
 
 # The dev server's OWN identity directory (SSH host key, TLS cert + key, the
 # mtls client CA, the GitHub key cache). It runs as root, so without this it

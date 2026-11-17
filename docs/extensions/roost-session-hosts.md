@@ -11,7 +11,7 @@ a real shed's `codex` row carries roost-sourced `activity` with `source: "roost"
 
 This page describes the mechanism the clients drive: where the bytes come from, what consent
 promises, what the rollback guarantee actually covers, and the edges (`shed reset`, two
-clients, mini3-style read-only hosts). The button, the dialog, and the toast are the desktop
+clients, buildbox-style read-only hosts). The button, the dialog, and the toast are the desktop
 UI's concern (Tauri `roost.probe`/`roost.preview`/`roost.bootstrap`/`roost.launch` — see
 [Desktop IPC](../desktop/ipc.md)); this page is about what happens once you click it.
 
@@ -232,9 +232,9 @@ protocol-6 build than the one this client just streamed). This is treated as the
 case, not a hazard to guard against further — a person with both apps open, bootstrapping the
 same shed from their phone and their laptop, is exactly the scenario this is built for.
 
-## A read-only example: mini3
+## A read-only example: buildbox
 
-A target that is already running a `roost-session` speaking a protocol other than 6 (mini3, at
+A target that is already running a `roost-session` speaking a protocol other than 6 (buildbox, at
 the time of writing, runs a release build of protocol 2) gets the **Report** row from the plan
 matrix above and nothing else — probing it is read-only, and its daemon's start time is
 unaffected before and after a probe. This is pin P6: an existing session is reported, never

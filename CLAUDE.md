@@ -70,8 +70,8 @@ The suite is **parameterized over `["vz", "fc"]`** and skips cleanly when a back
 
 ```bash
 # One-time setup per developer (Mac):
-#   1. Add a ~/.shed/config.yaml entry for the dev server (snippet below).
-#   2. make dev-server-up           # launches dev shed-server on ports 18080/12222
+#   1. make dev-server-up           # launches dev shed-server, mtls on 18443, SSH 12222
+#   2. shed server add localhost --ssh-port 12222 --name my-server-dev
 #
 # Per development cycle:
 make dev-server-up                  # refuses if already running (use dev-server-restart)
@@ -82,34 +82,26 @@ make test-integration-dev           # re-run
 make dev-server-down                # when done
 ```
 
-The dev server's lifecycle is intentionally `nohup` + PID file under `~/.shed/dev/` — no launchd plist, no auto-restart on crash (crashes should be visible), no survives-reboot. State-dirs are isolated under `~/Library/Application Support/shed-dev/vz/` so `shed image prune` from the brew server never touches dev blobs. The dev server's `SHED_BUILD_TOOLS_REF` is set inline to the latest release tag so the dev binary uses release-shaped upper-template behavior (sub-100 ms rootfs phase).
+The dev server's lifecycle is intentionally `nohup` + PID file under `~/.shed/dev/` — no launchd plist, no auto-restart on crash (crashes should be visible), no survives-reboot. State-dirs are isolated under `~/Library/Application Support/shed-dev/vz/` so `shed image prune` from the brew server never touches dev blobs. The dev server keeps its identity (host key, TLS certificate, client CA, upgrade marker, GitHub pins) under its own `state_dir: ~/.shed/dev/state`, not the installed server's `~/.shed`; the first start with it needs the `my-server-dev` entry re-added (`docs/development/testing.md`). The dev server's `SHED_BUILD_TOOLS_REF` is set inline to the latest release tag so the dev binary uses release-shaped upper-template behavior (sub-100 ms rootfs phase).
 
-**`~/.shed/config.yaml` entry** (copy-paste alongside the existing `my-server` entry):
-
-```yaml
-servers:
-  my-server-dev:
-    host: localhost
-    http_port: 18080
-    ssh_port: 12222
-```
-
-Or run `shed server add localhost --port 18080 --ssh-port 12222 --name my-server-dev` after the first `make dev-server-up` — first contact is SSH-first, so the dev server's SSH port (12222) must be named explicitly.
+**Both dev servers run `auth.mode: mtls`** (the committed `configs/server.dev-parallel.*.yaml`), and so does the suite by default. Register each with `shed server add` after its first start — first contact is SSH-first and enrols an mtls client certificate, so the dev server's SSH port (12222) must be named and a hand-written `config.yaml` entry cannot work. shed-server has no token mode any more (`token`, `secure` and `allow_insecure_exposure` fail config load; open mode binds loopback only), and `SHED_DEV_AUTH_MODE` is gone. Tests that need another config reconfigure the Mac dev server through `tests/integration/fixtures/devcontrol.py: dev_config()` (an open server on loopback included); see `docs/development/testing.md` § "Auth mode: mtls".
 
 **FC remote parallel-dev** (same shape, over SSH to `$SHED_FC_HOST`):
 
 ```bash
-# One-time setup: register the FC dev entry (after first dev-server-up-fc):
-shed server add mini3 --port 18080 --ssh-port 12222 --name mini3-dev
+# One-time setup: register the FC dev entry (after first dev-server-up-fc).
+# An entry from when this server ran open is plain HTTP and does not heal:
+# `shed server remove mini3-dev` first.
+shed server add mini3 --ssh-port 12222 --name mini3-dev
 
 # Per dev cycle:
-make dev-server-up-fc                    # launches dev shed-server on mini3:18080
+make dev-server-up-fc                    # launches dev shed-server on mini3 (mtls, HTTPS 18443)
 make test-integration-dev-fc             # runs suite against FC dev (auto-ups if needed)
 make build && make dev-server-restart-fc # pick up the rebuild
 make dev-server-down-fc                  # when done
 ```
 
-The FC dev server runs via `sudo nohup` on the remote (no systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server). Listens on `mini3:18080/12222` alongside the deb shed-server's `mini3:8080/2222`. Separate state-dirs under `/var/lib/shed-dev/firecracker/`. Offset `vsock_base_cid: 600` (deb default is 100) to avoid CID collision. SHARED bridge/CIDR/tap_prefix — kernel-level TAP coordination handles the cross-server case.
+The FC dev server runs via `sudo nohup` on the remote (no systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server). Listens on `mini3:18443` (HTTPS, mtls) and `mini3:12222` (SSH) alongside the deb shed-server's `mini3:8080/2222`. Separate state-dirs under `/var/lib/shed-dev/firecracker/`. Offset `vsock_base_cid: 600` (deb default is 100) to avoid CID collision. SHARED bridge/CIDR/tap_prefix — kernel-level TAP coordination handles the cross-server case.
 
 **Open a server-side PR with `make test-integration-dev: N/N pass against dev-build at commit <sha>`**, and that statement is true and meaningful — not a brew-binary alibi.
 
@@ -143,6 +135,9 @@ This catches the v0.5.4-class regression where the binary built correctly but a 
 | `SHED_FC_SERVER` | same as `$SHED_FC_HOST` | `~/.shed/config.yaml` entry name for the deb FC server. |
 | `SHED_FC_DEV_SERVER` | `$(SHED_FC_HOST)-dev` | `~/.shed/config.yaml` entry name for the parallel dev FC server. |
 | `SHED_FC_LOG_PATH` | _unset_ (uses journald) | Remote file path for `fc_server` fixture to read logs from (set by `test-integration-dev-fc` to the dev server's log file because the dev FC server runs via `sudo nohup` and isn't under systemd). |
+| `SHED_DEV_USERS` | _unset_ | Makefile only. `itest` starts the dev servers (`dev-server-up`, `-up-fc`, `-up-remote` and their restarts) with the integration suite's itest user list (`auth.users`: an admin `dev` holding the config's own key sources, plus `itest-alice`, `itest-bob`, `itest-admin`), and has `test-integration-dev-fc` / `-remote` tell the suite so. Empty: no user list. Any other value stops the target. |
+| `SHED_ITEST_USERS` | _unset_ | Suite only. A comma list of the backends (`fc`, `remote`) whose dev server was started with the itest user list; without it the users and pin cases skip on those backends, saying what to set. `[vz]` restarts the Mac dev server with the list itself. |
+| `SHED_ITEST_USERS_DIR` | `~/.shed/dev/itest-users` | The itest users' keys (made once by `make dev-itest-users`, or on first use) and each test identity's throwaway `$HOME`. The dev server's user list must be rendered from the same directory. |
 | `SHED_REMOTE_SERVER` | _unset_ | `~/.shed/config.yaml` entry for a `default_backend: remote` server. Unset skips every `[remote]` case (each would create a billed cloud VM); `make test-integration-remote` sets it to `remote-dev`. |
 | `RELEASE_BUILD_TOOLS_REF` | latest `git tag` matching `v*` | shed-build-tools image ref injected into the dev binary so it uses release-shaped upper-template behavior. Pin to an older release if your source has drifted: `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7`. |
 | `SHED_IMAGE_HAS_ROOST` | _unset_ | Gates `test_roost_session_baked`: a comma list of the backends (`vz`, `fc`) whose `extensions` image was rebuilt with the roost-session bake. `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the suite is parameterized over both backends and the other one still boots the published image); unset (skips) for plain `test-integration` since images built before 0.9.0 carry no roost-session. |
@@ -166,6 +161,8 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - `internal/vmutil/` — Shared VM agent communication (no build tags)
 - `internal/agentproto/` — Binary protocol for vsock communication
 - `internal/sshd/` — SSH server implementation
+- `internal/source/` — Credential source bindings: which machine answers each user's credential-bus requests (`source-bindings.json`); `fake/` is the test double
+- `internal/users/` — User seam (`users.Lookup`: which user owns a key, list users); `ConfigLookup` holds the SSH key allowlist with each key's source; `userstest/` has the test doubles
 - `internal/backend/` — Backend interface all backends implement
 - `internal/remote/` — Remote (cloud VM) backend: async jobs, record cache, start-up reconcile, limits; `provider/` (cloud seam, `gce/` REST client, `fake/`), `transport/` (SSH link to the VM, `sshlink/`, `locallink/`), `guest/` (guest layout contract)
 - `gce/` — Remote VM image provisioning (provision, identity and agent units, verify, seal, bake), run by `scripts/build-gce-image.sh` (`make gce-image`)

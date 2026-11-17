@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -112,6 +113,8 @@ func Run(t *testing.T, h Harness) {
 		{"create refuses a bad spec", testCreateInvalid},
 		{"stop and start", testStopStart},
 		{"labels", testLabels},
+		{"user label", testUserLabel},
+		{"claim label", testClaimLabel},
 		{"metadata", testMetadata},
 		{"destroy", testDestroy},
 		{"missing instance", testMissing},
@@ -385,6 +388,45 @@ func testLabels(t *testing.T, h Harness) {
 	}
 	if err := p.SetLabels(ctx, ref, map[string]string{"shed_state": "Not Valid"}); !errors.Is(err, provider.ErrInvalid) {
 		t.Errorf("SetLabels(bad value) = %v, want ErrInvalid", err)
+	}
+}
+
+// testUserLabel: shed_user is carried from the spec to the instance, read
+// back into the Identity, and can be changed and emptied later (an admin's
+// assignment of a shed made before users existed writes it).
+func testUserLabel(t *testing.T, h Harness) {
+	p, _ := h.New(t)
+	ctx := h.ctx(t)
+	spec := h.Spec(t, h.Env, "eta")
+	spec.Labels[provider.LabelOwner] = ""
+	spec.Labels[provider.LabelUser] = "alice"
+	pend, err := p.Create(ctx, spec)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	inst, err := p.Wait(ctx, pend)
+	if err != nil {
+		t.Fatalf("Wait(create): %v", err)
+	}
+	id, err := inst.Identity()
+	if err != nil {
+		t.Fatalf("Identity: %v", err)
+	}
+	if id.User != "alice" || id.Owner != "" {
+		t.Errorf("identity after create = %+v, want user alice and no owner", id)
+	}
+	if err := p.SetLabels(ctx, inst.Ref, map[string]string{provider.LabelUser: "bob"}); err != nil {
+		t.Fatalf("SetLabels(user): %v", err)
+	}
+	if got, _ := p.Get(ctx, inst.Ref); got.Labels[provider.LabelUser] != "bob" {
+		t.Errorf("user = %q after SetLabels, want bob", got.Labels[provider.LabelUser])
+	}
+	if err := p.SetLabels(ctx, inst.Ref, map[string]string{provider.LabelUser: ""}); err != nil {
+		t.Fatalf("SetLabels(empty user): %v", err)
+	}
+	got, _ := p.Get(ctx, inst.Ref)
+	if id, err := got.Identity(); err != nil || id.User != "" {
+		t.Errorf("identity after emptying the user = %+v, %v; want no user", id, err)
 	}
 }
 
@@ -798,4 +840,71 @@ func refs(insts []provider.Instance) []provider.Ref {
 		out = append(out, i.Ref)
 	}
 	return out
+}
+
+// testClaimLabel: ClaimLabel writes a label that is empty, accepts one that
+// already has the value without a change, and refuses one that holds another
+// value with ErrLabelTaken, writing nothing. The labels that identify an
+// instance cannot be claimed.
+func testClaimLabel(t *testing.T, h Harness) {
+	p, _ := h.New(t)
+	ctx := h.ctx(t)
+	_, inst := mustCreate(t, h, p, "theta")
+	ref := inst.Ref
+	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "bob"); err != nil {
+		t.Fatalf("ClaimLabel(empty): %v", err)
+	}
+	if got, _ := p.Get(ctx, ref); got.Labels[provider.LabelUser] != "bob" || got.Labels[provider.LabelName] != "theta" {
+		t.Errorf("after ClaimLabel: %v", got.Labels)
+	}
+	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "bob"); err != nil {
+		t.Errorf("ClaimLabel(same): %v", err)
+	}
+	if err := p.ClaimLabel(ctx, ref, provider.LabelUser, "alice"); !errors.Is(err, provider.ErrLabelTaken) {
+		t.Errorf("ClaimLabel(other) = %v, want ErrLabelTaken", err)
+	}
+	if got, _ := p.Get(ctx, ref); got.Labels[provider.LabelUser] != "bob" {
+		t.Errorf("user = %q after a refused claim, want bob", got.Labels[provider.LabelUser])
+	}
+	for _, k := range []string{provider.LabelSchema, provider.LabelEnv, provider.LabelID} {
+		if err := p.ClaimLabel(ctx, ref, k, "changed1"); !errors.Is(err, provider.ErrInvalid) {
+			t.Errorf("ClaimLabel(%s) = %v, want ErrInvalid", k, err)
+		}
+	}
+
+	// An empty key is not a label: refused, nothing written.
+	before, err := p.Get(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ClaimLabel(ctx, ref, "", "bob"); !errors.Is(err, provider.ErrInvalid) {
+		t.Errorf("ClaimLabel(empty key) = %v, want ErrInvalid", err)
+	}
+	if got, _ := p.Get(ctx, ref); !maps.Equal(got.Labels, before.Labels) {
+		t.Errorf("labels after a refused empty-key claim: %v, was %v", got.Labels, before.Labels)
+	}
+
+	// An instance takes at most 64 labels: filled to 64, a claim that would
+	// add a 65th is refused and writes nothing.
+	_, full := mustCreate(t, h, p, "iota")
+	fill := map[string]string{}
+	for i := len(full.Labels); i < 64; i++ {
+		fill[fmt.Sprintf("fill-%02d", i)] = "x"
+	}
+	if err := p.SetLabels(ctx, full.Ref, fill); err != nil {
+		t.Fatalf("SetLabels(to 64): %v", err)
+	}
+	if got, _ := p.Get(ctx, full.Ref); len(got.Labels) != 64 {
+		t.Fatalf("test set-up: %d labels, want 64", len(got.Labels))
+	}
+	const extra = "claimed-extra"
+	if _, ok := full.Labels[extra]; ok {
+		t.Fatalf("test set-up: the instance already has label %s", extra)
+	}
+	if err := p.ClaimLabel(ctx, full.Ref, extra, "bob"); !errors.Is(err, provider.ErrInvalid) {
+		t.Errorf("ClaimLabel(a 65th label) = %v, want ErrInvalid", err)
+	}
+	if got, _ := p.Get(ctx, full.Ref); len(got.Labels) != 64 || got.Labels[extra] != "" {
+		t.Errorf("after a refused 65th-label claim: %d labels, %s=%q", len(got.Labels), extra, got.Labels[extra])
+	}
 }

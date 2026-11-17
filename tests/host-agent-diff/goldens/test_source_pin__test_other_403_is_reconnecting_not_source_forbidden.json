@@ -1,0 +1,19 @@
+[
+  {
+    "name": "",
+    "namespaces": [
+      {
+        "namespace": "docker-credentials",
+        "since": "<ts>",
+        "state": "connected"
+      },
+      {
+        "last_error": "unexpected status 403: {\"error\":{\"code\":\"FORBIDDEN\",\"message\":\"a script key cannot subscribe\"}}",
+        "namespace": "ssh-agent",
+        "since": "<ts>",
+        "state": "reconnecting"
+      }
+    ],
+    "url": "<bus>"
+  }
+]

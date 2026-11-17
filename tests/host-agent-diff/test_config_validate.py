@@ -49,6 +49,11 @@ BAD_CONFIGS = [
     ("map-valued-discovery-servers", "discovery:\n  servers:\n    web: {}\n"),
     ("malformed-top-level-garbage", "{{invalid yaml"),
     ("malformed-unterminated-flow", "ssh:\n  approval:\n    policy: [unterminated\n"),
+    # The signing check's machine-wide settings (plan 035 §3.5).
+    ("allow-users-not-a-list", "ssh:\n  allow_users: git\n"),
+    ("allow-users-reserved-name", "ssh:\n  allow_users: [_bootstrap]\n  offer_keys: []\n"),
+    ("allow-users-widened-without-offer-keys", "ssh:\n  allow_users: [git, deploy]\n"),
+    ("offer-keys-bad-entry", "ssh:\n  offer_keys: [id_ed25519]\n"),
 ]
 
 

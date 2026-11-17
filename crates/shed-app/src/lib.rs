@@ -54,13 +54,14 @@ pub mod traits;
 pub use audit_store::AuditStore;
 pub use auth_modes::{AuthModeRegistry, AuthModeState};
 pub use backend::{
-    Backend, HostDiskUsage, HostEgressProfiles, HostFailure, HostFailureKind, RcTarget,
-    Reachability,
+    Backend, HostDiskUsage, HostEgressProfiles, HostFailure, HostFailureKind, HostSource, RcTarget,
+    Reachability, SourceMachineRow,
 };
 #[cfg(feature = "broker")]
 pub use broker_bridge::{
-    detect_mode, load_or_synthesize, probe_sockets, probe_sockets_at, resolve_mode, BrokerConfig,
-    BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, ResolvedMode,
+    detect_mode, load_or_synthesize, machine_identity, probe_sockets, probe_sockets_at,
+    resolve_mode, BrokerConfig, BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent,
+    ModePref, ModeProbe, ResolvedMode,
 };
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};
 pub use craze_rows::{fold_plan, FoldPlan, RoostTabRef};
@@ -82,6 +83,11 @@ pub use roost::{
 /// client implements it without depending on `shed-broker` itself.
 #[cfg(feature = "broker")]
 pub use shed_broker::bus::BusLog;
+/// This machine's identity, as [`machine_identity`] and
+/// [`EmbeddedHostAgent::machine_identity`] hand it out — named here so an embedder
+/// needs no `shed-broker` dependency of its own.
+#[cfg(feature = "broker")]
+pub use shed_broker::machine::MachineIdentity;
 pub use slash_menu::{
     SlashAccept, SlashAcceptKey, SlashAction, SlashDispatch, SlashFilter, SlashFilterRow,
     SlashHidden, SlashMenu, SlashMenuRow,

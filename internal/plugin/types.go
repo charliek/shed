@@ -38,6 +38,9 @@ func NewResponse(inReplyTo, namespace string, payload json.RawMessage) *Envelope
 
 // ListenerInfo is the public representation of an active listener.
 type ListenerInfo struct {
-	Namespace string    `json:"namespace"`
+	Namespace string `json:"namespace"`
+	// User is the user the listener receives requests for; empty (and
+	// omitted) for the implicit user of a server with no user list.
+	User      string    `json:"user,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }

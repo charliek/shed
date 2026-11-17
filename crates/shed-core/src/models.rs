@@ -663,6 +663,172 @@ impl<'de> Deserialize<'de> for Overview {
     }
 }
 
+// ---- credential sources (plan 035 §3.4) ----
+//
+// `GET /api/sources` and `POST /api/sources/use` answer the same document: which
+// machine answers credential requests for the caller's user on this server (the
+// binding) and every machine the server has seen for that user. Decoded tolerantly in
+// every field, so a later server can add fields or widen a type without breaking an
+// older client: an unknown field is ignored, a missing, `null` or wrongly typed field
+// takes its default, and a machine entry that is not an object is dropped. Every
+// string here is carried VERBATIM; it came from other machines by way of the server,
+// so whoever shows one cleans it first ([`display_source_text`]).
+
+/// Decode `T` from whatever value is there; anything that does not fit (a `null`, the
+/// wrong type) becomes `T::default()` rather than failing the whole document.
+fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    Ok(serde_json::from_value(Value::deserialize(d)?).unwrap_or_default())
+}
+
+/// A list of `T` decoded entry by entry: an entry that does not decode is dropped, and
+/// anything but an array is an empty list.
+fn lenient_list<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(match Value::deserialize(d)? {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// A binding's slot list decoded POSITION FOR POSITION: an entry that does not decode
+/// (a `null`, a number, an object of the wrong shape) is kept as an empty
+/// [`SourceRef`], which names nothing, rather than dropped, so a later entry can never
+/// slide into an earlier slot and be taken for it. Anything but an array is an empty
+/// list.
+fn lenient_slots<'de, D>(d: D) -> Result<Vec<SourceRef>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Value::deserialize(d)? {
+        Value::Array(items) => items
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap_or_default())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// The `kind` of a [`SourceRef`] this client understands: one machine.
+pub const SOURCE_REF_MACHINE: &str = "machine";
+
+/// One slot of a binding: what answers. In this cut always `{"kind":"machine","id":…}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct SourceRef {
+    #[serde(default, deserialize_with = "lenient")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub id: String,
+}
+
+/// Which machine answers for the user: the delivery slot (who receives requests) and the
+/// signing slot (who signs). This cut always holds one machine, the same one, in both.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct SourceBinding {
+    /// Slot for slot as the server sent it ([`lenient_slots`]).
+    #[serde(default, deserialize_with = "lenient_slots")]
+    pub delivery: Vec<SourceRef>,
+    /// Slot for slot as the server sent it ([`lenient_slots`]).
+    #[serde(default, deserialize_with = "lenient_slots")]
+    pub signing: Vec<SourceRef>,
+    /// RFC 3339, verbatim.
+    #[serde(default, deserialize_with = "lenient")]
+    pub bound_at: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub bound_by: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub generation: u64,
+}
+
+/// One machine the server has seen for this user (its broker has tried to subscribe at
+/// least once).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct SourceMachine {
+    #[serde(default, deserialize_with = "lenient")]
+    pub id: String,
+    /// The machine's own display name. Untrusted text: see [`display_source_text`].
+    #[serde(default, deserialize_with = "lenient")]
+    pub name: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub key_fingerprint: String,
+    /// RFC 3339, verbatim.
+    #[serde(default, deserialize_with = "lenient")]
+    pub first_seen: String,
+    /// Whether it holds a live subscription right now.
+    #[serde(default, deserialize_with = "lenient")]
+    pub connected: bool,
+    #[serde(default, deserialize_with = "lenient")]
+    pub namespaces: Vec<String>,
+}
+
+/// The body of `GET /api/sources` and of a successful `POST /api/sources/use`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct SourceDocument {
+    #[serde(default, deserialize_with = "lenient")]
+    pub user: String,
+    /// `None` until a machine has been bound for the user.
+    #[serde(default, deserialize_with = "lenient")]
+    pub binding: Option<SourceBinding>,
+    #[serde(default, deserialize_with = "lenient_list")]
+    pub machines: Vec<SourceMachine>,
+}
+
+impl SourceDocument {
+    /// The id of the machine that answers: the FIRST signing slot, when that slot is a
+    /// well-formed machine reference; when it is not (another kind, no id, an entry that
+    /// did not decode), there is no source, whatever later slots say. There is no other
+    /// notion of "the source" (no per-machine flag).
+    pub fn source_machine_id(&self) -> Option<&str> {
+        self.binding
+            .as_ref()?
+            .signing
+            .first()
+            .filter(|r| r.kind == SOURCE_REF_MACHINE && !r.id.is_empty())
+            .map(|r| r.id.as_str())
+    }
+
+    /// The machine entry with this id, if the server listed one.
+    pub fn machine(&self, id: &str) -> Option<&SourceMachine> {
+        self.machines.iter().find(|m| m.id == id)
+    }
+}
+
+/// The most of one machine name or id that is shown. Names are at most 63 bytes and ids
+/// 32, so this only ever cuts something that was not a valid one.
+pub const SOURCE_TEXT_MAX_BYTES: usize = 64;
+
+/// Text that came from another machine by way of the server (a machine's name, its id, a
+/// refusal's message), made safe to show: control characters and Unicode format
+/// characters (bidirectional overrides, zero-widths, …) removed, so it can neither forge
+/// a line nor reorder or hide what is around it, then cut to `max_bytes` on a character
+/// boundary. The broker cleans the same text the same way before it reaches its status
+/// (`shed-broker`'s `bus::display_field`).
+pub fn display_source_text(raw: &str, max_bytes: usize) -> String {
+    let mut out = String::new();
+    for c in strip_format_chars(raw).chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Whether `id` has the machine id form the server accepts: 32 lowercase hex
+/// characters, no hyphens.
+pub fn valid_machine_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,5 +1374,149 @@ mod tests {
         assert_eq!(o, Overview::default());
         let o: Overview = serde_json::from_str("[]").unwrap();
         assert_eq!(o, Overview::default());
+    }
+
+    // ---- credential sources (plan 035 §3.4) ----
+
+    const SOURCE_A: &str = "0123456789abcdef0123456789abcdef";
+    const SOURCE_B: &str = "fedcba9876543210fedcba9876543210";
+
+    /// The full document the server answers decodes field for field, and the source is
+    /// the machine named in the first signing slot.
+    #[test]
+    fn source_document_decodes_the_full_shape() {
+        let doc: SourceDocument = serde_json::from_str(&format!(
+            r#"{{"user":"ada",
+                "binding":{{"delivery":[{{"kind":"machine","id":"{SOURCE_B}"}}],
+                            "signing":[{{"kind":"machine","id":"{SOURCE_B}"}}],
+                            "bound_at":"2026-11-16T10:00:00Z","bound_by":"ada","generation":3}},
+                "machines":[
+                  {{"id":"{SOURCE_A}","name":"laptop","key_fingerprint":"SHA256:aa",
+                    "first_seen":"2026-11-15T09:00:00Z","connected":false,"namespaces":[]}},
+                  {{"id":"{SOURCE_B}","name":"desk","key_fingerprint":"SHA256:bb",
+                    "first_seen":"2026-11-14T09:00:00Z","connected":true,
+                    "namespaces":["ssh-agent","docker-credentials"]}}]}}"#
+        ))
+        .unwrap();
+        assert_eq!(doc.user, "ada");
+        let b = doc.binding.as_ref().unwrap();
+        assert_eq!(b.generation, 3);
+        assert_eq!(b.bound_by, "ada");
+        assert_eq!(b.bound_at, "2026-11-16T10:00:00Z");
+        assert_eq!(b.delivery[0].id, SOURCE_B);
+        assert_eq!(doc.source_machine_id(), Some(SOURCE_B));
+        let desk = doc.machine(SOURCE_B).unwrap();
+        assert_eq!(desk.name, "desk");
+        assert!(desk.connected);
+        assert_eq!(desk.namespaces, ["ssh-agent", "docker-credentials"]);
+        assert_eq!(doc.machine(SOURCE_A).unwrap().key_fingerprint, "SHA256:aa");
+    }
+
+    /// A user with no binding yet: `binding: null`, and no source.
+    #[test]
+    fn source_document_with_no_binding_has_no_source() {
+        let doc: SourceDocument =
+            serde_json::from_str(r#"{"user":"","binding":null,"machines":[]}"#).unwrap();
+        assert_eq!(doc.binding, None);
+        assert_eq!(doc.source_machine_id(), None);
+        // Missing entirely is the same.
+        let doc: SourceDocument = serde_json::from_str("{}").unwrap();
+        assert_eq!(doc, SourceDocument::default());
+    }
+
+    /// A later server may add fields, drop optional ones or send a type this client did
+    /// not expect: none of that fails the document, and one bad machine entry costs only
+    /// that entry.
+    #[test]
+    fn source_document_decodes_tolerantly() {
+        let doc: SourceDocument = serde_json::from_str(&format!(
+            r#"{{"user":7,"future":{{"x":1}},
+                "binding":{{"signing":[{{"kind":"machine","id":"{SOURCE_B}","weight":2}}],
+                            "generation":"three","delivery":null,"later":true}},
+                "machines":[42,
+                  {{"id":"{SOURCE_B}","name":"desk","connected":"yes","namespaces":null,
+                    "last_seen":"2026-11-16T10:00:00Z"}}]}}"#
+        ))
+        .unwrap();
+        assert_eq!(doc.user, "");
+        let b = doc.binding.as_ref().unwrap();
+        assert_eq!(b.generation, 0);
+        assert!(b.delivery.is_empty());
+        assert_eq!(doc.source_machine_id(), Some(SOURCE_B));
+        assert_eq!(doc.machines.len(), 1, "the non-object entry is dropped");
+        let m = &doc.machines[0];
+        assert_eq!(m.name, "desk");
+        assert!(!m.connected, "a wrongly typed flag is false, not an error");
+        assert!(m.namespaces.is_empty());
+        // A wrongly typed binding is no binding; a wrongly typed list is empty.
+        let doc: SourceDocument =
+            serde_json::from_str(r#"{"binding":"bound","machines":{"a":1}}"#).unwrap();
+        assert_eq!(doc.binding, None);
+        assert!(doc.machines.is_empty());
+    }
+
+    /// Only a slot that names a machine is the source: another kind (a later cut's) or
+    /// an empty id is none.
+    #[test]
+    fn source_machine_id_needs_a_machine_ref() {
+        let doc: SourceDocument =
+            serde_json::from_str(r#"{"binding":{"signing":[{"kind":"service","id":"x"}]}}"#)
+                .unwrap();
+        assert_eq!(doc.source_machine_id(), None);
+        let doc: SourceDocument =
+            serde_json::from_str(r#"{"binding":{"signing":[{"kind":"machine","id":""}]}}"#)
+                .unwrap();
+        assert_eq!(doc.source_machine_id(), None);
+    }
+
+    /// A malformed slot keeps its position: with `[null, {machine B}]` the first slot
+    /// names nothing, so there is no source — B was never `signing[0]`. The same for
+    /// any entry that does not decode, and for delivery.
+    #[test]
+    fn a_malformed_first_slot_is_no_source_not_the_next_one() {
+        for bad in [
+            "null",
+            "42",
+            r#""machine""#,
+            "[]",
+            r#"{"kind":["machine"]}"#,
+        ] {
+            let doc: SourceDocument = serde_json::from_str(&format!(
+                r#"{{"binding":{{"signing":[{bad},{{"kind":"machine","id":"{SOURCE_B}"}}],
+                                "delivery":[{bad},{{"kind":"machine","id":"{SOURCE_B}"}}]}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(doc.source_machine_id(), None, "{bad}");
+            let b = doc.binding.as_ref().unwrap();
+            assert_eq!(b.signing.len(), 2, "{bad}: slots keep their positions");
+            assert_eq!(b.signing[0], SourceRef::default(), "{bad}");
+            assert_eq!(b.signing[1].id, SOURCE_B, "{bad}");
+            assert_eq!(b.delivery.len(), 2, "{bad}");
+            assert_eq!(b.delivery[1].id, SOURCE_B, "{bad}");
+        }
+    }
+
+    /// Text from another machine loses its control and format characters (a bell, a
+    /// newline, a bidirectional override, a zero-width space) and is cut on a character
+    /// boundary.
+    #[test]
+    fn display_source_text_cleans_and_bounds() {
+        assert_eq!(
+            display_source_text("desk\u{202E}\u{7}\n\u{200B}evil", 64),
+            "deskevil"
+        );
+        assert_eq!(display_source_text("héllo wörld", 64), "héllo wörld");
+        // é is two bytes: a cut never splits it.
+        assert_eq!(display_source_text("aé", 2), "a");
+        assert_eq!(display_source_text(&"x".repeat(100), 64).len(), 64);
+    }
+
+    #[test]
+    fn valid_machine_id_is_32_lowercase_hex() {
+        assert!(valid_machine_id(SOURCE_A));
+        assert!(!valid_machine_id(&SOURCE_A.to_uppercase()));
+        assert!(!valid_machine_id(&SOURCE_A[1..]));
+        assert!(!valid_machine_id("0123456789abcdef-0123456789abcde"));
+        assert!(!valid_machine_id(""));
     }
 }

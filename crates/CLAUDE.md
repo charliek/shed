@@ -164,6 +164,18 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   builder. Consumed today by the **`shed-host-agent` bin** (the daemon shell — CLI,
   signals, socket bind, the Surface-A desktop UDS server) and, from leg 3a.2, embedded
   in-process by the desktop app. Carries no daemon-only or WebKitGTK concern.
+  `sign_check` (plan 035 §3.5) is the pure parser and policy for what the machine will
+  sign for a shed: an exact SSH login request or an exact `git` SSHSIG blob, nothing
+  else, returning an `Approved` that is the only way to sign the bytes it checked. Its
+  vectors in `shed-broker/fixtures/sign_check/` are REAL OpenSSH captures: re-record
+  them only with that directory's `capture.sh` (Docker), never by hand. Its two
+  machine-wide settings are `ssh.allow_users` and `ssh.offer_keys` (`config.rs`,
+  `HostAgentConfig::ssh_sign_policy`); the key filter itself is
+  `ssh_backend::FilteredSshBackend`, wrapped around whichever SSH backend resolved in
+  BOTH the daemon and the embedded broker. It asks the backend nothing of its own (the
+  agent-forward transcripts depend on that), and a key it does not offer fails with
+  the backend's own unknown-key error, so a shed cannot tell "not offered" from "not
+  present".
 - **`shed-opencode`** — the **opencode adapter** for `shed_core::lane` (plan 015): the
   implementation of both contract traits that talks to an opencode server's local HTTP
   API — the same server the TUI is already running, never a sidecar it launches itself.

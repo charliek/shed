@@ -54,7 +54,7 @@ The run limit is enforced by the cloud: each VM is created with a maximum run du
 
 A delete without `Accept: text/event-stream` answers as soon as the shed is hidden (about 3 s measured, and about 10 s when the VM cannot be labelled at once because its create or a stop is still in flight); the VM is destroyed in the background, about 30 s measured. With `Accept: text/event-stream`, which is what `shed delete` sends, the shed is hidden just as fast but the stream stays open until the VM is gone, so the command returns only then (29 to 34 s measured) and a create right after it never meets the old VM. A delete sent while the shed's create is still asking the cloud for its VM waits for that VM to appear and then destroys it, which took about two and a half minutes when measured. A destroy that fails is retried by the periodic pass (see below). The shed is hidden all the same; a streamed delete then ends with an error event (`shed delete` prints `the delete is recorded but the VM could not be destroyed yet; the server keeps trying` and exits 1), and a JSON delete has already answered 204.
 
-Exec (`POST /api/sheds/{name}/exec`) and the Connect tunnel on a shed that is not running return **409 `SHED_NOT_RUNNING`**.
+Exec (`POST /api/sheds/{name}/exec`) and the Connect tunnel on a shed that is not running return **409 `SHED_NOT_RUNNING`**. (Firecracker and VZ answer exec the same way, but the Connect tunnel with `503 SHED_NOT_RUNNING`; see [API › Connect API](api.md#connect-api).)
 
 The CLI waits for you: `shed start` and `shed stop` poll until the shed settles (up to 180 s), `shed delete` returns once the VM is gone, and `shed attach`, `shed console`, `shed sync` and `shed tunnels` wait for a starting or stopping shed. SSH to the server (`ssh <shed>@<server>`) starts a stopped shed and waits up to 150 s, writing progress to stderr.
 
@@ -275,11 +275,48 @@ The check covers VPC firewall rules. It does not read hierarchical or network fi
 
 A server stop leaves every VM as it is: running sheds keep running and keep costing money. At start-up the server lists the cloud VMs of its `environment` and reconciles them with its record cache (`state_dir`):
 
-- A VM labelled ready that has no record is adopted under its own shed ID.
+- A VM labelled ready that has no record is adopted under its own shed ID, with the user its `shed_user` label names (see [Users](#users)).
 - A record left `starting` or `stopping` resumes its job.
 - A record whose VM is stopped but was `running` becomes `stopped` with reason `run_limit` or `external`.
 - A record whose VM is gone is dropped, unless the shed is in `error` or its create had not reached the cloud.
 - A VM labelled `deleting`, or one with a local delete marker, is deleted. So is a VM still labelled `creating` 15 minutes after the cloud made it that has no record: a create nobody will finish. Nothing else is ever removed.
+
+## Users
+
+On a server with [`auth.users`](configuration.md#users) a remote shed belongs
+to a user like any other (see [Security › Ownership](security.md#ownership)),
+and the user is kept in two places: the shed's record and the VM's
+`shed_user` label.
+
+- **The label.** `shed_user` is written on every new VM, beside the
+  `shed_owner` label a service client's shed carries. It was added to label
+  schema `1` without changing it, so a VM labelled before it existed is still
+  read: no `shed_user` label means no user. The server writes it on the VM at
+  create; the boot disk gets the labels it had at create, so the disk of a VM
+  made before the label existed has none, and nothing adds one later.
+- **Adoption.** A VM the server adopts at start-up (labelled ready, no record)
+  takes its user from its label. A record with no user and no owner whose VM
+  is labelled with a user takes that user at the next read of the VM (the
+  start-up pass, the periodic pass, any job), which is how a record rewritten
+  by an older build or a rollback gets its user back.
+- **A conflict fails closed.** When the record names another user or a service
+  client and the label names a user, or the label is not a valid user name,
+  the shed is reported with the user `!unresolved`: only an admin can reach
+  it, and nobody can enter it, until a read of the VM finds the two in line
+  again. Each such read logs it.
+- **Assigning.** [`shed assign`](cli.md#shed-assign) writes the label first,
+  with a write the cloud refuses unless the label is empty or already names
+  the target user, so two servers sharing an environment cannot give one shed
+  to two users. The record follows before the command returns. A label that was
+  written without its record is taken up at the next read of the VM. A
+  remote shed has no host directories or server mounts, so `SHED_HOST_RESOURCES`
+  never applies here.
+
+A remote server has no snapshots and refuses `env_file` at load, so neither
+part of Ownership applies to it. Its sheds make no credential-helper requests
+(`extensions.enabled` is refused with the remote backend), so a user's
+[credential source](security.md#one-machine-answers-for-each-user) is never
+asked on their behalf.
 
 ## Not supported yet
 

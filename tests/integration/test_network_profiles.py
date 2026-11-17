@@ -1,8 +1,8 @@
 """Network profiles (`open`, `isolated`) against the parallel FC dev server.
 
-Firecracker only, against a dev server started in mtls mode
-(`SHED_DEV_AUTH_MODE=mtls`), whose rendered config carries the `itest` service
-client with no `network:` in its policy (so its sheds are isolated by default).
+Firecracker only, against the FC dev server, which runs mtls: its committed
+config carries the `itest` service client with no `network:` in its policy
+(so its sheds are isolated by default).
 
 What it shows, live, from inside real guests (probes are
 `timeout 5 bash -c 'exec 3<>/dev/tcp/HOST/PORT'`, and `curl` for a source
@@ -20,8 +20,8 @@ tables are gone once the last isolated shed is deleted.
 The isolated profile's rule set itself is proven first, as root inside
 network namespaces, by `make test-netns-remote`.
 
-Run: `make build && make dev-server-restart-fc SHED_DEV_AUTH_MODE=mtls &&
-make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls PYTEST_ARGS="test_network_profiles.py"`.
+Run: `make build && make dev-server-restart-fc &&
+make test-integration-dev-fc PYTEST_ARGS="test_network_profiles.py"`.
 """
 
 from __future__ import annotations
@@ -41,16 +41,10 @@ from urllib.parse import urlparse
 import pytest
 import yaml
 
-from fixtures.devcontrol import DEV_AUTH_MODE
 from fixtures.tlsclient import fingerprint, server_cert_pem
 
-pytestmark = pytest.mark.skipif(
-    DEV_AUTH_MODE != "mtls",
-    reason=(
-        f"SHED_DEV_AUTH_MODE={DEV_AUTH_MODE!r} (want 'mtls'): run "
-        "`make test-integration-dev-fc SHED_DEV_AUTH_MODE=mtls`."
-    ),
-)
+# No auth-mode gate: the FC dev server is always mtls, and `_load_entry`
+# skips cleanly when the dev entry has no mtls client certificate.
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEV_BIN = os.environ.get("SHED_FC_DEV_BIN_PATH", "/tmp/shed-server-dev")
@@ -318,7 +312,7 @@ def test_down_removes_only_its_tables_and_up_rebuilds(fc_server_dev, sheds, base
         assert not {f"table bridge {TABLE}", f"table inet {TABLE}"} & tables(fc_server_dev), "teardown left a table"
         assert shared_host_state(fc_server_dev) == baseline, "dev-server-down-fc changed the bridge, NAT or FORWARD rules"
     finally:
-        make("dev-server-up-fc", "SHED_DEV_AUTH_MODE=mtls")
+        make("dev-server-up-fc")
         wait_listed(fc_server_dev)
     assert guarded_ips(fc_server_dev) == before, "the rebuild from metadata differs"
     r = host_run(fc_server_dev, f"sudo -n grep -c 'Network policy: tables bridge/inet {TABLE} installed' {DEV_LOG}")

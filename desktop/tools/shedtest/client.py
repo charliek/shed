@@ -480,6 +480,27 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
         An unknown mode is rejected (`bad_request`)."""
         return self.call("broker.set_mode", {"mode": mode})
 
+    # -- credential sources (plan 035 §3.4) -------------------------------
+    def source_status(self) -> dict:
+        """`{rows, this_machine, this_machine_error, broker_mode}`: one row per
+        configured server — `{host, supported, source: {id, name}|None, this_machine,
+        connected, error}` — and this machine's `{id, name}` (or why there is none). A
+        server older than the feature is `supported: False` with no error."""
+        return self.call("source.status")
+
+    def source_use(self, host: str) -> dict:
+        """Make THIS machine the credential source on `host` (one request, never
+        retried); `{row, woke_broker}`. Raises `ShedError` with the refusal: `bad_request`
+        (unknown host), `machine_identity_unavailable`, `source_machine_not_found`,
+        `forbidden`, `unsupported`, `action_failed`."""
+        return self.call("source.use", {"host": host})
+
+    def press_source_use(self, host: str) -> None:
+        """Press the open Preferences window's own "Use this machine" button for `host`
+        (the `button[data-source-use="<host>"]` it renders) — test mode only. A press on
+        a disabled or missing button lands nowhere, as a pointer's would."""
+        self.call("ui.press_source_use", {"host": host})
+
     def hosts_auth(self) -> list[dict]:
         """Per-server credential mode (plan 002 C3): `[{name, auth_mode, learned}]`,
         name-sorted. `auth_mode` is `token`|`mtls`; `learned` is False while the value

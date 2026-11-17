@@ -163,15 +163,30 @@ type Backend struct {
 	readyOnce sync.Once
 	sweepOnce sync.Once
 
-	mu       sync.Mutex
-	closed   bool
-	records  map[string]*state.Record // by shed name
-	jobs     map[string]*job          // lifecycle job in flight, by shed name
-	deletes  map[string]*job          // delete job in flight, by shed ID
-	pending  map[string]time.Time     // delete markers on disk: shed ID -> when acknowledged
-	conns    map[string]*shedLink     // by shed ID
-	idle     chan struct{}            // closed and replaced whenever a job ends
-	reported []string                 // what the last reconcile pass reported
+	// assignMu serializes AssignUser, which writes a label and then the
+	// record without holding mu across the cloud call.
+	assignMu sync.Mutex
+	// busApplyMu serializes every application of a shed's reported user to
+	// its bus route (applyBusRoute and busSyncWorker): each reads the record
+	// and the hold's epoch, applies the user and lifts the hold as one, so
+	// a stale user is never applied after a newer one. Taken before mu,
+	// never under it.
+	busApplyMu sync.Mutex
+
+	mu      sync.Mutex
+	closed  bool
+	records map[string]*state.Record // by shed name
+	// busSyncs are the bus routes held for a change of the shed's reported
+	// user and not yet lifted; busStarting counts the message-channel starts
+	// in progress. Both by shed name (see busUserChangedLocked).
+	busSyncs    map[string]*busSync
+	busStarting map[string]int
+	jobs        map[string]*job      // lifecycle job in flight, by shed name
+	deletes     map[string]*job      // delete job in flight, by shed ID
+	pending     map[string]time.Time // delete markers on disk: shed ID -> when acknowledged
+	conns       map[string]*shedLink // by shed ID
+	idle        chan struct{}        // closed and replaced whenever a job ends
+	reported    []string             // what the last reconcile pass reported
 }
 
 var (
@@ -256,25 +271,27 @@ func New(opts Options) (*Backend, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Backend{
-		opts:       opts,
-		cfg:        opts.Config,
-		prov:       opts.Provider,
-		links:      opts.Links,
-		fw:         fw,
-		store:      store,
-		credMgr:    vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
-		logf:       opts.Logf,
-		now:        opts.Now,
-		clone:      vmutil.CloneRepo,
-		rootCtx:    ctx,
-		rootCancel: cancel,
-		ready:      make(chan struct{}),
-		records:    make(map[string]*state.Record),
-		jobs:       make(map[string]*job),
-		deletes:    make(map[string]*job),
-		pending:    make(map[string]time.Time),
-		conns:      make(map[string]*shedLink),
-		idle:       make(chan struct{}),
+		opts:        opts,
+		cfg:         opts.Config,
+		prov:        opts.Provider,
+		links:       opts.Links,
+		fw:          fw,
+		store:       store,
+		credMgr:     vmutil.NewCredentialManager(opts.Server, opts.Bridge, config.BackendRemote, vmutil.NewHealthTracker()),
+		logf:        opts.Logf,
+		now:         opts.Now,
+		clone:       vmutil.CloneRepo,
+		rootCtx:     ctx,
+		rootCancel:  cancel,
+		ready:       make(chan struct{}),
+		records:     make(map[string]*state.Record),
+		busSyncs:    make(map[string]*busSync),
+		busStarting: make(map[string]int),
+		jobs:        make(map[string]*job),
+		deletes:     make(map[string]*job),
+		pending:     make(map[string]time.Time),
+		conns:       make(map[string]*shedLink),
+		idle:        make(chan struct{}),
 	}
 	for _, r := range records {
 		b.records[r.Shed.Name] = r
@@ -394,6 +411,7 @@ func (b *Backend) Reported() []string {
 func (b *Backend) shedOf(r *state.Record) *config.Shed {
 	shed := r.Shed
 	shed.Backend = config.BackendRemote
+	shed.Owner, shed.User = ownership(r)
 	if r.Shed.Status == config.StatusRunning {
 		if hs, ok := b.credMgr.HealthTracker().Get(r.Shed.Name); ok {
 			lastHealthy := hs.LastSeen
@@ -403,6 +421,25 @@ func (b *Backend) shedOf(r *state.Record) *config.Shed {
 		}
 	}
 	return &shed
+}
+
+// ownership returns the service client and user a record is reported with.
+// A record that names both, or whose instance's shed_user label names
+// another user (Record.UserConflict), fails closed: no owner, and
+// config.UserUnresolved, which no caller's user can equal.
+func ownership(r *state.Record) (owner, user string) {
+	if r.UserConflict != "" {
+		return "", config.UserUnresolved
+	}
+	return config.ShedOwnership(r.Shed.Owner, r.Shed.User)
+}
+
+// busIdentity is the credential-bus identity of a record's shed: a service
+// client's shed (any stored owner) stays off the bus, and the user is the
+// reported one, so a record whose user is in conflict routes nowhere.
+func busIdentity(r *state.Record) vmutil.BusIdentity {
+	_, user := ownership(r)
+	return vmutil.BusIdentity{Owned: r.Shed.Owner != "", User: user, CreatedAt: r.Shed.CreatedAt}
 }
 
 // saveLocked writes a record to disk. A failure is logged: the record in
@@ -479,16 +516,17 @@ func (b *Backend) update(name, id string, fn func(*state.Record)) bool {
 }
 
 // lookupLocked finds a record by name and applies the caller's ownership
-// requirements to it.
+// requirements to it: the reported owner and user and the creation time the
+// access guard authorized against (backend.CheckIdentity). A reconcile that
+// changed the reported user in between (a label conflict reports
+// config.UserUnresolved) makes the shed not found to that caller.
 func (b *Backend) lookupLocked(ctx context.Context, name string) (*state.Record, error) {
 	r := b.records[name]
 	if r == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
 	}
-	if err := backend.CheckOwner(ctx, name, r.Shed.Owner); err != nil {
-		return nil, err
-	}
-	if err := backend.CheckCreatedAt(ctx, name, r.Shed.CreatedAt); err != nil {
+	owner, user := ownership(r)
+	if err := backend.CheckIdentity(ctx, name, owner, user, r.Shed.CreatedAt); err != nil {
 		return nil, err
 	}
 	return r, nil

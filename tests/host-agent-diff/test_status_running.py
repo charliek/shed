@@ -33,6 +33,9 @@ def test_status_json_masked_canonical_equal(daemon, watch_none_config, different
     assert masked["servers"] == []
     assert masked["approval_channel"]["consumer_connected"] is False
     assert masked["approval_channel"]["socket_path"] == "<dir>/host-agent.sock"
+    # The machine identity block is present (shape-asserted inside the mask).
+    assert masked["machine"] == {"id": "<machine_id>", "name": "<machine_name>"}
+    assert "machine_error" not in masked
 
 
 @pytest.mark.differential
@@ -52,3 +55,4 @@ def test_status_text_masked_equal(daemon, watch_none_config, differential):
     assert "Servers (0):" in text
     assert "(none being watched)" in text
     assert "  socket    <dir>/host-agent.sock" in text
+    assert text.split("\n")[3] == "machine:  <machine_name> (<machine_id>)"

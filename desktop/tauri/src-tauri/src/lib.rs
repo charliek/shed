@@ -23,6 +23,7 @@ mod screenshot;
 mod shutdown;
 mod single_instance;
 mod slash;
+mod source;
 mod state;
 mod termctl;
 mod tray;
@@ -1294,6 +1295,35 @@ fn broker_set_mode(
     )
 }
 
+// -- credential sources (plan 035 §3.4): the Preferences source rows -------------
+
+/// Which machine answers credential requests on each configured server, and this
+/// machine's identity — the Preferences source rows. Mirrors the `source.status` IPC op
+/// (see [`source::status`]).
+#[tauri::command]
+async fn source_status(
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Arc<Backend>>,
+) -> Result<serde_json::Value, String> {
+    let rt = app.try_state::<broker::BrokerRuntime>();
+    Ok(source::status(&backend, rt.as_deref()).await)
+}
+
+/// "Use this machine": make this machine the source on `host` (and wake the embedded
+/// broker). The error string is the refusal in plain words, which the row shows.
+/// Mirrors the `source.use` IPC op (see [`source::use_this_machine`]).
+#[tauri::command]
+async fn source_use(
+    app: tauri::AppHandle,
+    backend: tauri::State<'_, Arc<Backend>>,
+    host: String,
+) -> Result<serde_json::Value, String> {
+    let rt = app.try_state::<broker::BrokerRuntime>();
+    source::use_this_machine(&backend, rt.as_deref(), &host)
+        .await
+        .map_err(|(_, message)| message)
+}
+
 // -- menu-bar popover footer commands (B1b) — a 2nd webview can't call the IPC ops
 //    or emit the main-window events, so the footer invokes these dedicated commands
 //    (test-mode-safe: they only show/emit/exit, never spawn or write). --
@@ -1511,6 +1541,8 @@ pub fn run() {
             loginitem_set,
             broker_status,
             broker_set_mode,
+            source_status,
+            source_use,
             open_dashboard,
             open_preferences,
             app_exit,

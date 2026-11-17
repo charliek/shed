@@ -20,9 +20,9 @@ const (
 	// reservedAPIUser is a special username reserved for API access.
 	reservedAPIUser = "_api"
 
-	// reservedBootstrapUser issues a short-lived HTTP credential — a bearer
-	// token, or a client certificate in mtls mode — over the authenticated SSH
-	// channel (see bootstrap.go). Like _api it is not a shed.
+	// reservedBootstrapUser issues a short-lived client certificate (mtls
+	// mode) over the authenticated SSH channel (see bootstrap.go). Like _api it
+	// is not a shed.
 	reservedBootstrapUser = "_bootstrap"
 
 	// containerReadyTimeout is the maximum time to wait for a container to be ready.
@@ -35,16 +35,41 @@ const (
 // readyTimeout is containerReadyTimeout as a var, so tests can shorten it.
 var readyTimeout = containerReadyTimeout
 
+// shedNameFor maps the username a connection authenticated as
+// (authenticatedUser) to the name of the shed it addresses. It is the one
+// place that mapping is made: the wake path every shell, command and sftp
+// session goes through (ensureRunning) and the port-forward handler call it
+// before any shed lookup.
+//
+// A username that could not be a shed's name is refused (ok false): one that
+// fails config.ValidateShedName (a case variant such as "Git" or "BOX", which
+// a case-insensitive volume would otherwise resolve to the shed stored as
+// "git" or "box"; an underscore; the empty name) and the reserved name git.
+// The caller answers it exactly as it answers a shed that does not exist, so
+// the refusal reveals nothing. _bootstrap and _api are handled by name before
+// the session gets here; on sftp and a port forward they are not shed names
+// and are answered as not found, as they always were.
+func shedNameFor(user string) (string, bool) {
+	if config.ValidateShedName(user) != nil || config.IsReservedShedName(user) {
+		return "", false
+	}
+	return user, true
+}
+
 // handleSession is the main session handler for SSH connections.
 func (s *Server) handleSession(sess ssh.Session) {
-	user := sess.User()
+	// The username the connection authenticated as (the one its verified
+	// key signed for), which is also what sess.User() reports once
+	// authentication is done; ctx.User() is never used to route.
+	user := authenticatedUser(sess.Context())
 	remoteAddr := sess.RemoteAddr()
 
-	log.Printf("SSH session started: user=%s remote=%s", user, remoteAddr)
-	defer log.Printf("SSH session ended: user=%s remote=%s", user, remoteAddr)
+	log.Printf("SSH session started: user=%s remote=%s", logUser(user), remoteAddr)
+	defer log.Printf("SSH session ended: user=%s remote=%s", logUser(user), remoteAddr)
 
-	// Reserved bootstrap user: mint + return an HTTP token bundle over the
-	// authenticated SSH channel, before any shed-name routing or shell wrap.
+	// Reserved bootstrap user: issue + return a client-certificate bundle over
+	// the authenticated SSH channel (or the open-server refusal), before any
+	// shed-name routing or shell wrap.
 	if user == reservedBootstrapUser {
 		s.handleBootstrap(sess)
 		return
@@ -52,36 +77,37 @@ func (s *Server) handleSession(sess ssh.Session) {
 
 	// Check for reserved usernames.
 	if user == reservedAPIUser {
-		log.Printf("Rejected reserved username: %s", user)
+		log.Printf("Rejected reserved username: %s", logUser(user))
 		fmt.Fprintf(sess.Stderr(), "Error: username '%s' is reserved for API access\n", user)
 		_ = sess.Exit(1)
 		return
 	}
 
-	// Extract shed name from username (username maps directly to shed name).
-	shedName := user
-
-	// Validate shed name.
-	if shedName == "" {
-		log.Printf("Empty shed name from user")
-		fmt.Fprintf(sess.Stderr(), "Error: invalid username\n")
+	// The channel's principal, from the key the connection authenticated
+	// with, resolved again for this channel.
+	p, err := s.principalFor(sess.Context())
+	if err != nil {
+		log.Printf("SSH session refused: user=%s: %v", logUser(user), err)
+		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
 		_ = sess.Exit(1)
 		return
 	}
+	ctx := backend.WithPrincipal(sess.Context(), p)
 
-	ctx := sess.Context()
-
-	// Look up the shed, waking it when it is stopped.
-	shed, err := s.ensureRunning(ctx, shedName, sess.Stderr(), true)
+	// Look up the shed the username names (shedNameFor), waking it when it
+	// is stopped.
+	shed, err := s.ensureRunning(ctx, user, sess.Stderr(), true)
 	if err != nil {
 		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
 		_ = sess.Exit(1)
 		return
 	}
+	// The exec acts on the incarnation that was checked and woken.
+	ctx = backend.PinCreatedAt(ctx, shed.CreatedAt)
 
 	// Execute in the container.
 	if err := s.execInContainer(ctx, sess, shed); err != nil {
-		log.Printf("Exec failed for shed %s: %v", shedName, err)
+		log.Printf("Exec failed for shed %s: %v", shed.Name, err)
 		// Propagate the actual exit code when available.
 		if exitErr, ok := err.(*vmutil.ExitError); ok {
 			_ = sess.Exit(exitErr.Code)

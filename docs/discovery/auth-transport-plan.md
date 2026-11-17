@@ -1,5 +1,7 @@
 # Auth & Transport: Implementation Plan & Acceptance Criteria
 
+> **Status (v0.10.0):** the bearer-token mode this document designs (`auth.mode: token`, also spelled `secure`) was removed in v0.10.0; `mtls` is the networked mode and `open` is loopback only. This document is kept as history; see [Security](../reference/security.md) for the current model.
+
 > **✅ Implemented (2026-06).** All phases below shipped on the `feat/auth-transport`
 > branches — shed [#198](https://github.com/charliek/shed/pull/198), shed-desktop
 > [#15](https://github.com/charliek/shed-desktop/pull/15), shed-extensions

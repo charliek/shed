@@ -284,6 +284,8 @@ func (s Spec) Validate() error {
 	switch {
 	case s.Name != id.InstanceName():
 		return Errorf(ErrInvalid, "create", "instance name %q does not match its labels (want %q)", s.Name, id.InstanceName())
+	case id.Owner != "" && id.User != "":
+		return Errorf(ErrInvalid, "create", "labels %s and %s are both set: a shed belongs to a service client or to a user, not both", LabelOwner, LabelUser)
 	case s.Labels[LabelState] != string(ShedStateCreating):
 		return Errorf(ErrInvalid, "create", "label %s must be %q at create", LabelState, ShedStateCreating)
 	case s.Metadata[MetadataShedName] != id.Name || s.Metadata[MetadataShedID] != id.ID:

@@ -49,13 +49,17 @@
 //!   warn+skip where Go loads it. (Legacy-PEM P-521 via `SecretKey::from_sec1_pem`
 //!   is *not* affected — the SEC1/PKCS#8 scalar is fixed-width.)
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::Signer; // = signature::Signer — also covers the p256/p384/p521 SigningKeys.
 use ssh_key::private::{KeypairData, PrivateKey};
 
+use crate::bus::BusLog;
 use crate::config::user_home_dir;
+use crate::sign_check::{digest_fingerprint, key_blob_digest, KeyFilter};
 
 /// The standard SSH private-key filenames, loaded in this exact order (Go's
 /// `ssh_backend_localkeys.go:standardKeyFiles`).
@@ -102,6 +106,177 @@ pub trait SshBackend: Send + Sync {
     fn sign(&self, public_key: &[u8], data: &[u8], flags: u32) -> Result<SshSignature, String>;
     /// The backend mode name (`"agent-forward"` or `"local-keys"`).
     fn mode(&self) -> &str;
+    /// The error `sign` returns for a key this backend does not hold — what
+    /// [`FilteredSshBackend`] answers for a key outside `ssh.offer_keys`, so a key that is
+    /// not offered fails exactly as one that is not present. Local keys: `key not
+    /// found`; the agent-forward backend overrides it with what an agent's refusal reads
+    /// as.
+    fn unknown_key_error(&self) -> String {
+        "key not found".to_string()
+    }
+}
+
+/// How many keys the last listing offered to sheds, of how many the backend had
+/// (plan 035 §3.5). Recorded by [`FilteredSshBackend`] on every successful `list`,
+/// with or without a filter; `None` until the first one. Read by the status block.
+#[derive(Debug, Default)]
+pub struct SshOfferCounts {
+    last: Mutex<Option<OfferCount>>,
+}
+
+/// One listing's counts: `offered` of `available` keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfferCount {
+    pub offered: usize,
+    pub available: usize,
+}
+
+impl SshOfferCounts {
+    /// The last listing's counts (`None` before any).
+    pub fn get(&self) -> Option<OfferCount> {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn record(&self, count: OfferCount) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(count);
+    }
+}
+
+/// The `ssh.offer_keys` key filter (plan 035 §3.5), wrapped around whichever backend
+/// is configured (local keys or agent-forward), so code in a shed can neither see nor
+/// use any other key the machine holds:
+///
+/// - `list` returns only the keys in the filter, in the backend's order;
+/// - `sign` with a key outside the filter fails with the backend's own
+///   [`SshBackend::unknown_key_error`] WITHOUT asking the backend, so a shed cannot
+///   tell a key that is not offered from one that is not present, and the host agent is
+///   never asked to sign with it;
+/// - `mode` passes through.
+///
+/// With no filter everything passes through. Either way every successful `list`
+/// records its counts ([`SshOfferCounts`]); and when a filter entry matches none of the
+/// keys a listing found, one warning naming its fingerprint goes to `warn` the first
+/// time (a typo would otherwise silently offer nothing). The wrapper makes no call of
+/// its own: the agent-forward backend is still asked nothing until a shed asks.
+pub struct FilteredSshBackend {
+    inner: Arc<dyn SshBackend>,
+    filter: Option<KeyFilter>,
+    counts: Arc<SshOfferCounts>,
+    warn: Option<Arc<dyn BusLog>>,
+    warned_unmatched: AtomicBool,
+}
+
+/// Wrap `backend` in the `ssh.offer_keys` filter (`None` = no filter). Returns the
+/// wrapper (an `Arc<dyn SshBackend>` for the bus) and its counts. `warn` receives the
+/// one-time warning for filter entries that match no key.
+pub fn with_key_filter(
+    backend: Arc<dyn SshBackend>,
+    filter: Option<KeyFilter>,
+    warn: Option<Arc<dyn BusLog>>,
+) -> Arc<FilteredSshBackend> {
+    Arc::new(FilteredSshBackend {
+        inner: backend,
+        filter,
+        counts: Arc::new(SshOfferCounts::default()),
+        warn,
+        warned_unmatched: AtomicBool::new(false),
+    })
+}
+
+impl FilteredSshBackend {
+    /// The counts every listing records.
+    pub fn counts(&self) -> Arc<SshOfferCounts> {
+        self.counts.clone()
+    }
+
+    /// The filter, when `ssh.offer_keys` is set.
+    pub fn filter(&self) -> Option<&KeyFilter> {
+        self.filter.as_ref()
+    }
+
+    /// The start-up log line for a filter (`None` without one): how many keys are
+    /// offered of how many are available once a listing has happened — the daemon lists
+    /// local keys at start-up — else how many entries the filter has, since the
+    /// forwarded agent is not asked until a shed asks. Counts and fingerprints only,
+    /// never key material.
+    pub fn startup_line(&self) -> Option<String> {
+        let filter = self.filter.as_ref()?;
+        Some(match self.counts.get() {
+            Some(c) => format!(
+                "ssh key filter offered={} available={} entries={}",
+                c.offered,
+                c.available,
+                filter.len()
+            ),
+            None => format!(
+                "ssh key filter entries={} mode={} (keys are counted when a shed first lists them)",
+                filter.len(),
+                self.inner.mode()
+            ),
+        })
+    }
+
+    fn offered(&self, blob: &[u8]) -> bool {
+        self.filter
+            .as_ref()
+            .is_none_or(|filter| filter.contains_key_blob(blob))
+    }
+
+    /// Warn once about filter entries that none of `available` matches.
+    fn warn_unmatched(&self, available: &[SshKeyInfo]) {
+        let (Some(filter), Some(warn)) = (&self.filter, &self.warn) else {
+            return;
+        };
+        let present: HashSet<[u8; 32]> =
+            available.iter().map(|k| key_blob_digest(&k.blob)).collect();
+        let mut unmatched: Vec<String> = filter
+            .digests()
+            .filter(|d| !present.contains(*d))
+            .map(digest_fingerprint)
+            .collect();
+        if unmatched.is_empty() || self.warned_unmatched.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        unmatched.sort();
+        for fingerprint in unmatched {
+            warn.warn(&format!(
+                "ssh.offer_keys entry matches no available key fingerprint={fingerprint} mode={}",
+                self.inner.mode()
+            ));
+        }
+    }
+}
+
+impl SshBackend for FilteredSshBackend {
+    fn list(&self) -> Result<Vec<SshKeyInfo>, String> {
+        let available = self.inner.list()?;
+        self.warn_unmatched(&available);
+        let total = available.len();
+        let offered: Vec<SshKeyInfo> = available
+            .into_iter()
+            .filter(|k| self.offered(&k.blob))
+            .collect();
+        self.counts.record(OfferCount {
+            offered: offered.len(),
+            available: total,
+        });
+        Ok(offered)
+    }
+
+    fn sign(&self, public_key: &[u8], data: &[u8], flags: u32) -> Result<SshSignature, String> {
+        if !self.offered(public_key) {
+            return Err(self.inner.unknown_key_error());
+        }
+        self.inner.sign(public_key, data, flags)
+    }
+
+    fn mode(&self) -> &str {
+        self.inner.mode()
+    }
+
+    fn unknown_key_error(&self) -> String {
+        self.inner.unknown_key_error()
+    }
 }
 
 /// The RSA digest an `rsa-sha2` flag selects (or the `ssh-rsa` SHA-1 default).
@@ -1645,5 +1820,173 @@ thaWnPuu0EWHWhqSQuP3zx/47Kd98x5FMIW92hlf+vZxuURwYr0VwYB/tz9p4s4Z\n\
         );
         let (backend, warnings) = LocalKeysBackend::load_from_ssh_dir(tmp.path());
         assert_eq!(backend.list().unwrap().len(), 1, "{warnings:?}");
+    }
+
+    // ---- the ssh.offer_keys key filter (plan 035 §3.5) ----------------------------
+
+    /// A `BusLog` that keeps its warnings.
+    #[derive(Default)]
+    struct CapturingLog {
+        warnings: Mutex<Vec<String>>,
+    }
+
+    impl BusLog for CapturingLog {
+        fn info(&self, _msg: &str) {}
+        fn warn(&self, msg: &str) {
+            self.warnings.lock().unwrap().push(msg.to_string());
+        }
+        fn debug(&self, _msg: &str) {}
+        fn error(&self, _msg: &str) {}
+    }
+
+    /// The three local keys (ed25519, RSA, ECDSA P-256, in load order) and their blobs.
+    fn three_local_keys() -> (tempfile::TempDir, Arc<dyn SshBackend>, [Vec<u8>; 3]) {
+        let tmp = temp_dir("filter");
+        write_fixed_ed25519(tmp.path());
+        write_key(tmp.path(), "id_rsa", RSA_KEY);
+        write_key(tmp.path(), "id_ecdsa", ECDSA_P256_KEY);
+        let (backend, warnings) = LocalKeysBackend::load_from_ssh_dir(tmp.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let keys = backend.list().unwrap();
+        assert_eq!(keys.len(), 3);
+        let blobs = [
+            keys[0].blob.clone(),
+            keys[1].blob.clone(),
+            keys[2].blob.clone(),
+        ];
+        (tmp, Arc::new(backend), blobs)
+    }
+
+    /// The filter the config builds from `offer_keys` entries.
+    fn config_filter(entries: &[String]) -> KeyFilter {
+        let mut yaml = String::from("ssh:\n  offer_keys:\n");
+        for e in entries {
+            yaml.push_str(&format!("    - \"{e}\"\n"));
+        }
+        let cfg = crate::config::HostAgentConfig::try_parse(&yaml).unwrap();
+        cfg.validate().unwrap();
+        cfg.ssh_sign_policy().offer_keys().cloned().unwrap()
+    }
+
+    fn key_line(blob: &[u8]) -> String {
+        let format = PublicKey::from_bytes(blob).unwrap().algorithm();
+        format!(
+            "{} {} comment",
+            format.as_str(),
+            base64::engine::general_purpose::STANDARD.encode(blob)
+        )
+    }
+
+    /// Three local keys, one named by fingerprint and one by public key line: `list`
+    /// offers those two, in load order; `sign` with the third fails exactly as an
+    /// unknown key does, though the backend holds it; counts are recorded.
+    #[test]
+    fn key_filter_offers_only_named_local_keys() {
+        let (_tmp, inner, [ed, rsa, ecdsa]) = three_local_keys();
+        let filter = config_filter(&[digest_fingerprint(&key_blob_digest(&ed)), key_line(&ecdsa)]);
+        let log = Arc::new(CapturingLog::default());
+        let filtered = with_key_filter(inner.clone(), Some(filter), Some(log.clone()));
+        assert_eq!(filtered.counts().get(), None, "nothing listed yet");
+        assert_eq!(
+            filtered.startup_line().unwrap(),
+            "ssh key filter entries=2 mode=local-keys (keys are counted when a shed first lists them)"
+        );
+
+        let listed = filtered.list().unwrap();
+        let blobs: Vec<&[u8]> = listed.iter().map(|k| k.blob.as_slice()).collect();
+        assert_eq!(blobs, [ed.as_slice(), ecdsa.as_slice()]);
+        assert_eq!(
+            filtered.counts().get(),
+            Some(OfferCount {
+                offered: 2,
+                available: 3
+            })
+        );
+        assert_eq!(
+            filtered.startup_line().unwrap(),
+            "ssh key filter offered=2 available=3 entries=2"
+        );
+        assert_eq!(filtered.mode(), "local-keys");
+
+        // Offered keys sign; the unoffered RSA key is refused with the backend's own
+        // unknown-key error, though the backend itself would sign with it.
+        assert!(filtered.sign(&ed, CHALLENGE, 0).is_ok());
+        assert!(filtered.sign(&ecdsa, CHALLENGE, 0).is_ok());
+        assert_eq!(
+            filtered.sign(&rsa, CHALLENGE, 0).unwrap_err(),
+            "key not found"
+        );
+        let mut absent = ed.clone();
+        *absent.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            filtered.sign(&rsa, CHALLENGE, 0).unwrap_err(),
+            inner.sign(&absent, CHALLENGE, 0).unwrap_err(),
+            "not offered reads exactly as not present"
+        );
+        assert!(inner.sign(&rsa, CHALLENGE, 0).is_ok(), "the backend has it");
+        assert!(
+            log.warnings.lock().unwrap().is_empty(),
+            "every entry matched"
+        );
+    }
+
+    #[test]
+    fn empty_key_filter_offers_nothing() {
+        let (_tmp, inner, [ed, _, _]) = three_local_keys();
+        let filtered = with_key_filter(inner, Some(KeyFilter::new()), None);
+        assert!(filtered.list().unwrap().is_empty());
+        assert_eq!(
+            filtered.counts().get(),
+            Some(OfferCount {
+                offered: 0,
+                available: 3
+            })
+        );
+        assert_eq!(
+            filtered.sign(&ed, CHALLENGE, 0).unwrap_err(),
+            "key not found"
+        );
+    }
+
+    #[test]
+    fn no_key_filter_passes_everything_and_still_counts() {
+        let (_tmp, inner, [ed, rsa, ecdsa]) = three_local_keys();
+        let filtered = with_key_filter(inner, None, None);
+        assert_eq!(filtered.startup_line(), None, "no filter, no line");
+        let listed = filtered.list().unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(
+            filtered.counts().get(),
+            Some(OfferCount {
+                offered: 3,
+                available: 3
+            })
+        );
+        for key in [&ed, &rsa, &ecdsa] {
+            assert!(filtered.sign(key, CHALLENGE, 0).is_ok());
+        }
+    }
+
+    /// An entry that matches no available key is warned about once, by fingerprint,
+    /// and only by fingerprint.
+    #[test]
+    fn unmatched_filter_entry_is_warned_once() {
+        let (_tmp, inner, [ed, _, _]) = three_local_keys();
+        let typo = [7u8; 32];
+        let mut filter = KeyFilter::new();
+        filter.insert_key_blob(&ed);
+        filter.insert_digest(typo);
+        let log = Arc::new(CapturingLog::default());
+        let filtered = with_key_filter(inner, Some(filter), Some(log.clone()));
+        assert_eq!(filtered.list().unwrap().len(), 1);
+        assert_eq!(filtered.list().unwrap().len(), 1);
+        let warnings = log.warnings.lock().unwrap().clone();
+        assert_eq!(
+            warnings,
+            [format!(
+                "ssh.offer_keys entry matches no available key fingerprint={} mode=local-keys",
+                digest_fingerprint(&typo)
+            )]
+        );
     }
 }
