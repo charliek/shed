@@ -1,0 +1,36 @@
+{
+  "name": "directory-token-bad-signature",
+  "description": "A token shaped as the service's own for the live server srv-a, valid in every claim and naming the service's key id, whose signature is corrupted (the lowest bit of its first byte flipped): 401 invalid_token. A service that does not verify its own tokens' signatures fails here.",
+  "token": {
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "scope": [
+      "directory:read"
+    ],
+    "corrupt_signature": true
+  },
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {
+      "Authorization": "Bearer {{access_token}}"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

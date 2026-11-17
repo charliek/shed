@@ -1,0 +1,36 @@
+{
+  "name": "directory-token-wrong-key-id",
+  "description": "A token for the live server srv-a, valid in every claim and signed correctly with the service's own key, whose header kid names a key the service does not have (test-signing-2): 401 invalid_token. A service checks the key id along with the signature.",
+  "token": {
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "scope": [
+      "directory:read"
+    ],
+    "kid": "test-signing-2"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {
+      "Authorization": "Bearer {{access_token}}"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

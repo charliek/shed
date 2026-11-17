@@ -64,7 +64,7 @@ var (
 	requestMembers        = memberSet("method", "path", "headers", "body")
 	responseMembers       = memberSet("status", "headers", "body", "text")
 	assertionMembers      = memberSet("key", "client_id", "typ", "aud", "lifetime", "iat_offset", "nbf_offset", "duplicate_claim")
-	tokenMembers          = memberSet("client_id", "scope", "nbf_offset", "sub", "aud", "gty", "iss", "typ")
+	tokenMembers          = memberSet("client_id", "scope", "nbf_offset", "sub", "aud", "gty", "iss", "typ", "kid", "corrupt_signature")
 	comparedHeaders       = memberSet("Cache-Control", "Content-Type", "ETag", "Pragma", "Retry-After", "WWW-Authenticate")
 	placeholderNames      = memberSet("client_id", "assertion", "access_token", "message", "description", "version")
 	clientMembers         = memberSet("name", "description", "response", "expect")
@@ -446,10 +446,13 @@ func (c *shapeChecker) token(where string, v any) {
 	if val, ok := m["nbf_offset"]; ok && !isInteger(val) {
 		c.addf("%s: nbf_offset is not an integer", where)
 	}
-	for _, n := range []string{"sub", "gty", "iss", "typ"} {
+	for _, n := range []string{"sub", "gty", "iss", "typ", "kid"} {
 		if val, ok := m[n]; ok && !isNonEmptyString(val) {
 			c.addf("%s: %s is not a string", where, n)
 		}
+	}
+	if val, ok := m["corrupt_signature"]; ok && val != true {
+		c.addf("%s: corrupt_signature is not true (leave it out for a sound signature)", where)
 	}
 }
 
@@ -680,6 +683,9 @@ func TestFixtureShapeChecker(t *testing.T) {
 		{shapeExchange, `"ETag":null,`, ``},
 		{shapeExchange, `"body":{"access_token"`, `"body":{"note":"{{message}}","access_token"`},
 		{shapeExchange, `"Authorization":"Bearer {{access_token}}"`, `"Authorization":"Bearer x"`},
+		{shapeExchange, `"nbf_offset":120}`, `"nbf_offset":120,"corrupt_signature":false}`},
+		{shapeExchange, `"nbf_offset":120}`, `"nbf_offset":120,"corrupt_signatur":true}`},
+		{shapeExchange, `"nbf_offset":120}`, `"nbf_offset":120,"kid":7}`},
 		{shapeGoodCase, `"malformed"`, `"malformd"`},
 		{shapeGoodCase, `"entry":1`, `"entry":2`},
 		{shapeGoodCase, `"reason"`, `"reasn"`},

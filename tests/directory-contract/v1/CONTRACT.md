@@ -660,15 +660,17 @@ that expects a refusal).
   "scope": ["<scope>", ...]}`, optionally with, each changing only what it
   names: `nbf_offset` (seconds; default 0), `sub` (default the client id),
   `aud` (any JSON value; default `["<issuer>/v1"]`), `gty` (default
-  `"client_credentials"`), `iss` (default the issuer) and `typ` (the
-  header's `typ`; default `"at+jwt"`). No other member is part of this
-  language. `{{access_token}}` in this step's request is then a token the
-  harness signs itself with `test-keys/token-signing-key.pem` under the
-  key id `test-signing-1`, exactly as the service signs a client's (the
-  `{{access_token}}` rule below), but for that client id and scope, with
-  `nbf` = `iat` + `nbf_offset` and each other member as given: for a case
-  the service's token endpoint never issues, such as a token without
-  `directory:read`, or one valid in every claim but one.
+  `"client_credentials"`), `iss` (default the issuer), `typ` (the
+  header's `typ`; default `"at+jwt"`), `kid` (the header's `kid`, a
+  string; default `"test-signing-1"`) and `corrupt_signature` (only
+  `true`: the lowest bit of the signature's first byte is flipped after
+  signing). No other member is part of this language. `{{access_token}}`
+  in this step's request is then a token the harness signs itself with
+  `test-keys/token-signing-key.pem`, exactly as the service signs a
+  client's (the `{{access_token}}` rule below), but for that client id and
+  scope, with `nbf` = `iat` + `nbf_offset` and each other member as given:
+  for a case the service's token endpoint never issues, such as a token
+  without `directory:read`, or one valid in every claim but one.
 - `before` (optional, on the first step or any step in `then`) runs set-up
   steps against the world before that step's request. Each is named by
   what it makes true, an object with one member, and these six are the
@@ -736,18 +738,22 @@ assertions at and just outside each time boundary), `token-unavailable`,
 `enroll-invalid-public-key`, `enroll-public-key-in-use`,
 `enroll-server-name-in-use`, `enroll-rate-limited`); the directory
 (`directory-ok`, `directory-version-changes` (two equal versions, a
-change, a different version), `directory-last-person-removed`
+change, a different version, then the clock moved forward with nothing
+changed and the same version), `directory-last-person-removed`
 (`users: []`), `directory-last-admin-removed` and
 `directory-last-admin-demoted` (a list with no admin),
 `directory-no-bearer`, `directory-invalid-token` (an expired token),
 `directory-foreign-token` (a person's token from another issuer),
 `directory-cookie-only`, `directory-server-disabled` (disabled after its
 token was issued), `directory-rate-limited`,
-`directory-insufficient-scope`, and tokens signed with the service's own
-key that fail one check each: `directory-token-not-yet-valid`,
+`directory-insufficient-scope`, and tokens shaped as the service's own
+that fail one check each: `directory-token-not-yet-valid`,
 `directory-token-subject-mismatch`, `directory-token-unknown-server`,
 `directory-token-wrong-audience`, `directory-token-wrong-grant`,
-`directory-token-wrong-issuer`, `directory-token-wrong-type`).
+`directory-token-wrong-issuer`, `directory-token-wrong-type`,
+`directory-token-bad-signature` (every claim valid, the signature
+corrupted) and `directory-token-wrong-key-id` (signed correctly, naming a
+key id the service does not have)).
 
 The two literal tokens are fixed strings (RS256 signatures are
 deterministic). `directory-invalid-token`'s is signed with
