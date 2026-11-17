@@ -12,7 +12,7 @@
 // server accepts is theirs. A server with a user list has named users only:
 // each key belongs to exactly one of them, and an unknown key is nobody's.
 // Each key records where it came from (an inline key, the keys file, a GitHub
-// login or a key listed by hand under a user).
+// login, a key listed by hand under a user, or a directory's list).
 package users
 
 import (
@@ -57,6 +57,10 @@ const (
 	SourceGitHub Source = "github"
 	// SourceAdHoc is a key listed by hand under a user in auth.users.
 	SourceAdHoc Source = "adhoc"
+	// SourceDirectory is a key the server's directory lists under a user
+	// (auth.directory): an account service the server pulls its user list
+	// from.
+	SourceDirectory Source = "directory"
 )
 
 // Key is one accepted SSH public key and where it came from.

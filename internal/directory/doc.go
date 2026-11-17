@@ -28,6 +28,12 @@
 //     loopback when asked for, requests only to the issuer. A caller cannot
 //     supply its own client or transport. Every failure is a *Failure,
 //     classified, with RetryAfter as rule 2 reads it.
+//   - Lookup is the users.Lookup of a directory server: the local admins
+//     (auth.users beside auth.directory) and a decoded list's users, after
+//     the server's own rules (an entry with a local admin's name or key, or
+//     a service client's name, is skipped). Every reader answers from one
+//     snapshot per call, whose users and keys never change once the lookup
+//     holds it.
 //   - The state files (enrolment.json, users.json) are read only after
 //     checks of their directory and themselves (ReadStateFile), written
 //     durably (WriteStateFile) or once (CreateStateFileOnce), always through
