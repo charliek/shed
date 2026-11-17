@@ -350,3 +350,35 @@ func TestDirectoryConfigRoundTrips(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckDirectoryIssuer: the exported origin check accepts exactly the
+// normalized issuers auth.directory.url can give, and names the issuer in
+// its refusals (never auth.directory.url, which the caller may not hold).
+func TestCheckDirectoryIssuer(t *testing.T) {
+	for issuer, ok := range map[string]bool{
+		"https://accounts.example.test":        true,
+		"https://accounts.example.test:8443":   true,
+		"http://127.0.0.1:18080":               true,
+		"http://[::1]:18080":                   true,
+		"":                                     false,
+		"https://accounts.example.test/":       false,
+		"https://accounts.example.test/prefix": false,
+		"https://accounts.example.test?q":      false,
+		"https://accounts.example.test#f":      false,
+		"https://user@accounts.example.test":   false,
+		"https://accounts.example.test:":       false,
+		"https://accounts.example.test:0":      false,
+		"https://ACCOUNTS%2Eexample.test":      false,
+		"https://":                             false,
+		"ftp://accounts.example.test":          false,
+		"https://accounts.example.test ":       false,
+	} {
+		err := CheckDirectoryIssuer(issuer)
+		if (err == nil) != ok {
+			t.Errorf("%q: %v, want accepted=%v", issuer, err, ok)
+		}
+		if err != nil && strings.Contains(err.Error(), "auth.directory.url") {
+			t.Errorf("%q: %v names the config field", issuer, err)
+		}
+	}
+}

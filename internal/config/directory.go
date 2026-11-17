@@ -198,57 +198,9 @@ func validateDirectoryURL(d *DirectoryConfig) error {
 	if raw == "" {
 		return fmt.Errorf("auth.directory.url is required (the service's issuer, for example https://accounts.example.test)")
 	}
-	if strings.IndexFunc(raw, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
-		return fmt.Errorf("auth.directory.url %q holds a space or a control character", raw)
-	}
-	issuer := d.Issuer()
-	var scheme string
-	switch {
-	case strings.HasPrefix(raw, "https://"):
-		scheme = "https"
-	case strings.HasPrefix(raw, "http://"):
-		scheme = "http"
-	default:
-		return fmt.Errorf("auth.directory.url %q must start with https:// (or http:// with allow_plain_http, loopback only)", raw)
-	}
-	if raw == scheme+"://" {
-		return fmt.Errorf("auth.directory.url %q has no host", raw)
-	}
-	u, err := url.Parse(issuer)
+	u, scheme, err := checkDirectoryOrigin("auth.directory.url", raw, d.Issuer())
 	if err != nil {
-		return fmt.Errorf("auth.directory.url %q does not parse: %w", raw, err)
-	}
-	switch {
-	case u.User != nil:
-		return fmt.Errorf("auth.directory.url %q carries user info; it must be an origin (scheme, host, optional port)", raw)
-	case u.Path != "" || u.RawPath != "" || u.Opaque != "":
-		return fmt.Errorf("auth.directory.url %q has a path; it must be an origin (scheme, host, optional port)", raw)
-	case u.RawQuery != "" || u.ForceQuery || strings.Contains(issuer, "?"):
-		return fmt.Errorf("auth.directory.url %q has a query; it must be an origin (scheme, host, optional port)", raw)
-	case u.Fragment != "" || strings.Contains(issuer, "#"):
-		return fmt.Errorf("auth.directory.url %q has a fragment; it must be an origin (scheme, host, optional port)", raw)
-	case u.Hostname() == "":
-		return fmt.Errorf("auth.directory.url %q has no host", raw)
-	}
-	if strings.HasSuffix(u.Host, ":") {
-		return fmt.Errorf("auth.directory.url %q has an empty port; remove the ':' or name a port", raw)
-	}
-	if p := u.Port(); p != "" {
-		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != p {
-			return fmt.Errorf("auth.directory.url %q has an invalid port %q", raw, p)
-		}
-	}
-	// The issuer is compared byte for byte, so its host must have one
-	// spelling only: plain ASCII, an IPv4 address or a bracketed IPv6
-	// address, never a percent-escape (which the parser decodes, so an
-	// invisible or space character could hide in it).
-	if err := checkDirectoryHost(raw, strings.TrimPrefix(issuer, scheme+"://")); err != nil {
 		return err
-	}
-	// Belt and braces: with the host checked, the parser's own spelling of
-	// the origin is the issuer itself.
-	if plain := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String(); plain != issuer {
-		return fmt.Errorf("auth.directory.url %q is not written plainly; write it as scheme://host or scheme://host:port, the host in ASCII letters, digits, '-' and '.'", raw)
 	}
 	loopback := isLoopbackDirectoryHost(u.Hostname())
 	allowPlain := bool(d.AllowPlainHTTP)
@@ -261,33 +213,107 @@ func validateDirectoryURL(d *DirectoryConfig) error {
 	return nil
 }
 
+// CheckDirectoryIssuer reports why issuer cannot be a directory's issuer
+// (auth.directory.url as normalized by DirectoryConfig.Issuer), or nil: it
+// must be an origin written plainly (https or http, a host, an optional
+// port) with no path, query, fragment, user info or trailing slash. It is
+// the check config load applies to auth.directory.url, for a caller that
+// holds an issuer from elsewhere (an enrolment). The plain-HTTP rules
+// (allow_plain_http, a loopback host) need the configuration and are not
+// checked here.
+func CheckDirectoryIssuer(issuer string) error {
+	if issuer == "" {
+		return fmt.Errorf("the issuer is empty")
+	}
+	_, _, err := checkDirectoryOrigin("issuer", issuer, issuer)
+	return err
+}
+
+// checkDirectoryOrigin checks that raw, whose normalized form is issuer, is
+// an origin written plainly, and returns it parsed with its scheme. field
+// names what raw is in the messages.
+func checkDirectoryOrigin(field, raw, issuer string) (*url.URL, string, error) {
+	if strings.IndexFunc(raw, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return nil, "", fmt.Errorf("%s %q holds a space or a control character", field, raw)
+	}
+	var scheme string
+	switch {
+	case strings.HasPrefix(raw, "https://"):
+		scheme = "https"
+	case strings.HasPrefix(raw, "http://"):
+		scheme = "http"
+	default:
+		return nil, "", fmt.Errorf("%s %q must start with https:// (or http:// with allow_plain_http, loopback only)", field, raw)
+	}
+	if raw == scheme+"://" {
+		return nil, "", fmt.Errorf("%s %q has no host", field, raw)
+	}
+	u, err := url.Parse(issuer)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s %q does not parse: %w", field, raw, err)
+	}
+	switch {
+	case u.User != nil:
+		return nil, "", fmt.Errorf("%s %q carries user info; it must be an origin (scheme, host, optional port)", field, raw)
+	case u.Path != "" || u.RawPath != "" || u.Opaque != "":
+		return nil, "", fmt.Errorf("%s %q has a path; it must be an origin (scheme, host, optional port)", field, raw)
+	case u.RawQuery != "" || u.ForceQuery || strings.Contains(issuer, "?"):
+		return nil, "", fmt.Errorf("%s %q has a query; it must be an origin (scheme, host, optional port)", field, raw)
+	case u.Fragment != "" || strings.Contains(issuer, "#"):
+		return nil, "", fmt.Errorf("%s %q has a fragment; it must be an origin (scheme, host, optional port)", field, raw)
+	case u.Hostname() == "":
+		return nil, "", fmt.Errorf("%s %q has no host", field, raw)
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return nil, "", fmt.Errorf("%s %q has an empty port; remove the ':' or name a port", field, raw)
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != p {
+			return nil, "", fmt.Errorf("%s %q has an invalid port %q", field, raw, p)
+		}
+	}
+	// The issuer is compared byte for byte, so its host must have one
+	// spelling only: plain ASCII, an IPv4 address or a bracketed IPv6
+	// address, never a percent-escape (which the parser decodes, so an
+	// invisible or space character could hide in it).
+	if err := checkDirectoryHost(field, raw, strings.TrimPrefix(issuer, scheme+"://")); err != nil {
+		return nil, "", err
+	}
+	// Belt and braces: with the host checked, the parser's own spelling of
+	// the origin is the issuer itself.
+	if plain := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String(); plain != issuer {
+		return nil, "", fmt.Errorf("%s %q is not written plainly; write it as scheme://host or scheme://host:port, the host in ASCII letters, digits, '-' and '.'", field, raw)
+	}
+	return u, scheme, nil
+}
+
 // directoryHostRule is how a refusal of the host says what is accepted.
 const directoryHostRule = "write the host plainly: ASCII letters, digits, '-' and '.' (an internationalized name in its xn-- form), an IPv4 address, or an IPv6 address in brackets"
 
-// checkDirectoryHost checks the authority (host and optional port) of an
-// auth.directory.url that has already parsed as an origin: no percent sign
+// checkDirectoryHost checks the authority (host and optional port) of raw
+// (field names it), which has already parsed as an origin: no percent sign
 // anywhere, and the host either a bracketed IPv6 address or made of ASCII
 // letters, digits, '-' and '.' only (which an IPv4 address is). The port
 // was checked by the caller.
-func checkDirectoryHost(raw, authority string) error {
+func checkDirectoryHost(field, raw, authority string) error {
 	if strings.Contains(authority, "%") {
-		return fmt.Errorf("auth.directory.url %q has a percent sign in its host; %s", raw, directoryHostRule)
+		return fmt.Errorf("%s %q has a percent sign in its host; %s", field, raw, directoryHostRule)
 	}
 	if strings.HasPrefix(authority, "[") {
 		end := strings.IndexByte(authority, ']')
 		if end < 0 {
-			return fmt.Errorf("auth.directory.url %q has an unclosed '[' in its host; %s", raw, directoryHostRule)
+			return fmt.Errorf("%s %q has an unclosed '[' in its host; %s", field, raw, directoryHostRule)
 		}
 		inner := authority[1:end]
 		if !strings.Contains(inner, ":") || net.ParseIP(inner) == nil {
-			return fmt.Errorf("auth.directory.url %q: %q in brackets is not an IPv6 address; %s", raw, inner, directoryHostRule)
+			return fmt.Errorf("%s %q: %q in brackets is not an IPv6 address; %s", field, raw, inner, directoryHostRule)
 		}
 		return nil
 	}
 	host, _, _ := strings.Cut(authority, ":")
 	for i := 0; i < len(host); i++ {
 		if !isPlainHostByte(host[i]) {
-			return fmt.Errorf("auth.directory.url %q: the host %q holds a character other than ASCII letters, digits, '-' and '.'; %s", raw, host, directoryHostRule)
+			return fmt.Errorf("%s %q: the host %q holds a character other than ASCII letters, digits, '-' and '.'; %s", field, raw, host, directoryHostRule)
 		}
 	}
 	return nil
