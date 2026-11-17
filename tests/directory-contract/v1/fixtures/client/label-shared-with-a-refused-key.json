@@ -1,0 +1,96 @@
+{
+  "name": "label-shared-with-a-refused-key",
+  "description": "Label uniqueness counts every element of a user's keys, a key the reader refuses for another reason included (rule 9). bob's key laptop shares its label with a key line the reader's parser refuses: neither is used, and bob stands on his key desk. carol's key laptop shares its label with a key whose expires is a bare date: neither is used, and carol, left with none, is skipped. ada stands.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "contract": 1,
+      "organization": "example",
+      "version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "generated_at": "2026-11-16T06:00:00Z",
+      "rules": {
+        "version": 0
+      },
+      "users": [
+        {
+          "name": "ada",
+          "admin": true,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+              "label": "laptop"
+            }
+          ]
+        },
+        {
+          "name": "bob",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO8fd5tNsoV/rj9hOkas4nY6UkrUTJ5sYB5U4uqCxtlR",
+              "label": "desk"
+            },
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+              "label": "laptop"
+            },
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA",
+              "label": "laptop"
+            }
+          ]
+        },
+        {
+          "name": "carol",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDGGt3mM1CzzhTeoSaXhz5LTrMGKtctoIugKBssGGpKi",
+              "label": "laptop"
+            },
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKYXkBjz6tqlFzJhkm2QLBRr5EsaUYsMJcFRaF9U5hBB",
+              "label": "laptop",
+              "expires": "2027-01-01"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          }
+        ]
+      },
+      {
+        "name": "bob",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO8fd5tNsoV/rj9hOkas4nY6UkrUTJ5sYB5U4uqCxtlR",
+            "label": "desk"
+          }
+        ]
+      }
+    ],
+    "skipped": [
+      {
+        "entry": 2,
+        "reason": "no-usable-key"
+      }
+    ]
+  }
+}

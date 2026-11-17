@@ -770,6 +770,101 @@ func TestBoundaryFixtures(t *testing.T) {
 	}
 }
 
+// TestFixturesTurnOnTheirPoint checks the client fixtures that pin one
+// ruling turn on that point alone: with the one piece of text the fixture is
+// about replaced, its body decodes as a good answer skipping the number of
+// entries given, and the user named (when one is) stands with exactly the
+// keys labelled. A failed fixture so repaired is good, so only that point
+// refuses it; a good fixture so changed admits the entry it skipped, or
+// (duplicate-inside-an-ignored-member) skips the entry the duplicate moved
+// into, or (surrogate-pair, each pair broken) is refused.
+func TestFixturesTurnOnTheirPoint(t *testing.T) {
+	// labelLaptopBareDate is carol's second key in
+	// label-shared-with-a-refused-key, as the fixture's body indents it.
+	const labelLaptopBareDate = "\"label\": \"laptop\",\n              \"expires\": \"2027-01-01\""
+	for _, tc := range []struct {
+		name, old, new string
+		skipped        int
+		user, labels   string // the user's keys after the change, by label
+		refused        bool   // the change makes the answer refused
+	}{
+		{name: "contract-decimal", old: `"contract":1.0,`, new: `"contract":1,`},
+		{name: "contract-exponent", old: `"contract":1e0,`, new: `"contract":1,`},
+		{name: "unpaired-surrogate", old: `"note\ud800"`, new: `"note"`},
+		{name: "huge-number", old: `"admin":1e400`, new: `"admin":false`},
+		{name: "key-expires-lowercase-t", old: `2027-01-01t00:00:00Z`, new: `2027-01-01T00:00:00Z`},
+		{name: "key-expires-lowercase-z", old: `2027-01-01T00:00:00z`, new: `2027-01-01T00:00:00Z`},
+		{name: "key-expires-second-60", old: `23:59:60Z`, new: `23:59:59Z`},
+		{name: "key-expires-offset-24", old: `+24:00`, new: `+23:00`},
+		{name: "key-expires-one-digit-hour", old: `T0:00:00Z`, new: `T00:00:00Z`},
+		{name: "key-expires-offset-minus-zero", old: `-00:00`, new: `-00:0`, skipped: 1},
+		{name: "key-expires-fraction", old: `00.5Z`, new: `00.Z`, skipped: 1},
+		// bob's refused line relabelled: his laptop key is used again
+		// beside desk (carol is still skipped).
+		{
+			name:    "label-shared-with-a-refused-key",
+			old:     "\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA\",\n              \"label\": \"laptop\"",
+			new:     "\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA\",\n              \"label\": \"spare\"",
+			skipped: 1, user: "bob", labels: "desk laptop",
+		},
+		// carol's bare-date key relabelled: her laptop key is used again
+		// and she stands.
+		{
+			name:    "label-shared-with-a-refused-key",
+			old:     labelLaptopBareDate,
+			new:     strings.Replace(labelLaptopBareDate, `"laptop"`, `"spare"`, 1),
+			skipped: 0, user: "carol", labels: "laptop",
+		},
+		{name: "duplicate-inside-an-ignored-member", old: `"profile":{"display":"Ada","display":"A"}`, new: `"display":"Ada","display":"A"`, skipped: 1},
+		{name: "surrogate-pair", old: `"note\ud83d\ude00"`, new: `"note\ud83d\u0041"`, refused: true},
+		{name: "surrogate-pair", old: `"key\ud83d\udd11"`, new: `"key\ud83d\u0041"`, refused: true},
+		{name: "top-level-duplicate-escaped-name", old: `"\u0063ontract":1,`, new: `"note":1,`},
+		{name: "entry-duplicate-escaped-name", old: `"\u0061dmin":false,`, new: `"note":false,`, user: "bob", labels: "laptop"},
+		{name: "key-expires-boundaries-accepted", old: `"2028-02-29T`, new: `"2027-02-29T`, skipped: 1},
+		{name: "key-expires-boundaries-accepted", old: `+23:59`, new: `+23:60`, skipped: 1},
+		{name: "key-expires-boundaries-refused", old: `"2027-02-29T`, new: `"2028-02-29T`, skipped: 2, user: "bob", labels: "laptop"},
+		{name: "key-expires-boundaries-refused", old: `+00:60`, new: `+00:59`, skipped: 2, user: "turing", labels: "laptop"},
+		{name: "key-expires-boundaries-refused", old: `Z[UTC]`, new: `Z`, skipped: 2, user: "carol", labels: "laptop"},
+	} {
+		c := loadClientFixture(t, "fixtures/client/"+tc.name+".json")
+		body := string(c.served(t).body)
+		if n := strings.Count(body, tc.old); n != 1 {
+			t.Errorf("%s: the body holds %q %d times, want once", tc.name, tc.old, n)
+			continue
+		}
+		l, err := DecodeList([]byte(strings.Replace(body, tc.old, tc.new, 1)), worldOrg)
+		if tc.refused {
+			if err == nil {
+				t.Errorf("%s with %q for %q: accepted, want refused: %s", tc.name, tc.new, tc.old, describeList(l))
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s with %q for %q: refused: %v", tc.name, tc.new, tc.old, err)
+			continue
+		}
+		if len(l.Skipped) != tc.skipped {
+			t.Errorf("%s with %q for %q: %s, want %d skipped", tc.name, tc.new, tc.old, describeList(l), tc.skipped)
+		}
+		if tc.user == "" {
+			continue
+		}
+		labels := "(not admitted)"
+		for _, u := range l.Users {
+			if u.Name == tc.user {
+				var ls []string
+				for _, k := range u.Keys {
+					ls = append(ls, k.Label)
+				}
+				labels = strings.Join(ls, " ")
+			}
+		}
+		if labels != tc.labels {
+			t.Errorf("%s with %q for %q: %s has keys %q, want %q", tc.name, tc.new, tc.old, tc.user, labels, tc.labels)
+		}
+	}
+}
+
 // TestDuplicateKeyVariants checks client/duplicate-key.json holds what its
 // description says: lines that differ only by a comment or by whitespace,
 // each pair the same key blob, so a reader comparing text would admit them.

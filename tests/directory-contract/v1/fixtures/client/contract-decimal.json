@@ -1,0 +1,16 @@
+{
+  "name": "contract-decimal",
+  "description": "contract is written 1.0: the number one, but not written as the integer 1, so the whole answer is refused (rule 6). The body is given as text so that it reaches the client exactly as written.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "text": "{\"contract\":1.0,\"organization\":\"example\",\"version\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"generated_at\":\"2026-11-16T06:00:00Z\",\"rules\":{\"version\":0},\"users\":[{\"name\":\"ada\",\"admin\":true,\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe\",\"label\":\"laptop\"}]}]}"
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "name": "huge-number",
+  "description": "Numbers too large for a reader to hold: bob's admin is 1e400, where a reader reads a boolean, so bob is skipped as malformed; carol carries 1e400, -1e400 and a forty-digit integer only in members a reader ignores (in her entry and in her key), as does the top level, so they are ignored and carol stands beside ada. Such a number never refuses the answer (rules 6 and 7). The body is given as text so that the numbers reach the client exactly as written.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "text": "{\"contract\":1,\"organization\":\"example\",\"version\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"generated_at\":\"2026-11-16T06:00:00Z\",\"rules\":{\"version\":0},\"sequence\":1e400,\"users\":[{\"name\":\"ada\",\"admin\":true,\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe\",\"label\":\"laptop\"}]},{\"name\":\"bob\",\"admin\":1e400,\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e\",\"label\":\"laptop\"}]},{\"name\":\"carol\",\"admin\":false,\"rank\":1e400,\"serial\":1234567890123456789012345678901234567890,\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO8fd5tNsoV/rj9hOkas4nY6UkrUTJ5sYB5U4uqCxtlR\",\"label\":\"laptop\",\"bits\":-1e400}]}]}"
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          }
+        ]
+      },
+      {
+        "name": "carol",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO8fd5tNsoV/rj9hOkas4nY6UkrUTJ5sYB5U4uqCxtlR",
+            "label": "laptop"
+          }
+        ]
+      }
+    ],
+    "skipped": [
+      {
+        "entry": 1,
+        "reason": "malformed"
+      }
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "entry-duplicate-escaped-name",
+  "description": "bob's entry names admin twice, once as \"admin\" and once as \"\\u0061dmin\", both false. Member names are compared after JSON unescaping (Conventions), so the two are one name given twice: bob is skipped as duplicate-member (rule 7), and the list stands with ada. A reader comparing names as written would see an unknown member and admit bob. The body is given as text so that the escape reaches the client exactly as written.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "text": "{\"contract\":1,\"organization\":\"example\",\"version\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"generated_at\":\"2026-11-16T06:00:00Z\",\"rules\":{\"version\":0},\"users\":[{\"name\":\"ada\",\"admin\":true,\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe\",\"label\":\"laptop\"}]},{\"name\":\"bob\",\"admin\":false,\"\\u0061dmin\":false,\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e\",\"label\":\"laptop\"}]}]}"
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          }
+        ]
+      }
+    ],
+    "skipped": [
+      {
+        "entry": 1,
+        "reason": "duplicate-member"
+      }
+    ]
+  }
+}

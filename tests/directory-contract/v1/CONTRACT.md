@@ -29,14 +29,50 @@ as "rule N".
 
 - HTTPS, JSON, UTF-8 (rule 4). Unknown members are ignored by both sides,
   except where a rule below refuses them.
+- **Member names** are compared after JSON unescaping, wherever this
+  document speaks of a member's name or of a member named twice:
+  `"cont\u0072act"` names the member `contract`, so an object holding
+  it beside `"contract"` names `contract` twice.
+- **Every JSON answer.** A client holds every answer body it reads as JSON
+  (the enrolment 201, the token 200, the directory 200, and every error
+  body) to four checks, throughout the body, member names and members a
+  reader ignores included, and a service's answers meet them: it is
+  valid UTF-8; no string in it escapes an unpaired UTF-16 surrogate (a
+  `\ud800` to `\udbff` escape not followed at once by a `\udc00` to
+  `\udfff` escape, or a `\udc00` to `\udfff` escape that does not follow
+  one: `\ud800` alone, say), while an escaped pair (`\ud83d\ude00`)
+  is text like any other; it is one JSON object with nothing after it but
+  whitespace; and it nests no deeper than 16 levels, counted as rule 6
+  says. *Client:* invalid UTF-8 and an unpaired surrogate are refused,
+  never repaired (by a replacement character or otherwise). An answer that
+  fails a check is one the client cannot read: a token or directory answer
+  so failing is a failed refresh; an error body so failing is an error the
+  client does not recognise (below); and an enrolment 201 so failing is,
+  for the client, a lost enrolment (section 1, "A lost answer"): it takes
+  no client id from a body it cannot read. Rule 6 adds the directory
+  answer's own checks.
 - Times are RFC 3339 (section 5.6) instants in UTC, written with `Z` and
-  whole seconds.
+  whole seconds. (What a client accepts in a key's `expires` is rule 7's
+  date-time.)
 - **Errors on `/v1`** are `{"error":{"code":"<CODE>","message":"<text>"}}`,
   with the status the tables give. `code` is stable; `message` is for
   people and may change: a client never compares it.
 - **Errors from the token endpoint** are OAuth's (RFC 6749, section 5.2):
   `{"error":"<code>","error_description":"<text>"}`. `error_description`
   is for people: a client logs it, quoted, and never compares it.
+- *Client:* locates an error's code by exactly these member names, and
+  by no other spelling or case: `error` at the body's top level, holding
+  either a non-empty string (the OAuth shape, the code itself) or an
+  object whose member `code` is a non-empty string (the `/v1` shape). A
+  member of another spelling or case beside them (`Error`, `errors`,
+  `CODE`) is ignored like any unknown member:
+  `{"error":{"code":"SERVER_DISABLED","CODE":"x"}}` is `SERVER_DISABLED`.
+  The client recognises no code in a body without those members, in a
+  body that fails the checks every JSON answer meets (above), or in a body
+  that names a member twice in either object it reads (the body's top
+  level, or the object in `error`), whichever member that is: it never
+  picks one of two candidates. An error it does not recognise is still a
+  failed refresh (or a failed enrolment) by its status.
 - Every answer on `/v1` and `/oauth2` carries `Cache-Control: no-store`.
 - Cookies are never read on `/v1` or `/oauth2`.
 - While the service is starting (its storage not yet checked), `/v1`
@@ -115,14 +151,16 @@ object. The service keeps the key as the JSON text exactly as sent.
 | 429 `RATE_LIMITED` | | the caller has made too many enrolment requests; `Retry-After` says when to try again (rule 2) |
 | 503 `UNAVAILABLE` | | the service could not reach its storage, lost it while committing, or did not finish within 15 seconds: **the enrolment may or may not have happened**. Treat it as a lost answer (below) |
 
-The client checks the 201: `contract` is 1; `client_id` matches
-`^srv_[0-9a-f]{32}$`; `issuer` is the issuer it was configured with, byte
-for byte; `token_endpoint` is `<issuer>/oauth2/token`; `organization` is
-accepted (rule 5). It stores `client_id`, `issuer`, `token_endpoint` and
+The client checks the 201: it meets the checks every JSON answer meets
+(Conventions; a 201 that fails them is a lost answer, below); `contract`
+is 1; `client_id` matches `^srv_[0-9a-f]{32}$`; `issuer` is the issuer it
+was configured with, byte for byte; `token_endpoint` is
+`<issuer>/oauth2/token`; `organization` is accepted (rule 5). It stores `client_id`, `issuer`, `token_endpoint` and
 `organization` beside its key, and uses that token endpoint from then on
 (rule 13). A failed enrolment discards the key pair it made.
 
-**A lost answer** (a 201 that never arrived, a 503, a timeout). If the
+**A lost answer** (a 201 that never arrived or that the client cannot
+read, a 503, a timeout). If the
 service committed the enrolment, the code is spent and the server exists,
 under a client id the client never learned. Retrying with the same code then
 answers `ENROLMENT_CODE_SPENT`, which after a lost answer means exactly
@@ -204,7 +242,8 @@ forget it at `exp + 30 s`, when the window refuses it anyway).
 
 Every 4xx and 503 carries `Cache-Control: no-store`.
 
-A client takes the 200 only when it carries `access_token` (a non-empty
+A client takes the 200 only when it meets the checks every JSON answer
+meets (Conventions) and carries `access_token` (a non-empty
 string), `token_type` `bearer` (any case) and `expires_in` (a positive
 integer), and `scope`, when present, includes `directory:read`. Anything
 else is a failed refresh.
@@ -338,7 +377,7 @@ Each user is (rule 8):
 |---|---|---|
 | `name` | string | The user name on every server: `^[a-z][a-z0-9-]{0,62}$`. Never reused for another person, even after the person is removed. Servers know a person only by this name, so a service that changes a person's name has made, to every server, a new user. Never `root`, `admin`, `git`, `shed`, `system` or `nobody`; an implementation may refuse further names. Unique in the list |
 | `admin` | boolean | Whether the user is an admin on the servers |
-| `keys` | array | Always present. Each key's `key` is the canonical line below; `label` as rule 9 says; `expires`, when present, is the instant the key stops being valid, an RFC 3339 date-time (section 5.6) and nothing else (omitted when it never expires). Ordered by `label` (bytewise). No key is in the list twice, under one user or two (a key's identity is its key blob, rule 7) |
+| `keys` | array | Always present. Each key's `key` is the canonical line below; `label` as rule 9 says; `expires`, when present, is the instant the key stops being valid, an RFC 3339 date-time (section 5.6) in UTC with `Z` and nothing else (omitted when it never expires; rule 7 gives what a client accepts). Ordered by `label` (bytewise). No key is in the list twice, under one user or two (a key's identity is its key blob, rule 7) |
 
 **Who is listed** is the service's own business. It never lists a user
 with no key, nor a key that has expired; a user holds at most 20 keys.
@@ -353,7 +392,7 @@ it in members a client ignores (rule 8).
 | `admin` | `Admin` |
 | `keys[].key` | `UserKeyConfig.Key` |
 | `keys[].label` | `Label` |
-| `keys[].expires` | `Expires`: an RFC 3339 date-time and nothing else. A bare date, which shed's own configuration accepts, is not one: a key whose `expires` is a date is not used (rule 7) |
+| `keys[].expires` | `Expires`: a date-time as rule 7 gives it and nothing else. A bare date, which shed's own configuration accepts, is not one: a key whose `expires` is a date is not used (rule 7) |
 | — | `Script`: never sent; absent means false |
 
 **The list is authoritative, empty or not.** `users: []` means nobody but
@@ -381,8 +420,9 @@ a service never relies on that.
 1. **Sizes.** *Service:* never serves a directory body over 8 MiB, nor a
    token or enrolment answer over 64 KiB. *Client:* refuses a larger one,
    counted on the bytes it reads (with no content decoding, so the bytes
-   read are the body's), and reads no further. An error body is read to at
-   most 4 KiB.
+   read are the body's). It may read one byte past the limit, to learn that
+   the body is larger than the limit (a body of exactly the limit is
+   accepted), and reads no further. An error body is read to at most 4 KiB.
 2. **`Retry-After`.** *Service:* sends it only on 429 and 503, and only as
    delta-seconds (a non-negative integer), once. *Client:* reads it only
    on a 429 or a 503 and ignores it on any other status. It accepts
@@ -403,22 +443,45 @@ a service never relies on that.
 5. **The organization** matches `^[a-z][a-z0-9-]{0,62}$`. *Client:* with an
    organization configured, refuses an answer naming another; with none
    configured, compares with the organization its enrolment answer named.
-6. **The directory answer's top level.** `contract` present and the
-   integer 1; `organization` per rule 5; `version` 64 lowercase hex digits;
-   `users` an array; no member named twice at the top level; nothing after
-   the JSON value but whitespace; valid UTF-8 throughout, members a reader
-   ignores included; nesting no deeper than 16. Each object and each array
-   adds a level: the top-level object is level 1, an object or array that
-   is a member's value or an array's element is one level deeper than what
-   holds it, and other values add none; members a reader ignores count like
-   any other. *Client:* any failure refuses the whole answer (a failed
-   refresh). Invalid UTF-8 is refused, never repaired (by a replacement
-   character or otherwise).
+6. **The directory answer's top level.** `contract` present and written
+   as the integer 1 exactly: the one character `1` (`1.0`, `1e0` and every
+   other spelling of the number one are refused); `organization` per rule
+   5; `version` 64 lowercase hex digits; `users` an array; no member named
+   twice at the top level. And, as for every JSON answer (Conventions),
+   throughout the body, members a reader ignores included: valid UTF-8; no
+   escaped unpaired UTF-16 surrogate; one JSON object with nothing after
+   it but whitespace; nesting no deeper than 16. Each object and each
+   array adds a level: the top-level object is level 1, an object or array
+   that is a member's value or an array's element is one level deeper than
+   what holds it, and other values add none; members a reader ignores
+   count like any other. *Client:* any failure, of these checks or of the
+   ones every JSON answer meets, refuses the whole answer (a failed
+   refresh). Invalid UTF-8 and an unpaired surrogate are refused, never
+   repaired (by a replacement character or otherwise). A number too large
+   for a reader to hold (`1e400`, an integer of forty digits) is not a
+   failure of this rule: it is judged only where a reader reads the member
+   that holds it, by that member's own check (`contract` so written is not
+   the integer 1; in an entry it is a value of the wrong type, rule 7), and
+   inside a member a reader ignores it is ignored. It never refuses the
+   answer by itself.
 7. **Each user is decoded alone.** A user is an object with `name`
    (string), `admin` (boolean) and `keys` (array); each key an object with
    `key` (string), `label` (string) and optional `expires` (string).
    Members a reader does not know are ignored. A bad entry skips that
    user, never the list.
+
+   **Members named twice** (their names compared after unescaping,
+   Conventions) are looked for in three places only: the answer's top
+   level (rule 6), each user object and each key object. A
+   member named twice inside a member a reader ignores (`rules`, or a
+   member a service adds to a user or a key), at any depth, is not looked
+   at: it neither refuses the answer nor skips the entry.
+
+   **A number too large for a reader to hold**, as the value of a member
+   the reader reads in an entry (`admin`, say), is a value of the wrong
+   type: the entry is `malformed`. As the value of a member the reader
+   ignores, or anywhere inside one, it is ignored. It never refuses the
+   answer (rule 6).
 
    **A key's identity is its key blob**: the algorithm and the key bytes
    the base64 field decodes to, never the text of the line. Two lines that
@@ -428,10 +491,29 @@ a service never relies on that.
    admin holds.
 
    **A key is used** when the reader's parser accepts `key`, `label` is as
-   rule 9 says, and `expires` is absent or an RFC 3339 date-time (section
-   5.6); a bare date, or a date-time without an offset, is not one. A key
-   that is not used is not an error: the user stands on its other keys.
-   Whether `expires` is past is not part of this (see "Keeping the list").
+   rule 9 says, and `expires` is absent or a date-time as below; a bare
+   date, or a date-time without an offset, is not one. A key that is not
+   used is not an error: the user stands on its other keys. Whether
+   `expires` is past is not part of this (see "Keeping the list").
+
+   **The date-time of `expires`.** *Service:* writes an RFC 3339 date-time
+   (section 5.6) in UTC with `Z`, in whole seconds. *Client:* accepts RFC
+   3339's date-time with these limits, and nothing else: `YYYY-MM-DD`, an
+   upper-case `T`, `hh:mm:ss`, then optionally a fraction (a `.` and one
+   or more digits; nothing but a dot introduces one), then an upper-case
+   `Z` or a numeric offset `+hh:mm` or `-hh:mm`. Every field has exactly
+   its digits (four for the year, two for each other) and is within its
+   range: the month 01 to 12, the day within its month (leap years
+   counted), the hour 00 to 23, the minute and the second 00 to 59 (a
+   second of 60, a leap second, is never accepted), the offset's hour 00
+   to 23 and its minute 00 to 59. An offset of `-00:00` is accepted, as the
+   same instant as `Z`. A lower-case `t` or `z` (which RFC 3339 itself
+   allows), a one-digit field, an offset of `+24:00`, anything after the
+   `Z` or the offset, or anything else is not a date-time here: that key is
+   not used. A client keeps at least the whole seconds of an accepted
+   `expires`, and may drop the digits of a fraction beyond what it can
+   represent (shed keeps nanoseconds: `.123456789123` is kept as
+   `.123456789`).
 
    **Counting.** Names and keys are counted in every entry that holds
    them, whether or not that entry is skipped for another reason: an
@@ -463,7 +545,11 @@ a service never relies on that.
 9. **Labels.** *Service:* sends 1 to 64 bytes of UTF-8 with no control
    character, unique within the user. *Client:* needs only a non-empty
    label, unique within the user (keys of a user that share a label are
-   none of them used), and quotes labels when it prints them.
+   none of them used), and quotes labels when it prints them. Uniqueness
+   counts every element of the user's `keys`, a key the reader does not
+   use for another reason included (a line its parser refuses, an
+   `expires` that is not a date-time): two elements that share a label are
+   neither of them used, and the user stands on its other keys.
 10. **The assertion.** *Service:* accepts `typ` absent, `JWT`, or
     `client-authentication+jwt` (in any case, with an optional
     `application/` prefix), and refuses every other `typ` (`at+jwt`
@@ -789,7 +875,10 @@ client must classify it:
   an array of strings each sent as its own header line (a header given
   more than once). The body is one of: `response.body`, a JSON value (sent
   as JSON); `response.text`, sent byte for byte as its UTF-8, for a body
-  that is not one JSON value or that names a member twice; or
+  that is not one JSON value or that names a member twice, or whose exact
+  text is the point (a number written `1.0` or `1e400`, an escape such as
+  `\ud800`), which a harness reading `body` as a JSON value might rewrite;
+  or
   `response.body_base64`, the body's exact bytes in padded standard base64,
   for a body a JSON string cannot carry (bytes that are not UTF-8). A
   `response` with none of the three has no body.

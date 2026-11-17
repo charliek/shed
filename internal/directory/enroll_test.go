@@ -15,6 +15,11 @@ import (
 // good201 is the recorded enroll-ok answer, its client id filled.
 const good201 = `{"client_id":"` + enrolledID + `","contract":1,"issuer":"https://accounts.example.test","organization":"example","token_endpoint":"https://accounts.example.test/oauth2/token"}`
 
+// nestedArrays is n arrays, each inside the one before: n levels by rule 6.
+func nestedArrays(n int) string {
+	return strings.Repeat("[", n) + strings.Repeat("]", n)
+}
+
 func enrolAgainst(t *testing.T, fs *fakeService, org string) (*Enrolment, error) {
 	t.Helper()
 	clock := worldClock
@@ -132,13 +137,19 @@ func Test201Checks(t *testing.T) {
 		})
 	}
 	// The controls: the recorded 201 enrols, with or without the
-	// organization configured.
+	// organization configured, and so does one carrying an escaped
+	// surrogate pair and an ignored member nesting it 16 levels deep.
 	for _, org := range []string{"", "example"} {
 		fs := newFakeService(t)
 		fs.enroll = []served{{status: 201, body: []byte(good201)}}
 		if _, err := enrolAgainst(t, fs, org); err != nil {
 			t.Errorf("organization %q: %v", org, err)
 		}
+	}
+	fs := newFakeService(t)
+	fs.enroll = []served{{status: 201, body: []byte(strings.Replace(good201, `"contract":1`, `"contract":1,"p":"\ud83d\ude00","x":`+nestedArrays(15), 1))}}
+	if _, err := enrolAgainst(t, fs, ""); err != nil {
+		t.Errorf("a pair and 16 levels: %v", err)
 	}
 }
 
@@ -161,7 +172,13 @@ func TestLostEnrolment(t *testing.T) {
 		{"200 with a good body", served{status: 200, body: []byte(good201)}, true},
 		{"202 with a good body", served{status: 202, body: []byte(good201)}, true},
 		{"204", served{status: 204}, true},
+		// A 201 that fails the checks every JSON answer meets (CONTRACT.md,
+		// Conventions) is one the client cannot read: no client id is
+		// taken from it, so it is lost.
 		{"201 with a lone surrogate", served{status: 201, body: []byte(strings.Replace(good201, `"contract":1`, `"contract":1,"x":"\udc00"`, 1))}, true},
+		{"201 not valid UTF-8", served{status: 201, body: []byte(strings.Replace(good201, `"contract":1`, "\"contract\":1,\"x\":\"\xff\"", 1))}, true},
+		{"201 with data after it", served{status: 201, body: []byte(good201 + ` {}`)}, true},
+		{"201 nested 17 deep", served{status: 201, body: []byte(strings.Replace(good201, `"contract":1`, `"contract":1,"x":`+nestedArrays(16), 1))}, true},
 		{"429", served{status: 429, header: http.Header{"Retry-After": {"60"}}, body: []byte(`{"error":{"code":"RATE_LIMITED","message":"m"}}`)}, false},
 	} {
 		fs := newFakeService(t)

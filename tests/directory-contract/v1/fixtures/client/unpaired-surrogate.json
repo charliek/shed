@@ -1,0 +1,16 @@
+{
+  "name": "unpaired-surrogate",
+  "description": "A member name, in a member a reader ignores, holds the escape \\ud800: half of a UTF-16 surrogate pair with no other half. A string escaping an unpaired surrogate is not valid text, wherever it stands (member names and members a reader ignores included), so the whole answer is refused (rule 6). It is never repaired, by a replacement character or otherwise. The body is given as text so that the escape reaches the client exactly as written.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "text": "{\"contract\":1,\"organization\":\"example\",\"version\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"generated_at\":\"2026-11-16T06:00:00Z\",\"rules\":{\"version\":0},\"users\":[{\"name\":\"ada\",\"admin\":true,\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe\",\"label\":\"laptop\"}]},{\"name\":\"bob\",\"admin\":false,\"note\\ud800\":\"x\",\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e\",\"label\":\"laptop\"}]}]}"
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

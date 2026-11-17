@@ -518,6 +518,13 @@ func TestTokenAnswerChecks(t *testing.T) {
 		`{"access_token":"t","token_type":"bearer","expires_in":600,"access_token":"u"}`:           false,
 		`{"access_token":"t","token_type":"bearer","expires_in":600} {}`:                           false,
 		`[]`: false,
+		// The checks every JSON answer meets (CONTRACT.md, Conventions),
+		// in a member the client ignores.
+		`{"access_token":"t","token_type":"bearer","expires_in":600,"x":"\ud800"}`:                 false,
+		`{"access_token":"t","token_type":"bearer","expires_in":600,"x":"\ud83d\ude00"}`:           true,
+		"{\"access_token\":\"t\",\"token_type\":\"bearer\",\"expires_in\":600,\"x\":\"\xff\"}":     false,
+		`{"access_token":"t","token_type":"bearer","expires_in":600,"x":` + nestedArrays(15) + `}`: true,
+		`{"access_token":"t","token_type":"bearer","expires_in":600,"x":` + nestedArrays(16) + `}`: false,
 	} {
 		fs := newFakeService(t)
 		fs.tokens = []served{{status: 200, header: goodToken.header, body: []byte(body)}}
@@ -637,6 +644,9 @@ func TestFailureStatuses(t *testing.T) {
 		{StepDirectory, 403, nil, `{"error":{"CODE":"SERVER_DISABLED","message":"m"}}`, KindStatus, false},
 		{StepDirectory, 403, nil, `{"error":{"code":"INSUFFICIENT_SCOPE","code":"SERVER_DISABLED"}}`, KindStatus, false},
 		{StepDirectory, 403, nil, `{"error":{"code":"SERVER_DISABLED"},"error":{"code":"INSUFFICIENT_SCOPE"}}`, KindStatus, false},
+		// A member of another case beside code is ignored like any
+		// unknown member.
+		{StepDirectory, 403, nil, `{"error":{"code":"SERVER_DISABLED","CODE":"ignored"}}`, KindServerDisabled, false},
 		{StepDirectory, 502, nil, ``, KindServerError, false},
 		{StepEnroll, 409, nil, `{"error":{"code":"ENROLMENT_CODE_SPENT","message":"m"}}`, KindRefused, false},
 	} {
@@ -668,6 +678,20 @@ func TestErrorBody(t *testing.T) {
 		{`{"error":7}`, "", ""},
 		{`{"error":"\ud800"}`, "", ""},
 		{`{"error":"x"} trailing`, "", ""},
+		// Members of another spelling or case beside the located ones are
+		// ignored; a located member's name is compared after unescaping.
+		{`{"error":{"code":"SERVER_DISABLED","CODE":"ignored"}}`, "SERVER_DISABLED", ""},
+		{`{"Error":"x","error":{"code":"X","message":"m"}}`, "X", "m"},
+		{`{"error":{"c\u006fde":"X","message":"m"}}`, "X", "m"},
+		// A member named twice in either object read, whichever it is, and
+		// names compared after unescaping.
+		{`{"error":{"code":"X"},"\u0065rror":{"code":"Y"}}`, "", ""},
+		{`{"error":{"code":"X"},"x":1,"x":2}`, "", ""},
+		// The checks every JSON answer meets.
+		{"{\"error\":{\"code\":\"X\",\"message\":\"\xff\"}}", "", ""},
+		{`{"error":{"code":"X","message":"m","n":` + nestedArrays(14) + `}}`, "X", "m"},
+		{`{"error":{"code":"X","message":"m","n":` + nestedArrays(15) + `}}`, "", ""},
+		{`{"error":{"code":"X","message":"\ud83d\ude00"}}`, "X", "\U0001F600"},
 		{`not json`, "", ""},
 		{``, "", ""},
 	} {
