@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 import pytest
 import yaml
 
-from fixtures.identity import skip_unless_started_with_users, users_environment
+from fixtures.identity import itest_source, skip_unless_users_source_ready, users_environment
 from fixtures.tlsclient import Pinned, error_code
 
 # No auth-mode gate: the FC dev server is always mtls, and `_load_entry`
@@ -199,10 +199,17 @@ def test_admin_sees_owner_and_can_exec(admin, client_shed):
 @pytest.fixture(scope="module")
 def fc_users(fc_server_dev):
     """The itest identities, when the FC dev server was started with the
-    itest user list (`SHED_ITEST_USERS=fc`); skips otherwise. See
-    `fixtures/identity.py`."""
-    skip_unless_started_with_users("fc", fc_server_dev.name)
-    with users_environment("fc", fc_server_dev, reconfigure=False, image="itest") as env:
+    itest users: with the itest user list (`SHED_ITEST_USERS=fc`), or, under
+    the directory source (`SHED_ITEST_SOURCE=directory`), from the directory,
+    which the server itself must confirm; skips otherwise. The server is
+    never reconfigured here, so the gate follows the run's source like
+    `users_env`'s. See `fixtures/identity.py`."""
+    try:
+        source = itest_source()
+    except ValueError as e:
+        pytest.fail(str(e))
+    skip_unless_users_source_ready("fc", fc_server_dev.name, source)
+    with users_environment("fc", fc_server_dev, reconfigure=False, image="itest", source=source) as env:
         yield env
 
 

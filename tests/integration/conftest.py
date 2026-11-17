@@ -34,7 +34,12 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.identity import skip_unless_started_with_users, users_environment
+from fixtures.identity import (
+    itest_source,
+    skip_reason_under_directory_source,
+    skip_unless_users_source_ready,
+    users_environment,
+)
 from fixtures.server import CloudServer, LocalServer, RemoteServer
 
 
@@ -340,6 +345,12 @@ def shed_server_dev(request):
 #            a users case the remote backend need not run carries
 #            `@pytest.mark.local_vm_only(reason)` and skips on [remote]
 #            before any fixture runs (pytest_runtest_setup below).
+#
+# Under the directory source (SHED_ITEST_SOURCE=directory) the run started
+# the server with `python -m fixtures.identity render-directory`'s auth block
+# and the reference server with its users.json: no backend is reconfigured or
+# asked for SHED_ITEST_USERS, and a case marked
+# `not_under_directory_source(reason)` skips before any fixture runs.
 
 
 def skip_vz_off_macos() -> None:
@@ -354,19 +365,25 @@ def skip_vz_off_macos() -> None:
 @pytest.fixture(scope="module", params=["vz", "fc", "remote"])
 def users_env(request):
     backend = request.param
+    try:
+        source = itest_source()
+    except ValueError as e:
+        pytest.fail(str(e))
     if backend == "vz":
         skip_vz_off_macos()
         server = request.getfixturevalue("vz_server_dev")
-        reconfigure, image = True, "base"
+        # The Mac dev server is restarted with the itest list, except under
+        # the directory source, where the run started it so.
+        reconfigure, image = source == "config", "base"
     elif backend == "fc":
         server = request.getfixturevalue("fc_server_dev")
-        skip_unless_started_with_users("fc", server.name)
+        skip_unless_users_source_ready("fc", server.name, source)
         reconfigure, image = False, "base"
     else:
         server = request.getfixturevalue("remote_server")
-        skip_unless_started_with_users("remote", server.name)
+        skip_unless_users_source_ready("remote", server.name, source)
         reconfigure, image = False, server.image
-    with users_environment(backend, server, reconfigure=reconfigure, image=image) as env:
+    with users_environment(backend, server, reconfigure=reconfigure, image=image, source=source) as env:
         yield env
 
 
@@ -376,7 +393,13 @@ def pytest_runtest_setup(item):
     that is not macOS (`skip_vz_off_macos`), and a case marked
     `local_vm_only` skips on [remote] (a module-scoped shed fixture would
     otherwise create a billed VM first). `shed_server` does the same for its
-    own parameter."""
+    own parameter. A case marked `not_under_directory_source(reason)` skips
+    under the directory source."""
+    marker = item.get_closest_marker("not_under_directory_source")
+    if marker is not None:
+        why = skip_reason_under_directory_source(marker.args[0] if marker.args else "not supported")
+        if why:
+            pytest.skip(why)
     callspec = getattr(item, "callspec", None)
     if callspec is None:
         return

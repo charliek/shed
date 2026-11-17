@@ -46,11 +46,19 @@ from fixtures.devcontrol import USERS_UPGRADE_FILE, assert_dev_target, dev_confi
 from fixtures.identity import ADMIN, ALICE, BOB, DEV_USER, users_environment, with_itest_users
 from fixtures.tlsclient import error_code
 
+# Under the directory source (SHED_ITEST_SOURCE=directory) the run started
+# the Mac dev server with a directory config; these cases restart it with
+# their own auth.users configs and restore the committed base, which would
+# replace that config, so they do not run there.
+NOT_WITH_A_DIRECTORY = ("restarts the Mac dev server with its own auth.users configs and restores the committed "
+                        "base, which would replace the directory config the run started it with")
+
 pytestmark = [
     pytest.mark.vz,
     pytest.mark.slow,
     # A mark, not a fixture, so it skips before any fixture runs.
     pytest.mark.skipif(sys.platform != "darwin", reason="restarts the Mac dev server: macOS only"),
+    pytest.mark.not_under_directory_source(NOT_WITH_A_DIRECTORY),
 ]
 
 

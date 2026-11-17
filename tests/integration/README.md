@@ -89,6 +89,8 @@ tests they would have run, not the whole session.
 | `SHED_IMAGE_HAS_HOME_DIRS` | _unset_                                            | Gates `test_smoke.py::test_home_dirs_owned_by_shed` — a comma list of the backends (`vz`, `fc`) whose `base` image was rebuilt with the shed-owned `~/.local`, `~/.config` and `~/.cache` dirs (#410). `test-integration-dev` sets `vz`, `test-integration-dev-fc` sets `fc` (the other backend still boots the published image); unset for plain `test-integration` (published images carry these dirs only from the 0.9.1 tag). |
 | `SHED_ITEST_USERS`     | _unset_                                            | A comma list of the backends (`fc`, `remote`) whose dev server was STARTED with the itest user list (see [Named users](#named-users-authusers)). Gates the users cases on `[fc]` and `[remote]`, which skip saying what to set when it is missing; `[vz]` always restarts the Mac dev server with the list itself. `test-integration-dev-fc` and `-remote` set it from `SHED_DEV_USERS`. |
 | `SHED_ITEST_USERS_DIR` | `~/.shed/dev/itest-users`                          | Where the itest users' keys live (generated once; a server is started with their public halves) and where each identity's throwaway `$HOME` is made. Must be the same directory the server's user list was rendered from. |
+| `SHED_ITEST_SOURCE`    | `config`                                           | Where the users cases' server takes its users from: `config` (`auth.users`) or `directory` (an account service; the run started the server with `render-directory`'s auth block). See [Named users](#named-users-authusers). |
+| `SHED_DIRECTORY_ITEST` | _unset_                                            | `1` runs `test_directory.py`; set, with `SHED_BIN_DIR` (the built `bin/`), by `make test-integration-directory` only. Unset, the module skips. |
 | `SHED_DEV_USERS`       | _unset_                                            | Makefile only. `itest` starts the dev servers (`dev-server-up`, `-up-fc`, `-up-remote` and their restarts) with the itest user list and tells `test-integration-dev-fc`/`-remote` so; empty means no user list (one implicit user). |
 
 ## Fixtures
@@ -146,6 +148,7 @@ tests/integration/
   test_users.py           # named users on the API, SSH and the bus (users_env)
   test_users_upgrade.py   # sheds with no user: the upgrade step, shed assign (Mac dev server)
   test_source_pin.py      # the pin: one machine per user answers credential requests (users_env)
+  test_directory.py       # users from an account service, self-managed (make test-integration-directory)
   fixtures/
     __init__.py
     server.py             # LocalServer + RemoteServer + ShedHandle
@@ -154,6 +157,7 @@ tests/integration/
     tlsclient.py          # pinned HTTPS: pinned_request, Pinned
     identity.py           # itest users: keys, the user list, Identity, users_environment
     busclient.py          # synthetic credential-bus listeners and machines (FakeMachine), ensure_source
+    directory.py          # test_directory.py's world: the reference server, a private shed-server, held connections
 ```
 
 ## The MVP smoke tests
@@ -582,9 +586,9 @@ cd tests/integration && PATH="$PWD/../../bin:$PATH" \
 | Module | Covers | Where it runs |
 |---|---|---|
 | `test_users.py` | Each user lists and sees only their own sheds (`shed list`, `/api/overview`), an admin sees all with their users; another user's shed is 404 on every API route and refused for a session, `shed exec`, sftp, scp and a forwarded port, and a stopped one is not woken; a taken name is one 409 for everyone, naming nobody; an admin may view, stop and delete another user's shed and is refused entry with the message; a non-admin is refused `local_dir`, server mounts, an image that is not an alias and the image store; snapshots belong to their user (and the owner can make a shed from one, a third VM, local backends only); a script key cannot take the credentials scope; an expired key opens nothing; a bus request from a user's shed reaches only that user's listener and only that user may answer it (a synthetic listener, `fixtures/busclient.py`); `shed assign` refuses a non-admin, an unknown user and an assigned shed. Each refusal is checked against the server's own words or code, beside the same user doing the same thing to their own shed | `[vz]` (macOS only), `[fc]`; on `[remote]` only the ownership cases (one shed per user, two VMs): listing, the API 404s, session and exec refusals, the 409, the admin's refusal to enter, and the admin's stop and delete. The rest are `local_vm_only` there. |
-| `test_users_upgrade.py` | Sheds made before a user list: with one user they become that user's at start; cutting a list from two users to one later hands out nothing (the one-time marker); with several users an admin assigns one with `shed assign`, a shed carrying server mounts is refused (409 `SHED_HOST_RESOURCES`), the user can then enter it and the admin no longer can; a key taken off the list opens nothing new | `[vz]` on macOS only (it skips on any other host before a fixture runs): it restarts the server with other configs, which the suite can do only to the Mac dev server. Each case checks that its target is a dev server before it creates anything. The one-user restart gives every shed on the Mac dev server that has no user to `dev`, the developer, permanently (see the note above). |
+| `test_users_upgrade.py` | Sheds made before a user list: with one user they become that user's at start; cutting a list from two users to one later hands out nothing (the one-time marker); with several users an admin assigns one with `shed assign`, a shed carrying server mounts is refused (409 `SHED_HOST_RESOURCES`), the user can then enter it and the admin no longer can; a key taken off the list opens nothing new | `[vz]` on macOS only (it skips on any other host before a fixture runs): it restarts the server with other configs, which the suite can do only to the Mac dev server. Each case checks that its target is a dev server before it creates anything. The one-user restart gives every shed on the Mac dev server that has no user to `dev`, the developer, permanently (see the note above). Skips under `SHED_ITEST_SOURCE=directory`. |
 | `test_cred_bus.py::test_a_user_list_outside_its_rules_hard_fails` | A user list with an open server, or beside `auth.ssh` key sources, refuses to start (`run_preflight`, no running server) | Marked `vz` like the other preflight cases (they start `bin/shed-server` from the Mac dev config) |
-| `test_service_client.py::test_users_and_the_client_do_not_reach_each_others_sheds` | A user cannot see or enter a service client's shed, an admin can enter it, and the client cannot see the user's shed | `[fc]` with `SHED_ITEST_USERS=fc` |
+| `test_service_client.py::test_users_and_the_client_do_not_reach_each_others_sheds` | A user cannot see or enter a service client's shed, an admin can enter it, and the client cannot see the user's shed | `[fc]` with `SHED_ITEST_USERS=fc` (or, under `SHED_ITEST_SOURCE=directory`, a server that says its users come from the directory) |
 | `test_source_pin.py` | The pin: one machine per user answers credential requests (see [The pin](#the-pin-test_source_pinpy)) | `[vz]` (macOS only), `[fc]`; the whole module skips on `[remote]` |
 
 Clean-up in these modules is checked: a shed is deleted by its owner, then
@@ -598,6 +602,119 @@ Not covered live: the server's `env_file` reaching only admins' sheds (it
 only feeds a `--repo` clone's environment, which a test cannot observe
 without a private repository; the unit tests in `internal/backend`,
 `internal/api`, `internal/config` and `internal/vmutil` cover it).
+
+**The same users from an account service** (`SHED_ITEST_SOURCE=directory`).
+`test_users.py` can run against a server whose users come from the directory
+(`auth.directory`) instead of `auth.users`, the account service being the
+in-tree reference server (`make directory-ref`). The run starts both:
+
+```sh
+make build directory-ref
+mkdir -m 0700 /path/to/control                      # the reference server's control directory
+bin/test/shed-directory-ref --control /path/to/control   # prints "listening on http://127.0.0.1:<port>"
+(cd tests/integration && uv run python -m fixtures.identity render-directory \
+    http://127.0.0.1:<port> /path/to/control/users.json --admin-key-file ~/.ssh/id_ed25519.pub)
+# put the printed auth block in the dev server's config in place of its auth
+# block, add "<server name> <code>" to /path/to/control/codes, then enrol
+# (the code on standard input, never an argument) and start the server:
+bin/shed-server --config <config> directory enroll --name <server name> < <0600 file holding the code>
+```
+
+`render-directory` prints the server's `auth` block (one local admin,
+`localadmin`, holding its own itest key and each `--admin-key-file`, which
+makes the developer's CLI entry a local admin for clean-up; the directory at
+the URL, plain HTTP allowed only to loopback; `refresh: 1m`, `trust: 2m`
+unless `--refresh`/`--trust` say otherwise) and writes the reference
+server's `users.json` (the three itest users, less the script and expired
+keys a list never carries; each key file must hold exactly one public key:
+a private key file, several lines or an upper-case URL scheme or host is
+refused with a message). With `SHED_ITEST_SOURCE=directory`, `users_env`
+reconfigures no server and asks for no `SHED_ITEST_USERS`; the developer's
+entry first asks the server itself (`shed --json users status`) and fails
+the run unless its users come from the directory, then runs `shed users
+refresh` (so no identity's first login waits on the unknown-key pull, at
+most one a minute). Every `test_users.py` case runs except
+`test_a_script_key_never_holds_the_credentials_scope` and
+`test_an_expired_key_opens_nothing`, which skip saying why
+(`@pytest.mark.not_under_directory_source`).
+
+The variable changes only callers that follow it: `users_environment` takes
+its source from its caller (`config` unless told otherwise) and refuses
+`reconfigure=True` with the directory source.
+`test_users_upgrade.py` restarts the Mac dev server with its own
+`auth.users` configs, which would replace the run's directory config, so it
+skips under the directory source; `test_service_client.py`'s users fixture
+follows the source the way `users_env` does (the `SHED_ITEST_USERS` gate
+under `config`, the server's own answer under `directory`).
+
+## Users from an account service (`test_directory.py`)
+
+The suite's one **self-managed** module: it starts and stops its own servers,
+so it never runs against an installed or dev server. Linux only.
+
+```sh
+make test-integration-directory                         # the whole module, about three minutes
+make test-integration-directory PYTEST_ARGS="-k rates"  # one case
+```
+
+The target builds `bin/` and the directory contract's reference server
+(`bin/test/shed-directory-ref`), then runs `test_directory.py` with `bin/`
+first on `PATH`, `SHED_DIRECTORY_ITEST=1`, `SHED_BIN_DIR` and every other
+server variable of the suite set empty. Under any other target the module
+skips, saying to run `make test-integration-directory`. Not in CI; its
+helpers' unit tests are (`test_fixture_units.py`).
+
+**Each case's world** (`fixtures/directory.py`), in one fresh temporary
+folder, all of it stopped and removed when the case ends, pass or fail:
+
+- the reference server on a loopback port the kernel picks, reading a
+  control directory the case writes (`users.json`, `codes`, `outage`);
+- `bin/shed-server` on the remote backend's test drivers (`provider: fake`,
+  `transport: local`: no root, no cloud VM), mtls, an explicit `state_dir`,
+  ports the kernel picks on `127.0.0.1` (never one other work on the machine
+  holds), its own `HOME` and `TMPDIR`, `auth.directory` at the reference
+  server with `allow_plain_http`, `refresh: 1m` and `trust: 2m` (the
+  shortest the config allows), and one local admin, `localadmin` (the
+  reference server never serves a reserved name such as `admin`);
+- `shed-server directory enroll` with the code on standard input;
+- identities with their own `HOME` and `ssh` shim (`fixtures/identity.py`),
+  never the developer's `~/.shed`.
+
+A "shed" there is a `shed-agent` on this host, run by the server as the user
+running the tests: the cases assert that a session opens, runs, closes or is
+refused, never the guest user or its directories, and run only `echo` and
+`cat` in one. A held connection is a real OpenSSH control master; channels
+through it never fall back to a new connection.
+
+An API refusal counts only when it is the server's own: an HTTP 401 or 403
+with its error code, or its `bad_certificate` alert at the TLS handshake (a
+TLS 1.2 handshake, so the alert cannot race the request), and the local
+admin's next request is answered. A request with no answer (no connection, a
+reset, a timeout, another TLS error) fails the case, so a server that went
+down cannot pass as one that refused.
+
+Clean-up stops, besides the processes the fixture started, every process of
+the user whose command line names a path inside the world's folder (an agent
+that outlived the server, whether or not the server is still running), and
+whatever runs below each. Such a process is pinned by its pid and start time,
+checked again just before each signal, and signalled through a pidfd, so a
+reused pid is never signalled; one that has gone already is not an error.
+
+| Case | Shows |
+|---|---|
+| `test_end_to_end_flow` | enrolment (private state; neither the code nor a private key in any file of the world but the ones meant for them, every log included); a new person logs in over SSH through the unknown-key pull and over the API; an admin flip and a demotion with the same certificate; a removal plus `shed users refresh` closes their held connection and refuses SSH and the API; added back, a good pull; the service out: the kept copy carries them across a restart; the trust time, computed by the case from the last good pull plus `trust`: the person is admitted (an API request and a new channel) shortly before it, then their held connection closes, only the local admin remains and the kept copy is gone (this server's choice: a restart has none); a restart that leaves too little trust time starts a new one first. The service back: the local admin's refresh restores the list. The local admin and `shed users status` at every step |
+| `test_a_list_entry_named_like_the_local_admin_is_skipped` | the entry skipped (status, log), the local admin unchanged, its key not added |
+| `test_a_list_entry_holding_the_local_admins_key_is_skipped` | an entry with another name that lists the local admin's key skipped whole (status with its reason, log), the local admin still logs in with that key (SSH, a certificate naming it, the API) |
+| `test_a_key_moved_between_two_people_with_a_held_connection` | a new channel on the old connection refused, the connection kept; the first person's certificate, answered before the move, refused after it; a new connection is the second person's |
+| `test_the_unknown_key_rates` | a second unknown key in the same minute refused at once, with no pull; in after a refresh |
+| `test_an_unbound_certificate_is_refused` | a certificate made with the CA in the state directory that names no user is refused, the same one naming the user accepted before and after |
+| `test_a_session_inside_a_shed_is_closed_when_its_person_is_removed` | the session closed, a new one refused, the shed still theirs for an admin |
+| `test_a_session_inside_a_shed_across_a_key_move` | the open session survives, a new one is refused, the person's CLI certificate (answered before the move) is refused, the key's new owner may not enter |
+
+An unknown key pulls at most once a minute (and not while a retry wait is
+pending), so each case's first unknown login is the first of its minute, or
+the local admin runs `shed users refresh` before a person's first login when
+the case is not about that path.
 
 ## The pin (`test_source_pin.py`)
 

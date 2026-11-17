@@ -35,6 +35,11 @@ every shed is a billed cloud VM and at most two run at once, so only the
 cases that prove ownership run there (one shed per user); the rest carry
 `local_vm_only`.
 
+Under the directory source (`SHED_ITEST_SOURCE=directory`) the same users
+come from an account service's list (the reference server, started by the
+run with `python -m fixtures.identity render-directory`): every case runs
+but the two about a script key and an expired key, which a list never holds.
+
 The module runs in any order: the one case that deletes a shared shed
 takes it out of the module's hands first, and the next case that wants one
 gets a new one. Every clean-up is checked: a shed or snapshot that cannot be
@@ -71,6 +76,10 @@ from fixtures.identity import ADMIN, ALICE, BOB, Identity, UsersEnv
 from fixtures.tlsclient import error_code, error_message, pinned_request
 
 LOCAL = "the remote run is kept to one shed per user, which proves ownership"
+# Under the directory source (SHED_ITEST_SOURCE=directory) the users come
+# from an account service's list, which carries neither key these cases need.
+NO_SCRIPT_KEY_IN_A_LIST = "a list never marks a key script (the server never reads script from it)"
+NO_EXPIRED_KEY_IN_A_LIST = "a service never serves an expired key, so no list holds one"
 NOT_FOUND = "SHED_NOT_FOUND"
 ANOTHER_USER = "belongs to another user"
 # What a forwarded port to a shed the caller may not see is refused with: the
@@ -552,6 +561,7 @@ def test_the_image_store_is_for_admins_only(users_env):
 
 
 @pytest.mark.local_vm_only(LOCAL)
+@pytest.mark.not_under_directory_source(NO_SCRIPT_KEY_IN_A_LIST)
 def test_a_script_key_never_holds_the_credentials_scope(users_env, alice_shed, bob_shed, enrolled):
     env = users_env
     # Control: alice's normal key may take it.
@@ -572,6 +582,7 @@ def test_a_script_key_never_holds_the_credentials_scope(users_env, alice_shed, b
 
 
 @pytest.mark.local_vm_only(LOCAL)
+@pytest.mark.not_under_directory_source(NO_EXPIRED_KEY_IN_A_LIST)
 def test_an_expired_key_opens_nothing(users_env, bob_shed, enrolled):
     env = users_env
     _ensure_running(env, env.bob, bob_shed)

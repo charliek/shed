@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory check-directory-itest-host test-host-agent-diff test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -112,6 +112,48 @@ test-integration-units:
 	  exit 1; \
 	}
 	cd tests/integration && uv sync && uv run pytest test_smoke_units.py test_fixture_units.py -v
+
+# The integration suite's one self-managed module: a server whose users come
+# from an account service (auth.directory), end to end, on this host
+# (tests/integration/test_directory.py). It builds bin/ and the directory
+# contract's reference server, and each case starts its own reference server
+# and private shed-server from bin/ on loopback ports of its own (the remote
+# backend's test drivers: no root, no cloud VM), then stops them and removes
+# their files. It never touches an installed or dev server: every server
+# variable of the rest of the suite is set empty. Linux only (the local link
+# runs a shed-agent on this host). Not in CI. About three minutes, most of it
+# the end-to-end case waiting out a two-minute trust time. Narrow it with
+# PYTEST_ARGS, e.g.
+#   make test-integration-directory PYTEST_ARGS="-k rates"
+test-integration-directory: check-directory-itest-host build directory-ref
+	cd tests/integration && uv sync && \
+	  PATH="$(CURDIR)/bin:$$PATH" \
+	  SHED_DIRECTORY_ITEST=1 \
+	  SHED_BIN_DIR="$(CURDIR)/bin" \
+	  SHED_VZ_SERVER= \
+	  SHED_VZ_DEV_SERVER= \
+	  SHED_VZ_LOG_PATH= \
+	  SHED_VZ_DEV_LOG_PATH= \
+	  SHED_FC_HOST= \
+	  SHED_FC_SERVER= \
+	  SHED_FC_DEV_SERVER= \
+	  SHED_FC_LOG_PATH= \
+	  SHED_FC_DEV_LOG_PATH= \
+	  SHED_REMOTE_SERVER= \
+	  SHED_ITEST_SOURCE= \
+	  uv run pytest -v test_directory.py $(PYTEST_ARGS)
+
+check-directory-itest-host:
+	@if [ "$$(uname -s)" != "Linux" ]; then \
+	  echo "test-integration-directory runs on Linux only: its server uses the remote backend's local link,"; \
+	  echo "which runs a shed-agent on this host (this host is $$(uname -s))."; \
+	  exit 1; \
+	fi
+	@command -v uv >/dev/null 2>&1 || { \
+	  echo "uv is required for integration tests."; \
+	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
+	  exit 1; \
+	}
 
 test-machine-transport:
 	@command -v uv >/dev/null 2>&1 || { \
