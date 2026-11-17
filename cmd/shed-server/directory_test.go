@@ -1,12 +1,16 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/directory"
+	"github.com/charliek/shed/internal/users"
 )
 
 // writeServeConfig writes a config serve's own loader accepts on this
@@ -32,37 +36,71 @@ func writeServeConfig(t *testing.T, auth string) {
 	t.Cleanup(func() { configPath = prev })
 }
 
-// TestServeRefusesTheDirectoryBlock: serve's config load (the first thing
-// runServe does, before anything binds) refuses a config with auth.directory,
-// which this build cannot serve, saying so; the same config is valid to
-// config-validate's loader. Without the block serve's load is unchanged.
-func TestServeRefusesTheDirectoryBlock(t *testing.T) {
-	adminLine, _ := wiringKey(t)
+// TestServeBuildsTheLookupByConfig: serve's config load (loadConfig) takes a
+// config with auth.directory, and serve's lookup is then the directory's
+// (its local admin a user, no implicit user, every connection tracked by its
+// user, unbound certificates refused). Without the block it is the config
+// lookup, as before.
+func TestServeBuildsTheLookupByConfig(t *testing.T) {
+	adminLine, adminFP := wiringKey(t)
 	admins := "auth:\n  mode: mtls\n  users:\n    admin:\n      admin: true\n      keys:\n        - {key: \"" + adminLine + "\", label: laptop}\n"
 
 	writeServeConfig(t, admins+"  directory:\n    url: https://accounts.example.test\n")
-	if cfg, err := loadConfig(); err != nil || !cfg.DirectoryConfigured() {
-		t.Fatalf("config-validate's load: %v (directory configured: %v); want it accepted", err, cfg != nil && cfg.DirectoryConfigured())
+	cfg, err := loadConfig()
+	if err != nil || !cfg.DirectoryConfigured() {
+		t.Fatalf("serve's load: %v (directory configured: %v); want it accepted", err, cfg != nil && cfg.DirectoryConfigured())
 	}
-	cfg, err := loadServeConfig()
-	if !errors.Is(err, errDirectoryUnavailable) || cfg != nil {
-		t.Fatalf("serve's load = %v, %v; want errDirectoryUnavailable and no config", cfg, err)
+	l, err := newUserLookup(context.Background(), cfg, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "auth.directory: the directory is not available in this build") {
-		t.Errorf("refusal %q does not name the block and say why", err)
+	rt, ok := l.(*directory.Runtime)
+	if !ok {
+		t.Fatalf("with auth.directory serve's lookup is a %T, want *directory.Runtime", l)
+	}
+	if _, bound := l.(users.BoundCredentialsOnly); !bound {
+		t.Error("the directory's lookup does not refuse unbound certificates")
+	}
+	if _, refetch := l.(users.UnknownKeyRefetcher); refetch {
+		t.Error("the directory's lookup fetches for unknown keys in this commit")
+	}
+	if u, k, ok := l.UserForKey(adminFP); !ok || u.Name != "admin" || !u.Admin || k.Source != users.SourceAdHoc || k.Label != "laptop" {
+		t.Errorf("the local admin's key resolves to %+v %+v %v", u, k, ok)
+	}
+	if _, ok := l.User(users.ImplicitName); ok || l.Mode() != config.SSHAuthEnforce {
+		t.Errorf("implicit user %v, mode %s; want none and enforce", ok, l.Mode())
+	}
+	if st := rt.Status(); st.State != directory.StateNotEnrolled {
+		t.Errorf("a fresh state directory: state %s, want not-enrolled", st.State)
 	}
 
 	writeServeConfig(t, admins)
-	cfg, err = loadServeConfig()
-	if err != nil || cfg == nil || cfg.DirectoryConfigured() || !cfg.UsersConfigured() {
+	cfg, err = loadConfig()
+	if err != nil || cfg.DirectoryConfigured() || !cfg.UsersConfigured() {
 		t.Fatalf("serve's load without a directory = %v, %v; want the config", cfg, err)
+	}
+	l, err = newUserLookup(context.Background(), cfg, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := l.(*users.ConfigLookup); !ok {
+		t.Fatalf("without auth.directory serve's lookup is a %T, want *users.ConfigLookup", l)
+	}
+	if _, bound := l.(users.BoundCredentialsOnly); bound {
+		t.Error("the config lookup refuses unbound certificates")
+	}
+	if ka := sshKeyAuth(l); ka.TrackConnections || ka.Users != l {
+		t.Errorf("without auth.directory the SSH key auth tracks connections (%v)", ka.TrackConnections)
+	}
+	if ka := sshKeyAuth(rt); !ka.TrackConnections || ka.Mode != config.SSHAuthEnforce {
+		t.Errorf("with auth.directory the SSH key auth = %+v; want connections tracked, enforce", ka)
 	}
 }
 
 // TestConfigValidateSummarisesTheDirectory: config-validate prints the
 // service (issuer, trailing slash dropped), the organization, refresh and
-// trust with their defaults, the local admins, and that serve refuses the
-// block in this build. Nothing without a directory.
+// trust with their defaults, and the local admins. Nothing without a
+// directory.
 func TestConfigValidateSummarisesTheDirectory(t *testing.T) {
 	aLine, _ := wiringKey(t)
 	bLine, _ := wiringKey(t)
@@ -74,14 +112,13 @@ func TestConfigValidateSummarisesTheDirectory(t *testing.T) {
 	want := []string{
 		"users: from the directory at https://accounts.example.test (organization example), refresh 1h0m0s, trust 72h0m0s",
 		"local admins: ops, root",
-		"note: auth.directory: the directory is not available in this build; remove the auth.directory block to start the server",
 	}
 	if got := directorySummary(cfg); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("summary:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 
 	cfg = loadWiringConfig(t, admins+"  directory:\n    url: http://127.0.0.1:18080\n    allow_plain_http: true\n")
-	if got := directorySummary(cfg); len(got) != 3 || got[0] != "users: from the directory at http://127.0.0.1:18080 (the organization named at enrolment), refresh 24h0m0s, trust 72h0m0s" {
+	if got := directorySummary(cfg); len(got) != 2 || got[0] != "users: from the directory at http://127.0.0.1:18080 (the organization named at enrolment), refresh 24h0m0s, trust 72h0m0s" {
 		t.Errorf("summary with defaults: %q", got)
 	}
 

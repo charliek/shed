@@ -195,9 +195,10 @@ func (c *Client) fetch(ctx context.Context, tok string, sk *skew) (*Pull, *Failu
 	a, f := exchange(c.hc, req, StepDirectory, http.StatusOK, MaxDirectoryBody, c.now)
 	sk.see(a)
 	if f != nil {
-		return nil, f
+		return nil, scrub(f, tok)
 	}
-	return classifyDirectory(a, c.organization)
+	p, f := classifyDirectory(a, c.organization)
+	return p, scrub(f, tok)
 }
 
 // classifyDirectory turns one answer of GET /v1/directory into a good pull
@@ -246,12 +247,19 @@ func (c *Client) forget(tok string) {
 }
 
 // requestToken logs in: client credentials with a fresh assertion, sent
-// once.
+// once. A failure's text taken from the answer never holds the assertion
+// (scrub).
 func (c *Client) requestToken(ctx context.Context) (string, time.Duration, *answer, *Failure) {
 	assertion, err := c.assertion()
 	if err != nil {
 		return "", 0, nil, &Failure{Step: StepToken, Kind: KindTransport, Err: err}
 	}
+	tok, lifetime, a, f := c.sendToken(ctx, assertion)
+	return tok, lifetime, a, scrub(f, assertion)
+}
+
+// sendToken sends the token request carrying assertion.
+func (c *Client) sendToken(ctx context.Context, assertion string) (string, time.Duration, *answer, *Failure) {
 	form := url.Values{
 		"grant_type":            {"client_credentials"},
 		"client_assertion_type": {assertionType},

@@ -40,6 +40,35 @@
 //     latched, until a new list arrives. Each publication runs a hook
 //     (SetPublicationHook) through which the server closes the SSH
 //     connections of users the new snapshot no longer has.
+//   - Runtime is a directory server's user source while it runs: the Lookup
+//     every front door asks, and the pulls that change it. It reads the
+//     enrolment before each pull (one that is missing, for another issuer or
+//     organization, or failing a check means nothing is sent and only the
+//     local admins can log in), pulls one list at a time (a caller joins a
+//     pull not yet started, or waits behind the one running), writes the
+//     kept copy (users.json) durably before it publishes the list (and
+//     removes the old copy when the new one cannot be written), starts from
+//     that copy (Load) only when every check of it passes, and schedules
+//     the next pull: the last good pull plus the refresh, or after a
+//     failure 15 minutes or the Retry-After when later (at most an hour).
+//     Write, then publish keeps the copy on disk never OLDER than the list
+//     published, so no restart brings back a person a published list
+//     removed. The other direction is allowed on purpose: a server that
+//     stops between the write and the publication leaves a copy of a list
+//     it never published, the service's own, fully checked answer, and the
+//     next start loads it (under every start-up check); that crash window is
+//     not a bug. When the trust time of the list ends (or a copy past it is
+//     found at start), the copy is removed durably, outside the publication
+//     and every lock readers take, and tried again at each turn of the
+//     schedule if that fails, so a restart starts with only the local
+//     admins whatever its clock says. A pull's network work is bounded by
+//     PullTimeout; the storage work around it is not interruptible and lies
+//     outside that bound.
+//     Refresh (`shed users refresh`) pulls at once and reports the pull as
+//     a row; Status is what an admin is shown.
+//   - Every text a Failure takes from an answer has the credential the
+//     request carried (the assertion, the access token) replaced by
+//     CredentialMarker, so nothing that logs a failure can show it.
 //   - The state files (enrolment.json, users.json) are read only after
 //     checks of their directory and themselves (ReadStateFile), written
 //     durably (WriteStateFile) or once (CreateStateFileOnce), always through

@@ -109,14 +109,16 @@ type Lookup interface {
 	Users() []User
 }
 
-// Refresher is a Lookup whose keys come partly from GitHub logins, which it
-// can be told to fetch again at once (`shed users refresh`).
+// Refresher is a Lookup whose keys come partly from GitHub logins, or from a
+// directory's list, which it can be told to fetch again at once (`shed users
+// refresh`).
 type Refresher interface {
 	// Refresh fetches every GitHub login again, checking each against its
-	// pinned account id, and reports what it found. It joins a fetch that
-	// has not started yet, and otherwise starts one after any fetch already
-	// running, so its result is never older than the call. It returns when
-	// the fetch ends or ctx ends, whichever is first.
+	// pinned account id (or pulls the directory's list again), and reports
+	// what it found. It joins a fetch that has not started yet, and otherwise
+	// starts one after any fetch already running, so its result is never
+	// older than the call. It returns when the fetch ends or ctx ends,
+	// whichever is first.
 	Refresh(ctx context.Context) (RefreshReport, error)
 }
 
@@ -156,10 +158,41 @@ type BoundCredentialsOnly interface {
 	BoundCredentialsOnly()
 }
 
-// RefreshReport is what one fetch of the GitHub logins found.
+// RefreshReport is what one fetch of the GitHub logins found, or, on a
+// server whose users come from a directory, what one pull of its list found.
 type RefreshReport struct {
 	// Logins has one row per configured GitHub login, in config order.
 	Logins []LoginRefresh
+	// Directory is the pull's row on a server whose users come from a
+	// directory (auth.directory); nil on every other server.
+	Directory *DirectoryRefresh
+}
+
+// Directory refresh statuses (DirectoryRefresh.Status).
+const (
+	// DirectoryRefreshGood: the pull was good and its list is the one the
+	// server answers for.
+	DirectoryRefreshGood = "good"
+	// DirectoryRefreshFailed: the pull failed (the service refused it, could
+	// not be reached, answered with something the server refuses, or the
+	// server is not enrolled). The list the server held before stays.
+	DirectoryRefreshFailed = "failed"
+)
+
+// DirectoryRefresh is a directory pull's row in a RefreshReport.
+type DirectoryRefresh struct {
+	// Status is DirectoryRefreshGood or DirectoryRefreshFailed.
+	Status string
+	// Version is the version of the list the server answers for after the
+	// pull ("" when it holds none): the pull's own when it was good.
+	Version string
+	// Users is how many of that list's users the server admits, and Skipped
+	// how many of its entries it does not answer for (the local admins are
+	// not counted).
+	Users, Skipped int
+	// Error says why the pull failed, when it did. Text from the service in
+	// it is quoted.
+	Error string
 }
 
 // Login refresh statuses (LoginRefresh.Status).

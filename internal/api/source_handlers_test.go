@@ -686,12 +686,21 @@ func TestMoverFor(t *testing.T) {
 	}
 }
 
-// TestUserCallerKeyLabel: only a label from auth.users becomes the caller's
-// key label; an authorized_keys comment (often an account and host) does not.
+// TestUserCallerKeyLabel: only a label from auth.users or from a directory's
+// list becomes the caller's key label; an authorized_keys comment (often an
+// account and host) does not.
 func TestUserCallerKeyLabel(t *testing.T) {
 	u := users.User{Name: "alice"}
 	if c := userCaller(u, users.Key{Source: users.SourceAdHoc, Label: "laptop"}, aliceFP, ""); c.KeyLabel != "laptop" {
 		t.Fatalf("auth.users label = %q, want laptop", c.KeyLabel)
+	}
+	c := userCaller(u, users.Key{Source: users.SourceDirectory, Label: "work \"laptop\""}, aliceFP, "")
+	if c.KeyLabel != `work "laptop"` {
+		t.Fatalf("directory label = %q, want the list's label", c.KeyLabel)
+	}
+	// It is shown quoted, like a config user's.
+	if got, want := moverFor(c, false), `user alice with key "work \"laptop\"" (`+aliceFP+")"; got != want {
+		t.Fatalf("a directory user's mover = %q, want %q", got, want)
 	}
 	for _, src := range []users.Source{users.SourceInline, users.SourceFile, users.SourceGitHub} {
 		if c := userCaller(u, users.Key{Source: src, Label: "comment naming a person and host"}, aliceFP, ""); c.KeyLabel != "" {

@@ -1,6 +1,7 @@
 package directory
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -114,6 +115,55 @@ func (f *Failure) Error() string {
 }
 
 func (f *Failure) Unwrap() error { return f.Err }
+
+// CredentialMarker stands, in a Failure, where text taken from an answer
+// held a credential the client had just sent (scrub).
+const CredentialMarker = "[credential removed]"
+
+// scrub replaces, in every text of f taken from an answer (its code, its
+// message, and its error's text, which may quote the answer: a body
+// fragment, a Location, a value it refused), every occurrence of each of
+// sent, the credentials the request carried (the assertion, the access
+// token), by CredentialMarker, so that nothing logging f can show them. An
+// error whose text changed is replaced by its scrubbed text, which still
+// answers errors.Is for what the original did but no longer unwraps to it.
+// It returns f.
+func scrub(f *Failure, sent ...string) *Failure {
+	if f == nil {
+		return nil
+	}
+	f.Code = scrubText(f.Code, sent)
+	f.Message = scrubText(f.Message, sent)
+	if f.Err != nil {
+		if text := f.Err.Error(); scrubText(text, sent) != text {
+			f.Err = &scrubbedError{text: scrubText(text, sent), was: f.Err}
+		}
+	}
+	return f
+}
+
+// scrubText is s with every occurrence of each non-empty secret replaced by
+// CredentialMarker.
+func scrubText(s string, secrets []string) string {
+	for _, secret := range secrets {
+		if secret != "" {
+			s = strings.ReplaceAll(s, secret, CredentialMarker)
+		}
+	}
+	return s
+}
+
+// scrubbedError is an error whose text held a credential: its text with the
+// credential replaced. It matches (errors.Is) what the original matched,
+// and does not unwrap to it.
+type scrubbedError struct {
+	text string
+	was  error
+}
+
+func (e *scrubbedError) Error() string { return e.text }
+
+func (e *scrubbedError) Is(target error) bool { return errors.Is(e.was, target) }
 
 // Lost reports whether an enrolment's outcome is unknown: the service may
 // have enrolled the server under a client id the client never learned. It

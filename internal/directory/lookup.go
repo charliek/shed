@@ -687,7 +687,11 @@ func (l *Lookup) Install(list *List, fetchedAt time.Time, trust time.Duration, s
 // WatchTrust checks, at every tick of its ticker (every TrustCheckEvery),
 // whether the trust time of the list the lookup holds has ended, and when it
 // has publishes the end (checkTrust), until ctx ends.
-func (l *Lookup) WatchTrust(ctx context.Context) {
+func (l *Lookup) WatchTrust(ctx context.Context) { l.watchTrust(ctx, nil) }
+
+// watchTrust is WatchTrust, running after (when set) after each tick's
+// check, once the publication it may have made, and its hook, are over.
+func (l *Lookup) watchTrust(ctx context.Context, after func()) {
 	ticks, stop := l.trustTicks()
 	defer stop()
 	for {
@@ -696,6 +700,9 @@ func (l *Lookup) WatchTrust(ctx context.Context) {
 			return
 		case <-ticks:
 			l.checkTrust()
+			if after != nil {
+				after()
+			}
 		}
 	}
 }
@@ -723,6 +730,68 @@ func (l *Lookup) checkTrust() bool {
 func logTrustEnded(s *snapshot) {
 	log.Printf("directory: TRUST ENDED: the list whose answer arrived at %s was trusted until %s and no good pull has replaced it; only the local admins can log in until one does, and the listed users' SSH connections are closed",
 		s.fetchedAt.UTC().Format(time.RFC3339), s.deadline.UTC().Format(time.RFC3339))
+}
+
+// withdraw publishes, as the result of pull seq, a state with no list: only
+// the local admins are users until a list is installed again, and the
+// publication hook closes the listed users' connections. It is what a pull
+// does when it finds the server no longer enrolled, or its enrolment
+// unusable. It reports whether it published (false when the lookup holds no
+// list, or a pull numbered seq or later has been published).
+func (l *Lookup) withdraw(seq uint64) bool {
+	if l.snap.Load().listed == nil {
+		return false
+	}
+	_, ok := l.publish(&snapshot{local: l.admins}, seq)
+	return ok
+}
+
+// held is what the current snapshot holds of its list, whether or not it is
+// still trusted: its admitted users (nil with no list) and every entry it
+// does not answer for.
+func (l *Lookup) held() (listed map[string]users.User, skipped []Skip) {
+	s := l.snap.Load()
+	if s.listed != nil {
+		listed = s.listed.users
+	}
+	return listed, s.skipped
+}
+
+// UserSource says where a user of a directory server comes from.
+type UserSource string
+
+// The sources of a user.
+const (
+	// UserLocal is a local admin (auth.users beside auth.directory).
+	UserLocal UserSource = "local"
+	// UserDirectory is a user of the directory's list.
+	UserDirectory UserSource = "directory"
+)
+
+// StatusUser is one user of the lookup as status shows it: no keys.
+type StatusUser struct {
+	Name   string
+	Admin  bool
+	Source UserSource
+}
+
+// statusUsers lists the users the lookup answers for now, with where each
+// comes from, sorted by name. Like every reader it finds, and latches, the
+// end of the list's trust time.
+func (l *Lookup) statusUsers() []StatusUser {
+	s := l.load()
+	listed := l.trusted(s)
+	out := make([]StatusUser, 0, len(s.local.users))
+	for _, u := range s.local.users {
+		out = append(out, StatusUser{Name: u.Name, Admin: u.Admin, Source: UserLocal})
+	}
+	if listed != nil {
+		for _, u := range listed.users {
+			out = append(out, StatusUser{Name: u.Name, Admin: u.Admin, Source: UserDirectory})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // trustEndOf is the snapshot that publishes the end of s's trust time: s's

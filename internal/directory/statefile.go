@@ -33,12 +33,15 @@ const (
 
 // Test hooks, nil outside tests: run between the directory's check by name
 // and its opening, between the opened directory's check and the first
-// operation on a file in it, and in CreateOnce after the link (an error it
-// returns is the error of a step after the link).
+// operation on a file in it, in CreateOnce after the link (an error it
+// returns is the error of a step after the link), and in syncDir before the
+// directory is synced (an error it returns is the sync's: the rename, link
+// or unlink before it has happened).
 var (
 	hookBeforeDirOpen   func()
 	hookAfterDirChecked func()
 	hookAfterLink       func() error
+	hookBeforeDirSync   func() error
 )
 
 // ErrLocked is the error of StateDir.Lock when another process holds the
@@ -459,6 +462,11 @@ func writeTemp(root *os.Root, name string, data []byte) (string, error) {
 // syncDir syncs the open directory root (dir names it in an error), so a
 // rename, link or unlink in it is durable.
 func syncDir(root *os.Root, dir string) error {
+	if hookBeforeDirSync != nil {
+		if err := hookBeforeDirSync(); err != nil {
+			return fmt.Errorf("sync directory %s: %w", dir, err)
+		}
+	}
 	d, err := root.Open(".")
 	if err != nil {
 		return err
