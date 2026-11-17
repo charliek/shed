@@ -247,6 +247,9 @@ func (s *Server) Router() chi.Router {
 
 		// Users: fetch the GitHub logins again (admin only; control scope).
 		r.Post("/users/refresh", s.handleUsersRefresh)
+		// Users: where they come from and, on a directory server, the
+		// state of its list (admin only; control scope).
+		r.Get("/users/status", s.handleUsersStatus)
 
 		// Credential sources: which of a user's machines answers their
 		// credential requests, and moving that (control scope: outside

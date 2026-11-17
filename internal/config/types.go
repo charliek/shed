@@ -614,9 +614,167 @@ type ShedsResponse struct {
 }
 
 // UsersRefreshResponse is returned by POST /api/users/refresh: one row per
-// GitHub login whose keys the server follows.
+// GitHub login whose keys the server follows, and, on a server whose users
+// come from a directory (auth.directory), the row of the pull it made.
 type UsersRefreshResponse struct {
 	Logins []GitHubLoginRefresh `json:"logins"`
+	// Directory is the pull's row on a directory server; absent on every
+	// other server. A failed pull is a row (the request still answers 200).
+	Directory *DirectoryRefreshRow `json:"directory,omitempty"`
+}
+
+// Directory refresh statuses (DirectoryRefreshRow.Status).
+const (
+	// DirectoryPullGood: the pull was good; its list is the one the server
+	// answers for.
+	DirectoryPullGood = "good"
+	// DirectoryPullFailed: the pull failed; the list the server held before
+	// stays while its trust time lasts (DirectoryRefreshRow.List says
+	// whether one is in force).
+	DirectoryPullFailed = "failed"
+)
+
+// Whether a list is in force after a directory pull (DirectoryRefreshRow.List).
+const (
+	// DirectoryListInForce: the server answers for a list (Version), inside
+	// its trust time.
+	DirectoryListInForce = "in-force"
+	// DirectoryListTrustEnded: the trust time of the list the server holds
+	// has ended: only the local admins are admitted until a good pull.
+	DirectoryListTrustEnded = "trust-ended"
+	// DirectoryListWithdrawn: the pull found the server not enrolled (or its
+	// enrolment unusable) and withdrew the list it held: only the local
+	// admins are admitted.
+	DirectoryListWithdrawn = "withdrawn"
+	// DirectoryListNone: the server holds no list: only the local admins are
+	// admitted.
+	DirectoryListNone = "none"
+)
+
+// DirectoryRefreshRow is a directory pull's row in UsersRefreshResponse. It
+// describes the list in force after the pull: users admitted, never a list
+// held past its trust time.
+type DirectoryRefreshRow struct {
+	// Status is good or failed.
+	Status string `json:"status"`
+	// List is in-force, trust-ended, withdrawn or none: whether a list is in
+	// force after the pull, and if not why.
+	List string `json:"list"`
+	// Version is the version of the list in force after the pull ("" when
+	// none is).
+	Version string `json:"version,omitempty"`
+	// Users is how many of that list's users the server admits, and Skipped
+	// how many of its entries it does not answer for (local admins are not
+	// counted); both 0 when no list is in force.
+	Users   int `json:"users"`
+	Skipped int `json:"skipped"`
+	// Error says why the pull failed, when it did. Text from the account
+	// service in it is quoted.
+	Error string `json:"error,omitempty"`
+}
+
+// Where a server's users come from (UsersStatusResponse.Source).
+const (
+	// UsersSourceConfig: the server's config lists its users (auth.users).
+	UsersSourceConfig = "config"
+	// UsersSourceDirectory: a directory's list, beside the local admins
+	// (auth.directory).
+	UsersSourceDirectory = "directory"
+	// UsersSourceNone: no user list; every accepted key is the implicit
+	// user, an admin.
+	UsersSourceNone = "none"
+)
+
+// Where one user comes from (UserStatus.Source).
+const (
+	// UserFromConfig: a user of auth.users on a server with no directory.
+	UserFromConfig = "config"
+	// UserFromLocal: a local admin (auth.users beside auth.directory).
+	UserFromLocal = "local"
+	// UserFromDirectory: a user of the directory's list.
+	UserFromDirectory = "directory"
+)
+
+// UsersStatusResponse is returned by GET /api/users/status (`shed users
+// status`, admin only): where the server's users come from, who they are,
+// and on a directory server the state of its list. It never holds a key.
+type UsersStatusResponse struct {
+	// Source is config, directory or none.
+	Source string `json:"source"`
+	// Directory is the state of the directory's list; absent unless Source
+	// is directory.
+	Directory *DirectoryStatus `json:"directory,omitempty"`
+	// Users are the users the server answers for now, sorted by name: no
+	// keys. Empty with no user list (the implicit user is not listed).
+	Users []UserStatus `json:"users"`
+}
+
+// UserStatus is one user in UsersStatusResponse.
+type UserStatus struct {
+	// Name is the user's name. A directory user's name is the account
+	// service's text: print it quoted.
+	Name  string `json:"name"`
+	Admin bool   `json:"admin"`
+	// Source is config, local or directory.
+	Source string `json:"source"`
+}
+
+// The states of a directory server's user source (DirectoryStatus.State).
+const (
+	DirectoryStateTrusted           = "trusted"
+	DirectoryStateExpired           = "expired"
+	DirectoryStateNoCopy            = "no-copy"
+	DirectoryStateNotEnrolled       = "not-enrolled"
+	DirectoryStateEnrolmentUnusable = "enrolment-unusable"
+)
+
+// DirectoryStatus is the state of a directory server's user source.
+type DirectoryStatus struct {
+	// URL is the configured account service (the issuer); Organization the
+	// accepted organization ("" when not known yet); ClientID the server's
+	// enrolment ("" when not enrolled).
+	URL          string `json:"url"`
+	Organization string `json:"organization,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	// State is trusted, expired, no-copy, not-enrolled or
+	// enrolment-unusable, and Reason why it is not trusted.
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
+	// LastGoodPull is when the answer of the last list held arrived, and
+	// Version its version; absent before the first.
+	LastGoodPull *time.Time `json:"last_good_pull,omitempty"`
+	Version      string     `json:"version,omitempty"`
+	// TrustedUntil is when the list held is (or was) trusted until.
+	TrustedUntil *time.Time `json:"trusted_until,omitempty"`
+	// LastAttempt is when the last pull started, and LastError why it failed
+	// (absent when it was good).
+	LastAttempt *time.Time `json:"last_attempt,omitempty"`
+	LastError   string     `json:"last_error,omitempty"`
+	// NextAttempt is when the next scheduled pull is due; absent: at once.
+	NextAttempt *time.Time `json:"next_attempt,omitempty"`
+	// Copy is the kept copy's condition (none, kept, unused, not-written,
+	// stale-on-disk), and CopyError why it is not kept.
+	Copy      string `json:"copy"`
+	CopyError string `json:"copy_error,omitempty"`
+	// Skipped are the entries of the list held that the server does not
+	// answer for.
+	Skipped []SkippedEntry `json:"skipped"`
+	// ExpiredLocalAdmins names the local admins, by name only (no key, label
+	// or fingerprint), when every key of every local admin has expired: then
+	// no local admin can log in. Absent otherwise.
+	ExpiredLocalAdmins []string `json:"expired_local_admins,omitempty"`
+}
+
+// SkippedEntry is one entry of a directory's list that the server does not
+// answer for.
+type SkippedEntry struct {
+	// Name is the entry's name as the account service sent it ("" when it
+	// had none): print it quoted.
+	Name string `json:"name"`
+	// Reason is why, as a code (local-admin-name, duplicate-key, ...), and
+	// Description the same in words.
+	Reason      string `json:"reason"`
+	Description string `json:"description,omitempty"`
 }
 
 // GitHubLoginRefresh is one GitHub login's row in UsersRefreshResponse.

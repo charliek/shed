@@ -187,7 +187,13 @@ type Runtime struct {
 	// it. No reader of the lookup and no status takes it.
 	copyMu sync.Mutex
 
-	// mu guards everything below.
+	// mu guards everything below. A publication made by a pull (Install in
+	// Load and good, withdraw in notEnrolled) runs under it together with
+	// the record of what it published, and Status and row read the lookup's
+	// snapshot under it, so a status never pairs one list with another's
+	// record. The publication hook runs inside it then: it must not take mu
+	// (it does not: it closes SSH connections). The readers of the lookup
+	// never take it.
 	mu sync.Mutex
 	// seq numbers the lists offered to the lookup (Install), in the order
 	// their pulls started.
@@ -440,12 +446,14 @@ func (r *Runtime) Load() {
 		r.copyUnused(fmt.Sprintf("%s: %v", d.Join(CopyFileName), err))
 		return
 	}
+	// The list and the runtime's record of it change together (see good).
+	r.mu.Lock()
 	ok, err := r.Install(c.list, c.fetchedAt, r.trust, seq)
 	if err != nil || !ok {
+		r.mu.Unlock()
 		r.copyUnused(fmt.Sprintf("%s: not installed: %v", d.Join(CopyFileName), err))
 		return
 	}
-	r.mu.Lock()
 	r.lastGood, r.version = c.fetchedAt, c.list.Version
 	r.copyCond, r.copyErr = CopyKept, ""
 	r.mu.Unlock()
@@ -993,9 +1001,11 @@ func (r *Runtime) enrolled(es enrolState) {
 // in, and the listed users' SSH connections are closed), and the client and
 // its access token are forgotten.
 func (r *Runtime) notEnrolled(seq uint64, es enrolState, start time.Time) users.DirectoryRefresh {
-	withdrawn := r.withdraw(seq)
 	next := r.now().Add(RetryInterval)
+	// The withdrawal and the enrolment state it is for change together: a
+	// status never shows the list withdrawn under the state before.
 	r.mu.Lock()
+	withdrawn := r.withdraw(seq)
 	r.enrol = es
 	r.dropClientLocked()
 	r.lastAttempt, r.lastErr, r.next, r.retryEnd = start, es.describe(), next, time.Time{}
@@ -1015,7 +1025,11 @@ func (r *Runtime) notEnrolled(seq uint64, es enrolState, start time.Time) users.
 		r.logf("directory: the list is withdrawn: only the local admins can log in, and the listed users' SSH connections are closed")
 	}
 	r.logStale()
-	return r.row(false, es.describe())
+	row := r.row(false, es.describe())
+	if withdrawn && row.List == users.DirectoryListNone {
+		row.List = users.DirectoryListWithdrawn
+	}
+	return row
 }
 
 // describe is es in a status line.
@@ -1053,8 +1067,15 @@ func (r *Runtime) good(seq uint64, start time.Time, d *StateDir, e *Enrolment, p
 	}
 	before := r.State()
 	prev, _ := r.held()
+	// The list is published and the runtime's record of it (its version,
+	// when it arrived, the attempt, the copy) set under one hold of r.mu,
+	// which Status and row read under: no status pairs the new list with the
+	// previous version or pull time. The readers of the lookup take no lock
+	// and see the new list at its publication, as before.
+	r.mu.Lock()
 	ok, err := r.Install(p.List, p.FetchedAt, r.trust, seq)
 	if err != nil || !ok {
+		r.mu.Unlock()
 		if err == nil {
 			err = errors.New("a newer list was published first")
 		}
@@ -1070,7 +1091,6 @@ func (r *Runtime) good(seq uint64, start time.Time, d *StateDir, e *Enrolment, p
 		return r.failed(start, fmt.Errorf("installing the list: %w", err))
 	}
 	listed, skipped := r.held()
-	r.mu.Lock()
 	pastTrust := !r.pastTrust.IsZero()
 	prevCond := r.copyCond
 	r.lastGood, r.version = p.FetchedAt.Round(0), p.List.Version
@@ -1295,19 +1315,28 @@ func describeFailure(f *Failure, err error, next time.Time) (class, line string,
 }
 
 // row is the Directory row of an attempt that was good or failed with
-// errText: the version and counts are those of the list the lookup holds
-// after it.
+// errText: the version and counts are those of the list in force after it,
+// read from one snapshot (view) with the version recorded for it (under
+// r.mu, as good sets both). A list whose trust time has ended is not in
+// force: the row then has no version and no users, and says why (List).
 func (r *Runtime) row(good bool, errText string) users.DirectoryRefresh {
-	listed, skipped := r.held()
 	r.mu.Lock()
-	version := r.version
+	v := r.view()
+	version, pastTrust := r.version, !r.pastTrust.IsZero()
 	r.mu.Unlock()
-	if listed == nil {
-		version, skipped = "", nil
-	}
-	row := users.DirectoryRefresh{Status: users.DirectoryRefreshFailed, Version: version, Users: len(listed), Skipped: len(skipped), Error: errText}
+	row := users.DirectoryRefresh{Status: users.DirectoryRefreshFailed, Error: errText}
 	if good {
 		row.Status = users.DirectoryRefreshGood
+	}
+	switch {
+	case v.Listed && !v.Expired:
+		row.List, row.Version, row.Users, row.Skipped = users.DirectoryListInForce, version, v.Admitted, len(v.Skipped)
+	case v.Listed, pastTrust:
+		// The list held, or the kept copy found at start, is past its trust
+		// time.
+		row.List = users.DirectoryListTrustEnded
+	default:
+		row.List = users.DirectoryListNone
 	}
 	return row
 }
@@ -1431,13 +1460,19 @@ type Status struct {
 	Skipped []Skip
 }
 
-// Status reports the source's state now.
+// Status reports the source's state now, coherently: the lookup's part (the
+// state, whether the list is trusted, its deadline, the users and the skip
+// report) from one snapshot, loaded once, with one check of its trust time;
+// the runtime's own fields read together under r.mu, the lock a good pull
+// (good) and a withdrawal (notEnrolled) hold while they publish and record,
+// so the snapshot is never paired with the version, pull time or enrolment
+// of another.
 func (r *Runtime) Status() Status {
-	ls := r.State()
-	us := r.statusUsers()
-	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	v := r.view()
+	ls := v.State
+	now := r.now()
 	st := Status{
 		Issuer:       r.issuer,
 		Organization: r.organization,
@@ -1450,7 +1485,7 @@ func (r *Runtime) Status() Status {
 		NextAttempt:  r.nextAttemptLocked(now),
 		Copy:         r.copyCond,
 		CopyError:    r.copyErr,
-		Users:        us,
+		Users:        v.Users,
 		Skipped:      ls.Skipped,
 	}
 	if r.enrol.organization != "" {

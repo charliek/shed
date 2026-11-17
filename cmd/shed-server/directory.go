@@ -7,9 +7,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charliek/shed/internal/api"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/directory"
 )
+
+// A directory server's lookup reports its state at GET /api/users/status.
+var _ api.UsersStatusReporter = (*directory.Runtime)(nil)
 
 // Seams for tests of a directory server: the wall clock its lookup and
 // runtime run on, the ticks of its trust watch, the timers of its schedule
@@ -73,11 +77,7 @@ func directoryStartupLines(cfg *config.ServerConfig, rt *directory.Runtime, now 
 	lines := rt.StartupLines()
 	names := cfg.UserNames()
 	lines = append(lines, "Local admins: "+strings.Join(names, ", "))
-	total := 0
-	for _, name := range names {
-		total += len(cfg.Auth.Users[name].Keys)
-	}
-	if expired := cfg.ExpiredUserKeys(now); total > 0 && len(expired) == total {
+	if expired := cfg.EveryUserKeyExpired(now); expired != nil {
 		lines = append(lines, fmt.Sprintf("WARNING: every local admin key has expired (%s): no local admin can log in, and with the account service unreachable nobody can", strings.Join(expired, ", ")))
 	}
 	return lines

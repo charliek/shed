@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -269,13 +270,55 @@ type rtService struct {
 	// inflight is how many directory requests are being answered now, and
 	// maxInflight the most there have been at once.
 	inflight, maxInflight int
+	// conns are the service's connections not yet closed, in their state,
+	// and connChanged when one last changed state (real time).
+	conns       map[net.Conn]http.ConnState
+	connChanged time.Time
+}
+
+// connState tracks the service's connections (http.Server.ConnState).
+func (s *rtService) connState(c net.Conn, st http.ConnState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st == http.StateClosed || st == http.StateHijacked {
+		delete(s.conns, c)
+	} else {
+		s.conns[c] = st
+	}
+	s.connChanged = time.Now()
+}
+
+// quiet waits until no connection of the service is new (accepted, its
+// request not yet read) or active (a request being read or answered), and
+// none has changed state for settle: every request a client wrote before the
+// call has then arrived and been counted. It fails the test after a while.
+func (s *rtService) quiet(t *testing.T, settle time.Duration) {
+	t.Helper()
+	end := time.Now().Add(10 * time.Second)
+	for time.Now().Before(end) {
+		s.mu.Lock()
+		busy := time.Since(s.connChanged) < settle
+		for _, st := range s.conns {
+			if st == http.StateNew || st == http.StateActive {
+				busy = true
+			}
+		}
+		s.mu.Unlock()
+		if !busy {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("the service's connections did not go quiet")
 }
 
 func newRTService(t *testing.T, clock *fakeClock) *rtService {
 	t.Helper()
 	s := &rtService{t: t, clock: clock, arrived: make(chan struct{}, 1024), hung: make(chan struct{}, 1024),
-		dir: &memDirectory{codes: map[string]string{}, disabled: map[string]bool{}}}
+		dir:   &memDirectory{codes: map[string]string{}, disabled: map[string]bool{}},
+		conns: map[net.Conn]http.ConnState{}}
 	ts := httptest.NewUnstartedServer(nil)
+	ts.Config.ConnState = s.connState
 	s.issuer = "http://" + ts.Listener.Addr().String()
 	ref, err := refserver.New(refserver.Config{Issuer: s.issuer, Organization: worldOrg, Inputs: s.dir, Now: clock.Now})
 	if err != nil {
@@ -291,6 +334,12 @@ func (s *rtService) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/oauth2/token":
+			// Counted at arrival, before any work: a request the client sent,
+			// and then gave up on, is counted when it arrives, not after its
+			// answer has been made (which may be after the client stopped).
+			s.mu.Lock()
+			s.tokenReqs++
+			s.mu.Unlock()
 			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			form, _ := url.ParseQuery(string(body))
@@ -313,7 +362,6 @@ func (s *rtService) wrap(next http.Handler) http.Handler {
 				next.ServeHTTP(rec, r)
 			}
 			s.mu.Lock()
-			s.tokenReqs++
 			if a := form.Get("client_assertion"); a != "" {
 				s.assertions = append(s.assertions, a)
 			}

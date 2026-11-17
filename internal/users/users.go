@@ -178,7 +178,9 @@ const (
 	DirectoryRefreshGood = "good"
 	// DirectoryRefreshFailed: the pull failed (the service refused it, could
 	// not be reached, answered with something the server refuses, or the
-	// server is not enrolled). The list the server held before stays.
+	// server is not enrolled). The list the server held before stays, while
+	// its trust time lasts (DirectoryRefresh.List says whether it is in
+	// force).
 	DirectoryRefreshFailed = "failed"
 )
 
@@ -191,12 +193,33 @@ type DirectoryRefresh struct {
 	Version string
 	// Users is how many of that list's users the server admits, and Skipped
 	// how many of its entries it does not answer for (the local admins are
-	// not counted).
+	// not counted). Both are 0 when no list is in force.
 	Users, Skipped int
+	// List says whether a list is in force after the pull, and if not why:
+	// DirectoryListInForce, DirectoryListTrustEnded, DirectoryListWithdrawn or
+	// DirectoryListNone.
+	List string
 	// Error says why the pull failed, when it did. Text from the service in
 	// it is quoted.
 	Error string
 }
+
+// Whether a list is in force after a directory pull (DirectoryRefresh.List).
+const (
+	// DirectoryListInForce: the server answers for a list (Version), inside
+	// its trust time.
+	DirectoryListInForce = "in-force"
+	// DirectoryListTrustEnded: the trust time of the list the server holds
+	// has ended: only the local admins are admitted until a good pull.
+	DirectoryListTrustEnded = "trust-ended"
+	// DirectoryListWithdrawn: this pull found the server not enrolled (or its
+	// enrolment unusable) and withdrew the list it held: only the local
+	// admins are admitted.
+	DirectoryListWithdrawn = "withdrawn"
+	// DirectoryListNone: the server holds no list: only the local admins are
+	// admitted.
+	DirectoryListNone = "none"
+)
 
 // Login refresh statuses (LoginRefresh.Status).
 const (

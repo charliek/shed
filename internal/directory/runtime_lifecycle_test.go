@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,10 +118,20 @@ func TestRuntimeRequestAfterStopStartsNothing(t *testing.T) {
 
 // TestRuntimeRefreshRacingShutdown: admins' refreshes racing the stop each
 // return (a row or their own deadline), the barrier returns, and no pull
-// starts after it. Run under -race.
+// starts after it: no attempt runs after the barrier, and the service gets
+// no request after every request written before it has arrived. Run under
+// -race.
 func TestRuntimeRefreshRacingShutdown(t *testing.T) {
 	_, svc, dir, opsLine, _ := rtSetup(t)
-	srv := startRT(t, svc, dir, opsLine, nil)
+	var barrier atomic.Bool
+	var late atomic.Int64
+	srv := startRT(t, svc, dir, opsLine, func(rt *Runtime) {
+		rt.afterAttempt = func(users.DirectoryRefresh) {
+			if barrier.Load() {
+				late.Add(1)
+			}
+		}
+	})
 	srv.start()
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -167,11 +178,19 @@ func TestRuntimeRefreshRacingShutdown(t *testing.T) {
 		stopCallers()
 		t.Fatal("the barrier did not return while refreshes raced the stop")
 	}
+	barrier.Store(true)
+	// A request the client wrote before the barrier (its pull then cancelled)
+	// may still be on its way to the service: it is counted on arrival, so
+	// the count is taken once the service's connections are quiet.
+	svc.quiet(t, 50*time.Millisecond)
 	n := svc.directoryCount() + svc.tokenCount()
 	time.Sleep(50 * time.Millisecond)
 	stopCallers()
 	if m := svc.directoryCount() + svc.tokenCount(); m != n {
 		t.Fatalf("%d requests sent after the barrier returned", m-n)
+	}
+	if k := late.Load(); k != 0 {
+		t.Fatalf("%d pulls ran after the barrier returned", k)
 	}
 }
 

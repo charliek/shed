@@ -506,7 +506,12 @@ func (l *Lookup) BoundCredentialsOnly() {}
 // latches, the end of the list's trust time.
 func (l *Lookup) State() State {
 	s := l.load()
-	listed := l.trusted(s)
+	return stateOf(s, l.trusted(s))
+}
+
+// stateOf is the State of s, whose trusted listed users (trusted) are
+// listed, or nil.
+func stateOf(s *snapshot, listed *userSet) State {
 	return State{
 		Gen:       s.gen,
 		Seq:       s.seq,
@@ -516,6 +521,38 @@ func (l *Lookup) State() State {
 		Expired:   s.listed != nil && listed == nil,
 		Skipped:   append([]Skip(nil), s.skipped...),
 	}
+}
+
+// view is the lookup's part of a status or a refresh row: its state, the
+// users it answers for (with where each comes from, sorted by name) and how
+// many of them are the list's, all from one snapshot, loaded once, with one
+// check of its trust time. Like every reader it finds, and latches, the end
+// of the list's trust time.
+type view struct {
+	State
+	Users []StatusUser
+	// Admitted is how many of Users are the list's (0 when no list is in
+	// force: none held, or its trust time ended).
+	Admitted int
+}
+
+// view reads the lookup's view (see the type).
+func (l *Lookup) view() view {
+	s := l.load()
+	listed := l.trusted(s)
+	v := view{State: stateOf(s, listed)}
+	v.Users = make([]StatusUser, 0, len(s.local.users))
+	for _, u := range s.local.users {
+		v.Users = append(v.Users, StatusUser{Name: u.Name, Admin: u.Admin, Source: UserLocal})
+	}
+	if listed != nil {
+		for _, u := range listed.users {
+			v.Users = append(v.Users, StatusUser{Name: u.Name, Admin: u.Admin, Source: UserDirectory})
+		}
+		v.Admitted = len(listed.users)
+	}
+	sort.Slice(v.Users, func(i, j int) bool { return v.Users[i].Name < v.Users[j].Name })
+	return v
 }
 
 // load is the snapshot a reader answers from, loaded once.
@@ -626,7 +663,9 @@ func (l *Lookup) publication(s *snapshot) Publication {
 // a time, in the order of the publications, after readers already see the
 // new state; the next publication waits for it.
 //
-// The hook's contract: no network and no other blocking work. On a directory
+// The hook's contract: no network and no other blocking work, and no call
+// into a Runtime over the lookup (a pull's publication runs under the
+// runtime's lock, which Status and Refresh's row take). On a directory
 // server it does one thing, close the sockets of the SSH connections of users
 // the new state no longer has (sshd's CloseConnectionsExcept, which closes
 // every such socket before it writes any log line).
@@ -773,25 +812,6 @@ type StatusUser struct {
 	Name   string
 	Admin  bool
 	Source UserSource
-}
-
-// statusUsers lists the users the lookup answers for now, with where each
-// comes from, sorted by name. Like every reader it finds, and latches, the
-// end of the list's trust time.
-func (l *Lookup) statusUsers() []StatusUser {
-	s := l.load()
-	listed := l.trusted(s)
-	out := make([]StatusUser, 0, len(s.local.users))
-	for _, u := range s.local.users {
-		out = append(out, StatusUser{Name: u.Name, Admin: u.Admin, Source: UserLocal})
-	}
-	if listed != nil {
-		for _, u := range listed.users {
-			out = append(out, StatusUser{Name: u.Name, Admin: u.Admin, Source: UserDirectory})
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
 }
 
 // trustEndOf is the snapshot that publishes the end of s's trust time: s's
