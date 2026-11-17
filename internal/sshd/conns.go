@@ -2,6 +2,7 @@ package sshd
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"sort"
@@ -129,8 +130,11 @@ func (s *Server) untrackLocked(c *trackedConn) {
 // CloseConnectionsExcept closes every tracked connection whose user keep
 // rejects, which ends every channel open on it, and returns how many
 // connections it closed. It closes the socket of every such connection first,
-// and only after that sweep writes its log lines (one per user, with the
-// count), so a slow log writer never delays or prevents a close. keep is
+// and only after that sweep are its log lines written (one per user, with
+// the count), from a goroutine of their own, outside every lock, so a slow
+// or blocked log writer never delays or prevents a close, and never holds
+// the publication that called it (nor, through it, the next publication or
+// an unknown-key login waiting for the directory runtime's lock). keep is
 // called with each tracked user's name, under the server's connection lock:
 // it must not block or call back into the server. With
 // KeyAuth.TrackConnections unset nothing is tracked, and it closes nothing.
@@ -163,13 +167,23 @@ func (s *Server) CloseConnectionsExcept(keep func(name string) bool) int {
 		closed += len(conns)
 	}
 
+	if closed == 0 {
+		return 0
+	}
 	names := make([]string, 0, len(byUser))
 	for name := range byUser {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	for _, name := range names {
-		log.Printf("SSH: closed %d connection(s) of user %q: no longer a user of this server", len(byUser[name]), name)
+	lines := make([]string, len(names))
+	for i, name := range names {
+		lines[i] = fmt.Sprintf("SSH: closed %d connection(s) of user %q: no longer a user of this server", len(byUser[name]), name)
 	}
+	// Not joined, by choice: a line not yet written when the process exits is lost.
+	go func() {
+		for _, line := range lines {
+			log.Print(line)
+		}
+	}()
 	return closed
 }

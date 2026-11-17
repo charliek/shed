@@ -273,8 +273,17 @@ are outside its reach.
   if the clock moves back; only a good pull restores the list.
 - **The end of the trust time is durable.** When it ends, the kept copy is
   removed, so a restart after it starts with only the local admins, whatever
-  the clock says then. A removal that fails is tried again at each turn of the
-  schedule, and status shows `stale-on-disk` meanwhile.
+  the clock says then. The removal happens at once when a login or request
+  finds the end, within 30 seconds otherwise, and at a graceful stop of the
+  server, checked as the stop begins and again as its last step, after the
+  SSH server and the API have shut down (each check waited for up to 5
+  seconds); a pull that ends after the stop began writes no copy. A removal
+  that fails is tried again at each turn of the schedule, and status shows
+  `stale-on-disk` meanwhile. What remains: a server that dies without a graceful stop in the
+  moment between the end of the trust time and the removal of the copy,
+  followed by a clock set back and a restart while the service cannot be
+  reached, brings the list back for what remains of its trust time on that
+  clock. An accurate clock is a prerequisite.
 - **At start** the kept copy is used only when it passes the file checks
   below, names the current enrolment's issuer and client id and an accepted
   organization, was fetched no later than the current wall clock, passes

@@ -263,11 +263,14 @@ method `private_key_jwt` with `ES256` and `EdDSA`, and the scope
 **Retries.** A client signs a **fresh assertion, with a new `jti`, for
 every attempt**, after any failure, and never sends one twice. A 429, a 5xx,
 a timeout or a refused connection is a failed refresh: retry after 15
-minutes, and never before `Retry-After` (rule 2). On a 401, log the
+minutes, and never before `Retry-After` (rule 2), except that a refresh an
+operator asks for explicitly may be sent sooner. On a 401, log the
 response's `Date` header beside the client's own clock (a skewed clock is
-the usual cause). Client timeouts: 30 seconds for a background refresh, 20
-seconds for the fetch an unknown key triggers (the service may be starting
-from cold).
+the usual cause). Client timeouts: 30 seconds for a refresh (a background
+one, one an operator asks for, or one an unknown key starts). A login by an
+unknown key waits at most 20 seconds for the refresh it started (the
+service may be starting from cold); that refresh may run on to its own
+bound, and its result still applies.
 
 ## 3. The directory
 
@@ -326,14 +329,25 @@ refresh that fails never shortens or empties the copy a client keeps.
 ### Keeping the list
 
 A **good pull** is a 200 whose body rules 1 and 6 accept and whose
-`organization` the client accepts (rule 5). Anything else (any other status,
+`organization` the client accepts (rule 5), and that holds no access token
+the client presented in that pull (below). Anything else (any other status,
 a redirect, a timeout, a body the client refuses) is a **failed refresh**.
+
+**An answer never holds a client's credentials.** A service never puts a
+client's access token, or any credential a client presented, in an answer.
+A client may refuse, as a failed refresh, an answer that contains an access
+token it presented in that pull, wherever in the answer it appears (in a
+member a client ignores, in a user's name, anywhere else): that is the one
+exception to the rule that one bad user never rejects the whole list
+(below, under "The list is authoritative").
 
 - **Refresh.** A client pulls on a schedule (every 24 hours by default, a
   setting of the client), at once when a key it does not know tries to log
   in (at most once a minute for the whole client, the login waiting at most
-  20 seconds), and when an admin asks for it. A failed refresh is retried
-  every 15 minutes, never before a `Retry-After` (rule 2).
+  20 seconds for it, while the pull runs on to its own bound and its result
+  still applies), and when an admin asks for it. A failed refresh is retried
+  every 15 minutes, never before a `Retry-After` (rule 2); a refresh an
+  operator asks for explicitly may be sent sooner.
 - **Trust time.** The kept copy authorizes logins for a fixed time after
   the **last good pull** (72 hours by default, a setting of the client),
   counted from when that pull's answer arrived. The client stores that
@@ -404,7 +418,10 @@ logged; the rest of the list stands. Whether a listed key is one a local
 admin holds is decided by the same identity rule 7 uses for duplicates:
 the key blob, never the text of the line. A client never discards the whole list
 for one bad user, and never passes the list through a path where an empty
-list means "unconfigured" or a list without an admin fails to load.
+list means "unconfigured" or a list without an admin fails to load. The one
+exception: an answer that contains an access token the client presented in
+that pull, in a user or anywhere else, may be refused whole, as a failed
+refresh ("An answer never holds a client's credentials", above).
 
 ### Reserved
 
@@ -430,7 +447,8 @@ a service never relies on that.
    whitespace (spaces and tabs) is trimmed from both ends, is one or more
    ASCII digits (`0` to `9`) and nothing else. That is a number of
    seconds; the client waits at least that long, up to one hour, and
-   treats a larger value (however many digits it has) as one hour.
+   treats a larger value (however many digits it has) as one hour. A
+   refresh its operator asks for explicitly may be sent sooner.
    Anything else is treated as absent: an HTTP date, a sign (`+` or `-`), a
    decimal point, any other character, an empty value, or the header given
    more than once. Absent, the 15-minute retry applies.

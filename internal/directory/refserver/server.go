@@ -14,6 +14,14 @@
 // moves back, an assertion whose acceptance window ended before the latest
 // time the server has seen is refused until the clock catches up.
 //
+// Its command's control directory (ControlDir) does not model everything a
+// service keeps; these are limits of a test tool, not of the contract: a
+// code in the codes file does not expire (until it is spent, or removed
+// from the file, it is accepted however old it is, and a restart forgets
+// which codes were spent), and a client id
+// removed from the disabled file is enabled again (on a real service a
+// disabled server stays disabled, and enrols again with a new code).
+//
 // Its verification shares no code with shed's client of the contract
 // (internal/directory): each side uses the standard library's crypto on its
 // own, so the two cannot agree on one mistake.

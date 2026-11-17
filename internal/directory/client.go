@@ -1,6 +1,7 @@
 package directory
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -167,13 +168,14 @@ func (c *Client) Pull(ctx context.Context) (*Pull, error) {
 	if err != nil {
 		return nil, err
 	}
-	p, f := c.fetch(ctx, tok, &sk)
+	p, f := c.fetch(ctx, tok, &sk, nil)
 	if f != nil && f.Kind == KindInvalidToken {
 		c.forget(tok)
+		first := tok
 		if tok, err = c.accessToken(ctx, &sk); err != nil {
 			return nil, err
 		}
-		p, f = c.fetch(ctx, tok, &sk)
+		p, f = c.fetch(ctx, tok, &sk, []string{first})
 		if f != nil && f.Kind == KindInvalidToken {
 			c.forget(tok)
 		}
@@ -185,8 +187,13 @@ func (c *Client) Pull(ctx context.Context) (*Pull, error) {
 	return p, nil
 }
 
-// fetch is one GET of the directory with tok.
-func (c *Client) fetch(ctx context.Context, tok string, sk *skew) (*Pull, *Failure) {
+// fetch is one GET of the directory with tok; earlier are the access tokens
+// this pull sent before it (the one a 401 refused). A 200 that would be a
+// good pull is refused when its body holds tok or one of earlier (echoes):
+// the service has reflected a credential this server sent, and nothing of
+// that answer may be kept or logged.
+func (c *Client) fetch(ctx context.Context, tok string, sk *skew, earlier []string) (*Pull, *Failure) {
+	sent := append([]string{tok}, earlier...)
 	req, err := newRequest(ctx, http.MethodGet, c.issuer+"/v1/directory", nil)
 	if err != nil {
 		return nil, &Failure{Step: StepDirectory, Kind: KindTransport, Err: err}
@@ -195,10 +202,64 @@ func (c *Client) fetch(ctx context.Context, tok string, sk *skew) (*Pull, *Failu
 	a, f := exchange(c.hc, req, StepDirectory, http.StatusOK, MaxDirectoryBody, c.now)
 	sk.see(a)
 	if f != nil {
-		return nil, scrub(f, tok)
+		return nil, scrub(f, sent...)
 	}
 	p, f := classifyDirectory(a, c.organization)
-	return p, scrub(f, tok)
+	if f == nil {
+		echoed, err := echoes(a.body, sent)
+		switch {
+		case err != nil:
+			return nil, a.fail(StepDirectory, KindBadAnswer, errors.New("the answer could not be read again for the credential check"))
+		case echoed:
+			return nil, a.fail(StepDirectory, KindCredentialEchoed, errEchoed)
+		}
+	}
+	return p, scrub(f, sent...)
+}
+
+// errEchoed is the failure of a directory answer that holds the access token
+// the request carried. It never holds the token.
+var errEchoed = errors.New("the answer holds the access token this server sent with the request; it is refused, and nothing of it is kept")
+
+// echoes reports whether body, a directory answer that rules 1, 5 and 6
+// accepted, holds any of sent (the access tokens this pull carried): as its
+// bytes stand, or inside any JSON string (a member's name or a value, an
+// ignored member's included) once its escapes are read, so an escaped
+// spelling of a token is found too. An error is a body the decoder could not
+// read again, which the caller refuses.
+func echoes(body []byte, sent []string) (bool, error) {
+	var live []string
+	for _, s := range sent {
+		if s != "" {
+			live = append(live, s)
+		}
+	}
+	if len(live) == 0 {
+		return false, nil
+	}
+	for _, s := range live {
+		if bytes.Contains(body, []byte(s)) {
+			return true, nil
+		}
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if s, ok := tok.(string); ok {
+			for _, t := range live {
+				if strings.Contains(s, t) {
+					return true, nil
+				}
+			}
+		}
+	}
 }
 
 // classifyDirectory turns one answer of GET /v1/directory into a good pull

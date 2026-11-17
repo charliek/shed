@@ -143,6 +143,11 @@ type Lookup struct {
 	pubMu sync.Mutex
 	// hook is the publication hook, guarded by pubMu.
 	hook func(Publication)
+	// latched is told, without blocking, each time a reader sets a
+	// snapshot's latch (trusted): the runtime's trust watch then removes the
+	// kept copy at once rather than at its next tick. It holds one signal; a
+	// signal sent while one waits is dropped (the one waiting covers it).
+	latched chan struct{}
 	// loaded, when set (by tests only), runs in every reader just after it
 	// has loaded its snapshot.
 	loaded func()
@@ -235,7 +240,7 @@ func newLookup(opts LookupOptions, list *List) (*Lookup, error) {
 	}
 	l := &Lookup{
 		maxAuthTries: opts.MaxAuthTries, admins: admins, clients: clients,
-		clock: opts.Now, trustTicks: opts.TrustTicks,
+		clock: opts.Now, trustTicks: opts.TrustTicks, latched: make(chan struct{}, 1),
 	}
 	if l.clock == nil {
 		l.clock = time.Now
@@ -580,6 +585,10 @@ func (l *Lookup) now() time.Time { return l.clock().Round(0) }
 // are accepted: another reader may have set it between this one's first read
 // and its clock reading, and the clock may have moved back since, so a
 // reading before the deadline alone does not show the list is still trusted.
+//
+// The reader that sets the latch tells the runtime so (latched), without
+// blocking and without taking a lock or touching the disk: the runtime's
+// trust watch removes the kept copy at once.
 func (l *Lookup) trusted(s *snapshot) *userSet {
 	if s.listed == nil || s.expired.Load() {
 		return nil
@@ -591,7 +600,12 @@ func (l *Lookup) trusted(s *snapshot) *userSet {
 		l.latchRead()
 	}
 	if !l.now().Before(s.deadline) {
-		s.expired.Store(true)
+		if s.expired.CompareAndSwap(false, true) {
+			select {
+			case l.latched <- struct{}{}:
+			default:
+			}
+		}
 		return nil
 	}
 	if s.expired.Load() {
@@ -668,7 +682,8 @@ func (l *Lookup) publication(s *snapshot) Publication {
 // runtime's lock, which Status and Refresh's row take). On a directory
 // server it does one thing, close the sockets of the SSH connections of users
 // the new state no longer has (sshd's CloseConnectionsExcept, which closes
-// every such socket before it writes any log line).
+// every such socket first and leaves its log lines to a goroutine of their
+// own, so a blocked log writer holds no publication).
 func (l *Lookup) SetPublicationHook(fn func(Publication)) {
 	l.pubMu.Lock()
 	defer l.pubMu.Unlock()
@@ -726,11 +741,14 @@ func (l *Lookup) Install(list *List, fetchedAt time.Time, trust time.Duration, s
 // WatchTrust checks, at every tick of its ticker (every TrustCheckEvery),
 // whether the trust time of the list the lookup holds has ended, and when it
 // has publishes the end (checkTrust), until ctx ends.
-func (l *Lookup) WatchTrust(ctx context.Context) { l.watchTrust(ctx, nil) }
+func (l *Lookup) WatchTrust(ctx context.Context) { l.watchTrust(ctx, nil, nil) }
 
 // watchTrust is WatchTrust, running after (when set) after each tick's
-// check, once the publication it may have made, and its hook, are over.
-func (l *Lookup) watchTrust(ctx context.Context, after func()) {
+// check, once the publication it may have made, and its hook, are over; and
+// also, with no check of its own, each time latched is told that a reader
+// set a snapshot's latch (nil: never). The ticker stays the backstop, and
+// the end of the trust time is published at its ticks only.
+func (l *Lookup) watchTrust(ctx context.Context, latched <-chan struct{}, after func()) {
 	ticks, stop := l.trustTicks()
 	defer stop()
 	for {
@@ -739,6 +757,10 @@ func (l *Lookup) watchTrust(ctx context.Context, after func()) {
 			return
 		case <-ticks:
 			l.checkTrust()
+			if after != nil {
+				after()
+			}
+		case <-latched:
 			if after != nil {
 				after()
 			}

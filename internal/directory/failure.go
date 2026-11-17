@@ -59,6 +59,13 @@ const (
 	// refuses (rules 5 and 6, a token answer without its members, a 201
 	// that fails its checks).
 	KindBadAnswer Kind = "bad-answer"
+	// KindCredentialEchoed: a directory 200 whose body holds the access
+	// token the request carried (anywhere: a member a reader ignores, an
+	// entry's name, a string written with escapes). Not a good pull: nothing
+	// of the answer is kept, published or logged, so the token reaches
+	// neither the kept copy nor a skipped entry's log line. The failure's
+	// text never holds the token.
+	KindCredentialEchoed Kind = "credential-echoed"
 )
 
 // Failure is one failed request of the contract.

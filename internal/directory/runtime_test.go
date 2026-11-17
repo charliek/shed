@@ -621,7 +621,7 @@ func TestRuntimeSchedule(t *testing.T) {
 	waits := make(chan time.Time, 1024)
 	srv := startRT(t, svc, dir, opsLine, func(rt *Runtime) {
 		rt.afterAttempt = func(row users.DirectoryRefresh) { attempts <- row }
-		rt.beforeWait = func(now time.Time) { waits <- now }
+		rt.beforeWait = func(now, _ time.Time) { waits <- now }
 	})
 	// idleAt waits until the schedule has read the clock at at and gone
 	// back to waiting.

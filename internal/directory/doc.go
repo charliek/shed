@@ -59,16 +59,28 @@
 //     next start loads it (under every start-up check); that crash window is
 //     not a bug. When the trust time of the list ends (or a copy past it is
 //     found at start), the copy is removed durably, outside the publication
-//     and every lock readers take, and tried again at each turn of the
-//     schedule if that fails, so a restart starts with only the local
-//     admins whatever its clock says. A pull's network work is bounded by
+//     and every lock readers take: at once when a reader finds the end (it
+//     tells the runtime without blocking, taking no lock and doing no disk
+//     work), at the trust watch's ticks, at each turn of the schedule (where
+//     a removal that failed is tried again), and at a graceful stop
+//     (CheckTrustAtStop), so a restart starts with only the local admins
+//     whatever its clock says. What remains: a process that dies without a
+//     graceful stop in the moment between the end of the trust time and the
+//     removal of the copy, followed by a clock set back and a restart while
+//     the service cannot be reached, brings the list back for what remains
+//     of its trust time on that clock; an accurate clock is a prerequisite.
+//     A pull's network work is bounded by
 //     PullTimeout; the storage work around it is not interruptible and lies
 //     outside that bound.
 //     Refresh (`shed users refresh`) pulls at once and reports the pull as
 //     a row; Status is what an admin is shown.
 //   - Every text a Failure takes from an answer has the credential the
 //     request carried (the assertion, the access token) replaced by
-//     CredentialMarker, so nothing that logs a failure can show it.
+//     CredentialMarker, so nothing that logs a failure can show it. A
+//     directory 200 whose body holds the access token the request carried
+//     (as its bytes stand or inside any JSON string) is not a good pull but
+//     a failure of its own kind (KindCredentialEchoed), so the token reaches
+//     neither the kept copy nor a skipped entry's log line.
 //   - The state files (enrolment.json, users.json) are read only after
 //     checks of their directory and themselves (ReadStateFile), written
 //     durably (WriteStateFile) or once (CreateStateFileOnce), always through

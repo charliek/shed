@@ -236,7 +236,55 @@ const (
 	// faultRedirectBearer: every directory request is answered 302 to a
 	// Location carrying the bearer token it received.
 	faultRedirectBearer faultMode = "redirect-bearer"
+	// faultEchoIgnored: every directory request is answered with the
+	// reference server's 200, plus a top-level member a reader ignores
+	// holding the bearer token it received.
+	faultEchoIgnored faultMode = "echo-ignored-member"
+	// faultEchoName: the reference server's 200, plus a first entry whose
+	// name is the bearer token it received (not a user name: skipped).
+	faultEchoName faultMode = "echo-entry-name"
+	// faultEchoEscaped: as faultEchoIgnored, the token written with its
+	// first character as a \u escape, so its bytes do not appear as they
+	// stand.
+	faultEchoEscaped faultMode = "echo-escaped"
 )
+
+// echoBearer is body, a directory 200, with bearer reflected as mode says;
+// line is the key the entry faultEchoName adds lists. It runs in the
+// service's handler: it reports a problem with t.Errorf, never t.Fatal.
+func echoBearer(t *testing.T, mode faultMode, body []byte, bearer, line string) []byte {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		t.Errorf("the reference server's answer: %v", err)
+		return body
+	}
+	switch mode {
+	case faultEchoIgnored, faultEchoEscaped:
+		top["note"], _ = json.Marshal("seen " + bearer)
+	case faultEchoName:
+		var list []json.RawMessage
+		if err := json.Unmarshal(top["users"], &list); err != nil {
+			t.Errorf("the reference server's users: %v", err)
+			return body
+		}
+		entry, _ := json.Marshal(map[string]any{"name": bearer, "admin": false,
+			"keys": []map[string]string{{"key": line, "label": "laptop"}}})
+		top["users"], _ = json.Marshal(append([]json.RawMessage{entry}, list...))
+	}
+	out, err := json.Marshal(top)
+	if err != nil {
+		t.Errorf("echo: %v", err)
+		return body
+	}
+	if mode == faultEchoEscaped {
+		escaped := fmt.Sprintf(`\u%04x`, bearer[0]) + bearer[1:]
+		out = bytes.Replace(out, []byte(bearer), []byte(escaped), 1)
+		if bytes.Contains(out, []byte(bearer)) {
+			t.Error("the escaped echo still holds the token's bytes")
+		}
+	}
+	return out
+}
 
 // rtService is the reference server behind a recorder that can also answer
 // in its place (faultMode), hold the directory's answers (gate), and keep
@@ -264,9 +312,14 @@ type rtService struct {
 	gateMode       faultMode
 	gateRetryAfter string
 	directory      int
-	tokenReqs      int
-	tokens         []string
-	assertions     []string
+	// echoed counts the 200s answered with the bearer reflected
+	// (faultEchoIgnored, faultEchoName, faultEchoEscaped).
+	echoed int
+	// echoKey is the key line of the entry faultEchoName adds.
+	echoKey    string
+	tokenReqs  int
+	tokens     []string
+	assertions []string
 	// inflight is how many directory requests are being answered now, and
 	// maxInflight the most there have been at once.
 	inflight, maxInflight int
@@ -422,6 +475,17 @@ func (s *rtService) wrap(next http.Handler) http.Handler {
 			}
 			rec := httptest.NewRecorder()
 			next.ServeHTTP(rec, r)
+			if (mode == faultEchoIgnored || mode == faultEchoName || mode == faultEchoEscaped) && rec.Code == http.StatusOK {
+				s.mu.Lock()
+				line := s.echoKey
+				s.mu.Unlock()
+				echoed := echoBearer(s.t, mode, rec.Body.Bytes(), bearer, line)
+				rec.Body.Reset()
+				rec.Body.Write(echoed)
+				s.mu.Lock()
+				s.echoed++
+				s.mu.Unlock()
+			}
 			select {
 			case s.arrived <- struct{}{}:
 			default:

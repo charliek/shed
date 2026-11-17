@@ -186,6 +186,13 @@ type Runtime struct {
 	// between the two), and the removal at the end of the trust time holds
 	// it. No reader of the lookup and no status takes it.
 	copyMu sync.Mutex
+	// fenced is set once the runtime has been told to stop
+	// (CheckTrustAtStop), before that stop takes copyMu: from then on no
+	// pull writes a copy or installs a list. good reads it (and the
+	// runtime's context) under copyMu, so a pull's write either ended
+	// before the stop's check of the trust time, which waits for copyMu, or
+	// never starts.
+	fenced atomic.Bool
 
 	// mu guards everything below. A publication made by a pull (Install in
 	// Load and good, withdraw in notEnrolled) runs under it together with
@@ -243,9 +250,9 @@ type Runtime struct {
 	writeCopy    func(d *StateDir, data []byte) error
 	removeCopy   func(d *StateDir) error
 	afterAttempt func(users.DirectoryRefresh)
-	// beforeWait runs when the schedule, having read the clock (now) and
-	// armed its timer, is about to wait.
-	beforeWait func(now time.Time)
+	// beforeWait runs when the schedule, having read the clock (now), found
+	// its next attempt (next) and armed its timer, is about to wait.
+	beforeWait func(now, next time.Time)
 	// afterDone runs in the pull goroutine after a pull's callers were told
 	// its result and before the next pull asked for is taken up.
 	afterDone func()
@@ -487,9 +494,10 @@ func (r *Runtime) StartRefresh(ctx context.Context) {
 	r.wg.Add(2)
 	go func() {
 		defer r.wg.Done()
-		// After each tick's check, outside the publication and its lock:
-		// when the trust time has ended, the kept copy is removed.
-		r.watchTrust(r.ctx, r.removeExpiredCopy)
+		// After each tick's check, outside the publication and its lock, and
+		// at once when a reader latches the end of the trust time: when it
+		// has ended, the kept copy is removed.
+		r.watchTrust(r.ctx, r.latched, r.removeExpiredCopy)
 	}()
 	go func() {
 		defer r.wg.Done()
@@ -506,6 +514,37 @@ func (r *Runtime) wait() {
 	r.stopped = true
 	r.fmu.Unlock()
 	r.wg.Wait()
+}
+
+// StopTrustBound is how long a graceful stop of the server waits for
+// CheckTrustAtStop.
+const StopTrustBound = 5 * time.Second
+
+// CheckTrustAtStop is a graceful stop's step, and its last directory work:
+// it fences the kept copy, so that no pull writes a copy or installs a list
+// from then on (a pull that ends later is discarded: its answer is not
+// written, not published and not logged as a good pull), then checks the
+// trust time once more and, when it has ended, removes the kept copy
+// (removeExpiredCopy), so that a stop after the end leaves no copy a
+// restart with its clock set back could bring back. A pull already writing
+// its copy ends first (copyMu), and its list is what is checked. It waits
+// for the check until ctx ends, and returns ctx's error if it ended first
+// (the check then carries on while the process lives). It sends nothing,
+// and may be called again: serve calls it at the start of a stop and once
+// more after the servers have shut down.
+func (r *Runtime) CheckTrustAtStop(ctx context.Context) error {
+	r.fenced.Store(true)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.removeExpiredCopy()
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Refresh pulls the list now (`shed users refresh`), ignoring a pending
@@ -749,18 +788,21 @@ func (r *Runtime) retryLeftLocked(el time.Time) time.Duration {
 }
 
 // nextAttempt is when the schedule's next attempt is due, read at now on
-// the wall clock: the next attempt recorded, put off (and recorded, so
-// status shows it) to the end of the pending Retry-After when that is
-// later. The Retry-After's end is measured as elapsed time, so a wall clock
+// the wall clock: the later of the schedule's own next attempt (r.next, on
+// the wall clock) and now plus what is left of the pending Retry-After (on
+// the elapsed clock). The two are kept apart and the result is never
+// written back over r.next: a Retry-After projected onto a wall clock set
+// forward, then corrected back, would otherwise put the schedule off by the
+// correction. The Retry-After is measured as elapsed time, so a wall clock
 // set forward while it runs does not bring a scheduled pull inside it.
+// Status shows the same value (nextAttemptLocked).
 func (r *Runtime) nextAttempt(now time.Time) time.Time {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.next = r.nextAttemptLocked(now)
-	return r.next
+	return r.nextAttemptLocked(now)
 }
 
-// nextAttemptLocked is nextAttempt without recording it; r.mu is held.
+// nextAttemptLocked is nextAttempt; r.mu is held.
 func (r *Runtime) nextAttemptLocked(now time.Time) time.Time {
 	next := r.next
 	if left := r.retryLeftLocked(r.elapsed()); left > 0 {
@@ -801,7 +843,7 @@ func (r *Runtime) schedule() {
 			continue
 		}
 		if r.beforeWait != nil {
-			r.beforeWait(now)
+			r.beforeWait(now, next)
 		}
 		select {
 		case <-r.ctx.Done():
@@ -1055,8 +1097,18 @@ func (es enrolState) describe() string {
 // holds a list that was never published. That list is the service's own
 // answer to a good pull, fully checked, and loading it at the next start
 // (under every start-up check) is correct; the crash window is not a bug.
+//
+// Once the runtime has been told to stop, the answer is discarded
+// (CheckTrustAtStop).
 func (r *Runtime) good(seq uint64, start time.Time, d *StateDir, e *Enrolment, p *Pull) users.DirectoryRefresh {
 	r.copyMu.Lock()
+	if r.fenced.Load() || r.ctx.Err() != nil {
+		// Told to stop (CheckTrustAtStop, or the runtime's context ended):
+		// the answer is discarded, unwritten and unpublished, so no copy is
+		// written after the stop's check of the trust time.
+		r.copyMu.Unlock()
+		return r.row(false, "the server is stopping")
+	}
 	cond, why := CopyKept, ""
 	data, err := marshalCopy(e, p)
 	if err == nil {
@@ -1174,9 +1226,17 @@ func (r *Runtime) trustEnd() (end time.Time, ok bool) {
 // start), the kept copy is removed (unlinked, the directory synced), so a
 // restart, whatever its clock then says, starts with only the local admins
 // until a good pull. It runs outside the publication hook and outside every
-// lock the readers take, after each check of the trust watch and at each
-// turn of the schedule; a removal that failed is tried again then. The last
+// lock the readers take: at once when a reader latches the end (the trust
+// watch is told, without the reader blocking), after each check of the trust
+// watch, at each turn of the schedule, and at a graceful stop
+// (CheckTrustAtStop); a removal that failed is tried again then. The last
 // good pull's time and version stay known (Status) until the server stops.
+//
+// What remains: a process that dies without a graceful stop in the moment
+// between the end of the trust time and this removal, followed by a clock
+// set back and a restart while the service cannot be reached, brings the
+// list back for what remains of its trust time on that clock. An accurate
+// clock is a prerequisite of the trust time.
 func (r *Runtime) removeExpiredCopy() {
 	r.copyMu.Lock()
 	defer r.copyMu.Unlock()
@@ -1240,10 +1300,10 @@ func (r *Runtime) endedCopy(end time.Time, err error) {
 // Retry-After (at most MaxRetryAfter) is kept, as elapsed time, as the
 // runtime's one outstanding Retry-After (retryEnd): a later failure never
 // ends a pending one sooner, with no Retry-After or a shorter one; the later
-// end is kept. The next attempt is 15 minutes away, or the end of that
-// outstanding Retry-After when later, whatever this failure's own answer
-// carried: an admin's refresh that fails inside it does not bring the
-// schedule closer.
+// end is kept. The schedule's own next attempt (r.next) is 15 minutes away;
+// the next attempt is that, or the end of the outstanding Retry-After when
+// later (nextAttemptLocked), whatever this failure's own answer carried: an
+// admin's refresh that fails inside it does not bring the schedule closer.
 func (r *Runtime) failed(start time.Time, err error) users.DirectoryRefresh {
 	now := r.now()
 	var f *Failure
@@ -1259,12 +1319,13 @@ func (r *Runtime) failed(start time.Time, err error) users.DirectoryRefresh {
 			r.retryEnd = end
 		}
 	}
-	next := now.Add(max(RetryInterval, r.retryLeftLocked(el)))
+	r.next = now.Add(RetryInterval)
+	next := r.nextAttemptLocked(now)
 	// The row and the line's account of the list in force are read from one
 	// view.
 	row := r.rowLocked(false, err.Error())
 	class, line, everyAttempt := describeFailure(f, err, next, row.List)
-	r.lastAttempt, r.lastErr, r.next = start, err.Error(), next
+	r.lastAttempt, r.lastErr = start, err.Error()
 	logIt := everyAttempt || r.failClass != class
 	r.failClass, r.goodLogged = class, ""
 	r.mu.Unlock()

@@ -26,8 +26,12 @@ type schedProbe struct {
 	svc      *rtService
 	srv      *rtServer
 	attempts chan users.DirectoryRefresh
-	waits    chan time.Time
+	waits    chan schedWait
 }
+
+// schedWait is one return of the schedule to waiting: the clock it read and
+// the next attempt it found.
+type schedWait struct{ now, next time.Time }
 
 // startScheduled starts a runtime enrolled with a service listing ada, and
 // its schedule, whose first pull (at rtT0) is good.
@@ -40,10 +44,10 @@ func startScheduled(t *testing.T) *schedProbe {
 	opsLine, _ := newTestKey(t)
 	svc.dir.setUsers(newPerson(t, "ada", false).served())
 	p := &schedProbe{t: t, clock: clock, svc: svc,
-		attempts: make(chan users.DirectoryRefresh, 64), waits: make(chan time.Time, 1024)}
+		attempts: make(chan users.DirectoryRefresh, 64), waits: make(chan schedWait, 1024)}
 	p.srv = startRT(t, svc, dir, opsLine, func(rt *Runtime) {
 		rt.afterAttempt = func(row users.DirectoryRefresh) { p.attempts <- row }
-		rt.beforeWait = func(now time.Time) { p.waits <- now }
+		rt.beforeWait = func(now, next time.Time) { p.waits <- schedWait{now, next} }
 	})
 	p.srv.start()
 	if row := p.next(); row.Status != users.DirectoryRefreshGood {
@@ -57,15 +61,15 @@ func startScheduled(t *testing.T) *schedProbe {
 }
 
 // idleAt waits until the schedule has read the clock at at and gone back to
-// waiting.
-func (p *schedProbe) idleAt(at time.Time) {
+// waiting, and returns the next attempt it found then.
+func (p *schedProbe) idleAt(at time.Time) time.Time {
 	p.t.Helper()
 	deadline := time.After(10 * time.Second)
 	for {
 		select {
 		case w := <-p.waits:
-			if w.Equal(at) {
-				return
+			if w.now.Equal(at) {
+				return w.next
 			}
 		case <-deadline:
 			p.t.Fatalf("the schedule did not wait at %s", stamp(at))
@@ -73,11 +77,12 @@ func (p *schedProbe) idleAt(at time.Time) {
 	}
 }
 
-// setIdle moves the clock to at and waits for the schedule to look at it.
-func (p *schedProbe) setIdle(at time.Time) {
+// setIdle moves the clock to at and waits for the schedule to look at it; it
+// returns the next attempt the schedule found.
+func (p *schedProbe) setIdle(at time.Time) time.Time {
 	p.t.Helper()
 	p.clock.set(at)
-	p.idleAt(at)
+	return p.idleAt(at)
 }
 
 // next is the next attempt's row.
@@ -200,6 +205,47 @@ func TestScheduleRetryAfterIsElapsedTime(t *testing.T) {
 	}
 	p.svc.setMode(faultNone, "")
 	p.clock.set(at.Add(49 * time.Minute))
+	if row := p.next(); row.Status != users.DirectoryRefreshGood {
+		t.Fatalf("the scheduled pull once the hour has elapsed: %+v", row)
+	}
+}
+
+// TestScheduleRetryAfterDoesNotRatchet: the wall clock set forward while an
+// hour's Retry-After runs, the schedule looking at it, then the clock
+// corrected back: the scheduled pull goes out when the hour has elapsed, not
+// later. The schedule's own next attempt and the Retry-After are kept apart,
+// and the next attempt computed from them is never written back; status
+// shows the instant the schedule uses.
+func TestScheduleRetryAfterDoesNotRatchet(t *testing.T) {
+	p := startScheduled(t)
+	failAt := p.failHour()
+	p.setIdle(failAt.Add(10 * time.Minute))
+
+	// Ten minutes in, the wall clock is set 30 minutes forward; the
+	// schedule's timer fires a minute on: 11 minutes have elapsed, 49 remain.
+	p.clock.stepWall(30 * time.Minute)
+	at := failAt.Add(41 * time.Minute)
+	if got := p.setIdle(at); !got.Equal(at.Add(49 * time.Minute)) {
+		t.Fatalf("the schedule's next attempt with the clock forward: %s, want %s", stamp(got), stamp(at.Add(49*time.Minute)))
+	}
+	p.wantNext(at.Add(49 * time.Minute))
+
+	// The clock is corrected back: the hour ends where it always did.
+	p.clock.stepWall(-30 * time.Minute)
+	p.wantNext(failAt.Add(time.Hour))
+	look := failAt.Add(42 * time.Minute)
+	if got := p.setIdle(look); !got.Equal(failAt.Add(time.Hour)) {
+		t.Fatalf("the schedule's next attempt once the clock is corrected: %s, want %s", stamp(got), stamp(failAt.Add(time.Hour)))
+	}
+	p.wantNext(failAt.Add(time.Hour))
+	sent := p.svc.sent()
+	p.setIdle(failAt.Add(time.Hour - time.Second))
+	p.none("a second before the Retry-After has elapsed")
+	if n := p.svc.sent() - sent; n != 0 {
+		t.Fatalf("%d scheduled requests reached the service inside the Retry-After", n)
+	}
+	p.svc.setMode(faultNone, "")
+	p.clock.set(failAt.Add(time.Hour))
 	if row := p.next(); row.Status != users.DirectoryRefreshGood {
 		t.Fatalf("the scheduled pull once the hour has elapsed: %+v", row)
 	}

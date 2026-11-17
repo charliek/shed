@@ -121,5 +121,14 @@ The directory and each file must not be writable by group or others, and
 none may be a symbolic link. `codes` or `disabled` missing holds nothing.
 Edit `users.json` to add, change or remove people; the next pull serves it.
 
+The control directory does not model everything a service keeps. These are
+limits of a test tool, not rules of the contract:
+
+- A code in `codes` does not expire: until it is spent, or removed from the
+  file, it is accepted however old it is (and a restart forgets which codes
+  were spent).
+- A client id removed from `disabled` is enabled again. On a real service a
+  disabled server stays disabled; the server enrols again with a new code.
+
 The [User Directory guide](../guides/user-directory.md#try-it-with-the-reference-server)
 runs a trial with it.

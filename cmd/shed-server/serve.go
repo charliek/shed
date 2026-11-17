@@ -671,43 +671,75 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Stopping the max_age reaper...")
 	}
 	stopReaper()
-	// GitHub key fetches (or a directory's pulls and trust watch) end now:
-	// none in flight outlives the shutdown.
-	cancelRefresh()
 
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
+	shutdownServers := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
 
-	// Credential-bus streams never end on their own, so a graceful
-	// shutdown would wait out its whole timeout for them: close them (and
-	// refuse new subscriptions) first.
-	log.Printf("Closing credential bus streams...")
-	pluginRegistry.Close()
+		// Credential-bus streams never end on their own, so a graceful
+		// shutdown would wait out its whole timeout for them: close them (and
+		// refuse new subscriptions) first.
+		log.Printf("Closing credential bus streams...")
+		pluginRegistry.Close()
 
-	// Shutdown HTTP server (when serving — skipped in mtls mode)
-	if httpServer != nil {
-		log.Printf("Shutting down HTTP server...")
-		if err := httpServer.Shutdown(ctx); err != nil {
-			log.Printf("HTTP server shutdown error: %v", err)
+		// Shutdown HTTP server (when serving — skipped in mtls mode)
+		if httpServer != nil {
+			log.Printf("Shutting down HTTP server...")
+			if err := httpServer.Shutdown(ctx); err != nil {
+				log.Printf("HTTP server shutdown error: %v", err)
+			}
+		}
+
+		// Shutdown HTTPS server (when enabled)
+		if httpsServer != nil {
+			log.Printf("Shutting down HTTPS server...")
+			if err := httpsServer.Shutdown(ctx); err != nil {
+				log.Printf("HTTPS server shutdown error: %v", err)
+			}
+		}
+
+		// Shutdown SSH server
+		log.Printf("Shutting down SSH server...")
+		if err := sshServer.Shutdown(ctx); err != nil {
+			log.Printf("SSH server shutdown error: %v", err)
 		}
 	}
-
-	// Shutdown HTTPS server (when enabled)
-	if httpsServer != nil {
-		log.Printf("Shutting down HTTPS server...")
-		if err := httpsServer.Shutdown(ctx); err != nil {
-			log.Printf("HTTPS server shutdown error: %v", err)
-		}
+	var checkTrust func(context.Context) error
+	if dirUsers != nil {
+		checkTrust = dirUsers.CheckTrustAtStop
 	}
-
-	// Shutdown SSH server
-	log.Printf("Shutting down SSH server...")
-	if err := sshServer.Shutdown(ctx); err != nil {
-		log.Printf("SSH server shutdown error: %v", err)
-	}
+	stopUserSource(checkTrust, directory.StopTrustBound, cancelRefresh, shutdownServers, log.Printf)
 
 	log.Printf("Shutdown complete")
 	return nil
+}
+
+// stopUserSource is the user source's part of a graceful stop, around the
+// servers' shutdown (shutdown). GitHub key fetches (or a directory's pulls
+// and trust watch) end first (cancelRefresh): none in flight outlives the
+// shutdown. On a directory server (checkTrust set: its runtime's
+// CheckTrustAtStop) the kept copy is then fenced, so no pull writes it from
+// that moment, and the trust time is checked at once (an ended copy is
+// removed); and once more as the last thing the server does with the
+// directory, after the servers have finished shutting down, so a trust time
+// that ends during a slow shutdown is caught too. Each check is waited for
+// up to bound; the warning that one did not finish is written without
+// waiting (a stuck log writer never holds the exit).
+func stopUserSource(checkTrust func(context.Context) error, bound time.Duration, cancelRefresh, shutdown func(), logf func(string, ...any)) {
+	cancelRefresh()
+	check := func() {
+		if checkTrust == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), bound)
+		defer cancel()
+		if err := checkTrust(ctx); err != nil {
+			go logf("directory: WARNING: the trust time's check at stop did not finish within %s (%v); if the trust time has ended, the kept copy may remain on disk", bound, err)
+		}
+	}
+	check()
+	shutdown()
+	check()
 }
 
 // upgradePassTimeout bounds the start-up pass over sheds with no user. On the

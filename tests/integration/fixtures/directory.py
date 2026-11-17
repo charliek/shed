@@ -41,11 +41,15 @@ is stopped, every shed deleted (as the local admin), the server and the
 reference server stopped, then every process still running whose command
 line names a path inside the world's folder (an agent the server started
 that outlived it, whether or not the server is still there), with whatever
-runs under it, and the folder removed. A process the fixture did not start
-itself is signalled only through a handle that pins it (its pid and start
-time, read from /proc when it was found and checked again just before each
-signal, the signal sent through a pidfd), so a reused pid is never
-signalled. What could not be cleaned up fails the case, naming it. The logs'
+runs under it, whoever's it is, and the folder removed. Every clean-up path
+finds what to stop through one helper (`owned_processes`). A process the
+fixture did not start itself is signalled only through a handle that pins it
+(its pid and start time, read from /proc before anything else of it is read,
+so the readings that decide it is the world's are confirmed to be that
+process's by reading its start time again after them; checked again just
+before each signal, the signal sent through a pidfd), so a reused pid is
+never selected or signalled. What could not be cleaned up (a process that
+could not be signalled included) fails the case, naming it. The logs'
 last lines are printed at teardown (pytest shows them for a failed case).
 
 An API request (`api_request`) is either answered (an HTTP status and body)
@@ -81,7 +85,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Optional, Sequence
@@ -156,6 +160,9 @@ WORLD_CODE_FILES = ("control/codes",)
 # A private key in PEM form, raw or JSON-escaped: the header and the start of
 # its body.
 _PRIVATE_PEM = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:\\n|\\r|\r|\n)+[A-Za-z0-9+/=]{40}")
+# A JWT-shaped string (an access token, a client assertion): "eyJ" (the
+# base64url of '{"'), 20 or more base64url characters, a dot, more, a dot.
+_JWT = re.compile(rb"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.")
 
 
 # ----------------------------------------------------------------------------
@@ -341,24 +348,6 @@ def trust_deadline(directory: Mapping, trust_seconds: float = TRUST_SECONDS) -> 
     return parse_stamp(directory["last_good_pull"]) + timedelta(seconds=trust_seconds)
 
 
-def descendants(pid: int, proc: Path = Path("/proc")) -> list[int]:
-    """Every process below `pid` now (children first found, recursively)."""
-    out: list[int] = []
-    todo = [pid]
-    while todo:
-        p = todo.pop()
-        for task in (proc / str(p) / "task").glob("*"):
-            try:
-                kids = (task / "children").read_text().split()
-            except OSError:
-                continue
-            for k in kids:
-                if int(k) not in out:
-                    out.append(int(k))
-                    todo.append(int(k))
-    return out
-
-
 def _cmdline(pid: int, proc: Path = Path("/proc")) -> str:
     try:
         return (proc / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
@@ -366,10 +355,17 @@ def _cmdline(pid: int, proc: Path = Path("/proc")) -> str:
         return ""
 
 
-def proc_stat(pid: int, proc: Path = Path("/proc")) -> Optional[tuple[str, int]]:
-    """A process's state letter and start time (clock ticks after boot, field
-    22 of /proc/<pid>/stat), or None when there is no such process. The start
-    time tells a process from a later one that reuses its pid."""
+def _cwd(pid: int, proc: Path = Path("/proc")) -> str:
+    try:
+        return os.readlink(proc / str(pid) / "cwd")
+    except OSError:
+        return ""
+
+
+def _stat_fields(pid: int, proc: Path = Path("/proc")) -> Optional[tuple[str, int, int]]:
+    """A process's state letter, start time (clock ticks after boot, field 22
+    of /proc/<pid>/stat) and parent's pid (field 4), from one reading, or None
+    when there is no such process."""
     try:
         data = (proc / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -378,9 +374,17 @@ def proc_stat(pid: int, proc: Path = Path("/proc")) -> Optional[tuple[str, int]]
     # the last ")".
     try:
         rest = data[data.rindex(")") + 2:].split()
-        return rest[0], int(rest[19])
+        return rest[0], int(rest[19]), int(rest[1])
     except (ValueError, IndexError):
         return None
+
+
+def proc_stat(pid: int, proc: Path = Path("/proc")) -> Optional[tuple[str, int]]:
+    """A process's state letter and start time (clock ticks after boot, field
+    22 of /proc/<pid>/stat), or None when there is no such process. The start
+    time tells a process from a later one that reuses its pid."""
+    st = _stat_fields(pid, proc)
+    return None if st is None else (st[0], st[1])
 
 
 @dataclass(frozen=True)
@@ -394,13 +398,24 @@ class ProcHandle:
     pid: int
     start: int
     cmdline: str = ""
+    # The parent's pid, read with the start time (one reading of stat).
+    ppid: int = 0
 
     @classmethod
     def of(cls, pid: int, proc: Path = Path("/proc")) -> Optional["ProcHandle"]:
-        st = proc_stat(pid, proc)
+        st = _stat_fields(pid, proc)
         if st is None or st[0] == "Z":
             return None
-        return cls(pid, st[1], _cmdline(pid, proc))
+        return cls(pid, st[1], _cmdline(pid, proc), st[2])
+
+    @classmethod
+    def pin(cls, pid: int, proc: Path = Path("/proc")) -> Optional["ProcHandle"]:
+        """The handle alone (pid, start time, parent), read from one reading
+        of stat, before anything else is read of the process."""
+        st = _stat_fields(pid, proc)
+        if st is None or st[0] == "Z":
+            return None
+        return cls(pid, st[1], "", st[2])
 
     def alive(self, proc: Path = Path("/proc")) -> bool:
         """Still this process, and not a zombie."""
@@ -426,39 +441,81 @@ class ProcHandle:
 
     def stop(self, grace: float = 5) -> Optional[str]:
         """SIGTERM, then SIGKILL after `grace`; how it ended, or None when it
-        had already gone."""
-        if not self.signal(signal.SIGTERM):
-            return None
-        if _wait_for(lambda: not self.alive(), grace, interval=0.1):
-            return "stopped on SIGTERM"
-        if not self.signal(signal.SIGKILL):
-            return "stopped on SIGTERM"
+        had already gone. A process this user may not signal (another user's
+        child of the world's) is left running and said so, never passed
+        over."""
+        try:
+            if not self.signal(signal.SIGTERM):
+                return None
+            if _wait_for(lambda: not self.alive(), grace, interval=0.1):
+                return "stopped on SIGTERM"
+            if not self.signal(signal.SIGKILL):
+                return "stopped on SIGTERM"
+        except PermissionError as e:
+            return f"could not be signalled ({e.strerror or e}), and is still running"
         return "killed" if _wait_for(lambda: not self.alive(), 5, interval=0.1) else "still running after SIGKILL"
 
 
-def owned_processes(marker: str, proc: Path = Path("/proc"), uid: Optional[int] = None,
-                    me: Optional[int] = None) -> list[ProcHandle]:
-    """Every live process of this user (not this one) whose command line
-    holds `marker` (a path inside a world's folder), and every process below
-    each, as handles."""
+def _proc_uid(pid: int, proc: Path = Path("/proc")) -> Optional[int]:
+    """The uid that owns a process's /proc entry, or None when it has gone."""
+    try:
+        return (proc / str(pid)).stat().st_uid
+    except OSError:
+        return None
+
+
+def owned_processes(marker: Optional[str], proc: Path = Path("/proc"), uid: Optional[int] = None,
+                    me: Optional[int] = None, roots: Sequence[ProcHandle] = ()) -> list[ProcHandle]:
+    """The processes the world owns, as handles: every live process of this
+    user (not this one) whose command line or working directory holds
+    `marker` (a path inside a world's folder; None: none is looked for), and
+    every process below each of those or below one of `roots` (processes the
+    caller started itself and pinned; they are followed, not returned),
+    whatever its user. Every clean-up path finds what to stop here.
+
+    The handle comes first: every process is pinned (its pid, start time and
+    parent, from one reading of stat) before anything else of it is read.
+    Ownership is then decided from readings made after the handle (the user,
+    the command line, the working directory), and holds only when the start
+    time, read again after them, is still the handle's: so the readings were
+    that process's, and a pid reused at any point between the handle and the
+    decision is never selected. A process below one selected (or below a
+    root) is selected, whatever its user, when its parent (from its own
+    handle's reading) is one selected, started no later than it, and still
+    that process (its start time read again) after the child's handle was
+    taken; its command line is then read and its start time checked again.
+    A child of another user is so followed and returned: if it cannot be
+    signalled, `stop_survivors` reports it."""
     uid = os.getuid() if uid is None else uid
     me = os.getpid() if me is None else me
-    found: dict[int, ProcHandle] = {}
+    handles: dict[int, ProcHandle] = {}
     for d in proc.iterdir():
         if not d.name.isdigit() or int(d.name) == me:
             continue
-        try:
-            if d.stat().st_uid != uid:
+        h = ProcHandle.pin(int(d.name), proc)
+        if h is not None:
+            handles[h.pid] = h
+    root_pids = {r.pid for r in roots}
+    found: dict[int, ProcHandle] = {r.pid: r for r in roots if r.alive(proc)}
+    if marker is not None:
+        for h in handles.values():
+            if h.pid in found:
                 continue
-        except OSError:
-            continue
-        if marker not in _cmdline(int(d.name), proc):
-            continue
-        for pid in [int(d.name), *descendants(int(d.name), proc)]:
-            h = ProcHandle.of(pid, proc)
-            if h is not None and pid != me:
-                found.setdefault(pid, h)
-    return list(found.values())
+            owner, cmd, cwd = _proc_uid(h.pid, proc), _cmdline(h.pid, proc), _cwd(h.pid, proc)
+            if owner == uid and (marker in cmd or (cwd and marker in cwd + "/")) and h.alive(proc):
+                found[h.pid] = replace(h, cmdline=cmd)
+    grew = True
+    while grew:
+        grew = False
+        for h in handles.values():
+            parent = found.get(h.ppid)
+            if h.pid in found or parent is None or parent.start > h.start or not parent.alive(proc):
+                continue
+            cmd = _cmdline(h.pid, proc)
+            if h.alive(proc):
+                found[h.pid] = replace(h, cmdline=cmd)
+                grew = True
+    return [h for h in found.values() if h.pid not in root_pids]
 
 
 def stop_survivors(handles: Sequence[ProcHandle], what: str) -> list[str]:
@@ -473,17 +530,21 @@ def stop_survivors(handles: Sequence[ProcHandle], what: str) -> list[str]:
             continue
         how = h.stop()
         if how is not None:
-            problems.append(f"process {h.pid} {what} outlived it and was {how}: {h.cmdline!r}")
+            verb = "" if how.startswith("could not") else "was "
+            problems.append(f"process {h.pid} {what} outlived it and {verb}{how}: {h.cmdline!r}")
     return problems
 
 
 def secrets_in(root: Path, code: str) -> list[str]:
-    """What under `root` (a world's folder) holds the enrolment `code` or a
-    private key where it should not: every regular file of the folder is read
-    (the server's HOME and TMPDIR, its config, its state, every log, the
-    reference server's included, the certificate folders and the identities'
-    homes) except `WORLD_CODE_FILES` for the code and
-    `WORLD_PRIVATE_KEY_FILES` for a private key."""
+    """What under `root` (a world's folder) holds the enrolment `code`, a
+    private key or a JWT-shaped string (an access token or an assertion)
+    where it should not: every regular file of the folder is read (the
+    server's HOME and TMPDIR, its config, its state, the kept copy, every
+    log, the reference server's included, the certificate folders and the
+    identities' homes) except `WORLD_CODE_FILES` for the code and
+    `WORLD_PRIVATE_KEY_FILES` (the files meant to hold a key) for a private
+    key or a JWT-shaped string. A file that holds a base64 `body` (the kept
+    copy holds the directory's answer so) is also searched decoded."""
     hits = []
     needle = code.encode()
     for p in sorted(root.rglob("*")):
@@ -495,11 +556,32 @@ def secrets_in(root: Path, code: str) -> list[str]:
         except OSError as e:
             hits.append(f"{rel}: unreadable ({e})")
             continue
-        if needle in data and rel not in WORLD_CODE_FILES:
-            hits.append(f"{rel}: holds the enrolment code")
-        if _PRIVATE_PEM.search(data) and not any(path_matches(rel, pat) for pat in WORLD_PRIVATE_KEY_FILES):
-            hits.append(f"{rel}: holds a private key")
+        key_file = any(path_matches(rel, pat) for pat in WORLD_PRIVATE_KEY_FILES)
+        views = [("", data)]
+        body = _kept_body(data)
+        if body is not None:
+            views.append(("its kept body ", body))
+        for where, text in views:
+            if needle in text and rel not in WORLD_CODE_FILES:
+                hits.append(f"{rel}: {where}holds the enrolment code")
+            if _PRIVATE_PEM.search(text) and not key_file:
+                hits.append(f"{rel}: {where}holds a private key")
+            if _JWT.search(text) and not key_file:
+                hits.append(f"{rel}: {where}holds a JWT-shaped string")
     return hits
+
+
+def _kept_body(data: bytes) -> Optional[bytes]:
+    """The decoded `body` of a JSON object that holds one in base64 (the kept
+    copy, `users.json`, holds the directory's answer so), or None."""
+    if not data.lstrip().startswith(b"{"):
+        return None
+    try:
+        obj = json.loads(data)
+        body = obj.get("body") if isinstance(obj, dict) else None
+        return base64.b64decode(body, validate=True) if isinstance(body, str) else None
+    except ValueError:
+        return None
 
 
 def path_matches(rel: str, pattern: str) -> bool:
@@ -704,6 +786,8 @@ class ShedServer:
         self.starts = 0
         self.log_path = logs / "server-0.log"
         self.ssh_port = 0
+        # Where processes are read (a fake one in the fixture's unit tests).
+        self.proc_root = Path("/proc")
 
     def env(self) -> dict:
         return _base_env(self.home, {"TMPDIR": str(self.tmpdir)})
@@ -755,10 +839,14 @@ class ShedServer:
         problems: list[str] = []
         kids: list[ProcHandle] = []
         if self.proc is not None and self.proc.poll() is None:
-            kids = [h for h in (ProcHandle.of(p) for p in descendants(self.proc.pid)) if h is not None]
+            # The server is this fixture's own child, not yet reaped: its pid
+            # is its own until it is waited for. What runs below it is found
+            # through the one helper, handles first.
+            server = ProcHandle.pin(self.proc.pid, self.proc_root)
+            kids = owned_processes(None, self.proc_root, roots=[server] if server is not None else [])
             if not _stop(self.proc, timeout=20):
                 problems.append(f"shed-server (pid {self.proc.pid}) did not stop on SIGTERM and was killed")
-        kids += owned_processes(self.marker)
+        kids += owned_processes(self.marker, self.proc_root)
         problems += stop_survivors(kids, "started by shed-server")
         return problems
 
@@ -1261,8 +1349,9 @@ class World:
             assert stat.S_IMODE(p.stat().st_mode) == 0o600, (name, oct(p.stat().st_mode))
 
     def secrets_found(self) -> list[str]:
-        """Every file of the world's folder that holds the enrolment code or
-        a private key where it should not (`secrets_in`)."""
+        """Every file of the world's folder that holds the enrolment code, a
+        private key or a JWT-shaped string where it should not
+        (`secrets_in`)."""
         return secrets_in(self.root, self.code)
 
     # -- clean-up ------------------------------------------------------------

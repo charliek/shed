@@ -3296,17 +3296,23 @@ def test_parse_stamp_reads_the_servers_instants():
     assert dfx.parse_stamp("2026-11-17T03:36:00Z").isoformat() == "2026-11-17T03:36:00+00:00"
 
 
-@pytest.mark.skipif(not Path("/proc/self/task").exists(), reason="needs /proc")
-def test_descendants_finds_a_grandchild():
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_owned_processes_find_what_runs_below_a_root():
     proc = subprocess.Popen(["sh", "-c", "sleep 30 & wait"])
     try:
-        assert dfx._wait_for(lambda: bool(dfx.descendants(proc.pid)), 5)
-        kids = dfx.descendants(proc.pid)
-        assert kids and all("sleep" in dfx._cmdline(k) for k in kids), kids
-    finally:
-        for k in dfx.descendants(proc.pid):
-            os.kill(k, 15)
+        root = dfx.ProcHandle.pin(proc.pid)
+        assert root is not None
+        assert dfx._wait_for(lambda: bool(dfx.owned_processes(None, roots=[root])), 5)
+        kids = dfx.owned_processes(None, roots=[root])
+        assert kids and all("sleep" in h.cmdline for h in kids) and root.pid not in [h.pid for h in kids], kids
+        assert len(dfx.stop_survivors(kids, "started by the test")) == len(kids)
         proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            root = dfx.ProcHandle.pin(proc.pid)
+            dfx.stop_survivors(dfx.owned_processes(None, roots=[root]) if root else [], "started by the test")
+            proc.kill()
+            proc.wait(timeout=10)
 
 
 def test_a_probe_tells_admitted_from_refused():
@@ -3705,11 +3711,147 @@ def test_the_service_client_cases_users_follow_the_source(monkeypatch, users_env
 # -- Processes the world did not start itself ---------------------------------
 
 
-def _fake_stat(proc: Path, pid: int, name: str, state: str, start: int) -> None:
+def _fake_stat(proc: Path, pid: int, name: str, state: str, start: int, ppid: int = 4) -> None:
     rest = [state] + [str(i) for i in range(4, 53)]
+    rest[1] = str(ppid)
     rest[19] = str(start)
     (proc / str(pid)).mkdir(parents=True, exist_ok=True)
     (proc / str(pid) / "stat").write_text(f"{pid} ({name}) " + " ".join(rest) + "\n")
+
+
+def _fake_proc(proc: Path, pid: int, start: int, cmdline: str, ppid: int = 1) -> None:
+    _fake_stat(proc, pid, cmdline.split(" ")[0] or "x", "S", start, ppid)
+    (proc / str(pid) / "cmdline").write_bytes(cmdline.replace(" ", "\0").encode() + b"\0")
+
+
+def _reuse_on_read(monkeypatch, at: int, proc: Path, start: int, cmdline: str, before: bool) -> None:
+    """Make pid `at` another process (`start`, `cmdline`) at the first
+    reading of its command line: just before it (`before`) or just after."""
+    real = dfx._cmdline
+    done = []
+
+    def reading(pid: int, p: Path = Path("/proc")) -> str:
+        if pid == at and not done and before:
+            done.append(1)
+            _fake_proc(proc, at, start, cmdline)
+        out = real(pid, p)
+        if pid == at and not done and not before:
+            done.append(1)
+            _fake_proc(proc, at, start, cmdline)
+        return out
+
+    monkeypatch.setattr(dfx, "_cmdline", reading)
+
+
+@pytest.mark.parametrize("before", [False, True], ids=["just after the ownership reading", "just after the handle"])
+def test_owned_processes_never_select_a_reused_pid(tmp_path, monkeypatch, before):
+    marker = f"{tmp_path}/world/"
+    if before:
+        # The handle pins an unrelated process; the pid is then the world's
+        # (another start time) when its command line is read.
+        _fake_proc(tmp_path, 100, 500, "unrelated-program")
+        _reuse_on_read(monkeypatch, 100, tmp_path, 900, f"agent {marker}t/x", before)
+    else:
+        # The world's process is pinned and its command line read; it exits
+        # and an unrelated process takes its pid at once.
+        _fake_proc(tmp_path, 100, 500, f"agent {marker}t/x")
+        _reuse_on_read(monkeypatch, 100, tmp_path, 900, "unrelated-program", before)
+    assert dfx.owned_processes(marker, tmp_path, os.getuid(), 0) == []
+
+
+def test_owned_processes_select_by_command_line_or_folder_and_follow_children(tmp_path):
+    marker = f"{tmp_path}/world/"
+    (tmp_path / "world").mkdir()
+    _fake_proc(tmp_path, 100, 500, f"agent {marker}t/x")
+    _fake_proc(tmp_path, 101, 600, "child-program", ppid=100)
+    _fake_proc(tmp_path, 102, 700, "grandchild-program", ppid=101)
+    _fake_proc(tmp_path, 103, 400, "older-than-its-parent", ppid=100)  # its parent's pid, reused
+    _fake_proc(tmp_path, 104, 650, "worker")  # no marker; its folder is the world's
+    os.symlink(tmp_path / "world", tmp_path / "104" / "cwd")
+    _fake_proc(tmp_path, 105, 650, "unrelated-program")
+    _fake_proc(tmp_path, 106, 660, "a-zombie's-child", ppid=107)
+    _fake_stat(tmp_path, 107, "z", "Z", 610, 100)
+    found = {h.pid: h for h in dfx.owned_processes(marker, tmp_path, os.getuid(), 0)}
+    assert sorted(found) == [100, 101, 102, 104], found
+    assert found[101].cmdline == "child-program " and found[100].start == 500 and found[102].ppid == 101
+
+
+def test_owned_processes_follow_a_child_of_another_user(tmp_path, monkeypatch):
+    marker = f"{tmp_path}/world/"
+    me = os.getuid()
+    other = me + 1
+    _fake_proc(tmp_path, 100, 500, f"agent {marker}t/x")
+    _fake_proc(tmp_path, 101, 600, "helper-run-as-another-user", ppid=100)
+    _fake_proc(tmp_path, 102, 700, "its-child", ppid=101)
+    _fake_proc(tmp_path, 103, 650, f"another-users-program {marker}t/y")  # names the world, not ours
+    uids = {101: other, 102: other, 103: other}
+    monkeypatch.setattr(dfx, "_proc_uid", lambda pid, proc=Path("/proc"): uids.get(pid, me))
+    found = {h.pid: h for h in dfx.owned_processes(marker, tmp_path, me, 0)}
+    assert sorted(found) == [100, 101, 102], found
+    assert found[101].cmdline == "helper-run-as-another-user "
+
+
+def _fake_popen(pid: int):
+    class P:
+        def __init__(self) -> None:
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+    return P()
+
+
+@pytest.mark.parametrize("before", [False, True], ids=["just after the ownership reading", "just after the handle"])
+def test_a_server_stop_never_selects_a_reused_pid(tmp_path, monkeypatch, before):
+    marker = f"{tmp_path}/world/t/"
+    _fake_proc(tmp_path, 50, 100, "shed-server serve")
+    _fake_proc(tmp_path, 100, 500, f"agent {marker}x", ppid=50)
+    # The server's child exits and an unrelated process takes its pid, around
+    # the first reading of its command line.
+    _reuse_on_read(monkeypatch, 100, tmp_path, 900, "unrelated-program", before)
+    s = dfx.ShedServer(Path("shed-server"), tmp_path / "c.yaml", tmp_path, tmp_path, tmp_path, marker)
+    s.proc, s.proc_root = _fake_popen(50), tmp_path
+    handed: list = []
+    monkeypatch.setattr(dfx, "_stop", lambda proc, timeout=15: True)
+    monkeypatch.setattr(dfx, "stop_survivors", lambda hs, what: handed.extend(hs) or [])
+    assert s.stop() == []
+    assert handed == [], handed
+
+
+def test_a_server_stop_follows_its_children(tmp_path, monkeypatch):
+    marker = f"{tmp_path}/world/t/"
+    _fake_proc(tmp_path, 50, 100, "shed-server serve")
+    _fake_proc(tmp_path, 100, 500, "worker-without-the-marker", ppid=50)
+    _fake_proc(tmp_path, 101, 600, "its-child", ppid=100)
+    _fake_proc(tmp_path, 102, 650, "unrelated-program")
+    s = dfx.ShedServer(Path("shed-server"), tmp_path / "c.yaml", tmp_path, tmp_path, tmp_path, marker)
+    s.proc, s.proc_root = _fake_popen(50), tmp_path
+    handed: list = []
+    monkeypatch.setattr(dfx, "_stop", lambda proc, timeout=15: True)
+    monkeypatch.setattr(dfx, "stop_survivors", lambda hs, what: handed.extend(hs) or [])
+    assert s.stop() == []
+    assert sorted(h.pid for h in handed) == [100, 101], handed  # not the server itself
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_a_process_that_cannot_be_signalled_is_reported(monkeypatch):
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        h = dfx.ProcHandle.of(proc.pid)
+        assert h is not None
+
+        def refuse(fd, sig, *a):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(dfx.signal, "pidfd_send_signal", refuse)
+        problems = dfx.stop_survivors([h], "started in the world")
+        assert problems == [f"process {proc.pid} started in the world outlived it and could not be signalled "
+                            f"(Operation not permitted), and is still running: {h.cmdline!r}"], problems
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
 
 
 def test_proc_stat_reads_the_start_time_after_any_name(tmp_path):
@@ -3822,6 +3964,54 @@ def test_secrets_in_reads_the_whole_world_but_the_files_meant_for_them(tmp_path)
         "state/directory/users.json: holds the enrolment code",
         "t/agent-1/agent.log: holds the enrolment code",
     ]
+
+
+_JWT = "eyJhbGciOiJSUzI1NiIsInR5cCI6ImF0K2p3dCJ9.eyJzdWIiOiJzcnZfMCJ9.c2lnbmF0dXJl"
+
+
+def test_secrets_in_finds_a_jwt_shaped_string_outside_the_key_files(tmp_path):
+    code = "0f" * 16
+
+    def put(rel: str, text: str) -> None:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    put("control/codes", f"itest-dir {code}\n")
+    put("state/directory/enrolment.json", json.dumps({"note": _JWT}))  # a file meant to hold a key
+    put("logs/server-1.log", "directory: good pull: version abc; eyJshort.x.y; a.b.c\n")  # not JWT-shaped
+    assert dfx.secrets_in(tmp_path, code) == []
+    put("logs/server-2.log", f"refused the assertion {_JWT} as sent\n")
+    put("state/directory/users.json", json.dumps({"body": base64.b64encode(b"{}").decode(), "note": _JWT}))
+    put("homes/server/.cache/x", _JWT.rsplit(".", 1)[0] + ".")  # header and claims, no signature
+    assert dfx.secrets_in(tmp_path, code) == [
+        "homes/server/.cache/x: holds a JWT-shaped string",
+        "logs/server-2.log: holds a JWT-shaped string",
+        "state/directory/users.json: holds a JWT-shaped string",
+    ]
+
+
+def test_secrets_in_searches_the_kept_copys_body_decoded(tmp_path):
+    code = "0f" * 16
+
+    def put(rel: str, text: str) -> None:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    def kept(answer: dict) -> str:
+        body = base64.b64encode(json.dumps(answer).encode()).decode()
+        return json.dumps({"format": 1, "version": "a" * 64, "body": body})
+
+    put("control/codes", f"itest-dir {code}\n")
+    put("state/directory/users.json", kept({"contract": 1, "users": []}))
+    assert dfx.secrets_in(tmp_path, code) == []
+    # The token only inside the encoded body: its raw bytes are not in the file.
+    put("state/directory/users.json", kept({"contract": 1, "users": [], "seen": _JWT}))
+    assert _JWT.encode() not in (tmp_path / "state/directory/users.json").read_bytes()
+    assert dfx.secrets_in(tmp_path, code) == ["state/directory/users.json: its kept body holds a JWT-shaped string"]
+    put("state/directory/users.json", kept({"contract": 1, "users": [{"name": code}]}))
+    assert dfx.secrets_in(tmp_path, code) == ["state/directory/users.json: its kept body holds the enrolment code"]
 
 
 def test_the_files_meant_for_a_private_key_are_named_one_folder_at_a_time():

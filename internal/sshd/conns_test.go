@@ -445,6 +445,65 @@ func TestSSHCloseSweepBeforeLogging(t *testing.T) {
 	}
 }
 
+// TestSSHBlockedLogWriterHoldsNoPublication: while the log writer is blocked
+// on the first close line (and holds the log package's lock), the
+// publication that closed alice's connection has already returned, and the
+// next publication, which closes bob's, completes too: the close lines are
+// written outside the publication.
+func TestSSHBlockedLogWriterHoldsNoPublication(t *testing.T) {
+	p := newDirPeople(t, directory.LookupOptions{})
+	_, addr, closed := trackingServer(t, twoShedBackend{&identityBackend{}}, p.lookup, nil)
+	alice := dialWith(t, addr, "box", p.alice)
+	bob := dialWith(t, addr, "crate", p.bob)
+	root := dialWith(t, addr, reservedBootstrapUser, p.root)
+
+	gate := &gatedLog{match: "SSH: closed", blocked: make(chan struct{}), release: make(chan struct{})}
+	prev := log.Writer()
+	log.SetOutput(gate)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate.release) }) }
+	t.Cleanup(func() {
+		release()
+		log.SetOutput(prev)
+	})
+
+	install := func(seq uint64, us ...directory.User) {
+		t.Helper()
+		installed := make(chan error, 1)
+		go func() {
+			ok, err := p.lookup.Install(&directory.List{Users: us}, time.Now(), time.Hour, seq)
+			if err == nil && !ok {
+				err = fmt.Errorf("the list was not published")
+			}
+			installed <- err
+		}()
+		select {
+		case err := <-installed:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("publication %d waited for the blocked log writer", seq)
+		}
+	}
+	install(2, dirUser("bob", false, p.bob)) // alice leaves
+	select {
+	case <-gate.blocked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no close line was written")
+	}
+	waitGone(t, "alice", alice)
+	install(3) // bob leaves, the writer still blocked
+	waitGone(t, "bob", bob)
+	if a, b := closedCount(t, closed), closedCount(t, closed); a != 1 || b != 1 {
+		t.Errorf("the publications closed %d and %d connections, want one each", a, b)
+	}
+	if !alive(root) {
+		t.Error("the local admin's connection was closed")
+	}
+	release()
+}
+
 // TestSSHDisconnectUntracks: a connection the client closes is no longer
 // tracked once the server has closed its end.
 func TestSSHDisconnectUntracks(t *testing.T) {

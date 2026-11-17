@@ -291,18 +291,34 @@ func (s *rtServer) expire(svc *rtService, clock *fakeClock, at time.Time) {
 	s.ticks <- at
 }
 
+// expireByReader moves the wall clock to at, past the deadline of the list s
+// holds, with the service unreachable, and has a reader find the end
+// (latching it). No tick of the trust watch is sent and no timer fires (the
+// wall clock is stepped): it waits until the kept copy has been removed and
+// status says so. (A turn of the schedule woken by a pull's end may also
+// remove it; TestRuntimeReaderLatchRemovesTheCopy shows the latch alone
+// does.)
+func (s *rtServer) expireByReader(t *testing.T, svc *rtService, clock *fakeClock, at time.Time) {
+	t.Helper()
+	svc.dir.setOutage(true)
+	clock.stepWall(at.Sub(clock.Now()))
+	_ = s.rt.Users() // a reader of the list: it finds the end and latches it
+	eventually(t, "the kept copy removed with no tick", func() bool { return s.rt.Status().Copy == CopyNone })
+}
+
 // TestRuntimeTrustEndRemovesTheCopy: the end of the trust time is made
 // durable. When it ends the kept copy is removed, so a restart whose clock
 // reads before that end (moved back) with the service unreachable starts
 // with only the local admins. Status keeps the last good pull and its
 // version; a good pull in the same run logs that trust is restored, and the
-// next end removes the new copy again.
+// next end removes the new copy again. No tick of the trust watch is needed
+// for the removal.
 func TestRuntimeTrustEndRemovesTheCopy(t *testing.T) {
 	clock, svc, dir, opsLine, ada := rtSetup(t)
 	srv := startRT(t, svc, dir, opsLine, nil)
 	first := srv.refresh(t)
 	srv.start()
-	srv.expire(svc, clock, rtT0.Add(rtTrust))
+	srv.expireByReader(t, svc, clock, rtT0.Add(rtTrust))
 	st := srv.rt.Status()
 	if st.State != StateExpired || st.Copy != CopyNone || !strings.Contains(st.CopyError, "removed: the trust time of its list ended at 2026-11-16T13:00:00Z") ||
 		!st.LastGoodPull.Equal(rtT0) || st.Version != first.Version {
@@ -322,14 +338,16 @@ func TestRuntimeTrustEndRemovesTheCopy(t *testing.T) {
 	if !strings.Contains(srv.log.String(), "trust restored") {
 		t.Errorf("no trust restored line:\n%s", srv.log)
 	}
-	srv.expire(svc, clock, restoredAt.Add(rtTrust))
+	srv.expireByReader(t, svc, clock, restoredAt.Add(rtTrust))
 	if copyBytes(t, dir) != nil {
 		t.Fatal("the second end did not remove the copy")
 	}
-	if n := srv.log.count("kept copy removed: the trust time of its list ended at"); n != 2 {
+	const removed = "kept copy removed: the trust time of its list ended at"
+	eventually(t, "the second removal logged", func() bool { return srv.log.count(removed) >= 2 })
+	srv.stop()
+	if n := srv.log.count(removed); n != 2 {
 		t.Errorf("%d removal lines over two ends:\n%s", n, srv.log)
 	}
-	srv.stop()
 
 	// The clock moved back before the last end; the service unreachable.
 	clock.set(restoredAt.Add(rtTrust - time.Hour))
@@ -340,6 +358,196 @@ func TestRuntimeTrustEndRemovesTheCopy(t *testing.T) {
 	}
 	if lines := strings.Join(again.rt.StartupLines(), "\n"); !strings.Contains(lines, "Users: no kept copy;") {
 		t.Fatalf("start-up lines:\n%s", lines)
+	}
+}
+
+// idleRT starts a runtime over the set-up's service and state directory,
+// has an admin's refresh pull the list (a good pull, its copy written), then
+// starts its schedule and trust watch and waits for the schedule to wait.
+// The service is then made unreachable. Nothing is left to wake the
+// schedule: the refresh's pull goroutine has ended and the wake it sent is
+// drained before the schedule starts, so the schedule waits on its timer
+// alone, which only a move of the fake clock by set or advance fires
+// (stepWall does not).
+func idleRT(t *testing.T, svc *rtService, dir, opsLine string) *rtServer {
+	t.Helper()
+	waits := make(chan time.Time, 64)
+	srv := startRT(t, svc, dir, opsLine, func(rt *Runtime) {
+		rt.beforeWait = func(now, _ time.Time) {
+			select {
+			case waits <- now:
+			default:
+			}
+		}
+	})
+	if row := srv.refresh(t); row.Status != users.DirectoryRefreshGood || copyBytes(t, dir) == nil {
+		t.Fatalf("set-up pull: %+v", row)
+	}
+	// The refresh's pull goroutine is the only one counted (nothing else has
+	// started): once it has ended, its wake is sent, and drained here.
+	srv.rt.wg.Wait()
+	select {
+	case <-srv.rt.wake:
+	default:
+		t.Fatal("the refresh's pull sent the schedule no wake: the drain checks nothing")
+	}
+	srv.start()
+	select {
+	case <-waits:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the schedule did not wait")
+	}
+	svc.dir.setOutage(true)
+	return srv
+}
+
+// TestRuntimeStopFencesALatePull: a pull whose answer arrives after the
+// runtime was told to stop (CheckTrustAtStop) is discarded: its copy is not
+// written, its list not published, no good pull is logged. Here the stop
+// comes after the end of the trust time of the list held, so the stop
+// removes that list's copy; the late answer's list, trusted on its own
+// clock, would otherwise be written after the stop's check and outlive the
+// stop.
+func TestRuntimeStopFencesALatePull(t *testing.T) {
+	clock, svc, dir, opsLine, ada := rtSetup(t)
+	srv := startRT(t, svc, dir, opsLine, nil)
+	if row := srv.refresh(t); row.Status != users.DirectoryRefreshGood || copyBytes(t, dir) == nil {
+		t.Fatalf("set-up pull: %+v", row)
+	}
+	bob := newPerson(t, "bob", false)
+	svc.dir.setUsers(ada.served(), bob.served())
+	for len(svc.arrived) > 0 {
+		<-svc.arrived // the set-up pull's
+	}
+
+	// A pull held open: the service has its answer ready (bob listed) and
+	// holds it.
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release) // before the service closes, which waits for its handlers
+	svc.setGate(gate)
+	rows := make(chan users.DirectoryRefresh, 1)
+	go func() {
+		rep, err := srv.rt.Refresh(context.Background())
+		if err != nil || rep.Directory == nil {
+			t.Errorf("Refresh: %+v %v", rep, err)
+			rows <- users.DirectoryRefresh{}
+			return
+		}
+		rows <- *rep.Directory
+	}()
+	select {
+	case <-svc.arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pull did not reach the service")
+	}
+
+	// The trust time of the list held ends; the stop removes its copy.
+	clock.stepWall(rtTrust + time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), StopTrustBound)
+	defer cancel()
+	if err := srv.rt.CheckTrustAtStop(ctx); err != nil {
+		t.Fatalf("CheckTrustAtStop: %v", err)
+	}
+	if copyBytes(t, dir) != nil {
+		t.Fatal("the stop after the end of the trust time left the copy")
+	}
+
+	// The held answer arrives after the stop.
+	release()
+	var row users.DirectoryRefresh
+	select {
+	case row = <-rows:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the held pull did not end")
+	}
+	if row.Status == users.DirectoryRefreshGood {
+		t.Errorf("the late pull's row: %+v", row)
+	}
+	if copyBytes(t, dir) != nil {
+		t.Fatal("a pull that ended after the stop wrote the kept copy")
+	}
+	if srv.owner(bob.fp) != "" {
+		t.Fatal("a pull that ended after the stop published its list")
+	}
+	if n := srv.log.count("directory: good pull:"); n != 1 {
+		t.Errorf("%d good pull lines, want the set-up's alone:\n%s", n, srv.log)
+	}
+	srv.stop()
+	again := startRT(t, svc, dir, opsLine, nil)
+	if again.owner(bob.fp) != "" || again.owner(ada.fp) != "" || again.owner(again.opsFP) != "ops" {
+		t.Fatal("a restart after the stop did not start with only the local admins")
+	}
+}
+
+// restartAfterRollback stops srv, sets the clock back to an hour before the
+// end of the trust time of the list pulled at rtT0, and starts again with the
+// service unreachable: it fails the test unless only the local admins can log
+// in.
+func restartAfterRollback(t *testing.T, srv *rtServer, svc *rtService, clock *fakeClock, dir, opsLine string, ada *person) {
+	t.Helper()
+	srv.stop()
+	clock.set(rtT0.Add(rtTrust - time.Hour))
+	again := startRT(t, svc, dir, opsLine, nil)
+	if again.owner(ada.fp) != "" || again.owner(again.opsFP) != "ops" {
+		t.Fatal("a restart with the clock set back admitted a list user after the trust time ended")
+	}
+}
+
+// TestRuntimeReaderLatchRemovesTheCopy: a reader that finds the end of the
+// trust time (and latches it) tells the runtime so, without blocking, and
+// the kept copy is removed at once: no tick of the trust watch and no turn
+// of the schedule comes (the wall clock is stepped, firing no timer). A
+// restart with the clock set back then has only the local admins.
+func TestRuntimeReaderLatchRemovesTheCopy(t *testing.T) {
+	clock, svc, dir, opsLine, ada := rtSetup(t)
+	srv := idleRT(t, svc, dir, opsLine)
+	clock.stepWall(rtTrust)
+	if srv.owner(ada.fp) != "" {
+		t.Fatal("a list user resolved at the end of the trust time")
+	}
+	eventually(t, "the kept copy removed after a reader latched the end", func() bool { return copyBytes(t, dir) == nil })
+	eventually(t, "status says the copy was removed", func() bool { return srv.rt.Status().Copy == CopyNone })
+	restartAfterRollback(t, srv, svc, clock, dir, opsLine, ada)
+}
+
+// TestRuntimeGracefulStopAfterTheDeadline: a graceful stop right after the
+// end of the trust time, before any reader, tick or turn of the schedule has
+// seen it, checks the trust time once more and removes the kept copy before
+// it returns; a restart with the clock set back then has only the local
+// admins.
+func TestRuntimeGracefulStopAfterTheDeadline(t *testing.T) {
+	clock, svc, dir, opsLine, ada := rtSetup(t)
+	srv := idleRT(t, svc, dir, opsLine)
+	clock.stepWall(rtTrust + time.Second)
+	if copyBytes(t, dir) == nil {
+		t.Fatal("the copy went before the stop: the test checks nothing")
+	}
+	srv.cancel() // as serve cancels the refresh at a graceful stop
+	ctx, cancel := context.WithTimeout(context.Background(), StopTrustBound)
+	defer cancel()
+	if err := srv.rt.CheckTrustAtStop(ctx); err != nil {
+		t.Fatalf("CheckTrustAtStop: %v", err)
+	}
+	if copyBytes(t, dir) != nil {
+		t.Fatal("the kept copy outlived a graceful stop after the end of its trust time")
+	}
+	restartAfterRollback(t, srv, svc, clock, dir, opsLine, ada)
+
+	// Inside the trust time, a stop keeps the copy.
+	clockIn, svcIn, dirIn, opsIn, adaIn := rtSetup(t)
+	inside := idleRT(t, svcIn, dirIn, opsIn)
+	clockIn.stepWall(rtTrust - time.Second)
+	inside.cancel()
+	if err := inside.rt.CheckTrustAtStop(ctx); err != nil {
+		t.Fatalf("CheckTrustAtStop: %v", err)
+	}
+	if copyBytes(t, dirIn) == nil {
+		t.Fatal("a stop inside the trust time removed the copy")
+	}
+	inside.stop()
+	if again := startRT(t, svcIn, dirIn, opsIn, nil); again.owner(adaIn.fp) != "ada" {
+		t.Fatal("the copy kept at a stop inside the trust time was not used")
 	}
 }
 

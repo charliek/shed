@@ -294,7 +294,13 @@ good pull it came from. When that ends without a good pull, only the local
 admins can log in, the listed users' SSH connections are closed, the kept copy
 is removed (so a restart cannot bring the list back), and the log says
 `directory: TRUST ENDED: ...`. The next good pull restores the list. A local
-admin can log in throughout.
+admin can log in throughout. The copy goes at once when a login or request
+finds the end, within 30 seconds otherwise, and at a graceful stop. What
+remains: a server that dies without a graceful stop in the moment between
+the end of the trust time and the removal of the copy, followed by a clock
+set back and a restart while the service cannot be reached, brings the list
+back for what remains of its trust time on that clock. Keep the host's clock
+accurate.
 
 A server the service has disabled keeps its list until the trust time ends,
 and logs `directory: SERVER DISABLED: ...`.
@@ -464,7 +470,7 @@ there, or the old client id in `disabled`). Stop both with Ctrl-C and remove
 | Log: `Users: not enrolled (no enrolment: ...): run 'shed-server directory enroll'; only the local admins can log in` | Not enrolled yet | [Enrol](#enrol) |
 | Log: `Users: enrolment unusable (<file>: <check>); only the local admins can log in` | `enrolment.json` or its directory failed a check (owner, mode, symbolic link, size, content) | Put the file right (owned by the server's user, mode `0600`, in a `0700` directory), or [enrol again](#enrolling-again) |
 | Log: `directory: the account service refused this server's login: ...` | The service does not recognise this server's key or assertion | Check the host's clock, then the server on the service; enrol again if it was removed there |
-| Log: `directory: SERVER DISABLED: ...` | The server is disabled on the service | Enable it there, or enrol again with a new code |
+| Log: `directory: SERVER DISABLED: ...` | The server is disabled on the service | A disabled server stays disabled: have a new code issued and [enrol again](#enrolling-again) |
 | Log: `directory: WARNING: the account service's clock is ... from this server's; ...` | The clocks differ by more than 30 s | Fix the host's clock (NTP) |
 | Log: `directory: kept copy not written: ...; a restart starts with only the local admins until a good pull` | The state directory cannot be written | Free space or fix permissions; the next good pull writes it again |
 | `shed users status`: `Error: <server>: this server has no status route (it is older than 'shed users status')` | The server is older than the CLI | Upgrade the server |
