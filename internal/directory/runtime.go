@@ -1260,7 +1260,10 @@ func (r *Runtime) failed(start time.Time, err error) users.DirectoryRefresh {
 		}
 	}
 	next := now.Add(max(RetryInterval, r.retryLeftLocked(el)))
-	class, line, everyAttempt := describeFailure(f, err, next)
+	// The row and the line's account of the list in force are read from one
+	// view.
+	row := r.rowLocked(false, err.Error())
+	class, line, everyAttempt := describeFailure(f, err, next, row.List)
 	r.lastAttempt, r.lastErr, r.next = start, err.Error(), next
 	logIt := everyAttempt || r.failClass != class
 	r.failClass, r.goodLogged = class, ""
@@ -1272,7 +1275,7 @@ func (r *Runtime) failed(start time.Time, err error) users.DirectoryRefresh {
 		r.warnSkew(f.Date.Sub(f.Local))
 	}
 	r.logStale()
-	return r.row(false, err.Error())
+	return row
 }
 
 // warnSkew warns when an answer's Date was further than skewWarning from the
@@ -1285,33 +1288,54 @@ func (r *Runtime) warnSkew(skew time.Duration) {
 
 // describeFailure is the log line of a failed pull, its class (for the
 // lines logged once per change of state) and whether it is logged at every
-// attempt. f is err as a *Failure, or nil.
-func describeFailure(f *Failure, err error, next time.Time) (class, line string, everyAttempt bool) {
+// attempt. f is err as a *Failure, or nil; list is the refresh row's account
+// of the list in force after it (users.DirectoryList*), which the line
+// states (heldClause).
+func describeFailure(f *Failure, err error, next time.Time, list string) (class, line string, everyAttempt bool) {
 	at := "next attempt at " + stamp(next)
+	held, heldToTrustEnd := heldClause(list, false), heldClause(list, true)
 	if f == nil {
-		return "other", fmt.Sprintf("directory: pull failed: %v; the list held stays; %s", err, at), false
+		return "other", fmt.Sprintf("directory: pull failed: %v; %s; %s", err, held, at), false
 	}
 	switch {
 	case f.Kind == KindInvalidClient:
-		return "token-refused", fmt.Sprintf("directory: the account service refused this server's login: %v; the list held stays; %s", f, at), true
+		return "token-refused", fmt.Sprintf("directory: the account service refused this server's login: %v; %s; %s", f, held, at), true
 	case f.Kind == KindInvalidToken:
-		return "token-refused", fmt.Sprintf("directory: the account service refused this server's access token after a new login: %v (the service's clock %s, this server's %s); the list held stays; %s",
-			f, formatDate(f.Date), stamp(f.Local), at), true
+		return "token-refused", fmt.Sprintf("directory: the account service refused this server's access token after a new login: %v (the service's clock %s, this server's %s); %s; %s",
+			f, formatDate(f.Date), stamp(f.Local), held, at), true
 	case f.Kind == KindServerDisabled:
-		return "server-disabled", fmt.Sprintf("directory: SERVER DISABLED: the account service has disabled this server: %v; the list held stays until its trust time ends; %s", f, at), false
+		return "server-disabled", fmt.Sprintf("directory: SERVER DISABLED: the account service has disabled this server: %v; %s; %s", f, heldToTrustEnd, at), false
 	case f.Step == StepDirectory && f.Status == 403 && f.Code == "":
 		// A SERVER_DISABLED answer whose body was cut at the 4 KiB an error
 		// body is read to arrives with no code: it is reported as possibly
 		// that.
-		return "server-disabled", fmt.Sprintf("directory: REFUSED: the account service answered HTTP 403 with no error this server could read (a disabled server's answer, cut short, looks like this): %v; the list held stays until its trust time ends; %s", f, at), false
+		return "server-disabled", fmt.Sprintf("directory: REFUSED: the account service answered HTTP 403 with no error this server could read (a disabled server's answer, cut short, looks like this): %v; %s; %s", f, heldToTrustEnd, at), false
 	case f.Kind == KindRateLimited:
-		return "rate-limited", fmt.Sprintf("directory: rate limited by the account service: %v; the list held stays; %s", f, at), false
+		return "rate-limited", fmt.Sprintf("directory: rate limited by the account service: %v; %s; %s", f, held, at), false
 	case f.Kind == KindUnavailable || f.Kind == KindTransport || f.Kind == KindServerError:
-		return "unavailable", fmt.Sprintf("directory: the account service is unavailable or did not answer in time: %v; the list held stays; %s", f, at), true
+		return "unavailable", fmt.Sprintf("directory: the account service is unavailable or did not answer in time: %v; %s; %s", f, held, at), true
 	case errors.Is(err, ErrContract) || errors.Is(err, ErrOrganization):
-		return "contract", fmt.Sprintf("directory: the account service's answer is refused: %v; the list held stays; %s", f, at), false
+		return "contract", fmt.Sprintf("directory: the account service's answer is refused: %v; %s; %s", f, held, at), false
 	}
-	return "refused:" + string(f.Kind), fmt.Sprintf("directory: pull failed: %v; the list held stays; %s", f, at), false
+	return "refused:" + string(f.Kind), fmt.Sprintf("directory: pull failed: %v; %s; %s", f, held, at), false
+}
+
+// heldClause is what a failed pull's line says of the list in force after
+// it (list, the refresh row's List). With a list in force it stays: until
+// its trust time ends, when untilTrustEnds (a disabled server). With none
+// (none held, the list withdrawn, or its trust time ended) only the local
+// admins can log in.
+func heldClause(list string, untilTrustEnds bool) string {
+	switch list {
+	case users.DirectoryListInForce:
+		if untilTrustEnds {
+			return "the list held stays until its trust time ends"
+		}
+		return "the list held stays"
+	case users.DirectoryListTrustEnded:
+		return "no list is in force (the trust time of the last list ended); only the local admins can log in"
+	}
+	return "no list is in force; only the local admins can log in"
 }
 
 // row is the Directory row of an attempt that was good or failed with
@@ -1321,9 +1345,14 @@ func describeFailure(f *Failure, err error, next time.Time) (class, line string,
 // force: the row then has no version and no users, and says why (List).
 func (r *Runtime) row(good bool, errText string) users.DirectoryRefresh {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rowLocked(good, errText)
+}
+
+// rowLocked is row, with r.mu held.
+func (r *Runtime) rowLocked(good bool, errText string) users.DirectoryRefresh {
 	v := r.view()
 	version, pastTrust := r.version, !r.pastTrust.IsZero()
-	r.mu.Unlock()
 	row := users.DirectoryRefresh{Status: users.DirectoryRefreshFailed, Error: errText}
 	if good {
 		row.Status = users.DirectoryRefreshGood

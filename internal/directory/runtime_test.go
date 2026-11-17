@@ -889,6 +889,115 @@ func TestRuntimeFailureLogLines(t *testing.T) {
 	noSecretsIn(t, "the log", srv.log.String(), svc.secrets())
 }
 
+// TestRuntimeFailureLineSaysWhetherAListIsInForce: a failed pull's line says
+// the list held stays (until its trust time ends, for a disabled server's
+// answer) only while a list is in force. With none in force (a start with no
+// kept copy, after the trust time ended, after a withdrawal, a kept copy
+// refused at start for its trust time) it says no list is in force and only
+// the local admins can log in, and that the trust time ended when it did.
+// The row's List and the line agree.
+func TestRuntimeFailureLineSaysWhetherAListIsInForce(t *testing.T) {
+	const (
+		inForce      = "; the list held stays; next attempt at "
+		inForceToEnd = "; the list held stays until its trust time ends; next attempt at "
+		none         = "; no list is in force; only the local admins can log in; next attempt at "
+		ended        = "; no list is in force (the trust time of the last list ended); only the local admins can log in; next attempt at "
+	)
+	// setUp brings a server over dir, enrolled at svc, to the state, and
+	// returns it.
+	type setUp func(t *testing.T, clock *fakeClock, svc *rtService, dir, opsLine string) *rtServer
+	goodPull := func(t *testing.T, srv *rtServer) {
+		t.Helper()
+		if row := srv.refresh(t); row.List != users.DirectoryListInForce {
+			t.Fatalf("set-up pull: %+v", row)
+		}
+	}
+	for _, tc := range []struct {
+		name          string
+		setUp         setUp
+		list          string
+		line, lineEnd string
+	}{
+		{"a list in force", func(t *testing.T, _ *fakeClock, svc *rtService, dir, opsLine string) *rtServer {
+			srv := startRT(t, svc, dir, opsLine, nil)
+			goodPull(t, srv)
+			return srv
+		}, users.DirectoryListInForce, inForce, inForceToEnd},
+		{"a start with no kept copy", func(t *testing.T, _ *fakeClock, svc *rtService, dir, opsLine string) *rtServer {
+			return startRT(t, svc, dir, opsLine, nil)
+		}, users.DirectoryListNone, none, none},
+		{"after the trust time ended", func(t *testing.T, clock *fakeClock, svc *rtService, dir, opsLine string) *rtServer {
+			srv := startRT(t, svc, dir, opsLine, nil)
+			goodPull(t, srv)
+			clock.set(rtT0.Add(rtTrust))
+			return srv
+		}, users.DirectoryListTrustEnded, ended, ended},
+		{"after a withdrawal", func(t *testing.T, _ *fakeClock, svc *rtService, dir, opsLine string) *rtServer {
+			srv := startRT(t, svc, dir, opsLine, nil)
+			goodPull(t, srv)
+			path := filepath.Join(dir, EnrolmentFileName)
+			enrolment, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if row := srv.refresh(t); row.List != users.DirectoryListWithdrawn {
+				t.Fatalf("the withdrawing pull: %+v", row)
+			}
+			if err := os.WriteFile(path, enrolment, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return srv
+		}, users.DirectoryListNone, none, none},
+		{"a kept copy past its trust time", func(t *testing.T, clock *fakeClock, svc *rtService, dir, opsLine string) *rtServer {
+			first := startRT(t, svc, dir, opsLine, nil)
+			goodPull(t, first)
+			first.stop()
+			clock.advance(rtTrust + time.Minute)
+			return startRT(t, svc, dir, opsLine, nil)
+		}, users.DirectoryListTrustEnded, ended, ended},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock, svc, dir, opsLine, _ := rtSetup(t)
+			srv := tc.setUp(t, clock, svc, dir, opsLine)
+			// The last line holding marker, after a failed pull whose row is
+			// checked.
+			failedLine := func(marker string) string {
+				t.Helper()
+				if row := srv.refresh(t); row.Status != users.DirectoryRefreshFailed || row.List != tc.list {
+					t.Fatalf("the failed pull's row: %+v; want list %s", row, tc.list)
+				}
+				srv.log.mu.Lock()
+				defer srv.log.mu.Unlock()
+				for i := len(srv.log.lines) - 1; i >= 0; i-- {
+					if strings.Contains(srv.log.lines[i], marker) {
+						return srv.log.lines[i]
+					}
+				}
+				t.Fatalf("no line holds %q:\n%s", marker, strings.Join(srv.log.lines, "\n"))
+				return ""
+			}
+			svc.dir.setOutage(true)
+			if got := failedLine("the account service is unavailable or did not answer in time: "); !strings.Contains(got, tc.line) {
+				t.Errorf("an unavailable service's line:\n%s\nwant it to hold %q", got, tc.line)
+			}
+			svc.dir.setOutage(false)
+			svc.setMode(faultCut403, "")
+			if got := failedLine("REFUSED: the account service answered HTTP 403"); !strings.Contains(got, tc.lineEnd) {
+				t.Errorf("a disabled server's answer, cut short:\n%s\nwant it to hold %q", got, tc.lineEnd)
+			}
+			svc.setMode(faultNone, "")
+			if tc.list != users.DirectoryListInForce {
+				if n := srv.log.count("the list held stays"); n != 0 {
+					t.Errorf("%d lines say the list held stays with no list in force:\n%s", n, srv.log)
+				}
+			}
+		})
+	}
+}
+
 // TestRuntimeGoodPullLines: a good pull is logged when its version changes,
 // with the names added and removed and the admin flags changed; each
 // skipped entry once per version, and an entry with a local admin's name at
