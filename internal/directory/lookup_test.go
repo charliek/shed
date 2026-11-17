@@ -72,13 +72,25 @@ func localAdmin(lines ...string) config.UserConfig {
 	return uc
 }
 
+// mustLookup is a lookup of these local admins holding list (nil: none) from
+// the start, fixed: a list given so has no trust time (newLookup). A test of
+// the trust time installs its lists (Install).
 func mustLookup(t *testing.T, opts LookupOptions, list *List) *Lookup {
 	t.Helper()
-	l, err := NewLookup(opts, list)
+	l, err := newLookupOrNot(opts, list)
 	if err != nil {
-		t.Fatalf("NewLookup: %v", err)
+		t.Fatalf("newLookup: %v", err)
 	}
 	return l
+}
+
+// newLookupOrNot builds a lookup through the exported constructor when there
+// is no list, and through newLookup, its fixed-list form, when there is one.
+func newLookupOrNot(opts LookupOptions, list *List) (*Lookup, error) {
+	if list == nil {
+		return NewLookup(opts)
+	}
+	return newLookup(opts, list)
 }
 
 func names(us []users.User) string {
@@ -552,7 +564,7 @@ func TestNewLookupRefuses(t *testing.T) {
 		{"list: a counted fingerprint not canonical", good, nil, &List{Users: []User{{Name: "eve", Keys: []Key{adaKey}, Fingerprints: []string{"MD5:example"}}}}, "canonical"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			l, err := NewLookup(LookupOptions{LocalAdmins: tc.admins, ServiceClients: tc.clients}, tc.list)
+			l, err := newLookupOrNot(LookupOptions{LocalAdmins: tc.admins, ServiceClients: tc.clients}, tc.list)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("NewLookup = %v, %v; want an error containing %q", l, err, tc.want)
 			}
@@ -582,7 +594,7 @@ func TestNewLookupRefuses(t *testing.T) {
 		{"list: no fingerprint", good, &List{Users: []User{{Name: "ada", Keys: []Key{{Label: "l"}}}}}, "no fingerprint"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			l, err := NewLookup(LookupOptions{LocalAdmins: tc.admins}, tc.list)
+			l, err := newLookupOrNot(LookupOptions{LocalAdmins: tc.admins}, tc.list)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("NewLookup = %v, %v; want an error containing %q", l, err, tc.want)
 			}

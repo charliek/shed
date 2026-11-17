@@ -1,12 +1,15 @@
 package directory
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -54,6 +57,54 @@ type LookupOptions struct {
 	ServiceClients []string
 	// MaxAuthTries is auth.ssh.max_auth_tries (0: the SSH server's default).
 	MaxAuthTries int
+	// Now is the wall clock the trust time is measured on; nil is
+	// time.Now. Every instant it gives is used without its monotonic
+	// reading (Round(0)). For tests.
+	Now func() time.Time
+	// TrustTicks starts the ticker WatchTrust checks the trust time on and
+	// returns its ticks and how to stop it; nil ticks every
+	// TrustCheckEvery. For tests.
+	TrustTicks func() (ticks <-chan time.Time, stop func())
+}
+
+// TrustCheckEvery is how often WatchTrust checks whether the trust time of
+// the list the lookup holds has ended.
+const TrustCheckEvery = 30 * time.Second
+
+// Publication is what the publication hook (SetPublicationHook) is told of a
+// state the lookup has just published.
+type Publication struct {
+	// Gen is the published state's generation.
+	Gen uint64
+	// TrustEnded is true when the published state answers for the local
+	// admins only because the trust time of its list has ended.
+	TrustEnded bool
+	// Has reports whether name is a user of the published state: a local
+	// admin, or a listed user while the list is trusted. It answers from
+	// that state alone, never blocks, and may be called at any time.
+	Has func(name string) bool
+}
+
+// State is the lookup's current state, as its readers see it now.
+type State struct {
+	// Gen is the state's generation; the first is 1, and each publication
+	// adds one.
+	Gen uint64
+	// Seq is the pull sequence number of the list the state holds (the
+	// last one published); 0 before the first.
+	Seq uint64
+	// Listed is true when the state holds a list.
+	Listed bool
+	// FetchedAt is when the list's answer arrived, and Deadline when its
+	// trust time ends, both on the wall clock (no monotonic reading). Zero
+	// before the first list.
+	FetchedAt, Deadline time.Time
+	// Expired is true when the trust time of the list has ended: the
+	// lookup answers for the local admins only until a new list is
+	// installed.
+	Expired bool
+	// Skipped is the list's skip report (a copy).
+	Skipped []Skip
 }
 
 // Lookup is the users.Lookup of a server whose users come from a directory
@@ -66,6 +117,14 @@ type LookupOptions struct {
 // Every reader answers from one snapshot, loaded once per call: a call never
 // mixes two snapshots. A snapshot's users, keys and skip report never change
 // once the lookup holds it.
+//
+// The list changes only through one publication point (publish): a newly
+// pulled list (Install), or the end of its trust time (WatchTrust). A list
+// is trusted until its deadline, the wall-clock instant its answer arrived
+// plus the trust time; from that instant on (now == deadline included) the
+// lookup answers for the local admins only, and keeps doing so, even if the
+// clock moves back, until a new list is installed. The local admins are
+// never subject to the trust time.
 type Lookup struct {
 	maxAuthTries int
 	// admins are the local admins, built once from config and shared by
@@ -73,28 +132,61 @@ type Lookup struct {
 	admins *userSet
 	// clients holds the auth.clients names. Never changed.
 	clients map[string]bool
+	// clock is the wall clock (LookupOptions.Now); read through now.
+	clock func() time.Time
+	// trustTicks starts WatchTrust's ticker (LookupOptions.TrustTicks).
+	trustTicks func() (<-chan time.Time, func())
 	// snap is the snapshot every reader answers from.
 	snap atomic.Pointer[snapshot]
+	// pubMu orders the publications: publish holds it from its check of the
+	// current snapshot through the publication hook. Readers never take it.
+	pubMu sync.Mutex
+	// hook is the publication hook, guarded by pubMu.
+	hook func(Publication)
+	// loaded, when set (by tests only), runs in every reader just after it
+	// has loaded its snapshot.
+	loaded func()
+	// latchRead, when set (by tests only), runs in trusted after its first
+	// read of the latch and before its clock reading.
+	latchRead func()
 }
 
-var _ users.Lookup = (*Lookup)(nil)
+var (
+	_ users.Lookup               = (*Lookup)(nil)
+	_ users.BoundCredentialsOnly = (*Lookup)(nil)
+)
 
 // snapshot is one state of the lookup's users. Its users, keys and skip
 // report never change once the lookup holds it.
 type snapshot struct {
 	// gen counts the snapshots the lookup has held; the first is 1.
 	gen uint64
+	// seq is the pull sequence number of the list the snapshot holds (0:
+	// none, or a fixed list given to newLookup).
+	seq uint64
 	// local are the local admins.
 	local *userSet
 	// listed are the list's users that this server admits; nil before the
 	// lookup has a list. No name and no key is in both local and listed.
 	listed *userSet
-	// deadline and expired bound how long listed is honoured (the trust
-	// time, a wall-clock deadline and a latch set once it has passed). A
-	// snapshot built from a given list, as NewLookup builds, has neither:
-	// a zero deadline and expired unset, and nothing reads them.
-	deadline time.Time
-	expired  atomic.Bool
+	// fetchedAt is when the list's answer arrived and deadline when its
+	// trust time ends, both on the wall clock with no monotonic reading. A
+	// fixed list given to newLookup (tests only) has neither (zero): it has
+	// no trust time.
+	fetchedAt, deadline time.Time
+	// expired is the latch: set by the first reader that finds the deadline
+	// passed (now >= deadline), and from then on the snapshot answers for
+	// the local admins only, whatever the clock says later.
+	expired atomic.Bool
+	// ended marks a snapshot published as the end of the trust time,
+	// expired from the start: one made for it (trustEndOf), or a list whose
+	// trust time had already ended when it was installed (Install). No
+	// second end is published after it.
+	ended bool
+	// from is, on a snapshot made for the end of the trust time, the
+	// snapshot it was made from: publish refuses it unless that one is
+	// still the current one. nil once published.
+	from *snapshot
 	// skipped are the list's entries the lookup does not answer for: rule
 	// 7's skips in List.Skipped's order (the answer's, as DecodeList makes
 	// it), then this server's own, sorted by name.
@@ -115,16 +207,24 @@ type keyEntry struct {
 	key  users.Key
 }
 
-// NewLookup builds the lookup from the local admins and list, a decoded
-// directory answer (DecodeList), or nil for none: then only the local admins
-// are users. It refuses local admins that config load would refuse beside
-// auth.directory (none; one that is not an admin, is named like a service
-// client, has a GitHub login, no key, a key with no label or a label used
-// twice, a key that does not parse, a script key, or a key another holds)
-// and a list that DecodeList could not have made (a name that is not a user
-// name or is listed twice, a user with no key, a fingerprint that is not in
-// the canonical gossh.FingerprintSHA256 form, a key listed twice).
-func NewLookup(opts LookupOptions, list *List) (*Lookup, error) {
+// NewLookup builds the lookup from the local admins, with no list: only the
+// local admins are users until a list is installed (Install), and every list
+// it ever holds comes through Install, with its trust time. It refuses local
+// admins that config load would refuse beside auth.directory (none; one that
+// is not an admin, is named like a service client, has a GitHub login, no
+// key, a key with no label or a label used twice, a key that does not parse,
+// a script key, or a key another holds).
+func NewLookup(opts LookupOptions) (*Lookup, error) {
+	return newLookup(opts, nil)
+}
+
+// newLookup is NewLookup holding list, a decoded directory answer
+// (DecodeList), or nil for none, from the start. A list given here has no
+// trust time and never expires: for the package's own tests of a fixed list.
+// It also refuses a list that DecodeList could not have made (a name that is
+// not a user name or is listed twice, a user with no key, a fingerprint that
+// is not in the canonical gossh.FingerprintSHA256 form, a key listed twice).
+func newLookup(opts LookupOptions, list *List) (*Lookup, error) {
 	clients := map[string]bool{}
 	for _, name := range opts.ServiceClients {
 		clients[name] = true
@@ -133,7 +233,19 @@ func NewLookup(opts LookupOptions, list *List) (*Lookup, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Lookup{maxAuthTries: opts.MaxAuthTries, admins: admins, clients: clients}
+	l := &Lookup{
+		maxAuthTries: opts.MaxAuthTries, admins: admins, clients: clients,
+		clock: opts.Now, trustTicks: opts.TrustTicks,
+	}
+	if l.clock == nil {
+		l.clock = time.Now
+	}
+	if l.trustTicks == nil {
+		l.trustTicks = func() (<-chan time.Time, func()) {
+			t := time.NewTicker(TrustCheckEvery)
+			return t.C, t.Stop
+		}
+	}
 	s, err := l.build(list)
 	if err != nil {
 		return nil, err
@@ -334,52 +446,295 @@ func (l *Lookup) UserForKey(fingerprint string) (users.User, users.Key, bool) {
 	if fingerprint == "" {
 		return users.User{}, users.Key{}, false
 	}
-	s := l.snap.Load()
+	s := l.load()
 	if e, ok := s.local.keys[fingerprint]; ok {
 		return s.local.users[e.user], ownExpiry(e.key), true
 	}
-	if s.listed != nil {
-		if e, ok := s.listed.keys[fingerprint]; ok {
-			return s.listed.users[e.user], ownExpiry(e.key), true
+	if listed := l.trusted(s); listed != nil {
+		if e, ok := listed.keys[fingerprint]; ok {
+			return listed.users[e.user], ownExpiry(e.key), true
 		}
 	}
 	return users.User{}, users.Key{}, false
 }
 
-// User returns the user with this name: a local admin, or a listed user.
-// There is no implicit user: users.ImplicitName is nobody.
+// User returns the user with this name: a local admin, or a listed user
+// while the list is trusted. There is no implicit user: users.ImplicitName
+// is nobody.
 func (l *Lookup) User(name string) (users.User, bool) {
-	s := l.snap.Load()
+	s := l.load()
 	if u, ok := s.local.users[name]; ok {
 		return u, true
 	}
-	if s.listed != nil {
-		if u, ok := s.listed.users[name]; ok {
+	if listed := l.trusted(s); listed != nil {
+		if u, ok := listed.users[name]; ok {
 			return u, true
 		}
 	}
 	return users.User{}, false
 }
 
-// Users lists every user, the local admins and the listed users, sorted by
-// name.
+// Users lists every user, the local admins and, while the list is trusted,
+// the listed users, sorted by name.
 func (l *Lookup) Users() []users.User {
-	s := l.snap.Load()
+	s := l.load()
+	listed := l.trusted(s)
 	n := len(s.local.users)
-	if s.listed != nil {
-		n += len(s.listed.users)
+	if listed != nil {
+		n += len(listed.users)
 	}
 	out := make([]users.User, 0, n)
 	for _, u := range s.local.users {
 		out = append(out, u)
 	}
-	if s.listed != nil {
-		for _, u := range s.listed.users {
+	if listed != nil {
+		for _, u := range listed.users {
 			out = append(out, u)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// BoundCredentialsOnly marks the lookup as one whose users change while the
+// server runs (users.BoundCredentialsOnly): a client certificate that names
+// no user is refused, and a credential-bus stream checks its caller again
+// before each message.
+func (l *Lookup) BoundCredentialsOnly() {}
+
+// State reports the lookup's current state. Like every reader it finds, and
+// latches, the end of the list's trust time.
+func (l *Lookup) State() State {
+	s := l.load()
+	listed := l.trusted(s)
+	return State{
+		Gen:       s.gen,
+		Seq:       s.seq,
+		Listed:    s.listed != nil,
+		FetchedAt: s.fetchedAt,
+		Deadline:  s.deadline,
+		Expired:   s.listed != nil && listed == nil,
+		Skipped:   append([]Skip(nil), s.skipped...),
+	}
+}
+
+// load is the snapshot a reader answers from, loaded once.
+func (l *Lookup) load() *snapshot {
+	s := l.snap.Load()
+	if l.loaded != nil {
+		l.loaded()
+	}
+	return s
+}
+
+// now is the wall clock's reading with no monotonic reading: every instant
+// the trust time stores or compares is one of these. Go compares two times
+// that both carry a monotonic reading on that reading, which does not count
+// the time a host spent asleep; on the wall clock, a host that slept past
+// the deadline stops trusting the list at once.
+func (l *Lookup) now() time.Time { return l.clock().Round(0) }
+
+// trusted is s's listed users while s's list is trusted, or nil: when s has
+// no list, or the list's trust time has ended. A reader that finds the
+// deadline passed (now >= deadline) sets s's latch, and from then on s
+// answers nil whatever the clock says.
+//
+// The latch is read again after the clock reading, before the listed users
+// are accepted: another reader may have set it between this one's first read
+// and its clock reading, and the clock may have moved back since, so a
+// reading before the deadline alone does not show the list is still trusted.
+func (l *Lookup) trusted(s *snapshot) *userSet {
+	if s.listed == nil || s.expired.Load() {
+		return nil
+	}
+	if s.deadline.IsZero() {
+		return s.listed
+	}
+	if l.latchRead != nil {
+		l.latchRead()
+	}
+	if !l.now().Before(s.deadline) {
+		s.expired.Store(true)
+		return nil
+	}
+	if s.expired.Load() {
+		return nil
+	}
+	return s.listed
+}
+
+// noPull is the pull sequence number of a publication no pull made: the end
+// of the trust time.
+const noPull = 0
+
+// publish is the lookup's one publication point. Under pubMu it refuses a
+// stale next: one made by a pull (pullSeq) whose sequence number is not
+// greater than the current snapshot's, a result of an older pull that ended
+// late; or one made for the end of the trust time (pullSeq noPull) from a
+// snapshot that is no longer the current one. Otherwise it numbers next
+// (gen), makes it the snapshot readers load, and runs the publication hook
+// before it lets pubMu go, so hooks run one at a time and in the order of
+// the publications. All network work is done before publish, which does
+// none. It reports whether next was published, and the snapshot it replaced
+// (nil when it was not published).
+func (l *Lookup) publish(next *snapshot, pullSeq uint64) (prev *snapshot, ok bool) {
+	l.pubMu.Lock()
+	defer l.pubMu.Unlock()
+	cur := l.snap.Load()
+	if pullSeq == noPull {
+		if next.from != cur {
+			return nil, false
+		}
+		next.seq = cur.seq
+	} else {
+		if pullSeq <= cur.seq {
+			return nil, false
+		}
+		next.seq = pullSeq
+	}
+	next.from = nil
+	next.gen = cur.gen + 1
+	l.snap.Store(next)
+	if l.hook != nil {
+		l.hook(l.publication(next))
+	}
+	return cur, true
+}
+
+// publication is what the hook is told of s, just published.
+func (l *Lookup) publication(s *snapshot) Publication {
+	local, listed := s.local, l.trusted(s)
+	return Publication{
+		Gen:        s.gen,
+		TrustEnded: s.listed != nil && listed == nil,
+		Has: func(name string) bool {
+			if _, ok := local.users[name]; ok {
+				return true
+			}
+			if listed != nil {
+				_, ok := listed.users[name]
+				return ok
+			}
+			return false
+		},
+	}
+}
+
+// SetPublicationHook sets the function every publication runs with the
+// state it published (nil: none), from then on. It runs inside the
+// publication, under the lock that orders publications, so hooks run one at
+// a time, in the order of the publications, after readers already see the
+// new state; the next publication waits for it.
+//
+// The hook's contract: no network and no other blocking work. On a directory
+// server it does one thing, close the sockets of the SSH connections of users
+// the new state no longer has (sshd's CloseConnectionsExcept, which closes
+// every such socket before it writes any log line).
+func (l *Lookup) SetPublicationHook(fn func(Publication)) {
+	l.pubMu.Lock()
+	defer l.pubMu.Unlock()
+	l.hook = fn
+}
+
+// Install publishes list, a good pull's decoded answer (DecodeList), as the
+// list the lookup answers for: the pull numbered seq (1 or more, increasing
+// with each pull started), whose answer arrived at fetchedAt on the wall
+// clock and is trusted for trust from then. It reports whether the list was
+// published: false, with nothing changed, when a pull with a greater or equal
+// number has been published already. The lookup's own rules apply to the
+// list (Skip). It refuses a list DecodeList could not have made, no list, a
+// trust time that is not positive, a zero fetchedAt, a fetchedAt after the
+// lookup's own clock reading (no tolerance), and seq 0.
+//
+// A list whose trust time has already ended by that clock reading (a late
+// result) is published as the end of the trust time at once: expired from
+// the start, so the publication answers for the local admins only and is the
+// one end published (the trust ticker publishes no second one). Logged once,
+// loudly, unless the state it replaces had already ended.
+func (l *Lookup) Install(list *List, fetchedAt time.Time, trust time.Duration, seq uint64) (bool, error) {
+	switch {
+	case list == nil:
+		return false, errors.New("directory: no list to install")
+	case trust <= 0:
+		return false, fmt.Errorf("directory: trust time %s is not positive", trust)
+	case fetchedAt.IsZero():
+		return false, errors.New("directory: the list has no fetched-at instant")
+	case seq == noPull:
+		return false, errors.New("directory: a list is installed with a pull sequence number of 1 or more")
+	}
+	now := l.now()
+	if at := fetchedAt.Round(0); at.After(now) {
+		return false, fmt.Errorf("directory: the list's fetched-at instant %s is after this server's clock (%s)",
+			at.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano))
+	}
+	s, err := l.build(list)
+	if err != nil {
+		return false, err
+	}
+	s.fetchedAt = fetchedAt.Round(0)
+	s.deadline = s.fetchedAt.Add(trust)
+	if !now.Before(s.deadline) {
+		s.ended = true
+		s.expired.Store(true)
+	}
+	prev, ok := l.publish(s, seq)
+	if ok && s.ended && !prev.ended {
+		logTrustEnded(s)
+	}
+	return ok, nil
+}
+
+// WatchTrust checks, at every tick of its ticker (every TrustCheckEvery),
+// whether the trust time of the list the lookup holds has ended, and when it
+// has publishes the end (checkTrust), until ctx ends.
+func (l *Lookup) WatchTrust(ctx context.Context) {
+	ticks, stop := l.trustTicks()
+	defer stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticks:
+			l.checkTrust()
+		}
+	}
+}
+
+// checkTrust publishes the end of the trust time when the current snapshot
+// holds a list whose deadline has passed (or whose latch is set) and that
+// end is not published yet: a snapshot with the same users, expired from the
+// start, so the publication hook closes the listed users' connections as it
+// does a removed user's. Logged once, loudly. It reports whether it
+// published.
+func (l *Lookup) checkTrust() bool {
+	s := l.snap.Load()
+	if s.listed == nil || s.ended || l.trusted(s) != nil {
+		return false
+	}
+	if _, ok := l.publish(trustEndOf(s), noPull); !ok {
+		return false
+	}
+	logTrustEnded(s)
+	return true
+}
+
+// logTrustEnded logs, loudly, the publication of the end of the trust time
+// of s's list.
+func logTrustEnded(s *snapshot) {
+	log.Printf("directory: TRUST ENDED: the list whose answer arrived at %s was trusted until %s and no good pull has replaced it; only the local admins can log in until one does, and the listed users' SSH connections are closed",
+		s.fetchedAt.UTC().Format(time.RFC3339), s.deadline.UTC().Format(time.RFC3339))
+}
+
+// trustEndOf is the snapshot that publishes the end of s's trust time: s's
+// users, expired from the start, made from s (so publish refuses it once s
+// is no longer the current snapshot).
+func trustEndOf(s *snapshot) *snapshot {
+	end := &snapshot{
+		local: s.local, listed: s.listed, fetchedAt: s.fetchedAt, deadline: s.deadline,
+		skipped: s.skipped, ended: true, from: s,
+	}
+	end.expired.Store(true)
+	return end
 }
 
 // ownExpiry is k with its own copy of its expiry, so that neither the List a

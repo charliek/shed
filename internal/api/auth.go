@@ -113,7 +113,7 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 		leaf := r.TLS.PeerCertificates[0]
 
 		now := time.Now()
-		valid := !now.Before(leaf.NotBefore) && !now.After(leaf.NotAfter)
+		valid := certValidAt(leaf, now)
 		refuseInvalid := func(w http.ResponseWriter, r *http.Request) {
 			closeIdentityBoundConnection(w, r)
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is expired or not yet valid")
@@ -168,6 +168,14 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 		caller := userCaller(user, key, leaf.Subject.CommonName, certSerial(leaf))
 		next.ServeHTTP(w, r.WithContext(withCaller(r.Context(), caller)))
 	})
+}
+
+// certValidAt reports whether now is inside leaf's validity dates
+// (NotBefore and NotAfter, both inclusive): the check the mtls middleware
+// makes of every request's certificate, and a directory server's
+// credential-bus stream of its caller's before each message.
+func certValidAt(leaf *x509.Certificate, now time.Time) bool {
+	return !now.Before(leaf.NotBefore) && !now.After(leaf.NotAfter)
 }
 
 // certSerial is a certificate's serial as lowercase hex ("" when it has none).
@@ -274,7 +282,9 @@ func certScope(leaf *x509.Certificate) string {
 // A certificate issued before certificates named their user names none. It is
 // checked by its key alone, as it was then, and expires on its own: such a
 // certificate lives auth.token_ttl from its issue (24 hours by default), and
-// the server never issues one again.
+// the server never issues one again. On a server whose lookup is
+// users.BoundCredentialsOnly (a directory server, whose users change while it
+// runs) it is refused: the client enrols again.
 //
 // ok is false with a nil lookup (no SetUserLookup call) or a malformed user
 // attribute: fail closed. Service certificates never come here (they are told
@@ -291,6 +301,8 @@ func CertificateUser(l users.Lookup, leaf *x509.Certificate, now time.Time) (use
 	b := users.Binding{}
 	if bound {
 		b = users.Binding{Bound: true, Name: name, Implicit: name == users.ImplicitName}
+	} else if _, only := l.(users.BoundCredentialsOnly); only {
+		return users.User{}, users.Key{}, false
 	}
 	return users.ResolveBound(l, leaf.Subject.CommonName, b, now)
 }

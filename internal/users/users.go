@@ -136,6 +136,26 @@ type UnknownKeyRefetcher interface {
 	RefetchForUnknownKey(ctx context.Context, fingerprint string) bool
 }
 
+// BoundCredentialsOnly is a Lookup whose users change while the server runs
+// (a directory's list, auth.directory), so that a name may stop being a user,
+// or a key move to another user, at any moment. Two things follow on a
+// server whose lookup implements it, and on no other:
+//   - a credential that names no user (Binding.Bound false: a client
+//     certificate issued before certificates named their user) is refused
+//     outright rather than checked by its key alone, since its key alone
+//     cannot say whose it was; its client enrols again;
+//   - a credential-bus stream checks its caller's certificate again before
+//     each message it sends, and ends when the certificate no longer
+//     authenticates its user.
+//
+// The two lookups of a server with no user list or with auth.users do not
+// implement it.
+type BoundCredentialsOnly interface {
+	Lookup
+	// BoundCredentialsOnly marks the lookup; it does nothing.
+	BoundCredentialsOnly()
+}
+
 // RefreshReport is what one fetch of the GitHub logins found.
 type RefreshReport struct {
 	// Logins has one row per configured GitHub login, in config order.

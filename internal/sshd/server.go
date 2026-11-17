@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/gliderlabs/ssh"
@@ -38,6 +39,18 @@ type Server struct {
 	termConfig  *terminal.Config
 	keyAuth     KeyAuth
 	bootstrap   *BootstrapInfo // static bundle metadata; nil until SetBootstrap
+
+	// connMu guards conns: the authenticated connections by the name of the
+	// user each is bound to, kept only with KeyAuth.TrackConnections
+	// (CloseConnectionsExcept). Empty otherwise.
+	connMu sync.Mutex
+	conns  map[string]map[*trackedConn]struct{}
+	// beforeTrack, when set (by tests only), runs on an authenticating
+	// connection after its identity is resolved and before it is tracked.
+	beforeTrack func()
+	// afterClose, when set (by tests only), runs at the end of every close
+	// of a tracked connection (trackedConn.Close).
+	afterClose func()
 }
 
 // KeyAuth is how the SSH server decides public-key auth: the auth.ssh mode,
@@ -52,6 +65,12 @@ type KeyAuth struct {
 	// Users resolves an offered key's fingerprint to its user. nil resolves
 	// nothing, so enforce mode then accepts no key.
 	Users users.Lookup
+	// TrackConnections keeps every authenticated connection by the name of
+	// the user it is bound to, so that CloseConnectionsExcept can close a
+	// user's connections when they stop being a user (a directory server,
+	// whose list changes while it runs). Off by default: then no connection
+	// is wrapped or kept, and authentication runs as it always has.
+	TrackConnections bool
 }
 
 // enforced reports whether keys the lookup does not resolve are refused: in
@@ -208,6 +227,12 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 					return nil, err
 				}
 				setConnIdentity(ctx, id)
+				if s.keyAuth.TrackConnections {
+					if err := s.trackAuthenticated(ctx, id); err != nil {
+						log.Printf("SSH auth DENIED: user=%s fingerprint=%s (%v)", logUser(conn.User()), id.fingerprint, err)
+						return nil, err
+					}
+				}
 				return perms, nil
 			}
 			// Best-effort diagnostic from the transport's authoritative per-attempt
@@ -239,6 +264,10 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 				s.handleSFTP(sess)
 			},
 		},
+	}
+
+	if keyAuth.TrackConnections {
+		s.sshServer.ConnCallback = s.wrapConn
 	}
 
 	// Add the host key to the server.

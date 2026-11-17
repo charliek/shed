@@ -74,9 +74,14 @@ func TestDirectoryServiceClientUnchanged(t *testing.T) {
 	lookup, err := directory.NewLookup(directory.LookupOptions{
 		LocalAdmins:    map[string]config.UserConfig{"root": {Admin: true, Keys: []config.UserKeyConfig{{Key: rootLine, Label: "laptop"}}}},
 		ServiceClients: []string{testClientName},
-	}, list)
+	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Trusted far beyond the test: a list reaches a lookup only through
+	// Install, with its trust time.
+	if ok, err := lookup.Install(list, time.Now(), 24*time.Hour, 1); err != nil || !ok {
+		t.Fatalf("Install = %v, %v", ok, err)
 	}
 	s, after := clientTestServer(t, newClientFakeBackend(sheds...), defaultTestPolicy())
 	s.SetUserLookup(lookup)

@@ -33,7 +33,13 @@
 //     the server's own rules (an entry with a local admin's name or key, or
 //     a service client's name, is skipped). Every reader answers from one
 //     snapshot per call, whose users and keys never change once the lookup
-//     holds it.
+//     holds it. A new snapshot is published at one point only: a newly
+//     pulled list (Install, numbered so an older pull's late result is
+//     discarded) or the end of its trust time (WatchTrust), after which the
+//     lookup answers for the local admins only, on the wall clock and
+//     latched, until a new list arrives. Each publication runs a hook
+//     (SetPublicationHook) through which the server closes the SSH
+//     connections of users the new snapshot no longer has.
 //   - The state files (enrolment.json, users.json) are read only after
 //     checks of their directory and themselves (ReadStateFile), written
 //     durably (WriteStateFile) or once (CreateStateFileOnce), always through
