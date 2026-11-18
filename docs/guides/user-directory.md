@@ -72,7 +72,8 @@ auth:
 A local admin is a separate, local-only identity. A list entry with a local
 admin's name, or with one of a local admin's keys, is skipped. If you also
 have an account on the service and want to use it day to day, give the local
-admin another name (such as `admin`, above).
+admin another name (such as `admin`, above), and [keep it on a backup
+key](#keeping-the-local-admin-on-a-backup-key).
 
 Check the config with the binary you will run:
 
@@ -301,6 +302,136 @@ accurate.
 
 A server the service has disabled keeps its list until the trust time ends,
 and logs `directory: SERVER DISABLED: ...`.
+
+## Keeping the local admin on a backup key
+
+This is for a person who is both a user in the service's list (`pat`, say)
+and the server's local admin (`admin`). The everyday key stays in the list; a
+second key, the **backup key**, is the local admin's only key. You hold two
+CLI entries for the server, each reaching it with exactly one key: an entry's
+client certificate names the key it enrolled with, and the CLI enrols again by
+itself (near the certificate's expiry, and whenever the server rejects it)
+with the first key `ssh` offers that the server accepts. An entry that can
+offer both keys becomes the local admin when the list is not in force ([see
+below](#if-the-everyday-entry-can-reach-the-backup-key)).
+
+1. **Make the backup key** with a passphrase, and keep it out of your agent.
+   The CLI runs `ssh` with `BatchMode=yes`, which cannot ask for a passphrase:
+   load the key for a few minutes when you need it. Without it in the agent,
+   adding the admin entry fails with `Error: your SSH key is not in this
+   server's allowlist ...`.
+
+    ```bash
+    ssh-keygen -t ed25519 -f ~/.ssh/shed-admin -C shed-admin
+    ```
+
+2. **In the server's config**, the local admin holds the backup key only. The
+   everyday key is `pat`'s in the list, not in the config.
+
+    ```yaml
+    auth:
+      mode: mtls
+      users:
+        admin:                               # the local admin: the backup key only
+          admin: true
+          keys:
+            - key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... shed-admin
+              label: backup
+      directory:
+        url: https://accounts.example.test
+    ```
+
+3. **In `~/.ssh/config`**, give each entry its own name for the server. An
+   entry's host is both its SSH host and its API address, so both names must
+   reach the server: its DNS name and a second one for the same address, or the
+   name and its address. A `Host` alias with `HostName` does not work (the API
+   address would be the alias). The CLI checks the server's TLS certificate by
+   its pin, not by name, so the second name need not be in `tls_names`.
+   `IdentitiesOnly yes` on **both** stanzas keeps each to its one key; without
+   it `ssh` also offers every key in the agent.
+
+    ```text
+    Host shed.example.test
+        IdentityFile ~/.ssh/id_ed25519
+        IdentitiesOnly yes
+
+    Host admin.shed.example.test
+        IdentityFile ~/.ssh/shed-admin
+        IdentitiesOnly yes
+    ```
+
+4. **Add both entries**, the everyday one first so that it is the default:
+
+    ```bash
+    shed server add shed.example.test --name shed
+    ssh-add -t 10m ~/.ssh/shed-admin
+    shed server add admin.shed.example.test --name shed-admin
+    ssh-add -d ~/.ssh/shed-admin
+    ```
+
+5. **Check who each entry is**: `shed source ls` names the caller's user.
+
+    ```bash
+    shed --json -s shed source ls          # "user": "pat"
+    shed --json -s shed-admin source ls    # "user": "admin"
+    ```
+
+Day to day, use the everyday entry. `shed console` and `shed exec` run `ssh`
+to the entry's host too, so its stanza gives them the everyday key.
+
+### When the list is not in force
+
+Every command through the everyday entry fails and exits 1:
+
+```text
+Error: failed to list sheds: re-authenticating after a TLS client-certificate rejection: sdk/bootstrap: ssh could not authenticate with any available identity (the daemon may have no SSH identity available — see IdentityAgent docs — or the key may not be on the server allowlist): ...
+_bootstrap@shed.example.test: Permission denied (publickey).
+```
+
+Use the admin entry. It works with the backup key out of the agent while its
+certificate is valid (`auth.token_ttl`, 24 hours by default); when a command
+through it fails with `Permission denied (publickey)`, load the key
+(`ssh-add -t 10m ~/.ssh/shed-admin`) and run it again.
+
+```bash
+shed -s shed-admin users status    # State: expired (the list's trust time ended at <time>)
+shed -s shed-admin users refresh   # when the service is back: Directory pull: good: ...
+```
+
+The everyday entry then works again as `pat` at its next command, with the
+certificate it holds. Without the refresh, the list comes back at the next
+pull (`Next attempt` in `shed users status`).
+
+### If the everyday entry can reach the backup key
+
+Do not let `ssh` offer the backup key for the everyday host. When the list is
+not in force, the server refuses the everyday key, `ssh` offers the backup
+key, and the server accepts it: the command succeeds, prints nothing about it
+(not even with `-vv`), and **from then on the everyday entry is the local
+admin**. It stays so after the list is back, until it next enrols (in the last
+2 hours of its certificate's lifetime: up to about 22 hours later with the
+default `auth.token_ttl`).
+
+| How `ssh` can reach the backup key for the everyday host | At add | List not in force | List back |
+|---|---|---|---|
+| A stanza names the everyday key, without `IdentitiesOnly yes`; both keys in the agent | `pat` | `admin`, silently | `admin` until it next enrols, then `pat` |
+| No stanza; both keys in the agent | The user of the agent's first key | `admin` | `admin` until it next enrols, then the user of the agent's first key |
+| No stanza; the everyday key in the agent, the backup key as the default identity file (`~/.ssh/id_ed25519`) | `pat` | `admin`, silently | `admin` until it next enrols, then `pat` |
+| Both stanzas with `IdentitiesOnly yes` (above); the backup key in the agent or not | `pat` | Refused (exit 1) | `pat` at once |
+
+Without a stanza, the agent's order decides at every enrolment, even while the
+list is in force. To put a switched entry back (check it with step 5), take
+the backup key out of the agent and fix the stanza, then add the entry again:
+
+```bash
+ssh-add -d ~/.ssh/shed-admin
+shed server remove shed
+shed server add shed.example.test --name shed
+```
+
+Listing your everyday key under the local admin instead makes you the local
+admin on that server for good: a list entry with a local admin's key is
+skipped, so your list identity is not used there.
 
 ## Switching a server to the directory
 

@@ -243,7 +243,9 @@ applies to them, while each key's own `expires` does. The service cannot
 change them: a list entry with a local admin's name or key is skipped, and
 the local admin keeps its name and keys whole. The server warns at start and
 in `shed users status` when every local admin key has expired, since then no
-local admin can log in.
+local admin can log in. A person who is also a user in the list keeps the local
+admin on a separate key: see [User Directory › Keeping the local admin on a
+backup key](../guides/user-directory.md#keeping-the-local-admin-on-a-backup-key).
 
 ### A list admin controls the host
 
