@@ -109,10 +109,10 @@ SERVER_NAME = "itest-dir"
 REFRESH = "1m"
 TRUST = "2m"
 # internal/directory: an unknown key pulls at most once a minute while pulls
-# succeed (UnknownKeyEvery), waits for that pull at most 20 s
+# succeed (UnknownKeyEvery), waits for that pull at most 8 s
 # (UnknownKeyWait); the trust watch ticks every 30 s.
 UNKNOWN_KEY_EVERY = 60
-UNKNOWN_KEY_WAIT = 20
+UNKNOWN_KEY_WAIT = 8
 TRUST_TICK = 30
 # Ports other work on this machine holds: never picked, even if free now.
 FORBIDDEN_PORTS = frozenset({8000, 8100, 8114, 5179, 5533, 1126, 8126, 12222, 18443, 12290, 18490, 12936, 18936})

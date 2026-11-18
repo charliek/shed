@@ -240,18 +240,15 @@ shed server add build-1.example.test --name build-1
 ```
 
 Their key is not in the list the server holds yet, so their first SSH login
-makes the server pull the list. That login can wait up to 20 seconds. The
-`shed` CLI built from this version waits up to 25 seconds for that login. A
-client with a shorter bound (an earlier `shed`, which waited 15 seconds, or
-another client) may fail that first attempt when the account service is slow;
-the server's pull goes on and its result applies, so trying again succeeds. An
-admin running `shed users refresh` before the person's first login avoids the
-wait altogether. The
-server pulls for an unknown key at most once a minute while pulls succeed,
-once per 15 minutes while they fail, and never inside a pending
-`Retry-After`; a second unknown key in that window is refused at once. If
-that happens to a genuine newcomer, they try again a minute later, or an
-admin runs `shed users refresh` first.
+makes the server pull the list. That login waits at most 8 seconds. If the
+account service is slower than that, the login is refused once; the server's
+pull goes on and its result applies, so trying again succeeds. An admin
+running `shed users refresh` before the person's first login avoids the wait
+altogether. The server pulls for an unknown key at most once a minute while
+pulls succeed, once per 15 minutes while they fail, and never inside a
+pending `Retry-After`; a second unknown key in that window is refused at
+once. If that happens to a genuine newcomer, they try again a minute later,
+or an admin runs `shed users refresh` first.
 
 ### Admins, removals and keys
 

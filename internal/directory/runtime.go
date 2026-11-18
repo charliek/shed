@@ -48,7 +48,14 @@ const (
 	// slot waits under: queueing behind a pull already running, the token
 	// request, the directory request and the one new login after a refused
 	// token, together. Measured on the runtime's timer.
-	UnknownKeyWait = 20 * time.Second
+	//
+	// It must stay below the shortest bound a shipped client puts on a first
+	// login, 10 seconds around the whole ssh exchange, with room left for the
+	// TCP connect, the SSH handshake and the answer: a client that gives up
+	// first fails a login the server is about to accept. When the wait ends
+	// first, the login is refused, the pull carries on under PullTimeout and
+	// its result applies, so the next attempt finds the key known.
+	UnknownKeyWait = 8 * time.Second
 )
 
 // SourceState is the state of a directory server's user source.

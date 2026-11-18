@@ -435,7 +435,7 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   is an RFC 3339 instant only), a local admin's name or key, or an `auth.clients` name is
   skipped and logged. A person added on the service logs in with no restart (their first SSH
   login pulls the list: at most once a minute while pulls succeed, once per 15 minutes while
-  they fail, the login waiting up to 20 s); a person removed loses their SSH connections at
+  they fail, the login waiting at most 8 s); a person removed loses their SSH connections at
   the next pull. Certificates issued before certificates named a user are refused on such a
   server. See the [User Directory
   guide](https://charliek.github.io/shed/guides/user-directory/).
@@ -486,8 +486,6 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   reference server and a private `shed-server` on loopback for each case and never touches an
   installed or dev server. The module skips under every other target with a message naming
   this one. Not in CI; its fixture unit tests run in `make test-integration-units`.
-- **CLI: the bootstrap login waits up to 25 seconds**, up from 15 (`shed server add` and
-  re-enrolment), so it does not give up before a directory server answers a first login.
 
 #### Changed
 

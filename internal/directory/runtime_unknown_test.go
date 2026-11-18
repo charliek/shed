@@ -270,6 +270,20 @@ func TestUnknownKeyRetryAfter(t *testing.T) {
 	pulledFor(t, svc, srv, eve.fp, true, "after a good refresh cleared the Retry-After")
 }
 
+// TestUnknownKeyWaitFitsTheClients: the first-login wait is positive and at
+// most 8 seconds. Shipped clients bound the whole first-login exchange at 10
+// seconds, connect and handshake included; a larger wait makes first logins
+// fail in those clients while the server is about to accept them. The wait
+// also ends before the pull it waits on, so the pull carries on past it.
+func TestUnknownKeyWaitFitsTheClients(t *testing.T) {
+	if UnknownKeyWait <= 0 || UnknownKeyWait > 8*time.Second {
+		t.Fatalf("UnknownKeyWait = %v, want above 0 and at most 8s (clients give up on a first login at 10s)", UnknownKeyWait)
+	}
+	if UnknownKeyWait >= PullTimeout {
+		t.Fatalf("UnknownKeyWait = %v, want below PullTimeout %v", UnknownKeyWait, PullTimeout)
+	}
+}
+
 // TestUnknownKeyDeadline: the login that takes the slot waits under one
 // deadline (UnknownKeyWait, on the runtime's clock) and is answered when it
 // passes, from the newest snapshot, while the pull carries on; the deadline

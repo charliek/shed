@@ -37,10 +37,7 @@ const bootstrapUser = "_bootstrap"
 // earlier deadline. A var so tests can shorten it. The bound is enforced even
 // for a cancel-only daemon ctx, so a mint can never hang on a wedged
 // ProxyCommand, a slow agent, or a touch-required key with no one present.
-// The bound must sit above 20 seconds: a server that takes its users from an
-// account service may hold a first login for up to 20 seconds while it pulls
-// its list, and giving up sooner fails a login the server is about to answer.
-var DefaultTimeout = 25 * time.Second
+var DefaultTimeout = 15 * time.Second
 
 // maxOutputBytes caps captured stdout/stderr so a misbehaving ssh, helper, or
 // ProxyCommand can't balloon the daemon's memory. A bundle is well under this.

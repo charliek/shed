@@ -356,10 +356,10 @@ A person the server does not know yet logs in over SSH (`shed server add`)
 with a key the list does not hold yet. The server then pulls the list, at most
 **once a minute** while pulls succeed and **once per 15 minutes** while they
 fail, and never inside a pending `Retry-After`. Only the login that takes that
-slot waits, for up to 20 seconds (the `shed` CLI of this version waits up to 25
-seconds for it; a client with a shorter bound may give up first, and trying
-again succeeds); every other unknown key at that moment is
-refused at once. A local admin's login never waits for a pull.
+slot waits, for at most 8 seconds. If the account service is slower than that,
+the login is refused once, the pull carries on and its result applies, and
+trying again succeeds. Every other unknown key at that moment is refused at
+once. A local admin's login never waits for a pull.
 
 The server holds **one outstanding `Retry-After`** for itself: neither the
 schedule nor an unknown key pulls before it ends. Only an admin's `shed users

@@ -5,16 +5,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
-
-// A directory server holds a first login from an unknown key for up to 20
-// seconds while it pulls its user list; the client bound must sit above it.
-func TestDefaultTimeoutAboveServerFirstLoginWait(t *testing.T) {
-	if DefaultTimeout <= 20*time.Second {
-		t.Fatalf("DefaultTimeout = %v, must exceed the server's 20s first-login wait", DefaultTimeout)
-	}
-}
 
 func TestArgs(t *testing.T) {
 	args := sshArgs(Params{Host: "vps.example.com", Port: 2222, KnownHostsPath: "/home/u/.shed/known_hosts", Scope: "control", ClientKind: "cli"})
