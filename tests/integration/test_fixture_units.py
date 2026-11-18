@@ -3863,6 +3863,10 @@ def test_proc_stat_reads_the_start_time_after_any_name(tmp_path):
     h = dfx.ProcHandle(7, 4242)
     assert h.alive(tmp_path)
     assert not dfx.ProcHandle(7, 4243).alive(tmp_path)  # the pid, reused
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_proc_stat_reads_this_process_from_the_real_proc():
     st = dfx.proc_stat(os.getpid())
     assert st is not None and st[1] > 0
 
