@@ -58,10 +58,9 @@
 //!     `409 SOURCE_DUPLICATE_STREAM` is retried on the backoff, as always: with the lock
 //!     it is left for the time before the daemon's next look, and for two daemons on a
 //!     copied state directory;
-//!   * a client holding the presence lock ([`BusClient::with_presence_lock`]: the
-//!     embedded broker only) retries an older server's terminal `409` for
-//!     [`OLD_SERVER_CONFLICT_GRACE`] after it started or took the lock, then stops as
-//!     before;
+//!   * any other `409` (a 0.9.x server's `NAMESPACE_ALREADY_REGISTERED`, or one with no
+//!     code) is terminal for every client, the desktop's embedded broker included: the
+//!     subscription stops and the type reads `rejected`;
 //!   * a respond answered 503 or 429 WITH a whole-seconds `Retry-After` that fits the
 //!     remaining budget (the server wrote nothing) is re-sent a bounded number of times,
 //!     all of it inside one deadline from the first send; every other non-204 (403 and
@@ -157,18 +156,6 @@ pub const PRESENCE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// A `yielding` namespace's `last_error`: who answers, and when this client takes over.
 pub const YIELDING_REASON: &str = "the desktop app on this machine is answering (its embedded \
      broker is running); this daemon takes over within a few seconds of the app quitting";
-/// How long, from when it started subscribing (or took the presence lock, if later), a
-/// client holding the presence lock ([`BusClient::with_presence_lock`]: the desktop's
-/// embedded broker) retries a TERMINAL `409` (a 0.9.x server's
-/// `NAMESPACE_ALREADY_REGISTERED`: another stream of this machine holds the type) instead
-/// of stopping. On such a server the daemon may still hold the type when the app first
-/// subscribes; it lets go at its next look, at most one [`PRESENCE_CHECK_INTERVAL`] away
-/// (two allowing for a slow look), and the server unregisters its listener when the
-/// connection closes. Four intervals (8 s) plus 7 s for that teardown and for the app's
-/// backoff (1, 2, 4 s) to come round to a retry: 15 s. Past it, a 409 is terminal again,
-/// as for every other client.
-pub const OLD_SERVER_CONFLICT_GRACE: Duration =
-    Duration::from_secs(4 * PRESENCE_CHECK_INTERVAL.as_secs() + 7);
 /// The audit note of an answer the daemon did not post because the desktop app's embedded
 /// broker took over the request type while the request was being handled: the server
 /// re-delivers the still-pending request to the app, which answers it.
@@ -635,17 +622,6 @@ fn set_state_with(
     }
 }
 
-/// What a terminal-looking `409` means for a client ([`BusClient::with_presence_lock`]).
-enum Grace {
-    /// Terminal, as for every client without the presence lock.
-    None,
-    /// Inside the older-server grace: retry on the backoff.
-    Retry,
-    /// The client is the embedded broker but does not hold its lock yet: rejected until
-    /// it does, then retried.
-    WaitForLock(watch::Receiver<Option<tokio::time::Instant>>),
-}
-
 /// How a single `stream_messages` attempt ended, driving the reconnect decision.
 enum StreamEnd {
     /// Shutdown was requested mid-connect / mid-stream — return cleanly.
@@ -929,9 +905,6 @@ pub struct BusClient {
     /// yield epoch the handler started in. A respond whose epoch has been passed sends
     /// nothing. `None` (every other copy): the epoch when the respond starts.
     handler_epoch: Option<u64>,
-    /// Set by the desktop's embedded broker only: when it took the presence lock (`None`
-    /// until it has), for the older-server grace ([`Self::with_presence_lock`]).
-    presence_lock: Option<watch::Receiver<Option<tokio::time::Instant>>>,
     /// How long one respond POST waits for an answer ([`RESPOND_ATTEMPT_TIMEOUT`]).
     respond_attempt_timeout: Duration,
     /// One respond's whole deadline from its first send ([`RESPOND_RETRY_BUDGET`]).
@@ -982,7 +955,6 @@ impl BusClient {
             wake: Arc::new(watch::channel(0u64).0),
             presence: None,
             handler_epoch: None,
-            presence_lock: None,
             respond_attempt_timeout: RESPOND_ATTEMPT_TIMEOUT,
             respond_budget: RESPOND_RETRY_BUDGET,
             #[cfg(test)]
@@ -1008,21 +980,6 @@ impl BusClient {
     /// the one that answers while it runs, passes none.
     pub fn with_presence(mut self, presence: Option<watch::Receiver<Presence>>) -> Self {
         self.presence = presence;
-        self
-    }
-
-    /// This client holds the presence lock: `held_since` is when it took it (`None`
-    /// until it has). Set only by the desktop's embedded broker. Its one effect: a
-    /// terminal `409` (an older server's `NAMESPACE_ALREADY_REGISTERED`) is retried on
-    /// the backoff for [`OLD_SERVER_CONFLICT_GRACE`] after it started subscribing or took
-    /// the lock, whichever is later, because on such a server the daemon on this machine
-    /// may still hold the type for a moment after the app takes the lock. A client
-    /// without it treats every such 409 as terminal, as before.
-    pub fn with_presence_lock(
-        mut self,
-        held_since: Option<watch::Receiver<Option<tokio::time::Instant>>>,
-    ) -> Self {
-        self.presence_lock = held_since;
         self
     }
 
@@ -1148,10 +1105,6 @@ impl BusClient {
         // `setState(stopState, stopCause)`).
         let mut terminal_state = ConnState::Stopped;
         let mut terminal_cause: Option<String> = None;
-        // When this subscription started: the older-server grace counts from here (or
-        // from when the presence lock was taken, if later).
-        let started = tokio::time::Instant::now();
-        let mut grace_said = false;
         loop {
             if *shutdown.borrow() {
                 break;
@@ -1208,71 +1161,15 @@ impl BusClient {
                     continue;
                 }
                 StreamEnd::Conflict(reason) => {
-                    match self.conflict_grace(started) {
-                        // The embedded broker, inside its grace: on an older server the
-                        // daemon on this machine may hold the type for a moment after
-                        // this app took the lock. Retry on the backoff.
-                        Grace::Retry => {
-                            let line = format!(
-                                "namespace {namespace} server={} is held by another stream; \
-                                 on an older server that is the shed-host-agent daemon on \
-                                 this machine, which lets go within seconds of this app \
-                                 taking its lock, so retrying backoff={backoff:?}: {reason}",
-                                self.server_label()
-                            );
-                            if grace_said {
-                                self.log.debug(&line);
-                            } else {
-                                self.log.info(&line);
-                                grace_said = true;
-                            }
-                            set_state(&status, ConnState::Reconnecting, Some(&reason));
-                            down_logged = false;
-                        }
-                        // The embedded broker before it holds the lock: the daemon does
-                        // not know to let go, so this is the old terminal refusal — until
-                        // the lock is taken, when the daemon will let go: then retry at
-                        // once, the grace counting from that moment.
-                        Grace::WaitForLock(mut held) => {
-                            self.log.error(&format!(
-                                "SSE subscription rejected; another listener owns namespace {namespace} server={} — \
-                                 not retrying until this app holds its lock: {reason}",
-                                self.server_label()
-                            ));
-                            set_state(&status, ConnState::Rejected, Some(&reason));
-                            tokio::select! {
-                                _ = wait_shutdown(shutdown.clone()) => {
-                                    terminal_state = ConnState::Rejected;
-                                    terminal_cause = Some(reason);
-                                    break;
-                                }
-                                held_now = async { held.wait_for(|h| h.is_some()).await.is_ok() } => {
-                                    if !held_now {
-                                        // The holder is gone (the broker is stopping).
-                                        wait_shutdown(shutdown.clone()).await;
-                                        terminal_state = ConnState::Rejected;
-                                        terminal_cause = Some(reason);
-                                        break;
-                                    }
-                                }
-                            }
-                            set_state(&status, ConnState::Reconnecting, Some(&reason));
-                            backoff = self.initial_backoff;
-                            down_logged = false;
-                            continue;
-                        }
-                        // Terminal: a second broker must be observably rejected, not
-                        // silently retry forever (hostclient.go's errSubscribeConflict).
-                        Grace::None => {
-                            self.log.error(&format!(
-                                "SSE subscription rejected; another listener owns namespace {namespace} server={} — not retrying: {reason}",
-                                self.server_label()
-                            ));
-                            terminal_state = ConnState::Rejected;
-                            terminal_cause = Some(reason);
-                            break;
-                        }
-                    }
+                    // Terminal: a second broker must be observably rejected, not
+                    // silently retry forever (hostclient.go's errSubscribeConflict).
+                    self.log.error(&format!(
+                        "SSE subscription rejected; another listener owns namespace {namespace} server={} — not retrying: {reason}",
+                        self.server_label()
+                    ));
+                    terminal_state = ConnState::Rejected;
+                    terminal_cause = Some(reason);
+                    break;
                 }
                 StreamEnd::NotSource { reason, source } => {
                     // Not terminal and not a credential problem: no invalidate (a
@@ -1465,23 +1362,6 @@ impl BusClient {
         let mut p = p.clone();
         if p.wait_for(|v| v.present || v.epoch != epoch).await.is_err() {
             std::future::pending::<()>().await;
-        }
-    }
-
-    /// What a terminal-looking `409` means for this client ([`Self::with_presence_lock`]).
-    fn conflict_grace(&self, started: tokio::time::Instant) -> Grace {
-        let Some(lock) = &self.presence_lock else {
-            return Grace::None;
-        };
-        let held_at = *lock.borrow();
-        match held_at {
-            None => Grace::WaitForLock(lock.clone()),
-            Some(at)
-                if tokio::time::Instant::now() < at.max(started) + OLD_SERVER_CONFLICT_GRACE =>
-            {
-                Grace::Retry
-            }
-            Some(_) => Grace::None,
         }
     }
 
@@ -2611,8 +2491,7 @@ pub fn spawn_server_group(
         Ok(c) => c
             .with_server_name(target.name.clone())
             .with_machine(deps.machine.clone())
-            .with_presence(deps.embedded_presence.clone())
-            .with_presence_lock(deps.presence_lock.clone()),
+            .with_presence(deps.embedded_presence.clone()),
         Err(e) => {
             log.error(&format!(
                 "message bus disabled server={} url={}: {e}",
@@ -10941,7 +10820,6 @@ pub(crate) mod tests {
             log: silent_log(),
             machine: Some(identity("laptop")),
             embedded_presence: presence,
-            presence_lock: None,
         };
         let target = crate::discovery::ServerTarget {
             name: String::new(),
@@ -11015,7 +10893,6 @@ pub(crate) mod tests {
                 log: silent_log(),
                 machine: Some(identity("laptop")),
                 embedded_presence: None,
-                presence_lock: None,
             };
             let target = crate::discovery::ServerTarget {
                 name: "s".into(),
@@ -11138,84 +11015,12 @@ pub(crate) mod tests {
         }
     }
 
-    // ---- an older server's terminal 409 during the handoff (review item 5) --------------
+    // ---- an older server's terminal 409 ------------------------------------------------
 
-    /// On a 0.9.x server the daemon holds the type; the app has taken the lock and
-    /// subscribes before the daemon's next look, and is answered the TERMINAL 409. The
-    /// embedded broker (holding the lock) retries on its backoff inside the grace, and
-    /// holds the type once the daemon's stream is gone.
+    /// An older server's 409 (another stream holds the type) stops a client at the first
+    /// answer: every client, the desktop's embedded broker included.
     #[tokio::test(start_paused = true)]
-    async fn the_embedded_broker_retries_an_older_servers_409_inside_the_grace() {
-        let bus = SimBus::new();
-        bus.old_server();
-        let p = FakePresence::new(false);
-        let daemon = bus.client("daemon").with_presence(Some(p.rx()));
-        let (_d_tx, d_subs) = subscribe_all(&daemon);
-        run_for(Duration::from_secs(5)).await;
-        let (_lock_tx, held) = watch::channel(Some(tokio::time::Instant::now()));
-        let app = bus.client("app").with_presence_lock(Some(held));
-        let t0 = tokio::time::Instant::now();
-        let (_a_tx, a_subs) = subscribe_all(&app);
-        run_for(Duration::from_millis(1)).await;
-        assert!(bus.attempts("app", t0).iter().all(|e| e.reached && !e.ok));
-        for s in &a_subs {
-            assert_eq!(s.status().state, ConnState::Reconnecting, "not terminal");
-        }
-        // The daemon's next look (two seconds on).
-        run_for(PRESENCE_CHECK_INTERVAL).await;
-        p.set(true);
-        run_for(Duration::from_secs(4)).await;
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("app"), "{ns}");
-        }
-        for s in &a_subs {
-            assert_eq!(s.status().state, ConnState::Connected);
-        }
-        assert_yielding(&d_subs, "the daemon stood by");
-    }
-
-    /// Past the grace the older server's 409 is terminal again, as before: an app whose
-    /// lock was taken long ago, against another stream that never lets go, stops after
-    /// the grace and asks no more.
-    #[tokio::test(start_paused = true)]
-    async fn past_the_grace_an_older_servers_409_is_terminal() {
-        let bus = SimBus::new();
-        bus.old_server();
-        let other = bus.client("other-machine");
-        let (_o_tx, _o_subs) = subscribe_all(&other);
-        run_for(Duration::from_millis(1)).await;
-        let (_lock_tx, held) = watch::channel(Some(tokio::time::Instant::now()));
-        let app = bus.client("app").with_presence_lock(Some(held));
-        let t0 = tokio::time::Instant::now();
-        let (_a_tx, a_subs) = subscribe_all(&app);
-        run_for(OLD_SERVER_CONFLICT_GRACE + MAX_BACKOFF).await;
-        for s in &a_subs {
-            assert_eq!(
-                s.status().state,
-                ConnState::Rejected,
-                "terminal past the grace"
-            );
-        }
-        let tried = bus.attempts("app", t0);
-        assert!(
-            tried.iter().filter(|e| e.ns == "ssh-agent").count() > 1,
-            "retried inside the grace: {tried:?}"
-        );
-        assert!(
-            tried
-                .iter()
-                .all(|e| e.at - t0 < OLD_SERVER_CONFLICT_GRACE + Duration::from_secs(1)),
-            "nothing after the grace: {tried:?}"
-        );
-        let after = tokio::time::Instant::now();
-        run_for(Duration::from_secs(10 * 60)).await;
-        assert!(bus.attempts("app", after).is_empty());
-    }
-
-    /// A client without the option (the daemon, every other host) is unchanged: an older
-    /// server's 409 stops it at the first answer.
-    #[tokio::test(start_paused = true)]
-    async fn without_the_presence_lock_an_older_servers_409_is_terminal_at_once() {
+    async fn an_older_servers_409_is_terminal_at_once() {
         let bus = SimBus::new();
         bus.old_server();
         let (_o_tx, _o_subs) = subscribe_all(&bus.client("other"));
@@ -11227,35 +11032,6 @@ pub(crate) mod tests {
             assert_eq!(s.status().state, ConnState::Rejected);
         }
         assert_eq!(bus.attempts("plain", t0).len(), PIN_NS.len(), "one each");
-    }
-
-    /// The embedded broker started without the lock (it could not take it within its
-    /// wait) is refused by an older server: rejected, until it takes the lock, when the
-    /// daemon lets go — then it retries at once and, inside the grace counted from the
-    /// lock, holds the type.
-    #[tokio::test(start_paused = true)]
-    async fn an_older_servers_409_before_the_lock_is_retried_once_it_is_taken() {
-        let bus = SimBus::new();
-        bus.old_server();
-        let p = FakePresence::new(false);
-        let daemon = bus.client("daemon").with_presence(Some(p.rx()));
-        let (_d_tx, _d_subs) = subscribe_all(&daemon);
-        run_for(Duration::from_millis(1)).await;
-        let (lock_tx, held) = watch::channel(None);
-        let app = bus.client("app").with_presence_lock(Some(held));
-        let (_a_tx, a_subs) = subscribe_all(&app);
-        run_for(Duration::from_secs(60)).await;
-        for s in &a_subs {
-            assert_eq!(s.status().state, ConnState::Rejected, "no lock: as before");
-        }
-        // The lock is taken a minute in; the daemon sees it at its next look.
-        lock_tx.send_replace(Some(tokio::time::Instant::now()));
-        run_for(PRESENCE_CHECK_INTERVAL).await;
-        p.set(true);
-        run_for(Duration::from_secs(8)).await;
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("app"), "{ns}");
-        }
     }
 
     // ---- the daemon stops answering when it yields (review item 3) ----------------------

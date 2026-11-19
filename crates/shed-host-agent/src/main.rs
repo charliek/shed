@@ -477,8 +477,6 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         // daemon delegating approval to an app running its own broker would deny every
         // sign request.
         embedded_presence: Some(presence_watcher.subscribe()),
-        // Only the embedded broker holds the lock.
-        presence_lock: None,
     };
     let sup = Arc::new(supervisor::Supervisor::new(shutdown_rx.clone(), deps));
 

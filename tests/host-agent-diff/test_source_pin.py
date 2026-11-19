@@ -10,9 +10,10 @@ every cell runs one single-server daemon against it, subscribing `ssh-agent` and
   (and so does its server), keeps retrying, and `status` prints the command that moves
   the source here. Once the bus accepts it, it connects with no restart.
 * **duplicate** — 409 `SOURCE_DUPLICATE_STREAM`: `duplicate`, still retrying.
-* **the desktop app on the same machine** — while the app's embedded broker runs it holds
-  a lock beside `machine.json` (`shed_broker::presence`); the cells take that same lock
-  from Python, on the daemon's real lock file, so it is the shipped daemon's own check
+* **the desktop app on the same machine** — the daemon stands by while another process
+  holds a lock beside `machine.json` (`shed_broker::presence`; the desktop app no longer
+  takes it, plan 037 B1a); the cells take that lock from Python, standing in for the
+  app, on the daemon's real lock file, so it is the shipped daemon's own check
   that is exercised. A daemon started while the lock is held never subscribes and reads
   `yielding`; a lock taken while it is connected makes it close every stream within a
   few seconds (a stand-in for the app's broker then holds each type); releasing the
@@ -320,8 +321,8 @@ def test_not_source_never_remints(daemon, discovery_poll_config):
 # A fixed machine identity for these cells: written into the daemon's state directory
 # before it starts, so the stand-in for the app's broker presents the same id.
 _MID = "00112233445566778899aabbccddeeff"
-# The lock the app's embedded broker holds while it runs (`shed_broker::presence`),
-# beside `machine.json`.
+# The lock the daemon watches (`shed_broker::presence`), beside `machine.json`. The
+# desktop app no longer takes it (plan 037 B1a); these cells take it in its place.
 _LOCK_NAME = "embedded-broker.lock"
 # The daemon's presence check interval (`bus.rs` PRESENCE_CHECK_INTERVAL), and the slack
 # a cell allows on top of it for a loaded machine.
@@ -348,7 +349,7 @@ def _lock_path(state_dir):
 
 
 def _take_lock(state_dir):
-    """Hold the app's lock from this process, as its embedded broker does (an exclusive
+    """Hold the daemon's lock from this process, standing in for the app (an exclusive
     `flock`, not waiting). Close the returned file to release it."""
     f = open(_lock_path(state_dir), "a+")  # noqa: SIM115 — held across the cell
     os.chmod(f.name, 0o600)
@@ -357,7 +358,7 @@ def _take_lock(state_dir):
 
 
 def _lock_in_child(state_dir) -> subprocess.Popen:
-    """Hold the app's lock from a child process, which says `locked` once it holds it and
+    """Hold the daemon's lock from a child process, which says `locked` once it holds it and
     then waits to be killed (a minute at most)."""
     code = (
         "import fcntl, sys, time\n"

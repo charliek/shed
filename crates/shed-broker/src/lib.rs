@@ -57,9 +57,8 @@ mod egress;
 // the daemon and the desktop's embedded broker (plan 035 §3.4).
 pub mod machine;
 pub mod minter;
-// Whether the desktop app's embedded broker runs on this machine: a lock beside
-// `machine.json` it holds while it brokers, which the daemon checks before subscribing
-// (plan 035 §3.4).
+// The daemon's watcher of a lock beside `machine.json`, which it checks before
+// subscribing (plan 035 §3.4). The desktop app no longer takes that lock (plan 037 §3.4).
 pub mod presence;
 // What the broker will sign for a shed: the pure sign-request parser and policy (plan
 // 035 §3.5). Nothing calls it from the signing path yet.

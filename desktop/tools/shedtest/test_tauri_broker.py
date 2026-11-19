@@ -23,7 +23,6 @@ cell shells real `ssh` (hermetic token handling, §C4.2).
 from __future__ import annotations
 
 import base64
-import fcntl
 import json
 import os
 import shutil
@@ -469,26 +468,22 @@ def test_embedded_status_and_set_mode_round_trip():
 
 def test_split_namespace_409_surfaced_in_status():
     """A namespace already owned by a competing listener answers an older server's 409
-    NAMESPACE_ALREADY_REGISTERED while the others connect. The embedded broker, which
-    holds the presence lock, retries it on its backoff for the older-server grace (15 s:
-    on such a server a daemon on the same machine may hold the type for a moment after
-    the app took its lock — `bus.rs` OLD_SERVER_CONFLICT_GRACE), then reads terminal
-    `rejected` and asks no more. Surfaced in status."""
+    NAMESPACE_ALREADY_REGISTERED while the others connect: terminal `rejected` at the
+    first refusal, never retried, for the embedded broker as for every bus client.
+    Surfaced in status."""
     with _broker_app(discovery_mock=True, conflict_namespaces=("ssh-agent",)) as (client, mock, info):
         client.wait_until(
             lambda: _server_ns_states(client.broker_status()).get("ssh-agent") == "rejected"
             and _server_ns_states(client.broker_status()).get("docker-credentials") == "connected",
-            timeout=40, what="ssh-agent rejected (after the grace) while docker-credentials connects")
+            timeout=20, what="ssh-agent rejected while docker-credentials connects")
         states = _server_ns_states(client.broker_status())
         assert states["ssh-agent"] == "rejected", states
         assert states["docker-credentials"] == "connected", states
-        # Retried inside the grace (at least once: a broker without the grace stops at its
-        # first refusal), only on the backoff (1, 2, 4, 8 s: at most five attempts), never
-        # hot; and terminal after it: no further attempt.
-        attempts = mock.subscribe_count("ssh-agent")
-        assert 2 <= attempts <= 5, attempts
+        # Terminal client-side: exactly one subscribe attempt, and none later (the first
+        # backoff steps, 1 s and 2 s, pass while the cell waits).
+        assert mock.subscribe_count("ssh-agent") == 1, mock.subscribe_count("ssh-agent")
         time.sleep(3.0)
-        assert mock.subscribe_count("ssh-agent") == attempts, "no retry once rejected"
+        assert mock.subscribe_count("ssh-agent") == 1, "no retry once rejected"
         # And the app's log file says which server refused it (#414).
         log = ui.app_log_path(info["runtime_dir"])
         client.wait_until(
@@ -653,40 +648,6 @@ def _machine_json(info) -> Path:
     """Where the app reads this machine's identity: `ui.subproc_env` points
     SHED_HOST_AGENT_STATE_DIR at `<runtime>/host-agent-state`."""
     return Path(info["runtime_dir"]) / "host-agent-state" / "host-agent" / "machine.json"
-
-
-def _lock_is_held(lock: Path) -> bool:
-    """Whether another process holds `lock` (the presence lock a shed-host-agent daemon
-    looks at): a non-blocking exclusive `flock` on a descriptor of our own."""
-    try:
-        f = open(lock, "rb")  # noqa: SIM115 — closed below on every path
-    except FileNotFoundError:
-        return False
-    try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return True
-    finally:
-        f.close()
-    return False
-
-
-def test_the_embedded_broker_holds_the_presence_lock_until_the_app_quits():
-    """The real app, in embedded mode, holds `embedded-broker.lock` beside `machine.json`
-    while its broker runs — what a shed-host-agent daemon on this machine stands by for
-    (`shed_broker::presence`) — and an orderly quit releases it."""
-    with _broker_app(discovery_mock=True) as (client, _mock, info):
-        lock = _machine_json(info).parent / "embedded-broker.lock"
-        client.wait_until(lambda: client.broker_status().get("effective_mode") == "embedded",
-                          timeout=20, what="the embedded broker running")
-        client.wait_until(lambda: _lock_is_held(lock), timeout=20,
-                          what="the embedded broker holding its presence lock")
-        assert stat.S_IMODE(lock.stat().st_mode) == 0o600
-        client.call("app.quit")
-        code = info["proc"].wait(timeout=scaled_timeout(20))
-        assert code == 0, code
-        assert not _lock_is_held(lock), "released with the app"
-        assert lock.exists(), "the lock file is never removed"
 
 
 def test_not_source_until_use_this_machine_then_connected_at_once():

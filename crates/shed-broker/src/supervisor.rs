@@ -112,14 +112,9 @@ pub struct SharedDeps {
     /// client stands by: it subscribes nothing and answers nothing, and work it received
     /// before a start of the app (an older yield epoch) is never answered by it
     /// ([`crate::bus::BusClient::with_presence`]). `Some` in the shed-host-agent daemon;
-    /// `None` in the embedded broker itself, which holds that lock and never stands by,
-    /// and in every other host.
+    /// `None` in the embedded broker itself, which never stands by, and in every other
+    /// host.
     pub embedded_presence: Option<tokio::sync::watch::Receiver<crate::presence::Presence>>,
-    /// When this process took the presence lock (`None` until it has): set only by the
-    /// desktop's embedded broker, which holds it ([`crate::presence::Holder`]); every
-    /// other host leaves it `None`. Its one use: the older-server grace
-    /// ([`crate::bus::BusClient::with_presence_lock`]).
-    pub presence_lock: Option<tokio::sync::watch::Receiver<Option<tokio::time::Instant>>>,
 }
 
 /// Whether the agent should self-mint a token for `target` (attaching a token provider +
@@ -465,7 +460,6 @@ mod tests {
             log: test_log(),
             machine: None,
             embedded_presence: None,
-            presence_lock: None,
         }
     }
 
