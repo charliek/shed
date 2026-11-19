@@ -545,6 +545,18 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   restart long-running `shed` commands and tunnel daemons; until then they continue as the
   previous user for at most the certificate's life. A tunnel daemon reads the entry at every
   re-enrolment and never takes up a user the entry does not record.
+- **CLI: who a server entry is.** `shed server add` against an mtls server prints the user
+  the entry is held to after the enrol line (`  User: pat`, or `  User: (implicit)` for a
+  server with no user list). `shed server list` gains a `USER` column, worked out from local
+  files with no request and writing nothing: the user the entry records; for one that records
+  none, `(implicit)` when its stored certificate is the implicit user's, else `-` (also for a
+  plain-HTTP or control-token entry, and for a hand-edited `user` that is not a valid user
+  name, which is never printed). A certificate's own name is never shown for an entry that
+  does not record it: such an entry shows `-` and STATUS `refused`. In JSON, both commands
+  gain `user` (the recorded user name, omitted when there is none) and `user_implicit`
+  (`true` when the stored certificate is the implicit user's); the text's `(implicit)` and
+  `-` never appear there. Scripts that split the text table by column position see the new
+  column before `STATUS`; the JSON is unchanged apart from the new members.
 - **Development:** `SHED_DEV_USERS=itest` starts the dev servers with the suite's user list;
   the suite gains `test_users.py`, `test_users_upgrade.py` and `test_source_pin.py`, with
   `SHED_ITEST_USERS` and `SHED_ITEST_USERS_DIR`.

@@ -1010,8 +1010,11 @@ func saveAddedServer(name string, entry config.ServerEntry) error {
 
 // reportAddedServer prints what was added, in whichever output mode is active.
 // It runs only after both halves of the transaction have committed, so what it
-// describes is what is on disk.
+// describes is what is on disk: the user is worked out as `shed server list`
+// works it out (entryUserOf), from the saved entry and its stored certificate,
+// writing nothing.
 func reportAddedServer(name string, entry config.ServerEntry) error {
+	user := entryUserOf(name, entry)
 	if jsonFlag {
 		return outputJSON(ActionResult{
 			Status: "ok",
@@ -1024,7 +1027,13 @@ func reportAddedServer(name string, entry config.ServerEntry) error {
 				APIURL             string `json:"api_url,omitempty"`
 				TLSCertFingerprint string `json:"tls_cert_fingerprint,omitempty"`
 				AuthMode           string `json:"auth_mode,omitempty"`
-				Default            bool   `json:"default"`
+				// As in `shed server list --json`: the user name the
+				// entry records (omitted when none), and whether its
+				// certificate is the implicit user's. Never `(implicit)`
+				// or `-`, which are text only.
+				User         string `json:"user,omitempty"`
+				UserImplicit bool   `json:"user_implicit"`
+				Default      bool   `json:"default"`
 			}{
 				Host:               entry.Host,
 				HTTPPort:           entry.HTTPPort,
@@ -1032,6 +1041,8 @@ func reportAddedServer(name string, entry config.ServerEntry) error {
 				APIURL:             entry.APIURL,
 				TLSCertFingerprint: entry.TLSCertFingerprint,
 				AuthMode:           entry.AuthMode,
+				User:               user.name,
+				UserImplicit:       user.implicit,
 				Default:            clientConfig.DefaultServer == name,
 			},
 		})
@@ -1049,6 +1060,9 @@ func reportAddedServer(name string, entry config.ServerEntry) error {
 	switch {
 	case entry.IsMTLS():
 		fmt.Println("  Enrolled a client certificate over SSH (mtls mode)")
+		// Who the entry is: the user it is held to, or (implicit) for a
+		// server with no user list. Check it is the user you expect.
+		fmt.Printf("  User: %s\n", user.label())
 	case entry.ControlToken != "":
 		fmt.Println("  Bootstrapped a control token over SSH (token mode)")
 	}

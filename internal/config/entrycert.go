@@ -206,6 +206,37 @@ func LoadEntryCertificate(name string, e *ServerEntry) (*tls.Certificate, error)
 	if err != nil {
 		return nil, err
 	}
+	return checkEntryCertificate(name, e, cert)
+}
+
+// ReadEntryCertificate is LoadEntryCertificate for a reader that must write
+// nothing (`shed server list`'s USER column, `shed server add`'s report): the
+// same files, the same pair check and the same user check, but no credential
+// lock, so no directory or lock file is created and no permission is changed.
+//
+// Without the lock a concurrent rotation can be seen half done: each file is
+// replaced by an atomic rename, so the read sees a whole old or new file, and
+// an old certificate beside a new key (or the reverse) fails the pair check
+// like any mismatched pair. What it returns is therefore always a certificate
+// beside its own key. It is for display only: nothing that is sent, or
+// written, may rest on it.
+func ReadEntryCertificate(name string, e *ServerEntry) (*tls.Certificate, error) {
+	if e.ClientCertFile == "" || e.ClientKeyFile == "" {
+		return nil, errors.New("no client certificate on file")
+	}
+	// An empty lock name is the store's unlocked load: it takes no lock and
+	// so never creates the store's root, its lock directory or a lock file.
+	cert, err := LoadClientCredentials("", e.ClientCertFile, e.ClientKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	return checkEntryCertificate(name, e, cert)
+}
+
+// checkEntryCertificate is the user check of LoadEntryCertificate and
+// ReadEntryCertificate, on a pair already loaded.
+func checkEntryCertificate(name string, e *ServerEntry, cert *tls.Certificate) (*tls.Certificate, error) {
+	var err error
 	leaf := cert.Leaf
 	if leaf == nil {
 		if len(cert.Certificate) == 0 {

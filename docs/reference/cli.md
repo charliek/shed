@@ -56,6 +56,17 @@ What the bootstrap returns decides the rest:
 
 Against an mtls server your SSH key must be one the server accepts (listed under `auth.users`, or in `auth.ssh.github_users` / `authorized_keys`); a key that is not is a hard error, not a downgrade. On a server with users, the entry acts as the user your key belongs to. From then on the CLI renews the credential transparently, near expiry and on a rejection. See [Security › Enrollment over SSH](security.md#enrollment-over-ssh) and [Security › Native pinned TLS](security.md#native-pinned-tls).
 
+The add says who the entry is. Against an mtls server it prints the user the entry is now held to, after the enrol line; check that it is the user you expect:
+
+```text
+✓ Added server work (https://shed.example.test:8443, TLS pinned)
+  Enrolled a client certificate over SSH (mtls mode)
+  User: pat
+  Set as default server
+```
+
+A server with no user list issues a certificate for its one implicit user, shown as `User: (implicit)`. An `auth.mode: open` server issues no credential, and a server older than v0.10.0 in token mode issues a control token, which names no user: neither prints a `User:` line. With `--json` the result's `details` carry two members: `user`, the user name the entry records (omitted when it records none), and `user_implicit`, `true` when the entry's stored certificate is the implicit user's. The JSON never carries the text's `(implicit)` or `-`.
+
 `--https-port` names the port **you** reach the server's TLS listener on. It overrides the HTTPS port the bootstrap bundle advertises when the `api_url` is built, which is what makes a port-mapped or externally published deployment addable; the pinned certificate fingerprint always comes from the bundle, and the verification request still has to succeed, so a wrong port fails during the add rather than on your next command.
 
 #### When the SSH port cannot be scanned
@@ -157,12 +168,27 @@ shed server list
 **Output:**
 
 ```
-NAME            ENDPOINT                                 SSH                               SECURITY  STATUS   DEFAULT
-mini-desktop    http://mini-desktop.tailnet.ts.net:8080  mini-desktop.tailnet.ts.net:2222  open      online   *
-cloud-vps       https://vps.tailnet.ts.net:8443          vps.tailnet.ts.net:2222           secure    offline
+NAME     ENDPOINT                           SSH                        SECURITY  USER        STATUS   DEFAULT
+local    http://127.0.0.1:8080              127.0.0.1:2222             open      -           online   *
+work     https://shed.example.test:8443     shed.example.test:2222     secure    pat         offline
+build-1  https://build-1.example.test:8443  build-1.example.test:2222  secure    (implicit)  online
 ```
 
-The `ENDPOINT` is the control-plane URL the CLI actually uses (`https://…` for a pinned-TLS secure server, `http://…` otherwise). `SECURITY` is `secure` (pinned TLS), `open` (plain HTTP), or `unpinned` (an `https` endpoint with no pinned cert — misconfigured). `STATUS` is `online`, `offline`, or `refused`: the CLI refuses the entry (see [`shed server update`](#shed-server-update)), either for its stored certificate, which is known without sending a request, or because the server rejected its certificate and the re-enrolment was issued another user's. The refusal's message is printed once to stderr. Add `--json` for the full record, including `https_port`, `tls_pinned`, and the pinned fingerprint.
+The `ENDPOINT` is the control-plane URL the CLI actually uses (`https://…` for a pinned-TLS secure server, `http://…` otherwise). `SECURITY` is `secure` (pinned TLS), `open` (plain HTTP), or `unpinned` (an `https` endpoint with no pinned cert — misconfigured).
+
+`USER` is who the entry is, worked out from local files with no request and writing nothing, after `STATUS` is probed (a re-enrolment during the probe can record the entry's first user, and the row is read again from `config.yaml` for it):
+
+| `USER` | Meaning |
+|---|---|
+| a name (`pat`) | The user the entry records (`user` in `config.yaml`), whatever its stored certificate says: the only user the CLI acts as for it |
+| `(implicit)` | The entry records no user, and its stored certificate is for the implicit user of a server with no user list |
+| `-` | No user to show. For a plain-HTTP entry (`auth.mode: open`) and for a control-token entry (a server older than v0.10.0 in token mode): these credentials name no user. For an mtls entry: no certificate on file yet, one that cannot be read, or one the CLI refuses. Also for a `user` in `config.yaml` that is not a valid user name (a hand edit; it is never printed), and for an entry whose row could not be read again |
+
+It never shows a name the entry does not record: an entry that records no user but holds a certificate for a named user shows `-`, with `STATUS` `refused`.
+
+`STATUS` is `online`, `offline`, or `refused`: the CLI refuses the entry (see [`shed server update`](#shed-server-update)), either for its stored certificate, which is known without sending a request, or because the server rejected its certificate and the re-enrolment was issued another user's. The refusal's message is printed once to stderr.
+
+Add `--json` for the full record, including `https_port`, `tls_pinned`, the pinned fingerprint, and who the entry is as two members: `user`, the user name the entry records (omitted when it records none, or none that is a valid user name), and `user_implicit`, `true` when the entry's stored certificate is the implicit user's (it can be `true` beside a `user`: a named entry whose server dropped its user list). The JSON never carries the text's `(implicit)` or `-`.
 
 ### shed server remove
 

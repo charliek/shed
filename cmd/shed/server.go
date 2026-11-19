@@ -365,13 +365,22 @@ func runServerList(cmd *cobra.Command, args []string) error {
 			Security           string `json:"security"`
 			TLSPinned          bool   `json:"tls_pinned"`
 			TLSCertFingerprint string `json:"tls_cert_fingerprint,omitempty"`
-			Status             string `json:"status"`
-			Default            bool   `json:"default"`
+			// User is the user name the entry records (omitted when it
+			// records none, or none that is a valid user name); UserImplicit
+			// is whether its stored certificate is the implicit user's. The
+			// text's `(implicit)` and `-` are never carried here.
+			User         string `json:"user,omitempty"`
+			UserImplicit bool   `json:"user_implicit"`
+			Status       string `json:"status"`
+			Default      bool   `json:"default"`
 		}
 		result := make([]serverJSON, 0, len(names))
 		for _, name := range names {
 			entry := clientConfig.Servers[name]
+			// The probe first: its re-enrolment can record the entry's user,
+			// which listedEntryUser then reads from disk.
 			status := probeServerStatus(name, entry)
+			user := listedEntryUser(name, entry)
 			result = append(result, serverJSON{
 				Name:               name,
 				Host:               entry.Host,
@@ -382,6 +391,8 @@ func runServerList(cmd *cobra.Command, args []string) error {
 				Security:           securityLabel(entry),
 				TLSPinned:          entry.TLSCertFingerprint != "",
 				TLSCertFingerprint: entry.TLSCertFingerprint,
+				User:               user.name,
+				UserImplicit:       user.implicit,
 				Status:             status,
 				Default:            name == clientConfig.DefaultServer,
 			})
@@ -397,7 +408,7 @@ func runServerList(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tENDPOINT\tSSH\tSECURITY\tSTATUS\tDEFAULT")
+	fmt.Fprintln(w, "NAME\tENDPOINT\tSSH\tSECURITY\tUSER\tSTATUS\tDEFAULT")
 
 	for _, name := range names {
 		entry := clientConfig.Servers[name]
@@ -405,6 +416,8 @@ func runServerList(cmd *cobra.Command, args []string) error {
 		// Reachability is probed over the entry's real endpoint (BaseURL +
 		// pinned cert), so STATUS is correct for secure servers too.
 		status := probeServerStatus(name, entry)
+		// After the probe: its re-enrolment can record the entry's user.
+		user := listedEntryUser(name, entry).label()
 
 		defaultMark := ""
 		if name == clientConfig.DefaultServer {
@@ -412,12 +425,100 @@ func runServerList(cmd *cobra.Command, args []string) error {
 		}
 
 		sshAddr := fmt.Sprintf("%s:%d", entry.Host, entry.SSHPort)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			name, entry.BaseURL(), sshAddr, securityLabel(entry), status, defaultMark)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			name, entry.BaseURL(), sshAddr, securityLabel(entry), user, status, defaultMark)
 	}
 
 	w.Flush()
 	return nil
+}
+
+// The text USER value of an entry with no user name to show (plan 037 §3.3).
+// They are text only: the JSON carries the facts (entryUser), never these.
+const (
+	// serverUserImplicit: the entry records no user and its stored
+	// certificate is the implicit user's (a server with no user list).
+	serverUserImplicit = "(implicit)"
+	// serverUserNone: no user to show — not an mtls entry (plain HTTP, or a
+	// control token), no certificate on file, one that cannot be read or that
+	// the CLI refuses, a recorded user that is not a valid user name, or a
+	// row that could not be read again.
+	serverUserNone = "-"
+)
+
+// entryUser is who a server entry is, for `shed server add` and `shed server
+// list`, worked out offline and writing nothing (no request, no lock, no
+// directory, no permission change).
+//
+// A certificate's own name is never taken as the entry's user: an entry that
+// records no user and holds a certificate for a named user is one the CLI
+// refuses (config.LoadEntryCertificate); it has no name here and shows `-`
+// beside STATUS `refused`. An entry that records a user is that user whatever
+// its certificate says: it is the only user the CLI will ever act as for it.
+type entryUser struct {
+	// name is the user the entry records, when it is a valid user name (the
+	// grammar the server enforces, config.ValidUserName); "" otherwise.
+	name string
+	// recorded: the entry records a user, valid or not. A recorded value that
+	// is not a valid user name (a hand edit) is never shown and never taken
+	// as the label: the text shows `-`.
+	recorded bool
+	// implicit: the entry's stored certificate, read and checked as every
+	// reader checks it, is the implicit user's.
+	implicit bool
+}
+
+// label is the text value: the user's name; `(implicit)` for an entry that
+// records no user and holds the implicit user's certificate; else `-`. It is
+// built only from a valid user name and the two constants above, so no
+// control character or other text from config.yaml can reach the terminal.
+func (u entryUser) label() string {
+	switch {
+	case u.name != "":
+		return u.name
+	case !u.recorded && u.implicit:
+		return serverUserImplicit
+	}
+	return serverUserNone
+}
+
+// entryUserOf works out who entry is from the row it is given and the stored
+// certificate the row names, writing nothing (config.ReadEntryCertificate).
+func entryUserOf(name string, entry config.ServerEntry) entryUser {
+	u := entryUser{recorded: entry.User != ""}
+	if config.ValidUserName(entry.User) {
+		u.name = entry.User
+	}
+	if entry.IsMTLS() {
+		// Checked against no recorded user, the stored certificate is returned
+		// only when it is the implicit user's; a named one is refused, and one
+		// that names no user, is unreadable or is missing is an error.
+		probe := entry
+		probe.User = ""
+		if _, err := config.ReadEntryCertificate(name, &probe); err == nil {
+			u.implicit = true
+		}
+	}
+	return u
+}
+
+// listedEntryUser is who an entry is, for `shed server list`, read after the
+// entry was probed: the probe's re-enrolment can record the entry's first
+// user, its certificate paths and its auth mode, so the WHOLE row is read
+// again from disk (config.ClientConfig.ReadOnDisk, no lock) and the user is
+// worked out from that row. A row that cannot be read again, is gone, or no
+// longer names the endpoint the listing shows (snapshot) vouches for
+// nothing: the zero entryUser, `-` in text and no `user` in JSON.
+func listedEntryUser(name string, snapshot config.ServerEntry) entryUser {
+	disk, err := clientConfig.ReadOnDisk()
+	if err != nil {
+		return entryUser{}
+	}
+	fresh, ok := disk.Servers[name]
+	if !ok || !sameServerEndpoint(fresh, snapshot) {
+		return entryUser{}
+	}
+	return entryUserOf(name, fresh)
 }
 
 // probeServerStatus is one entry's STATUS for `shed server list`: online,

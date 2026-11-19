@@ -139,6 +139,67 @@ func TestLoadEntryCertificate(t *testing.T) {
 	})
 }
 
+// TestReadEntryCertificateIsTheSameCheck: the unlocked reader that `shed
+// server list` and `shed server add` use for display gives, for every stored
+// state, the answer LoadEntryCertificate gives (presented, refused with the
+// same kind and entry name, or an ordinary error), and takes no lock: the
+// credential store under HOME is never created.
+func TestReadEntryCertificateIsTheSameCheck(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	_, mixedKey := clientCertPEM(t, "pat")
+	cases := []struct {
+		name      string
+		certUsers []string
+		mixed     bool
+		entryUser string
+	}{
+		{"names the entry's user", []string{"pat"}, false, "pat"},
+		{"the implicit user, entry records none", []string{servertls.ImplicitUserValue}, false, ""},
+		{"the implicit user, entry records one", []string{servertls.ImplicitUserValue}, false, "pat"},
+		{"names no user", nil, false, ""},
+		{"names a user the entry does not record", []string{"pat"}, false, ""},
+		{"names another user", []string{"admin"}, false, "pat"},
+		{"a malformed value", []string{"Pat"}, false, "pat"},
+		{"a mixed pair", []string{"pat"}, true, "pat"},
+	}
+	type answer struct {
+		presented bool
+		refused   RefusalKind
+		entry     string
+		failed    bool
+	}
+	answerOf := func(cert any, err error) answer {
+		a := answer{presented: err == nil && cert != nil, failed: err != nil}
+		if r, ok := AsEntryRefused(err); ok {
+			a.refused, a.entry = r.Kind, r.Entry
+		}
+		return a
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			certPEM, keyPEM := clientCertPEM(t, tc.certUsers...)
+			if tc.mixed {
+				keyPEM = mixedKey
+			}
+			certPath, keyPath := writePair(t, certPEM, keyPEM)
+			e := &ServerEntry{AuthMode: AuthModeMTLS, ClientCertFile: certPath, ClientKeyFile: keyPath, User: tc.entryUser}
+			readCert, readErr := ReadEntryCertificate("srv", e)
+			if _, err := os.Stat(GetCredsDir()); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the unlocked read touched the credential store (%v)", err)
+			}
+			loadCert, loadErr := LoadEntryCertificate("srv", e)
+			if got, want := answerOf(readCert, readErr), answerOf(loadCert, loadErr); got != want {
+				t.Errorf("ReadEntryCertificate = %+v (%v), LoadEntryCertificate = %+v (%v)", got, readErr, want, loadErr)
+			}
+			// The locked load made the store; drop it for the next case.
+			if err := os.RemoveAll(GetCredsDir()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 // TestIssuedCertificateUser: a newly issued certificate is read fail closed.
 func TestIssuedCertificateUser(t *testing.T) {
 	cases := []struct {

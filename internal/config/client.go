@@ -467,6 +467,20 @@ func (c *ClientConfig) ReadLocked(read func(*ClientConfig) error) error {
 	return read(fresh)
 }
 
+// ReadOnDisk returns the configuration as it is on disk now, read with no lock
+// and writing nothing: no directory, no lock file. The file is only ever
+// replaced by an atomic rename (SaveToPath), so the read sees one whole saved
+// file. A file that does not exist reads as an empty configuration.
+//
+// It is for a display that must not write (`shed server list`'s USER column).
+// A decision that a write depends on reads under ReadLocked instead.
+func (c *ClientConfig) ReadOnDisk() (*ClientConfig, error) {
+	if c.path == "" {
+		return nil, errors.New("client config: this configuration has no path to read")
+	}
+	return LoadClientConfigFromPath(c.path)
+}
+
 // Save writes the configuration to disk.
 //
 // It is the UNSYNCHRONIZED writer: it renames this whole snapshot over the file,
