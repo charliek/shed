@@ -22,7 +22,9 @@ clients](../reference/security.md#service-clients); every key is in
   `auth.users`. A client name may not also be a user name.
 - For the `isolated` network profile, the server uses the Firecracker backend
   and can run `nft` (the deb package's root unit can). A VZ server works too, with
-  `network: open` in the client's policy.
+  `network: open` in the client's policy. On the remote backend the network
+  provides `isolated` instead: see [On a directory server or the remote
+  backend](#on-a-directory-server-or-the-remote-backend).
 - Every client request is written to the audit log, which is turned on
   automatically.
 
@@ -248,12 +250,15 @@ The log does not yet record everything a person can do to a client's shed:
 
 - **Recorded:** an HTTPS exec (`exec.end`); a shell, a command, sftp or scp,
   or a connection forwarded over SSH (`ssh`); a tunnel through the HTTPS
-  Connect API, as `shed tunnels` opens (`connect`).
+  Connect API, as `shed tunnels` opens (`connect`, once the tunnel is
+  established).
 - **Not recorded yet:** starting, stopping, deleting or resetting the shed;
   taking a snapshot of it; changing its egress rules; reading its egress
-  decisions (its recent decisions, or the live egress stream); listing or
-  killing its sessions; reading its record. An admin may do each of these to
-  a client's shed, and none writes an audit line.
+  decisions (its recent decisions, `GET /api/egress/{name}`, or the live
+  egress stream, `GET /api/egress/stream`); listing or killing its sessions;
+  reading its record (`shed list`, `GET /api/sheds/{name}`). The access guard
+  lets an admin do each of these to a client's shed, and none writes an audit
+  line.
 
 ## Revoking a client
 
@@ -262,6 +267,225 @@ There is no per-certificate revocation yet. To revoke a client, remove it from
 from then on, at the TLS handshake. Its sheds stay, admin-only, until an admin
 deletes them. Re-adding the same name later would trust the old certificates
 again until they expire, so give a replacement client a new name.
+
+## On a directory server or the remote backend
+
+A client works the same way on a server that takes its users from an
+[account service](user-directory.md) and on a server whose sheds are cloud
+VMs (the [remote backend](../reference/remote-backend.md)): the same bundle,
+routes and policy. What differs is who else can reach its sheds, what
+`isolated` means, and, on the remote backend, the create options, the
+lifecycle and the server-wide limits.
+
+### Who can enter the client's sheds
+
+Every admin of the server can enter a client's shed: over SSH (a shell,
+`shed exec`, sftp or scp, a forwarded port), with an HTTPS exec, and through
+a `shed tunnels` Connect tunnel. A user who is not an admin cannot see the
+client's sheds. On a server with an account service, the admins are:
+
+- the server's **local admins** (`auth.users` beside `auth.directory`);
+- every user the account service **lists as an admin** for this server
+  (`admin: true` in the list it sends).
+
+So **the people who administer the account service decide who can read a
+running task's credentials**, by two routes: whoever can make a person an
+admin there, themselves included, and whoever can add a key to a person who
+already is one, and so log in as that person. Either way they can enter the
+client's sheds on every server that lists that person as an admin, and read
+what the orchestrator put in them (a clone, a token passed to a command). No
+server setting keeps an admin out of a client's shed. What an operator can do
+today:
+
+- **Keep the list's admins few.** Who is listed, and whether as an admin, is
+  what the service sends this server, and it may differ from one server to
+  another ([Security › A list admin controls the
+  host](../reference/security.md#a-list-admin-controls-the-host)). Ask the
+  service's operators to list as admins of this server only the people who
+  must be. A list with no admin loads; the local admins stay admins.
+- **Administer with a local admin on a backup key.** The service cannot
+  change a local admin, and a local admin logs in whatever state the service
+  is in ([User Directory › Keeping the local admin on a backup
+  key](user-directory.md#keeping-the-local-admin-on-a-backup-key)).
+- **Read the audit lines.** Each entry above writes a line that names the
+  person: `ssh`, `exec.end` or `connect`. A list admin is recorded under their
+  list name, with `admin: true`, whichever of their keys was used; the
+  `subject` (the key's fingerprint) tells the keys apart. [The audit
+  log](#the-audit-log) lists what is recorded and what is not yet.
+
+```bash
+sudo jq -c 'select(.event == "ssh" or .event == "connect" or (.event == "exec.end" and .identity.kind == "user"))' /var/lib/shed/firecracker/audit.jsonl | tail
+```
+
+A person whose admin flag is taken away on the service loses it for each new
+SSH channel and API request after the server's next pull; `shed users
+refresh` pulls at once. What they already have open stays open: an SSH
+shell, command or forwarded port, a Connect tunnel, an API stream. Removing
+the person from the list closes their SSH connections at that pull, and every
+channel on them, but not a Connect tunnel or an API stream; a restart of
+`serve` closes all of them, and whatever reconnects is checked again ([User
+Directory › Admins, removals and
+keys](user-directory.md#admins-removals-and-keys)).
+
+The client itself does not depend on the account service. Its certificate is
+never checked against the list, so it keeps working while the service cannot
+be reached and after the list's trust time ends. A list entry with the
+client's name is skipped, and `shed users status` shows it under `Skipped
+entries`; a local admin may not have the client's name (the config does not
+load).
+
+### What `isolated` means on each backend
+
+| Backend | `isolated` | The client's `policy.network` |
+|---|---|---|
+| Firecracker | Firewall rules the server installs on its own host. The guest reaches the internet and, beyond it, only its own ports on the gateway (its egress proxy when it has an egress profile, and its 9P ports when its policy names server mounts) and the destinations in the server's `network.allow_cidrs`; not the rest of the host, the LAN or other sheds. The full rule, and what the egress proxy can reach for it, is in [Security › Network profiles](../reference/security.md#network-profiles). | `isolated` (the default) or `open` |
+| VZ | Not offered. A command reaches whatever the host's NAT reaches, including the host, the LAN and other sheds. | `open` only: any other value, the default included, stops the server from starting |
+| Remote | The network gives a shed no route to another shed and no private route to the server's host. Outbound traffic is not filtered: a shed has a public address and reaches any public address, including a port the server's host exposes to the internet. | `isolated` (the default) or `open`; `remote.firewall.mode: any` and `acknowledge_any: true` are refused beside service clients |
+
+`GET /api/info` says which applies: its `backend` is `firecracker`, `vz` or
+`remote`, and a remote server also reports `isolation: "topology"`. An
+isolated shed's record says `network_profile: isolated` on Firecracker and on
+remote alike, so `/api/info` is where a client learns which kind it is.
+
+### A client on the remote backend
+
+The client's policy on a remote server:
+
+| Policy key | On the remote backend |
+|---|---|
+| `name_prefix`, `max_sheds` | As on any backend. |
+| `max_age` | As on any backend, and the cloud's run limit for the client's sheds is the larger of `remote.max_run_duration` and `max_age`, counted from each start. So the cloud does not stop a client's shed before it is `max_age` old. |
+| `network` | `isolated` (the default) or `open`; see the table above. |
+| `images` | Names from `remote.image_aliases` only; any other entry stops the server from starting. `GET /api/images` lists nothing on a remote server. |
+| `caps` | Compared with the [size](../reference/remote-backend.md#sizes) a create gets, not with the numbers it asked for. A create that names neither `cpus` nor `memory_mb` gets `default_size`, so caps below that size's numbers refuse such a create. |
+| `server_mounts` | Must be empty: a client that names any stops the server from starting. |
+
+A client's create may carry `name`, `repo`, `image`, `cpus` and `memory_mb`
+(which pick a size), `upper_size_bytes` (the boot disk, 10 to 500 GB),
+`network` (its own profile), `mounts` omitted or `[]`, and `egress` omitted,
+`[]` or `["off"]`. These are refused before a VM is asked for, checked in
+this order, and the first that fails is the answer:
+
+| Order | Request | Answer |
+|---|---|---|
+| 1 | `cpus` and `memory_mb` that no configured size provides (a negative value included): the size is resolved before the policy runs | `400 INVALID_REQUEST` |
+| 2 | `local_dir`, `add_dirs`, `from_snapshot`, a named `mounts` entry (a remote client's `server_mounts` is empty), an image outside `images`, a size over `caps`, a `network` other than its own | `403 POLICY_VIOLATION` |
+| 3 | `egress` naming any profile (anything but omitted, `[]` or `["off"]`) | `422 FEATURE_UNSUPPORTED` |
+
+So `{"name":"ci-probe","local_dir":"/tmp","cpus":999}` answers `400`, not
+`403`.
+
+The lifecycle is **asynchronous** (`features` holds `async_lifecycle`). A JSON
+create answers `201` with `status: "starting"` and goes on in the background.
+Before it answers, the server may run its firewall check (when the last result
+is stale), looks the image up, and waits up to 15 seconds for the cloud to
+accept the VM. Each step has its own bound, but the reply has no single one:
+give the request a timeout of a minute or more. A quota or capacity refusal
+that arrives in those 15 seconds is answered as a `503` and leaves no shed; a
+later one leaves the shed in `error`. If the request times out on the
+client's side, the shed may still have been created: get it by name before
+creating it again. A start answers `200`
+with `starting`, a stop `200` with `stopping`, and a delete `204` at once:
+the shed leaves the list then, and its VM is destroyed in the background.
+An exec on a shed that is not `running` answers `409 SHED_NOT_RUNNING`, so
+poll `GET /api/sheds/{name}` before the first exec.
+With `$API` from step 4, on a server whose `tls_names` lists
+`shed.example.test`:
+
+```bash
+$API -d '{"name":"ci-demo"}' https://shed.example.test:8443/api/sheds | jq '{name,status}'
+
+# Poll until the shed leaves starting, for up to 10 minutes.
+for i in $(seq 120); do
+  st="$($API https://shed.example.test:8443/api/sheds/ci-demo | jq -r .status)"
+  [ "$st" = starting ] || break
+  sleep 5
+done
+$API https://shed.example.test:8443/api/sheds/ci-demo | jq '{name,status,status_reason}'
+```
+
+A create with `Accept: text/event-stream` instead keeps the stream open until
+the shed settles: its `complete` event carries the running shed, and an
+`error` event reports a create that failed. What each status and
+`status_reason` asks of the client (the full table is in [Remote backend ›
+Statuses](../reference/remote-backend.md#statuses)):
+
+| `status` (`status_reason`) | What the client does |
+|---|---|
+| `starting` (none, `no_pin`, `unreachable`, `cloud_unreadable`) | Keep polling: the server is still bringing the VM up, reaching it, or reading the cloud. A create whose VM never answers ends in `error` (`create_failed`) after the server's 5-minute wait for the agent. |
+| `running` | Exec works. |
+| `stopping` | Wait; exec answers `409 SHED_NOT_RUNNING`. |
+| `stopped` (none, `run_limit` or `external`) | A stop request stopped it, a start failed for a reason with no code of its own (the server log has it), the cloud stopped the VM at its run limit, or someone stopped the VM outside shed. Start it again, or delete it. |
+| `stopped` (`capacity`, `quota`, `limit` or `firewall`) | A start was refused, by the cloud, the server's `max_running` or the firewall check. Start it again later, or delete it. |
+| `stopped` (`unreachable`) | The VM came up but its agent did not answer, so the server stopped it again. Start it again; if it happens again, ask an admin to read the server log. |
+| `stopped` (`host_key` or `layout`) | The VM presented a host key other than the pinned one, or its agent is one this server cannot drive. Starting again is not expected to help: delete it, and tell an admin. |
+| `error` (`capacity`, `quota`, `create_failed`, `host_key`, `layout` or `firewall`) | The create failed. Only a delete leaves this state, and until then the shed counts against `max_sheds`. Delete it; after `capacity`, `quota` or `firewall`, create again later. |
+
+A create or start that the server's limits, the cloud or the firewall check
+refuses at once answers `503`, never `409`: `SERVER_LIMIT_REACHED`,
+`CLOUD_QUOTA_EXCEEDED`,
+`ZONE_CAPACITY_UNAVAILABLE` or `FIREWALL_CHECK_FAILED` ([Remote backend ›
+Error codes](../reference/remote-backend.md#error-codes)). Wait and try
+again.
+
+For a service client the server shortens one message: `FIREWALL_CHECK_FAILED`,
+whose full text names the server's public address and the firewall rule's
+source ranges. Every other error message is the server's error text as it
+is, and a refusal or failure from the cloud carries the cloud's own text,
+which can name the cloud project, the zone or the VM. An operator should
+expect those in a client's error messages, and so in the client's own logs.
+
+**Size the server-wide limits for the client.** They count every shed on the
+server, people's and every client's together:
+
+| Setting | Counts | Set it to |
+|---|---|---|
+| `remote.limits.max_sheds` (default 8), checked at create | Every shed, in any state (`error` included) | At least the clients' `max_sheds` added up, plus what people need |
+| `remote.limits.max_running` (default 2, at most `max_sheds`), checked at create and at start | Every shed that is `starting`, `running` or `stopping`, plus each VM the server is cleaning up (a deleted shed's, or that of a failed create whose record shows `error`) whose clean-up has not finished two minutes after it began | At least the client sheds that run at once, plus what people need |
+
+A create past either limit, or a start past `max_running`, is refused with
+`503 SERVER_LIMIT_REACHED`, and a start refused this way leaves the shed
+`stopped (limit)`. A start does not check `max_sheds`.
+With the defaults, a client whose `max_sheds` is 4 can have at most two of its
+sheds running, and fewer while people's sheds run. Firecracker and VZ have no
+server-wide shed limit: there the client's `max_sheds` is its only bound.
+
+Every remote shed is a cloud VM, billed while it runs. The `max_age` reaper
+runs only while `serve` runs: a stopped server leaves the client's VMs
+running, and the cloud's run limit is then what stops them.
+
+On a remote server the audit log is `audit.jsonl` in `remote.state_dir`,
+which by default is `remote` under the server's state directory
+(`/etc/shed/remote/audit.jsonl` for a server that runs as root).
+
+### The certificate's lifetime
+
+`cert_max_ttl` (default `2160h`, 90 days) bounds what `shed-server client
+issue` signs, and `--ttl` issues a shorter certificate. The bundle's
+`expires_at` says when it ends; after that the server refuses it. To issue
+again before then, run the issue command on the server's host as the user
+that runs `serve` and with its config (step 2), naming an output file that
+does not exist yet: `--out` never overwrites one. Run with `sudo`, it writes
+the bundle owned by root with mode `0600`, so read it with `sudo` too. Put the
+new bundle in the orchestrator's secret store, have the orchestrator load it,
+and delete the file:
+
+```bash
+sudo shed-server client issue ci --ttl 720h --out ci-bundle-2.json
+sudo jq -r .expires_at ci-bundle-2.json
+```
+
+The old certificate keeps working until it expires: there is no
+per-certificate revocation. This is the same on every backend, with or
+without an account service.
+
+### Revoking
+
+[Revoking a client](#revoking-a-client) is unchanged: remove it from
+`auth.clients`, restart `serve`, and give a replacement client a new name.
+The reaper leaves a removed client's sheds alone. On a remote server a
+running one keeps running, and billed, until the cloud's run limit stops it
+or an admin stops or deletes it.
 
 ## What a leaked bundle gives
 
