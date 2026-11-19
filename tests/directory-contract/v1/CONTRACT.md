@@ -268,9 +268,12 @@ operator asks for explicitly may be sent sooner. On a 401, log the
 response's `Date` header beside the client's own clock (a skewed clock is
 the usual cause). Client timeouts: 30 seconds for a refresh (a background
 one, one an operator asks for, or one an unknown key starts). A login by an
-unknown key waits at most 20 seconds for the refresh it started (the
-service may be starting from cold); that refresh may run on to its own
-bound, and its result still applies.
+unknown key waits at most 8 seconds for the refresh it started, and is
+refused if its key is still unknown when that wait ends. That refresh runs
+on to its own bound and its result still applies, so a later attempt
+succeeds once a pull has brought the key. A service that cannot answer a
+token request and a directory request within about 8 seconds from cold
+should expect first logins to be refused until one pull completes.
 
 ## 3. The directory
 
@@ -342,12 +345,20 @@ exception to the rule that one bad user never rejects the whole list
 (below, under "The list is authoritative").
 
 - **Refresh.** A client pulls on a schedule (every 24 hours by default, a
-  setting of the client), at once when a key it does not know tries to log
-  in (at most once a minute for the whole client, the login waiting at most
-  20 seconds for it, while the pull runs on to its own bound and its result
-  still applies), and when an admin asks for it. A failed refresh is retried
-  every 15 minutes, never before a `Retry-After` (rule 2); a refresh an
-  operator asks for explicitly may be sent sooner.
+  setting of the client), when an admin asks for it, and at once when a key
+  it does not know tries to log in: at most once a minute for a first login
+  (for shed, a login as `_bootstrap`), the login waiting at most 8 seconds
+  for it, and at most once every 5 minutes for a login to an existing shed
+  (for shed, a login name that is the name of a shed on that server), the
+  login not waiting. Each of those two rates is a bound across the whole
+  client (one enrolled server), whatever the key, the person, the login
+  name or the peer that offered the key; the two rates are independent of
+  each other. A key it does not know, offered under any other login name,
+  starts no pull. While refreshes fail, each of those two rates
+  becomes at most once every 15 minutes. A pull an unknown key starts runs
+  on to its own bound, and its result still applies. A failed refresh is
+  retried every 15 minutes, never before a `Retry-After` (rule 2); a refresh
+  an operator asks for explicitly may be sent sooner.
 - **Trust time.** The kept copy authorizes logins for a fixed time after
   the **last good pull** (72 hours by default, a setting of the client),
   counted from when that pull's answer arrived. The client stores that
@@ -390,11 +401,16 @@ Each user is (rule 8):
 | Member | Type | Rule |
 |---|---|---|
 | `name` | string | The user name on every server: `^[a-z][a-z0-9-]{0,62}$`. Never reused for another person, even after the person is removed. Servers know a person only by this name, so a service that changes a person's name has made, to every server, a new user. Never `root`, `admin`, `git`, `shed`, `system` or `nobody`; an implementation may refuse further names. Unique in the list |
-| `admin` | boolean | Whether the user is an admin on the servers |
+| `admin` | boolean | Whether the user is an admin on the server that pulled the list |
 | `keys` | array | Always present. Each key's `key` is the canonical line below; `label` as rule 9 says; `expires`, when present, is the instant the key stops being valid, an RFC 3339 date-time (section 5.6) in UTC with `Z` and nothing else (omitted when it never expires; rule 7 gives what a client accepts). Ordered by `label` (bytewise). No key is in the list twice, under one user or two (a key's identity is its key blob, rule 7) |
 
-**Who is listed** is the service's own business. It never lists a user
-with no key, nor a key that has expired; a user holds at most 20 keys.
+**Who is listed** is the service's own business. Who is listed, and
+whether as admin, may differ from one requesting server to another. A
+service never lists a user to a server when the user's access there
+depends on a restriction that server has not declared it enforces (in this
+version a server declares none: `rules` is reserved): it omits the user.
+It never lists a user with no key, nor a key that has expired; a user
+holds at most 20 keys.
 Nothing else about a person is specified: a service with more to say says
 it in members a client ignores (rule 8).
 
