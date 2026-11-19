@@ -430,13 +430,27 @@ Each line is one JSON object with `ts` first:
 | `api` | Every service-client request, allowed or refused (401, 403, 404 and policy refusals included). A person's API requests are not logged. | `identity` (`kind: client`, `name`, `serial`), `request_id`, `remote`, `method`, `route` (the matched pattern, `""` when none matched), `path`, `shed`, `status`, `duration_ms` |
 | `exec.end` | Every HTTPS exec, a person's or a client's, that passed the request checks and was handed to the backend, however it ended (a timeout before the command started included). An exec refused with `400`, `404`, `409`, `413` or `429` writes none. | `identity` (`kind: client`, or `kind: user` for a person; see below), `request_id`, `shed`, `argv0` and `argc` (or `argv` with `exec_argv: full`), `exit_code` (`-1` when there is none), `timed_out`, `truncated`, `disconnected`, `duration_ms` |
 | `reap` | Each shed the `max_age` reaper deleted, and each delete it tried that failed (the shed may still exist; the next pass tries again and writes another line) | `identity` (always `kind: system`), `shed`, `owner`, `age_seconds`, `error` (the backend's error, only when the delete failed) |
+| `ssh` | Each time a person enters a service client's shed over SSH, once the entry has happened: a shell, or a command (`shed exec`, `shed attach`, `ssh <host> <command>`), once it has started in the shed; an sftp or scp session once `sftp-server` has started; each forwarded connection (`ssh -L`) once it is connected. A refused entry, one that failed before it started, an entry into a person's own shed and `_bootstrap` write none. A `shed tunnels` connection uses the HTTPS Connect API, not SSH: it writes a `connect` line. | `identity` (`kind: user`, with `subject` the key's fingerprint and no `serial`), `remote` (the SSH peer's address), `shed`, `owner` (the service client), `channel` (`shell`, `exec`, `sftp` or `tunnel`), `port` (the shed's port, `tunnel` only). The command is never recorded: an SSH command is one shell string, not an argv, and can carry secrets. |
+| `connect` | Each tunnel a person opens into a service client's shed through the HTTPS Connect API (`GET /api/sheds/{name}/connect/{port}`, what `shed tunnels` uses), once it is established: the dial into the shed connected and the connection was switched to the tunnel. A refused or failed Connect, a person's Connect to their own shed and a service client's own requests (its `api` line records those) write none. | `identity` (`kind: user`, as for an HTTPS exec: with the certificate's `subject` and `serial`), `remote` (the HTTPS peer's address), `shed`, `owner` (the service client), `port` (the shed's port). No `request_id`: the server's request id can come from a caller's `X-Request-Id` header, and nothing a caller sends goes into this line. |
+
+The `ssh` and `connect` lines are written inline, as every audit line is: a
+stalled audit file stalls entries into a client's sheds, which is the
+fail-closed choice for an audited entry. A line that cannot be written (an
+error, not a stall) is logged in the server log, and the entry goes on. When
+the server stops (on a signal, or after one of its listeners fails), it
+first refuses new entries into a client's sheds, before it waits on
+anything; then it shuts every listener down together and waits, within its
+30-second shutdown bound, for the entries it had already admitted to write
+their lines (a request that never ends, such as the egress stream, does not
+hold the other listeners open or use up their wait); only then does it close
+the log.
 
 The `identity` member says who acted, by `kind`:
 
 | `kind` | Who | Members |
 |--------|-----|---------|
 | `client` | A service client (`auth.clients`) | `name`, `serial` (the certificate's serial) |
-| `user` | A person: a user of the server, or the one user of a server with no user list | `user` (the user's name), `admin` and `script` (always present, `true` or `false`: whether the person is an admin, and whether they used a script key), `subject` (the key's fingerprint), `serial` (the client certificate's serial, when there is one). The one user of a server with no user list carries `implicit: true`, `admin: true` and no `user`; in `open` mode there is no certificate, so no `subject` or `serial` either. |
+| `user` | A person: a user of the server, or the one user of a server with no user list | `user` (the user's name), `admin` and `script` (always present, `true` or `false`: whether the person is an admin, and whether they used a script key), `subject` (the key's fingerprint), `serial` (the client certificate's serial, when there is one; an `ssh` line has none). The one user of a server with no user list carries `implicit: true`, `admin: true` and no `user`. In `open` mode an HTTPS request presents no certificate, so its line (`exec.end`, `connect`) has no `subject` or `serial` either; an `ssh` line still carries the key's fingerprint as `subject`. |
 | `system` | The server acting for itself (the `max_age` reaper) | none |
 | `unknown` | A caller the server could not name; never expected, since such a request is refused before it reaches a shed | none |
 
@@ -445,6 +459,19 @@ The `identity` member says who acted, by `kind`:
 {"kind":"user","user":"pat","admin":false,"script":false,"subject":"SHA256:…","serial":"…"}
 {"kind":"user","implicit":true,"admin":true,"script":false}
 {"kind":"system"}
+```
+
+An `ssh` line, for an admin's `shed exec` in a service client's shed:
+
+```json
+{"ts":"2026-11-19T10:04:05.123456789Z","event":"ssh","identity":{"kind":"user","user":"pat","admin":true,"script":false,"subject":"SHA256:…"},"remote":"192.0.2.10:51234","shed":"build-1-a1b2","owner":"build-1","channel":"exec"}
+```
+
+A `connect` line, for an admin's `shed tunnels` into port 8080 of a service
+client's shed:
+
+```json
+{"ts":"2026-11-19T10:06:01.234567891Z","event":"connect","identity":{"kind":"user","user":"pat","admin":true,"script":false,"subject":"SHA256:…","serial":"…"},"remote":"192.0.2.10:51240","shed":"build-1-a1b2","owner":"build-1","port":8080}
 ```
 
 ### Mounts

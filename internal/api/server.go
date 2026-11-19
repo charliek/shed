@@ -54,6 +54,10 @@ type Server struct {
 
 	// audit is the audit log (nil: off). See audit.go.
 	audit *audit.Log
+	// connects holds each person's Connect into a service client's shed
+	// from just before its guarded dial until its connect line is written
+	// (or it failed): DrainEntries waits for them (connect.go).
+	connects audit.Pending
 
 	// reapSkipped records the owned sheds the reaper has already logged as
 	// left alone (owner no longer configured), so each is logged once.

@@ -20,6 +20,7 @@ import (
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/terminal"
@@ -40,6 +41,13 @@ type Server struct {
 	termConfig  *terminal.Config
 	keyAuth     KeyAuth
 	bootstrap   *BootstrapInfo // static bundle metadata; nil until SetBootstrap
+	// audit is the audit log a person's entry into a service client's shed
+	// is recorded in (audit.go); nil records nothing. Set before Start.
+	audit *audit.Log
+	// entries holds each entry into a service client's shed from just
+	// before its guarded exec or dial until its line is written (or it
+	// failed): Shutdown waits for them (beginEntry).
+	entries audit.Pending
 
 	// connMu guards conns: the authenticated connections by the name of the
 	// user each is bound to, kept only with KeyAuth.TrackConnections
@@ -496,17 +504,39 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully shuts down the SSH server. It first ends the server's
 // lifetime, so the off-path check of a shed name's unknown key starts no more
-// and asks for no pull, then shuts the listener and the connections down, and
-// waits, until ctx ends, for a check still running.
+// and asks for no pull; and it refuses new entries into service clients'
+// sheds (CloseEntries). Only then does it wait on anything: it closes the
+// listener and waits, until ctx ends, for the connections to end; then for
+// the entries already being admitted to write their audit lines
+// (beginEntry); then for a check still running. The audit log must be closed
+// only after Shutdown returns.
 func (s *Server) Shutdown(ctx context.Context) error {
 	log.Printf("Shutting down SSH server...")
 	s.endLife()
+	// No new entry into a service client's shed starts from here (the
+	// caller may have closed this gate already, CloseEntries).
+	s.CloseEntries()
+	// The listener closes at once; the wait is for the connections. A
+	// begun entry's channel can outlive its connection, so the entries are
+	// waited for on their own after it: each until its ssh line is written,
+	// so the audit log the caller closes after Shutdown loses none. Drain
+	// returns at once when none is left, even past ctx.
 	err := s.sshServer.Shutdown(ctx)
+	if derr := s.entries.Drain(ctx); err == nil {
+		err = derr
+	}
 	if cerr := s.stopShedCheck(ctx); err == nil {
 		err = cerr
 	}
 	return err
 }
+
+// CloseEntries refuses every later entry into a service client's shed (the
+// channel is refused, saying the server is shutting down). It does not wait:
+// Shutdown does. shed-server calls it first thing when its shutdown begins,
+// before it waits on any server, so no other server's wait keeps this gate
+// open; Shutdown calls it too.
+func (s *Server) CloseEntries() { s.entries.Close() }
 
 // defaultMaxAuthTries is the per-connection public-key attempt cap applied when
 // auth.ssh.max_auth_tries is unset. It is deliberately higher than OpenSSH's
@@ -761,7 +791,9 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 		_ = newChan.Reject(gossh.ConnectionFailed, "shed not found")
 		return
 	}
-	bctx = backend.PinCreatedAt(bctx, shed.CreatedAt)
+	// The dial acts on the shed that was checked, with the owner it was
+	// checked against (pinEntry).
+	bctx = pinEntry(bctx, shed)
 
 	// Validate port range (SSH protocol uses uint32, TCP ports are uint16).
 	if d.DestPort > 65535 {
@@ -769,6 +801,21 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 		_ = newChan.Reject(gossh.ConnectionFailed, "invalid port number")
 		return
 	}
+
+	// An entry into a service client's shed is held open in the server's
+	// pending entries from here until its line is written (or it fails), so
+	// a shutdown waits for that line before the audit log is closed; once
+	// the shutdown has begun, no new one starts.
+	id, _ := connIdentityFrom(ctx)
+	// (A tunnel writes its line itself, below, so the exec hook beginEntry
+	// also returns is not used, and needs no peer address.)
+	_, endEntry, ok := s.beginEntry(p, id.fingerprint, nil, shed, audit.SSHChannelTunnel)
+	if !ok {
+		log.Printf("Port forward refused: user=%s: %v", logUser(user), errShuttingDown)
+		_ = newChan.Reject(gossh.ConnectionFailed, errShuttingDown.Error())
+		return
+	}
+	defer endEntry()
 
 	// Connect to the service inside the VM via DialService.
 	dialCtx, dialCancel := context.WithTimeout(bctx, 30*time.Second)
@@ -787,6 +834,12 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 		return
 	}
 	go gossh.DiscardRequests(reqs)
+
+	// The entry is admitted: the guarded dial passed its own check and
+	// connected, and the channel is open. Only now is it recorded (a
+	// service client's shed only; auditEntry).
+	s.auditEntry(p, id.fingerprint, conn.RemoteAddr(), shed, audit.SSHChannelTunnel, int(d.DestPort))
+	endEntry()
 
 	log.Printf("Port forward established: %s -> %s:%d", logUser(user), shed.Name, d.DestPort)
 

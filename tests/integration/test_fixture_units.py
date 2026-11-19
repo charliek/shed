@@ -4288,3 +4288,259 @@ def test_audit_person_identity_expects_the_implicit_user():
 def test_audit_person_identity_refuses_a_bad_expected_user(bad):
     with pytest.raises(ValueError, match="a user name, or None"):
         auditlog.person_identity_problems(_DEV_NAMED, user=bad)
+
+
+# The ssh line: a person's entry into a service client's shed over SSH
+# (internal/audit TestSSHEventShape pins the same shape).
+
+_SSH_ID = {"kind": "user", "user": "dev", "admin": True, "script": False, "subject": "SHA256:abc"}
+_SSH_EXEC = {
+    "ts": "2026-11-19T10:04:05.123456789Z", "event": "ssh", "identity": _SSH_ID,
+    "remote": "192.0.2.10:51234", "shed": "itest-svc-1", "owner": "itest", "channel": "exec",
+}
+
+
+def _ssh_line(**changes):
+    line = json.loads(json.dumps(_SSH_EXEC))
+    for k, v in changes.items():
+        if v is _DROP:
+            line.pop(k, None)
+        else:
+            line[k] = v
+    return line
+
+
+_DROP = object()
+
+
+def test_ssh_entry_accepts_what_the_server_writes():
+    assert auditlog.ssh_entry_problems(_SSH_EXEC, shed="itest-svc-1", owner="itest", channel="exec") == []
+    assert auditlog.ssh_entry_problems(
+        _SSH_EXEC, shed="itest-svc-1", owner="itest", channel="exec", admin=True, user="dev") == []
+    for channel in ("shell", "sftp"):
+        line = _ssh_line(channel=channel)
+        assert auditlog.ssh_entry_problems(line, shed="itest-svc-1", owner="itest", channel=channel) == []
+    tunnel = _ssh_line(channel="tunnel", port=8080)
+    assert auditlog.ssh_entry_problems(tunnel, shed="itest-svc-1", owner="itest", channel="tunnel") == []
+    assert auditlog.ssh_entry_problems(tunnel, shed="itest-svc-1", owner="itest", channel="tunnel", port=8080) == []
+    implicit = _ssh_line(identity={"kind": "user", "implicit": True, "admin": True, "script": False, "subject": "SHA256:abc"})
+    assert auditlog.ssh_entry_problems(implicit, shed="itest-svc-1", owner="itest", channel="exec", admin=True, user=None) == []
+
+
+@pytest.mark.parametrize(
+    "changes, kwargs, problem",
+    [
+        ({"event": "exec.end"}, {}, "not 'ssh'"),
+        ({"shed": "other"}, {}, "shed is 'other'"),
+        ({"owner": "build-1"}, {}, "owner is 'build-1'"),
+        ({"channel": "shell"}, {}, "channel is 'shell'"),
+        ({"remote": _DROP}, {}, "remote is None"),
+        ({"remote": ""}, {}, "remote is ''"),
+        # The command never reaches the line, in any member.
+        ({"cmd": "echo hi"}, {}, "carries ['cmd']"),
+        ({"argv0": "echo", "argc": 2}, {}, "carries ['argc', 'argv0']"),
+        ({"port": 22}, {}, "the exec line carries port"),
+        ({"identity": {"kind": "client", "name": "itest", "serial": "3fa2"}}, {}, "not 'user'"),
+        ({"identity": {"kind": "admin", "subject": "SHA256:abc"}}, {}, "not 'user'"),
+        ({"identity": {**_SSH_ID, "serial": "1f"}}, {}, "an SSH login has none"),
+        ({"identity": {k: v for k, v in _SSH_ID.items() if k != "subject"}}, {}, "no subject"),
+        ({"identity": {**_SSH_ID, "admin": False}}, {"admin": True}, "admin is False, want True"),
+        ({}, {"user": "localadmin"}, "user is 'dev', want 'localadmin'"),
+        ({}, {"user": None}, "want the implicit user"),
+    ],
+)
+def test_ssh_entry_refuses(changes, kwargs, problem):
+    problems = auditlog.ssh_entry_problems(_ssh_line(**changes), shed="itest-svc-1", owner="itest", channel="exec", **kwargs)
+    assert any(problem in p for p in problems), problems
+
+
+@pytest.mark.parametrize(
+    "port, want, problem",
+    [
+        (_DROP, None, "the line names the shed's port"),
+        (0, None, "port is 0"),
+        (70000, None, "port is 70000"),
+        ("8080", None, "port is '8080'"),
+        (True, None, "port is True"),
+        (8080, 3000, "port is 8080, want 3000"),
+    ],
+)
+def test_ssh_entry_tunnel_port(port, want, problem):
+    line = _ssh_line(channel="tunnel", port=port)
+    problems = auditlog.ssh_entry_problems(line, shed="itest-svc-1", owner="itest", channel="tunnel", port=want)
+    assert any(problem in p for p in problems), problems
+
+
+def test_ssh_entry_refuses_a_line_that_is_not_an_object_and_a_bad_channel():
+    assert any("not an object" in p for p in auditlog.ssh_entry_problems(None, shed="s", owner="o", channel="exec"))
+    with pytest.raises(ValueError, match="channel='session'"):
+        auditlog.ssh_entry_problems(_SSH_EXEC, shed="itest-svc-1", owner="itest", channel="session")
+
+
+def test_ssh_lines_by_picks_one_persons_lines_about_one_shed():
+    other_admin = _ssh_line(identity={**_SSH_ID, "user": "itest-admin"})
+    implicit = _ssh_line(identity={"kind": "user", "implicit": True, "admin": True, "script": False, "subject": "SHA256:abc"})
+    lines = [
+        _SSH_EXEC,
+        other_admin,
+        implicit,
+        _ssh_line(shed="itest-svc-2"),
+        {"event": "exec.end", "shed": "itest-svc-1", "identity": _SSH_ID},
+        "not a line",
+    ]
+    assert auditlog.ssh_lines_by(lines, shed="itest-svc-1", user="dev") == [_SSH_EXEC]
+    assert auditlog.ssh_lines_by(lines, shed="itest-svc-1", user="itest-admin") == [other_admin]
+    assert auditlog.ssh_lines_by(lines, shed="itest-svc-1", user=None) == [implicit]
+    assert auditlog.ssh_lines_by(lines, shed="itest-svc-3", user="dev") == []
+    with pytest.raises(ValueError, match="a user name, or None"):
+        auditlog.ssh_lines_by(lines, shed="itest-svc-1", user="")
+
+
+def test_ssh_line_example_in_the_configuration_reference():
+    """The ssh line the configuration reference prints is one the helper
+    accepts, with no command in it."""
+    doc = (dc.REPO_ROOT / "docs" / "reference" / "configuration.md").read_text()
+    start = doc.index("An `ssh` line, for an admin's `shed exec`")
+    block = doc[start:].split("```json\n", 1)[1].split("```", 1)[0]
+    examples = [json.loads(line) for line in block.splitlines() if line.strip()]
+    assert len(examples) == 1, examples
+    ex = examples[0]
+    assert auditlog.ssh_entry_problems(ex, shed=ex["shed"], owner="build-1", channel="exec", admin=True, user="pat") == []
+
+
+@pytest.mark.parametrize(
+    "ts, problem",
+    [
+        (_DROP, "every line carries its time"),
+        (42, "ts is 42"),
+        ("", "ts is ''"),
+        ("yesterday", "not the RFC 3339 UTC time the server writes"),
+        ("2026-11-19T10:04:05.123+01:00", "not the RFC 3339 UTC time the server writes"),
+        # Only the first 19 characters and the final Z of these look right:
+        # the whole string is matched.
+        ("2026-11-19T10:04:05secretZ", "not the RFC 3339 UTC time the server writes"),
+        ("2026-11-19T10:04:05.Z", "not the RFC 3339 UTC time the server writes"),
+        ("2026-11-19T10:04:05.1234567891Z", "not the RFC 3339 UTC time the server writes"),
+        ("2026-11-19T10:04:05.120Z", "not the RFC 3339 UTC time the server writes"),
+        ("2026-11-19T10:04:05Z\n", "not the RFC 3339 UTC time the server writes"),
+        (" 2026-11-19T10:04:05Z", "not the RFC 3339 UTC time the server writes"),
+        ("2026-11-19 10:04:05Z", "not the RFC 3339 UTC time the server writes"),
+        ("2026-13-19T10:04:05Z", "not a real date and time"),
+    ],
+)
+def test_ssh_entry_needs_its_time(ts, problem):
+    problems = auditlog.ssh_entry_problems(_ssh_line(ts=ts), shed="itest-svc-1", owner="itest", channel="exec")
+    assert any(problem in p for p in problems), problems
+    # The connect line's time is checked the same way.
+    problems = auditlog.connect_entry_problems(_connect_line(ts=ts), shed="itest-svc-1", owner="itest")
+    assert any(problem in p for p in problems), problems
+
+
+@pytest.mark.parametrize(
+    "ts",
+    [
+        "2026-11-19T10:04:05Z",  # a zero fraction is left out
+        "2026-11-19T10:04:05.1Z",
+        "2026-11-19T10:04:05.12Z",
+        "2026-11-19T10:04:05.123456789Z",
+        "2026-11-19T10:04:05.000000001Z",
+    ],
+)
+def test_entry_lines_accept_every_time_the_server_writes(ts):
+    """Go's time.RFC3339Nano of a UTC time: one to nine fraction digits with
+    trailing zeros cut, or none."""
+    assert auditlog.ssh_entry_problems(_ssh_line(ts=ts), shed="itest-svc-1", owner="itest", channel="exec") == []
+    assert auditlog.connect_entry_problems(_connect_line(ts=ts), shed="itest-svc-1", owner="itest") == []
+
+
+# The connect line: a person's tunnel into a service client's shed through
+# the HTTPS Connect API (internal/audit TestConnectEventShape pins the same
+# shape).
+
+_CONNECT_ID = {"kind": "user", "user": "dev", "admin": True, "script": False, "subject": "SHA256:abc", "serial": "1f"}
+_CONNECT = {
+    "ts": "2026-11-19T10:06:01.234567891Z", "event": "connect",
+    "identity": _CONNECT_ID, "remote": "192.0.2.10:51240", "shed": "itest-svc-1", "owner": "itest", "port": 8080,
+}
+
+
+def _connect_line(**changes):
+    line = json.loads(json.dumps(_CONNECT))
+    for k, v in changes.items():
+        if v is _DROP:
+            line.pop(k, None)
+        else:
+            line[k] = v
+    return line
+
+
+def test_connect_entry_accepts_what_the_server_writes():
+    assert auditlog.connect_entry_problems(_CONNECT, shed="itest-svc-1", owner="itest") == []
+    assert auditlog.connect_entry_problems(_CONNECT, shed="itest-svc-1", owner="itest", admin=True, user="dev", port=8080) == []
+    # Open mode: the implicit user, with no certificate (no subject, no serial).
+    implicit = _connect_line(identity={"kind": "user", "implicit": True, "admin": True, "script": False})
+    assert auditlog.connect_entry_problems(implicit, shed="itest-svc-1", owner="itest", admin=True, user=None) == []
+
+
+@pytest.mark.parametrize(
+    "changes, kwargs, problem",
+    [
+        ({"event": "ssh"}, {}, "not 'connect'"),
+        ({"ts": _DROP}, {}, "every line carries its time"),
+        ({"shed": "other"}, {}, "shed is 'other'"),
+        ({"owner": "build-1"}, {}, "owner is 'build-1'"),
+        ({"remote": _DROP}, {}, "remote is None"),
+        # The request id can come from a caller's X-Request-Id header: the
+        # connect line carries none.
+        ({"request_id": "host/Ab3dEf-000042"}, {}, "carries ['request_id']"),
+        ({"request_id": ""}, {}, "carries ['request_id']"),
+        ({"channel": "tunnel"}, {}, "carries ['channel']"),
+        ({"argv0": "nc"}, {}, "carries ['argv0']"),
+        ({"port": _DROP}, {}, "the line names the shed's port"),
+        ({"port": 0}, {}, "port is 0"),
+        ({"port": 70000}, {}, "port is 70000"),
+        ({"port": "8080"}, {}, "port is '8080'"),
+        ({"port": True}, {}, "port is True"),
+        ({}, {"port": 3000}, "port is 8080, want 3000"),
+        ({"identity": {"kind": "client", "name": "itest", "serial": "3fa2"}}, {}, "not 'user'"),
+        ({"identity": {"kind": "admin", "subject": "SHA256:abc"}}, {}, "not 'user'"),
+        ({"identity": {**_CONNECT_ID, "admin": False}}, {"admin": True}, "admin is False, want True"),
+        ({}, {"user": "localadmin"}, "user is 'dev', want 'localadmin'"),
+        ({}, {"user": None}, "want the implicit user"),
+    ],
+)
+def test_connect_entry_refuses(changes, kwargs, problem):
+    problems = auditlog.connect_entry_problems(_connect_line(**changes), shed="itest-svc-1", owner="itest", **kwargs)
+    assert any(problem in p for p in problems), problems
+
+
+def test_connect_entry_refuses_a_line_that_is_not_an_object():
+    assert any("not an object" in p for p in auditlog.connect_entry_problems([], shed="s", owner="o"))
+
+
+def test_connect_lines_by_picks_one_persons_lines_about_one_shed():
+    other_admin = _connect_line(identity={**_CONNECT_ID, "user": "itest-admin"})
+    lines = [
+        _CONNECT,
+        other_admin,
+        _connect_line(shed="itest-svc-2"),
+        _ssh_line(),  # an ssh line about the same shed, by the same person
+        None,
+    ]
+    assert auditlog.connect_lines_by(lines, shed="itest-svc-1", user="dev") == [_CONNECT]
+    assert auditlog.connect_lines_by(lines, shed="itest-svc-1", user="itest-admin") == [other_admin]
+    assert auditlog.connect_lines_by(lines, shed="itest-svc-1", user=None) == []
+    with pytest.raises(ValueError, match="a user name, or None"):
+        auditlog.connect_lines_by(lines, shed="itest-svc-1", user="")
+
+
+def test_connect_line_example_in_the_configuration_reference():
+    """The connect line the configuration reference prints is one the helper
+    accepts."""
+    doc = (dc.REPO_ROOT / "docs" / "reference" / "configuration.md").read_text()
+    start = doc.index("A `connect` line, for an admin's `shed tunnels`")
+    block = doc[start:].split("```json\n", 1)[1].split("```", 1)[0]
+    examples = [json.loads(line) for line in block.splitlines() if line.strip()]
+    assert len(examples) == 1, examples
+    ex = examples[0]
+    assert auditlog.connect_entry_problems(ex, shed=ex["shed"], owner="build-1", admin=True, user="pat", port=8080) == []

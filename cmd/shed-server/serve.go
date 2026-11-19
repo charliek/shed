@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -526,10 +527,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// The audit log (service client requests, HTTPS execs, max_age reaps),
-	// next to the egress audit log in the backend's state directory. On when
-	// auth.clients is set or audit.enabled; a server that needs it and can't
-	// open it does not start.
+	// The audit log (service client requests, HTTPS execs, max_age reaps, a
+	// person's entries into service clients' sheds), next to the egress
+	// audit log in the backend's state directory. On when auth.clients is
+	// set or audit.enabled; a server that needs it and can't open it does
+	// not start. Once serving, runFrontDoors closes it, after every server
+	// has drained; this close (a no-op then) is for a return before that.
 	var auditLog *audit.Log
 	if cfg.AuditEnabled() {
 		auditPath := filepath.Join(egressStateDir, audit.FileName)
@@ -542,8 +545,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Initialize HTTP API server
+	// The audit log is handed to both front doors by runFrontDoors, before
+	// either serves.
 	apiServer := api.NewServer(guard, cfg, hostKey, pluginRegistry, pluginBridge)
-	apiServer.SetAuditLog(auditLog)               // nil-safe: records nothing when audit is off
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
 	apiServer.SetKeyRefresher(userLookup)         // `shed users refresh`, in every mode
@@ -607,111 +611,234 @@ func runServe(cmd *cobra.Command, args []string) error {
 		CA:             clientCA,
 	})
 
-	// Channel to collect errors from servers (HTTP, HTTPS, SSH).
-	errChan := make(chan error, 3)
-
-	// Start HTTP server in goroutine (skipped in mtls mode — TLS-only)
-	if httpServer != nil {
-		go func() {
-			log.Printf("HTTP server listening on %s", httpServer.Addr)
-			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				errChan <- fmt.Errorf("HTTP server error: %w", err)
-			}
-		}()
-	}
-
-	// Start HTTPS server in goroutine (when https_port set). The cert + key
-	// are already loaded into TLSConfig, so the file args are empty.
-	if httpsServer != nil {
-		go func() {
-			log.Printf("HTTPS server listening on %s", httpsServer.Addr)
-			if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-				errChan <- fmt.Errorf("HTTPS server error: %w", err)
-			}
-		}()
-	}
-
-	// Start SSH server in goroutine
-	go func() {
-		if err := sshServer.Start(); err != nil {
-			errChan <- fmt.Errorf("SSH server error: %w", err)
-		}
-	}()
-
 	// The max_age reaper: the only server-side lifetime bound on a service
-	// client's sheds. It runs only when clients are configured. stopReaper
-	// ends it and waits for a stop or delete in progress to finish: it runs
-	// first thing at shutdown, and (deferred, for an error return) before the
-	// audit log and the backend, deferred earlier, close.
-	stopReaper := func() {}
+	// client's sheds. It runs only when clients are configured.
+	var startReaper func() func()
 	if cfg.ServiceClientsEnabled() {
-		log.Printf("Starting the max_age reaper (every %s)", api.DefaultReapInterval)
-		stopReaper = apiServer.StartReaper(api.DefaultReapInterval, time.Now)
-	}
-	defer stopReaper()
-
-	// Setup signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	log.Printf("Shed server is ready")
-
-	// Wait for signal or error
-	select {
-	case sig := <-sigChan:
-		log.Printf("Received signal %v, initiating graceful shutdown...", sig)
-	case err := <-errChan:
-		log.Printf("Server error: %v", err)
-		return err
-	}
-
-	// Graceful shutdown. The reaper first: a reap that has begun finishes
-	// (an expired shed is not left half torn down, nor its reap unrecorded).
-	if cfg.ServiceClientsEnabled() {
-		log.Printf("Stopping the max_age reaper...")
-	}
-	stopReaper()
-
-	shutdownServers := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-
-		// Credential-bus streams never end on their own, so a graceful
-		// shutdown would wait out its whole timeout for them: close them (and
-		// refuse new subscriptions) first.
-		log.Printf("Closing credential bus streams...")
-		pluginRegistry.Close()
-
-		// Shutdown HTTP server (when serving — skipped in mtls mode)
-		if httpServer != nil {
-			log.Printf("Shutting down HTTP server...")
-			if err := httpServer.Shutdown(ctx); err != nil {
-				log.Printf("HTTP server shutdown error: %v", err)
-			}
-		}
-
-		// Shutdown HTTPS server (when enabled)
-		if httpsServer != nil {
-			log.Printf("Shutting down HTTPS server...")
-			if err := httpsServer.Shutdown(ctx); err != nil {
-				log.Printf("HTTPS server shutdown error: %v", err)
-			}
-		}
-
-		// Shutdown SSH server
-		log.Printf("Shutting down SSH server...")
-		if err := sshServer.Shutdown(ctx); err != nil {
-			log.Printf("SSH server shutdown error: %v", err)
+		startReaper = func() func() {
+			log.Printf("Starting the max_age reaper (every %s)", api.DefaultReapInterval)
+			return apiServer.StartReaper(api.DefaultReapInterval, time.Now)
 		}
 	}
 	var checkTrust func(context.Context) error
 	if dirUsers != nil {
 		checkTrust = dirUsers.CheckTrustAtStop
 	}
-	stopUserSource(checkTrust, directory.StopTrustBound, cancelRefresh, shutdownServers, log.Printf)
 
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	return runFrontDoors(frontDoors{
+		api:         apiServer,
+		ssh:         sshServer,
+		auditLog:    auditLog,
+		doors:       serveDoors(httpServer, httpsServer, apiServer, sshServer),
+		startReaper: startReaper,
+		// Credential-bus streams never end on their own, so a graceful
+		// shutdown would wait out its whole timeout for them: close them
+		// (and refuse new subscriptions) first.
+		beforeShutdown: func() {
+			log.Printf("Closing credential bus streams...")
+			pluginRegistry.Close()
+		},
+		stopping: func(shutdownServers func()) {
+			stopUserSource(checkTrust, directory.StopTrustBound, cancelRefresh, shutdownServers, log.Printf)
+		},
+		timeout: shutdownTimeout,
+	}, sigChan)
+}
+
+// frontDoor is one listener serve runs. serve runs it until it is shut down
+// (an error it returns ends serve); shutdown stops it, until ctx ends: it
+// stops accepting at once and then drains what it is serving. A door with no
+// serve is only shut down.
+type frontDoor struct {
+	name     string
+	serve    func() error
+	shutdown func(context.Context) error
+}
+
+// serveDoors is serve's doors: the HTTP listener (when serving; never in
+// mtls mode), the HTTPS listener (when https_port is set), the API server's
+// Connect tunnels (a hijacked connection outlives its HTTP server's
+// shutdown, so the tunnels a person was opening into service clients' sheds
+// are drained on their own, for their audit lines), and the SSH server
+// (which drains its own entries into service clients' sheds). runFrontDoors
+// shuts them all down together.
+func serveDoors(httpServer, httpsServer *http.Server, apiServer *api.Server, sshServer *sshd.Server) []frontDoor {
+	var doors []frontDoor
+	if httpServer != nil {
+		doors = append(doors, frontDoor{
+			name: "HTTP server",
+			serve: func() error {
+				log.Printf("HTTP server listening on %s", httpServer.Addr)
+				if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+					return err
+				}
+				return nil
+			},
+			shutdown: httpServer.Shutdown,
+		})
+	}
+	if httpsServer != nil {
+		doors = append(doors, frontDoor{
+			name: "HTTPS server",
+			// The cert + key are already loaded into TLSConfig, so the file
+			// args are empty.
+			serve: func() error {
+				log.Printf("HTTPS server listening on %s", httpsServer.Addr)
+				if err := httpsServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+					return err
+				}
+				return nil
+			},
+			shutdown: httpsServer.Shutdown,
+		})
+	}
+	doors = append(doors,
+		frontDoor{name: "Connect tunnels", shutdown: apiServer.DrainEntries},
+		frontDoor{name: "SSH server", serve: sshServer.Start, shutdown: sshServer.Shutdown},
+	)
+	return doors
+}
+
+// frontDoors is what serve runs once everything is built (runFrontDoors).
+type frontDoors struct {
+	api *api.Server
+	ssh *sshd.Server
+	// auditLog is the one audit log both front doors write; nil when audit
+	// is off. runFrontDoors closes it last.
+	auditLog *audit.Log
+	// doors (serveDoors), shut down together; errors are logged in this
+	// order.
+	doors []frontDoor
+	// startReaper starts the max_age reaper and returns what stops it (and
+	// waits for a reap in progress); nil when no service client is
+	// configured.
+	startReaper func() (stop func())
+	// beforeShutdown runs first in the servers' shutdown; may be nil.
+	beforeShutdown func()
+	// stopping runs the servers' shutdown (its argument) inside the user
+	// source's stop (stopUserSource); nil runs it alone.
+	stopping func(shutdownServers func())
+	// timeout bounds the servers' shutdown.
+	timeout time.Duration
+}
+
+// runFrontDoors hands the audit log to both front doors (attachAuditLog),
+// starts every door and the max_age reaper, and waits for a signal on
+// signals or for a door's serve to fail. Then, on either path, it stops in
+// order. First, before anything waits, both front doors' gates for entries
+// into service clients' sheds close (closeEntryGates): from then on a
+// person's SSH channel or Connect into one is refused at once. Then the
+// reaper (a reap that has begun finishes, so an expired shed is not left
+// half torn down, nor its reap unrecorded). Then the servers, all together
+// under the one bound (shutdownDoors): each stops accepting at once and
+// then drains what it is serving, including the entries into service
+// clients' sheds admitted before the gates closed, whose audit lines are
+// written by then; no server's wait (an HTTP request that never ends, such
+// as the egress stream) delays another's listener closing or uses up
+// another's drain. Only then the audit log, which is closed last so that no
+// admitted entry loses its line to the shutdown. It returns the door's
+// error, or nil after a signal.
+func runFrontDoors(fd frontDoors, signals <-chan os.Signal) error {
+	attachAuditLog(fd.auditLog, fd.api, fd.ssh) // nil-safe: records nothing when audit is off
+
+	// Each door reports a failed serve here; the buffer holds one per door,
+	// so none blocks once the select below has taken the first.
+	errChan := make(chan error, len(fd.doors))
+	for _, d := range fd.doors {
+		if d.serve == nil {
+			continue
+		}
+		go func() {
+			if err := d.serve(); err != nil {
+				errChan <- fmt.Errorf("%s error: %w", d.name, err)
+			}
+		}()
+	}
+
+	stopReaper := func() {}
+	if fd.startReaper != nil {
+		stopReaper = fd.startReaper()
+	}
+
+	log.Printf("Shed server is ready")
+
+	// Wait for signal or error
+	var serveErr error
+	select {
+	case sig := <-signals:
+		log.Printf("Received signal %v, initiating graceful shutdown...", sig)
+	case serveErr = <-errChan:
+		log.Printf("Server error: %v", serveErr)
+		log.Printf("Shutting down the other servers after the error...")
+	}
+
+	closeEntryGates(fd.api, fd.ssh)
+
+	if fd.startReaper != nil {
+		log.Printf("Stopping the max_age reaper...")
+	}
+	stopReaper()
+
+	shutdownServers := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), fd.timeout)
+		defer cancel()
+		if fd.beforeShutdown != nil {
+			fd.beforeShutdown()
+		}
+		shutdownDoors(ctx, fd.doors)
+	}
+	if fd.stopping != nil {
+		fd.stopping(shutdownServers)
+	} else {
+		shutdownServers()
+	}
+
+	// Every server has stopped and drained: no entry into a service
+	// client's shed can still be on its way to a line.
+	if err := fd.auditLog.Close(); err != nil {
+		log.Printf("audit: closing the log: %v", err)
+	}
+	if serveErr != nil {
+		return serveErr
+	}
 	log.Printf("Shutdown complete")
 	return nil
+}
+
+// closeEntryGates closes both front doors' gates for entries into service
+// clients' sheds (a person's SSH channel, a person's Connect), without
+// waiting on anything: an entry not begun by now is refused, and every
+// entry the drains will wait for was begun before the shutdown did.
+func closeEntryGates(apiServer *api.Server, sshServer *sshd.Server) {
+	apiServer.CloseEntries()
+	sshServer.CloseEntries()
+}
+
+// shutdownDoors starts every door's shutdown at once, under the one bound
+// ctx, and waits for all of them; then it logs each error, in door order. A
+// door that waits long (an HTTP request that never ends) neither keeps
+// another door's listener open nor uses up another's wait.
+func shutdownDoors(ctx context.Context, doors []frontDoor) {
+	errs := make([]error, len(doors))
+	var wg sync.WaitGroup
+	for i, d := range doors {
+		log.Printf("Shutting down %s...", d.name)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = d.shutdown(ctx)
+		}()
+	}
+	wg.Wait()
+	for i, d := range doors {
+		if errs[i] != nil {
+			log.Printf("%s shutdown error: %v", d.name, errs[i])
+		}
+	}
 }
 
 // stopUserSource is the user source's part of a graceful stop, around the
@@ -945,6 +1072,15 @@ func sshKeyAuth(l userSource) sshd.KeyAuth {
 		Users:            l,
 		TrackConnections: dir,
 	}
+}
+
+// attachAuditLog hands the one audit log to both front doors: the API server
+// (service client requests, HTTPS execs, max_age reaps) and the SSH server (a
+// person's entry into a service client's shed). Called before either serves.
+// A nil log (audit off) records nothing on either.
+func attachAuditLog(l *audit.Log, apiServer *api.Server, sshServer *sshd.Server) {
+	apiServer.SetAuditLog(l)
+	sshServer.SetAuditLog(l)
 }
 
 // closeOnPublication makes every publication of rt's list (a pull, the end of

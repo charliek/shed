@@ -1083,6 +1083,33 @@ name. On a server with no user list it carries no user name: the person is the
 server's one implicit user (`implicit: true`), known on the line only by the
 key's fingerprint.
 
+**Every time a person enters a client's shed over SSH, an `ssh` line records
+it**: a shell, a command (`shed exec`, `shed attach`), sftp or scp, and each
+connection forwarded with `ssh -L`. Only an admin can enter a client's shed
+(on a server with no user list, its one implicit user; a user who is not an
+admin is told the shed does not exist), and the shed holds what
+the orchestrator put there, so this is the record of who went in over SSH. The line
+names the person as above (by user name and key fingerprint), the peer's
+address, the shed, its client and the channel, never the command. It is
+written once the entry has happened (the command has started in the shed, or
+the forwarded connection is open), so a refused or failed attempt writes none
+and leaves only its server-log line.
+
+The log is not yet a complete record of what a person does to a client's
+shed. Of the ways a person (an admin) can reach into one:
+
+- **Recorded:** an HTTPS exec (`exec.end`); a shell, a command, sftp or scp,
+  or a connection forwarded over SSH (`ssh`); a tunnel through the HTTPS
+  Connect API, as `shed tunnels` opens (`connect`, once the tunnel is
+  established).
+- **Not recorded yet:** starting, stopping, deleting or resetting the shed;
+  taking a snapshot of it; changing its egress rules; reading its egress
+  decisions (its recent decisions, `GET /api/egress/{name}`, or the live
+  egress stream, `GET /api/egress/stream`); listing or killing its sessions;
+  reading its record (`shed list`, `GET /api/sheds/{name}`). The access guard
+  lets an admin do each of these to a client's shed, and none writes an audit
+  line.
+
 ### Residual risks
 
 - **A leaked bundle is root in that client's sheds.** Whoever holds a client's

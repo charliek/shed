@@ -227,6 +227,34 @@ shed:
 sudo jq -c 'select(.event == "exec.end" and .identity.kind == "user")' /var/lib/shed/firecracker/audit.jsonl | tail
 ```
 
+When a person enters one of the client's sheds over SSH (a shell, `shed exec`
+or `shed attach`, sftp or scp, or a connection forwarded with `ssh -L`), an
+`ssh` line records it: the person (`kind: user`, by name and key
+fingerprint), the peer's `remote` address, the `shed`, its `owner` (the
+client) and the `channel` (`shell`, `exec`, `sftp` or `tunnel`, with the
+`port` for a tunnel). It is written once the entry has happened, never for a
+refused or failed attempt, and it never holds the command. Entering a
+person's own shed writes none. A `shed tunnels` connection uses the HTTPS
+Connect API instead, and writes a `connect` line once its tunnel into the
+client's shed is established: the person as for an HTTPS exec, the `shed`,
+its `owner` and the `port`. To list who entered the client's sheds over SSH
+or through a tunnel:
+
+```bash
+sudo jq -c 'select(.event == "ssh" or .event == "connect")' /var/lib/shed/firecracker/audit.jsonl | tail
+```
+
+The log does not yet record everything a person can do to a client's shed:
+
+- **Recorded:** an HTTPS exec (`exec.end`); a shell, a command, sftp or scp,
+  or a connection forwarded over SSH (`ssh`); a tunnel through the HTTPS
+  Connect API, as `shed tunnels` opens (`connect`).
+- **Not recorded yet:** starting, stopping, deleting or resetting the shed;
+  taking a snapshot of it; changing its egress rules; reading its egress
+  decisions (its recent decisions, or the live egress stream); listing or
+  killing its sessions; reading its record. An admin may do each of these to
+  a client's shed, and none writes an audit line.
+
 ## Revoking a client
 
 There is no per-certificate revocation yet. To revoke a client, remove it from

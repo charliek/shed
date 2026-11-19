@@ -25,6 +25,17 @@ type wakeFakeBackend struct {
 	runningAfter int // polls after a start until running; <0 never
 	polls        int
 	starts       int
+	// owner and user are the shed's reported ownership; onStart, onPoll
+	// and onSettle, when set, change the shed when a start is asked, at the
+	// first poll after a start and when a wait settles (the creation time
+	// never changes).
+	owner, user               string
+	onStart, onPoll, onSettle func(*wakeFakeBackend)
+}
+
+// record is the shed as it is now. The caller holds b.mu.
+func (b *wakeFakeBackend) record(name string) *config.Shed {
+	return &config.Shed{Name: name, Status: b.status, StatusReason: b.reason, Owner: b.owner, User: b.user}
 }
 
 func (b *wakeFakeBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
@@ -33,13 +44,17 @@ func (b *wakeFakeBackend) GetShed(_ context.Context, name string) (*config.Shed,
 	if b.missing {
 		return nil, config.ErrShedNotFoundSentinel
 	}
+	if b.status == config.StatusStarting && b.onPoll != nil {
+		b.onPoll(b)
+		b.onPoll = nil
+	}
 	if b.status == config.StatusStarting && b.runningAfter >= 0 {
 		if b.polls >= b.runningAfter {
 			b.status = config.StatusRunning
 		}
 		b.polls++
 	}
-	return &config.Shed{Name: name, Status: b.status, StatusReason: b.reason}, nil
+	return b.record(name), nil
 }
 
 func (b *wakeFakeBackend) StartShed(_ context.Context, name string) (*config.Shed, error) {
@@ -50,7 +65,10 @@ func (b *wakeFakeBackend) StartShed(_ context.Context, name string) (*config.She
 		return nil, b.startErr
 	}
 	b.status = config.StatusStarting
-	return &config.Shed{Name: name, Status: b.status}, nil
+	if b.onStart != nil {
+		b.onStart(b)
+	}
+	return b.record(name), nil
 }
 
 // asyncWakeBackend adds WaitSettled: a waited-on job moves starting to
@@ -88,7 +106,78 @@ func (b *asyncWakeBackend) WaitSettled(ctx context.Context, name string) (*confi
 	case config.StatusStopping:
 		b.status = config.StatusStopped
 	}
-	return &config.Shed{Name: name, Status: b.status, StatusReason: b.reason}, nil
+	if b.onSettle != nil {
+		b.onSettle(&b.wakeFakeBackend)
+	}
+	return b.record(name), nil
+}
+
+// TestWakeRefusesAShedWhoseOwnershipChanged: the shed's owner and user are
+// pinned from the first check and held through the whole wake. A shed whose
+// reported owner or user changes during a start, a poll or a settle (its
+// creation time unchanged) is refused as one that is not there, never handed
+// on as the shed it has become: reassigned to another client, or a client's
+// shed a reconcile could no longer resolve (no owner, user unresolved). A
+// wake that changes nothing still succeeds.
+func TestWakeRefusesAShedWhoseOwnershipChanged(t *testing.T) {
+	old, oldAsync := readyTimeout, asyncWakeTimeout
+	readyTimeout, asyncWakeTimeout = 2*time.Second, 2*time.Second
+	t.Cleanup(func() { readyTimeout, asyncWakeTimeout = old, oldAsync })
+
+	reassign := func(b *wakeFakeBackend) { b.owner = "build-2" }
+	unresolve := func(b *wakeFakeBackend) { b.owner, b.user = "", config.UserUnresolved }
+	keep := func(*wakeFakeBackend) {}
+	syncStart := func(on func(*wakeFakeBackend)) backend.Backend {
+		return &wakeFakeBackend{status: config.StatusStopped, runningAfter: 1, owner: "build-1", onStart: on}
+	}
+	// A start that hands the shed on unchanged, then a poll that finds it
+	// changed.
+	syncPoll := func(on func(*wakeFakeBackend)) backend.Backend {
+		return &wakeFakeBackend{status: config.StatusStopped, runningAfter: 1, owner: "build-1", onPoll: on}
+	}
+	asyncStart := func(on func(*wakeFakeBackend)) backend.Backend {
+		return &asyncWakeBackend{wakeFakeBackend: wakeFakeBackend{status: config.StatusStopped, runningAfter: -1, owner: "build-1", onStart: on}}
+	}
+	asyncSettle := func(on func(*wakeFakeBackend)) backend.Backend {
+		return &asyncWakeBackend{wakeFakeBackend: wakeFakeBackend{status: config.StatusStarting, runningAfter: -1, owner: "build-1", onSettle: on}}
+	}
+	for _, tc := range []struct {
+		name string
+		be   backend.Backend
+		ok   bool
+	}{
+		{"sync start, unchanged", syncStart(keep), true},
+		{"sync start, reassigned", syncStart(reassign), false},
+		{"sync start, unresolved", syncStart(unresolve), false},
+		{"sync poll, reassigned", syncPoll(reassign), false},
+		{"sync poll, unresolved", syncPoll(unresolve), false},
+		{"async start, unchanged", asyncStart(keep), true},
+		{"async start, reassigned", asyncStart(reassign), false},
+		{"async start, unresolved", asyncStart(unresolve), false},
+		{"async settle, unchanged", asyncSettle(keep), true},
+		{"async settle, reassigned", asyncSettle(reassign), false},
+		{"async settle, unresolved", asyncSettle(unresolve), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{backend: tc.be}
+			var stderr bytes.Buffer
+			ctx, shed, err := s.ensureRunning(implicitCtx(), "a1", &stderr, true)
+			if tc.ok {
+				if err != nil || shed.Status != config.StatusRunning || shed.Owner != "build-1" {
+					t.Fatalf("shed %+v err %v, want build-1's shed running", shed, err)
+				}
+				// The context handed to the exec still requires the owner
+				// the first check found.
+				if err := backend.CheckIdentity(ctx, "a1", "build-2", "", time.Time{}); err == nil {
+					t.Error("the exec's context does not require the checked owner")
+				}
+				return
+			}
+			if err == nil || err.Error() != "shed 'a1' not found" {
+				t.Fatalf("shed %+v err %v, want the shed refused as not found", shed, err)
+			}
+		})
+	}
 }
 
 // TestSyncWakeUnchanged pins the Firecracker/VZ wake: a synchronous start,
@@ -122,7 +211,7 @@ func TestSyncWakeUnchanged(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{backend: tt.b}
 			var stderr bytes.Buffer
-			shed, err := s.ensureRunning(implicitCtx(), "a1", &stderr, tt.announce)
+			_, shed, err := s.ensureRunning(implicitCtx(), "a1", &stderr, tt.announce)
 			if tt.wantErr != "" {
 				if err == nil || err.Error() != tt.wantErr {
 					t.Fatalf("err = %v, want %q", err, tt.wantErr)
@@ -170,7 +259,7 @@ func TestAsyncWake(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Server{backend: tt.b}
 			var stderr bytes.Buffer
-			shed, err := s.ensureRunning(implicitCtx(), "a1", &stderr, true)
+			_, shed, err := s.ensureRunning(implicitCtx(), "a1", &stderr, true)
 			if tt.wantErr != "" {
 				if err == nil || err.Error() != tt.wantErr {
 					t.Fatalf("err = %v, want %q", err, tt.wantErr)

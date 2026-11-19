@@ -415,7 +415,9 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
 - **Readers of `audit.jsonl`: the identity kind `admin` is gone, with no alias.** A person is
   now `kind: user` (with `user`, or `implicit: true`, and `admin` and `script`), and a `reap`
   line carries `kind: system` (see "Audit log: callers by kind" below). Update any filter that
-  matches `kind == "admin"`.
+  matches `kind == "admin"`. A new `ssh` line records each time a person enters a service
+  client's shed over SSH, and a new `connect` line each tunnel a person opens into one through
+  the HTTPS Connect API (see "Audit log: a person's entry" below).
 
 #### Added
 
@@ -569,9 +571,34 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   reference server and a private `shed-server` on loopback for each case and never touches an
   installed or dev server. The module skips under every other target with a message naming
   this one. Not in CI; its fixture unit tests run in `make test-integration-units`.
+- **Audit log: a person's entry into a service client's shed.** Each time a person (an
+  admin, or the one user of a server with no user list) enters a client's shed over SSH, a new
+  `ssh` line records it: a shell, a command (`shed exec`, `shed attach`), sftp or scp, and
+  each connection forwarded with `ssh -L`. It names the person (`kind: user`, with the key's
+  fingerprint as `subject`), the peer's `remote` address, the `shed`, its `owner` and the
+  `channel` (`shell`, `exec`, `sftp` or `tunnel`, with `port` for a tunnel), never the
+  command. Each tunnel a person opens into a client's shed through the HTTPS Connect API (what
+  `shed tunnels` uses) writes a new `connect` line: the person as for an HTTPS exec (with the
+  certificate's `subject` and `serial`), `remote`, `shed`, `owner` and `port`; neither line
+  carries a request id or anything else the caller sent. Each is written once the entry has happened (the command has started in the shed,
+  or the connection or tunnel is open), so a refused or failed attempt writes none; nor does a
+  person's own shed, or `_bootstrap`. A shed whose owner or user changes between the check of
+  an entry and the entry itself (during a wake included) is refused as not found. When the
+  server stops, it refuses new entries into a client's sheds first, then waits for the
+  entries it has admitted to write their lines before it closes the log. Starting, stopping,
+  deleting or resetting a client's shed, a snapshot of it, its egress rules, reading its
+  egress decisions and its sessions are not recorded yet. Before, such an entry left only
+  server-log lines. See [Configuration › Audit
+  log](https://charliek.github.io/shed/reference/configuration/#audit-log).
 
 #### Changed
 
+- **`serve` stops its other servers when one fails.** When a listener fails (a port another
+  process holds, for example), `serve` now logs `Server error: …` as before and then stops
+  the max_age reaper and shuts its other servers down as on a signal, before it exits with the
+  error; before, it exited at once. On both paths every listener is now shut down together
+  (before, one after another, so a request that never ends, such as the egress stream, kept
+  the SSH listener open for the whole 30-second bound), and the audit log is closed last.
 - **The credential bus is routed by user.** A machine receives only its user's sheds'
   requests, and only that user's source may answer them. The server mints its own id for
   each request, an answer that matches no pending request is refused in every mode (open

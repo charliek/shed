@@ -20,7 +20,10 @@ has the client's api lines and an exec.end line with argv[0] and the count,
 never the arguments, and an admin's exec in the client's shed is recorded as
 a person (`kind: user`, `admin: true`; `fixtures/auditlog.py`): by the
 developer's user name on a server with a user list (`SHED_ITEST_USERS=fc`, or
-the directory source), as the implicit user on one without. An admin create
+the directory source), as the implicit user on one without. The developer's
+`shed exec` over SSH into the client's shed writes one `ssh` line (that
+person, `admin: true`, `channel: exec`, `owner` the client) with no command
+text. An admin create
 with `"mounts": []` also boots with no 9P mounts, before and after stop/start.
 
 Run: `make build && make dev-server-restart-fc &&
@@ -39,7 +42,13 @@ from urllib.parse import urlparse
 import pytest
 import yaml
 
-from fixtures.auditlog import client_identity_problems, developer_audit_user, person_identity_problems
+from fixtures.auditlog import (
+    client_identity_problems,
+    developer_audit_user,
+    person_identity_problems,
+    ssh_entry_problems,
+    ssh_lines_by,
+)
 from fixtures.identity import itest_source, skip_unless_users_source_ready, started_with_users, users_environment
 from fixtures.tlsclient import Pinned, error_code
 
@@ -279,9 +288,15 @@ def test_audit_log_records_client_requests_and_execs(svc, admin, bundle, client_
     # person (kind user), never the retired kind admin.
     status, _, code, _ = admin.exec(name, ["true"])
     assert (status, code) == (200, 0)
+    # The developer's `shed exec` over SSH into the client's shed (an admin):
+    # one ssh line, with no command text.
+    ssh_secret = f"audit-ssh-secret-{uuid.uuid4().hex}"
+    r = fc_server_dev.exec(name, ["echo", ssh_secret])
+    assert r.returncode == 0 and ssh_secret in r.stdout, f"shed exec into the client's shed failed: {r.stderr!r}"
 
     raw, lines = read_audit(fc_server_dev)
     assert secret not in raw, "the exec's arguments reached the audit log (exec_argv is not full)"
+    assert ssh_secret not in raw, "the SSH command reached the audit log"
 
     serial = bundle["cert_serial"]
     api = [l for l in lines if l.get("event") == "api"]
@@ -309,6 +324,12 @@ def test_audit_log_records_client_requests_and_execs(svc, admin, bundle, client_
     for l in people:
         problems = person_identity_problems(l["identity"], admin=True, user=want_user)
         assert not problems and "subject" in l["identity"], (problems, l)
+    # The developer's SSH exec: exactly one ssh line for this shed by this
+    # person (another admin's SSH entry in an earlier test is someone else's).
+    entered = ssh_lines_by(lines, shed=name, user=want_user)
+    assert len(entered) == 1, f"want one ssh line for the developer's shed exec into {name}, got {entered}"
+    problems = ssh_entry_problems(entered[0], shed=name, owner=CLIENT, channel="exec", admin=True, user=want_user)
+    assert not problems, (problems, entered[0])
     exec_lines = [l for l in mine if l["route"] == "/api/sheds/{name}/exec" and l["shed"] == name and l["method"] == "POST"]
     assert exec_lines and exec_lines[-1]["status"] == 200, exec_lines
     refused = [l for l in mine if l["path"] == bogus]
