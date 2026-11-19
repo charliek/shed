@@ -218,10 +218,14 @@ tauri-test-linux: tauri-ui-build  ## Tauri crate cargo test on ubuntu:24.04 (Lin
 	    cd /work/desktop/tauri/src-tauri && \
 	    cargo clippy --locked --all-targets -- -D warnings && cargo test --locked'
 
+# shed-core's machine_transport_contract test reads the shared contract at
+# <repo>/tests/machine-transport (CARGO_MANIFEST_DIR/../../tests/...), which is
+# /tests/machine-transport inside the container: mount it there, read-only.
 core-linux:  ## Build+test shed-core on Linux in Docker (ubuntu:24.04; ring needs build-essential)
 	docker build -t shed-core-linux:latest - < Dockerfile.linux
 	docker run --rm \
 	  -v "$(REPO_ROOT)/crates:/work:ro" \
+	  -v "$(REPO_ROOT)/tests/machine-transport:/tests/machine-transport:ro" \
 	  -v shed-core-linux-target:/target \
 	  -v shed-core-linux-cargo:/usr/local/cargo/registry \
 	  -e CARGO_TARGET_DIR=/target \
