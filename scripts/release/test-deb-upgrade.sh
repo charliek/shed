@@ -3,6 +3,12 @@
 # so no install, upgrade, reinstall, remove, purge or downgrade of the
 # shed-server deb prompts about it or changes an operator's config.
 #
+# It also holds what the systemd unit's upgrade does. The unit
+# (/etc/systemd/system/shed-server.service) IS a conffile, and plan 037 A13
+# changed it (network-online ordering): an unedited unit is replaced with no
+# prompt; an edited one makes dpkg prompt, so an unattended upgrade stops there
+# with the edit untouched; --force-confold completes it and keeps the edit.
+#
 # Usage:
 #   test-deb-upgrade.sh <shed-server_*_amd64.deb>
 #
@@ -14,7 +20,9 @@
 # Baselines, downloaded from the GitHub releases and pinned by sha256:
 #   v0.7.10  conffile era, and its packaged template differs from today's, so
 #            an edited config made dpkg prompt on the upgrade
-#   v0.9.0   the last conffile-era release, for the stuck-host row (T3)
+#   v0.9.0   the last conffile-era release, for the stuck-host row (T3); its
+#            unit predates network-online ordering, for the unit rows
+#            (T11-T13)
 #
 # Version order: the deb under test must sort above 0.9.0, or the upgrade rows
 # would be downgrades. A goreleaser snapshot is versioned 0.9.0~SNAPSHOT-<sha>,
@@ -25,7 +33,8 @@
 #
 # A1 (on the deb itself): conffiles does not list /etc/shed/server.yaml, the
 # deb ships /usr/share/shed/server.yaml.default (0644) and owns /etc/shed.
-# T1-T10: the rows in row_title below (plan 028 D1). Each row prints every
+# T1-T13: the rows in row_title below (T1-T10 plan 028 D1, the config; T11-T13
+# plan 037 A13, the unit). Each row prints every
 # apt-get output and one ok/MISS line per assertion; the run ends with a
 # PASS/FAIL summary and exits 1 if anything failed.
 #
@@ -46,10 +55,11 @@ BASELINES=(
   "0.7.10 78ded347c0e5e7e2eb47834119d61d835ae737c2caf327b880d11350c6e8ddb8"
   "0.9.0 fb90307e8f586f80aafbd9befdf4dd911bb87e29c5886db6fbc04f909cd75a0a"
 )
-ROWS="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10"
+ROWS="T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13"
 
 # Paths inside the containers.
 CFG=/etc/shed/server.yaml
+UNIT=/etc/systemd/system/shed-server.service
 REF=/usr/share/shed/server.yaml.default
 OLD=/work/shed-server_0.7.10_amd64.deb
 STUCK=/work/shed-server_0.9.0_amd64.deb
@@ -68,6 +78,9 @@ row_title() {
     T8) echo "fresh install of new" ;;
     T9) echo "new, then new+1 with a changed template" ;;
     T10) echo "edited new, downgrade to 0.7.10 with --force-confold" ;;
+    T11) echo "0.9.0 with an unedited unit, upgrade to new" ;;
+    T12) echo "0.9.0, edit the unit, upgrade to new: stops at the prompt" ;;
+    T13) echo "T12 with --force-confold" ;;
     *) return 1 ;;
   esac
 }
@@ -153,6 +166,40 @@ edit_cfg() {
   echo "# operator edit" >>"${CFG}"
   cp "${CFG}" "${EDITED}"
   echo "  (edited ${CFG})"
+}
+
+# edit_unit: an operator edit of the systemd unit; the edited bytes are kept.
+EDITED_UNIT=/tmp/shed-server.service.edited
+edit_unit() {
+  echo "# operator edit" >>"${UNIT}"
+  cp "${UNIT}" "${EDITED_UNIT}"
+  echo "  (edited ${UNIT})"
+}
+unit_is() { cmp -s "${UNIT}" "$1"; }
+no_unit_leftovers() { not compgen -G "${UNIT}.dpkg-*" >/dev/null; }
+# online <unit file>: an After= line and a Wants= line each list
+# network-online.target.
+online() {
+  grep -Eq '^After=(.*[[:space:]])?network-online\.target([[:space:]]|$)' "$1" &&
+    grep -Eq '^Wants=(.*[[:space:]])?network-online\.target([[:space:]]|$)' "$1"
+}
+# new_unit: new's own copy of the unit, extracted once, for byte comparisons.
+NEW_X=/tmp/new-x
+new_unit() {
+  [ -d "${NEW_X}" ] || dpkg-deb -x "${NEW}" "${NEW_X}"
+  echo "${NEW_X}${UNIT}"
+}
+# install_stuck_unit: 0.9.0 installed, its unit (the rows' premise) not yet
+# ordered after network-online.target, and new's unit differing from it.
+install_stuck_unit() {
+  local nu
+  nu="$(new_unit)"
+  require "new ships ${UNIT}" test -f "${nu}"
+  apt_get install "${STUCK}"
+  require "install 0.9.0 exits 0" exit_is 0
+  require "0.9.0 installed ${UNIT}" test -f "${UNIT}"
+  require "0.9.0's unit does not wait for network-online.target" not online "${UNIT}"
+  require "new's unit differs from 0.9.0's" not cmp -s "${nu}" "${UNIT}"
 }
 
 show_conffiles() {
@@ -349,6 +396,36 @@ row() {
       check "0.7.10 installed and configured" state_is "0.7.10 install ok installed"
       check "config byte-identical to the edit" cfg_is "${EDITED}"
       ;;
+    T11)
+      install_stuck_unit
+      apt_get install "${NEW}"
+      check "upgrade exits 0" exit_is 0
+      check "no conffile prompt" no_prompt
+      check "installed and configured" state_is "${new_ver} install ok installed"
+      check "the unit is new's, byte for byte" unit_is "$(new_unit)"
+      check "the unit orders after and wants network-online.target" online "${UNIT}"
+      check "no ${UNIT}.dpkg-* left" no_unit_leftovers
+      ;;
+    T12 | T13)
+      local force=()
+      if [ "$1" = T13 ]; then force=(-o Dpkg::Options::=--force-confold); fi
+      install_stuck_unit
+      edit_unit
+      apt_get install "${force[@]}" "${NEW}"
+      show_conffiles
+      check "the unit is byte-identical to the edit" unit_is "${EDITED_UNIT}"
+      if [ "$1" = T12 ]; then
+        check "upgrade fails at the conffile prompt (exit 100)" exit_is 100
+        check "the prompt names the unit" logged "Configuration file '${UNIT}'"
+        check "new is left unpacked" state_is "${new_ver} install ok unpacked"
+        check "new's unit waits beside it as ${UNIT}.dpkg-new" cmp -s "${UNIT}.dpkg-new" "$(new_unit)"
+      else
+        check "upgrade exits 0" exit_is 0
+        check "no conffile prompt" no_prompt
+        check "installed and configured" state_is "${new_ver} install ok installed"
+        check "new's unit is kept beside it as ${UNIT}.dpkg-dist" cmp -s "${UNIT}.dpkg-dist" "$(new_unit)"
+      fi
+      ;;
     *)
       echo "unknown row: $1"
       exit 2
@@ -449,10 +526,10 @@ host() {
   done <<<"${results}"
 
   if [ "${failed}" -ne 0 ]; then
-    echo "FAIL: the shed-server deb broke the config contract (#109); see the MISS lines above." >&2
+    echo "FAIL: the shed-server deb broke the config contract (#109) or the unit's upgrade rows; see the MISS lines above." >&2
     exit 1
   fi
-  echo "PASS: A1 and T1-T10"
+  echo "PASS: A1 and T1-T13"
 }
 
 case "${1:-}" in

@@ -510,8 +510,10 @@ jobs:
   # snapshot's deb in fresh ubuntu:24.04 containers over the pinned v0.7.10 and
   # v0.9.0 release debs (upgrade, stuck host, reinstall, remove, purge, a later
   # template change, downgrade), with stdin closed as an unattended upgrade
-  # has it, and asserts no prompt and an untouched config. Runs whenever
-  # release-snapshot runs, and is skipped with it.
+  # has it, and asserts no prompt and an untouched config. T11-T13 hold the
+  # systemd unit, which IS a conffile: an unedited one is replaced silently, an
+  # edited one stops at the prompt, and --force-confold keeps the edit. Runs
+  # whenever release-snapshot runs, and is skipped with it.
   server-deb-upgrade:
     name: server deb upgrade (#109)
     needs: release-snapshot
@@ -522,7 +524,7 @@ jobs:
         with:
           name: shed-server-deb-amd64
           path: dist/server
-      - name: Config contract (A1, T1-T10)
+      - name: Config and unit contract (A1, T1-T13)
         run: bash scripts/release/test-deb-upgrade.sh dist/server/shed-server_*_amd64.deb
 
   # ---- desktop / crates legs (imported from shed-desktop's ci.yml) ----------

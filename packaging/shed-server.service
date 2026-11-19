@@ -1,7 +1,12 @@
 [Unit]
 Description=Shed Development Environment Server
-After=network.target docker.service
-Wants=docker.service
+# network-online.target: a server that takes its users from an account service
+# pulls the list at start-up, and a remote-backend server calls its cloud
+# provider; before the network is online both fail. This file is a dpkg
+# conffile: an edited copy makes the upgrade that changes it prompt
+# (scripts/release/test-deb-upgrade.sh, rows T11-T13).
+After=network-online.target docker.service
+Wants=network-online.target docker.service
 
 [Service]
 Type=simple

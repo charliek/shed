@@ -426,6 +426,25 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   matches `kind == "admin"`. A new `ssh` line records each time a person enters a service
   client's shed over SSH, and a new `connect` line each tunnel a person opens into one through
   the HTTPS Connect API (see "Audit log: a person's entry" below).
+- **Deb: an edited `/etc/systemd/system/shed-server.service` makes the upgrade prompt.** The
+  unit is a dpkg conffile and changes in this release (it now waits for the network, see
+  "Changed"). An unedited unit is replaced with no prompt. An edited one makes dpkg ask, and
+  an unattended `apt-get -y` upgrade stops at that prompt (`end of file on stdin at conffile
+  prompt`), the package left unpacked and the edit untouched. To avoid the stop, add
+  `-o Dpkg::Options::=--force-confold` to the upgrade: it keeps your unit and leaves the
+  package's as `shed-server.service.dpkg-dist`; add `network-online.target` to your `After=`
+  and `Wants=` lines. To recover from an upgrade that already stopped, finish the
+  configuration yourself: run `sudo dpkg --configure shed-server` in a terminal and answer
+  the prompt about the unit. If you take the package's version (until then it waits beside
+  yours as `shed-server.service.dpkg-new`), apply your edits to it again; if you keep yours,
+  add `network-online.target` as above. Then `sudo systemctl daemon-reload` and restart the
+  service.
+- **Upgrading the binary does not rewrite a unit `shed-server install` wrote.** Run `sudo
+  shed-server install` again, or add `network-online.target` to its `After=` and `Wants=`
+  lines and `sudo systemctl daemon-reload`, to get the new ordering. Recommended for a server
+  that takes its users from an account service; not required. On a deb install the same path
+  is the package's conffile, so dpkg can replace the unit if you choose the package's
+  version at the prompt.
 
 #### Added
 
@@ -736,6 +755,14 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   user is used only once `config.yaml` records it: if the save fails, the command fails and
   says why. A re-enrolment that cannot read the entry under its lock fails closed, and an
   expired certificate the CLI kept after a refused re-enrolment is never sent.
+- **Server (Linux): `shed-server` is ordered after the host's network-online check.** The
+  deb's unit and the one `shed-server install` writes now order after, and want,
+  `network-online.target` (they ordered after `network.target`). A host with no such check
+  enabled, or whose check times out, still starts the server. A server that takes its users from an account service
+  pulls the list at start-up, and a remote-backend server calls its cloud provider; started
+  before the network was online, a directory server with no kept copy failed its first pull
+  and ran with only its local admins until the next attempt, 15 minutes later. See the
+  upgrade notes above for an edited deb unit and a unit `shed-server install` wrote.
 
 #### Removed
 
