@@ -59,7 +59,10 @@ func GenerateEntry(entry Entry) string {
 	fmt.Fprintf(&sb, "    Port %d\n", entry.Port)
 	fmt.Fprintf(&sb, "    User %s\n", entry.User)
 	if entry.KnownHostsFile != "" {
-		fmt.Fprintf(&sb, "    UserKnownHostsFile %s\n", entry.KnownHostsFile)
+		// Quoted, so a home directory with a space is one file name to ssh
+		// (the keyword takes a list); Entry.Validate keeps the path free of
+		// anything a quoted value would still expand or end on.
+		fmt.Fprintf(&sb, "    UserKnownHostsFile \"%s\"\n", entry.KnownHostsFile)
 	}
 	sb.WriteString(IdentityLines(entry.IdentityFile, "    "))
 

@@ -27,7 +27,7 @@ func TestGenerateEntryIdentityFile(t *testing.T) {
 		"    HostName shed.example.test\n" +
 		"    Port 2222\n" +
 		"    User box\n" +
-		"    UserKnownHostsFile /home/pat/.shed/known_hosts\n"
+		"    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n"
 	if got := GenerateEntry(entry); got != without {
 		t.Errorf("stanza without an identity file =\n%s\nwant\n%s", got, without)
 	}
@@ -110,7 +110,7 @@ func TestAddEntryIfAbsentWritesTheIdentityLines(t *testing.T) {
 		"    HostName shed.example.test\n" +
 		"    Port 2222\n" +
 		"    User box\n" +
-		"    UserKnownHostsFile /home/pat/.shed/known_hosts\n" +
+		"    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n" +
 		identityLinesFor("/home/pat/.ssh/cl\xc3\xa9_travail"))
 	if got.RawContent != want {
 		t.Errorf("entry =\n%s\nwant\n%s", got.RawContent, want)

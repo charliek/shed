@@ -75,7 +75,7 @@ fn the_accepted_entries_read_as_go_reads_them() {
         );
         let stanza = format!(
             "Host shed-{shed}\n    HostName {host}\n    Port {port}\n    User {shed}\n    \
-             UserKnownHostsFile {known_hosts}\n{}",
+             UserKnownHostsFile \"{known_hosts}\"\n{}",
             identity_config_lines(&entry.identity_file, "    ")
         );
         assert_eq!(

@@ -70,6 +70,20 @@ func refusedEntries() []struct {
 		{"a known_hosts path with a line break", with(func(e *Entry) {
 			e.KnownHostsFile = "/home/pat/kh\n    ProxyCommand id"
 		}), "UserKnownHostsFile"},
+		// ssh expands tokens and variables in this path, and reads it as a
+		// list: none of these may be written, quoted or not.
+		{"a known_hosts path with a token", with(func(e *Entry) { e.KnownHostsFile = "/home/pat/%h/known_hosts" }),
+			"UserKnownHostsFile"},
+		{"a known_hosts path with a variable", with(func(e *Entry) { e.KnownHostsFile = "/home/${USER}/known_hosts" }),
+			"UserKnownHostsFile"},
+		{"a known_hosts path with a quote", with(func(e *Entry) { e.KnownHostsFile = `/home/pat/k"h` }),
+			"UserKnownHostsFile"},
+		{"a known_hosts path with a backslash", with(func(e *Entry) { e.KnownHostsFile = `/home/pat/k\h` }),
+			"UserKnownHostsFile"},
+		{"a known_hosts path with a hash", with(func(e *Entry) { e.KnownHostsFile = "/home/pat/k#h" }),
+			"UserKnownHostsFile"},
+		{"a relative known_hosts path", with(func(e *Entry) { e.KnownHostsFile = ".shed/known_hosts" }),
+			"UserKnownHostsFile"},
 		{"an identity file with a quote", with(func(e *Entry) { e.IdentityFile = `/k"ey` }), "IdentityFile"},
 		{"a relative identity file", with(func(e *Entry) { e.IdentityFile = "id_work" }), "IdentityFile"},
 	}...)
@@ -168,5 +182,20 @@ func TestWritersRefuseAnEntryValidateRefuses(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestKnownHostsPathIsOneQuotedValue: UserKnownHostsFile takes a list of file
+// names, so the path is written inside double quotes: a home directory with a
+// space stays one file.
+func TestKnownHostsPathIsOneQuotedValue(t *testing.T) {
+	e := goodEntry()
+	e.KnownHostsFile = "/home/pat x/.shed/known_hosts"
+	if err := e.Validate(); err != nil {
+		t.Fatalf("a path with a space was refused: %v", err)
+	}
+	want := "    UserKnownHostsFile \"/home/pat x/.shed/known_hosts\"\n"
+	if got := GenerateEntry(e); !strings.Contains(got, want) {
+		t.Fatalf("stanza =\n%s\nwant the line %q", got, want)
 	}
 }

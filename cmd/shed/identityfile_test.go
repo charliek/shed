@@ -1181,7 +1181,7 @@ func TestGenerateEntriesIdentityFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	stanza := "Host shed-a\n    HostName shed.example.test\n    Port 2222\n    User a\n" +
-		"    UserKnownHostsFile /home/pat/.shed/known_hosts\n" +
+		"    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n" +
 		"    IdentityFile \"" + key + "\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
 	if got := sshconfig.GenerateEntry(entries[0]); got != stanza {
 		t.Errorf("stanza =\n%s\nwant\n%s", got, stanza)

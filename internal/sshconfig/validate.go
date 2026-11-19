@@ -1,9 +1,9 @@
 package sshconfig
 
 import (
+	"errors"
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/charliek/shed/internal/config"
 	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
@@ -98,8 +98,9 @@ func LiteralHost(host string) bool {
 //     config may hand it to a shell through `%h`, so quoting alone would not
 //     make any other value safe.
 //   - Port: 1 to 65535 (written as a number, so it carries no text).
-//   - KnownHostsFile: no control character (it is written as it is, so a line
-//     break would end the line).
+//   - KnownHostsFile: sdkbootstrap.ValidateIdentityFile's rule (it is written
+//     inside double quotes, as IdentityFile is, and ssh expands `%` tokens
+//     and `$` variables in it).
 //   - IdentityFile: sdkbootstrap.ValidateIdentityFile, the rule that makes it
 //     safe to write inside double quotes as it is.
 func (e Entry) Validate() error {
@@ -124,9 +125,17 @@ func (e Entry) Validate() error {
 	if e.Port < 1 || e.Port > 65535 {
 		return refuse("Port", fmt.Sprint(e.Port), "it is not a port number (1 to 65535)")
 	}
-	for _, r := range e.KnownHostsFile {
-		if unicode.IsControl(r) {
-			return refuse("UserKnownHostsFile", e.KnownHostsFile, "it holds a control character")
+	if e.KnownHostsFile != "" {
+		// The rule that makes IdentityFile safe inside double quotes makes
+		// this path safe there too: absolute, and no line break, quote,
+		// backslash, '#', '%' or '$' (ssh expands tokens and variables in it).
+		if err := sdkbootstrap.ValidateIdentityFile(e.KnownHostsFile); err != nil {
+			reason := err.Error()
+			var ife *sdkbootstrap.IdentityFileError
+			if errors.As(err, &ife) {
+				reason = ife.Reason
+			}
+			return refuse("UserKnownHostsFile", e.KnownHostsFile, reason)
 		}
 	}
 	if e.IdentityFile != "" {

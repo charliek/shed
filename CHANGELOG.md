@@ -287,7 +287,9 @@ All notable changes to this project will be documented in this file.
   skipped, with one warning line naming it escaped, and the other sheds are written; the ssh
   config writer itself refuses any stanza whose alias, user, host name, port or paths could
   change what it says, and writes nothing then; the host name must be a literal host name
-  or address (no `%` token, shell syntax, `=` or leading `-`). An error answer from a
+  or address (no `%` token, shell syntax, `=` or leading `-`), and the `UserKnownHostsFile`
+  path is written quoted (a home directory with a space was read as two files) and held to
+  the rule the `IdentityFile` path has. An error answer from a
   server (a JSON request's or an event stream's), a create's progress lines and warnings, a
   shed's status and status reason, and a server's name are shown with their control
   characters escaped, as other server text is.

@@ -1607,7 +1607,11 @@ DNS name or IPv4 address (ASCII letters, digits, `.`, `-` and `_`, starting
 and ending with a letter or digit) or an IPv6 address (hex digits and `:`, with
 no zone and no brackets). ssh expands `%` tokens in `HostName`, and a
 `ProxyCommand` in your own config can hand it to a shell, so any other value
-is refused, naming the field.
+is refused, naming the field. The `UserKnownHostsFile` path (your
+`~/.shed/known_hosts`) is written inside double quotes, as the `IdentityFile`
+path is, so a home directory with a space is one file to ssh; a path holding
+`%`, `$`, `#`, a quote or a backslash is refused, because ssh would expand or
+split it.
 
 ## Roost Integration
 

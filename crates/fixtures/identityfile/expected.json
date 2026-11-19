@@ -59,7 +59,7 @@
         "cli"
       ],
       "ssh_config_lines": [],
-      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile /home/pat/.shed/known_hosts\n"
+      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n"
     },
     {
       "entry": "plain",
@@ -132,7 +132,7 @@
         "ControlMaster no",
         "ControlPath none"
       ],
-      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile /home/pat/.shed/known_hosts\n    IdentityFile \"/home/pat/.ssh/id_work\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
+      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n    IdentityFile \"/home/pat/.ssh/id_work\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
     },
     {
       "entry": "space",
@@ -205,7 +205,7 @@
         "ControlMaster no",
         "ControlPath none"
       ],
-      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile /home/pat/.shed/known_hosts\n    IdentityFile \"/home/pat/.ssh/id work\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
+      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n    IdentityFile \"/home/pat/.ssh/id work\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
     },
     {
       "entry": "apostrophe",
@@ -278,7 +278,7 @@
         "ControlMaster no",
         "ControlPath none"
       ],
-      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile /home/pat/.shed/known_hosts\n    IdentityFile \"/home/pat/.ssh/pat's key\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
+      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n    IdentityFile \"/home/pat/.ssh/pat's key\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
     },
     {
       "entry": "colon",
@@ -351,7 +351,7 @@
         "ControlMaster no",
         "ControlPath none"
       ],
-      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile /home/pat/.shed/known_hosts\n    IdentityFile \"/home/pat/.ssh/id:work\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
+      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n    IdentityFile \"/home/pat/.ssh/id:work\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
     },
     {
       "entry": "colon-space",
@@ -424,7 +424,7 @@
         "ControlMaster no",
         "ControlPath none"
       ],
-      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile /home/pat/.shed/known_hosts\n    IdentityFile \"/home/pat/.ssh/keys: work\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
+      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n    IdentityFile \"/home/pat/.ssh/keys: work\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
     },
     {
       "entry": "non-ascii",
@@ -497,7 +497,7 @@
         "ControlMaster no",
         "ControlPath none"
       ],
-      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile /home/pat/.shed/known_hosts\n    IdentityFile \"/home/pat/.ssh/clé_travail\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
+      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n    IdentityFile \"/home/pat/.ssh/clé_travail\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
     },
     {
       "entry": "tab-inside",
@@ -570,7 +570,7 @@
         "ControlMaster no",
         "ControlPath none"
       ],
-      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile /home/pat/.shed/known_hosts\n    IdentityFile \"/home/pat/.ssh/id\twork\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
+      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n    IdentityFile \"/home/pat/.ssh/id\twork\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
     },
     {
       "entry": "nbsp-inside",
@@ -643,7 +643,7 @@
         "ControlMaster no",
         "ControlPath none"
       ],
-      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile /home/pat/.shed/known_hosts\n    IdentityFile \"/home/pat/.ssh/id work\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
+      "ssh_config_stanza": "Host shed-box\n    HostName shed.example.test\n    Port 2222\n    User box\n    UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n    IdentityFile \"/home/pat/.ssh/id work\"\n    IdentitiesOnly yes\n    ControlMaster no\n    ControlPath none\n"
     }
   ],
   "refused": [

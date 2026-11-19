@@ -67,7 +67,7 @@ func TestAddToAMissingFile(t *testing.T) {
 	for _, want := range []string{
 		BeginMarker, EndMarker,
 		"Host shed-demo\n", "    HostName localhost\n", "    Port 2222\n",
-		"    User demo\n", "    UserKnownHostsFile /home/me/.shed/known_hosts\n",
+		"    User demo\n", "    UserKnownHostsFile \"/home/me/.shed/known_hosts\"\n",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("the written config is missing %q:\n%s", want, got)
@@ -133,13 +133,13 @@ Host shed-alpha
     HostName localhost
     Port 2222
     User alpha
-    UserKnownHostsFile /home/me/.shed/known_hosts
+    UserKnownHostsFile "/home/me/.shed/known_hosts"
 
 Host shed-beta
     HostName mini3
     Port 22
     User beta
-    UserKnownHostsFile /home/me/.shed/known_hosts
+    UserKnownHostsFile "/home/me/.shed/known_hosts"
 ` + EndMarker + `
 
 # below the block
