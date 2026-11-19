@@ -1,0 +1,36 @@
+{
+  "name": "directory-token-not-yet-valid",
+  "description": "A token signed with the service's own key for the live server srv-a, whose nbf is 120 seconds after the service's clock (beyond the leeway): 401 invalid_token.",
+  "token": {
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "scope": [
+      "directory:read"
+    ],
+    "nbf_offset": 120
+  },
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {
+      "Authorization": "Bearer {{access_token}}"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

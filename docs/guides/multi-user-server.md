@@ -8,7 +8,10 @@ directories, server mounts and the image store.
 
 This guide adds a user list to an mtls server. The rules it relies on are in
 [Security › Ownership](../reference/security.md#ownership), and every field is
-in [Configuration › Users](../reference/configuration.md#users).
+in [Configuration › Users](../reference/configuration.md#users). To take the
+list from an account service instead, with local admins in the config, see the
+[User Directory guide](user-directory.md); ownership, admins and what is
+admin-only work as described here.
 
 Users separate people who trust the host and its admins. They are not
 isolation between hostile tenants: an admin controls the host directories,

@@ -21,6 +21,7 @@ import (
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/directory"
 	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/plugin"
@@ -461,14 +462,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ssh auth: %w", err)
 	}
 	log.Printf("SSH auth mode: %s", userLookup.Mode())
-	if names := cfg.UserNames(); len(names) > 0 {
+	dirUsers, _ := userLookup.(*directory.Runtime)
+	switch names := cfg.UserNames(); {
+	case dirUsers != nil:
+		for _, line := range directoryStartupLines(cfg, dirUsers, time.Now()) {
+			log.Printf("%s", line)
+		}
+	case len(names) > 0:
 		log.Printf("Users: %s (each key belongs to one user; an unknown key is nobody's)", strings.Join(names, ", "))
-	} else {
+	default:
 		log.Printf("Users: none configured (every accepted key is the implicit user, an admin)")
 	}
 
-	// Refresh GitHub-seeded keys in the background until shutdown.
-	userLookup.StartRefresh(refreshCtx)
+	// Refresh GitHub-seeded keys in the background until shutdown. A
+	// directory server starts its pulls once the SSH server exists (below),
+	// so that every publication of its list can close connections.
+	if dirUsers == nil {
+		userLookup.StartRefresh(refreshCtx)
+	}
 
 	// The access guard: the one door both front doors call the backend
 	// through. It applies the access rule (internal/backend/access.go) for
@@ -479,15 +490,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 	guard := backend.NewGuard(be)
 
 	// Initialize SSH server
-	sshServer, err := sshd.NewServer(guard, hostKeyPath, cfg.SSHListenAddr(), cfg.Terminal, sshd.KeyAuth{
-		Mode:         userLookup.Mode(),
-		MaxAuthTries: userLookup.MaxAuthTries(),
-		Users:        userLookup,
-	})
+	sshServer, err := sshd.NewServer(guard, hostKeyPath, cfg.SSHListenAddr(), cfg.Terminal, sshKeyAuth(userLookup))
 	if err != nil {
 		return fmt.Errorf("failed to create SSH server: %w", err)
 	}
 	hostKey := sshServer.GetHostPublicKey()
+	if dirUsers != nil {
+		// Every publication of the list closes the SSH connections of users
+		// it no longer has; then the pulls and the trust watch start, until
+		// shutdown.
+		closeOnPublication(dirUsers, sshServer)
+		userLookup.StartRefresh(refreshCtx)
+	}
 
 	// Client CA (mtls mode only): the internal root that signs the short-lived
 	// client certificates issued over the SSH bootstrap channel, and the trust
@@ -657,42 +671,75 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Stopping the max_age reaper...")
 	}
 	stopReaper()
-	// GitHub key fetches end now: none in flight outlives the shutdown.
-	cancelRefresh()
 
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
+	shutdownServers := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
 
-	// Credential-bus streams never end on their own, so a graceful
-	// shutdown would wait out its whole timeout for them: close them (and
-	// refuse new subscriptions) first.
-	log.Printf("Closing credential bus streams...")
-	pluginRegistry.Close()
+		// Credential-bus streams never end on their own, so a graceful
+		// shutdown would wait out its whole timeout for them: close them (and
+		// refuse new subscriptions) first.
+		log.Printf("Closing credential bus streams...")
+		pluginRegistry.Close()
 
-	// Shutdown HTTP server (when serving — skipped in mtls mode)
-	if httpServer != nil {
-		log.Printf("Shutting down HTTP server...")
-		if err := httpServer.Shutdown(ctx); err != nil {
-			log.Printf("HTTP server shutdown error: %v", err)
+		// Shutdown HTTP server (when serving — skipped in mtls mode)
+		if httpServer != nil {
+			log.Printf("Shutting down HTTP server...")
+			if err := httpServer.Shutdown(ctx); err != nil {
+				log.Printf("HTTP server shutdown error: %v", err)
+			}
+		}
+
+		// Shutdown HTTPS server (when enabled)
+		if httpsServer != nil {
+			log.Printf("Shutting down HTTPS server...")
+			if err := httpsServer.Shutdown(ctx); err != nil {
+				log.Printf("HTTPS server shutdown error: %v", err)
+			}
+		}
+
+		// Shutdown SSH server
+		log.Printf("Shutting down SSH server...")
+		if err := sshServer.Shutdown(ctx); err != nil {
+			log.Printf("SSH server shutdown error: %v", err)
 		}
 	}
-
-	// Shutdown HTTPS server (when enabled)
-	if httpsServer != nil {
-		log.Printf("Shutting down HTTPS server...")
-		if err := httpsServer.Shutdown(ctx); err != nil {
-			log.Printf("HTTPS server shutdown error: %v", err)
-		}
+	var checkTrust func(context.Context) error
+	if dirUsers != nil {
+		checkTrust = dirUsers.CheckTrustAtStop
 	}
-
-	// Shutdown SSH server
-	log.Printf("Shutting down SSH server...")
-	if err := sshServer.Shutdown(ctx); err != nil {
-		log.Printf("SSH server shutdown error: %v", err)
-	}
+	stopUserSource(checkTrust, directory.StopTrustBound, cancelRefresh, shutdownServers, log.Printf)
 
 	log.Printf("Shutdown complete")
 	return nil
+}
+
+// stopUserSource is the user source's part of a graceful stop, around the
+// servers' shutdown (shutdown). GitHub key fetches (or a directory's pulls
+// and trust watch) end first (cancelRefresh): none in flight outlives the
+// shutdown. On a directory server (checkTrust set: its runtime's
+// CheckTrustAtStop) the kept copy is then fenced, so no pull writes it from
+// that moment, and the trust time is checked at once (an ended copy is
+// removed); and once more as the last thing the server does with the
+// directory, after the servers have finished shutting down, so a trust time
+// that ends during a slow shutdown is caught too. Each check is waited for
+// up to bound; the warning that one did not finish is written without
+// waiting (a stuck log writer never holds the exit).
+func stopUserSource(checkTrust func(context.Context) error, bound time.Duration, cancelRefresh, shutdown func(), logf func(string, ...any)) {
+	cancelRefresh()
+	check := func() {
+		if checkTrust == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), bound)
+		defer cancel()
+		if err := checkTrust(ctx); err != nil {
+			go logf("directory: WARNING: the trust time's check at stop did not finish within %s (%v); if the trust time has ended, the kept copy may remain on disk", bound, err)
+		}
+	}
+	check()
+	shutdown()
+	check()
 }
 
 // upgradePassTimeout bounds the start-up pass over sheds with no user. On the
@@ -747,7 +794,7 @@ func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir st
 	// bindings' step and the pass below follow the same recipient at every
 	// start until the step is done.
 	plan := upgrade.Begin(users, time.Now())
-	if err := applySourceUpgrade(bindings, plan, cfg.UserNames()); err != nil {
+	if err := applySourceUpgrade(bindings, plan, cfg.UserNames(), !cfg.DirectoryConfigured()); err != nil {
 		return backend.UpgradeReport{}, upgrade, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), upgradePassTimeout)
@@ -790,10 +837,14 @@ func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir st
 //     user alone when there is no user list), so a name configured again
 //     later starts clean. With no user list nothing is adopted, and only
 //     named users' records (unreachable without a user list) are dropped.
+//     Not on a directory server (retain false): names are then the local
+//     admins only, the list's people are not known at start, and dropping
+//     every other user's records would drop each list person's at every
+//     start.
 //
 // A store that cannot be written fails the start; the marker still says what
 // the next start does.
-func applySourceUpgrade(b source.Bindings, plan backend.UpgradePlan, names []string) error {
+func applySourceUpgrade(b source.Bindings, plan backend.UpgradePlan, names []string, retain bool) error {
 	if b == nil {
 		return nil
 	}
@@ -825,6 +876,9 @@ func applySourceUpgrade(b source.Bindings, plan backend.UpgradePlan, names []str
 		}
 	case plan.Deferred:
 		keep = append(append([]string(nil), names...), source.ImplicitUser)
+	}
+	if !retain {
+		return nil
 	}
 	dropped, err := b.RetainUsers(keep)
 	if err != nil {
@@ -862,24 +916,71 @@ func newPluginBridge(cfg *config.ServerConfig, reg *plugin.Registry) *plugin.Bri
 	return plugin.NewBridge(reg, cfg.UsersConfigured())
 }
 
-// newUserLookup builds the user lookup both front doors ask: the SSH key
-// allowlist (auth.ssh, default off = accept all) with every key the implicit
-// user's, or, with auth.users, each user's keys. GitHub-seeded keys are cached
-// in stateDir/github_keys, and each GitHub login is pinned to its numeric
-// account id at its first good fetch, in the pin store next to the cache (a
-// user's github_id, when configured, wins). Every fetch is bound to ctx.
-func newUserLookup(ctx context.Context, cfg *config.ServerConfig, stateDir string) (*users.ConfigLookup, error) {
+// userSource is the user lookup serve builds, whichever kind it is: a
+// users.ConfigLookup (no user list, or auth.users) or a directory.Runtime
+// (auth.directory). Both front doors ask it; serve also asks it for the SSH
+// mode and attempt cap, and starts its background refresh.
+type userSource interface {
+	users.Lookup
+	users.Refresher
+	Mode() string
+	MaxAuthTries() int
+	StartRefresh(ctx context.Context)
+}
+
+var (
+	_ userSource = (*users.ConfigLookup)(nil)
+	_ userSource = (*directory.Runtime)(nil)
+)
+
+// sshKeyAuth is the SSH server's key auth over l. A directory server's users
+// change while it runs, so every authenticated connection is tracked by its
+// user (closeOnPublication closes those of a user who leaves); no other
+// server tracks any.
+func sshKeyAuth(l userSource) sshd.KeyAuth {
+	_, dir := l.(*directory.Runtime)
+	return sshd.KeyAuth{
+		Mode:             l.Mode(),
+		MaxAuthTries:     l.MaxAuthTries(),
+		Users:            l,
+		TrackConnections: dir,
+	}
+}
+
+// closeOnPublication makes every publication of rt's list (a pull, the end of
+// its trust time, a withdrawal) close the SSH connections of users the new
+// state no longer has.
+func closeOnPublication(rt *directory.Runtime, s *sshd.Server) {
+	rt.SetPublicationHook(func(p directory.Publication) { s.CloseConnectionsExcept(p.Has) })
+}
+
+// newUserLookup builds the user lookup both front doors ask. With
+// auth.directory it is the directory's (newDirectoryUsers). Otherwise it is
+// the SSH key allowlist (auth.ssh, default off = accept all) with every key
+// the implicit user's, or, with auth.users, each user's keys. GitHub-seeded
+// keys are cached in stateDir/github_keys, and each GitHub login is pinned to
+// its numeric account id at its first good fetch, in the pin store next to
+// the cache (a user's github_id, when configured, wins). Every fetch is
+// bound to ctx.
+func newUserLookup(ctx context.Context, cfg *config.ServerConfig, stateDir string) (userSource, error) {
+	if cfg.DirectoryConfigured() {
+		return newDirectoryUsers(cfg, stateDir)
+	}
 	var list map[string]config.UserConfig
 	if cfg.UsersConfigured() {
 		list = cfg.Auth.Users
 	}
-	return users.NewConfigLookup(users.ConfigOptions{
+	l, err := users.NewConfigLookup(users.ConfigOptions{
 		SSH:            cfg.EffectiveSSHAuth(),
 		GitHubCacheDir: filepath.Join(stateDir, "github_keys"),
 		PinsPath:       filepath.Join(stateDir, users.PinsFileName),
 		Context:        ctx,
 		Users:          list,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return l, nil
 }
 
 // configWatchPath names the config file in a startup stall line: the --config

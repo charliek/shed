@@ -1,0 +1,6 @@
+{
+  "line": "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIOVzZKKwOmTO0hU1SOKYkhX1xXdv5o1do9QKlxN4ibbxAAAAAA==",
+  "canonical": "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIOVzZKKwOmTO0hU1SOKYkhX1xXdv5o1do9QKlxN4ibbxAAAAAA==",
+  "fingerprint": "SHA256:YbMWFDBaUEQ9jxueB/xclYMflRrk1tQbkuCFnPjgGBg",
+  "algorithm": "sk-ssh-ed25519@openssh.com"
+}

@@ -67,6 +67,7 @@ var clientForbiddenList = []string{
 	"POST /api/egress/{name}",
 	"DELETE /api/egress/{name}",
 	"POST /api/users/refresh",
+	"GET /api/users/status",
 	"GET /api/sources",
 	"POST /api/sources/use",
 	"GET /api/plugins/listeners",

@@ -1,0 +1,37 @@
+{
+  "name": "enroll-code-expired",
+  "description": "A code past its expiry, never used: 410 ENROLMENT_CODE_EXPIRED.",
+  "request": {
+    "method": "POST",
+    "path": "/v1/servers/enroll",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "code": "expired-code-for-srv-e-0000000000000",
+      "name": "build-1.example.test",
+      "public_key": {
+        "crv": "Ed25519",
+        "kty": "OKP",
+        "x": "NHeag29J2Xiwi2c44mZPGMwy4iqkMSHXAs3I7EdsKEc"
+      }
+    }
+  },
+  "response": {
+    "status": 410,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "error": {
+        "code": "ENROLMENT_CODE_EXPIRED",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

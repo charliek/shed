@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-seconds",
+  "description": "429 with Retry-After: 120: a failed refresh, retried no sooner than 120 seconds (rule 2).",
+  "response": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "120"
+    },
+    "body": {
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": 120
+  }
+}

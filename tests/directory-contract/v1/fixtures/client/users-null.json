@@ -1,0 +1,25 @@
+{
+  "name": "users-null",
+  "description": "users is null, not an array: the whole answer is refused (rule 6).",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "contract": 1,
+      "organization": "example",
+      "version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "generated_at": "2026-11-16T06:00:00Z",
+      "rules": {
+        "version": 0
+      },
+      "users": null
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

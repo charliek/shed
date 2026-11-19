@@ -67,6 +67,11 @@ type Server struct {
 	// missingID logs a credential-bus request with no valid machine headers
 	// once per caller (a released broker retries every few seconds).
 	missingID missingIDLog
+
+	// busNow, when set (by tests only, before any stream opens), is the clock
+	// a directory server's credential-bus stream checks its caller's
+	// certificate on before each message (busCallerCheck); nil is time.Now.
+	busNow func() time.Time
 }
 
 // SetSourceBindings gives the credential bus its source bindings (the pin):
@@ -242,6 +247,9 @@ func (s *Server) Router() chi.Router {
 
 		// Users: fetch the GitHub logins again (admin only; control scope).
 		r.Post("/users/refresh", s.handleUsersRefresh)
+		// Users: where they come from and, on a directory server, the
+		// state of its list (admin only; control scope).
+		r.Get("/users/status", s.handleUsersStatus)
 
 		// Credential sources: which of a user's machines answers their
 		// credential requests, and moving that (control scope: outside

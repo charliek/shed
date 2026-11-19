@@ -1,0 +1,29 @@
+{
+  "name": "directory-invalid-token",
+  "description": "A token the service signed for the live server srv-a that expired on 2026-01-01: 401 invalid_token with WWW-Authenticate, as for any token that does not verify (another issuer's or audience's, a forged signature, a server that no longer exists). Log in again, once, then treat it as a failed refresh.",
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {
+      "Authorization": "Bearer eyJ0eXAiOiJhdCtqd3QiLCJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qtc2lnbmluZy0xIn0.eyJhdWQiOlsiaHR0cHM6Ly9hY2NvdW50cy5leGFtcGxlLnRlc3QvdjEiXSwiY2xpZW50X2lkIjoic3J2XzBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhIiwiZXhwIjoxNzY3MjI2MjAwLCJndHkiOiJjbGllbnRfY3JlZGVudGlhbHMiLCJpYXQiOjE3NjcyMjU2MDAsImlzcyI6Imh0dHBzOi8vYWNjb3VudHMuZXhhbXBsZS50ZXN0IiwianRpIjoidGVzdC1zcnZfMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEtMTc2NzIyNTYwMCIsIm5iZiI6MTc2NzIyNTYwMCwic2NwIjpbImRpcmVjdG9yeTpyZWFkIl0sInN1YiI6InNydl8wYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYTBhMGEwYSJ9.Umd1EYMnM9c_7L-lWrdUwSFrXSfNlrx5XPIZByGiT68Zhk4ZENe5e0_WhBVz_GHbAepNvNhFhilQmd5FDRx_P7x-tYNZLMOFWJfI1YX4Asqvqf2l_vY1Db8VhvhhrifL9oQ0544g7isNExVNoC6XFapxXE921974r-xheK6GiuUjLqt5pdmwMfoqQNEq6yBNkjLzGTyqgtCZ9JHNRBks5LCiYQvalfQfHh6xV2g4vWY1h2a29vQZi_6wa9k1DCIqNYX00Gxqkbjxi9ZS2hiq75peM-GjYjjKVuBsVjH1a6Zr4rb7aR47BDBwlZZI5KpyQfn47cX6S9_3TdsijXV7UQ"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

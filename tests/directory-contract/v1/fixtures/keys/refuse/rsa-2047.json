@@ -1,0 +1,5 @@
+{
+  "line": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAEAkoH8cVhqqNZcyEoSkE7STnYdHdMRT3YRdlitY3vpBUBsX0OdChnOVpSNfNvM3hL2i4cdKZwA6WVKy3Rq0/08uXdue1sLccQfKZG6lcyqWSFwYaXRTCZ07yAqumwcbf3vE/5OVfMYlYdjFq8ed102gi699gMlwI1T2aHDVcMToaO+PgOzQDiI8RU157Nwtruyy2w4CmplvuvQQ+Q7Hq/KUVcsF4v3KwxuYSeVJkEwOmv55xOOFghbeesDK75LfntE1SbpHNsNSGWCkbktqTtDsgu2bSBHevSl3lb4nMPNi+11JaCti1IYW5UTqbBfo3lrLmqwPo4aqhCbFRCSGR5s=",
+  "code": "RSA_TOO_SHORT",
+  "shed_also_refuses": false
+}

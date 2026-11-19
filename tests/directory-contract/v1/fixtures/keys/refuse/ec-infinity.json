@@ -1,0 +1,5 @@
+{
+  "line": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAAABAA==",
+  "code": "EC_POINT_ENCODING",
+  "shed_also_refuses": true
+}

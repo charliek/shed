@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-malformed",
+  "description": "503 with a negative Retry-After: a sign is not a digit, so treated as absent (rule 2).",
+  "response": {
+    "status": 503,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "-5"
+    },
+    "body": {
+      "error": {
+        "code": "UNAVAILABLE",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

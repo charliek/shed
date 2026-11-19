@@ -1,0 +1,64 @@
+{
+  "name": "key-expires-offset-24",
+  "description": "bob's only key has expires 2027-01-01T00:00:00+24:00. An offset's hour is 00 to 23 (rule 7), so the key is not used and bob, left with none, is skipped; ada stands.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "contract": 1,
+      "organization": "example",
+      "version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "generated_at": "2026-11-16T06:00:00Z",
+      "rules": {
+        "version": 0
+      },
+      "users": [
+        {
+          "name": "ada",
+          "admin": true,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+              "label": "laptop"
+            }
+          ]
+        },
+        {
+          "name": "bob",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+              "label": "laptop",
+              "expires": "2027-01-01T00:00:00+24:00"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          }
+        ]
+      }
+    ],
+    "skipped": [
+      {
+        "entry": 1,
+        "reason": "no-usable-key"
+      }
+    ]
+  }
+}

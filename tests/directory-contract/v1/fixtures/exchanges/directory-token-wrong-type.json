@@ -1,0 +1,36 @@
+{
+  "name": "directory-token-wrong-type",
+  "description": "A token signed with the service's own key for the live server srv-a, valid in every claim, whose header typ is JWT rather than at+jwt: 401 invalid_token.",
+  "token": {
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "scope": [
+      "directory:read"
+    ],
+    "typ": "JWT"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {
+      "Authorization": "Bearer {{access_token}}"
+    },
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

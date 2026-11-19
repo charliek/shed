@@ -397,6 +397,12 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
 - **Development:** the Firecracker dev entry from when that server ran open is plain HTTP and
   does not heal: remove it and add it again with `shed server add <host> --ssh-port 12222
   --name <host>-dev`.
+- **Switching a server to `auth.directory` is a fresh start**: there is no migration, and
+  names decide ownership (a list person named like an earlier user receives that user's
+  sheds and credential-source records). Whoever controls the account service controls the
+  host of every server enrolled with it (a list admin is an admin there), and the trust time
+  needs an accurate host clock. See the [upgrade
+  guide](https://charliek.github.io/shed/upgrades/v0.9.1-to-v0.10.0/#users-from-an-account-service).
 
 #### Added
 
@@ -415,6 +421,45 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   listed. `409 SHED_ALREADY_ASSIGNED` and `409 SHED_HOST_RESOURCES` refuse the rest.
 - **Server and CLI: `shed users refresh`** (`POST /api/users/refresh`, admin) fetches every
   GitHub login's keys now.
+- **Server: users from an account service (`auth.directory`, `mtls` only, optional).** The
+  server takes its users from a service that holds people and their SSH login keys, beside
+  **local admins** in `auth.users` (at least one; admins with keys only, no GitHub login or
+  script key), who log in whatever state the service is in. It enrols once, signs in with
+  OAuth 2.0 client credentials and a JWT client assertion (an Ed25519 key made at
+  enrolment), pulls the list every `refresh` (default `24h`; 15 minutes after a failure, or
+  the service's `Retry-After` in seconds up to one hour), writes a kept copy
+  (`{state_dir}/directory/users.json`) before using each list, and honours it for `trust`
+  (default `72h`) while it cannot reach the service; when that ends only the local admins can
+  log in and the kept copy is removed. Each entry is decoded alone: an entry with a bad
+  name, a name or key listed twice, no usable key (a key's identity is its blob; `expires`
+  is an RFC 3339 instant only), a local admin's name or key, or an `auth.clients` name is
+  skipped and logged. A person added on the service logs in with no restart (their first SSH
+  login pulls the list: at most once a minute while pulls succeed, once per 15 minutes while
+  they fail, the login waiting at most 8 s); a person removed loses their SSH connections at
+  the next pull. Certificates issued before certificates named a user are refused on such a
+  server. See the [User Directory
+  guide](https://charliek.github.io/shed/guides/user-directory/).
+- **Server: `shed-server directory enroll [--name <name>]`** enrols the server with the
+  service at `auth.directory.url`, once, writing `{state_dir}/directory/enrolment.json` (mode
+  `0600`). It reads the one-time code from standard input only (a prompt that does not echo
+  at a terminal), never waits for another run's lock, refuses a server already enrolled, and
+  on a lost answer writes nothing and says how to recover.
+- **Server and CLI: `shed users status`** (`GET /api/users/status`, admin; refused to a script
+  key) shows where a server's users come from (`config`, `directory` or `none`) and who they
+  are, never their keys; on a directory server also the list's state, last good pull,
+  version, trust time left, last error, next attempt, kept copy and skipped entries. On a
+  directory server `shed users refresh` pulls the list now, prints the pull's row (the
+  answer's new `directory` member), and exits 1 when the pull failed.
+- **The directory contract, in this repository** (`tests/directory-contract/`), as the source
+  of truth for both sides: an implementation copies `v1/` whole from a shed commit and checks
+  it with `sha256sum -c MANIFEST.sha256`. Compared with the draft the first service was built
+  to, version 1 has no `github` member (a reader ignores members it does not know), reads
+  `Retry-After` as delta-seconds only, and writes down what the draft left open: the JSON
+  checks every answer passes, how error codes are found, reading one byte past a size limit,
+  `contract` as the integer 1, the `expires` grammar, and label uniqueness counting every key.
+  Go tests hold shed's client to its fixtures, and an in-tree reference server
+  (`make directory-ref`, loopback and plain HTTP only, for tests) to every recorded exchange.
+  See [Directory Contract](https://charliek.github.io/shed/reference/directory-contract/).
 - **Server, CLI and desktop: the credential source.** One machine answers each user's
   credential requests on a server: the first to connect, until moved. Each broker has a machine
   identity (`machine.json`, shown by `shed-host-agent status`) and sends it as
@@ -436,6 +481,11 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
 - **Development:** `SHED_DEV_USERS=itest` starts the dev servers with the suite's user list;
   the suite gains `test_users.py`, `test_users_upgrade.py` and `test_source_pin.py`, with
   `SHED_ITEST_USERS` and `SHED_ITEST_USERS_DIR`.
+- **Development: `make test-integration-directory`** (Linux only) builds `bin/` and the
+  reference server, then runs the suite's one self-managed module, which starts its own
+  reference server and a private `shed-server` on loopback for each case and never touches an
+  installed or dev server. The module skips under every other target with a message naming
+  this one. Not in CI; its fixture unit tests run in `make test-integration-units`.
 
 #### Changed
 

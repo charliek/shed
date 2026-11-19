@@ -1,0 +1,5 @@
+{
+  "line": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQCu4/ELl2TAUvJyYKxBQ8PdFlLqs0k2VzZMImHwjlYXlZXw0oWA+UnDGkqP9xwZoLLSodOfD66Pxe1UV/aMrBUWcETWY0US4Y4hVsXbd7V7RI+an1bn5GHT5VkfiNZ/I7UJ+/V7MmqMHPDtej7NgsJBmGrWqom02D45SUtF/bO+fQ== corpus-rsa-1024",
+  "code": "RSA_TOO_SHORT",
+  "shed_also_refuses": false
+}

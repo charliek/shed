@@ -1,0 +1,75 @@
+{
+  "name": "enroll-public-key-in-use",
+  "description": "A key an enrolled server already holds (srv-a's): 409 PUBLIC_KEY_IN_USE, and the code stays unspent: the same code then enrols with a key of its own.",
+  "request": {
+    "method": "POST",
+    "path": "/v1/servers/enroll",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "code": "pending-code-for-srv-c-0000000000000",
+      "name": "build-1.example.test",
+      "public_key": {
+        "crv": "Ed25519",
+        "kty": "OKP",
+        "x": "7-iGf8mkKzS2jTSNmrFW_kpXGFrMRrVckdxsVnHI6lM"
+      }
+    }
+  },
+  "response": {
+    "status": 409,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "error": {
+        "code": "PUBLIC_KEY_IN_USE",
+        "message": "{{message}}"
+      }
+    }
+  },
+  "then": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/v1/servers/enroll",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "code": "pending-code-for-srv-c-0000000000000",
+          "name": "build-1.example.test",
+          "public_key": {
+            "crv": "Ed25519",
+            "kty": "OKP",
+            "x": "NHeag29J2Xiwi2c44mZPGMwy4iqkMSHXAs3I7EdsKEc"
+          }
+        }
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "client_id": "{{client_id}}",
+          "contract": 1,
+          "issuer": "https://accounts.example.test",
+          "organization": "example",
+          "token_endpoint": "https://accounts.example.test/oauth2/token"
+        }
+      }
+    }
+  ]
+}

@@ -132,7 +132,8 @@ Current clients still speak the token protocol to servers older than v0.10.0.
 |-------|------|---------|-------------|
 | `auth.mode` | string | `open` | `open` enforces nothing (plain HTTP, loopback only); `mtls` derives SSH-allowlist enforce + client-certificate enforce + TLS-only (`https_port` defaults to `8443`; **no plain-HTTP listener is served**), and **fails to start without a key source**. `token` and `secure` were removed in v0.10.0 and fail config load. |
 | `auth.token_ttl` | duration | `24h` | Lifetime of an issued client certificate (the name is kept from the removed token mode). Clients re-enroll transparently near expiry / on an auth failure. |
-| `auth.users` | map | `{}` | Named users, keyed by name. **Requires `auth.mode: mtls`**, and replaces `auth.ssh`'s key sources. See [Users](#users). |
+| `auth.users` | map | `{}` | Named users, keyed by name. **Requires `auth.mode: mtls`**, and replaces `auth.ssh`'s key sources. See [Users](#users). Beside `auth.directory`, the local admins only. |
+| `auth.directory` | object | - | Take the users from an account service. **Requires `auth.mode: mtls`** and at least one local admin in `auth.users`. See [Users from an account service](#users-from-an-account-service). |
 | `auth.clients` | map | `{}` | Service clients, keyed by name. **Requires `auth.mode: mtls`** (refused at load otherwise). See [Service clients](#service-clients). |
 
 Keys removed in earlier releases (`public_exposure`, `auth.http`,
@@ -240,6 +241,78 @@ Config load refuses, naming the field:
 `auth.users: {}` is the same as no user list. An expired key is not a load
 error: it is simply not accepted, and the server logs it at start.
 
+### Users from an account service
+
+`auth.directory` takes the server's users from an **account service**: a
+service that holds people and their SSH login keys and hands an enrolled
+server its user list over the [directory contract](directory-contract.md).
+Beside it, `auth.users` holds the **local admins** only: admins whose keys are
+in this config, who can log in whatever state the service is in. Everyone else
+comes from the service's list. The [User Directory
+guide](../guides/user-directory.md) walks through enrolling a server; the
+security model is in [Security › Users from an account
+service](security.md#users-from-an-account-service).
+
+```yaml
+auth:
+  mode: mtls                       # required
+  users:                           # beside a directory: the local admins only
+    admin:
+      admin: true
+      keys:
+        - key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... admin@laptop
+          label: laptop
+  directory:
+    url: https://accounts.example.test   # the service's issuer: an origin, no path
+    organization: example                 # optional
+    refresh: 24h
+    trust: 72h
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth.directory.url` | string | required | The service's issuer: an origin (scheme, host and optional port) with no path, query, fragment or user info, the host written plainly (ASCII letters, digits, `-` and `.`, an IPv4 address, or an IPv6 address in brackets). One trailing `/` is dropped; the result is compared byte for byte with the issuer the service names, and is the audience of the server's sign-in. `https://`, or `http://` only with `allow_plain_http`. |
+| `auth.directory.organization` | string | - | The organization every answer must name (`^[a-z][a-z0-9-]{0,62}$`). Unset, the server accepts the organization its enrolment answer named. |
+| `auth.directory.refresh` | duration | `24h` | How long after a good pull the next one is due. From `1m` to `168h` (7 days). |
+| `auth.directory.trust` | duration | `72h` | How long after a good pull its list is honoured while no newer one arrives. From `refresh` to `720h` (30 days). After it only the local admins can log in until a good pull. |
+| `auth.directory.allow_plain_http` | bool | `false` | Permits an `http://` URL, and only on a loopback host (`localhost`, `127.0.0.0/8`, `::1`). For tests and trials with the [reference server](directory-contract.md#the-reference-server). `true` or `false` only. |
+
+Durations are Go durations (`90m`, `168h`); a day is written in hours.
+
+Config load refuses, naming the field:
+
+- `auth.directory` with any `auth.mode` but `mtls` (`auth.directory requires
+  auth.mode: mtls`);
+- no local admin (`auth.directory needs at least one local admin in
+  auth.users (admin: true, with a key): the local admins are the users who can
+  log in whatever state the directory is in`);
+- an `auth.users` entry without `admin: true`, with `github` or `github_id`,
+  or with a key marked `script` (a local admin has keys only);
+- a `url` that is missing, not an origin, not written plainly, or plain HTTP
+  without `allow_plain_http`; `allow_plain_http: true` beside a host that is
+  not loopback;
+- an `organization` that does not match the pattern;
+- a `refresh` or `trust` out of its range (a value written as `0` is out of
+  range; omit the field for the default);
+- an unknown key, a key written twice, a merge key (`<<`) or a key with no
+  value under `auth.directory`.
+
+Every rule of [Users](#users) still applies to the local admins: `mtls`, no
+`auth.ssh` key source beside them (so no `github_users`), names, labels and
+keys. `auth.ssh.max_auth_tries` applies; `github_refresh` has nothing to
+fetch.
+
+Fixed, not settings: the retry 15 minutes after a failed pull; the longest
+`Retry-After` the server honours, one hour; one pull's bound, 30 seconds; and
+the state directory `{state_dir}/directory/` (mode `0700`), which holds
+`enrolment.json` (the enrolment and this server's private key) and `users.json`
+(the kept copy of the last good pull), each mode `0600`. There is no setting
+to ignore the list's admin flag.
+
+`shed-server config-validate` prints the directory's summary, for example
+`users: from the directory at https://accounts.example.test (organization
+example), refresh 24h0m0s, trust 72h0m0s` and `local admins: admin`.
+
 ### TLS and network surface
 
 TLS and network-surface fields. HTTP credential enforcement is **not** an
@@ -254,7 +327,7 @@ in mtls mode. See
 | `https_port` | int | `8443` in mtls mode | Serve HTTPS with a self-signed, client-pinned cert, bound to `bind_address`. **Requires `auth.mode: mtls`** (rejected in open mode); defaults to `8443` there. It is the *only* listener — no plain HTTP is served — and it runs `RequireAndVerifyClientCert` against the internal CA (see [mTLS mode](security.md#mtls-mode)). |
 | `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs (on the server's own leaf; unrelated to the mtls client-CA). `localhost`, `127.0.0.1`, `::1` are always included. |
 | `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
-| `state_dir` | string | `/etc/shed` as root, `~/.shed` otherwise | Directory for the server's identity material: the SSH host key, the TLS cert + key (unless overridden above), the mtls client CA, the GitHub key cache (`github_keys/`), the GitHub account pins (`github_pins.json`) and the users upgrade marker (`users-upgrade.json`). Absolute or `~/`-relative; created `0700` at start. Set it when a second server runs on the same host, and give that server a `name` that differs from the first's after sanitization (the `name` also names its nftables tables). |
+| `state_dir` | string | `/etc/shed` as root, `~/.shed` otherwise | Directory for the server's identity material: the SSH host key, the TLS cert + key (unless overridden above), the mtls client CA, the GitHub key cache (`github_keys/`), the GitHub account pins (`github_pins.json`), the users upgrade marker (`users-upgrade.json`) and, with `auth.directory`, `directory/` (the enrolment and the kept copy of the user list; see [Users from an account service](#users-from-an-account-service)). Absolute or `~/`-relative; created `0700` at start. Set it when a second server runs on the same host, and give that server a `name` that differs from the first's after sanitization (the `name` also names its nftables tables). |
 | `bind_address` | string | `127.0.0.1` | Interface every listener binds to (loopback by default in every mode). In mtls mode set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. An **open** server is loopback only; a non-loopback bind fails config load. |
 | `trusted_proxy` | bool | `false` | Trust `X-Forwarded-For` (only behind a proxy that overwrites it). |
 

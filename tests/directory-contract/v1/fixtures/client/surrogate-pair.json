@@ -1,0 +1,38 @@
+{
+  "name": "surrogate-pair",
+  "description": "Valid escaped UTF-16 surrogate pairs: ada carries a member a reader ignores whose name holds the pair \\ud83d\\ude00, and bob's key has the label key\\ud83d\\udd11. An escaped pair is text like any other (Conventions, rule 6); only an unpaired surrogate is refused. The answer is good: ada and bob stand, bob's label read as the one character the pair encodes. The body is given as text so that the escapes reach the client exactly as written.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "text": "{\"contract\":1,\"organization\":\"example\",\"version\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"generated_at\":\"2026-11-16T06:00:00Z\",\"rules\":{\"version\":0},\"users\":[{\"name\":\"ada\",\"admin\":true,\"note\\ud83d\\ude00\":\"x\",\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe\",\"label\":\"laptop\"}]},{\"name\":\"bob\",\"admin\":false,\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e\",\"label\":\"key\\ud83d\\udd11\"}]}]}"
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          }
+        ]
+      },
+      {
+        "name": "bob",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+            "label": "key\ud83d\udd11"
+          }
+        ]
+      }
+    ],
+    "skipped": []
+  }
+}

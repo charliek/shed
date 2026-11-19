@@ -1,0 +1,134 @@
+{
+  "name": "nesting-16",
+  "description": "Nesting exactly 16 levels deep, the most rule 6 allows (each object and each array adds a level; the top-level object is level 1): a member the reader ignores at the top level holds arrays and objects to level 16, and one in ada's entry holds arrays to level 16. A good answer; the ignored members are read as if absent.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "contract": 1,
+      "organization": "example",
+      "version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "generated_at": "2026-11-16T06:00:00Z",
+      "rules": {
+        "version": 0
+      },
+      "users": [
+        {
+          "name": "ada",
+          "admin": true,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+              "label": "laptop"
+            },
+            {
+              "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+              "label": "yubikey"
+            }
+          ],
+          "more": [
+            [
+              [
+                [
+                  [
+                    [
+                      [
+                        [
+                          [
+                            [
+                              [
+                                [
+                                  [
+                                    1
+                                  ]
+                                ]
+                              ]
+                            ]
+                          ]
+                        ]
+                      ]
+                    ]
+                  ]
+                ]
+              ]
+            ]
+          ]
+        },
+        {
+          "name": "turing",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIERf1v1GIX0HaSB21SvWXsjbjLpQw4bbLwkBKozSaD4K",
+              "label": "laptop"
+            }
+          ]
+        }
+      ],
+      "deep": [
+        {
+          "n": [
+            {
+              "n": [
+                {
+                  "n": [
+                    {
+                      "n": [
+                        {
+                          "n": [
+                            {
+                              "n": [
+                                {
+                                  "n": [
+                                    1
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          },
+          {
+            "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+            "label": "yubikey"
+          }
+        ]
+      },
+      {
+        "name": "turing",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIERf1v1GIX0HaSB21SvWXsjbjLpQw4bbLwkBKozSaD4K",
+            "label": "laptop"
+          }
+        ]
+      }
+    ],
+    "skipped": []
+  }
+}

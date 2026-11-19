@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-on-403",
+  "description": "403 SERVER_DISABLED carrying Retry-After: 30: a client honours Retry-After only on 429 and 503 and ignores it here (rule 2).",
+  "response": {
+    "status": 403,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "30"
+    },
+    "body": {
+      "error": {
+        "code": "SERVER_DISABLED",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

@@ -1,0 +1,112 @@
+{
+  "name": "key-expires-not-an-instant",
+  "description": "expires is an RFC 3339 date-time and nothing else: a bare date (2027-01-01) and a date-time with no offset are not times a reader can read, so those keys are not used (rule 7). bob keeps his other key; carol and dave, left with none, are skipped.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "contract": 1,
+      "organization": "example",
+      "version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "generated_at": "2026-11-16T06:00:00Z",
+      "rules": {
+        "version": 0
+      },
+      "users": [
+        {
+          "name": "ada",
+          "admin": true,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+              "label": "laptop"
+            },
+            {
+              "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+              "label": "yubikey"
+            }
+          ]
+        },
+        {
+          "name": "bob",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+              "label": "laptop"
+            },
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO8fd5tNsoV/rj9hOkas4nY6UkrUTJ5sYB5U4uqCxtlR",
+              "label": "yubikey",
+              "expires": "2027-01-01"
+            }
+          ]
+        },
+        {
+          "name": "carol",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDGGt3mM1CzzhTeoSaXhz5LTrMGKtctoIugKBssGGpKi",
+              "label": "laptop",
+              "expires": "2027-01-01"
+            }
+          ]
+        },
+        {
+          "name": "dave",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKYXkBjz6tqlFzJhkm2QLBRr5EsaUYsMJcFRaF9U5hBB",
+              "label": "laptop",
+              "expires": "2027-01-01T00:00:00"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          },
+          {
+            "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+            "label": "yubikey"
+          }
+        ]
+      },
+      {
+        "name": "bob",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+            "label": "laptop"
+          }
+        ]
+      }
+    ],
+    "skipped": [
+      {
+        "entry": 2,
+        "reason": "no-usable-key"
+      },
+      {
+        "entry": 3,
+        "reason": "no-usable-key"
+      }
+    ]
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "name": "contract-missing",
+  "description": "No contract member: the whole answer is refused (rule 6).",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "organization": "example",
+      "version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "generated_at": "2026-11-16T06:00:00Z",
+      "rules": {
+        "version": 0
+      },
+      "users": [
+        {
+          "name": "ada",
+          "admin": true,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+              "label": "laptop"
+            },
+            {
+              "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+              "label": "yubikey"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

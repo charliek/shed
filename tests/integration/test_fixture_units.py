@@ -3103,3 +3103,1046 @@ def test_the_pin_cases_match_the_servers_and_the_clis_own_words():
                   '"MACHINE\\tID\\tKEY\\tBOUND\\tCONNECTED\\tFIRST SEEN"'):
         assert words in cli, words
     assert tsp._label(busclient.FakeMachine(ident.ALICE, "h", None)) == f'"itest-itest-alice" ({busclient.machine_id(ident.ALICE)[:8]})'
+
+
+# ----------------------------------------------------------------------------
+# A server whose users come from an account service: fixtures/directory.py
+# (the world of test_directory.py), the Makefile's test-integration-directory,
+# and the identity fixture's directory source (render-directory,
+# SHED_ITEST_SOURCE=directory). No server: the helpers are run on local
+# files, local processes and the Go sources they mirror.
+# ----------------------------------------------------------------------------
+
+import ssl  # noqa: E402
+
+from fixtures import directory as dfx  # noqa: E402
+
+INTEGRATION_DIR = Path(__file__).resolve().parent
+
+
+def test_the_directory_module_runs_only_under_its_make_target():
+    full = {"SHED_DIRECTORY_ITEST": "1", "SHED_BIN_DIR": "/repo/bin"}
+    assert dfx.skip_reason(full, "linux") is None
+    # Plain `make test-integration` (installed binaries): skipped, saying what to run.
+    assert "run make test-integration-directory" in dfx.skip_reason({}, "linux")
+    assert "run make test-integration-directory" in dfx.skip_reason({**full, "SHED_DIRECTORY_ITEST": "0"}, "linux")
+    assert "Linux only" in dfx.skip_reason(full, "darwin")
+    assert "SHED_BIN_DIR" in dfx.skip_reason({"SHED_DIRECTORY_ITEST": "1"}, "linux")
+
+
+def test_the_directory_module_skips_under_plain_test_integration():
+    # The real module, collected as `make test-integration` collects it.
+    env = {k: v for k, v in os.environ.items() if k not in ("SHED_DIRECTORY_ITEST", "SHED_BIN_DIR")}
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", "test_directory.py"],
+                       cwd=INTEGRATION_DIR, capture_output=True, text=True, timeout=120, env=env)
+    # A module skipped whole collects no test: pytest exits 5 ("no tests ran").
+    assert r.returncode in (0, 5), r.stdout + r.stderr
+    assert "1 skipped" in r.stdout and "run make test-integration-directory" in r.stdout, r.stdout
+    assert "failed" not in r.stdout and "error" not in r.stdout.lower(), r.stdout
+
+
+def _make_recipe(target: str) -> tuple[str, str]:
+    text = (dc.REPO_ROOT / "Makefile").read_text()
+    m = re.search(rf"^{re.escape(target)}:([^\n]*)\n((?:\t[^\n]*\n)+)", text, re.MULTILINE)
+    assert m, target
+    return m.group(1), m.group(2)
+
+
+def test_the_directory_target_builds_then_runs_the_module_against_no_other_server():
+    deps, recipe = _make_recipe("test-integration-directory")
+    # The host check first, then everything the world runs from bin/.
+    assert deps.split() == ["check-directory-itest-host", "build", "directory-ref"]
+    assert "uv run pytest -v test_directory.py $(PYTEST_ARGS)" in recipe
+    assert 'PATH="$(CURDIR)/bin:$$PATH"' in recipe
+    assert "SHED_DIRECTORY_ITEST=1" in recipe and 'SHED_BIN_DIR="$(CURDIR)/bin"' in recipe
+    # Every server variable of the rest of the suite is set empty.
+    conftest_src = (INTEGRATION_DIR / "conftest.py").read_text()
+    names = set(re.findall(r'os\.environ\.get\(\s*"(SHED_(?:VZ|FC)_[A-Z_]+|SHED_REMOTE_SERVER)"', conftest_src))
+    assert names >= {"SHED_VZ_SERVER", "SHED_FC_HOST", "SHED_FC_SERVER", "SHED_REMOTE_SERVER"}, names
+    for name in names | {"SHED_ITEST_SOURCE"}:
+        assert re.search(rf"^\s*{name}= \\$", recipe, re.MULTILINE), f"{name} is not set empty"
+    _, check = _make_recipe("check-directory-itest-host")
+    assert '"$$(uname -s)" != "Linux"' in check and "exit 1" in check
+    _, ref = _make_recipe("directory-ref")
+    assert "-o bin/test/shed-directory-ref ./internal/directory/refserver/cmd/shed-directory-ref" in ref
+
+
+def test_free_ports_never_picks_a_forbidden_or_repeated_port():
+    seq = iter([8000, 12222, 40000, 18443, 40000, 40001, 40002])
+    assert dfx.free_ports(2, pick=lambda: next(seq)) == [40000, 40001]
+    with pytest.raises(RuntimeError, match="no 2 free loopback ports"):
+        dfx.free_ports(2, pick=lambda: 8000, attempts=5)
+    got = dfx.free_ports(3)
+    assert len(set(got)) == 3 and not set(got) & dfx.FORBIDDEN_PORTS
+    assert {8000, 8100, 8114, 5179, 5533, 1126, 8126, 12222, 18443, 12290, 18490, 12936, 18936} <= dfx.FORBIDDEN_PORTS
+
+
+def test_the_worlds_folder_is_short_enough_for_its_sockets():
+    assert dfx.socket_base("/tmp") == "/tmp"
+    assert dfx.socket_base("/tmp/x" * 3) == "/tmp/x" * 3
+    assert dfx.socket_base("/tmp/" + "d" * 80) == "/tmp"
+
+
+def test_agent_arch_names_the_go_architecture():
+    assert dfx.agent_arch("x86_64") == "amd64"
+    assert dfx.agent_arch("aarch64") == "arm64"
+    assert dfx.agent_arch("arm64") == "arm64"
+    with pytest.raises(RuntimeError):
+        dfx.agent_arch("riscv64")
+
+
+def test_ssh_fingerprint_is_ssh_keygens(tmp_path):
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh-keygen is not installed")
+    key = tmp_path / "k"
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", str(key)], check=True, timeout=30)
+    pub = key.with_suffix(".pub").read_text()
+    r = subprocess.run(["ssh-keygen", "-l", "-E", "sha256", "-f", str(key.with_suffix(".pub"))],
+                       capture_output=True, text=True, check=True, timeout=30)
+    assert dfx.ssh_fingerprint(pub) == r.stdout.split()[1]
+
+
+def _go_reserved_names() -> set[str]:
+    src = (dc.REPO_ROOT / "internal" / "directory" / "refserver" / "directory.go").read_text()
+    m = re.search(r"reservedNames\s*=\s*map\[string\]bool\{([^}]*)\}", src)
+    assert m
+    return set(re.findall(r'"([a-z]+)":\s*true', m.group(1)))
+
+
+def test_the_server_config_is_a_directory_server_on_the_test_drivers(tmp_path):
+    cfg = dfx.server_config(http_port=1, https_port=2, ssh_port=3, state_dir=tmp_path / "state",
+                            issuer="http://127.0.0.1:9", admin_key="ssh-ed25519 AAAA", agent_dir=tmp_path / "agent")
+    assert cfg["bind_address"] == "127.0.0.1"
+    assert cfg["state_dir"] == str(tmp_path / "state")
+    assert cfg["default_backend"] == "remote"
+    auth = cfg["auth"]
+    assert auth["mode"] == "mtls"
+    assert auth["directory"] == {"url": "http://127.0.0.1:9", "refresh": "1m", "trust": "2m", "allow_plain_http": True}
+    assert auth["users"] == {dfx.LOCAL_ADMIN: {"admin": True, "keys": [{"key": "ssh-ed25519 AAAA", "label": "itest"}]}}
+    remote = cfg["remote"]
+    assert (remote["provider"], remote["transport"], remote["allow_test_drivers"]) == ("fake", "local", True)
+    assert remote["agent_dir"] == str(tmp_path / "agent") and remote["agent_install"] == "never"
+    assert remote["firewall"]["source_ranges"]
+    # The local admin can be named in a list: the reference server serves no
+    # reserved name (it refuses the whole list), and `localadmin` is not one.
+    reserved = _go_reserved_names()
+    assert "admin" in reserved and dfx.LOCAL_ADMIN not in reserved
+
+
+def test_the_server_config_loads(tmp_path):
+    binary = dc.REPO_ROOT / "bin" / "shed-server"
+    if not binary.exists():
+        pytest.skip("bin/shed-server is not built (make build)")
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    cfg = dfx.server_config(http_port=40001, https_port=40002, ssh_port=40003, state_dir=tmp_path / "state",
+                            issuer="http://127.0.0.1:40004",
+                            admin_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGuffgNov86IRo5236ko3Fma9npCn7RtJrpSU6FFijOs",
+                            agent_dir=agent)
+    path = tmp_path / "server.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    r = subprocess.run([str(binary), "--config", str(path), "config-validate"], capture_output=True, text=True,
+                       timeout=60, env={**os.environ, "HOME": str(tmp_path)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "local admins: localadmin" in r.stdout, r.stdout
+
+
+def test_listed_users_and_the_control_files(tmp_path):
+    u = dfx.listed_user("pat", [("ssh-ed25519 AAAA", "laptop")], admin=True)
+    assert u == {"name": "pat", "admin": True, "keys": [{"key": "ssh-ed25519 AAAA", "label": "laptop"}]}
+    path = tmp_path / "users.json"
+    path.write_text("old")
+    path.chmod(0o644)
+    dfx.write_private(path, b"[]")
+    assert path.read_bytes() == b"[]"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["users.json"]
+
+
+def test_parse_issuer_reads_the_reference_servers_line():
+    assert dfx.parse_issuer("listening on http://127.0.0.1:41234\nenrolled x srv_1\n") == "http://127.0.0.1:41234"
+    assert dfx.parse_issuer("enrolled x srv_1\n") is None
+    # Only a loopback plain-HTTP issuer, the only kind it serves.
+    assert dfx.parse_issuer("listening on http://192.0.2.1:41234\n") is None
+
+
+def test_cert_user_reads_both_openssl_subject_formats():
+    fp = "SHA256:abc+/def"
+    assert dfx.cert_user(f"subject=UID=jay,CN={fp},OU=control,O=cli") == "jay"
+    assert dfx.cert_user(f'subject=O = cli, OU = control, CN = "{fp}", UID = jay') == "jay"
+    assert dfx.cert_user(f"subject=CN={fp},OU=control,O=cli") is None
+    assert dfx.cert_user("subject=O = cli, OU = control, CN = itest") is None
+
+
+def test_a_request_config_makes_the_subject_the_ca_issues(tmp_path):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not installed")
+    fp = "SHA256:Ab+/0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"
+    for user in ("jay", None):
+        cnf, key, csr = tmp_path / "r.cnf", tmp_path / "k.pem", tmp_path / "c.csr"
+        cnf.write_text(dfx.cert_request_config(fp, "control", "cli", user))
+        subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(key)],
+                       check=True, capture_output=True, timeout=30)
+        subprocess.run(["openssl", "req", "-new", "-key", str(key), "-config", str(cnf), "-out", str(csr)],
+                       check=True, capture_output=True, timeout=30)
+        subject = subprocess.run(["openssl", "req", "-in", str(csr), "-noout", "-subject", "-nameopt", "RFC2253"],
+                                 check=True, capture_output=True, text=True, timeout=30).stdout
+        assert dfx.cert_user(subject) == user, subject
+        assert "OU=control" in subject and "O=cli" in subject and "CN=SHA256:Ab\\+/0123" in subject, subject
+    assert "clientAuth" in dfx.CLIENT_CERT_EXTENSIONS and "CA:FALSE" in dfx.CLIENT_CERT_EXTENSIONS
+
+
+def test_parse_stamp_reads_the_servers_instants():
+    assert dfx.parse_stamp("2026-11-17T03:36:00Z").isoformat() == "2026-11-17T03:36:00+00:00"
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_owned_processes_find_what_runs_below_a_root():
+    proc = subprocess.Popen(["sh", "-c", "sleep 30 & wait"])
+    try:
+        root = dfx.ProcHandle.pin(proc.pid)
+        assert root is not None
+        assert dfx._wait_for(lambda: bool(dfx.owned_processes(None, roots=[root])), 5)
+        kids = dfx.owned_processes(None, roots=[root])
+        assert kids and all("sleep" in h.cmdline for h in kids) and root.pid not in [h.pid for h in kids], kids
+        assert len(dfx.stop_survivors(kids, "started by the test")) == len(kids)
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            root = dfx.ProcHandle.pin(proc.pid)
+            dfx.stop_survivors(dfx.owned_processes(None, roots=[root]) if root else [], "started by the test")
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_a_probe_tells_admitted_from_refused():
+    admitted = dfx.Probe(1, "", f"this server requires auth.mode: mtls; {dfx.NEEDS_CSR}\n", 0.1)
+    refused = dfx.Probe(255, "", "_bootstrap@127.0.0.1: Permission denied (publickey).\n", 0.1)
+    other = dfx.Probe(1, "", "bootstrap: key not authorized\n", 0.1)
+    assert admitted.admitted and not admitted.refused
+    assert refused.refused and not refused.admitted
+    assert not other.admitted and not other.refused
+
+
+def test_a_session_echoes_and_closes(tmp_path):
+    s = dfx.Session(["sh", "-c", "echo ready; exec cat"], os.environ, tmp_path / "err")
+    try:
+        assert s.read_until(b"ready\n", 10)
+        assert s.echo("one") and s.echo("two")
+        assert not s.wait_closed(0.2)
+    finally:
+        s.close()
+    assert s.proc.poll() is not None
+    # A session whose far side ended: its echo is not answered.
+    s = dfx.Session(["sh", "-c", "echo ready"], os.environ, tmp_path / "err2")
+    try:
+        assert s.read_until(b"ready\n", 10)
+        assert s.wait_closed(10)
+        assert not s.echo("lost", timeout=1)
+    finally:
+        s.close()
+
+
+def test_the_directory_cases_match_the_servers_own_words():
+    root = dc.REPO_ROOT
+    bootstrap = (root / "internal" / "sshd" / "bootstrap.go").read_text()
+    assert f'"this server requires auth.mode: mtls; {dfx.NEEDS_CSR}"' in bootstrap
+    assert f'errors.New("{dfx.BOOTSTRAP_NOT_AUTHORIZED}")' in bootstrap
+    assert f'"key %s {dfx.KEY_MOVED}"' in (root / "internal" / "sshd" / "identity.go").read_text()
+    runtime = (root / "internal" / "directory" / "runtime.go").read_text()
+    assert f'r.logf("{dfx.UNKNOWN_KEY_PULL}%s: pulling the list' in runtime
+    assert f'"{dfx.STARTUP_NO_COPY}"' in runtime
+    assert f'fmt.Sprintf("{dfx.STARTUP_KEPT_COPY}%s, version' in runtime
+    assert "UnknownKeyEvery = time.Minute" in runtime and dfx.UNKNOWN_KEY_EVERY == 60
+    assert f"UnknownKeyWait = {dfx.UNKNOWN_KEY_WAIT} * time.Second" in runtime
+    lookup = (root / "internal" / "directory" / "lookup.go").read_text()
+    assert f'log.Printf("{dfx.TRUST_ENDED}:' in lookup
+    assert f"TrustCheckEvery = {dfx.TRUST_TICK} * time.Second" in lookup
+    assert f'SkipLocalAdminName SkipReason = "{dfx.SKIPPED_LOCAL_ADMIN_NAME}"' in lookup
+    assert f'fmt.Fprintf(w, "{dfx.PULL_GOOD}: %s\\n"' in (root / "cmd" / "shed" / "users.go").read_text()
+    https_line, ssh_line = dfx.READY_LINES
+    assert f'log.Printf("{https_line} %s"' in (root / "cmd" / "shed-server" / "serve.go").read_text()
+    assert f'log.Printf("{ssh_line} %s"' in (root / "internal" / "sshd" / "server.go").read_text()
+    # The skipped entry's log line the local-admin cases match, and the
+    # reason a list entry with a local admin's key is skipped for.
+    assert 'r.logf("directory: list entry %q skipped: %s"' in runtime
+    assert dfx.SKIPPED_LOG.replace('"{name}"', "%q") + "%s" == "directory: list entry %q skipped: %s"
+    assert f'SkipLocalAdminKey SkipReason = "{dfx.SKIPPED_LOCAL_ADMIN_KEY}"' in lookup
+    # An mtls listener refuses a user certificate at the handshake, through
+    # VerifyConnection (crypto/tls answers its error with bad_certificate).
+    serve = (root / "cmd" / "shed-server" / "serve.go").read_text()
+    assert "tlsCfg.VerifyConnection = servertls.ClientConnectionVerifier(authorized, clientKnown)" in serve
+    assert "MinVersion:   tls.VersionTLS12," in serve
+    # The files of the server's state that are meant to hold a private key.
+    assert 'filepath.Join(stateDir, "tls_key.pem")' in serve
+    assert 'filepath.Join(stateDir, "ca_cert.pem"), filepath.Join(stateDir, "ca_key.pem")' in serve
+    assert 'filepath.Join(stateDir, "host_key")' in serve
+    assert {"state/tls_key.pem", "state/ca_key.pem", "state/host_key",
+            "state/directory/enrolment.json"} <= set(dfx.WORLD_PRIVATE_KEY_FILES)
+    # The CLI keeps an entry's client key at ~/.shed/creds/<entry>/client.key.
+    assert 'filepath.Join(GetClientConfigDir(), "creds")' in (root / "internal" / "config" / "clientcreds.go").read_text()
+    assert "homes/*/.shed/creds/*/client.key" in dfx.WORLD_PRIVATE_KEY_FILES
+    assert dfx.TRUST_SECONDS == 120 and dfx.TRUST == "2m"
+    # The world's refresh is the shortest the config allows, and its trust
+    # time two refreshes.
+    assert "MinDirectoryRefresh = time.Minute" in (root / "internal" / "config" / "types.go").read_text()
+    assert (dfx.REFRESH, dfx.TRUST) == ("1m", "2m")
+
+
+def test_the_directory_source_is_config_by_default():
+    assert ident.itest_source({}) == "config"
+    assert ident.itest_source({"SHED_ITEST_SOURCE": " "}) == "config"
+    assert ident.itest_source({"SHED_ITEST_SOURCE": "directory"}) == "directory"
+    with pytest.raises(ValueError, match="SHED_ITEST_SOURCE"):
+        ident.itest_source({"SHED_ITEST_SOURCE": "nope"})
+    assert ident.skip_reason_under_directory_source("why", {}) is None
+    assert ident.skip_reason_under_directory_source("why", {"SHED_ITEST_SOURCE": "directory"}).endswith(": why")
+
+
+def test_directory_users_leave_out_script_and_expired_keys(keys_dir):
+    got = ident.directory_users(keys_dir)
+    assert [u["name"] for u in got] == sorted(ident.ITEST_USERS)
+    by = {u["name"]: u for u in got}
+    assert by[ident.ADMIN]["admin"] is True and by[ident.ALICE]["admin"] is False
+    for name in ident.ITEST_USERS:
+        assert by[name]["keys"] == [{"key": ident.public_key(name, ident.PRIMARY_KEY, keys_dir), "label": "itest"}]
+    assert not {u["name"] for u in got} & _go_reserved_names()
+
+
+def _ed25519_pub(seed: int) -> str:
+    """A well-formed ed25519 public key line (`<type> <base64>`), made from
+    `seed` (no key pair behind it: its shape is all that is checked)."""
+    blob = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + bytes([seed]) * 32
+    return "ssh-ed25519 " + base64.b64encode(blob).decode("ascii")
+
+
+ED_A, ED_B = _ed25519_pub(1), _ed25519_pub(2)
+
+
+def test_directory_auth_allows_plain_http_to_loopback_only():
+    auth = ident.directory_auth("http://127.0.0.1:41234/", [f"{ED_A} me@example.test", ED_B])
+    assert auth["mode"] == "mtls"
+    assert auth["directory"] == {"url": "http://127.0.0.1:41234", "refresh": "1m", "trust": "2m",
+                                 "allow_plain_http": True}
+    assert auth["users"] == {ident.LOCAL_ADMIN: {"admin": True, "keys": [
+        {"key": ED_A, "label": "itest"}, {"key": ED_B, "label": "itest-2"}]}}
+    https = ident.directory_auth("https://accounts.example.test", [ED_A], refresh="1h", trust="72h")
+    assert https["directory"] == {"url": "https://accounts.example.test", "refresh": "1h", "trust": "72h"}
+    assert ident.directory_auth("http://[::1]:9", [ED_A])["directory"]["allow_plain_http"] is True
+    for bad, match in (("http://accounts.example.test", "loopback"), ("https://accounts.example.test/v1", "origin"),
+                       ("ftp://127.0.0.1", "origin"), ("http://u@127.0.0.1:9", "origin"),
+                       # Nothing is lower-cased: an upper-case scheme or host is refused.
+                       ("HTTP://127.0.0.1:9", "lower case"), ("Https://accounts.example.test", "lower case"),
+                       ("http://LOCALHOST:9", "lower case"), ("https://Accounts.example.test", "lower case")):
+        with pytest.raises(ValueError, match=match):
+            ident.directory_auth(bad, [ED_A])
+    with pytest.raises(ValueError, match="at least one key"):
+        ident.directory_auth("http://127.0.0.1:9", [])
+    with pytest.raises(ValueError, match="admin key 2: not a public key"):
+        ident.directory_auth("http://127.0.0.1:9", [ED_A, "ssh-ed25519"])
+
+
+def test_public_key_line_takes_exactly_one_public_key(tmp_path):
+    assert ident.public_key_line(f"{ED_A} someone@example.test\n", "k") == ED_A
+    assert ident.public_key_line(ED_B, "k") == ED_B
+    private = ("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n"
+               "-----END OPENSSH PRIVATE KEY-----\n")
+    for text, match in (
+        (private, "private key"),
+        (f"{ED_A}\n{ED_B}\n", "exactly one line.*found 2"),
+        (f"{ED_A}\n\n", "exactly one line"),
+        ("", "exactly one line.*found 0"),
+        ("\n", "exactly one line"),
+        ("ssh-dss AAAA", "not a public key line"),
+        ("ssh-ed25519", "not a public key line"),
+        ("ssh-ed25519 not*base64", "not base64"),
+        # Base64, but not a key of the type it names.
+        (f"ssh-rsa {ED_A.split()[1]}", "not a ssh-rsa key"),
+        ("ssh-ed25519 " + base64.b64encode(b"\x00\x00\x00\x0bssh-ed25519").decode(), "not a ssh-ed25519 key"),
+    ):
+        with pytest.raises(ValueError, match=match) as e:
+            ident.public_key_line(text, "/where/k.pub")
+        assert str(e.value).startswith("/where/k.pub: "), e.value
+    if shutil.which("ssh-keygen") is None:
+        return
+    # A real key pair: its .pub is taken, its private half refused.
+    key = tmp_path / "k"
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-C", "x@example.test", "-f", str(key)],
+                   check=True, timeout=30)
+    pub = key.with_name("k.pub").read_text()
+    assert ident.public_key_line(pub, "k.pub") == " ".join(pub.split()[:2])
+    with pytest.raises(ValueError, match="private key"):
+        ident.public_key_line(key.read_text(), "k")
+
+
+def test_render_directory_refuses_what_is_not_one_public_key(tmp_path, keys_dir):
+    control = tmp_path / "control"
+    control.mkdir()
+    users_json = control / "users.json"
+    key = tmp_path / "dev"
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", str(key)], check=True, timeout=30)
+    two = tmp_path / "two.pub"
+    two.write_text(f"{ED_A}\n{ED_B}\n")
+    for bad, words in ((key, "private key"), (two, "exactly one line")):
+        r = subprocess.run(
+            [sys.executable, "-m", "fixtures.identity", "--dir", str(keys_dir), "render-directory",
+             "http://127.0.0.1:41234", str(users_json), "--admin-key-file", str(bad)],
+            cwd=INTEGRATION_DIR, capture_output=True, text=True, timeout=60,
+        )
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert str(bad) in r.stderr and words in r.stderr, r.stderr
+        assert r.stdout == "" and "PRIVATE" not in r.stderr, (r.stdout, r.stderr)
+    r = subprocess.run(
+        [sys.executable, "-m", "fixtures.identity", "--dir", str(keys_dir), "render-directory",
+         "HTTP://127.0.0.1:41234", str(users_json)],
+        cwd=INTEGRATION_DIR, capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 1 and "lower case" in r.stderr, r.stderr
+    assert list(control.iterdir()) == []
+
+
+def test_render_directory_leaves_no_temporary_file_when_the_write_fails(tmp_path, keys_dir):
+    control = tmp_path / "control"
+    control.mkdir()
+    # users.json is a directory: the final rename fails.
+    (control / "users.json").mkdir()
+    with pytest.raises(OSError):
+        ident.render_directory("http://127.0.0.1:41234", control / "users.json", keys_dir)
+    assert sorted(p.name for p in control.iterdir()) == ["users.json"]
+
+
+def test_render_directory_prints_the_auth_block_and_writes_the_list(tmp_path, keys_dir):
+    dev = tmp_path / "dev.pub"
+    dev.write_text(f"{ED_A} developer@example.test\n")
+    users_json = tmp_path / "control" / "users.json"
+    users_json.parent.mkdir()
+    r = subprocess.run(
+        [sys.executable, "-m", "fixtures.identity", "--dir", str(keys_dir), "render-directory",
+         "http://127.0.0.1:41234", str(users_json), "--admin-key-file", str(dev)],
+        cwd=INTEGRATION_DIR, capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, r.stderr
+    auth = yaml.safe_load(r.stdout)["auth"]
+    admin_pub = ident.public_key(ident.LOCAL_ADMIN, ident.PRIMARY_KEY, keys_dir)
+    assert auth["users"][ident.LOCAL_ADMIN]["keys"] == [{"key": admin_pub, "label": "itest"},
+                                                         {"key": ED_A, "label": "itest-2"}]
+    assert auth["directory"]["url"] == "http://127.0.0.1:41234" and auth["directory"]["allow_plain_http"] is True
+    assert json.loads(users_json.read_text()) == ident.directory_users(keys_dir)
+    assert stat.S_IMODE(users_json.stat().st_mode) == 0o600
+    # The local admin key is generated once and kept.
+    before = ident.key_path(ident.LOCAL_ADMIN, ident.PRIMARY_KEY, keys_dir).read_bytes()
+    assert ident.ensure_local_admin_key(keys_dir).read_bytes() == before
+
+
+def test_the_two_users_cases_skip_under_the_directory_source_before_any_fixture(monkeypatch):
+    import conftest
+
+    skipped = {name for name, fn in vars(tu).items() if name.startswith("test_")
+               and any(m.name == "not_under_directory_source" for m in getattr(fn, "pytestmark", []))}
+    assert skipped == {"test_a_script_key_never_holds_the_credentials_scope", "test_an_expired_key_opens_nothing"}
+    runs = {name for name in vars(tu) if name.startswith("test_")} - skipped
+    assert len(runs) == 13, sorted(runs)
+
+    marker = next(m for m in tu.test_an_expired_key_opens_nothing.pytestmark
+                  if m.name == "not_under_directory_source")
+
+    class Item:
+        callspec = type("C", (), {"params": {"users_env": "fc"}})()
+
+        def get_closest_marker(self, name):
+            return marker if name == "not_under_directory_source" else None
+
+    monkeypatch.setenv("SHED_ITEST_SOURCE", "directory")
+    with pytest.raises(pytest.skip.Exception, match="skipped under the directory source.*expired key"):
+        conftest.pytest_runtest_setup(Item())
+    monkeypatch.delenv("SHED_ITEST_SOURCE")
+    conftest.pytest_runtest_setup(Item())
+
+
+# -- The directory source: what the server says, and callers that chose ------
+
+
+class _FakeUsersServer:
+    """A dev server entry for users_environment: `users status` says
+    `source`, `users refresh` exits `refresh_rc`; every call is recorded."""
+
+    def __init__(self, source: str = "directory", refresh_rc: int = 0) -> None:
+        self.name, self.source, self.refresh_rc = "box-dev", source, refresh_rc
+        self.calls: list[tuple] = []
+
+    def cli(self, *args: str, timeout: float = 60) -> subprocess.CompletedProcess:
+        self.calls.append(args)
+        if args == ("--json", "users", "status"):
+            return subprocess.CompletedProcess(args, 0, json.dumps({"source": self.source, "users": []}), "")
+        if args == ("users", "refresh"):
+            return subprocess.CompletedProcess(args, self.refresh_rc, "", "refresh failed" if self.refresh_rc else "")
+        raise AssertionError(f"unexpected cli call {args}")
+
+
+@pytest.fixture
+def users_env_fakes(monkeypatch, keys_dir):
+    """users_environment with no server and no ssh: what it asks of the
+    server, whether it reconfigures, and which identities it enrols."""
+    from contextlib import contextmanager
+
+    events: list[tuple] = []
+
+    @contextmanager
+    def fake_dev_config(overrides, name, transform=None):
+        events.append(("dev_config", name))
+        yield
+
+    monkeypatch.setattr(fx, "resolve_server_entry", lambda name: {"host": "127.0.0.1", "ssh_port": 2222})
+    monkeypatch.setattr(dc, "dev_config", fake_dev_config)
+    monkeypatch.setattr(ident, "_check_host_resolves_without_ssh_config", lambda host: None)
+    monkeypatch.setattr(ident.Identity, "add_server", lambda self, timeout=90: events.append(("add_server", self.user)))
+    return events, keys_dir
+
+
+def test_users_environment_does_as_its_caller_asks_whatever_the_ambient_source(monkeypatch, users_env_fakes):
+    events, keys_dir = users_env_fakes
+    monkeypatch.setenv("SHED_ITEST_SOURCE", "directory")
+    # A caller that asks to reconfigure (test_users_upgrade) reconfigures,
+    # and the server is not asked about the directory.
+    server = _FakeUsersServer(source="config")
+    with ident.users_environment("vz", server, reconfigure=True, image="base", keys_dir=keys_dir) as env:
+        assert env.alice.user == ident.ALICE
+    assert events[0] == ("dev_config", "box-dev"), events
+    assert [e for e in events if e[0] == "add_server"] == [("add_server", u) for u in (ident.ALICE, ident.BOB, ident.ADMIN)]
+    assert server.calls == []
+    # One that does not (test_service_client before this source): neither.
+    events.clear()
+    with ident.users_environment("fc", server, reconfigure=False, image="itest", keys_dir=keys_dir):
+        pass
+    assert ("dev_config", "box-dev") not in events and server.calls == []
+
+
+def test_users_environment_under_the_directory_source_asks_the_server_first(users_env_fakes):
+    events, keys_dir = users_env_fakes
+    # A server whose users come from its config: refused before anything.
+    server = _FakeUsersServer(source="config")
+    with pytest.raises(pytest.fail.Exception, match="takes its users from 'config', not 'directory'"):
+        with ident.users_environment("fc", server, reconfigure=False, image="base", keys_dir=keys_dir, source="directory"):
+            pass
+    assert server.calls == [("--json", "users", "status")] and events == []
+    # The directory's: refreshed, never reconfigured, then the identities.
+    server = _FakeUsersServer(source="directory")
+    with ident.users_environment("fc", server, reconfigure=False, image="base", keys_dir=keys_dir, source="directory"):
+        pass
+    assert server.calls == [("--json", "users", "status"), ("users", "refresh")]
+    assert ("dev_config", "box-dev") not in events and len(events) == 3
+    # A refresh that fails stops it.
+    events.clear()
+    server = _FakeUsersServer(source="directory", refresh_rc=1)
+    with pytest.raises(pytest.fail.Exception, match="users refresh` failed"):
+        with ident.users_environment("fc", server, reconfigure=False, image="base", keys_dir=keys_dir, source="directory"):
+            pass
+    assert events == []
+    # Asking to reconfigure under the directory source is a caller's error.
+    server = _FakeUsersServer()
+    with pytest.raises(ValueError, match="reconfigure=True"):
+        with ident.users_environment("vz", server, reconfigure=True, image="base", keys_dir=keys_dir, source="directory"):
+            pass
+    with pytest.raises(ValueError, match="source 'nope'"):
+        with ident.users_environment("vz", server, reconfigure=False, image="base", keys_dir=keys_dir, source="nope"):
+            pass
+    assert server.calls == [] and events == []
+
+
+def test_directory_source_problem_reads_the_servers_own_answer():
+    def done(rc, out):
+        return subprocess.CompletedProcess([], rc, out, "boom" if rc else "")
+
+    assert ident.directory_source_problem(done(0, '{"source": "directory", "users": []}'), "s") is None
+    assert "'config', not 'directory'" in ident.directory_source_problem(done(0, '{"source": "config"}'), "s")
+    assert "None, not 'directory'" in ident.directory_source_problem(done(0, "[]"), "s")
+    assert "printed no JSON" in ident.directory_source_problem(done(0, "this server has no status route"), "s")
+    assert "failed (exit 1)" in ident.directory_source_problem(done(1, ""), "s")
+
+
+def test_the_users_gate_follows_the_source(monkeypatch):
+    monkeypatch.delenv("SHED_ITEST_USERS", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="SHED_ITEST_USERS=fc"):
+        ident.skip_unless_users_source_ready("fc", "box-dev", "config")
+    ident.skip_unless_users_source_ready("fc", "box-dev", "directory")
+    monkeypatch.setenv("SHED_ITEST_USERS", "fc")
+    ident.skip_unless_users_source_ready("fc", "box-dev", "config")
+
+
+def test_the_upgrade_cases_skip_under_the_directory_source(monkeypatch):
+    import conftest
+
+    (mark,) = [m for m in tuu.pytestmark if m.name == "not_under_directory_source"]
+
+    class Item:
+        callspec = None
+
+        def get_closest_marker(self, name):
+            return mark if name == "not_under_directory_source" else None
+
+    monkeypatch.setenv("SHED_ITEST_SOURCE", "directory")
+    with pytest.raises(pytest.skip.Exception, match="directory source.*restarts the Mac dev server"):
+        conftest.pytest_runtest_setup(Item())
+    monkeypatch.delenv("SHED_ITEST_SOURCE")
+    conftest.pytest_runtest_setup(Item())
+
+
+def test_the_service_client_cases_users_follow_the_source(monkeypatch, users_env_fakes):
+    import test_service_client as tsc
+
+    events, keys_dir = users_env_fakes
+    real = ident.users_environment
+    monkeypatch.setattr(tsc, "users_environment", lambda *a, **kw: real(*a, **{**kw, "keys_dir": keys_dir}))
+    fixture = tsc.fc_users._get_wrapped_function()
+    # Under the directory source: no SHED_ITEST_USERS gate; the server is asked.
+    monkeypatch.delenv("SHED_ITEST_USERS", raising=False)
+    monkeypatch.setenv("SHED_ITEST_SOURCE", "directory")
+    server = _FakeUsersServer(source="directory")
+    gen = fixture(server)
+    env = next(gen)
+    assert env.backend == "fc" and server.calls == [("--json", "users", "status"), ("users", "refresh")]
+    gen.close()
+    # Under the config source: the SHED_ITEST_USERS gate, as before.
+    monkeypatch.delenv("SHED_ITEST_SOURCE")
+    with pytest.raises(pytest.skip.Exception, match="SHED_ITEST_USERS=fc"):
+        next(fixture(_FakeUsersServer()))
+
+
+# -- Processes the world did not start itself ---------------------------------
+
+
+def _fake_stat(proc: Path, pid: int, name: str, state: str, start: int, ppid: int = 4) -> None:
+    rest = [state] + [str(i) for i in range(4, 53)]
+    rest[1] = str(ppid)
+    rest[19] = str(start)
+    (proc / str(pid)).mkdir(parents=True, exist_ok=True)
+    (proc / str(pid) / "stat").write_text(f"{pid} ({name}) " + " ".join(rest) + "\n")
+
+
+def _fake_proc(proc: Path, pid: int, start: int, cmdline: str, ppid: int = 1) -> None:
+    _fake_stat(proc, pid, cmdline.split(" ")[0] or "x", "S", start, ppid)
+    (proc / str(pid) / "cmdline").write_bytes(cmdline.replace(" ", "\0").encode() + b"\0")
+
+
+def _reuse_on_read(monkeypatch, at: int, proc: Path, start: int, cmdline: str, before: bool) -> None:
+    """Make pid `at` another process (`start`, `cmdline`) at the first
+    reading of its command line: just before it (`before`) or just after."""
+    real = dfx._cmdline
+    done = []
+
+    def reading(pid: int, p: Path = Path("/proc")) -> str:
+        if pid == at and not done and before:
+            done.append(1)
+            _fake_proc(proc, at, start, cmdline)
+        out = real(pid, p)
+        if pid == at and not done and not before:
+            done.append(1)
+            _fake_proc(proc, at, start, cmdline)
+        return out
+
+    monkeypatch.setattr(dfx, "_cmdline", reading)
+
+
+@pytest.mark.parametrize("before", [False, True], ids=["just after the ownership reading", "just after the handle"])
+def test_owned_processes_never_select_a_reused_pid(tmp_path, monkeypatch, before):
+    marker = f"{tmp_path}/world/"
+    if before:
+        # The handle pins an unrelated process; the pid is then the world's
+        # (another start time) when its command line is read.
+        _fake_proc(tmp_path, 100, 500, "unrelated-program")
+        _reuse_on_read(monkeypatch, 100, tmp_path, 900, f"agent {marker}t/x", before)
+    else:
+        # The world's process is pinned and its command line read; it exits
+        # and an unrelated process takes its pid at once.
+        _fake_proc(tmp_path, 100, 500, f"agent {marker}t/x")
+        _reuse_on_read(monkeypatch, 100, tmp_path, 900, "unrelated-program", before)
+    assert dfx.owned_processes(marker, tmp_path, os.getuid(), 0) == []
+
+
+def test_owned_processes_select_by_command_line_or_folder_and_follow_children(tmp_path):
+    marker = f"{tmp_path}/world/"
+    (tmp_path / "world").mkdir()
+    _fake_proc(tmp_path, 100, 500, f"agent {marker}t/x")
+    _fake_proc(tmp_path, 101, 600, "child-program", ppid=100)
+    _fake_proc(tmp_path, 102, 700, "grandchild-program", ppid=101)
+    _fake_proc(tmp_path, 103, 400, "older-than-its-parent", ppid=100)  # its parent's pid, reused
+    _fake_proc(tmp_path, 104, 650, "worker")  # no marker; its folder is the world's
+    os.symlink(tmp_path / "world", tmp_path / "104" / "cwd")
+    _fake_proc(tmp_path, 105, 650, "unrelated-program")
+    _fake_proc(tmp_path, 106, 660, "a-zombie's-child", ppid=107)
+    _fake_stat(tmp_path, 107, "z", "Z", 610, 100)
+    found = {h.pid: h for h in dfx.owned_processes(marker, tmp_path, os.getuid(), 0)}
+    assert sorted(found) == [100, 101, 102, 104], found
+    assert found[101].cmdline == "child-program " and found[100].start == 500 and found[102].ppid == 101
+
+
+def test_owned_processes_follow_a_child_of_another_user(tmp_path, monkeypatch):
+    marker = f"{tmp_path}/world/"
+    me = os.getuid()
+    other = me + 1
+    _fake_proc(tmp_path, 100, 500, f"agent {marker}t/x")
+    _fake_proc(tmp_path, 101, 600, "helper-run-as-another-user", ppid=100)
+    _fake_proc(tmp_path, 102, 700, "its-child", ppid=101)
+    _fake_proc(tmp_path, 103, 650, f"another-users-program {marker}t/y")  # names the world, not ours
+    uids = {101: other, 102: other, 103: other}
+    monkeypatch.setattr(dfx, "_proc_uid", lambda pid, proc=Path("/proc"): uids.get(pid, me))
+    found = {h.pid: h for h in dfx.owned_processes(marker, tmp_path, me, 0)}
+    assert sorted(found) == [100, 101, 102], found
+    assert found[101].cmdline == "helper-run-as-another-user "
+
+
+def _fake_popen(pid: int):
+    class P:
+        def __init__(self) -> None:
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+    return P()
+
+
+@pytest.mark.parametrize("before", [False, True], ids=["just after the ownership reading", "just after the handle"])
+def test_a_server_stop_never_selects_a_reused_pid(tmp_path, monkeypatch, before):
+    marker = f"{tmp_path}/world/t/"
+    _fake_proc(tmp_path, 50, 100, "shed-server serve")
+    _fake_proc(tmp_path, 100, 500, f"agent {marker}x", ppid=50)
+    # The server's child exits and an unrelated process takes its pid, around
+    # the first reading of its command line.
+    _reuse_on_read(monkeypatch, 100, tmp_path, 900, "unrelated-program", before)
+    s = dfx.ShedServer(Path("shed-server"), tmp_path / "c.yaml", tmp_path, tmp_path, tmp_path, marker)
+    s.proc, s.proc_root = _fake_popen(50), tmp_path
+    handed: list = []
+    monkeypatch.setattr(dfx, "_stop", lambda proc, timeout=15: True)
+    monkeypatch.setattr(dfx, "stop_survivors", lambda hs, what: handed.extend(hs) or [])
+    assert s.stop() == []
+    assert handed == [], handed
+
+
+def test_a_server_stop_follows_its_children(tmp_path, monkeypatch):
+    marker = f"{tmp_path}/world/t/"
+    _fake_proc(tmp_path, 50, 100, "shed-server serve")
+    _fake_proc(tmp_path, 100, 500, "worker-without-the-marker", ppid=50)
+    _fake_proc(tmp_path, 101, 600, "its-child", ppid=100)
+    _fake_proc(tmp_path, 102, 650, "unrelated-program")
+    s = dfx.ShedServer(Path("shed-server"), tmp_path / "c.yaml", tmp_path, tmp_path, tmp_path, marker)
+    s.proc, s.proc_root = _fake_popen(50), tmp_path
+    handed: list = []
+    monkeypatch.setattr(dfx, "_stop", lambda proc, timeout=15: True)
+    monkeypatch.setattr(dfx, "stop_survivors", lambda hs, what: handed.extend(hs) or [])
+    assert s.stop() == []
+    assert sorted(h.pid for h in handed) == [100, 101], handed  # not the server itself
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_a_process_that_cannot_be_signalled_is_reported(monkeypatch):
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        h = dfx.ProcHandle.of(proc.pid)
+        assert h is not None
+
+        def refuse(fd, sig, *a):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(dfx.signal, "pidfd_send_signal", refuse)
+        problems = dfx.stop_survivors([h], "started in the world")
+        assert problems == [f"process {proc.pid} started in the world outlived it and could not be signalled "
+                            f"(Operation not permitted), and is still running: {h.cmdline!r}"], problems
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_proc_stat_reads_the_start_time_after_any_name(tmp_path):
+    _fake_stat(tmp_path, 7, "a) b (c", "S", 4242)
+    assert dfx.proc_stat(7, tmp_path) == ("S", 4242)
+    assert dfx.proc_stat(8, tmp_path) is None
+    _fake_stat(tmp_path, 9, "z", "Z", 5)
+    assert dfx.ProcHandle.of(9, tmp_path) is None  # a zombie is not a process to stop
+    h = dfx.ProcHandle(7, 4242)
+    assert h.alive(tmp_path)
+    assert not dfx.ProcHandle(7, 4243).alive(tmp_path)  # the pid, reused
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_proc_stat_reads_this_process_from_the_real_proc():
+    st = dfx.proc_stat(os.getpid())
+    assert st is not None and st[1] > 0
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_a_proc_handle_signals_only_its_own_process():
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        h = dfx.ProcHandle.of(proc.pid)
+        assert h is not None and h.alive()
+        # The same pid with another start time is another process: not signalled.
+        other = dfx.ProcHandle(proc.pid, h.start + 1)
+        assert not other.alive() and other.signal(15) is False and other.stop() is None
+        assert proc.poll() is None
+        assert h.stop() == "stopped on SIGTERM"
+        assert proc.wait(timeout=10) == -15
+        # Gone: no error, nothing sent.
+        assert h.signal(15) is False and h.stop() is None and not h.alive()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_owned_processes_find_an_orphan_by_its_folder_whoever_its_parent(tmp_path):
+    marker = f"{tmp_path}/world/"
+    # The orphan's parent exits at once (as a server that died would):
+    # it is found by the folder its command line names.
+    r = subprocess.run(["sh", "-c", f'{sys.executable} -c "import time; time.sleep(60)" {marker}agent '
+                                    f'</dev/null >/dev/null 2>&1 & echo $!'],
+                       capture_output=True, text=True, timeout=30)
+    pid = int(r.stdout.strip())
+    try:
+        assert dfx._wait_for(lambda: any(h.pid == pid for h in dfx.owned_processes(marker)), 10)
+        unrelated = subprocess.Popen(["sleep", "30"])
+        try:
+            found = dfx.owned_processes(marker)
+            assert [h.pid for h in found] == [pid] and marker in found[0].cmdline
+            problems = dfx.stop_survivors(found + found, "started in the world")
+            assert problems == [f"process {pid} started in the world outlived it and was stopped on SIGTERM: "
+                                f"{found[0].cmdline!r}"], problems
+            assert unrelated.poll() is None
+        finally:
+            unrelated.kill()
+            unrelated.wait(timeout=10)
+        assert dfx._wait_for(lambda: dfx.owned_processes(marker) == [], 10)
+        # What has gone already is passed over.
+        assert dfx.stop_survivors(found, "started in the world") == []
+    finally:
+        h = dfx.ProcHandle.of(pid)
+        if h is not None and marker in h.cmdline:
+            h.stop()
+
+
+# -- What the world keeps --------------------------------------------------------
+
+
+_PEM = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n"
+
+
+def test_secrets_in_reads_the_whole_world_but_the_files_meant_for_them(tmp_path):
+    code = "0f" * 16
+
+    def put(rel: str, text: str) -> None:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    # Meant to hold them.
+    put("control/codes", f"itest-dir {code}\n")
+    put("keys/dana/id_ed25519", _PEM)
+    put("certs/c3/client.key", _PEM.replace("OPENSSH", "EC"))
+    put("homes/dana-2/.shed/creds/dir-itest/client.key", _PEM)
+    put("state/directory/enrolment.json", json.dumps({"private_key": _PEM.replace("OPENSSH ", "")}))
+    put("state/ca_key.pem", _PEM)
+    put("state/tls_key.pem", _PEM)
+    put("state/host_key", _PEM)
+    # Clean.
+    put("keys/dana/id_ed25519.pub", "ssh-ed25519 AAAA")
+    put("logs/server-1.log", "a log naming -----BEGIN OPENSSH PRIVATE KEY----- in words only\n")
+    assert dfx.secrets_in(tmp_path, code) == []
+    # Anywhere else: the server's home and TMPDIR, its config, every log (the
+    # reference server's too), identity homes, a key under another name.
+    put("homes/server/.cache/x", f"code={code}")
+    put("t/agent-1/agent.log", code)
+    put("server.yaml", f"note: {code}\n")
+    put("logs/ref.err", json.dumps({"k": _PEM}))
+    put("homes/dana-2/.shed/config.yaml", _PEM)
+    put("state/directory/users.json", f"{code}")
+    put("control/users.json", code)
+    (tmp_path / "control" / "link").symlink_to(tmp_path / "control" / "codes")
+    assert dfx.secrets_in(tmp_path, code) == [
+        "control/users.json: holds the enrolment code",
+        "homes/dana-2/.shed/config.yaml: holds a private key",
+        "homes/server/.cache/x: holds the enrolment code",
+        "logs/ref.err: holds a private key",
+        "server.yaml: holds the enrolment code",
+        "state/directory/users.json: holds the enrolment code",
+        "t/agent-1/agent.log: holds the enrolment code",
+    ]
+
+
+_JWT = "eyJhbGciOiJSUzI1NiIsInR5cCI6ImF0K2p3dCJ9.eyJzdWIiOiJzcnZfMCJ9.c2lnbmF0dXJl"
+
+
+def test_secrets_in_finds_a_jwt_shaped_string_outside_the_key_files(tmp_path):
+    code = "0f" * 16
+
+    def put(rel: str, text: str) -> None:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    put("control/codes", f"itest-dir {code}\n")
+    put("state/directory/enrolment.json", json.dumps({"note": _JWT}))  # a file meant to hold a key
+    put("logs/server-1.log", "directory: good pull: version abc; eyJshort.x.y; a.b.c\n")  # not JWT-shaped
+    assert dfx.secrets_in(tmp_path, code) == []
+    put("logs/server-2.log", f"refused the assertion {_JWT} as sent\n")
+    put("state/directory/users.json", json.dumps({"body": base64.b64encode(b"{}").decode(), "note": _JWT}))
+    put("homes/server/.cache/x", _JWT.rsplit(".", 1)[0] + ".")  # header and claims, no signature
+    assert dfx.secrets_in(tmp_path, code) == [
+        "homes/server/.cache/x: holds a JWT-shaped string",
+        "logs/server-2.log: holds a JWT-shaped string",
+        "state/directory/users.json: holds a JWT-shaped string",
+    ]
+
+
+def test_secrets_in_searches_the_kept_copys_body_decoded(tmp_path):
+    code = "0f" * 16
+
+    def put(rel: str, text: str) -> None:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    def kept(answer: dict) -> str:
+        body = base64.b64encode(json.dumps(answer).encode()).decode()
+        return json.dumps({"format": 1, "version": "a" * 64, "body": body})
+
+    put("control/codes", f"itest-dir {code}\n")
+    put("state/directory/users.json", kept({"contract": 1, "users": []}))
+    assert dfx.secrets_in(tmp_path, code) == []
+    # The token only inside the encoded body: its raw bytes are not in the file.
+    put("state/directory/users.json", kept({"contract": 1, "users": [], "seen": _JWT}))
+    assert _JWT.encode() not in (tmp_path / "state/directory/users.json").read_bytes()
+    assert dfx.secrets_in(tmp_path, code) == ["state/directory/users.json: its kept body holds a JWT-shaped string"]
+    put("state/directory/users.json", kept({"contract": 1, "users": [{"name": code}]}))
+    assert dfx.secrets_in(tmp_path, code) == ["state/directory/users.json: its kept body holds the enrolment code"]
+
+
+def test_the_files_meant_for_a_private_key_are_named_one_folder_at_a_time():
+    assert dfx.path_matches("keys/dana/id_ed25519", "keys/*/id_ed25519")
+    assert not dfx.path_matches("keys/a/b/id_ed25519", "keys/*/id_ed25519")
+    assert not dfx.path_matches("keys/dana/id_ed25519.bak", "keys/*/id_ed25519")
+    assert not dfx.path_matches("state/directory/users.json", "state/directory/enrolment.json")
+
+
+def test_trust_deadline_is_the_last_good_pull_plus_the_trust_time():
+    d = dfx.trust_deadline({"last_good_pull": "2026-11-17T03:36:00.123456789Z", "trusted_until": "ignored"})
+    assert d.isoformat() == "2026-11-17T03:38:00.123456+00:00"
+    assert dfx.trust_deadline({"last_good_pull": "2026-11-17T03:36:00Z"}, 60).isoformat() == "2026-11-17T03:37:00+00:00"
+
+
+# -- The API: answered, refused by the server, or a failure ---------------------
+
+
+def test_a_refusal_is_only_the_servers_own():
+    assert dfx.http_refusal(401, {"error": {"code": "UNAUTHORIZED", "message": "x"}}) == "HTTP 401 UNAUTHORIZED"
+    assert dfx.http_refusal(403, {"error": {"code": "FORBIDDEN"}}) == "HTTP 403 FORBIDDEN"
+    for status, body in ((401, None), (403, {"raw": "<html>"}), (403, [1]), (500, {"error": {"code": "X"}}),
+                         (200, {"sheds": []}), (None, None)):
+        assert dfx.http_refusal(status, body) == "", (status, body)
+
+    def ssl_error(reason):
+        e = ssl.SSLError(1, f"[SSL: {reason}] alert")
+        e.reason = reason
+        return e
+
+    assert dfx.tls_refusal(ssl_error("SSLV3_ALERT_BAD_CERTIFICATE")) == "TLS alert SSLV3_ALERT_BAD_CERTIFICATE"
+    for e in (ssl_error("TLSV1_ALERT_UNKNOWN_CA"), ssl_error("CERTIFICATE_VERIFY_FAILED"), ssl.SSLEOFError(8, "eof"),
+              ConnectionResetError(104, "reset"), ConnectionRefusedError(111, "refused"), OSError("x")):
+        assert dfx.tls_refusal(e) == "", e
+    assert dfx.ApiAnswer(None, None, "TLS alert X").refused
+    assert not dfx.ApiAnswer(200, {}).refused and not dfx.ApiAnswer(500, None).refused
+
+
+def test_an_api_request_that_gets_no_answer_is_a_failure_not_a_refusal(tmp_path):
+    # Nothing listens.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    with pytest.raises(dfx.TransportFailure, match="no TLS connection"):
+        dfx.api_request("127.0.0.1", port, "sha256:00", ("c", "k"), "/api/sheds")
+    # A listener that closes every connection at once (a server going down).
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    import threading
+
+    def serve():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            c.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        with pytest.raises(dfx.TransportFailure):
+            dfx.api_request("127.0.0.1", srv.getsockname()[1], "sha256:00", ("c", "k"), "/api/sheds", timeout=5)
+    finally:
+        srv.close()
+        t.join(timeout=5)
+    assert issubclass(dfx.TransportFailure, AssertionError)
+
+
+# -- The world's own clean-up ----------------------------------------------------
+
+
+def _fake_bin(tmp_path: Path) -> Path:
+    b = tmp_path / "bin"
+    (b / "test").mkdir(parents=True)
+    for p in dfx.required_binaries(b):
+        p.write_text("#!/bin/sh\nexit 1\n")
+        p.chmod(0o755)
+    return b
+
+
+def test_the_world_leaves_no_folder_when_a_prerequisite_is_missing(tmp_path, monkeypatch):
+    base = tmp_path / "w"
+    base.mkdir()
+    monkeypatch.setenv("SHED_BIN_DIR", str(_fake_bin(tmp_path)))
+    monkeypatch.setattr(dfx, "socket_base", lambda tmp: str(base))
+    monkeypatch.setattr(dfx.shutil, "which", lambda name: None)
+    with pytest.raises(AssertionError, match="ssh and false must be on PATH"):
+        with dfx.directory_world():
+            pass
+    assert list(base.iterdir()) == []
+
+
+def test_the_world_removes_its_folder_when_it_cannot_start(tmp_path, monkeypatch):
+    if shutil.which("ssh-keygen") is None or shutil.which("ssh") is None:
+        pytest.skip("ssh and ssh-keygen are needed")
+    base = tmp_path / "w"
+    base.mkdir()
+    monkeypatch.setenv("SHED_BIN_DIR", str(_fake_bin(tmp_path)))
+    monkeypatch.setattr(dfx, "socket_base", lambda tmp: str(base))
+    # The reference server (a script that exits at once) never comes up.
+    with pytest.raises(AssertionError, match="the reference server exited"):
+        with dfx.directory_world():
+            pass
+    assert list(base.iterdir()) == []
+
+
+def test_a_held_connection_is_registered_for_clean_up_before_it_starts(tmp_path):
+    from types import SimpleNamespace
+
+    if shutil.which("ssh") is None or shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh and ssh-keygen are needed")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    key = tmp_path / "k"
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", str(key)], check=True, timeout=30)
+    world = SimpleNamespace(ssh=shutil.which("ssh"), false=shutil.which("false"), sockets=tmp_path, logs=tmp_path,
+                            known_hosts=tmp_path / "known_hosts", ssh_port=port, _n=0, _helpers=[])
+    who = dfx.DirIdentity(user="u", key=key, home=tmp_path, entry="e", host="127.0.0.1", ssh_port=port,
+                          shim=tmp_path / "bin" / "ssh")
+    # Nothing listens: the start fails, and the world already holds it.
+    with pytest.raises(AssertionError, match="was refused"):
+        dfx.World.held(world, who)
+    (h,) = world._helpers
+    assert isinstance(h, dfx.Held) and h.proc is not None and h.proc.poll() is not None
+    h.close()
+    # One that never started closes too.
+    dfx.Held(world, who, "_bootstrap", 9).close()

@@ -1,0 +1,16 @@
+{
+  "name": "top-level-duplicate-escaped-name",
+  "description": "contract named twice at the top level, once as \"contract\" and once as \"\\u0063ontract\", both with the value 1. Member names are compared after JSON unescaping (Conventions), so the two are one name given twice and the whole answer is refused (rule 6). A reader comparing names as written would see an unknown member and admit the answer. The body is given as text so that the escape reaches the client exactly as written.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "text": "{\"contract\":1,\"\\u0063ontract\":1,\"organization\":\"example\",\"version\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"generated_at\":\"2026-11-16T06:00:00Z\",\"rules\":{\"version\":0},\"users\":[{\"name\":\"ada\",\"admin\":true,\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe\",\"label\":\"laptop\"}]}]}"
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

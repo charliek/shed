@@ -349,6 +349,81 @@ key is accepted (`unreachable`). `USER` is `-` on a server with no user list.
 The statuses are listed under [API › POST
 /api/users/refresh](api.md#post-apiusersrefresh).
 
+On a server whose users come from an account service
+([`auth.directory`](configuration.md#users-from-an-account-service)), it pulls
+the service's list now, even while the service's `Retry-After` is pending, and
+prints the pull's row first:
+
+```text
+Directory pull: good: version 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0, 3 users (1 skipped)
+```
+
+A failed pull prints why, then the list in force after it, and **the command
+exits 1**:
+
+```text
+Directory pull: failed: directory: unavailable (HTTP 503) "UNAVAILABLE": "try later"
+The list held stays: version 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0, 1 user (0 skipped)
+Error: refresh users on work: the directory pull failed; the list in force is unchanged
+```
+
+When no list is in force after the pull, the second line is `No list held:
+only the local admins can log in.`, `The list held is past its trust time:
+only the local admins can log in.` or `The list held is withdrawn: only the
+local admins can log in.`, and the error ends `the directory pull failed; only
+the local admins are admitted`. The counts are the list's users the server
+admits and the entries it skips; local admins are not counted.
+
+### shed users status
+
+Shows where the server's users come from and who they are (name, admin flag
+and source; never a key), and on a directory server the state of its list.
+Admin only; refused to a [script key](security.md#expired-keys-and-script-keys).
+
+```bash
+shed users status [-s <server>] [--json]
+```
+
+```text
+Source: directory (an account service's list, beside the local admins)
+Account service:  https://accounts.example.test
+Organization:     example
+Client id:        srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a
+State:            trusted
+Last good pull:   2026-11-17T09:00:00Z
+Version:          0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0
+Trusted until:    2026-11-20T09:00:00Z (about 2d 22h 30m left, by this machine's clock)
+Last attempt:     2026-11-17T10:00:00Z, failed
+Last error:       directory: unavailable (HTTP 503) "UNAVAILABLE": "try later"
+Next attempt:     2026-11-17T10:15:00Z
+Kept copy:        kept
+
+Users:
+  USER   ADMIN  SOURCE
+  "ada"  yes    directory
+  "bob"  no     directory
+  ops    yes    local
+
+Skipped entries (1):
+  "ops": its name is a local admin's (the local admin is a separate, local-only identity)
+```
+
+| Line | Meaning |
+|------|---------|
+| `Source` | `directory`, `config (auth.users)`, or `none` (no user list: every accepted key is the implicit user, an admin; nothing else is printed) |
+| `State` | `trusted`, `expired` (the list's trust time ended), `no-copy` (enrolled, no list yet), `not-enrolled` or `enrolment-unusable`, with the reason in brackets |
+| `Trusted until` | The end of the list's trust time; while it is trusted, about how long is left by this machine's clock (the server's state is what counts) |
+| `Last attempt`, `Last error`, `Next attempt` | The last pull, why it failed, and when the next is due (`due now` when none is scheduled) |
+| `Kept copy` | `kept`, `none`, `unused` (the copy found at start failed a check), `not-written` (the last good pull's copy could not be written; the old one was removed) or `stale-on-disk` (a copy that must not be used could not be removed), with why in brackets |
+| `Users` | `SOURCE` is `local` for a local admin, `directory` for a list user, `config` on a server with `auth.users`. A name from the service is quoted |
+| `Skipped entries` | The list's entries the server does not answer for, each quoted with its reason |
+
+A warning line follows the table when every key of every local admin has
+expired. Text that came from the account service is quoted, and control
+characters the server sends are shown escaped, in `--json` too. A server older
+than this command answers `<server>: this server has no status route (it is
+older than 'shed users status')`.
+
 ## Credential Sources
 
 ### shed source
@@ -1544,6 +1619,45 @@ shed-server client list [--json] [--config <path>]
 
 The table has `NAME`, `PREFIX`, `MAX SHEDS`, `MAX AGE`, `CERT MAX TTL`,
 `NETWORK`, `SERVER MOUNTS`, `IMAGES` and `CAPS`; `--json` prints an array.
+
+### shed-server directory enroll
+
+Enrols this server, once, with the account service at `auth.directory.url`
+(see [Configuration › Users from an account
+service](configuration.md#users-from-an-account-service)). It makes an Ed25519
+key pair, sends the public key with a one-time enrolment code, and on the
+service's answer writes the key and the enrolment to
+`{state_dir}/directory/enrolment.json` (mode `0600`, in a directory of mode
+`0700`). Run it on the shed host as the user the server runs as, with the same
+`--config`.
+
+```bash
+sudo shed-server directory enroll [--name <name>] [--config <path>]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--name` | the host name | The name the account service shows for this server: 1 to 255 printable ASCII characters (required when the host name is not one) |
+| `--config` | Auto-detect | Path to server config file |
+
+The code is read from standard input, never from the command line: at a
+prompt that does not echo (`Enrolment code (not echoed): `) when standard
+input is a terminal, otherwise one line, piped from the command that issued it
+or from a file only you can read. It is 1 to 64 bytes. The command never waits
+for another enrolment's lock, refuses a server already enrolled (naming its
+client id), and refuses a name, or an answer, that contains the code. On
+success it prints:
+
+```text
+State directory: /etc/shed
+Enrolled with the account service at https://accounts.example.test as srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a (organization example, name "build-1").
+Wrote /etc/shed/directory/enrolment.json (mode 0600): this server's key for the account service, which never leaves this host.
+```
+
+Every failure exits 1 and says whether anything was written and what to do;
+a lost answer says how to recover. The [User Directory
+guide](../guides/user-directory.md#enrol) covers each case, enrolling again and
+recovery.
 
 ### shed-server network teardown
 

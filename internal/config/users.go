@@ -219,3 +219,34 @@ func (c *ServerConfig) ExpiredUserKeys(now time.Time) []string {
 	}
 	return out
 }
+
+// EveryUserKeyExpired is ExpiredUserKeys(now) when it lists every auth.users
+// key (and there is at least one), else nil. On a directory server, where
+// auth.users are the local admins, no local admin can then log in.
+func (c *ServerConfig) EveryUserKeyExpired(now time.Time) []string {
+	total := 0
+	for _, name := range c.UserNames() {
+		total += len(c.Auth.Users[name].Keys)
+	}
+	if expired := c.ExpiredUserKeys(now); total > 0 && len(expired) == total {
+		return expired
+	}
+	return nil
+}
+
+// UsersWithEveryKeyExpired names, by name only, the auth.users entries that
+// have keys when every auth.users key has expired at now (as
+// EveryUserKeyExpired), sorted; nil otherwise. It holds no label: for an
+// answer an API client is shown.
+func (c *ServerConfig) UsersWithEveryKeyExpired(now time.Time) []string {
+	if c.EveryUserKeyExpired(now) == nil {
+		return nil
+	}
+	var out []string
+	for _, name := range c.UserNames() {
+		if len(c.Auth.Users[name].Keys) > 0 {
+			out = append(out, name)
+		}
+	}
+	return out
+}

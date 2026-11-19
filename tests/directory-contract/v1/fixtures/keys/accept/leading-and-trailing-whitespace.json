@@ -1,0 +1,6 @@
+{
+  "line": " \t ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOVzZKKwOmTO0hU1SOKYkhX1xXdv5o1do9QKlxN4ibbx corpus-ed25519 \t ",
+  "canonical": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOVzZKKwOmTO0hU1SOKYkhX1xXdv5o1do9QKlxN4ibbx",
+  "fingerprint": "SHA256:ZqbohB7ZbB2RGUW2hASD5r0PeF2Hmq5GrV4wfUv3ZKA",
+  "algorithm": "ssh-ed25519"
+}

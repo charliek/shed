@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -255,6 +256,7 @@ func (s *Server) streamListener(w http.ResponseWriter, r *http.Request, listener
 	ctx := r.Context()
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
+	stillTheCaller := s.busCallerCheck(r, listener)
 
 	for {
 		select {
@@ -268,6 +270,17 @@ func (s *Server) streamListener(w http.ResponseWriter, r *http.Request, listener
 			env := listener.Take(m)
 			if env == nil {
 				continue
+			}
+			// On a directory server the caller is checked again, at the
+			// point of sending: a user who left the list, whose key moved to
+			// another user, or whose certificate is past its validity dates,
+			// is sent nothing more. The stream ends; a
+			// request stays pending as it does for any stream that ends (Take
+			// keeps it), and an event is dropped with it.
+			if stillTheCaller != nil && !stillTheCaller() {
+				log.Printf("credential bus: closing the %q stream of machine %s (%q)%s: its certificate no longer authenticates its user; nothing more is sent on it",
+					listener.Namespace, listener.MachineID, listener.MachineName, forBusUser(listener.User))
+				return
 			}
 			data, err := json.Marshal(env)
 			if err != nil {
@@ -290,6 +303,40 @@ func (s *Server) streamListener(w http.ResponseWriter, r *http.Request, listener
 				return
 			}
 		}
+	}
+}
+
+// busCallerCheck is the check a credential-bus stream makes again before each
+// message it sends, on a server whose user lookup is
+// users.BoundCredentialsOnly (a directory server, whose users change while it
+// runs): the request's client certificate must still be inside its validity
+// dates (certValidAt, as the mtls middleware checks every request's) and
+// still authenticate the listener's user (CertificateUser, against the lookup
+// as it is then). nil on any other server, whose streams are authorized once,
+// when they open, as they always were. A request with no client certificate
+// fails the check.
+func (s *Server) busCallerCheck(r *http.Request, listener *plugin.Listener) func() bool {
+	if _, ok := s.users.(users.BoundCredentialsOnly); !ok {
+		return nil
+	}
+	var leaf *x509.Certificate
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		leaf = r.TLS.PeerCertificates[0]
+	}
+	clock := s.busNow
+	if clock == nil {
+		clock = time.Now
+	}
+	return func() bool {
+		if leaf == nil {
+			return false
+		}
+		now := clock()
+		if !certValidAt(leaf, now) {
+			return false
+		}
+		u, _, ok := CertificateUser(s.users, leaf, now)
+		return ok && !u.Implicit && u.Name == listener.User
 	}
 }
 

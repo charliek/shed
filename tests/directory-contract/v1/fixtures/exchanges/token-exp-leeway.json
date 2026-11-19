@@ -1,0 +1,162 @@
+{
+  "name": "token-exp-leeway",
+  "description": "Fresh assertions at and just outside the exp boundary (t < exp + 30 s), each signed with its iat before the service's clock t. iat = t - 75 (exp 15 s in the past, inside the leeway): accepted. iat = t - 89 (exp + 30 s is t + 1 s): accepted. iat = t - 90 (exp + 30 s is exactly t): invalid_client. With exp - iat = 30, iat = t - 59: accepted, and iat = t - 60 (exp + 30 s is exactly t): invalid_client, though iat is only 60 s old: the boundary is on exp, not on iat.",
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "iat_offset": -75
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": "no-cache",
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "access_token": "{{access_token}}",
+      "expires_in": 600,
+      "scope": "directory:read",
+      "token_type": "bearer"
+    }
+  },
+  "then": [
+    {
+      "assertion": {
+        "key": "server-ed25519",
+        "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "iat_offset": -89
+      },
+      "request": {
+        "method": "POST",
+        "path": "/oauth2/token",
+        "headers": {
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": "no-cache",
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "access_token": "{{access_token}}",
+          "expires_in": 600,
+          "scope": "directory:read",
+          "token_type": "bearer"
+        }
+      }
+    },
+    {
+      "assertion": {
+        "key": "server-ed25519",
+        "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "iat_offset": -90
+      },
+      "request": {
+        "method": "POST",
+        "path": "/oauth2/token",
+        "headers": {
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}"
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "error": "invalid_client",
+          "error_description": "{{description}}"
+        }
+      }
+    },
+    {
+      "assertion": {
+        "key": "server-ed25519",
+        "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "lifetime": 30,
+        "iat_offset": -59
+      },
+      "request": {
+        "method": "POST",
+        "path": "/oauth2/token",
+        "headers": {
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": "no-cache",
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "access_token": "{{access_token}}",
+          "expires_in": 600,
+          "scope": "directory:read",
+          "token_type": "bearer"
+        }
+      }
+    },
+    {
+      "assertion": {
+        "key": "server-ed25519",
+        "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "lifetime": 30,
+        "iat_offset": -60
+      },
+      "request": {
+        "method": "POST",
+        "path": "/oauth2/token",
+        "headers": {
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}"
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "error": "invalid_client",
+          "error_description": "{{description}}"
+        }
+      }
+    }
+  ]
+}

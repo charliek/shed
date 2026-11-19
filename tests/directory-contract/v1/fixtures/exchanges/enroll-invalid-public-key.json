@@ -1,0 +1,38 @@
+{
+  "name": "enroll-invalid-public-key",
+  "description": "A public key carrying a private member (d): 400 INVALID_PUBLIC_KEY, refused before the code is looked up, so the code stays unspent. A server that sends one has leaked its key.",
+  "request": {
+    "method": "POST",
+    "path": "/v1/servers/enroll",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "code": "pending-code-for-srv-c-0000000000000",
+      "name": "build-1.example.test",
+      "public_key": {
+        "crv": "Ed25519",
+        "d": "NHeag29J2Xiwi2c44mZPGMwy4iqkMSHXAs3I7EdsKEc",
+        "kty": "OKP",
+        "x": "NHeag29J2Xiwi2c44mZPGMwy4iqkMSHXAs3I7EdsKEc"
+      }
+    }
+  },
+  "response": {
+    "status": 400,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "error": {
+        "code": "INVALID_PUBLIC_KEY",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

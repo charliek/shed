@@ -1,0 +1,102 @@
+{
+  "name": "directory-ok",
+  "description": "A live server (srv-a) logs in and reads the directory: every user of the world, ordered by name; each user's keys ordered by label, with expires where the key has one; keys always present.",
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": "no-cache",
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "access_token": "{{access_token}}",
+      "expires_in": 600,
+      "scope": "directory:read",
+      "token_type": "bearer"
+    }
+  },
+  "then": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/directory",
+        "headers": {
+          "Authorization": "Bearer {{access_token}}"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json",
+          "ETag": null,
+          "Pragma": null,
+          "Retry-After": null,
+          "WWW-Authenticate": null
+        },
+        "body": {
+          "contract": 1,
+          "generated_at": "2026-11-16T06:00:00Z",
+          "organization": "example",
+          "rules": {
+            "version": 0
+          },
+          "users": [
+            {
+              "admin": true,
+              "keys": [
+                {
+                  "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+                  "label": "laptop"
+                },
+                {
+                  "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+                  "label": "yubikey"
+                }
+              ],
+              "name": "ada"
+            },
+            {
+              "admin": false,
+              "keys": [
+                {
+                  "expires": "2027-01-01T00:00:00Z",
+                  "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEeWBu3C9yakpSruddaMXyxBJe9M+Ykumvj49G+jJxeX",
+                  "label": "desk"
+                }
+              ],
+              "name": "linus"
+            },
+            {
+              "admin": false,
+              "keys": [
+                {
+                  "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIERf1v1GIX0HaSB21SvWXsjbjLpQw4bbLwkBKozSaD4K",
+                  "label": "laptop"
+                }
+              ],
+              "name": "turing"
+            }
+          ],
+          "version": "{{version}}"
+        }
+      }
+    }
+  ]
+}

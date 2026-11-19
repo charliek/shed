@@ -1,0 +1,27 @@
+{
+  "name": "directory-no-bearer",
+  "description": "No Authorization header: 401 invalid_token with WWW-Authenticate. Log in, then ask again.",
+  "request": {
+    "method": "GET",
+    "path": "/v1/directory",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": "Bearer error=\"invalid_token\""
+    },
+    "body": {
+      "error": {
+        "code": "invalid_token",
+        "message": "{{message}}"
+      }
+    }
+  }
+}

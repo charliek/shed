@@ -1,0 +1,92 @@
+{
+  "name": "key-expires-boundaries-accepted",
+  "description": "Date-times at the edge of what a client accepts in expires (rule 7), each accepted: bob's key expires 2028-02-29T00:00:00Z, the 29th of February in a leap year; turing's key expires 2027-01-01T00:00:00+23:59, the largest offset. ada, bob and turing all stand, each with the key it sent.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "contract": 1,
+      "organization": "example",
+      "version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "generated_at": "2026-11-16T06:00:00Z",
+      "rules": {
+        "version": 0
+      },
+      "users": [
+        {
+          "name": "ada",
+          "admin": true,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+              "label": "laptop"
+            }
+          ]
+        },
+        {
+          "name": "bob",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+              "label": "laptop",
+              "expires": "2028-02-29T00:00:00Z"
+            }
+          ]
+        },
+        {
+          "name": "turing",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIERf1v1GIX0HaSB21SvWXsjbjLpQw4bbLwkBKozSaD4K",
+              "label": "laptop",
+              "expires": "2027-01-01T00:00:00+23:59"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          }
+        ]
+      },
+      {
+        "name": "bob",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+            "label": "laptop",
+            "expires": "2028-02-29T00:00:00Z"
+          }
+        ]
+      },
+      {
+        "name": "turing",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIERf1v1GIX0HaSB21SvWXsjbjLpQw4bbLwkBKozSaD4K",
+            "label": "laptop",
+            "expires": "2027-01-01T00:00:00+23:59"
+          }
+        ]
+      }
+    ],
+    "skipped": []
+  }
+}

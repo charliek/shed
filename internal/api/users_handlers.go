@@ -28,7 +28,9 @@ func (s *Server) SetKeyRefresher(r users.Refresher) { s.keyRefresher = r }
 
 // handleUsersRefresh is POST /api/users/refresh (`shed users refresh`): an
 // admin forces a fetch of every GitHub login, checked against its pinned
-// account id, and gets one row per login.
+// account id, and gets one row per login; on a directory server, a pull of
+// the directory's list, and its row (good or failed, both with 200). Only
+// the request's own deadline is an error (504).
 func (s *Server) handleUsersRefresh(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r, "refreshing user keys") {
 		return
@@ -43,12 +45,28 @@ func (s *Server) handleUsersRefresh(w http.ResponseWriter, r *http.Request) {
 	report, err := s.keyRefresher.Refresh(ctx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
+			what := "the GitHub fetch"
+			if _, ok := s.keyRefresher.(UsersStatusReporter); ok {
+				what = "the directory pull"
+			}
 			writeError(w, http.StatusGatewayTimeout, config.ErrInternalError,
-				"the GitHub fetch is still running; its result applies when it ends")
+				what+" is still running; its result applies when it ends")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, config.ErrInternalError, "refreshing keys: "+err.Error())
 		return
+	}
+	// A directory server's pull is a row whether it was good or failed: a
+	// failed pull is not an error of the request.
+	if d := report.Directory; d != nil {
+		resp.Directory = &config.DirectoryRefreshRow{
+			Status:  d.Status,
+			List:    d.List,
+			Version: d.Version,
+			Users:   d.Users,
+			Skipped: d.Skipped,
+			Error:   d.Error,
+		}
 	}
 	for _, row := range report.Logins {
 		resp.Logins = append(resp.Logins, config.GitHubLoginRefresh{
@@ -64,6 +82,71 @@ func (s *Server) handleUsersRefresh(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// UsersStatusReporter is a user lookup whose users come from a source with a
+// state of its own to report: a directory server's (auth.directory). GET
+// /api/users/status asks the lookup for it. The lookups of a server with no
+// user list or with auth.users do not implement it; the route answers for
+// them from the lookup itself.
+type UsersStatusReporter interface {
+	// UsersStatus is the source's state now: Source directory, its
+	// Directory block (without ExpiredLocalAdmins, which the route adds
+	// from the server's config) and its users. It holds no key or label.
+	UsersStatus() config.UsersStatusResponse
+}
+
+// handleUsersStatus is GET /api/users/status (`shed users status`): an admin
+// sees where the server's users come from, who they are (name, admin flag
+// and source, never a key), and on a directory server the state of its list:
+// its state and why, the last good pull, the trust time, the last attempt
+// and its error, the next attempt, the kept copy, and the entries skipped.
+//
+//	403 FORBIDDEN  the caller is not an admin, or uses a script key
+//
+// A script key is automation, not a person: like the credential source
+// routes, this one is refused to it even when its user is an admin.
+func (s *Server) handleUsersStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r, "the status of the server's users") {
+		return
+	}
+	if callerFrom(r.Context()).Script {
+		writeError(w, http.StatusForbidden, config.ErrForbidden, "a script key cannot read the status of the server's users")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.usersStatus(time.Now()))
+}
+
+// usersStatus is what GET /api/users/status answers at now.
+func (s *Server) usersStatus(now time.Time) config.UsersStatusResponse {
+	if rep, ok := s.users.(UsersStatusReporter); ok {
+		st := rep.UsersStatus()
+		if st.Users == nil {
+			st.Users = []config.UserStatus{}
+		}
+		if st.Directory != nil {
+			if st.Directory.Skipped == nil {
+				st.Directory.Skipped = []config.SkippedEntry{}
+			}
+			if s.cfg != nil {
+				// By name only: no label, key or fingerprint reaches the
+				// answer.
+				st.Directory.ExpiredLocalAdmins = s.cfg.UsersWithEveryKeyExpired(now)
+			}
+		}
+		return st
+	}
+	if s.users == nil || !users.HasUserList(s.users) {
+		return config.UsersStatusResponse{Source: config.UsersSourceNone, Users: []config.UserStatus{}}
+	}
+	out := config.UsersStatusResponse{Source: config.UsersSourceConfig, Users: []config.UserStatus{}}
+	for _, u := range s.users.Users() {
+		if u.Implicit {
+			continue
+		}
+		out.Users = append(out.Users, config.UserStatus{Name: u.Name, Admin: u.Admin, Source: config.UserFromConfig})
+	}
+	return out
 }
 
 // assignBodyLimit bounds the body of POST /api/sheds/{name}/assign.

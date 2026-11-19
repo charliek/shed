@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/gliderlabs/ssh"
@@ -38,6 +39,18 @@ type Server struct {
 	termConfig  *terminal.Config
 	keyAuth     KeyAuth
 	bootstrap   *BootstrapInfo // static bundle metadata; nil until SetBootstrap
+
+	// connMu guards conns: the authenticated connections by the name of the
+	// user each is bound to, kept only with KeyAuth.TrackConnections
+	// (CloseConnectionsExcept). Empty otherwise.
+	connMu sync.Mutex
+	conns  map[string]map[*trackedConn]struct{}
+	// beforeTrack, when set (by tests only), runs on an authenticating
+	// connection after its identity is resolved and before it is tracked.
+	beforeTrack func()
+	// afterClose, when set (by tests only), runs at the end of every close
+	// of a tracked connection (trackedConn.Close).
+	afterClose func()
 }
 
 // KeyAuth is how the SSH server decides public-key auth: the auth.ssh mode,
@@ -52,6 +65,12 @@ type KeyAuth struct {
 	// Users resolves an offered key's fingerprint to its user. nil resolves
 	// nothing, so enforce mode then accepts no key.
 	Users users.Lookup
+	// TrackConnections keeps every authenticated connection by the name of
+	// the user it is bound to, so that CloseConnectionsExcept can close a
+	// user's connections when they stop being a user (a directory server,
+	// whose list changes while it runs). Off by default: then no connection
+	// is wrapped or kept, and authentication runs as it always has.
+	TrackConnections bool
 }
 
 // enforced reports whether keys the lookup does not resolve are refused: in
@@ -208,6 +227,12 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 					return nil, err
 				}
 				setConnIdentity(ctx, id)
+				if s.keyAuth.TrackConnections {
+					if err := s.trackAuthenticated(ctx, id); err != nil {
+						log.Printf("SSH auth DENIED: user=%s fingerprint=%s (%v)", logUser(conn.User()), id.fingerprint, err)
+						return nil, err
+					}
+				}
 				return perms, nil
 			}
 			// Best-effort diagnostic from the transport's authoritative per-attempt
@@ -239,6 +264,10 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 				s.handleSFTP(sess)
 			},
 		},
+	}
+
+	if keyAuth.TrackConnections {
+		s.sshServer.ConnCallback = s.wrapConn
 	}
 
 	// Add the host key to the server.
@@ -465,7 +494,13 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	}
 	authorized := s.keyAuth.known(fingerprint)
 	if !authorized && s.refetchUnknownKey(ctx, user, fingerprint) {
-		log.Printf("SSH auth: key %s is known after fetching the GitHub logins again", fingerprint)
+		// A lookup whose users change while the server runs (a directory's
+		// list) pulled its list; any other fetched GitHub logins.
+		if _, live := s.keyAuth.Users.(users.BoundCredentialsOnly); live {
+			log.Printf("SSH auth: key %s is known after pulling the directory again", fingerprint)
+		} else {
+			log.Printf("SSH auth: key %s is known after fetching the GitHub logins again", fingerprint)
+		}
 		authorized = true
 	}
 	if s.keyAuth.enforced() && !authorized {
@@ -481,17 +516,21 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	return true
 }
 
-// refetchUnknownKey asks the user lookup to look for a key it does not know on
-// GitHub, and reports whether the key is known afterwards. Only in enforce
-// mode (warn lets the key in anyway; off looks nothing up), only when the
-// lookup can fetch (a users.UnknownKeyRefetcher), and only when the login is
-// `_bootstrap` (`shed server add`) or a valid shed name. That check is on the
-// name's syntax alone: nothing about sheds is looked up for a peer that has
-// not authenticated. The lookup then allows one fetch a minute for the whole
-// server, checked before it does anything else; only the login that takes
-// that slot waits for the fetch (up to five seconds), every other returns at
-// once. A key the lookup knows (an expired one included) never gets here, and
-// the lookup refuses a key it dropped for a GitHub account mismatch.
+// refetchUnknownKey asks the user lookup to look for a key it does not know
+// (on GitHub, or in a directory's list), and reports whether the key is known
+// afterwards. Only in enforce mode (warn lets the key in anyway; off looks
+// nothing up), only when the lookup can fetch (a users.UnknownKeyRefetcher),
+// and only when the login is `_bootstrap` (`shed server add`) or a valid shed
+// name. That check is on the name's syntax alone: nothing about sheds is
+// looked up for a peer that has not authenticated. The lookup then takes a
+// server-wide slot, checked before it does anything else; only the login that
+// takes it waits for the fetch, every other returns at once. With GitHub
+// logins (auth.users) the slot is one fetch a minute and the wait up to five
+// seconds, and the lookup refuses a key it dropped for a GitHub account
+// mismatch; with a directory's list (auth.directory) the slot is one pull a
+// minute while pulls succeed, one per retry interval while they fail, none
+// inside a pending Retry-After, and the wait one 20-second deadline. A key
+// the lookup knows (an expired one included) never gets here.
 func (s *Server) refetchUnknownKey(ctx ssh.Context, user, fingerprint string) bool {
 	if !s.keyAuth.enforced() {
 		return false

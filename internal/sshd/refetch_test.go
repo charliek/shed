@@ -2,7 +2,10 @@ package sshd
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -116,6 +119,53 @@ func TestUnknownKeyRefetchAtTheDoor(t *testing.T) {
 			}
 			if n := be.gets.Load(); n != 0 {
 				t.Errorf("the handshake looked a shed up %d times", n)
+			}
+		})
+	}
+}
+
+// liveRefetchLookup is a refetchLookup whose users change while the server
+// runs (users.BoundCredentialsOnly), as a directory's list is.
+type liveRefetchLookup struct{ *refetchLookup }
+
+var _ users.BoundCredentialsOnly = liveRefetchLookup{}
+
+func (liveRefetchLookup) BoundCredentialsOnly() {}
+
+// TestUnknownKeyRefetchLogLine: the line logged when a fetch makes an unknown
+// key known names what was fetched. A lookup whose users change while the
+// server runs (a directory's list) says it pulled the directory and never
+// names GitHub; any other prints, byte for byte, the line it always has.
+func TestUnknownKeyRefetchLogLine(t *testing.T) {
+	const github = "SSH auth: key %s is known after fetching the GitHub logins again"
+	const directory = "SSH auth: key %s is known after pulling the directory again"
+	for _, tc := range []struct {
+		name      string
+		live      bool
+		want, not string
+	}{
+		{"GitHub logins", false, github, directory},
+		{"a directory's list", true, directory, github},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			newcomer := testSigner(t)
+			fp := gossh.FingerprintSHA256(newcomer.PublicKey())
+			base := &refetchLookup{Fake: userstest.Implicit(), upstream: fp}
+			var lookup users.Lookup = base
+			if tc.live {
+				lookup = liveRefetchLookup{base}
+			}
+			_, addr := identityServer(t, &identityBackend{}, lookup)
+			out := captureLog(t)
+			if !dialUser(t, addr, "box", newcomer) {
+				t.Fatal("the key the fetch found was refused")
+			}
+			lines := strings.Split(out.String(), "\n")
+			if !slices.Contains(lines, fmt.Sprintf(tc.want, fp)) {
+				t.Errorf("no line %q in the log:\n%s", fmt.Sprintf(tc.want, fp), out)
+			}
+			if slices.Contains(lines, fmt.Sprintf(tc.not, fp)) || (tc.live && strings.Contains(out.String(), "GitHub")) {
+				t.Errorf("the other lookup's line in the log:\n%s", out)
 			}
 		})
 	}

@@ -1,0 +1,15 @@
+{
+  "name": "redirect-302",
+  "description": "A redirect: never followed; a failed refresh (rule 3).",
+  "response": {
+    "status": 302,
+    "headers": {
+      "Location": "https://elsewhere.example.test/v1/directory",
+      "Cache-Control": "no-store"
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "token-unknown-client",
+  "description": "An assertion for a client id no server holds: invalid_client, the same answer as any other authentication failure.",
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}"
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": null,
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "error": "invalid_client",
+      "error_description": "{{description}}"
+    }
+  }
+}

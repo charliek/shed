@@ -1499,6 +1499,36 @@ func (c *APIClient) RefreshUsers() (*config.UsersRefreshResponse, error) {
 	return &resp, nil
 }
 
+// errUsersStatusUnsupported is a server older than GET /api/users/status:
+// it answers the route with a 404 (the route itself never does).
+var errUsersStatusUnsupported = errors.New("this server has no status route")
+
+// UsersStatus asks where the server's users come from and, on a directory
+// server, the state of its list (admin only).
+func (c *APIClient) UsersStatus() (*config.UsersStatusResponse, error) {
+	resp, err := c.sendWithReauth(
+		func(cred clienttoken.Credential) (*http.Response, error) {
+			return c.sendRequest(http.MethodGet, "/api/users/status", nil, cred)
+		},
+		connectFailure)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return nil, errUsersStatusUnsupported
+	default:
+		return nil, c.parseError(resp)
+	}
+	var st config.UsersStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	return &st, nil
+}
+
 // GetSystemDF retrieves disk usage information for the server.
 func (c *APIClient) GetSystemDF() (*config.DiskUsage, error) {
 	var du config.DiskUsage

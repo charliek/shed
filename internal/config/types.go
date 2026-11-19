@@ -614,9 +614,167 @@ type ShedsResponse struct {
 }
 
 // UsersRefreshResponse is returned by POST /api/users/refresh: one row per
-// GitHub login whose keys the server follows.
+// GitHub login whose keys the server follows, and, on a server whose users
+// come from a directory (auth.directory), the row of the pull it made.
 type UsersRefreshResponse struct {
 	Logins []GitHubLoginRefresh `json:"logins"`
+	// Directory is the pull's row on a directory server; absent on every
+	// other server. A failed pull is a row (the request still answers 200).
+	Directory *DirectoryRefreshRow `json:"directory,omitempty"`
+}
+
+// Directory refresh statuses (DirectoryRefreshRow.Status).
+const (
+	// DirectoryPullGood: the pull was good; its list is the one the server
+	// answers for.
+	DirectoryPullGood = "good"
+	// DirectoryPullFailed: the pull failed; the list the server held before
+	// stays while its trust time lasts (DirectoryRefreshRow.List says
+	// whether one is in force).
+	DirectoryPullFailed = "failed"
+)
+
+// Whether a list is in force after a directory pull (DirectoryRefreshRow.List).
+const (
+	// DirectoryListInForce: the server answers for a list (Version), inside
+	// its trust time.
+	DirectoryListInForce = "in-force"
+	// DirectoryListTrustEnded: the trust time of the list the server holds
+	// has ended: only the local admins are admitted until a good pull.
+	DirectoryListTrustEnded = "trust-ended"
+	// DirectoryListWithdrawn: the pull found the server not enrolled (or its
+	// enrolment unusable) and withdrew the list it held: only the local
+	// admins are admitted.
+	DirectoryListWithdrawn = "withdrawn"
+	// DirectoryListNone: the server holds no list: only the local admins are
+	// admitted.
+	DirectoryListNone = "none"
+)
+
+// DirectoryRefreshRow is a directory pull's row in UsersRefreshResponse. It
+// describes the list in force after the pull: users admitted, never a list
+// held past its trust time.
+type DirectoryRefreshRow struct {
+	// Status is good or failed.
+	Status string `json:"status"`
+	// List is in-force, trust-ended, withdrawn or none: whether a list is in
+	// force after the pull, and if not why.
+	List string `json:"list"`
+	// Version is the version of the list in force after the pull ("" when
+	// none is).
+	Version string `json:"version,omitempty"`
+	// Users is how many of that list's users the server admits, and Skipped
+	// how many of its entries it does not answer for (local admins are not
+	// counted); both 0 when no list is in force.
+	Users   int `json:"users"`
+	Skipped int `json:"skipped"`
+	// Error says why the pull failed, when it did. Text from the account
+	// service in it is quoted.
+	Error string `json:"error,omitempty"`
+}
+
+// Where a server's users come from (UsersStatusResponse.Source).
+const (
+	// UsersSourceConfig: the server's config lists its users (auth.users).
+	UsersSourceConfig = "config"
+	// UsersSourceDirectory: a directory's list, beside the local admins
+	// (auth.directory).
+	UsersSourceDirectory = "directory"
+	// UsersSourceNone: no user list; every accepted key is the implicit
+	// user, an admin.
+	UsersSourceNone = "none"
+)
+
+// Where one user comes from (UserStatus.Source).
+const (
+	// UserFromConfig: a user of auth.users on a server with no directory.
+	UserFromConfig = "config"
+	// UserFromLocal: a local admin (auth.users beside auth.directory).
+	UserFromLocal = "local"
+	// UserFromDirectory: a user of the directory's list.
+	UserFromDirectory = "directory"
+)
+
+// UsersStatusResponse is returned by GET /api/users/status (`shed users
+// status`, admin only): where the server's users come from, who they are,
+// and on a directory server the state of its list. It never holds a key.
+type UsersStatusResponse struct {
+	// Source is config, directory or none.
+	Source string `json:"source"`
+	// Directory is the state of the directory's list; absent unless Source
+	// is directory.
+	Directory *DirectoryStatus `json:"directory,omitempty"`
+	// Users are the users the server answers for now, sorted by name: no
+	// keys. Empty with no user list (the implicit user is not listed).
+	Users []UserStatus `json:"users"`
+}
+
+// UserStatus is one user in UsersStatusResponse.
+type UserStatus struct {
+	// Name is the user's name. A directory user's name is the account
+	// service's text: print it quoted.
+	Name  string `json:"name"`
+	Admin bool   `json:"admin"`
+	// Source is config, local or directory.
+	Source string `json:"source"`
+}
+
+// The states of a directory server's user source (DirectoryStatus.State).
+const (
+	DirectoryStateTrusted           = "trusted"
+	DirectoryStateExpired           = "expired"
+	DirectoryStateNoCopy            = "no-copy"
+	DirectoryStateNotEnrolled       = "not-enrolled"
+	DirectoryStateEnrolmentUnusable = "enrolment-unusable"
+)
+
+// DirectoryStatus is the state of a directory server's user source.
+type DirectoryStatus struct {
+	// URL is the configured account service (the issuer); Organization the
+	// accepted organization ("" when not known yet); ClientID the server's
+	// enrolment ("" when not enrolled).
+	URL          string `json:"url"`
+	Organization string `json:"organization,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	// State is trusted, expired, no-copy, not-enrolled or
+	// enrolment-unusable, and Reason why it is not trusted.
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
+	// LastGoodPull is when the answer of the last list held arrived, and
+	// Version its version; absent before the first.
+	LastGoodPull *time.Time `json:"last_good_pull,omitempty"`
+	Version      string     `json:"version,omitempty"`
+	// TrustedUntil is when the list held is (or was) trusted until.
+	TrustedUntil *time.Time `json:"trusted_until,omitempty"`
+	// LastAttempt is when the last pull started, and LastError why it failed
+	// (absent when it was good).
+	LastAttempt *time.Time `json:"last_attempt,omitempty"`
+	LastError   string     `json:"last_error,omitempty"`
+	// NextAttempt is when the next scheduled pull is due; absent: at once.
+	NextAttempt *time.Time `json:"next_attempt,omitempty"`
+	// Copy is the kept copy's condition (none, kept, unused, not-written,
+	// stale-on-disk), and CopyError why it is not kept.
+	Copy      string `json:"copy"`
+	CopyError string `json:"copy_error,omitempty"`
+	// Skipped are the entries of the list held that the server does not
+	// answer for.
+	Skipped []SkippedEntry `json:"skipped"`
+	// ExpiredLocalAdmins names the local admins, by name only (no key, label
+	// or fingerprint), when every key of every local admin has expired: then
+	// no local admin can log in. Absent otherwise.
+	ExpiredLocalAdmins []string `json:"expired_local_admins,omitempty"`
+}
+
+// SkippedEntry is one entry of a directory's list that the server does not
+// answer for.
+type SkippedEntry struct {
+	// Name is the entry's name as the account service sent it ("" when it
+	// had none): print it quoted.
+	Name string `json:"name"`
+	// Reason is why, as a code (local-admin-name, duplicate-key, ...), and
+	// Description the same in words.
+	Reason      string `json:"reason"`
+	Description string `json:"description,omitempty"`
 }
 
 // GitHubLoginRefresh is one GitHub login's row in UsersRefreshResponse.
@@ -1372,7 +1530,64 @@ type AuthConfig struct {
 	// come only from here (auth.ssh's key sources are refused beside it), and
 	// each user reaches only their own sheds (an admin may also list, stop
 	// and delete anyone's). Unknown keys are refused at config load.
+	//
+	// Beside Directory, Users holds the local admins only: admin-only,
+	// key-only identities that work whatever state the directory is in.
 	Users map[string]UserConfig `yaml:"users,omitempty"`
+	// Directory, when set, takes the server's users from an account service
+	// that serves a user list over the directory contract
+	// (tests/directory-contract/). It needs mtls and at least one local admin
+	// in Users. See DirectoryConfig.
+	Directory *DirectoryConfig `yaml:"directory,omitempty"`
+}
+
+// Directory refresh and trust bounds and defaults (auth.directory).
+const (
+	// DefaultDirectoryRefresh is auth.directory.refresh when unset: how
+	// long after a good pull the next one is due.
+	DefaultDirectoryRefresh = 24 * time.Hour
+	// DefaultDirectoryTrust is auth.directory.trust when unset: how long
+	// after a good pull the server keeps honouring that list while it
+	// cannot get a newer one.
+	DefaultDirectoryTrust = 72 * time.Hour
+	// MinDirectoryRefresh and MaxDirectoryRefresh bound refresh.
+	MinDirectoryRefresh = time.Minute
+	MaxDirectoryRefresh = 7 * 24 * time.Hour
+	// MaxDirectoryTrust bounds trust from above; refresh bounds it from
+	// below.
+	MaxDirectoryTrust = 30 * 24 * time.Hour
+)
+
+// DirectoryConfig is auth.directory: where the server's user list comes
+// from. The service's URL is its issuer; the server enrols with it once
+// (shed-server directory enroll), then pulls the list on a schedule and keeps
+// a copy, honoured for Trust after the pull that fetched it.
+//
+// The block is decoded by its own UnmarshalYAML (directory.go), so that an
+// omitted refresh or trust is told apart from one written as zero, and every
+// refusal names its field.
+type DirectoryConfig struct {
+	// URL is the service's issuer: an origin (scheme, host and optional
+	// port; no path, query, fragment or user info), the host written plainly
+	// (ASCII letters, digits, '-' and '.', or an IPv6 address in brackets).
+	// One trailing "/" is dropped; the result is the issuer the server
+	// checks and the audience of its sign-in, byte for byte. https, or http
+	// only with AllowPlainHTTP on a loopback host.
+	URL string `yaml:"url"`
+	// Organization, when set, is the organization every answer must name.
+	// Unset, the server accepts the organization its enrolment answer named.
+	Organization string `yaml:"organization,omitempty"`
+	// Refresh is how long after a good pull the next one is due (from 1m to
+	// 7d). Nil (omitted) is the default, 24h; a written zero is out of range.
+	Refresh *Duration `yaml:"refresh,omitempty"`
+	// Trust is how long after a good pull its list is honoured while no
+	// newer one arrives (from Refresh to 30d). Nil (omitted) is the default,
+	// 72h; a written zero is out of range. After it only the local admins
+	// can log in until a good pull.
+	Trust *Duration `yaml:"trust,omitempty"`
+	// AllowPlainHTTP permits an http:// URL, and only on a loopback host
+	// (localhost, 127.0.0.0/8, ::1). For tests.
+	AllowPlainHTTP StrictBool `yaml:"allow_plain_http,omitempty"`
 }
 
 // UserConfig is one user under auth.users. A user needs a GitHub login, a key,

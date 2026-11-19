@@ -12,7 +12,7 @@
 // server accepts is theirs. A server with a user list has named users only:
 // each key belongs to exactly one of them, and an unknown key is nobody's.
 // Each key records where it came from (an inline key, the keys file, a GitHub
-// login or a key listed by hand under a user).
+// login, a key listed by hand under a user, or a directory's list).
 package users
 
 import (
@@ -57,6 +57,10 @@ const (
 	SourceGitHub Source = "github"
 	// SourceAdHoc is a key listed by hand under a user in auth.users.
 	SourceAdHoc Source = "adhoc"
+	// SourceDirectory is a key the server's directory lists under a user
+	// (auth.directory): an account service the server pulls its user list
+	// from.
+	SourceDirectory Source = "directory"
 )
 
 // Key is one accepted SSH public key and where it came from.
@@ -105,38 +109,117 @@ type Lookup interface {
 	Users() []User
 }
 
-// Refresher is a Lookup whose keys come partly from GitHub logins, which it
-// can be told to fetch again at once (`shed users refresh`).
+// Refresher is a Lookup whose keys come partly from GitHub logins, or from a
+// directory's list, which it can be told to fetch again at once (`shed users
+// refresh`).
 type Refresher interface {
 	// Refresh fetches every GitHub login again, checking each against its
-	// pinned account id, and reports what it found. It joins a fetch that
-	// has not started yet, and otherwise starts one after any fetch already
-	// running, so its result is never older than the call. It returns when
-	// the fetch ends or ctx ends, whichever is first.
+	// pinned account id (or pulls the directory's list again), and reports
+	// what it found. It joins a fetch that has not started yet, and otherwise
+	// starts one after any fetch already running, so its result is never
+	// older than the call. It returns when the fetch ends or ctx ends,
+	// whichever is first.
 	Refresh(ctx context.Context) (RefreshReport, error)
 }
 
-// UnknownKeyRefetcher is a Lookup that can look for a key it does not know
-// on GitHub, at most once a minute for the whole server. The SSH front door
-// asks it, in enforce mode only, when an unknown key logs in as `_bootstrap`
-// or as a name that is a valid shed name.
+// UnknownKeyRefetcher is a Lookup that can fetch its users again for a key
+// it does not know (from GitHub logins, or a directory's list), at a bounded
+// rate for the whole server. The SSH front door asks it, in enforce mode
+// only, when an unknown key logs in as `_bootstrap` or as a name that is a
+// valid shed name.
 type UnknownKeyRefetcher interface {
-	// RefetchForUnknownKey takes the server-wide slot (one a minute) before
-	// doing anything else; when it gets it, it starts a fetch on behalf of
-	// the unknown key with this fingerprint, waits up to five seconds for
-	// it, and reports whether the key is known (and not expired)
-	// afterwards. Every other call returns false at once, having started
-	// nothing and waited for nothing: while the slot is used, for a key
-	// dropped because its GitHub login no longer names its pinned account,
-	// and outside enforce mode.
+	// RefetchForUnknownKey takes a server-wide slot before doing anything
+	// else; when it gets it, it starts (or joins) a fetch on behalf of the
+	// unknown key with this fingerprint, waits for it up to a bounded time,
+	// and reports whether the key is known (and not expired) afterwards.
+	// Every other call returns false at once, having started nothing and
+	// waited for nothing. How often the slot may be taken, how long the
+	// wait is, and when else a call is refused are each implementation's,
+	// stated on it (ConfigLookup: one a minute, a five-second wait;
+	// directory.Runtime: by the state of its last pull, one 20-second
+	// deadline). ctx ending ends the wait, not the fetch.
 	RefetchForUnknownKey(ctx context.Context, fingerprint string) bool
 }
 
-// RefreshReport is what one fetch of the GitHub logins found.
+// BoundCredentialsOnly is a Lookup whose users change while the server runs
+// (a directory's list, auth.directory), so that a name may stop being a user,
+// or a key move to another user, at any moment. Two things follow on a
+// server whose lookup implements it, and on no other:
+//   - a credential that names no user (Binding.Bound false: a client
+//     certificate issued before certificates named their user) is refused
+//     outright rather than checked by its key alone, since its key alone
+//     cannot say whose it was; its client enrols again;
+//   - a credential-bus stream checks its caller's certificate again before
+//     each message it sends, and ends when the certificate no longer
+//     authenticates its user.
+//
+// The two lookups of a server with no user list or with auth.users do not
+// implement it.
+type BoundCredentialsOnly interface {
+	Lookup
+	// BoundCredentialsOnly marks the lookup; it does nothing.
+	BoundCredentialsOnly()
+}
+
+// RefreshReport is what one fetch of the GitHub logins found, or, on a
+// server whose users come from a directory, what one pull of its list found.
 type RefreshReport struct {
 	// Logins has one row per configured GitHub login, in config order.
 	Logins []LoginRefresh
+	// Directory is the pull's row on a server whose users come from a
+	// directory (auth.directory); nil on every other server.
+	Directory *DirectoryRefresh
 }
+
+// Directory refresh statuses (DirectoryRefresh.Status).
+const (
+	// DirectoryRefreshGood: the pull was good and its list is the one the
+	// server answers for.
+	DirectoryRefreshGood = "good"
+	// DirectoryRefreshFailed: the pull failed (the service refused it, could
+	// not be reached, answered with something the server refuses, or the
+	// server is not enrolled). The list the server held before stays, while
+	// its trust time lasts (DirectoryRefresh.List says whether it is in
+	// force).
+	DirectoryRefreshFailed = "failed"
+)
+
+// DirectoryRefresh is a directory pull's row in a RefreshReport.
+type DirectoryRefresh struct {
+	// Status is DirectoryRefreshGood or DirectoryRefreshFailed.
+	Status string
+	// Version is the version of the list the server answers for after the
+	// pull ("" when it holds none): the pull's own when it was good.
+	Version string
+	// Users is how many of that list's users the server admits, and Skipped
+	// how many of its entries it does not answer for (the local admins are
+	// not counted). Both are 0 when no list is in force.
+	Users, Skipped int
+	// List says whether a list is in force after the pull, and if not why:
+	// DirectoryListInForce, DirectoryListTrustEnded, DirectoryListWithdrawn or
+	// DirectoryListNone.
+	List string
+	// Error says why the pull failed, when it did. Text from the service in
+	// it is quoted.
+	Error string
+}
+
+// Whether a list is in force after a directory pull (DirectoryRefresh.List).
+const (
+	// DirectoryListInForce: the server answers for a list (Version), inside
+	// its trust time.
+	DirectoryListInForce = "in-force"
+	// DirectoryListTrustEnded: the trust time of the list the server holds
+	// has ended: only the local admins are admitted until a good pull.
+	DirectoryListTrustEnded = "trust-ended"
+	// DirectoryListWithdrawn: this pull found the server not enrolled (or its
+	// enrolment unusable) and withdrew the list it held: only the local
+	// admins are admitted.
+	DirectoryListWithdrawn = "withdrawn"
+	// DirectoryListNone: the server holds no list: only the local admins are
+	// admitted.
+	DirectoryListNone = "none"
+)
 
 // Login refresh statuses (LoginRefresh.Status).
 const (

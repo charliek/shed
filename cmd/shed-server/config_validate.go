@@ -32,6 +32,9 @@ here with a pointer to the upgrade guide.`,
 			// which case it never appears literally in the config file.
 			fmt.Printf("default_image: %s\n", img)
 		}
+		for _, line := range directorySummary(cfg) {
+			fmt.Println(line)
+		}
 		return nil
 	},
 }

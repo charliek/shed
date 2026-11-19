@@ -1,0 +1,38 @@
+{
+  "name": "duplicate-inside-an-ignored-member",
+  "description": "Members named twice are looked for only at the top level, in each user and in each key (rules 6 and 7). Here a member is named twice only inside members a reader ignores: in rules at the top level, in ada's profile and the objects of her history, and in a meta of bob's key. None of those is looked at, so the answer is good and ada and bob stand. The body is given as text because it names members twice.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "text": "{\"contract\":1,\"organization\":\"example\",\"version\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"generated_at\":\"2026-11-16T06:00:00Z\",\"rules\":{\"version\":0,\"version\":0},\"users\":[{\"name\":\"ada\",\"admin\":true,\"profile\":{\"display\":\"Ada\",\"display\":\"A\"},\"history\":[{\"at\":1,\"at\":2}],\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe\",\"label\":\"laptop\"}]},{\"name\":\"bob\",\"admin\":false,\"keys\":[{\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e\",\"label\":\"laptop\",\"meta\":{\"origin\":\"desk\",\"origin\":\"laptop\"}}]}]}"
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          }
+        ]
+      },
+      {
+        "name": "bob",
+        "admin": false,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+            "label": "laptop"
+          }
+        ]
+      }
+    ],
+    "skipped": []
+  }
+}

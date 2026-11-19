@@ -1,0 +1,112 @@
+{
+  "name": "entry-wrong-types",
+  "description": "Five entries that are not users as rule 7 defines them: bob's admin is the string \"true\", carol's keys is null, dave's only label is a number, entry 4 has no name, and entry 5 is a string, not an object. Each is skipped as malformed; ada stands (rule 7). Entries are identified by their index in users, since a skipped entry may have no name.",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "contract": 1,
+      "organization": "example",
+      "version": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "generated_at": "2026-11-16T06:00:00Z",
+      "rules": {
+        "version": 0
+      },
+      "users": [
+        {
+          "name": "ada",
+          "admin": true,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+              "label": "laptop"
+            },
+            {
+              "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+              "label": "yubikey"
+            }
+          ]
+        },
+        {
+          "name": "bob",
+          "admin": "true",
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILQ3mKx8a1NGEfl7t1wWqtWcM/uQcOweBJK5zE5Jqd5e",
+              "label": "laptop"
+            }
+          ]
+        },
+        {
+          "name": "carol",
+          "admin": false,
+          "keys": null
+        },
+        {
+          "name": "dave",
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDGGt3mM1CzzhTeoSaXhz5LTrMGKtctoIugKBssGGpKi",
+              "label": 7
+            }
+          ]
+        },
+        {
+          "admin": false,
+          "keys": [
+            {
+              "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKYXkBjz6tqlFzJhkm2QLBRr5EsaUYsMJcFRaF9U5hBB",
+              "label": "laptop"
+            }
+          ]
+        },
+        "erin"
+      ]
+    }
+  },
+  "expect": {
+    "result": "good",
+    "users": [
+      {
+        "name": "ada",
+        "admin": true,
+        "keys": [
+          {
+            "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBy7bQtK7HKLg24Jda/ypO5MK6DYapUE7szlye2w4Phe",
+            "label": "laptop"
+          },
+          {
+            "key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJsgP7fMowoR9ecxQ00zvjvKV+POeCHm+v/DHkJ/VEPhQs/Qk2uNjjxtSaPCtrqrhPMAiyalcOh4uVdUbynbHTw=",
+            "label": "yubikey"
+          }
+        ]
+      }
+    ],
+    "skipped": [
+      {
+        "entry": 1,
+        "reason": "malformed"
+      },
+      {
+        "entry": 2,
+        "reason": "malformed"
+      },
+      {
+        "entry": 3,
+        "reason": "malformed"
+      },
+      {
+        "entry": 4,
+        "reason": "malformed"
+      },
+      {
+        "entry": 5,
+        "reason": "malformed"
+      }
+    ]
+  }
+}

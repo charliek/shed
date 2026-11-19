@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-date",
+  "description": "503 with Retry-After as an HTTP date: treated as absent, so the 15-minute retry applies (rule 2).",
+  "response": {
+    "status": 503,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "Wed, 18 Nov 2026 07:28:00 GMT"
+    },
+    "body": {
+      "error": {
+        "code": "UNAVAILABLE",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": null
+  }
+}

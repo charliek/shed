@@ -1,0 +1,22 @@
+{
+  "name": "retry-after-one-hour",
+  "description": "429 with Retry-After: 3600: exactly one hour, the most a client honours, waited in full (rule 2).",
+  "response": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Retry-After": "3600"
+    },
+    "body": {
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "try again later"
+      }
+    }
+  },
+  "expect": {
+    "result": "failed",
+    "retry_after_seconds": 3600
+  }
+}
