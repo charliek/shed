@@ -13,6 +13,7 @@ Runs in CI via `make test-integration-units`, next to `test_smoke_units.py`.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -21,6 +22,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import threading
 import time
 import urllib.error
 from pathlib import Path
@@ -4151,6 +4153,434 @@ def test_a_held_connection_is_registered_for_clean_up_before_it_starts(tmp_path)
     h.close()
     # One that never started closes too.
     dfx.Held(world, who, "_bootstrap", 9).close()
+
+
+# The entry cases of test_directory.py (an entry held to its user, its own
+# SSH key, the shed record on the remote backend): their helpers, and the
+# CLI's and the server's words they match.
+
+
+def _as_go(template: str) -> str:
+    """A fixture template as the Go format string that writes it: each
+    quoted placeholder is %q, each bare one %s, a line break is `\\n`."""
+    return re.sub(r"\{[a-z]+\}", "%s", re.sub(r'"\{[a-z]+\}"', "%q", template)).replace("\n", "\\n")
+
+
+def test_the_entry_cases_match_the_clis_own_words():
+    root = dc.REPO_ROOT
+    entrycert = (root / "internal" / "config" / "entrycert.go").read_text()
+    assert f'"{_as_go(dfx.USER_CHANGE_REFUSAL)}\\n"' in entrycert
+    stored, _, tail = dfx.STORED_UNRECORDED_REFUSAL.partition(" records no user")
+    assert tail == "" and f'"{_as_go(stored)} %s; "' in entrycert
+    assert 'records := "records no user (' in entrycert
+    assert f'"{dfx.NO_REQUEST_SENT}. Enrol it again: %s"' in entrycert
+    add = (root / "cmd" / "shed" / "server_add.go").read_text()
+    # Printed by `shed server add` and by a refetch.
+    assert add.count(f'fmt.Printf("{_as_go(dfx.ENTRY_USER_LINE)}"') == 2
+    assert f'fmt.Printf("{_as_go(dfx.ENTRY_USER_CHANGED_LINE)}", previousUser, updated.User)' in add
+    # The rendered words.
+    assert dfx.USER_CHANGE_REFUSAL.format(cert="admin", entry="shed", held="pat") == (
+        'the server issued a certificate for user "admin", but entry "shed" is held to user "pat"; nothing was saved.')
+    assert dfx.ENTRY_USER_CHANGED_LINE.format(was="pat", now="admin") == '  User changed from "pat" to "admin"\n'
+    # `shed users status` refused: the CLI's wrapping, its rendering of an API
+    # error, the server's code and message.
+    wrap, rest = dfx.USERS_STATUS_FORBIDDEN.split(": ", 1)
+    assert wrap == "users status on {entry}"
+    users = (root / "cmd" / "shed" / "users.go").read_text()
+    assert 'fmt.Errorf("users status on %s: %w", name, err)' in users
+    client = (root / "cmd" / "shed" / "client.go").read_text()
+    assert 'fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)' in client
+    code, message = rest.split(": ", 1)
+    assert re.search(rf'ErrForbidden\s*=\s*"{code}"', (root / "internal" / "config" / "types.go").read_text())
+    what = message.removeprefix("admin only: ")
+    assert what != message
+    assert 'writeError(w, http.StatusForbidden, config.ErrForbidden, "admin only: "+what)' in (
+        root / "internal" / "api" / "policy.go").read_text()
+    assert f'requireAdmin(w, r, "{what}")' in (root / "internal" / "api" / "users_handlers.go").read_text()
+
+
+def test_the_token_request_lines_match_the_reference_servers(tmp_path):
+    token = (dc.REPO_ROOT / "internal" / "directory" / "refserver" / "token.go").read_text()
+    prefix, _, value = dfx.TOKEN_REQUEST_DIRECTORY_SCOPE.partition("scope=")
+    assert prefix == dfx.TOKEN_REQUEST
+    assert f'fmt.Sprintf("{dfx.TOKEN_REQUEST}scope=%q", scope[0])' in token
+    assert f'"{dfx.TOKEN_REQUEST}no scope"' in token
+    assert value == '"directory:read"'
+    assert 's.logf("%s", tokenRequestLine(form["scope"]))' in token
+    # What the fixture reads back from the reference server's log (its
+    # standard error, each line after the logger's date and time).
+    ref = dfx.RefServer(tmp_path / "bin", tmp_path / "control", tmp_path, tmp_path)
+    assert ref.token_requests() == []
+    (tmp_path / "ref.err").write_text("\n".join([
+        "2026/11/19 10:00:00 token request: scope=\"directory:read\"",
+        "2026/11/19 10:00:01 directory: a pull",
+        "2026/11/19 10:00:02 token request: no scope",
+        "2026/11/19 10:00:03 token refused: the assertion has expired",
+    ]) + "\n")
+    assert ref.token_requests() == [dfx.TOKEN_REQUEST_DIRECTORY_SCOPE, "token request: no scope"]
+
+
+def test_the_record_case_matches_the_servers_members_and_tokens():
+    root = dc.REPO_ROOT
+    types = (root / "internal" / "config" / "types.go").read_text()
+    m = re.search(r"^type ExecLimits struct \{\n(.*?)^\}", types, re.MULTILINE | re.DOTALL)
+    assert m
+    assert set(re.findall(r'json:"([a-z_]+)"', m.group(1))) == dfx.EXEC_LIMIT_MEMBERS
+    assert len(dfx.EXEC_LIMIT_MEMBERS) == 9
+    overview = (root / "internal" / "api" / "overview.go").read_text()
+    assert f'FeatureExecLimits = "{dfx.FEATURE_EXEC_LIMITS}"' in overview
+    assert f'FeatureUniformShedRecord = "{dfx.FEATURE_UNIFORM_SHED_RECORD}"' in overview
+    features = re.search(r"features := \[\]string\{([^}]*)\}", overview)
+    assert features and {"FeatureExecLimits", "FeatureUniformShedRecord"} <= set(re.findall(r"\w+", features.group(1)))
+    caps = (root / "internal" / "backend" / "capabilities.go").read_text()
+    for name, value in (("IsolationNone", "none"), ("IsolationTopology", "topology")):
+        assert re.search(rf'{name}\s*=\s*"{value}"', caps), name
+
+
+def _shed_folder(home: Path) -> Path:
+    """A `~/.shed` holding each kind of entry the CLI may leave."""
+    shed = home / ".shed"
+    for d in ("creds/e", "creds/%staging/attempt-1", "creds/%staging/empty", "empty"):
+        (shed / d).mkdir(parents=True)
+    (shed / "config.yaml").write_text("servers: {}\n")
+    (shed / "known_hosts").write_text("[127.0.0.1]:2222 ssh-ed25519 AAAA\n")
+    (shed / "%config.lock").write_text("")
+    (shed / "config.yaml.tmp.123").write_text("half")
+    (shed / "creds" / "e" / "client.pem").write_text("cert")
+    (shed / "creds" / "e" / "client.key").write_text("key")
+    (shed / "creds" / "e" / "client.key").chmod(0o600)
+    (shed / "creds" / "%staging" / "attempt-1" / "client.pem").write_text("staged")
+    (shed / "creds" / "current").symlink_to("e")
+    os.mkfifo(shed / "fifo")
+    return shed
+
+
+def test_shed_tree_records_every_entry_of_the_shed_folder(tmp_path):
+    shed = _shed_folder(tmp_path)
+    got = dfx.shed_tree(tmp_path)
+    assert sorted(got) == sorted([
+        ".shed", ".shed/%config.lock", ".shed/config.yaml", ".shed/config.yaml.tmp.123", ".shed/creds",
+        ".shed/creds/%staging", ".shed/creds/%staging/attempt-1", ".shed/creds/%staging/attempt-1/client.pem",
+        ".shed/creds/%staging/empty", ".shed/creds/current", ".shed/creds/e", ".shed/creds/e/client.key",
+        ".shed/creds/e/client.pem", ".shed/empty", ".shed/fifo", ".shed/known_hosts",
+    ]), sorted(got)
+    assert got[".shed/creds/e/client.pem"] == ("file", 0o644 & ~_umask(), hashlib.sha256(b"cert").hexdigest())
+    assert got[".shed/creds/e/client.key"][:2] == ("file", 0o600)
+    assert got[".shed/creds/current"] == ("symlink", stat.S_IMODE(os.lstat(shed / "creds" / "current").st_mode), "e")
+    assert got[".shed/empty"][0] == got[".shed/creds/%staging/empty"][0] == "dir"
+    assert got[".shed/fifo"][0] == "other"
+    # A link is never followed: the folder it names is listed once, as itself.
+    assert not any(p.startswith(".shed/creds/current/") for p in got)
+
+    # Each kind of change is seen.
+    def changed(change, undo) -> bool:
+        change()
+        try:
+            return dfx.shed_tree(tmp_path) != got
+        finally:
+            undo()
+            assert dfx.shed_tree(tmp_path) == got
+
+    key = shed / "creds" / "e" / "client.key"
+    assert changed(lambda: (shed / "known_hosts").write_text("[127.0.0.1]:2222 ssh-ed25519 AAAB\n"),
+                   lambda: (shed / "known_hosts").write_text("[127.0.0.1]:2222 ssh-ed25519 AAAA\n"))
+    assert changed(lambda: key.chmod(0o644), lambda: key.chmod(0o600))
+    assert changed(lambda: (shed / "creds" / "%staging" / "attempt-2").mkdir(),
+                   lambda: (shed / "creds" / "%staging" / "attempt-2").rmdir())
+    assert changed(lambda: (shed / "config.yaml.tmp.456").write_text(""),
+                   lambda: (shed / "config.yaml.tmp.456").unlink())
+    assert changed(lambda: (shed / "%config.lock").unlink(), lambda: (shed / "%config.lock").write_text(""))
+    assert changed(lambda: (shed / "creds" / "current").unlink() or (shed / "creds" / "current").symlink_to("x"),
+                   lambda: (shed / "creds" / "current").unlink() or (shed / "creds" / "current").symlink_to("e"))
+    assert changed(lambda: (shed / "creds" / "other").symlink_to("e"), lambda: (shed / "creds" / "other").unlink())
+    assert changed(lambda: (shed / "empty").chmod(got[".shed/empty"][1] ^ 0o010),
+                   lambda: (shed / "empty").chmod(got[".shed/empty"][1]))
+    # A time is not content: a file written again with its own bytes is no
+    # change.
+    st = os.stat(shed / "%config.lock")
+    os.utime(shed / "%config.lock", ns=(st.st_atime_ns + 10**9, st.st_mtime_ns + 10**9))
+    assert dfx.shed_tree(tmp_path) == got
+    # No `.shed` at all is an empty tree.
+    assert dfx.shed_tree(tmp_path / "nobody") == {}
+
+
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+_TWO_ENTRIES = """\
+default_server: dir-itest
+servers:
+    dir-itest:
+        host: 127.0.0.1
+        user: pat
+        ssh_port: 2222
+        tls_cert_fingerprint: "sha256:ab:cd"  # quoted, with a comment
+        api_url: 'https://127.0.0.1:4443'
+    other:
+        host: 127.0.0.1
+        user: bob
+        extra:
+            user: nested
+"""
+
+
+@pytest.mark.parametrize("text", [_TWO_ENTRIES, _TWO_ENTRIES.replace("    ", "  "),
+                                  _TWO_ENTRIES.replace("\n", "\r\n")])
+def test_drop_entry_field_removes_one_line_of_one_entry(text):
+    got = dfx.drop_entry_field(text, "dir-itest", "user")
+    # Exactly that line is gone; every other byte stays.
+    removed = [line for line in text.splitlines(keepends=True) if line not in got.splitlines(keepends=True)]
+    assert [line.strip() for line in removed] == ["user: pat"], removed
+    assert len(got) == len(text) - len(removed[0])
+    want = yaml.safe_load(text)
+    del want["servers"]["dir-itest"]["user"]
+    assert yaml.safe_load(got) == want
+    # No such line, or a name that is no entry: refused.
+    with pytest.raises(ValueError, match="0 'user' lines"):
+        dfx.drop_entry_field(got, "dir-itest", "user")
+    with pytest.raises(ValueError):
+        dfx.drop_entry_field(text, "missing", "user")
+    with pytest.raises(ValueError):
+        dfx.drop_entry_field(text, "dir-itest", "use")
+
+
+@pytest.mark.parametrize("text", [
+    # The review's input: a flow mapping whose inner `user:` sits at the
+    # entry's member indentation.
+    "servers:\n  dir-itest:\n    extra: {\n    user: nested\n    }\n",
+    "servers:\n  dir-itest:\n    host: 127.0.0.1\n    extra: [a,\n    user: x]\n",
+    # A nested block member, and a key with no value on its line.
+    "servers:\n  dir-itest:\n    user: pat\n    extra:\n      user: nested\n",
+    "servers:\n  dir-itest:\n    user: pat\n    extra:\n",
+    # Block scalars, an alias, an anchor, a tag.
+    "servers:\n  dir-itest:\n    user: |\n      pat\n",
+    "servers:\n  dir-itest:\n    note: >-\n      x\n    user: pat\n",
+    "servers:\n  dir-itest:\n    user: *who\n",
+    "servers:\n  dir-itest:\n    user: &who pat\n",
+    "servers:\n  dir-itest:\n    user: !!str pat\n",
+    # A quoted value that does not end on its line.
+    'servers:\n  dir-itest:\n    note: "a\n      b"\n    user: pat\n',
+    "servers:\n  dir-itest:\n    note: 'a\n      b'\n    user: pat\n",
+    # A plain value continued on the next line.
+    "servers:\n  dir-itest:\n    note: a\n      b\n    user: pat\n",
+    # A sequence item, a member deeper or shallower than the first.
+    "servers:\n  dir-itest:\n    - user: pat\n",
+    "servers:\n  dir-itest:\n    host: 127.0.0.1\n     user: pat\n",
+    "servers:\n  dir-itest:\n      host: 127.0.0.1\n    user: pat\n",
+    # Tab indentation.
+    "servers:\n  dir-itest:\n\tuser: pat\n",
+    "servers:\n  dir-itest:\n    host: x\n  \tuser: pat\n",
+])
+def test_drop_entry_field_refuses_an_entry_it_cannot_edit_line_by_line(text):
+    with pytest.raises(ValueError):
+        dfx.drop_entry_field(text, "dir-itest", "user")
+
+
+def test_drop_entry_field_judges_only_the_named_entry():
+    # The other entry's nested member does not stop an edit of this one, and
+    # an edit of the other one is refused for it.
+    got = dfx.drop_entry_field(_TWO_ENTRIES, "dir-itest", "user")
+    assert "    user: pat\n" not in got and "            user: nested\n" in got
+    with pytest.raises(ValueError, match="not a one-line"):
+        dfx.drop_entry_field(_TWO_ENTRIES, "other", "user")
+
+
+def test_the_agent_shim_offers_the_agents_keys_and_no_key_file(tmp_path):
+    ssh = shutil.which("ssh")
+    if ssh is None:
+        pytest.skip("ssh is not installed")
+    sock, no_key, key = tmp_path / "agent.sock", tmp_path / "none" / "absent", tmp_path / "id"
+    argv_dir = tmp_path / "argv"
+    argv_dir.mkdir()
+    key.write_text("not read by ssh -G")
+    shim = tmp_path / "ssh"
+    shim.write_text(dfx.agent_shim_text("pat", sock, no_key, ssh, argv_dir))
+    shim.chmod(0o755)
+    runs: list[list[str]] = []
+
+    def config(*args: str, command: tuple = ()) -> dict:
+        # ssh -G prints the configuration it would use and connects to nothing.
+        argv = ["-G", *args, "127.0.0.1", *command]
+        r = subprocess.run([str(shim), *argv], capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "SSH_AUTH_SOCK": str(tmp_path / "other.sock")}, stdin=subprocess.DEVNULL)
+        assert r.returncode == 0, r.stderr
+        runs.append(argv)
+        got: dict = {}
+        for line in r.stdout.splitlines():
+            name, _, value = line.partition(" ")
+            got.setdefault(name, []).append(value)
+        return got
+
+    plain = config()
+    # The world's agent, never the caller's; no key file but the absent one
+    # (so not the default key files of the account); IdentitiesOnly unset.
+    assert plain["identityagent"] == [str(sock)], plain.get("identityagent")
+    assert plain["identityfile"] == [str(no_key)], plain["identityfile"]
+    assert plain["identitiesonly"] == ["no"]
+    # Nothing the CLI is meant to set: ssh's own defaults, which the CLI's
+    # options replace (an option the shim set first would win over the CLI's).
+    assert {k: plain[k] for k in ("batchmode", "controlmaster", "passwordauthentication",
+                                  "kbdinteractiveauthentication", "updatehostkeys")} == {
+        "batchmode": ["no"], "controlmaster": ["false"], "passwordauthentication": ["yes"],
+        "kbdinteractiveauthentication": ["yes"], "updatehostkeys": ["true"]}, plain
+    assert "controlpath" not in plain
+    cli = config("-o", "BatchMode=yes", "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
+                 "-o", "UpdateHostKeys=no", "-o", "ControlMaster=auto", "-o", "ControlPath=/run/x")
+    assert {k: cli[k] for k in ("batchmode", "controlmaster", "controlpath", "passwordauthentication",
+                                "kbdinteractiveauthentication", "updatehostkeys")} == {
+        "batchmode": ["yes"], "controlmaster": ["auto"], "controlpath": ["/run/x"], "passwordauthentication": ["no"],
+        "kbdinteractiveauthentication": ["no"], "updatehostkeys": ["false"]}, cli
+    # What the CLI adds for an entry with an identity file narrows the offer.
+    narrowed = config("-i", str(key), "-o", "IdentitiesOnly=yes")
+    assert narrowed["identitiesonly"] == ["yes"]
+    assert narrowed["identityfile"] == [str(no_key), str(key)], narrowed["identityfile"]
+    # Each run's arguments, as given and in order, before the shim's own; an
+    # argument with a space or a newline is kept whole.
+    config(command=("control", "a b\nc", ""))
+    assert dfx.recorded_argv(argv_dir) == runs
+    assert dfx.has_option(runs[2], "-i", str(key)) and not dfx.has_option(runs[2], "-o", "IdentityAgent=" + str(sock))
+    assert not dfx.has_option(runs[2], "-i", str(no_key))
+
+
+@pytest.mark.parametrize("bad", [" ", "%", "~", "$", '"', "'", "\\", "#", "\t", "\n"])
+def test_the_agent_shim_refuses_a_path_ssh_would_read_as_more(tmp_path, bad):
+    good = {"sock": tmp_path / "s", "no_key": tmp_path / "k", "ssh": "/usr/bin/ssh", "argv_dir": tmp_path / "a"}
+    dfx.agent_shim_text("pat", **good)
+    for name in good:
+        args = dict(good)
+        args[name] = type(good[name])(f"{good[name]}x{bad}y")
+        with pytest.raises(ValueError, match="cannot hand ssh the path"):
+            dfx.agent_shim_text("pat", **args)
+    with pytest.raises(ValueError, match="not absolute"):
+        dfx.agent_shim_text("pat", **{**good, "sock": Path("relative/s")})
+
+
+def test_a_relay_counts_every_accept_and_forwards_both_ways():
+    # A plain echo server as the target.
+    echo = socket.socket()
+    echo.bind(("127.0.0.1", 0))
+    echo.listen(8)
+    echo.settimeout(0.2)
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                c, _ = echo.accept()
+            except (socket.timeout, OSError):
+                continue
+            with c:
+                while data := c.recv(4096):
+                    c.sendall(data)
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    relay = dfx.Relay(echo.getsockname()[1])
+    try:
+        assert relay.accepts == 0
+        relay.start()
+        assert relay.settle() == 0
+        # Bytes both ways.
+        with socket.create_connection(("127.0.0.1", relay.port), timeout=5) as c:
+            c.sendall(b"ping")
+            got = b""
+            while len(got) < 4:
+                got += c.recv(16)
+            assert got == b"ping"
+            c.shutdown(socket.SHUT_WR)
+            assert c.recv(16) == b""
+        assert relay.settle() == 1
+        # A connection opened and closed with nothing sent is counted.
+        socket.create_connection(("127.0.0.1", relay.port), timeout=5).close()
+        assert relay.settle() == 2
+        # Several at once, each counted, none lost.
+        conns = [socket.create_connection(("127.0.0.1", relay.port), timeout=5) for _ in range(5)]
+        for c in conns:
+            c.close()
+        assert relay.settle() == 7
+        # A connection still open when the relay closes is ended by it.
+        held = socket.create_connection(("127.0.0.1", relay.port), timeout=5)
+        assert relay.settle() == 8
+    finally:
+        relay.close()
+        stop.set()
+        t.join(5)
+        echo.close()
+    held.settimeout(5)
+    assert held.recv(16) == b""
+    held.close()
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", relay.port), timeout=2)
+    assert not any(th.is_alive() for th in relay._threads), relay._threads
+    # One that never started closes too.
+    dfx.Relay(1).close()
+
+
+def test_a_relay_of_the_world_is_registered_for_clean_up_before_it_starts(monkeypatch):
+    from types import SimpleNamespace
+
+    world = SimpleNamespace(_helpers=[])
+
+    def refuse(self):
+        assert world._helpers == [self], "started before it was registered"
+        raise OSError("no port")
+
+    monkeypatch.setattr(dfx.Relay, "start", refuse)
+    with pytest.raises(OSError):
+        dfx.World.relay(world, 1)
+    (r,) = world._helpers
+    assert isinstance(r, dfx.Relay) and r.target == 1
+
+
+def test_a_key_agent_holds_its_keys_in_order_and_is_registered_before_it_starts(tmp_path):
+    from types import SimpleNamespace
+
+    if not all(shutil.which(t) for t in ("ssh-agent", "ssh-add", "ssh-keygen")):
+        pytest.skip("ssh-agent, ssh-add and ssh-keygen are needed")
+    keys = []
+    for label in ("first", "second"):
+        path = tmp_path / label
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-C", label, "-f", str(path)], check=True,
+                       timeout=30)
+        keys.append(dfx.Key(label, path, " ".join(path.with_suffix(".pub").read_text().split()[:2])))
+    world = SimpleNamespace(sockets=tmp_path, logs=tmp_path, homes=tmp_path, _n=0, _helpers=[])
+
+    def close_all() -> None:
+        # The world's clean-up, here: whatever World.agent registered.
+        for h in reversed(world._helpers):
+            h.close()
+
+    # The clean-up is in place before anything starts (as the live world's
+    # is), so a failure inside World.agent leaves nothing running.
+    try:
+        agent = dfx.World.agent(world, [keys[1], keys[0]])
+        (h,) = world._helpers
+        assert h is agent and agent.proc.poll() is None and agent.sock.exists()
+        # The order they were added, which is the order ssh offers them.
+        assert agent.listed() == [keys[1].pub, keys[0].pub]
+        # The agent's command line names its socket, inside the world's folder.
+        assert str(tmp_path) in " ".join(agent.proc.args)
+    finally:
+        close_all()
+    assert agent.proc.poll() is not None and not agent.sock.exists()
+
+    # An agent whose setup fails after it started (a key ssh-add cannot
+    # read) was registered first, so the clean-up stops it.
+    world._helpers.clear()
+    missing = dfx.Key("missing", tmp_path / "missing", keys[0].pub)
+    try:
+        with pytest.raises(AssertionError, match="ssh-add missing"):
+            dfx.World.agent(world, [missing])
+        (failed,) = world._helpers
+        assert failed.proc is not None and failed.proc.poll() is None, "the agent should still run until clean-up"
+    finally:
+        close_all()
+    assert failed.proc.poll() is not None and not failed.sock.exists()
+    # One that never started closes too.
+    dfx.KeyAgent("ssh-agent", "ssh-add", tmp_path / "never", tmp_path / "never.log", tmp_path).close()
 
 
 # The audit log's identity shapes: fixtures/auditlog.py, which

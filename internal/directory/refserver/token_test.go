@@ -250,6 +250,49 @@ func TestTokenRequestRefusals(t *testing.T) {
 	}
 }
 
+// TestTokenRequestLine checks the one line logged per token request: the
+// scope exactly as received, a form of its own when the parameter is absent
+// or sent twice, and nothing else from the request (not the assertion, not
+// the client id).
+func TestTokenRequestLine(t *testing.T) {
+	for _, tc := range []struct {
+		name, scope string
+		status      int
+		want        string
+	}{
+		{"present", "&scope=directory%3Aread", 200, `token request: scope="directory:read"`},
+		{"absent", "", 200, "token request: no scope"},
+		{"unknown", "&scope=other%3Aread", 400, `token request: scope="other:read"`},
+		{"empty", "&scope=", 200, `token request: scope=""`},
+		{"two scopes", "&scope=directory%3Aread+other%3Aread", 400, `token request: scope="directory:read other:read"`},
+		{"a control character", "&scope=directory%3Aread%0Ax", 400, `token request: scope="directory:read\nx"`},
+		{"twice", "&scope=directory%3Aread&scope=directory%3Aread", 400, "token request: scope sent 2 times"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newWorld(t)
+			var logged []string
+			s.srv.logf = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+			a := s.defaultAssertion(srvA, "EdDSA").sign(s.key("server-ed25519"))
+			rec := s.tokenRequest(withAssertion(a) + tc.scope)
+			if rec.Code != tc.status {
+				t.Fatalf("%d %s, want %d", rec.Code, rec.Body, tc.status)
+			}
+			var lines []string
+			for _, l := range logged {
+				if strings.HasPrefix(l, "token request: ") {
+					lines = append(lines, l)
+				}
+			}
+			if len(lines) != 1 || lines[0] != tc.want {
+				t.Fatalf("token request lines %q, want exactly %q", lines, tc.want)
+			}
+			if strings.ContainsAny(lines[0], "\n\r") || strings.Contains(lines[0], a) || strings.Contains(lines[0], srvA) {
+				t.Fatalf("the line holds more than the scope: %q", lines[0])
+			}
+		})
+	}
+}
+
 // TestTokenBodyTooLarge checks a body over 64 KiB is a bare 413.
 func TestTokenBodyTooLarge(t *testing.T) {
 	s := newWorld(t)

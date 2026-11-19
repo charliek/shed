@@ -32,7 +32,18 @@ What it shows, live, over real SSH connections and the real HTTPS API:
   - a certificate that names no user is refused;
   - a session inside a shed is closed when its person is removed, and an
     open session survives a key move while a new one, and the person's CLI
-    certificate, are refused.
+    certificate, are refused;
+  - an entry is held to its user: with keys of two users in the agent and
+    the list out of force, a command through the everyday entry is refused
+    and nothing the CLI keeps changes, and the entry works again as its user
+    once the list is back; a refetch makes the entry another user only with
+    --allow-user-change; an entry whose `user` line was removed by hand is
+    refused before anything reaches the server, and a refetch restores it;
+    one host name, two entries with their own SSH keys, two users;
+  - every token request the server makes for its pulls names the
+    directory scope and nothing else;
+  - on the remote backend, the shed record carries `mounts`, `isolation` and
+    `arch`, and /api/info its exec limits, `guest_arch` and the tokens.
 
 An API refusal is always the server's own (an HTTP 401 or 403 with its
 error code, or its bad_certificate alert at the TLS handshake), followed by a
@@ -46,16 +57,32 @@ skips. A subset: `make test-integration-directory PYTEST_ARGS="-k rates"`.
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
+import yaml
 
 from fixtures.directory import (
     BOOTSTRAP_NOT_AUTHORIZED,
+    ENTRY,
+    ENTRY_USER_CHANGED_LINE,
+    ENTRY_USER_LINE,
+    EXEC_LIMIT_MEMBERS,
+    FEATURE_EXEC_LIMITS,
+    FEATURE_UNIFORM_SHED_RECORD,
+    HOST,
     KEY_MOVED,
     LOCAL_ADMIN,
+    NO_REQUEST_SENT,
+    STORED_UNRECORDED_REFUSAL,
+    TOKEN_REQUEST_DIRECTORY_SCOPE,
+    TRUST_SECONDS,
+    USER_CHANGE_REFUSAL,
+    USERS_STATUS_FORBIDDEN,
     SKIPPED_LOCAL_ADMIN_KEY,
     SKIPPED_LOCAL_ADMIN_NAME,
     SHED_NAME_PULL,
@@ -68,7 +95,10 @@ from fixtures.directory import (
     UNKNOWN_KEY_WAIT,
     World,
     directory_world,
+    drop_entry_field,
+    has_option,
     parse_stamp,
+    shed_tree,
     skip_reason,
     trust_deadline,
 )
@@ -359,6 +389,13 @@ def test_a_key_moved_between_two_people_with_a_held_connection(world):
     a = frank_cert.get("/api/sheds")
     assert a.status == 200, a
 
+    # Every token request the server made for its pulls named the directory
+    # scope and nothing else (the reference server serves this world's
+    # server only, so each line it logged is this server's).
+    asked = w.ref.token_requests()
+    assert asked, "the reference server logged no token request"
+    assert all(line == TOKEN_REQUEST_DIRECTORY_SCOPE for line in asked), asked
+
 
 # ----------------------------------------------------------------------------
 # The unknown-key pull's rate
@@ -594,3 +631,243 @@ def test_a_session_inside_a_shed_across_a_key_move(world):
     r = w.ssh_run(w.identity("ivan", moving), "hana-shed", f"echo {marker}")
     assert r.returncode != 0 and marker not in r.stdout, (r.returncode, r.stdout, r.stderr)
     assert "shed 'hana-shed' not found" in r.stderr, r.stderr
+
+
+# ----------------------------------------------------------------------------
+# A CLI entry is held to its user
+# ----------------------------------------------------------------------------
+
+
+def _listed(who, *entries: str) -> tuple[dict, str]:
+    """`shed --json server list` as `who`: the rows of `entries` by name, and
+    what it wrote to stderr."""
+    r = who.shed("--json", "server", "list", timeout=180)
+    assert r.returncode == 0, f"shed server list: exit {r.returncode}: {r.stderr!r}"
+    rows = {s["name"]: s for s in json.loads(r.stdout)}
+    assert set(entries) <= set(rows), (entries, sorted(rows))
+    return {e: rows[e] for e in entries}, r.stderr
+
+
+def _pat_with_two_users_keys(w: World):
+    """`pat` in the list, with an agent offering pat's key first and then the
+    local admin's, enrolled as pat through the entry `ENTRY`."""
+    k = w.key("pat")
+    w.set_user("pat", [k])
+    w.publish()
+    w.refresh_ok()
+    pat = w.agent_identity("pat", w.agent([k, w.admin_key]))
+    pat.add_server()
+    assert pat.entry_config().get("user") == "pat", pat.entry_config()
+    assert w.cli_cert(pat).user() == "pat"
+    r = pat.cli("list")
+    assert r.returncode == 0, r.stderr
+    return pat
+
+
+@pytest.mark.slow
+def test_an_entry_offering_two_users_keys_is_refused_while_the_list_is_out_of_force(world):
+    w = world
+    pat = _pat_with_two_users_keys(w)
+    kept = shed_tree(pat.home)
+
+    # The list goes out of force: the service is out and the trust time ends
+    # (only the local admin can log in). pat's certificate is refused, so the
+    # CLI enrols again: ssh offers pat's key, which the server no longer
+    # knows, then the local admin's, which it lets in.
+    w.ref.outage(True)
+    w.wait_state("expired", TRUST_SECONDS + TRUST_TICK + 60)
+    w.assert_api_refused(w.cli_cert(pat), "pat's certificate with the list out of force")
+    refusal = USER_CHANGE_REFUSAL.format(cert=LOCAL_ADMIN, entry=ENTRY, held="pat")
+    r = pat.cli("list")
+    assert r.returncode == 1, f"the everyday entry was not refused: exit {r.returncode}: {r.stdout!r} {r.stderr!r}"
+    assert refusal in r.stderr, r.stderr
+    assert shed_tree(pat.home) == kept, "a refused enrolment changed what the CLI keeps"
+    # The listing shows it refused, still pat's, and says why once.
+    rows, err = _listed(pat, ENTRY)
+    assert (rows[ENTRY]["status"], rows[ENTRY].get("user")) == ("refused", "pat"), rows
+    assert err.count(refusal) == 1, err
+    assert shed_tree(pat.home) == kept, "listing the refused entry changed what the CLI keeps"
+    w.assert_local_admin_works("the list out of force")
+
+    # The list is back in force: the same entry works again as pat, with the
+    # certificate it holds, and no step on the entry.
+    w.ref.outage(False)
+    w.refresh_ok()
+    r = pat.cli("list")
+    assert r.returncode == 0, f"the everyday entry did not work again: {r.stderr!r}"
+    assert shed_tree(pat.home) == kept, "the entry was enrolled again"
+    assert pat.entry_config().get("user") == "pat"
+    assert w.cli_cert(pat).user() == "pat"
+
+
+def test_a_refetch_makes_the_entry_another_user_only_when_asked(world):
+    w = world
+    pat = _pat_with_two_users_keys(w)
+    kept = shed_tree(pat.home)
+    # pat leaves the list: ssh's first key is refused, the local admin's is
+    # let in, and the server issues a certificate for the local admin.
+    w.remove_user("pat")
+    w.publish()
+    w.refresh_ok()
+
+    r = pat.shed("server", "update", ENTRY, "--refetch", timeout=180)
+    assert r.returncode == 1, f"the refetch was not refused: exit {r.returncode}: {r.stdout!r} {r.stderr!r}"
+    assert USER_CHANGE_REFUSAL.format(cert=LOCAL_ADMIN, entry=ENTRY, held="pat") in r.stderr, r.stderr
+    assert "--allow-user-change" in r.stderr, r.stderr
+    assert shed_tree(pat.home) == kept, "a refused refetch changed what the CLI keeps"
+
+    r = pat.shed("server", "update", ENTRY, "--refetch", "--allow-user-change", timeout=180)
+    assert r.returncode == 0, f"the refetch with --allow-user-change failed: {r.stdout!r} {r.stderr!r}"
+    assert ENTRY_USER_CHANGED_LINE.format(was="pat", now=LOCAL_ADMIN) in r.stdout, r.stdout
+    assert pat.entry_config().get("user") == LOCAL_ADMIN, pat.entry_config()
+    assert w.cli_cert(pat).user() == LOCAL_ADMIN
+    rows, _ = _listed(pat, ENTRY)
+    assert (rows[ENTRY]["status"], rows[ENTRY].get("user")) == ("online", LOCAL_ADMIN), rows
+    # The entry is the local admin's now: an admin's request is answered.
+    r = pat.cli("users", "status", timeout=60)
+    assert r.returncode == 0, r.stderr
+
+
+def test_an_entry_whose_user_line_was_removed_is_refused_before_any_request(world):
+    w = world
+    k = w.key("pat")
+    w.set_user("pat", [k])
+    w.publish()
+    w.refresh_ok()
+    pat = w.identity("pat", k)
+    # The entry reaches the server only through two relays of the test, one
+    # in front of its SSH port and one in front of its HTTPS port, so every
+    # connection the CLI makes for it is an accept the test counts.
+    ssh_relay, https_relay = w.relay(w.ssh_port), w.relay(w.https_port)
+    r = pat.shed("server", "add", HOST, "--ssh-port", str(ssh_relay.port), "--https-port", str(https_relay.port),
+                 "--name", ENTRY, "--trust-on-first-use", timeout=180)
+    assert r.returncode == 0, f"shed server add through the relays: exit {r.returncode}: {r.stdout!r} {r.stderr!r}"
+    e = pat.entry_config()
+    assert (e["ssh_port"], e["api_url"]) == (ssh_relay.port, f"https://{HOST}:{https_relay.port}"), e
+    # The relays see the entry's connections (the controls for the check
+    # below): the enrolment's ssh, and a command's request.
+    assert ssh_relay.settle() > 0, "the enrolment's ssh did not go through its relay"
+    before = https_relay.settle()
+    r = pat.cli("list")
+    assert r.returncode == 0, r.stderr
+    assert https_relay.settle() > before, "the entry's request did not go through its relay"
+
+    cfg = pat.home / ".shed" / "config.yaml"
+    cfg.write_text(drop_entry_field(cfg.read_text(encoding="utf-8"), ENTRY, "user"), encoding="utf-8")
+    assert "user" not in pat.entry_config(), pat.entry_config()
+    kept = shed_tree(pat.home)
+    accepts = ssh_relay.settle(), https_relay.settle()
+
+    # Refused before anything is sent: a command, and the listing.
+    refusal = STORED_UNRECORDED_REFUSAL.format(entry=ENTRY, cert="pat")
+    r = pat.cli("list")
+    assert r.returncode == 1, f"the entry was not refused: exit {r.returncode}: {r.stdout!r} {r.stderr!r}"
+    assert refusal in r.stderr and NO_REQUEST_SENT in r.stderr, r.stderr
+    rows, err = _listed(pat, ENTRY)
+    assert rows[ENTRY]["status"] == "refused" and "user" not in rows[ENTRY], rows
+    assert err.count(refusal) == 1, err
+    assert shed_tree(pat.home) == kept, "a refused entry changed what the CLI keeps"
+    assert (ssh_relay.settle(), https_relay.settle()) == accepts, "a connection was made for the refused entry"
+
+    # The fix the refusal names: a refetch records the user again (its ssh
+    # goes through the SSH relay), and the entry works.
+    r = pat.shed("server", "update", ENTRY, "--refetch", timeout=180)
+    assert r.returncode == 0, f"the refetch failed: {r.stdout!r} {r.stderr!r}"
+    assert ENTRY_USER_LINE.format(user="pat") in r.stdout, r.stdout
+    assert pat.entry_config().get("user") == "pat", pat.entry_config()
+    assert ssh_relay.settle() > accepts[0], "the refetch's ssh did not go through its relay"
+    r = pat.cli("list")
+    assert r.returncode == 0, r.stderr
+
+
+def test_one_host_name_two_entries_two_users(world):
+    """The guide's backup-admin recipe (docs/guides/user-directory.md,
+    "Keeping the local admin on a backup key"): one host name, an entry that
+    names the backup key (--identity-file) and is the local admin, and an
+    everyday entry that is pat, while the agent offers pat's key to any ssh
+    that does not name its key. The everyday entry here names no key, so the
+    ssh the CLI runs for each entry shows that it narrows the offer, and
+    keeps the connection to itself, only for the entry that names one."""
+    w = world
+    k = w.key("pat")
+    w.set_user("pat", [k])
+    w.publish()
+    w.refresh_ok()
+    pat = w.agent_identity("pat", w.agent([k]))
+    admin_entry = f"{ENTRY}-admin"
+    admin_key = str(w.admin_key.path)
+    for entry, identity, user in ((admin_entry, ["--identity-file", admin_key], LOCAL_ADMIN), (ENTRY, [], "pat")):
+        pat.forget_ssh_runs()
+        r = pat.shed("server", "add", HOST, "--ssh-port", str(w.ssh_port), "--name", entry, *identity,
+                     "--trust-on-first-use", timeout=180)
+        assert r.returncode == 0, f"shed server add {entry}: exit {r.returncode}: {r.stdout!r} {r.stderr!r}"
+        assert ENTRY_USER_LINE.format(user=user) in r.stdout, r.stdout
+        # What the CLI asked ssh for: the enrolment, which names the entry's
+        # key alone and opens no shared connection when the entry has a key,
+        # and names no key when it has none.
+        runs = pat.ssh_runs()
+        assert runs and all(has_option(a, "-l", "_bootstrap") for a in runs), runs
+        for argv in runs:
+            narrowed = [has_option(argv, "-i", admin_key), has_option(argv, "-o", "IdentitiesOnly=yes"),
+                        has_option(argv, "-o", "ControlMaster=no"), has_option(argv, "-o", "ControlPath=none")]
+            if identity:
+                assert all(narrowed), (entry, argv)
+            else:
+                assert "-i" not in argv and not narrowed[1], (entry, argv)
+
+    servers = yaml.safe_load((pat.home / ".shed" / "config.yaml").read_text(encoding="utf-8"))["servers"]
+    assert {(servers[e]["host"], servers[e]["ssh_port"]) for e in (admin_entry, ENTRY)} == {(HOST, w.ssh_port)}
+    assert (servers[admin_entry]["user"], servers[admin_entry]["identity_file"]) == (LOCAL_ADMIN, admin_key)
+    assert (servers[ENTRY]["user"], servers[ENTRY].get("identity_file")) == ("pat", None)
+    rows, _ = _listed(pat, admin_entry, ENTRY)
+    assert {e: (rows[e]["status"], rows[e].get("user")) for e in rows} == {
+        admin_entry: ("online", LOCAL_ADMIN), ENTRY: ("online", "pat")}, rows
+
+    admin = replace(pat, entry=admin_entry)
+    assert w.cli_cert(admin).user() == LOCAL_ADMIN
+    assert w.cli_cert(pat).user() == "pat"
+    # Each entry acts as its user: the admin's request is answered, pat's is
+    # refused (pat is no admin), and pat's own list is answered.
+    r = admin.cli("users", "status", timeout=60)
+    assert r.returncode == 0, r.stderr
+    r = pat.cli("users", "status", timeout=60)
+    assert r.returncode != 0, f"pat's entry read the users' status: {r.stdout!r}"
+    assert USERS_STATUS_FORBIDDEN.format(entry=ENTRY) in r.stderr, r.stderr
+    a = w.api(pat, "/api/users/status")
+    assert (a.status, a.refusal) == (403, "HTTP 403 FORBIDDEN"), a
+    r = pat.cli("list")
+    assert r.returncode == 0, r.stderr
+
+
+# ----------------------------------------------------------------------------
+# The shed record and /api/info on the remote backend
+# ----------------------------------------------------------------------------
+
+
+def test_the_shed_record_and_the_server_info_on_the_remote_backend(world):
+    w = world
+    r = w.admin.cli("create", "iso", "--no-provision", "--network", "isolated", timeout=180)
+    assert r.returncode == 0, f"shed create iso --network isolated: {r.stdout[-600:]!r} {r.stderr[-600:]!r}"
+    _create(w, w.admin, "plain")
+
+    info = w.api(w.admin, "/api/info")
+    assert info.status == 200, info
+    limits = info.body.get("exec")
+    assert isinstance(limits, dict) and set(limits) == EXEC_LIMIT_MEMBERS, limits
+    assert all(isinstance(v, int) and v > 0 for v in limits.values()), limits
+    assert {FEATURE_EXEC_LIMITS, FEATURE_UNIFORM_SHED_RECORD} <= set(info.body.get("features") or []), info
+    arch = info.body.get("guest_arch")
+    assert arch in ("amd64", "arm64"), info
+
+    want = {
+        "iso": {"mounts": {"mode": "selected"}, "network_profile": "isolated", "isolation": "topology", "arch": arch},
+        "plain": {"mounts": {"mode": "selected"}, "network_profile": "open", "isolation": "none", "arch": arch},
+    }
+    listed = w.api(w.admin, "/api/sheds")
+    assert listed.status == 200, listed
+    rows = {s["name"]: s for s in listed.body["sheds"]}
+    for name, members in want.items():
+        got = w.api(w.admin, f"/api/sheds/{name}")
+        assert got.status == 200, got
+        for record in (got.body, rows[name]):
+            assert {k: record.get(k) for k in members} == members, record

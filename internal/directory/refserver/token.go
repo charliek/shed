@@ -65,6 +65,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "the body is not a form", 0)
 		return
 	}
+	s.logf("%s", tokenRequestLine(form["scope"]))
 	if !slices.Contains(form["grant_type"], grantClientCreds) {
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "the grant is client_credentials", 0)
 		return
@@ -134,6 +135,22 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		"expires_in":   accessTokenTTL,
 		"scope":        strings.Join(scopes, " "),
 	}, true)
+}
+
+// tokenRequestLine is the line logged for each token request whose form was
+// read: the scope parameter exactly as received (quoted), and nothing else
+// from the request, so a test can see what a client asks for. The scope is
+// not a secret. A request with no scope parameter, and one that sends it
+// more than once, each have a form of their own.
+func tokenRequestLine(scope []string) string {
+	switch len(scope) {
+	case 0:
+		return "token request: no scope"
+	case 1:
+		return fmt.Sprintf("token request: scope=%q", scope[0])
+	default:
+		return fmt.Sprintf("token request: scope sent %d times", len(scope))
+	}
 }
 
 func anyNonEmpty(vals []string) bool {

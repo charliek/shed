@@ -121,8 +121,8 @@ test-integration-units:
 # backend's test drivers: no root, no cloud VM), then stops them and removes
 # their files. It never touches an installed or dev server: every server
 # variable of the rest of the suite is set empty. Linux only (the local link
-# runs a shed-agent on this host). Not in CI. About three minutes, most of it
-# the end-to-end case waiting out a two-minute trust time. Narrow it with
+# runs a shed-agent on this host). Not in CI. About five minutes, most of it
+# two cases waiting out a two-minute trust time. Narrow it with
 # PYTEST_ARGS, e.g.
 #   make test-integration-directory PYTEST_ARGS="-k rates"
 test-integration-directory: check-directory-itest-host build directory-ref
