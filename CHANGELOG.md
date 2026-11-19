@@ -478,6 +478,19 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   signs](https://charliek.github.io/shed/extensions/ssh-agent/#what-the-machine-signs).
 - **Remote backend: an additive `shed_user` instance label** (no label schema change), from
   which a VM adopted at start-up takes its user.
+- **SSH: limits on connections that have not authenticated, in every auth mode.** A
+  connection that has not authenticated 120 seconds after it was accepted is closed. At most
+  100 connections may be unauthenticated at once, and at most 10 of them from one address
+  (an IPv4 address, or an IPv6 /64); loopback counts like any other address, so a proxy on the
+  same host gets no exemption. A connection beyond either is closed at once. New log lines:
+  `SSH: closed a connection from <host:port> that did not authenticate within 120 seconds`,
+  `SSH: refusing connections from <address>: ...` and `SSH: refusing new connections: ...`
+  (each at most once a minute), and `SSH auth failed: remote=<host:port> user=<name>
+  keys=<n>`, once for each connection that offered a key and closed without proving one
+  (`keys=` counts the public-key offers the server examined on it). Point fail2ban at the
+  failed, grace and per-address refusal lines, never at `SSH auth DENIED`, which a person
+  whose agent offers several keys draws before one logs in. The values are fixed. See [Security › Facing
+  the internet](https://charliek.github.io/shed/reference/security/#facing-the-internet).
 - **Development:** `SHED_DEV_USERS=itest` starts the dev servers with the suite's user list;
   the suite gains `test_users.py`, `test_users_upgrade.py` and `test_source_pin.py`, with
   `SHED_ITEST_USERS` and `SHED_ITEST_USERS_DIR`.

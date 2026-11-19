@@ -574,13 +574,20 @@ func TestSSHRefusedKeyThenAcceptedKeyTracked(t *testing.T) {
 }
 
 // TestSSHConnectionsNotTrackedByDefault: without TrackConnections no
-// connection is wrapped or tracked, and CloseConnectionsExcept closes
-// nothing, whatever keep says.
+// connection is wrapped for tracking (the connection callback, installed on
+// every server for the pre-auth limits, gives the connection its preauthConn
+// alone) or tracked, and CloseConnectionsExcept closes nothing, whatever keep
+// says.
 func TestSSHConnectionsNotTrackedByDefault(t *testing.T) {
 	who := newPeople(t)
 	s, addr := identityServer(t, &identityBackend{}, who.lookup)
-	if s.sshServer.ConnCallback != nil {
-		t.Error("a connection callback is installed without TrackConnections")
+	server, client := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
+	switch c := s.sshServer.ConnCallback(newFakeSSHContext(t, "box"), server).(type) {
+	case *preauthConn:
+		_ = c.Close()
+	default:
+		t.Errorf("the connection callback without TrackConnections gave a %T, want a *preauthConn", c)
 	}
 	alice := dialWith(t, addr, "box", who.alice)
 	if stderr, status := runOn(t, alice, "true", ""); status != 0 {

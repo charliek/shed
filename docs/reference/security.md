@@ -175,7 +175,8 @@ that are already open stay open until they end.
 
 Every `SSH auth` line in the server log names the peer's address as
 `remote=<host:port>`: right after `fingerprint=` on a line that names a key,
-right after `user=` on the attempt-cap line. `user=` is the username the
+right after `user=` on the attempt-cap line, and right after `SSH auth failed:`
+on the one line written per failed connection. `user=` is the username the
 client asked for, quoted when it holds any character other than `a-z`, `0-9`,
 `-` and `_`.
 
@@ -186,6 +187,7 @@ client asked for, quoted when it holds any character other than `a-z`, `0-9`,
 | `SSH auth attempt: ...` (`off`) and `SSH auth WOULD DENY (warn mode): ...` (`warn`) | When a key is offered. Neither claims a login. |
 | `SSH auth: key <fp> remote=<host:port> is known after ...` | When fetching an unknown key's GitHub logins, or pulling the directory, made it known. |
 | `SSH auth: public-key attempt cap (<n>) reached for user=<name> remote=<host:port> ...` | When a connection used up `max_auth_tries`. |
+| `SSH auth failed: remote=<host:port> user=<name> keys=<n>` | Once per connection that offered at least one key and closed without proving one, in every mode: `user=` is the username of its last offer, `keys=` how many public-key offers the server examined on that connection (a key offered twice can count twice, and a repeat the SSH library answers from its cache of the last key counts once). A connection that logs in writes none, however many `DENIED` lines it drew first, and so does one that offered no key. This is the line to count failures by (see [Facing the internet](#facing-the-internet)). |
 
 The `allowed` line, and the `DENIED` line for an expired key, end with what the
 user lookup said about the key's user. On the `allowed` line that is the
@@ -739,6 +741,60 @@ the bus over `https://127.0.0.1:8443` with the pinned cert and its own
 | `bind_address` | Interface every listener (plain HTTP, HTTPS, SSH) binds to. **Defaults to loopback (`127.0.0.1`).** In mtls mode set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. An open server is loopback only: any other value fails config load. |
 | `https_port` | The HTTPS listener (bound to `bind_address`) serving the control plane, credential bus, and Connect tunnel over pinned TLS. **Requires `mtls` mode**; defaults to `8443` there. |
 | `trusted_proxy` | Trust `X-Forwarded-For` (only safe behind a proxy that overwrites it). Default false uses the real TCP peer, so a source IP can't be forged to evade per-IP controls. |
+
+### Facing the internet
+
+The SSH listener accepts public-key auth only, with at most
+`auth.ssh.max_auth_tries` keys tried per connection. It also limits
+connections that have not authenticated yet, in every auth mode
+(`off`, `warn`, `enforce`):
+
+| Limit | Value | What happens |
+|-------|-------|--------------|
+| Login grace | 120 seconds | A connection that has not authenticated 120 seconds after it was accepted is closed. A connection that authenticated is never closed by it, however long it stays idle. |
+| Unauthenticated connections | 100 at once | A new connection while 100 are unauthenticated is closed as soon as it is accepted. |
+| Per address | 10 at once | A new connection from an address that holds 10 unauthenticated connections is closed as soon as it is accepted, while other addresses still get in. An address is an IPv4 address, or an IPv6 `/64`. |
+
+A connection leaves both counts once, when it authenticates or when it
+closes. The values are fixed. Loopback has no exemption: a proxy or a tunnel
+on the same host that forwards to `127.0.0.1` would otherwise get past every
+limit, so a proxy in front of the SSH port makes every connection one
+address, and the per-address limit then applies to all of them together.
+
+The limits write these lines:
+
+| Line | Written |
+|------|---------|
+| `SSH: closed a connection from <host:port> that did not authenticate within 120 seconds` | When the login grace closes a connection. |
+| `SSH: refusing connections from <address>: <n> are not yet authenticated (at most 10 from one address, 100 in all)` | When an address's share is full, at most once a minute per address. |
+| `SSH: refusing new connections: <n> are not yet authenticated; the most from one address: <address> (<n>)` | When the limit of 100 is full, at most once a minute. |
+| `SSH auth failed: remote=<host:port> user=<name> keys=<n>` | Once per connection that offered a key and closed without proving one ([The SSH auth log](#the-ssh-auth-log)). |
+
+A connection is closed (and its place given back) before its line is
+written, so a slow log never keeps a connection open.
+
+Count failures by `SSH auth failed`, the grace line and the per-address
+refusal line, never by `SSH auth DENIED`: that line is written once per
+refused key, so a person whose agent offers several keys draws several before
+one of them logs in. A connection that offered a key and then stalled past
+the login grace writes two of these lines (the grace line and its
+`SSH auth failed` line), so a count of lines is not a count of connections.
+The line for the limit of 100 names only the address holding the most, not
+the address refused, so it is not one to count failures by. [Public VPS
+Deployment › Hardening the SSH
+surface](../guides/vps-deployment.md#hardening-the-ssh-surface) has a fail2ban
+filter.
+
+**When the limit refuses everyone.** A peer that holds 100 unauthenticated
+connections from many addresses keeps everyone else out until the login grace
+closes them. The way back: the line for the limit of 100 names the address
+holding the most; block it at the host's firewall (fail2ban's example filter
+bans addresses from the per-address refusal and grace lines, not from that
+line), then restart `shed-server serve`, which drops every connection it
+holds. That ends one wave, not a flood: a peer with more addresses than you
+have blocked fills the limit again after the restart. Against a flood from
+many addresses, filter or rate-limit the SSH port before it reaches the
+server (the firewall, or your provider's network controls).
 
 ## Connection flow: what's encrypted where
 

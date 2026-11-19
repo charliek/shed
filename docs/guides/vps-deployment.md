@@ -220,14 +220,81 @@ worth the same operational care as any other internet-facing SSH daemon:
 - **`auth.ssh.max_auth_tries`** (default `10`) bounds public-key attempts per
   connection; raise it only if a legitimate client's agent (1Password,
   Secretive) holds enough keys that the allowlisted one gets tried late.
-- **fail2ban** (or an equivalent rate-limiter) watching shed-server's SSH
-  auth-failure log lines is standard, optional hardening for a
-  publicly-reachable `ssh_port` — shed's own allowlist rejects unauthorized
-  keys, but a connection-rate limiter reduces log noise and the (already
-  bounded) cost of processing scanner traffic. This is operator-managed;
-  shed does not ship a rate-limiter itself.
+- **Built-in limits on connections that have not authenticated**, in every
+  auth mode: a connection is closed if it has not authenticated within 120
+  seconds; at most 100 may be unauthenticated at once, and at most 10 from one
+  address (an IPv4 address or an IPv6 `/64`). They are fixed values. What each
+  does, the lines it logs, and what to do when the limit refuses everyone are
+  in [Security › Facing the
+  internet](../reference/security.md#facing-the-internet).
+- **fail2ban** (or an equivalent rate-limiter) is standard, optional
+  hardening for a publicly-reachable `ssh_port`: shed rejects unauthorized
+  keys itself, but banning an address that keeps failing reduces log noise and
+  the (already bounded) cost of scanner traffic. Match these lines, each of
+  which names the peer's address:
+    - `SSH auth failed: remote=<host:port> ...`, written once per connection
+      that offered a key and closed without proving one;
+    - `SSH: closed a connection from <host:port> that did not authenticate ...`
+      (the login grace);
+    - `SSH: refusing connections from <address>: ...` (the per-address limit).
+
+    Never match `SSH auth DENIED`: it is written once per refused key, so a
+    person whose agent offers several keys draws several `DENIED` lines on a
+    login that then succeeds, and would be banned for it. This is
+    operator-managed; shed does not ship a rate-limiter itself.
 - Keeping `ssh_port` off the well-known `22` is a minor, optional reduction
   in automated-scanner noise, not a security boundary on its own.
+
+An example for a deb install (the unit `shed-server.service` logs to the
+journal), banning an address after 5 failures in 10 minutes. Each pattern is
+anchored at the start of the message, so a username a client chooses (which
+comes after the address) cannot put another address in front of it:
+
+```ini
+# /etc/fail2ban/filter.d/shed-ssh.conf
+[INCLUDES]
+before = common.conf
+
+[Definition]
+_daemon = shed-server
+_go_time = (?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} )?
+failregex = ^%(__prefix_line)s%(_go_time)sSSH auth failed: remote=\[?<HOST>\]?:\d+ user=
+            ^%(__prefix_line)s%(_go_time)sSSH: closed a connection from \[?<HOST>\]?:\d+ that did not authenticate
+            ^%(__prefix_line)s%(_go_time)sSSH: refusing connections from <HOST>(?:/64)?: 
+ignoreregex =
+
+[Init]
+journalmatch = _SYSTEMD_UNIT=shed-server.service
+```
+
+```ini
+# /etc/fail2ban/jail.d/shed-ssh.conf
+[shed-ssh]
+enabled  = true
+filter   = shed-ssh
+backend  = systemd
+port     = 2222
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+```
+
+Set `port` to your `ssh_port`, and check the filter against your own log with
+`fail2ban-regex systemd-journal shed-ssh` before you enable the jail. Some
+limits of this example:
+
+- `maxretry` counts matching lines, not connections: a connection that
+  offered a key and then stalled past the login grace writes both its
+  `SSH auth failed` line and the grace line, so it counts twice.
+- An IPv6 peer's refusal line names its `/64`; the pattern bans the `/64`'s
+  first address only, so ban IPv6 ranges at the firewall instead if you see
+  them.
+- A link-local IPv6 peer whose address carries a zone
+  (`remote=[fe80::1%eth0]:4000`) is not matched: fail2ban's `<HOST>` does not
+  take the `%eth0`. Such a peer is on your own network segment.
+- The line for the limit of 100 (`SSH: refusing new connections: ...`) is not
+  matched on purpose: it names the address holding the most connections, not
+  the one refused.
 
 ## Co-located host-agent
 

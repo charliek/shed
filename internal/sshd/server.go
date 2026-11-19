@@ -51,6 +51,31 @@ type Server struct {
 	// afterClose, when set (by tests only), runs at the end of every close
 	// of a tracked connection (trackedConn.Close).
 	afterClose func()
+	// afterPreauthClose, when set (by tests only), runs after the first
+	// close of every connection the server admitted (preauthConn.shut), once
+	// its "SSH auth failed" line, if any, has been written (closeLogged).
+	afterPreauthClose func()
+
+	// The limits on connections that have not authenticated (preauth.go):
+	// the login grace, the cap and each source's share of it. NewServer sets
+	// the fixed defaults; only tests change them (before the server serves),
+	// with afterFunc (the grace timer) and now (the clock of the cap's log
+	// lines).
+	loginGrace                  time.Duration
+	maxUnauthenticated          int
+	maxUnauthenticatedPerSource int
+	afterFunc                   func(time.Duration, func()) graceTimer
+	now                         func() time.Time
+	// preMu guards the counts of unauthenticated connections, in all and by
+	// source, and when a cap refusal was last logged: per source in
+	// preLoggedSource, and in the order written in preLoggedOrder, which
+	// preauthMayLog drops old records from.
+	preMu           sync.Mutex
+	preTotal        int
+	preBySource     map[string]int
+	preLoggedSource map[string]time.Time
+	preLoggedOrder  []preauthLogged
+	preLoggedTotal  time.Time
 }
 
 // KeyAuth is how the SSH server decides public-key auth: the auth.ssh mode,
@@ -194,6 +219,12 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 		listenAddr:  listenAddr,
 		termConfig:  termConfig,
 		keyAuth:     keyAuth,
+
+		loginGrace:                  defaultLoginGrace,
+		maxUnauthenticated:          defaultMaxUnauthenticated,
+		maxUnauthenticatedPerSource: defaultMaxUnauthenticatedPerSource,
+		afterFunc:                   realAfterFunc,
+		now:                         time.Now,
 	}
 
 	// Load or generate the host key.
@@ -254,6 +285,14 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 						return nil, err
 					}
 				}
+				// The connection is authenticated: its login grace stops
+				// and it leaves the unauthenticated counts. One whose grace
+				// ended first, or that closed, is being closed and does not
+				// authenticate.
+				if err := preauthAuthenticated(ctx); err != nil {
+					log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (%v)", logUser(conn.User()), id.fingerprint, remote, err)
+					return nil, err
+				}
 				// The one line that says a login happened: the client has
 				// proved it holds this key (x/crypto verified its signature)
 				// and the connection authenticates with it, in every mode.
@@ -296,9 +335,10 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 		},
 	}
 
-	if keyAuth.TrackConnections {
-		s.sshServer.ConnCallback = s.wrapConn
-	}
+	// Every connection, in every mode: the login grace, the cap and its
+	// per-source share, and the "SSH auth failed" line (preauth.go). It then
+	// applies wrapConn when connections are tracked.
+	s.sshServer.ConnCallback = s.admitConn
 
 	// Add the host key to the server.
 	s.sshServer.AddHostKey(hostKey)
@@ -493,6 +533,9 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	// decides the reserved-name refusal, the refetch eligibility and the logs.
 	user := requestUser(ctx)
 	remote := logRemote(ctx.RemoteAddr())
+	// Counted for the connection's "SSH auth failed" line, written if it
+	// closes without proving a key (preauthConn.Close).
+	noteOffer(ctx, user)
 
 	// The username git is reserved (no shed may have that name), and it is
 	// refused here first: in every mode, with or without a user list, before
