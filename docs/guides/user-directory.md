@@ -3,9 +3,10 @@
 A shed server can take its users from an **account service**: a service that
 holds people and their SSH login keys, and hands each server enrolled with it
 the list of users that server admits. People are added, removed and made
-admins on the service, and every enrolled server follows within its refresh
+admins on the service, and each enrolled server follows within its refresh
 interval, or at once with `shed users refresh`, with no config change or
-restart.
+restart. Who is listed, and whether as an admin, is what the service sends
+that server: it may differ from one enrolled server to another.
 
 How the two sides work together:
 
@@ -241,15 +242,28 @@ shed server add build-1.example.test --name build-1
 ```
 
 Their key is not in the list the server holds yet, so their first SSH login
-makes the server pull the list. That login waits at most 8 seconds. If the
-account service is slower than that, the login is refused once; the server's
-pull goes on and its result applies, so trying again succeeds. An admin
-running `shed users refresh` before the person's first login avoids the wait
-altogether. The server pulls for an unknown key at most once a minute while
-pulls succeed, once per 15 minutes while they fail, and never inside a
-pending `Retry-After`; a second unknown key in that window is refused at
-once. If that happens to a genuine newcomer, they try again a minute later,
-or an admin runs `shed users refresh` first.
+(`shed server add` logs in as `_bootstrap`) makes the server pull the list.
+That login waits at most 8 seconds: it is let in as soon as the key is known
+(its own pull, or any other, brought it), and refused when the 8 seconds end
+if the key is still unknown, even when the pull ended sooner. If the account
+service is slower than that, their
+logins are refused until a pull has brought the key; the server's pull goes on
+and its result applies, so a later attempt succeeds. An admin running `shed
+users refresh` before the person's first login avoids the wait altogether.
+The server pulls for an unknown first login at most once a minute while pulls
+succeed, once per 15 minutes while they fail, and never inside a pending
+`Retry-After`; a second unknown key in that window is refused at once, not
+after 8 seconds. If that
+happens to a genuine newcomer, they try again a minute later, or an admin runs
+`shed users refresh` first.
+
+A key a person added on the service, used first to log in to an existing shed
+(`ssh <shed>@build-1.example.test`), is refused at once; the server then pulls
+the list in the background (at most once every 5 minutes) and a retry a few
+seconds later gets in. An unknown key under any other name, one no shed on
+the server has (such as `root` or `ubuntu`, unless a shed has that name),
+starts no pull. [Security › A new
+person](../reference/security.md#a-new-person) has the whole rule.
 
 ### Admins, removals and keys
 

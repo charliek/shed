@@ -39,14 +39,44 @@ func TestNewPersonLogsInThroughTheUnknownKeyPull(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	// Unlisted, her key pulls and is refused; that takes the unknown-key
+	// Unlisted, her key pulls and is refused at her deadline (8 s, a timer
+	// the test fires), not when the pull ends; that takes the unknown-key
 	// slot for a minute of the server's clock, which then passes.
-	pulls := s.recorder.pullCount()
-	if _, err := s.dial(ada, "_bootstrap"); err == nil {
-		t.Fatal("ada logged in before anyone listed her")
+	pulls, firstAttempt := s.recorder.pullCount(), s.rt.Status().LastAttempt
+	unlisted := make(chan error, 1)
+	go func() {
+		c, err := s.dial(ada, "_bootstrap")
+		if err == nil {
+			_ = c.Close()
+		}
+		unlisted <- err
+	}()
+	deadline = time.After(10 * time.Second)
+	// Her pull has ended (its attempt recorded) and her deadline is set.
+	for s.recorder.pullCount() != pulls+1 || s.timers.armed(8*time.Second) != 1 || s.rt.Status().LastAttempt.Equal(firstAttempt) {
+		select {
+		case err := <-unlisted:
+			t.Fatalf("ada's unlisted login answered before its pull and its deadline: %v", err)
+		case <-deadline:
+			t.Fatal("an unknown key's login did not pull the list and wait for its deadline")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
-	if s.recorder.pullCount() != pulls+1 {
-		t.Fatal("an unknown key's login did not pull the list")
+	select {
+	case err := <-unlisted:
+		t.Fatalf("ada's unlisted login answered (%v) once her pull had ended, before her deadline", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if n := s.timers.fire(8 * time.Second); n != 1 {
+		t.Fatalf("%d deadline timers fired, want 1", n)
+	}
+	select {
+	case err := <-unlisted:
+		if err == nil {
+			t.Fatal("ada logged in before anyone listed her")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ada's unlisted login was not answered at her deadline")
 	}
 	s.offset.Add(int64(directory.UnknownKeyEvery))
 

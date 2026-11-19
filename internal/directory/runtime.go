@@ -40,14 +40,24 @@ const (
 	// it reads the wall clock again: a timer does not count the time a host
 	// spends asleep, the wall clock does.
 	maxScheduleWait = time.Minute
-	// UnknownKeyEvery is how often an unknown key may start a pull while the
-	// last pull succeeded (RefetchForUnknownKey). While the server is in the
-	// failed state, it is RetryInterval.
+	// UnknownKeyEvery is how often an unknown key offered for a first login
+	// (`_bootstrap`, RefetchForUnknownKey) may start a pull while the last
+	// pull succeeded. While the server is in the failed state, it is
+	// RetryInterval.
 	UnknownKeyEvery = time.Minute
-	// UnknownKeyWait is the one deadline the login that takes the unknown-key
+	// UnknownKeyShedEvery is how often an unknown key offered for a login to
+	// a shed that exists (NudgeForUnknownKey) may start a pull while the last
+	// pull succeeded: a slot of its own, apart from UnknownKeyEvery's. While
+	// the server is in the failed state, it is RetryInterval.
+	UnknownKeyShedEvery = 5 * time.Minute
+	// UnknownKeyWait is the one deadline the login that takes the first-login
 	// slot waits under: queueing behind a pull already running, the token
 	// request, the directory request and the one new login after a refused
-	// token, together. Measured on the runtime's timer.
+	// token, together. Measured on the runtime's timer. A login whose key is
+	// still unknown is answered when it ends, never earlier, whenever its
+	// pull ended, so for a key that stays unknown the answer's timing does
+	// not depend on a pull another login started. A login whose key becomes
+	// known (from any publication) is let in then.
 	//
 	// It must stay below the shortest bound a shipped client puts on a first
 	// login, 10 seconds around the whole ssh exchange, with room left for the
@@ -134,7 +144,7 @@ type RuntimeOptions struct {
 	// each pull's bound (PullTimeout) run on it. For tests.
 	Timer func(d time.Duration) (<-chan time.Time, func())
 	// Elapsed reads the clock the runtime's waits are measured on (a pending
-	// Retry-After, the unknown-key slot's intervals): the
+	// Retry-After, the unknown-key slots' intervals): the
 	// difference of two readings is the time elapsed between them, whatever
 	// the wall clock was set to meanwhile. nil is the lookup's clock as it
 	// reads, unrounded: in production time.Now, whose monotonic reading makes
@@ -154,9 +164,10 @@ type RuntimeOptions struct {
 // each good pull (written before the list is published), starts from that
 // copy, and schedules the next pull.
 //
-// It is the users.Refresher of a directory server (`shed users refresh`), and
-// its users.UnknownKeyRefetcher (a new person's first SSH login). Its Status
-// is what an admin is shown.
+// It is the users.Refresher of a directory server (`shed users refresh`), its
+// users.UnknownKeyRefetcher (a new person's first SSH login, `_bootstrap`)
+// and its users.UnknownKeyNudger (a new key offered for a login to a shed that
+// exists). Its Status is what an admin is shown.
 type Runtime struct {
 	*Lookup
 
@@ -241,10 +252,13 @@ type Runtime struct {
 	// earlier; a good pull, a read of the enrolment that finds the server not
 	// enrolled, or its own end clears it.
 	retryEnd time.Time
-	// unknownAt is when an unknown key last took the unknown-key slot (zero:
-	// never), on the elapsed clock: a wall clock set forward does not free
-	// the slot early, nor one set back hold it.
-	unknownAt time.Time
+	// unknownAt is when an unknown key last took the first-login slot
+	// (`_bootstrap`, RefetchForUnknownKey), and unknownShedAt when one last
+	// took the shed-name slot (NudgeForUnknownKey) (zero: never), on the
+	// elapsed clock: a wall clock set forward does not free a slot early, nor
+	// one set back hold it. The two slots are independent.
+	unknownAt     time.Time
+	unknownShedAt time.Time
 
 	// What has been logged, for the lines logged once per change of state.
 	failClass   string
@@ -263,11 +277,16 @@ type Runtime struct {
 	// afterDone runs in the pull goroutine after a pull's callers were told
 	// its result and before the next pull asked for is taken up.
 	afterDone func()
+	// unknownWaiting runs in RefetchForUnknownKey once its deadline timer
+	// exists and its pull has been asked for (made or joined), just before
+	// it waits.
+	unknownWaiting func()
 }
 
 var (
 	_ users.Refresher           = (*Runtime)(nil)
 	_ users.UnknownKeyRefetcher = (*Runtime)(nil)
+	_ users.UnknownKeyNudger    = (*Runtime)(nil)
 )
 
 // enrolState is what a read of the enrolment found: state "" when the
@@ -285,16 +304,19 @@ type enrolState struct {
 type flight struct {
 	done chan struct{}
 	row  users.DirectoryRefresh
-	// unknownOnly: the pull exists only for an unknown key (made by
-	// RefetchForUnknownKey, joined by no admin's refresh and not by the
-	// schedule); prevUnknown is when the unknown-key slot had been taken
-	// before the take that made it (zero: never). Such a pull is checked
-	// again against the unknown-key policy when it would start
-	// (unknownMayStart). Both are written under fmu, and read by the pull
-	// goroutine once the pull is the running one, after which nobody joins
-	// it.
-	unknownOnly bool
-	prevUnknown time.Time
+	// unknownOnly: the pull exists only for unknown keys (made by
+	// RefetchForUnknownKey or NudgeForUnknownKey, joined by no admin's
+	// refresh and not by the schedule). unknownPrevs holds, for each unknown
+	// key that asked for it (the one that made it and each that joined it),
+	// when that key's own slot had been taken before the take that let it
+	// ask (zero: never). Such a pull is checked again against the unknown-key
+	// policy when it would start, and is sent when the policy allows it for
+	// any one of its askers (unknownMayStartAny): joining never takes away a
+	// pull one asker alone would have had, nor sends one no asker alone would
+	// have. Both are written under fmu, and read by the pull goroutine once
+	// the pull is the running one, after which nobody joins it.
+	unknownOnly  bool
+	unknownPrevs []time.Time
 	// admin: an admin's refresh asked for the pull, or joined it. A pull no
 	// admin asked for (the schedule's) is not sent while a Retry-After is
 	// pending when it would start (scheduleMayStart). Written under fmu,
@@ -312,9 +334,10 @@ const (
 	// askSchedule is the schedule: its pull is not sent while a Retry-After
 	// is pending.
 	askSchedule
-	// askUnknown is an unknown key that took the unknown-key slot: its pull,
-	// while nobody else joins it, is checked against the unknown-key policy
-	// when it would start.
+	// askUnknown is an unknown key that took one of the unknown-key slots
+	// (the first-login slot or the shed-name slot): its pull, while nobody
+	// but other unknown keys joins it, is checked against the unknown-key
+	// policy when it would start.
 	askUnknown
 )
 
@@ -572,26 +595,35 @@ func (r *Runtime) Refresh(ctx context.Context) (users.RefreshReport, error) {
 }
 
 // RefetchForUnknownKey is a new person's first SSH login (asked by the SSH
-// server, in enforce mode, for a key the lookup does not know): it pulls the
-// list, at most at the unknown-key rate, and reports whether the key is
-// known, and not expired, afterwards.
+// server, in enforce mode, for a key the lookup does not know, offered as
+// `_bootstrap`): it pulls the list, at most at the first-login rate, and
+// reports whether the key is known, and not expired, afterwards.
 //
-// It first takes the unknown-key slot (takeUnknownKeySlot), atomically and
+// It first takes the first-login slot (takeUnknownKeySlot), atomically and
 // before anything else; every caller that does not get it returns false at
 // once, having started nothing and waited for nothing. The caller that gets
 // it joins the single flight (a pull asked for and not yet started, or one
 // queued behind the pull running) and waits for it under one deadline,
 // UnknownKeyWait on the runtime's timer, started before it joins, so it
 // covers the queueing as well as the pull's own requests; or until ctx ends.
-// It then answers from the newest snapshot. A pull it stops waiting for
-// carries on under its own bound (PullTimeout), and its result applies when
-// it ends, as an admin's refresh whose caller gave up.
+// As soon as the key is known, from any publication made meanwhile (its own
+// pull's, or another's: an admin's refresh, the schedule, a nudge), it
+// answers true. A key that stays unknown is answered when the deadline ends
+// (or ctx does), never earlier, whether its pull ended sooner or not, from
+// the newest snapshot then: how long a refused first login took does not
+// depend on how long its pull took, so a peer whose key stays unknown cannot
+// tell from it whether a pull another login started (a shed name's,
+// NudgeForUnknownKey) was queued ahead of its own. (A key that is listed is
+// let in when a pull brings it, so a pull already running ahead of its own
+// delays that answer.) A pull it stops waiting for carries on under its own
+// bound (PullTimeout), and its result applies when it ends, as an admin's
+// refresh whose caller gave up.
 //
-// A pull that exists only for the unknown key (no admin's refresh and not
-// the schedule joined it) is checked against the policy again when it would
-// start (unknownMayStart): queued behind a pull that was then answered with
-// a Retry-After, or that failed, it may end without sending anything, and
-// the caller is answered from the snapshot it has.
+// A pull that exists only for unknown keys (no admin's refresh and not the
+// schedule joined it) is checked against the policy again when it would
+// start (unknownMayStartAny): queued behind a pull that was then answered
+// with a Retry-After, or that failed, it may end without sending anything,
+// and the caller is answered from the snapshot it has.
 //
 // A local admin's login never comes here (their keys are always known), and
 // no reader of the lookup waits for a pull: a login that does not take the
@@ -608,26 +640,85 @@ func (r *Runtime) RefetchForUnknownKey(ctx context.Context, fingerprint string) 
 	r.logf("directory: unknown key %s: pulling the list (at most once a minute while pulls succeed, once every %s while they fail)", fingerprint, RetryInterval)
 	deadline, stop := r.timer(UnknownKeyWait)
 	defer stop()
-	f := r.ask(askUnknown, prev)
-	select {
-	case <-f.done:
-	case <-deadline:
-	case <-ctx.Done():
+	r.ask(askUnknown, prev)
+	if r.unknownWaiting != nil {
+		r.unknownWaiting()
 	}
+	for {
+		// Taken before the read, so a publication between the two is not
+		// missed: the key may become known from any publication, its own
+		// pull's or another's (an admin's refresh, the schedule, a nudge).
+		pub := r.published()
+		if r.knows(fingerprint) {
+			return true
+		}
+		select {
+		case <-pub:
+		case <-deadline:
+			return r.knows(fingerprint)
+		case <-ctx.Done():
+			return r.knows(fingerprint)
+		}
+	}
+}
+
+// NudgeForUnknownKey is an unknown key offered for a login to a shed that
+// exists (asked by the SSH server, in enforce mode, off the login path, which
+// refuses the login without waiting for it, once it has found the shed): it
+// asks for a pull of the list in the background, at most at the shed-name
+// rate, and reports whether it asked for one. No login waits for it: the pull
+// runs under its own bound
+// (PullTimeout), its result applies when it ends, and the person's next
+// attempt finds the key known.
+//
+// It takes the shed-name slot (takeUnknownShedSlot), which is apart from the
+// first-login slot: a nudge never takes RefetchForUnknownKey's slot, nor the
+// reverse. A key known by now asks for nothing. Its pull joins the single
+// flight like any other, and is checked against the unknown-key policy when
+// it would start (unknownMayStartAny).
+func (r *Runtime) NudgeForUnknownKey(fingerprint string) bool {
+	if fingerprint == "" || r.knows(fingerprint) {
+		return false
+	}
+	prev, ok := r.takeUnknownShedSlot()
+	if !ok {
+		return false
+	}
+	r.logf("directory: shed-name key %s for an existing shed: pulling the list in the background (at most once every 5 minutes while pulls succeed, once every 15 minutes while they fail)", fingerprint)
+	r.ask(askUnknown, prev)
+	return true
+}
+
+// knows reports whether the lookup knows the key with this fingerprint now
+// and it has not expired.
+func (r *Runtime) knows(fingerprint string) bool {
 	_, k, known := r.UserForKey(fingerprint)
 	return known && !k.Expired(r.now())
 }
 
-// takeUnknownKeySlot takes the unknown-key slot, and reports whether it did,
-// and when it had been taken before (prev; zero: never). It is taken only
-// when the runtime is not stopping, the last read of the enrolment found the
-// server enrolled with the configured service, no Retry-After is pending,
-// and the slot was last taken at least UnknownKeyEvery ago while the last
-// pull succeeded (or none has ended yet), or at least RetryInterval ago while
-// the server is in the failed state. Every check and the taking are done
-// under one lock, so of callers at once one at most gets it. The waits are
-// measured as elapsed time (RuntimeOptions.Elapsed), not on the wall clock.
+// takeUnknownKeySlot takes the first-login slot (RefetchForUnknownKey):
+// takeSlot with UnknownKeyEvery.
 func (r *Runtime) takeUnknownKeySlot() (prev time.Time, ok bool) {
+	return r.takeSlot(&r.unknownAt, UnknownKeyEvery)
+}
+
+// takeUnknownShedSlot takes the shed-name slot (NudgeForUnknownKey):
+// takeSlot with UnknownKeyShedEvery.
+func (r *Runtime) takeUnknownShedSlot() (prev time.Time, ok bool) {
+	return r.takeSlot(&r.unknownShedAt, UnknownKeyShedEvery)
+}
+
+// takeSlot takes the unknown-key slot whose last take is *at, and reports
+// whether it did, and when it had been taken before (prev; zero: never). It
+// is taken only when the runtime is not stopping, the last read of the
+// enrolment found the server enrolled with the configured service, no
+// Retry-After is pending, and the slot was last taken at least every ago
+// while the last pull succeeded (or none has ended yet), or at least
+// RetryInterval ago while the server is in the failed state. Every check and
+// the taking are done under one lock, so of callers at once one at most gets
+// it. The waits are measured as elapsed time (RuntimeOptions.Elapsed), not
+// on the wall clock.
+func (r *Runtime) takeSlot(at *time.Time, every time.Duration) (prev time.Time, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.ctx.Err() != nil || r.enrol.state != "" || r.enrol.clientID == "" {
@@ -637,24 +728,24 @@ func (r *Runtime) takeUnknownKeySlot() (prev time.Time, ok bool) {
 	if now.Before(r.retryEnd) {
 		return time.Time{}, false
 	}
-	every := UnknownKeyEvery
 	if r.lastErr != "" {
 		every = RetryInterval
 	}
-	if !r.unknownAt.IsZero() && now.Sub(r.unknownAt) < every {
+	if !at.IsZero() && now.Sub(*at) < every {
 		return time.Time{}, false
 	}
-	prev, r.unknownAt = r.unknownAt, now
+	prev, *at = *at, now
 	return prev, true
 }
 
-// unknownMayStart reports whether a pull that exists only for an unknown key
-// (made when the slot was taken, prev the take before that one) may start
-// now, and if not, why: not while a Retry-After is pending, and not while
-// the last pull failed and the slot had been taken less than RetryInterval
-// before (the failed state's rate, counted as when the slot is taken). It
-// is the slot's own policy, read again at the start: the pull it was made
-// for may have queued behind one that ended since.
+// unknownMayStart reports whether a pull asked for by one unknown key (when
+// it took its slot, prev that slot's take before that one) may start now, by
+// that asker's policy, and if not, why: not while a Retry-After is pending,
+// and not while the last pull failed and the slot had been taken less than
+// RetryInterval before (the failed state's rate, counted as when the slot is
+// taken; the same for both slots). It is the slot's own policy, read again at
+// the start: the pull it was made for may have queued behind one that ended
+// since.
 func (r *Runtime) unknownMayStart(prev time.Time) (bool, string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -666,6 +757,29 @@ func (r *Runtime) unknownMayStart(prev time.Time) (bool, string) {
 		return false, fmt.Sprintf("the last pull failed, and while pulls fail an unknown key pulls at most once every %s", RetryInterval)
 	}
 	return true, ""
+}
+
+// unknownMayStartAny is the merge rule of a pull that exists only for
+// unknown keys and that several asked for (prevs, one per asker, each that
+// asker's own previous take of its slot): it may start when unknownMayStart
+// allows it for any one of them. When none allows it, why is the first
+// asker's reason.
+func (r *Runtime) unknownMayStartAny(prevs []time.Time) (bool, string) {
+	var first string
+	for i, prev := range prevs {
+		ok, why := r.unknownMayStart(prev)
+		if ok {
+			return true, ""
+		}
+		if i == 0 {
+			first = why
+		}
+	}
+	if len(prevs) == 0 {
+		// Not reached: an unknown-only pull has the asker that made it.
+		return r.unknownMayStart(time.Time{})
+	}
+	return false, first
 }
 
 // PullsAsked is how many pulls have been asked for since the runtime was
@@ -685,8 +799,10 @@ func (r *Runtime) request() *flight { return r.ask(askAdmin, time.Time{}) }
 // ask is the pull a caller waits for: the one asked for and not yet
 // started, if there is one; otherwise a new one, started now when none is
 // running, or else started when the running one ends. by says who asks;
-// for an unknown key that took the slot, prev is the take before its own: a
-// pull it makes exists only for it until another caller joins it.
+// for an unknown key that took one of the unknown-key slots, prev is that
+// slot's take before its own: a pull it makes exists only for unknown keys
+// until another caller joins it, and every unknown key that joins it adds its
+// own prev (the merge rule, unknownMayStartAny).
 //
 // Once the runtime is stopping (its context ended), it starts nothing: the
 // pull it returns has already ended, as "the server is stopping".
@@ -699,7 +815,9 @@ func (r *Runtime) ask(by asker, prev time.Time) *flight {
 		return f
 	}
 	if f := r.pending; f != nil {
-		if by != askUnknown {
+		if by == askUnknown {
+			f.unknownPrevs = append(f.unknownPrevs, prev)
+		} else {
 			f.unknownOnly = false
 		}
 		if by == askAdmin {
@@ -708,7 +826,10 @@ func (r *Runtime) ask(by asker, prev time.Time) *flight {
 		return f
 	}
 	r.asked++
-	f := &flight{done: make(chan struct{}), unknownOnly: by == askUnknown, prevUnknown: prev, admin: by == askAdmin}
+	f := &flight{done: make(chan struct{}), unknownOnly: by == askUnknown, admin: by == askAdmin}
+	if by == askUnknown {
+		f.unknownPrevs = []time.Time{prev}
+	}
 	if r.running == nil {
 		r.running = f
 		r.wg.Add(1)
@@ -721,17 +842,17 @@ func (r *Runtime) ask(by asker, prev time.Time) *flight {
 
 // run runs f, then each pull asked for while it ran, one at a time. When
 // the last ends with the runtime stopping, it forgets the client. A pull
-// that exists only for an unknown key is sent only when the unknown-key
-// policy still allows it (unknownMayStart), and one no admin asked for only
-// when no Retry-After is pending (scheduleMayStart); otherwise it ends at
-// once, having sent nothing.
+// that exists only for unknown keys is sent only when the unknown-key policy
+// still allows it for one of its askers (unknownMayStartAny), and one no
+// admin asked for only when no Retry-After is pending (scheduleMayStart);
+// otherwise it ends at once, having sent nothing.
 func (r *Runtime) run(f *flight) {
 	defer r.wg.Done()
 	// f is the running pull: nobody joins it, so what it was asked for is
 	// settled.
-	unknownOnly, admin, prev := f.unknownOnly, f.admin, f.prevUnknown
+	unknownOnly, admin, prevs := f.unknownOnly, f.admin, f.unknownPrevs
 	for f != nil {
-		f.row = r.startPull(unknownOnly, admin, prev)
+		f.row = r.startPull(unknownOnly, admin, prevs)
 		close(f.done)
 		if r.afterDone != nil {
 			r.afterDone()
@@ -740,7 +861,7 @@ func (r *Runtime) run(f *flight) {
 		f, r.pending = r.pending, nil
 		r.running = f
 		if f != nil {
-			unknownOnly, admin, prev = f.unknownOnly, f.admin, f.prevUnknown
+			unknownOnly, admin, prevs = f.unknownOnly, f.admin, f.unknownPrevs
 		}
 		forget := f == nil && r.stopped
 		r.fmu.Unlock()
@@ -755,15 +876,15 @@ func (r *Runtime) run(f *flight) {
 }
 
 // startPull is the running pull's attempt, unless the pull exists only for
-// an unknown key (prev: the slot's take before the one that made it) and the
-// unknown-key policy no longer allows it, or no admin asked for it (the
-// schedule's) and a Retry-After is pending: then it ends at once, failed,
-// having sent nothing.
-func (r *Runtime) startPull(unknownOnly, admin bool, prev time.Time) users.DirectoryRefresh {
+// unknown keys (prevs: each asker's own slot's take before the one that let
+// it ask) and the unknown-key policy allows it for none of them, or no admin
+// asked for it (the schedule's) and a Retry-After is pending: then it ends at
+// once, failed, having sent nothing.
+func (r *Runtime) startPull(unknownOnly, admin bool, prevs []time.Time) users.DirectoryRefresh {
 	switch {
 	case admin:
 	case unknownOnly:
-		if ok, why := r.unknownMayStart(prev); !ok {
+		if ok, why := r.unknownMayStartAny(prevs); !ok {
 			r.logf("directory: the pull asked for by an unknown key is not sent: %s", why)
 			return r.row(false, "not sent: "+why)
 		}

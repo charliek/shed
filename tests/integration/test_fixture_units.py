@@ -3351,6 +3351,11 @@ def test_the_directory_cases_match_the_servers_own_words():
     assert f'"key %s {dfx.KEY_MOVED}"' in (root / "internal" / "sshd" / "identity.go").read_text()
     runtime = (root / "internal" / "directory" / "runtime.go").read_text()
     assert f'r.logf("{dfx.UNKNOWN_KEY_PULL}%s: pulling the list' in runtime
+    # A shed name's background pull has its own prefix, which the count of
+    # first-login pulls (UNKNOWN_KEY_PULL) does not take in.
+    assert f'r.logf("{dfx.SHED_NAME_PULL}%s for an existing shed: pulling the list in the background' in runtime
+    assert not dfx.SHED_NAME_PULL.startswith(dfx.UNKNOWN_KEY_PULL)
+    assert not dfx.UNKNOWN_KEY_PULL.startswith(dfx.SHED_NAME_PULL)
     assert f'"{dfx.STARTUP_NO_COPY}"' in runtime
     assert f'fmt.Sprintf("{dfx.STARTUP_KEPT_COPY}%s, version' in runtime
     assert "UnknownKeyEvery = time.Minute" in runtime and dfx.UNKNOWN_KEY_EVERY == 60

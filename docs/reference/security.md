@@ -67,7 +67,7 @@ local admins listed in `auth.users`.
 | Modes | `open` or `mtls` | `mtls` only | `mtls` only |
 | Who a key is | the implicit user, an admin | the user it is listed under, with that user's `admin` flag | a local admin, or the list's user, with the list's `admin` flag |
 | Sheds a caller reaches | every shed | their own; an admin also lists, stops and deletes others' (see [Ownership](#ownership)) | as with `auth.users` |
-| Unknown key | refused in `enforce`, let in as the implicit user in `off` and `warn` | refused in every SSH mode | refused, after at most one pull of the list (see [A new person](#a-new-person)) |
+| Unknown key | refused in `enforce`, let in as the implicit user in `off` and `warn` | refused in every SSH mode | refused, unless a pull of the list it may start brings it (see [A new person](#a-new-person)) |
 
 With a user list a user's key is a plain public key: a client that presents an
 SSH certificate is refused, and a certificate listed as a key fails config
@@ -138,7 +138,8 @@ from a fetch that shows the login still names that id.
   accepts nothing from it; the REST API requests it leads to have their own
   budget of 20 an hour, so strangers cannot spend the scheduled refreshes'
   allowance. An expired key, a key dropped for a mismatch and the username
-  `git` never trigger it.
+  `git` never trigger it. (A server whose users come from an account service
+  has another rule: see [A new person](#a-new-person).)
 
 The per-login key cache, `{state_dir}/github_keys/<login>.keys`, keeps its
 name and format, and is trusted only when it matches the hash stored with the
@@ -281,8 +282,10 @@ backup key](../guides/user-directory.md#keeping-the-local-admin-on-a-backup-key)
 
 A list admin has an admin's powers on the server, host directories and server
 mounts included, so **whoever controls the account service controls the
-host**. Whoever can add a key to a person there enters every enrolled server
-as that person, and whoever can set the admin flag gets every enrolled
+host**. Who is listed, and whether as an admin, is what the service sends
+this server; it may differ from one enrolled server to another. Whoever can
+add a key to a person there enters every server that lists that person, as
+that person, and whoever can make a person an admin on a server gets that
 server's host. Run the service with the care that implies; the local admins
 are outside its reach.
 
@@ -384,18 +387,67 @@ connections are closed.
 
 ### A new person
 
-A person the server does not know yet logs in over SSH (`shed server add`)
-with a key the list does not hold yet. The server then pulls the list, at most
-**once a minute** while pulls succeed and **once per 15 minutes** while they
-fail, and never inside a pending `Retry-After`. Only the login that takes that
-slot waits, for at most 8 seconds. If the account service is slower than that,
-the login is refused once, the pull carries on and its result applies, and
-trying again succeeds. Every other unknown key at that moment is refused at
-once. A local admin's login never waits for a pull.
+A key the list the server holds does not have (a person added on the service
+since the last pull, or a key they added there) can make the server pull the
+list early. What it can start depends on the login name it is offered under:
+
+| Login name | What happens |
+|------------|--------------|
+| `_bootstrap` (`shed server add`, a refetch) | The server pulls the list, at most **once a minute** while pulls succeed and **once per 15 minutes** while they fail, never inside a pending `Retry-After`, and only when enrolled. Only the login that takes that slot waits: it is let in as soon as its key is known (brought by its own pull or by any other: an admin's refresh, the schedule, a shed name's pull), and if its key is still unknown it is refused when its **8-second** wait ends, never earlier, however soon the pull ended. Every other unknown key at that moment is refused at once, so a refused `shed server add` takes 8 seconds only when its login took the slot. |
+| The name of a shed that exists on this server | Refused at once. Off the login path the server checks that the shed exists, and only then pulls the list in the background, on a slot of its own: at most **once every 5 minutes** while pulls succeed, once per 15 minutes while they fail, never inside a pending `Retry-After`, only when enrolled. No login waits for it. A retry a few seconds later is let in once the pull has brought the key. |
+| Any other name (a name no shed has, or one that cannot be a shed name) | Refused at once. No pull. |
+
+If the account service answers more slowly than the wait, a new person's
+logins are refused until a pull has brought their key; the pull carries on,
+its result applies, and a later attempt succeeds. An admin's `shed users
+refresh` before the person's first login avoids the wait altogether, and is
+not limited by either slot. A local admin's login never waits for a pull.
+
+**What a peer can learn about which shed names exist.** A login under a shed
+name is refused without waiting for the server's check of the name, so that
+answer does not depend on whether the shed exists. A pull started for a shed
+name can delay a later `_bootstrap` pull that queues behind it, but a
+`_bootstrap` login whose key stays unknown is answered at its fixed 8-second
+deadline, so that delay does not show. For a peer whose key stays unknown, then,
+the time of each answer does not depend on whether a guessed login name is an
+existing shed, except in three cases, in which whether a shed-name pull was
+sent changes when the `_bootstrap` slot may next be taken (a slot it may take
+waits 8 seconds; one it may not is refused at once), so a peer probing at that
+moment can learn whether a guessed name is a shed, at most one guess per
+`_bootstrap` slot:
+
+- while pulls fail;
+- while a `Retry-After` is pending;
+- when pulls had been succeeding and the shed-name pull itself fails: the
+  server then enters the failed state, and a `_bootstrap` login that would have
+  taken the slot (a minute after the last take) and waited 8 seconds is refused
+  at once instead.
+
+A person whose key is listed on the service learns something else, which is
+accepted: their own first login is let in when a pull brings their key, so a
+pull that was already running ahead of theirs delays that login, which can
+show them that some pull was in flight.
+
+At most one check of a shed name runs at a time, as the server itself, within
+2 seconds; an offer that arrives while one runs is refused with no check, and a
+check that takes longer asks for no pull.
+
+The server logs each such pull: `directory: unknown key <fp>: pulling the
+list ...` for `_bootstrap`, and `directory: shed-name key <fp> for an existing
+shed: pulling the list in the background ...` for a shed name. Once an hour,
+when there was any, it logs how many unknown keys were offered under a shed
+name: `directory: in the last hour <n> unknown keys were offered as a name
+that is no shed here and <m> as an existing shed's name (<p> started a pull,
+<q> skipped while a check ran, <e> checks failed: <first error>)`.
 
 The server holds **one outstanding `Retry-After`** for itself: neither the
 schedule nor an unknown key pulls before it ends. Only an admin's `shed users
 refresh` may pull before it.
+
+A server whose users come from `auth.users` with GitHub logins keeps its own
+rule (see [GitHub logins are pinned to their account
+id](#github-logins-are-pinned-to-their-account-id)): an unknown key under
+`_bootstrap` or any valid shed name may start a GitHub fetch.
 
 ### Certificates
 
@@ -795,6 +847,23 @@ holds. That ends one wave, not a flood: a peer with more addresses than you
 have blocked fills the limit again after the restart. Against a flood from
 many addresses, filter or rate-limit the SSH port before it reaches the
 server (the firewall, or your provider's network controls).
+
+**What an unknown key can start.** On a server whose users come from an
+account service, a key the server does not know can make it pull the list
+early, and nothing else: under `_bootstrap`, at most once a minute (the
+newcomer's slot); under the name of a shed that exists on this server, at most
+once every 5 minutes, in the background; while pulls fail, each at most once
+every 15 minutes, and neither inside a pending `Retry-After`. Under any other
+name it starts nothing, so scanners trying `root`, `admin` or `ubuntu` cost
+the account service nothing unless a shed has that name, and at most one
+check of a shed name (a read of the server's own records, as the server, within
+2 seconds) runs at a time. A peer that knows `_bootstrap` can take the
+newcomer's slot, up to 60 pulls an hour; one that names a real shed adds at
+most 12. A newcomer refused because the slot was taken tries again a minute
+later, or an admin runs `shed users refresh`, which neither slot limits. A
+server whose users come from `auth.users` keeps its own rule for GitHub
+logins. See [A new person](#a-new-person), which also states what a peer can
+learn about which shed names exist.
 
 ## Connection flow: what's encrypted where
 

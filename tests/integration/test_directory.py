@@ -26,6 +26,9 @@ What it shows, live, over real SSH connections and the real HTTPS API:
     connection is the second person's;
   - the unknown-key pull's rate: a second unknown key in the same minute is
     refused at once;
+  - an unknown key under a name that is no shed asks for no pull; under an
+    existing shed's name it is refused at once, the server pulls in the
+    background, and a retry is let in;
   - a certificate that names no user is refused;
   - a session inside a shed is closed when its person is removed, and an
     open session survives a key move while a new one, and the person's CLI
@@ -55,6 +58,7 @@ from fixtures.directory import (
     LOCAL_ADMIN,
     SKIPPED_LOCAL_ADMIN_KEY,
     SKIPPED_LOCAL_ADMIN_NAME,
+    SHED_NAME_PULL,
     SKIPPED_LOG,
     STARTUP_KEPT_COPY,
     STARTUP_NO_COPY,
@@ -387,6 +391,98 @@ def test_the_unknown_key_rates(world):
     w.refresh_ok()
     p = w.probe(dora)
     assert p.admitted, p
+
+
+# How long the server's off-path check of a shed name may take (its 2 s
+# deadline, internal/sshd) plus room: after it, a check has ended.
+SHED_CHECK_SETTLE = 4
+
+
+def _ssh_timed(w: World, who, shed: str):
+    t0 = time.monotonic()
+    r = w.ssh_run(who, shed, "true")
+    return r, time.monotonic() - t0
+
+
+def test_an_unknown_key_as_a_name_that_is_no_shed_asks_no_pull(world):
+    """A smoke test over real SSH, not a proof of the rule's timing.
+
+    The sleep does not establish that the server's check has ended (its
+    deadline starts inside the check, and a backend may ignore it), and the
+    log is read only up to then: it shows no pull was asked in that interval.
+    `took < 4` catches a login that waits for an 8-second pull, not a shorter
+    inline wait. The rule itself, its timing and its bounds are held by the
+    Go tests (internal/sshd unknownshed_test.go, internal/directory
+    runtime_unknown_shed_test.go).
+    """
+    w = world
+    k = w.key("nell")
+    w.set_user("nell", [k])
+    w.publish()
+    nell = w.identity("nell", k)
+    log = w.server.log()
+    first_logins, shed_names = log.count(UNKNOWN_KEY_PULL), log.count(SHED_NAME_PULL)
+
+    # Listed on the service, unknown to the server: refused at once, under a
+    # valid shed name that no shed has, and no pull is asked for, then or
+    # once the server's check of the name has ended.
+    r, took = _ssh_timed(w, nell, "no-such-shed")
+    assert r.returncode == 255 and "Permission denied" in r.stderr, (r.returncode, r.stderr)
+    assert took < UNKNOWN_KEY_WAIT / 2, f"the login waited {took:.1f} s"
+    time.sleep(SHED_CHECK_SETTLE)
+    log = w.server.log()
+    assert log.count(SHED_NAME_PULL) == shed_names, "a name that is no shed asked for a pull"
+    assert log.count(UNKNOWN_KEY_PULL) == first_logins, "a name that is no shed took the first-login slot"
+
+    # It was the rule, not the list: after the local admin's refresh she is in.
+    w.refresh_ok()
+    p = w.probe(nell)
+    assert p.admitted, p
+
+
+def test_an_unknown_key_as_an_existing_sheds_name_is_refused_then_let_in(world):
+    """A smoke test over real SSH, not a proof of the rule's timing.
+
+    `took < 4` catches a login that waits for an 8-second pull, not a shorter
+    inline wait, and says nothing about whether the two names' refusals take
+    the same time; the retry loop allows 30 seconds. The rule itself, its
+    timing and its bounds are held by the Go tests (internal/sshd
+    unknownshed_test.go, internal/directory runtime_unknown_shed_test.go).
+    """
+    w = world
+    _create(w, w.admin, "lab")
+    k = w.key("olga")
+    w.set_user("olga", [k])
+    w.publish()
+    olga = w.identity("olga", k)
+    log = w.server.log()
+    first_logins, shed_names = log.count(UNKNOWN_KEY_PULL), log.count(SHED_NAME_PULL)
+    allowed = f"SSH auth allowed: user=lab fingerprint={k.fingerprint} "
+
+    # Refused at once, as a name that is no shed is: the login never waits.
+    r, took = _ssh_timed(w, olga, "lab")
+    assert r.returncode == 255 and "Permission denied" in r.stderr, (r.returncode, r.stderr)
+    assert took < UNKNOWN_KEY_WAIT / 2, f"the login waited {took:.1f} s"
+
+    # The shed exists: the server pulls in the background, on the shed-name
+    # slot, never the first-login one.
+    deadline = time.monotonic() + 30
+    while w.server.log().count(SHED_NAME_PULL) == shed_names and time.monotonic() < deadline:
+        time.sleep(0.5)
+    log = w.server.log()
+    assert log.count(SHED_NAME_PULL) == shed_names + 1, "no background pull for an existing shed's name"
+    assert log.count(UNKNOWN_KEY_PULL) == first_logins, "the shed name took the first-login slot"
+
+    # A retry seconds later is let in (authenticated; the shed is the local
+    # admin's, so the session itself may be refused, but not the login).
+    deadline = time.monotonic() + 30
+    while True:
+        r, _ = _ssh_timed(w, olga, "lab")
+        if "Permission denied" not in r.stderr:
+            break
+        assert time.monotonic() < deadline, f"the retry is still refused: {r.stderr!r}"
+        time.sleep(1)
+    assert w.server.log().count(allowed) >= 1, f"no {allowed!r} line in the server's log"
 
 
 # ----------------------------------------------------------------------------

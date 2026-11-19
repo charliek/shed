@@ -434,9 +434,9 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   name, a name or key listed twice, no usable key (a key's identity is its blob; `expires`
   is an RFC 3339 instant only), a local admin's name or key, or an `auth.clients` name is
   skipped and logged. A person added on the service logs in with no restart (their first SSH
-  login pulls the list: at most once a minute while pulls succeed, once per 15 minutes while
-  they fail, the login waiting at most 8 s); a person removed loses their SSH connections at
-  the next pull. Certificates issued before certificates named a user are refused on such a
+  login, as `_bootstrap`, pulls the list: at most once a minute while pulls succeed, once per
+  15 minutes while they fail, the login waiting at most 8 s; see the unknown-key rule below);
+  a person removed loses their SSH connections at the next pull. Certificates issued before certificates named a user are refused on such a
   server. See the [User Directory
   guide](https://charliek.github.io/shed/guides/user-directory/).
 - **Server: `shed-server directory enroll [--name <name>]`** enrols the server with the
@@ -491,6 +491,35 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   failed, grace and per-address refusal lines, never at `SSH auth DENIED`, which a person
   whose agent offers several keys draws before one logs in. The values are fixed. See [Security › Facing
   the internet](https://charliek.github.io/shed/reference/security/#facing-the-internet).
+- **Directory server: what an unknown SSH key can start.** A key the server's list does not
+  hold makes it pull the list early only under two login names. As `_bootstrap` (`shed server
+  add`): at most once a minute (15 minutes while pulls fail, none inside a `Retry-After`), as
+  before; the login that takes that slot is let in as soon as its key is known (from its own
+  pull or any other), and if its key is still unknown it is now refused when its 8-second wait
+  ends, never earlier, so a refused `shed server add` whose login took the slot takes 8 seconds
+  to fail (one that did not is refused at once). As the name of a shed that exists on the
+  server: the login is refused at once, without waiting for the server's check of the name,
+  which runs off the login path; the server then pulls in the background on a slot of its own,
+  at most once every 5 minutes (15 while pulls fail), and a retry seconds later gets in. Under
+  any other name an unknown key starts nothing: a name no shed on the server has (such as
+  `root` or `ubuntu`, unless a shed has that name) or one that cannot be a shed name; before,
+  any valid shed name could pull once a minute. For a key that stays unknown, how long the
+  answer takes does not show whether a guessed name is a shed, except while pulls fail, while
+  a `Retry-After` is pending, or when that shed name's own pull fails (see the security
+  reference). If the account service
+  is slow, a new key's logins are refused until a pull has brought it, and a later attempt then
+  succeeds. New log lines: `directory: shed-name key <fp> for an existing shed: pulling the list
+  in the background ...`, and at most once an hour `directory: in the last hour <n> unknown keys
+  were offered as a name that is no shed here and <m> as an existing shed's name (...)`. A
+  server with GitHub logins (`auth.users`) keeps its rule. See [Security › A new
+  person](https://charliek.github.io/shed/reference/security/#a-new-person).
+- **The directory contract, version 1, text change** (no wire, fixture or key change): an
+  unknown key's login waits at most 8 seconds (it said 20); the two pull rates above, each a
+  bound across the whole client; and who is listed, and whether as an admin, may differ from
+  one requesting server to another, with a user whose access on a server depends on a
+  restriction that server has not declared left out. An account service built from the
+  contract copies `tests/directory-contract/v1/` again (its manifest line for `CONTRACT.md`
+  changed).
 - **Development:** `SHED_DEV_USERS=itest` starts the dev servers with the suite's user list;
   the suite gains `test_users.py`, `test_users_upgrade.py` and `test_source_pin.py`, with
   `SHED_ITEST_USERS` and `SHED_ITEST_USERS_DIR`.

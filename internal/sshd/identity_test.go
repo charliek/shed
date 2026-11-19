@@ -88,10 +88,20 @@ func newPeople(t *testing.T) people {
 
 func identityServer(t *testing.T, be backend.Backend, lookup users.Lookup) (*Server, string) {
 	t.Helper()
+	return identityServerWith(t, be, lookup, nil)
+}
+
+// identityServerWith is identityServer with configure, when set, run on the
+// server before it serves.
+func identityServerWith(t *testing.T, be backend.Backend, lookup users.Lookup, configure func(*Server)) (*Server, string) {
+	t.Helper()
 	s, err := NewServer(be, filepath.Join(t.TempDir(), "host_key"), "127.0.0.1:0", nil,
 		KeyAuth{Mode: config.SSHAuthEnforce, Users: lookup})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if configure != nil {
+		configure(s)
 	}
 	return s, serveForTest(t, s)
 }

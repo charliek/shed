@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gliderlabs/ssh"
@@ -76,6 +77,38 @@ type Server struct {
 	preLoggedSource map[string]time.Time
 	preLoggedOrder  []preauthLogged
 	preLoggedTotal  time.Time
+
+	// life is the server's lifetime: made by NewServer, ended by Shutdown.
+	// The off-path check of a shed name's unknown key (unknownshed.go) runs
+	// under it, never under a connection's context.
+	life       context.Context
+	lifeCancel context.CancelFunc
+	// checking is held from the start of a check until its backend call
+	// returns (at most one at a time). checkMu orders the start of a check
+	// against Shutdown, and guards checkDone, closed when the last check
+	// started has ended.
+	checking  atomic.Bool
+	checkMu   sync.Mutex
+	checkDone chan struct{}
+	// nudgeMu is held while a check, having found the shed, checks the
+	// lifetime and nudges the lookup, and by Shutdown while it ends the
+	// lifetime (endLife), so no nudge is asked once Shutdown has begun. It
+	// is taken before checkMu where both are held; the login path never
+	// takes it.
+	nudgeMu sync.Mutex
+	// shedCheckTimeout bounds one check (defaultShedCheckTimeout; tests
+	// change it before the server serves).
+	shedCheckTimeout time.Duration
+	// afterShedFound, when set (by tests only, before the server serves),
+	// runs in a check once the backend has found the shed, before the
+	// nudge's lifetime check.
+	afterShedFound func()
+	// statsMu guards stats, the counts of shed-name offers logged once per
+	// statsEvery (unknownShedStatsEvery) by a goroutine statsOnce starts.
+	statsMu    sync.Mutex
+	stats      unknownShedStats
+	statsOnce  sync.Once
+	statsEvery time.Duration
 }
 
 // KeyAuth is how the SSH server decides public-key auth: the auth.ssh mode,
@@ -225,7 +258,11 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 		maxUnauthenticatedPerSource: defaultMaxUnauthenticatedPerSource,
 		afterFunc:                   realAfterFunc,
 		now:                         time.Now,
+
+		shedCheckTimeout: defaultShedCheckTimeout,
+		statsEvery:       unknownShedStatsEvery,
 	}
+	s.life, s.lifeCancel = context.WithCancel(context.Background())
 
 	// Load or generate the host key.
 	hostKey, err := s.loadOrGenerateHostKey()
@@ -457,10 +494,18 @@ func (s *Server) Start() error {
 	return s.sshServer.Serve(listener)
 }
 
-// Shutdown gracefully shuts down the SSH server.
+// Shutdown gracefully shuts down the SSH server. It first ends the server's
+// lifetime, so the off-path check of a shed name's unknown key starts no more
+// and asks for no pull, then shuts the listener and the connections down, and
+// waits, until ctx ends, for a check still running.
 func (s *Server) Shutdown(ctx context.Context) error {
 	log.Printf("Shutting down SSH server...")
-	return s.sshServer.Shutdown(ctx)
+	s.endLife()
+	err := s.sshServer.Shutdown(ctx)
+	if cerr := s.stopShedCheck(ctx); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // defaultMaxAuthTries is the per-connection public-key attempt cap applied when
@@ -593,32 +638,66 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 
 // refetchUnknownKey asks the user lookup to look for a key it does not know
 // (on GitHub, or in a directory's list), and reports whether the key is known
-// afterwards. Only in enforce mode (warn lets the key in anyway; off looks
-// nothing up), only when the lookup can fetch (a users.UnknownKeyRefetcher),
-// and only when the login is `_bootstrap` (`shed server add`) or a valid shed
-// name. That check is on the name's syntax alone: nothing about sheds is
-// looked up for a peer that has not authenticated. The lookup then takes a
-// server-wide slot, checked before it does anything else; only the login that
-// takes it waits for the fetch, every other returns at once. With GitHub
-// logins (auth.users) the slot is one fetch a minute and the wait up to five
-// seconds, and the lookup refuses a key it dropped for a GitHub account
-// mismatch; with a directory's list (auth.directory) the slot is one pull a
-// minute while pulls succeed, one per retry interval while they fail, none
-// inside a pending Retry-After, and the wait one 8-second deadline
-// (directory.UnknownKeyWait). A key
-// the lookup knows (an expired one included) never gets here.
+// on this attempt. Only in enforce mode (warn lets the key in anyway; off
+// looks nothing up), and by the login name:
+//
+//   - `_bootstrap` (`shed server add`), on a lookup that can fetch (a
+//     users.UnknownKeyRefetcher): the lookup takes its server-wide slot,
+//     checked before it does anything else; only the login that takes it
+//     waits for the fetch, every other returns at once. With GitHub logins
+//     (auth.users) the slot is one fetch a minute and the wait up to five
+//     seconds, and the lookup refuses a key it dropped for a GitHub account
+//     mismatch. With a directory's list (auth.directory) the slot is one pull
+//     a minute while pulls succeed, one per retry interval while they fail,
+//     none inside a pending Retry-After. The login that takes it is let in as
+//     soon as its key is known (from any pull), and if its key is still
+//     unknown it is refused when its 8-second deadline ends
+//     (directory.UnknownKeyWait), never earlier, whenever its pull ended.
+//   - a valid shed name, on a lookup that can nudge (a
+//     users.UnknownKeyNudger: a directory's list): refused at once, whether
+//     a shed of that name exists or not, without waiting for anything about
+//     the name. Off the login path the server checks whether it exists, and
+//     only then nudges a pull on the lookup's shed-name slot (one every 5
+//     minutes while pulls succeed, one per retry interval while they fail,
+//     none inside a Retry-After); no login waits for it, and the person's
+//     next attempt finds the key known (nudgeIfShed).
+//   - a valid shed name on a lookup that can fetch and not nudge (GitHub
+//     logins): as `_bootstrap`, on the name's syntax alone.
+//   - any other name: nothing is asked, and the key is refused.
+//
+// What a peer whose key stays unknown can learn about which shed names
+// exist: nothing from the shed-name login's answer, which never waits for
+// the check. A shed-name pull can delay a later `_bootstrap` pull that queues
+// behind it, but a `_bootstrap` login whose key stays unknown is answered at
+// its fixed deadline, so that delay does not show. Except in three cases, in
+// which whether a shed-name pull was sent changes when the `_bootstrap` slot
+// may next be taken, so a peer probing then can tell, at most one guess per
+// `_bootstrap` slot take: while pulls fail; while a Retry-After is pending;
+// and when the shed-name pull itself fails while pulls had been succeeding
+// (the server then enters the failed state, and a `_bootstrap` login that
+// would have taken the slot and waited is refused at once). Apart from that,
+// a person whose key is listed is let in when a pull brings it, so a pull
+// already running ahead of theirs delays their own first login, which can
+// show that some pull was in flight; that is accepted.
+//
+// A key the lookup knows (an expired one included) never gets here.
 func (s *Server) refetchUnknownKey(ctx ssh.Context, user, fingerprint string) bool {
 	if !s.keyAuth.enforced() {
 		return false
 	}
-	if user != reservedBootstrapUser && config.ValidateShedName(user) != nil {
+	if user == reservedBootstrapUser {
+		r, ok := s.keyAuth.Users.(users.UnknownKeyRefetcher)
+		return ok && r.RefetchForUnknownKey(ctx, fingerprint)
+	}
+	if config.ValidateShedName(user) != nil {
+		return false
+	}
+	if n, ok := s.keyAuth.Users.(users.UnknownKeyNudger); ok {
+		s.nudgeIfShed(n, user, fingerprint)
 		return false
 	}
 	r, ok := s.keyAuth.Users.(users.UnknownKeyRefetcher)
-	if !ok {
-		return false
-	}
-	return r.RefetchForUnknownKey(ctx, fingerprint)
+	return ok && r.RefetchForUnknownKey(ctx, fingerprint)
 }
 
 // localForwardChannelData matches RFC4254 Section 7.2

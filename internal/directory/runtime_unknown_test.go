@@ -18,8 +18,9 @@ import (
 // The unknown-key path (RefetchForUnknownKey): a new person's first SSH login
 // pulls the list, at most once a minute while pulls succeed, at most once per
 // retry interval while they fail, never before a pending Retry-After, and
-// waits under one deadline. These tests run on the fake clock: none sleeps,
-// and the schedule is never started, so every pull is one the test caused.
+// waits under one deadline, at which a key still unknown is answered (never
+// earlier). These tests run on the fake clock: none sleeps, and the schedule
+// is never started, so every pull is one the test caused.
 
 // unknownRT is a runtime enrolled with svc, with ada listed and pulled once
 // (good), its schedule not started.
@@ -47,17 +48,33 @@ func (s *rtService) sent() int { return s.directoryCount() + s.tokenCount() }
 
 // unknownKey is RefetchForUnknownKey for fp, which must answer within ten
 // seconds of real time (a pull against the in-process service, or nothing).
-func (s *rtServer) unknownKey(t *testing.T, fp string) bool {
+// A key still unknown when the pull it asked for has ended is answered at its
+// deadline (UnknownKeyWait), never earlier: once that pull has ended, the
+// deadline is fired on svc's clock without moving it (fireWithin), so the
+// slots' rates the test checks are not moved by the wait.
+func (s *rtServer) unknownKey(t *testing.T, svc *rtService, fp string) bool {
 	t.Helper()
+	asked := s.rt.PullsAsked()
 	got := make(chan bool, 1)
 	go func() { got <- s.rt.RefetchForUnknownKey(context.Background(), fp) }()
-	select {
-	case ok := <-got:
-		return ok
-	case <-time.After(10 * time.Second):
-		t.Fatal("RefetchForUnknownKey did not answer")
+	deadline := time.After(10 * time.Second)
+	fired := false
+	for {
+		select {
+		case ok := <-got:
+			return ok
+		case <-deadline:
+			t.Fatal("RefetchForUnknownKey did not answer")
+			return false
+		case <-time.After(5 * time.Millisecond):
+		}
+		if !fired && s.rt.PullsAsked() != asked {
+			if r, p := s.flights(); r == nil && p == nil {
+				svc.clock.fireWithin(UnknownKeyWait)
+				fired = true
+			}
+		}
 	}
-	return false
 }
 
 // refusedAtOnce checks that RefetchForUnknownKey for fp returns false having
@@ -125,17 +142,31 @@ func (s *rtServer) idle(t *testing.T) {
 	})
 }
 
+// settled waits until no pull runs and none is queued, then drops the
+// arrivals svc has been told of, so a later wait on svc.arrived is for a
+// request sent after it. A first login whose key a pull brings is let in when
+// the list is published, before that pull has ended, so a test that goes on
+// to hold or queue a pull of its own settles first.
+func (s *rtServer) settled(t *testing.T, svc *rtService) {
+	t.Helper()
+	s.idle(t)
+	for len(svc.arrived) > 0 {
+		<-svc.arrived
+	}
+}
+
 // pulledFor checks that RefetchForUnknownKey for fp pulled once and reports
-// want.
+// want, and waits until the runtime has settled.
 func pulledFor(t *testing.T, svc *rtService, srv *rtServer, fp string, want bool, why string) {
 	t.Helper()
 	before := svc.sent()
-	if got := srv.unknownKey(t, fp); got != want {
+	if got := srv.unknownKey(t, svc, fp); got != want {
 		t.Fatalf("%s: RefetchForUnknownKey = %v, want %v", why, got, want)
 	}
 	if n := svc.sent() - before; n < 1 {
 		t.Fatalf("%s: no pull for the unknown key", why)
 	}
+	srv.settled(t, svc)
 }
 
 // TestUnknownKeyHealthyRate: while the last pull succeeded, an unknown key
@@ -159,7 +190,7 @@ func TestUnknownKeyHealthyRate(t *testing.T) {
 		t.Errorf("the unknown-key pull logged %d times, want 1:\n%s", n, srv.log)
 	}
 	refusedAtOnce(t, svc, srv, cy.fp, "a second unknown key at once")
-	clock.set(t0.Add(UnknownKeyEvery - time.Second))
+	clock.set(t0.Add(wantFirstLoginEvery - time.Second))
 	refusedAtOnce(t, svc, srv, cy.fp, "a second unknown key a second before the minute")
 
 	// An admin's refresh inside the minute and one at the minute: neither
@@ -168,7 +199,7 @@ func TestUnknownKeyHealthyRate(t *testing.T) {
 	if row := srv.refresh(t); row.Status != users.DirectoryRefreshGood || srv.owner(cy.fp) != "cy" {
 		t.Fatalf("an admin's refresh inside the minute: %+v", row)
 	}
-	clock.set(t0.Add(UnknownKeyEvery))
+	clock.set(t0.Add(wantFirstLoginEvery))
 	if row := srv.refresh(t); row.Status != users.DirectoryRefreshGood {
 		t.Fatalf("an admin's refresh at the minute: %+v", row)
 	}
@@ -180,7 +211,7 @@ func TestUnknownKeyHealthyRate(t *testing.T) {
 	}
 
 	// A key the list does not name: the pull happens, the answer is no.
-	clock.set(t0.Add(2 * UnknownKeyEvery))
+	clock.set(t0.Add(2 * wantFirstLoginEvery))
 	stranger := newPerson(t, "stranger", false)
 	pulledFor(t, svc, srv, stranger.fp, false, "a key nobody lists")
 	refusedAtOnce(t, svc, srv, "", "the empty fingerprint")
@@ -201,18 +232,18 @@ func TestUnknownKeyFailedRate(t *testing.T) {
 
 	t0 := clock.Now()
 	pulledFor(t, svc, srv, bob.fp, false, "the first unknown key in the failed state")
-	for _, at := range []time.Duration{0, UnknownKeyEvery, 5 * time.Minute, RetryInterval - time.Second} {
+	for _, at := range []time.Duration{0, wantFirstLoginEvery, 5 * time.Minute, wantFailingEvery - time.Second} {
 		clock.set(t0.Add(at))
 		refusedAtOnce(t, svc, srv, bob.fp, "inside the retry interval after "+at.String())
 	}
 	svc.dir.setOutage(false)
-	clock.set(t0.Add(RetryInterval))
+	clock.set(t0.Add(wantFailingEvery))
 	pulledFor(t, svc, srv, bob.fp, true, "at the retry interval, the service back")
 
 	// Good again: once a minute.
 	cy := newPerson(t, "cy", false)
 	svc.dir.setUsers(ada.served(), bob.served(), cy.served())
-	clock.set(t0.Add(RetryInterval + UnknownKeyEvery))
+	clock.set(t0.Add(wantFailingEvery + wantFirstLoginEvery))
 	pulledFor(t, svc, srv, cy.fp, true, "a minute later, the last pull good")
 }
 
@@ -270,14 +301,15 @@ func TestUnknownKeyRetryAfter(t *testing.T) {
 	pulledFor(t, svc, srv, eve.fp, true, "after a good refresh cleared the Retry-After")
 }
 
-// TestUnknownKeyWaitFitsTheClients: the first-login wait is positive and at
-// most 8 seconds. Shipped clients bound the whole first-login exchange at 10
-// seconds, connect and handshake included; a larger wait makes first logins
-// fail in those clients while the server is about to accept them. The wait
-// also ends before the pull it waits on, so the pull carries on past it.
+// TestUnknownKeyWaitFitsTheClients: the first-login wait is 8 seconds, the
+// number the contract and the docs state (a refused first login that took the
+// slot is answered then). Shipped clients bound the whole first-login exchange
+// at 10 seconds, connect and handshake included; a larger wait makes first
+// logins fail in those clients while the server is about to accept them. The
+// wait also ends before the pull it waits on, so the pull carries on past it.
 func TestUnknownKeyWaitFitsTheClients(t *testing.T) {
-	if UnknownKeyWait <= 0 || UnknownKeyWait > 8*time.Second {
-		t.Fatalf("UnknownKeyWait = %v, want above 0 and at most 8s (clients give up on a first login at 10s)", UnknownKeyWait)
+	if UnknownKeyWait != 8*time.Second {
+		t.Fatalf("UnknownKeyWait = %v, want 8s (the contract's and the docs' number; clients give up on a first login at 10s)", UnknownKeyWait)
 	}
 	if UnknownKeyWait >= PullTimeout {
 		t.Fatalf("UnknownKeyWait = %v, want below PullTimeout %v", UnknownKeyWait, PullTimeout)
@@ -301,7 +333,7 @@ func TestUnknownKeyDeadline(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the unknown key's pull did not reach the service")
 		}
-		clock.advance(UnknownKeyWait - time.Nanosecond)
+		clock.advance(wantWait - time.Nanosecond)
 		select {
 		case ok := <-got:
 			t.Fatalf("answered (%v) before the deadline", ok)
@@ -320,7 +352,7 @@ func TestUnknownKeyDeadline(t *testing.T) {
 		// its caller gives up is shown, without depending on timing, by "the
 		// pull outlives its waiter".)
 		svc.setMode(faultNone, "")
-		clock.advance(PullTimeout - UnknownKeyWait)
+		clock.advance(PullTimeout - wantWait)
 		eventually(t, "the pull ending at its own bound", func() bool { return srv.rt.Status().LastError != "" })
 	})
 
@@ -497,7 +529,7 @@ func TestUnknownKeyLocalAdminsNeverWait(t *testing.T) {
 		}
 	}
 	before, asked := svc.sent(), srv.rt.PullsAsked()
-	if srv.unknownKey(t, cy.fp) || svc.sent() != before || srv.rt.PullsAsked() != asked {
+	if srv.unknownKey(t, svc, cy.fp) || svc.sent() != before || srv.rt.PullsAsked() != asked {
 		t.Fatal("a second unknown key during the hung pull was not refused at once")
 	}
 	clock.advance(UnknownKeyWait)
@@ -679,6 +711,9 @@ func queuedUnknownKey(t *testing.T, svc *rtService, srv *rtServer, fp string, mo
 	case <-time.After(10 * time.Second):
 		t.Fatal("the running pull did not reach the service")
 	}
+	if r, p := srv.flights(); r != running || p != nil {
+		t.Fatal("the admin's pull is not the one running alone: the unknown key would join it, not queue a pull of its own")
+	}
 	asked := srv.rt.PullsAsked()
 	got := make(chan bool, 1)
 	go func() { got <- srv.rt.RefetchForUnknownKey(context.Background(), fp) }()
@@ -711,6 +746,10 @@ func queuedUnknownKey(t *testing.T, svc *rtService, srv *rtServer, fp string, mo
 	if running.row.Status != users.DirectoryRefreshFailed {
 		t.Fatalf("the running pull: %+v", running.row)
 	}
+	// Once the queued pull has ended too, a key it did not bring is answered
+	// at its deadline: fired here without moving the clock.
+	srv.idle(t)
+	svc.clock.fireWithin(UnknownKeyWait)
 	var ok bool
 	select {
 	case ok = <-got:

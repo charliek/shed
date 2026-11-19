@@ -15,7 +15,10 @@ import (
 )
 
 // serveForTest starts s on a loopback port and returns its address. The
-// listener closes with the test. It makes the start-up check Start makes.
+// listener closes with the test, and the server's lifetime ends with it, so
+// what runs under it (the hourly count of shed-name offers) stops. It makes
+// the start-up check Start makes. Configure s before calling it: once it
+// serves, its fields are read by the connections' goroutines.
 func serveForTest(t *testing.T, s *Server) string {
 	t.Helper()
 	if err := s.checkNoBanner(); err != nil {
@@ -26,7 +29,12 @@ func serveForTest(t *testing.T, s *Server) string {
 		t.Fatal(err)
 	}
 	go func() { _ = s.sshServer.Serve(ln) }()
-	t.Cleanup(func() { _ = s.sshServer.Close() })
+	t.Cleanup(func() {
+		if s.lifeCancel != nil {
+			s.lifeCancel()
+		}
+		_ = s.sshServer.Close()
+	})
 	return ln.Addr().String()
 }
 

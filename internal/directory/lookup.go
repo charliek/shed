@@ -143,6 +143,11 @@ type Lookup struct {
 	pubMu sync.Mutex
 	// hook is the publication hook, guarded by pubMu.
 	hook func(Publication)
+	// sigMu guards sig, closed by each publication once readers see the new
+	// state (and then replaced), so a waiter (published) learns of every
+	// publication made after it took the channel.
+	sigMu sync.Mutex
+	sig   chan struct{}
 	// latched is told, without blocking, each time a reader sets a
 	// snapshot's latch (trusted): the runtime's trust watch then removes the
 	// kept copy at once rather than at its next tick. It holds one signal; a
@@ -646,10 +651,35 @@ func (l *Lookup) publish(next *snapshot, pullSeq uint64) (prev *snapshot, ok boo
 	next.from = nil
 	next.gen = cur.gen + 1
 	l.snap.Store(next)
+	l.signalPublished()
 	if l.hook != nil {
 		l.hook(l.publication(next))
 	}
 	return cur, true
+}
+
+// published is a channel closed at the next publication: one made after this
+// call, readers already seeing its state when it is closed. A waiter takes it
+// before it reads the lookup, so a publication between that read and its wait
+// is not missed.
+func (l *Lookup) published() <-chan struct{} {
+	l.sigMu.Lock()
+	defer l.sigMu.Unlock()
+	if l.sig == nil {
+		l.sig = make(chan struct{})
+	}
+	return l.sig
+}
+
+// signalPublished closes the channel published handed out, if any: a
+// publication has been made.
+func (l *Lookup) signalPublished() {
+	l.sigMu.Lock()
+	defer l.sigMu.Unlock()
+	if l.sig != nil {
+		close(l.sig)
+		l.sig = nil
+	}
 }
 
 // publication is what the hook is told of s, just published.

@@ -39,9 +39,9 @@ func writeServeConfig(t *testing.T, auth string) {
 // TestServeBuildsTheLookupByConfig: serve's config load (loadConfig) takes a
 // config with auth.directory, and serve's lookup is then the directory's
 // (its local admin a user, no implicit user, every connection tracked by its
-// user, unbound certificates refused, an unknown key's login a pull). Without
-// the block it is the config
-// lookup, as before.
+// user, unbound certificates refused, an unknown key's first login a pull, an
+// unknown key offered as a shed's name a background nudge). Without the block
+// it is the config lookup, as before, which never nudges.
 func TestServeBuildsTheLookupByConfig(t *testing.T) {
 	adminLine, adminFP := wiringKey(t)
 	admins := "auth:\n  mode: mtls\n  users:\n    admin:\n      admin: true\n      keys:\n        - {key: \"" + adminLine + "\", label: laptop}\n"
@@ -64,6 +64,9 @@ func TestServeBuildsTheLookupByConfig(t *testing.T) {
 	}
 	if _, refetch := l.(users.UnknownKeyRefetcher); !refetch {
 		t.Error("the directory's lookup does not pull for an unknown key (a new person's first SSH login)")
+	}
+	if _, nudge := sshKeyAuth(rt).Users.(users.UnknownKeyNudger); !nudge {
+		t.Error("the SSH server's lookup on a directory server does not nudge for an unknown key offered as an existing shed's name")
 	}
 	if u, k, ok := l.UserForKey(adminFP); !ok || u.Name != "admin" || !u.Admin || k.Source != users.SourceAdHoc || k.Label != "laptop" {
 		t.Errorf("the local admin's key resolves to %+v %+v %v", u, k, ok)
@@ -89,6 +92,9 @@ func TestServeBuildsTheLookupByConfig(t *testing.T) {
 	}
 	if _, bound := l.(users.BoundCredentialsOnly); bound {
 		t.Error("the config lookup refuses unbound certificates")
+	}
+	if _, nudge := sshKeyAuth(l).Users.(users.UnknownKeyNudger); nudge {
+		t.Error("the config lookup nudges: a GitHub-login server's unknown-key rule changed")
 	}
 	if ka := sshKeyAuth(l); ka.TrackConnections || ka.Users != l {
 		t.Errorf("without auth.directory the SSH key auth tracks connections (%v)", ka.TrackConnections)

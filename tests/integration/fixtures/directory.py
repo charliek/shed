@@ -127,6 +127,9 @@ NEEDS_CSR = "upgrade shed (client certificate support)"  # internal/sshd/bootstr
 BOOTSTRAP_NOT_AUTHORIZED = "bootstrap: key not authorized"  # internal/sshd/bootstrap.go
 KEY_MOVED = "no longer belongs to the user this connection authenticated as"  # internal/sshd/identity.go
 UNKNOWN_KEY_PULL = "directory: unknown key "  # internal/directory/runtime.go
+# A shed name's background pull (NudgeForUnknownKey): its own prefix, which
+# UNKNOWN_KEY_PULL's count does not include.
+SHED_NAME_PULL = "directory: shed-name key "  # internal/directory/runtime.go
 TRUST_ENDED = "directory: TRUST ENDED"  # internal/directory/lookup.go
 STARTUP_KEPT_COPY = "Users: kept copy from "  # internal/directory/runtime.go StartupLines
 STARTUP_NO_COPY = "Users: no kept copy; only the local admins can log in until the first good pull"
