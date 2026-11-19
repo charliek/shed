@@ -335,6 +335,9 @@ pub struct ServerOpts {
     /// ClientHello and the server's CertificateRequest — the seam
     /// `tls::certificate_installed_mid_handshake_is_presented_on_tls12` needs.
     pub handshake_delay: Duration,
+    /// Answer every authorized request `302 Found` with this `Location` instead of
+    /// its body (the client must not follow it).
+    pub redirect_to: Option<String>,
 }
 
 impl Default for ServerOpts {
@@ -345,6 +348,7 @@ impl Default for ServerOpts {
             auth_mode: None,
             allow_unauthenticated: false,
             handshake_delay: Duration::ZERO,
+            redirect_to: None,
         }
     }
 }
@@ -452,6 +456,7 @@ pub async fn spawn_server(ca: &TestCa, opts: ServerOpts) -> TlsServer {
 async fn spawn_with_config(config: ServerConfig, pin: String, opts: ServerOpts) -> TlsServer {
     let close_after_each = opts.close_after_each;
     let auth_mode = opts.auth_mode.clone();
+    let redirect_to = opts.redirect_to.clone();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -474,6 +479,7 @@ async fn spawn_with_config(config: ServerConfig, pin: String, opts: ServerOpts) 
                 let handshakes = handshakes.clone();
                 let seen_cns = seen_cns.clone();
                 let mode = mode.clone();
+                let redirect_to = redirect_to.clone();
                 let handshake_delay = opts.handshake_delay;
                 tokio::spawn(async move {
                     if !handshake_delay.is_zero() {
@@ -536,7 +542,14 @@ async fn spawn_with_config(config: ServerConfig, pin: String, opts: ServerOpts) 
                             (None, Some(sse)) => sse.to_string(),
                             (None, None) => "{\"ok\":true}".to_string(),
                         };
-                        let code = status.unwrap_or(200);
+                        let redirect = status.is_none().then_some(redirect_to.as_ref()).flatten();
+                        let code = match redirect {
+                            Some(_) => 302,
+                            None => status.unwrap_or(200),
+                        };
+                        let location = redirect
+                            .map(|to| format!("Location: {to}\r\n"))
+                            .unwrap_or_default();
                         // An SSE response is terminated by closing, like the real
                         // server's stream teardown.
                         let close = close_after_each || sse;
@@ -547,7 +560,7 @@ async fn spawn_with_config(config: ServerConfig, pin: String, opts: ServerOpts) 
                             "application/json"
                         };
                         let resp = format!(
-                            "HTTP/1.1 {code} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: {conn}\r\n\r\n{body}",
+                            "HTTP/1.1 {code} X\r\n{location}Content-Type: {ctype}\r\nContent-Length: {}\r\nConnection: {conn}\r\n\r\n{body}",
                             body.len()
                         );
                         if tls.write_all(resp.as_bytes()).await.is_err() {

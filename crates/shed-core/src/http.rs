@@ -5,7 +5,7 @@
 //! `models` layer.
 //!
 //! The client contract: an 8s GET timeout, an explicit
-//! User-Agent, an https-only redirect policy, leaf-cert pinning (fail-closed on
+//! User-Agent, no redirect followed (a 3xx is the answer), leaf-cert pinning (fail-closed on
 //! a non-https URL), a credential with an auth-failure → invalidate + retry-once
 //! (provider-backed only; the retry is skipped when the re-mint returns the same
 //! rejected credential — plan 001 §3.4), and a typed `ShedError`. Lifecycle +
@@ -621,7 +621,10 @@ impl Client {
     ///     failure is the held-user refusal (the server issued a certificate for
     ///     another user, or one that names no user): that server issues
     ///     certificates, so nothing it would accept is held, and the request is
-    ///     not sent at all ([`Resolution::held_user_refused`]).
+    ///     not sent at all ([`Resolution::held_user_refused`]). After such a
+    ///     refusal a held certificate past its expiry counts as nothing held
+    ///     ([`crate::token::ControlTokenProvider::surviving_credential_after`],
+    ///     plan 037 A25).
     ///
     /// That last case used to `.ok()`-discard the error, which is why an mtls
     /// server answered by a host-agent too old to mint a certificate reported a
@@ -646,7 +649,12 @@ impl Client {
         match &self.token_provider {
             Some(p) => match p.credential_checked().await {
                 Ok(cred) => Resolution::presenting(cred),
-                Err(failure) => match p.surviving_credential().await {
+                // A certificate past its expiry is no survivor after a held-user
+                // refusal (plan 037 A25): the request is then not sent.
+                Err(failure) => match p
+                    .surviving_credential_after(failure.held_user_refused)
+                    .await
+                {
                     Some(surviving) => Resolution {
                         cred: Some(surviving),
                         mint_error: Some(failure.error),
@@ -1355,14 +1363,11 @@ fn build_http_client(
 ) -> Result<reqwest::Client, ShedError> {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        // Fail closed on a plaintext redirect.
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.url().scheme() == "https" {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }));
+        // No request to a server's API follows a redirect (plan 037 A25, as the CLI's
+        // `servertls.RefuseRedirects`): a 3xx is the answer, surfaced as the status it is.
+        // Following one would hand the request, and with a pin the client certificate,
+        // to whichever host the server named.
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(pin) = pin {
         builder = builder.use_preconfigured_tls(crate::tls::pinned_client_config_with_client_auth(
             pin, resolver,
@@ -2690,10 +2695,11 @@ mod tests {
 
     #[tokio::test]
     async fn redirect_to_non_https_is_not_followed() {
-        // The https-only redirect policy must NOT follow a redirect to a
-        // non-https URL (a plaintext downgrade) — it stops, surfacing the 3xx
-        // rather than dialing the target. Exercised on Linux since the GTK
-        // e2e's plain-HTTP mock never trips the pin/redirect paths.
+        // No redirect is followed, a plaintext downgrade least of all: the
+        // client stops, surfacing the 3xx rather than dialing the target.
+        // Exercised on Linux since the GTK e2e's plain-HTTP mock never trips
+        // the pin/redirect paths. (An https target: `mtls_tests::
+        // a_redirect_is_the_answer_and_is_never_followed`.)
         let server = MockServer::start_async().await;
         server
             .mock_async(|w, t| {
@@ -3312,6 +3318,53 @@ mod mtls_tests {
         fn on_mode_changed(&self, _server: &str, mode: AuthMode) {
             self.0.lock().unwrap().push(mode);
         }
+    }
+
+    /// No request follows a redirect (plan 037 A25, as the CLI's `RefuseRedirects`): a
+    /// pinned server's 302, even to an https URL, is the answer, surfaced as the status
+    /// it is, and the listener it points at sees no connection at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_redirect_is_the_answer_and_is_never_followed() {
+        let ca = TestCa::new("shed-ca");
+        let elsewhere = spawn_server(
+            &ca,
+            ServerOpts {
+                allow_unauthenticated: true,
+                ..ServerOpts::default()
+            },
+        )
+        .await;
+        let srv = spawn_server(
+            &ca,
+            ServerOpts {
+                allow_unauthenticated: true,
+                redirect_to: Some(format!("{}/api/info", elsewhere.base_url())),
+                ..ServerOpts::default()
+            },
+        )
+        .await;
+        let c = Client::new(
+            srv.base_url(),
+            "s".into(),
+            String::new(),
+            Some(srv.pin.clone()),
+            None,
+        )
+        .unwrap();
+        match c.info().await {
+            Err(ShedError::BadStatus(302)) => {}
+            other => panic!("want the 302 as the answer, got {other:?}"),
+        }
+        assert_eq!(
+            srv.accept_count(),
+            1,
+            "the request reached the pinned server"
+        );
+        assert_eq!(
+            elsewhere.accept_count(),
+            0,
+            "the listener the redirect named saw no connection"
+        );
     }
 
     fn client_for(srv: &TlsServer, provider: Arc<ControlTokenProvider>) -> Client {
@@ -4084,5 +4137,50 @@ mod mtls_tests {
         }
         assert_eq!(minter.calls(), 2, "no enrolment inside the wait");
         assert_eq!(srv.accept_count(), accepted, "and no connection");
+    }
+
+    /// An expired held certificate is no survivor of a held-user refusal (plan 037 A25):
+    /// pat's certificate is held, the server issues admin's, and inside the refusal's
+    /// wait pat's certificate is still sent one second before its expiry, and past its
+    /// expiry nothing is sent at all: the error is the refusal alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_held_certificate_is_not_presented_after_a_held_user_refusal() {
+        // UserCaMinter's certificates expire at this unix second.
+        const EXPIRY: u64 = 4_102_444_800;
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        // close_after_each: every request handshakes, so what it presents is seen.
+        let srv = spawn_mtls_server(&ca, TlsVersion::Any, true).await;
+        let minter = UserCaMinter::new(ca.clone(), "pat");
+        const START: u64 = EXPIRY - 10 * 24 * 3600;
+        let clock = crate::token::TestClock::at_wall_ms(START * 1000);
+        let provider = Arc::new(
+            clock.on(ControlTokenProvider::new("s".into(), minter.clone())
+                .with_held_user(Some("pat".into()))),
+        );
+        let c = client_for(&srv, provider.clone());
+        get(&c).await.unwrap(); // pat's client-1
+        assert_eq!(srv.client_cns(), vec!["SHA256:client-1".to_string()]);
+
+        // The server now issues admin's. One second before pat's certificate expires
+        // (inside its refresh window, so the request asks for a new one): refused, and
+        // the request is still sent with pat's certificate.
+        minter.set_user("admin");
+        clock.set_wall_forward(std::time::Duration::from_secs(EXPIRY - 1 - START));
+        assert_eq!(get(&c).await.unwrap(), b"{\"ok\":true}");
+        assert_eq!(minter.calls(), 2, "refused once: the wait starts");
+        assert_eq!(
+            srv.client_cns(),
+            vec!["SHA256:client-1".to_string(), "SHA256:client-1".to_string()],
+            "sent with pat's certificate"
+        );
+
+        // Past its expiry, inside the same wait: nothing is sent.
+        clock.set_wall_forward(std::time::Duration::from_secs(2));
+        let accepted = srv.accept_count();
+        for _ in 0..3 {
+            assert_the_refusal_alone(get(&c).await);
+        }
+        assert_eq!(minter.calls(), 2, "no enrolment inside the wait");
+        assert_eq!(srv.accept_count(), accepted, "no connection was made");
     }
 }

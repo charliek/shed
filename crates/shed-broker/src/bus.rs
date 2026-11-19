@@ -435,8 +435,10 @@ pub trait TokenProvider: Send + Sync {
     fn surviving_token(&self) -> Option<String> {
         None
     }
-    /// Whether a certificate identity is armed on the transport — used only to
-    /// pick the right log line when `token()` fails. Default `false`.
+    /// Whether a certificate identity is armed on the transport (while a held-user
+    /// refusal stands, only one still valid: plan 037 A25) — used to pick the right log
+    /// line when `token()` fails, and, when `false` after a held-user refusal, to send
+    /// nothing (plan 037 A23). Default `false`.
     fn presenting_certificate(&self) -> bool {
         false
     }
@@ -903,6 +905,11 @@ pub struct BusClient {
     /// is the only path that 401-retries. `None` in open mode.
     token_provider: Option<Arc<dyn TokenProvider>>,
     log: Arc<dyn BusLog>,
+    /// The held-user refusal last logged at WARN by [`Self::bearer_for_request`]: a
+    /// refusal is logged at WARN once per episode (when first seen, or when its text
+    /// changes) and at DEBUG after that, until a credential is served again (plan 037
+    /// A25). Shared by every clone, so a server's subscriptions and answers log it once.
+    refusal_warned: Arc<Mutex<Option<String>>>,
     initial_backoff: Duration,
     max_backoff: Duration,
     /// This machine's identity, sent on every subscribe and respond; `None` sends no
@@ -968,6 +975,7 @@ impl BusClient {
             static_token,
             token_provider,
             log,
+            refusal_warned: Arc::new(Mutex::new(None)),
             initial_backoff: INITIAL_BACKOFF,
             max_backoff: MAX_BACKOFF,
             machine: None,
@@ -1988,26 +1996,40 @@ impl BusClient {
     async fn bearer_for_request(&self) -> Result<(Option<String>, Option<String>), String> {
         if let Some(p) = &self.token_provider {
             match p.token_for_request().await {
-                Ok(t) => Ok(((!t.is_empty()).then_some(t), None)),
+                Ok(t) => {
+                    // A credential is served again: the next refusal is a new episode.
+                    *self.refusal_warned.lock().unwrap() = None;
+                    Ok(((!t.is_empty()).then_some(t), None))
+                }
                 // A failed re-mint does not strip the wire of a credential the
                 // server might still accept: present the surviving token (or,
                 // in mtls state, the still-armed certificate) and log WHY the
                 // replacement could not be minted (Go setAuth parity).
                 Err((e, refusal)) => {
+                    let held_user = refusal.as_ref().filter(|r| r.held_user);
                     let bearer = if let Some(t) = p.surviving_token() {
-                        self.log.warn(&format!(
-                            "credential refresh failed; presenting the existing token: {e}"
-                        ));
+                        self.log_fetch_failure(
+                            held_user,
+                            &format!(
+                                "credential refresh failed; presenting the existing token: {e}"
+                            ),
+                        );
                         Some(t)
                     } else if p.presenting_certificate() {
-                        self.log.warn(&format!(
-                            "credential refresh failed; presenting the existing certificate: {e}"
-                        ));
+                        self.log_fetch_failure(
+                            held_user,
+                            &format!(
+                                "credential refresh failed; presenting the existing certificate: {e}"
+                            ),
+                        );
                         None
-                    } else if let Some(refusal) = refusal.as_ref().filter(|r| r.held_user) {
-                        self.log.warn(&format!(
-                            "credential refused for its user and none is held; not sending: {e}"
-                        ));
+                    } else if let Some(refusal) = held_user {
+                        self.log_fetch_failure(
+                            held_user,
+                            &format!(
+                                "credential refused for its user and none is held; not sending: {e}"
+                            ),
+                        );
                         return Err(refusal.message.clone());
                     } else {
                         self.log.warn(&format!(
@@ -2022,6 +2044,31 @@ impl BusClient {
             Ok((Some(self.static_token.clone()), None))
         } else {
             Ok((None, None))
+        }
+    }
+
+    /// Log why a request's credential fetch failed. Any failure but a held-user refusal
+    /// is logged at WARN every time, as before. A held-user refusal is answered to every
+    /// request while it lasts (the source mints again only after its wait), so it is
+    /// logged at WARN once per episode, when it is first seen or its text changes, and at
+    /// DEBUG after that, until a credential is served again (plan 037 A25).
+    fn log_fetch_failure(&self, held_user: Option<&MintRefusal>, line: &str) {
+        let Some(refusal) = held_user else {
+            self.log.warn(line);
+            return;
+        };
+        let first = {
+            let mut warned = self.refusal_warned.lock().unwrap();
+            let first = warned.as_deref() != Some(refusal.message.as_str());
+            if first {
+                *warned = Some(refusal.message.clone());
+            }
+            first
+        };
+        if first {
+            self.log.warn(line);
+        } else {
+            self.log.debug(line);
         }
     }
 
@@ -2321,6 +2368,21 @@ fn redirect_allowed(configured: Option<&reqwest::Url>, next: &reqwest::Url, hops
         && configured.is_some_and(|c| c.origin() == next.origin())
 }
 
+/// The redirect policy of every client the broker builds for a server (the bus's, and the
+/// egress stream's, plan 037 A25): follow a redirect only as [`redirect_allowed`] says,
+/// within `server_url`'s own HTTPS origin; stop at any other, which is then the answer. An
+/// unparseable URL follows no redirect at all.
+pub(crate) fn same_origin_redirects(server_url: &str) -> reqwest::redirect::Policy {
+    let configured = reqwest::Url::parse(server_url).ok();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if redirect_allowed(configured.as_ref(), attempt.url(), attempt.previous().len()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 /// Build the reqwest client. Redirects stay inside the configured server's HTTPS
 /// origin ([`redirect_allowed`]; fail-closed on a plaintext redirect, as shed-core's
 /// `build_http_client`); with a `pin` it installs the
@@ -2343,16 +2405,7 @@ fn build_http_client(
     pin: Option<&str>,
     client_certs: Option<Arc<ClientCertResolver>>,
 ) -> Result<reqwest::Client, BusError> {
-    // An unparseable URL follows no redirect at all.
-    let configured = reqwest::Url::parse(server_url).ok();
-    let mut builder =
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if redirect_allowed(configured.as_ref(), attempt.url(), attempt.previous().len()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }));
+    let mut builder = reqwest::Client::builder().redirect(same_origin_redirects(server_url));
     if let Some(pin) = pin {
         let cfg = match client_certs {
             Some(resolver) => pinned_client_config_with_client_auth(pin, resolver),
@@ -4382,7 +4435,7 @@ fn handle_docker_status(
 pub const BUS_NAMESPACES: [&str; 3] = [NS_SSH_AGENT, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS];
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use httpmock::prelude::*;
     use std::sync::atomic::AtomicUsize;
@@ -5567,6 +5620,190 @@ mod tests {
             );
             task.abort();
         }
+    }
+
+    /// The answers path against the real credential source (plan 037 A25): while pat's
+    /// held certificate is stale and the server issues `admin`'s, every answer still goes
+    /// out (pat's certificate presented) but the source mints only once per refusal wait,
+    /// and the refusal is logged at WARN once per episode (first seen, or its text changed)
+    /// and at DEBUG after that, until a credential is served again.
+    #[tokio::test]
+    async fn answers_during_a_refusal_wait_mint_once_and_warn_once() {
+        use crate::minter::tests::{minted_cert_for, FakeMinter, MonoClock, TestCa, TestUser};
+        let ca = TestCa::new();
+        let stale = || Some(crate::status::now_unix() + 60);
+        let day = Some(crate::status::now_unix() + 86_400);
+        let fm = FakeMinter::new(vec![
+            Ok(minted_cert_for(&ca, 0x0a, stale(), &TestUser::Named("pat"))),
+            Ok(minted_cert_for(&ca, 0x0b, day, &TestUser::Named("admin"))),
+            Ok(minted_cert_for(&ca, 0x0c, day, &TestUser::Named("admin"))),
+            Ok(minted_cert_for(&ca, 0x0d, day, &TestUser::Unbound)),
+            Ok(minted_cert_for(&ca, 0x0e, day, &TestUser::Named("admin"))),
+            Ok(minted_cert_for(&ca, 0x0f, stale(), &TestUser::Named("pat"))),
+            Ok(minted_cert_for(&ca, 0x10, day, &TestUser::Named("admin"))),
+        ]);
+        let clock = MonoClock::new();
+        let source = clock.on(crate::minter::new_credential_source_with_store(
+            fm.clone(),
+            ServerTarget {
+                name: "s".into(),
+                url: String::new(),
+                token: String::new(),
+                tls_fingerprint: String::new(),
+                ssh_host: String::new(),
+                ssh_port: 0,
+                auth_mode: String::new(),
+                user: "pat".into(),
+                identity_file: String::new(),
+            },
+            crate::minter::SCOPE_CREDENTIALS,
+            None,
+        ));
+        source.token().await.unwrap(); // pat's, already stale
+        let srv = ScriptedServer::spawn(vec![], Answer(204, vec![], String::new())).await;
+        let log = Arc::new(CountingLog::default());
+        let client = BusClient::new(
+            srv.url(),
+            String::new(),
+            Some(Arc::new(source.clone())),
+            None,
+            None,
+            log.clone(),
+        )
+        .unwrap();
+        let mints = || fm.calls.load(Ordering::SeqCst);
+        let answer = || async {
+            let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+            client
+                .respond("ns", &env, &never_shutdown())
+                .await
+                .expect("the answer goes out with pat's certificate");
+        };
+        let presenting = || {
+            log.lines()
+                .into_iter()
+                .filter(|l| l.contains("presenting the existing certificate"))
+                .map(|l| l.split(' ').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        const N: usize = 5;
+        for _ in 0..N {
+            answer().await;
+        }
+        assert_eq!(srv.seen().len(), N, "every answer was sent");
+        assert_eq!(mints(), 2, "one mint for {N} answers inside the first wait");
+        let mut want = vec!["WARN".to_string()];
+        want.extend(std::iter::repeat_n("DEBUG".to_string(), N - 1));
+        assert_eq!(presenting(), want, "WARN once, then DEBUG");
+
+        // The wait passes; the same refusal again: still DEBUG.
+        clock.advance(Duration::from_secs(1));
+        answer().await;
+        assert_eq!(mints(), 3);
+        want.push("DEBUG".into());
+        assert_eq!(presenting(), want, "the same refusal: DEBUG");
+
+        // Its text changes (a certificate that names no user), and back: WARN each time.
+        clock.advance(Duration::from_secs(2));
+        answer().await;
+        assert_eq!(mints(), 4);
+        want.push("WARN".into());
+        assert_eq!(presenting(), want, "a changed refusal: WARN");
+        clock.advance(Duration::from_secs(4));
+        answer().await;
+        assert_eq!(mints(), 5);
+        want.push("WARN".into());
+        assert_eq!(presenting(), want, "changed back: WARN");
+
+        // pat's certificate is adopted, then the same refusal again: a new episode, WARN.
+        clock.advance(Duration::from_secs(8));
+        answer().await;
+        assert_eq!(mints(), 6, "pat's adopted");
+        answer().await;
+        assert_eq!(mints(), 7, "the wait was reset by the adoption");
+        want.push("WARN".into());
+        assert_eq!(presenting(), want, "a new episode: WARN");
+        assert_eq!(srv.seen().len(), N + 5);
+    }
+
+    /// An expired held certificate is not something to present (plan 037 A25), against
+    /// the real credential source: pat's certificate is held, the server issues admin's,
+    /// and inside the refusal's wait the subscription and a response POST are still sent
+    /// with pat's certificate one second before it expires; once it has expired neither
+    /// connects, and each error is the refusal alone.
+    #[tokio::test]
+    async fn an_expired_held_certificate_sends_nothing_during_a_refusal() {
+        use crate::minter::tests::{pat_then_admin, MISMATCH};
+        const EXPIRY: i64 = 4_102_444_800;
+        let (fm, source, _mono, wall) = pat_then_admin(crate::minter::SCOPE_CREDENTIALS, EXPIRY);
+        source.token().await.unwrap(); // pat's
+        let armed = source.cert_resolver().current().unwrap();
+        let (url, accepts, task) = counting_listener().await;
+        let client = client_with(&url, Some(Arc::new(source.clone())));
+        async fn connected(accepts: &AtomicUsize, at_least: usize) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while accepts.load(Ordering::SeqCst) < at_least {
+                assert!(tokio::time::Instant::now() < deadline, "never connected");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        // One second before pat's certificate expires: refused (the wait starts), and
+        // both are sent with pat's certificate.
+        wall.set(EXPIRY - 1);
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        connected(&accepts, 1).await;
+        let _ = tx.send(true);
+        drop(sub);
+        assert_eq!(fm.calls.load(Ordering::SeqCst), 2, "refused once");
+        assert!(source.holds_certificate());
+        assert!(Arc::ptr_eq(
+            &armed,
+            &source.cert_resolver().current().unwrap()
+        ));
+        let before = accepts.load(Ordering::SeqCst);
+        let env = Envelope::new_response("r", "ssh-agent", serde_json::Value::Null);
+        // The listener answers nothing: the POST times out, having connected.
+        assert!(client
+            .respond("ssh-agent", &env, &never_shutdown())
+            .await
+            .is_err());
+        connected(&accepts, before + 1).await;
+
+        // Past its expiry, inside the same wait: nothing connects.
+        wall.set(EXPIRY + 1);
+        tokio::time::sleep(Duration::from_millis(50)).await; // let stray connects land
+        let before = accepts.load(Ordering::SeqCst);
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while sub.status().last_error.is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "no status error");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // several retries
+        assert_eq!(sub.status().last_error, MISMATCH, "the refusal alone");
+        let _ = tx.send(true);
+        drop(sub);
+        match client.respond("ssh-agent", &env, &never_shutdown()).await {
+            Err(BusError::Config(m)) => assert_eq!(m, MISMATCH, "the refusal alone"),
+            other => panic!("want the refusal, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            before,
+            "no connection was made"
+        );
+        assert_eq!(
+            fm.calls.load(Ordering::SeqCst),
+            2,
+            "no mint inside the wait"
+        );
+        assert!(!source.holds_certificate());
+        task.abort();
     }
 
     #[tokio::test]
@@ -9408,16 +9645,16 @@ mod tests {
     /// leaf, an OPTIONAL client certificate (so a client that has one presents it), and
     /// per request a record of its path, headers and whether a client certificate came
     /// with it. `accepts` counts TCP connections, so zero proves nothing at all arrived.
-    struct TlsRecorder {
-        port: u16,
-        accepts: Arc<AtomicUsize>,
-        seen: TlsSeen,
+    pub(crate) struct TlsRecorder {
+        pub(crate) port: u16,
+        pub(crate) accepts: Arc<AtomicUsize>,
+        pub(crate) seen: TlsSeen,
     }
 
     /// Per request: its path, its headers, and whether a client certificate came with it.
-    type TlsSeen = Arc<Mutex<Vec<(String, Vec<(String, String)>, bool)>>>;
+    pub(crate) type TlsSeen = Arc<Mutex<Vec<(String, Vec<(String, String)>, bool)>>>;
     /// `answer(path, own_port)`: the raw HTTP response for a request.
-    type TlsAnswer = Arc<dyn Fn(&str, u16) -> String + Send + Sync>;
+    pub(crate) type TlsAnswer = Arc<dyn Fn(&str, u16) -> String + Send + Sync>;
 
     #[derive(Debug)]
     struct AnyClientCert(rustls::crypto::WebPkiSupportedAlgorithms);
@@ -9462,7 +9699,7 @@ mod tests {
     }
 
     /// The test server's leaf (DER) and key; the pin a client uses for it.
-    fn test_leaf() -> (Vec<u8>, Vec<u8>, String) {
+    pub(crate) fn test_leaf() -> (Vec<u8>, Vec<u8>, String) {
         let key = rcgen::KeyPair::generate().unwrap();
         let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
         let cert = params.self_signed(&key).unwrap();
@@ -9473,7 +9710,7 @@ mod tests {
 
     impl TlsRecorder {
         /// `answer(path, own_port)` is the raw HTTP response for a request.
-        fn spawn(leaf: &(Vec<u8>, Vec<u8>, String), answer: TlsAnswer) -> TlsRecorder {
+        pub(crate) fn spawn(leaf: &(Vec<u8>, Vec<u8>, String), answer: TlsAnswer) -> TlsRecorder {
             use std::io::{Read, Write};
             let provider = Arc::new(rustls::crypto::ring::default_provider());
             let algs = provider.signature_verification_algorithms;

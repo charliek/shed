@@ -117,15 +117,25 @@ CLI writes `user` when it enrols the entry; the app only reads it.
 
   While the server keeps issuing the other user's certificate, the app asks it for one again
   only after a wait: 1 second after the first refusal, then 2, 4, 8 and 16 seconds, then
-  every 30 seconds. While the app still holds an earlier certificate for the entry's user
-  that has not expired, it keeps using it. When it holds no usable certificate for that user,
-  a request is refused: it fails at once with the same message and is not sent. When the
-  server issues a certificate for the entry's user again (for example, the user's key is back
-  in its list), the app uses it within 30 seconds, with no restart.
+  every 30 seconds. The app's control requests and the credential broker each keep their own
+  wait on this schedule; the broker's holds for every credential request it answers and every
+  subscription it makes, however many arrive meanwhile. While the app still holds an earlier
+  certificate for the entry's user that has not expired, it keeps using it. When it holds no
+  usable certificate for that user (none, or only one that has since expired), a request is
+  refused: it fails at once with the same message and is not sent. The entry stays held to
+  its user all the same. When the server issues a certificate for the entry's user again
+  (for example, the user's key is back in its list), each uses it at its first attempt once its
+  wait has passed, with no restart: the broker at its next credential request or subscription,
+  the control path when the dashboard next polls (every 5 seconds while the window is shown),
+  so the gap seen in the dashboard is about 35 seconds at most.
 
   The wait starts again from 1 second when a certificate for the entry's user is used, or
-  when the app restarts; a change to `config.yaml` does not reset it. After fixing the entry,
-  restart the app; without a restart, the next attempt comes within the wait.
+  when the app restarts. A change to `config.yaml` resets only the credential broker's wait,
+  and only for a server whose entry changed in a field the broker reads (such as its host,
+  ports, URL, TLS pin, `user` or `identity_file`): the broker then starts that server's credential
+  sources afresh. The app's control requests keep their wait, and their clients, until the
+  app restarts. After fixing the entry, restart the app; without a restart, the control
+  path's next attempt comes within its wait.
 
 - **A certificate that names no user is refused.** Only a shed-server older than 0.10.0 issues
   one:
@@ -189,12 +199,13 @@ broker read it with the CLI's value rule:
   quoted value, on one line). An entry with any other line (an explicit `? key`, the fields as a
   `{…}` mapping, a tag or an anchor such as `!!str …` or `&a …`, a merge key `<<`, a `|` or `>`
   block, a value over more than one line, a repeated key, a list) is still listed, and every use
-  of it is refused: `entry "buildbox" cannot be used: shed reads a server entry only when each
-  line in it is a plain key: value …; write its fields one per line, as key: value`. Nothing is
-  sent to its server. So is an entry whose `host` is null (`host: null`, `host: ~` or a bare
-  `host:`); an entry with no `host` at all still uses its name as the host. The broker refuses
-  an entry with a merge key or a key written with a tag the same way, and an `identity_file` or
-  `user` written with a tag, an anchor or over more than one line.
+  of it by the app is refused: `entry "buildbox" cannot be used: shed reads a server entry only
+  when each line in it is a plain key: value …; write its fields one per line, as key: value`.
+  The app's own requests (the dashboard and its control requests) send nothing to its server.
+  So is an entry whose `host` is null (`host: null`, `host: ~` or a bare `host:`); an entry
+  with no `host` at all still uses its name as the host. The credential broker reads entries
+  with another reader, and still serves some of these: see the limits under
+  [How the app reads the file](#how-the-app-reads-the-file).
 
 What the app and broker do not do: they do not check that a certificate was made for the
 entry's key (the CLI does). If `ssh` authenticates with another key that your own ssh config
@@ -234,7 +245,8 @@ never to misread what the CLI wrote, not to defend against a hostile file.)
   (`!!str servers:`, `servers: &s`), or whose first line under it is indented with a tab; and
   one whose first `---` has content on its line. The
   broker refuses the same line breaks, as an error reading the file.
-- **An entry the app does not read** (listed, and refused at every use, as above): any line in
+- **An entry the app does not read** (listed, and refused at every use the app makes of it, as
+  above): any line in
   it that is not a plain `key: value`, a line in it indented with a tab, or a null `host`.
 
 Limits, each refused rather than misread:
@@ -248,6 +260,23 @@ Limits, each refused rather than misread:
   `identity_file`.
 - An entry whose `host` is an empty string (`host: ""`) is read as an entry with an empty
   host, as before.
+- **The refusals above are the app's own.** An entry the app refuses sends nothing from the
+  app itself: not the dashboard's requests, not its control requests. The credential broker
+  (embedded, or the `shed-host-agent` daemon) reads the same file with a full YAML parser and
+  is not held to the line rule. An entry in a shape that parser reads as the CLI does (the
+  fields as a `{…}` mapping, an explicit `? key`, an anchored key, a block in a field other
+  than `user` and `identity_file`) is served like any other: the broker enrols with the entry's
+  key and sends that server its credential requests, though the app refuses the entry. It
+  never reads an entry as "no key" or "no user": an entry with a merge key `<<` or a key
+  written with a tag, and an `identity_file` or `user` written with a tag, an anchor or over
+  more than one line, are refused (no `ssh` runs with such an `identity_file`, and for such a
+  `user` no certificate that names a user is used: only one for the implicit user of a server
+  with no user list, as for any entry). Until the broker holds a certificate it may present
+  for the entry, its requests to that server carry none: a server that authenticates with
+  certificates refuses them, or, after a refusal for the entry's user, they are not sent. A
+  file with a repeated key, an alias, or a line indented with a tab is an error for the
+  broker: it logs it and keeps the servers it read before. An entry with a null `host` is one
+  the broker skips.
 
 When **Add machine** writes a host or a user, it writes the value bare only when it is a plain
 token (letters, digits and `. _ - / @ :`, beginning with a letter, `_` or `/`, and not a word

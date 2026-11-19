@@ -32,13 +32,13 @@
 //! the join (Go releases `s.mu` before `<-call.done`).
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustls::sign::CertifiedKey;
 use shed_core::certuser::{cert_user_pem, is_user_name, CertUser};
 use shed_core::csr::{pem_encode, ClientKeyPair, PEM_LABEL_PRIVATE_KEY};
 use shed_core::tls::{certified_key_from_pem, ClientCertResolver};
-use shed_core::token::{display_server_name, held_user_refusal};
+use shed_core::token::{display_server_name, held_user_refusal, next_refusal_backoff};
 use ssh_key::known_hosts::{HostPatterns, KnownHosts};
 use tokio::sync::watch;
 
@@ -463,6 +463,20 @@ struct SourceState {
     /// the mint's store write has completed, so two adoptions are written in the order
     /// they were adopted.
     inflight: Option<watch::Receiver<Option<Arc<MintOutcome>>>>,
+    /// The last held-user refusal ([`ObtainError::held_user`]), answered again to every
+    /// call while its wait ([`Self::refusal_until`]) runs. `None` once a credential is
+    /// adopted.
+    refusal: Option<ObtainError>,
+    /// The wait the last held-user refusal started (shed-core's [`next_refusal_backoff`]:
+    /// 1 s, doubling per consecutive refusal, up to 30 s); `None` once a credential is
+    /// adopted, so the next refusal waits the floor again.
+    refusal_backoff: Option<Duration>,
+    /// Until when no mint is started after a held-user refusal (plan 037 A25), on the
+    /// monotonic clock ([`CredentialSource::now_mono`]); `None` once a credential is
+    /// adopted. Without it every answered request minted again while the held
+    /// certificate was stale or rejected, and the server issued a certificate for the
+    /// other user each time, to be thrown away.
+    refusal_until: Option<Instant>,
 }
 
 /// The result a joined caller reads: `(bearer, expiry)` or why there is none. The bearer
@@ -482,6 +496,9 @@ pub struct ObtainError {
     /// established the first named user could not be stored. `message` is then the
     /// refusal, built from names already checked, never text a minter produced. Belongs
     /// to this call only: a request explains its own refusal with it, never another's.
+    /// The one exception is the held-user rule's wait (plan 037 A25): until it has passed
+    /// no mint is started, and a call that would have minted gets the refusal that started
+    /// the wait, which is still why the source has nothing newer.
     pub refused: bool,
     /// Set only with [`Self::refused`], when the refusal is the held-user rule's
     /// ([`held_user_refusal`]: a certificate for another named user, or one that names no
@@ -648,7 +665,12 @@ fn stored_user(cert_pem: &str, config_user: Option<&str>) -> Result<CertUser, St
 /// Every certificate this source adopts or presents must be issued to the user it holds
 /// ([`SourceState::held_user`]) or to the implicit user. A minted certificate for another
 /// named user, or one that names no user, is refused like any unusable credential: nothing
-/// is persisted and the held, armed credential stays. A stored certificate that fails the
+/// is persisted and the held, armed credential stays. Such a refusal also starts a wait
+/// (plan 037 A25, shed-core's [`next_refusal_backoff`]: 1 s, doubling per consecutive
+/// refusal to 30 s, reset by an adopted credential, on the monotonic clock): until it has
+/// passed no mint is started, and every call that would mint gets the same refusal, so the
+/// server is not asked to issue another user's certificate on every request while the held
+/// one is stale or was rejected. A stored certificate that fails the
 /// same check is not presented at start (the source mints instead and
 /// [`Self::hydration_note`] says why). While a name is held, a certificate for the implicit
 /// user is adopted in memory but NOT written to the store, so the stored named certificate
@@ -682,6 +704,13 @@ pub struct CredentialSource {
     /// `true` the source never writes to the store again (checked under the store's lock).
     fence: Option<watch::Receiver<bool>>,
     state: Mutex<SourceState>,
+    /// The monotonic clock the refusal wait is measured on ([`SourceState::refusal_until`]):
+    /// [`Instant::now`], replaced only by tests ([`Self::with_mono_clock`]).
+    now_mono: Arc<dyn Fn() -> Instant + Send + Sync>,
+    /// The wall clock, unix seconds, that a credential's expiry is judged by: when it is
+    /// stale, when the refresh loop runs, and when a held certificate has expired.
+    /// [`now_unix`], replaced only by tests ([`Self::with_wall_clock`]).
+    now_unix: Arc<dyn Fn() -> i64 + Send + Sync>,
     /// Test seam: when set, the next store write first signals the first `Notify` and
     /// waits on the second (the single flight is still held while it waits).
     #[cfg(test)]
@@ -804,6 +833,9 @@ fn build_credential_source(
         terminal_err: None,
         inflight: None,
         held_user: config_user.clone(),
+        refusal: None,
+        refusal_backoff: None,
+        refusal_until: None,
     };
     let mut hydration_note = None;
     if let Some(sc) = hydrated {
@@ -846,12 +878,72 @@ fn build_credential_source(
         hydration_note,
         fence,
         state: Mutex::new(state),
+        now_mono: Arc::new(Instant::now),
+        now_unix: Arc::new(now_unix),
         #[cfg(test)]
         pause_before_write: Mutex::new(None),
     })
 }
 
 impl CredentialSource {
+    /// Test seam: measure the refusal wait on `now` instead of [`Instant::now`]. Called
+    /// right after the source is built, before any other handle to it exists.
+    #[cfg(test)]
+    pub(crate) fn with_mono_clock(
+        mut self: Arc<Self>,
+        now: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("the clock is set before the source is shared")
+            .now_mono = Arc::new(now);
+        self
+    }
+
+    /// Test seam: judge expiry on `now` (unix seconds) instead of the system clock. Called
+    /// right after the source is built, before any other handle to it exists.
+    #[cfg(test)]
+    pub(crate) fn with_wall_clock(
+        mut self: Arc<Self>,
+        now: impl Fn() -> i64 + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("the clock is set before the source is shared")
+            .now_unix = Arc::new(now);
+        self
+    }
+
+    /// Whether the held credential is stale ([`stale`]) on this source's wall clock.
+    fn stale_now(&self, st: &SourceState) -> bool {
+        stale(st.expiry, (self.now_unix)())
+    }
+
+    /// While a held-user refusal stands (plan 037 A25: recorded, and no credential adopted
+    /// since), a held certificate past its expiry is not something to present: it is
+    /// dropped and withdrawn from the transport, so [`Self::holds_certificate`] answers
+    /// `false` and no handshake offers it. A request then has nothing to present and,
+    /// refused by the held-user rule, is not sent at all. The held USER is kept: only the
+    /// certificate goes. A certificate still valid is kept and presented as before, and
+    /// after any other failure an expired certificate stays as it was (the surviving
+    /// credential, as shed-core's provider keeps it). Caller holds the state lock.
+    fn withdraw_expired_locked(&self, st: &mut SourceState) {
+        if st.refusal.is_some()
+            && matches!(st.cred, Some(Held::Certificate { .. }))
+            && expired(st.expiry, (self.now_unix)())
+        {
+            st.cred = None;
+            self.cert_resolver.set(None);
+        }
+    }
+
+    /// The kept held-user refusal while its wait runs (plan 037 A25), else `None`.
+    /// Caller holds the state lock.
+    fn refusal_waiting(&self, st: &SourceState) -> Option<ObtainError> {
+        match (&st.refusal, st.refusal_until) {
+            (Some(refusal), Some(until)) if (self.now_mono)() < until => Some(refusal.clone()),
+            _ => None,
+        }
+    }
+
     /// The server this source mints for (used by the control-token provider to detect an
     /// endpoint change and recreate the source).
     pub fn target(&self) -> &ServerTarget {
@@ -969,9 +1061,13 @@ impl CredentialSource {
 
     /// Whether a certificate identity is currently held (and therefore armed on
     /// the transport's resolver) — used by callers to pick the right log line
-    /// when a re-mint fails.
+    /// when a re-mint fails, and to send nothing when a held-user refusal leaves
+    /// nothing to present. While a held-user refusal stands, a certificate past its
+    /// expiry is not held: it is withdrawn here first ([`Self::withdraw_expired_locked`]),
+    /// so this answer and what the next handshake offers agree.
     pub fn holds_certificate(&self) -> bool {
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
+        self.withdraw_expired_locked(&mut st);
         st.terminal_err.is_none() && matches!(st.cred, Some(Held::Certificate { .. }))
     }
 
@@ -979,17 +1075,20 @@ impl CredentialSource {
     /// credential — the same test `obtain` makes: a mint is in flight, nothing usable is
     /// held, it is stale, or the server REFUSED it (the `rejected` flag, which stays set
     /// until a mint succeeds — so after a failed re-mint every call mints again). The
-    /// terminal state fails at once without minting. Lets a caller bound its mint
-    /// attempts (a bus respond makes at most one).
+    /// terminal state fails at once without minting, and so does a call while a held-user
+    /// refusal's wait runs (plan 037 A25): it is answered the kept refusal. Lets a caller
+    /// bound its mint attempts (a bus respond makes at most one).
     pub fn would_mint(&self) -> bool {
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
         if st.terminal_err.is_some() {
             return false;
         }
         if st.inflight.is_some() {
             return true;
         }
-        !matches!(&st.cred, Some(c) if c.usable() && !stale(st.expiry) && !st.rejected)
+        self.withdraw_expired_locked(&mut st);
+        !matches!(&st.cred, Some(c) if c.usable() && !self.stale_now(&st) && !st.rejected)
+            && self.refusal_waiting(&st).is_none()
     }
 
     /// Proactively re-mint, best-effort (errors surface on the next obtain). Driven by
@@ -1009,6 +1108,7 @@ impl CredentialSource {
             if let Some(err) = &st.terminal_err {
                 return Err(ObtainError::plain(err.clone()));
             }
+            self.withdraw_expired_locked(&mut st);
             if force {
                 st.cred = None; // force a re-mint; never serve a completed cached credential
             } else if let Some(c) = &st.cred {
@@ -1016,11 +1116,11 @@ impl CredentialSource {
                 // short-circuit even when locally unexpired: the server
                 // refused it, so serving it as "fresh" would skip the re-mint
                 // forever (mirror Go EnsureFreshErr's !rejected condition).
-                if c.usable() && !stale(st.expiry) && !st.rejected {
+                if c.usable() && !self.stale_now(&st) && !st.rejected {
                     return Ok((c.bearer(), st.expiry));
                 }
             }
-            self.obtain_locked(&mut st)
+            self.obtain_locked(&mut st)?
         };
         // Await OFF the lock (Go releases s.mu before <-call.done).
         wait_outcome(rx).await
@@ -1036,25 +1136,35 @@ impl CredentialSource {
             if let Some(err) = &st.terminal_err {
                 return Err(ObtainError::plain(err.clone()));
             }
-            self.obtain_locked(&mut st)
+            self.withdraw_expired_locked(&mut st);
+            self.obtain_locked(&mut st)?
         };
         wait_outcome(rx).await
     }
 
     /// Return the in-flight mint's receiver, starting one (spawned, off the lock) if none
     /// is running so N concurrent callers share ONE mint. Caller holds the state lock.
+    ///
+    /// While a held-user refusal's wait runs (plan 037 A25) no mint is started: the call
+    /// gets the kept refusal at once, as the mint that recorded it answered, and the held
+    /// certificate stays armed when [`Self::keep_only_held`] kept it, until it expires
+    /// ([`Self::withdraw_expired_locked`]). Every other failure
+    /// starts no wait, so it is retried as before.
     fn obtain_locked(
         self: &Arc<Self>,
         st: &mut SourceState,
-    ) -> watch::Receiver<Option<Arc<MintOutcome>>> {
+    ) -> Result<watch::Receiver<Option<Arc<MintOutcome>>>, ObtainError> {
         if let Some(rx) = &st.inflight {
-            return rx.clone();
+            return Ok(rx.clone());
+        }
+        if let Some(refusal) = self.refusal_waiting(st) {
+            return Err(refusal);
         }
         let (tx, rx) = watch::channel(None);
         st.inflight = Some(rx.clone());
         let this = Arc::clone(self);
         tokio::spawn(async move { this.do_mint(tx).await });
-        rx
+        Ok(rx)
     }
 
     /// Perform the mint off the state lock, then decide and adopt under it. A host-key
@@ -1128,7 +1238,12 @@ impl CredentialSource {
         self.cert_resolver.set(held.certified());
         st.expiry = expiry;
         st.cred = Some(held);
-        st.rejected = false; // a fresh credential has no rejection history
+        // A fresh credential has no rejection history, and ends a refusal episode: the next
+        // refusal waits the floor.
+        st.rejected = false;
+        st.refusal = None;
+        st.refusal_backoff = None;
+        st.refusal_until = None;
         (bearer, expiry)
     }
 
@@ -1203,11 +1318,22 @@ impl CredentialSource {
                 // Nothing is persisted and the held credential stays armed — but only
                 // after a positive check that it is still for the held user.
                 self.keep_only_held(st);
-                MintStep::Done(Err(if r.held_user {
-                    ObtainError::held_user_refusal(r.message)
-                } else {
-                    ObtainError::refusal(r.message)
-                }))
+                if !r.held_user {
+                    // An unreadable certificate: no wait, retried as before.
+                    return MintStep::Done(Err(ObtainError::refusal(r.message)));
+                }
+                // The held-user rule's refusal starts the wait (plan 037 A25): no mint
+                // until it has passed, and every call meanwhile gets this refusal. On
+                // the monotonic clock read after the mint (it took time), overflow-safe.
+                let refusal = ObtainError::held_user_refusal(r.message);
+                let wait = next_refusal_backoff(st.refusal_backoff);
+                let now = (self.now_mono)();
+                st.refusal_backoff = Some(wait);
+                st.refusal_until = Some(now.checked_add(wait).unwrap_or(now));
+                st.refusal = Some(refusal.clone());
+                // The kept certificate is presented only while it is still valid.
+                self.withdraw_expired_locked(st);
+                MintStep::Done(Err(refusal))
             }
             Err(MintFailure::Minter(e)) if e.is_host_key_mismatch() => {
                 // Go: fmt.Errorf("refusing to broker %q: SSH host key pin mismatch
@@ -1285,20 +1411,27 @@ impl CredentialSource {
     fn next_refresh_delay(&self) -> Duration {
         let expiry = self.state.lock().unwrap().expiry;
         apply_jitter_and_clamp(
-            base_refresh_delay(expiry, now_unix()),
+            base_refresh_delay(expiry, (self.now_unix)()),
             random_jitter_fraction(),
         )
     }
 }
 
 /// Whether a cached token with the given expiry is within [`TOKEN_REFRESH_WINDOW`] of
-/// expiry (a `None` expiry is a non-expiring token — never stale). Mirror `staleLocked`:
-/// `!expiry.IsZero() && now >= expiry - window`.
-fn stale(expiry: Option<i64>) -> bool {
+/// expiry at `now` (a `None` expiry is a non-expiring token — never stale). Mirror
+/// `staleLocked`: `!expiry.IsZero() && now >= expiry - window`.
+fn stale(expiry: Option<i64>, now: i64) -> bool {
     match expiry {
         None => false,
-        Some(exp) => now_unix() >= exp - TOKEN_REFRESH_WINDOW.as_secs() as i64,
+        Some(exp) => now >= exp - TOKEN_REFRESH_WINDOW.as_secs() as i64,
     }
+}
+
+/// Whether a credential with the given expiry has expired at `now` (unix seconds; a
+/// `None` expiry never does). The same rule as shed-core's provider (`now >= exp`): a
+/// certificate is not counted valid in the second its validity ends.
+fn expired(expiry: Option<i64>, now: i64) -> bool {
+    matches!(expiry, Some(exp) if now >= exp)
 }
 
 /// The pre-jitter refresh base: `remaining/2` while the token is valid, `MIN_REFRESH_DELAY`
@@ -1365,6 +1498,7 @@ async fn wait_outcome(
 pub(crate) mod tests {
     use super::*;
     use crate::bootstrap::{BootstrapError, Bundle};
+    use shed_core::token::{REFUSAL_BACKOFF_CEILING, REFUSAL_BACKOFF_FLOOR};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn target(name: &str, host: &str, port: u16) -> ServerTarget {
@@ -1556,12 +1690,12 @@ pub(crate) mod tests {
     // ---- CredentialSource (mirror the credmint_test.go source tests) ----------------
 
     /// A `Minter` returning canned results in sequence (repeating the last) + call count.
-    struct FakeMinter {
+    pub(crate) struct FakeMinter {
         results: std::sync::Mutex<Vec<Result<Minted, bool>>>, // Err(bool) = terminal?
-        calls: AtomicUsize,
+        pub(crate) calls: AtomicUsize,
     }
     impl FakeMinter {
-        fn new(results: Vec<Result<Minted, bool>>) -> Arc<Self> {
+        pub(crate) fn new(results: Vec<Result<Minted, bool>>) -> Arc<Self> {
             Arc::new(Self {
                 results: std::sync::Mutex::new(results),
                 calls: AtomicUsize::new(0),
@@ -1584,6 +1718,81 @@ pub(crate) mod tests {
 
     fn minted(token: &str) -> Minted {
         Minted::token(token, Some(now_unix() + 24 * 3600))
+    }
+
+    /// A monotonic clock a test moves by hand, for the refusal wait
+    /// ([`CredentialSource::with_mono_clock`]): it reads the same instant until advanced.
+    #[derive(Clone)]
+    pub(crate) struct MonoClock(Arc<std::sync::Mutex<Instant>>);
+
+    impl MonoClock {
+        pub(crate) fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Instant::now())))
+        }
+
+        pub(crate) fn advance(&self, by: Duration) {
+            *self.0.lock().unwrap() += by;
+        }
+
+        /// The source's clock: reads this one.
+        pub(crate) fn reader(&self) -> impl Fn() -> Instant + Send + Sync + 'static {
+            let at = self.0.clone();
+            move || *at.lock().unwrap()
+        }
+
+        /// `source`, measuring its refusal wait on this clock.
+        pub(crate) fn on(&self, source: Arc<CredentialSource>) -> Arc<CredentialSource> {
+            source.with_mono_clock(self.reader())
+        }
+    }
+
+    /// A wall clock (unix seconds) a test sets by hand, for expiry
+    /// ([`CredentialSource::with_wall_clock`]).
+    #[derive(Clone)]
+    pub(crate) struct WallClock(Arc<std::sync::atomic::AtomicI64>);
+
+    impl WallClock {
+        pub(crate) fn at(unix: i64) -> Self {
+            Self(Arc::new(std::sync::atomic::AtomicI64::new(unix)))
+        }
+
+        pub(crate) fn set(&self, unix: i64) {
+            self.0.store(unix, Ordering::SeqCst);
+        }
+
+        /// `source`, judging expiry on this clock.
+        pub(crate) fn on(&self, source: Arc<CredentialSource>) -> Arc<CredentialSource> {
+            let at = self.0.clone();
+            source.with_wall_clock(move || at.load(Ordering::SeqCst))
+        }
+    }
+
+    /// A source held to pat on both clocks: pat's certificate expiring at `expiry`, then
+    /// `admin`'s from every later mint (plan 037 A25). The wall clock starts a day before
+    /// `expiry`, so pat's is fresh.
+    pub(crate) fn pat_then_admin(
+        scope: &str,
+        expiry: i64,
+    ) -> (Arc<FakeMinter>, Arc<CredentialSource>, MonoClock, WallClock) {
+        let ca = TestCa::new();
+        let fm = FakeMinter::new(vec![
+            Ok(minted_cert(&ca, 0x0a, Some(expiry))),
+            Ok(minted_cert_for(
+                &ca,
+                0x0b,
+                Some(expiry + 86_400),
+                &TestUser::Named("admin"),
+            )),
+        ]);
+        let mono = MonoClock::new();
+        let wall = WallClock::at(expiry - 86_400);
+        let s = wall.on(mono.on(new_credential_source_with_store(
+            fm.clone(),
+            held_target("pat"),
+            scope,
+            None,
+        )));
+        (fm, s, mono, wall)
     }
 
     #[tokio::test]
@@ -2535,7 +2744,7 @@ pub(crate) mod tests {
 
     // ---- the held user (plan 037 §3.2.2) ----------------------------------------------
 
-    const MISMATCH: &str = "server \"mini3\": the server issued a certificate for user \
+    pub(crate) const MISMATCH: &str = "server \"mini3\": the server issued a certificate for user \
         \"admin\", but this entry is held to \"pat\"; it was not used. Fix it with the shed \
         CLI (shed server update mini3 --identity-file /path/to/key, or --refetch \
         --allow-user-change), then restart the app.";
@@ -2592,12 +2801,13 @@ pub(crate) mod tests {
                 Ok(minted_cert_for(&ca, 0x0b, day(), &refused)),
                 Ok(minted_cert(&ca, 0x0c, day())),
             ]);
-            let s = new_credential_source_with_store(
+            let clock = MonoClock::new();
+            let s = clock.on(new_credential_source_with_store(
                 fm.clone(),
                 held_target("pat"),
                 SCOPE_CREDENTIALS,
                 Some(store.clone()),
-            );
+            ));
             s.token().await.unwrap();
             let armed = s.cert_resolver().current().unwrap();
             let before = stored(&store);
@@ -2620,7 +2830,9 @@ pub(crate) mod tests {
             assert_eq!(s.credential_serial().as_deref(), Some("a"));
             assert_eq!(held_user_of(&s).as_deref(), Some("pat"));
 
-            // The next mint is pat's again: adopted and stored.
+            // The next mint, once the refusal's wait has passed, is pat's again: adopted
+            // and stored.
+            clock.advance(REFUSAL_BACKOFF_FLOOR);
             s.token().await.unwrap();
             assert_eq!(s.credential_serial().as_deref(), Some("c"));
             assert_ne!(stored(&store), before);
@@ -3173,5 +3385,214 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(&armed, &s.cert_resolver().current().unwrap()));
         assert_eq!(s.token().await.unwrap_err(), MISMATCH);
         assert_eq!(held_user_of(&s).as_deref(), Some("pat"));
+        // Once the held-user refusal stands, the expired certificate is not presented
+        // (plan 037 A25); the name stays held.
+        assert!(!s.holds_certificate());
+        assert!(s.cert_resolver().current().is_none());
+    }
+
+    /// The held-user refusal's wait (plan 037 A25): a source holding pat's certificate,
+    /// `admin`'s issued from the next mint on.
+    fn refusing_source(
+        first_expiry: Option<i64>,
+        then: &TestUser,
+    ) -> (Arc<FakeMinter>, Arc<CredentialSource>, MonoClock) {
+        let ca = TestCa::new();
+        let fm = FakeMinter::new(vec![
+            Ok(minted_cert(&ca, 0x0a, first_expiry)),
+            Ok(minted_cert_for(&ca, 0x0b, day(), then)),
+        ]);
+        let clock = MonoClock::new();
+        let s = clock.on(new_credential_source_with_store(
+            fm.clone(),
+            held_target("pat"),
+            SCOPE_CREDENTIALS,
+            None,
+        ));
+        (fm, s, clock)
+    }
+
+    fn mints(fm: &FakeMinter) -> usize {
+        fm.calls.load(Ordering::SeqCst)
+    }
+
+    /// While the held certificate is stale (inside its refresh window), N requests in a
+    /// row make ONE mint inside the first wait, not N: each gets the refusal, and pat's
+    /// certificate stays armed for the request to go out with.
+    #[tokio::test]
+    async fn a_stale_held_certificate_mints_once_per_refusal_wait() {
+        const N: usize = 10;
+        let (fm, s, _clock) = refusing_source(Some(now_unix() + 60), &TestUser::Named("admin"));
+        s.token().await.unwrap(); // pat's, already stale
+        let armed = s.cert_resolver().current().unwrap();
+        assert_eq!(mints(&fm), 1);
+        for i in 0..N {
+            let err = s.token_for_request().await.unwrap_err();
+            assert_eq!(
+                err,
+                ObtainError::held_user_refusal(MISMATCH.to_string()),
+                "{i}"
+            );
+            assert!(s.holds_certificate(), "{i}: pat's certificate is presented");
+            assert!(Arc::ptr_eq(&armed, &s.cert_resolver().current().unwrap()));
+            assert!(!s.would_mint(), "{i}: no mint while the wait runs");
+        }
+        assert_eq!(
+            mints(&fm),
+            2,
+            "one mint for {N} requests inside the first wait"
+        );
+    }
+
+    /// The wait doubles per consecutive refusal from 1 second to 30, measured on the
+    /// monotonic clock: a millisecond short of it, no mint; at it, one.
+    #[tokio::test]
+    async fn the_refusal_wait_doubles_to_thirty_seconds() {
+        let (fm, s, clock) = refusing_source(Some(now_unix() + 60), &TestUser::Named("admin"));
+        s.token().await.unwrap();
+        s.token_for_request().await.unwrap_err(); // the first refusal
+        assert_eq!(mints(&fm), 2);
+        let ms = Duration::from_millis(1);
+        let mut want = 2;
+        for wait in [1, 2, 4, 8, 16, 30, 30, 30].map(Duration::from_secs) {
+            clock.advance(wait - ms);
+            assert!(!s.would_mint());
+            s.token_for_request().await.unwrap_err();
+            assert_eq!(mints(&fm), want, "{wait:?} not yet passed");
+            clock.advance(ms);
+            assert!(s.would_mint());
+            s.token_for_request().await.unwrap_err();
+            want += 1;
+            assert_eq!(mints(&fm), want, "{wait:?} passed: one mint");
+        }
+        assert_eq!(
+            s.state.lock().unwrap().refusal_backoff,
+            Some(REFUSAL_BACKOFF_CEILING)
+        );
+    }
+
+    /// An adopted credential resets the wait: the next refusal waits the floor again.
+    #[tokio::test]
+    async fn an_adoption_resets_the_refusal_wait() {
+        let ca = TestCa::new();
+        let stale = || Some(now_unix() + 60);
+        let fm = FakeMinter::new(vec![
+            Ok(minted_cert(&ca, 0x0a, stale())),
+            Ok(minted_cert_for(&ca, 0x0b, day(), &TestUser::Named("admin"))),
+            Ok(minted_cert_for(&ca, 0x0c, day(), &TestUser::Named("admin"))),
+            Ok(minted_cert(&ca, 0x0d, stale())),
+            Ok(minted_cert_for(&ca, 0x0e, day(), &TestUser::Named("admin"))),
+        ]);
+        let clock = MonoClock::new();
+        let s = clock.on(new_credential_source_with_store(
+            fm.clone(),
+            held_target("pat"),
+            SCOPE_CREDENTIALS,
+            None,
+        ));
+        s.token().await.unwrap();
+        s.token().await.unwrap_err(); // refused: waits 1 s
+        clock.advance(Duration::from_secs(1));
+        s.token().await.unwrap_err(); // refused again: waits 2 s
+        clock.advance(Duration::from_secs(2));
+        s.token().await.unwrap(); // pat's again: adopted
+        assert_eq!(s.credential_serial().as_deref(), Some("d"));
+        s.token().await.unwrap_err(); // refused: the floor again, not 4 s
+        assert_eq!(mints(&fm), 5);
+        clock.advance(REFUSAL_BACKOFF_FLOOR - Duration::from_millis(1));
+        s.token().await.unwrap_err();
+        assert_eq!(mints(&fm), 5);
+        clock.advance(Duration::from_millis(1));
+        s.token().await.unwrap_err();
+        assert_eq!(mints(&fm), 6);
+    }
+
+    /// A held certificate the server rejected (a 401) waits the same, for both arms of
+    /// the rule: a certificate for another user, and one that names no user.
+    #[tokio::test]
+    async fn a_rejected_held_certificate_waits_the_same() {
+        for (then, want) in [
+            (TestUser::Named("admin"), MISMATCH),
+            (TestUser::Unbound, NO_USER),
+        ] {
+            let (fm, s, clock) = refusing_source(day(), &then);
+            s.token().await.unwrap();
+            let armed = s.cert_resolver().current().unwrap();
+            s.invalidate();
+            for _ in 0..5 {
+                let err = s.token_for_request().await.unwrap_err();
+                assert_eq!(err, ObtainError::held_user_refusal(want.to_string()));
+                assert!(Arc::ptr_eq(&armed, &s.cert_resolver().current().unwrap()));
+            }
+            assert_eq!(mints(&fm), 2, "one mint inside the first wait");
+            clock.advance(REFUSAL_BACKOFF_FLOOR);
+            s.token_for_request().await.unwrap_err();
+            assert_eq!(mints(&fm), 3, "one more once it has passed");
+        }
+    }
+
+    /// Every other failure keeps its behaviour: a minter that fails, and a certificate
+    /// whose user cannot be read, are tried again on every call, with no wait.
+    #[tokio::test]
+    async fn another_failure_starts_no_refusal_wait() {
+        let ca = TestCa::new();
+        let cases: [Result<Minted, bool>; 2] = [
+            Err(false),
+            Ok(minted_cert_for(&ca, 0x0b, day(), &TestUser::Unreadable)),
+        ];
+        for then in cases {
+            let fm = FakeMinter::new(vec![
+                Ok(minted_cert(&ca, 0x0a, Some(now_unix() + 60))),
+                then,
+            ]);
+            let s = MonoClock::new().on(new_credential_source_with_store(
+                fm.clone(),
+                held_target("pat"),
+                SCOPE_CREDENTIALS,
+                None,
+            ));
+            s.token().await.unwrap();
+            for i in 0..5 {
+                let err = s.token_for_request().await.unwrap_err();
+                assert!(!err.held_user, "{err:?}");
+                assert!(s.would_mint());
+                assert_eq!(mints(&fm), 2 + i, "a mint on every call");
+            }
+        }
+    }
+
+    /// An expired held certificate is not something to present (plan 037 A25): while a
+    /// held-user refusal stands, pat's certificate is presented one second before its
+    /// expiry and withdrawn once it has passed, inside the same wait; no mint starts and
+    /// the name stays held.
+    #[tokio::test]
+    async fn an_expired_held_certificate_is_not_presented_during_a_refusal() {
+        const EXPIRY: i64 = 4_102_444_800;
+        let refusal = || ObtainError::held_user_refusal(MISMATCH.to_string());
+        let (fm, s, _mono, wall) = pat_then_admin(SCOPE_CREDENTIALS, EXPIRY);
+        s.token().await.unwrap(); // pat's
+        let armed = s.cert_resolver().current().unwrap();
+
+        // One second before it expires (inside its refresh window): refused, and pat's
+        // certificate is still presented.
+        wall.set(EXPIRY - 1);
+        assert_eq!(s.token_for_request().await.unwrap_err(), refusal());
+        assert_eq!(mints(&fm), 2);
+        assert!(s.holds_certificate());
+        assert!(Arc::ptr_eq(&armed, &s.cert_resolver().current().unwrap()));
+
+        // Past its expiry, inside the same wait: nothing is presented and the refusal
+        // is the answer.
+        wall.set(EXPIRY + 1);
+        assert!(!s.holds_certificate());
+        assert!(s.cert_resolver().current().is_none());
+        assert_eq!(s.token_for_request().await.unwrap_err(), refusal());
+        assert!(!s.would_mint());
+        assert_eq!(mints(&fm), 2, "no mint inside the wait");
+        assert_eq!(
+            held_user_of(&s).as_deref(),
+            Some("pat"),
+            "the name stays held"
+        );
     }
 }

@@ -275,7 +275,11 @@ All notable changes to this project will be documented in this file.
   answer and report it as an error naming the status, so a credential is never sent on to
   the URL a redirect names; before, an endpoint holding the pinned certificate could pass a
   bearer token on to a plain-`http` URL. shed-server's API answers no request with a
-  redirect, so nothing that works today changes.
+  redirect, so nothing that works today changes. The desktop app's own client (the dashboard
+  and its control requests) follows none either: it used to follow a redirect to any `https`
+  URL, and with a pinned server it presented its client certificate to any host holding the
+  pinned certificate. The credential broker's bus and egress stream follow a redirect only
+  within the server's own origin.
 - **CLI: a shed name from a server never reaches `~/.ssh/config` unchecked (security).**
   `shed ssh-config` (printed, `--install`) and `shed attach` wrote each shed's name from the
   server's list into a `Host` and a `User` line as it came, so a hostile server could add
@@ -735,42 +739,11 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   and that `ssh` does not run (a connection an open tunnel makes later, a local command that
   only closes a shared connection, and a terminal running a command built earlier are not
   checked again); a stored `control_token` or `credentials_token` is never sent for such an
-  entry. The app reads a server entry only when every line in it is a plain `key: value`:
-  an entry with any other line (an explicit `? key`, a `{…}` mapping, a tag, an anchor, a
-  merge key, a block scalar, a continued value, a repeated key, a list) or a null `host` is
-  listed and refused, never read with defaults, and nothing is sent to its server; the
-  broker refuses an entry with a merge key or a tagged key. Unlike the CLI, the app does not
+  entry. An entry the app or the broker cannot read exactly is refused, never read as "no
+  key" (see the `config.yaml` item under Changed). Unlike the CLI, the app does not
   check that a certificate was made for the entry's key: what bounds who it acts as is the
   entry's `user`. Restart the app after changing an entry's `identity_file`. See [Desktop
   configuration](https://charliek.github.io/shed/desktop/configuration/#the-ssh-key-an-entry-uses).
-- **Fix (desktop): `config.yaml` values are read as YAML reads them**, as the CLI wrote them.
-  Two shapes change meaning: a value with a `#` and no space before it (`host: mini#2`,
-  `identity_file: /home/pat/.ssh/id#work`) is now the whole value, where the app used to cut it
-  at the `#`; and a value that is literally `null` or `~` (`user: null`) is now no value, where
-  the app used to read the text. Double-quoted escapes such as `\t` are decoded, `''` in a
-  single-quoted value is one `'`, a `#` inside quotes is text, and a quoted key is decoded the
-  same way. The app's **Add machine** refuses a host or user holding a control character or a
-  line break rather than write it, and writes every other value double-quoted unless it is a
-  plain token (so `&a other.example` is written as `"&a other.example"` and read back as that
-  text by any YAML reader). Since an entry is read only when every line is a plain
-  `key: value`, an entry the app used to read in part (a `user:` list or `[…]`, a `host:` value
-  continued on the next line) is now refused whole, and a null `host` no longer falls back to
-  the entry's name.
-- **Desktop: the app reads `config.yaml` as the shed CLI writes it, and refuses the rest by
-  name.** Every entry the CLI's save path writes with ordinary values is read with the host,
-  ports, user and `identity_file` the CLI reads (a fixture written by the CLI's own save
-  function holds this); an entry or a file in a form the app does not read exactly is refused
-  with a reason, never read with defaults, and a hand-edited file in YAML forms the CLI never
-  writes may be refused by the app while the CLI accepts it. An entry named with a colon
-  (`prod:blue`, `10.0.0.5:8443`) is now read under its name; a byte-order mark is skipped; only
-  the first YAML document is read. The app reads no part of a file that holds a raw CR outside
-  a CRLF line ending, NEL, U+2028 or U+2029 (the broker refuses such a file too), that has
-  `servers:` twice, or whose `servers:` is in flow form or has a tag or an anchor; the log says
-  why. A line indented with a tab refuses the entry it is in. Not read, by design: a name the
-  CLI writes as an explicit `? key` (over 128 bytes), and a value written as a multi-line block
-  or with a `!!binary` tag; each refuses its entry. **Add machine** refuses a character YAML
-  does not allow in a file (U+FFFE, U+FFFF). See [How the app reads the
-  file](https://charliek.github.io/shed/desktop/configuration/#how-the-app-reads-the-file).
 - **Development:** `SHED_DEV_USERS=itest` starts the dev servers with the suite's user list;
   the suite gains `test_users.py`, `test_users_upgrade.py` and `test_source_pin.py`, with
   `SHED_ITEST_USERS` and `SHED_ITEST_USERS_DIR`.
@@ -893,8 +866,10 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   any other check, on every `/api/sheds/{name}` and `/api/egress/{name}` route.
 - **Egress history and the live stream are filtered by user and by shed incarnation**: a shed
   recreated under an earlier name no longer shows the earlier shed's records.
-- **Host-agent and desktop: the bus follows a redirect only to the server's own origin**, and
-  an answer the server refused is audited as `undelivered`.
+- **Host-agent and desktop: the bus and the egress stream follow a redirect only to the
+  server's own origin**, and an answer the server refused is audited as `undelivered`. The
+  egress stream used to follow a redirect to any `https` URL, with its credential, to any
+  host that held the pinned certificate.
 - **Audit log: callers by kind.** A person's line no longer reads `{"kind":"admin",
   "subject":…}` for everyone who is not a service client: it is `{"kind":"user","user":"pat",
   "admin":true,"script":false,"subject":…,"serial":…}`, with the user's name, whether they are
@@ -913,18 +888,57 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   user name is never read as no user. A certificate for another named user, or one that names no user (a shed-server older
   than 0.10.0), is refused: nothing is stored, the held credential stays, and the message
   (the host error, and the broker's last error in `broker.status`) names both users and the
-  fix. While a refusal lasts, the app's control requests ask the server for a certificate
-  again only after a wait (1 s, doubling to 30 s, the broker's own schedule, measured on a
-  monotonic clock), and a request with nothing the server would accept is not sent, by the
-  control path or by the credential broker (its subscription, its answers and its egress
-  stream): it fails at once with the refusal alone. A still-valid certificate for the entry's
-  user keeps being used. Once the server issues a certificate for the entry's user again, the
-  app uses it within 30 seconds, with no restart; a change to `config.yaml` does not reset the
-  wait, so restart the app after fixing the entry. The refusal suggests `--identity-file /path/to/key`, as the CLI
+  fix. While a refusal lasts, the app's control requests and the credential broker each ask
+  the server for a certificate again only after a wait (1 s, doubling to 30 s, measured on a
+  monotonic clock), however many requests arrive meanwhile: before, the broker enrolled again
+  for every credential request it answered while its held certificate was near expiry or had
+  been rejected, and the server issued the other user's certificate each time. A request with
+  nothing the server would accept is not sent, by the control path or by the credential
+  broker (its subscription, its answers and its egress stream): it fails at once with the
+  refusal alone. A still-valid certificate for the entry's user keeps being used; one that
+  has expired meanwhile is not presented, and the entry stays held to its user. The broker
+  logs that it presents a certificate at WARN once per refusal, then at DEBUG. Once the server
+  issues a certificate for the entry's user again, each path uses it at its first attempt
+  after its wait, with no restart (the control path's when the dashboard next polls, so about
+  35 seconds at most). A change to `config.yaml` resets the broker's wait for a server whose
+  entry changed, not the control path's, so restart the app after fixing the entry. The
+  refusal suggests `--identity-file /path/to/key`, as the CLI
   does. A stored broker certificate that fails the same check is not presented and the broker
   enrols again. Restart the app after an entry's user changes; run `shed server update <name>
   --refetch` once so `config.yaml` records the user. See [Desktop
   configuration](https://charliek.github.io/shed/desktop/configuration/#the-user-an-entry-is-held-to).
+- **Desktop: the app reads `config.yaml` as the shed CLI writes it, and refuses the rest by
+  name.** Every entry the CLI's save path writes with ordinary values is read with the host,
+  ports, user and `identity_file` the CLI reads (a fixture written by the CLI's own save
+  function holds this). Values are read as YAML reads them, so two shapes change meaning: a
+  value with a `#` and no space before it (`host: mini#2`, `identity_file:
+  /home/pat/.ssh/id#work`) is now the whole value, where the app used to cut it at the `#`; and
+  a value that is literally `null` or `~` (`user: null`) is now no value, where the app used to
+  read the text. Double-quoted escapes such as `\t` are decoded, `''` in a single-quoted value
+  is one `'`, a `#` inside quotes is text, and a quoted key is decoded the same way. An entry
+  named with a colon (`prod:blue`, `10.0.0.5:8443`) is read under its name, a byte-order mark
+  is skipped, and only the first YAML document is read. The app reads a server entry only when
+  every line in it is a plain `key: value`: an entry with any other line (an explicit `? key`,
+  a `{…}` mapping, a tag, an anchor, a merge key, a block scalar, a continued value, a repeated
+  key, a list, a line indented with a tab) or a null `host` is listed and refused with a
+  reason, never read with defaults, so an entry the app used to read in part (a `user:` list, a
+  `host:` value continued on the next line) is now refused whole, and a null `host` no longer
+  falls back to the entry's name. The app reads no part of a file that holds a raw CR outside a
+  CRLF line ending, NEL, U+2028 or U+2029 (the broker refuses such a file too), that has
+  `servers:` twice, or whose `servers:` is in flow form or has a tag or an anchor; the log says
+  why. Not read, by design: a name the CLI writes as an explicit `? key` (over 128 bytes), and
+  a value written as a multi-line block or with a `!!binary` tag; each refuses its entry. A
+  hand-edited file in YAML forms the CLI never writes may be refused by the app while the CLI
+  accepts it. These refusals are the app's own: for an entry it refuses, the dashboard and its
+  control requests send nothing. The credential broker reads the file with a full YAML parser:
+  it serves an entry in a shape that parser reads as the CLI does (a `{…}` mapping, an explicit
+  `? key`), and refuses the key and the user of one it cannot read so (a merge key, a tagged
+  key, a tagged, anchored or multi-line `user` or `identity_file`), never reading it as "no
+  key" or "no user". **Add machine** writes every value double-quoted unless it is a plain
+  token (so `&a other.example` is written as `"&a other.example"` and read back as that text by
+  any YAML reader), and refuses a host or user holding a control character, a line break or a
+  character YAML does not allow in a file (U+FFFE, U+FFFF). See [How the app reads the
+  file](https://charliek.github.io/shed/desktop/configuration/#how-the-app-reads-the-file).
 - **Development: both parallel dev servers and the integration suite run `mtls`.**
 - **CLI: every client-certificate write for an entry is one transaction** (a re-enrolment, an
   add, a refetch) under that server's credential lock, deciding against the entry as

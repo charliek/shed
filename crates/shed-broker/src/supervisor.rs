@@ -983,7 +983,8 @@ mod tests {
             ca: crate::minter::tests::TestCa::new(),
             script: Mutex::new(vec![Ok("pat"), Ok("admin"), Ok("admin"), Err(())]),
         });
-        let src = crate::minter::new_credential_source_with_store(
+        let clock = crate::minter::tests::MonoClock::new();
+        let src = clock.on(crate::minter::new_credential_source_with_store(
             minter,
             ServerTarget {
                 user: "pat".into(),
@@ -991,7 +992,7 @@ mod tests {
             },
             crate::minter::SCOPE_CREDENTIALS,
             None,
-        );
+        ));
         let p: Arc<dyn TokenProvider> = Arc::new(src.clone());
         p.token_for_request().await.unwrap(); // pat adopted
 
@@ -1002,6 +1003,8 @@ mod tests {
             "served from the cache: no refusal to explain this request with"
         );
 
+        // Past the refusal's wait (plan 037 A25), so this request makes its own mint.
+        clock.advance(shed_core::token::REFUSAL_BACKOFF_FLOOR);
         src.invalidate();
         let (err, refusal) = p.token_for_request().await.unwrap_err();
         let refusal = refusal.expect("this request's own mint was refused");
@@ -1009,6 +1012,7 @@ mod tests {
         assert!(refusal.message.contains("held to \"pat\""), "{refusal:?}");
         assert!(refusal.held_user, "the held-user rule's refusal");
 
+        clock.advance(shed_core::token::REFUSAL_BACKOFF_CEILING);
         let (err, refusal) = p.token_for_request().await.unwrap_err();
         assert_eq!(err.to_string(), "transient");
         assert_eq!(refusal, None, "a minter failure is no refusal");

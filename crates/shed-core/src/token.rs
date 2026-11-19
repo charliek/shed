@@ -554,32 +554,45 @@ const MINT_FAILED_REDACTED: &str = "control token mint failed";
 /// an adopted credential resets it. Without it every request re-enrolled, and the
 /// server issued a certificate for the other user each time, to be thrown away.
 ///
-/// The same schedule as the broker's credential streams, whose copy is `INITIAL_BACKOFF`
-/// and `MAX_BACKOFF` in `crates/shed-broker/src/bus.rs` (shed-core cannot depend on
-/// shed-broker). Keep the two equal.
+/// One definition serves both of the app's credential paths: this provider, and the
+/// embedded broker's credential source (`CredentialSource` in
+/// `crates/shed-broker/src/minter.rs`, plan 037 A25), which reads these two constants and
+/// [`next_refusal_backoff`] from here. The broker's credential streams reconnect on the
+/// same schedule with their own copy, `INITIAL_BACKOFF` and `MAX_BACKOFF` in
+/// `crates/shed-broker/src/bus.rs` (a stream's backoff, not a refusal's). Keep the two
+/// equal.
 ///
 /// The wait is measured on the monotonic clock ([`ControlTokenProvider`]'s `now_mono`),
 /// to the full resolution of [`Instant`]: a wall clock read in whole seconds would let a
 /// refusal at 1000.999 s allow the next enrolment at 1001.000 s, and a wall clock set
 /// back would stretch the wait by as much.
-const REFUSAL_BACKOFF_FLOOR: Duration = Duration::from_secs(1);
+pub const REFUSAL_BACKOFF_FLOOR: Duration = Duration::from_secs(1);
 /// The longest wait between two enrolments while a held-user refusal lasts, so a server
 /// that issues the held user's certificate again is used within this long, unless the
 /// provider is configured with a longer mint cooldown
 /// ([`ControlTokenProvider::with_mint_cooldown`]), which a refusal then waits instead.
 /// The desktop app configures none.
-const REFUSAL_BACKOFF_CEILING: Duration = Duration::from_secs(30);
+pub const REFUSAL_BACKOFF_CEILING: Duration = Duration::from_secs(30);
 
 /// The longest wait a refusal's deadline is computed for: a configured mint cooldown
 /// beyond this is held to it, so the deadline on the monotonic clock cannot overflow.
 const REFUSAL_WAIT_LIMIT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// The wait after a held-user refusal, given the wait after the one before it (`None`
-/// when the last mint was not refused).
-fn next_refusal_backoff(prev: Option<Duration>) -> Duration {
+/// when the last mint was not refused): [`REFUSAL_BACKOFF_FLOOR`], then twice the one
+/// before, up to [`REFUSAL_BACKOFF_CEILING`].
+///
+/// Total for any input, so a caller outside this crate cannot misuse it: `prev` is held
+/// to the ceiling before it is doubled (and the doubling saturates), so even
+/// `Duration::MAX` gives the ceiling and never panics; the answer is never below the
+/// floor, so `Some(Duration::ZERO)` gives the floor, never a zero wait.
+pub fn next_refusal_backoff(prev: Option<Duration>) -> Duration {
     match prev {
         None => REFUSAL_BACKOFF_FLOOR,
-        Some(prev) => (prev * 2).min(REFUSAL_BACKOFF_CEILING),
+        Some(prev) => prev
+            .min(REFUSAL_BACKOFF_CEILING)
+            .saturating_mul(2)
+            .clamp(REFUSAL_BACKOFF_FLOOR, REFUSAL_BACKOFF_CEILING),
     }
 }
 
@@ -1583,8 +1596,30 @@ impl ControlTokenProvider {
     /// Unusable shapes ([`Credential::usable`]) are filtered out: a credential
     /// with no payload is indistinguishable from having none.
     pub async fn surviving_credential(&self) -> Option<Credential> {
+        self.surviving_credential_after(false).await
+    }
+
+    /// [`Self::surviving_credential`] for a request whose own credential resolution
+    /// failed, given whether that failure is the held-user refusal
+    /// ([`CredentialFailure::held_user_refused`]).
+    ///
+    /// While a held-user refusal stands, a certificate past its expiry (on this
+    /// provider's clock, the one [`Self::credential`] judges expiry by) is not
+    /// something to present (plan 037 A25): the server could accept it no more than it
+    /// accepts the refused one, so there is no survivor and the request is not sent at
+    /// all. A still-valid certificate is a survivor as before. After any other failure
+    /// the rule above is unchanged, an expired survivor included (the C2(i) contract,
+    /// `http::mtls_tests::an_armed_certificate_is_still_presented_when_the_re_mint_fails`).
+    pub(crate) async fn surviving_credential_after(
+        &self,
+        held_user_refused: bool,
+    ) -> Option<Credential> {
         let st = self.state.lock().await;
-        st.cached.clone().filter(Credential::usable)
+        let now = (self.now_unix)();
+        st.cached
+            .clone()
+            .filter(Credential::usable)
+            .filter(|c| !(held_user_refused && c.mode == Some(AuthMode::Mtls) && expired(c, now)))
     }
 
     /// Drop the cached token UNCONDITIONALLY so the next `token()` force-mints.
@@ -4752,5 +4787,35 @@ mod held_user_tests {
         let odd = held_user_refusal("shed", Some("Pat\"; rm"), &named("pat")).unwrap();
         assert!(!odd.contains("rm"), "{odd}");
         assert!(odd.contains("not a valid user name"), "{odd}");
+    }
+
+    /// The refusal backoff is total (plan 037 A25): the schedule from the floor to the
+    /// ceiling, and any input, however large or small, gives a wait between the two
+    /// without panicking.
+    #[test]
+    fn the_refusal_backoff_is_total() {
+        let secs = Duration::from_secs;
+        let mut prev = None;
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            let wait = next_refusal_backoff(prev);
+            seen.push(wait.as_secs());
+            prev = Some(wait);
+        }
+        assert_eq!(seen, [1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(
+            next_refusal_backoff(Some(Duration::MAX)),
+            REFUSAL_BACKOFF_CEILING
+        );
+        assert_eq!(
+            next_refusal_backoff(Some(Duration::ZERO)),
+            REFUSAL_BACKOFF_FLOOR
+        );
+        assert_eq!(
+            next_refusal_backoff(Some(Duration::from_nanos(1))),
+            REFUSAL_BACKOFF_FLOOR
+        );
+        assert_eq!(next_refusal_backoff(Some(secs(20))), secs(30));
+        assert_eq!(next_refusal_backoff(Some(secs(3600))), secs(30));
     }
 }

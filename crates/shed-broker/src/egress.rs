@@ -270,10 +270,13 @@ fn backoff_step(prev: Duration, outcome: &Result<(), EgressStreamError>) -> (Dur
 /// `build_http_client` does NOT itself fail-closed on pin+non-https — that scheme check
 /// lives in `Client::new` — so the check is REPLICATED here (the plan's finding 7).
 ///
-/// DIVERGENCE from Go (deliberate, finding 6): Go's `egressHTTPClient` follows redirects
-/// with no https-only guard (an `http://` redirect would be followed UNPINNED); the Rust
-/// client REFUSES non-https redirects (matching shed-core's pinned session) — a Rust-side
-/// improvement kept on purpose, not parity.
+/// Redirects: the bus's rule, through the same function
+/// ([`crate::bus::same_origin_redirects`], plan 037 A25): a redirect is followed only within
+/// the configured server's own HTTPS origin, and any other is the answer (a non-2xx status,
+/// so the stream backs off as for any other error). The stream may present a client
+/// certificate and a bearer token, so neither must reach another host. DIVERGENCE from Go
+/// (deliberate, finding 6): Go's `egressHTTPClient` follows redirects with no guard; the
+/// Rust client follows only those the bus does.
 /// `client_certs` installs the control-scope credential source's client-certificate
 /// resolver, so an `auth.mode: mtls` server authenticates this stream by the CERTIFICATE
 /// (plan 001 D5's adaptive transport — read at handshake time, so a rotation never
@@ -285,13 +288,7 @@ pub fn egress_http_client(
     client_certs: Option<Arc<ClientCertResolver>>,
 ) -> Result<reqwest::Client, String> {
     let builder =
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.url().scheme() == "https" {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }));
+        reqwest::Client::builder().redirect(crate::bus::same_origin_redirects(server_url));
     if fingerprint.is_empty() {
         return builder.build().map_err(|e| e.to_string());
     }
@@ -1248,6 +1245,175 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(accepts.load(Ordering::SeqCst), 0, "no connection was made");
+        task.abort();
+    }
+
+    /// The egress stream follows a redirect only as the bus does (plan 037 A25): a pinned
+    /// server's 302 to another HTTPS listener, one even presenting the SAME pinned
+    /// certificate, is the answer, and that listener sees no connection, so neither the
+    /// client certificate nor anything else reaches it. A redirect within the configured
+    /// origin is still followed, with the certificate.
+    #[tokio::test]
+    async fn the_stream_never_follows_a_redirect_off_the_server_origin() {
+        use crate::bus::tests::{test_leaf, TlsRecorder};
+        const FOUND: &str = "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        const EMPTY_STREAM: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let found = |to: String| FOUND.replace("{to}", &to);
+        let leaf = test_leaf();
+        // A client certificate, armed directly (a layer below adoption's user rule).
+        let resolver = {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = rcgen::CertificateParams::new(Vec::<String>::new())
+                .unwrap()
+                .self_signed(&key)
+                .unwrap();
+            let certified = shed_core::tls::certified_key_from_pem(
+                &shed_core::csr::pem_encode(shed_core::csr::PEM_LABEL_CERTIFICATE, cert.der()),
+                &key.serialize_der(),
+            )
+            .unwrap();
+            let r = Arc::new(ClientCertResolver::new());
+            r.set(Some(Arc::new(certified)));
+            r
+        };
+        let pinned = |port: u16| {
+            EgressSubscriber::new(
+                "srv".into(),
+                format!("https://127.0.0.1:{port}"),
+                String::new(),
+                &leaf.2,
+                EgressCredentials {
+                    tokens: None,
+                    client_certs: Some(resolver.clone()),
+                },
+                CollectingAudit::new(),
+                silent_log(),
+            )
+        };
+
+        // Another origin: not followed; the 302 is the answer.
+        let other = TlsRecorder::spawn(&leaf, Arc::new(|_: &str, _: u16| EMPTY_STREAM.into()));
+        let other_port = other.port;
+        let home = TlsRecorder::spawn(
+            &leaf,
+            Arc::new(move |_: &str, _: u16| {
+                found(format!(
+                    "https://127.0.0.1:{other_port}{EGRESS_STREAM_PATH}"
+                ))
+            }),
+        );
+        match pinned(home.port).stream(&never_shutdown()).await {
+            Err(EgressStreamError::Other(m)) => {
+                assert_eq!(m, "egress stream: unexpected status 302")
+            }
+            other => panic!("want the 302 as the answer, got {other:?}"),
+        }
+        assert_eq!(
+            other.accepts.load(Ordering::SeqCst),
+            0,
+            "the listener the redirect named saw no connection: {:?}",
+            other.seen.lock().unwrap()
+        );
+        let home_seen = home.seen.lock().unwrap().clone();
+        assert_eq!(home_seen.len(), 1);
+        assert!(
+            home_seen[0].2,
+            "the configured server got the client certificate"
+        );
+
+        // The same origin: followed, with the certificate.
+        let same = TlsRecorder::spawn(
+            &leaf,
+            Arc::new(move |path: &str, port: u16| {
+                if path == "/moved" {
+                    EMPTY_STREAM.into()
+                } else {
+                    found(format!("https://127.0.0.1:{port}/moved"))
+                }
+            }),
+        );
+        pinned(same.port)
+            .stream(&never_shutdown())
+            .await
+            .expect("a same-origin redirect is followed");
+        let seen = same.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(),
+            [EGRESS_STREAM_PATH, "/moved"]
+        );
+        assert!(seen.iter().all(|s| s.2), "the certificate both times");
+    }
+
+    /// An expired held certificate is not something to present (plan 037 A25), against
+    /// the real control-scope source: pat's certificate is held, the server issues
+    /// admin's, and inside the refusal's wait the stream is still opened with pat's
+    /// certificate one second before it expires; once it has expired the stream is not
+    /// opened, and its error is the refusal alone.
+    #[tokio::test]
+    async fn an_expired_held_certificate_opens_no_stream_during_a_refusal() {
+        use crate::minter::tests::{pat_then_admin, MISMATCH};
+        const EXPIRY: i64 = 4_102_444_800;
+        let (fm, src, _mono, wall) = pat_then_admin(crate::minter::SCOPE_CONTROL, EXPIRY);
+        crate::minter::CredentialSource::token(&src).await.unwrap(); // pat's
+        let armed = src.cert_resolver().current().unwrap();
+        let (url, accepts, task) = counting_listener().await;
+        let sub = Arc::new(subscriber(
+            &url,
+            "",
+            Some(Arc::new(src.clone())),
+            CollectingAudit::new(),
+        ));
+
+        // One second before it expires: refused (the wait starts), and the stream is
+        // opened with pat's certificate.
+        wall.set(EXPIRY - 1);
+        let (tx, rx) = watch::channel(false);
+        let streaming = {
+            let sub = sub.clone();
+            tokio::spawn(async move { sub.stream(&rx).await })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while accepts.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stream was never opened"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = tx.send(true);
+        let _ = streaming.await;
+        assert_eq!(fm.calls.load(Ordering::SeqCst), 2, "refused once");
+        assert!(src.holds_certificate());
+        assert!(Arc::ptr_eq(&armed, &src.cert_resolver().current().unwrap()));
+
+        // Past its expiry, inside the same wait: not opened.
+        wall.set(EXPIRY + 1);
+        let before = accepts.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            // Bounded: a stream wrongly opened waits on a listener that never answers.
+            match tokio::time::timeout(Duration::from_secs(2), sub.stream(&never_shutdown())).await
+            {
+                Ok(Err(EgressStreamError::Other(m))) => {
+                    assert_eq!(m, MISMATCH, "the refusal alone")
+                }
+                other => panic!(
+                    "want the refusal, got {other:?} with {} connection(s)",
+                    accepts.load(Ordering::SeqCst) - before
+                ),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            before,
+            "no connection was made"
+        );
+        assert_eq!(
+            fm.calls.load(Ordering::SeqCst),
+            2,
+            "no mint inside the wait"
+        );
+        assert!(!src.holds_certificate());
         task.abort();
     }
 
