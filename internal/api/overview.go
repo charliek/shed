@@ -18,6 +18,11 @@ const (
 	// FeatureHTTPExec signals POST /api/sheds/{name}/exec, the NDJSON exec
 	// over HTTPS (see exec.go).
 	FeatureHTTPExec = "http_exec"
+	// FeatureExecLimits signals that GET /api/info carries "exec": the limits
+	// an exec request is refused above and the defaults a request that sets
+	// none gets (see execLimits). Advertised with FeatureHTTPExec; the info
+	// handler reports the member exactly when this token is in the set.
+	FeatureExecLimits = "exec_limits"
 	// FeatureMountSelection signals the create request's "mounts" field
 	// (and the stored selection on every shed). An older server ignores the
 	// field, so a client must not send it without this token.
@@ -43,7 +48,7 @@ const (
 // the returned value (an append can't alias a shared backing array). It is a
 // method because some tokens depend on the server's configuration.
 func (s *Server) serverFeatures() []string {
-	features := []string{FeatureOverview, FeatureHTTPExec, FeatureMountSelection}
+	features := []string{FeatureOverview, FeatureHTTPExec, FeatureExecLimits, FeatureMountSelection}
 	if s.cfg.ServiceClientsEnabled() {
 		features = append(features, FeatureServiceClients)
 	}

@@ -581,6 +581,41 @@ type ServerInfo struct {
 	// remote (no route between sheds or to the server host). Omitted on
 	// Firecracker and VZ, whose /api/info is unchanged.
 	Isolation string `json:"isolation,omitempty"`
+
+	// Exec is what POST /api/sheds/{name}/exec holds a request to, present
+	// exactly when Features carries "exec_limits". The values are the
+	// server's own, the same for every caller. Omitted by older servers.
+	Exec *ExecLimits `json:"exec,omitempty"`
+}
+
+// ExecLimits is the exec member of GET /api/info: the limits an HTTPS exec
+// request is refused above (Max*) and the values a request that sets none
+// gets (Default*). internal/api fills it from the same values its exec route
+// enforces. Durations are whole seconds, rounded down.
+type ExecLimits struct {
+	// MaxStdinBytes is exec.max_stdin_bytes: the decoded stdin a request
+	// may carry.
+	MaxStdinBytes int64 `json:"max_stdin_bytes"`
+	// MaxTimeoutSeconds is exec.max_timeout: the largest timeout_seconds.
+	MaxTimeoutSeconds int64 `json:"max_timeout_seconds"`
+	// DefaultTimeoutSeconds is the timeout of a request with no
+	// timeout_seconds: 60, or MaxTimeoutSeconds when that is lower.
+	DefaultTimeoutSeconds int64 `json:"default_timeout_seconds"`
+	// MaxOutputBytes is the largest max_output_bytes.
+	MaxOutputBytes int64 `json:"max_output_bytes"`
+	// DefaultOutputBytes is the output budget of a request with no
+	// max_output_bytes.
+	DefaultOutputBytes int64 `json:"default_output_bytes"`
+	// MaxConcurrentPerShed is exec.max_concurrent_per_shed: one more exec in
+	// the same shed is refused with 429 EXEC_LIMIT.
+	MaxConcurrentPerShed int `json:"max_concurrent_per_shed"`
+	// MaxArgvElements, MaxEnvKeys and MaxArgvEnvBytes bound argv's length,
+	// env's keys, and the bytes of argv plus env as the route counts them:
+	// every argv element, plus for each env entry its key, one "=" byte and
+	// its value.
+	MaxArgvElements int   `json:"max_argv_elements"`
+	MaxEnvKeys      int   `json:"max_env_keys"`
+	MaxArgvEnvBytes int64 `json:"max_argv_env_bytes"`
 }
 
 // FeatureMountSelection is the /api/info feature token for the create

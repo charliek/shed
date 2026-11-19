@@ -167,7 +167,18 @@ Returns server metadata and capabilities.
   "http_port": 8080,
   "backend": "vz",
   "auth_mode": "open",
-  "features": ["overview", "http_exec", "mount_selection", "source_binding"]
+  "features": ["overview", "http_exec", "exec_limits", "mount_selection", "source_binding"],
+  "exec": {
+    "max_stdin_bytes": 1048576,
+    "max_timeout_seconds": 3600,
+    "default_timeout_seconds": 60,
+    "max_output_bytes": 268435456,
+    "default_output_bytes": 4194304,
+    "max_concurrent_per_shed": 8,
+    "max_argv_elements": 1024,
+    "max_env_keys": 256,
+    "max_argv_env_bytes": 1048576
+  }
 }
 ```
 
@@ -187,7 +198,18 @@ valid certificate, since the listener runs `RequireAndVerifyClientCert`:**
   "https_port": 8443,
   "ca_fingerprint": "sha256:…",
   "ca_not_after": "2036-06-15T00:00:00Z",
-  "features": ["overview", "http_exec", "mount_selection", "service_clients", "network_profiles", "source_binding"]
+  "features": ["overview", "http_exec", "exec_limits", "mount_selection", "service_clients", "network_profiles", "source_binding"],
+  "exec": {
+    "max_stdin_bytes": 1048576,
+    "max_timeout_seconds": 3600,
+    "default_timeout_seconds": 60,
+    "max_output_bytes": 268435456,
+    "default_output_bytes": 4194304,
+    "max_concurrent_per_shed": 8,
+    "max_argv_elements": 1024,
+    "max_env_keys": 256,
+    "max_argv_env_bytes": 1048576
+  }
 }
 ```
 
@@ -204,6 +226,7 @@ never renamed; treat an unknown token as absent.
 |-------|------------|---------|
 | `overview` | always | `GET /api/overview`, the single-call host snapshot |
 | `http_exec` | always | [`POST /api/sheds/{name}/exec`](#post-apishedsnameexec) |
+| `exec_limits` | always (with `http_exec`) | This response carries `exec`: the limits an exec request is refused above, and the defaults a request that sets none gets (below) |
 | `mount_selection` | always | The create request's `mounts` field |
 | `service_clients` | mtls mode with `auth.clients` configured | This server accepts [service clients](#service-clients) |
 | `network_profiles` | Firecracker; remote unless its `firewall.mode` is `any` | The create request's `network` field (`open` or `isolated`) |
@@ -213,6 +236,33 @@ never renamed; treat an unknown token as absent.
 The `shed` CLI refuses `--mounts none|<names>` against a server without
 `mount_selection`, and `--network isolated` against one without
 `network_profiles`, before it sends anything.
+
+`exec` is present exactly when `features` lists `exec_limits` (an older server
+sends neither). It holds the limits of
+[`POST /api/sheds/{name}/exec`](#post-apishedsnameexec), read from the same
+values the route enforces, so a client can size a request instead of learning
+a limit from a refusal. They are the server's own, from its `exec:` config and
+fixed values: every caller, a person or a [service client](#service-clients),
+reads the same ones and is held to them.
+
+| Member | Kind | Meaning |
+|--------|------|---------|
+| `max_stdin_bytes` | limit | `stdin`, once decoded, is refused above this (`exec.max_stdin_bytes`, default 1 MiB) |
+| `max_timeout_seconds` | limit | `timeout_seconds` is refused above this (`exec.max_timeout`, default 1h) |
+| `default_timeout_seconds` | default | The timeout of a request with no `timeout_seconds`: 60, or `max_timeout_seconds` when that is lower |
+| `max_output_bytes` | limit | `max_output_bytes` is refused above this (256 MiB) |
+| `default_output_bytes` | default | The output budget of a request with no `max_output_bytes` (4 MiB) |
+| `max_concurrent_per_shed` | limit | One more exec in a shed already running this many is refused with `429 EXEC_LIMIT` (`exec.max_concurrent_per_shed`, default 8) |
+| `max_argv_elements` | limit | `argv` is refused above this many elements (1024) |
+| `max_env_keys` | limit | `env` is refused above this many keys (256) |
+| `max_argv_env_bytes` | limit | `argv` and `env` together are refused above this many bytes (1 MiB): the bytes of every `argv` element plus, for each `env` entry, its key, one `=` byte and its value |
+
+Times are whole seconds, rounded down; an `exec.max_timeout` that is not a
+whole number of seconds is reported as the largest `timeout_seconds` the route
+accepts. A `max_*` member is the point past which a request is refused, not a
+promise that a request at every limit at once fits: the request body as a
+whole is also capped (base64 `stdin` plus 1 MiB), and a body over that is
+refused with `413 REQUEST_TOO_LARGE`.
 
 The `backend` field reflects the resolved backend for this server (`vz`,
 `firecracker` or `remote`). When the server is configured with
@@ -563,6 +613,9 @@ on a shed it owns. Advertised by the
 | `max_output_bytes` | No | 4194304 (4 MiB) | Output budget for stdout and stderr together, at most 268435456 (256 MiB). |
 
 Unknown fields and trailing data after the JSON object are refused (`400`).
+
+A server that advertises `exec_limits` reports this server's values for each of
+these limits and defaults in [`GET /api/info`](#get-apiinfo) `exec`.
 
 **Response (200 OK, `Content-Type: application/x-ndjson`):** one JSON object
 per line, flushed as output arrives:

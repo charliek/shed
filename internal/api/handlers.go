@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,13 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		DefaultImage: s.cfg.ActiveDefaultImage(),
 		HTTPSPort:    s.cfg.HTTPSPort,
 		Features:     s.serverFeatures(),
+	}
+	// The exec limits travel with their token and only with it. They are
+	// server-wide (no caller is held to others). A caller who can read this
+	// route can call the exec route, subject to the same shed access and
+	// ownership checks as before; reading the limits grants nothing.
+	if slices.Contains(info.Features, FeatureExecLimits) {
+		info.Exec = s.execLimits().report()
 	}
 	// Only a backend that reports its own capabilities (remote) states its
 	// isolation kind; Firecracker and VZ answer exactly as before.

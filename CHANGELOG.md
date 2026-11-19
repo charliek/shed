@@ -697,6 +697,16 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   egress decisions and its sessions are not recorded yet. Before, such an entry left only
   server-log lines. See [Configuration › Audit
   log](https://charliek.github.io/shed/reference/configuration/#audit-log).
+- **API: `/api/info` reports the exec limits.** A new `exec` member, with the new feature
+  token `exec_limits` (always advertised, beside `http_exec`), gives the limits an HTTPS exec
+  request is refused above (`max_stdin_bytes`, `max_timeout_seconds`, `max_output_bytes`,
+  `max_concurrent_per_shed`, `max_argv_elements`, `max_env_keys`, `max_argv_env_bytes`) and
+  the defaults a request that sets none gets (`default_timeout_seconds`,
+  `default_output_bytes`). They are read from the same values the exec route enforces, the
+  configured `exec:` settings included, and are the same for every caller, service clients
+  included, so an orchestrator can size its requests instead of learning a limit from a
+  refusal. A client that ignores unknown members is unaffected. See [API › GET
+  /api/info](https://charliek.github.io/shed/reference/api/#get-apiinfo).
 
 #### Changed
 
