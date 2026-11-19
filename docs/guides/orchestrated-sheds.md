@@ -5,8 +5,12 @@ shed-server it does not administer. It authenticates as a **service client**: an
 mTLS identity that can create sheds within a policy, run commands in them over
 HTTPS, and delete them, and can see or touch nothing else on the server. Its
 sheds never get the credential bus, get no server mounts unless its policy
-names some, and by default, on Firecracker, get an `isolated` network that
-reaches the internet and nothing else.
+names some, and by default, on Firecracker, get an `isolated` network: the
+internet, the server's `network.allow_cidrs` and the gateway's own ports for
+its egress proxy and server mounts, not the host, the LAN or other sheds. VZ has
+no isolation, and the remote backend isolates by network topology; the rule is
+in [Security › Network
+profiles](../reference/security.md#network-profiles).
 
 This guide sets one up. The model and its limits are in [Security › Service
 clients](../reference/security.md#service-clients); every key is in
@@ -90,8 +94,10 @@ that client's sheds (see [What a leaked bundle gives](#what-a-leaked-bundle-give
 ## 4. Call the API
 
 The client talks to the server's HTTPS port with its certificate, and pins the
-server's self-signed certificate by `tls_cert_fingerprint`. With `curl` and
-`jq`:
+server's self-signed certificate by `tls_cert_fingerprint`. Step 2 wrote the
+bundle as root with mode `0600`, so run these as a user who can read it: as
+root, or after you have put the bundle where the orchestrator's own user reads
+it. With `curl` and `jq`:
 
 ```bash
 jq -r .client_cert nocturn-bundle.json > client.crt
@@ -499,8 +505,11 @@ create sheds, run commands as root in its live sheds, read what the
 orchestrator put in them, and delete them. Through the API it cannot touch a
 person's sheds or another client's, and it gives no admin route and no SSH.
 What those commands can reach on the network and the host is set by the
-shed's profile and mounts, not by the certificate: an `isolated` shed reaches
-only the internet (and its own egress proxy), while with `policy.network:
+shed's profile and mounts, not by the certificate: an `isolated` shed on
+Firecracker reaches the internet, the server's `network.allow_cidrs` and its own
+gateway ports (egress proxy, server mounts), not the rest of the host or the
+LAN (the full rule is in [Security › Network
+profiles](../reference/security.md#network-profiles)), while with `policy.network:
 open` (required on VZ) a command reaches whatever the host's NAT reaches,
 including the host, the LAN and other open sheds; the client's
 `server_mounts` are host directories it can read and, unless read-only, write.
