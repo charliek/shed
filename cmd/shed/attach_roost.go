@@ -528,7 +528,10 @@ func (a *roostAttach) ensureSSHAlias(alias, shedName string, entry *config.Serve
 		return fmt.Errorf("server %q: %w", a.shedServer, unmanaged)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to add Host %s to %s: %w", alias, tildePath(a.sshConfigPath), err)
+		// The alias holds the shed's name; one the writer refused
+		// (sshconfig.Entry.Validate) is shown escaped, and nothing was written.
+		return fmt.Errorf("failed to add Host %s to %s: %w",
+			sdkbootstrap.SafeText(alias), sdkbootstrap.SafeText(tildePath(a.sshConfigPath)), err)
 	}
 	switch outcome {
 	case sshconfig.AddedEntry:

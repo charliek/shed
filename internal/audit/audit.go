@@ -114,6 +114,18 @@ func UserIdentity(user string, implicit, admin, script bool, subject, serial str
 	return id
 }
 
+// PersonIdentity is the one rule both doors (the API's and the SSH server's)
+// use to record a caller they take for a person: UserIdentity when person is
+// set and the caller is named (user) or the implicit user; UnknownIdentity
+// otherwise. A caller that names no person, a user that is neither named nor
+// implicit included, is recorded as unknown, never passed off as a person.
+func PersonIdentity(person bool, user string, implicit, admin, script bool, subject, serial string) Identity {
+	if !person || (user == "" && !implicit) {
+		return UnknownIdentity()
+	}
+	return UserIdentity(user, implicit, admin, script, subject, serial)
+}
+
 // SystemIdentity is the server acting for itself.
 func SystemIdentity() Identity { return Identity{Kind: KindSystem} }
 

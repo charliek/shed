@@ -109,8 +109,8 @@ func (l execLimits) bodyLimit() int64 {
 }
 
 // report is the /api/info exec member. Durations are whole seconds rounded
-// down: the route compares whole-second requests with the exact duration, so
-// the largest timeout_seconds it accepts is exactly the rounded-down value.
+// down; the route compares a request's timeout_seconds with
+// maxTimeoutSeconds(), the same number reported here.
 func (l execLimits) report() *config.ExecLimits {
 	return &config.ExecLimits{
 		MaxStdinBytes:         l.maxStdinBytes,

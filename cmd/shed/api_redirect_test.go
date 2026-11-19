@@ -154,9 +154,9 @@ func TestAPIClientFollowsNoRedirect(t *testing.T) {
 			}
 		})
 	}
-	t.Run("the ping", func(t *testing.T) {
-		if client.Ping() {
-			t.Error("Ping answered true for a 302")
+	t.Run("the status probe", func(t *testing.T) {
+		if status, _ := client.Status(); status == serverStatusOnline {
+			t.Error("Status answered online for a 302")
 		}
 	})
 	if seen := plain.requests(); len(seen) != 0 {

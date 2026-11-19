@@ -749,6 +749,10 @@ func TestSSHIdentity(t *testing.T) {
 		{"client", backend.ClientPrincipal("build-1"), `{"kind":"unknown"}`},
 		{"system", backend.SystemPrincipal(), `{"kind":"unknown"}`},
 		{"none", backend.Principal{}, `{"kind":"unknown"}`},
+		// The API's auditIdentity records the same caller the same way
+		// (TestAuditIdentityOfEachCaller): a user that is neither named nor
+		// implicit is unknown, never a person.
+		{"a user with no name, not implicit", backend.Principal{Kind: backend.PrincipalUser, Admin: true}, `{"kind":"unknown"}`},
 	} {
 		if got := mustJSON(t, sshIdentity(tc.p, "SHA256:abc")); got != tc.want {
 			t.Errorf("%s: identity = %s, want %s", tc.name, got, tc.want)

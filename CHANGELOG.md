@@ -72,7 +72,10 @@ All notable changes to this project will be documented in this file.
   NDJSON `stdout`/`stderr` frames and a final `exit` frame (`124` with `timed_out` on a
   timeout; no `exit` frame means the result was lost). A stopped shed is
   `409 SHED_NOT_RUNNING` (exec never starts one). New `exec:` config block:
-  `max_stdin_bytes` (1 MiB), `max_timeout` (1h), `max_concurrent_per_shed` (8).
+  `max_stdin_bytes` (1 MiB; at most 1 GiB), `max_timeout` (1h; at most `168h`) and
+  `max_concurrent_per_shed` (8; at most 4096); a value above its bound fails config load,
+  naming the key, the value and the bound. See [Configuration › HTTPS
+  exec](https://charliek.github.io/shed/reference/configuration/#https-exec).
 - **Server (Firecracker): the `isolated` network profile.** `shed create --network isolated`
   (or the API's `network` field) gives a shed the internet and nothing else: not the host,
   other sheds, RFC 1918, CGNAT/tailnet, link-local and metadata, multicast, and no IPv6, with
@@ -273,9 +276,19 @@ All notable changes to this project will be documented in this file.
   the URL a redirect names; before, an endpoint holding the pinned certificate could pass a
   bearer token on to a plain-`http` URL. shed-server's API answers no request with a
   redirect, so nothing that works today changes.
+- **CLI: a shed name from a server never reaches `~/.ssh/config` unchecked (security).**
+  `shed ssh-config` (printed, `--install`) and `shed attach` wrote each shed's name from the
+  server's list into a `Host` and a `User` line as it came, so a hostile server could add
+  lines (a `ProxyCommand`) to the managed block. A shed whose name is not a shed name is now
+  skipped, with one warning line naming it escaped, and the other sheds are written; the ssh
+  config writer itself refuses any stanza whose alias, user, host name, port or paths could
+  change what it says, and writes nothing then; the host name must be a literal host name
+  or address (no `%` token, shell syntax, `=` or leading `-`). An error answer from a
+  server (a JSON request's or an event stream's), a create's progress lines and warnings, a
+  shed's status and status reason, and a server's name are shown with their control
+  characters escaped, as other server text is.
 - **Server: a graceful stop logs each step once.** `Shutting down SSH server...` was written
-  twice; and a new line, `Closing entry gates...`, comes before every server's shutdown line,
-  when the gates for entries into service clients' sheds close.
+  twice.
 - **Desktop: a cloud shed that is stopping shows `stopping`, and a shed's reason shows beside
   its status.** The shared core now decodes the remote backend's `stopping` status (it read
   `unknown`) and a shed's `status_reason`. The Sheds pane shows the reason the way `shed list`
@@ -439,7 +452,7 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   switch, with the local admin under another name); and the local admin on a backup key with
   one host name and `--identity-file` on each entry.
 - **CLI: upgrade every server first, then enrol every mtls entry again with `shed server
-  update <name> --refetch`**, once per entry, on every machine. The CLI refuses, before it
+  update NAME --refetch`** (`NAME` the entry's name), once per entry, on every machine. The CLI refuses, before it
   sends any request or runs `ssh`, an entry whose stored certificate names no user (a server
   older than 0.10.0 issued it) or names a user the entry does not record (an older CLI saved
   the entry, it was edited by hand, or an enrolment was interrupted); the refetch records the
@@ -587,8 +600,12 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   reference). If the account service
   is slow, a new key's logins are refused until a pull has brought it, and a later attempt then
   succeeds. New log lines: `directory: shed-name key <fp> for an existing shed: pulling the list
-  in the background ...`, and at most once an hour `directory: in the last hour <n> unknown keys
-  were offered as a name that is no shed here and <m> as an existing shed's name (...)`. A
+  in the background (at most once every 5 minutes while pulls succeed, once every 15 minutes
+  while they fail)`, and at most once an hour `directory: in the last hour <n> unknown keys
+  were offered as a name that is no shed here and <m> as an existing shed's name (<p> asked for
+  a pull, ...)`. The first-login line states its rates the same way: `directory: unknown key
+  <fp>: pulling the list (at most once a minute while pulls succeed, once every 15 minutes
+  while they fail)` (it said `once every 15m0s`). A
   server with GitHub logins (`auth.users`) keeps its rule. See [Security › A new
   person](https://charliek.github.io/shed/reference/security/#a-new-person).
 - **The directory contract, version 1, text change** (no wire, fixture or key change): an
@@ -621,7 +638,7 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   --refetch`, or by a re-enrolment when it has none; a certificate for the implicit user of a
   server with no user list neither sets nor clears it. When a re-enrolment is issued a
   certificate for another user (`ssh` offered a key that belongs to someone else), the command
-  fails, naming both users, and nothing is written or used; `shed server update <name>
+  fails, naming both users, and nothing is written or used; `shed server update NAME
   --refetch --allow-user-change` makes the change. `shed server list` shows STATUS `refused`
   for an entry the CLI refuses and prints why once to stderr. The roost provider presents a
   stored certificate under the same rule. The rule is about what a process takes up: a process
@@ -637,8 +654,9 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   server with no user list). `shed server list` gains a `USER` column, worked out from local
   files with no request and writing nothing: the user the entry records; for one that records
   none, `(implicit)` when its stored certificate is the implicit user's, else `-` (also for a
-  plain-HTTP or control-token entry, and for a hand-edited `user` that is not a valid user
-  name, which is never printed). A certificate's own name is never shown for an entry that
+  plain-HTTP entry, a control-token entry that records no user, and a hand-edited `user`
+  that is not a valid user name, which is never printed). An entry whose server goes back to
+  issuing control tokens keeps, and shows, the user it recorded. A certificate's own name is never shown for an entry that
   does not record it: such an entry shows `-` and STATUS `refused`. In JSON, both commands
   gain `user` (the recorded user name, omitted when there is none) and `user_implicit`
   (`true` when the stored certificate is the implicit user's); the text's `(implicit)` and
@@ -701,8 +719,12 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   key on removable media) stops accepting new connections and must be started again once the
   key is back. A refetch that races another process's `--identity-file` is refused with
   nothing saved, and an add or a refetch whose key file is replaced while it runs saves
-  nothing. JSON results gain `identity_file`. Without the field every argv and stanza is as
-  before.
+  nothing. JSON results gain `identity_file` (`shed --json server list` included). The
+  stanzas `shed ssh-config --install` and `shed attach` wrote are not rewritten when the key
+  is changed or cleared: after a change run `shed ssh-config --install` again (and `shed
+  attach` rewrites its alias at its next run); after clearing it, run `shed ssh-config
+  --uninstall`, then `shed ssh-config --install`, and attach again. Without the field every
+  argv and stanza is as before.
 - **Desktop and host-agent: an entry's own SSH key, `identity_file`.** The app and its
   credential broker (embedded or the `shed-host-agent` daemon) read the field the CLI writes,
   with the CLI's value rule. Every `ssh` they run for the entry passes the key (`-i <path> -o
@@ -766,15 +788,19 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   command. Each tunnel a person opens into a client's shed through the HTTPS Connect API (what
   `shed tunnels` uses) writes a new `connect` line: the person as for an HTTPS exec (with the
   certificate's `subject` and `serial`), `remote`, `shed`, `owner` and `port`; neither line
-  carries a request id or anything else the caller sent. Each is written once the entry has happened (the command has started in the shed,
-  or the connection or tunnel is open), so a refused or failed attempt writes none; nor does a
-  person's own shed, or `_bootstrap`. A shed whose owner or user changes between the check of
-  an entry and the entry itself (during a wake included) is refused as not found. When the
-  server stops, it refuses new entries into a client's sheds first, then waits for the
-  entries it has admitted to write their lines before it closes the log. Starting, stopping,
-  deleting or resetting a client's shed, a snapshot of it, its egress rules, reading its
-  egress decisions and its sessions are not recorded yet. Before, such an entry left only
-  server-log lines. See [Configuration › Audit
+  carries a request id or anything else the caller sent. Each is written once the entry has
+  happened (the command was handed to the shed's agent, where it may still fail to start, or
+  the connection or tunnel is open), so a refused attempt, or one that failed before it reached
+  the agent, writes none; nor does a person's own shed, or `_bootstrap`. A shed whose owner or
+  user changes between the check of an entry and the entry itself (during a wake included) is
+  refused as not found. When the server stops, it refuses new `ssh` and `connect` entries into
+  a client's sheds first (logging `Closing entry gates...` before every server's shutdown
+  line), then waits for the entries it has admitted to write their lines before it closes the
+  log. A person's HTTPS exec is not covered by that: its `exec.end` line is written when the
+  exec ends, so one still running at the 30-second shutdown bound leaves none. Starting,
+  stopping, deleting or resetting a client's shed, a snapshot of it, its egress rules, reading
+  its egress decisions, its sessions or its record are not recorded yet. Before, such an entry
+  left only server-log lines. See [Configuration › Audit
   log](https://charliek.github.io/shed/reference/configuration/#audit-log).
 - **API: `/api/info` reports the exec limits.** A new `exec` member, with the new feature
   token `exec_limits` (always advertised, beside `http_exec`), gives the limits an HTTPS exec
@@ -795,13 +821,14 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   profile's name. `network_profile` is unchanged beside it. Records also carry `arch`
   (`amd64` or `arm64`): the host's on Firecracker and VZ, the size's on remote (stored at
   create, or, when a lost record is rebuilt, the architecture the cloud reports for the VM's
-  boot disk, never the one the sizes configured now give its machine type; a remote shed
-  created before this reports none). A remote record now always carries `"mounts": {"mode": "selected"}`,
+  boot disk; when the cloud reports none, the one the configured sizes give its machine type,
+  only if they all agree, else none; a remote shed created before this reports none). A remote record now always carries `"mounts": {"mode": "selected"}`,
   so `shed list` shows `none` for its mounts where it showed `-`. `GET /api/info` gains
   `guest_arch` (the host's on Firecracker and VZ; on remote the one `arch` every size shares,
   omitted when they mix) and the always-advertised feature token `uniform_shed_record`.
   `isolation` and a local `arch` are computed when the record is reported; nothing stored
-  changes. A client that ignores unknown members is unaffected. See [API › GET
+  changes. `shed --json list` carries `isolation` and `arch` as `shed --json create` does.
+  A client that ignores unknown members is unaffected. See [API › GET
   /api/sheds](https://charliek.github.io/shed/reference/api/#get-apisheds).
 
 #### Changed
@@ -873,7 +900,8 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   "admin":true,"script":false,"subject":…,"serial":…}`, with the user's name, whether they are
   an admin, whether they used a script key, the key's fingerprint as `subject` and the client
   certificate's serial. The one user of a server with no user list is `implicit: true` with
-  no `user` (and, in `open` mode, no `subject` or `serial`). A `reap` line gains
+  no `user`; in `open` mode an HTTPS line (`exec.end`, `connect`) has no `subject` or
+  `serial`, while an `ssh` line still carries the key's fingerprint as `subject`. A `reap` line gains
   `"identity":{"kind":"system"}`. A service client's identity is unchanged. There is no alias
   for the old kind: a filter on `kind == "admin"` matches nothing written after the upgrade,
   and rotated files keep the old shape. See [Configuration › Audit
@@ -904,7 +932,7 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   users cannot both win, and a refetch does not overwrite another process's
   `--allow-user-change`. The loser writes nothing and fails. A command killed between writing
   the certificate and saving `config.yaml` leaves an entry the CLI refuses (nothing is sent)
-  until `shed server update <name> --refetch`; a save whose old certificate cannot be put back
+  until `shed server update NAME --refetch`; a save whose old certificate cannot be put back
   fails the command, naming that refetch. A re-enrolment that would record an entry's first
   user is used only once `config.yaml` records it: if the save fails, the command fails and
   says why. A re-enrolment that cannot read the entry under its lock fails closed, and an
@@ -917,17 +945,6 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   before the network was online, a directory server with no kept copy failed its first pull
   and ran with only its local admins until the next attempt, 15 minutes later. See the
   upgrade notes above for an edited deb unit and a unit `shed-server install` wrote.
-- **Server: the `exec:` settings have upper bounds.** `exec.max_stdin_bytes` at most
-  `1073741824` (1 GiB), `exec.max_timeout` at most `168h` (7 days),
-  `exec.max_concurrent_per_shed` at most `4096`. **A server whose config sets a value above
-  its bound now refuses to start**, with an error naming the key, the value and the bound;
-  lower the value. Defaults and the lower bounds are unchanged. Before, a very large
-  `max_stdin_bytes` overflowed the request-body cap and every exec was refused as too large.
-  Separately, the exec route now compares `timeout_seconds` with `max_timeout` in whole
-  seconds, so a request whose `timeout_seconds` is far past the maximum (up to the largest
-  integer a JSON number carries) is refused; multiplied by a second first, such a number
-  overflowed and the request ran with a nonsense timeout. See [Configuration › HTTPS
-  exec](https://charliek.github.io/shed/reference/configuration/#https-exec).
 
 #### Removed
 

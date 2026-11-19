@@ -183,7 +183,7 @@ the orchestrator passes in the exec request's `env`:
 
 ```bash
 $API -d '{"argv":["bash","-lc","git clone \"https://x-access-token:${TOKEN}@github.com/org/repo.git\" ~/repo"],
-          "env":{"TOKEN":"<short-lived token>"},"timeout_seconds":300}' \
+          "env":{"TOKEN":"SHORT_LIVED_TOKEN"},"timeout_seconds":300}' \
   https://shed-host:8443/api/sheds/nocturn-demo/exec | jq -c 'select(.t == "exit")'
 ```
 
@@ -356,7 +356,9 @@ requires isolation checks `isolation` on the record its create returns, not
 A server that does not list `uniform_shed_record` in `GET /api/info`
 `features` sends no `isolation` on a record: treat such a shed as not
 isolated, or read the server's kind from `/api/info` (`backend`, and
-`isolation: "topology"` on remote).
+`isolation: "topology"` on remote, which names the backend's kind: check that
+`features` also lists `network_profiles`, which says the server offers
+`isolated` now).
 
 ### A client on the remote backend
 

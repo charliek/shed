@@ -130,6 +130,44 @@ func TestListJSONUser(t *testing.T) {
 	}
 }
 
+// `shed list --json` carries the record's isolation and arch, under the
+// names `shed --json create` and the API use, and omits each when the server
+// sent none (an older server).
+func TestListJSONIsolationAndArch(t *testing.T) {
+	sheds := []listedShed{
+		{shed: config.Shed{Name: "fc", Status: config.StatusStopped, NetworkProfile: "isolated", Isolation: "firewall", Arch: "amd64"}, server: "srv"},
+		{shed: config.Shed{Name: "old", Status: config.StatusStopped, NetworkProfile: "open"}, server: "srv"},
+	}
+	b, err := json.Marshal(shedListJSON(sheds))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got[0]["isolation"] != "firewall" || got[0]["arch"] != "amd64" {
+		t.Errorf("first shed: isolation %v, arch %v; want firewall, amd64", got[0]["isolation"], got[0]["arch"])
+	}
+	for _, key := range []string{"isolation", "arch"} {
+		if v, ok := got[1][key]; ok {
+			t.Errorf("a shed with no %s carries %v", key, v)
+		}
+	}
+	// The same names as the record the API and `--json create` carry.
+	created, err := json.Marshal(sheds[0].shed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record map[string]any
+	if err := json.Unmarshal(created, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record["isolation"] != got[0]["isolation"] || record["arch"] != got[0]["arch"] {
+		t.Errorf("list JSON %v disagrees with the record %v", got[0], record)
+	}
+}
+
 // `shed snapshot list` follows the default table's rule.
 func TestSnapshotTableUserColumn(t *testing.T) {
 	at := time.Date(2026, 1, 2, 3, 4, 0, 0, time.UTC)

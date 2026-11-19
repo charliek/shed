@@ -278,7 +278,9 @@ every configured size shares, and it is omitted when the sizes mix
 architectures: each shed record's `arch` then says. An older server omits it.
 
 `isolation` is present on the remote backend only (`topology`): how that
-backend provides the isolated profile. What a given shed has is its record's
+backend provides the isolated profile. It names the backend's kind whether or
+not the current `firewall` config offers `isolated` (`network_profiles` says
+whether it does). What a given shed has is its record's
 [`isolation`](#get-apisheds).
 
 `ca_fingerprint` / `ca_not_after` are present **only in mtls mode**: the
@@ -340,7 +342,7 @@ Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mo
 | `mounts` | object | The server mounts (top-level `mounts:` in the server config) the shed gets on every start: `{"mode": "all"}` (every server mount, the default) or `{"mode": "selected", "names": [...]}` (only those; no `names` means none). A shed created before mount selection existed reports `{"mode": "all"}`. A remote shed, which mounts nothing, always reports `{"mode": "selected"}`. |
 | `network_profile` | string | `open` or `isolated`, fixed at create. A shed created before network profiles existed reports `open`. See [Security › Network profiles](security.md#network-profiles). |
 | `isolation` | string | The isolation in force for this shed: `none` (its profile is `open`), `firewall` (`isolated`, held by firewall rules the server installs on its own host: Firecracker) or `topology` (`isolated`, held by the network giving the shed no route to another shed or to the server's private network: [remote](remote-backend.md)). It fails closed: an `isolated` shed on a backend that cannot hold isolation now reports `none` (a remote server whose `firewall` config admits more than the server), never the profile's name. It names the kind of isolation the server's configuration provides; it is not a live check that the network isolates the shed at this moment. A client that requires isolation reads this member, not `network_profile`, and treats a record without it (an older server) as not isolated. |
-| `arch` | string | The guest's CPU architecture, `amd64` or `arm64`. Firecracker and VZ: the host's. Remote: the shed's size's, stored at create; when a lost record is rebuilt from the cloud, the architecture the cloud reports for the VM's boot disk (none when the cloud reports none and the configured sizes for its machine type disagree); a remote shed created by a server older than this member reports none. |
+| `arch` | string | The guest's CPU architecture, `amd64` or `arm64`. Firecracker and VZ: the host's. Remote: the shed's size's, stored at create; when a lost record is rebuilt from the cloud, the architecture the cloud reports for the VM's boot disk (when the cloud reports none, the configured sizes' for its machine type if they all agree; none when they disagree or no configured size has that machine type); a remote shed created by a server older than this member reports none. |
 
 Every route that returns a shed record (this list, `GET /api/sheds/{name}`,
 create (JSON and the stream's `complete` event), start, stop, assign, reset,

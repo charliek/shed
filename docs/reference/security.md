@@ -228,8 +228,9 @@ Directory guide](../guides/user-directory.md) covers the operator's steps.
   list: users, each a name, an admin flag and keys. A pull is due at start,
   `auth.directory.refresh` after each good pull, 15 minutes after a failed one
   (or at the end of the service's `Retry-After`, in seconds, when that is
-  later, up to one hour), on `shed users refresh`, and on a new person's
-  first login.
+  later, up to one hour), on `shed users refresh`, and on a first login
+  (`_bootstrap`) or a login to an existing shed by a key the server does not
+  know (see [A new person](#a-new-person)).
 - **Transport.** HTTPS with the system's certificate checks; the environment's
   proxy settings apply. No redirect is followed. Plain HTTP only with
   `allow_plain_http`, and only to a loopback address (checked on the address
@@ -435,12 +436,17 @@ At most one check of a shed name runs at a time, as the server itself, within
 check that takes longer asks for no pull.
 
 The server logs each such pull: `directory: unknown key <fp>: pulling the
-list ...` for `_bootstrap`, and `directory: shed-name key <fp> for an existing
-shed: pulling the list in the background ...` for a shed name. Once an hour,
-when there was any, it logs how many unknown keys were offered under a shed
-name: `directory: in the last hour <n> unknown keys were offered as a name
-that is no shed here and <m> as an existing shed's name (<p> started a pull,
-<q> skipped while a check ran, <e> checks failed: <first error>)`.
+list (at most once a minute while pulls succeed, once every 15 minutes while
+they fail)` for `_bootstrap`, and `directory: shed-name key <fp> for an
+existing shed: pulling the list in the background (at most once every 5
+minutes while pulls succeed, once every 15 minutes while they fail)` for a
+shed name. Once an hour, when there was any, it logs how many unknown keys
+were offered under a shed name: `directory: in the last hour <n> unknown keys
+were offered as a name that is no shed here and <m> as an existing shed's name
+(<p> asked for a pull, <q> skipped while a check ran, <e> checks failed:
+<first error>)`. `<p>` counts the offers that asked for a pull; such a pull
+may join one already asked for, or not be sent at all (a `Retry-After`, or the
+failed state's rate, when it would start).
 
 The server holds **one outstanding `Retry-After`** for itself: neither the
 schedule nor an unknown key pulls before it ends. Only an admin's `shed users
@@ -1101,14 +1107,16 @@ admin is told the shed does not exist), and the shed holds what
 the orchestrator put there, so this is the record of who went in over SSH. The line
 names the person as above (by user name and key fingerprint), the peer's
 address, the shed, its client and the channel, never the command. It is
-written once the entry has happened (the command has started in the shed, or
-the forwarded connection is open), so a refused or failed attempt writes none
-and leaves only its server-log line.
+written once the entry has happened (the command was handed to the shed's
+agent, where it may still fail to start, or the forwarded connection is open),
+so a refused attempt, or one that failed before it reached the agent, writes
+none and leaves only its server-log line.
 
 The log is not yet a complete record of what a person does to a client's
 shed. Of the ways a person (an admin) can reach into one:
 
-- **Recorded:** an HTTPS exec (`exec.end`); a shell, a command, sftp or scp,
+- **Recorded:** an HTTPS exec (`exec.end`, written when the exec ends: one
+  still running when a stopping server's 30-second bound passes leaves none); a shell, a command, sftp or scp,
   or a connection forwarded over SSH (`ssh`); a tunnel through the HTTPS
   Connect API, as `shed tunnels` opens (`connect`, once the tunnel is
   established).

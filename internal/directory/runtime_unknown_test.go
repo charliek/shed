@@ -189,6 +189,12 @@ func TestUnknownKeyHealthyRate(t *testing.T) {
 	if n := srv.log.count("unknown key " + bob.fp); n != 1 {
 		t.Errorf("the unknown-key pull logged %d times, want 1:\n%s", n, srv.log)
 	}
+	// The line states its rates as the shed-name line does, from the
+	// constants, in the words the security reference quotes.
+	if n := srv.log.count("directory: unknown key " + bob.fp + ": pulling the list " +
+		"(at most once a minute while pulls succeed, once every 15 minutes while they fail)"); n != 1 {
+		t.Errorf("the unknown-key line is not the documented one:\n%s", srv.log)
+	}
 	refusedAtOnce(t, svc, srv, cy.fp, "a second unknown key at once")
 	clock.set(t0.Add(wantFirstLoginEvery - time.Second))
 	refusedAtOnce(t, svc, srv, cy.fp, "a second unknown key a second before the minute")

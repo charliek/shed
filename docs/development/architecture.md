@@ -235,7 +235,7 @@ The `isolated` network profile on Firecracker: renders this server's two nftable
 
 ### `internal/audit`
 
-The JSON Lines audit log, `audit.jsonl` (service-client requests, HTTPS execs, reaps), written `0600` and rotated at 50 MiB.
+The JSON Lines audit log, `audit.jsonl` (service-client requests, HTTPS execs, reaps, and a person's entries into a service client's shed: over SSH, the `ssh` line, and through the HTTPS Connect API, the `connect` line), written `0600` and rotated at 50 MiB.
 
 ### `internal/servertls`
 
@@ -305,5 +305,5 @@ A shed a service client owns has one more exit: once it is older than the client
 | `/etc/shed/server.yaml` | Server configuration |
 | `{state_dir}/` | Identity material: `host_key`, `tls_cert.pem`/`tls_key.pem`, the mtls client CA (`ca_cert.pem`/`ca_key.pem`) and `github_keys/`. `state_dir` defaults to `/etc/shed` as root and `~/.shed` otherwise |
 | `~/.shed/env` (`env_file`) | Variables passed to the in-VM `git clone` of `repo` (never for a service client's sheds) |
-| `<instance_dir parent>/audit.jsonl` | Audit log: service-client requests, HTTPS execs, reaps (`/var/lib/shed/firecracker/audit.jsonl` by default) |
+| `<instance_dir parent>/audit.jsonl` | Audit log: service-client requests, HTTPS execs, reaps, and a person's `ssh` and `connect` entries into a service client's shed (`/var/lib/shed/firecracker/audit.jsonl` by default) |
 | `<instance_dir parent>/egress-audit.jsonl` | Egress-proxy decisions, when egress is enabled |

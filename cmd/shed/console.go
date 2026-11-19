@@ -145,7 +145,8 @@ func ttyFlag(hasCommand, stdinTTY, stdoutTTY bool) string {
 
 // baseSSHArgs returns the SSH args common to every shed connection: port, pinned
 // known_hosts, strict host-key check, the entry's identity file when it has one
-// (`-i <path> -o IdentitiesOnly=yes`), any extra -o options, then
+// (sdkbootstrap.IdentityArgs: `-i <path> -o IdentitiesOnly=yes -o
+// ControlMaster=no -o ControlPath=none`), any extra -o options, then
 // <shed>@<host>. Callers prepend "ssh" (and "-t" for an interactive PTY) and
 // append "--" + the remote command. Shared by the interactive attach and
 // exec/console paths so the connection options can't drift.

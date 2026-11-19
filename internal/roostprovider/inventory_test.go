@@ -56,21 +56,15 @@ func captureStderr(t *testing.T, fn func()) string {
 	return string(out)
 }
 
-// generateSelfSignedCert returns a fresh self-signed certificate and its
+// generateClientCert returns a fresh self-signed certificate for cn and its
 // matching private key, PEM encoded, for use as a client certificate in an
-// mtls test. It is self-signed rather than CA-issued because the mtls
-// success test's server uses tls.RequireAnyClientCert (accepts any
-// certificate, verifies no chain) — the point of that test is that a
+// mtls test, with the subject's userId attribute (the user a shed client
+// certificate is issued to) set to *user; nil leaves it out, the shape of a
+// certificate a pre-0.10 server issued. It is self-signed rather than
+// CA-issued because the mtls tests' server uses tls.RequireAnyClientCert
+// (accepts any certificate, verifies no chain): the point is that a
 // certificate got PRESENTED at all, not that shed's own CA issuance path was
 // exercised (that path is covered elsewhere).
-func generateSelfSignedCert(t *testing.T, cn string) (certPEM, keyPEM []byte) {
-	t.Helper()
-	return generateClientCert(t, cn, nil)
-}
-
-// generateClientCert is generateSelfSignedCert with the subject's userId
-// attribute (the user a shed client certificate is issued to) set to *user;
-// nil leaves it out, the shape of a certificate a pre-0.10 server issued.
 func generateClientCert(t *testing.T, cn string, user *string) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

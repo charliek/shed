@@ -209,7 +209,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	entry, serverName, err := getServerEntry()
 	if err != nil {
 		printError("no server configured",
-			"shed server add <hostname>  # Add a server first")
+			"shed server add HOST  # Add a server first")
 		return err
 	}
 
@@ -315,9 +315,32 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	printSuccess("Created shed %s on %s (backend: %s)", name, serverName, resolvedBackend)
-	fmt.Printf("\nConnect with:\n  shed console %s\n", name)
+	fmt.Printf("\n%s\n", consoleHint(name))
 
 	return nil
+}
+
+// consoleHint is the advice printed after a create: the command that connects
+// to the shed, with its name as config.ShellWord gives it, or the name
+// escaped, in words, with no command line. (A created shed's name passed
+// config.ValidateShedName; this holds whatever it is given.)
+func consoleHint(name string) string {
+	if word, ok := config.ShellWord(name); ok {
+		return "Connect with:\n  shed console " + word
+	}
+	return fmt.Sprintf("Connect with shed console, naming the shed %q "+
+		"(its name cannot be pasted safely as one word, so no command line is shown)", name)
+}
+
+// createShedHint is the suggestion printed when a shed is not found: the
+// command that creates it, with the name the person typed as config.ShellWord
+// gives it, or the name escaped, in words, with no command line.
+func createShedHint(name string) string {
+	if word, ok := config.ShellWord(name); ok {
+		return "shed create " + word + "  # Create a new shed"
+	}
+	return fmt.Sprintf("create a shed named %q with shed create "+
+		"(its name cannot be pasted safely as one word, so no command line is shown)", name)
 }
 
 // parseMountsFlag turns `shed create --mounts` into the request's mounts
@@ -461,7 +484,7 @@ func runList(cmd *cobra.Command, args []string) error {
 	entry, serverName, err := getServerEntry()
 	if err != nil && !listAll {
 		printError("no server configured",
-			"shed server add <hostname>  # Add a server first",
+			"shed server add HOST        # Add a server first",
 			"shed list --all             # List from all servers")
 		return err
 	}
@@ -522,7 +545,7 @@ func runList(cmd *cobra.Command, args []string) error {
 	if len(allSheds) == 0 {
 		fmt.Println("No sheds found.")
 		fmt.Println("\nTo create a shed:")
-		fmt.Println("  shed create <name>")
+		fmt.Println("  shed create NAME")
 		return nil
 	}
 
@@ -575,6 +598,11 @@ type shedJSON struct {
 	User           string                                `json:"user,omitempty"`
 	Mounts         *config.MountSelection                `json:"mounts,omitempty"`
 	NetworkProfile string                                `json:"network_profile,omitempty"`
+	// Isolation and Arch are the record's members of the same names, as
+	// `shed --json create` and the API carry them (config.Shed): omitted when
+	// the server sends none.
+	Isolation string `json:"isolation,omitempty"`
+	Arch      string `json:"arch,omitempty"`
 }
 
 // shedListJSON is the `shed list --json` document.
@@ -601,6 +629,8 @@ func shedListJSON(sheds []listedShed) []shedJSON {
 			User:           s.shed.User,
 			Mounts:         s.shed.Mounts,
 			NetworkProfile: s.shed.NetworkProfile,
+			Isolation:      s.shed.Isolation,
+			Arch:           s.shed.Arch,
 		}
 		if s.shed.Status == config.StatusRunning {
 			sj.SSH = shedSSHString(s.shed.Name, s.server)
@@ -1112,7 +1142,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 			}
 			printError(fmt.Sprintf("shed %q not found on %s", name, serverFlag),
 				"shed list --all       # Find which server has it",
-				"shed create "+name+"  # Create a new shed")
+				createShedHint(name))
 			return "", nil, fmt.Errorf("shed %q not found on %s", name, serverFlag)
 		}
 		return serverFlag, entry, nil
@@ -1135,7 +1165,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 	}
 	printError(fmt.Sprintf("shed %q not found on %s", name, defaultServer),
 		"shed list --all       # Find which server has it",
-		"shed create "+name+"  # Create a new shed")
+		createShedHint(name))
 	return "", nil, fmt.Errorf("shed %q not found", name)
 }
 

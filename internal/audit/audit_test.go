@@ -116,6 +116,33 @@ func TestRecordShape(t *testing.T) {
 	}
 }
 
+// TestPersonIdentity: the one rule both doors record a person by (the API's
+// auditIdentity, sshd's sshIdentity): a named or implicit person is a user
+// line; anything else, a user that is neither named nor implicit included,
+// is unknown, never a person.
+func TestPersonIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		id   Identity
+		want string
+	}{
+		{"named", PersonIdentity(true, "pat", false, true, false, "SHA256:abc", "1f"),
+			`{"kind":"user","user":"pat","admin":true,"script":false,"subject":"SHA256:abc","serial":"1f"}`},
+		{"implicit", PersonIdentity(true, "", true, true, false, "SHA256:abc", ""),
+			`{"kind":"user","implicit":true,"admin":true,"script":false,"subject":"SHA256:abc"}`},
+		{"neither named nor implicit", PersonIdentity(true, "", false, true, false, "SHA256:abc", "1f"), `{"kind":"unknown"}`},
+		{"not a person", PersonIdentity(false, "pat", false, true, false, "SHA256:abc", "1f"), `{"kind":"unknown"}`},
+	} {
+		got, err := json.Marshal(tc.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s: identity = %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestIdentityShapes pins each identity kind's JSON exactly, as a reader of
 // audit.jsonl sees it: a client keeps its shape (name and serial, nothing
 // else), a person always carries both flags, the implicit user carries no

@@ -558,7 +558,7 @@ func (f installFixture) install(t *testing.T, content string, sheds []shedInfo) 
 	origJSON := jsonFlag
 	t.Cleanup(func() { jsonFlag = origJSON })
 	jsonFlag = true
-	entries, err := generateEntries(sheds)
+	entries, _, err := generateEntries(sheds)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -705,10 +705,10 @@ func TestSSHConfigInstallWithNoIdentityFileIsAsBefore(t *testing.T) {
 	})
 }
 
-// TestSSHConfigInstallEscapesUpdatedNames: an alias listed under "Entries to
-// update" is printed with its control characters escaped. A server entry name
-// edited by hand into config.yaml with an escape sequence reaches the output
-// through the qualified roost alias `shed attach` wrote for it.
+// TestSSHConfigInstallEscapesUpdatedNames: a qualified roost alias in the
+// block whose name the ssh config writer refuses (a server entry name edited
+// by hand into config.yaml with an escape sequence) is not kept, and is listed
+// under "Entries to remove" with its control characters escaped.
 func TestSSHConfigInstallEscapesUpdatedNames(t *testing.T) {
 	f := newInstallFixture(t)
 	key := writeKey(t, t.TempDir(), "id_work")
@@ -722,7 +722,7 @@ func TestSSHConfigInstallEscapesUpdatedNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	sheds := []shedInfo{{name: "box", serverName: server, server: keyed}}
-	entries, err := generateEntries(sheds)
+	entries, _, err := generateEntries(sheds)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -737,8 +737,8 @@ func TestSSHConfigInstallEscapesUpdatedNames(t *testing.T) {
 	if strings.ContainsRune(out, '\x1b') {
 		t.Errorf("the output carries a raw ESC: %q", out)
 	}
-	if !strings.Contains(out, `~ shed-srv\x1b[31m-box`) {
-		t.Errorf("the updated alias is not listed escaped: %q", out)
+	if !strings.Contains(out, `- shed-srv\x1b[31m-box`) {
+		t.Errorf("the refused alias is not listed escaped as removed: %q", out)
 	}
 }
 

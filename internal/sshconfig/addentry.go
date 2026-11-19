@@ -93,8 +93,12 @@ func AliasDeclared(path, alias string) (bool, error) {
 //     `Host *` defaults, Include lines, ordering, trailing whitespace.
 //
 // Safe to call when the file, the managed block, or the whole `~/.ssh`
-// directory does not exist yet.
+// directory does not exist yet. An entry that fails Entry.Validate is refused
+// before anything is read or written.
 func AddEntryIfAbsent(path string, entry Entry) (AddOutcome, error) {
+	if err := entry.Validate(); err != nil {
+		return AddedEntry, err
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return AddedEntry, fmt.Errorf("failed to create %s: %w", dir, err)
@@ -213,8 +217,12 @@ func (e *UnmanagedAliasError) Error() string {
 //
 // A file whose marker lines frame no single block is refused (*MarkerError),
 // the file left byte-identical. The same lock as AddEntryIfAbsent spans the
-// read and the write, and every other byte of the file is kept.
+// read and the write, and every other byte of the file is kept. An entry that
+// fails Entry.Validate is refused before anything is read or written.
 func EnsureEntry(path string, entry Entry) (AddOutcome, error) {
+	if err := entry.Validate(); err != nil {
+		return AddedEntry, err
+	}
 	if entry.IdentityFile == "" {
 		return AddEntryIfAbsent(path, entry)
 	}

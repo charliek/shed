@@ -32,17 +32,15 @@ func (s *Server) recordAudit(v any) {
 // person as kind user, by name (or implicit), with the admin and script flags,
 // the certificate's subject (the key's fingerprint; none in open mode) and its
 // serial. A caller that maps to no principal (no kind, or a user that is
-// neither named nor implicit) is recorded as unknown, never as a person. The
-// access guard refuses such a caller before the backend, so no line should
-// ever carry it.
+// neither named nor implicit) is recorded as unknown, never as a person: the
+// rule sshd's sshIdentity applies too (audit.PersonIdentity). The access
+// guard refuses such a caller before the backend, so no line should ever
+// carry it.
 func auditIdentity(c Caller) audit.Identity {
-	switch {
-	case c.IsClient():
+	if c.IsClient() {
 		return audit.ClientIdentity(c.Name, c.Serial)
-	case c.Kind == CallerUser && (c.Implicit || c.User != ""):
-		return audit.UserIdentity(c.User, c.Implicit, c.IsAdmin(), c.Script, c.Name, c.Serial)
 	}
-	return audit.UnknownIdentity()
+	return audit.PersonIdentity(c.Kind == CallerUser, c.User, c.Implicit, c.IsAdmin(), c.Script, c.Name, c.Serial)
 }
 
 // auditEntry is the part of a client request's api line that is learned while

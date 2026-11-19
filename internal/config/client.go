@@ -139,7 +139,12 @@ type ServerEntry struct {
 	// certificate that names another user, or none, is refused
 	// (LoadEntryCertificate), and a newly issued certificate for another user
 	// is refused unless the change is asked for (--allow-user-change). Empty
-	// for an entry that is not mtls, or whose server has no user list.
+	// for an entry that was never enrolled for a named user (a plain-HTTP
+	// entry, a control-token entry, or one whose server has no user list). An
+	// entry whose server goes back to issuing control tokens (a shed-server
+	// older than 0.10.0) keeps it: only --allow-user-change changes it and
+	// only `shed server remove` drops it, so a certificate issued once the
+	// server is upgraded again must name the same user.
 	User string `yaml:"user,omitempty"`
 	// IdentityFile is the absolute path of the SSH key this entry uses
 	// (identityfile.go states the three properties it gives): a certificate

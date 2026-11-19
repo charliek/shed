@@ -208,17 +208,12 @@ func newMTLSCredentialIssuer(t *testing.T) *mtlsServer {
 // implicit user), and an entry holding one records it.
 const testUser = "pat"
 
-// issue runs the REAL enrollment path — generate a P-256 key, build a CSR, have
-// the CA sign it — and returns what a bootstrap would hand back: the leaf PEM
-// and the matching key PEM. Using SignClientCSR rather than a hand-rolled leaf
-// keeps these tests honest about the subject and extension shape the server
-// actually issues. The certificate is for testUser.
-func (m *mtlsServer) issue(t *testing.T, label string, ttl time.Duration) (certPEM, keyPEM []byte, serial string) {
-	t.Helper()
-	return m.issueFor(t, label, testUser, ttl)
-}
-
-// issueFor is issue for a given user ("" for the implicit user).
+// issueFor runs the REAL enrollment path — generate a P-256 key, build a CSR,
+// have the CA sign it — and returns what a bootstrap would hand back: the leaf
+// PEM and the matching key PEM. Using SignClientCSR rather than a hand-rolled
+// leaf keeps these tests honest about the subject and extension shape the
+// server actually issues. The certificate is for user ("" for the implicit
+// user).
 func (m *mtlsServer) issueFor(t *testing.T, label, user string, ttl time.Duration) (certPEM, keyPEM []byte, serial string) {
 	t.Helper()
 	return m.issueForSubject(t, sshFingerprint(label), user, ttl)

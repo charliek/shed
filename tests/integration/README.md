@@ -728,8 +728,10 @@ reused pid is never signalled; one that has gone already is not an error.
 | `test_one_host_name_two_entries_two_users` | the guide's backup-admin recipe: with the agent offering pat's key, `shed server add --identity-file` with the local admin's key enrols the local admin (its ssh carries `-i <that key>`, `IdentitiesOnly=yes`, `ControlMaster=no` and `ControlPath=none`), and a second entry for the same host with no key enrols pat (its ssh carries no `-i`); each acts as its user, pat's `shed users status` refused with the CLI's forbidden message |
 | `test_the_shed_record_and_the_server_info_on_the_remote_backend` | a shed made with `--network isolated` reports `mounts` `{"mode":"selected"}`, `isolation` `topology` and `arch`; an open one `isolation` `none`, in the get and the list; `/api/info` carries the nine `exec` members, `guest_arch` and the `exec_limits` and `uniform_shed_record` tokens |
 
-An unknown key pulls at most once a minute (and not while a retry wait is
-pending), so each case's first unknown login is the first of its minute, or
+An unknown key offered as `_bootstrap` pulls at most once a minute (and not
+while a retry wait is pending); offered as an existing shed's name, at most
+once every 5 minutes, on a slot of its own; under any other name, never. So
+each case's first unknown login is the first of its minute, or
 the local admin runs `shed users refresh` before a person's first login when
 the case is not about that path.
 

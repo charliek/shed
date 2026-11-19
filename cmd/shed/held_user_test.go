@@ -402,7 +402,7 @@ func TestCredentialLessEntryRecordsItsFirstUser(t *testing.T) {
 // names no user, or a user the entry does not record, fails every command with
 // its own message, unwrapped, before any connection: zero bootstrap calls and
 // zero TCP connections accepted by the server, through a JSON request, a
-// create stream, the tunnel's Connect probe and dial, and Ping and Status.
+// create stream, the tunnel's Connect probe and dial, and Status.
 func TestStoredCertificateRefusalSendsNothing(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -456,9 +456,6 @@ func TestStoredCertificateRefusalSendsNothing(t *testing.T) {
 			check("a JSON request", err)
 			_, err = c.CreateShedWithProgress(&config.CreateShedRequest{Name: "x"}, false, func(backend.ProgressEvent) {})
 			check("a create stream", err)
-			if c.Ping() {
-				t.Error("Ping reported a refused entry online")
-			}
 			status, err := c.Status()
 			check("Status", err)
 			if status != serverStatusRefused {
@@ -727,6 +724,35 @@ func TestRefetchRestoresARefusedEntry(t *testing.T) {
 	e = clientConfig.Servers["srv"]
 	if _, err := NewAPIClientFromNamedEntry("srv", &e, DefaultTimeout).GetInfo(); err != nil {
 		t.Fatalf("the refetched entry does not work: %v", err)
+	}
+}
+
+// TestRefetchPrintsTheImplicitUser: a refetch from a server with no user list
+// prints the same `User:` line the add prints in that case, `(implicit)`, so
+// the line the guide tells a person to check is always there on an mtls entry.
+func TestRefetchPrintsTheImplicitUser(t *testing.T) {
+	testClientConfig(t)
+	withCleanAddFlags(t)
+	serverAddTrustTOFU = true
+	m := newMTLSServer(t)
+	refusedEntryAfterAdd(t, m)
+
+	serverUpdateRefetch = true
+	serverUpdateTrustTOFU = true
+	implicit := m.credentialFor(t, "cli-key", "", farFromExpiry)
+	_, port := hostPort(t, m.srv.URL)
+	implicit.Bundle.HTTPSPort = port
+	stubBootstrapResult(implicit, nil)
+	var err error
+	out := captureStdout(t, func() { err = runServerUpdate(nil, []string{"srv"}) })
+	if err != nil {
+		t.Fatalf("refetch: %v", err)
+	}
+	if !strings.Contains(out, "  User: (implicit)\n") {
+		t.Errorf("the refetch did not print the implicit user:\n%s", out)
+	}
+	if got := clientConfig.Servers["srv"].User; got != "" {
+		t.Errorf("an implicit certificate recorded user %q", got)
 	}
 }
 

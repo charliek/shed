@@ -53,16 +53,18 @@ func TestSSHAliasHint(t *testing.T) {
 // and `--uninstall` list (entries to add, to remove, to update, unchanged,
 // and the `ssh <alias>` hint) is shown escaped. No line break or ESC from a
 // name reaches the terminal raw, and no hint is a command a person could paste
-// as something else.
+// as something else. A hostile alias is listed by a dry run, but the writer
+// refuses to put it into the file (sshconfig.Entry.Validate): the install
+// fails and the file is unchanged.
 func TestSSHConfigInstallEscapesListedNames(t *testing.T) {
 	f := newInstallFixture(t)
 	if err := os.MkdirAll(filepath.Dir(f.path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// The block on disk holds one plain alias, which stays; one hostile alias
-	// whose stanza lacks the identity lines its entry now has, which is
-	// updated; and two hostile ones, which go (a Host line cannot carry a line
-	// break).
+	// The block on disk (written by hand, or by an older shed) holds one plain
+	// alias, which stays; one hostile alias whose stanza lacks the identity
+	// lines its entry now has, listed as updated; and two hostile ones, which
+	// go.
 	keep := f.stanza("shed-keep", "keep")
 	const changed = "shed-chg\x1b[1m"
 	content := sshconfig.GenerateManagedBlock([]sshconfig.Entry{
@@ -80,17 +82,38 @@ func TestSSHConfigInstallEscapesListedNames(t *testing.T) {
 
 	origJSON, origDry, origVerbose := jsonFlag, sshConfigDryRun, verboseLevel
 	t.Cleanup(func() { jsonFlag, sshConfigDryRun, verboseLevel = origJSON, origDry, origVerbose })
-	jsonFlag, sshConfigDryRun, verboseLevel = false, false, 1
+	jsonFlag, sshConfigDryRun, verboseLevel = false, true, 1
 
+	// A dry run lists every name.
 	var runErr error
 	out := captureStdout(t, func() { runErr = runSSHConfigInstall(entries, nil) })
 	if runErr != nil {
-		t.Fatalf("install: %v", runErr)
+		t.Fatalf("install --dry-run: %v", runErr)
+	}
+	// The install itself is refused, and writes nothing.
+	sshConfigDryRun = false
+	out += captureStdout(t, func() { runErr = runSSHConfigInstall(entries, nil) })
+	var refused *sshconfig.EntryError
+	if !errors.As(runErr, &refused) {
+		t.Fatalf("install of hostile aliases: err = %v, want the writer's refusal", runErr)
+	}
+	if strings.ContainsRune(runErr.Error(), '\x1b') || strings.ContainsRune(runErr.Error(), '\n') {
+		t.Errorf("the refusal carries a raw control character: %q", runErr)
+	}
+	if got := string(must(os.ReadFile(f.path))); got != content {
+		t.Errorf("a refused install changed the file:\n%s", got)
 	}
 	sshConfigDryRun = true
 	out += captureStdout(t, func() { runErr = runSSHConfigUninstall() })
 	if runErr != nil {
 		t.Fatalf("uninstall: %v", runErr)
+	}
+	// An install of the plain alias alone is written, and its hint is a
+	// command.
+	sshConfigDryRun = false
+	out += captureStdout(t, func() { runErr = runSSHConfigInstall([]sshconfig.Entry{keep}, nil) })
+	if runErr != nil {
+		t.Fatalf("install: %v", runErr)
 	}
 
 	if strings.ContainsRune(out, '\x1b') {
@@ -108,9 +131,6 @@ func TestSSHConfigInstallEscapesListedNames(t *testing.T) {
 		`  ~ shed-chg\x1b[1m`, // Entries to update
 		`  = shed-keep`,       // Entries unchanged
 		"  ssh shed-keep",     // the one hint that is a command
-		`  the Host alias "shed-a;id" (`, `  the Host alias "shed-pat@other-host" (`, `  the Host alias "shed-a b" (`,
-		`  the Host alias "shed-a\nb" (`, `  the Host alias "shed-x\x1b[2J" (`, `  the Host alias "-oProxyCommand=x" (`,
-		`  the Host alias "shed-chg\x1b[1m" (`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the output lacks %q:\n%s", want, out)

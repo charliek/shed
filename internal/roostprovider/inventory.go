@@ -66,8 +66,10 @@ type RunningShed struct {
 	ServerHost    string
 	ServerSSHPort int
 	// IdentityFile is the server entry's identity_file, copied like
-	// ServerHost: the one key ssh offers for this shed (`-i <path> -o
-	// IdentitiesOnly=yes`, Target.IdentityFile). Empty for none.
+	// ServerHost: the one key ssh offers for this shed (Target.IdentityFile:
+	// `-i <path> -o IdentitiesOnly=yes`, and `-o ControlMaster=no -o
+	// ControlPath=none` unless the roost transport keeps its own shared
+	// connection, keyed by the file and its key). Empty for none.
 	IdentityFile string
 	// LandingDir is config.Shed's landing_dir field verbatim. Empty means the
 	// server didn't report one — an older shed-server predating the field, or

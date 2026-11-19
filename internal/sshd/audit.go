@@ -110,11 +110,9 @@ func (s *Server) onEntered(p backend.Principal, fingerprint string, remote net.A
 // for: the principal the guard decided on (its user is the one the connection
 // is bound to, principalFor), with the key's fingerprint as subject and no
 // serial (an SSH login has no certificate). A principal that is not a person
-// never reaches a shed over SSH; it would be recorded as unknown, never as a
-// person.
+// (or a user that is neither named nor implicit) never reaches a shed over
+// SSH; it would be recorded as unknown, never as a person: the rule the API's
+// auditIdentity applies too (audit.PersonIdentity).
 func sshIdentity(p backend.Principal, fingerprint string) audit.Identity {
-	if p.Kind != backend.PrincipalUser {
-		return audit.UnknownIdentity()
-	}
-	return audit.UserIdentity(p.User, p.Implicit, p.IsAdmin(), p.Script, fingerprint, "")
+	return audit.PersonIdentity(p.Kind == backend.PrincipalUser, p.User, p.Implicit, p.IsAdmin(), p.Script, fingerprint, "")
 }

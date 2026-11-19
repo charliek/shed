@@ -197,7 +197,8 @@ func TestUnknownKeyShedNudge(t *testing.T) {
 
 	// One line, with its own prefix: none starts as a first login's line,
 	// which the integration suite counts.
-	if n := srv.log.count("directory: shed-name key " + bob.fp + " for an existing shed: pulling the list in the background"); n != 1 {
+	if n := srv.log.count("directory: shed-name key " + bob.fp + " for an existing shed: pulling the list in the background " +
+		"(at most once every 5 minutes while pulls succeed, once every 15 minutes while they fail)"); n != 1 {
 		t.Fatalf("the nudge's line logged %d times, want 1:\n%s", n, srv.log)
 	}
 	for _, l := range strings.Split(srv.log.String(), "\n") {
@@ -482,5 +483,28 @@ func TestUnknownKeyAdversarialDeadline(t *testing.T) {
 				t.Fatal("an unknown key was let in")
 			}
 		})
+	}
+}
+
+// TestUnknownKeyRatesText: both unknown-key lines say their rates in the same
+// words, built from the constants (unknownKeyRates, everyText), so a changed
+// constant changes the line rather than leaving it false.
+func TestUnknownKeyRatesText(t *testing.T) {
+	for _, tc := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{time.Minute, "once a minute"},
+		{5 * time.Minute, "once every 5 minutes"},
+		{15 * time.Minute, "once every 15 minutes"},
+		{90 * time.Second, "once every 1m30s"},
+	} {
+		if got := everyText(tc.d); got != tc.want {
+			t.Errorf("everyText(%s) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+	if got, want := unknownKeyRates(UnknownKeyEvery), "at most "+everyText(UnknownKeyEvery)+
+		" while pulls succeed, "+everyText(RetryInterval)+" while they fail"; got != want {
+		t.Errorf("unknownKeyRates = %q, want %q", got, want)
 	}
 }

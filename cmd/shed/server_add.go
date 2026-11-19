@@ -296,8 +296,10 @@ func ensureHostKeyPinned(host string, sshPort int, expectedFingerprint string, t
 				"  Continuing: the bootstrap runs the real ssh client, which honors ~/.ssh/config\n"+
 				"  (HostName/Port/ProxyJump/ProxyCommand) and verifies the host key itself against\n"+
 				"  %s. If ssh reaches this server through ~/.ssh/config, pin its key there first:\n"+
-				"    ssh-keyscan -p <port> <hostname> >> %s\n",
-			scanAddr(host, sshPort), err, config.GetKnownHostsPath(), config.GetKnownHostsPath())
+				"  add the lines this command prints to that file, with the server's SSH port and host name\n"+
+				"  in place of PORT and HOST:\n"+
+				"    ssh-keyscan -p PORT HOST\n",
+			sdkbootstrap.SafeText(scanAddr(host, sshPort)), err, sdkbootstrap.SafeText(config.GetKnownHostsPath()))
 		return pin, nil
 	}
 	pin.key = hostKey
@@ -645,7 +647,7 @@ func (t *credentialTxn) discard() {
 func addDecide(name string) func(*config.ClientConfig) error {
 	return func(c *config.ClientConfig) error {
 		if _, exists := c.Servers[name]; exists {
-			return fmt.Errorf("server '%s' already exists", name)
+			return fmt.Errorf("server '%s' already exists", sdkbootstrap.SafeText(name))
 		}
 		return nil
 	}
@@ -841,8 +843,8 @@ func unscannedHostKeyHint(pin pinnedHostKey) string {
 	}
 	return fmt.Sprintf("\n(the host key could not be scanned directly, so nothing was pinned; "+
 		"if ssh reaches this server through ~/.ssh/config, add its key to %s — "+
-		"`ssh-keyscan -p <port> <hostname> >> %s` — and retry)",
-		config.GetKnownHostsPath(), config.GetKnownHostsPath())
+		"the lines `ssh-keyscan -p PORT HOST` prints, with the server's SSH port and host name — and retry)",
+		sdkbootstrap.SafeText(config.GetKnownHostsPath()))
 }
 
 // addFromBundle writes the server entry described by a bootstrap bundle.
@@ -885,7 +887,7 @@ func addFromBundle(host string, sshPort int, identityFile, entryKey string, res 
 
 	name := addedServerName(info, host)
 	if _, exists := clientConfig.Servers[name]; exists {
-		return fmt.Errorf("server '%s' already exists", name)
+		return fmt.Errorf("server '%s' already exists", sdkbootstrap.SafeText(name))
 	}
 
 	// And once more before a copy is written to staging: the network check
@@ -1080,7 +1082,7 @@ func addOverHTTP(host string, sshPort int, identityFile string) error {
 
 	name := addedServerName(info, host)
 	if _, exists := clientConfig.Servers[name]; exists {
-		return fmt.Errorf("server '%s' already exists", name)
+		return fmt.Errorf("server '%s' already exists", sdkbootstrap.SafeText(name))
 	}
 
 	entry := config.ServerEntry{
@@ -1129,7 +1131,7 @@ func saveAddedServer(name string, entry config.ServerEntry) error {
 	err := updateClientConfigChecked(
 		func(c *config.ClientConfig) error {
 			if _, exists := c.Servers[name]; exists {
-				duplicate = fmt.Errorf("server '%s' already exists", name)
+				duplicate = fmt.Errorf("server '%s' already exists", sdkbootstrap.SafeText(name))
 			}
 			return duplicate
 		},
@@ -1193,14 +1195,17 @@ func reportAddedServer(name string, entry config.ServerEntry) error {
 		})
 	}
 
+	// The name may be the one the server reported (addedServerName) and the
+	// API URL comes from its bundle: both are server text, escaped here.
+	shownName := sdkbootstrap.SafeText(name)
 	if entry.APIURL != "" {
 		if entry.TLSCertFingerprint != "" {
-			printSuccess("Added server %s (%s, TLS pinned)", name, entry.APIURL)
+			printSuccess("Added server %s (%s, TLS pinned)", shownName, sdkbootstrap.SafeText(entry.APIURL))
 		} else {
-			printSuccess("Added server %s (%s)", name, entry.APIURL)
+			printSuccess("Added server %s (%s)", shownName, sdkbootstrap.SafeText(entry.APIURL))
 		}
 	} else {
-		printSuccess("Added server %s (%s)", name, entry.BaseURL())
+		printSuccess("Added server %s (%s)", shownName, sdkbootstrap.SafeText(entry.BaseURL()))
 	}
 	switch {
 	case entry.IsMTLS():
@@ -1385,8 +1390,10 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, identityFile st
 	switch {
 	case previousUser != "":
 		fmt.Printf("  User changed from %q to %q\n", previousUser, updated.User)
-	case updated.User != "":
-		fmt.Printf("  User: %s\n", updated.User)
+	case updated.IsMTLS() || updated.User != "":
+		// Who the entry is, as the add prints it (entryUser.label): the user
+		// it is held to, or (implicit) for a server with no user list.
+		fmt.Printf("  User: %s\n", entryUserOf(name, updated).label())
 	}
 	if updated.IdentityFile != entry.IdentityFile {
 		printIdentityFileLine(updated.IdentityFile)

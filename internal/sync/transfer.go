@@ -53,11 +53,12 @@ func (s *Syncer) SetServerName(name string) {
 
 // sshArgs is the ssh argv (without the binary) every sync step runs against a
 // shed: the port, the pinned known_hosts, strict host-key checking and batch
-// mode, the server entry's identity file when it has one (`-i <path> -o
-// IdentitiesOnly=yes`), then <shed>@<host> and the remote command. The
-// identity file is checked here, at each use (its value and the file), and
-// one that cannot be used is an error before ssh is spawned. Without one the
-// argv is exactly what it was before the field existed.
+// mode, the server entry's identity file when it has one
+// (sdkbootstrap.IdentityArgs: `-i <path> -o IdentitiesOnly=yes -o
+// ControlMaster=no -o ControlPath=none`), then <shed>@<host> and the remote
+// command. The identity file is checked here, at each use (its value and the
+// file), and one that cannot be used is an error before ssh is spawned.
+// Without one the argv is exactly what it was before the field existed.
 func (s *Syncer) sshArgs(shedName string, serverEntry *config.ServerEntry, remoteCmd string) ([]string, error) {
 	identity, err := serverEntry.SSHIdentityArgs(s.serverName)
 	if err != nil {

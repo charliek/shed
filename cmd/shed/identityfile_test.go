@@ -346,7 +346,7 @@ func TestHandEditedIdentityFileIsRefusedBeforeSSH(t *testing.T) {
 			asIdentityRefusal(t, err, "srv", tc.reason)
 
 			// The generated ssh config.
-			_, err = generateEntries([]shedInfo{{name: "box", serverName: "srv", server: &entry}})
+			_, _, err = generateEntries([]shedInfo{{name: "box", serverName: "srv", server: &entry}})
 			asIdentityRefusal(t, err, "srv", tc.reason)
 		})
 	}
@@ -1173,7 +1173,7 @@ func TestGenerateEntriesIdentityFile(t *testing.T) {
 	key := writeKey(t, t.TempDir(), "id work")
 	keyed := &config.ServerEntry{Host: "shed.example.test", SSHPort: 2222, IdentityFile: key}
 	plain := &config.ServerEntry{Host: "shed.example.test", SSHPort: 2222}
-	entries, err := generateEntries([]shedInfo{
+	entries, _, err := generateEntries([]shedInfo{
 		{name: "a", serverName: "work", server: keyed},
 		{name: "b", serverName: "home", server: plain},
 	})
@@ -1313,7 +1313,7 @@ func TestSSHConfigInstallIdentityLines(t *testing.T) {
 		t.Cleanup(func() { jsonFlag = origJSON })
 		jsonFlag = true
 		sheds := []shedInfo{{name: "box", serverName: "srv", server: server}}
-		entries, err := generateEntries(sheds)
+		entries, _, err := generateEntries(sheds)
 		if err != nil {
 			t.Fatal(err)
 		}

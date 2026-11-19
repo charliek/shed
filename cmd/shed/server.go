@@ -92,7 +92,9 @@ credential, or set the SSH key it uses.
 Pass --tls-fingerprint <sha256:...> to pin a new fingerprint verified
 out-of-band, or --refetch to re-read it from the server over the same SSH-first
 path 'shed server add' uses (trust-on-first-use or interactive prompt), which
-also re-enrolls the entry's credential.
+also re-enrolls the entry's credential. A refetch keeps the entry's HTTPS
+endpoint while the server answers there, and moves to the port the server
+reports only when it does not.
 
 An entry is held to the user its certificates name. --refetch refuses a new
 certificate for another user and writes nothing; add --allow-user-change to
@@ -108,10 +110,11 @@ the CLI runs for it offers that key first and no key that is only in your agent
 your own ssh config names for the host, after this key. On its own the flag
 changes only that field, and the entry re-enrols with this key on its next use
 (a stored certificate made for another key is never presented); with --refetch
-the re-enrolment uses the new key now, and nothing is saved unless it succeeds. --identity-file "" clears it. The path is stored absolute (~ is
-expanded); it may not contain whitespace at either end, or any of NUL, CR, LF,
-" \ # % $; the file must be readable, and its public key must be learnable
-without a passphrase (an OpenSSH-format key, or a .pub beside it).`,
+the re-enrolment uses the new key now, and nothing is saved unless it succeeds.
+--identity-file "" clears it. The path is stored absolute (~ is expanded); it
+may not contain whitespace at either end, or any of NUL, CR, LF, " \ # % $; the
+file must be readable, and its public key must be learnable without a
+passphrase (an OpenSSH-format key, or a .pub beside it).`,
 	Args: cobra.ExactArgs(1),
 	RunE: runServerUpdate,
 }
@@ -163,7 +166,7 @@ func init() {
 	serverAddCmd.Flags().StringVar(&serverAddIdentityFile, "identity-file", "", "SSH private key this entry uses: its certificates must be made for that key, and every ssh for the entry offers it first and no agent-only key; stored as an absolute path, ~ expanded")
 
 	serverUpdateCmd.Flags().StringVar(&serverUpdateTLSFingerprint, "tls-fingerprint", "", "New pinned TLS cert fingerprint (sha256:...) to rotate to")
-	serverUpdateCmd.Flags().BoolVar(&serverUpdateRefetch, "refetch", false, "Re-fetch the cert from the server's api_url and re-pin it (TOFU/prompt)")
+	serverUpdateCmd.Flags().BoolVar(&serverUpdateRefetch, "refetch", false, "Re-pin and re-enrol over the SSH-first path (TOFU/prompt); keeps the entry's HTTPS endpoint while it answers")
 	serverUpdateCmd.Flags().BoolVar(&serverUpdateTrustTOFU, "trust-on-first-use", false, "With --refetch, trust the re-fetched TLS cert without prompting")
 	serverUpdateCmd.Flags().BoolVar(&serverUpdateAllowUserChange, "allow-user-change", false, "With --refetch, let the entry change to the user the server issues the new certificate for")
 	serverUpdateCmd.Flags().Var(&serverUpdateIdentityFile, "identity-file", "Set the SSH private key this entry uses (\"\" clears it); with --refetch, the re-enrolment uses it")
@@ -412,6 +415,9 @@ func runServerList(cmd *cobra.Command, args []string) error {
 			// text's `(implicit)` and `-` are never carried here.
 			User         string `json:"user,omitempty"`
 			UserImplicit bool   `json:"user_implicit"`
+			// IdentityFile is the entry's identity_file, as add, update and
+			// a refetch report it (omitted when it has none).
+			IdentityFile string `json:"identity_file,omitempty"`
 			Status       string `json:"status"`
 			Default      bool   `json:"default"`
 		}
@@ -434,6 +440,7 @@ func runServerList(cmd *cobra.Command, args []string) error {
 				TLSCertFingerprint: entry.TLSCertFingerprint,
 				User:               user.name,
 				UserImplicit:       user.implicit,
+				IdentityFile:       entry.IdentityFile,
 				Status:             status,
 				Default:            name == clientConfig.DefaultServer,
 			})
@@ -444,7 +451,7 @@ func runServerList(cmd *cobra.Command, args []string) error {
 	if len(clientConfig.Servers) == 0 {
 		fmt.Println("No servers configured.")
 		fmt.Println("\nTo add a server:")
-		fmt.Println("  shed server add <hostname>")
+		fmt.Println("  shed server add HOST")
 		return nil
 	}
 
@@ -465,9 +472,13 @@ func runServerList(cmd *cobra.Command, args []string) error {
 			defaultMark = "*"
 		}
 
+		// The name (possibly the one a server reported at add), its URL and
+		// its host are shown escaped (SafeText): a control character in any
+		// of them never reaches the terminal raw nor breaks the table.
 		sshAddr := fmt.Sprintf("%s:%d", entry.Host, entry.SSHPort)
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			name, entry.BaseURL(), sshAddr, securityLabel(entry), user, status, defaultMark)
+			sdkbootstrap.SafeText(name), sdkbootstrap.SafeText(entry.BaseURL()), sdkbootstrap.SafeText(sshAddr),
+			securityLabel(entry), user, status, defaultMark)
 	}
 
 	w.Flush()

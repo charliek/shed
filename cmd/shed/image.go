@@ -566,7 +566,20 @@ func recordBuiltImage(imagesDir, name, sourceRef, digest string) error {
 // inside convertAndInstall via recordBuiltImage.
 func finishImageBuild(digest string) {
 	printSuccess("Built image %q (%s)", imageBuildName, vmimage.ShortDigest(digest))
-	fmt.Printf("\nUse it with: shed create mydev --image %s\n", imageBuildName)
+	fmt.Printf("\n%s\n", imageUseHint(imageBuildName))
+}
+
+// imageUseHint is the line that says how to create a shed from the image
+// name just built: a command only with the name as config.ShellWord gives
+// it, else the name escaped, in words, with no command line. (The build
+// checks the name first, vmimage.ValidateImageName; this holds whatever it
+// is given.)
+func imageUseHint(name string) string {
+	if word, ok := config.ShellWord(name); ok {
+		return "Use it with: shed create mydev --image " + word
+	}
+	return fmt.Sprintf("Use it with the --image flag of shed create, naming the image %q "+
+		"(its name cannot be pasted safely as one word, so no command line is shown)", name)
 }
 
 func runImageList(_ *cobra.Command, _ []string) error {
@@ -615,7 +628,7 @@ func runImageList(_ *cobra.Command, _ []string) error {
 	w.Flush()
 	if !jsonFlag && len(resp.Images) > 0 {
 		fmt.Println()
-		fmt.Println("Use 'shed image rm <image>' to remove an image, or 'shed image prune' to GC unused blobs.")
+		fmt.Println("Use `shed image rm IMAGE` to remove an image, or `shed image prune` to GC unused blobs.")
 	}
 	return nil
 }

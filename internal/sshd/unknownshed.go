@@ -59,13 +59,16 @@ func (st unknownShedStats) zero() bool {
 	return st.noShed == 0 && st.existing == 0 && st.skipped == 0 && st.failed == 0
 }
 
-// line is the hourly log line of st.
+// line is the hourly log line of st. "asked for a pull" counts the nudges
+// that took the shed-name slot and asked the runtime for a pull: the pull may
+// join one already asked for, or not be sent at all (a Retry-After, or the
+// failed state's rate, when it would start).
 func (st unknownShedStats) line() string {
 	failed := fmt.Sprintf("%d checks failed", st.failed)
 	if st.failed > 0 {
 		failed += ": " + st.firstErr
 	}
-	return fmt.Sprintf("directory: in the last hour %d unknown keys were offered as a name that is no shed here and %d as an existing shed's name (%d started a pull, %d skipped while a check ran, %s)",
+	return fmt.Sprintf("directory: in the last hour %d unknown keys were offered as a name that is no shed here and %d as an existing shed's name (%d asked for a pull, %d skipped while a check ran, %s)",
 		st.noShed, st.existing, st.pulled, st.skipped, failed)
 }
 

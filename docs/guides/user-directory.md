@@ -338,7 +338,7 @@ happens to a genuine newcomer, they try again a minute later, or an admin runs
 `shed users refresh` first.
 
 A key a person added on the service, used first to log in to an existing shed
-(`ssh <shed>@build-1.example.test`), is refused at once; the server then pulls
+(`ssh web@build-1.example.test`, for a shed named `web`), is refused at once; the server then pulls
 the list in the background (at most once every 5 minutes) and a retry a few
 seconds later gets in. An unknown key under any other name, one no shed on
 the server has (such as `root` or `ubuntu`, unless a shed has that name),
@@ -582,8 +582,8 @@ name:
   person.
 - Sheds of earlier users who are not in the list keep their user; an admin can
   see, stop and delete them.
-- Sheds with no user are admin-only until an admin runs `shed assign <shed>
-  <user>`, which accepts a list user.
+- Sheds with no user are admin-only until an admin assigns them, which accepts
+  a list user: `shed assign web pat` gives the shed `web` to `pat`.
 - The [one-time upgrade step](multi-user-server.md#sheds-with-no-user) reads
   the local admins only, never the list: on a server that never had a user
   list, a single local admin receives every shed with no user (and the
@@ -592,8 +592,8 @@ name:
 - Client certificates that name their user keep working where the list (or the
   local admins) has that name with the same key. A certificate issued by a
   server older than v0.10.0 names no user: the CLI refuses such an entry
-  before it sends anything, and `shed server update <name> --refetch` enrols
-  it again.
+  before it sends anything, and a refetch enrols it again (for an entry named
+  `shed`: `shed server update shed --refetch`).
 
 GitHub usernames are not supported on a directory server: move each person's
 keys to the service.
@@ -941,7 +941,7 @@ there, or the old client id in `disabled`). Stop both with Ctrl-C and remove
 | `entry "shed" now records user "admin", but this command was using it as user "pat" (...); nothing was saved and this command's certificate is no longer used. Run the command again.` | Another `shed` process changed the entry's user (for example `--refetch --allow-user-change`) while this command re-enrolled | Run the command again; it uses the entry as it now is |
 | `entry "shed": a client certificate update did not complete and the previous certificate could not be put back (...); its certificate files and its recorded user may now disagree. ...` | Writing a new certificate, or saving `config.yaml` after it, failed, and putting the old certificate back failed too (a full or read-only disk) | Fix the disk, then `shed server update shed --refetch` |
 | `the server issued a certificate for user "pat", but entry "shed" could not be updated to record that user (...); the certificate was not used and nothing was kept. ...` | The entry recorded no user yet, and saving `config.yaml` (or writing the certificate files) failed, so the first user could not be recorded. Nothing is sent as a user the entry does not record | Make `config.yaml` and `~/.shed/creds/` writable, then run the command again |
-| A tunnel stops: `the server issued a certificate for user "pat", but entry "shed" records no user, and this long-running command (a tunnel) never records one; ...` | The server gained a user list while a tunnel daemon was running for an entry that records no user. A daemon never takes up a user the entry does not record | `shed server update shed --refetch` (it prints `User: <name>`: check it is you), then `shed tunnels stop <shed>` and `shed tunnels start <shed>` |
+| A tunnel stops: `the server issued a certificate for user "pat", but entry "shed" records no user, and this long-running command (a tunnel) never records one; ...` | The server gained a user list while a tunnel daemon was running for an entry that records no user. A daemon never takes up a user the entry does not record | `shed server update shed --refetch` (it prints `User: <name>`: check it is you), then, for a tunnel into the shed `web`, `shed tunnels stop web` and `shed tunnels start web` |
 | `entry "shed" could not be verified against its recorded user and identity (...); nothing was saved and this command's certificate is no longer used. ...` | During a re-enrolment the CLI could not lock the entry's credential files or read `config.yaml`, the entry was removed or changed meanwhile, or the key in its `identity_file` changed while the command ran | Fix what the message names (permissions, a damaged `config.yaml`, the `identity_file`), check the entry with `shed server list`, then run the command again |
 | `shed server list` shows `refused` | One of the refusals above; its message is printed above the table | As for that message |
 | `shed ssh-config --all` fails with `no configured server could be used: <n> refused (see above)` | No configured server answered, and at least one is refused; each refused server's message is printed above | As for that message |

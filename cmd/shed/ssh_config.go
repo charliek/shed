@@ -101,14 +101,19 @@ func runSSHConfig(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Println("No sheds found.")
 		fmt.Println("\nTo create a shed:")
-		fmt.Println("  shed create <name>")
+		fmt.Println("  shed create NAME")
 		return nil
 	}
 
 	// Generate entries
-	entries, err := generateEntries(sheds)
+	entries, sheds, err := generateEntries(sheds)
 	if err != nil {
 		return err
+	}
+	if len(entries) == 0 {
+		// Every shed was skipped, each with its warning above: nothing is
+		// printed or written, as when there is no shed at all.
+		return fmt.Errorf("no shed's ssh config entry could be written (see the warnings above)")
 	}
 
 	// Handle different modes
@@ -229,23 +234,38 @@ func getAllShedsInfo() ([]shedInfo, error) {
 	return result, nil
 }
 
-// generateEntries builds the ssh config stanza for each shed. A server entry
-// with an identity_file gives its sheds' stanzas `IdentityFile "<path>"` and
-// `IdentitiesOnly yes`; the value and the file are checked first
-// (ServerEntry.SSHIdentityArgs), and one that cannot be used fails the
-// command, named for its entry, before anything is printed or written.
-func generateEntries(sheds []shedInfo) ([]sshconfig.Entry, error) {
+// generateEntries builds the ssh config stanza for each shed, and returns the
+// stanzas and the sheds they are for. A server entry with an identity_file
+// gives its sheds' stanzas its identity lines (sshconfig.IdentityLines); the
+// value and the file are checked first (ServerEntry.SSHIdentityArgs), and one
+// that cannot be used fails the command, named for its entry, before anything
+// is printed or written.
+//
+// A shed whose stanza the ssh config writer refuses (sshconfig.Entry.Validate:
+// above all a name from the server's shed list that is not a shed name, which
+// could otherwise add lines such as a ProxyCommand to ~/.ssh/config) is
+// skipped, with one warning line on standard error naming it escaped. It is
+// never printed, written or used to build an alias; the other sheds are.
+func generateEntries(sheds []shedInfo) ([]sshconfig.Entry, []shedInfo, error) {
 	entries := make([]sshconfig.Entry, 0, len(sheds))
+	kept := make([]shedInfo, 0, len(sheds))
 	knownHostsPath := config.GetKnownHostsPath()
 
 	for _, shed := range sheds {
 		if _, err := shed.server.SSHIdentityArgs(shed.serverName); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		entries = append(entries, shedSSHConfigEntry(shed.name, shed.server, knownHostsPath))
+		entry := shedSSHConfigEntry(shed.name, shed.server, knownHostsPath)
+		if err := entry.Validate(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipped shed %s on server %s: %v\n",
+				sdkbootstrap.SafeText(shed.name), sdkbootstrap.SafeText(shed.serverName), err)
+			continue
+		}
+		entries = append(entries, entry)
+		kept = append(kept, shed)
 	}
 
-	return entries, nil
+	return entries, kept, nil
 }
 
 // shedSSHConfigEntry is the stanza of one shed on server, checking nothing:
@@ -275,22 +295,12 @@ func sshAliasHint(alias string) string {
 }
 
 // sshHostAlias reports whether alias is a Host alias of the shape shed
-// generates (`shed-<shed>`, `shed-<server>-<shed>`): not empty, not starting
-// with `-` (ssh would read an option), and only ASCII letters, digits, `.`,
-// `_` and `-`. Such a name is one shell word as it is, and ssh reads it as a
-// host alias with no user part (`@`) and no port.
+// generates (`shed-<shed>`, `shed-<server>-<shed>`): sshconfig.PlainAlias,
+// the rule the ssh config writer holds every alias to. Such a name is one
+// shell word as it is, and ssh reads it as a host alias with no user part
+// (`@`) and no port.
 func sshHostAlias(alias string) bool {
-	if alias == "" || alias[0] == '-' {
-		return false
-	}
-	for i := 0; i < len(alias); i++ {
-		c := alias[i]
-		alnum := 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9'
-		if !alnum && c != '.' && c != '_' && c != '-' {
-			return false
-		}
-	}
-	return true
+	return sshconfig.PlainAlias(alias)
 }
 
 func printSSHConfig(entries []sshconfig.Entry) {
@@ -323,7 +333,9 @@ func roostAliasEntries(parsed *sshconfig.ParsedConfig, sheds []shedInfo, entries
 		}
 		alias := shedSSHConfigEntry(shed.name, shed.server, knownHostsPath)
 		alias.Name = "shed-" + shed.serverName + "-" + shed.name
-		if have[alias.Name] || parsed.FindEntry(alias.Name) == nil {
+		// An alias the writer refuses (a server entry name that makes it no
+		// plain host alias) is not kept: the regenerated block drops it.
+		if have[alias.Name] || parsed.FindEntry(alias.Name) == nil || alias.Validate() != nil {
 			continue
 		}
 		have[alias.Name] = true

@@ -679,7 +679,7 @@ func TestSourceFlagErrorsAreEscaped(t *testing.T) {
 			if !strings.Contains(stderr, `\u202egnp.exe\u200b`) && !strings.Contains(stderr, `\\u202egnp.exe\\u200b`) {
 				t.Errorf("the error does not show the argument escaped:\n%s", stderr)
 			}
-			const hint = "put -- before a machine name that begins with '-': shed source use -- <name>"
+			const hint = "put -- before a machine name that begins with '-': shed source use -- NAME"
 			msg := stderr
 			if tc.json {
 				var obj struct {

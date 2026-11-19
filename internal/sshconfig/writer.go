@@ -25,11 +25,11 @@ type Entry struct {
 	// IdentityFile, when set, is the key ssh offers first for this host, and
 	// no agent-only key; the stanza gains IdentityLines: `IdentityFile
 	// "<path>"`, `IdentitiesOnly yes`, `ControlMaster no` and `ControlPath
-	// none`. The caller checks the value first
-	// (config.ServerEntry.SSHIdentityArgs): it is written inside double quotes
-	// as it is, which is safe only because that rule refuses `"`, `\`, `%`,
-	// `$`, `#`, CR, LF and NUL. Empty writes the stanza exactly as it was
-	// without the field.
+	// none`. The value is checked first (the caller's
+	// config.ServerEntry.SSHIdentityArgs, and every writer's Entry.Validate): it
+	// is written inside double quotes as it is, which is safe only because that
+	// rule refuses `"`, `\`, `%`, `$`, `#`, CR, LF and NUL. Empty writes the
+	// stanza exactly as it was without the field.
 	IdentityFile string
 }
 
@@ -236,8 +236,16 @@ func (d Diff) HasChanges() bool {
 }
 
 // Write writes the SSH config file with the managed block.
-// It performs an atomic write by writing to a temp file first.
+// It performs an atomic write by writing to a temp file first. Every entry is
+// checked first (Entry.Validate): one that fails it is refused and nothing is
+// written.
 func Write(path string, before string, entries []Entry, after string) error {
+	for _, entry := range entries {
+		if err := entry.Validate(); err != nil {
+			return err
+		}
+	}
+
 	// Ensure the .ssh directory exists
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {

@@ -421,7 +421,7 @@ func TestUnknownKeyShedStatsLine(t *testing.T) {
 	s.stats = unknownShedStats{noShed: 7, existing: 2, pulled: 1, skipped: 3, failed: 2, firstErr: "shed metadata unreadable"}
 	s.statsMu.Unlock()
 	s.flushUnknownShedStats()
-	const want = "directory: in the last hour 7 unknown keys were offered as a name that is no shed here and 2 as an existing shed's name (1 started a pull, 3 skipped while a check ran, 2 checks failed: shed metadata unreadable)\n"
+	const want = "directory: in the last hour 7 unknown keys were offered as a name that is no shed here and 2 as an existing shed's name (1 asked for a pull, 3 skipped while a check ran, 2 checks failed: shed metadata unreadable)\n"
 	if out.String() != want {
 		t.Fatalf("line\n got %q\nwant %q", out.String(), want)
 	}
@@ -435,7 +435,7 @@ func TestUnknownKeyShedStatsLine(t *testing.T) {
 	s.stats = unknownShedStats{noShed: 1}
 	s.statsMu.Unlock()
 	s.flushUnknownShedStats()
-	if !strings.HasSuffix(out.String(), "(0 started a pull, 0 skipped while a check ran, 0 checks failed)\n") {
+	if !strings.HasSuffix(out.String(), "(0 asked for a pull, 0 skipped while a check ran, 0 checks failed)\n") {
 		t.Fatalf("a line with no failure: %q", out.String())
 	}
 }

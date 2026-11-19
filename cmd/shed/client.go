@@ -753,6 +753,7 @@ func persistTokenCredential(name string, endpoint config.ServerEntry, token stri
 		e.ControlTokenExpiresAt = expiresAt
 		e.ClientCertFile, e.ClientKeyFile = "", ""
 		e.ClientCertExpiresAt = time.Time{}
+		// e.User is kept: the held user survives the flip (ServerEntry.User).
 	})
 	if !hadCert {
 		return
@@ -1662,11 +1663,15 @@ func (c *APIClient) readSSEStream(body io.Reader, onProgress func(backend.Progre
 		case "complete":
 			return true, []byte(data), nil
 		case "error":
+			// Server text, escaped as parseError escapes it (SafeText):
+			// printable text is unchanged, a control character never reaches
+			// the terminal raw.
 			var apiErr config.APIError
 			if uerr := json.Unmarshal([]byte(data), &apiErr); uerr != nil {
-				return true, nil, fmt.Errorf("server error: %s", data)
+				return true, nil, fmt.Errorf("server error: %s", sdkbootstrap.SafeText(data))
 			}
-			return true, nil, fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
+			return true, nil, fmt.Errorf("%s: %s",
+				sdkbootstrap.SafeText(apiErr.Error.Code), sdkbootstrap.SafeText(apiErr.Error.Message))
 		}
 		return false, nil, nil
 	}
@@ -2247,20 +2252,6 @@ func (c *APIClient) SystemPrune(opts SystemPruneOptions) (*config.PruneReport, e
 	return &report, nil
 }
 
-// Ping checks if the server is reachable. A refused client answers false
-// without dialling.
-func (c *APIClient) Ping() bool {
-	if c.tokens.Err() != nil {
-		return false
-	}
-	resp, err := c.newHTTPClient(2 * time.Second).Get(c.baseURL + "/api/info")
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
-}
-
 // Server statuses `shed server list` shows.
 const (
 	serverStatusOnline  = "online"
@@ -2314,7 +2305,11 @@ type apiStatusError struct {
 func (e *apiStatusError) Error() string { return e.text }
 
 // parseError extracts the error message from an API error response, as an
-// *apiStatusError carrying the status.
+// *apiStatusError carrying the status. What the server sent (the body, or the
+// structured error's code and message) is escaped as its neighbours escape
+// server text (sdkbootstrap.SafeText): printable text is unchanged, and a
+// control character (an ESC sequence, a line break) never reaches the
+// terminal raw.
 func (c *APIClient) parseError(resp *http.Response) error {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -2323,10 +2318,12 @@ func (c *APIClient) parseError(resp *http.Response) error {
 
 	var apiErr config.APIError
 	if err := json.Unmarshal(body, &apiErr); err != nil {
-		// If not a structured error, return the body as-is
-		return &apiStatusError{Status: resp.StatusCode,
-			text: fmt.Sprintf("server returned status %d: %s", resp.StatusCode, string(body))}
+		// If not a structured error, return the body as it is, escaped (the
+		// line break that ends a plain-text body ends the line, as before).
+		return &apiStatusError{Status: resp.StatusCode, text: fmt.Sprintf("server returned status %d: %s",
+			resp.StatusCode, sdkbootstrap.SafeText(strings.TrimRight(string(body), "\r\n")))}
 	}
 
-	return &apiStatusError{Status: resp.StatusCode, text: fmt.Sprintf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)}
+	return &apiStatusError{Status: resp.StatusCode, text: fmt.Sprintf("%s: %s",
+		sdkbootstrap.SafeText(apiErr.Error.Code), sdkbootstrap.SafeText(apiErr.Error.Message))}
 }

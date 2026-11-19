@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/config"
+	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 )
 
 var snapshotCmd = &cobra.Command{
@@ -130,7 +131,7 @@ func runSnapshotList(cmd *cobra.Command, args []string) error {
 	entry, serverName, err := getServerEntry()
 	if err != nil {
 		printError("no server configured",
-			"shed server add <hostname>  # Add a server first")
+			"shed server add HOST  # Add a server first")
 		return err
 	}
 
@@ -230,16 +231,26 @@ func runSnapshotInfo(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Comment:        %s\n", snap.Comment)
 	}
 	if snap.LowerDigest != "" && !snap.LowerCached {
-		ref := snap.SourceImage
-		if ref == "" {
-			ref = "<unknown>"
-		}
-		fmt.Fprintf(os.Stderr,
-			"\nWarning: this snapshot's lower image is no longer cached.\n"+
-				"  shed create --from-snapshot %s will fail until you pull/rebuild %s.\n",
-			snap.Name, ref)
+		fmt.Fprint(os.Stderr, snapshotLowerWarning(snap.Name, snap.SourceImage))
 	}
 	return nil
+}
+
+// snapshotLowerWarning is the warning for a snapshot whose lower image is no
+// longer cached. The snapshot's name and its source image come from the
+// server: the name is in the command only as config.ShellWord gives it (else
+// named escaped, in words), and the image is named escaped, outside it.
+func snapshotLowerWarning(snapName, sourceImage string) string {
+	image := "its source image (not recorded)"
+	if sourceImage != "" {
+		image = sdkbootstrap.SafeText(sourceImage)
+	}
+	create := fmt.Sprintf("creating a shed from the snapshot %q", snapName)
+	if word, ok := config.ShellWord(snapName); ok {
+		create = "`shed create NAME --from-snapshot " + word + "`"
+	}
+	return "\nWarning: this snapshot's lower image is no longer cached.\n" +
+		"  " + create + " will fail until you pull/rebuild " + image + ".\n"
 }
 
 func runSnapshotDelete(cmd *cobra.Command, args []string) error {

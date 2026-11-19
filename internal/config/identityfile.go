@@ -219,7 +219,8 @@ func IdentityPublicKey(entry, path string) (ssh.PublicKey, error) {
 			ownErr, pubPath, sdkbootstrap.SafeText(reasonOf(besideErr)))
 	}
 	return nil, refuse(reason + "; shed needs the public key to check that the server enrolled this key: " +
-		"put the key's .pub file beside it, or use a key in the OpenSSH format (ssh-keygen -p -f <key> rewrites it)")
+		"put the key's .pub file beside it, or use a key in the OpenSSH format (ssh-keygen -p -f " +
+		identityFilePlaceholder + " rewrites it, with the key's path in place of " + identityFilePlaceholder + ")")
 }
 
 // isNotExistIdentity reports whether err is OpenIdentityFile's "does not exist".

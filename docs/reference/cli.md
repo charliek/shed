@@ -156,6 +156,16 @@ process while the key changes is refused with nothing saved
 (`entry "<name>" changed while this command ran`), and so is one racing an
 `--allow-user-change`.
 
+The ssh config stanzas `shed ssh-config --install` wrote for the entry's sheds,
+and the `Host` alias `shed attach` wrote, are not rewritten by
+`server update`: until they are written again, a program that connects through
+them (plain `ssh`, roost) offers the key they name. After the key is changed,
+run `shed ssh-config --install` again, and `shed attach` rewrites its alias at
+its next run. After it is cleared, both keep the old key's lines (a stanza for
+an entry without an identity file is compared by name only, so neither rewrites
+it): run `shed ssh-config --uninstall`, then `shed ssh-config --install`, and
+`shed attach` once more for each shed you attach to.
+
 `--refetch` follows the same SSH-first path as `shed server add`: it re-verifies
 the pinned host key, re-bootstraps, and takes the new TLS pin from the bundle —
 which is the only way to re-pin an `auth.mode: mtls` server, whose HTTPS
@@ -184,8 +194,9 @@ Rotating an existing pin in a non-interactive session requires
 `--trust-on-first-use`.
 
 An mtls entry is held to the user its certificates name (`user` in
-`config.yaml`). `--refetch` prints that user (`  User: pat`) and records it when
-the entry has none yet. When the server issues a certificate for another user
+`config.yaml`). `--refetch` prints that user (`  User: pat`, or
+`  User: (implicit)` from a server with no user list, as the add prints them)
+and records it when the entry has none yet. When the server issues a certificate for another user
 (for example because `ssh` offered a key that belongs to someone else), the
 refetch fails before its network check and writes nothing; add
 `--allow-user-change` to make the entry that user, which prints
@@ -254,15 +265,15 @@ The `ENDPOINT` is the control-plane URL the CLI actually uses (`https://…` for
 
 | `USER` | Meaning |
 |---|---|
-| a name (`pat`) | The user the entry records (`user` in `config.yaml`), whatever its stored certificate says: the only user the CLI acts as for it |
+| a name (`pat`) | The user the entry records (`user` in `config.yaml`), whatever its stored certificate says: the only user the CLI acts as for it. An entry whose server went back to issuing control tokens (a server older than v0.10.0) keeps the user it recorded, and shows it: a certificate the server issues once it is upgraded again must name that user |
 | `(implicit)` | The entry records no user, and its stored certificate is for the implicit user of a server with no user list |
-| `-` | No user to show. For a plain-HTTP entry (`auth.mode: open`) and for a control-token entry (a server older than v0.10.0 in token mode): these credentials name no user. For an mtls entry: no certificate on file yet, one that cannot be read, or one the CLI refuses. Also for a `user` in `config.yaml` that is not a valid user name (a hand edit; it is never printed), and for an entry whose row could not be read again |
+| `-` | No user to show. For a plain-HTTP entry (`auth.mode: open`) and for a control-token entry that records no user (a server older than v0.10.0 in token mode): these credentials name no user. For an mtls entry: no certificate on file yet, one that cannot be read, or one the CLI refuses. Also for a `user` in `config.yaml` that is not a valid user name (a hand edit; it is never printed), and for an entry whose row could not be read again |
 
 It never shows a name the entry does not record: an entry that records no user but holds a certificate for a named user shows `-`, with `STATUS` `refused`.
 
 `STATUS` is `online`, `offline`, or `refused`: the CLI refuses the entry (see [`shed server update`](#shed-server-update)), either for its stored certificate, which is known without sending a request, or because the server rejected its certificate and the re-enrolment was issued another user's. The refusal's message is printed once to stderr.
 
-Add `--json` for the full record, including `https_port`, `tls_pinned`, the pinned fingerprint, and who the entry is as two members: `user`, the user name the entry records (omitted when it records none, or none that is a valid user name), and `user_implicit`, `true` when the entry's stored certificate is the implicit user's (it can be `true` beside a `user`: a named entry whose server dropped its user list). The JSON never carries the text's `(implicit)` or `-`.
+Add `--json` for the full record, including `https_port`, `tls_pinned`, the pinned fingerprint, `identity_file` (the entry's key, as `server add` and `server update` report it; omitted when it has none), and who the entry is as two members: `user`, the user name the entry records (omitted when it records none, or none that is a valid user name), and `user_implicit`, `true` when the entry's stored certificate is the implicit user's (it can be `true` beside a `user`: a named entry whose server dropped its user list). The JSON never carries the text's `(implicit)` or `-`.
 
 ### shed server remove
 
@@ -391,7 +402,7 @@ mcp-test      firecracker  stopped  -                               -           
 | `STATUS` | `running`, `stopped`, `starting`, `stopping` or `error`, followed by the reason in brackets when the server gives one (`stopped (run_limit)`). See [Remote backend › Statuses](remote-backend.md#statuses). |
 | `ID` | The shed's permanent ID. Shown only when a listed shed has one (remote sheds do). |
 
-With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `User:` (when it has one), `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `user`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`.
+With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `User:` (when it has one), `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `user`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)), and, as `--json create` does, the record's `isolation` and `arch` when the server sends them (each omitted otherwise). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`.
 
 ### shed start
 
@@ -1582,6 +1593,22 @@ more than one of either line, one without the other, or the END line first is
 refused, naming the file, and nothing is changed; `shed attach` refuses it the
 same way.
 
+A shed's name comes from the server's shed list, and is the stanza's `User`
+and part of its `Host` alias. A name that is not a shed name (a line break, a
+space, `*`, `%`, a quote: nothing a server that follows the rules sends) is
+skipped, with one warning line on standard error naming it escaped
+(`warning: skipped shed …`), and the other sheds are printed or written; when
+every shed is skipped the command fails and writes nothing. The writer of
+`~/.ssh/config` (here and in `shed attach`) refuses any stanza whose alias,
+user, host name, port, `UserKnownHostsFile` or `IdentityFile` could end its
+line or be read as a pattern or token, and writes nothing then. The server
+entry's host, written as `HostName`, must be a literal host name or address: a
+DNS name or IPv4 address (ASCII letters, digits, `.`, `-` and `_`, starting
+and ending with a letter or digit) or an IPv6 address (hex digits and `:`, with
+no zone and no brackets). ssh expands `%` tokens in `HostName`, and a
+`ProxyCommand` in your own config can hand it to a shell, so any other value
+is refused, naming the field.
+
 ## Roost Integration
 
 ### shed roost-provider
@@ -1797,10 +1824,15 @@ key pair, sends the public key with a one-time enrolment code, and on the
 service's answer writes the key and the enrolment to
 `{state_dir}/directory/enrolment.json` (mode `0600`, in a directory of mode
 `0700`). Run it on the shed host as the user the server runs as, with the same
-`--config`.
+`--config`: with `sudo` for the Linux package, whose server runs as root; as
+yourself, never with `sudo`, for Homebrew, whose service runs as your user
+(see [User directory › Enrol](../guides/user-directory.md#enrol)).
 
 ```bash
-sudo shed-server directory enroll [--name <name>] [--config <path>]
+# Linux package
+sudo shed-server --config /etc/shed/server.yaml directory enroll [--name <name>]
+# Homebrew
+"$(brew --prefix)/opt/shed/bin/shed-server" --config "$(brew --prefix)/etc/shed/server.yaml" directory enroll [--name <name>]
 ```
 
 | Flag | Default | Description |

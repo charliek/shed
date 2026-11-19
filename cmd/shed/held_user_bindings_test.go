@@ -132,8 +132,8 @@ func TestUnrecordedFirstUserIsNeverUsed(t *testing.T) {
 	if _, err := first.GetInfo(); err == nil {
 		t.Error("the first process sent a request")
 	}
-	if first.Ping() {
-		t.Error("the first process's Ping reached the server")
+	if status, _ := first.Status(); status == serverStatusOnline {
+		t.Error("the first process's status probe reached the server")
 	}
 	if first.tokens.CertificateFor(context.Background()) != nil {
 		t.Error("the first process still presents a certificate")
@@ -287,8 +287,8 @@ func TestRefusalKeepsOnlyWhenTheRowStillRecordsTheHeldUser(t *testing.T) {
 				if _, err := c.GetInfo(); err == nil {
 					t.Fatal("a second request was sent")
 				}
-				if c.Ping() {
-					t.Error("Ping reached the server")
+				if status, _ := c.Status(); status == serverStatusOnline {
+					t.Error("the status probe reached the server")
 				}
 				if got := m.accepted.Load(); got != 0 {
 					t.Errorf("the server accepted %d connection(s), want 0 (pat's certificate was sent again)", got)
@@ -350,7 +350,7 @@ func TestClientAfterFirstEnrolmentInTheLookupWorks(t *testing.T) {
 // TestKeptCertificateExpiresAtThePreSendCheck: a proactive refresh is refused
 // (admin's certificate came back) while pat's certificate is still valid, so
 // the client keeps it. Once its NotAfter has passed, no path sends or dials
-// with it — a JSON request, an event stream, Ping and Status — even though
+// with it — a JSON request, an event stream and Status — even though
 // none of them runs another proactive refresh: each one's pre-send check sees
 // the expiry and ends the client with the remembered refusal, unwrapped.
 func TestKeptCertificateExpiresAtThePreSendCheck(t *testing.T) {
@@ -376,9 +376,6 @@ func TestKeptCertificateExpiresAtThePreSendCheck(t *testing.T) {
 	asRefusal(t, err, config.RefusedIssuedUserChange)
 	_, err = c.CreateShedWithProgress(&config.CreateShedRequest{Name: "x"}, false, func(backend.ProgressEvent) {})
 	asRefusal(t, err, config.RefusedIssuedUserChange)
-	if c.Ping() {
-		t.Error("Ping reported the server online with an expired kept certificate")
-	}
 	status, err := c.Status()
 	asRefusal(t, err, config.RefusedIssuedUserChange)
 	if status != serverStatusRefused {
@@ -462,6 +459,11 @@ func TestSSHConfigAllReportsRefusals(t *testing.T) {
 		setup(t)
 		delete(clientConfig.Servers, "b")
 		addFakeServer("ok", shedListServer(t))
+		// The stanza names the entry's SSH host and port (an entry with
+		// neither has no stanza the ssh config writer accepts).
+		ok := clientConfig.Servers["ok"]
+		ok.Host, ok.SSHPort = "shed.example.test", 2222
+		clientConfig.Servers["ok"] = ok
 		stdout, stderr, err := run(t)
 		if err != nil {
 			t.Fatalf("ssh-config --all failed although a server answered: %v", err)

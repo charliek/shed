@@ -637,7 +637,7 @@ func (r *Runtime) RefetchForUnknownKey(ctx context.Context, fingerprint string) 
 	if !ok {
 		return false
 	}
-	r.logf("directory: unknown key %s: pulling the list (at most once a minute while pulls succeed, once every %s while they fail)", fingerprint, RetryInterval)
+	r.logf("directory: unknown key %s: pulling the list (%s)", fingerprint, unknownKeyRates(UnknownKeyEvery))
 	deadline, stop := r.timer(UnknownKeyWait)
 	defer stop()
 	r.ask(askUnknown, prev)
@@ -684,9 +684,31 @@ func (r *Runtime) NudgeForUnknownKey(fingerprint string) bool {
 	if !ok {
 		return false
 	}
-	r.logf("directory: shed-name key %s for an existing shed: pulling the list in the background (at most once every 5 minutes while pulls succeed, once every 15 minutes while they fail)", fingerprint)
+	r.logf("directory: shed-name key %s for an existing shed: pulling the list in the background (%s)",
+		fingerprint, unknownKeyRates(UnknownKeyShedEvery))
 	r.ask(askUnknown, prev)
 	return true
+}
+
+// unknownKeyRates is the rate both unknown-key log lines state, built from
+// the constants so it cannot drift from them: "at most once every <every>
+// while pulls succeed, once every <RetryInterval> while they fail", each in
+// whole minutes (everyText).
+func unknownKeyRates(every time.Duration) string {
+	return fmt.Sprintf("at most %s while pulls succeed, %s while they fail", everyText(every), everyText(RetryInterval))
+}
+
+// everyText says how often a rate of one per d is: "once a minute", "once
+// every 5 minutes", or, for a d that is not a whole number of minutes,
+// "once every <d>".
+func everyText(d time.Duration) string {
+	switch {
+	case d == time.Minute:
+		return "once a minute"
+	case d > 0 && d%time.Minute == 0:
+		return fmt.Sprintf("once every %d minutes", d/time.Minute)
+	}
+	return "once every " + d.String()
 }
 
 // knows reports whether the lookup knows the key with this fingerprint now
