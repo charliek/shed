@@ -195,6 +195,18 @@ jobs:
       - run: go test -v ./...
         env:
           SHED_REQUIRE_SSHD: "1"
+      # The one exception to the sdk rule above: sdk/bootstrap's text checks
+      # against the Rust broker run no ssh, so they run here, and nothing else
+      # of the sdk module does. TestNoSSHIdentitiesTextMatchesRust reads the
+      # Rust NoSshIdentities text and the shared stderr table
+      # (crates/fixtures/bootstrap-stderr/); TestRustTextReaderFailsClosed holds
+      # its reader of the Rust source. (The shared pasteable-word table,
+      # crates/fixtures/shellword/, is read by internal/config's
+      # TestShellWordSharedTable, which `go test ./...` above runs; the Rust
+      # side of both tables is in the rust job's cargo test.)
+      - name: sdk text checks against the Rust broker (no ssh)
+        working-directory: sdk
+        run: go test -v -count=1 -run '^(TestNoSSHIdentitiesTextMatchesRust|TestRustTextReaderFailsClosed)$' ./bootstrap/
 
   lint:
     needs: changes

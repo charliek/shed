@@ -617,9 +617,17 @@ There is no static credential to copy between machines. A certificate is
 issued to one client over SSH and its private key stays with that client, so a
 `~/.shed/config.yaml` entry written by hand cannot reach an mtls server: the
 entry comes from `shed server add`, or from a client re-enrolling on its own.
-`shed server add` therefore needs an allowed key at add time, and fails at once
-with `your SSH key is not in this server's allowlist` when it does not have
-one (see [CLI › shed server add](cli.md#shed-server-add)).
+`shed server add` therefore needs a key the server accepts at add time. When
+the server refuses every key ssh offers, the add fails with `the server refused
+every SSH key ssh offered for _bootstrap@<host>`, followed by the causes ssh
+cannot tell apart: no offered key is a user's key on that server (wherever the
+server takes its users from: its config, GitHub, or an account service), the
+right key has a passphrase and is not in your agent (the CLI runs ssh with
+`BatchMode=yes`, so `ssh-add` it), or the server's user list is not in force
+and only its local admins can log in. A key listed moments ago can be refused
+once while the server fetches the list: try again a minute later. For an entry
+with its own key (`--identity-file`) the message names that key. See [CLI ›
+shed server add](cli.md#shed-server-add).
 
 **Clients older than v0.8.1** have no way to obtain a certificate. A CLI that
 sends no CSR is answered `this server requires auth.mode: mtls; upgrade shed

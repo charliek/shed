@@ -48,6 +48,11 @@ does not stop: the bootstrap shells out to the real ssh client, which honors
 itself against ~/.shed/known_hosts. Pin the key there (ssh-keyscan) if you reach
 this server through ~/.ssh/config.
 
+The host you give is also the API address: the entry's api_url is built from
+it. A ~/.ssh/config Host alias whose HostName points elsewhere therefore enrols
+over SSH and then fails at the API. To give an entry its own SSH key, use the
+server's real name with --identity-file instead of an alias.
+
 Nothing survives a failed add: a host key this command pinned is removed again,
 and no credential material or config entry is left behind.`,
 	Args: cobra.ExactArgs(1),

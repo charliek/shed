@@ -416,8 +416,8 @@ the key paths with yours.
 1. **Make the backup key** with a passphrase, and keep it out of your agent.
    The CLI runs `ssh` with `BatchMode=yes`, which cannot ask for a passphrase:
    load the key for a few minutes when you need it. Without it in the agent,
-   adding the admin entry fails with `Error: your SSH key is not in this
-   server's allowlist ...`.
+   adding the admin entry fails with `Error: the server refused the entry's
+   SSH key ... for _bootstrap@shed.example.test: ...`.
 
     ```bash
     ssh-keygen -t ed25519 -f ~/.ssh/shed-admin -C shed-admin
@@ -482,9 +482,11 @@ key out of such a stanza.
 Every command through the everyday entry fails and exits 1:
 
 ```text
-Error: failed to list sheds: re-authenticating after a TLS client-certificate rejection: sdk/bootstrap: ssh could not authenticate with any available identity (the daemon may have no SSH identity available — see IdentityAgent docs — or the key may not be on the server allowlist): ...
-_bootstrap@shed.example.test: Permission denied (publickey).
+Error: failed to list sheds: re-authenticating after a TLS client-certificate rejection: sdk/bootstrap: the server refused every key ssh offered (no key ssh can reach, for example an agent ssh cannot find — see IdentityAgent; not a user's key; a passphrase key not in the agent; or the server's user list not in force. A key listed moments ago can be refused once: try again): _bootstrap@shed.example.test: Permission denied (publickey).
 ```
+
+ssh's own words come last, shown escaped: a line break in them reads `\n`,
+and any other control or non-ASCII character `\u{…}`.
 
 Use the admin entry. It works with the backup key out of the agent while its
 certificate is valid (`auth.token_ttl`, 24 hours by default); when a command
@@ -521,7 +523,7 @@ user:
 
 ```text
 the server issued a certificate for user "admin", but entry "shed" is held to user "pat"; nothing was saved.
-ssh offered a key that belongs to "admin". To stay "pat", let this entry offer only pat's key (shed server update shed --identity-file <pat's private key>) and retry.
+ssh offered a key that belongs to "admin". To stay "pat", let this entry offer only the private key of user "pat" (shed server update shed --identity-file /path/to/key, with that key's path in place of /path/to/key) and retry.
 To make this entry "admin": shed server update shed --refetch --allow-user-change
 ```
 

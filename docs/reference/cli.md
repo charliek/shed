@@ -55,7 +55,16 @@ What the bootstrap returns decides the rest:
 | `auth.mode: open` | The server issues no credential, so the command falls back to the HTTP probe (`--port`, `--https-port`, `--secure`) to find the API endpoint |
 | `auth.mode: token` (a server older than v0.10.0) | A scoped, short-TTL control token, written as `control_token` + `control_token_expires_at` (never printed) |
 
-Against an mtls server your SSH key must be one the server accepts (listed under `auth.users`, or in `auth.ssh.github_users` / `authorized_keys`); a key that is not is a hard error, not a downgrade. On a server with users, the entry acts as the user your key belongs to. From then on the CLI renews the credential transparently, near expiry and on a rejection. See [Security › Enrollment over SSH](security.md#enrollment-over-ssh) and [Security › Native pinned TLS](security.md#native-pinned-tls).
+Against an mtls server your SSH key must be one the server accepts (a user's key wherever the server takes its users from: `auth.users`, `auth.ssh.github_users` / `authorized_keys` on a server with no user list, or an account service); a key that is not is a hard error, not a downgrade. ssh cannot say why a server refused every key it offered, so the error names each cause you can act on:
+
+```text
+the server refused every SSH key ssh offered for _bootstrap@shed.example.test: none of them is a user's key there,
+or the right key has a passphrase and is not in your agent (shed runs ssh with BatchMode=yes: ssh-add it),
+or the server's user list is not in force and only its local admins can log in. A key listed for a user moments
+ago can be refused once while the server fetches it: try again in a minute. sdk/bootstrap: ...
+```
+
+(one line in the terminal). For an entry with its own key (`--identity-file`) it begins `the server refused the entry's SSH key "<path>" (and any other key ssh offered)`. Where a key is listed is the server operator's choice: on a server that takes its users from an account service it is added there, not in `server.yaml`. On a server with users, the entry acts as the user your key belongs to. From then on the CLI renews the credential transparently, near expiry and on a rejection. See [Security › Enrollment over SSH](security.md#enrollment-over-ssh) and [Security › Native pinned TLS](security.md#native-pinned-tls).
 
 The add says who the entry is. Against an mtls server it prints the user the entry is now held to, after the enrol line; check that it is the user you expect:
 
@@ -103,6 +112,8 @@ The host-key scan dials `<host>:<ssh-port>` directly. `ssh` does not: the bootst
 
 - **ssh reaches the server.** Host-key verification is ssh's: `StrictHostKeyChecking=yes` against `~/.shed/known_hosts`, with the global `known_hosts` and every `ssh_config`-supplied host-key source disabled. Nothing is trusted that was not already pinned there, so an unpinned host is refused **by ssh**. If you reach a server through `~/.ssh/config`, pin its key yourself first — `ssh-keyscan -p <port> <hostname> >> ~/.shed/known_hosts` — and the add proceeds normally.
 - **ssh cannot reach it either.** There is no SSH evidence at all, so the command falls back to the HTTP probe, exactly as it did before first contact moved to SSH. It refuses to write an entry if that probe reports a mode that issues credentials (`mtls`, or an older server's token mode): those servers issue their credential over SSH and nowhere else, so an entry written here could never authenticate.
+
+**A `Host` alias is not a way to a second key.** The host you give `server add` is also the API address: the entry's `api_url` is built from it. A `Host` alias in `~/.ssh/config` whose `HostName` points elsewhere therefore enrols over SSH (ssh follows the alias) and then fails at the API, which is dialled at the alias's name. To give an entry its own key, add the server under its real name with `--identity-file` (see [One SSH key per entry](#one-ssh-key-per-entry)).
 
 #### A failed add leaves nothing behind
 

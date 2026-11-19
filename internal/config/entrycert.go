@@ -19,6 +19,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/charliek/shed/internal/servertls"
 	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
@@ -145,7 +146,7 @@ func (e *EntryRefusedError) Error() string {
 	case RefusedStoredNoUser:
 		return fmt.Sprintf("entry %q cannot be used: its certificate names no user "+
 			"(issued by a shed-server older than 0.10.0); no request was sent. "+
-			"Enrol it again: shed server update %s --refetch", e.Entry, e.Entry)
+			"Enrol it again: %s", e.Entry, suggestUpdate(e.Entry, updateRefetch))
 	case RefusedStoredUserMismatch:
 		// The causes include a certificate write that was interrupted (a crash
 		// between writing the files and saving config.yaml) or raced by another
@@ -157,21 +158,24 @@ func (e *EntryRefusedError) Error() string {
 			records = fmt.Sprintf("records user %q (edited by hand, or an interrupted or concurrent enrolment)", e.EntryUser)
 		}
 		return fmt.Sprintf("entry %q cannot be used: its certificate is for user %q but the entry %s; "+
-			"no request was sent. Enrol it again: shed server update %s --refetch",
-			e.Entry, e.CertUser, records, e.Entry)
+			"no request was sent. Enrol it again: %s",
+			e.Entry, e.CertUser, records, suggestUpdate(e.Entry, updateRefetch))
 	case RefusedIssuedNoUser:
 		return "the server issued a certificate that names no user: it runs a shed-server older than 0.10.0; " +
 			"nothing was saved. Upgrade the server to 0.10.0, then retry."
 	case RefusedIssuedUnreadable:
 		return fmt.Sprintf("the server issued a certificate whose user cannot be read (%v); nothing was saved", e.Cause)
 	case RefusedIssuedUserChange:
+		// EntryUser comes from config.yaml, which may be edited by hand: it is
+		// named only in the sentence, escaped (%q), never in the command, whose
+		// key path is a fixed placeholder.
 		return fmt.Sprintf("the server issued a certificate for user %q, but entry %q is held to user %q; nothing was saved.\n"+
-			"ssh offered a key that belongs to %q. To stay %q, let this entry offer only %s's key "+
-			"(shed server update %s --identity-file <%s's private key>) and retry.\n"+
-			"To make this entry %q: shed server update %s --refetch --allow-user-change",
+			"ssh offered a key that belongs to %q. To stay %q, let this entry offer only the private key of user %q "+
+			"(%s, with that key's path in place of %s) and retry.\n"+
+			"To make this entry %q: %s",
 			e.CertUser, e.Entry, e.EntryUser,
-			e.CertUser, e.EntryUser, e.EntryUser, e.Entry, e.EntryUser,
-			e.CertUser, e.Entry)
+			e.CertUser, e.EntryUser, e.EntryUser, suggestUpdate(e.Entry, updateIdentityFile), identityFilePlaceholder,
+			e.CertUser, suggestUpdate(e.Entry, updateAllowUserChange))
 	case RefusedEntryChanged:
 		return fmt.Sprintf("entry %q changed while this command ran; nothing was saved. Run it again.", e.Entry)
 	case RefusedEntryUserChanged:
@@ -184,8 +188,8 @@ func (e *EntryRefusedError) Error() string {
 			"certificate is no longer used. Run the command again.", e.Entry, records, e.CertUser)
 	case RefusedRestoreFailed:
 		return fmt.Sprintf("entry %q: a client certificate update did not complete and the previous certificate could not be put back (%v); "+
-			"its certificate files and its recorded user may now disagree. Enrol it again: shed server update %s --refetch",
-			e.Entry, e.Cause, e.Entry)
+			"its certificate files and its recorded user may now disagree. Enrol it again: %s",
+			e.Entry, e.Cause, suggestUpdate(e.Entry, updateRefetch))
 	case RefusedEntryUnreadable:
 		return fmt.Sprintf("entry %q could not be verified against its recorded user and identity (%v); "+
 			"nothing was saved and this command's certificate is no longer used. "+
@@ -199,9 +203,9 @@ func (e *EntryRefusedError) Error() string {
 	case RefusedMintOnlyUnrecorded:
 		return fmt.Sprintf("the server issued a certificate for user %q, but entry %q records no user, "+
 			"and this long-running command (a tunnel) never records one; the certificate was not used and "+
-			"nothing was sent as that user. Record the user: shed server update %s --refetch, "+
+			"nothing was sent as that user. Record the user: %s, "+
 			"then restart the tunnel (shed tunnels stop, then shed tunnels start).",
-			e.CertUser, e.Entry, e.Entry)
+			e.CertUser, e.Entry, suggestUpdate(e.Entry, updateRefetch))
 	case RefusedIssuedOtherKey:
 		return fmt.Sprintf("the server issued a certificate for SSH key %q, but entry %q uses only its identity_file %q "+
 			"(key %s); nothing was saved.\n"+
@@ -217,10 +221,99 @@ func (e *EntryRefusedError) Error() string {
 	case RefusedStoredTokenForKey:
 		return fmt.Sprintf("entry %q cannot be used: it holds a control token, which does not say which SSH key it "+
 			"was issued for, and the entry uses only its identity_file %q; no request was sent. "+
-			"Enrol it again: shed server update %s --refetch", e.Entry, e.IdentityFile, sdkbootstrap.SafeText(e.Entry))
+			"Enrol it again: %s", e.Entry, e.IdentityFile, suggestUpdate(e.Entry, updateRefetch))
 	default:
 		return fmt.Sprintf("entry %q cannot be used", e.Entry)
 	}
+}
+
+// shellWordBare is every character ShellWord writes bare, besides ASCII
+// letters and digits. The Rust core's shell_server_name uses the same set.
+const shellWordBare = "._-/:@+="
+
+// ShellWord returns s as one word a person can paste into a POSIX shell, and
+// true, or false when no pasted word is safe. The rule, the same as the Rust
+// core's (shed_core::token::shell_server_name, both held to the hand-written
+// table crates/fixtures/shellword/cases.json):
+//
+//   - s is pasteable only if it is not empty, does not start with `-` (a
+//     command would read it as an option), and every byte is printable ASCII
+//     (0x20 to 0x7E). Anything else (a control character such as a line break
+//     or ESC, any non-ASCII character, bytes that are not UTF-8) returns false:
+//     the caller gives its advice in words, with no command line.
+//   - It is written bare when every character is an ASCII letter or digit or
+//     one of shellWordBare, otherwise in single quotes (a single quote inside
+//     is closed, escaped with a backslash and reopened).
+func ShellWord(s string) (string, bool) {
+	if s == "" || s[0] == '-' {
+		return "", false
+	}
+	bare := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c > 0x7e {
+			return "", false
+		}
+		if !asciiAlnum(c) && strings.IndexByte(shellWordBare, c) < 0 {
+			bare = false
+		}
+	}
+	if bare {
+		return s, true
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'", true
+}
+
+// asciiAlnum reports whether c is an ASCII letter or digit.
+func asciiAlnum(c byte) bool {
+	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9'
+}
+
+// updateForm is one of the fixed forms of the `shed server update` command a
+// refusal suggests. The arguments after the entry's name are compile-time
+// constants: nothing read from config.yaml, a certificate or a server is ever
+// placed in a suggested command, except the entry's name as ShellWord gives it.
+type updateForm int
+
+const (
+	// updateRefetch enrols the entry again.
+	updateRefetch updateForm = iota
+	// updateIdentityFile sets the entry's key. Its path is a fixed
+	// placeholder (identityFilePlaceholder) the sentence before it explains.
+	updateIdentityFile
+	// updateAllowUserChange enrols the entry again as the user the server now
+	// issues.
+	updateAllowUserChange
+)
+
+// identityFilePlaceholder stands for a key's path in a suggested command: no
+// angle brackets, quotes or user text, so pasted unchanged it is one plain
+// word, never a redirection.
+const identityFilePlaceholder = "/path/to/key"
+
+// args is the form's arguments after the entry's name.
+func (f updateForm) args() string {
+	switch f {
+	case updateIdentityFile:
+		return "--identity-file " + identityFilePlaceholder
+	case updateAllowUserChange:
+		return "--refetch --allow-user-change"
+	default:
+		return "--refetch"
+	}
+}
+
+// suggestUpdate is the `shed server update` command a refusal suggests for
+// entry, in the given form. A name ShellWord cannot give as one pasted word is
+// never interpolated into a command line: the advice is given in words
+// instead, naming the entry escaped (%q), so a hand-edited name can neither put
+// a control sequence on the terminal nor be pasted as something else.
+func suggestUpdate(entry string, form updateForm) string {
+	if word, ok := ShellWord(entry); ok {
+		return "shed server update " + word + " " + form.args()
+	}
+	return fmt.Sprintf("run shed server update for the entry %q with %s "+
+		"(its name cannot be pasted safely as one word, so no command line is shown)", entry, form.args())
 }
 
 // StoredTokenRefusal is the refusal of an entry, named name, that has an

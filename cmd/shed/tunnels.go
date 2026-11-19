@@ -158,6 +158,20 @@ func init() {
 	rootCmd.AddCommand(tunnelsCmd)
 }
 
+// tunnelPortFlagHint is the advice to name a port with -t when a shed has no
+// tunnel config. The shed's name came from the command line or a server, so
+// it is a command word only as config.ShellWord gives it (bare or
+// single-quoted); a name no pasted word can carry is named escaped, in words,
+// with no command line. cmdName is the subcommand ("start", "config"), a
+// constant.
+func tunnelPortFlagHint(cmdName, shedName string) string {
+	if word, ok := config.ShellWord(shedName); ok {
+		return fmt.Sprintf("Or use -t flag: shed tunnels %s %s -t 3000", cmdName, word)
+	}
+	return fmt.Sprintf("Or use the -t flag of shed tunnels %s for the shed %q "+
+		"(its name cannot be pasted safely as one word, so no command line is shown)", cmdName, shedName)
+}
+
 // collectPortMappings gathers port mappings from profiles and explicit ports.
 func collectPortMappings(mgr *tunnels.Manager, shedName string, profiles, ports []string, cmdName string) ([]tunnels.PortMapping, string, error) {
 	var allPorts []tunnels.PortMapping
@@ -175,7 +189,7 @@ func collectPortMappings(mgr *tunnels.Manager, shedName string, profiles, ports 
 				if errors.Is(err, tunnels.ErrNoTunnelConfig) {
 					printError(fmt.Sprintf("No tunnel config for shed %q", shedName),
 						"Add configuration to ~/.shed/tunnels.yaml",
-						fmt.Sprintf("Or use -t flag: shed tunnels %s %s -t 3000", cmdName, shedName))
+						tunnelPortFlagHint(cmdName, shedName))
 					return nil, "", err
 				}
 				return nil, "", err

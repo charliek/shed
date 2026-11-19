@@ -143,8 +143,9 @@ CLI writes `user` when it enrols the entry; the app only reads it.
   user name `true`. Quote the value (`user: "pat"`) if you mean a name that YAML would read as
   something else.
 - When an entry's name cannot be pasted into a shell command as one word (it starts with `-`,
-  or holds a line break or another non-printing character), the refusal gives the same advice
-  in words instead of a command line.
+  or holds a line break, another control character or any non-ASCII character), the refusal
+  gives the same advice in words instead of a command line. The `shed` CLI follows the same
+  rule.
 
 ### The SSH key an entry uses
 

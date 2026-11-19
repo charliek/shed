@@ -163,9 +163,11 @@ pub enum BootstrapError {
     /// (Go `ErrHostKeyVerificationFailed`).
     #[error("sdk/bootstrap: ssh host key verification failed: {0}")]
     HostKeyVerificationFailed(String),
-    /// A public-key auth failure: the daemon offered no identity ssh could use, or the
-    /// offered key is not on the server allowlist. Retryable (Go `ErrNoSSHIdentities`).
-    #[error("sdk/bootstrap: ssh could not authenticate with any available identity (the daemon may have no SSH identity available — see IdentityAgent docs — or the key may not be on the server allowlist): {0}")]
+    /// A public-key auth failure: the server refused every key ssh offered, for one of
+    /// several causes ssh cannot tell apart, which the text names. Retryable (Go
+    /// `ErrNoSSHIdentities`). The text is Go's (`ErrNoSSHIdentities` and
+    /// `noSSHIdentitiesHint`) byte for byte; a Go test in `sdk/bootstrap` reads this line.
+    #[error("sdk/bootstrap: the server refused every key ssh offered (no key ssh can reach, for example an agent ssh cannot find — see IdentityAgent; not a user's key; a passphrase key not in the agent; or the server's user list not in force. A key listed moments ago can be refused once: try again): {0}")]
     NoSshIdentities(String),
     /// The ssh exchange was aborted (our own timeout, or a caller cancel). Retryable —
     /// the server is not implicated.
@@ -365,7 +367,10 @@ fn classify(exit: i32, host_key_changed: bool, stderr_text: &str) -> BootstrapEr
     if stderr_text.contains("Permission denied (publickey")
         || stderr_text.contains("No more authentication methods")
     {
-        return BootstrapError::NoSshIdentities(msg);
+        // The refusal of every key keeps ssh's words as its cause, and a client shows
+        // them: escaped (`diag_text`, Go `diagText`), never raw, so an ESC or a line
+        // break a ProxyCommand wrote cannot reach a terminal or a log line.
+        return BootstrapError::NoSshIdentities(diag_text(stderr_text.trim(), MAX_ERR_STDERR));
     }
     if !msg.is_empty() {
         return BootstrapError::Ssh { exit, msg };
@@ -697,17 +702,59 @@ fn first_line(s: &str) -> String {
     s.to_string()
 }
 
+/// Ends a text `clip` cut (Go `clipMarker`).
+const CLIP_MARKER: &str = "…(truncated)";
+
 /// Truncate `s` to at most `n` bytes (on a char boundary), appending an ellipsis marker
 /// when cut (Go `clip`).
 fn clip(s: &str, n: usize) -> String {
+    match clip_head(s, n) {
+        Some(head) => format!("{head}{CLIP_MARKER}"),
+        None => s.to_string(),
+    }
+}
+
+/// `s` cut to at most `n` bytes on a char boundary, or `None` when it fits (Go
+/// `clipHead`, which cuts valid UTF-8 at the same byte).
+fn clip_head(s: &str, n: usize) -> Option<&str> {
     if s.len() <= n {
-        return s.to_string();
+        return None;
     }
     let mut end = n;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…(truncated)", &s[..end])
+    Some(&s[..end])
+}
+
+/// ssh's stderr as a refusal keeps it for display (Go `diagText`, byte for byte, both
+/// held to `crates/fixtures/bootstrap-stderr/cases.json`): cut to at most `n` bytes on a
+/// char boundary, then escaped, then marked when cut. Printable ASCII (`' '` to `'~'`)
+/// other than `\` is itself; `\` is `\\`, a line feed `\n`, a carriage return `\r`, a tab
+/// `\t`; every other character (a control character such as ESC, any non-ASCII
+/// character, the U+FFFD lossy decoding put where a byte was not UTF-8) is `\u{<hex>}`,
+/// lowercase with no leading zeros. The text then cannot move the cursor, colour the
+/// terminal, start a new line or reorder what follows.
+fn diag_text(s: &str, n: usize) -> String {
+    let (head, cut) = match clip_head(s, n) {
+        Some(head) => (head, true),
+        None => (s, false),
+    };
+    let mut out = String::with_capacity(head.len());
+    for c in head.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ' '..='~' => out.push(c),
+            _ => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+        }
+    }
+    if cut {
+        out.push_str(CLIP_MARKER);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1057,6 +1104,25 @@ mod tests {
             classify(255, false, "No more authentication methods to try."),
             BootstrapError::NoSshIdentities(_)
         ));
+        // Its text names the refusal and each cause, then ssh's words; it names no
+        // server setting (where a key is listed is the server's own choice).
+        let text = classify(255, false, "mini3: Permission denied (publickey).").to_string();
+        assert_eq!(
+            text,
+            "sdk/bootstrap: the server refused every key ssh offered (no key ssh can reach, \
+             for example an agent ssh cannot find — see IdentityAgent; not a user's key; a \
+             passphrase key not in the agent; or the server's user list not in force. A key \
+             listed moments ago can be refused once: try again): mini3: Permission denied \
+             (publickey)."
+        );
+        for old in [
+            "allowlist",
+            "github_users",
+            "authorized_keys",
+            "could not authenticate",
+        ] {
+            assert!(!text.contains(old), "{old:?} in {text}");
+        }
         // Other non-empty stderr → generic ssh-exited.
         assert!(matches!(
             classify(1, false, "kex_exchange_identification: banner"),
@@ -1067,6 +1133,35 @@ mod tests {
             classify(-1, false, ""),
             BootstrapError::SshFailed(_)
         ));
+    }
+
+    /// The cause the refusal of every key keeps, against the one hand-written table Go's
+    /// `diagText` is held to as well (`TestNoSSHIdentitiesTextMatchesRust` in
+    /// `sdk/bootstrap`): ssh's stderr escaped (an ESC sequence, line breaks, a backslash,
+    /// non-ASCII) and clipped on a char boundary (a multi-byte character at the 2048-byte
+    /// boundary), the same text in both languages.
+    #[test]
+    fn no_ssh_identities_cause_shared_table() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fixtures/bootstrap-stderr/cases.json");
+        let text = std::fs::read_to_string(&path).expect("read the shared table");
+        let table: serde_json::Value = serde_json::from_str(&text).expect("decode the table");
+        let cases = table["cases"].as_array().expect("cases");
+        assert!(
+            cases.len() >= 10,
+            "the shared table holds only {} cases",
+            cases.len()
+        );
+        for case in cases {
+            let name = case["name"].as_str().expect("name");
+            let pad = "a".repeat(case.get("pad").and_then(|p| p.as_u64()).unwrap_or(0) as usize);
+            let stderr = format!("{pad}{}", case["stderr"].as_str().expect("stderr"));
+            let cause = format!("{pad}{}", case["cause"].as_str().expect("cause"));
+            match classify(255, false, &stderr) {
+                BootstrapError::NoSshIdentities(got) => assert_eq!(got, cause, "{name}"),
+                other => panic!("{name}: classify = {other:?}, want NoSshIdentities"),
+            }
+        }
     }
 
     fn bundle_json(token: &str, https: bool, scope: &str) -> String {

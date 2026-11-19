@@ -71,12 +71,13 @@ var (
 	// a confirmed change (e.g. a racing/garbled known_hosts, or a missing entry
 	// when the caller did not pre-check). Retryable, never a terminal MITM latch.
 	ErrHostKeyVerificationFailed = errors.New("sdk/bootstrap: ssh host key verification failed")
-	// ErrNoSSHIdentities is a public-key auth failure: the daemon offered no
-	// identity ssh could use, or the offered key is not on the server allowlist.
-	// Surfaced distinctly so operators see an identity/allowlist problem rather
-	// than mistaking it for a MITM. Retryable (the user may fix ssh config / load
-	// the agent / get added to the allowlist).
-	ErrNoSSHIdentities = errors.New("sdk/bootstrap: ssh could not authenticate with any available identity")
+	// ErrNoSSHIdentities is a public-key auth failure: the server refused every
+	// key ssh offered. The causes differ (no key ssh could reach, a key that is
+	// no user's, a passphrase key not in the agent, a user list not in force, a
+	// key listed moments ago), so the error names them all (noSSHIdentitiesHint)
+	// rather than one. Surfaced distinctly so it is never mistaken for a MITM.
+	// Retryable.
+	ErrNoSSHIdentities = errors.New("sdk/bootstrap: the server refused every key ssh offered")
 
 	// errNoCertificatePEM / errCertKeyMismatch report a malformed or wrong
 	// client_cert in an mtls bundle (see clientKeyPair.matchesIssuedCert).
@@ -605,6 +606,16 @@ func run(ctx context.Context, p Params) (sdk.Bundle, error) {
 	return decodeBundle(stdout.Bytes(), p.Scope)
 }
 
+// noSSHIdentitiesHint follows ErrNoSSHIdentities in classify's error: the
+// causes of a refusal of every key, none of which ssh can tell apart. It names
+// no server setting, because where a key is listed (the server's config, GitHub,
+// an account service) is the server's own choice. The Rust broker's
+// BootstrapError::NoSshIdentities text is the same, byte for byte
+// (TestNoSSHIdentitiesTextMatchesRust).
+const noSSHIdentitiesHint = "(no key ssh can reach, for example an agent ssh cannot find — see IdentityAgent; " +
+	"not a user's key; a passphrase key not in the agent; or the server's user list not in force. " +
+	"A key listed moments ago can be refused once: try again)"
+
 // classify maps a non-zero ssh exit to a typed error. Only a confirmed host-key
 // change (exit 255 + the CHANGED banner, detected over the full stderr stream) is
 // the terminal sdk.ErrHostKeyMismatch; everything else is retryable. The stderr
@@ -620,7 +631,11 @@ func classify(runErr error, exit int, hostKeyChanged bool, stderrText string) er
 		return fmt.Errorf("%w: %s", ErrHostKeyVerificationFailed, msg)
 	case strings.Contains(stderrText, "Permission denied (publickey") ||
 		strings.Contains(stderrText, "No more authentication methods"):
-		return fmt.Errorf("%w (the daemon may have no SSH identity available — see IdentityAgent docs — or the key may not be on the server allowlist): %s", ErrNoSSHIdentities, msg)
+		// The refusal of every key keeps ssh's words as its cause, and a
+		// command prints them: shown escaped (diagText), never raw, so an ESC
+		// or a line break a ProxyCommand wrote cannot reach the terminal.
+		return fmt.Errorf("%w %s: %s", ErrNoSSHIdentities, noSSHIdentitiesHint,
+			diagText(strings.TrimSpace(stderrText), maxErrStderr))
 	case msg != "":
 		return fmt.Errorf("sdk/bootstrap: ssh exited %d: %s", exit, msg)
 	default:
@@ -784,10 +799,70 @@ func (c *capWriter) Write(p []byte) (int, error) {
 func (c *capWriter) String() string { return c.buf.String() }
 func (c *capWriter) Bytes() []byte  { return c.buf.Bytes() }
 
-// clip truncates s to at most n bytes, appending an ellipsis marker when cut.
+// clipMarker ends a text clip cut.
+const clipMarker = "…(truncated)"
+
+// clip truncates s to at most n bytes, appending clipMarker when cut.
 func clip(s string, n int) string {
-	if len(s) <= n {
-		return s
+	head, cut := clipHead(s, n)
+	if cut {
+		return head + clipMarker
 	}
-	return s[:n] + "…(truncated)"
+	return s
+}
+
+// clipHead is s cut to at most n bytes on a character boundary, and whether it
+// was cut. It never cuts a UTF-8 character in two: it backs up over at most
+// three continuation bytes, as the Rust broker's clip backs up to a char
+// boundary (for valid UTF-8 the two cut at the same byte).
+func clipHead(s string, n int) (string, bool) {
+	if len(s) <= n {
+		return s, false
+	}
+	end := n
+	for end > 0 && end > n-(utf8.UTFMax-1) && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end], true
+}
+
+// diagText is ssh's stderr as a refusal keeps it for display: cut to at most
+// n bytes on a character boundary (clipHead), then escaped, then marked when
+// cut. The rule is the Rust broker's diag_text, byte for byte, held to the
+// shared table crates/fixtures/bootstrap-stderr/cases.json:
+//
+//   - printable ASCII (0x20 to 0x7E) other than `\` is itself;
+//   - `\` is `\\`, a line feed `\n`, a carriage return `\r`, a tab `\t`;
+//   - every other character, a control character such as ESC and any
+//     non-ASCII character alike, is `\u{<hex>}` (lowercase, no leading zeros);
+//     a byte that is not UTF-8 is `\u{fffd}`, as Rust's lossy decoding makes it.
+//
+// So the text cannot move the cursor, colour the terminal, start a new line or
+// reorder what follows (a bidi control), and an escape in ssh's own words
+// cannot pass for one this function wrote.
+func diagText(s string, n int) string {
+	head, cut := clipHead(s, n)
+	var b strings.Builder
+	for i := 0; i < len(head); {
+		r, size := utf8.DecodeRuneInString(head[i:])
+		i += size
+		switch {
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r >= 0x20 && r <= 0x7e:
+			b.WriteByte(byte(r))
+		default:
+			fmt.Fprintf(&b, `\u{%x}`, r)
+		}
+	}
+	if cut {
+		b.WriteString(clipMarker)
+	}
+	return b.String()
 }

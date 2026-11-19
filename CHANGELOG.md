@@ -426,6 +426,12 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   issued certificate that names no user is refused too, with nothing saved. A CLI older than
   0.10.0 drops `user` when it saves `config.yaml`: use 0.10.0 on every machine that shares
   one. A running tunnel daemon keeps the entry it started with: restart it after a refetch.
+- **Scripts that match the refusal of a key must match its new text.** `your SSH key is not
+  in this server's allowlist (auth.ssh.github_users / authorized_keys)` and the bootstrap
+  error's `ssh could not authenticate with any available identity (… or the key may not be
+  on the server allowlist)` are gone; match `the server refused every SSH key ssh offered`
+  (the CLI) or `sdk/bootstrap: the server refused every key ssh offered` (the bootstrap
+  error) instead (see "Changed").
 - **Readers of `audit.jsonl`: the identity kind `admin` is gone, with no alias.** A person is
   now `kind: user` (with `user`, or `implicit: true`, and `admin` and `script`), and a `reap`
   line carries `kind: system` (see "Audit log: callers by kind" below). Update any filter that
@@ -779,6 +785,35 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
 
 #### Changed
 
+- **CLI, SDK and desktop: a refused SSH key names each cause, not an allowlist.** `shed server
+  add` and `shed server update --refetch` now fail with `the server refused every SSH key ssh
+  offered for _bootstrap@<host>: none of them is a user's key there, or the right key has a
+  passphrase and is not in your agent (shed runs ssh with BatchMode=yes: ssh-add it), or the
+  server's user list is not in force and only its local admins can log in`, and say that a
+  key listed moments ago can be refused once (try again in a minute); an entry with
+  `identity_file` is refused naming that key. The bootstrap error the CLI's renewals and the
+  desktop's broker report (Go `sdk/bootstrap.ErrNoSSHIdentities`, the Rust
+  `BootstrapError::NoSshIdentities`, the same text in both) now reads `sdk/bootstrap: the
+  server refused every key ssh offered (no key ssh can reach, …; not a user's key; a
+  passphrase key not in the agent; or the server's user list not in force. …)`. Neither names
+  `auth.ssh` settings any more, which a server that takes its users from an account service
+  does not have. `shed server add --help` and the CLI reference say that a `~/.ssh/config`
+  alias whose `HostName` points elsewhere enrols over SSH and then fails at the API: use the
+  real name with `--identity-file`.
+- **CLI: an entry name that cannot be pasted is never put in a suggested command.** The
+  refusals that suggest `shed server update <name> …` (a stored certificate that names no
+  user or another user, a certificate for another user, a restore that failed, a tunnel that
+  cannot record its user, a stored token on an entry with its own key) quote the name for the
+  shell when it holds a shell metacharacter, and give the advice in words, with the name
+  escaped and no command line, when it holds a control character or any non-ASCII
+  character, or starts with `-`; the desktop follows the same rule. Nothing else read from
+  `config.yaml`, a certificate or a server goes into a suggested command: the refusal of a
+  certificate for another user now suggests `--identity-file /path/to/key` and names the
+  user whose key it means in the sentence. `shed tunnels start` names a shed in its `-t`
+  advice the same way. `shed ssh-config --install` and `--uninstall` list entry and alias
+  names escaped, and print `ssh <alias>` only for an alias of the shape shed generates
+  (letters, digits, `.`, `_`, `-`). The ssh words a refused key's error ends with are shown
+  escaped (a line break as `\n`), in the CLI and the desktop alike.
 - **`serve` stops its other servers when one fails.** When a listener fails (a port another
   process holds, for example), `serve` now logs `Server error: …` as before and then stops
   the max_age reaper and shuts its other servers down as on a signal, before it exits with the

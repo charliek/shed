@@ -612,23 +612,36 @@ pub fn display_server_name(server: &str) -> String {
     format!("{server:?}")
 }
 
+/// Every character [`shell_server_name`] writes bare, besides ASCII letters and digits.
+/// The Go CLI's `config.ShellWord` uses the same set.
+const SHELL_WORD_BARE: &str = "._-/:@+=";
+
 /// A config entry's name as one word of the `shed server update` command a message
-/// suggests: bare when every character is an ASCII letter, digit, `.`, `_` or `-` and it
-/// does not start with `-`; otherwise in single quotes for a POSIX shell (a `'` written
-/// as `'\''`). `None` for a name that is empty, starts with `-` (it would be read as an
-/// option), or holds a control or other non-printing character (a line break, among
-/// others): it cannot be given safely as one pasted word, so the message gives its advice
-/// in words, with no command line. The name is never interpolated raw.
+/// suggests. The rule is the Go CLI's (`config.ShellWord`); both are held to the
+/// hand-written table `crates/fixtures/shellword/cases.json`:
+///
+/// * The name is pasteable only if it is not empty, does not start with `-` (it would be
+///   read as an option), and every character is printable ASCII (`' '` to `'~'`).
+///   Anything else (a control character such as a line break or ESC, any non-ASCII
+///   character) is `None`: it cannot be given safely as one pasted word, so the message
+///   gives its advice in words, with no command line.
+/// * It is written bare when every character is an ASCII letter or digit or one of
+///   [`SHELL_WORD_BARE`], otherwise in single quotes for a POSIX shell (a `'` written as
+///   `'\''`).
+///
+/// The name is never interpolated raw.
 pub fn shell_server_name(server: &str) -> Option<String> {
-    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
-    if !server.is_empty() && !server.starts_with('-') && server.chars().all(plain) {
-        return Some(server.to_string());
-    }
-    // `escape_debug` leaves exactly the printing characters as themselves; the three it
-    // also escapes for a Rust literal are literal inside single quotes.
-    let non_printing = |c: char| !matches!(c, '\'' | '"' | '\\') && c.escape_debug().count() > 1;
-    if server.is_empty() || server.starts_with('-') || server.chars().any(non_printing) {
+    if server.is_empty()
+        || server.starts_with('-')
+        || !server.chars().all(|c| (' '..='~').contains(&c))
+    {
         return None;
+    }
+    if server
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || SHELL_WORD_BARE.contains(c))
+    {
+        return Some(server.to_string());
     }
     Some(format!("'{}'", server.replace('\'', r"'\''")))
 }
@@ -3867,6 +3880,33 @@ mod held_user_tests {
     const NO_USER: &str = "server \"shed\": the server issued a certificate that names no user \
         (a shed-server older than 0.10.0); it was not used. Upgrade the server, then restart \
         the app.";
+
+    /// The pasteable-word rule against the one hand-written table the Go CLI's
+    /// `config.ShellWord` is held to as well (`TestShellWordSharedTable`), so the two
+    /// cannot drift: the same names are bare, quoted or refused.
+    #[test]
+    fn shell_server_name_shared_table() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fixtures/shellword/cases.json");
+        let text = std::fs::read_to_string(&path).expect("read the shared table");
+        let table: serde_json::Value = serde_json::from_str(&text).expect("decode the table");
+        let cases = table["cases"].as_array().expect("cases");
+        assert!(
+            cases.len() >= 40,
+            "the shared table holds only {} cases",
+            cases.len()
+        );
+        for case in cases {
+            let name = case["name"].as_str().expect("name");
+            let word = case.get("word").expect("word");
+            let want = if word.is_null() {
+                None
+            } else {
+                Some(word.as_str().expect("word is a string or null"))
+            };
+            assert_eq!(shell_server_name(name).as_deref(), want, "{name:?}");
+        }
+    }
 
     /// The hostile-name test set: `(name, display form, shell word)`, the word `None`
     /// where no pasted word is safe.

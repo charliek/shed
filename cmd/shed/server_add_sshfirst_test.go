@@ -516,12 +516,31 @@ func TestServerAddBootstrapDecisionTable(t *testing.T) {
 		name     string
 		bootErr  error
 		wantErr  []string
+		notErr   []string
 		wantNoKH bool
 	}{
 		{
-			name:    "key not authorized names the allowlist and never falls back",
+			name:    "key not authorized names each cause and never falls back",
 			bootErr: errors.New("sdk/bootstrap: ssh exited 1: bootstrap: key not authorized"),
-			wantErr: []string{"not in this server's allowlist", "auth.ssh.github_users", "authorized_keys"},
+			wantErr: []string{
+				"the server refused every SSH key ssh offered for _bootstrap@example.test: none of them is a user's key there",
+				"the right key has a passphrase and is not in your agent (shed runs ssh with BatchMode=yes: ssh-add it)",
+				"the server's user list is not in force and only its local admins can log in",
+				"can be refused once while the server fetches it: try again in a minute",
+				"bootstrap: key not authorized", // the cause is kept
+			},
+			// A server may take its users from an account service, where there
+			// is no auth.ssh setting to edit: the refusal names none.
+			notErr: []string{"allowlist", "auth.ssh", "github_users", "authorized_keys"},
+		},
+		{
+			name:    "a refusal of every key ssh offered names each cause",
+			bootErr: fmt.Errorf("%w: _bootstrap@example.test: Permission denied (publickey).", sdkbootstrap.ErrNoSSHIdentities),
+			wantErr: []string{
+				"the server refused every SSH key ssh offered for _bootstrap@example.test",
+				"Permission denied (publickey)",
+			},
+			notErr: []string{"allowlist", "auth.ssh", "github_users", "authorized_keys"},
 		},
 		{
 			name:    "an ssh dial failure names host:ssh-port",
@@ -559,10 +578,46 @@ func TestServerAddBootstrapDecisionTable(t *testing.T) {
 					t.Errorf("error %q must mention %q", err, want)
 				}
 			}
+			for _, not := range tc.notErr {
+				if strings.Contains(err.Error(), not) {
+					t.Errorf("error %q must not mention %q", err, not)
+				}
+			}
 			if len(clientConfig.Servers) != 0 {
 				t.Errorf("a server entry was written despite the failure: %+v", clientConfig.Servers)
 			}
 		})
+	}
+}
+
+// TestKeysRefusedErrorNamesTheEntrysKey: an entry that offers its own key
+// (identity_file) is refused naming that key, and a host from a hand-edited
+// entry never reaches the terminal raw.
+func TestKeysRefusedErrorNamesTheEntrysKey(t *testing.T) {
+	cause := errors.New("sdk/bootstrap: ssh exited 1: bootstrap: key not authorized")
+
+	err := keysRefusedError("shed.example.test", "/home/pat/.ssh/id_pat", cause)
+	for _, want := range []string{
+		`the server refused the entry's SSH key "/home/pat/.ssh/id_pat" (and any other key ssh offered) for _bootstrap@shed.example.test`,
+		"bootstrap: key not authorized",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q must mention %q", err, want)
+		}
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("the cause is not kept: %v", err)
+	}
+	if plain := keysRefusedError("shed.example.test", "", cause); strings.Contains(plain.Error(), "entry's SSH key") {
+		t.Errorf("an entry with no identity_file named one: %v", plain)
+	}
+
+	hostile := keysRefusedError("evil\n\x1b[2Jhost", "", cause)
+	if strings.ContainsAny(hostile.Error(), "\n\x1b") {
+		t.Errorf("a control character reached the message raw: %q", hostile)
+	}
+	if !strings.Contains(hostile.Error(), `_bootstrap@evil\n\x1b[2Jhost`) {
+		t.Errorf("the host is not shown escaped: %q", hostile)
 	}
 }
 
@@ -1425,8 +1480,13 @@ func TestServerUpdateRefetchKeyNotAuthorized(t *testing.T) {
 	stubBootstrapResult(sdk.Credential{}, errors.New("sdk/bootstrap: ssh exited 1: bootstrap: key not authorized"))
 
 	err := runServerUpdate(nil, []string{"srv"})
-	if err == nil || !strings.Contains(err.Error(), "not in this server's allowlist") {
-		t.Fatalf("err = %v, want the allowlist error", err)
+	if err == nil || !strings.Contains(err.Error(), "the server refused every SSH key ssh offered for _bootstrap@example.test") {
+		t.Fatalf("err = %v, want the refusal of every key", err)
+	}
+	for _, not := range []string{"allowlist", "auth.ssh", "github_users", "authorized_keys"} {
+		if strings.Contains(err.Error(), not) {
+			t.Errorf("error %q must not mention %q", err, not)
+		}
 	}
 	if got := clientConfig.Servers["srv"].TLSCertFingerprint; got != "sha256:old" {
 		t.Errorf("the pin was rewritten despite the failure: %q", got)

@@ -388,6 +388,26 @@ var sshUnreachableMarkers = []string{
 	"ssh exchange aborted",
 }
 
+// keysRefusedError is the bootstrapKeyNotAuthorized refusal of `shed server
+// add` and `shed server update --refetch`: the server refused every key ssh
+// offered for _bootstrap (plan 037 §3.3). ssh cannot say why, so it names each
+// cause a person can act on, and no server setting: a server may take its users
+// from its config, from GitHub or from an account service, and only its
+// operator knows which. identityFile is the key the entry offers ("" for
+// none), named because ssh offers it first. err is the bootstrap's own error,
+// kept as the cause.
+func keysRefusedError(host, identityFile string, err error) error {
+	offered := "every SSH key ssh offered"
+	if identityFile != "" {
+		offered = fmt.Sprintf("the entry's SSH key %q (and any other key ssh offered)", identityFile)
+	}
+	return fmt.Errorf("the server refused %s for _bootstrap@%s: none of them is a user's key there, "+
+		"or the right key has a passphrase and is not in your agent (shed runs ssh with BatchMode=yes: ssh-add it), "+
+		"or the server's user list is not in force and only its local admins can log in. "+
+		"A key listed for a user moments ago can be refused once while the server fetches it: try again in a minute. %w",
+		offered, sdkbootstrap.SafeText(host), err)
+}
+
 // classifyAddBootstrap maps a bootstrap result onto the decision table.
 //
 // ORDER: every hard outcome is decided FIRST, and open-mode — the one
@@ -789,8 +809,7 @@ func addAfterHostKey(host string, sshPort int, identityFile string, pin pinnedHo
 		}
 		return addOverHTTP(host, sshPort, identityFile)
 	case bootstrapKeyNotAuthorized:
-		return fmt.Errorf("your SSH key is not in this server's allowlist "+
-			"(auth.ssh.github_users / authorized_keys) — add it on %s, then retry: %w", host, err)
+		return keysRefusedError(host, identityFile, err)
 	case bootstrapUnreachable:
 		if !pin.scanned() {
 			// Neither our direct dial nor ssh itself could reach the SSH port, so
@@ -1209,8 +1228,7 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, identityFile st
 		// re-fetch is the only thing that can help it.
 		return refetchTLSPinOverHTTPS(name, entry, identityFile)
 	case bootstrapKeyNotAuthorized:
-		return fmt.Errorf("your SSH key is not in this server's allowlist "+
-			"(auth.ssh.github_users / authorized_keys) — add it on %s, then retry: %w", entry.Host, err)
+		return keysRefusedError(entry.Host, identityFile, err)
 	case bootstrapUnreachable:
 		return fmt.Errorf("could not complete the SSH bootstrap with %s: %w%s",
 			scanAddr(entry.Host, entry.SSHPort), err, unscannedHostKeyHint(pin))
