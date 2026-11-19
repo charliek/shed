@@ -4389,7 +4389,7 @@ def test_drop_entry_field_judges_only_the_named_entry():
 
 
 def test_the_agent_shim_offers_the_agents_keys_and_no_key_file(tmp_path):
-    ssh = shutil.which("ssh")
+    ssh = dfx.real_ssh()
     if ssh is None:
         pytest.skip("ssh is not installed")
     sock, no_key, key = tmp_path / "agent.sock", tmp_path / "none" / "absent", tmp_path / "id"

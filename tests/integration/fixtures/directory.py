@@ -1870,6 +1870,18 @@ class World:
             print(f"----- {p.name} (last lines) -----\n{_tail(p)}")
 
 
+def real_ssh() -> Optional[str]:
+    """The system's own ssh: /usr/bin/ssh where there is one, else the first
+    on PATH. The shims here wrap it, and a run on a shared machine may itself
+    put a wrapper named ssh first on PATH (one that adds its own options ahead
+    of a shim's); taking the system's binary keeps what a shim adds the only
+    thing added."""
+    system = "/usr/bin/ssh"
+    if os.access(system, os.X_OK):
+        return system
+    return shutil.which("ssh")
+
+
 @contextmanager
 def directory_world() -> Iterator[World]:
     """A fresh world, removed when the block ends, whatever happened in it.
@@ -1878,7 +1890,7 @@ def directory_world() -> Iterator[World]:
     missing = missing_binaries(bin_dir)
     if missing:
         raise AssertionError(f"missing {', '.join(map(str, missing))}: make test-integration-directory builds them")
-    ssh, false = shutil.which("ssh"), shutil.which("false")
+    ssh, false = real_ssh(), shutil.which("false")
     if not ssh or not false:
         raise AssertionError("ssh and false must be on PATH")
     root = Path(tempfile.mkdtemp(prefix="shed-dir-", dir=socket_base(tempfile.gettempdir())))
