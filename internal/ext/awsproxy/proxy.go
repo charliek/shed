@@ -1,6 +1,6 @@
 // Package awsproxy implements the guest-side AWS container credential endpoint.
 // It serves the HTTP format the AWS SDK expects and translates requests into
-// message bus calls to the host agent. The proxy is a passthrough — it does
+// message bus calls to the credential broker. The proxy is a passthrough — it does
 // not cache credentials.
 package awsproxy
 
@@ -89,7 +89,7 @@ func (p *Proxy) HandleCredentials(w http.ResponseWriter, r *http.Request) {
 		p.logger.Error("credential request failed", "error", err)
 		p.writeError(w, http.StatusServiceUnavailable,
 			"credential request timed out",
-			"shed-host-agent not reachable. Is it running on the host machine?",
+			"no credential broker answered. Is the shed desktop app running on your machine?",
 		)
 		return
 	}
@@ -105,7 +105,7 @@ func (p *Proxy) HandleCredentials(w http.ResponseWriter, r *http.Request) {
 	var creds protocol.AWSCredentialsResponse
 	if err := json.Unmarshal(respPayload, &creds); err != nil {
 		p.logger.Error("failed to parse credentials response", "error", err)
-		p.writeError(w, http.StatusBadGateway, "invalid response from host agent", "")
+		p.writeError(w, http.StatusBadGateway, "invalid response from the credential broker", "")
 		return
 	}
 
@@ -123,14 +123,14 @@ func (p *Proxy) HandleCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Ping sends a health check ping and returns nil if the host agent responds.
+// Ping sends a health check ping and returns nil if the credential broker responds.
 func (p *Proxy) Ping(timeout time.Duration) error {
 	return p.bus.Ping(context.Background(), protocol.NamespaceAWSCredentials, timeout)
 }
 
 func (p *Proxy) writeError(w http.ResponseWriter, status int, msg, hint string) {
 	if hint == "" {
-		hint = "Ensure shed-host-agent is running on the host machine."
+		hint = "Make sure the shed desktop app is running on your machine."
 	}
 	resp := awsSDKErrorResponse{
 		Error:   msg,

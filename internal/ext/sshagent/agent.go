@@ -134,7 +134,7 @@ func (a *Agent) signWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 	}, nil
 }
 
-// Ping sends a health check ping and returns nil if the host agent responds.
+// Ping sends a health check ping and returns nil if the credential broker responds.
 func (a *Agent) Ping(timeout time.Duration) error {
 	return a.bus.Ping(context.Background(), protocol.NamespaceSSHAgent, timeout)
 }

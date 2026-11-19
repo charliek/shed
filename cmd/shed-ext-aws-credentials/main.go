@@ -1,6 +1,6 @@
 // shed-ext-aws-credentials is the guest-side AWS credential proxy that runs inside shed
 // microVMs. It serves the AWS container credential endpoint format and
-// translates SDK requests into message bus requests to the host agent.
+// translates SDK requests into message bus requests to the credential broker.
 package main
 
 import (
@@ -36,13 +36,13 @@ func main() {
 	// Startup health check
 	go func() {
 		if err := proxy.Ping(2 * time.Second); err != nil {
-			logger.Warn("shed-host-agent not connected for namespace 'aws-credentials'",
+			logger.Warn("credential broker not connected for namespace 'aws-credentials'",
 				"error", err,
-				"hint", "AWS operations will fail until shed-host-agent is running on the host machine.",
+				"hint", "AWS operations will fail until the shed desktop app is running on your machine.",
 			)
 			writeStatus("aws-credentials: not connected")
 		} else {
-			logger.Info("shed-host-agent connected", "namespace", "aws-credentials")
+			logger.Info("credential broker connected", "namespace", "aws-credentials")
 			writeStatus("aws-credentials: connected")
 		}
 	}()

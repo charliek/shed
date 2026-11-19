@@ -166,7 +166,7 @@ func (s *Server) collectExtensionHealth() map[string]plugin.ExtensionHealth {
 
 // runExtensionHealthChecks periodically checks each enabled extension's health.
 // Guest check: is the systemd unit active?
-// Host check: can we reach the host agent end-to-end via bus ping?
+// Host check: can we reach the credential broker end-to-end via bus ping?
 func (s *Server) runExtensionHealthChecks(ctx context.Context) {
 	// Use a bus client pointing at our own HTTP endpoint for host pings.
 	busClient := sdk.NewBusClient(

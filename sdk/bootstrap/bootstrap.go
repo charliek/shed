@@ -8,7 +8,7 @@
 // ssh remains the security enforcement point: `StrictHostKeyChecking=yes` against
 // the shed-only `known_hosts` (with the global file disabled) is what refuses a
 // MITM. This package only *classifies* a failure as terminal (a confirmed host-key
-// change) versus retryable, so callers like the host-agent can fail closed without
+// change) versus retryable, so callers like a credential broker can fail closed without
 // re-implementing host-key verification. It never logs or returns stdout, which
 // carries the freshly minted token.
 package bootstrap
@@ -526,15 +526,16 @@ func RunCredential(ctx context.Context, p Params) (sdk.Credential, error) {
 
 // RunWithCSR submits a CSR the CALLER generated and returns the raw bundle.
 //
-// It is the relay shape, and it exists for exactly one reason: the desktop app
-// holds a credential whose private key must never leave the app process, while
-// the SSH channel that can get that key certified belongs to the host-agent.
-// The app generates the keypair, sends only the CSR across the local socket,
-// and the host-agent runs this — passing the CSR through untouched and handing
-// back the certificate the server issued. No private key exists on the
-// host-agent side of that exchange, which is why RunCredential (which generates
-// its own keypair and would return a certificate the app cannot use) is the
-// wrong entry point for it.
+// It is the relay shape, and it exists for exactly one reason: one part of a
+// program holds a credential whose private key must never leave it, while the
+// SSH channel that can get that key certified belongs to another part (the
+// desktop app's broker relays the app's control credential this way, in its
+// own Rust code). The key holder generates the keypair and hands over only the
+// CSR, and the relaying side runs this — passing the CSR through untouched and
+// handing back the certificate the server issued. No private key exists on the
+// relaying side of that exchange, which is why RunCredential (which generates
+// its own keypair and would return a certificate the key holder cannot use) is
+// the wrong entry point for it.
 //
 // An empty p.CSRBase64 makes this identical to Run, and against an mtls server
 // the result is the server's own explicit upgrade error — the honest answer for

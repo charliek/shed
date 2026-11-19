@@ -543,8 +543,8 @@ func (s *Server) CloseEntries() { s.entries.Close() }
 // auth.ssh.max_auth_tries is unset. It is deliberately higher than OpenSSH's
 // default of 6 so a developer whose agent holds many keys (1Password, Secretive,
 // hardware) can still have the one allowlisted key tried before the server gives
-// up — which is exactly the path the host-agent bootstrap and `shed server add`
-// take. This is a mild loosening of a DoS cap; public-key auth is not guessable,
+// up — which is exactly the path `shed server add` and the desktop app's
+// broker bootstrap take. This is a mild loosening of a DoS cap; public-key auth is not guessable,
 // so the risk is low. Operators can override it via auth.ssh.max_auth_tries.
 const defaultMaxAuthTries = 10
 

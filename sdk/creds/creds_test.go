@@ -27,7 +27,7 @@ import (
 // able to reach each other's material.
 //
 // That is not a hypothetical tidiness concern. The shed CLI holds a
-// control-scope certificate and the host-agent holds a credentials-scope one;
+// control-scope certificate and a credential broker holds a credentials-scope one;
 // one certificate carries exactly one scope, so if they shared a per-server
 // directory each would overwrite the other in place on every rotation, and each
 // would then present a certificate the server refuses for the route it is

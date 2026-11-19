@@ -59,8 +59,8 @@ func bootstrapParams(host string, sshPort int, identityFile, scope, clientKind s
 // must already be pinned in known_hosts (the trust decision stays with
 // confirmHostKey, run earlier in `server add`); ssh enforces that pin via
 // StrictHostKeyChecking=yes. The shared sdk/bootstrap helper owns the argv,
-// timeout, and error classification so the CLI and the host-agent reach a
-// server identically.
+// timeout, and error classification so the CLI and the desktop app's broker
+// reach a server identically.
 //
 // RunCredential (not Run) is used unconditionally: it submits a CSR, which a
 // token-mode or pre-mtls server ignores and an mtls-mode server signs. The CLI

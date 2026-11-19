@@ -7,7 +7,7 @@ an admin) moves the binding with `shed source use`. These cases drive one dev
 server with the itest user list (`fixtures/identity.py`) through synthetic
 machines (`fixtures/busclient.py: FakeMachine`): an identity's credentials
 certificate plus a machine id and name, subscribing and answering exactly as
-a broker does. No real host agent runs here (the broker's side is
+a broker does. No real broker runs here (the broker's side is
 tests/host-agent-diff); requests start inside a shed with a POST to the
 shed-agent's `127.0.0.1:498/v1/publish`, which every image serves.
 
@@ -46,8 +46,8 @@ and survive a restart, so a second run (or a run after `test_users.py`) meets
 bindings already there: every case sets up what it needs by moving the
 binding (`busclient.ensure_source`), never by assuming a fresh server, and
 runs in any order. Only the throwaway itest identities are ever bound or
-moved by these cases, never the developer's own user (whose real host agent
-may be the source on this server). When the module ends each itest user's
+moved by these cases, never the developer's own user (whose real desktop
+app may be the source on this server). When the module ends each itest user's
 source is again their DEFAULT machine (alice: A; bob: his), each user put
 back on their own as soon as their certificate exists, so a set-up that
 fails part-way still repairs what it can; the teardown fails loudly when it
@@ -84,6 +84,7 @@ with the environment the README's "The pin" section lists.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import threading
@@ -130,8 +131,8 @@ SCRIPT_KEY = "a script key cannot see or move a credential source"
 UNMATCHED = "response does not match a pending request for this namespace"
 CONTROL_SCOPE = "control scope required"
 DUPLICATE = "already holds"
-# The first releases whose brokers send the machine headers.
-MINIMUM_VERSION = "0.10.0"
+# What the refusal of a request with no machine headers tells the person to do.
+INSTALL_APP = "install the current shed desktop app"
 
 # Timing. The guest gives up on a request publishTimeout after it sends it
 # (cmd/shed-agent/http.go: 30 s), so every step of one request, from starting
@@ -549,7 +550,8 @@ def test_a_subscribe_or_answer_without_a_machine_id_is_refused(pin, alice_shed):
     for what, headers in bad.items():
         sub = a.subscribe(ns, headers=headers)
         assert (sub.status, sub.code) == (403, SOURCE_MACHINE_ID_REQUIRED), f"{what}: {sub}"
-        assert MINIMUM_VERSION in sub.message, f"{what}: the refusal does not name the versions to upgrade to: {sub}"
+        assert INSTALL_APP in sub.message, f"{what}: the refusal does not say to install the desktop app: {sub}"
+        assert not re.search(r"\d+\.\d+\.\d+", sub.message), f"{what}: the refusal names a version: {sub}"
 
     # Positive control, same certificate, same request type: with the
     # headers the subscribe is admitted.
@@ -988,7 +990,7 @@ def test_the_developers_own_source_is_readable(shed_server_dev):
     """On the developer's own entry, whatever the server's user list: the
     feature is advertised and `shed source status` reads (text and JSON).
     Nothing is bound or moved: on a server with no user list the only user
-    is the developer's, whose real host agent may be the source."""
+    is the developer's, whose real desktop app may be the source."""
     server = shed_server_dev
     _require_shed_source()
     # The entry's certificate names the user its key had when the CLI last

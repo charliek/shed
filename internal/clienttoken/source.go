@@ -457,7 +457,7 @@ func (s *Source) EnsureFresh() { _ = s.EnsureFreshErr() }
 //
 // The CLI genuinely does not want the error: it mints ahead of a command that
 // will surface any real problem itself, and a warning there would be noise. A
-// long-lived daemon does want it — the host-agent's bus asks its credential
+// long-lived process does want it — a broker's bus client asks its credential
 // source for something to present and has to be able to say WHY there is
 // nothing, rather than silently sending an unauthenticated request and
 // reporting the resulting 401 as the problem.

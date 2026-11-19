@@ -7,7 +7,7 @@ package config
 // The store itself — the ~/.shed/creds layout, the 0700/0600 permissions, the
 // atomic per-file write, and the per-server advisory lock that makes a rotation
 // atomic as a PAIR — lives in sdk/creds. It lives THERE rather than here
-// because the CLI is not its only holder: the host-agent keeps a
+// because the CLI is not its only holder: a credential broker keeps a
 // credentials-scope certificate of its own, under its own state dir, and two
 // copies of a lock-and-rename discipline is exactly the kind of duplication
 // that drifts. This file is the CLI's binding of that store to ~/.shed/creds,

@@ -91,7 +91,7 @@ type ServerEntry struct {
 	SSHPort  int       `yaml:"ssh_port"`
 	AddedAt  time.Time `yaml:"added_at"`
 	// ControlToken is the bearer token sent on control-plane HTTP requests
-	// (CLI, desktop). CredentialsToken is sent by the host-agent for the
+	// (CLI, desktop). CredentialsToken is sent by a credential broker for the
 	// credential bus. Both optional; empty when the server isn't token-gated.
 	ControlToken     string `yaml:"control_token,omitempty"`
 	CredentialsToken string `yaml:"credentials_token,omitempty"`

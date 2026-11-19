@@ -7,7 +7,7 @@
 // shed client credentials must NOT share a directory:
 //
 //	shed CLI     control-scope credential   ~/.shed/creds/<server>/
-//	host-agent   credentials-scope one      its own state dir
+//	a broker     credentials-scope one      its own state dir
 //
 // One certificate carries one scope, and two processes rotating independently
 // would otherwise overwrite each other's material in place. Parameterizing the
@@ -247,7 +247,7 @@ func (s *Store) Load(name, certPath, keyPath string) (*tls.Certificate, error) {
 
 // LoadServer is Load for a pair the store itself owns: the paths come from
 // Paths(name) rather than from a caller-held config entry. It is the shape every
-// non-CLI holder wants — the host-agent has no config file recording where its
+// non-CLI holder wants — a credential broker has no config file recording where its
 // own material lives, so the store is the only authority on the location.
 func (s *Store) LoadServer(name string) (*tls.Certificate, error) {
 	certPath, keyPath := s.Paths(name)

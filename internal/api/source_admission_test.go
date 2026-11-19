@@ -2,16 +2,19 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,6 +89,97 @@ func assertRefusal(t *testing.T, what string, r apiResp, status int, code string
 	}
 }
 
+// versionLike matches a release version such as 0.10.0.
+var versionLike = regexp.MustCompile(`\d+\.\d+\.\d+`)
+
+// retiredDaemon matches the retired daemon's name in any spelling.
+var retiredDaemon = regexp.MustCompile(`(?i)host.?agent`)
+
+// assertMachineIDRequiredBody checks the refusal of a request with no valid
+// machine headers: a JSON body with its code whose message is the whole
+// message (not a shortened one), tells the person to install the desktop app,
+// names both headers an SDK listener must send, and names neither the retired
+// daemon nor any version, within the 1000 bytes a broker reads.
+func assertMachineIDRequiredBody(t *testing.T, what string, r apiResp) {
+	t.Helper()
+	data := bytes.TrimSuffix(r.body, []byte("\n"))
+	var body struct {
+		Error config.APIErrorDetail `json:"error"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("%s: body is not JSON: %v: %s", what, err, r.body)
+	}
+	if body.Error.Code != config.ErrSourceMachineIDRequired {
+		t.Errorf("%s: code = %q, want %q", what, body.Error.Code, config.ErrSourceMachineIDRequired)
+	}
+	msg := body.Error.Message
+	// The whole message, written out here and not read from the constant, so
+	// a clause dropped from either copy fails.
+	const whole = "this server lets one machine per user answer credential requests and needs to know which machine is asking " +
+		"(headers X-Shed-Machine-Id and X-Shed-Machine-Name), but this request named no valid machine; " +
+		"install the current shed desktop app"
+	if msg != whole {
+		t.Errorf("%s: message is not the whole refusal:\n got %q\nwant %q", what, msg, whole)
+	}
+	for _, want := range []string{"install the current shed desktop app", "X-Shed-Machine-Id", "X-Shed-Machine-Name"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("%s: message does not contain %q: %q", what, want, msg)
+		}
+	}
+	if retiredDaemon.MatchString(msg) {
+		t.Errorf("%s: message names the retired daemon: %q", what, msg)
+	}
+	if v := versionLike.FindString(msg); v != "" {
+		t.Errorf("%s: message names a version (%s): %q", what, v, msg)
+	}
+	if len(data) > 1000 || len(data) > maxRefusalBody {
+		t.Errorf("%s: body is %d bytes, want at most 1000: %s", what, len(data), data)
+	}
+}
+
+// TestMachineIDRequiredRefusal: the refusal itself, as writeMachineIDRequired
+// writes it: 403 with the whole message.
+func TestMachineIDRequiredRefusal(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeMachineIDRequired(rec)
+	r := apiResp{rec.Code, rec.Body.Bytes(), rec.Header()}
+	assertRefusal(t, "no machine headers", r, http.StatusForbidden, config.ErrSourceMachineIDRequired)
+	assertMachineIDRequiredBody(t, "no machine headers", r)
+}
+
+// TestMissingMachineIDLoggedOncePerKey: the server's log line for a request
+// with no machine headers says what to install, names no version and no
+// retired daemon, quotes the key and the user, and is written once per key.
+func TestMissingMachineIDLoggedOncePerKey(t *testing.T) {
+	var buf bytes.Buffer
+	oldOut, oldFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() { log.SetOutput(oldOut); log.SetFlags(oldFlags) }()
+
+	var l missingIDLog
+	l.logOnce("alice", "SHA256:alice")
+	l.logOnce("alice", "SHA256:alice")
+	l.logOnce("", "SHA256:odd\nkey")
+
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("logged %d lines, want 2 (once per key, a key's newline escaped): %q", len(lines), buf.String())
+	}
+	if want := `credential bus: refused a request with no valid machine id for user "alice" from key "SHA256:alice"; ` +
+		`install the current shed desktop app on that machine; logged once per key`; lines[0] != want {
+		t.Errorf("line = %q, want %q", lines[0], want)
+	}
+	if !strings.Contains(lines[1], `with no valid machine id from key "SHA256:odd\nkey";`) {
+		t.Errorf("the implicit user's line = %q, want the key quoted and no user", lines[1])
+	}
+	for _, line := range lines {
+		if retiredDaemon.MatchString(line) || versionLike.MatchString(line) {
+			t.Errorf("line names the retired daemon or a version: %q", line)
+		}
+	}
+}
+
 // TestSourceAdmissionTable is the admission table at the API door (mtls,
 // users alice, bob and the admin root; each key its own machine unless a
 // case names one).
@@ -117,9 +211,7 @@ func TestSourceAdmissionTable(t *testing.T) {
 		t.Helper()
 		r := subscribeOnce(router, alice, subPath, hdrs...)
 		assertRefusal(t, name, r, http.StatusForbidden, config.ErrSourceMachineIDRequired)
-		if !strings.Contains(r.errMessage(t), "0.10.0") {
-			t.Fatalf("%s: message does not name the minimum versions: %s", name, r.body)
-		}
+		assertMachineIDRequiredBody(t, name, r)
 	}
 	for _, tc := range []struct {
 		name string
@@ -199,6 +291,7 @@ func TestSourceRespondOnlyFromTheBoundMachine(t *testing.T) {
 	}
 	r = do(router, credsAs(aliceFP), http.MethodPost, respondPath, respondBody("box", id), HeaderMachineID, "", HeaderMachineName, "")
 	assertRefusal(t, "an answer with no machine", r, http.StatusForbidden, config.ErrSourceMachineIDRequired)
+	assertMachineIDRequiredBody(t, "an answer with no machine", r)
 	if box.count() != 0 {
 		t.Fatal("a refused answer reached the shed")
 	}

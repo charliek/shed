@@ -20,7 +20,7 @@ HTTPS API over pinned mTLS. What it shows, live:
     nothing;
   - a credential-bus request from a user's shed reaches only that user's
     listener, and only that user may answer it (a synthetic listener,
-    `fixtures/busclient.py`; no real host agent);
+    `fixtures/busclient.py`; no real broker);
   - `shed assign` refuses a non-admin, an unknown user and a shed that has a
     user.
 

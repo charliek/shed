@@ -85,7 +85,7 @@ func (c *BusClient) Publish(ctx context.Context, namespace string, payload json.
 }
 
 // Ping sends a health check ping to the given namespace and returns nil
-// if the host agent responds within the timeout.
+// if the credential broker responds within the timeout.
 func (c *BusClient) Ping(ctx context.Context, namespace string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

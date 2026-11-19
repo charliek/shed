@@ -588,10 +588,10 @@ func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleEgressStream streams egress decisions as Server-Sent Events for the
-// host-agent subscriber (shed-extensions). GET /api/egress/stream
+// desktop app's broker. GET /api/egress/stream
 //
 // In mtls mode this route accepts a control OR credentials certificate (the
-// host-agent holds credentials; a control certificate may tail it) — see
+// broker holds credentials; a control certificate may tail it) — see
 // authMiddleware. It is per user: an admin (and the implicit user of a server
 // with no user list) sees every shed's decisions; any other user sees only
 // those of their own sheds (egressRecordVisible).

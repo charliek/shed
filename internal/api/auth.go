@@ -236,11 +236,11 @@ func authorizeScope(method, path, scope string) (detail string, ok bool) {
 		}
 	case isConnectRoute(path) || isEgressStreamPath(method, path):
 		// Neither is the credential bus. The Connect tunnel is a data-plane
-		// port-forward (`shed forward` uses control; the host-agent's reverse
-		// proxy uses credentials); the egress stream is audit metadata,
-		// filtered to the caller's own sheds unless the caller is an admin
-		// (host-agent subscriber uses credentials; a control credential may
-		// tail it too). Both accept either scope.
+		// port-forward (`shed forward` uses control; a credentials
+		// certificate is admitted as well); the egress stream is audit
+		// metadata, filtered to the caller's own sheds unless the caller is an
+		// admin (the desktop app's broker subscribes with credentials; a
+		// control credential may tail it too). Both accept either scope.
 		if scope != authtoken.ScopeControl && scope != authtoken.ScopeCredentials {
 			return "control or credentials scope required", false
 		}
@@ -331,7 +331,7 @@ func isConnectRoute(path string) bool {
 }
 
 // isEgressStreamPath reports whether r targets the egress audit SSE stream
-// (GET /api/egress/stream, filtered per user), consumed by the host-agent (credentials) and
+// (GET /api/egress/stream, filtered per user), consumed by the desktop app's broker (credentials) and
 // tailable by the CLI (control). It is method-scoped to GET on purpose: the
 // sibling POST/DELETE /api/egress/{name} mutators (handleEgressSet/Off) are
 // control-only, so a shed named "stream" must not let a credentials credential
