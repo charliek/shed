@@ -322,6 +322,36 @@ func TestConnectProbePlain(t *testing.T) {
 	}
 }
 
+// TestConnectProbeFollowsNoRedirect: a pinned endpoint that answers the probe
+// with a 302 to a plain-http listener. The probe fails on the 302, and the
+// plain listener sees no request, so the token never travels in the clear.
+// Negative control: a probe client that follows redirects reaches the plain
+// listener, which answers as the Connect route does (the probe passes), with
+// the token.
+func TestConnectProbeFollowsNoRedirect(t *testing.T) {
+	var plainSeen atomic.Int32
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		plainSeen.Add(1)
+		probeStatusHandler(t, "", http.StatusBadRequest)(w, r)
+	}))
+	defer plain.Close()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer srv.Close()
+	pin := servertls.Fingerprint(srv.Certificate().Raw)
+	client := NewConnectClient(ConnectTarget{Addr: addrOf(srv), TLSPin: pin, Token: "shed_control_test"}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := client.Probe(ctx, "myshed")
+	if err == nil || !strings.Contains(err.Error(), "302") {
+		t.Errorf("err = %v, want the probe to fail on the 302", err)
+	}
+	if n := plainSeen.Load(); n != 0 {
+		t.Errorf("the plain-http listener saw %d request(s), want none", n)
+	}
+}
+
 func TestConnectProbeWrongPin(t *testing.T) {
 	srv := httptest.NewTLSServer(probeStatusHandler(t, "", http.StatusBadRequest))
 	defer srv.Close()

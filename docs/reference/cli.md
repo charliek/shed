@@ -104,7 +104,7 @@ With `identity_file` set, three things hold, each checked at the points it names
 
 The path is stored in `config.yaml` as `identity_file`, absolute, with a leading `~` expanded; nothing else about it is rewritten. A value is refused, by the flag and in a hand-edited `config.yaml` alike, when it is not an absolute path, is not valid UTF-8, begins or ends with whitespace (any Unicode whitespace), or contains NUL, CR, LF, `"`, `\`, `#`, `%` or `$` (ssh expands `%` tokens and `${…}` and unescapes `\` in `-i` and `IdentityFile`, and a quote or `#` breaks the config line). Move or link a key whose path has one of those characters. The file is checked when the flag is given and again each time it is used: it must be a readable regular file, and its public key must be learnable without a passphrase, which item 1 needs. That is the case for a key in the OpenSSH format (`-----BEGIN OPENSSH PRIVATE KEY-----`, encrypted or not), for an unencrypted key, and for any key with its `.pub` file beside it; a `.pub` that names another key than the file's own is refused. A public key file is accepted too (ssh then offers the agent's copy of that key). A key that cannot be used fails the command before ssh runs, with `entry "<name>": identity_file "<path>" cannot be used: <reason>`.
 
-`--https-port` names the port **you** reach the server's TLS listener on. It overrides the HTTPS port the bootstrap bundle advertises when the `api_url` is built, which is what makes a port-mapped or externally published deployment addable; the pinned certificate fingerprint always comes from the bundle, and the verification request still has to succeed, so a wrong port fails during the add rather than on your next command.
+`--https-port` names the port **you** reach the server's TLS listener on. It overrides the HTTPS port the bootstrap bundle advertises when the `api_url` is built, which is what makes a port-mapped or externally published deployment addable; the pinned certificate fingerprint always comes from the bundle, and the verification request still has to succeed, so a wrong port fails during the add rather than on your next command. A later `shed server update <name> --refetch` keeps that port while the server answers on it.
 
 #### When the SSH port cannot be scanned
 
@@ -163,6 +163,22 @@ listener will not complete a handshake with an unenrolled client. It re-enrolls
 the entry's credential as a side effect, so a server that changed `auth.mode`
 lands on the right one. An `auth.mode: open` server (no bundle) still has its
 certificate read directly off its `api_url`.
+
+An entry whose `api_url` is `https` with a port (for example one added with
+`--https-port`) keeps that endpoint across a `--refetch` while the server
+answers there with the new pin and credential. Only when it cannot be reached
+there (a refused connection, a timeout, or a TLS handshake the pin does not
+pass) is the HTTPS port the server reports tried; if that one answers, the entry
+moves to it and the refetch prints
+`  HTTPS port changed from 18443 to 8443: … did not answer, and the server reports …`
+(with `--json`, `previous_api_url` beside `api_url`). An answer from the entry's
+own endpoint (a 401, a 403, a redirect, a 5xx, a body that does not decode, a TLS
+refusal of the certificate) is not a moved port: the refetch fails, naming that
+endpoint and what it answered, and saves nothing. If neither endpoint answers,
+the refetch fails, naming both, and saves nothing.
+
+No request the CLI makes to a server's API follows a redirect: a 3xx is reported
+as an error naming the status, and nothing is sent to the URL it names.
 
 Rotating an existing pin in a non-interactive session requires
 `--trust-on-first-use`.

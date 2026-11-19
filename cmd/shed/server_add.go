@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -994,10 +995,53 @@ func verifyServerEntry(entry *config.ServerEntry, cred clienttoken.Credential) (
 		clienttoken.New(cred, nil), DefaultTimeout)
 	info, err := client.GetInfo()
 	if err != nil {
-		return nil, fmt.Errorf("bootstrapped a credential over SSH, but the server's API at %s did not answer: %w",
-			entry.BaseURL(), err)
+		// The api_url comes from config.yaml (a refetch) or the command line,
+		// so it is escaped as every other line that shows one.
+		at := sdkbootstrap.SafeText(entry.BaseURL())
+		var status *apiStatusError
+		switch {
+		case errors.As(err, &status):
+			return nil, fmt.Errorf("bootstrapped a credential over SSH, but the server's API at %s answered HTTP %d: %w",
+				at, status.Status, err)
+		case endpointUnreached(err):
+			return nil, fmt.Errorf("bootstrapped a credential over SSH, but the server's API at %s did not answer: %w",
+				at, err)
+		case clienttoken.IsAuthFailure(0, err):
+			return nil, fmt.Errorf("bootstrapped a credential over SSH, but the server's API at %s refused it: %w",
+				at, err)
+		default:
+			return nil, fmt.Errorf("bootstrapped a credential over SSH, but the server's API at %s could not be used: %w",
+				at, err)
+		}
 	}
 	return info, nil
+}
+
+// endpointUnreached reports whether a request to the server's API failed
+// before the server answered it or proved who it is: the request was sent to
+// the network (a *url.Error from the HTTP client, not one from parsing the
+// URL) and produced no HTTP response, and the endpoint did not refuse the
+// credential with a TLS alert. That is a dial failure (connection refused, a
+// name that does not resolve), a timeout, or a TLS handshake that did not
+// authenticate the pinned server (the pin did not match, or the peer hung up
+// or does not speak TLS). It is decided by the error's type, never its text.
+//
+// Everything else is an answer from the endpoint: an HTTP status the request
+// did not expect (*apiStatusError: 401, 403, a 3xx, a 5xx), a body that does
+// not decode, or a TLS alert refusing the client certificate. The client
+// presents a certificate only after the pin check passed, so that refusal
+// comes from the server it pinned; the same alert from anything else is
+// treated alike, which can only stop a refetch, never move one.
+func endpointUnreached(err error) bool {
+	var ue *url.Error
+	if !errors.As(err, &ue) || ue.Op == "parse" {
+		return false
+	}
+	var status *apiStatusError
+	if errors.As(err, &status) {
+		return false
+	}
+	return !clienttoken.IsAuthFailure(0, err)
 }
 
 // warnSSHPortMismatch notes a server whose reported ssh_port differs from the
@@ -1284,9 +1328,11 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, identityFile st
 	}
 
 	updated := *entry
-	// No --https-port override on this path: `shed server update` has no such
-	// flag, and an entry being re-pinned already carries whatever endpoint the
-	// operator chose when they added it.
+	// stampBundle builds the api_url from the port the server REPORTS: it has
+	// no override here, because `shed server update` has no --https-port. The
+	// endpoint the entry already has (an add's --https-port, for a server
+	// reached through a port mapping) is kept, when it still answers, by
+	// verifyRefetchedEndpoint below, never by stampBundle.
 	cred, err := stampBundle(&updated, updated.Host, res, 0)
 	if err != nil {
 		return err
@@ -1294,11 +1340,13 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, identityFile st
 	updated.User = newUser
 	updated.IdentityFile = identityFile
 	// Learned again here: a TLS pin confirmation above may have waited on a
-	// person.
+	// person. verifyRefetchedEndpoint learns it again before each further
+	// presentation.
 	if err := keyHolds(); err != nil {
 		return err
 	}
-	if _, err := verifyServerEntry(&updated, cred); err != nil {
+	previousAPIURL, err := verifyRefetchedEndpoint(&updated, entry.APIURL, cred, keyHolds)
+	if err != nil {
 		return err
 	}
 	// And once more before a copy is written to staging: the network check
@@ -1320,7 +1368,8 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, identityFile st
 	}
 	if jsonFlag {
 		return outputJSON(refetchResult{Status: "ok", Action: "updated", Name: name,
-			User: updated.User, PreviousUser: previousUser, IdentityFile: updated.IdentityFile})
+			User: updated.User, PreviousUser: previousUser, IdentityFile: updated.IdentityFile,
+			APIURL: updated.APIURL, PreviousAPIURL: previousAPIURL})
 	}
 	if unchanged {
 		printSuccess("Server %s TLS pin unchanged: %s", name, updated.TLSCertFingerprint)
@@ -1329,6 +1378,9 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, identityFile st
 	}
 	if updated.IsMTLS() {
 		fmt.Println("  Re-enrolled a client certificate over SSH (mtls mode)")
+	}
+	if previousAPIURL != "" {
+		fmt.Println(movedEndpointLine(previousAPIURL, updated.APIURL))
 	}
 	switch {
 	case previousUser != "":
@@ -1354,6 +1406,137 @@ type refetchResult struct {
 	// IdentityFile is the entry's identity_file after the refetch (omitted
 	// when it has none).
 	IdentityFile string `json:"identity_file,omitempty"`
+	// APIURL is the entry's api_url after the refetch, and PreviousAPIURL,
+	// when the refetch moved it (the entry's own endpoint did not answer and
+	// the port the server reports did: verifyRefetchedEndpoint), the one
+	// before.
+	APIURL         string `json:"api_url,omitempty"`
+	PreviousAPIURL string `json:"previous_api_url,omitempty"`
+}
+
+// verifyRefetchedEndpoint is a refetch's network check, and decides which
+// endpoint the re-stamped entry keeps. updated has been stamped from the
+// bundle (stampBundle): its api_url is the one the server REPORTS. stored is
+// the api_url the entry had before the refetch.
+//
+//  1. An entry whose stored api_url is https with an explicit port keeps it
+//     when it still answers: the new credential and the bundle's pin are
+//     verified there first, exactly as verifyServerEntry does. This keeps an
+//     add's --https-port (a server reached through a port mapping) across a
+//     refetch.
+//  2. Only when it could not be reached or did not prove it is the server (a
+//     dial failure, a timeout, a TLS handshake the pin did not pass:
+//     endpointUnreached), and differs from the endpoint the server reports,
+//     is the reported one tried the same way; if that one verifies, the
+//     entry moves to it, and the stored api_url is returned as previous (the
+//     command says so). This heals a server that really changed its port.
+//     An ANSWER from the stored endpoint (a 401, a 403, a 3xx, a 5xx, a body
+//     that does not decode, a TLS refusal of the certificate) is no sign of a
+//     moved port: the refetch is refused there, naming that endpoint and what
+//     it answered, the reported endpoint is not tried, and the caller writes
+//     nothing.
+//  3. When neither verifies, the error names both, and the caller writes
+//     nothing.
+//  4. An entry whose api_url is plain http or has no port, or a bundle that
+//     reports no pinned HTTPS endpoint, is checked at the reported endpoint
+//     alone, as before.
+//
+// Why the first attempt is safe: it sends the new credential only to the
+// endpoint the entry already sent its credential to, and only over TLS pinned
+// to the fingerprint the server reported over the authenticated SSH channel.
+// A listener at that endpoint that is not this server cannot complete the
+// handshake: the pin is checked before the client presents its certificate,
+// and a bearer token is sent only after the handshake. The second attempt is
+// the endpoint a refetch has always used.
+//
+// keyHolds is the refetch's identity-file check (issuedKeyHolds), run again
+// before the second presentation, since the first may have waited on the
+// network; the caller runs it before the first.
+func verifyRefetchedEndpoint(updated *config.ServerEntry, stored string, cred clienttoken.Credential,
+	keyHolds func() error) (previous string, err error) {
+	reported := updated.APIURL
+	kept, ok := keptRefetchEndpoint(stored, reported, updated.TLSCertFingerprint)
+	if !ok {
+		_, err := verifyServerEntry(updated, cred)
+		return "", err
+	}
+	updated.APIURL = kept
+	_, keptErr := verifyServerEntry(updated, cred)
+	if keptErr == nil {
+		return "", nil
+	}
+	if sameEndpoint(kept, reported) {
+		return "", keptErr
+	}
+	if !endpointUnreached(keptErr) {
+		return "", fmt.Errorf("%w; nothing was saved (an answer is no sign of a moved port, so the endpoint the server reports, %s, was not tried)",
+			keptErr, sdkbootstrap.SafeText(reported))
+	}
+	if err := keyHolds(); err != nil {
+		return "", err
+	}
+	updated.APIURL = reported
+	if _, reportedErr := verifyServerEntry(updated, cred); reportedErr != nil {
+		updated.APIURL = kept
+		return "", fmt.Errorf("bootstrapped a credential over SSH, but the server's API answered at neither "+
+			"the entry's endpoint %s (%v) nor the endpoint the server reports, %s (%v); nothing was saved",
+			sdkbootstrap.SafeText(strings.TrimRight(kept, "/")), apiErrorCause(keptErr),
+			sdkbootstrap.SafeText(reported), apiErrorCause(reportedErr))
+	}
+	return kept, nil
+}
+
+// keptRefetchEndpoint returns the stored api_url a refetch tries first
+// (verifyRefetchedEndpoint rule 1): stored, when it is https with an explicit
+// port and the bundle reports a pinned https endpoint. ok is false otherwise
+// (rule 4).
+func keptRefetchEndpoint(stored, reported, pin string) (string, bool) {
+	if !isHTTPSURL(stored) || !isHTTPSURL(reported) || strings.TrimSpace(pin) == "" {
+		return "", false
+	}
+	u, err := url.Parse(strings.TrimSpace(stored))
+	if err != nil || u.Hostname() == "" || u.Port() == "" {
+		return "", false
+	}
+	return stored, true
+}
+
+// sameEndpoint reports whether two https api_urls name the same host and port.
+func sameEndpoint(a, b string) bool {
+	ua, errA := url.Parse(strings.TrimSpace(a))
+	ub, errB := url.Parse(strings.TrimSpace(b))
+	if errA != nil || errB != nil {
+		return false
+	}
+	return strings.EqualFold(ua.Hostname(), ub.Hostname()) && ua.Port() == ub.Port()
+}
+
+// apiErrorCause is verifyServerEntry's error without its leading sentence, so
+// a refusal that names two endpoints says each once.
+func apiErrorCause(err error) error {
+	if inner := errors.Unwrap(err); inner != nil {
+		return inner
+	}
+	return err
+}
+
+// movedEndpointLine is the text a refetch prints when it moved the entry to
+// the port the server reports (verifyRefetchedEndpoint rule 2). Each api_url
+// comes from config.yaml or is built from its host, so it is escaped as the
+// other lines that show one are.
+func movedEndpointLine(previous, current string) string {
+	return fmt.Sprintf("  HTTPS port changed from %s to %s: %s did not answer, and the server reports %s",
+		sdkbootstrap.SafeText(portOfURL(previous)), sdkbootstrap.SafeText(portOfURL(current)),
+		sdkbootstrap.SafeText(strings.TrimRight(previous, "/")), sdkbootstrap.SafeText(current))
+}
+
+// portOfURL is the port an api_url names ("" when it names none).
+func portOfURL(apiURL string) string {
+	u, err := url.Parse(strings.TrimSpace(apiURL))
+	if err != nil {
+		return ""
+	}
+	return u.Port()
 }
 
 // saveUpdatedServer writes a modified entry back to config.yaml through the
@@ -1439,7 +1622,7 @@ func refetchTLSPinOverHTTPS(name string, entry *config.ServerEntry, identityFile
 	if jsonFlag {
 		// The same result as the SSH-first refetch's (refetchResult).
 		return outputJSON(refetchResult{Status: "ok", Action: "updated", Name: name,
-			User: updated.User, IdentityFile: updated.IdentityFile})
+			User: updated.User, IdentityFile: updated.IdentityFile, APIURL: updated.APIURL})
 	}
 	if pinChanged {
 		printSuccess("Updated server %s TLS pin: %s", name, fp)

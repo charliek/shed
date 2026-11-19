@@ -255,6 +255,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **CLI: `shed server update <name> --refetch` keeps the HTTPS port you chose.** An entry
+  added with `--https-port` (a server reached through a port mapping) had its `api_url`
+  rebuilt from the port the server reports, so after a refetch it pointed at another port.
+  The refetch now verifies the entry's own endpoint first and keeps it when it answers. Only
+  when it cannot be reached (a refused connection, a timeout, a TLS handshake the pin does
+  not pass), the reported port is tried; the entry moves to it only if that one answers, and
+  the refetch says so (`  HTTPS port changed from … to …`; `previous_api_url` in `--json`).
+  An answer from the entry's own endpoint (a 401, a 403, a redirect, a 5xx, a body that does
+  not decode) is no sign of a moved port: the refetch fails there, naming the endpoint and
+  the status, and saves nothing. If neither endpoint answers, the refetch names both and
+  saves nothing. Limits: a stored `api_url` with a path that fails is not retried without
+  the path, and an `/api/info` answer that decodes but is empty still verifies.
+- **CLI: no request to a server's API follows a redirect (security).** Every command's API
+  client, the tunnel's probe and the roost provider's inventory now treat a 3xx as the
+  answer and report it as an error naming the status, so a credential is never sent on to
+  the URL a redirect names; before, an endpoint holding the pinned certificate could pass a
+  bearer token on to a plain-`http` URL. shed-server's API answers no request with a
+  redirect, so nothing that works today changes.
 - **Desktop: a cloud shed that is stopping shows `stopping`, and a shed's reason shows beside
   its status.** The shared core now decodes the remote backend's `stopping` status (it read
   `unknown`) and a shed's `status_reason`. The Sheds pane shows the reason the way `shed list`

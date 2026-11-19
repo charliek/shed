@@ -354,7 +354,9 @@ func (c *ConnectClient) attemptProbe(ctx context.Context, shedName string, cred 
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
-	client := &http.Client{Transport: transport}
+	// No redirect is followed (servertls.RefuseRedirects): a 3xx is an
+	// unexpected status below, and the token never reaches its Location.
+	client := &http.Client{Transport: transport, CheckRedirect: servertls.RefuseRedirects}
 	if transport != nil {
 		// One-shot probe: close our own pinned transport's idle keep-alive conn so
 		// it doesn't linger for the (long-lived) daemon worker's lifetime. Guarded

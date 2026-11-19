@@ -1301,7 +1301,12 @@ func TestServerUpdateRefetchIsATransaction(t *testing.T) {
 		m := newMTLSServer(t)
 		cfgPath, cert, entry := addedMTLSServer(t, m)
 
-		// The server has switched to token mode: same endpoint, a bearer token.
+		// The server has switched to token mode: a bearer token, on the port its
+		// bundle reports. Its mtls listener is gone, so the entry's own endpoint
+		// cannot be reached and the refetch moves to the reported one. (An mtls
+		// listener still refusing the token client there would be an answer,
+		// and the refetch would stop at it: TestRefetchAnAnswerIsNotAMovedPort.)
+		m.srv.Close()
 		_, tokHost, tokPort, tokPin := tokenServer(t, "srv", "shed_ctl_flip")
 		saved := clientConfig.Servers["srv"]
 		saved.Host = tokHost

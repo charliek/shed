@@ -165,8 +165,13 @@ func (c *APIClient) CredentialSource() *clienttoken.Source {
 // so every request path — including the long-running, ad-hoc clients used for
 // SSE and timeouts — verifies the pinned TLS cert. timeout 0 means no
 // client-level timeout (the caller bounds it with a context).
+//
+// It is the one place an APIClient's HTTP clients are made, and none of them
+// follows a redirect (servertls.RefuseRedirects): a 3xx is the answer, a
+// non-success status the request path reports, and the request's credential
+// never reaches the Location it names.
 func (c *APIClient) newHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{Timeout: timeout, Transport: c.transport}
+	return &http.Client{Timeout: timeout, Transport: c.transport, CheckRedirect: servertls.RefuseRedirects}
 }
 
 // NewAPIClient creates a plain-HTTP API client for the given host and port
@@ -2298,18 +2303,30 @@ func (c *APIClient) Status() (string, error) {
 	return serverStatusOffline, nil
 }
 
-// parseError extracts the error message from an API error response.
+// apiStatusError is the server's answer with a status the request did not
+// expect (parseError): the server was reached and answered. Status is the
+// HTTP status; the text is what parseError has always returned.
+type apiStatusError struct {
+	Status int
+	text   string
+}
+
+func (e *apiStatusError) Error() string { return e.text }
+
+// parseError extracts the error message from an API error response, as an
+// *apiStatusError carrying the status.
 func (c *APIClient) parseError(resp *http.Response) error {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("server returned status %d", resp.StatusCode)
+		return &apiStatusError{Status: resp.StatusCode, text: fmt.Sprintf("server returned status %d", resp.StatusCode)}
 	}
 
 	var apiErr config.APIError
 	if err := json.Unmarshal(body, &apiErr); err != nil {
 		// If not a structured error, return the body as-is
-		return fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
+		return &apiStatusError{Status: resp.StatusCode,
+			text: fmt.Sprintf("server returned status %d: %s", resp.StatusCode, string(body))}
 	}
 
-	return fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
+	return &apiStatusError{Status: resp.StatusCode, text: fmt.Sprintf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)}
 }

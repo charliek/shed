@@ -273,7 +273,9 @@ func fetchSheds(ctx context.Context, entry config.ServerEntry, timeout time.Dura
 	// credential" is a skip rather than a trigger to go get one.
 	src := clienttoken.New(cred, nil)
 	transport := servertls.PinnedTransport(entry.TLSCertFingerprint, src.CertificateFor)
-	client := &http.Client{Transport: transport}
+	// No redirect is followed (servertls.RefuseRedirects): a 3xx is an
+	// unexpected status below, and the credential never reaches its Location.
+	client := &http.Client{Transport: transport, CheckRedirect: servertls.RefuseRedirects}
 
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

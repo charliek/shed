@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -334,6 +335,36 @@ func (zeroReader) Read(p []byte) (int, error) {
 		p[i] = 'x'
 	}
 	return len(p), nil
+}
+
+// TestFetchSheds_FollowsNoRedirect: a pinned endpoint answering GET
+// /api/sheds with a 302 to a plain-http listener. The fetch fails on the 302,
+// and the plain listener sees no request, so the stored token never travels in
+// the clear. Negative control: a client that follows redirects reaches the
+// plain listener, which answers with a shed list, with the token.
+func TestFetchSheds_FollowsNoRedirect(t *testing.T) {
+	handler, hits := shedsHandler(t, config.Shed{Name: "a", Status: config.StatusRunning})
+	plain := httptest.NewServer(handler)
+	defer plain.Close()
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer ts.Close()
+
+	entry := config.ServerEntry{
+		Host:               "127.0.0.1",
+		APIURL:             ts.URL,
+		SSHPort:            2222,
+		ControlToken:       "shed_control_abc123",
+		TLSCertFingerprint: servertls.Fingerprint(ts.Certificate().Raw),
+	}
+	_, err := fetchSheds(context.Background(), entry, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "302") {
+		t.Errorf("err = %v, want the fetch to fail on the 302", err)
+	}
+	if n := atomic.LoadInt32(hits); n != 0 {
+		t.Errorf("the plain-http listener saw %d request(s), want none", n)
+	}
 }
 
 // TestInventory_FingerprintOverPlaintextIsSkipped covers fix 3: an entry with a
