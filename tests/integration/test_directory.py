@@ -776,6 +776,11 @@ def test_an_entry_whose_user_line_was_removed_is_refused_before_any_request(worl
     assert ENTRY_USER_LINE.format(user="pat") in r.stdout, r.stdout
     assert pat.entry_config().get("user") == "pat", pat.entry_config()
     assert ssh_relay.settle() > accepts[0], "the refetch's ssh did not go through its relay"
+    # A refetch keeps the endpoint the entry was added with (its --https-port):
+    # it verified the new certificate through the HTTPS relay, not at the port
+    # the server reports, and the entry still points there.
+    assert pat.entry_config()["api_url"] == f"https://{HOST}:{https_relay.port}", pat.entry_config()
+    assert https_relay.settle() > accepts[1], "the refetch did not verify the entry's own endpoint"
     r = pat.cli("list")
     assert r.returncode == 0, r.stderr
 
