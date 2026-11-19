@@ -1793,7 +1793,12 @@ success it prints:
 State directory: /etc/shed
 Enrolled with the account service at https://accounts.example.test as srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a (organization example, name "build-1").
 Wrote /etc/shed/directory/enrolment.json (mode 0600): this server's key for the account service, which never leaves this host.
+If the server is already running with this config, it reads the enrolment at its next attempt, at most 15 minutes from now; to use it at once, restart the server or run 'shed users refresh' as a local admin.
 ```
+
+A server that is not running reads the enrolment when it starts. One already
+running found none at its last attempt and reads it at its next, at most 15
+minutes later; until then only the local admins can log in.
 
 Every failure exits 1 and says whether anything was written and what to do;
 a lost answer says how to recover. The [User Directory

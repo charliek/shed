@@ -403,6 +403,14 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   host of every server enrolled with it (a list admin is an admin there), and the trust time
   needs an accurate host clock. See the [upgrade
   guide](https://charliek.github.io/shed/upgrades/v0.9.1-to-v0.10.0/#users-from-an-account-service).
+- **Moving an installed server to the account service** is written down in the [User
+  Directory guide](https://charliek.github.io/shed/guides/user-directory/): the Homebrew
+  commands (run `shed-server` as yourself with `--config "$(brew --prefix)/etc/shed/server.yaml"`,
+  never with `sudo`, which enrols into `/etc/shed`, where the service never looks); a first
+  enrolment on a running server; keeping your sheds, in two starts (once with only yourself
+  in `auth.users`, so the one-time upgrade step gives them to your list name, then the
+  switch, with the local admin under another name); and the local admin on a backup key with
+  one host name and `--identity-file` on each entry.
 - **CLI: upgrade every server first, then enrol every mtls entry again with `shed server
   update <name> --refetch`**, once per entry, on every machine. The CLI refuses, before it
   sends any request or runs `ssh`, an entry whose stored certificate names no user (a server
@@ -458,7 +466,10 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   service at `auth.directory.url`, once, writing `{state_dir}/directory/enrolment.json` (mode
   `0600`). It reads the one-time code from standard input only (a prompt that does not echo
   at a terminal), never waits for another run's lock, refuses a server already enrolled, and
-  on a lost answer writes nothing and says how to recover.
+  on a lost answer writes nothing and says how to recover. Its last line says what a server
+  already running does: it reads the enrolment at its next attempt, at most 15 minutes later
+  (until then only the local admins can log in, and a new person's first login starts no
+  pull); a restart or `shed users refresh` reads it at once.
 - **Server and CLI: `shed users status`** (`GET /api/users/status`, admin; refused to a script
   key) shows where a server's users come from (`config`, `directory` or `none`) and who they
   are, never their keys; on a directory server also the list's state, last good pull,

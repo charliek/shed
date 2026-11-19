@@ -419,6 +419,15 @@ func TestDirectoryEnrollEnrols(t *testing.T) {
 	dir := filepath.Join(stateDir, directory.StateDirName)
 	path := filepath.Join(dir, directory.EnrolmentFileName)
 	mustContain(t, "output", run.out, "State directory: "+stateDir+"\n", "as "+id, "Wrote "+path+" (mode 0600)")
+	// After the state directory, exactly three lines: the enrolment, the
+	// file, and what a server already running does with it.
+	lines := strings.Split(strings.TrimSuffix(run.out, "\n"), "\n")
+	if len(lines) != 4 || !strings.HasPrefix(lines[0], "State directory: ") ||
+		!strings.HasPrefix(lines[1], "Enrolled with the account service at ") ||
+		!strings.HasPrefix(lines[2], "Wrote "+path+" ") || lines[3] != runningServerNote() {
+		t.Errorf("output %q; want the state directory, then the enrolment, the file and the running-server note %q",
+			run.out, runningServerNote())
+	}
 	if run.errOut != "" {
 		t.Errorf("standard error %q; want nothing (standard input is not a terminal)", run.errOut)
 	}
@@ -469,6 +478,54 @@ func TestDirectoryEnrollEnrols(t *testing.T) {
 		t.Error("the second run changed enrolment.json")
 	}
 	checkNoSecrets(t, stateDir, []string{"code-one-a1b2c3", "code-two-d4e5f6"}, run.text(), second.text(), logs.String())
+}
+
+// TestEnrolNoteInGuide: the running-server note is what the code does, and
+// every copy the docs show of it is the line the command prints. A server
+// that found no enrolment tries again RetryInterval later (notEnrolled),
+// which the note states in minutes.
+func TestEnrolNoteInGuide(t *testing.T) {
+	note := runningServerNote()
+	if want := fmt.Sprintf("at most %d minutes from now", int(directory.RetryInterval/time.Minute)); !strings.Contains(note, want) {
+		t.Errorf("note %q does not contain %q", note, want)
+	}
+	if directory.RetryInterval%time.Minute != 0 {
+		t.Errorf("RetryInterval %s is not whole minutes; the note would understate it", directory.RetryInterval)
+	}
+	// The note's opening words find every copy, a corrupted one included.
+	const opening = "If the server is already running with this config,"
+	if !strings.HasPrefix(note, opening) {
+		t.Fatalf("note %q does not start with %q; update this test", note, opening)
+	}
+	for _, doc := range []struct {
+		path   []string
+		copies int // the guide shows it under both tabs of "Enrol"
+	}{
+		{[]string{"docs", "guides", "user-directory.md"}, 2},
+		{[]string{"docs", "reference", "cli.md"}, 1},
+	} {
+		rel := filepath.Join(doc.path...)
+		data, err := os.ReadFile(filepath.Join(append([]string{"..", ".."}, doc.path...)...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A line of its own, indented or not (an output block inside a tab
+		// is indented).
+		found := 0
+		for i, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, opening) {
+				continue
+			}
+			found++
+			if line != note {
+				t.Errorf("%s:%d quotes the enrolment's last line as\n%s\nbut the command prints\n%s", rel, i+1, line, note)
+			}
+		}
+		if found != doc.copies {
+			t.Errorf("%s has %d copies of the enrolment's last line, want %d:\n%s", rel, found, doc.copies, note)
+		}
+	}
 }
 
 // TestDirectoryEnrollRefused: every 4xx the service gives a well-formed
