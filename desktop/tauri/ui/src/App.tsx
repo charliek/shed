@@ -21,6 +21,7 @@ import { LanePanel } from "@/components/LanePanel";
 import { CrazeCreateDialog } from "@/components/CrazeCreateDialog";
 import { canOpenTerminal, crazeDoingLine, crazeMachineNote, killTarget } from "@/lib/crazeRows";
 import { newestReload } from "@/lib/newest";
+import { isBusy, statusText } from "@/lib/shedStatus";
 import {
   EMPTY_DRAFT, beginSubmit, closesOntoTranscript, crazeCreateOffered, crazeCreateTargets, createTitle,
   crazeCreateUpdateNote, crazeStatusFor, edit as editCrazeDraft, groupMachine, liveSetter,
@@ -120,13 +121,20 @@ const sessionOrigin = (s: RcSession): string =>
     ? (s.origin ?? `machine:${s.machine ?? "?"}`)
     : `${s.host}/${s.shed}`;
 
-/** A one-line spec summary (falls back to just the status when specs are absent). */
-function metaLine(s: Shed): string {
-  const bits: string[] = [];
-  if (s.cpus) bits.push(`${s.cpus} vCPU`);
-  if (s.memory_mb) bits.push(`${Math.round(s.memory_mb / 1024)} GB`);
-  bits.push(s.status);
-  return bits.join(" · ");
+/** A one-line spec summary ending in the status and its reason (`statusText`:
+ *  `2 vCPU · 4 GB · stopped (capacity)`; just the status when specs are absent).
+ *  The status part is its own node, so the dashboard report reads it back off
+ *  the row (`data-shed-status`). */
+function MetaLine({ s }: { s: Shed }) {
+  const specs: string[] = [];
+  if (s.cpus) specs.push(`${s.cpus} vCPU`);
+  if (s.memory_mb) specs.push(`${Math.round(s.memory_mb / 1024)} GB`);
+  return (
+    <div className="font-mono text-[12.5px] leading-tight text-shed-text-muted">
+      {specs.map((b) => `${b} · `).join("")}
+      <span data-shed-status>{statusText(s)}</span>
+    </div>
+  );
 }
 
 /** Human-readable bytes for the System pane (matches the mock's "Zero KB" empties). */
@@ -353,10 +361,11 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
             <div className="flex flex-col gap-3">
               {rows.map((s) => {
                 const running = s.status === "running";
-                const busy = s.status === "restarting" || s.status === "starting" || s.status === "stopping";
+                const busy = isBusy(s);
                 const dotColor = running ? "var(--shed-ok)" : busy ? "var(--shed-attention)" : "var(--shed-text-muted)";
                 return (
-                  <div key={`${host}/${s.name}`} className={cn(cardCls, "flex items-center gap-3.5 px-[18px] py-[15px]")} style={{ animation: "shed-in .25s ease" }}>
+                  <div key={`${host}/${s.name}`} data-shed-row data-shed-host={s.host} data-shed-name={s.name}
+                    className={cn(cardCls, "flex items-center gap-3.5 px-[18px] py-[15px]")} style={{ animation: "shed-in .25s ease" }}>
                     <Dot className="h-2.5 w-2.5" style={{ background: dotColor }} />
                     <div className="min-w-0 flex-1">
                       <div className="mb-1.5 flex flex-wrap items-center gap-2.5">
@@ -364,7 +373,7 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                         {s.backend && <Tag kind={s.backend} />}
                         {s.image && <ImageChip>{s.image}</ImageChip>}
                       </div>
-                      <div className="font-mono text-[12.5px] leading-tight text-shed-text-muted">{metaLine(s)}</div>
+                      <MetaLine s={s} />
                       {running && (() => {
                         const target = `roost:${s.host}/${s.name}`;
                         const craze = crazeOf(target);
@@ -397,7 +406,7 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
                         );
                       })()}
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex gap-2" data-shed-controls>
                       {running ? (
                         <>
                           <ActBtn icon={Terminal} tone="neutral" title="Open in Terminal" onClick={() => void openTerminal(s.name, s.host)} />

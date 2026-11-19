@@ -5,6 +5,7 @@ import type { CrazeCreateOptions } from "@/lib/crazeCreate";
 import type { CrazeSavedList } from "@/lib/crazeResume";
 import { killTarget } from "@/lib/crazeRows";
 import { initialReport } from "@/lib/report";
+import { pairRowsWithCards } from "@/lib/shedStatus";
 import type { SourceMachine, SourceRow, SourceStatus } from "@/lib/sources";
 
 export type Pane = "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system";
@@ -25,6 +26,9 @@ export type Shed = {
   name: string;
   host: string;
   status: string;
+  /** Why the shed is in `status` (a remote backend code such as `capacity`), or
+   *  null — shown beside the status by `statusText` (`lib/shedStatus`). */
+  status_reason?: string | null;
   backend?: string | null;
   image?: string | null;
   cpus?: number | null;
@@ -164,6 +168,50 @@ type ReportPayload = {
   hostErrors: HostFailure[];
 };
 
+/** What one shed's card on the Sheds pane rendered, read back off its own nodes
+ *  — the `renderedText` rule, so `dashboard.dump` says what the row shows, not
+ *  what `statusText`/`isBusy` would say. Both are null when no card for the shed
+ *  is mounted (another pane is up).
+ *
+ *  `status_text` is the meta line's status part (`stopping`, `stopped
+ *  (capacity)`); `controls` is `{spinner, buttons}` — whether the busy spinner
+ *  shows, and the titles of the action buttons present (`Start`, `Delete`,
+ *  `Stop`, `Restart`, `Open in Terminal`). */
+export type ShedRowRendered = {
+  status_text: string | null;
+  controls: { spinner: boolean; buttons: string[] } | null;
+};
+
+/** The reported shed rows: each row with its [ShedRowRendered]. A card is found
+ *  by its `data-shed-host` + `data-shed-name` pair (no selector is built from a
+ *  server name); rows that share both are paired with their cards in order, and
+ *  get null when the counts differ (`pairRowsWithCards`), so no row reports
+ *  another card's evidence. Call at send time, after the commit. */
+function withRenderedRows(sheds: Shed[]): (Shed & ShedRowRendered)[] {
+  const cards = typeof document === "undefined" ? [] : Array.from(document.querySelectorAll("[data-shed-row]"));
+  const paired = pairRowsWithCards(sheds, cards, (el) => {
+    const host = el.getAttribute("data-shed-host");
+    const name = el.getAttribute("data-shed-name");
+    return host === null || name === null ? null : { host, name };
+  });
+  return sheds.map((s, i) => {
+    const card = paired[i];
+    const controls = card?.querySelector("[data-shed-controls]");
+    return {
+      ...s,
+      status_text: card?.querySelector("[data-shed-status]")?.textContent ?? null,
+      controls: controls
+        ? {
+            spinner: !!controls.querySelector(".animate-spin"),
+            buttons: Array.from(controls.querySelectorAll("button"))
+              .map((b) => b.title)
+              .filter((t) => t !== ""),
+          }
+        : null,
+    };
+  });
+}
+
 /** Report the rendered snapshot Rust relays to the harness (`ui.current_pane` /
  *  `ui.computed_style` / `dashboard.dump` / `ui.badges`). ALWAYS a FULL blob — every
  *  key present — so no partial report can (a) create the `main` slot before the shell
@@ -175,7 +223,9 @@ function report({ pane, sheds, refreshToken, modal, badges, sidebar, mode, hostE
     snapshot: {
       pane,
       style: sampleStyle(mode),
-      sheds,
+      // Each row as shed-core sent it, plus what its card RENDERED (read off
+      // the mounted row at send time): `status_text` and `controls`.
+      sheds: withRenderedRows(sheds),
       refresh_token: refreshToken,
       modal,
       badges,

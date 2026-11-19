@@ -50,7 +50,8 @@ fails there.
 `agent_upgrade_required` (shed-host-agent is too old to obtain a certificate) or `other`,
 `summary` is the one-line remedy-first text, and `detail` is the hover/log body. It is always
 present — `[]` when every host is healthy. The UI-truth op `dashboard.dump` returns
-`{rows, host_errors, empty}`: the rendered shed rows, the failures the shell holds, and the
+`{rows, host_errors, empty}`: the rendered shed rows (each with the `status_text` and
+`controls` its card shows, [below](#ui-truth-ops)), the failures the shell holds, and the
 rendered empty state (`{title, body}`, `null` when the list rendered).
 
 The Sheds pane renders no error rows of its own. An unreachable server is a *status*, and
@@ -432,7 +433,7 @@ backend's view — the two can disagree, and have.
 
 | op | answers | result |
 |----|---------|--------|
-| `dashboard.dump` | on the Sheds pane | `{rows, host_errors, empty}` |
+| `dashboard.dump` | on the Sheds pane | `{rows, host_errors, empty}` — each row is the shed as shed-core decoded it (`status` is `running`, `stopped`, `starting`, `stopping`, `error`, or `unknown` for a status the app does not know; `status_reason` the server's reason code or `null`), plus what its card rendered, read off the row: `status_text` (the status, and the reason in parentheses as `shed list` shows it: `stopped (capacity)`) and `controls` (`{spinner, buttons}`: whether the busy spinner shows, and the titles of the action buttons present — a `starting` or `stopping` shed shows the spinner and none). Both are `null` when the card is not mounted. Rows of one server that share a name take their cards in order, and are `null` when the number of rows and cards differs, so a row never reports another row's card |
 | `agents.dump` | on the Agents pane | `{sessions, empty}` — `empty` is the rendered empty state (`{state, title, body, action}`), `null` when rows rendered. `state` is `loading` \| `failed` \| `unreachable` \| `empty`: four blanks wearing one screen, and only `empty` offers the bootstrap |
 | `launch.dump` | while the New-session dialog is open | `{launch}` — `{rendered, values, create_enabled}`, `null` when none is mounted: the dialog's own rendered text, each labelled control's current value keyed by its label (what was typed is not text content), and whether its Create button is enabled — all three read off the mounted DOM |
 | `egress.profiles` | on the Egress pane | `{egress}` |

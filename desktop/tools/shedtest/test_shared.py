@@ -56,6 +56,67 @@ def test_null_sheds_is_an_empty_list_not_an_error(client, mock):
     assert client.sheds_host_errors() == []
 
 
+def test_cloud_lifecycle_rows(client, mock):
+    # The remote backend's lifecycle (plan 037 §3.14): a cloud shed that is
+    # stopping reads `stopping` (it read `unknown`) with the busy spinner and no
+    # Start or Delete, one that is starting the same, and a stopped one with a
+    # reason reads as the CLI's
+    # `shed list` does. Everything here is read back off the RENDERED row
+    # (`dashboard.dump`'s `status_text` and `controls`), not the backend's view.
+    # `rebooting` is no status shed-core knows: it still reads `unknown`.
+    mock.set_sheds([
+        {"name": "cloudy", "status": "stopping", "backend": "remote"},
+        {"name": "booting", "status": "starting", "backend": "remote"},
+        {"name": "full-zone", "status": "stopped", "status_reason": "capacity",
+         "backend": "remote"},
+        {"name": "rebooting", "status": "rebooting", "backend": "remote"},
+    ])
+    client.wait_until(lambda: client.current_pane() is not None, timeout=15,
+                      what="frontend ready")
+    client.navigate("sheds")
+    client.wait_until(lambda: client.current_pane() == "sheds", timeout=15, what="pane=sheds")
+    client.sheds_refresh()
+
+    def rendered() -> dict:
+        rows = {r["name"]: r for r in client.dashboard_dump()["rows"]}
+        if set(rows) != {"cloudy", "booting", "full-zone", "rebooting"}:
+            return {}
+        # Off-pane (or before the cards mount) the rendered fields are null.
+        if any(r.get("status_text") is None or r.get("controls") is None
+               for r in rows.values()):
+            return {}
+        return rows
+
+    client.wait_until(lambda: rendered(), timeout=10, what="cloud rows rendered")
+    rows = rendered()
+
+    cloudy = rows["cloudy"]
+    assert cloudy["status"] == "stopping", cloudy
+    assert cloudy["status_text"] == "stopping", cloudy
+    assert cloudy["controls"]["spinner"] is True, cloudy
+    assert "Start" not in cloudy["controls"]["buttons"], cloudy
+    assert "Delete" not in cloudy["controls"]["buttons"], cloudy
+    assert cloudy["controls"]["buttons"] == [], cloudy  # nothing to press while busy
+
+    booting = rows["booting"]
+    assert booting["status"] == "starting", booting
+    assert booting["status_text"] == "starting", booting
+    assert booting["controls"] == {"spinner": True, "buttons": []}, booting
+
+    full = rows["full-zone"]
+    assert full["status"] == "stopped", full
+    assert full["status_reason"] == "capacity", full
+    assert full["status_text"] == "stopped (capacity)", full
+    assert full["controls"] == {"spinner": False, "buttons": ["Start", "Delete"]}, full
+
+    # Negative control: a status shed-core does not know is not mistaken for
+    # one it does.
+    odd = rows["rebooting"]
+    assert odd["status"] == "unknown", odd
+    assert odd["status_text"] == "unknown", odd
+    assert odd["controls"]["spinner"] is False, odd
+
+
 def test_sheds_list_carries_image_and_digest(client):
     # A shed created from the server's default image carries only `image_digest`
     # (no `image` label); one created from an alias carries both.

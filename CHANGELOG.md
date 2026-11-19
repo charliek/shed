@@ -255,6 +255,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Desktop: a cloud shed that is stopping shows `stopping`, and a shed's reason shows beside
+  its status.** The shared core now decodes the remote backend's `stopping` status (it read
+  `unknown`) and a shed's `status_reason`. The Sheds pane shows the reason the way `shed list`
+  does (`stopped (capacity)`, `starting (no_pin)`), and a starting or stopping shed shows the
+  busy spinner with no Start or Delete button until it settles. A status the app does not know
+  still reads `unknown`.
 - **Desktop (craze): stopping a session no longer freezes its transcript panel.** craze 0.2.0
   removes a stopping session from its list before the session's last events arrive. The
   desktop used to close the lane at once, leaving a panel with no "ended" banner, a live
