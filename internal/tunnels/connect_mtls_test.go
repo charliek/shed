@@ -221,7 +221,10 @@ func TestPlainTunnelNeverPresentsACertificate(t *testing.T) {
 	src := clienttoken.New(clienttoken.MTLSCredential(cert, time.Now().Add(24*time.Hour)), nil)
 
 	client := NewConnectClient(ConnectTarget{Addr: "127.0.0.1:1"}, src) // no TLSPin ⇒ plain
-	cred, _ := client.capture()
+	cred, _, err := client.capture()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got := client.clientCertificate(clienttoken.WithPinned(context.Background(), cred)); got != nil {
 		t.Error("a client certificate was offered on an unpinned (plaintext) target")
 	}

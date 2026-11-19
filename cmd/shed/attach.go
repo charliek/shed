@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 )
 
@@ -80,6 +81,9 @@ func attachPlain(name, serverName string, entry *config.ServerEntry, shed *confi
 	if attachNewFlag {
 		sessions, err := listShedSessions(serverName, entry, name)
 		if err != nil {
+			if clienttoken.IsRefusal(err) {
+				return err // the entry may not be used: its message stands alone
+			}
 			return fmt.Errorf("failed to check existing sessions: %w", err)
 		}
 		for _, s := range sessions {

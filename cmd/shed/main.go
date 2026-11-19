@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/version"
 )
@@ -223,6 +224,9 @@ func printError(msg string, suggestions ...string) {
 func ensureRunningShed(client *APIClient, name string) (*config.Shed, error) {
 	shed, err := client.GetShed(name)
 	if err != nil {
+		if clienttoken.IsRefusal(err) {
+			return nil, err // the entry may not be used: its message stands alone
+		}
 		return nil, fmt.Errorf("failed to get shed status: %w", err)
 	}
 	// Only a remote shed is waited on, or refused in status "error": a
@@ -248,6 +252,9 @@ func ensureRunningShed(client *APIClient, name string) (*config.Shed, error) {
 	}
 	shed, err = client.StartShed(name)
 	if err != nil {
+		if clienttoken.IsRefusal(err) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("failed to start shed: %w", err)
 	}
 	if inTransition(shed.Status) {

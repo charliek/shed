@@ -5,6 +5,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 )
 
@@ -52,6 +53,9 @@ func waitSettled(c shedGetter, shed *config.Shed, progress io.Writer) (*config.S
 		time.Sleep(settlePollInterval)
 		next, err := c.GetShed(shed.Name)
 		if err != nil {
+			if clienttoken.IsRefusal(err) {
+				return nil, err // the entry may not be used: its message stands alone
+			}
 			return nil, fmt.Errorf("failed to get shed status: %w", err)
 		}
 		shed = next

@@ -403,6 +403,15 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   host of every server enrolled with it (a list admin is an admin there), and the trust time
   needs an accurate host clock. See the [upgrade
   guide](https://charliek.github.io/shed/upgrades/v0.9.1-to-v0.10.0/#users-from-an-account-service).
+- **CLI: upgrade every server first, then enrol every mtls entry again with `shed server
+  update <name> --refetch`**, once per entry, on every machine. The CLI refuses, before it
+  sends any request or runs `ssh`, an entry whose stored certificate names no user (a server
+  older than 0.10.0 issued it) or names a user the entry does not record (an older CLI saved
+  the entry, it was edited by hand, or an enrolment was interrupted); the refetch records the
+  user and prints it. A newly
+  issued certificate that names no user is refused too, with nothing saved. A CLI older than
+  0.10.0 drops `user` when it saves `config.yaml`: use 0.10.0 on every machine that shares
+  one. A running tunnel daemon keeps the entry it started with: restart it after a refetch.
 
 #### Added
 
@@ -520,6 +529,22 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   restriction that server has not declared left out. An account service built from the
   contract copies `tests/directory-contract/v1/` again (its manifest line for `CONTRACT.md`
   changed).
+- **CLI: a server entry is held to its user.** An mtls entry records the user its
+  certificates name (`user` in `config.yaml`), set at `shed server add`, at `shed server update
+  --refetch`, or by a re-enrolment when it has none; a certificate for the implicit user of a
+  server with no user list neither sets nor clears it. When a re-enrolment is issued a
+  certificate for another user (`ssh` offered a key that belongs to someone else), the command
+  fails, naming both users, and nothing is written or used; `shed server update <name>
+  --refetch --allow-user-change` makes the change. `shed server list` shows STATUS `refused`
+  for an entry the CLI refuses and prints why once to stderr. The roost provider presents a
+  stored certificate under the same rule. The rule is about what a process takes up: a process
+  never takes up a certificate for a user the entry does not record when it checks, but a
+  certificate it already holds stays in use until its next re-enrolment or until the
+  certificate ends, whichever is first, even after another process changed the entry with
+  `--allow-user-change`; at that re-enrolment it stops. After changing an entry's user,
+  restart long-running `shed` commands and tunnel daemons; until then they continue as the
+  previous user for at most the certificate's life. A tunnel daemon reads the entry at every
+  re-enrolment and never takes up a user the entry does not record.
 - **Development:** `SHED_DEV_USERS=itest` starts the dev servers with the suite's user list;
   the suite gains `test_users.py`, `test_users_upgrade.py` and `test_source_pin.py`, with
   `SHED_ITEST_USERS` and `SHED_ITEST_USERS_DIR`.
@@ -559,6 +584,17 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
 - **Host-agent and desktop: the bus follows a redirect only to the server's own origin**, and
   an answer the server refused is audited as `undelivered`.
 - **Development: both parallel dev servers and the integration suite run `mtls`.**
+- **CLI: every client-certificate write for an entry is one transaction** (a re-enrolment, an
+  add, a refetch) under that server's credential lock, deciding against the entry as
+  `config.yaml` holds it at that moment: two processes that enrol one entry for different
+  users cannot both win, and a refetch does not overwrite another process's
+  `--allow-user-change`. The loser writes nothing and fails. A command killed between writing
+  the certificate and saving `config.yaml` leaves an entry the CLI refuses (nothing is sent)
+  until `shed server update <name> --refetch`; a save whose old certificate cannot be put back
+  fails the command, naming that refetch. A re-enrolment that would record an entry's first
+  user is used only once `config.yaml` records it: if the save fails, the command fails and
+  says why. A re-enrolment that cannot read the entry under its lock fails closed, and an
+  expired certificate the CLI kept after a refused re-enrolment is never sent.
 
 #### Removed
 

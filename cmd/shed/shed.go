@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/sync"
 	"github.com/charliek/shed/internal/tunnels"
@@ -1105,6 +1106,10 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		}
 		client := NewAPIClientFromNamedEntry(serverFlag, entry, DefaultTimeout)
 		if _, err := client.GetShed(name); err != nil {
+			if clienttoken.IsRefusal(err) {
+				// The entry may not be used: say why, not "not found".
+				return "", nil, err
+			}
 			printError(fmt.Sprintf("shed %q not found on %s", name, serverFlag),
 				"shed list --all       # Find which server has it",
 				"shed create "+name+"  # Create a new shed")
@@ -1113,8 +1118,14 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		return serverFlag, entry, nil
 	}
 
-	if server, entry, ok := searchShedServer(name); ok {
+	server, entry, ok, refusal := searchShedServer(name)
+	if ok {
 		return server, entry, nil
+	}
+	if refusal != nil {
+		// A server that might host the shed refused to be used: its message,
+		// unwrapped, is the answer, not "not found".
+		return "", nil, refusal
 	}
 
 	// Not found anywhere
@@ -1134,15 +1145,33 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 // server. It reports false when no server answers for the shed (a server
 // hides a shed the caller may not see, so "not found" can also mean "not
 // yours").
-func searchShedServer(name string) (string, *config.ServerEntry, bool) {
+//
+// A server whose entry the CLI refuses (clienttoken.IsRefusal: its stored
+// certificate, or a re-enrolment, is for a user the entry may not use) is not
+// a server that lacks the shed: its refusal is kept and returned when no other
+// server answers for the shed, so the command fails with that message rather
+// than "not found". The cached server refusing ends the search at once (the
+// cache says the shed is there), and its cache row is kept.
+func searchShedServer(name string) (string, *config.ServerEntry, bool, error) {
+	var refusal error
+	note := func(err error) {
+		if refusal == nil && clienttoken.IsRefusal(err) {
+			refusal = err
+		}
+	}
+
 	// Check cache first (unqualified form only)
 	if cachedServer, err := clientConfig.GetShedServer(name); err == nil {
 		entry, err := clientConfig.GetServer(cachedServer)
 		if err == nil {
 			// Verify the shed still exists
 			client := NewAPIClientFromNamedEntry(cachedServer, entry, DefaultTimeout)
-			if _, err := client.GetShed(name); err == nil {
-				return cachedServer, entry, true
+			_, err := client.GetShed(name)
+			if err == nil {
+				return cachedServer, entry, true, nil
+			}
+			if clienttoken.IsRefusal(err) {
+				return "", nil, false, err
 			}
 			// Shed not found on cached server, clear cache and search
 			clientConfig.RemoveShedCache(name)
@@ -1154,10 +1183,12 @@ func searchShedServer(name string) (string, *config.ServerEntry, bool) {
 		entry, _ := clientConfig.GetServer(clientConfig.DefaultServer)
 		if entry != nil {
 			client := NewAPIClientFromNamedEntry(clientConfig.DefaultServer, entry, DefaultTimeout)
-			if _, err := client.GetShed(name); err == nil {
+			_, err := client.GetShed(name)
+			if err == nil {
 				clientConfig.CacheShed(name, clientConfig.DefaultServer, "")
-				return clientConfig.DefaultServer, entry, true
+				return clientConfig.DefaultServer, entry, true, nil
 			}
+			note(err)
 		}
 	}
 
@@ -1167,15 +1198,17 @@ func searchShedServer(name string) (string, *config.ServerEntry, bool) {
 			continue // Already checked
 		}
 		client := NewAPIClientFromNamedEntry(serverName, &entry, DefaultTimeout)
-		if _, err := client.GetShed(name); err == nil {
+		_, err := client.GetShed(name)
+		if err == nil {
 			// Update cache
 			clientConfig.CacheShed(name, serverName, "")
 			entryCopy := entry
-			return serverName, &entryCopy, true
+			return serverName, &entryCopy, true, nil
 		}
+		note(err)
 	}
 
-	return "", nil, false
+	return "", nil, false, refusal
 }
 
 // autoSyncAfterCreate syncs files after shed creation.

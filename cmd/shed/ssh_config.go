@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/sshconfig"
 )
@@ -158,17 +159,29 @@ func getAllShedsInfo() ([]shedInfo, error) {
 	type cacheRow struct{ name, server, status string }
 	var cacheRows []cacheRow
 
+	// A server whose entry the CLI refuses (clienttoken.IsRefusal) is not one
+	// that has no sheds: its refusal is printed, once, whatever the verbosity,
+	// and when no server answered at all the command fails rather than print
+	// "No sheds found".
+	answered, refused := 0, 0
+
 	// Query all servers for their sheds
 	for serverName, entry := range clientConfig.Servers {
 		entryCopy := entry
 		client := NewAPIClientFromNamedEntry(serverName, &entryCopy, DefaultTimeout)
 		resp, err := client.ListSheds()
 		if err != nil {
+			if clienttoken.IsRefusal(err) {
+				refused++
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				continue
+			}
 			if verboseLevel > 0 {
 				fmt.Fprintf(os.Stderr, "Warning: could not reach %s: %v\n", serverName, err)
 			}
 			continue
 		}
+		answered++
 
 		for _, shed := range resp.Sheds {
 			result = append(result, shedInfo{
@@ -179,6 +192,10 @@ func getAllShedsInfo() ([]shedInfo, error) {
 			// Update cache
 			cacheRows = append(cacheRows, cacheRow{shed.Name, serverName, shed.Status})
 		}
+	}
+	if answered == 0 && refused > 0 {
+		// Each refusal is printed above; this only says the command failed.
+		return nil, fmt.Errorf("no configured server could be used: %d refused (see above)", refused)
 	}
 
 	// Save updated cache. One timestamp for the whole batch: Update applies the

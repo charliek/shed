@@ -85,7 +85,13 @@ var serverUpdateCmd = &cobra.Command{
 Pass --tls-fingerprint <sha256:...> to pin a new fingerprint verified
 out-of-band, or --refetch to re-read it from the server over the same SSH-first
 path 'shed server add' uses (trust-on-first-use or interactive prompt), which
-also re-enrolls the entry's credential.`,
+also re-enrolls the entry's credential.
+
+An entry is held to the user its certificates name. --refetch refuses a new
+certificate for another user and writes nothing; add --allow-user-change to
+make the entry that user. --refetch is also how an entry the CLI refuses (its
+certificate names no user, or a user the entry does not record) is enrolled
+again.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runServerUpdate,
 }
@@ -100,9 +106,10 @@ var (
 	serverAddTLSFingerprint string
 	serverAddSecure         bool
 
-	serverUpdateTLSFingerprint string
-	serverUpdateRefetch        bool
-	serverUpdateTrustTOFU      bool
+	serverUpdateTLSFingerprint  string
+	serverUpdateRefetch         bool
+	serverUpdateTrustTOFU       bool
+	serverUpdateAllowUserChange bool
 )
 
 func init() {
@@ -118,6 +125,7 @@ func init() {
 	serverUpdateCmd.Flags().StringVar(&serverUpdateTLSFingerprint, "tls-fingerprint", "", "New pinned TLS cert fingerprint (sha256:...) to rotate to")
 	serverUpdateCmd.Flags().BoolVar(&serverUpdateRefetch, "refetch", false, "Re-fetch the cert from the server's api_url and re-pin it (TOFU/prompt)")
 	serverUpdateCmd.Flags().BoolVar(&serverUpdateTrustTOFU, "trust-on-first-use", false, "With --refetch, trust the re-fetched TLS cert without prompting")
+	serverUpdateCmd.Flags().BoolVar(&serverUpdateAllowUserChange, "allow-user-change", false, "With --refetch, let the entry change to the user the server issues the new certificate for")
 
 	serverCmd.AddCommand(serverAddCmd)
 	serverCmd.AddCommand(serverListCmd)
@@ -363,11 +371,7 @@ func runServerList(cmd *cobra.Command, args []string) error {
 		result := make([]serverJSON, 0, len(names))
 		for _, name := range names {
 			entry := clientConfig.Servers[name]
-			client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
-			status := "offline"
-			if client.Ping() {
-				status = "online"
-			}
+			status := probeServerStatus(name, entry)
 			result = append(result, serverJSON{
 				Name:               name,
 				Host:               entry.Host,
@@ -400,11 +404,7 @@ func runServerList(cmd *cobra.Command, args []string) error {
 
 		// Reachability is probed over the entry's real endpoint (BaseURL +
 		// pinned cert), so STATUS is correct for secure servers too.
-		client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
-		status := "offline"
-		if client.Ping() {
-			status = "online"
-		}
+		status := probeServerStatus(name, entry)
 
 		defaultMark := ""
 		if name == clientConfig.DefaultServer {
@@ -418,6 +418,22 @@ func runServerList(cmd *cobra.Command, args []string) error {
 
 	w.Flush()
 	return nil
+}
+
+// probeServerStatus is one entry's STATUS for `shed server list`: online,
+// offline, or refused. It probes through the request path (APIClient.Status),
+// so a certificate the server rejects is re-enrolled once, as for any request.
+// An entry the CLI refuses — its stored certificate names no user or another
+// user, which is known without a request, or a re-enrolment issued a
+// certificate for another user — shows `refused`, and its message is printed
+// once to stderr.
+func probeServerStatus(name string, entry config.ServerEntry) string {
+	client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
+	status, refusal := client.Status()
+	if refusal != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", refusal)
+	}
+	return status
 }
 
 // securityLabel classifies a server entry's control-plane transport for the
@@ -565,6 +581,9 @@ func isHTTPSURL(s string) bool {
 
 func runServerUpdate(cmd *cobra.Command, args []string) error {
 	name := args[0]
+	if serverUpdateAllowUserChange && !serverUpdateRefetch {
+		return fmt.Errorf("--allow-user-change only applies with --refetch")
+	}
 	entry, err := clientConfig.GetServer(name)
 	if err != nil {
 		return err

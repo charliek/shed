@@ -1028,26 +1028,37 @@ func TestServerUpdateRefetchIsSSHFirst(t *testing.T) {
 // the add/refetch transaction: config.yaml and the credential store
 // ---------------------------------------------------------------------------
 
-// breakConfigSave points clientConfig at a path that cannot be written (its
-// parent is a regular file), preserving the entries the current config holds.
-// Every subsequent Save fails; nothing else changes.
+// breakConfigSave points clientConfig at a copy of the current config, in a
+// directory that can be read and locked but not written: the credential
+// transaction's under-lock read of the row succeeds, and every Save after it
+// fails. Nothing else changes.
 func breakConfigSave(t *testing.T) {
 	t.Helper()
-	blocked := filepath.Join(t.TempDir(), "not-a-dir")
-	broken, err := config.LoadClientConfigFromPath(filepath.Join(blocked, "config.yaml"))
-	if err != nil {
-		t.Fatal(err)
+	if os.Geteuid() == 0 {
+		t.Skip("a read-only directory does not stop root from writing")
 	}
-	// Only now put a regular FILE where the config's directory has to be: the load
-	// above had to succeed (there is simply no config there yet), and every Save
-	// from here on fails on the mkdir.
-	if err := os.WriteFile(blocked, []byte("x"), 0600); err != nil {
+	dir := filepath.Join(t.TempDir(), "read-only")
+	broken, err := config.LoadClientConfigFromPath(filepath.Join(dir, "config.yaml"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	for name, entry := range clientConfig.Servers {
 		broken.Servers[name] = entry
 	}
 	broken.DefaultServer = clientConfig.DefaultServer
+	// Write the copy (and its lock file) while the directory is writable, then
+	// take the write bit away: a read and a lock still work, a save cannot
+	// create its temp file.
+	if err := broken.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := broken.Update(func(*config.ClientConfig) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
 	clientConfig = broken
 	if err := clientConfig.Update(func(*config.ClientConfig) {}); err == nil {
 		t.Fatal("test setup: the config save was supposed to fail")

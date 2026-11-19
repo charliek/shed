@@ -99,6 +99,53 @@ certificate read directly off its `api_url`.
 Rotating an existing pin in a non-interactive session requires
 `--trust-on-first-use`.
 
+An mtls entry is held to the user its certificates name (`user` in
+`config.yaml`). `--refetch` prints that user (`  User: pat`) and records it when
+the entry has none yet. When the server issues a certificate for another user
+(for example because `ssh` offered a key that belongs to someone else), the
+refetch fails before its network check and writes nothing; add
+`--allow-user-change` to make the entry that user, which prints
+`  User changed from "pat" to "admin"`. With `--json` the result carries
+`user` and, after a change, `previous_user`.
+
+After changing an entry's user, restart long-running `shed` commands and
+tunnel daemons (`shed tunnels stop <shed>`, then `shed tunnels start <shed>`).
+A process already running keeps the certificate it holds until its next
+re-enrolment or until that certificate ends, whichever is first, so until
+then it continues as the previous user for at most the certificate's life.
+At its next re-enrolment it reads the entry again and stops, because the
+entry now names another user. A tunnel daemon never takes up a user the
+entry does not record: if the entry records none and the server issues a
+named certificate, the daemon stops and asks for
+`shed server update <name> --refetch` and a restart.
+
+```bash
+shed server update <name> --refetch --allow-user-change    # make the entry the user the server now issues for
+```
+
+| Flag | Description |
+|------|-------------|
+| `--tls-fingerprint <sha256:...>` | Pin this TLS certificate fingerprint, verified out-of-band |
+| `--refetch` | Re-pin and re-enrol over the SSH-first path |
+| `--trust-on-first-use` | With `--refetch`, trust the re-fetched TLS certificate without prompting |
+| `--allow-user-change` | With `--refetch`, let the entry change to the user of the new certificate. Without `--refetch` it is a usage error |
+
+`--refetch` is also the way back for an entry the CLI refuses. Every other
+command refuses an entry, before it sends any request or runs `ssh`, when its
+stored certificate names no user (a shed-server older than 0.10.0 issued it) or
+names a user the entry does not record (an older CLI saved the entry, it was
+edited by hand, or an enrolment was interrupted or overlapped another `shed`
+process):
+
+```text
+entry "shed" cannot be used: its certificate names no user (issued by a shed-server older than 0.10.0); no request was sent. Enrol it again: shed server update shed --refetch
+```
+
+A command also fails, with nothing saved, when a re-enrolment is issued a
+certificate for another user than the entry's, or one that names no user (the
+server is older than 0.10.0: upgrade it first). `shed server remove <name>`
+works on a refused entry too.
+
 ### shed server list
 
 Lists configured servers.
@@ -115,7 +162,7 @@ mini-desktop    http://mini-desktop.tailnet.ts.net:8080  mini-desktop.tailnet.ts
 cloud-vps       https://vps.tailnet.ts.net:8443          vps.tailnet.ts.net:2222           secure    offline
 ```
 
-The `ENDPOINT` is the control-plane URL the CLI actually uses (`https://…` for a pinned-TLS secure server, `http://…` otherwise). `SECURITY` is `secure` (pinned TLS), `open` (plain HTTP), or `unpinned` (an `https` endpoint with no pinned cert — misconfigured). Add `--json` for the full record, including `https_port`, `tls_pinned`, and the pinned fingerprint.
+The `ENDPOINT` is the control-plane URL the CLI actually uses (`https://…` for a pinned-TLS secure server, `http://…` otherwise). `SECURITY` is `secure` (pinned TLS), `open` (plain HTTP), or `unpinned` (an `https` endpoint with no pinned cert — misconfigured). `STATUS` is `online`, `offline`, or `refused`: the CLI refuses the entry (see [`shed server update`](#shed-server-update)), either for its stored certificate, which is known without sending a request, or because the server rejected its certificate and the re-enrolment was issued another user's. The refusal's message is printed once to stderr. Add `--json` for the full record, including `https_port`, `tls_pinned`, and the pinned fingerprint.
 
 ### shed server remove
 

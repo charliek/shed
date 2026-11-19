@@ -455,6 +455,12 @@ func resolveTarget(ctx context.Context, host roostprovider.Token) (roostprovider
 			return roostprovider.ShedTarget(s, config.GetKnownHostsPath()), s.LandingDir, nil
 		}
 	}
+	if refusal := inv.Refused[host.Server]; refusal != nil {
+		// The entry may not be used: nothing was sent, and its message says
+		// what fixes it.
+		row := roostprovider.UnreachableRow(host, refusal.Error())
+		return roostprovider.Target{}, "", &row
+	}
 	if len(inv.Answered) == 0 {
 		row := roostprovider.UnreachableRow(host, host.Server+" did not answer")
 		return roostprovider.Target{}, "", &row

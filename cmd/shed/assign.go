@@ -67,8 +67,12 @@ func runAssign(cmd *cobra.Command, args []string) error {
 // error says so and suggests --server; nothing else is printed.
 func assignServer(name string) (string, *config.ServerEntry, error) {
 	if serverFlag == "" {
-		if server, entry, ok := searchShedServer(name); ok {
+		server, entry, ok, refusal := searchShedServer(name)
+		if ok {
 			return server, entry, nil
+		}
+		if refusal != nil {
+			return "", nil, refusal
 		}
 		return "", nil, fmt.Errorf("assign shed %s: no configured server shows a shed named %s to you (an unassigned shed is visible only to an admin, and a server that could not be reached shows nothing), so nothing was sent; to send the assignment to a server and see its answer, name it with -s/--server", name, name)
 	}

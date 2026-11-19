@@ -98,16 +98,28 @@ func (c *ConnectClient) clientCertificate(ctx context.Context) *tls.Certificate 
 // client certificate; the latter surfaces as a dial error with no HTTP status
 // at all, so the retry cannot be keyed on the status alone.
 func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
-	cred, sentGen := c.capture()
+	cred, sentGen, err := c.capture()
+	if err != nil {
+		return nil, err
+	}
 	conn, status, err := c.attemptDial(ctx, shedName, port, cred)
+	if clienttoken.IsRefusal(err) {
+		return nil, err // refused before this attempt dialled: the message stands alone
+	}
 	// A credential can expire mid-tunnel: re-mint once and re-dial from scratch
 	// (the raw upgrade connection can't be reused for a retry).
 	if clienttoken.IsAuthFailure(status, err) && c.source != nil && c.source.Refreshable() {
 		fresh, rerr := c.source.Refresh(sentGen)
+		if clienttoken.IsRefusal(rerr) {
+			return nil, rerr // the entry may not be used: no re-dial, and the message stands alone
+		}
 		if rerr != nil {
 			return nil, fmt.Errorf("connect API rejected the tunnel credential and the re-mint failed: %w", rerr)
 		}
 		conn, status, err = c.attemptDial(ctx, shedName, port, fresh)
+		if clienttoken.IsRefusal(err) {
+			return nil, err
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -128,12 +140,52 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 // A client with no source (the legacy static/plain path) captures the zero
 // credential; authToken falls back to target.Token and no certificate is ever
 // offered.
-func (c *ConnectClient) capture() (clienttoken.Credential, uint64) {
+//
+// A REFUSED source (the entry may not be used, see clienttoken.Refusal)
+// returns its refusal, checked before and after the proactive refresh. That is
+// not the last check: a source shared by several calls (a tunnel daemon's
+// connections) can be refused by another call after this one captured, so
+// every attempt checks again immediately before it dials (refusedNow, whose
+// contract is per attempt: one that already passed that check may complete).
+func (c *ConnectClient) capture() (clienttoken.Credential, uint64, error) {
 	if c.source == nil {
-		return clienttoken.Credential{}, 0
+		return clienttoken.Credential{}, 0, nil
+	}
+	if err := c.source.Err(); err != nil {
+		return clienttoken.Credential{}, 0, err
 	}
 	c.source.EnsureFresh() // proactive: re-mint if within the expiry window
-	return c.source.Current()
+	if err := c.source.Err(); err != nil {
+		return clienttoken.Credential{}, 0, err
+	}
+	cred, gen := c.source.Current()
+	return cred, gen, nil
+}
+
+// beforeAttempt, when set, runs at the start of every dial or probe attempt,
+// before its refusal check: the window in which another call sharing the
+// source can end it. Test-only; nil in production.
+var beforeAttempt func()
+
+// refusedNow is the check every attempt makes immediately before it dials,
+// the first attempt and the retry alike: the source's recorded refusal (which
+// also ends it once a kept credential is no longer valid), or nil. A refusal
+// recorded by another call before this check (after this one captured its
+// credential, or after its own re-mint succeeded) stops the attempt before any
+// connection, and is returned as it is.
+//
+// THE CONTRACT IS PER ATTEMPT, and no stronger: an attempt that passed this
+// check before the refusal was recorded may complete (its dial, its upgrade,
+// a probe's request); no attempt starts after the refusal is recorded.
+// Nothing here coordinates admission with a concurrent refusal.
+func (c *ConnectClient) refusedNow() error {
+	if beforeAttempt != nil {
+		beforeAttempt()
+	}
+	if c.source == nil {
+		return nil
+	}
+	return c.source.Err()
 }
 
 // attemptDial performs a single dial + Connect upgrade with cred as its pinned
@@ -142,6 +194,9 @@ func (c *ConnectClient) capture() (clienttoken.Credential, uint64) {
 // other HTTP status it closes the connection and returns (nil, status, nil); a
 // transport/handshake/cancellation error returns (nil, 0, err).
 func (c *ConnectClient) attemptDial(ctx context.Context, shedName string, port uint16, cred clienttoken.Credential) (net.Conn, int, error) {
+	if err := c.refusedNow(); err != nil {
+		return nil, 0, err
+	}
 	// The dial carries the pinned credential so this attempt's handshake presents
 	// the certificate it captured; cancellation is unaffected (the pinned context
 	// derives from ctx), so the watcher below still uses the caller's ctx.
@@ -228,10 +283,16 @@ func (c *ConnectClient) attemptDial(ctx context.Context, shedName string, port u
 // failed startup with a "re-run the command" message describing work the client
 // was perfectly able to do itself.
 func (c *ConnectClient) Probe(ctx context.Context, shedName string) error {
-	cred, sentGen := c.capture()
+	cred, sentGen, err := c.capture()
+	if err != nil {
+		return err
+	}
 	res := c.attemptProbe(ctx, shedName, cred)
 	if clienttoken.IsAuthFailure(res.status, res.reqErr) && c.source != nil && c.source.Refreshable() {
 		fresh, rerr := c.source.Refresh(sentGen)
+		if clienttoken.IsRefusal(rerr) {
+			return rerr
+		}
 		if rerr != nil {
 			return fmt.Errorf("connect probe: shed-server rejected the tunnel credential and the re-mint failed: %w", rerr)
 		}
@@ -272,6 +333,11 @@ type probeResult struct {
 // long-lived shared transport; the probe is one-shot, so a fresh transport is
 // simpler and equivalent.)
 func (c *ConnectClient) attemptProbe(ctx context.Context, shedName string, cred clienttoken.Credential) probeResult {
+	if err := c.refusedNow(); err != nil {
+		// The verdict, not reqErr: a refusal is returned as it is, never wrapped
+		// as a transport failure, and it is no auth failure to retry on.
+		return probeResult{verdict: err}
+	}
 	scheme := "http"
 	if c.target.TLSPin != "" {
 		scheme = "https"

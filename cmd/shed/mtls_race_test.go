@@ -277,6 +277,7 @@ func mtlsEntryForFlip(t *testing.T) (certPath, keyPath string) {
 		ClientCertFile:      certPath,
 		ClientKeyFile:       keyPath,
 		ClientCertExpiresAt: cred.Bundle.ExpiresAt,
+		User:                testUser,
 	})
 	return certPath, keyPath
 }

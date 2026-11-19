@@ -69,18 +69,21 @@ func newClientKeyPair() (clientKeyPair, error) {
 // mismatched pair produces a TLS handshake failure at some later, unrelated
 // moment ("bad certificate" from a server that looks broken), and catching it
 // at enrollment turns that into a legible error at the point of the mistake.
+//
+// Every failure is an *UnusableCertificateError (with the same text as
+// before), so a caller can recognize an issuance it cannot use.
 func (kp clientKeyPair) matchesIssuedCert(certPEM []byte) error {
 	block, _ := pem.Decode(certPEM)
 	if block == nil || block.Type != "CERTIFICATE" {
-		return errNoCertificatePEM
+		return &UnusableCertificateError{Err: errNoCertificatePEM}
 	}
 	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return fmt.Errorf("sdk/bootstrap: parse issued certificate: %w", err)
+		return &UnusableCertificateError{Err: fmt.Errorf("sdk/bootstrap: parse issued certificate: %w", err)}
 	}
 	pub, ok := leaf.PublicKey.(*ecdsa.PublicKey)
 	if !ok || !pub.Equal(kp.key.Public()) {
-		return errCertKeyMismatch
+		return &UnusableCertificateError{Err: errCertKeyMismatch}
 	}
 	return nil
 }

@@ -27,6 +27,7 @@ package clienttoken
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"strconv"
 	"sync"
@@ -57,6 +58,93 @@ const RefreshWindow = 2 * time.Hour
 // preferably, a prior Refreshable() check — to know an auth failure must not be
 // retried.
 var ErrStatic = errors.New("clienttoken: source has no refresh callback")
+
+// Refusal is implemented by an error that ends a Source for good: the entry the
+// Source was built from must not be used at all (its stored certificate is for
+// another user, or the server issued a certificate for a user the entry is not
+// held to). This package cannot import the type that carries the details, so it
+// recognizes it by this method alone.
+//
+// A Source that meets one never mints again in this process. It stops
+// presenting anything — every later request fails with the same refusal,
+// before any connection is made — unless the refusal came from a proactive
+// refresh while the credential it holds is still valid for the entry's user
+// (see EnsureFreshErr), in which case it presents that credential until it is
+// no longer valid, and then ends.
+type Refusal interface {
+	error
+	// EntryRefusal marks the error; it does nothing.
+	EntryRefusal()
+}
+
+// IsRefusal reports whether err is, or wraps, a Refusal.
+func IsRefusal(err error) bool {
+	var r Refusal
+	return errors.As(err, &r)
+}
+
+// timeNow is the clock the refusal decisions read (whether a held credential is
+// still valid). A var so a test can move it past a certificate's NotAfter.
+var timeNow = time.Now
+
+// SetClockForTest replaces the clock the refusal decisions read (whether a
+// kept certificate is still valid) and returns the function that puts the real
+// one back. It is a test seam for packages that drive a Source through a
+// client (cmd/shed); nothing outside a test calls it.
+func SetClockForTest(now func() time.Time) (restore func()) {
+	orig := timeNow
+	timeNow = now
+	return func() { timeNow = orig }
+}
+
+// afterSharedMint, when set, runs in refreshGen right after the shared mint
+// returns to a caller and before that caller does anything else: the window in
+// which a refusal must already be recorded. Test-only; nil in production.
+var afterSharedMint func()
+
+// heldInvalidation is implemented by a Refusal that also withdraws the
+// credential the Source already holds, not only the replacement it was
+// minting: the entry's recorded user changed under the caller (another
+// process re-enrolled it for another user), or the entry's files and its
+// recorded user may now disagree. Such a refusal ends the Source at once,
+// however valid the held credential still is.
+type heldInvalidation interface {
+	InvalidatesHeld() bool
+}
+
+// invalidatesHeld reports whether err is, or wraps, a Refusal that withdraws
+// the held credential too (heldInvalidation).
+func invalidatesHeld(err error) bool {
+	var h heldInvalidation
+	return errors.As(err, &h) && h.InvalidatesHeld()
+}
+
+// stillValid reports whether cred may still be presented at now, judged from
+// the credential itself: for a certificate, the NotAfter of the leaf actually
+// held (never the cached ExpiresAt, which is a scheduling hint recorded beside
+// it and can be stale or wrong); for a token, its recorded expiry, which is
+// all a token has (zero: not known to be valid). A certificate whose leaf
+// cannot be read is not valid.
+func stillValid(cred Credential, now time.Time) bool {
+	if !cred.Usable() {
+		return false
+	}
+	if c := cred.ClientCertificate(); c != nil {
+		leaf := c.Leaf
+		if leaf == nil {
+			if len(c.Certificate) == 0 {
+				return false
+			}
+			parsed, err := x509.ParseCertificate(c.Certificate[0])
+			if err != nil {
+				return false
+			}
+			leaf = parsed
+		}
+		return now.Before(leaf.NotAfter)
+	}
+	return !cred.ExpiresAt.IsZero() && now.Before(cred.ExpiresAt)
+}
 
 // Credential is one minted authentication credential: EITHER a bearer token OR
 // a client certificate, plus when it expires.
@@ -150,12 +238,67 @@ type Source struct {
 	// advances the generation. Only meaningful for the generation it was set
 	// against — both writes hold mu and check gen.
 	credRejected bool
+	// refused, when set, is the terminal state: the entry must not be used.
+	// It is set at construction (Refused) or by a mint whose error is a
+	// Refusal, and never cleared. While set the Source presents nothing and
+	// never calls refresh. Guarded by mu.
+	refused error
+	// kept, when set, is a REFUSED REPLACEMENT: a proactive refresh was
+	// refused (the server issued a certificate for another user) while the
+	// credential held was still valid for the entry's user, so that
+	// credential stays in use. It is never minted past: no later call runs
+	// refresh again (each would ssh and be refused the same way). Once the
+	// held credential is no longer valid, or the server rejects it (a
+	// reactive Refresh), kept becomes the terminal refusal. Guarded by mu;
+	// set only inside the shared mint (refreshGen), never cleared.
+	kept error
 }
 
 // New returns a refreshing Source seeded with initial. A nil refresh yields a
 // static Source.
 func New(initial Credential, refresh func() (Credential, error)) *Source {
 	return &Source{cred: initial, refresh: refresh}
+}
+
+// Refused returns a Source in the terminal state: it holds no credential, has
+// no refresh, never runs ssh, and Err returns err. Every caller checks Err
+// before it connects, so a request built on it fails before any dial.
+func Refused(err error) *Source {
+	return &Source{refused: err}
+}
+
+// Err returns the refusal that ended this Source, or nil while it is usable.
+//
+// It is the check every request path makes before it sends or dials (the CLI's
+// sendWithReauth, Ping and Status, its transport gate, the Connect client's
+// every attempt, the handshake's CertificateFor), so it is also where a KEPT
+// credential's expiry is noticed: each call reads the held leaf's validity,
+// and once it is no longer valid the remembered refusal ends the Source. An
+// expired kept certificate is therefore never sent or dialled with, whichever
+// path comes next, not only after another EnsureFreshErr.
+func (s *Source) Err() error {
+	now := timeNow()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.expireKeptLocked(now)
+	return s.refused
+}
+
+// expireKeptLocked ends the Source with its kept refusal once the credential it
+// kept is no longer valid at now (s.mu held).
+func (s *Source) expireKeptLocked(now time.Time) {
+	if s.refused == nil && s.kept != nil && !stillValid(s.cred, now) {
+		s.refused = s.kept
+	}
+}
+
+// refuse records err as the terminal state, unless one is already recorded.
+func (s *Source) refuse(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.refused == nil {
+		s.refused = err
+	}
 }
 
 // Static returns a Source that never mints — Token returns token, EnsureFresh
@@ -247,6 +390,12 @@ func PinnedCredential(ctx context.Context) (Credential, bool) {
 // others, and a handshake that happens outside any pinned request must still
 // present something usable.
 func (s *Source) CertificateFor(ctx context.Context) *tls.Certificate {
+	if s.Err() != nil {
+		// A refused Source presents nothing, even for a request that pinned a
+		// credential before the refusal landed. (Every caller checks Err before
+		// it dials; this is the backstop.)
+		return nil
+	}
 	if cred, ok := PinnedCredential(ctx); ok {
 		return cred.ClientCertificate()
 	}
@@ -315,21 +464,40 @@ func (s *Source) EnsureFresh() { _ = s.EnsureFreshErr() }
 //
 // nil means "there is a usable, non-expiring-soon credential now" — either
 // because there already was one, or because this call minted it.
+//
+// A mint that fails with a Refusal ends the Source (Err) unless the credential
+// it holds is still valid for the entry's user (stillValid: the leaf's own
+// NotAfter, not the cached ExpiresAt) and the refusal does not withdraw it
+// (heldInvalidation). A kept credential stays in use and the refusal is
+// remembered: later calls return it WITHOUT minting again, until the held
+// credential is no longer valid, when the Source ends.
+//
+// The proactive decision is scheduled on the cached ExpiresAt, as before. A
+// ZERO cached expiry therefore never refreshes proactively (needsRefresh), so a
+// refusal can only come from the reactive path, which always ends the Source.
 func (s *Source) EnsureFreshErr() error {
+	now := timeNow()
+	s.mu.Lock()
+	s.expireKeptLocked(now)
+	cred, gen, rejected, refused, kept := s.cred, s.gen, s.credRejected, s.refused, s.kept
+	s.mu.Unlock()
+	if refused != nil {
+		return refused
+	}
+	if kept != nil {
+		return kept // the held credential is still valid; never mint past a refused refresh
+	}
 	if s.refresh == nil {
 		return nil
 	}
-	s.mu.Lock()
-	cred, gen, rejected := s.cred, s.gen, s.credRejected
-	s.mu.Unlock()
 	// A rejected credential is disqualified from the fast path even when its
 	// local expiry looks fine: the server refused it and the replacement mint
 	// failed (Reject), so vouching for it here would hand the caller the very
 	// credential the server just turned away — and swallow the reason why.
-	if cred.Usable() && !needsRefresh(cred.ExpiresAt, time.Now()) && !rejected {
+	if cred.Usable() && !needsRefresh(cred.ExpiresAt, now) && !rejected {
 		return nil
 	}
-	_, err := s.Refresh(gen)
+	_, err := s.refreshGen(gen, false)
 	return err
 }
 
@@ -343,7 +511,29 @@ func (s *Source) EnsureFreshErr() error {
 // prevGen is the generation the caller used on the request that failed (or the
 // generation it observed before EnsureFresh). Returns ErrStatic when the Source
 // cannot mint.
+//
+// A mint that fails with a Refusal ends the Source: Err returns it from then on
+// and every later Refresh returns it without minting. A refused Source returns
+// its refusal at once. A reactive Refresh after a refused proactive refresh
+// (EnsureFreshErr kept the held credential) does not mint either: the server
+// has now rejected what was kept, so the remembered refusal ends the Source.
 func (s *Source) Refresh(prevGen uint64) (Credential, error) {
+	return s.refreshGen(prevGen, true)
+}
+
+// refreshGen is Refresh; reactive says the caller's credential was rejected by
+// the server (Refresh, Reject), as opposed to a proactive EnsureFreshErr.
+//
+// A REFUSAL IS RECORDED INSIDE THE SHARED MINT, before the mint returns to any
+// caller, so no later caller can observe the Source unrefused and start a
+// second mint: the Source is either ended (refused) or holds a refused
+// replacement (kept), and both stop every later mint. The shared mint also
+// checks for a recorded refusal before it mints and again before it installs a
+// result, so a mint that finishes after the Source ended installs nothing.
+func (s *Source) refreshGen(prevGen uint64, reactive bool) (Credential, error) {
+	if err := s.Err(); err != nil {
+		return Credential{}, err
+	}
 	if s.refresh == nil {
 		cur, _ := s.Current()
 		return cur, ErrStatic
@@ -361,26 +551,77 @@ func (s *Source) Refresh(prevGen uint64) (Credential, error) {
 	// callers coalesce onto one mint; a caller replacing a DIFFERENT generation
 	// uses a different key and gets its own mint rather than a stale answer.
 	v, err, _ := s.sf.Do(strconv.FormatUint(prevGen, 10), func() (interface{}, error) {
-		if cur, curGen := s.Current(); curGen != prevGen {
+		s.mu.Lock()
+		if s.refused != nil {
+			refused := s.refused
+			s.mu.Unlock()
+			return Credential{}, refused
+		}
+		if s.gen != prevGen {
+			cur := s.cred
+			s.mu.Unlock()
 			return cur, nil // another batch minted past prevGen between the check above and here
 		}
+		if s.kept != nil {
+			// A refused replacement is already known: never mint past it. A
+			// reactive leader, or a held credential no longer valid, ends the
+			// Source with it.
+			kept := s.kept
+			if reactive || !stillValid(s.cred, timeNow()) {
+				s.refused = kept
+			}
+			s.mu.Unlock()
+			return Credential{}, kept
+		}
+		s.mu.Unlock()
+
 		// Mint without the mutex held (a network round-trip); singleflight
 		// guarantees only one goroutine runs this at a time for this generation.
 		fresh, mintErr := s.refresh()
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.refused != nil {
+			return Credential{}, s.refused // ended while this mint ran: install nothing
+		}
 		if mintErr != nil {
+			if IsRefusal(mintErr) {
+				s.recordRefusalLocked(mintErr, reactive)
+			}
 			return Credential{}, mintErr
 		}
-		s.mu.Lock()
 		s.cred = fresh
 		s.gen++
 		s.credRejected = false // a fresh credential has no rejection history
-		s.mu.Unlock()
 		return fresh, nil
 	})
+	if afterSharedMint != nil {
+		afterSharedMint()
+	}
 	if err != nil {
+		// A reactive caller that coalesced onto a proactive leader's mint: the
+		// leader may have kept the held credential, but the server has rejected
+		// it for this caller, so the refusal ends the Source. (No mint can start
+		// in between: kept already stops every mint.)
+		if reactive && IsRefusal(err) {
+			s.refuse(err)
+		}
 		return Credential{}, err
 	}
 	return v.(Credential), nil
+}
+
+// recordRefusalLocked records a Refusal a mint returned (s.mu held): it ends
+// the Source when the caller is reactive (the server rejected what is held),
+// when the refusal withdraws the held credential too (heldInvalidation), or
+// when the held credential is not still valid (stillValid) or was rejected
+// (Reject); otherwise the held credential is kept and the refusal remembered.
+func (s *Source) recordRefusalLocked(err error, reactive bool) {
+	if reactive || invalidatesHeld(err) || s.credRejected || !stillValid(s.cred, timeNow()) {
+		s.refused = err
+		return
+	}
+	s.kept = err
 }
 
 // Reject is Refresh for the reactive path: the server REFUSED the credential

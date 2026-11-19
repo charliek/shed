@@ -75,7 +75,10 @@ func withCleanAddFlags(t *testing.T) {
 	serverUpdateRefetch = false
 	serverUpdateTrustTOFU = false
 	serverUpdateTLSFingerprint = ""
+	oAllowUserChange := serverUpdateAllowUserChange
+	serverUpdateAllowUserChange = false
 	t.Cleanup(func() {
+		serverUpdateAllowUserChange = oAllowUserChange
 		serverAddHTTPSPort, serverAddSecure, serverAddPort, serverAddTrustTOFU,
 			serverAddTLSFingerprint, defaultAddHTTPSPort, jsonFlag =
 			oHTTPS, oSecure, oPort, oTOFU, oFP, oDefault, oJSON

@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -63,13 +64,25 @@ func captureStderr(t *testing.T, fn func()) string {
 // exercised (that path is covered elsewhere).
 func generateSelfSignedCert(t *testing.T, cn string) (certPEM, keyPEM []byte) {
 	t.Helper()
+	return generateClientCert(t, cn, nil)
+}
+
+// generateClientCert is generateSelfSignedCert with the subject's userId
+// attribute (the user a shed client certificate is issued to) set to *user;
+// nil leaves it out, the shape of a certificate a pre-0.10 server issued.
+func generateClientCert(t *testing.T, cn string, user *string) (certPEM, keyPEM []byte) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
+	subject := pkix.Name{CommonName: cn}
+	if user != nil {
+		subject.ExtraNames = []pkix.AttributeTypeAndValue{{Type: servertls.ClientUserOID, Value: *user}}
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		Subject:      pkix.Name{CommonName: cn},
+		Subject:      subject,
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 	}
@@ -371,16 +384,8 @@ func TestInventory_MTLSEntrySendsClientCertificateAndSucceeds(t *testing.T) {
 	ts.StartTLS()
 	defer ts.Close()
 
-	certPEM, keyPEM := generateSelfSignedCert(t, "roostprovider-test-client")
-	dir := t.TempDir()
-	certPath := filepath.Join(dir, "client.crt")
-	keyPath := filepath.Join(dir, "client.key")
-	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
-		t.Fatalf("write client cert: %v", err)
-	}
-	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
-		t.Fatalf("write client key: %v", err)
-	}
+	user := "pat"
+	certPath, keyPath := writeClientCert(t, &user)
 
 	entry := config.ServerEntry{
 		Host:               "127.0.0.1",
@@ -390,6 +395,7 @@ func TestInventory_MTLSEntrySendsClientCertificateAndSucceeds(t *testing.T) {
 		TLSCertFingerprint: servertls.Fingerprint(ts.Certificate().Raw),
 		ClientCertFile:     certPath,
 		ClientKeyFile:      keyPath,
+		User:               "pat",
 	}
 
 	got := Inventory(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0).Sheds
@@ -401,6 +407,143 @@ func TestInventory_MTLSEntrySendsClientCertificateAndSucceeds(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(hits); n != 1 {
 		t.Fatalf("expected exactly one request, got %d", n)
+	}
+}
+
+// writeClientCert writes a client certificate (with user as its userId, nil
+// for none) and its key into a temp dir and returns their paths.
+func writeClientCert(t *testing.T, user *string) (certPath, keyPath string) {
+	t.Helper()
+	certPEM, keyPEM := generateClientCert(t, "roostprovider-test-client", user)
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "client.crt")
+	keyPath = filepath.Join(dir, "client.key")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatalf("write client cert: %v", err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatalf("write client key: %v", err)
+	}
+	return certPath, keyPath
+}
+
+// countingListener counts the TCP connections it accepts, so a test can prove
+// a client made none at all (not merely that no request reached a handler).
+type countingListener struct {
+	net.Listener
+	accepted atomic.Int32
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+	}
+	return c, err
+}
+
+// TestInventory_RefusedStoredCertificateIsNeverPresented: the roost provider
+// reads stored certificates through the same check as the CLI
+// (config.LoadEntryCertificate). A certificate that names no user, or a user
+// the entry does not record, is presented to nobody: the entry is treated as
+// unreachable and no TCP connection is made to its server. A certificate for
+// the entry's own user, or the implicit user, is presented as before.
+func TestInventory_RefusedStoredCertificateIsNeverPresented(t *testing.T) {
+	pat, admin, implicit := "pat", "admin", servertls.ImplicitUserValue
+	cases := []struct {
+		name      string
+		certUser  *string
+		entryUser string
+		wantShown bool
+	}{
+		{"names no user", nil, "", false},
+		{"names no user, entry records one", nil, "pat", false},
+		{"names a user the entry does not record", &pat, "", false},
+		{"names another user than the entry", &admin, "pat", false},
+		{"names the entry's user", &pat, "pat", true},
+		{"the implicit user", &implicit, "pat", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, hits := shedsHandler(t, config.Shed{Name: "a", Status: config.StatusRunning})
+			ts := httptest.NewUnstartedServer(http.HandlerFunc(handler))
+			ts.TLS = &tls.Config{ClientAuth: tls.RequireAnyClientCert}
+			counter := &countingListener{Listener: ts.Listener}
+			ts.Listener = counter
+			ts.StartTLS()
+			defer ts.Close()
+
+			certPath, keyPath := writeClientCert(t, tc.certUser)
+			entry := config.ServerEntry{
+				Host:               "127.0.0.1",
+				APIURL:             ts.URL,
+				SSHPort:            2222,
+				AuthMode:           config.AuthModeMTLS,
+				TLSCertFingerprint: servertls.Fingerprint(ts.Certificate().Raw),
+				ClientCertFile:     certPath,
+				ClientKeyFile:      keyPath,
+				User:               tc.entryUser,
+			}
+
+			out := Inventory(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0)
+			if tc.wantShown {
+				if len(out.Sheds) != 1 || atomic.LoadInt32(hits) != 1 {
+					t.Fatalf("a certificate the entry may use was not presented: sheds=%#v hits=%d", out.Sheds, atomic.LoadInt32(hits))
+				}
+				return
+			}
+			if len(out.Sheds) != 0 || len(out.Answered) != 0 {
+				t.Fatalf("a refused entry must be treated as unreachable, got %#v", out)
+			}
+			if n := counter.accepted.Load(); n != 0 {
+				t.Fatalf("a refused entry made %d TCP connection(s) to its server, want 0", n)
+			}
+			// The refusal itself is kept, named for its entry, so an
+			// activation can say what fixes it.
+			r, ok := config.AsEntryRefused(out.Refused["srv"])
+			if !ok || out.Refused["srv"].Error() != r.Error() {
+				t.Fatalf("Refused = %#v, want the entry's refusal, unwrapped", out.Refused)
+			}
+			if r.Entry != "srv" {
+				t.Errorf("refusal = %q, want it to name the entry", r)
+			}
+		})
+	}
+}
+
+// TestInventory_MixedPairIsNeverPresented: a certificate beside a key that is
+// not its own — what an interrupted or interleaved write by the CLI can leave,
+// or an unlocked read can see mid-write — is presented to nobody: no TCP
+// connection is made. It is no refusal (the CLI re-enrols such an entry), so
+// nothing is recorded in Refused.
+func TestInventory_MixedPairIsNeverPresented(t *testing.T) {
+	handler, _ := shedsHandler(t, config.Shed{Name: "a", Status: config.StatusRunning})
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(handler))
+	ts.TLS = &tls.Config{ClientAuth: tls.RequireAnyClientCert}
+	counter := &countingListener{Listener: ts.Listener}
+	ts.Listener = counter
+	ts.StartTLS()
+	defer ts.Close()
+
+	pat := "pat"
+	certPath, _ := writeClientCert(t, &pat)
+	_, otherKey := writeClientCert(t, &pat)
+	entry := config.ServerEntry{
+		Host:               "127.0.0.1",
+		APIURL:             ts.URL,
+		SSHPort:            2222,
+		AuthMode:           config.AuthModeMTLS,
+		TLSCertFingerprint: servertls.Fingerprint(ts.Certificate().Raw),
+		ClientCertFile:     certPath,
+		ClientKeyFile:      otherKey,
+		User:               pat,
+	}
+	out := Inventory(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0)
+	if len(out.Answered) != 0 || len(out.Refused) != 0 {
+		t.Fatalf("a mixed pair was used or refused: %#v", out)
+	}
+	if n := counter.accepted.Load(); n != 0 {
+		t.Fatalf("a mixed pair made %d TCP connection(s), want 0", n)
 	}
 }
 

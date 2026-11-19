@@ -78,7 +78,27 @@ var (
 	// client_cert in an mtls bundle (see clientKeyPair.matchesIssuedCert).
 	errNoCertificatePEM = errors.New("sdk/bootstrap: bundle client_cert is not a PEM CERTIFICATE block")
 	errCertKeyMismatch  = errors.New("sdk/bootstrap: issued certificate does not match the submitted key")
+	// errNoClientCertificate is the bundle-shape check's error for an mtls
+	// bundle whose client_cert is missing, empty or only whitespace.
+	errNoClientCertificate = errors.New("sdk/bootstrap: mtls bundle carries no client certificate")
 )
+
+// UnusableCertificateError is RunCredential's error for an mtls bundle whose
+// client_cert cannot be used: it is missing, empty or only whitespace, it is
+// not a PEM CERTIFICATE block, its DER does not parse, or it does not certify
+// the key RunCredential submitted. The
+// server answered and issued something, so a caller that holds a user to its
+// certificates can tell this apart from a failed exchange (errors.As) and
+// treat it as an unreadable issuance. Its text is the underlying error's,
+// unchanged, and it unwraps to it.
+type UnusableCertificateError struct {
+	Err error
+}
+
+func (e *UnusableCertificateError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the reason the certificate cannot be used.
+func (e *UnusableCertificateError) Unwrap() error { return e.Err }
 
 // Params describes one bootstrap exchange. Host/Port address the server's SSH
 // endpoint; KnownHostsPath is the pinned trust root (~/.shed/known_hosts);
@@ -263,6 +283,12 @@ func RunCredential(ctx context.Context, p Params) (sdk.Credential, error) {
 	p.CSRBase64 = kp.csrB64
 
 	bundle, err := run(ctx, p)
+	if errors.Is(err, errNoClientCertificate) {
+		// The server answered with an mtls bundle that carries no certificate:
+		// as unusable as a malformed one (matchesIssuedCert), and typed the same.
+		// Run and RunWithCSR keep the plain error.
+		return sdk.Credential{}, &UnusableCertificateError{Err: err}
+	}
 	if err != nil {
 		return sdk.Credential{}, err
 	}
@@ -435,7 +461,7 @@ func validateTokenBundle(b sdk.Bundle) error {
 // still serve over plain HTTP).
 func validateMTLSBundle(b sdk.Bundle) error {
 	if strings.TrimSpace(b.ClientCert) == "" {
-		return errors.New("sdk/bootstrap: mtls bundle carries no client certificate")
+		return errNoClientCertificate
 	}
 	if b.HTTPSPort == 0 {
 		return errors.New("sdk/bootstrap: mtls bundle has no HTTPS port (mtls is only served over TLS)")

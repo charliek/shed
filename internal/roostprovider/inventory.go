@@ -80,7 +80,8 @@ type RunningShed struct {
 //
 // Every caller only ever checks this for non-nilness (listServer treats it
 // like any other per-server failure), so a plain sentinel is enough — no
-// custom type needed.
+// custom type needed. (An entry the CLI refuses is skipped the same way, but
+// with its own *config.EntryRefusedError, which listServer keeps.)
 var errNoStoredCredential = errors.New("no usable stored credential")
 
 // ShedInventory is one Inventory call's whole answer: the running sheds, and
@@ -107,6 +108,13 @@ type ShedInventory struct {
 	// A server whose worker had not finished when ctx expired appears in
 	// neither — unreachable is the honest reading of "we never heard back".
 	Answered []string
+	// Refused maps each server whose entry the CLI refuses (its stored
+	// certificate names no user, or a user the entry does not record:
+	// config.LoadEntryCertificate) to that refusal, unwrapped. Nothing was
+	// sent to it. Such a server is in Tried and not in Answered, like any
+	// server that could not be used; this keeps WHY, so an activation can say
+	// what fixes it rather than "did not answer". nil when there is none.
+	Refused map[string]error
 }
 
 // Inventory enumerates every RUNNING shed across servers, using ONLY each
@@ -154,12 +162,13 @@ func Inventory(ctx context.Context, servers map[string]config.ServerEntry, timeo
 		name     string
 		rows     []RunningShed
 		answered bool
+		refusal  error
 	}
 	results := make(chan serverResult, len(servers))
 	for name, entry := range servers {
 		go func(name string, entry config.ServerEntry) {
-			rows, answered := listServer(ctx, name, entry, timeout)
-			results <- serverResult{name: name, rows: rows, answered: answered}
+			rows, answered, refusal := listServer(ctx, name, entry, timeout)
+			results <- serverResult{name: name, rows: rows, answered: answered, refusal: refusal}
 		}(name, entry)
 	}
 
@@ -171,6 +180,12 @@ collect:
 			out.Sheds = append(out.Sheds, res.rows...)
 			if res.answered {
 				out.Answered = append(out.Answered, res.name)
+			}
+			if res.refusal != nil {
+				if out.Refused == nil {
+					out.Refused = map[string]error{}
+				}
+				out.Refused[res.name] = res.refusal
 			}
 		case <-ctx.Done():
 			break collect
@@ -192,11 +207,16 @@ collect:
 // refused, timeout, non-200, a body that doesn't decode — returns
 // (nil, false): in the shed list an erroring server and a server with nothing
 // running look identical, and the second return value is the only thing that
-// tells them apart.
-func listServer(ctx context.Context, name string, entry config.ServerEntry, timeout time.Duration) ([]RunningShed, bool) {
+// tells them apart. The third return value is the entry's refusal
+// (config.EntryRefusedError) when that is why nothing was sent, else nil.
+func listServer(ctx context.Context, name string, entry config.ServerEntry, timeout time.Duration) ([]RunningShed, bool, error) {
 	resp, err := fetchSheds(ctx, entry, timeout)
 	if err != nil {
-		return nil, false
+		if r, refused := config.AsEntryRefused(err); refused {
+			r.Entry = name // the reader had no name to give it
+			return nil, false, r
+		}
+		return nil, false, nil
 	}
 
 	var rows []RunningShed
@@ -212,14 +232,14 @@ func listServer(ctx context.Context, name string, entry config.ServerEntry, time
 			LandingDir:    shed.LandingDir,
 		})
 	}
-	return rows, true
+	return rows, true, nil
 }
 
 // fetchSheds performs the one bounded GET /api/sheds call for entry.
 func fetchSheds(ctx context.Context, entry config.ServerEntry, timeout time.Duration) (*config.ShedsResponse, error) {
-	cred, ok := stashedCredential(&entry)
-	if !ok {
-		return nil, errNoStoredCredential
+	cred, err := stashedCredential(&entry)
+	if err != nil {
+		return nil, err // errNoStoredCredential, or the entry's refusal, unwrapped
 	}
 
 	// Refuse to send a credential over plaintext. entry.BaseURL() falls
@@ -305,7 +325,7 @@ func fetchSheds(ctx context.Context, entry config.ServerEntry, timeout time.Dura
 // the client certificate on disk) into a clienttoken.Credential — but never
 // mints one and never touches disk beyond the read.
 //
-// It returns ok=false in exactly the case where entryCredential would need
+// It returns an error in exactly the case where entryCredential would need
 // an SSH-borne mint to get anything usable: an mtls entry with no loadable
 // certificate, or a secure (HTTPS) entry with no token recorded at all
 // (config.ServerEntry.NeedsEnrollment). Those are the shapes a real client
@@ -316,23 +336,40 @@ func fetchSheds(ctx context.Context, entry config.ServerEntry, timeout time.Dura
 //
 // A legacy static token, a not-yet-expired bootstrap-minted token, and an
 // OPEN server (which needs no credential at all — the zero Credential is
-// perfectly usable there) all return ok=true. An expired stored token is
+// perfectly usable there) all return a nil error. An expired stored token is
 // NOT specially detected here; the resulting request simply 401s and
 // listServer treats that like any other per-server failure — this package
 // has no reactive re-mint to fall back on by design.
-func stashedCredential(entry *config.ServerEntry) (clienttoken.Credential, bool) {
+//
+// The error is errNoStoredCredential for every such skip, except an entry
+// the CLI refuses (below), whose *config.EntryRefusedError is returned as it
+// is, so the caller can say why.
+func stashedCredential(entry *config.ServerEntry) (clienttoken.Credential, error) {
 	if entry.IsMTLS() {
 		if entry.ClientCertFile == "" || entry.ClientKeyFile == "" {
-			return clienttoken.Credential{}, false
+			return clienttoken.Credential{}, errNoStoredCredential
 		}
 		// name="" — this call never persists, so there's nothing to
 		// serialize a write against; loadClientCert's own reasoning
 		// (cmd/shed/client.go) for locking under a name doesn't apply here.
-		cert, err := config.LoadClientCredentials("", entry.ClientCertFile, entry.ClientKeyFile)
-		if err != nil || cert == nil {
-			return clienttoken.Credential{}, false
+		// Unlocked, it can read a pair mid-write by the CLI: a mixed pair (one
+		// enrolment's certificate beside another's key) does not load, and a
+		// complete new pair beside the old row is checked against that row
+		// below, so neither is presented.
+		//
+		// LoadEntryCertificate is the same check the CLI makes: a stored
+		// certificate that names no user, or a user the entry does not
+		// record, is refused (the entry must be enrolled again) and is
+		// treated here like any entry this package cannot use — nothing is
+		// presented and nothing is sent — except that its refusal is kept.
+		cert, err := config.LoadEntryCertificate("", entry)
+		if _, refused := config.AsEntryRefused(err); refused {
+			return clienttoken.Credential{}, err
 		}
-		return clienttoken.MTLSCredential(cert, entry.ClientCertExpiresAt), true
+		if err != nil || cert == nil {
+			return clienttoken.Credential{}, errNoStoredCredential
+		}
+		return clienttoken.MTLSCredential(cert, entry.ClientCertExpiresAt), nil
 	}
 	if entry.ControlTokenExpiresAt.IsZero() {
 		// Either a legacy static token (has something to present, never
@@ -342,9 +379,9 @@ func stashedCredential(entry *config.ServerEntry) (clienttoken.Credential, bool)
 		// stripped of its credential, which DOES need a mint and is
 		// therefore refused here.
 		if entry.NeedsEnrollment() {
-			return clienttoken.Credential{}, false
+			return clienttoken.Credential{}, errNoStoredCredential
 		}
-		return clienttoken.TokenCredential(entry.ControlToken, time.Time{}), true
+		return clienttoken.TokenCredential(entry.ControlToken, time.Time{}), nil
 	}
-	return clienttoken.TokenCredential(entry.ControlToken, entry.ControlTokenExpiresAt), true
+	return clienttoken.TokenCredential(entry.ControlToken, entry.ControlTokenExpiresAt), nil
 }

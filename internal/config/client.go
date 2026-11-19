@@ -130,6 +130,17 @@ type ServerEntry struct {
 	// of ControlTokenExpiresAt. Cached here so the proactive check costs no file
 	// read; the certificate itself remains the authority.
 	ClientCertExpiresAt time.Time `yaml:"client_cert_expires_at,omitempty"`
+	// User is the named user this entry is held to: the user the server's
+	// client certificates for it name. It is set from an issued certificate at
+	// `shed server add`, at `shed server update --refetch`, and by a refresh
+	// on the first named certificate when it is empty, always inside the CLI's
+	// credential write transaction. A certificate for the implicit user (a
+	// server with no user list) neither sets nor clears it. A stored
+	// certificate that names another user, or none, is refused
+	// (LoadEntryCertificate), and a newly issued certificate for another user
+	// is refused unless the change is asked for (--allow-user-change). Empty
+	// for an entry that is not mtls, or whose server has no user list.
+	User string `yaml:"user,omitempty"`
 }
 
 // IsMTLS reports whether this entry last bootstrapped a client certificate.
@@ -424,6 +435,36 @@ func (c *ClientConfig) UpdateChecked(check func(*ClientConfig) error, mutate fun
 	}
 	mutate(c)
 	return nil
+}
+
+// ReadLocked runs read against the config as it is on disk, under the same
+// locks UpdateChecked takes (updateMu, then the config file lock), and writes
+// nothing. read must not keep the snapshot it is handed.
+//
+// It is for a decision that must be made against the on-disk row before a
+// caller writes something else (the CLI's credential write transaction reads
+// an entry's user here, then writes the certificate files, then saves the row
+// with UpdateChecked, re-checking the same condition). The ORDER rule is
+// UpdateChecked's: a caller that holds a server's credential lock takes it
+// before this.
+func (c *ClientConfig) ReadLocked(read func(*ClientConfig) error) error {
+	if c.path == "" {
+		return errors.New("client config: this configuration has no path to read")
+	}
+	c.updateMu.Lock()
+	defer c.updateMu.Unlock()
+
+	unlock, err := lockClientConfig(c.path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	fresh, err := LoadClientConfigFromPath(c.path)
+	if err != nil {
+		return err
+	}
+	return read(fresh)
 }
 
 // Save writes the configuration to disk.
