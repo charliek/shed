@@ -707,6 +707,23 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   included, so an orchestrator can size its requests instead of learning a limit from a
   refusal. A client that ignores unknown members is unaffected. See [API › GET
   /api/info](https://charliek.github.io/shed/reference/api/#get-apiinfo).
+- **API: one shed record on every backend.** Every shed record, on every route that returns
+  one (list, get, create and its stream's `complete` event, start, stop, assign, reset, the
+  egress set and off routes, and `GET /api/overview`), now carries `isolation`: `none`,
+  `firewall` (an `isolated` shed held by the server host's firewall, Firecracker) or
+  `topology` (an `isolated` shed held by the network, remote). It fails closed: an
+  `isolated` shed on a backend that cannot hold isolation reports `none`, never the
+  profile's name. `network_profile` is unchanged beside it. Records also carry `arch`
+  (`amd64` or `arm64`): the host's on Firecracker and VZ, the size's on remote (stored at
+  create, or, when a lost record is rebuilt, the architecture the cloud reports for the VM's
+  boot disk, never the one the sizes configured now give its machine type; a remote shed
+  created before this reports none). A remote record now always carries `"mounts": {"mode": "selected"}`,
+  so `shed list` shows `none` for its mounts where it showed `-`. `GET /api/info` gains
+  `guest_arch` (the host's on Firecracker and VZ; on remote the one `arch` every size shares,
+  omitted when they mix) and the always-advertised feature token `uniform_shed_record`.
+  `isolation` and a local `arch` are computed when the record is reported; nothing stored
+  changes. A client that ignores unknown members is unaffected. See [API › GET
+  /api/sheds](https://charliek.github.io/shed/reference/api/#get-apisheds).
 
 #### Changed
 
@@ -795,6 +812,13 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   stored under the lowercase name** (access checks still applied).
 - **Docs: the Connect API's status for a stopped shed** is `503 SHED_NOT_RUNNING` on
   Firecracker and VZ and `409` on the remote backend, and `default_backend` lists `remote`.
+- **Docs: the remote backend's JSON create has no single time bound.** The reference said
+  the reply always comes within 25 s; the firewall check (up to 10 s, when its last result is
+  stale), the image lookup (10 s) and the wait for the cloud (15 s) each have a bound, and the
+  reply can take longer than their sum. Give it a minute or more. The statuses table now
+  lists `unreachable` and `host_key` among the reasons a failed start leaves a shed
+  `stopped` with. See [Remote backend › Calls and
+  statuses](https://charliek.github.io/shed/reference/remote-backend/#calls-and-statuses).
 
 #### Security
 

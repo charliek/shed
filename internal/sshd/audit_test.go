@@ -57,6 +57,10 @@ func newEntryBackend() *entryBackend {
 	return &entryBackend{gets: map[string]int{}, dialClosed: make(chan struct{})}
 }
 
+// Type is read by the access guard's report step (the record's isolation and
+// arch).
+func (b *entryBackend) Type() backend.Type { return backend.TypeFirecracker }
+
 func (b *entryBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
 	var shed *config.Shed
 	switch name {

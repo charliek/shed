@@ -103,12 +103,17 @@ func (g *Guard) Inner() Backend { return g.inner }
 // snapshot's name. For tests that force an interleaving; set it before use.
 func (g *Guard) SetBeforeAct(fn func(op, name string)) { g.beforeAct = fn }
 
-// unwrap returns the backend a Guard wraps, or b itself.
+// unwrap returns the backend under every Guard around b, or b itself. A
+// Guard around a Guard is unwrapped all the way down, so a capability lookup
+// never stops at a Guard and mistakes the backend for a local one.
 func unwrap(b Backend) Backend {
-	if g, ok := b.(*Guard); ok {
-		return g.inner
+	for {
+		g, ok := b.(*Guard)
+		if !ok || g == nil {
+			return b
+		}
+		b = g.inner
 	}
-	return b
 }
 
 func (g *Guard) acting(op, name string) {
@@ -244,39 +249,71 @@ func (g *Guard) Check(ctx context.Context, name string, a Action) (*config.Shed,
 	if err != nil {
 		return nil, err
 	}
-	return shownTo(ctx, shed), nil
+	return g.shownTo(ctx, shed), nil
 }
 
-// shownTo returns shed as the principal on ctx may see it. Every shed record
-// a Guard returns goes through it. A caller who may not enter the shed (an
-// admin looking at another user's shed) gets a copy with no repository URL
-// and no landing directory at all. A clone URL can carry a token anywhere (its
-// userinfo, its query, its path), and the landing directory is derived from
-// the URL, so no redaction of either is safe: both are withheld. The shed's
-// own user, the implicit user, the server and anyone else who may enter it see
-// the record unchanged. The backend's record is never changed.
-func shownTo(ctx context.Context, shed *config.Shed) *config.Shed {
-	if shed == nil || (shed.Repo == "" && shed.LandingDir == "") {
-		return shed
+// recordCaps is what the report step (shownTo) reads from the wrapped
+// backend: its capabilities, with no isolation kind when it cannot give a
+// shed the isolated profile now (on remote, a firewall config that admits
+// more than the server), so a record never claims an isolation the backend
+// does not hold.
+func (g *Guard) recordCaps() Capabilities {
+	caps := CapabilitiesOf(g.inner)
+	if !SupportsNetworkProfile(g.inner, config.NetworkProfileIsolated) {
+		caps.Isolation = ""
 	}
-	p, _ := PrincipalFrom(ctx)
-	if Authorize(p, shed.Owner, shed.User, ActionEnter) == nil {
-		return shed
+	return caps
+}
+
+// shownTo is the report step: every shed record a Guard returns goes through
+// it, and it always returns a copy, so the backend's record is never changed.
+//
+// It sets the members computed when a record is reported, never stored:
+// Isolation, from the backend's capabilities and the shed's network profile
+// (IsolationOf: fail closed, and whatever the backend set is replaced), and
+// Arch from the backend's GuestArch when the record carries none (a local
+// backend; a remote record carries its own, or none).
+//
+// And it shows the record as the principal on ctx may see it. A caller who
+// may not enter the shed (an admin looking at another user's shed) gets no
+// repository URL and no landing directory at all. A clone URL can carry a
+// token anywhere (its userinfo, its query, its path), and the landing
+// directory is derived from the URL, so no redaction of either is safe: both
+// are withheld. The shed's own user, the implicit user, the server and anyone
+// else who may enter it see them.
+func (g *Guard) shownTo(ctx context.Context, shed *config.Shed) *config.Shed {
+	return g.shownWith(ctx, g.recordCaps(), shed)
+}
+
+// shownWith is shownTo with the capabilities already read (ListSheds reads
+// them once for every row).
+func (g *Guard) shownWith(ctx context.Context, caps Capabilities, shed *config.Shed) *config.Shed {
+	if shed == nil {
+		return nil
 	}
 	cp := *shed
-	cp.Repo, cp.LandingDir = "", ""
+	cp.Isolation = IsolationOf(caps, cp.NetworkProfile)
+	if cp.Arch == "" {
+		cp.Arch = caps.GuestArch
+	}
+	if cp.Repo != "" || cp.LandingDir != "" {
+		p, _ := PrincipalFrom(ctx)
+		if Authorize(p, cp.Owner, cp.User, ActionEnter) != nil {
+			cp.Repo, cp.LandingDir = "", ""
+		}
+	}
 	return &cp
 }
 
 // showFor returns shownTo for ctx in the shape of a call that returns a shed
 // and an error, so a guarded method can pass the wrapped call's results
 // straight through it.
-func showFor(ctx context.Context) func(*config.Shed, error) (*config.Shed, error) {
+func (g *Guard) showFor(ctx context.Context) func(*config.Shed, error) (*config.Shed, error) {
 	return func(shed *config.Shed, err error) (*config.Shed, error) {
 		if err != nil {
 			return shed, err
 		}
-		return shownTo(ctx, shed), nil
+		return g.shownTo(ctx, shed), nil
 	}
 }
 
@@ -323,7 +360,7 @@ func (g *Guard) CreateShed(ctx context.Context, req config.CreateShedRequest) (*
 		// caller nothing of whose the shed is or what it is like.
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
-	return showFor(ctx)(shed, err)
+	return g.showFor(ctx)(shed, err)
 }
 
 // hostResourceAsked names the first thing a create asks for that is shared on
@@ -344,24 +381,27 @@ func hostResourceAsked(req config.CreateShedRequest) string {
 // GetShed returns the shed if the principal may view it.
 func (g *Guard) GetShed(ctx context.Context, name string) (*config.Shed, error) {
 	_, shed, err := g.bind(ctx, "GetShed", name, ActionView)
-	return showFor(ctx)(shed, err)
+	return g.showFor(ctx)(shed, err)
 }
 
 // ListSheds returns the sheds the principal may view, each as shownTo gives
-// it.
+// it. An unrestricted principal (the system, the implicit user) views every
+// shed, and every row still goes through the report step.
 func (g *Guard) ListSheds(ctx context.Context) ([]config.Shed, error) {
 	p, err := principal(ctx)
 	if err != nil {
 		return nil, err
 	}
 	sheds, err := g.inner.ListSheds(ctx)
-	if err != nil || p.unrestricted() {
+	all := p.unrestricted()
+	if err != nil || (all && sheds == nil) {
 		return sheds, err
 	}
+	caps := g.recordCaps()
 	out := make([]config.Shed, 0, len(sheds))
 	for i := range sheds {
-		if Authorize(p, sheds[i].Owner, sheds[i].User, ActionView) == nil {
-			out = append(out, *shownTo(ctx, &sheds[i]))
+		if all || Authorize(p, sheds[i].Owner, sheds[i].User, ActionView) == nil {
+			out = append(out, *g.shownWith(ctx, caps, &sheds[i]))
 		}
 	}
 	return out, nil
@@ -382,7 +422,7 @@ func (g *Guard) StartShed(ctx context.Context, name string) (*config.Shed, error
 	if err != nil {
 		return nil, err
 	}
-	return showFor(ctx)(g.inner.StartShed(bctx, name))
+	return g.showFor(ctx)(g.inner.StartShed(bctx, name))
 }
 
 // StopShed needs the right to manage the shed.
@@ -391,7 +431,7 @@ func (g *Guard) StopShed(ctx context.Context, name string) (*config.Shed, error)
 	if err != nil {
 		return nil, err
 	}
-	return showFor(ctx)(g.inner.StopShed(bctx, name))
+	return g.showFor(ctx)(g.inner.StopShed(bctx, name))
 }
 
 // AssignUser is admin-only. The admin is checked before the shed is looked
@@ -419,7 +459,7 @@ func (g *Guard) AssignUser(ctx context.Context, name string, req config.AssignSh
 	if err != nil {
 		return nil, err
 	}
-	return showFor(ctx)(g.inner.AssignUser(bctx, name, req))
+	return g.showFor(ctx)(g.inner.AssignUser(bctx, name, req))
 }
 
 // ResetShed needs the right to enter the shed.
@@ -428,7 +468,7 @@ func (g *Guard) ResetShed(ctx context.Context, name string) (*config.Shed, error
 	if err != nil {
 		return nil, err
 	}
-	return showFor(ctx)(g.inner.ResetShed(bctx, name))
+	return g.showFor(ctx)(g.inner.ResetShed(bctx, name))
 }
 
 // ListSessions needs the right to enter the shed.
@@ -666,7 +706,7 @@ func (a guardedAsync) WaitSettled(ctx context.Context, name string) (*config.She
 	if err != nil {
 		return nil, err
 	}
-	return showFor(ctx)(a.inner.WaitSettled(bctx, name))
+	return a.g.showFor(ctx)(a.inner.WaitSettled(bctx, name))
 }
 
 // DeleteAndWait deletes the named shed and waits until its VM is destroyed.
@@ -733,7 +773,7 @@ func (e guardedEgress) SetShedEgress(ctx context.Context, name string, profiles 
 	if err != nil {
 		return nil, err
 	}
-	return showFor(ctx)(e.inner.SetShedEgress(bctx, name, profiles))
+	return e.g.showFor(ctx)(e.inner.SetShedEgress(bctx, name, profiles))
 }
 
 func (e guardedEgress) ClearShedEgress(ctx context.Context, name string) (*config.Shed, error) {
@@ -741,5 +781,5 @@ func (e guardedEgress) ClearShedEgress(ctx context.Context, name string) (*confi
 	if err != nil {
 		return nil, err
 	}
-	return showFor(ctx)(e.inner.ClearShedEgress(bctx, name))
+	return e.g.showFor(ctx)(e.inner.ClearShedEgress(bctx, name))
 }

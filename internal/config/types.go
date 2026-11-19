@@ -315,6 +315,19 @@ type Shed struct {
 	// fixed at create. A shed created before network profiles existed
 	// reports "open".
 	NetworkProfile string `json:"network_profile,omitempty" yaml:"network_profile,omitempty"`
+	// Isolation is the isolation in force for the shed: "none", "firewall"
+	// (the isolated profile, held by the server host's own firewall) or
+	// "topology" (the isolated profile, held by the network's topology). It
+	// is computed when a record is reported (backend.IsolationOf, in the
+	// access guard's report step), never stored by any backend, and fails
+	// closed: an isolated shed on a backend with no isolation kind reports
+	// "none".
+	Isolation string `json:"isolation,omitempty" yaml:"-"`
+	// Arch is the guest's architecture, "amd64" or "arm64". The remote
+	// backend stores it (from the size at create, from the instance on
+	// adoption; a record written before it existed has none and reports
+	// none); for Firecracker and VZ the report step sets the host's.
+	Arch string `json:"arch,omitempty" yaml:"arch,omitempty"`
 }
 
 // HostResources names what the shed, as its backend reports it, reaches that
@@ -325,10 +338,10 @@ type Shed struct {
 // are how server credentials (~/.config/gh and the like) reach a shed. It
 // returns nil for a shed that reaches none of them.
 //
-// Firecracker and VZ always report a selection (a shed created before
-// selection existed reports {mode: all}, so it counts); the remote backend
-// cannot mount anything and reports none (nil), which counts as nothing.
-// The access rule refuses a user who is not an admin entry to (and a start
+// Every backend reports a selection: a Firecracker or VZ shed created before
+// selection existed reports {mode: all}, so it counts; a remote shed, which
+// cannot mount anything, reports {mode: selected} with no names, which counts
+// as nothing. The access rule refuses a user who is not an admin entry to (and a start
 // of) a shed that carries any of these, and assigning such a shed to a user
 // is refused for the same reason.
 func (s *Shed) HostResources() []string {
@@ -586,6 +599,13 @@ type ServerInfo struct {
 	// exactly when Features carries "exec_limits". The values are the
 	// server's own, the same for every caller. Omitted by older servers.
 	Exec *ExecLimits `json:"exec,omitempty"`
+
+	// GuestArch is the architecture every shed this server can create runs
+	// ("amd64" or "arm64"): the host's on Firecracker and VZ, the one every
+	// configured size shares on remote. Omitted when remote sizes mix
+	// architectures (each shed record's arch then says), and by older
+	// servers.
+	GuestArch string `json:"guest_arch,omitempty"`
 }
 
 // ExecLimits is the exec member of GET /api/info: the limits an HTTPS exec

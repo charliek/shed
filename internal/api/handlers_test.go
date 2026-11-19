@@ -725,6 +725,10 @@ type stopDetachBackend struct {
 	ctxErr          chan error
 }
 
+// Type is read by the access guard's report step (the record's isolation and
+// arch).
+func (b *stopDetachBackend) Type() backend.Type { return backend.TypeFirecracker }
+
 // GetShed reports the shed: the access guard loads it before a stop.
 func (b *stopDetachBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
 	return &config.Shed{Name: name, Status: config.StatusRunning}, nil

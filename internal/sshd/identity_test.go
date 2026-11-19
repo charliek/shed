@@ -35,6 +35,10 @@ type identityBackend struct {
 	dials []backend.Principal
 }
 
+// Type is read by the access guard's report step (the record's isolation and
+// arch).
+func (b *identityBackend) Type() backend.Type { return backend.TypeFirecracker }
+
 func (b *identityBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
 	if name != "box" {
 		return nil, config.ErrShedNotFoundSentinel

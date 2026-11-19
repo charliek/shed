@@ -167,7 +167,8 @@ Returns server metadata and capabilities.
   "http_port": 8080,
   "backend": "vz",
   "auth_mode": "open",
-  "features": ["overview", "http_exec", "exec_limits", "mount_selection", "source_binding"],
+  "features": ["overview", "http_exec", "exec_limits", "mount_selection", "uniform_shed_record", "source_binding"],
+  "guest_arch": "arm64",
   "exec": {
     "max_stdin_bytes": 1048576,
     "max_timeout_seconds": 3600,
@@ -198,7 +199,8 @@ valid certificate, since the listener runs `RequireAndVerifyClientCert`:**
   "https_port": 8443,
   "ca_fingerprint": "sha256:…",
   "ca_not_after": "2036-06-15T00:00:00Z",
-  "features": ["overview", "http_exec", "exec_limits", "mount_selection", "service_clients", "network_profiles", "source_binding"],
+  "features": ["overview", "http_exec", "exec_limits", "mount_selection", "uniform_shed_record", "service_clients", "network_profiles", "source_binding"],
+  "guest_arch": "amd64",
   "exec": {
     "max_stdin_bytes": 1048576,
     "max_timeout_seconds": 3600,
@@ -228,6 +230,7 @@ never renamed; treat an unknown token as absent.
 | `http_exec` | always | [`POST /api/sheds/{name}/exec`](#post-apishedsnameexec) |
 | `exec_limits` | always (with `http_exec`) | This response carries `exec`: the limits an exec request is refused above, and the defaults a request that sets none gets (below) |
 | `mount_selection` | always | The create request's `mounts` field |
+| `uniform_shed_record` | always | Every [shed record](#get-apisheds), on every backend and every route that returns one, carries `mounts`, `network_profile` and `isolation`, and `arch` where the server knows it; this response carries `guest_arch` when every shed this server can create has one architecture (below) |
 | `service_clients` | mtls mode with `auth.clients` configured | This server accepts [service clients](#service-clients) |
 | `network_profiles` | Firecracker; remote unless its `firewall.mode` is `any` | The create request's `network` field (`open` or `isolated`) |
 | `async_lifecycle` | remote backend | Create, start, stop and delete return before the cloud work is done; see [Remote backend](remote-backend.md) |
@@ -267,6 +270,16 @@ refused with `413 REQUEST_TOO_LARGE`.
 The `backend` field reflects the resolved backend for this server (`vz`,
 `firecracker` or `remote`). When the server is configured with
 `default_backend: detect`, this field shows the auto-detected value.
+
+`guest_arch` is the CPU architecture (`amd64` or `arm64`) every shed this
+server can create runs, so a client can pick a binary before it sends one. On
+Firecracker and VZ it is the host's. On the remote backend it is the `arch`
+every configured size shares, and it is omitted when the sizes mix
+architectures: each shed record's `arch` then says. An older server omits it.
+
+`isolation` is present on the remote backend only (`topology`): how that
+backend provides the isolated profile. What a given shed has is its record's
+[`isolation`](#get-apisheds).
 
 `ca_fingerprint` / `ca_not_after` are present **only in mtls mode**: the
 internal CA's fingerprint and expiry (see [Security › CA
@@ -310,20 +323,30 @@ Lists all sheds on this server.
       "cpus": 2,
       "memory_mb": 4096,
       "mounts": {"mode": "all"},
-      "network_profile": "open"
+      "network_profile": "open",
+      "isolation": "none",
+      "arch": "arm64"
     }
   ]
 }
 ```
 
-Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mounts`, `landing_dir`, `owner` and `user` are omitted when empty or zero.
+Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mounts`, `landing_dir`, `owner`, `user` and `arch` are omitted when empty or zero.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `owner` | string | The [service client](#service-clients) that created the shed. Omitted for a shed a person created. |
 | `user` | string | The [user](configuration.md#users) the shed belongs to. Omitted on a server with no user list, and for a shed with no user (one made before the server had a user list, until [assigned](#post-apishedsnameassign)). A shed has an `owner` or a `user`, never both. `!unresolved` marks a shed whose records disagree about whose it is; only an admin reaches it. |
-| `mounts` | object | The server mounts (top-level `mounts:` in the server config) the shed gets on every start: `{"mode": "all"}` (every server mount, the default) or `{"mode": "selected", "names": [...]}` (only those; no `names` means none). A shed created before mount selection existed reports `{"mode": "all"}`. |
+| `mounts` | object | The server mounts (top-level `mounts:` in the server config) the shed gets on every start: `{"mode": "all"}` (every server mount, the default) or `{"mode": "selected", "names": [...]}` (only those; no `names` means none). A shed created before mount selection existed reports `{"mode": "all"}`. A remote shed, which mounts nothing, always reports `{"mode": "selected"}`. |
 | `network_profile` | string | `open` or `isolated`, fixed at create. A shed created before network profiles existed reports `open`. See [Security › Network profiles](security.md#network-profiles). |
+| `isolation` | string | The isolation in force for this shed: `none` (its profile is `open`), `firewall` (`isolated`, held by firewall rules the server installs on its own host: Firecracker) or `topology` (`isolated`, held by the network giving the shed no route to another shed or to the server's private network: [remote](remote-backend.md)). It fails closed: an `isolated` shed on a backend that cannot hold isolation now reports `none` (a remote server whose `firewall` config admits more than the server), never the profile's name. It names the kind of isolation the server's configuration provides; it is not a live check that the network isolates the shed at this moment. A client that requires isolation reads this member, not `network_profile`, and treats a record without it (an older server) as not isolated. |
+| `arch` | string | The guest's CPU architecture, `amd64` or `arm64`. Firecracker and VZ: the host's. Remote: the shed's size's, stored at create; when a lost record is rebuilt from the cloud, the architecture the cloud reports for the VM's boot disk (none when the cloud reports none and the configured sizes for its machine type disagree); a remote shed created by a server older than this member reports none. |
+
+Every route that returns a shed record (this list, `GET /api/sheds/{name}`,
+create (JSON and the stream's `complete` event), start, stop, assign, reset,
+the egress `POST` and `DELETE`, and `GET /api/overview`) returns it with these
+members; `isolation` and the local `arch` are computed when the record is
+reported, never stored. Advertised by `uniform_shed_record`.
 
 The list holds only the sheds the caller may view: a service client's, its
 own; a user's, their own; an admin's, every shed (see [Ownership](#ownership)).
@@ -456,12 +479,15 @@ Gets details for a specific shed.
     }
   ],
   "mounts": {"mode": "selected", "names": ["claude"]},
-  "network_profile": "open"
+  "network_profile": "open",
+  "isolation": "none",
+  "arch": "arm64"
 }
 ```
 
 The fields are those of [GET /api/sheds](#get-apisheds), including `owner`
-and `user` (both omitted here), `mounts` and `network_profile`. An admin
+and `user` (both omitted here), `mounts`, `network_profile`, `isolation` and
+`arch`. An admin
 viewing another user's shed gets it without `repo` and `landing_dir`.
 
 | Field | Type | Description |

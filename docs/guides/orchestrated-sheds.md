@@ -342,10 +342,15 @@ load).
 | VZ | Not offered. A command reaches whatever the host's NAT reaches, including the host, the LAN and other sheds. | `open` only: any other value, the default included, stops the server from starting |
 | Remote | The network gives a shed no route to another shed and no private route to the server's host. Outbound traffic is not filtered: a shed has a public address and reaches any public address, including a port the server's host exposes to the internet. | `isolated` (the default) or `open`; `remote.firewall.mode: any` and `acknowledge_any: true` are refused beside service clients |
 
-`GET /api/info` says which applies: its `backend` is `firecracker`, `vz` or
-`remote`, and a remote server also reports `isolation: "topology"`. An
-isolated shed's record says `network_profile: isolated` on Firecracker and on
-remote alike, so `/api/info` is where a client learns which kind it is.
+A shed's record says which applies: its `isolation` member is `firewall`
+(Firecracker), `topology` (remote) or `none` (an `open` shed, and an
+`isolated` one whose backend cannot hold isolation now), so a client that
+requires isolation checks `isolation` on the record its create returns, not
+`network_profile`, which says `isolated` on Firecracker and on remote alike.
+A server that does not list `uniform_shed_record` in `GET /api/info`
+`features` sends no `isolation` on a record: treat such a shed as not
+isolated, or read the server's kind from `/api/info` (`backend`, and
+`isolation: "topology"` on remote).
 
 ### A client on the remote backend
 

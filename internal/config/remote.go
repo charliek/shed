@@ -524,6 +524,20 @@ func (c *RemoteConfig) ResolveImage(image string) (string, error) {
 	return "", fmt.Errorf("%w: %q (image aliases: %s)", ErrUnknownImageSentinel, image, strings.Join(aliases, ", "))
 }
 
+// GuestArch is the architecture every configured size shares (every shed
+// this backend can create runs it), or "" when the sizes mix architectures,
+// or one names none (a config not yet defaulted), or there are none.
+func (c *RemoteConfig) GuestArch() string {
+	arch := ""
+	for _, s := range c.Sizes {
+		if s.Arch == "" || (arch != "" && s.Arch != arch) {
+			return ""
+		}
+		arch = s.Arch
+	}
+	return arch
+}
+
 // RunLimit is the run limit a shed gets: the larger of max_run_duration and
 // the owning service client's max_age (zero for an admin's shed).
 func (c *RemoteConfig) RunLimit(clientMaxAge time.Duration) time.Duration {

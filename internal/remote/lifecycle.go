@@ -166,6 +166,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 			Owner:          req.Owner,
 			User:           req.User,
 			NetworkProfile: network,
+			Arch:           size.Arch,
 		},
 		Env:         b.cfg.Environment,
 		Spec:        &spec,

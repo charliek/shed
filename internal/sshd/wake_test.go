@@ -38,6 +38,10 @@ func (b *wakeFakeBackend) record(name string) *config.Shed {
 	return &config.Shed{Name: name, Status: b.status, StatusReason: b.reason, Owner: b.owner, User: b.user}
 }
 
+// Type is read by the access guard's report step (the record's isolation and
+// arch).
+func (b *wakeFakeBackend) Type() backend.Type { return backend.TypeFirecracker }
+
 func (b *wakeFakeBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

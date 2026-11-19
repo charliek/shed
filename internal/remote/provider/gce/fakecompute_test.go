@@ -105,11 +105,17 @@ type fInst struct {
 	metaFP                    string
 	natIP, internalIP         string
 	diskGB                    int
+	// diskArch is the boot disk's "architecture": "" reports X86_64,
+	// diskArchNone leaves the member out.
+	diskArch                  string
 	scheduling                map[string]any
 	created, started, stopped time.Time
 	guestAttrs                map[string]string
 	tags                      []string
 }
+
+// diskArchNone, as fInst.diskArch, leaves the boot disk's architecture out.
+const diskArchNone = "-"
 
 type fOp struct {
 	name, opType, target string
@@ -559,6 +565,17 @@ func (f *fakeCompute) instJSON(in *fInst) map[string]any {
 		}
 		return t.In(time.FixedZone("PDT", -7*3600)).Format("2006-01-02T15:04:05.000-07:00")
 	}
+	disk := map[string]any{
+		"boot": true, "diskSizeGb": strconv.Itoa(in.diskGB), "architecture": "X86_64",
+		"source": f.selfLink("projects/" + f.project + "/zones/" + f.zone + "/disks/" + in.name),
+	}
+	switch in.diskArch {
+	case "":
+	case diskArchNone:
+		delete(disk, "architecture")
+	default:
+		disk["architecture"] = in.diskArch
+	}
 	out := map[string]any{
 		"kind":              "compute#instance",
 		"id":                "1234567890",
@@ -571,12 +588,9 @@ func (f *fakeCompute) instJSON(in *fInst) map[string]any {
 		"labelFingerprint":  in.labelFP,
 		"metadata":          map[string]any{"kind": "compute#metadata", "fingerprint": in.metaFP, "items": items},
 		"networkInterfaces": []any{map[string]any{"networkIP": in.internalIP, "accessConfigs": []any{ac}}},
-		"disks": []any{map[string]any{
-			"boot": true, "diskSizeGb": strconv.Itoa(in.diskGB), "architecture": "X86_64",
-			"source": f.selfLink("projects/" + f.project + "/zones/" + f.zone + "/disks/" + in.name),
-		}},
-		"scheduling": in.scheduling,
-		"tags":       map[string]any{"items": in.tags},
+		"disks":             []any{disk},
+		"scheduling":        in.scheduling,
+		"tags":              map[string]any{"items": in.tags},
 	}
 	if s := ts(in.started); s != "" {
 		out["lastStartTimestamp"] = s

@@ -44,6 +44,10 @@ func (b *routeBackend) seen() []string {
 	return append([]string(nil), b.calls...)
 }
 
+// Type is read by the access guard's report step (the record's isolation and
+// arch).
+func (b *routeBackend) Type() backend.Type { return backend.TypeFirecracker }
+
 func (b *routeBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
 	b.record("GetShed", name)
 	for _, stored := range []string{"box", config.ReservedShedName} {

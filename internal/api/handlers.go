@@ -47,6 +47,7 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	if caps, ok := backend.ReportedCapabilities(s.backend); ok {
 		info.Isolation = caps.Isolation
 	}
+	info.GuestArch = s.guestArch()
 	// Client-CA visibility, mtls only. Reaching /api/info in mtls mode already
 	// required a valid client certificate (that mode has no bootstrap
 	// exemptions), so this is reported to authenticated callers only.
@@ -58,6 +59,23 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, info)
+}
+
+// guestArch is /api/info's guest_arch: the architecture every shed this
+// server can create runs, or "" when that is not one value. A local VM
+// backend's is the host's (its capabilities say); a remote backend's is the
+// one every configured size shares.
+func (s *Server) guestArch() string {
+	if s.backend == nil {
+		return ""
+	}
+	if arch := backend.CapabilitiesOf(s.backend).GuestArch; arch != "" {
+		return arch
+	}
+	if s.backend.Type() == backend.TypeRemote && s.cfg.Remote != nil {
+		return s.cfg.Remote.GuestArch()
+	}
+	return ""
 }
 
 // handleGetSSHHostKey returns the server's SSH host key.

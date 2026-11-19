@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"runtime"
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
@@ -84,7 +85,7 @@ func TestSupportsNetworkProfile(t *testing.T) {
 }
 
 func TestCapabilitiesOf(t *testing.T) {
-	local := Capabilities{Mounts: true, Snapshots: true, Reset: true, ImageManagement: true, EgressProfiles: true}
+	local := Capabilities{Mounts: true, Snapshots: true, Reset: true, ImageManagement: true, EgressProfiles: true, GuestArch: runtime.GOARCH}
 	fc := local
 	fc.Isolation = IsolationFirewall
 	tests := []struct {
@@ -96,11 +97,41 @@ func TestCapabilitiesOf(t *testing.T) {
 		{"firecracker", typedBackend{typ: TypeFirecracker}, fc},
 		{"vz", typedBackend{typ: TypeVZ}, local},
 		{"remote", newRemoteLike(), Capabilities{AsyncLifecycle: true, Isolation: IsolationTopology}},
+		{"guarded remote", NewGuard(newRemoteLike()), Capabilities{AsyncLifecycle: true, Isolation: IsolationTopology}},
+		// A Guard around a Guard is seen through all the way down: still the
+		// remote's capabilities, never a local guest architecture.
+		{"doubly guarded remote", NewGuard(NewGuard(newRemoteLike())), Capabilities{AsyncLifecycle: true, Isolation: IsolationTopology}},
+		{"doubly guarded firecracker", NewGuard(NewGuard(typedBackend{typ: TypeFirecracker})), fc},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := CapabilitiesOf(tt.backend); got != tt.want {
 				t.Errorf("CapabilitiesOf = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestReportedCapabilitiesSeesThroughGuards holds that the reporter is found
+// under any number of Guards.
+func TestReportedCapabilitiesSeesThroughGuards(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		backend Backend
+		wantOK  bool
+	}{
+		{"remote", newRemoteLike(), true},
+		{"guarded remote", NewGuard(newRemoteLike()), true},
+		{"doubly guarded remote", NewGuard(NewGuard(newRemoteLike())), true},
+		{"doubly guarded firecracker", NewGuard(NewGuard(typedBackend{typ: TypeFirecracker})), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ReportedCapabilities(tt.backend)
+			if ok != tt.wantOK {
+				t.Fatalf("ReportedCapabilities ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && got != RemoteCapabilities() {
+				t.Errorf("ReportedCapabilities = %+v, want %+v", got, RemoteCapabilities())
 			}
 		})
 	}
