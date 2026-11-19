@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -197,6 +198,15 @@ func (l *syncLog) String() string {
 	return l.b.String()
 }
 
+// loopbackRemote is a loopback peer address in an auth log line.
+var loopbackRemote = regexp.MustCompile(`remote=127\.0\.0\.1:[0-9]+`)
+
+// anyPort is an auth log with each loopback peer's port (a test client's,
+// chosen by the kernel) written as PORT, so a test can compare whole lines.
+func anyPort(text string) string {
+	return loopbackRemote.ReplaceAllString(text, "remote=127.0.0.1:PORT")
+}
+
 // captureLog sends the standard logger's output, without its date prefix,
 // to a buffer for the rest of the test.
 func captureLog(t *testing.T) *syncLog {
@@ -224,13 +234,13 @@ func TestConfigUsersAuthLogNamesTheUser(t *testing.T) {
 	dialUser(t, addr, "crate", who.bobExpired)
 	dialUser(t, addr, "crate", who.stranger)
 	for _, want := range []string{
-		fmt.Sprintf("SSH auth allowed: user=crate fingerprint=%s key_user=\"bob\" admin=false label=\"laptop\"\n", fp(who.bob)),
-		fmt.Sprintf("SSH auth allowed: user=box fingerprint=%s key_user=\"root\" admin=true label=\"desk\"\n", fp(who.root)),
-		fmt.Sprintf("SSH auth DENIED: user=crate fingerprint=%s (the key has expired) key_user=\"bob\" admin=false label=\"old\"\n", fp(who.bobExpired)),
-		// An unknown key: exactly today's line, nothing about any user.
-		fmt.Sprintf("SSH auth DENIED: user=crate fingerprint=%s\n", fp(who.stranger)),
+		fmt.Sprintf("SSH auth allowed: user=crate fingerprint=%s remote=127.0.0.1:PORT key_user=\"bob\" admin=false label=\"laptop\"\n", fp(who.bob)),
+		fmt.Sprintf("SSH auth allowed: user=box fingerprint=%s remote=127.0.0.1:PORT key_user=\"root\" admin=true label=\"desk\"\n", fp(who.root)),
+		fmt.Sprintf("SSH auth DENIED: user=crate fingerprint=%s remote=127.0.0.1:PORT (the key has expired) key_user=\"bob\" admin=false label=\"old\"\n", fp(who.bobExpired)),
+		// An unknown key: nothing about any user.
+		fmt.Sprintf("SSH auth DENIED: user=crate fingerprint=%s remote=127.0.0.1:PORT\n", fp(who.stranger)),
 	} {
-		if !strings.Contains(out.String(), want) {
+		if !strings.Contains(anyPort(out.String()), want) {
 			t.Errorf("log does not contain %q:\n%s", want, out.String())
 		}
 	}
@@ -243,7 +253,7 @@ func TestConfigUsersAuthLogNamesTheUser(t *testing.T) {
 		t.Fatal(err)
 	}
 	dialUser(t, serveForTest(t, s), "box", listed)
-	if want := fmt.Sprintf("SSH auth allowed: user=box fingerprint=%s\n", fp(listed)); !strings.Contains(out.String(), want) {
+	if want := fmt.Sprintf("SSH auth allowed: user=box fingerprint=%s remote=127.0.0.1:PORT\n", fp(listed)); !strings.Contains(anyPort(out.String()), want) {
 		t.Errorf("log does not contain %q:\n%s", want, out.String())
 	}
 }
@@ -287,10 +297,10 @@ func TestAuthLogQuotesAHostileUsername(t *testing.T) {
 		dialUser(t, addr, user, who.bob)
 		dialUser(t, addr, user, who.stranger)
 		for _, want := range []string{
-			fmt.Sprintf("SSH auth allowed: user=%q fingerprint=%s key_user=\"bob\" admin=false label=\"laptop\"\n", user, fp(who.bob)),
-			fmt.Sprintf("SSH auth DENIED: user=%q fingerprint=%s\n", user, fp(who.stranger)),
+			fmt.Sprintf("SSH auth allowed: user=%q fingerprint=%s remote=127.0.0.1:PORT key_user=\"bob\" admin=false label=\"laptop\"\n", user, fp(who.bob)),
+			fmt.Sprintf("SSH auth DENIED: user=%q fingerprint=%s remote=127.0.0.1:PORT\n", user, fp(who.stranger)),
 		} {
-			if !strings.Contains(out.String(), want) {
+			if !strings.Contains(anyPort(out.String()), want) {
 				t.Errorf("log does not contain %q:\n%s", want, out.String())
 			}
 		}

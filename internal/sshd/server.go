@@ -113,11 +113,11 @@ func (k KeyAuth) expired(fingerprint string) bool {
 }
 
 // owner describes, for an auth log line, the user the lookup resolves the
-// key's fingerprint to: the user's name and whether they are an admin (a
-// named user; the implicit user of a server with no user list is not
-// named), and the key's label when it has one. Empty for a key the lookup
-// does not resolve, so an unknown key's line says nothing more than before.
-// Called only where the auth path has looked the key up already.
+// key's fingerprint to now (ownerSuffix). Empty for a key the lookup does
+// not resolve, so an unknown key's line says nothing more than before.
+// Called only where the auth path has looked the key up already. The
+// allowed line does not use it: it describes the user the connection was
+// bound to (connIdentity.owner), which a later lookup may no longer give.
 func (k KeyAuth) owner(fingerprint string) string {
 	if k.Users == nil {
 		return ""
@@ -126,12 +126,20 @@ func (k KeyAuth) owner(fingerprint string) string {
 	if !ok {
 		return ""
 	}
+	return ownerSuffix(u.Implicit, u.Name, u.Admin, key.Label)
+}
+
+// ownerSuffix is the end of an auth log line that names a key's user: the
+// user's name and whether they are an admin, for a named user (the implicit
+// user of a server with no user list is not named), and the key's label when
+// it has one. A script key reads as its user's key.
+func ownerSuffix(implicit bool, name string, admin bool, label string) string {
 	var out string
-	if !u.Implicit {
-		out = fmt.Sprintf(" key_user=%q admin=%t", u.Name, u.Admin)
+	if !implicit {
+		out = fmt.Sprintf(" key_user=%q admin=%t", name, admin)
 	}
-	if key.Label != "" {
-		out += fmt.Sprintf(" label=%q", key.Label)
+	if label != "" {
+		out += fmt.Sprintf(" label=%q", label)
 	}
 	return out
 }
@@ -153,6 +161,18 @@ func logUser(name string) string {
 		return name
 	}
 	return fmt.Sprintf("%q", name)
+}
+
+// logRemote is a connection's peer address as an auth log line prints it
+// (remote=<host:port>), so a refused or accepted login can be traced, and
+// blocked, by the address it came from. It is the transport's own peer
+// address, which the client does not write the way it writes a username; "-"
+// when there is none on record.
+func logRemote(addr net.Addr) string {
+	if addr == nil {
+		return "-"
+	}
+	return addr.String()
 }
 
 // NewServer creates a new SSH server. listenAddr is the TCP bind address
@@ -212,8 +232,9 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 			// connection, and handlePublicKey alone cannot be relied on to see
 			// that switch (requestUser).
 			cfg.VerifiedPublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey, perms *gossh.Permissions, _ string) (*gossh.Permissions, error) {
+				remote := logRemote(conn.RemoteAddr())
 				if config.IsReservedShedName(conn.User()) {
-					log.Printf("SSH auth DENIED: user=%s fingerprint=%s (reserved username)", logUser(conn.User()), gossh.FingerprintSHA256(key))
+					log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (reserved username)", logUser(conn.User()), gossh.FingerprintSHA256(key), remote)
 					return nil, errReservedUser
 				}
 				// The identity records the user the key resolves to now,
@@ -223,16 +244,25 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 				// authenticate.
 				id, err := s.newConnIdentity(key, conn.User())
 				if err != nil {
-					log.Printf("SSH auth DENIED: user=%s fingerprint=%s (%v)", logUser(conn.User()), gossh.FingerprintSHA256(key), err)
+					log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (%v)", logUser(conn.User()), gossh.FingerprintSHA256(key), remote, err)
 					return nil, err
 				}
 				setConnIdentity(ctx, id)
 				if s.keyAuth.TrackConnections {
 					if err := s.trackAuthenticated(ctx, id); err != nil {
-						log.Printf("SSH auth DENIED: user=%s fingerprint=%s (%v)", logUser(conn.User()), id.fingerprint, err)
+						log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (%v)", logUser(conn.User()), id.fingerprint, remote, err)
 						return nil, err
 					}
 				}
+				// The one line that says a login happened: the client has
+				// proved it holds this key (x/crypto verified its signature)
+				// and the connection authenticates with it, in every mode.
+				// A key the client only offered is never logged as allowed
+				// (handlePublicKey).
+				// The owner it names is the user this connection was bound to
+				// above, from that same lookup, never a second one that a
+				// list change since could answer differently.
+				log.Printf("SSH auth allowed: user=%s fingerprint=%s remote=%s%s", logUser(id.user), id.fingerprint, remote, id.owner)
 				return perms, nil
 			}
 			// Best-effort diagnostic from the transport's authoritative per-attempt
@@ -247,7 +277,7 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 					return
 				}
 				if pubkeyFails++; pubkeyFails == maxTries {
-					log.Printf("SSH auth: public-key attempt cap (%d) reached for user=%s — the client may be offering more keys than the cap allows, so its allowlisted key may never be tried. Raise auth.ssh.max_auth_tries, or use a per-host IdentityFile + IdentitiesOnly on the client.", maxTries, logUser(conn.User()))
+					log.Printf("SSH auth: public-key attempt cap (%d) reached for user=%s remote=%s — the client may be offering more keys than the cap allows, so its allowlisted key may never be tried. Raise auth.ssh.max_auth_tries, or use a per-host IdentityFile + IdentitiesOnly on the client.", maxTries, logUser(conn.User()), logRemote(conn.RemoteAddr()))
 				}
 			}
 			return cfg
@@ -462,6 +492,7 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	// The username of this request, not of the connection's first one: it
 	// decides the reserved-name refusal, the refetch eligibility and the logs.
 	user := requestUser(ctx)
+	remote := logRemote(ctx.RemoteAddr())
 
 	// The username git is reserved (no shed may have that name), and it is
 	// refused here first: in every mode, with or without a user list, before
@@ -472,12 +503,12 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	// machine gives out is for exactly "git". A case variant ("Git") is not a
 	// valid shed name, and shedNameFor refuses it before any shed lookup.
 	if config.IsReservedShedName(user) {
-		log.Printf("SSH auth DENIED: user=%s fingerprint=%s (reserved username)", logUser(user), fingerprint)
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (reserved username)", logUser(user), fingerprint, remote)
 		return false
 	}
 
 	if s.keyAuth.off() {
-		log.Printf("SSH auth attempt: user=%s fingerprint=%s (allowlist off)", logUser(user), fingerprint)
+		log.Printf("SSH auth attempt: user=%s fingerprint=%s remote=%s (allowlist off)", logUser(user), fingerprint, remote)
 		return true
 	}
 
@@ -485,11 +516,11 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	// certificate would be a second identity for whoever holds the key in
 	// it (the lookup resolves none to a user either).
 	if _, cert := key.(*gossh.Certificate); cert && users.HasUserList(s.keyAuth.Users) {
-		log.Printf("SSH auth DENIED: user=%s fingerprint=%s (an SSH certificate; this server's users log in with plain keys)", logUser(user), fingerprint)
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (an SSH certificate; this server's users log in with plain keys)", logUser(user), fingerprint, remote)
 		return false
 	}
 	if s.keyAuth.expired(fingerprint) {
-		log.Printf("SSH auth DENIED: user=%s fingerprint=%s (the key has expired)%s", logUser(user), fingerprint, s.keyAuth.owner(fingerprint))
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (the key has expired)%s", logUser(user), fingerprint, remote, s.keyAuth.owner(fingerprint))
 		return false
 	}
 	authorized := s.keyAuth.known(fingerprint)
@@ -497,21 +528,22 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 		// A lookup whose users change while the server runs (a directory's
 		// list) pulled its list; any other fetched GitHub logins.
 		if _, live := s.keyAuth.Users.(users.BoundCredentialsOnly); live {
-			log.Printf("SSH auth: key %s is known after pulling the directory again", fingerprint)
+			log.Printf("SSH auth: key %s remote=%s is known after pulling the directory again", fingerprint, remote)
 		} else {
-			log.Printf("SSH auth: key %s is known after fetching the GitHub logins again", fingerprint)
+			log.Printf("SSH auth: key %s remote=%s is known after fetching the GitHub logins again", fingerprint, remote)
 		}
 		authorized = true
 	}
 	if s.keyAuth.enforced() && !authorized {
-		log.Printf("SSH auth DENIED: user=%s fingerprint=%s", logUser(user), fingerprint)
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s", logUser(user), fingerprint, remote)
 		return false
 	}
 	// Reaches here only in warn mode, or enforce mode with an authorized key.
-	if authorized {
-		log.Printf("SSH auth allowed: user=%s fingerprint=%s%s", logUser(user), fingerprint, s.keyAuth.owner(fingerprint))
-	} else {
-		log.Printf("SSH auth WOULD DENY (warn mode): user=%s fingerprint=%s", logUser(user), fingerprint)
+	// An accepted key is not logged here: the client has only offered it, and
+	// may never sign with it. "SSH auth allowed" is written once the client
+	// has proved it holds the key (the VerifiedPublicKeyCallback).
+	if !authorized {
+		log.Printf("SSH auth WOULD DENY (warn mode): user=%s fingerprint=%s remote=%s", logUser(user), fingerprint, remote)
 	}
 	return true
 }
@@ -529,7 +561,8 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 // seconds, and the lookup refuses a key it dropped for a GitHub account
 // mismatch; with a directory's list (auth.directory) the slot is one pull a
 // minute while pulls succeed, one per retry interval while they fail, none
-// inside a pending Retry-After, and the wait one 20-second deadline. A key
+// inside a pending Retry-After, and the wait one 8-second deadline
+// (directory.UnknownKeyWait). A key
 // the lookup knows (an expired one included) never gets here.
 func (s *Server) refetchUnknownKey(ctx ssh.Context, user, fingerprint string) bool {
 	if !s.keyAuth.enforced() {

@@ -171,6 +171,34 @@ config or a GitHub account, expires, or loses its pin therefore opens no new
 channel and makes no new request. Channels, SSE streams and Connect tunnels
 that are already open stay open until they end.
 
+### The SSH auth log
+
+Every `SSH auth` line in the server log names the peer's address as
+`remote=<host:port>`: right after `fingerprint=` on a line that names a key,
+right after `user=` on the attempt-cap line. `user=` is the username the
+client asked for, quoted when it holds any character other than `a-z`, `0-9`,
+`-` and `_`.
+
+| Line | Written |
+|------|---------|
+| `SSH auth allowed: user=<name> fingerprint=<fp> remote=<host:port>` | Once per login, in every mode, when the client has proved it holds the key (its signature verified) and the connection authenticates. A key a client only offers is never logged as allowed. The end of the line describes the user the connection authenticated as (see below). |
+| `SSH auth DENIED: user=<name> fingerprint=<fp> remote=<host:port>` | Once per refused key, followed by the reason when there is one (`(the key has expired)`, `(reserved username)`, ...). An agent that offers several keys can write several before one of its keys logs in. |
+| `SSH auth attempt: ...` (`off`) and `SSH auth WOULD DENY (warn mode): ...` (`warn`) | When a key is offered. Neither claims a login. |
+| `SSH auth: key <fp> remote=<host:port> is known after ...` | When fetching an unknown key's GitHub logins, or pulling the directory, made it known. |
+| `SSH auth: public-key attempt cap (<n>) reached for user=<name> remote=<host:port> ...` | When a connection used up `max_auth_tries`. |
+
+The `allowed` line, and the `DENIED` line for an expired key, end with what the
+user lookup said about the key's user. On the `allowed` line that is the
+lookup made when the key was proven, the one the connection is bound to, even
+if the list has changed since:
+
+| The key is | The line ends with |
+|------------|--------------------|
+| a named user's key | `key_user="<user>" admin=<true or false>`, then `label="<label>"` when the key has a label |
+| a named user's script key | the same as any of that user's keys; the line does not say it is a script key |
+| the key of the implicit user (a server with no user list) | `label="<label>"` when the key has a label, otherwise nothing |
+| a key the lookup does not list (it logs in only in `off` or `warn` mode, on a server with no user list) | nothing |
+
 ## Users from an account service
 
 With [`auth.directory`](configuration.md#users-from-an-account-service) a

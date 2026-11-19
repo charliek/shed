@@ -136,8 +136,9 @@ type UnknownKeyRefetcher interface {
 	// waited for nothing. How often the slot may be taken, how long the
 	// wait is, and when else a call is refused are each implementation's,
 	// stated on it (ConfigLookup: one a minute, a five-second wait;
-	// directory.Runtime: by the state of its last pull, one 20-second
-	// deadline). ctx ending ends the wait, not the fetch.
+	// directory.Runtime: by the state of its last pull, one 8-second
+	// deadline, directory.UnknownKeyWait). ctx ending ends the wait, not the
+	// fetch.
 	RefetchForUnknownKey(ctx context.Context, fingerprint string) bool
 }
 

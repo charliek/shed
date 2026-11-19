@@ -501,6 +501,12 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
 - **GitHub keys are read by account id** from `api.github.com/user/<id>/keys`, after the login
   is pinned to its numeric id in `{state_dir}/github_pins.json`. When GitHub is unreachable
   the last known keys stay and no new key is accepted.
+- **SSH: `SSH auth allowed` is logged when a key is proven, not when it is offered**, once per
+  login and in every mode: a key a client only asks about, and never signs with, is no longer
+  logged as allowed. Every `SSH auth` line now carries the peer's address, `remote=<host:port>`
+  (after `fingerprint=`, or after `user=` on the attempt-cap line, which names no key). Log
+  scrapers and fail2ban filters that match these lines need updating. See [Security › The SSH
+  auth log](https://charliek.github.io/shed/reference/security/#the-ssh-auth-log).
 - **SSH picks the shed by the username that authenticated**, in every channel type: a client
   that changed username between authentication requests could have its port forwards routed by
   the first one. An empty username gets the unknown-shed answer.

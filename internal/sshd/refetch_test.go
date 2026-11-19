@@ -137,8 +137,8 @@ func (liveRefetchLookup) BoundCredentialsOnly() {}
 // server runs (a directory's list) says it pulled the directory and never
 // names GitHub; any other prints, byte for byte, the line it always has.
 func TestUnknownKeyRefetchLogLine(t *testing.T) {
-	const github = "SSH auth: key %s is known after fetching the GitHub logins again"
-	const directory = "SSH auth: key %s is known after pulling the directory again"
+	const github = "SSH auth: key %s remote=127.0.0.1:PORT is known after fetching the GitHub logins again"
+	const directory = "SSH auth: key %s remote=127.0.0.1:PORT is known after pulling the directory again"
 	for _, tc := range []struct {
 		name      string
 		live      bool
@@ -160,7 +160,7 @@ func TestUnknownKeyRefetchLogLine(t *testing.T) {
 			if !dialUser(t, addr, "box", newcomer) {
 				t.Fatal("the key the fetch found was refused")
 			}
-			lines := strings.Split(out.String(), "\n")
+			lines := strings.Split(anyPort(out.String()), "\n")
 			if !slices.Contains(lines, fmt.Sprintf(tc.want, fp)) {
 				t.Errorf("no line %q in the log:\n%s", fmt.Sprintf(tc.want, fp), out)
 			}
