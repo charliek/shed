@@ -4151,3 +4151,140 @@ def test_a_held_connection_is_registered_for_clean_up_before_it_starts(tmp_path)
     h.close()
     # One that never started closes too.
     dfx.Held(world, who, "_bootstrap", 9).close()
+
+
+# The audit log's identity shapes: fixtures/auditlog.py, which
+# test_service_client.py uses on the dev server's audit.jsonl.
+
+from fixtures import auditlog  # noqa: E402
+
+# What the server writes (internal/audit TestIdentityShapes pins the same).
+_PERSON_IDS = [
+    {"kind": "user", "user": "pat", "admin": False, "script": False, "subject": "SHA256:abc", "serial": "1f"},
+    {"kind": "user", "user": "admin", "admin": True, "script": False, "subject": "SHA256:abc", "serial": "1f"},
+    {"kind": "user", "user": "ci", "admin": False, "script": True, "subject": "SHA256:abc"},
+    {"kind": "user", "implicit": True, "admin": True, "script": False},
+    {"kind": "user", "implicit": True, "admin": True, "script": False, "subject": "SHA256:abc", "serial": "1f"},
+]
+
+
+@pytest.mark.parametrize("identity", _PERSON_IDS)
+def test_audit_person_identity_accepts_what_the_server_writes(identity):
+    assert auditlog.person_identity_problems(identity) == []
+    assert auditlog.person_identity_problems(identity, admin=identity["admin"]) == []
+    assert auditlog.person_identity_problems(identity, admin=not identity["admin"]) != []
+    # A person is never a client.
+    assert auditlog.client_identity_problems(identity) != []
+
+
+@pytest.mark.parametrize(
+    "identity, problem",
+    [
+        # The retired shape, for anyone who was not a client.
+        ({"kind": "admin", "subject": "SHA256:abc"}, "not 'user'"),
+        ({"kind": "admin"}, "not 'user'"),
+        ({"kind": "client", "name": "build-1", "serial": "3fa2"}, "not 'user'"),
+        ({"kind": "system"}, "not 'user'"),
+        # Both flags are always present, as booleans.
+        ({"kind": "user", "user": "pat", "script": False}, "admin is None"),
+        ({"kind": "user", "user": "pat", "admin": True}, "script is None"),
+        ({"kind": "user", "user": "pat", "admin": "true", "script": False}, "admin is 'true'"),
+        ({"kind": "user", "user": "pat", "admin": 1, "script": False}, "admin is 1"),
+        # A named person has a name; the implicit user has none and is an admin.
+        ({"kind": "user", "admin": True, "script": False}, "no user name"),
+        ({"kind": "user", "user": "", "admin": True, "script": False}, "no user name"),
+        ({"kind": "user", "implicit": True, "user": "pat", "admin": True, "script": False}, "carries a user name"),
+        ({"kind": "user", "implicit": True, "admin": False, "script": False}, "not an admin"),
+        ({"kind": "user", "implicit": False, "user": "pat", "admin": True, "script": False}, "true or absent"),
+        ({"kind": "user", "user": "pat", "admin": True, "script": False, "subject": ""}, "subject is ''"),
+        ({"kind": "user", "user": "pat", "admin": True, "script": False, "name": "x"}, "carries ['name']"),
+        ("admin", "not an object"),
+    ],
+)
+def test_audit_person_identity_refuses(identity, problem):
+    problems = auditlog.person_identity_problems(identity)
+    assert any(problem in p for p in problems), problems
+
+
+def test_audit_client_identity():
+    assert auditlog.client_identity_problems({"kind": "client", "name": "build-1", "serial": "3fa2"}) == []
+    assert auditlog.client_identity_problems({"kind": "client", "name": "build-1"}) == []
+    for bad, problem in (
+        ({"kind": "client", "name": "build-1", "serial": "3fa2", "admin": False}, "carries ['admin']"),
+        ({"kind": "client", "name": "build-1", "user": "pat", "script": False}, "carries ['script', 'user']"),
+        ({"kind": "client", "serial": "3fa2"}, "no client name"),
+        ({"kind": "admin", "subject": "SHA256:abc"}, "not 'client'"),
+        (None, "not an object"),
+    ):
+        problems = auditlog.client_identity_problems(bad)
+        assert any(problem in p for p in problems), (bad, problems)
+
+
+def test_audit_identity_examples_in_the_configuration_reference():
+    """The identity examples the configuration reference prints are shapes
+    the helpers accept, one per kind, and none is the retired kind admin."""
+    doc = (dc.REPO_ROOT / "docs" / "reference" / "configuration.md").read_text()
+    start = doc.index("The `identity` member says who acted")
+    block = doc[start:].split("```json\n", 1)[1].split("```", 1)[0]
+    examples = [json.loads(line) for line in block.splitlines() if line.strip()]
+    assert [e["kind"] for e in examples] == ["client", "user", "user", "system"], examples
+    assert auditlog.client_identity_problems(examples[0]) == []
+    assert auditlog.person_identity_problems(examples[1], admin=False) == []
+    assert auditlog.person_identity_problems(examples[2], admin=True) == []
+    assert examples[3] == {"kind": "system"}
+
+
+# The developer's entry on the dev server test_service_client.py runs
+# against: a named admin on a server with a user list, the implicit user on
+# one without.
+_DEV_NAMED = {"kind": "user", "user": "dev", "admin": True, "script": False, "subject": "SHA256:abc", "serial": "1f"}
+_DEV_IMPLICIT = {"kind": "user", "implicit": True, "admin": True, "script": False, "subject": "SHA256:abc", "serial": "1f"}
+
+
+@pytest.mark.parametrize(
+    "source, with_user_list, want",
+    [
+        ("config", True, "dev"),
+        ("config", False, None),
+        ("directory", True, "localadmin"),
+        ("directory", False, "localadmin"),
+    ],
+)
+def test_developer_audit_user(source, with_user_list, want):
+    assert auditlog.developer_audit_user(source, with_user_list) == want
+
+
+def test_developer_audit_user_refuses_an_unknown_source():
+    with pytest.raises(ValueError, match="github"):
+        auditlog.developer_audit_user("github", True)
+
+
+def test_audit_person_identity_expects_the_named_user():
+    assert auditlog.person_identity_problems(_DEV_NAMED, admin=True, user="dev") == []
+    # A server with a user list that wrote the developer as the implicit user
+    # is wrong, though the line is a well-formed person and an admin.
+    assert auditlog.person_identity_problems(_DEV_IMPLICIT, admin=True) == []
+    problems = auditlog.person_identity_problems(_DEV_IMPLICIT, admin=True, user="dev")
+    assert any("got the implicit user" in p for p in problems), problems
+    problems = auditlog.person_identity_problems(_DEV_NAMED, admin=True, user="localadmin")
+    assert any("user is 'dev', want 'localadmin'" in p for p in problems), problems
+    # What test_service_client.py asks for under the itest user list.
+    want = auditlog.developer_audit_user("config", True)
+    assert auditlog.person_identity_problems(_DEV_NAMED, admin=True, user=want) == []
+    assert auditlog.person_identity_problems(_DEV_IMPLICIT, admin=True, user=want) != []
+
+
+def test_audit_person_identity_expects_the_implicit_user():
+    assert auditlog.person_identity_problems(_DEV_IMPLICIT, admin=True, user=None) == []
+    problems = auditlog.person_identity_problems(_DEV_NAMED, admin=True, user=None)
+    assert any("want the implicit user" in p for p in problems), problems
+    # What test_service_client.py asks for on a server with no user list.
+    want = auditlog.developer_audit_user("config", False)
+    assert auditlog.person_identity_problems(_DEV_IMPLICIT, admin=True, user=want) == []
+    assert auditlog.person_identity_problems(_DEV_NAMED, admin=True, user=want) != []
+
+
+@pytest.mark.parametrize("bad", ["", 7])
+def test_audit_person_identity_refuses_a_bad_expected_user(bad):
+    with pytest.raises(ValueError, match="a user name, or None"):
+        auditlog.person_identity_problems(_DEV_NAMED, user=bad)

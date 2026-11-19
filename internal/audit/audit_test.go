@@ -53,7 +53,7 @@ func TestRecordShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := l.Record(ExecEndEvent{
-		Event: EventExecEnd, Identity: Identity{Kind: KindAdmin}, Shed: "s",
+		Event: EventExecEnd, Identity: UserIdentity("", true, true, false, "", ""), Shed: "s",
 		Argv0: "craze", Argc: 6, ExitCode: -1, Disconnected: true,
 	}); err != nil {
 		t.Fatal(err)
@@ -112,6 +112,103 @@ func TestRecordShape(t *testing.T) {
 	}
 	if err := l.Record(struct{}{}); err == nil {
 		t.Error("Record after Close must fail")
+	}
+}
+
+// TestIdentityShapes pins each identity kind's JSON exactly, as a reader of
+// audit.jsonl sees it: a client keeps its shape (name and serial, nothing
+// else), a person always carries both flags, the implicit user carries no
+// name, and the server's own actions carry the kind alone. No constructor
+// makes the retired kind "admin".
+func TestIdentityShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		id   Identity
+		want string
+	}{
+		{"client", ClientIdentity("build-1", "3fa2"), `{"kind":"client","name":"build-1","serial":"3fa2"}`},
+		{"client without serial", ClientIdentity("build-1", ""), `{"kind":"client","name":"build-1"}`},
+		{
+			"user", UserIdentity("pat", false, false, false, "SHA256:abc", "1f"),
+			`{"kind":"user","user":"pat","admin":false,"script":false,"subject":"SHA256:abc","serial":"1f"}`,
+		},
+		{
+			"admin user", UserIdentity("admin", false, true, false, "SHA256:abc", "1f"),
+			`{"kind":"user","user":"admin","admin":true,"script":false,"subject":"SHA256:abc","serial":"1f"}`,
+		},
+		{
+			"script key", UserIdentity("ci", false, false, true, "SHA256:abc", ""),
+			`{"kind":"user","user":"ci","admin":false,"script":true,"subject":"SHA256:abc"}`,
+		},
+		{
+			// An SSH login has a fingerprint and no certificate serial.
+			"user over ssh", UserIdentity("pat", false, true, false, "SHA256:abc", ""),
+			`{"kind":"user","user":"pat","admin":true,"script":false,"subject":"SHA256:abc"}`,
+		},
+		{"implicit, open mode", UserIdentity("", true, true, false, "", ""), `{"kind":"user","implicit":true,"admin":true,"script":false}`},
+		{
+			"implicit with a certificate", UserIdentity("", true, true, false, "SHA256:abc", "1f"),
+			`{"kind":"user","implicit":true,"admin":true,"script":false,"subject":"SHA256:abc","serial":"1f"}`,
+		},
+		{
+			// The implicit user has no name; one passed by mistake is dropped.
+			"implicit drops a name", UserIdentity("pat", true, true, false, "", ""),
+			`{"kind":"user","implicit":true,"admin":true,"script":false}`,
+		},
+		{"system", SystemIdentity(), `{"kind":"system"}`},
+		{"unknown", UnknownIdentity(), `{"kind":"unknown"}`},
+	}
+	path := filepath.Join(t.TempDir(), FileName)
+	l, err := Open(path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := json.Marshal(tt.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tt.want {
+				t.Errorf("identity = %s, want %s", got, tt.want)
+			}
+			if err := l.Record(ExecEndEvent{Event: EventExecEnd, Identity: tt.id, Shed: tt.name}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Round trip: each line read back holds the identity as written.
+	lines := readLines(t, path)
+	if len(lines) != len(tests) {
+		t.Fatalf("want %d lines, got %d", len(tests), len(lines))
+	}
+	for i, tt := range tests {
+		var want map[string]any
+		if err := json.Unmarshal([]byte(tt.want), &want); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := json.Marshal(lines[i]["identity"])
+		wantJSON, _ := json.Marshal(want)
+		if string(got) != string(wantJSON) {
+			t.Errorf("%s: line identity = %s, want %s", tt.name, got, wantJSON)
+		}
+		if lines[i]["identity"].(map[string]any)["kind"] == "admin" {
+			t.Errorf("%s: a line carries the retired kind admin", tt.name)
+		}
+	}
+}
+
+func TestReapEventIdentity(t *testing.T) {
+	got, err := json.Marshal(ReapEvent{Event: EventReap, Identity: SystemIdentity(), Shed: "s", Owner: "build-1", AgeSeconds: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"event":"reap","identity":{"kind":"system"},"shed":"s","owner":"build-1","age_seconds":3}`
+	if string(got) != want {
+		t.Errorf("reap = %s, want %s", got, want)
 	}
 }
 

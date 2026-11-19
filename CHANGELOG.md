@@ -412,6 +412,10 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   issued certificate that names no user is refused too, with nothing saved. A CLI older than
   0.10.0 drops `user` when it saves `config.yaml`: use 0.10.0 on every machine that shares
   one. A running tunnel daemon keeps the entry it started with: restart it after a refetch.
+- **Readers of `audit.jsonl`: the identity kind `admin` is gone, with no alias.** A person is
+  now `kind: user` (with `user`, or `implicit: true`, and `admin` and `script`), and a `reap`
+  line carries `kind: system` (see "Audit log: callers by kind" below). Update any filter that
+  matches `kind == "admin"`.
 
 #### Added
 
@@ -595,6 +599,16 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   recreated under an earlier name no longer shows the earlier shed's records.
 - **Host-agent and desktop: the bus follows a redirect only to the server's own origin**, and
   an answer the server refused is audited as `undelivered`.
+- **Audit log: callers by kind.** A person's line no longer reads `{"kind":"admin",
+  "subject":…}` for everyone who is not a service client: it is `{"kind":"user","user":"pat",
+  "admin":true,"script":false,"subject":…,"serial":…}`, with the user's name, whether they are
+  an admin, whether they used a script key, the key's fingerprint as `subject` and the client
+  certificate's serial. The one user of a server with no user list is `implicit: true` with
+  no `user` (and, in `open` mode, no `subject` or `serial`). A `reap` line gains
+  `"identity":{"kind":"system"}`. A service client's identity is unchanged. There is no alias
+  for the old kind: a filter on `kind == "admin"` matches nothing written after the upgrade,
+  and rotated files keep the old shape. See [Configuration › Audit
+  log](https://charliek.github.io/shed/reference/configuration/#audit-log).
 - **Development: both parallel dev servers and the integration suite run `mtls`.**
 - **CLI: every client-certificate write for an entry is one transaction** (a re-enrolment, an
   add, a refetch) under that server's credential lock, deciding against the entry as

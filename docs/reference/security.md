@@ -1074,7 +1074,14 @@ Each owned shed:
 Every client request, allowed or refused, writes one `api` line to the [audit
 log](configuration.md#audit-log), and every HTTPS exec that passes the request
 checks writes an `exec.end` line (argv[0] and the argument count by default,
-never the arguments).
+never the arguments). Each line names who acted: the client (`kind: client`,
+by name and certificate serial); a person (`kind: user`, with whether they are
+an admin and whether they used a script key, and their key's fingerprint); or
+the server itself (`kind: system`, on a `reap` line). On a server with a user
+list, an admin's exec into a client's shed is recorded under that admin's user
+name. On a server with no user list it carries no user name: the person is the
+server's one implicit user (`implicit: true`), known on the line only by the
+key's fingerprint.
 
 ### Residual risks
 

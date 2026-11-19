@@ -427,9 +427,25 @@ Each line is one JSON object with `ts` first:
 
 | `event` | Written for | Fields |
 |---------|-------------|--------|
-| `api` | Every service-client request, allowed or refused (401, 403, 404 and policy refusals included). Admin API requests are not logged. | `identity` (`kind: client`, `name`, `serial`), `request_id`, `remote`, `method`, `route` (the matched pattern, `""` when none matched), `path`, `shed`, `status`, `duration_ms` |
-| `exec.end` | Every HTTPS exec, admin or client, that passed the request checks and was handed to the backend, however it ended (a timeout before the command started included). An exec refused with `400`, `404`, `409`, `413` or `429` writes none. | `identity` (`kind: client` or `kind: admin` with `subject`), `request_id`, `shed`, `argv0` and `argc` (or `argv` with `exec_argv: full`), `exit_code` (`-1` when there is none), `timed_out`, `truncated`, `disconnected`, `duration_ms` |
-| `reap` | Each shed the `max_age` reaper deleted | `shed`, `owner`, `age_seconds`, `error` (when the delete failed) |
+| `api` | Every service-client request, allowed or refused (401, 403, 404 and policy refusals included). A person's API requests are not logged. | `identity` (`kind: client`, `name`, `serial`), `request_id`, `remote`, `method`, `route` (the matched pattern, `""` when none matched), `path`, `shed`, `status`, `duration_ms` |
+| `exec.end` | Every HTTPS exec, a person's or a client's, that passed the request checks and was handed to the backend, however it ended (a timeout before the command started included). An exec refused with `400`, `404`, `409`, `413` or `429` writes none. | `identity` (`kind: client`, or `kind: user` for a person; see below), `request_id`, `shed`, `argv0` and `argc` (or `argv` with `exec_argv: full`), `exit_code` (`-1` when there is none), `timed_out`, `truncated`, `disconnected`, `duration_ms` |
+| `reap` | Each shed the `max_age` reaper deleted, and each delete it tried that failed (the shed may still exist; the next pass tries again and writes another line) | `identity` (always `kind: system`), `shed`, `owner`, `age_seconds`, `error` (the backend's error, only when the delete failed) |
+
+The `identity` member says who acted, by `kind`:
+
+| `kind` | Who | Members |
+|--------|-----|---------|
+| `client` | A service client (`auth.clients`) | `name`, `serial` (the certificate's serial) |
+| `user` | A person: a user of the server, or the one user of a server with no user list | `user` (the user's name), `admin` and `script` (always present, `true` or `false`: whether the person is an admin, and whether they used a script key), `subject` (the key's fingerprint), `serial` (the client certificate's serial, when there is one). The one user of a server with no user list carries `implicit: true`, `admin: true` and no `user`; in `open` mode there is no certificate, so no `subject` or `serial` either. |
+| `system` | The server acting for itself (the `max_age` reaper) | none |
+| `unknown` | A caller the server could not name; never expected, since such a request is refused before it reaches a shed | none |
+
+```json
+{"kind":"client","name":"build-1","serial":"3fa2"}
+{"kind":"user","user":"pat","admin":false,"script":false,"subject":"SHA256:…","serial":"…"}
+{"kind":"user","implicit":true,"admin":true,"script":false}
+{"kind":"system"}
+```
 
 ### Mounts
 

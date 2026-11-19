@@ -127,7 +127,7 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 		// its validity is checked inside the audit wrapper (an expired one
 		// reaches here over a connection that opened while it was valid).
 		if name, isService, err := servertls.ServiceClientName(leaf); isService {
-			id := audit.Identity{Kind: audit.KindClient, Name: name, Serial: certSerial(leaf)}
+			id := audit.ClientIdentity(name, certSerial(leaf))
 			if err != nil {
 				id.Name = leaf.Subject.CommonName
 			}

@@ -211,6 +211,22 @@ log the full argv set `audit.exec_argv: full`; it can carry secrets. See
 sudo jq -c 'select(.identity.name == "nocturn")' /var/lib/shed/firecracker/audit.jsonl | tail
 ```
 
+Every line's `identity` says who acted. The client is `kind: client` with its
+`name` and certificate `serial`. A person, such as an admin who runs an HTTPS
+exec in one of the client's sheds, is `kind: user` with the `user` name,
+`admin` and `script` (each `true` or `false`) and the key's fingerprint as
+`subject`; on a server with no user list the person is `implicit: true` with
+no name. A `reap` line is `kind: system`: the server's `max_age` reaper acted,
+not a person. A `reap` line without `error` records a shed the reaper deleted.
+One with `error` records a delete that failed, with the backend's error text:
+the shed may still exist, and while it does (and its client is still
+configured) the reaper tries again on its next pass, which writes another line. To list the HTTPS execs people ran, in any
+shed:
+
+```bash
+sudo jq -c 'select(.event == "exec.end" and .identity.kind == "user")' /var/lib/shed/firecracker/audit.jsonl | tail
+```
+
 ## Revoking a client
 
 There is no per-certificate revocation yet. To revoke a client, remove it from

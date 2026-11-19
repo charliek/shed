@@ -33,19 +33,70 @@ const (
 
 // Identity kinds.
 const (
+	// KindClient is a service client (auth.clients), by name and serial.
 	KindClient = "client"
-	KindAdmin  = "admin"
+	// KindUser is a person: a user of the server by name, or the implicit
+	// user of a server with no user list.
+	KindUser = "user"
+	// KindSystem is the server acting for itself (the max_age reaper).
+	KindSystem = "system"
+	// KindUnknown is a caller the server could not name. It is never
+	// expected (the access guard refuses such a caller before the backend);
+	// it is recorded as it is rather than passed off as a person.
+	KindUnknown = "unknown"
 )
 
-// Identity is who made a request. A service client is {kind: client, name,
-// serial}; an admin is {kind: admin, subject} (the token's subject or the user
-// certificate's fingerprint; no subject in open mode).
+// Identity is who did something. Its shape depends on Kind:
+//
+//   - client: {kind, name, serial}, nothing else.
+//   - user: {kind, user, admin, script, subject, serial}: the user's name, the
+//     two flags (always present, true or false), the key's fingerprint as
+//     subject, and the certificate's serial when there is one. The implicit
+//     user carries implicit: true and no user.
+//   - system and unknown: {kind} alone.
+//
+// Build one with ClientIdentity, UserIdentity, SystemIdentity or
+// UnknownIdentity.
 type Identity struct {
-	Kind    string `json:"kind"`
-	Name    string `json:"name,omitempty"`
+	Kind     string `json:"kind"`
+	Name     string `json:"name,omitempty"`
+	User     string `json:"user,omitempty"`
+	Implicit bool   `json:"implicit,omitempty"`
+	// Admin and Script are pointers so a person's line always carries both
+	// and a client's or the system's carries neither.
+	Admin   *bool  `json:"admin,omitempty"`
+	Script  *bool  `json:"script,omitempty"`
 	Subject string `json:"subject,omitempty"`
 	Serial  string `json:"serial,omitempty"`
 }
+
+// ClientIdentity is the service client name, by its certificate serial.
+func ClientIdentity(name, serial string) Identity {
+	return Identity{Kind: KindClient, Name: name, Serial: serial}
+}
+
+// UserIdentity is a person: the user named user, or, when implicit is set,
+// the one user of a server with no user list, which carries no name (user is
+// then ignored). admin is whether the person may use what is shared on the
+// host (the implicit user always may); script whether they acted with a
+// script key. subject is the key's fingerprint and serial the certificate's
+// serial; either may be empty (open mode presents no certificate, and an SSH
+// login no serial).
+func UserIdentity(user string, implicit, admin, script bool, subject, serial string) Identity {
+	id := Identity{Kind: KindUser, Admin: &admin, Script: &script, Subject: subject, Serial: serial}
+	if implicit {
+		id.Implicit = true
+	} else {
+		id.User = user
+	}
+	return id
+}
+
+// SystemIdentity is the server acting for itself.
+func SystemIdentity() Identity { return Identity{Kind: KindSystem} }
+
+// UnknownIdentity is a caller the server could not name.
+func UnknownIdentity() Identity { return Identity{Kind: KindUnknown} }
 
 // APIEvent is one service client API request, allowed or refused. Route is
 // the matched route pattern ("" when the path matched no route); Path is the
@@ -84,13 +135,15 @@ type ExecEndEvent struct {
 	DurationMS   int64    `json:"duration_ms"`
 }
 
-// ReapEvent is one owned shed the max_age reaper deleted (or failed to).
+// ReapEvent is one owned shed the max_age reaper deleted (or failed to). Its
+// Identity is always SystemIdentity(): the server deleted it, not a person.
 type ReapEvent struct {
-	Event      string `json:"event"`
-	Shed       string `json:"shed"`
-	Owner      string `json:"owner"`
-	AgeSeconds int64  `json:"age_seconds"`
-	Error      string `json:"error,omitempty"`
+	Event      string   `json:"event"`
+	Identity   Identity `json:"identity"`
+	Shed       string   `json:"shed"`
+	Owner      string   `json:"owner"`
+	AgeSeconds int64    `json:"age_seconds"`
+	Error      string   `json:"error,omitempty"`
 }
 
 // Log is an append-only JSONL file with size rotation. Safe for concurrent

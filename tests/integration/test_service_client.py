@@ -17,8 +17,11 @@ it does, as the positive control); it cannot see or touch the admin's shed;
 policy and route refusals are 403; the admin sees the client's shed with its
 owner and can exec in it; the dev server's audit log (read with `sudo cat`)
 has the client's api lines and an exec.end line with argv[0] and the count,
-never the arguments. An admin create with `"mounts": []` also boots with
-no 9P mounts, before and after stop/start.
+never the arguments, and an admin's exec in the client's shed is recorded as
+a person (`kind: user`, `admin: true`; `fixtures/auditlog.py`): by the
+developer's user name on a server with a user list (`SHED_ITEST_USERS=fc`, or
+the directory source), as the implicit user on one without. An admin create
+with `"mounts": []` also boots with no 9P mounts, before and after stop/start.
 
 Run: `make build && make dev-server-restart-fc &&
 make test-integration-dev-fc PYTEST_ARGS="test_service_client.py"`.
@@ -36,7 +39,8 @@ from urllib.parse import urlparse
 import pytest
 import yaml
 
-from fixtures.identity import itest_source, skip_unless_users_source_ready, users_environment
+from fixtures.auditlog import client_identity_problems, developer_audit_user, person_identity_problems
+from fixtures.identity import itest_source, skip_unless_users_source_ready, started_with_users, users_environment
 from fixtures.tlsclient import Pinned, error_code
 
 # No auth-mode gate: the FC dev server is always mtls, and `_load_entry`
@@ -271,6 +275,10 @@ def test_audit_log_records_client_requests_and_execs(svc, admin, bundle, client_
     # An admin request, which must not be logged.
     status, _ = admin.request("GET", "/api/sheds")
     assert status == 200
+    # An admin's HTTPS exec in the client's shed: its exec.end line names a
+    # person (kind user), never the retired kind admin.
+    status, _, code, _ = admin.exec(name, ["true"])
+    assert (status, code) == (200, 0)
 
     raw, lines = read_audit(fc_server_dev)
     assert secret not in raw, "the exec's arguments reached the audit log (exec_argv is not full)"
@@ -279,6 +287,28 @@ def test_audit_log_records_client_requests_and_execs(svc, admin, bundle, client_
     api = [l for l in lines if l.get("event") == "api"]
     assert api and all(l["identity"]["kind"] == "client" for l in api), "admin requests must not be logged"
     mine = [l for l in api if l["identity"].get("name") == CLIENT and l["identity"].get("serial") == serial]
+    for l in mine:
+        assert not client_identity_problems(l["identity"]), (client_identity_problems(l["identity"]), l)
+
+    # The shed's name is new to this run, so every line about it was written
+    # by this server version: a person's lines are kind user, admin true, and
+    # name exactly who the developer's entry is on this server: its own user
+    # (`dev`, or `localadmin` under the directory source) on a server with a
+    # user list, never the implicit user there; the implicit user on one
+    # without.
+    try:
+        source = itest_source()
+    except ValueError as e:
+        pytest.fail(str(e))
+    want_user = developer_audit_user(source, started_with_users("fc"))
+    people = [
+        l for l in lines
+        if l.get("event") == "exec.end" and l["shed"] == name and l["identity"].get("kind") != "client"
+    ]
+    assert people, f"no exec.end line for the admin's exec in {name}"
+    for l in people:
+        problems = person_identity_problems(l["identity"], admin=True, user=want_user)
+        assert not problems and "subject" in l["identity"], (problems, l)
     exec_lines = [l for l in mine if l["route"] == "/api/sheds/{name}/exec" and l["shed"] == name and l["method"] == "POST"]
     assert exec_lines and exec_lines[-1]["status"] == 200, exec_lines
     refused = [l for l in mine if l["path"] == bogus]
@@ -294,6 +324,7 @@ def test_audit_log_records_client_requests_and_execs(svc, admin, bundle, client_
     echo = [e for e in ends if e.get("argv0") == "echo"]
     assert echo, ends
     e = echo[-1]
+    assert not client_identity_problems(e["identity"]), (client_identity_problems(e["identity"]), e)
     assert e["argc"] == 2 and "argv" not in e, e
     assert e["exit_code"] == 0 and e["timed_out"] is False and e["disconnected"] is False, e
 
