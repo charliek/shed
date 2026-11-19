@@ -399,11 +399,13 @@ exec:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `exec.max_stdin_bytes` | int | `1048576` (1 MiB) | Largest decoded `stdin` a request may carry (`413 REQUEST_TOO_LARGE` above it). |
-| `exec.max_timeout` | duration | `1h` | Largest `timeout_seconds` a request may ask for (refused above it, never clamped). At least `1s`. A request with no timeout gets 60 s, or this value if it is lower. |
-| `exec.max_concurrent_per_shed` | int | `8` | HTTPS execs one shed may run at once (`429 EXEC_LIMIT` above it). |
+| `exec.max_stdin_bytes` | int | `1048576` (1 MiB) | Largest decoded `stdin` a request may carry (`413 REQUEST_TOO_LARGE` above it). At most `1073741824` (1 GiB): the server holds a request's stdin in memory. |
+| `exec.max_timeout` | duration | `1h` | Largest `timeout_seconds` a request may ask for (refused above it, never clamped). At least `1s`, at most `168h` (7 days). A request with no timeout gets 60 s, or this value if it is lower. |
+| `exec.max_concurrent_per_shed` | int | `8` | HTTPS execs one shed may run at once (`429 EXEC_LIMIT` above it). At most `4096`. |
 
-Negative values are refused at load.
+A negative value, a `max_timeout` under `1s`, or a value above its upper bound is
+refused at load, with an error that names the key, the value and the bound. The
+bounds are far past any real need; they keep the exec route's arithmetic in range.
 
 ### Audit log
 

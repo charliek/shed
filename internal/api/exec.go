@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"path"
 	"regexp"
@@ -85,13 +86,35 @@ func (s *Server) execLimits() execLimits {
 	}
 }
 
+// maxTimeoutSeconds is the largest timeout_seconds the route accepts:
+// maxTimeout in whole seconds, rounded down. For a whole number of seconds
+// n, n*1s > maxTimeout exactly when n > this value, so the route compares in
+// whole seconds and never multiplies a request's number before it is known
+// to be in range (the product of a large one overflows to a negative or
+// small duration).
+func (l execLimits) maxTimeoutSeconds() int64 {
+	return int64(l.maxTimeout / time.Second)
+}
+
+// bodyLimit is the most bytes a request body may carry: the base64 of
+// maxStdinBytes plus execBodySlack. It saturates at math.MaxInt64 rather
+// than overflow (a negative cap would refuse every request), whatever
+// maxStdinBytes is; config validation keeps it far below that.
+func (l execLimits) bodyLimit() int64 {
+	if l.maxStdinBytes > (math.MaxInt64-2-execBodySlack)/4 {
+		return math.MaxInt64
+	}
+	// Base64 grows stdin by 4/3; the slack carries argv, env and the JSON.
+	return (l.maxStdinBytes*4+2)/3 + execBodySlack
+}
+
 // report is the /api/info exec member. Durations are whole seconds rounded
 // down: the route compares whole-second requests with the exact duration, so
 // the largest timeout_seconds it accepts is exactly the rounded-down value.
 func (l execLimits) report() *config.ExecLimits {
 	return &config.ExecLimits{
 		MaxStdinBytes:         l.maxStdinBytes,
-		MaxTimeoutSeconds:     int64(l.maxTimeout / time.Second),
+		MaxTimeoutSeconds:     l.maxTimeoutSeconds(),
 		DefaultTimeoutSeconds: int64(l.defaultTimeout / time.Second),
 		MaxOutputBytes:        l.maxOutputBytes,
 		DefaultOutputBytes:    l.defaultOutputBytes,
@@ -252,8 +275,7 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 // means plan is ready to run.
 func (s *Server) parseExecRequest(w http.ResponseWriter, r *http.Request, lim execLimits) (*execPlan, *execRequestError) {
 	maxStdin := lim.maxStdinBytes
-	// Base64 grows stdin by 4/3; the slack carries argv, env and the JSON.
-	limit := (maxStdin*4+2)/3 + execBodySlack
+	limit := lim.bodyLimit()
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 
 	var req config.ExecRequest
@@ -330,7 +352,7 @@ func (s *Server) parseExecRequest(w http.ResponseWriter, r *http.Request, lim ex
 		return nil, badExecRequest("timeout_seconds must not be negative")
 	case req.TimeoutSeconds == 0:
 		plan.timeout = lim.defaultTimeout
-	case time.Duration(req.TimeoutSeconds)*time.Second > maxTimeout:
+	case int64(req.TimeoutSeconds) > lim.maxTimeoutSeconds():
 		return nil, badExecRequest("timeout_seconds %d is over the server's exec.max_timeout (%s)", req.TimeoutSeconds, maxTimeout)
 	default:
 		plan.timeout = time.Duration(req.TimeoutSeconds) * time.Second

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -371,10 +372,207 @@ func TestInfoExecLimitsAreWhatTheExecRouteEnforces(t *testing.T) {
 	}
 }
 
+// hugeTimeouts are timeout_seconds values a request can carry far past any
+// maximum: up to the largest integer a JSON number decodes into
+// (math.MaxInt64). With timeout_seconds multiplied by a second before the
+// comparison, each of these overflows (MaxInt64 to -1 s), and the request
+// would be accepted with a nonsense timeout.
+var hugeTimeouts = []int64{
+	// 9223372036, the largest whose product with a second fits, and the
+	// first that overflows.
+	math.MaxInt64 / int64(time.Second),
+	math.MaxInt64/int64(time.Second) + 1,
+	math.MaxInt64 / int64(time.Second) * 2,
+	// The largest integer a float64 holds exactly, and the next.
+	1 << 53,
+	1<<53 + 1,
+	// The largest a JSON number decodes into, and the one before.
+	math.MaxInt64 - 1,
+	math.MaxInt64,
+}
+
+// TestExecLimitsAtConfigBounds: a server whose exec settings are all at
+// their upper bounds (config.MaxExecMax*) reports them, and the route holds
+// a request to exactly what it reports: a timeout at max_timeout_seconds is
+// given that whole timeout, one past it and every far larger one (up to the
+// largest JSON integer) is refused; a request with stdin is not refused as
+// too large (the body cap computed from max_stdin_bytes does not overflow);
+// and max_concurrent_per_shed execs fill the shed, one more is refused.
+//
+// A request at, or past, a 1 GiB max_stdin_bytes is not sent: the server
+// would buffer several GiB. The stdin check itself is the one the
+// configured-values cases drive at each reported maximum; here the body cap
+// is checked to leave room for a stdin of max_stdin_bytes.
+func TestExecLimitsAtConfigBounds(t *testing.T) {
+	atBounds := &config.ExecConfig{
+		MaxStdinBytes:        config.MaxExecMaxStdinBytes,
+		MaxTimeout:           config.Duration(config.MaxExecMaxTimeout),
+		MaxConcurrentPerShed: config.MaxExecMaxConcurrentPerShed,
+	}
+	// That such a config loads is internal/config's TestExecConfigBoundsFromYAML.
+	b := newLimitsBackend()
+	s := newExecTestServer(b, atBounds)
+	_, info := getInfo(t, s.Router())
+	if info.Exec == nil {
+		t.Fatal("/api/info has no exec member")
+	}
+	lim := *info.Exec
+	want := config.ExecLimits{
+		MaxStdinBytes: 1 << 30, MaxTimeoutSeconds: 7 * 24 * 3600, DefaultTimeoutSeconds: 60,
+		MaxOutputBytes: 268435456, DefaultOutputBytes: 4194304, MaxConcurrentPerShed: 4096,
+		MaxArgvElements: 1024, MaxEnvKeys: 256, MaxArgvEnvBytes: 1 << 20,
+	}
+	if lim != want {
+		t.Fatalf("exec = %+v\nwant   %+v", lim, want)
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		before := time.Now()
+		res := postExec(t, s, "box", config.ExecRequest{Argv: []string{"deadline"}, TimeoutSeconds: int(lim.MaxTimeoutSeconds)})
+		after := time.Now()
+		if res.status != http.StatusOK || res.exit == nil || res.exit.Code != 0 {
+			t.Fatalf("timeout_seconds at max_timeout_seconds: status %d body %.300s, want 200 and exit 0", res.status, res.body)
+		}
+		b.mu.Lock()
+		dl := b.deadline
+		b.mu.Unlock()
+		given := time.Duration(lim.MaxTimeoutSeconds) * time.Second
+		if dl.Before(before.Add(given)) || dl.After(after.Add(given)) {
+			t.Errorf("timeout_seconds %d was given %s, want %s", lim.MaxTimeoutSeconds, dl.Sub(before), given)
+		}
+		for _, n := range append([]int64{lim.MaxTimeoutSeconds + 1}, hugeTimeouts...) {
+			res := postExec(t, s, "box", config.ExecRequest{Argv: []string{"x"}, TimeoutSeconds: int(n)})
+			if res.status != http.StatusBadRequest || apiErrorCode(t, res.body) != config.ErrInvalidRequest {
+				t.Errorf("timeout_seconds %d (max %d): status %d body %.300s, want 400 INVALID_REQUEST", n, lim.MaxTimeoutSeconds, res.status, res.body)
+			}
+		}
+		// One past the largest integer: the body does not decode.
+		res = postExec(t, s, "box", `{"argv":["x"],"timeout_seconds":9223372036854775808}`)
+		if res.status != http.StatusBadRequest || apiErrorCode(t, res.body) != config.ErrInvalidRequest {
+			t.Errorf("timeout_seconds 2^63: status %d body %.300s, want 400 INVALID_REQUEST", res.status, res.body)
+		}
+	})
+
+	t.Run("stdin", func(t *testing.T) {
+		res := postExec(t, s, "box", config.ExecRequest{Argv: []string{"x"}, Stdin: base64.StdEncoding.EncodeToString([]byte("hi"))})
+		if res.status != http.StatusOK || res.exit == nil || res.exit.Code != 0 {
+			t.Fatalf("a small stdin: status %d body %.300s, want 200", res.status, res.body)
+		}
+		room := int64(base64.StdEncoding.EncodedLen(int(lim.MaxStdinBytes))) + 64<<10
+		if got := s.execLimits().bodyLimit(); got < room {
+			t.Errorf("body cap %d leaves no room for a stdin of max_stdin_bytes (%d) and its request (%d)", got, lim.MaxStdinBytes, room)
+		}
+	})
+
+	t.Run("concurrency", func(t *testing.T) {
+		var releases []func()
+		defer func() {
+			for _, r := range releases {
+				r()
+			}
+		}()
+		for i := range lim.MaxConcurrentPerShed {
+			r, ok := s.acquireExecSlot("box", s.execLimits().maxConcurrentPerShed)
+			if !ok {
+				t.Fatalf("slot %d of max_concurrent_per_shed (%d) refused", i+1, lim.MaxConcurrentPerShed)
+			}
+			releases = append(releases, r)
+		}
+		res := postExec(t, s, "box", config.ExecRequest{Argv: []string{"x"}})
+		if res.status != http.StatusTooManyRequests || apiErrorCode(t, res.body) != config.ErrExecLimit {
+			t.Fatalf("one exec past max_concurrent_per_shed (%d): status %d body %.300s, want 429 EXEC_LIMIT",
+				lim.MaxConcurrentPerShed, res.status, res.body)
+		}
+		releases[0]()
+		releases = releases[1:]
+		res = postExec(t, s, "box", config.ExecRequest{Argv: []string{"x"}})
+		if res.status != http.StatusOK {
+			t.Fatalf("the last slot of max_concurrent_per_shed (%d): status %d body %.300s, want 200",
+				lim.MaxConcurrentPerShed, res.status, res.body)
+		}
+	})
+}
+
+// TestExecRouteArithmeticWithoutValidation: the route's own arithmetic is
+// safe whatever exec values it is handed, not only those config validation
+// lets through. With the largest representable max_timeout, timeout_seconds
+// one past the reported maximum is still refused (multiplied first, it
+// overflowed and escaped the refusal); with a max_stdin_bytes near int64's
+// end, the body cap saturates instead of going negative (which refused
+// every request as too large).
+func TestExecRouteArithmeticWithoutValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		exec *config.ExecConfig
+	}{
+		{"largest durations and sizes", &config.ExecConfig{MaxStdinBytes: math.MaxInt64, MaxTimeout: config.Duration(math.MaxInt64)}},
+		{"stdin 2^61", &config.ExecConfig{MaxStdinBytes: 1 << 61, MaxTimeout: config.Duration(math.MaxInt64 - 1)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Past the bounds on purpose: the route must not rely on them.
+			if tc.exec.MaxStdinBytes <= config.MaxExecMaxStdinBytes || tc.exec.MaxTimeout.Duration() <= config.MaxExecMaxTimeout {
+				t.Fatalf("%+v is within the config bounds; this test wants values only the route sees", *tc.exec)
+			}
+			s := newExecTestServer(newLimitsBackend(), tc.exec)
+			_, info := getInfo(t, s.Router())
+			if info.Exec == nil {
+				t.Fatal("/api/info has no exec member")
+			}
+			lim := *info.Exec
+			if lim.MaxStdinBytes != tc.exec.MaxStdinBytes || lim.MaxTimeoutSeconds != int64(time.Duration(tc.exec.MaxTimeout)/time.Second) {
+				t.Fatalf("exec = %+v, want the configured values", lim)
+			}
+			if got := s.execLimits().bodyLimit(); got != math.MaxInt64 {
+				t.Errorf("body cap %d, want it saturated at %d", got, int64(math.MaxInt64))
+			}
+
+			res := postExec(t, s, "box", config.ExecRequest{Argv: []string{"x"}, Stdin: base64.StdEncoding.EncodeToString([]byte("hi"))})
+			if res.status != http.StatusOK || res.exit == nil || res.exit.Code != 0 {
+				t.Fatalf("a small request: status %d body %.300s, want 200 (the body cap must not overflow)", res.status, res.body)
+			}
+			res = postExec(t, s, "box", config.ExecRequest{Argv: []string{"x"}, TimeoutSeconds: int(lim.MaxTimeoutSeconds)})
+			if res.status != http.StatusOK {
+				t.Fatalf("timeout_seconds at max_timeout_seconds (%d): status %d body %.300s, want 200", lim.MaxTimeoutSeconds, res.status, res.body)
+			}
+			for _, n := range hugeTimeouts {
+				if n <= lim.MaxTimeoutSeconds {
+					continue
+				}
+				res := postExec(t, s, "box", config.ExecRequest{Argv: []string{"x"}, TimeoutSeconds: int(n)})
+				if res.status != http.StatusBadRequest || apiErrorCode(t, res.body) != config.ErrInvalidRequest {
+					t.Errorf("timeout_seconds %d (max %d): status %d body %.300s, want 400 INVALID_REQUEST", n, lim.MaxTimeoutSeconds, res.status, res.body)
+				}
+			}
+		})
+	}
+}
+
 // TestInfoExecLimitsSameForEveryCaller: on an mtls server with a service
 // client, a person and the client read the same exec member (the limits are
 // the server's, not per caller), and a caller /api/info refuses learns
 // nothing of them.
+// TestExecDefaultConfigRefusesAnOverflowingTimeout: on a server with no exec
+// settings at all, a timeout_seconds so large that multiplying it by a second
+// wraps to a negative duration is refused like any other value past the
+// maximum. Before the comparison was made in whole seconds, such a request
+// passed the check on every server, the default one included.
+func TestExecDefaultConfigRefusesAnOverflowingTimeout(t *testing.T) {
+	s := newExecTestServer(newLimitsBackend(), nil)
+	_, info := getInfo(t, s.Router())
+	if info.Exec == nil {
+		t.Fatal("/api/info has no exec member")
+	}
+	if got, want := info.Exec.MaxTimeoutSeconds, int64(config.DefaultExecMaxTimeout/time.Second); got != want {
+		t.Fatalf("default max_timeout_seconds = %d, want %d", got, want)
+	}
+	for _, n := range hugeTimeouts {
+		res := postExec(t, s, "box", config.ExecRequest{Argv: []string{"x"}, TimeoutSeconds: int(n)})
+		if res.status != http.StatusBadRequest || apiErrorCode(t, res.body) != config.ErrInvalidRequest {
+			t.Errorf("timeout_seconds %d on a default server: status %d body %.300s, want 400 INVALID_REQUEST", n, res.status, res.body)
+		}
+	}
+}
+
 func TestInfoExecLimitsSameForEveryCaller(t *testing.T) {
 	s, router := clientTestServer(t, newClientFakeBackend(), defaultTestPolicy())
 	s.cfg.Exec = &config.ExecConfig{MaxTimeout: config.Duration(20 * time.Minute), MaxConcurrentPerShed: 2}

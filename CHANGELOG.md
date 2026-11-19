@@ -790,6 +790,17 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   before the network was online, a directory server with no kept copy failed its first pull
   and ran with only its local admins until the next attempt, 15 minutes later. See the
   upgrade notes above for an edited deb unit and a unit `shed-server install` wrote.
+- **Server: the `exec:` settings have upper bounds.** `exec.max_stdin_bytes` at most
+  `1073741824` (1 GiB), `exec.max_timeout` at most `168h` (7 days),
+  `exec.max_concurrent_per_shed` at most `4096`. **A server whose config sets a value above
+  its bound now refuses to start**, with an error naming the key, the value and the bound;
+  lower the value. Defaults and the lower bounds are unchanged. Before, a very large
+  `max_stdin_bytes` overflowed the request-body cap and every exec was refused as too large.
+  Separately, the exec route now compares `timeout_seconds` with `max_timeout` in whole
+  seconds, so a request whose `timeout_seconds` is far past the maximum (up to the largest
+  integer a JSON number carries) is refused; multiplied by a second first, such a number
+  overflowed and the request ran with a nonsense timeout. See [Configuration › HTTPS
+  exec](https://charliek.github.io/shed/reference/configuration/#https-exec).
 
 #### Removed
 
