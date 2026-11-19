@@ -814,6 +814,7 @@ func runFrontDoors(fd frontDoors, signals <-chan os.Signal) error {
 // waiting on anything: an entry not begun by now is refused, and every
 // entry the drains will wait for was begun before the shutdown did.
 func closeEntryGates(apiServer *api.Server, sshServer *sshd.Server) {
+	log.Printf("Closing entry gates...")
 	apiServer.CloseEntries()
 	sshServer.CloseEntries()
 }

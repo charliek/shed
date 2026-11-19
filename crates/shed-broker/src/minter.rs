@@ -483,6 +483,12 @@ pub struct ObtainError {
     /// refusal, built from names already checked, never text a minter produced. Belongs
     /// to this call only: a request explains its own refusal with it, never another's.
     pub refused: bool,
+    /// Set only with [`Self::refused`], when the refusal is the held-user rule's
+    /// ([`held_user_refusal`]: a certificate for another named user, or one that names no
+    /// user), not an unreadable certificate or one that could not be stored. With nothing
+    /// held to present, a request is then not sent at all (plan 037 A23): the server
+    /// issues certificates, so it could not authenticate it.
+    pub held_user: bool,
 }
 
 impl ObtainError {
@@ -490,6 +496,7 @@ impl ObtainError {
         Self {
             message,
             refused: false,
+            held_user: false,
         }
     }
 
@@ -497,6 +504,15 @@ impl ObtainError {
         Self {
             message,
             refused: true,
+            held_user: false,
+        }
+    }
+
+    fn held_user_refusal(message: String) -> Self {
+        Self {
+            message,
+            refused: true,
+            held_user: true,
         }
     }
 }
@@ -509,7 +525,15 @@ enum MintFailure {
     Unusable(String),
     /// A certificate the held-user rule refuses (or whose user cannot be read): like
     /// `Unusable`, plus a positive check of what stays held.
-    Refused(String),
+    Refused(IssuedRefusal),
+}
+
+/// Why [`issued_user`] refuses a certificate: the message, and whether it is the
+/// held-user rule's refusal ([`held_user_refusal`]) rather than an unreadable
+/// certificate ([`ObtainError::held_user`]).
+struct IssuedRefusal {
+    message: String,
+    held_user: bool,
 }
 
 /// What [`CredentialSource::do_mint`] decided under the state lock.
@@ -573,18 +597,22 @@ fn issued_user(
     held: &Held,
     held_user: Option<&str>,
     server: &str,
-) -> Result<Option<CertUser>, String> {
+) -> Result<Option<CertUser>, IssuedRefusal> {
     let Held::Certificate { cert_pem, .. } = held else {
         return Ok(None);
     };
-    let user = cert_user_pem(cert_pem).map_err(|e| {
-        format!(
+    let user = cert_user_pem(cert_pem).map_err(|e| IssuedRefusal {
+        message: format!(
             "client certificate issued for {} is unusable: {e}",
             display_server_name(server)
-        )
+        ),
+        held_user: false,
     })?;
     match held_user_refusal(server, held_user, &user) {
-        Some(msg) => Err(msg),
+        Some(message) => Err(IssuedRefusal {
+            message,
+            held_user: true,
+        }),
         None => Ok(Some(user)),
     }
 }
@@ -1171,11 +1199,15 @@ impl CredentialSource {
                 }
             }
             Err(MintFailure::Unusable(msg)) => MintStep::Done(Err(ObtainError::plain(msg))),
-            Err(MintFailure::Refused(msg)) => {
+            Err(MintFailure::Refused(r)) => {
                 // Nothing is persisted and the held credential stays armed — but only
                 // after a positive check that it is still for the held user.
                 self.keep_only_held(st);
-                MintStep::Done(Err(ObtainError::refusal(msg)))
+                MintStep::Done(Err(if r.held_user {
+                    ObtainError::held_user_refusal(r.message)
+                } else {
+                    ObtainError::refusal(r.message)
+                }))
             }
             Err(MintFailure::Minter(e)) if e.is_host_key_mismatch() => {
                 // Go: fmt.Errorf("refusing to broker %q: SSH host key pin mismatch
@@ -2505,7 +2537,7 @@ pub(crate) mod tests {
 
     const MISMATCH: &str = "server \"mini3\": the server issued a certificate for user \
         \"admin\", but this entry is held to \"pat\"; it was not used. Fix it with the shed \
-        CLI (shed server update mini3 --identity-file <key>, or --refetch \
+        CLI (shed server update mini3 --identity-file /path/to/key, or --refetch \
         --allow-user-change), then restart the app.";
     const NO_USER: &str = "server \"mini3\": the server issued a certificate that names no \
         user (a shed-server older than 0.10.0); it was not used. Upgrade the server, then \
@@ -2573,7 +2605,11 @@ pub(crate) mod tests {
 
             s.invalidate(); // force the replacement mint
             let err = s.token_for_request().await.unwrap_err();
-            assert_eq!(err, ObtainError::refusal(want.to_string()), "a refusal");
+            assert_eq!(
+                err,
+                ObtainError::held_user_refusal(want.to_string()),
+                "a refusal, the held-user rule's"
+            );
             assert_eq!(fm.calls.load(Ordering::SeqCst), 2);
             assert_eq!(stored(&store), before, "nothing written to the store");
             assert!(
@@ -2633,8 +2669,13 @@ pub(crate) mod tests {
             SCOPE_CREDENTIALS,
             Some(store.clone()),
         );
-        let err = s.token().await.unwrap_err();
-        assert!(err.contains("cannot be read for its user"), "{err}");
+        let err = s.token_for_request().await.unwrap_err();
+        assert!(
+            err.message.contains("cannot be read for its user"),
+            "{err:?}"
+        );
+        // A refusal, but not the held-user rule's: a request is still sent as before.
+        assert!(err.refused && !err.held_user, "{err:?}");
         assert_eq!(stored(&store), (None, None));
         assert!(s.cert_resolver().current().is_none());
     }
@@ -2943,6 +2984,7 @@ pub(crate) mod tests {
         );
         let err = s.token_for_request().await.unwrap_err();
         assert!(err.refused, "{err:?}");
+        assert!(!err.held_user, "not the held-user rule's refusal: {err:?}");
         assert!(
             err.message.starts_with(
                 "server \"mini3\": the server issued a certificate for user \"pat\", the first \

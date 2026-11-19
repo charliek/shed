@@ -234,6 +234,11 @@ struct Resolution {
     cred: Option<crate::token::Credential>,
     /// The mint failure behind a missing or merely surviving credential.
     mint_error: Option<ShedError>,
+    /// Set only with no `cred`: `mint_error` is the held-user refusal
+    /// ([`crate::token::held_user_refusal`]). The server issues certificates, so a
+    /// request with nothing to present cannot be authenticated: it is not sent, and the
+    /// refusal alone is the caller's error ([`Client::send_authed`]).
+    held_user_refused: bool,
 }
 
 impl Resolution {
@@ -242,6 +247,20 @@ impl Resolution {
         Self {
             cred: Some(cred),
             mint_error: None,
+            held_user_refused: false,
+        }
+    }
+
+    /// The held-user refusal this resolution ends in, when it has nothing to present:
+    /// what the caller gets instead of a request.
+    fn into_held_user_refusal(self) -> Result<Self, ShedError> {
+        match self {
+            Resolution {
+                cred: None,
+                mint_error: Some(refusal),
+                held_user_refused: true,
+            } => Err(refusal),
+            other => Ok(other),
         }
     }
 }
@@ -598,7 +617,11 @@ impl Client {
     ///     `66abaa9`: "presenting something the server might still accept beats
     ///     presenting nothing"). The error rides along so a refusal can name it;
     ///   * the mint failed and NOTHING usable is held — the request still goes
-    ///     out, unauthenticated, with the error riding along.
+    ///     out, unauthenticated, with the error riding along. Except when the
+    ///     failure is the held-user refusal (the server issued a certificate for
+    ///     another user, or one that names no user): that server issues
+    ///     certificates, so nothing it would accept is held, and the request is
+    ///     not sent at all ([`Resolution::held_user_refused`]).
     ///
     /// That last case used to `.ok()`-discard the error, which is why an mtls
     /// server answered by a host-agent too old to mint a certificate reported a
@@ -621,16 +644,18 @@ impl Client {
     /// through the refusal path below.
     async fn credential(&self) -> Resolution {
         match &self.token_provider {
-            Some(p) => match p.credential().await {
+            Some(p) => match p.credential_checked().await {
                 Ok(cred) => Resolution::presenting(cred),
-                Err(e) => match p.surviving_credential().await {
+                Err(failure) => match p.surviving_credential().await {
                     Some(surviving) => Resolution {
                         cred: Some(surviving),
-                        mint_error: Some(e),
+                        mint_error: Some(failure.error),
+                        held_user_refused: false,
                     },
                     None => Resolution {
                         cred: None,
-                        mint_error: Some(e),
+                        mint_error: Some(failure.error),
+                        held_user_refused: failure.held_user_refused,
                     },
                 },
             },
@@ -782,6 +807,11 @@ impl Client {
     /// and Go says the same: `cmd/shed`'s `reauthenticated` returns a failed
     /// re-mint rather than the 401 that triggered it.
     ///
+    /// A held-user refusal ([`Resolution::held_user_refused`]) is never sent at all:
+    /// when the resolution, or the re-resolution after a refusal, ends in one with
+    /// nothing to present, that refusal is returned as it is, before any dial and with
+    /// no transport error after it (plan 037 A23).
+    ///
     /// Ahead of all that, the ambiguous "connection was not ready" shape
     /// ([`crate::authfail::is_connection_lost_message`]) gets ONE plain re-send:
     /// the request was never dispatched, so re-sending is safe for any method, and
@@ -820,10 +850,13 @@ impl Client {
         resolved: Resolution,
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<Sent, ShedError> {
+        // A held-user refusal with nothing held: no request goes out (it could not be
+        // authenticated), and the refusal is the whole error.
         let Resolution {
             cred: used,
             mint_error,
-        } = resolved;
+            held_user_refused: _,
+        } = resolved.into_held_user_refusal()?;
         let bearer = used
             .as_ref()
             .and_then(|c| c.bearer_token().map(str::to_string));
@@ -876,10 +909,16 @@ impl Client {
             Some(crate::token::AuthMode::Mtls) => Some(self.recycle_transport()?),
             _ => None,
         };
+        // The re-mint refused by the held-user rule, with nothing left to present: the
+        // refusal alone, not the refused request's own error after it.
         let Resolution {
             cred: fresh,
             mint_error: remint_error,
-        } = self.bounded_credential(bound).await?;
+            held_user_refused: _,
+        } = self
+            .bounded_credential(bound)
+            .await?
+            .into_held_user_refusal()?;
         let Some(fresh) = fresh.filter(crate::token::Credential::usable) else {
             // Never retry unauthenticated; the freshest explanation wins.
             return refuse(outcome, remint_error.or(mint_error), sent);
@@ -3901,5 +3940,149 @@ mod mtls_tests {
             "no handshake COMPLETED — the listener requires a certificate"
         );
         assert!(provider.credential().await.is_err());
+    }
+
+    // ---- plan 037 A23: a held-user refusal sends nothing, and backs off ----
+
+    /// Signs the provider's CSR for whichever user it is set to, with the same
+    /// `SHA256:client-<n>` names as [`CaMinter`].
+    struct UserCaMinter {
+        ca: Arc<TestCa>,
+        user: Mutex<TestUser>,
+        calls: AtomicUsize,
+    }
+
+    impl UserCaMinter {
+        fn new(ca: Arc<TestCa>, user: &str) -> Arc<Self> {
+            Arc::new(Self {
+                ca,
+                user: Mutex::new(TestUser::named(user)),
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn set_user(&self, user: &str) {
+            *self.user.lock().unwrap() = TestUser::named(user);
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TokenMinter for UserCaMinter {
+        async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+            unreachable!("an mtls-capable minter is driven through mint_credential")
+        }
+        fn supports_mtls(&self) -> bool {
+            true
+        }
+        async fn mint_credential(
+            &self,
+            _server: &str,
+            req: &CredentialRequest,
+        ) -> Result<MintedCredential, ShedError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let der = BASE64
+                .decode(req.csr_base64().expect("a CSR").as_bytes())
+                .unwrap();
+            let user = self.user.lock().unwrap().clone();
+            let (pem, serial) = self.ca.sign_csr_for(
+                &der,
+                &format!("SHA256:client-{n}"),
+                "control",
+                n as u64,
+                valid_window(),
+                &user,
+            );
+            Ok(MintedCredential::Certificate(
+                crate::token::MintedCertificate {
+                    cert_pem: pem,
+                    serial,
+                    expires_at_unix: Some(4_102_444_800),
+                },
+            ))
+        }
+    }
+
+    /// The refusal the provider builds for server "s", held to pat, issued admin.
+    fn admin_refusal() -> String {
+        crate::token::held_user_refusal(
+            "s",
+            Some("pat"),
+            &crate::certuser::CertUser::Named("admin".into()),
+        )
+        .unwrap()
+    }
+
+    fn assert_the_refusal_alone(r: Result<Vec<u8>, ShedError>) {
+        match r {
+            Err(ShedError::Config(m)) => assert_eq!(m, admin_refusal(), "the refusal alone"),
+            other => panic!("want the held-user refusal, got {other:?}"),
+        }
+    }
+
+    /// A refused mint makes no connection at all: every request in a row gets the
+    /// refusal alone (no transport error after it), the server's listener accepts
+    /// nothing, and the server is asked for one certificate inside the first wait.
+    /// Once the server issues the held user's certificate again, the first request
+    /// after the wait is sent with it and works.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_user_refusal_sends_nothing_and_backs_off() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_mtls_server(&ca, TlsVersion::Any, false).await;
+        let minter = UserCaMinter::new(ca.clone(), "admin");
+        let clock = crate::token::TestClock::new();
+        let provider = Arc::new(
+            clock.on(ControlTokenProvider::new("s".into(), minter.clone())
+                .with_held_user(Some("pat".into()))),
+        );
+        let c = client_for(&srv, provider.clone());
+
+        for _ in 0..6 {
+            assert_the_refusal_alone(get(&c).await);
+        }
+        assert_eq!(minter.calls(), 1, "one enrolment inside the first wait");
+        assert_eq!(srv.accept_count(), 0, "no connection was made");
+
+        // The server issues pat's certificate again: recovered after the wait.
+        minter.set_user("pat");
+        clock.advance(std::time::Duration::from_secs(1));
+        assert_eq!(get(&c).await.unwrap(), b"{\"ok\":true}");
+        assert_eq!(minter.calls(), 2);
+        assert_eq!(srv.client_cns(), vec!["SHA256:client-2".to_string()]);
+    }
+
+    /// The live-run shape: pat's certificate is refused by the server, and the re-mint
+    /// is refused by the held-user rule. The caller gets the refusal alone, and later
+    /// requests make no connection while the backoff lasts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_re_mint_is_the_refusal_alone_and_later_requests_send_nothing() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_flip_server(
+            &ca,
+            ServerAuthMode::MtlsAllow(vec!["SHA256:client-1".into()]),
+            false,
+        )
+        .await;
+        let minter = UserCaMinter::new(ca.clone(), "pat");
+        let clock = crate::token::TestClock::new();
+        let provider = Arc::new(
+            clock.on(ControlTokenProvider::new("s".into(), minter.clone())
+                .with_held_user(Some("pat".into()))),
+        );
+        let c = client_for(&srv, provider.clone());
+        get(&c).await.unwrap(); // pat's client-1, pooled
+
+        // pat leaves the server's list; the server would now issue admin's.
+        srv.set_mode(ServerAuthMode::MtlsAllow(Vec::new()));
+        minter.set_user("admin");
+        assert_the_refusal_alone(get_stable(&c).await);
+        assert_eq!(minter.calls(), 2);
+        let accepted = srv.accept_count();
+        for _ in 0..5 {
+            assert_the_refusal_alone(get(&c).await);
+        }
+        assert_eq!(minter.calls(), 2, "no enrolment inside the wait");
+        assert_eq!(srv.accept_count(), accepted, "and no connection");
     }
 }

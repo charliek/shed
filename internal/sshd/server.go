@@ -509,9 +509,10 @@ func (s *Server) Start() error {
 // listener and waits, until ctx ends, for the connections to end; then for
 // the entries already being admitted to write their audit lines
 // (beginEntry); then for a check still running. The audit log must be closed
-// only after Shutdown returns.
+// only after Shutdown returns. It logs nothing of its own: shed-server's
+// shutdown writes the one "Shutting down SSH server..." line, in the same
+// form as every other door's (cmd/shed-server shutdownDoors).
 func (s *Server) Shutdown(ctx context.Context) error {
-	log.Printf("Shutting down SSH server...")
 	s.endLife()
 	// No new entry into a service client's shed starts from here (the
 	// caller may have closed this gate already, CloseEntries).

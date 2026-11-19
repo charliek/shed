@@ -270,6 +270,9 @@ pub struct TlsServer {
     /// Number of completed TLS handshakes — i.e. how many times a connection was
     /// actually dialed rather than served from reqwest's pool.
     pub handshakes: Arc<AtomicUsize>,
+    /// Number of TCP connections accepted, whether or not their handshake then
+    /// completed: a request that was never sent leaves it unchanged.
+    pub accepts: Arc<AtomicUsize>,
     /// The client-certificate serials seen, in arrival order (hex of the DER's
     /// serial as rendered by the CN we put in — see [`Self::client_cns`]).
     pub seen_cns: Arc<std::sync::Mutex<Vec<String>>>,
@@ -298,6 +301,10 @@ impl TlsServer {
 
     pub fn handshake_count(&self) -> usize {
         self.handshakes.load(Ordering::SeqCst)
+    }
+
+    pub fn accept_count(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
     }
 
     pub fn base_url(&self) -> String {
@@ -449,10 +456,12 @@ async fn spawn_with_config(config: ServerConfig, pin: String, opts: ServerOpts) 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handshakes = Arc::new(AtomicUsize::new(0));
+    let accepts = Arc::new(AtomicUsize::new(0));
     let seen_cns = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mode = Arc::new(std::sync::Mutex::new(auth_mode));
     let task = {
         let handshakes = handshakes.clone();
+        let accepts = accepts.clone();
         let seen_cns = seen_cns.clone();
         let mode = mode.clone();
         tokio::spawn(async move {
@@ -460,6 +469,7 @@ async fn spawn_with_config(config: ServerConfig, pin: String, opts: ServerOpts) 
                 let Ok((sock, _)) = listener.accept().await else {
                     return;
                 };
+                accepts.fetch_add(1, Ordering::SeqCst);
                 let acceptor = acceptor.clone();
                 let handshakes = handshakes.clone();
                 let seen_cns = seen_cns.clone();
@@ -557,6 +567,7 @@ async fn spawn_with_config(config: ServerConfig, pin: String, opts: ServerOpts) 
         addr,
         pin,
         handshakes,
+        accepts,
         seen_cns,
         mode,
         task,

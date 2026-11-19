@@ -59,7 +59,7 @@
 //! state; the `reqwest::Client` is untouched.
 
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use rustls::sign::CertifiedKey;
@@ -548,6 +548,41 @@ const REFRESH_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
 /// propagation and Dart's rethrow, `control_token_provider.dart:149`).
 const MINT_FAILED_REDACTED: &str = "control token mint failed";
 
+/// The wait after a held-user refusal ([`held_user_refusal`]) before this provider asks
+/// for another certificate (plan 037 A23): the first refusal waits this long, each
+/// refusal after it twice as long as the one before, up to [`REFUSAL_BACKOFF_CEILING`];
+/// an adopted credential resets it. Without it every request re-enrolled, and the
+/// server issued a certificate for the other user each time, to be thrown away.
+///
+/// The same schedule as the broker's credential streams, whose copy is `INITIAL_BACKOFF`
+/// and `MAX_BACKOFF` in `crates/shed-broker/src/bus.rs` (shed-core cannot depend on
+/// shed-broker). Keep the two equal.
+///
+/// The wait is measured on the monotonic clock ([`ControlTokenProvider`]'s `now_mono`),
+/// to the full resolution of [`Instant`]: a wall clock read in whole seconds would let a
+/// refusal at 1000.999 s allow the next enrolment at 1001.000 s, and a wall clock set
+/// back would stretch the wait by as much.
+const REFUSAL_BACKOFF_FLOOR: Duration = Duration::from_secs(1);
+/// The longest wait between two enrolments while a held-user refusal lasts, so a server
+/// that issues the held user's certificate again is used within this long, unless the
+/// provider is configured with a longer mint cooldown
+/// ([`ControlTokenProvider::with_mint_cooldown`]), which a refusal then waits instead.
+/// The desktop app configures none.
+const REFUSAL_BACKOFF_CEILING: Duration = Duration::from_secs(30);
+
+/// The longest wait a refusal's deadline is computed for: a configured mint cooldown
+/// beyond this is held to it, so the deadline on the monotonic clock cannot overflow.
+const REFUSAL_WAIT_LIMIT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// The wait after a held-user refusal, given the wait after the one before it (`None`
+/// when the last mint was not refused).
+fn next_refusal_backoff(prev: Option<Duration>) -> Duration {
+    match prev {
+        None => REFUSAL_BACKOFF_FLOOR,
+        Some(prev) => (prev * 2).min(REFUSAL_BACKOFF_CEILING),
+    }
+}
+
 /// The held-user rule for a certificate a server just issued (plan 037 §3.2.2): `Some`
 /// with the refusal message when it must not be used, `None` when it may be adopted.
 ///
@@ -581,9 +616,12 @@ pub fn held_user_refusal(server: &str, held: Option<&str>, issued: &CertUser) ->
                     "held to a user in config.yaml that is not a valid user name".to_string()
                 };
                 let fix = match shell_server_name(server) {
+                    // `/path/to/key` is the Go CLI's placeholder too
+                    // (`internal/config/entrycert.go`, `identityFilePlaceholder`): pasted
+                    // as it stands it holds no shell metacharacter.
                     Some(word) => format!(
                         "Fix it with the shed CLI (shed server update {word} --identity-file \
-                         <key>, or --refetch --allow-user-change), then restart the app."
+                         /path/to/key, or --refetch --allow-user-change), then restart the app."
                     ),
                     // No command line a person could paste: the same advice in words.
                     None => format!(
@@ -667,6 +705,25 @@ enum AdoptFailure {
     /// Any other failure (the key does not match, the certificate cannot be read, an
     /// empty token): its text is returned to the immediate caller and never kept.
     Other(ShedError),
+}
+
+/// A failed [`ControlTokenProvider::credential_checked`]: the caller's error, and
+/// whether it is the held-user refusal ([`held_user_refusal`]), freshly made or kept
+/// while the provider backs off. Only the client in this crate reads the flag: a request
+/// that a held-user refusal leaves with nothing to present is not sent at all
+/// (`http::Client::send_authed`), since no server could authenticate it.
+pub(crate) struct CredentialFailure {
+    pub(crate) error: ShedError,
+    pub(crate) held_user_refused: bool,
+}
+
+impl CredentialFailure {
+    fn other(error: ShedError) -> Self {
+        Self {
+            error,
+            held_user_refused: false,
+        }
+    }
 }
 
 /// A minted credential that passed every check, ready to be stored.
@@ -1190,6 +1247,16 @@ struct State {
     /// else the first named certificate adopted, in memory. Changes only from `None`
     /// to a name, in the same critical section that adopts that certificate.
     held_user: Option<String>,
+    /// The wait set after the last held-user refusal, while refusals follow one another
+    /// ([`next_refusal_backoff`]); `None` once a credential is adopted. Only an adoption
+    /// resets it: another kind of failure in between leaves it as it is.
+    refusal_backoff: Option<Duration>,
+    /// The monotonic instant before which no mint is attempted after a held-user
+    /// refusal: the refusal's own wait, or the configured mint cooldown when that is
+    /// longer, counted from the end of the refused mint. `None` once a credential is
+    /// adopted. Kept apart from the wall-clock [`Self::cooldown_until`], which every
+    /// other failure still uses as before.
+    refusal_until: Option<Instant>,
 }
 
 impl State {
@@ -1236,6 +1303,9 @@ pub struct ControlTokenProvider {
     /// The clock, unix SECONDS (an `Arc<dyn Fn>` so tests can drive advancing
     /// time — a bare `fn` pointer can't capture per-test mutable state).
     now_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// The monotonic clock the held-user refusal's wait is measured on
+    /// ([`State::refusal_until`]): [`Instant::now`], replaced only by tests.
+    now_mono: Arc<dyn Fn() -> Instant + Send + Sync>,
     refresh_window: Duration,
     /// Deterministic per-name refresh jitter, derived ONCE from the server
     /// name by [`Self::with_name_jitter`]. Subtracted from the refresh
@@ -1263,6 +1333,7 @@ impl ControlTokenProvider {
             server,
             minter,
             now_unix: Arc::new(default_now_unix),
+            now_mono: Arc::new(Instant::now),
             refresh_window: REFRESH_WINDOW,
             jitter: Duration::ZERO,
             mint_cooldown: Duration::ZERO,
@@ -1301,6 +1372,17 @@ impl ControlTokenProvider {
         self
     }
 
+    /// Replace the monotonic clock the held-user refusal's wait is measured on (tests
+    /// only: production always uses [`Instant::now`]).
+    #[cfg(test)]
+    pub(crate) fn with_mono_now(
+        mut self,
+        now: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> Self {
+        self.now_mono = Arc::new(now);
+        self
+    }
+
     /// Refresh this long before expiry (default [`REFRESH_WINDOW`], 2h —
     /// unchanged desktop behavior; mobile passes 2h5m).
     pub fn with_refresh_window(mut self, window: Duration) -> Self {
@@ -1327,7 +1409,9 @@ impl ControlTokenProvider {
     /// elapsed — a polling caller can't storm a host with doomed mints
     /// (`control_token_provider.dart:107-123`). During the cooldown `token()`
     /// returns the cached still-valid token if one exists, else the recorded
-    /// last error. Default `0` = off (every call may attempt a mint).
+    /// last error. Default `0` = off (every call may attempt a mint), except after a
+    /// held-user refusal, which always waits its own backoff ([`next_refusal_backoff`]),
+    /// or this cooldown when it is longer.
     pub fn with_mint_cooldown(mut self, cooldown: Duration) -> Self {
         self.mint_cooldown = cooldown;
         self
@@ -1337,7 +1421,16 @@ impl ControlTokenProvider {
     /// shed CLI). A certificate issued for any other named user, or one that names no
     /// user, is refused at adoption: nothing is cached or presented, the credential
     /// already held stays, and the refusal is the error (and the kept last error). A
-    /// certificate for the implicit user is still adopted and changes nothing.
+    /// certificate for the implicit user is still adopted and changes nothing. After a
+    /// refusal no certificate is asked for until its backoff has passed (1 s, doubling
+    /// to 30 s, or the configured mint cooldown when that is longer; reset by an
+    /// adoption); every call in between gets the same refusal.
+    ///
+    /// The held user is given once, here, when the app builds its clients at start
+    /// (plan 037 §3.2.2): this provider never rereads `config.yaml`, and a change to it
+    /// does not reset the wait; an adopted credential or an app restart does. After the
+    /// entry is fixed, restart the app; without a restart the next attempt comes within
+    /// the wait.
     ///
     /// `None` (or an empty name) holds no user: the first named certificate adopted
     /// sets it, in memory, for the life of this provider. Config wins: a held user given
@@ -1401,6 +1494,12 @@ impl ControlTokenProvider {
     /// it. Expiry cannot express that state — a credential you never had has no
     /// expiry to be near — so [`Credential::usable`] is checked separately.
     pub async fn credential(&self) -> Result<Credential, ShedError> {
+        self.credential_checked().await.map_err(|f| f.error)
+    }
+
+    /// [`Self::credential`], with whether a failure is the held-user refusal
+    /// ([`CredentialFailure`]).
+    pub(crate) async fn credential_checked(&self) -> Result<Credential, CredentialFailure> {
         // Hold the lock across the mint so concurrent callers serialize: the
         // first mints, the rest re-check here and return its result.
         let mut st = self.state.lock().await;
@@ -1591,15 +1690,35 @@ impl ControlTokenProvider {
     /// text) and returns it as [`ShedError::Config`]; any other adoption failure
     /// records the fixed marker. Every outcome is recorded under the state lock
     /// held across the mint, so no other caller can start a mint before it.
-    async fn mint_locked(&self, st: &mut State, now: u64) -> Result<Credential, ShedError> {
+    ///
+    /// A held-user refusal also starts the refusal backoff ([`next_refusal_backoff`]):
+    /// until it has passed no mint is attempted (so the server issues no more
+    /// certificates for the other user), and every call gets the same refusal, flagged
+    /// as one ([`CredentialFailure`]). Its wait is the backoff or the configured mint
+    /// cooldown, whichever is longer, measured on the monotonic clock
+    /// ([`State::refusal_until`]), never on the wall clock the other failures use.
+    async fn mint_locked(&self, st: &mut State, now: u64) -> Result<Credential, CredentialFailure> {
+        if let Some(until) = st.refusal_until {
+            if (self.now_mono)() < until {
+                return Err(CredentialFailure {
+                    error: last_error(st),
+                    held_user_refused: matches!(st.last_error, Some(LastError::Refused(_))),
+                });
+            }
+        }
         if now < st.cooldown_until {
-            return Err(last_error(st));
+            return Err(CredentialFailure {
+                error: last_error(st),
+                held_user_refused: matches!(st.last_error, Some(LastError::Refused(_))),
+            });
         }
         // A fresh keypair per mint keeps key lifetime == certificate lifetime
         // (plan 001 D5). Generated only for a minter that can actually carry a
         // CSR, so token-only minters pay nothing.
         let keypair = if self.minter.supports_mtls() {
-            Some(Arc::new(ClientKeyPair::generate()?))
+            Some(Arc::new(
+                ClientKeyPair::generate().map_err(CredentialFailure::other)?,
+            ))
         } else {
             None
         };
@@ -1608,7 +1727,13 @@ impl ControlTokenProvider {
         };
         let minted = match self.minter.mint_credential(&self.server, &req).await {
             Ok(minted) => minted,
-            Err(e) => return Err(self.record_failure(st, LastError::Redacted, e)),
+            Err(e) => {
+                return Err(CredentialFailure::other(self.record_failure(
+                    st,
+                    LastError::Redacted,
+                    e,
+                )))
+            }
         };
         match self.adopt(minted, keypair.as_ref(), st.held_user.as_deref()) {
             Ok(adopted) => {
@@ -1623,6 +1748,8 @@ impl ControlTokenProvider {
                 st.cached = Some(cred.clone());
                 st.keypair = adopted.keypair;
                 st.last_error = None;
+                st.refusal_backoff = None;
+                st.refusal_until = None;
                 st.last_announced_mode = cred.mode;
                 // Present (mtls) or withdraw (token) the certificate BEFORE
                 // returning: the caller's very next request may handshake.
@@ -1634,19 +1761,39 @@ impl ControlTokenProvider {
                 // The held credential stays (it is presented while still valid),
                 // but only after a positive check that it is for the user held.
                 self.keep_only_held_locked(st);
-                Err(self.record_failure(
-                    st,
-                    LastError::Refused(msg.clone()),
-                    ShedError::Config(msg),
-                ))
+                let wait = next_refusal_backoff(st.refusal_backoff);
+                st.refusal_backoff = Some(wait);
+                // The whole wait, the configured cooldown included, on the monotonic
+                // clock read after the mint (it took time): the wall-clock cooldown is
+                // cleared, so neither a sub-second refusal time nor a wall clock moved
+                // either way can shorten or stretch it.
+                // A configured cooldown too long for the clock to hold is held to a
+                // year, not allowed to overflow the deadline.
+                let now = (self.now_mono)();
+                let whole = wait.max(self.mint_cooldown).min(REFUSAL_WAIT_LIMIT);
+                st.refusal_until = Some(
+                    now.checked_add(whole)
+                        .or_else(|| now.checked_add(wait))
+                        .unwrap_or(now),
+                );
+                st.cooldown_until = 0;
+                st.last_error = Some(LastError::Refused(msg.clone()));
+                Err(CredentialFailure {
+                    error: ShedError::Config(msg),
+                    held_user_refused: true,
+                })
             }
-            Err(AdoptFailure::Other(e)) => Err(self.record_failure(st, LastError::Redacted, e)),
+            Err(AdoptFailure::Other(e)) => Err(CredentialFailure::other(self.record_failure(
+                st,
+                LastError::Redacted,
+                e,
+            ))),
         }
     }
 
     /// Record a failed mint or adoption under the held state lock: start the
     /// cooldown and keep `kept` as the last error. Returns `e` for the immediate
-    /// caller.
+    /// caller. (A held-user refusal records its own wait instead.)
     fn record_failure(&self, st: &mut State, kept: LastError, e: ShedError) -> ShedError {
         // Fresh clock read for the cooldown start (Dart `_doMint`
         // re-reads `_now()`, `:147` — the mint itself took time).
@@ -1822,6 +1969,67 @@ fn default_now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// A test clock for a [`ControlTokenProvider`]: a wall clock in milliseconds, read by
+/// the provider in whole unix seconds ([`ControlTokenProvider::with_now`]), and a
+/// monotonic clock in milliseconds ([`ControlTokenProvider::with_mono_now`]).
+/// [`Self::advance`] moves both, as time passing does; [`Self::set_wall_back`] and
+/// [`Self::set_wall_forward`] move only the wall clock, as a person or NTP setting it does.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestClock {
+    wall_ms: Arc<std::sync::atomic::AtomicU64>,
+    mono_ms: Arc<std::sync::atomic::AtomicU64>,
+    base: Instant,
+}
+
+#[cfg(test)]
+impl TestClock {
+    /// A clock whose wall time starts at `wall_ms` milliseconds after the epoch.
+    pub(crate) fn at_wall_ms(wall_ms: u64) -> Self {
+        Self {
+            wall_ms: Arc::new(std::sync::atomic::AtomicU64::new(wall_ms)),
+            mono_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            base: Instant::now(),
+        }
+    }
+
+    pub(crate) fn new() -> Self {
+        Self::at_wall_ms(1_000_000_000)
+    }
+
+    /// `p` reading both of this clock's halves.
+    pub(crate) fn on(&self, p: ControlTokenProvider) -> ControlTokenProvider {
+        use std::sync::atomic::Ordering;
+        let wall = self.wall_ms.clone();
+        let mono = self.mono_ms.clone();
+        let base = self.base;
+        p.with_now(move || wall.load(Ordering::SeqCst) / 1000)
+            .with_mono_now(move || base + Duration::from_millis(mono.load(Ordering::SeqCst)))
+    }
+
+    /// Time passes: both clocks move by `by`.
+    pub(crate) fn advance(&self, by: Duration) {
+        use std::sync::atomic::Ordering;
+        let ms = by.as_millis() as u64;
+        self.wall_ms.fetch_add(ms, Ordering::SeqCst);
+        self.mono_ms.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    /// The wall clock is set back by `by`; no time passes.
+    pub(crate) fn set_wall_back(&self, by: Duration) {
+        use std::sync::atomic::Ordering;
+        self.wall_ms
+            .fetch_sub(by.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// The wall clock is set forward by `by`; no time passes.
+    pub(crate) fn set_wall_forward(&self, by: Duration) {
+        use std::sync::atomic::Ordering;
+        self.wall_ms
+            .fetch_add(by.as_millis() as u64, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -3875,8 +4083,8 @@ mod held_user_tests {
 
     const MISMATCH: &str = "server \"shed\": the server issued a certificate for user \"admin\", \
         but this entry is held to \"pat\"; it was not used. Fix it with the shed CLI (shed \
-        server update shed --identity-file <key>, or --refetch --allow-user-change), then \
-        restart the app.";
+        server update shed --identity-file /path/to/key, or --refetch --allow-user-change), \
+        then restart the app.";
     const NO_USER: &str = "server \"shed\": the server issued a certificate that names no user \
         (a shed-server older than 0.10.0); it was not used. Upgrade the server, then restart \
         the app.";
@@ -3941,13 +4149,13 @@ mod held_user_tests {
 
     /// The unquoted characters of the command a refusal suggests, read the way a POSIX
     /// shell reads the pasted text: from `(shed server update ` to the first unquoted `,`
-    /// that ends it, with `'…'` quoted and `\x` escaped. The `<key>` placeholder is first
-    /// replaced with a path, as the person replacing it does. `None` when the message
-    /// suggests no command line.
+    /// that ends it, with `'…'` quoted and `\x` escaped. The text is read exactly as the
+    /// message gives it, placeholder included: a person may paste it before replacing
+    /// anything, so the placeholder too must hold no shell metacharacter. `None` when the
+    /// message suggests no command line.
     fn unquoted_command_chars(msg: &str) -> Option<String> {
         let start = msg.find("(shed server update ")? + 1;
-        let cmd = msg[start..].replacen("<key>", "/home/pat/.ssh/id_ed25519", 1);
-        let (mut out, mut quoted, mut chars) = (String::new(), false, cmd.chars());
+        let (mut out, mut quoted, mut chars) = (String::new(), false, msg[start..].chars());
         while let Some(c) = chars.next() {
             match (quoted, c) {
                 (true, '\'') => quoted = false,
@@ -3979,7 +4187,7 @@ mod held_user_tests {
             match word {
                 Some(word) => assert!(
                     msg.contains(&format!(
-                        "(shed server update {word} --identity-file <key>,"
+                        "(shed server update {word} --identity-file /path/to/key,"
                     )),
                     "{msg}"
                 ),
@@ -3993,7 +4201,10 @@ mod held_user_tests {
                         )),
                         "{msg}"
                     );
-                    assert!(!msg.contains("<key>") && !msg.contains("<name>"), "{msg}");
+                    assert!(
+                        !msg.contains("/path/to/key") && !msg.contains("<name>"),
+                        "{msg}"
+                    );
                 }
             }
             let unbound = held_user_refusal(server, None, &CertUser::Unbound).unwrap();
@@ -4137,13 +4348,230 @@ mod held_user_tests {
     #[tokio::test]
     async fn the_held_user_from_config_wins_over_what_is_minted() {
         // Config says pat; the first certificate the server issues is admin's.
-        // Nothing binds to admin: it is refused, and pat's is then adopted.
+        // Nothing binds to admin: it is refused, and pat's is then adopted (once the
+        // refusal's backoff has passed).
         let minter = UserMinter::new(vec![sign("admin"), sign("pat")]);
-        let p = ControlTokenProvider::new("shed".into(), minter).with_held_user(Some("pat".into()));
+        let clock = TestClock::new();
+        let p =
+            clock
+                .on(ControlTokenProvider::new("shed".into(), minter)
+                    .with_held_user(Some("pat".into())));
         assert!(p.credential().await.is_err());
         assert_eq!(held(&p).await.as_deref(), Some("pat"));
+        clock.advance(REFUSAL_BACKOFF_FLOOR);
         assert_eq!(p.credential().await.unwrap().cert_serial, "2");
         assert_eq!(held(&p).await.as_deref(), Some("pat"));
+    }
+
+    /// The refusal's wait is measured to the millisecond on the monotonic clock: a
+    /// refusal at wall time 1000.999 s waits a whole second, not until the wall clock
+    /// reads 1001 (one millisecond later).
+    #[tokio::test]
+    async fn a_refusal_just_before_a_second_boundary_waits_the_whole_first_wait() {
+        let minter = UserMinter::new(vec![sign("admin")]);
+        let clock = TestClock::at_wall_ms(1_000_999);
+        let p = clock.on(ControlTokenProvider::new("shed".into(), minter.clone())
+            .with_held_user(Some("pat".into())));
+        assert!(p.credential().await.is_err());
+        assert_eq!(minter.calls(), 1);
+        clock.advance(Duration::from_millis(999));
+        for _ in 0..3 {
+            let f = p.credential_checked().await.unwrap_err();
+            assert!(f.held_user_refused);
+        }
+        assert_eq!(minter.calls(), 1, "no enrolment 999 ms after the refusal");
+        clock.advance(Duration::from_millis(1));
+        assert!(p.credential().await.is_err());
+        assert_eq!(
+            minter.calls(),
+            2,
+            "one enrolment once the second has passed"
+        );
+    }
+
+    /// The wall clock set back or forward during a wait changes nothing: the next
+    /// enrolment comes when the wait has passed, and not before.
+    #[tokio::test]
+    async fn a_wall_clock_moved_during_a_wait_changes_nothing() {
+        let minter = UserMinter::new(vec![sign("admin")]);
+        let clock = TestClock::new();
+        let p = clock.on(ControlTokenProvider::new("shed".into(), minter.clone())
+            .with_held_user(Some("pat".into())));
+        let hour = Duration::from_secs(3600);
+
+        // First wait, 1 s: the wall clock is set back an hour.
+        assert!(p.credential().await.is_err());
+        clock.set_wall_back(hour);
+        clock.advance(Duration::from_millis(999));
+        assert!(p.credential().await.is_err());
+        assert_eq!(minter.calls(), 1);
+        clock.advance(Duration::from_millis(1));
+        assert!(p.credential().await.is_err());
+        assert_eq!(minter.calls(), 2, "set back an hour: still one second");
+
+        // Second wait, 2 s: the wall clock is set forward an hour.
+        clock.set_wall_forward(hour);
+        assert!(p.credential().await.is_err());
+        clock.advance(Duration::from_millis(1999));
+        assert!(p.credential().await.is_err());
+        assert_eq!(minter.calls(), 2, "set forward an hour: no early enrolment");
+        clock.advance(Duration::from_millis(1));
+        assert!(p.credential().await.is_err());
+        assert_eq!(minter.calls(), 3, "and the wait still ends on time");
+    }
+
+    /// A provider configured with a mint cooldown longer than the refusal's wait never
+    /// enrols more often than that cooldown, whatever the backoff says.
+    #[tokio::test]
+    async fn a_longer_configured_cooldown_bounds_the_refusal_wait() {
+        let minter = UserMinter::new(vec![sign("admin")]);
+        let clock = TestClock::new();
+        let p = clock.on(ControlTokenProvider::new("shed".into(), minter.clone())
+            .with_held_user(Some("pat".into()))
+            .with_mint_cooldown(Duration::from_secs(600)));
+        assert!(p.credential().await.is_err());
+        clock.advance(Duration::from_secs(599));
+        assert!(p.credential().await.is_err());
+        assert_eq!(minter.calls(), 1, "no enrolment inside the 600 s cooldown");
+        clock.advance(Duration::from_secs(1));
+        assert!(p.credential().await.is_err());
+        assert_eq!(minter.calls(), 2);
+    }
+
+    /// A configured cooldown too long for the monotonic clock to hold does not panic:
+    /// the refusal is returned, and the wait holds (at its limit of a year).
+    #[tokio::test]
+    async fn a_cooldown_too_long_for_the_clock_does_not_overflow() {
+        let minter = UserMinter::new(vec![sign("admin")]);
+        let clock = TestClock::new();
+        let p = clock.on(ControlTokenProvider::new("shed".into(), minter.clone())
+            .with_held_user(Some("pat".into()))
+            .with_mint_cooldown(Duration::from_secs(1_u64 << 63)));
+        assert!(matches!(p.credential().await, Err(ShedError::Config(m)) if m == MISMATCH));
+        clock.advance(Duration::from_secs(364 * 24 * 60 * 60));
+        assert!(p.credential().await.is_err());
+        assert_eq!(minter.calls(), 1, "no enrolment inside the wait");
+        clock.advance(Duration::from_secs(24 * 60 * 60));
+        assert!(p.credential().await.is_err());
+        assert_eq!(minter.calls(), 2, "the wait ends at its limit");
+    }
+
+    /// While the server keeps issuing another user's certificate, the provider asks for
+    /// one at most once per backoff: N calls in a row inside the first wait cause one
+    /// enrolment, and each gets the same refusal; the next enrolment happens only once
+    /// the clock passes the wait, which doubles per refusal (1, 2, 4, 8, 16 s) up to 30 s.
+    #[tokio::test]
+    async fn a_refusal_backs_off_before_the_next_enrolment() {
+        const N: usize = 12;
+        let minter = UserMinter::new(vec![sign("admin")]);
+        let clock = TestClock::new();
+        let p = clock.on(ControlTokenProvider::new("shed".into(), minter.clone())
+            .with_held_user(Some("pat".into())));
+        let refused = |r: Result<Credential, ShedError>| match r {
+            Err(ShedError::Config(m)) => assert_eq!(m, MISMATCH),
+            other => panic!("want the refusal, got {other:?}"),
+        };
+        for _ in 0..N {
+            refused(p.credential().await);
+        }
+        assert_eq!(minter.calls(), 1, "one enrolment inside the first wait");
+        for (i, wait) in [1u64, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            // One second short of the wait: still the refusal, no enrolment.
+            clock.advance(Duration::from_secs(wait - 1));
+            for _ in 0..3 {
+                refused(p.credential().await);
+            }
+            assert_eq!(minter.calls(), i + 1, "inside wait {wait}s");
+            // The wait has passed: the next call enrols once more (and is refused).
+            clock.advance(Duration::from_secs(1));
+            refused(p.credential().await);
+            assert_eq!(minter.calls(), i + 2, "after wait {wait}s");
+        }
+        assert!(p.cert_resolver().current().is_none(), "nothing armed");
+    }
+
+    /// An adopted certificate resets the backoff: the next refusal waits the first wait
+    /// again, not the doubled one.
+    #[tokio::test]
+    async fn an_adoption_resets_the_refusal_backoff() {
+        let minter = UserMinter::new(vec![
+            sign("admin"),
+            sign("admin"),
+            sign("pat"),
+            sign("admin"),
+        ]);
+        let clock = TestClock::new();
+        let p = clock.on(ControlTokenProvider::new("shed".into(), minter.clone())
+            .with_held_user(Some("pat".into())));
+        assert!(p.credential().await.is_err()); // admin: wait 1 s
+        clock.advance(Duration::from_secs(1));
+        assert!(p.credential().await.is_err()); // admin: wait 2 s
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(p.credential().await.unwrap().cert_serial, "3"); // pat: adopted
+        p.invalidate().await;
+        assert!(p.credential().await.is_err()); // admin: wait 1 s again, not 4 s
+        assert_eq!(minter.calls(), 4);
+        clock.advance(Duration::from_secs(1));
+        assert!(p.credential().await.is_err());
+        assert_eq!(
+            minter.calls(),
+            5,
+            "the wait after an adoption is the first one"
+        );
+        assert_eq!(kept(&p).await, Some(format!("refused: {MISMATCH}")));
+    }
+
+    /// Recovery needs no step: once the server issues the held user's certificate
+    /// again, the first call after the wait adopts it, and the provider is held as
+    /// before.
+    #[tokio::test]
+    async fn recovery_after_a_refusal_is_automatic() {
+        let minter = UserMinter::new(vec![sign("admin"), sign("admin"), sign("pat")]);
+        let clock = TestClock::new();
+        let p = clock.on(ControlTokenProvider::new("shed".into(), minter.clone())
+            .with_held_user(Some("pat".into())));
+        assert!(p.credential().await.is_err());
+        clock.advance(REFUSAL_BACKOFF_FLOOR);
+        assert!(p.credential().await.is_err());
+        clock.advance(REFUSAL_BACKOFF_CEILING);
+        assert_eq!(p.credential().await.unwrap().cert_serial, "3");
+        assert!(p.cert_resolver().current().is_some());
+        assert_eq!(kept(&p).await, None);
+    }
+
+    /// Only a held-user refusal backs off: a minter that fails outright is retried as
+    /// before (no cooldown is configured here, so every call mints).
+    #[tokio::test]
+    async fn another_mint_failure_does_not_back_off() {
+        let minter = UserMinter::new(vec![Answer::Fail(ShedError::Transport(
+            "ssh: connection refused".into(),
+        ))]);
+        let clock = TestClock::new();
+        let p = clock.on(ControlTokenProvider::new("shed".into(), minter.clone())
+            .with_held_user(Some("pat".into())));
+        for _ in 0..5 {
+            let f = p.credential_checked().await.unwrap_err();
+            assert!(!f.held_user_refused);
+        }
+        assert_eq!(minter.calls(), 5);
+    }
+
+    /// The flag the client reads: set on the refusal and on every call the backoff
+    /// answers, never on another failure.
+    #[tokio::test]
+    async fn the_refusal_is_flagged_while_it_backs_off() {
+        let minter = UserMinter::new(vec![sign("admin")]);
+        let p = ControlTokenProvider::new("shed".into(), minter).with_held_user(Some("pat".into()));
+        for _ in 0..3 {
+            let f = p.credential_checked().await.unwrap_err();
+            assert!(f.held_user_refused);
+            assert!(matches!(&f.error, ShedError::Config(m) if m == MISMATCH));
+        }
+        let p = ControlTokenProvider::new(
+            "shed".into(),
+            UserMinter::new(vec![Answer::Sign(TestUser::Unreadable)]),
+        );
+        assert!(!p.credential_checked().await.unwrap_err().held_user_refused);
     }
 
     #[tokio::test]

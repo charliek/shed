@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -302,6 +303,90 @@ func TestAuditLogReachesBothFrontDoors(t *testing.T) {
 	}
 	if ev := r.events(t); ev[audit.EventExecEnd] != 1 || ev[audit.EventSSH] != 1 {
 		t.Errorf("the one log holds %v, want one exec.end and one ssh line", ev)
+	}
+}
+
+// syncBuffer is a log destination safe to read while servers may still log.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestFrontDoorsShutdownLogsEachStepOnce: a graceful stop logs the entry
+// gates closing once, before any door's shutdown line (they close first),
+// and each door's shutdown line exactly once; the SSH server's own shutdown
+// adds no second line. No line from the signal on appears twice.
+func TestFrontDoorsShutdownLogsEachStepOnce(t *testing.T) {
+	logs := &syncBuffer{}
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(logs)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) })
+
+	r := startFrontDoors(t, &ownedShedBackend{})
+	_ = r.sshClient(t).Close() // the doors serve; no connection holds the shutdown up
+	r.signals <- syscall.SIGTERM
+	if err := r.wait(t); err != nil {
+		t.Fatalf("runFrontDoors = %v", err)
+	}
+
+	all := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	start := -1
+	for i, l := range all {
+		if strings.HasPrefix(l, "Received signal ") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatalf("no signal line in the log:\n%s", logs.String())
+	}
+	lines := all[start:]
+	seen := map[string]int{}
+	gate := -1
+	for i, l := range lines {
+		seen[l]++
+		if l == "Closing entry gates..." && gate < 0 {
+			gate = i
+		}
+	}
+	for l, n := range seen {
+		if n > 1 {
+			t.Errorf("%q logged %d times in the shutdown", l, n)
+		}
+	}
+	if gate < 0 {
+		t.Fatalf("no entry-gate line in the shutdown:\n%s", strings.Join(lines, "\n"))
+	}
+	doors := 0
+	for i, l := range lines {
+		if !strings.HasPrefix(l, "Shutting down ") {
+			continue
+		}
+		doors++
+		if i < gate {
+			t.Errorf("%q logged before the entry gates closed", l)
+		}
+	}
+	for _, want := range []string{"Shutting down test server...", "Shutting down Connect tunnels...", "Shutting down SSH server..."} {
+		if seen[want] != 1 {
+			t.Errorf("%q logged %d times, want once", want, seen[want])
+		}
+	}
+	if doors != 3 {
+		t.Errorf("%d door shutdown lines, want 3:\n%s", doors, strings.Join(lines, "\n"))
 	}
 }
 

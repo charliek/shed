@@ -273,6 +273,9 @@ All notable changes to this project will be documented in this file.
   the URL a redirect names; before, an endpoint holding the pinned certificate could pass a
   bearer token on to a plain-`http` URL. shed-server's API answers no request with a
   redirect, so nothing that works today changes.
+- **Server: a graceful stop logs each step once.** `Shutting down SSH server...` was written
+  twice; and a new line, `Closing entry gates...`, comes before every server's shutdown line,
+  when the gates for entries into service clients' sheds close.
 - **Desktop: a cloud shed that is stopping shows `stopping`, and a shed's reason shows beside
   its status.** The shared core now decodes the remote backend's `stopping` status (it read
   `unknown`) and a shed's `status_reason`. The Sheds pane shows the reason the way `shed list`
@@ -882,7 +885,15 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   user name is never read as no user. A certificate for another named user, or one that names no user (a shed-server older
   than 0.10.0), is refused: nothing is stored, the held credential stays, and the message
   (the host error, and the broker's last error in `broker.status`) names both users and the
-  fix. A stored broker certificate that fails the same check is not presented and the broker
+  fix. While a refusal lasts, the app's control requests ask the server for a certificate
+  again only after a wait (1 s, doubling to 30 s, the broker's own schedule, measured on a
+  monotonic clock), and a request with nothing the server would accept is not sent, by the
+  control path or by the credential broker (its subscription, its answers and its egress
+  stream): it fails at once with the refusal alone. A still-valid certificate for the entry's
+  user keeps being used. Once the server issues a certificate for the entry's user again, the
+  app uses it within 30 seconds, with no restart; a change to `config.yaml` does not reset the
+  wait, so restart the app after fixing the entry. The refusal suggests `--identity-file /path/to/key`, as the CLI
+  does. A stored broker certificate that fails the same check is not presented and the broker
   enrols again. Restart the app after an entry's user changes; run `shed server update <name>
   --refetch` once so `config.yaml` records the user. See [Desktop
   configuration](https://charliek.github.io/shed/desktop/configuration/#the-user-an-entry-is-held-to).

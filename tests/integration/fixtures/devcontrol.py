@@ -916,13 +916,24 @@ _DEFAULT_IDENTITY = "id_ed25519"
 @contextmanager
 def isolated_home_with_identity() -> Iterator[str]:
     """A throwaway `$HOME` carrying a copy of the developer's real default SSH
-    identity, so system `ssh`'s default identity-file resolution (which honors
-    the `HOME` env var for `~/.ssh/id_ed25519`) finds a usable key without
-    depending on an ssh-agent being loaded. `shed server add`'s SSH-first
-    bootstrap shells out to the real `ssh` binary (`sdk/bootstrap`), so this
-    is what lets an add run against a config- and creds-isolated `$HOME`
-    (never the developer's real `~/.shed/config.yaml`) while still
-    authenticating as a key the dev server allowlists.
+    identity (`~/.ssh/id_ed25519` and its `.pub`), so that `shed server add`
+    can run against a config- and creds-isolated `$HOME` (never the
+    developer's real `~/.shed/config.yaml`) while still authenticating as a
+    key the dev server allowlists.
+
+    What this does and does not prove: the shed CLI takes the home directory
+    from `$HOME` (`$HOME` in this docstring is shell notation for the scratch
+    home directory, never text for a config field). A key given to
+    `--identity-file` as `~/.ssh/id_ed25519` is expanded from it and stored as
+    the absolute path of the copy in the scratch home; a stored
+    `identity_file` is an absolute path, in which the CLI expands nothing.
+    System `ssh` does not use `$HOME`: OpenSSH
+    takes the home directory for its default `~/.ssh/id_*` keys and
+    `~/.ssh/config` from the password database, not from `$HOME`. An `ssh`
+    that is not given `-i` (`shed server add`'s SSH-first bootstrap shells
+    out to the real `ssh`, `sdk/bootstrap`) therefore still offers the keys of
+    the account's real home directory, and those of a loaded ssh-agent; that
+    such an add authenticates says nothing about the copy here.
 
     Skips the calling test if no default identity exists to copy."""
     priv = _REAL_SSH_DIR / _DEFAULT_IDENTITY

@@ -112,8 +112,20 @@ CLI writes `user` when it enrols the entry; the app only reads it.
   ```text
   server "buildbox": the server issued a certificate for user "admin", but this entry is held
   to "pat"; it was not used. Fix it with the shed CLI (shed server update buildbox
-  --identity-file <key>, or --refetch --allow-user-change), then restart the app.
+  --identity-file /path/to/key, or --refetch --allow-user-change), then restart the app.
   ```
+
+  While the server keeps issuing the other user's certificate, the app asks it for one again
+  only after a wait: 1 second after the first refusal, then 2, 4, 8 and 16 seconds, then
+  every 30 seconds. While the app still holds an earlier certificate for the entry's user
+  that has not expired, it keeps using it. When it holds no usable certificate for that user,
+  a request is refused: it fails at once with the same message and is not sent. When the
+  server issues a certificate for the entry's user again (for example, the user's key is back
+  in its list), the app uses it within 30 seconds, with no restart.
+
+  The wait starts again from 1 second when a certificate for the entry's user is used, or
+  when the app restarts; a change to `config.yaml` does not reset it. After fixing the entry,
+  restart the app; without a restart, the next attempt comes within the wait.
 
 - **A certificate that names no user is refused.** Only a shed-server older than 0.10.0 issues
   one:

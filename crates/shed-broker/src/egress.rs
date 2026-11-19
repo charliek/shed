@@ -169,6 +169,18 @@ pub trait EgressTokenSource: Send + Sync {
     fn surviving_token(&self) -> Option<String> {
         None
     }
+    /// Whether a certificate identity is armed on the transport (see the bus
+    /// `TokenProvider::presenting_certificate`). Default `false`.
+    fn presenting_certificate(&self) -> bool {
+        false
+    }
+    /// [`Self::token`] for one request; on failure also whether it is the held-user
+    /// rule's refusal of the certificate the mint THIS call made or joined was issued
+    /// ([`crate::minter::ObtainError::held_user`]). Default: [`Self::token`], never
+    /// that refusal.
+    async fn token_for_request(&self) -> Result<String, (String, bool)> {
+        self.token().await.map_err(|e| (e, false))
+    }
 }
 
 /// Bridge the caching, invalidatable control-token source onto [`EgressTokenSource`].
@@ -190,6 +202,14 @@ impl EgressTokenSource for Arc<crate::minter::CredentialSource> {
     }
     fn surviving_token(&self) -> Option<String> {
         (**self).surviving_bearer()
+    }
+    fn presenting_certificate(&self) -> bool {
+        (**self).holds_certificate()
+    }
+    async fn token_for_request(&self) -> Result<String, (String, bool)> {
+        crate::minter::CredentialSource::token_for_request(self)
+            .await
+            .map_err(|e| (e.message, e.held_user))
     }
 }
 
@@ -349,12 +369,17 @@ impl EgressSubscriber {
     /// In mtls mode the source resolves to the EMPTY string and no header is sent — the
     /// stream authenticates with the certificate the same source armed on this
     /// subscriber's transport. The mint still runs, which is exactly what arms it.
-    async fn bearer(&self) -> Option<String> {
+    ///
+    /// `Err(refusal)` when the mint was refused by the held-user rule and nothing is held
+    /// to present (no surviving token, no armed certificate): the stream is not opened,
+    /// since the server issues certificates and could not authenticate it, and the
+    /// refusal is its error (plan 037 A23). Every other mint failure is sent as before.
+    async fn bearer(&self) -> Result<Option<String>, String> {
         let tok = match &self.tokens {
             None => self.token.clone(),
-            Some(src) => match src.token().await {
+            Some(src) => match src.token_for_request().await {
                 Ok(t) => t,
-                Err(e) => {
+                Err((e, held_user_refused)) => {
                     // A failed re-mint keeps the surviving bearer on the wire
                     // (Go parity; in mtls state the armed certificate carries
                     // the identity instead and "" stays correct).
@@ -362,15 +387,17 @@ impl EgressSubscriber {
                         "egress: control-token mint failed server={} error={e}",
                         self.server
                     ));
-                    src.surviving_token().unwrap_or_default()
+                    match src.surviving_token() {
+                        Some(t) => t,
+                        None if held_user_refused && !src.presenting_certificate() => {
+                            return Err(e)
+                        }
+                        None => String::new(),
+                    }
                 }
             },
         };
-        if tok.is_empty() {
-            None
-        } else {
-            Some(tok)
-        }
+        Ok(if tok.is_empty() { None } else { Some(tok) })
     }
 
     /// Make one connection and forward decisions until it errors, the stream ends, or
@@ -390,7 +417,12 @@ impl EgressSubscriber {
         // invalidation), so it races shutdown like every other network await.
         let bearer = tokio::select! {
             _ = wait_shutdown(shutdown.clone()) => return Ok(()),
-            t = self.bearer() => t,
+            t = self.bearer() => match t {
+                Ok(t) => t,
+                // Refused for its user with nothing to present: not sent (plan 037 A23);
+                // the loop's normal backoff applies.
+                Err(refusal) => return Err(EgressStreamError::Other(refusal)),
+            },
         };
         if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
@@ -1070,7 +1102,7 @@ mod tests {
             Some(Arc::new(MtlsSource)),
             audit,
         );
-        assert_eq!(sub.bearer().await, None);
+        assert_eq!(sub.bearer().await, Ok(None));
     }
 
     #[tokio::test]
@@ -1078,10 +1110,10 @@ mod tests {
         let audit = CollectingAudit::new();
         // tokens=None + non-empty static token → that token.
         let sub = subscriber("http://x", "static-tok", None, audit.clone());
-        assert_eq!(sub.bearer().await, Some("static-tok".to_string()));
+        assert_eq!(sub.bearer().await, Ok(Some("static-tok".to_string())));
         // tokens=None + empty static token → no header.
         let sub = subscriber("http://x", "", None, audit.clone());
-        assert_eq!(sub.bearer().await, None);
+        assert_eq!(sub.bearer().await, Ok(None));
         // A source that errors on mint → no header (→ 401 → retry).
         let sub = subscriber(
             "http://x",
@@ -1089,6 +1121,168 @@ mod tests {
             Some(FakeTokenSource::erroring()),
             audit,
         );
-        assert_eq!(sub.bearer().await, None);
+        assert_eq!(sub.bearer().await, Ok(None));
+    }
+
+    // ---- plan 037 A23: a held-user refusal with nothing to present sends nothing ----
+
+    /// A plain TCP listener on loopback that counts the connections it accepts and
+    /// answers none: a stream never sent leaves the count at zero.
+    async fn counting_listener() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counted = accepts.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                held.push(sock); // never answered; dropped with the task
+            }
+        });
+        (url, accepts, task)
+    }
+
+    /// A control-scope source whose mint is refused, by the held-user rule or not, with
+    /// or without a certificate still armed.
+    struct RefusingSource {
+        held_user: bool,
+        presenting: bool,
+    }
+    #[async_trait::async_trait]
+    impl EgressTokenSource for RefusingSource {
+        async fn token(&self) -> Result<String, String> {
+            unreachable!("the stream fetches through token_for_request")
+        }
+        fn invalidate(&self) {}
+        fn presenting_certificate(&self) -> bool {
+            self.presenting
+        }
+        async fn token_for_request(&self) -> Result<String, (String, bool)> {
+            Err(("server \"s\": the refusal".into(), self.held_user))
+        }
+    }
+
+    /// A held-user refusal with nothing to present opens no connection: the stream's
+    /// error is the refusal alone.
+    #[tokio::test]
+    async fn a_held_user_refusal_with_nothing_held_opens_no_stream() {
+        let (url, accepts, task) = counting_listener().await;
+        let sub = subscriber(
+            &url,
+            "",
+            Some(Arc::new(RefusingSource {
+                held_user: true,
+                presenting: false,
+            })),
+            CollectingAudit::new(),
+        );
+        for _ in 0..3 {
+            // Bounded: a stream wrongly opened waits on a listener that never answers.
+            match tokio::time::timeout(Duration::from_secs(2), sub.stream(&never_shutdown())).await
+            {
+                Ok(Err(EgressStreamError::Other(m))) => {
+                    assert_eq!(m, "server \"s\": the refusal")
+                }
+                other => panic!(
+                    "want the refusal, got {other:?} with {} connection(s)",
+                    accepts.load(Ordering::SeqCst)
+                ),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 0, "no connection was made");
+        task.abort();
+    }
+
+    /// The same through the real control-scope source: held to `pat`, holding nothing,
+    /// and issued `admin`'s certificate. The bridge carries the held-user flag, so the
+    /// stream is not opened.
+    #[tokio::test]
+    async fn the_credential_source_bridge_carries_the_held_user_refusal() {
+        use crate::minter::tests::{minted_cert_for, TestCa, TestUser};
+        use crate::minter::{Minted, Minter, MinterError};
+        struct AdminMinter(TestCa);
+        #[async_trait::async_trait]
+        impl Minter for AdminMinter {
+            async fn mint(
+                &self,
+                _t: &crate::discovery::ServerTarget,
+                _scope: &str,
+            ) -> Result<Minted, MinterError> {
+                Ok(minted_cert_for(
+                    &self.0,
+                    7,
+                    Some(4_102_444_800),
+                    &TestUser::Named("admin"),
+                ))
+            }
+        }
+        let src = crate::minter::new_credential_source_with_store(
+            Arc::new(AdminMinter(TestCa::new())),
+            crate::discovery::ServerTarget {
+                name: "s".into(),
+                url: "https://h:8443".into(),
+                token: String::new(),
+                tls_fingerprint: String::new(),
+                ssh_host: "h".into(),
+                ssh_port: 2222,
+                auth_mode: String::new(),
+                user: "pat".into(),
+                identity_file: String::new(),
+            },
+            crate::minter::SCOPE_CONTROL,
+            None,
+        );
+        let (url, accepts, task) = counting_listener().await;
+        let sub = subscriber(&url, "", Some(Arc::new(src)), CollectingAudit::new());
+        // Bounded: a stream wrongly opened waits on a listener that never answers.
+        match tokio::time::timeout(Duration::from_secs(2), sub.stream(&never_shutdown())).await {
+            Ok(Err(EgressStreamError::Other(m))) => {
+                assert!(m.contains("held to \"pat\""), "the refusal alone: {m}")
+            }
+            other => panic!(
+                "want the refusal, got {other:?} with {} connection(s)",
+                accepts.load(Ordering::SeqCst)
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 0, "no connection was made");
+        task.abort();
+    }
+
+    /// Every other case still connects: no credential needed (an open server), a
+    /// refusal that is not the held-user rule's, and a held-user refusal while a
+    /// certificate for the held user is still armed.
+    #[tokio::test]
+    async fn every_other_case_still_opens_the_stream() {
+        let cases: Vec<Option<Arc<dyn EgressTokenSource>>> = vec![
+            None,
+            Some(Arc::new(RefusingSource {
+                held_user: false,
+                presenting: false,
+            })),
+            Some(Arc::new(RefusingSource {
+                held_user: true,
+                presenting: true,
+            })),
+        ];
+        for (i, tokens) in cases.into_iter().enumerate() {
+            let (url, accepts, task) = counting_listener().await;
+            let sub = subscriber(&url, "", tokens, CollectingAudit::new());
+            let (tx, rx) = watch::channel(false);
+            let streaming = tokio::spawn(async move { sub.stream(&rx).await });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while accepts.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "case {i}: the stream was never opened"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = tx.send(true);
+            let _ = streaming.await;
+            task.abort();
+        }
     }
 }

@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 use crate::approval::ApprovalGate;
 use crate::audit::AuditSink;
 use crate::bus::{
-    AwsHandlers, BusError, BusLog, ConnState, DockerHandlers, SubStatus, TokenProvider,
+    AwsHandlers, BusError, BusLog, ConnState, DockerHandlers, MintRefusal, SubStatus, TokenProvider,
 };
 use crate::discovery::ServerTarget;
 use crate::machine::MachineIdentity;
@@ -70,11 +70,14 @@ impl TokenProvider for Arc<CredentialSource> {
     fn would_mint(&self) -> bool {
         (**self).would_mint()
     }
-    async fn token_for_request(&self) -> Result<String, (BusError, Option<String>)> {
+    async fn token_for_request(&self) -> Result<String, (BusError, Option<MintRefusal>)> {
         CredentialSource::token_for_request(self)
             .await
             .map_err(|e| {
-                let refusal = e.refused.then(|| e.message.clone());
+                let refusal = e.refused.then(|| MintRefusal {
+                    message: e.message.clone(),
+                    held_user: e.held_user,
+                });
                 (BusError::Config(e.message), refusal)
             })
     }
@@ -1002,8 +1005,9 @@ mod tests {
         src.invalidate();
         let (err, refusal) = p.token_for_request().await.unwrap_err();
         let refusal = refusal.expect("this request's own mint was refused");
-        assert_eq!(err.to_string(), refusal);
-        assert!(refusal.contains("held to \"pat\""), "{refusal}");
+        assert_eq!(err.to_string(), refusal.message);
+        assert!(refusal.message.contains("held to \"pat\""), "{refusal:?}");
+        assert!(refusal.held_user, "the held-user rule's refusal");
 
         let (err, refusal) = p.token_for_request().await.unwrap_err();
         assert_eq!(err.to_string(), "transient");

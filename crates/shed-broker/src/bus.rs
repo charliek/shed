@@ -451,9 +451,21 @@ pub trait TokenProvider: Send + Sync {
     /// the mint THIS call made or joined was issued (plan 037 §3.2.2), when that is why it
     /// failed. The request explains a server's refusal with it — never with a refusal
     /// another request's mint produced. Default: [`Self::token`], with no refusal.
-    async fn token_for_request(&self) -> Result<String, (BusError, Option<String>)> {
+    async fn token_for_request(&self) -> Result<String, (BusError, Option<MintRefusal>)> {
         self.token().await.map_err(|e| (e, None))
     }
+}
+
+/// The refusal of the certificate one request's own mint was issued
+/// ([`TokenProvider::token_for_request`], plan 037 §3.2.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintRefusal {
+    pub message: String,
+    /// The held-user rule's refusal (a certificate for another named user, or one that
+    /// names no user: [`crate::minter::ObtainError::held_user`]). With nothing held to
+    /// present, the request is then not sent at all (plan 037 A23); any other refusal
+    /// only explains the server's answer to a request that is sent as before.
+    pub held_user: bool,
 }
 
 /// A fixed-token provider (the open-mode / static-token analog of Go's
@@ -662,6 +674,9 @@ enum StreamEnd {
     },
     /// The server closed a healthy stream → reconnect.
     ClosedByServer(String),
+    /// This request's own mint was refused by the held-user rule and nothing is held to
+    /// present (plan 037 A23): nothing was sent → backoff + retry, which mints again.
+    NotSent(String),
     /// The desktop app's embedded broker appeared on this machine while this client
     /// was connecting or held the stream: the attempt was dropped (its connection
     /// closed) → stand by ([`BusClient::with_presence`]).
@@ -1302,7 +1317,8 @@ impl BusClient {
                 }
                 StreamEnd::Transport(reason)
                 | StreamEnd::BadStatus(reason)
-                | StreamEnd::ClosedByServer(reason) => {
+                | StreamEnd::ClosedByServer(reason)
+                | StreamEnd::NotSent(reason) => {
                     set_state(&status, ConnState::Reconnecting, Some(&reason));
                     // Reset backoff only after a connection that held for a while.
                     if connected && start.elapsed() > HELD_RESET {
@@ -1514,7 +1530,11 @@ impl BusClient {
         // timeout.
         let (bearer, refusal) = tokio::select! {
             _ = wait_shutdown(shutdown.clone()) => return StreamEnd::Shutdown,
-            t = self.bearer_for_request() => t,
+            t = self.bearer_for_request() => match t {
+                Ok(t) => t,
+                // Refused for its user with nothing to present: not sent (plan 037 A23).
+                Err(refusal) => return StreamEnd::NotSent(refusal),
+            },
         };
         if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
@@ -1838,7 +1858,10 @@ impl BusClient {
                 return Err(BusError::Transport("sending response: shutting down".into()))
             }
             t = until(deadline, self.respond_bearer(&mut ctx.mint_spent)) => match t {
-                Some(t) => t,
+                Some(Ok(t)) => t,
+                // Refused for its user with nothing to present: not sent (plan 037 A23),
+                // and the refusal is the whole error.
+                Some(Err(refusal)) => return Err(BusError::Config(refusal)),
                 None => {
                     ctx.not_sent = Some(NotSent::NoRoom);
                     return Err(past_deadline());
@@ -1927,33 +1950,45 @@ impl BusClient {
     /// the held credential is presented as it is: the surviving bearer, or nothing (the
     /// certificate still armed on the transport). Without this bound a failed re-mint
     /// leaves the source refused, and every 503 retry would mint again.
-    async fn respond_bearer(&self, mint_spent: &mut bool) -> Option<String> {
+    ///
+    /// `Err` is [`Self::bearer_for_request`]'s: the POST is not sent.
+    async fn respond_bearer(&self, mint_spent: &mut bool) -> Result<Option<String>, String> {
         if let Some(p) = &self.token_provider {
             if p.would_mint() {
                 if *mint_spent {
-                    return p.surviving_token();
+                    return Ok(p.surviving_token());
                 }
                 *mint_spent = true;
             }
         }
-        self.bearer().await
+        self.bearer_for_request().await.map(|(bearer, _)| bearer)
     }
 
     /// The bearer token to send, or `None`. A provider takes precedence (and on a
     /// mint error the client sends unauthenticated, warning once — Go's setAuth);
     /// otherwise the static token is sent when non-empty; else no header.
+    #[cfg(test)]
     async fn bearer(&self) -> Option<String> {
-        self.bearer_for_request().await.0
+        self.bearer_for_request()
+            .await
+            .map(|(bearer, _)| bearer)
+            .unwrap_or(None)
     }
 
-    /// [`Self::bearer`] for one request, and the refusal of the certificate the mint THIS
+    /// The bearer for one request, and the refusal of the certificate the mint THIS
     /// fetch made or joined was issued, when that is why the fetch failed (plan 037
     /// §3.2.2). The request carries it to its own outcome: a server's refusal of this
     /// request is explained by this mint's refusal and by no other.
-    async fn bearer_for_request(&self) -> (Option<String>, Option<String>) {
+    ///
+    /// `Err(refusal)` when that refusal is the held-user rule's
+    /// ([`MintRefusal::held_user`]) and nothing is held to present (no surviving token,
+    /// no armed certificate): the request is not sent at all, since the server issues
+    /// certificates and could not authenticate it, and the refusal is its whole error
+    /// (plan 037 A23). Every other failure is sent as before.
+    async fn bearer_for_request(&self) -> Result<(Option<String>, Option<String>), String> {
         if let Some(p) = &self.token_provider {
             match p.token_for_request().await {
-                Ok(t) => ((!t.is_empty()).then_some(t), None),
+                Ok(t) => Ok(((!t.is_empty()).then_some(t), None)),
                 // A failed re-mint does not strip the wire of a credential the
                 // server might still accept: present the surviving token (or,
                 // in mtls state, the still-armed certificate) and log WHY the
@@ -1969,19 +2004,24 @@ impl BusClient {
                             "credential refresh failed; presenting the existing certificate: {e}"
                         ));
                         None
+                    } else if let Some(refusal) = refusal.as_ref().filter(|r| r.held_user) {
+                        self.log.warn(&format!(
+                            "credential refused for its user and none is held; not sending: {e}"
+                        ));
+                        return Err(refusal.message.clone());
                     } else {
                         self.log.warn(&format!(
                             "token provider returned no token; sending unauthenticated: {e}"
                         ));
                         None
                     };
-                    (bearer, refusal)
+                    Ok((bearer, refusal.map(|r| r.message)))
                 }
             }
         } else if !self.static_token.is_empty() {
-            (Some(self.static_token.clone()), None)
+            Ok((Some(self.static_token.clone()), None))
         } else {
-            (None, None)
+            Ok((None, None))
         }
     }
 
@@ -5315,10 +5355,21 @@ mod tests {
             async fn token(&self) -> Result<String, BusError> {
                 unreachable!("a request fetches through token_for_request")
             }
-            async fn token_for_request(&self) -> Result<String, (BusError, Option<String>)> {
-                Err((BusError::Config(REFUSAL.into()), self.0.map(str::to_string)))
+            async fn token_for_request(&self) -> Result<String, (BusError, Option<MintRefusal>)> {
+                Err((
+                    BusError::Config(REFUSAL.into()),
+                    self.0.map(|m| MintRefusal {
+                        message: m.to_string(),
+                        held_user: true,
+                    }),
+                ))
             }
             fn invalidate(&self) {}
+            // A certificate for the held user is still armed, so the request is sent
+            // and the refusal explains the server's answer to it.
+            fn presenting_certificate(&self) -> bool {
+                true
+            }
         }
         for (refusal, starts) in [(Some(REFUSAL), REFUSAL), (None, "unexpected status 401")] {
             let server = MockServer::start_async().await;
@@ -5357,6 +5408,164 @@ mod tests {
                     "{last}"
                 );
             }
+        }
+    }
+
+    // ---- plan 037 A23: a held-user refusal with nothing to present sends nothing ----
+
+    const HELD_USER_REFUSAL: &str = "server \"s\": the server issued a certificate for user \
+        \"admin\", but this entry is held to \"pat\"; it was not used.";
+
+    /// A provider whose every fetch fails with a mint refusal: the held-user rule's or
+    /// another, with or without a certificate still armed.
+    struct RefusingProvider {
+        held_user: bool,
+        presenting: bool,
+        fetches: AtomicUsize,
+    }
+    impl RefusingProvider {
+        fn new(held_user: bool, presenting: bool) -> Arc<Self> {
+            Arc::new(Self {
+                held_user,
+                presenting,
+                fetches: AtomicUsize::new(0),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl TokenProvider for RefusingProvider {
+        async fn token(&self) -> Result<String, BusError> {
+            unreachable!("a request fetches through token_for_request")
+        }
+        async fn token_for_request(&self) -> Result<String, (BusError, Option<MintRefusal>)> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Err((
+                BusError::Config(HELD_USER_REFUSAL.into()),
+                Some(MintRefusal {
+                    message: HELD_USER_REFUSAL.into(),
+                    held_user: self.held_user,
+                }),
+            ))
+        }
+        fn invalidate(&self) {}
+        fn presenting_certificate(&self) -> bool {
+            self.presenting
+        }
+    }
+
+    /// A plain TCP listener on loopback that counts the connections it accepts and
+    /// answers none: a request never sent leaves the count at zero.
+    async fn counting_listener() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counted = accepts.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                held.push(sock); // never answered; dropped with the task
+            }
+        });
+        (url, accepts, task)
+    }
+
+    fn client_with(url: &str, provider: Option<Arc<dyn TokenProvider>>) -> BusClient {
+        BusClient::new(
+            url.to_string(),
+            String::new(),
+            provider,
+            None,
+            None,
+            silent_log(),
+        )
+        .unwrap()
+        .with_test_backoff(Duration::from_millis(5), Duration::from_millis(20))
+        .with_test_respond_timing(Duration::from_millis(200), Duration::from_secs(1))
+    }
+
+    /// When a request's own mint is refused by the held-user rule and nothing is held to
+    /// present, nothing is sent: the subscription retries on its backoff without ever
+    /// connecting, its status says the refusal alone, and a response POST fails with the
+    /// refusal alone.
+    #[tokio::test]
+    async fn a_held_user_refusal_with_nothing_held_sends_nothing() {
+        let (url, accepts, task) = counting_listener().await;
+        let provider = RefusingProvider::new(true, false);
+        let client = client_with(&url, Some(provider.clone()));
+
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while provider.fetches.load(Ordering::SeqCst) < 3 {
+            assert_eq!(
+                accepts.load(Ordering::SeqCst),
+                0,
+                "the subscription made no connection"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the subscription never retried"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            sub.status().last_error,
+            HELD_USER_REFUSAL,
+            "the refusal alone"
+        );
+        let _ = tx.send(true);
+        drop(sub);
+
+        let env = Envelope::new_response("r", "ssh-agent", serde_json::Value::Null);
+        match client.respond("ssh-agent", &env, &never_shutdown()).await {
+            Err(BusError::Config(m)) => assert_eq!(m, HELD_USER_REFUSAL, "the refusal alone"),
+            other => panic!("want the refusal, got {other:?}"),
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 0, "no connection was made");
+        task.abort();
+    }
+
+    /// Every other case is sent as before: a server that needs no credential, a refusal
+    /// that is not the held-user rule's, and a held-user refusal while a certificate for
+    /// the held user is still armed. Both the subscription and a response POST connect.
+    #[tokio::test]
+    async fn every_other_case_is_still_sent() {
+        let cases: Vec<Option<Arc<dyn TokenProvider>>> = vec![
+            None,
+            Some(RefusingProvider::new(false, false)),
+            Some(RefusingProvider::new(true, true)),
+        ];
+        for (i, provider) in cases.into_iter().enumerate() {
+            let (url, accepts, task) = counting_listener().await;
+            let client = client_with(&url, provider);
+            let (tx, rx) = shutdown_pair();
+            let sub = client.subscribe("ssh-agent", rx);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while accepts.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "case {i}: the subscription never connected"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = tx.send(true);
+            drop(sub);
+
+            let before = accepts.load(Ordering::SeqCst);
+            let env = Envelope::new_response("r", "ssh-agent", serde_json::Value::Null);
+            // The listener answers nothing: the POST times out, having connected.
+            assert!(client
+                .respond("ssh-agent", &env, &never_shutdown())
+                .await
+                .is_err());
+            assert!(
+                accepts.load(Ordering::SeqCst) > before,
+                "case {i}: the response POST never connected"
+            );
+            task.abort();
         }
     }
 
