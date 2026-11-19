@@ -45,6 +45,7 @@
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use shed_core::identityfile::IdentityFileError;
 use shed_core::machine;
 
 use crate::spawn_gate::{SlotClose, SpawnGate, SpawnSection, SHUTTING_DOWN};
@@ -73,9 +74,30 @@ const IN_FLIGHT_WAIT: Duration = Duration::from_millis(500);
 /// The readiness loop's poll interval, and the local probe's connect budget.
 const READY_POLL: Duration = Duration::from_millis(100);
 
-/// A forward could not be established.
+/// A forward could not be established: the sentence, and (plan 037 A8) the
+/// typed cause when no ssh ran because the entry's identity file cannot be used
+/// ([`ForwardError::identity_refusal`], also the error's
+/// [`source`](std::error::Error::source)). Build one with [`ForwardError::new`]
+/// or [`ForwardError::identity`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForwardError(pub String);
+pub struct ForwardError(pub String, Option<IdentityFileError>);
+
+impl ForwardError {
+    pub fn new(message: impl Into<String>) -> ForwardError {
+        ForwardError(message.into(), None)
+    }
+
+    /// No ssh ran: the entry's identity file cannot be used. The sentence is the
+    /// refusal's own, which names the entry, escaped.
+    pub fn identity(refusal: IdentityFileError) -> ForwardError {
+        ForwardError(refusal.to_string(), Some(refusal))
+    }
+
+    /// The identity-file refusal this error is, if it is one.
+    pub fn identity_refusal(&self) -> Option<&IdentityFileError> {
+        self.1.as_ref()
+    }
+}
 
 impl std::fmt::Display for ForwardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -83,7 +105,13 @@ impl std::fmt::Display for ForwardError {
     }
 }
 
-impl std::error::Error for ForwardError {}
+impl std::error::Error for ForwardError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.1
+            .as_ref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// A live local port proxying to a machine's `127.0.0.1:1029`.
 ///
@@ -236,7 +264,7 @@ impl SshForward {
         remote_port: u16,
     ) -> Result<Self, ForwardError> {
         let port = free_loopback_port()
-            .map_err(|e| ForwardError(format!("allocating a local forward port: {e}")))?;
+            .map_err(|e| ForwardError::new(format!("allocating a local forward port: {e}")))?;
         let label = format!("machine:{}", entry.name);
         Ok(Self {
             entry,
@@ -290,18 +318,24 @@ impl SshForward {
     }
 
     /// The ssh argv this forward spawns — exposed so a caller can print it.
-    pub fn argv(&self) -> Vec<String> {
+    ///
+    /// Built fresh for every spawn, so an entry whose identity file can no longer be
+    /// used (a shed's server entry whose key was removed after the shed was registered)
+    /// is refused here, typed ([`ForwardError::identity`]) and by the entry's name,
+    /// before any ssh — the respawn included.
+    pub fn argv(&self) -> Result<Vec<String>, ForwardError> {
         machine::forward_argv(&self.entry, self.port, self.remote_port)
+            .map_err(ForwardError::identity)
     }
 
     /// What is actually exec'd: [`argv`](Self::argv), unless a test seam has
     /// substituted a stand-in for the `ssh` binary.
-    fn spawn_argv(&self) -> Vec<String> {
+    fn spawn_argv(&self) -> Result<Vec<String>, ForwardError> {
         #[cfg(test)]
         if let Some(prefix) = &self.exec_prefix {
             let mut argv = prefix.clone();
-            argv.extend(self.argv());
-            return argv;
+            argv.extend(self.argv()?);
+            return Ok(argv);
         }
         self.argv()
     }
@@ -318,7 +352,7 @@ impl SshForward {
         let port = self.port;
         tokio::task::spawn_blocking(move || port_answers(port))
             .await
-            .map_err(|e| ForwardError(format!("forward probe failed: {e}")))
+            .map_err(|e| ForwardError::new(format!("forward probe failed: {e}")))
     }
 
     /// Is the child gone (exited, reaped elsewhere, or never spawned)?
@@ -361,7 +395,7 @@ impl MachineForward for SshForward {
             return Ok(());
         }
 
-        let argv = self.spawn_argv();
+        let argv = self.spawn_argv()?;
         let port = self.port;
         let label = self.label.clone();
         let slot = Arc::clone(&self.child);
@@ -397,7 +431,7 @@ impl MachineForward for SshForward {
             outcome
         })
         .await
-        .map_err(|e| ForwardError(format!("forward task failed: {e}")))?
+        .map_err(|e| ForwardError::new(format!("forward task failed: {e}")))?
     }
 
     /// Close the slot — its child killed and reaped (bounded), every later
@@ -456,7 +490,7 @@ fn reap_until(child: &mut std::process::Child, deadline: Instant) {
 
 /// The error a closed forward or a closed gate answers with.
 fn shutting_down(label: &str) -> ForwardError {
-    ForwardError(format!(
+    ForwardError::new(format!(
         "{SHUTTING_DOWN}: the app is quitting, so the hub tunnel to {label} is not started"
     ))
 }
@@ -806,7 +840,7 @@ fn spawn_and_wait(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| ForwardError(format!("opening the hub tunnel to {label}: {e}")))?;
+        .map_err(|e| ForwardError::new(format!("opening the hub tunnel to {label}: {e}")))?;
     #[cfg(test)]
     slot.spawned
         .lock()
@@ -842,7 +876,7 @@ fn spawn_and_wait(
             }
         };
         if let Some(status) = exited {
-            return Err(ForwardError(format!(
+            return Err(ForwardError::new(format!(
                 "the hub tunnel to {label} exited immediately ({status})"
             )));
         }
@@ -850,7 +884,7 @@ fn spawn_and_wait(
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(ForwardError(format!(
+            return Err(ForwardError::new(format!(
                 "the hub tunnel to {label} did not come up"
             )));
         }
@@ -1093,6 +1127,7 @@ mod tests {
             user: Some("charliek".into()),
             ssh_port: 22,
             known_hosts: None,
+            identity_file: None,
         }
     }
 
@@ -1109,7 +1144,7 @@ mod tests {
     fn a_reserved_ssh_forward_picks_a_local_port_and_spawns_nothing_yet() {
         let f = SshForward::reserve_for(entry(), SOME_REMOTE_PORT).expect("reserve");
         assert!(f.port() > 0);
-        let argv = f.argv();
+        let argv = f.argv().unwrap();
         // The concrete thing that matters: this local port maps to the named
         // loopback port on the far side, and a lost race is loud.
         assert!(argv.windows(2).any(|w| w
@@ -1164,7 +1199,7 @@ mod tests {
         let remote = 41_811;
         assert_ne!(remote, SOME_REMOTE_PORT, "a different port on purpose");
         let f = SshForward::reserve_for(entry(), remote).expect("reserve_for");
-        let argv = f.argv();
+        let argv = f.argv().unwrap();
         assert!(
             argv.windows(2)
                 .any(|w| w == ["-L", &format!("127.0.0.1:{}:127.0.0.1:{remote}", f.port())]),
@@ -1181,7 +1216,7 @@ mod tests {
         // A second forward names its own far side independently — the port is
         // per-forward, not a shared constant.
         let other = SshForward::reserve_for(entry(), SOME_REMOTE_PORT).expect("reserve_for");
-        assert!(other.argv().windows(2).any(|w| w
+        assert!(other.argv().unwrap().windows(2).any(|w| w
             == [
                 "-L",
                 &format!("127.0.0.1:{}:127.0.0.1:{SOME_REMOTE_PORT}", other.port())
@@ -1204,7 +1239,7 @@ mod tests {
             SshForward::reserve_faked_for(entry(), remote, fake_ssh(&log, "exec sleep 30"))
                 .expect("reserve_faked_for");
         let port = forward.port();
-        let argv_before = forward.argv();
+        let argv_before = forward.argv().unwrap();
 
         let tunnel = tunnel_once_started(port, &log, 1);
         forward.ensure().await.expect("the first ensure");
@@ -1225,9 +1260,70 @@ mod tests {
             "the re-establish moved the local port"
         );
         assert_eq!(
-            forward.argv(),
+            forward.argv().unwrap(),
             argv_before,
             "the re-established tunnel forwards somewhere else"
+        );
+    }
+
+    /// **A respawn checks the shed's identity file again** (plan 037 A8). The lane
+    /// keeps the reach entry it was given when the shed was registered and respawns
+    /// its forward from it; once the entry's key is removed, the respawn is refused,
+    /// by the entry's name, and no ssh is spawned (a missing `-i` file would let ssh
+    /// try other keys). The refusal stays typed (a caller tells it from a dead host
+    /// without reading the text), and its text is the refusal's own: the entry's name
+    /// is shown escaped, with no raw label (a newline, a terminal sequence) in front.
+    #[tokio::test]
+    async fn a_respawn_after_the_key_is_removed_spawns_no_ssh() {
+        const NAME: &str = "roost:pop\nos\u{1b}[31m/p019-a";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let key = dir.path().join("id work");
+        std::fs::write(&key, "a key file\n").unwrap();
+        let entry = shed_core::config::MachineEntry {
+            name: NAME.into(),
+            identity_file: Some(key.to_str().unwrap().to_string()),
+            ..entry()
+        };
+        let forward = SshForward::reserve_faked_for(entry, 41_813, fake_ssh(&log, "exec sleep 30"))
+            .expect("reserve_faked_for");
+        let port = forward.port();
+        let argv = forward.argv().unwrap();
+        assert!(argv.windows(2).any(|w| w == ["-i", key.to_str().unwrap()]));
+
+        let tunnel = tunnel_once_started(port, &log, 1);
+        forward
+            .ensure()
+            .await
+            .expect("the first ensure, with the key there");
+        let tunnel = tunnel.await.expect("the tunnel task");
+
+        // The tunnel dies, and the key is removed before the lane respawns it.
+        let _reservation = close_tunnel_and_reserve(tunnel, port);
+        std::fs::remove_file(&key).unwrap();
+        let err = forward.ensure().await.unwrap_err();
+        assert_eq!(
+            err.0,
+            format!(
+                "entry \"roost:pop\\nos\\u{{1b}}[31m/p019-a\": identity_file {:?} cannot be \
+                 used: the file does not exist",
+                key.to_str().unwrap()
+            ),
+        );
+        let refusal = err.identity_refusal().expect("the typed cause");
+        assert_eq!(
+            (refusal.entry.as_str(), refusal.path.as_str()),
+            (NAME, key.to_str().unwrap())
+        );
+        assert_eq!(shed_core::identityfile::refusal_in(&err), Some(refusal));
+        // Through the roost seam's error too.
+        let reach = crate::roost::ReachError::from(err.clone());
+        assert_eq!(reach.identity_refusal(), Some(refusal));
+        assert_eq!(shed_core::identityfile::refusal_in(&reach), Some(refusal));
+        assert_eq!(
+            spawned_pids(&log).len(),
+            1,
+            "no ssh was spawned for the respawn"
         );
     }
 
@@ -1266,6 +1362,9 @@ mod tests {
         );
         // Errors name the machine the way the user addressed it.
         assert!(err.to_string().contains("machine:mini3"), "{err}");
+        // A dead tunnel is not mistaken for an identity-file refusal (plan 037 A8).
+        assert_eq!(err.identity_refusal(), None);
+        assert_eq!(shed_core::identityfile::refusal_in(&err), None);
         // A failed attempt leaves nothing running.
         assert!(f.child_is_dead());
     }

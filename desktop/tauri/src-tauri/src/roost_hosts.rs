@@ -3586,7 +3586,11 @@ impl RoostHosts {
                          running shed by that name, so nothing was contacted"
                     ));
                 }
-                Ok(shed_reach_entry(entry, name))
+                // The server entry's `identity_file` is checked here too (plan 037
+                // A8): one that cannot be used is the refusal, before any reach. A
+                // transport built from the entry checks it again each time it builds a
+                // command line or opens (ensures) a tunnel or runner.
+                shed_reach_entry(entry, name)
             }
         }
     }

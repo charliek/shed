@@ -459,6 +459,7 @@ mod tests {
             user: Some("nobody".to_string()),
             ssh_port: 22,
             known_hosts: None,
+            identity_file: None,
         }
     }
 

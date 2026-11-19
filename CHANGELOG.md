@@ -676,6 +676,52 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   nothing saved, and an add or a refetch whose key file is replaced while it runs saves
   nothing. JSON results gain `identity_file`. Without the field every argv and stanza is as
   before.
+- **Desktop and host-agent: an entry's own SSH key, `identity_file`.** The app and its
+  credential broker (embedded or the `shed-host-agent` daemon) read the field the CLI writes,
+  with the CLI's value rule. Every `ssh` they run for the entry passes the key (`-i <path> -o
+  IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none`, byte for byte the CLI's argv,
+  or the same four lines in the stanza a roost connection reads); the file is checked each
+  time they build an `ssh` command for the entry or open a tunnel or command runner for it,
+  and one that is missing, or a value the rule refuses, is a typed refusal naming the entry
+  and that `ssh` does not run (a connection an open tunnel makes later, a local command that
+  only closes a shared connection, and a terminal running a command built earlier are not
+  checked again); a stored `control_token` or `credentials_token` is never sent for such an
+  entry. The app reads a server entry only when every line in it is a plain `key: value`:
+  an entry with any other line (an explicit `? key`, a `{…}` mapping, a tag, an anchor, a
+  merge key, a block scalar, a continued value, a repeated key, a list) or a null `host` is
+  listed and refused, never read with defaults, and nothing is sent to its server; the
+  broker refuses an entry with a merge key or a tagged key. Unlike the CLI, the app does not
+  check that a certificate was made for the entry's key: what bounds who it acts as is the
+  entry's `user`. Restart the app after changing an entry's `identity_file`. See [Desktop
+  configuration](https://charliek.github.io/shed/desktop/configuration/#the-ssh-key-an-entry-uses).
+- **Fix (desktop): `config.yaml` values are read as YAML reads them**, as the CLI wrote them.
+  Two shapes change meaning: a value with a `#` and no space before it (`host: mini#2`,
+  `identity_file: /home/pat/.ssh/id#work`) is now the whole value, where the app used to cut it
+  at the `#`; and a value that is literally `null` or `~` (`user: null`) is now no value, where
+  the app used to read the text. Double-quoted escapes such as `\t` are decoded, `''` in a
+  single-quoted value is one `'`, a `#` inside quotes is text, and a quoted key is decoded the
+  same way. The app's **Add machine** refuses a host or user holding a control character or a
+  line break rather than write it, and writes every other value double-quoted unless it is a
+  plain token (so `&a other.example` is written as `"&a other.example"` and read back as that
+  text by any YAML reader). Since an entry is read only when every line is a plain
+  `key: value`, an entry the app used to read in part (a `user:` list or `[…]`, a `host:` value
+  continued on the next line) is now refused whole, and a null `host` no longer falls back to
+  the entry's name.
+- **Desktop: the app reads `config.yaml` as the shed CLI writes it, and refuses the rest by
+  name.** Every entry the CLI's save path writes with ordinary values is read with the host,
+  ports, user and `identity_file` the CLI reads (a fixture written by the CLI's own save
+  function holds this); an entry or a file in a form the app does not read exactly is refused
+  with a reason, never read with defaults, and a hand-edited file in YAML forms the CLI never
+  writes may be refused by the app while the CLI accepts it. An entry named with a colon
+  (`prod:blue`, `10.0.0.5:8443`) is now read under its name; a byte-order mark is skipped; only
+  the first YAML document is read. The app reads no part of a file that holds a raw CR outside
+  a CRLF line ending, NEL, U+2028 or U+2029 (the broker refuses such a file too), that has
+  `servers:` twice, or whose `servers:` is in flow form or has a tag or an anchor; the log says
+  why. A line indented with a tab refuses the entry it is in. Not read, by design: a name the
+  CLI writes as an explicit `? key` (over 128 bytes), and a value written as a multi-line block
+  or with a `!!binary` tag; each refuses its entry. **Add machine** refuses a character YAML
+  does not allow in a file (U+FFFE, U+FFFF). See [How the app reads the
+  file](https://charliek.github.io/shed/desktop/configuration/#how-the-app-reads-the-file).
 - **Development:** `SHED_DEV_USERS=itest` starts the dev servers with the suite's user list;
   the suite gains `test_users.py`, `test_users_upgrade.py` and `test_source_pin.py`, with
   `SHED_ITEST_USERS` and `SHED_ITEST_USERS_DIR`.

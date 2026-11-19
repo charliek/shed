@@ -1547,6 +1547,7 @@ mod tests {
             // No recorded credential shape: an open http target never enrolled.
             auth_mode: String::new(),
             user: String::new(),
+            identity_file: String::new(),
         };
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let group = bus::spawn_server_group(shutdown_rx, &target, &deps);
@@ -1671,6 +1672,7 @@ mod tests {
             ssh_port: 0,
             auth_mode: String::new(),
             user: String::new(),
+            identity_file: String::new(),
         };
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let group = bus::spawn_server_group(shutdown_rx, &target, &deps);

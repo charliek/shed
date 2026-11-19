@@ -479,6 +479,18 @@ impl TokenProvider for StaticTokenProvider {
     fn invalidate(&self) {}
 }
 
+/// The static bearer a server group that does not mint sends, on the bus and on the egress
+/// stream: the entry's `credentials_token`, except for an entry that names an
+/// `identity_file` (plan 037 A8), which never sends a stored token — it says nothing about
+/// which SSH key it was issued for. Such a group sends no bearer.
+pub(crate) fn static_bearer(target: &ServerTarget) -> String {
+    if target.identity_file.is_empty() {
+        target.token.clone()
+    } else {
+        String::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Logging seam
 // ---------------------------------------------------------------------------
@@ -2456,6 +2468,16 @@ pub fn spawn_server_group(
     // reads at handshake time. An open/static-token server has neither, so both stay None
     // and the transport is byte-identical to what it was before mtls existed.
     let secure = crate::supervisor::should_mint(deps, target);
+    // The one static bearer a group that does not mint may send — the bus provider's and
+    // the egress stream's alike. Never a stored token for an entry with an identity file.
+    let static_bearer = static_bearer(target);
+    if !secure && static_bearer.is_empty() && !target.token.is_empty() {
+        log.warn(&format!(
+            "server {}: its credentials_token is not sent: the entry names an identity_file, \
+             and a stored token does not say which SSH key it was issued for",
+            shed_core::token::display_server_name(&target.name)
+        ));
+    }
     let mut refresh_source: Option<Arc<crate::minter::CredentialSource>> = None;
     let provider: Arc<dyn TokenProvider> = if secure {
         let minter = deps
@@ -2481,7 +2503,7 @@ pub fn spawn_server_group(
         // into the trait object the client holds.
         Arc::new(src) as Arc<dyn TokenProvider>
     } else {
-        Arc::new(StaticTokenProvider::new(target.token.clone())) as Arc<dyn TokenProvider>
+        Arc::new(StaticTokenProvider::new(static_bearer.clone())) as Arc<dyn TokenProvider>
     };
 
     let bus_certs = refresh_source.as_ref().map(|s| s.cert_resolver());
@@ -2609,7 +2631,7 @@ pub fn spawn_server_group(
     let egress = crate::egress::EgressSubscriber::new(
         target.name.clone(),
         target.url.clone(),
-        target.token.clone(),
+        static_bearer,
         &target.tls_fingerprint,
         crate::egress::EgressCredentials {
             tokens: egress_tokens,
@@ -9482,6 +9504,7 @@ mod tests {
                 ssh_port: 0,
                 auth_mode: String::new(),
                 user: String::new(),
+                identity_file: String::new(),
             },
             "credentials",
             None,
@@ -10483,6 +10506,7 @@ mod tests {
             ssh_port: 0,
             auth_mode: String::new(),
             user: String::new(),
+            identity_file: String::new(),
         };
 
         let (tx, rx) = shutdown_pair();
@@ -10520,6 +10544,66 @@ mod tests {
         );
         let _ = tx.send(true);
         let _ = g.done.await;
+    }
+
+    /// The static path of a group that does not mint (plan 037 A8): an entry that names
+    /// an `identity_file` never sends its stored `credentials_token` — not on the bus and
+    /// not on the egress stream; the same entry without one sends it on both, as before.
+    #[tokio::test]
+    async fn a_group_for_an_entry_with_an_identity_file_sends_no_stored_token() {
+        let subscribe = "/api/plugins/listeners/ssh-agent/messages";
+        let egress = "/api/egress/stream";
+        for (identity_file, want) in [
+            ("/home/pat/.ssh/id_work", None),
+            ("", Some("Bearer stored-tok".to_string())),
+        ] {
+            let srv = ScriptedServer::spawn(vec![], Answer(200, vec![], sse_one("x"))).await;
+            let deps = crate::supervisor::SharedDeps {
+                ssh_backend: empty_backend(),
+                ssh_gate: approve_gate(),
+                ssh_sign_policy: Arc::new(SignPolicy::default()),
+                aws: None,
+                docker: None,
+                audit: Arc::new(CollectingAudit::default()),
+                minter: None,
+                log: silent_log(),
+                machine: Some(identity("laptop")),
+                embedded_presence: None,
+                presence_lock: None,
+            };
+            let target = crate::discovery::ServerTarget {
+                name: "s".into(),
+                url: srv.url(),
+                token: "stored-tok".into(),
+                tls_fingerprint: String::new(),
+                ssh_host: String::new(),
+                ssh_port: 0,
+                auth_mode: String::new(),
+                user: String::new(),
+                identity_file: identity_file.into(),
+            };
+            assert_eq!(static_bearer(&target).is_empty(), want.is_none());
+            let (tx, rx) = shutdown_pair();
+            let g = spawn_server_group(rx, &target, &deps);
+            let seen = |path: &str| srv.seen().iter().any(|r| r.path.starts_with(path));
+            for _ in 0..250 {
+                if seen(subscribe) && seen(egress) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(seen(subscribe) && seen(egress), "{identity_file:?}");
+            for r in srv.seen() {
+                assert_eq!(
+                    r.header("authorization"),
+                    want,
+                    "{identity_file:?}: {}",
+                    r.path
+                );
+            }
+            let _ = tx.send(true);
+            let _ = g.done.await;
+        }
     }
 
     // ---- the reconnect after a long healthy stream (review item i) ----------------------

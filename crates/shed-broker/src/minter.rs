@@ -264,6 +264,9 @@ impl Minter for CredentialMinter {
             scope: scope.to_string(),
             client_kind: "host-agent".to_string(),
             csr: keypair.csr_base64(),
+            // The entry's own key, when it names one (plan 037 A8): ssh offers it and
+            // no key that is only in the agent; the runner checks the file first.
+            identity_file: target.identity_file.clone(),
         };
         match self.runner.run(&params).await {
             Ok(bundle) if bundle.is_mtls() => Ok(Minted {
@@ -322,6 +325,7 @@ impl Minter for CredentialMinter {
             scope: scope.to_string(),
             client_kind: "host-agent".to_string(),
             csr: csr_base64.to_string(),
+            identity_file: target.identity_file.clone(),
         };
         match self.runner.run(&params).await {
             Ok(bundle) => Ok(RelayedCredential {
@@ -1341,6 +1345,7 @@ pub(crate) mod tests {
             ssh_port: port,
             auth_mode: String::new(),
             user: String::new(),
+            identity_file: String::new(),
         }
     }
 
@@ -2459,6 +2464,41 @@ pub(crate) mod tests {
         assert!(!crate::bootstrap::ssh_args(&sent2)
             .iter()
             .any(|a| a.starts_with("csr=")));
+    }
+
+    /// The entry's `identity_file` reaches ssh on both mint paths (plan 037 A8): the
+    /// source's own mint and the relay hand it to the runner, whose argv then carries
+    /// the key; an entry with none hands none, and its argv is as before.
+    #[tokio::test]
+    async fn both_mint_paths_hand_the_runner_the_entrys_identity_file() {
+        let (_d, path) = write_known_hosts(&format!("[mini3]:2222 {ED25519_KEY}\n"));
+        let keyed = ServerTarget {
+            identity_file: "/home/pat/.ssh/id_work".into(),
+            ..target("s", "mini3", 2222)
+        };
+        let runner = FakeRunner::ok(bundle("tok"));
+        let m = CredentialMinter::with_runner(&path, runner.clone());
+        m.mint(&keyed, SCOPE_CREDENTIALS).await.unwrap();
+        let sent = runner.last_params.lock().unwrap().clone().unwrap();
+        assert_eq!(sent.identity_file, "/home/pat/.ssh/id_work");
+        assert!(crate::bootstrap::ssh_args(&sent)
+            .windows(2)
+            .any(|w| w == ["-i", "/home/pat/.ssh/id_work"]));
+
+        let runner = FakeRunner::ok(bundle("tok"));
+        let m = CredentialMinter::with_runner(&path, runner.clone());
+        m.mint_relayed(&keyed, SCOPE_CONTROL, "").await.unwrap();
+        let sent = runner.last_params.lock().unwrap().clone().unwrap();
+        assert_eq!(sent.identity_file, "/home/pat/.ssh/id_work");
+
+        let runner = FakeRunner::ok(bundle("tok"));
+        let m = CredentialMinter::with_runner(&path, runner.clone());
+        m.mint(&target("s", "mini3", 2222), SCOPE_CREDENTIALS)
+            .await
+            .unwrap();
+        let sent = runner.last_params.lock().unwrap().clone().unwrap();
+        assert!(sent.identity_file.is_empty());
+        assert!(!crate::bootstrap::ssh_args(&sent).iter().any(|a| a == "-i"));
     }
 
     // ---- the held user (plan 037 §3.2.2) ----------------------------------------------

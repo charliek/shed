@@ -79,6 +79,15 @@ pub struct Params {
     /// detail) only so [`validate`] covers it on the same path as every other argv
     /// element.
     pub csr: String,
+    /// The one key ssh may offer (mirror Go `Params.IdentityFile`): the server entry's
+    /// `identity_file`, or empty for none. When set, the argv gains `-i <path> -o
+    /// IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none` after the fixed options
+    /// and before `-l` ([`ssh_args`]), so the entry enrols with that key first, with no
+    /// key that is only in the agent, and never over a shared connection another key
+    /// opened. [`validate`] holds it to the value rule
+    /// ([`shed_core::identityfile::check_value`]) and [`SystemSshRunner`] checks the file
+    /// before it spawns ssh. Empty leaves the argv exactly as it is without the field.
+    pub identity_file: String,
 }
 
 /// The ssh stdout JSON (mirrors Go `sdk.Bundle`, `sdk/bundle.go:16`). Every field is
@@ -168,6 +177,11 @@ pub enum BootstrapError {
     /// ssh failed to run (spawn error) with no useful stderr.
     #[error("sdk/bootstrap: ssh failed: {0}")]
     SshFailed(String),
+    /// The identity file cannot be handed to ssh: its value breaks the rule, or the file
+    /// cannot be used now (mirror Go's `*IdentityFileError` wrapped as `sdk/bootstrap: …`).
+    /// Returned before ssh is spawned.
+    #[error("sdk/bootstrap: {0}")]
+    IdentityFile(shed_core::identityfile::IdentityFileError),
     /// Invalid [`Params`] (would break argv construction / inject ssh options).
     #[error("sdk/bootstrap: {0}")]
     Validate(String),
@@ -235,11 +249,16 @@ pub fn ssh_args(p: &Params) -> Vec<String> {
         "ClearAllForwardings=yes".into(),
         "-o".into(),
         "PermitLocalCommand=no".into(),
-        "-l".into(),
-        BOOTSTRAP_USER.into(),
+    ];
+    // The entry's own key, when it has one: after the fixed options, before `-l`, exactly
+    // where Go's `sshArgs` puts `IdentityArgs`. Nothing at all when it has none.
+    args.extend(shed_core::identityfile::identity_args(&p.identity_file));
+    args.extend([
+        "-l".to_string(),
+        BOOTSTRAP_USER.to_string(),
         p.host.clone(),
         p.scope.clone(),
-    ];
+    ]);
     if !p.client_kind.is_empty() {
         args.push(p.client_kind.clone());
     }
@@ -297,6 +316,10 @@ pub fn validate(p: &Params) -> Result<(), BootstrapError> {
             p.client_kind
         )));
     }
+    // The identity file's value, under the one rule every reader applies (the file itself
+    // is checked by the runner, at its time of use).
+    shed_core::identityfile::check_entry_value("", &p.identity_file)
+        .map_err(BootstrapError::IdentityFile)?;
     validate_csr_arg(&p.csr)
 }
 
@@ -530,6 +553,13 @@ impl Default for SystemSshRunner {
 impl BootstrapRunner for SystemSshRunner {
     async fn run(&self, p: &Params) -> Result<Bundle, BootstrapError> {
         validate(p)?;
+        // The identity file is checked at the time of use, before ssh is spawned (Go
+        // `run`): a key removed since it was set fails here with its own reason, not as an
+        // ssh that "refused every key".
+        if !p.identity_file.is_empty() {
+            shed_core::identityfile::check_file(&p.identity_file)
+                .map_err(BootstrapError::IdentityFile)?;
+        }
         #[cfg(test)]
         let ssh = match &self.ssh_override {
             Some(path) => path.clone(),
@@ -692,7 +722,140 @@ mod tests {
             scope: "credentials".into(),
             client_kind: "host-agent".into(),
             csr: String::new(),
+            identity_file: String::new(),
         }
+    }
+
+    /// With an identity file, the exact vector: the four identity elements after the 17
+    /// fixed options and before `-l`, nothing else moved (Go `sshArgs` with
+    /// `Params.IdentityFile`).
+    #[test]
+    fn ssh_args_exact_vector_with_an_identity_file() {
+        let mut p = params();
+        p.identity_file = "/home/pat/.ssh/id work".into();
+        let got = ssh_args(&p);
+        let without = ssh_args(&params());
+        let at = without.iter().position(|a| a == "-l").unwrap();
+        let mut want = without[..at].to_vec();
+        want.extend(
+            [
+                "-i",
+                "/home/pat/.ssh/id work",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
+            ]
+            .map(String::from),
+        );
+        want.extend(without[at..].iter().cloned());
+        assert_eq!(got, want);
+        assert_eq!(got[36], "PermitLocalCommand=no");
+        assert_eq!(got[37], "-i", "right after PermitLocalCommand=no");
+        assert_eq!(got[45], "-l");
+    }
+
+    /// The Go-written fixture (`crates/fixtures/identityfile/`): every accepted entry,
+    /// read through the broker's discovery, gives Go's bootstrap argv byte for byte (scope
+    /// `control`, client kind `cli`, no CSR, the fixture's known_hosts), and every refused
+    /// entry is refused before ssh is spawned (a shim that records any spawn stays
+    /// untouched).
+    #[tokio::test]
+    async fn the_go_fixture_gives_go_s_bootstrap_argv_and_its_refusals_spawn_nothing() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/identityfile");
+        let expected: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("expected.json")).unwrap())
+                .unwrap();
+        let config = root.join("config.yaml");
+        let targets = crate::discovery::load_discovered_servers(config.to_str().unwrap()).unwrap();
+        let accepted = expected["accepted"].as_array().unwrap();
+        assert_eq!(targets.len(), accepted.len());
+        for want in accepted {
+            let name = want["entry"].as_str().unwrap();
+            let target = targets.iter().find(|t| t.name == name).unwrap();
+            assert_eq!(
+                target.identity_file,
+                want["identity_file"].as_str().unwrap(),
+                "{name}"
+            );
+            let p = Params {
+                host: target.ssh_host.clone(),
+                port: target.ssh_port,
+                known_hosts_path: expected["known_hosts"].as_str().unwrap().into(),
+                scope: "control".into(),
+                client_kind: "cli".into(),
+                csr: String::new(),
+                identity_file: target.identity_file.clone(),
+            };
+            validate(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let want_argv: Vec<String> = want["bootstrap_argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(ssh_args(&p), want_argv, "{name}");
+        }
+
+        let refused =
+            crate::discovery::load_discovered_servers(root.join("refused.yaml").to_str().unwrap())
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = dir.path().join("spawned");
+        let body = format!(": > '{}'\nexit 0\n", spawned.display());
+        let (_shim_dir, ssh) = write_shim(&body);
+        let runner = SystemSshRunner::with_shim(ssh, Duration::from_secs(5));
+        for want in expected["refused"].as_array().unwrap() {
+            let name = want["entry"].as_str().unwrap();
+            let target = refused.iter().find(|t| t.name == name).unwrap();
+            assert_eq!(
+                target.identity_file,
+                want["identity_file"].as_str().unwrap(),
+                "{name}: decoded as Go decodes it"
+            );
+            let p = Params {
+                identity_file: target.identity_file.clone(),
+                ..params()
+            };
+            // The argv-safety gate refuses it on its own, and so does the runner.
+            assert!(
+                matches!(validate(&p), Err(BootstrapError::IdentityFile(_))),
+                "{name}: validate"
+            );
+            match runner.run(&p).await {
+                Err(BootstrapError::IdentityFile(e)) => {
+                    assert_eq!(e.rule.map(|r| r.class()), want["class"].as_str(), "{name}")
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        assert!(!spawned.exists(), "no ssh was spawned for a refused value");
+    }
+
+    /// A file that is missing at the time of use is refused before ssh is spawned, with
+    /// its own reason, not as an ssh that refused every key.
+    #[tokio::test]
+    async fn a_missing_identity_file_is_refused_before_ssh() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = dir.path().join("spawned");
+        let (_shim_dir, ssh) = write_shim(&format!(": > '{}'\nexit 0\n", spawned.display()));
+        let p = Params {
+            identity_file: dir.path().join("gone").to_str().unwrap().into(),
+            ..params()
+        };
+        let err = SystemSshRunner::with_shim(ssh, Duration::from_secs(5))
+            .run(&p)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("cannot be used: the file does not exist"),
+            "{err}"
+        );
+        assert!(!spawned.exists());
     }
 
     #[test]

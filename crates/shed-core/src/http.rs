@@ -353,6 +353,9 @@ pub struct Client {
     /// be rebuilt identically (same pin, same resolver) when its pool has to go.
     pin: Option<String>,
     resolver: Arc<crate::tls::ClientCertResolver>,
+    /// Set only by [`Client::refused`]: why this client sends nothing. Every
+    /// request fails with it before a URL is built.
+    refusal: Option<String>,
 }
 
 impl Clone for Client {
@@ -370,6 +373,7 @@ impl Clone for Client {
             http: std::sync::RwLock::new(self.transport()),
             pin: self.pin.clone(),
             resolver: self.resolver.clone(),
+            refusal: self.refusal.clone(),
         }
     }
 }
@@ -412,6 +416,17 @@ impl Client {
         Self::build(base_url, server_name, String::new(), pin, Some(provider))
     }
 
+    /// A client for a configured server it must never contact: every request
+    /// fails with `ShedError::Config(refusal)` before a URL is built, so
+    /// nothing is sent anywhere. For an entry the config reader did not read
+    /// (plan 037 A8: it has no host it could trust), so the entry is still
+    /// listed, and says why it cannot be used, rather than silently dropped.
+    pub fn refused(server_name: String, refusal: String) -> Result<Self, ShedError> {
+        let mut client = Self::build(String::new(), server_name, String::new(), None, None)?;
+        client.refusal = Some(refusal);
+        Ok(client)
+    }
+
     /// Shared tail of the constructors: pin validation (fail-closed on a
     /// non-https URL) + the reqwest client build.
     fn build(
@@ -448,6 +463,7 @@ impl Client {
             http,
             pin,
             resolver,
+            refusal: None,
         })
     }
 
@@ -694,6 +710,10 @@ impl Client {
         segments: &[&str],
         query: &[(&str, String)],
     ) -> Result<reqwest::Url, ShedError> {
+        // Every request builds its URL here first: a refused client stops here.
+        if let Some(refusal) = &self.refusal {
+            return Err(ShedError::Config(refusal.clone()));
+        }
         let mut url = reqwest::Url::parse(&self.base_url)
             .map_err(|e| ShedError::Config(format!("invalid base URL {}: {e}", self.base_url)))?;
         {

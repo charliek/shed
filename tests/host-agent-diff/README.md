@@ -154,8 +154,15 @@ expected []ServerTarget`. Its one reader is the Rust runner
 (`golden_load_discovered_servers`, an in-crate test in `crates/shed-broker/src/discovery.rs`),
 which parses each vector's YAML and asserts equal `ServerTarget`s. It pins the load-bearing
 divergences from `shed-core::ShedConfig`: `ssh_port` defaults to **0** (not 22) when omitted,
-empty-host entries are skipped, targets sort by name; `auth_mode` and `user` are carried
-verbatim and required on every expected entry.
+empty-host entries are skipped, targets sort by name; `auth_mode`, `user` and
+`identity_file` are carried verbatim and required on every expected entry (an `identity_file`
+that is a list or a map, or is written with a tag, an anchor or over more than one line, is the
+unreadable marker every check refuses, and so is one in an entry with a merge key or a key written
+with a tag). A byte-order mark is skipped, only the first YAML document is read, and a raw CR
+outside a CRLF pair, NEL, U+2028 or U+2029 makes the whole file an error. The last two vectors
+hold the shapes of the plan 037 A8 reviews' tables that this reader parses;
+`both_readers_on_every_shape_of_the_review` in the same file pins each shape for shed-core's
+reader too, beside what Go reads.
 
 `fixtures/ssh_payload_shapes.json` (`"protocol_version": 1`) pins the four ssh-agent
 **response payload shapes** (`internal/ext/protocol/ssh.go`). The Rust runner

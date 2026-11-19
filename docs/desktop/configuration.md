@@ -90,6 +90,7 @@ servers:
     http_port: 8080      # default 8080
     ssh_port: 2222       # default 22
     user: pat            # written by the shed CLI; the user this entry is held to
+    identity_file: /home/pat/.ssh/id_work   # optional; the SSH key this entry uses
 default_server: buildbox
 ```
 
@@ -144,6 +145,103 @@ CLI writes `user` when it enrols the entry; the app only reads it.
 - When an entry's name cannot be pasted into a shell command as one word (it starts with `-`,
   or holds a line break or another non-printing character), the refusal gives the same advice
   in words instead of a command line.
+
+### The SSH key an entry uses
+
+An entry the `shed` CLI added or updated with `--identity-file` names the SSH key it uses
+(`identity_file`; see the CLI's
+[One SSH key per entry](../reference/cli.md#one-ssh-key-per-entry)). The app and its credential
+broker read it with the CLI's value rule:
+
+- **Every `ssh` they run for the entry passes the key**: `-i <path> -o IdentitiesOnly=yes -o
+  ControlMaster=no -o ControlPath=none`, byte for byte as the CLI does (the broker's enrolment
+  over `_bootstrap`, the terminal command). A roost connection (a shed's session list, the
+  bootstrap that installs roost, the craze hub) reads a generated ssh config whose stanza for
+  the host carries the same four lines and comes before your own config; it keeps its own
+  private connection, which its command line names.
+- **The file is checked each time the app or the broker builds an `ssh` command for the entry,
+  and each time it opens a tunnel or a command runner for it**, as the CLI checks it: it must
+  still be a regular file. One that is missing, or a value the rule refuses, is a refusal that
+  names the entry, and that `ssh` does not run: `entry "buildbox": identity_file
+  "/home/pat/.ssh/id_work" cannot be used: the file does not exist`. This is an early, clear
+  error instead of an `ssh` that quietly tries your other keys; it is not checked again for a
+  connection a tunnel that is already open makes later, for the local commands that only close
+  a shared connection, or when a terminal runs a command the app built for it earlier.
+- **A stored token is never used for the entry.** A `control_token` in `config.yaml` is not
+  sent (`entry "buildbox" cannot be used: it holds a control token …; the token was not sent.
+  Enrol it again: shed server update buildbox --refetch`), and neither is a
+  `credentials_token`.
+- **An entry the app cannot read exactly is never read as "no key".** The app reads a server
+  entry only when each line in it is a plain `key: value` (a plain or quoted key and a plain or
+  quoted value, on one line). An entry with any other line (an explicit `? key`, the fields as a
+  `{…}` mapping, a tag or an anchor such as `!!str …` or `&a …`, a merge key `<<`, a `|` or `>`
+  block, a value over more than one line, a repeated key, a list) is still listed, and every use
+  of it is refused: `entry "buildbox" cannot be used: shed reads a server entry only when each
+  line in it is a plain key: value …; write its fields one per line, as key: value`. Nothing is
+  sent to its server. So is an entry whose `host` is null (`host: null`, `host: ~` or a bare
+  `host:`); an entry with no `host` at all still uses its name as the host. The broker refuses
+  an entry with a merge key or a key written with a tag the same way, and an `identity_file` or
+  `user` written with a tag, an anchor or over more than one line.
+
+What the app and broker do not do: they do not check that a certificate was made for the
+entry's key (the CLI does). If `ssh` authenticates with another key that your own ssh config
+names for the host (a `Host` or `Match` stanza, or `Host *`, can add its `IdentityFile` lines
+after the entry's), the app accepts the certificate when it names the entry's `user`, and
+refuses it when it names anyone else ([the user an entry is held to](#the-user-an-entry-is-held-to)).
+Keep no other `IdentityFile` for that host if the entry must use one key. Restart the app after
+changing an entry's `identity_file`: it builds its control clients once, at start (the embedded
+broker picks the change up by itself).
+
+### How the app reads the file
+
+**The app reads `config.yaml` as the shed CLI writes it.** Every entry the CLI's own save path
+writes with ordinary values is read with the same host, ports, user and `identity_file` the
+CLI reads. An entry, or the whole file, written in a form the app does not read exactly is
+**refused by name, with a reason**; it is never read with missing fields filled by defaults. A
+file edited by hand into YAML forms the CLI never writes may be refused by the app while the
+CLI accepts it: that difference is by design. (`config.yaml` is your own file; the app's job is
+never to misread what the CLI wrote, not to defend against a hostile file.)
+
+- **Values** are read as YAML reads them: a `#` is a comment only after a space or a tab
+  (`/home/pat/.ssh/id#work` is that path), a quoted value keeps its `#`, double-quoted escapes
+  such as `\t` are decoded, `''` in a single-quoted value is one `'`, and a plain `null` or `~`
+  is no value (`user: null` is no user).
+- **Keys**: a key ends at the first `:` followed by a space or the end of the line, so an entry
+  named `prod:blue` or `10.0.0.5:8443` is read under that name. A name the CLI writes in YAML's
+  explicit form (a name longer than 128 bytes, written as `? <name>` and `: …`) is not readable
+  by the app: that entry is listed under its name and refused. So is a name that begins with a
+  character YAML gives a meaning there, such as `-prod`.
+- **The file**: a byte-order mark at the start is skipped, and only the first YAML document is
+  read (a `---` or `...` line after content ends it, as for the CLI).
+- **A file the app does not read at all**, so that no server or machine is listed and the app's
+  log says why: one that holds a carriage return that does not end a CRLF line, a next-line
+  character (U+0085), a line separator (U+2028) or a paragraph separator (U+2029) anywhere (the
+  escaped forms inside a double-quoted value are text); one with the key `servers:` twice; one
+  whose `servers:` is written in flow form (`servers: {…}`), or with a tag or an anchor
+  (`!!str servers:`, `servers: &s`), or whose first line under it is indented with a tab; and
+  one whose first `---` has content on its line. The
+  broker refuses the same line breaks, as an error reading the file.
+- **An entry the app does not read** (listed, and refused at every use, as above): any line in
+  it that is not a plain `key: value`, a line in it indented with a tab, or a null `host`.
+
+Limits, each refused rather than misread:
+
+- A value the CLI writes as a multi-line block (a path holding a line break, written `|-`)
+  makes the app refuse that entry. A line break is not an ordinary value for a host, a user or
+  a path.
+- A value the CLI writes with a `!!binary` tag (a string that is not valid UTF-8) makes the app
+  refuse that entry.
+- `machines:` entries are read by the older, more tolerant reader and carry no
+  `identity_file`.
+- An entry whose `host` is an empty string (`host: ""`) is read as an entry with an empty
+  host, as before.
+
+When **Add machine** writes a host or a user, it writes the value bare only when it is a plain
+token (letters, digits and `. _ - / @ :`, beginning with a letter, `_` or `/`, and not a word
+such as `yes` or `null`), and double-quoted otherwise, so any YAML reader reads back the text
+you typed. It refuses a value holding a control character, a line break, or a character YAML
+does not allow in a file at all (such as U+FFFE or U+FFFF), and it does not add to a file it
+does not read.
 
 ## Host-agent approval (`extensions.yaml`)
 

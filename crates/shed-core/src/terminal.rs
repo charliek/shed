@@ -29,8 +29,25 @@ pub fn ssh_command(
     known_hosts: &str,
     session: Option<&str>,
 ) -> TerminalCommand {
+    ssh_command_with_identity(shed, host, ssh_port, known_hosts, &[], session)
+}
+
+/// [`ssh_command`] for a server entry with an `identity_file`: `identity` is
+/// [`crate::identityfile::identity_file_args`]'s answer for the entry (checked by the
+/// caller right before, so a file that cannot be used never reaches an argv), placed
+/// right after the host-key options, where the Go CLI's `baseSSHArgs` places it. Empty
+/// `identity` is exactly [`ssh_command`].
+pub fn ssh_command_with_identity(
+    shed: &str,
+    host: &str,
+    ssh_port: u16,
+    known_hosts: &str,
+    identity: &[String],
+    session: Option<&str>,
+) -> TerminalCommand {
     let mut argv = vec!["ssh".to_string(), "-t".to_string()];
     argv.extend(ssh_host_key_opts(known_hosts));
+    argv.extend(identity.iter().cloned());
     argv.push(format!("{shed}@{host}"));
     argv.push("-p".to_string());
     argv.push(ssh_port.to_string());
@@ -62,8 +79,9 @@ pub fn quote_argv(argv: &[String]) -> String {
 }
 
 /// The shared `-o` host-key options: strict checking against the shed CLI's
-/// `known_hosts`. Used by both the interactive terminal ssh (`ssh_command`) and
-/// the non-interactive RC ssh (`rc::ssh_argv`), so the two never drift.
+/// `known_hosts`, for the interactive terminal ssh ([`ssh_command`]). (The RC ssh
+/// argv that once shared it went with the RC hub in plan 022; a machine's argv has
+/// its own, in `machine.rs`, because a machine pins only when its entry asks.)
 pub(crate) fn ssh_host_key_opts(known_hosts: &str) -> Vec<String> {
     vec![
         "-o".to_string(),
@@ -75,7 +93,6 @@ pub(crate) fn ssh_host_key_opts(known_hosts: &str) -> Vec<String> {
 
 /// POSIX single-quote a shell argument (only when it contains anything outside a
 /// conservative safe set), so the `command` line re-parses to the same argv.
-/// `pub(crate)` so `rc::ssh_argv` shares the exact quoting for the remote command.
 pub(crate) fn shell_quote(s: &str) -> String {
     let safe = !s.is_empty()
         && s.bytes()
@@ -265,6 +282,57 @@ mod tests {
         assert_eq!(
             c.command,
             "ssh -t -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/home/u/.shed/known_hosts web@10.0.0.5 -p 2222"
+        );
+    }
+
+    /// With the entry's identity args, the exact vector: the args right after the
+    /// host-key options, the rest unchanged; with none, exactly `ssh_command`.
+    #[test]
+    fn ssh_command_with_identity_places_the_key_after_the_host_key_options() {
+        let identity = crate::identityfile::identity_args("/home/pat/.ssh/id work");
+        let c = ssh_command_with_identity(
+            "web",
+            "10.0.0.5",
+            2222,
+            "/home/u/.shed/known_hosts",
+            &identity,
+            Some("main"),
+        );
+        assert_eq!(
+            c.argv,
+            [
+                "ssh",
+                "-t",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "UserKnownHostsFile=/home/u/.shed/known_hosts",
+                "-i",
+                "/home/pat/.ssh/id work",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
+                "web@10.0.0.5",
+                "-p",
+                "2222",
+                "tmux",
+                "attach",
+                "-t",
+                "main",
+            ]
+        );
+        // The path with a space is quoted so the line re-parses.
+        assert!(
+            c.command.contains("-i '/home/pat/.ssh/id work'"),
+            "{}",
+            c.command
+        );
+        assert_eq!(
+            ssh_command_with_identity("web", "h", 22, "/k", &[], None),
+            ssh_command("web", "h", 22, "/k", None)
         );
     }
 

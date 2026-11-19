@@ -476,6 +476,7 @@ mod tests {
             ssh_port: 0,
             auth_mode: String::new(),
             user: String::new(),
+            identity_file: String::new(),
         }
     }
 
@@ -549,6 +550,7 @@ mod tests {
             ssh_port: 2222,
             auth_mode: String::new(),
             user: String::new(),
+            identity_file: String::new(),
         }
     }
 
@@ -613,6 +615,7 @@ mod tests {
                 ssh_port: v["ssh_port"].as_u64().unwrap() as u16,
                 auth_mode: String::new(),
                 user: String::new(),
+                identity_file: String::new(),
             };
             assert_eq!(
                 should_mint(&deps, &target),
@@ -683,6 +686,7 @@ mod tests {
             ssh_port: 0,
             auth_mode: String::new(),
             user: String::new(),
+            identity_file: String::new(),
         };
         s.reconcile(vec![mk("t1", "")]).await;
         s.reconcile(vec![mk("t2", "")]).await; // token rotated
@@ -717,6 +721,34 @@ mod tests {
         assert_eq!(fg.stopped_names(), vec!["s".to_string(), "s".to_string()]);
         let inner = s.inner.lock().unwrap();
         assert_eq!(inner.groups["s"].target.user, "admin");
+    }
+
+    /// A changed `identity_file` (the CLI's `--identity-file`) restarts the server's group
+    /// the same way, so its sources are rebuilt and the ssh they run offers the new key
+    /// (plan 037 A8). What bounds who they act as is still the entry's `user`; nothing
+    /// checks that a certificate was made for the key.
+    #[tokio::test]
+    async fn reconcile_identity_file_change_restarts() {
+        let fg = Arc::new(FakeGroups::default());
+        let s = test_supervisor(&fg);
+        let mk = |key: &str| ServerTarget {
+            identity_file: key.into(),
+            ..secure_target()
+        };
+        s.reconcile(vec![mk("")]).await;
+        s.reconcile(vec![mk("/home/pat/.ssh/id_work")]).await; // set
+        s.reconcile(vec![mk("/home/pat/.ssh/id_work")]).await; // unchanged
+        s.reconcile(vec![mk("/home/pat/.ssh/id_admin")]).await; // changed
+        assert_eq!(
+            fg.start_count(),
+            3,
+            "each change restarts, a no-op does not"
+        );
+        let inner = s.inner.lock().unwrap();
+        assert_eq!(
+            inner.groups["s"].target.identity_file,
+            "/home/pat/.ssh/id_admin"
+        );
     }
 
     const FAR_FUTURE: Option<i64> = Some(4_102_444_800);

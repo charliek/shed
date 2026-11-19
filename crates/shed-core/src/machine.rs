@@ -24,8 +24,19 @@
 //! we say nothing and let `~/.ssh/config` and ssh's own defaults decide. Forcing
 //! the shed posture onto a machine would break every host the operator reaches
 //! through a jump host, an agent, or a per-host identity.
+//!
+//! **The one thing a builder reads.** A shed's reach entry may carry its server
+//! entry's `identity_file` (a `machines:` entry never does). The argv builders
+//! check that file right where they emit its options ([`check_identity`]: it must
+//! still be a regular file), so every command line built here for such an entry,
+//! the first one or a respawn's, is refused with a typed error when the key is
+//! gone, instead of an ssh that quietly tries other keys. The check is made when a
+//! command line is BUILT: a terminal that runs a built command later, a connection
+//! an already-open tunnel makes, and a local command that only closes a shared
+//! connection are not checked again. An entry with no identity file reads nothing.
 
 use crate::config::{MachineEntry, ShedConfig};
+use crate::identityfile::IdentityFileError;
 
 /// ssh `ConnectTimeout` for the non-interactive ops — bounds connection setup
 /// only, never a hung remote command (same value + rationale as `RcService`).
@@ -81,13 +92,19 @@ pub fn resolve<'a>(config: &'a ShedConfig, name: &str) -> Result<&'a MachineEntr
 /// the conditional `terminal::shell_quote`. One quoter everywhere means a
 /// command line reads identically whoever built it, on a mixed Go/Rust fleet;
 /// the cost is that a printed line is quoted even where it needn't be.
-pub fn ssh_argv(entry: &MachineEntry, remote_argv: &[String]) -> Vec<String> {
+///
+/// `Err` only for an entry whose identity file cannot be used now ([`check_identity`]).
+pub fn ssh_argv(
+    entry: &MachineEntry,
+    remote_argv: &[String],
+) -> Result<Vec<String>, IdentityFileError> {
     let mut argv = vec![
         "ssh".to_string(),
         "-o".to_string(),
         "BatchMode=yes".to_string(),
     ];
     argv.extend(host_key_opts(entry));
+    argv.extend(identity_opts(entry)?);
     argv.push("-o".to_string());
     argv.push(format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"));
     argv.extend(port_opts(entry));
@@ -96,7 +113,7 @@ pub fn ssh_argv(entry: &MachineEntry, remote_argv: &[String]) -> Vec<String> {
     // The remote command line and a PRINTED one are the same string by
     // construction — one quoter everywhere is the whole point.
     argv.push(display_line(remote_argv));
-    argv
+    Ok(argv)
 }
 
 /// Interactive (TTY) ssh to a machine — an `attach`'s exec target. No
@@ -108,21 +125,34 @@ pub fn ssh_argv(entry: &MachineEntry, remote_argv: &[String]) -> Vec<String> {
 /// shell, so bare argv here would let a metacharacter in any element escape into
 /// that shell — the same hole [`ssh_argv`] already closed. One quoter, both
 /// directions.
-pub fn tty_argv(entry: &MachineEntry, remote_argv: &[String]) -> Vec<String> {
+///
+/// `Err` only for an entry whose identity file cannot be used now ([`check_identity`]).
+pub fn tty_argv(
+    entry: &MachineEntry,
+    remote_argv: &[String],
+) -> Result<Vec<String>, IdentityFileError> {
     let mut argv = vec!["ssh".to_string(), "-t".to_string()];
     argv.extend(host_key_opts(entry));
+    argv.extend(identity_opts(entry)?);
     argv.extend(port_opts(entry));
     argv.push(user_at_host(entry));
     argv.push("--".to_string());
     argv.push(display_line(remote_argv));
-    argv
+    Ok(argv)
 }
 
 /// `ssh -N -L <local>:127.0.0.1:<remote> <machine>` — the background tunnel a
 /// client runs its hub reads through. `-N` runs no remote command;
 /// `ExitOnForwardFailure` turns a taken local port into an immediate non-zero
 /// exit instead of a tunnel that silently forwards nothing.
-pub fn forward_argv(entry: &MachineEntry, local_port: u16, remote_port: u16) -> Vec<String> {
+///
+/// `Err` only for an entry whose identity file cannot be used now ([`check_identity`]):
+/// a forward respawned after its key was removed is refused here, before ssh runs.
+pub fn forward_argv(
+    entry: &MachineEntry,
+    local_port: u16,
+    remote_port: u16,
+) -> Result<Vec<String>, IdentityFileError> {
     let mut argv = vec![
         "ssh".to_string(),
         "-N".to_string(),
@@ -132,6 +162,7 @@ pub fn forward_argv(entry: &MachineEntry, local_port: u16, remote_port: u16) -> 
         "ExitOnForwardFailure=yes".to_string(),
     ];
     argv.extend(host_key_opts(entry));
+    argv.extend(identity_opts(entry)?);
     argv.push("-o".to_string());
     argv.push(format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"));
     argv.extend(port_opts(entry));
@@ -147,7 +178,7 @@ pub fn forward_argv(entry: &MachineEntry, local_port: u16, remote_port: u16) -> 
     // succeeding on v6.
     argv.push(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"));
     argv.push(user_at_host(entry));
-    argv
+    Ok(argv)
 }
 
 /// Render an argv as one copy-pasteable shell line — a `--print` output, a
@@ -177,6 +208,38 @@ fn host_key_opts(entry: &MachineEntry) -> Vec<String> {
         ],
         None => Vec::new(),
     }
+}
+
+/// The entry's identity file, checked now (Go `CheckIdentityFile`: the value rule, and the
+/// file is still a regular file that can be opened): `Ok` for an entry with none, which
+/// reads nothing. Made each time a command line is built for a shed's reach entry, or a
+/// tunnel or a runner is opened (ensured) for it: the argv builders here call it where they
+/// emit the key's options, and the transports that read a generated ssh config instead
+/// (`shed_app::roost`'s bridge on each `ensure`, its exec runner on each exec) call it
+/// first. It is an early, typed refusal that names the entry, not a guard on every ssh
+/// process: a connection an already-open tunnel makes later (roost's bridge spawns those
+/// itself), and the local commands that only close a shared connection, are not checked
+/// again.
+pub fn check_identity(entry: &MachineEntry) -> Result<(), IdentityFileError> {
+    match entry.identity_file.as_deref() {
+        Some(path) => crate::identityfile::check_entry_file(&entry.name, path),
+        None => Ok(()),
+    }
+}
+
+/// The entry's own SSH key, when it has one (a shed's roost host whose server entry names
+/// an `identity_file`; never a `machines:` entry): `-i <path> -o IdentitiesOnly=yes -o
+/// ControlMaster=no -o ControlPath=none`, right after the host-key options, as the Go
+/// CLI places it, once [`check_identity`] passes. `-i` is a local ssh option, not part of
+/// the remote command line, so the machine-transport contract (`tests/machine-transport/`)
+/// does not see it.
+fn identity_opts(entry: &MachineEntry) -> Result<Vec<String>, IdentityFileError> {
+    check_identity(entry)?;
+    Ok(entry
+        .identity_file
+        .as_deref()
+        .map(crate::identityfile::identity_args)
+        .unwrap_or_default())
 }
 
 /// `-p <port>` only for a non-default port, so an entry that says nothing lets
@@ -209,7 +272,164 @@ mod tests {
             user: Some("charliek".into()),
             ssh_port: 2022,
             known_hosts: Some("/kh".into()),
+            identity_file: None,
         }
+    }
+
+    /// A temp key file (with a space in its name), removed on drop (shed-core takes no
+    /// `tempfile` dependency).
+    struct Key(std::path::PathBuf);
+
+    impl Key {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("shed-core-machine-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("id work");
+            std::fs::write(&path, "a key file: never read\n").unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for Key {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    /// A shed's reach entry with its server entry's `identity_file`: the exact vectors.
+    /// The key half comes right after the host-key options, then the connection half,
+    /// exactly as the Go CLI orders them; nothing else moves.
+    #[test]
+    fn an_identity_file_is_carried_in_the_exact_place() {
+        let key = Key::new("exact");
+        let entry = MachineEntry {
+            name: "roost:shed/box".into(),
+            host: "shed.example.test".into(),
+            user: Some("box".into()),
+            ssh_port: 2222,
+            known_hosts: Some("/home/pat/.shed/known_hosts".into()),
+            identity_file: Some(key.path().to_string()),
+        };
+        let identity = [
+            "-i",
+            key.path(),
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+        ];
+        let host_keys = [
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "UserKnownHostsFile=/home/pat/.shed/known_hosts",
+        ];
+        let mut want: Vec<&str> = vec!["ssh", "-o", "BatchMode=yes"];
+        want.extend(host_keys);
+        want.extend(identity);
+        want.extend([
+            "-o",
+            "ConnectTimeout=10",
+            "-p",
+            "2222",
+            "box@shed.example.test",
+            "--",
+            "'true'",
+        ]);
+        assert_eq!(ssh_argv(&entry, &["true".into()]).unwrap(), want);
+
+        let mut want: Vec<&str> = vec!["ssh", "-t"];
+        want.extend(host_keys);
+        want.extend(identity);
+        want.extend(["-p", "2222", "box@shed.example.test", "--", "'true'"]);
+        assert_eq!(tty_argv(&entry, &["true".into()]).unwrap(), want);
+
+        let mut want: Vec<&str> = vec![
+            "ssh",
+            "-N",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+        ];
+        want.extend(host_keys);
+        want.extend(identity);
+        want.extend([
+            "-o",
+            "ConnectTimeout=10",
+            "-p",
+            "2222",
+            "-L",
+            "127.0.0.1:1:127.0.0.1:2",
+            "box@shed.example.test",
+        ]);
+        assert_eq!(forward_argv(&entry, 1, 2).unwrap(), want);
+
+        // Without the field, the same entry's argv is what it always was.
+        let none = MachineEntry {
+            identity_file: None,
+            ..entry.clone()
+        };
+        let argv = ssh_argv(&none, &["true".into()]).unwrap();
+        assert!(!argv
+            .iter()
+            .any(|a| a == "-i" || a.starts_with("Identities")));
+        let with = ssh_argv(&entry, &["true".into()]).unwrap();
+        let without_identity: Vec<String> = with
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !(7..15).contains(i))
+            .map(|(_, a)| a.clone())
+            .collect();
+        assert_eq!(without_identity, argv);
+    }
+
+    /// The file is checked where its options are emitted: once the key is gone (or the
+    /// value breaks the rule), every builder refuses for the entry, by name, and builds
+    /// nothing to spawn; an entry with no identity file reads nothing and never fails.
+    #[test]
+    fn a_key_that_cannot_be_used_builds_no_argv() {
+        let key = Key::new("gone");
+        let entry = MachineEntry {
+            name: "roost:shed/box".into(),
+            host: "shed.example.test".into(),
+            identity_file: Some(key.path().to_string()),
+            ..Default::default()
+        };
+        assert!(check_identity(&entry).is_ok());
+        std::fs::remove_file(&key.0).unwrap();
+        let want = format!(
+            "entry \"roost:shed/box\": identity_file {:?} cannot be used: the file does not exist",
+            key.path()
+        );
+        assert_eq!(check_identity(&entry).unwrap_err().to_string(), want);
+        assert_eq!(
+            ssh_argv(&entry, &["true".into()]).unwrap_err().to_string(),
+            want
+        );
+        assert_eq!(
+            tty_argv(&entry, &["true".into()]).unwrap_err().to_string(),
+            want
+        );
+        assert_eq!(forward_argv(&entry, 1, 2).unwrap_err().to_string(), want);
+        let refused = MachineEntry {
+            identity_file: Some("relative/key".into()),
+            ..entry.clone()
+        };
+        assert!(forward_argv(&refused, 1, 2).is_err());
+        let none = MachineEntry {
+            identity_file: None,
+            ..entry
+        };
+        assert!(forward_argv(&none, 1, 2).is_ok());
     }
 
     fn bare() -> MachineEntry {
@@ -223,7 +443,7 @@ mod tests {
 
     #[test]
     fn a_full_machine_entry_pins_user_port_and_host_key() {
-        let argv = ssh_argv(&full(), &["sx".into(), "rc".into(), "list".into()]);
+        let argv = ssh_argv(&full(), &["sx".into(), "rc".into(), "list".into()]).unwrap();
         assert_eq!(argv[0], "ssh");
         assert!(argv.contains(&"BatchMode=yes".to_string()));
         assert!(argv.contains(&"StrictHostKeyChecking=yes".to_string()));
@@ -237,7 +457,7 @@ mod tests {
 
     #[test]
     fn a_bare_machine_entry_says_nothing_ssh_config_can_decide() {
-        let argv = ssh_argv(&bare(), &["sx".into(), "rc".into(), "list".into()]);
+        let argv = ssh_argv(&bare(), &["sx".into(), "rc".into(), "list".into()]).unwrap();
         // No host-key override, no -p: ~/.ssh/config keeps its say.
         assert!(!argv.iter().any(|a| a.starts_with("UserKnownHostsFile")));
         assert!(!argv.contains(&"StrictHostKeyChecking=yes".to_string()));
@@ -248,7 +468,7 @@ mod tests {
 
     #[test]
     fn tty_argv_asks_for_a_terminal_and_never_batches() {
-        let argv = tty_argv(&full(), &["tmux".into(), "attach".into()]);
+        let argv = tty_argv(&full(), &["tmux".into(), "attach".into()]).unwrap();
         assert_eq!(&argv[..2], ["ssh", "-t"]);
         assert!(!argv.contains(&"BatchMode=yes".to_string()));
         // …and carries the remote command as ONE always-quoted line after `--`,
@@ -262,15 +482,15 @@ mod tests {
     #[test]
     fn tty_argv_quotes_every_remote_element_like_the_batch_builder() {
         let evil = ["tmux".to_string(), "attach; touch /tmp/pwn".to_string()];
-        let tty = tty_argv(&full(), &evil);
-        let batch = ssh_argv(&full(), &evil);
+        let tty = tty_argv(&full(), &evil).unwrap();
+        let batch = ssh_argv(&full(), &evil).unwrap();
         assert_eq!(tty.last().unwrap(), batch.last().unwrap());
         assert_eq!(tty.last().unwrap(), "'tmux' 'attach; touch /tmp/pwn'");
     }
 
     #[test]
     fn forward_argv_binds_the_loopback_port_and_fails_loudly() {
-        let argv = forward_argv(&full(), 40123, 1029);
+        let argv = forward_argv(&full(), 40123, 1029).unwrap();
         assert!(argv.contains(&"-N".to_string()));
         assert!(argv.contains(&"ExitOnForwardFailure=yes".to_string()));
         // The BIND ADDRESS is pinned, not left to `localhost` resolution — the
