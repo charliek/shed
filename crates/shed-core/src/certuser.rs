@@ -175,6 +175,13 @@ fn user_value(tag: u8, value: &[u8]) -> Result<CertUser, CertUserError> {
     }
 }
 
+/// Whether `name` is a valid user name (`^[a-z][a-z0-9-]{0,62}$`, exactly): the same test
+/// [`cert_user`] applies to a userId value. For a caller that holds a user name it did not
+/// read from a certificate (a config file's `user`) and must decide whether to quote it.
+pub fn is_user_name(name: &str) -> bool {
+    valid_user_name(name.as_bytes())
+}
+
 /// `^[a-z][a-z0-9-]{0,62}$` over bytes, exactly (Go's `userNamePattern`; no trailing
 /// newline is admitted).
 fn valid_user_name(name: &[u8]) -> bool {
@@ -287,6 +294,27 @@ mod tests {
 
     fn cat(parts: &[&[u8]]) -> Vec<u8> {
         parts.concat()
+    }
+
+    /// `is_user_name` is the reader's own name test, exposed for config values.
+    #[test]
+    fn is_user_name_is_the_readers_rule() {
+        for ok in ["pat", "a", "build-1", &format!("a{}", "b".repeat(62))] {
+            assert!(is_user_name(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "Pat",
+            "1pat",
+            "-pat",
+            "pat\n",
+            "pa t",
+            "!implicit",
+            "\"pat\"",
+            &format!("a{}", "b".repeat(63)),
+        ] {
+            assert!(!is_user_name(bad), "{bad:?}");
+        }
     }
 
     fn uid(tag: u8, value: &[u8]) -> Vec<u8> {

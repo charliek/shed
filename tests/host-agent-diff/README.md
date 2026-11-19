@@ -150,12 +150,12 @@ carrying `"protocol_version": 2`. The Rust runner
 `HostAgentConfig::gate_namespaces` match every vector.
 
 `fixtures/load_discovered_servers.json` (`"protocol_version": 1`) is `config.yaml text →
-expected []ServerTarget`. The Rust runner (`golden_load_discovered_servers`, an
-**in-crate** `controltoken.rs` test — the binary crate has no lib, so `tests/golden.rs`
-can't reach `load_discovered_servers`) parses each vector's YAML and asserts equal
-`ServerTarget`s. It pins the load-bearing divergences from `shed-core::ShedConfig`:
-`ssh_port` defaults to **0** (not 22) when omitted, empty-host entries are skipped,
-targets sort by name.
+expected []ServerTarget`. Its one reader is the Rust runner
+(`golden_load_discovered_servers`, an in-crate test in `crates/shed-broker/src/discovery.rs`),
+which parses each vector's YAML and asserts equal `ServerTarget`s. It pins the load-bearing
+divergences from `shed-core::ShedConfig`: `ssh_port` defaults to **0** (not 22) when omitted,
+empty-host entries are skipped, targets sort by name; `auth_mode` and `user` are carried
+verbatim and required on every expected entry.
 
 `fixtures/ssh_payload_shapes.json` (`"protocol_version": 1`) pins the four ssh-agent
 **response payload shapes** (`internal/ext/protocol/ssh.go`). The Rust runner

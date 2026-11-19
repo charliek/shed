@@ -89,10 +89,61 @@ servers:
     host: buildbox
     http_port: 8080      # default 8080
     ssh_port: 2222       # default 22
+    user: pat            # written by the shed CLI; the user this entry is held to
 default_server: buildbox
 ```
 
 A missing file degrades to an empty host list (no crash).
+
+### The user an entry is held to
+
+On a server with a user list, every client certificate names the user it was issued to. The
+app (its control requests, and the credential broker's own certificate) uses a certificate only
+when it names the entry's `user`, or the implicit user of a server with no user list. The `shed`
+CLI writes `user` when it enrols the entry; the app only reads it.
+
+- **A certificate for another user is refused.** When `ssh` can offer keys of two users and the
+  server issues a certificate for the other one, the app does not use it: it keeps the
+  certificate it holds and writes nothing. When the server then refuses the request, the host
+  error says why, and so does the credential broker's last error for that server (a
+  namespace's `last_error` in [`broker.status`](ipc.md); the broker log has it too):
+
+  ```text
+  server "buildbox": the server issued a certificate for user "admin", but this entry is held
+  to "pat"; it was not used. Fix it with the shed CLI (shed server update buildbox
+  --identity-file <key>, or --refetch --allow-user-change), then restart the app.
+  ```
+
+- **A certificate that names no user is refused.** Only a shed-server older than 0.10.0 issues
+  one:
+
+  ```text
+  server "buildbox": the server issued a certificate that names no user (a shed-server older
+  than 0.10.0); it was not used. Upgrade the server, then restart the app.
+  ```
+
+- **Restart the app after changing an entry's user** (`shed server update <name> --refetch`,
+  with or without `--allow-user-change`). The app builds its control clients once, at start.
+  The embedded broker picks up a changed `user` by itself.
+- **Record the user once with the CLI.** For an entry with no `user`, the app holds the first
+  named user it is issued, in memory only, so after a restart it takes the first named user
+  again. The broker keeps its user across restarts through the certificate it stores. Run
+  `shed server update <name> --refetch` once, even for a server you use only from the app, so
+  `config.yaml` records the user and both paths hold it.
+- A stored broker certificate that names no user, names another user than the entry's `user`,
+  or cannot be read is not presented: the broker logs why and enrols again.
+- For an entry with no `user`, the broker uses the certificate that sets the first user only
+  once it has stored it, so a restart cannot forget that user. If its state directory is not
+  writable, it refuses that certificate with a message that says it could not be stored.
+- A `user` that is not a plain user name (a list or a map, a number, a value with a space)
+  matches no certificate for a named user: every one is refused, as for another user. It is
+  never read as "no user".
+- An unquoted value is read as its text, by the app as by the `shed` CLI: `user: true` is the
+  user name `true`. Quote the value (`user: "pat"`) if you mean a name that YAML would read as
+  something else.
+- When an entry's name cannot be pasted into a shell command as one word (it starts with `-`,
+  or holds a line break or another non-printing character), the refusal gives the same advice
+  in words instead of a command line.
 
 ## Host-agent approval (`extensions.yaml`)
 

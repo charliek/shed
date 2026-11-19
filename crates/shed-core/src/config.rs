@@ -3,7 +3,7 @@
 //! indentation-aware reader scoped to the machine-generated shape
 //! (`servers: {NAME: {host, http_port, ssh_port, control_token, api_url,
 //! tls_cert_fingerprint, auth_mode, client_cert_file, client_key_file,
-//! client_cert_expires_at}}` + `default_server`), so no client takes on a
+//! client_cert_expires_at, user}}` + `default_server`), so no client takes on a
 //! YAML dependency. The GTK client (M2) reads secure/token-gated Linux hosts through
 //! this, so it carries **all** per-server fields — not just host/ports.
 //!
@@ -49,6 +49,13 @@ pub struct ShedServerEntry {
     /// RFC3339 expiry of the certificate, cached so the proactive re-enrollment
     /// check costs no file read. The certificate itself remains the authority.
     pub client_cert_expires_at: String,
+    /// The named user this entry is held to (Go `config.ServerEntry.User`), written by
+    /// the shed CLI when it enrols the entry; empty when absent (a server with no user
+    /// list, or an entry with no certificate yet). The app only reads it: a client
+    /// certificate issued for another named user is refused
+    /// ([`crate::token::ControlTokenProvider::with_held_user`]). A `user` that is not a
+    /// plain string reads as [`USER_NOT_A_STRING`] (fail closed).
+    pub user: String,
 }
 
 /// The resolved control-plane endpoint + TLS pin for a server entry.
@@ -216,10 +223,15 @@ impl ShedConfig {
         let Node::Map(top) = yaml_lite::parse(text) else {
             return Self::default();
         };
+        // A bare `name:` entry has every field at its default, like `name: {}`.
+        let no_fields = std::collections::HashMap::new();
+        let fields_of = |value| entry_fields(value, &no_fields);
         let mut servers = Vec::new();
         if let Some(Node::Map(server_map)) = top.get("servers") {
             for (name, value) in server_map {
-                let Node::Map(fields) = value else { continue };
+                let Some(fields) = fields_of(value) else {
+                    continue;
+                };
                 let scalar = |k: &str| fields.get(k).and_then(Node::as_scalar);
                 servers.push(ShedServerEntry {
                     name: name.clone(),
@@ -248,6 +260,7 @@ impl ShedConfig {
                     client_cert_expires_at: scalar("client_cert_expires_at")
                         .unwrap_or("")
                         .to_string(),
+                    user: config_user(fields.get("user")),
                 });
             }
         }
@@ -258,7 +271,9 @@ impl ShedConfig {
         let mut machines = Vec::new();
         if let Some(Node::Map(machine_map)) = top.get("machines") {
             for (name, value) in machine_map {
-                let Node::Map(fields) = value else { continue };
+                let Some(fields) = fields_of(value) else {
+                    continue;
+                };
                 let scalar = |k: &str| fields.get(k).and_then(Node::as_scalar);
                 // An optional string is ABSENT when the key is missing OR its
                 // value is empty.
@@ -290,9 +305,43 @@ impl ShedConfig {
     }
 }
 
+/// What [`ShedServerEntry::user`] holds when config.yaml's `user` is not a plain string (a
+/// list or a map, which no shed CLI writes and Go refuses to load at all). It is no valid
+/// user name (a plain YAML value cannot start with `!`), so a provider held to it refuses
+/// every certificate for a named user, as for any other value that is no user name: the
+/// entry fails closed, never as "no user recorded".
+pub const USER_NOT_A_STRING: &str = "!not-a-string";
+
+/// An entry's fields: its map, or `empty` for a bare `name:` entry; `None` for anything
+/// else (the entry is skipped).
+fn entry_fields<'a>(
+    value: &'a Node,
+    empty: &'a std::collections::HashMap<String, Node>,
+) -> Option<&'a std::collections::HashMap<String, Node>> {
+    match value {
+        Node::Map(fields) => Some(fields),
+        Node::Null => Some(empty),
+        _ => None,
+    }
+}
+
+/// An entry's `user` as the readers hold it: absent or a bare `user:` → `""` (no user
+/// recorded); a scalar → verbatim (the CLI writes a valid user name, and the provider
+/// compares it byte for byte, so a hand-edited value that is no user name matches no
+/// certificate and refuses); anything else → [`USER_NOT_A_STRING`].
+fn config_user(node: Option<&Node>) -> String {
+    match node {
+        None | Some(Node::Null) => String::new(),
+        Some(Node::Scalar(s)) => s.clone(),
+        Some(Node::Map(_) | Node::Seq) => USER_NOT_A_STRING.to_string(),
+    }
+}
+
 /// A deliberately tiny indentation-based reader. Handles exactly what
 /// `~/.shed/config.yaml` contains: nested maps and scalar leaves. Inline `{}` is
-/// an empty map; comments (`#`) and blank lines are skipped.
+/// an empty map, a bare `key:` is null; comments (`#`) and blank lines are skipped. A
+/// block sequence under a key is recognized as one (so it is never mistaken for an
+/// empty value), but its items are not read.
 mod yaml_lite {
     use std::collections::HashMap;
 
@@ -300,21 +349,38 @@ mod yaml_lite {
     pub enum Node {
         Map(HashMap<String, Node>),
         Scalar(String),
+        /// A bare `key:` with no value and no block under it.
+        Null,
+        /// A block sequence (`- item` lines) under a key. Its items are not read: no
+        /// field of the config is a list, and a value that is one is only ever an
+        /// error to report, never data (a `user:` list must not read as no user).
+        Seq,
     }
 
     impl Node {
         pub fn as_scalar(&self) -> Option<&str> {
             match self {
                 Node::Scalar(s) => Some(s),
-                Node::Map(_) => None,
+                _ => None,
             }
         }
+    }
+
+    enum Value {
+        /// `key: text` — a scalar.
+        Scalar(String),
+        /// `key: {}` — an inline empty map.
+        EmptyMap,
+        /// `key:` — a nested block, a block sequence, or nothing.
+        Open,
     }
 
     struct Line {
         indent: usize,
         key: String,
-        value: Option<String>, // None → a nested block follows
+        value: Value,
+        /// A block-sequence item (`- …`); its key and value are not read.
+        item: bool,
     }
 
     pub fn parse(text: &str) -> Node {
@@ -326,6 +392,14 @@ mod yaml_lite {
                     return None;
                 }
                 let indent = raw.len() - raw.trim_start_matches(' ').len();
+                if trimmed == "-" || trimmed.starts_with("- ") {
+                    return Some(Line {
+                        indent,
+                        key: String::new(),
+                        value: Value::Open,
+                        item: true,
+                    });
+                }
                 let colon = raw.find(':')?;
                 let key = raw[..colon].trim();
                 let mut rest = raw[colon + 1..].trim().to_string();
@@ -333,15 +407,18 @@ mod yaml_lite {
                 if let Some(hash) = rest.find('#') {
                     rest = rest[..hash].trim().to_string();
                 }
-                let value = if rest.is_empty() || rest == "{}" {
-                    None
+                let value = if rest.is_empty() {
+                    Value::Open
+                } else if rest == "{}" {
+                    Value::EmptyMap
                 } else {
-                    Some(unquote(&rest))
+                    Value::Scalar(unquote(&rest))
                 };
                 Some(Line {
                     indent,
                     key: unquote(key),
                     value,
+                    item: false,
                 })
             })
             .collect();
@@ -360,23 +437,41 @@ mod yaml_lite {
             if indent <= parent_indent {
                 break;
             }
-            if indent != child_indent {
-                // A line deeper than expected without a parent (defensive skip).
+            if indent != child_indent || lines[*index].item {
+                // A line deeper than expected without a parent, or a sequence item no
+                // key owns (defensive skip).
                 *index += 1;
                 continue;
             }
             let key = lines[*index].key.clone();
-            match lines[*index].value.clone() {
-                Some(value) => {
-                    map.insert(key, Node::Scalar(value));
-                    *index += 1;
+            *index += 1;
+            let node = match &lines[*index - 1].value {
+                Value::Scalar(value) => Node::Scalar(value.clone()),
+                Value::EmptyMap | Value::Open
+                    if lines
+                        .get(*index)
+                        .is_some_and(|next| next.item && next.indent as isize >= child_indent) =>
+                {
+                    // A block sequence: its items may sit at the key's own indent. Skip
+                    // them, and anything nested under them.
+                    let item_indent = lines[*index].indent;
+                    while lines.get(*index).is_some_and(|l| {
+                        (l.item && l.indent == item_indent) || l.indent > item_indent
+                    }) {
+                        *index += 1;
+                    }
+                    Node::Seq
                 }
-                None => {
-                    *index += 1;
-                    let child = build(lines, index, child_indent);
-                    map.insert(key, child);
+                Value::Open
+                    if !lines
+                        .get(*index)
+                        .is_some_and(|next| next.indent as isize > child_indent) =>
+                {
+                    Node::Null
                 }
-            }
+                Value::EmptyMap | Value::Open => build(lines, index, child_indent),
+            };
+            map.insert(key, node);
         }
         Node::Map(map)
     }
@@ -538,7 +633,23 @@ default_server: ghost
         assert_eq!(config.default_server.as_deref(), Some("mini2"));
         // Sorted by name (byte-wise: '2' (0x32) < 'm' (0x6d), so mini2 < minimal).
         let names: Vec<&str> = config.servers.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["mini2", "minimal", "secure"]);
+        assert_eq!(
+            names,
+            [
+                "mini2",
+                "minimal",
+                "secure",
+                "u-bare",
+                "u-blockmap",
+                "u-flowlist",
+                "u-flowmap",
+                "u-list",
+                "u-listflat",
+                "u-number",
+                "u-true",
+                "u-truequoted"
+            ]
+        );
 
         let mini2 = by_name(&config, "mini2");
         assert_eq!(mini2.host, "mini2");
@@ -712,6 +823,33 @@ default_server: mini2
             "/Users/dev/.shed/creds/secure/client.key"
         );
         assert_eq!(secure.client_cert_expires_at, "2026-07-26T12:00:00Z");
+        // The user the CLI recorded; an entry without the key parses to "".
+        assert_eq!(secure.user, "pat");
+        assert_eq!(by_name(&config, "mini2").user, "");
+        assert_eq!(by_name(&config, "minimal").user, "");
+        // A `user` that is not a plain string fails closed: never "" (no user).
+        for (name, user) in [
+            ("u-bare", ""),
+            ("u-blockmap", USER_NOT_A_STRING),
+            ("u-flowmap", USER_NOT_A_STRING),
+            ("u-list", USER_NOT_A_STRING),
+            ("u-listflat", USER_NOT_A_STRING),
+            ("u-flowlist", "[pat]"),
+            ("u-number", "5"),
+        ] {
+            assert_eq!(by_name(&config, name).user, user, "{name}");
+            assert!(!crate::certuser::is_user_name(user), "{name}");
+        }
+        // An unquoted `true` is read as its text, as Go's reader reads it (yaml.v3 into a
+        // string field): it satisfies the user-name rule, so it is the user name `true`,
+        // the same as the quoted value.
+        for name in ["u-true", "u-truequoted"] {
+            assert_eq!(by_name(&config, name).user, "true", "{name}");
+            assert!(crate::certuser::is_user_name("true"), "{name}");
+        }
+        // The list's items are skipped, not read as the entry's next fields.
+        let flat = by_name(&config, "u-listflat");
+        assert_eq!((flat.host.as_str(), flat.ssh_port), ("ulf", 2200));
         assert!(secure.uses_tls());
         // It holds both credential files, so nothing to enroll.
         assert!(!secure.needs_enrollment());
@@ -739,6 +877,7 @@ default_server: mini2
             client_cert_file: String::new(),
             client_key_file: String::new(),
             client_cert_expires_at: String::new(),
+            user: String::new(),
         };
 
         // (a) an https entry stripped of every credential field by an older

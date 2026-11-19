@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden fixture for LoadDiscoveredServers / load_discovered_servers — input ~/.shed/config.yaml text -> expected []ServerTarget. Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go) and the Rust runner (in crates/shed-host-agent/src/controltoken.rs tests) so the two impls cannot drift together. Pins the load-bearing divergences from shed-core::ShedConfig: ssh_port defaults to 0 (NOT 22) when omitted, and empty-host entries are skipped. Targets are sorted by name. auth_mode is carried VERBATIM from the entry and is NOT defaulted: \"\" (never recorded, legacy entry) and \"token\" (recorded) stay distinguishable, because only the former means \"this client has never been told\".",
+  "_comment": "Golden fixture for load_discovered_servers (crates/shed-broker/src/discovery.rs) — input ~/.shed/config.yaml text -> expected []ServerTarget. Recorded while the Go daemon still read it; its one reader now is the Rust test golden_load_discovered_servers in crates/shed-broker/src/discovery.rs. Pins the load-bearing divergences from shed-core::ShedConfig: ssh_port defaults to 0 (NOT 22) when omitted, and empty-host entries are skipped. Targets are sorted by name. auth_mode is carried VERBATIM from the entry and is NOT defaulted: \"\" (never recorded, legacy entry) and \"token\" (recorded) stay distinguishable, because only the former means \"this client has never been told\". user (the named user the shed CLI recorded) is carried verbatim (an unquoted scalar is read as its text, as Go's reader reads it: true is the user name \"true\"); absent or null is \"\" (no user held); a list or a map is \"!not-a-string\" (no valid user name, so the entry fails closed instead of reading as no user). Both members are required on every expected entry.",
   "protocol_version": 1,
   "vectors": [
     {
@@ -13,7 +13,8 @@
           "tls_fingerprint": "",
           "ssh_host": "b.example",
           "ssh_port": 0,
-          "auth_mode": "token"
+          "auth_mode": "token",
+          "user": ""
         },
         {
           "name": "https-with-ssh",
@@ -22,7 +23,8 @@
           "tls_fingerprint": "",
           "ssh_host": "a.example",
           "ssh_port": 2222,
-          "auth_mode": "mtls"
+          "auth_mode": "mtls",
+          "user": ""
         },
         {
           "name": "plain",
@@ -31,7 +33,8 @@
           "tls_fingerprint": "",
           "ssh_host": "c.example",
           "ssh_port": 0,
-          "auth_mode": ""
+          "auth_mode": "",
+          "user": ""
         }
       ]
     },
@@ -46,7 +49,8 @@
           "tls_fingerprint": "sha256:AABBcc",
           "ssh_host": "s.example",
           "ssh_port": 8022,
-          "auth_mode": ""
+          "auth_mode": "",
+          "user": ""
         }
       ]
     },
@@ -66,7 +70,126 @@
           "tls_fingerprint": "",
           "ssh_host": "w.example",
           "ssh_port": 2222,
-          "auth_mode": "MTLS"
+          "auth_mode": "MTLS",
+          "user": ""
+        }
+      ]
+    },
+    {
+      "name": "user is carried verbatim per entry; absent is empty",
+      "config_yaml": "servers:\n  held:\n    api_url: https://h.example:8443\n    host: h.example\n    ssh_port: 2222\n    auth_mode: mtls\n    user: pat\n  unheld:\n    api_url: https://u.example:8443\n    host: u.example\n    ssh_port: 2222\n    auth_mode: mtls\n",
+      "expected": [
+        {
+          "name": "held",
+          "url": "https://h.example:8443",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "h.example",
+          "ssh_port": 2222,
+          "auth_mode": "mtls",
+          "user": "pat"
+        },
+        {
+          "name": "unheld",
+          "url": "https://u.example:8443",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "u.example",
+          "ssh_port": 2222,
+          "auth_mode": "mtls",
+          "user": ""
+        }
+      ]
+    },
+    {
+      "name": "a user that is not a plain string fails closed as !not-a-string, never empty; null is empty; a number is a scalar kept verbatim",
+      "config_yaml": "servers:\n  blockmap:\n    host: bm.example\n    user:\n      name: pat\n  flowlist:\n    host: fl.example\n    user: [pat]\n  flowmap:\n    host: fm.example\n    user: {}\n  list:\n    host: l.example\n    user:\n    - pat\n  null:\n    host: n.example\n    user:\n  number:\n    host: num.example\n    user: 5\n",
+      "expected": [
+        {
+          "name": "blockmap",
+          "url": "http://bm.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "bm.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string"
+        },
+        {
+          "name": "flowlist",
+          "url": "http://fl.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "fl.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string"
+        },
+        {
+          "name": "flowmap",
+          "url": "http://fm.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "fm.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string"
+        },
+        {
+          "name": "list",
+          "url": "http://l.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "l.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string"
+        },
+        {
+          "name": "null",
+          "url": "http://n.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "n.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": ""
+        },
+        {
+          "name": "number",
+          "url": "http://num.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "num.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "5"
+        }
+      ]
+    },
+    {
+      "name": "an unquoted true is read as its text, as Go's reader reads it: the user name true, the same as the quoted value",
+      "config_yaml": "servers:\n  quoted:\n    host: q.example\n    user: \"true\"\n  unquoted:\n    host: u.example\n    user: true\n",
+      "expected": [
+        {
+          "name": "quoted",
+          "url": "http://q.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "q.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "true"
+        },
+        {
+          "name": "unquoted",
+          "url": "http://u.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "u.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "true"
         }
       ]
     }

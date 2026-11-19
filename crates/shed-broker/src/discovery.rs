@@ -48,6 +48,13 @@ pub struct ServerTarget {
     /// "never recorded" and "recorded as token" stay distinguishable — the Go mirror
     /// keeps the same distinction and the shared golden fixture pins it.
     pub auth_mode: String,
+    /// The named user the shed CLI recorded for this entry (`user`; empty when absent or
+    /// null; [`shed_core::config::USER_NOT_A_STRING`] when it is a list or a map).
+    /// The credential sources hold their certificates to it: one issued for another named
+    /// user, or one that names no user, is refused (plan 037 §3.2.2). Part of the target,
+    /// so a changed `user` restarts the server's sources (the supervisor's whole-target
+    /// compare).
+    pub user: String,
 }
 
 impl ServerTarget {
@@ -125,11 +132,25 @@ pub fn load_discovered_servers(path: &str) -> Result<Vec<ServerTarget>, String> 
                 // Absent → "" (NOT "token"): the Go mirror keeps "never recorded" and
                 // "recorded as token" distinguishable, and the golden fixture pins it.
                 auth_mode: scalar("auth_mode").unwrap_or("").to_string(),
+                user: target_user(fields.get("user")),
             });
         }
     }
     targets.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(targets)
+}
+
+/// An entry's `user` as the sources hold it (the same rule as shed-core's reader): absent
+/// or null → `""` (no user recorded); a scalar → verbatim (a value that is no user name
+/// matches no certificate, which refuses); a list or a map →
+/// [`shed_core::config::USER_NOT_A_STRING`], so the entry fails closed instead of reading
+/// as "no user", which would take the first named user it is issued.
+fn target_user(node: Option<&Node>) -> String {
+    match node {
+        None | Some(Node::Null) => String::new(),
+        Some(Node::Scalar(s)) => s.clone(),
+        Some(Node::Map(_) | Node::Sequence(_)) => shed_core::config::USER_NOT_A_STRING.to_string(),
+    }
 }
 
 // The `resolve_targets` methods live here (rather than on `HostAgentConfig` in
@@ -159,6 +180,7 @@ impl HostAgentConfig {
                 // unnamed target is plain-http/open in practice, and an enrollment would
                 // discover the mode from the bundle anyway.
                 auth_mode: String::new(),
+                user: String::new(),
             }];
         };
         let mut out = Vec::with_capacity(discovered.len());
@@ -220,11 +242,10 @@ mod tests {
         assert!(err.contains("parsing shed config"), "err = {err}");
     }
 
-    /// The Rust half of the `load_discovered_servers` golden — reads the SAME shared
-    /// fixture the Go runner reads (`cmd/shed-host-agent/golden_test.go`), so the two
-    /// impls can't drift together on the ssh_port=0/empty-host/sort semantics. Lives
-    /// in-crate (not `tests/golden.rs`) because this is a binary crate with no lib, so
-    /// an integration test can't reach `load_discovered_servers`.
+    /// The `load_discovered_servers` golden — the shared fixture under
+    /// `tests/host-agent-diff/fixtures/`, recorded while the Go daemon still read it too
+    /// (retired in plan 006); this test is now its one reader. It pins the
+    /// ssh_port=0/empty-host/sort semantics and the verbatim `auth_mode` and `user`.
     #[test]
     fn golden_load_discovered_servers() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -249,6 +270,7 @@ mod tests {
                         "ssh_host": t.ssh_host,
                         "ssh_port": t.ssh_port,
                         "auth_mode": t.auth_mode,
+                        "user": t.user,
                     })
                 })
                 .collect();
@@ -263,6 +285,14 @@ mod tests {
                         .is_some(),
                     "golden vector {name:?} entry {i} has no auth_mode key — the fixture \
                      must pin it (absent-in-config means \"\", never \"token\")"
+                );
+                // `user` is required the same way: an entry that stopped carrying it
+                // would stop pinning that an absent user is "" (no user held).
+                assert!(
+                    want.get("user")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some(),
+                    "golden vector {name:?} entry {i} has no user key — the fixture must pin it"
                 );
             }
             assert_eq!(
@@ -385,6 +415,7 @@ servers:
             ssh_host: String::new(),
             ssh_port: 0,
             auth_mode: String::new(),
+            user: String::new(),
         };
         let discovered = vec![
             mk("mini2", "http://mini2:8080"),

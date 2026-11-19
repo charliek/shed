@@ -1036,6 +1036,7 @@ mod tests {
         // The config that gets installed reads through the SAME handle the source writes.
         let cfg = pinned_client_config_with_client_auth(PIN, resolver.clone()).unwrap();
         assert!(cfg.client_auth_cert_resolver.resolve(&[], &[]).is_none());
+        // No userId: this arms the resolver directly, a layer below adoption's user rule.
         let key = rcgen::KeyPair::generate().unwrap();
         let leaf = rcgen::CertificateParams::new(Vec::<String>::new())
             .unwrap()

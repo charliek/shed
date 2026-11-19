@@ -190,25 +190,37 @@ impl Backend {
                         // config token (F6).
                         let r = s.resolved_endpoint();
                         let pin = (!r.pin.is_empty()).then_some(r.pin);
+                        // Three real-server arms. Both minter arms build the
+                        // provider here so it is held to the entry's `user`: a
+                        // certificate issued for another named user, or one that
+                        // names none, is refused (plan 037 §3.2.2). The entry is
+                        // read once, at start; a changed `user` needs a restart.
+                        let held_user = (!s.user.is_empty()).then(|| s.user.clone());
                         match (minter, modes) {
-                            // The observer can only be attached to a provider we
-                            // build ourselves, so this arm exists purely to reach
-                            // `with_observer`; it is otherwise `Client::new`.
                             (Some(m), Some(obs)) => {
                                 let provider = Arc::new(
                                     ControlTokenProvider::new(s.name.clone(), Arc::clone(m))
+                                        .with_held_user(held_user)
                                         .with_observer(
                                             Arc::clone(obs) as Arc<dyn CredentialObserver>
                                         ),
                                 );
                                 Client::with_provider(r.base_url, s.name.clone(), pin, provider)
                             }
-                            _ => Client::new(
+                            (Some(m), None) => {
+                                let provider = Arc::new(
+                                    ControlTokenProvider::new(s.name.clone(), Arc::clone(m))
+                                        .with_held_user(held_user),
+                                );
+                                Client::with_provider(r.base_url, s.name.clone(), pin, provider)
+                            }
+                            // No minter: the static open-mode config token, as before.
+                            (None, _) => Client::new(
                                 r.base_url,
                                 s.name.clone(),
                                 s.control_token.clone(),
                                 pin,
-                                minter.map(Arc::clone),
+                                None,
                             ),
                         }
                     }
@@ -818,6 +830,128 @@ mod tests {
             ssh_port: 2222,
             ..Default::default()
         }
+    }
+
+    /// A minter that answers every mint with the same certificate: one a 0.10
+    /// server issued for user `pat` (the shared two-language fixture). Its key is
+    /// not the provider's, so it can never be ADOPTED — what it shows is whether
+    /// the provider refused it for its user first, which only a provider held to
+    /// the entry's `user` does.
+    struct PatCertMinter;
+
+    #[async_trait::async_trait]
+    impl TokenMinter for PatCertMinter {
+        async fn mint(&self, _server: &str) -> Result<shed_core::token::MintedToken, ShedError> {
+            unreachable!("an mtls-capable minter is asked through mint_credential")
+        }
+        fn supports_mtls(&self) -> bool {
+            true
+        }
+        async fn mint_credential(
+            &self,
+            _server: &str,
+            _req: &shed_core::token::CredentialRequest,
+        ) -> Result<shed_core::token::MintedCredential, ShedError> {
+            Ok(shed_core::token::MintedCredential::Certificate(
+                shed_core::token::MintedCertificate {
+                    cert_pem: include_str!("../../fixtures/clientuser/issued-pat.pem").into(),
+                    serial: "01".into(),
+                    expires_at_unix: Some(4_102_444_800),
+                },
+            ))
+        }
+    }
+
+    /// A config of one server at `url`, held to `user`.
+    fn held_config(url: &str, user: &str) -> ShedConfig {
+        ShedConfig {
+            servers: vec![shed_core::config::ShedServerEntry {
+                name: "shed".into(),
+                host: "127.0.0.1".into(),
+                api_url: url.into(),
+                control_token: "static-tok".into(),
+                user: user.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Both minter arms build a provider held to the entry's `user` (plan 037
+    /// §3.2.2): pat's certificate on an entry held to admin is refused with the
+    /// held-user message, which reaches the caller once the server refuses the
+    /// unauthenticated request.
+    #[tokio::test]
+    async fn both_minter_arms_hold_the_entrys_user() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds");
+                t.status(401);
+            })
+            .await;
+        let minter: Arc<dyn TokenMinter> = Arc::new(PatCertMinter);
+        let modes = Arc::new(crate::auth_modes::AuthModeRegistry::new());
+        let config = held_config(&server.base_url(), "admin");
+        for (arm, observer) in [("observer", Some(&modes)), ("no observer", None)] {
+            let backend = Backend::from_config_with_credentials(
+                &config,
+                None,
+                Some(&minter),
+                observer,
+                &HashSet::new(),
+            );
+            let clients = backend.host_clients();
+            assert_eq!(clients.len(), 1, "{arm}");
+            let err = clients[0].1.list_sheds().await.unwrap_err();
+            let ShedError::Config(msg) = &err else {
+                panic!("{arm}: the refusal is ShedError::Config, got {err:?}");
+            };
+            assert!(
+                msg.starts_with(
+                    "server \"shed\": the server issued a certificate for user \"pat\", \
+                     but this entry is held to \"admin\"; it was not used."
+                ),
+                "{arm}: {msg}"
+            );
+        }
+
+        // The control: with no `user` the same certificate passes the user rule
+        // and fails only on its key — so the message above came from the hold.
+        let backend = Backend::from_config_with_credentials(
+            &held_config(&server.base_url(), ""),
+            None,
+            Some(&minter),
+            None,
+            &HashSet::new(),
+        );
+        let err = backend.host_clients()[0].1.list_sheds().await.unwrap_err();
+        assert!(err.to_string().contains("unusable"), "{err}");
+        assert!(!err.to_string().contains("held to"), "{err}");
+    }
+
+    /// The no-minter arm keeps sending the static open-mode token from config.
+    #[tokio::test]
+    async fn the_no_minter_arm_still_sends_the_static_token() {
+        let server = MockServer::start_async().await;
+        let with_token = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/sheds")
+                    .header("authorization", "Bearer static-tok");
+                t.status(200).body(r#"{"sheds":[]}"#);
+            })
+            .await;
+        let backend = Backend::from_config_with_credentials(
+            &held_config(&server.base_url(), "pat"),
+            None,
+            None,
+            None,
+            &HashSet::new(),
+        );
+        let sheds = backend.host_clients()[0].1.list_sheds().await.unwrap();
+        assert!(sheds.is_empty());
+        assert_eq!(with_token.hits_async().await, 1);
     }
 
     #[tokio::test]

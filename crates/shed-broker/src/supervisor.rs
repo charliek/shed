@@ -70,6 +70,14 @@ impl TokenProvider for Arc<CredentialSource> {
     fn would_mint(&self) -> bool {
         (**self).would_mint()
     }
+    async fn token_for_request(&self) -> Result<String, (BusError, Option<String>)> {
+        CredentialSource::token_for_request(self)
+            .await
+            .map_err(|e| {
+                let refusal = e.refused.then(|| e.message.clone());
+                (BusError::Config(e.message), refusal)
+            })
+    }
 }
 
 /// The server-agnostic components every per-server watcher group shares — built once in
@@ -467,6 +475,7 @@ mod tests {
             ssh_host: String::new(),
             ssh_port: 0,
             auth_mode: String::new(),
+            user: String::new(),
         }
     }
 
@@ -539,6 +548,7 @@ mod tests {
             ssh_host: "h".into(),
             ssh_port: 2222,
             auth_mode: String::new(),
+            user: String::new(),
         }
     }
 
@@ -602,6 +612,7 @@ mod tests {
                 ssh_host: v["ssh_host"].as_str().unwrap().to_string(),
                 ssh_port: v["ssh_port"].as_u64().unwrap() as u16,
                 auth_mode: String::new(),
+                user: String::new(),
             };
             assert_eq!(
                 should_mint(&deps, &target),
@@ -671,6 +682,7 @@ mod tests {
             ssh_host: String::new(),
             ssh_port: 0,
             auth_mode: String::new(),
+            user: String::new(),
         };
         s.reconcile(vec![mk("t1", "")]).await;
         s.reconcile(vec![mk("t2", "")]).await; // token rotated
@@ -680,6 +692,290 @@ mod tests {
         let got = &inner.groups["s"].target;
         assert_eq!(got.token, "t2");
         assert_eq!(got.tls_fingerprint, "sha256:aa");
+    }
+
+    /// A changed `user` in config (the CLI's `--refetch`, `--allow-user-change`) restarts
+    /// the server's group, so its credential sources are rebuilt held to the new user;
+    /// an unchanged one does not (plan 037 §3.2.2).
+    #[tokio::test]
+    async fn reconcile_user_change_restarts() {
+        let fg = Arc::new(FakeGroups::default());
+        let s = test_supervisor(&fg);
+        let mk = |user: &str| ServerTarget {
+            user: user.into(),
+            ..secure_target()
+        };
+        s.reconcile(vec![mk("")]).await;
+        s.reconcile(vec![mk("pat")]).await; // first recorded
+        s.reconcile(vec![mk("pat")]).await; // unchanged: no churn
+        s.reconcile(vec![mk("admin")]).await; // changed
+        assert_eq!(
+            fg.start_count(),
+            3,
+            "each user change restarts, a no-op does not"
+        );
+        assert_eq!(fg.stopped_names(), vec!["s".to_string(), "s".to_string()]);
+        let inner = s.inner.lock().unwrap();
+        assert_eq!(inner.groups["s"].target.user, "admin");
+    }
+
+    const FAR_FUTURE: Option<i64> = Some(4_102_444_800);
+
+    /// A group's detached credential fetch.
+    type MintTask = JoinHandle<Result<String, String>>;
+
+    /// Mints for the target's config user: `admin` gets admin's certificate at once; any
+    /// other gets pat's, but only once `release` is notified — the old group's mint, still
+    /// running across the reconcile that replaces its group.
+    struct HeldUpMinter {
+        ca: crate::minter::tests::TestCa,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Minter for HeldUpMinter {
+        async fn mint(&self, t: &ServerTarget, _scope: &str) -> Result<Minted, MinterError> {
+            use crate::minter::tests::{minted_cert_for, TestUser};
+            if t.user == "admin" {
+                return Ok(minted_cert_for(
+                    &self.ca,
+                    2,
+                    FAR_FUTURE,
+                    &TestUser::Named("admin"),
+                ));
+            }
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(minted_cert_for(
+                &self.ca,
+                1,
+                FAR_FUTURE,
+                &TestUser::Named("pat"),
+            ))
+        }
+    }
+
+    /// A reconcile that changes the config `user` while the old group's mint is still
+    /// running: the old group is cancelled before its replacement starts, the replacement
+    /// (held to admin) stores admin's certificate, and the old mint, finishing last, writes
+    /// nothing — so the store never holds a certificate the current config disallows.
+    #[tokio::test]
+    async fn an_old_groups_late_mint_never_overwrites_the_replacements_store() {
+        for old_user in ["", "pat"] {
+            let (_d, store) = crate::minter::tests::tmp_store();
+            let minter = Arc::new(HeldUpMinter {
+                ca: crate::minter::tests::TestCa::new(),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            let mints: Arc<Mutex<Vec<MintTask>>> = Arc::default();
+            let factory: GroupFactory = {
+                let (minter, store, mints) = (minter.clone(), store.clone(), mints.clone());
+                Box::new(move |_parent, target, _deps| {
+                    let (cancel_tx, cancel_rx) = watch::channel(false);
+                    let src = crate::minter::new_group_credential_source_with_store(
+                        minter.clone(),
+                        target.clone(),
+                        crate::minter::SCOPE_CREDENTIALS,
+                        Some(store.clone()),
+                        cancel_rx.clone(),
+                    );
+                    // The group's first request: a credential fetch, detached like a
+                    // subscription's.
+                    mints
+                        .lock()
+                        .unwrap()
+                        .push(tokio::spawn(async move { src.token().await }));
+                    let mut cancelled = cancel_rx;
+                    let done = tokio::spawn(async move {
+                        let _ = cancelled.wait_for(|c| *c).await;
+                    });
+                    WatcherGroup {
+                        target,
+                        cancel: Arc::new(cancel_tx),
+                        done,
+                        statuses: Vec::new(),
+                        wake: Arc::new(watch::channel(0u64).0),
+                    }
+                })
+            };
+            let (_tx, rx) = watch::channel(false);
+            let s = Supervisor::with_factory(rx, deps_with_minter(None), factory);
+            let mk = |user: &str| ServerTarget {
+                user: user.into(),
+                ..secure_target()
+            };
+
+            s.reconcile(vec![mk(old_user)]).await;
+            minter.entered.notified().await; // the old group's mint is running
+            s.reconcile(vec![mk("admin")]).await;
+            let new_mint = mints.lock().unwrap().pop().unwrap();
+            new_mint.await.unwrap().unwrap();
+            let user_of_stored = || {
+                let cert = std::fs::read_to_string(store.paths("s").0).unwrap();
+                shed_core::certuser::cert_user_pem(&cert).unwrap()
+            };
+            assert_eq!(
+                user_of_stored(),
+                shed_core::certuser::CertUser::Named("admin".into())
+            );
+
+            // The old mint finishes last.
+            minter.release.notify_one();
+            let old_mint = mints.lock().unwrap().pop().unwrap();
+            let _ = old_mint.await.unwrap();
+            assert_eq!(
+                user_of_stored(),
+                shed_core::certuser::CertUser::Named("admin".into()),
+                "old user {old_user:?}: the old group's late mint wrote nothing"
+            );
+        }
+    }
+
+    /// Holds a `credentials` mint until `release`, then answers pat's certificate and
+    /// signals `returned`; a `control` mint fails at once.
+    struct HeldUpCredentialsMinter {
+        ca: crate::minter::tests::TestCa,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        returned: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Minter for HeldUpCredentialsMinter {
+        async fn mint(&self, _t: &ServerTarget, scope: &str) -> Result<Minted, MinterError> {
+            use crate::minter::tests::{minted_cert_for, TestUser};
+            if scope != crate::minter::SCOPE_CREDENTIALS {
+                return Err(MinterError::new("not this scope".into()));
+            }
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.returned.notify_one();
+            Ok(minted_cert_for(
+                &self.ca,
+                1,
+                FAR_FUTURE,
+                &TestUser::Named("pat"),
+            ))
+        }
+    }
+
+    /// The production wiring, `spawn_server_group`, builds the group's credentials source
+    /// FENCED by the group's cancel: a mint the group started that finishes after the
+    /// group was cancelled writes nothing to the store. (Its store is rooted in a temp
+    /// directory for this thread, never the real state directory.)
+    #[tokio::test]
+    async fn the_production_group_builds_a_fenced_credentials_source() {
+        for user in ["", "pat"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("creds");
+            let _rooted = crate::minter::root_credentials_store_at(&root);
+            let store = crate::credstore::CredStore::new(&root);
+            let minter = Arc::new(HeldUpCredentialsMinter {
+                ca: crate::minter::tests::TestCa::new(),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                returned: tokio::sync::Notify::new(),
+            });
+            let target = ServerTarget {
+                url: "https://127.0.0.1:9".into(),
+                ssh_host: "127.0.0.1".into(),
+                user: user.into(),
+                ..secure_target()
+            };
+            let deps = deps_with_minter(Some(minter.clone() as Arc<dyn Minter>));
+            assert!(should_mint(&deps, &target));
+            let (_parent_tx, parent) = watch::channel(false);
+            let g = crate::bus::spawn_server_group(parent, &target, &deps);
+
+            minter.entered.notified().await; // the group's credentials mint is running
+            g.cancel.send(true).unwrap();
+            let _ = g.done.await;
+            minter.release.notify_one();
+            minter.returned.notified().await;
+            // The mint's detached task finishes its adoption and (fenced) write.
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (cert, key) = store.paths("s");
+            assert!(
+                !cert.exists() && !key.exists(),
+                "user {user:?}: the cancelled group's late mint wrote nothing"
+            );
+        }
+    }
+
+    /// A mint scripted in order (the last answer repeats): `Ok(user)` is a certificate for
+    /// that user, `Err(())` a transient minter failure.
+    struct ScriptMinter {
+        ca: crate::minter::tests::TestCa,
+        script: Mutex<Vec<Result<&'static str, ()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Minter for ScriptMinter {
+        async fn mint(&self, _t: &ServerTarget, _scope: &str) -> Result<Minted, MinterError> {
+            use crate::minter::tests::{minted_cert_for, TestUser};
+            let next = {
+                let mut script = self.script.lock().unwrap();
+                if script.len() > 1 {
+                    script.remove(0)
+                } else {
+                    script[0]
+                }
+            };
+            match next {
+                Ok(user) => Ok(minted_cert_for(
+                    &self.ca,
+                    7,
+                    FAR_FUTURE,
+                    &TestUser::Named(user),
+                )),
+                Err(()) => Err(MinterError::new("transient".into())),
+            }
+        }
+    }
+
+    /// A request is explained only by the refusal of the mint its own fetch made or
+    /// joined: one served from the cache after ANOTHER caller's refused refresh carries
+    /// none; one whose own mint is refused carries that refusal; a minter failure is no
+    /// refusal.
+    #[tokio::test]
+    async fn a_request_is_explained_only_by_its_own_mints_refusal() {
+        let minter = Arc::new(ScriptMinter {
+            ca: crate::minter::tests::TestCa::new(),
+            script: Mutex::new(vec![Ok("pat"), Ok("admin"), Ok("admin"), Err(())]),
+        });
+        let src = crate::minter::new_credential_source_with_store(
+            minter,
+            ServerTarget {
+                user: "pat".into(),
+                ..secure_target()
+            },
+            crate::minter::SCOPE_CREDENTIALS,
+            None,
+        );
+        let p: Arc<dyn TokenProvider> = Arc::new(src.clone());
+        p.token_for_request().await.unwrap(); // pat adopted
+
+        src.refresh().await; // another caller's mint: admin, refused
+        assert_eq!(
+            p.token_for_request().await.unwrap(),
+            "",
+            "served from the cache: no refusal to explain this request with"
+        );
+
+        src.invalidate();
+        let (err, refusal) = p.token_for_request().await.unwrap_err();
+        let refusal = refusal.expect("this request's own mint was refused");
+        assert_eq!(err.to_string(), refusal);
+        assert!(refusal.contains("held to \"pat\""), "{refusal}");
+
+        let (err, refusal) = p.token_for_request().await.unwrap_err();
+        assert_eq!(err.to_string(), "transient");
+        assert_eq!(refusal, None, "a minter failure is no refusal");
     }
 
     #[tokio::test]

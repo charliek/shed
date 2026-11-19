@@ -770,6 +770,17 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   for the old kind: a filter on `kind == "admin"` matches nothing written after the upgrade,
   and rotated files keep the old shape. See [Configuration › Audit
   log](https://charliek.github.io/shed/reference/configuration/#audit-log).
+- **Desktop and host-agent: a server entry is held to one user.** The app's control
+  credential and the broker's own certificate are used only when they name the entry's
+  `user` (recorded by the CLI) or the implicit user; with no `user`, the first named user is
+  held (by the broker only once it has stored that certificate). A `user` that is not a plain
+  user name is never read as no user. A certificate for another named user, or one that names no user (a shed-server older
+  than 0.10.0), is refused: nothing is stored, the held credential stays, and the message
+  (the host error, and the broker's last error in `broker.status`) names both users and the
+  fix. A stored broker certificate that fails the same check is not presented and the broker
+  enrols again. Restart the app after an entry's user changes; run `shed server update <name>
+  --refetch` once so `config.yaml` records the user. See [Desktop
+  configuration](https://charliek.github.io/shed/desktop/configuration/#the-user-an-entry-is-held-to).
 - **Development: both parallel dev servers and the integration suite run `mtls`.**
 - **CLI: every client-certificate write for an entry is one transaction** (a re-enrolment, an
   add, a refetch) under that server's credential lock, deciding against the entry as

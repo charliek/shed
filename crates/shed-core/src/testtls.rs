@@ -27,6 +27,57 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+/// The user every client certificate a [`TestCa`] issues names unless told otherwise:
+/// a 0.10 shed-server always writes the userId attribute (plan 037 §3.2.2), so the
+/// default test certificate does too.
+pub const TEST_USER: &str = "pat";
+
+/// The userId attribute a test client certificate carries (`servertls.clientSubject`'s
+/// shapes): a named user as a PrintableString, the implicit user as the UTF8String
+/// `!implicit`, or none at all — the shape only a server older than 0.10.0 issues, kept
+/// for the refusal tests. `Unreadable` writes `pat` as an IA5String, which the reader
+/// refuses ([`crate::certuser`]): a certificate whose user cannot be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TestUser {
+    Named(String),
+    Implicit,
+    Unbound,
+    Unreadable,
+}
+
+impl TestUser {
+    pub fn named(name: &str) -> Self {
+        Self::Named(name.to_string())
+    }
+
+    /// The default: [`TEST_USER`].
+    pub fn default_user() -> Self {
+        Self::named(TEST_USER)
+    }
+
+    /// Add the attribute to `params`' subject, in an RDN of its own (as Go's
+    /// `ExtraNames` does).
+    fn push(&self, params: &mut rcgen::CertificateParams) {
+        // userId, 0.9.2342.19200300.100.1.1.
+        let oid = rcgen::DnType::CustomDnType(vec![0, 9, 2342, 19_200_300, 100, 1, 1]);
+        match self {
+            TestUser::Named(name) => params.distinguished_name.push(
+                oid,
+                rcgen::DnValue::PrintableString(name.as_str().try_into().unwrap()),
+            ),
+            TestUser::Implicit => params.distinguished_name.push(
+                oid,
+                rcgen::DnValue::Utf8String(crate::certuser::IMPLICIT_USER_VALUE.into()),
+            ),
+            TestUser::Unbound => {}
+            TestUser::Unreadable => params.distinguished_name.push(
+                oid,
+                rcgen::DnValue::Ia5String(TEST_USER.try_into().unwrap()),
+            ),
+        }
+    }
+}
+
 /// A throwaway CA that issues the test server's leaf and the client certificates.
 pub struct TestCa {
     cert: rcgen::Certificate,
@@ -73,13 +124,25 @@ impl TestCa {
     }
 
     /// Issue a client certificate with a shed-shaped subject
-    /// (`CN=<ssh-fingerprint> OU=<scope> O=<kind>`) and an explicit validity
-    /// window, so an EXPIRED credential can be produced on demand.
+    /// (`CN=<ssh-fingerprint> OU=<scope> O=<kind>` and the userId of
+    /// [`TEST_USER`]) and an explicit validity window, so an EXPIRED credential can
+    /// be produced on demand.
     pub fn client_cert(
         &self,
         cn: &str,
         scope: &str,
         validity: (SystemTime, SystemTime),
+    ) -> IssuedCert {
+        self.client_cert_for(cn, scope, validity, &TestUser::default_user())
+    }
+
+    /// [`Self::client_cert`] for a chosen userId attribute.
+    pub fn client_cert_for(
+        &self,
+        cn: &str,
+        scope: &str,
+        validity: (SystemTime, SystemTime),
+        user: &TestUser,
     ) -> IssuedCert {
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params
@@ -91,6 +154,7 @@ impl TestCa {
         params
             .distinguished_name
             .push(rcgen::DnType::OrganizationName, "cli");
+        user.push(&mut params);
         params.use_authority_key_identifier_extension = true;
         params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
         params.not_before = validity.0.into();
@@ -108,6 +172,8 @@ impl TestCa {
     /// feature, which would pull a parser into this workspace's lock for test
     /// convenience alone. The extraction is self-checking — a wrong key produces a
     /// certificate whose pairing `certified_key_from_pem` rejects.
+    ///
+    /// The subject names [`TEST_USER`], as a 0.10 server's always names a user.
     pub fn sign_csr(
         &self,
         csr_der: &[u8],
@@ -115,6 +181,26 @@ impl TestCa {
         scope: &str,
         serial: u64,
         validity: (SystemTime, SystemTime),
+    ) -> (String, String) {
+        self.sign_csr_for(
+            csr_der,
+            cn,
+            scope,
+            serial,
+            validity,
+            &TestUser::default_user(),
+        )
+    }
+
+    /// [`Self::sign_csr`] for a chosen userId attribute.
+    pub fn sign_csr_for(
+        &self,
+        csr_der: &[u8],
+        cn: &str,
+        scope: &str,
+        serial: u64,
+        validity: (SystemTime, SystemTime),
+        user: &TestUser,
     ) -> (String, String) {
         let point = p256_public_point(csr_der).expect("P-256 SPKI in CSR");
         struct RawP256(Vec<u8>);
@@ -133,6 +219,7 @@ impl TestCa {
         params
             .distinguished_name
             .push(rcgen::DnType::OrganizationalUnitName, scope);
+        user.push(&mut params);
         params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
         params.serial_number = Some(rcgen::SerialNumber::from(serial));
         params.not_before = validity.0.into();
@@ -565,4 +652,55 @@ pub fn expired_window() -> (SystemTime, SystemTime) {
         SystemTime::now() - Duration::from_secs(7200),
         SystemTime::now() - Duration::from_secs(3600),
     )
+}
+
+mod tests {
+    use super::*;
+    use crate::certuser::{cert_user_pem, CertUser};
+
+    /// The issuers write the userId attribute the way a 0.10 server does, and the
+    /// default names [`TEST_USER`] — what every existing provider test now adopts.
+    #[test]
+    fn issued_certificates_name_the_user_asked_for() {
+        let ca = TestCa::new("shed-ca");
+        let kp = crate::csr::ClientKeyPair::generate().unwrap();
+        let sign = |user: &TestUser| {
+            ca.sign_csr_for(kp.csr_der(), "SHA256:x", "control", 1, valid_window(), user)
+                .0
+        };
+        assert_eq!(
+            cert_user_pem(
+                &ca.sign_csr(kp.csr_der(), "SHA256:x", "control", 1, valid_window())
+                    .0
+            ),
+            Ok(CertUser::Named(TEST_USER.into()))
+        );
+        assert_eq!(
+            cert_user_pem(
+                &ca.client_cert("SHA256:x", "control", valid_window())
+                    .cert_pem
+            ),
+            Ok(CertUser::Named(TEST_USER.into()))
+        );
+        assert_eq!(
+            cert_user_pem(&sign(&TestUser::named("admin"))),
+            Ok(CertUser::Named("admin".into()))
+        );
+        assert_eq!(
+            cert_user_pem(&sign(&TestUser::Implicit)),
+            Ok(CertUser::Implicit)
+        );
+        assert_eq!(
+            cert_user_pem(&sign(&TestUser::Unbound)),
+            Ok(CertUser::Unbound)
+        );
+        assert!(cert_user_pem(&sign(&TestUser::Unreadable)).is_err());
+        assert_eq!(
+            cert_user_pem(
+                &ca.client_cert_for("SHA256:x", "control", valid_window(), &TestUser::Unbound)
+                    .cert_pem
+            ),
+            Ok(CertUser::Unbound)
+        );
+    }
 }
