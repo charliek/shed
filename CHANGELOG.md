@@ -535,6 +535,14 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   restriction that server has not declared left out. An account service built from the
   contract copies `tests/directory-contract/v1/` again (its manifest line for `CONTRACT.md`
   changed).
+- **Directory server: the sign-in names its scope.** The token request now carries
+  `scope=directory:read`, once, so the server no longer asks for every scope the account
+  service has, and a scope the service adds later is never requested. The contract already
+  allows the parameter; no fixture changes. An account service must accept it: one that
+  answers `400 invalid_scope` fails every refresh (logged as `directory: pull failed: token:
+  refused (HTTP 400) "invalid_scope"`, the list held staying in force until its trust time
+  ends), and the server does not retry without the scope. A token answer whose `scope` lists
+  more than `directory:read` is still accepted, as the contract says.
 - **CLI: a server entry is held to its user.** An mtls entry records the user its
   certificates name (`user` in `config.yaml`), set at `shed server add`, at `shed server update
   --refetch`, or by a re-enrolment when it has none; a certificate for the implicit user of a

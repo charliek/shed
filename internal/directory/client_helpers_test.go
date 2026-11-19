@@ -85,6 +85,7 @@ type fakeService struct {
 	directory  []served
 	enroll     []served
 	assertions []string // every client_assertion received
+	tokenForms []string // every token request's body, as sent
 	bearers    []string // every Authorization header on the directory
 	enrolBody  [][]byte
 	paths      []string
@@ -123,6 +124,7 @@ func (fs *fakeService) serve(w http.ResponseWriter, r *http.Request) {
 			fs.t.Errorf("the token request is not a form: %v", err)
 		}
 		fs.assertions = append(fs.assertions, form.Get("client_assertion"))
+		fs.tokenForms = append(fs.tokenForms, string(body))
 		s, ok = take(&fs.tokens)
 	case "GET /v1/directory":
 		fs.bearers = append(fs.bearers, r.Header.Get("Authorization"))

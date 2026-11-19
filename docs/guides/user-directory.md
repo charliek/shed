@@ -14,7 +14,8 @@ How the two sides work together:
   issues. It makes an Ed25519 key pair for the service and keeps the private
   key on the host.
 - It **signs in** with OAuth 2.0 client credentials and a JWT client assertion
-  signed by that key, and **pulls the list**: users, each a name, an admin
+  signed by that key, asking the token endpoint for the scope `directory:read`
+  and nothing else, and **pulls the list**: users, each a name, an admin
   flag and SSH public keys.
 - It **keeps a copy** of each good pull, and honours it for a **trust time**
   while it cannot reach the service.
@@ -612,6 +613,7 @@ there, or the old client id in `disabled`). Stop both with Ctrl-C and remove
 | Log: `Users: not enrolled (no enrolment: ...): run 'shed-server directory enroll'; only the local admins can log in` | Not enrolled yet | [Enrol](#enrol) |
 | Log: `Users: enrolment unusable (<file>: <check>); only the local admins can log in` | `enrolment.json` or its directory failed a check (owner, mode, symbolic link, size, content) | Put the file right (owned by the server's user, mode `0600`, in a `0700` directory), or [enrol again](#enrolling-again) |
 | Log: `directory: the account service refused this server's login: ...` | The service does not recognise this server's key or assertion | Check the host's clock, then the server on the service; enrol again if it was removed there |
+| Log: `directory: pull failed: token: refused (HTTP 400) "invalid_scope": ...` | The service refuses a token request that names the scope `directory:read`, which the contract allows and shed-server sends. Every refresh fails; the list held stays until its trust time ends | Update the service to accept `scope=directory:read` |
 | Log: `directory: SERVER DISABLED: ...` | The server is disabled on the service | A disabled server stays disabled: have a new code issued and [enrol again](#enrolling-again) |
 | Log: `directory: WARNING: the account service's clock is ... from this server's; ...` | The clocks differ by more than 30 s | Fix the host's clock (NTP) |
 | Log: `directory: kept copy not written: ...; a restart starts with only the local admins until a good pull` | The state directory cannot be written | Free space or fix permissions; the next good pull writes it again |

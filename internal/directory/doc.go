@@ -15,8 +15,9 @@
 //     the 201; the Enrolment it returns is what enrolment.json holds
 //     (MarshalFile, ParseEnrolmentFile).
 //   - Client logs in (client credentials with a JWT client assertion, a
-//     fresh one for every request) and pulls the list (Pull); the access
-//     token lives in memory only.
+//     fresh one for every request, asking for the scope directory:read and
+//     nothing else) and pulls the list (Pull); the access token lives in
+//     memory only.
 //   - DecodeList applies the contract's rules to a directory answer: the
 //     top level (rule 6) and the organization (rule 5) refuse the whole
 //     answer; each user is decoded alone (rule 7), skipped with a reason

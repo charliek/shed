@@ -221,7 +221,9 @@ Directory guide](../guides/user-directory.md) covers the operator's steps.
   and is written to no file or log.
 - **Sign-in.** OAuth 2.0 client credentials with a JWT client assertion
   signed by that key: a new assertion for every token request, none sent
-  twice. The access token is kept in memory only.
+  twice. The request asks for the scope `directory:read` and nothing else, so
+  a scope the service adds later is never requested. The access token is kept
+  in memory only.
 - **The pull.** `GET <url>/v1/directory` with the access token returns the
   list: users, each a name, an admin flag and keys. A pull is due at start,
   `auth.directory.refresh` after each good pull, 15 minutes after a failed one

@@ -248,6 +248,11 @@ const (
 	// faultInvalidClient: every token request is answered 401
 	// invalid_client, with a Date an hour ahead of the clock.
 	faultInvalidClient faultMode = "invalid-client"
+	// faultScopeRefused: a token request that names a scope is answered
+	// 400 invalid_scope (a service that does not accept the explicit scope
+	// the contract allows); one that names none goes to the reference
+	// server.
+	faultScopeRefused faultMode = "scope-refused"
 	// faultReflectAssertion: every token request is answered 401
 	// invalid_client whose error_description quotes the assertion it
 	// received.
@@ -433,6 +438,15 @@ func (s *rtService) wrap(next http.Handler) http.Handler {
 				rec.Header().Set("Date", s.clock.Now().Add(time.Hour).UTC().Format(http.TimeFormat))
 				rec.WriteHeader(http.StatusUnauthorized)
 				_, _ = rec.Write(out)
+			case faultScopeRefused:
+				if _, named := form["scope"]; !named {
+					next.ServeHTTP(rec, r)
+					break
+				}
+				rec.Header().Set("Content-Type", "application/json")
+				rec.Header().Set("Cache-Control", "no-store")
+				rec.WriteHeader(http.StatusBadRequest)
+				_, _ = rec.Write([]byte(`{"error":"invalid_scope","error_description":"this service does not accept a scope"}`))
 			default:
 				next.ServeHTTP(rec, r)
 			}
