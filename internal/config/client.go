@@ -141,6 +141,17 @@ type ServerEntry struct {
 	// is refused unless the change is asked for (--allow-user-change). Empty
 	// for an entry that is not mtls, or whose server has no user list.
 	User string `yaml:"user,omitempty"`
+	// IdentityFile is the absolute path of the SSH key this entry uses
+	// (identityfile.go states the three properties it gives): a certificate
+	// is accepted for the entry only when it was made for that key; each ssh
+	// argv carries `-i <path> -o IdentitiesOnly=yes -o ControlMaster=no -o
+	// ControlPath=none` and each generated ssh config stanza the same four
+	// options. Set by `shed server add --identity-file` and `shed server
+	// update --identity-file` (an empty value clears it). A value that breaks
+	// the rule, names no readable file at the time of use, or holds a key
+	// whose public half cannot be learned without a passphrase, fails the
+	// command before ssh is spawned.
+	IdentityFile string `yaml:"identity_file,omitempty"`
 }
 
 // IsMTLS reports whether this entry last bootstrapped a client certificate.

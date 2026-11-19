@@ -226,7 +226,7 @@ func TestTokenMTLSFlipLeavesConfigAndFilesConsistent(t *testing.T) {
 	issuer := newMTLSCredentialIssuer(t)
 
 	// token → mtls: the certificate is written, then the entry starts naming it.
-	if _, err := persistMTLSCredential("srv", endpoint, issuer.credential(t, "cli-key", farFromExpiry), testUser, false, nil, ""); err != nil {
+	if _, err := persistMTLSCredential("srv", endpoint, issuer.credential(t, "cli-key", farFromExpiry), "", testUser, false, nil, ""); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
 	stored := onDisk(t, cfgPath).Servers["srv"]

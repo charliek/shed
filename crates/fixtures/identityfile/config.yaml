@@ -1,0 +1,47 @@
+servers:
+    apostrophe:
+        host: shed.example.test
+        ssh_port: 2222
+        added_at: 2026-01-02T03:04:05Z
+        identity_file: /home/pat/.ssh/pat's key
+    colon:
+        host: shed.example.test
+        ssh_port: 2222
+        added_at: 2026-01-02T03:04:05Z
+        identity_file: /home/pat/.ssh/id:work
+    colon-space:
+        host: shed.example.test
+        ssh_port: 2222
+        added_at: 2026-01-02T03:04:05Z
+        identity_file: '/home/pat/.ssh/keys: work'
+    nbsp-inside:
+        host: shed.example.test
+        ssh_port: 2222
+        added_at: 2026-01-02T03:04:05Z
+        identity_file: /home/pat/.ssh/id work
+    non-ascii:
+        host: shed.example.test
+        ssh_port: 2222
+        added_at: 2026-01-02T03:04:05Z
+        identity_file: /home/pat/.ssh/clé_travail
+    none:
+        host: shed.example.test
+        ssh_port: 2222
+        added_at: 2026-01-02T03:04:05Z
+    plain:
+        host: shed.example.test
+        ssh_port: 2222
+        added_at: 2026-01-02T03:04:05Z
+        identity_file: /home/pat/.ssh/id_work
+    space:
+        host: shed.example.test
+        ssh_port: 2222
+        added_at: 2026-01-02T03:04:05Z
+        identity_file: /home/pat/.ssh/id work
+    tab-inside:
+        host: shed.example.test
+        ssh_port: 2222
+        added_at: 2026-01-02T03:04:05Z
+        identity_file: "/home/pat/.ssh/id\twork"
+default_server: plain
+sheds: {}

@@ -171,6 +171,7 @@ func (r *roostSessions) runningSheds(servers []namedServer, only string) []roost
 				Server:        server.name,
 				ServerHost:    entry.Host,
 				ServerSSHPort: entry.SSHPort,
+				IdentityFile:  entry.IdentityFile,
 				LandingDir:    shed.LandingDir,
 			})
 		}

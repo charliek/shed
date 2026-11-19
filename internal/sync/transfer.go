@@ -41,6 +41,36 @@ func (e *SyncErrors) Unwrap() []error {
 type Syncer struct {
 	cfg    *Config
 	output io.Writer
+	// serverName is the config name of the server entry, for the message
+	// when its identity_file cannot be used (SetServerName).
+	serverName string
+}
+
+// SetServerName names the server entry the sync reaches, for messages.
+func (s *Syncer) SetServerName(name string) {
+	s.serverName = name
+}
+
+// sshArgs is the ssh argv (without the binary) every sync step runs against a
+// shed: the port, the pinned known_hosts, strict host-key checking and batch
+// mode, the server entry's identity file when it has one (`-i <path> -o
+// IdentitiesOnly=yes`), then <shed>@<host> and the remote command. The
+// identity file is checked here, at each use (its value and the file), and
+// one that cannot be used is an error before ssh is spawned. Without one the
+// argv is exactly what it was before the field existed.
+func (s *Syncer) sshArgs(shedName string, serverEntry *config.ServerEntry, remoteCmd string) ([]string, error) {
+	identity, err := serverEntry.SSHIdentityArgs(s.serverName)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{
+		"-p", strconv.Itoa(serverEntry.SSHPort),
+		"-o", "UserKnownHostsFile=" + config.GetKnownHostsPath(),
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "BatchMode=yes",
+	}
+	args = append(args, identity...)
+	return append(args, shedName+"@"+serverEntry.Host, remoteCmd), nil
 }
 
 // NewSyncer creates a new file syncer.
@@ -304,8 +334,6 @@ func (s *Syncer) transferViaSsh(ctx context.Context, tarData []byte, extractDir,
 		return fmt.Errorf("server entry is required for SSH transfer")
 	}
 
-	knownHostsPath := config.GetKnownHostsPath()
-
 	// Build SSH command to extract tar
 	// We need to handle the case where source and target names might differ
 	sourceBaseName := filepath.Base(sourcePath)
@@ -330,13 +358,9 @@ func (s *Syncer) transferViaSsh(ctx context.Context, tarData []byte, extractDir,
 			sudoPrefix, extractDir, sudoPrefix, extractDir, sudoPrefix, extractDir, sourceBaseName, extractDir, targetName)
 	}
 
-	args := []string{
-		"-p", strconv.Itoa(serverEntry.SSHPort),
-		"-o", "UserKnownHostsFile=" + knownHostsPath,
-		"-o", "StrictHostKeyChecking=yes",
-		"-o", "BatchMode=yes",
-		shedName + "@" + serverEntry.Host,
-		extractCmd,
+	args, err := s.sshArgs(shedName, serverEntry, extractCmd)
+	if err != nil {
+		return err
 	}
 
 	cmd := exec.CommandContext(ctx, "ssh", args...)
@@ -361,18 +385,12 @@ func (s *Syncer) runPostSyncHook(ctx context.Context, hook PostSyncHook, shedNam
 		return fmt.Errorf("server entry is required for post-sync hooks")
 	}
 
-	knownHostsPath := config.GetKnownHostsPath()
-
 	// Note: hook.Run is user-defined in sync.yaml, so we pass it as-is without escaping.
 	// Users expect their shell command to run exactly as written.
 	// Prefix with sudo so hooks that need root (e.g. update-ca-certificates) work.
-	args := []string{
-		"-p", strconv.Itoa(serverEntry.SSHPort),
-		"-o", "UserKnownHostsFile=" + knownHostsPath,
-		"-o", "StrictHostKeyChecking=yes",
-		"-o", "BatchMode=yes",
-		shedName + "@" + serverEntry.Host,
-		"sudo " + hook.Run,
+	args, err := s.sshArgs(shedName, serverEntry, "sudo "+hook.Run)
+	if err != nil {
+		return err
 	}
 
 	cmd := exec.CommandContext(ctx, "ssh", args...)
@@ -406,20 +424,14 @@ func (s *Syncer) SaveSyncLog(ctx context.Context, logContent string, shedName st
 		return fmt.Errorf("server entry is required to save sync log")
 	}
 
-	knownHostsPath := config.GetKnownHostsPath()
-
 	// Create log directory and write log
 	// Use sudo + tee since the log directory may be owned by root,
 	// and shell redirect (>) wouldn't inherit sudo
 	cmdStr := fmt.Sprintf("sudo mkdir -p %s && sudo tee %s > /dev/null", filepath.Dir(provision.SyncLog), provision.SyncLog)
 
-	args := []string{
-		"-p", strconv.Itoa(serverEntry.SSHPort),
-		"-o", "UserKnownHostsFile=" + knownHostsPath,
-		"-o", "StrictHostKeyChecking=yes",
-		"-o", "BatchMode=yes",
-		shedName + "@" + serverEntry.Host,
-		cmdStr,
+	args, err := s.sshArgs(shedName, serverEntry, cmdStr)
+	if err != nil {
+		return err
 	}
 
 	sshCmd := exec.CommandContext(ctx, "ssh", args...)

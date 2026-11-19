@@ -83,7 +83,7 @@ func (s *bootstrapStub) pinned() []string {
 
 func stubBootstrapResult(cred sdk.Credential, err error) *bootstrapStub {
 	s := &bootstrapStub{}
-	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(string, int, string, string, string) (sdk.Credential, error) {
 		s.calls.Add(1)
 		s.pinnedAtCall.Store(readKnownHostsLines())
 		return cred, err
@@ -687,7 +687,7 @@ func TestServerAddMTLSEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved := reloaded.Servers["srv"]
-	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(string, int, string, string, string) (sdk.Credential, error) {
 		t.Error("the saved entry must not need a fresh bootstrap")
 		return sdk.Credential{}, errors.New("unexpected")
 	}

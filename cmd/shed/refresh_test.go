@@ -168,7 +168,7 @@ func TestProactiveRefreshOnNearExpiry(t *testing.T) {
 	})
 
 	newExpiry := time.Now().Add(24 * time.Hour)
-	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(string, int, string, string, string) (sdk.Credential, error) {
 		return sdk.Credential{Bundle: sdk.Bundle{Token: "fresh", ExpiresAt: newExpiry, Scope: "control"}}, nil
 	}
 
@@ -194,7 +194,7 @@ func TestNoRefreshForStaticToken(t *testing.T) {
 	origCfg, origBF := clientConfig, bootstrapCredentialFn
 	defer func() { clientConfig, bootstrapCredentialFn = origCfg, origBF }()
 	called := false
-	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(string, int, string, string, string) (sdk.Credential, error) {
 		called = true
 		return sdk.Credential{Bundle: sdk.Bundle{Token: "x"}}, nil
 	}
@@ -255,7 +255,7 @@ func TestConcurrentRefreshNoRace(t *testing.T) {
 		})
 	}
 	newExpiry := time.Now().Add(24 * time.Hour)
-	bootstrapCredentialFn = func(host string, _ int, _, _ string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(host string, _ int, _, _, _ string) (sdk.Credential, error) {
 		return sdk.Credential{Bundle: sdk.Bundle{Token: "fresh-" + host, ExpiresAt: newExpiry, Scope: "control"}}, nil
 	}
 

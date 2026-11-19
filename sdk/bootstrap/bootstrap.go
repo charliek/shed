@@ -20,11 +20,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charliek/shed/sdk"
 )
@@ -118,6 +122,210 @@ type Params struct {
 	// and fills it in. It is a Params field (rather than an internal detail)
 	// only so validate() covers it on the same path as every other argv element.
 	CSRBase64 string
+	// IdentityFile, when set, is the one private (or public) key file ssh may
+	// offer: the argv gains `-i <IdentityFile> -o IdentitiesOnly=yes -o
+	// ControlMaster=no -o ControlPath=none` (IdentityArgs) after the fixed
+	// options and before `-l`. It is a server entry's identity_file, so an
+	// entry enrols with that key first and with no agent-only key, never over
+	// a shared connection another key opened. It must
+	// pass ValidateIdentityFile (validate refuses it otherwise), and Run checks
+	// it is a readable regular file before ssh is spawned (CheckIdentityFile).
+	// Empty leaves the argv exactly as it is without the field.
+	IdentityFile string
+}
+
+// IdentityFileError is a value of Params.IdentityFile (a server entry's
+// identity_file) that cannot be handed to ssh. Reason says why, in words that
+// follow "cannot be used: ".
+type IdentityFileError struct {
+	Path   string
+	Reason string
+}
+
+func (e *IdentityFileError) Error() string {
+	return fmt.Sprintf("identity_file %q cannot be used: %s", e.Path, SafeText(e.Reason))
+}
+
+// SafeText returns s with every character that is not printable (a control
+// character, a line separator, a stray byte that is not UTF-8) written as a Go
+// escape (an ESC as backslash-x1b, U+2028 as backslash-u2028, a stray byte as
+// backslash-xff), so a message built from a path or a file system error never
+// puts a raw control sequence on a terminal. Printable text, spaces included, is
+// kept as it is.
+func SafeText(s string) string {
+	var sb strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&sb, `\x%02x`, s[i])
+		case r == ' ' || unicode.IsPrint(r):
+			sb.WriteRune(r)
+		default:
+			quoted := strconv.QuoteRune(r)
+			sb.WriteString(quoted[1 : len(quoted)-1])
+		}
+		i += size
+	}
+	return sb.String()
+}
+
+// identityFileRefused names each character an identity file path may not
+// hold, and why. ssh expands `%` tokens and `${…}` environment references and
+// unescapes `\` in both `-i` and an ssh_config `IdentityFile` line; `"` would
+// end the quoted `IdentityFile "<path>"` value a generated ssh config writes;
+// the desktop's config reader cuts a value at `#`; NUL, CR and LF cannot be
+// carried by an argv element or a config line. The rule is the same in every
+// language that reads the field (the Rust readers mirror it), so a value one
+// side accepts the other never refuses.
+var identityFileRefused = []struct {
+	char   rune
+	reason string
+}{
+	{0, "it contains a NUL byte"},
+	{'\r', "it contains a carriage return"},
+	{'\n', "it contains a line feed"},
+	{'"', `it contains a double quote ("), which would end the quoted IdentityFile value`},
+	{'\\', `it contains a backslash (\), which ssh unescapes`},
+	{'#', "it contains #, which a config reader takes as the start of a comment"},
+	{'%', "it contains %, which ssh expands as a token"},
+	{'$', "it contains $, which ssh expands as an environment variable"},
+}
+
+// ValidateIdentityFile is the one rule for the value of an identity file, on
+// every path that reads it (the CLI's --identity-file flag, a hand-edited
+// config.yaml, and Params.IdentityFile): it must be an absolute path (it
+// begins with "/"); it may not be empty, only whitespace, or begin or end
+// with whitespace (Unicode White_Space); and it may not hold NUL, CR, LF, `"`,
+// `\`, `#`, `%` or `$`. It must be valid UTF-8 (YAML and the Rust readers
+// cannot carry anything else, so a value one side accepts the other never
+// refuses). It says nothing about the file itself: that is CheckIdentityFile,
+// at the time of use. The error is an *IdentityFileError.
+func ValidateIdentityFile(path string) error {
+	refuse := func(reason string) error { return &IdentityFileError{Path: path, Reason: reason} }
+	if !utf8.ValidString(path) {
+		return refuse("it is not valid UTF-8")
+	}
+	if strings.TrimSpace(path) == "" {
+		if path == "" {
+			return refuse("it is empty")
+		}
+		return refuse("it is only whitespace")
+	}
+	for _, r := range identityFileRefused {
+		if strings.ContainsRune(path, r.char) {
+			return refuse(r.reason)
+		}
+	}
+	if first, _ := utf8.DecodeRuneInString(path); unicode.IsSpace(first) {
+		return refuse("it begins with whitespace")
+	}
+	if last, _ := utf8.DecodeLastRuneInString(path); unicode.IsSpace(last) {
+		return refuse("it ends with whitespace")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return refuse("it is not an absolute path")
+	}
+	return nil
+}
+
+// CheckIdentityFile is ValidateIdentityFile plus the file itself, checked at
+// the time of use: it must exist, be a regular file (a symbolic link to one
+// is followed), and be readable by this process (OpenIdentityFile). A public
+// key file passes (ssh then offers the agent's copy of that key). The error
+// is an *IdentityFileError.
+func CheckIdentityFile(path string) error {
+	f, err := OpenIdentityFile(path)
+	if err != nil {
+		return err
+	}
+	_ = f.Close()
+	return nil
+}
+
+// OpenIdentityFile is ValidateIdentityFile, then opens the file for reading
+// and returns it once the OPENED file is known to be a regular file. The open
+// never blocks (O_NONBLOCK: a FIFO or a device swapped in for the key is
+// opened at once, then refused by the type check), and the type is checked on
+// the descriptor (fstat), not on the name, so a swap between a check and the
+// open cannot get anything but a regular file past it. The caller closes the
+// file. The error is an *IdentityFileError, whose reason never repeats the
+// path or carries a raw control character (SafeText).
+func OpenIdentityFile(path string) (*os.File, error) {
+	if err := ValidateIdentityFile(path); err != nil {
+		return nil, err
+	}
+	refuse := func(reason string) error { return &IdentityFileError{Path: path, Reason: reason} }
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, refuse("the file does not exist")
+		}
+		return nil, refuse("the file cannot be opened (" + fsReason(err) + ")")
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, refuse("the file cannot be read (" + fsReason(err) + ")")
+	}
+	switch {
+	case info.IsDir():
+		_ = f.Close()
+		return nil, refuse("it is a directory, not a key file")
+	case !info.Mode().IsRegular():
+		_ = f.Close()
+		return nil, refuse("it is not a regular file")
+	}
+	return f, nil
+}
+
+// fsReason is a file system error's own words without the path it names (a
+// *fs.PathError repeats the path, which the message already shows quoted),
+// with any control character escaped.
+func fsReason(err error) string {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		err = pe.Err
+	}
+	return SafeText(err.Error())
+}
+
+// IdentityArgs is the ssh argv an identity file adds, or nil for "":
+// IdentityKeyArgs (`-i <path> -o IdentitiesOnly=yes`) and then `-o
+// ControlMaster=no -o ControlPath=none`, so the ssh never rides (or opens) a
+// shared connection: a master another key opened, through a ControlMaster /
+// ControlPath in the person's own ssh config, would let this ssh reach the
+// server without authenticating with the entry's key at all. Options given on
+// the command line win over every ssh config file. It checks nothing: callers
+// validate first (ValidateIdentityFile, CheckIdentityFile). It is the one
+// spelling, shared by the bootstrap argv and every CLI ssh argv.
+func IdentityArgs(path string) []string {
+	if path == "" {
+		return nil
+	}
+	return append(IdentityKeyArgs(path), "-o", "ControlMaster=no", "-o", "ControlPath=none")
+}
+
+// IdentityKeyArgs is the key half of IdentityArgs, `-i <path> -o
+// IdentitiesOnly=yes`, or nil for "": for an ssh that keeps a shared
+// connection of its own, keyed by the identity file too, and sets its own
+// ControlMaster and ControlPath (the roost provider's transport).
+func IdentityKeyArgs(path string) []string {
+	if path == "" {
+		return nil
+	}
+	return []string{"-i", path, "-o", "IdentitiesOnly=yes"}
+}
+
+// Args returns the ssh arguments (without the ssh binary) of a bootstrap
+// exchange with p, after validating p as Run does (the identity file's value
+// included; not the file itself, which Run checks before it spawns ssh). It
+// lets a caller show or compare the exact argv a bootstrap runs.
+func Args(p Params) ([]string, error) {
+	if err := validate(p); err != nil {
+		return nil, err
+	}
+	return sshArgs(p), nil
 }
 
 // sshArgs builds the `ssh` argv for a bootstrap exchange (asserted directly by
@@ -136,7 +344,10 @@ type Params struct {
 // `~/.ssh/config` is intentionally NOT disabled (no `-F none`): it is how a user
 // points the daemon at a 1Password/Secretive `IdentityAgent` or a specific
 // `IdentityFile`. IdentitiesOnly is intentionally left unset so a multi-key
-// agent can still offer the allowlisted key. But a matching Host stanza must not
+// agent can still offer the allowlisted key — unless p.IdentityFile names the
+// one key to offer, which adds `-i <path> -o IdentitiesOnly=yes -o
+// ControlMaster=no -o ControlPath=none` (IdentityArgs) after the fixed options
+// and before `-l`. But a matching Host stanza must not
 // introduce side effects during the unattended mint, so agent forwarding,
 // port forwardings, and LocalCommand hooks are force-disabled.
 func sshArgs(p Params) []string {
@@ -160,10 +371,13 @@ func sshArgs(p Params) []string {
 		"-o", "ForwardAgent=no", // a matching ~/.ssh/config Host stanza must not
 		"-o", "ClearAllForwardings=yes", // forward the agent, open tunnels,
 		"-o", "PermitLocalCommand=no", // or run a local hook during the mint
+	}
+	args = append(args, IdentityArgs(p.IdentityFile)...)
+	args = append(args,
 		"-l", bootstrapUser,
 		p.Host,
 		p.Scope,
-	}
+	)
 	if p.ClientKind != "" {
 		args = append(args, p.ClientKind)
 	}
@@ -206,6 +420,11 @@ func validate(p Params) error {
 	}
 	if strings.ContainsAny(p.ClientKind, " \t\r\n") {
 		return fmt.Errorf("sdk/bootstrap: invalid client kind %q", p.ClientKind)
+	}
+	if p.IdentityFile != "" {
+		if err := ValidateIdentityFile(p.IdentityFile); err != nil {
+			return fmt.Errorf("sdk/bootstrap: %w", err)
+		}
 	}
 	// The CSR rides in a single argv element (`csr=<base64>`) that the server
 	// splits on the FIRST "=" and then base64-decodes. Whitespace would split it
@@ -332,6 +551,14 @@ func RunWithCSR(ctx context.Context, p Params) (sdk.Bundle, error) {
 func run(ctx context.Context, p Params) (sdk.Bundle, error) {
 	if err := validate(p); err != nil {
 		return sdk.Bundle{}, err
+	}
+	// The identity file is checked at the time of use, before ssh is spawned:
+	// a key removed since it was set fails here with its own reason, not as
+	// an ssh that "refused every key".
+	if p.IdentityFile != "" {
+		if err := CheckIdentityFile(p.IdentityFile); err != nil {
+			return sdk.Bundle{}, fmt.Errorf("sdk/bootstrap: %w", err)
+		}
 	}
 
 	sshPath, err := lookSSH()

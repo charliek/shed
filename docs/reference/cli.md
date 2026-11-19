@@ -39,6 +39,7 @@ shed server add <host> [flags]
 | `--fingerprint` | | | Expected SSH host-key fingerprint (`SHA256:...`); verified out-of-band and fails on mismatch |
 | `--tls-fingerprint` | | | Expected TLS cert fingerprint (`sha256:...`); verified out-of-band and fails on mismatch |
 | `--trust-on-first-use` | | `false` | Trust the server's SSH host key (and TLS cert) without prompting |
+| `--identity-file` | | | The SSH private key this entry uses, and the only one ssh offers for it (see [One SSH key per entry](#one-ssh-key-per-entry)) |
 
 **First contact is over SSH.** `server add` scans the server's SSH port (`--ssh-port`, default `2222`), pins the host key in `~/.shed/known_hosts`, and then mints a credential over the reserved `_bootstrap` SSH channel. The bundle the server returns describes everything else — API port, TLS pin, and which credential shape the server issues — and the entry is only saved after an authenticated `GET /api/info` over that endpoint succeeds.
 
@@ -66,6 +67,33 @@ The add says who the entry is. Against an mtls server it prints the user the ent
 ```
 
 A server with no user list issues a certificate for its one implicit user, shown as `User: (implicit)`. An `auth.mode: open` server issues no credential, and a server older than v0.10.0 in token mode issues a control token, which names no user: neither prints a `User:` line. With `--json` the result's `details` carry two members: `user`, the user name the entry records (omitted when it records none), and `user_implicit`, `true` when the entry's stored certificate is the implicit user's. The JSON never carries the text's `(implicit)` or `-`.
+
+#### One SSH key per entry
+
+`--identity-file <path>` names the SSH key the entry uses, so that a second entry for the same server, held to another user, needs no second host name:
+
+```bash
+shed server add shed.example.test --name work                                         # your everyday key
+shed server add shed.example.test --name work-admin --identity-file ~/.ssh/id_admin   # the backup admin key
+```
+
+With `identity_file` set, three things hold, each checked at the points it names, not continuously (see the last limit below):
+
+1. **The entry's API identity is that key and no other, at each check.** The server writes the SSH key that a `_bootstrap` login proved into the certificate it issues. Every enrolment for the entry (at the add, at `--refetch`, at each renewal, and a tunnel daemon's) compares that key with the public key of the identity file, and accepts the certificate only when they are the same. When they differ, nothing is stored or used and the command fails: `the server issued a certificate for SSH key "SHA256:…", but entry "<name>" uses only its identity_file "<path>" … ssh authenticated with a different key than the entry's identity file`. A certificate is also adopted only while the entry still names the identity file the enrolment started from and the key learned from that file is still the one it used: if another `shed` command changed the entry's `identity_file`, or the key file was replaced, while ssh ran, nothing is stored or recorded and the command stops using what it held. A control token names no key, so such an entry never uses one: a server older than v0.10.0 that issues one is refused, and an entry that still holds one from before its `identity_file` was set is refused before any request (`entry "<name>" cannot be used: it holds a control token …`; run `shed server update <name> --refetch`). The same comparison is made each time a stored certificate is loaded for use: one made for another key (stored before the entry's `identity_file` was set or changed, or by another program) is never presented, and the entry enrols again with its identity file on its next use, under the same rules as any enrolment (the user it is held to included). So `--identity-file` without `--refetch` takes effect at the next command; `--refetch` enrols with the key at once. If the identity file cannot be read at any of these points, whether or not a certificate is stored, the command fails with its `identity_file` message, nothing is presented and nothing is sent; a long-running command (a tunnel) that meets it at a renewal stops using the certificate it held.
+2. **The CLI's own ssh for the entry never rides a connection another key opened.** Every ssh the CLI runs for the entry carries `-o ControlMaster=no -o ControlPath=none`: the enrolment, `shed console`, `shed exec`, `shed attach`, `shed sync`. Options on the command line win over your ssh config, so a `ControlMaster auto` there cannot hand this ssh a connection your other key authenticated. The roost transport keeps a shared connection of its own, under its own `ControlPath`, keyed by the identity file and by the key in it (learned at each use), so a key replaced at the same path never reuses a connection the old key opened.
+3. **ssh offers that key first, and no key that is only in your agent.** Every ssh for the entry carries `-i <path> -o IdentitiesOnly=yes`.
+
+**Your ssh config's keys:** OpenSSH has no option that makes ssh ignore the `IdentityFile` lines of your own ssh config. A `Host` or `Match` stanza that matches the server's host (or `Host *`) can still add its keys, and ssh offers them after the entry's key. For the API this is caught by item 1: a certificate made for such a key is refused. For shell access (`shed console`, `shed exec`, `shed attach`) the server accepts whichever key it knows, so if the entry must use one key for shell access too, keep no other `IdentityFile` for that host in `~/.ssh/config`.
+
+**Through an alias, by another program:** item 2 is a promise about the ssh the CLI itself runs, whose command-line options win over any ssh config. The stanzas `shed ssh-config` generates, and the `Host` alias `shed attach` writes for roost, carry `IdentityFile "<path>"`, `IdentitiesOnly yes`, `ControlMaster no` and `ControlPath none`, but in an ssh config the first value found for an option wins: a stanza earlier in your own ssh config that sets `ControlMaster` or `ControlPath` for the same host takes precedence over these lines. A program other than the CLI that connects through the alias (plain `ssh`, an editor's remote mode, `rsync`) therefore gets only what your ssh config leaves the stanza to decide. The CLI never edits a stanza it did not write.
+
+**An alias defined through `Include`:** `shed attach` refuses an alias that is declared anywhere in `~/.ssh/config` outside shed's managed block, but it reads that one file only. An alias defined in a file `~/.ssh/config` pulls in with `Include` is not seen by that check.
+
+**Checked at these points, not continuously:** the key is checked when a stored certificate is loaded, when an enrolment is checked, and when an enrolment is adopted. It is not watched in between. A certificate a running process has already loaded stays in use until that process next loads or renews one, and a key file replaced after ssh has read it is caught at the next check, not at that one.
+
+**A key that is away, or slow:** a long-running tunnel whose identity file is absent when it renews its certificate (a key on removable media) stops accepting new connections and must be started again (`shed tunnels stop`, then `shed tunnels start`) once the key is back. The key file is read while the CLI holds its config lock, so a key on a stalled network filesystem stalls the command (and any other `shed` command waiting for that lock).
+
+The path is stored in `config.yaml` as `identity_file`, absolute, with a leading `~` expanded; nothing else about it is rewritten. A value is refused, by the flag and in a hand-edited `config.yaml` alike, when it is not an absolute path, is not valid UTF-8, begins or ends with whitespace (any Unicode whitespace), or contains NUL, CR, LF, `"`, `\`, `#`, `%` or `$` (ssh expands `%` tokens and `${…}` and unescapes `\` in `-i` and `IdentityFile`, and a quote or `#` breaks the config line). Move or link a key whose path has one of those characters. The file is checked when the flag is given and again each time it is used: it must be a readable regular file, and its public key must be learnable without a passphrase, which item 1 needs. That is the case for a key in the OpenSSH format (`-----BEGIN OPENSSH PRIVATE KEY-----`, encrypted or not), for an unencrypted key, and for any key with its `.pub` file beside it; a `.pub` that names another key than the file's own is refused. A public key file is accepted too (ssh then offers the agent's copy of that key). A key that cannot be used fails the command before ssh runs, with `entry "<name>": identity_file "<path>" cannot be used: <reason>`.
 
 `--https-port` names the port **you** reach the server's TLS listener on. It overrides the HTTPS port the bootstrap bundle advertises when the `api_url` is built, which is what makes a port-mapped or externally published deployment addable; the pinned certificate fingerprint always comes from the bundle, and the verification request still has to succeed, so a wrong port fails during the add rather than on your next command.
 
@@ -97,7 +125,25 @@ regenerates its cert).
 ```bash
 shed server update <name> --tls-fingerprint sha256:<new>   # pin a new value out-of-band
 shed server update <name> --refetch                        # re-read the pin over SSH and re-pin
+shed server update <name> --identity-file ~/.ssh/id_work   # set the SSH key the entry uses
+shed server update <name> --identity-file ~/.ssh/id_work --refetch   # ...and re-enrol with it
+shed server update <name> --identity-file ""               # clear it
 ```
+
+`--identity-file` sets the entry's `identity_file` (see
+[One SSH key per entry](#one-ssh-key-per-entry)); the value is checked as
+`shed server add` checks it, and only whitespace is refused rather than read as
+"clear". On its own it changes only that field, on any entry, plain HTTP
+included, and the entry re-enrols with this key on its next use: a stored
+certificate made for another key is never presented.
+With `--refetch` the re-enrolment offers the new key, the new certificate must
+have been made for it, and the key is saved together with the certificate: if
+the refetch fails or is refused, nothing is saved, the key included. An entry
+whose stored `identity_file` cannot be used is refused by `--refetch` until the
+key is fixed (or replaced with `--identity-file`). A `--refetch` running in another `shed`
+process while the key changes is refused with nothing saved
+(`entry "<name>" changed while this command ran`), and so is one racing an
+`--allow-user-change`.
 
 `--refetch` follows the same SSH-first path as `shed server add`: it re-verifies
 the pinned host key, re-bootstraps, and takes the new TLS pin from the bundle —
@@ -140,6 +186,7 @@ shed server update <name> --refetch --allow-user-change    # make the entry the 
 | `--refetch` | Re-pin and re-enrol over the SSH-first path |
 | `--trust-on-first-use` | With `--refetch`, trust the re-fetched TLS certificate without prompting |
 | `--allow-user-change` | With `--refetch`, let the entry change to the user of the new certificate. Without `--refetch` it is a usage error |
+| `--identity-file <path>` | Set the SSH key the entry uses (`""` clears it); with `--refetch`, the re-enrolment uses it |
 
 `--refetch` is also the way back for an entry the CLI refuses. Every other
 command refuses an entry, before it sends any request or runs `ssh`, when its
@@ -1216,7 +1263,7 @@ Both are left alone on every later attach.
 
 | Behaviour | Detail |
 |---|---|
-| No `IdentityFile` | The `Host` entry carries the host, port, user and pinned `~/.shed/known_hosts` file, and no identity — your default key and ssh agent decide, exactly as `shed ssh-config --install` writes it. An entry you wrote by hand is never modified. |
+| `IdentityFile` only from the server entry | The `Host` entry carries the host, port, user and pinned `~/.shed/known_hosts` file, exactly as `shed ssh-config --install` writes it. Without an `identity_file` on the server entry it carries no identity (your default key and ssh agent decide), and an entry already in the file, written by an earlier attach or by hand, is never modified. With one (see [One SSH key per entry](#one-ssh-key-per-entry)) it also carries `IdentityFile "<path>"`, `IdentitiesOnly yes`, `ControlMaster no` and `ControlPath none`; an alias shed wrote earlier (inside its managed block) whose stanza differs, for example one written before the key was set or with another key, is rewritten before it is used (`rewrote Host <alias> …`); and an alias of that name that shed did not write stops the attach with a message naming the alias and the identity file, changing nothing, because shed cannot vouch for what it offers. That is an alias declared anywhere in `~/.ssh/config` outside the managed block (even when the block also holds a copy), or a stanza inside the block that is not entirely shed's: a `Host` line naming other hosts too (or anything else on that line), a line shed does not write (a comment, an `Include`, another option such as `ProxyJump`), an indented `Host` or a `Match` line after it, or a second stanza for the alias. Remove that stanza to let shed write its own. An alias in a file pulled in with `Include` is not seen. A file whose managed-block marker lines do not frame exactly one block is refused, unchanged, with or without an `identity_file`. |
 | Renaming the tab defeats reuse | Reuse matches the tab's title and working directory. A tab renamed in roost no longer matches, so the next `shed attach` opens a new one. |
 | Concurrent attaches can duplicate a saved host | Two `shed attach` runs racing on a shed that has no saved host yet can each add one, leaving a duplicate. roost offers no compare-and-swap; remove the extra host in roost. |
 | Nothing is cleaned up on `shed delete` | The `Host` entry and the saved roost host outlive the shed. Remove them by hand; automatic cleanup is future work. |
@@ -1486,6 +1533,27 @@ shed ssh-config --all --install --dry-run  # Preview changes
 shed ssh-config --all --install       # Apply changes
 shed ssh-config --uninstall           # Remove managed block
 ```
+
+A shed on a server entry with an `identity_file` gets `IdentityFile "<path>"`,
+`IdentitiesOnly yes`, `ControlMaster no` and `ControlPath none` in its stanza
+(see [One SSH key per entry](#one-ssh-key-per-entry)); an identity file that
+cannot be used fails the command before anything is printed or written. For
+such a shed, `--install` writes the managed block again when a stanza's
+identity lines are not exactly these (for example one written before the
+entry's key was set) or the block holds the alias twice, and keeps the
+qualified roost alias `shed-<server>-<shed>` that `shed attach` may have
+written, listing each under "Entries to update" (`changed` in `--json`). A shed
+on an entry without an `identity_file` is compared by name only, as before.
+
+The managed block is shed's: whenever it must change (an addition, a removal,
+or an update above), `--install` regenerates it whole from the sheds it lists,
+so lines edited by hand inside the block are not kept; keep your own lines
+outside it. The block is found by its marker lines only, a line that is exactly
+`# --- BEGIN SHED MANAGED BLOCK ---` or `# --- END SHED MANAGED BLOCK ---`, so
+the same text inside a comment or a quoted value is not a boundary. A file with
+more than one of either line, one without the other, or the END line first is
+refused, naming the file, and nothing is changed; `shed attach` refuses it the
+same way.
 
 ## Roost Integration
 

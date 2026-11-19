@@ -17,8 +17,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -67,6 +69,21 @@ type mtlsServer struct {
 	// prove a client made none at all — not merely that no request reached the
 	// handler (a refused handshake never does).
 	accepted atomic.Int32
+	// shown records the Subject CN of every client certificate a handshake
+	// presented (refused or not), so a test can prove a certificate was never
+	// shown at all, not merely that no request used it.
+	shownMu sync.Mutex
+	shown   []string
+	// onRequest, when a test sets it, runs at the start of every request the
+	// handler serves (while the client waits for the answer).
+	onRequest atomic.Pointer[func()]
+}
+
+// shownCNs returns the Subject CN of every client certificate presented so far.
+func (m *mtlsServer) shownCNs() []string {
+	m.shownMu.Lock()
+	defer m.shownMu.Unlock()
+	return slices.Clone(m.shown)
 }
 
 // acceptCounter wraps a listener and counts the connections it accepts.
@@ -124,6 +141,9 @@ func newMTLSServer(t *testing.T) *mtlsServer {
 
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		m.requests.Add(1)
+		if hook := m.onRequest.Load(); hook != nil {
+			(*hook)()
+		}
 		m.lastAuth.Store(r.Header.Get("Authorization"))
 		serial := ""
 		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
@@ -142,6 +162,17 @@ func newMTLSServer(t *testing.T) *mtlsServer {
 		MinVersion: tls.VersionTLS12,
 		ClientCAs:  ca.Pool(),
 		ClientAuth: tls.RequireAndVerifyClientCert,
+		// Record every client certificate the handshake verified (a
+		// certificate this CA issued and still valid), whether or not a
+		// request follows on the connection.
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) > 0 {
+				m.shownMu.Lock()
+				m.shown = append(m.shown, cs.PeerCertificates[0].Subject.CommonName)
+				m.shownMu.Unlock()
+			}
+			return nil
+		},
 	}
 	// A refused handshake is the point of several of these tests, not a surprise
 	// worth pages of output.
@@ -190,6 +221,13 @@ func (m *mtlsServer) issue(t *testing.T, label string, ttl time.Duration) (certP
 // issueFor is issue for a given user ("" for the implicit user).
 func (m *mtlsServer) issueFor(t *testing.T, label, user string, ttl time.Duration) (certPEM, keyPEM []byte, serial string) {
 	t.Helper()
+	return m.issueForSubject(t, sshFingerprint(label), user, ttl)
+}
+
+// issueForSubject is issueFor with the subject given: the SSH key fingerprint
+// the server writes as the certificate's CN (the key the bootstrap proved).
+func (m *mtlsServer) issueForSubject(t *testing.T, subject, user string, ttl time.Duration) (certPEM, keyPEM []byte, serial string) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -199,7 +237,7 @@ func (m *mtlsServer) issueFor(t *testing.T, label, user string, ttl time.Duratio
 	if err != nil {
 		t.Fatal(err)
 	}
-	certDER, err := m.ca.SignClientCSR(csrDER, sshFingerprint(label), user, "control", "cli", ttl)
+	certDER, err := m.ca.SignClientCSR(csrDER, subject, user, "control", "cli", ttl)
 	if err != nil {
 		t.Fatalf("sign client CSR: %v", err)
 	}
@@ -302,7 +340,7 @@ func putServerEntry(t *testing.T, name string, entry config.ServerEntry) {
 // per request.
 func stubBootstrap(mint func() sdk.Credential) *atomic.Int32 {
 	var calls atomic.Int32
-	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(string, int, string, string, string) (sdk.Credential, error) {
 		calls.Add(1)
 		return mint(), nil
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/charliek/shed/internal/roostctl"
 	"github.com/charliek/shed/internal/roostprovider"
 	"github.com/charliek/shed/internal/sshconfig"
+	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 )
 
 // The roost-native half of `shed attach` (plan 022 §3.3), under owner decision
@@ -203,6 +204,9 @@ type roostAttach struct {
 	// a test that drives connectHost directly sets them itself.
 	shedName  string
 	shedEntry *config.ServerEntry
+	// shedServer is the config name of shedEntry, which names the entry in a
+	// message about its identity_file. Set by attach.
+	shedServer string
 	// recoveryAttempted is the start rung's one-shot latch: at most ONE remote
 	// recovery per attach, and therefore at most two `host connect` calls. The
 	// second poll cannot re-enter the rung, whatever it settles on.
@@ -292,7 +296,7 @@ func attachShed(name, serverName string, entry *config.ServerEntry, shed *config
 func (a *roostAttach) attach(ctx context.Context, name, serverName string, entry *config.ServerEntry, shed *config.Shed, title string, forceNew bool) error {
 	// Which shed this attempt is for, recorded before step 5 because step 5's
 	// start rung reaches the shed directly (see startRemoteSession).
-	a.shedName, a.shedEntry = name, entry
+	a.shedName, a.shedEntry, a.shedServer = name, entry, serverName
 	alias := a.aliasFor(ctx, name, serverName) // step 3, naming
 	if err := a.ensureSSHAlias(alias, name, entry); err != nil {
 		return err
@@ -484,31 +488,54 @@ func shedNameIsAmbiguous(name, serverName string) bool {
 }
 
 // ensureSSHAlias is §3.3 step 3's second half: make sure `ssh <alias>` reaches
-// this shed, without ever touching an alias that already exists.
+// this shed.
 //
 // roost connects to a saved host by handing the target string to ssh, so the
 // alias has to resolve in `~/.ssh/config` — and it is the ONE thing this flow
-// writes to the user's own files. An existing `Host <alias>`, managed or
-// hand-written, is left exactly as it is: a user who wrote their own entry
-// with a ProxyJump or a different IdentityFile meant it, and a shed whose
-// alias was already written by an earlier attach needs nothing done.
+// writes to the user's own files.
 //
-// The entry's shape is `generateEntries`', including its omissions: no
-// IdentityFile, so the default key and the ssh agent decide — documented in
-// the reference docs rather than special-cased here.
+// Without an identity_file on the server entry, an existing `Host <alias>`,
+// managed or hand-written, is left exactly as it is: a user who wrote their
+// own entry with a ProxyJump or a different IdentityFile meant it, and a shed
+// whose alias was already written by an earlier attach needs nothing done.
+//
+// With one, the alias is the entry's key or nothing (sshconfig.EnsureEntry):
+// the stanza carries `IdentityFile "<path>"`, `IdentitiesOnly yes`,
+// `ControlMaster no` and `ControlPath none`, so roost's ssh offers that key
+// first and no agent-only key, and rides no other key's shared connection. An
+// alias shed wrote (inside its managed block) whose stanza differs from that,
+// identity lines included, is rewritten before it is used; an alias of that
+// name that shed did not write (outside the managed block) refuses the attach,
+// naming the alias and the file, so it never proceeds through a stanza it
+// cannot vouch for. The identity file is checked first (its value, the file
+// and its public key), and one that cannot be used fails here, before
+// anything is written.
 func (a *roostAttach) ensureSSHAlias(alias, shedName string, entry *config.ServerEntry) error {
-	outcome, err := sshconfig.AddEntryIfAbsent(a.sshConfigPath, sshconfig.Entry{
+	if _, err := entry.SSHIdentityArgs(a.shedServer); err != nil {
+		return err
+	}
+	outcome, err := sshconfig.EnsureEntry(a.sshConfigPath, sshconfig.Entry{
 		Name:           alias,
 		Host:           entry.Host,
 		Port:           entry.SSHPort,
 		User:           shedName,
 		KnownHostsFile: config.GetKnownHostsPath(),
+		IdentityFile:   entry.IdentityFile,
 	})
+	var unmanaged *sshconfig.UnmanagedAliasError
+	if errors.As(err, &unmanaged) {
+		unmanaged.Path = tildePath(a.sshConfigPath)
+		return fmt.Errorf("server %q: %w", a.shedServer, unmanaged)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to add Host %s to %s: %w", alias, tildePath(a.sshConfigPath), err)
 	}
-	if outcome == sshconfig.AddedEntry {
+	switch outcome {
+	case sshconfig.AddedEntry:
 		fmt.Fprintf(a.out, "wrote Host %s to %s\n", alias, tildePath(a.sshConfigPath))
+	case sshconfig.RewroteEntry:
+		fmt.Fprintf(a.out, "rewrote Host %s in %s for the server entry's identity_file\n",
+			sdkbootstrap.SafeText(alias), sdkbootstrap.SafeText(tildePath(a.sshConfigPath)))
 	}
 	return nil
 }
@@ -1330,8 +1357,10 @@ func reusableTab(projects []roostprovider.Project, title, cwd string) (string, b
 func (a *roostAttach) remoteFor(name string, entry *config.ServerEntry) (*roostprovider.Remote, roostprovider.Target, error) {
 	return roostRemoteFor(a.sshBin, a.controlDir, roostprovider.RunningShed{
 		Name:          name,
+		Server:        a.shedServer,
 		ServerHost:    entry.Host,
 		ServerSSHPort: entry.SSHPort,
+		IdentityFile:  entry.IdentityFile,
 	})
 }
 
@@ -1339,7 +1368,8 @@ func (a *roostAttach) remoteFor(name string, entry *config.ServerEntry) (*roostp
 //
 // A shed's ssh identity is always `<shed>@<server host> -p <server ssh port>`
 // pinned against `~/.shed/known_hosts` — shed mints those host keys itself —
-// which is exactly what ShedTarget spells. The `Host <alias>` entry `shed
+// with the server entry's identity file when it has one, which is exactly what
+// ShedTarget spells. The `Host <alias>` entry `shed
 // attach` writes is for ROOST's ssh, not for this one, which is why nothing
 // here reads the ssh config.
 //

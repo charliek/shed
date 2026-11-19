@@ -59,7 +59,7 @@ func TestSaveTimeRefusalIsNeverAWarning(t *testing.T) {
 			if err := os.WriteFile(cfgPath, []byte("servers: [this is not a map\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-		}, "could not be read to check the user it is held to"},
+		}, "could not be verified against its recorded user and identity"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

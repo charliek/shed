@@ -77,7 +77,10 @@ func withCleanAddFlags(t *testing.T) {
 	serverUpdateTLSFingerprint = ""
 	oAllowUserChange := serverUpdateAllowUserChange
 	serverUpdateAllowUserChange = false
+	oAddIdentity, oUpdateIdentity := serverAddIdentityFile, serverUpdateIdentityFile
+	serverAddIdentityFile, serverUpdateIdentityFile = "", optionalString{}
 	t.Cleanup(func() {
+		serverAddIdentityFile, serverUpdateIdentityFile = oAddIdentity, oUpdateIdentity
 		serverUpdateAllowUserChange = oAllowUserChange
 		serverAddHTTPSPort, serverAddSecure, serverAddPort, serverAddTrustTOFU,
 			serverAddTLSFingerprint, defaultAddHTTPSPort, jsonFlag =

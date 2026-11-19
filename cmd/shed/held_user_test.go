@@ -919,7 +919,7 @@ func TestTwoFirstEnrolmentsCannotBothWin(t *testing.T) {
 	adminCred := m.credentialFor(t, "admin-key", "admin", farFromExpiry)
 	var mintsDone atomic.Int32
 	var issueAdmin atomic.Bool
-	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(string, int, string, string, string) (sdk.Credential, error) {
 		defer mintsDone.Add(1)
 		if issueAdmin.Load() {
 			return adminCred, nil
@@ -1100,7 +1100,7 @@ func TestRefetchRefusedAfterAnotherProcessChangedTheUser(t *testing.T) {
 	issued := mtlsCredentialFor(t, m)
 	var before fileSnapshot
 	var requests int64
-	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(string, int, string, string, string) (sdk.Credential, error) {
 		// The other process lands while this one's bootstrap runs.
 		asAnotherProcess(t, cfgPath, func(c *config.ClientConfig) {
 			e := c.Servers["srv"]

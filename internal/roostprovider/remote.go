@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/charliek/shed/internal/config"
+	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 )
 
 // execChain builds roost's candidate ladder as one remote command: the same
@@ -184,6 +185,16 @@ type Target struct {
 	// against this file. Empty means the user's own ssh config decides, which
 	// is what an unpinned `machines:` entry asks for.
 	KnownHosts string
+	// IdentityFile, when non-empty, is the key ssh offers first, and no
+	// agent-only key: the argv gains `-i <path> -o IdentitiesOnly=yes`, and,
+	// when the Remote keeps no shared connection of its own, `-o
+	// ControlMaster=no -o ControlPath=none`. It is a shed server entry's
+	// identity_file (a `machines:` entry never sets it). Argv checks it, the
+	// value, the file and its public key, before it builds anything.
+	IdentityFile string
+	// Entry is the config name of the server entry IdentityFile came from,
+	// for the message when it cannot be used. It does not affect the argv.
+	Entry string
 }
 
 // ShedTarget builds the Target for a running shed. knownHosts is
@@ -194,10 +205,12 @@ type Target struct {
 // `~/.ssh/config` could be expected to know.
 func ShedTarget(s RunningShed, knownHosts string) Target {
 	return Target{
-		Dest:       s.Name + "@" + s.ServerHost,
-		Port:       s.ServerSSHPort,
-		EmitPort:   true,
-		KnownHosts: knownHosts,
+		Dest:         s.Name + "@" + s.ServerHost,
+		Port:         s.ServerSSHPort,
+		EmitPort:     true,
+		KnownHosts:   knownHosts,
+		IdentityFile: s.IdentityFile,
+		Entry:        s.Server,
 	}
 }
 
@@ -277,9 +290,27 @@ func (t Target) Validate() error {
 // StrictHostKeyChecking, ConnectTimeout, -T) is either a constant or derived
 // from KnownHosts, so this is the whole connection-affecting set.
 //
+// IdentityFile is load-bearing the same way: two server entries for one server
+// with different keys (the reason the field exists) are the same `user@host:
+// port` and pin, and sharing a master would let the second ride a connection
+// authenticated with the FIRST entry's key — as the first entry's user. And
+// the file NAME is not the key: a key replaced at the same path (or a symlink
+// retargeted) is another identity under the same name, and a master opened
+// with the old key must never carry the new one. So a target with an identity
+// file has a key of its own, under the `v2` format prefix with the identity
+// file and identityKey, the fingerprint of the public key learned from that
+// file at this use (config.IdentityFileKey, which Argv calls), as a fifth and
+// sixth field. A target with none keeps the `v1` key byte for byte, so its
+// ControlPath (and so its argv) is exactly what it was before the field
+// existed; the two prefixes keep the two shapes from ever colliding.
+//
 // NUL-joined with a version prefix: none of these values can contain a NUL, so
 // no combination of them can collide with another by running together.
-func (t Target) muxKey() string {
+func (t Target) muxKey(identityKey string) string {
+	if t.IdentityFile != "" {
+		return fmt.Sprintf("v2\x00%s\x00%d\x00%t\x00%s\x00%s\x00%s",
+			t.Dest, t.Port, t.EmitPort, t.KnownHosts, t.IdentityFile, identityKey)
+	}
 	return fmt.Sprintf("v1\x00%s\x00%d\x00%t\x00%s", t.Dest, t.Port, t.EmitPort, t.KnownHosts)
 }
 
@@ -331,16 +362,35 @@ func (r *Remote) Argv(t Target, remoteCmd string) ([]string, error) {
 	if err := t.Validate(); err != nil {
 		return nil, err
 	}
+	// The identity file is checked at the time of use, its value, the file
+	// itself and its public key: one that cannot be used is an error, and no
+	// ssh is spawned. The fingerprint learned here keys the shared connection
+	// (muxKey), so a key replaced at the same path never reuses a master.
+	identityKey, err := config.IdentityFileKey(t.Entry, t.IdentityFile)
+	if err != nil {
+		return nil, err
+	}
+	// With a ControlDir this transport keeps its own shared connection, keyed
+	// by the identity file and its key too (muxKey), and sets its own ControlMaster and
+	// ControlPath below; options on the command line win over the person's
+	// ssh config, so a ControlPath there is never the one in force. Without
+	// one, the ssh shares no connection at all (ControlMaster=no,
+	// ControlPath=none), so it never rides a master another key opened.
+	identity := sdkbootstrap.IdentityArgs(t.IdentityFile)
+	if r.ControlDir != "" {
+		identity = sdkbootstrap.IdentityKeyArgs(t.IdentityFile)
+	}
 	argv := []string{r.SSHBin, "-o", "BatchMode=yes"}
 	if t.KnownHosts != "" {
 		argv = append(argv, "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile="+t.KnownHosts)
 	}
+	argv = append(argv, identity...)
 	argv = append(argv, "-o", "ConnectTimeout="+strconv.Itoa(sshConnectTimeoutSecs))
 	if r.ControlDir != "" {
 		argv = append(argv,
 			"-o", "ControlMaster=auto",
 			"-o", "ControlPersist="+controlPersistArg,
-			"-o", "ControlPath="+controlPath(r.ControlDir, t.muxKey()),
+			"-o", "ControlPath="+controlPath(r.ControlDir, t.muxKey(identityKey)),
 		)
 	}
 	argv = append(argv, "-T")

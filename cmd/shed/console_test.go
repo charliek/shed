@@ -315,7 +315,7 @@ func TestBaseSSHArgs(t *testing.T) {
 	entry := &config.ServerEntry{Host: "mini3", SSHPort: 2222}
 
 	t.Run("carries the shared connection options", func(t *testing.T) {
-		joined := strings.Join(baseSSHArgs("myshed", entry), " ")
+		joined := strings.Join(mustBaseSSHArgs(t, "myshed", entry), " ")
 		for _, want := range []string{
 			"-p 2222",
 			"UserKnownHostsFile=",
@@ -329,7 +329,7 @@ func TestBaseSSHArgs(t *testing.T) {
 	})
 
 	t.Run("extra options land before the destination", func(t *testing.T) {
-		args := baseSSHArgs("myshed", entry, "-T", "-o", "BatchMode=yes")
+		args := mustBaseSSHArgs(t, "myshed", entry, "-T", "-o", "BatchMode=yes")
 		if got := args[len(args)-1]; got != "myshed@mini3" {
 			t.Fatalf("destination must be last, got %q in %v", got, args)
 		}
@@ -351,7 +351,7 @@ func TestSSHSessionArgs(t *testing.T) {
 		// A multi-element quoted command: it must be appended verbatim, in order,
 		// after the host — no reordering and no "--" inserted.
 		cmd := []string{"'bash'", "'-c'", "'echo hi'"}
-		got := sshSessionArgs("-T", "box", entry, cmd)
+		got := mustSSHSessionArgs(t, "-T", "box", entry, cmd)
 		if len(got) < 3 || got[0] != "ssh" || got[1] != "-T" {
 			t.Fatalf("expected argv to start with [ssh -T ...], got %v", got)
 		}
@@ -374,7 +374,7 @@ func TestSSHSessionArgs(t *testing.T) {
 	})
 
 	t.Run("interactive omits the command and ends at the host", func(t *testing.T) {
-		got := sshSessionArgs("-t", "box", entry, nil)
+		got := mustSSHSessionArgs(t, "-t", "box", entry, nil)
 		if got[0] != "ssh" || got[1] != "-t" {
 			t.Fatalf("expected [ssh -t ...], got %v", got)
 		}

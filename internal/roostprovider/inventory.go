@@ -65,6 +65,10 @@ type RunningShed struct {
 	// that's the whole reach this struct needs to carry.
 	ServerHost    string
 	ServerSSHPort int
+	// IdentityFile is the server entry's identity_file, copied like
+	// ServerHost: the one key ssh offers for this shed (`-i <path> -o
+	// IdentitiesOnly=yes`, Target.IdentityFile). Empty for none.
+	IdentityFile string
 	// LandingDir is config.Shed's landing_dir field verbatim. Empty means the
 	// server didn't report one — an older shed-server predating the field, or
 	// a shed with no project mount — and the caller falls back to "~" per
@@ -216,6 +220,9 @@ func listServer(ctx context.Context, name string, entry config.ServerEntry, time
 			r.Entry = name // the reader had no name to give it
 			return nil, false, r
 		}
+		if ie, refused := config.NameIdentityFileError(name, err); refused {
+			return nil, false, ie // its identity file cannot be used: a refusal too
+		}
 		return nil, false, nil
 	}
 
@@ -229,6 +236,7 @@ func listServer(ctx context.Context, name string, entry config.ServerEntry, time
 			Server:        name,
 			ServerHost:    entry.Host,
 			ServerSSHPort: entry.SSHPort,
+			IdentityFile:  entry.IdentityFile,
 			LandingDir:    shed.LandingDir,
 		})
 	}
@@ -343,11 +351,12 @@ func fetchSheds(ctx context.Context, entry config.ServerEntry, timeout time.Dura
 //
 // The error is errNoStoredCredential for every such skip, except an entry
 // the CLI refuses (below), whose *config.EntryRefusedError is returned as it
-// is, so the caller can say why.
+// is, and an entry whose identity_file cannot be used, whose
+// *config.IdentityFileError is (noStoredCredential), so the caller can say why.
 func stashedCredential(entry *config.ServerEntry) (clienttoken.Credential, error) {
 	if entry.IsMTLS() {
 		if entry.ClientCertFile == "" || entry.ClientKeyFile == "" {
-			return clienttoken.Credential{}, errNoStoredCredential
+			return clienttoken.Credential{}, noStoredCredential(entry)
 		}
 		// name="" — this call never persists, so there's nothing to
 		// serialize a write against; loadClientCert's own reasoning
@@ -362,14 +371,27 @@ func stashedCredential(entry *config.ServerEntry) (clienttoken.Credential, error
 		// record, is refused (the entry must be enrolled again) and is
 		// treated here like any entry this package cannot use — nothing is
 		// presented and nothing is sent — except that its refusal is kept.
+		// For an entry with an identity_file it also checks the certificate was
+		// made for that key (plan 037 P-a): one made for another key is a skip
+		// here, never presented; a key file that cannot be used now is the
+		// entry's refusal (its *config.IdentityFileError), kept like the others.
 		cert, err := config.LoadEntryCertificate("", entry)
 		if _, refused := config.AsEntryRefused(err); refused {
+			return clienttoken.Credential{}, err
+		}
+		if _, refused := config.NameIdentityFileError("", err); refused {
 			return clienttoken.Credential{}, err
 		}
 		if err != nil || cert == nil {
 			return clienttoken.Credential{}, errNoStoredCredential
 		}
 		return clienttoken.MTLSCredential(cert, entry.ClientCertExpiresAt), nil
+	}
+	if entry.IdentityFile != "" && entry.ControlToken != "" {
+		// A control token names no SSH key, so an entry held to its identity
+		// file never presents one (plan 037 P-a), stored or newly issued: the
+		// entry's refusal, as the CLI's (config.StoredTokenRefusal).
+		return clienttoken.Credential{}, config.StoredTokenRefusal("", entry)
 	}
 	if entry.ControlTokenExpiresAt.IsZero() {
 		// Either a legacy static token (has something to present, never
@@ -379,9 +401,23 @@ func stashedCredential(entry *config.ServerEntry) (clienttoken.Credential, error
 		// stripped of its credential, which DOES need a mint and is
 		// therefore refused here.
 		if entry.NeedsEnrollment() {
-			return clienttoken.Credential{}, errNoStoredCredential
+			return clienttoken.Credential{}, noStoredCredential(entry)
 		}
 		return clienttoken.TokenCredential(entry.ControlToken, time.Time{}), nil
 	}
 	return clienttoken.TokenCredential(entry.ControlToken, entry.ControlTokenExpiresAt), nil
+}
+
+// noStoredCredential is stashedCredential's skip of an entry with nothing
+// stored to present (errNoStoredCredential), except that an entry whose
+// identity_file cannot be used now is that refusal (its
+// *config.IdentityFileError): the CLI refuses such an entry before it would
+// enrol, so it is reported, not silently skipped.
+func noStoredCredential(entry *config.ServerEntry) error {
+	if entry.IdentityFile != "" {
+		if _, err := config.IdentityFileKey("", entry.IdentityFile); err != nil {
+			return err
+		}
+	}
+	return errNoStoredCredential
 }

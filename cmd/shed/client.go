@@ -362,13 +362,29 @@ func observableMintOnlyRefresh(host, reason string, refresh func() (clienttoken.
 // The one stored state that is NOT recoverable is a certificate whose user the
 // entry may not use (config.LoadEntryCertificate): it names no user, or a user
 // the entry does not record. That returns refusal, and the caller builds a
-// refused client that sends nothing.
+// refused client that sends nothing. So does an identity_file that cannot be
+// used when the stored pair is checked against it (its typed
+// *config.IdentityFileError; when the entry holds no certificate, the
+// enrolment EnsureFresh runs before the first request meets the same refusal
+// and ends the client), and a stored control token on an entry with an
+// identity_file
+// (config.RefusedStoredTokenForKey: a token names no key, so it is never
+// presented for such an entry). A stored certificate made for another SSH key
+// than the entry's identity_file is the recoverable case: it is not presented
+// and the entry enrols again with its identity file.
 func entryCredential(entry *config.ServerEntry, name, displayName string) (cred clienttoken.Credential, refreshable bool, refusal error) {
 	if entry.IsMTLS() {
 		cert, err := loadClientCert(entry, name)
 		if r, ok := config.AsEntryRefused(err); ok {
 			r.Entry = displayName
 			return clienttoken.Credential{}, false, r
+		}
+		if ie, ok := config.NameIdentityFileError(displayName, err); ok {
+			// The entry's identity_file cannot be used now, so neither its
+			// stored certificate (whose key cannot be checked) nor an enrolment
+			// (which would fail the same way) may be: fail closed, nothing is
+			// presented and nothing is dialled.
+			return clienttoken.Credential{}, false, ie
 		}
 		if err != nil && verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "warning: could not load client certificate for %s (re-enrolling): %v\n", entry.Host, err)
@@ -378,7 +394,16 @@ func entryCredential(entry *config.ServerEntry, name, displayName string) (cred 
 		}
 		// No usable certificate — refreshable, holding nothing. EnsureFresh
 		// enrolls on that (Credential.Usable), so no fake expiry is needed.
+		// An identity_file that cannot be used fails that enrolment with its
+		// *config.IdentityFileError, a refusal, which ends the source before
+		// any request: nothing is sent without a certificate first.
 		return clienttoken.Credential{Mode: clienttoken.ModeMTLS}, true, nil
+	}
+	if entry.IdentityFile != "" && entry.ControlToken != "" {
+		// A control token names no SSH key, so an entry held to its identity
+		// file never presents one, stored or newly issued (plan 037 P-a): the
+		// entry is refused and nothing is dialled with the token.
+		return clienttoken.Credential{}, false, config.StoredTokenRefusal(displayName, entry)
 	}
 	if entry.ControlTokenExpiresAt.IsZero() {
 		// Either an open server / legacy static token (static, as always), or a
@@ -451,19 +476,30 @@ func controlCredentialMintOnly(endpoint config.ServerEntry, rowName string) func
 // persisting refresh, the entry's name for a named mint-only one, "" for none.
 func controlCredentialRefreshHeld(endpoint config.ServerEntry, persistName, rowName, displayName string, held *heldUser) func() (clienttoken.Credential, error) {
 	return func() (clienttoken.Credential, error) {
-		res, err := bootstrapCredentialFn(endpoint.Host, endpoint.SSHPort, "control", "cli")
+		// The entry's identity_file, when set, is the key ssh offers first; a
+		// value or file that cannot be used fails here, before ssh is spawned,
+		// and entryKey is its public key, which the issued certificate must
+		// have been made for.
+		res, entryKey, err := bootstrapEntryCredential(displayName, endpoint.Host, endpoint.SSHPort, endpoint.IdentityFile)
 		var unusable *sdkbootstrap.UnusableCertificateError
 		if errors.As(err, &unusable) {
 			// The server answered with a certificate the SDK cannot use (none,
 			// not PEM, DER that does not parse, another key's certificate): an
 			// unreadable issuance, decided like any other, under the same rule.
-			return adoptMTLSCredential(sdk.Credential{}, unusable, persistName, rowName, displayName, endpoint, held)
+			return adoptMTLSCredential(sdk.Credential{}, unusable, entryKey, persistName, rowName, displayName, endpoint, held)
 		}
 		if err != nil {
 			return clienttoken.Credential{}, err
 		}
 		if res.Mode() == sdk.AuthModeMTLS {
-			return adoptMTLSCredential(res, nil, persistName, rowName, displayName, endpoint, held)
+			return adoptMTLSCredential(res, nil, entryKey, persistName, rowName, displayName, endpoint, held)
+		}
+		if endpoint.IdentityFile != "" {
+			// A control token says nothing of the key it was issued for, so an
+			// entry held to its identity file never uses one (plan 037 P-a).
+			// Nothing is written or adopted.
+			return clienttoken.Credential{}, &config.EntryRefusedError{Entry: displayName,
+				Kind: config.RefusedIssuedTokenForKey, IdentityFile: endpoint.IdentityFile}
 		}
 		if persistName != "" {
 			// Best-effort: a Save failure never wastes the mint or fails the
@@ -503,7 +539,14 @@ func controlCredentialRefreshHeld(endpoint config.ServerEntry, persistName, rowN
 // unusable, when set, is the SDK's rejection of the issued certificate
 // (sdkbootstrap.UnusableCertificateError): res is then empty, and the
 // issuance is refused as unreadable through the same decision.
-func adoptMTLSCredential(res sdk.Credential, unusable error, persistName, rowName, displayName string,
+//
+// entryKey is the fingerprint of endpoint's identity_file, learned before the
+// bootstrap ran ("" without one). With an identity file, a certificate made
+// for any other SSH key (config.IssuedCertificateKey) is refused through the
+// same decision as every other refused issuance: nothing is adopted or
+// written, and the client keeps only a certificate it already holds for the
+// user the row still records (plan 037 P-a).
+func adoptMTLSCredential(res sdk.Credential, unusable error, entryKey, persistName, rowName, displayName string,
 	endpoint config.ServerEntry, held *heldUser) (clienttoken.Credential, error) {
 	var (
 		user     string
@@ -514,6 +557,10 @@ func adoptMTLSCredential(res sdk.Credential, unusable error, persistName, rowNam
 		issued = &config.EntryRefusedError{Entry: displayName, Kind: config.RefusedIssuedUnreadable, Cause: unusable}
 	} else {
 		user, implicit, issued = config.IssuedCertificateUser(displayName, []byte(res.Bundle.ClientCert))
+		if issued == nil {
+			issued = config.IssuedCertificateKey(displayName, endpoint.Host, endpoint.IdentityFile, entryKey,
+				[]byte(res.Bundle.ClientCert))
+		}
 	}
 	var cert tls.Certificate
 	if issued == nil {
@@ -528,18 +575,23 @@ func adoptMTLSCredential(res sdk.Credential, unusable error, persistName, rowNam
 	defer held.mu.Unlock()
 	switch {
 	case persistName != "":
-		recorded, err := persistMTLSCredential(persistName, endpoint, res, user, implicit, issued, held.name)
+		recorded, err := persistMTLSCredential(persistName, endpoint, res, entryKey, user, implicit, issued, held.name)
 		if err != nil {
 			return clienttoken.Credential{}, err
 		}
 		held.name = recorded
 	case rowName != "":
-		recorded, err := decideMintOnly(rowName, endpoint, user, implicit, issued, held.name)
+		recorded, err := decideMintOnly(rowName, endpoint, entryKey, user, implicit, issued, held.name)
 		if err != nil {
 			return clienttoken.Credential{}, err
 		}
 		held.name = recorded
 	default:
+		// No row to read: the key is learned again from the entry's
+		// identity_file now, and must still be the one the enrolment used.
+		if err := enrolledIdentityHolds(displayName, endpoint, endpoint, entryKey); err != nil {
+			return clienttoken.Credential{}, err
+		}
 		if issued != nil {
 			return clienttoken.Credential{}, issued
 		}
@@ -794,7 +846,7 @@ func persistTokenCredential(name string, endpoint config.ServerEntry, token stri
 // row already records (the snapshot read, the file write, or the config file
 // write) is a warning, the persistTokenCredential contract: the credential is
 // usable in memory and the next process re-enrolls.
-func persistMTLSCredential(name string, endpoint config.ServerEntry, res sdk.Credential, user string, implicit bool,
+func persistMTLSCredential(name string, endpoint config.ServerEntry, res sdk.Credential, entryKey, user string, implicit bool,
 	issued *config.EntryRefusedError, held string) (recorded string, err error) {
 	unlockCreds, err := config.LockServerCredentials(name)
 	if err != nil {
@@ -811,11 +863,11 @@ func persistMTLSCredential(name string, endpoint config.ServerEntry, res sdk.Cre
 	decide := func(c *config.ClientConfig) error {
 		checked = true
 		var err error
-		recorded, establishes, err = decideAgainstRow(c, name, endpoint, user, implicit, issued, held)
+		recorded, establishes, err = decideAgainstRow(c, name, endpoint, entryKey, user, implicit, issued, held)
 		return err
 	}
 	if err := readClientConfigLocked(decide); err != nil {
-		if _, refused := config.AsEntryRefused(err); refused {
+		if clienttoken.IsRefusal(err) {
 			return "", err
 		}
 		return "", entryUnreadable(name, err)
@@ -867,9 +919,10 @@ func persistMTLSCredential(name string, endpoint config.ServerEntry, res sdk.Cre
 		if rerr := prev.restoreHeld(name); rerr != nil {
 			return "", restoreFailed(name, rerr)
 		}
-		if _, refused := config.AsEntryRefused(err); refused {
+		if clienttoken.IsRefusal(err) {
 			// The save's re-check refused (the row was removed, repointed or
-			// changed its user since the first check): returned unchanged.
+			// changed its user or its identity since the first check):
+			// returned unchanged.
 			return "", err
 		}
 		if !checked {
@@ -898,20 +951,27 @@ func entryUnreadable(name string, cause error) error {
 // config lock): the persisting refresh (twice: before writing and at the
 // save) and the named mint-only refresh (at every mint).
 //
-// The row must still name this endpoint (else RefusedEntryUnreadable) and
-// still record the user the caller holds (held; else RefusedEntryUserChanged).
-// Only then is the issued certificate judged: issued (it names no user, or its
-// user cannot be read) is returned, and the row's `user` must accept the
-// certificate (HeldUserAccepts; else RefusedIssuedUserChange). recorded is the
-// user the row records once this decision is made; establishes says the
-// certificate would record the entry's first named user (the row records none
-// and the certificate is named).
-func decideAgainstRow(c *config.ClientConfig, name string, endpoint config.ServerEntry, user string, implicit bool,
+// The row must still name this endpoint (else RefusedEntryUnreadable), still
+// hold the identity the enrolment was made with (enrolledIdentityHolds: the
+// same identity_file, and the same key learned from it now as entryKey, the
+// key learned before the bootstrap; else RefusedEntryUnreadable, or the
+// file's *config.IdentityFileError) and still record the user the caller
+// holds (held; else RefusedEntryUserChanged). Each of those withdraws what
+// the caller holds too. Only then is the issued certificate judged: issued (it
+// names no user, or its user cannot be read) is returned, and the row's `user`
+// must accept the certificate (HeldUserAccepts; else
+// RefusedIssuedUserChange). recorded is the user the row records once this
+// decision is made; establishes says the certificate would record the entry's
+// first named user (the row records none and the certificate is named).
+func decideAgainstRow(c *config.ClientConfig, name string, endpoint config.ServerEntry, entryKey, user string, implicit bool,
 	issued *config.EntryRefusedError, held string) (recorded string, establishes bool, err error) {
 	if err := checkStillNames(c, name, endpoint); err != nil {
 		return "", false, entryUnreadable(name, err)
 	}
 	stored := c.Servers[name]
+	if err := enrolledIdentityHolds(name, stored, endpoint, entryKey); err != nil {
+		return "", false, err
+	}
 	if held != "" && stored.User != held {
 		return "", false, &config.EntryRefusedError{Entry: name, Kind: config.RefusedEntryUserChanged,
 			CertUser: held, EntryUser: stored.User}
@@ -931,12 +991,42 @@ func decideAgainstRow(c *config.ClientConfig, name string, endpoint config.Serve
 	return stored.User, false, nil
 }
 
+// enrolledIdentityHolds checks, at the moment an enrolment is decided, that the
+// entry still holds the identity the enrolment was made with: stored (the row
+// now, or for a source with no row, endpoint itself) has the same
+// identity_file as endpoint (sameIdentityFile, the comparison a --refetch
+// makes), and the public key learned from that file NOW is entryKey, the one
+// learned before the bootstrap ran and that the issued certificate was checked
+// against. Another process that set another key, or a key replaced at the
+// same path (or a retargeted symlink), fails it: nothing is written or
+// adopted, no user is recorded, and the refusal withdraws what the caller
+// holds (RefusedEntryUnreadable, the refusal of a row that no longer matches
+// what the process started with; or the file's *config.IdentityFileError when
+// its key cannot be learned now, so it cannot be shown to be the same). An
+// entry with no identity_file on either side reads no file.
+func enrolledIdentityHolds(name string, stored, endpoint config.ServerEntry, entryKey string) error {
+	if !sameIdentityFile(stored, endpoint) {
+		return entryUnreadable(name, errors.New("its identity_file changed while this command ran"))
+	}
+	if endpoint.IdentityFile == "" {
+		return nil
+	}
+	now, err := config.IdentityFileKey(name, stored.IdentityFile)
+	if err != nil {
+		return err
+	}
+	if now != entryKey {
+		return entryUnreadable(name, errors.New("the key in its identity_file changed while this command ran"))
+	}
+	return nil
+}
+
 // decideMintOnly is the named mint-only refresh's decision (the tunnel
 // daemon): decideAgainstRow against the entry's row, read under the config
 // lock at this mint. It writes nothing, so a certificate that would establish
 // the entry's first named user is refused (config.RefusedMintOnlyUnrecorded):
 // a user the row does not record is never adopted, not even in memory.
-func decideMintOnly(name string, endpoint config.ServerEntry, user string, implicit bool,
+func decideMintOnly(name string, endpoint config.ServerEntry, entryKey, user string, implicit bool,
 	issued *config.EntryRefusedError, held string) (string, error) {
 	var (
 		recorded    string
@@ -944,11 +1034,11 @@ func decideMintOnly(name string, endpoint config.ServerEntry, user string, impli
 	)
 	err := readClientConfigLocked(func(c *config.ClientConfig) error {
 		var err error
-		recorded, establishes, err = decideAgainstRow(c, name, endpoint, user, implicit, issued, held)
+		recorded, establishes, err = decideAgainstRow(c, name, endpoint, entryKey, user, implicit, issued, held)
 		return err
 	})
 	if err != nil {
-		if _, refused := config.AsEntryRefused(err); refused {
+		if clienttoken.IsRefusal(err) {
 			return "", err
 		}
 		return "", entryUnreadable(name, err)

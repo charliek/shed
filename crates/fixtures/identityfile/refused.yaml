@@ -1,0 +1,76 @@
+# Hand-written for the identity_file fixture (see README.md). Every
+# identity_file below breaks the rule; the Go reader and both Rust readers
+# must refuse each one before any ssh is spawned.
+servers:
+  nul:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "/home/pat/.ssh/id\0work"
+  cr:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "/home/pat/.ssh/id\rwork"
+  lf:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "/home/pat/.ssh/id\nwork"
+  double-quote:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: '/home/pat/.ssh/id"work'
+  backslash:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: '/home/pat/.ssh/id\work'
+  hash:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "/home/pat/.ssh/id#work"
+  percent:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: '/home/pat/.ssh/id_%h'
+  dollar:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: '/home/pat/.ssh/${KEY}'
+  leading-space:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: " /home/pat/.ssh/id_work"
+  trailing-space:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "/home/pat/.ssh/id_work "
+  whitespace-only:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "   "
+  relative:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: .ssh/id_work
+  tilde:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: ~/.ssh/id_work
+  leading-tab:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "\t/home/pat/.ssh/id_work"
+  leading-nbsp:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "\_/home/pat/.ssh/id_work"
+  trailing-next-line:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "/home/pat/.ssh/id_work\N"
+  trailing-line-separator:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "/home/pat/.ssh/id_work\L"
+  leading-ideographic-space:
+    host: shed.example.test
+    ssh_port: 2222
+    identity_file: "\U00003000/home/pat/.ssh/id_work"

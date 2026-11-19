@@ -299,7 +299,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 
 	// Auto-sync default profile unless --no-sync is set
 	if !createNoSync {
-		if err := autoSyncAfterCreate(cmd.Context(), name, entry); err != nil {
+		if err := autoSyncAfterCreate(cmd.Context(), name, serverName, entry); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: sync failed: %v\n", err)
 		}
 	}
@@ -1212,7 +1212,7 @@ func searchShedServer(name string) (string, *config.ServerEntry, bool, error) {
 }
 
 // autoSyncAfterCreate syncs files after shed creation.
-func autoSyncAfterCreate(ctx context.Context, shedName string, entry *config.ServerEntry) error {
+func autoSyncAfterCreate(ctx context.Context, shedName, serverName string, entry *config.ServerEntry) error {
 	// Load sync config
 	cfg, err := sync.LoadConfig()
 	if err != nil {
@@ -1243,6 +1243,7 @@ func autoSyncAfterCreate(ctx context.Context, shedName string, entry *config.Ser
 	}
 
 	syncer := sync.NewSyncer(cfg)
+	syncer.SetServerName(serverName)
 	if jsonFlag {
 		syncer.SetOutput(io.Discard)
 	}

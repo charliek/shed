@@ -11,6 +11,7 @@ import (
 	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/sshconfig"
+	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 )
 
 var sshConfigCmd = &cobra.Command{
@@ -48,12 +49,15 @@ type sshEntryJSON struct {
 	Port           int    `json:"port"`
 	User           string `json:"user"`
 	KnownHostsFile string `json:"known_hosts_file"`
+	IdentityFile   string `json:"identity_file,omitempty"`
 }
 
 type sshConfigInstallResult struct {
 	Path    string   `json:"path"`
 	Added   []string `json:"added"`
 	Removed []string `json:"removed"`
+	// Changed names entries whose stanza was rewritten (omitted when none).
+	Changed []string `json:"changed,omitempty"`
 }
 
 type sshConfigUninstallResult struct {
@@ -102,11 +106,14 @@ func runSSHConfig(cmd *cobra.Command, args []string) error {
 	}
 
 	// Generate entries
-	entries := generateEntries(sheds)
+	entries, err := generateEntries(sheds)
+	if err != nil {
+		return err
+	}
 
 	// Handle different modes
 	if sshConfigInstall || sshConfigDryRun {
-		return runSSHConfigInstall(entries)
+		return runSSHConfigInstall(entries, sheds)
 	}
 
 	// Default: print config (or JSON)
@@ -119,6 +126,7 @@ func runSSHConfig(cmd *cobra.Command, args []string) error {
 				Port:           e.Port,
 				User:           e.User,
 				KnownHostsFile: e.KnownHostsFile,
+				IdentityFile:   e.IdentityFile,
 			})
 		}
 		return outputJSON(result)
@@ -220,22 +228,36 @@ func getAllShedsInfo() ([]shedInfo, error) {
 	return result, nil
 }
 
-func generateEntries(sheds []shedInfo) []sshconfig.Entry {
+// generateEntries builds the ssh config stanza for each shed. A server entry
+// with an identity_file gives its sheds' stanzas `IdentityFile "<path>"` and
+// `IdentitiesOnly yes`; the value and the file are checked first
+// (ServerEntry.SSHIdentityArgs), and one that cannot be used fails the
+// command, named for its entry, before anything is printed or written.
+func generateEntries(sheds []shedInfo) ([]sshconfig.Entry, error) {
 	entries := make([]sshconfig.Entry, 0, len(sheds))
 	knownHostsPath := config.GetKnownHostsPath()
 
 	for _, shed := range sheds {
-		entry := sshconfig.Entry{
-			Name:           "shed-" + shed.name,
-			Host:           shed.server.Host,
-			Port:           shed.server.SSHPort,
-			User:           shed.name,
-			KnownHostsFile: knownHostsPath,
+		if _, err := shed.server.SSHIdentityArgs(shed.serverName); err != nil {
+			return nil, err
 		}
-		entries = append(entries, entry)
+		entries = append(entries, shedSSHConfigEntry(shed.name, shed.server, knownHostsPath))
 	}
 
-	return entries
+	return entries, nil
+}
+
+// shedSSHConfigEntry is the stanza of one shed on server, checking nothing:
+// generateEntries checks the server entry's identity file first.
+func shedSSHConfigEntry(shedName string, server *config.ServerEntry, knownHostsPath string) sshconfig.Entry {
+	return sshconfig.Entry{
+		Name:           "shed-" + shedName,
+		Host:           server.Host,
+		Port:           server.SSHPort,
+		User:           shedName,
+		KnownHostsFile: knownHostsPath,
+		IdentityFile:   server.IdentityFile,
+	}
 }
 
 func printSSHConfig(entries []sshconfig.Entry) {
@@ -247,7 +269,43 @@ func printSSHConfig(entries []sshconfig.Entry) {
 	}
 }
 
-func runSSHConfigInstall(entries []sshconfig.Entry) error {
+// roostAliasEntries is the stanza of each qualified roost alias
+// (`shed-<server>-<shed>`, the name `shed attach` gives a shed whose name is
+// on two servers) that the managed block already holds for one of sheds whose
+// server entry has an identity_file. Install keeps such an alias, generated
+// from the entry as `shed attach` generates it, so a stale one is rewritten
+// with the entry's identity lines (as attach rewrites it) rather than kept or
+// left for roost to reach the shed through. An alias of a shed whose entry has
+// no identity_file is handled as before the field existed.
+func roostAliasEntries(parsed *sshconfig.ParsedConfig, sheds []shedInfo, entries []sshconfig.Entry) []sshconfig.Entry {
+	have := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		have[e.Name] = true
+	}
+	knownHostsPath := config.GetKnownHostsPath()
+	var extra []sshconfig.Entry
+	for _, shed := range sheds {
+		if shed.server.IdentityFile == "" {
+			continue
+		}
+		alias := shedSSHConfigEntry(shed.name, shed.server, knownHostsPath)
+		alias.Name = "shed-" + shed.serverName + "-" + shed.name
+		if have[alias.Name] || parsed.FindEntry(alias.Name) == nil {
+			continue
+		}
+		have[alias.Name] = true
+		extra = append(extra, alias)
+	}
+	return extra
+}
+
+// runSSHConfigInstall regenerates the whole managed block from entries
+// whenever it must change: an addition, a removal, or an entry with an
+// identity file whose alias the block holds twice or without exactly its
+// identity lines (sshconfig.ComputeDiff). Lines edited by hand inside the
+// block are not kept then. A file whose marker lines frame no single block is
+// refused, untouched (sshconfig.CheckMarkers).
+func runSSHConfigInstall(entries []sshconfig.Entry, sheds []shedInfo) error {
 	sshConfigPath := sshconfig.GetSSHConfigPath()
 
 	// Read existing config
@@ -263,8 +321,15 @@ func runSSHConfigInstall(entries []sshconfig.Entry) error {
 		content = string(data)
 	}
 
+	if err := sshconfig.CheckMarkers(sshConfigPath, content); err != nil {
+		return err
+	}
+
 	// Parse existing config
 	parsed := sshconfig.Parse(content)
+	// Qualified roost aliases of sheds on an entry with an identity file are
+	// kept, with that file's lines (generateEntries checked each entry).
+	entries = append(entries, roostAliasEntries(parsed, sheds, entries)...)
 
 	// Compute diff
 	diff := sshconfig.ComputeDiff(parsed.ManagedEntries, entries)
@@ -303,6 +368,13 @@ func runSSHConfigInstall(entries []sshconfig.Entry) error {
 			}
 		}
 
+		if len(diff.Changed) > 0 {
+			fmt.Println("Entries to update:")
+			for _, name := range diff.Changed {
+				fmt.Printf("  ~ %s\n", sdkbootstrap.SafeText(name))
+			}
+		}
+
 		if len(diff.Unchanged) > 0 && verboseLevel > 0 {
 			fmt.Println("Entries unchanged:")
 			for _, name := range diff.Unchanged {
@@ -325,6 +397,7 @@ func runSSHConfigInstall(entries []sshconfig.Entry) error {
 					Path:    sshConfigPath,
 					Added:   diff.Additions,
 					Removed: diff.Removals,
+					Changed: diff.Changed,
 				},
 			})
 		}
@@ -346,6 +419,7 @@ func runSSHConfigInstall(entries []sshconfig.Entry) error {
 				Path:    sshConfigPath,
 				Added:   diff.Additions,
 				Removed: diff.Removals,
+				Changed: diff.Changed,
 			},
 		})
 	}

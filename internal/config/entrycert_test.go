@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -23,11 +24,18 @@ import (
 // given userId values (none: a certificate that names no user).
 func clientCertPEM(t *testing.T, users ...string) (certPEM, keyPEM []byte) {
 	t.Helper()
+	return clientCertPEMFor(t, "SHA256:test", users...)
+}
+
+// clientCertPEMFor is clientCertPEM with the subject CN given: the SSH key
+// fingerprint a server writes on a certificate it issues to that key.
+func clientCertPEMFor(t *testing.T, cn string, users ...string) (certPEM, keyPEM []byte) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	subject := pkix.Name{CommonName: "SHA256:test"}
+	subject := pkix.Name{CommonName: cn}
 	for _, u := range users {
 		subject.ExtraNames = append(subject.ExtraNames, pkix.AttributeTypeAndValue{Type: servertls.ClientUserOID, Value: u})
 	}
@@ -200,6 +208,81 @@ func TestReadEntryCertificateIsTheSameCheck(t *testing.T) {
 	}
 }
 
+// TestStoredCertificateIsHeldToTheIdentityFile (plan 037 P-a, held wherever a
+// stored pair is loaded for use): for an entry with an identity_file, a stored
+// certificate is presented only when it was made for that key (its subject is
+// the key's fingerprint). One made for another key is the ordinary,
+// re-enrol error, never a refusal and never presented; an identity file whose
+// public key cannot be learned is its typed *IdentityFileError, nothing
+// presented. Both readers (the locked load and the display read) answer
+// alike. An entry with no identity_file reads no identity file and keeps
+// today's answer for a certificate of any subject.
+func TestStoredCertificateIsHeldToTheIdentityFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	k1, k2 := identityKey(t, dir, "id_old"), identityKey(t, dir, "id_work")
+	fp := func(path string) string {
+		t.Helper()
+		k, err := IdentityFileKey("", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	var reads int
+	orig := storedCertKeyFn
+	t.Cleanup(func() { storedCertKeyFn = orig })
+	storedCertKeyFn = func(entry, path string) (string, error) {
+		reads++
+		return orig(entry, path)
+	}
+	entryFor := func(cn, identity string) *ServerEntry {
+		certPEM, keyPEM := clientCertPEMFor(t, cn, "pat")
+		certPath, keyPath := writePair(t, certPEM, keyPEM)
+		return &ServerEntry{AuthMode: AuthModeMTLS, ClientCertFile: certPath, ClientKeyFile: keyPath,
+			User: "pat", IdentityFile: identity}
+	}
+	readers := map[string]func(string, *ServerEntry) (*tls.Certificate, error){
+		"LoadEntryCertificate": LoadEntryCertificate,
+		"ReadEntryCertificate": ReadEntryCertificate,
+	}
+	for name, read := range readers {
+		t.Run(name, func(t *testing.T) {
+			// Made for the identity file's key: presented.
+			if cert, err := read("srv", entryFor(fp(k2), k2)); err != nil || cert == nil {
+				t.Fatalf("a certificate for the entry's key: presented=%t, err=%v; want it presented", cert != nil, err)
+			}
+
+			// Made for another key: not presented, an ordinary error.
+			cert, err := read("srv", entryFor(fp(k1), k2))
+			var ie *IdentityFileError
+			if _, refused := AsEntryRefused(err); cert != nil || err == nil || refused || errors.As(err, &ie) {
+				t.Fatalf("a certificate for another key: presented=%t, err=%v; want an ordinary (re-enrol) error", cert != nil, err)
+			}
+			if !strings.Contains(err.Error(), fp(k1)) || !strings.Contains(err.Error(), fp(k2)) {
+				t.Errorf("message %q names neither key", err)
+			}
+
+			// The identity file is gone: its typed refusal, nothing presented.
+			gone := filepath.Join(dir, "removed")
+			cert, err = read("srv", entryFor(fp(k2), gone))
+			if cert != nil || !errors.As(err, &ie) || ie.Entry != "srv" || !strings.Contains(ie.Reason, "does not exist") {
+				t.Fatalf("an identity file that is gone: presented=%t, err=%v; want its typed refusal", cert != nil, err)
+			}
+
+			// No identity_file: no identity file is read, and a certificate
+			// of any subject is presented as before.
+			reads = 0
+			if cert, err := read("srv", entryFor(fp(k1), "")); err != nil || cert == nil {
+				t.Fatalf("no identity_file: presented=%t, err=%v; want the certificate as before", cert != nil, err)
+			}
+			if reads != 0 {
+				t.Errorf("no identity_file: %d identity-file read(s), want none", reads)
+			}
+		})
+	}
+}
+
 // TestIssuedCertificateUser: a newly issued certificate is read fail closed.
 func TestIssuedCertificateUser(t *testing.T) {
 	cases := []struct {
@@ -292,10 +375,9 @@ func TestEntryRefusedMessages(t *testing.T) {
 			`entry "shed": a client certificate update did not complete and the previous certificate could not be put back (disk full); ` +
 				`its certificate files and its recorded user may now disagree. Enrol it again: shed server update shed --refetch`},
 		{&EntryRefusedError{Entry: "shed", Kind: RefusedEntryUnreadable, Cause: errors.New("permission denied")},
-			`entry "shed" could not be read to check the user it is held to (permission denied); ` +
+			`entry "shed" could not be verified against its recorded user and identity (permission denied); ` +
 				`nothing was saved and this command's certificate is no longer used. ` +
-				`Make config.yaml and the entry's credential files readable (or, if the entry was removed or changed, ` +
-				`see shed server list), then run the command again.`},
+				`Check config.yaml, the entry's credential files and identity_file, then run the command again.`},
 		{&EntryRefusedError{Entry: "shed", Kind: RefusedUserNotRecorded, CertUser: "pat", Cause: errors.New("read-only file system")},
 			`the server issued a certificate for user "pat", but entry "shed" could not be updated to record that user ` +
 				`(read-only file system); the certificate was not used and nothing was kept. ` +
@@ -320,5 +402,19 @@ func TestEntryRefusedMessages(t *testing.T) {
 	unreadable := &EntryRefusedError{Kind: RefusedIssuedUnreadable, Cause: errors.New("bad DER")}
 	if !strings.Contains(unreadable.Error(), "bad DER") || !errors.Is(unreadable, unreadable.Cause) {
 		t.Errorf("the unreadable refusal does not carry its cause: %v", unreadable)
+	}
+}
+
+// TestStoredTokenRefusalEscapesTheEntryName: an entry name edited by hand into
+// config.yaml can hold an escape sequence; the stored-token refusal shows it
+// escaped everywhere, the suggested command included, never raw.
+func TestStoredTokenRefusalEscapesTheEntryName(t *testing.T) {
+	name := "srv\x1b[31m"
+	msg := StoredTokenRefusal(name, &ServerEntry{IdentityFile: "/home/pat/.ssh/id_work"}).Error()
+	if strings.ContainsRune(msg, '\x1b') {
+		t.Errorf("the refusal carries a raw ESC: %q", msg)
+	}
+	if !strings.Contains(msg, `shed server update srv\x1b[31m --refetch`) {
+		t.Errorf("the suggested command does not show the name escaped: %q", msg)
 	}
 }

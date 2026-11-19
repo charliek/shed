@@ -648,7 +648,7 @@ func TestPromptnessWithRealSSH(t *testing.T) {
 		t.Skipf("no sshd reachable at 127.0.0.1 with the provider's ssh options: %v", err)
 	}
 
-	ctlPath := controlPath(controlDir, target.muxKey())
+	ctlPath := controlPath(controlDir, target.muxKey(""))
 	if _, err := os.Stat(ctlPath); err != nil {
 		t.Fatalf("the first connection left no control socket at %s: %v", ctlPath, err)
 	}

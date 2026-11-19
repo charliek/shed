@@ -271,6 +271,7 @@ func runSessionsKill(cmd *cobra.Command, args []string) error {
 		Server:        serverName,
 		ServerHost:    entry.Host,
 		ServerSSHPort: entry.SSHPort,
+		IdentityFile:  entry.IdentityFile,
 	}
 	found := roost.tabsForShed(ctx, shed)
 	if found.err != nil {

@@ -105,7 +105,7 @@ func attachPlain(name, serverName string, entry *config.ServerEntry, shed *confi
 	} else {
 		tmuxCmd = fmt.Sprintf("tmux new-session -A -s %s -c %s", attachSessionFlag, shellQuoteArg(landingDir))
 	}
-	return execSSHTmux(name, entry, tmuxCmd)
+	return execSSHTmux(serverName, name, entry, tmuxCmd)
 }
 
 // execSSH is the process-replacement seam execSSHTmux hands off to. Production
@@ -118,8 +118,12 @@ var execSSH = syscall.Exec
 // attach path). Interactive, so it intentionally omits BatchMode/ConnectTimeout
 // (an interactive session may legitimately prompt); the rest is shared via
 // baseSSHArgs.
-func execSSHTmux(name string, entry *config.ServerEntry, tmuxCmd string) error {
-	sshArgs := append([]string{"ssh", "-t"}, baseSSHArgs(name, entry)...)
+func execSSHTmux(serverName, name string, entry *config.ServerEntry, tmuxCmd string) error {
+	base, err := baseSSHArgs(serverName, name, entry)
+	if err != nil {
+		return err
+	}
+	sshArgs := append([]string{"ssh", "-t"}, base...)
 	sshArgs = append(sshArgs, "--", tmuxCmd)
 	sshPath, err := exec.LookPath("ssh")
 	if err != nil {

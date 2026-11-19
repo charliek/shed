@@ -581,6 +581,65 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   (`true` when the stored certificate is the implicit user's); the text's `(implicit)` and
   `-` never appear there. Scripts that split the text table by column position see the new
   column before `STATUS`; the JSON is unchanged apart from the new members.
+- **CLI: an entry's own SSH key, `identity_file`.** `shed server add --identity-file <path>`
+  and `shed server update <name> --identity-file <path>` (on its own, or with `--refetch`,
+  which then enrols with the new key; `""` clears it) set the key an entry uses, so a second
+  entry for the same server, held to another user (a local admin on a backup key), needs no
+  second host name. With it set, three things hold, each checked at defined points (when a
+  stored certificate is loaded, when an enrolment is checked, and when it is adopted), not
+  continuously. (1) The entry's API identity is that key and no other: every enrolment (the
+  add, `--refetch`, each renewal, a tunnel daemon's) compares the SSH key the server wrote
+  into the issued certificate with the identity file's public key, and when they differ
+  nothing is stored or used and the command fails, saying ssh authenticated with a different
+  key and why; a renewal is adopted only while the entry still names the same file and the
+  same key is in it (another command's `--identity-file`, or a key replaced at the same path,
+  while ssh ran: nothing is written or recorded, and what the process held is no longer
+  used); a control token names no key, so one a server older than 0.10.0 issues is refused,
+  and an entry that still holds one is refused before any request (`--refetch` fixes it). A
+  stored certificate is held to the same rule wherever it is loaded for use: one made for
+  another key (stored before the field was set or changed) is never presented, and the entry
+  enrols again with its key on the next command, so `--identity-file` without `--refetch`
+  takes effect then. An identity file that cannot be used refuses the entry everywhere
+  (before any request, with or without a stored certificate; a tunnel that meets it at a
+  renewal stops using what it held; `shed ssh-config` and the roost provider report it as a
+  refusal). (2) The CLI's own ssh for the entry never rides a connection another key opened:
+  every ssh it runs for the entry (the enrolment, `console`, `exec`, `attach`, `sync`) carries
+  `-o ControlMaster=no -o ControlPath=none`, and the roost transport keeps its own shared
+  connection, keyed by the file and the key in it. (3) ssh offers that key first and no
+  agent-only key: `-i <path> -o IdentitiesOnly=yes`. The limits: ssh still offers, after it,
+  the `IdentityFile` lines your own ssh config names for that host (OpenSSH cannot be told to
+  ignore them); (1) refuses a certificate made for one of them, and for shell access the docs
+  say to keep no other `IdentityFile` for that host. The stanzas `shed ssh-config` and `shed
+  attach` write carry the same four options; in an ssh config the first value wins, so an
+  earlier stanza of your own for the host decides for another program that connects through
+  the alias ((2) is a promise about the ssh the CLI runs). An alias defined in a file your ssh
+  config pulls in with `Include` is not seen by the check below. `shed attach` rewrites a
+  roost alias it wrote whose stanza differs, and stops, changing nothing, when an alias of
+  that name is one you wrote by hand anywhere outside shed's managed block (even with a
+  managed copy too), or a stanza in the block that is not entirely shed's (a line shed does
+  not write, such as a comment, an `Include` or a `ProxyJump`; a `Host` line naming other
+  hosts; a `Match` or indented `Host` line after it; a second stanza for the alias). `shed
+  ssh-config --install` has one more reason to write the managed block again: for such an
+  entry, a stanza (the qualified roost alias included) whose identity lines differ, or an
+  alias the block holds twice (`changed` in `--json`). As for an addition or a removal, the
+  block is then regenerated whole, so lines edited by hand inside it are not kept; an entry
+  without the field is compared by name only, as before. Both commands find the block by its
+  marker lines only (a line that is exactly the marker), so marker text inside a comment or a
+  quoted value earlier in the file is no longer taken for the block's start (it could
+  corrupt the file before), and both refuse, changing nothing, a file whose marker lines do
+  not frame exactly one block. The path is
+  stored absolute (`~` expanded); one rule holds for the flag and a hand-edited `config.yaml`:
+  not absolute, not valid UTF-8, whitespace at either end, or any of NUL, CR, LF, `"`, `\`,
+  `#`, `%`, `$` is refused. The file is checked at each use (opened without blocking, a
+  regular file only), and its public key must be learnable without a passphrase (an
+  OpenSSH-format key, or a `.pub` beside it), so a key that cannot be used fails the command
+  before ssh runs; it is read while the CLI holds its config lock, so a key on a stalled
+  network filesystem stalls the command. A tunnel whose key file is absent when it renews (a
+  key on removable media) stops accepting new connections and must be started again once the
+  key is back. A refetch that races another process's `--identity-file` is refused with
+  nothing saved, and an add or a refetch whose key file is replaced while it runs saves
+  nothing. JSON results gain `identity_file`. Without the field every argv and stanza is as
+  before.
 - **Development:** `SHED_DEV_USERS=itest` starts the dev servers with the suite's user list;
   the suite gains `test_users.py`, `test_users_upgrade.py` and `test_source_pin.py`, with
   `SHED_ITEST_USERS` and `SHED_ITEST_USERS_DIR`.

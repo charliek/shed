@@ -646,6 +646,46 @@ func refetchDecide(name string, was config.ServerEntry) func(*config.ClientConfi
 	}
 }
 
+// andKeyHolds is decide followed by keyHolds (issuedKeyHolds for this
+// issuance), so the transaction learns the identity file's key again under its
+// locks, just before anything is committed.
+func andKeyHolds(decide func(*config.ClientConfig) error, keyHolds func() error) func(*config.ClientConfig) error {
+	return func(c *config.ClientConfig) error {
+		if err := decide(c); err != nil {
+			return err
+		}
+		return keyHolds()
+	}
+}
+
+// issuedKeyHolds is the add's and the refetch's check of the identity file at
+// each point the issuance would be presented to the server (its first check),
+// staged, or committed: the key learned from identityFile NOW must still be entryKey,
+// the key learned before the bootstrap ran, and the key the certificate was
+// made for (its subject CN). A key replaced at the same path while the command
+// ran fails it: nothing is presented or saved, and no copy is written to
+// staging unless the key still held when staging began (a copy staged just
+// before a later change is discarded by the check under the locks)
+// (RefusedEntryUnreadable, the refusal the refresh path uses for the same
+// change; or the file's *config.IdentityFileError when its key cannot be
+// learned now). No identity file, or no certificate, reads no file.
+func issuedKeyHolds(name, host, identityFile, entryKey string, res sdk.Credential) error {
+	if identityFile == "" || res.Mode() != sdk.AuthModeMTLS {
+		return nil
+	}
+	now, err := config.IdentityFileKey(name, identityFile)
+	if err != nil {
+		return err
+	}
+	if now != entryKey {
+		return entryUnreadable(name, errors.New("the key in its identity_file changed while this command ran"))
+	}
+	if refusal := config.IssuedCertificateKey(name, host, identityFile, now, []byte(res.Bundle.ClientCert)); refusal != nil {
+		return refusal
+	}
+	return nil
+}
+
 // checkRowUnderLock runs decide against the row on disk under the server's
 // credential lock and the config lock (the transaction's order), writing
 // nothing. A refusal is returned as it is; any other failure is wrapped as an
@@ -666,9 +706,19 @@ func checkRowUnderLock(name string, decide func(*config.ClientConfig) error) err
 }
 
 // sameHeldIdentity reports whether two views of one entry hold it to the same
-// user: the fields a --refetch decides against.
+// user with the same SSH key: the fields a --refetch decides against. A
+// concurrent `--allow-user-change` changes the first, a concurrent
+// `--identity-file` the second; either makes this process's view stale, and
+// writing it back would undo the other command.
 func sameHeldIdentity(a, b config.ServerEntry) bool {
-	return a.User == b.User
+	return a.User == b.User && sameIdentityFile(a, b)
+}
+
+// sameIdentityFile is sameHeldIdentity's key half, which every enrolment's
+// decision makes too (enrolledIdentityHolds): the two views name the same
+// identity_file.
+func sameIdentityFile(a, b config.ServerEntry) bool {
+	return a.IdentityFile == b.IdentityFile
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +733,12 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 	sshPort := serverAddSSHPort
 	if sshPort < 1 || sshPort > 65535 {
 		return fmt.Errorf("invalid --ssh-port %d", sshPort)
+	}
+	// The key this entry will use, checked before anything is pinned or
+	// spawned: the bootstrap below already offers only it.
+	identityFile, err := config.IdentityFileFromFlag(serverAddName, serverAddIdentityFile)
+	if err != nil {
+		return err
 	}
 
 	// A duplicate name is cheap to catch here and expensive to discover after a
@@ -701,7 +757,7 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		pin.rollback()
 		return err
 	}
-	if err := addAfterHostKey(host, sshPort, pin); err != nil {
+	if err := addAfterHostKey(host, sshPort, identityFile, pin); err != nil {
 		// An add that did not finish leaves no trust decision behind.
 		pin.rollback()
 		return err
@@ -710,20 +766,28 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 }
 
 // addAfterHostKey is steps two and three of the add: ask the server for a
-// credential, and act on what it said.
-func addAfterHostKey(host string, sshPort int, pin pinnedHostKey) error {
+// credential, and act on what it said. identityFile is the entry's
+// --identity-file ("" for none): the bootstrap offers only that key, and the
+// entry stores it.
+func addAfterHostKey(host string, sshPort int, identityFile string, pin pinnedHostKey) error {
 	// The bootstrap always submits a CSR, so a token-mode server answers with a
 	// token and an mtls-mode server answers with a signed certificate — the client
 	// never has to know which in advance (see sdk/bootstrap.RunCredential).
-	res, err := bootstrapCredentialFn(host, sshPort, "control", "cli")
+	res, entryKey, err := bootstrapEntryCredential(serverAddName, host, sshPort, identityFile)
+	if _, bad := asIdentityFileError(err); bad {
+		// The key cannot be used (found by type, whichever layer found it):
+		// never classified as a bootstrap outcome, so no words inside a path
+		// can turn it into an unreachable or open server and a fallback.
+		return err
+	}
 	switch classifyAddBootstrap(err) {
 	case bootstrapIssued:
-		return addFromBundle(host, sshPort, res)
+		return addFromBundle(host, sshPort, identityFile, entryKey, res)
 	case bootstrapOpenServer:
 		if !jsonFlag {
 			fmt.Fprintf(os.Stderr, "%s issues no credentials over SSH (auth.mode: open); adding it over HTTP...\n", host)
 		}
-		return addOverHTTP(host, sshPort)
+		return addOverHTTP(host, sshPort, identityFile)
 	case bootstrapKeyNotAuthorized:
 		return fmt.Errorf("your SSH key is not in this server's allowlist "+
 			"(auth.ssh.github_users / authorized_keys) — add it on %s, then retry: %w", host, err)
@@ -739,7 +803,7 @@ func addAfterHostKey(host string, sshPort int, pin pinnedHostKey) error {
 				fmt.Fprintf(os.Stderr, "the SSH port %s is unreachable (%v); trying HTTP...\n",
 					scanAddr(host, sshPort), err)
 			}
-			return addOverHTTP(host, sshPort)
+			return addOverHTTP(host, sshPort, identityFile)
 		}
 		return fmt.Errorf("could not complete the SSH bootstrap with %s: %w", scanAddr(host, sshPort), err)
 	default:
@@ -768,17 +832,19 @@ func unscannedHostKeyHint(pin pinnedHostKey) string {
 // endpoint, the TLS pin, and the credential shape all come from it. The entry
 // is only persisted after an authenticated GET /api/info proves the resulting
 // transport actually works, so a half-usable entry never lands in config.yaml.
-func addFromBundle(host string, sshPort int, res sdk.Credential) error {
-	entry := config.ServerEntry{Host: host, SSHPort: sshPort}
+func addFromBundle(host string, sshPort int, identityFile, entryKey string, res sdk.Credential) error {
+	entry := config.ServerEntry{Host: host, SSHPort: sshPort, IdentityFile: identityFile}
 	// The user the certificate is for becomes the user the entry is held to.
 	// A certificate that names no user (a server older than 0.10.0), or whose
 	// user cannot be read, is refused here, before anything is checked or
-	// written.
+	// written. With an identity file the certificate must also have been made
+	// for that key (entryKey), and a control token, which names no key, is
+	// refused (plan 037 P-a).
+	if err := checkIssuedForEntry(serverAddName, host, identityFile, entryKey, res); err != nil {
+		return err
+	}
 	if res.Mode() == sdk.AuthModeMTLS {
-		user, _, refusal := config.IssuedCertificateUser(serverAddName, []byte(res.Bundle.ClientCert))
-		if refusal != nil {
-			return refusal
-		}
+		user, _, _ := config.IssuedCertificateUser(serverAddName, []byte(res.Bundle.ClientCert))
 		entry.User = user // "" for the implicit user
 	}
 	cred, err := stampBundle(&entry, host, res, serverAddHTTPSPort)
@@ -786,6 +852,11 @@ func addFromBundle(host string, sshPort int, res sdk.Credential) error {
 		return err
 	}
 
+	// The key is learned again before the certificate is first presented, and
+	// again under the locks before it is committed (issuedKeyHolds).
+	if err := issuedKeyHolds(serverAddName, host, identityFile, entryKey, res); err != nil {
+		return err
+	}
 	info, err := verifyServerEntry(&entry, cred)
 	if err != nil {
 		return err
@@ -797,7 +868,13 @@ func addFromBundle(host string, sshPort int, res sdk.Credential) error {
 		return fmt.Errorf("server '%s' already exists", name)
 	}
 
-	txn, err := stageCredentials(&entry, name, res, addDecide(name))
+	// And once more before a copy is written to staging: the network check
+	// above waited on the server.
+	if err := issuedKeyHolds(name, host, identityFile, entryKey, res); err != nil {
+		return err
+	}
+	txn, err := stageCredentials(&entry, name, res, andKeyHolds(addDecide(name),
+		func() error { return issuedKeyHolds(name, host, identityFile, entryKey, res) }))
 	if err != nil {
 		return err
 	}
@@ -921,7 +998,7 @@ func warnSSHPortMismatch(info *config.ServerInfo, sshPort int) {
 // SSH port that could not be reached at all. The host key is pinned by the time
 // this runs if it could be scanned, so this only has to find the API endpoint
 // (plain HTTP, or pinned TLS via --https-port/--secure).
-func addOverHTTP(host string, sshPort int) error {
+func addOverHTTP(host string, sshPort int, identityFile string) error {
 	_, apiURL, tlsFingerprint, info, err := selectAddTransport(host)
 	if err != nil {
 		return err
@@ -949,6 +1026,9 @@ func addOverHTTP(host string, sshPort int) error {
 		SSHPort:            sshPort,
 		APIURL:             apiURL,         // empty for the plain-HTTP path
 		TLSCertFingerprint: tlsFingerprint, // empty for the plain-HTTP path
+		// An open server issues no credential, but console, exec, attach and
+		// sync still reach its sheds over ssh, with this key.
+		IdentityFile: identityFile,
 		// AuthMode stays empty: an open server issues no credential, and
 		// "absent means token" only matters once one exists.
 	}
@@ -1033,6 +1113,7 @@ func reportAddedServer(name string, entry config.ServerEntry) error {
 				// or `-`, which are text only.
 				User         string `json:"user,omitempty"`
 				UserImplicit bool   `json:"user_implicit"`
+				IdentityFile string `json:"identity_file,omitempty"`
 				Default      bool   `json:"default"`
 			}{
 				Host:               entry.Host,
@@ -1043,6 +1124,7 @@ func reportAddedServer(name string, entry config.ServerEntry) error {
 				AuthMode:           entry.AuthMode,
 				User:               user.name,
 				UserImplicit:       user.implicit,
+				IdentityFile:       entry.IdentityFile,
 				Default:            clientConfig.DefaultServer == name,
 			},
 		})
@@ -1066,6 +1148,9 @@ func reportAddedServer(name string, entry config.ServerEntry) error {
 	case entry.ControlToken != "":
 		fmt.Println("  Bootstrapped a control token over SSH (token mode)")
 	}
+	if entry.IdentityFile != "" {
+		printIdentityFileLine(entry.IdentityFile)
+	}
 	if clientConfig.DefaultServer == name {
 		fmt.Println("  Set as default server")
 	}
@@ -1085,32 +1170,44 @@ func reportAddedServer(name string, entry config.ServerEntry) error {
 // unenrolled TLS dial cannot complete a handshake. It also re-enrolls the
 // credential as a side effect, so an entry whose server changed mode since it
 // was added lands on the right one.
-func refetchServerCredential(name string, entry *config.ServerEntry) error {
+//
+// identityFile is the entry's identity_file after the command: its own, or the
+// value of --identity-file. The bootstrap offers only that key, and the saved
+// row records it; nothing is saved unless the whole re-enrolment succeeds.
+func refetchServerCredential(name string, entry *config.ServerEntry, identityFile string) error {
+	// Checked before anything is pinned or spawned (a key removed since it was
+	// set fails here, with its own message).
+	if _, err := config.IdentityFileArgs(name, identityFile); err != nil {
+		return err
+	}
 	if entry.SSHPort < 1 || entry.SSHPort > 65535 {
 		// An entry with no usable SSH endpoint (hand-edited, or written by a very
 		// old client) can still have its pin re-read the legacy way.
-		return refetchTLSPinOverHTTPS(name, entry)
+		return refetchTLSPinOverHTTPS(name, entry, identityFile)
 	}
 	pin, err := ensureHostKeyPinned(entry.Host, entry.SSHPort, "", serverUpdateTrustTOFU)
 	if err != nil {
 		pin.rollback()
 		return err
 	}
-	if err := refetchAfterHostKey(name, entry, pin); err != nil {
+	if err := refetchAfterHostKey(name, entry, identityFile, pin); err != nil {
 		pin.rollback()
 		return err
 	}
 	return nil
 }
 
-func refetchAfterHostKey(name string, entry *config.ServerEntry, pin pinnedHostKey) error {
-	res, err := bootstrapCredentialFn(entry.Host, entry.SSHPort, "control", "cli")
+func refetchAfterHostKey(name string, entry *config.ServerEntry, identityFile string, pin pinnedHostKey) error {
+	res, entryKey, err := bootstrapEntryCredential(name, entry.Host, entry.SSHPort, identityFile)
+	if _, bad := asIdentityFileError(err); bad {
+		return err // the key cannot be used (by type, from any layer): never a bootstrap outcome
+	}
 	switch classifyAddBootstrap(err) {
 	case bootstrapIssued:
 	case bootstrapOpenServer:
 		// An open server has no bundle to read a pin from; the legacy TLS
 		// re-fetch is the only thing that can help it.
-		return refetchTLSPinOverHTTPS(name, entry)
+		return refetchTLSPinOverHTTPS(name, entry, identityFile)
 	case bootstrapKeyNotAuthorized:
 		return fmt.Errorf("your SSH key is not in this server's allowlist "+
 			"(auth.ssh.github_users / authorized_keys) — add it on %s, then retry: %w", entry.Host, err)
@@ -1128,13 +1225,14 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, pin pinnedHostK
 	// written, unless --allow-user-change asks for it. The transaction compares
 	// again, under the lock, against the row on disk (refetchDecide).
 	// An implicit certificate (a server with no user list) neither sets nor
-	// clears the user.
+	// clears the user. With an identity file the certificate must have been
+	// made for that key, and a token is refused (checkIssuedForEntry).
+	if err := checkIssuedForEntry(name, entry.Host, identityFile, entryKey, res); err != nil {
+		return err
+	}
 	newUser := entry.User
 	if res.Mode() == sdk.AuthModeMTLS {
-		user, implicit, refusal := config.IssuedCertificateUser(name, []byte(res.Bundle.ClientCert))
-		if refusal != nil {
-			return refusal
-		}
+		user, implicit, _ := config.IssuedCertificateUser(name, []byte(res.Bundle.ClientCert))
 		if !serverUpdateAllowUserChange && !config.HeldUserAccepts(entry.User, user, implicit) {
 			return &config.EntryRefusedError{Entry: name, Kind: config.RefusedIssuedUserChange,
 				CertUser: user, EntryUser: entry.User}
@@ -1148,7 +1246,12 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, pin pinnedHostK
 	// it is checked again, since the network check below takes time). Another
 	// process that changed the entry's user while this bootstrap ran is found
 	// here, before the TLS pin, the network check or any staging.
-	if err := checkRowUnderLock(name, refetchDecide(name, *entry)); err != nil {
+	// Each decision also learns the identity file's key again (issuedKeyHolds):
+	// a key replaced at its path while the bootstrap ran is refused before the
+	// certificate is presented, staged or committed.
+	keyHolds := func() error { return issuedKeyHolds(name, entry.Host, identityFile, entryKey, res) }
+	decide := andKeyHolds(refetchDecide(name, *entry), keyHolds)
+	if err := checkRowUnderLock(name, decide); err != nil {
 		return err
 	}
 
@@ -1171,10 +1274,21 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, pin pinnedHostK
 		return err
 	}
 	updated.User = newUser
+	updated.IdentityFile = identityFile
+	// Learned again here: a TLS pin confirmation above may have waited on a
+	// person.
+	if err := keyHolds(); err != nil {
+		return err
+	}
 	if _, err := verifyServerEntry(&updated, cred); err != nil {
 		return err
 	}
-	txn, err := stageCredentials(&updated, name, res, refetchDecide(name, *entry))
+	// And once more before a copy is written to staging: the network check
+	// above waited on the server.
+	if err := keyHolds(); err != nil {
+		return err
+	}
+	txn, err := stageCredentials(&updated, name, res, decide)
 	if err != nil {
 		return err
 	}
@@ -1188,7 +1302,7 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, pin pinnedHostK
 	}
 	if jsonFlag {
 		return outputJSON(refetchResult{Status: "ok", Action: "updated", Name: name,
-			User: updated.User, PreviousUser: previousUser})
+			User: updated.User, PreviousUser: previousUser, IdentityFile: updated.IdentityFile})
 	}
 	if unchanged {
 		printSuccess("Server %s TLS pin unchanged: %s", name, updated.TLSCertFingerprint)
@@ -1204,6 +1318,9 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, pin pinnedHostK
 	case updated.User != "":
 		fmt.Printf("  User: %s\n", updated.User)
 	}
+	if updated.IdentityFile != entry.IdentityFile {
+		printIdentityFileLine(updated.IdentityFile)
+	}
 	return nil
 }
 
@@ -1216,6 +1333,9 @@ type refetchResult struct {
 	Name         string `json:"name"`
 	User         string `json:"user,omitempty"`
 	PreviousUser string `json:"previous_user,omitempty"`
+	// IdentityFile is the entry's identity_file after the refetch (omitted
+	// when it has none).
+	IdentityFile string `json:"identity_file,omitempty"`
 }
 
 // saveUpdatedServer writes a modified entry back to config.yaml through the
@@ -1263,7 +1383,11 @@ func saveUpdatedServer(name string, was, updated config.ServerEntry) error {
 // entry's https api_url and re-pin it. It survives for `auth.mode: open`
 // servers with TLS in front of them, which have no bootstrap bundle to carry a
 // pin — and it is the reason the "no https api_url" guard still exists.
-func refetchTLSPinOverHTTPS(name string, entry *config.ServerEntry) error {
+//
+// identityFile is the entry's identity_file after the command (see
+// refetchServerCredential): a changed one is saved with the pin, or alone when
+// the pin is unchanged.
+func refetchTLSPinOverHTTPS(name string, entry *config.ServerEntry, identityFile string) error {
 	if !isHTTPSURL(entry.APIURL) {
 		return fmt.Errorf("server %q has no https api_url; a TLS pin only applies over https — re-add it with --https-port", name)
 	}
@@ -1275,23 +1399,71 @@ func refetchTLSPinOverHTTPS(name string, entry *config.ServerEntry) error {
 	if err != nil {
 		return err
 	}
-	if fp == entry.TLSCertFingerprint {
+	identityChanged := identityFile != entry.IdentityFile
+	pinChanged := fp != entry.TLSCertFingerprint
+	if !pinChanged && !identityChanged {
 		if !jsonFlag {
 			printSuccess("Server %s TLS pin unchanged: %s", name, fp)
 		}
 		return nil
 	}
-	if err := confirmTLSCert(fp, "", serverUpdateTrustTOFU, isStdinTTY(), jsonFlag, entry.TLSCertFingerprint == ""); err != nil {
-		return err
+	if pinChanged {
+		if err := confirmTLSCert(fp, "", serverUpdateTrustTOFU, isStdinTTY(), jsonFlag, entry.TLSCertFingerprint == ""); err != nil {
+			return err
+		}
 	}
 	updated := *entry
 	updated.TLSCertFingerprint = fp
+	updated.IdentityFile = identityFile
 	if err := saveUpdatedServer(name, *entry, updated); err != nil {
 		return err
 	}
 	if jsonFlag {
-		return outputJSON(ActionResult{Status: "ok", Action: "updated", Name: name})
+		// The same result as the SSH-first refetch's (refetchResult).
+		return outputJSON(refetchResult{Status: "ok", Action: "updated", Name: name,
+			User: updated.User, IdentityFile: updated.IdentityFile})
 	}
-	printSuccess("Updated server %s TLS pin: %s", name, fp)
+	if pinChanged {
+		printSuccess("Updated server %s TLS pin: %s", name, fp)
+	} else {
+		printSuccess("Server %s TLS pin unchanged: %s", name, fp)
+	}
+	if identityChanged {
+		printIdentityFileLine(identityFile)
+	}
+	return nil
+}
+
+// asIdentityFileError reports whether err is an identity_file that cannot be
+// used (config.IdentityFileError, which bootstrapEntryCredential makes of the
+// SDK's own): returned as it is, never classified as a bootstrap outcome.
+func asIdentityFileError(err error) (*config.IdentityFileError, bool) {
+	var ie *config.IdentityFileError
+	if errors.As(err, &ie) {
+		return ie, true
+	}
+	return nil, false
+}
+
+// checkIssuedForEntry is the add's and the refetch's check of what the
+// bootstrap issued, before anything is checked over the network or written:
+// a certificate must name a user (config.IssuedCertificateUser) and, for an
+// entry with an identity file, must have been made for that key (entryKey,
+// config.IssuedCertificateKey); and such an entry never takes a control
+// token, which names no key (plan 037 P-a). name, host and identityFile name
+// things in the refusal.
+func checkIssuedForEntry(name, host, identityFile, entryKey string, res sdk.Credential) error {
+	if res.Mode() != sdk.AuthModeMTLS {
+		if identityFile != "" {
+			return &config.EntryRefusedError{Entry: name, Kind: config.RefusedIssuedTokenForKey, IdentityFile: identityFile}
+		}
+		return nil
+	}
+	if _, _, refusal := config.IssuedCertificateUser(name, []byte(res.Bundle.ClientCert)); refusal != nil {
+		return refusal
+	}
+	if refusal := config.IssuedCertificateKey(name, host, identityFile, entryKey, []byte(res.Bundle.ClientCert)); refusal != nil {
+		return refusal
+	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -21,6 +22,15 @@ type Entry struct {
 	User string
 	// KnownHostsFile is the path to the known_hosts file to use.
 	KnownHostsFile string
+	// IdentityFile, when set, is the key ssh offers first for this host, and
+	// no agent-only key; the stanza gains IdentityLines: `IdentityFile
+	// "<path>"`, `IdentitiesOnly yes`, `ControlMaster no` and `ControlPath
+	// none`. The caller checks the value first
+	// (config.ServerEntry.SSHIdentityArgs): it is written inside double quotes
+	// as it is, which is safe only because that rule refuses `"`, `\`, `%`,
+	// `$`, `#`, CR, LF and NUL. Empty writes the stanza exactly as it was
+	// without the field.
+	IdentityFile string
 }
 
 // Diff represents the difference between current and desired SSH config entries.
@@ -29,6 +39,13 @@ type Diff struct {
 	Additions []string
 	// Removals are entries that will be removed.
 	Removals []string
+	// Changed are entries present on both sides whose stanza must be written
+	// again: the desired entry has an identity file, and the block holds its
+	// alias more than once, or a stanza that does not carry exactly its
+	// identity lines (IdentityLinesDiffer). Without an identity file an entry
+	// is never Changed: it is compared by name only, as before the field
+	// existed. A change of any kind regenerates the whole block.
+	Changed []string
 	// Unchanged are entries that remain the same.
 	Unchanged []string
 }
@@ -44,8 +61,86 @@ func GenerateEntry(entry Entry) string {
 	if entry.KnownHostsFile != "" {
 		fmt.Fprintf(&sb, "    UserKnownHostsFile %s\n", entry.KnownHostsFile)
 	}
+	sb.WriteString(IdentityLines(entry.IdentityFile, "    "))
 
 	return sb.String()
+}
+
+// IdentityLines is the ssh config lines an identity file adds to a Host
+// stanza, each prefixed by indent and ending in a newline: `IdentityFile
+// "<path>"` and `IdentitiesOnly yes` (that key first, no agent-only key), then
+// `ControlMaster no` and `ControlPath none` (no shared connection, so an ssh
+// through this stanza never rides a master another key opened); "" for no
+// identity file. The path is written as it is (see Entry.IdentityFile for why
+// that is safe). In an ssh config the first value found for an option wins,
+// so a stanza earlier in the file that sets one of these for the same host
+// prevails; the docs say so.
+func IdentityLines(identityFile, indent string) string {
+	if identityFile == "" {
+		return ""
+	}
+	return fmt.Sprintf("%sIdentityFile \"%s\"\n%sIdentitiesOnly yes\n%sControlMaster no\n%sControlPath none\n",
+		indent, identityFile, indent, indent, indent)
+}
+
+// keywordOf is the option keyword a stanza line starts with, after its
+// indentation: the text up to the first space, tab or `=`.
+func keywordOf(line string) string {
+	line = strings.TrimSpace(line)
+	if end := strings.IndexAny(line, " \t="); end >= 0 {
+		return line[:end]
+	}
+	return line
+}
+
+// keywordsOf is the set of option keywords the lines of text start with.
+func keywordsOf(text string) map[string]bool {
+	set := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		set[keywordOf(line)] = true
+	}
+	return set
+}
+
+// identityKeywords are the options IdentityLines writes, lower-cased, read
+// from IdentityLines itself.
+var identityKeywords = func() map[string]bool {
+	set := map[string]bool{}
+	for keyword := range keywordsOf(IdentityLines("x", "")) {
+		set[strings.ToLower(keyword)] = true
+	}
+	return set
+}()
+
+// identityLinesOf returns the lines of a stanza that set one of the options
+// IdentityLines writes, each trimmed, with CRLF read as LF.
+func identityLinesOf(stanza string) []string {
+	var lines []string
+	for _, line := range strings.Split(strings.ReplaceAll(stanza, "\r\n", "\n"), "\n") {
+		if identityKeywords[strings.ToLower(keywordOf(line))] {
+			lines = append(lines, strings.TrimSpace(line))
+		}
+	}
+	return lines
+}
+
+// IdentityLinesDiffer reports whether a stanza on disk (raw) does not carry
+// exactly the identity lines entry calls for: the same lines, in the same
+// order, and no other line that sets one of those options. It is false for an
+// entry with no identity file, whatever raw holds (the name-only comparison
+// that predates the field).
+func IdentityLinesDiffer(raw string, entry Entry) bool {
+	if entry.IdentityFile == "" {
+		return false
+	}
+	return !slices.Equal(identityLinesOf(raw), identityLinesOf(IdentityLines(entry.IdentityFile, "")))
+}
+
+// StanzaDiffers reports whether a stanza on disk (raw) differs from the one
+// entry generates, after trimming and with CRLF read as LF.
+func StanzaDiffers(raw string, entry Entry) bool {
+	norm := func(s string) string { return strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n")) }
+	return norm(raw) != norm(GenerateEntry(entry))
 }
 
 // GenerateManagedBlock generates the complete managed block content.
@@ -85,13 +180,17 @@ func ComputeDiff(current []ManagedEntry, desired []Entry) Diff {
 	diff := Diff{
 		Additions: []string{},
 		Removals:  []string{},
+		Changed:   []string{},
 		Unchanged: []string{},
 	}
 
-	// Create maps for easier lookup
-	currentNames := make(map[string]bool)
+	// Create maps for easier lookup: each current entry's stanza by name, and
+	// how many stanzas the block holds for it.
+	currentNames := make(map[string]string)
+	stanzas := make(map[string]int)
 	for _, entry := range current {
-		currentNames[entry.Name] = true
+		currentNames[entry.Name] = entry.RawContent
+		stanzas[entry.Name]++
 	}
 
 	desiredNames := make(map[string]bool)
@@ -99,11 +198,17 @@ func ComputeDiff(current []ManagedEntry, desired []Entry) Diff {
 		desiredNames[entry.Name] = true
 	}
 
-	// Find additions (in desired but not in current)
+	// Find additions (in desired but not in current), and entries with an
+	// identity file held twice or whose stanza does not carry its identity
+	// lines.
 	for _, entry := range desired {
-		if !currentNames[entry.Name] {
+		raw, ok := currentNames[entry.Name]
+		switch {
+		case !ok:
 			diff.Additions = append(diff.Additions, entry.Name)
-		} else {
+		case entry.IdentityFile != "" && stanzas[entry.Name] > 1, IdentityLinesDiffer(raw, entry):
+			diff.Changed = append(diff.Changed, entry.Name)
+		default:
 			diff.Unchanged = append(diff.Unchanged, entry.Name)
 		}
 	}
@@ -118,14 +223,16 @@ func ComputeDiff(current []ManagedEntry, desired []Entry) Diff {
 	// Sort all slices for consistent output
 	sort.Strings(diff.Additions)
 	sort.Strings(diff.Removals)
+	sort.Strings(diff.Changed)
 	sort.Strings(diff.Unchanged)
 
 	return diff
 }
 
-// HasChanges returns true if the diff contains any additions or removals.
+// HasChanges returns true if the diff contains any additions, removals or
+// changed entries.
 func (d Diff) HasChanges() bool {
-	return len(d.Additions) > 0 || len(d.Removals) > 0
+	return len(d.Additions) > 0 || len(d.Removals) > 0 || len(d.Changed) > 0
 }
 
 // Write writes the SSH config file with the managed block.
