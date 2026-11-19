@@ -1,0 +1,33 @@
+{
+  "name": "token-scope-directory-read",
+  "description": "The enrolled, live server (srv-a) names the scope it asks for, scope=directory:read, beside its assertion: it is answered exactly as token-ok, a ten-minute access token for <issuer>/v1 with the scope directory:read. A server may send scope or leave it out.",
+  "assertion": {
+    "key": "server-ed25519",
+    "client_id": "srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/oauth2/token",
+    "headers": {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{assertion}}&scope=directory%3Aread"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      "ETag": null,
+      "Pragma": "no-cache",
+      "Retry-After": null,
+      "WWW-Authenticate": null
+    },
+    "body": {
+      "access_token": "{{access_token}}",
+      "expires_in": 600,
+      "scope": "directory:read",
+      "token_type": "bearer"
+    }
+  }
+}

@@ -849,7 +849,10 @@ a value of its rule.
 fresh assertion with the same window then accepted),
 `token-exp-leeway`, `token-iat-future-leeway`, `token-nbf-leeway` (fresh
 assertions at and just outside each time boundary), `token-unavailable`,
-`token-rate-limited`, `token-aud-array`, `token-aud-array-two-elements`,
+`token-rate-limited`, `token-scope-directory-read` (the request names
+`scope=directory:read`), `token-scope-unknown` (a scope the server lacks
+refused, and the same assertion then accepted, as it was not spent),
+`token-aud-array`, `token-aud-array-two-elements`,
 `token-aud-trailing-slash`, `token-aud-token-endpoint`,
 `token-typ-client-authentication`, `token-typ-jwt-lowercase`,
 `token-typ-at-jwt`, `token-exp-window-too-long`, `token-duplicate-claim`,

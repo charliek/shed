@@ -538,11 +538,21 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
 - **Directory server: the sign-in names its scope.** The token request now carries
   `scope=directory:read`, once, so the server no longer asks for every scope the account
   service has, and a scope the service adds later is never requested. The contract already
-  allows the parameter; no fixture changes. An account service must accept it: one that
-  answers `400 invalid_scope` fails every refresh (logged as `directory: pull failed: token:
-  refused (HTTP 400) "invalid_scope"`, the list held staying in force until its trust time
-  ends), and the server does not retry without the scope. A token answer whose `scope` lists
+  allows the parameter, and two new exchanges hold a service to it (below). An account
+  service must accept it: one that answers `400 invalid_scope` fails every refresh (logged as
+  `directory: pull failed: token: refused (HTTP 400) "invalid_scope"`, the list held staying
+  in force until its trust time ends), and the server does not retry without the scope. A token answer whose `scope` lists
   more than `directory:read` is still accepted, as the contract says.
+- **The directory contract, version 1, two new exchanges** (no wire change; no existing
+  fixture changes): `token-scope-directory-read`, a token request that names
+  `scope=directory:read`, the request every server now sends, answered as `token-ok` is; and
+  `token-scope-unknown`, a request naming a scope the server lacks, answered `400
+  invalid_scope`, after which the same assertion is accepted, as it was not spent. Before
+  them, no exchange sent a scope or held a service to `invalid_scope`, so a service could
+  pass every exchange and still refuse every 0.10.0 server. `CONTRACT.md`'s list of exchanges
+  names them. An account service built from the contract copies
+  `tests/directory-contract/v1/` again (the manifest gains the two files, and its line for
+  `CONTRACT.md` changed) and runs the two new exchanges.
 - **CLI: a server entry is held to its user.** An mtls entry records the user its
   certificates name (`user` in `config.yaml`), set at `shed server add`, at `shed server update
   --refetch`, or by a re-enrolment when it has none; a certificate for the implicit user of a
