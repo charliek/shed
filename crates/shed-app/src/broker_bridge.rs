@@ -2429,6 +2429,22 @@ mod tests {
         assert!(cfg.discovery.is_none());
     }
 
+    /// A `desktop:` block (the retired daemon's) is refused: the broker is not
+    /// started, and the error names the block and where its timeout went.
+    #[test]
+    fn load_or_synthesize_refuses_a_desktop_block() {
+        let (_d, path) = write_tmp(
+            "extensions.yaml",
+            "ssh:\n  approval:\n    policy: approve-all\ndesktop:\n  timeout_ms: 30000\n",
+        );
+        match load_or_synthesize(&path) {
+            Err(BrokerError::Config(msg)) => {
+                assert_eq!(msg, shed_broker::config::DESKTOP_BLOCK_REMOVED)
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn load_or_synthesize_malformed_is_typed_error_no_panic() {
         // An invalid ssh policy fails `validate` → Config error (the daemon would exit 1;

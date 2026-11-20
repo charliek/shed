@@ -137,7 +137,8 @@ reachable from other hosts runs `mtls`.
   then `brew uninstall shed-host-agent`). Its formula is removed from the tap, and a 0.10.0
   server refuses it. The desktop app never reads its Homebrew config
   (`$(brew --prefix)/etc/shed/extensions.yaml`): copy it to `~/.config/shed/extensions.yaml`
-  only if you edited it, then delete its `server:` line and any `desktop:` block. See [Remove the old credential
+  only if you edited it, then delete its `server:` line and any `desktop:` block (which the
+  app refuses). See [Remove the old credential
   daemon](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.10.0/#remove-the-old-credential-daemon).
 - **The desktop app starts as a new machine.** Its broker keeps its state in `<state>/broker/`
   and nothing is moved from the old directory, so it enrols with each server again over SSH
@@ -877,6 +878,11 @@ reachable from other hosts runs `mtls`.
 - **Desktop: the IPC op `rc.launch`**, the alias for `roost.launch` kept for 0.9.x scripts. It
   now answers `unknown_op`. Launch in a shed with `roost.launch` and `target:
   roost:HOST/SHED`. The app's own launch dialog is unchanged.
+- **Desktop: the `desktop:` block of `extensions.yaml`** (`enabled`, `socket_path`,
+  `timeout_ms`), which was ignored with a log warning nobody saw. A config that has one
+  now fails to load: the broker does not start and Preferences › Credential broker shows
+  ``the `desktop:` block was removed; delete it (a `desktop.timeout_ms` becomes
+  `approval_timeout` with a unit: 30000 ms is `approval_timeout: 30s`)``. Delete the block.
 - **Desktop: the broker modes.** The app always runs its own broker: the Preferences mode
   setting, the IPC operations `broker.mode` and `broker.set_mode`, the `identify` reply's
   `broker_mode` and the mode fields of `broker.status` are gone. A stored mode choice in

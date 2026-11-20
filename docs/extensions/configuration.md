@@ -85,6 +85,12 @@ cache an approval so you aren't prompted on every operation). Under
 The top-level **`approval_timeout`** (Go duration, default `25s`) bounds how long
 the broker waits for a `shed-desktop` decision before failing closed.
 
+A top-level `desktop:` block (`enabled`, `socket_path`, `timeout_ms`, from the retired
+credential daemon) fails the load: ``the `desktop:` block was removed; delete it (a
+`desktop.timeout_ms` becomes `approval_timeout` with a unit: 30000 ms is `approval_timeout:
+30s`)``. The app then starts no broker and shows the
+message in Preferences › Credential broker. Delete the block.
+
 For SSH, the policy decides only requests that have already passed the signing check: a
 request the check refuses never reaches the policy and shows no prompt (see
 [SSH Agent → What the machine signs](ssh-agent.md#what-the-machine-signs)).

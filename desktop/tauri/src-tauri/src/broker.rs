@@ -301,6 +301,27 @@ mod tests {
         assert!(!rt.retry_now(), "no broker to wake");
     }
 
+    /// A config with the retired `desktop:` block fails the broker closed, and its
+    /// status (what Preferences › Credential broker shows) carries the refusal.
+    #[tokio::test]
+    async fn a_desktop_block_fails_closed_with_its_message_in_the_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extensions.yaml");
+        std::fs::write(&path, "ssh:\n  mode: local-keys\ndesktop:\n  enabled: true\n").unwrap();
+        let mut env = crate::env::Env::from_process();
+        env.broker_extensions_path = path;
+        let spine = build(&env);
+        assert!(spine.minter.is_none(), "no broker on a refused config");
+        let v = spine.runtime.status();
+        let want = "broker config error: the `desktop:` block was removed; delete it \
+                    (a `desktop.timeout_ms` becomes `approval_timeout` with a unit: \
+                    30000 ms is `approval_timeout: 30s`)";
+        assert_eq!(v["config"]["source"], "error");
+        assert_eq!(v["config"]["message"], want);
+        assert_eq!(v["broker_error"], want);
+        assert!(spine.runtime.broker_failed());
+    }
+
     /// A loaded config's status: the source is reported and nothing failed. The broker
     /// is built (never spawned), so nothing connects.
     #[tokio::test]
