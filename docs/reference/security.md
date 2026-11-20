@@ -460,10 +460,10 @@ id](#github-logins-are-pinned-to-their-account-id)): an unknown key under
 ### Certificates
 
 A client certificate issued before certificates named their user (by a server
-older than v0.10.0) is refused on a directory server, since the list can
-change under it; the client enrolls again (the CLI does so on the auth
-failure and retries). Certificates that name their user are checked against
-the list on every request, as on any server with users.
+older than v0.10.0) is refused here as on every server (see [The certificate is
+the credential](#the-certificate-is-the-credential)). Certificates that name
+their user are checked against the list on every request, as on any server
+with users.
 
 ## Ownership
 
@@ -695,10 +695,19 @@ client cannot request an identity it doesn't hold:
 - **CN** = the SSH key fingerprint (`SHA256:...`).
 - **OU** = scope (`control` or `credentials`), one scope per certificate.
 - **O** = client kind (`cli`, `broker`, `desktop`, `mobile`).
+- **userId** (RFC 4519 `uid`) = the user the key belonged to at enrolment
+  (`!implicit` for the implicit user of a server with no user list).
 - TTL = `auth.token_ttl` (default 24h), extended-key-usage `ClientAuth` only.
 
 The server ignores every requested subject field, SAN or extension in the
-CSR. The user a request acts as is whoever the CN's key belongs to **now**.
+CSR. A request acts as whoever the CN's key belongs to **now**, and only while
+that is still the user the certificate names. A user's certificate with no
+userId (one a server older than v0.10.0 issued) is refused on every server: at
+the TLS handshake on a new connection, and with `401` on a connection already
+open. A 0.9.x CLI, desktop app or phone enrolls again by itself on that
+failure; if one does not, run `shed server update NAME --refetch`. A service
+client's certificate names no user either, but is told apart by its shape (see
+below) and is not affected.
 
 This describes a user's certificate. A [service client](#service-clients)'s
 certificate has a different shape (CN = the client name, OU = `service`, a

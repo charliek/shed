@@ -351,8 +351,8 @@ reachable from other hosts runs `mtls`.
   skipped and logged. A person added on the service logs in with no restart (their first SSH
   login, as `_bootstrap`, pulls the list: at most once a minute while pulls succeed, once per
   15 minutes while they fail, the login waiting at most 8 s; see the unknown-key rule below);
-  a person removed loses their SSH connections at the next pull. Certificates issued before certificates named a user are refused on such a
-  server. See the [User Directory
+  a person removed loses their SSH connections at the next pull. Certificates issued before certificates named a user are refused, on such a
+  server as on every other (see "Security"). See the [User Directory
   guide](https://charliek.github.io/shed/guides/user-directory/).
 - **Server: `shed-server directory enroll [--name <name>]`** enrols the server with the
   service at `auth.directory.url`, once, writing `{state_dir}/directory/enrolment.json` (mode
@@ -1053,6 +1053,13 @@ reachable from other hosts runs `mtls`.
 - **A shed named `git` can no longer be opened by the signature machines give out for git.**
 - **Script keys** cannot take a `credentials` certificate or use the bus, and **expired keys**
   are refused at the SSH and TLS handshakes and on every request.
+- **A client certificate that names no user is refused on every server.** Only a server
+  older than 0.10.0 issues one. It used to be accepted by its key alone until it expired
+  (`auth.token_ttl`, 24 hours by default), except on a server with `auth.directory`. Now
+  it is refused at the TLS handshake, or with `401` on a connection already open; a 0.9.x
+  CLI, app or phone enrols again by itself, and `shed server update NAME --refetch` does
+  it by hand. A service client's certificate (`auth.clients`) is told apart by its shape
+  and is not affected.
 
 ## v0.9.0 — 2026-10-10
 

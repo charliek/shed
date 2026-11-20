@@ -279,17 +279,18 @@ func certScope(leaf *x509.Certificate) string {
 // reverse. The caller answers that with the same 401 as an unknown key, and
 // the client enrols again as whoever its key now belongs to.
 //
-// A certificate issued before certificates named their user names none. It is
-// checked by its key alone, as it was then, and expires on its own: such a
-// certificate lives auth.token_ttl from its issue (24 hours by default), and
-// the server never issues one again. On a server whose lookup is
-// users.BoundCredentialsOnly (a directory server, whose users change while it
-// runs) it is refused: the client enrols again.
+// A user's certificate that names no user (one a server older than 0.10.0
+// issued, before certificates named their user) is refused on every server:
+// its key alone cannot say whose it was. At the handshake that refuses a new
+// connection; on a connection already open the middleware answers 401. The
+// client enrols again.
 //
-// ok is false with a nil lookup (no SetUserLookup call) or a malformed user
-// attribute: fail closed. Service certificates never come here (they are told
-// apart by their shape first, servertls.ServiceClientName). The API middleware
-// and the HTTPS listener's handshake check both use it.
+// ok is false with a nil lookup (no SetUserLookup call), a certificate that
+// names no user, or a malformed user attribute: fail closed. Service
+// certificates (auth.clients), which name no user, never come here: they are
+// told apart by their shape first (servertls.ServiceClientName), at the
+// handshake and in the middleware. The API middleware and the HTTPS
+// listener's handshake check both use it.
 func CertificateUser(l users.Lookup, leaf *x509.Certificate, now time.Time) (users.User, users.Key, bool) {
 	if l == nil || leaf == nil {
 		return users.User{}, users.Key{}, false
@@ -298,12 +299,10 @@ func CertificateUser(l users.Lookup, leaf *x509.Certificate, now time.Time) (use
 	if err != nil {
 		return users.User{}, users.Key{}, false
 	}
-	b := users.Binding{}
-	if bound {
-		b = users.Binding{Bound: true, Name: name, Implicit: name == users.ImplicitName}
-	} else if _, only := l.(users.BoundCredentialsOnly); only {
+	if !bound {
 		return users.User{}, users.Key{}, false
 	}
+	b := users.Binding{Bound: true, Name: name, Implicit: name == users.ImplicitName}
 	return users.ResolveBound(l, leaf.Subject.CommonName, b, now)
 }
 

@@ -507,9 +507,9 @@ func (l *Lookup) Users() []users.User {
 }
 
 // BoundCredentialsOnly marks the lookup as one whose users change while the
-// server runs (users.BoundCredentialsOnly): a client certificate that names
-// no user is refused, and a credential-bus stream checks its caller again
-// before each message.
+// server runs (users.BoundCredentialsOnly): a credential-bus stream checks
+// its caller again before each message. (A client certificate that names no
+// user is refused on every server.)
 func (l *Lookup) BoundCredentialsOnly() {}
 
 // State reports the lookup's current state. Like every reader it finds, and

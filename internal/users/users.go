@@ -164,15 +164,11 @@ type UnknownKeyNudger interface {
 
 // BoundCredentialsOnly is a Lookup whose users change while the server runs
 // (a directory's list, auth.directory), so that a name may stop being a user,
-// or a key move to another user, at any moment. Two things follow on a
-// server whose lookup implements it, and on no other:
-//   - a credential that names no user (Binding.Bound false: a client
-//     certificate issued before certificates named their user) is refused
-//     outright rather than checked by its key alone, since its key alone
-//     cannot say whose it was; its client enrols again;
-//   - a credential-bus stream checks its caller's certificate again before
-//     each message it sends, and ends when the certificate no longer
-//     authenticates its user.
+// or a key move to another user, at any moment. On a server whose lookup
+// implements it, and on no other, a credential-bus stream checks its
+// caller's certificate again before each message it sends, and ends when the
+// certificate no longer authenticates its user. (A client certificate that
+// names no user is refused on every server, api.CertificateUser.)
 //
 // The two lookups of a server with no user list or with auth.users do not
 // implement it.
@@ -309,9 +305,10 @@ func HasKey(l Lookup, fingerprint string) bool {
 // one user must not then act as the other, so whoever checks the credential
 // asks ResolveBound, not UserForKey.
 type Binding struct {
-	// Bound is false for a credential that names no user: a client
-	// certificate issued before certificates named one. It is checked by
-	// its key alone, as it always was, until it expires.
+	// Bound is false only for the zero Binding. Every credential the server
+	// checks names its user: a client certificate that names none (one a
+	// server older than 0.10.0 issued) is refused before it gets a Binding
+	// (api.CertificateUser).
 	Bound bool
 	// Name is the user's name; ImplicitName for the implicit user.
 	Name string

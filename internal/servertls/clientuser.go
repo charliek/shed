@@ -30,9 +30,11 @@ package servertls
 // A user name is never ImplicitUserValue, so a certificate issued to the
 // implicit user never reads as a named user's, nor the reverse.
 //
-// A certificate issued before this attribute existed has none (Bound false).
-// It is accepted under the fingerprint rule alone until it expires; the
-// server never issues one again.
+// A certificate issued before this attribute existed (by a server older than
+// 0.10.0) has none (bound false). The server refuses it, at the handshake and
+// on every request, and never issues one again; its client enrols again. A
+// service certificate (service.go) names no user either: it is told apart by
+// its shape and never read for a user.
 
 import (
 	"crypto/x509"

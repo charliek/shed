@@ -59,9 +59,10 @@ func installUsers(t *testing.T, l *directory.Lookup, seq uint64, listed map[stri
 // TestUnboundCertificateRefusedOnADirectoryServer: a client certificate
 // that names no user (issued before certificates named one) is refused on a
 // directory server, for a local admin's key and a listed user's alike, while
-// the same keys' bound certificates are accepted; with the lookup of
-// auth.users (ConfigLookup) the unbound certificate is still accepted by its
-// key.
+// the same keys' bound certificates are accepted; it is refused with the
+// lookup of auth.users (ConfigLookup) and with no user list as well, where
+// the same key's bound certificate is accepted (cert_binding_test.go holds
+// the handshake).
 func TestUnboundCertificateRefusedOnADirectoryServer(t *testing.T) {
 	rootLine, rootFP := directoryTestKey(t)
 	_, adaFP := directoryTestKey(t)
@@ -70,7 +71,7 @@ func TestUnboundCertificateRefusedOnADirectoryServer(t *testing.T) {
 	s.SetUserLookup(lookup)
 
 	for _, tc := range []struct{ name, fp string }{{"root", rootFP}, {"ada", adaFP}} {
-		unbound := testClientCert(tc.fp, "control", time.Hour)
+		unbound := unboundClientCert(tc.fp, "control", time.Hour)
 		if _, bound, err := servertls.ClientCertUser(unbound); err != nil || bound {
 			t.Fatalf("the test's unbound certificate is bound (%v, %v)", bound, err)
 		}
@@ -98,11 +99,18 @@ func TestUnboundCertificateRefusedOnADirectoryServer(t *testing.T) {
 	if _, only := any(cl).(users.BoundCredentialsOnly); only {
 		t.Fatal("ConfigLookup is BoundCredentialsOnly")
 	}
-	if u, _, ok := CertificateUser(cl, testClientCert(rootFP, "control", time.Hour), time.Now()); !ok || u.Name != "root" {
-		t.Errorf("CertificateUser(ConfigLookup, root's unbound certificate) = %+v %v; want root, as before", u, ok)
+	if u, _, ok := CertificateUser(cl, unboundClientCert(rootFP, "control", time.Hour), time.Now()); ok {
+		t.Errorf("CertificateUser(ConfigLookup, root's unbound certificate) = %+v; want refused", u)
 	}
-	if u, _, ok := CertificateUser(userstest.Implicit(rootFP), testClientCert(rootFP, "control", time.Hour), time.Now()); !ok || !u.Implicit {
-		t.Errorf("CertificateUser(no user list, an unbound certificate) = %+v %v; want the implicit user", u, ok)
+	if u, _, ok := CertificateUser(cl, boundLeaf(rootFP, "root"), time.Now()); !ok || u.Name != "root" {
+		t.Errorf("CertificateUser(ConfigLookup, root's bound certificate) = %+v %v; want root", u, ok)
+	}
+	implicit := userstest.Implicit(rootFP)
+	if u, _, ok := CertificateUser(implicit, unboundClientCert(rootFP, "control", time.Hour), time.Now()); ok {
+		t.Errorf("CertificateUser(no user list, an unbound certificate) = %+v; want refused", u)
+	}
+	if u, _, ok := CertificateUser(implicit, implicitClientCert(rootFP, "control", time.Hour), time.Now()); !ok || !u.Implicit {
+		t.Errorf("CertificateUser(no user list, the implicit user's certificate) = %+v %v; want the implicit user", u, ok)
 	}
 }
 
