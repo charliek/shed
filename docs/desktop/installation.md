@@ -124,8 +124,9 @@ records that in its preferences. It never turns it on again, so if you switch it
 Preferences it stays off. A debug build does not register itself.
 
 If you installed the separate credential daemon from Homebrew with an earlier release, it has
-been removed from the tap and does nothing now: uninstall it with `brew uninstall` (the
-upgrade guide for this release names the formula).
+been removed from the tap and does nothing now: uninstall it with `brew uninstall` (see
+[Remove the old credential daemon](../upgrades/v0.9.0-to-v0.10.0.md#remove-the-old-credential-daemon) in the
+upgrade guide for this release).
 
 The active SSH backend and per-server connection state are visible in Preferences → Credential
 broker and over IPC (`broker.status`). The app and the servers see one machine identity, and

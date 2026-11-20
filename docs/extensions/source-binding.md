@@ -188,16 +188,19 @@ does not take over. Move the source with `shed source use` or the desktop button
 
 ## Upgrading
 
-Upgrade machines **before** servers (the whole procedure is in the [v0.9.1 → v0.10.0
-upgrade guide](../upgrades/v0.9.1-to-v0.10.0.md)):
+Upgrade servers **first**, then every machine right after (the whole procedure is in the
+[v0.9.0 → v0.10.0 upgrade guide](../upgrades/v0.9.0-to-v0.10.0.md#the-order-servers-first-then-every-machine-right-after)):
 
-- A broker that sends the headers works against an older server, which ignores them. (On a
-  server older than the pin, a second listener for a namespace still gets the old terminal
-  `409`.)
-- A broker released before the pin sends no headers, so a pinning server refuses every
-  subscribe and response from it with `403 SOURCE_MACHINE_ID_REQUIRED`, whose message names
-  the versions to upgrade to. It keeps retrying, but credential forwarding for that machine
-  stops until it is upgraded.
+- A broker released before the pin (the retired credential daemon, or a desktop app older
+  than 0.10.0) sends no headers, so a pinning server refuses every subscribe and response from it with
+  `403 SOURCE_MACHINE_ID_REQUIRED`, whose message says to install the current shed desktop
+  app. It keeps retrying, but credential forwarding for that machine stops until the app is
+  upgraded.
+- The 0.10.0 app refuses a certificate that names no user, which only a server older than
+  0.10.0 issues, so it cannot broker for such a server.
+- The 0.10.0 app keeps its state in a new directory, so it is a new machine to every server.
+  Where another machine id is your source, move it with **Use this machine** or `shed source
+  use`.
 
 On its first start with credential sources a server has no bindings, so whichever of a
 user's machines connects first becomes the source. Start the intended machine first, or

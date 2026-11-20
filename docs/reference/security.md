@@ -1282,8 +1282,8 @@ fails config load (before, `auth: {Mode: mtls}` was ignored and the server
 started open), and so does a top-level key that matches a known one only when
 case is ignored (`Auth:`, `Bind_Address:`). The server holds no bearer-token
 code: an `Authorization` header is never read. The clients still speak the
-token protocol to servers older than v0.10.0. The [v0.9.1 → v0.10.0 upgrade
-guide](../upgrades/v0.9.1-to-v0.10.0.md) takes a server of any mode across.
+token protocol to servers older than v0.10.0. The [v0.9.0 → v0.10.0 upgrade
+guide](../upgrades/v0.9.0-to-v0.10.0.md) takes a server of any mode across.
 
 ## Removed earlier
 

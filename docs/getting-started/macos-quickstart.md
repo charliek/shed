@@ -43,7 +43,9 @@ xattr -dr com.apple.quarantine /Applications/ShedDesktop.app
 
 The app is the only credential broker; there is nothing else to install. (If you ran the
 separate credential daemon from an earlier release, it has been removed from Homebrew:
-uninstall it with `brew uninstall`; the upgrade guide for this release names the formula.)
+uninstall it with `brew uninstall`; see
+[Remove the old credential daemon](../upgrades/v0.9.0-to-v0.10.0.md#remove-the-old-credential-daemon) in the
+upgrade guide for this release.)
 
 `brew install charliek/tap/shed` installs the `shed` CLI and `shed-server`, pulls
 `vfkit` (the Apple Virtualization bridge), generates a default VZ server config,

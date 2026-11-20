@@ -744,7 +744,7 @@ server**. It stops before it opens anything, gives nothing away and records
 nothing, and its error, in the same log, begins:
 
 ```text
-the server does not start: the one-time upgrade step for the user list began for user pat and did not finish, and the users in auth.users are now admin (marker /etc/shed/users-upgrade.json).
+the server does not start: the one-time upgrade step for the user list began for user pat and did not finish, and the users in auth.users are now admin (marker "/etc/shed/users-upgrade.json").
 ```
 
 The sheds and snapshots the step has not reached have no user yet. Take one

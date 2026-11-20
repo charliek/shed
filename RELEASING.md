@@ -74,8 +74,8 @@ them and they get no fixes.
   and the `release` job's Rust and host-agent steps are deleted. Its
   artifacts stay frozen at v0.9.0: the GitHub release assets of the tags
   that shipped it stay where they are, and the tap's `shed-host-agent`
-  formula stays at v0.9.0 until the tap retires it (a commit in
-  `charliek/homebrew-tap`, not here). **Refused** through the generic
+  formula is deleted (a commit in `charliek/homebrew-tap`, not here; the
+  upgrade guide tells users to uninstall it). **Refused** through the generic
   errors, with no message of its own: `--components host-agent` exits 2
   with `unknown component 'host-agent' (valid: server, desktop)`, and a
   `**Ships:** host-agent` token exits 1 as an unknown token. **No
