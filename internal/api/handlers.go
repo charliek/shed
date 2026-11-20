@@ -675,9 +675,7 @@ func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, shed)
 }
 
-// handleDeleteShed deletes a shed. Delete always discards the writable volume;
-// any stray ?keep_volume query is ignored for back-compat with old clients (it
-// was a no-op on both backends).
+// handleDeleteShed deletes a shed. Delete always discards the writable volume.
 // DELETE /api/sheds/{name}
 func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
