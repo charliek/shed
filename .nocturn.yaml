@@ -1,5 +1,5 @@
 version: 1
-# One vX.Y.Z tag family carries three components; a tag ships a component
+# One vX.Y.Z tag family carries two components; a tag ships a component
 # only when its version manifest equals the tag (scripts/release/release-plan.sh,
 # RELEASING.md "Component selection").
 targets:
@@ -12,13 +12,6 @@ targets:
     # pushes the shed-vz and shed-fc guest images to ghcr on the same tag.
     released: { tag_pattern: '^v\d+\.\d+\.\d+$', homebrew: shed }
     ships: [go.mod]
-  host-agent:
-    kind: cli
-    # Component `host-agent` (manifest crates/shed-host-agent/VERSION):
-    # .goreleaser.host-agent.yaml builds the Rust shed-host-agent from the
-    # crates/ workspace (--locked) into the tap's shed-host-agent formula.
-    released: { tag_pattern: '^v\d+\.\d+\.\d+$', homebrew: shed-host-agent }
-    ships: [crates/Cargo.lock]
   desktop:
     kind: desktop
     # Component `desktop` (manifest desktop/VERSION): publish-images.yaml's

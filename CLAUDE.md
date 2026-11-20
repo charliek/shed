@@ -24,10 +24,9 @@ The Go build never traverses `crates/` or `desktop/` (`go list ./...` / `golangc
 One `vX.Y.Z` tag family, **manifest-selected** — a component ships iff its version manifest equals the tag:
 
 - **server** selector = `.claude-plugin/plugin.json` (renamed from `go`; file unchanged); ships the CLI/server/agent brew + apt + rootfs images.
-- **host-agent** selector = `crates/shed-host-agent/VERSION`; ships brew `shed-host-agent` + a GH linux tarball (brew-only, no apt).
 - **desktop** selector = `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified **lockstep**); ships the DMG + Sparkle appcast + `shed-desktop` debs.
 
-`scripts/release/update-version.sh X.Y.Z --components server,host-agent,desktop` bumps the selected manifests (default `server`; `go` accepted as a deprecated alias). `scripts/release/recommend-components.sh X.Y.Z` recommends the component set (all three on a minor/major bump, only what changed since each component's last-shipped tag on a patch; a never-shipped component is bootstrapped via the script's `NEVER_SHIPPED` list rather than hard-erroring) for the human to confirm/edit before bumping. `scripts/release/release-plan.sh` maps a tag → `ship_server`/`ship_host_agent`/`ship_desktop` and **exits 1 if none match** (forgotten-bump guard). Each `CHANGELOG.md` entry opens with a `**Ships:**` line naming the components — **enforced** by `release-plan.sh` against the manifest-computed set on stable tags. A **desktop-only** tag publishes **no** rootfs images; a **helper-only** tag (host-agent, no server) also publishes no images and leaves the other components' brew/apt entries pinned at their prior release. (The former **machine-rc** component was retired in plan 010 — the shed-host-agent daemon hosts the machine RC hub; its brew/apt artifacts stay frozen at v0.8.2. Plan 011 handed its brew+apt slot to `sx`, and that slot was given up in turn when `sx` was sunset, unreleased, in plan 016.) Full detail in `RELEASING.md` (and `desktop/RELEASING.md` for the recurring desktop steps).
+`scripts/release/update-version.sh X.Y.Z --components server,desktop` bumps the selected manifests (default `server`; `go` accepted as a deprecated alias). `scripts/release/recommend-components.sh X.Y.Z` recommends the component set (both on a minor/major bump, only what changed since each component's last-shipped tag on a patch; a never-shipped component is bootstrapped via the script's `NEVER_SHIPPED` list rather than hard-erroring) for the human to confirm/edit before bumping. `scripts/release/release-plan.sh` maps a tag → `ship_server`/`ship_desktop` (plus `ship_goreleaser`, equal to `ship_server`) and **exits 1 if none match** (forgotten-bump guard). Each `CHANGELOG.md` entry opens with a `**Ships:**` line naming the components — **enforced** by `release-plan.sh` against the manifest-computed set on stable tags. A **desktop-only** tag publishes **no** rootfs images and leaves the server's brew/apt entries pinned at their prior release. (The former **machine-rc** component was retired in plan 010; its brew/apt artifacts stay frozen at v0.8.2. Plan 011 handed its brew+apt slot to `sx`, and that slot was given up in turn when `sx` was sunset, unreleased, in plan 016.) The former **host-agent** component (brew `shed-host-agent`) was retired in plan 037, since the desktop app is the only credential broker, and its artifacts stay frozen at v0.9.0. Full detail in `RELEASING.md` "Retired components" (and `desktop/RELEASING.md` for the recurring desktop steps).
 
 ## Build & Test
 
@@ -42,7 +41,7 @@ make test-integration   # Run the pytest-based integration suite (see below)
 make test-integration-units  # Server-free unit tests of the suite's own helpers/baked-image bodies (runs in CI)
 ```
 
-Tools are managed via [mise](https://mise.jdx.dev/) — run `mise install` to set up Go and golangci-lint, plus `goreleaser` (pinned to CI's exact version) and `zig` (release tooling; only needed for a local `make snapshot-<component>` run).
+Tools are managed via [mise](https://mise.jdx.dev/) — run `mise install` to set up Go and golangci-lint, plus `goreleaser` (pinned to CI's exact version; release tooling, only needed for a local `make snapshot-server` run).
 
 ### Integration test suite (`tests/integration/`)
 
@@ -156,7 +155,7 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - `cmd/shed/` — CLI binary (command handlers split across `shed.go`, `console.go`, `attach.go`, `sessions.go`, `tunnels.go`, `sync.go`, `ssh_config.go`, etc.)
 - `cmd/shed-server/` — Server daemon binary
 - `cmd/shed-agent/` — In-VM agent binary (Firecracker/VZ)
-- `crates/shed-host-agent/` — Host-side credential broker, in Rust (see `crates/CLAUDE.md`). The Go `cmd/shed-host-agent` it replaced was retired in plan 006. Its Touch ID / LocalAuthentication approval gate uses `objc2` to link the framework directly — no CGO. Its release job (`.goreleaser.host-agent.yaml`, `builder: rust`) still runs on **macos-latest** to match the real release runner (cross-compiling linux via `cargo zigbuild`).
+- `crates/shed-host-agent/` — Host-side credential broker, in Rust (see `crates/CLAUDE.md`). The Go `cmd/shed-host-agent` it replaced was retired in plan 006. Its Touch ID / LocalAuthentication approval gate uses `objc2` to link the framework directly — no CGO. It is no longer a release component.
 - `cmd/shed-ext-ssh-agent/`, `cmd/shed-ext-aws-credentials/`, `cmd/docker-credential-shed/` — In-VM guest extension binaries (imported from shed-extensions). Cross-compiled for linux and staged into the rootfs build context by `scripts/stage-guest-binaries.sh`; not shipped as host `bin/` artifacts.
 - `internal/api/` — HTTP API handlers (Chi router)
 - `internal/config/` — Configuration types and validation

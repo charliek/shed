@@ -12,58 +12,80 @@ Everything else is automatic.
 
 ## Component selection (the manifest-selected release model)
 
-The monorepo carries **three** release components on ONE `vX.Y.Z` tag
+The monorepo carries **two** release components on ONE `vX.Y.Z` tag
 family. A component ships in a release **iff its version manifest
 equals the tag**:
 
 | Component | Ship selector (version manifest) | Artifacts |
 |---|---|---|
 | `server` | `.claude-plugin/plugin.json` `.version` (file unchanged; the component was renamed from `go`) | brew `shed`, apt `shed-server` deb, ghcr rootfs images (vz/fc + build-tools) |
-| `host-agent` | `crates/shed-host-agent/VERSION` | brew `shed-host-agent` + a GH release linux tarball. **brew-only — no apt deb.** |
 | `desktop` | `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified lockstep) | ShedDesktop DMG (Tauri, the macOS client as of 0.9.0) + Sparkle appcast, `shed-desktop` debs — a **prerelease** (`-`) tag ships on the appcast beta channel, a stable tag on the stable channel (see [`desktop/RELEASING.md`](desktop/RELEASING.md)) |
 
-`server` and `host-agent` are the two **goreleaser** components
-— each published by its own split config (`.goreleaser.server.yaml`,
-`.goreleaser.host-agent.yaml`; see "What happens"
-below). Only `desktop` has a beta channel — a prerelease (`-suffix`) tag
-that would ship a goreleaser component is rejected by `release-plan.sh`
-(stable-only guard).
+`server` is the one **goreleaser** component, published by
+`.goreleaser.server.yaml` (see "What happens" below). Only `desktop` has
+a beta channel — a prerelease (`-suffix`) tag that would ship the server
+is rejected by `release-plan.sh` (stable-only guard).
 
-> **The retired `machine-rc` component (plan 010).** `shed-machine-rc`
-> shipped as a fourth component through v0.8.2; the shed-host-agent
-> daemon now hosts the machine RC hub, so the component is retired:
-> `cmd/shed-machine-rc`,
-> `.goreleaser.machine-rc.yaml`, and its selector are deleted, and
-> `update-version.sh`/`release-plan.sh` reject the `machine-rc` token.
-> **Published artifacts are not withdrawn, but they are not supported.**
-> Nothing new is built for them and they get no fixes; the intended
-> move is `shed-host-agent` (see
-> [`docs/extensions/shed-machine-rc.md`](docs/extensions/shed-machine-rc.md)).
-> Its brew+apt channel pair passed to `sx` in plan 011 and was retired
-> again with `sx`'s sunset in plan 016 — nobody holds it now. The tap/apt
-> housekeeping landed with the machine-rc block: `Formula/shed-machine-rc.rb` was
-> dropped from `charliek/homebrew-tap`, and the `shed-machine-rc` entry
-> was dropped from `charliek/apt-charliek`'s `packages.yaml` (that entry
-> still pointed at the pre-monorepo `charliek/shed-extensions` repo — it
-> was never repointed, so the v0.8.x machine-rc debs were never indexed
-> by apt in the first place).
-> **Old-tag guard:** a PRE-retirement tag's own `release-plan.sh` can
-> emit `ship_machine_rc=true`; the current `publish-images.yaml` has no
-> machine-rc jobs. On a tag **push** it **fails loudly** instead of
-> silently ignoring it — build machine-rc from the tag's own workflow,
-> or accept the gap. On a `workflow_dispatch` image republish it only
-> **warns** and continues: the `release` job is tag-push gated, so a
-> dispatch never builds goreleaser artifacts anyway and the documented
-> image-recovery path for pre-retirement tags keeps working.
+### Retired components
 
-**The `host-agent` `VERSION` file is a ship-selector ONLY** —
-same convention as `.claude-plugin/plugin.json` for `server`. The
-*shipped* binary version is always the tag value GoReleaser injects at
-build time (`SHED_HOST_AGENT_VERSION`), never read from
-this file. It is deliberately **independent of**
-`crates/Cargo.toml`'s `[workspace.package].version` (owned by the
-`desktop` component, which shares the Rust workspace) — they will
-diverge in normal operation and that's expected, not a bug.
+Three components have left the release. Their published artifacts are
+not withdrawn, but they are not supported: nothing new is built for
+them and they get no fixes.
+
+- **`machine-rc` (retired in plan 010).** `shed-machine-rc` shipped as a
+  fourth component through v0.8.2 (brew `shed-machine-rc` and a deb);
+  the shed-host-agent daemon took over the machine RC hub, and that hub
+  was itself retired in plan 022 (see
+  [`docs/extensions/shed-machine-rc.md`](docs/extensions/shed-machine-rc.md)).
+  `cmd/shed-machine-rc`, `.goreleaser.machine-rc.yaml` and its selector
+  are deleted. The tap/apt housekeeping landed with the retirement:
+  `Formula/shed-machine-rc.rb` was dropped from `charliek/homebrew-tap`,
+  and the `shed-machine-rc` entry was dropped from
+  `charliek/apt-charliek`'s `packages.yaml` (that entry still pointed at
+  the pre-monorepo `charliek/shed-extensions` repo — it was never
+  repointed, so the v0.8.x machine-rc debs were never indexed by apt in
+  the first place). Its brew+apt channel pair passed to `sx` in plan 011.
+  **Refused:** `update-version.sh --components machine-rc` exits 2 and a
+  `**Ships:** machine-rc` token exits 1, each naming the retirement.
+  **Old-tag guard:** a post-migration, pre-retirement tag's own
+  `release-plan.sh` can emit `ship_machine_rc=true`; the current
+  `publish-images.yaml` has no machine-rc jobs. On a tag **push** it
+  **fails loudly** instead of silently ignoring it — build machine-rc
+  from the tag's own workflow, or accept the gap. On a
+  `workflow_dispatch` image republish it only **warns** and continues:
+  the `release` job is tag-push gated, so a dispatch never builds
+  goreleaser artifacts anyway and the documented image-recovery path for
+  pre-retirement tags keeps working.
+- **`sx` (sunset in plan 016, #329).** The RC session porcelain was never
+  tagged, so nothing of it was ever published. Its selector
+  (`crates/sx/VERSION`), `.goreleaser.sx.yaml` and the brew + apt
+  channel pair it inherited from machine-rc were removed outright; nobody
+  holds that pair now. **Refused:** `--components sx` exits 2 and a
+  `**Ships:** sx` token exits 1, each naming the sunset.
+- **`host-agent` (retired in plan 037).** `shed-host-agent`, the
+  host-side credential broker daemon, shipped on its own selector
+  (`crates/shed-host-agent/VERSION`) through v0.9.0, as brew
+  `shed-host-agent` plus GitHub release tarballs (darwin and linux,
+  amd64 and arm64), built from the Rust crate by
+  `.goreleaser.host-agent.yaml` (`builder: rust`, cross-compiled with
+  `cargo zigbuild`). It was never an apt package. The desktop app now
+  brokers credentials in-process on macOS and Linux and is the only
+  broker. The selector, the goreleaser config, the zig install script
+  and the `release` job's Rust and host-agent steps are deleted. Its
+  artifacts stay frozen at v0.9.0: the GitHub release assets of the tags
+  that shipped it stay where they are, and the tap's `shed-host-agent`
+  formula stays at v0.9.0 until the tap retires it (a commit in
+  `charliek/homebrew-tap`, not here). **Refused** through the generic
+  errors, with no message of its own: `--components host-agent` exits 2
+  with `unknown component 'host-agent' (valid: server, desktop)`, and a
+  `**Ships:** host-agent` token exits 1 as an unknown token. **No
+  old-tag guard:** a tag push runs that tag's own workflow, so an old tag
+  brings its own host-agent jobs; a `workflow_dispatch` of an old tag
+  reads its `ship_host_agent=true` line into an output no job declares,
+  which is ignored, and the `release` job never runs on a dispatch. Every
+  tag that shipped host-agent also shipped the server, so its
+  `ship_goreleaser` equals its `ship_server` and `desktop-release-create`
+  is skipped exactly as before.
 
 ### Recommend + confirm
 
@@ -73,14 +95,13 @@ Cutting a release is a two-step flow, not a single command:
    committed history and prints a recommendation (component | last-shipped
    tag | changed? | sample paths) plus a derived bump level:
    - **minor/major** bump (target's major or minor exceeds every
-     manifest's) → recommends **all three** components.
+     manifest's) → recommends **both** components.
    - **patch** bump → recommends only the components that **changed**
      since each component's own last-shipped tag (walked independently
-     — server, host-agent and desktop each advance on their own tag
-     history).
+     — server and desktop each advance on their own tag history).
    - Requires a full clone (hard-errors with an `--unshallow` hint on a
      shallow one) and a target strictly greater than the max version
-     across all three manifests (the tag family is monotonic — versions
+     across both manifests (the tag family is monotonic — versions
      are never reused).
    - **First-ship bootstrap**: a component that has never shipped has no
      last-shipped tag to diff against, so the walk would hard-error "no
@@ -103,9 +124,7 @@ Cutting a release is a two-step flow, not a single command:
      while unused.
    - The recommendation is a **starting point**: the path sets are
      deliberately coarse (over-recommending is free — under-recommending
-     is the costly failure mode), and the script prints a caveat for the
-     one known gap (a `[workspace.dependencies]`-only bump doesn't
-     auto-flag `host-agent`). The human confirms or edits the set.
+     is the costly failure mode). The human confirms or edits the set.
 2. The human authors the CHANGELOG entry's `**Ships:**` line with the
    confirmed set, then runs `scripts/release/update-version.sh X.Y.Z
    --components <confirmed set>` (`go` is a deprecated alias for
@@ -123,9 +142,10 @@ Cutting a release is a two-step flow, not a single command:
 ### `**Ships:**` enforcement
 
 Each stable-tag CHANGELOG entry's `**Ships:**` line uses the canonical
-tokens `server`, `host-agent`, `desktop` (comma-separated; `machine-rc`
-is rejected with a retirement message on entries written after plan 010
-and `sx` with a sunset message after plan 016;
+tokens `server`, `desktop` (comma-separated; `machine-rc`
+is rejected with a retirement message on entries written after plan 010,
+`sx` with a sunset message after plan 016, and any other token — a
+component retired since among them — as unknown;
 legacy `server/CLI` is accepted as an alias for `server`, for entries
 written before the rename). `release-plan.sh` locates the tag's
 `## vX.Y.Z — date` section, parses the line, and **hard-fails the whole
@@ -136,10 +156,12 @@ CHANGELOG entry and skip the check entirely.
 
 - **CI-side selection**: `publish-images.yaml`'s first job runs
   `scripts/release/release-plan.sh`, which maps the tag to
-  `ship_server`/`ship_host_agent`/`ship_desktop` outputs, plus a derived
-  `ship_goreleaser` (true iff any goreleaser component ships — computed
-  in the script, not re-inferred in YAML, so it's unit-tested). Every downstream job gates on those.
-- **No-manifest-matches guard**: if a tag matches NONE of the three
+  `ship_server`/`ship_desktop` outputs, plus a derived
+  `ship_goreleaser` (true iff goreleaser runs, which today equals
+  `ship_server` — computed in the script, not re-inferred in YAML, so
+  it's unit-tested; `desktop-release-create` keys on it). Every
+  downstream job gates on those.
+- **No-manifest-matches guard**: if a tag matches NEITHER of the two
   manifests (a forgotten `update-version.sh` run), `release-plan.sh`
   exits 1 and the whole workflow fails loudly — a silent no-op release
   is impossible. Fix by bumping the right manifest(s) and cutting a
@@ -166,20 +188,18 @@ CHANGELOG entry and skip the check entirely.
 - **Interleaved component versions**: component versions advance
   independently — each component's "current version" is **the most
   recent tag that shipped it**, not the most recent tag overall. The
-  server may sit at a newer tag than host-agent or desktop (or any
-  permutation), legitimately. Never reuse a version for a different
-  component set. Corollary: a **helper-only** tag (host-agent,
-  no server) publishes **no** `ghcr.io/charliek/shed-{vz,fc}-*`
-  rootfs images and leaves the other
-  components' brew/apt entries pinned at their prior release — same
-  rule the desktop-only case has always followed.
+  server may sit at a newer tag than the desktop (or the reverse),
+  legitimately. Never reuse a version for a different
+  component set. Corollary: a **desktop-only** tag publishes **no**
+  `ghcr.io/charliek/shed-{vz,fc}-*` rootfs images and leaves the
+  server's brew/apt entries pinned at their prior release.
 - **The apt reality**: apt-charliek indexes a package by scanning the
   latest GitHub release **assets** that match its glob — the
   `repository_dispatch` payload is a freshness nudge only, ignored for
   correctness. That's *why* an unshipped component must produce **no
-  release assets at all**: the per-component split goreleaser configs
-  (below) are the mechanism that keeps an unshipped component's deb
-  entirely off the release, so apt's scan can't accidentally pick it up.
+  release assets at all**: the server's goreleaser config runs only when
+  the server ships, so an unshipped server's deb stays entirely off the
+  release and apt's scan can't accidentally pick it up.
 - Both bump/plan scripts and the recommender are covered by
   `scripts/release/release-scripts-test.sh` (run in CI by `ci.yml`'s
   `plugin` job).
@@ -278,8 +298,6 @@ fails, and the seam is proven ignored without the self-test flag.
        in-repo bumper) to update `.claude-plugin/plugin.json`'s
        top-level `.version`, then jq-verifies the bump landed (defense
        against set-version.sh's silent-failure mode on malformed JSON)
-     - `host-agent` writes + grep-verifies its standalone `VERSION`
-       file
      - `desktop` bumps the lockstep set (unchanged)
    - Commits as `chore(version): bump to X.Y.Z`
    - **Runs `scripts/release/release-plan.sh vX.Y.Z` locally and
@@ -293,7 +311,7 @@ fails, and the seam is proven ignored without the self-test flag.
 2. **`publish-images.yaml`** (CI, on tag push `v*`) — a `release-plan`
    job first (component selection, see above), then the image chain
    below (gated on `ship_server`) plus the goreleaser `release` job
-   (gated on `ship_goreleaser`, i.e. server and/or host-agent)
+   (gated on `ship_server` and the whole server chain)
    plus the desktop jobs (gated on `ship_desktop`; documented in
    `desktop/RELEASING.md`). The image chain keeps its strict dependency
    ordering:
@@ -345,77 +363,58 @@ fails, and the seam is proven ignored without the self-test flag.
    **`release`** (`macos-latest`; needs `release-plan` +
    `server-signing-preflight` +
    `publish-build-tools`/`publish-vz`/`publish-fc`/`smoke`; tag-push
-   only; `if: ship_goreleaser`, and — when `ship_server` — additionally
-   requires the preflight and all four image/smoke jobs to have
-   `== 'success'`):
-   - Runs `go test ./...` + golangci-lint (unconditional — every
-     goreleaser-shipping tag exercises the Go test suite, not just
-     server tags).
+   only; `if: ship_server`, and requires the preflight and all four
+   image/smoke jobs to have `== 'success'`; `macos-latest` because the
+   server build hook signs with `codesign`):
+   - Runs `go test ./...` + golangci-lint.
    - Mints a release-bot App token scoped to `charliek/homebrew-tap`
-     once, shared by every invocation below.
-   - Runs **one `goreleaser release --clean -f <config>` invocation per
-     shipping goreleaser component**, in fixed order **server →
-     host-agent**, each step individually gated on its own
-     `ship_<component> == 'true'`:
-     - `.goreleaser.server.yaml` — 3 Go binaries × OS/arch matrix with
-       ldflag versioning, `checksums-server.txt`, `Formula/shed.rb`
-       (pushed to homebrew-tap), `shed-server_*.deb` (via nfpm).
-       The step right before it imports the Developer ID certificate
+     for the formula push.
+   - Runs **one `goreleaser release --clean -f .goreleaser.server.yaml`
+     invocation**: 3 Go binaries × OS/arch matrix with ldflag
+     versioning, `checksums-server.txt`, `Formula/shed.rb` (pushed to
+     homebrew-tap), `shed-server_*.deb` (via nfpm).
+     - The step right before it imports the Developer ID certificate
        into a throwaway keychain, and the invocation runs with
        `SHED_SERVER_SIGNING=required`. The build hook therefore signs
        the darwin `shed-server` and `ShedServer.app` with that identity,
        and refuses anything but a timestamped Developer ID signature from
        the team. The step right after it deletes the keychain, whatever
        the outcome.
-     - `.goreleaser.host-agent.yaml` — the Rust `shed-host-agent`
-       binary (`builder: rust`, via `cargo zigbuild`), a GH linux
-       tarball, `checksums-host-agent.txt`, `Formula/shed-host-agent.rb`
-       — **no `.deb`**, brew-only. See "Host-agent" below.
-     - The Rust toolchain + zig install step is gated on
-       `ship_host_agent`, so a pure-Go server-only tag skips
-       it (~3 min). It runs right before the host-agent invocation,
-       after the keychain delete, not at the start of the job.
      - **No third-party build code runs while the certificate is
-       imported.** The two steps that run it, the Rust toolchain install
-       (`cargo install` runs dependency build scripts) and the
-       host-agent invocation (`cargo zigbuild` runs `build.rs`), both
-       follow the keychain delete, and a failed delete skips them. What
-       runs earlier in the job is trusted at the release workflow's
-       level: the actions it uses, and the repo's own code (tests, lint,
-       release notes, the server build) with the `go.sum`-pinned modules
-       the shipped binaries link. `release-scripts-test.sh` fails if
-       either step, or any step running `cargo`, `rustup` or `brew`,
-       moves before the delete.
-     - Both share `release.mode: keep-existing` +
-       `release.replace_existing_artifacts: true`, identical
-       `changelog`/`prerelease: auto`/`project_name: shed`. **The FIRST
-       shipping invocation creates the GitHub Release, with the tag's
-       curated CHANGELOG section as its body**: the job extracts it with
+       imported.** The job installs no Rust toolchain and runs no
+       `cargo`, `rustup` or `brew`. What runs before the delete is
+       trusted at the release workflow's level: the actions it uses, and
+       the repo's own code (tests, lint, release notes, the server build)
+       with the `go.sum`-pinned modules the shipped binaries link.
+       `release-scripts-test.sh` fails if any step running `cargo`,
+       `rustup` or `brew` comes before the delete, or if a Rust
+       toolchain step appears in the job at all.
+     - The config uses `release.mode: keep-existing` +
+       `release.replace_existing_artifacts: true`. **It creates the
+       GitHub Release, with the tag's curated CHANGELOG section as its
+       body**: the job extracts it with
        `scripts/release/changelog-section.sh` into a file outside the
-       checkout and passes `--release-notes <file>` to that invocation
-       only (server, or host-agent when server doesn't ship). Later
-       invocations in the same run only add their own assets — they never
-       touch the body. This makes re-runs safe: `replace_existing_artifacts`
-       lets a re-run replace its own already-uploaded assets instead of
-       failing on `already_exists`.
+       checkout and passes `--release-notes <file>`. The desktop jobs
+       later only add their own assets — they never touch the body. This
+       makes re-runs safe: `replace_existing_artifacts` lets a re-run
+       replace its own already-uploaded assets instead of failing on
+       `already_exists`.
      - The body is the CHANGELOG section, not goreleaser's commit list,
        so anything users must read on the release page (a one-time
        upgrade warning, say) belongs in the CHANGELOG entry.
-     - Before-hooks in every split config are constrained to **not
-       mutate tracked files** — CI asserts `go mod tidy` leaves
+     - The config's before-hooks are constrained to **not mutate
+       tracked files** — CI asserts `go mod tidy` leaves
        `go.mod`/`go.sum` clean and that `packaging/server.yaml.generated`
-       (written by the server config's sed before-hook) stays gitignored.
-       A tracked-file mutation between invocation N and N+1 would fail
-       goreleaser's dirty-check on the second invocation.
+       (written by the server config's sed before-hook) stays gitignored,
+       since a tracked-file mutation would fail goreleaser's dirty-check.
    - Mints a release-bot App token scoped to `charliek/apt-charliek`,
      gated on `ship_server` — the only apt-carrying component.
    - Dispatches `event_type=publish` to apt-charliek with
-     `client_payload[package]=shed-server` (`if: ship_server`);
-     host-agent has no apt dispatch (brew-only). Retry loop with stderr
-     capture for diagnosability. The dispatch is a freshness nudge only
-     — see "The apt reality" above; the split
-     configs (no assets built for an unshipped component) are what
-     actually keeps it out of apt's scan.
+     `client_payload[package]=shed-server` (`if: ship_server`). Retry
+     loop with stderr capture for diagnosability. The dispatch is a
+     freshness nudge only — see "The apt reality" above; building no
+     assets for an unshipped component is what actually keeps it out of
+     apt's scan.
 
    `workflow_dispatch` (manual republish) re-runs only the
    image-publish chain; the `release` job is gated on `tag-push`
@@ -426,11 +425,10 @@ fails, and the seam is proven ignored without the self-test flag.
    has a permanent legacy-dispatch shim that detects the missing
    `ship_server=` line and maps that old script's single combined-Go
    output onto
-   `ship_server`/`ship_host_agent`/`ship_goreleaser` together, so
-   old-tag republishes keep working unchanged. (When a post-migration,
-   pre-retirement tag's own script emits `ship_machine_rc=true`, the job
-   fails loudly on a tag push and warns on a dispatch republish — see
-   the retired-component note under "Component selection".)
+   `ship_server`/`ship_goreleaser` together, so
+   old-tag republishes keep working unchanged. (A tag's own script that
+   emits a retired component's line is handled as "Retired components"
+   above describes.)
 
    **One republish is deliberately NOT idempotent, and is refused.** The
    macOS client changed implementation at **0.9.0** (Swift → Tauri), so
@@ -455,43 +453,26 @@ The maintainer runs step 1; everything else is automated.
 - `--components server` (default; `go` accepted as a deprecated alias
   that warns on stderr): `.claude-plugin/plugin.json` `.version` (via
   `scripts/set-version.sh`, with a jq-verify safety net)
-- `--components host-agent`: `crates/shed-host-agent/VERSION` (write +
-  grep-verify; a standalone ship-selector, see the cross-selector note
-  below)
 - `--components desktop`: `desktop/VERSION`, `crates/Cargo.toml`
   (`[workspace.package].version`) + `crates/Cargo.lock` regen,
   `desktop/tauri/src-tauri/Cargo.toml` + `tauri.conf.json` +
   `desktop/tauri/src-tauri/Cargo.lock` regen (with a path-dep
   lock-entry verify for `shed-core`/`shed-app`)
 
-Components combine: `--components server,host-agent,desktop` bumps
-all three in one call. `server`/`host-agent` reject a prerelease
-(`-suffix`) version — they are stable-only; a desktop-only prerelease is
-allowed (the Tauri rc-rehearsal path). The retired `machine-rc` token
-and the sunset `sx` token are both hard errors (exit 2) naming the
-retirement / the sunset, so a stale muscle-memory invocation fails with
-the reason rather than as a generic typo.
+Components combine: `--components server,desktop` bumps both in one
+call. `server` rejects a prerelease (`-suffix`) version — it is
+stable-only; a desktop-only prerelease is allowed (the Tauri
+rc-rehearsal path). The retired `machine-rc` token and the sunset `sx`
+token are both hard errors (exit 2) naming the retirement / the sunset,
+so a stale muscle-memory invocation fails with the reason rather than as
+a generic typo; any other token fails as an unknown component (exit 2,
+listing the valid ones).
 
 The Go binaries' version comes from a build-time `-X` ldflag injected
-by GoReleaser via the split config's `builds[].ldflags`
+by GoReleaser via the config's `builds[].ldflags`
 (`.goreleaser.server.yaml`). The Docker images are tagged from
 `GITHUB_REF_NAME` at workflow time. None of
 those need a source-tree bump.
-
-> **Cross-selector subtlety — the Rust `shed-host-agent`.** Its source
-> version (`crates/Cargo.toml [workspace.package].version`) tracks the
-> **desktop** selector (both live in the shared Rust workspace), but the
-> binary **ships on its own `host-agent` selector**
-> (`crates/shed-host-agent/VERSION`, see "Host-agent: Rust binary"
-> below) — the two are intentionally independent and will
-> normally show different values. The shipped `shed-host-agent version`
-> is **not** `CARGO_PKG_VERSION` either way; GoReleaser's `builder: rust`
-> build in `.goreleaser.host-agent.yaml` sets
-> `SHED_HOST_AGENT_VERSION={{ .Version }}` (the tag), which
-> `crates/shed-host-agent/src/version.rs` reads via `option_env!`. So no
-> source bump is needed for the host-agent's shipped version — only its
-> standalone `VERSION` ship-selector. (The sunset `sx` component was the
-> identical story until plan 016 removed it.)
 
 `CHANGELOG.md` is maintained by the release skill for human-readable
 in-repo history, and **the tag's section is the GitHub Release body** on
@@ -502,7 +483,7 @@ next `## Unreleased` or `## v<digit>` heading, so any other `## ` line (an
 upgrade example's, say) stays in the body. **A curated section must not
 contain a line starting `## Unreleased` or `## v<digit>`**: it would end the
 release body there. The `release` job passes it
-to the first shipping goreleaser invocation as `--release-notes`;
+to the server's goreleaser invocation as `--release-notes`;
 `desktop-release-create` passes it as `--notes-file` on a desktop-only
 tag, and `desktop-macos` then appends its notarization line. GoReleaser's
 generated changelog (`changelog: use: github`, filtered: skip `docs:`,
@@ -529,48 +510,6 @@ The folded section **is the release page body**: the `release` job publishes
 exactly what `changelog-section.sh` prints, so it must read as release notes
 from its first line, with any one-time upgrade warning near the top. It must
 not contain a line starting `## Unreleased` or `## v<digit>` (see above).
-
-## Host-agent: Rust binary
-
-`host-agent` ships on its **own** selector
-(`crates/shed-host-agent/VERSION`, see "Component selection" above) —
-it no longer rides the `server`/`go` selector. It's built from the
-**Rust** `crates/shed-host-agent`, with the version injected from the
-tag, via GoReleaser's OSS `builder: rust` in
-`.goreleaser.host-agent.yaml` (which runs `cargo zigbuild`; the
-`release` + `release-snapshot` jobs install `zig` + `cargo-zigbuild`,
-and the `release` job only pays that install cost when
-`ship_host_agent` is true). `builder: prebuilt` is GoReleaser
-**Pro-only** and was not an option.
-
-- **Install identity is unchanged.** Same binary/formula/archive name, same
-  `brew services` `service` block (run args, PATH env, `keep_alive`, log
-  paths), same bundled `extensions.example.yaml` → `etc/shed/extensions.yaml`,
-  same `shed-host-agent status`/`version` surface. The swap only changed where
-  the binary is compiled from. No apt/`.deb` (the host-agent is brew-only).
-- **The Go daemon and its rollback path are retired.** `cmd/shed-host-agent`,
-  the Go goreleaser ids (`shed-host-agent-{darwin,linux}`), and the
-  `hostagent`-filter's `cmd/shed-host-agent/**` CI entry were deleted in plan
-  006 (mtls-cleanup / host-agent sunset). This is a deliberate, explicit
-  waiver of the retirement window this section previously described (**"~2
-  clean releases"**): only **v0.8.0** had shipped the Rust agent when
-  retirement landed here — the maintainer accepted that early, judging the
-  Rust port's differential coverage (see below) sufficient. Source-level
-  rollback (flipping a goreleaser id back to a Go build) **ends with this
-  change** — there is no Go source left in the tree to build.
-- **Post-removal rollback procedure.** If the Rust `shed-host-agent` needs to
-  be rolled back after this point, reinstall the last released formula/bottle
-  that still carries the desired behavior — e.g. `brew install
-  shed-host-agent` pinned at `v0.8.0` (or the prior tag) via the formula's
-  versioned bottle/tap history. There is no source-level revert; this is an
-  install-time pin.
-- **The differential harness became the golden-pinned wire harness.** Every
-  value the Go-vs-Rust differential harness once asserted was recorded as a
-  golden before the Go daemon was deleted, so `tests/host-agent-diff/` keeps
-  its coverage — it now runs the Rust `shed-host-agent` daemon alone against
-  those committed goldens instead of against a live Go process. See
-  `tests/host-agent-diff/README.md` for the mechanics and why the directory
-  and Makefile target still say "diff".
 
 ## Snapshot / dev versioning
 
@@ -706,15 +645,13 @@ RUN_ID=$(gh run list -R charliek/shed --workflow publish-images.yaml \
 gh run rerun "${RUN_ID}" -R charliek/shed --failed
 ```
 
-Each split config runs `release.mode: keep-existing` +
+The server config runs `release.mode: keep-existing` +
 `release.replace_existing_artifacts: true` — a re-run is safe. The
 GitHub Release itself isn't recreated (`keep-existing` finds it already
-exists and leaves the body alone — it was written once, by whichever
-invocation ran first in the original attempt); each re-invocation just
-re-uploads **its own** component's assets, replacing any it had already
-uploaded before the failure rather than erroring on `already_exists`.
-An invocation that never got to run in the failed attempt runs fresh, as
-normal.
+exists and leaves the body alone — it was written once, in the original
+attempt); the re-invocation just re-uploads the server's assets,
+replacing any it had already uploaded before the failure rather than
+erroring on `already_exists`.
 
 **A signing failure in the server build hook** is the one release-only
 failure the gate and the preflight can't rule out. It happens after the
@@ -757,8 +694,8 @@ version on main, even without the sync-version job:
 ```bash
 # Manually fix the drifted manifest(s) on a hotfix branch — include
 # ONLY the components that shipped on vX.Y.Z but whose manifests
-# drifted (bumping all three would falsely mark non-shipping
-# components as released at X.Y.Z):
+# drifted (bumping both would falsely mark a non-shipping
+# component as released at X.Y.Z):
 git checkout -b fix/version-resync
 scripts/release/update-version.sh X.Y.Z --components <drifted components>
 git commit -am "chore(version): resync manifests to vX.Y.Z"
@@ -818,7 +755,7 @@ in the framework repo.
   post-migration replacement for the deleted `sync-version` job (and,
   since plan 002, for the old inline `release` job step too — the
   check now lives entirely in `scripts/release/release-plan.sh`, run
-  once up front for all three manifests plus the `**Ships:**`
+  once up front for both manifests plus the `**Ships:**`
   cross-check). The pre-migration flow could tolerate a "tag was
   pushed before the manifest was bumped" state because sync-version
   would fix it after the fact. The current flow REJECTS that state at
@@ -829,12 +766,12 @@ in the framework repo.
 - **GoReleaser pin**: `goreleaser-action@v7` is pinned to `version:
   v2.15.3` everywhere it's invoked (the `release` job here, ci.yml's
   `release-snapshot` job, `server-signing-dry-run.yml`, and `.mise.toml`
-  for local `make snapshot-server` / `make snapshot-host-agent` runs) — the
+  for local `make snapshot-server` runs) — the
   split-config model was spiked and proven against this line. v2.15.3
   ships the secret-redaction fix that prevents secrets from leaking
   into logs, so it's the security floor;
-  it's still **below** v2.16, where `brews:` (used by both split
-  configs) is **hard-deprecated**, so the pin keeps `brews:` functional
+  it's still **below** v2.16, where `brews:` (used by the server
+  config) is **hard-deprecated**, so the pin keeps `brews:` functional
   while deliberately deferring that migration. A `brews:` →
   `homebrew_casks:` rewrite is named future work, not scoped here.
 - **No `ci-gate` job in the release pipeline**: the inline `go test` +

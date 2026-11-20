@@ -1217,22 +1217,17 @@ release:
 	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/shed-firstboot-linux-amd64 ./cmd/shed-firstboot
 	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/shed-firstboot-linux-arm64 ./cmd/shed-firstboot
 
-# Local goreleaser snapshot of ONE release component — the pre-CI proof that
-# .goreleaser.<component>.yaml still builds its targets and renders its deb /
-# brew formula. `make snapshot-server`, `snapshot-host-agent`.
+# Local goreleaser snapshot of a goreleaser release component — the pre-CI
+# proof that .goreleaser.<component>.yaml still builds its targets and renders
+# its deb / brew formula. `make snapshot-server` (the only one).
 # Mirrors what ci.yml's release-snapshot job runs.
 #
 # goreleaser comes from .mise.toml pinned to CI's exact version (a local
-# snapshot that predicts CI has to run CI's goreleaser), and so is zig, matched
-# to scripts/release/install-zig.sh. Setup is `mise install` plus two
-# cargo-side prerequisites for the Rust components:
-#
-#   cargo install --locked --version 0.23.0 cargo-zigbuild
-#   rustup target add x86_64-apple-darwin \
-#                     aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+# snapshot that predicts CI has to run CI's goreleaser). Setup is
+# `mise install`.
 #
 # `check` alone (config validation, no build) is the cheap subset:
-#   mise exec -- goreleaser check -f .goreleaser.host-agent.yaml
+#   mise exec -- goreleaser check -f .goreleaser.server.yaml
 #
 # A pattern rule, so it needs no .PHONY entry (pattern rules never match a
 # real file here — there is no `snapshot-*` on disk).
