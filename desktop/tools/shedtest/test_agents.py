@@ -5,9 +5,10 @@ list, launch, close and inject them.
 sessions used to be a UNION — the hub's rows, listed by ssh'ing `shed-ext-rc`
 into the shed, beside the tabs its `roost-session` reported. The guest binary,
 the server's routes and the Go engine are gone, so what is left is the roost
-half: `rc.list` returns it, `rc.launch` is `roost.launch` addressed by
-`{shed, host?}` (an alias kept for 0.9.x), `rc.kill` is a `tab.close`, and
-`rc.inject_test` puts a row into the roost snapshot.
+half: `rc.list` returns it, a shed is launched with `roost.launch` on
+`roost:<server>/<shed>` (its 0.9.x alias `rc.launch` was removed in 0.10.0),
+`rc.kill` is a `tab.close`, and `rc.inject_test` puts a row into the roost
+snapshot.
 
 **Hermetic, and genuinely exercising the real code.** The app is launched with
 the test-mode `SHED_TAURI_ROOST_SOCKETS` seam — which swaps roost's SSH
@@ -207,14 +208,13 @@ def test_a_filtered_list_narrows_to_that_shed(app):
 # ---- launch / kill -------------------------------------------------------
 
 def test_launch_lists_and_kill_closes_the_tab(app, shed_roost):
-    """`rc.launch` → a roost `tab.open` on the shed, `rc.kill` → its `tab.close`.
+    """`roost.launch` on the shed's target → a roost `tab.open` on the shed,
+    `rc.kill` → its `tab.close`.
 
-    The alias is addressed by `{shed, host?}`; everything under it is the same
-    path `roost.launch` takes, so the launched row carries the same origin stamp
-    the listed ones do.
+    The launched row carries the same origin stamp the listed ones do.
     """
-    launched = app.call("rc.launch", {"shed": SHED, "kind": "opencode",
-                                      "workdir": "/home/shed/fresh"})
+    launched = app.call("roost.launch", {"target": TARGET, "kind": "opencode",
+                                         "workdir": "/home/shed/fresh"})
     slug = launched["slug"]
     try:
         assert launched["origin"] == TARGET
@@ -247,8 +247,19 @@ def test_launch_refuses_a_kind_this_build_does_not_know(app):
     LAUNCH one — the far side would be asked to run something this build has
     never heard of."""
     with pytest.raises(ShedError) as exc:
-        app.call("rc.launch", {"shed": SHED, "kind": "borg"})
+        app.call("roost.launch", {"target": TARGET, "kind": "borg"})
     assert exc.value.code == "bad_request"
+
+
+def test_rc_launch_is_an_unknown_op(app, shed_roost):
+    """The 0.9.x alias `rc.launch {shed}` was removed in 0.10.0: it answers the
+    IPC's unknown-op error and opens nothing."""
+    opens = len(shed_roost.opens)
+    with pytest.raises(ShedError) as exc:
+        app.call("rc.launch", {"shed": SHED, "kind": "opencode"})
+    assert exc.value.code == "unknown_op", exc.value
+    assert exc.value.message == "unknown op: rc.launch", exc.value
+    assert len(shed_roost.opens) == opens, "a removed op opened a tab"
 
 
 def test_kill_refuses_a_slug_that_is_not_a_tab_id(app):

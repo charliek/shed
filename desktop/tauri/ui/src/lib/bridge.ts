@@ -1284,7 +1284,7 @@ export type RcLaunchFields = {
   workdir?: string;
 };
 
-/** Launch a session IN A SHED — the `rc.launch` alias, which is
+/** Launch a session IN A SHED — the `rc_launch` command, which is
  *  [machineLaunch] on the shed's roost host since S6. THROWS a coded
  *  [LaneFailure] on error (the dialog shows its message) — unlike the
  *  swallowing `invoke`, because a launch failure must be shown. */

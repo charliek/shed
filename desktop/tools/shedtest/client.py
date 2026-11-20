@@ -217,9 +217,10 @@ class _RcOps:
 
     **All four are roost ops since S6** (charliek/shed#328): a shed's agent
     sessions are the tabs its own `roost-session` reports, so `rc.list` returns
-    that and only that, `rc.launch` is `roost.launch` addressed by `{shed, host?}`
-    (an alias kept for 0.9.x), `rc.kill` is a `tab.close`, and `rc.inject_test`
-    puts a row into the roost snapshot. `self.call` comes from the `IPCClient`
+    that and only that, a shed is launched with `roost.launch` on
+    `roost:<server>/<shed>` (the 0.9.x alias `rc.launch` was removed in 0.10.0),
+    `rc.kill` is a `tab.close`, and `rc.inject_test` puts a row into the roost
+    snapshot. `self.call` comes from the `IPCClient`
     base each mixes in with.
 
     The pure pane-classifier op and its `rc_classify` helper went with S2
@@ -232,19 +233,6 @@ class _RcOps:
         if shed:
             params["shed"] = shed
         return self.call("rc.list", params)["sessions"]
-
-    def rc_launch(self, shed: str, kind: str = "claude-rc", host: str | None = None,
-                  display_name: str | None = None, initial_prompt: str | None = None) -> dict:
-        params: dict = {"shed": shed, "kind": kind}
-        if host:
-            params["host"] = host
-        if display_name:
-            params["display_name"] = display_name
-        # Include whenever non-None (not just truthy) so negative tests can send a
-        # deliberately bad value (e.g. a control char) through to the op.
-        if initial_prompt is not None:
-            params["initial_prompt"] = initial_prompt
-        return self.call("rc.launch", params)
 
     def rc_kill(self, shed: str, slug: str, host: str | None = None) -> None:
         params: dict = {"shed": shed, "slug": slug}

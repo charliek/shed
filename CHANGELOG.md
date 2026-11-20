@@ -874,6 +874,9 @@ reachable from other hosts runs `mtls`.
   --refetch` on such an entry (written before mtls, or edited by hand) used to re-read the
   TLS certificate over HTTPS; it now dials nothing and says to add the server again: `shed
   server remove NAME`, then `shed server add HOST --name NAME`.
+- **Desktop: the IPC op `rc.launch`**, the alias for `roost.launch` kept for 0.9.x scripts. It
+  now answers `unknown_op`. Launch in a shed with `roost.launch` and `target:
+  roost:HOST/SHED`. The app's own launch dialog is unchanged.
 - **Desktop: the broker modes.** The app always runs its own broker: the Preferences mode
   setting, the IPC operations `broker.mode` and `broker.set_mode`, the `identify` reply's
   `broker_mode` and the mode fields of `broker.status` are gone. A stored mode choice in

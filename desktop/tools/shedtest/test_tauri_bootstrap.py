@@ -1194,12 +1194,6 @@ def test_a_sheds_rows_are_roosts_and_a_filter_returns_them(boot, rig, mock):
     # binary, resolved by roost on the far side.
     assert opened["argv"] == ["opencode"], opened
 
-    # `rc.launch {shed}` is the SAME op under its pre-S6 name — an alias kept
-    # for 0.9.x — so it lands on the same host and stamps the same origin.
-    alias = boot.call("rc.launch", {"shed": shed, "kind": "opencode"})
-    assert alias["origin"] == target, alias
-    assert alias["source"] == "roost", alias
-
     # Wait for the WATCHER's own snapshot rather than reading the optimistic row
     # `roost.launch` inserted: the claim is about what a listing says, and the
     # adapter-claimed tab is what makes a row survive a resync.
@@ -1237,18 +1231,17 @@ def test_a_first_prompt_or_permission_mode_is_refused_on_a_shed(boot, rig, mock)
     026 §3.5) — the `roost:<server>/<shed>` twin of `test_tauri_machines.py`'s
     machine-form cell, over the real bridge.
 
-    Every door a shed is addressed through: `rc.launch {shed}` (the pre-S6 op,
-    which can only name a shed) and `roost.launch`/`machine.launch` by the
-    grammar token. The last launch is the control: the same shed, asked for what
-    a roost launch does, opens a tab — so the zero `tab.open` above is the
-    refusal's, not a shed that could not have opened anything. It carries a name,
+    Every door a shed is addressed through: `roost.launch`/`machine.launch` by
+    the grammar token (the pre-S6 `rc.launch {shed}` was removed in 0.10.0).
+    The last launch is the control: the same shed, asked for what a roost
+    launch does, opens a tab — so the zero `tab.open` above is the refusal's,
+    not a shed that could not have opened anything. It carries a name,
     which is the shed path's half of the title rule.
     """
     shed = "p26-refused"
     fake = rig.roost()
     target = rig.host(shed, identity=IDENTITY_CURRENT, running=True, roost=fake)
     doors = [
-        ("rc.launch", {"shed": shed}),
         ("roost.launch", {"target": target}),
         ("machine.launch", {"target": target}),
     ]

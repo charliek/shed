@@ -303,9 +303,10 @@ fn bad_launch(message: String) -> String {
     roost_hosts::LaunchError::BadRequest(message).command_string()
 }
 
-/// Launch a session IN a shed — an alias for [`machine_launch`] on the shed's
-/// roost host since S6, kept for 0.9.x. Same `tab.open`, addressed by
-/// `{shed, host?}` rather than by machine name, and the same coded error.
+/// Launch a session IN a shed — the UI's door onto [`machine_launch`] on the
+/// shed's roost host since S6. Same `tab.open`, addressed by `{shed, host?}`
+/// rather than by machine name, and the same coded error. (The IPC op of the
+/// same name, `rc.launch`, was removed in 0.10.0; this command stays.)
 ///
 /// **Every launch field is declared, the refused ones included** (plan 026
 /// §3.5): Tauri extracts only the arguments a command names and drops the rest

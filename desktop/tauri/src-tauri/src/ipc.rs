@@ -1173,7 +1173,6 @@ impl Handler {
             "terminal.open" => self.terminal_open(params),
             "terminal.presets" => Ok(self.terminal_presets()),
             "rc.list" => self.rc_list(params).await,
-            "rc.launch" => self.rc_launch(params).await,
             "rc.kill" => self.rc_kill(params).await,
             "rc.inject_test" => self.rc_inject_test(params),
             "machines.list" => Ok(self.machines_list()),
@@ -1755,10 +1754,9 @@ impl Handler {
     /// sheds. `machine.launch {machine, …}` is the same op under its old name
     /// and its old parameter, kept as an alias.
     ///
-    /// **`rc.launch {shed}` IS this op** since S6 (`charliek/shed#328`): the
-    /// shed launch was hub/tmux until then, and plan 019 §3.6 deliberately kept
-    /// the two apart while that was true. Now there is one launch path, and
-    /// [`Self::rc_launch`] is a second door onto it, held open for 0.9.x.
+    /// Since S6 (`charliek/shed#328`) a shed is launched here too, as
+    /// `roost:<server>/<shed>`. Its pre-S6 alias `rc.launch {shed}`, held open
+    /// for 0.9.x clients, was removed in 0.10.0 and answers `unknown_op`.
     ///
     /// `kind` and `workdir` are the `tab.open`, and a `display_name` is set as
     /// the tab's title after it (the row's `title` says whether it took); an
@@ -2214,38 +2212,6 @@ impl Handler {
             .map_err(|e| err("bad_request", e.to_string()))?
             .server_name;
         Ok(format!("roost:{server}/{shed}"))
-    }
-
-    /// `rc.launch {shed, kind, host?, display_name?, workdir?, permission_mode?,
-    /// initial_prompt?}` → the opened row, under [`Self::roost_launch`]'s rule:
-    /// a name is set as the tab's title, a first prompt or a permission mode is
-    /// refused `bad_request`.
-    ///
-    /// **An ALIAS for [`Self::roost_launch`] since S6** (`charliek/shed#328`),
-    /// kept for 0.9.x: it is the same `tab.open` on the same host, addressed by
-    /// `{shed, host?}` instead of by `target`. The two ops were genuinely
-    /// different things while a shed launch was hub/tmux — now there is one
-    /// launch path and this is a second door onto it, held open so a client
-    /// written against the pre-S6 op keeps working through the release that
-    /// removes the hub.
-    async fn rc_launch(&self, params: &Value) -> Result<Value, (String, String)> {
-        let target = self.shed_target(params)?;
-        let kind = rc_kind(params)?;
-        let opt = |k: &str| params.get(k).and_then(Value::as_str);
-        self.machines
-            .launch(
-                &target,
-                &kind,
-                opt("display_name"),
-                opt("workdir"),
-                // TYPED, unlike the fields above: a first prompt or a mode in
-                // some other JSON shape is still one, and reading it as absent
-                // would drop it silently (plan 026 §3.5).
-                opt_str(params, "permission_mode")?,
-                opt_str(params, "initial_prompt")?,
-            )
-            .await
-            .map_err(launch_failure)
     }
 
     /// `rc.kill {shed, slug, host?}` → close the shed's roost tab.
