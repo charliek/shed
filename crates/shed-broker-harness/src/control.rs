@@ -73,14 +73,13 @@ impl Hub {
 /// The JSON line the subscriber is sent for one bridge frame: `approval_request`
 /// (the request as the app receives it; `server` left out when empty, as in
 /// single-server mode) or `event` (the audit row the bridge fans in; absent fields
-/// left out). Any other frame the bridge never sends: `None`.
-pub fn frame_json(frame: &BrokerFrame) -> Option<String> {
+/// left out).
+pub fn frame_json(frame: &BrokerFrame) -> String {
     let value = match frame {
         BrokerFrame::ApprovalRequest(req) => approval_request_json(req),
         BrokerFrame::Event(ev) => event_json(ev),
-        _ => return None,
     };
-    Some(value.to_string())
+    value.to_string()
 }
 
 fn approval_request_json(req: &ApprovalRequest) -> Value {
@@ -125,9 +124,7 @@ fn event_json(ev: &AuditEventFrame) -> Value {
 pub async fn pump(mut events: mpsc::UnboundedReceiver<BrokerEvent>, hub: Arc<Hub>) {
     while let Some(event) = events.recv().await {
         if let BrokerEvent::Frame(frame) = event {
-            if let Some(line) = frame_json(&frame) {
-                hub.push(line);
-            }
+            hub.push(frame_json(&frame));
         }
     }
 }
@@ -482,7 +479,7 @@ mod tests {
             detail: "SSH sign request".into(),
             expires_at: "2026-01-01T00:00:25Z".into(),
         };
-        let line = frame_json(&BrokerFrame::ApprovalRequest(req.clone())).unwrap();
+        let line = frame_json(&BrokerFrame::ApprovalRequest(req.clone()));
         let value: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
             value,
@@ -497,7 +494,7 @@ mod tests {
             server: "server-b".into(),
             ..req
         };
-        let line = frame_json(&BrokerFrame::ApprovalRequest(named)).unwrap();
+        let line = frame_json(&BrokerFrame::ApprovalRequest(named));
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap()["server"],
             "server-b"
@@ -517,7 +514,7 @@ mod tests {
             request_id: None,
             ts: Some("2026-01-01T00:00:01Z".into()),
         };
-        let line = frame_json(&BrokerFrame::Event(ev)).unwrap();
+        let line = frame_json(&BrokerFrame::Event(ev));
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap(),
             json!({
@@ -525,6 +522,5 @@ mod tests {
                 "result": "denied", "approval": "shed-desktop", "ts": "2026-01-01T00:00:01Z",
             })
         );
-        assert_eq!(frame_json(&BrokerFrame::Ping { id: "p".into() }), None);
     }
 }

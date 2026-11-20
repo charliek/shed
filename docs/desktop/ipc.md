@@ -47,8 +47,7 @@ fails there.
 
 **Per-host failures.** A host whose sheds can't be listed is reported rather than dropped:
 `host_errors[]` carries `{server, kind, summary, detail}` per failed host, where `kind` is
-`agent_upgrade_required` (shed-host-agent is too old to obtain a certificate) or `other`,
-`summary` is the one-line remedy-first text, and `detail` is the hover/log body. It is always
+`other`, `summary` is the one-line text naming the host, and `detail` is the hover/log body. It is always
 present — `[]` when every host is healthy. The UI-truth op `dashboard.dump` returns
 `{rows, host_errors, empty}`: the rendered shed rows (each with the `status_text` and
 `controls` its card shows, [below](#ui-truth-ops)), the failures the shell holds, and the

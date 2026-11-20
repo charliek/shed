@@ -83,14 +83,9 @@ use crate::tls::{certified_key_from_pem, ClientCertResolver};
 ///
 /// These live in `shed-core` (rather than in one of the layers above it)
 /// because every credential mapper the clients ship must enforce the SAME
-/// numbers: `shed-app`'s `token_minter::credential_from_parts` (UDS + embedded
-/// broker) re-exports these constants — a cap that differed by crate would be a
-/// cross-client divergence.
-///
-/// A mapper that cannot import Rust constants is pinned to the same numbers by
-/// the shared
-/// `tests/broker-wire/fixtures/desktop-credential/credential_response.json`
-/// `limits` block, which every language asserts against.
+/// numbers: `shed-app`'s `credential_shape::credential_from_parts` (the
+/// embedded broker's mapper) reads these constants — a cap that differed by
+/// crate would be a cross-client divergence.
 pub mod limits {
     pub const MAX_TOKEN_BYTES: usize = 4 * 1024;
     pub const MAX_CLIENT_CERT_BYTES: usize = 64 * 1024;
@@ -232,8 +227,7 @@ impl CredentialRequest {
 }
 
 /// The mint primitive: request a fresh CONTROL credential for `server`.
-/// Implemented by the app's UDS minter, the embedded broker, the
-/// mobile bridge, or a test mock. A failure (Err) is fail-closed — the provider
+/// Implemented by the embedded broker, the mobile bridge, or a test mock. A failure (Err) is fail-closed — the provider
 /// surfaces it and the caller sends no credential.
 ///
 /// **Extending an implementation for mtls** (plan 001 D5): override

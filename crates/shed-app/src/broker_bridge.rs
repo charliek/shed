@@ -1,28 +1,26 @@
 //! The embedded broker bridge (leg 3a.2): the desktop app's credential broker, a
 //! `shed_broker::Supervisor` running on the app's own tokio runtime.
 //!
-//! It presents the SAME Coordinator-facing surface the external-mode client does:
+//! It presents the Coordinator-facing surface:
 //!   * an [`mpsc::UnboundedReceiver<BrokerEvent>`] the [`Coordinator`] consumes via
 //!     [`Coordinator::spawn`](crate::coordinator::Coordinator::spawn) — carrying a
-//!     synthesized `Connected(HelloAck)` (so the approvals UI sections light up exactly
-//!     as in external mode), plus each broker approval-request as a `Frame` and each
-//!     audit row (fanned in from the broker) as an `Event` frame;
+//!     synthesized `Connected { gate_namespaces }` (so the approvals UI sections light
+//!     up), plus each broker approval-request as a `Frame` and each audit row (fanned
+//!     in from the broker) as an `Event` frame;
 //!   * a synchronous [`Responder`] the Coordinator calls inside its atomic decision
 //!     handler (bounded-`mpsc` handoff → the bridge's async side completes the matching
 //!     `oneshot`, so nothing awaits under the actor lock);
 //!   * a [`TokenMinter`] adapter over the broker's `ControlTokenProvider` for the
 //!     Backend's secure-server credential vend — mtls-capable (plan 002 §7 P2): it
 //!     relays the shed-core provider's CSR into the broker's control-credential mint,
-//!     so an embedded-broker app enrolls against an mtls server exactly as an
-//!     external-agent one does.
+//!     so the app enrolls against an mtls server.
 //!
 //! **Deadlock-free** (the §3.2 analysis): the Coordinator is two-phase (never awaits the
 //! gate inline) and `Responder` is synchronous, so `AppGate`-awaits-oneshot /
 //! `Responder`-completes-oneshot has no cycle.
 //!
-//! **No replay buffer:** the UDS hello's `replay_events: 50` has no embedded analogue.
-//! Post-restart activity comes from the app's own `AuditStore`, not a broker ring —
-//! documented and accepted (§3.2).
+//! **No replay buffer:** post-restart activity comes from the app's own `AuditStore`,
+//! not a broker ring — documented and accepted (§3.2).
 
 use std::collections::HashMap;
 use std::io;
@@ -34,9 +32,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use shed_core::approval::protocol::{AuditEventFrame, BrokerFrame};
-use shed_core::approval::{
-    ApprovalDecision, ApprovalRequest, DecidedBy, HelloAck, CAP_CREDENTIAL_GET,
-};
+use shed_core::approval::{ApprovalDecision, ApprovalRequest, DecidedBy};
 use shed_core::http::ShedError;
 use shed_core::token::{CredentialRequest, MintedCredential, MintedToken, TokenMinter};
 
@@ -44,7 +40,7 @@ use shed_broker::approval::{select_builtin_gate, ApprovalGate, ApprovalOutcome};
 use shed_broker::audit::{AuditEntry as BrokerAuditEntry, AuditFanout, AuditSink, JsonlAuditSink};
 use shed_broker::config::{
     DiscoveryConfig, ExtensionsYaml, DEFAULT_DISCOVERY_SOURCE, NS_AWS_CREDENTIALS,
-    NS_DOCKER_CREDENTIALS, NS_EGRESS, NS_SSH_AGENT,
+    NS_DOCKER_CREDENTIALS, NS_SSH_AGENT,
 };
 use shed_broker::controltoken::{
     ControlCredentialMinter, ControlTokenMinter, ControlTokenProvider, MintedControlCredential,
@@ -57,11 +53,10 @@ use shed_broker::{
     aws_backend, bus, docker_backend, minter as broker_minter, ssh_backend, watcher,
 };
 
-use crate::host_agent::BrokerEvent;
+use crate::broker_event::BrokerEvent;
+// The credential-shape rules — see `map_embedded_credential`.
+use crate::credential_shape::{credential_from_parts, expiry_unix, minted_token, CredentialParts};
 use crate::timefmt;
-// The credential-shape rules are the UDS minter's, shared verbatim — see
-// `map_embedded_credential`.
-use crate::token_minter::{credential_from_parts, expiry_unix, minted_token, CredentialParts};
 use crate::traits::{system_clock, ClockRef, Responder, ResponderRef};
 
 /// The known_hosts pin the control-token minter bootstraps over (parity with the
@@ -357,10 +352,10 @@ impl Responder for BridgeResponder {
         };
         // A full queue (wedged consumer) or closed queue (consumer gone) → drop the
         // decision; the AppGate then fails CLOSED on its own timeout (the bus denies by
-        // timeout — never a bypass; same class as the UDS respond-while-disconnected
-        // no-op). We must never block the Coordinator's atomic handler, so the drop is
-        // accepted (§RESPOND_QUEUE_CAP) — but it is LOUDLY logged so an audited approve
-        // whose decision never reached the gate is diagnosable.
+        // timeout — never a bypass). We must never block the Coordinator's atomic
+        // handler, so the drop is accepted (§RESPOND_QUEUE_CAP) — but it is LOUDLY
+        // logged so an audited approve whose decision never reached the gate is
+        // diagnosable.
         if let Err(e) = self.tx.try_send(msg) {
             let cause = match e {
                 mpsc::error::TrySendError::Full(_) => "queue full",
@@ -429,9 +424,9 @@ fn audit_entry_to_event_frame(e: &BrokerAuditEntry) -> AuditEventFrame {
 // ---------------------------------------------------------------------------
 
 /// Adapts the broker's control-credential seams onto shed-core's [`TokenMinter`], so
-/// the Backend's secure-server vend calls the in-process provider directly instead of
-/// going out over the UDS. Fail-closed: a mint error surfaces as `Err`, so the FSM sends
-/// NO credential (parity with [`crate::HostAgentTokenMinter`]). Bus-independent +
+/// the Backend's secure-server vend calls the in-process provider directly.
+/// Fail-closed: a mint error surfaces as `Err`, so the FSM sends NO credential.
+/// Bus-independent +
 /// synchronously constructible, so it exists BEFORE the Backend (§3.2).
 ///
 /// Both halves of the contract are implemented (plan 002 §7 P2):
@@ -465,16 +460,12 @@ impl EmbeddedTokenMinter {
 
 #[async_trait]
 impl TokenMinter for EmbeddedTokenMinter {
-    /// Capability, and here it is a STATIC one — the deliberate difference from
-    /// [`crate::HostAgentTokenMinter`], which has to ask the socket what the agent on
-    /// the other end can do.
-    ///
-    /// There is no other end: the broker is this build, linked into this process, and
-    /// the credential path is compiled in right here. Version skew — the thing the UDS
-    /// capability handshake exists to absorb — cannot occur, so advertising anything
-    /// but `true` would make the provider withhold a CSR from a minter that can always
-    /// relay one, and an mtls server would answer the resulting CSR-less bootstrap with
-    /// its "upgrade the app" refusal.
+    /// Capability, and here it is a STATIC one: the broker is this build, linked into
+    /// this process, and the credential path is compiled in right here, so no version
+    /// skew can occur. Advertising anything but `true` would make the provider
+    /// withhold a CSR from a minter that can always relay one, and an mtls server
+    /// would answer the resulting CSR-less bootstrap with its "upgrade the app"
+    /// refusal.
     fn supports_mtls(&self) -> bool {
         true
     }
@@ -512,10 +503,9 @@ impl TokenMinter for EmbeddedTokenMinter {
             .mint_control(server)
             .await
             .map_err(ShedError::Config)?;
-        // Same guards as the UDS minter's `map_response`, because they are the same
-        // functions: fail-closed on an empty token (an `Ok(MintedControlToken { token:
-        // "" })` must never become a valid-looking blank token), and an
-        // absent/unparseable expiry → None → the provider caches until invalidate().
+        // Fail-closed on an empty token (an `Ok(MintedControlToken { token: "" })` must
+        // never become a valid-looking blank token), and an absent/unparseable expiry →
+        // None → the provider caches until invalidate().
         minted_token(
             minted.token,
             expiry_unix(minted.expires_at.as_deref()),
@@ -527,12 +517,9 @@ impl TokenMinter for EmbeddedTokenMinter {
 /// Map a broker [`MintedControlCredential`] onto shed-core's [`MintedCredential`], or a
 /// fail-closed `Err`. Pure, so every shape is unit-tested without a live SSH mint.
 ///
-/// The in-process sibling of the UDS reply mapper (`token_minter.rs`), and identical in
-/// its rules BY CONSTRUCTION: this only normalizes the broker's struct into
-/// [`CredentialParts`] and hands it to the shared [`credential_from_parts`], which is
-/// where the mode/fail-closed rules live. Nothing here may add a rule of its own — the
-/// two paths feed the SAME provider FSM, so a divergence would mean the app behaved
-/// differently in embedded mode than in external mode against the same server.
+/// This only normalizes the broker's struct into [`CredentialParts`] and hands it to
+/// [`credential_from_parts`] (`credential_shape.rs`), which is where the
+/// mode/fail-closed rules live; nothing here adds a rule of its own.
 fn map_embedded_credential(
     minted: MintedControlCredential,
     server: &str,
@@ -792,7 +779,7 @@ impl EmbeddedBroker {
 
     /// Phase 2 (async, in a tokio runtime): resolve the SSH backend, build the
     /// `SharedDeps` supervisor, spawn the watch/reconcile loop on the current runtime,
-    /// and emit the synthesized `Connected(HelloAck)`. On SSH-resolve failure returns
+    /// and emit the synthesized `Connected`. On SSH-resolve failure returns
     /// `Err(BrokerError::SshBackend)` (broker NOT started, but token minting still works
     /// — the Backend already holds the minter).
     ///
@@ -960,26 +947,11 @@ impl EmbeddedBroker {
         });
         *self.watch_task.lock().unwrap() = Some(task);
 
-        // Synthesize the Connected(HelloAck) so the approvals UI sections light up exactly
-        // as in external mode (no replay buffer — post-restart activity comes from the
-        // app's AuditStore).
-        let ack = HelloAck {
-            namespaces: vec![
-                NS_SSH_AGENT.to_string(),
-                NS_AWS_CREDENTIALS.to_string(),
-                NS_DOCKER_CREDENTIALS.to_string(),
-                NS_EGRESS.to_string(),
-            ],
+        // Synthesize the Connected so the approvals UI sections light up (no replay
+        // buffer — post-restart activity comes from the app's AuditStore).
+        let _ = self.inner.event_tx.send(BrokerEvent::Connected {
             gate_namespaces: cfg.gate_namespaces(),
-            // The EMBEDDED broker is the same build as the app, so there is no
-            // version skew to describe here — but the synthesized ack must still
-            // advertise what the app can rely on, or capability-gated paths would
-            // work in external mode and silently refuse in embedded mode.
-            agent_capabilities: vec![CAP_CREDENTIAL_GET.to_string()],
-            request_timeout_ms: cfg.approval_timeout().as_millis() as i64,
-            accepted: true,
-        };
-        let _ = self.inner.event_tx.send(BrokerEvent::Connected(ack));
+        });
 
         Ok(())
     }
@@ -1617,10 +1589,8 @@ mod tests {
             .unwrap()
             .unwrap();
         match ev {
-            BrokerEvent::Connected(ack) => {
-                assert!(ack.accepted);
-                assert_eq!(ack.gate_namespaces, vec!["ssh-agent".to_string()]);
-                assert_eq!(ack.request_timeout_ms, 25_000); // default approval_timeout
+            BrokerEvent::Connected { gate_namespaces } => {
+                assert_eq!(gate_namespaces, vec!["ssh-agent".to_string()]);
             }
             other => panic!("expected Connected, got {other:?}"),
         }
@@ -1960,7 +1930,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(ev, BrokerEvent::Connected(_)), "{ev:?}");
+        assert!(matches!(ev, BrokerEvent::Connected { .. }), "{ev:?}");
         let why = agent
             .machine_identity()
             .expect("load attempted at spawn")
@@ -1995,7 +1965,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(ev, BrokerEvent::Connected(_)),
+            matches!(ev, BrokerEvent::Connected { .. }),
             "first spawn Connected"
         );
         let sup_after_first = agent.supervisor.lock().unwrap().clone();
@@ -2103,7 +2073,7 @@ mod tests {
     }
 
     // (FIX 1) An Ok mint carrying an EMPTY token is fail-closed — never a valid
-    // MintedToken (parity with token_minter.rs's `missing_or_empty_token_is_fail_closed`).
+    // MintedToken.
     #[tokio::test]
     async fn token_minter_fails_closed_on_empty_token() {
         use shed_broker::controltoken::MintedControlToken;
@@ -2271,8 +2241,8 @@ mod tests {
         );
     }
 
-    // Fail-closed on every answer that cannot authenticate — the embedded twin of
-    // `token_minter.rs`'s UDS-reply guards, so the two modes behave identically.
+    // Fail-closed on every answer that cannot authenticate (the shape rules are
+    // `credential_shape.rs`'s; its own tests cover the arms this stand-in cannot reach).
     #[tokio::test]
     async fn credential_minter_fails_closed_on_unusable_answers() {
         // (a) an mtls answer with no certificate
@@ -2310,8 +2280,7 @@ mod tests {
 
         // (b2) a token answer that ALSO carries a certificate: the shapes are
         // mutually exclusive, so this is a protocol violation rather than a
-        // "token mode with a blank token" — the embedded path gets the same rule
-        // 6 the UDS path does, because it is literally the same function.
+        // "token mode with a blank token" (rule 6 of `credential_from_parts`).
         let creds = RecordingCredentials::answering(MintedControlCredential {
             auth_mode: "token".into(),
             token: String::new(),

@@ -2914,19 +2914,12 @@ mod tests {
 
     #[test]
     fn sheds_payload_carries_host_errors_for_two_failed_hosts() {
-        // The shape shed#300 needs: one host that needs a host-agent upgrade and
-        // one generic failure, BOTH present — the singular shape couldn't
-        // represent two failed hosts (plan 006 D6).
+        // The shape shed#300 needs: two failed hosts, BOTH present — the singular
+        // shape couldn't represent two failed hosts (plan 006 D6).
         let r = reachability(
             &[("mock", "alpha")],
             &[
-                (
-                    "mini2",
-                    ShedError::AgentUpgradeRequired {
-                        server: "mini2".into(),
-                        detail: "the installed shed-host-agent has no credential.get".into(),
-                    },
-                ),
+                ("mini2", ShedError::Transport("connection refused".into())),
                 ("mini3", ShedError::BadStatus(500)),
             ],
         );
@@ -2943,19 +2936,16 @@ mod tests {
             .expect("host_errors is an array");
         assert_eq!(errs.len(), 2, "both failed hosts survive: {p}");
         assert_eq!(errs[0]["server"], "mini2");
-        assert_eq!(errs[0]["kind"], "agent_upgrade_required");
+        assert_eq!(errs[0]["kind"], "other");
         assert!(
-            errs[0]["summary"]
-                .as_str()
-                .unwrap()
-                .starts_with("Upgrade shed-host-agent"),
-            "the summary must lead with the remedy: {}",
+            errs[0]["summary"].as_str().unwrap().starts_with("mini2: "),
+            "the summary must name its host: {}",
             errs[0]["summary"]
         );
         assert!(errs[0]["detail"]
             .as_str()
             .unwrap()
-            .contains("credential.get"));
+            .contains("connection refused"));
         assert_eq!(errs[1]["server"], "mini3");
         assert_eq!(errs[1]["kind"], "other");
         assert!(!errs[1]["summary"].as_str().unwrap().is_empty());

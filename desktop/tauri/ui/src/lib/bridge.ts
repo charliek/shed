@@ -35,9 +35,8 @@ export type Shed = {
   memory_mb?: number | null;
 };
 
-/** Why a host couldn't be listed. `agent_upgrade_required` is the one cause whose
- *  remedy is a user action; `other` is the open set (rendered generically). */
-export type HostFailureKind = "agent_upgrade_required" | "other";
+/** Why a host couldn't be listed. `other` is the open set (rendered generically). */
+export type HostFailureKind = "other";
 
 /** One host's failure in presentation shape (`shed_app::HostFailure`): `summary`
  *  is the one-line strip text with the REMEDY FIRST (strips truncate from the

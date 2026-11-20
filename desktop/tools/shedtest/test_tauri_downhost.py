@@ -246,9 +246,7 @@ def test_a_failed_host_is_still_carried_and_surfaced_in_the_sidebar(downhost):
     # renders no error strip (an unreachable server is a status, and status lives
     # in the sidebar's SHED SERVERS section + the System pane); the payload keeps
     # the failure, which drives the sidebar and the empty state.
-    # The mock's closed-port simulation is a transport failure → kind `other`
-    # (the AgentUpgradeRequired kind is pinned at the Rust unit level —
-    # ipc.rs::sheds_payload_carries_host_errors_for_two_failed_hosts).
+    # The mock's closed-port simulation is a transport failure → kind `other`.
     errs = downhost.sheds_host_errors()
     assert [e["server"] for e in errs] == ["down"], f"unexpected host_errors: {errs}"
     assert errs[0]["kind"] == "other"

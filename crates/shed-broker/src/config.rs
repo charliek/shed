@@ -899,10 +899,8 @@ impl ExtensionsYaml {
         self.discovery.is_some()
     }
 
-    /// The delegated-approval budget the desktop server enforces per request, and
-    /// which drives the `hello_ack.request_timeout_ms` it advertises. Mirrors Go's
-    /// `ApprovalTimeoutDuration` + `NewDesktopServer`'s guard: an absent, invalid,
-    /// or non-positive `approval_timeout` falls back to 25s. [`ExtensionsYaml::load`]
+    /// The delegated-approval budget the app's approval gate enforces per request:
+    /// an absent, invalid, or non-positive `approval_timeout` falls back to 25s. [`ExtensionsYaml::load`]
     /// now hard-rejects an invalid/non-positive value at startup (via `validate`), so
     /// production never reaches this accessor with a bad value; the fail-safe remains
     /// for the in-crate `parse` convenience (which skips validation), mirroring Go's

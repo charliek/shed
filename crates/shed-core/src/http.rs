@@ -45,15 +45,6 @@ pub enum ShedError {
     Create(String),
     #[error("{0}")]
     Config(String),
-    /// The host-side credential broker must be upgraded before this server is
-    /// usable — the one mint failure whose remedy is a user ACTION rather than
-    /// waiting or debugging, so it is a typed case instead of a `Config` string:
-    /// presentation layers branch on it (banner leads with the remedy, `detail`
-    /// demoted to tooltip/log) and the empty state stops blaming config.yaml
-    /// (shed#300). The Display keeps the remedy FIRST so even a string-only
-    /// consumer truncates the context, never the action.
-    #[error("upgrade shed-host-agent — it is too old to obtain a client certificate for {server} ({detail})")]
-    AgentUpgradeRequired { server: String, detail: String },
 }
 
 /// Why a credential-source call (`GET /api/sources`, `POST /api/sources/use`) did not
@@ -286,10 +277,6 @@ fn refused_because(outcome: &Result<reqwest::Response, ShedError>, mint: ShedErr
     match mint {
         ShedError::Config(m) => ShedError::Config(describe(m)),
         ShedError::Transport(m) => ShedError::Transport(describe(m)),
-        ShedError::AgentUpgradeRequired { server, detail } => ShedError::AgentUpgradeRequired {
-            server,
-            detail: format!("{detail}; request refused: {refusal}"),
-        },
         other => ShedError::Transport(describe(other.to_string())),
     }
 }
@@ -2599,25 +2586,6 @@ mod tests {
             m.contains("(request refused: transport error: received fatal alert"),
             "{m}"
         );
-    }
-
-    #[test]
-    fn refused_because_preserves_the_typed_upgrade_case() {
-        let outcome: Result<reqwest::Response, ShedError> =
-            Err(ShedError::Transport("tls alert".into()));
-        let e = refused_because(
-            &outcome,
-            ShedError::AgentUpgradeRequired {
-                server: "mini2".into(),
-                detail: "does not support `credential.get`".into(),
-            },
-        );
-        let ShedError::AgentUpgradeRequired { server, detail } = e else {
-            panic!("the typed case must survive the refusal wrap, got {e:?}");
-        };
-        assert_eq!(server, "mini2");
-        assert!(detail.starts_with("does not support"), "{detail}");
-        assert!(detail.contains("request refused"), "{detail}");
     }
 
     #[test]

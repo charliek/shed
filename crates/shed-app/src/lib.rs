@@ -13,14 +13,19 @@ pub mod backend;
 mod backoff;
 #[cfg(feature = "broker")]
 pub mod broker_bridge;
+/// What the credential broker tells the approval Coordinator.
+pub mod broker_event;
 pub mod coordinator;
 /// The craze row merge (plan 025 §3.6.3, D4) — which roost tabs a machine's
 /// live craze hub absorbs. Ungated for the reason [`lane_view`] is: shed-mobile
 /// links this crate with default features and folds the same two feeds, so the
 /// rule has to be one implementation rather than two.
 pub mod craze_rows;
+/// The credential-shape rules for a minted control credential; the embedded
+/// bridge is their only caller.
+#[cfg(feature = "broker")]
+mod credential_shape;
 pub mod fakes;
-pub mod host_agent;
 /// The staged agent-lane view (plan 018 §3.5) — the client-side fold of a
 /// [`shed_core::lane`] subscription into a renderable, TYPED snapshot.
 /// Ungated for the same reason [`machine`] and [`roost`] are: shed-mobile links
@@ -48,7 +53,6 @@ pub mod slash_menu;
 /// one (every consumer's gate is optional).
 pub mod spawn_gate;
 pub mod timefmt;
-pub mod token_minter;
 pub mod traits;
 
 pub use audit_store::AuditStore;
@@ -61,13 +65,10 @@ pub use backend::{
 pub use broker_bridge::{
     load_or_synthesize, machine_identity, BrokerConfig, BrokerError, EmbeddedBroker,
 };
+pub use broker_event::BrokerEvent;
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};
 pub use craze_rows::{fold_plan, FoldPlan, RoostTabRef};
 pub use fakes::{AlwaysApprovedGate, FakeNotifier, NoopEventSink};
-pub use host_agent::{
-    AgentCapabilityState, BrokerEvent, CapabilitySnapshot, HelloClientInfo, HostAgentClient,
-    HostAgentClientError,
-};
 pub use lane_view::{LaneView, LaneViewSnapshot, MAX_VIEW_MESSAGES};
 pub use machine::{FixedPort, ForwardError, MachineForward, SshForward};
 pub use roost::{
@@ -91,7 +92,6 @@ pub use slash_menu::{
     SlashHidden, SlashMenu, SlashMenuRow,
 };
 pub use spawn_gate::{ChildExit, ShuttingDown, SlotClose, SpawnGate, SpawnSection, SHUTTING_DOWN};
-pub use token_minter::HostAgentTokenMinter;
 pub use traits::{
     AuthGate, AuthGateRef, AuthOutcome, AuthPrompt, Clock, ClockRef, CoordinatorEvent, EventSink,
     EventSinkRef, Notifier, NotifierRef, PostedNotification, Responder, ResponderRef, SystemClock,

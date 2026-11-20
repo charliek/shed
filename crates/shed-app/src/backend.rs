@@ -82,9 +82,9 @@ impl Backend {
     }
 
     /// As [`from_env_parts`](Self::from_env_parts), but threads a control-token
-    /// `minter` (the host-agent bridge) into every non-mock server's client, so a
-    /// secure server mints/refreshes its bearer via `token.get` and fails closed
-    /// on a mint failure (F6). GTK passes `None` (static-token only).
+    /// `minter` (the embedded broker's) into every non-mock server's client, so a
+    /// secure server mints/refreshes its control credential through it and fails
+    /// closed on a mint failure (F6). GTK passes `None` (static-token only).
     ///
     /// `unreachable_hosts` is a TEST-ONLY per-host down simulation consulted only in
     /// the mock arm (see [`from_config_with_minter`](Self::from_config_with_minter)).
@@ -196,7 +196,7 @@ impl Backend {
                     None => {
                         // A pin on a non-https URL fails closed in Client::new → that
                         // server is skipped rather than sent plaintext. Secure servers
-                        // mint/refresh their control credential via the host agent; on
+                        // mint/refresh their control credential via the broker; on
                         // a mint failure the client sends nothing — never the static
                         // config token (F6).
                         let r = s.resolved_endpoint();
@@ -687,42 +687,24 @@ pub struct HostFailure {
     pub detail: String,
 }
 
-/// The known causes a UI treats specially. `Other` is the open set — an
-/// unrecognized failure renders generically but still names its host.
+/// Why a host could not be listed, for a UI to branch on. `Other` is the open
+/// set — a failure renders generically but still names its host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostFailureKind {
-    AgentUpgradeRequired,
     Other,
 }
 
 impl HostFailure {
-    /// Presentation mapping for one host's error. The typed
-    /// [`ShedError::AgentUpgradeRequired`] keeps its remedy as the whole
-    /// summary; everything else leads with the host name so multi-host strips
-    /// stay scannable.
+    /// Presentation mapping for one host's error: the summary leads with the host
+    /// name so multi-host strips stay scannable.
     pub fn from_error(server: &str, e: &ShedError) -> Self {
-        match e {
-            ShedError::AgentUpgradeRequired {
-                server: for_server,
-                detail,
-            } => Self {
-                server: server.to_string(),
-                kind: HostFailureKind::AgentUpgradeRequired,
-                summary: format!(
-                    "Upgrade shed-host-agent — it can't obtain a certificate for {for_server}."
-                ),
-                detail: detail.clone(),
-            },
-            other => {
-                let detail = other.to_string();
-                Self {
-                    server: server.to_string(),
-                    kind: HostFailureKind::Other,
-                    summary: format!("{server}: {detail}"),
-                    detail,
-                }
-            }
+        let detail = e.to_string();
+        Self {
+            server: server.to_string(),
+            kind: HostFailureKind::Other,
+            summary: format!("{server}: {detail}"),
+            detail,
         }
     }
 }
@@ -870,29 +852,14 @@ mod tests {
         (name.to_string(), client)
     }
 
-    /// The presentation mapping (plan 006 D6 / shed#300): the typed upgrade
-    /// case leads with the remedy and keeps its kind; everything else names its
-    /// host and stays `Other`.
+    /// The presentation mapping (plan 006 D6 / shed#300): a failure names its
+    /// host and is `Other`.
     #[test]
     fn host_failure_presentation_mapping() {
-        let up = HostFailure::from_error(
-            "dev-mtls",
-            &ShedError::AgentUpgradeRequired {
-                server: "dev-mtls".into(),
-                detail: "does not support `credential.get`".into(),
-            },
-        );
-        assert_eq!(up.kind, HostFailureKind::AgentUpgradeRequired);
-        assert!(
-            up.summary.starts_with("Upgrade shed-host-agent"),
-            "{}",
-            up.summary
-        );
-        assert!(up.detail.contains("credential.get"), "{}", up.detail);
-
         let other = HostFailure::from_error("mini3", &ShedError::BadStatus(500));
         assert_eq!(other.kind, HostFailureKind::Other);
         assert!(other.summary.starts_with("mini3: "), "{}", other.summary);
+        assert_eq!(other.detail, ShedError::BadStatus(500).to_string());
     }
 
     fn server_entry(name: &str) -> shed_core::config::ShedServerEntry {

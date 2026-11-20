@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 /// Injectable "now", so the expiry / TTL / grant / TOCTOU edge-cases are
 /// deterministic in tests. `now_iso8601` formats the wire `ts` fields
-/// (hello / pong / approval_response / audit) off `now_unix`, keeping timestamp
+/// (approval requests and audit rows) off `now_unix`, keeping timestamp
 /// formatting in `shed-app` (`shed-core` stays parse/format-free).
 pub trait Clock: Send + Sync {
     fn now_unix(&self) -> i64;
@@ -110,8 +110,8 @@ pub type NotifierRef = Arc<dyn Notifier>;
 
 // ---- Responder (the coordinator's decision sink) ----
 
-/// Sends an approve/deny decision to the broker (a no-op if disconnected —
-/// the broker then fails closed). Abstracts the broker bridge's respond so the
+/// Sends an approve/deny decision to the broker (a decision it cannot deliver
+/// is dropped — the broker then fails closed on its own timeout). Abstracts the broker bridge's respond so the
 /// coordinator is decoupled from the transport and unit-testable. The impl must
 /// be synchronous + non-blocking so the coordinator can call it inside its atomic
 /// command handler.
@@ -134,7 +134,7 @@ pub type ResponderRef = Arc<dyn Responder>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoordinatorEvent {
     /// The pending-approvals queue changed (a new prompt, a decision, an expiry,
-    /// a disconnect drop, a policy re-evaluation).
+    /// a policy re-evaluation).
     Approvals,
     /// A new audit entry (a decision or a streamed host event).
     Activity,
