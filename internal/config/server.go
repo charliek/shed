@@ -76,15 +76,12 @@ type ServerConfig struct {
 	StateDir string `yaml:"state_dir,omitempty"`
 
 	// Mounts are host directories mounted into every shed (e.g. ~/.ssh,
-	// ~/.config/gh). This was previously named "credentials".
-	Mounts map[string]MountConfig `yaml:"mounts"`
-	// Credentials is the deprecated alias for Mounts. When "mounts" is unset
-	// it is used as a fallback (see LoadServerConfigFromPath). Remove in a
-	// future release.
-	Credentials map[string]MountConfig `yaml:"credentials"`
-	EnvFile     string                 `yaml:"env_file"`
-	LogLevel    string                 `yaml:"log_level"`
-	Terminal    *terminal.Config       `yaml:"terminal"`
+	// ~/.config/gh). The key was once named "credentials", which is now
+	// refused (rejectRenamedKeys).
+	Mounts   map[string]MountConfig `yaml:"mounts"`
+	EnvFile  string                 `yaml:"env_file"`
+	LogLevel string                 `yaml:"log_level"`
+	Terminal *terminal.Config       `yaml:"terminal"`
 
 	// DefaultBackend specifies the backend type: "vz", "firecracker",
 	// "remote", or "detect". When set to "detect", the backend is chosen
@@ -1720,11 +1717,7 @@ func DefaultServerConfig() *ServerConfig {
 		Name:     "shed-server",
 		HTTPPort: 8080,
 		SSHPort:  2222,
-		// Mounts is intentionally left nil here: a nil map means the
-		// "mounts" key was absent (so the loader can fall back to the
-		// deprecated "credentials" key), whereas an explicit `mounts: {}`
-		// unmarshals to a non-nil empty map. Consumers range/len it, which
-		// are nil-safe.
+		// Mounts is left nil: consumers range/len it, which are nil-safe.
 		LogLevel:       "info",
 		Terminal:       terminal.DefaultConfig(),
 		EnvVars:        make(map[string]string),
@@ -1901,9 +1894,10 @@ func rejectUnknownAuthKeys(data []byte) error {
 
 // removedTopLevelKeys are top-level keys earlier releases accepted and this
 // one refuses by name (rejectRemovedImageKeys, rejectRemovedAuthKeys,
-// rejectRemovedNetworkKeys). A re-cased spelling of one is refused as well.
+// rejectRemovedNetworkKeys, rejectRenamedKeys). A re-cased spelling of one is refused as well.
 var removedTopLevelKeys = []string{
 	"default_image", "public_exposure", "internal_http_port", "http_bind", "ssh_bind", "allow_insecure_exposure",
+	"credentials",
 }
 
 // yamlKeys returns the yaml key of every field of struct type t, following
@@ -2041,19 +2035,18 @@ func ServerConfigSearchPaths() []string {
 	}
 }
 
-// normalizeMounts applies the credentials→mounts backwards-compat fallback so
-// both the server and CLI config loaders behave identically. The deprecated
-// "credentials" key is used only when "mounts" is entirely ABSENT (nil map); an
-// explicitly empty `mounts: {}` is non-nil and means "no mounts", winning over a
-// leftover credentials block. Idempotent; after it runs the rest of the code
-// reads only cfg.Mounts.
-func normalizeMounts(cfg *ServerConfig, configPath string) {
-	if cfg.Mounts == nil {
-		cfg.Mounts = cfg.Credentials
-	} else if len(cfg.Credentials) != 0 {
-		fmt.Fprintf(os.Stderr, "Warning: both \"mounts\" and the deprecated \"credentials\" are set in %s; ignoring \"credentials\"\n", configPath)
+// rejectRenamedKeys fails loudly on a top-level key that was renamed. The
+// typed unmarshal ignores unknown fields, so a server.yaml that still says
+// "credentials:" would otherwise start with no mounts at all.
+func rejectRenamedKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
 	}
-	cfg.Credentials = nil
+	if _, present := raw["credentials"]; present {
+		return fmt.Errorf("config key %q was renamed to %q; rename it", "credentials", "mounts")
+	}
+	return nil
 }
 
 // rejectRemovedKeys runs every removed-key scan in one place so the two loaders
@@ -2061,7 +2054,7 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 // nil on malformed YAML (deferring the parse error to the typed unmarshal).
 func rejectRemovedKeys(data []byte) error {
 	for _, check := range []func([]byte) error{
-		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys,
+		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys, rejectRenamedKeys,
 		rejectMiscasedTopLevelKeys,
 		rejectUnknownClientKeys, rejectUnknownAuthKeys, rejectUnknownNetworkKeys, rejectUnknownRemoteKeys,
 	} {
@@ -2149,8 +2142,6 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	if err := rejectRemovedKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
-
-	normalizeMounts(cfg, configPath)
 
 	applyModeAndCommonDefaults(cfg)
 
@@ -2296,8 +2287,6 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 	if err := rejectRemovedKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
-
-	normalizeMounts(cfg, configPath)
 
 	applyModeAndCommonDefaults(cfg)
 

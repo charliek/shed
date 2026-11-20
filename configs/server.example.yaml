@@ -27,11 +27,11 @@ bind_address: 127.0.0.1
 # "detect" picks vz on macOS Apple Silicon and firecracker on Linux.
 default_backend: detect
 
-# Host directories to mount into sheds (formerly "credentials"): every shed by
-# default; per shed with `shed create --mounts none|all|a,b`.
+# Host directories to mount into sheds: every shed by default; per shed with
+# `shed create --mounts none|all|a,b`.
 # Each entry creates a directory mount from host to VM
 # Paths support ~ expansion
-# (The deprecated key "credentials" is still accepted as a fallback.)
+# (The old name of this key, "credentials", fails the config load: rename it.)
 mounts:
   claude:
     source: ~/.claude

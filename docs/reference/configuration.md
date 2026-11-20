@@ -88,7 +88,7 @@ log_level: info
 | `bind_address` | string | `127.0.0.1` | Interface every listener (HTTP, HTTPS, SSH) binds to. **Defaults to loopback in every mode** — shed is local-first. In mtls mode set a specific IP (LAN/tailnet), `0.0.0.0` or `*` (all IPv4), or `::` (all interfaces) to face the network. **An open-mode server is loopback only**: a non-loopback bind fails config load (the old `allow_insecure_exposure` acknowledgment was removed in v0.10.0 and is itself refused). |
 | `trusted_proxy` | bool | `false` | Trust the client-supplied `X-Forwarded-For` header for the request source IP. Only enable behind a reverse proxy that overwrites that header; the default uses the real TCP peer address. |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`, `remote`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux; it never picks `remote`. `remote` runs each shed as a cloud VM and needs a `remote:` block (a `remote:` block with any other backend fails config load); see [Remote Backend](remote-backend.md#configuration). |
-| `mounts` | map | `{}` | Host directories to mount into sheds (formerly `credentials`) |
+| `mounts` | map | `{}` | Host directories to mount into sheds. The old name `credentials` is refused |
 | `env_file` | string | - | Path to a `KEY=value` file whose variables are passed to the in-VM `git clone` of `repo` (git settings and credentials such as `GIT_SSH_COMMAND`); see [Environment File](#environment-file) |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
 | `extensions` | object | `{}` | Extensions to activate in VMs (see [Extensions](extensions.md)) |
@@ -493,7 +493,7 @@ Mounts are directories from the host that are shared with sheds. The method depe
 Both mechanisms provide live filesystem sharing -- changes on either side are immediately visible to the other.
 
 !!! note "Renamed from `credentials`"
-    This section was previously named `credentials`. The `mounts` key has the identical shape. The deprecated `credentials` key still works as a fallback when `mounts` is absent, but new configs should use `mounts`.
+    This section was previously named `credentials`. From v0.10.0 a config with a top-level `credentials` key fails to load (`config key "credentials" was renamed to "mounts"; rename it`). The `mounts` key has the identical shape: rename the key.
 
 ```yaml
 mounts:

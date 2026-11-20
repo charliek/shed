@@ -866,6 +866,10 @@ reachable from other hosts runs `mtls`.
   SSH](https://charliek.github.io/shed/reference/security/#enrollment-over-ssh). The status
   CLI page is gone too: the `shed-ext status` command it described does not exist.
 - **Development: `SHED_DEV_AUTH_MODE`** and `render-dev-config.sh`'s `--mtls` flag.
+- **Server: the `credentials:` key, the old name of `mounts:`.** A `server.yaml` that still
+  has it fails to load (`config key "credentials" was renamed to "mounts"; rename it`), at
+  start and in `config-validate`; it used to be read when `mounts:` was absent. Rename the
+  key: the entries keep their shape.
 - **Desktop: the broker modes.** The app always runs its own broker: the Preferences mode
   setting, the IPC operations `broker.mode` and `broker.set_mode`, the `identify` reply's
   `broker_mode` and the mode fields of `broker.status` are gone. A stored mode choice in

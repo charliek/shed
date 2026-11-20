@@ -933,7 +933,7 @@ func TestCredentialSourceMustBeDirectory(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			backend, bcfg := platformTestBackend(t)
-			cfgYAML := "name: test-server\ndefault_backend: " + backend + "\ncredentials:\n  testcred:\n    source: " + tt.source + "\n    target: /home/shed/.test\n"
+			cfgYAML := "name: test-server\ndefault_backend: " + backend + "\nmounts:\n  testcred:\n    source: " + tt.source + "\n    target: /home/shed/.test\n"
 			if bcfg.vz != nil {
 				cfgYAML += "vz:\n  vfkit_path: vfkit\n  kernel_path: /dev/null\n  default_image: /dev/null\n  instance_dir: /tmp/test-instances\n  socket_dir: /tmp/test-sockets\n  default_cpus: 2\n  default_memory_mb: 4096\n  default_disk_gb: 20\n  console_port: 1024\n  notify_port: 1026\n"
 			}
