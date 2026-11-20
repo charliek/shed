@@ -11,10 +11,10 @@ Building from source, custom images, or hacking on shed itself? See
 
 - A local `shed-server` running VMs through Apple's Virtualization.framework (via
   `vfkit`, installed by Homebrew).
-- `shed-host-agent` brokering your real credentials (SSH agent, Docker registry
-  auth, optionally AWS) into sheds — keys never leave the host.
-- **shed-desktop**: a menu-bar app (Tauri) that lists/creates sheds and shows a Touch ID
-  approval prompt whenever a shed asks to use a credential.
+- **shed-desktop**: a menu-bar app (Tauri) that lists/creates sheds, shows a Touch ID
+  approval prompt whenever a shed asks to use a credential, and is the credential broker:
+  it brokers your real credentials (SSH agent, Docker registry auth, optionally AWS) into
+  sheds — keys never leave your Mac.
 
 ## Prerequisites
 
@@ -22,14 +22,28 @@ Building from source, custom images, or hacking on shed itself? See
 - [Homebrew](https://brew.sh).
 - No host Docker needed — the `full` shed image ships its own Docker daemon.
 
-## 1. Install the CLI, server, and host agent
+## 1. Install the CLI, server, and desktop app
 
 ```bash
 brew install charliek/tap/shed             # shed CLI + shed-server (+ vfkit)
-brew install charliek/tap/shed-host-agent  # credential broker
 brew services start shed
-brew services start shed-host-agent
 ```
+
+Then install **shed-desktop**: download the latest `ShedDesktop-VERSION.dmg` from the
+[releases page](https://github.com/charliek/shed/releases), open it, and drag
+**ShedDesktop.app** to Applications.
+
+Release builds are signed and notarized, so they open normally. If you built the
+app yourself it is signed ad-hoc instead, and macOS quarantines it until you
+clear the flag once:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/ShedDesktop.app
+```
+
+The app is the only credential broker; there is nothing else to install. (If you ran the
+separate credential daemon from an earlier release, it has been removed from Homebrew:
+uninstall it with `brew uninstall`; the upgrade guide for this release names the formula.)
 
 `brew install charliek/tap/shed` installs the `shed` CLI and `shed-server`, pulls
 `vfkit` (the Apple Virtualization bridge), generates a default VZ server config,
@@ -66,7 +80,7 @@ mounts:
     target: /home/shed/.config/gh
     readonly: false
 
-# Credential brokering via shed-host-agent (configured in step 3).
+# Credential brokering by the shed-desktop app (configured in step 3).
 extensions:
   enabled:
     - ssh-agent
@@ -79,15 +93,15 @@ extensions:
 
 Restart after editing: `brew services restart shed`.
 
-## 3. Configure credential brokering (shed-host-agent)
+## 3. Configure credential brokering
 
-The host agent holds your real keys and decides each request; its config is at
-`/opt/homebrew/etc/shed/extensions.yaml`. To route approvals to shed-desktop, set
-each provider's policy to `shed-desktop` (the agent always serves the local
-socket the app connects to — there's nothing to enable):
+The credential broker runs inside shed-desktop. It holds your real keys and decides each
+request; its config is `~/.config/shed/extensions.yaml`. To route approvals to the app's
+approval prompt, set each provider's policy to `shed-desktop` (there is nothing to
+enable). With no file at all, the app uses a default that routes SSH approvals to the app.
 
 ```yaml
-# /opt/homebrew/etc/shed/extensions.yaml
+# ~/.config/shed/extensions.yaml
 # Full reference: https://charliek.github.io/shed/extensions/configuration/
 discovery:
   servers: all            # broker for every server in ~/.shed/config.yaml
@@ -104,7 +118,7 @@ ssh:
 docker:
   approval:
     policy: shed-desktop  # live Allow/Deny toggle in shed-desktop
-  registries:             # registries the agent brokers creds for
+  registries:             # registries the broker brokers creds for
     - ghcr.io
     - docker.io
     # - registry.example.com   # add your private/org registries here
@@ -128,36 +142,18 @@ logging:
   path: ~/.local/share/shed/extensions-audit.log
 ```
 
-Restart and verify. `status` queries the running agent directly and prints the
-config it loaded, so there's no need to point it at a path:
-
-```bash
-brew services restart shed-host-agent
-shed-host-agent status
-```
-
-It should report `config: /opt/homebrew/etc/shed/extensions.yaml`, each delegated
-provider's policy reading `shed-desktop`, and the approval channel (its consumer
-shows as connected once shed-desktop is running, next step). Policies, roles, and
-registries are off by default — see the
+Restart shed-desktop to apply the file, then verify in the app: **Preferences → Credential
+broker** shows that the broker started and lists each server with its credential source
+(`shedctl raw broker.status` prints the same details, including the config it loaded, as
+JSON). Policies, roles, and registries are off by default — see the
 [full reference](../extensions/configuration.md).
 
-## 4. Install shed-desktop
-
-Download the latest `ShedDesktop-<version>.dmg` from the
-[releases page](https://github.com/charliek/shed/releases), open it, and drag
-**ShedDesktop.app** to Applications.
-
-Release builds are signed and notarized, so they open normally. If you built the
-app yourself it is signed ad-hoc instead, and macOS quarantines it until you
-clear the flag once:
-
-```bash
-xattr -dr com.apple.quarantine /Applications/ShedDesktop.app
-```
+## 4. Open shed-desktop
 
 Launch it (it lives in the menu bar, no Dock icon). It reads your
-`~/.shed/config.yaml` host list and connects to the host-agent socket. Open
+`~/.shed/config.yaml` host list and starts its credential broker. The first time it starts, it
+turns on **launch at login**, so credentials keep being answered whenever you are logged in
+(they are answered only while the app is running). Open
 **Preferences** from the menu-bar dropdown to set approval behavior:
 
 | Section | What |

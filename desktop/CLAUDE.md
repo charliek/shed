@@ -118,8 +118,8 @@ daemon. It embeds `crates/shed-broker` via `shed-app`'s non-default `broker` fea
 the app keeps running. This machine's identity is `<state>/broker/machine.json`
 (`shed_broker::machine`, `<state>` = `shed_broker::paths::state_dir`); it is the only id
 `source.use` ever sends. Full behavior is documented user-facing in
-[docs/desktop/architecture.md § The embedded credential
-broker](../docs/desktop/architecture.md#the-embedded-credential-broker).
+[docs/desktop/architecture.md § The credential
+broker](../docs/desktop/architecture.md#the-credential-broker).
 
 The broker answers only while the app runs, so **launch at login is on by default**: at
 the first launch that can record it (`Prefs.login_item_defaulted` in `prefs.json`, saved

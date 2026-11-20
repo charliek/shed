@@ -121,27 +121,28 @@ shed server add shed.example.com --ssh-port 2222 \
 
 ## 3. Credential brokering over TLS
 
-Point the host-agent (running on your laptop) at the server. It **enrolls its
+The shed desktop app on your laptop is the credential broker. Its broker **enrolls its
 own `credentials`-scope certificate** over the same SSH bootstrap channel —
 there is no credential to paste — and subscribes to the credential bus over
 the pinned TLS connection, brokering SSH signatures / cloud credentials to
 your remote shed. It picks up `api_url` and `tls_cert_fingerprint` from the
 same `~/.shed/config.yaml` entry, and persists its own certificate/key in its
 state dir (never the same key material the CLI holds — one certificate per
-process, per scope).
+process, per scope). The app also needs launch at login on, which it turns on at its first
+launch, since credentials are answered only while it runs.
 
 The bus stream is long-lived and often idle; shed-server sends an SSE
 keepalive comment every 25 s so an idle NAT or proxy does not evict the
-connection. If the agent reconnects across a blip, a credential request it had
+connection. If the broker reconnects across a blip, a credential request it had
 not answered is delivered to it again; no other machine ever receives it.
 
-The first machine whose host-agent (or desktop app) connects becomes your
+The first machine whose desktop app connects becomes your
 **credential source** on this server, and only it answers your sheds'
 requests. A second machine of yours is refused, names the first, and keeps
 retrying until you move the source with `shed source use` (see [Security ›
 One machine answers for each
 user](../reference/security.md#one-machine-answers-for-each-user)). Run
-shed-host-agent 0.10.0 or newer: an older one is refused with a message to
+the desktop app at 0.10.0 or newer: an older one is refused with a message to
 upgrade.
 
 ## 4. Rotation and expiry
@@ -296,13 +297,15 @@ limits of this example:
   matched on purpose: it names the address holding the most connections, not
   the one refused.
 
-## Co-located host-agent
+## No broker on the server
 
-If you instead run the host-agent **on the VPS itself**, no extra config is
-needed: the credential bus (`credentials` scope) and Connect tunnel (`control`
-or `credentials`) ride the single pinned-TLS listener, and the on-box
-host-agent reaches them over `https://127.0.0.1:8443` with the pinned cert (in
-mtls mode, its own credentials-scope client certificate). Remote `shed
-forward` keeps working at the same time, because there is no longer a
-separate loopback-only listener. See the [network
+A server has no credential broker unless a desktop app runs there. Credential requests are
+answered only while the shed desktop app is running on your machine; a machine without the
+app (a server, or a box with no desktop session) has no broker. Run the app on your own
+machine and make it your credential source (see [Credential brokering over
+TLS](#3-credential-brokering-over-tls)). The credential bus (`credentials` scope) and Connect
+tunnel (`control` or `credentials`) ride the single pinned-TLS listener, so the app reaches
+them over `https://` with the pinned cert and its own credentials-scope client certificate.
+Remote `shed forward` keeps working at the same time, because there is no separate
+loopback-only listener. See the [network
 surface](../reference/security.md#network-surface).

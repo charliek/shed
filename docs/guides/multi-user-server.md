@@ -23,9 +23,9 @@ Firecracker runs without its jailer.
 - The server runs `auth.mode: mtls` (see [Security
   Configuration](security-configuration.md#case-3-networked-mtls-facing-the-network)).
   A user list is refused in open mode.
-- Upgrade every machine that answers credential requests (shed-host-agent and
-  the desktop app) to 0.10.0 or newer before the server: a server that pins
-  refuses an older broker.
+- Upgrade the desktop app on every machine that answers credential requests to
+  0.10.0 or newer before the server: a server that pins refuses an older
+  broker.
 - Decide the **whole** list before the first start with it. On that start a
   server with exactly one user gives that user every shed that has no user; a
   server with several gives none away (see [Sheds with no
@@ -222,7 +222,7 @@ automation never answers, or receives, the user's credential requests.
 
 Each user's credential requests (SSH signatures, AWS and Docker credentials)
 go to one machine of theirs: their **credential source** on this server. The
-first of their machines whose shed-host-agent or desktop app connects becomes
+first of their machines whose desktop app connects becomes
 it. Any other machine of that user is refused, shows the source's name, and
 keeps retrying; it never takes over by itself.
 

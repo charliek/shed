@@ -12,8 +12,8 @@ Building from source, custom kernels/images, or the full manual setup? See
     Linux runs the **server** (`shed-server`) and the **desktop app**
     (`shed-desktop`, a Tauri client, installed from the same apt repository with
     `sudo apt install shed-desktop`). The desktop app embeds the credential
-    broker, so it handles credential approvals itself with no separate
-    `shed-host-agent` daemon; a standalone host-agent is brew-only. See
+    broker (it is the only one), so it handles credential approvals itself;
+    there is no separate daemon. See
     [Desktop installation](../desktop/installation.md).
 
 ## Prerequisites

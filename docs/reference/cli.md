@@ -608,7 +608,7 @@ shed source use <machine>    # make another of your machines the source
 hex digits, or its exact name, as `shed source ls` shows them. An argument
 that matches more than one machine in any of those ways changes nothing and
 lists them. Put `--` before a name that begins with `-`. The old machine stops
-answering at once; the new one starts when its shed-host-agent or desktop app
+answering at once; the new one starts when its desktop app
 next connects, within about 30 s (at once from the desktop app's "Use this
 machine"). Nothing fails over on its own.
 
@@ -620,7 +620,7 @@ desktop  fedcba98  SHA256:...  no     no         1 hour ago
 
 $ shed source use desktop
 Machine "desktop" (fedcba98) is now the credential source for you on my-server.
-Machine "laptop" (01234567) no longer answers. The new source answers once its shed-host-agent or desktop app next connects, within about 30 s.
+Machine "laptop" (01234567) no longer answers. The new source answers once its desktop app next connects, within about 30 s.
 
 $ shed source status
 Credential source for you on my-server: "desktop" (fedcba98), connected (ssh-agent).
@@ -631,7 +631,7 @@ A script key cannot use these commands. Machine names come from the machines,
 so every output is escaped for the terminal. Against a server older than
 v0.10.0 the commands say the server does not support credential sources.
 `shed source status` reads the server; it does not say whether the machine you
-run it on is the source (the host-agent's own status does).
+run it on is the source (the desktop app's Preferences and `broker.status` do).
 
 ## Egress Control
 

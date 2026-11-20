@@ -616,7 +616,7 @@ internal CA and returns a bundle the CLI persists:
 | Scope | Grants |
 |-------|--------|
 | `control` | The control plane (lifecycle, images, sessions, snapshots, users, credential sources), the Connect tunnel for `shed forward`, and the egress audit stream. |
-| `credentials` | The credential bus (`/api/plugins/*`), plus the Connect tunnel and the egress audit stream (used by the host-agent's reverse proxy and egress subscriber). |
+| `credentials` | The credential bus (`/api/plugins/*`), plus the Connect tunnel and the egress audit stream (used by the desktop app's broker and egress subscriber). |
 
 The bus requires `credentials`, so a leaked `control` certificate cannot reach
 the live-secret bus, and a `credentials` certificate cannot manage the fleet
@@ -643,13 +643,8 @@ shed server add](cli.md#shed-server-add).
 
 **Clients older than v0.8.1** have no way to obtain a certificate. A CLI that
 sends no CSR is answered `this server requires auth.mode: mtls; upgrade shed
-(client certificate support)`. The desktop app, when it gets its credential
-through a `shed-host-agent` daemon, needs a daemon that answers
-`credential.get`: with an older daemon every request to an mtls server fails
-with `upgrade shed-host-agent — it is too old to obtain a client certificate
-for <server>`, and an app older than the daemon's protocol is told `this
-shed-desktop is too old to use one — upgrade the app`. Upgrade
-`shed-host-agent` before, or with, the desktop app.
+(client certificate support)`. A desktop app older than that cannot obtain one
+either: upgrade the app.
 
 ### Short TTL, transparent renewal
 
@@ -660,7 +655,7 @@ TTL is invisible in normal use:
 - **CLI**: re-enrolls when the stored certificate is near expiry, and on an
   auth failure retries the request once after re-enrolling. The expiry is kept
   in the client config as `client_cert_expires_at`.
-- **host-agent**: enrolls its **own** `credentials` certificate over the same
+- **desktop app's broker**: enrolls its **own** `credentials` certificate over the same
   SSH channel with its identity key.
 - **background tunnels** (`shed tunnels start -d`): the detached daemon
   re-enrolls the same way, **in memory only**, so a multi-day daemon never
@@ -699,7 +694,7 @@ client cannot request an identity it doesn't hold:
 
 - **CN** = the SSH key fingerprint (`SHA256:...`).
 - **OU** = scope (`control` or `credentials`), one scope per certificate.
-- **O** = client kind (`cli`, `host-agent`, `desktop`, `mobile`).
+- **O** = client kind (`cli`, `broker`, `desktop`, `mobile`).
 - TTL = `auth.token_ttl` (default 24h), extended-key-usage `ClientAuth` only.
 
 The server ignores every requested subject field, SAN or extension in the
@@ -806,8 +801,8 @@ single pinned-TLS (`https_port`) listener in mtls mode, with **no plain-HTTP
 listener at all**. The credential bus (`/api/plugins/*`) and the Connect
 tunnel (`/api/sheds/*/connect/*`) ride that same listener; in mtls mode the
 bus needs the `credentials` scope while the Connect tunnel accepts `control`
-or `credentials`, and both travel over TLS. A co-located host-agent reaches
-the bus over `https://127.0.0.1:8443` with the pinned cert and its own
+or `credentials`, and both travel over TLS. The desktop app's broker reaches
+the bus over `https://` with the pinned cert and its own
 `credentials` certificate. These knobs shape what is reachable where:
 
 | Field | Effect |
@@ -904,8 +899,8 @@ over pinned TLS or pinned-host-key SSH.
 ## Credential bus
 
 The credential bus carries live secrets (SSH signatures, AWS and Docker
-credentials) between a shed and a machine's host-agent or desktop app, which
-subscribe to it with a `credentials` certificate. What the machine will sign
+credentials) between a shed and a machine's desktop app, whose broker
+subscribes to it with a `credentials` certificate. What the machine will sign
 is decided on the machine: see the [SSH agent](../extensions/ssh-agent.md)
 extension.
 
@@ -947,8 +942,9 @@ A machine names itself on every subscribe and respond with two headers:
 | `X-Shed-Machine-Id` | 32 lowercase hex digits, the machine's stable id |
 | `X-Shed-Machine-Name` | its display name, percent-encoded UTF-8; 1 to 63 bytes decoded, no control characters |
 
-shed-host-agent and the desktop app 0.10.0 or newer send them. A broker
-released earlier sends neither and is refused until it is upgraded, so
+The desktop app 0.10.0 or newer sends them. A broker
+released earlier sends neither and is refused, with a message ending "install the current
+shed desktop app", until it is upgraded, so
 upgrade machines before servers.
 
 - **Who may move it.** A user moves their own source from any of their keys

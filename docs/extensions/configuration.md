@@ -2,11 +2,13 @@
 
 ## Host-Side Configuration
 
-The host agent reads configuration from `~/.config/shed/extensions.yaml`.
+The credential broker, which runs inside the [shed desktop app](../desktop/index.md), reads
+its configuration from `~/.config/shed/extensions.yaml`. Restart the app after you change it.
 
 ```yaml
-# shed-server URL
-server: http://localhost:8080
+# shed-server URL. Leave this unset: the app then brokers for every server in
+# ~/.shed/config.yaml; setting it limits the app to that one server.
+# server: http://localhost:8080
 
 # How long to wait for a shed-desktop approval before failing closed (default 25s)
 # approval_timeout: 25s
@@ -72,7 +74,7 @@ omitted/empty policy means **`deny-all`** (fail closed). Values:
 |--------|----------|
 | `deny-all` | Reject every request. The safe default / kill-switch. |
 | `approve-all` | Allow every request. Any allowlist/role below still applies — this only removes the approval prompt. |
-| `shed-desktop` | Decide each request in the [shed-desktop](desktop-approval.md) app. The app connects to the agent's always-on [approval socket](host-agent-ipc.md#approval-channel); its Preferences own method/scope/TTL. If the app isn't running, requests **fail closed**. |
+| `shed-desktop` | Decide each request in the [shed-desktop](../desktop/approvals.md) app: SSH shows an interactive card (scope, TTL, always-allow, always-deny); AWS and Docker show a live Allow/Deny toggle. Its Preferences own method/scope/TTL. If no one answers within `approval_timeout`, the request **fails closed**. An extension whose policy is anything else is handled by the broker itself and only streams its events to the app's Activity feed. |
 | `biometrics` | **SSH only, macOS.** Native Touch ID, biometrics only (fails with no sensor). Off macOS it denies every request. |
 | `biometrics-or-password` | **SSH only, macOS.** Native Touch ID, Apple Watch, **or** account password — works in clamshell mode and on Macs without a sensor. Off macOS it denies every request. |
 
@@ -81,7 +83,7 @@ cache an approval so you aren't prompted on every operation). Under
 `shed-desktop` the app owns scope/TTL; under `deny-all`/`approve-all` they are unused.
 
 The top-level **`approval_timeout`** (Go duration, default `25s`) bounds how long
-the agent waits for a `shed-desktop` decision before failing closed.
+the broker waits for a `shed-desktop` decision before failing closed.
 
 For SSH, the policy decides only requests that have already passed the signing check: a
 request the check refuses never reaches the policy and shows no prompt (see
@@ -145,32 +147,34 @@ shed-desktop Preferences UI for it.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `server` | string | `http://localhost:8080` | shed-server URL. Used only in single-server mode (when `discovery:` is omitted) |
+| `server` | string | unset | shed-server URL. When set, limits the broker to that one server (single-server mode, which turns discovery off); leave it unset to broker for every server in `~/.shed/config.yaml` |
 
 ### Machine identity
 
 Not configured here. The broker keeps this machine's id and name in `machine.json` under its
-state directory (`~/Library/Application Support/shed/host-agent/` on macOS,
-`$XDG_DATA_HOME/shed/host-agent/`, else `~/.local/share/shed/host-agent/`, on Linux), creates it on first start, and sends it on every
+state directory (`~/Library/Application Support/shed/broker/` on macOS,
+`$XDG_DATA_HOME/shed/broker/`, else `~/.local/share/shed/broker/`, on Linux; `SHED_BROKER_STATE_DIR`
+replaces the `shed` part), creates it on first start, and sends it on every
 bus request so a server can tell the user's machines apart. The name comes from the hostname
 once and can be edited in the file. See
 [Credential Source → Machine identity](source-binding.md#machine-identity).
 
 ## Multi-Server Discovery
 
-A single `shed-host-agent` process can broker credentials for **many** shed
-servers at once, instead of running one process per server. Add a `discovery:`
-block — its presence switches the agent into multi-server mode (and `server:`
-above is then ignored). Servers are discovered from shed's own CLI config
+One broker can broker credentials for **many** shed
+servers at once. Add a `discovery:`
+block — its presence switches the broker into multi-server mode (and `server:`
+above is then ignored). With neither `server:` nor `discovery:` the broker discovers every
+server in `~/.shed/config.yaml`. Servers are discovered from shed's own CLI config
 (`~/.shed/config.yaml`, the same `servers:` you manage with `shed server add`).
 A server's broker URL is its pinned `api_url` (`https://…`) when present, else
 `http://<host>:<http_port>`.
 
-The agent **enrols its own `credentials` certificate only for servers reached over
+The broker **enrols its own `credentials` certificate only for servers reached over
 `https`**: an `api_url` in `~/.shed/config.yaml`, which `shed server add` writes for an
 `mtls` server. It enrols over the server's `_bootstrap` SSH channel with your system `ssh`
 client (see [SSH Agent → Enrolling the broker's certificate](ssh-agent.md#enrolling-the-brokers-certificate)).
-For an **open** server (plain `http`, loopback only) no credential is needed: the agent
+For an **open** server (plain `http`, loopback only) no credential is needed: the broker
 connects to the credential bus unauthenticated and enrols nothing. (The presence of an
 `ssh_port` alone is *not* the signal — every shed server has an SSH endpoint.)
 
@@ -193,7 +197,7 @@ discovery:
   # debounce: 500ms       # used when watch: fsnotify
 ```
 
-When a server is added to (or removed from) `~/.shed/config.yaml`, the agent
+When a server is added to (or removed from) `~/.shed/config.yaml`, the broker
 starts (or stops) brokering for it automatically — no restart needed. Offline
 servers are retried in the background and cost nothing until they come up.
 
@@ -265,82 +269,42 @@ None. The opinionated base image configures everything:
 
 ## Diagnostics
 
-### `shed-host-agent status`
+### Checking the broker
 
-Queries the **running** agent over its read-only [status socket](host-agent-ipc.md#status-socket)
-and prints the daemon's own self-report. It does not read a config file — the daemon is the source
-of truth for what it loaded — so `status` can never disagree with the running service (the confusion
-that motivated this design: a bare invocation reading a different config than the brew service).
+The broker is the desktop app, so the app is where you check it:
 
-```bash
-shed-host-agent status              # human-readable
-shed-host-agent status --json       # machine-readable (schema 1)
-```
+- **Preferences → Credential broker** shows whether the broker started (a start-up error is
+  shown there), this machine's name, and one row per server with its
+  [credential source](source-binding.md).
+- `shedctl raw broker.status` prints the broker's own self-report as JSON (see
+  [shedctl](../desktop/cli.md) and the [IPC catalog](../desktop/ipc.md)).
 
-It reports:
+`broker.status` reports:
 
-- which **config file** the running agent loaded (the absolute `config_path`);
+- where the **config** came from (`loaded`, `synthesized` when there is no file, or `error`
+  with the message);
 - this **machine's identity** (its name and id, from `machine.json`), or why there is none
   (see [Credential Source → Machine identity](source-binding.md#machine-identity));
-- the **effective approval policy** per provider, and which are delegated to shed-desktop;
-- what the machine **signs for a shed**: the SSH backend mode, the usernames in
-  `ssh.allow_users`, and how many keys are offered (`N offered` with no filter,
-  `N of M offered` with `ssh.offer_keys`, `not listed yet` until the first listing, since a
-  forwarded agent is not asked until a shed asks);
-- the **approval channel**: its socket path and whether a consumer (e.g. shed-desktop) is
-  connected;
-- each **watched server**: per-namespace connection state, marked `ok`, `-` or `x`.
+- the namespaces **delegated to shed-desktop** (`gate_namespaces`);
+- what the machine **signs for a shed**: the SSH backend mode in force, the usernames in
+  `ssh.allow_users`, and the keys offered;
+- each **watched server**: per-namespace connection state.
 
-```text
-shed-host-agent status (pid 4242, 0.10.0)
-config:   /Users/me/.config/shed/extensions.yaml
-started:  2026-11-16T09:12:03Z
-machine:  laptop (0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60)
+| State | Meaning |
+|---|---|
+| `connected` | Subscribed; requests are served |
+| `reconnecting` | Not subscribed; retrying on a 1–30 s backoff. `last_error` says why, such as `unexpected status 403: …` with the server's message when this machine has no identity and the server requires one |
+| `not-source` | Another of your machines is the [credential source](source-binding.md) on this server; retrying. The row names the source; `shed source use` moves it to this machine |
+| `duplicate` | Another process with this machine's id already holds the namespace on this server; retrying |
+| `rejected` | The server refused a second listener (a `409` from a server older than credential sources); not retried |
+| `stopped` | The subscription ended (shutdown) |
 
-Approval policies:
-  ssh-agent           shed-desktop  (decided in shed-desktop)
-  aws-credentials     deny-all
-  docker-credentials  approve-all
-
-SSH signing:
-  mode   agent-forward
-  users  git
-  keys   2 of 5 offered (ssh.offer_keys)
-
-Approval channel:
-  socket    /Users/me/Library/Application Support/shed/host-agent.sock
-  consumer  connected (shed-desktop 0.10.0)
-
-Servers (1):
-  devbox  (https://devbox.example.com:18443)
-    ok  ssh-agent           connected
-    ok  docker-credentials  connected
-```
-
-| State | Mark | Meaning |
-|---|---|---|
-| `connected` | `ok` | Subscribed; requests are served |
-| `reconnecting` | `x` | Not subscribed; retrying on a 1–30 s backoff. `last_error` says why, such as `unexpected status 403: …` with the server's message when this machine has no identity and the server requires one |
-| `not-source` | `-` | Another of your machines is the [credential source](source-binding.md) on this server; retrying. Two more lines name the source and print the `shed source use` command that moves it here (naming this machine by its full id, its name alongside) |
-| `duplicate` | `x` | Another process with this machine's id already holds the namespace on this server; retrying |
-| `yielding` | `-` | The desktop app's embedded broker is running on this machine and answers; the daemon subscribes nothing until the app quits, then takes over within a few seconds. See [Credential source](source-binding.md#the-daemon-and-the-desktop-app-on-one-machine) |
-| `rejected` | `x` | The server refused a second listener (a `409` from a server older than credential sources); not retried |
-| `stopped` | `-` | The subscription ended (shutdown) |
-
-If the agent isn't running, `status` says so and exits non-zero (nothing is listening on the
-socket) rather than guessing from a file. Start it with `brew services start shed-host-agent`.
+Credential requests are answered only while the app is running. With the app quit there is no
+broker: a machine without the app (a server, or a box with no desktop session) has none.
 
 ## CLI Flags
 
-### shed-host-agent
-
-| Flag / Subcommand | Default | Description |
-|------|---------|-------------|
-| `--config` | `~/.config/shed/extensions.yaml` | Path to config file |
-| `--log-file` | `""` (stderr) | Append the operational log to this file (the brew service sets it to `$(brew --prefix)/var/log/shed-host-agent.log`; empty logs to stderr). The file is not rotated or size-capped |
-| `version` | — | Print version and exit |
-| `status [--json]` | — | Query the running daemon's self-report (config, machine, policies, SSH signing, connection state) and exit (see [Diagnostics](#diagnostics)) |
-| `rc-hub` | — | **Retired** (plan 022, S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)). Exits 2 naming the retirement rather than starting anything — kept as a tombstone so stale docs or launchd/systemd entries fail loudly instead of silently doing something else |
+The broker has no command line of its own. The in-VM extension binaries take these flags:
 
 ### shed-ext-ssh-agent
 

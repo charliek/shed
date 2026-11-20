@@ -28,11 +28,7 @@ brew install charliek/tap/shed
 
 This installs `shed` (CLI) and `shed-server`, installs the vfkit dependency, generates a default server config (image refs resolve from the server version — no pinned tags to bump on upgrade), and installs `shed-server` inside a signed app bundle (`ShedServer.app`, under `$(brew --prefix)/opt/shed/libexec`). `bin/shed-server` links into the bundle, so the brew service is unchanged. The bundle keeps macOS privacy grants, such as access to an external drive, across upgrades.
 
-For credential brokering (SSH agent forwarding, AWS credentials, Docker registry auth):
-
-```bash
-brew install charliek/tap/shed-host-agent
-```
+For credential brokering (SSH agent forwarding, AWS credentials, Docker registry auth), install the [shed desktop app](../desktop/installation.md). It runs the credential broker itself; there is no separate daemon to install.
 
 ### 2. Configure
 
@@ -43,13 +39,12 @@ Edit the server config to enable mounts and extensions:
 $EDITOR $(brew --prefix)/etc/shed/server.yaml
 ```
 
-Uncomment the `mounts` section to mount tool configs into VMs, and the `extensions` section if you installed `shed-host-agent`. (The older `credentials` key still works as a fallback when `mounts` is absent, but `mounts` is preferred.)
+Uncomment the `mounts` section to mount tool configs into VMs, and the `extensions` section if you use the desktop app for credential brokering. (The older `credentials` key still works as a fallback when `mounts` is absent, but `mounts` is preferred.)
 
 ### 3. Start services
 
 ```bash
 brew services start shed
-brew services start shed-host-agent  # if installed
 ```
 
 ### 4. Create a test shed
@@ -73,7 +68,7 @@ brew services list                  # check status
 brew services restart shed          # restart after config changes
 ```
 
-Logs are at `$(brew --prefix)/var/log/shed-server.log` and `$(brew --prefix)/var/log/shed-host-agent.log`.
+Logs are at `$(brew --prefix)/var/log/shed-server.log`.
 
 ## Upgrading from v0.4.x
 

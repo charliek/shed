@@ -1,7 +1,7 @@
 # Extensions Architecture
 
 The credential extensions broker all signing and secret resolution through the
-host machine over shed's [plugin message bus](../reference/extensions.md). This
+user's own machine over shed's [plugin message bus](../reference/extensions.md). This
 page traces the component layout, the per-namespace message flows, and how the
 guest binaries are built and shipped.
 
@@ -18,7 +18,7 @@ graph TB
         DCS --> BUS
     end
     BUS -->|vsock| SRV[shed-server<br/>Plugin message bus<br/>routed by user]
-    SRV -->|SSE, to the user's<br/>credential source only| HA[shed-host-agent<br/>or the desktop app's<br/>embedded broker]
+    SRV -->|SSE, to the user's<br/>credential source only| HA[credential broker<br/>in the shed desktop app]
     subgraph "The user's machine (macOS or Linux)"
         HA --> SC[Signing check]
         SC --> AG[Approval gate<br/>policy / Touch ID / shed-desktop]
@@ -41,7 +41,7 @@ graph TB
    request id with one it mints, and routes it to the `ssh-agent` listener of the **shed's
    user**. That listener exists only on the user's [credential source](source-binding.md);
    with no listener the request is dropped and logged
-6. The broker (`shed-host-agent`, or the desktop app's embedded broker) decodes the request
+6. The broker (in the shed desktop app) decodes the request
    and runs the [signing check](ssh-agent.md#what-the-machine-signs). A refused request is
    audited and answered at once, with no prompt
 7. A request that passes goes to the approval gate, then to the SSH backend, which signs
@@ -67,7 +67,7 @@ sequenceDiagram
     participant SDK as AWS SDK
     participant Proxy as shed-ext-aws-credentials
     participant Bus as Message Bus
-    participant Host as shed-host-agent
+    participant Host as credential broker (desktop app)
     participant STS as AWS STS
 
     SDK->>Proxy: GET /credentials
@@ -98,11 +98,12 @@ sequenceDiagram
 ## Package Structure
 
 All extension code lives in the shed monorepo. The guest binaries are Go and share the
-`internal/ext/` packages and the `github.com/charliek/shed/sdk` module. The host binary,
-`shed-host-agent`, is a separate Rust crate (`crates/shed-host-agent`, built on the
-shared `crates/shed-broker` core) that ports the same wire protocol — it talks to
-shed-server over the identical `sdk.HostClient`-shaped SSE subscribe/respond endpoints,
-so guest and host still agree on the wire even though they no longer share Go source.
+`internal/ext/` packages and the `github.com/charliek/shed/sdk` module. The host side, the
+credential broker, is the Rust crate `crates/shed-broker`, which the shed desktop app embeds
+and runs in its own process. It ports the same wire protocol — it talks to shed-server over
+the identical `sdk.HostClient`-shaped SSE subscribe/respond endpoints, so guest and host still
+agree on the wire even though they no longer share Go source. The desktop app is the only
+credential broker: there is no separate daemon to install.
 
 ### Guest-Side
 
@@ -115,16 +116,15 @@ so guest and host still agree on the wire even though they no longer share Go so
 
 ### Host-Side
 
-- **`crates/shed-host-agent/`** — the daemon shell (CLI, signals, socket bind, the
-  desktop UDS server) over **`crates/shed-broker`**, the embeddable broker core: it
+- **`crates/shed-broker/`** — the broker core, embedded in the desktop app. It
   subscribes to namespaces via a Rust port of the `sdk.HostClient` SSE
   subscribe/respond protocol (handles subscription, reconnection, and response
   delivery), dispatches requests to the SSH, AWS, and Docker handlers concurrently, and
   hosts the approval gates. The `biometrics`/`biometrics-or-password` policies use a
   native macOS Touch ID / LocalAuthentication gate built on `objc2` — it links the
-  LocalAuthentication framework directly, so the binary needs no CGO on darwin (unlike
-  the Go daemon it replaced). The `shed-desktop` policy instead delegates the approval
-  decision to a connected desktop app over the UDS channel described below.
+  LocalAuthentication framework directly, so the binary needs no CGO on darwin. The
+  `shed-desktop` policy instead delegates the approval decision to the app's own approval
+  gate (see [Credential approvals](../desktop/approvals.md)).
 
 ### Shared
 
@@ -165,7 +165,7 @@ Extension artifacts ship from the shed release pipeline, split by where they run
 
 | Component | Channel | How it is built |
 |-----------|---------|-----------------|
-| `shed-host-agent` (darwin + linux) | GitHub Release (GoReleaser) + Homebrew tap (brew-only) | Built from `crates/shed-host-agent` on the macOS release runner. Credential brokering only (the machine RC hub it briefly carried was removed before release); the retired `shed-machine-rc`'s brew/apt artifacts stay frozen at their last release, v0.8.2 |
+| Credential broker (`shed-broker`) | The shed desktop app (macOS DMG, Linux `.deb`) | Built into the desktop app; there is no separate broker binary or Homebrew formula. The retired `shed-machine-rc`'s brew/apt artifacts stay frozen at their last release, v0.8.2 |
 | Guest binaries + systemd units + env config | Baked into the `extensions` / `full` rootfs images | Cross-compiled from `cmd/` and staged into the image build context by `scripts/stage-guest-binaries.sh`, alongside the `guest/extensions/etc/` overlay |
 
 The guest binaries (`shed-ext-ssh-agent`, `shed-ext-aws-credentials`,

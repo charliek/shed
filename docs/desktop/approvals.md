@@ -2,14 +2,13 @@
 
 The headline feature: the credential broker delegates credential-approval decisions to
 shed-desktop, and streams an all-namespace audit feed the app surfaces in **Activity**. The
-broker is either the app's embedded one (the default) or a separate `shed-host-agent` daemon
-reached over a local Unix-domain socket — see [Installation → Credential
-broker](installation.md#credential-broker). Either way only request metadata reaches the
-approval gate; the broker stays the sole credential holder.
+broker runs inside the app — see [Installation → Credential
+broker](installation.md#credential-broker). Only request metadata reaches the approval gate;
+the broker stays the sole credential holder.
 
 ## Configuring for shed-desktop
 
-In `~/.config/shed/extensions.yaml` (read by the embedded broker and by the daemon alike),
+In `~/.config/shed/extensions.yaml` (read by the app's broker),
 set the `approval.policy` of each extension you want the app to decide to `shed-desktop`:
 
 ```yaml
@@ -23,28 +22,23 @@ docker:
   approval:
     policy: shed-desktop      # optional — a live Allow/Deny toggle in the app
 
-# Optional — how long the agent waits for the app to decide before failing
+# Optional — how long the broker waits for an approval before failing
 # closed (deny). Go duration, default 25s.
 # approval_timeout: 25s
 ```
 
-The daemon always serves the approval socket at a fixed path, so there is nothing else to
-enable. (shed-host-agent v0.4.0 removed the old `desktop.enabled` / `socket_path` /
-`timeout_ms` keys; a config that still sets them loads with a deprecation warning.) With no
-`extensions.yaml` at all, the embedded broker synthesizes a default that routes SSH approvals
+There is nothing else to enable. With no `extensions.yaml` at all, the broker synthesizes a default that routes SSH approvals
 to the app — see [Architecture → The embedded credential
-broker](architecture.md#the-embedded-credential-broker).
+broker](architecture.md#the-credential-broker).
 
-Restart the daemon (if you run one), then launch shed-desktop. Pending requests appear in the
-**Approvals** pane; `broker.status` over IPC reports the broker mode in effect and, for the
-embedded broker, the delegated namespaces, per-server connection state, this machine's
-identity and the SSH signing settings in force.
+Restart shed-desktop to apply the change. Pending requests appear in the
+**Approvals** pane; `broker.status` over IPC reports the delegated namespaces, per-server
+connection state, this machine's identity and the SSH signing settings in force.
 
 It is **default-off**: an extension whose policy isn't `shed-desktop` is handled by the
 broker itself (`deny-all`, `approve-all`, or native Touch ID for SSH) and is **audit-only**
-to the app — its events still stream to Activity. The broker advertises which extensions it
-delegates (`hello_ack.gate_namespaces` from the daemon); Preferences shows an approval section
-for exactly those.
+to the app — its events still stream to Activity. Preferences shows an approval section
+for exactly the extensions the broker delegates.
 
 ## What reaches the Approvals pane
 
@@ -102,11 +96,10 @@ reachable without the dashboard.
 
 ## Fail-closed
 
-The broker denies a request when **no app is connected**, when the app **doesn't answer
-within `approval_timeout`**, or on a **disconnect mid-request** — the same outcome as an
-unanswered local prompt. The app likewise auto-denies a queued request when its countdown
-expires. Quitting the app with the embedded broker stops brokering altogether, and the
-server side fails closed.
+The broker denies a request when the approval **isn't answered within
+`approval_timeout`** — the same outcome as an unanswered local prompt. The app likewise
+auto-denies a queued request when its countdown expires. Credentials are answered only while
+the app is running: with the app quit there is no broker, and the server side fails closed.
 
 ## Testing
 

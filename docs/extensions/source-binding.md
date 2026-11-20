@@ -12,18 +12,17 @@ machines show, and how to move the source. The server side of the same rules is 
 
 ## Machine identity
 
-Each machine that runs a broker (the `shed-host-agent` daemon, or the desktop app's
-embedded broker) has an identity stored in one file:
+Each machine that runs the shed desktop app has a broker, and the broker keeps an identity
+in one file. One machine is one app, so one identity; a machine without the app has no broker
+and no identity:
 
 | Platform | Path |
 |---|---|
-| macOS | `~/Library/Application Support/shed/host-agent/machine.json` |
-| Linux | `$XDG_DATA_HOME/shed/host-agent/machine.json`, else `~/.local/share/shed/host-agent/machine.json` |
+| macOS | `~/Library/Application Support/shed/broker/machine.json` |
+| Linux | `$XDG_DATA_HOME/shed/broker/machine.json`, else `~/.local/share/shed/broker/machine.json` |
 
-`SHED_HOST_AGENT_STATE_DIR` replaces the `shed` directory above. The daemon and the
-desktop app read the **same** file, so a machine presents the same identity whichever of
-them is brokering. A process started with a different `SHED_HOST_AGENT_STATE_DIR` is a
-different machine.
+`SHED_BROKER_STATE_DIR` replaces the `shed` directory above. An app started with a different
+`SHED_BROKER_STATE_DIR` is a different machine.
 
 ```json
 {"schema":1,"id":"0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60","name":"laptop","created_at":"2026-11-16T09:12:03Z"}
@@ -35,8 +34,7 @@ different machine.
 | `name` | What people see and type. Taken once, when the file is created, from the first label of the hostname (`laptop.local` → `laptop`; an IP address is kept whole); `machine-<first 8 characters of the id>` when there is no usable hostname. Renaming the host later does not rename the machine, and a name edited by hand in the file is used. 1 to 63 bytes of UTF-8, no control characters. |
 
 The file is mode `0600` in a `0700` directory. It is loaded once when the broker starts,
-before it connects anywhere; `shed-host-agent status` prints it on its `machine:` line and
-the desktop app shows it in Preferences.
+before it connects anywhere; the desktop app shows it in Preferences and in `broker.status`.
 
 What the broker does with the file it finds:
 
@@ -47,7 +45,7 @@ What the broker does with the file it finds:
 | A valid `id`, anything else wrong | The id is kept; the other fields are repaired and written back (a warning is logged). |
 | Written by a newer version (`schema` above 1) | Never rewritten, moved or replaced. Its id is used if it can be read; otherwise the broker runs without an identity. |
 | No readable `id` (not JSON, wrong type, wrong format) | Copied to `machine.json.corrupt` and replaced by a new identity. A warning is logged: servers will see a new machine, which has to be chosen again. |
-| Cannot be read or created (permissions, I/O) | The broker keeps running **without** an identity and reports why (`machine_error` in status, `machine:  unavailable: <reason>` in the text report). A pinning server refuses such a broker (below). |
+| Cannot be read or created (permissions, I/O) | The broker keeps running **without** an identity and reports why (`machine_error` in `broker.status`). A pinning server refuses such a broker (below). |
 
 !!! warning "A machine restored from another machine's backup"
     The id is never derived from the hardware, so a cloned disk or a restored backup is the
@@ -82,9 +80,7 @@ the key its certificate was issued to, and shows both, but never matches on them
 remembers up to 32 machines per user, refused ones included, and forgets the least recently
 seen past that.
 
-A `duplicate` has three usual causes: the desktop app's embedded broker connecting in the
-moment before the daemon on the same machine lets go ([below](#the-daemon-and-the-desktop-app-on-one-machine)),
-a state directory copied to another machine, or a reconnect that arrives before the server
+A `duplicate` has two usual causes: a state directory copied to another machine, or a reconnect that arrives before the server
 has ended the previous stream. A stream that has gone dead is ended by the server's write
 deadline (15 s), after which the next retry succeeds. No stream ever replaces another.
 
@@ -101,101 +97,24 @@ directory. A server that starts without that file logs a warning that no binding
 that the first machine to connect for each user becomes its source; deleting the file on
 purpose is how an operator discards every binding.
 
-### The daemon and the desktop app on one machine
-
-The `shed-host-agent` daemon and the desktop app's embedded broker share the machine
-identity (`<state>/host-agent/machine.json`), so to a server they are one machine, and only
-one of them can hold each namespace. Which one is decided on the machine itself, not by
-the server: **while the app's embedded broker runs, it answers, and the daemon stands by**.
-The app is where the prompts are answered; a daemon that delegates approval to the app
-would have nothing to send its prompts to while the app runs its own broker.
-
-The app's embedded broker holds an exclusive lock on
-`<state>/host-agent/embedded-broker.lock` (beside `machine.json`) while it runs. It takes
-the lock only when it has a machine identity: without one a pinning server refuses its
-subscribes, so it leaves the lock alone and the daemon, if one runs, keeps answering. The
-app's broker starts once it holds the lock, or after one second without it; in that case
-it keeps trying (every 2 seconds) and takes the lock as soon as it can, for example when
-an earlier instance of the app exits. Until it holds the lock, the daemon does not know the
-app is there.
-
-The daemon has one watcher that looks at the lock every 2 seconds (a shared lock, which
-never gets in the way of another look) and tells every namespace what it found:
-
-- While the lock is held, the daemon subscribes nothing and answers nothing. Each
-  namespace reads `yielding`, with `the desktop app on this machine is answering (its
-  embedded broker is running); this daemon takes over within a few seconds of the app
-  quitting`; its mark in `shed-host-agent status` is `-`. This applies at once, whatever
-  the daemon was doing: connected, connecting, or waiting to retry, with one exception: a
-  wait the server asked for (a `429` with `Retry-After` on a subscribe, at most 60
-  seconds). The daemon has no stream during that wait; it stays `reconnecting` until the
-  wait ends, then yields before it would subscribe.
-- When the app starts while the daemon holds a namespace, the daemon closes its streams at
-  its next look, within about 2 seconds; the app's broker, refused as a `duplicate` until
-  then, connects on its next retry. The daemon also stops answering: it starts no handler
-  for a request it has received but not started, and a handler that was already running
-  (for example waiting for an approval) finishes but posts nothing, and its audit entry
-  reads `undelivered` with the reason `result <what it came to>, but not sent: left for
-  the desktop app (...)`. If an earlier send of that answer may have reached the shed (it
-  got no answer in time, or a refusal that was not the shed server's own), only the retry
-  was left to the app: the entry keeps its result and its reason says delivery unknown and
-  that the retry was not sent, left for the desktop app.
-- Work the daemon received before it yielded is never answered by it afterwards, even if
-  the app has quit again by then: a request it had queued is dropped when the app starts,
-  and an answer it was holding back for a retry is not sent again. Each such request stays
-  pending on the server, which sends it again to the app's broker when it connects (same
-  machine), and the app answers it; if the app quits without answering, the server sends
-  it again on the daemon's new stream, and the daemon answers that copy. The one overlap
-  left is an answer the daemon was already sending at the moment it yielded: if the app
-  answers the same request too, the first answer to arrive is delivered and the other is
-  refused and audited `undelivered`.
-- When the app quits, however it quits (a crash included: the operating system drops the
-  lock with the process), the daemon subscribes at its next look, within about 2 seconds,
-  without waiting out a retry delay. The exception is the same server-requested wait as
-  above: if the app started and quit while the daemon was waiting out a `429`, the
-  daemon subscribes when that wait ends.
-
-On a server older than credential sources (0.9.x), the second subscriber of a namespace
-is refused with a `409` that a broker treats as final. If the app's broker subscribes
-while the daemon still holds the namespace (before the daemon's next look), it keeps
-retrying that `409` for 15 seconds after it started or took the lock, long enough for the
-daemon to let go, and treats it as final after that, as before. The daemon and every other
-broker treat it as final at once, as before.
-
-What is not covered:
-
-- If the daemon and the app are configured with different state directories, each has its
-  own lock and its own machine id: to the server they are two machines, and the
-  [binding](#how-the-source-is-chosen) decides between them as between any two machines.
-- If the state directory is on a filesystem where `flock` does not work between processes,
-  the daemon cannot see the lock (a look that fails is logged once and read as "the app is
-  not running", so the daemon answers), and the app logs why it cannot take it; either
-  process may then hold a namespace, as before this lock existed.
-- Two daemons on a copied state directory take no lock from each other: one holds each
-  namespace and the other stays `duplicate`, retrying on its backoff.
-
 ## What the other machines show
 
-A machine that is not the source shows it in three places:
+A machine that is not the source shows it in these places:
 
-- `shed-host-agent status` marks the namespace `-` with `not-source`, names the source, and
-  prints the command that would move it here:
+- The broker's log marks the namespace `not-source` and name the source.
+  To move the source here, press **Use this machine** or run this command, which names this
+  machine by its full id:
 
     ```text
-    Servers (1):
-      devbox  (https://devbox.example.com:18443)
-        -  ssh-agent  not-source: not the credential source for this server; the active source is desk (7d2e0c41a9b85f3e6c1d0a2b4f8e9c57)
-        this machine is not the credential source here; the active source is desk
-        to make this machine (laptop) the source: shed -s devbox source use -- 0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60
+    shed -s devbox source use -- 0f3c9a2e7b1d4c6a8e5f2b9d1c7a3e60
     ```
 
-    The command names this machine by its full id, which cannot be ambiguous: two of a
-    user's machines can share a name (the same hostname), and `shed source use` refuses a
-    name that matches more than one machine. The name is shown on the same line.
+    The full id cannot be ambiguous: two of a user's machines can share a name (the same
+    hostname), and `shed source use` refuses a name that matches more than one machine.
 
-- The status JSON (and the desktop's `broker.status`) carries `state: "not-source"` and an
+- `broker.status` carries `state: "not-source"` and an
   `active_source` object (`machine_id`, `machine_name`) on the namespace and on the server.
-  See [Host Agent IPC](host-agent-ipc.md#status-socket).
+  See [Configuration → Checking the broker](configuration.md#checking-the-broker).
 - The desktop app's Preferences show the source's name on that server's row, with a
   **Use this machine** button. A server that cannot be reached when Preferences reads it
   (it is restarting, or the network is down) keeps the row it last showed, marked
@@ -205,7 +124,7 @@ A machine that is not the source shows it in three places:
   reached since the window opened (there is no last row to keep). A server that answers
   but is busy shows **server busy, retrying** instead.
 
-A `duplicate` is shown as `x` with a message naming the duplicate stream.
+A `duplicate` is shown with a message naming the duplicate stream.
 
 ## Moving the source
 
@@ -234,9 +153,8 @@ What a move does:
    An approval still waiting on the old machine is lost: if it is approved there, the answer
    is refused, and the old machine's audit log records it as `undelivered`.
 3. The new machine starts answering when its broker next subscribes. The desktop app's
-   embedded broker is woken at once by the button; a `shed-host-agent` daemon picks the
-   change up on its next retry, within about 30 seconds (while the desktop app runs its
-   embedded broker on that machine, the app answers instead).
+   broker is woken at once by the button; `shed source use` from a terminal is picked up on
+   the broker's next retry, within about 30 seconds.
 
 The routes behind both are `GET /api/sources` and `POST /api/sources/use` with
 `{"machine_id": "<32 hex>"}` (an admin may add `"user"`). Both need a control-scope

@@ -6,7 +6,7 @@ The `ssh-agent` namespace brokers SSH key operations between the shed microVM an
 
 `shed-ext-ssh-agent` runs inside the VM as a systemd service, listening on a Unix domain socket at `/run/shed-extensions/ssh-agent.sock`. The `SSH_AUTH_SOCK` environment variable points all SSH clients to this socket.
 
-When an SSH client (git, ssh, scp) requests a key operation, `shed-ext-ssh-agent` translates it into a message bus request and forwards it to the host agent for processing.
+When an SSH client (git, ssh, scp) requests a key operation, `shed-ext-ssh-agent` translates it into a message bus request and forwards it to the credential broker (the shed desktop app on your machine) for processing.
 
 ## Operations
 
@@ -64,7 +64,7 @@ When an SSH client (git, ssh, scp) requests a key operation, `shed-ext-ssh-agent
 
 ## Host-Side Backend
 
-The host agent auto-detects the best signing strategy for **request-time signing**
+The broker auto-detects the best signing strategy for **request-time signing**
 (the per-VM ssh-agent operations above):
 
 1. **Agent-forward** (default): If `SSH_AUTH_SOCK` is set on the host and its socket answers, proxies sign requests to the developer's existing SSH agent (Secretive, 1Password, ssh-agent, etc.)
@@ -83,7 +83,7 @@ The broker needs a credential of its own to subscribe to a server's credential b
 server reached over `https` (every `mtls` server), it enrols a client certificate for the
 `credentials` scope over the server's reserved `_bootstrap` SSH channel: it generates a key
 pair, sends a certificate request, and stores the issued certificate with its key under its
-state directory (`host-agent/creds/credentials/<server>/`, `0600` files in `0700`
+state directory (`broker/creds/credentials/<server>/`, `0600` files in `0700`
 directories). It enrols again before the certificate expires, and at once when the server
 refuses it. A server reached over plain `http` (an `open` server, which listens on loopback
 only) needs no credential, and the broker enrols nothing for it. A server older than 0.10.0
@@ -103,30 +103,30 @@ The server's host key is pinned in `~/.shed/known_hosts` (written by `shed serve
 A confirmed host-key **change** is treated as a possible MITM and fails closed permanently for
 that server; a *missing* pin is a non-terminal "run `shed server add`" error.
 
-### Running under `brew services` (launchd)
+### Running at login
 
-The agent runs as a per-user LaunchAgent. macOS exposes the **Apple Keychain
-ssh-agent** to that launchd session automatically, so a key added with
+The desktop app starts at login, as a login item, not from your shell. macOS exposes the
+**Apple Keychain ssh-agent** to that session automatically, so a key added with
 `ssh-add --apple-use-keychain` works out of the box. **1Password and Secretive**,
-however, usually export `SSH_AUTH_SOCK` only from your shell rc files, which the
-launchd agent does not inherit — so the daemon may not see them. If a mint fails
-and `shed-host-agent status` (or the log) reports *the server refused every key
-ssh offered* while your shell's `ssh` gets in, the daemon is not reaching your
+however, usually export `SSH_AUTH_SOCK` only from your shell rc files, which a login item
+does not inherit, so the app may not see them. If a mint fails
+and the app's log (or `broker.status`) reports *the server refused every key
+ssh offered* while your shell's `ssh` gets in, the broker is not reaching your
 agent: point `ssh` at the agent explicitly in `~/.ssh/config` (the recommended
 fix):
 
 ```ssh-config
-Host my-server          # the SSH host the agent dials — see `shed server list`
+Host my-server          # the SSH host the broker dials — see `shed server list`
     IdentityAgent ~/.1password/agent.sock   # or your Secretive socket
     # or pin a specific key instead:
     # IdentityFile ~/.ssh/id_ed25519
     # IdentitiesOnly yes
 ```
 
-Alternatives: `launchctl setenv SSH_AUTH_SOCK <socket>`, or add `SSH_AUTH_SOCK`
-to the service's launchd plist.
+An alternative is `launchctl setenv SSH_AUTH_SOCK SOCKET`, with the path of your agent's
+socket, followed by a restart of the app.
 
-> The `Host` block must match the **actual** server host the agent dials (as in
+> The `Host` block must match the **actual** server host the broker dials (as in
 > `shed server list`), not an invented alias — the bootstrap connects to that
 > host directly.
 
@@ -134,9 +134,9 @@ If your allowlisted identity lives in an agent holding **many** keys, `ssh` can
 exhaust the server's per-connection attempt cap before offering it; pin the one
 key with `IdentityFile` + `IdentitiesOnly yes`, or raise `auth.ssh.max_auth_tries`
 on the server. A **touch-required** (FIDO/hardware) key is a poor fit for the
-unattended, periodic mint — the daemon can't satisfy the touch — so keep a
-non-touch key on the server's allowlist. Note that `~/.ssh/config` is read by an
-unattended daemon, so a global `ProxyCommand`/`Match` will run on each mint.
+unattended, periodic mint — the broker can't satisfy the touch — so keep a
+non-touch key on the server's allowlist. Note that `~/.ssh/config` is read by the
+broker on its own, so a global `ProxyCommand`/`Match` will run on each mint.
 
 ## What the machine signs
 
@@ -186,20 +186,18 @@ ssh:
 | `ssh.offer_keys` | none: every key the backend holds is offered | A list; `[]` offers no key. Each entry a SHA256 fingerprint as `ssh-keygen -l` and `ssh-add -l` print it, or an OpenSSH public key line (as in a `.pub` file or `ssh-add -L`). A key line for a certificate, an `sk-` key, a DSA key or an invalid key fails config load. |
 
 Both settings are machine-wide: they apply to every server and shed the broker answers for.
-An invalid setting fails the daemon's config load (exit 1, logged as
-`failed to load config path=… error=…`); the
-desktop app's embedded broker fails closed instead (see
-[Desktop architecture](../desktop/architecture.md#the-embedded-credential-broker)).
+An invalid setting makes the config invalid, so the broker fails closed (see
+[Desktop architecture](../desktop/architecture.md#the-credential-broker)).
 
 With `ssh.offer_keys` set, a `list` from a shed returns only the offered keys, and a sign
 request for any other key fails exactly as one for a key the backend does not hold, so a shed
-cannot tell "not offered" from "not present". At start-up the daemon logs how many keys are
+cannot tell "not offered" from "not present". At start-up the broker logs how many keys are
 offered of how many are available, and warns once, by fingerprint, about an entry that
 matches no key.
 
-`shed-host-agent status` shows the result in its `SSH signing:` block (the backend mode, the
-allowed usernames, and how many keys are offered); see
-[Configuration](configuration.md#shed-host-agent-status).
+`broker.status` shows the result in its `ssh` block (the backend mode, the
+allowed usernames, and the keys offered); see
+[Configuration](configuration.md#checking-the-broker).
 
 ## Approval
 

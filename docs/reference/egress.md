@@ -316,7 +316,7 @@ Every decision is appended as one JSON line to `{state}/egress-audit.jsonl`
 `shed egress show`. Records carry host / port / resolved IP / protocol / verdict
 / reason — **never full URLs or paths** (which can carry tokens). The records
 are also streamed over `GET /api/egress/stream` (Server-Sent Events) for the
-shed-host-agent → shed-desktop activity feed.
+the desktop app's activity feed.
 
 The server's own audit log, `audit.jsonl` (service-client requests, HTTPS execs
 and `max_age` reaps), sits beside `egress-audit.jsonl` in the same directory. It
@@ -419,7 +419,7 @@ A profile that combines the two, isolated with the proxy as the only way out
    │  per-shed listener + token                                                    └▶ dropped (deny)
    │  audit (host/port/ip/verdict/reason)
    ▼
- shed-server  ── durable JSONL + recent ring + SSE stream ──▶ shed-host-agent ──▶ shed-desktop (view)
+ shed-server  ── durable JSONL + recent ring + SSE stream ──▶ shed-desktop (view)
 ```
 
 On Firecracker, an `isolated` shed's direct traffic (everything that does not

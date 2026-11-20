@@ -315,7 +315,7 @@ Extensions are **enable-only** — they persist until VM restart. Runtime disabl
 The agent periodically checks each enabled extension at two levels:
 
 - **guest**: Is the systemd service running? (`systemctl is-active`)
-- **host**: Can the extension reach the host agent end-to-end? (bus ping round-trip)
+- **host**: Can the extension reach the credential broker end-to-end? (bus ping round-trip)
 
 Health status is included in heartbeats and visible via `shed list -vv`:
 
@@ -378,15 +378,15 @@ The client follows a redirect only within the configured server's origin (the sa
 
 ## Credential extensions
 
-The `extensions` and `full` images come with shed's credential extensions pre-installed, providing SSH agent forwarding, AWS credential proxying, and Docker credential brokering. `extensions` is the lightweight starting point (base OS + credential extensions + Docker creds helper, no coding agents); `full` layers the coding agents on top. Create a shed with `--image extensions` (or `--image full` for the kitchen-sink default), enable extensions in your server config, and run a credential broker (the `shed-host-agent` daemon, or the desktop app's embedded broker) on your machine.
+The `extensions` and `full` images come with shed's credential extensions pre-installed, providing SSH agent forwarding, AWS credential proxying, and Docker credential brokering. `extensions` is the lightweight starting point (base OS + credential extensions + Docker creds helper, no coding agents); `full` layers the coding agents on top. Create a shed with `--image extensions` (or `--image full` for the kitchen-sink default), enable extensions in your server config, and run the shed desktop app, which is the credential broker, on your machine.
 
-These extensions are concrete implementations built on the plugin bus above, and their source lives in this repository (`cmd/shed-ext-*`, `internal/ext/` for the guest side; `crates/shed-host-agent` and `crates/shed-broker` for the host-side broker). See the Extensions reference for setup and usage:
+These extensions are concrete implementations built on the plugin bus above, and their source lives in this repository (`cmd/shed-ext-*`, `internal/ext/` for the guest side; `crates/shed-broker` for the host-side broker). See the Extensions reference for setup and usage:
 
 - [Architecture](../extensions/architecture.md) — component layout and message flows
-- [Configuration](../extensions/configuration.md) — host agent `extensions.yaml`
+- [Configuration](../extensions/configuration.md) — the broker's `extensions.yaml`
 - [SSH Agent](../extensions/ssh-agent.md), [AWS Credentials](../extensions/aws-credentials.md), [Docker Credentials](../extensions/docker-credentials.md)
 - [Credential Source](../extensions/source-binding.md) — which of a user's machines answers
-- [Host Agent IPC](../extensions/host-agent-ipc.md) and [shed-desktop Approval](../extensions/desktop-approval.md)
+- [Credential approvals](../desktop/approvals.md) — deciding requests in the desktop app
 - [Security Posture](../extensions/security-posture.md)
 
 ## Use Cases

@@ -6,14 +6,14 @@ The `docker-credentials` namespace brokers Docker registry credentials between s
 
 `docker-credential-shed` is installed inside the VM at `/usr/local/bin/`. Docker discovers it via the `credsStore` setting in `~/.docker/config.json`. Unlike the SSH and AWS extensions, this is a **one-shot binary** — Docker execs it on demand, not a long-running daemon.
 
-When Docker needs credentials for a registry pull or push, it runs `docker-credential-shed get` with the registry hostname on stdin. The binary sends the request through the message bus to the host agent, which resolves credentials from the host's Docker credential store.
+When Docker needs credentials for a registry pull or push, it runs `docker-credential-shed get` with the registry hostname on stdin. The binary sends the request through the message bus to the credential broker (the shed desktop app on your machine), which resolves credentials from the host's Docker credential store.
 
 ```mermaid
 sequenceDiagram
     participant Docker as Docker CLI (VM)
     participant Helper as docker-credential-shed (VM)
     participant Bus as Message Bus
-    participant Host as shed-host-agent (Mac)
+    participant Host as shed desktop app (your machine)
     participant Cred as Host credential helper<br/>(gcloud, osxkeychain, etc.)
 
     Docker->>Helper: exec get (stdin: "us-docker.pkg.dev")
@@ -61,7 +61,7 @@ These anonymous pulls are recorded in the audit log with `result: anonymous` (no
 
 ## Registry Configuration
 
-The host agent controls which registries are available to VMs via an allowlist:
+The broker controls which registries are available to VMs via an allowlist:
 
 ```yaml
 docker:
@@ -84,7 +84,7 @@ If no registries are configured and `allow_all` is false (the default), the hand
 
 ## Supported Credential Sources
 
-The host agent reads `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`) and resolves credentials in priority order:
+The broker reads `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`) and resolves credentials in priority order:
 
 | Source | Config key | Example | How it works |
 |--------|-----------|---------|-------------|
