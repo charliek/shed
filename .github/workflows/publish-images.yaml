@@ -8,11 +8,7 @@ name: Publish Images and Release
 #                                             ship_desktop, plus
 #                                             ship_goreleaser = whether
 #                                             goreleaser runs at all, which
-#                                             equals ship_server). Fails LOUDLY on
-#                                             a re-dispatched pre-retirement
-#                                             tag whose own release-plan.sh
-#                                             says ship_machine_rc=true (the
-#                                             component was retired, plan 010).
+#                                             equals ship_server).
 #                                             When ship_desktop, it also runs
 #                                             the desktop signing gate: a
 #                                             STABLE tag without all six Apple
@@ -133,16 +129,17 @@ name: Publish Images and Release
 # GitHub Release or re-push formulas/debs. Desktop jobs DO run on a
 # dispatch of a desktop-shipping tag (release is skipped, not failed);
 # desktop-release-create re-runs only for desktop-only tags and is
-# idempotent (reuses the existing release). Dispatching a PRE-MIGRATION
-# tag runs that tag's old two-output release-plan.sh — the shim in the
-# release-plan step maps legacy ship_go to ship_server and ship_goreleaser
-# so image republishes of old tags keep working. A dispatch of a tag whose
-# own release-plan.sh still prints a retired component's ship_* line (a tag
-# from before that component's retirement) leaves that line in an output no
-# job reads; the `release` job never runs on a dispatch, and every such tag
-# that shipped that component also shipped the server, so its
-# ship_goreleaser equals its ship_server and desktop-release-create is
-# skipped exactly as before.
+# idempotent (reuses the existing release). A dispatch of a tag whose own
+# release-plan.sh prints a retired component's ship_* line (a tag from
+# before that component's retirement, machine-rc's on v0.8.x among them)
+# leaves that line in an output no job reads; the `release` job never runs
+# on a dispatch, and every such tag that shipped that component also shipped
+# the server, so its ship_goreleaser equals its ship_server and
+# desktop-release-create is skipped exactly as before. A dispatch of a tag
+# older than v0.8.0 is refused in the release-plan step: its own
+# release-plan.sh prints no ship_goreleaser line (v0.7.10's prints ship_go;
+# older tags have no plan script), so the workflow fails before anything
+# publishes.
 
 on:
   push:
@@ -196,42 +193,14 @@ jobs:
           # stdout is exactly the ship_* key=value lines; diagnostics go
           # to stderr (still visible in the log).
           scripts/release/release-plan.sh "$VERSION" > plan.out
-          # Old-tag guard (plan 010): the machine-rc component is RETIRED —
-          # this workflow (from the dispatching ref) has no machine-rc jobs.
-          # A POST-migration, PRE-retirement tag's own release-plan.sh (from
-          # the checked-out tag) can still emit ship_machine_rc=true;
-          # silently ignoring it would be exactly the silent-no-ship failure
-          # the exit-1 guard exists to prevent. Scope by event: on a tag
-          # PUSH (the only event whose `release` job builds goreleaser
-          # artifacts) fail loudly; on a workflow_dispatch image republish
-          # the `release` job never runs anyway (tag-push gated), so a hard
-          # fail would only break the documented image-recovery path for
-          # every pre-retirement tag — warn loudly and continue instead.
-          if grep -q '^ship_machine_rc=true' plan.out; then
-            if [ "${{ github.event_name }}" = "push" ]; then
-              echo "::error::tag ${VERSION} ships the RETIRED machine-rc component and this workflow cannot build it. Build shed-machine-rc from the tag's own workflow (its ref carries the machine-rc jobs) or accept the gap. See RELEASING.md."
-              exit 1
-            fi
-            echo "::warning::tag ${VERSION} planned ship_machine_rc=true, but the machine-rc component is retired — this dispatch republishes images only (the release job is tag-push gated) and no machine-rc artifact is affected. See RELEASING.md."
-          fi
-          # Legacy-tag shim: this workflow file comes from the DISPATCHING
-          # ref (main), but the script above comes from the CHECKED-OUT tag.
-          # A workflow_dispatch republish of a pre-migration tag therefore
-          # runs the old two-output script (ship_go/ship_desktop only). Old
-          # ship_go shipped every Go artifact together — map it so image
-          # republishes of old tags keep working. (No ship_machine_rc
-          # mapping: this workflow has no machine-rc jobs to feed, and
-          # pre-migration goreleaser artifacts only ever republish from the
-          # tag's own workflow.)
-          if grep -q '^ship_go=' plan.out && ! grep -q '^ship_server=' plan.out; then
-            # Strict true|false capture — immune to trailing whitespace/CRLF
-            # in the legacy script's output (a stray '\r' would otherwise
-            # poison every downstream == 'true' comparison).
-            go_val="$(sed -n 's/^ship_go=\(true\|false\).*/\1/p' plan.out | head -1)"
-            {
-              echo "ship_server=${go_val}"
-              echo "ship_goreleaser=${go_val}"
-            } >> plan.out
+          # Fail closed on a plan with no ship_goreleaser line: a tag older
+          # than v0.8.0 (v0.7.10's own release-plan.sh prints ship_go and no
+          # ship_goreleaser) would leave the output empty, and the
+          # desktop-only steps (ship_goreleaser != 'true') would then upload
+          # desktop artifacts over that old release.
+          if ! grep -qxE 'ship_goreleaser=(true|false)' plan.out; then
+            echo "::error::tag ${VERSION}: its release-plan.sh prints no ship_goreleaser=true|false line. This workflow cannot republish a tag older than v0.8.0, the first whose plan has that output."
+            exit 1
           fi
           cat plan.out
           cat plan.out >> "$GITHUB_OUTPUT"

@@ -1998,6 +1998,21 @@ def extract_step(src, job, step_name, dst, env_dst):
     return 0
 
 
+def extract_plan_step(src, dst):
+    """Write release-plan's "Compute the release plan" run script with its one
+    expression, the tag, rendered as ${TAG}."""
+    wf, _ = load(src)
+    found = [s for s in wf["jobs"]["release-plan"]["steps"] if s.get("name") == "Compute the release plan"]
+    if len(found) != 1:
+        sys.exit("extract-plan-step: expected one plan step, found %d" % len(found))
+    run = found[0]["run"].replace("${{ github.event.inputs.version || github.ref_name }}", "${TAG}")
+    if "${{" in run:
+        sys.exit("extract-plan-step: an expression is left unrendered in the step")
+    with open(dst, "w") as f:
+        f.write(run)
+    return 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 6 and sys.argv[1] == "check":
         sys.exit(check(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]))
@@ -2011,11 +2026,14 @@ if __name__ == "__main__":
         sys.exit(extract(sys.argv[2], "release-plan", sys.argv[3], set(sys.argv[4:]), SERVER_GATE))
     if len(sys.argv) == 7 and sys.argv[1] == "extract-step":
         sys.exit(extract_step(*sys.argv[2:7]))
+    if len(sys.argv) == 4 and sys.argv[1] == "extract-plan-step":
+        sys.exit(extract_plan_step(sys.argv[2], sys.argv[3]))
     sys.exit("usage: wiring.py check <workflow> <gate-script> <server-gate-script> <dry-run-workflow>"
              " | mutate <in> <out> <mutation> | mutate-dry <in> <out> <mutation>"
              " | extract <workflow> <job> <out> [missing secret...]"
              " | extract-server-gate <workflow> <out> [missing secret...]"
-             " | extract-step <workflow> <job> <step name> <out> <env out>")
+             " | extract-step <workflow> <job> <step name> <out> <env out>"
+             " | extract-plan-step <workflow> <out>")
 PY
 
 WF="${SCRATCH}/.github/workflows/publish-images.yaml"
@@ -2133,6 +2151,35 @@ step_case "backstop, push v9.1.0, all six present" 0 "is stable and all six Appl
   "${WF}" desktop-macos with-gate push v9.1.0
 step_case "backstop, no gate script, dispatch v0.9.0" 127 "desktop-signing-gate.sh" \
   "${WF}" desktop-macos no-gate workflow_dispatch v0.9.0
+
+# release-plan's plan step, EXECUTED in a scratch "checkout" whose
+# scripts/release/release-plan.sh prints a given plan (as a dispatch runs the
+# tag's own script): a plan with no ship_goreleaser=true|false line (an old
+# tag's) is refused before anything reaches $GITHUB_OUTPUT.
+PLAN_DIR="${SCRATCH}/plan-step"
+mkdir -p "${PLAN_DIR}/scripts/release"
+python3 "${WIRING}" extract-plan-step "${WF}" "${PLAN_DIR}/step.sh" || fail "extract the plan step failed"
+# plan_case <label> <want rc> <expected output substring> <tag> <plan text>
+plan_case() {
+  local label="$1" want="$2" expect="$3" tag="$4" plan="$5" rc=0 out
+  printf '#!/usr/bin/env bash\nprintf %%s %q\n' "${plan}" > "${PLAN_DIR}/scripts/release/release-plan.sh"
+  chmod +x "${PLAN_DIR}/scripts/release/release-plan.sh"
+  : > "${PLAN_DIR}/github_output"
+  out="$(cd "${PLAN_DIR}" && env -i PATH="${PATH}" TAG="${tag}" GITHUB_OUTPUT="${PLAN_DIR}/github_output" \
+    bash -e "${PLAN_DIR}/step.sh" 2>&1)" || rc=$?
+  [ "${rc}" -eq "${want}" ] || fail "plan step (${label}) exited ${rc} (want ${want}): ${out}"
+  case "${out}" in *"${expect}"*) ;; *) fail "plan step (${label}) output lacks '${expect}': ${out}" ;; esac
+  if [ "${want}" -ne 0 ] && [ -s "${PLAN_DIR}/github_output" ]; then
+    fail "plan step (${label}) was refused but wrote outputs: $(cat "${PLAN_DIR}/github_output")"
+  fi
+  ok "plan step ${label} → exit ${want}"
+}
+OLD_TAG="cannot republish a tag older than v0.8.0"
+step "release-plan's plan step, executed: a plan with no ship_goreleaser line is refused"
+plan_case "v0.7.10's plan (ship_go, no ship_goreleaser)" 1 "${OLD_TAG}" v0.7.10 $'ship_go=true\nship_desktop=true\n'
+plan_case "an empty ship_goreleaser" 1 "${OLD_TAG}" v0.7.10 $'ship_server=true\nship_desktop=true\nship_goreleaser=\n'
+plan_case "a desktop-only plan of today" 0 "ship_goreleaser=false" v9.1.0 $'ship_server=false\nship_desktop=true\nship_goreleaser=false\n'
+plan_case "a server plan of today" 0 "ship_goreleaser=true" v9.1.0 $'ship_server=true\nship_desktop=false\nship_goreleaser=true\n'
 
 step "the rp-unreachable mutation is a real bypass when executed, which the guard refuses (above)"
 run_step "${WIRING_DIR}/rp-unreachable.json" release-plan with-gate push v9.1.0 ${GATE_SECRETS}

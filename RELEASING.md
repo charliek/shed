@@ -49,15 +49,11 @@ them and they get no fixes.
   `update-version.sh --components machine-rc` exits 2 as an unknown
   component and a `**Ships:** machine-rc` token exits 1 as an unknown
   token.
-  **Old-tag guard:** a post-migration, pre-retirement tag's own
-  `release-plan.sh` can emit `ship_machine_rc=true`; the current
-  `publish-images.yaml` has no machine-rc jobs. On a tag **push** it
-  **fails loudly** instead of silently ignoring it — build machine-rc
-  from the tag's own workflow, or accept the gap. On a
-  `workflow_dispatch` image republish it only **warns** and continues:
-  the `release` job is tag-push gated, so a dispatch never builds
-  goreleaser artifacts anyway and the documented image-recovery path for
-  pre-retirement tags keeps working.
+  **No old-tag guard** (removed in plan 037): a tag push runs that
+  tag's own workflow, so a v0.8.x tag brings its own machine-rc jobs; a
+  `workflow_dispatch` image republish of one reads its machine-rc line
+  into an output no job declares, which is ignored, and its images
+  republish as normal.
 - **`sx` (sunset in plan 016, #329).** The RC session porcelain was never
   tagged, so nothing of it was ever published. Its selector
   (`crates/sx/VERSION`), `.goreleaser.sx.yaml` and the brew + apt
@@ -419,16 +415,15 @@ fails, and the seam is proven ignored without the self-test flag.
    `workflow_dispatch` (manual republish) re-runs only the
    image-publish chain; the `release` job is gated on `tag-push`
    events so manual republishes don't accidentally cut a new GitHub
-   Release. A `workflow_dispatch` republish of a tag from **before**
-   this migration re-runs that tag's old two-output
-   `release-plan.sh` (checked out at the tag) — the `release-plan` job
-   has a permanent legacy-dispatch shim that detects the missing
-   `ship_server=` line and maps that old script's single combined-Go
-   output onto
-   `ship_server`/`ship_goreleaser` together, so
-   old-tag republishes keep working unchanged. (A tag's own script that
-   emits a retired component's line is handled as "Retired components"
-   above describes.)
+   Release. A dispatch of a tag from **before** this migration (older
+   than v0.8.0) is **refused**: that tag's own `release-plan.sh`
+   (checked out at the tag) prints no `ship_goreleaser` line (v0.7.10's
+   prints `ship_go`; older tags have no plan script), so the
+   `release-plan` step fails with an error naming v0.8.0 as the oldest
+   tag this workflow can republish, before anything publishes. (The shim
+   that mapped `ship_go` onto `ship_server`/`ship_goreleaser` was removed
+   in plan 037. A tag's own script that emits a retired component's line
+   is handled as "Retired components" above describes.)
 
    **One republish is deliberately NOT idempotent, and is refused.** The
    macOS client changed implementation at **0.9.0** (Swift → Tauri), so

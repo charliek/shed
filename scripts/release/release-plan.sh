@@ -25,11 +25,10 @@
 #   ship_desktop=true|false
 #   ship_goreleaser=true|false     # equals ship_server
 #
-# (Pre-migration versions of this script emitted `ship_go`/`ship_desktop`
-# only; publish-images.yaml carries a permanent shim mapping legacy
-# `ship_go` output to the server outputs when a pre-migration tag is
-# dispatched — the workflow file comes from the dispatching ref, this
-# script from the checked-out tag.)
+# (Pre-migration versions of this script, v0.7.10 and older, emitted
+# `ship_go`/`ship_desktop` only. publish-images.yaml reads `ship_server`, so
+# an image republish of such a tag publishes nothing; that path is not
+# supported.)
 #
 # All diagnostics go to stderr so stdout stays machine-parseable.
 #
