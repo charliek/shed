@@ -26,9 +26,9 @@
 #   ship_goreleaser=true|false     # equals ship_server
 #
 # (Pre-migration versions of this script, v0.7.10 and older, emitted
-# `ship_go`/`ship_desktop` only. publish-images.yaml reads `ship_server`, so
-# an image republish of such a tag publishes nothing; that path is not
-# supported.)
+# `ship_go`/`ship_desktop` only. publish-images.yaml requires a
+# `ship_goreleaser` line, so it refuses to republish such a tag: the run
+# fails before it publishes anything.)
 #
 # All diagnostics go to stderr so stdout stays machine-parseable.
 #

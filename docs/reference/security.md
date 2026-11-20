@@ -711,8 +711,9 @@ CSR. A request acts as whoever the CN's key belongs to **now**, and only while
 that is still the user the certificate names. A user's certificate with no
 userId (one a server older than v0.10.0 issued) is refused on every server: at
 the TLS handshake on a new connection, and with `401` on a connection already
-open. A 0.9.x CLI, desktop app or phone enrolls again by itself on that
-failure; if one does not, run `shed server update NAME --refetch`. A service
+open. A 0.9.x CLI or desktop app enrolls again by itself on that failure, and
+so does the mobile app, which builds on the same core as the desktop app; if
+one does not, run `shed server update NAME --refetch`. A service
 client's certificate names no user either, but is told apart by its shape (see
 below) and is not affected.
 

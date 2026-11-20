@@ -134,8 +134,8 @@ reachable from other hosts runs `mtls`.
   version at the prompt.
 - **Uninstall `shed-host-agent` on every machine**, right after the servers it answered for
   run 0.10.0 and before you upgrade the desktop app (`brew services stop shed-host-agent`,
-  then `brew uninstall shed-host-agent`). Its formula is removed from the tap, and a 0.10.0
-  server refuses it. The desktop app never reads its Homebrew config
+  then `brew uninstall shed-host-agent`). Its formula is removed from the tap with this
+  release, and a 0.10.0 server refuses it. The desktop app never reads its Homebrew config
   (`$(brew --prefix)/etc/shed/extensions.yaml`): copy it to `~/.config/shed/extensions.yaml`
   only if you edited it, then delete its `server:` line and any `desktop:` block (which the
   app refuses). See [Remove the old credential
@@ -892,8 +892,8 @@ reachable from other hosts runs `mtls`.
 ### Retired
 
 - **`shed-host-agent`.** The desktop app (macOS and Linux) is the only credential broker and
-  runs it in its own process. The `shed-host-agent` formula is removed from the Homebrew tap,
-  and its Linux tarballs end at v0.9.0; their release assets stay where they are but are
+  runs it in its own process. The `shed-host-agent` formula is removed from the Homebrew tap
+  with this release, and its Linux tarballs end at v0.9.0; their release assets stay where they are but are
   unsupported. A 0.10.0 server refuses every released `shed-host-agent`. Uninstall it: see
   the [upgrade
   guide](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.10.0/#remove-the-old-credential-daemon).
@@ -1057,8 +1057,8 @@ reachable from other hosts runs `mtls`.
   older than 0.10.0 issues one. It used to be accepted by its key alone until it expired
   (`auth.token_ttl`, 24 hours by default), except on a server with `auth.directory`. Now
   it is refused at the TLS handshake, or with `401` on a connection already open; a 0.9.x
-  CLI, app or phone enrols again by itself, and `shed server update NAME --refetch` does
-  it by hand. A service client's certificate (`auth.clients`) is told apart by its shape
+  CLI or app enrols again by itself, and so does the mobile app, which builds on the same
+  core as the desktop app; `shed server update NAME --refetch` does it by hand. A service client's certificate (`auth.clients`) is told apart by its shape
   and is not affected.
 - **A GitHub login's key cache from before logins were pinned is no longer read.** Until a
   login's first good fetch from `api.github.com` pins it, the login has no keys, even when

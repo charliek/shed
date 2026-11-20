@@ -121,8 +121,9 @@ jobs:
               # test-only process that runs it for the harness, their shared wire
               # contract (sdk envelope + ext/protocol payloads), the harness, the
               # committed wire reference, and the shared build manifests/locks/
-              # toolchain a dependency bump would ride in on. (release-snapshot is
-              # gated on this filter too.)
+              # toolchain a dependency bump would ride in on. (release-snapshot
+              # does not use this filter: it runs when the go or ci filter
+              # matches.)
               - 'crates/shed-broker/**'
               - 'crates/shed-app/**'
               - 'crates/shed-broker-harness/**'
