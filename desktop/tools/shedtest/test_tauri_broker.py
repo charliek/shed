@@ -262,8 +262,8 @@ def test_embedded_always():
 
 @pytest.mark.skipif(
     shutil.which("ssh-keygen") is None,
-    reason="needs ssh-keygen to seed a local-keys backend (absent on the Linux render "
-           "gate image; the round-trip runs on the macOS e2e-tauri gate + in-crate tests)",
+    reason="needs ssh-keygen to seed a local-keys backend (both CI gates have it: the "
+           "Linux render gate image installs openssh-client for every harness launch)",
 )
 def test_embedded_sign_round_trip_through_appgate():
     """A bus `sign` request reaches the Coordinator queue, the app approves (test-mode
