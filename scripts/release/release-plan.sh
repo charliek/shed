@@ -14,18 +14,8 @@
 # channel — the server is stable-only.
 #
 # (Components retired earlier — see RELEASING.md "Retired components" — have
-# no selector here; a `**Ships:**` token naming one fails as an unknown or
-# retired token below.)
-#
-# (The `machine-rc` component was retired in plan 010. This script no longer
-# reads cmd/shed-machine-rc/VERSION or emits ship_machine_rc; the publish
-# workflow FAILS LOUDLY if a re-dispatched pre-retirement tag's own copy of
-# this script emits ship_machine_rc=true.)
-#
-# (The `sx` component was SUNSET in plan 016 (S7, #329) — the RC porcelain
-# never shipped, so crates/sx/VERSION, .goreleaser.sx.yaml and the ship_sx
-# output are gone. `sx` in a `**Ships:**` line is a hard error naming the
-# sunset, not an unknown token.)
+# no selector here; a `**Ships:**` token naming one fails as an unknown token
+# below.)
 #
 # Input:  the tag, as $1 or $GITHUB_REF_NAME (leading `v` tolerated).
 # Output: exactly these `key=value` lines on stdout, suitable for
@@ -222,7 +212,7 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
   fi
 
   # Grammar: `**Ships:** token(, token)*`, split on `\s*,\s*`. Tokens are
-  # case-sensitive canonical names; `server/CLI` is the sole legacy alias.
+  # case-sensitive canonical names, with no alias.
   tokens_raw="${ships_line#\*\*Ships:\*\*}"
   # `read -a` silently DROPS a trailing empty field, so a trailing comma
   # (`**Ships:** server,`) would slip past the per-token empty check below.
@@ -246,27 +236,17 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
       echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has an empty token (grammar: token(, token)*)." >&2
       exit 1
     fi
-    # Legacy alias, applied BEFORE canonical + duplicate checks.
-    [ "${tok}" = "server/CLI" ] && tok="server"
     case "${tok}" in
       server|desktop) ;;
-      sx)
-        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line names 'sx' — the component was sunset in plan 016 (the RC porcelain never shipped; its selector, goreleaser config and brew/apt slots were removed)." >&2
-        exit 1
-        ;;
-      machine-rc)
-        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line names 'machine-rc' — the component was retired in plan 010." >&2
-        exit 1
-        ;;
       *)
-        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has unknown token '${tok}' (valid: server, desktop; alias: server/CLI)." >&2
+        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has unknown token '${tok}' (valid: server, desktop)." >&2
         exit 1
         ;;
     esac
     j=0
     while [ "${j}" -lt "${#actual_ships[@]}" ]; do
       if [ "${actual_ships[${j}]}" = "${tok}" ]; then
-        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has duplicate token '${tok}' (post-aliasing)." >&2
+        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has duplicate token '${tok}'." >&2
         exit 1
       fi
       j=$((j + 1))

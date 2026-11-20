@@ -45,8 +45,10 @@ them and they get no fixes.
   the pre-monorepo `charliek/shed-extensions` repo — it was never
   repointed, so the v0.8.x machine-rc debs were never indexed by apt in
   the first place). Its brew+apt channel pair passed to `sx` in plan 011.
-  **Refused:** `update-version.sh --components machine-rc` exits 2 and a
-  `**Ships:** machine-rc` token exits 1, each naming the retirement.
+  **Refused** through the generic errors, with no message of its own:
+  `update-version.sh --components machine-rc` exits 2 as an unknown
+  component and a `**Ships:** machine-rc` token exits 1 as an unknown
+  token.
   **Old-tag guard:** a post-migration, pre-retirement tag's own
   `release-plan.sh` can emit `ship_machine_rc=true`; the current
   `publish-images.yaml` has no machine-rc jobs. On a tag **push** it
@@ -60,8 +62,9 @@ them and they get no fixes.
   tagged, so nothing of it was ever published. Its selector
   (`crates/sx/VERSION`), `.goreleaser.sx.yaml` and the brew + apt
   channel pair it inherited from machine-rc were removed outright; nobody
-  holds that pair now. **Refused:** `--components sx` exits 2 and a
-  `**Ships:** sx` token exits 1, each naming the sunset.
+  holds that pair now. **Refused** through the generic errors:
+  `--components sx` exits 2 and a `**Ships:** sx` token exits 1, as
+  unknown.
 - **`host-agent` (retired in plan 037).** `shed-host-agent`, the
   host-side credential broker daemon, shipped on its own selector
   (`crates/shed-host-agent/VERSION`) through v0.9.0, as brew
@@ -127,8 +130,8 @@ Cutting a release is a two-step flow, not a single command:
      is the costly failure mode). The human confirms or edits the set.
 2. The human authors the CHANGELOG entry's `**Ships:**` line with the
    confirmed set, then runs `scripts/release/update-version.sh X.Y.Z
-   --components <confirmed set>` (`go` is a deprecated alias for
-   `server`).
+   --components <confirmed set>` (`server`, `desktop`; any other name,
+   the old `go` among them, exits 2 as an unknown component).
 3. **Mandatory before tagging:** run
    `scripts/release/release-plan.sh vX.Y.Z` locally, before `git tag`.
    This is a pre-tag mirror of every guard CI will run — including the
@@ -142,12 +145,9 @@ Cutting a release is a two-step flow, not a single command:
 ### `**Ships:**` enforcement
 
 Each stable-tag CHANGELOG entry's `**Ships:**` line uses the canonical
-tokens `server`, `desktop` (comma-separated; `machine-rc`
-is rejected with a retirement message on entries written after plan 010,
-`sx` with a sunset message after plan 016, and any other token — a
-component retired since among them — as unknown;
-legacy `server/CLI` is accepted as an alias for `server`, for entries
-written before the rename). `release-plan.sh` locates the tag's
+tokens `server`, `desktop` (comma-separated, with no alias; any other
+token, a retired component's or the old `server/CLI` among them, is
+refused as unknown). `release-plan.sh` locates the tag's
 `## vX.Y.Z — date` section, parses the line, and **hard-fails the whole
 workflow** if it disagrees with the manifest-computed ship set, contains
 an unknown/duplicate token, or is missing — this is enforced on every
@@ -450,8 +450,7 @@ The maintainer runs step 1; everything else is automated.
 
 `scripts/release/update-version.sh` bumps:
 
-- `--components server` (default; `go` accepted as a deprecated alias
-  that warns on stderr): `.claude-plugin/plugin.json` `.version` (via
+- `--components server` (default): `.claude-plugin/plugin.json` `.version` (via
   `scripts/set-version.sh`, with a jq-verify safety net)
 - `--components desktop`: `desktop/VERSION`, `crates/Cargo.toml`
   (`[workspace.package].version`) + `crates/Cargo.lock` regen,
@@ -462,11 +461,9 @@ The maintainer runs step 1; everything else is automated.
 Components combine: `--components server,desktop` bumps both in one
 call. `server` rejects a prerelease (`-suffix`) version — it is
 stable-only; a desktop-only prerelease is allowed (the Tauri
-rc-rehearsal path). The retired `machine-rc` token and the sunset `sx`
-token are both hard errors (exit 2) naming the retirement / the sunset,
-so a stale muscle-memory invocation fails with the reason rather than as
-a generic typo; any other token fails as an unknown component (exit 2,
-listing the valid ones).
+rc-rehearsal path). Any other token, a retired component's or the old
+name `go` among them, fails as an unknown component (exit 2, listing the
+valid ones).
 
 The Go binaries' version comes from a build-time `-X` ldflag injected
 by GoReleaser via the config's `builds[].ldflags`

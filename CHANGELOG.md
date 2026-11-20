@@ -5,10 +5,10 @@ All notable changes to this project will be documented in this file.
 <!--
   `**Ships:**` convention: each release entry opens with a `**Ships:** …`
   line naming the components that tag actually shipped, using the
-  canonical tokens `server`, `desktop`
-  (comma-separated; legacy `server/CLI` is accepted as an alias for
-  `server`, for entries written before the rename).
-  Older entries name components since retired (`machine-rc`, `sx`, `host-agent`); a new entry that names one of them, or any other token, is refused.
+  canonical tokens `server`, `desktop` (comma-separated, with no alias).
+  Older entries name components since retired (`machine-rc`, `sx`, `host-agent`)
+  or the old spelling `server/CLI`; a new entry that names one of them, or any
+  other token, is refused.
   A component ships iff
   its version manifest equals the tag (server: .claude-plugin/plugin.json;
   desktop: desktop/VERSION) — see

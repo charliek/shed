@@ -14,18 +14,11 @@
 #                   the server component's ship selector; bumped here by
 #                   delegating to scripts/set-version.sh (the existing, tested
 #                   bumper), then jq-verified.
-#                 (Historically named `go`; `go` is still accepted as a
-#                 deprecated alias — it prints a one-line stderr warning and
-#                 behaves identically.)
+#                 (Historically named `go`; that name is now an unknown
+#                 component like any other.)
 #
-#   (machine-rc — RETIRED in plan 010. Selecting it here is a hard error.)
-#
-#   (sx         — SUNSET in plan 016 (S7, #329): the RC session porcelain was
-#                 never tagged, so its component — selector crates/sx/VERSION,
-#                 .goreleaser.sx.yaml, the brew + apt channel pair it inherited
-#                 from machine-rc — was removed outright rather than kept alive
-#                 for a role nobody had designed. Selecting it here is a hard
-#                 error.)
+#   (Components retired earlier — see RELEASING.md "Retired components" —
+#   are unknown components here.)
 #
 #   desktop     — the shed-desktop app (absorbed from the old shed-desktop
 #                 repo's scripts/release/update-version.sh). Bumps, in lockstep:
@@ -48,7 +41,7 @@
 #   - optional `--components server,desktop`
 #     (default: server — preserves the historical one-arg behavior; the release
 #     skill computes the set from recommend-components.sh and passes it
-#     explicitly). `go` accepted as a deprecated alias for `server`.
+#     explicitly).
 #   - unknown component → hard error listing valid names (a component retired
 #     earlier, see RELEASING.md "Retired components", fails here too)
 #   - PRERELEASE versions (X.Y.Z-suffix) are rejected for the server — it is
@@ -121,27 +114,9 @@ DO_SERVER=false
 DO_DESKTOP=false
 IFS=',' read -r -a comps <<< "${COMPONENTS}"
 [ "${#comps[@]}" -gt 0 ] || { echo "error: --components is empty (valid: ${VALID_COMPONENTS})" >&2; exit 2; }
-GO_ALIAS_WARNED=false
 for c in "${comps[@]}"; do
   case "$c" in
-    go)
-      # Deprecated alias for `server` (the component was renamed from `go`).
-      # Warn once per invocation even if `go` is repeated (e.g. --components go,go).
-      if [ "${GO_ALIAS_WARNED}" = "false" ]; then
-        echo "warning: component 'go' is a deprecated alias for 'server' — use --components server" >&2
-        GO_ALIAS_WARNED=true
-      fi
-      DO_SERVER=true
-      ;;
     server) DO_SERVER=true ;;
-    sx)
-      echo "error: component 'sx' was sunset in plan 016 — the RC porcelain never shipped and its release wiring (crates/sx/VERSION, .goreleaser.sx.yaml, the brew + apt slots) was removed (valid: ${VALID_COMPONENTS})" >&2
-      exit 2
-      ;;
-    machine-rc)
-      echo "error: component 'machine-rc' was retired in plan 010 (valid: ${VALID_COMPONENTS})" >&2
-      exit 2
-      ;;
     desktop) DO_DESKTOP=true ;;
     *)
       echo "error: unknown component '${c}' (valid: ${VALID_COMPONENTS})" >&2

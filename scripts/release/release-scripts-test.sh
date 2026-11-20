@@ -17,15 +17,15 @@
 # (server / desktop) and combined plans / neither→exit 1 /
 # lockstep-broken→exit 1 / malformed-manifest→exit 1 / prerelease×
 # server→exit 1 / desktop-only-prerelease→pass / the `**Ships:**`
-# CHANGELOG cross-check (legacy alias, unknown token, duplicate, mismatch,
+# CHANGELOG cross-check (no alias, unknown token, duplicate, mismatch,
 # missing entry, Unreleased-skipping) — plus the update-version.sh contract
 # asserts (unknown component errors + valid-set listing; `--components server`
 # leaves desktop manifests untouched; `--components desktop` bumps all four
-# desktop surfaces + both locks; the combined bump; `go` alias warns on
-# stderr; prerelease rejected for the server but allowed desktop-only;
-# idempotent re-run; the RETIRED `machine-rc` component rejected by both the
-# bumper and the Ships grammar — plan 010; the SUNSET `sx` component rejected
-# by both — plan 016).
+# desktop surfaces + both locks; the combined bump; the old name `go` is an
+# unknown component; prerelease rejected for the server but allowed
+# desktop-only; idempotent re-run). A retired component (RELEASING.md
+# "Retired components") fails through the same generic unknown-component and
+# unknown-token arms as any other name.
 #
 # recommend-components.sh is exercised against a SEPARATE throwaway git repo
 # (built below) with synthetic tagged history — proving the last-shipped walk,
@@ -273,11 +273,11 @@ echo "${out}" | grep -q "(valid: server, desktop)" || fail "error message doesn'
 ok "rejected with valid-name listing"
 
 # ---------------------------------------------------------------------------
-step "update-version.sh --components go bumps plugin.json ONLY (desktop untouched)"
+step "update-version.sh --components server bumps plugin.json ONLY (desktop untouched)"
 before="$(desktop_state)"
-"${UV}" 9.9.9 --components go >/dev/null
+"${UV}" 9.9.9 --components server >/dev/null
 [ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "9.9.9" ] || fail "plugin.json didn't bump to 9.9.9"
-[ "$(desktop_state)" = "${before}" ] || fail "--components go modified a desktop version surface"
+[ "$(desktop_state)" = "${before}" ] || fail "--components server modified a desktop version surface"
 ok "plugin.json=9.9.9, desktop surfaces byte-identical"
 
 # ---------------------------------------------------------------------------
@@ -313,8 +313,8 @@ run_plan v0.8.0
 ok "ship_desktop=true only, ship_goreleaser=false"
 
 # ---------------------------------------------------------------------------
-step "update-version.sh --components go,desktop; release-plan sees a combined tag"
-"${UV}" 0.8.0 --components go,desktop >/dev/null
+step "update-version.sh --components server,desktop; release-plan sees a combined tag"
+"${UV}" 0.8.0 --components server,desktop >/dev/null
 [ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "0.8.0" ] || fail "plugin.json didn't bump to 0.8.0"
 write_changelog 0.8.0 "server, desktop"
 run_plan v0.8.0
@@ -333,7 +333,7 @@ ok "reads the tag from GITHUB_REF_NAME"
 # ---------------------------------------------------------------------------
 step "update-version.sh: idempotent re-run (byte-identical tree)"
 before="$(desktop_state)$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")"
-"${UV}" 0.8.0 --components go,desktop >/dev/null
+"${UV}" 0.8.0 --components server,desktop >/dev/null
 after="$(desktop_state)$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")"
 [ "${before}" = "${after}" ] || fail "re-running the same bump changed bytes"
 ok "same-version re-run is a no-op"
@@ -382,45 +382,16 @@ ok "stale lock entry caught; bumper repairs it"
 # Entering state: plugin.json=0.8.0, desktop surfaces=0.8.0 (lockstep intact).
 # ===========================================================================
 
-# The two token-rejection cases below both need a manifest matching v1.2.3 (the
-# Ships grammar check only runs once a component manifest matches the tag), so
-# the server is bumped to 1.2.3; the `server/CLI` case further down puts it
-# back at 0.8.0.
-"${UV}" 1.2.3 --components server >/dev/null
-
 # ---------------------------------------------------------------------------
-step "release-plan.sh: retired 'machine-rc' Ships token exits 1 naming the retirement"
-write_changelog 1.2.3 "server, machine-rc"
-run_plan v1.2.3
-[ "${PLAN_RC}" -eq 1 ] || fail "retired machine-rc token plan exited ${PLAN_RC} (want 1)"
-out="$("${RP}" v1.2.3 2>&1 || true)"
-echo "${out}" | grep -q "retired in plan 010" || fail "retired-token error missing the retirement message: ${out}"
-ok "'machine-rc' in a Ships line rejected with the retirement message"
-
-# ---------------------------------------------------------------------------
-step "release-plan.sh: sunset 'sx' Ships token exits 1 naming the sunset (plan 016)"
-# A stale muscle-memory Ships line must fail with the SUNSET reason, not as a
-# generic unknown token. The entry pairs `sx` with a SURVIVING component that
-# actually matches the tag — an `**Ships:** sx`-only entry on a tag no manifest
-# matches would fail earlier ("matches NO component manifest") and never reach
-# the token parser.
-write_changelog 1.2.3 "server, sx"
-run_plan v1.2.3
-[ "${PLAN_RC}" -eq 1 ] || fail "sunset sx token plan exited ${PLAN_RC} (want 1)"
-out="$("${RP}" v1.2.3 2>&1 || true)"
-echo "${out}" | grep -q "sunset in plan 016" || fail "sunset-token error missing the sunset message: ${out}"
-echo "${out}" | grep -q "names 'sx'" || fail "sunset-token error doesn't name the offending token: ${out}"
-echo "${out}" | grep -q "unknown token" && fail "'sx' fell through to the generic unknown-token arm: ${out}"
-ok "'sx' in a Ships line rejected with the plan-016 sunset message"
-
-# ---------------------------------------------------------------------------
-step "release-plan.sh: legacy 'server/CLI' alias accepted (server + desktop tag)"
-"${UV}" 0.8.0 --components go >/dev/null
+step "release-plan.sh: the old 'server/CLI' spelling is an unknown Ships token"
+# Both manifests are at 0.8.0 and the line names both, so only the token arm
+# can refuse it: there is no alias any more.
 write_changelog 0.8.0 "server/CLI, desktop"
 run_plan v0.8.0
-[ "${PLAN_RC}" -eq 0 ] || fail "legacy-alias plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan true true true)" ] || fail "legacy-alias plan stdout: ${PLAN_OUT}"
-ok "server/CLI alias maps to server; ship_server=true ship_desktop=true"
+[ "${PLAN_RC}" -eq 1 ] || fail "server/CLI plan exited ${PLAN_RC} (want 1)"
+out="$("${RP}" v0.8.0 2>&1 || true)"
+echo "${out}" | grep -q "unknown token 'server/CLI' (valid: server, desktop)" || fail "server/CLI error doesn't name it as unknown: ${out}"
+ok "'server/CLI' rejected as an unknown token"
 
 # ---------------------------------------------------------------------------
 step "release-plan.sh: unknown Ships token exits 1 naming it"
@@ -436,17 +407,17 @@ echo "${out}" | grep -q "unknown token 'gopher'" || fail "unknown-token error do
 ok "unknown token 'gopher' rejected"
 
 # ---------------------------------------------------------------------------
-step "release-plan.sh: duplicate Ships token (post-aliasing) exits 1"
-write_changelog 0.8.0 "server, server/CLI"
+step "release-plan.sh: duplicate Ships token exits 1"
+write_changelog 0.8.0 "server, desktop, server"
 run_plan v0.8.0
 [ "${PLAN_RC}" -eq 1 ] || fail "duplicate-token plan exited ${PLAN_RC} (want 1)"
 out="$("${RP}" v0.8.0 2>&1 || true)"
 echo "${out}" | grep -q "duplicate token 'server'" || fail "duplicate-token error missing: ${out}"
-ok "duplicate 'server' (via server/CLI alias) rejected"
+ok "duplicate 'server' rejected"
 
 # ---------------------------------------------------------------------------
 step "release-plan.sh: Ships set disagreeing with manifests exits 1 showing both"
-"${UV}" 5.0.0 --components go >/dev/null   # plugin.json=5.0.0 → server-only tag
+"${UV}" 5.0.0 --components server >/dev/null   # plugin.json=5.0.0 → server-only tag
 write_changelog 5.0.0 "server, desktop"
 run_plan v5.0.0
 [ "${PLAN_RC}" -eq 1 ] || fail "ships-mismatch plan exited ${PLAN_RC} (want 1)"
@@ -605,40 +576,11 @@ echo "${out}" | grep -qF "has no **Ships:** line" || fail "duplicate-heading err
 ok "only the first duplicate section is parsed; its missing Ships line is caught (no borrow from the second)"
 
 # ===========================================================================
-# Phase 2: update-version.sh arms (the retired machine-rc / the sunset sx /
-# the combined bump), the `go` deprecation alias, and the prerelease matrix.
+# Phase 2: update-version.sh arms (the combined bump, the old name `go`) and
+# the prerelease matrix.
 # These run last (they mutate the shared scratch manifests; nothing after them
 # depends on the state left).
 # ===========================================================================
-
-# ---------------------------------------------------------------------------
-step "update-version.sh: sunset 'sx' component hard-errors with the plan-016 sunset message"
-# The `sx` case arm rejects BEFORE any stable-only / bump logic runs, so the
-# error must name plan 016 and the sunset (not read as a generic typo), exit 2,
-# and leave every surviving selector byte-identical.
-before_desktop="$(desktop_state)"
-before_plugin="$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")"
-sx_rc=0
-out="$("${UV}" 6.1.5 --components sx 2>&1)" || sx_rc=$?
-[ "${sx_rc}" -eq 2 ] || fail "sunset component 'sx' exited ${sx_rc} (want 2): ${out}"
-echo "${out}" | grep -q "plan 016" || fail "sunset-component error doesn't name plan 016: ${out}"
-echo "${out}" | grep -q "sunset" || fail "sunset-component error doesn't say 'sunset': ${out}"
-echo "${out}" | grep -q "unknown component" && fail "'sx' fell through to the generic unknown-component arm: ${out}"
-[ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "${before_plugin}" ] || fail "rejected sx bump touched plugin.json"
-[ "$(desktop_state)" = "${before_desktop}" ] || fail "rejected sx bump touched a desktop surface"
-ok "'sx' rejected (exit 2) naming plan 016 + the sunset; both selectors byte-identical"
-
-# ---------------------------------------------------------------------------
-step "update-version.sh: retired 'machine-rc' component hard-errors with the retirement message"
-before_desktop="$(desktop_state)"
-before_plugin="$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")"
-if out="$("${UV}" 6.2.0 --components machine-rc 2>&1)"; then
-  fail "retired component 'machine-rc' was accepted"
-fi
-echo "${out}" | grep -q "retired in plan 010" || fail "retired-component error missing the retirement message: ${out}"
-[ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "${before_plugin}" ] || fail "rejected machine-rc bump touched plugin.json"
-[ "$(desktop_state)" = "${before_desktop}" ] || fail "rejected machine-rc bump touched a desktop surface"
-ok "machine-rc rejected with the retirement message; nothing touched"
 
 # ---------------------------------------------------------------------------
 step "update-version.sh --components server,desktop bumps both"
@@ -665,11 +607,16 @@ after="$(desktop_state)$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json
 ok "combined re-run is a no-op"
 
 # ---------------------------------------------------------------------------
-step "update-version.sh: 'go' is a deprecated alias for 'server' AND warns on stderr"
-err="$("${UV}" 6.4.0 --components go 2>&1 >/dev/null)"
-[ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "6.4.0" ] || fail "'go' alias didn't bump plugin.json"
-echo "${err}" | grep -q "deprecated alias for 'server'" || fail "'go' alias didn't warn on stderr: ${err}"
-ok "'go' bumps plugin.json (== server) and prints the deprecation warning to stderr"
+step "update-version.sh: the old name 'go' is an unknown component (exit 2, nothing touched)"
+before_desktop="$(desktop_state)"
+before_plugin="$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")"
+go_rc=0
+out="$("${UV}" 6.4.0 --components go 2>&1)" || go_rc=$?
+[ "${go_rc}" -eq 2 ] || fail "--components go exited ${go_rc} (want 2): ${out}"
+echo "${out}" | grep -q "unknown component 'go' (valid: server, desktop)" || fail "'go' error isn't the generic unknown-component one: ${out}"
+[ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "${before_plugin}" ] || fail "rejected 'go' bump touched plugin.json"
+[ "$(desktop_state)" = "${before_desktop}" ] || fail "rejected 'go' bump touched a desktop surface"
+ok "'go' rejected through the generic unknown-component error; both selectors byte-identical"
 
 # ---------------------------------------------------------------------------
 step "update-version.sh: prerelease + server is rejected (the server is stable-only)"
@@ -699,14 +646,6 @@ if out="$("${UV}" 0.07.11 --components server 2>&1)"; then
 fi
 echo "${out}" | grep -q "not semver" || fail "leading-zero error missing 'not semver': ${out}"
 ok "0.07.11 rejected (leading zeros barred)"
-
-# ---------------------------------------------------------------------------
-step "update-version.sh: --components go,go warns exactly once (not per occurrence)"
-err="$("${UV}" 6.5.0 --components go,go 2>&1 >/dev/null)"
-[ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "6.5.0" ] || fail "go,go didn't bump plugin.json"
-n_warn="$(printf '%s\n' "${err}" | grep -c "deprecated alias for 'server'")"
-[ "${n_warn}" -eq 1 ] || fail "expected exactly 1 deprecation warning, got ${n_warn}: ${err}"
-ok "go,go bumps plugin.json and warns once"
 
 # ===========================================================================
 # Phase 3: recommend-components.sh against a throwaway git repo with synthetic
@@ -1038,7 +977,7 @@ good_out="$("${READ_PIN}" "${GOOD_PIN}")" || good_rc=$?
 ok "comments (plain and indented) and blank/CRLF-blank lines are skipped; the two real values parse cleanly"
 
 step "release-plan.sh: craze release check PASSES when the resolved commit matches CRAZE_TEST_SHA (non-vacuous: the checker actually ran)"
-"${UV}" 8.8.8 --components go >/dev/null
+"${UV}" 8.8.8 --components server >/dev/null
 write_changelog 8.8.8 "server"
 cat > "${CRAZE_PIN_FILE}" <<EOF
 CRAZE_TEST_SHA=${FAKE_CRAZE_SHA}

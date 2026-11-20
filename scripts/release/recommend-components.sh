@@ -49,7 +49,7 @@ set -euo pipefail
 # ===========================================================================
 # PATH SETS — component → the pathspecs whose changes imply that component
 # should re-ship. Passed verbatim to `git diff --name-only <lastship>..HEAD --`.
-# `:(exclude)…` entries are git pathspec magic (subtract a subtree). These are
+# An `:(exclude)…` entry would be git pathspec magic (subtract a subtree). These are
 # intentionally coarse: over-recommending is harmless under the recommend+
 # confirm flow; a false NEGATIVE (an unflagged real change) is the costly one.
 # Kept in lockstep with plan 002 §3 D4.
@@ -63,14 +63,8 @@ set -euo pipefail
 # server: the Go binaries + plugin + rootfs image inputs. `sdk/**` is a
 # path-replaced local module baked into shipped binaries with no go.sum trace;
 # `.claude-plugin/**` is the ship selector; `skills/**` ships in the plugin.
-# The retired machine-rc cmd/ subtree is subtracted.
 PATHS_SERVER=(
   cmd
-  # cmd/shed-machine-rc was deleted from the tree (plan 010 H15 — the
-  # machine-rc retirement), but the exclusion stays: it's needed so diffs
-  # against PRE-DELETION tags still classify correctly. Prune once every
-  # plausible basis tag is post-deletion.
-  ':(exclude)cmd/shed-machine-rc'
   internal
   sdk
   guest
