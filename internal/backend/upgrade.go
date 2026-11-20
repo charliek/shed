@@ -527,7 +527,8 @@ type UpgradePlan struct {
 //     *UsersUpgradeChangedError; nothing is written); with abandon (the
 //     operator's AbandonUsersUpgradeFlag), abandoned. Nothing is given to
 //     anyone, the marker is written as done, and the sheds and snapshots
-//     still with no user need 'shed assign'.
+//     still with no user need 'shed assign'. If the done marker cannot be
+//     written, Begin returns an error and the start fails.
 //
 // abandon with no such pending step is refused (a *UsersUpgradeAbandonError;
 // nothing is written). The rule is CheckUsersUpgrade's, which the server
@@ -536,15 +537,18 @@ func (u *UsersUpgrade) Begin(users []UpgradeUser, abandon bool, now time.Time) (
 	if err := u.check(users, abandon); err != nil {
 		return UpgradePlan{}, err
 	}
-	return u.begin(users, now), nil
+	return u.begin(users, now)
 }
 
-// begin is Begin once check has passed.
-func (u *UsersUpgrade) begin(users []UpgradeUser, now time.Time) UpgradePlan {
+// begin is Begin once check has passed. Its only error is an abandonment
+// (AbandonUsersUpgradeFlag) whose done marker could not be written: the start
+// fails, so the operator does not take the step as abandoned while the marker
+// still holds it pending (the next start without the flag would refuse again).
+func (u *UsersUpgrade) begin(users []UpgradeUser, now time.Time) (UpgradePlan, error) {
 	switch u.state {
 	case upgradeFirst:
 		if len(users) == 0 {
-			return UpgradePlan{}
+			return UpgradePlan{}, nil
 		}
 		if len(users) > 1 {
 			// With several users nothing is ever stamped, so the outcome is
@@ -557,15 +561,15 @@ func (u *UsersUpgrade) begin(users []UpgradeUser, now time.Time) UpgradePlan {
 			} else {
 				u.logf("Users: the one-time upgrade step for the user list is recorded (several users: nothing is given a user automatically); from now on a shed with no user is given one only by 'shed assign'")
 			}
-			return UpgradePlan{SeveralUsers: true}
+			return UpgradePlan{SeveralUsers: true}, nil
 		}
 		want := users[0]
 		if err := u.write(usersUpgradeMarker{Version: usersUpgradeVersion, Pending: &usersUpgradePending{User: want.Name, Admin: want.Admin, StartedAt: now.UTC()}}); err != nil {
 			u.logf("Users: the one-time upgrade step for the user list could not be recorded as begun for user %s, so nothing is given a user at this start; it runs again at the next start: %v", want.Name, err)
-			return UpgradePlan{Deferred: true}
+			return UpgradePlan{Deferred: true}, nil
 		}
 		u.logf("Users: the one-time upgrade step for the user list has begun for user %s (the only configured user); until it finishes it resumes only while %s is the only configured user, and the server does not start with other users", want.Name, want.Name)
-		return UpgradePlan{StampFor: &want}
+		return UpgradePlan{StampFor: &want}, nil
 	case upgradePending:
 		p := u.pending
 		if resumesFor(p, users) {
@@ -574,22 +578,23 @@ func (u *UsersUpgrade) begin(users []UpgradeUser, now time.Time) UpgradePlan {
 				u.logf("Users: user %s was an admin when the one-time upgrade step began: %v; is now: %v. Sheds that carry host directories or server mounts are given to them only if both", p.Name, p.Admin, users[0].Admin)
 			}
 			u.logf("Users: resuming the unfinished one-time upgrade step for user %s, still the only configured user", p.Name)
-			return UpgradePlan{StampFor: &resumed}
+			return UpgradePlan{StampFor: &resumed}, nil
 		}
 		// The configuration no longer names p alone, and the operator chose
 		// to abandon the step (check refused the start otherwise): resuming
 		// would give what is left to someone the step was not begun for (or,
 		// with several users, to nobody the operator chose). Nothing is
-		// given.
-		recorded := "it is recorded as done"
+		// given. The abandonment counts only once the marker says so: a
+		// write that fails stops the start (nothing has acted on it yet).
 		if err := u.writeDone(now); err != nil {
-			recorded = fmt.Sprintf("recording it as done failed (%v), so the same decision is taken again at the next start", err)
+			return UpgradePlan{}, fmt.Errorf("the server does not start: %s was given to abandon the unfinished one-time upgrade step for user %s, but recording it as done in the marker %q failed: %w; nothing was given a user and the step may still be pending, so fix the cause and start the server once more with the flag",
+				AbandonUsersUpgradeFlag, p.Name, u.path, err)
 		}
-		u.logf("Users: the unfinished one-time upgrade step for user %s was abandoned, because the configured users are now %s: nothing more is given a user automatically, and %s; the sheds and snapshots still with no user stay admin-only until 'shed assign <shed> <user>' gives one to a user",
-			p.Name, describeUsers(users), recorded)
-		return UpgradePlan{}
+		u.logf("Users: the unfinished one-time upgrade step for user %s was abandoned, because the configured users are now %s: nothing more is given a user automatically, and it is recorded as done; the sheds and snapshots still with no user stay admin-only until 'shed assign <shed> <user>' gives one to a user",
+			p.Name, describeUsers(users))
+		return UpgradePlan{}, nil
 	}
-	return UpgradePlan{}
+	return UpgradePlan{}, nil
 }
 
 // describeUsers names the configured users for a log line.

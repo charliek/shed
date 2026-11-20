@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -770,6 +771,35 @@ func TestUsersUpgradePending(t *testing.T) {
 		}
 		if !containsLine(lines, "the unfinished one-time upgrade step for user alice was abandoned, because the configured users are now bob") {
 			t.Errorf("log %q", lines)
+		}
+	})
+
+	t.Run("abandoning fails when the done marker cannot be written", func(t *testing.T) {
+		dir := t.TempDir()
+		begin(dir, UpgradeUser{Name: "alice", Admin: true})
+		lines = nil
+		u := OpenUsersUpgrade(dir, true, logf)
+		// The marker was read as pending; its path is now a directory that
+		// is not empty, so renaming the done marker over it fails (for root
+		// too).
+		path := filepath.Join(dir, UsersUpgradeFile)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(path, "keep"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		plan, err := u.Begin([]UpgradeUser{{Name: "bob", Admin: true}}, true, now)
+		if err == nil || plan != (UpgradePlan{}) {
+			t.Fatalf("plan %+v err %v; want the start to fail", plan, err)
+		}
+		for _, part := range []string{"the server does not start", AbandonUsersUpgradeFlag, "for user alice", "marker " + strconv.Quote(path) + " failed", "start the server once more with the flag"} {
+			if !strings.Contains(err.Error(), part) {
+				t.Errorf("the error does not say %q: %v", part, err)
+			}
+		}
+		if containsLine(lines, "was abandoned") {
+			t.Errorf("an abandonment was logged although it was not recorded: %q", lines)
 		}
 	})
 

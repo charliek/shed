@@ -760,8 +760,9 @@ of two ways forward:
    [What stays without a user](#what-stays-without-a-user)). Stop the
    service, start the server **once** by hand with `--abandon-user-upgrade`,
    as the user the service runs as and with its config, wait for the line
-   `Shed server is ready`, stop it with Ctrl-C, and start the service
-   again (without the flag):
+   `Shed server is ready`, confirm that its log says the abandonment was
+   recorded (below), stop it with Ctrl-C, and start the service again
+   (without the flag):
 
     === "Linux package"
 
@@ -779,10 +780,20 @@ of two ways forward:
         brew services start shed
         ```
 
-    The start with the flag logs `the unfinished one-time upgrade step for
-    user pat was abandoned`. The flag is refused, and the server does not
-    start, at any start with no such step to abandon: never leave it on the
-    service's command line.
+    Before you start the service again, find this line in the log of the
+    start with the flag. It says the abandonment was recorded:
+
+    ```text
+    Users: the unfinished one-time upgrade step for user pat was abandoned, because the configured users are now admin: nothing more is given a user automatically, and it is recorded as done; ...
+    ```
+
+    If the server cannot record it (a full disk, for example), it does not
+    start, and its error begins
+    `the server does not start: --abandon-user-upgrade was given to abandon the unfinished one-time upgrade step for user pat, but recording it as done in the marker`. The
+    step may still be pending, so a start without the flag may be refused
+    again: fix the cause and start once more with the flag. The flag is refused, and the
+    server does not start, at any start with no such step to abandon: never
+    leave it on the service's command line.
 
 #### When step 1 can be skipped
 
