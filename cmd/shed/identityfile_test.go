@@ -1036,33 +1036,39 @@ func TestRefetchWithIdentityFile(t *testing.T) {
 	})
 }
 
-// TestLegacyRefetchReportsTheIdentityFile: the legacy re-pin (an entry with no
-// SSH endpoint, read over its https api_url) saves a changed identity file and
-// reports it in --json as the SSH-first refetch does.
-func TestLegacyRefetchReportsTheIdentityFile(t *testing.T) {
+// TestRefetchRefusesAnEntryWithNoSSHPort: an entry with no SSH port (one a
+// client from before mtls wrote, or one edited by hand) is not re-pinned over
+// its https api_url any more. --refetch refuses it with the commands that add
+// it again, dials nothing (no TLS connection, no host-key scan, no bootstrap)
+// and changes no file.
+func TestRefetchRefusesAnEntryWithNoSSHPort(t *testing.T) {
 	cfgPath := testClientConfig(t)
 	withCleanAddFlags(t)
-	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	t.Cleanup(tlsSrv.Close)
+	tlsSrv, conns := pinnedEndpoint(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), nil)
 	putServerEntry(t, "legacy", config.ServerEntry{Host: "127.0.0.1", APIURL: tlsSrv.URL,
 		TLSCertFingerprint: servertls.Fingerprint(tlsSrv.Certificate().Raw)})
-	key := writeKey(t, t.TempDir(), "id_work")
 	serverUpdateRefetch = true
-	serverUpdateIdentityFile = optionalString{value: key, set: true}
-	jsonFlag = true
+	serverUpdateTrustTOFU = true
+	before := snapshotFiles(t, cfgPath)
+	scans := stubHostKeyScan(t, "", errors.New("test: no scan expected"))
+	calls, _ := stubBootstrapIdentity(sdk.Credential{}, errors.New("test: no bootstrap expected"))
 
-	var err error
-	out := captureStdout(t, func() { err = runServerUpdate(nil, []string{"legacy"}) })
-	if err != nil {
-		t.Fatalf("legacy refetch: %v", err)
+	err := runServerUpdate(nil, []string{"legacy"})
+	want := `entry "legacy" has no SSH port, so it cannot be enrolled again; ` +
+		"add the server again under the same name: shed server remove NAME, then shed server add HOST --name NAME"
+	if err == nil || err.Error() != want {
+		t.Fatalf("refetch error = %v, want %q", err, want)
 	}
-	var got map[string]any
-	if err := json.Unmarshal([]byte(out), &got); err != nil || got["identity_file"] != key || got["name"] != "legacy" {
-		t.Errorf("JSON = %s (%v), want name and identity_file", out, err)
+	if bad := unsafeSuggestions(err.Error()); len(bad) != 0 {
+		t.Errorf("the refusal suggests a command with shell syntax: %q", bad)
 	}
-	if got := onDisk(t, cfgPath).Servers["legacy"].IdentityFile; got != key {
-		t.Errorf("identity_file on disk = %q, want %q", got, key)
+	if n := conns.Load(); n != 0 {
+		t.Errorf("the entry's https api_url accepted %d connection(s), want none", n)
 	}
+	if scans.calls.Load() != 0 || calls.Load() != 0 {
+		t.Errorf("scans = %d, bootstraps = %d; want none", scans.calls.Load(), calls.Load())
+	}
+	before.assertUnchanged(t)
 }
 
 // TestRefetchRefusedAfterAnotherProcessChangedTheIdentityFile is A5's

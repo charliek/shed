@@ -1249,9 +1249,11 @@ func refetchServerCredential(name string, entry *config.ServerEntry, identityFil
 		return err
 	}
 	if entry.SSHPort < 1 || entry.SSHPort > 65535 {
-		// An entry with no usable SSH endpoint (hand-edited, or written by a very
-		// old client) can still have its pin re-read the legacy way.
-		return refetchTLSPinOverHTTPS(name, entry, identityFile)
+		// An entry with no usable SSH endpoint (hand-edited, or written by a
+		// client from before mtls) cannot be enrolled again: it is added again.
+		// Nothing is dialled. The entry's name, read from the config file, is
+		// named escaped in the sentence and never put into the commands.
+		return noSSHPortError(name)
 	}
 	pin, err := ensureHostKeyPinned(entry.Host, entry.SSHPort, "", serverUpdateTrustTOFU)
 	if err != nil {
@@ -1263,6 +1265,13 @@ func refetchServerCredential(name string, entry *config.ServerEntry, identityFil
 		return err
 	}
 	return nil
+}
+
+// noSSHPortError is the refusal of --refetch for an entry with no usable SSH
+// port.
+func noSSHPortError(name string) error {
+	return fmt.Errorf("entry %q has no SSH port, so it cannot be enrolled again; "+
+		"add the server again under the same name: shed server remove NAME, then shed server add HOST --name NAME", name)
 }
 
 func refetchAfterHostKey(name string, entry *config.ServerEntry, identityFile string, pin pinnedHostKey) error {
@@ -1587,10 +1596,10 @@ func saveUpdatedServer(name string, was, updated config.ServerEntry) error {
 	return nil
 }
 
-// refetchTLSPinOverHTTPS is the legacy re-pin: read the certificate off the
-// entry's https api_url and re-pin it. It survives for `auth.mode: open`
-// servers with TLS in front of them, which have no bootstrap bundle to carry a
-// pin — and it is the reason the "no https api_url" guard still exists.
+// refetchTLSPinOverHTTPS reads the certificate off the entry's https api_url
+// and re-pins it. It serves `auth.mode: open` servers with TLS in front of
+// them, which have no bootstrap bundle to carry a pin, and it is the reason
+// the "no https api_url" guard still exists.
 //
 // identityFile is the entry's identity_file after the command (see
 // refetchServerCredential): a changed one is saved with the pin, or alone when

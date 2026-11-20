@@ -870,6 +870,10 @@ reachable from other hosts runs `mtls`.
   has it fails to load (`config key "credentials" was renamed to "mounts"; rename it`), at
   start and in `config-validate`; it used to be read when `mounts:` was absent. Rename the
   key: the entries keep their shape.
+- **CLI: the HTTPS re-pin of an entry with no SSH port.** `shed server update NAME
+  --refetch` on such an entry (written before mtls, or edited by hand) used to re-read the
+  TLS certificate over HTTPS; it now dials nothing and says to add the server again: `shed
+  server remove NAME`, then `shed server add HOST --name NAME`.
 - **Desktop: the broker modes.** The app always runs its own broker: the Preferences mode
   setting, the IPC operations `broker.mode` and `broker.set_mode`, the `identify` reply's
   `broker_mode` and the mode fields of `broker.status` are gone. A stored mode choice in
