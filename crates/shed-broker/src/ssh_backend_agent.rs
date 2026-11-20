@@ -1,4 +1,4 @@
-//! The host-agent's **agent-forward** SSH backend — the Rust port of the Go daemon's
+//! The broker's **agent-forward** SSH backend — the Rust port of the Go daemon's
 //! `ssh_backend_agent.go`. It proxies the `list`/`sign` ops to the host's existing
 //! SSH agent (Secretive, 1Password, `ssh-agent`, …) reachable at `$SSH_AUTH_SOCK`, by
 //! speaking the **ssh-agent wire protocol** directly (a minimal hand-rolled client —

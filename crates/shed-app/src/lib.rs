@@ -60,15 +60,15 @@ pub use backend::{
 #[cfg(feature = "broker")]
 pub use broker_bridge::{
     detect_mode, load_or_synthesize, machine_identity, probe_sockets, probe_sockets_at,
-    resolve_mode, BrokerConfig, BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent,
-    ModePref, ModeProbe, ResolvedMode,
+    resolve_mode, BrokerConfig, BrokerError, DetectedMode, EffectiveMode, EmbeddedBroker, ModePref,
+    ModeProbe, ResolvedMode,
 };
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};
 pub use craze_rows::{fold_plan, FoldPlan, RoostTabRef};
 pub use fakes::{AlwaysApprovedGate, FakeNotifier, NoopEventSink};
 pub use host_agent::{
-    AgentCapabilityState, CapabilitySnapshot, HelloClientInfo, HostAgentClient,
-    HostAgentClientError, HostAgentEvent,
+    AgentCapabilityState, BrokerEvent, CapabilitySnapshot, HelloClientInfo, HostAgentClient,
+    HostAgentClientError,
 };
 pub use lane_view::{LaneView, LaneViewSnapshot, MAX_VIEW_MESSAGES};
 pub use machine::{FixedPort, ForwardError, MachineForward, SshForward};
@@ -79,12 +79,12 @@ pub use roost::{
     RoostWatcherOptions, SshBridge, SshBridgeOptions, SshExec, SystemSshTunnels, TeardownSink,
     Tunnel, TunnelOpener, UnreachableReach,
 };
-/// The embedded broker's log seam ([`EmbeddedHostAgent::new`] takes one), so a
+/// The embedded broker's log seam ([`EmbeddedBroker::new`] takes one), so a
 /// client implements it without depending on `shed-broker` itself.
 #[cfg(feature = "broker")]
 pub use shed_broker::bus::BusLog;
 /// This machine's identity, as [`machine_identity`] and
-/// [`EmbeddedHostAgent::machine_identity`] hand it out — named here so an embedder
+/// [`EmbeddedBroker::machine_identity`] hand it out — named here so an embedder
 /// needs no `shed-broker` dependency of its own.
 #[cfg(feature = "broker")]
 pub use shed_broker::machine::MachineIdentity;

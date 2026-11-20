@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
-use shed_core::approval::protocol::HostAgentInbound;
+use shed_core::approval::protocol::BrokerFrame;
 use shed_core::approval::{
     namespace, ttl_shorthand_seconds, ApprovalChoice, ApprovalDecision, ApprovalMethod,
     ApprovalRequest, ApprovalScope, AuditEntry, AuditSource, DecidedBy, PendingApprovalItem,
@@ -28,7 +28,7 @@ use shed_core::approval::{
 };
 
 use crate::audit_store::AuditStore;
-use crate::host_agent::HostAgentEvent;
+use crate::host_agent::BrokerEvent;
 use crate::traits::{
     AuthGateRef, AuthOutcome, AuthPrompt, ClockRef, CoordinatorEvent, EventSinkRef, NotifierRef,
     PostedNotification, ResponderRef,
@@ -90,7 +90,7 @@ pub struct CoordinatorDeps {
 }
 
 enum Command {
-    Host(HostAgentEvent),
+    Host(BrokerEvent),
     Expire(Option<oneshot::Sender<()>>),
     Decide {
         id: String,
@@ -153,13 +153,10 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// Spawn the actor + a task forwarding host-agent events into it. Returns the
+    /// Spawn the actor + a task forwarding broker events into it. Returns the
     /// handle. Call [`start_expiry_tick`](Self::start_expiry_tick) to drive the
     /// 1s expiry in production (tests drive `expire_now` deterministically).
-    pub fn spawn(
-        deps: CoordinatorDeps,
-        host_events: mpsc::UnboundedReceiver<HostAgentEvent>,
-    ) -> Self {
+    pub fn spawn(deps: CoordinatorDeps, host_events: mpsc::UnboundedReceiver<BrokerEvent>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut state = State {
             pending: HashMap::new(),
@@ -502,13 +499,13 @@ async fn run(mut state: State, mut rx: mpsc::UnboundedReceiver<Command>) {
 }
 
 impl State {
-    fn handle_host_event(&mut self, ev: HostAgentEvent) {
+    fn handle_host_event(&mut self, ev: BrokerEvent) {
         match ev {
-            HostAgentEvent::Connected(ack) => {
+            BrokerEvent::Connected(ack) => {
                 self.gate_namespaces = ack.gate_namespaces;
                 self.sink.emit(CoordinatorEvent::Connected);
             }
-            HostAgentEvent::Disconnected => {
+            BrokerEvent::Disconnected => {
                 // F3: in-flight requests are dead (the agent fails closed on its
                 // side); drop them so the user can't act on / persist a rule from a
                 // stale prompt.
@@ -530,7 +527,7 @@ impl State {
                 self.gate_namespaces.clear();
                 self.sink.emit(CoordinatorEvent::Connected);
             }
-            HostAgentEvent::Untrusted => {
+            BrokerEvent::Untrusted => {
                 // A1: the socket peer isn't running as us — we never handshook, so
                 // there's no delegation. Record a distinct reason (so it's not a
                 // silent connecting… loop) and keep the "not connected" indicator.
@@ -539,9 +536,9 @@ impl State {
                 self.gate_namespaces.clear();
                 self.sink.emit(CoordinatorEvent::Connected);
             }
-            HostAgentEvent::Frame(frame) => match *frame {
-                HostAgentInbound::ApprovalRequest(req) => self.handle_approval_request(req),
-                HostAgentInbound::Event(evt) => {
+            BrokerEvent::Frame(frame) => match *frame {
+                BrokerFrame::ApprovalRequest(req) => self.handle_approval_request(req),
+                BrokerFrame::Event(evt) => {
                     let entry =
                         AuditEntry::from_event_frame(evt, new_id(), self.clock.now_iso8601());
                     self.audit.append(entry);
@@ -1247,7 +1244,7 @@ mod tests {
         assert!(h.wait_calls(2).await);
         assert_eq!(h.responder.calls()[1].decided_by, DecidedBy::Policy);
         // Disconnect → the grant (and pending) are dropped.
-        h.events.send(HostAgentEvent::Disconnected).unwrap();
+        h.events.send(BrokerEvent::Disconnected).unwrap();
         assert!(h.wait_queued(0).await);
         // r3 same shed must RE-PROMPT (queue, not auto-approve) — the grant is gone.
         h.inject(ssh_req("r3", "s", 5_000));
@@ -1299,7 +1296,7 @@ mod tests {
 
     struct Harness {
         coord: Coordinator,
-        events: mpsc::UnboundedSender<HostAgentEvent>,
+        events: mpsc::UnboundedSender<BrokerEvent>,
         responder: Arc<FakeResponder>,
         clock: ClockHandle,
     }
@@ -1335,9 +1332,9 @@ mod tests {
 
         fn inject(&self, req: ApprovalRequest) {
             self.events
-                .send(HostAgentEvent::Frame(Box::new(
-                    HostAgentInbound::ApprovalRequest(req),
-                )))
+                .send(BrokerEvent::Frame(Box::new(BrokerFrame::ApprovalRequest(
+                    req,
+                ))))
                 .unwrap();
         }
 
@@ -1690,7 +1687,7 @@ mod tests {
             .await;
         h.inject(ssh_req("r1", "s", 5_000));
         assert!(h.wait_queued(1).await);
-        h.events.send(HostAgentEvent::Disconnected).unwrap();
+        h.events.send(BrokerEvent::Disconnected).unwrap();
         assert!(h.wait_queued(0).await);
         // A late decide sends nothing (the request is gone).
         h.coord
@@ -1860,9 +1857,7 @@ mod tests {
             ts: Some(iso(1_000)),
         };
         h.events
-            .send(HostAgentEvent::Frame(Box::new(HostAgentInbound::Event(
-                evt,
-            ))))
+            .send(BrokerEvent::Frame(Box::new(BrokerFrame::Event(evt))))
             .unwrap();
         for _ in 0..300 {
             let a = h.coord.activity_list(10).await;
@@ -1880,7 +1875,7 @@ mod tests {
     async fn gate_namespaces_from_hello_ack() {
         let h = Harness::new(1_000);
         h.events
-            .send(HostAgentEvent::Connected(shed_core::approval::HelloAck {
+            .send(BrokerEvent::Connected(shed_core::approval::HelloAck {
                 namespaces: vec![],
                 gate_namespaces: vec!["ssh-agent".into()],
                 agent_capabilities: vec![],
@@ -1900,7 +1895,7 @@ mod tests {
 
         // Down-edge: a disconnect clears the delegation, so the UI's "connected"
         // indicator (derived from a non-empty namespace set) flips back.
-        h.events.send(HostAgentEvent::Disconnected).unwrap();
+        h.events.send(BrokerEvent::Disconnected).unwrap();
         for _ in 0..300 {
             if h.coord.gate_namespaces().await.is_empty() {
                 return;

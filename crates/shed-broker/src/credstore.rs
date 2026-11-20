@@ -8,8 +8,7 @@
 //!
 //! ```text
 //! shed CLI (Go)              control-scope credential      ~/.shed/creds/<server>/
-//! host-agent (Go)            credentials-scope             its own state dir
-//! broker (this crate)        credentials-scope             <state>/host-agent/creds/credentials/<server>/
+//! broker (this crate)        credentials-scope             <state>/broker/creds/credentials/<server>/
 //! ```
 //!
 //! One certificate carries one scope, and two processes rotating independently would
@@ -167,8 +166,8 @@ impl CredStore {
         Ok(())
     }
 
-    /// The production store for a credential `scope`, under the agent's durable state
-    /// directory (`<state>/host-agent/creds/<scope>` — see [`crate::sockets::state_dir`]
+    /// The production store for a credential `scope`, under the broker's durable state
+    /// directory (`<state>/broker/creds/<scope>` — see [`crate::sockets::state_dir`]
     /// for why that is NOT the socket dir on Linux).
     ///
     /// The scope is part of the path rather than of the filename because one certificate
@@ -177,7 +176,7 @@ impl CredStore {
     pub fn for_scope(scope: &str) -> Self {
         Self::new(
             crate::sockets::state_dir()
-                .join("host-agent")
+                .join("broker")
                 .join("creds")
                 .join(escape_server_name(scope)),
         )
@@ -1010,18 +1009,18 @@ mod tests {
     #[test]
     fn for_scope_is_state_rooted_and_scope_separated() {
         let _guard = crate::env_lock();
-        std::env::set_var("SHED_HOST_AGENT_STATE_DIR", "/tmp/shed-state-test");
+        std::env::set_var("SHED_BROKER_STATE_DIR", "/tmp/shed-state-test");
         let creds = CredStore::for_scope("credentials");
         assert_eq!(
             creds.root(),
-            Path::new("/tmp/shed-state-test/host-agent/creds/credentials")
+            Path::new("/tmp/shed-state-test/broker/creds/credentials")
         );
         // A different scope is a different root — one certificate carries one scope.
         assert_ne!(creds.root(), CredStore::for_scope("control").root());
         assert_eq!(
             creds.paths("mini3").0,
-            Path::new("/tmp/shed-state-test/host-agent/creds/credentials/mini3/client.pem")
+            Path::new("/tmp/shed-state-test/broker/creds/credentials/mini3/client.pem")
         );
-        std::env::remove_var("SHED_HOST_AGENT_STATE_DIR");
+        std::env::remove_var("SHED_BROKER_STATE_DIR");
     }
 }

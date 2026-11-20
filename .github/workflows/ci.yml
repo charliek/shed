@@ -41,7 +41,7 @@ jobs:
       tauri: ${{ steps.filter.outputs.tauri }}
       packaging: ${{ steps.filter.outputs.packaging }}
       harness: ${{ steps.filter.outputs.harness }}
-      hostagent: ${{ steps.filter.outputs.hostagent }}
+      brokerwire: ${{ steps.filter.outputs.brokerwire }}
       machinetransport: ${{ steps.filter.outputs.machinetransport }}
       integrationunits: ${{ steps.filter.outputs.integrationunits }}
       docs: ${{ steps.filter.outputs.docs }}
@@ -115,7 +115,7 @@ jobs:
               - 'desktop/pyproject.toml'
               - 'desktop/uv.lock'
               - 'craze-pin.env'
-            hostagent:
+            brokerwire:
               # The broker wire-goldens leg: the desktop app's embedded broker
               # (shed-broker, and shed-app's `broker` bridge that hosts it), the
               # test-only process that runs it for the harness, their shared wire
@@ -132,8 +132,8 @@ jobs:
               - 'crates/Cargo.lock'
               - 'sdk/**'
               - 'internal/ext/protocol/**'
-              - 'tests/host-agent-diff/**'
-              - 'docs/development/host-agent-wire-catalog.md'
+              - 'tests/broker-wire/**'
+              - 'docs/development/broker-wire-catalog.md'
               - 'go.mod'
               - 'go.sum'
             machinetransport:
@@ -210,7 +210,7 @@ jobs:
       # crates/fixtures/shellword/, is read by internal/config's
       # TestShellWordSharedTable, which `go test ./...` above runs. The Rust
       # side of the stderr table, in shed-broker, runs in core-mac and
-      # host-agent-diff; of the shellword table, in shed-core, in core-mac and
+      # broker-wire; of the shellword table, in shed-core, in core-mac and
       # core-linux. A change to only crates/fixtures/** or the Rust text runs
       # this job too: the `gocrossread` filter.)
       - name: sdk text checks against the Rust broker (no ssh)
@@ -574,10 +574,10 @@ jobs:
   # embedded broker in that host and asserts its wire-visible output against
   # goldens recorded from the last agreeing Go↔Rust run. Rust + Python on one
   # runner (the "third pytest suite").
-  host-agent-diff:
-    name: host-agent-diff (wire goldens)
+  broker-wire:
+    name: broker-wire (wire goldens)
     needs: changes
-    if: ${{ needs.changes.outputs.hostagent == 'true' || needs.changes.outputs.ci == 'true' }}
+    if: ${{ needs.changes.outputs.brokerwire == 'true' || needs.changes.outputs.ci == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -612,7 +612,7 @@ jobs:
       - name: Wire goldens + golden runners
         # Builds shed-broker-harness (conftest) and runs the pytest suite against
         # the recorded goldens + the Rust golden-fixture runners.
-        run: make test-host-agent-diff
+        run: make test-broker-wire
 
   # The machine-transport differential's LIVE leg (plan 025 C5, P10): every
   # scenario's wire line through a throwaway sshd on 127.0.0.1, asserting the
@@ -993,12 +993,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, pins, release-snapshot, server-deb-upgrade, core-mac, core-linux, host-agent-diff, machine-transport, integration-units, deb, images, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, pins, release-snapshot, server-deb-upgrade, core-mac, core-linux, broker-wire, machine-transport, integration-units, deb, images, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.server-deb-upgrade.result }} ${{ needs.core-mac.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.images.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.server-deb-upgrade.result }} ${{ needs.core-mac.result }} ${{ needs.core-linux.result }} ${{ needs.broker-wire.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.images.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in

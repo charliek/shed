@@ -272,7 +272,7 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     # `$XDG_DATA_HOME`, which an isolated HOME does not redirect, so a developer with
     # that exported would have a hermetic run write `machine.json` into their real data
     # dir (and two cells would share one identity).
-    env["SHED_HOST_AGENT_STATE_DIR"] = str(runtime_dir / "host-agent-state")
+    env["SHED_BROKER_STATE_DIR"] = str(runtime_dir / "broker-state")
     env[f"{cfg.env_prefix}_TEST_MODE"] = "1"
     env[f"{cfg.env_prefix}_MOCK_BASE_URL"] = mock_base_url
     env[f"{cfg.env_prefix}_SHED_CONFIG"] = str(config_path)

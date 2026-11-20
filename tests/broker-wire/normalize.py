@@ -11,9 +11,8 @@ of which now serve the recorded goldens:
 * **D3 — determinism over blanking.** Mask as *little* as possible: only the fields
   that genuinely vary run-to-run (`pid`, `version`, timestamps, absolute paths). Every
   masked timestamp has its **RFC3339 shape asserted before** it is replaced, so the
-  mask can't hide a malformed value. Structure is preserved — e.g. the approval-channel
-  socket path keeps its `host-agent.sock` basename; only the volatile dir prefix is
-  masked.
+  mask can't hide a malformed value. Structure is preserved: a masked field keeps its
+  key and is checked (a path absolute, an id of the right shape) before it is replaced.
 """
 
 from __future__ import annotations

@@ -52,7 +52,7 @@ func TestBootstrapOpenServerRefusal(t *testing.T) {
 		// handler must refuse on its own.
 		{"auth.ssh warn with the key listed", KeyAuth{Mode: config.SSHAuthWarn, Users: listed}},
 	} {
-		for _, cmd := range []string{"", "control", "control cli", "credentials host-agent", csr} {
+		for _, cmd := range []string{"", "control", "control cli", "credentials broker", csr} {
 			t.Run(tc.name+"/"+strings.SplitN(cmd, " csr=", 2)[0], func(t *testing.T) {
 				s := &Server{keyAuth: tc.auth}
 				// Even a server that somehow has a CA wired must not issue.
@@ -189,7 +189,7 @@ func TestMintBootstrapMTLSBundle(t *testing.T) {
 	ca := testCA(t)
 	s := mtlsServer(t, key, ca)
 
-	bundle, err := s.mintBootstrapKey(key, "credentials host-agent csr="+testCSR(t, elliptic.P256()))
+	bundle, err := s.mintBootstrapKey(key, "credentials broker csr="+testCSR(t, elliptic.P256()))
 	if err != nil {
 		t.Fatalf("mintBootstrap: %v", err)
 	}
@@ -224,8 +224,8 @@ func TestMintBootstrapMTLSBundle(t *testing.T) {
 	if len(leaf.Subject.OrganizationalUnit) != 1 || leaf.Subject.OrganizationalUnit[0] != authtoken.ScopeCredentials {
 		t.Errorf("subject OU = %v, want [credentials]", leaf.Subject.OrganizationalUnit)
 	}
-	if len(leaf.Subject.Organization) != 1 || leaf.Subject.Organization[0] != authtoken.ClientHostAgent {
-		t.Errorf("subject O = %v, want [host-agent]", leaf.Subject.Organization)
+	if len(leaf.Subject.Organization) != 1 || leaf.Subject.Organization[0] != authtoken.ClientBroker {
+		t.Errorf("subject O = %v, want [broker]", leaf.Subject.Organization)
 	}
 	if !bundle.ExpiresAt.Equal(leaf.NotAfter) {
 		t.Errorf("expires_at = %s, want leaf NotAfter %s", bundle.ExpiresAt, leaf.NotAfter)
@@ -282,7 +282,7 @@ func TestMintBootstrapMTLSCSRPositionIndependent(t *testing.T) {
 func TestMintBootstrapMTLSRequiresCSR(t *testing.T) {
 	key := testKey(t)
 	s := mtlsServer(t, key, testCA(t))
-	for _, cmd := range []string{"", "control", "control cli", "credentials host-agent"} {
+	for _, cmd := range []string{"", "control", "control cli", "credentials broker"} {
 		_, err := s.mintBootstrapKey(key, cmd)
 		if err == nil {
 			t.Fatalf("%q: expected error", cmd)
@@ -371,7 +371,7 @@ func TestMintBootstrapClientKindNormalization(t *testing.T) {
 		want string
 	}{
 		{"cli", authtoken.ClientCLI},
-		{"host-agent", authtoken.ClientHostAgent},
+		{"broker", authtoken.ClientBroker},
 		{"desktop", authtoken.ClientDesktop},
 		{"mobile", authtoken.ClientMobile},
 		{"shed-mobile", authtoken.ClientMobile},

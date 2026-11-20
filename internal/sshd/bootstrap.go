@@ -303,7 +303,7 @@ func parseBootstrapRequest(rawCmd string) (bootstrapRequest, error) {
 // bookkeeping, so the normalization is safe to apply uniformly.
 func normalizeClientKind(arg string) string {
 	switch arg {
-	case authtoken.ClientCLI, authtoken.ClientHostAgent, authtoken.ClientDesktop, authtoken.ClientMobile:
+	case authtoken.ClientCLI, authtoken.ClientBroker, authtoken.ClientDesktop, authtoken.ClientMobile:
 		return arg
 	case legacyMobileClientKind:
 		return authtoken.ClientMobile

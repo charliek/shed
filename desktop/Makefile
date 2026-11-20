@@ -48,7 +48,7 @@ run: tauri-run  ## Alias: tauri-run
 .PHONY: core-test core-lint core-fmt core-linux
 core-test:  ## cargo test the Rust core workspace (+ the non-default `broker` feature)
 	cd ../crates && cargo test
-	# `broker` (the embedded host-agent bridge) is non-default, so a bare
+	# `broker` (the embedded broker bridge) is non-default, so a bare
 	# `cargo test` skips `broker_bridge.rs` entirely. `rc` was the other
 	# non-default feature until plan 022 (S6, charliek/shed#328) deleted it.
 	cd ../crates && cargo test -p shed-app --features broker

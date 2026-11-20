@@ -112,10 +112,10 @@ DEFAULT_SHEDS = [
 # `bus.rs`) drives against a shed-server, plus the always-on egress consumer route.
 # Wire shapes are derived from the REAL server contract and pinned against two
 # in-repo references (the §3.8 anti-drift pin) so the two fakes can't diverge:
-#   * `tests/host-agent-diff/synthetic_bus.py` — the Go-vs-Rust differential bus
+#   * `tests/broker-wire/synthetic_bus.py` — the Go-vs-Rust differential bus
 #     (identical `_MESSAGES_RE`/`_RESPOND_RE`/`_EGRESS_PATH`, `data: {json}\n\n`
 #     SSE framing, 204-on-respond, 409-terminal-conflict, 501-egress-unavailable);
-#   * `docs/development/host-agent-wire-catalog.md` §0/§9 (the observable channels).
+#   * `docs/development/broker-wire-catalog.md` §0/§9 (the observable channels).
 #
 # Only the embedded-broker cells exercise these (the mock object is shared, but
 # these routes stay dormant for every non-broker test).
@@ -125,7 +125,7 @@ _EGRESS_PATH = "/api/egress/stream"
 
 # The machine pin (plan 035 §3.4): the identity headers every subscribe and respond
 # carries, and the pinned refusals a pinning server answers. KEPT IDENTICAL to
-# `tests/host-agent-diff/synthetic_bus.py` (`_REFUSALS`, `_RESPOND_REFUSALS`,
+# `tests/broker-wire/synthetic_bus.py` (`_REFUSALS`, `_RESPOND_REFUSALS`,
 # `NOT_SOURCE_ACTIVE`) — the same anti-drift pin as the routes above.
 MACHINE_ID_HEADER = "X-Shed-Machine-Id"
 MACHINE_NAME_HEADER = "X-Shed-Machine-Name"
@@ -150,7 +150,7 @@ _REFUSALS: dict[str, tuple[int, object]] = {
         {
             "error": {
                 "code": "SOURCE_MACHINE_ID_REQUIRED",
-                "message": "this server needs shed-host-agent and shed-desktop 0.10.0 or newer",
+                "message": "this server needs to know which machine is asking; install the current shed desktop app",
             }
         },
     ),
@@ -314,8 +314,8 @@ class MockShedServer:
         # machine, at the same generation, every request still pending on its namespace
         # (`plugin.Registry` `pendingForLocked`); this mock never re-sends a pending
         # request on a later stream, so no cell here can see the daemon/app handoff of an
-        # in-flight request. That handoff is exercised against the host-agent harness's
-        # synthetic bus, which does model it (`tests/host-agent-diff/synthetic_bus.py`,
+        # in-flight request. That handoff is exercised against the broker wire harness's
+        # synthetic bus, which does model it (`tests/broker-wire/synthetic_bus.py`,
         # `test_source_pin.py`).
         self._bus_pending: dict[tuple[str, str], dict] = {}
         # Set while `pause()` has the server down; the port it serves (kept across one).

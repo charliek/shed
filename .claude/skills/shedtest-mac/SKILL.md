@@ -25,7 +25,7 @@ make -C desktop e2e                # e2e-tauri: the hermetic pytest harness (no 
 That is what CI runs on `macos-15`: the **`tauri-mac`** job (`tauri-lint`, `tauri-test`, the
 craze binaries, `SHED_TAURI_TEST_TIMEOUT_SCALE=4 make -C desktop e2e-tauri`, then the bundle
 smoke below) and the **`core-mac`** job (`make -C desktop core-test core-lint` — the
-`cfg(target_os = "macos")` paths in `crates/`, e.g. `shed-host-agent`'s Touch ID gate, only
+`cfg(target_os = "macos")` paths in `crates/`, e.g. `shed-broker`'s Touch ID gate, only
 compile there).
 
 - **Craze cells.** `test_tauri_craze.py` drives the real craze hub and skips without the
@@ -119,7 +119,7 @@ holds.
   and the test-mode `ui.press_source_use {host}` door (the window clicks its own
   `button[data-source-use]`), against the mock armed with `arm_source`. Nothing here is
   macOS-specific, but the machine identity file lives under the harness's
-  `SHED_HOST_AGENT_STATE_DIR` (`<runtime>/host-agent-state`), never `~/Library/Application
+  `SHED_BROKER_STATE_DIR` (`<runtime>/broker-state`), never `~/Library/Application
   Support/shed` — a run that finds a real `machine.json` there has lost its hermeticity. The
   shedtest-linux skill has the op and mock details.
 

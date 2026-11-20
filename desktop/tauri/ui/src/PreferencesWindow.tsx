@@ -28,7 +28,7 @@ import {
   type SourceReader, type SourcesState,
 } from "@/lib/sources";
 
-/* The credential namespaces the host agent can delegate (mac CredentialNamespace). */
+/* The credential namespaces the credential broker can delegate (mac CredentialNamespace). */
 const NS_SSH = "ssh-agent";
 const NS_AWS = "aws-credentials";
 const NS_DOCKER = "docker-credentials";
@@ -62,10 +62,10 @@ const BROKER_MODES: { id: BrokerMode; label: string }[] = [
 
 // The human line for the active effective mode — mac-style live note.
 const BROKER_EFFECTIVE_NOTE: Record<BrokerStatus["effective_mode"], string> = {
-  external: "Brokering credentials via the shed-host-agent daemon.",
+  external: "Brokering credentials via a separate broker daemon.",
   embedded: "Brokering credentials in-app — no separate daemon needed.",
   "headless-coexist":
-    "Brokering handled by a headless shed-host-agent; in-app approvals unavailable.",
+    "Brokering handled by a separate headless broker; in-app approvals unavailable.",
 };
 
 /** A titled grouped card: the mac per-section mono label + the rounded container
@@ -176,7 +176,7 @@ export default function PreferencesWindow() {
   const sshGen = useRef(0);
   const reloadGen = useRef(0); // bumped per reloadAll; guards every fetch's application
   const ttlAtFocus = useRef(""); // the Duration value when the field gained focus
-  // Which namespaces the host agent delegates here — gates the approval sections.
+  // Which namespaces the credential broker delegates here — gates the approval sections.
   // Own subscription (separate React root ⇒ separate hook instance from the shell's).
   const gateNs = useCoordinatorData<string[]>("connected-changed", fetchGateNamespaces, []);
 
@@ -677,14 +677,14 @@ export default function PreferencesWindow() {
             })}
           </Section>
           <Footnote>
-            Automatic uses the in-app broker when no shed-host-agent is running, and the
+            Automatic uses the in-app broker when no separate broker daemon is running, and the
             daemon when it is. Changes take effect{" "}
             {brokerRestart ? <strong>after you restart Shed Desktop.</strong> : "on the next launch."}
             {sourceRows.length > 0 && (
               <span className="mt-1.5 block" data-source-footnote>
                 One machine answers credential requests per server, and nothing fails over on
                 its own: if the source is off, nothing answers until you choose another. The
-                in-app broker connects at once; a separate shed-host-agent switches within
+                in-app broker connects at once; a separate broker daemon switches within
                 about half a minute. Moving the source here drops any approval still waiting
                 on the other machine.
               </span>

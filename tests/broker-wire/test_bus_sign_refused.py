@@ -56,7 +56,7 @@ SHED = {"name": "web", "backend": "vz", "server": "mini2"}
 SIGN_FAILED = {"error": "sign operation failed", "code": "SIGN_FAILED"}
 
 # The old cells' arbitrary challenge: neither a login request nor an SSHSIG blob.
-OLD_CHALLENGE = b"shed-host-agent gated-sign differential challenge v1"
+OLD_CHALLENGE = b"broker-wire gated-sign differential challenge v1"
 
 
 def _login(user: bytes) -> bytes:

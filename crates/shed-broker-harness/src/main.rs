@@ -1,5 +1,5 @@
 //! shed-broker-harness — a TEST-ONLY process that runs the desktop app's embedded
-//! credential broker, so the wire harness (`tests/host-agent-diff`) can drive it as a
+//! credential broker, so the wire harness (`tests/broker-wire`) can drive it as a
 //! process: a config file in, the bus and the audit file out, a control socket for
 //! status, approval frames and decisions.
 //!
@@ -8,7 +8,7 @@
 //! ```
 //!
 //! It is the app's broker exactly (`shed_app::load_or_synthesize`, then
-//! `EmbeddedHostAgent::new` + `spawn`), minus the app's Coordinator: the control
+//! `EmbeddedBroker::new` + `spawn`), minus the app's Coordinator: the control
 //! socket (`control.rs`) stands where the Coordinator sits. It lists no keys at
 //! spawn, as the app does not.
 //!
@@ -31,7 +31,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
-use shed_app::{load_or_synthesize, EmbeddedHostAgent};
+use shed_app::{load_or_synthesize, EmbeddedBroker};
 use shed_broker::bus::{BusLog, FileBusLog};
 use shed_broker::config::expand_tilde;
 use shed_broker::status::now_rfc3339;
@@ -138,7 +138,7 @@ async fn serve(args: Args) -> i32 {
     let started_at = now_rfc3339();
     let config_path = status_config_path(&args.config);
 
-    let (agent, events) = EmbeddedHostAgent::new(cfg.clone(), log.clone());
+    let (agent, events) = EmbeddedBroker::new(cfg.clone(), log.clone());
     let agent = Arc::new(agent);
     if let Err(e) = agent.spawn().await {
         log.error(&format!("broker did not start error={e}"));

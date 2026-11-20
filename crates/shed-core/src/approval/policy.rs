@@ -2,7 +2,7 @@
 //!
 //! Given a request, the configured rules, and the set of currently-valid session
 //! grants, returns approve | deny | prompt with the gate to apply. No I/O — the
-//! whole matrix is unit-testable without a host agent.
+//! whole matrix is unit-testable without a broker.
 
 use std::collections::HashSet;
 

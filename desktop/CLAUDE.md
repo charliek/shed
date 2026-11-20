@@ -143,9 +143,9 @@ Test pointers:
 - The mock server's plugin-bus routes live in `desktop/tools/shedtest/mockserver.py`
   (`GET /api/plugins/listeners/{ns}/messages` SSE + `POST
   /api/plugins/listeners/{ns}/respond`), shape-pinned against
-  `tests/host-agent-diff`'s synthetic bus and `docs/development/host-agent-wire-catalog.md`
+  `tests/broker-wire`'s synthetic bus and `docs/development/broker-wire-catalog.md`
   so the fakes can't drift independently.
-- The `tests/host-agent-diff` wire harness (`make test-host-agent-diff`) still protects
+- The `tests/broker-wire` wire harness (`make test-broker-wire`) still protects
   the extracted `shed-broker` core itself — it doesn't know about the embedded path,
   only that the standalone daemon built from the same lib matches its pinned goldens.
 

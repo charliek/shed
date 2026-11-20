@@ -1,7 +1,7 @@
 """A fake ssh-agent on a UDS for the agent-forward cells.
 
-Stands in for the host SSH agent ($SSH_AUTH_SOCK) that the host-agent's
-**agent-forward** backend (`crates/shed-host-agent/ssh_backend_agent.rs`, the
+Stands in for the host SSH agent ($SSH_AUTH_SOCK) that the broker's
+**agent-forward** backend (`crates/shed-broker/src/ssh_backend_agent.rs`, the
 hand-rolled client) proxies to, so the three messages it speaks are exercised against
 a deterministic peer.
 

@@ -1,6 +1,6 @@
 """A broker started with a valid-YAML-but-INVALID (or malformed) `--config` exits 1 —
 the live half of the config-validate contract. Each vector is a config
-`HostAgentConfig::load` must reject: an unknown/biometric policy, an
+`ExtensionsYaml::load` must reject: an unknown/biometric policy, an
 `aws.mode`/`aws.sheds` error, a non-positive/invalid `approval_timeout`, a duplicate
 map key, or malformed YAML. (The vector set is the one the retired Go
 `LoadConfig`/`Validate` rejected; the saphyr parser + `validate()` port matched it,

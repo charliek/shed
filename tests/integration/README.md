@@ -745,7 +745,7 @@ one), and the user or an admin moves the binding with `shed source use`.
 through synthetic machines (`fixtures/busclient.py: FakeMachine`): a test
 identity's credentials certificate plus a machine id and name, subscribing
 and answering as a broker does. No real broker runs (the broker side is
-`tests/host-agent-diff`).
+`tests/broker-wire`).
 
 | Case | Shows |
 |---|---|

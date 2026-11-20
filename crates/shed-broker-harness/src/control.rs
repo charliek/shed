@@ -31,8 +31,8 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch, Notify};
 
-use shed_app::{HostAgentEvent, ResponderRef};
-use shed_core::approval::protocol::{AuditEventFrame, HostAgentInbound};
+use shed_app::{BrokerEvent, ResponderRef};
+use shed_core::approval::protocol::{AuditEventFrame, BrokerFrame};
 use shed_core::approval::{ApprovalDecision, ApprovalRequest, DecidedBy};
 
 /// The frames the bridge has sent and no subscriber has taken yet, plus the one
@@ -74,10 +74,10 @@ impl Hub {
 /// (the request as the app receives it; `server` left out when empty, as in
 /// single-server mode) or `event` (the audit row the bridge fans in; absent fields
 /// left out). Any other frame the bridge never sends: `None`.
-pub fn frame_json(frame: &HostAgentInbound) -> Option<String> {
+pub fn frame_json(frame: &BrokerFrame) -> Option<String> {
     let value = match frame {
-        HostAgentInbound::ApprovalRequest(req) => approval_request_json(req),
-        HostAgentInbound::Event(ev) => event_json(ev),
+        BrokerFrame::ApprovalRequest(req) => approval_request_json(req),
+        BrokerFrame::Event(ev) => event_json(ev),
         _ => return None,
     };
     Some(value.to_string())
@@ -122,9 +122,9 @@ fn event_json(ev: &AuditEventFrame) -> Value {
 
 /// Move every frame the bridge sends into the hub, until the bridge's sender is gone.
 /// The synthesized `Connected` carries nothing the harness reports.
-pub async fn pump(mut events: mpsc::UnboundedReceiver<HostAgentEvent>, hub: Arc<Hub>) {
+pub async fn pump(mut events: mpsc::UnboundedReceiver<BrokerEvent>, hub: Arc<Hub>) {
     while let Some(event) = events.recv().await {
-        if let HostAgentEvent::Frame(frame) = event {
+        if let BrokerEvent::Frame(frame) = event {
             if let Some(line) = frame_json(&frame) {
                 hub.push(line);
             }
@@ -482,7 +482,7 @@ mod tests {
             detail: "SSH sign request".into(),
             expires_at: "2026-01-01T00:00:25Z".into(),
         };
-        let line = frame_json(&HostAgentInbound::ApprovalRequest(req.clone())).unwrap();
+        let line = frame_json(&BrokerFrame::ApprovalRequest(req.clone())).unwrap();
         let value: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
             value,
@@ -497,7 +497,7 @@ mod tests {
             server: "server-b".into(),
             ..req
         };
-        let line = frame_json(&HostAgentInbound::ApprovalRequest(named)).unwrap();
+        let line = frame_json(&BrokerFrame::ApprovalRequest(named)).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap()["server"],
             "server-b"
@@ -517,7 +517,7 @@ mod tests {
             request_id: None,
             ts: Some("2026-01-01T00:00:01Z".into()),
         };
-        let line = frame_json(&HostAgentInbound::Event(ev)).unwrap();
+        let line = frame_json(&BrokerFrame::Event(ev)).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap(),
             json!({
@@ -525,6 +525,6 @@ mod tests {
                 "result": "denied", "approval": "shed-desktop", "ts": "2026-01-01T00:00:01Z",
             })
         );
-        assert_eq!(frame_json(&HostAgentInbound::Ping { id: "p".into() }), None);
+        assert_eq!(frame_json(&BrokerFrame::Ping { id: "p".into() }), None);
     }
 }

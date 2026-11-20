@@ -5,7 +5,7 @@
 //!
 //! * **External** — a `shed-host-agent` desktop daemon is running: today's
 //!   `HostAgentClient` over its UDS, unchanged (zero breakage for daemon users).
-//! * **Embedded** — no daemon: start the in-process `EmbeddedHostAgent` (bus broker +
+//! * **Embedded** — no daemon: start the in-process `EmbeddedBroker` (bus broker +
 //!   approvals + minting), living and dying with the app.
 //! * **HeadlessCoexist** — a deliberately-run *headless* daemon owns brokering: the app
 //!   does NOT start a bus (no 409 fights) and gets no approvals; it keeps only the
@@ -26,8 +26,8 @@ use tokio::sync::mpsc;
 
 use shed_app::traits::{ClockRef, Responder, ResponderRef};
 use shed_app::{
-    load_or_synthesize, resolve_mode, AuthModeRegistry, BrokerConfig, EffectiveMode,
-    EmbeddedHostAgent, HelloClientInfo, HostAgentClient, HostAgentEvent, HostAgentTokenMinter,
+    load_or_synthesize, resolve_mode, AuthModeRegistry, BrokerConfig, BrokerEvent,
+    EffectiveMode, EmbeddedBroker, HelloClientInfo, HostAgentClient, HostAgentTokenMinter,
     MachineIdentity, ModePref, ModeProbe,
 };
 use shed_core::approval::{ApprovalDecision, DecidedBy};
@@ -43,7 +43,7 @@ pub struct Spine {
     pub minter: Option<Arc<dyn TokenMinter>>,
     /// The Coordinator's event stream (approval requests + audit rows, or a closed
     /// stream = approvals dark).
-    pub event_rx: mpsc::UnboundedReceiver<HostAgentEvent>,
+    pub event_rx: mpsc::UnboundedReceiver<BrokerEvent>,
     /// The Coordinator's decision sink.
     pub responder: ResponderRef,
     /// The observability + lifecycle handle, managed in Tauri state.
@@ -83,7 +83,7 @@ pub struct BrokerRuntime {
     /// The embedded agent — `Some` in embedded + headless-coexist (config OK); `None`
     /// in external mode or when config failed closed. Held for `health()` /
     /// `resolved_ssh_mode()` reads and the shutdown handle.
-    agent: Option<Arc<EmbeddedHostAgent>>,
+    agent: Option<Arc<EmbeddedBroker>>,
     /// Embedded only: spawn the bus at [`start`](Self::start) (after the Coordinator is
     /// consuming). False for coexist (mint-only) + failed.
     should_spawn: bool,
@@ -296,7 +296,7 @@ impl Responder for NoopResponder {
 }
 
 /// Build the mode-specific spine. Runs inside the Tauri tokio runtime (external's
-/// `HostAgentClient::start` + `EmbeddedHostAgent::new` both `tokio::spawn`); the bus
+/// `HostAgentClient::start` + `EmbeddedBroker::new` both `tokio::spawn`); the bus
 /// itself starts later, via [`BrokerRuntime::start`], once the Coordinator is consuming.
 ///
 /// `probe` is taken by the caller BEFORE entering async (bounded-blocking `connect(2)`s).
@@ -378,7 +378,7 @@ fn build_embedded(
             };
             // The broker's own lines (bus connects, drops, 409s, handler warnings) go
             // to the app's log file, not just stderr (#414).
-            let (agent, agent_rx) = EmbeddedHostAgent::new(
+            let (agent, agent_rx) = EmbeddedBroker::new(
                 cfg.into_config(),
                 Arc::new(crate::applog::BrokerLog),
             );
@@ -441,7 +441,7 @@ fn build_embedded(
 /// A closed event stream + no-op Responder: the Coordinator's feeder task ends at once,
 /// but the actor lives on (fed by its own command channel), so prefs/approval reads keep
 /// working — approvals are simply dark. The dropped sender is intentional.
-fn empty_source() -> (mpsc::UnboundedReceiver<HostAgentEvent>, ResponderRef) {
+fn empty_source() -> (mpsc::UnboundedReceiver<BrokerEvent>, ResponderRef) {
     let (_tx, rx) = mpsc::unbounded_channel();
     (rx, Arc::new(NoopResponder))
 }

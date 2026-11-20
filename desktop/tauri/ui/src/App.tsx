@@ -534,7 +534,7 @@ function ApprovalsPane({ approvals }: { approvals: Approval[] }) {
     <div>
       <PageHead
         title="Credential approvals"
-        sub="Requests routed from shed-host-agent when its approval mode is shed-desktop."
+        sub="Requests routed from the credential broker when its approval mode is shed-desktop."
         right={<span className="text-[14px] text-shed-text-muted">gate: shed-desktop</span>}
       />
       {approvals.length === 0 ? (
@@ -1118,7 +1118,7 @@ function ActivityPane() {
     <div>
       <PageHead
         title="Activity"
-        sub="Host-agent credential audit + shed-desktop decisions, newest first."
+        sub="Credential broker audit + shed-desktop decisions, newest first."
       />
       {activity.length === 0 ? (
         <Empty icon={ScrollText} title="No activity yet" body="Credential checks and your approval decisions will appear here." />
@@ -2299,7 +2299,7 @@ export default function App() {
     }
   }, [refreshRc, updateDraft, setModal]);
   // Live approval queue (drives the badge + the pane) + the delegated namespaces
-  // (a non-empty set = the host agent handshook, so it's connected).
+  // (a non-empty set = the credential broker handshook, so it's connected).
   const approvals = useCoordinatorData<Approval[]>("approvals-changed", fetchApprovals, []);
   const gateNs = useCoordinatorData<string[]>("connected-changed", fetchGateNamespaces, []);
   const connected = gateNs.length > 0;
@@ -2553,7 +2553,7 @@ export default function App() {
             </button>
           )}
           <span className="inline-flex items-center gap-2 text-[13px] font-medium text-shed-text-secondary">
-            <Dot className="h-2 w-2" style={{ background: connected ? "var(--shed-ok)" : "var(--shed-text-muted)" }} /> host agent · {connected ? "connected" : "connecting…"}
+            <Dot className="h-2 w-2" style={{ background: connected ? "var(--shed-ok)" : "var(--shed-text-muted)" }} /> credential broker · {connected ? "connected" : "connecting…"}
           </span>
           <button onClick={() => void openPreferences()} title="Preferences" className="hlink flex h-[34px] w-[34px] items-center justify-center rounded-[9px] text-shed-text-muted">
             <Settings size={18} />

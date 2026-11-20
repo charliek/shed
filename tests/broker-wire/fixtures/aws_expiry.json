@@ -1,5 +1,5 @@
 {
-  "_comment": "Language-neutral goldens for the AWS expiry-hint scan + timestamp render helpers. The Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenAWSExpiry) routes each vector through the REAL parseSessionExpiry/parseExpiryValue + the handler's expiration Format + awsExpiryDetail; the Rust runner (crates/shed-host-agent/src/aws_backend.rs:golden_aws_expiry) routes through parse_session_expiry/parse_expiry_value + aws_literal_z + aws_expiry_detail. expiry_vectors: INI text + profile -> expected unix seconds (or null). literal_z_vectors: unix -> literal-Z UTC string. expiry_detail_vectors: unix (or null) -> audit detail.",
+  "_comment": "Language-neutral goldens for the AWS expiry-hint scan + timestamp render helpers. The Rust runner (crates/shed-broker/src/aws_backend.rs:golden_aws_expiry) routes each vector through parse_session_expiry/parse_expiry_value + aws_literal_z + aws_expiry_detail; the vectors were recorded while the retired Go daemon's runner (golden_test.go:TestGoldenAWSExpiry) routed them through the REAL parseSessionExpiry/parseExpiryValue + the handler's expiration Format + awsExpiryDetail. expiry_vectors: INI text + profile -> expected unix seconds (or null). literal_z_vectors: unix -> literal-Z UTC string. expiry_detail_vectors: unix (or null) -> audit detail.",
   "protocol_version": 1,
   "expiry_vectors": [
     {

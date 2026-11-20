@@ -53,7 +53,7 @@ libc = "0.2"
 # crate's other non-default feature until plan 022 (S6, charliek/shed#328)
 # demolished the RC hub; `broker` is the only one left.
 #
-# The in-process broker bridge (`broker_bridge.rs`): the embedded host-agent replacement
+# The in-process broker bridge (`broker_bridge.rs`): the desktop app's credential broker,
 # backed by `shed-broker`. NON-default so a featureless `shed-app` stays
 # broker-free — `cargo test --features broker` runs its unit tests.
 broker = ["dep:shed-broker"]

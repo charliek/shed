@@ -30,7 +30,7 @@ pub const CAP_CREDENTIAL_GET: &str = "credential.get";
 
 /// A frame from the host agent (or the fake), decoded by `type`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HostAgentInbound {
+pub enum BrokerFrame {
     HelloAck(HelloAck),
     ApprovalRequest(ApprovalRequest),
     Event(AuditEventFrame),
@@ -125,7 +125,7 @@ pub struct CredentialResponse {
 }
 
 impl AuditEntry {
-    /// Map a host-agent `event` frame into a stored entry (source = host-agent).
+    /// Map a broker `event` frame into a stored entry (source = broker).
     /// The caller supplies `id`/`ts` fallbacks (a UUID + "now") when the frame
     /// omits them, keeping UUID + clock out of this crate.
     pub fn from_event_frame(
@@ -138,7 +138,7 @@ impl AuditEntry {
         AuditEntry {
             id: frame.request_id.unwrap_or(id_fallback),
             ts: frame.ts.unwrap_or(ts_fallback),
-            source: AuditSource::HostAgent,
+            source: AuditSource::Broker,
             server: frame.server,
             shed: frame.shed,
             ns: frame.ns,
@@ -163,12 +163,12 @@ struct TypeTag {
 /// Decode one newline-JSON line into a typed inbound frame. `Err` on malformed
 /// JSON or a known frame that fails to decode (the caller skips such a line); an
 /// unrecognized `type` decodes to `Unknown`, never an error.
-pub fn decode(line: &[u8]) -> Result<HostAgentInbound, serde_json::Error> {
+pub fn decode(line: &[u8]) -> Result<BrokerFrame, serde_json::Error> {
     let tag: TypeTag = serde_json::from_slice(line)?;
     Ok(match tag.r#type.as_str() {
-        "hello_ack" => HostAgentInbound::HelloAck(serde_json::from_slice(line)?),
-        "approval_request" => HostAgentInbound::ApprovalRequest(serde_json::from_slice(line)?),
-        "event" => HostAgentInbound::Event(serde_json::from_slice(line)?),
+        "hello_ack" => BrokerFrame::HelloAck(serde_json::from_slice(line)?),
+        "approval_request" => BrokerFrame::ApprovalRequest(serde_json::from_slice(line)?),
+        "event" => BrokerFrame::Event(serde_json::from_slice(line)?),
         "ping" => {
             #[derive(Deserialize)]
             struct Ping {
@@ -176,13 +176,11 @@ pub fn decode(line: &[u8]) -> Result<HostAgentInbound, serde_json::Error> {
                 id: String,
             }
             let p: Ping = serde_json::from_slice(line)?;
-            HostAgentInbound::Ping { id: p.id }
+            BrokerFrame::Ping { id: p.id }
         }
-        "token.response" => HostAgentInbound::TokenResponse(serde_json::from_slice(line)?),
-        "credential.response" => {
-            HostAgentInbound::CredentialResponse(serde_json::from_slice(line)?)
-        }
-        other => HostAgentInbound::Unknown {
+        "token.response" => BrokerFrame::TokenResponse(serde_json::from_slice(line)?),
+        "credential.response" => BrokerFrame::CredentialResponse(serde_json::from_slice(line)?),
+        other => BrokerFrame::Unknown {
             r#type: other.to_string(),
         },
     })
@@ -284,7 +282,7 @@ mod tests {
     fn decodes_hello_ack() {
         let line = br#"{"type":"hello_ack","namespaces":["ssh-agent"],"gate_namespaces":["ssh-agent"],"request_timeout_ms":25000,"accepted":true}"#;
         match decode(line).unwrap() {
-            HostAgentInbound::HelloAck(a) => {
+            BrokerFrame::HelloAck(a) => {
                 assert_eq!(a.namespaces, vec!["ssh-agent"]);
                 assert_eq!(a.gate_namespaces, vec!["ssh-agent"]);
                 assert_eq!(a.request_timeout_ms, 25000);
@@ -298,7 +296,7 @@ mod tests {
     fn decodes_approval_request_with_omitted_server() {
         let line = br#"{"type":"approval_request","id":"r1","ts":"t","namespace":"ssh-agent","op":"sign","shed":"s","detail":"d","expires_at":"e"}"#;
         match decode(line).unwrap() {
-            HostAgentInbound::ApprovalRequest(r) => {
+            BrokerFrame::ApprovalRequest(r) => {
                 assert_eq!(r.server, ""); // omitted -> "" (single-server mode)
                 assert_eq!(r.id, "r1");
                 assert_eq!(r.namespace, "ssh-agent");
@@ -310,7 +308,7 @@ mod tests {
     #[test]
     fn decodes_ping() {
         match decode(br#"{"type":"ping","id":"p9"}"#).unwrap() {
-            HostAgentInbound::Ping { id } => assert_eq!(id, "p9"),
+            BrokerFrame::Ping { id } => assert_eq!(id, "p9"),
             other => panic!("expected ping, got {other:?}"),
         }
     }
@@ -319,7 +317,7 @@ mod tests {
     fn decodes_token_response_success_and_failure() {
         let ok = br#"{"type":"token.response","in_reply_to":"q1","server":"mini2","token":"tok","expires_at":"2026-07-03T02:00:00Z"}"#;
         match decode(ok).unwrap() {
-            HostAgentInbound::TokenResponse(t) => {
+            BrokerFrame::TokenResponse(t) => {
                 assert_eq!(t.in_reply_to, "q1");
                 assert_eq!(t.token.as_deref(), Some("tok"));
                 assert!(t.error.is_none());
@@ -329,7 +327,7 @@ mod tests {
         // Fail-closed: error set, token/expires_at absent.
         let fail = br#"{"type":"token.response","in_reply_to":"q1","server":"mini2","error":"host key mismatch"}"#;
         match decode(fail).unwrap() {
-            HostAgentInbound::TokenResponse(t) => {
+            BrokerFrame::TokenResponse(t) => {
                 assert_eq!(t.error.as_deref(), Some("host key mismatch"));
                 assert!(t.token.is_none());
                 assert!(t.expires_at.is_none());
@@ -342,7 +340,7 @@ mod tests {
     fn decodes_event_frame() {
         let line = br#"{"type":"event","kind":"audit","ns":"aws-credentials","op":"get_credentials","shed":"s","result":"ok","approval":"none"}"#;
         match decode(line).unwrap() {
-            HostAgentInbound::Event(e) => {
+            BrokerFrame::Event(e) => {
                 assert_eq!(e.ns.as_deref(), Some("aws-credentials"));
                 assert_eq!(e.result, "ok");
                 assert!(e.code.is_none());
@@ -354,7 +352,7 @@ mod tests {
     #[test]
     fn unknown_type_is_not_an_error() {
         match decode(br#"{"type":"future_frame","x":1}"#).unwrap() {
-            HostAgentInbound::Unknown { r#type } => assert_eq!(r#type, "future_frame"),
+            BrokerFrame::Unknown { r#type } => assert_eq!(r#type, "future_frame"),
             other => panic!("expected unknown, got {other:?}"),
         }
     }
@@ -436,7 +434,7 @@ mod tests {
         let e = AuditEntry::from_event_frame(frame, "fallback-id".into(), "fallback-ts".into());
         assert_eq!(e.id, "rid"); // request_id wins over fallback
         assert_eq!(e.ts, "2026-07-03T00:00:00Z");
-        assert_eq!(e.source, AuditSource::HostAgent);
+        assert_eq!(e.source, AuditSource::Broker);
         assert_eq!(e.ns.as_deref(), Some("ssh-agent"));
 
         // Missing request_id/ts -> fallbacks.
@@ -466,7 +464,7 @@ mod tests {
         let line =
             br#"{"type":"hello_ack","agent_capabilities":["credential.get"],"accepted":true}"#;
         match decode(line).unwrap() {
-            HostAgentInbound::HelloAck(a) => {
+            BrokerFrame::HelloAck(a) => {
                 assert!(a.supports(CAP_CREDENTIAL_GET));
                 assert!(!a.supports("something.else"));
             }
@@ -478,7 +476,7 @@ mod tests {
         // legible message with a dropped connection.
         let old = br#"{"type":"hello_ack","namespaces":["ssh-agent"],"accepted":true}"#;
         match decode(old).unwrap() {
-            HostAgentInbound::HelloAck(a) => {
+            BrokerFrame::HelloAck(a) => {
                 assert!(a.agent_capabilities.is_empty());
                 assert!(!a.supports(CAP_CREDENTIAL_GET));
             }
@@ -515,7 +513,7 @@ mod tests {
     fn decodes_credential_response_in_both_modes_and_on_failure() {
         let token = br#"{"type":"credential.response","in_reply_to":"q1","server":"mini2","auth_mode":"token","token":"tok","expires_at":"2030-01-01T00:00:00Z"}"#;
         match decode(token).unwrap() {
-            HostAgentInbound::CredentialResponse(r) => {
+            BrokerFrame::CredentialResponse(r) => {
                 assert_eq!(r.in_reply_to, "q1");
                 assert_eq!(r.auth_mode.as_deref(), Some("token"));
                 assert_eq!(r.token.as_deref(), Some("tok"));
@@ -526,7 +524,7 @@ mod tests {
         }
         let mtls = br#"{"type":"credential.response","in_reply_to":"q2","server":"mini2","auth_mode":"mtls","client_cert":"-----BEGIN CERTIFICATE-----\n","cert_serial":"0a0b"}"#;
         match decode(mtls).unwrap() {
-            HostAgentInbound::CredentialResponse(r) => {
+            BrokerFrame::CredentialResponse(r) => {
                 assert_eq!(r.auth_mode.as_deref(), Some("mtls"));
                 assert!(r.client_cert.is_some());
                 assert_eq!(r.cert_serial.as_deref(), Some("0a0b"));
@@ -540,7 +538,7 @@ mod tests {
         // Fail closed: an errored reply carries no credential fields at all.
         let failed = br#"{"type":"credential.response","in_reply_to":"q3","server":"mini2","error":"unknown server"}"#;
         match decode(failed).unwrap() {
-            HostAgentInbound::CredentialResponse(r) => {
+            BrokerFrame::CredentialResponse(r) => {
                 assert_eq!(r.error.as_deref(), Some("unknown server"));
                 assert!(r.auth_mode.is_none() && r.token.is_none() && r.client_cert.is_none());
             }

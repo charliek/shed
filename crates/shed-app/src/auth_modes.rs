@@ -35,7 +35,7 @@
 //! walk it back. The very next mint would then read `expects_mtls == false`,
 //! skip the CSR, and send a `token.get` to an mtls-only server: exactly the §7
 //! P5 bug the tri-state exists to prevent. (The inverse interleaving produces
-//! the mirror image — a false "upgrade shed-host-agent" against a token server.)
+//! the mirror image — a false upgrade-required error against a token server.)
 //!
 //! [`CredentialAdopted`] carries no ordering token, so the rule is a priority
 //! one, and it is sound by construction:
@@ -376,7 +376,7 @@ mod tests {
 
     /// The mirror image: mint N was mtls, mint N+1 saw the server back on
     /// tokens, and N's late callback would re-assert certificates — producing a
-    /// false "upgrade shed-host-agent" against a token server.
+    /// false "upgrade the broker" refusal against a token server.
     #[test]
     fn the_inverse_interleaving_cannot_re_assert_certificates() {
         let r = AuthModeRegistry::new();

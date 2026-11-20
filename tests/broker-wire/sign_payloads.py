@@ -26,6 +26,10 @@ SESSION_ID = bytes(range(32))
 
 # The message an SSHSIG blob's hash covers (git signs the commit object; any fixed
 # bytes do here).
+# These bytes keep the retired daemon's name on purpose: they are signed into the
+# `payload.blob` a kept golden pins
+# (`test_bus_sign_refused__test_sign_git_sshsig_signed.json`), so changing them changes
+# that golden.
 SSHSIG_MESSAGE = b"shed-host-agent differential commit v1"
 
 

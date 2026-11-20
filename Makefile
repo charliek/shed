@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory check-directory-itest-host test-host-agent-diff test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory check-directory-itest-host test-broker-wire test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -72,14 +72,14 @@ test-integration:
 # test-only, in no release) and asserts its wire-visible output under a defined
 # canonicalization against goldens recorded from the last agreeing Go↔Rust run,
 # then runs the language-neutral golden-fixture runners in Rust. Needs Rust
-# (cargo on PATH) + uv. See tests/host-agent-diff/README.md.
-test-host-agent-diff:
+# (cargo on PATH) + uv. See tests/broker-wire/README.md.
+test-broker-wire:
 	@command -v uv >/dev/null 2>&1 || { \
-	  echo "uv is required for the host-agent differential harness."; \
+	  echo "uv is required for the broker wire harness."; \
 	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
 	  exit 1; \
 	}
-	cd tests/host-agent-diff && uv sync && uv run pytest -v
+	cd tests/broker-wire && uv sync && uv run pytest -v
 	# The golden-fixture runners all live in shed-broker: its tests/golden.rs
 	# (effective_policy, gate_namespaces) and the in-crate runners
 	# (load_discovered_servers, ssh_payload_shapes, the config/aws/docker/egress

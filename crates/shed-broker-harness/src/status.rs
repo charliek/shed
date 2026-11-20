@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use shed_broker::config::{
-    HostAgentConfig, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT,
+    ExtensionsYaml, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT,
 };
 use shed_broker::status::now_rfc3339;
 use shed_broker::{MachineIdentity, ServerHealth, SshSigningStatus};
@@ -49,7 +49,7 @@ pub struct LiveStatus {
 /// connection snapshot, `machine` the identity the broker loaded or the reason there is
 /// none, `ssh` the signing block.
 pub fn build_live_status(
-    cfg: &HostAgentConfig,
+    cfg: &ExtensionsYaml,
     config_path: &str,
     started_at: &str,
     version: &str,
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn build_live_status_reports_the_machine_or_why_not() {
-        let cfg = HostAgentConfig::try_parse("").unwrap();
+        let cfg = ExtensionsYaml::try_parse("").unwrap();
         let identity = MachineIdentity {
             id: "0123456789abcdef0123456789abcdef".into(),
             name: "laptop".into(),
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn build_live_status_carries_the_policies_and_the_ssh_block() {
-        let cfg = HostAgentConfig::try_parse("").unwrap();
+        let cfg = ExtensionsYaml::try_parse("").unwrap();
         let ssh = SshSigningStatus::new("local-keys", &cfg.ssh_sign_policy(), None);
         let ls = build_live_status(
             &cfg,

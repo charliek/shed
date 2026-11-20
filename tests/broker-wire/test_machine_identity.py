@@ -1,4 +1,4 @@
-"""This machine's identity (plan 035 §3.4): `<state>/host-agent/machine.json`, created on
+"""This machine's identity (plan 035 §3.4): `<state>/broker/machine.json`, created on
 first start, read unchanged on every later one, and shown in the status.
 
 Not golden cells — the id is random per state dir and the name comes from the host's
@@ -26,7 +26,7 @@ _KEPT_ID = "0123456789abcdef0123456789abcdef"
 
 
 def _machine_file(state_dir) -> str:
-    return os.path.join(str(state_dir), "host-agent", "machine.json")
+    return os.path.join(str(state_dir), "broker", "machine.json")
 
 
 def test_machine_id_stable_across_restart(daemon, watch_none_config, tmp_path):
@@ -87,7 +87,7 @@ def test_daemon_runs_without_an_identity_it_cannot_create(
 ):
     if os.geteuid() == 0:
         pytest.skip("root writes through any directory mode")
-    # A read-only state dir with no `host-agent/` in it: nothing can be created.
+    # A read-only state dir with no `broker/` in it: nothing can be created.
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     os.chmod(state_dir, 0o500)

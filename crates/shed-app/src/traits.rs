@@ -1,6 +1,6 @@
 //! Platform-seam traits shared by the shed clients. The pure decision logic
 //! lives in `shed-core`; these are the I/O / platform boundaries the coordinator
-//! and the host-agent client depend on, so `shed-app` stays UI-free. GTK ignores
+//! and the broker bridge depend on, so `shed-app` stays UI-free. GTK ignores
 //! the approval seams; Tauri implements them (B3+). This module grows as later
 //! milestones add `AuthGate` / `Notifier` / `Paths`.
 
@@ -17,7 +17,7 @@ pub trait Clock: Send + Sync {
     }
 }
 
-/// A shared clock handle (the coordinator + host-agent client share one clock).
+/// A shared clock handle (the coordinator + the broker bridge share one clock).
 pub type ClockRef = Arc<dyn Clock>;
 
 /// The real clock — the only place `shed-app` reads the wall clock (chrono's
@@ -110,8 +110,8 @@ pub type NotifierRef = Arc<dyn Notifier>;
 
 // ---- Responder (the coordinator's decision sink) ----
 
-/// Sends an approve/deny decision to the host agent (a no-op if disconnected —
-/// the agent then fails closed). Abstracts `HostAgentClient::respond` so the
+/// Sends an approve/deny decision to the broker (a no-op if disconnected —
+/// the broker then fails closed). Abstracts the broker bridge's respond so the
 /// coordinator is decoupled from the transport and unit-testable. The impl must
 /// be synchronous + non-blocking so the coordinator can call it inside its atomic
 /// command handler.
@@ -138,7 +138,7 @@ pub enum CoordinatorEvent {
     Approvals,
     /// A new audit entry (a decision or a streamed host event).
     Activity,
-    /// The host-agent connection came up — the delegated `gate_namespaces` are
+    /// The broker connection came up — the delegated `gate_namespaces` are
     /// available (drives which approval-prefs sections show).
     Connected,
 }

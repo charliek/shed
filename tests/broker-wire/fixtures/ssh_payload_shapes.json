@@ -1,6 +1,6 @@
 {
   "protocol_version": 1,
-  "_comment": "input -> expected wire JSON for the four ssh-agent response payload types (internal/ext/protocol/ssh.go). The Go runner (golden_test.go:TestGoldenSSHPayloadShapes) builds protocol.* structs; the Rust runner (bus.rs:golden_ssh_payload_shapes) builds the bus serde types; both marshal and assert equal to `expected` (compared as parsed JSON values). Pins tag names, the b64 pass-through of blobs, the always-present rest:\"\", and that an empty key list marshals as [] not null.",
+  "_comment": "input -> expected wire JSON for the four ssh-agent response payload types (internal/ext/protocol/ssh.go). The Rust runner (crates/shed-broker/src/bus.rs:golden_ssh_payload_shapes) builds the bus serde types, marshals and asserts equal to `expected` (compared as parsed JSON values); the vectors were recorded while the retired Go daemon's runner (golden_test.go:TestGoldenSSHPayloadShapes) built protocol.* structs and asserted the same. Pins tag names, the b64 pass-through of blobs, the always-present rest:\"\", and that an empty key list marshals as [] not null.",
   "list_vectors": [
     {
       "name": "two-keys",

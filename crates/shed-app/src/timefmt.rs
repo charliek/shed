@@ -1,6 +1,6 @@
 //! Flexible ISO-8601 timestamp parse/format.
 //!
-//! shed-server (and the host agent) render timestamps in more than one shape —
+//! shed-server (and the broker) render timestamps in more than one shape —
 //! `2026-05-31T13:33:00.884935839-05:00` (nanosecond fraction + local offset),
 //! plain `...Z` UTC, and occasionally a trailing ` (UTC)` annotation — so a
 //! single fixed parser would silently fail on one of them. The pure crates carry

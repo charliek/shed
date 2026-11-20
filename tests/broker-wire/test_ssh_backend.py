@@ -9,7 +9,7 @@ Two modes:
   line pinned; `sign` verifies the produced RSA/ECDSA blob against the fixture pubkey
   (verify-not-bytes, per the harness plan) and pins the `format`; `status` is pinned.
 * **agent-forward** (auto-detect: no `ssh.mode`, `SSH_AUTH_SOCK` → a
-  `fake_ssh_agent.py`): the daemon proxies to the fake host agent. `list` is pinned
+  `fake_ssh_agent.py`): the broker proxies to the fake SSH agent. `list` is pinned
   (3 identities); `sign` ed25519 → the fake's REAL deterministic signature, so the blob
   is pinned UNMASKED; `sign` rsa flags=2 → the fake's canned blob byte-equal + the
   recorded `flags==2` (wire passthrough); `status` is pinned. The **fake's transcript**

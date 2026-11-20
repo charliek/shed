@@ -4,7 +4,7 @@
 //!
 //! Caches a shed-server CONTROL token, refreshing it near expiry or on demand
 //! (`invalidate*`, called on a 401). The mint primitive is a foreign
-//! `TokenMinter` (the host agent; a mock in tests) — this crate owns
+//! `TokenMinter` (the broker; a mock in tests) — this crate owns
 //! only the cache/refresh/single-flight logic, so it stays pure.
 //!
 //! FSM extensions (all builder-opted, defaults preserve the pre-existing
@@ -89,7 +89,7 @@ use crate::tls::{certified_key_from_pem, ClientCertResolver};
 ///
 /// A mapper that cannot import Rust constants is pinned to the same numbers by
 /// the shared
-/// `tests/host-agent-diff/fixtures/desktop-credential/credential_response.json`
+/// `tests/broker-wire/fixtures/desktop-credential/credential_response.json`
 /// `limits` block, which every language asserts against.
 pub mod limits {
     pub const MAX_TOKEN_BYTES: usize = 4 * 1024;
@@ -103,7 +103,7 @@ pub mod limits {
 
 /// A minted control token plus its optional expiry (unix seconds). `None` expiry
 /// → only an explicit `invalidate*()` forces a refresh (mirrors `MintedToken`).
-/// A foreign minter parses the host agent's ISO-8601 expiry to epoch before
+/// A foreign minter parses the broker's ISO-8601 expiry to epoch before
 /// handing it over; the SSH-bundle path parses RFC3339 in this module instead
 /// ([`parse_token_bundle`]), and always yields `Some` — a bundle without a
 /// parseable expiry is rejected, never treated as non-expiring (plan 001 §3.5).
@@ -232,7 +232,7 @@ impl CredentialRequest {
 }
 
 /// The mint primitive: request a fresh CONTROL credential for `server`.
-/// Implemented by the host-agent UDS minter, the embedded broker, the
+/// Implemented by the app's UDS minter, the embedded broker, the
 /// mobile bridge, or a test mock. A failure (Err) is fail-closed — the provider
 /// surfaces it and the caller sends no credential.
 ///

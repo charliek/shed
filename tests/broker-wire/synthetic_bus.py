@@ -123,7 +123,7 @@ _REFUSALS: dict[str, tuple[int, object]] = {
         {
             "error": {
                 "code": "SOURCE_MACHINE_ID_REQUIRED",
-                "message": "this server needs shed-host-agent and shed-desktop 0.10.0 or newer",
+                "message": "this server needs to know which machine is asking; install the current shed desktop app",
             }
         },
     ),

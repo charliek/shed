@@ -1,6 +1,6 @@
 //! # shed-broker — the credential broker core the desktop app embeds
 //!
-//! The credential-broker engine, ported from the Go `cmd/shed-host-agent`. The desktop
+//! The credential-broker engine, ported from the retired Go daemon. The desktop
 //! app runs it in-process (`shed-app`'s `broker` feature); the test-only
 //! `shed-broker-harness` hosts the same broker for the wire harness. The standalone
 //! daemon that used to drive it was removed in plan 037.
@@ -46,8 +46,8 @@ pub mod discovery;
 pub mod docker_backend;
 // The always-on egress-audit SSE consumer — internal; the supervisor spawns it.
 mod egress;
-// This machine's stable id + display name (`<state>/host-agent/machine.json`), shared by
-// the daemon and the desktop's embedded broker (plan 035 §3.4).
+// This machine's stable id + display name (`<state>/broker/machine.json`; plan 035
+// §3.4).
 pub mod machine;
 pub mod minter;
 // What the broker will sign for a shed: the pure sign-request parser and policy (plan
@@ -75,7 +75,7 @@ pub use approval::{
     select_builtin_gate, ApprovalGate, ApprovalOutcome, ApproveAllGate, DenyAllGate,
 };
 pub use audit::{AuditEntry, AuditFanout, AuditSink, JsonlAuditSink};
-pub use config::HostAgentConfig;
+pub use config::ExtensionsYaml;
 pub use controltoken::{
     ControlCredentialMinter, ControlTokenMinter, ControlTokenProvider, MintedControlCredential,
     MintedControlToken,

@@ -93,7 +93,7 @@ pub struct SharedDeps {
     pub ssh_gate: Arc<dyn ApprovalGate>,
     /// What this machine signs for a shed (plan 035 §3.5): every `sign` request is checked
     /// against it before the approval gate. Built once from
-    /// [`crate::config::HostAgentConfig::ssh_sign_policy`] at start, by both hosts.
+    /// [`crate::config::ExtensionsYaml::ssh_sign_policy`] at start, by both hosts.
     pub ssh_sign_policy: Arc<SignPolicy>,
     pub aws: Option<AwsHandlers>,
     pub docker: Option<DockerHandlers>,
@@ -573,12 +573,12 @@ mod tests {
     }
 
     /// The Rust half of the `should_mint` golden — reads the SAME shared fixture the Go
-    /// runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenShouldMint`), so the
+    /// runner read (the retired Go daemon's `golden_test.go:TestGoldenShouldMint`), so the
     /// two impls can't drift on the https-scheme / ssh-endpoint / minter-presence matrix.
     #[test]
     fn golden_should_mint() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/should_mint.json");
+            .join("../../tests/broker-wire/fixtures/should_mint.json");
         let raw = std::fs::read_to_string(&path).expect("read golden fixture");
         let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(fx["protocol_version"], 1, "version skew");

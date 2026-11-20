@@ -34,7 +34,7 @@ members = ["shed-core", "shed-app", "shedctl", "shed-broker", "shed-opencode", "
 #
 # `shed-broker-harness` (plan 037) is a member but NOT a default member: a
 # TEST-ONLY binary that hosts the desktop app's embedded broker for the wire
-# harness (tests/host-agent-diff). It builds shed-app with `broker`, so were it a
+# harness (tests/broker-wire). It builds shed-app with `broker`, so were it a
 # default member, a plain `cargo build`/`cargo test` would turn that feature on
 # for the whole workspace by feature unification and hide dead code in the
 # default build shed-mobile links. Name it with `-p`; `make -C desktop core-lint`

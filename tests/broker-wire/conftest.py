@@ -43,7 +43,7 @@ import pytest
 import control_client
 from normalize import canonical
 
-# tests/host-agent-diff/conftest.py -> tests -> repo root.
+# tests/broker-wire/conftest.py -> tests -> repo root.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Committed, throwaway, passphrase-less OpenSSH ed25519 test key (see
@@ -201,7 +201,7 @@ def _clean_env(
 
     The socket dir (`SHED_HOST_AGENT_SOCKET_DIR`) holds the harness's control socket.
 
-    The state dir (`SHED_HOST_AGENT_STATE_DIR`: the machine identity file and the
+    The state dir (`SHED_BROKER_STATE_DIR`: the machine identity file and the
     credential store) defaults to `<home>/state`. It is set explicitly because an
     isolated HOME alone does not isolate it on Linux: the broker prefers
     `$XDG_DATA_HOME`, so a developer with that exported would otherwise have the
@@ -214,7 +214,7 @@ def _clean_env(
     env = dict(os.environ)
     env["SHED_HOST_AGENT_SOCKET_DIR"] = str(socket_dir)
     env["HOME"] = str(home)
-    env["SHED_HOST_AGENT_STATE_DIR"] = str(
+    env["SHED_BROKER_STATE_DIR"] = str(
         state_dir if state_dir is not None else Path(home) / "state"
     )
     env.pop("SSH_AUTH_SOCK", None)

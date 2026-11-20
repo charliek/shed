@@ -36,7 +36,7 @@ def _assert_window_renders(client) -> None:
     assert shot["png"][:8] == PNG_MAGIC and shot["width"] > 0 and shot["height"] > 0
 
 
-def test_app_connected_to_host_agent(fake):
+def test_broker_connected(fake):
     assert fake.wait_connected()
 
 

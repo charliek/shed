@@ -153,11 +153,11 @@ fn broker_hint(host: &str, rt: Option<&BrokerRuntime>) -> String {
             "The in-app broker is running; check that it lists {host} under Credential broker."
         ),
         Some(("external", _)) => format!(
-            "This app uses the shed-host-agent daemon: check that it is running and brokers \
+            "This app uses a separate broker daemon: check that it is running and brokers \
              for {host}."
         ),
         Some(("headless-coexist", _)) => format!(
-            "A headless shed-host-agent brokers here: check that it is running and brokers \
+            "A separate headless broker runs here: check that it is running and brokers \
              for {host}."
         ),
         _ => "Check that this machine's credential broker is running.".to_string(),

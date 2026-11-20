@@ -8,7 +8,7 @@ server with the itest user list (`fixtures/identity.py`) through synthetic
 machines (`fixtures/busclient.py: FakeMachine`): an identity's credentials
 certificate plus a machine id and name, subscribing and answering exactly as
 a broker does. No real broker runs here (the broker's side is
-tests/host-agent-diff); requests start inside a shed with a POST to the
+tests/broker-wire); requests start inside a shed with a POST to the
 shed-agent's `127.0.0.1:498/v1/publish`, which every image serves.
 
 What it shows, live:

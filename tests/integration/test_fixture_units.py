@@ -890,7 +890,7 @@ def test_bootstrap_cert_sends_one_csr_and_writes_the_issued_cert(monkeypatch, tm
 
     monkeypatch.setattr(dc, "assert_dev_target", lambda name: {"host": "localhost", "ssh_port": 12222})
     monkeypatch.setattr(dc.subprocess, "run", run)
-    got = dc.bootstrap_cert("my-server-dev", "credentials", tmp_path / "c", "host-agent")
+    got = dc.bootstrap_cert("my-server-dev", "credentials", tmp_path / "c", "broker")
 
     assert len(sent) == 1
     argv = sent[0]
@@ -900,7 +900,7 @@ def test_bootstrap_cert_sends_one_csr_and_writes_the_issued_cert(monkeypatch, tm
     # decodes to a DER CSR openssl verifies.
     target = argv.index("_bootstrap@localhost")
     request = argv[target + 1:]
-    assert request[:2] == ["credentials", "host-agent"]
+    assert request[:2] == ["credentials", "broker"]
     csr_args = [a for a in request if a.startswith("csr=")]
     assert len(csr_args) == 1 and len(request) == 3
     der = base64.b64decode(csr_args[0][len("csr="):], validate=True)

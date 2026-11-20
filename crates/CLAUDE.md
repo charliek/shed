@@ -156,22 +156,22 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `shed-craze`'s `ExitWatch::pid()` exists only to name a child in such a log.
 - **`shedctl`** — a headless UDS/IPC client on `shed-core` (no GUI-toolkit dep), shipped in the
   Linux `.deb` and drives the Tauri app's socket. In `default-members`.
-- **`shed-broker`** — the embeddable host-agent broker core: the shed-server plugin bus,
+- **`shed-broker`** — the embeddable credential broker core: the shed-server plugin bus,
   the multi-server supervisor + discovery watcher, the SSH/AWS/Docker/egress credential
   backends, the SSH-bootstrap minter + control-token provider, the approval/audit seams
   (incl. the always-compiled `AuditFanout` fan-out and the native `touchid` gate), the
   `config` reader, socket path-resolution + liveness probes, and the health types
   (`ServerHealth`, `SshSigningStatus`). Embedded in-process by the desktop app (through
   `shed-app`'s `broker` feature) and hosted for the wire harness by the test-only
-  **`shed-broker-harness`**. The standalone `shed-host-agent` daemon that used to drive
-  it was removed in plan 037. Carries no WebKitGTK concern.
+  **`shed-broker-harness`**. The standalone daemon that used to drive it was removed in
+  plan 037. Carries no WebKitGTK concern.
   `sign_check` (plan 035 §3.5) is the pure parser and policy for what the machine will
   sign for a shed: an exact SSH login request or an exact `git` SSHSIG blob, nothing
   else, returning an `Approved` that is the only way to sign the bytes it checked. Its
   vectors in `shed-broker/fixtures/sign_check/` are REAL OpenSSH captures: re-record
   them only with that directory's `capture.sh` (Docker), never by hand. Its two
   machine-wide settings are `ssh.allow_users` and `ssh.offer_keys` (`config.rs`,
-  `HostAgentConfig::ssh_sign_policy`); the key filter itself is
+  `ExtensionsYaml::ssh_sign_policy`); the key filter itself is
   `ssh_backend::FilteredSshBackend`, wrapped around whichever SSH backend resolved in
   the embedded broker. It asks the backend nothing of its own (the
   agent-forward transcripts depend on that), and a key it does not offer fails with
@@ -179,7 +179,7 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   present".
 - **`shed-broker-harness`** — a TEST-ONLY binary (plan 037) that hosts the desktop app's
   embedded broker (`shed-app`'s `broker` feature, minus the Coordinator) for the wire
-  harness `tests/host-agent-diff/`: a config in, the bus and the audit file out, and a
+  harness `tests/broker-wire/`: a config in, the bus and the audit file out, and a
   control socket for its status snapshot (`src/status.rs`, the JSON shape the goldens
   record), approval frames and decisions. A workspace member but **not** a default
   member: as one, a plain `cargo build`/`cargo test` would turn `broker` on for the whole
@@ -554,7 +554,7 @@ Both clients hand-roll a tiny indentation reader (`shed-core`'s and `shed-broker
 crates (`serde_yaml` — archived/unmaintained — and `serde_norway`): serde-derive on the config
 structs is what's being avoided, not a parser per se.
 
-**The scoped exception:** `shed-broker` (the broker core, home of the host-agent `config`
+**The scoped exception:** `shed-broker` (the broker core, home of the extensions `config`
 reader) depends on **`saphyr-parser`** (pure-Rust, no-serde, no-C, no encoding_rs,
 `default-features = false`) to back ITS `yaml_lite::parse`. Justification: the shipped
 `configs/extensions.example.yaml` uses block-style `docker.registries:` sequences the line/colon

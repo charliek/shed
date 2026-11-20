@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "shed-broker-harness — a TEST-ONLY process that hosts the desktop app's embedded credential broker (shed-app's `broker` feature) for the wire harness under tests/host-agent-diff. It ships in no release: no goreleaser config, bundle script, deb or workflow builds it, and `tests/not_shipped.rs` fails if any crate depends on it or it becomes a default member."
+description = "shed-broker-harness — a TEST-ONLY process that hosts the desktop app's embedded credential broker (shed-app's `broker` feature) for the wire harness under tests/broker-wire. It ships in no release: no goreleaser config, bundle script, deb or workflow builds it, and `tests/not_shipped.rs` fails if any crate depends on it or it becomes a default member."
 
 [[bin]]
 name = "shed-broker-harness"

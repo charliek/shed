@@ -124,7 +124,7 @@ def _broker_app(
       through.
     * `source` — arm the mock's credential-source binding (plan 035 §3.4) with these
       `MockShedServer.arm_source` kwargs (`{}` binds the default other machine, "desk").
-    * `block_state_dir` — make the broker state dir (`SHED_HOST_AGENT_STATE_DIR`) a
+    * `block_state_dir` — make the broker state dir (`SHED_BROKER_STATE_DIR`) a
       regular FILE, so no machine identity can be loaded or created.
     """
     cfg = ui._SUBPROC["tauri"]
@@ -168,8 +168,8 @@ def _broker_app(
             ext_path.write_text(extensions_yaml)
 
         if block_state_dir:
-            # `ui.subproc_env` points SHED_HOST_AGENT_STATE_DIR here.
-            (runtime_dir / "host-agent-state").write_text("not a directory\n")
+            # `ui.subproc_env` points SHED_BROKER_STATE_DIR here.
+            (runtime_dir / "broker-state").write_text("not a directory\n")
 
         if gen_ssh_key:
             ssh_dir = runtime_dir / ".ssh"
@@ -646,8 +646,8 @@ def _open_prefs(client) -> None:
 
 def _machine_json(info) -> Path:
     """Where the app reads this machine's identity: `ui.subproc_env` points
-    SHED_HOST_AGENT_STATE_DIR at `<runtime>/host-agent-state`."""
-    return Path(info["runtime_dir"]) / "host-agent-state" / "host-agent" / "machine.json"
+    SHED_BROKER_STATE_DIR at `<runtime>/broker-state`."""
+    return Path(info["runtime_dir"]) / "broker-state" / "broker" / "machine.json"
 
 
 def test_not_source_until_use_this_machine_then_connected_at_once():
@@ -792,7 +792,7 @@ def test_external_mode_rows_and_use_this_machine():
                 client.source_use("mock")
             assert e.value.code == "source_machine_not_found", e.value
             assert e.value.message.startswith("mock has not seen this machine yet"), e.value
-            assert "shed-host-agent daemon" in e.value.message, e.value
+            assert "separate broker daemon" in e.value.message, e.value
             assert mock.source_use_requests() == [{"machine_id": me["id"]}], "sent once"
 
             # What the daemon's first subscribe does on the real server.

@@ -1,7 +1,7 @@
 //! Surface B — the shed-server plugin message bus (Rust port of `sdk/hostclient.go`
 //! + `sdk/envelope.go`).
 //!
-//! [`BusClient`] is the host-agent's `HostClient` equivalent: it subscribes to a
+//! [`BusClient`] is the broker's `HostClient` equivalent: it subscribes to a
 //! namespace's SSE stream, receives request [`Envelope`]s, and `respond`s with
 //! response envelopes routed back to the originating shed. It reuses shed-core's
 //! transport primitives — the SSE framer (`shed_core::sse::SseParser`) and the
@@ -5652,7 +5652,7 @@ pub(crate) mod tests {
     #[test]
     fn golden_ssh_payload_shapes() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/ssh_payload_shapes.json");
+            .join("../../tests/broker-wire/fixtures/ssh_payload_shapes.json");
         let data = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let fx: serde_json::Value = serde_json::from_str(&data).unwrap();
@@ -6181,7 +6181,7 @@ pub(crate) mod tests {
         let gate = CountingGate::new(true);
         let backend = RecordingBackend::signing();
         let key = b64(&fixed_ed25519_pub());
-        let declined = sign_env(&key, &b64(b"shed-host-agent challenge"), 0);
+        let declined = sign_env(&key, &b64(b"broker challenge"), 0);
         let (payload, _) = run_sign(&declined, &SignPolicy::default(), &gate, &backend).await;
         assert_eq!(payload["code"], "SIGN_FAILED");
         assert_eq!(gate.calls(), 0);

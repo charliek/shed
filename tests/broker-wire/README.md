@@ -1,4 +1,4 @@
-# host-agent-diff — the credential broker's **wire** harness
+# broker-wire — the credential broker's **wire** harness
 
 The wire-contract gate for the desktop app's credential broker. A hermetic pytest suite
 that spawns `shed-broker-harness` — the desktop app's embedded broker (shed-app's
@@ -17,7 +17,7 @@ requests and audit events the bridge sends the app (queued from spawn on), and
 On SIGTERM it waits for the broker to drain every server group, writes
 `harness drained` to its log and exits 0; the `daemon` fixture asserts all three.
 
-**What went with the retired daemon (plan 037):** `shed-host-agent`'s desktop approval
+**What went with the retired daemon (plan 037):** the standalone daemon's desktop approval
 socket ("surface A": the handshake, supersede, replay, `token.get`/`credential.get`),
 its status socket and `status` command (the text render, exit codes), its socket
 lifecycle and its `version` command. Their cells and goldens were deleted; the values
@@ -26,12 +26,11 @@ only the daemon produced (its desktop socket's `approval_request`/`event` frames
 kept everything else, never re-recorded. Each gated cell still asserts in code the
 approval request the control client is shown.
 
-**Why the directory and the `make test-host-agent-diff` target still say "diff":** the
-harness began as a Go-vs-Rust *differential* — it ran both `shed-host-agent`
-implementations side by side and asserted they agreed. When the Go daemon was retired
-(plan 006), every one of those agreed values was recorded as a golden, so the suite kept
-its coverage and changed only what it compares against. "diff" now reads as **wire-diff
-against pinned goldens**, and each golden carries the strongest provenance available:
+**Where the goldens come from:** the harness began as a Go-vs-Rust *differential*: it ran
+the Go and the Rust implementations of the retired daemon side by side and asserted they
+agreed. When the Go daemon was retired (plan 006), every one of those agreed values was
+recorded as a golden, so the suite kept its coverage and changed only what it compares
+against. Each golden carries the strongest provenance available:
 *two independent implementations produced this exact value*, and the app's broker
 produces it still.
 
@@ -39,14 +38,14 @@ This is the **third** pytest suite in the repo and is **never merged** with
 `tests/integration/` (live server create-cycle) or `desktop/tools/shedtest/` (mock UI
 harness). See the root `CLAUDE.md`.
 
-The design (comparison model, normalization contract, slices, acceptance matrix) lives
-in `~/.claude/plans/monorepo-phase3-host-agent-difftest-harness.md`; the authoritative
-wire-behavior reference is `docs/development/host-agent-wire-catalog.md`.
+The design (comparison model, normalization contract, slices, acceptance matrix) lived in
+the monorepo phase 3 harness plan, outside this repository; the authoritative
+wire-behavior reference is `docs/development/broker-wire-catalog.md`.
 
 ## Running
 
 ```bash
-make test-host-agent-diff
+make test-broker-wire
 ```
 
 That target (root `Makefile`) runs the live wire suite (the session fixture builds the
@@ -60,7 +59,7 @@ To run just the pytest suite directly:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"   # so the session fixture's cargo build resolves
-cd tests/host-agent-diff && uv sync && uv run pytest -v
+cd tests/broker-wire && uv sync && uv run pytest -v
 ```
 
 ## Recording and updating goldens
@@ -155,14 +154,14 @@ file per pytest cell, written and read only by `conftest.py`. **`fixtures/`** ho
 hand-authored, language-neutral `input → expected-output` vectors for the pure decision
 functions, and is consumed from several crates at once — `shed-broker` and `shed-app`
 read these same files. That shared consumption is the point; the directory
-is a neutral home, not a Python asset. (The Go runner, `cmd/shed-host-agent/golden_test.go`,
+is a neutral home, not a Python asset. (The retired Go daemon's runner, `golden_test.go`,
 read every vector below as well until it retired with the Go daemon — that two-language
 agreement is the history the vectors and the goldens both carry.)
 
 `fixtures/effective_policy.json` and `fixtures/gate_namespaces.json` are vectors
 carrying `"protocol_version": 2`. The Rust runner
 (`crates/shed-broker/tests/golden.rs`) asserts `effective_policy_from_raw` /
-`HostAgentConfig::gate_namespaces` match every vector.
+`ExtensionsYaml::gate_namespaces` match every vector.
 
 `fixtures/load_discovered_servers.json` (`"protocol_version": 1`) is `config.yaml text →
 expected []ServerTarget`. Its one reader is the Rust runner
@@ -198,11 +197,12 @@ broker's isolated `<HOME>/.ssh/id_<algo>`; `fake_ssh_agent.py` also serves them 
 identities (real-signing ed25519, canned blobs for rsa/ecdsa).
 
 **Committed TLS pair (secure-bus cells).** `fixtures/synthetic_bus_{cert,key}.pem` is a
-**throwaway, non-secret** self-signed RSA-2048 cert/key (CN `shed-host-agent-diff synthetic
-bus`, `subjectAltName=IP:127.0.0.1`, 100-year validity) generated ONCE with `openssl req
--x509` and committed because Python's stdlib `ssl` cannot generate a cert at runtime — a
-fixed pair means a **stable leaf-DER fingerprint**. `synthetic_bus.py`'s TLS mode serves it
-via `ssl.SSLContext.wrap_socket`; the `discovery:` config pins it as `tls_cert_fingerprint =
+**throwaway, non-secret** self-signed RSA-2048 cert/key (`subjectAltName=IP:127.0.0.1`,
+100-year validity; it keeps the subject it was made with, because the secure-bus goldens
+pin its fingerprint) generated ONCE with `openssl req -x509` and committed because
+Python's stdlib `ssl` cannot generate a cert at runtime — a fixed pair means a **stable
+leaf-DER fingerprint**. `synthetic_bus.py`'s TLS mode serves it via
+`ssl.SSLContext.wrap_socket`; the `discovery:` config pins it as `tls_cert_fingerprint =
 "sha256:" + hex(sha256(leaf_DER))` — the derivation `shed_core::tls::fingerprint` uses
 (leaf DER, lowercase hex), matching the server-side `sdk.certFingerprint`.
 **If the pair is regenerated, recompute the pin** (`python3 -c "import
@@ -234,7 +234,7 @@ the daemon in plan 037.
   detected** (returns `Err` → exit 1) instead of being swallowed; and a bare `key:` (YAML
   null) is distinct from `key: ""` (empty string), so Go's null-vs-empty merge is
   reproduced (`source_profile` cross-language golden). On top of the parser, the Rust
-  `HostAgentConfig::load` now runs a faithful `validate()` port and **rejects (exit 1) the
+  `ExtensionsYaml::load` now runs a faithful `validate()` port and **rejects (exit 1) the
   SAME configs Go `LoadConfig`/`Validate` rejects** — unknown/biometric policy strings, the
   AWS/Docker biometric policies, `aws.mode`/`aws.sheds` errors, a non-positive/invalid
   `approval_timeout`, malformed YAML, and duplicate map keys — enforced live by
@@ -260,7 +260,7 @@ the daemon in plan 037.
   keys (→ `Err`, matching yaml.v3) and multi-document input (first document consumed,
   matching Go's `yaml.Unmarshal`). Also documented-open: anchors/aliases/
   merge-keys, non-string keys, tagged scalars (low real-world risk), and the **cross-client
-  inconsistency on the shared `~/.shed/config.yaml`** — the host-agent (`saphyr-parser`) and
+  inconsistency on the shared `~/.shed/config.yaml`** — the broker (`saphyr-parser`) and
   the desktop app (shed-core's own hand-rolled `yaml_lite`, a separate crate with a Swift
   byte-parity test) may now diverge on the SAME file; converging the two readers is a
   separate shed-core slice, not this one.
@@ -361,7 +361,7 @@ layer). They carry no cell — they are recorded here so the audit is complete, 
   (This is the ERROR set ONLY; the bool forms yaml.v3 RESOLVES — `yes/on/y/True/…` — are the
   D2 FIX, closed and pinned by `config_bool_forms.json`.)
 - **D7 · `serve_namespace` shutdown at SIGTERM — verified NO divergence.** The gated-sign path
-  calls `RequestApproval` via `desktopGate.Approve` (`cmd/shed-host-agent/desktop_gate.go:21`)
+  calls `RequestApproval` via `desktopGate.Approve` (the retired Go daemon's `desktop_gate.go:21`)
   passing `context.Background()` — never cancelled — and `ApprovalGate.Approve`
   (`approval.go:19`) carries no `ctx`. So Go's `ctx.Done()` `select` arm is DEAD on this path:
   at SIGTERM Go blocks on `time.After(timeout)` (≤ 25 s), EXACTLY like the Rust `select!`

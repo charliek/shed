@@ -1,29 +1,29 @@
 //! The language-neutral golden fixtures of the broker's wire harness, read by the
 //! broker's own config functions. The JSON vectors were recorded while the retired Go
 //! runner read them too, and this test asserts the pure decision functions
-//! (`effective_policy_from_raw`, `HostAgentConfig::gate_namespaces`) match every
+//! (`effective_policy_from_raw`, `ExtensionsYaml::gate_namespaces`) match every
 //! vector: a drift guard the live wire cells cannot give.
 //!
 //! An integration test of the `shed-broker` library: it imports the real config
-//! functions the desktop app's embedded broker runs (`make test-host-agent-diff`
+//! functions the desktop app's embedded broker runs (`make test-broker-wire`
 //! runs it as `cargo test -p shed-broker golden`).
 
 use std::path::PathBuf;
 
-use shed_broker::config::{effective_policy_from_raw, HostAgentConfig};
+use shed_broker::config::{effective_policy_from_raw, ExtensionsYaml};
 
 /// The shared fixture directory. `CARGO_MANIFEST_DIR` is `crates/shed-broker`;
-/// `../../` is the repo root, where `tests/host-agent-diff/fixtures` lives (the
+/// `../../` is the repo root, where `tests/broker-wire/fixtures` lives (the
 /// wire harness's neutral home for the vectors).
 fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/host-agent-diff/fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/broker-wire/fixtures")
 }
 
 /// Build a config from the three raw approval policies via the crate's real
 /// (block-style) config parser, so the gate golden exercises the same
 /// `parse` → `gate_namespaces` path the broker uses. Only clean policy tokens flow
 /// through here, so a minimal block-YAML template is sufficient.
-fn config_from_policies(ssh: &str, aws: &str, docker: &str) -> HostAgentConfig {
+fn config_from_policies(ssh: &str, aws: &str, docker: &str) -> ExtensionsYaml {
     let text = format!(
         "ssh:\n  approval:\n    policy: {ssh}\n\
          aws:\n  approval:\n    policy: {aws}\n\
@@ -31,7 +31,7 @@ fn config_from_policies(ssh: &str, aws: &str, docker: &str) -> HostAgentConfig {
     );
     // `parse` is a `#[cfg(test)]`-only convenience inside the crate; from this external
     // integration test use the public `try_parse` (same block-YAML path) + expect.
-    HostAgentConfig::try_parse(&text).expect("yaml fixture parses")
+    ExtensionsYaml::try_parse(&text).expect("yaml fixture parses")
 }
 
 fn read_fixture(name: &str) -> serde_json::Value {

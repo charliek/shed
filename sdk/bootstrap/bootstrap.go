@@ -108,7 +108,7 @@ func (e *UnusableCertificateError) Unwrap() error { return e.Err }
 // Params describes one bootstrap exchange. Host/Port address the server's SSH
 // endpoint; KnownHostsPath is the pinned trust root (~/.shed/known_hosts);
 // Scope is the credential scope ("control"/"credentials"); ClientKind is
-// advisory audit metadata ("cli"/"host-agent"/"desktop") and may be empty.
+// advisory audit metadata ("cli"/"broker"/"desktop") and may be empty.
 type Params struct {
 	Host           string
 	Port           int

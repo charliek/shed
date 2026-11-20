@@ -286,8 +286,8 @@ func TestClientCertificateIsPresentedToAnMTLSServer(t *testing.T) {
 	if err := c.Respond(context.Background(), "ns", &Envelope{}); err != nil {
 		t.Fatalf("Respond: %v", err)
 	}
-	if got := sawPeer.Load().(string); got != "host-agent" {
-		t.Errorf("server saw peer CN %q, want host-agent", got)
+	if got := sawPeer.Load().(string); got != "broker" {
+		t.Errorf("server saw peer CN %q, want broker", got)
 	}
 	if got := sawAuth.Load().(string); got != "" {
 		t.Errorf("the client sent Authorization %q alongside its certificate", got)
@@ -304,7 +304,7 @@ func selfSignedClientCert(t *testing.T) *tls.Certificate {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "host-agent"},
+		Subject:      pkix.Name{CommonName: "broker"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},

@@ -911,7 +911,7 @@ mod tests {
 
     fn fixture(name: &str) -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/desktop-credential")
+            .join("../../tests/broker-wire/fixtures/desktop-credential")
             .join(name);
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
@@ -964,7 +964,7 @@ mod tests {
             // gated too — not just the arm logic.
             let line = serde_json::to_vec(&frame).unwrap();
             let resp = match shed_core::approval::protocol::decode(&line).unwrap() {
-                shed_core::approval::protocol::HostAgentInbound::CredentialResponse(r) => r,
+                shed_core::approval::protocol::BrokerFrame::CredentialResponse(r) => r,
                 other => panic!("{name}: expected credential.response, got {other:?}"),
             };
             let got = map_credential_response(resp, server);

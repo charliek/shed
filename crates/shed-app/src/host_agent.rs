@@ -25,7 +25,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use shed_core::approval::protocol::{self, HostAgentInbound};
+use shed_core::approval::protocol::{self, BrokerFrame};
 use shed_core::approval::{
     ApprovalDecision, CredentialResponse, DecidedBy, HelloAck, TokenResponse,
 };
@@ -54,13 +54,13 @@ pub struct HelloClientInfo {
 /// inbound frame (an approval request / audit event) is much larger than the
 /// other variants.
 #[derive(Debug)]
-pub enum HostAgentEvent {
+pub enum BrokerEvent {
     Connected(HelloAck),
     Disconnected,
     /// The socket peer failed the A1 peer-UID check (server not running as us) —
     /// a distinct, audited state so the UI isn't left silently loop-with-gate-down.
     Untrusted,
-    Frame(Box<HostAgentInbound>),
+    Frame(Box<BrokerFrame>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,7 +256,7 @@ impl HostAgentClient {
 
     /// Start connecting and return a stream of connection + frame events. The
     /// background loop runs until `stop()` (or the process exits).
-    pub fn start(&self, info: HelloClientInfo) -> mpsc::UnboundedReceiver<HostAgentEvent> {
+    pub fn start(&self, info: HelloClientInfo) -> mpsc::UnboundedReceiver<BrokerEvent> {
         // Restart-safe: abort any prior loop + reset connection state so a second
         // start() cleanly replaces the first rather than orphaning it.
         if let Some(h) = self.inner.loop_handle.lock().unwrap().take() {
@@ -524,7 +524,7 @@ fn with_newline(line: String) -> Vec<u8> {
 async fn run_loop(
     inner: Arc<Inner>,
     info: HelloClientInfo,
-    event_tx: mpsc::UnboundedSender<HostAgentEvent>,
+    event_tx: mpsc::UnboundedSender<BrokerEvent>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     while inner.running.load(Ordering::SeqCst) {
@@ -548,7 +548,7 @@ async fn run_loop(
         // this closes the weak-perms cases (the `/tmp` fallback, a mis-permissioned
         // dir, and macOS where the socket resolves under `~/.local/share`).
         if !peer_trusted(peer_uid(&stream), our_uid()) {
-            let _ = event_tx.send(HostAgentEvent::Untrusted);
+            let _ = event_tx.send(BrokerEvent::Untrusted);
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
             continue;
@@ -593,7 +593,7 @@ async fn run_loop(
         }
         inner.set_capabilities(None);
         writer_task.abort();
-        let _ = event_tx.send(HostAgentEvent::Disconnected);
+        let _ = event_tx.send(BrokerEvent::Disconnected);
         if !inner.running.load(Ordering::SeqCst) {
             break;
         }
@@ -613,7 +613,7 @@ async fn read_frames(
     inner: &Arc<Inner>,
     read_half: OwnedReadHalf,
     writer_tx: &mpsc::UnboundedSender<Vec<u8>>,
-    event_tx: &mpsc::UnboundedSender<HostAgentEvent>,
+    event_tx: &mpsc::UnboundedSender<BrokerEvent>,
 ) {
     let mut reader = BufReader::new(read_half);
     let mut line = Vec::new();
@@ -634,18 +634,18 @@ async fn read_frames(
             Err(_) => continue, // skip a malformed line
         };
         match frame {
-            HostAgentInbound::Ping { id } => {
+            BrokerFrame::Ping { id } => {
                 let pong = protocol::pong(&id, &inner.clock.now_iso8601());
                 let _ = writer_tx.send(with_newline(pong));
             }
-            HostAgentInbound::HelloAck(ack) => {
+            BrokerFrame::HelloAck(ack) => {
                 inner.apply_hello_ack(&ack);
-                let _ = event_tx.send(HostAgentEvent::Connected(ack));
+                let _ = event_tx.send(BrokerEvent::Connected(ack));
             }
-            HostAgentInbound::TokenResponse(resp) => resolve_pending(inner, resp),
-            HostAgentInbound::CredentialResponse(resp) => resolve_pending_credential(inner, resp),
+            BrokerFrame::TokenResponse(resp) => resolve_pending(inner, resp),
+            BrokerFrame::CredentialResponse(resp) => resolve_pending_credential(inner, resp),
             other => {
-                let _ = event_tx.send(HostAgentEvent::Frame(Box::new(other)));
+                let _ = event_tx.send(BrokerEvent::Frame(Box::new(other)));
             }
         }
     }
@@ -1115,7 +1115,7 @@ mod tests {
         let client = agent.client(clock());
         let mut events = client.start(info());
         match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
-            Ok(Some(HostAgentEvent::Connected(ack))) => {
+            Ok(Some(BrokerEvent::Connected(ack))) => {
                 assert_eq!(ack.gate_namespaces, vec!["ssh-agent"]);
                 assert!(ack.accepted);
             }
@@ -1431,7 +1431,7 @@ mod tests {
 
     fn fixture(name: &str) -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/desktop-credential")
+            .join("../../tests/broker-wire/fixtures/desktop-credential")
             .join(name);
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
@@ -1454,7 +1454,7 @@ mod tests {
             let name = v["name"].as_str().unwrap();
             let line = serde_json::to_vec(&v["frame"]).unwrap();
             let ack = match protocol::decode(&line).unwrap() {
-                HostAgentInbound::HelloAck(a) => a,
+                BrokerFrame::HelloAck(a) => a,
                 other => panic!("{name}: expected hello_ack, got {other:?}"),
             };
             let client = HostAgentClient::new("/nonexistent.sock", Arc::new(FixedClock));
@@ -1481,7 +1481,7 @@ mod tests {
         let line =
             br#"{"type":"hello_ack","agent_capabilities":["credential.get"],"accepted":false}"#;
         let ack = match protocol::decode(line).unwrap() {
-            HostAgentInbound::HelloAck(a) => a,
+            BrokerFrame::HelloAck(a) => a,
             other => panic!("expected hello_ack, got {other:?}"),
         };
         let client = HostAgentClient::new("/nonexistent.sock", Arc::new(FixedClock));

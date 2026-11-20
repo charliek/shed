@@ -115,7 +115,7 @@ def _req(req_id: str, operation: str) -> dict:
 # --- D3.6 introspection: RAW captured pairs, saved ONLY when a reviewer opts in -------
 #
 # During per-slice development the orchestrator manually diffs the RAW (unmasked)
-# Go/Rust wire pairs; setting SHED_HOST_AGENT_DIFF_INTROSPECTION to a writable file
+# Go/Rust wire pairs; setting SHED_BROKER_WIRE_INTROSPECTION to a writable file
 # path re-enables that capture. It MUST default off: an earlier revision hard-coded
 # a developer-machine absolute path here, which made these cells unrunnable on any
 # other host (caught by the first Linux CI execution of this suite).
@@ -126,8 +126,8 @@ _introspection: dict = {}
 def _record_introspection(section: str, data: dict) -> None:
     """Merge a RAW captured pair (response envelope + audit) into the opt-in
     introspection file and rewrite it (tests run serially, so accumulation is
-    safe). No-op unless SHED_HOST_AGENT_DIFF_INTROSPECTION names a target file."""
-    target = os.environ.get("SHED_HOST_AGENT_DIFF_INTROSPECTION")
+    safe). No-op unless SHED_BROKER_WIRE_INTROSPECTION names a target file."""
+    target = os.environ.get("SHED_BROKER_WIRE_INTROSPECTION")
     if not target:
         return
     _introspection[section] = data
