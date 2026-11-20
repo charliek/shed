@@ -143,7 +143,14 @@ from a fetch that shows the login still names that id.
 
 The per-login key cache, `{state_dir}/github_keys/<login>.keys`, keeps its
 name and format, and is trusted only when it matches the hash stored with the
-pin.
+pin. A login with no pin yet (at a server's first v0.10.0 start, its cache is
+one an earlier release wrote) has no last known keys: the cache is not read,
+and until a fetch succeeds the login contributes no key. A server whose only
+keys are such logins then does not start (an `mtls` server always enforces its
+keys). Let it reach `api.github.com` and start it again, or give it a key that
+does not come from GitHub: with a user list (`auth.users`) a key under that
+user's `keys`, without one `auth.ssh.authorized_keys` or `authorized_keys_file`
+(the two cannot be combined).
 
 ### Expired keys and script keys
 

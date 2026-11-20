@@ -1060,6 +1060,13 @@ reachable from other hosts runs `mtls`.
   CLI, app or phone enrols again by itself, and `shed server update NAME --refetch` does
   it by hand. A service client's certificate (`auth.clients`) is told apart by its shape
   and is not affected.
+- **A GitHub login's key cache from before logins were pinned is no longer read.** Until a
+  login's first good fetch from `api.github.com` pins it, the login has no keys, even when
+  GitHub is unreachable. A server whose only keys are GitHub logins does not start at its
+  first 0.10.0 start while GitHub cannot be reached: the refusal names the two ways out (let
+  it reach `api.github.com` and start it again, or give it a key that does not come from
+  GitHub: with `auth.users` a key under that user's `keys`, without one
+  `auth.ssh.authorized_keys`). Allow `api.github.com` before upgrading, or add such a key.
 
 ## v0.9.0 — 2026-10-10
 
