@@ -1684,6 +1684,31 @@ shed roost-provider --uninstall            # Remove it
 
 These commands are part of `shed-server`, the server daemon binary.
 
+### shed-server serve
+
+Runs the server. The Linux package's systemd unit and the Homebrew service run
+it with their `--config`; run it by hand only as the same system user, with
+the same `--config`, and with the service stopped.
+
+```bash
+shed-server serve [--config <path>] [--abandon-user-upgrade]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | Auto-detect | Path to server config file |
+| `--abandon-user-upgrade` | off | Abandon, at this one start, the unfinished [one-time upgrade step](../guides/multi-user-server.md#sheds-with-no-user) after the users in `auth.users` changed. The step gives nothing more away and is recorded as done; the sheds and snapshots it had not reached keep no user (an admin gives one to a user with `shed assign`; one that carries host directories or server mounts can never be assigned). Refused, and the server does not start, when there is no such step: never leave it on a service's command line. |
+
+Without the flag, a server whose one-time upgrade step began for one user and
+has not finished does not start once `auth.users` holds any other users (beside
+`auth.directory`, the local admins: the account service's list never counts,
+whether or not it is in force). It stops before it opens a backend, a store or
+a listener, and before it gives anything away or records anything, and says
+the user the step began for and the two ways forward: put that user back as
+the only one in `auth.users` and start again until the log says the step is
+`done and recorded`, or start once with `--abandon-user-upgrade`. A server with
+no user list is not refused: it removes the step's marker, as before.
+
 ### shed-server setup
 
 Sets up Firecracker infrastructure on a Linux host. Idempotent and safe to re-run.

@@ -647,7 +647,7 @@ server, `pat` with your list name, and the key paths with yours.
 
     ```text
     Users: first start with a user list (no marker at /etc/shed/users-upgrade.json): running the one-time upgrade step
-    Users: the one-time upgrade step for the user list has begun for user pat (the only configured user); until it finishes it resumes only while pat is the only configured user
+    Users: the one-time upgrade step for the user list has begun for user pat (the only configured user); until it finishes it resumes only while pat is the only configured user, and the server does not start with other users
     Users: found no shed without a user or a service client
     Users: the one-time upgrade step for the user list is done and recorded; from now on a shed with no user is given one only by 'shed assign'
     ```
@@ -666,7 +666,9 @@ server, `pat` with your list name, and the key paths with yours.
     step that resumed and finished. If the last line says the step `did not
     finish`, restart the server again with the **same** config and check
     again, until it ends with `done and recorded`; change nothing in
-    `auth.users` before then (see the warning below). If it says the step
+    `auth.users` before then (until then the server does not start with
+    other users: see [If the server does not
+    start](#if-the-server-does-not-start)). If it says the step
     `ran at` an earlier start instead, this start gave nothing away: read
     [When step 1 can be skipped](#when-step-1-can-be-skipped).
 
@@ -730,13 +732,57 @@ with the same key. Until the first good pull only the local admins can log
 in: a command through your entry in that moment enrols again and waits for
 the pull, or fails once; run it again.
 
-!!! warning "Finish step 1 before changing `auth.users`"
-    A step that has begun and not finished resumes only while the user it
-    began for is the only one in `auth.users`. A start with any other users,
-    such as step 3's `admin` in place of `pat`, abandons it: the step is
-    recorded as done, nothing more is given away, and the sheds and snapshots
-    it had not reached stay with no user for good (the log says `the
-    unfinished one-time upgrade step for user pat was abandoned`).
+#### If the server does not start
+
+A step that has begun and not finished resumes only while the user it began
+for is the only one in `auth.users`. Beside `auth.directory` those are the
+local admins: adding, removing or renaming a local admin is a change, while
+the account service's list, and whether it is in force (not enrolled yet, or
+the service unreachable with no kept copy), never is. A start with any other
+users, such as step 3's `admin` in place of `pat`, **does not start the
+server**. It stops before it opens anything, gives nothing away and records
+nothing, and its error, in the same log, begins:
+
+```text
+the server does not start: the one-time upgrade step for the user list began for user pat and did not finish, and the users in auth.users are now admin (marker /etc/shed/users-upgrade.json).
+```
+
+The sheds and snapshots the step has not reached have no user yet. Take one
+of two ways forward:
+
+1. **Finish the step (keeps them yours).** Put back the `auth.users` of step
+   1, with `pat` as the only user and no `auth.directory`, restart the
+   server, and check its log with the commands of step 1, until the last
+   line that names the step is `done and recorded`. Then go on with step 3.
+
+2. **Abandon the step on purpose.** Nothing more is given away, the step is
+   recorded as done, and what it had not reached keeps no user for good (see
+   [What stays without a user](#what-stays-without-a-user)). Stop the
+   service, start the server **once** by hand with `--abandon-user-upgrade`,
+   as the user the service runs as and with its config, wait for the line
+   `Shed server is ready`, stop it with Ctrl-C, and start the service
+   again (without the flag):
+
+    === "Linux package"
+
+        ```bash
+        sudo systemctl stop shed-server
+        sudo shed-server serve --config /etc/shed/server.yaml --abandon-user-upgrade
+        sudo systemctl start shed-server
+        ```
+
+    === "Homebrew"
+
+        ```bash
+        brew services stop shed
+        "$(brew --prefix)/opt/shed/bin/shed-server" serve --config "$(brew --prefix)/etc/shed/server.yaml" --abandon-user-upgrade
+        brew services start shed
+        ```
+
+    The start with the flag logs `the unfinished one-time upgrade step for
+    user pat was abandoned`. The flag is refused, and the server does not
+    start, at any start with no such step to abandon: never leave it on the
+    service's command line.
 
 #### When step 1 can be skipped
 

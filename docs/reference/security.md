@@ -540,7 +540,13 @@ them all to that user (a shed with host directories or server mounts only if
 that user is an admin) and logs each. With several users nothing is given
 away: only an admin sees such a shed, nobody enters it, and an admin gives it
 to a user with [`shed assign`](cli.md#shed-assign). A marker,
-`{state_dir}/users-upgrade.json`, records that this one-time step ran. The
+`{state_dir}/users-upgrade.json`, records that this one-time step ran, or that
+it began for one user and has not finished. While it has not finished, the
+server **does not start** with any other users in `auth.users` (beside
+`auth.directory`, the local admins; the account service's list never counts):
+it stops before it opens anything or gives anything away, and says how to
+finish the step or abandon it on purpose with [`shed-server serve
+--abandon-user-upgrade`](cli.md#shed-server-serve). The
 [Multi-user server guide](../guides/multi-user-server.md#sheds-with-no-user)
 has the details.
 

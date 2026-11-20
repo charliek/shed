@@ -806,6 +806,19 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
 
 #### Changed
 
+- **Server: a changed user list no longer abandons an unfinished one-time upgrade step; the
+  server does not start.** While the step that gives sheds and snapshots with no user to the
+  only configured user has begun and not finished (`{state_dir}/users-upgrade.json` names
+  that user as pending), a start whose `auth.users` no longer holds that user alone (beside
+  `auth.directory`, the local admins; the account service's list never counts, in force or
+  not) stops before it opens a backend, a store or a listener, and before it gives anything
+  away or records anything. Its error names the user and the two ways forward: put that user
+  back as the only one and start again until the log says the step is `done and recorded`,
+  or start once with the new `shed-server serve --abandon-user-upgrade`, which abandons the
+  step as every start did before (nothing more given away, the step recorded as done, the
+  same log line). The flag is refused at a start with no such step, so it cannot stay on a
+  service's command line. A start with no user list still removes the marker. The start-up
+  log says, while the step is unfinished, that the server does not start with other users.
 - **CLI, SDK and desktop: a refused SSH key names each cause, not an allowlist.** `shed server
   add` and `shed server update --refetch` now fail with `the server refused every SSH key ssh
   offered for _bootstrap@<host>: none of them is a user's key there, or the right key has a

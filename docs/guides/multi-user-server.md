@@ -146,12 +146,21 @@ unassigned sheds to whoever is left. With one user, the marker names that
 user before anything is given away. A start that does not finish (a shed or
 snapshot it could not read or stamp) leaves the step pending for that user,
 and the next start resumes it only while that same user is still the only
-one listed; with any other list it gives nothing more away, records the step
-as done, and logs that the unfinished step was abandoned, so the sheds still
-without a user need `shed assign`. A start with **no** user list removes the
-marker, so removing the list and adding it back repeats the step. At every
-start the log reports how many sheds have no user and how many of those carry
-host resources (with their names at `log_level: debug`).
+one listed. With any other list the server **does not start**: it stops
+before it opens anything or gives anything away, and its error names the user
+the step began for and the two ways forward. Either put that user back as the
+only one in `auth.users` and start the server again until its log says the
+step is `done and recorded`, then change the list; or start it once with
+[`shed-server serve --abandon-user-upgrade`](../reference/cli.md#shed-server-serve),
+which gives nothing more away, records the step as done, and logs that the
+unfinished step was abandoned, so the sheds still without a user need `shed
+assign` (one that carries host directories or server mounts can never be
+assigned: it has to be recreated). The flag is refused at any start with no
+such step, so it cannot be left on the service's command line. A start with
+**no** user list removes the marker, so removing the list and adding it back
+repeats the step. At every start the log reports how many sheds have no user
+and how many of those carry host resources (with their names at `log_level:
+debug`).
 
 So the simplest path for a server one person used before: **start once with
 only yourself listed**, which gives you every existing shed, then add the
