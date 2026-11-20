@@ -107,39 +107,30 @@ make -C desktop deb-validate   # build + install-validate in a clean ubuntu:24.0
   as a degraded state, never a hard failure.
 
 **Nothing else.** `brew install shed` (or `apt install shed-server` on a Linux host) plus the
-desktop app is a complete install — its embedded broker handles credential approvals (SSH
-sign, AWS, Docker) itself, no extra daemon needed.
+desktop app is a complete install — its credential broker handles credential approvals (SSH
+sign, AWS, Docker) itself, with nothing else to install.
 
 ## Credential broker
 
 The app's headline feature — SSH-sign approvals, AWS/Docker credential gating, and the
-Activity audit feed — needs a **credential broker** in the loop. By default the app runs it
-**embedded**, in-process, on both macOS and Linux: no extra install.
+Activity audit feed — needs a **credential broker** in the loop. The app is that broker: it
+runs it in its own process, on both macOS and Linux, with nothing extra to install and no
+mode to choose. A machine without the app (a server, or a box with no desktop session) has no
+broker.
 
-The app can also run against a standalone `shed-host-agent` daemon instead of its embedded broker
-— useful if you already run `shed-host-agent` headless on a server, or want one broker
-shared across tools. A **Preferences → Credential broker** setting (`Automatic` /
-`In-app (embedded)` / `External daemon`) controls it, default `Automatic`:
+Credential requests are answered only while the app is running. To keep it running, the app
+turns on **launch at login** once, at its first launch (an upgraded install included), and
+records that in its preferences. It never turns it on again, so if you switch it off in
+Preferences it stays off. A debug build does not register itself.
 
-| Mode | Behavior |
-|---|---|
-| `Automatic` (default) | Probes for a running `shed-host-agent` at startup: a full daemon present ⇒ **external** (dials it, unchanged from today); a *headless* daemon (status socket only, no desktop socket) ⇒ **coexist** (the app doesn't start its own broker — no namespace conflicts — and obtains its own control credentials for secure servers, but gets no in-app approvals, since the headless daemon owns those); neither present ⇒ **embedded**. |
-| `In-app (embedded)` | Always starts the in-process broker, regardless of any running daemon. If a daemon is also running, both present this machine's identity. While the app's broker holds its lock (it takes it when it has a machine identity and the lock can be taken; see [Credential source](../extensions/source-binding.md#the-daemon-and-the-desktop-app-on-one-machine)), the daemon stands by (`yielding`) and answers nothing, and the app answers; without the lock either may hold a request type. In the moment before the daemon lets go, the second to subscribe is refused with a `409` (`duplicate`, retried, on a server with credential sources; on an older server the app retries it for 15 seconds, then `rejected`), surfaced (not hidden) in `broker.status`. |
-| `External daemon` | Always dials the standalone daemon, never starts an in-process broker. |
+If you installed the separate credential daemon from Homebrew with an earlier release, it is
+removed from the tap with this release and does nothing now: uninstall it with `brew uninstall` (see
+[Remove the old credential daemon](../upgrades/v0.9.0-to-v0.10.0.md#remove-the-old-credential-daemon) in the
+upgrade guide for this release).
 
-If the daemon `Automatic` chose at launch is stopped or uninstalled while the app runs, the
-app does not fall back to its embedded broker: there is no credential broker, and sheds lose
-ssh-agent and credential forwarding, until you relaunch the app. Relaunch after removing the
-daemon, or pin `In-app (embedded)`. A runtime fallback is tracked in
-[#411](https://github.com/charliek/shed/issues/411).
-
-The resolved mode is **fixed for the app's process lifetime** — changing the preference
-takes effect on the **next launch**, not live. The active mode, the probe evidence that
-produced it, and (for embedded) the resolved SSH backend and per-server connection state
-are visible in Preferences and over IPC (`broker.status`, `identify.broker_mode`). Whichever
-mode runs, the app and the daemon share one machine identity, so a server sees one machine;
+The active SSH backend and per-server connection state are visible in Preferences → Credential
+broker and over IPC (`broker.status`). The app and the servers see one machine identity, and
 Preferences shows which of your machines is the [credential source](../extensions/source-binding.md)
-on each server. Full
-mechanics — `extensions.yaml` handling, the synthesized fresh-install default, and the
-fail-closed behaviors — are documented in
-[Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker).
+on each server. Full mechanics — `extensions.yaml` handling, the synthesized fresh-install
+default, and the fail-closed behaviors — are in
+[Architecture → The credential broker](architecture.md#the-credential-broker).

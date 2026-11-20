@@ -1,7 +1,7 @@
 //! The native macOS Touch-ID / biometrics approval gate — a pure-`objc2` port of the
 //! Go daemon's CGO `touchid_darwin.go` (`LAContext.canEvaluatePolicy` /
 //! `evaluatePolicy`) + `touchid_stub.go` (the `!darwin` deny-all twin). This is the
-//! last CGO in `cmd/shed-host-agent`, so the Rust binary needs NO C toolchain: `objc2`
+//! last CGO in the retired Go daemon, so the Rust binary needs NO C toolchain: `objc2`
 //! links LocalAuthentication / Foundation at the linker level (`#[link(kind =
 //! "framework")]`) — no `import "C"`, no clang glue.
 //!

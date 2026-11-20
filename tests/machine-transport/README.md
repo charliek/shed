@@ -6,7 +6,7 @@ with them:
 | suite | what it drives |
 |---|---|
 | `tests/integration/` | a LIVE `shed-server` create cycle |
-| `tests/host-agent-diff/` | the `shed-host-agent` daemon's wire output, vs recorded goldens |
+| `tests/broker-wire/` | the desktop app's credential broker's wire output, vs recorded goldens |
 | `desktop/tools/shedtest/` | the desktop app over its IPC socket |
 | **`tests/machine-transport/`** | **every transport that reaches a machine over SSH, against one shared contract** |
 

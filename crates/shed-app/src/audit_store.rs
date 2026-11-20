@@ -1,6 +1,6 @@
 //! The app's own append-only audit log.
 //!
-//! A superset of the host agent's JSON-lines log: it adds the app's own approval
+//! A superset of the broker's JSON-lines log: it adds the app's own approval
 //! decisions (with the policy applied) and the streamed host events. Append-only
 //! on disk (best-effort — a write failure must never block a decision, F9); a
 //! bounded in-memory tail backs the Activity feed.

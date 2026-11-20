@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use crate::config::{
-    HostAgentConfig, POLICY_APPROVE_ALL, POLICY_BIOMETRICS, POLICY_BIOMETRICS_OR_PASSWORD,
+    ExtensionsYaml, POLICY_APPROVE_ALL, POLICY_BIOMETRICS, POLICY_BIOMETRICS_OR_PASSWORD,
     POLICY_DENY_ALL, POLICY_SHED_DESKTOP,
 };
 
@@ -160,7 +160,7 @@ impl ApprovalGate for DenyAllGate {
 ///
 /// Only the ssh gate can ever reach the biometric arms — `config` validation rejects
 /// biometrics for aws/docker — so reading ssh's scope/session-TTL here is exact.
-pub fn select_builtin_gate(policy: &str, cfg: &HostAgentConfig) -> Option<Arc<dyn ApprovalGate>> {
+pub fn select_builtin_gate(policy: &str, cfg: &ExtensionsYaml) -> Option<Arc<dyn ApprovalGate>> {
     match policy {
         POLICY_APPROVE_ALL => Some(Arc::new(ApproveAllGate)),
         POLICY_BIOMETRICS | POLICY_BIOMETRICS_OR_PASSWORD => Some(

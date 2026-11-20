@@ -4,10 +4,5 @@ golangci-lint = "2.15.0"
 # Release tooling, for running a goreleaser snapshot LOCALLY before trusting CI
 # (`make snapshot-server`). goreleaser is pinned to the exact version the
 # goreleaser-action pins in ci.yml / publish-images.yaml — the point of a local
-# snapshot is to predict CI, so a patch drift defeats it. zig backs
-# `cargo zigbuild`, which goreleaser's `builder: rust` shells out to for the
-# *-unknown-linux-gnu cross targets; it matches the zig CI installs through
-# scripts/release/install-zig.sh (move both together). `cargo-zigbuild` itself
-# is a `cargo install` (see RELEASING.md), not a mise tool.
+# snapshot is to predict CI, so a patch drift defeats it.
 goreleaser = "2.15.3"
-zig = "0.16.0"

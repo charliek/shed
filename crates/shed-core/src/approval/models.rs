@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 // wire DTOs.
 use crate::models::null_default;
 
-/// The credential namespaces the host agent brokers. Only `ssh-agent` is gated
+/// The credential namespaces the broker handles. Only `ssh-agent` is gated
 /// today; the rest are audit-only (visible in the activity feed).
 pub mod namespace {
     pub const SSH: &str = "ssh-agent";
@@ -25,13 +25,13 @@ pub mod namespace {
 /// or unparseable, and as the pre-fill default.
 pub const DEFAULT_APPROVAL_TTL: &str = "2h";
 
-/// A credential-approval request delegated from shed-host-agent. The app only
+/// A credential-approval request delegated from the broker. The app only
 /// ever sees metadata — never key material.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub id: String,
     pub ts: String,
-    /// The shed server this came from. Omitted by the host agent in
+    /// The shed server this came from. Omitted by the broker in
     /// single-server mode (shed-extensions #21), so decode it defensively
     /// (absent OR null -> ""); the rest are always present on the wire.
     #[serde(default, deserialize_with = "null_default")]
@@ -86,14 +86,13 @@ pub enum DecidedBy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuditSource {
-    #[serde(rename = "host-agent")]
-    HostAgent,
+    Broker,
     App,
     Lifecycle,
     Rc,
 }
 
-/// An entry in the app's own audit store — a superset of the host agent's JSON
+/// An entry in the app's own audit store — a superset of the broker's JSON
 /// log (adds `id`, `source`, `policy`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
@@ -128,7 +127,7 @@ pub struct AuditEntry {
 
 impl AuditEntry {
     /// The audit namespace for egress-control decisions, matching the
-    /// host-agent's stamping (shed-extensions egress subscriber).
+    /// broker's stamping (shed-extensions egress subscriber).
     pub const EGRESS_NAMESPACE: &'static str = "egress";
 
     /// True when this entry is an egress-control decision (ns == "egress").
@@ -169,7 +168,7 @@ impl PolicyGate {
     }
 }
 
-/// How the app prompts for an SSH approval when the host-agent delegates
+/// How the app prompts for an SSH approval when the broker delegates
 /// (policy: shed-desktop). The preferences "method" dropdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalMethod {
@@ -217,7 +216,7 @@ pub enum ApprovalScope {
 }
 
 impl ApprovalScope {
-    /// The wire scope string reported to the host agent for its audit.
+    /// The wire scope string reported to the broker for its audit.
     pub fn wire(self) -> &'static str {
         match self {
             ApprovalScope::PerRequest => "per-request",
@@ -447,7 +446,7 @@ mod tests {
 
     #[test]
     fn decode_request_with_missing_server_defaults_empty_string() {
-        // The host agent omits `server` in single-server mode (F12/defensive).
+        // The broker omits `server` in single-server mode (F12/defensive).
         let r: ApprovalRequest = serde_json::from_str(
             r#"{"id":"r1","ts":"t","namespace":"ssh-agent","op":"sign","shed":"s","detail":"d","expires_at":"e"}"#,
         )
@@ -561,8 +560,8 @@ mod tests {
             json!("per-shed-allow")
         );
         assert_eq!(
-            serde_json::to_value(AuditSource::HostAgent).unwrap(),
-            json!("host-agent")
+            serde_json::to_value(AuditSource::Broker).unwrap(),
+            json!("broker")
         );
         assert_eq!(
             serde_json::to_value(DecidedBy::Touchid).unwrap(),
@@ -629,7 +628,7 @@ mod tests {
         let mut e = AuditEntry {
             id: "1".into(),
             ts: "t".into(),
-            source: AuditSource::HostAgent,
+            source: AuditSource::Broker,
             server: None,
             shed: None,
             ns: Some("egress".into()),

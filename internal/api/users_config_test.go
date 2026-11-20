@@ -101,10 +101,17 @@ type twoUsersAndAnAdmin struct {
 }
 
 func newTwoUsersAndAnAdmin(t *testing.T) twoUsersAndAnAdmin {
-	return twoUsersAndAnAdmin{
+	k := twoUsersAndAnAdmin{
 		alice: newKeyPair(t), bob: newKeyPair(t), bobScript: newKeyPair(t), bobExpired: newKeyPair(t),
 		root: newKeyPair(t), stranger: newKeyPair(t),
 	}
+	// Each key's certificates name its user, as the bootstrap issues them.
+	nameTestKey(t, k.alice.fp, "alice")
+	for _, b := range []keyPair{k.bob, k.bobScript, k.bobExpired} {
+		nameTestKey(t, b.fp, "bob")
+	}
+	nameTestKey(t, k.root.fp, "root")
+	return k
 }
 
 func (k twoUsersAndAnAdmin) yaml() string {

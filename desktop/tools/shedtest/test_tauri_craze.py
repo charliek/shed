@@ -74,7 +74,6 @@ import pytest
 
 import ui
 from client import ShedError, TauriClient, scaled_timeout
-from fake_host_agent import FakeHostAgent
 from fake_opencode import FakeOpencode
 from fake_roost import FakeRoost
 from mockserver import MockShedServer
@@ -646,19 +645,18 @@ class Bridge:
 def _launch(mock, *, runtime_dir: Path, craze: CrazeEnv | None, roost: FakeRoost | None,
             ssh_bin: Path | None = None, config: Path = FIXTURES / "config-craze.yaml"):
     """An independent app instance (`test_tauri_lane.py`'s shape): its own
-    HOME/XDG_RUNTIME_DIR, its own fake host-agent, the session app untouched."""
+    HOME/XDG_RUNTIME_DIR, its own broker (which serves no server), the session
+    app untouched."""
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
         raise RuntimeError(f"tauri binary not found at {cfg.binary}; build it first (make tauri-build).")
-    agent = FakeHostAgent()
-    agent.start()
     client = proc = log_fh = None
     try:
         sock = runtime_dir / cfg.sock_rel
         log = runtime_dir / "craze-ui.log"
         env = ui.subproc_env(
             cfg, runtime_dir=runtime_dir, mock_base_url=mock.base_url,
-            config_path=config, host_agent_socket=agent.socket_path,
+            config_path=config,
             roost_sockets={LOCAL: roost.socket_path} if roost else None,
             ssh_bin=ssh_bin,
             craze_path=craze.path_dir if craze else None,
@@ -672,8 +670,8 @@ def _launch(mock, *, runtime_dir: Path, craze: CrazeEnv | None, roost: FakeRoost
                           what="tauri frontend ready")
     except BaseException:
         # A launch that failed after its spawn still owns what it started (plan
-        # 026 §3.3, F9): the app — and with it its children — its log handle and
-        # its agent, each released even if another's release fails.
+        # 026 §3.3, F9): the app — and with it its children — and its log handle,
+        # each released even if another's release fails.
         try:
             if client is not None:
                 client.close()
@@ -682,23 +680,19 @@ def _launch(mock, *, runtime_dir: Path, craze: CrazeEnv | None, roost: FakeRoost
                 if proc is not None:
                     ui.terminate(proc)
             finally:
-                try:
-                    if log_fh is not None:
-                        log_fh.close()
-                finally:
-                    agent.stop()
+                if log_fh is not None:
+                    log_fh.close()
         raise
-    return client, proc, log_fh, agent
+    return client, proc, log_fh
 
 
-def _stop(client, proc, log_fh, agent) -> None:
+def _stop(client, proc, log_fh) -> None:
     if client is not None:
         client.close()
     started = time.monotonic()
     ui.terminate(proc)
     took = time.monotonic() - started
     log_fh.close()
-    agent.stop()
     print(f"\n[craze] app pid {proc.pid} stopped in {took:.2f}s (exit {proc.returncode})")
     # Plan 026 §3.3: the harness's SIGTERM runs the app's orderly shutdown,
     # which ends it by itself — the 5 s grace, and the SIGKILL after it, must
@@ -4449,7 +4443,7 @@ def _quit_leaves_no_app_children(rig: SigRig, mock, how: str) -> str:
       the session.
 
     Answers the created session's hostId."""
-    app, proc, _log_fh, _agent = rig.launch(mock)
+    app, proc, _log_fh = rig.launch(mock)
     host = _set_up_children(app, rig)
     owned, persistent = _app_owned(proc.pid, rig)
     hubs = [p for p in rig.local.hub_pids() if p in persistent]
@@ -4517,8 +4511,7 @@ def test_sigterm_leaves_no_app_children(sig_rig, mock, how):
     first, rig.started = rig.started, None
     first[0].close()
     first[2].close()
-    first[3].stop()
-    app2, _proc2, _fh2, _agent2 = rig.launch(mock)
+    app2, _proc2, _fh2 = rig.launch(mock)
     app2.wait_until(lambda: _row(app2, host) is not None, timeout=WAIT,
                     what="the session's row after the relaunch")
     _ready(app2, host)
@@ -4546,7 +4539,7 @@ def test_a_second_signal_exits_at_once(wedged_rig, mock):
     orderly shutdown is held in its tunnels/masters phase; a second SIGTERM
     ends the app at once, with status 143 (128 + SIGTERM)."""
     rig = wedged_rig
-    app, proc, _log_fh, _agent = rig.launch(mock)
+    app, proc, _log_fh = rig.launch(mock)
     app.wait_until(lambda: _row(app, SIG_FAKE_HOST, machine=SIG_MACHINE) is not None,
                    timeout=WAIT, what="the remote machine's craze row")
     # The wedge is on from launch, so roost's own replace path may have logged

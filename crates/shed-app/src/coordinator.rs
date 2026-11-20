@@ -4,9 +4,9 @@
 //! processes them one at a time.
 //!
 //! The gate (§2.2 crux): `decide_approval` NEVER awaits the `AuthGate` inline in
-//! the actor — that would head-of-line-block the `Expire`/`Disconnect` commands
-//! and let a decision persist a grant/rule from a prompt whose request already
-//! expired (and was denied by the tick) or whose connection already dropped.
+//! the actor — that would head-of-line-block the `Expire` command and the
+//! broker's events, and let a decision persist a grant/rule from a prompt whose
+//! request already expired (and was denied by the tick).
 //! Instead it is two-phase: phase 1 validates + **spawns** the gate task; the
 //! gate task re-enters the actor as `GateResolved`; phase 2 re-validates
 //! presence + expiry (F4) and commits — mutate grants/rules, `respond`, audit,
@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
-use shed_core::approval::protocol::HostAgentInbound;
+use shed_core::approval::protocol::BrokerFrame;
 use shed_core::approval::{
     namespace, ttl_shorthand_seconds, ApprovalChoice, ApprovalDecision, ApprovalMethod,
     ApprovalRequest, ApprovalScope, AuditEntry, AuditSource, DecidedBy, PendingApprovalItem,
@@ -28,7 +28,7 @@ use shed_core::approval::{
 };
 
 use crate::audit_store::AuditStore;
-use crate::host_agent::HostAgentEvent;
+use crate::broker_event::BrokerEvent;
 use crate::traits::{
     AuthGateRef, AuthOutcome, AuthPrompt, ClockRef, CoordinatorEvent, EventSinkRef, NotifierRef,
     PostedNotification, ResponderRef,
@@ -90,7 +90,7 @@ pub struct CoordinatorDeps {
 }
 
 enum Command {
-    Host(HostAgentEvent),
+    Host(BrokerEvent),
     Expire(Option<oneshot::Sender<()>>),
     Decide {
         id: String,
@@ -153,13 +153,10 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// Spawn the actor + a task forwarding host-agent events into it. Returns the
+    /// Spawn the actor + a task forwarding broker events into it. Returns the
     /// handle. Call [`start_expiry_tick`](Self::start_expiry_tick) to drive the
     /// 1s expiry in production (tests drive `expire_now` deterministically).
-    pub fn spawn(
-        deps: CoordinatorDeps,
-        host_events: mpsc::UnboundedReceiver<HostAgentEvent>,
-    ) -> Self {
+    pub fn spawn(deps: CoordinatorDeps, host_events: mpsc::UnboundedReceiver<BrokerEvent>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut state = State {
             pending: HashMap::new(),
@@ -378,7 +375,7 @@ struct State {
     pending: HashMap<String, PendingApproval>,
     /// Ids with an OS auth gate currently in flight (A2) — so a duplicate approve
     /// doesn't stack a second native prompt. Cleared on every terminal path
-    /// (gate resolve, disconnect, same-id replacement).
+    /// (gate resolve, same-id replacement).
     gating: HashSet<String>,
     session_grants: HashMap<SessionGrantKey, GrantExpiry>,
     engine: PolicyEngine,
@@ -502,52 +499,20 @@ async fn run(mut state: State, mut rx: mpsc::UnboundedReceiver<Command>) {
 }
 
 impl State {
-    fn handle_host_event(&mut self, ev: HostAgentEvent) {
+    fn handle_host_event(&mut self, ev: BrokerEvent) {
         match ev {
-            HostAgentEvent::Connected(ack) => {
-                self.gate_namespaces = ack.gate_namespaces;
+            BrokerEvent::Connected { gate_namespaces } => {
+                self.gate_namespaces = gate_namespaces;
                 self.sink.emit(CoordinatorEvent::Connected);
             }
-            HostAgentEvent::Disconnected => {
-                // F3: in-flight requests are dead (the agent fails closed on its
-                // side); drop them so the user can't act on / persist a rule from a
-                // stale prompt.
-                let ids: Vec<String> = self.pending.keys().cloned().collect();
-                for id in &ids {
-                    self.notifier.withdraw(id);
-                }
-                self.pending.clear();
-                self.gating.clear(); // A2: any in-flight gates are moot now
-                                     // A3: drop ALL session grants — a reconnected (possibly different /
-                                     // squatting) agent must not inherit an auto-approve made to the
-                                     // previous connection. Clearing everything is simpler + strictly
-                                     // safer than scoping to a namespace across a reconnect.
-                self.session_grants.clear();
-                self.sink.emit(CoordinatorEvent::Approvals);
-                // The delegation is gone until we re-handshake; clear it (and signal
-                // the down-edge) so the UI's "host agent · connected" indicator, which
-                // derives liveness from a non-empty namespace set, flips back.
-                self.gate_namespaces.clear();
-                self.sink.emit(CoordinatorEvent::Connected);
-            }
-            HostAgentEvent::Untrusted => {
-                // A1: the socket peer isn't running as us — we never handshook, so
-                // there's no delegation. Record a distinct reason (so it's not a
-                // silent connecting… loop) and keep the "not connected" indicator.
-                self.last_error =
-                    Some("host-agent socket peer failed the UID check (not running as us)".into());
-                self.gate_namespaces.clear();
-                self.sink.emit(CoordinatorEvent::Connected);
-            }
-            HostAgentEvent::Frame(frame) => match *frame {
-                HostAgentInbound::ApprovalRequest(req) => self.handle_approval_request(req),
-                HostAgentInbound::Event(evt) => {
+            BrokerEvent::Frame(frame) => match *frame {
+                BrokerFrame::ApprovalRequest(req) => self.handle_approval_request(req),
+                BrokerFrame::Event(evt) => {
                     let entry =
                         AuditEntry::from_event_frame(evt, new_id(), self.clock.now_iso8601());
                     self.audit.append(entry);
                     self.sink.emit(CoordinatorEvent::Activity);
                 }
-                _ => {}
             },
         }
     }
@@ -679,8 +644,8 @@ impl State {
         self.gating.remove(id);
         // The request must still be pending, be the SAME request that opened the
         // gate (a same-id replacement while the gate was up must not inherit this
-        // decision), and not have expired (it may have been denied by the tick or
-        // dropped by a disconnect while the gate was up).
+        // decision), and not have expired (it may have been denied by the tick
+        // while the gate was up).
         let Some(item) = self.pending.get(id) else {
             return; // gone -> no late decision
         };
@@ -1034,7 +999,7 @@ impl State {
 
     /// True if the 1s tick should expire-to-deny this. Unparseable/absent -> NOT
     /// expired by the tick (matches the mac `?? now`: the request can't be
-    /// approved either, so it lingers until disconnect).
+    /// approved either, so it lingers until denied or the app exits).
     fn expired_by_tick(&self, req: &ApprovalRequest, now: i64) -> bool {
         crate::timefmt::parse_unix(&req.expires_at)
             .map(|e| e < now)
@@ -1229,36 +1194,6 @@ mod tests {
         assert_eq!(h.responder.calls()[0].decision, ApprovalDecision::Approve);
     }
 
-    #[tokio::test]
-    async fn a3_disconnect_clears_session_grants() {
-        // A3: a disconnect drops session grants, so a reconnected agent can't
-        // inherit an auto-approve granted to the previous connection.
-        let h = Harness::new(1_000);
-        h.coord
-            .set_policy_rules(vec![default_rule(PolicyAction::Prompt, PolicyGate::None)])
-            .await;
-        // r1 approved per-session → a grant for shed "s".
-        h.inject(ssh_req("r1", "s", 5_000));
-        assert!(h.wait_queued(1).await);
-        h.coord.decide_approval("r1", approve_session("1h")).await;
-        assert!(h.wait_calls(1).await);
-        // r2 same shed auto-approves via the grant.
-        h.inject(ssh_req("r2", "s", 5_000));
-        assert!(h.wait_calls(2).await);
-        assert_eq!(h.responder.calls()[1].decided_by, DecidedBy::Policy);
-        // Disconnect → the grant (and pending) are dropped.
-        h.events.send(HostAgentEvent::Disconnected).unwrap();
-        assert!(h.wait_queued(0).await);
-        // r3 same shed must RE-PROMPT (queue, not auto-approve) — the grant is gone.
-        h.inject(ssh_req("r3", "s", 5_000));
-        assert!(h.wait_queued(1).await);
-        assert_eq!(
-            h.responder.calls().len(),
-            2,
-            "r3 was auto-approved from a stale grant"
-        );
-    }
-
     // -- harness helpers -----------------------------------------------------
 
     fn temp_audit() -> AuditStore {
@@ -1299,7 +1234,7 @@ mod tests {
 
     struct Harness {
         coord: Coordinator,
-        events: mpsc::UnboundedSender<HostAgentEvent>,
+        events: mpsc::UnboundedSender<BrokerEvent>,
         responder: Arc<FakeResponder>,
         clock: ClockHandle,
     }
@@ -1335,9 +1270,9 @@ mod tests {
 
         fn inject(&self, req: ApprovalRequest) {
             self.events
-                .send(HostAgentEvent::Frame(Box::new(
-                    HostAgentInbound::ApprovalRequest(req),
-                )))
+                .send(BrokerEvent::Frame(Box::new(BrokerFrame::ApprovalRequest(
+                    req,
+                ))))
                 .unwrap();
         }
 
@@ -1682,33 +1617,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_drops_all_pending() {
-        // F3: a disconnect empties the queue; a late decide is a no-op.
-        let h = Harness::new(1_000);
-        h.coord
-            .set_policy_rules(vec![default_rule(PolicyAction::Prompt, PolicyGate::None)])
-            .await;
-        h.inject(ssh_req("r1", "s", 5_000));
-        assert!(h.wait_queued(1).await);
-        h.events.send(HostAgentEvent::Disconnected).unwrap();
-        assert!(h.wait_queued(0).await);
-        // A late decide sends nothing (the request is gone).
-        h.coord
-            .decide_approval(
-                "r1",
-                ApprovalChoice {
-                    decision: ApprovalDecision::Approve,
-                    scope: None,
-                    ttl: None,
-                    persist: false,
-                },
-            )
-            .await;
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(h.responder.calls().is_empty());
-    }
-
-    #[tokio::test]
     async fn persist_creates_per_shed_rule() {
         let h = Harness::new(1_000);
         h.coord
@@ -1860,9 +1768,7 @@ mod tests {
             ts: Some(iso(1_000)),
         };
         h.events
-            .send(HostAgentEvent::Frame(Box::new(HostAgentInbound::Event(
-                evt,
-            ))))
+            .send(BrokerEvent::Frame(Box::new(BrokerFrame::Event(evt))))
             .unwrap();
         for _ in 0..300 {
             let a = h.coord.activity_list(10).await;
@@ -1877,37 +1783,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_namespaces_from_hello_ack() {
+    async fn gate_namespaces_from_connected() {
         let h = Harness::new(1_000);
         h.events
-            .send(HostAgentEvent::Connected(shed_core::approval::HelloAck {
-                namespaces: vec![],
+            .send(BrokerEvent::Connected {
                 gate_namespaces: vec!["ssh-agent".into()],
-                agent_capabilities: vec![],
-                request_timeout_ms: 25_000,
-                accepted: true,
-            }))
+            })
             .unwrap();
-        let mut published = false;
         for _ in 0..300 {
             if h.coord.gate_namespaces().await == vec!["ssh-agent".to_string()] {
-                published = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(published, "gate_namespaces not published on connect");
-
-        // Down-edge: a disconnect clears the delegation, so the UI's "connected"
-        // indicator (derived from a non-empty namespace set) flips back.
-        h.events.send(HostAgentEvent::Disconnected).unwrap();
-        for _ in 0..300 {
-            if h.coord.gate_namespaces().await.is_empty() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("gate_namespaces not cleared on disconnect");
+        panic!("gate_namespaces not published on connect");
     }
 
     #[tokio::test]

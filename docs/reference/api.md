@@ -56,7 +56,7 @@ channel**:
    }
    ```
 
-`shed server add` performs this exchange automatically; the host-agent enrolls
+`shed server add` performs this exchange automatically; the desktop app's credential broker enrolls
 its own `credentials` certificate the same way. The certificate lives
 `auth.token_ttl` (default 24h) and is **re-validated on every request**: its
 expiry, its key against the live key set (with a user list, also the key's

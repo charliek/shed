@@ -223,32 +223,68 @@ func TestCertificateAdminAndScriptStayLive(t *testing.T) {
 	}
 }
 
-// TestPreBindingCertificateWorksUntilItExpires: a certificate issued before
-// certificates named their user has no user attribute. It keeps working
-// under the fingerprint rule (as whoever its key belongs to now) until it
-// expires, and is refused after, on the API and at the handshake.
-func TestPreBindingCertificateWorksUntilItExpires(t *testing.T) {
+// TestUnboundCertificateRefusedOnEveryServer: a user's certificate that
+// names no user (one a server older than 0.10.0 issued, before certificates
+// named their user) is refused on every server, at the handshake and on the
+// API (401): on a server with no user list, where its key is the implicit
+// user's, and on one with auth.users, where its key is alice's, as on a
+// directory server (directory_bus_test.go). Controls: on each server a
+// certificate naming the user the key belongs to passes both, and a service
+// client's certificate (auth.clients), which names no user and is told apart
+// by its shape before CertificateUser, is still admitted at the handshake and
+// served by the middleware.
+func TestUnboundCertificateRefusedOnEveryServer(t *testing.T) {
 	k := testFingerprint("K")
-	l := bindingLookup(k)
-	s := bindingServer(l)
+	ca := testCA(t)
 	caCert, caKey := testCAMaterial(t)
-
 	legacy := legacyClientCert(t, caCert, caKey, k, time.Now().Add(time.Hour))
 	if _, bound, err := servertls.ClientCertUser(legacy); bound || err != nil {
 		t.Fatalf("the legacy certificate names a user: bound %v err %v", bound, err)
 	}
-	if code, c := callerOf(s, legacy); code != http.StatusOK || c.User != "alice" {
-		t.Errorf("a legacy certificate before it expires: %d %+v, want alice", code, c)
+	service := serviceLeaf(testClientName)
+	if _, bound, err := servertls.ClientCertUser(service); bound || err != nil {
+		t.Fatalf("the service certificate names a user: bound %v err %v", bound, err)
 	}
-	if err := handshake(l, legacy); err != nil {
-		t.Errorf("a legacy certificate's handshake: %v", err)
-	}
-	expired := legacyClientCert(t, caCert, caKey, k, time.Now().Add(-time.Second))
-	if code, _ := callerOf(s, expired); code != http.StatusUnauthorized {
-		t.Errorf("an expired legacy certificate: %d, want 401", code)
-	}
-	if _, err := expired.Verify(x509.VerifyOptions{Roots: poolOf(caCert), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err == nil {
-		t.Error("an expired legacy certificate verifies against the CA: the TLS stack would let it through")
+	clientKnown := func(name string) bool { return name == testClientName }
+
+	for _, tc := range []struct {
+		name   string
+		lookup users.Lookup
+		own    *x509.Certificate // a certificate naming the user K belongs to
+	}{
+		{"no user list", userstest.Implicit(k), issueClientCertAs(t, ca, k, users.ImplicitName, authtoken.ScopeControl, time.Hour).Leaf},
+		{"auth.users", bindingLookup(k), issueClientCertAs(t, ca, k, "alice", authtoken.ScopeControl, time.Hour).Leaf},
+	} {
+		s := bindingServer(tc.lookup)
+		if code, c := callerOf(s, legacy); code != http.StatusUnauthorized {
+			t.Errorf("%s: a certificate that names no user: %d %+v, want 401", tc.name, code, c)
+		}
+		if err := handshake(tc.lookup, legacy); err == nil {
+			t.Errorf("%s: a certificate that names no user passed the handshake", tc.name)
+		}
+		if u, _, ok := CertificateUser(tc.lookup, legacy, time.Now()); ok {
+			t.Errorf("%s: CertificateUser accepted a certificate that names no user as %+v", tc.name, u)
+		}
+		// Control: the key's own user's certificate.
+		if code, _ := callerOf(s, tc.own); code != http.StatusOK {
+			t.Errorf("%s: a certificate naming K's user: %d, want 200", tc.name, code)
+		}
+		if err := handshake(tc.lookup, tc.own); err != nil {
+			t.Errorf("%s: a certificate naming K's user failed the handshake: %v", tc.name, err)
+		}
+		// Control: a service client's certificate.
+		verify := servertls.ClientConnectionVerifier(func(leaf *x509.Certificate) bool {
+			_, _, ok := CertificateUser(tc.lookup, leaf, time.Now())
+			return ok
+		}, clientKnown)
+		if err := verify(tls.ConnectionState{PeerCertificates: []*x509.Certificate{service}}); err != nil {
+			t.Errorf("%s: a service client's certificate failed the handshake: %v", tc.name, err)
+		}
+		cs, router := clientTestServer(t, newClientFakeBackend(), defaultTestPolicy())
+		cs.SetUserLookup(tc.lookup)
+		if r := do(router, service, "GET", "/api/sheds", ""); r.code != http.StatusOK {
+			t.Errorf("%s: a service client's GET /api/sheds = %d %s, want 200", tc.name, r.code, r.body)
+		}
 	}
 }
 

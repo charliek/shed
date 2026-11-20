@@ -6,39 +6,29 @@
 # component ships in a release iff its version manifest equals the tag:
 #
 #   server      .claude-plugin/plugin.json  .version
-#   host-agent  crates/shed-host-agent/VERSION
 #   desktop     desktop/VERSION
 #
-# `server` and `host-agent` are the two goreleaser-published components;
-# `ship_goreleaser` is their OR (true iff the tag ships at least one
-# goreleaser component). Only `desktop` has a beta channel — the goreleaser
-# components are stable-only.
+# `server` is the one goreleaser-published component; `ship_goreleaser`
+# equals `ship_server` and is kept as its own output because the publish
+# workflow's desktop-only release step reads it. Only `desktop` has a beta
+# channel — the server is stable-only.
 #
-# (The `machine-rc` component was retired in plan 010 — the shed-host-agent
-# daemon hosts the machine RC hub. This script no longer reads
-# cmd/shed-machine-rc/VERSION or emits ship_machine_rc; the publish workflow
-# FAILS LOUDLY if a re-dispatched pre-retirement tag's own copy of this script
-# emits ship_machine_rc=true.)
-#
-# (The `sx` component was SUNSET in plan 016 (S7, #329) — the RC porcelain
-# never shipped, so crates/sx/VERSION, .goreleaser.sx.yaml and the ship_sx
-# output are gone. `sx` in a `**Ships:**` line is a hard error naming the
-# sunset, not an unknown token.)
+# (Components retired earlier — see RELEASING.md "Retired components" — have
+# no selector here; a `**Ships:**` token naming one fails as an unknown token
+# below.)
 #
 # Input:  the tag, as $1 or $GITHUB_REF_NAME (leading `v` tolerated).
 # Output: exactly these `key=value` lines on stdout, suitable for
 #         `>> "$GITHUB_OUTPUT"`:
 #
 #   ship_server=true|false
-#   ship_host_agent=true|false
 #   ship_desktop=true|false
-#   ship_goreleaser=true|false     # OR of the goreleaser components
+#   ship_goreleaser=true|false     # equals ship_server
 #
-# (Pre-migration versions of this script emitted `ship_go`/`ship_desktop`
-# only; publish-images.yaml carries a permanent shim mapping legacy
-# `ship_go` output to the goreleaser components when a pre-migration
-# tag is dispatched — the workflow file comes from the dispatching ref, this
-# script from the checked-out tag.)
+# (Pre-migration versions of this script, v0.7.10 and older, emitted
+# `ship_go`/`ship_desktop` only. publish-images.yaml requires a
+# `ship_goreleaser` line, so it refuses to republish such a tag: the run
+# fails before it publishes anything.)
 #
 # All diagnostics go to stderr so stdout stays machine-parseable.
 #
@@ -48,8 +38,8 @@
 #     NO manifest matches the tag (a forgotten
 #     scripts/release/update-version.sh run — failing loudly here prevents a
 #     silent no-op release); ship_desktop but the desktop version surfaces are
-#     out of lockstep; a prerelease tag ships a goreleaser component
-#     (stable-only); (stable tags only) the CHANGELOG `**Ships:**` line
+#     out of lockstep; a prerelease tag ships the server (stable-only);
+#     (stable tags only) the CHANGELOG `**Ships:**` line
 #     disagrees with the manifest-computed ship set; or (stable tags that
 #     ship `server`, plan 025 O4) scripts/release/check-craze-pin.sh fails —
 #     craze-pin.env's CRAZE_RELEASE is empty or doesn't resolve to
@@ -135,26 +125,20 @@ if [ -z "${SERVER_V}" ] || [ "${SERVER_V}" = "null" ] || [[ ! "${SERVER_V}" =~ ^
   exit 1
 fi
 
-HOST_AGENT_V="$(read_version_file "${REPO_ROOT}/crates/shed-host-agent/VERSION")"
 DESKTOP_V="$(read_version_file "${REPO_ROOT}/desktop/VERSION")"
 
 SHIP_SERVER=false
 [ "${SERVER_V}" = "${V}" ] && SHIP_SERVER=true
-SHIP_HOST_AGENT=false
-[ "${HOST_AGENT_V}" = "${V}" ] && SHIP_HOST_AGENT=true
 SHIP_DESKTOP=false
 [ "${DESKTOP_V}" = "${V}" ] && SHIP_DESKTOP=true
 
-# ship_goreleaser is the OR of the goreleaser components, computed here
-# (not inferred in YAML) so the "any goreleaser component" decision is unit-tested.
-SHIP_GORELEASER=false
-if [ "${SHIP_SERVER}" = "true" ] || [ "${SHIP_HOST_AGENT}" = "true" ]; then
-  SHIP_GORELEASER=true
-fi
+# ship_goreleaser: whether the tag runs goreleaser at all. The server is the
+# only goreleaser component, so it equals ship_server; the output stays
+# because the publish workflow's desktop-only release step keys on it.
+SHIP_GORELEASER="${SHIP_SERVER}"
 
-if [ "${SHIP_SERVER}" = "false" ] && [ "${SHIP_HOST_AGENT}" = "false" ] \
-   && [ "${SHIP_DESKTOP}" = "false" ]; then
-  echo "::error::tag ${TAG} matches NO component manifest (server .claude-plugin/plugin.json=${SERVER_V}, host-agent crates/shed-host-agent/VERSION=${HOST_AGENT_V}, desktop desktop/VERSION=${DESKTOP_V}). Run scripts/release/update-version.sh ${V} --components ... and re-tag — refusing a silent no-op release." >&2
+if [ "${SHIP_SERVER}" = "false" ] && [ "${SHIP_DESKTOP}" = "false" ]; then
+  echo "::error::tag ${TAG} matches NO component manifest (server .claude-plugin/plugin.json=${SERVER_V}, desktop desktop/VERSION=${DESKTOP_V}). Run scripts/release/update-version.sh ${V} --components ... and re-tag — refusing a silent no-op release." >&2
   exit 1
 fi
 
@@ -184,11 +168,11 @@ if [ "${SHIP_DESKTOP}" = "true" ]; then
   done
 fi
 
-# Stable-only guard: the two goreleaser components have no beta channel, so a
-# prerelease (`-suffix`) tag must not select either of them. A desktop-only
-# prerelease (the Tauri rc rehearsal) is fine and falls through cleanly.
-if [ "${IS_PRERELEASE}" = "true" ] && [ "${SHIP_GORELEASER}" = "true" ]; then
-  echo "::error::prerelease tag ${TAG} ships a goreleaser component (server=${SHIP_SERVER}, host-agent=${SHIP_HOST_AGENT}) — those components are stable-only (only desktop has a beta channel). Cut a stable tag, or bump only the desktop surfaces for an rc." >&2
+# Stable-only guard: the server has no beta channel, so a prerelease
+# (`-suffix`) tag must not select it. A desktop-only prerelease (the Tauri rc
+# rehearsal) is fine and falls through cleanly.
+if [ "${IS_PRERELEASE}" = "true" ] && [ "${SHIP_SERVER}" = "true" ]; then
+  echo "::error::prerelease tag ${TAG} ships the server — it is stable-only (only desktop has a beta channel). Cut a stable tag, or bump only the desktop surfaces for an rc." >&2
   exit 1
 fi
 
@@ -227,7 +211,7 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
   fi
 
   # Grammar: `**Ships:** token(, token)*`, split on `\s*,\s*`. Tokens are
-  # case-sensitive canonical names; `server/CLI` is the sole legacy alias.
+  # case-sensitive canonical names, with no alias.
   tokens_raw="${ships_line#\*\*Ships:\*\*}"
   # `read -a` silently DROPS a trailing empty field, so a trailing comma
   # (`**Ships:** server,`) would slip past the per-token empty check below.
@@ -240,9 +224,8 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
   fi
   # This local run is mandatory on stock macOS bash (3.2), which has no
   # associative arrays — so the "already seen this token" set is tracked by a
-  # linear scan over actual_ships (canonical, ≤3 elements — server, host-agent,
-  # desktop) rather than an
-  # associative `ship_seen`. Index-loop the scan so an empty actual_ships can't
+  # linear scan over actual_ships (canonical, ≤2 elements — server, desktop)
+  # rather than an associative `ship_seen`. Index-loop the scan so an empty actual_ships can't
   # trip `set -u` on the `[@]` expansion.
   actual_ships=()
   IFS=',' read -r -a ship_parts <<< "${tokens_raw}"
@@ -252,27 +235,17 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
       echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has an empty token (grammar: token(, token)*)." >&2
       exit 1
     fi
-    # Legacy alias, applied BEFORE canonical + duplicate checks.
-    [ "${tok}" = "server/CLI" ] && tok="server"
     case "${tok}" in
-      server|host-agent|desktop) ;;
-      sx)
-        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line names 'sx' — the component was sunset in plan 016 (the RC porcelain never shipped; its selector, goreleaser config and brew/apt slots were removed)." >&2
-        exit 1
-        ;;
-      machine-rc)
-        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line names 'machine-rc' — the component was retired in plan 010 (the hub ships in host-agent)." >&2
-        exit 1
-        ;;
+      server|desktop) ;;
       *)
-        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has unknown token '${tok}' (valid: server, host-agent, desktop; alias: server/CLI)." >&2
+        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has unknown token '${tok}' (valid: server, desktop)." >&2
         exit 1
         ;;
     esac
     j=0
     while [ "${j}" -lt "${#actual_ships[@]}" ]; do
       if [ "${actual_ships[${j}]}" = "${tok}" ]; then
-        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has duplicate token '${tok}' (post-aliasing)." >&2
+        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has duplicate token '${tok}'." >&2
         exit 1
       fi
       j=$((j + 1))
@@ -283,7 +256,6 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
   # Manifest-computed ship set.
   expected_ships=()
   [ "${SHIP_SERVER}" = "true" ] && expected_ships+=(server)
-  [ "${SHIP_HOST_AGENT}" = "true" ] && expected_ships+=(host-agent)
   [ "${SHIP_DESKTOP}" = "true" ] && expected_ships+=(desktop)
 
   actual_sorted="$(printf '%s\n' "${actual_ships[@]}" | sort | paste -sd, -)"
@@ -313,16 +285,15 @@ if [ "${IS_PRERELEASE}" = "false" ] && [ "${SHIP_SERVER}" = "true" ]; then
     CRAZE_PIN_FILE="${REPO_ROOT}/craze-pin.env"
     CRAZE_RELEASE="$("${SCRIPT_DIR}/read-craze-pin.sh" --field CRAZE_RELEASE "${CRAZE_PIN_FILE}")" || exit 1
     # Redirect its stdout to stderr: release-plan.sh's own stdout is a
-    # strict 4-line machine-parseable contract (ship_server=... etc, see the
+    # strict 3-line machine-parseable contract (ship_server=... etc, see the
     # header above) and the checker's own diagnostic line must not leak
     # into it.
     "${SCRIPT_DIR}/check-craze-pin.sh" --release "v${CRAZE_RELEASE}" >&2 || exit 1
   fi
 fi
 
-echo "release plan for ${TAG}: server=${SHIP_SERVER} host-agent=${SHIP_HOST_AGENT} desktop=${SHIP_DESKTOP} goreleaser=${SHIP_GORELEASER} (manifests: server=${SERVER_V}, host-agent=${HOST_AGENT_V}, desktop=${DESKTOP_V})" >&2
+echo "release plan for ${TAG}: server=${SHIP_SERVER} desktop=${SHIP_DESKTOP} goreleaser=${SHIP_GORELEASER} (manifests: server=${SERVER_V}, desktop=${DESKTOP_V})" >&2
 
 echo "ship_server=${SHIP_SERVER}"
-echo "ship_host_agent=${SHIP_HOST_AGENT}"
 echo "ship_desktop=${SHIP_DESKTOP}"
 echo "ship_goreleaser=${SHIP_GORELEASER}"

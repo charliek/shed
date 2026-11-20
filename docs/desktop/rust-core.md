@@ -9,14 +9,13 @@ re-implementing it per language. Its consumers:
   which links `shed-core` + `shed-app` as path dependencies;
 - **shed-mobile** — the phone client, which takes `shed-core` as a git dependency and calls
   it from Dart through flutter_rust_bridge (FRB);
-- **`shed-host-agent`** — the credential-broker daemon, built on `shed-broker`, which itself
-  builds on `shed-core`.
+- **`shed-broker`** — the credential broker the desktop app embeds, built on `shed-core`.
 
 ## Layout
 
 A cargo workspace under `crates/`, every member a default-member. The client
 core is `shed-core`, `shed-app` and `shedctl`, below; beside them sit the
-credential broker (`shed-broker`) and its daemon (`shed-host-agent`), and the
+credential broker (`shed-broker`), and the
 two [agent-lane](agent-lanes.md) adapters, `shed-opencode` and `shed-craze`:
 
 - **`shed-core`** — a *pure* Rust lib (no UI): wire DTOs + serde decoders
@@ -33,9 +32,9 @@ two [agent-lane](agent-lanes.md) adapters, `shed-opencode` and `shed-craze`:
   builders, the permission-mode table, and the pane classifier — with the RC
   hub itself).
 - **`shed-app`** — the UI-free app-logic layer (`Backend`, the approval
-  `Coordinator`, `HostAgentClient`, `AuditStore`, the roost client), consumed by
+  `Coordinator`, `AuditStore`, the roost client), consumed by
   the Tauri client as a cross-workspace path dep. `broker` (the in-process
-  host-agent-replacement bridge, backed by `shed-broker`) is its only
+  bridge to the credential broker, backed by `shed-broker`) is its only
   non-default feature — the RC hub's `RcRunner` seam, `rc.rs` and `RcService`
   were deleted with the hub in plan 022 (S6); agent sessions are driven through
   `roost.rs` instead (see [Agent lanes](agent-lanes.md) and

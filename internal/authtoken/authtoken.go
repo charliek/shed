@@ -16,15 +16,15 @@ package authtoken
 // there is no separate HTTP admin capability.
 const (
 	ScopeControl     = "control"     // shed lifecycle / control plane (CLI, desktop); also accepted on the Connect tunnel and egress stream
-	ScopeCredentials = "credentials" // credential bus (/api/plugins/*); also accepted on the Connect tunnel + egress audit stream (host-agent)
+	ScopeCredentials = "credentials" // credential bus (/api/plugins/*); also accepted on the Connect tunnel + egress audit stream (the broker)
 )
 
 // Client kinds are advisory metadata, recorded in the issued certificate for
 // audit only.
 const (
-	ClientCLI       = "cli"
-	ClientHostAgent = "host-agent"
-	ClientDesktop   = "desktop"
+	ClientCLI     = "cli"
+	ClientBroker  = "broker"
+	ClientDesktop = "desktop"
 	// ClientMobile is the shed mobile app. The app itself sends the literal
 	// "shed-mobile" on the wire today; the bootstrap parser normalizes that
 	// spelling to this canonical value (see internal/sshd/bootstrap.go).

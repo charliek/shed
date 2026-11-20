@@ -201,7 +201,7 @@ func TestRunSuccess(t *testing.T) {
 
 // TestRunNeverSendsACSRButRunCredentialDoes pins the split between the two
 // entry points, asserted from the SERVER's side: Run is token-only and must
-// stay that way (the host-agent depends on it), while RunCredential submits a
+// stay that way (a caller asking for a token depends on it), while RunCredential submits a
 // CSR to every server so a mode flip needs no client change.
 //
 // It drives the real Run/RunCredential over the real ssh client rather than
@@ -232,7 +232,7 @@ func TestRunNeverSendsACSRButRunCredentialDoes(t *testing.T) {
 		Host: "127.0.0.1", Port: port, KnownHostsPath: kh, Scope: "control", ClientKind: "test",
 		// Set deliberately. Run must DISCARD it — a caller passing one (or a
 		// struct copied from a RunCredential call site) must not turn Run into an
-		// enrolling client behind the host-agent's back.
+		// enrolling client behind its caller's back.
 		CSRBase64: "QUJD",
 	}
 

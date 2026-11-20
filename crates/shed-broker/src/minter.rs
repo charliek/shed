@@ -1,4 +1,4 @@
-//! The SSH credential minter — a faithful Rust port of `cmd/shed-host-agent/credmint.go`.
+//! The SSH credential minter — a faithful Rust port of the retired Go daemon's `credmint.go`.
 //!
 //! [`CredentialMinter`] bootstraps a scoped CREDENTIAL over a server's SSH `_bootstrap`
 //! channel (via [`crate::bootstrap`]), after a fast-fail `known_hosts` pin pre-check.
@@ -42,13 +42,13 @@ use shed_core::token::{display_server_name, held_user_refusal, next_refusal_back
 use ssh_key::known_hosts::{HostPatterns, KnownHosts};
 use tokio::sync::watch;
 
-use crate::bootstrap::{BootstrapRunner, Params, SystemSshRunner};
+use crate::bootstrap::{BootstrapRunner, Params, SystemSshRunner, CLIENT_KIND_BROKER};
 use crate::config::expand_tilde;
 use crate::credstore::CredStore;
 use crate::discovery::ServerTarget;
 use crate::status::now_unix;
 
-/// Token scopes the host-agent mints over SSH: `credentials` for its own bus
+/// Token scopes the broker mints over SSH: `credentials` for its own bus
 /// brokering, `control` for a `token.get` on the desktop's behalf (`credmint.go:48`).
 /// `credentials` is the bus token provider's scope (wired by the supervisor's
 /// credentials-scope `CredentialSource`); `control` is the egress side task + `token.get`.
@@ -202,7 +202,7 @@ pub trait Minter: Send + Sync {
     }
 }
 
-/// Bootstraps the host-agent's own scoped token over a server's SSH `_bootstrap`
+/// Bootstraps the broker's own scoped token over a server's SSH `_bootstrap`
 /// channel via the injectable [`BootstrapRunner`] (mirror `credmint.go:CredentialMinter`).
 pub struct CredentialMinter {
     known_hosts_path: String,
@@ -262,7 +262,7 @@ impl Minter for CredentialMinter {
             port: target.ssh_port,
             known_hosts_path: self.known_hosts_path.clone(),
             scope: scope.to_string(),
-            client_kind: "host-agent".to_string(),
+            client_kind: CLIENT_KIND_BROKER.to_string(),
             csr: keypair.csr_base64(),
             // The entry's own key, when it names one (plan 037 A8): ssh offers it and
             // no key that is only in the agent; the runner checks the file first.
@@ -323,7 +323,7 @@ impl Minter for CredentialMinter {
             port: target.ssh_port,
             known_hosts_path: self.known_hosts_path.clone(),
             scope: scope.to_string(),
-            client_kind: "host-agent".to_string(),
+            client_kind: CLIENT_KIND_BROKER.to_string(),
             csr: csr_base64.to_string(),
             identity_file: target.identity_file.clone(),
         };
@@ -2621,6 +2621,7 @@ pub(crate) mod tests {
 
         let seen = runner.last_params.lock().unwrap().clone().unwrap();
         assert!(!seen.csr.is_empty(), "a CSR must be submitted");
+        assert_eq!(seen.client_kind, "broker", "the broker's client kind");
         crate::bootstrap::validate(&seen).expect("the composed params must be argv-safe");
         // Two mints use two DIFFERENT keys: key lifetime == certificate lifetime.
         let runner2 = FakeRunner::ok(bundle("tok"));
@@ -2690,6 +2691,8 @@ pub(crate) mod tests {
         let sent = runner.last_params.lock().unwrap().clone().unwrap();
         assert_eq!(sent.csr, "QUJDREVG==", "verbatim");
         assert_eq!(sent.scope, SCOPE_CONTROL);
+        // The app's control mint relays through here: it sends the broker's kind too.
+        assert_eq!(sent.client_kind, "broker");
 
         // An EMPTY relayed CSR sends no `csr=` argument at all (the legacy request).
         let runner2 = FakeRunner::ok(bundle("tok"));

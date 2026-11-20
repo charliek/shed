@@ -1,30 +1,26 @@
-//! The embedded broker bridge (leg 3a.2) — an in-process replacement for the
-//! [`HostAgentClient`](crate::host_agent::HostAgentClient) UDS client, backed by a
-//! `shed_broker::Supervisor` running on the app's own tokio runtime instead of a
-//! socket to a standalone `shed-host-agent` daemon.
+//! The embedded broker bridge (leg 3a.2): the desktop app's credential broker, a
+//! `shed_broker::Supervisor` running on the app's own tokio runtime.
 //!
-//! It presents the SAME Coordinator-facing surface the external-mode client does:
-//!   * an [`mpsc::UnboundedReceiver<HostAgentEvent>`] the [`Coordinator`] consumes via
+//! It presents the Coordinator-facing surface:
+//!   * an [`mpsc::UnboundedReceiver<BrokerEvent>`] the [`Coordinator`] consumes via
 //!     [`Coordinator::spawn`](crate::coordinator::Coordinator::spawn) — carrying a
-//!     synthesized `Connected(HelloAck)` (so the approvals UI sections light up exactly
-//!     as in external mode), plus each broker approval-request as a `Frame` and each
-//!     audit row (fanned in from the broker) as an `Event` frame;
+//!     synthesized `Connected { gate_namespaces }` (so the approvals UI sections light
+//!     up), plus each broker approval-request as a `Frame` and each audit row (fanned
+//!     in from the broker) as an `Event` frame;
 //!   * a synchronous [`Responder`] the Coordinator calls inside its atomic decision
 //!     handler (bounded-`mpsc` handoff → the bridge's async side completes the matching
 //!     `oneshot`, so nothing awaits under the actor lock);
 //!   * a [`TokenMinter`] adapter over the broker's `ControlTokenProvider` for the
 //!     Backend's secure-server credential vend — mtls-capable (plan 002 §7 P2): it
 //!     relays the shed-core provider's CSR into the broker's control-credential mint,
-//!     so an embedded-broker app enrolls against an mtls server exactly as an
-//!     external-agent one does.
+//!     so the app enrolls against an mtls server.
 //!
 //! **Deadlock-free** (the §3.2 analysis): the Coordinator is two-phase (never awaits the
 //! gate inline) and `Responder` is synchronous, so `AppGate`-awaits-oneshot /
 //! `Responder`-completes-oneshot has no cycle.
 //!
-//! **No replay buffer:** the UDS hello's `replay_events: 50` has no embedded analogue.
-//! Post-restart activity comes from the app's own `AuditStore`, not a broker ring —
-//! documented and accepted (§3.2).
+//! **No replay buffer:** post-restart activity comes from the app's own `AuditStore`,
+//! not a broker ring — documented and accepted (§3.2).
 
 use std::collections::HashMap;
 use std::io;
@@ -35,18 +31,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use shed_core::approval::protocol::{AuditEventFrame, HostAgentInbound};
-use shed_core::approval::{
-    ApprovalDecision, ApprovalRequest, DecidedBy, HelloAck, CAP_CREDENTIAL_GET,
-};
+use shed_core::approval::protocol::{AuditEventFrame, BrokerFrame};
+use shed_core::approval::{ApprovalDecision, ApprovalRequest, DecidedBy};
 use shed_core::http::ShedError;
 use shed_core::token::{CredentialRequest, MintedCredential, MintedToken, TokenMinter};
 
 use shed_broker::approval::{select_builtin_gate, ApprovalGate, ApprovalOutcome};
 use shed_broker::audit::{AuditEntry as BrokerAuditEntry, AuditFanout, AuditSink, JsonlAuditSink};
 use shed_broker::config::{
-    DiscoveryConfig, HostAgentConfig, DEFAULT_DISCOVERY_SOURCE, NS_AWS_CREDENTIALS,
-    NS_DOCKER_CREDENTIALS, NS_EGRESS, NS_SSH_AGENT,
+    DiscoveryConfig, ExtensionsYaml, DEFAULT_DISCOVERY_SOURCE, NS_AWS_CREDENTIALS,
+    NS_DOCKER_CREDENTIALS, NS_SSH_AGENT,
 };
 use shed_broker::controltoken::{
     ControlCredentialMinter, ControlTokenMinter, ControlTokenProvider, MintedControlCredential,
@@ -56,15 +50,13 @@ use shed_broker::sign_check::SignPolicy;
 use shed_broker::status::{ServerHealth, SshSigningStatus};
 use shed_broker::supervisor::{SharedDeps, Supervisor};
 use shed_broker::{
-    aws_backend, bus, desktop_socket_path, docker_backend, minter as broker_minter, presence,
-    socket_is_live, ssh_backend, status_socket_path, watcher,
+    aws_backend, bus, docker_backend, minter as broker_minter, ssh_backend, watcher,
 };
 
-use crate::host_agent::HostAgentEvent;
+use crate::broker_event::BrokerEvent;
+// The credential-shape rules — see `map_embedded_credential`.
+use crate::credential_shape::{credential_from_parts, expiry_unix, minted_token, CredentialParts};
 use crate::timefmt;
-// The credential-shape rules are the UDS minter's, shared verbatim — see
-// `map_embedded_credential`.
-use crate::token_minter::{credential_from_parts, expiry_unix, minted_token, CredentialParts};
 use crate::traits::{system_clock, ClockRef, Responder, ResponderRef};
 
 /// The known_hosts pin the control-token minter bootstraps over (parity with the
@@ -87,11 +79,6 @@ const KNOWN_HOSTS_PATH: &str = "~/.shed/known_hosts";
 /// stays diagnosable.
 const RESPOND_QUEUE_CAP: usize = 64;
 
-/// How long `spawn` waits for the presence lock before starting the broker without it
-/// (the holder keeps trying). A daemon's look costs one retry of 50 ms; a second while
-/// another instance of the app holds the lock is all the start-up should give it.
-const EMBEDDED_LOCK_WAIT: Duration = Duration::from_secs(1);
-
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -110,7 +97,7 @@ pub enum BrokerError {
     /// SSH backend resolve failed at spawn (unknown `ssh.mode`, or an explicit
     /// `agent-forward` with `$SSH_AUTH_SOCK` unset).
     SshBackend(String),
-    /// [`EmbeddedHostAgent::spawn`] was called more than once. `spawn` is once-only —
+    /// [`EmbeddedBroker::spawn`] was called more than once. `spawn` is once-only —
     /// a second call must NOT build a second `Supervisor` + watch loop (dual brokers
     /// fighting for the same servers, 409s) — so it returns this WITHOUT side effects.
     AlreadySpawned,
@@ -134,21 +121,21 @@ impl std::error::Error for BrokerError {}
 #[derive(Debug, Clone)]
 pub enum BrokerConfig {
     /// A valid `extensions.yaml` was found and parsed — honored exactly like the daemon.
-    Loaded(HostAgentConfig),
+    Loaded(ExtensionsYaml),
     /// No `extensions.yaml` (fresh desktop install) — the synthesized desktop default.
-    Synthesized(HostAgentConfig),
+    Synthesized(ExtensionsYaml),
 }
 
 impl BrokerConfig {
     /// The underlying config, regardless of provenance.
-    pub fn config(&self) -> &HostAgentConfig {
+    pub fn config(&self) -> &ExtensionsYaml {
         match self {
             BrokerConfig::Loaded(c) | BrokerConfig::Synthesized(c) => c,
         }
     }
 
     /// Consume into the underlying config.
-    pub fn into_config(self) -> HostAgentConfig {
+    pub fn into_config(self) -> ExtensionsYaml {
         match self {
             BrokerConfig::Loaded(c) | BrokerConfig::Synthesized(c) => c,
         }
@@ -165,7 +152,7 @@ impl BrokerConfig {
 /// The missing-file discrimination keys on [`io::ErrorKind::NotFound`], so a genuinely
 /// unreadable-or-malformed file is a `Config` error rather than a silent synthesis.
 pub fn load_or_synthesize(config_path: &str) -> Result<BrokerConfig, BrokerError> {
-    match HostAgentConfig::load(config_path) {
+    match ExtensionsYaml::load(config_path) {
         Ok(cfg) => Ok(BrokerConfig::Loaded(cfg)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BrokerConfig::Synthesized(
             synthesize_default(DEFAULT_DISCOVERY_SOURCE),
@@ -175,136 +162,18 @@ pub fn load_or_synthesize(config_path: &str) -> Result<BrokerConfig, BrokerError
 }
 
 /// Build the fresh-install default through the SAME parser/validation path
-/// `HostAgentConfig::load` uses (a real config text, not a hand-rolled struct — parity
+/// `ExtensionsYaml::load` uses (a real config text, not a hand-rolled struct — parity
 /// is structural). `discovery_source` overrides the shed-CLI config path (production
 /// passes [`DEFAULT_DISCOVERY_SOURCE`]; tests point it at a temp file).
-pub(crate) fn synthesize_default(discovery_source: &str) -> HostAgentConfig {
+pub(crate) fn synthesize_default(discovery_source: &str) -> ExtensionsYaml {
     let yaml = format!(
         "ssh:\n  approval:\n    policy: shed-desktop\ndiscovery:\n  source: {discovery_source}\n"
     );
     // A known-good literal: `try_parse` + `validate` mirror `load` exactly. A failure
     // here is a bug in this constant, not a runtime input, so `expect` is correct.
-    let cfg = HostAgentConfig::try_parse(&yaml).expect("synthesized default parses");
+    let cfg = ExtensionsYaml::try_parse(&yaml).expect("synthesized default parses");
     cfg.validate().expect("synthesized default validates");
     cfg
-}
-
-// ---------------------------------------------------------------------------
-// Mode detection (§3.3)
-// ---------------------------------------------------------------------------
-
-/// The daemon-socket liveness evidence auto-detect keys on, surfaced verbatim in
-/// `broker.status` so the UI can explain why `auto` chose what it did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModeProbe {
-    pub desktop_socket_live: bool,
-    pub status_socket_live: bool,
-}
-
-/// What the three-way probe detected (before the pref overlay).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetectedMode {
-    /// A desktop daemon owns the approval channel — use today's UDS client, unchanged.
-    External,
-    /// A deliberately-run headless daemon owns brokering — do NOT start the bus broker
-    /// (no 409 fights) and get no UDS approvals; token minting falls back to in-process.
-    HeadlessCoexist,
-    /// No daemon — start the in-process broker.
-    Embedded,
-}
-
-/// The persisted user preference (default `auto`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModePref {
-    Auto,
-    Embedded,
-    External,
-}
-
-/// The effective mode after the pref overlay — fixed for the process lifetime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EffectiveMode {
-    External,
-    HeadlessCoexist,
-    Embedded,
-}
-
-/// The resolved mode plus the probe evidence that produced it (for `broker.status`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResolvedMode {
-    pub mode: EffectiveMode,
-    pub probe: ModeProbe,
-}
-
-/// Probe BOTH daemon sockets (§3.1 liveness probes) at their well-known paths.
-///
-/// **Blocking:** each probe is a synchronous `connect(2)` (via
-/// [`shed_broker::socket_is_live`]), bounded to 500 ms per socket by
-/// `SOCKET_PROBE_TIMEOUT`. A caller ON an async runtime should run this inside
-/// [`tokio::task::spawn_blocking`] so a pathological peer (full accept backlog) can't
-/// occupy a runtime worker for up to a second. The signature stays sync deliberately —
-/// this is the startup mode-probe, typically run before the runtime spins up.
-pub fn probe_sockets() -> ModeProbe {
-    ModeProbe {
-        desktop_socket_live: socket_is_live(&desktop_socket_path()),
-        status_socket_live: socket_is_live(&status_socket_path()),
-    }
-}
-
-/// Sibling status-socket filename the daemon binds next to the desktop socket
-/// (parity with `status_socket_path()`'s basename).
-const STATUS_SOCKET_FILE: &str = "host-agent-status.sock";
-
-/// Probe the daemon sockets the app would connect to in EXTERNAL mode, keyed off the
-/// app's **configured** desktop socket path rather than the shed-broker default.
-///
-/// An embedder (the Tauri app, its harness) may point the external client at a
-/// non-default socket via its own env override; auto-detect MUST probe the SAME path
-/// the client would dial, which [`probe_sockets`] — bound to the shed-broker default —
-/// would miss. The status socket is derived as the sibling [`STATUS_SOCKET_FILE`] in
-/// that path's directory (the daemon binds both there). Bounded-blocking like
-/// [`probe_sockets`]: run it before the runtime spins up, or via `spawn_blocking`.
-pub fn probe_sockets_at(desktop_socket: &std::path::Path) -> ModeProbe {
-    let status_socket = desktop_socket
-        .parent()
-        .map(|dir| dir.join(STATUS_SOCKET_FILE))
-        .unwrap_or_else(|| std::path::PathBuf::from(STATUS_SOCKET_FILE));
-    ModeProbe {
-        desktop_socket_live: socket_is_live(desktop_socket),
-        status_socket_live: socket_is_live(&status_socket),
-    }
-}
-
-/// The pure three-way probe (§3.3): desktop live ⇒ External; status-only live ⇒
-/// HeadlessCoexist; neither ⇒ Embedded.
-///
-/// This function itself is pure; but note its input is produced by [`probe_sockets`],
-/// which does bounded (500 ms) blocking `connect(2)`s — a caller on an async runtime
-/// should obtain the [`ModeProbe`] via [`tokio::task::spawn_blocking`].
-pub fn detect_mode(probe: ModeProbe) -> DetectedMode {
-    if probe.desktop_socket_live {
-        DetectedMode::External
-    } else if probe.status_socket_live {
-        DetectedMode::HeadlessCoexist
-    } else {
-        DetectedMode::Embedded
-    }
-}
-
-/// Apply the pref overlay: `auto` follows the probe; `embedded`/`external` pin the mode
-/// explicitly (user intent — an explicitly pinned `embedded` alongside a daemon means
-/// the daemon 409s, surfaced not hidden). The probe evidence is retained regardless.
-pub fn resolve_mode(pref: ModePref, probe: ModeProbe) -> ResolvedMode {
-    let mode = match pref {
-        ModePref::External => EffectiveMode::External,
-        ModePref::Embedded => EffectiveMode::Embedded,
-        ModePref::Auto => match detect_mode(probe) {
-            DetectedMode::External => EffectiveMode::External,
-            DetectedMode::HeadlessCoexist => EffectiveMode::HeadlessCoexist,
-            DetectedMode::Embedded => EffectiveMode::Embedded,
-        },
-    };
-    ResolvedMode { mode, probe }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,8 +181,7 @@ pub fn resolve_mode(pref: ModePref, probe: ModeProbe) -> ResolvedMode {
 // ---------------------------------------------------------------------------
 
 /// The app's decision as delivered internally, before the `decided_by` default is
-/// applied — the embedded mirror of the daemon's `DesktopDecision`
-/// (`crates/shed-host-agent/src/desktop.rs:147-154`).
+/// applied — the embedded mirror of the retired daemon's `DesktopDecision`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppDecision {
     approved: bool,
@@ -323,7 +191,7 @@ struct AppDecision {
 }
 
 /// Map an app decision to the broker's `ApprovalOutcome`, field-for-field with the
-/// daemon's `decision_to_outcome` (`crates/shed-host-agent/src/desktop.rs:156-173`): an
+/// retired daemon's `decision_to_outcome`: an
 /// empty `decided_by` defaults to `"user"`; scope/ttl pass through as raw strings;
 /// `reason` is always empty (the ssh/aws deny audits don't read it, and the
 /// docker-desktop deny reason is a later slice). Keeping this a free function of a plain
@@ -363,7 +231,7 @@ fn decided_by_wire(d: DecidedBy) -> String {
 /// (which resolves) both hold.
 struct BridgeInner {
     /// The Coordinator-facing event stream — approval requests + fanned-in audit rows.
-    event_tx: mpsc::UnboundedSender<HostAgentEvent>,
+    event_tx: mpsc::UnboundedSender<BrokerEvent>,
     clock: ClockRef,
     /// The delegated-approval budget, from `cfg.approval_timeout()` (NOT a constant).
     timeout: Duration,
@@ -403,8 +271,8 @@ impl ApprovalGate for AppGate {
             detail: detail.to_string(),
             // `as_secs()` truncates sub-second timeout to whole seconds (a ~1s
             // expires_at truncation, and a sub-second `approval_timeout` footgun) — a
-            // deliberate byte-parity choice with the daemon's `as_secs` truncation
-            // (crates/shed-host-agent/src/desktop.rs:302), not an oversight.
+            // deliberate byte-parity choice with the retired daemon's `as_secs`
+            // truncation, not an oversight.
             expires_at: timefmt::format_iso8601(now + self.inner.timeout.as_secs() as i64),
         };
 
@@ -414,9 +282,9 @@ impl ApprovalGate for AppGate {
         if self
             .inner
             .event_tx
-            .send(HostAgentEvent::Frame(Box::new(
-                HostAgentInbound::ApprovalRequest(req),
-            )))
+            .send(BrokerEvent::Frame(Box::new(BrokerFrame::ApprovalRequest(
+                req,
+            ))))
             .is_err()
         {
             // The Coordinator's event receiver is gone — nothing will ever decide. Fail
@@ -484,10 +352,10 @@ impl Responder for BridgeResponder {
         };
         // A full queue (wedged consumer) or closed queue (consumer gone) → drop the
         // decision; the AppGate then fails CLOSED on its own timeout (the bus denies by
-        // timeout — never a bypass; same class as the UDS respond-while-disconnected
-        // no-op). We must never block the Coordinator's atomic handler, so the drop is
-        // accepted (§RESPOND_QUEUE_CAP) — but it is LOUDLY logged so an audited approve
-        // whose decision never reached the gate is diagnosable.
+        // timeout — never a bypass). We must never block the Coordinator's atomic
+        // handler, so the drop is accepted (§RESPOND_QUEUE_CAP) — but it is LOUDLY
+        // logged so an audited approve whose decision never reached the gate is
+        // diagnosable.
         if let Err(e) = self.tx.try_send(msg) {
             let cause = match e {
                 mpsc::error::TrySendError::Full(_) => "queue full",
@@ -515,7 +383,7 @@ async fn run_respond_consumer(inner: Arc<BridgeInner>, mut rx: mpsc::Receiver<Re
 /// frame — the embedded analogue of the daemon's desktop `event`-frame forwarder, wired
 /// through the C1 [`AuditFanout`] seam (the single mechanism; no second path).
 struct ActivityFanout {
-    event_tx: mpsc::UnboundedSender<HostAgentEvent>,
+    event_tx: mpsc::UnboundedSender<BrokerEvent>,
 }
 
 impl AuditFanout for ActivityFanout {
@@ -523,9 +391,7 @@ impl AuditFanout for ActivityFanout {
         let frame = audit_entry_to_event_frame(entry);
         let _ = self
             .event_tx
-            .send(HostAgentEvent::Frame(Box::new(HostAgentInbound::Event(
-                frame,
-            ))));
+            .send(BrokerEvent::Frame(Box::new(BrokerFrame::Event(frame))));
     }
 }
 
@@ -558,9 +424,9 @@ fn audit_entry_to_event_frame(e: &BrokerAuditEntry) -> AuditEventFrame {
 // ---------------------------------------------------------------------------
 
 /// Adapts the broker's control-credential seams onto shed-core's [`TokenMinter`], so
-/// the Backend's secure-server vend calls the in-process provider directly instead of
-/// going out over the UDS. Fail-closed: a mint error surfaces as `Err`, so the FSM sends
-/// NO credential (parity with [`crate::HostAgentTokenMinter`]). Bus-independent +
+/// the Backend's secure-server vend calls the in-process provider directly.
+/// Fail-closed: a mint error surfaces as `Err`, so the FSM sends NO credential.
+/// Bus-independent +
 /// synchronously constructible, so it exists BEFORE the Backend (§3.2).
 ///
 /// Both halves of the contract are implemented (plan 002 §7 P2):
@@ -571,7 +437,7 @@ fn audit_entry_to_event_frame(e: &BrokerAuditEntry) -> AuditEventFrame {
 ///     drive directly.
 ///
 /// Internal: it only ever escapes as the `Arc<dyn TokenMinter>` from
-/// [`EmbeddedHostAgent::token_minter`], so the concrete type stays crate-private.
+/// [`EmbeddedBroker::token_minter`], so the concrete type stays crate-private.
 struct EmbeddedTokenMinter {
     tokens: Arc<dyn ControlTokenMinter>,
     credentials: Arc<dyn ControlCredentialMinter>,
@@ -594,16 +460,12 @@ impl EmbeddedTokenMinter {
 
 #[async_trait]
 impl TokenMinter for EmbeddedTokenMinter {
-    /// Capability, and here it is a STATIC one — the deliberate difference from
-    /// [`crate::HostAgentTokenMinter`], which has to ask the socket what the agent on
-    /// the other end can do.
-    ///
-    /// There is no other end: the broker is this build, linked into this process, and
-    /// the credential path is compiled in right here. Version skew — the thing the UDS
-    /// capability handshake exists to absorb — cannot occur, so advertising anything
-    /// but `true` would make the provider withhold a CSR from a minter that can always
-    /// relay one, and an mtls server would answer the resulting CSR-less bootstrap with
-    /// its "upgrade the app" refusal.
+    /// Capability, and here it is a STATIC one: the broker is this build, linked into
+    /// this process, and the credential path is compiled in right here, so no version
+    /// skew can occur. Advertising anything but `true` would make the provider
+    /// withhold a CSR from a minter that can always relay one, and an mtls server
+    /// would answer the resulting CSR-less bootstrap with its "upgrade the app"
+    /// refusal.
     fn supports_mtls(&self) -> bool {
         true
     }
@@ -641,10 +503,9 @@ impl TokenMinter for EmbeddedTokenMinter {
             .mint_control(server)
             .await
             .map_err(ShedError::Config)?;
-        // Same guards as the UDS minter's `map_response`, because they are the same
-        // functions: fail-closed on an empty token (an `Ok(MintedControlToken { token:
-        // "" })` must never become a valid-looking blank token), and an
-        // absent/unparseable expiry → None → the provider caches until invalidate().
+        // Fail-closed on an empty token (an `Ok(MintedControlToken { token: "" })` must
+        // never become a valid-looking blank token), and an absent/unparseable expiry →
+        // None → the provider caches until invalidate().
         minted_token(
             minted.token,
             expiry_unix(minted.expires_at.as_deref()),
@@ -656,12 +517,9 @@ impl TokenMinter for EmbeddedTokenMinter {
 /// Map a broker [`MintedControlCredential`] onto shed-core's [`MintedCredential`], or a
 /// fail-closed `Err`. Pure, so every shape is unit-tested without a live SSH mint.
 ///
-/// The in-process sibling of the UDS reply mapper (`token_minter.rs`), and identical in
-/// its rules BY CONSTRUCTION: this only normalizes the broker's struct into
-/// [`CredentialParts`] and hands it to the shared [`credential_from_parts`], which is
-/// where the mode/fail-closed rules live. Nothing here may add a rule of its own — the
-/// two paths feed the SAME provider FSM, so a divergence would mean the app behaved
-/// differently in embedded mode than in external mode against the same server.
+/// This only normalizes the broker's struct into [`CredentialParts`] and hands it to
+/// [`credential_from_parts`] (`credential_shape.rs`), which is where the
+/// mode/fail-closed rules live; nothing here adds a rule of its own.
 fn map_embedded_credential(
     minted: MintedControlCredential,
     server: &str,
@@ -679,21 +537,21 @@ fn map_embedded_credential(
 }
 
 // ---------------------------------------------------------------------------
-// EmbeddedHostAgent — the assembled bridge
+// EmbeddedBroker — the assembled bridge
 // ---------------------------------------------------------------------------
 
 /// The in-process broker bridge. Built in two phases to honor the minter-before-Backend
 /// launch order (§3.2): [`new`](Self::new) (sync) yields the token minter + Responder +
 /// event receiver immediately; [`spawn`](Self::spawn) (async, after the Backend +
 /// Coordinator exist) starts the bus and emits the synthesized `Connected` event.
-pub struct EmbeddedHostAgent {
+pub struct EmbeddedBroker {
     inner: Arc<BridgeInner>,
     responder: ResponderRef,
     token_minter: Arc<dyn TokenMinter>,
     /// Shared by the supervisor's per-server bus (each secure server self-mints over
     /// SSH) — the SAME `Arc` the control-token provider wraps.
     minter: Arc<dyn broker_minter::Minter>,
-    cfg: HostAgentConfig,
+    cfg: ExtensionsYaml,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     gate_namespaces: Vec<String>,
@@ -702,6 +560,14 @@ pub struct EmbeddedHostAgent {
     spawned: AtomicBool,
     /// The running supervisor (`None` until [`spawn`] succeeds) — `health()` reads it.
     supervisor: Mutex<Option<Arc<Supervisor>>>,
+    /// The watch/reconcile loop task [`spawn`](Self::spawn) starts. It ends after the
+    /// shutdown flip has drained every server group;
+    /// [`shutdown_and_wait`](Self::shutdown_and_wait) awaits it. `None` before spawn,
+    /// and once awaited.
+    watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set while a [`shutdown_and_wait`](Self::shutdown_and_wait) call holds the watch
+    /// loop's handle, and left set when that loop ended any way but by returning.
+    watch_joining: std::sync::atomic::AtomicBool,
     /// The SSH mode the backend resolved to at spawn (env-dependent for `ssh.mode: ""`);
     /// surfaced in `broker.status`.
     resolved_ssh_mode: Mutex<Option<String>>,
@@ -716,16 +582,15 @@ pub struct EmbeddedHostAgent {
     /// Where the broker's lines go (the bus, the supervisor, the backends, the
     /// Responder's drop path) — the embedder's own log, injected at [`new`](Self::new).
     log: Arc<dyn bus::BusLog>,
-    /// Where this machine's identity file lives: the SAME `<state>/host-agent/machine.json`
-    /// the `shed-host-agent` daemon reads ([`broker_machine::machine_state_path`]), so the
-    /// app and the daemon on one machine present one id.
+    /// Where this machine's identity file lives: `<state>/broker/machine.json`
+    /// ([`broker_machine::machine_state_path`]), so the app presents one id on every start.
     machine_path: std::path::PathBuf,
     /// The identity loaded at [`spawn`](Self::spawn), or why there is none (`None` until
     /// then). Surfaced in `broker.status`.
     machine: Mutex<Option<Result<MachineIdentity, String>>>,
 }
 
-impl EmbeddedHostAgent {
+impl EmbeddedBroker {
     /// Phase 1 (sync, must run inside a tokio runtime): build the approval/event seams +
     /// the control-token minter. The token minter + Responder are usable immediately;
     /// the bus is not started until [`spawn`](Self::spawn). Returns the agent plus the
@@ -736,9 +601,9 @@ impl EmbeddedHostAgent {
     /// desktop passes its own log file's sink; a test passes `bus::FileBusLog::new("")`
     /// (stderr), which is what this used to hard-code.
     pub fn new(
-        cfg: HostAgentConfig,
+        cfg: ExtensionsYaml,
         log: Arc<dyn bus::BusLog>,
-    ) -> (Self, mpsc::UnboundedReceiver<HostAgentEvent>) {
+    ) -> (Self, mpsc::UnboundedReceiver<BrokerEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (respond_tx, respond_rx) = mpsc::channel(RESPOND_QUEUE_CAP);
         let clock = system_clock();
@@ -775,7 +640,7 @@ impl EmbeddedHostAgent {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let gate_namespaces = cfg.gate_namespaces();
 
-        let agent = EmbeddedHostAgent {
+        let agent = EmbeddedBroker {
             inner,
             // The Responder's loud-log sink for the (accepted) decision-drop path.
             responder: Arc::new(BridgeResponder {
@@ -790,6 +655,8 @@ impl EmbeddedHostAgent {
             gate_namespaces,
             spawned: AtomicBool::new(false),
             supervisor: Mutex::new(None),
+            watch_task: Mutex::new(None),
+            watch_joining: std::sync::atomic::AtomicBool::new(false),
             resolved_ssh_mode: Mutex::new(None),
             ssh_filter: Mutex::new(None),
             ssh_sign_policy: Mutex::new(None),
@@ -814,6 +681,47 @@ impl EmbeddedHostAgent {
     /// groups best-effort (§3.6).
     pub fn shutdown_handle(&self) -> watch::Sender<bool> {
         self.shutdown_tx.clone()
+    }
+
+    /// Flip the shutdown handle and wait, at most `bound`, for the watch loop to end:
+    /// it ends only after the supervisor has drained every server group, so on `true`
+    /// every bus stream this broker held is closed and [`health`](Self::health) is
+    /// empty. `false` when `bound` passed first (the loop keeps draining on its own).
+    /// Before [`spawn`](Self::spawn) there is nothing to wait for: `true`. The app's
+    /// own exit path does not call this (it flips the handle and exits); the wire
+    /// harness's test-only host does, so it can say the broker drained.
+    ///
+    /// `true` means the loop itself returned: a loop that panicked did not drain, and is
+    /// `false`. A second call made while the first is still waiting, or after one timed
+    /// out, is also `false` (the handle is with the first caller, so this one cannot say
+    /// the drain finished); a call after a drain that was seen to finish is `true`.
+    pub async fn shutdown_and_wait(&self, bound: Duration) -> bool {
+        let _ = self.shutdown_tx.send(true);
+        let mut task = {
+            let mut slot = self.watch_task.lock().unwrap();
+            match slot.take() {
+                Some(task) => task,
+                // Never spawned, or already seen to drain: nothing to wait for.
+                None => return !self.watch_joining.load(std::sync::atomic::Ordering::SeqCst),
+            }
+        };
+        self.watch_joining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        match tokio::time::timeout(bound, &mut task).await {
+            // The loop returned by itself: drained.
+            Ok(Ok(())) => {
+                self.watch_joining
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+            // The loop panicked or was aborted: it never reached the drain.
+            Ok(Err(_)) => false,
+            // Still draining: keep the handle so a later call can wait again.
+            Err(_) => {
+                *self.watch_task.lock().unwrap() = Some(task);
+                false
+            }
+        }
     }
 
     /// The delegated-gate namespaces the synthesized `Connected` advertises.
@@ -871,7 +779,7 @@ impl EmbeddedHostAgent {
 
     /// Phase 2 (async, in a tokio runtime): resolve the SSH backend, build the
     /// `SharedDeps` supervisor, spawn the watch/reconcile loop on the current runtime,
-    /// and emit the synthesized `Connected(HelloAck)`. On SSH-resolve failure returns
+    /// and emit the synthesized `Connected`. On SSH-resolve failure returns
     /// `Err(BrokerError::SshBackend)` (broker NOT started, but token minting still works
     /// — the Backend already holds the minter).
     ///
@@ -988,44 +896,6 @@ impl EmbeddedHostAgent {
             }
         };
 
-        // Say "an embedded broker runs here" before anything subscribes (the supervisor
-        // subscribes from the reconcile task spawned below): the lock beside the machine
-        // identity file the daemon shares (`shed_broker::presence`), held for as long as
-        // this broker runs — released once the supervisor has drained at shutdown, or by
-        // the kernel when the app exits however it exits.
-        //
-        // Only with a usable machine identity: without one this broker's subscribes are
-        // refused by a pinning server (`SOURCE_MACHINE_ID_REQUIRED`), so holding the lock
-        // would silence a daemon that can still answer. A restart that loads the identity
-        // takes the lock then.
-        //
-        // The holder never gives up (a daemon's momentary look, another instance of this
-        // app, a path that is not usable yet): the broker starts once it holds the lock,
-        // or after a short wait without it, the holder taking it in the background as
-        // soon as it can.
-        let lock_path = presence::lock_path_beside(&self.machine_path);
-        let machine = machine.ok();
-        let holder = if machine.is_some() {
-            let holder = presence::Holder::spawn(lock_path.clone(), bus_log.clone());
-            if !holder.wait_held(EMBEDDED_LOCK_WAIT).await {
-                bus_log.warn(&format!(
-                    "embedded broker lock not held after {EMBEDDED_LOCK_WAIT:?} path={}; \
-                     starting the broker now and taking the lock as soon as it can be taken \
-                     (until then a shed-host-agent daemon on this machine may hold request \
-                     types too)",
-                    lock_path.display()
-                ));
-            }
-            Some(holder)
-        } else {
-            bus_log.warn(&format!(
-                "no machine identity, so not taking the embedded broker lock path={}; a \
-                 shed-host-agent daemon on this machine, if one runs, keeps answering",
-                lock_path.display()
-            ));
-            None
-        };
-
         let deps = SharedDeps {
             ssh_backend,
             ssh_gate,
@@ -1035,14 +905,7 @@ impl EmbeddedHostAgent {
             audit,
             minter: Some(self.minter.clone()),
             log: bus_log.clone(),
-            machine,
-            // Never stands by: this broker is the one that answers while it runs. It
-            // holds the lock above instead, which a shed-host-agent daemon on this machine
-            // (same machine id) sees and stands by for.
-            embedded_presence: None,
-            // When it took that lock: an older server's terminal 409 is retried for a
-            // short while after it (`bus::OLD_SERVER_CONFLICT_GRACE`).
-            presence_lock: holder.as_ref().map(|h| h.held_since()),
+            machine: machine.ok(),
         };
         let sup = Arc::new(Supervisor::new(self.shutdown_rx.clone(), deps));
         *self.supervisor.lock().unwrap() = Some(sup.clone());
@@ -1062,7 +925,7 @@ impl EmbeddedHostAgent {
         let shutdown = self.shutdown_rx.clone();
         let reconcile_log = bus_log.clone();
         let loop_log = bus_log.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let reconcile = {
                 let sup = sup.clone();
                 move || {
@@ -1081,40 +944,22 @@ impl EmbeddedHostAgent {
             };
             watcher::run_watch_loop(watch_cfg, reconcile, shutdown, loop_log).await;
             sup.shutdown().await;
-            // Every stream is closed: let a daemon on this machine take over (or stop
-            // trying to take the lock).
-            drop(holder);
         });
+        *self.watch_task.lock().unwrap() = Some(task);
 
-        // Synthesize the Connected(HelloAck) so the approvals UI sections light up exactly
-        // as in external mode (no replay buffer — post-restart activity comes from the
-        // app's AuditStore).
-        let ack = HelloAck {
-            namespaces: vec![
-                NS_SSH_AGENT.to_string(),
-                NS_AWS_CREDENTIALS.to_string(),
-                NS_DOCKER_CREDENTIALS.to_string(),
-                NS_EGRESS.to_string(),
-            ],
+        // Synthesize the Connected so the approvals UI sections light up (no replay
+        // buffer — post-restart activity comes from the app's AuditStore).
+        let _ = self.inner.event_tx.send(BrokerEvent::Connected {
             gate_namespaces: cfg.gate_namespaces(),
-            // The EMBEDDED broker is the same build as the app, so there is no
-            // version skew to describe here — but the synthesized ack must still
-            // advertise what the app can rely on, or capability-gated paths would
-            // work in external mode and silently refuse in embedded mode.
-            agent_capabilities: vec![CAP_CREDENTIAL_GET.to_string()],
-            request_timeout_ms: cfg.approval_timeout().as_millis() as i64,
-            accepted: true,
-        };
-        let _ = self.inner.event_tx.send(HostAgentEvent::Connected(ack));
+        });
 
         Ok(())
     }
 }
 
-/// This machine's identity (plan 035 §3.4): the one the `shed-host-agent` daemon and the
-/// embedded broker present, read from the file they share
-/// (`<state>/host-agent/machine.json`, created on first use) — so an embedder knows the
-/// id whichever of them is brokering, the daemon included. Blocking file I/O under an
+/// This machine's identity (plan 035 §3.4): the one the embedded broker presents, read
+/// from `<state>/broker/machine.json` (created on first use), so an embedder knows the
+/// id the broker presents. Blocking file I/O under an
 /// advisory lock: call it off an async worker. `Err` says why there is none.
 pub fn machine_identity() -> Result<MachineIdentity, String> {
     broker_machine::load_or_create().map(|loaded| loaded.identity)
@@ -1168,8 +1013,8 @@ fn log_machine_identity(
 mod tests {
     use super::*;
 
-    // ---- (iii) outcome-mapping fixture: field-for-field vs the daemon's
-    // decision_to_outcome (crates/shed-host-agent/src/desktop.rs:156-173) --------------
+    // ---- (iii) outcome-mapping fixture: field-for-field vs the retired daemon's
+    // decision_to_outcome ---------------------------------------------------------------
 
     #[test]
     fn decision_to_outcome_matches_daemon_fixture() {
@@ -1266,7 +1111,7 @@ mod tests {
     ) -> (
         Arc<BridgeInner>,
         ResponderRef,
-        mpsc::UnboundedReceiver<HostAgentEvent>,
+        mpsc::UnboundedReceiver<BrokerEvent>,
     ) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (respond_tx, respond_rx) = mpsc::channel(RESPOND_QUEUE_CAP);
@@ -1300,8 +1145,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let req = match ev {
-            HostAgentEvent::Frame(f) => match *f {
-                HostAgentInbound::ApprovalRequest(r) => r,
+            BrokerEvent::Frame(f) => match *f {
+                BrokerFrame::ApprovalRequest(r) => r,
                 other => panic!("expected ApprovalRequest, got {other:?}"),
             },
             other => panic!("expected Frame, got {other:?}"),
@@ -1355,8 +1200,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let req = match ev {
-            HostAgentEvent::Frame(f) => match *f {
-                HostAgentInbound::ApprovalRequest(r) => r,
+            BrokerEvent::Frame(f) => match *f {
+                BrokerFrame::ApprovalRequest(r) => r,
                 other => panic!("unexpected {other:?}"),
             },
             other => panic!("unexpected {other:?}"),
@@ -1418,7 +1263,7 @@ mod tests {
         assert_eq!(f.request_id, None);
         assert_eq!(f.ts.as_deref(), Some("2026-07-15T00:00:00Z"));
 
-        // The app maps it into a stored entry (host-agent source), stamping its own id.
+        // The app maps it into a stored entry (broker source), stamping its own id.
         let stored =
             shed_core::approval::AuditEntry::from_event_frame(f, "gen-id".into(), "gen-ts".into());
         assert_eq!(stored.id, "gen-id"); // no request_id → fallback
@@ -1470,7 +1315,7 @@ mod tests {
         // One `sign` request over the ssh-agent SSE stream: a valid ed25519 key and a
         // valid login for `git` with it, which the signing check passes to the gate (an
         // arbitrary payload would now be declined before any prompt).
-        // The key is the host-agent harness's throwaway test key; the login is
+        // The key is the wire harness's throwaway test key; the login is
         // string(32 bytes of 7) || byte 50 || string("git") || string("ssh-connection") ||
         // string("publickey") || bool true || string("ssh-ed25519") || string(key).
         const KEY_B64: &str =
@@ -1507,8 +1352,8 @@ mod tests {
         let deny_responder = responder.clone();
         tokio::spawn(async move {
             while let Some(ev) = events.recv().await {
-                if let HostAgentEvent::Frame(f) = ev {
-                    if let HostAgentInbound::ApprovalRequest(req) = *f {
+                if let BrokerEvent::Frame(f) = ev {
+                    if let BrokerFrame::ApprovalRequest(req) = *f {
                         deny_responder.respond(
                             &req.id,
                             ApprovalDecision::Deny,
@@ -1534,8 +1379,6 @@ mod tests {
             minter: None,
             log: Arc::new(bus::FileBusLog::new("")),
             machine: None,
-            embedded_presence: None,
-            presence_lock: None,
         };
         let target = ServerTarget {
             name: String::new(), // single-server unnamed target (open http)
@@ -1590,7 +1433,7 @@ mod tests {
     /// `ssh.allow_users` — never reaches the embedded broker's approval channel: the
     /// Coordinator side sees no approval request at all, the shed gets the ordinary sign
     /// failure, and the audit says `refused` with the class. The daemon cells
-    /// (`tests/host-agent-diff/test_bus_sign_refused.py`) pin the same for the daemon;
+    /// (`tests/broker-wire/test_bus_sign_refused.py`) pin the same for the daemon;
     /// this is the embedded broker's own path (AppGate, its Coordinator channel).
     #[tokio::test]
     async fn a_declined_sign_request_never_prompts_through_the_embedded_coordinator() {
@@ -1631,8 +1474,8 @@ mod tests {
         let seen = prompts.clone();
         tokio::spawn(async move {
             while let Some(ev) = events.recv().await {
-                if let HostAgentEvent::Frame(f) = ev {
-                    if let HostAgentInbound::ApprovalRequest(req) = *f {
+                if let BrokerEvent::Frame(f) = ev {
+                    if let BrokerFrame::ApprovalRequest(req) = *f {
                         seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         responder.respond(
                             &req.id,
@@ -1660,8 +1503,6 @@ mod tests {
             minter: None,
             log: Arc::new(bus::FileBusLog::new("")),
             machine: None,
-            embedded_presence: None,
-            presence_lock: None,
         };
         let target = ServerTarget {
             name: String::new(),
@@ -1733,12 +1574,11 @@ mod tests {
             "ssh:\n  approval:\n    policy: shed-desktop\ndiscovery:\n  source: {}\n  watch: off\n",
             src.display()
         );
-        let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
+        let cfg = ExtensionsYaml::try_parse(&yaml).unwrap();
 
-        let (mut agent, mut events) =
-            EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        let (mut agent, mut events) = EmbeddedBroker::new(cfg, Arc::new(bus::FileBusLog::new("")));
         // Never the developer's real state dir.
-        agent.machine_path = dir.path().join("state/host-agent/machine.json");
+        agent.machine_path = dir.path().join("state/broker/machine.json");
         agent
             .spawn()
             .await
@@ -1749,10 +1589,8 @@ mod tests {
             .unwrap()
             .unwrap();
         match ev {
-            HostAgentEvent::Connected(ack) => {
-                assert!(ack.accepted);
-                assert_eq!(ack.gate_namespaces, vec!["ssh-agent".to_string()]);
-                assert_eq!(ack.request_timeout_ms, 25_000); // default approval_timeout
+            BrokerEvent::Connected { gate_namespaces } => {
+                assert_eq!(gate_namespaces, vec!["ssh-agent".to_string()]);
             }
             other => panic!("expected Connected, got {other:?}"),
         }
@@ -1776,156 +1614,219 @@ mod tests {
         let _ = agent.shutdown_handle().send(true);
     }
 
-    /// While the embedded broker runs it holds the lock beside the machine identity file
-    /// that a shed-host-agent daemon on this machine stands by for (plan 035 §3.4): taken
-    /// by `spawn` before anything subscribes — the reconcile task that subscribes has not
-    /// run yet when `spawn` returns on this single-threaded runtime — and released once
-    /// the broker has stopped.
+    /// The embedded broker's bus client, as `spawn` builds its `SharedDeps`, takes a
+    /// bare `409` (anything but `SOURCE_DUPLICATE_STREAM`: a 0.9.x server's
+    /// `NAMESPACE_ALREADY_REGISTERED`, or a 409 with no body) as terminal: one subscribe
+    /// per request type, never retried on the backoff, and the type reads `rejected`, as
+    /// for every other bus client (plan 037 §3.4, B1a). The broker runs with a machine
+    /// identity here, the case in which it used to retry such a 409 for a while.
     #[tokio::test]
-    async fn the_embedded_broker_holds_the_presence_lock_while_it_runs() {
+    async fn the_embedded_broker_takes_a_bare_409_as_terminal_with_no_retry() {
+        let server = MockServer::start_async().await;
+        let old_server = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/plugins/listeners/ssh-agent/messages");
+                t.status(409).header("content-type", "application/json").body(
+                    r#"{"error":{"code":"NAMESPACE_ALREADY_REGISTERED","message":"namespace already has a listener"}}"#,
+                );
+            })
+            .await;
+        let no_body = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/plugins/listeners/docker-credentials/messages");
+                t.status(409);
+            })
+            .await;
+
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("config.yaml");
-        std::fs::write(&src, "servers: {}\n").unwrap();
+        std::fs::write(
+            &src,
+            format!(
+                "servers:\n  old:\n    host: 127.0.0.1\n    http_port: {}\n",
+                server.port()
+            ),
+        )
+        .unwrap();
         let yaml = format!("discovery:\n  source: {}\n  watch: off\n", src.display());
-        let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
-        let (mut agent, _events) = EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
-        agent.machine_path = dir.path().join("state/host-agent/machine.json");
-        let lock = presence::lock_path_beside(&agent.machine_path);
-        assert!(!presence::present(&lock), "nothing holds it before spawn");
-
+        let cfg = ExtensionsYaml::try_parse(&yaml).unwrap();
+        let (mut agent, _events) = EmbeddedBroker::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        agent.machine_path = dir.path().join("state/broker/machine.json");
         agent.spawn().await.expect("spawn ok");
         assert!(
-            presence::present(&lock),
-            "held from spawn on, before the first subscribe"
+            matches!(agent.machine_identity(), Some(Ok(_))),
+            "runs with a machine identity"
         );
-        // A second instance of the app is told someone else holds it.
-        assert!(matches!(
-            presence::hold(&lock),
-            presence::Hold::HeldElsewhere
-        ));
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(presence::present(&lock), "held while the broker runs");
 
-        let _ = agent.shutdown_handle().send(true);
-        let mut released = false;
-        for _ in 0..100 {
-            if !presence::present(&lock) {
-                released = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(released, "released once the broker has stopped");
-    }
-
-    /// A log that keeps its lines, for the lock cells below.
-    #[derive(Default)]
-    struct KeptLog(std::sync::Mutex<Vec<String>>);
-    impl KeptLog {
-        fn lines(&self) -> Vec<String> {
-            self.0.lock().unwrap().clone()
-        }
-    }
-    impl bus::BusLog for KeptLog {
-        fn info(&self, m: &str) {
-            self.0.lock().unwrap().push(m.to_string());
-        }
-        fn warn(&self, m: &str) {
-            self.0.lock().unwrap().push(m.to_string());
-        }
-        fn debug(&self, _m: &str) {}
-        fn error(&self, m: &str) {
-            self.0.lock().unwrap().push(m.to_string());
-        }
-    }
-
-    fn lock_cell_agent(
-        dir: &tempfile::TempDir,
-        log: Arc<KeptLog>,
-    ) -> (EmbeddedHostAgent, std::path::PathBuf) {
-        let src = dir.path().join("config.yaml");
-        std::fs::write(&src, "servers: {}\n").unwrap();
-        let yaml = format!("discovery:\n  source: {}\n  watch: off\n", src.display());
-        let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
-        let (mut agent, _events) = EmbeddedHostAgent::new(cfg, log);
-        agent.machine_path = dir.path().join("state/host-agent/machine.json");
-        let lock = presence::lock_path_beside(&agent.machine_path);
-        (agent, lock)
-    }
-
-    /// An app that could not load its machine identity does not take the lock (a
-    /// pinning server refuses its subscribes, so holding it would silence a daemon that
-    /// can still answer), and says so. Here `machine.json` is a directory: the identity
-    /// cannot be read, while the directory the lock lives in is perfectly usable.
-    #[tokio::test]
-    async fn without_a_machine_identity_the_embedded_broker_takes_no_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = Arc::new(KeptLog::default());
-        let (agent, lock) = lock_cell_agent(&dir, log.clone());
-        std::fs::create_dir_all(&agent.machine_path).unwrap(); // unreadable as a file
-        agent.spawn().await.expect("spawn ok without an identity");
-        assert!(agent.machine.lock().unwrap().as_ref().unwrap().is_err());
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!presence::present(&lock), "no lock without an identity");
-        assert!(
-            matches!(presence::hold(&lock), presence::Hold::Held(_)),
-            "free for anyone"
-        );
-        assert!(
-            log.lines()
+        let types = ["ssh-agent", "docker-credentials"];
+        let state = |ns: &str| {
+            agent
+                .health()
                 .iter()
-                .any(|l| l.contains("no machine identity, so not taking the embedded broker lock")),
-            "{:?}",
-            log.lines()
-        );
-        let _ = agent.shutdown_handle().send(true);
-    }
-
-    /// The lock is held elsewhere when the app starts (a first instance of the app):
-    /// `spawn` waits a second, starts the broker without it and says so, and takes it
-    /// as soon as the other lets go — no restart — until the broker stops.
-    #[tokio::test]
-    async fn an_embedded_broker_that_started_without_the_lock_takes_it_when_it_frees() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = Arc::new(KeptLog::default());
-        let (agent, lock) = lock_cell_agent(&dir, log.clone());
-        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
-        let presence::Hold::Held(first) = presence::hold(&lock) else {
-            panic!("hold");
+                .flat_map(|s| s.namespaces.clone())
+                .find(|n| n.namespace == ns)
+                .map(|n| n.state)
         };
-        let started = std::time::Instant::now();
-        agent.spawn().await.expect("spawn ok");
-        assert!(
-            started.elapsed() >= EMBEDDED_LOCK_WAIT,
-            "waited for the lock before starting"
-        );
-        assert!(
-            log.lines()
-                .iter()
-                .any(|l| l.contains("embedded broker lock not held after")),
-            "{:?}",
-            log.lines()
-        );
-        drop(first); // the first instance exits
-        let mut retaken = false;
-        for _ in 0..80 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if presence::present(&lock) {
-                retaken = true;
-                break;
-            }
-        }
-        assert!(retaken, "taken by this broker once free");
-        let _ = agent.shutdown_handle().send(true);
-        let mut released = false;
+        let mut rejected = false;
         for _ in 0..100 {
-            if !presence::present(&lock) {
-                released = true;
+            if types
+                .iter()
+                .all(|ns| state(ns).as_deref() == Some("rejected"))
+            {
+                rejected = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(released, "released once the broker has stopped");
+        assert!(rejected, "rejected: {:?}", types.map(|ns| (ns, state(ns))));
+        // Well past the first backoff steps (1 s, then 2 s): a retry would have come.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        old_server.assert_hits_async(1).await;
+        no_body.assert_hits_async(1).await;
+        for ns in types {
+            assert_eq!(
+                state(ns).as_deref(),
+                Some("rejected"),
+                "{ns}: still terminal"
+            );
+        }
+        // Beside the identity the broker keeps only the identity and its own lock: it
+        // creates no other file there.
+        let mut kept: Vec<String> = std::fs::read_dir(agent.machine_path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["machine.json", "machine.lock"]);
+        let _ = agent.shutdown_handle().send(true);
+    }
+
+    /// What a held-stream bus has seen: subscriptions it accepted and holds open, and
+    /// how many of those the client has since closed.
+    #[derive(Default)]
+    struct HeldStreams {
+        opened: std::sync::atomic::AtomicUsize,
+        closed: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A loopback stand-in for a server's plugin bus that answers every subscribe with
+    /// `200 text/event-stream` and then holds the stream open, sending nothing, until
+    /// the client closes it (counted). Every other request (the egress stream) gets 501.
+    async fn held_stream_bus() -> (u16, Arc<HeldStreams>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let streams = Arc::new(HeldStreams::default());
+        let seen = streams.clone();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request_line = String::from_utf8_lossy(&head)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let subscribe = request_line.starts_with("GET /api/plugins/listeners/")
+                        && request_line.contains("/messages");
+                    if !subscribe {
+                        let _ = conn
+                            .write_all(b"HTTP/1.1 501 Not Implemented\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    if conn
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    seen.opened.fetch_add(1, SeqCst);
+                    // Hold the stream until the client goes away.
+                    loop {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    seen.closed.fetch_add(1, SeqCst);
+                });
+            }
+        });
+        (port, streams)
+    }
+
+    /// `shutdown_and_wait` returns only once the supervisor has drained every server
+    /// group: on `true`, `health()` is already empty and every stream the broker held
+    /// is closing. The test runs on a current-thread runtime, so nothing else runs
+    /// between the call's return and the `health()` read: a `shutdown_and_wait` that
+    /// returned before the drain would leave the server group in place there.
+    #[tokio::test]
+    async fn shutdown_and_wait_returns_after_every_stream_is_drained() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (port, streams) = held_stream_bus().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("config.yaml");
+        std::fs::write(
+            &src,
+            format!("servers:\n  held:\n    host: 127.0.0.1\n    http_port: {port}\n"),
+        )
+        .unwrap();
+        let yaml = format!("discovery:\n  source: {}\n  watch: off\n", src.display());
+        let cfg = ExtensionsYaml::try_parse(&yaml).unwrap();
+        let (mut agent, _events) = EmbeddedBroker::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        agent.machine_path = dir.path().join("state/broker/machine.json");
+        agent.spawn().await.expect("spawn ok");
+
+        // Every request type the broker subscribes is connected and held open.
+        let mut held = false;
+        for _ in 0..200 {
+            let health = agent.health();
+            let namespaces: Vec<_> = health.iter().flat_map(|s| s.namespaces.clone()).collect();
+            if !namespaces.is_empty()
+                && namespaces.iter().all(|n| n.state == "connected")
+                && streams.opened.load(SeqCst) == namespaces.len()
+            {
+                held = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(held, "never held: {:?}", agent.health());
+        assert_eq!(streams.closed.load(SeqCst), 0);
+
+        assert!(
+            agent.shutdown_and_wait(Duration::from_secs(5)).await,
+            "drained within the bound"
+        );
+        assert!(
+            agent.health().is_empty(),
+            "the groups are drained when it returns: {:?}",
+            agent.health()
+        );
+        // The client side of each stream is gone; the bus reads the close.
+        let opened = streams.opened.load(SeqCst);
+        for _ in 0..200 {
+            if streams.closed.load(SeqCst) == opened {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(streams.closed.load(SeqCst), opened, "every stream closed");
+        // Awaited once: a second call has nothing left to wait for.
+        assert!(agent.shutdown_and_wait(Duration::from_millis(1)).await);
     }
 
     /// The backend the bus actually runs with is the filtered one: the supervisor's
@@ -1945,11 +1846,10 @@ mod tests {
                 "ssh:\n  approval:\n    policy: shed-desktop\n{offer_keys}discovery:\n  source: {}\n  watch: off\n",
                 src.display()
             );
-            let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
+            let cfg = ExtensionsYaml::try_parse(&yaml).unwrap();
             cfg.validate().unwrap();
-            let (mut agent, _events) =
-                EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
-            agent.machine_path = dir.path().join("state/host-agent/machine.json");
+            let (mut agent, _events) = EmbeddedBroker::new(cfg, Arc::new(bus::FileBusLog::new("")));
+            agent.machine_path = dir.path().join("state/broker/machine.json");
             agent.spawn().await.expect("spawn ok");
 
             let installed = agent
@@ -2016,13 +1916,12 @@ mod tests {
             "ssh:\n  approval:\n    policy: shed-desktop\ndiscovery:\n  source: {}\n  watch: off\n",
             src.display()
         );
-        let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
-        let (mut agent, mut events) =
-            EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        let cfg = ExtensionsYaml::try_parse(&yaml).unwrap();
+        let (mut agent, mut events) = EmbeddedBroker::new(cfg, Arc::new(bus::FileBusLog::new("")));
         // A regular FILE where the identity's directory must be: nothing can be created.
         let blocker = dir.path().join("not-a-dir");
         std::fs::write(&blocker, "x").unwrap();
-        agent.machine_path = blocker.join("host-agent/machine.json");
+        agent.machine_path = blocker.join("broker/machine.json");
         agent
             .spawn()
             .await
@@ -2031,7 +1930,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(ev, HostAgentEvent::Connected(_)), "{ev:?}");
+        assert!(matches!(ev, BrokerEvent::Connected { .. }), "{ev:?}");
         let why = agent
             .machine_identity()
             .expect("load attempted at spawn")
@@ -2055,11 +1954,10 @@ mod tests {
             "ssh:\n  approval:\n    policy: shed-desktop\ndiscovery:\n  source: {}\n  watch: off\n",
             src.display()
         );
-        let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
+        let cfg = ExtensionsYaml::try_parse(&yaml).unwrap();
 
-        let (mut agent, mut events) =
-            EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
-        agent.machine_path = dir.path().join("state/host-agent/machine.json");
+        let (mut agent, mut events) = EmbeddedBroker::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        agent.machine_path = dir.path().join("state/broker/machine.json");
         // First spawn succeeds and emits exactly one Connected.
         agent.spawn().await.expect("first spawn ok");
         let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
@@ -2067,7 +1965,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(ev, HostAgentEvent::Connected(_)),
+            matches!(ev, BrokerEvent::Connected { .. }),
             "first spawn Connected"
         );
         let sup_after_first = agent.supervisor.lock().unwrap().clone();
@@ -2175,7 +2073,7 @@ mod tests {
     }
 
     // (FIX 1) An Ok mint carrying an EMPTY token is fail-closed — never a valid
-    // MintedToken (parity with token_minter.rs's `missing_or_empty_token_is_fail_closed`).
+    // MintedToken.
     #[tokio::test]
     async fn token_minter_fails_closed_on_empty_token() {
         use shed_broker::controltoken::MintedControlToken;
@@ -2343,8 +2241,8 @@ mod tests {
         );
     }
 
-    // Fail-closed on every answer that cannot authenticate — the embedded twin of
-    // `token_minter.rs`'s UDS-reply guards, so the two modes behave identically.
+    // Fail-closed on every answer that cannot authenticate (the shape rules are
+    // `credential_shape.rs`'s; its own tests cover the arms this stand-in cannot reach).
     #[tokio::test]
     async fn credential_minter_fails_closed_on_unusable_answers() {
         // (a) an mtls answer with no certificate
@@ -2382,8 +2280,7 @@ mod tests {
 
         // (b2) a token answer that ALSO carries a certificate: the shapes are
         // mutually exclusive, so this is a protocol violation rather than a
-        // "token mode with a blank token" — the embedded path gets the same rule
-        // 6 the UDS path does, because it is literally the same function.
+        // "token mode with a blank token" (rule 6 of `credential_from_parts`).
         let creds = RecordingCredentials::answering(MintedControlCredential {
             auth_mode: "token".into(),
             token: String::new(),
@@ -2532,6 +2429,22 @@ mod tests {
         assert!(cfg.discovery.is_none());
     }
 
+    /// A `desktop:` block (the retired daemon's) is refused: the broker is not
+    /// started, and the error names the block and where its timeout went.
+    #[test]
+    fn load_or_synthesize_refuses_a_desktop_block() {
+        let (_d, path) = write_tmp(
+            "extensions.yaml",
+            "ssh:\n  approval:\n    policy: approve-all\ndesktop:\n  timeout_ms: 30000\n",
+        );
+        match load_or_synthesize(&path) {
+            Err(BrokerError::Config(msg)) => {
+                assert_eq!(msg, shed_broker::config::DESKTOP_BLOCK_REMOVED)
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn load_or_synthesize_malformed_is_typed_error_no_panic() {
         // An invalid ssh policy fails `validate` → Config error (the daemon would exit 1;
@@ -2542,151 +2455,5 @@ mod tests {
         );
         let err = load_or_synthesize(&path).unwrap_err();
         assert!(matches!(err, BrokerError::Config(_)), "got {err:?}");
-    }
-
-    // ---- (v) mode detection ----------------------------------------------------------
-
-    #[test]
-    fn detect_mode_three_way() {
-        assert_eq!(
-            detect_mode(ModeProbe {
-                desktop_socket_live: true,
-                status_socket_live: true
-            }),
-            DetectedMode::External
-        );
-        assert_eq!(
-            detect_mode(ModeProbe {
-                desktop_socket_live: true,
-                status_socket_live: false
-            }),
-            DetectedMode::External
-        );
-        assert_eq!(
-            detect_mode(ModeProbe {
-                desktop_socket_live: false,
-                status_socket_live: true
-            }),
-            DetectedMode::HeadlessCoexist
-        );
-        assert_eq!(
-            detect_mode(ModeProbe {
-                desktop_socket_live: false,
-                status_socket_live: false
-            }),
-            DetectedMode::Embedded
-        );
-    }
-
-    #[test]
-    fn resolve_mode_pref_overlay_pins_and_keeps_evidence() {
-        let both_dead = ModeProbe {
-            desktop_socket_live: false,
-            status_socket_live: false,
-        };
-        let desktop_live = ModeProbe {
-            desktop_socket_live: true,
-            status_socket_live: false,
-        };
-        // Auto follows the probe.
-        assert_eq!(
-            resolve_mode(ModePref::Auto, both_dead),
-            ResolvedMode {
-                mode: EffectiveMode::Embedded,
-                probe: both_dead
-            }
-        );
-        // Embedded pins even with a live daemon (the 409 is surfaced, not hidden).
-        assert_eq!(
-            resolve_mode(ModePref::Embedded, desktop_live).mode,
-            EffectiveMode::Embedded
-        );
-        // External pins even with no daemon.
-        assert_eq!(
-            resolve_mode(ModePref::External, both_dead).mode,
-            EffectiveMode::External
-        );
-        // The evidence is retained regardless of the pref.
-        assert_eq!(
-            resolve_mode(ModePref::External, desktop_live).probe,
-            desktop_live
-        );
-    }
-
-    /// Serialize the env-mutating socket-dir probe tests (Rust runs tests in-process +
-    /// parallel; `set_var`/`remove_var` on `SHED_HOST_AGENT_SOCKET_DIR` would race).
-    fn socket_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    #[test]
-    fn probe_sockets_real_temp_uds_matrix() {
-        use std::os::unix::net::UnixListener;
-        let _guard = socket_env_lock();
-        // A short /tmp root keeps the sun_path under the AF_UNIX cap.
-        let dir = tempfile::Builder::new()
-            .prefix("shed-mode")
-            .tempdir_in("/tmp")
-            .unwrap();
-        std::env::set_var("SHED_HOST_AGENT_SOCKET_DIR", dir.path());
-
-        // Neither live → Embedded.
-        assert_eq!(detect_mode(probe_sockets()), DetectedMode::Embedded);
-
-        // Status-only live → HeadlessCoexist.
-        let status = UnixListener::bind(dir.path().join("host-agent-status.sock")).unwrap();
-        assert_eq!(detect_mode(probe_sockets()), DetectedMode::HeadlessCoexist);
-
-        // Desktop live too → External (desktop wins).
-        let desktop = UnixListener::bind(dir.path().join("host-agent.sock")).unwrap();
-        let p = probe_sockets();
-        assert!(p.desktop_socket_live && p.status_socket_live);
-        assert_eq!(detect_mode(p), DetectedMode::External);
-        // A pref override still pins.
-        assert_eq!(
-            resolve_mode(ModePref::Embedded, p).mode,
-            EffectiveMode::Embedded
-        );
-
-        drop(status);
-        drop(desktop);
-        std::env::remove_var("SHED_HOST_AGENT_SOCKET_DIR");
-    }
-
-    #[test]
-    fn probe_sockets_at_keys_off_the_given_path_and_sibling_status() {
-        use std::os::unix::net::UnixListener;
-        // No env: this variant probes an EXPLICIT desktop path (the embedder's
-        // configured socket) + its sibling status socket — the path the harness
-        // overrides that the default `probe_sockets` would miss.
-        let dir = tempfile::Builder::new()
-            .prefix("shed-mode-at")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let desktop = dir.path().join("host-agent.sock");
-
-        // Neither bound → Embedded.
-        assert_eq!(
-            detect_mode(probe_sockets_at(&desktop)),
-            DetectedMode::Embedded
-        );
-
-        // Only the sibling status socket live → HeadlessCoexist.
-        let status = UnixListener::bind(dir.path().join(STATUS_SOCKET_FILE)).unwrap();
-        assert_eq!(
-            detect_mode(probe_sockets_at(&desktop)),
-            DetectedMode::HeadlessCoexist
-        );
-
-        // The configured desktop socket live too → External (desktop wins).
-        let d = UnixListener::bind(&desktop).unwrap();
-        let p = probe_sockets_at(&desktop);
-        assert!(p.desktop_socket_live && p.status_socket_live);
-        assert_eq!(detect_mode(p), DetectedMode::External);
-
-        drop(status);
-        drop(d);
     }
 }

@@ -148,7 +148,7 @@ The diagrams below show the internal implementation flow for each backend.
 
 ### Mount Mechanisms
 
-The server-config `mounts:` section (which falls back to the deprecated `credentials:` key when absent) binds host directories into a VM: the shed's selected mounts (`--mounts`, stored in its metadata; all of them by default), on every start. Each backend handles them differently based on its isolation model. All mount sources must be directories.
+The server-config `mounts:` section (its old name `credentials:` fails the load) binds host directories into a VM: the shed's selected mounts (`--mounts`, stored in its metadata; all of them by default), on every start. Each backend handles them differently based on its isolation model. All mount sources must be directories.
 
 **Firecracker** — Mounts are bound via 9P over the TAP bridge network. Each mount directory gets a TCP-based 9P server on the bridge IP. Changes are immediately visible on both sides.
 

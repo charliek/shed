@@ -227,7 +227,7 @@ func TestRespondNon204Status(t *testing.T) {
 }
 
 func TestWithTokenSetsBearerHeader(t *testing.T) {
-	// The host-agent authenticates to the credential bus with its scoped bearer
+	// A credential broker authenticates to the credential bus with its scoped bearer
 	// token. WithToken must attach it as `Authorization: Bearer <token>` on
 	// outbound requests; without it, no Authorization header is sent (so the
 	// default-off / tailnet path stays unauthenticated).

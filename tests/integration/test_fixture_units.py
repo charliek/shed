@@ -890,7 +890,7 @@ def test_bootstrap_cert_sends_one_csr_and_writes_the_issued_cert(monkeypatch, tm
 
     monkeypatch.setattr(dc, "assert_dev_target", lambda name: {"host": "localhost", "ssh_port": 12222})
     monkeypatch.setattr(dc.subprocess, "run", run)
-    got = dc.bootstrap_cert("my-server-dev", "credentials", tmp_path / "c", "host-agent")
+    got = dc.bootstrap_cert("my-server-dev", "credentials", tmp_path / "c", "broker")
 
     assert len(sent) == 1
     argv = sent[0]
@@ -900,7 +900,7 @@ def test_bootstrap_cert_sends_one_csr_and_writes_the_issued_cert(monkeypatch, tm
     # decodes to a DER CSR openssl verifies.
     target = argv.index("_bootstrap@localhost")
     request = argv[target + 1:]
-    assert request[:2] == ["credentials", "host-agent"]
+    assert request[:2] == ["credentials", "broker"]
     csr_args = [a for a in request if a.startswith("csr=")]
     assert len(csr_args) == 1 and len(request) == 3
     der = base64.b64decode(csr_args[0][len("csr="):], validate=True)
@@ -1794,7 +1794,7 @@ def sse_listener(tmp_path):
             bound machine."""
             mid = self.headers.get(busclient.MACHINE_ID_HEADER)
             if not mid or not re.fullmatch(r"[0-9a-f]{32}", mid) or not self.headers.get(busclient.MACHINE_NAME_HEADER):
-                return 403, {"error": {"code": "SOURCE_MACHINE_ID_REQUIRED", "message": "upgrade to 0.10.0"}}
+                return 403, {"error": {"code": "SOURCE_MACHINE_ID_REQUIRED", "message": "install the current shed desktop app"}}
             if mid != state["bound"]:
                 return 403, {"error": {"code": "SOURCE_NOT_BOUND", "message": f"only {state['bound_name']}"},
                              "source": {"machine_id": state["bound"], "machine_name": state["bound_name"]}}
@@ -2699,7 +2699,7 @@ def test_fake_machine_reports_how_the_server_answered(sse_listener):
 
     no_id = a.subscribe("pin", headers={})
     assert (no_id.status, no_id.code, no_id.source) == (403, busclient.SOURCE_MACHINE_ID_REQUIRED, None)
-    assert "0.10.0" in no_id.message and len(a.streams) == 1
+    assert "install the current shed desktop app" in no_id.message and len(a.streams) == 1
 
     held = a.streams[0]
     a.close()
@@ -3088,7 +3088,10 @@ def test_the_pin_cases_match_the_servers_and_the_clis_own_words():
     assert 'who := "user " + c.User' in handlers and 'who = "admin " + c.User' in handlers
     assert f'return "{tsp.CONTROL_SCOPE}", false' in (root / "internal" / "api" / "auth.go").read_text()
     machine = (root / "internal" / "api" / "source_machine.go").read_text()
-    assert tsp.DUPLICATE in machine and f"{tsp.MINIMUM_VERSION} and the shed desktop app" in machine
+    assert tsp.DUPLICATE in machine
+    # The phrase is in the refusal itself, not only in the log line beside it.
+    refusal = machine.split("const machineIDRequiredMessage =", 1)[1].split("\n\n", 1)[0]
+    assert tsp.INSTALL_APP in refusal, refusal
     assert 'MachineID   string `json:"machine_id"`' in machine and 'MachineName string `json:"machine_name"`' in machine
     assert f'FeatureSourceBinding = "{tsp.FEATURE}"' in (root / "internal" / "api" / "overview.go").read_text()
     assert f'"FORBIDDEN", "{tsp.UNMATCHED}"' in (root / "internal" / "api" / "plugin_handlers.go").read_text()

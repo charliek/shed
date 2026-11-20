@@ -744,14 +744,14 @@ one), and the user or an admin moves the binding with `shed source use`.
 `test_source_pin.py` drives this on a dev server with the itest user list
 through synthetic machines (`fixtures/busclient.py: FakeMachine`): a test
 identity's credentials certificate plus a machine id and name, subscribing
-and answering as a broker does. No real host agent runs (the broker side is
-`tests/host-agent-diff`).
+and answering as a broker does. No real broker runs (the broker side is
+`tests/broker-wire`).
 
 | Case | Shows |
 |---|---|
 | `test_the_server_advertises_the_pin` | `GET /api/info` lists `source_binding` |
 | `test_one_machine_is_the_source_and_another_is_refused_by_name` | alice's machine A subscribes; her machine B, same certificate, gets 403 `SOURCE_NOT_BOUND` with `source` naming A (never 401 or a bare 409), and the refusal changes nothing |
-| `test_a_subscribe_or_answer_without_a_machine_id_is_refused` | a subscribe with no machine headers, no name or a malformed id: 403 `SOURCE_MACHINE_ID_REQUIRED` naming the versions to upgrade to; with the headers it is admitted. Then a real request from alice's shed pending on A: A's answer with no headers, or a malformed id, is refused the same way, and A's proper answer to the same request is accepted and reaches the shed |
+| `test_a_subscribe_or_answer_without_a_machine_id_is_refused` | a subscribe with no machine headers, no name or a malformed id: 403 `SOURCE_MACHINE_ID_REQUIRED` that says to install the desktop app and names no version; with the headers it is admitted. Then a real request from alice's shed pending on A: A's answer with no headers, or a malformed id, is refused the same way, and A's proper answer to the same request is accepted and reaches the shed |
 | `test_the_source_subscribing_twice_is_refused_as_a_duplicate` | A subscribing twice to one request type is 409 `SOURCE_DUPLICATE_STREAM`; the first stream is still the one registered and still delivers a request |
 | `test_a_request_reaches_only_the_source` | a request from alice's shed reaches A; B's answer is refused naming A; bob's machine, subscribed to the same request type, receives nothing and its answer is refused; A's answer reaches the shed |
 | `test_moving_the_source_ends_the_old_stream_and_drops_its_requests` | with a request pending on A, `shed source use -- <B>`: A's stream ends, A's late answer and next subscribe are refused naming B, B receives the next request and never the pending one. The case's request is a raw POST to the in-VM agent's port, which waits its full lifetime (30 s) and ends in the guest's timeout (checked after B's stream shows it still delivers); a real client in the shed, such as `ssh` through the guest's SSH agent, sees `agent refused operation` after about 3 s instead, because the guest helper waits only `sdk.DefaultBusTimeout` for an answer. Nothing fails back: with B disconnected, A is still refused naming B and the binding and its generation are unchanged; B, reconnected, answers again |
@@ -791,7 +791,7 @@ starts with bindings in place. No case assumes a fresh server: each moves the
 binding to where it needs it (`busclient.ensure_source`, through `GET
 /api/sources` and `POST /api/sources/use`), and the cases run in any order.
 The cases bind and move only the throwaway itest users, never the
-developer's own user, whose real host agent may be the source on that server
+developer's own user, whose real desktop app may be the source on that server
 (the developer's entry is only read). A correct server may answer `GET
 /api/sources` with 503 `SOURCE_BUSY` for a moment, and a set-up subscribe
 with 429 `SOURCE_RATE_LIMITED`: the helpers and the `shed source` wrappers

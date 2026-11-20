@@ -608,7 +608,7 @@ shed source use <machine>    # make another of your machines the source
 hex digits, or its exact name, as `shed source ls` shows them. An argument
 that matches more than one machine in any of those ways changes nothing and
 lists them. Put `--` before a name that begins with `-`. The old machine stops
-answering at once; the new one starts when its shed-host-agent or desktop app
+answering at once; the new one starts when its desktop app
 next connects, within about 30 s (at once from the desktop app's "Use this
 machine"). Nothing fails over on its own.
 
@@ -620,7 +620,7 @@ desktop  fedcba98  SHA256:...  no     no         1 hour ago
 
 $ shed source use desktop
 Machine "desktop" (fedcba98) is now the credential source for you on my-server.
-Machine "laptop" (01234567) no longer answers. The new source answers once its shed-host-agent or desktop app next connects, within about 30 s.
+Machine "laptop" (01234567) no longer answers. The new source answers once its desktop app next connects, within about 30 s.
 
 $ shed source status
 Credential source for you on my-server: "desktop" (fedcba98), connected (ssh-agent).
@@ -631,7 +631,7 @@ A script key cannot use these commands. Machine names come from the machines,
 so every output is escaped for the terminal. Against a server older than
 v0.10.0 the commands say the server does not support credential sources.
 `shed source status` reads the server; it does not say whether the machine you
-run it on is the source (the host-agent's own status does).
+run it on is the source (the desktop app's Preferences and `broker.status` do).
 
 ## Egress Control
 
@@ -1683,6 +1683,31 @@ shed roost-provider --uninstall            # Remove it
 ## Server Commands
 
 These commands are part of `shed-server`, the server daemon binary.
+
+### shed-server serve
+
+Runs the server. The Linux package's systemd unit and the Homebrew service run
+it with their `--config`; run it by hand only as the same system user, with
+the same `--config`, and with the service stopped.
+
+```bash
+shed-server serve [--config <path>] [--abandon-user-upgrade]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | Auto-detect | Path to server config file |
+| `--abandon-user-upgrade` | off | Abandon, at this one start, the unfinished [one-time upgrade step](../guides/multi-user-server.md#sheds-with-no-user) after the users in `auth.users` changed. The step gives nothing more away and is recorded as done; the sheds and snapshots it had not reached keep no user (an admin gives one to a user with `shed assign`; one that carries host directories or server mounts can never be assigned). Refused, and the server does not start, when there is no such step: never leave it on a service's command line. |
+
+Without the flag, a server whose one-time upgrade step began for one user and
+has not finished does not start once `auth.users` holds any other users (beside
+`auth.directory`, the local admins: the account service's list never counts,
+whether or not it is in force). It stops before it opens a backend, a store or
+a listener, and before it gives anything away or records anything, and says
+the user the step began for and the two ways forward: put that user back as
+the only one in `auth.users` and start again until the log says the step is
+`done and recorded`, or start once with `--abandon-user-upgrade`. A server with
+no user list is not refused: it removes the step's marker, as before.
 
 ### shed-server setup
 

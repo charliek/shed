@@ -37,7 +37,7 @@ assert reached the host cannot pass against a shape roost does not publish.
 
 **The app instance is self-managed and INDEPENDENT** (the down-host suite's
 pattern): its own throwaway `HOME`/`XDG_RUNTIME_DIR`, its own IPC socket, its own
-fake host-agent, and it never touches `ui._state`. The session-scoped instance
+broker (which serves no server), and it never touches `ui._state`. The session-scoped instance
 keeps running beside it, which is what keeps the autouse `_reset_policy` /
 `_reset_mock` fixtures — which reconnect to the session socket before every test
 — working for the modules that come after this one.
@@ -62,7 +62,6 @@ import pytest
 
 import ui
 from client import ShedError, TauriClient, scaled_timeout
-from fake_host_agent import FakeHostAgent
 from fake_roost import ROOST_WIRED_AGENTS, SESSION_PROTOCOL, FakeRoost, vector
 from mockserver import MockShedServer
 
@@ -556,7 +555,7 @@ def _boot_app(
     asset_base: str | None = None,
 ):
     """Launch an INDEPENDENT tauri instance pointed at `rig` — its own throwaway
-    `HOME`/`XDG_RUNTIME_DIR`, its own socket, its own fake host-agent — and yield
+    `HOME`/`XDG_RUNTIME_DIR`, its own socket, its own broker — and yield
     a ready client.
 
     Independent, never `ui.launch`, for the down-host suite's reason: a
@@ -589,57 +588,51 @@ def _boot_app(
         raise RuntimeError(
             f"tauri binary not found at {cfg.binary}; build it first (make tauri-build)."
         )
-    agent = FakeHostAgent()
-    agent.start()
+    runtime_dir = Path(tempfile.mkdtemp(prefix="shed-boot-app-"))
+    sock = runtime_dir / cfg.sock_rel
+    log = runtime_dir / "bootstrap-ui.log"
+    env = ui.subproc_env(
+        cfg,
+        runtime_dir=runtime_dir,
+        mock_base_url=mock_base_url,
+        config_path=FIXTURES / "config.yaml",
+        ssh_bin=rig.root / "bin/fake-ssh",
+        roost_jail=True,
+        roost_install_bin=install_bin,
+        roost_session_bin=session_bin,
+    )
+    if asset_base:
+        env["ROOST_SESSION_ASSET_BASE"] = asset_base
+    else:
+        env.pop("ROOST_SESSION_ASSET_BASE", None)
+    log_fh = open(log, "wb")
+    proc = subprocess.Popen(
+        [str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT
+    )
     try:
-        runtime_dir = Path(tempfile.mkdtemp(prefix="shed-boot-app-"))
-        sock = runtime_dir / cfg.sock_rel
-        log = runtime_dir / "bootstrap-ui.log"
-        env = ui.subproc_env(
-            cfg,
-            runtime_dir=runtime_dir,
-            mock_base_url=mock_base_url,
-            config_path=FIXTURES / "config.yaml",
-            host_agent_socket=agent.socket_path,
-            ssh_bin=rig.root / "bin/fake-ssh",
-            roost_jail=True,
-            roost_install_bin=install_bin,
-            roost_session_bin=session_bin,
+        ui.await_hermetic(
+            "tauri", sock=sock, mock_base_url=mock_base_url, proc=proc, log=log
         )
-        if asset_base:
-            env["ROOST_SESSION_ASSET_BASE"] = asset_base
-        else:
-            env.pop("ROOST_SESSION_ASSET_BASE", None)
-        log_fh = open(log, "wb")
-        proc = subprocess.Popen(
-            [str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT
-        )
+        client = TauriClient(sock)
+        # This instance is the one `Rig.list_running` refreshes while it is
+        # up — restored on the way out, so a cell with its own app hands the
+        # module-scoped one back. See `Rig.app`.
+        previous_app = rig.app
+        rig.app = client
         try:
-            ui.await_hermetic(
-                "tauri", sock=sock, mock_base_url=mock_base_url, proc=proc, log=log
+            client.wait_until(
+                lambda: client.current_pane() is not None,
+                timeout=30,
+                what="bootstrap frontend ready",
             )
-            client = TauriClient(sock)
-            # This instance is the one `Rig.list_running` refreshes while it is
-            # up — restored on the way out, so a cell with its own app hands the
-            # module-scoped one back. See `Rig.app`.
-            previous_app = rig.app
-            rig.app = client
-            try:
-                client.wait_until(
-                    lambda: client.current_pane() is not None,
-                    timeout=30,
-                    what="bootstrap frontend ready",
-                )
-                yield client
-            finally:
-                rig.app = previous_app
-                client.close()
+            yield client
         finally:
-            ui.terminate(proc)
-            log_fh.close()
-            shutil.rmtree(runtime_dir, ignore_errors=True)
+            rig.app = previous_app
+            client.close()
     finally:
-        agent.stop()
+        ui.terminate(proc)
+        log_fh.close()
+        shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
 @pytest.fixture(scope="module")
@@ -1201,12 +1194,6 @@ def test_a_sheds_rows_are_roosts_and_a_filter_returns_them(boot, rig, mock):
     # binary, resolved by roost on the far side.
     assert opened["argv"] == ["opencode"], opened
 
-    # `rc.launch {shed}` is the SAME op under its pre-S6 name — an alias kept
-    # for 0.9.x — so it lands on the same host and stamps the same origin.
-    alias = boot.call("rc.launch", {"shed": shed, "kind": "opencode"})
-    assert alias["origin"] == target, alias
-    assert alias["source"] == "roost", alias
-
     # Wait for the WATCHER's own snapshot rather than reading the optimistic row
     # `roost.launch` inserted: the claim is about what a listing says, and the
     # adapter-claimed tab is what makes a row survive a resync.
@@ -1244,18 +1231,17 @@ def test_a_first_prompt_or_permission_mode_is_refused_on_a_shed(boot, rig, mock)
     026 §3.5) — the `roost:<server>/<shed>` twin of `test_tauri_machines.py`'s
     machine-form cell, over the real bridge.
 
-    Every door a shed is addressed through: `rc.launch {shed}` (the pre-S6 op,
-    which can only name a shed) and `roost.launch`/`machine.launch` by the
-    grammar token. The last launch is the control: the same shed, asked for what
-    a roost launch does, opens a tab — so the zero `tab.open` above is the
-    refusal's, not a shed that could not have opened anything. It carries a name,
+    Every door a shed is addressed through: `roost.launch`/`machine.launch` by
+    the grammar token (the pre-S6 `rc.launch {shed}` was removed in 0.10.0).
+    The last launch is the control: the same shed, asked for what a roost
+    launch does, opens a tab — so the zero `tab.open` above is the refusal's,
+    not a shed that could not have opened anything. It carries a name,
     which is the shed path's half of the title rule.
     """
     shed = "p26-refused"
     fake = rig.roost()
     target = rig.host(shed, identity=IDENTITY_CURRENT, running=True, roost=fake)
     doors = [
-        ("rc.launch", {"shed": shed}),
         ("roost.launch", {"target": target}),
         ("machine.launch", {"target": target}),
     ]

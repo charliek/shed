@@ -58,10 +58,14 @@ const MAX_ERR_STDERR: usize = 2 << 10;
 /// `hostKeyChangedMarker`).
 const HOST_KEY_CHANGED_MARKER: &[u8] = b"REMOTE HOST IDENTIFICATION HAS CHANGED";
 
+/// The client kind the broker sends with every bootstrap: advisory audit metadata the
+/// server records in the issued certificate (Go `authtoken.ClientBroker`).
+pub const CLIENT_KIND_BROKER: &str = "broker";
+
 /// One bootstrap exchange (mirrors Go `bootstrap.Params`). Host/Port address the
 /// server's SSH endpoint; `known_hosts_path` is the pinned trust root
 /// (`~/.shed/known_hosts`); `scope` is the token scope (`"control"`/`"credentials"`);
-/// `client_kind` is advisory audit metadata (`"host-agent"`/`"cli"`/`"desktop"`) and
+/// `client_kind` is advisory audit metadata (`"broker"`/`"cli"`/`"desktop"`) and
 /// may be empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
@@ -767,7 +771,7 @@ mod tests {
             port: 2222,
             known_hosts_path: "/home/x/.shed/known_hosts".into(),
             scope: "credentials".into(),
-            client_kind: "host-agent".into(),
+            client_kind: CLIENT_KIND_BROKER.into(),
             csr: String::new(),
             identity_file: String::new(),
         }
@@ -952,7 +956,7 @@ mod tests {
             "_bootstrap",
             "mini3",
             "credentials",
-            "host-agent",
+            "broker",
         ];
         assert_eq!(got, want);
         // Exactly 17 `-o` flags (Codex: 17, not 20).
@@ -979,7 +983,7 @@ mod tests {
             &got[got.len() - 3..],
             &[
                 "credentials".to_string(),
-                "host-agent".to_string(),
+                "broker".to_string(),
                 "csr=QUJD+/aa==".to_string()
             ]
         );
@@ -994,7 +998,7 @@ mod tests {
 
         // Empty CSR → the legacy, token-only argv (no trailing element at all).
         p.csr = String::new();
-        p.client_kind = "host-agent".into();
+        p.client_kind = CLIENT_KIND_BROKER.into();
         assert_eq!(ssh_args(&p), ssh_args(&params()));
     }
 

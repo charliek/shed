@@ -1,29 +1,25 @@
 # GoReleaser config — SERVER component (plan 002: release component model).
 #
-# One of TWO split configs. The release job invokes goreleaser once per
-# SHIPPING component, in the FIXED order: server → host-agent.
-#   - .goreleaser.server.yaml      (this file): brew `shed`, apt `shed-server` deb
-#   - .goreleaser.host-agent.yaml  : brew `shed-host-agent` + GH linux tarball
-# (.goreleaser.machine-rc.yaml was deleted with the machine-rc component's
-# retirement in plan 010; .goreleaser.sx.yaml with sx's sunset in plan 016.)
-# See RELEASING.md "Component selection" for the selector law and the flow.
-# Boilerplate is duplicated across the two (goreleaser `includes` is Pro-only).
+# The only goreleaser config: brew `shed`, apt `shed-server` deb. The release
+# job invokes it when the server component ships. (The configs of components
+# retired earlier were deleted with them; see RELEASING.md "Retired
+# components".) See RELEASING.md "Component selection" for the selector law
+# and the flow.
 
 version: 2
 
 project_name: shed
 
 # Own subdir of dist/ (covered by .gitignore's `dist/`); `--clean` wipes only
-# this dir, never a sibling config's, so both snapshots/releases coexist.
+# this dir.
 dist: dist/server
 
 before:
   hooks:
     # ONLY the sed that renders packaging/server.yaml.generated (gitignored) for
-    # the shed-deb nfpm below. NO `go mod tidy` here: the release job runs the
-    # split configs sequentially (server → host-agent) and asserts
-    # a clean tree; a before-hook MUST NOT mutate a tracked file (go.mod/go.sum)
-    # or invocation #2 aborts on the dirty-check. CI asserts tidiness separately
+    # the shed-deb nfpm below. NO `go mod tidy` here: a before-hook MUST NOT
+    # mutate a tracked file (go.mod/go.sum) or goreleaser's dirty-check
+    # aborts. The release job and CI assert tidiness separately
     # (go mod tidy && git diff --exit-code go.mod go.sum).
     - sh -c 'sed "s/{{"{{"}}VERSION{{"}}"}}/{{ .Version }}/g" packaging/server.yaml.tmpl > packaging/server.yaml.generated'
 
@@ -202,7 +198,7 @@ brews:
             default_backend: vz
             log_level: info
 
-            # Host directories to mount into every shed (formerly "credentials")
+            # Host directories to mount into every shed
             # Using ~/.shed/mounts/ keeps host and VM configs separate.
             # mounts:
             #   claude:
@@ -230,9 +226,8 @@ brews:
             # env_file: ~/.shed/env
 
             # Extensions provide credential brokering from host to VM.
-            # Requires shed-host-agent to be installed and running:
-            #   brew install shed-host-agent
-            #   brew services start shed-host-agent
+            # The shed desktop app brokers credentials (install it from the
+            # release page).
             # extensions:
             #   enabled:
             #     - ssh-agent
@@ -278,7 +273,7 @@ brews:
             default_backend: firecracker
             log_level: info
 
-            # Host directories to mount into every shed (formerly "credentials")
+            # Host directories to mount into every shed
             # Using ~/.shed/mounts/ keeps host and VM configs separate.
             # mounts:
             #   claude:
@@ -298,9 +293,8 @@ brews:
             # env_file: ~/.shed/env
 
             # Extensions provide credential brokering from host to VM.
-            # Requires shed-host-agent to be installed and running:
-            #   brew install shed-host-agent
-            #   brew services start shed-host-agent
+            # The shed desktop app brokers credentials (install it from the
+            # release page).
             # extensions:
             #   enabled:
             #     - ssh-agent
@@ -361,8 +355,8 @@ brews:
       allow_insecure_exposure, were removed in v0.10.0 and fail to load.
 
       To enable extensions (SSH agent forwarding, AWS credentials,
-      Docker credentials), also install the host agent:
-        brew install shed-host-agent
+      Docker credentials), the shed desktop app brokers credentials
+      (install it from the release page).
 
       Logs: #{var}/log/shed-server.log
 
@@ -446,11 +440,10 @@ release:
     name: shed
   draft: false
   prerelease: auto
-  # keep-existing: the first SHIPPING invocation (server → host-agent)
-  # creates the release, with the tag's curated CHANGELOG section as its
-  # body (publish-images.yaml passes it as --release-notes, which skips the
-  # changelog below); later invocations upload their assets without
-  # touching the body.
+  # keep-existing: this invocation creates the release, with the tag's
+  # curated CHANGELOG section as its body (publish-images.yaml passes it as
+  # --release-notes, which skips the changelog below); the desktop jobs
+  # upload their assets afterwards without touching the body.
   mode: keep-existing
   # replace_existing_artifacts: a re-run of a partially-failed release job
   # replaces its own already-uploaded assets instead of dying `already_exists`

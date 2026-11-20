@@ -1,5 +1,5 @@
-//! The always-on egress-audit SSE consumer — a Rust port of the Go daemon's
-//! `cmd/shed-host-agent/egress_handler.go`.
+//! The always-on egress-audit SSE consumer — a Rust port of the retired Go daemon's
+//! `egress_handler.go`.
 //!
 //! Unlike the plugin-bus namespaces this is NOT a bus subscription: it is a plain
 //! read-only `GET {server}/api/egress/stream` (`Accept: text/event-stream`) whose
@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn golden_egress_audit_entry() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/egress_audit_entry.json");
+            .join("../../tests/broker-wire/fixtures/egress_audit_entry.json");
         let raw = std::fs::read_to_string(&path).expect("read golden fixture");
         let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(fx["protocol_version"], 1, "version skew");

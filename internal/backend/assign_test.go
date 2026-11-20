@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -691,7 +693,11 @@ func TestUsersUpgradePending(t *testing.T) {
 	}
 	begin := func(dir string, users ...UpgradeUser) (*UsersUpgrade, UpgradePlan) {
 		u := OpenUsersUpgrade(dir, true, logf)
-		return u, u.Begin(users, now)
+		plan, err := u.Begin(users, false, now)
+		if err != nil {
+			t.Fatalf("Begin(%+v): %v", users, err)
+		}
+		return u, plan
 	}
 
 	t.Run("first start with one user writes pending first", func(t *testing.T) {
@@ -724,19 +730,124 @@ func TestUsersUpgradePending(t *testing.T) {
 		}
 	})
 
-	t.Run("abandoned for another user", func(t *testing.T) {
+	t.Run("refused for another user", func(t *testing.T) {
+		for _, users := range [][]UpgradeUser{
+			{{Name: "bob", Admin: true}},
+			{{Name: "alice", Admin: true}, {Name: "bob"}},
+		} {
+			dir := t.TempDir()
+			begin(dir, UpgradeUser{Name: "alice", Admin: true})
+			path := filepath.Join(dir, UsersUpgradeFile)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			u := OpenUsersUpgrade(dir, true, logf)
+			plan, err := u.Begin(users, false, now)
+			var changed *UsersUpgradeChangedError
+			if !errors.As(err, &changed) || changed.Pending.Name != "alice" || plan != (UpgradePlan{}) {
+				t.Fatalf("users %+v: plan %+v err %v; want the start refused for alice's step", users, plan, err)
+			}
+			if after, _ := os.ReadFile(path); !bytes.Equal(after, before) {
+				t.Errorf("users %+v: the refusal changed the marker: %s, was %s", users, after, before)
+			}
+			if cerr := CheckUsersUpgrade(dir, users, false); !errors.As(cerr, &changed) {
+				t.Errorf("users %+v: CheckUsersUpgrade = %v, want the same refusal", users, cerr)
+			}
+		}
+	})
+
+	t.Run("abandoned for another user on purpose", func(t *testing.T) {
 		dir := t.TempDir()
 		begin(dir, UpgradeUser{Name: "alice", Admin: true})
 		lines = nil
-		_, plan := begin(dir, UpgradeUser{Name: "bob", Admin: true})
-		if plan != (UpgradePlan{}) {
-			t.Errorf("plan %+v, want nothing", plan)
+		u := OpenUsersUpgrade(dir, true, logf)
+		plan, err := u.Begin([]UpgradeUser{{Name: "bob", Admin: true}}, true, now)
+		if err != nil || plan != (UpgradePlan{}) {
+			t.Errorf("plan %+v err %v, want nothing", plan, err)
 		}
 		if m := readState(t, dir); m["pending"] != nil || m["completed_at"] != "2026-11-16T12:00:00Z" {
 			t.Errorf("marker %v, want done", m)
 		}
-		if !containsLine(lines, "the unfinished one-time upgrade step for user alice was abandoned") {
+		if !containsLine(lines, "the unfinished one-time upgrade step for user alice was abandoned, because the configured users are now bob") {
 			t.Errorf("log %q", lines)
+		}
+	})
+
+	t.Run("abandoning fails when the done marker cannot be written", func(t *testing.T) {
+		dir := t.TempDir()
+		begin(dir, UpgradeUser{Name: "alice", Admin: true})
+		lines = nil
+		u := OpenUsersUpgrade(dir, true, logf)
+		// The marker was read as pending; its path is now a directory that
+		// is not empty, so renaming the done marker over it fails (for root
+		// too).
+		path := filepath.Join(dir, UsersUpgradeFile)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(path, "keep"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		plan, err := u.Begin([]UpgradeUser{{Name: "bob", Admin: true}}, true, now)
+		if err == nil || plan != (UpgradePlan{}) {
+			t.Fatalf("plan %+v err %v; want the start to fail", plan, err)
+		}
+		for _, part := range []string{"the server does not start", AbandonUsersUpgradeFlag, "for user alice", "marker " + strconv.Quote(path) + " failed", "start the server once more with the flag"} {
+			if !strings.Contains(err.Error(), part) {
+				t.Errorf("the error does not say %q: %v", part, err)
+			}
+		}
+		if containsLine(lines, "was abandoned") {
+			t.Errorf("an abandonment was logged although it was not recorded: %q", lines)
+		}
+	})
+
+	t.Run("abandon with nothing to abandon", func(t *testing.T) {
+		pendingAlice := func(t *testing.T) string {
+			dir := t.TempDir()
+			begin(dir, UpgradeUser{Name: "alice", Admin: true})
+			return dir
+		}
+		done := func(t *testing.T) string {
+			dir := pendingAlice(t)
+			u := OpenUsersUpgrade(dir, true, logf)
+			u.Finish(UpgradePlan{StampFor: &UpgradeUser{Name: "alice"}}, UpgradeReport{}, now)
+			return dir
+		}
+		for _, tc := range []struct {
+			name   string
+			dir    func(t *testing.T) string
+			users  []UpgradeUser
+			reason string
+		}{
+			{"no user list", func(t *testing.T) string { return pendingAlice(t) }, nil, "has no user list"},
+			{"first start", func(t *testing.T) string { return t.TempDir() }, []UpgradeUser{{Name: "bob", Admin: true}}, "first start with a user list"},
+			{"done", done, []UpgradeUser{{Name: "bob", Admin: true}}, "is done"},
+			{"pending and resumable", pendingAlice, []UpgradeUser{{Name: "alice", Admin: true}}, "resumes at this start"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				dir := tc.dir(t)
+				path := filepath.Join(dir, UsersUpgradeFile)
+				before, _ := os.ReadFile(path)
+				err := CheckUsersUpgrade(dir, tc.users, true)
+				var refused *UsersUpgradeAbandonError
+				if !errors.As(err, &refused) || !strings.Contains(err.Error(), tc.reason) || !strings.Contains(err.Error(), AbandonUsersUpgradeFlag+" is refused") {
+					t.Fatalf("CheckUsersUpgrade = %v; want the flag refused (%s)", err, tc.reason)
+				}
+				if strings.Contains(err.Error(), "\n") {
+					t.Errorf("the flag's refusal is more than one line: %q", err)
+				}
+				if len(tc.users) > 0 {
+					u := OpenUsersUpgrade(dir, true, logf)
+					if plan, err := u.Begin(tc.users, true, now); !errors.As(err, &refused) || plan != (UpgradePlan{}) {
+						t.Errorf("Begin = %+v, %v; want the flag refused", plan, err)
+					}
+				}
+				if after, _ := os.ReadFile(path); !bytes.Equal(after, before) {
+					t.Errorf("the refusal changed the marker: %q, was %q", after, before)
+				}
+			})
 		}
 	})
 

@@ -1,5 +1,5 @@
 //! The control-token provider — a faithful Rust port of
-//! `cmd/shed-host-agent/controltoken.go`. The `ServerTarget` / `load_discovered_servers`
+//! the retired Go daemon's `controltoken.go`. The `ServerTarget` / `load_discovered_servers`
 //! slice its resolve path needs now lives in the always-on [`crate::discovery`] module
 //! (hoisted out of here so the headless supervisor path can use it too).
 //!
@@ -32,10 +32,8 @@ pub use crate::config::DEFAULT_DISCOVERY_SOURCE;
 // Control-token minter seam
 // ---------------------------------------------------------------------------
 //
-// The `token.get` seam lives here (the broker core), not in the daemon's
-// `desktop` module: the desktop UDS server (`shed-host-agent`) and any future
-// embedder both consume it, and [`ControlTokenProvider`] below is its production
-// implementation. The bin's `DesktopServer` re-imports these from `shed_broker`.
+// The `token.get` seam lives here, in the broker core, for any embedder to consume;
+// [`ControlTokenProvider`] below is its production implementation.
 
 /// A minted control-scoped token: the token plus an optional RFC3339 expiry
 /// (`None` = non-expiring / unknown, which omits `expires_at` in the reply).

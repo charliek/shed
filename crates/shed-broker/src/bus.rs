@@ -1,7 +1,7 @@
 //! Surface B — the shed-server plugin message bus (Rust port of `sdk/hostclient.go`
 //! + `sdk/envelope.go`).
 //!
-//! [`BusClient`] is the host-agent's `HostClient` equivalent: it subscribes to a
+//! [`BusClient`] is the broker's `HostClient` equivalent: it subscribes to a
 //! namespace's SSE stream, receives request [`Envelope`]s, and `respond`s with
 //! response envelopes routed back to the originating shed. It reuses shed-core's
 //! transport primitives — the SSE framer (`shed_core::sse::SseParser`) and the
@@ -44,24 +44,8 @@
 //!     retried no sooner than its whole-seconds `Retry-After` (capped at a minute), and
 //!     never sooner than the current backoff, and a `retry_now` does not cut that wait
 //!     short (it cuts only the ordinary backoff);
-//!   * a client built with a presence channel ([`BusClient::with_presence`]: the daemon,
-//!     never the desktop's embedded broker) stands by while the desktop app's embedded
-//!     broker runs on this machine ([`crate::presence`]: a lock the app holds, which the
-//!     daemon's one watcher looks at every [`PRESENCE_CHECK_INTERVAL`] and publishes).
-//!     While the channel says present the client neither subscribes nor answers: it
-//!     subscribes nothing (state `yielding`), drops a connect or a held stream at once,
-//!     leaves an ordinary backoff sleep at once (a `429`'s wait is still waited out),
-//!     starts no handler for a request it has received, and posts no answer (checked
-//!     immediately before every send; audited `undelivered`, left for the desktop app).
-//!     Such requests stay pending on the server, which re-delivers them to the app. Once
-//!     it says absent the client subscribes at once, from the backoff floor. A
-//!     `409 SOURCE_DUPLICATE_STREAM` is retried on the backoff, as always: with the lock
-//!     it is left for the time before the daemon's next look, and for two daemons on a
-//!     copied state directory;
-//!   * a client holding the presence lock ([`BusClient::with_presence_lock`]: the
-//!     embedded broker only) retries an older server's terminal `409` for
-//!     [`OLD_SERVER_CONFLICT_GRACE`] after it started or took the lock, then stops as
-//!     before;
+//!   * any other `409` (a 0.9.x server's `NAMESPACE_ALREADY_REGISTERED`, or one with no
+//!     code) is terminal: the subscription stops and the type reads `rejected`;
 //!   * a respond answered 503 or 429 WITH a whole-seconds `Retry-After` that fits the
 //!     remaining budget (the server wrote nothing) is re-sent a bounded number of times,
 //!     all of it inside one deadline from the first send; every other non-204 (403 and
@@ -119,7 +103,6 @@ use crate::docker_backend::{
     DockerBackend, DOCKER_CODE_INTERNAL, DOCKER_CODE_NOT_ALLOWED, DOCKER_CODE_NOT_FOUND,
 };
 use crate::machine::MachineIdentity;
-use crate::presence::Presence;
 use crate::sign_check::{Refusal, RefusalClass, SignPolicy};
 use crate::ssh_backend::SshBackend;
 use crate::status::ActiveSource;
@@ -145,34 +128,6 @@ const MAX_CODE_CHARS: usize = 64;
 pub const CODE_SOURCE_RATE_LIMITED: &str = "SOURCE_RATE_LIMITED";
 /// The longest a `429 SOURCE_RATE_LIMITED`'s `Retry-After` is honoured for.
 const SUBSCRIBE_RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
-
-/// How often the daemon's one lock watcher ([`crate::presence::LockWatcher`]) looks
-/// whether the desktop app's embedded broker runs on this machine. Every subscription of
-/// a client with the watcher's channel ([`BusClient::with_presence`]) reacts to what it
-/// publishes at once — while waiting, while connecting, while holding a stream, while
-/// backing off, and just before posting an answer. A local syscall on a lock file, no
-/// network: what bounds how soon the daemon takes over after the app quits, and how soon
-/// it lets go after the app starts.
-pub const PRESENCE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
-/// A `yielding` namespace's `last_error`: who answers, and when this client takes over.
-pub const YIELDING_REASON: &str = "the desktop app on this machine is answering (its embedded \
-     broker is running); this daemon takes over within a few seconds of the app quitting";
-/// How long, from when it started subscribing (or took the presence lock, if later), a
-/// client holding the presence lock ([`BusClient::with_presence_lock`]: the desktop's
-/// embedded broker) retries a TERMINAL `409` (a 0.9.x server's
-/// `NAMESPACE_ALREADY_REGISTERED`: another stream of this machine holds the type) instead
-/// of stopping. On such a server the daemon may still hold the type when the app first
-/// subscribes; it lets go at its next look, at most one [`PRESENCE_CHECK_INTERVAL`] away
-/// (two allowing for a slow look), and the server unregisters its listener when the
-/// connection closes. Four intervals (8 s) plus 7 s for that teardown and for the app's
-/// backoff (1, 2, 4 s) to come round to a retry: 15 s. Past it, a 409 is terminal again,
-/// as for every other client.
-pub const OLD_SERVER_CONFLICT_GRACE: Duration =
-    Duration::from_secs(4 * PRESENCE_CHECK_INTERVAL.as_secs() + 7);
-/// The audit note of an answer the daemon did not post because the desktop app's embedded
-/// broker took over the request type while the request was being handled: the server
-/// re-delivers the still-pending request to the app, which answers it.
-pub const AUDIT_NOTE_LEFT_FOR_APP: &str = "left for the desktop app";
 
 /// How many times a respond answered 503/429 with `Retry-After` is re-sent.
 const RESPOND_MAX_RETRIES: u32 = 3;
@@ -576,8 +531,7 @@ impl BusLog for FileBusLog {
 /// A namespace subscription's connection state (`hostclient.go`'s `Conn*`).
 /// `Rejected` is terminal — a 409 (another listener owns the namespace) stops the
 /// loop instead of hot-looping a retry. `NotSource` and `Duplicate` (plan 035 §3.4) are
-/// NOT terminal: the loop keeps retrying on its backoff. `Yielding` is not terminal
-/// either: the loop stands by, subscribing nothing, until the embedded broker is gone.
+/// NOT terminal: the loop keeps retrying on its backoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
     Reconnecting,
@@ -588,13 +542,8 @@ pub enum ConnState {
     /// (`403 SOURCE_NOT_BOUND`); [`SubStatus::active_source`] names it.
     NotSource,
     /// Another process with this machine's id already holds the namespace on the server
-    /// (`409 SOURCE_DUPLICATE_STREAM`) — e.g. two daemons on a copied state directory,
-    /// or the daemon in the instant before it sees the desktop app's lock.
+    /// (`409 SOURCE_DUPLICATE_STREAM`) — e.g. two brokers on a copied state directory.
     Duplicate,
-    /// The desktop app's embedded broker runs on this machine ([`crate::presence`]), so
-    /// this client (the daemon) does not subscribe: the app answers. Only a client with
-    /// a presence check ([`BusClient::with_presence`]) is ever in it.
-    Yielding,
 }
 
 /// A snapshot of one subscription's state (`hostclient.go:SubStatus`). `since` is the
@@ -635,17 +584,6 @@ fn set_state_with(
     }
 }
 
-/// What a terminal-looking `409` means for a client ([`BusClient::with_presence_lock`]).
-enum Grace {
-    /// Terminal, as for every client without the presence lock.
-    None,
-    /// Inside the older-server grace: retry on the backoff.
-    Retry,
-    /// The client is the embedded broker but does not hold its lock yet: rejected until
-    /// it does, then retried.
-    WaitForLock(watch::Receiver<Option<tokio::time::Instant>>),
-}
-
 /// How a single `stream_messages` attempt ended, driving the reconnect decision.
 enum StreamEnd {
     /// Shutdown was requested mid-connect / mid-stream — return cleanly.
@@ -679,10 +617,6 @@ enum StreamEnd {
     /// This request's own mint was refused by the held-user rule and nothing is held to
     /// present (plan 037 A23): nothing was sent → backoff + retry, which mints again.
     NotSent(String),
-    /// The desktop app's embedded broker appeared on this machine while this client
-    /// was connecting or held the stream: the attempt was dropped (its connection
-    /// closed) → stand by ([`BusClient::with_presence`]).
-    Yield,
 }
 
 // ---------------------------------------------------------------------------
@@ -920,24 +854,12 @@ pub struct BusClient {
     /// watch channel rather than a `Notify`, so a bump that lands while a subscription
     /// is mid-request is not lost: its next wait returns immediately.
     wake: Arc<watch::Sender<u64>>,
-    /// Set by the daemon only: whether the desktop app's embedded broker runs on this
-    /// machine, and the yield epoch, as the daemon's one lock watcher publishes them; while
-    /// it runs, this client subscribes nothing and answers nothing, and what it received
-    /// or began under an older epoch it never answers ([`Self::with_presence`]).
-    presence: Option<watch::Receiver<Presence>>,
-    /// Set on the copy a request's handler answers through ([`Self::for_handler`]): the
-    /// yield epoch the handler started in. A respond whose epoch has been passed sends
-    /// nothing. `None` (every other copy): the epoch when the respond starts.
-    handler_epoch: Option<u64>,
-    /// Set by the desktop's embedded broker only: when it took the presence lock (`None`
-    /// until it has), for the older-server grace ([`Self::with_presence_lock`]).
-    presence_lock: Option<watch::Receiver<Option<tokio::time::Instant>>>,
     /// How long one respond POST waits for an answer ([`RESPOND_ATTEMPT_TIMEOUT`]).
     respond_attempt_timeout: Duration,
     /// One respond's whole deadline from its first send ([`RESPOND_RETRY_BUDGET`]).
     respond_budget: Duration,
     /// Test seam: an in-memory server that answers this client's subscribes in place of
-    /// HTTP, so the presence check and the backoff can be driven on tokio's paused clock.
+    /// HTTP, so the backoff can be driven on tokio's paused clock.
     #[cfg(test)]
     sim: Option<Arc<tests::SimBus>>,
 }
@@ -980,77 +902,11 @@ impl BusClient {
             max_backoff: MAX_BACKOFF,
             machine: None,
             wake: Arc::new(watch::channel(0u64).0),
-            presence: None,
-            handler_epoch: None,
-            presence_lock: None,
             respond_attempt_timeout: RESPOND_ATTEMPT_TIMEOUT,
             respond_budget: RESPOND_RETRY_BUDGET,
             #[cfg(test)]
             sim: None,
         })
-    }
-
-    /// Stand by while the desktop app's embedded broker runs on this machine
-    /// ([`crate::presence`]), as `presence` (the daemon's one lock watcher's channel)
-    /// says: while it reads present, subscribe nothing (state [`ConnState::Yielding`]),
-    /// close a stream held or being opened, leave a sleep at once, start no handler for a
-    /// request already received, and post no answer.
-    ///
-    /// A yield is also PERMANENT for the work it interrupted: every request carries the
-    /// yield epoch ([`Presence::epoch`]) of the stream it came on, and every answer the
-    /// epoch its handler started in. A request from an older epoch is never handled and
-    /// an answer from one is never sent (a first send or a re-send), even when the app
-    /// has quit again by then; a stream opened under an older epoch is closed. Such a
-    /// request stays pending on the server, which delivers it again to whichever stream
-    /// of this machine subscribes next: the app's, or this daemon's new one.
-    ///
-    /// `None` (the default) never stands by. The daemon passes one; the embedded broker,
-    /// the one that answers while it runs, passes none.
-    pub fn with_presence(mut self, presence: Option<watch::Receiver<Presence>>) -> Self {
-        self.presence = presence;
-        self
-    }
-
-    /// This client holds the presence lock: `held_since` is when it took it (`None`
-    /// until it has). Set only by the desktop's embedded broker. Its one effect: a
-    /// terminal `409` (an older server's `NAMESPACE_ALREADY_REGISTERED`) is retried on
-    /// the backoff for [`OLD_SERVER_CONFLICT_GRACE`] after it started subscribing or took
-    /// the lock, whichever is later, because on such a server the daemon on this machine
-    /// may still hold the type for a moment after the app takes the lock. A client
-    /// without it treats every such 409 as terminal, as before.
-    pub fn with_presence_lock(
-        mut self,
-        held_since: Option<watch::Receiver<Option<tokio::time::Instant>>>,
-    ) -> Self {
-        self.presence_lock = held_since;
-        self
-    }
-
-    /// Whether the desktop app's embedded broker runs now, as the watcher last published
-    /// (always `false` without one). A channel read: no file I/O, no wait.
-    fn embedded_present(&self) -> bool {
-        self.presence.as_ref().is_some_and(|p| p.borrow().present)
-    }
-
-    /// The yield epoch as the watcher last published it ([`Presence::epoch`]; always 0
-    /// without a presence channel, so nothing is ever stale there).
-    fn yield_epoch(&self) -> u64 {
-        self.presence.as_ref().map_or(0, |p| p.borrow().epoch)
-    }
-
-    /// Whether work stamped with yield epoch `epoch` was overtaken by a start of the
-    /// desktop app's embedded broker: it is then never handled or answered here.
-    fn yielded_since(&self, epoch: u64) -> bool {
-        self.yield_epoch() != epoch
-    }
-
-    /// The copy a request's handler answers through: its responds belong to yield epoch
-    /// `epoch` (the epoch of the stream the request came on, checked current when the
-    /// handler started).
-    fn for_handler(&self, epoch: u64) -> BusClient {
-        let mut c = self.clone();
-        c.handler_epoch = Some(epoch);
-        c
     }
 
     /// Present `machine` on every subscribe and respond. An identity whose id or name
@@ -1107,7 +963,7 @@ impl BusClient {
     /// `status()` reports the live connection state. The loop runs until `shutdown`
     /// flips true or the subscription is terminally rejected (409).
     pub fn subscribe(&self, namespace: &str, shutdown: watch::Receiver<bool>) -> Subscription {
-        let (tx, rx) = mpsc::channel::<Received>(ENVELOPE_CHANNEL_CAP);
+        let (tx, rx) = mpsc::channel::<Envelope>(ENVELOPE_CHANNEL_CAP);
         let status = Arc::new(Mutex::new(SubStatus {
             namespace: namespace.to_string(),
             state: ConnState::Reconnecting,
@@ -1126,17 +982,13 @@ impl BusClient {
         let handle = tokio::spawn(async move {
             client.subscribe_loop(ns, tx, shutdown, st, wake).await;
         });
-        Subscription {
-            rx: EnvelopeRx { rx },
-            status,
-            handle,
-        }
+        Subscription { rx, status, handle }
     }
 
     async fn subscribe_loop(
         self,
         namespace: String,
-        tx: mpsc::Sender<Received>,
+        tx: mpsc::Sender<Envelope>,
         shutdown: watch::Receiver<bool>,
         status: Arc<Mutex<SubStatus>>,
         mut wake: watch::Receiver<u64>,
@@ -1148,131 +1000,33 @@ impl BusClient {
         // `setState(stopState, stopCause)`).
         let mut terminal_state = ConnState::Stopped;
         let mut terminal_cause: Option<String> = None;
-        // When this subscription started: the older-server grace counts from here (or
-        // from when the presence lock was taken, if later).
-        let started = tokio::time::Instant::now();
-        let mut grace_said = false;
         loop {
             if *shutdown.borrow() {
                 break;
-            }
-            // Before EVERY attempt: while the desktop app's embedded broker runs on this
-            // machine, subscribe nothing (it answers); once it is gone, ask at once, from
-            // the backoff floor.
-            if self.embedded_present() {
-                if !self
-                    .stand_by(&namespace, &shutdown, &status, &mut down_logged)
-                    .await
-                {
-                    break;
-                }
-                backoff = self.initial_backoff;
-                continue;
             }
             // tokio's clock (the real one outside tests), so a paused-clock test sees
             // how long a stream held.
             let start = tokio::time::Instant::now();
             let connected = AtomicBool::new(false);
-            // The yield epoch this stream belongs to: every request it delivers is stamped
-            // with it.
-            let epoch = self.yield_epoch();
-            // The attempt races the presence watch: the embedded broker appearing while
-            // it connects or holds a stream ends it (dropping the stream closes the
-            // connection), and so does the epoch moving on (the app started and quit
-            // again between two looks at the channel). Requests already received are not
-            // answered by this daemon either: `serve_namespace` starts no handler for
-            // them (and drops those queued when the app starts), and a handler already
-            // running posts nothing (`send_respond`); each stays pending on the server,
-            // which delivers it again to the next stream of this machine: the app's, or
-            // this daemon's next one, opened under the new epoch.
-            let end = tokio::select! {
-                end = self.stream_messages(&namespace, &tx, epoch, shutdown.clone(), &status, &connected) => end,
-                _ = self.embedded_appears_since(epoch) => StreamEnd::Yield,
-            };
+            let end = self
+                .stream_messages(&namespace, &tx, shutdown.clone(), &status, &connected)
+                .await;
             let connected = connected.load(Ordering::SeqCst);
             // A wait the server asked for (a 429's `Retry-After`), instead of the backoff.
             let mut server_wait: Option<Duration> = None;
 
             match end {
                 StreamEnd::Shutdown => break,
-                StreamEnd::Yield => {
-                    self.log.info(&format!(
-                        "the desktop app's embedded broker started on this machine; closing \
-                         namespace={namespace} server={} and leaving it to the app",
+                StreamEnd::Conflict(reason) => {
+                    // Terminal: a second broker must be observably rejected, not
+                    // silently retry forever (hostclient.go's errSubscribeConflict).
+                    self.log.error(&format!(
+                        "SSE subscription rejected; another listener owns namespace {namespace} server={} — not retrying: {reason}",
                         self.server_label()
                     ));
-                    // The top of the loop stands by (or, if the app is already gone again,
-                    // asks at once).
-                    down_logged = false;
-                    backoff = self.initial_backoff;
-                    continue;
-                }
-                StreamEnd::Conflict(reason) => {
-                    match self.conflict_grace(started) {
-                        // The embedded broker, inside its grace: on an older server the
-                        // daemon on this machine may hold the type for a moment after
-                        // this app took the lock. Retry on the backoff.
-                        Grace::Retry => {
-                            let line = format!(
-                                "namespace {namespace} server={} is held by another stream; \
-                                 on an older server that is the shed-host-agent daemon on \
-                                 this machine, which lets go within seconds of this app \
-                                 taking its lock, so retrying backoff={backoff:?}: {reason}",
-                                self.server_label()
-                            );
-                            if grace_said {
-                                self.log.debug(&line);
-                            } else {
-                                self.log.info(&line);
-                                grace_said = true;
-                            }
-                            set_state(&status, ConnState::Reconnecting, Some(&reason));
-                            down_logged = false;
-                        }
-                        // The embedded broker before it holds the lock: the daemon does
-                        // not know to let go, so this is the old terminal refusal — until
-                        // the lock is taken, when the daemon will let go: then retry at
-                        // once, the grace counting from that moment.
-                        Grace::WaitForLock(mut held) => {
-                            self.log.error(&format!(
-                                "SSE subscription rejected; another listener owns namespace {namespace} server={} — \
-                                 not retrying until this app holds its lock: {reason}",
-                                self.server_label()
-                            ));
-                            set_state(&status, ConnState::Rejected, Some(&reason));
-                            tokio::select! {
-                                _ = wait_shutdown(shutdown.clone()) => {
-                                    terminal_state = ConnState::Rejected;
-                                    terminal_cause = Some(reason);
-                                    break;
-                                }
-                                held_now = async { held.wait_for(|h| h.is_some()).await.is_ok() } => {
-                                    if !held_now {
-                                        // The holder is gone (the broker is stopping).
-                                        wait_shutdown(shutdown.clone()).await;
-                                        terminal_state = ConnState::Rejected;
-                                        terminal_cause = Some(reason);
-                                        break;
-                                    }
-                                }
-                            }
-                            set_state(&status, ConnState::Reconnecting, Some(&reason));
-                            backoff = self.initial_backoff;
-                            down_logged = false;
-                            continue;
-                        }
-                        // Terminal: a second broker must be observably rejected, not
-                        // silently retry forever (hostclient.go's errSubscribeConflict).
-                        Grace::None => {
-                            self.log.error(&format!(
-                                "SSE subscription rejected; another listener owns namespace {namespace} server={} — not retrying: {reason}",
-                                self.server_label()
-                            ));
-                            terminal_state = ConnState::Rejected;
-                            terminal_cause = Some(reason);
-                            break;
-                        }
-                    }
+                    terminal_state = ConnState::Rejected;
+                    terminal_cause = Some(reason);
+                    break;
                 }
                 StreamEnd::NotSource { reason, source } => {
                     // Not terminal and not a credential problem: no invalidate (a
@@ -1366,19 +1120,13 @@ impl BusClient {
                     wake.borrow_and_update();
                 }
                 // Back off — the backoff as it stands NOW, after any reset above — but
-                // wake immediately on shutdown, retry at once (from the floor) on a
-                // `retry_now`, and stand by at once when the desktop app's embedded broker
-                // appears (the top of the loop does; when it is gone again, the
-                // subscribe is at once, from the floor, not after the rest of this sleep).
+                // wake immediately on shutdown, and retry at once (from the floor) on a
+                // `retry_now`.
                 None => {
                     tokio::select! {
                         _ = wait_shutdown(shutdown.clone()) => break,
                         _ = tokio::time::sleep(backoff) => {}
                         _ = woken(&mut wake) => {
-                            backoff = self.initial_backoff;
-                            continue;
-                        }
-                        _ = self.embedded_appears() => {
                             backoff = self.initial_backoff;
                             continue;
                         }
@@ -1389,100 +1137,6 @@ impl BusClient {
         }
         set_state(&status, terminal_state, terminal_cause.as_deref());
         // Dropping `tx` here closes the receiver, ending the responder loop.
-    }
-
-    /// Stand by while the desktop app's embedded broker runs: state `yielding`, a look
-    /// every [`PRESENCE_CHECK_INTERVAL`], nothing subscribed. Returns `true` once it is
-    /// gone, `false` on shutdown. Said once at INFO on entering and once on leaving.
-    async fn stand_by(
-        &self,
-        namespace: &str,
-        shutdown: &watch::Receiver<bool>,
-        status: &Arc<Mutex<SubStatus>>,
-        down_logged: &mut bool,
-    ) -> bool {
-        self.log.info(&format!(
-            "the desktop app's embedded broker is running on this machine; standing by \
-             namespace={namespace} server={} (the app answers; this daemon takes over when it quits)",
-            self.server_label()
-        ));
-        set_state(status, ConnState::Yielding, Some(YIELDING_REASON));
-        if let Some(p) = &self.presence {
-            let mut p = p.clone();
-            tokio::select! {
-                _ = wait_shutdown(shutdown.clone()) => return false,
-                gone = async { p.wait_for(|v| !v.present).await.is_ok() } => {
-                    if !gone {
-                        // The watcher is gone (the daemon is stopping): stay put.
-                        wait_shutdown(shutdown.clone()).await;
-                        return false;
-                    }
-                }
-            }
-        }
-        self.log.info(&format!(
-            "the desktop app's embedded broker is gone; taking over namespace={namespace} server={}",
-            self.server_label()
-        ));
-        set_state(status, ConnState::Reconnecting, None);
-        *down_logged = false;
-        true
-    }
-
-    /// Resolve once the watcher says the desktop app's embedded broker runs (at once if
-    /// it says so now); never without a presence channel, or once the watcher is gone.
-    async fn embedded_appears(&self) {
-        let Some(p) = &self.presence else {
-            return std::future::pending().await;
-        };
-        let mut p = p.clone();
-        if p.wait_for(|v| v.present).await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
-
-    /// Resolve with the yield epoch once it has moved past `seen` (the desktop app's
-    /// embedded broker started); never without a presence channel, or once the watcher is
-    /// gone.
-    async fn next_yield(&self, seen: u64) -> u64 {
-        let Some(p) = &self.presence else {
-            return std::future::pending().await;
-        };
-        let mut p = p.clone();
-        let epoch = p.wait_for(|v| v.epoch != seen).await.map(|v| v.epoch);
-        match epoch {
-            Ok(epoch) => epoch,
-            Err(_) => std::future::pending().await,
-        }
-    }
-
-    /// [`Self::embedded_appears`], or the yield epoch moving past `epoch` (the app started
-    /// and may have quit again before this looked): what ends a stream of that epoch.
-    async fn embedded_appears_since(&self, epoch: u64) {
-        let Some(p) = &self.presence else {
-            return std::future::pending().await;
-        };
-        let mut p = p.clone();
-        if p.wait_for(|v| v.present || v.epoch != epoch).await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
-
-    /// What a terminal-looking `409` means for this client ([`Self::with_presence_lock`]).
-    fn conflict_grace(&self, started: tokio::time::Instant) -> Grace {
-        let Some(lock) = &self.presence_lock else {
-            return Grace::None;
-        };
-        let held_at = *lock.borrow();
-        match held_at {
-            None => Grace::WaitForLock(lock.clone()),
-            Some(at)
-                if tokio::time::Instant::now() < at.max(started) + OLD_SERVER_CONFLICT_GRACE =>
-            {
-                Grace::Retry
-            }
-            Some(_) => Grace::None,
-        }
     }
 
     /// Loud-on-the-down-transition, quiet-while-down logging (mirrors
@@ -1505,8 +1159,7 @@ impl BusClient {
     async fn stream_messages(
         &self,
         namespace: &str,
-        tx: &mpsc::Sender<Received>,
-        epoch: u64,
+        tx: &mpsc::Sender<Envelope>,
         shutdown: watch::Receiver<bool>,
         status: &Arc<Mutex<SubStatus>>,
         connected: &AtomicBool,
@@ -1518,7 +1171,7 @@ impl BusClient {
                 _ = wait_shutdown(shutdown.clone()) => return StreamEnd::Shutdown,
                 t = self.bearer() => t,
             };
-            let _ = (tx, epoch);
+            let _ = tx;
             return sim
                 .subscribe(self, namespace, &shutdown, status, connected)
                 .await;
@@ -1652,7 +1305,7 @@ impl BusClient {
                                 // stalled consumer (full channel) can't pin teardown.
                                 let sent = tokio::select! {
                                     _ = wait_shutdown(shutdown.clone()) => return StreamEnd::Shutdown,
-                                    r = tx.send(Received { env, epoch }) => r,
+                                    r = tx.send(env) => r,
                                 };
                                 if sent.is_err() {
                                     // The consumer dropped the receiver (shutdown).
@@ -1708,11 +1361,7 @@ impl BusClient {
         // the answer is re-sent a bounded number of times, inside the deadline. Every
         // other non-204 — 403 (a stale or unmatched answer, or not the source) and 413
         // (too large) among them — is final.
-        // The yield epoch this answer belongs to: its handler's, or now.
-        let mut ctx = RespondCtx {
-            epoch: self.handler_epoch.unwrap_or_else(|| self.yield_epoch()),
-            ..RespondCtx::default()
-        };
+        let mut ctx = RespondCtx::default();
         let mut retries = 0u32;
         loop {
             let resp = match self.respond_attempt(&url, &body, shutdown, &mut ctx).await {
@@ -1724,7 +1373,6 @@ impl BusClient {
                         unanswered: ctx.unanswered,
                         not_sent: ctx.not_sent,
                         last_refusal: ctx.last_refusal.take(),
-                        maybe_delivered: ctx.maybe_delivered,
                     })
                 }
             };
@@ -1742,7 +1390,6 @@ impl BusClient {
                 unanswered: false,
                 not_sent: None,
                 last_refusal: None,
-                maybe_delivered: ctx.maybe_delivered,
             };
             // Eligibility is decided AFTER the body read, against what is left of the
             // deadline then: a retry is started only if, after its wait, a whole attempt
@@ -1879,30 +1526,12 @@ impl BusClient {
         if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
         }
-        // Immediately before the send, two checks, each of which means nothing is sent:
-        //
-        // 1. The desktop app's embedded broker took over this request type on this
-        //    machine (the daemon's watcher says so) while the request was being handled,
-        //    or did at any moment since the handler started (the yield epoch moved on,
-        //    even if the app has quit again since): the request belongs to whoever
-        //    answered after that yield (the server re-delivers it to the app's stream,
-        //    and, if it is still pending, to this daemon's next one), so this answer is
-        //    never posted, as a first send or a re-send. Only a POST already on the wire
-        //    can still overlap.
-        if self.embedded_present() || self.yielded_since(ctx.epoch) {
-            ctx.not_sent = Some(NotSent::LeftForApp);
-            return Err(BusError::Transport(
-                "sending response: not sent; the desktop app's embedded broker on this \
-                 machine took over this request type"
-                    .into(),
-            ));
-        }
         let now = tokio::time::Instant::now();
         let attempt = self.respond_attempt_timeout;
-        // 2. Every send but the first must have a whole attempt left before the deadline
-        //    (credential work, a 401's re-mint, a lost pooled connection or a retry wait
-        //    may have used up the room): one the deadline would cut short could say
-        //    nothing about the answer.
+        // Immediately before the send: every send but the first must have a whole attempt
+        // left before the deadline (credential work, a 401's re-mint, a lost pooled
+        // connection or a retry wait may have used up the room): one the deadline would
+        // cut short could say nothing about the answer, so it is not sent.
         if let Some(deadline) = ctx.deadline {
             if deadline.saturating_duration_since(now) < attempt {
                 ctx.not_sent = Some(NotSent::NoRoom);
@@ -1925,7 +1554,6 @@ impl BusClient {
             r = tokio::time::timeout_at(attempt_ends, req.send()) => match r {
                 Err(_) => {
                     ctx.unanswered = true;
-                    ctx.maybe_delivered = true;
                     Err(if attempt_ends < deadline {
                         BusError::Transport(format!(
                             "sending response: not answered within {attempt:?}"
@@ -1938,16 +1566,10 @@ impl BusClient {
                 // that respond()'s classifier (and any human reading the log)
                 // needs — it sits down the source() chain.
                 Ok(r) => r.map_err(|e| {
-                    let flat = shed_core::authfail::flatten(&e);
-                    // A failure that may come after the request was written could have
-                    // reached the shed; a lost pooled connection (nothing written) or a
-                    // refused credential (the server read nothing) could not.
-                    if !shed_core::authfail::is_connection_lost_message(&flat)
-                        && !shed_core::authfail::is_auth_shaped_message(&flat)
-                    {
-                        ctx.maybe_delivered = true;
-                    }
-                    BusError::Transport(format!("sending response: {flat}"))
+                    BusError::Transport(format!(
+                        "sending response: {}",
+                        shed_core::authfail::flatten(&e)
+                    ))
                 }),
             }
         }
@@ -2089,29 +1711,10 @@ impl BusClient {
     }
 }
 
-/// An inbound request as the subscribe loop hands it on: with the yield epoch of the
-/// stream it came on ([`BusClient::with_presence`]).
-pub(crate) struct Received {
-    env: Envelope,
-    epoch: u64,
-}
-
-/// The inbound side of a [`Subscription`].
-pub struct EnvelopeRx {
-    rx: mpsc::Receiver<Received>,
-}
-
-impl EnvelopeRx {
-    /// The next inbound envelope; `None` once the subscription has ended.
-    pub async fn recv(&mut self) -> Option<Envelope> {
-        self.rx.recv().await.map(|r| r.env)
-    }
-}
-
 /// A live namespace subscription: `rx` yields inbound envelopes; `status()` reports
 /// the connection state. Dropping it aborts the loop.
 pub struct Subscription {
-    pub rx: EnvelopeRx,
+    pub rx: mpsc::Receiver<Envelope>,
     status: Arc<Mutex<SubStatus>>,
     handle: JoinHandle<()>,
 }
@@ -2157,14 +1760,6 @@ async fn woken(wake: &mut watch::Receiver<u64>) {
 /// The per-call state of one [`BusClient::respond`].
 #[derive(Default)]
 struct RespondCtx {
-    /// The yield epoch this answer belongs to ([`BusClient::with_presence`]): once the
-    /// watcher's has moved past it, nothing more is sent.
-    epoch: u64,
-    /// A POST of this answer went out and what it came to was not the shed server's own
-    /// refusal (no answer in time, a failure after the request may have been written, a
-    /// refusal that is not the API's own body): it may have reached the shed. Never
-    /// cleared within a respond.
-    maybe_delivered: bool,
     /// The respond's budget ([`RESPOND_RETRY_BUDGET`]) from the moment the first POST is
     /// sent; `None` until then. Every later step — a refusal body read, a retry wait, a credential fetch, a
     /// send — must finish by it; past it the respond stops (and is audited).
@@ -2186,12 +1781,8 @@ struct RespondCtx {
 
 impl RespondCtx {
     /// The server answered the last POST `status` with `code` (`None` unless the body was
-    /// its own, read whole): remembered for the audit, and, unless it is the server's own
-    /// refusal, the POST may have been delivered.
+    /// its own, read whole): remembered for the audit.
     fn saw_refusal(&mut self, status: u16, code: Option<String>) {
-        if code.is_none() {
-            self.maybe_delivered = true;
-        }
         self.last_refusal = Some(SeenRefusal { status, code });
     }
 }
@@ -2199,9 +1790,6 @@ impl RespondCtx {
 /// Why a respond's send was not made ([`BusClient::send_respond`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotSent {
-    /// The desktop app's embedded broker took over the request type on this machine
-    /// (it runs now, or started since the handler did).
-    LeftForApp,
     /// Less than a whole attempt was left of the respond's deadline.
     NoRoom,
 }
@@ -2229,8 +1817,6 @@ struct RespondFailure {
     not_sent: Option<NotSent>,
     /// With `not_sent`: the server's last refusal of this answer before it, if any.
     last_refusal: Option<SeenRefusal>,
-    /// An earlier POST of this answer may have reached the shed ([`RespondCtx`]).
-    maybe_delivered: bool,
 }
 
 impl From<BusError> for RespondFailure {
@@ -2241,7 +1827,6 @@ impl From<BusError> for RespondFailure {
             unanswered: false,
             not_sent: None,
             last_refusal: None,
-            maybe_delivered: false,
         }
     }
 }
@@ -2610,9 +2195,7 @@ pub fn spawn_server_group(
     ) {
         Ok(c) => c
             .with_server_name(target.name.clone())
-            .with_machine(deps.machine.clone())
-            .with_presence(deps.embedded_presence.clone())
-            .with_presence_lock(deps.presence_lock.clone()),
+            .with_machine(deps.machine.clone()),
         Err(e) => {
             log.error(&format!(
                 "message bus disabled server={} url={}: {e}",
@@ -2774,79 +2357,20 @@ async fn serve_namespace(
     handlers: Arc<BusHandlers>,
     log: Arc<dyn BusLog>,
 ) {
-    // A request taken off the channel while a handler ran (the drain below) that is still
-    // current: dealt with next, ahead of the channel.
-    let mut next: Option<Received> = None;
-    // The yield epoch whose queue has been drained.
-    let mut drained = client.yield_epoch();
     loop {
-        let got = match next.take() {
-            Some(got) => got,
-            None => tokio::select! {
-                _ = wait_shutdown(shutdown.clone()) => break,
-                e = sub.rx.rx.recv() => match e {
-                    Some(got) => got,
-                    None => break, // sender dropped: shutdown or terminal 409
-                },
+        let env = tokio::select! {
+            _ = wait_shutdown(shutdown.clone()) => break,
+            e = sub.rx.recv() => match e {
+                Some(env) => env,
+                None => break, // sender dropped: shutdown or terminal 409
             },
         };
-        // The desktop app's embedded broker took over this request type on this machine
-        // (the daemon's watcher says so), or did since the request was received (its yield
-        // epoch has been passed, even if the app has quit again since): the request is
-        // left to whoever answered after that yield, unanswered here. It stays pending on
-        // the server until it is answered: the registry hands a listener its user's
-        // un-answered requests for the namespace that were delivered to the SAME machine
-        // at the SAME binding generation (`internal/plugin/registry.go`,
-        // `pendingForLocked`), and the app presents this machine's id (the two share
-        // `machine.json`). If the app quit without answering it, this daemon's next
-        // stream (opened under the new epoch) is that listener, and gets it again,
-        // stamped current: nothing is lost.
-        if client.embedded_present() || client.yielded_since(got.epoch) {
-            leave_to_app(&client, namespace, &got.env, &log);
-            continue;
-        }
-        // The handler answers through a copy that knows its epoch. While it runs, a start
-        // of the app drains what is queued at that moment (each left as above), so no
-        // request received before the yield waits behind the handler to be looked at.
-        let handler_client = client.for_handler(got.epoch);
-        let dispatch =
-            dispatch_bus_message(&handler_client, namespace, &got.env, &shutdown, &handlers);
-        tokio::pin!(dispatch);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut dispatch => break,
-                epoch = client.next_yield(drained), if next.is_none() => {
-                    drained = epoch;
-                    while next.is_none() {
-                        match sub.rx.rx.try_recv() {
-                            Ok(r) if client.yielded_since(r.epoch) || client.embedded_present() => {
-                                leave_to_app(&client, namespace, &r.env, &log)
-                            }
-                            // Received after the yield (a newer stream): kept, in order.
-                            Ok(r) => next = Some(r),
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
-        }
+        dispatch_bus_message(&client, namespace, &env, &shutdown, &handlers).await;
     }
     let s = sub.status();
     log.info(&format!(
         "message bus stopped namespace={} state={:?} last_error={}",
         s.namespace, s.state, s.last_error
-    ));
-}
-
-/// Say that `env` is left to the desktop app's embedded broker (not handled here).
-fn leave_to_app(client: &BusClient, namespace: &str, env: &Envelope, log: &Arc<dyn BusLog>) {
-    log.info(&format!(
-        "leaving request_id={} namespace={namespace} server={} to the desktop app's \
-         embedded broker on this machine (it took over this request type; the server \
-         delivers the request again to the next stream of this machine)",
-        env.id,
-        client.server_label()
     ));
 }
 
@@ -2986,20 +2510,12 @@ async fn respond_and_audit(
     let mut resp = Envelope::new_response(&env.id, namespace, payload);
     resp.shed = env.shed.clone(); // route the reply back (resp.Shed = req.Shed)
     let delivered = client.respond_detailed(namespace, &resp, shutdown).await;
-    match &delivered {
-        Err(f) if f.not_sent == Some(NotSent::LeftForApp) => client.log.info(&format!(
-            "not sending {what} request_id={} namespace={namespace} server={}: the desktop \
-             app's embedded broker on this machine took over this request type, and the \
-             server re-delivers the request to it",
-            env.id,
-            client.server_label(),
-        )),
-        Err(f) => client.log.warn(&format!(
+    if let Err(f) = &delivered {
+        client.log.warn(&format!(
             "failed to send {what} namespace={namespace} server={}: {}",
             client.server_label(),
             f.err
-        )),
-        Ok(()) => {}
+        ));
     }
     // Audit after responding — the durable log + desktop fan-out. An answer the shed
     // server ITSELF refused (its own error body, read whole) never reached the shed, so
@@ -3010,53 +2526,11 @@ async fn respond_and_audit(
     // does a POST that got no answer within its wait. Any other transport failure is
     // left as is: the answer may well have been delivered.
     //
-    // An answer not sent because the desktop app's embedded broker took over is
-    // `undelivered` when no POST of it was made, or every one made was refused by the
-    // server itself (this answer never reached the shed), with its own reason: the app
-    // answers the re-delivered request. When an earlier POST of it may have reached the
-    // shed (no answer in time, a failure after the request may have been written, a
-    // refusal that is not the server's own), only the retry was left to the app: the
-    // result is kept and delivery is unknown. One that could not be sent again in time is
-    // recorded by the last thing known about it: the server's earlier refusal (as that
-    // refusal would be), or, with none, delivery unknown (an earlier POST may have been
-    // delivered).
+    // One that could not be sent again in time is recorded by the last thing known about
+    // it: the server's earlier refusal (as that refusal would be), or, with none, delivery
+    // unknown (an earlier POST may have been delivered).
     if let Some(mut entry) = audit_entry {
         match &delivered {
-            Err(RespondFailure {
-                not_sent: Some(NotSent::LeftForApp),
-                maybe_delivered: true,
-                last_refusal,
-                ..
-            }) => {
-                let earlier = match last_refusal {
-                    Some(r) => format!("was answered with status {}", r.status),
-                    None => "got no definite answer".to_string(),
-                };
-                append_reason(
-                    &mut entry,
-                    format!(
-                        "an earlier send of the response {earlier}; delivery unknown; the \
-                         retry was not sent: {AUDIT_NOTE_LEFT_FOR_APP} (its embedded broker on \
-                         this machine took over this request type; the server re-delivers the \
-                         request to it if it is still pending)"
-                    ),
-                );
-            }
-            Err(RespondFailure {
-                not_sent: Some(NotSent::LeftForApp),
-                ..
-            }) => {
-                let was =
-                    std::mem::replace(&mut entry.result, AUDIT_RESULT_UNDELIVERED.to_string());
-                append_reason(
-                    &mut entry,
-                    format!(
-                        "result {was}, but not sent: {AUDIT_NOTE_LEFT_FOR_APP} (its embedded \
-                         broker on this machine took over this request type; the server \
-                         re-delivers the request to it)"
-                    ),
-                );
-            }
             Err(RespondFailure {
                 err: BusError::BadStatus(status, _),
                 server_code,
@@ -6178,7 +5652,7 @@ pub(crate) mod tests {
     #[test]
     fn golden_ssh_payload_shapes() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/ssh_payload_shapes.json");
+            .join("../../tests/broker-wire/fixtures/ssh_payload_shapes.json");
         let data = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let fx: serde_json::Value = serde_json::from_str(&data).unwrap();
@@ -6707,7 +6181,7 @@ pub(crate) mod tests {
         let gate = CountingGate::new(true);
         let backend = RecordingBackend::signing();
         let key = b64(&fixed_ed25519_pub());
-        let declined = sign_env(&key, &b64(b"shed-host-agent challenge"), 0);
+        let declined = sign_env(&key, &b64(b"broker challenge"), 0);
         let (payload, _) = run_sign(&declined, &SignPolicy::default(), &gate, &backend).await;
         assert_eq!(payload["code"], "SIGN_FAILED");
         assert_eq!(gate.calls(), 0);
@@ -10457,45 +9931,12 @@ pub(crate) mod tests {
         );
     }
 
-    // ---- the daemon stands by while the desktop app's broker runs (plan 035 §3.4) ------
-
-    /// The daemon's presence channel, set by hand (what the lock watcher publishes: each
-    /// start of the app moves the yield epoch on).
-    struct FakePresence {
-        tx: watch::Sender<Presence>,
-    }
-
-    impl FakePresence {
-        fn new(on: bool) -> Arc<FakePresence> {
-            Arc::new(FakePresence {
-                tx: watch::channel(Presence::default().next(on)).0,
-            })
-        }
-        fn set(&self, on: bool) {
-            self.tx.send_modify(|v| *v = v.next(on));
-        }
-        fn epoch(&self) -> u64 {
-            self.tx.borrow().epoch
-        }
-        fn rx(&self) -> watch::Receiver<Presence> {
-            self.tx.subscribe()
-        }
-    }
-
     /// One subscribe a [`SimBus`] saw.
     #[derive(Clone, Debug)]
     struct SimEvent {
         at: tokio::time::Instant,
         who: String,
-        ns: String,
-        /// It reached the server (not a refused connect).
-        reached: bool,
-        /// It holds the namespace now (not refused as a duplicate).
-        ok: bool,
     }
-
-    /// A [`SimBus`] hook, given the accepted client's name.
-    type OnAccept = Arc<dyn Fn(&str) + Send + Sync>;
 
     #[derive(Default)]
     struct SimState {
@@ -10504,9 +9945,6 @@ pub(crate) mod tests {
         holders: HashMap<String, (u64, String)>,
         next: u64,
         events: Vec<SimEvent>,
-        /// Run when a subscribe is accepted, before it is answered (the hook a race
-        /// cell uses to act in the instant after a subscribe got through).
-        on_accept: Option<OnAccept>,
         /// A 0.9.x server: a subscribe for a held namespace is the TERMINAL
         /// `409 NAMESPACE_ALREADY_REGISTERED`, not the retryable duplicate.
         old_server: bool,
@@ -10517,7 +9955,7 @@ pub(crate) mod tests {
     /// is still fetched as for a real request). One live stream per namespace; another
     /// is `409 SOURCE_DUPLICATE_STREAM`. While it is down every connect is refused at once
     /// and every stream has ended. On the paused clock a test runs minutes of retries
-    /// with the real backoff and presence constants in milliseconds.
+    /// with the real backoff constants in milliseconds.
     pub(super) struct SimBus {
         state: Mutex<SimState>,
         /// Bumped when streams may have ended.
@@ -10577,10 +10015,6 @@ pub(crate) mod tests {
             self.state.lock().unwrap().old_server = true;
         }
 
-        fn on_accept(&self, f: impl Fn(&str) + Send + Sync + 'static) {
-            self.state.lock().unwrap().on_accept = Some(Arc::new(f));
-        }
-
         fn holder(&self, ns: &str) -> Option<String> {
             self.state
                 .lock()
@@ -10613,15 +10047,12 @@ pub(crate) mod tests {
             let who = sim_name(client);
             // Watched from the moment it is accepted, so no drop is missed.
             let mut changed = self.changed.subscribe();
-            let (id, hook) = {
+            let id = {
                 let mut s = self.state.lock().unwrap();
                 if s.down {
                     s.events.push(SimEvent {
                         at: tokio::time::Instant::now(),
                         who: who.clone(),
-                        ns: ns.to_string(),
-                        reached: false,
-                        ok: false,
                     });
                     return StreamEnd::Transport("connecting: connection refused".into());
                 }
@@ -10636,9 +10067,6 @@ pub(crate) mod tests {
                 s.events.push(SimEvent {
                     at: tokio::time::Instant::now(),
                     who: who.clone(),
-                    ns: ns.to_string(),
-                    reached: true,
-                    ok: !held,
                 });
                 if held && s.old_server {
                     return StreamEnd::Conflict(format!(
@@ -10647,11 +10075,8 @@ pub(crate) mod tests {
                          has an active listener\"}}}}"
                     ));
                 }
-                (id, s.on_accept.clone().filter(|_| !held))
+                id
             };
-            if let Some(hook) = hook {
-                hook(&who);
-            }
             let Some(id) = id else {
                 return StreamEnd::Duplicate(format!(
                     "another process with this machine's id already holds namespace {ns} on \
@@ -10660,7 +10085,7 @@ pub(crate) mod tests {
             };
             connected.store(true, Ordering::SeqCst);
             set_state(status, ConnState::Connected, None);
-            // Dropped (the presence watch won the race, or shutdown): the stream ends,
+            // Dropped (shutdown, or the subscription aborted): the stream ends,
             // so its namespace is free again — as the server's handler unregisters it
             // when the connection closes.
             struct Release<'a>(&'a SimBus, &'a str, u64);
@@ -10704,294 +10129,6 @@ pub(crate) mod tests {
         (tx, subs)
     }
 
-    fn assert_yielding(subs: &[Subscription], ctx: &str) {
-        for s in subs {
-            let st = s.status();
-            assert_eq!(st.state, ConnState::Yielding, "{ctx}: {st:?}");
-            assert_eq!(st.last_error, YIELDING_REASON, "{ctx}");
-        }
-    }
-
-    /// With the desktop app's broker already running when the daemon starts, the daemon
-    /// never subscribes — not once, across server outages of a few seconds and of many
-    /// minutes and drops with the server up — and says it is yielding. The app holds
-    /// every type throughout.
-    #[tokio::test(start_paused = true)]
-    async fn present_before_the_first_subscribe_means_no_subscribe_ever() {
-        let bus = SimBus::new();
-        let start = tokio::time::Instant::now();
-        let p = FakePresence::new(true);
-        let (_app_tx, _app_subs) = subscribe_all(&bus.client("app"));
-        let daemon = bus.client("daemon").with_presence(Some(p.rx()));
-        let (_d_tx, d_subs) = subscribe_all(&daemon);
-        run_for(Duration::from_secs(10)).await;
-        assert_yielding(&d_subs, "at start");
-
-        for (down, up) in [
-            (Duration::from_secs(3), Duration::from_secs(40)),
-            (Duration::from_secs(10 * 60), Duration::from_secs(90)),
-        ] {
-            bus.go_down();
-            run_for(down).await;
-            bus.come_up();
-            run_for(up).await;
-            bus.drop_streams();
-            run_for(Duration::from_secs(60)).await;
-        }
-        assert!(
-            bus.attempts("daemon", start).is_empty(),
-            "the daemon never asked: {:?}",
-            bus.attempts("daemon", start)
-        );
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("app"), "{ns}");
-        }
-        assert_yielding(&d_subs, "at the end");
-    }
-
-    /// The daemon holds every type; then the app starts — it takes the lock, then
-    /// subscribes, and is refused as a duplicate, because the daemon's watcher has not
-    /// looked since. At the watcher's next look (at most one interval later) the daemon
-    /// closes every stream it holds AT ONCE, and the app's next retry holds each type;
-    /// the daemon then stands by and never asks again while the app runs.
-    #[tokio::test(start_paused = true)]
-    async fn a_held_stream_is_closed_at_the_next_look_and_the_app_takes_the_type() {
-        let bus = SimBus::new();
-        let p = FakePresence::new(false);
-        let daemon = bus.client("daemon").with_presence(Some(p.rx()));
-        let (_d_tx, d_subs) = subscribe_all(&daemon);
-        run_for(Duration::from_secs(95)).await;
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("daemon"));
-        }
-
-        // The app starts: lock first, then its subscribes (refused: the daemon holds,
-        // its watcher not having looked yet).
-        let t0 = tokio::time::Instant::now();
-        let (_app_tx, _app_subs) = subscribe_all(&bus.client("app"));
-        run_for(Duration::from_millis(1)).await;
-        assert!(
-            bus.attempts("app", t0).iter().all(|e| !e.ok),
-            "refused while the daemon held"
-        );
-        // The watcher's next look, at most an interval later.
-        run_for(PRESENCE_CHECK_INTERVAL - Duration::from_millis(2)).await;
-        p.set(true);
-        run_for(Duration::from_millis(1)).await;
-        for ns in PIN_NS {
-            assert_ne!(
-                bus.holder(ns).as_deref(),
-                Some("daemon"),
-                "{ns}: closed at once on the look"
-            );
-        }
-        // The app's retries: 1 s, then 2 s after that.
-        run_for(Duration::from_secs(3)).await;
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("app"), "{ns}");
-        }
-        assert_yielding(&d_subs, "after the app took over");
-        let after = tokio::time::Instant::now();
-        run_for(Duration::from_secs(10 * 60)).await;
-        assert!(
-            bus.attempts("daemon", after).is_empty(),
-            "{:?}",
-            bus.attempts("daemon", after)
-        );
-    }
-
-    /// The race the lock leaves: the watcher looked (no app), then the app takes the lock
-    /// and the daemon's subscribe gets through in the same instant, so the daemon holds
-    /// the type and the app is refused as a duplicate. At the watcher's next look the
-    /// daemon closes its stream at once, and the app's next retry wins.
-    #[tokio::test(start_paused = true)]
-    async fn the_look_then_subscribe_race_resolves_at_the_next_look() {
-        let bus = SimBus::new();
-        let p = FakePresence::new(false);
-        // The instant the daemon's subscribes have got through, the app takes its lock
-        // (which the watcher sees only at its next look).
-        let locked_at = Arc::new(Mutex::new(None));
-        {
-            let locked_at = locked_at.clone();
-            let accepted = std::sync::atomic::AtomicUsize::new(0);
-            bus.on_accept(move |who| {
-                if who == "daemon" && accepted.fetch_add(1, Ordering::SeqCst) + 1 == PIN_NS.len() {
-                    *locked_at.lock().unwrap() = Some(tokio::time::Instant::now());
-                }
-            });
-        }
-        let daemon = bus.client("daemon").with_presence(Some(p.rx()));
-        let (_d_tx, d_subs) = subscribe_all(&daemon);
-        run_for(Duration::from_millis(1)).await;
-        assert!(locked_at.lock().unwrap().is_some());
-        let t0 = tokio::time::Instant::now();
-        for ns in PIN_NS {
-            assert_eq!(
-                bus.holder(ns).as_deref(),
-                Some("daemon"),
-                "the daemon got in"
-            );
-        }
-        let (_app_tx, _app_subs) = subscribe_all(&bus.client("app"));
-        run_for(Duration::from_millis(1)).await;
-        assert!(bus.attempts("app", t0).iter().all(|e| e.reached && !e.ok));
-        run_for(PRESENCE_CHECK_INTERVAL - Duration::from_millis(3)).await;
-        p.set(true); // the watcher's next look
-        run_for(Duration::from_millis(1)).await;
-        for ns in PIN_NS {
-            assert_ne!(bus.holder(ns).as_deref(), Some("daemon"), "{ns}");
-        }
-        run_for(Duration::from_secs(3)).await;
-        for ns in PIN_NS {
-            assert_eq!(
-                bus.holder(ns).as_deref(),
-                Some("app"),
-                "{ns}: the app's retry won"
-            );
-        }
-        assert_yielding(&d_subs, "after the race");
-    }
-
-    /// The app quits (the lock is released): the daemon subscribes within one check
-    /// interval, from the backoff floor — though it had backed off to the ceiling while
-    /// the server was away before the app started — so a drop right after it connected
-    /// is retried a second later, not thirty.
-    #[tokio::test(start_paused = true)]
-    async fn released_means_subscribe_at_once_with_a_fresh_backoff() {
-        let bus = SimBus::new();
-        let p = FakePresence::new(false);
-        bus.go_down();
-        let daemon = bus.client("daemon").with_presence(Some(p.rx()));
-        let (_d_tx, d_subs) = subscribe_all(&daemon);
-        // Down for two minutes: the backoff grows to its ceiling.
-        run_for(Duration::from_secs(120)).await;
-        p.set(true);
-        bus.come_up();
-        // The daemon's next attempt (within the ceiling) looks first and stands by.
-        run_for(MAX_BACKOFF + Duration::from_secs(1)).await;
-        assert_yielding(&d_subs, "while the app runs");
-        let quiet_since = tokio::time::Instant::now();
-        run_for(Duration::from_secs(60)).await;
-        assert!(bus.attempts("daemon", quiet_since).is_empty());
-
-        p.set(false);
-        let quit = tokio::time::Instant::now();
-        run_for(PRESENCE_CHECK_INTERVAL + Duration::from_millis(1)).await;
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("daemon"), "{ns}");
-        }
-        for s in &d_subs {
-            assert_eq!(s.status().state, ConnState::Connected);
-        }
-        let first = bus.attempts("daemon", quit);
-        assert!(
-            first
-                .iter()
-                .all(|e| e.at - quit <= PRESENCE_CHECK_INTERVAL && e.ok),
-            "{first:?}"
-        );
-
-        // A drop right away: the retry waits the floor, not the ceiling.
-        bus.drop_streams();
-        let dropped = tokio::time::Instant::now();
-        run_for(INITIAL_BACKOFF + Duration::from_millis(1)).await;
-        let again = bus.attempts("daemon", dropped);
-        let mut asked: Vec<&str> = again.iter().map(|e| e.ns.as_str()).collect();
-        asked.sort_unstable();
-        assert_eq!(asked, ["docker-credentials", "ssh-agent"], "{again:?}");
-        assert!(again.iter().all(|e| e.at - dropped <= INITIAL_BACKOFF));
-    }
-
-    /// Without a presence check (the embedded broker, every other host and test) the
-    /// client never asks one, and holds a type whatever another process's check would say.
-    #[tokio::test(start_paused = true)]
-    async fn a_client_without_the_option_never_checks() {
-        assert!(
-            open_client("http://x").presence.is_none(),
-            "the default is none"
-        );
-        let bus = SimBus::new();
-        let app = bus.client("app").with_presence(None);
-        let (_tx, subs) = subscribe_all(&app);
-        run_for(Duration::from_secs(60)).await;
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("app"));
-        }
-        for s in &subs {
-            assert_eq!(s.status().state, ConnState::Connected);
-        }
-    }
-
-    /// The daemon's wiring: `spawn_server_group` hands `SharedDeps.embedded_presence` to
-    /// the bus client, so with it set and saying present the group's subscriptions stand
-    /// by without asking the server anything; with it unset the group connects, whatever
-    /// that channel says.
-    #[tokio::test]
-    async fn the_group_takes_its_presence_check_from_the_shared_deps() {
-        let srv = ScriptedServer::spawn(vec![], Answer(200, vec![], sse_one("x"))).await;
-        let p = FakePresence::new(true);
-        let deps = |presence: Option<watch::Receiver<Presence>>| crate::supervisor::SharedDeps {
-            ssh_backend: empty_backend(),
-            ssh_gate: approve_gate(),
-            ssh_sign_policy: Arc::new(SignPolicy::default()),
-            aws: None,
-            docker: None,
-            audit: Arc::new(CollectingAudit::default()),
-            minter: None,
-            log: silent_log(),
-            machine: Some(identity("laptop")),
-            embedded_presence: presence,
-            presence_lock: None,
-        };
-        let target = crate::discovery::ServerTarget {
-            name: String::new(),
-            url: srv.url(),
-            token: String::new(),
-            tls_fingerprint: String::new(),
-            ssh_host: String::new(),
-            ssh_port: 0,
-            auth_mode: String::new(),
-            user: String::new(),
-            identity_file: String::new(),
-        };
-
-        let (tx, rx) = shutdown_pair();
-        let g = spawn_server_group(rx, &target, &deps(Some(p.rx())));
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        for s in &g.statuses {
-            assert_eq!(s.lock().unwrap().state, ConnState::Yielding);
-        }
-        assert!(
-            srv.seen().iter().all(|r| !r.path.contains("/api/plugins/")),
-            "nothing subscribed: {:?}",
-            srv.seen()
-                .iter()
-                .map(|r| r.path.clone())
-                .collect::<Vec<_>>()
-        );
-        let _ = tx.send(true);
-        let _ = g.done.await;
-
-        let (tx, rx) = shutdown_pair();
-        let g = spawn_server_group(rx, &target, &deps(None));
-        let subscribe = "/api/plugins/listeners/ssh-agent/messages";
-        let mut subscribed = false;
-        for _ in 0..100 {
-            if srv.seen().iter().any(|r| r.path == subscribe) {
-                subscribed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(subscribed, "the unset group subscribes");
-        assert!(
-            p.rx().borrow().present,
-            "though the channel it was not given says present"
-        );
-        let _ = tx.send(true);
-        let _ = g.done.await;
-    }
-
     /// The static path of a group that does not mint (plan 037 A8): an entry that names
     /// an `identity_file` never sends its stored `credentials_token` — not on the bus and
     /// not on the egress stream; the same entry without one sends it on both, as before.
@@ -11014,8 +10151,6 @@ pub(crate) mod tests {
                 minter: None,
                 log: silent_log(),
                 machine: Some(identity("laptop")),
-                embedded_presence: None,
-                presence_lock: None,
             };
             let target = crate::discovery::ServerTarget {
                 name: "s".into(),
@@ -11082,140 +10217,12 @@ pub(crate) mod tests {
         );
     }
 
-    // ---- the backoff sleeps watch the lock (review item 4) ------------------------------
+    // ---- an older server's terminal 409 ------------------------------------------------
 
-    /// The review's sequence: the daemon is in a 30 s backoff sleep (the server was away)
-    /// when the app starts at second 1 and runs until second 10. The daemon reads
-    /// `yielding` from the moment the watcher says so, not after the sleep; and the
-    /// moment the app is gone it subscribes, from the floor, not at second 30.
+    /// An older server's 409 (another stream holds the type) stops a client at the first
+    /// answer.
     #[tokio::test(start_paused = true)]
-    async fn a_backoff_sleep_yields_at_once_and_takes_over_at_once() {
-        let bus = SimBus::new();
-        let p = FakePresence::new(false);
-        bus.go_down();
-        let daemon = bus.client("daemon").with_presence(Some(p.rx()));
-        let (_tx, subs) = subscribe_all(&daemon);
-        // Down long enough that the backoff is at its ceiling, then just past an attempt:
-        // the daemon is now at the start of a 30 s sleep.
-        run_for(Duration::from_secs(120)).await;
-        let last = bus
-            .attempts("daemon", tokio::time::Instant::now() - MAX_BACKOFF)
-            .last()
-            .map(|e| e.at)
-            .expect("attempts while down");
-        // Just past the next attempt: a whole 30 s sleep lies ahead.
-        let next = last + MAX_BACKOFF;
-        run_for(next - tokio::time::Instant::now() + Duration::from_millis(1)).await;
-        assert_eq!(
-            bus.attempts("daemon", next).len(),
-            PIN_NS.len(),
-            "an attempt per type at the ceiling"
-        );
-        let sleep_ends = next + MAX_BACKOFF;
-        bus.come_up();
-        run_for(Duration::from_secs(1)).await;
-        p.set(true); // the app starts
-        run_for(Duration::from_millis(1)).await;
-        assert_yielding(&subs, "while the app runs, in the middle of the sleep");
-        run_for(Duration::from_secs(9)).await;
-        assert!(
-            tokio::time::Instant::now() < sleep_ends,
-            "still inside the old sleep"
-        );
-        let quit = tokio::time::Instant::now();
-        p.set(false); // the app quits
-        run_for(Duration::from_millis(1)).await;
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("daemon"), "{ns}: at once");
-        }
-        let got = bus.attempts("daemon", quit);
-        assert!(
-            got.iter().all(|e| e.at - quit <= Duration::from_millis(1)),
-            "{got:?}"
-        );
-        for s in &subs {
-            assert_eq!(s.status().state, ConnState::Connected);
-        }
-    }
-
-    // ---- an older server's terminal 409 during the handoff (review item 5) --------------
-
-    /// On a 0.9.x server the daemon holds the type; the app has taken the lock and
-    /// subscribes before the daemon's next look, and is answered the TERMINAL 409. The
-    /// embedded broker (holding the lock) retries on its backoff inside the grace, and
-    /// holds the type once the daemon's stream is gone.
-    #[tokio::test(start_paused = true)]
-    async fn the_embedded_broker_retries_an_older_servers_409_inside_the_grace() {
-        let bus = SimBus::new();
-        bus.old_server();
-        let p = FakePresence::new(false);
-        let daemon = bus.client("daemon").with_presence(Some(p.rx()));
-        let (_d_tx, d_subs) = subscribe_all(&daemon);
-        run_for(Duration::from_secs(5)).await;
-        let (_lock_tx, held) = watch::channel(Some(tokio::time::Instant::now()));
-        let app = bus.client("app").with_presence_lock(Some(held));
-        let t0 = tokio::time::Instant::now();
-        let (_a_tx, a_subs) = subscribe_all(&app);
-        run_for(Duration::from_millis(1)).await;
-        assert!(bus.attempts("app", t0).iter().all(|e| e.reached && !e.ok));
-        for s in &a_subs {
-            assert_eq!(s.status().state, ConnState::Reconnecting, "not terminal");
-        }
-        // The daemon's next look (two seconds on).
-        run_for(PRESENCE_CHECK_INTERVAL).await;
-        p.set(true);
-        run_for(Duration::from_secs(4)).await;
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("app"), "{ns}");
-        }
-        for s in &a_subs {
-            assert_eq!(s.status().state, ConnState::Connected);
-        }
-        assert_yielding(&d_subs, "the daemon stood by");
-    }
-
-    /// Past the grace the older server's 409 is terminal again, as before: an app whose
-    /// lock was taken long ago, against another stream that never lets go, stops after
-    /// the grace and asks no more.
-    #[tokio::test(start_paused = true)]
-    async fn past_the_grace_an_older_servers_409_is_terminal() {
-        let bus = SimBus::new();
-        bus.old_server();
-        let other = bus.client("other-machine");
-        let (_o_tx, _o_subs) = subscribe_all(&other);
-        run_for(Duration::from_millis(1)).await;
-        let (_lock_tx, held) = watch::channel(Some(tokio::time::Instant::now()));
-        let app = bus.client("app").with_presence_lock(Some(held));
-        let t0 = tokio::time::Instant::now();
-        let (_a_tx, a_subs) = subscribe_all(&app);
-        run_for(OLD_SERVER_CONFLICT_GRACE + MAX_BACKOFF).await;
-        for s in &a_subs {
-            assert_eq!(
-                s.status().state,
-                ConnState::Rejected,
-                "terminal past the grace"
-            );
-        }
-        let tried = bus.attempts("app", t0);
-        assert!(
-            tried.iter().filter(|e| e.ns == "ssh-agent").count() > 1,
-            "retried inside the grace: {tried:?}"
-        );
-        assert!(
-            tried
-                .iter()
-                .all(|e| e.at - t0 < OLD_SERVER_CONFLICT_GRACE + Duration::from_secs(1)),
-            "nothing after the grace: {tried:?}"
-        );
-        let after = tokio::time::Instant::now();
-        run_for(Duration::from_secs(10 * 60)).await;
-        assert!(bus.attempts("app", after).is_empty());
-    }
-
-    /// A client without the option (the daemon, every other host) is unchanged: an older
-    /// server's 409 stops it at the first answer.
-    #[tokio::test(start_paused = true)]
-    async fn without_the_presence_lock_an_older_servers_409_is_terminal_at_once() {
+    async fn an_older_servers_409_is_terminal_at_once() {
         let bus = SimBus::new();
         bus.old_server();
         let (_o_tx, _o_subs) = subscribe_all(&bus.client("other"));
@@ -11227,208 +10234,6 @@ pub(crate) mod tests {
             assert_eq!(s.status().state, ConnState::Rejected);
         }
         assert_eq!(bus.attempts("plain", t0).len(), PIN_NS.len(), "one each");
-    }
-
-    /// The embedded broker started without the lock (it could not take it within its
-    /// wait) is refused by an older server: rejected, until it takes the lock, when the
-    /// daemon lets go — then it retries at once and, inside the grace counted from the
-    /// lock, holds the type.
-    #[tokio::test(start_paused = true)]
-    async fn an_older_servers_409_before_the_lock_is_retried_once_it_is_taken() {
-        let bus = SimBus::new();
-        bus.old_server();
-        let p = FakePresence::new(false);
-        let daemon = bus.client("daemon").with_presence(Some(p.rx()));
-        let (_d_tx, _d_subs) = subscribe_all(&daemon);
-        run_for(Duration::from_millis(1)).await;
-        let (lock_tx, held) = watch::channel(None);
-        let app = bus.client("app").with_presence_lock(Some(held));
-        let (_a_tx, a_subs) = subscribe_all(&app);
-        run_for(Duration::from_secs(60)).await;
-        for s in &a_subs {
-            assert_eq!(s.status().state, ConnState::Rejected, "no lock: as before");
-        }
-        // The lock is taken a minute in; the daemon sees it at its next look.
-        lock_tx.send_replace(Some(tokio::time::Instant::now()));
-        run_for(PRESENCE_CHECK_INTERVAL).await;
-        p.set(true);
-        run_for(Duration::from_secs(8)).await;
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("app"), "{ns}");
-        }
-    }
-
-    // ---- the daemon stops answering when it yields (review item 3) ----------------------
-
-    /// A subscription fed by hand: what `serve_namespace` drains.
-    fn fed_subscription() -> (mpsc::Sender<Received>, Subscription) {
-        let (tx, rx) = mpsc::channel(ENVELOPE_CHANNEL_CAP);
-        let status = Arc::new(Mutex::new(SubStatus {
-            namespace: "ssh-agent".into(),
-            state: ConnState::Connected,
-            last_error: String::new(),
-            since: String::new(),
-            active_source: None,
-        }));
-        let handle = tokio::spawn(async {});
-        (
-            tx,
-            Subscription {
-                rx: EnvelopeRx { rx },
-                status,
-                handle,
-            },
-        )
-    }
-
-    /// `env` as a stream of yield epoch `epoch` hands it on.
-    fn on_stream(env: Envelope, epoch: u64) -> Received {
-        Received { env, epoch }
-    }
-
-    fn list_request_id(id: &str) -> Envelope {
-        let mut env = list_request();
-        env.id = id.into();
-        env
-    }
-
-    fn respond_posts(srv: &ScriptedServer) -> usize {
-        srv.seen()
-            .iter()
-            .filter(|r| r.method == "POST" && r.path.ends_with("/respond"))
-            .count()
-    }
-
-    /// Requests received but not started when the app takes over are left to it: no
-    /// handler runs (no audit) and nothing is posted. Once the lock is released, a new
-    /// request is answered as usual.
-    #[tokio::test]
-    async fn queued_requests_are_left_to_the_app_and_answering_resumes_after_it() {
-        let srv = ScriptedServer::spawn(vec![], Answer(204, vec![], String::new())).await;
-        let p = FakePresence::new(true);
-        let client = open_client(&srv.url()).with_presence(Some(p.rx()));
-        let audit = Arc::new(CollectingAudit::default());
-        let handlers = Arc::new(test_handlers(
-            approve_gate(),
-            audit.clone(),
-            empty_backend(),
-        ));
-        let (tx, sub) = fed_subscription();
-        let (stop_tx, stop_rx) = shutdown_pair();
-        let serve = tokio::spawn(serve_namespace(
-            client,
-            sub,
-            "ssh-agent",
-            stop_rx,
-            handlers,
-            silent_log(),
-        ));
-        for i in 0..3 {
-            tx.send(on_stream(
-                list_request_id(&format!("queued-{i}")),
-                p.epoch(),
-            ))
-            .await
-            .unwrap();
-        }
-        // All three taken off the channel (each is dealt with before the next is taken).
-        while tx.capacity() < ENVELOPE_CHANNEL_CAP {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        // Serialised behind the three: once this one is answered, they were dealt with.
-        p.set(false);
-        tx.send(on_stream(list_request_id("after"), p.epoch()))
-            .await
-            .unwrap();
-        for _ in 0..100 {
-            if respond_posts(&srv) >= 1 && !audit.entries.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(respond_posts(&srv), 1, "only the request after the release");
-        assert_eq!(
-            audit.entries.lock().unwrap().len(),
-            1,
-            "no handler ran for the others"
-        );
-        let _ = stop_tx.send(true);
-        let _ = serve.await;
-    }
-
-    /// A gate that holds its answer until told, saying when it has been asked.
-    struct HeldGate {
-        asked: tokio::sync::Notify,
-        release: tokio::sync::Notify,
-    }
-    #[async_trait::async_trait]
-    impl ApprovalGate for HeldGate {
-        async fn approve(
-            &self,
-            _ns: &str,
-            _op: &str,
-            _server: &str,
-            _shed: &str,
-            _detail: &str,
-        ) -> crate::approval::ApprovalOutcome {
-            self.asked.notify_one();
-            self.release.notified().await;
-            crate::approval::ApprovalOutcome {
-                approved: true,
-                decided_by: "user".into(),
-                scope: None,
-                ttl: None,
-                reason: String::new(),
-            }
-        }
-        fn method(&self) -> &str {
-            "shed-desktop"
-        }
-    }
-
-    /// A handler already running when the app takes over (here waiting on the approval)
-    /// finishes, posts nothing, and writes one audit entry saying the request was left
-    /// for the desktop app (`undelivered`, the operation's own result in the reason).
-    #[tokio::test]
-    async fn a_handler_that_finishes_after_the_app_took_over_posts_nothing() {
-        let srv = ScriptedServer::spawn(vec![], Answer(204, vec![], String::new())).await;
-        let p = FakePresence::new(false);
-        let client = open_client(&srv.url()).with_presence(Some(p.rx()));
-        let pub_bytes = fixed_ed25519_pub();
-        let backend: Arc<dyn SshBackend> = Arc::new(StubBackend {
-            pubkey: pub_bytes.clone(),
-            result: Ok(SshSignature {
-                format: "ssh-ed25519".to_string(),
-                blob: vec![0x11; 64],
-            }),
-        });
-        let gate = Arc::new(HeldGate {
-            asked: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        });
-        let audit = Arc::new(CollectingAudit::default());
-        let handlers = test_handlers(gate.clone(), audit.clone(), backend);
-        let env = sign_env(&b64(&pub_bytes), &b64(&git_login()), 0);
-        let handler = tokio::spawn(async move {
-            handle_bus_message(&client, "ssh-agent", &env, &never_shutdown(), &handlers).await;
-        });
-        gate.asked.notified().await;
-        p.set(true); // the app takes over while the person is approving
-        gate.release.notify_one();
-        handler.await.unwrap();
-        assert_eq!(
-            respond_posts(&srv),
-            0,
-            "the daemon's answer is never posted"
-        );
-        let entries = audit.entries.lock().unwrap().clone();
-        assert_eq!(entries.len(), 1, "{entries:?}");
-        assert_eq!(entries[0].result, AUDIT_RESULT_UNDELIVERED, "{entries:?}");
-        assert!(
-            entries[0].reason.contains(AUDIT_NOTE_LEFT_FOR_APP)
-                && entries[0].reason.starts_with("result ok, but not sent"),
-            "{entries:?}"
-        );
     }
 
     // ---- every send but the first needs a whole attempt (review item 7) -----------------
@@ -11558,278 +10363,5 @@ pub(crate) mod tests {
                 .contains("status 503 RESPONSE_NOT_DELIVERED"),
             "{entries:?}"
         );
-    }
-    // ---- a yield is permanent for the daemon's old work (third review, item 3) ---------
-
-    /// Wait (real clock, 5 s at most) until `cond` holds.
-    async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
-        for _ in 0..250 {
-            if cond() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("never happened: {what}");
-    }
-
-    fn audit_entries(audit: &CollectingAudit) -> Vec<AuditEntry> {
-        audit.entries.lock().unwrap().clone()
-    }
-
-    /// The review's sequence: the daemon's answer is answered `503` with `Retry-After`
-    /// (the server's own refusal: it wrote nothing); during the wait the app starts and
-    /// quits again, the presence channel reading absent before and after (the start was
-    /// never seen as `present` by the respond). The old answer is never re-sent, and the
-    /// audit says it was left for the desktop app (`undelivered`: the one POST made was
-    /// refused by the server itself).
-    #[tokio::test]
-    async fn an_answer_held_back_by_a_503_is_not_resent_after_the_app_came_and_went() {
-        let srv = ScriptedServer::spawn(
-            vec![Answer(
-                503,
-                vec![("Retry-After", "1".into())],
-                api_error("RESPONSE_NOT_DELIVERED"),
-            )],
-            Answer(204, vec![], String::new()),
-        )
-        .await;
-        let p = FakePresence::new(false);
-        let client = open_client(&srv.url())
-            .with_presence(Some(p.rx()))
-            .with_test_respond_timing(Duration::from_millis(800), Duration::from_secs(5));
-        let audit = Arc::new(CollectingAudit::default());
-        let handlers = test_handlers(approve_gate(), audit.clone(), empty_backend());
-        let handler = tokio::spawn(async move {
-            handle_bus_message(
-                &client,
-                "ssh-agent",
-                &list_request(),
-                &never_shutdown(),
-                &handlers,
-            )
-            .await;
-        });
-        eventually("the first POST", || respond_posts(&srv) == 1).await;
-        // Inside the 1 s wait: the app starts and quits again.
-        p.set(true);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        p.set(false);
-        handler.await.unwrap();
-        assert_eq!(respond_posts(&srv), 1, "the old answer is never re-sent");
-        let entries = audit_entries(&audit);
-        assert_eq!(entries.len(), 1, "{entries:?}");
-        assert_eq!(entries[0].result, AUDIT_RESULT_UNDELIVERED, "{entries:?}");
-        assert!(
-            entries[0].reason.contains("but not sent: ")
-                && entries[0].reason.contains(AUDIT_NOTE_LEFT_FOR_APP)
-                && !entries[0].reason.contains("delivery unknown"),
-            "{entries:?}"
-        );
-    }
-
-    /// The same, but the first POST's refusal is not the server's own (a proxy's `503`,
-    /// which can follow an answer that WAS delivered): that POST may have reached the
-    /// shed, so the entry keeps the result and says delivery unknown, and that only the
-    /// retry was left for the desktop app.
-    #[tokio::test]
-    async fn a_retry_left_for_the_app_after_a_proxy_refusal_is_delivery_unknown() {
-        let srv = ScriptedServer::spawn(
-            vec![Answer(
-                503,
-                vec![("Retry-After", "1".into())],
-                "<html>bad gateway</html>".into(),
-            )],
-            Answer(204, vec![], String::new()),
-        )
-        .await;
-        let p = FakePresence::new(false);
-        let client = open_client(&srv.url())
-            .with_presence(Some(p.rx()))
-            .with_test_respond_timing(Duration::from_millis(800), Duration::from_secs(5));
-        let audit = Arc::new(CollectingAudit::default());
-        let handlers = test_handlers(approve_gate(), audit.clone(), empty_backend());
-        let handler = tokio::spawn(async move {
-            handle_bus_message(
-                &client,
-                "ssh-agent",
-                &list_request(),
-                &never_shutdown(),
-                &handlers,
-            )
-            .await;
-        });
-        eventually("the first POST", || respond_posts(&srv) == 1).await;
-        p.set(true); // the app takes over during the wait (and stays)
-        handler.await.unwrap();
-        assert_eq!(respond_posts(&srv), 1, "the retry is not sent");
-        let entries = audit_entries(&audit);
-        assert_eq!(entries.len(), 1, "{entries:?}");
-        assert_ne!(entries[0].result, AUDIT_RESULT_UNDELIVERED, "{entries:?}");
-        let reason = &entries[0].reason;
-        assert!(
-            reason.contains("an earlier send of the response was answered with status 503")
-                && reason.contains("delivery unknown")
-                && reason.contains(&format!("retry was not sent: {AUDIT_NOTE_LEFT_FOR_APP}")),
-            "{entries:?}"
-        );
-    }
-
-    /// A request received before a yield, queued behind a handler, is not handled once
-    /// the app has come and gone: it is dropped from the queue when the app starts (while
-    /// the handler still runs), and the handler's own answer is not posted. The same
-    /// request delivered again on the daemon's new stream (the server re-delivers what is
-    /// pending) IS handled and answered.
-    #[tokio::test]
-    async fn a_request_queued_before_a_yield_is_left_and_its_redelivery_is_answered() {
-        let srv = ScriptedServer::spawn(vec![], Answer(204, vec![], String::new())).await;
-        let p = FakePresence::new(false);
-        let client = open_client(&srv.url()).with_presence(Some(p.rx()));
-        let pub_bytes = fixed_ed25519_pub();
-        let backend: Arc<dyn SshBackend> = Arc::new(StubBackend {
-            pubkey: pub_bytes.clone(),
-            result: Ok(SshSignature {
-                format: "ssh-ed25519".to_string(),
-                blob: vec![0x11; 64],
-            }),
-        });
-        let gate = Arc::new(HeldGate {
-            asked: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        });
-        let audit = Arc::new(CollectingAudit::default());
-        let handlers = Arc::new(test_handlers(gate.clone(), audit.clone(), backend));
-        let (tx, sub) = fed_subscription();
-        let (stop_tx, stop_rx) = shutdown_pair();
-        let serve = tokio::spawn(serve_namespace(
-            client,
-            sub,
-            "ssh-agent",
-            stop_rx,
-            handlers,
-            silent_log(),
-        ));
-        let old = p.epoch();
-        let mut sign = sign_env(&b64(&pub_bytes), &b64(&git_login()), 0);
-        sign.id = "running".into();
-        tx.send(on_stream(sign, old)).await.unwrap();
-        gate.asked.notified().await;
-        tx.send(on_stream(list_request_id("queued"), old))
-            .await
-            .unwrap();
-        // The app starts and quits again while the person is approving.
-        p.set(true);
-        p.set(false);
-        eventually(
-            "the queue drained at the yield, the handler still running",
-            || tx.capacity() == ENVELOPE_CHANNEL_CAP,
-        )
-        .await;
-        gate.release.notify_one();
-        eventually("the running handler's audit", || {
-            !audit_entries(&audit).is_empty()
-        })
-        .await;
-        // The daemon's new stream: the server delivers the still-pending request again.
-        tx.send(on_stream(list_request_id("queued"), p.epoch()))
-            .await
-            .unwrap();
-        eventually("the re-delivered request answered", || {
-            respond_posts(&srv) == 1 && audit_entries(&audit).len() == 2
-        })
-        .await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(respond_posts(&srv), 1, "only the re-delivered request");
-        let entries = audit_entries(&audit);
-        assert_eq!(entries.len(), 2, "the old copy ran no handler: {entries:?}");
-        assert_eq!(entries[0].result, AUDIT_RESULT_UNDELIVERED, "{entries:?}");
-        assert!(
-            entries[0].reason.contains(AUDIT_NOTE_LEFT_FOR_APP),
-            "{entries:?}"
-        );
-        assert_ne!(entries[1].result, AUDIT_RESULT_UNDELIVERED, "{entries:?}");
-        let _ = stop_tx.send(true);
-        let _ = serve.await;
-    }
-
-    /// Presence that never changes leaves everything as before: a `503` retry is sent, and
-    /// a request queued behind it is handled and answered.
-    #[tokio::test]
-    async fn presence_that_never_changes_leaves_retries_and_the_queue_alone() {
-        let srv = ScriptedServer::spawn(
-            vec![Answer(
-                503,
-                vec![("Retry-After", "1".into())],
-                api_error("RESPONSE_NOT_DELIVERED"),
-            )],
-            Answer(204, vec![], String::new()),
-        )
-        .await;
-        let p = FakePresence::new(false);
-        let client = open_client(&srv.url())
-            .with_presence(Some(p.rx()))
-            .with_test_respond_timing(Duration::from_millis(800), Duration::from_secs(5));
-        let audit = Arc::new(CollectingAudit::default());
-        let handlers = Arc::new(test_handlers(
-            approve_gate(),
-            audit.clone(),
-            empty_backend(),
-        ));
-        let (tx, sub) = fed_subscription();
-        let (stop_tx, stop_rx) = shutdown_pair();
-        let serve = tokio::spawn(serve_namespace(
-            client,
-            sub,
-            "ssh-agent",
-            stop_rx,
-            handlers,
-            silent_log(),
-        ));
-        tx.send(on_stream(list_request_id("first"), p.epoch()))
-            .await
-            .unwrap();
-        eventually("the first POST", || respond_posts(&srv) == 1).await;
-        tx.send(on_stream(list_request_id("second"), p.epoch()))
-            .await
-            .unwrap();
-        eventually("both answered", || {
-            respond_posts(&srv) == 3 && audit_entries(&audit).len() == 2
-        })
-        .await;
-        for e in audit_entries(&audit) {
-            assert_ne!(e.result, AUDIT_RESULT_UNDELIVERED, "{e:?}");
-            assert!(!e.reason.contains(AUDIT_NOTE_LEFT_FOR_APP), "{e:?}");
-        }
-        assert_eq!(p.epoch(), 0);
-        let _ = stop_tx.send(true);
-        let _ = serve.await;
-    }
-
-    /// A stream opened before the app started and quit again, both between two looks at
-    /// the channel (`present` never seen), is closed and opened again under the new epoch:
-    /// only a new stream is delivered again what is pending on the server.
-    #[tokio::test(start_paused = true)]
-    async fn a_stream_from_before_a_start_and_quit_is_opened_again() {
-        let bus = SimBus::new();
-        let p = FakePresence::new(false);
-        let daemon = bus.client("daemon").with_presence(Some(p.rx()));
-        let (_d_tx, _d_subs) = subscribe_all(&daemon);
-        run_for(Duration::from_secs(5)).await;
-        let t0 = tokio::time::Instant::now();
-        for ns in PIN_NS {
-            assert_eq!(bus.holder(ns).as_deref(), Some("daemon"));
-        }
-        // Started and gone again before the subscription task runs.
-        p.set(true);
-        p.set(false);
-        run_for(Duration::from_secs(5)).await;
-        for ns in PIN_NS {
-            let opened = bus
-                .attempts("daemon", t0)
-                .iter()
-                .filter(|e| e.ns == ns && e.ok)
-                .count();
-            assert_eq!(opened, 1, "{ns}: one new stream");
-            assert_eq!(bus.holder(ns).as_deref(), Some("daemon"), "{ns}");
-        }
     }
 }

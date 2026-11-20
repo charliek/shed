@@ -37,11 +37,11 @@ Claude Code, `/plugin marketplace add charliek/shed` then `/plugin install shed@
 
 ## Architecture
 
-Three binaries:
+Two binaries and a desktop app:
 
 - **`shed`** — the CLI on your developer machine.
 - **`shed-server`** — the daemon on each host (HTTP API + SSH server) that runs VMs via the VZ (macOS) or Firecracker (Linux) backend.
-- **`shed-host-agent`** — optional host-side credential broker (built in-tree from `crates/shed-host-agent`); on macOS it pairs with the [shed-desktop](https://charliek.github.io/shed/desktop/) approval app (in this monorepo under `desktop/`, with its shared Rust client core under `crates/`).
+- **shed desktop app** — the credential broker on your machine (macOS and Linux), with the approval prompts: the [shed-desktop](https://charliek.github.io/shed/desktop/) app, in this monorepo under `desktop/` with its shared Rust client core under `crates/`. It ships separately from these binaries.
 
 ```text
 Developer Machine                Remote Server / Local Mac

@@ -144,7 +144,7 @@ mounts:
 env_file: /root/.shed/env
 
 # Extensions provide credential brokering from host to VM.
-# Requires shed-host-agent to be installed and running.
+# Credentials are brokered by the shed desktop app, which must be running on your machine.
 # extensions:
 #   enabled:
 #     - ssh-agent

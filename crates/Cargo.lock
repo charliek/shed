@@ -3004,6 +3004,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "shed-broker-harness"
+version = "0.9.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shed-app",
+ "shed-broker",
+ "shed-core",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "shed-core"
 version = "0.9.0"
 dependencies = [
@@ -3038,20 +3051,6 @@ dependencies = [
  "shed-core",
  "shed-craze",
  "thiserror 1.0.69",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "shed-host-agent"
-version = "0.9.0"
-dependencies = [
- "async-trait",
- "serde",
- "serde_json",
- "shed-broker",
- "shed-core",
- "tempfile",
  "tokio",
  "uuid",
 ]

@@ -45,15 +45,6 @@ pub enum ShedError {
     Create(String),
     #[error("{0}")]
     Config(String),
-    /// The host-side credential broker must be upgraded before this server is
-    /// usable — the one mint failure whose remedy is a user ACTION rather than
-    /// waiting or debugging, so it is a typed case instead of a `Config` string:
-    /// presentation layers branch on it (banner leads with the remedy, `detail`
-    /// demoted to tooltip/log) and the empty state stops blaming config.yaml
-    /// (shed#300). The Display keeps the remedy FIRST so even a string-only
-    /// consumer truncates the context, never the action.
-    #[error("upgrade shed-host-agent — it is too old to obtain a client certificate for {server} ({detail})")]
-    AgentUpgradeRequired { server: String, detail: String },
 }
 
 /// Why a credential-source call (`GET /api/sources`, `POST /api/sources/use`) did not
@@ -268,8 +259,8 @@ impl Resolution {
 /// The error a REFUSED request reports when a mint failure is what left it
 /// unable to authenticate.
 ///
-/// The mint error leads (it is the actionable half — "upgrade
-/// shed-host-agent", "the SSH bootstrap is unreachable"), with the refusal
+/// The mint error leads (it is the actionable half — "the broker
+/// cannot mint a certificate", "the SSH bootstrap is unreachable"), with the refusal
 /// itself as context so the reader can still see WHAT the server said: an HTTP
 /// status, or the flattened TLS alert of a handshake-level refusal. Leading
 /// with the mint message is load-bearing, not cosmetic: banners truncate from
@@ -286,10 +277,6 @@ fn refused_because(outcome: &Result<reqwest::Response, ShedError>, mint: ShedErr
     match mint {
         ShedError::Config(m) => ShedError::Config(describe(m)),
         ShedError::Transport(m) => ShedError::Transport(describe(m)),
-        ShedError::AgentUpgradeRequired { server, detail } => ShedError::AgentUpgradeRequired {
-            server,
-            detail: format!("{detail}; request refused: {refusal}"),
-        },
         other => ShedError::Transport(describe(other.to_string())),
     }
 }
@@ -298,7 +285,7 @@ fn refused_because(outcome: &Result<reqwest::Response, ShedError>, mint: ShedErr
 /// request unauthenticated. The wire error keeps its identity (it is what
 /// actually happened on the socket); the mint error rides along as context,
 /// because an unclassified handshake refusal plus "credential setup failed:
-/// upgrade shed-host-agent" is diagnosable where either alone is not. Only for
+/// the broker cannot mint a certificate" is diagnosable where either alone is not. Only for
 /// `Err` outcomes — never for an HTTP status (see the call site's comment).
 fn with_mint_context(wire: &ShedError, mint: &ShedError) -> ShedError {
     // A `Transport` keeps its inner message rather than its `Display` so the
@@ -627,8 +614,8 @@ impl Client {
     ///     plan 037 A25).
     ///
     /// That last case used to `.ok()`-discard the error, which is why an mtls
-    /// server answered by a host-agent too old to mint a certificate reported a
-    /// bare 401 instead of "upgrade shed-host-agent". Raising it here instead
+    /// server answered by a broker too old to mint a certificate reported a
+    /// bare 401 instead of saying so. Raising it here instead
     /// would be the opposite bug: shed-app installs the shared minter on EVERY
     /// server (`shed-app/src/backend.rs`), including `auth.mode: open` ones,
     /// where the mint fails because there is no credential to issue and the
@@ -688,16 +675,16 @@ impl Client {
     /// inside the [`Resolution`], not raised (see [`Self::credential`]).
     async fn bounded_credential(&self, bound: Duration) -> Result<Resolution, ShedError> {
         // The message names the stage that stalled: this timeout fires when the
-        // MINTER (shed-host-agent on desktop; the SSH bootstrap elsewhere) sat on
+        // MINTER (the credential broker on desktop; the SSH bootstrap elsewhere) sat on
         // the resolution past the request bound, and "credential resolution" alone
         // read as a generic transport stall (shed#297) — pointing the operator at
-        // the network instead of the agent.
+        // the network instead of the broker.
         tokio::time::timeout(bound, self.credential())
             .await
             .map_err(|_| {
                 ShedError::Transport(
                     "credential resolution timed out; the credential minter \
-                     (shed-host-agent on desktop) did not answer in time"
+                     (the credential broker on desktop) did not answer in time"
                         .into(),
                 )
             })
@@ -810,7 +797,7 @@ impl Client {
     ///
     /// In every one of those skips the reported error is the mint failure when
     /// there is one — the freshest one, i.e. the re-mint's over the one carried
-    /// in — and the plain refusal otherwise. "The host-agent cannot mint a
+    /// in — and the plain refusal otherwise. "The broker cannot mint a
     /// replacement" is the actionable half of "the server refused what we had",
     /// and Go says the same: `cmd/shed`'s `reauthenticated` returns a failed
     /// re-mint rather than the 401 that triggered it.
@@ -893,7 +880,7 @@ impl Client {
             // replacing the wire error's identity. A `BadStatus` (404/500) or a
             // healthy response keeps today's behavior — an open-mode server
             // answers fine while carrying a mint error, and an unrelated HTTP
-            // status must never be masked by a host-agent message.
+            // status must never be masked by a broker message.
             if let (Err(wire), None, Some(mint)) = (&outcome, &used, &mint_error) {
                 return Err(with_mint_context(wire, mint));
             }
@@ -2164,8 +2151,8 @@ mod tests {
     // Plan 002 C2(i): the resolution used to be `.ok()`-discarded, so a provider
     // that could not mint sent the request UNAUTHENTICATED and reported whatever
     // the server said back — a generic 401 or TLS alert. The one message worth
-    // reading ("this server issues certificates; upgrade shed-host-agent", "the
-    // SSH bootstrap is unreachable") was thrown away at the call site. Go has
+    // reading ("this server issues certificates; the broker cannot mint a certificate",
+    // "the SSH bootstrap is unreachable") was thrown away at the call site. Go has
     // said the actionable thing all along (`cmd/shed`'s `reauthenticated`
     // returns the failed re-mint unwrapped; `sdk`'s `setAuth` names what goes on
     // the wire); these pin the Rust half.
@@ -2178,12 +2165,13 @@ mod tests {
     // reports the mint failure.
 
     /// A minter that always fails with a fixed, recognisable message, counting
-    /// attempts. The message stands in for the real one an mtls server's
-    /// too-old host-agent produces.
+    /// attempts. The message stands in for the real one a broker that
+    /// cannot mint for an mtls server produces.
     struct CountingFailMinter {
         calls: AtomicUsize,
     }
-    const UPGRADE_MSG: &str = "this server issues client certificates; upgrade shed-host-agent";
+    const UPGRADE_MSG: &str =
+        "this server issues client certificates; the broker cannot mint a certificate";
     impl CountingFailMinter {
         fn new() -> Arc<Self> {
             Arc::new(Self {
@@ -2588,12 +2576,12 @@ mod tests {
         ));
         let e = refused_because(
             &outcome,
-            ShedError::Config("upgrade shed-host-agent".into()),
+            ShedError::Config("the broker cannot mint a certificate".into()),
         );
         let ShedError::Config(m) = e else {
             panic!("variant must be preserved");
         };
-        assert!(m.starts_with("upgrade shed-host-agent"), "{m}");
+        assert!(m.starts_with("the broker cannot mint a certificate"), "{m}");
         assert!(
             m.contains("(request refused: transport error: received fatal alert"),
             "{m}"
@@ -2601,34 +2589,15 @@ mod tests {
     }
 
     #[test]
-    fn refused_because_preserves_the_typed_upgrade_case() {
-        let outcome: Result<reqwest::Response, ShedError> =
-            Err(ShedError::Transport("tls alert".into()));
-        let e = refused_because(
-            &outcome,
-            ShedError::AgentUpgradeRequired {
-                server: "mini2".into(),
-                detail: "does not support `credential.get`".into(),
-            },
-        );
-        let ShedError::AgentUpgradeRequired { server, detail } = e else {
-            panic!("the typed case must survive the refusal wrap, got {e:?}");
-        };
-        assert_eq!(server, "mini2");
-        assert!(detail.starts_with("does not support"), "{detail}");
-        assert!(detail.contains("request refused"), "{detail}");
-    }
-
-    #[test]
     fn mint_context_keeps_the_wire_errors_identity() {
         let wire = ShedError::Transport("connection refused".into());
-        let mint = ShedError::Config("upgrade shed-host-agent".into());
+        let mint = ShedError::Config("the broker cannot mint a certificate".into());
         let ShedError::Transport(m) = with_mint_context(&wire, &mint) else {
             panic!("the wire error's variant must survive");
         };
         assert!(m.starts_with("connection refused"), "{m}");
         assert!(
-            m.contains("additionally, credential setup failed: upgrade"),
+            m.contains("additionally, credential setup failed: the broker cannot mint"),
             "{m}"
         );
     }
@@ -2638,7 +2607,7 @@ mod tests {
         // An open-mode 404 (or any non-auth status) must surface AS the status:
         // the carried mint error explains nothing about it (plan 006 D5's
         // narrowing — the blanket "mint error wins when nothing was presented"
-        // would have replaced this 404 with a host-agent message).
+        // would have replaced this 404 with a broker message).
         let server = MockServer::start_async().await;
         server
             .mock_async(|w, t| {
@@ -3247,8 +3216,8 @@ mod mtls_tests {
         }
     }
 
-    /// A [`CaMinter`] that can be switched to FAIL — the "the host-agent can no
-    /// longer mint" state (it was upgraded away, SSH is down) reached AFTER a
+    /// A [`CaMinter`] that can be switched to FAIL — the "the broker can no
+    /// longer mint" state (SSH is down) reached AFTER a
     /// certificate has already been enrolled and armed.
     struct FailAfterEnroll {
         inner: Arc<CaMinter>,
@@ -3888,7 +3857,7 @@ mod mtls_tests {
         get(&c).await.unwrap(); // enrolled as client-1, certificate armed
 
         // The clock moves past the certificate's expiry, so the next resolution
-        // MUST mint — and the host-agent can no longer mint one.
+        // MUST mint — and the broker can no longer mint one.
         clock.store(4_000_000_000, Ordering::SeqCst);
         minter.set_fail();
 
@@ -3944,7 +3913,7 @@ mod mtls_tests {
         get(&c).await.unwrap(); // enrolled as client-1, connection pooled
         let poisoned_pool = c.transport_id();
 
-        // The identity is revoked AND the host-agent can no longer mint.
+        // The identity is revoked AND the broker can no longer mint.
         srv.set_mode(ServerAuthMode::MtlsAllow(vec!["SHA256:client-2".into()]));
         minter.set_fail();
 

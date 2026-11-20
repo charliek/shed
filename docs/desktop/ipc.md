@@ -28,7 +28,7 @@ own, documented with them below.
 
 | op | params | result |
 |----|--------|--------|
-| `identify` | — | `socket_path`, `pid`, `core` (`rust`), `platform` (`tauri`), `test_mode`, `mock_base_url` (`null` outside test mode), `log_path` (the app's log file, `null` when file logging is off), `broker_mode` (`{effective, pref, restart_required}`) |
+| `identify` | — | `socket_path`, `pid`, `core` (`rust`), `platform` (`tauri`), `test_mode`, `mock_base_url` (`null` outside test mode), `log_path` (the app's log file, `null` when file logging is off) |
 | `sheds.list` | — | `{sheds, host_errors}` — a fresh query of every configured host |
 | `sheds.refresh` | — | `{sheds, host_errors}` — asks the dashboard to re-fetch, waits for it to render, and answers with the listing it committed |
 | `system.df` | — | `usage[]` (per-host `GET /api/system/df`: totals + image/shed/orphan disk entries) |
@@ -47,8 +47,7 @@ fails there.
 
 **Per-host failures.** A host whose sheds can't be listed is reported rather than dropped:
 `host_errors[]` carries `{server, kind, summary, detail}` per failed host, where `kind` is
-`agent_upgrade_required` (shed-host-agent is too old to obtain a certificate) or `other`,
-`summary` is the one-line remedy-first text, and `detail` is the hover/log body. It is always
+`other`, `summary` is the one-line text naming the host, and `detail` is the hover/log body. It is always
 present — `[]` when every host is healthy. The UI-truth op `dashboard.dump` returns
 `{rows, host_errors, empty}`: the rendered shed rows (each with the `status_text` and
 `controls` its card shows, [below](#ui-truth-ops)), the failures the shell holds, and the
@@ -112,7 +111,6 @@ guest binary and the hub are gone.)
 | op | params | result |
 |----|--------|--------|
 | `rc.list` | `host?`, `shed?` | `{sessions, capabilities, machines, shed_craze}` — `shed_craze` lists the unlisted sheds craze is offered on (below) |
-| `rc.launch` | `host?`, `shed`, `kind`, `display_name?`, `workdir?`, `permission_mode?`, `initial_prompt?` | the opened row — an **alias** for `roost.launch` on `roost:<host>/<shed>`, kept for 0.9.x, under the same launch rules (below) |
 | `rc.kill` | `host?`, `shed`, `slug` | `{}` — a roost `tab.close`; the slug IS the tab id, and must be one THIS host lists (ids are per-host, so one copied from elsewhere would close an unrelated tab) |
 | `machines.list` | — | `machines[]` — every configured machine's health, name-ordered, each with its `craze` source's state (below) |
 | `machine.kill` | `machine`, `slug` | `{}` (addressed by machine + slug, not host/shed). For a **craze row**, `slug` is the row's `tab_id` — its End tab closes the roost tab the session runs in; a craze row's own slug is its hostId, not a tab id |
@@ -120,7 +118,7 @@ guest binary and the hub are gone.)
 | `roost.probe` | `target` | `target`, `probe` (its `fingerprint` nested inside) and `plan` — a read-only look at a shed or machine's `roost-session` state. The plan matrix row comes back from here too, so a caller that needs only the row does not also have to call `roost.preview` |
 | `roost.preview` | `target` | the plan (Install/Update/Start/Report/nothing to do) plus the sentence naming where the bytes would come from |
 | `roost.bootstrap` | `target`, `fingerprint`, `consent: true` | installs/updates/starts `roost-session` on that target and wires its agent hooks; refuses without consent or against a stale fingerprint |
-| `roost.launch` | `target`, `kind`, `display_name?`, `workdir?`, `permission_mode?`, `initial_prompt?` | the opened row, plus `title` when a name was given (below). Generalizes `machine.launch` to any roost host (a shed or a machine); `machine.launch` (addressed by `machine` or `target`) stays as an alias |
+| `roost.launch` | `target`, `kind`, `display_name?`, `workdir?`, `permission_mode?`, `initial_prompt?` | the opened row, plus `title` when a name was given (below). Generalizes `machine.launch` to any roost host (a shed is `roost:<host>/<shed>`, a machine `machine:<name>`); `machine.launch` (addressed by `machine` or `target`) stays as an alias. The 0.9.x alias `rc.launch {shed}` was removed in 0.10.0 and answers `unknown_op` |
 | `roost.run` | `target` (or `machine`), `command`, `workdir?` | `{origin, machine, slug, cwd, argv}` — the tab it opened. **Run a command in a tab**: `command` split on ASCII whitespace into the argv, with **no shell and no quoting**; gated by no kind. `command` is required — absent, empty or whitespace-only is `bad_request` |
 
 `roost.probe`, `roost.preview`, `roost.bootstrap` and `roost.launch` are how the desktop
@@ -130,8 +128,7 @@ consent card, and the rollback promise are documented there, not here. Kicking o
 from roost's own command palette instead of the desktop app is [the `shed` roost
 provider](../extensions/roost-provider.md).
 
-**The launch rules** (`rc.launch`, `roost.launch`, `machine.launch`, and the app's own launch
-dialog). roost's `tab.open` is the agent binary plus a working directory, so:
+**The launch rules** (`roost.launch`, `machine.launch`, and the app's own launch dialog). roost's `tab.open` is the agent binary plus a working directory, so:
 
 - **`display_name` is the tab's title.** Once the tab is open, a non-blank name (trimmed) is
   set with roost's `tab.set_title`, which sticks: the agent's own terminal title no longer
@@ -555,17 +552,15 @@ These drive the credential-approval gate (see [Credential approvals](approvals.m
 | `prefs.provider_modes` | — | `{namespace: "approve"\|"deny"}` for `aws-credentials` and `docker-credentials` |
 | `prefs.set_provider` | `namespace`, `decision` (approve\|deny) | `{}` — sets and persists an AWS/Docker mode |
 | `prefs.remove_shed_rule` | `server`, `shed` | `{}` — removes one per-shed override (`server` verbatim; `""` is the single unnamed server) |
-| `broker.status` | — | `{effective_mode, pref, restart_required, probe, config, resolved_ssh_mode, gate_namespaces, servers, machine, machine_error, ssh, broker_error}` (`machine` is the embedded broker's `{id, name}`, `machine_error` why there is none; `ssh` is what it signs for a shed, `{mode, allow_users, key_filter, keys_offered?, keys_available?}`, the daemon status's `ssh` block; all three `null` outside embedded mode or before the broker started; a `servers[]` namespace's `state` is one of the daemon's (`connected`, `reconnecting`, `not-source`, `duplicate`, `rejected`, `stopped`; never `yielding`, which only a daemon standing by for this broker shows), and a row and namespace carry `active_source` when the server names another machine as the credential source) — see [Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker) |
-| `broker.mode` | — | `{effective, pref, restart_required}` |
-| `broker.set_mode` | `mode` (auto\|embedded\|external) | `{pref, effective, restart_required}` — persisted; takes effect on the next launch |
-| `source.status` | — | `{rows, this_machine, this_machine_error, broker_mode}` — one row per configured server, `{host, supported, source, this_machine, connected, busy, unreachable, error}` (`source` is the machine that answers credential requests for you there, `{id, name}` or `null`; a server older than credential sources — a plain `404` — is `supported: false` with no error; `busy: true` means the server answered `503 SOURCE_BUSY` on every one of a few retries, so the source is unknown for now rather than absent — read again later; `unreachable: true` (with `supported: false` and the reason in `error`) means the server could not be reached or its answer read — a transport failure, an undecodable body, a 5xx with no API error body — so whether it supports sources is unknown, not "no": keep what was last known and read again later); `this_machine` is this machine's `{id, name}`, or `null` with `this_machine_error` saying why |
-| `source.use` | `host` | `{row, woke_broker}` — makes this machine the credential source on `host` (one request, never retried) and, in embedded mode, wakes the broker so it connects at once. Refusals: `bad_request` (unknown server), `machine_identity_unavailable`, `source_machine_not_found` (the server has not seen this machine's broker yet), `forbidden`, `unsupported`, `action_failed` |
+| `broker.status` | — | `{config, resolved_ssh_mode, gate_namespaces, servers, machine, machine_error, ssh, broker_error}` (`machine` is the broker's `{id, name}`, `machine_error` why there is none; `ssh` is what it signs for a shed, `{mode, allow_users, key_filter, keys_offered?, keys_available?}`; all three `null` before the broker started or when its config failed; a `servers[]` namespace's `state` is one of `connected`, `reconnecting`, `not-source`, `duplicate`, `rejected`, `stopped`), and a row and namespace carry `active_source` when the server names another machine as the credential source) — see [Architecture → The credential broker](architecture.md#the-credential-broker) |
+| `source.status` | — | `{rows, this_machine, this_machine_error}` — one row per configured server, `{host, supported, source, this_machine, connected, busy, unreachable, error}` (`source` is the machine that answers credential requests for you there, `{id, name}` or `null`; a server older than credential sources — a plain `404` — is `supported: false` with no error; `busy: true` means the server answered `503 SOURCE_BUSY` on every one of a few retries, so the source is unknown for now rather than absent — read again later; `unreachable: true` (with `supported: false` and the reason in `error`) means the server could not be reached or its answer read — a transport failure, an undecodable body, a 5xx with no API error body — so whether it supports sources is unknown, not "no": keep what was last known and read again later); `this_machine` is this machine's `{id, name}`, or `null` with `this_machine_error` saying why |
+| `source.use` | `host` | `{row, woke_broker}` — makes this machine the credential source on `host` (one request, never retried) and wakes the broker so it connects at once. Refusals: `bad_request` (unknown server), `machine_identity_unavailable`, `source_machine_not_found` (the server has not seen this machine's broker yet), `forbidden`, `unsupported`, `action_failed` |
 | `ui.press_source_use` | `host` | `{}` — test mode only: presses the open Preferences window's own "Use this machine" button for `host` (a disabled or missing button takes no press) |
 
 `approval.decide` with `persist:true` saves a per-`(server,shed)` rule (always-allow
 when `decision:approve`, always-deny when `decision:deny`). For an approve, `scope`
 controls the grant: `per-request` (once), or `per-session`/`per-shed` add an in-memory
-grant lasting `ttl` (e.g. `1h`). `scope`/`ttl`/`persist` are reported to the host agent
+grant lasting `ttl` (e.g. `1h`). `scope`/`ttl`/`persist` are reported to the broker
 so its durable audit records how the decision was made.
 
 ## Test mode

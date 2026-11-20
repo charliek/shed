@@ -11,7 +11,7 @@ first machine of a user to subscribe is bound, and the others are refused.
 Each synthetic machine here has a stable id of its own, derived from the name
 of the identity it stands for, so a listener and its answers name the same
 machine and two identities never share one. The real machine is the
-Rust `shed-host-agent` (tested in tests/host-agent-diff); this suite never
+credential broker in the desktop app (tested in tests/broker-wire); this suite never
 runs it. A test stands in for it with `BusListener`, over pinned mTLS with a
 credentials certificate enrolled over `_bootstrap`, and starts requests from
 inside a shed with a POST to the shed-agent's `127.0.0.1:498/v1/publish`,

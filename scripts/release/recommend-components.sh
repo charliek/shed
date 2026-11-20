@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Recommend which release components a NEXT stable tag should ship.
 #
-# The monorepo carries three release components on ONE vX.Y.Z tag family
-# (see RELEASING.md "Component selection"): server, host-agent, desktop.
-# (machine-rc was retired in plan 010 — the shed-host-agent daemon hosts the
-# machine RC hub. sx was sunset in plan 016 — the RC porcelain never shipped
-# and its whole release wiring was removed.)
+# The monorepo carries two release components on ONE vX.Y.Z tag family
+# (see RELEASING.md "Component selection"): server, desktop. (Components
+# retired earlier are listed in RELEASING.md "Retired components".)
 #
 # This script inspects committed history and prints a RECOMMENDATION; it never
 # bumps a manifest, never writes a file, never mutates git. The human
@@ -30,7 +28,7 @@
 #     human can double-check. Set RECOMMEND_NO_GH=1 to skip the gh probe.
 #   * The recommendation is a STARTING POINT — the human confirms/edits it. The
 #     path sets are deliberately coarse (over-recommending is free under human
-#     confirm); the one known under-flag is called out at the end.
+#     confirm).
 #
 # Input:  the target version, `X.Y.Z` (no `v`, stable only), as $1.
 # Output:
@@ -51,7 +49,7 @@ set -euo pipefail
 # ===========================================================================
 # PATH SETS — component → the pathspecs whose changes imply that component
 # should re-ship. Passed verbatim to `git diff --name-only <lastship>..HEAD --`.
-# `:(exclude)…` entries are git pathspec magic (subtract a subtree). These are
+# An `:(exclude)…` entry would be git pathspec magic (subtract a subtree). These are
 # intentionally coarse: over-recommending is harmless under the recommend+
 # confirm flow; a false NEGATIVE (an unflagged real change) is the costly one.
 # Kept in lockstep with plan 002 §3 D4.
@@ -65,19 +63,8 @@ set -euo pipefail
 # server: the Go binaries + plugin + rootfs image inputs. `sdk/**` is a
 # path-replaced local module baked into shipped binaries with no go.sum trace;
 # `.claude-plugin/**` is the ship selector; `skills/**` ships in the plugin.
-# The two helper cmd/ subtrees (their own components) are subtracted.
 PATHS_SERVER=(
   cmd
-  # cmd/shed-machine-rc was deleted from the tree (plan 010 H15 — the
-  # machine-rc retirement), but the exclusion stays: it's needed so diffs
-  # against PRE-DELETION tags still classify correctly. Prune once every
-  # plausible basis tag is post-deletion.
-  ':(exclude)cmd/shed-machine-rc'
-  # cmd/shed-host-agent was deleted from the tree (plan 006 C3 — the Go
-  # host-agent sunset), but the exclusion stays: it's needed so diffs against
-  # PRE-DELETION tags still classify correctly. Prune after the next
-  # host-agent release makes every future basis tag post-deletion.
-  ':(exclude)cmd/shed-host-agent'
   internal
   sdk
   guest
@@ -96,42 +83,16 @@ PATHS_SERVER=(
   .goreleaser.server.yaml
 )
 
-# host-agent: the Rust broker + the Go rollback binaries.
-# DELIBERATELY EXCLUDES crates/Cargo.toml + crates/Cargo.lock: every desktop
-# bump rewrites those (workspace version + lock regen), which would flag
-# host-agent after every desktop release. Accepted gap: a
-# [workspace.dependencies]-only bump to crates/Cargo.toml won't auto-flag
-# host-agent (rare; the human confirm is the backstop; noted in the output).
-# shellcheck disable=SC2034  # read via get_paths()
-PATHS_HOST_AGENT=(
-  crates/shed-host-agent
-  crates/shed-broker
-  crates/shed-core
-  crates/rust-toolchain.toml
-  configs/extensions.example.yaml
-  # cmd/shed-host-agent was deleted from the tree (plan 006 C3 — the Go
-  # host-agent sunset), but the entry stays: it's needed so diffs against
-  # PRE-DELETION tags still classify correctly. Prune after the next
-  # host-agent release makes every future basis tag post-deletion.
-  cmd/shed-host-agent
-  .goreleaser.host-agent.yaml
-)
-
 # desktop: the app + every crate it links + the shared cargo manifests/locks
 # (which the desktop bump owns).
 #
-# "every crate it links" is the rule, and the agent-lane adapter is part of
-# it: `desktop/tauri/src-tauri/Cargo.toml` takes `shed-opencode` as a plain
-# path-dep, so a correctness fix in it is IN the shipped DMG/.deb and must
-# flag desktop. (It never reaches the host-agent binary — shed-broker has
-# never linked it, and the hub that had its own opencode watcher is gone
-# (plan 022, S6, charliek/shed#328) — so it stays OFF PATHS_HOST_AGENT.)
-# release-plan.sh and update-version.sh already carry it in their desktop
-# lockstep dep lists; this list had not caught up. (`shed-gx`, plan 017's
-# second adapter, rode the same path-dep shape until plan 025 C1 — shed#390 —
-# retired the gx lane. `shed-craze`, the craze adapter, joined in plan 025 C9,
-# when the Tauri app began linking it — and it is a desktop crate only, like
-# shed-opencode: shed-broker never links it, so it is not a host-agent path.)
+# "every crate it links" is the rule, and the agent-lane adapters are part of
+# it: `desktop/tauri/src-tauri/Cargo.toml` takes `shed-opencode` and
+# `shed-craze` as plain path-deps, so a correctness fix in either is IN the
+# shipped DMG/.deb and must flag desktop. release-plan.sh and
+# update-version.sh carry the same crates in their desktop lockstep dep
+# lists. (`shed-gx`, plan 017's second adapter, rode the same path-dep shape
+# until plan 025 C1 — shed#390 — retired the gx lane.)
 # shellcheck disable=SC2034  # read via get_paths()
 PATHS_DESKTOP=(
   desktop
@@ -147,7 +108,7 @@ PATHS_DESKTOP=(
 )
 
 # Canonical component order (drives every output list).
-COMPONENTS=(server host-agent desktop)
+COMPONENTS=(server desktop)
 
 # Components that have NEVER shipped in any tag — the first-ship bootstrap.
 #
@@ -265,7 +226,6 @@ semver_cmp() {
 manifest_path() {
   case "$1" in
     server) echo ".claude-plugin/plugin.json" ;;
-    host-agent) echo "crates/shed-host-agent/VERSION" ;;
     desktop) echo "desktop/VERSION" ;;
   esac
 }
@@ -275,9 +235,8 @@ manifest_path() {
 # (fully reassigning `paths` each call — no stale accumulation).
 get_paths() {
   case "$1" in
-    server)     paths=("${PATHS_SERVER[@]}") ;;
-    host-agent) paths=("${PATHS_HOST_AGENT[@]}") ;;
-    desktop)    paths=("${PATHS_DESKTOP[@]}") ;;
+    server)  paths=("${PATHS_SERVER[@]}") ;;
+    desktop) paths=("${PATHS_DESKTOP[@]}") ;;
   esac
 }
 
@@ -308,8 +267,7 @@ comp_index() {
   exit 1
 }
 
-# Current manifest version from the working tree; empty if the file is absent
-# (the host-agent VERSION file doesn't exist pre-migration).
+# Current manifest version from the working tree; empty if the file is absent.
 current_manifest() {
   local comp="$1" path
   path="${REPO_ROOT}/$(manifest_path "${comp}")"
@@ -344,15 +302,6 @@ manifest_at_tag() {
   fi
 }
 
-# True (exit 0) iff a component's VERSION manifest exists at tag T. Used to gate
-# the pre-migration fallback: the fallback only applies where the component had
-# NO standalone selector yet (VERSION absent). server has no VERSION file.
-manifest_file_exists_at_tag() {
-  local comp="$1" t="$2" path
-  path="$(manifest_path "${comp}")"
-  git -C "${REPO_ROOT}" cat-file -e "${t}:${path}" 2>/dev/null
-}
-
 # ---------------------------------------------------------------------------
 # The candidate tags: `git tag -l 'v*'` (this glob EXCLUDES the `sdk/v*` module
 # tags), stable only (skip anything with a `-`), sorted semver-descending.
@@ -364,16 +313,9 @@ while IFS= read -r t; do
   TAGS+=("${t}")
 done < <(git -C "${REPO_ROOT}" tag -l 'v*' | sort -V -r)
 
-# find_lastship <comp> → echoes the newest tag T that SHIPPED the component.
-# A tag T ships host-agent iff EITHER:
-#   (a) its VERSION file exists at T and equals T's version (post-migration, its
-#       own selector), OR
-#   (b) its VERSION file does NOT exist at T (pre-migration era) AND plugin.json
-#       at T equals T's version (it rode the old `go`/server component then).
-# The (b) fallback MUST require the VERSION file to be absent: a post-migration
-# tag that carries the file but shipped server-only (VERSION stale, plugin==tag)
-# did NOT ship the component, so it must not be borrowed as the basis — doing so
-# would narrow the diff and hide real changes. Returns 1 if there is no basis.
+# find_lastship <comp> → echoes the newest tag T that SHIPPED the component:
+# the newest tag whose manifest at T equals T's version. Returns 1 if there is
+# no basis.
 find_lastship() {
   local comp="$1" t vt got
   for t in "${TAGS[@]}"; do
@@ -383,20 +325,6 @@ find_lastship() {
       echo "${t}"; return 0
     fi
   done
-  if [ "${comp}" = "host-agent" ]; then
-    for t in "${TAGS[@]}"; do
-      # Fallback is pre-migration ONLY: skip any tag where the component already
-      # had its own VERSION selector (its ship there is decided by loop (a)).
-      if manifest_file_exists_at_tag "${comp}" "${t}"; then
-        continue
-      fi
-      vt="${t#v}"
-      got="$(manifest_at_tag server "${t}")"
-      if [ -n "${got}" ] && [ "${got}" = "${vt}" ]; then
-        echo "${t}"; return 0
-      fi
-    done
-  fi
   return 1
 }
 
@@ -482,7 +410,7 @@ for comp in "${COMPONENTS[@]}"; do
     # comment): report it as a first ship and always recommend it. For anything
     # else it is a repo/tag-state bug and must stay loud.
     if ! never_shipped "${comp}"; then
-      echo "error: no historical basis for component '${comp}' (no tag matches its manifest, no fallback)." >&2
+      echo "error: no historical basis for component '${comp}' (no tag matches its manifest)." >&2
       exit 1
     fi
     LASTSHIP[${ci}]="(never shipped)"
@@ -546,8 +474,6 @@ done
   else
     echo "  ${LEVEL} → recommending ALL components (a version-line bump ships the fleet)."
   fi
-  echo "  CAVEAT (host-agent): a [workspace.dependencies]-only bump in crates/Cargo.toml is"
-  echo "         NOT auto-detected (that file is excluded to avoid desktop-bump false positives)."
   if [ "${FIRST_SHIP}" = "true" ]; then
     echo "  NOTE (first ship): a component shown as '(never shipped)' has no diff basis — it is"
     echo "         recommended unconditionally. Prune it from NEVER_SHIPPED once it has shipped once."

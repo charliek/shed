@@ -35,9 +35,8 @@ export type Shed = {
   memory_mb?: number | null;
 };
 
-/** Why a host couldn't be listed. `agent_upgrade_required` is the one cause whose
- *  remedy is a user action; `other` is the open set (rendered generically). */
-export type HostFailureKind = "agent_upgrade_required" | "other";
+/** Why a host couldn't be listed. `other` is the open set (rendered generically). */
+export type HostFailureKind = "other";
 
 /** One host's failure in presentation shape (`shed_app::HostFailure`): `summary`
  *  is the one-line strip text with the REMEDY FIRST (strips truncate from the
@@ -578,23 +577,11 @@ export async function setLoginItem(enabled: boolean): Promise<void> {
 
 /* ---- credential broker (leg 3a.2) ----------------------------------------- */
 
-/** The persisted broker-mode preference (default `auto`). */
-export type BrokerMode = "auto" | "embedded" | "external";
-/** The effective mode auto-detect (or the pref) resolved to for this process. */
-export type BrokerEffective = "external" | "embedded" | "headless-coexist";
-
-/** The credential-broker status the Preferences control reads: the effective mode +
- *  pref, the socket probe that produced it, the config provenance, and — in embedded
- *  mode — the resolved ssh mode, gate namespaces, per-server health, and any
+/** The credential-broker status the Preferences section reads: the config
+ *  provenance, the resolved ssh mode, gate namespaces, per-server health, and any
  *  broker-failed error (fields that don't apply are null/empty). Mirrors
  *  `broker::BrokerRuntime::status`. */
 export type BrokerStatus = {
-  effective_mode: BrokerEffective;
-  /** The LIVE persisted pref (tracks a `set_mode` without a relaunch). */
-  pref: BrokerMode;
-  /** The persisted pref drifted from the launch pref ⟹ a relaunch applies it. */
-  restart_required: boolean;
-  probe: { desktop_socket_live: boolean; status_socket_live: boolean };
   config: { source: "loaded" | "synthesized" | "error" | null; message: string | null };
   resolved_ssh_mode: string | null;
   gate_namespaces: string[];
@@ -604,16 +591,6 @@ export type BrokerStatus = {
 
 export async function getBrokerStatus(): Promise<BrokerStatus | undefined> {
   return invoke<BrokerStatus>("broker_status");
-}
-
-/** Set the broker mode. Does NOT hot-swap — the reply carries `restart_required:true`
- *  and the CURRENT effective mode; the control shows a restart-to-apply hint. THROWS on
- *  an unknown mode (unlike the swallowing `invoke`). */
-export async function setBrokerMode(
-  mode: BrokerMode,
-): Promise<{ pref: BrokerMode; effective: BrokerEffective; restart_required: boolean }> {
-  const core = await import("@tauri-apps/api/core");
-  return core.invoke("broker_set_mode", { mode });
 }
 
 /* ---- credential sources (plan 035 §3.4) ------------------------------------ */
@@ -888,8 +865,6 @@ export type PrefsReport = {
     login: boolean;
     provider_modes: ProviderModes;
     shed_rules_count: number;
-    broker_pref: BrokerMode;
-    broker_effective: BrokerEffective;
     broker_error: string | null;
     /** The credential-source rows as rendered (supporting servers only), plan 035. */
     sources: {
@@ -1309,7 +1284,7 @@ export type RcLaunchFields = {
   workdir?: string;
 };
 
-/** Launch a session IN A SHED — the `rc.launch` alias, which is
+/** Launch a session IN A SHED — the `rc_launch` command, which is
  *  [machineLaunch] on the shed's roost host since S6. THROWS a coded
  *  [LaneFailure] on error (the dialog shows its message) — unlike the
  *  swallowing `invoke`, because a launch failure must be shown. */

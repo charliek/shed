@@ -1,5 +1,5 @@
 //! The AWS credential backend — a faithful Rust port of
-//! `cmd/shed-host-agent/aws_backend.go`.
+//! the retired Go daemon's `aws_backend.go`.
 //!
 //! Two vending modes (selected per shed by [`crate::config::AwsConfig::resolve`]):
 //!
@@ -1268,7 +1268,7 @@ mod tests {
     #[test]
     fn golden_aws_expiry() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/aws_expiry.json");
+            .join("../../tests/broker-wire/fixtures/aws_expiry.json");
         let raw = std::fs::read_to_string(&path).expect("read golden fixture");
         let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(fx["protocol_version"], 1, "version skew");

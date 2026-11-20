@@ -1,4 +1,4 @@
-/* TrayPopover — the macOS menu-bar popover (B1b): a host-agent status dot, ≤3
+/* TrayPopover — the macOS menu-bar popover (B1b): a credential-broker status dot, ≤3
    pending-approval cards, ≤6 running sheds, and a footer (Open dashboard ·
    Preferences… · Check for Updates… [disabled] · Quit). A SEPARATE webview/entry
    from the dashboard shell, so it fetches its own data and reports its rows under
@@ -55,7 +55,7 @@ export default function TrayPopover() {
     const un: Array<() => void> = [];
     void (async () => {
       const { listen } = await import("@tauri-apps/api/event");
-      // Live while shown: approvals + the host-agent dot re-fetch on coordinator
+      // Live while shown: approvals + the credential-broker dot re-fetch on coordinator
       // events; sheds on a lifecycle `refresh`; everything on the Rust show path's
       // `popover-refresh` so the popover freshens each time it opens.
       un.push(await listen("approvals-changed", loadApprovals));
@@ -134,14 +134,14 @@ export default function TrayPopover() {
 
   return (
     <div ref={rootRef} className="flex w-full flex-col overflow-hidden rounded-[12px] bg-shed-surface text-shed-text" data-tray-popover>
-      {/* header — host-agent status dot */}
+      {/* header — credential-broker status dot */}
       <div className="flex items-center justify-between px-3.5 py-2.5">
         <span className="text-[13px] font-medium">shed desktop</span>
         <span className="flex items-center gap-1.5 text-[11px]"
               style={{ color: connected ? "var(--shed-ok)" : "var(--shed-text-muted)" }}>
           <span className="h-2 w-2 rounded-full"
                 style={{ background: connected ? "var(--shed-ok)" : "var(--shed-text-muted)" }} />
-          host agent
+          credential broker
         </span>
       </div>
       <div className="h-px bg-shed-border" />

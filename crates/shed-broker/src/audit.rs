@@ -30,7 +30,7 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
-use crate::config::HostAgentConfig;
+use crate::config::ExtensionsYaml;
 use crate::status::now_rfc3339;
 
 /// A single audit record. All fields are plain `String`s so the JSONL builder can
@@ -152,7 +152,7 @@ impl JsonlAuditSink {
     /// degrades to the no-op file half (no panic), still fanning out. `fanout` is
     /// the fan-out target (pass the embedder's [`AuditFanout`], or `None`).
     pub fn new(
-        cfg: &HostAgentConfig,
+        cfg: &ExtensionsYaml,
         fanout: Option<std::sync::Arc<dyn AuditFanout>>,
     ) -> JsonlAuditSink {
         JsonlAuditSink {
@@ -164,7 +164,7 @@ impl JsonlAuditSink {
 
 /// Open the durable audit file per config, or `None` (no-op) when disabled or on any
 /// dir/file error. Mirrors Go's `NewAuditLogger`.
-fn open_audit_file(cfg: &HostAgentConfig) -> Option<Mutex<File>> {
+fn open_audit_file(cfg: &ExtensionsYaml) -> Option<Mutex<File>> {
     if !cfg.logging_enabled {
         return None;
     }
@@ -225,7 +225,7 @@ mod tests {
             }
         }
         let cap = Arc::new(Capture::default());
-        let cfg = HostAgentConfig::parse("logging:\n  enabled: false\n");
+        let cfg = ExtensionsYaml::parse("logging:\n  enabled: false\n");
         let sink = JsonlAuditSink::new(&cfg, Some(cap.clone()));
         sink.log(AuditEntry {
             ns: "ssh-agent".into(),
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn disabled_logging_writes_no_file_and_stamps_ts() {
-        let cfg = HostAgentConfig::parse("logging:\n  enabled: false\n");
+        let cfg = ExtensionsYaml::parse("logging:\n  enabled: false\n");
         let sink = JsonlAuditSink::new(&cfg, None);
         // No file half; log() is a no-op-plus-stamp and must not panic.
         assert!(sink.file.is_none());
@@ -320,7 +320,7 @@ mod tests {
     fn enabled_logging_appends_jsonl_with_trailing_newline() {
         let dir = std::env::temp_dir().join(format!("shed-audit-{}", uuid::Uuid::new_v4()));
         let path = dir.join("audit.log");
-        let cfg = HostAgentConfig::parse(&format!(
+        let cfg = ExtensionsYaml::parse(&format!(
             "logging:\n  enabled: true\n  path: {}\n",
             path.display()
         ));

@@ -143,7 +143,14 @@ from a fetch that shows the login still names that id.
 
 The per-login key cache, `{state_dir}/github_keys/<login>.keys`, keeps its
 name and format, and is trusted only when it matches the hash stored with the
-pin.
+pin. A login with no pin yet (at a server's first v0.10.0 start, its cache is
+one an earlier release wrote) has no last known keys: the cache is not read,
+and until a fetch succeeds the login contributes no key. A server whose only
+keys are such logins then does not start (an `mtls` server always enforces its
+keys). Let it reach `api.github.com` and start it again, or give it a key that
+does not come from GitHub: with a user list (`auth.users`) a key under that
+user's `keys`, without one `auth.ssh.authorized_keys` or `authorized_keys_file`
+(the two cannot be combined).
 
 ### Expired keys and script keys
 
@@ -460,10 +467,10 @@ id](#github-logins-are-pinned-to-their-account-id)): an unknown key under
 ### Certificates
 
 A client certificate issued before certificates named their user (by a server
-older than v0.10.0) is refused on a directory server, since the list can
-change under it; the client enrolls again (the CLI does so on the auth
-failure and retries). Certificates that name their user are checked against
-the list on every request, as on any server with users.
+older than v0.10.0) is refused here as on every server (see [The certificate is
+the credential](#the-certificate-is-the-credential)). Certificates that name
+their user are checked against the list on every request, as on any server
+with users.
 
 ## Ownership
 
@@ -540,7 +547,13 @@ them all to that user (a shed with host directories or server mounts only if
 that user is an admin) and logs each. With several users nothing is given
 away: only an admin sees such a shed, nobody enters it, and an admin gives it
 to a user with [`shed assign`](cli.md#shed-assign). A marker,
-`{state_dir}/users-upgrade.json`, records that this one-time step ran. The
+`{state_dir}/users-upgrade.json`, records that this one-time step ran, or that
+it began for one user and has not finished. While it has not finished, the
+server **does not start** with any other users in `auth.users` (beside
+`auth.directory`, the local admins; the account service's list never counts):
+it stops before it opens anything or gives anything away, and says how to
+finish the step or abandon it on purpose with [`shed-server serve
+--abandon-user-upgrade`](cli.md#shed-server-serve). The
 [Multi-user server guide](../guides/multi-user-server.md#sheds-with-no-user)
 has the details.
 
@@ -610,7 +623,7 @@ internal CA and returns a bundle the CLI persists:
 | Scope | Grants |
 |-------|--------|
 | `control` | The control plane (lifecycle, images, sessions, snapshots, users, credential sources), the Connect tunnel for `shed forward`, and the egress audit stream. |
-| `credentials` | The credential bus (`/api/plugins/*`), plus the Connect tunnel and the egress audit stream (used by the host-agent's reverse proxy and egress subscriber). |
+| `credentials` | The credential bus (`/api/plugins/*`), plus the Connect tunnel and the egress audit stream (used by the desktop app's broker and egress subscriber). |
 
 The bus requires `credentials`, so a leaked `control` certificate cannot reach
 the live-secret bus, and a `credentials` certificate cannot manage the fleet
@@ -637,13 +650,8 @@ shed server add](cli.md#shed-server-add).
 
 **Clients older than v0.8.1** have no way to obtain a certificate. A CLI that
 sends no CSR is answered `this server requires auth.mode: mtls; upgrade shed
-(client certificate support)`. The desktop app, when it gets its credential
-through a `shed-host-agent` daemon, needs a daemon that answers
-`credential.get`: with an older daemon every request to an mtls server fails
-with `upgrade shed-host-agent — it is too old to obtain a client certificate
-for <server>`, and an app older than the daemon's protocol is told `this
-shed-desktop is too old to use one — upgrade the app`. Upgrade
-`shed-host-agent` before, or with, the desktop app.
+(client certificate support)`. A desktop app older than that cannot obtain one
+either: upgrade the app.
 
 ### Short TTL, transparent renewal
 
@@ -654,7 +662,7 @@ TTL is invisible in normal use:
 - **CLI**: re-enrolls when the stored certificate is near expiry, and on an
   auth failure retries the request once after re-enrolling. The expiry is kept
   in the client config as `client_cert_expires_at`.
-- **host-agent**: enrolls its **own** `credentials` certificate over the same
+- **desktop app's broker**: enrolls its **own** `credentials` certificate over the same
   SSH channel with its identity key.
 - **background tunnels** (`shed tunnels start -d`): the detached daemon
   re-enrolls the same way, **in memory only**, so a multi-day daemon never
@@ -693,11 +701,21 @@ client cannot request an identity it doesn't hold:
 
 - **CN** = the SSH key fingerprint (`SHA256:...`).
 - **OU** = scope (`control` or `credentials`), one scope per certificate.
-- **O** = client kind (`cli`, `host-agent`, `desktop`, `mobile`).
+- **O** = client kind (`cli`, `broker`, `desktop`, `mobile`).
+- **userId** (RFC 4519 `uid`) = the user the key belonged to at enrolment
+  (`!implicit` for the implicit user of a server with no user list).
 - TTL = `auth.token_ttl` (default 24h), extended-key-usage `ClientAuth` only.
 
 The server ignores every requested subject field, SAN or extension in the
-CSR. The user a request acts as is whoever the CN's key belongs to **now**.
+CSR. A request acts as whoever the CN's key belongs to **now**, and only while
+that is still the user the certificate names. A user's certificate with no
+userId (one a server older than v0.10.0 issued) is refused on every server: at
+the TLS handshake on a new connection, and with `401` on a connection already
+open. A 0.9.x CLI or desktop app enrolls again by itself on that failure, and
+so does the mobile app, which builds on the same core as the desktop app; if
+one does not, run `shed server update NAME --refetch`. A service
+client's certificate names no user either, but is told apart by its shape (see
+below) and is not affected.
 
 This describes a user's certificate. A [service client](#service-clients)'s
 certificate has a different shape (CN = the client name, OU = `service`, a
@@ -800,8 +818,8 @@ single pinned-TLS (`https_port`) listener in mtls mode, with **no plain-HTTP
 listener at all**. The credential bus (`/api/plugins/*`) and the Connect
 tunnel (`/api/sheds/*/connect/*`) ride that same listener; in mtls mode the
 bus needs the `credentials` scope while the Connect tunnel accepts `control`
-or `credentials`, and both travel over TLS. A co-located host-agent reaches
-the bus over `https://127.0.0.1:8443` with the pinned cert and its own
+or `credentials`, and both travel over TLS. The desktop app's broker reaches
+the bus over `https://` with the pinned cert and its own
 `credentials` certificate. These knobs shape what is reachable where:
 
 | Field | Effect |
@@ -898,8 +916,8 @@ over pinned TLS or pinned-host-key SSH.
 ## Credential bus
 
 The credential bus carries live secrets (SSH signatures, AWS and Docker
-credentials) between a shed and a machine's host-agent or desktop app, which
-subscribe to it with a `credentials` certificate. What the machine will sign
+credentials) between a shed and a machine's desktop app, whose broker
+subscribes to it with a `credentials` certificate. What the machine will sign
 is decided on the machine: see the [SSH agent](../extensions/ssh-agent.md)
 extension.
 
@@ -941,8 +959,9 @@ A machine names itself on every subscribe and respond with two headers:
 | `X-Shed-Machine-Id` | 32 lowercase hex digits, the machine's stable id |
 | `X-Shed-Machine-Name` | its display name, percent-encoded UTF-8; 1 to 63 bytes decoded, no control characters |
 
-shed-host-agent and the desktop app 0.10.0 or newer send them. A broker
-released earlier sends neither and is refused until it is upgraded, so
+The desktop app 0.10.0 or newer sends them. A broker
+released earlier sends neither and is refused, with a message ending "install the current
+shed desktop app", until it is upgraded, so
 upgrade machines before servers.
 
 - **Who may move it.** A user moves their own source from any of their keys
@@ -1280,8 +1299,8 @@ fails config load (before, `auth: {Mode: mtls}` was ignored and the server
 started open), and so does a top-level key that matches a known one only when
 case is ignored (`Auth:`, `Bind_Address:`). The server holds no bearer-token
 code: an `Authorization` header is never read. The clients still speak the
-token protocol to servers older than v0.10.0. The [v0.9.1 → v0.10.0 upgrade
-guide](../upgrades/v0.9.1-to-v0.10.0.md) takes a server of any mode across.
+token protocol to servers older than v0.10.0. The [v0.9.0 → v0.10.0 upgrade
+guide](../upgrades/v0.9.0-to-v0.10.0.md) takes a server of any mode across.
 
 ## Removed earlier
 

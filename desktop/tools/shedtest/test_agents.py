@@ -5,9 +5,10 @@ list, launch, close and inject them.
 sessions used to be a UNION — the hub's rows, listed by ssh'ing `shed-ext-rc`
 into the shed, beside the tabs its `roost-session` reported. The guest binary,
 the server's routes and the Go engine are gone, so what is left is the roost
-half: `rc.list` returns it, `rc.launch` is `roost.launch` addressed by
-`{shed, host?}` (an alias kept for 0.9.x), `rc.kill` is a `tab.close`, and
-`rc.inject_test` puts a row into the roost snapshot.
+half: `rc.list` returns it, a shed is launched with `roost.launch` on
+`roost:<server>/<shed>` (its 0.9.x alias `rc.launch` was removed in 0.10.0),
+`rc.kill` is a `tab.close`, and `rc.inject_test` puts a row into the roost
+snapshot.
 
 **Hermetic, and genuinely exercising the real code.** The app is launched with
 the test-mode `SHED_TAURI_ROOST_SOCKETS` seam — which swaps roost's SSH
@@ -24,7 +25,6 @@ from __future__ import annotations
 import platform
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -34,8 +34,6 @@ import ui
 from client import ShedError, TauriClient
 from fake_roost import FakeRoost, ownership
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fake-host-agent"))
-from fake_host_agent import FakeHostAgent  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -88,9 +86,8 @@ def agents_app(shed_roost, mock):
     at setup. That would make this file's position in the alphabet load-bearing,
     and this file sorts early.
 
-    Its own fake host-agent for the same reason those two have one: the session
-    `fake` tracks a single connection, and a second app dialling it would
-    misroute the frames the approval suites are waiting on.
+    Its broker serves no server (`ui.subproc_env`'s default hermetic broker), so
+    it never takes a listener slot on the session mock.
 
     Short `mkdtemp` prefixes: the IPC socket lives under the runtime dir, and a
     Unix socket path must stay inside SUN_LEN.
@@ -99,8 +96,6 @@ def agents_app(shed_roost, mock):
     if not cfg.binary.exists():
         raise RuntimeError(
             f"tauri binary not found at {cfg.binary}; build it first (make tauri-build).")
-    agent = FakeHostAgent()
-    agent.start()
     runtime_dir = Path(tempfile.mkdtemp(prefix="shed-agents-"))
     sock = runtime_dir / cfg.sock_rel
     log = runtime_dir / "agents-ui.log"
@@ -109,7 +104,6 @@ def agents_app(shed_roost, mock):
         runtime_dir=runtime_dir,
         mock_base_url=mock.base_url,
         config_path=FIXTURES / "config.yaml",
-        host_agent_socket=agent.socket_path,
         # Only the shed. `localhost` is deliberately unmapped, so the implicit
         # host stays unlisted and every row this suite sees is the shed's.
         roost_sockets={TARGET: shed_roost.socket_path},
@@ -130,7 +124,6 @@ def agents_app(shed_roost, mock):
             client.close()
         ui.terminate(proc)
         log_fh.close()
-        agent.stop()
         shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
@@ -215,14 +208,13 @@ def test_a_filtered_list_narrows_to_that_shed(app):
 # ---- launch / kill -------------------------------------------------------
 
 def test_launch_lists_and_kill_closes_the_tab(app, shed_roost):
-    """`rc.launch` → a roost `tab.open` on the shed, `rc.kill` → its `tab.close`.
+    """`roost.launch` on the shed's target → a roost `tab.open` on the shed,
+    `rc.kill` → its `tab.close`.
 
-    The alias is addressed by `{shed, host?}`; everything under it is the same
-    path `roost.launch` takes, so the launched row carries the same origin stamp
-    the listed ones do.
+    The launched row carries the same origin stamp the listed ones do.
     """
-    launched = app.call("rc.launch", {"shed": SHED, "kind": "opencode",
-                                      "workdir": "/home/shed/fresh"})
+    launched = app.call("roost.launch", {"target": TARGET, "kind": "opencode",
+                                         "workdir": "/home/shed/fresh"})
     slug = launched["slug"]
     try:
         assert launched["origin"] == TARGET
@@ -255,8 +247,19 @@ def test_launch_refuses_a_kind_this_build_does_not_know(app):
     LAUNCH one — the far side would be asked to run something this build has
     never heard of."""
     with pytest.raises(ShedError) as exc:
-        app.call("rc.launch", {"shed": SHED, "kind": "borg"})
+        app.call("roost.launch", {"target": TARGET, "kind": "borg"})
     assert exc.value.code == "bad_request"
+
+
+def test_rc_launch_is_an_unknown_op(app, shed_roost):
+    """The 0.9.x alias `rc.launch {shed}` was removed in 0.10.0: it answers the
+    IPC's unknown-op error and opens nothing."""
+    opens = len(shed_roost.opens)
+    with pytest.raises(ShedError) as exc:
+        app.call("rc.launch", {"shed": SHED, "kind": "opencode"})
+    assert exc.value.code == "unknown_op", exc.value
+    assert exc.value.message == "unknown op: rc.launch", exc.value
+    assert len(shed_roost.opens) == opens, "a removed op opened a tab"
 
 
 def test_kill_refuses_a_slug_that_is_not_a_tab_id(app):

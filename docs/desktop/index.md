@@ -7,16 +7,15 @@ credential requests, and watch a live activity feed. It is a **Tauri** app on a 
 core, shipped for **macOS** (DMG + Sparkle auto-update) and **Linux**
 (`apt install shed-desktop`).
 
-It is a coordinator — it runs no sheds. In its default embedded-broker mode the credential
-broker runs inside the app; pointed at an external host agent, it holds no credentials. It observes and drives
+It is a coordinator — it runs no sheds. The credential
+broker runs inside the app, so credentials are answered only while the app is running. It observes and drives
 components that already exist on the developer's Mac and on shed hosts (see
 [Architecture](architecture.md) for the full picture):
 
 - **shed lifecycle** — HTTP to one or more `shed-server` instances, discovered from
   `~/.shed/config.yaml`; live create-progress over SSE.
-- **credentials / approvals** — the embedded credential broker, or a Unix-domain-socket
-  channel to an external `shed-host-agent` (the headline feature; see [Credential
-  approvals](approvals.md)).
+- **credentials / approvals** — the credential broker, which runs in the app (the headline
+  feature; see [Credential approvals](approvals.md)).
 - **agents + terminals** — each host's [roost](../extensions/roost-session-hosts.md)
   sessions are rows in the Agents pane, with live [craze and opencode
   lanes](agent-lanes.md); the user's terminal app is launched for interactive attach.
@@ -51,9 +50,8 @@ component ships.
   rendered, plus a screenshot op, so every change is verified by a no-sleep functional
   harness — not by a human clicking. See [Test automation](test-automation.md).
 - **Fail-closed security.** Credential approval fails closed: a missing or unresponsive
-  app results in denial, matching the host agent's unanswered-prompt behavior. With an
-  external host agent the app holds no secrets; the default embedded broker holds them
-  in-process (see [Architecture](architecture.md#the-embedded-credential-broker)).
+  app results in denial, matching an unanswered local prompt. The broker holds the
+  secrets in-process (see [Architecture](architecture.md#the-credential-broker)).
 
 ## Roadmap & directions
 
@@ -65,16 +63,15 @@ gate, the System (disk) pane, plus notarized Sparkle auto-update on macOS and an
 **Shared Rust core & multi-client (delivered).** The shed-server protocol layer was extracted
 into a shared **Rust core** (`shed-core`) so the same logic backs every client instead of
 being re-implemented per language. The **Tauri** desktop client on it ships on both macOS
-(WKWebView) and Linux (WebKitGTK), and can broker credentials **in-process** (the default) or
-against a separate daemon — see [Installation → Credential
-broker](installation.md#credential-broker) and [Architecture → The embedded credential
-broker](architecture.md#the-embedded-credential-broker). See [Rust core](rust-core.md).
+(WKWebView) and Linux (WebKitGTK), and brokers credentials **in-process** — see [Installation → Credential
+broker](installation.md#credential-broker) and [Architecture → The credential
+broker](architecture.md#the-credential-broker). See [Rust core](rust-core.md).
 
 **Credentials.**
 
-- **Gate AWS + Docker, not just SSH.** The host agent already streams an all-namespace audit
-  feed and the approval protocol is namespace-agnostic; only `ssh-agent` is *gated* today.
-  Extending the gate to `aws-credentials` and `docker-credentials` is mostly agent-side
+- **Gate AWS + Docker, not just SSH.** The broker already streams an all-namespace audit
+  feed and the approval protocol is namespace-agnostic; only `ssh-agent` is *gated* by default.
+  Extending the gate to `aws-credentials` and `docker-credentials` is mostly broker-side
   wiring, behind a clean policy story so frequent STS refreshes don't become prompt fatigue.
   See [Credential approvals](approvals.md).
 - **Auto-approve with constraints** — e.g. docker limited to a registry allowlist.
@@ -95,7 +92,4 @@ client — `tauri/src-tauri`, bin `shed-desktop-tauri` → `/usr/bin/shed-deskto
 
 **Larger bets.** A **mobile client** (Android-first) on the same core; an **embedded
 terminal** (revisited only if delegating to the user's terminal app proves insufficient);
-**in-app host management** (writing `~/.shed/config.yaml` instead of read-only reflection);
-and, further out, retiring the standalone `shed-host-agent` formula/daemon for desktop
-users now that the app can broker credentials on its own (the headless daemon
-stays for server/no-desktop use). Have an idea? Open an issue.
+**in-app host management** (writing `~/.shed/config.yaml` instead of read-only reflection). Have an idea? Open an issue.

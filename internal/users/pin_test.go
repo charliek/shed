@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -69,9 +70,13 @@ func (f *pinFixture) open(t *testing.T) *ConfigLookup {
 }
 
 func (f *pinFixture) tryOpen() (*ConfigLookup, error) {
+	var keys []string // empty operator: a GitHub-only server
+	if f.operator != "" {
+		keys = []string{f.operator}
+	}
 	return newConfigLookup(ConfigOptions{
 		SSH: &config.SSHAuthConfig{
-			Mode: f.mode, GitHubUsers: f.logins, AuthorizedKeys: []string{f.operator},
+			Mode: f.mode, GitHubUsers: f.logins, AuthorizedKeys: keys,
 		},
 		GitHubCacheDir: f.cacheDir,
 		PinsPath:       f.pinsPath,
@@ -893,8 +898,9 @@ func TestConfigIDWinsOverStoredPin(t *testing.T) {
 
 // TestDiskCacheBoundToPin: at a start with GitHub down, the disk cache is
 // used only when it is the cache last confirmed for the pin; a cache that
-// was changed (by an earlier release after a rollback, or by hand) is not.
-// A login never pinned may use the cache an earlier release wrote.
+// was changed (by an earlier release after a rollback, or by hand) is not,
+// and neither is the cache of a login never pinned (one an earlier release
+// wrote, or one left by a first fetch whose pin was not written).
 func TestDiskCacheBoundToPin(t *testing.T) {
 	k1, line1 := genKey(t)
 	k2, line2 := genKey(t)
@@ -927,16 +933,14 @@ func TestDiskCacheBoundToPin(t *testing.T) {
 
 	t.Run("never pinned", func(t *testing.T) {
 		f := newPinFixture(t)
-		if err := os.MkdirAll(f.cacheDir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(f.cacheFile(), []byte(line1), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		writeUnpinnedCache(t, f, line1)
 		f.gh.setAPIStatus(http.StatusBadGateway, nil)
 		l := f.open(t)
-		if !has(l, k1) {
-			t.Error("an unpinned login lost its earlier release's cache during an outage")
+		if has(l, k1) {
+			t.Error("an unpinned login's disk cache was read during an outage")
+		}
+		if row := refreshRow(t, l); row.Keys != 0 || row.PinnedID != 0 {
+			t.Errorf("row during the outage = %+v, want no keys and no pin", row)
 		}
 		// The first good fetch pins, and the cache stays a plain .keys file
 		// an earlier release reads.
@@ -950,6 +954,102 @@ func TestDiskCacheBoundToPin(t *testing.T) {
 			t.Errorf("cache file = %q, want the .keys body", got)
 		}
 	})
+
+	t.Run("never pinned, cache not opened", func(t *testing.T) {
+		// A FIFO with no writer blocks whoever opens it, so a start that
+		// returns shows the unpinned login's cache was never opened.
+		f := newPinFixture(t)
+		if err := os.MkdirAll(f.cacheDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(f.cacheFile(), 0o600); err != nil {
+			t.Skipf("no FIFO here: %v", err)
+		}
+		f.outage()
+		done := make(chan *ConfigLookup, 1)
+		go func() { done <- f.open(t) }()
+		select {
+		case l := <-done:
+			if has(l, k1) {
+				t.Error("an unpinned login got keys")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the start blocked opening an unpinned login's cache")
+		}
+	})
+
+	t.Run("first pin not written", func(t *testing.T) {
+		// A 0.10 server whose first good fetch could not write its pin, then
+		// restarted while GitHub is down: whatever the cache holds, the login
+		// is not pinned, so nothing is read from it.
+		f := newPinFixture(t)
+		f.gh.set("octocat", 583231, line1)
+		f.failWrites.Store(true)
+		f.open(t)
+		f.failWrites.Store(false)
+		if _, err := os.Stat(f.pinsPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("pin store exists after a failed first write: %v", err)
+		}
+		writeUnpinnedCache(t, f, line1)
+		f.outage()
+		if l := f.open(t); has(l, k1) {
+			t.Error("a login whose pin was never written got its keys from the disk cache")
+		}
+	})
+}
+
+// writeUnpinnedCache writes body as the login's disk cache, as a release
+// from before logins were pinned wrote it.
+func writeUnpinnedCache(t *testing.T, f *pinFixture, body string) {
+	t.Helper()
+	if err := os.MkdirAll(f.cacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.cacheFile(), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestGitHubOnlyEnforceWithAnUnpinnedCache: a server whose only keys are a
+// GitHub login's, in enforce mode, with that login's cache from before
+// pinning and GitHub unreachable at its start, does not start, and the
+// refusal names the three ways out. With one authorized_keys entry it starts,
+// and the GitHub user resolves no key until a good fetch.
+func TestGitHubOnlyEnforceWithAnUnpinnedCache(t *testing.T) {
+	k1, line1 := genKey(t)
+
+	f := newPinFixture(t)
+	f.operator = ""
+	writeUnpinnedCache(t, f, line1)
+	f.outage()
+	_, err := f.tryOpen()
+	if err == nil {
+		t.Fatal("a GitHub-only enforce server started with no key it could vouch for")
+	}
+	for _, want := range []string{
+		"auth.ssh.mode=enforce but no authorized keys resolved",
+		"let the server reach api.github.com and start it again",
+		"with a user list (auth.users) a key under that user's keys",
+		"without one auth.ssh.authorized_keys or authorized_keys_file",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not say %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "warn") {
+		t.Errorf("refusal %q suggests warn mode, which an mtls server refuses", err)
+	}
+
+	g := newPinFixture(t) // with the operator's authorized_keys entry
+	writeUnpinnedCache(t, g, line1)
+	g.outage()
+	l := g.open(t)
+	if has(l, k1) {
+		t.Error("the GitHub login resolved a key from its unpinned cache")
+	}
+	if _, _, ok := l.UserForKey(fp(k1)); ok {
+		t.Error("UserForKey found the unpinned cache's key")
+	}
 }
 
 // TestLightFetchSpendsNoAPI: an unknown key fetches each login's .keys and

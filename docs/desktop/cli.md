@@ -23,7 +23,7 @@ running app.
 
 | Command | Op | Description |
 |---------|----|-------------|
-| `shedctl identify` | `identify` | Print the running app's identity, test mode and broker mode |
+| `shedctl identify` | `identify` | Print the running app's identity and test mode |
 | `shedctl sheds list` | `sheds.list` | List sheds across configured hosts, with per-host failures |
 | `shedctl dashboard dump` | `dashboard.dump` | Dump the shed rows the dashboard rendered |
 | `shedctl hosts auth` | `hosts.auth` | Per-server credential mode (`mtls`, or `token` for any other entry: a server older than 0.10.0 still in token mode (removed in 0.10.0), or an entry that records no mode) and whether it was learned this session |

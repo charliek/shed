@@ -1,4 +1,4 @@
-//! Multi-server discovery — the always-on server-model core the host-agent's bus,
+//! Multi-server discovery — the always-on server-model core the broker's bus,
 //! supervisor, and control-token provider all share.
 //!
 //! This module is the Rust home for the pieces of Go's `discovery.go` /
@@ -12,7 +12,7 @@
 //! selector + `DiscoveryConfig` parse that drives the filtering lives in `config.rs`.
 
 use crate::config::yaml_lite::{self, Node};
-use crate::config::HostAgentConfig;
+use crate::config::ExtensionsYaml;
 
 /// shed's default server HTTP port (mirror `discovery.go:defaultShedHTTPPort`).
 const DEFAULT_SHED_HTTP_PORT: u16 = 8080;
@@ -213,12 +213,12 @@ fn target_user(node: Option<&Node>, exact: bool) -> String {
     }
 }
 
-// The `resolve_targets` methods live here (rather than on `HostAgentConfig` in
+// The `resolve_targets` methods live here (rather than on `ExtensionsYaml` in
 // `config.rs`) because they depend on this module's `ServerTarget` /
 // `load_discovered_servers`. `config.rs` stays self-contained (only std + serde +
 // saphyr-parser) as a matter of hygiene — it is the crate's foundational module and
 // carries no dependency on the rest of the broker.
-impl HostAgentConfig {
+impl ExtensionsYaml {
     /// The desired server set to broker for, filtered from an already-loaded
     /// `discovered` list — a faithful port of Go's `Config.ResolveTargets`
     /// (`config.go:162`). Single-server mode (no `discovery:` block) returns ONE unnamed
@@ -304,13 +304,13 @@ mod tests {
     }
 
     /// The `load_discovered_servers` golden — the shared fixture under
-    /// `tests/host-agent-diff/fixtures/`, recorded while the Go daemon still read it too
+    /// `tests/broker-wire/fixtures/`, recorded while the Go daemon still read it too
     /// (retired in plan 006); this test is now its one reader. It pins the
     /// ssh_port=0/empty-host/sort semantics and the verbatim `auth_mode` and `user`.
     #[test]
     fn golden_load_discovered_servers() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/load_discovered_servers.json");
+            .join("../../tests/broker-wire/fixtures/load_discovered_servers.json");
         let raw = std::fs::read_to_string(&path).expect("read golden fixture");
         let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(fx["protocol_version"], 1, "version skew");
@@ -1041,7 +1041,7 @@ servers:
     /// no CLI config entry to read one from.
     #[test]
     fn single_server_target_has_no_auth_mode() {
-        let cfg = HostAgentConfig::parse("server: http://localhost:8080\n");
+        let cfg = ExtensionsYaml::parse("server: http://localhost:8080\n");
         let got = cfg.resolve_targets_from(Vec::new());
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].auth_mode, "");
@@ -1111,18 +1111,18 @@ servers:
         ];
 
         // Legacy single-server: one unnamed target, `discovered` ignored.
-        let cfg = HostAgentConfig::parse("server: http://localhost:8080\n");
+        let cfg = ExtensionsYaml::parse("server: http://localhost:8080\n");
         assert_eq!(
             cfg.resolve_targets_from(discovered.clone()),
             vec![mk("", "http://localhost:8080")]
         );
 
         // Discover all.
-        let cfg = HostAgentConfig::parse("discovery:\n  servers: all\n");
+        let cfg = ExtensionsYaml::parse("discovery:\n  servers: all\n");
         assert_eq!(cfg.resolve_targets_from(discovered.clone()), discovered);
 
         // Include a subset.
-        let cfg = HostAgentConfig::parse("discovery:\n  servers: [mini3]\n");
+        let cfg = ExtensionsYaml::parse("discovery:\n  servers: [mini3]\n");
         assert_eq!(
             cfg.resolve_targets_from(discovered.clone()),
             vec![mk("mini3", "http://mini3:8080")]
@@ -1133,13 +1133,13 @@ servers:
             mk("mini2", "http://mini2:8080"),
             mk("mini2", "http://other:8080"),
         ];
-        let cfg = HostAgentConfig::parse("discovery:\n  servers: all\n");
+        let cfg = ExtensionsYaml::parse("discovery:\n  servers: all\n");
         let got = cfg.resolve_targets_from(dup);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].url, "http://mini2:8080");
 
         // Explicit empty list (`servers: []`) selects nothing.
-        let cfg = HostAgentConfig::parse("discovery:\n  servers: []\n");
+        let cfg = ExtensionsYaml::parse("discovery:\n  servers: []\n");
         assert!(cfg.resolve_targets_from(discovered).is_empty());
     }
 
@@ -1150,7 +1150,7 @@ servers:
     #[test]
     fn resolve_targets_reads_source() {
         // Legacy: no discovery block → the unnamed single target, no I/O.
-        let cfg = HostAgentConfig::parse("server: http://localhost:8080\n");
+        let cfg = ExtensionsYaml::parse("server: http://localhost:8080\n");
         let got = cfg.resolve_targets().expect("legacy resolves");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "");
@@ -1160,7 +1160,7 @@ servers:
         let (_d, shed) = write_config(
             "servers:\n  mini2:\n    host: mini2\n    http_port: 8080\n  mini3:\n    host: mini3\n",
         );
-        let cfg = HostAgentConfig::parse(&format!(
+        let cfg = ExtensionsYaml::parse(&format!(
             "discovery:\n  servers: [mini3]\n  source: {shed}\n"
         ));
         let got = cfg.resolve_targets().expect("discovery resolves");

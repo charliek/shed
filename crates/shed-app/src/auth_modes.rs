@@ -35,7 +35,7 @@
 //! walk it back. The very next mint would then read `expects_mtls == false`,
 //! skip the CSR, and send a `token.get` to an mtls-only server: exactly the §7
 //! P5 bug the tri-state exists to prevent. (The inverse interleaving produces
-//! the mirror image — a false "upgrade shed-host-agent" against a token server.)
+//! the mirror image — a false upgrade-required error against a token server.)
 //!
 //! [`CredentialAdopted`] carries no ordering token, so the rule is a priority
 //! one, and it is sound by construction:
@@ -46,8 +46,8 @@
 //! * therefore, if an observer event DISAGREES with the latest synchronous
 //!   write, a newer mint has already superseded it — the event is stale, and it
 //!   is dropped ([`AuthModeRegistry::record_observed`]);
-//! * where no synchronous write exists at all (the embedded/headless-coexist
-//!   brokers, whose `EmbeddedTokenMinter` holds no registry), the observer is
+//! * where no synchronous write exists at all (the embedded
+//!   broker, whose `EmbeddedTokenMinter` holds no registry), the observer is
 //!   the only writer and always applies.
 //!
 //! The per-server `sync_seq` is the monotonic ordinal of the last synchronous
@@ -376,7 +376,7 @@ mod tests {
 
     /// The mirror image: mint N was mtls, mint N+1 saw the server back on
     /// tokens, and N's late callback would re-assert certificates — producing a
-    /// false "upgrade shed-host-agent" against a token server.
+    /// false "upgrade the broker" refusal against a token server.
     #[test]
     fn the_inverse_interleaving_cannot_re_assert_certificates() {
         let r = AuthModeRegistry::new();
@@ -393,7 +393,7 @@ mod tests {
 
     /// The guard is a PRIORITY rule, not a mute: an observer write that agrees
     /// with the minter still applies (it is the same fact), and where the minter
-    /// has never spoken — the embedded/headless-coexist brokers, whose
+    /// has never spoken — the embedded broker, whose
     /// `EmbeddedTokenMinter` holds no registry — the observer is the only writer
     /// and always applies.
     #[test]

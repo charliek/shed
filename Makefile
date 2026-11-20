@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory check-directory-itest-host test-host-agent-diff test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory check-directory-itest-host test-broker-wire test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -66,26 +66,25 @@ test-integration:
 	}
 	cd tests/integration && uv sync && uv run pytest -v $(PYTEST_ARGS)
 
-# Hermetic host-agent wire harness (the THIRD pytest suite — never merged with
-# tests/integration or desktop/tools/shedtest). It spawns the Rust
-# crates/shed-host-agent daemon and asserts its wire-visible output under a
-# defined canonicalization against goldens recorded from the last agreeing
-# Go↔Rust run (the Go cmd/shed-host-agent twin was sunset — see plan
-# 006-mtls-cleanup-hostagent-sunset.md), then runs the language-neutral
-# golden-fixture runners in Rust. Needs Rust (cargo on PATH) + uv. See
-# tests/host-agent-diff/README.md.
-test-host-agent-diff:
+# Hermetic broker wire harness (the THIRD pytest suite — never merged with
+# tests/integration or desktop/tools/shedtest). It runs the desktop app's
+# embedded credential broker in a test process (crates/shed-broker-harness,
+# test-only, in no release) and asserts its wire-visible output under a defined
+# canonicalization against goldens recorded from the last agreeing Go↔Rust run,
+# then runs the language-neutral golden-fixture runners in Rust. Needs Rust
+# (cargo on PATH) + uv. See tests/broker-wire/README.md.
+test-broker-wire:
 	@command -v uv >/dev/null 2>&1 || { \
-	  echo "uv is required for the host-agent differential harness."; \
+	  echo "uv is required for the broker wire harness."; \
 	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
 	  exit 1; \
 	}
-	cd tests/host-agent-diff && uv sync && uv run pytest -v
-	# Both Rust crates: the daemon bin owns tests/golden.rs, while the in-crate
-	# golden runners (load_discovered_servers, ssh_payload_shapes, the config/
-	# aws/docker/egress vectors) moved into shed-broker with the crate split. A
-	# filter scoped to the bin alone silently ran ZERO of them.
-	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent -p shed-broker golden
+	cd tests/broker-wire && uv sync && uv run pytest -v
+	# The golden-fixture runners all live in shed-broker: its tests/golden.rs
+	# (effective_policy, gate_namespaces) and the in-crate runners
+	# (load_discovered_servers, ssh_payload_shapes, the config/aws/docker/egress
+	# vectors).
+	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-broker golden
 
 # The machine-transport differential (plan 012 AC2). The FOURTH pytest suite,
 # and — like the other three — never merged with them. SSH has no argv API, so a
@@ -1218,22 +1217,17 @@ release:
 	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/shed-firstboot-linux-amd64 ./cmd/shed-firstboot
 	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/shed-firstboot-linux-arm64 ./cmd/shed-firstboot
 
-# Local goreleaser snapshot of ONE release component — the pre-CI proof that
-# .goreleaser.<component>.yaml still builds its targets and renders its deb /
-# brew formula. `make snapshot-server`, `snapshot-host-agent`.
+# Local goreleaser snapshot of a goreleaser release component — the pre-CI
+# proof that .goreleaser.<component>.yaml still builds its targets and renders
+# its deb / brew formula. `make snapshot-server` (the only one).
 # Mirrors what ci.yml's release-snapshot job runs.
 #
 # goreleaser comes from .mise.toml pinned to CI's exact version (a local
-# snapshot that predicts CI has to run CI's goreleaser), and so is zig, matched
-# to scripts/release/install-zig.sh. Setup is `mise install` plus two
-# cargo-side prerequisites for the Rust components:
-#
-#   cargo install --locked --version 0.23.0 cargo-zigbuild
-#   rustup target add x86_64-apple-darwin \
-#                     aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+# snapshot that predicts CI has to run CI's goreleaser). Setup is
+# `mise install`.
 #
 # `check` alone (config validation, no build) is the cheap subset:
-#   mise exec -- goreleaser check -f .goreleaser.host-agent.yaml
+#   mise exec -- goreleaser check -f .goreleaser.server.yaml
 #
 # A pattern rule, so it needs no .PHONY entry (pattern rules never match a
 # real file here — there is no `snapshot-*` on disk).

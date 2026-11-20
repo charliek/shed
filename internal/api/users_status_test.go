@@ -14,6 +14,7 @@ import (
 
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/directory"
+	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/internal/users"
 	"github.com/charliek/shed/internal/users/userstest"
 )
@@ -73,6 +74,8 @@ func TestUsersStatusAdminOnly(t *testing.T) {
 	l.AddKey("root", users.Key{Fingerprint: rootScript, Source: users.SourceAdHoc, Label: "cron", Script: true})
 	l.AddKey("bob", users.Key{Fingerprint: bobScript, Source: users.SourceAdHoc, Label: "ci", Script: true})
 	s.SetUserLookup(l)
+	nameTestKey(t, rootScript, "root")
+	nameTestKey(t, bobScript, "bob")
 
 	for _, tc := range []struct {
 		who, fp, msg string
@@ -119,6 +122,7 @@ func TestUsersStatusNoList(t *testing.T) {
 
 	s, router := usersTestServer(t, newUserFakeBackend())
 	s.SetUserLookup(userstest.Implicit(rootFP))
+	nameTestKey(t, rootFP, servertls.ImplicitUserValue)
 	r := doAs(router, rootFP, http.MethodGet, "/api/users/status", "")
 	if r.code != http.StatusOK || string(r.body) != `{"source":"none","users":[]}`+"\n" {
 		t.Errorf("implicit user = %d %s, want 200 source none", r.code, r.body)
@@ -277,6 +281,7 @@ func TestUsersStatusAsksTheReporterFirst(t *testing.T) {
 	s, router := usersTestServer(t, newUserFakeBackend())
 	want := directoryStates()["not-enrolled"]
 	s.SetUserLookup(statusLookup{Fake: userstest.Implicit(rootFP), status: want})
+	nameTestKey(t, rootFP, servertls.ImplicitUserValue)
 	r, got := getStatus(t, router, rootFP)
 	if r.code != http.StatusOK || !reflect.DeepEqual(got, want) {
 		t.Errorf("status = %d %s, want the reporter's directory state", r.code, r.body)

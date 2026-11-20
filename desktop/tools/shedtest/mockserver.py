@@ -112,10 +112,10 @@ DEFAULT_SHEDS = [
 # `bus.rs`) drives against a shed-server, plus the always-on egress consumer route.
 # Wire shapes are derived from the REAL server contract and pinned against two
 # in-repo references (the §3.8 anti-drift pin) so the two fakes can't diverge:
-#   * `tests/host-agent-diff/synthetic_bus.py` — the Go-vs-Rust differential bus
+#   * `tests/broker-wire/synthetic_bus.py` — the Go-vs-Rust differential bus
 #     (identical `_MESSAGES_RE`/`_RESPOND_RE`/`_EGRESS_PATH`, `data: {json}\n\n`
 #     SSE framing, 204-on-respond, 409-terminal-conflict, 501-egress-unavailable);
-#   * `docs/development/host-agent-wire-catalog.md` §0/§9 (the observable channels).
+#   * `docs/development/broker-wire-catalog.md` §0/§9 (the observable channels).
 #
 # Only the embedded-broker cells exercise these (the mock object is shared, but
 # these routes stay dormant for every non-broker test).
@@ -125,7 +125,7 @@ _EGRESS_PATH = "/api/egress/stream"
 
 # The machine pin (plan 035 §3.4): the identity headers every subscribe and respond
 # carries, and the pinned refusals a pinning server answers. KEPT IDENTICAL to
-# `tests/host-agent-diff/synthetic_bus.py` (`_REFUSALS`, `_RESPOND_REFUSALS`,
+# `tests/broker-wire/synthetic_bus.py` (`_REFUSALS`, `_RESPOND_REFUSALS`,
 # `NOT_SOURCE_ACTIVE`) — the same anti-drift pin as the routes above.
 MACHINE_ID_HEADER = "X-Shed-Machine-Id"
 MACHINE_NAME_HEADER = "X-Shed-Machine-Name"
@@ -150,7 +150,7 @@ _REFUSALS: dict[str, tuple[int, object]] = {
         {
             "error": {
                 "code": "SOURCE_MACHINE_ID_REQUIRED",
-                "message": "this server needs shed-host-agent and shed-desktop 0.10.0 or newer",
+                "message": "this server needs to know which machine is asking; install the current shed desktop app",
             }
         },
     ),
@@ -239,7 +239,7 @@ _SHEDS_HOLD_MAX = 6.0
 
 
 class MockShedServer:
-    def __init__(self, require_auth: bool = False):
+    def __init__(self, require_auth: bool = False, egress_events: list[dict] | None = None):
         # When set, every /api/* route answers 401 unless the request carried an
         # Authorization header (plan 006 D6): the AUTH-SHAPED refusal a secure
         # shed-server gives a client that presented nothing. It is what lets the
@@ -294,6 +294,17 @@ class MockShedServer:
         self._bus_queues: dict[str, queue.Queue] = {}
         self._bus_sse_threads: set[threading.Thread] = set()
         self._egress_hits = 0
+        # Opt-in egress decisions (`egress_events`): None keeps the route's 501
+        # (egress unavailable). A list makes the route a 200 SSE stream that writes
+        # each decision once, as a `data: {json}` frame in the shape the broker's
+        # egress consumer decodes (`crates/shed-broker/src/egress.rs` `EgressDecision`,
+        # pinned by `tests/broker-wire/fixtures/egress_audit_entry.json`), then holds
+        # the stream open; a reconnect gets no repeat.
+        self._egress_queue: queue.Queue | None = None
+        if egress_events is not None:
+            self._egress_queue = queue.Queue()
+            for decision in egress_events:
+                self._egress_queue.put(json.dumps(decision, separators=(",", ":")))
         # ---- the machine pin (plan 035 §3.4) ----
         # ns -> the pinned refusal kind its subscribe answers, until `accept(ns)`.
         self._bus_refuse: dict[str, str] = {}
@@ -314,8 +325,8 @@ class MockShedServer:
         # machine, at the same generation, every request still pending on its namespace
         # (`plugin.Registry` `pendingForLocked`); this mock never re-sends a pending
         # request on a later stream, so no cell here can see the daemon/app handoff of an
-        # in-flight request. That handoff is exercised against the host-agent harness's
-        # synthetic bus, which does model it (`tests/host-agent-diff/synthetic_bus.py`,
+        # in-flight request. That handoff is exercised against the broker wire harness's
+        # synthetic bus, which does model it (`tests/broker-wire/synthetic_bus.py`,
         # `test_source_pin.py`).
         self._bus_pending: dict[tuple[str, str], dict] = {}
         # Set while `pause()` has the server down; the port it serves (kept across one).
@@ -736,6 +747,29 @@ class MockShedServer:
                 self._bus_cond.wait(remaining)
             return self._bus_responses[ns][0]
 
+    def await_reply(self, ns: str, in_reply_to: str, timeout: float = 10.0) -> dict:
+        """Block until the broker POSTs the response to request `in_reply_to` on
+        `{ns}` and return it (or raise on timeout). Unlike `await_response`, which
+        returns the namespace's FIRST response, this finds one request's answer on
+        a mock that many requests go through (the session mocks)."""
+        deadline = time.monotonic() + timeout
+        with self._bus_cond:
+            while True:
+                for env in self._bus_responses.get(ns, []):
+                    if env.get("in_reply_to") == in_reply_to:
+                        return env
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"no response to {in_reply_to!r} POSTed for {ns!r} within {timeout}s")
+                self._bus_cond.wait(remaining)
+
+    def replies_to(self, ns: str, in_reply_to: str) -> list[dict]:
+        """Every accepted response to request `in_reply_to` on `{ns}` (arrival order)."""
+        with self._bus_cond:
+            return [env for env in self._bus_responses.get(ns, [])
+                    if env.get("in_reply_to") == in_reply_to]
+
     def egress_hits(self) -> int:
         with self._bus_cond:
             return self._egress_hits
@@ -1029,11 +1063,16 @@ class MockShedServer:
                     state._bus_release(ns, token)
 
             def _serve_egress(self):
-                """The always-on egress-audit consumer route. Record the hit and 501
-                (unavailable) so the broker's egress subscriber backs off — no decision
-                stream is needed for these cells (wire catalog §9)."""
+                """The always-on egress-audit consumer route. Record the hit, then
+                501 (unavailable) so the broker's egress subscriber backs off (wire
+                catalog §9) — unless the mock was built with `egress_events`, when it
+                streams them (each once) and holds the stream until teardown or the
+                client goes."""
                 state._bus_record_egress()
-                self._send(501, {"error": "egress unavailable"})
+                if state._egress_queue is None:
+                    self._send(501, {"error": "egress unavailable"})
+                    return
+                self._stream_sse(state._egress_queue, threading.Event())
 
             def _stream_sse(self, q, end: threading.Event, ns: str | None = None,
                             machine_id: str | None = None, gen: int = 0):
@@ -1228,6 +1267,8 @@ class MockShedServer:
         with self._bus_cond:
             for q in self._bus_queues.values():
                 q.put(None)  # per-queue teardown sentinel
+            if self._egress_queue is not None:
+                self._egress_queue.put(None)
             threads = list(self._bus_sse_threads)
         for t in threads:
             t.join(timeout=2)

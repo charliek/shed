@@ -1,5 +1,5 @@
 //! The Docker registry-credential backend — a faithful Rust port of
-//! `cmd/shed-host-agent/docker_backend.go`.
+//! the retired Go daemon's `docker_backend.go`.
 //!
 //! Resolves Docker registry credentials on the host by reading the host's Docker
 //! `config.json` and, when a credential helper is configured, shelling out to
@@ -1454,7 +1454,7 @@ mod tests {
 
     fn fixture(name: &str) -> serde_json::Value {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures")
+            .join("../../tests/broker-wire/fixtures")
             .join(name);
         let raw = std::fs::read_to_string(&path).expect("read golden fixture");
         serde_json::from_str(&raw).unwrap()

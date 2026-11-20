@@ -58,7 +58,7 @@ be another's id prefix), changes nothing and lists them. Put -- before a
 name that begins with '-'.
 
 The old machine stops answering at once. The new one starts answering when
-its shed-host-agent or desktop app next connects, within about 30 seconds
+its desktop app next connects, within about 30 seconds
 (at once from the desktop app's "Use this machine").`,
 	Example: `  shed source use laptop
   shed source use 9a60b039
@@ -219,7 +219,7 @@ func runSourceUse(cmd *cobra.Command, args []string) error {
 	if old, ok := findSourceMachine(before.Machines, prev); ok && prev != m.ID {
 		fmt.Fprintf(w, "Machine %s no longer answers. ", sourceMachineLabel(old))
 	}
-	fmt.Fprintln(w, "The new source answers once its shed-host-agent or desktop app next connects, within about 30 s.")
+	fmt.Fprintln(w, "The new source answers once its desktop app next connects, within about 30 s.")
 	return nil
 }
 

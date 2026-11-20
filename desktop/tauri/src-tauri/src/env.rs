@@ -25,11 +25,6 @@ pub struct Env {
     /// with a `/tmp/shed-tauri-<uid>/shed-tauri.sock` fallback — flat, no nested
     /// subdir, to stay under the macOS Unix-socket path limit).
     pub socket_path: PathBuf,
-    /// The host-agent approval socket (`SHED_TAURI_HOST_AGENT_SOCKET` in tests →
-    /// the fake agent; else the PLATFORM default — see [`default_host_agent_socket`]:
-    /// macOS `~/Library/Application Support/shed`, Linux `$XDG_RUNTIME_DIR/shed` or
-    /// `~/.local/share/shed`, both under `$SHED_HOST_AGENT_SOCKET_DIR` if set).
-    pub host_agent_socket: PathBuf,
     /// TEST-ONLY roost-session override: `SHED_TAURI_ROOST_SOCKETS`, a
     /// comma-separated `<machine>=<socket path>` map. A named machine's
     /// `roost-session` is dialled on that Unix socket directly instead of through
@@ -106,10 +101,9 @@ pub struct Env {
     /// ancestor). Read only alongside [`Self::craze_path`], so empty in
     /// production.
     pub craze_env: Vec<(String, String)>,
-    /// The host-agent `extensions.yaml` the EMBEDDED broker loads (`SHED_TAURI_EXTENSIONS_CONFIG`,
-    /// else the daemon default `~/.config/shed/extensions.yaml`). Only read in embedded /
-    /// headless-coexist mode; external mode never touches it. The harness overrides it to
-    /// keep an embedded-mode run hermetic.
+    /// The `extensions.yaml` the embedded broker loads (`SHED_TAURI_EXTENSIONS_CONFIG`,
+    /// else `~/.config/shed/extensions.yaml`). The harness overrides it to keep a run
+    /// hermetic.
     pub broker_extensions_path: PathBuf,
     /// The app's log file (#414, [`crate::applog`]): `SHED_TAURI_LOG_FILE`, else the
     /// platform default — macOS `~/Library/Logs/ShedDesktop/shed-desktop.log`, Linux
@@ -228,9 +222,6 @@ impl Env {
             socket_path: var("SHED_TAURI_SOCKET")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_socket_path),
-            host_agent_socket: var("SHED_TAURI_HOST_AGENT_SOCKET")
-                .map(PathBuf::from)
-                .unwrap_or_else(default_host_agent_socket),
             broker_extensions_path: var("SHED_TAURI_EXTENSIONS_CONFIG")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_extensions_path),
@@ -344,8 +335,7 @@ fn jail_flag(test_mode: bool, release_build: bool, raw: Option<&str>) -> (bool, 
     (value == Some("1"), refusal)
 }
 
-/// The embedded broker's `extensions.yaml`, matching where `shed-host-agent` reads it
-/// (`~/.config/shed/extensions.yaml`). Pre-expanded off `$HOME` so the broker's own
+/// The embedded broker's `extensions.yaml` (`~/.config/shed/extensions.yaml`). Pre-expanded off `$HOME` so the broker's own
 /// tilde-expansion is a no-op; a missing file is not fatal here (the bridge synthesizes
 /// the fresh-install default).
 fn default_extensions_path() -> PathBuf {
@@ -353,34 +343,6 @@ fn default_extensions_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_default();
     home.join(".config/shed/extensions.yaml")
-}
-
-/// The host agent's approval socket, matching where `shed-host-agent` places it
-/// PER PLATFORM: an explicit
-/// `$SHED_HOST_AGENT_SOCKET_DIR` wins everywhere; else **macOS** uses the native
-/// `~/Library/Application Support/shed`, and **Linux** the XDG convention
-/// (`$XDG_RUNTIME_DIR/shed`, else `~/.local/share/shed`) — plus `host-agent.sock`.
-///
-/// The macOS branch is load-bearing: without it the mac app resolves the Linux
-/// path (`~/.local/share/shed`), never reaches the agent that actually listens on
-/// `~/Library/Application Support/shed/host-agent.sock`, and every secure server
-/// then 401s (no control-token minting) with approvals silently unavailable.
-fn default_host_agent_socket() -> PathBuf {
-    let home = || {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-    };
-    let dir = if let Some(explicit) = std::env::var_os("SHED_HOST_AGENT_SOCKET_DIR") {
-        PathBuf::from(explicit)
-    } else if cfg!(target_os = "macos") {
-        home().join("Library/Application Support/shed")
-    } else if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").filter(|x| !x.is_empty()) {
-        PathBuf::from(xdg).join("shed")
-    } else {
-        home().join(".local/share/shed")
-    };
-    dir.join("host-agent.sock")
 }
 
 fn default_config_path() -> PathBuf {

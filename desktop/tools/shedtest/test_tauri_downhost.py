@@ -29,7 +29,6 @@ import pytest
 
 import ui
 from client import TauriClient
-from fake_host_agent import FakeHostAgent
 from mockserver import MockShedServer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -47,25 +46,20 @@ def _downhost_app(mock_base_url: str, *, config: Path = DOWNHOST_CONFIG,
     socket/proc, so it never touches ui._state (the session instance's
     bookkeeping).
 
-    It also owns a PRIVATE FakeHostAgent (started/stopped here, mirroring the
-    session `fake` fixture): the throwaway app connects to its own socket, so this
-    instance can never steal the session fake's single tracked connection and
-    misroute its emit_request/emit_event frames."""
+    Its broker serves no server (`ui.subproc_env`'s default hermetic broker), so
+    this instance never takes a listener slot on a session mock."""
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
         raise RuntimeError(
             f"tauri binary not found at {cfg.binary}; build it first (make tauri-build).")
-    agent = FakeHostAgent()
-    agent.start()
+    # Short prefix: the socket lives under this dir (itself under a long macOS
+    # TMPDIR), and a Unix socket path must stay under SUN_LEN (~104).
+    runtime_dir = Path(tempfile.mkdtemp(prefix="shed-dh-"))
+    sock = runtime_dir / cfg.sock_rel
+    log = runtime_dir / "downhost-ui.log"
     try:
-        # Short prefix: the socket lives under this dir (itself under a long macOS
-        # TMPDIR), and a Unix socket path must stay under SUN_LEN (~104).
-        runtime_dir = Path(tempfile.mkdtemp(prefix="shed-dh-"))
-        sock = runtime_dir / cfg.sock_rel
-        log = runtime_dir / "downhost-ui.log"
         env = ui.subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=mock_base_url,
-                             config_path=config, host_agent_socket=agent.socket_path,
-                             unreachable_hosts=unreachable)
+                             config_path=config, unreachable_hosts=unreachable)
         log_fh = open(log, "wb")
         proc = subprocess.Popen([str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT)
         try:
@@ -81,17 +75,15 @@ def _downhost_app(mock_base_url: str, *, config: Path = DOWNHOST_CONFIG,
         finally:
             ui.terminate(proc)
             log_fh.close()
-            shutil.rmtree(runtime_dir, ignore_errors=True)
     finally:
-        agent.stop()
+        shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
 @pytest.fixture
 def downhost(mock):
     """A ready client for a self-managed down-host tauri instance. `mock` is the
     session-scoped shared mock server (reused, not re-created); the instance itself
-    — and its private fake host-agent — is throwaway. The session `fake` fixture is
-    deliberately NOT requested, so this module never perturbs it."""
+    — and its broker, which serves no server — is throwaway."""
     with _downhost_app(mock.base_url) as client:
         yield client
 
@@ -254,9 +246,7 @@ def test_a_failed_host_is_still_carried_and_surfaced_in_the_sidebar(downhost):
     # renders no error strip (an unreachable server is a status, and status lives
     # in the sidebar's SHED SERVERS section + the System pane); the payload keeps
     # the failure, which drives the sidebar and the empty state.
-    # The mock's closed-port simulation is a transport failure → kind `other`
-    # (the AgentUpgradeRequired kind is pinned at the Rust unit level —
-    # ipc.rs::sheds_payload_carries_host_errors_for_two_failed_hosts).
+    # The mock's closed-port simulation is a transport failure → kind `other`.
     errs = downhost.sheds_host_errors()
     assert [e["server"] for e in errs] == ["down"], f"unexpected host_errors: {errs}"
     assert errs[0]["kind"] == "other"

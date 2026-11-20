@@ -49,12 +49,67 @@ func testFingerprint(label string) string {
 	return "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:])
 }
 
+// testKeyUsers is the user the tests' named-user lookups give each of the
+// package's well-known keys (user_routes_test.go, source_handlers_test.go).
+// testClientCert names that user in the certificate, as the bootstrap does
+// for the user a key resolves to; any other key is the implicit user's. A
+// test whose lookup gives a key to another user says so with nameTestKey.
+// (No test in this package runs in parallel.)
+var testKeyUsers = map[string]string{
+	aliceFP: "alice", aliceLaptopFP: "alice", aliceScriptFP: "alice",
+	bobFP:  "bob",
+	rootFP: "root", rootScriptFP: "root",
+}
+
+// nameTestKey makes testClientCert name user (servertls.ImplicitUserValue
+// for the implicit user) in the certificates of the key fp, for the rest of
+// the test.
+func nameTestKey(t *testing.T, fp, user string) {
+	t.Helper()
+	prev, had := testKeyUsers[fp]
+	testKeyUsers[fp] = user
+	t.Cleanup(func() {
+		if had {
+			testKeyUsers[fp] = prev
+		} else {
+			delete(testKeyUsers, fp)
+		}
+	})
+}
+
+// unboundClientCert is a certificate that names no user, as a server older
+// than 0.10.0 issued it: refused on every server.
+func unboundClientCert(cn, scope string, ttl time.Duration) *x509.Certificate {
+	c := implicitClientCert(cn, scope, ttl)
+	c.Subject.Names = nil
+	return c
+}
+
 // testClientCert builds an unsigned leaf carrying the identity the middleware
-// reads. A negative ttl produces an already-expired certificate.
+// reads: the key fingerprint cn, and the user the certificate was issued to
+// (testKeyUsers; a certificate that names no user is refused). A negative ttl
+// produces an already-expired certificate. A test on a server whose lookup
+// gives one of those keys to the implicit user uses implicitClientCert.
 func testClientCert(cn, scope string, ttl time.Duration) *x509.Certificate {
+	if name, ok := testKeyUsers[cn]; ok {
+		return clientCertNaming(cn, name, scope, ttl)
+	}
+	return implicitClientCert(cn, scope, ttl)
+}
+
+// implicitClientCert is testClientCert for a certificate issued to the
+// implicit user (a server with no user list), whatever the key.
+func implicitClientCert(cn, scope string, ttl time.Duration) *x509.Certificate {
+	return clientCertNaming(cn, servertls.ImplicitUserValue, scope, ttl)
+}
+
+// clientCertNaming is testClientCert for a certificate whose user attribute
+// holds value: a user name, or servertls.ImplicitUserValue.
+func clientCertNaming(cn, value, scope string, ttl time.Duration) *x509.Certificate {
 	now := time.Now()
 	cert := &x509.Certificate{
-		Subject:   pkix.Name{CommonName: cn},
+		Subject: pkix.Name{CommonName: cn, Names: []pkix.AttributeTypeAndValue{
+			{Type: servertls.ClientUserOID, Value: value}}},
 		NotBefore: now.Add(-time.Minute),
 		NotAfter:  now.Add(ttl),
 	}

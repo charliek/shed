@@ -105,9 +105,9 @@ func TestBootstrapOpenServerRefusalOnTheWire(t *testing.T) {
 			s.SetBootstrap(BootstrapInfo{TokenTTL: time.Hour})
 			addr := serveForTest(t, s)
 
-			// What released clients send: the CLI and the host-agent both put a
-			// CSR on the line since v0.8.1; older ones sent none.
-			for _, cmd := range []string{"control cli csr=AAAA", "credentials host-agent csr=AAAA", "control cli", ""} {
+			// What clients send: the CLI and the broker both put a CSR on
+			// the line; clients before v0.8.1 sent none.
+			for _, cmd := range []string{"control cli csr=AAAA", "credentials broker csr=AAAA", "control cli", ""} {
 				stdout, stderr, status := runBootstrap(t, addr, signer, cmd)
 				if stderr != wantStderr {
 					t.Errorf("%q: stderr = %q, want %q", cmd, stderr, wantStderr)

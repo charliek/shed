@@ -26,13 +26,12 @@ The sidebar selects a pane:
   CPU/memory, then streams creation progress live (SSE). The list is kept current by polling
   each `shed-server`.
 - **Approvals** — pending credential-approval requests, with Approve / Deny (optionally
-  confirmed with Touch ID on macOS or a polkit password prompt on Linux). They come from the app's own embedded broker by
-  default, or from a separate `shed-host-agent` configured to delegate — see
-  [Credential approvals](approvals.md).
+  confirmed with Touch ID on macOS or a polkit password prompt on Linux). They come from
+  the app's own credential broker — see [Credential approvals](approvals.md).
 - **Agents** — the agent sessions on each shed and machine, as [roost](../extensions/roost-session-hosts.md)
   rows with activity pills, plus craze and opencode sessions with a live transcript,
   approvals and **New craze session**. See [Agent lanes](agent-lanes.md).
-- **Activity** — the merged audit feed (host-agent credentials + the app's decisions), with
+- **Activity** — the merged audit feed (the broker's credentials + the app's decisions), with
   a "Reveal log" button.
 - **Egress** — per-host egress profiles (allow/deny rules, by source) plus an activity
   sub-tab filtered to the `egress` namespace.
@@ -52,10 +51,17 @@ through apt.
 ## Preferences
 
 **Preferences…** (in the menu) covers launch-at-login, the terminal, the credential broker
-mode and which of your machines is the credential source on each server (with
+and which of your machines is the credential source on each server (with
 **Use this machine**), and the approval policy (SSH policy and method, AWS/Docker modes, per-shed overrides). The full set of
 settings — and the environment-variable overrides — is in
 [Configuration](configuration.md).
+
+## Credentials need the app running
+
+The app is the credential broker: it answers your sheds' SSH, AWS and Docker credential
+requests only while it is running. So at its first launch it turns on **Launch at login**,
+once, and runs whenever you are logged in. Switch it off in **Preferences › General** if you
+do not want that; the app never turns it on again.
 
 ## Configuration
 

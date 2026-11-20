@@ -23,9 +23,9 @@ Firecracker runs without its jailer.
 - The server runs `auth.mode: mtls` (see [Security
   Configuration](security-configuration.md#case-3-networked-mtls-facing-the-network)).
   A user list is refused in open mode.
-- Upgrade every machine that answers credential requests (shed-host-agent and
-  the desktop app) to 0.10.0 or newer before the server: a server that pins
-  refuses an older broker.
+- Upgrade the desktop app on every machine that answers credential requests to
+  0.10.0 or newer before the server: a server that pins refuses an older
+  broker.
 - Decide the **whole** list before the first start with it. On that start a
   server with exactly one user gives that user every shed that has no user; a
   server with several gives none away (see [Sheds with no
@@ -146,12 +146,21 @@ unassigned sheds to whoever is left. With one user, the marker names that
 user before anything is given away. A start that does not finish (a shed or
 snapshot it could not read or stamp) leaves the step pending for that user,
 and the next start resumes it only while that same user is still the only
-one listed; with any other list it gives nothing more away, records the step
-as done, and logs that the unfinished step was abandoned, so the sheds still
-without a user need `shed assign`. A start with **no** user list removes the
-marker, so removing the list and adding it back repeats the step. At every
-start the log reports how many sheds have no user and how many of those carry
-host resources (with their names at `log_level: debug`).
+one listed. With any other list the server **does not start**: it stops
+before it opens anything or gives anything away, and its error names the user
+the step began for and the two ways forward. Either put that user back as the
+only one in `auth.users` and start the server again until its log says the
+step is `done and recorded`, then change the list; or start it once with
+[`shed-server serve --abandon-user-upgrade`](../reference/cli.md#shed-server-serve),
+which gives nothing more away, records the step as done, and logs that the
+unfinished step was abandoned, so the sheds still without a user need `shed
+assign` (one that carries host directories or server mounts can never be
+assigned: it has to be recreated). The flag is refused at any start with no
+such step, so it cannot be left on the service's command line. A start with
+**no** user list removes the marker, so removing the list and adding it back
+repeats the step. At every start the log reports how many sheds have no user
+and how many of those carry host resources (with their names at `log_level:
+debug`).
 
 So the simplest path for a server one person used before: **start once with
 only yourself listed**, which gives you every existing shed, then add the
@@ -213,7 +222,7 @@ automation never answers, or receives, the user's credential requests.
 
 Each user's credential requests (SSH signatures, AWS and Docker credentials)
 go to one machine of theirs: their **credential source** on this server. The
-first of their machines whose shed-host-agent or desktop app connects becomes
+first of their machines whose desktop app connects becomes
 it. Any other machine of that user is refused, shows the source's name, and
 keeps retrying; it never takes over by itself.
 

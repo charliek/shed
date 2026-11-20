@@ -252,7 +252,7 @@ func TestYAMLKeysCoverServerConfig(t *testing.T) {
 	for _, k := range yamlKeys(reflect.TypeOf(ServerConfig{})) {
 		got[k] = true
 	}
-	for _, want := range []string{"name", "auth", "bind_address", "https_port", "remote", "network", "credentials"} {
+	for _, want := range []string{"name", "auth", "bind_address", "https_port", "remote", "network", "mounts"} {
 		if !got[want] {
 			t.Errorf("yamlKeys(ServerConfig) lacks %q", want)
 		}

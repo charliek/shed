@@ -16,9 +16,9 @@ bind_address: 127.0.0.1
 default_backend: firecracker
 log_level: info
 
-# Credentials to mount into VMs
+# Host directories to mount into every shed
 # Using ~/.shed/mounts/ keeps host and VM configs separate.
-# credentials:
+# mounts:
 #   claude:
 #     source: /root/.shed/mounts/claude
 #     target: /home/shed/.claude
@@ -36,7 +36,7 @@ log_level: info
 # env_file: /root/.shed/env
 
 # Extensions provide credential brokering from host to VM.
-# Requires shed-host-agent to be installed and running.
+# Requires the shed desktop app on your machine.
 # extensions:
 #   enabled:
 #     - ssh-agent

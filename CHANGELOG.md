@@ -5,14 +5,12 @@ All notable changes to this project will be documented in this file.
 <!--
   `**Ships:**` convention: each release entry opens with a `**Ships:** …`
   line naming the components that tag actually shipped, using the
-  canonical tokens `server`, `host-agent`, `desktop`
-  (comma-separated; legacy `server/CLI` is accepted as an alias for
-  `server`, for entries written before the rename; `machine-rc` and `sx`
-  appear in historical entries but are REJECTED on new ones — machine-rc
-  was retired in plan 010, and sx was sunset, unreleased, in plan 016).
+  canonical tokens `server`, `desktop` (comma-separated, with no alias).
+  Older entries name components since retired (`machine-rc`, `sx`, `host-agent`)
+  or the old spelling `server/CLI`; a new entry that names one of them, or any
+  other token, is refused.
   A component ships iff
   its version manifest equals the tag (server: .claude-plugin/plugin.json;
-  host-agent: crates/shed-host-agent/VERSION;
   desktop: desktop/VERSION) — see
   RELEASING.md "Component selection". ENFORCED by
   scripts/release/release-plan.sh on stable tags (a mismatched, missing,
@@ -23,21 +21,138 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-> **macOS (VZ): upgrading from 0.9.0 stops every running VZ shed once.** The 0.9.0
-> `shed-server` started vfkit in the launchd job's process group, so the
-> `brew services restart shed` that applies 0.9.1 still takes running sheds down. Stop them
-> first (`shed stop`), or `shed start` them afterwards. From 0.9.1 on, restarts leave VMs
-> running.
+**Ships:** server, desktop
+
+v0.10.0 lets a server take its users from a remote account service as well as from its
+config, runs sheds as cloud VMs as well as on the server host, and retires the separate
+credential daemon: the desktop app is the only credential broker. It also brings the work of
+the unreleased 0.9.1:
+opt-in mount selection, the isolated network, service clients with HTTPS exec, the audit log,
+and fixes for #409, #284, #410, #412, #304 and #109. A shed server can now have named users,
+each of whom sees and enters only their own sheds; each user's credential requests go to one
+machine of theirs; and that machine signs only what git needs. Token mode is gone: a server
+reachable from other hosts runs `mtls`.
+
+> **Breaking, and a clean break: read the [v0.9.0 to v0.10.0 upgrade
+> guide](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.10.0/) before you upgrade
+> anything.** Old installs are not carried forward. In short:
 >
-> Read the [v0.9.0 to v0.9.1 upgrade guide](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.9.1/)
-> before upgrading.
+> - Move token-mode servers to `mtls` while they run 0.9.x.
+> - Hold the CLI and desktop app packages on machines that run no server. Then upgrade the
+>   servers first: a 0.10.0 CLI or app cannot use a 0.9.x server.
+> - Right after, on every machine: uninstall `shed-host-agent`, upgrade the CLI and enrol every
+>   entry again (`shed server update NAME --refetch`), then upgrade the desktop app. The app
+>   starts as a new machine.
+> - On macOS, upgrading a server from 0.9.0 stops every running VZ shed once (stop them
+>   first, or start them afterwards).
 
 ### Upgrade notes
 
-- **A server upgraded with no config change behaves as before**: token or mtls mode as
-  configured, every server `mounts:` entry in every shed, the `open` network, no audit log
-  and no reaper. Everything below is opt-in, per shed (`shed create --mounts`, `--network`)
-  or per service client (`auth.clients`).
+- **`auth.mode: token`, `secure` and `allow_insecure_exposure` fail config load** with a
+  message naming `mtls`; nothing falls back to open, and an `open` server binds loopback only.
+  Switch such a server to `mtls` while it still runs 0.9.x: clients since v0.8.1 re-enroll with
+  a certificate on their next request. A config left unmigrated makes the apt package skip
+  the restart and leave the old process running, and leaves a Homebrew service down after
+  its restart.
+- **An unknown or differently cased key under `auth:` fails config load** (`auth: {Mode:
+  mtls}` used to be ignored, starting the server open), and so does a top-level key that
+  matches a known one only when case is ignored (`Auth:`, `Bind_Address:`).
+- **Upgrade servers first, then every machine right after.** A 0.10.0 CLI or desktop app
+  refuses a certificate that names no user, which only a server older than 0.10.0 issues, so
+  it cannot use a 0.9.x server. A desktop app older than 0.10.0 gets `403
+  SOURCE_MACHINE_ID_REQUIRED` from a 0.10.0 server and brokers nothing until upgraded. On
+  machines that run no server, hold the CLI and app packages (`brew pin shed`; `apt-mark
+  hold shed-server shed-desktop`) until the servers they use run 0.10.0.
+- **The first machine to connect for each user becomes its credential source** (on a server
+  with no user list, the one source for every shed). Start the intended machine first, or move
+  it with `shed source use`. Nothing fails over by itself.
+- **`ssh`, `scp` or `rsync` from a shed as a username other than `git` is refused** by the
+  machine once it is upgraded. Allow a name with `ssh.allow_users`, which then needs
+  `ssh.offer_keys`.
+- **`git` is reserved as a shed name.** Delete or recreate a shed named `git` before upgrading.
+- **A user list is decided once.** On a server with existing sheds, start the first time with
+  only yourself listed (as an admin), then add the others: with several users nothing is
+  given away, and most existing Firecracker and VZ sheds cannot be assigned.
+- **`api.github.com` is a new outbound dependency** for every server that follows a GitHub
+  login.
+- **Development:** the Firecracker dev entry from when that server ran open is plain HTTP and
+  does not heal: remove it and add it again with `shed server add <host> --ssh-port 12222
+  --name <host>-dev`.
+- **Switching a server to `auth.directory` is a fresh start**: there is no migration, and
+  names decide ownership (a list person named like an earlier user receives that user's
+  sheds and credential-source records). Whoever controls the account service controls the
+  host of every server enrolled with it (a list admin is an admin there), and the trust time
+  needs an accurate host clock. See the [upgrade
+  guide](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.10.0/#users-from-an-account-service).
+- **Moving an installed server to the account service** is written down in the [User
+  Directory guide](https://charliek.github.io/shed/guides/user-directory/): the Homebrew
+  commands (run `shed-server` as yourself with `--config "$(brew --prefix)/etc/shed/server.yaml"`,
+  never with `sudo`, which enrols into `/etc/shed`, where the service never looks); a first
+  enrolment on a running server; keeping your sheds, in two starts (once with only yourself
+  in `auth.users`, so the one-time upgrade step gives them to your list name, then the
+  switch, with the local admin under another name); and the local admin on a backup key with
+  one host name and `--identity-file` on each entry.
+- **CLI: upgrade every server first, then enrol every mtls entry again with `shed server
+  update NAME --refetch`** (`NAME` the entry's name), once per entry, on every machine. The CLI refuses, before it
+  sends any request or runs `ssh`, an entry whose stored certificate names no user (a server
+  older than 0.10.0 issued it) or names a user the entry does not record (an older CLI saved
+  the entry, it was edited by hand, or an enrolment was interrupted); the refetch records the
+  user and prints it. A newly
+  issued certificate that names no user is refused too, with nothing saved. A CLI older than
+  0.10.0 drops `user` when it saves `config.yaml`: use 0.10.0 on every machine that shares
+  one. A running tunnel daemon keeps the entry it started with: restart it after a refetch.
+- **Scripts that match the refusal of a key must match its new text.** `your SSH key is not
+  in this server's allowlist (auth.ssh.github_users / authorized_keys)` and the bootstrap
+  error's `ssh could not authenticate with any available identity (… or the key may not be
+  on the server allowlist)` are gone; match `the server refused every SSH key ssh offered`
+  (the CLI) or `sdk/bootstrap: the server refused every key ssh offered` (the bootstrap
+  error) instead (see "Changed").
+- **Readers of `audit.jsonl`: the identity kind `admin` is gone, with no alias.** A person is
+  now `kind: user` (with `user`, or `implicit: true`, and `admin` and `script`), and a `reap`
+  line carries `kind: system` (see "Audit log: callers by kind" below). Update any filter that
+  matches `kind == "admin"`. A new `ssh` line records each time a person enters a service
+  client's shed over SSH, and a new `connect` line each tunnel a person opens into one through
+  the HTTPS Connect API (see "Audit log: a person's entry" below).
+- **Deb: an edited `/etc/systemd/system/shed-server.service` makes the upgrade prompt.** The
+  unit is a dpkg conffile and changes in this release (it now waits for the network, see
+  "Changed"). An unedited unit is replaced with no prompt. An edited one makes dpkg ask, and
+  an unattended `apt-get -y` upgrade stops at that prompt (`end of file on stdin at conffile
+  prompt`), the package left unpacked and the edit untouched. To avoid the stop, add
+  `-o Dpkg::Options::=--force-confold` to the upgrade: it keeps your unit and leaves the
+  package's as `shed-server.service.dpkg-dist`; add `network-online.target` to your `After=`
+  and `Wants=` lines. To recover from an upgrade that already stopped, finish the
+  configuration yourself: run `sudo dpkg --configure shed-server` in a terminal and answer
+  the prompt about the unit. If you take the package's version (until then it waits beside
+  yours as `shed-server.service.dpkg-new`), apply your edits to it again; if you keep yours,
+  add `network-online.target` as above. Then `sudo systemctl daemon-reload` and restart the
+  service.
+- **Upgrading the binary does not rewrite a unit `shed-server install` wrote.** Run `sudo
+  shed-server install` again, or add `network-online.target` to its `After=` and `Wants=`
+  lines and `sudo systemctl daemon-reload`, to get the new ordering. Recommended for a server
+  that takes its users from an account service; not required. On a deb install the same path
+  is the package's conffile, so dpkg can replace the unit if you choose the package's
+  version at the prompt.
+- **Uninstall `shed-host-agent` on every machine**, right after the servers it answered for
+  run 0.10.0 and before you upgrade the desktop app (`brew services stop shed-host-agent`,
+  then `brew uninstall shed-host-agent`). Its formula is removed from the tap with this
+  release, and a 0.10.0 server refuses it. The desktop app never reads its Homebrew config
+  (`$(brew --prefix)/etc/shed/extensions.yaml`): copy it to `~/.config/shed/extensions.yaml`
+  only if you edited it, then delete its `server:` line and any `desktop:` block (which the
+  app refuses). See [Remove the old credential
+  daemon](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.10.0/#remove-the-old-credential-daemon).
+- **The desktop app starts as a new machine.** Its broker keeps its state in `<state>/broker/`
+  and nothing is moved from the old directory, so it enrols with each server again over SSH
+  and creates a new machine id. A server where another machine id is your credential source
+  refuses it until you press **Use this machine** or run `shed source use`. Delete the old
+  `<state>/host-agent/` directory once the app works (`<state>` is `~/Library/Application
+  Support/shed` on macOS, `$XDG_DATA_HOME/shed` or `~/.local/share/shed` on Linux).
+- **The desktop app turns on Launch at login once**, at its first 0.10.0 launch, on an
+  upgraded install too. Credentials are answered only while it runs. Switch it off in
+  Preferences › General; the app never turns it on again.
+- **The new shed and service-client features are opt-in.** With no config change every shed
+  gets every server `mounts:` entry and the `open` network, and there is no audit log and no
+  reaper. They are turned on per shed (`shed create --mounts`, `--network`) or per service
+  client (`auth.clients`).
 - **`auth.clients` requires `auth.mode: mtls`**; a config that sets it in `open` or `token`
   mode is refused at load. Unknown keys under `auth.clients` and `network:` are refused too.
 - **Isolated sheds need `nft`.** A Firecracker server that creates an `isolated` shed, or
@@ -114,8 +229,7 @@ All notable changes to this project will be documented in this file.
   (macOS) or `~/.local/state/ai.stridelabs.shed-desktop/shed-desktop.log` (Linux,
   `$XDG_STATE_HOME` honoured), rotated at 5 MiB with three kept. `SHED_TAURI_LOG_FILE` moves
   it, `SHED_TAURI_LOG=debug` adds debug detail, and `identify` reports the path. The
-  broker's connect, drop and rejection lines now name their server, in `shed-host-agent`'s
-  log too. (#414)
+  broker's connect, drop and rejection lines now name their server. (#414)
 - **Desktop (craze): `/effort` in the `/` menu.** On a session whose model has an effort
   setting, a bare `/effort` opens the settings sheet and `/effort <level>` sets the effort
   directly (`/effort default` picks the model's default where craze says what it is). The row
@@ -207,299 +321,6 @@ All notable changes to this project will be documented in this file.
   (`SHED_REMOTE_SERVER`; `make test-integration-remote`, manual only, since every shed is a
   billed VM). See [Remote Backend
   Development](https://charliek.github.io/shed/development/remote-backend/).
-
-### Changed
-
-- **Images: the `extensions` and `full` images bake craze 0.2.0** (0.9.0 baked 0.1.0), and
-  shed's CI tests against it. See
-  [craze's changelog](https://github.com/charliek/craze/blob/main/CHANGELOG.md) for what changed
-  in craze itself, including that a model switch on a native session now lands on the effort
-  last used on that model. A machine with its own craze needs it upgraded and its running hub
-  ended; see the [upgrade guide's craze
-  section](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.9.1/#craze).
-- **Desktop (craze): a remote host's hub is reached with `craze bridge --hub --no-start`.**
-  The connections the desktop makes on its own attach only to a hub that is already running,
-  so they can never start a hub on a remote shed, and the race this leaves behind is gone.
-  A host with craze older than 0.2.0 falls back to the earlier probe-then-bridge path, race
-  included, until craze is updated there.
-- **Build: Go 1.27 and dependency updates.** chi v5.5.0, `golang.org/x/{crypto,net,sys,sync,term}`,
-  `mdlayher/vsock` v1.4.0, `creack/pty` v1.1.24, logrus v1.10.2, go-containerregistry v0.22.1,
-  and cel-go v0.33.2 under its new module path `cel.dev/cel-go`; golangci-lint 2.15.0.
-  `hugelgupf/p9` stays on v0.3.0 (v0.5.1 gives a file a new QID on every lookup).
-  go-containerregistry v0.22 dropped Go's bound on registry redirects; shed restores it
-  (at most 10) on pulls and pushes.
-- **Server: a cancelled exec closes the guest connection at once**, on every exec path (SSH
-  sessions included), so a guest that stops reading cannot hold a timed-out or abandoned
-  command's request open.
-- **Development: `make test-integration-dev-fc` is FC-only.** It sets `SHED_VZ_SERVER` and
-  `SHED_VZ_DEV_SERVER` empty, so its `[vz]` cases skip instead of reaching the `my-server`
-  entry (which can name a production server), and an empty server name never falls back to
-  the client's default server. The FC dev config gains an `itest` image alias
-  (`shed-fc-base:v0.9.0`) for the exec and service-client tests.
-
-### Removed
-
-- **Desktop: the Swift macOS app's sources.** The Tauri app has been the shipped macOS client
-  since 0.9.0; the retired Swift app (`desktop/Sources`, its tests, `Package.swift`), the
-  `shed-core-ffi` UniFFI crate that bridged the Rust core to it, its build/smoke scripts and
-  its CI job are gone ([#364](https://github.com/charliek/shed/issues/364)). Nothing a user
-  installs changes: the Tauri mac app keeps the bundle id, Sparkle feed and EdDSA key, so
-  pre-0.9.0 installs still update in place. The Swift app's iTerm2 and Warp terminal presets
-  have no Tauri equivalent yet ([#449](https://github.com/charliek/shed/issues/449),
-  [#450](https://github.com/charliek/shed/issues/450)).
-- **Development: `make -C desktop` targets for the Swift app** (`core`, `bundle`, `dmg`,
-  `e2e-ci`, `e2e-swift`, `m0-gates`, `smoke*`, swift-format). `build`, `test`, `lint`, `fmt`,
-  `e2e` and `run` now alias the Tauri and Rust-core targets, and the shedtest harness no
-  longer takes `--target`. CI's `swift` job is replaced by `core-mac` (the Rust core's tests
-  and clippy on macOS).
-- **Docs: the upgrade guides before v0.8.2 → v0.9.0.** Links to them, including the server's
-  config-error messages, now point at their copies in the
-  [v0.9.0 tag](https://github.com/charliek/shed/tree/v0.9.0/docs/upgrades).
-
-### Fixed
-
-- **CLI: `shed server update <name> --refetch` keeps the HTTPS port you chose.** An entry
-  added with `--https-port` (a server reached through a port mapping) had its `api_url`
-  rebuilt from the port the server reports, so after a refetch it pointed at another port.
-  The refetch now verifies the entry's own endpoint first and keeps it when it answers. Only
-  when it cannot be reached (a refused connection, a timeout, a TLS handshake the pin does
-  not pass), the reported port is tried; the entry moves to it only if that one answers, and
-  the refetch says so (`  HTTPS port changed from … to …`; `previous_api_url` in `--json`).
-  An answer from the entry's own endpoint (a 401, a 403, a redirect, a 5xx, a body that does
-  not decode) is no sign of a moved port: the refetch fails there, naming the endpoint and
-  the status, and saves nothing. If neither endpoint answers, the refetch names both and
-  saves nothing. Limits: a stored `api_url` with a path that fails is not retried without
-  the path, and an `/api/info` answer that decodes but is empty still verifies.
-- **CLI: no request to a server's API follows a redirect (security).** Every command's API
-  client, the tunnel's probe and the roost provider's inventory now treat a 3xx as the
-  answer and report it as an error naming the status, so a credential is never sent on to
-  the URL a redirect names; before, an endpoint holding the pinned certificate could pass a
-  bearer token on to a plain-`http` URL. shed-server's API answers no request with a
-  redirect, so nothing that works today changes. The desktop app's own client (the dashboard
-  and its control requests) follows none either: it used to follow a redirect to any `https`
-  URL, and with a pinned server it presented its client certificate to any host holding the
-  pinned certificate. The credential broker's bus and egress stream follow a redirect only
-  within the server's own origin.
-- **CLI: a shed name from a server never reaches `~/.ssh/config` unchecked (security).**
-  `shed ssh-config` (printed, `--install`) and `shed attach` wrote each shed's name from the
-  server's list into a `Host` and a `User` line as it came, so a hostile server could add
-  lines (a `ProxyCommand`) to the managed block. A shed whose name is not a shed name is now
-  skipped, with one warning line naming it escaped, and the other sheds are written; the ssh
-  config writer itself refuses any stanza whose alias, user, host name, port or paths could
-  change what it says, and writes nothing then; the host name must be a literal host name
-  or address (no `%` token, shell syntax, `=` or leading `-`), and the `UserKnownHostsFile`
-  path is written quoted (a home directory with a space was read as two files) and held to
-  the rule the `IdentityFile` path has. An error answer from a
-  server (a JSON request's or an event stream's), a create's progress lines and warnings, a
-  shed's status and status reason, and a server's name are shown with their control
-  characters escaped, as other server text is.
-- **Server: a graceful stop logs each step once.** `Shutting down SSH server...` was written
-  twice.
-- **Desktop: a cloud shed that is stopping shows `stopping`, and a shed's reason shows beside
-  its status.** The shared core now decodes the remote backend's `stopping` status (it read
-  `unknown`) and a shed's `status_reason`. The Sheds pane shows the reason the way `shed list`
-  does (`stopped (capacity)`, `starting (no_pin)`), and a starting or stopping shed shows the
-  busy spinner with no Start or Delete button until it settles. A status the app does not know
-  still reads `unknown`.
-- **Desktop (craze): stopping a session no longer freezes its transcript panel.** craze 0.2.0
-  removes a stopping session from its list before the session's last events arrive. The
-  desktop used to close the lane at once, leaving a panel with no "ended" banner, a live
-  composer, and a `no_lane` error on the next action. A lane now keeps its own connection for
-  up to 10 s after its row leaves. Its last events land, and then it ends with its reason
-  (`session_closed`, or `session_gone` / `hub_gone` when nothing final arrived). The ended
-  panel stays readable, and its composer is disabled. Closing a craze session's tab no longer
-  ends its transcript: the session runs on in its host.
-- **Desktop: while the agent is working, the `/` menu opens on the first command you can run
-  now**, not on one that has to wait for the turn, so Enter right after `/` no longer refuses.
-  The phone gets the same rule from the shared core in its next release.
-- **Desktop: opening, closing or reading a tab on a machine no longer tears down that machine's
-  shared SSH connection when roost refuses the request** (for example, a tab that was already
-  closed), and when the connection itself failed because no roost session is running there,
-  the error now says so and how to start one, instead of "the roost connection closed before
-  the reply". (#407, #351)
-- **Desktop: the roost-session consent card names the agents roost wires hooks into from the
-  same list the app sends**, in the right order. (#362)
-- **Desktop (craze): a session's model and mode settings come back when its settings support
-  drops out and returns**, instead of the settings sheet staying empty until a reconnect.
-- **macOS (VZ): VZ sheds no longer stop on `brew services restart shed`.** vfkit now runs in
-  its own process group, so launchd no longer kills it with the server. The restart that
-  applies 0.9.1 still stops running sheds once. The brew service now waits up to 35 s for a
-  graceful server exit (`stop_timeout`), which requires Homebrew 6.0.13 or later. (#409)
-- **Images: the base stage of both images now pre-creates `~/.local` (`bin`, `share`,
-  `state`), `~/.config` and `~/.cache` owned by `shed`.** Defense in depth for #410, so a mount
-  or tool under those paths never leaves a root-owned parent. Applies to newly built images,
-  from the next image release.
-- **CLI: the first command after a token-mode server restart no longer fails.** `shed start`,
-  `shed create`, `shed image pull`, `shed image push`, `shed snapshot create` and the prune
-  commands now re-mint and retry once on an expired or invalid credential, as the other
-  commands already did, instead of surfacing the 401. (#412)
-- **Server (Firecracker): stopping or deleting a running shed with writable host mounts is no
-  longer held up by its 9P mounts.** A stop took 25–30 s (and raced the CLI's 30 s timeout); it
-  now takes about `stop_timeout` (10 s). A delete took about 25 s; it now takes well under a
-  second. Each 9P mount server now closes only after the VM
-  is gone, force-closes its connections instead of waiting 5 s for the guest to hang up, and
-  closes in parallel with the shed's other mounts. The shutdown hook and the pre-stop sync run
-  before any mount closes, a failed start or a VM that exited unexpectedly no longer leaks 9P
-  listeners, and a `shed-server` restart no longer waits 5 s per mount. On both backends, a
-  client disconnect during `shed stop` no longer turns the graceful stop into a force-kill.
-  `shed delete` now refuses, and keeps the shed's resources, if its VM survives SIGKILL; retry
-  the delete once the VM is gone. A graceful Firecracker stop still ends in a force-kill at
-  `stop_timeout`: the guest kernel cannot receive the Ctrl-Alt-Del it is sent, which is tracked
-  separately. (#284)
-- **Server (VZ and Firecracker): directories a mount needs under the shed user's home are now
-  created as `shed`, not root.** A server mount nested below the home directory (e.g.
-  `~/.local/share/opencode`, `~/.config/gh`) used to leave `~/.local`, `~/.local/share` or
-  `~/.config` owned by root, so `roost-session` could not start — breaking `shed attach` and
-  Connect Host — and anything writing under `~/.local` or `~/.config` failed on `base` and
-  `extensions` sheds. Existing sheds are repaired on their next `shed start`. (#410)
-- **Docs: remove `shed-host-agent` before applying the desktop update, or relaunch the app
-  afterwards.** The 0.8.2 to 0.9.0 upgrade guide and the desktop docs now say so, because in
-  `Automatic` broker mode the app chooses its broker once at launch and does not fall back
-  if the daemon disappears at runtime. A runtime fallback is still open. (#411)
-- **CLI: `shed delete`, `reset`, `snapshot delete`, `image rm`, `image prune` and `system prune` no
-  longer report success when nobody answered.** When stdin is not a terminal and the confirmation
-  prompt gets no answer (EOF, for example under `</dev/null`), the command now exits 1 with an
-  error naming `--force` and sends no mutating request, instead of printing `Cancelled.` and
-  exiting 0. A piped `y` still works. `shed tunnels start` without `--replace` now refuses
-  `/dev/null` as stdin too. (#109)
-- **Server: a startup stalled on the filesystem now names the path.** `shed-server` reads
-  each state directory before starting the backend (`Checking state directories: …`), and a
-  startup step that waits on the filesystem logs a line naming the path after 10 s, then every
-  minute. On macOS the line points at the permission prompt for an external drive and at Full
-  Disk Access, and a directory macOS has denied gets its own warning. A store that hangs on a
-  read now holds startup at that line, instead of the server reaching `ready` while the resume
-  of running sheds hangs silently. (#304)
-- **Server (deb): `/etc/shed/server.yaml` is no longer a dpkg conffile, so an upgrade never
-  prompts about it.** An edited config made dpkg prompt whenever a release changed the
-  packaged template, and an unattended `apt-get -y` upgrade then failed with `end of file on
-  stdin at conffile prompt`, leaving the package unconfigured. The template now ships at
-  `/usr/share/shed/server.yaml.default`: a fresh install copies it to `/etc/shed/server.yaml`,
-  upgrades never touch the file, and purge deletes it. A host stuck by that failure recovers
-  by installing this release. Rolling back to 0.9.0 or earlier needs
-  `-o Dpkg::Options::=--force-confold` to keep an edited config without a prompt. (#109)
-- **macOS (brew): an external-drive permission now survives upgrades.** The formula installs
-  `shed-server` inside a Developer ID signed `ShedServer.app` (bundle ID
-  `ai.stridelabs.shed-server`) under `$(brew --prefix)/opt/shed/libexec`, and `bin/shed-server`
-  is a symlink into it. macOS keys the grant on the bundle ID and signature, not on the Cellar
-  path that changes every version. The brew service command is unchanged. macOS asks one more
-  time on the first start after this upgrade, because the identity changed; after that,
-  upgrades don't ask again. (#304)
-
-<!--
-  Two releases' notes share this Unreleased section. Everything ABOVE this
-  comment is the curated 0.9.1 entry (a fix release, no config change needed).
-  Everything BELOW the rule that follows is the breaking work for 0.10.0
-  (users, the credential source, the signing check, the removed token mode),
-  which ships server, host-agent and desktop. At release time either tag 0.9.1
-  from the notes above and move the block below under a fresh `## Unreleased`
-  (it then becomes the 0.10.0 entry, its `###` headings in place of the
-  `####` ones), or fold both into one v0.10.0 entry. Nothing below may start a
-  line with `## Unreleased` or `## v<digit>` (RELEASING.md).
--->
-
----
-
-### Users, the credential source and the signing check (0.10.0, breaking)
-
-A shed server can now have named users, each of whom sees and enters only their own sheds;
-each user's credential requests go to one machine of theirs; and that machine signs only what
-git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
-
-> **Breaking: move token-mode servers to `mtls` first, then upgrade machines before
-> servers.** `auth.mode: token` and `secure`, and `allow_insecure_exposure`, no longer load. A
-> `shed-host-agent` or desktop app older than 0.10.0 is refused by a 0.10.0 server, and a
-> 0.10.0 machine signs only SSH logins as `git` and git signatures unless told otherwise.
-> Read the [v0.9.1 to v0.10.0 upgrade
-> guide](https://charliek.github.io/shed/upgrades/v0.9.1-to-v0.10.0/) before upgrading
-> anything; it includes the order, the user-list decision and a rollback procedure.
-
-#### Upgrade notes
-
-- **`auth.mode: token`, `secure` and `allow_insecure_exposure` fail config load** with a
-  message naming `mtls`; nothing falls back to open, and an `open` server binds loopback only.
-  Switch such a server to `mtls` while it still runs 0.9.x: clients since v0.8.1 re-enroll with
-  a certificate on their next request. A config left unmigrated makes the apt package skip
-  the restart and leave the old process running, and leaves a Homebrew service down after
-  its restart.
-- **An unknown or differently cased key under `auth:` fails config load** (`auth: {Mode:
-  mtls}` used to be ignored, starting the server open), and so does a top-level key that
-  matches a known one only when case is ignored (`Auth:`, `Bind_Address:`).
-- **Upgrade machines before servers.** A new broker works against a 0.9.x server; a released
-  broker gets `403 SOURCE_MACHINE_ID_REQUIRED` from a 0.10.0 server and brokers nothing until
-  upgraded.
-- **The first machine to connect for each user becomes its credential source** (on a server
-  with no user list, the one source for every shed). Start the intended machine first, or move
-  it with `shed source use`. Nothing fails over by itself.
-- **`ssh`, `scp` or `rsync` from a shed as a username other than `git` is refused** by the
-  machine once it is upgraded. Allow a name with `ssh.allow_users`, which then needs
-  `ssh.offer_keys`.
-- **`git` is reserved as a shed name.** Delete or recreate a shed named `git` before upgrading
-  machines.
-- **A user list is decided once.** On a server with existing sheds, start the first time with
-  only yourself listed (as an admin), then add the others: with several users nothing is
-  given away, and most existing Firecracker and VZ sheds cannot be assigned.
-- **`api.github.com` is a new outbound dependency** for every server that follows a GitHub
-  login.
-- **Development:** the Firecracker dev entry from when that server ran open is plain HTTP and
-  does not heal: remove it and add it again with `shed server add <host> --ssh-port 12222
-  --name <host>-dev`.
-- **Switching a server to `auth.directory` is a fresh start**: there is no migration, and
-  names decide ownership (a list person named like an earlier user receives that user's
-  sheds and credential-source records). Whoever controls the account service controls the
-  host of every server enrolled with it (a list admin is an admin there), and the trust time
-  needs an accurate host clock. See the [upgrade
-  guide](https://charliek.github.io/shed/upgrades/v0.9.1-to-v0.10.0/#users-from-an-account-service).
-- **Moving an installed server to the account service** is written down in the [User
-  Directory guide](https://charliek.github.io/shed/guides/user-directory/): the Homebrew
-  commands (run `shed-server` as yourself with `--config "$(brew --prefix)/etc/shed/server.yaml"`,
-  never with `sudo`, which enrols into `/etc/shed`, where the service never looks); a first
-  enrolment on a running server; keeping your sheds, in two starts (once with only yourself
-  in `auth.users`, so the one-time upgrade step gives them to your list name, then the
-  switch, with the local admin under another name); and the local admin on a backup key with
-  one host name and `--identity-file` on each entry.
-- **CLI: upgrade every server first, then enrol every mtls entry again with `shed server
-  update NAME --refetch`** (`NAME` the entry's name), once per entry, on every machine. The CLI refuses, before it
-  sends any request or runs `ssh`, an entry whose stored certificate names no user (a server
-  older than 0.10.0 issued it) or names a user the entry does not record (an older CLI saved
-  the entry, it was edited by hand, or an enrolment was interrupted); the refetch records the
-  user and prints it. A newly
-  issued certificate that names no user is refused too, with nothing saved. A CLI older than
-  0.10.0 drops `user` when it saves `config.yaml`: use 0.10.0 on every machine that shares
-  one. A running tunnel daemon keeps the entry it started with: restart it after a refetch.
-- **Scripts that match the refusal of a key must match its new text.** `your SSH key is not
-  in this server's allowlist (auth.ssh.github_users / authorized_keys)` and the bootstrap
-  error's `ssh could not authenticate with any available identity (… or the key may not be
-  on the server allowlist)` are gone; match `the server refused every SSH key ssh offered`
-  (the CLI) or `sdk/bootstrap: the server refused every key ssh offered` (the bootstrap
-  error) instead (see "Changed").
-- **Readers of `audit.jsonl`: the identity kind `admin` is gone, with no alias.** A person is
-  now `kind: user` (with `user`, or `implicit: true`, and `admin` and `script`), and a `reap`
-  line carries `kind: system` (see "Audit log: callers by kind" below). Update any filter that
-  matches `kind == "admin"`. A new `ssh` line records each time a person enters a service
-  client's shed over SSH, and a new `connect` line each tunnel a person opens into one through
-  the HTTPS Connect API (see "Audit log: a person's entry" below).
-- **Deb: an edited `/etc/systemd/system/shed-server.service` makes the upgrade prompt.** The
-  unit is a dpkg conffile and changes in this release (it now waits for the network, see
-  "Changed"). An unedited unit is replaced with no prompt. An edited one makes dpkg ask, and
-  an unattended `apt-get -y` upgrade stops at that prompt (`end of file on stdin at conffile
-  prompt`), the package left unpacked and the edit untouched. To avoid the stop, add
-  `-o Dpkg::Options::=--force-confold` to the upgrade: it keeps your unit and leaves the
-  package's as `shed-server.service.dpkg-dist`; add `network-online.target` to your `After=`
-  and `Wants=` lines. To recover from an upgrade that already stopped, finish the
-  configuration yourself: run `sudo dpkg --configure shed-server` in a terminal and answer
-  the prompt about the unit. If you take the package's version (until then it waits beside
-  yours as `shed-server.service.dpkg-new`), apply your edits to it again; if you keep yours,
-  add `network-online.target` as above. Then `sudo systemctl daemon-reload` and restart the
-  service.
-- **Upgrading the binary does not rewrite a unit `shed-server install` wrote.** Run `sudo
-  shed-server install` again, or add `network-online.target` to its `After=` and `Wants=`
-  lines and `sudo systemctl daemon-reload`, to get the new ordering. Recommended for a server
-  that takes its users from an account service; not required. On a deb install the same path
-  is the package's conffile, so dpkg can replace the unit if you choose the package's
-  version at the prompt.
-
-#### Added
-
 - **Server: named users.** `auth.users.<name>` with `github` (keys pinned to the account id),
   optional `github_id`, `admin`, and hand-listed `keys` with a `label`, an optional `expires`
   and `script: true` for automation. Requires `mtls` and replaces `auth.ssh`'s key sources.
@@ -530,8 +351,8 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   skipped and logged. A person added on the service logs in with no restart (their first SSH
   login, as `_bootstrap`, pulls the list: at most once a minute while pulls succeed, once per
   15 minutes while they fail, the login waiting at most 8 s; see the unknown-key rule below);
-  a person removed loses their SSH connections at the next pull. Certificates issued before certificates named a user are refused on such a
-  server. See the [User Directory
+  a person removed loses their SSH connections at the next pull. Certificates issued before certificates named a user are refused, on such a
+  server as on every other (see "Security"). See the [User Directory
   guide](https://charliek.github.io/shed/guides/user-directory/).
 - **Server: `shed-server directory enroll [--name <name>]`** enrols the server with the
   service at `auth.directory.url`, once, writing `{state_dir}/directory/enrolment.json` (mode
@@ -559,14 +380,14 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   See [Directory Contract](https://charliek.github.io/shed/reference/directory-contract/).
 - **Server, CLI and desktop: the credential source.** One machine answers each user's
   credential requests on a server: the first to connect, until moved. Each broker has a machine
-  identity (`machine.json`, shown by `shed-host-agent status`) and sends it as
+  identity (`machine.json`, shown in the app's Preferences) and sends it as
   `X-Shed-Machine-Id` and `X-Shed-Machine-Name`. `shed source ls|status|use` and `GET
   /api/sources` / `POST /api/sources/use` show and move it; the desktop's Preferences show
   the source per server with a **Use this machine** button. Another machine shows `not-source`
   and names the source; a second process with the same id shows `duplicate`; both keep
   retrying. `GET /api/info` lists `source_binding`. See [Credential
   Source](https://charliek.github.io/shed/extensions/source-binding/).
-- **Host-agent and desktop: the signing check, `ssh.allow_users` and `ssh.offer_keys`.** A
+- **Desktop: the signing check, `ssh.allow_users` and `ssh.offer_keys`.** A
   machine signs an SSH login only for a username in `ssh.allow_users` (default `git`) with an
   offered key, and an SSH signature only in the namespace `git`, before any approval prompt.
   `ssh.offer_keys` (fingerprints or key lines) limits the keys sheds can list and use. Every
@@ -731,8 +552,8 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   attach` rewrites its alias at its next run); after clearing it, run `shed ssh-config
   --uninstall`, then `shed ssh-config --install`, and attach again. Without the field every
   argv and stanza is as before.
-- **Desktop and host-agent: an entry's own SSH key, `identity_file`.** The app and its
-  credential broker (embedded or the `shed-host-agent` daemon) read the field the CLI writes,
+- **Desktop: an entry's own SSH key, `identity_file`.** The app and its credential broker
+  read the field the CLI writes,
   with the CLI's value rule. Every `ssh` they run for the entry passes the key (`-i <path> -o
   IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none`, byte for byte the CLI's argv,
   or the same four lines in the stanza a roost connection reads); the file is checked each
@@ -806,8 +627,47 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   A client that ignores unknown members is unaffected. See [API › GET
   /api/sheds](https://charliek.github.io/shed/reference/api/#get-apisheds).
 
-#### Changed
+### Changed
 
+- **Images: the `extensions` and `full` images bake craze 0.2.0** (0.9.0 baked 0.1.0), and
+  shed's CI tests against it. See
+  [craze's changelog](https://github.com/charliek/craze/blob/main/CHANGELOG.md) for what changed
+  in craze itself, including that a model switch on a native session now lands on the effort
+  last used on that model. A machine with its own craze needs it upgraded and its running hub
+  ended; see the [upgrade guide's craze
+  section](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.10.0/#craze).
+- **Desktop (craze): a remote host's hub is reached with `craze bridge --hub --no-start`.**
+  The connections the desktop makes on its own attach only to a hub that is already running,
+  so they can never start a hub on a remote shed, and the race this leaves behind is gone.
+  A host with craze older than 0.2.0 falls back to the earlier probe-then-bridge path, race
+  included, until craze is updated there.
+- **Build: Go 1.27 and dependency updates.** chi v5.5.0, `golang.org/x/{crypto,net,sys,sync,term}`,
+  `mdlayher/vsock` v1.4.0, `creack/pty` v1.1.24, logrus v1.10.2, go-containerregistry v0.22.1,
+  and cel-go v0.33.2 under its new module path `cel.dev/cel-go`; golangci-lint 2.15.0.
+  `hugelgupf/p9` stays on v0.3.0 (v0.5.1 gives a file a new QID on every lookup).
+  go-containerregistry v0.22 dropped Go's bound on registry redirects; shed restores it
+  (at most 10) on pulls and pushes.
+- **Server: a cancelled exec closes the guest connection at once**, on every exec path (SSH
+  sessions included), so a guest that stops reading cannot hold a timed-out or abandoned
+  command's request open.
+- **Development: `make test-integration-dev-fc` is FC-only.** It sets `SHED_VZ_SERVER` and
+  `SHED_VZ_DEV_SERVER` empty, so its `[vz]` cases skip instead of reaching the `my-server`
+  entry (which can name a production server), and an empty server name never falls back to
+  the client's default server. The FC dev config gains an `itest` image alias
+  (`shed-fc-base:v0.9.0`) for the exec and service-client tests.
+- **Server: a changed user list no longer abandons an unfinished one-time upgrade step; the
+  server does not start.** While the step that gives sheds and snapshots with no user to the
+  only configured user has begun and not finished (`{state_dir}/users-upgrade.json` names
+  that user as pending), a start whose `auth.users` no longer holds that user alone (beside
+  `auth.directory`, the local admins; the account service's list never counts, in force or
+  not) stops before it opens a backend, a store or a listener, and before it gives anything
+  away or records anything. Its error names the user and the two ways forward: put that user
+  back as the only one and start again until the log says the step is `done and recorded`,
+  or start once with the new `shed-server serve --abandon-user-upgrade`, which abandons the
+  step as every start did before (nothing more given away, the step recorded as done, the
+  same log line). The flag is refused at a start with no such step, so it cannot stay on a
+  service's command line. A start with no user list still removes the marker. The start-up
+  log says, while the step is unfinished, that the server does not start with other users.
 - **CLI, SDK and desktop: a refused SSH key names each cause, not an allowlist.** `shed server
   add` and `shed server update --refetch` now fail with `the server refused every SSH key ssh
   offered for _bootstrap@<host>: none of them is a user's key there, or the right key has a
@@ -868,7 +728,7 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   any other check, on every `/api/sheds/{name}` and `/api/egress/{name}` route.
 - **Egress history and the live stream are filtered by user and by shed incarnation**: a shed
   recreated under an earlier name no longer shows the earlier shed's records.
-- **Host-agent and desktop: the bus and the egress stream follow a redirect only to the
+- **Desktop: the credential broker's bus and egress stream follow a redirect only to the
   server's own origin**, and an answer the server refused is audited as `undelivered`. The
   egress stream used to follow a redirect to any `https` URL, with its credential, to any
   host that held the pinned certificate.
@@ -883,7 +743,7 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   for the old kind: a filter on `kind == "admin"` matches nothing written after the upgrade,
   and rotated files keep the old shape. See [Configuration › Audit
   log](https://charliek.github.io/shed/reference/configuration/#audit-log).
-- **Desktop and host-agent: a server entry is held to one user.** The app's control
+- **Desktop: a server entry is held to one user.** The app's control
   credential and the broker's own certificate are used only when they name the entry's
   `user` (recorded by the CLI) or the implicit user; with no `user`, the first named user is
   held (by the broker only once it has stored that certificate). A `user` that is not a plain
@@ -961,21 +821,209 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   before the network was online, a directory server with no kept copy failed its first pull
   and ran with only its local admins until the next attempt, 15 minutes later. See the
   upgrade notes above for an edited deb unit and a unit `shed-server install` wrote.
+- **Desktop: the broker's state directory is `<state>/broker/`**, and its override is
+  `SHED_BROKER_STATE_DIR`. Nothing is migrated: the 0.10.0 app is a new machine to every
+  server (see Upgrade notes).
+- **Desktop: launch at login is on by default.** The first launch of the 0.10.0 app turns it
+  on once, saving that it did so in `prefs.json` first (`login_item_defaulted`); a launch
+  that cannot save it turns nothing on. Switched off in Preferences › General, it stays off.
+  A debug build outside the UI test harness never turns it on. Preferences › Credential
+  broker says that credentials are answered only while the app runs, beside the switch.
+- **Desktop and server: the broker's client kind is `broker`.** The app's broker enrols with
+  the bootstrap client kind `broker`, with no alias, and the app's own audit entries carry
+  `"source":"broker"`. The kind is bookkeeping: a server older than 0.10.0 records a kind it
+  does not know as empty and still issues the certificate.
+- **Server, CLI and images: messages name the desktop app.** The credential bus's `403
+  SOURCE_MACHINE_ID_REQUIRED` now says to install the current shed desktop app and names the
+  two machine headers, with no version, and so does its log line. `shed source` and the
+  in-shed credential helpers (the SSH agent, the AWS proxy, the Docker credential helper)
+  name the desktop app as the credential broker; the helpers' text reaches a shed with the
+  next image.
 
-#### Removed
+### Removed
 
+- **Desktop: the Swift macOS app's sources.** The Tauri app has been the shipped macOS client
+  since 0.9.0; the retired Swift app (`desktop/Sources`, its tests, `Package.swift`), the
+  `shed-core-ffi` UniFFI crate that bridged the Rust core to it, its build/smoke scripts and
+  its CI job are gone ([#364](https://github.com/charliek/shed/issues/364)). Nothing a user
+  installs changes: the Tauri mac app keeps the bundle id, Sparkle feed and EdDSA key, so
+  pre-0.9.0 installs still update in place. The Swift app's iTerm2 and Warp terminal presets
+  have no Tauri equivalent yet ([#449](https://github.com/charliek/shed/issues/449),
+  [#450](https://github.com/charliek/shed/issues/450)).
+- **Development: `make -C desktop` targets for the Swift app** (`core`, `bundle`, `dmg`,
+  `e2e-ci`, `e2e-swift`, `m0-gates`, `smoke*`, swift-format). `build`, `test`, `lint`, `fmt`,
+  `e2e` and `run` now alias the Tauri and Rust-core targets, and the shedtest harness no
+  longer takes `--target`. CI's `swift` job is replaced by `core-mac` (the Rust core's tests
+  and clippy on macOS).
+- **Docs: the upgrade guides before v0.8.2 → v0.9.0.** Links to them, including the server's
+  config-error messages, now point at their copies in the
+  [v0.9.0 tag](https://github.com/charliek/shed/tree/v0.9.0/docs/upgrades).
 - **Server: `auth.mode: token`, its spelling `secure`, and `allow_insecure_exposure`.** The
-  server's bearer-token code is gone: it never issues or reads a bearer token. The CLI,
-  host-agent and desktop keep their token code so they still reach 0.9.x servers.
+  server's bearer-token code is gone: it never issues or reads a bearer token. The CLI and
+  the desktop app keep their client-side token code.
 - **Docs: the "Upgrading to mTLS" page.** Its copy at the
   [v0.9.0 tag](https://github.com/charliek/shed/blob/v0.9.0/docs/upgrades/token-to-mtls.md)
   stays; what is still true moved to [Security › Enrollment over
   SSH](https://charliek.github.io/shed/reference/security/#enrollment-over-ssh). The status
   CLI page is gone too: the `shed-ext status` command it described does not exist.
 - **Development: `SHED_DEV_AUTH_MODE`** and `render-dev-config.sh`'s `--mtls` flag.
+- **Server: the `credentials:` key, the old name of `mounts:`.** A `server.yaml` that still
+  has it fails to load (`config key "credentials" was renamed to "mounts"; rename it`), at
+  start and in `config-validate`; it used to be read when `mounts:` was absent. Rename the
+  key: the entries keep their shape.
+- **CLI: the HTTPS re-pin of an entry with no SSH port.** `shed server update NAME
+  --refetch` on such an entry (written before mtls, or edited by hand) used to re-read the
+  TLS certificate over HTTPS; it now dials nothing and says to add the server again: `shed
+  server remove NAME`, then `shed server add HOST --name NAME`.
+- **Desktop: the IPC op `rc.launch`**, the alias for `roost.launch` kept for 0.9.x scripts. It
+  now answers `unknown_op`. Launch in a shed with `roost.launch` and `target:
+  roost:HOST/SHED`. The app's own launch dialog is unchanged.
+- **Desktop: the `desktop:` block of `extensions.yaml`** (`enabled`, `socket_path`,
+  `timeout_ms`), which was ignored with a log warning nobody saw. A config that has one
+  now fails to load: the broker does not start and Preferences › Credential broker shows
+  ``the `desktop:` block was removed; delete it (a `desktop.timeout_ms` becomes
+  `approval_timeout` with a unit: 30000 ms is `approval_timeout: 30s`)``. Delete the block.
+- **Desktop: the broker modes.** The app always runs its own broker: the Preferences mode
+  setting, the IPC operations `broker.mode` and `broker.set_mode`, the `identify` reply's
+  `broker_mode` and the mode fields of `broker.status` are gone. A stored mode choice in
+  `prefs.json` is ignored. The "agent upgrade required" error (the IPC failure kind
+  `agent_upgrade_required`) is gone with the daemon it named.
 
-#### Fixed
+### Retired
 
+- **`shed-host-agent`.** The desktop app (macOS and Linux) is the only credential broker and
+  runs it in its own process. The `shed-host-agent` formula is removed from the Homebrew tap
+  with this release, and its Linux tarballs end at v0.9.0; their release assets stay where they are but are
+  unsupported. A 0.10.0 server refuses every released `shed-host-agent`. Uninstall it: see
+  the [upgrade
+  guide](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.10.0/#remove-the-old-credential-daemon).
+  A machine with no desktop app running has no broker. The Automatic mode's missing fallback
+  ([#411](https://github.com/charliek/shed/issues/411)) ends with the daemon.
+
+### Fixed
+
+- **CLI: `shed server update <name> --refetch` keeps the HTTPS port you chose.** An entry
+  added with `--https-port` (a server reached through a port mapping) had its `api_url`
+  rebuilt from the port the server reports, so after a refetch it pointed at another port.
+  The refetch now verifies the entry's own endpoint first and keeps it when it answers. Only
+  when it cannot be reached (a refused connection, a timeout, a TLS handshake the pin does
+  not pass), the reported port is tried; the entry moves to it only if that one answers, and
+  the refetch says so (`  HTTPS port changed from … to …`; `previous_api_url` in `--json`).
+  An answer from the entry's own endpoint (a 401, a 403, a redirect, a 5xx, a body that does
+  not decode) is no sign of a moved port: the refetch fails there, naming the endpoint and
+  the status, and saves nothing. If neither endpoint answers, the refetch names both and
+  saves nothing. Limits: a stored `api_url` with a path that fails is not retried without
+  the path, and an `/api/info` answer that decodes but is empty still verifies.
+- **CLI: no request to a server's API follows a redirect (security).** Every command's API
+  client, the tunnel's probe and the roost provider's inventory now treat a 3xx as the
+  answer and report it as an error naming the status, so a credential is never sent on to
+  the URL a redirect names; before, an endpoint holding the pinned certificate could pass a
+  bearer token on to a plain-`http` URL. shed-server's API answers no request with a
+  redirect, so nothing that works today changes. The desktop app's own client (the dashboard
+  and its control requests) follows none either: it used to follow a redirect to any `https`
+  URL, and with a pinned server it presented its client certificate to any host holding the
+  pinned certificate. The credential broker's bus and egress stream follow a redirect only
+  within the server's own origin.
+- **CLI: a shed name from a server never reaches `~/.ssh/config` unchecked (security).**
+  `shed ssh-config` (printed, `--install`) and `shed attach` wrote each shed's name from the
+  server's list into a `Host` and a `User` line as it came, so a hostile server could add
+  lines (a `ProxyCommand`) to the managed block. A shed whose name is not a shed name is now
+  skipped, with one warning line naming it escaped, and the other sheds are written; the ssh
+  config writer itself refuses any stanza whose alias, user, host name, port or paths could
+  change what it says, and writes nothing then; the host name must be a literal host name
+  or address (no `%` token, shell syntax, `=` or leading `-`), and the `UserKnownHostsFile`
+  path is written quoted (a home directory with a space was read as two files) and held to
+  the rule the `IdentityFile` path has. An error answer from a
+  server (a JSON request's or an event stream's), a create's progress lines and warnings, a
+  shed's status and status reason, and a server's name are shown with their control
+  characters escaped, as other server text is.
+- **Server: a graceful stop logs each step once.** `Shutting down SSH server...` was written
+  twice.
+- **Desktop: a cloud shed that is stopping shows `stopping`, and a shed's reason shows beside
+  its status.** The shared core now decodes the remote backend's `stopping` status (it read
+  `unknown`) and a shed's `status_reason`. The Sheds pane shows the reason the way `shed list`
+  does (`stopped (capacity)`, `starting (no_pin)`), and a starting or stopping shed shows the
+  busy spinner with no Start or Delete button until it settles. A status the app does not know
+  still reads `unknown`.
+- **Desktop (craze): stopping a session no longer freezes its transcript panel.** craze 0.2.0
+  removes a stopping session from its list before the session's last events arrive. The
+  desktop used to close the lane at once, leaving a panel with no "ended" banner, a live
+  composer, and a `no_lane` error on the next action. A lane now keeps its own connection for
+  up to 10 s after its row leaves. Its last events land, and then it ends with its reason
+  (`session_closed`, or `session_gone` / `hub_gone` when nothing final arrived). The ended
+  panel stays readable, and its composer is disabled. Closing a craze session's tab no longer
+  ends its transcript: the session runs on in its host.
+- **Desktop: while the agent is working, the `/` menu opens on the first command you can run
+  now**, not on one that has to wait for the turn, so Enter right after `/` no longer refuses.
+  The phone gets the same rule from the shared core in its next release.
+- **Desktop: opening, closing or reading a tab on a machine no longer tears down that machine's
+  shared SSH connection when roost refuses the request** (for example, a tab that was already
+  closed), and when the connection itself failed because no roost session is running there,
+  the error now says so and how to start one, instead of "the roost connection closed before
+  the reply". (#407, #351)
+- **Desktop: the roost-session consent card names the agents roost wires hooks into from the
+  same list the app sends**, in the right order. (#362)
+- **Desktop (craze): a session's model and mode settings come back when its settings support
+  drops out and returns**, instead of the settings sheet staying empty until a reconnect.
+- **macOS (VZ): VZ sheds no longer stop on `brew services restart shed`.** vfkit now runs in
+  its own process group, so launchd no longer kills it with the server. The restart that
+  applies this release still stops running sheds once. The brew service now waits up to 35 s for a
+  graceful server exit (`stop_timeout`), which requires Homebrew 6.0.13 or later. (#409)
+- **Images: the base stage of both images now pre-creates `~/.local` (`bin`, `share`,
+  `state`), `~/.config` and `~/.cache` owned by `shed`.** Defense in depth for #410, so a mount
+  or tool under those paths never leaves a root-owned parent. Applies to newly built images,
+  from the next image release.
+- **CLI: the first command after a token-mode server restart no longer fails.** `shed start`,
+  `shed create`, `shed image pull`, `shed image push`, `shed snapshot create` and the prune
+  commands now re-mint and retry once on an expired or invalid credential, as the other
+  commands already did, instead of surfacing the 401. (#412)
+- **Server (Firecracker): stopping or deleting a running shed with writable host mounts is no
+  longer held up by its 9P mounts.** A stop took 25–30 s (and raced the CLI's 30 s timeout); it
+  now takes about `stop_timeout` (10 s). A delete took about 25 s; it now takes well under a
+  second. Each 9P mount server now closes only after the VM
+  is gone, force-closes its connections instead of waiting 5 s for the guest to hang up, and
+  closes in parallel with the shed's other mounts. The shutdown hook and the pre-stop sync run
+  before any mount closes, a failed start or a VM that exited unexpectedly no longer leaks 9P
+  listeners, and a `shed-server` restart no longer waits 5 s per mount. On both backends, a
+  client disconnect during `shed stop` no longer turns the graceful stop into a force-kill.
+  `shed delete` now refuses, and keeps the shed's resources, if its VM survives SIGKILL; retry
+  the delete once the VM is gone. A graceful Firecracker stop still ends in a force-kill at
+  `stop_timeout`: the guest kernel cannot receive the Ctrl-Alt-Del it is sent, which is tracked
+  separately. (#284)
+- **Server (VZ and Firecracker): directories a mount needs under the shed user's home are now
+  created as `shed`, not root.** A server mount nested below the home directory (e.g.
+  `~/.local/share/opencode`, `~/.config/gh`) used to leave `~/.local`, `~/.local/share` or
+  `~/.config` owned by root, so `roost-session` could not start — breaking `shed attach` and
+  Connect Host — and anything writing under `~/.local` or `~/.config` failed on `base` and
+  `extensions` sheds. Existing sheds are repaired on their next `shed start`. (#410)
+- **CLI: `shed delete`, `reset`, `snapshot delete`, `image rm`, `image prune` and `system prune` no
+  longer report success when nobody answered.** When stdin is not a terminal and the confirmation
+  prompt gets no answer (EOF, for example under `</dev/null`), the command now exits 1 with an
+  error naming `--force` and sends no mutating request, instead of printing `Cancelled.` and
+  exiting 0. A piped `y` still works. `shed tunnels start` without `--replace` now refuses
+  `/dev/null` as stdin too. (#109)
+- **Server: a startup stalled on the filesystem now names the path.** `shed-server` reads
+  each state directory before starting the backend (`Checking state directories: …`), and a
+  startup step that waits on the filesystem logs a line naming the path after 10 s, then every
+  minute. On macOS the line points at the permission prompt for an external drive and at Full
+  Disk Access, and a directory macOS has denied gets its own warning. A store that hangs on a
+  read now holds startup at that line, instead of the server reaching `ready` while the resume
+  of running sheds hangs silently. (#304)
+- **Server (deb): `/etc/shed/server.yaml` is no longer a dpkg conffile, so an upgrade never
+  prompts about it.** An edited config made dpkg prompt whenever a release changed the
+  packaged template, and an unattended `apt-get -y` upgrade then failed with `end of file on
+  stdin at conffile prompt`, leaving the package unconfigured. The template now ships at
+  `/usr/share/shed/server.yaml.default`: a fresh install copies it to `/etc/shed/server.yaml`,
+  upgrades never touch the file, and purge deletes it. A host stuck by that failure recovers
+  by installing this release. Rolling back to 0.9.0 or earlier needs
+  `-o Dpkg::Options::=--force-confold` to keep an edited config without a prompt. (#109)
+- **macOS (brew): an external-drive permission now survives upgrades.** The formula installs
+  `shed-server` inside a Developer ID signed `ShedServer.app` under
+  `$(brew --prefix)/opt/shed/libexec`, and `bin/shed-server`
+  is a symlink into it. macOS keys the grant on the bundle ID and signature, not on the Cellar
+  path that changes every version. The brew service command is unchanged. macOS asks one more
+  time on the first start after this upgrade, because the identity changed; after that,
+  upgrades don't ask again. (#304)
 - **Firecracker and VZ: reading a shed whose VM had died could save that stale record over a
   shed deleted and recreated under the same name in the meantime.** The save is now made under
   the shed's lock, and only for the same shed.
@@ -991,7 +1039,7 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   `stopped` with. See [Remote backend › Calls and
   statuses](https://charliek.github.io/shed/reference/remote-backend/#calls-and-statuses).
 
-#### Security
+### Security
 
 - **The machine no longer signs whatever a shed hands it.** Code in a shed could obtain a
   signature that logged in to any SSH server as any username with the user's key, the shed
@@ -1005,6 +1053,20 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
 - **A shed named `git` can no longer be opened by the signature machines give out for git.**
 - **Script keys** cannot take a `credentials` certificate or use the bus, and **expired keys**
   are refused at the SSH and TLS handshakes and on every request.
+- **A client certificate that names no user is refused on every server.** Only a server
+  older than 0.10.0 issues one. It used to be accepted by its key alone until it expired
+  (`auth.token_ttl`, 24 hours by default), except on a server with `auth.directory`. Now
+  it is refused at the TLS handshake, or with `401` on a connection already open; a 0.9.x
+  CLI or app enrols again by itself, and so does the mobile app, which builds on the same
+  core as the desktop app; `shed server update NAME --refetch` does it by hand. A service client's certificate (`auth.clients`) is told apart by its shape
+  and is not affected.
+- **A GitHub login's key cache from before logins were pinned is no longer read.** Until a
+  login's first good fetch from `api.github.com` pins it, the login has no keys, even when
+  GitHub is unreachable. A server whose only keys are GitHub logins does not start at its
+  first 0.10.0 start while GitHub cannot be reached: the refusal names the two ways out (let
+  it reach `api.github.com` and start it again, or give it a key that does not come from
+  GitHub: with `auth.users` a key under that user's `keys`, without one
+  `auth.ssh.authorized_keys`). Allow `api.github.com` before upgrading, or add such a key.
 
 ## v0.9.0 — 2026-10-10
 

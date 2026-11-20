@@ -12,7 +12,7 @@ emits — which notably carries an EMPTY `shed`, because a hub read directly has
 shed to name.
 
 The hub is a stdlib HTTP server in-process, shaped byte-for-byte like the real
-one (verified against a live `shed-host-agent rc-hub` on mini3). No Rust, no
+one (verified against the live machine RC hub before it was retired). No Rust, no
 network beyond loopback.
 """
 

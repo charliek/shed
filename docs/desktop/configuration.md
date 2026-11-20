@@ -10,7 +10,7 @@ There are three places configuration lives, with deliberately little overlap:
    a normal user sets.
 
 The app intentionally exposes a *small* settings surface; most behavior is derived from the
-shed config and the host-agent rather than configured here.
+shed config and the credential broker's `extensions.yaml` rather than configured here.
 
 ## Preferences (GUI)
 
@@ -23,9 +23,9 @@ The approval sections appear only for the providers the broker delegates to shed
 
 | Section | Setting | Stored as | What it does |
 |---|---|---|---|
-| **General** | Launch at login | the OS login item (a LaunchAgent on macOS, an XDG autostart entry on Linux), *not* `prefs.json` | Starts the app when you sign in. |
+| **General** | Launch at login | the OS login item (a LaunchAgent on macOS, an XDG autostart entry on Linux), *not* `prefs.json`; `login_item_defaulted` records only that the app turned it on once | Starts the app when you sign in. On by default: the app turns it on once, at its first launch, so the broker answers whenever you are logged in. Switch it off and it stays off. |
 | **Terminal** | Open sheds in: Ghostty / Roost / Custom | `terminal_preset`, `terminal_template` | Which terminal **Open in Terminal** launches. Custom takes a command template where `{cmd}` is the ssh command and `{shed}` the shed name, e.g. `ghostty -e {cmd}`; an empty template opens the platform's default terminal. |
-| **Credential broker** | Mode: Automatic / In-app (embedded) / External daemon | `broker_mode` | Where the credential broker runs; applies on the next launch. See [Installation → Credential broker](installation.md#credential-broker). |
+| **Credential broker** | Launch at login (the same switch as General, beside "Credentials are answered only while this app is running.") | the OS login item | The broker runs only while the app does. |
 | **Credential broker** | This machine, and one row per server: its credential source, with **Use this machine** | not stored (read from each server) | Which of your machines answers credential requests on each server. See [Credential sources](#credential-sources) below. |
 | **SSH approvals** | Approval policy / Duration / Method | `ssh_policy`, `ssh_ttl`, `ssh_method` | Policy: Always Allow, Per Shed Allow, **Time Based Allow** (default), Always Ask, Always Deny. Duration (default `2h`) applies to Time Based Allow. Method, for the policies that prompt: Authenticate (`biometrics-or-password`, the default) or Prompt only (`prompt`). Changing any of these clears live SSH grants. |
 | **AWS / Docker credentials** | Allow / Deny | `provider_modes` | A live Allow/Deny toggle (default Deny). No prompt; takes effect immediately. |
@@ -38,11 +38,11 @@ managed with the `shed` CLI (no Preferences UI); machines are added from the Mac
 ## Credential sources
 
 A shed server sends your sheds' credential requests to one of your machines only: your
-[credential source](../extensions/source-binding.md) on that server. Below the broker mode,
-Preferences shows:
+[credential source](../extensions/source-binding.md) on that server. In
+Preferences → Credential broker:
 
 - **This machine:** the name of the machine the app runs on, from the `machine.json` the
-  app and `shed-host-agent` share. If the machine has no identity, the reason is shown and
+  broker keeps. If the machine has no identity, the reason is shown and
   every **Use this machine** button is disabled.
 - One row per configured server that supports credential sources (a server older than that
   shows no row): the server's name, `Source: <machine>` (with `· not connected` when that
@@ -67,9 +67,8 @@ last confirmed source and shows why. Moving the source here drops any approval s
 the other machine. If the server has never seen this machine (its broker has not reached that
 server yet), the app says so and does not retry.
 
-With the embedded broker, the app wakes the broker at once, so it connects without waiting for
-its next retry. With an external `shed-host-agent`, the daemon picks the change up on its next
-retry, within about 30 seconds. Nothing fails over by itself: if the source is off, nothing
+The app wakes the broker at once, so it connects without waiting for
+its next retry. Nothing fails over by itself: if the source is off, nothing
 answers until you choose another.
 
 The window reads the sources when it opens and again whenever it is shown or focused, at most
@@ -147,7 +146,7 @@ CLI writes `user` when it enrols the entry; the app only reads it.
 
 - **Restart the app after changing an entry's user** (`shed server update <name> --refetch`,
   with or without `--allow-user-change`). The app builds its control clients once, at start.
-  The embedded broker picks up a changed `user` by itself.
+  The broker picks up a changed `user` by itself.
 - **Record the user once with the CLI.** For an entry with no `user`, the app holds the first
   named user it is issued, in memory only, so after a restart it takes the first named user
   again. The broker keeps its user across restarts through the certificate it stores. Run
@@ -213,8 +212,8 @@ names for the host (a `Host` or `Match` stanza, or `Host *`, can add its `Identi
 after the entry's), the app accepts the certificate when it names the entry's `user`, and
 refuses it when it names anyone else ([the user an entry is held to](#the-user-an-entry-is-held-to)).
 Keep no other `IdentityFile` for that host if the entry must use one key. Restart the app after
-changing an entry's `identity_file`: it builds its control clients once, at start (the embedded
-broker picks the change up by itself).
+changing an entry's `identity_file`: it builds its control clients once, at start (the broker
+picks the change up by itself).
 
 ### How the app reads the file
 
@@ -262,7 +261,7 @@ Limits, each refused rather than misread:
   host, as before.
 - **The refusals above are the app's own.** An entry the app refuses sends nothing from the
   app itself: not the dashboard's requests, not its control requests. The credential broker
-  (embedded, or the `shed-host-agent` daemon) reads the same file with a full YAML parser and
+  (inside the app) reads the same file with a full YAML parser and
   is not held to the line rule. An entry in a shape that parser reads as the CLI does (the
   fields as a `{…}` mapping, an explicit `? key`, an anchored key, a block in a field other
   than `user` and `identity_file`) is served like any other: the broker enrols with the entry's
@@ -285,13 +284,11 @@ you typed. It refuses a value holding a control character, a line break, or a ch
 does not allow in a file at all (such as U+FFFE or U+FFFF), and it does not add to a file it
 does not read.
 
-## Host-agent approval (`extensions.yaml`)
+## Credential broker (`extensions.yaml`)
 
 Whether the credential-approval gate is active is configured in the broker's
-`extensions.yaml`, not in this app — see [Credential approvals](approvals.md). In the
-external broker mode the app connects to the daemon's socket (default
-`~/Library/Application Support/shed/host-agent.sock` on macOS,
-`$XDG_RUNTIME_DIR/shed/host-agent.sock` on Linux) when it is serving one.
+`extensions.yaml` (`~/.config/shed/extensions.yaml`), not in this app — see [Credential
+approvals](approvals.md) and [Extensions → Configuration](../extensions/configuration.md).
 
 ## Environment variables
 
@@ -304,12 +301,11 @@ Normal use needs none of these. They exist for the test harness, packaging, and 
 | `SHED_TAURI_SOCKET` | Override the IPC socket path (default `$XDG_RUNTIME_DIR/shed-tauri.sock`, else `/tmp/shed-tauri-<uid>/shed-tauri.sock`). `shedctl` honors it too. |
 | `SHED_TAURI_LOG_FILE` | Move the app's log file. |
 | `SHED_TAURI_LOG` | `=debug` raises the shed crates' lines to DEBUG and adds roost-ipc's. |
-| `SHED_HOST_AGENT_SOCKET_DIR` | Move the directory the app looks in for the `shed-host-agent` sockets. |
 | `SHED_TAURI_TEST_MODE` | `=1` → hermetic test mode: all HTTP clients hit the mock, `terminal.open` + Sparkle are disabled, the test-mode-only IPC ops are enabled, and `identify` echoes the flag. |
 | `SHED_TAURI_MOCK_BASE_URL` | Redirects every shed-server client at one in-process mock (test mode); echoed by `identify`. |
 | `SHED_TAURI_SHED_CONFIG` | Override the `~/.shed/config.yaml` path. In test mode an unset value loads an empty config. |
-| `SHED_TAURI_HOST_AGENT_SOCKET` | Override the host-agent socket the approval client dials (a fake agent, in tests). |
-| `SHED_TAURI_EXTENSIONS_CONFIG` | Override the `extensions.yaml` the embedded broker loads. |
+| `SHED_TAURI_EXTENSIONS_CONFIG` | Override the `extensions.yaml` the broker loads. |
+| `SHED_BROKER_STATE_DIR` | Replace the broker's state directory (default: macOS `~/Library/Application Support/shed`, Linux `$XDG_DATA_HOME/shed` else `~/.local/share/shed`), which holds `broker/machine.json` and the broker's certificates. |
 | `SHED_TAURI_TEST_TIMEOUT_SCALE` | Multiply the harness's `wait_until` budgets (slow CI). Read by the harness, not the app. |
 
 The log file's location and rotation are in [Architecture](architecture.md#state-storage).

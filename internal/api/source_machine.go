@@ -30,9 +30,11 @@ const (
 	HeaderMachineName = "X-Shed-Machine-Name"
 )
 
-// minimumMachineVersions names the first releases whose brokers send the
-// machine headers.
-const minimumMachineVersions = "shed-host-agent 0.10.0 and the shed desktop app 0.10.0"
+// machineIDRequiredMessage is the refusal of a request with no valid machine
+// headers. It names the two headers (an SDK listener must send them) and
+// tells a person what to do; it names no version.
+const machineIDRequiredMessage = "this server lets one machine per user answer credential requests and needs to know which machine is asking " +
+	"(headers " + HeaderMachineID + " and " + HeaderMachineName + "), but this request named no valid machine; install the current shed desktop app"
 
 // maxRefusalBody is the most bytes a pin refusal body may have. A broker
 // classifies a refusal only from a body it read completely within 1024
@@ -122,9 +124,8 @@ func writeRefusal(w http.ResponseWriter, status int, data []byte) {
 // writeMachineIDRequired answers a request with no valid machine headers:
 // what a broker released before the pin gets. 403, never 401.
 func writeMachineIDRequired(w http.ResponseWriter) {
-	msg := "this server lets one machine per user answer credential requests and needs to know which machine is asking; " +
-		"upgrade to " + minimumMachineVersions + " or newer, which send " + HeaderMachineID + " and " + HeaderMachineName
-	writeRefusal(w, http.StatusForbidden, encodeRefusal(config.ErrSourceMachineIDRequired, msg, msg, nil))
+	writeRefusal(w, http.StatusForbidden,
+		encodeRefusal(config.ErrSourceMachineIDRequired, machineIDRequiredMessage, machineIDRequiredMessage, nil))
 }
 
 // writeSourceNotBound answers a machine that is not its user's credential
@@ -199,8 +200,8 @@ func (l *missingIDLog) logOnce(user, key string) {
 		l.seen = map[string]bool{}
 	}
 	l.seen[k] = true
-	log.Printf("credential bus: refused a request with no valid machine id%s from key %q: its broker predates the pin (needs %s); logged once per key",
-		forBusUser(user), key, minimumMachineVersions)
+	log.Printf("credential bus: refused a request with no valid machine id%s from key %q; install the current shed desktop app on that machine; logged once per key",
+		forBusUser(user), key)
 }
 
 // forBusUser names a named user in a log line; the implicit user is not

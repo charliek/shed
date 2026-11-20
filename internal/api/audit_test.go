@@ -494,6 +494,7 @@ func TestAuditExecEndNamesThePerson(t *testing.T) {
 	lookup := userLookup()
 	lookup.AddKey("alice", users.Key{Fingerprint: scriptFP, Source: users.SourceInline, Script: true})
 	s.SetUserLookup(lookup)
+	nameTestKey(t, scriptFP, "alice")
 	path := attachTestAudit(t, s)
 
 	withSerial := func(fp string, serial int64) *x509.Certificate {

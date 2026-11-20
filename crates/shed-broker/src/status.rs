@@ -1,67 +1,23 @@
-//! The daemon's authoritative self-report (`LiveStatus`) snapshot builder plus the
-//! shared RFC3339 time helpers. Ported to be wire-compatible, field-for-field, with
-//! the Go `status_server.go` / `status.go` (§4 of the wire catalog).
+//! The broker's health types and the shared RFC3339 time helpers.
 //!
-//! This is the crate-agnostic half: the snapshot **types** + [`build_live_status`]
-//! **builder** (which an embedder reuses for its `broker.status` op) and the
-//! RFC3339 helpers many core modules share. The read-only status UDS **server** and
-//! the `status` CLI **client + renderer** live bin-side (`status_server.rs`) — only
-//! the daemon serves that socket.
+//! [`ServerHealth`] / [`NamespaceHealth`] / [`ActiveSource`] are the per-server
+//! connection snapshot the supervisor reports (`Supervisor::health()`), and
+//! [`SshSigningStatus`] is the SSH backend's signing block; the desktop app's
+//! `broker.status` and the wire harness's status snapshot carry both. The RFC3339
+//! helpers are shared by many core modules.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{HostAgentConfig, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT};
-use crate::machine::MachineIdentity;
 use crate::sign_check::SignPolicy;
-use crate::sockets::desktop_socket_path;
 use crate::ssh_backend::OfferCount;
 
-/// The version of the LiveStatus JSON contract. Bumped only on a breaking change;
-/// additive fields do not bump it. A mismatch is a hard reject in the client.
-pub const STATUS_SCHEMA_VERSION: u32 = 1;
-
-/// The provider order shown in the status report (matches Go's `statusNamespaces`).
-/// `pub` so the bin-side renderer walks the same fixed order.
-pub const STATUS_NAMESPACES: [&str; 3] = [NS_SSH_AGENT, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS];
-
-/// `LiveStatus` is the daemon's authoritative self-report, served over the
-/// read-only status socket and rendered by `shed-host-agent status`. Field names
-/// and order match `status_server.go:25-60` byte-for-byte.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LiveStatus {
-    pub schema: u32,
-    pub version: String,
-    pub pid: i64,
-    pub started_at: String,
-    pub written_at: String,
-    pub config_path: String,
-    pub policies: std::collections::BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub gate_namespaces: Vec<String>,
-    pub approval_channel: ApprovalChannelStatus,
-    pub servers: Vec<ServerHealth>,
-    /// This machine's identity ([`crate::machine`]). Additive (schema stays 1): absent
-    /// from an older daemon's snapshot, and absent when the identity could not be
-    /// loaded, in which case [`Self::machine_error`] says why.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub machine: Option<MachineIdentity>,
-    /// Why there is no [`Self::machine`]; empty when there is one.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub machine_error: String,
-    /// What this machine signs for a shed (plan 035 §3.5). Additive (schema stays 1):
-    /// absent from an older daemon's snapshot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssh: Option<SshSigningStatus>,
-}
-
-/// The `ssh` block of [`LiveStatus`] and of the desktop's `broker.status`: the SSH
-/// backend's mode, the usernames a login may be signed for (`ssh.allow_users`), whether
-/// an `ssh.offer_keys` filter is set, and — once a listing has happened — how many keys
-/// the last listing offered to sheds of how many the backend had. The counts are absent
-/// until then: the daemon lists local keys at start-up, but never asks a forwarded agent
-/// until a shed asks.
+/// The `ssh` block of the desktop's `broker.status`: the SSH backend's mode, the
+/// usernames a login may be signed for (`ssh.allow_users`), whether an `ssh.offer_keys`
+/// filter is set, and — once a listing has happened — how many keys the last listing
+/// offered to sheds of how many the backend had. The counts are absent until then: the
+/// broker lists keys only when a shed asks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshSigningStatus {
     pub mode: String,
@@ -85,18 +41,6 @@ impl SshSigningStatus {
             keys_available: counts.map(|c| c.available),
         }
     }
-}
-
-/// `ApprovalChannelStatus` describes the approval-channel socket and its current
-/// consumer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalChannelStatus {
-    pub socket_path: String,
-    pub consumer_connected: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub client_name: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub client_version: String,
 }
 
 /// `ServerHealth` is one watched server's connection state.
@@ -136,68 +80,6 @@ pub struct ActiveSource {
     pub machine_id: String,
     #[serde(default)]
     pub machine_name: String,
-}
-
-/// `build_live_status` snapshots the daemon's live self-report. `consumer` is the
-/// desktop approval channel's current consumer identity (`Some((name, version))`
-/// when an app is connected, `None` otherwise) — the desktop server's
-/// `consumer_info()`, or always `None` in the headless build with no desktop server.
-/// `servers` is the supervisor's per-server connection snapshot (`Supervisor::health()`),
-/// populated in BOTH modes (single-server shows one entry, `name:""`). `machine` is the
-/// identity loaded at start ([`crate::machine::load_or_create`]) or the reason there is
-/// none. `ssh` is the signing block ([`SshSigningStatus`]).
-#[allow(clippy::too_many_arguments)]
-pub fn build_live_status(
-    cfg: &HostAgentConfig,
-    config_path: &str,
-    started_at: &str,
-    version: &str,
-    consumer: Option<(String, String)>,
-    servers: Vec<ServerHealth>,
-    machine: &Result<MachineIdentity, String>,
-    ssh: Option<SshSigningStatus>,
-) -> LiveStatus {
-    // Keyed by the fixed status/gate namespace order; the BTreeMap re-sorts on
-    // insert, so the emitted JSON key order is identical regardless.
-    let policies = STATUS_NAMESPACES
-        .iter()
-        .map(|&ns| (ns.to_string(), cfg.effective_policy(ns)))
-        .collect();
-    // Destructure the optional consumer identity once (clone-free) rather than
-    // re-inspecting it per approval-channel field.
-    let (consumer_connected, client_name, client_version) = match consumer {
-        Some((name, version)) => (true, name, version),
-        None => (false, String::new(), String::new()),
-    };
-    let (machine, machine_error) = match machine {
-        Ok(identity) => (Some(identity.clone()), String::new()),
-        Err(e) => (None, e.clone()),
-    };
-    LiveStatus {
-        schema: STATUS_SCHEMA_VERSION,
-        version: version.to_string(),
-        pid: current_pid(),
-        started_at: started_at.to_string(),
-        written_at: now_rfc3339(),
-        config_path: config_path.to_string(),
-        policies,
-        gate_namespaces: cfg.gate_namespaces(),
-        approval_channel: ApprovalChannelStatus {
-            socket_path: desktop_socket_path().to_string_lossy().into_owned(),
-            consumer_connected,
-            client_name,
-            client_version,
-        },
-        servers,
-        machine,
-        machine_error,
-        ssh,
-    }
-}
-
-fn current_pid() -> i64 {
-    // SAFETY: getpid() takes no arguments, touches no memory, and is always safe.
-    unsafe { libc::getpid() as i64 }
 }
 
 /// `now_rfc3339` formats the current UTC time as RFC3339 with second precision
@@ -356,14 +238,6 @@ fn parse_fixed<T: std::str::FromStr>(s: &str, width: usize) -> Result<T, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-
-    fn policies(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
 
     fn ns(name: &str, state: &str, last_error: &str) -> NamespaceHealth {
         NamespaceHealth {
@@ -452,219 +326,19 @@ mod tests {
         assert_eq!(parse_rfc3339_to_unix("0001-01-01T00:00:00Z"), Ok(None));
     }
 
-    fn sample_status() -> LiveStatus {
-        LiveStatus {
-            schema: STATUS_SCHEMA_VERSION,
-            version: "v9".to_string(),
-            pid: 4242,
-            started_at: "2026-06-11T00:00:00Z".to_string(),
-            written_at: "2026-06-11T00:00:01Z".to_string(),
-            config_path: "/opt/homebrew/etc/shed/extensions.yaml".to_string(),
-            policies: policies(&[
-                ("ssh-agent", "shed-desktop"),
-                ("aws-credentials", "deny-all"),
-                ("docker-credentials", "approve-all"),
-            ]),
-            gate_namespaces: vec!["ssh-agent".to_string()],
-            approval_channel: ApprovalChannelStatus {
-                socket_path: "/Users/x/Library/Application Support/shed/host-agent.sock"
-                    .to_string(),
-                consumer_connected: true,
-                client_name: "ShedDesktop".to_string(),
-                client_version: "1.2.0".to_string(),
-            },
-            servers: vec![ServerHealth {
-                name: "mac".to_string(),
-                url: "http://localhost:8080".to_string(),
-                namespaces: vec![ns("ssh-agent", "connected", "")],
-                active_source: None,
-            }],
-            machine: None,
-            machine_error: String::new(),
-            ssh: None,
-        }
-    }
-
+    /// The ssh signing block: the counts are omitted until a listing has happened, and
+    /// present (zeros included) after one; it round-trips.
     #[test]
-    fn live_status_json_round_trips_with_expected_keys() {
-        let ls = sample_status();
-        let compact = serde_json::to_string(&ls).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&compact).unwrap();
-
-        // Field names / casing / nesting match the Go contract.
-        assert_eq!(v["schema"], 1);
-        assert_eq!(v["pid"], 4242);
-        assert_eq!(v["policies"]["ssh-agent"], "shed-desktop");
-        assert_eq!(v["gate_namespaces"][0], "ssh-agent");
-        assert_eq!(
-            v["approval_channel"]["socket_path"],
-            "/Users/x/Library/Application Support/shed/host-agent.sock"
-        );
-        assert_eq!(v["approval_channel"]["consumer_connected"], true);
-        assert_eq!(v["approval_channel"]["client_version"], "1.2.0");
-        assert_eq!(v["servers"][0]["namespaces"][0]["state"], "connected");
-        // `since` has no omitempty → present even when empty.
-        assert_eq!(v["servers"][0]["namespaces"][0]["since"], "");
-
-        // Round-trips back to an identical struct.
-        let back: LiveStatus = serde_json::from_str(&compact).unwrap();
-        assert_eq!(back, ls);
-    }
-
-    #[test]
-    fn empty_gate_namespaces_and_client_fields_are_omitted() {
-        let ls = LiveStatus {
-            schema: STATUS_SCHEMA_VERSION,
-            version: "v1".to_string(),
-            pid: 1,
-            started_at: String::new(),
-            written_at: String::new(),
-            config_path: String::new(),
-            policies: policies(&[("ssh-agent", "deny-all")]),
-            gate_namespaces: vec![],
-            approval_channel: ApprovalChannelStatus {
-                socket_path: "/s".to_string(),
-                consumer_connected: false,
-                client_name: String::new(),
-                client_version: String::new(),
-            },
-            servers: vec![],
-            machine: None,
-            machine_error: String::new(),
-            ssh: None,
-        };
-        let compact = serde_json::to_string(&ls).unwrap();
-        assert!(!compact.contains("gate_namespaces"), "{compact}");
-        assert!(!compact.contains("client_name"), "{compact}");
-        assert!(!compact.contains("client_version"), "{compact}");
-        // Non-omitempty fields are still present.
-        assert!(compact.contains("\"servers\":[]"), "{compact}");
-        assert!(
-            compact.contains("\"consumer_connected\":false"),
-            "{compact}"
-        );
-    }
-
-    /// Decode-side version skew, now in the OTHER direction (plan 022 S6,
-    /// `charliek/shed#328`): `rc_hub` left the snapshot with the RC hub itself,
-    /// so a new `status` CLI reading an OLD daemon's snapshot — which still
-    /// carries the block — must render the rest instead of exiting 1. There is
-    /// no `deny_unknown_fields` anywhere on this wire and this test is what
-    /// keeps it that way.
-    #[test]
-    fn snapshot_carrying_a_retired_rc_hub_block_still_decodes() {
-        let ls = LiveStatus {
-            schema: STATUS_SCHEMA_VERSION,
-            version: "v1".to_string(),
-            pid: 1,
-            started_at: String::new(),
-            written_at: String::new(),
-            config_path: String::new(),
-            policies: policies(&[("ssh-agent", "deny-all")]),
-            gate_namespaces: vec![],
-            approval_channel: ApprovalChannelStatus {
-                socket_path: "/s".to_string(),
-                consumer_connected: false,
-                client_name: String::new(),
-                client_version: String::new(),
-            },
-            servers: vec![],
-            machine: None,
-            machine_error: String::new(),
-            ssh: None,
-        };
-        let mut v: serde_json::Value = serde_json::to_value(&ls).unwrap();
-        v.as_object_mut().unwrap().insert(
-            "rc_hub".to_string(),
-            serde_json::json!({"state": "listening", "addr": "127.0.0.1:1029"}),
-        );
-        let back: LiveStatus = serde_json::from_value(v).expect("old snapshot decodes");
-        assert_eq!(back, ls);
-    }
-
-    /// The machine block is additive under schema 1: an older daemon's snapshot (no
-    /// `machine`) still decodes, a new one round-trips, and an absent identity is
-    /// reported as an error string rather than an empty block.
-    #[test]
-    fn machine_block_is_additive_and_round_trips() {
-        let old = sample_status();
-        let json = serde_json::to_string(&old).unwrap();
-        assert!(!json.contains("machine"), "{json}");
-        let back: LiveStatus = serde_json::from_str(&json).expect("old snapshot decodes");
-        assert_eq!(back.machine, None);
-        assert_eq!(back.machine_error, "");
-
-        let mut ls = sample_status();
-        ls.machine = Some(MachineIdentity {
-            id: "0123456789abcdef0123456789abcdef".into(),
-            name: "laptop".into(),
-        });
-        let v = serde_json::to_value(&ls).unwrap();
-        assert_eq!(v["machine"]["id"], "0123456789abcdef0123456789abcdef");
-        assert_eq!(v["machine"]["name"], "laptop");
-        assert!(v.get("machine_error").is_none());
-        let back: LiveStatus = serde_json::from_value(v).unwrap();
-        assert_eq!(back, ls);
-    }
-
-    #[test]
-    fn build_live_status_reports_the_machine_or_why_not() {
-        let cfg = HostAgentConfig::parse("");
-        let identity = MachineIdentity {
-            id: "0123456789abcdef0123456789abcdef".into(),
-            name: "laptop".into(),
-        };
-        let ok = build_live_status(
-            &cfg,
-            "/c",
-            "",
-            "v",
-            None,
-            vec![],
-            &Ok(identity.clone()),
-            None,
-        );
-        assert_eq!(ok.machine, Some(identity));
-        assert_eq!(ok.machine_error, "");
-
-        let err = build_live_status(
-            &cfg,
-            "/c",
-            "",
-            "v",
-            None,
-            vec![],
-            &Err("no way".into()),
-            None,
-        );
-        assert_eq!(err.machine, None);
-        assert_eq!(err.machine_error, "no way");
-        let v = serde_json::to_value(&err).unwrap();
-        assert!(v.get("machine").is_none());
-        assert_eq!(v["machine_error"], "no way");
-    }
-
-    /// The ssh signing block is additive under schema 1: an older snapshot (no `ssh`)
-    /// still decodes; a new one round-trips; the counts are omitted until a listing has
-    /// happened, and present (zeros included) after one.
-    #[test]
-    fn ssh_block_is_additive_and_round_trips() {
-        let old = sample_status();
-        let json = serde_json::to_string(&old).unwrap();
-        assert!(!json.contains("\"ssh\""), "{json}");
-        let back: LiveStatus = serde_json::from_str(&json).expect("old snapshot decodes");
-        assert_eq!(back.ssh, None);
-
+    fn ssh_block_omits_the_counts_until_a_listing_and_round_trips() {
         let policy = SignPolicy::default();
-        let mut ls = sample_status();
-        ls.ssh = Some(SshSigningStatus::new("agent-forward", &policy, None));
-        let v = serde_json::to_value(&ls).unwrap();
+        let block = SshSigningStatus::new("agent-forward", &policy, None);
+        let v = serde_json::to_value(&block).unwrap();
         assert_eq!(
-            v["ssh"],
+            v,
             serde_json::json!({"mode": "agent-forward", "allow_users": ["git"], "key_filter": false})
         );
-        let back: LiveStatus = serde_json::from_value(v).unwrap();
-        assert_eq!(back, ls);
+        let back: SshSigningStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back, block);
 
         let mut filter = crate::sign_check::KeyFilter::new();
         filter.insert_key_blob(b"k");
@@ -673,10 +347,10 @@ mod tests {
             offered: 0,
             available: 3,
         };
-        ls.ssh = Some(SshSigningStatus::new("local-keys", &policy, Some(counts)));
-        let v = serde_json::to_value(&ls).unwrap();
+        let block = SshSigningStatus::new("local-keys", &policy, Some(counts));
+        let v = serde_json::to_value(&block).unwrap();
         assert_eq!(
-            v["ssh"],
+            v,
             serde_json::json!({
                 "mode": "local-keys",
                 "allow_users": ["git", "deploy"],
@@ -685,24 +359,7 @@ mod tests {
                 "keys_available": 3,
             })
         );
-        let back: LiveStatus = serde_json::from_value(v).unwrap();
-        assert_eq!(back, ls);
-    }
-
-    #[test]
-    fn build_live_status_carries_the_ssh_block() {
-        let cfg = HostAgentConfig::parse("");
-        let ssh = SshSigningStatus::new("local-keys", &cfg.ssh_sign_policy(), None);
-        let ls = build_live_status(
-            &cfg,
-            "/c",
-            "",
-            "v",
-            None,
-            vec![],
-            &Err("x".into()),
-            Some(ssh.clone()),
-        );
-        assert_eq!(ls.ssh, Some(ssh));
+        let back: SshSigningStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back, block);
     }
 }

@@ -617,7 +617,7 @@ func TestExecConcurrencyLimit(t *testing.T) {
 }
 
 // TestExecNeedsControlScope: exec is a control-scope route, so a credentials
-// certificate (the host-agent's) is refused before the handler runs.
+// certificate (a broker's) is refused before the handler runs.
 func TestExecNeedsControlScope(t *testing.T) {
 	fp := testFingerprint("exec")
 	b := &execFakeBackend{shed: runningShed(), exec: func(context.Context, string, backend.ExecOptions) error { return nil }}

@@ -108,46 +108,48 @@ need the pinned binaries: `make craze-binaries` (natively; it prints `SHED_CRAZE
 the module skips; `SHED_CRAZE_REQUIRE=1` (CI) makes that a failure. The shedtest-linux skill has
 the seams (`SHED_TAURI_CRAZE_PATH`, the jailed ladder) and the traps.
 
-## The embedded credential broker (leg 3a.2)
+## The credential broker
 
-The Tauri app can broker credentials **in-process**, no separate `shed-host-agent`
-daemon required. It embeds `crates/shed-broker` (the same lib crate the standalone
-daemon's `main.rs` wraps) via `shed-app`'s non-default `broker` feature
+The app **is** the credential broker: it brokers credentials in-process, with no separate
+daemon. It embeds `crates/shed-broker` via `shed-app`'s non-default `broker` feature
 (`crates/shed-app/src/broker_bridge.rs`), wired into the setup hook by
-`desktop/tauri/src-tauri/src/broker.rs`. Full behavior is documented user-facing in
-[docs/desktop/architecture.md § The embedded credential
-broker](../docs/desktop/architecture.md#the-embedded-credential-broker).
+`desktop/tauri/src-tauri/src/broker.rs`. There is no mode to choose: a malformed
+`extensions.yaml` fails the broker closed (approvals dark, reported in `broker.status`) and
+the app keeps running. This machine's identity is `<state>/broker/machine.json`
+(`shed_broker::machine`, `<state>` = `shed_broker::paths::state_dir`); it is the only id
+`source.use` ever sends. Full behavior is documented user-facing in
+[docs/desktop/architecture.md § The credential
+broker](../docs/desktop/architecture.md#the-credential-broker).
 
-Three modes, resolved once at startup from a persisted `broker_mode` pref (`auto`
-default) overlaid on a probe of both daemon sockets — `external` (a full daemon is
-running, dial it as before), `headless-coexist` (only a headless daemon's status
-socket is live — mint-only, no in-app approvals), `embedded` (neither socket live —
-start the in-process broker). Whatever the mode, the app and the daemon share one machine
-identity (`<state>/host-agent/machine.json`, `shed_broker::machine`): `BrokerRuntime::this_machine`
-is the embedded broker's loaded identity, else the shared file, and it is the only id
-`source.use` ever sends.
+The broker answers only while the app runs, so **launch at login is on by default**: at
+the first launch that can record it (`Prefs.login_item_defaulted` in `prefs.json`, saved
+BEFORE the login item is set; `prefs::apply_login_default`) the app turns it on once, and
+never again. A debug build outside the harness never applies it (`login_default_applies`),
+so `make run` / `tauri dev` never register a `target/debug` binary. Under the harness the
+write is contained: Linux writes `$HOME/.config/autostart/*.desktop` under the throwaway
+HOME; macOS test mode keeps it in an in-memory cell (`LoginItemCell`).
 
 Test pointers:
 
-- `cargo test -p shed-app --features broker` — the bridge's unit tests (mode
-  resolution, `load_or_synthesize`, outcome mapping, timeout/dismiss). `broker` is
-  `shed-app`'s ONLY non-default feature since plan 022 (S6, `charliek/shed#328`)
-  retired `rc` with the RC hub, so there is no `broker,rc` pair left to run.
-- `desktop/tools/shedtest/test_tauri_broker.py` — the hermetic e2e cells (three-way auto-detect, the bus → AppGate → Coordinator → respond
-  round-trip via the mock server's plugin-bus endpoints, split-namespace `409`,
-  malformed-config fail-closed, the synthesized fresh-install namespace set, and the
-  plan 035 machine pin: `not-source` then accepted, `duplicate`, other 403s, the respond
-  `503` retry; and the credential-source rows: `source.status`/`source.use`, the
-  Preferences "Use this machine" button via the test-mode `ui.press_source_use` door, in
-  embedded and external mode, against the mock's `arm_source` binding).
+- `cargo test -p shed-app --features broker` — the bridge's unit tests
+  (`load_or_synthesize`, outcome mapping, timeout/dismiss). `broker` is `shed-app`'s ONLY
+  non-default feature.
+- `desktop/tools/shedtest/test_tauri_broker.py` — the hermetic e2e cells (the app always
+  brokers in process, the bus → AppGate → Coordinator → respond round-trip via the mock
+  server's plugin-bus endpoints, split-namespace `409`, malformed-config fail-closed, the
+  synthesized fresh-install namespace set, the plan 035 machine pin: `not-source` then
+  accepted, `duplicate`, other 403s, the respond `503` retry; the credential-source rows:
+  `source.status`/`source.use`, the Preferences "Use this machine" button via the test-mode
+  `ui.press_source_use` door, against the mock's `arm_source` binding; and the
+  launch-at-login default, once, and never with unwritable prefs).
 - The mock server's plugin-bus routes live in `desktop/tools/shedtest/mockserver.py`
   (`GET /api/plugins/listeners/{ns}/messages` SSE + `POST
   /api/plugins/listeners/{ns}/respond`), shape-pinned against
-  `tests/host-agent-diff`'s synthetic bus and `docs/development/host-agent-wire-catalog.md`
+  `tests/broker-wire`'s synthetic bus and `docs/development/broker-wire-catalog.md`
   so the fakes can't drift independently.
-- The `tests/host-agent-diff` wire harness (`make test-host-agent-diff`) still protects
-  the extracted `shed-broker` core itself — it doesn't know about the embedded path,
-  only that the standalone daemon built from the same lib matches its pinned goldens.
+- The `tests/broker-wire` wire harness (`make test-broker-wire`) pins the broker's
+  wire output: it runs the app's embedded broker in the test-only
+  `crates/shed-broker-harness` process against committed goldens.
 
 ## mTLS credentials
 
@@ -155,25 +157,14 @@ The app can drive a `shed-server` running `auth.mode: mtls` (client
 certificates instead of bearer tokens — see the root `docs/reference/
 security.md#mtls-mode`) through the Rust core's credential provider.
 
-The private key is generated inside the Rust core's credential provider and
-**never crosses the UDS boundary** — only the CSR goes out (to the
-host-agent, over the UDS `credential.get` message) and the signed public
-certificate comes back. The Tauri shell and frontend never hold, see, or
-serialize key material. The app process itself **persists no credential**: the
-control-scope certificate lives in memory only, and a cold launch re-mints
-it from scratch over SSH via the host-agent relay (matches the existing
-no-persistence posture of the Rust core's control-scope token, just extended
-to certificates). The embedded broker (Tauri) and the standalone
-`shed-host-agent` both persist their own credentials-scope certificate in
-their state dir, same as they do for tokens — that's a different scope/
-process and a different tradeoff (see the credential-ownership table in
+The private key is generated inside the Rust core's credential provider; only
+the CSR goes to the embedded broker's minter, and the signed public certificate
+comes back. The Tauri shell and frontend never hold, see, or serialize key
+material. The app's control-scope certificate lives in memory only, and a cold
+launch re-mints it over SSH through the broker. The broker persists its own
+credentials-scope certificate in its state dir — a different scope and a
+different tradeoff (see the credential-ownership table in
 `~/.claude/plans/shed/001-mtls-mode.md` §3 D6 if working in this area).
-
-A desktop app newer than its `shed-host-agent` install can't use mTLS at all
-until the agent is upgraded — see [Security › Enrollment over
-SSH](../docs/reference/security.md#enrollment-over-ssh) ("Clients older than
-v0.8.1") for the exact failure messages and the required upgrade order (agent
-before/with the app; they're separate release selectors).
 
 ## Socket paths
 
@@ -181,7 +172,6 @@ before/with the app; they're separate release selectors).
   fallback; same on macOS). Hermeticity: `SHED_TAURI_TEST_MODE` / `SHED_TAURI_MOCK_BASE_URL` /
   `SHED_TAURI_SHED_CONFIG`. In containers, point the harness at a prebuilt binary with
   `SHED_TAURI_BIN`.
-- **host-agent (mac):** `~/Library/Application Support/shed/host-agent.sock`.
 
 ## Conventions
 

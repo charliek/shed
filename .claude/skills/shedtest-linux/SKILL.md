@@ -111,7 +111,7 @@ make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; 
   `ui.modal` now only ever reports `create` | `launch` | `null` — Preferences is never a
   modal value.
 - **Credential sources (plan 035 §3.4).** `source.status` → `{rows, this_machine,
-  this_machine_error, broker_mode}` (one row per configured server: `host`, `supported`,
+  this_machine_error}` (one row per configured server: `host`, `supported`,
   `source {id,name}|null`, `this_machine`, `connected`, `error`) and `source.use {host}` (makes
   THIS machine the source; `{row, woke_broker}`; refusals come back as `bad_request`,
   `machine_identity_unavailable`, `source_machine_not_found`, `forbidden`, `unsupported`,
@@ -123,8 +123,8 @@ make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; 
   UNARMED by default (`/api/sources` answers chi's plain 404 = an older server; subscribes
   unchanged); `MockShedServer.arm_source(...)` (or `_broker_app(source={...})`) makes it
   pin: another machine's subscribe gets 403 SOURCE_NOT_BOUND naming the bound machine, a
-  move needs a machine the mock has SEEN (a subscribe, or `know_machine` for external mode,
-  where nothing subscribes), and `source_use_script([403, 500])` scripts refusals. Like the
+  move needs a machine the mock has SEEN (a subscribe, or `know_machine` for a machine that
+  never subscribes), and `source_use_script([403, 500])` scripts refusals. Like the
   real server, a move (`POST /api/sources/use` or `mock.move_source(id, name)`, another
   machine taking it) releases every slot the old machine holds and ends its streams, and the
   old machine's later responds get 403 SOURCE_NOT_BOUND. More knobs: `source_busy(n,
@@ -139,6 +139,28 @@ make -C desktop e2e-tauri       # the hermetic pytest harness (needs a display; 
   lands at exactly +8 s. Preferences re-reads the rows when a hidden window is shown again
   (the native `prefs-shown` event, plus the DOM `focus`/`visibilitychange`, throttled to
   one read per 5 s); under Xvfb either path alone refreshes a reopen.
+- **Launch at login is on by default** (plan 037 §3.1.4): every hermetic first launch turns
+  it on, so the session app reads on (`test_loginitem_probe`). On Linux `auto-launch` writes
+  `$HOME/.config/autostart/*.desktop` and ignores `XDG_CONFIG_HOME`, so it lands under the
+  throwaway HOME (`ui.linux_autostart_dir`), never yours; `prefs.json` is under
+  `XDG_CONFIG_HOME` (`ui.app_config_dir`). `test_login_item_default_once` relaunches over the
+  same runtime dir (`_broker_app(runtime_dir=...)`, caller-owned); the unwritable cell makes
+  `prefs.json` a DIRECTORY because the Docker gate runs as root, which a read-only directory
+  does not stop. A debug build outside the harness never applies the default.
+- **The app's credential broker is the harness's own** (`broker_env.py`). The app brokers in
+  process, so every launch gets a hermetic broker in its runtime dir: `ssh.mode: local-keys`
+  over a throwaway key, every namespace delegated to the app, a server file naming only
+  loopback mocks, AWS/Docker credentials of constants, no `SSH_AUTH_SOCK` and no proxy
+  variables (`NO_PROXY=*`). The server file must be byte for byte what `render_server_file`
+  makes for the launch's mocks; hand-written YAML, however valid, is refused.
+  `broker_env.validate` runs inside `ui.subproc_env` before every spawn; the session app is
+  also held to its two mock URLs after launch (`check_running`). The session broker serves
+  the session mock as `mini3` and a bus-only second mock as `studio`; a self-managed launch
+  gets a broker that serves no server unless it passes `broker=` with a PRIVATE mock.
+  Approvals are real requests on a mock's bus (`bus_stimulus.py`: `emit_sign`,
+  `emit_docker`, `emit_aws`, `new_approval`), and outcomes are read from the bus answer
+  (`verdict`) and the broker's audit file (`audit_line`: `decided_by`, `scope`, `ttl`,
+  `server`). The negative controls for the guards are `test_broker_env.py`.
 - **Updater ops on Linux report `linux_apt`.** `updater.status` → `{os, enabled, reason,
   instantiated}` and `updater.check` exist on both targets (the Sparkle updater is macOS-only;
   Linux ships via apt). On the Linux render gate `updater.status` is
@@ -724,15 +746,19 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
 
 The driver is a Python script that:
 
-- adds `/work/desktop/tools/shedtest` + `/work/desktop/tools/fake-host-agent` to
-  `sys.path` and imports `ui`, `client`, `mockserver`, `fake_host_agent`;
-- launches the mock + fake host-agent + the app hermetically via the harness's own
-  `ui.launch` (throwaway HOME/XDG under `/work` or `/tmp`);
+- adds `/work/desktop/tools/shedtest` to `sys.path` and imports `ui`, `client`,
+  `mockserver`, `broker_env`, `bus_stimulus`;
+- launches the mock + the app hermetically via the harness's own `ui.launch`
+  (throwaway HOME/XDG under `/work` or `/tmp`), passing
+  `broker=broker_env.write_hermetic_broker(state_dir, {"mini3": mock.base_url})` when
+  the shots need credential activity (without it the app's broker serves no server);
 - seeds fixtures — `rc.inject_test` rows for the Agents pane (since S6 it injects into
   the shed's ROOST snapshot, so `slug` must parse as a roost tab id and the shed has to
-  have been listed by `sheds.list` first), `fake.emit_event`
-  audit frames for Activity/Egress (mixed-ns: an `ssh-agent` + an `egress` event is
-  the ns-filter fixture) — `navigate`s to the pane, drives sub-state
+  have been listed by `sheds.list` first), real requests for Activity/Approvals
+  (`bus_stimulus.emit_sign`/`emit_aws` on the mock), and for the Egress activity a mock
+  built with `MockShedServer(egress_events=[{...}])`, whose egress route streams those
+  decisions instead of answering 501 (`test_tauri.py::test_egress_activity_filters_ns`
+  is the mixed-ns pattern) — `navigate`s to the pane, drives sub-state
   (`egress.show`), calls `ui.set_appearance("dark")` for the dark shot, and captures
   via the `app.screenshot` op, writing each PNG under `/out`.
 
@@ -819,13 +845,32 @@ deliver — neither of which a screenshot can be made to fail on.
   `(cd desktop/tauri/src-tauri && cargo update -w --offline)` — each rewrites its lock in a
   second. Review the diff: a path-dep change should add/remove exactly the `[[package]]` block
   and its `dependencies` lines, and nothing third-party.
-- **A module fixture named `fake` breaks the whole pytest session** → `conftest.py` owns a
-  SESSION-scoped `fake` (the fake host-agent) that the autouse `_app_session` requests by name.
-  A module-level `fake` shadows it and every test in the run dies with
-  `ScopeMismatch: You tried to access the function scoped fixture fake with a session scoped
-  request object` — but ONLY when that module is collected before the session fixture is first
-  resolved, so it can pass in a full run and fail when the file is run alone. Name a per-module
-  double something else (`fake_roost`, `roost`, …).
+- **A module fixture named after a session fixture breaks the whole pytest session** →
+  `conftest.py` owns the SESSION-scoped `mock` and `studio` that the autouse `_app_session`
+  requests by name. A module-level fixture of either name shadows it and every test in the
+  run dies with `ScopeMismatch: You tried to access the function scoped fixture mock with a
+  session scoped request object` — but ONLY when that module is collected before the session
+  fixture is first resolved, so it can pass in a full run and fail when the file is run alone.
+  Name a per-module double something else (`fake_roost`, `roost`, `egress_mock`, …). (`fake`
+  is free since the session stopped using a fake daemon.)
+- **The app's broker answers ONE request per namespace and server at a time** → its bus loop
+  awaits each request's gate before it reads the next (`serve_namespace` in
+  `crates/shed-broker/src/bus.rs`). A cell that emits a second sign on the same mock while
+  the first is still pending never sees the second approval: it waits behind the first
+  until that is decided or times out (`approval_timeout`, 25 s by default). Emit one request,
+  take its approval (`bus_stimulus.new_approval`), decide it, then emit the next; two pending
+  at once needs two servers (`mock` and `studio`). For the same reason a pending approval
+  left by a failed cell would stall the next cell's request, so `_reset_policy` denies any
+  leftover before each test.
+- **Every harness launch needs `ssh-keygen`** → `broker_env.write_hermetic_broker` makes a
+  throwaway ed25519 key for the app's broker on every launch (the session's and each
+  self-managed one), so the render-gate image installs `openssh-client`. A missing
+  `ssh-keygen` fails every launch with "the hermetic broker needs ssh-keygen".
+- **A launch that fails `broker_env.validate` never spawns** → `ui.subproc_env` raises
+  `HermeticityError` naming the leak (an inherited `SSH_AUTH_SOCK`, a dir outside the runtime
+  dir, a server URL that is not one of the launch's mocks). Do not work around it by
+  editing the env after `subproc_env`: fix what the launch passes (`broker=` for the
+  servers, the runtime dir for the paths).
 - **`FakeRoost.stop()` is roost's `session.stopping`, not the teardown** (plan 014, mirroring the
   Rust fake) → it tells every stream why, hangs up, and latches the fake *unavailable* until
   `restart()`. Tearing the fake down — stop listening, remove the socket file, produce the

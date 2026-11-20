@@ -51,7 +51,6 @@ import pytest
 
 import ui
 from client import ShedError, TauriClient
-from fake_host_agent import FakeHostAgent
 from fake_opencode import FakeOpencode
 from fake_roost import FakeRoost, roost_call
 
@@ -199,9 +198,8 @@ def app(roost, mock):
     (hence its own socket and single-instance lock), `ui._state` untouched, the
     session app left running. Ordering stops mattering.
 
-    Its own fake host-agent for the same reason downhost has one — the session
-    `fake` tracks a single connection, and a second app connecting to it would
-    misroute the frames the approval suites are waiting on.
+    Its broker serves no server (`ui.subproc_env`'s default hermetic broker), so
+    it never takes a listener slot on the session mock.
 
     Short `mkdtemp` prefixes: the IPC socket lives under the runtime dir, and a
     Unix socket path must stay inside SUN_LEN.
@@ -210,8 +208,6 @@ def app(roost, mock):
     if not cfg.binary.exists():
         raise RuntimeError(
             f"tauri binary not found at {cfg.binary}; build it first (make tauri-build).")
-    agent = FakeHostAgent()
-    agent.start()
     runtime_dir = Path(tempfile.mkdtemp(prefix="shed-lane-"))
     sock = runtime_dir / cfg.sock_rel
     log = runtime_dir / "lane-ui.log"
@@ -220,7 +216,6 @@ def app(roost, mock):
         runtime_dir=runtime_dir,
         mock_base_url=mock.base_url,
         config_path=FIXTURES / "config-lane.yaml",
-        host_agent_socket=agent.socket_path,
         roost_sockets={MACHINE: roost.socket_path},
     )
     log_fh = open(log, "wb")
@@ -247,7 +242,6 @@ def app(roost, mock):
             client.close()
         ui.terminate(proc)
         log_fh.close()
-        agent.stop()
         shutil.rmtree(runtime_dir, ignore_errors=True)
 
 

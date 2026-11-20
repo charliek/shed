@@ -1,6 +1,6 @@
 // Package dockercred implements the guest-side Docker credential helper client.
 // It translates Docker credential helper protocol operations into message bus
-// requests to the host agent. This is used by the docker-credential-shed
+// requests to the credential broker. This is used by the docker-credential-shed
 // one-shot binary.
 package dockercred
 

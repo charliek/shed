@@ -26,8 +26,12 @@ UI-truth ops (`dashboard.dump`, `agents.dump`, `prefs.dump`, …) and on backend
 (`sheds.list`, `approvals.list`, …). It is fully **hermetic**:
 
 1. A stdlib `ThreadingHTTPServer` (`mockserver.py`) stands in for `shed-server` on an
-   ephemeral `127.0.0.1` port, serving fixture JSON the test can mutate directly, and a fake
-   host agent (`tools/fake-host-agent`) backs the approval gate.
+   ephemeral `127.0.0.1` port, serving fixture JSON the test can mutate directly. The app's
+   own credential broker runs hermetically (`broker_env.py`: a throwaway HOME, keys and
+   server list naming only the mocks, checked before every launch); approvals are pushed on
+   a mock's plugin bus (`bus_stimulus.py`). The app turns on launch at login at its first
+   launch; under the harness that login item stays inside the throwaway HOME (Linux) or in
+   memory (macOS).
 2. The harness launches the app in test mode (`SHED_TAURI_TEST_MODE=1`,
    `SHED_TAURI_MOCK_BASE_URL=…`, `SHED_TAURI_SHED_CONFIG` pointing at a fixture config) with a
    throwaway `HOME` and `XDG_RUNTIME_DIR`, so every HTTP client is redirected to the mock, the

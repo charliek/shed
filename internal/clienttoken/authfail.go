@@ -3,8 +3,8 @@ package clienttoken
 // authfail.go re-exports the credential-refused classifier.
 //
 // The classifier itself lives in sdk/authfail, not here, because the in-tree
-// CLI is not its only user: the SDK's bus client and the host-agent's egress
-// subscriber face the identical question — "did the server refuse the
+// CLI is not its only user: the SDK's bus client and a broker's egress
+// subscriber built on the SDK face the identical question — "did the server refuse the
 // credential we presented, in either of the two shapes that refusal takes?" —
 // and they live in the sdk module, which cannot import internal/. One
 // classifier with one alert allowlist is the point: a second copy would drift

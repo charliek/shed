@@ -8,14 +8,13 @@
 //! machine names itself, once, here:
 //!
 //! ```text
-//! <state>/host-agent/machine.json   0600  {"schema":1,"id":"<32 hex>","name":"<name>","created_at":"<RFC3339>"}
-//! <state>/host-agent/machine.lock   0600  the advisory lock that serializes a create or repair
+//! <state>/broker/machine.json   0600  {"schema":1,"id":"<32 hex>","name":"<name>","created_at":"<RFC3339>"}
+//! <state>/broker/machine.lock   0600  the advisory lock that serializes a create or repair
 //! ```
 //!
-//! `<state>` is [`crate::sockets::state_dir`], the directory the credential store already
-//! lives under, so the `shed-host-agent` daemon and the desktop app's embedded broker on
-//! one machine read the SAME file and present the same id, whichever of them runs. (A
-//! process started with a different `SHED_HOST_AGENT_STATE_DIR` is, by construction, a
+//! `<state>` is [`crate::paths::state_dir`], the directory the credential store already
+//! lives under, so the broker reads the same file and presents the same id on every start.
+//! (A process started with a different `SHED_BROKER_STATE_DIR` is, by construction, a
 //! different machine.)
 //!
 //! * **id** — 32 lowercase hexadecimal characters, no hyphens (a v4 UUID's simple form).
@@ -82,7 +81,7 @@ use serde_json::{Map, Value};
 
 use crate::credstore::{atomic_write_durable, ensure_dir, FileLock};
 
-/// The identity file's basename, under `<state>/host-agent/`.
+/// The identity file's basename, under `<state>/broker/`.
 pub const MACHINE_FILE_NAME: &str = "machine.json";
 /// The lock serializing a create, repair or replacement of [`MACHINE_FILE_NAME`]. Never
 /// removed once created (deleting a lock file someone holds breaks the mutex).
@@ -135,11 +134,11 @@ pub struct LoadedIdentity {
     pub outcome: LoadOutcome,
 }
 
-/// The identity file's path: `<state>/host-agent/machine.json`, beside the broker's
-/// credential store (`<state>/host-agent/creds/`).
+/// The identity file's path: `<state>/broker/machine.json`, beside the broker's
+/// credential store (`<state>/broker/creds/`).
 pub fn machine_state_path() -> PathBuf {
-    crate::sockets::state_dir()
-        .join("host-agent")
+    crate::paths::state_dir()
+        .join("broker")
         .join(MACHINE_FILE_NAME)
 }
 
@@ -374,13 +373,6 @@ fn tolerate_unsupported_sync(r: std::io::Result<()>) -> std::io::Result<()> {
         }
         r => r,
     }
-}
-
-/// Create the identity file's directory as a create of the file itself does
-/// ([`ensure_dir_durable`] with the real directory sync), for another file kept beside
-/// it ([`crate::presence`]'s lock).
-pub(crate) fn ensure_state_dir(dir: &Path) -> Result<(), String> {
-    ensure_dir_durable(dir, &sync_dir)
 }
 
 /// [`ensure_dir`] (create, tighten to 0700), and then make every directory it CREATED
@@ -697,12 +689,12 @@ mod tests {
         let path = dir
             .path()
             .join("state")
-            .join("host-agent")
+            .join("broker")
             .join(MACHINE_FILE_NAME);
         (dir, path)
     }
 
-    /// A state path whose `host-agent/` dir already exists, holding `contents`.
+    /// A state path whose `broker/` dir already exists, holding `contents`.
     fn state_with(contents: &[u8]) -> (tempfile::TempDir, PathBuf) {
         let (d, path) = state();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1106,9 +1098,9 @@ mod tests {
         synced.sort();
         let state_dir = d.path().join("state");
         let mut want = vec![
-            d.path().to_path_buf(),       // holds the new `state/`
-            state_dir.clone(),            // holds the new `host-agent/`
-            state_dir.join("host-agent"), // holds the renamed `machine.json`
+            d.path().to_path_buf(),   // holds the new `state/`
+            state_dir.clone(),        // holds the new `broker/`
+            state_dir.join("broker"), // holds the renamed `machine.json`
         ];
         want.sort();
         assert_eq!(synced, want);
@@ -1130,7 +1122,7 @@ mod tests {
     /// says why, rather than presenting an id a power loss could take back.
     #[test]
     fn a_failed_sync_fails_the_create() {
-        for fail_on in ["state", "host-agent"] {
+        for fail_on in ["state", "broker"] {
             let (_d, path) = state();
             let sync = |dir: &Path| {
                 if dir.ends_with(fail_on) {
@@ -1194,8 +1186,8 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        // The state dir exists but is read-only and `host-agent/` is not there yet, so
-        // nothing can be created. (Making `host-agent/` itself 0500 would not do: the
+        // The state dir exists but is read-only and `broker/` is not there yet, so
+        // nothing can be created. (Making `broker/` itself 0500 would not do: the
         // owner may chmod it back, and the create tightens it to 0700 as the credential
         // store does.)
         let (_d, path) = state();
@@ -1382,12 +1374,11 @@ mod tests {
     #[test]
     fn the_production_path_is_under_the_state_dir() {
         let _guard = crate::env_lock();
-        std::env::set_var("SHED_HOST_AGENT_STATE_DIR", "/tmp/shed-state-test");
+        std::env::set_var("SHED_BROKER_STATE_DIR", "/tmp/shed-state-test");
         let p = machine_state_path();
-        std::env::remove_var("SHED_HOST_AGENT_STATE_DIR");
-        // Beside the credential store (`host-agent/creds/`), so the daemon and the
-        // embedded broker share it.
-        assert_eq!(p, Path::new("/tmp/shed-state-test/host-agent/machine.json"));
+        std::env::remove_var("SHED_BROKER_STATE_DIR");
+        // Beside the credential store (`broker/creds/`).
+        assert_eq!(p, Path::new("/tmp/shed-state-test/broker/machine.json"));
     }
 
     /// The real `gethostname` path: it returns a hostname, and that hostname yields a

@@ -319,13 +319,21 @@ func newConfigLookup(opts ConfigOptions, deps lookupDeps) (*ConfigLookup, error)
 		return nil, err
 	}
 	if l.mode == config.SSHAuthEnforce && l.size() == 0 {
-		return nil, fmt.Errorf(
-			"auth.ssh.mode=enforce but no authorized keys resolved " +
-				"(inline/file empty and GitHub fetch failed with no cache); " +
-				"use mode=warn for first boot or provide authorized_keys")
+		return nil, errors.New(noKeysResolved)
 	}
 	return l, nil
 }
+
+// noKeysResolved is the refusal to start in enforce mode with no key at all:
+// no key that does not come from GitHub, and no GitHub login with keys (each
+// fetch failed, and a login is read back from its disk cache only once it is
+// pinned). An mtls server always enforces, so the two ways forward are
+// GitHub itself or a key of another source: with a user list a key under a
+// user's keys, without one auth.ssh's own keys (the two cannot be combined).
+const noKeysResolved = "auth.ssh.mode=enforce but no authorized keys resolved " +
+	"(no key that does not come from GitHub, and no GitHub login's keys could be fetched or read from a confirmed cache); " +
+	"let the server reach api.github.com and start it again, or give it a key that does not come from GitHub: " +
+	"with a user list (auth.users) a key under that user's keys, without one auth.ssh.authorized_keys or authorized_keys_file"
 
 // Mode returns the SSH key-auth mode (off/warn/enforce).
 func (l *ConfigLookup) Mode() string { return l.mode }
@@ -1095,15 +1103,15 @@ func (l *ConfigLookup) distrusted(key string) bool {
 const (
 	fromMemory = "memory"
 	fromCache  = "the disk cache"
-	fromLegacy = "the disk cache (the login is not pinned yet)"
 )
 
 // lastKnown is a login's last known keys, which a fetch that cannot vouch for
 // new ones falls back to and a pin write that fails keeps: the bytes this
 // process last accepted, else the disk cache, read only when it is the cache
-// last confirmed for the pin (its hash is the pin's) or the login has never
-// been pinned (a cache an earlier release wrote). Nothing is read from disk
-// for a distrusted login.
+// last confirmed for the pin (its hash is the pin's). The cache of a login
+// that has never been pinned (one an earlier release wrote, before logins
+// were pinned) is not read: its keys come only from a good fetch, which pins
+// the login. Nothing is read from disk for a distrusted login.
 func (l *ConfigLookup) lastKnown(g githubLogin) ([]byte, string) {
 	if data := l.lastGitHub[g.key]; data != nil {
 		return data, fromMemory
@@ -1111,13 +1119,18 @@ func (l *ConfigLookup) lastKnown(g githubLogin) ([]byte, string) {
 	if l.distrusted(g.key) || l.cacheDir == "" {
 		return nil, ""
 	}
+	pin := l.effectivePin(g)
+	if pin == 0 {
+		// Checked before the file is opened: an unpinned login's cache is
+		// never read.
+		if _, err := os.Lstat(l.cachePath(g.login)); err == nil {
+			log.Printf("auth.ssh: the disk cache of github login %q is not used: the login is not pinned to an account yet, and only a good fetch from api.github.com pins it", g.login)
+		}
+		return nil, ""
+	}
 	cached, err := os.ReadFile(l.cachePath(g.login))
 	if err != nil {
 		return nil, ""
-	}
-	pin := l.effectivePin(g)
-	if pin == 0 {
-		return cached, fromLegacy
 	}
 	if e, ok := l.pins[g.key]; ok && e.ID == pin && e.KeysSHA256 != "" && e.KeysSHA256 == keysDigest(cached) {
 		return cached, fromCache

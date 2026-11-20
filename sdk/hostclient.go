@@ -51,8 +51,8 @@ const (
 var errSubscribeConflict = errors.New("namespace already has an active subscriber")
 
 // SubStatus is a snapshot of one namespace subscription's connection state, so
-// callers can report health (e.g. `shed-host-agent status --live`) without
-// scraping logs.
+// callers can report health (e.g. a broker's status view) without scraping
+// logs.
 //
 // Fields may be added to SubStatus: build one with field names, since a
 // positional literal of it is not something this module keeps compiling.
@@ -392,7 +392,7 @@ func WithLogger(logger *slog.Logger) HostClientOption {
 }
 
 // WithTokenProvider sets a refreshing token source, used in preference to a
-// static WithToken. The host-agent passes one backed by its SSH credential
+// static WithToken. A credential broker passes one backed by its SSH credential
 // minter so the bus token is re-minted near expiry / on a 401 without rebuilding
 // the client.
 //
@@ -404,7 +404,7 @@ func WithTokenProvider(tp TokenProvider) HostClientOption {
 	}
 }
 
-// WithToken sets the bearer token sent on requests (the host-agent's
+// WithToken sets the bearer token sent on requests (a credential broker's
 // credentials-scoped token). Sent when non-empty.
 //
 // A wired WithClientCertificates outranks it: no Authorization header is sent

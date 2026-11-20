@@ -1,7 +1,7 @@
-//! Minimal host-agent config reader for slice 0 — deliberately scoped to exactly
+//! Minimal extensions-config reader for slice 0 — deliberately scoped to exactly
 //! what the LiveStatus self-report needs: the three approval policies
 //! (`ssh/aws/docker .approval.policy`) plus `logging.{enabled,path}`. `load` now
-//! also runs [`HostAgentConfig::validate`] — a faithful port of Go's
+//! also runs [`ExtensionsYaml::validate`] — a faithful port of Go's
 //! `Config.Validate` (the three policy allow-sets, `aws.sheds`/`aws.mode`, and
 //! `approval_timeout`), so the Rust daemon rejects (exit 1) exactly the configs the
 //! Go daemon rejects. The reader also surfaces the native-biometric approval knobs
@@ -13,7 +13,7 @@
 //! reader uses, but its parser is backed by `saphyr-parser` (a pure-Rust,
 //! no-serde/no-C YAML-1.2 *event* stream). The repo's deliberate no-YAML-dep
 //! posture targets the serde-based crates (`serde_yaml`/`serde_norway`); the
-//! host-agent reader is the scoped exception — a real parser gains block
+//! extensions-config reader is the scoped exception — a real parser gains block
 //! sequences, flow maps, and malformed-input detection the line/colon reader
 //! could not, which the shipped `configs/extensions.example.yaml` (block-style
 //! `registries:`) actually needs. See `crates/CLAUDE.md` for the carve-out;
@@ -66,6 +66,11 @@ pub const POLICY_BIOMETRICS_OR_PASSWORD: &str = "biometrics-or-password";
 /// (`config.go:428`). Used only in single-server mode (no `discovery:` block).
 pub const DEFAULT_SERVER_URL: &str = "http://localhost:8080";
 
+/// The refusal of a config that still has a top-level `desktop:` block, the retired
+/// daemon's (`enabled`, `socket_path`, `timeout_ms`), none of which does anything.
+pub const DESKTOP_BLOCK_REMOVED: &str = "the `desktop:` block was removed; delete it \
+     (a `desktop.timeout_ms` becomes `approval_timeout` with a unit: 30000 ms is `approval_timeout: 30s`)";
+
 /// The shed CLI config the agent discovers servers from when discovery is enabled
 /// without an explicit `source:` (mirror `config.go:DefaultDiscoverySource`). Applied
 /// (and tilde-expanded) by [`DiscoveryConfig::apply_defaults`]; also re-exported by
@@ -101,29 +106,6 @@ pub fn expand_tilde(path: &str) -> String {
         return user_home_dir().join(rest).to_string_lossy().into_owned();
     }
     path.to_string()
-}
-
-/// Render a log field value the way Go's `slog` TextHandler does: bare when it is safe,
-/// quoted-and-escaped otherwise. Go's `needsQuoting` quotes an empty value, or one
-/// containing a space, `=`, `"`, `\`, or any non-printable rune.
-///
-/// This is not cosmetic. The stock macOS socket path contains a space
-/// (`~/Library/Application Support/shed/…`), so Go quotes it and an unquoted Rust field
-/// would be both divergent and ambiguous to a text-log parser in the COMMON case. And
-/// escaping is what stops a config scalar containing a newline from forging a second log
-/// line — see the `desktop.timeout_ms` warning.
-fn slog_value(s: &str) -> String {
-    let needs_quoting = s.is_empty()
-        || s.chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '=' || c == '"' || c == '\\');
-    if needs_quoting {
-        // Rust's Debug for &str is strconv.Quote-shaped: wraps in `"` and escapes
-        // control characters, quotes and backslashes. Close enough for parity here,
-        // and identical for the cases that matter (paths, integers, injected newlines).
-        format!("{s:?}")
-    } else {
-        s.to_string()
-    }
 }
 
 /// Resolve `approval_timeout`'s raw string to a `Duration`, defaulting an
@@ -489,10 +471,10 @@ fn parse_offer_key(entry: &str) -> Result<[u8; 32], String> {
     Ok(key_blob_digest(&blob))
 }
 
-/// The slice-0/1 view of the host-agent config: the fields LiveStatus needs plus
+/// The slice-0/1 view of the extensions config (`extensions.yaml`): the fields LiveStatus needs plus
 /// `approval_timeout` (the delegated-approval budget the desktop server enforces).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostAgentConfig {
+pub struct ExtensionsYaml {
     ssh_policy: String,
     aws_policy: String,
     docker_policy: String,
@@ -515,7 +497,7 @@ pub struct HostAgentConfig {
     /// `ssh.allow_users` as written (plan 035 §3.5): the usernames this machine signs a
     /// login for. Absent or null → `[git]`; a present list replaces that default; `[]`
     /// signs no login at all (commit signing only). Checked by
-    /// [`HostAgentConfig::validate`], read through [`HostAgentConfig::ssh_sign_policy`].
+    /// [`ExtensionsYaml::validate`], read through [`ExtensionsYaml::ssh_sign_policy`].
     ssh_allow_users: ConfigList,
     /// `ssh.offer_keys` as written: the keys offered to sheds, as `SHA256:` fingerprints
     /// or OpenSSH public key lines. Absent or null → no filter; a present list, even an
@@ -523,34 +505,10 @@ pub struct HostAgentConfig {
     ssh_offer_keys: ConfigList,
     pub logging_enabled: bool,
     pub logging_path: String,
-    /// Log lines for deprecated keys that are still set and are IGNORED, collected at
-    /// parse time for the caller to emit (same shape as `resolve_ssh_backend`'s
-    /// warnings). Mirrors Go's `warnDeprecatedDesktopKeys`, which logs one line per
-    /// `desktop.*` key that is present; the daemons are maintained wire-identical, and
-    /// a silent Rust daemon meant an operator migrating off the Go one lost the signal
-    /// that their config knob does nothing. Emitted by `main.rs` right after load.
-    ///
-    /// Two known divergences from Go, both accepted deliberately:
-    ///
-    /// 1. Go warns inside `LoadConfig` BEFORE `Validate`, so a config that is BOTH
-    ///    invalid and sets deprecated keys logs the warnings and then the validation
-    ///    error. Here the warnings ride on the parsed value, which `load` drops when
-    ///    `validate` fails — so that path logs only the error. Both daemons still exit
-    ///    1 on that config (the error text already differs between them: Go prefixes
-    ///    `invalid config:`), so the only loss is the migration hint on a startup that
-    ///    was failing anyway; it reappears once the unrelated error is fixed. Reshaping
-    ///    `load`'s signature to carry warnings off the error path is not worth that.
-    /// 2. Go type-checks these keys (`*bool`/`*string`/`*int`), so `enabled: "false"` or
-    ///    `enabled: [false]` makes Go reject the whole config; the Rust reader never
-    ///    decoded the `desktop:` block at all, so it loads and (for a scalar) warns.
-    ///    That accept/reject split PREDATES this warning and is not introduced by it —
-    ///    making Rust hard-error to match would be a behaviour change well outside a
-    ///    diagnostics fix, and would break configs that load on the shipped daemon today.
-    pub deprecated_warnings: Vec<String>,
     // Read only by `approval_timeout()`, which the desktop/embedder approval path calls.
     approval_timeout: Duration,
     /// The RAW `approval_timeout` string exactly as written in the config (`""`
-    /// when the key is absent/null). Retained so [`HostAgentConfig::validate`] can
+    /// when the key is absent/null). Retained so [`ExtensionsYaml::validate`] can
     /// re-check it the way Go's `Validate` re-parses `Config.ApprovalTimeout`: an
     /// EMPTY raw is valid (→ 25s default); a non-empty raw that fails to parse or is
     /// non-positive is rejected. The parsed `approval_timeout` above still fail-safes
@@ -585,12 +543,12 @@ pub struct HostAgentConfig {
     pub docker: DockerConfig,
 }
 
-impl HostAgentConfig {
+impl ExtensionsYaml {
     /// Load + parse the config at `path` (tilde-expanded). A missing/unreadable
     /// file is an **error**: the daemon requires a config to know its policies, so
     /// it exits 1 rather than fail open (matches the Go daemon's `LoadConfig` →
     /// `os.Exit(1)` on any load error).
-    pub fn load(path: &str) -> io::Result<HostAgentConfig> {
+    pub fn load(path: &str) -> io::Result<ExtensionsYaml> {
         let expanded = expand_tilde(path);
         let text = std::fs::read_to_string(&expanded)?;
         // load = parse → validate (mirrors Go's `LoadConfig`: `yaml.Unmarshal` then
@@ -612,7 +570,7 @@ impl HostAgentConfig {
     /// message (Go returns the first error), with the same field prefixes and
     /// message shapes so the language-neutral golden can pin per-vector substrings.
     /// An empty policy is valid (→ deny-all); SSH alone accepts the native biometric
-    /// policies (aws/docker reject them). Called from [`HostAgentConfig::load`].
+    /// policies (aws/docker reject them). Called from [`ExtensionsYaml::load`].
     pub fn validate(&self) -> Result<(), String> {
         // Go's `sshAllowed` / `credAllowed` (`config.go:488-489`), same order — the
         // order is byte-visible in the `is not one of %s` join.
@@ -710,19 +668,19 @@ impl HostAgentConfig {
     /// Parse config text, returning an error on malformed YAML. Missing keys take
     /// their defaults (policies default to empty → deny-all effective; logging
     /// enabled true). This is the fallible path `load` uses; the infallible
-    /// `HostAgentConfig::parse` convenience wraps it for known-good test literals.
-    pub fn try_parse(text: &str) -> Result<HostAgentConfig, String> {
+    /// `ExtensionsYaml::parse` convenience wraps it for known-good test literals.
+    pub fn try_parse(text: &str) -> Result<ExtensionsYaml, String> {
         let root = yaml_lite::parse(text)?;
         Self::from_root(&root)
     }
 
     /// Parse known-good config text, panicking on malformed YAML. A convenience for
     /// the in-crate tests + fixtures that pass literals known to parse; production
-    /// load goes through [`HostAgentConfig::try_parse`] (via `load`), so this is
+    /// load goes through [`ExtensionsYaml::try_parse`] (via `load`), so this is
     /// only reached from test builds — so it is `#[cfg(test)]`-gated out of the
     /// production binary entirely rather than kept as a dead-code-allowed symbol.
     #[cfg(test)]
-    pub fn parse(text: &str) -> HostAgentConfig {
+    pub fn parse(text: &str) -> ExtensionsYaml {
         Self::try_parse(text).expect("yaml fixture parses")
     }
 
@@ -730,7 +688,7 @@ impl HostAgentConfig {
     /// half of `try_parse`). Fallible only through the discovery `ServerSelector`
     /// (D3): a map-valued `discovery.servers:` surfaces the exact Go error so
     /// `try_parse`/`load` reject it → exit 1, matching Go's `UnmarshalYAML`.
-    fn from_root(root: &yaml_lite::Node) -> Result<HostAgentConfig, String> {
+    fn from_root(root: &yaml_lite::Node) -> Result<ExtensionsYaml, String> {
         let policy = |ns_key: &str| -> String {
             root.get_path(&[ns_key, "approval", "policy"])
                 .unwrap_or_default()
@@ -807,54 +765,16 @@ impl HostAgentConfig {
                 Some(dc)
             }
         };
-        // Deprecated `desktop.*` keys are IGNORED but must not be ignored SILENTLY —
-        // Go's `warnDeprecatedDesktopKeys` logs one line per key that is set, and the
-        // two daemons are maintained as behavioural twins. Presence is what matters,
-        // not the value: Go decodes into `*bool`/`*string`/`*int`, so an explicit
-        // `enabled: false` or `timeout_ms: 0` is still "set" and still warns. A bare
-        // `desktop:` (YAML null) or `desktop: {}` sets no key, so it stays quiet, and
-        // an explicit null sub-key decodes to nil in Go — hence `Scalar` only.
-        let desktop = root.as_map().and_then(|m| m.get("desktop"));
-        let desktop_key = |key: &str| -> Option<&String> {
-            match desktop
-                .and_then(yaml_lite::Node::as_map)
-                .and_then(|m| m.get(key))
-            {
-                Some(yaml_lite::Node::Scalar(s)) => Some(s),
-                _ => None,
-            }
-        };
-        let mut deprecated_warnings = Vec::new();
-        if desktop_key("enabled").is_some() {
-            deprecated_warnings.push(
-                "config: `desktop.enabled` is deprecated and ignored — the approval channel is always on"
-                    .to_string(),
-            );
-        }
-        if desktop_key("socket_path").is_some() {
-            deprecated_warnings.push(format!(
-                "config: `desktop.socket_path` is deprecated and ignored — the socket path is fixed path={}",
-                slog_value(&crate::sockets::desktop_socket_path().to_string_lossy())
-            ));
-        }
-        if let Some(v) = desktop_key("timeout_ms") {
-            // Echo the PARSED integer, never the raw scalar. Go decodes into `*int`, so
-            // the only values it ever logs are valid integers (`01` prints as `1`), and
-            // anything else fails `yaml.Unmarshal` before the warning is reached. Two
-            // reasons this matters beyond cosmetics: raw text drifts from Go's rendering,
-            // and a scalar containing a newline would otherwise forge a whole log line
-            // (`timeout_ms: "0\nERROR forged"`). Unparseable values are a config Go
-            // rejects outright, so quote/escape rather than invent a number.
-            let rendered = match v.trim().parse::<i64>() {
-                Ok(n) => n.to_string(),
-                Err(_) => slog_value(v),
-            };
-            deprecated_warnings.push(format!(
-                "config: `desktop.timeout_ms` is deprecated and ignored — use the top-level `approval_timeout` timeout_ms={rendered}"
-            ));
+        // The `desktop:` block (`enabled`, `socket_path`, `timeout_ms`) belonged to
+        // the retired daemon and no key in it does anything. It is refused by its
+        // presence, whatever its value (a bare `desktop:` and `desktop: {}` too), so
+        // a person sees it once instead of running on a knob that is ignored: a
+        // `desktop.timeout_ms` never set the approval budget, `approval_timeout` does.
+        if root.as_map().is_some_and(|m| m.contains_key("desktop")) {
+            return Err(DESKTOP_BLOCK_REMOVED.to_string());
         }
 
-        Ok(HostAgentConfig {
+        Ok(ExtensionsYaml {
             ssh_policy: policy("ssh"),
             aws_policy: policy("aws"),
             docker_policy: policy("docker"),
@@ -868,7 +788,6 @@ impl HostAgentConfig {
             ssh_offer_keys: ssh_list("offer_keys"),
             logging_enabled,
             logging_path,
-            deprecated_warnings,
             approval_timeout: parse_approval_timeout(&approval_timeout_raw),
             approval_timeout_raw,
             server,
@@ -899,10 +818,8 @@ impl HostAgentConfig {
         self.discovery.is_some()
     }
 
-    /// The delegated-approval budget the desktop server enforces per request, and
-    /// which drives the `hello_ack.request_timeout_ms` it advertises. Mirrors Go's
-    /// `ApprovalTimeoutDuration` + `NewDesktopServer`'s guard: an absent, invalid,
-    /// or non-positive `approval_timeout` falls back to 25s. [`HostAgentConfig::load`]
+    /// The delegated-approval budget the app's approval gate enforces per request:
+    /// an absent, invalid, or non-positive `approval_timeout` falls back to 25s. [`ExtensionsYaml::load`]
     /// now hard-rejects an invalid/non-positive value at startup (via `validate`), so
     /// production never reaches this accessor with a bad value; the fail-safe remains
     /// for the in-crate `parse` convenience (which skips validation), mirroring Go's
@@ -961,7 +878,7 @@ impl HostAgentConfig {
 
 /// Selects which discovered servers a single agent process watches and how it reacts
 /// to changes in the discovery source — a faithful port of Go's `DiscoveryConfig`
-/// (`config.go:60`). Present (`Some`) on [`HostAgentConfig`] means multi-server mode.
+/// (`config.go:60`). Present (`Some`) on [`ExtensionsYaml`] means multi-server mode.
 ///
 /// The reload knobs (`watch`/`poll_interval`/`debounce`) are consumed by the watcher
 /// (`run_watch_loop`) and `servers` by the reconcile path (`resolve_targets`);
@@ -1127,9 +1044,9 @@ fn normalize_aws_mode(mode: &str) -> &str {
 /// top-level fields are the defaults; `servers` carries per-server (and per-shed)
 /// overrides layered over them. `source_profile` and `cache_refresh_before` are
 /// process-global and are not overridable per server. The `aws.approval.policy`
-/// gate lives on `HostAgentConfig.aws_policy`, not here.
+/// gate lives on `ExtensionsYaml.aws_policy`, not here.
 ///
-/// Built by [`AwsConfig::from_node`] (called from `HostAgentConfig::parse`) and
+/// Built by [`AwsConfig::from_node`] (called from `ExtensionsYaml::parse`) and
 /// consumed by the AWS backend (`aws_backend.rs`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AwsConfig {
@@ -1140,7 +1057,7 @@ pub struct AwsConfig {
     pub session_duration: String,
     pub cache_refresh_before: String,
     /// The REMOVED global per-shed override map (Go's `AWSConfig.Sheds`). Parsed
-    /// ONLY so [`HostAgentConfig::validate`] can reject a populated one with the
+    /// ONLY so [`ExtensionsYaml::validate`] can reject a populated one with the
     /// migration message (`config.go:561`, the `len > 0` reject); it does NOT affect
     /// resolution. Bare `sheds:` / `sheds: {}` / `sheds: null` parse to an EMPTY map
     /// (len 0 = valid); only a populated map rejects.
@@ -1207,7 +1124,7 @@ fn read_aws_sheds(
     out
 }
 
-// `from_node` is live (called by `HostAgentConfig::parse`); `resolve`/`enabled` are
+// `from_node` is live (called by `ExtensionsYaml::parse`); `resolve`/`enabled` are
 // reached through the AWS backend + `main.rs`, wired into the bus (`new_sts_backend`
 // calls `enabled`; the backend's get_credentials/status call `resolve`).
 impl AwsConfig {
@@ -1227,7 +1144,7 @@ impl AwsConfig {
     /// golden.)
     ///
     /// `aws.sheds` (Go's removed global per-shed map) IS parsed now — but only so
-    /// [`HostAgentConfig::validate`] can reject a populated one (the `len > 0`
+    /// [`ExtensionsYaml::validate`] can reject a populated one (the `len > 0`
     /// migration reject, `config.go:561`). It stays parse-and-ignore for resolution.
     fn from_node(root: &yaml_lite::Node) -> AwsConfig {
         use yaml_lite::Node;
@@ -1384,7 +1301,7 @@ impl AwsConfig {
 /// Go's `DockerConfig` (`config.go:198-254`). The top-level fields are the defaults;
 /// `servers` carries per-server (and per-shed) overrides layered over them.
 /// `config_path` (the Docker `config.json` override) is process-global. The
-/// `docker.approval.policy` gate lives on `HostAgentConfig.docker_policy`, not here.
+/// `docker.approval.policy` gate lives on `ExtensionsYaml.docker_policy`, not here.
 ///
 /// Unlike [`AwsConfig`], Docker has **no `enabled()` method and no load-defaults**:
 /// Go's `DockerConfig` carries no `Enabled()` and `DefaultConfig` sets no Docker
@@ -1394,7 +1311,7 @@ impl AwsConfig {
 /// off when unconfigured, Docker stays on — is the crux of the Docker slice and is
 /// carried by the constructor (commit 2), not by this config type.
 ///
-/// Built by [`DockerConfig::from_node`] (called from `HostAgentConfig::parse`) and
+/// Built by [`DockerConfig::from_node`] (called from `ExtensionsYaml::parse`) and
 /// consumed by the Docker backend (`docker_backend.rs`, commit 2) + `main.rs` bus
 /// wiring (commit 3).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1550,7 +1467,7 @@ impl DockerConfig {
 /// `false/False/FALSE`, `no/No/NO`, `off/Off/OFF`, `n/N` → `Some(false)`. Anything
 /// else — a non-canonical case (`tRUe`, `yEs`), `nonsense`, `1`, `0`, or a non-scalar
 /// — is NOT a resolvable bool: yaml.v3 ERRORS (`!!str`/`!!int` into bool), but the
-/// stringly-typed host-agent reader can't error without a typed `Node` layer, so it
+/// stringly-typed extensions-config reader can't error without a typed `Node` layer, so it
 /// returns `None` (the D6 typed-decode residue, ACCEPT — the caller keeps its lenient
 /// default). This is the D2 FIX: `opt_bool`/`logging_enabled` previously matched only
 /// lowercase `true`/`false`, silently mis-reading `allow_all: yes` / `logging.enabled:
@@ -1580,7 +1497,7 @@ fn opt_bool(node: Option<&yaml_lite::Node>) -> Option<bool> {
         .map(|s| parse_yaml_bool(s).unwrap_or(false))
 }
 
-/// The host-agent config parser, exposing a tiny `Node` model (nested maps,
+/// The extensions-config parser, exposing a tiny `Node` model (nested maps,
 /// scalars, sequences, and an explicit null) over a real YAML-1.2 parser.
 ///
 /// The parser is driven off `saphyr-parser`'s low-level *event* stream (see the
@@ -1809,9 +1726,9 @@ pub(crate) mod yaml_lite {
                     }
                     self.build_mapping()
                 }
-                Event::Alias(_) => {
-                    Err("YAML anchors/aliases are not supported in host-agent config".to_string())
-                }
+                Event::Alias(_) => Err(
+                    "YAML anchors/aliases are not supported in the extensions config".to_string(),
+                ),
                 other => Err(format!("unexpected YAML node event: {other:?}")),
             }
         }
@@ -1892,7 +1809,7 @@ mod tests {
 
     #[test]
     fn parses_policies_and_logging() {
-        let cfg = HostAgentConfig::parse(
+        let cfg = ExtensionsYaml::parse(
             "\
 ssh:
   approval:
@@ -1918,13 +1835,13 @@ logging:
     #[test]
     fn empty_or_missing_policy_defaults_to_deny_all() {
         // An entirely empty config → all three deny-all, logging enabled default.
-        let cfg = HostAgentConfig::parse("");
+        let cfg = ExtensionsYaml::parse("");
         assert_eq!(cfg.effective_policy(NS_SSH_AGENT), POLICY_DENY_ALL);
         assert_eq!(cfg.effective_policy(NS_AWS_CREDENTIALS), POLICY_DENY_ALL);
         assert_eq!(cfg.effective_policy(NS_DOCKER_CREDENTIALS), POLICY_DENY_ALL);
         assert!(cfg.logging_enabled);
         // A present ssh block with an empty policy still resolves to deny-all.
-        let cfg2 = HostAgentConfig::parse("ssh:\n  approval:\n    policy:\n");
+        let cfg2 = ExtensionsYaml::parse("ssh:\n  approval:\n    policy:\n");
         assert_eq!(cfg2.effective_policy(NS_SSH_AGENT), POLICY_DENY_ALL);
         // An unknown namespace is deny-all too.
         assert_eq!(cfg2.effective_policy("nope"), POLICY_DENY_ALL);
@@ -1934,7 +1851,7 @@ logging:
     fn gate_namespaces_selects_shed_desktop_in_fixed_order() {
         // Config order is docker, ssh, aws — the selection must still come back in
         // the fixed ssh, aws, docker order, and skip the non-shed-desktop aws.
-        let cfg = HostAgentConfig::parse(
+        let cfg = ExtensionsYaml::parse(
             "\
 docker:
   approval:
@@ -1952,29 +1869,29 @@ aws:
             vec!["ssh-agent".to_string(), "docker-credentials".to_string()]
         );
         // No shed-desktop anywhere → empty gate list.
-        assert!(HostAgentConfig::parse("").gate_namespaces().is_empty());
+        assert!(ExtensionsYaml::parse("").gate_namespaces().is_empty());
     }
 
     #[test]
     fn load_missing_file_is_error() {
-        assert!(HostAgentConfig::load("/nonexistent/does-not-exist-xyz.yaml").is_err());
+        assert!(ExtensionsYaml::load("/nonexistent/does-not-exist-xyz.yaml").is_err());
     }
 
     #[test]
     fn server_defaults_and_single_server_detection() {
         // No `server:` and no `discovery:` → default URL + single-server mode.
-        let cfg = HostAgentConfig::parse("");
+        let cfg = ExtensionsYaml::parse("");
         assert_eq!(cfg.server, DEFAULT_SERVER_URL);
         assert!(cfg.is_single_server());
 
         // An explicit `server:` overrides the default and stays single-server.
-        let cfg = HostAgentConfig::parse("server: http://mini2:8080\n");
+        let cfg = ExtensionsYaml::parse("server: http://mini2:8080\n");
         assert_eq!(cfg.server, "http://mini2:8080");
         assert!(cfg.is_single_server());
 
         // A `discovery:` block flips to multi-server mode (bus stays off), and the
         // `server:` field defaults but is unused. Mirrors the watch-none diff config.
-        let cfg = HostAgentConfig::parse(
+        let cfg = ExtensionsYaml::parse(
             "\
 discovery:
   servers: []
@@ -1999,9 +1916,9 @@ discovery:
         // A bare `discovery:` (YAML null) reads as ABSENT → SINGLE-server, matching
         // Go's nil `*DiscoveryConfig` (CodeRabbit review). An empty MAP `discovery: {}`
         // is non-null → multi-server (Go non-nil empty struct).
-        assert!(HostAgentConfig::parse("discovery:\n").is_single_server());
-        assert!(!HostAgentConfig::parse("discovery: {}\n").is_single_server());
-        assert!(!HostAgentConfig::parse("discovery:\n  watch: off\n").is_single_server());
+        assert!(ExtensionsYaml::parse("discovery:\n").is_single_server());
+        assert!(!ExtensionsYaml::parse("discovery: {}\n").is_single_server());
+        assert!(!ExtensionsYaml::parse("discovery:\n  watch: off\n").is_single_server());
     }
 
     // ---- discovery: ServerSelector / DiscoveryConfig / resolve_targets ---------------
@@ -2072,7 +1989,7 @@ discovery:
     /// `~/...`). Explicit values are kept.
     #[test]
     fn discovery_apply_defaults() {
-        let cfg = HostAgentConfig::parse("discovery:\n  servers: all\n");
+        let cfg = ExtensionsYaml::parse("discovery:\n  servers: all\n");
         let dc = cfg.discovery.as_ref().expect("discovery present");
         assert!(dc.servers.all);
         assert_eq!(dc.watch, "fsnotify");
@@ -2084,7 +2001,7 @@ discovery:
         assert!(!dc.source.starts_with("~/"));
 
         // Explicit knobs are kept, not overwritten by defaults.
-        let cfg = HostAgentConfig::parse(
+        let cfg = ExtensionsYaml::parse(
             "discovery:\n  watch: poll\n  poll_interval: 3s\n  debounce: 100ms\n  source: /abs/x.yaml\n",
         );
         let dc = cfg.discovery.as_ref().unwrap();
@@ -2100,7 +2017,7 @@ discovery:
     // standalone `#[path]` golden include (`tests/golden.rs`).
 
     /// The Rust half of the `server_selector` golden — reads the SAME shared fixture the
-    /// Go runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenServerSelector`, via
+    /// Go runner read (the retired daemon's `golden_test.go:TestGoldenServerSelector`, via
     /// a real `yaml.Unmarshal` into `DiscoveryConfig` + `Selected`), so the two impls
     /// can't drift on the all / one-name / list-member / empty-list-none / absent-all
     /// selector semantics (the nil-vs-empty distinction). In-crate (binary crate, no lib
@@ -2108,7 +2025,7 @@ discovery:
     #[test]
     fn golden_server_selector() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/server_selector.json");
+            .join("../../tests/broker-wire/fixtures/server_selector.json");
         let raw = std::fs::read_to_string(&path).expect("read golden fixture");
         let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(fx["protocol_version"], 1, "version skew");
@@ -2131,19 +2048,19 @@ discovery:
     #[test]
     fn ssh_mode_reads_or_defaults_empty() {
         // Absent → "" (auto).
-        assert_eq!(HostAgentConfig::parse("").ssh_mode(), "");
+        assert_eq!(ExtensionsYaml::parse("").ssh_mode(), "");
         // An ssh block with only an approval policy → still "".
         assert_eq!(
-            HostAgentConfig::parse("ssh:\n  approval:\n    policy: approve-all\n").ssh_mode(),
+            ExtensionsYaml::parse("ssh:\n  approval:\n    policy: approve-all\n").ssh_mode(),
             ""
         );
         // Explicit modes.
         assert_eq!(
-            HostAgentConfig::parse("ssh:\n  mode: local-keys\n").ssh_mode(),
+            ExtensionsYaml::parse("ssh:\n  mode: local-keys\n").ssh_mode(),
             "local-keys"
         );
         assert_eq!(
-            HostAgentConfig::parse(
+            ExtensionsYaml::parse(
                 "ssh:\n  mode: agent-forward\n  approval:\n    policy: shed-desktop\n"
             )
             .ssh_mode(),
@@ -2155,26 +2072,26 @@ discovery:
     fn approval_timeout_parses_and_defaults() {
         // Absent -> 25s default (matches Go's config default).
         assert_eq!(
-            HostAgentConfig::parse("").approval_timeout(),
+            ExtensionsYaml::parse("").approval_timeout(),
             Duration::from_secs(25)
         );
         assert_eq!(
-            HostAgentConfig::parse("approval_timeout: 40s").approval_timeout(),
+            ExtensionsYaml::parse("approval_timeout: 40s").approval_timeout(),
             Duration::from_secs(40)
         );
         assert_eq!(
-            HostAgentConfig::parse("approval_timeout: 1h30m").approval_timeout(),
+            ExtensionsYaml::parse("approval_timeout: 1h30m").approval_timeout(),
             Duration::from_secs(5400)
         );
         assert_eq!(
-            HostAgentConfig::parse("approval_timeout: 300ms").approval_timeout(),
+            ExtensionsYaml::parse("approval_timeout: 300ms").approval_timeout(),
             Duration::from_millis(300)
         );
         // Invalid / non-positive -> fail-safe 25s (the full config's Validate() would
         // hard-reject these; this minimal reader falls back instead).
         for bad in ["nonsense", "0s", "-5s", "10"] {
             assert_eq!(
-                HostAgentConfig::parse(&format!("approval_timeout: {bad}")).approval_timeout(),
+                ExtensionsYaml::parse(&format!("approval_timeout: {bad}")).approval_timeout(),
                 Duration::from_secs(25),
                 "approval_timeout: {bad}"
             );
@@ -2525,7 +2442,7 @@ discovery:
     #[test]
     fn aws_load_and_defaults() {
         // TestLoadConfigAWS: explicit values + nested per-shed overrides parse.
-        let cfg = HostAgentConfig::parse(
+        let cfg = ExtensionsYaml::parse(
             "\
 server: http://localhost:8080
 aws:
@@ -2559,21 +2476,21 @@ aws:
         );
 
         // TestLoadConfigDefaults: with no aws block the load defaults apply.
-        let defaults = HostAgentConfig::parse("server: http://localhost:8080\n");
+        let defaults = ExtensionsYaml::parse("server: http://localhost:8080\n");
         assert_eq!(defaults.aws.source_profile, "default");
         assert_eq!(defaults.aws.session_duration, "1h");
         assert_eq!(defaults.aws.cache_refresh_before, "5m");
     }
 
     /// The Rust half of the `aws_resolve` golden — reads the SAME shared fixture the
-    /// Go runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenAWSResolve`),
+    /// Go runner read (the retired daemon's `golden_test.go:TestGoldenAWSResolve`),
     /// so the two impls can't drift together on the layering / defaults / enabled
     /// semantics. Lives in-crate (the `load_discovered_servers` precedent) because
     /// this is a binary crate with no lib.
     #[test]
     fn golden_aws_resolve() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/aws_resolve.json");
+            .join("../../tests/broker-wire/fixtures/aws_resolve.json");
         let raw = std::fs::read_to_string(&path).expect("read golden fixture");
         let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(fx["protocol_version"], 1, "version skew");
@@ -2581,7 +2498,7 @@ aws:
         assert!(!vectors.is_empty(), "fixture has no vectors");
         for v in vectors {
             let name = v["name"].as_str().unwrap();
-            let cfg = HostAgentConfig::parse(v["config_yaml"].as_str().unwrap());
+            let cfg = ExtensionsYaml::parse(v["config_yaml"].as_str().unwrap());
             let aws = &cfg.aws;
             assert_eq!(
                 aws.enabled(),
@@ -2683,7 +2600,7 @@ g:
     /// vector in the `docker_resolve` golden.
     #[test]
     fn yaml_lite_block_sequence() {
-        let cfg = HostAgentConfig::parse(
+        let cfg = ExtensionsYaml::parse(
             "\
 docker:
   registries:
@@ -2704,8 +2621,8 @@ docker:
     /// whole `{ ... }` as an opaque scalar (→ all deny-all).
     #[test]
     fn yaml_lite_inline_flow_map() {
-        let flow = HostAgentConfig::parse("ssh: { approval: { policy: shed-desktop } }\n");
-        let block = HostAgentConfig::parse("ssh:\n  approval:\n    policy: shed-desktop\n");
+        let flow = ExtensionsYaml::parse("ssh: { approval: { policy: shed-desktop } }\n");
+        let block = ExtensionsYaml::parse("ssh:\n  approval:\n    policy: shed-desktop\n");
         assert_eq!(flow.effective_policy(NS_SSH_AGENT), "shed-desktop");
         assert_eq!(
             flow.effective_policy(NS_SSH_AGENT),
@@ -2763,9 +2680,9 @@ discovery:
         // The resolved-config half: bare `source_profile:` (null) keeps the
         // DefaultConfig default; explicit `source_profile: ""` keeps the empty
         // string. (Verified against Go's LoadConfig; goldened cross-language.)
-        let null_sp = HostAgentConfig::parse("aws:\n  source_profile:\n");
+        let null_sp = ExtensionsYaml::parse("aws:\n  source_profile:\n");
         assert_eq!(null_sp.aws.source_profile, "default");
-        let empty_sp = HostAgentConfig::parse("aws:\n  source_profile: \"\"\n");
+        let empty_sp = ExtensionsYaml::parse("aws:\n  source_profile: \"\"\n");
         assert_eq!(empty_sp.aws.source_profile, "");
     }
 
@@ -2796,7 +2713,7 @@ discovery:
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.yaml");
         std::fs::write(&path, "{{invalid yaml").unwrap();
-        assert!(HostAgentConfig::load(path.to_str().unwrap()).is_err());
+        assert!(ExtensionsYaml::load(path.to_str().unwrap()).is_err());
     }
 
     /// Only the FIRST document is consumed (mirrors Go's `yaml.Unmarshal`): a
@@ -2804,7 +2721,7 @@ discovery:
     /// rest.
     #[test]
     fn yaml_lite_multi_doc_takes_first() {
-        let cfg = HostAgentConfig::parse("server: http://a:8080\n---\nserver: http://b:8080\n");
+        let cfg = ExtensionsYaml::parse("server: http://a:8080\n---\nserver: http://b:8080\n");
         assert_eq!(cfg.server, "http://a:8080");
     }
 
@@ -2938,7 +2855,7 @@ discovery:
     #[test]
     fn docker_load_parse() {
         // Single-item flow list + shed-desktop policy (TestLoadConfig header).
-        let cfg = HostAgentConfig::parse(
+        let cfg = ExtensionsYaml::parse(
             "\
 docker:
   registries: [ghcr.io]
@@ -2951,7 +2868,7 @@ docker:
         assert!(!cfg.docker.allow_all);
 
         // Two-item flow list + allow_all + config_path + per-server/shed nesting.
-        let cfg = HostAgentConfig::parse(
+        let cfg = ExtensionsYaml::parse(
             "\
 docker:
   registries: [index.docker.io, ghcr.io]
@@ -2993,7 +2910,7 @@ docker:
     /// unconfigured deny-all backend). No load-defaults are applied to Docker.
     #[test]
     fn docker_policy_default_deny_all() {
-        let cfg = HostAgentConfig::parse("server: http://localhost:8080\n");
+        let cfg = ExtensionsYaml::parse("server: http://localhost:8080\n");
         assert_eq!(cfg.effective_policy(NS_DOCKER_CREDENTIALS), POLICY_DENY_ALL);
         assert_eq!(cfg.docker, DockerConfig::default());
         assert!(cfg.docker.registries.is_empty());
@@ -3002,7 +2919,7 @@ docker:
     }
 
     /// The Rust half of the `docker_resolve` golden — reads the SAME shared fixture
-    /// the Go runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenDockerResolve`,
+    /// the Go runner read (the retired daemon's `golden_test.go:TestGoldenDockerResolve`,
     /// via the production `LoadConfig`→`Docker.Resolve` path), so the two impls can't
     /// drift together on the `Option<Vec<String>>` replace / `Option<bool>` force /
     /// flow-list-parse semantics. Go has NO `Resolve` layering test, so this golden
@@ -3010,7 +2927,7 @@ docker:
     #[test]
     fn golden_docker_resolve() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/docker_resolve.json");
+            .join("../../tests/broker-wire/fixtures/docker_resolve.json");
         let raw = std::fs::read_to_string(&path).expect("read golden fixture");
         let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(fx["protocol_version"], 1, "version skew");
@@ -3018,7 +2935,7 @@ docker:
         assert!(!vectors.is_empty(), "fixture has no vectors");
         for v in vectors {
             let name = v["name"].as_str().unwrap();
-            let cfg = HostAgentConfig::parse(v["config_yaml"].as_str().unwrap());
+            let cfg = ExtensionsYaml::parse(v["config_yaml"].as_str().unwrap());
             for q in v["queries"].as_array().unwrap() {
                 let r = cfg
                     .docker
@@ -3050,7 +2967,7 @@ docker:
     /// Parse `yaml` then `validate()` — the `load = parse → validate` chain without a
     /// temp file. Returns the validate error (parse is known-good for these literals).
     fn validate_yaml(yaml: &str) -> Result<(), String> {
-        HostAgentConfig::parse(yaml).validate()
+        ExtensionsYaml::parse(yaml).validate()
     }
 
     /// Mirrors `config_test.go:TestLoadConfigRejectsBadPolicy`. An unknown ssh policy
@@ -3271,7 +3188,7 @@ aws:
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../configs/extensions.example.yaml");
         let text = std::fs::read_to_string(&path).expect("read example config");
-        let cfg = HostAgentConfig::try_parse(&text).expect("example config parses");
+        let cfg = ExtensionsYaml::try_parse(&text).expect("example config parses");
         cfg.validate().expect("example config validates");
         assert_eq!(cfg.effective_policy(NS_SSH_AGENT), "biometrics-or-password");
         assert_eq!(cfg.effective_policy(NS_AWS_CREDENTIALS), POLICY_DENY_ALL);
@@ -3291,7 +3208,7 @@ aws:
             .replace("  # allow_users: [git]", "  allow_users: [git]")
             .replace("  # offer_keys:", "  offer_keys:")
             .replace("  #   - ", "    - ");
-        let cfg = HostAgentConfig::try_parse(&uncommented).expect("uncommented example parses");
+        let cfg = ExtensionsYaml::try_parse(&uncommented).expect("uncommented example parses");
         cfg.validate().expect("uncommented example validates");
         assert_eq!(cfg.ssh_sign_policy().offer_keys().map(|f| f.len()), Some(1));
     }
@@ -3303,11 +3220,11 @@ aws:
     #[test]
     fn biometric_knobs_default_when_absent_or_null() {
         // Absent (only a policy under ssh.approval).
-        let cfg = HostAgentConfig::parse("ssh:\n  approval:\n    policy: biometrics\n");
+        let cfg = ExtensionsYaml::parse("ssh:\n  approval:\n    policy: biometrics\n");
         assert_eq!(cfg.ssh_scope(), "per-session");
         assert_eq!(cfg.ssh_session_ttl(), "4h");
         // Explicit YAML null → still the defaults (null-aware read).
-        let cfg = HostAgentConfig::parse("ssh:\n  approval:\n    scope:\n    session_ttl: null\n");
+        let cfg = ExtensionsYaml::parse("ssh:\n  approval:\n    scope:\n    session_ttl: null\n");
         assert_eq!(cfg.ssh_scope(), "per-session");
         assert_eq!(cfg.ssh_session_ttl(), "4h");
     }
@@ -3319,7 +3236,7 @@ aws:
     #[test]
     fn biometric_knobs_keep_explicit_empty() {
         let cfg =
-            HostAgentConfig::parse("ssh:\n  approval:\n    scope: \"\"\n    session_ttl: \"\"\n");
+            ExtensionsYaml::parse("ssh:\n  approval:\n    scope: \"\"\n    session_ttl: \"\"\n");
         assert_eq!(cfg.ssh_scope(), "");
         assert_eq!(cfg.ssh_session_ttl(), "");
     }
@@ -3327,114 +3244,49 @@ aws:
     /// A non-default scope/ttl round-trips verbatim through the accessors.
     #[test]
     fn biometric_knobs_read_explicit_values() {
-        let cfg = HostAgentConfig::parse(
-            "ssh:\n  approval:\n    scope: per-shed\n    session_ttl: 30m\n",
-        );
+        let cfg =
+            ExtensionsYaml::parse("ssh:\n  approval:\n    scope: per-shed\n    session_ttl: 30m\n");
         assert_eq!(cfg.ssh_scope(), "per-shed");
         assert_eq!(cfg.ssh_session_ttl(), "30m");
     }
 
-    /// Mirrors `config_test.go:TestLoadConfigDeprecatedDesktopKeysIgnored`. A config
-    /// that still sets the deprecated `desktop.*` keys with EXPLICIT ZERO/false values
-    /// LOADS OK (exit 0) — the Rust reader ignores the block entirely, and validate
-    /// touches only policies/aws/approval_timeout. (P: H3) this is unit-owned: "still
-    /// loads" has no live exit-code cell. Driven through the real `load` (parse →
-    /// validate) on a temp file.
-    ///
-    /// The warnings WERE originally left unported ("(P: H4) op-log-only") because they
-    /// are not wire-visible and so were out of scope for the wire-identity port. That
-    /// left the brew-shipped Rust daemon silently ignoring a knob the Go one warned
-    /// about (shed#296), so they are ported now and asserted below.
+    /// A `desktop:` block fails the load, whichever of its retired keys it sets
+    /// (`enabled: false` and `timeout_ms: 0` included) and when it sets none (a bare
+    /// `desktop:` or `desktop: {}`): the person sees the refusal once instead of
+    /// running on a key that is ignored. Driven through the real `load` (parse →
+    /// validate) on a temp file; a config without the block loads.
     #[test]
-    fn deprecated_desktop_keys_load_ok() {
+    fn desktop_block_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
-        std::fs::write(
-            &path,
-            "server: http://localhost:8080\n\
-             desktop:\n  enabled: false\n  socket_path: ~/somewhere/else.sock\n  timeout_ms: 0\n",
-        )
-        .unwrap();
-        let cfg =
-            HostAgentConfig::load(path.to_str().unwrap()).expect("deprecated desktop keys load ok");
-        // The budget still comes from approval_timeout (defaulted 25s), not timeout_ms.
-        assert_eq!(cfg.approval_timeout(), Duration::from_secs(25));
-        // Presence, not truthiness: `enabled: false` and `timeout_ms: 0` still warn,
-        // because Go decodes into pointers and warns on a set key (config.go:201-207).
-        let w = &cfg.deprecated_warnings;
-        assert_eq!(w.len(), 3, "{w:?}");
-        assert_eq!(
-            w[0],
-            "config: `desktop.enabled` is deprecated and ignored — the approval channel is always on"
-        );
-        assert!(
-            w[1].starts_with(
-                "config: `desktop.socket_path` is deprecated and ignored — the socket path is fixed path="
-            ),
-            "{:?}",
-            w[1]
-        );
-        assert_eq!(
-            w[2],
-            "config: `desktop.timeout_ms` is deprecated and ignored — use the top-level `approval_timeout` timeout_ms=0"
-        );
-    }
-
-    /// `timeout_ms` is echoed as the PARSED integer, never the raw scalar: Go decodes
-    /// into `*int` so `01` prints as `1`, and — the reason this is not cosmetic — a
-    /// scalar carrying a newline must not be able to forge a second log line.
-    #[test]
-    fn deprecated_timeout_ms_is_rendered_not_echoed() {
-        let cfg = HostAgentConfig::parse("desktop:\n  timeout_ms: 01\n");
-        assert!(
-            cfg.deprecated_warnings[0].ends_with("timeout_ms=1"),
-            "{:?}",
-            cfg.deprecated_warnings[0]
-        );
-
-        // A value Go would reject outright: quote+escape rather than invent a number,
-        // and above all never emit a bare newline into the log stream.
-        let cfg = HostAgentConfig::parse("desktop:\n  timeout_ms: \"0\\nERROR forged-line\"\n");
-        let w = &cfg.deprecated_warnings[0];
-        assert!(!w.contains('\n'), "warning must stay one line: {w:?}");
-        assert!(w.ends_with(r#"timeout_ms="0\nERROR forged-line""#), "{w:?}");
-    }
-
-    /// A field value containing a space is quoted, matching Go's slog `needsQuoting`.
-    /// The stock macOS socket path (`~/Library/Application Support/…`) hits this, so it
-    /// is the common case, not an exotic one.
-    #[test]
-    fn slog_value_quotes_like_go() {
-        assert_eq!(
-            slog_value("/tmp/plain/host-agent.sock"),
-            "/tmp/plain/host-agent.sock"
-        );
-        assert_eq!(
-            slog_value("/Users/x/Library/Application Support/shed/host-agent.sock"),
-            "\"/Users/x/Library/Application Support/shed/host-agent.sock\""
-        );
-        assert_eq!(slog_value(""), "\"\"");
-        assert_eq!(slog_value("a\nb"), r#""a\nb""#);
-        assert_eq!(slog_value("k=v"), "\"k=v\"");
-    }
-
-    /// No `desktop:` block, a bare `desktop:` (YAML null), and `desktop: {}` all set
-    /// no key, so none of them warn — Go's pointers stay nil in each case. Guards the
-    /// obvious over-fire: warning at every startup for a config nobody wrote.
-    #[test]
-    fn absent_or_empty_desktop_block_is_quiet() {
-        for yaml in [
-            "server: http://localhost:8080\n",
-            "server: http://localhost:8080\ndesktop:\n",
-            "server: http://localhost:8080\ndesktop: {}\n",
+        let load = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            ExtensionsYaml::load(path.to_str().unwrap())
+        };
+        for block in [
+            "desktop:\n  enabled: false\n",
+            "desktop:\n  socket_path: ~/somewhere/else.sock\n",
+            "desktop:\n  timeout_ms: 0\n",
+            "desktop:\n  enabled: true\n  socket_path: /tmp/x.sock\n  timeout_ms: 30000\n",
+            "desktop: {}\n",
+            "desktop:\n",
         ] {
-            let cfg = HostAgentConfig::parse(yaml);
-            assert!(
-                cfg.deprecated_warnings.is_empty(),
-                "{yaml:?} → {:?}",
-                cfg.deprecated_warnings
+            let text = format!("server: http://localhost:8080\n{block}");
+            let err = load(&text).expect_err(&format!("{block:?} loaded"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{block:?}");
+            assert_eq!(err.to_string(), DESKTOP_BLOCK_REMOVED, "{block:?}");
+            assert_eq!(
+                ExtensionsYaml::try_parse(&text).unwrap_err(),
+                DESKTOP_BLOCK_REMOVED,
+                "{block:?}"
             );
         }
+        // The hint's example loads; the same number with no unit does not.
+        let cfg = load("server: http://localhost:8080\napproval_timeout: 30s\n")
+            .expect("a config without the block loads");
+        assert_eq!(cfg.approval_timeout(), Duration::from_secs(30));
+        load("server: http://localhost:8080\napproval_timeout: 30000\n")
+            .expect_err("an approval_timeout with no unit is refused");
     }
 
     /// Validate runs in Go's EXACT order (`config.go:487-505`): ssh → aws → docker
@@ -3463,13 +3315,13 @@ aws:
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, "ssh:\n  approval:\n    policy: maybe\n").unwrap();
         assert!(
-            HostAgentConfig::load(path.to_str().unwrap()).is_err(),
+            ExtensionsYaml::load(path.to_str().unwrap()).is_err(),
             "invalid policy config must fail load (main.rs exit 1)"
         );
     }
 
     /// The Rust half of the `config_validate` golden — reads the SAME shared fixture
-    /// the Go runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenConfigValidate`,
+    /// the Go runner read (the retired daemon's `golden_test.go:TestGoldenConfigValidate`,
     /// via the production `LoadConfig`), driving `try_parse` → `validate` (the
     /// `load = parse → validate` chain minus the file I/O). Pins that both impls agree
     /// on valid-vs-invalid and (for the semantic errors) share the PER-VECTOR message
@@ -3479,7 +3331,7 @@ aws:
     #[test]
     fn golden_config_validate() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/config_validate.json");
+            .join("../../tests/broker-wire/fixtures/config_validate.json");
         let raw = std::fs::read_to_string(&path).expect("read golden fixture");
         let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(fx["protocol_version"], 1, "version skew");
@@ -3491,7 +3343,7 @@ aws:
             let yaml = v["config_yaml"].as_str().unwrap();
             // load = parse → validate; a parse error (malformed / duplicate-key) OR a
             // validate error both mean "not valid" (Go's LoadConfig fails at either).
-            let result: Result<(), String> = match HostAgentConfig::try_parse(yaml) {
+            let result: Result<(), String> = match ExtensionsYaml::try_parse(yaml) {
                 Err(e) => Err(e),
                 Ok(cfg) => cfg.validate(),
             };
@@ -3536,31 +3388,31 @@ aws:
     fn bool_alternate_forms_wire_through_reader() {
         // logging.enabled resolving-false forms → OFF.
         for off in ["off", "no", "false", "No", "OFF", "n", "N"] {
-            let cfg = HostAgentConfig::parse(&format!("logging:\n  enabled: {off}\n"));
+            let cfg = ExtensionsYaml::parse(&format!("logging:\n  enabled: {off}\n"));
             assert!(!cfg.logging_enabled, "logging.enabled: {off} → off");
         }
         // logging.enabled resolving-true forms + absent → ON.
         for on in ["on", "yes", "true", "Yes", "TRUE", "y"] {
-            let cfg = HostAgentConfig::parse(&format!("logging:\n  enabled: {on}\n"));
+            let cfg = ExtensionsYaml::parse(&format!("logging:\n  enabled: {on}\n"));
             assert!(cfg.logging_enabled, "logging.enabled: {on} → on");
         }
         assert!(
-            HostAgentConfig::parse("").logging_enabled,
+            ExtensionsYaml::parse("").logging_enabled,
             "absent → default on"
         );
         // Residue: a non-resolvable value keeps the pre-D2 lenient default (ON).
         for res in ["nonsense", "1", "0"] {
-            let cfg = HostAgentConfig::parse(&format!("logging:\n  enabled: {res}\n"));
+            let cfg = ExtensionsYaml::parse(&format!("logging:\n  enabled: {res}\n"));
             assert!(cfg.logging_enabled, "logging.enabled: {res} → residue on");
         }
         // docker.allow_all resolving-true forms → force-on.
         for on in ["yes", "on", "true", "True", "ON"] {
-            let cfg = HostAgentConfig::parse(&format!("docker:\n  allow_all: {on}\n"));
+            let cfg = ExtensionsYaml::parse(&format!("docker:\n  allow_all: {on}\n"));
             assert!(cfg.docker.allow_all, "docker.allow_all: {on} → on");
         }
         // docker.allow_all resolving-false + residue → off.
         for off in ["no", "off", "false", "nonsense", "1", "0"] {
-            let cfg = HostAgentConfig::parse(&format!("docker:\n  allow_all: {off}\n"));
+            let cfg = ExtensionsYaml::parse(&format!("docker:\n  allow_all: {off}\n"));
             assert!(!cfg.docker.allow_all, "docker.allow_all: {off} → off");
         }
     }
@@ -3571,7 +3423,7 @@ aws:
     /// selector forms (all / one / list / none / bare-null) still parse.
     #[test]
     fn discovery_servers_map_value_rejected() {
-        let err = HostAgentConfig::try_parse("discovery:\n  servers:\n    web: {}\n")
+        let err = ExtensionsYaml::try_parse("discovery:\n  servers:\n    web: {}\n")
             .expect_err("map-valued servers rejected");
         assert_eq!(
             err,
@@ -3579,7 +3431,7 @@ aws:
         );
         // A nested-map form errors too.
         assert!(
-            HostAgentConfig::try_parse("discovery:\n  servers:\n    web:\n      x: y\n").is_err()
+            ExtensionsYaml::try_parse("discovery:\n  servers:\n    web:\n      x: y\n").is_err()
         );
         // The valid forms still parse (all / one / list / explicit-none / bare null).
         for ok in [
@@ -3590,14 +3442,14 @@ aws:
             "discovery:\n  servers:\n",
         ] {
             assert!(
-                HostAgentConfig::try_parse(ok).is_ok(),
+                ExtensionsYaml::try_parse(ok).is_ok(),
                 "valid selector {ok:?}"
             );
         }
     }
 
     /// The Rust half of the `config_bool_forms` golden — reads the SAME shared fixture
-    /// the Go runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenConfigBoolForms`,
+    /// the Go runner read (the retired daemon's `golden_test.go:TestGoldenConfigBoolForms`,
     /// which decodes `v: <value>` into a Go `bool` via yaml.v3, asserting resolve-vs-error).
     /// The Rust side routes each value through [`parse_yaml_bool`]: a fixture `resolved`
     /// of `true`/`false` must be `Some(bool)`; a `resolved` of `"error"` is the D6
@@ -3607,7 +3459,7 @@ aws:
     #[test]
     fn golden_config_bool_forms() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/config_bool_forms.json");
+            .join("../../tests/broker-wire/fixtures/config_bool_forms.json");
         let raw = std::fs::read_to_string(&path).expect("read golden fixture");
         let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(fx["protocol_version"], 1, "version skew");
@@ -3644,7 +3496,7 @@ aws:
             "server: http://localhost:8080\nrc_hub:\n  enabled: false\n",
         )
         .unwrap();
-        let cfg = HostAgentConfig::load(p.to_str().unwrap())
+        let cfg = ExtensionsYaml::load(p.to_str().unwrap())
             .expect("a config carrying the retired rc_hub key still loads");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(cfg.server, "http://localhost:8080");
@@ -3652,10 +3504,10 @@ aws:
 
     // ---- ssh.allow_users / ssh.offer_keys (plan 035 §3.5) ------------------------
 
-    /// The harness's three fixture public key lines (`tests/host-agent-diff/fixtures`).
+    /// The harness's three fixture public key lines (`tests/broker-wire/fixtures`).
     fn fixture_pub_line(stem: &str) -> String {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures")
+            .join("../../tests/broker-wire/fixtures")
             .join(format!("{stem}.pub"));
         std::fs::read_to_string(path)
             .expect("read fixture pub")
@@ -3688,8 +3540,8 @@ aws:
         ),
     ];
 
-    fn ssh_config(body: &str) -> HostAgentConfig {
-        HostAgentConfig::try_parse(&format!("ssh:\n{body}")).expect("yaml parses")
+    fn ssh_config(body: &str) -> ExtensionsYaml {
+        ExtensionsYaml::try_parse(&format!("ssh:\n{body}")).expect("yaml parses")
     }
 
     fn validate_ssh(body: &str) -> Result<(), String> {
@@ -3704,7 +3556,7 @@ aws:
             "ssh:\n  allow_users:\n  offer_keys:\n",
             "ssh:\n  allow_users: null\n  offer_keys: ~\n",
         ] {
-            let cfg = HostAgentConfig::try_parse(yaml).unwrap();
+            let cfg = ExtensionsYaml::try_parse(yaml).unwrap();
             cfg.validate().unwrap_or_else(|e| panic!("{yaml:?}: {e}"));
             let policy = cfg.ssh_sign_policy();
             assert_eq!(policy.allow_users(), ["git".to_string()], "{yaml:?}");

@@ -95,7 +95,7 @@ shed stop <name>              # for each shed you want stopped
 brew services restart shed
 ```
 
-A restart can take up to about 30 s while `shed-server` shuts down gracefully. If the server cannot come back, the VMs keep running unmanaged until it does. A foreground `shed-server` stopped with Ctrl-C no longer stops its VMs either. Upgrading from 0.9.0 stops running sheds once; see the [v0.9.0 to v0.9.1 guide](../upgrades/v0.9.0-to-v0.9.1.md).
+A restart can take up to about 30 s while `shed-server` shuts down gracefully. If the server cannot come back, the VMs keep running unmanaged until it does. A foreground `shed-server` stopped with Ctrl-C no longer stops its VMs either. Upgrading from 0.9.0 stops running sheds once; see the [v0.9.0 to v0.10.0 guide](../upgrades/v0.9.0-to-v0.10.0.md#macos-vz-running-sheds-stop-once).
 
 ## Inspecting VMs
 

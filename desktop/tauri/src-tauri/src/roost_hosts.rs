@@ -1697,8 +1697,8 @@ impl RoostHosts {
     /// Create a session from CALLER-SUPPLIED, un-normalized fields.
     ///
     /// The one place blank-vs-absent is decided, shared by the `machine.launch`
-    /// / `roost.launch` / `rc.launch` IPC ops and the `machine_launch` /
-    /// `rc_launch` Tauri commands: the same request must not mean two things
+    /// / `roost.launch` IPC ops and the `machine_launch` / `rc_launch` Tauri
+    /// commands: the same request must not mean two things
     /// depending on which door it came through. A field that is blank or all
     /// whitespace is ABSENT — `"   "` as a working directory is someone leaving
     /// the box empty, not a directory named three spaces.

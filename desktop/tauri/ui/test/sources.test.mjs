@@ -48,7 +48,6 @@ const status = (...rows) => ({
   rows,
   this_machine: ME,
   this_machine_error: null,
-  broker_mode: "embedded",
 });
 
 const shown = (state, host) => state.rows[host];

@@ -771,7 +771,7 @@ pub struct SourceBinding {
 pub struct SourceMachine {
     #[serde(default, deserialize_with = "lenient")]
     pub id: String,
-    /// The machine's own display name. Untrusted text: see [`display_source_text`].
+    /// The machine's own display name, which is untrusted text: see [`display_source_text`].
     #[serde(default, deserialize_with = "lenient")]
     pub name: String,
     #[serde(default, deserialize_with = "lenient")]

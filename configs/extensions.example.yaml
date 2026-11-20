@@ -1,19 +1,20 @@
-# shed-host-agent configuration
+# Credential broker configuration
 #
-# Installed to ~/.config/shed/extensions.yaml (or, via Homebrew,
-# $(brew --prefix)/etc/shed/extensions.yaml). Override the path with:
-#   shed-host-agent -config /path/to/config.yaml
+# The file the shed desktop app reads at ~/.config/shed/extensions.yaml (the
+# broker runs inside the app). Copy this file there and restart the app.
 #
 # This file ships working defaults: SSH is gated by native Touch ID, Docker
 # brokers Docker Hub + GitHub registry creds, and AWS is OFF until you add a
 # role. Edit the `approval.policy` of each extension to change how requests are
-# approved (see "Approval model" below), then restart the agent.
+# approved (see "Approval model" below), then restart the app.
 
 # ---------------------------------------------------------------------------
 # shed server
 # ---------------------------------------------------------------------------
-# The shed-server this agent brokers credentials for (single-server mode).
-server: http://localhost:8080
+# The shed-server the broker brokers credentials for (single-server mode).
+# Leave this unset: the app then brokers for every server in `~/.shed/config.yaml`;
+# setting it limits the app to that one server.
+# server: http://localhost:8080
 
 # Multi-server mode (optional): broker for many shed servers from one process,
 # discovered from shed's own CLI config. Uncomment to enable; `server:` above is
@@ -33,17 +34,17 @@ server: http://localhost:8080
 #                          below still applies — this only removes the approval
 #                          prompt.)
 #   shed-desktop           Decide each request in the shed-desktop app. The app
-#                          connects to the agent's always-on approval socket; its
-#                          Preferences own the method/scope/TTL. If the app isn't
-#                          running, requests fail closed (deny).
+#                          the app's own approval prompt; its Preferences
+#                          own the method/scope/TTL. If no one answers in time,
+#                          requests fail closed (deny).
 #
-#   SSH only — native macOS Touch ID (works with no app running; off macOS
-#   these two deny every request):
+#   SSH only — native macOS Touch ID, decided by the broker itself with no card
+#   in the app (off macOS these two deny every request):
 #   biometrics             Touch ID only. Fails when no biometric is available.
 #   biometrics-or-password Touch ID, Apple Watch, OR account password. Works in
 #                          clamshell mode and on Macs without a sensor.
 #
-# How long the agent waits for the app to decide a shed-desktop approval before
+# How long the broker waits for a shed-desktop approval before
 # failing closed (Go duration; default 25s):
 # approval_timeout: 25s
 
@@ -95,7 +96,7 @@ ssh:
 # AWS credential vending
 # ---------------------------------------------------------------------------
 aws:
-  # Local AWS profile the agent uses: the AssumeRole source, or (in passthrough
+  # Local AWS profile the broker uses: the AssumeRole source, or (in passthrough
   # mode) the profile whose session credentials are vended directly.
   source_profile: default
 
@@ -103,7 +104,7 @@ aws:
   #   assume-role (default) — sts:AssumeRole from source_profile into default_role.
   #   passthrough           — vend source_profile's existing SSO/SAML session creds
   #                           directly, no AssumeRole (no role needed). Re-run your
-  #                           SSO login to refresh; the agent re-reads the file.
+  #                           SSO login to refresh; the broker re-reads the file.
   # mode: assume-role
 
   # The IAM role to assume (assume-role mode). REQUIRED for assume-role to work —
@@ -132,7 +133,7 @@ aws:
 # Docker registry credential brokering
 # ---------------------------------------------------------------------------
 docker:
-  # Registries the agent will broker credentials for. REQUIRED for Docker to
+  # Registries the broker will serve credentials for. REQUIRED for Docker to
   # work (no Preferences UI for this). Defaults to Docker Hub + GitHub.
   # NOTE: list Docker Hub as `index.docker.io` — Docker requests Hub creds for
   # `https://index.docker.io/v1/`, which normalizes to `index.docker.io`. A bare
@@ -165,7 +166,7 @@ docker:
 # Every credential operation is appended here as JSON, whether or not the
 # shed-desktop app is connected. This is the authoritative record. Sign
 # requests the signing check refuses are recorded too (result: refused). The
-# file is never rotated by the agent.
+# file is never rotated by the broker.
 logging:
   enabled: true
   path: ~/.local/share/shed/extensions-audit.log
@@ -173,20 +174,18 @@ logging:
 # ---------------------------------------------------------------------------
 # shed-desktop integration
 # ---------------------------------------------------------------------------
-# No configuration needed: the agent always serves a local approval socket at a
-# fixed path that the shed-desktop app connects to (it receives the audit/event
-# stream and decides any extension whose policy is `shed-desktop`). See
-# docs/extensions/host-agent-ipc.md. Tune the approval budget with the top-level
+# No configuration needed: the app decides any extension whose policy is
+# `shed-desktop` and shows the audit stream in Activity. See
+# docs/desktop/approvals.md. Tune the approval budget with the top-level
 # `approval_timeout` above.
 
 # ---------------------------------------------------------------------------
 # Machine identity
 # ---------------------------------------------------------------------------
-# Not configured here. The agent keeps this machine's id and name in
-# host-agent/machine.json under its state directory (macOS:
+# Not configured here. The broker keeps this machine's id and name in
+# broker/machine.json under its state directory (macOS:
 # ~/Library/Application Support/shed/, Linux: $XDG_DATA_HOME/shed/ or
-# ~/.local/share/shed/), shared
-# with the desktop app's embedded broker. A shed server lets one machine per
+# ~/.local/share/shed/). A shed server lets one machine per
 # user answer credential requests and tells machines apart by that id; see
 # docs/extensions/source-binding.md. On a machine restored from another's
 # backup, delete machine.json so it gets an id of its own.
@@ -194,7 +193,7 @@ logging:
 # ---------------------------------------------------------------------------
 # Retired keys
 # ---------------------------------------------------------------------------
-# `rc_hub:` configured the machine RC activity hub the agent used to host on
+# `rc_hub:` configured the machine RC activity hub the broker once hosted on
 # 127.0.0.1:1029. The hub was removed in v0.9.0 (charliek/shed#328) — machine
 # session activity now comes from roost. The key is IGNORED, not rejected: a
 # config that still carries it loads unchanged, so there is nothing to do on

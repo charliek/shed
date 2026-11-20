@@ -1,6 +1,6 @@
 // shed-ext-ssh-agent is the guest-side SSH agent that runs inside shed microVMs.
 // It implements the SSH agent protocol on a Unix domain socket and translates
-// SSH operations into message bus requests to the host agent.
+// SSH operations into message bus requests to the credential broker.
 package main
 
 import (
@@ -48,13 +48,13 @@ func main() {
 	// Startup health check
 	go func() {
 		if err := a.Ping(2 * time.Second); err != nil {
-			logger.Warn("shed-host-agent not connected for namespace 'ssh-agent'",
+			logger.Warn("credential broker not connected for namespace 'ssh-agent'",
 				"error", err,
-				"hint", "SSH operations will fail until shed-host-agent is running on the host machine.",
+				"hint", "SSH operations will fail until the shed desktop app is running on your machine.",
 			)
 			writeStatus("ssh-agent: not connected")
 		} else {
-			logger.Info("shed-host-agent connected", "namespace", "ssh-agent")
+			logger.Info("credential broker connected", "namespace", "ssh-agent")
 			writeStatus("ssh-agent: connected")
 		}
 	}()

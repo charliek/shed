@@ -214,6 +214,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	log.Printf("SSH listen: %s", cfg.SSHListenAddr())
 
+	// The one-time upgrade step for a user list: an unfinished step whose
+	// users changed stops the start here, before any backend, store or
+	// listener opens and before anything is stamped, adopted or recorded,
+	// unless the operator abandons it on purpose; the flag with no such step
+	// stops it too. stampUnassigned applies the same rule again.
+	if err := checkUsersUpgrade(cfg, serverStateDir(cfg), serveAbandonUserUpgrade); err != nil {
+		return err
+	}
+
 	// Touch every state directory before the backend does, so a store that is
 	// waiting on a macOS permission prompt (or a wedged network filesystem)
 	// stalls here, at a line naming the path (#304).
@@ -354,7 +363,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// cloud list has rebuilt its records, and moves the bus routes it
 	// resumed.
 	if waitBackendReady == nil {
-		if _, _, err := stampUnassigned(cfg, be, sourceBindings); err != nil {
+		if _, _, err := stampUnassigned(cfg, be, sourceBindings, serveAbandonUserUpgrade); err != nil {
 			return err
 		}
 	}
@@ -372,7 +381,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		if _, _, err := stampUnassigned(cfg, be, sourceBindings); err != nil {
+		if _, _, err := stampUnassigned(cfg, be, sourceBindings, serveAbandonUserUpgrade); err != nil {
 			return err
 		}
 	}
@@ -883,18 +892,43 @@ const upgradePassTimeout = 2 * time.Minute
 // before anything is listed; with exactly one user on the first start, begun
 // for that user (a pending marker naming them) before anything is given to
 // anyone; an unfinished step is resumed only for the user it was begun for,
-// while they are still the only configured user, and is otherwise abandoned
+// while they are still the only configured user; otherwise the start is
+// refused (checkUsersUpgrade already refused it before anything opened),
+// unless abandon (serve's AbandonUsersUpgradeFlag) abandons it on purpose
 // (marked done, nothing given). Then the credential source bindings follow
 // that decision (applySourceUpgrade), then the pass over sheds and snapshots
 // runs on the raw backend (backend.StampUnassigned), stamping only for the
 // decided user, and the step is marked done once a stamping pass finishes
 // (backend.UsersUpgrade.Finish). With no user list it stamps nothing and
 // removes the marker. It logs how many sheds it found with no user, naming
-// them when log_level is debug. An error (only from the source bindings'
-// step) means the server must not start; the marker then still says what
-// the next start resumes.
-func stampUnassigned(cfg *config.ServerConfig, be backend.Backend, bindings source.Bindings) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
-	return stampUnassignedIn(cfg, be, serverStateDir(cfg), bindings)
+// them when log_level is debug. An error (the step's refusal, or the source
+// bindings' step) means the server must not start; the marker then still
+// says what the next start resumes.
+func stampUnassigned(cfg *config.ServerConfig, be backend.Backend, bindings source.Bindings, abandon bool) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
+	return stampUnassignedWith(cfg, be, serverStateDir(cfg), bindings, abandon)
+}
+
+// serveAbandonUserUpgrade is serve's AbandonUsersUpgradeFlag.
+var serveAbandonUserUpgrade bool
+
+func init() {
+	serveCmd.Flags().BoolVar(&serveAbandonUserUpgrade, strings.TrimPrefix(backend.AbandonUsersUpgradeFlag, "--"), false,
+		"abandon, at this one start, the unfinished one-time upgrade step for the user list after its users changed (the sheds and snapshots it has not reached keep no user); refused at start when there is no such step, so never leave it on a service's command line")
+}
+
+// checkUsersUpgrade is the one-time upgrade step's start-up check
+// (backend.CheckUsersUpgrade), run by serve before it opens a backend, a
+// store or a listener: a step pending for a user who is no longer the only
+// configured user stops the start, unless abandon; abandon with no such
+// step stops it too. It reads the marker and changes nothing.
+//
+// The users compared are upgradeUsers': auth.users, which beside
+// auth.directory holds the local admins only. The account service's list
+// never enters it, so a directory list that is not in force at start (not
+// enrolled, the service unreachable with no kept copy) neither refuses nor
+// abandons a step.
+func checkUsersUpgrade(cfg *config.ServerConfig, stateDir string, abandon bool) error {
+	return backend.CheckUsersUpgrade(stateDir, upgradeUsers(cfg), abandon)
 }
 
 // reportReservedSheds warns when a shed already has the reserved name git:
@@ -914,14 +948,28 @@ func reportReservedSheds(be backend.Backend) {
 	}
 }
 
-// stampUnassignedIn is stampUnassigned with the marker in stateDir.
+// stampUnassignedIn is stampUnassigned with the marker in stateDir, without
+// the abandon flag.
 func stampUnassignedIn(cfg *config.ServerConfig, be backend.Backend, stateDir string, bindings source.Bindings) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
+	return stampUnassignedWith(cfg, be, stateDir, bindings, false)
+}
+
+// stampUnassignedWith is stampUnassigned with the marker in stateDir.
+func stampUnassignedWith(cfg *config.ServerConfig, be backend.Backend, stateDir string, bindings source.Bindings, abandon bool) (backend.UpgradeReport, *backend.UsersUpgrade, error) {
+	// The check first, before opening the marker (which, with no user list,
+	// removes it): a refused start changes nothing.
+	if err := checkUsersUpgrade(cfg, stateDir, abandon); err != nil {
+		return backend.UpgradeReport{}, nil, err
+	}
 	users := upgradeUsers(cfg)
 	upgrade := backend.OpenUsersUpgrade(stateDir, len(users) > 0, log.Printf)
 	// The decision is recorded before anything acts on it, so the source
 	// bindings' step and the pass below follow the same recipient at every
 	// start until the step is done.
-	plan := upgrade.Begin(users, time.Now())
+	plan, err := upgrade.Begin(users, abandon, time.Now())
+	if err != nil {
+		return backend.UpgradeReport{}, upgrade, err
+	}
 	if err := applySourceUpgrade(bindings, plan, cfg.UserNames(), !cfg.DirectoryConfigured()); err != nil {
 		return backend.UpgradeReport{}, upgrade, err
 	}

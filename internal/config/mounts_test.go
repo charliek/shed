@@ -210,10 +210,10 @@ func TestResolveCreateLayout(t *testing.T) {
 	})
 }
 
-// TestServerConfigMountsCredentialsFallback verifies the "mounts" key is read,
-// the deprecated "credentials" key still works as a fallback, and "mounts"
-// wins when both are present.
-func TestServerConfigMountsCredentialsFallback(t *testing.T) {
+// TestServerConfigCredentialsKeyRefused verifies the "mounts" key is read and
+// the old name "credentials" fails the load with a message naming "mounts",
+// alone or beside "mounts", and in any case. Both loaders refuse it.
+func TestServerConfigCredentialsKeyRefused(t *testing.T) {
 	srcDir := t.TempDir()
 	backend, bcfg := platformTestBackend(t)
 
@@ -229,54 +229,43 @@ func TestServerConfigMountsCredentialsFallback(t *testing.T) {
 		return key + ":\n  " + name + ":\n    source: " + srcDir + "\n    target: " + target + "\n"
 	}
 
-	load := func(t *testing.T, yaml string) *ServerConfig {
+	write := func(t *testing.T, yaml string) string {
 		t.Helper()
 		p := filepath.Join(t.TempDir(), "server.yaml")
 		if err := os.WriteFile(p, []byte(yaml), 0644); err != nil {
 			t.Fatal(err)
 		}
-		cfg, err := LoadServerConfigFromPath(p)
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
-		return cfg
+		return p
 	}
 
 	t.Run("mounts key", func(t *testing.T) {
-		cfg := load(t, base+entry("mounts", "test", "/home/shed/.test")+backendYAML)
+		cfg, err := LoadServerConfigFromPath(write(t, base+entry("mounts", "test", "/home/shed/.test")+backendYAML))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
 		if _, ok := cfg.Mounts["test"]; !ok {
 			t.Errorf("Mounts[test] missing; Mounts=%+v", cfg.Mounts)
 		}
-		if cfg.Credentials != nil {
-			t.Errorf("Credentials should be cleared after load, got %+v", cfg.Credentials)
-		}
 	})
 
-	t.Run("credentials fallback", func(t *testing.T) {
-		cfg := load(t, base+entry("credentials", "test", "/home/shed/.test")+backendYAML)
-		if _, ok := cfg.Mounts["test"]; !ok {
-			t.Errorf("expected credentials to fall back into Mounts; Mounts=%+v", cfg.Mounts)
-		}
-	})
-
-	t.Run("mounts wins over credentials", func(t *testing.T) {
-		cfg := load(t, base+entry("mounts", "fromMounts", "/home/shed/.a")+entry("credentials", "fromCreds", "/home/shed/.b")+backendYAML)
-		if _, ok := cfg.Mounts["fromMounts"]; !ok {
-			t.Error("expected mounts entry to be present")
-		}
-		if _, ok := cfg.Mounts["fromCreds"]; ok {
-			t.Error("credentials entry should be ignored when mounts is present")
-		}
-	})
-
-	t.Run("explicit empty mounts does not fall back", func(t *testing.T) {
-		// `mounts: {}` is a non-nil empty map and means "no mounts"; it must
-		// NOT trigger the deprecated-credentials fallback.
-		cfg := load(t, base+"mounts: {}\n"+entry("credentials", "test", "/home/shed/.test")+backendYAML)
-		if _, ok := cfg.Mounts["test"]; ok {
-			t.Error("explicit empty mounts:{} should not fall back to credentials")
-		}
-	})
+	const want = `config key "credentials" was renamed to "mounts"; rename it`
+	for _, tc := range []struct{ name, yaml, want string }{
+		{"credentials alone", base + entry("credentials", "test", "/home/shed/.test") + backendYAML, want},
+		{"credentials beside mounts", base + entry("mounts", "a", "/home/shed/.a") + entry("credentials", "b", "/home/shed/.b") + backendYAML, want},
+		{"empty mounts and credentials", base + "mounts: {}\n" + entry("credentials", "test", "/home/shed/.test") + backendYAML, want},
+		{"empty credentials", base + "credentials: {}\n" + backendYAML, want},
+		{"re-cased credentials", base + entry("Credentials", "test", "/home/shed/.test") + backendYAML, `config key "Credentials" is not recognised; keys are case-sensitive, did you mean "credentials"?`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := write(t, tc.yaml)
+			if _, err := LoadServerConfigFromPath(p); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("LoadServerConfigFromPath err = %v, want it to contain %q", err, tc.want)
+			}
+			if _, err := LoadServerConfigForCLI(p); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("LoadServerConfigForCLI err = %v, want it to contain %q", err, tc.want)
+			}
+		})
+	}
 }
 
 func TestProjectAddDirTargets(t *testing.T) {

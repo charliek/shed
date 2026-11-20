@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/internal/users"
 	"github.com/charliek/shed/internal/users/userstest"
 )
@@ -116,6 +117,7 @@ func TestAssignShedNeedsAUserList(t *testing.T) {
 	be.sheds["legacy"] = config.Shed{Name: "legacy", CreatedAt: be.sheds["box"].CreatedAt, Mounts: config.SelectedMounts(nil)}
 	s, router := usersTestServer(t, be)
 	s.SetUserLookup(userstest.Implicit(rootFP))
+	nameTestKey(t, rootFP, servertls.ImplicitUserValue)
 	for _, body := range []string{`{"user":""}`, `{"user":"root"}`} {
 		r := doAs(router, rootFP, http.MethodPost, "/api/sheds/legacy/assign", body)
 		if r.code != http.StatusBadRequest || r.errCode(t) != config.ErrInvalidRequest {

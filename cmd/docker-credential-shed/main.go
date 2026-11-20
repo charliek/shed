@@ -1,7 +1,7 @@
 // docker-credential-shed is the guest-side Docker credential helper that runs
 // inside shed microVMs. Docker execs this binary on demand to resolve registry
 // credentials. It translates credential helper protocol operations into message
-// bus requests to the host agent.
+// bus requests to the credential broker.
 //
 // This is a one-shot CLI, not a daemon. Docker execs it per operation:
 //

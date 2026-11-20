@@ -887,7 +887,7 @@ pub struct Handler {
     /// preference), shared with the frontend invoke commands.
     terminal: SharedTerminal,
     /// The approval coordinator (the security spine): the approvals queue, policy,
-    /// grants, audit, and the host-agent decision path.
+    /// grants, audit, and the broker decision path.
     coordinator: Coordinator,
     /// The persisted prefs store, so `ui.set_ssh_approval` persists the chosen SSH
     /// prefs through the same path as the frontend command (both survive a restart).
@@ -957,17 +957,11 @@ impl Handler {
     /// an error envelope.
     pub async fn dispatch(&self, op: &str, params: &Value) -> Result<Value, (String, String)> {
         match op {
-            "identify" => {
-                // Augment the base payload with the resolved broker mode (leg 3a.2) —
-                // read from managed state, so `identify_payload` stays a pure, testable
-                // free fn of `Env`.
-                let mut v =
-                    identify_payload(&self.env, self.pid, crate::applog::active_path().as_deref());
-                if let Some(rt) = self.app.try_state::<crate::broker::BrokerRuntime>() {
-                    v["broker_mode"] = rt.identify_fragment();
-                }
-                Ok(v)
-            }
+            "identify" => Ok(identify_payload(
+                &self.env,
+                self.pid,
+                crate::applog::active_path().as_deref(),
+            )),
             "ui.navigate" => self.navigate(params),
             "ui.current_pane" => Ok(json!({ "pane": self.ui_get("pane") })),
             "ui.computed_style" => Ok(json!({ "style": self.ui_get("style") })),
@@ -1179,7 +1173,6 @@ impl Handler {
             "terminal.open" => self.terminal_open(params),
             "terminal.presets" => Ok(self.terminal_presets()),
             "rc.list" => self.rc_list(params).await,
-            "rc.launch" => self.rc_launch(params).await,
             "rc.kill" => self.rc_kill(params).await,
             "rc.inject_test" => self.rc_inject_test(params),
             "machines.list" => Ok(self.machines_list()),
@@ -1269,8 +1262,6 @@ impl Handler {
             "loginitem.set" => self.login_item_set(params),
             // -- credential broker (leg 3a.2) --
             "broker.status" => Ok(self.broker_status()),
-            "broker.mode" => Ok(self.broker_mode()),
-            "broker.set_mode" => self.broker_set_mode(params),
             // -- credential sources (plan 035 §3.4) --
             "source.status" => {
                 let rt = self.app.try_state::<crate::broker::BrokerRuntime>();
@@ -1763,10 +1754,9 @@ impl Handler {
     /// sheds. `machine.launch {machine, …}` is the same op under its old name
     /// and its old parameter, kept as an alias.
     ///
-    /// **`rc.launch {shed}` IS this op** since S6 (`charliek/shed#328`): the
-    /// shed launch was hub/tmux until then, and plan 019 §3.6 deliberately kept
-    /// the two apart while that was true. Now there is one launch path, and
-    /// [`Self::rc_launch`] is a second door onto it, held open for 0.9.x.
+    /// Since S6 (`charliek/shed#328`) a shed is launched here too, as
+    /// `roost:<server>/<shed>`. Its pre-S6 alias `rc.launch {shed}`, held open
+    /// for 0.9.x clients, was removed in 0.10.0 and answers `unknown_op`.
     ///
     /// `kind` and `workdir` are the `tab.open`, and a `display_name` is set as
     /// the tab's title after it (the row's `title` says whether it took); an
@@ -2224,38 +2214,6 @@ impl Handler {
         Ok(format!("roost:{server}/{shed}"))
     }
 
-    /// `rc.launch {shed, kind, host?, display_name?, workdir?, permission_mode?,
-    /// initial_prompt?}` → the opened row, under [`Self::roost_launch`]'s rule:
-    /// a name is set as the tab's title, a first prompt or a permission mode is
-    /// refused `bad_request`.
-    ///
-    /// **An ALIAS for [`Self::roost_launch`] since S6** (`charliek/shed#328`),
-    /// kept for 0.9.x: it is the same `tab.open` on the same host, addressed by
-    /// `{shed, host?}` instead of by `target`. The two ops were genuinely
-    /// different things while a shed launch was hub/tmux — now there is one
-    /// launch path and this is a second door onto it, held open so a client
-    /// written against the pre-S6 op keeps working through the release that
-    /// removes the hub.
-    async fn rc_launch(&self, params: &Value) -> Result<Value, (String, String)> {
-        let target = self.shed_target(params)?;
-        let kind = rc_kind(params)?;
-        let opt = |k: &str| params.get(k).and_then(Value::as_str);
-        self.machines
-            .launch(
-                &target,
-                &kind,
-                opt("display_name"),
-                opt("workdir"),
-                // TYPED, unlike the fields above: a first prompt or a mode in
-                // some other JSON shape is still one, and reading it as absent
-                // would drop it silently (plan 026 §3.5).
-                opt_str(params, "permission_mode")?,
-                opt_str(params, "initial_prompt")?,
-            )
-            .await
-            .map_err(launch_failure)
-    }
-
     /// `rc.kill {shed, slug, host?}` → close the shed's roost tab.
     ///
     /// A `tab.close` since S6, like [`Self::machine_kill`] — the slug IS the tab
@@ -2620,49 +2578,14 @@ impl Handler {
         json!({ "hosts": hosts })
     }
 
-    /// `broker.status` → the resolved broker mode + probe evidence + config source +
-    /// (embedded) resolved ssh mode / gate namespaces / per-server LiveStatus health.
+    /// `broker.status` → the embedded broker's config source, resolved ssh mode, gate
+    /// namespaces, per-server health, machine identity and any start-up error.
     /// The harness drives + asserts it (C4); shedtest reads it as broker truth.
     fn broker_status(&self) -> Value {
         self.app
             .try_state::<crate::broker::BrokerRuntime>()
             .map(|rt| rt.status())
             .unwrap_or_else(|| json!({}))
-    }
-
-    /// `broker.mode` → the effective mode + the LIVE persisted pref + `restart_required`
-    /// (the persisted pref drifted from the launch pref ⟹ a relaunch applies it).
-    fn broker_mode(&self) -> Value {
-        self.app
-            .try_state::<crate::broker::BrokerRuntime>()
-            .map(|rt| {
-                json!({
-                    "pref": rt.pref_str(),
-                    "effective": rt.effective_mode_str(),
-                    "restart_required": rt.restart_required(),
-                })
-            })
-            .unwrap_or_else(|| json!({}))
-    }
-
-    /// `broker.set_mode {mode}` → persist the broker mode pref (the same path as the
-    /// `broker_set_mode` frontend command). Guarded: an unknown mode is `bad_request`.
-    /// The change is NOT hot-swapped — the CURRENT effective mode + the computed
-    /// `restart_required` (persisted pref != launch pref) are returned so a driver can
-    /// assert the deferred-apply contract.
-    fn broker_set_mode(&self, params: &Value) -> Result<Value, (String, String)> {
-        let mode = req_str(params, "mode")?;
-        if crate::broker::parse_mode_pref(mode).is_none() {
-            return Err(err("bad_request", format!("unknown broker mode: {mode:?}")));
-        }
-        self.prefs.set_broker_mode(mode.to_string());
-        let (effective, restart_required) = self
-            .app
-            .try_state::<crate::broker::BrokerRuntime>()
-            .map(|rt| (rt.effective_mode_str().to_string(), rt.restart_required()))
-            .unwrap_or_default();
-        self.emit_prefs_changed();
-        Ok(json!({ "pref": mode, "effective": effective, "restart_required": restart_required }))
     }
 
     /// `source.use {host}` → make THIS machine the credential source on `host` (the
@@ -2957,19 +2880,12 @@ mod tests {
 
     #[test]
     fn sheds_payload_carries_host_errors_for_two_failed_hosts() {
-        // The shape shed#300 needs: one host that needs a host-agent upgrade and
-        // one generic failure, BOTH present — the singular shape couldn't
-        // represent two failed hosts (plan 006 D6).
+        // The shape shed#300 needs: two failed hosts, BOTH present — the singular
+        // shape couldn't represent two failed hosts (plan 006 D6).
         let r = reachability(
             &[("mock", "alpha")],
             &[
-                (
-                    "mini2",
-                    ShedError::AgentUpgradeRequired {
-                        server: "mini2".into(),
-                        detail: "the installed shed-host-agent has no credential.get".into(),
-                    },
-                ),
+                ("mini2", ShedError::Transport("connection refused".into())),
                 ("mini3", ShedError::BadStatus(500)),
             ],
         );
@@ -2986,19 +2902,16 @@ mod tests {
             .expect("host_errors is an array");
         assert_eq!(errs.len(), 2, "both failed hosts survive: {p}");
         assert_eq!(errs[0]["server"], "mini2");
-        assert_eq!(errs[0]["kind"], "agent_upgrade_required");
+        assert_eq!(errs[0]["kind"], "other");
         assert!(
-            errs[0]["summary"]
-                .as_str()
-                .unwrap()
-                .starts_with("Upgrade shed-host-agent"),
-            "the summary must lead with the remedy: {}",
+            errs[0]["summary"].as_str().unwrap().starts_with("mini2: "),
+            "the summary must name its host: {}",
             errs[0]["summary"]
         );
         assert!(errs[0]["detail"]
             .as_str()
             .unwrap()
-            .contains("credential.get"));
+            .contains("connection refused"));
         assert_eq!(errs[1]["server"], "mini3");
         assert_eq!(errs[1]["kind"], "other");
         assert!(!errs[1]["summary"].as_str().unwrap().is_empty());
@@ -3048,7 +2961,6 @@ mod tests {
             craze_env: Vec::new(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
-            host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),
             broker_extensions_path: PathBuf::from("/run/user/0/shed/extensions.yaml"),
             log_file: None,
             log_debug: false,

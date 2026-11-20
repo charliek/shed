@@ -58,7 +58,7 @@ Two invariants hold, and explain the startup rejections you may hit (see
 - **credential ⟺ TLS ⟺ mtls**: HTTP credential enforcement (a client
   certificate) exists only in mtls mode, and mtls is always TLS.
 - **https ⟺ mtls**: `https_port` is valid only in mtls mode. So a client (or
-  the host-agent) can treat an `https://` `api_url` as proof the server
+  the desktop app) can treat an `https://` `api_url` as proof the server
   requires a credential.
 
 ---
@@ -162,9 +162,8 @@ no credential to paste. Add `--ssh-port` when the server's SSH port is not
 **You get:** HTTPS on the chosen interfaces (`8443`), the SSH allowlist, and a
 certificate checked on every request. An unauthenticated peer cannot complete
 the HTTPS handshake (`curl -k` with no certificate gets no HTTP response at
-all, not even a `401`). A co-located host-agent reaches the credential bus
-over the same pinned-TLS listener at `https://127.0.0.1:8443`, gated by the
-`credentials` scope. **Trade-off:** revoking access means removing the SSH key
+all, not even a `401`). The credential bus is gated by the
+`credentials` scope on the same pinned-TLS listener. **Trade-off:** revoking access means removing the SSH key
 (it also cuts SSH and SFTP), and `curl` or a script needs a client
 certificate. A script or orchestrator that needs only its own sheds can be a
 [service client](orchestrated-sheds.md). See [Public VPS
@@ -246,7 +245,7 @@ shed list -v      # the MOUNTS column shows none, NETWORK shows isolated
   user answers for this server, code in the shed can request SSH signatures
   and the cloud and registry credentials configured for it, like any shed (see
   [Credential isolation](../extensions/security-posture.md)). For untrusted
-  code, stop the host-agent while the shed runs, or have a [service
+  code, quit the desktop app on your machine while the shed runs, or have a [service
   client](../reference/security.md#service-clients) own the shed: the bus is
   always off for an owned shed.
 - **Neither flag stops the create's sync.** `shed create` still syncs your
@@ -299,7 +298,7 @@ auth:
 ```
 
 Restart, then watch the log for `SSH auth WOULD DENY (warn mode)` lines while
-you (and the host-agent) connect. Once nothing legitimate is denied, switch to
+you (and the desktop app) connect. Once nothing legitimate is denied, switch to
 `auth.mode: mtls`, which forces `enforce`. `warn` is valid only in open mode,
 and a server with `auth.users` (mtls only) always enforces.
 
@@ -315,8 +314,8 @@ moment is `shed server add` showing you the fingerprints to confirm (or pass
 [connection-flow table](../reference/security.md#connection-flow-whats-encrypted-where).
 
 The credential bus (`credentials` scope) and Connect tunnel (`control` or
-`credentials`) ride that same TLS listener, so a co-located host-agent reaches
-them over `https://127.0.0.1:8443` with the pinned cert and its own client
+`credentials`) ride that same TLS listener, so a desktop app's broker reaches
+them over `https://HOST:8443` with the pinned cert and its own client
 certificate. There is no plaintext channel, implicit or opt-in.
 
 ## Troubleshooting startup rejections

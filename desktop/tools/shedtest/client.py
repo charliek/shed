@@ -217,9 +217,10 @@ class _RcOps:
 
     **All four are roost ops since S6** (charliek/shed#328): a shed's agent
     sessions are the tabs its own `roost-session` reports, so `rc.list` returns
-    that and only that, `rc.launch` is `roost.launch` addressed by `{shed, host?}`
-    (an alias kept for 0.9.x), `rc.kill` is a `tab.close`, and `rc.inject_test`
-    puts a row into the roost snapshot. `self.call` comes from the `IPCClient`
+    that and only that, a shed is launched with `roost.launch` on
+    `roost:<server>/<shed>` (the 0.9.x alias `rc.launch` was removed in 0.10.0),
+    `rc.kill` is a `tab.close`, and `rc.inject_test` puts a row into the roost
+    snapshot. `self.call` comes from the `IPCClient`
     base each mixes in with.
 
     The pure pane-classifier op and its `rc_classify` helper went with S2
@@ -232,19 +233,6 @@ class _RcOps:
         if shed:
             params["shed"] = shed
         return self.call("rc.list", params)["sessions"]
-
-    def rc_launch(self, shed: str, kind: str = "claude-rc", host: str | None = None,
-                  display_name: str | None = None, initial_prompt: str | None = None) -> dict:
-        params: dict = {"shed": shed, "kind": kind}
-        if host:
-            params["host"] = host
-        if display_name:
-            params["display_name"] = display_name
-        # Include whenever non-None (not just truthy) so negative tests can send a
-        # deliberately bad value (e.g. a control char) through to the op.
-        if initial_prompt is not None:
-            params["initial_prompt"] = initial_prompt
-        return self.call("rc.launch", params)
 
     def rc_kill(self, shed: str, slug: str, host: str | None = None) -> None:
         params: dict = {"shed": shed, "slug": slug}
@@ -463,26 +451,14 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
 
     # -- credential broker (leg 3a.2) ------------------------------------
     def broker_status(self) -> dict:
-        """The LiveStatus-shaped broker snapshot: `{effective_mode, pref,
-        restart_required, probe:{desktop_socket_live, status_socket_live},
-        config:{source, message}, resolved_ssh_mode, gate_namespaces, servers,
-        broker_error}`. The C4 embedded-mode truth op."""
+        """The LiveStatus-shaped broker snapshot: `{config:{source, message},
+        resolved_ssh_mode, gate_namespaces, servers, machine, machine_error, ssh,
+        broker_error}`. The embedded broker's truth op."""
         return self.call("broker.status")
-
-    def broker_mode(self) -> dict:
-        """The `{effective, pref, restart_required}` fragment — the effective mode plus
-        the LIVE persisted pref (reflects a `broker_set_mode` without a relaunch)."""
-        return self.call("broker.mode")
-
-    def broker_set_mode(self, mode: str) -> dict:
-        """Persist the broker mode pref (`auto`|`embedded`|`external`). Effective mode is
-        fixed for the process lifetime, so a change sets `restart_required` until relaunch.
-        An unknown mode is rejected (`bad_request`)."""
-        return self.call("broker.set_mode", {"mode": mode})
 
     # -- credential sources (plan 035 §3.4) -------------------------------
     def source_status(self) -> dict:
-        """`{rows, this_machine, this_machine_error, broker_mode}`: one row per
+        """`{rows, this_machine, this_machine_error}`: one row per
         configured server — `{host, supported, source: {id, name}|None, this_machine,
         connected, error}` — and this machine's `{id, name}` (or why there is none). A
         server older than the feature is `supported: False` with no error."""
@@ -627,7 +603,8 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
 
     # -- launch-at-login (B4) --------------------------------------------
     def login_item_status(self) -> bool:
-        """Whether launch-at-login is enabled (the Preferences → General toggle)."""
+        """Whether launch-at-login is enabled (the Preferences → General toggle). The
+        app turns it on once at its first launch (plan 037 §3.1.4)."""
         return self.call("loginitem.status")["enabled"]
 
     def login_item_set(self, enabled: bool) -> None:

@@ -1,0 +1,19 @@
+[
+  {
+    "name": "",
+    "namespaces": [
+      {
+        "namespace": "docker-credentials",
+        "since": "<ts>",
+        "state": "connected"
+      },
+      {
+        "last_error": "unexpected status 403: {\"error\":{\"code\":\"SOURCE_MACHINE_ID_REQUIRED\",\"message\":\"this server needs to know which machine is asking; install the current shed desktop app\"}}",
+        "namespace": "ssh-agent",
+        "since": "<ts>",
+        "state": "reconnecting"
+      }
+    ],
+    "url": "<bus>"
+  }
+]
