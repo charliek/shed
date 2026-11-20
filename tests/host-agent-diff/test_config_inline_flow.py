@@ -46,7 +46,7 @@ def test_inline_flow_config_parses_equal(daemon, differential):
     def scenario(impl):
         with daemon(impl, INLINE_FLOW_CONFIG) as d:
             obj = d.status()
-            return canonical(mask_live_status(obj, d.socket_dir, d.config_path))
+            return canonical(mask_live_status(obj, d.config_path))
 
     masked = differential(scenario)
 

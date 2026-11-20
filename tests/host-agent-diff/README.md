@@ -119,10 +119,9 @@ means "carried into the golden unmasked" — i.e. pinned byte-for-byte.
   diff.
 - **Determinism over blanking.** `normalize.mask_live_status()` masks only the genuinely
   volatile fields — `version`, `pid`, `started_at`, `written_at`, `config_path`,
-  `approval_channel.socket_path` (dir prefix only; the `host-agent.sock` basename is
-  kept), and each `servers[].namespaces[].since`. Every masked timestamp has its
+  and each `servers[].namespaces[].since`. Every masked timestamp has its
   **RFC3339 shape asserted before** masking. Everything else (`schema`, `policies`,
-  `gate_namespaces`, `approval_channel.consumer_connected`, `servers[]`) is diffed.
+  `gate_namespaces`, `servers[]`) is diffed.
   The bus tests use `normalize.mask_bus_response()` in the same spirit — it masks a
   response Envelope's
   volatile `id` (a fresh UUID per response) and `timestamp` (RFC3339 shape-asserted

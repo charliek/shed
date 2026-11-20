@@ -75,7 +75,7 @@ def _state(obj: dict, ns: str) -> str | None:
 
 def _servers(d, obj: dict, bus_url: str) -> list:
     """The masked `servers[]`, with the dynamic bus URL as `<bus>`."""
-    masked = mask_live_status(obj, d.socket_dir, d.config_path)
+    masked = mask_live_status(obj, d.config_path)
     out = []
     for sv in masked["servers"]:
         sv = dict(sv)

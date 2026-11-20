@@ -78,7 +78,7 @@ def test_servers_connected_masked_equal(daemon, single_server_config, differenti
                     lambda s: _state_of(s, _SSH) == "connected"
                     and _state_of(s, _DOCKER) == "connected",
                 )
-                masked = mask_live_status(obj, d.socket_dir, d.config_path)
+                masked = mask_live_status(obj, d.config_path)
                 return canonical(_normalize_url(masked["servers"], bus.url))
 
     servers = differential(scenario)
@@ -117,7 +117,7 @@ def test_servers_409_rejected_masked_equal(daemon, single_server_config, differe
                 # 409 retryable (test_source_pin.py has the duplicate cell).
                 time.sleep(3.5)
                 assert bus.subscribe_count(_SSH) == 1, bus.subscribe_count(_SSH)
-                masked = mask_live_status(obj, d.socket_dir, d.config_path)
+                masked = mask_live_status(obj, d.config_path)
                 return canonical(_normalize_url(masked["servers"], bus.url))
 
     servers = differential(scenario)

@@ -199,8 +199,7 @@ def _clean_env(
     goes on the FRONT of PATH so a shim binary (e.g. a fake `ssh`) is resolved before
     the real one — the broker uses `look_ssh` on PATH.
 
-    The socket dir (`SHED_HOST_AGENT_SOCKET_DIR`) holds the harness's control socket,
-    and the status's `approval_channel.socket_path` is derived from it.
+    The socket dir (`SHED_HOST_AGENT_SOCKET_DIR`) holds the harness's control socket.
 
     The state dir (`SHED_HOST_AGENT_STATE_DIR`: the machine identity file and the
     credential store) defaults to `<home>/state`. It is set explicitly because an

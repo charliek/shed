@@ -78,18 +78,17 @@ def canonical(obj: Any) -> Any:
     return obj
 
 
-def mask_live_status(obj: dict, socket_dir: str, config_path: str) -> dict:
+def mask_live_status(obj: dict, config_path: str) -> dict:
     """Mask the volatile fields of a `LiveStatus` JSON object, leaving everything
     else to be diffed.
 
     Masked (volatile): `version`, `pid`, `started_at`, `written_at`, `config_path`,
-    `approval_channel.socket_path` (dir prefix only — the `host-agent.sock` basename
-    is kept), every `servers[].namespaces[].since`, and `machine.id` / `machine.name`
-    (a fresh random id per run, a name from the host's hostname; both shape-asserted
-    first). The presence of the `machine` block, and of `machine_error`, is diffed.
+    every `servers[].namespaces[].since`, and `machine.id` / `machine.name` (a fresh
+    random id per run, a name from the host's hostname; both shape-asserted first). The
+    presence of the `machine` block, and of `machine_error`, is diffed.
 
-    Diffed (stable): `schema`, `policies`, `gate_namespaces`,
-    `approval_channel.consumer_connected`, and the `servers[]` structure.
+    Diffed (stable): `schema`, `policies`, `gate_namespaces`, and the `servers[]`
+    structure.
 
     `started_at`/`written_at`/`since` have their RFC3339 shape asserted before the
     mask. Returns a new object; the input is not mutated.
@@ -123,19 +122,6 @@ def mask_live_status(obj: dict, socket_dir: str, config_path: str) -> dict:
     for ts_field in ("started_at", "written_at"):
         assert_rfc3339(out.get(ts_field), ts_field)
         out[ts_field] = MASK_TS
-
-    ac = dict(out.get("approval_channel", {}))
-    sp = ac.get("socket_path")
-    assert isinstance(sp, str), f"approval_channel.socket_path missing: {ac!r}"
-    # Structure-preserving mask: keep the fixed public basename, blank only the
-    # env-dependent directory (the plan: "mask the dir prefix, KEEP host-agent.sock").
-    if socket_dir:
-        assert os.path.dirname(sp) == socket_dir, (
-            f"approval_channel.socket_path parent {os.path.dirname(sp)!r} "
-            f"!= socket_dir {socket_dir!r}"
-        )
-    ac["socket_path"] = "<dir>/" + os.path.basename(sp)
-    out["approval_channel"] = ac
 
     masked_servers = []
     for sv in out.get("servers", []):

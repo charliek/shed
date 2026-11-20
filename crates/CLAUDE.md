@@ -160,10 +160,11 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   the multi-server supervisor + discovery watcher, the SSH/AWS/Docker/egress credential
   backends, the SSH-bootstrap minter + control-token provider, the approval/audit seams
   (incl. the always-compiled `AuditFanout` fan-out and the native `touchid` gate), the
-  `config` reader, socket path-resolution + liveness probes, and the LiveStatus snapshot
-  builder. Consumed today by the **`shed-host-agent` bin** (the daemon shell — CLI,
-  signals, socket bind, the Surface-A desktop UDS server) and, from leg 3a.2, embedded
-  in-process by the desktop app. Carries no daemon-only or WebKitGTK concern.
+  `config` reader, socket path-resolution + liveness probes, and the health types
+  (`ServerHealth`, `SshSigningStatus`). Embedded in-process by the desktop app (through
+  `shed-app`'s `broker` feature) and hosted for the wire harness by the test-only
+  **`shed-broker-harness`**. The standalone `shed-host-agent` daemon that used to drive
+  it was removed in plan 037. Carries no WebKitGTK concern.
   `sign_check` (plan 035 §3.5) is the pure parser and policy for what the machine will
   sign for a shed: an exact SSH login request or an exact `git` SSHSIG blob, nothing
   else, returning an `Approved` that is the only way to sign the bytes it checked. Its
@@ -172,10 +173,19 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   machine-wide settings are `ssh.allow_users` and `ssh.offer_keys` (`config.rs`,
   `HostAgentConfig::ssh_sign_policy`); the key filter itself is
   `ssh_backend::FilteredSshBackend`, wrapped around whichever SSH backend resolved in
-  BOTH the daemon and the embedded broker. It asks the backend nothing of its own (the
+  the embedded broker. It asks the backend nothing of its own (the
   agent-forward transcripts depend on that), and a key it does not offer fails with
   the backend's own unknown-key error, so a shed cannot tell "not offered" from "not
   present".
+- **`shed-broker-harness`** — a TEST-ONLY binary (plan 037) that hosts the desktop app's
+  embedded broker (`shed-app`'s `broker` feature, minus the Coordinator) for the wire
+  harness `tests/host-agent-diff/`: a config in, the bus and the audit file out, and a
+  control socket for its status snapshot (`src/status.rs`, the JSON shape the goldens
+  record), approval frames and decisions. A workspace member but **not** a default
+  member: as one, a plain `cargo build`/`cargo test` would turn `broker` on for the whole
+  workspace by feature unification and hide dead code in the default build shed-mobile
+  links. For the same reason `make -C desktop core-lint`'s workspace leg excludes it and
+  a leg of its own lints it. It ships in no release (`tests/not_shipped.rs`).
 - **`shed-opencode`** — the **opencode adapter** for `shed_core::lane` (plan 015): the
   implementation of both contract traits that talks to an opencode server's local HTTP
   API — the same server the TUI is already running, never a sidecar it launches itself.
@@ -552,8 +562,8 @@ reader silently dropped, and Go's `LoadConfig` rejects malformed YAML the hand-r
 not detect — a real Go-vs-Rust divergence on the product's own default config. `saphyr-parser`
 sits behind the `Node` interface (swap-insulation for its pre-1.0 API). It — and `shed-broker`'s
 other leaf deps (`notify`, the `aws-sdk-*` stack) — are **deps of `shed-broker`, reaching only its
-embedders** (today the `shed-host-agent` bin; from leg 3a.2 also `shed-app` under its non-default
-`broker` feature and, transitively, the Tauri client). They must **never** reach `shed-core`
+embedders** (`shed-app` under its non-default `broker` feature and, transitively, the Tauri
+client; and the test-only `shed-broker-harness`). They must **never** reach `shed-core`
 or **default-features `shed-app`** (proven by `cargo tree -i saphyr-parser` /
 `notify` / `aws-sdk-sts` — the §7 reverse-dep AC mechanically enforces this). **shed-core's own
 `yaml_lite` stays hand-rolled**; converging the two readers
@@ -565,7 +575,9 @@ onto `saphyr-parser` would be a separate shed-core slice, not assumed here.
 cd crates && cargo test                              # workspace tests
 cargo test -p shed-app --features broker             # the embedded broker bridge (3a.2)
 cargo test -p shed-core --features test-support      # exports `roost::testing::FakeRoost` + `lane::conformance`
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --exclude shed-broker-harness --all-targets -- -D warnings
+cargo test -p shed-broker -p shed-broker-harness --all-targets   # the broker + its wire-harness host
+cargo clippy -p shed-broker-harness --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo test -p shed-opencode                          # the opencode agent-lane adapter
 cargo test -p shed-opencode --features test-support  # exports `testing::FakeOpencode`
@@ -590,12 +602,3 @@ At **release**, this workspace's `Cargo.toml` version is bumped in **lockstep** 
 `desktop/VERSION` (and the Tauri manifests) by `scripts/release/update-version.sh X.Y.Z
 --components desktop`; `scripts/release/release-plan.sh` hard-verifies the lockstep before the
 desktop leg ships. Don't hand-edit the version out of step.
-
-**One crate here ships on its own selector, deliberately OUT of that lockstep:**
-`crates/shed-host-agent/VERSION` (the `host-agent` component). That file is a ship-
-**selector** only — the shipped binary's version is the tag, injected at build time by
-the component's goreleaser config (`SHED_HOST_AGENT_VERSION`) and read via
-`option_env!` in `version.rs`. So `shed-host-agent version` on a released build reports
-the release tag, NOT `CARGO_PKG_VERSION` (which follows the desktop selector and is not
-bumped on a host-agent-only tag). Expect the two versions to differ in normal operation;
-that is the design, not drift. See the root `RELEASING.md` "Component selection".

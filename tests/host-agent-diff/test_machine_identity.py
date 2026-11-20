@@ -168,7 +168,6 @@ def _live_status_with_machine(machine_id: str) -> dict:
         "config_path": "/c.yaml",
         "started_at": "2026-01-01T00:00:00Z",
         "written_at": "2026-01-01T00:00:00Z",
-        "approval_channel": {"socket_path": "/s/host-agent.sock"},
         "servers": [],
         "machine": {"id": machine_id, "name": "desk"},
     }
@@ -181,6 +180,6 @@ def test_machine_id_mask_requires_a_full_match():
     with pytest.raises(AssertionError):
         assert_machine_identity(bad, "desk")
     with pytest.raises(AssertionError):
-        mask_live_status(_live_status_with_machine(bad), "/s", "/c.yaml")
-    masked = mask_live_status(_live_status_with_machine("a" * 32), "/s", "/c.yaml")
+        mask_live_status(_live_status_with_machine(bad), "/c.yaml")
+    masked = mask_live_status(_live_status_with_machine("a" * 32), "/c.yaml")
     assert masked["machine"] == {"id": "<machine_id>", "name": "<machine_name>"}

@@ -21,6 +21,7 @@
 //! offers no compatibility promise: its interface is whatever the harness needs.
 
 mod control;
+mod status;
 
 use std::path::{Path, PathBuf};
 use std::process;
@@ -33,7 +34,7 @@ use tokio::sync::watch;
 use shed_app::{load_or_synthesize, EmbeddedHostAgent};
 use shed_broker::bus::{BusLog, FileBusLog};
 use shed_broker::config::expand_tilde;
-use shed_broker::status::{build_live_status, now_rfc3339};
+use shed_broker::status::now_rfc3339;
 
 /// The harness's name: the `version` its status reports, and the prefix of its stderr
 /// lines.
@@ -154,12 +155,11 @@ async fn serve(args: Args) -> i32 {
             let machine = agent
                 .machine_identity()
                 .unwrap_or_else(|| Err("not loaded".to_string()));
-            let snapshot = build_live_status(
+            let snapshot = status::build_live_status(
                 &cfg,
                 &config_path,
                 &started_at,
                 HARNESS_NAME,
-                None,
                 agent.health(),
                 &machine,
                 agent.ssh_signing_status(),

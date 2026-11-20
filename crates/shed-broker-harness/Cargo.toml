@@ -19,11 +19,12 @@ workspace = true
 # must not turn on shed-app's `broker` feature for the whole workspace through
 # feature unification.
 shed-app = { path = "../shed-app", features = ["broker"] }
-# The status snapshot builder and the log sink the bridge takes.
+# The log sink the bridge takes, and the health types the status snapshot carries.
 shed-broker = { path = "../shed-broker" }
 # The approval frames the bridge sends and the decision types it takes.
 shed-core = { path = "../shed-core" }
 tokio = { workspace = true, features = ["net", "io-util", "signal", "sync", "time", "rt-multi-thread", "macros"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

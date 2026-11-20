@@ -307,8 +307,7 @@ pub fn resolve_mode(pref: ModePref, probe: ModeProbe) -> ResolvedMode {
 // ---------------------------------------------------------------------------
 
 /// The app's decision as delivered internally, before the `decided_by` default is
-/// applied — the embedded mirror of the daemon's `DesktopDecision`
-/// (`crates/shed-host-agent/src/desktop.rs:147-154`).
+/// applied — the embedded mirror of the retired daemon's `DesktopDecision`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppDecision {
     approved: bool,
@@ -318,7 +317,7 @@ struct AppDecision {
 }
 
 /// Map an app decision to the broker's `ApprovalOutcome`, field-for-field with the
-/// daemon's `decision_to_outcome` (`crates/shed-host-agent/src/desktop.rs:156-173`): an
+/// retired daemon's `decision_to_outcome`: an
 /// empty `decided_by` defaults to `"user"`; scope/ttl pass through as raw strings;
 /// `reason` is always empty (the ssh/aws deny audits don't read it, and the
 /// docker-desktop deny reason is a later slice). Keeping this a free function of a plain
@@ -398,8 +397,8 @@ impl ApprovalGate for AppGate {
             detail: detail.to_string(),
             // `as_secs()` truncates sub-second timeout to whole seconds (a ~1s
             // expires_at truncation, and a sub-second `approval_timeout` footgun) — a
-            // deliberate byte-parity choice with the daemon's `as_secs` truncation
-            // (crates/shed-host-agent/src/desktop.rs:302), not an oversight.
+            // deliberate byte-parity choice with the retired daemon's `as_secs`
+            // truncation, not an oversight.
             expires_at: timefmt::format_iso8601(now + self.inner.timeout.as_secs() as i64),
         };
 
@@ -1044,10 +1043,6 @@ impl EmbeddedHostAgent {
             minter: Some(self.minter.clone()),
             log: bus_log.clone(),
             machine: machine.ok(),
-            // Never stands by: this broker is the one that answers while it runs. A
-            // terminal 409 (another stream holds the type) is terminal for it, as for
-            // every bus client.
-            embedded_presence: None,
         };
         let sup = Arc::new(Supervisor::new(self.shutdown_rx.clone(), deps));
         *self.supervisor.lock().unwrap() = Some(sup.clone());
@@ -1171,8 +1166,8 @@ fn log_machine_identity(
 mod tests {
     use super::*;
 
-    // ---- (iii) outcome-mapping fixture: field-for-field vs the daemon's
-    // decision_to_outcome (crates/shed-host-agent/src/desktop.rs:156-173) --------------
+    // ---- (iii) outcome-mapping fixture: field-for-field vs the retired daemon's
+    // decision_to_outcome ---------------------------------------------------------------
 
     #[test]
     fn decision_to_outcome_matches_daemon_fixture() {
@@ -1537,7 +1532,6 @@ mod tests {
             minter: None,
             log: Arc::new(bus::FileBusLog::new("")),
             machine: None,
-            embedded_presence: None,
         };
         let target = ServerTarget {
             name: String::new(), // single-server unnamed target (open http)
@@ -1662,7 +1656,6 @@ mod tests {
             minter: None,
             log: Arc::new(bus::FileBusLog::new("")),
             machine: None,
-            embedded_presence: None,
         };
         let target = ServerTarget {
             name: String::new(),
