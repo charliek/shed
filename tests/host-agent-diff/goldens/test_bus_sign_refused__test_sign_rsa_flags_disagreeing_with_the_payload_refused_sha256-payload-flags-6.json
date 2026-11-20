@@ -11,21 +11,6 @@
     "shed": "web",
     "ts": "<ts>"
   },
-  "event": {
-    "approval": "none",
-    "code": "SIGN_REFUSED",
-    "detail": "login: RSA flags do not name the algorithm's hash",
-    "id": "<id>",
-    "kind": "audit",
-    "ns": "ssh-agent",
-    "op": "sign",
-    "reason": "unparseable_data",
-    "result": "refused",
-    "shed": "web",
-    "ts": "<ts>",
-    "type": "event",
-    "v": 2
-  },
   "response": {
     "final": true,
     "id": "<id>",

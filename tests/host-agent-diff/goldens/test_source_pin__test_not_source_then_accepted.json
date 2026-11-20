@@ -43,6 +43,5 @@
       ],
       "url": "<bus>"
     }
-  ],
-  "refused_text": "Servers (1):\n  (default)  (<bus>)\n    ok  docker-credentials  connected\n    -   ssh-agent           not-source: not the credential source for this server; the active source is desk (fedcba9876543210fedcba9876543210)\n    this machine is not the credential source here; the active source is desk\n    to make this machine (<machine_name>) the source: shed source use -- <machine_id>\n"
+  ]
 }

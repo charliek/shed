@@ -54,9 +54,14 @@ core-test:  ## cargo test the Rust core workspace (+ the non-default `broker` fe
 	cd ../crates && cargo test -p shed-app --features broker
 
 core-lint:  ## cargo clippy the Rust core (deny warnings; + the `broker` feature)
-	cd ../crates && cargo clippy --workspace --all-targets -- -D warnings
+	# The wire harness's test-only host (shed-broker-harness) turns on shed-app's
+	# `broker` feature; linted with the workspace, feature unification would lint
+	# every crate with it on, and the default-features build shed-mobile links
+	# would go unlinted. So the workspace leg excludes it, and it has a leg of its own.
+	cd ../crates && cargo clippy --workspace --exclude shed-broker-harness --all-targets -- -D warnings
 	# The default clippy above never compiles the `broker` module.
 	cd ../crates && cargo clippy -p shed-app --features broker --all-targets -- -D warnings
+	cd ../crates && cargo clippy -p shed-broker-harness --all-targets -- -D warnings
 
 core-fmt:  ## cargo fmt the Rust core
 	cd ../crates && cargo fmt --all

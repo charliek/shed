@@ -116,21 +116,16 @@ jobs:
               - 'desktop/uv.lock'
               - 'craze-pin.env'
             hostagent:
-              # The Go-vs-Rust host-agent differential leg: both daemons, their
-              # shared wire contract (sdk envelope + ext/protocol payloads), the
-              # harness, the committed wire reference, and the shared build
-              # manifests/locks/toolchain a dependency bump would ride in on.
-              - 'crates/shed-host-agent/**'
-              # The daemon bin is now a thin shell over the `shed-broker` lib crate
-              # (the broker core: bus, backends, minter, supervisor, config, the
-              # approval/audit seams, socket paths/liveness, the LiveStatus snapshot).
-              # A change there is a change to the shipped daemon's behavior, so it must
-              # trigger the differential harness + the release-snapshot.
+              # The broker wire-goldens leg: the desktop app's embedded broker
+              # (shed-broker, and shed-app's `broker` bridge that hosts it), the
+              # test-only process that runs it for the harness, their shared wire
+              # contract (sdk envelope + ext/protocol payloads), the harness, the
+              # committed wire reference, and the shared build manifests/locks/
+              # toolchain a dependency bump would ride in on. (release-snapshot is
+              # gated on this filter too.)
               - 'crates/shed-broker/**'
-              # The Rust host-agent has a path-dep on shed-core, and the release
-              # build (builder: rust) reads rust-toolchain.toml — a change to
-              # either can break the shipped binary, so both must trigger the
-              # differential + the release-snapshot (which is gated on this filter).
+              - 'crates/shed-app/**'
+              - 'crates/shed-broker-harness/**'
               - 'crates/shed-core/**'
               - 'crates/rust-toolchain.toml'
               - 'crates/Cargo.toml'
@@ -281,8 +276,9 @@ jobs:
     needs: changes
     # Also gated on `hostagent`: the SHIPPED shed-host-agent binary is built
     # from crates/ (builder: rust), so a crates-only PR must run this snapshot
-    # to prove the release build still resolves. That filter scopes
-    # crates/shed-host-agent/**.
+    # to prove the release build still resolves. That filter scopes the broker
+    # crates the daemon is built from (shed-broker, shed-core) and the lock; the
+    # daemon's own crate left it when the wire harness moved off the daemon.
     if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.hostagent == 'true' || needs.changes.outputs.ci == 'true' }}
     # macos-latest matches the real release runner: the shipped shed-host-agent
     # is Rust (builder: rust / cargo zigbuild — cross-builds the linux
@@ -654,13 +650,14 @@ jobs:
           cargo test -p shed-craze --all-targets --features test-support --locked
           cargo clippy -p shed-craze --all-targets --features test-support --locked -- -D warnings
 
-  # The host-agent wire-goldens leg (Phase 3 leg 3a.1; the Go twin sunset by
-  # plan 006-mtls-cleanup-hostagent-sunset.md). One Linux job covers BOTH the
-  # standalone Rust daemon's build+test+clippy (so it can't Mac-dev bit-rot —
-  # it persists as the 3a.2 headless fallback) AND the hermetic wire harness
-  # that spawns the daemon and asserts its wire-visible output against goldens
-  # recorded from the last agreeing Go↔Rust run. Rust + Python on one runner
-  # (the "third pytest suite").
+  # The broker wire-goldens leg (the Go twin sunset in plan 006; the harness
+  # moved off the daemon onto the desktop app's broker in plan 037). One Linux job
+  # covers BOTH the broker core and its test-only host's build+test+clippy
+  # (shed-broker, shed-broker-harness — the harness crate is not a default member,
+  # so it is named here) AND the hermetic wire harness that runs the app's
+  # embedded broker in that host and asserts its wire-visible output against
+  # goldens recorded from the last agreeing Go↔Rust run. Rust + Python on one
+  # runner (the "third pytest suite").
   host-agent-diff:
     name: host-agent-diff (wire goldens)
     needs: changes
@@ -689,25 +686,16 @@ jobs:
           fi
           sudo timeout 300 apt-get install -y build-essential
       - uses: astral-sh/setup-uv@v6
-      # The broker core lives in `shed-broker` now; the bin is the daemon shell over
-      # it. Both must build/test/clippy-clean for the shipped daemon to be sound.
-      - name: Rust host-agent — test + clippy (Linux)
+      # The broker core and the harness's host (its unit tests, and the check that
+      # no crate depends on it and it is no default member).
+      - name: Broker + harness host — test + clippy (Linux)
         working-directory: crates
         run: |
-          cargo test -p shed-broker -p shed-host-agent --all-targets --locked
-          cargo clippy -p shed-broker -p shed-host-agent --all-targets --locked -- -D warnings
-      # The headless variant (surface A dropped) is the 3a.2 server/no-desktop
-      # distribution — it must not bit-rot unwatched on the platform it ships to. The
-      # `desktop-forwarding` feature is the BIN's; `shed-broker` has no features, so
-      # `--no-default-features` reshapes only the shell.
-      - name: Rust host-agent — headless (--no-default-features) test + clippy (Linux)
-        working-directory: crates
-        run: |
-          cargo test -p shed-host-agent --all-targets --locked --no-default-features
-          cargo clippy -p shed-host-agent --all-targets --locked --no-default-features -- -D warnings
+          cargo test -p shed-broker -p shed-broker-harness --all-targets --locked
+          cargo clippy -p shed-broker -p shed-broker-harness --all-targets --locked -- -D warnings
       - name: Wire goldens + golden runners
-        # Builds the Rust daemon binary (conftest) and runs the pytest suite
-        # against the recorded goldens + the Rust golden-fixture runners.
+        # Builds shed-broker-harness (conftest) and runs the pytest suite against
+        # the recorded goldens + the Rust golden-fixture runners.
         run: make test-host-agent-diff
 
   # The machine-transport differential's LIVE leg (plan 025 C5, P10): every

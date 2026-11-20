@@ -1,15 +1,4 @@
 {
-  "approval_request": {
-    "detail": "SSH sign request",
-    "expires_at": "<expires_at>",
-    "id": "<id>",
-    "namespace": "ssh-agent",
-    "op": "sign",
-    "shed": "web",
-    "ts": "<ts>",
-    "type": "approval_request",
-    "v": 2
-  },
   "audit": {
     "approval": "shed-desktop",
     "decided_by": "user",
@@ -18,19 +7,6 @@
     "result": "denied",
     "shed": "web",
     "ts": "<ts>"
-  },
-  "event": {
-    "approval": "shed-desktop",
-    "decided_by": "user",
-    "id": "<id>",
-    "kind": "audit",
-    "ns": "ssh-agent",
-    "op": "sign",
-    "result": "denied",
-    "shed": "web",
-    "ts": "<ts>",
-    "type": "event",
-    "v": 2
   },
   "response": {
     "final": true,

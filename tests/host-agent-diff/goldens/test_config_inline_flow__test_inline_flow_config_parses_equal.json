@@ -24,8 +24,6 @@
       "git"
     ],
     "key_filter": false,
-    "keys_available": 0,
-    "keys_offered": 0,
     "mode": "local-keys"
   },
   "started_at": "<ts>",

@@ -1,29 +1,33 @@
-"""Fixtures for the hermetic host-agent **wire** harness.
+"""Fixtures for the hermetic broker **wire** harness.
 
-The session `binaries` fixture builds the `shed-host-agent` daemon (`cargo build`,
-with `~/.cargo/bin` on PATH) once and returns its path. `run_cli` drives a one-shot
-subcommand (`version`, `status`, ...) against a chosen impl in an isolated HOME +
-socket dir. `daemon` is a context manager that launches a daemon with a valid config,
-waits for its status socket, yields a handle that can query `status [--json]`, and on
-exit sends SIGTERM, asserts a clean exit 0, and asserts both sockets are unlinked.
+The harness drives the desktop app's embedded credential broker, hosted in a
+test-only process: `crates/shed-broker-harness` (shed-app's `broker` feature, the
+app's own loader and bridge, minus the app's Coordinator). The session `binaries`
+fixture builds it (`cargo build -p shed-broker-harness`, with `~/.cargo/bin` on PATH)
+once and returns its path. `daemon` (the name kept so the cells read as before) is a
+context manager that launches it with a config, waits for its control socket, yields a
+handle that reads its status over that socket, and on exit sends SIGTERM and asserts
+exit 0, the `harness drained` line in its log (the broker drained every server group
+before it exited) and the control socket unlinked.
 
-`differential` asserts the Rust daemon's wire-visible output against a committed
-golden under `goldens/` (see the "Goldens" block below `_shutdown`). Those goldens
-were recorded (73755c0-era) from a run where the Go and Rust daemons produced
-IDENTICAL values, so each one is a two-implementation agreement frozen in place —
-that is what the Go daemon's retirement handed forward. The `impl` seam and the
-fixture's `scenario(impl)` signature survive because the whole harness is written in
-terms of it; `"rust"` is the only impl now.
+`differential` asserts the broker's wire-visible output against a committed golden
+under `goldens/` (see the "Goldens" block below `_shutdown`). Those goldens were
+recorded (73755c0-era) from a run where the Go and Rust daemons produced IDENTICAL
+values, and have since held for the Rust daemon and now for the app's broker; the
+values only the retired daemon produced (its desktop socket's frames, its `status`
+text, its start-up key listing) were removed from them, not re-recorded. The `impl`
+seam and the fixture's `scenario(impl)` signature survive because the whole harness is
+written in terms of it; `"rust"` is the only impl.
 
-Hermetic by construction: every test gets a fresh `$SHED_HOST_AGENT_SOCKET_DIR` and
-`$HOME` (so no real `~/.ssh` / `~/.shed` is read), `SSH_AUTH_SOCK` is stripped (the
-daemon falls back to an empty local-keys backend), and there is no network.
+Hermetic by construction: every test gets a fresh `$SHED_HOST_AGENT_SOCKET_DIR`,
+`$HOME` (so no real `~/.ssh` / `~/.shed` is read) and state dir, `SSH_AUTH_SOCK` is
+stripped (the broker falls back to an empty local-keys backend), and the only network
+is the synthetic bus on loopback.
 """
 
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import json
 import os
 import re
@@ -36,6 +40,7 @@ from pathlib import Path
 
 import pytest
 
+import control_client
 from normalize import canonical
 
 # tests/host-agent-diff/conftest.py -> tests -> repo root.
@@ -50,10 +55,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 TEST_ED25519_KEY = FIXTURES_DIR / "test_ed25519"
 
-# The status/desktop socket basenames (fixed public interface — sockets.go /
-# sockets.rs). The dir is the only configurable part (`$SHED_HOST_AGENT_SOCKET_DIR`).
-STATUS_SOCK_NAME = "host-agent-status.sock"
-DESKTOP_SOCK_NAME = "host-agent.sock"
+# The harness's control socket, in the per-test short socket dir.
+CONTROL_SOCK_NAME = "control.sock"
+
+# What the harness writes to its log once the broker has drained on SIGTERM
+# (`crates/shed-broker-harness/src/main.rs`).
+DRAINED_LINE = "INFO  harness drained"
 
 # The "watch none" launch config: ssh delegated to shed-desktop, aws approve-all,
 # docker deny-all, logging on, discovery watching zero servers. Chosen so the daemon
@@ -114,8 +121,8 @@ def _single_server_config(bus_url: str) -> str:
 # `discovery:` block → single-server mode, subscribes to `ssh-agent`), but with
 # `ssh.mode: local-keys` (so the committed ed25519 key the `daemon` fixture installs
 # is loaded) and `ssh.approval.policy: shed-desktop` (so a `sign` is DELEGATED to the
-# connected desktop consumer via a `DesktopGate`, which fans the resulting audit out
-# to that consumer as an `event`). BLOCK style on purpose (the Rust `yaml_lite` parser is block-only; see
+# app through the bridge's approval gate, which the harness's control socket stands in
+# for; the resulting audit fans out to it as an `event`). BLOCK style on purpose (the Rust `yaml_lite` parser is block-only; see
 # WATCH_NONE_CONFIG / README "Known contract gaps"). `{server}` is filled by
 # `sign_config(bus_url)`; `{audit_log}` survives to the `daemon` fixture's `.format`.
 SIGN_CONFIG = """\
@@ -184,31 +191,23 @@ def discovery_source_doc(servers: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-@dataclasses.dataclass
-class CliResult:
-    """The outcome of one one-shot subcommand invocation."""
-
-    returncode: int
-    stdout: str
-    stderr: str
-    socket_dir: str
-    home: str
-
-
 def _clean_env(
     socket_dir, home, path_prepend=None, ssh_auth_sock=None, state_dir=None
 ) -> dict:
     """A hermetic environment: real PATH (so system tools resolve) but an isolated
     HOME + socket dir + state dir, and no ambient ssh-agent. `path_prepend` (a dir)
     goes on the FRONT of PATH so a shim binary (e.g. a fake `ssh`) is resolved before
-    the real one — the daemon uses `look_ssh` on PATH.
+    the real one — the broker uses `look_ssh` on PATH.
+
+    The socket dir (`SHED_HOST_AGENT_SOCKET_DIR`) holds the harness's control socket,
+    and the status's `approval_channel.socket_path` is derived from it.
 
     The state dir (`SHED_HOST_AGENT_STATE_DIR`: the machine identity file and the
     credential store) defaults to `<home>/state`. It is set explicitly because an
-    isolated HOME alone does not isolate it on Linux: the daemon prefers
+    isolated HOME alone does not isolate it on Linux: the broker prefers
     `$XDG_DATA_HOME`, so a developer with that exported would otherwise have the
-    daemon write `machine.json` into their real data dir. Pass `state_dir` to share
-    one across several daemon runs (the machine-identity restart cell).
+    broker write `machine.json` into their real data dir. Pass `state_dir` to share
+    one across several harness runs (the machine-identity restart cell).
 
     `SSH_AUTH_SOCK` is stripped by default (so the local-keys backend is the
     auto-detect result); pass `ssh_auth_sock` to point the agent-forward backend at a
@@ -232,20 +231,17 @@ def _clean_env(
     return env
 
 
-def _run_cli(binary: str, args, socket_dir, home) -> CliResult:
-    proc = subprocess.run(
-        [binary, *args],
-        env=_clean_env(socket_dir, home),
-        capture_output=True,
-        timeout=30,
-    )
-    return CliResult(
-        returncode=proc.returncode,
-        stdout=proc.stdout.decode("utf-8"),
-        stderr=proc.stderr.decode("utf-8"),
-        socket_dir=str(socket_dir),
-        home=str(home),
-    )
+def harness_argv(binary: str, config_path, log_path, control_path) -> list:
+    """The harness command line (`shed-broker-harness --config --log-file --control`)."""
+    return [
+        binary,
+        "--config",
+        str(config_path),
+        "--log-file",
+        str(log_path),
+        "--control",
+        str(control_path),
+    ]
 
 
 def _build(cmd, cwd, env=None) -> None:
@@ -259,18 +255,20 @@ def _build(cmd, cwd, env=None) -> None:
 
 @pytest.fixture(scope="session")
 def binaries() -> dict:
-    """Build the daemon binary once and return `{"rust": path}`.
+    """Build the harness binary once and return `{"rust": path}`.
 
-    Still a dict keyed by impl — every `run_cli`/`daemon` call site is written as
+    Still a dict keyed by impl — every `daemon` call site is written as
     `binaries[impl]`, and the `impl` seam is what makes a golden's provenance
     readable ("the value both implementations produced"). `"rust"` is the only key
-    since the Go daemon's retirement."""
+    since the Go daemon's retirement. The build is `-p shed-broker-harness`: the
+    crate is not a default member, and building it alone keeps shed-app's `broker`
+    feature out of every other crate's build."""
     cargo_env = dict(os.environ)
     cargo_env["PATH"] = (
         str(Path.home() / ".cargo" / "bin") + os.pathsep + cargo_env.get("PATH", "")
     )
     _build(
-        ["cargo", "build", "-p", "shed-host-agent"],
+        ["cargo", "build", "-p", "shed-broker-harness"],
         cwd=REPO_ROOT / "crates",
         env=cargo_env,
     )
@@ -285,30 +283,15 @@ def binaries() -> dict:
             target_dir = REPO_ROOT / "crates" / target_dir
     else:
         target_dir = REPO_ROOT / "crates" / "target"
-    rust_bin = target_dir / "debug" / "shed-host-agent"
+    rust_bin = target_dir / "debug" / "shed-broker-harness"
 
     assert rust_bin.exists(), f"rust binary missing: {rust_bin}"
     return {"rust": str(rust_bin)}
 
 
-@pytest.fixture
-def run_cli(binaries, tmp_path_factory):
-    """Return `run(impl, *args, socket_dir=None, home=None) -> CliResult`. Each call
-    gets a fresh isolated socket dir + HOME unless one is passed (to let a scenario
-    point several invocations at the same dir)."""
-
-    def _call(impl, *args, socket_dir=None, home=None) -> CliResult:
-        if socket_dir is None:
-            socket_dir = tmp_path_factory.mktemp("sock")
-        if home is None:
-            home = tmp_path_factory.mktemp("home")
-        return _run_cli(binaries[impl], list(args), socket_dir, home)
-
-    return _call
-
-
 class DaemonHandle:
-    """A running daemon under test: query it, inspect its socket dir."""
+    """A running harness under test: read its status over the control socket, inspect
+    its files."""
 
     def __init__(
         self,
@@ -335,8 +318,8 @@ class DaemonHandle:
         # discovery test writes/rewrites it to drive the poll/off convergence differential;
         # `None` for the non-discovery configs.
         self.source_path = Path(source_path) if source_path else None
-        # When the daemon was launched with a shim `ssh` (the minter tests), the shim
-        # appends its argv (one element per line) to this file — the daemon's exact
+        # When the harness was launched with a shim `ssh` (the minter tests), the shim
+        # appends its argv (one element per line) to this file — the broker's exact
         # `ssh` invocation, captured for the differential's argv comparison.
         self.ssh_argv_file = Path(ssh_argv_file) if ssh_argv_file else None
         # When launched with a fake `docker-credential-testhelper` (the docker helper
@@ -349,33 +332,31 @@ class DaemonHandle:
         # The DURABLE audit JSONL (`logging.path`), distinct from the operational log
         # above. Populated by gated ops (the sign flow); a fan-out `event` is sent
         # AFTER the file line is written (`JsonlAuditSink::log`), so a durable line is
-        # readable once the desktop consumer has seen the matching `event`.
+        # readable once the control client has seen the matching `event`.
         self.audit_log_path = Path(audit_log_path)
-        self.status_sock = Path(socket_dir) / STATUS_SOCK_NAME
-        self.desktop_sock = Path(socket_dir) / DESKTOP_SOCK_NAME
+        self.control_sock = Path(socket_dir) / CONTROL_SOCK_NAME
 
-    def status(self, json: bool = False) -> CliResult:
-        args = ["status"] + (["--json"] if json else [])
-        return _run_cli(self.binary, args, self.socket_dir, self.home)
+    def status(self) -> dict:
+        """The broker's status JSON (`{"op":"status"}` on a connection of its own)."""
+        return control_client.request(self.control_sock, {"op": "status"})
 
     def poll_status(self, predicate, timeout: float = 12.0) -> dict:
-        """Poll `status --json` until `predicate(obj)` holds (a deadline poll, never a
-        fixed sleep) and return the parsed status object. A non-zero `status` exit is
-        retried, not fatal. Raises on timeout with the last snapshot for a readable
-        failure — the shared primitive behind the discovery/servers[] convergence cells."""
-        import json as _json
-
+        """Poll the status until `predicate(obj)` holds (a deadline poll, never a fixed
+        sleep) and return the parsed status object. A failed request is retried, not
+        fatal. Raises on timeout with the last snapshot for a readable failure — the
+        shared primitive behind the discovery/servers[] convergence cells."""
         deadline = time.monotonic() + timeout
         last = None
         while time.monotonic() < deadline:
-            r = self.status(json=True)
-            if r.returncode == 0:
-                last = _json.loads(r.stdout)
-                if predicate(last):
-                    return last
+            try:
+                last = self.status()
+            except (OSError, AssertionError, ValueError):
+                last = None
+            if last is not None and predicate(last):
+                return last
             time.sleep(0.05)
         raise AssertionError(
-            f"{self.impl}: status --json never satisfied the predicate within "
+            f"{self.impl}: status never satisfied the predicate within "
             f"{timeout}s; last={last!r}"
         )
 
@@ -445,9 +426,10 @@ def daemon(binaries, tmp_path_factory):
     """Return a context-manager factory `make(impl, config_text) -> DaemonHandle`.
 
     On enter: writes `config_text` (a `.format(audit_log=..., source=...)` template)
-    into an isolated dir, launches the daemon with `-config`/`-log-file`, and waits
-    up to 3s for the status socket to appear. On exit: SIGTERM, assert exit 0, and
-    assert BOTH the status and desktop sockets are unlinked.
+    into an isolated dir — or, with `config_text=None`, writes no config at all — then
+    launches `shed-broker-harness --config/--log-file/--control` and waits up to 10s
+    for the control socket to appear. On exit: SIGTERM, assert exit 0, the
+    `harness drained` line in the log and the control socket unlinked.
     """
 
     @contextlib.contextmanager
@@ -463,7 +445,6 @@ def daemon(binaries, tmp_path_factory):
         install_aws_credentials: str | None = None,
         install_docker_config: str | None = None,
         docker_helper_bundle: str | None = None,
-        pre_launch=None,
         state_dir=None,
     ):
         root = tmp_path_factory.mktemp(f"daemon-{impl}")
@@ -473,8 +454,9 @@ def daemon(binaries, tmp_path_factory):
         source = root / "nonexistent-discovery.yaml"
         config_path = root / "extensions.yaml"
         log_path = root / "op.log"
-        config = config_text.format(audit_log=audit_log, source=source)
-        config_path.write_text(config)
+        if config_text is not None:
+            config = config_text.format(audit_log=audit_log, source=source)
+            config_path.write_text(config)
 
         # Install the committed ed25519 key into this daemon's isolated
         # `<HOME>/.ssh/id_ed25519` (dir 0700, file 0600) BEFORE launch, so a
@@ -570,27 +552,16 @@ def daemon(binaries, tmp_path_factory):
 
         # The socket dir must be SHORT: an AF_UNIX bind path caps at ~104 bytes
         # (macOS) / ~108 (Linux), and pytest's nested tmp tree blows past that. A
-        # shallow mkdtemp under $TMPDIR keeps `<dir>/host-agent-status.sock` well
-        # under the limit. (One-shot subcommands don't bind, so `run_cli` can use the
-        # long pytest tmp dir.) Cleaned up in the finally below.
+        # shallow mkdtemp under $TMPDIR keeps `<dir>/control.sock` well under the
+        # limit. Cleaned up in the finally below.
         socket_dir = Path(tempfile.mkdtemp(prefix="hadiff-"))
+        control_sock = socket_dir / CONTROL_SOCK_NAME
 
-        status_sock = socket_dir / STATUS_SOCK_NAME
-        desktop_sock = socket_dir / DESKTOP_SOCK_NAME
-
-        # `pre_launch(socket_dir)` runs AFTER the socket dir exists but BEFORE the
-        # daemon launches — the seam the A1 socket-lifecycle cell uses to widen the
-        # dir to 0777 (so the daemon's re-chmod-to-0700 is observable) or to plant a
-        # stale AF_UNIX socket at the fixed socket paths (so the daemon's stale-detect
-        # + rebind is exercised). No-op for every other test.
-        if pre_launch is not None:
-            pre_launch(socket_dir)
-
-        # The daemon writes its operational log to -log-file, so stdout/stderr carry
+        # The harness writes its operational log to --log-file, so stdout/stderr carry
         # nothing worth capturing; DEVNULL avoids leaving un-read pipe file objects
         # (which would trip the suite's warnings-as-errors as ResourceWarnings).
         proc = subprocess.Popen(
-            [binaries[impl], "-config", str(config_path), "-log-file", str(log_path)],
+            harness_argv(binaries[impl], config_path, log_path, control_sock),
             env=_clean_env(
                 socket_dir,
                 home,
@@ -602,22 +573,25 @@ def daemon(binaries, tmp_path_factory):
             stderr=subprocess.DEVNULL,
         )
 
-        # Readiness: the status socket file exists once the daemon has bound it.
-        deadline = time.monotonic() + 3.0
+        # Readiness: the control socket exists once the broker has spawned and the
+        # harness has bound it.
+        deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
-            if status_sock.exists():
+            if control_sock.exists():
                 break
             if proc.poll() is not None:
+                shutil.rmtree(socket_dir, ignore_errors=True)
                 raise AssertionError(
-                    f"{impl} daemon exited early rc={proc.returncode}\n"
+                    f"{impl} harness exited early rc={proc.returncode}\n"
                     f"oplog={_safe_read(log_path)}"
                 )
             time.sleep(0.02)
         else:
             proc.kill()
             proc.wait()
+            shutil.rmtree(socket_dir, ignore_errors=True)
             raise AssertionError(
-                f"{impl} daemon did not bind {status_sock} within 3s\n"
+                f"{impl} harness did not bind {control_sock} within 10s\n"
                 f"oplog={_safe_read(log_path)}"
             )
 
@@ -637,35 +611,42 @@ def daemon(binaries, tmp_path_factory):
         try:
             yield handle
         finally:
-            _shutdown(impl, proc, status_sock, desktop_sock)
-            shutil.rmtree(socket_dir, ignore_errors=True)
+            try:
+                _shutdown(impl, proc, control_sock, log_path)
+            finally:
+                shutil.rmtree(socket_dir, ignore_errors=True)
 
     return _make
 
 
-def _shutdown(impl, proc, status_sock, desktop_sock) -> None:
-    """SIGTERM the daemon, assert a clean exit 0, and assert both sockets unlinked.
+def _shutdown(impl, proc, control_sock, log_path) -> None:
+    """SIGTERM the harness and assert it drained: exit 0, the `harness drained` line in
+    its log (written only after the broker's every server group was drained) and the
+    control socket unlinked.
 
-    The daemon MUST still be running at teardown: an early exit (a crash after
+    The harness MUST still be running at teardown: an early exit (a crash after
     serving a request, say) would otherwise false-pass this "clean SIGTERM
     shutdown" check, since `proc.wait()` would just return the prior code."""
     assert proc.poll() is None, (
-        f"{impl} daemon already exited (rc={proc.returncode}) before SIGTERM — "
-        "a daemon must stay up until teardown; an early exit is a bug"
+        f"{impl} harness already exited (rc={proc.returncode}) before SIGTERM — "
+        "it must stay up until teardown; an early exit is a bug"
     )
     proc.send_signal(signal.SIGTERM)
     try:
-        rc = proc.wait(timeout=5)
+        # The harness waits at most 5s for the drain, then exits 3.
+        rc = proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        raise AssertionError(f"{impl} daemon did not exit within 5s of SIGTERM")
-    assert rc == 0, f"{impl} daemon exit={rc} on SIGTERM (want 0)"
-    assert not status_sock.exists(), (
-        f"{impl}: status socket not unlinked on shutdown: {status_sock}"
+        raise AssertionError(f"{impl} harness did not exit within 10s of SIGTERM")
+    oplog = _safe_read(log_path)
+    assert rc == 0, f"{impl} harness exit={rc} on SIGTERM (want 0)\noplog={oplog}"
+    assert DRAINED_LINE in oplog.splitlines(), (
+        f"{impl}: no {DRAINED_LINE!r} in the harness log: the broker did not drain "
+        f"before exit\noplog={oplog}"
     )
-    assert not desktop_sock.exists(), (
-        f"{impl}: desktop socket not unlinked on shutdown: {desktop_sock}"
+    assert not control_sock.exists(), (
+        f"{impl}: control socket not unlinked on shutdown: {control_sock}"
     )
 
 

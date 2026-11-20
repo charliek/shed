@@ -1,10 +1,30 @@
-# host-agent-diff — the shed-host-agent **wire** harness
+# host-agent-diff — the credential broker's **wire** harness
 
-The wire-contract gate for `shed-host-agent`. A hermetic pytest suite that spawns the
-real `crates/shed-host-agent` daemon binary and asserts its **wire-visible output,
-under a defined canonicalization, against committed goldens** in `goldens/` — plus the
-language-neutral **fixture vectors** in `fixtures/`, which pin the pure decision
-functions from the Rust crates and the Swift `ShedKitTests` alike.
+The wire-contract gate for the desktop app's credential broker. A hermetic pytest suite
+that spawns `shed-broker-harness` — the desktop app's embedded broker (shed-app's
+`broker` feature: the app's own config loader and bridge over `shed-broker`) in a
+**test-only** process, minus the app's Coordinator — and asserts its **wire-visible
+output, under a defined canonicalization, against committed goldens** in `goldens/`,
+plus the language-neutral **fixture vectors** in `fixtures/`, which pin the pure
+decision functions of the Rust crates.
+
+`crates/shed-broker-harness` is a workspace member but not a default member, and it
+ships in no release (its `tests/not_shipped.rs` fails if any crate depends on it or it
+becomes a default member). Its control socket stands where the app's Coordinator sits:
+`{"op":"status"}` returns the status JSON, `{"op":"subscribe"}` streams the approval
+requests and audit events the bridge sends the app (queued from spawn on), and
+`{"op":"decide",...}` hands a person's decision to the bridge (`control_client.py`).
+On SIGTERM it waits for the broker to drain every server group, writes
+`harness drained` to its log and exits 0; the `daemon` fixture asserts all three.
+
+**What went with the retired daemon (plan 037):** `shed-host-agent`'s desktop approval
+socket ("surface A": the handshake, supersede, replay, `token.get`/`credential.get`),
+its status socket and `status` command (the text render, exit codes), its socket
+lifecycle and its `version` command. Their cells and goldens were deleted; the values
+only the daemon produced (its desktop socket's `approval_request`/`event` frames, the
+`status` text, its start-up key listing's counts) were removed from the goldens that
+kept everything else, never re-recorded. Each gated cell still asserts in code the
+approval request the control client is shown.
 
 **Why the directory and the `make test-host-agent-diff` target still say "diff":** the
 harness began as a Go-vs-Rust *differential* — it ran both `shed-host-agent`
@@ -12,8 +32,8 @@ implementations side by side and asserted they agreed. When the Go daemon was re
 (plan 006), every one of those agreed values was recorded as a golden, so the suite kept
 its coverage and changed only what it compares against. "diff" now reads as **wire-diff
 against pinned goldens**, and each golden carries the strongest provenance available:
-*two independent implementations produced this exact value.* The names were kept rather
-than churned across six languages for a cosmetic gain.
+*two independent implementations produced this exact value*, and the app's broker
+produces it still.
 
 This is the **third** pytest suite in the repo and is **never merged** with
 `tests/integration/` (live server create-cycle) or `desktop/tools/shedtest/` (mock UI
@@ -30,7 +50,8 @@ make test-host-agent-diff
 ```
 
 That target (root `Makefile`) runs the live wire suite (the session fixture builds the
-daemon with `cargo build`) followed by the fixture-vector runners in each language.
+harness with `cargo build -p shed-broker-harness`) followed by the fixture-vector runners
+(`cargo test -p shed-broker golden`).
 
 The pytest leg needs **Rust (cargo) + Python/uv** — no Go toolchain. Install uv via
 `brew install uv`.
@@ -55,7 +76,7 @@ uv run pytest                        # assert (the default, and what CI runs)
 **When re-recording is legitimate:**
 
 - a **new cell** — it has no golden yet, so the first `UPDATE_GOLDEN=1` run creates one;
-- an **intended wire change** — you changed the daemon's output on purpose, the diff in
+- an **intended wire change** — you changed the broker's output on purpose, the diff in
   the failure message is what you meant, and the golden diff lands in the same commit as
   the code change, reviewed as part of it;
 - a **mask change** — a field moved between masked and pinned in `normalize.py`.
@@ -78,16 +99,18 @@ Three guards make the golden set self-maintaining, all enforced from `conftest.p
 
 ## Hermeticity
 
-Every test runs with no network and a fresh, isolated `$SHED_HOST_AGENT_SOCKET_DIR`
-(the two fixed sockets live there) **and** `$HOME` (so no real `~/.ssh` / `~/.shed` is
-read); `SSH_AUTH_SOCK` is stripped so the daemon falls back to an empty local-keys
-backend. The daemon writes its operational log to a per-test `-log-file` (that log is
-**not** a pinned surface — it was never comparable across implementations and is not
-a wire contract now). See `conftest.py`.
+Every test runs with no network but the synthetic bus on `127.0.0.1`, and a fresh,
+isolated `$SHED_HOST_AGENT_SOCKET_DIR` (the harness's control socket lives there),
+`$HOME` (so no real `~/.ssh` / `~/.shed` is read) and state dir; `SSH_AUTH_SOCK` is
+stripped so the broker falls back to an empty local-keys backend. A real broker answers
+for every server in its user's config, which is why the harness only ever runs it this
+way. The harness writes its operational log to a per-test `--log-file` (that log is
+**not** a pinned surface, beyond the few lines the machine-identity cells and the
+`harness drained` check look for). See `conftest.py`.
 
 ## Comparison model (D2) and normalization (D3)
 
-Both disciplines predate the goldens and now serve them: a cell normalizes the daemon's
+Both disciplines predate the goldens and now serve them: a cell normalizes the broker's
 output, and the normalized value is what gets recorded and asserted. "Diffed" below
 means "carried into the golden unmasked" — i.e. pinned byte-for-byte.
 
@@ -100,53 +123,46 @@ means "carried into the golden unmasked" — i.e. pinned byte-for-byte.
   kept), and each `servers[].namespaces[].since`. Every masked timestamp has its
   **RFC3339 shape asserted before** masking. Everything else (`schema`, `policies`,
   `gate_namespaces`, `approval_channel.consumer_connected`, `servers[]`) is diffed.
-  The surface-A desktop tests use `normalize.mask_hello_ack()` in the same spirit — it
-  masks a `hello_ack` frame's volatile `id`/`ts` (and, on an **accepted** ack, the
-  build `agent.version`, shape-asserted nonempty first) while diffing the rest
-  (`v`, `type`, `accepted`, `reason`, `agent.approval_method`, `namespaces`,
-  `gate_namespaces`, `request_timeout_ms`). A **superseded** (`accepted:false`) ack's
-  `agent` is the zero value `{"version":"","approval_method":""}`, so its empty
-  `version` is diffed as a stable constant, not masked. The surface-B bus test uses
-  `normalize.mask_bus_response()` in the same spirit — it masks a response Envelope's
+  The bus tests use `normalize.mask_bus_response()` in the same spirit — it masks a
+  response Envelope's
   volatile `id` (a fresh UUID per response) and `timestamp` (RFC3339 shape-asserted
   first) while **diffing** `in_reply_to` (the
   correlation id — it must echo the request's `id`, so it is asserted, never masked),
   `namespace`, `type`, `final`, `payload`, and the echoed `shed`.
 
-- **The gated cross-surface `sign` flow compares the ed25519 signature UNMASKED.** The
-  capstone `test_bus_sign_gated.py` drives one bus `sign` request → an
-  `approval_request` to the desktop consumer → (approve) a signature + audit `event` +
-  durable JSONL line, or (deny) `{approval denied, SIGN_FAILED}` + a `denied` audit.
+- **The gated `sign` flow compares the ed25519 signature UNMASKED.** The capstone
+  `test_bus_sign_gated.py` drives one bus `sign` request → an approval request to the
+  control client (the app's place) → (approve) a signature + durable JSONL line (also
+  fanned out as an audit `event`), or (deny) `{approval denied, SIGN_FAILED}` + a
+  `denied` audit.
   Because ed25519 signing is **deterministic** (RFC 8032 — the nonce is derived from
   key+message, not randomness), the `ed25519-dalek` backend, loading the committed
   `~/.ssh/id_ed25519` (`fixtures/test_ed25519`, installed by the `daemon` fixture) and
   signing the fixed data, always produces the SAME 64-byte blob — so
   `mask_bus_response` leaves `payload.blob` to be **diffed** (never
   masked/normalized-to-"present"), and it is additionally pinned inline as an absolute
-  constant (`EXPECTED_SIGN_BLOB_B64`). The surface-A
-  frames use `normalize.mask_approval_request()` (masks the volatile `id`/`ts`/
-  `expires_at`; diffs `namespace`/`op`/`shed`/`detail` and the single-server ABSENCE
-  of `server`) and `normalize.mask_event()` (masks `id`/`ts`; diffs `kind` + every
-  audit field, so the omitempty set — e.g. NO `detail`/`code` on a deny — is pinned);
-  the durable line uses `normalize.mask_audit_entry()` (masks `ts` only). Field *order*
-  in every frame is normalized away by `canonical()`; the sign blob is pinned, not
-  masked.
+  constant (`EXPECTED_SIGN_BLOB_B64`). The approval request the control client is
+  shown is asserted in code (`namespace`/`op`/`shed`/`detail`, the single-server
+  ABSENCE of `server`, RFC3339 `ts`/`expires_at`) and the audit `event` against the
+  durable line's fields, not golden-pinned; the durable line uses
+  `normalize.mask_audit_entry()` (masks `ts` only, so its omitempty set — e.g. NO
+  `detail`/`code` on a deny — is pinned). Field *order* is normalized away by
+  `canonical()`; the sign blob is pinned, not masked.
 
 ## Cross-language fixture vectors
 
 Distinct from `goldens/`. **`goldens/`** holds this suite's recorded wire values, one
 file per pytest cell, written and read only by `conftest.py`. **`fixtures/`** holds
 hand-authored, language-neutral `input → expected-output` vectors for the pure decision
-functions, and is consumed from several languages at once — the `shed-host-agent` and
-`shed-broker` crates, `shed-core-ffi`, `shed-app`, and the Swift `ShedKitTests` all read
-these same files. That shared consumption is the point; the directory is a neutral home,
-not a Python asset. (The Go runner, `cmd/shed-host-agent/golden_test.go`, reads every
-vector below as well and retires together with the Go daemon — that two-language
+functions, and is consumed from several crates at once — `shed-broker` and `shed-app`
+read these same files. That shared consumption is the point; the directory
+is a neutral home, not a Python asset. (The Go runner, `cmd/shed-host-agent/golden_test.go`,
+read every vector below as well until it retired with the Go daemon — that two-language
 agreement is the history the vectors and the goldens both carry.)
 
 `fixtures/effective_policy.json` and `fixtures/gate_namespaces.json` are vectors
 carrying `"protocol_version": 2`. The Rust runner
-(`crates/shed-host-agent/tests/golden.rs`) asserts `effective_policy_from_raw` /
+(`crates/shed-broker/tests/golden.rs`) asserts `effective_policy_from_raw` /
 `HostAgentConfig::gate_namespaces` match every vector.
 
 `fixtures/load_discovered_servers.json` (`"protocol_version": 1`) is `config.yaml text →
@@ -179,7 +195,7 @@ marshals as `[]` not `null`.
 `hadiff-test`) and committed so every run loads an identical key set — which is what makes
 the recorded signature blobs reproducible. They guard nothing and must never be reused
 anywhere real. The `daemon` fixture installs them into the
-daemon's isolated `<HOME>/.ssh/id_<algo>`; `fake_ssh_agent.py` also serves them as agent
+broker's isolated `<HOME>/.ssh/id_<algo>`; `fake_ssh_agent.py` also serves them as agent
 identities (real-signing ed25519, canned blobs for rsa/ecdsa).
 
 **Committed TLS pair (secure-bus cells).** `fixtures/synthetic_bus_{cert,key}.pem` is a
@@ -201,7 +217,11 @@ Everything in this section and the next is written from the **Go-vs-Rust port**,
 kept deliberately: it is the record of which contracts the Rust daemon closed, which it
 deliberately did not, and why — the reasoning behind values the goldens now freeze. Read
 the Go references here as history, not as a live comparison. The authoritative
-implementation is `crates/shed-host-agent` + `crates/shed-broker`.
+implementation is `crates/shed-broker` and shed-app's embedded bridge
+(`crates/shed-app/src/broker_bridge.rs`). The bullets that name the daemon's own
+surface — the status client and `test_status_not_running.py`, the replay ring and
+`test_replay.py`, `token.get` and `test_token_get.py` — describe cells that went with
+the daemon in plan 037.
 
 - **Config parsing & validation — STRUCTURAL sub-class retired; typed-decode residue
   documented-open.** The Rust config reader (`config.rs` `yaml_lite`) is now backed by
@@ -352,11 +372,13 @@ layer). They carry no cell — they are recorded here so the audit is complete, 
 
 ## Per-cell status table
 
-**Completeness (as of sub-plan 8):** every cell below is **enforced** (with the live test /
-golden runner / unit named), **out-of-scope(mechanism)** (with the owning mechanism named),
-or **deferred-to-3a.2(named)** (with the named follow-up) — **zero bare `xfail`s.** All three
-prior `xfail` cells (socket-dir rebind, event replay ring, sign timeout / no-consumer
-fail-closed) are now enforced; the accepted divergences above (D4/D5/D6/D7) carry no cell.
+**Completeness (as of sub-plan 8, trimmed in plan 037):** every cell below is
+**enforced** (with the live test / golden runner / unit named) or
+**out-of-scope(mechanism)** (with the owning mechanism named) — **zero bare `xfail`s.**
+The rows for the retired daemon's own surface (its `version` and `status` commands, its
+socket lifecycle and permissions, the desktop UDS server, the no-consumer fail-closed
+cell, `token.get`) went with it; the accepted divergences above (D4/D5/D6/D7) carry no
+cell.
 
 `enforced` = pinned (or smoke-asserted) now; `out-of-scope` = owned by a different
 mechanism (fixture vector / unit) or later slice, not the live suite. (`xfail` — a real
@@ -369,33 +391,22 @@ the cell asserted Go-vs-Rust equality and now asserts the recorded golden.
 
 | Axis | Cell | Status | Owning mechanism |
 |---|---|---|---|
-| CLI | `version` (exit 0 + nonempty stdout, smoke) | **enforced** | live (`test_version.py`) |
-| CLI | `status` not-running (exit 1 + masked stderr byte-pinned) | **enforced** | live (`test_status_not_running.py`) |
-| CLI | `status --bogus` / `--live` (exit 2 + stderr pinned) | **enforced** | live (`test_status_badarg.py`) |
-| CLI | `status --json` running (masked `LiveStatus`, pinned) | **enforced** | live (`test_status_running.py`) |
-| CLI | `status` text render running (masked equal) | **enforced** | live (`test_status_running.py`) |
-| status | the signing block (plan 035 §3.5; `ssh` in `status --json`: mode, `allow_users`, `key_filter`, `keys_offered`/`keys_available` once a listing has happened; the `SSH signing:` text block between the policies and the approval channel) | **enforced** | live (`test_status_running.py`, `test_config_inline_flow.py` goldens) + Rust unit (`status.rs`: additive, an older snapshot decodes; `status_server.rs`: one render per keys state) |
-| status | machine identity (`machine` block + `machine:` line; id/name shape-asserted then masked) | **enforced** | live (`test_status_running.py`, `test_config_inline_flow.py` goldens) + live behaviour cells (`test_machine_identity.py`: same id across a restart on one state dir, file 0600 in a 0700 dir; a file with no readable id copied aside and replaced with a WARN; a valid id with unreadable other fields kept and repaired; a newer schema with no readable id left untouched, the daemon running with `machine_error`; an uncreatable one leaves the daemon running with `machine_error`; the id mask's full match) + Rust unit (`machine.rs`: create/reload, a valid id kept whatever else is wrong, newer schemas never rewritten, a failed replacement never leaving the path empty, every created directory and the rename synced, a failed sync failing the write, forced create and repair races under the lock with bounded waits, concurrent creates, validators, hostname sanitising) |
-| bus | the machine pin (plan 035 §3.4): identity headers on every subscribe and respond; 403 `SOURCE_NOT_BOUND` → `not-source` naming the active machine, retried with no re-mint, then connected once accepted; 409 `SOURCE_DUPLICATE_STREAM` → `duplicate`, retried; any other 403 (another code, the released-broker code, an unparseable body) → plain `reconnecting`, never `not-source`; respond 503/429 with `Retry-After` re-sent then delivered; 403/413 sent once and audited `undelivered` (the server's own error body); the status text's hint and command | **enforced** | live (`test_source_pin.py` goldens and count cells; the bare 409 stays terminal in `test_servers.py`) + Rust unit (`bus.rs`: the classification table with negative controls, percent-encoding, the live loop per refusal, `retry_now`, the respond retry bounds, the undelivered audit; `supervisor.rs`: health and `retry_now`; `status_server.rs`: the hint) |
-| lifecycle | config-load error → exit 1 (exit code only) | **enforced** | live (`test_config_error.py`) |
-| lifecycle | SIGTERM → exit 0 + both sockets unlinked | **enforced** | live (`test_lifecycle.py`) |
-| socket | status socket bind + `0600` file perms | **enforced** | live (`conftest` daemon + `test_socket_perms.py`) |
-| socket | socket-dir `0700` re-chmod + stale-socket rebind | **enforced** | live (`test_socket_rebind.py`: pre-existing 0777 dir → 0700; stale AF_UNIX sockets at both fixed paths → unlinked + rebound, daemon answers) |
-| socket | live-socket / non-socket-file refuse (op-log-only, no wire consequence) | **out-of-scope(unit-owned)** | Rust unit (`sockets.rs::prepare_refuses_live_socket`, `prepare_refuses_non_socket_file`) |
+| status | the signing block (plan 035 §3.5; `ssh` in the status: mode, `allow_users`, `key_filter`, `keys_offered`/`keys_available` once a shed has listed keys — the app's broker lists none at spawn) | **enforced** | live (`test_config_inline_flow.py` golden) + Rust unit (`status.rs`: additive, an older snapshot decodes; `broker_bridge.rs`: no listing at spawn) |
+| status | machine identity (`machine` block; id/name shape-asserted then masked) | **enforced** | live (`test_config_inline_flow.py` golden) + live behaviour cells (`test_machine_identity.py`: same id across a restart on one state dir, file 0600 in a 0700 dir; a file with no readable id copied aside and replaced with a WARN; a valid id with unreadable other fields kept and repaired; a newer schema with no readable id left untouched, the broker running with `machine_error`; an uncreatable one leaves the broker running with `machine_error`; the id mask's full match) + Rust unit (`machine.rs`: create/reload, a valid id kept whatever else is wrong, newer schemas never rewritten, a failed replacement never leaving the path empty, every created directory and the rename synced, a failed sync failing the write, forced create and repair races under the lock with bounded waits, concurrent creates, validators, hostname sanitising) |
+| bus | the machine pin (plan 035 §3.4): identity headers on every subscribe and respond; 403 `SOURCE_NOT_BOUND` → `not-source` naming the active machine, retried with no re-mint, then connected once accepted; 409 `SOURCE_DUPLICATE_STREAM` → `duplicate`, retried; any other 403 (another code, the released-broker code, an unparseable body) → plain `reconnecting`, never `not-source`; respond 503/429 with `Retry-After` re-sent then delivered; 403/413 sent once and audited `undelivered` (the server's own error body) | **enforced** | live (`test_source_pin.py` goldens and count cells; the bare 409 stays terminal in `test_servers.py`) + Rust unit (`bus.rs`: the classification table with negative controls, percent-encoding, the live loop per refusal, `retry_now`, the respond retry bounds, the undelivered audit; `supervisor.rs`: health and `retry_now`) |
+| lifecycle | no config file → the app's synthesized default (`ssh-agent` delegated, no server watched) | **enforced** | live (`test_config_error.py`) |
+| lifecycle | SIGTERM → the broker drains every server group, then exit 0 + control socket unlinked | **enforced** | live (`conftest` `daemon` teardown, every cell: exit 0, `harness drained`) + Rust unit (`broker_bridge.rs` `shutdown_and_wait_returns_after_every_stream_is_drained`) |
+| harness | control socket: `0600`, concurrent status while a subscriber is attached, frames queued from spawn delivered on subscribe, one subscriber, `decide` | **enforced (unit)** | Rust unit (`shed-broker-harness` `control.rs`) |
 | config-validate | reject unknown/biometric policy, bad mode/timeout, malformed YAML, duplicate key, **map-valued `discovery.servers` (D3, exit-1)** | **enforced** | live (`test_config_validate.py`) + golden (`config_validate.json`, Rust runner; the D3 map-selector vectors pin the `discovery.servers must be` message) |
 | config-parse | **bool alternate forms (D2)** — `docker.allow_all` / `logging.enabled` resolve yaml.v3's YAML-1.1 bool token set (`yes/on/y/True/…`) identically; the yaml.v3-ERROR forms (`nonsense`/`1`/`0`/non-canonical-case) are the D6 residue (Go errors, Rust → `None`, pinned explicitly) | **enforced** | golden (`config_bool_forms.json`, Rust [`parse_yaml_bool`] runner) + Rust unit (`parse_yaml_bool_matches_yaml_v3_resolved_set`, `bool_alternate_forms_wire_through_reader`) + wire-visible `docker_resolve.json` (`allow_all: yes`/`True`/`no`) |
 | decision | `EffectivePolicy` (`""→deny-all`, echoes) | **enforced** | golden (Rust runner) |
 | decision | `desktopGateNamespaces` ordered gate list | **enforced** | golden (Rust runner) |
 | config-parse | inline-flow-style YAML (`{ ... }`) parsing (masked `LiveStatus` policies pinned) | **enforced** | live (`test_config_inline_flow.py`) |
-| desktop UDS server | hello/hello_ack handshake (masked, pinned) + non-hello first line dropped | **enforced** | live surface A (`test_desktop_handshake.py`, `test_desktop_first_non_hello_drops.py`) |
-| desktop UDS server | single-consumer last-writer-wins supersede (`accepted:false, reason:"superseded"`, old closed) | **enforced** | live surface A (`test_desktop_supersede.py`) |
-| desktop UDS server | `token.get` → `token.response` (masked; `token`+`expires_at` pinned UNMASKED via the PATH-shim mint) | **enforced** | live surface A (`test_token_get.py`) |
-| desktop UDS server | event fan-out + approval request/response correlation (driven by the gated `sign`) | **enforced** | live surface A+B (`test_bus_sign_gated.py`) |
-| desktop UDS server | event replay ring (`replay_events` on connect) | **enforced** | live surface A+B (`test_replay.py`: a non-gated ssh `list` buffers an `event` in the ring with NO consumer connected, then a consumer connects with `replay_events:N` → the buffered frame is replayed and pinned via `mask_event` [id/ts masked], then a live `list` fans out to the connected consumer) |
-| approval | gated `sign` delegated approve/deny (deterministic ed25519 blob pinned UNMASKED) | **enforced** | live surface A+B (`test_bus_sign_gated.py`) |
-| approval | gated `sign` timeout / no-consumer fail-closed | **enforced** | live surface A+B (`test_bus_sign_gated.py`: `test_bus_sign_no_consumer_fails_closed` [no consumer → immediate `{approval denied, SIGN_FAILED}` + a no-`decided_by` denied audit] + `test_bus_sign_timeout_fails_closed` [silent consumer + `approval_timeout:1s` → timeout deny, same shape]); the Rust units `approval_without_consumer_denies_no_decision`/`approval_times_out_denies` stay the fast pin |
+| approval | event fan-out + approval request/response correlation (driven by the gated `sign`; the request the control client is shown and the event asserted in code) | **enforced** | live (`test_bus_sign_gated.py`) |
+| approval | gated `sign` delegated approve/deny (deterministic ed25519 blob pinned UNMASKED) | **enforced** | live (`test_bus_sign_gated.py`) |
+| approval | gated `sign` timeout fail-closed | **enforced** | live (`test_bus_sign_gated.py::test_bus_sign_timeout_fails_closed`: a control client that never decides + `approval_timeout:1s` → timeout deny, a no-`decided_by` denied audit) + Rust unit (`broker_bridge.rs` `timeout_fails_closed_and_drops_the_corpse`) |
 | approval | native Touch-ID (biometrics) | **out-of-scope** | separate manual sign-off (needs live biometric) |
-| bus | subscribe → ping → respond (open) ping/pong (masked, pinned) | **enforced** | live surface B (`test_bus_ping_pong.py`) |
+| bus | subscribe → ping → respond (open) ping/pong (masked, pinned) | **enforced** | live (`test_bus_ping_pong.py`) |
 | bus | secure (TLS-pin) subscribe/respond, 401/409, reconnect | **enforced** | live surface B (`test_secure_bus.py`: a `discovery:`-config secure server, committed-cert TLS pin, minted-Bearer subscribe, 401→re-mint→reconnect, wrong-pin fails closed) + `bus.rs` unit (409-rejected + pin/401 machinery) |
 | bus | aws-credentials subscription (when configured) | **enforced** | live surface B (`test_aws_backend.py`: `wait_for_subscribe("aws-credentials")`) |
 | bus | docker-credentials subscription (even unconfigured) | **enforced** | live surface B (`test_docker_backend.py`: `wait_for_subscribe("docker-credentials")`, incl. the unconfigured cell) |
@@ -414,7 +425,7 @@ the cell asserted Go-vs-Rust equality and now asserts the recorded golden.
 | ssh backend · agent-forward | `list` (3 fake identities pinned + audit + fake transcript pinned) | **enforced** | live (`test_ssh_backend.py` + `fake_ssh_agent.py`) |
 | ssh backend · agent-forward | `sign` ed25519 (fake real-signs → blob UNMASKED) + `sign` rsa flags=2 (canned blob byte-equal, transcript `flags==2` passthrough) | **enforced** | live (`test_ssh_backend.py`) |
 | ssh backend · agent-forward | `status` (`mode:"agent-forward"`, extra REQUEST_IDENTITIES on the transcript) | **enforced** | live (`test_ssh_backend.py`) |
-| signing check (plan 035 §3.5) | every `sign` cell sends real data: an exact login for `git` (fixed session id, `sign_payloads.py`). Signed after the prompt: a `git` login, a `git` SSHSIG, a `deploy` login once `ssh.allow_users` lists it with `ssh.offer_keys`. Declined before the gate (zero `approval_request` frames to the consumer, `{sign operation failed, SIGN_FAILED}` to the shed, a `refused` audit line + `event` with the class in `reason`, code `SIGN_REFUSED`, approval `none`): another username, `_bootstrap`, the old arbitrary challenge, a trailing byte, SSHSIG namespace `file`, RSA flags that disagree with the payload (and flags 6), a key that is not offered | **enforced** | live (`test_bus_sign_refused.py`, `test_ssh_backend.py` `*_unoffered_key`) + Rust unit (`bus.rs`: one case per refusal class with counting gate and backend doubles, the order, the refusal-audit limit; `sign_check.rs`: the parser, a listed `_` name, the real OpenSSH vectors). A LISTED `_` name is unit-only: config load refuses it |
+| signing check (plan 035 §3.5) | every `sign` cell sends real data: an exact login for `git` (fixed session id, `sign_payloads.py`). Signed after the prompt: a `git` login, a `git` SSHSIG, a `deploy` login once `ssh.allow_users` lists it with `ssh.offer_keys`. Declined before the gate (zero approval requests shown to the control client, `{sign operation failed, SIGN_FAILED}` to the shed, a `refused` audit line + `event` with the class in `reason`, code `SIGN_REFUSED`, approval `none`): another username, `_bootstrap`, the old arbitrary challenge, a trailing byte, SSHSIG namespace `file`, RSA flags that disagree with the payload (and flags 6), a key that is not offered | **enforced** | live (`test_bus_sign_refused.py`, `test_ssh_backend.py` `*_unoffered_key`) + Rust unit (`bus.rs`: one case per refusal class with counting gate and backend doubles, the order, the refusal-audit limit; `sign_check.rs`: the parser, a listed `_` name, the real OpenSSH vectors). A LISTED `_` name is unit-only: config load refuses it |
 | ssh backend · mode resolution | unknown `ssh.mode` → exit 1 (single-server AND `discovery:` config shapes) | **enforced** | live (`test_ssh_mode_error.py`) |
 | ssh backend | response payload shapes (`list`/`sign`/`status`/`error`: tag names, b64 pass-through, `rest:""`, empty-list `[]` not `null`) | **enforced** | golden (Rust runner on `ssh_payload_shapes.json`) |
 | ssh backend | agent-client wire (framing/failure/oversize/wedged bounds), flag-bit matrix, resolve matrix, missing/encrypted skip, unknown-op/invalid-payload strings, list-error audit | **enforced (unit)** | Rust unit (`ssh_backend*.rs`, `bus.rs`) + fake-seam self-test (`test_fake_ssh_agent.py`) |
@@ -423,11 +434,9 @@ the cell asserted Go-vs-Rust equality and now asserts the recorded golden.
 | aws backend | response payload shapes (`get_credentials`/`status`/`ping`/`error`: tag names, `expiration`/`cached_until` omitempty) + per-namespace gate selection | **enforced (unit)** | Rust unit (`bus.rs`: `aws_*`, incl. `aws_uses_aws_gate_not_ssh`, `aws_payload_tag_names_match_protocol`) |
 | docker backend | `get` inline-auth (payload+audit) / helper (transcript diffed + payload + ok audit) / not-allowed (backend REGISTRY_NOT_ALLOWED) / approval-deny (guest REGISTRY_NOT_ALLOWED + audit APPROVAL_DENIED, the two-code split) / not-found→anonymous (guest CREDENTIALS_NOT_FOUND + audit anonymous) / `list` (positional `count:N`) / `status` / `ping` / unknown-op / **unconfigured** (still subscribes + denies) | **enforced** | live (`test_docker_backend.py`, fake `docker-credential-testhelper` seam + self-test) |
 | docker backend | `resolve` layering (Option registries/allow_all, flow-list), `normalize_registry` (one-occurrence strip), inline-auth decode, PATH augment (append), helper-exec seam (abs-resolve, 5s timeout, PascalCase-avoidance tag guard) | **enforced (golden+unit)** | golden (`docker_resolve`/`docker_normalize`/`docker_inline_auth`/`docker_path_augment` runners) + Rust unit (`docker_backend.rs`, `bus.rs` docker handler incl. `docker_uses_docker_gate_not_ssh_or_aws`, `docker_payload_tag_names_match_protocol`) |
-| minter | control-scope argv + success `token.response` | **enforced** | live (`test_token_get.py`: `token`/`expires_at` pinned + argv == expected vector, `<scope>` == `control`) |
 | minter | host-key-mismatch terminal; single-flight; refresh cadence | **enforced (unit)** | unit parity (`minter.rs` / `bootstrap.rs`, incl. real-runner shell-shim tests) |
 | minter | `load_discovered_servers` shape (ssh_port=0-vs-22, empty-host skip, sort) | **enforced (golden)** | Rust golden runner on `fixtures/load_discovered_servers.json` |
 | minter | credentials-scope live bus drive | **enforced** | live surface B (`test_secure_bus.py::test_secure_bus_credentials_mint`: a secure discovery server self-mints a credentials-scope token over the PATH-shim `ssh` and presents `Bearer <minted>` on the TLS-pinned bus subscribe) |
-| minter | malformed `~/.shed/config.yaml` error (outer `reading server config:` prefix) | **enforced** | live (`test_token_get.py::test_token_get_malformed_shed_config`) |
 | supervisor | reconcile / restart-on-cred-or-TLS-change | **enforced** | golden (`should_mint.json`, Rust runner) + Rust unit (`supervisor.rs`: `reconcile_{add_remove,no_churn,url_change,credential_or_pin_change,dedup}`, `shutdown`, `health`, the fake-group factory) — reconcile/restart is fake-group-owned (no wire surface); `should_mint` is the wire-visible half |
 | discovery | off / poll / fsnotify | **enforced** | live (`test_discovery.py`: `poll` convergence within a deadline + `off` no-reload, `servers[]` names pinned) + `watcher.rs` `notify`-backed unit smoke (the production `fsnotify` default; the live cells drive POLL for determinism) + golden (`load_discovered_servers.json`) |
 | concurrency | single-flight mint, drop-on-full fan-out | **out-of-scope** | unit parity |

@@ -1,10 +1,12 @@
 """This machine's identity (plan 035 §3.4): `<state>/host-agent/machine.json`, created on
-first start, read unchanged on every later one, and shown in `status`.
+first start, read unchanged on every later one, and shown in the status.
 
 Not golden cells — the id is random per state dir and the name comes from the host's
 hostname, so what these pin is the behaviour (stable across restarts, replaced when
-corrupt, a daemon that keeps running without one) rather than a recorded value. The
-masked shape of the `machine` block is pinned by `test_status_running.py`'s goldens.
+corrupt, a broker that keeps running without one) rather than a recorded value. The
+masked shape of the `machine` block is pinned by `test_config_inline_flow.py`'s golden.
+The log lines asserted are the broker's own (the bridge logs them with the same
+`WARN  `/`ERROR ` prefixes the retired daemon used).
 """
 
 from __future__ import annotations
@@ -27,17 +29,11 @@ def _machine_file(state_dir) -> str:
     return os.path.join(str(state_dir), "host-agent", "machine.json")
 
 
-def _status_json(d) -> dict:
-    r = d.status(json=True)
-    assert r.returncode == 0, f"status --json exit {r.returncode}\n{r.stderr}"
-    return json.loads(r.stdout)
-
-
 def test_machine_id_stable_across_restart(daemon, watch_none_config, tmp_path):
     state_dir = tmp_path / "state"
 
     with daemon("rust", watch_none_config, state_dir=state_dir) as d:
-        first = _status_json(d)
+        first = d.status()
         oplog = d.read_log()
     machine = first.get("machine")
     assert machine is not None, f"no machine block: {first}"
@@ -45,7 +41,7 @@ def test_machine_id_stable_across_restart(daemon, watch_none_config, tmp_path):
     assert "machine_error" not in first, first
     assert "machine identity created" in oplog, oplog
 
-    # The file the daemon wrote: 0600 in a 0700 dir, and it says what status said.
+    # The file the broker wrote: 0600 in a 0700 dir, and it says what status said.
     path = _machine_file(state_dir)
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     assert stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode) == 0o700
@@ -55,15 +51,13 @@ def test_machine_id_stable_across_restart(daemon, watch_none_config, tmp_path):
     assert on_disk["id"] == machine["id"]
     assert on_disk["name"] == machine["name"]
 
-    # A second start on the same state dir (a fresh daemon, a fresh HOME and socket
+    # A second start on the same state dir (a fresh broker, a fresh HOME and socket
     # dir) is the same machine.
     with daemon("rust", watch_none_config, state_dir=state_dir) as d:
-        second = _status_json(d)
-        text = d.status(json=False).stdout
+        second = d.status()
         oplog = d.read_log()
     assert second["machine"] == machine
     assert "machine identity created" not in oplog, oplog
-    assert f"machine:  {machine['name']} ({machine['id']})" in text.splitlines(), text
 
 
 def test_corrupt_machine_file_is_replaced_not_fatal(daemon, watch_none_config, tmp_path):
@@ -74,7 +68,7 @@ def test_corrupt_machine_file_is_replaced_not_fatal(daemon, watch_none_config, t
         f.write("{not json")
 
     with daemon("rust", watch_none_config, state_dir=state_dir) as d:
-        status = _status_json(d)
+        status = d.status()
         oplog = d.read_log()
 
     machine = status.get("machine")
@@ -99,18 +93,15 @@ def test_daemon_runs_without_an_identity_it_cannot_create(
     os.chmod(state_dir, 0o500)
     try:
         with daemon("rust", watch_none_config, state_dir=state_dir) as d:
-            status = _status_json(d)
-            text = d.status(json=False).stdout
+            status = d.status()
             oplog = d.read_log()
     finally:
         os.chmod(state_dir, 0o700)
 
-    # The daemon started and serves status; it just has no identity, and says why.
+    # The broker started and serves status; it just has no identity, and says why.
     assert "machine" not in status, status
     assert status["machine_error"], status
     assert "ERROR machine identity unavailable; continuing without one" in oplog, oplog
-    lines = [line for line in text.splitlines() if line.startswith("machine:")]
-    assert lines == [f"machine:  unavailable: {status['machine_error']}"], text
 
 
 def _write_machine_file(state_dir, text: str) -> str:
@@ -131,7 +122,7 @@ def test_a_valid_id_with_unreadable_fields_is_kept(daemon, watch_none_config, tm
     )
 
     with daemon("rust", watch_none_config, state_dir=state_dir) as d:
-        status = _status_json(d)
+        status = d.status()
         oplog = d.read_log()
 
     assert status["machine"]["id"] == _KEPT_ID, status
@@ -151,21 +142,19 @@ def test_a_newer_schema_without_a_readable_id_is_left_alone(
     daemon, watch_none_config, tmp_path
 ):
     """A newer build's file is never rewritten, moved or replaced. With no id this build
-    can read, the daemon runs without an identity and says which schema it found."""
+    can read, the broker runs without an identity and says which schema it found."""
     state_dir = tmp_path / "state"
     text = json.dumps({"schema": 2, "id": {"hex": _KEPT_ID}, "name": "desk"})
     path = _write_machine_file(state_dir, text)
 
     with daemon("rust", watch_none_config, state_dir=state_dir) as d:
-        status = _status_json(d)
-        rendered = d.status(json=False).stdout
+        status = d.status()
         oplog = d.read_log()
 
     assert "machine" not in status, status
     err = status["machine_error"]
     assert "newer build (schema 2)" in err and "left as it is" in err, status
     assert "ERROR machine identity unavailable; continuing without one" in oplog, oplog
-    assert f"machine:  unavailable: {err}" in rendered.splitlines(), rendered
     with open(path, encoding="utf-8") as f:
         assert f.read() == text
     assert not os.path.exists(path + ".corrupt")

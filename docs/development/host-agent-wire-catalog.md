@@ -1,10 +1,16 @@
-# shed-host-agent — Wire-Visible Behavior Catalog
+# Credential broker: wire-visible behaviour catalog
 
-**Authority.** The Rust implementation (`crates/shed-host-agent`, `crates/shed-broker`)
-is authoritative for shed-host-agent's wire-visible behavior. Its executable contract
-coverage is the goldens + fixture vectors under `tests/host-agent-diff/` (see that
-directory's README) — those, not this document, are what a behavior change must keep
-green.
+**Authority.** The Rust implementation — `crates/shed-broker` plus shed-app's embedded
+bridge (`crates/shed-app/src/broker_bridge.rs`, the desktop app's in-process broker) —
+is authoritative for the credential broker's wire-visible behaviour. Its executable
+contract coverage is the goldens + fixture vectors under `tests/host-agent-diff/` (see
+that directory's README), which run the app's broker in the test-only
+`crates/shed-broker-harness` process — those, not this document, are what a behaviour
+change must keep green.
+
+The retired `shed-host-agent` daemon's own surfaces — its desktop approval socket, its
+status socket and `status` command, and its CLI and socket lifecycle — went with the
+daemon (plan 037), and so did their sections here. "The agent" below is the broker.
 
 This document predates the Rust port and was written against the Go daemon
 (`cmd/shed-host-agent`), which was retired in plan 006. Every `file.go:line` citation
@@ -27,19 +33,16 @@ Protocol/const source of truth: `internal/ext/protocol/{ssh,aws,docker}.go`
 |---|---------|-----------|----------------------|--------|
 | 1 | **Bus responses** | agent → shed-server | SDK `HostClient.Respond` HTTP POST to the server bus (subscribed via SSE) | `sdk.Envelope` (JSON) with a per-namespace payload |
 | 2 | **Durable audit log** | agent → disk | file at `cfg.logging.path` (default `~/.local/share/shed/extensions-audit.log`) | one `AuditEntry` JSON object per line (JSONL), `json.Encoder` `\n`-terminated (`audit.go:80,113`) |
-| 3 | **Desktop approval channel** | agent ↔ app | UDS `<socketDir>/host-agent.sock`, perms `0600` | newline-delimited typed JSON frames (`desktop_protocol.go`) |
-| 4 | **Status socket** | agent → any client | UDS `<socketDir>/host-agent-status.sock`, perms `0600` | one `LiveStatus` JSON blob per connection, then close (`status_server.go:97`) |
-| 5 | **`status` subcommand** | CLI → stdout | reads channel 4 | `LiveStatus` pretty-JSON (`--json`) or text report; **process exit code** 0/1/2 |
-| 6 | **Operational log** | agent → stderr or file | `-log-file` → lumberjack-rotated file, else stderr | `slog` text lines (loose; not a good diff target) |
+| 3 | **Approval requests and audit events to the app** | broker → app | in-process: the bridge's event stream to the app's Coordinator (the harness's control socket stands in for it, `{"op":"subscribe"}`) | `approval_request` / `event` frames |
+| 4 | **Status** | broker → app | in-process: `LiveStatus` (§4.1; the harness serves it as `{"op":"status"}`; the app reports the same `servers`, `machine` and `ssh` in `broker.status`) | one JSON object |
+| 6 | **Operational log** | broker → the app's log | the app's log file (`--log-file` in the harness) | text lines (loose; not a good diff target) |
 | 7 | **Egress SSE consumer** | agent → shed-server | HTTP `GET /api/egress/stream` | observable *request*: method, path, `Accept: text/event-stream`, `Authorization: Bearer` |
 | 8 | **SSH mint subprocess** | agent → `ssh` | `exec` of system `ssh` (via `sdk/bootstrap`) | observable *argv* + stdin/stdout contract |
 | 9 | **Docker helper subprocess** | agent → `docker-credential-<h>` | `exec ... get`, serverURL on stdin | observable argv + stdin + parsed stdout |
-| 10 | **Process lifecycle** | OS | signals / exit | exit codes 0/1/2; socket file teardown |
+| 10 | **Shutdown** | app | the app's exit (the harness: SIGTERM) | every server group drained before exit (§10.3) |
 
-`socketDir()` (`sockets.go:21`): `$SHED_HOST_AGENT_SOCKET_DIR` if set; else darwin
-`~/Library/Application Support/shed`; else `$XDG_RUNTIME_DIR/shed`; else
-`~/.local/share/shed`. **The two socket paths are NOT configurable** — fixed
-public interface; only the dir env override exists.
+(`LiveStatus.approval_channel.socket_path` still names `<socketDir>/host-agent.sock`,
+`$SHED_HOST_AGENT_SOCKET_DIR` if set, until the field is removed; nothing listens there.)
 
 ---
 
@@ -47,22 +50,18 @@ public interface; only the dir env override exists.
 
 These vary run-to-run and MUST be masked. Grouped by channel.
 
-**Audit JSONL (channel 2) / desktop `event` frame (channel 3):**
+**Audit JSONL (channel 2) / the app's `event` frame (channel 3):**
 - `ts` — RFC3339 `time.Now().UTC()` stamped in `LogEntry` if unset (`audit.go:106`). VOLATILE. (Exception: egress entries carry the server-supplied `ts` — still wall-clock.)
 - `detail` — VOLATILE **only for AWS ok** (`awsExpiryDetail` → `expires:15:04` / `expires:none`, `aws_handler.go:168`) and **SSH list** (`"N keys"`). Docker/SSH-sign details are stable (registry / key type).
 - `ttl` — config-derived (`4h`), stable per config, but treat as env-derived.
 
-**Desktop frames (channel 3, `desktop_protocol.go`):**
-- `id` — UUIDv7 `newID()` on every outbound frame (`hello_ack`, `approval_request`, `event`, `ping`, `token.response`). VOLATILE.
-- `ts` — RFC3339 UTC `nowRFC3339()`. VOLATILE (except `event.ts`, which echoes the audit entry's `ts`).
-- `expires_at` — `approval_request` = `now + timeout`; `token.response` = mint expiry. VOLATILE.
-- `agent.version` / `hello_ack` version — build-version string. VOLATILE.
-- `request_timeout_ms` — stable per config (`int(timeout/ms)`).
+**Approval requests to the app (channel 3):**
+- `id` — a fresh UUID per request; `ts` — RFC3339 UTC send time; `expires_at` — `now + approval_timeout`. VOLATILE.
 
-**Status (channels 4/5, `status.go`/`status_server.go`):**
-- `pid` (`os.Getpid()`), `started_at`, `written_at` (snapshot time), `version`, per-namespace `since` (RFC3339). All VOLATILE.
+**Status (channel 4):**
+- `pid`, `started_at`, `written_at` (snapshot time), `version`, per-namespace `since` (RFC3339). All VOLATILE.
 - `config_path` — absolute path, env-dependent. VOLATILE.
-- `machine.id` (a random 32-hex id per state dir) and `machine.name` (from the host's hostname). VOLATILE; the harness asserts their shape (§4.1) before masking them to `<machine_id>` / `<machine_name>`, in the JSON and on the text render's `machine:` line.
+- `machine.id` (a random 32-hex id per state dir) and `machine.name` (from the host's hostname). VOLATILE; the harness asserts their shape (§4.1) before masking them to `<machine_id>` / `<machine_name>`.
 - `schema` — constant `1` (stable; a mismatch is a hard reject).
 
 **Bus response payloads (channel 1):**
@@ -134,28 +133,24 @@ approval-detail; `audit.go:87`) and `LogEntry(entry)` (full, used by gated ops).
 - **No rotation** for the audit file (append-only forever). The *operational* log (`-log-file`) rotates via lumberjack (10 MB, 5 backups, 30 days, compress; `logging.go:20`) — separate file.
 - Disabled logging (`enabled:false`) or open failure → **no-op logger**, no file, no panic (`audit.go:60,72`; `audit_test.go:54`).
 
-### 3.3 Audit → desktop event fan-out (`desktop_server.go:421-448`)
+### 3.3 Audit → the app's activity stream
 
-Every `LogEntry`/`Log` publishes to in-process subscribers (`audit.go:117,145`,
-non-blocking, drops on a full 256-buffer channel). The desktop server maps each
-`AuditEntry` → an `event` frame **1:1**:
-
-```
-eventMsg{ v:2, type:"event", id:<newID>, ts:entry.Timestamp, kind:"audit",
-  server, shed, ns:entry.Namespace, op:entry.Operation,
-  result, detail, code, reason, approval, decided_by, scope, ttl }
-```
-
-Field-for-field copy; only `id` (fresh UUIDv7) and the fixed `v/type/kind` are
-added. `ts` is the audit entry's own timestamp (NOT re-stamped). Ring buffer of
-last **100** events for replay (`ringMax=100`, `desktop_server.go:171,438`).
-Fan-out happens even when file logging is disabled (`audit.go:104` comment).
+Every entry the durable sink writes is also fanned out, after the file line
+(`JsonlAuditSink`, the `AuditFanout` seam; even when file logging is disabled). In the
+app the bridge maps each entry to an `event` frame on its event stream
+(`audit_entry_to_event_frame`: `server`, `shed`, `ns`, `op`, `result`, `detail`,
+`code`, `reason`, `approval`, `ts` — the entry's own timestamp, not re-stamped — with
+empty fields left out; `decided_by`, `scope` and `ttl` stay in the durable line). The
+retired daemon's desktop-socket `event` frame, and its replay ring, went with it.
 
 ---
 
-## 4. Status (`status.go`, `status_server.go`, `sockets.go`, `status_test.go`)
+## 4. Status (`status.go`, `status_server.go`, `status_test.go`)
 
-### 4.1 `LiveStatus` JSON (`status_server.go:25-60`) — emitted by channel 4/5
+### 4.1 `LiveStatus` JSON (`status_server.go:25-60`) — channel 4
+
+`shed_broker::status::build_live_status` builds it; the harness serves it for
+`{"op":"status"}` (`version` = `shed-broker-harness`, no `approval_channel` consumer).
 
 ```jsonc
 {
@@ -206,22 +201,13 @@ Fan-out happens even when file logging is disabled (`audit.go:104` comment).
 - `policies` keys are always the 3 credential namespaces (`status_server.go:81`).
 - `state` ∈ `connected|reconnecting|stopped` (also `rejected` in the SDK), from `sdk/hostclient.go:28-34` `ConnConnected/ConnReconnecting/ConnStopped/ConnRejected` → the health snapshot maps `client.Status()` (`supervisor.go:243`). Plan 035 adds three non-terminal states, Rust only: `not-source`, `duplicate` and `yielding` (§9b; `yielding` only in the daemon, while the desktop app's embedded broker holds its lock).
 - `active_source` (plan 035, additive under schema 1, omitted otherwise so every pre-pin golden is unchanged): on a namespace, the machine a `403 SOURCE_NOT_BOUND` named as the active credential source, exactly as the server sent it (control and Unicode format characters dropped, at most 64 bytes each); on a server, the first such namespace's, so the server row reads as not the source when any of its namespaces is.
-- `ssh` (plan 035, Rust only, additive under schema 1): what this machine signs for a shed — the policy built once at start from `ssh.allow_users` and `ssh.offer_keys` (§5.2), the backend mode, and the key filter's counts from the LAST `list` (local keys are listed at start-up, so they are counted at once; a forwarded agent is not asked until a shed asks, so its counts are absent until then). The desktop app's embedded broker reports the same object as `broker.status.ssh` (null outside embedded mode or before the broker started).
+- `ssh` (plan 035, Rust only, additive under schema 1): what this machine signs for a shed — the policy built once at start from `ssh.allow_users` and `ssh.offer_keys` (§5.2), the backend mode, and the key filter's counts from the LAST `list` (the app's broker lists no keys at start-up, so the counts are absent until a shed first lists keys; the retired daemon listed local keys at start-up). The desktop app's embedded broker reports the same object as `broker.status.ssh` (null outside embedded mode or before the broker started).
 - `buildLiveStatus` (`status_server.go:65`) composes it: policies from `cfg.*.Approval.EffectivePolicy()`, gate list from `desktopGateNamespaces(cfg)`, approval-channel from `desktop.ConsumerInfo()`, servers from `sup.Health()`.
 - `machine` / `machine_error` (plan 035, Rust only — added after the Go daemon's retirement, additive under schema 1): this machine's identity from `<state dir>/host-agent/machine.json` (`shed_broker::machine`), the file the daemon and the desktop app's embedded broker share. Loaded once at start, before any socket binds. The id and the schema are read on their own first, so an id that can be read is never thrown away. Missing → created; a valid id with any other field missing, `null`, of the wrong type or malformed → the id kept and the rest repaired (a WARN line); a newer schema → never rewritten, moved or replaced: its id is used if it can be read, otherwise the daemon runs without one and `machine_error` names the schema; no readable id at all → copied to `machine.json.corrupt` and replaced in one atomic rename (a WARN line: servers will see a new machine); unreadable, impossible to create, or a write whose fsync (file, directory, or a directory it created) fails → the daemon runs without one and `machine_error` says why, and `machine.json` is never left missing by a failed replacement. Nothing here stops the daemon from starting, matching the credential store. Every bus request carries it (§9b).
 
-### 4.2 Status socket behavior (`status_server.go:97`, `sockets.go`)
-
-- Read-only: per connection, write `LiveStatus` JSON then close. 5s write deadline. Separate from the approval socket (a status query never becomes the approval consumer).
-- `bindUnixSocket` ceremony (shared, `desktop_server.go:65`): dir `0700`, `prepareSocketPath` refuses to clobber a **live** socket or a non-socket file, removes a **stale** one, binds, chmods `0600`. Stale detection = `net.DialTimeout` 500 ms probe (`desktop_server.go:23,27`).
-
-### 4.3 `status` subcommand (`status.go:28`, `main.go:54`)
-
-- Dials the status socket (2s). Not running → stderr message + **exit 1** (`status.go:32`).
-- Decodes `LiveStatus`; `schema != 1` → stderr skew message + **exit 1** (`status.go:48`).
-- `--json`/`-json` → indented `LiveStatus` (exit 0). Else `renderStatus` text (exit 0).
-- Unknown arg or removed `--live` → stderr + **exit 2** (`main.go:61-66`).
-- `renderStatus` text landmarks (good for text golden, `status_test.go:108-122`): `shed-host-agent status (pid N, <ver>)`, `machine:  <name> (<id>)` (or `machine:  unavailable: <error>`) right after `started:`, `Approval policies:`, `(decided in shed-desktop)` for gated ns, then (plan 035, when the snapshot has `ssh`) an `SSH signing:` block — `  mode   <mode>`, `  users  <a, b>` (`(none)` when empty), `  keys   N offered (no ssh.offer_keys filter)` / `N of M offered (ssh.offer_keys)` / `not listed yet (…)` — and a blank line before `Approval channel:`, `none connected (shed-desktop-policy requests fail closed)`, `Servers (N):`, `(none being watched)`, per-ns marks `ok`/`-`/`x` (`connMark`, `status.go:141`; `not-source` and `yielding` are `-`, `duplicate` is `x`). Under a server with any `not-source` namespace, two more lines (plan 035): `    this machine is not the credential source here; the active source is <name>` and `    to make this machine (<this machine's name>) the source: shed [-s <server> ]source use -- <this machine's 32-hex id>` (the command names the machine by its full id, never its name: two of a user's machines can share a name and the CLI refuses an ambiguous one; the name is on the same line so a person sees which machine it is; the server is one shell word: bare only when non-empty and made of ASCII letters, digits, `.`, `_` and `-`, single-quoted otherwise; `-s` omitted for the unnamed single-server target; the second line omitted when this machine has no identity). No new host-agent verb.
+The daemon's status socket and its `status` command (exit codes, the text render) went
+with the daemon (plan 037); the app shows the same snapshot in Preferences and
+`broker.status`.
 
 ---
 
@@ -494,7 +480,7 @@ more authentication methods` → `ErrNoSSHIdentities` (retryable). ctx cancel/ti
 ### 7.2 CONTROL vs CREDENTIALS
 
 - `scopeCredentials` — the agent's own bus brokering credential (secure servers). Attached via **both** `sdk.WithTokenProvider` and `sdk.WithClientCertificates` in `busClientOptions` when `shouldMint` (`supervisor.go`): one object serving both interfaces, because a bearer token and a client certificate are two shapes of the same credential and only the server knows which is current.
-- `scopeControl` — used for (a) the egress SSE stream (control-scoped route) and (b) the desktop's `credential.get`/`token.get` on the app's behalf (`controltoken.go`).
+- `scopeControl` — used for (a) the egress SSE stream (control-scoped route) and (b) the app's own control credential, minted on its behalf (`controltoken.go`).
 - Difference is only the `Scope` param in the argv + a distinct `credentialSource`. **One certificate carries one scope**, so in mtls mode these are two genuinely different certificates, not one credential used twice.
 
 ### 7.2b The two mint entry points
@@ -502,7 +488,7 @@ more authentication methods` → `ErrNoSSHIdentities` (retryable). ctx cancel/ti
 | entry point | keypair | used by | result |
 |---|---|---|---|
 | `CredentialMinter.Mint` → `sdkbootstrap.RunCredential` | generated HERE, per mint | the agent's own bus + egress credentials | `sdk.Credential` — token, or certificate **+ the matching key** |
-| `CredentialMinter.MintRelayed` → `sdkbootstrap.RunWithCSR` | generated by the CALLER (the desktop app) | `credential.get` (§8.6b); and, with an empty CSR, `token.get` | `sdk.Bundle` — token, or certificate and **no key** |
+| `CredentialMinter.MintRelayed` → `sdkbootstrap.RunWithCSR` | generated by the CALLER (the desktop app) | the app's control credential (in the app, through the embedded bridge; the retired daemon served it as `credential.get`, and with an empty CSR `token.get`) | `sdk.Bundle` — token, or certificate and **no key** |
 
 The relay exists because the desktop's key must not leave the desktop. `RunCredential` on
 that path would return a certificate for a key the agent holds — useless to the app that
@@ -560,117 +546,18 @@ no server. At the `credentialSource` layer the `minter` interface is faked by
 
 ---
 
-## 8. Desktop UDS server (`desktop_server.go`, `desktop_protocol.go`, `desktop_gate.go`, `approval*.go`)
+## 8. The app's approval gate (`crates/shed-app/src/broker_bridge.rs`)
 
-Protocol v2, newline-delimited JSON, one typed envelope per line
-(`desktop_protocol.go:15`). Directions: app→agent `hello`, `approval_response`,
-`pong`, `token.get`, `credential.get`; agent→app `hello_ack`, `approval_request`,
-`event`, `ping`, `token.response`, `credential.response`.
-
-**Version skew is handled by capability, not by `v`.** `v` is stamped on every frame
-and never checked on receive, and bumping it would break the very pairing it is meant
-to describe — shed-desktop and shed-host-agent ship separately, so every combination
-of versions runs in the field. The agent instead names what it answers, in
-`hello_ack.agent_capabilities` (§8.1), and the app checks before sending an optional
-message. An agent too old to know a message does not reject it, it drops it, so
-without the advertisement a mismatch would surface as a request timeout rather than a
-sentence naming what to upgrade.
-
-### 8.1 Handshake (`desktop_server.go:208`)
-- New conn must send a `hello` within **2s** (read deadline), else the conn is dropped (`desktop_server.go:216`). A first line whose `type != "hello"` → dropped.
-- Agent replies `hello_ack` **before promoting** the connection:
-```jsonc
-{ "v":2, "type":"hello_ack", "id":<uuid>, "ts":<rfc3339>,
-  "agent": { "version":<build>, "approval_method":"shed-desktop" },
-  "namespaces": ["ssh-agent","aws-credentials","docker-credentials","egress"],
-  "gate_namespaces": [...],           // == desktopGateNamespaces(cfg)
-  "agent_capabilities": ["credential.get"],  // omitempty — see below
-  "request_timeout_ms": <timeout ms>,
-  "accepted": true }
-```
-- `agent_capabilities` is **omitempty**, and its ABSENCE is load-bearing: that is exactly
-  what an agent predating capability advertisement emits, and what a new app turns into
-  "upgrade shed-host-agent". It is absent, never `null` and never `[]` — a third state
-  nobody reads. (Contrast `namespaces`/`gate_namespaces`, which are non-omitempty and so
-  marshal as `null` when nil.)
-- The **superseded** ack (`accepted:false`) carries no capabilities either: it is a bare
-  `helloAckMsg{}` (§8.2), so the key is absent there too.
-- `hello.client{name,version,pid}` is stored and surfaced in status (`client_name`/`client_version`).
-- `hello.replay_events` (int) drives replay (§8.4).
-
-### 8.2 Single-consumer / last-writer-wins (`promote`, `desktop_server.go:349`)
-- A 2nd connection **supersedes** the 1st: the old consumer receives
-  `hello_ack{accepted:false, reason:"superseded"}` and is closed. The new one becomes active. (Not "second rejected" — newest wins.)
-- On disconnect (`demote`, `:363`) the active consumer is cleared and **all its in-flight approvals fail closed** (`approved:false`).
-- `ConsumerInfo()` (`:393`) reports connected + client identity for status.
-
-### 8.3 Approval request/response correlation + timeout (`RequestApproval`, `:318`)
-- No consumer → `errNoConsumer` (→ deny). Else send:
-```jsonc
-{ "v":2, "type":"approval_request", "id":<uuid>, "ts":<rfc3339>,
-  "namespace", "op", "server"(omitempty), "shed", "detail",
-  "expires_at": <now+timeout rfc3339> }
-```
-- Reply `approval_response{request_id, decision:"approve"|<other=deny>, decided_by, scope(omitempty), ttl(omitempty)}` correlated by `id`==`request_id`.
-- **Ownership guard** (`resolve`, `:402`): only the consumer the request was sent to may resolve it; a superseded conn that merely saw the id can't.
-- Timeout = `s.timeout` (config `approval_timeout`, default 25s; non-positive → 25s, `desktop_server.go:163`) → `errTimeout` → deny. ctx cancel → deny.
-- `desktopGate.Approve` (`desktop_gate.go:20`): maps reply → `ApprovalOutcome{decided_by(default "user" if empty), scope, ttl}`, returns the outcome on **both** approve and deny (so denies are audited with detail).
-
-### 8.4 Event fan-out + replay (`forwardAudit`/`replay`, `:421,450`)
-- Every audit entry → `event` frame (§3.3) appended to a **100-entry ring**, sent to the active consumer.
-- On connect, `replay(c, hello.replay_events)`: replays the **last min(n, ring-len)** buffered events (n≤0 → none). Order preserved.
-
-### 8.5 Peer-UID trust
-- **No SO_PEERCRED / peer-UID check** in this code. Trust is the socket's `0700` parent dir + `0600` socket file (`bindUnixSocket`, `desktop_server.go:65-86`) — owner-only filesystem perms are the gate. (Any file-level fake works; there is no UID assertion to satisfy.)
-
-### 8.6 token.get → token.response (`handleTokenGet`, `:296`)
-- Inbound `token.get{type,id,server}` handled in its own goroutine (must not stall the read loop). Reply:
-```jsonc
-{ "v":2, "type":"token.response", "id":<uuid>, "ts":<rfc3339>,
-  "in_reply_to": <req.id>, "server": <req.server>,
-  "token":<...>(omitempty), "expires_at":<...>(omitempty), "error":<...>(omitempty) }
-```
-- `nil controlTokens` → `error:"control-token minting is not available"`. Mint error → `error:<msg>`, token/expires_at empty (**fail closed, never a partial token**). Success → token + (non-zero) expiry. Backed by `controlTokenProvider` (§7.3).
-- **FROZEN at bearer tokens, and the request carries NO `csr=`.** This is the message every
-  shipped app knows, and a certificate cannot be delivered through a `token.response`.
-  Against a server whose entry records `auth_mode: mtls` the agent therefore answers with
-  an explicit error naming the component to upgrade — `server %q issues client
-  certificates (auth.mode: mtls); this shed-desktop is too old to use one — upgrade the
-  app` (`controltoken.go:errDesktopTooOldForMTLS`) — **before** any SSH round-trip, and
-  never a certificate the app cannot present.
-
-### 8.6b credential.get → credential.response (`handleCredentialGet`)
-
-The mode-agnostic successor to `token.get`, and a SEPARATE message rather than a widened
-one. Silently extending `token.get` would leave a new app unable to tell "the server is in
-token mode" from "the agent is old", and would let a new agent answer an old app with a
-`token.response` carrying no token — which decodes fine and fails later.
-
-- Inbound `credential.get{type,id,server,csr?}`, handled in its own goroutine.
-- `csr` is standard-base64 PKCS#10 DER **generated by the APP**. Only the request crosses
-  the socket; the private key that will pair with the issued certificate never leaves the
-  app process (plan 001 §D6). The agent passes it through **verbatim** as the bootstrap's
-  `csr=` argument — it does not parse, re-encode, or substitute one. `csr` is optional
-  (`omitempty`); absent means the bootstrap sends no `csr=` argument at all (**not** an
-  empty one, which the server rejects).
-- Reply:
-```jsonc
-{ "v":2, "type":"credential.response", "id":<uuid>, "ts":<rfc3339>,
-  "in_reply_to": <req.id>, "server": <req.server>,
-  "auth_mode":"token"|"mtls"(omitempty),
-  "token":<...>(omitempty),        // token mode only
-  "client_cert":<PEM>(omitempty),  // mtls mode only
-  "cert_serial":<hex>(omitempty), "expires_at":<...>(omitempty),
-  "error":<...>(omitempty) }
-```
-- `auth_mode` names which shape is populated, so the app never infers the mode from which
-  field happens to be non-empty. **Never both**; on error, **neither** (fail closed).
-- `nil` credential provider → `error:"control-credential minting is not available"`.
-- Go: `MintRelayed` → `sdkbootstrap.RunWithCSR` (the relay entry point — it validates the
-  bundle's SHAPE but not against a private key, because this side does not have one).
-
-### 8.7 Frame safety
-- 1 MiB per-line cap (`maxFrameBytes`, `:19`); 5s write deadline per frame (`consumerWriteTimeout`, `:107`); 10s server→app `ping` keepalive; `pong` is liveness-only.
+The daemon's desktop UDS server (its handshake, single-consumer supersede, replay ring,
+`token.get` and `credential.get`) went with the daemon (plan 037). In the app, a
+`shed-desktop` policy selects the bridge's in-process gate (`AppGate`): it posts an
+`approval_request` (`id`, `ts`, `server` — empty in single-server mode — `namespace`,
+`op`, `shed`, `detail`, `expires_at` = now + `approval_timeout`) to the app's
+Coordinator, which is always attached (the app is its own consumer), and waits for the
+person's decision; `decided_by` defaults to `user`, `scope` and `ttl` pass through to
+the audit line. No decision within `approval_timeout` (default 25 s) → deny with no
+`decided_by`; a late decision finds nothing and is a no-op. The harness's control socket
+stands in for the Coordinator (`{"op":"subscribe"}`, `{"op":"decide"}`).
 
 ---
 
@@ -705,12 +592,12 @@ A pinning shed-server answers one machine per user. The broker's side of that co
   | any other (a 403 with another code — `SOURCE_MACHINE_ID_REQUIRED`, a scope failure, a script key, a reserved namespace — or a 403 whose body does not parse or was cut short) | — | `reconnecting`, `last_error` = `unexpected status <n>: <body>` | backoff and retry (as before) |
 
   `not-source` is entered if and only if the status is 403 **and** the body was read whole **and** parses with `error.code == SOURCE_NOT_BOUND`; a truncated, slow or unparseable body never is, even when the part read parses. Any other state clears `active_source`.
-- **The daemon and the desktop's embedded broker on one machine** (`shed_broker::presence`). They share `machine.json`, so a server sees one machine. **The app's side** (`presence::Holder`, started by `EmbeddedHostAgent::spawn` before the supervisor exists, so before any subscribe): only when the embedded broker loaded a machine identity (without one it takes no lock, logs that a daemon keeps answering, and a pinning server refuses its subscribes with `SOURCE_MACHINE_ID_REQUIRED` anyway), it takes a NON-blocking EXCLUSIVE `flock` on `<state>/host-agent/embedded-broker.lock` (beside `machine.json`; 0600, created with its directory as `machine.json`'s is, never removed; opened close-on-exec, so an exec'd helper never inherits it; a bare fork without exec would). Each attempt runs on a thread of its own; a failed attempt is retried every 50 ms for the first second (a daemon's momentary shared lock costs one retry), then every 2 s for as long as the broker runs, each distinct cause logged once (`held by another process` only after the first second). `spawn` starts the broker once the lock is held, or after `EMBEDDED_LOCK_WAIT` (1 s) without it, logging that; the holder then takes the lock in the background when it can (an earlier app instance exiting, a path becoming usable). Released when the broker has drained at shutdown, or by the kernel when the app exits however it exits. **The daemon's side** (`presence::LockWatcher`, one per process, started in the runtime before the first subscribe): it looks with a NON-blocking SHARED `flock` on a read-only descriptor of its own, released at once (shared locks never conflict, so two lookers never read each other as the app; the app's exclusive lock makes the look fail with `EWOULDBLOCK`, which is "present"; Linux and macOS `flock` agree on this), on a thread of its own every `PRESENCE_CHECK_INTERVAL` (2 s), one look at a time, and publishes the answer on a watch channel (`SharedDeps.embedded_presence`) that every subscription reads; no subscription touches the file. The first look is awaited before any subscription starts, for at most `FIRST_LOOK_BOUND` (1 s): one that takes longer reads as absent (logged) until it finishes. A missing file or directory, or any other error (logged once per distinct error), reads as absent, so the daemon serves rather than going silent; shutdown never waits for a stalled look. The embedded broker and every other host leave the channel `None`, and a client without it never stands by. **While present**, a namespace is `yielding` (`last_error` = `the desktop app on this machine is answering (its embedded broker is running); this daemon takes over within a few seconds of the app quitting`; one INFO line on entering and one on leaving), and the daemon neither subscribes nor answers: the subscribe loop stands by before an attempt, drops a connect or a held stream at once (the connection closes; the server unregisters the listener), and leaves an ordinary backoff sleep at once (a `429`'s `Retry-After` is still waited out whole, then the look at the top of the loop applies); `serve_namespace` starts no handler for an envelope it receives (logged, left pending on the server); and a handler already running posts nothing: the look is made immediately before every send (`send_respond`), and the request's audit entry, if the op audits, is written with `result: "undelivered"` and `reason: "result <what the op came to>, but not sent: left for the desktop app (its embedded broker on this machine took over this request type; the server re-delivers the request to it)"` (`AUDIT_NOTE_LEFT_FOR_APP`), or, when an earlier POST of that answer may have reached the shed, as the Audit entry below says. **A yield is permanent for the work it interrupted**, not only while the lock is held: the watcher's channel carries a yield epoch (`presence::Presence`), bumped each time it publishes the lock held (a watch channel keeps no history, so the app starting and quitting between two of a subscription's observations can leave the value reading absent throughout, never the epoch unchanged). Every envelope is stamped with the epoch its stream was opened under, and a stream whose epoch has been passed is closed (`embedded_appears_since`); every respond records the epoch its handler started in (`BusClient::for_handler`; a bare `respond` the epoch when it starts). `serve_namespace` drops (logged, no handler, no audit) an envelope whose epoch is older than the current one, and drains the envelopes queued when the epoch moves while a handler runs; `send_respond` makes no send, first or re-send (a 503/429 retry, a 401 re-send, a pooled-connection re-send), whose epoch is older (the same `LeftForApp` path). So a daemon's answer held back on a `503 Retry-After` is never re-sent after the app came and went, although the server would accept it (it matches on machine and binding generation, not on the stream). Every such request stays pending on the server, which re-delivers it to the next listener of this machine (same machine id, same binding generation: `internal/plugin/registry.go`, `pendingForLocked`): the app's stream, where the app answers it, or, if the app quit without answering, the daemon's next stream, opened under the new epoch, whose copy the daemon handles and answers. Nothing is lost. The one overlap left is a POST already on the wire at the moment of yielding: the first answer written is delivered, the other refused (`403 FORBIDDEN`, audited `undelivered`). When the lock is released the daemon subscribes at once, from the backoff floor; the exception is a `429`'s `Retry-After` being waited out when the app came and went (the daemon stays `reconnecting` until it ends: it had no stream to close). A `409 SOURCE_DUPLICATE_STREAM` stays an ordinary backoff retry (above): with the lock it is left for the time between the app taking the lock and the daemon's next look (the daemon then closes its stream and the app's next retry holds the type) and for two daemons on a copied state directory (no lock between them: either holds each type, the other retries on its backoff). On an older (0.9.x) server the second subscriber gets a terminal `409 NAMESPACE_ALREADY_REGISTERED`: a client holding the lock (`BusClient::with_presence_lock`, set from `SharedDeps.presence_lock` by the embedded broker only) retries it on the backoff for `OLD_SERVER_CONFLICT_GRACE` (15 s: four check intervals plus 7 s for the daemon's connection to close and the app's backoff to come round) after it started subscribing or took the lock, whichever is later, and treats it as terminal after that; before it holds the lock it reads `rejected` and retries once the lock is taken; every other client treats it as terminal at once, as before. Not covered: the two processes on different state directories (two machine ids, two locks: two machines to the server), and a state directory on a filesystem whose `flock` does not work between processes (either may hold a type). Status: the additive state value `yielding` in `servers[].namespaces[].state` (`-` in `shed-host-agent status`). Pinned by `presence.rs` (another descriptor and another process see the lock; released on drop and on SIGKILL of the holder; a missing or unlockable path is absent; a look needs only read access; concurrent lookers never see each other; a holder gets past a look in progress and wins against hammering lookers every round; a second holder takes over without a restart; a path that becomes usable is taken; the watcher publishes the lock, bounds a stalled first look and never holds shutdown, and logs a failed look once), by `bus.rs` on tokio's paused clock with an in-memory pinning server (`SimBus`) and a fake presence channel (no subscribe ever while present, across outages; a held stream closed at the next look and the app holding the type; the look-then-subscribe race; a backoff sleep left at once in both directions; subscribe at once from the floor on release; no standing by without the option; the older-server grace, its end, a client without it, and the lock taken late), and on the real clock (queued requests left to the app and answering resumed after it; a handler finishing after the app took over posts nothing and audits the reason; an answer held back by a `503` not re-sent after the app came and went, audited `undelivered`, and after a proxy's `503` audited delivery unknown; a request queued before a yield dropped at the yield and its re-delivery answered; presence that never changes leaving retries and the queue alone), on the paused clock (a stream from before a start and quit opened again), by `broker_bridge.rs` (the lock held while the embedded broker runs and released when it stops; no lock without a machine identity; a lock held elsewhere at start taken once free), and by the wire cells in `test_source_pin.py`, which take the real lock from Python on the daemon's own lock file (one where a request in flight at the handoff is answered by the stand-in only, and one where an answer held back by a scripted `503 Retry-After: 8` is never re-sent after the app's lock and stand-in came and went, and the request delivered again on the daemon's new stream is answered).
+- **The daemon and the desktop's embedded broker on one machine** (`shed_broker::presence`). They share `machine.json`, so a server sees one machine. **The app's side** (`presence::Holder`, started by `EmbeddedHostAgent::spawn` before the supervisor exists, so before any subscribe): only when the embedded broker loaded a machine identity (without one it takes no lock, logs that a daemon keeps answering, and a pinning server refuses its subscribes with `SOURCE_MACHINE_ID_REQUIRED` anyway), it takes a NON-blocking EXCLUSIVE `flock` on `<state>/host-agent/embedded-broker.lock` (beside `machine.json`; 0600, created with its directory as `machine.json`'s is, never removed; opened close-on-exec, so an exec'd helper never inherits it; a bare fork without exec would). Each attempt runs on a thread of its own; a failed attempt is retried every 50 ms for the first second (a daemon's momentary shared lock costs one retry), then every 2 s for as long as the broker runs, each distinct cause logged once (`held by another process` only after the first second). `spawn` starts the broker once the lock is held, or after `EMBEDDED_LOCK_WAIT` (1 s) without it, logging that; the holder then takes the lock in the background when it can (an earlier app instance exiting, a path becoming usable). Released when the broker has drained at shutdown, or by the kernel when the app exits however it exits. **The daemon's side** (`presence::LockWatcher`, one per process, started in the runtime before the first subscribe): it looks with a NON-blocking SHARED `flock` on a read-only descriptor of its own, released at once (shared locks never conflict, so two lookers never read each other as the app; the app's exclusive lock makes the look fail with `EWOULDBLOCK`, which is "present"; Linux and macOS `flock` agree on this), on a thread of its own every `PRESENCE_CHECK_INTERVAL` (2 s), one look at a time, and publishes the answer on a watch channel (`SharedDeps.embedded_presence`) that every subscription reads; no subscription touches the file. The first look is awaited before any subscription starts, for at most `FIRST_LOOK_BOUND` (1 s): one that takes longer reads as absent (logged) until it finishes. A missing file or directory, or any other error (logged once per distinct error), reads as absent, so the daemon serves rather than going silent; shutdown never waits for a stalled look. The embedded broker and every other host leave the channel `None`, and a client without it never stands by. **While present**, a namespace is `yielding` (`last_error` = `the desktop app on this machine is answering (its embedded broker is running); this daemon takes over within a few seconds of the app quitting`; one INFO line on entering and one on leaving), and the daemon neither subscribes nor answers: the subscribe loop stands by before an attempt, drops a connect or a held stream at once (the connection closes; the server unregisters the listener), and leaves an ordinary backoff sleep at once (a `429`'s `Retry-After` is still waited out whole, then the look at the top of the loop applies); `serve_namespace` starts no handler for an envelope it receives (logged, left pending on the server); and a handler already running posts nothing: the look is made immediately before every send (`send_respond`), and the request's audit entry, if the op audits, is written with `result: "undelivered"` and `reason: "result <what the op came to>, but not sent: left for the desktop app (its embedded broker on this machine took over this request type; the server re-delivers the request to it)"` (`AUDIT_NOTE_LEFT_FOR_APP`), or, when an earlier POST of that answer may have reached the shed, as the Audit entry below says. **A yield is permanent for the work it interrupted**, not only while the lock is held: the watcher's channel carries a yield epoch (`presence::Presence`), bumped each time it publishes the lock held (a watch channel keeps no history, so the app starting and quitting between two of a subscription's observations can leave the value reading absent throughout, never the epoch unchanged). Every envelope is stamped with the epoch its stream was opened under, and a stream whose epoch has been passed is closed (`embedded_appears_since`); every respond records the epoch its handler started in (`BusClient::for_handler`; a bare `respond` the epoch when it starts). `serve_namespace` drops (logged, no handler, no audit) an envelope whose epoch is older than the current one, and drains the envelopes queued when the epoch moves while a handler runs; `send_respond` makes no send, first or re-send (a 503/429 retry, a 401 re-send, a pooled-connection re-send), whose epoch is older (the same `LeftForApp` path). So a daemon's answer held back on a `503 Retry-After` is never re-sent after the app came and went, although the server would accept it (it matches on machine and binding generation, not on the stream). Every such request stays pending on the server, which re-delivers it to the next listener of this machine (same machine id, same binding generation: `internal/plugin/registry.go`, `pendingForLocked`): the app's stream, where the app answers it, or, if the app quit without answering, the daemon's next stream, opened under the new epoch, whose copy the daemon handles and answers. Nothing is lost. The one overlap left is a POST already on the wire at the moment of yielding: the first answer written is delivered, the other refused (`403 FORBIDDEN`, audited `undelivered`). When the lock is released the daemon subscribes at once, from the backoff floor; the exception is a `429`'s `Retry-After` being waited out when the app came and went (the daemon stays `reconnecting` until it ends: it had no stream to close). A `409 SOURCE_DUPLICATE_STREAM` stays an ordinary backoff retry (above): with the lock it is left for the time between the app taking the lock and the daemon's next look (the daemon then closes its stream and the app's next retry holds the type) and for two daemons on a copied state directory (no lock between them: either holds each type, the other retries on its backoff). On an older (0.9.x) server the second subscriber gets a terminal `409 NAMESPACE_ALREADY_REGISTERED`: a client holding the lock (`BusClient::with_presence_lock`, set from `SharedDeps.presence_lock` by the embedded broker only) retries it on the backoff for `OLD_SERVER_CONFLICT_GRACE` (15 s: four check intervals plus 7 s for the daemon's connection to close and the app's backoff to come round) after it started subscribing or took the lock, whichever is later, and treats it as terminal after that; before it holds the lock it reads `rejected` and retries once the lock is taken; every other client treats it as terminal at once, as before. Not covered: the two processes on different state directories (two machine ids, two locks: two machines to the server), and a state directory on a filesystem whose `flock` does not work between processes (either may hold a type). Status: the additive state value `yielding` in `servers[].namespaces[].state` (`-` in `shed-host-agent status`). Pinned by `presence.rs` (another descriptor and another process see the lock; released on drop and on SIGKILL of the holder; a missing or unlockable path is absent; a look needs only read access; concurrent lookers never see each other; a holder gets past a look in progress and wins against hammering lookers every round; a second holder takes over without a restart; a path that becomes usable is taken; the watcher publishes the lock, bounds a stalled first look and never holds shutdown, and logs a failed look once), by `bus.rs` on tokio's paused clock with an in-memory pinning server (`SimBus`) and a fake presence channel (no subscribe ever while present, across outages; a held stream closed at the next look and the app holding the type; the look-then-subscribe race; a backoff sleep left at once in both directions; subscribe at once from the floor on release; no standing by without the option; the older-server grace, its end, a client without it, and the lock taken late), and on the real clock (queued requests left to the app and answering resumed after it; a handler finishing after the app took over posts nothing and audits the reason; an answer held back by a `503` not re-sent after the app came and went, audited `undelivered`, and after a proxy's `503` audited delivery unknown; a request queued before a yield dropped at the yield and its re-delivery answered; presence that never changes leaving retries and the queue alone), on the paused clock (a stream from before a start and quit opened again), by `broker_bridge.rs` (the lock held while the embedded broker runs and released when it stops; no lock without a machine identity; a lock held elsewhere at start taken once free), and, until the wire harness moved onto the app's broker (plan 037), by wire cells that drove the daemon against a lock taken from Python (those went with the daemon's harness host).
 - **Respond answers.** A 503 or 429 **with `Retry-After`** means the server wrote nothing: the same body is re-sent at most 3 times. Each POST waits at most `RESPOND_ATTEMPT_TIMEOUT`, 8 s: the server's own delivery deadline (`responseTimeout`, 5 s, `internal/plugin/bridge.go`), after which it answers `503 RESPONSE_NOT_DELIVERED` with `Retry-After: 1`, plus 3 s of margin, so that 503 arrives and is retried instead of this client giving up first. One deadline, `RESPOND_RETRY_BUDGET` = 8 + 1 + 8 = 17 s from the first send (room for one more whole attempt after that 503), covers every refusal body read, every wait, every credential fetch and every send after it; when it passes the respond stops and is audited. `Retry-After` must be a non-negative whole number of seconds (waited at least 100 ms) after which one whole attempt (8 s) still fits what is left of the deadline — otherwise the respond ends on that refusal, the server's own word (`undelivered`), rather than on an attempt the deadline would cut short; an HTTP date, a negative, a fraction, garbage or a number too large means no retry. A 503/429 without `Retry-After`, a 403, a 413 and every other non-204 are final, one send. Immediately before every send but the first (a 503/429 retry, a 401's re-send, the one re-send after a lost pooled connection), after its credential fetch, at least one whole attempt (8 s) must be left of the deadline; otherwise nothing is sent and the respond ends (credential work, a re-mint or a wait may have used the room up). The 17 s bounds the respond phase from its first send; it does not cover the time before it (queueing behind earlier requests of the namespace, the approval, the backend, the first credential fetch). One invalidation (401 / TLS alert) and one credential fetch that could mint, per respond, across the retries: after a failed re-mint the surviving credential is presented without minting again.
 - **Audit.** When the shed server itself refused a respond (after any retries) — a non-204 whose body, read whole, is the API's error JSON with an `error.code` — the request's audit entry (if the op audits) is written with `result: "undelivered"` and `reason: "result <what the op came to>, but the server refused the response (status <n> <error.code>)"` appended to any existing reason. Any other non-204 (a proxy's 502, an empty or cut-short body) keeps the op's result and appends `the response was answered with status <n>; delivery unknown`. A POST that got no answer within its 8 s keeps the op's result and appends `the response got no answer within 8s; delivery unknown`. Any other transport failure leaves the entry as before (the answer may have been delivered). A send that was not made because less than a whole attempt was left (or the deadline passed during its credential fetch) is recorded by the last thing known about the answer: the server's last refusal of it in this respond (a 401, whose body is read for its code, or a 503/429 before a retry), as that refusal would be (`undelivered` with its code, or delivery unknown for a non-API body); with none, the op's result is kept and `the response could not be sent again within its deadline; delivery unknown` is appended. An answer not sent because the desktop app's embedded broker took over (it runs, or started since the handler did) is recorded as above (`undelivered`, `left for the desktop app`) when no POST of it was made or every one made was refused by the shed server itself; when an earlier POST of it may have reached the shed (no answer in its 8 s, a transport failure after the request may have been written, a non-API refusal body), the op's result is kept and `an earlier send of the response was answered with status <n>; delivery unknown; the retry was not sent: left for the desktop app (...)` is appended (`got no definite answer` in place of the status when the last POST got none).
 - **Waking.** `Supervisor::retry_now` (and the embedded broker's `EmbeddedHostAgent::retry_now`) cut every waiting subscribe backoff short and reset it to the floor, so a machine just made the source connects at once.
 - **The desktop's embedded broker** loads the same `machine.json` through the same function at spawn and sends the same headers. Like the daemon, an identity it cannot load does not stop it: it brokers without one, and `broker.status` carries `machine` / `machine_error`.
-- **Harness.** `tests/host-agent-diff/synthetic_bus.py` and `desktop/tools/shedtest/mockserver.py` answer each refusal with these exact shapes (`refuse=` / `accept`, `respond_script`) and record the identity headers; the daemon cells are `test_source_pin.py`. Both match responds as the server does: a request is pending from the write of its frame, an answer must name a pending request of its namespace and shed (`in_reply_to`), else `403 FORBIDDEN`, a final answer consumes it, and a move away drops the requests pending on the old machine (so after a move A → B → A, A's answer to a request delivered before the first move is `403 FORBIDDEN`). Their codes are the server's: a respond body over the limit is `413 REQUEST_TOO_LARGE`, an unconfirmed move `500 INTERNAL_ERROR`, a malformed machine id `400 INVALID_REQUEST`. A move away also ends the old machine's live streams. `SyntheticBus.restart()` is a server restart (every stream ends, every pending request is gone); `drop_streams()` is a lost connection with the server up (every stream ends, pending requests kept). The synthetic bus re-delivers, as the server does: a new stream is first sent every request pending on its namespace that was delivered to the same machine id at the same binding generation (bumped by each move away and back), in first-delivery order; and a stream that has ended never delivers a frame it takes afterwards (the frame goes back on the queue); a re-delivered frame whose request was answered finally after the new stream copied it (the old stream's answer) is not written and does not become pending again, as `Listener.Take` checks the message is still live. The desktop mock does NOT model re-delivery (stated in `mockserver.py`): no desktop cell sees the handoff of an in-flight request; the host-agent cells do. The desktop mock binds each stream to the binding generation it was admitted at: a stream that stopped being live cannot take a request (it goes back for the next stream), as the server's `Listener.Take` refuses an unregistered listener; it checks a respond's machine headers, then its size, then the binding, in the server's order; and `pause()` (a restart) forgets pending requests. `SyntheticBus(single_holder=True)` adds the duplicate rule for one bound machine (one live stream per namespace, `holders()`, `attempts()`, `attempt_times()`) with `StandInBroker`, a minimal subscriber standing in for the app's broker (it keeps every request it is sent and, given `answer`, posts a final response to each); their own contract is pinned by `test_synthetic_bus.py` and `desktop/tools/shedtest/test_mockserver_sources.py`.
+- **Harness.** `tests/host-agent-diff/synthetic_bus.py` and `desktop/tools/shedtest/mockserver.py` answer each refusal with these exact shapes (`refuse=` / `accept`, `respond_script`) and record the identity headers; the broker cells are `test_source_pin.py`. Both match responds as the server does: a request is pending from the write of its frame, an answer must name a pending request of its namespace and shed (`in_reply_to`), else `403 FORBIDDEN`, a final answer consumes it, and a move away drops the requests pending on the old machine (so after a move A → B → A, A's answer to a request delivered before the first move is `403 FORBIDDEN`). Their codes are the server's: a respond body over the limit is `413 REQUEST_TOO_LARGE`, an unconfirmed move `500 INTERNAL_ERROR`, a malformed machine id `400 INVALID_REQUEST`. A move away also ends the old machine's live streams. `SyntheticBus.restart()` is a server restart (every stream ends, every pending request is gone); `drop_streams()` is a lost connection with the server up (every stream ends, pending requests kept). The synthetic bus re-delivers, as the server does: a new stream is first sent every request pending on its namespace that was delivered to the same machine id at the same binding generation (bumped by each move away and back), in first-delivery order; and a stream that has ended never delivers a frame it takes afterwards (the frame goes back on the queue); a re-delivered frame whose request was answered finally after the new stream copied it (the old stream's answer) is not written and does not become pending again, as `Listener.Take` checks the message is still live. The desktop mock does NOT model re-delivery (stated in `mockserver.py`): no desktop cell sees the handoff of an in-flight request; the synthetic bus's own cells (`test_synthetic_bus.py`) pin it. The desktop mock binds each stream to the binding generation it was admitted at: a stream that stopped being live cannot take a request (it goes back for the next stream), as the server's `Listener.Take` refuses an unregistered listener; it checks a respond's machine headers, then its size, then the binding, in the server's order; and `pause()` (a restart) forgets pending requests. `SyntheticBus(single_holder=True)` adds the duplicate rule for one bound machine (one live stream per namespace, `holders()`, `attempts()`); their own contract is pinned by `test_synthetic_bus.py` and `desktop/tools/shedtest/test_mockserver_sources.py`.
 
 ---
 
@@ -725,10 +612,9 @@ A pinning shed-server answers one machine per user. The broker's side of that co
 - Runs SSH handler always; AWS/Docker handlers only when their backend is non-nil; egress subscriber always (control-token source only for secure servers).
 - `shouldMint` matrix is a clean golden: true **only** for https (case-insensitive) + non-nil minter + non-empty SSHHost + SSHPort>0.
 
-### 10.3 Signal shutdown ordering (`main.go`)
-- `signal.Notify(SIGTERM, SIGINT)` (`main.go:106`); on signal → `cancel()` the root ctx (`:111`).
-- Shutdown order after the watch loop returns (`:241-247`): (a) `sup.Shutdown()` cancels every group and drains; (b) ctx-cancel closes the desktop + status listeners (each unlinks its own socket via `ln.Close()`); (c) `wg.Wait()`; audit file closed via defer. **Exit 0** on clean shutdown.
-- Startup exit codes a harness can watch: **exit 1** on config load failure (`:85`) or SSH-backend init failure (`:118`); **exit 0** for `version`; **exit 0/1** for `status`; **exit 2** for a bad `status` arg / removed `--live`. Sockets appear at bind (logged `socket listening`) and disappear on `ln.Close()`.
+### 10.3 Shutdown (`EmbeddedHostAgent`)
+- The shutdown flip ends the watch loop, which then runs `sup.shutdown()`: every group is cancelled and drained. The app flips it on exit and does not wait; `EmbeddedHostAgent::shutdown_and_wait(bound)` flips it and waits for the loop task, returning `true` only once every group has drained (`false` when `bound` passed first).
+- The harness (`shed-broker-harness`): SIGTERM/SIGINT → `shutdown_and_wait(5 s)` → `harness drained` in its log and **exit 0**, or `harness drain timed out` and **exit 3**. **Exit 1** when the config exists but does not load or the broker does not spawn (an unknown `ssh.mode`, or an explicit `agent-forward` with `$SSH_AUTH_SOCK` unset); a missing config is the app's synthesized default, not an error. **Exit 2** on a usage error. (The daemon's CLI exit codes went with it.)
 
 ### 10.4 Watch loop (`watcher.go:18`)
 - `off` → reconcile once, idle until ctx done. `poll` → ticker (`poll_interval`, default 10s). `fsnotify`/`""` → watches the source's **parent dir** (survives atomic rename), debounced (`debounce`, default 500ms), matches basename; falls back to poll if fsnotify can't start. Unknown mode → poll with a warning. Single-server mode = `{Watch:"off"}` reconciled once (`main.go:234`).

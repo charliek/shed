@@ -1,29 +1,27 @@
-//! The Rust half of mechanism 2 (language-neutral golden fixtures) of the host-agent
-//! differential harness. Reads the SAME JSON vectors the Go runner reads
-//! (`cmd/shed-host-agent/golden_test.go`) and asserts the Rust pure decision
-//! functions (`effective_policy_from_raw`, `HostAgentConfig::gate_namespaces`) match
-//! every vector. The Go and Rust runners agreeing with a committed fixture is the
-//! drift guard the live differential cannot give.
+//! The language-neutral golden fixtures of the broker's wire harness, read by the
+//! broker's own config functions. The JSON vectors were recorded while the retired Go
+//! runner read them too, and this test asserts the pure decision functions
+//! (`effective_policy_from_raw`, `HostAgentConfig::gate_namespaces`) match every
+//! vector: a drift guard the live wire cells cannot give.
 //!
-//! `config` now lives in the `shed-broker` library crate, so this integration test
-//! imports its real config functions from the library `shed-host-agent` links (before
-//! the broker extraction, when `shed-host-agent` was binary-only, it `#[path]`-included
-//! `config.rs` standalone).
+//! An integration test of the `shed-broker` library: it imports the real config
+//! functions the desktop app's embedded broker runs (`make test-host-agent-diff`
+//! runs it as `cargo test -p shed-broker golden`).
 
 use std::path::PathBuf;
 
 use shed_broker::config::{effective_policy_from_raw, HostAgentConfig};
 
-/// The shared fixture directory. `CARGO_MANIFEST_DIR` is `crates/shed-host-agent`;
+/// The shared fixture directory. `CARGO_MANIFEST_DIR` is `crates/shed-broker`;
 /// `../../` is the repo root, where `tests/host-agent-diff/fixtures` lives (the
-/// neutral home shared with the Go runner).
+/// wire harness's neutral home for the vectors).
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/host-agent-diff/fixtures")
 }
 
 /// Build a config from the three raw approval policies via the crate's real
 /// (block-style) config parser, so the gate golden exercises the same
-/// `parse` → `gate_namespaces` path the daemon uses. Only clean policy tokens flow
+/// `parse` → `gate_namespaces` path the broker uses. Only clean policy tokens flow
 /// through here, so a minimal block-YAML template is sufficient.
 fn config_from_policies(ssh: &str, aws: &str, docker: &str) -> HostAgentConfig {
     let text = format!(

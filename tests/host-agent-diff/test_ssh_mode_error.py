@@ -1,12 +1,12 @@
-"""A daemon started with an unknown `ssh.mode` exits 1 — and does so whether the
-config is single-server OR carries a `discovery:` block. Resolution runs
-UNCONDITIONALLY at startup (before any socket binds), so the mode is validated even in
-multi-server mode where the single-server bus stays off (the exact case the
-unconditional-resolve relocation protects). Only the exit code is asserted — the
-stderr is the operational log (`tracing` lines), which the plan excludes.
+"""A broker started with an unknown `ssh.mode` exits 1 — and does so whether the
+config is single-server OR carries a `discovery:` block. The app's broker resolves the
+SSH backend UNCONDITIONALLY at spawn (before the harness binds its socket), so the mode
+is validated in multi-server mode too (the exact case the unconditional-resolve
+relocation protects); the spawn error fails the broker closed, and the harness exits 1.
+Only the exit code is asserted — the stderr and the log are excluded.
 
-Distinct from `test_config_error.py` (that is a file-not-found → exit 1); this drives a
-readable config whose `ssh.mode` value is bad.
+This drives a readable config whose `ssh.mode` value is bad (`test_config_validate.py`
+drives configs that do not load at all).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import tempfile
 
 import pytest
 
-from conftest import _clean_env
+from conftest import CONTROL_SOCK_NAME, _clean_env, harness_argv
 
 # Single-server (no `discovery:`) with a bogus ssh mode.
 BOGUS_SINGLE = "ssh:\n  mode: bogus\n"
@@ -40,12 +40,14 @@ def test_ssh_unknown_mode_exits_1(binaries, tmp_path_factory, impl, shape):
     else:
         cfg.write_text(BOGUS_DISCOVERY.format(source=root / "nonexistent-discovery.yaml"))
 
-    # The daemon exits before binding any socket, so the dir length doesn't matter; a
+    # The harness exits before binding its socket, so the dir length doesn't matter; a
     # short mkdtemp keeps it consistent with the rest of the harness anyway.
     socket_dir = tempfile.mkdtemp(prefix="hadiff-")
     try:
         proc = subprocess.run(
-            [binaries[impl], "-config", str(cfg), "-log-file", str(root / "op.log")],
+            harness_argv(
+                binaries[impl], cfg, root / "op.log", f"{socket_dir}/{CONTROL_SOCK_NAME}"
+            ),
             env=_clean_env(socket_dir, home),
             capture_output=True,
             timeout=30,

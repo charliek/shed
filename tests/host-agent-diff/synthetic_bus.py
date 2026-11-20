@@ -1,9 +1,10 @@
 """A synthetic shed-server plugin bus for the surface-B wire tests.
 
 Stands in for shed-server's plugin message-bus HTTP API (`sdk/hostclient.go`) so the
-host-agent's bus client (`crates/shed-host-agent/bus.rs`) can subscribe, receive a
-pushed request Envelope, and POST a response back, entirely on `127.0.0.1` with no
-real server. It exposes exactly the three routes a single-server daemon touches:
+broker's bus client (`crates/shed-broker/src/bus.rs`, run by `shed-broker-harness`) can
+subscribe, receive a pushed request Envelope, and POST a response back, entirely on
+`127.0.0.1` with no real server. It exposes exactly the three routes a single-server
+broker touches:
 
 * `GET /api/plugins/listeners/{ns}/messages` — the SSE subscribe. Records that a
   subscribe happened for `{ns}` (and the `Authorization` header — `None` in open
@@ -14,7 +15,7 @@ real server. It exposes exactly the three routes a single-server daemon touches:
   expects; a non-204 is a bus error).
 * `GET /api/egress/stream` — the always-on egress-audit consumer's route. Two modes,
   chosen at construction (`SyntheticBus(egress=...)`):
-    - `"unavailable"` (default) → **501**, so the daemon's egress subscriber backs
+    - `"unavailable"` (default) → **501**, so the broker's egress subscriber backs
       off hard (5m, DEBUG-quiet) — the harness asserts `egress_hits() == 1` within a
       short window to prove that hard backoff (no reconnect).
     - `"events"` → **200** + a held `text/event-stream` that pushes `data:` decision
@@ -54,22 +55,17 @@ every live stream and KEEPS the pending requests. As the server does
 request still pending on its namespace that was delivered to the SAME machine (the
 `X-Shed-Machine-Id` it subscribed with) at the SAME binding generation (bumped by every
 move, away or back), in the order they were first delivered: a lost connection's
-reconnect, or another process of the same machine (the daemon and the desktop app's
-embedded broker share one id), is handed what was in flight. A stream that has ended (a
+reconnect, or another process of the same machine (two brokers on a copied state
+directory share one id), is handed what was in flight. A stream that has ended (a
 move, a restart, `drop_streams`) never delivers a frame it takes after that: the frame
 goes back on the queue for the next stream.
 
 `single_holder=True` adds the duplicate rule of a pinning server for this one bound
 machine: at most one live stream per namespace, and a subscribe for a held namespace is
-`409 SOURCE_DUPLICATE_STREAM` — two processes sharing one machine id (the daemon and the
-desktop's embedded broker, two daemons on a copied state directory); `holders()` and
-`attempts()` say who holds and who asked. `StandInBroker` is a minimal subscriber
-(retrying a refusal or a dropped stream after a fixed second; given `answer`, it also
-answers each request it is sent), the embedded broker's part in those cells; the lock that
-makes the daemon stand by for it is taken by the cell itself, from Python, on the daemon's
-real lock file.
+`409 SOURCE_DUPLICATE_STREAM` — two processes sharing one machine id (two brokers on a
+copied state directory); `holders()` and `attempts()` say who holds and who asked.
 
-Threading model mirrors the plain-`socket`/blocking style of `desktop_client.py`:
+Threading model mirrors the plain-`socket`/blocking style of `control_client.py`:
 a `ThreadingHTTPServer` on a background thread, one handler thread per connection
 (the long-lived SSE GET, the egress GET, and the respond POST each get their own),
 and a deterministic, deadline-driven shutdown — an `Event` plus a per-namespace
@@ -77,12 +73,11 @@ sentinel unblocks the SSE loops immediately, and every handler thread is joined 
 no socket lingers to trip the suite's warnings-as-errors (ResourceWarning).
 
 Robust timing: `wait_for_subscribe` / `await_response` block on a `Condition` with a
-deadline (never a fixed sleep), so a slow daemon connect can't flake the test.
+deadline (never a fixed sleep), so a slow broker connect can't flake the test.
 """
 
 from __future__ import annotations
 
-import http.client
 import json
 import queue
 import re
@@ -893,139 +888,4 @@ class _BusHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args) -> None:
         """Silence the default per-request stderr logging (keeps pytest output clean;
-        the bus runs in-process, so there's no daemon DEVNULL to swallow it)."""
-
-
-class StandInBroker:
-    """A minimal subscriber that never yields — the desktop's embedded broker in the
-    two-brokers-on-one-machine cells. One thread per namespace subscribes with the given
-    machine id and name, holds the stream while it is served, and on a refusal or a
-    dropped stream asks again after `retry` seconds (fixed: the embedded broker's first
-    backoff). Every request envelope it is sent is kept (`received()`); with `answer`
-    (`envelope -> payload or None`) it also POSTs a final response carrying that payload,
-    with the same identity headers. `stop()` ends every stream and thread."""
-
-    def __init__(
-        self,
-        url: str,
-        namespaces,
-        machine_id: str,
-        name: str,
-        retry: float = 1.0,
-        answer=None,
-    ):
-        u = urlsplit(url)
-        assert u.scheme == "http", url
-        self._host, self._port = u.hostname, u.port
-        self._headers = {
-            "Accept": "text/event-stream",
-            MACHINE_ID_HEADER: machine_id,
-            MACHINE_NAME_HEADER: name,
-        }
-        self._retry = retry
-        self._answer = answer
-        self._received: list[dict] = []
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        # The live sockets (kept apart from their connections: http.client hands a
-        # `Connection: close` stream's socket to the response and forgets it).
-        self._socks: set[socket.socket] = set()
-        self._threads = [
-            threading.Thread(target=self._run, args=(ns,), name=f"stand-in-{ns}", daemon=True)
-            for ns in namespaces
-        ]
-        for t in self._threads:
-            t.start()
-
-    def _run(self, ns: str) -> None:
-        while not self._stop.is_set():
-            conn = http.client.HTTPConnection(self._host, self._port, timeout=60)
-            sock = None
-            try:
-                conn.connect()
-                sock = conn.sock
-                with self._lock:
-                    if self._stop.is_set():
-                        break
-                    self._socks.add(sock)
-                conn.request("GET", f"/api/plugins/listeners/{ns}/messages", headers=self._headers)
-                resp = conn.getresponse()
-                try:
-                    buf = b""
-                    while True:  # held until the bus ends it
-                        chunk = resp.read1(1024) if resp.status == 200 else resp.read(1024)
-                        if not chunk:
-                            break
-                        if resp.status != 200:
-                            continue
-                        buf += chunk
-                        while b"\n\n" in buf:
-                            event, buf = buf.split(b"\n\n", 1)
-                            self._on_event(ns, event)
-                finally:
-                    resp.close()
-            except (OSError, http.client.HTTPException):
-                pass
-            finally:
-                with self._lock:
-                    self._socks.discard(sock)
-                conn.close()
-                if sock is not None:
-                    sock.close()
-            self._stop.wait(self._retry)
-
-    def _on_event(self, ns: str, event: bytes) -> None:
-        data = b"".join(
-            line[len(b"data: "):] for line in event.split(b"\n") if line.startswith(b"data: ")
-        )
-        try:
-            env = json.loads(data)
-        except ValueError:
-            return
-        if not isinstance(env, dict):
-            return
-        with self._lock:
-            self._received.append(env)
-        if self._answer is None:
-            return
-        payload = self._answer(env)
-        if payload is None:
-            return
-        body = json.dumps(
-            {
-                "id": f"stand-in-{env.get('id')}",
-                "namespace": ns,
-                "type": "response",
-                "in_reply_to": env.get("id"),
-                "final": True,
-                "timestamp": "2026-11-16T00:00:00Z",
-                "payload": payload,
-                "shed": env.get("shed"),
-            }
-        ).encode("utf-8")
-        headers = dict(self._headers, **{"Content-Type": "application/json"})
-        headers.pop("Accept", None)
-        post = http.client.HTTPConnection(self._host, self._port, timeout=10)
-        try:
-            post.request("POST", f"/api/plugins/listeners/{ns}/respond", body=body, headers=headers)
-            post.getresponse().read()
-        except (OSError, http.client.HTTPException):
-            pass
-        finally:
-            post.close()
-
-    def received(self) -> list[dict]:
-        """Every request envelope this stand-in was sent, in arrival order."""
-        with self._lock:
-            return list(self._received)
-
-    def stop(self) -> None:
-        self._stop.set()
-        with self._lock:
-            for sock in self._socks:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-        for t in self._threads:
-            t.join(timeout=5.0)
+        the bus runs in-process, so there's no harness DEVNULL to swallow it)."""

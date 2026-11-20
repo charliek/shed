@@ -1,21 +1,21 @@
-"""A daemon started with a valid-YAML-but-INVALID (or malformed) `-config` exits 1 —
+"""A broker started with a valid-YAML-but-INVALID (or malformed) `--config` exits 1 —
 the live half of the config-validate contract. Each vector is a config
 `HostAgentConfig::load` must reject: an unknown/biometric policy, an
 `aws.mode`/`aws.sheds` error, a non-positive/invalid `approval_timeout`, a duplicate
 map key, or malformed YAML. (The vector set is the one the retired Go
 `LoadConfig`/`Validate` rejected; the saphyr parser + `validate()` port matched it,
-which is what the shared `config_validate.json` fixture records.) The daemon exits 1
-before binding any socket.
+which is what the shared `config_validate.json` fixture records.) The app's loader
+(`shed_app::load_or_synthesize`) refuses each, so the harness exits 1 before binding
+its control socket (the app keeps running with its broker failed closed).
 
-Direct-launch-await-exit-1 pattern (like `test_ssh_mode_error.py` / `test_config_error.py`),
-NOT the `daemon` fixture — a rejected config never binds a socket, so there is nothing to
-query; only the exit code is asserted. The operational log (`tracing` lines) is the
-message channel and is excluded from the compared surface; per-vector message
-substrings are pinned language-neutrally by the `config_validate.json` fixture's
-in-crate runner, not here.
+Direct-launch-await-exit-1 pattern (like `test_ssh_mode_error.py`), NOT the `daemon`
+fixture — a rejected config never binds a socket, so there is nothing to query; only
+the exit code is asserted. The operational log is the message channel and is excluded
+from the compared surface; per-vector message substrings are pinned language-neutrally
+by the `config_validate.json` fixture's in-crate runner, not here.
 
-There is deliberately NO exit-0 positive control: a VALID config boots the daemon and
-runs forever (it never exits), so this exit-code pattern cannot assert exit 0. The
+There is deliberately NO exit-0 positive control: a VALID config boots the broker and
+runs until it is signalled, so this exit-code pattern cannot assert exit 0. The
 "a valid / deprecated-key config loads OK" case is unit-owned (`config.rs`
 `deprecated_desktop_keys_load_ok`) and golden-owned (`config_validate.json` `valid:true`
 vectors), per the plan's H3 disposition.
@@ -29,7 +29,7 @@ import tempfile
 
 import pytest
 
-from conftest import _clean_env
+from conftest import CONTROL_SOCK_NAME, _clean_env, harness_argv
 
 # (id, config_yaml) — each valid YAML but an invalid config, OR malformed YAML. Mirrors
 # the config_validate.json fixture's invalid vectors; the fixture pins the per-vector
@@ -66,12 +66,14 @@ def test_invalid_config_exits_1(binaries, tmp_path_factory, impl, cfg_id, config
     cfg = root / "cfg.yaml"
     cfg.write_text(config_yaml)
 
-    # The daemon exits before binding any socket, so the dir length doesn't matter; a
+    # The harness exits before binding its socket, so the dir length doesn't matter; a
     # short mkdtemp keeps it consistent with the rest of the harness anyway.
     socket_dir = tempfile.mkdtemp(prefix="hadiff-")
     try:
         proc = subprocess.run(
-            [binaries[impl], "-config", str(cfg), "-log-file", str(root / "op.log")],
+            harness_argv(
+                binaries[impl], cfg, root / "op.log", f"{socket_dir}/{CONTROL_SOCK_NAME}"
+            ),
             env=_clean_env(socket_dir, home),
             capture_output=True,
             timeout=30,

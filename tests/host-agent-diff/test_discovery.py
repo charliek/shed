@@ -1,6 +1,6 @@
 """Discovery reload — the `off`/`poll` convergence cells.
 
-The daemon builds ONE supervisor and reconciles the desired server set from a discovery
+The broker builds ONE supervisor and reconciles the desired server set from a discovery
 `source:` (`~/.shed/config.yaml`-style `servers:` doc) per the `watch:` mode. This drives
 a source that starts absent and then appears, pinning the `servers[]` set (by name) it
 converges to:
@@ -19,7 +19,6 @@ dependent `last_error`) is not pinned here — the `servers[]` state shape is ow
 
 from __future__ import annotations
 
-import json
 import time
 
 import pytest
@@ -32,15 +31,13 @@ ALPHA = {"alpha": {"host": "127.0.0.1", "http_port": 9}}
 
 
 def _names_of(obj) -> list:
-    """The sorted `servers[].name` set from a parsed `status --json` object."""
+    """The sorted `servers[].name` set from a parsed status object."""
     return sorted(sv["name"] for sv in obj.get("servers", []))
 
 
 def _server_names(d) -> list:
-    """The sorted `servers[].name` set from `impl`'s `status --json` (once, no poll)."""
-    r = d.status(json=True)
-    assert r.returncode == 0, f"{d.impl}: status --json exit {r.returncode}\n{r.stderr}"
-    return _names_of(json.loads(r.stdout))
+    """The sorted `servers[].name` set from the broker's status (once, no poll)."""
+    return _names_of(d.status())
 
 
 def _poll_names(d, expected: list, timeout: float = 12.0) -> list:

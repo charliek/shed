@@ -66,14 +66,13 @@ test-integration:
 	}
 	cd tests/integration && uv sync && uv run pytest -v $(PYTEST_ARGS)
 
-# Hermetic host-agent wire harness (the THIRD pytest suite — never merged with
-# tests/integration or desktop/tools/shedtest). It spawns the Rust
-# crates/shed-host-agent daemon and asserts its wire-visible output under a
-# defined canonicalization against goldens recorded from the last agreeing
-# Go↔Rust run (the Go cmd/shed-host-agent twin was sunset — see plan
-# 006-mtls-cleanup-hostagent-sunset.md), then runs the language-neutral
-# golden-fixture runners in Rust. Needs Rust (cargo on PATH) + uv. See
-# tests/host-agent-diff/README.md.
+# Hermetic broker wire harness (the THIRD pytest suite — never merged with
+# tests/integration or desktop/tools/shedtest). It runs the desktop app's
+# embedded credential broker in a test process (crates/shed-broker-harness,
+# test-only, in no release) and asserts its wire-visible output under a defined
+# canonicalization against goldens recorded from the last agreeing Go↔Rust run,
+# then runs the language-neutral golden-fixture runners in Rust. Needs Rust
+# (cargo on PATH) + uv. See tests/host-agent-diff/README.md.
 test-host-agent-diff:
 	@command -v uv >/dev/null 2>&1 || { \
 	  echo "uv is required for the host-agent differential harness."; \
@@ -81,11 +80,11 @@ test-host-agent-diff:
 	  exit 1; \
 	}
 	cd tests/host-agent-diff && uv sync && uv run pytest -v
-	# Both Rust crates: the daemon bin owns tests/golden.rs, while the in-crate
-	# golden runners (load_discovered_servers, ssh_payload_shapes, the config/
-	# aws/docker/egress vectors) moved into shed-broker with the crate split. A
-	# filter scoped to the bin alone silently ran ZERO of them.
-	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent -p shed-broker golden
+	# The golden-fixture runners all live in shed-broker: its tests/golden.rs
+	# (effective_policy, gate_namespaces) and the in-crate runners
+	# (load_discovered_servers, ssh_payload_shapes, the config/aws/docker/egress
+	# vectors).
+	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-broker golden
 
 # The machine-transport differential (plan 012 AC2). The FOURTH pytest suite,
 # and — like the other three — never merged with them. SSH has no argv API, so a

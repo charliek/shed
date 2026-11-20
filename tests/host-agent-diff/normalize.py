@@ -1,4 +1,4 @@
-"""Canonicalization + volatile-field masking for the host-agent wire harness.
+"""Canonicalization + volatile-field masking for the broker wire harness.
 
 Two disciplines from the harness plan (D2 comparison model, D3 normalization), both
 of which now serve the recorded goldens:
@@ -29,7 +29,6 @@ MASK_PID = "<pid>"
 MASK_VERSION = "<version>"
 MASK_CONFIG_PATH = "<config_path>"
 MASK_ID = "<id>"
-MASK_EXPIRES = "<expires_at>"
 MASK_MACHINE_ID = "<machine_id>"
 MASK_MACHINE_NAME = "<machine_name>"
 
@@ -37,14 +36,10 @@ MASK_MACHINE_NAME = "<machine_name>"
 # with `fullmatch`: `$` also matches before a final newline, which would pass (and then
 # mask away) an id with a trailing `\n`.
 _MACHINE_ID = re.compile(r"[0-9a-f]{32}")
-# The text render's machine line: `machine:  <name> (<id>)`. The name may itself hold
-# parentheses, so the id is anchored at the end.
-_MACHINE_LINE = re.compile(r"machine:  (?P<name>.+) \((?P<id>[^()]*)\)")
 
-# RFC3339 with second precision and either a `Z` or a numeric offset. Both daemons
-# emit `...Z` (the daemon's std-only formatter; the retired Go twin's `time.RFC3339`
-# on a UTC time), but accept
-# an offset too so the shape check isn't brittle.
+# RFC3339 with second precision and either a `Z` or a numeric offset. The broker emits
+# `...Z` (its std-only formatter; the retired Go twin's `time.RFC3339` on a UTC time),
+# but accept an offset too so the shape check isn't brittle.
 _RFC3339 = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -119,8 +114,7 @@ def mask_live_status(obj: dict, socket_dir: str, config_path: str) -> dict:
     cp = out.get("config_path")
     assert isinstance(cp, str) and cp, f"config_path missing/empty: {cp!r}"
     if config_path:
-        # The daemon must echo back the exact config path it was given (resolved by a
-        # lexical clean).
+        # The broker must echo back the exact config path it was given (made absolute).
         assert cp == config_path, f"config_path {cp!r} != expected {config_path!r}"
     else:
         assert os.path.isabs(cp), f"config_path not absolute: {cp!r}"
@@ -167,63 +161,9 @@ def mask_live_status(obj: dict, socket_dir: str, config_path: str) -> dict:
     return out
 
 
-def mask_hello_ack(obj: dict) -> dict:
-    """Mask the volatile fields of a desktop `hello_ack` frame, leaving everything
-    else to be diffed (D3 normalization for surface A).
-
-    Masked (volatile): `id` (a fresh UUID per frame) and `ts` (RFC3339, shape-asserted
-    first). On an **accepted** ack `agent.version` is
-    also masked (the build string, shape-asserted **nonempty** first — same discipline
-    as `mask_live_status`).
-
-    Diffed (stable): `v`, `type`, `accepted`, `reason`, `agent.approval_method`,
-    `namespaces`, `gate_namespaces`, `agent_capabilities`, `request_timeout_ms` — and,
-    on a **superseded**
-    (`accepted:false`) ack, `agent.version` too: that ack carries the ZERO-value agent
-    `{"version":"","approval_method":""}` (the `hello_ack` builder emits an empty agent
-    whenever `accepted` is false). An empty `version` there is a stable constant, not a volatile
-    build string, so it is diffed as-is rather than masked (and masking it would trip
-    the nonempty shape-assert).
-
-    Returns a new object; the input is not mutated.
-    """
-    assert obj.get("type") == "hello_ack", f"not a hello_ack frame: {obj!r}"
-    out = dict(obj)
-
-    # id: a nonempty string (UUID). Masked — it varies per-frame.
-    _id = out.get("id")
-    assert isinstance(_id, str) and _id, f"hello_ack.id missing/empty: {_id!r}"
-    out["id"] = MASK_ID
-
-    # ts: RFC3339 shape asserted BEFORE masking (so the mask can't hide a bad value).
-    assert_rfc3339(out.get("ts"), "hello_ack.ts")
-    out["ts"] = MASK_TS
-
-    accepted = out.get("accepted")
-    assert isinstance(accepted, bool), f"hello_ack.accepted not a bool: {accepted!r}"
-
-    agent = dict(out.get("agent", {}))
-    if accepted:
-        # An accepted ack carries the live build version — volatile, so mask it
-        # (shape-asserted nonempty first). approval_method stays diffed ("shed-desktop").
-        version = agent.get("version")
-        assert isinstance(version, str) and version.strip(), (
-            f"accepted hello_ack agent.version not a nonempty string: {version!r}"
-        )
-        agent["version"] = MASK_VERSION
-    else:
-        # A superseded ack's agent is the zero value; leave version ("") to be diffed.
-        assert agent.get("version") == "", (
-            f"superseded hello_ack agent.version should be zero-value \"\": {agent!r}"
-        )
-    out["agent"] = agent
-
-    return out
-
-
 def mask_bus_response(obj: dict) -> dict:
-    """Mask the volatile fields of a bus **response** Envelope (surface B), leaving
-    everything else to be diffed (D3 normalization).
+    """Mask the volatile fields of a bus **response** Envelope, leaving everything else
+    to be diffed (D3 normalization).
 
     Masked (volatile): `id` (a fresh UUID per response, `new_response`) and
     `timestamp` (the response mint time, RFC3339 shape-asserted first so the mask
@@ -250,98 +190,6 @@ def mask_bus_response(obj: dict) -> dict:
     return out
 
 
-def mask_token_response(obj: dict) -> dict:
-    """Mask the volatile fields of a desktop `token.response` frame (surface A), leaving
-    everything else to be diffed (D3 normalization for the minter flow).
-
-    Masked (volatile): `id` (a fresh UUID per frame) and `ts` (RFC3339 send time,
-    shape-asserted BEFORE masking).
-
-    Diffed (stable — NOT masked): `v`, `type`, `in_reply_to` (the correlation id, which
-    MUST echo the request's `id`), `server`, `token`, and `expires_at`. The `token` +
-    `expires_at` are DETERMINISTIC here — the daemon mints over a PATH-shim `ssh`
-    returning a fixed bundle — so they are pinned UNMASKED (same "determinism over
-    blanking" rationale as the sign blob), which pins that the daemon carries the minted
-    token through and formats the expiry to UTC RFC3339. On a success the `error` key is
-    ABSENT (skipped when empty), so the golden pins its absence; the caller asserts it.
-
-    Returns a new object; the input is not mutated.
-    """
-    assert obj.get("type") == "token.response", f"not a token.response: {obj!r}"
-    out = dict(obj)
-
-    _id = out.get("id")
-    assert isinstance(_id, str) and _id, f"token.response.id missing/empty: {_id!r}"
-    out["id"] = MASK_ID
-
-    assert_rfc3339(out.get("ts"), "token.response.ts")
-    out["ts"] = MASK_TS
-
-    return out
-
-
-def mask_approval_request(obj: dict) -> dict:
-    """Mask the volatile fields of a desktop `approval_request` frame (surface A),
-    leaving everything else to be diffed (D3 normalization).
-
-    Masked (volatile): `id` (a fresh UUID per frame), `ts` (RFC3339 send time), and
-    `expires_at` (`now + approval_timeout`).
-    Both timestamps have their RFC3339 shape asserted BEFORE masking so the mask can't
-    paper over a malformed value; distinct sentinels (`<ts>` vs `<expires_at>`) make a
-    cross-field leak obvious.
-
-    Diffed (stable — NOT masked): `v`, `type`, `namespace`, `op`, `shed`, `detail`
-    (the fixed `"SSH sign request"`), and — in single-server mode — the ABSENCE of
-    `server` (omitempty). The caller asserts those carry the expected values.
-
-    Returns a new object; the input is not mutated.
-    """
-    assert obj.get("type") == "approval_request", f"not an approval_request: {obj!r}"
-    out = dict(obj)
-
-    _id = out.get("id")
-    assert isinstance(_id, str) and _id, f"approval_request.id missing/empty: {_id!r}"
-    out["id"] = MASK_ID
-
-    assert_rfc3339(out.get("ts"), "approval_request.ts")
-    out["ts"] = MASK_TS
-
-    assert_rfc3339(out.get("expires_at"), "approval_request.expires_at")
-    out["expires_at"] = MASK_EXPIRES
-
-    return out
-
-
-def mask_event(obj: dict) -> dict:
-    """Mask the volatile fields of a desktop `event` frame — the 1:1 audit fan-out
-    (surface A, catalog §3.3) — leaving everything else to be diffed.
-
-    Masked (volatile): `id` (a fresh UUID per frame) and `ts` (the underlying audit
-    entry's own timestamp, RFC3339 shape-asserted first).
-
-    Diffed (stable — NOT masked): `v`, `type` (`"event"`), `kind` (`"audit"`), and
-    every carried audit field that survives the empty-field skip (`shed`, `ns`, `op`,
-    `result`, `detail`, `code`, `reason`, `approval`, `decided_by`, `scope`, `ttl`,
-    `server`). An empty audit field is OMITTED (`is_empty_str`), so the golden pins the
-    exact present-key set — e.g.
-    the deny event carries NO `detail`/`code`, the single-server event carries NO
-    `server`. The caller asserts the stable fields.
-
-    Returns a new object; the input is not mutated.
-    """
-    assert obj.get("type") == "event", f"not an event frame: {obj!r}"
-    out = dict(obj)
-
-    _id = out.get("id")
-    assert isinstance(_id, str) and _id, f"event.id missing/empty: {_id!r}"
-    out["id"] = MASK_ID
-
-    assert_rfc3339(out.get("ts"), "event.ts")
-    out["ts"] = MASK_TS
-
-    return out
-
-
 def mask_audit_entry(obj: dict) -> dict:
     """Mask the volatile fields of a durable audit JSONL record (channel 2, catalog
     §3.1), leaving everything else to be diffed.
@@ -358,69 +206,4 @@ def mask_audit_entry(obj: dict) -> dict:
     out = dict(obj)
     assert_rfc3339(out.get("ts"), "audit.ts")
     out["ts"] = MASK_TS
-    return out
-
-
-def mask_not_running(stderr: str, socket_dir: str) -> str:
-    """Mask the socket directory in the `status`-not-running stderr so the two
-    impls' three lines are byte-equal. Only the first line embeds the path
-    (`<dir>/host-agent-status.sock`); the dir prefix is replaced with `<DIR>`."""
-    return stderr.replace(socket_dir, "<DIR>")
-
-
-def mask_status_text(text: str, socket_dir: str, config_path: str) -> str:
-    """Mask the volatile lines of the human-readable `status` render so the two
-    impls' text is equal: the `pid`/`version` header line, the `config:` line, the
-    `started:` line, the approval-channel `socket` line, and the name and id on the
-    `machine:` line (shape-asserted first; a `machine:  unavailable: …` line is kept).
-    Everything else (the policy table, gate annotations, consumer line,
-    `Servers (N):` block) is diffed.
-    """
-    lines = text.split("\n")
-    masked = []
-    for line in lines:
-        if line.startswith("shed-host-agent status (pid "):
-            masked.append("shed-host-agent status (pid <pid>, <version>)")
-        elif line.startswith("config:"):
-            masked.append("config:   <config_path>")
-        elif line.startswith("started:"):
-            masked.append("started:  <ts>")
-        elif line.startswith("machine:  ") and not line.startswith("machine:  unavailable: "):
-            m = _MACHINE_LINE.fullmatch(line)
-            assert m, f"machine line not `machine:  <name> (<id>)`: {line!r}"
-            assert_machine_identity(m.group("id"), m.group("name"))
-            masked.append(f"machine:  {MASK_MACHINE_NAME} ({MASK_MACHINE_ID})")
-        elif line.startswith("  socket    "):
-            masked.append("  socket    <dir>/" + os.path.basename(line.strip().split()[-1]))
-        else:
-            masked.append(line)
-    return "\n".join(masked)
-
-
-def mask_credential_response(obj: dict) -> dict:
-    """Mask the volatile fields of a desktop `credential.response` frame (surface A),
-    leaving everything else to be diffed.
-
-    Masked (volatile): `id` (a fresh UUID per frame) and `ts` (RFC3339 send time,
-    shape-asserted BEFORE masking).
-
-    Diffed (stable — NOT masked): `v`, `type`, `in_reply_to`, `server`, `auth_mode`,
-    `token`, `client_cert`, `cert_serial`, and `expires_at`. Same "determinism over
-    blanking" rationale as `mask_token_response`: the daemon runs over a PATH-shim
-    `ssh` returning a fixed bundle, so the credential fields ARE deterministic, and
-    pinning them is what freezes how the bundle maps onto the wire
-    — including which fields are OMITTED, which is the load-bearing half in a message
-    whose whole job is to say "here is a token" or "here is a certificate", never both.
-
-    Returns a new object; the input is not mutated.
-    """
-    assert obj.get("type") == "credential.response", f"not a credential.response: {obj!r}"
-    out = dict(obj)
-
-    _id = out.get("id")
-    assert isinstance(_id, str) and _id, f"credential.response.id missing/empty: {_id!r}"
-    out["id"] = "<id>"
-
-    assert_rfc3339(out.get("ts"), "credential.response.ts")
-    out["ts"] = "<ts>"
     return out

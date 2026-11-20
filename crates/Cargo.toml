@@ -4,7 +4,7 @@
 # which links shed-core + shed-app directly, and by shed-mobile (via FRB).
 [workspace]
 resolver = "2"
-members = ["shed-core", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
+members = ["shed-core", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze", "shed-broker-harness"]
 # All members are default members: a plain `cargo build` / `cargo test` (and
 # `make core-test`) build every crate here. shedctl (the headless CLI driver for
 # the shed-desktop IPC socket) has no GUI-toolkit dependency, so it gets Mac
@@ -31,6 +31,14 @@ members = ["shed-core", "shed-app", "shedctl", "shed-broker", "shed-host-agent",
 # (serde, tokio, no reqwest, no chrono). Its recipe cells skip
 # without `SHED_CRAZE_BIN_DIR` (`make craze-binaries`); CI sets
 # `SHED_CRAZE_REQUIRE=1` so a skip there fails.
+#
+# `shed-broker-harness` (plan 037) is a member but NOT a default member: a
+# TEST-ONLY binary that hosts the desktop app's embedded broker for the wire
+# harness (tests/host-agent-diff). It builds shed-app with `broker`, so were it a
+# default member, a plain `cargo build`/`cargo test` would turn that feature on
+# for the whole workspace by feature unification and hide dead code in the
+# default build shed-mobile links. Name it with `-p`; `make -C desktop core-lint`
+# lints it on its own leg. It ships in no release (its `tests/not_shipped.rs`).
 default-members = ["shed-core", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
 
 [workspace.package]

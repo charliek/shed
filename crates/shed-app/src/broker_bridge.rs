@@ -697,6 +697,14 @@ pub struct EmbeddedHostAgent {
     spawned: AtomicBool,
     /// The running supervisor (`None` until [`spawn`] succeeds) — `health()` reads it.
     supervisor: Mutex<Option<Arc<Supervisor>>>,
+    /// The watch/reconcile loop task [`spawn`](Self::spawn) starts. It ends after the
+    /// shutdown flip has drained every server group;
+    /// [`shutdown_and_wait`](Self::shutdown_and_wait) awaits it. `None` before spawn,
+    /// and once awaited.
+    watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set while a [`shutdown_and_wait`](Self::shutdown_and_wait) call holds the watch
+    /// loop's handle, and left set when that loop ended any way but by returning.
+    watch_joining: std::sync::atomic::AtomicBool,
     /// The SSH mode the backend resolved to at spawn (env-dependent for `ssh.mode: ""`);
     /// surfaced in `broker.status`.
     resolved_ssh_mode: Mutex<Option<String>>,
@@ -785,6 +793,8 @@ impl EmbeddedHostAgent {
             gate_namespaces,
             spawned: AtomicBool::new(false),
             supervisor: Mutex::new(None),
+            watch_task: Mutex::new(None),
+            watch_joining: std::sync::atomic::AtomicBool::new(false),
             resolved_ssh_mode: Mutex::new(None),
             ssh_filter: Mutex::new(None),
             ssh_sign_policy: Mutex::new(None),
@@ -809,6 +819,47 @@ impl EmbeddedHostAgent {
     /// groups best-effort (§3.6).
     pub fn shutdown_handle(&self) -> watch::Sender<bool> {
         self.shutdown_tx.clone()
+    }
+
+    /// Flip the shutdown handle and wait, at most `bound`, for the watch loop to end:
+    /// it ends only after the supervisor has drained every server group, so on `true`
+    /// every bus stream this broker held is closed and [`health`](Self::health) is
+    /// empty. `false` when `bound` passed first (the loop keeps draining on its own).
+    /// Before [`spawn`](Self::spawn) there is nothing to wait for: `true`. The app's
+    /// own exit path does not call this (it flips the handle and exits); the wire
+    /// harness's test-only host does, so it can say the broker drained.
+    ///
+    /// `true` means the loop itself returned: a loop that panicked did not drain, and is
+    /// `false`. A second call made while the first is still waiting, or after one timed
+    /// out, is also `false` (the handle is with the first caller, so this one cannot say
+    /// the drain finished); a call after a drain that was seen to finish is `true`.
+    pub async fn shutdown_and_wait(&self, bound: Duration) -> bool {
+        let _ = self.shutdown_tx.send(true);
+        let mut task = {
+            let mut slot = self.watch_task.lock().unwrap();
+            match slot.take() {
+                Some(task) => task,
+                // Never spawned, or already seen to drain: nothing to wait for.
+                None => return !self.watch_joining.load(std::sync::atomic::Ordering::SeqCst),
+            }
+        };
+        self.watch_joining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        match tokio::time::timeout(bound, &mut task).await {
+            // The loop returned by itself: drained.
+            Ok(Ok(())) => {
+                self.watch_joining
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+            // The loop panicked or was aborted: it never reached the drain.
+            Ok(Err(_)) => false,
+            // Still draining: keep the handle so a later call can wait again.
+            Err(_) => {
+                *self.watch_task.lock().unwrap() = Some(task);
+                false
+            }
+        }
     }
 
     /// The delegated-gate namespaces the synthesized `Connected` advertises.
@@ -1016,7 +1067,7 @@ impl EmbeddedHostAgent {
         let shutdown = self.shutdown_rx.clone();
         let reconcile_log = bus_log.clone();
         let loop_log = bus_log.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let reconcile = {
                 let sup = sup.clone();
                 move || {
@@ -1036,6 +1087,7 @@ impl EmbeddedHostAgent {
             watcher::run_watch_loop(watch_cfg, reconcile, shutdown, loop_log).await;
             sup.shutdown().await;
         });
+        *self.watch_task.lock().unwrap() = Some(task);
 
         // Synthesize the Connected(HelloAck) so the approvals UI sections light up exactly
         // as in external mode (no replay buffer — post-restart activity comes from the
@@ -1812,6 +1864,132 @@ mod tests {
         kept.sort();
         assert_eq!(kept, ["machine.json", "machine.lock"]);
         let _ = agent.shutdown_handle().send(true);
+    }
+
+    /// What a held-stream bus has seen: subscriptions it accepted and holds open, and
+    /// how many of those the client has since closed.
+    #[derive(Default)]
+    struct HeldStreams {
+        opened: std::sync::atomic::AtomicUsize,
+        closed: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A loopback stand-in for a server's plugin bus that answers every subscribe with
+    /// `200 text/event-stream` and then holds the stream open, sending nothing, until
+    /// the client closes it (counted). Every other request (the egress stream) gets 501.
+    async fn held_stream_bus() -> (u16, Arc<HeldStreams>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let streams = Arc::new(HeldStreams::default());
+        let seen = streams.clone();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request_line = String::from_utf8_lossy(&head)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let subscribe = request_line.starts_with("GET /api/plugins/listeners/")
+                        && request_line.contains("/messages");
+                    if !subscribe {
+                        let _ = conn
+                            .write_all(b"HTTP/1.1 501 Not Implemented\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    if conn
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    seen.opened.fetch_add(1, SeqCst);
+                    // Hold the stream until the client goes away.
+                    loop {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    seen.closed.fetch_add(1, SeqCst);
+                });
+            }
+        });
+        (port, streams)
+    }
+
+    /// `shutdown_and_wait` returns only once the supervisor has drained every server
+    /// group: on `true`, `health()` is already empty and every stream the broker held
+    /// is closing. The test runs on a current-thread runtime, so nothing else runs
+    /// between the call's return and the `health()` read: a `shutdown_and_wait` that
+    /// returned before the drain would leave the server group in place there.
+    #[tokio::test]
+    async fn shutdown_and_wait_returns_after_every_stream_is_drained() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (port, streams) = held_stream_bus().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("config.yaml");
+        std::fs::write(
+            &src,
+            format!("servers:\n  held:\n    host: 127.0.0.1\n    http_port: {port}\n"),
+        )
+        .unwrap();
+        let yaml = format!("discovery:\n  source: {}\n  watch: off\n", src.display());
+        let cfg = HostAgentConfig::try_parse(&yaml).unwrap();
+        let (mut agent, _events) = EmbeddedHostAgent::new(cfg, Arc::new(bus::FileBusLog::new("")));
+        agent.machine_path = dir.path().join("state/host-agent/machine.json");
+        agent.spawn().await.expect("spawn ok");
+
+        // Every request type the broker subscribes is connected and held open.
+        let mut held = false;
+        for _ in 0..200 {
+            let health = agent.health();
+            let namespaces: Vec<_> = health.iter().flat_map(|s| s.namespaces.clone()).collect();
+            if !namespaces.is_empty()
+                && namespaces.iter().all(|n| n.state == "connected")
+                && streams.opened.load(SeqCst) == namespaces.len()
+            {
+                held = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(held, "never held: {:?}", agent.health());
+        assert_eq!(streams.closed.load(SeqCst), 0);
+
+        assert!(
+            agent.shutdown_and_wait(Duration::from_secs(5)).await,
+            "drained within the bound"
+        );
+        assert!(
+            agent.health().is_empty(),
+            "the groups are drained when it returns: {:?}",
+            agent.health()
+        );
+        // The client side of each stream is gone; the bus reads the close.
+        let opened = streams.opened.load(SeqCst);
+        for _ in 0..200 {
+            if streams.closed.load(SeqCst) == opened {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(streams.closed.load(SeqCst), opened, "every stream closed");
+        // Awaited once: a second call has nothing left to wait for.
+        assert!(agent.shutdown_and_wait(Duration::from_millis(1)).await);
     }
 
     /// The backend the bus actually runs with is the filtered one: the supervisor's

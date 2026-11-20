@@ -1,27 +1,28 @@
-"""The signing check (plan 035 §3.5): what the daemon signs for a shed, and what it
+"""The signing check (plan 035 §3.5): what the broker signs for a shed, and what it
 declines BEFORE any approval prompt.
 
-The daemon signs only an exact SSH login request for a username on `ssh.allow_users`
+The broker signs only an exact SSH login request for a username on `ssh.allow_users`
 (default `[git]`) or an exact SSHSIG blob with namespace `git`
 (`crates/shed-broker/src/sign_check.rs`). Every other request is declined before the
-approval gate: the connected desktop consumer receives NO `approval_request`, the
-backend is never asked, the shed gets the ordinary failure shape
+approval gate: the app (here the harness's control client) is shown NO approval
+request, the backend is never asked, the shed gets the ordinary failure shape
 (`{sign operation failed, SIGN_FAILED}` — it cannot tell which rule declined it), and
-the daemon writes one audit line: `result: "refused"`, the audit-only code
+the broker writes one audit line: `result: "refused"`, the audit-only code
 `SIGN_REFUSED`, `reason` the refusal class, `detail` the check's bounded, escaped
-detail (never the request), `approval: "none"`. The line also reaches the desktop as
-an audit `event`.
+detail (never the request), `approval: "none"`. The line also reaches the app as an
+audit `event`.
 
 Each cell runs the gated configuration of `test_bus_sign_gated.py` (local keys, the
-committed ed25519 key, `ssh.approval.policy: shed-desktop`, a connected and promoted
-desktop consumer), so a request that DID reach the gate would prompt the consumer;
-the golden pins how many `approval_request` frames the consumer saw (none for a
-refusal, one for a request that is signed).
+committed ed25519 key, `ssh.approval.policy: shed-desktop`, a subscribed control
+client), so a request that DID reach the gate would prompt the app; the golden pins
+how many approval requests the control client was shown (none for a refusal, one for
+a request that is signed), and each cell asserts in code that a prompt it was shown is
+the request's.
 
 Not covered here: a name beginning with `_` that is LISTED in `ssh.allow_users`.
 Config load refuses such a list (exit 1, `test_config_validate.py`), and a config that
 fails validation yields a policy that signs nothing, so the run-time rule ("never sign
-a `_` name, whatever the list says") cannot be reached through the daemon's config. It
+a `_` name, whatever the list says") cannot be reached through the broker's config. It
 is covered by the unit tests instead (`bus.rs`
 `every_refusal_class_skips_the_gate_and_the_backend_and_is_audited`, `sign_check.rs`
 `a_listed_underscore_name_is_still_reserved`); the `_bootstrap` cell below covers the
@@ -37,8 +38,8 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.serialization import load_ssh_public_key
 
-from desktop_client import DesktopClient, wait_for_consumer
-from normalize import canonical, mask_audit_entry, mask_bus_response, mask_event
+from control_client import ControlClient
+from normalize import canonical, mask_audit_entry, mask_bus_response
 from sign_payloads import b64, login_request, sshsig
 from synthetic_bus import SyntheticBus
 
@@ -75,33 +76,38 @@ def _sign_request(data: bytes, *, pub_b64: str = ED25519_PUB_B64, flags: int = 0
 
 
 def _run(daemon, config: str, request: dict, *, approve: bool):
-    """Return `scenario(impl)`: push `request` with a promoted desktop consumer; when
+    """Return `scenario(impl)`: push `request` with a subscribed control client; when
     `approve`, answer the one approval prompt it raises. Returns the masked response,
-    the audit `event` the consumer got, the durable audit line, and how many
-    `approval_request` frames the consumer saw in all."""
+    the durable audit line, and how many approval requests the control client was shown
+    in all (each asserted to be this request's prompt)."""
 
     def scenario(impl):
         with SyntheticBus() as bus:
             with daemon(impl, config.replace("{server}", bus.url), install_ssh_key=True) as d:
-                with DesktopClient(str(d.desktop_sock)) as app:
-                    app.send_hello()
-                    wait_for_consumer(d, connected=True, timeout=10.0)
+                with ControlClient(d.control_sock) as app:
                     bus.wait_for_subscribe("ssh-agent", timeout=10.0)
 
                     bus.push_request("ssh-agent", request)
                     if approve:
                         ar = app.await_frame("approval_request", timeout=10.0)
-                        app.send_approval_response(ar["id"], "approve")
+                        app.decide(ar["id"], "approve")
 
                     response = bus.await_response("ssh-agent", timeout=10.0)
-                    # The audit line fans out to the consumer after the response; once it
-                    # is here, any prompt this request caused would have arrived first.
+                    # The audit line fans out to the app after the response; once it is
+                    # here, any prompt this request caused would have arrived first (the
+                    # bridge sends both on one ordered channel).
                     event = app.await_frame("event", timeout=10.0)
                     audit = d.read_audit_jsonl(expect=1, timeout=10.0)[0]
+                    for key in ("shed", "ns", "op", "result", "approval", "code", "reason"):
+                        assert event.get(key) == audit.get(key), (key, event, audit)
                     prompts = [f for f in app.frames() if f.get("type") == "approval_request"]
+                    for prompt in prompts:
+                        assert prompt["namespace"] == "ssh-agent", prompt
+                        assert prompt["op"] == "sign", prompt
+                        assert prompt["shed"] == SHED["name"], prompt
+                        assert "server" not in prompt, prompt
                     return {
                         "response": canonical(mask_bus_response(response)),
-                        "event": canonical(mask_event(event)),
                         "audit": canonical(mask_audit_entry(audit)),
                         "approval_requests": len(prompts),
                     }
@@ -127,8 +133,6 @@ def _assert_refused(result: dict, reason: str, detail: str) -> None:
         "approval": "none",
     }
     assert result["audit"] == want
-    event = dict(want, v=2, type="event", kind="audit", id="<id>")
-    assert result["event"] == event
 
 
 # --- declined before any prompt ------------------------------------------------------
