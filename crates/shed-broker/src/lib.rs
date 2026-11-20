@@ -11,7 +11,7 @@
 //! `ssh_backend_agent`, `aws_backend`, `docker_backend`, `egress`), the SSH-bootstrap
 //! **minter** + control-token provider (`minter`, `bootstrap`, `controltoken`), the
 //! **approval**/**audit** seams (`approval`, `audit`, `touchid`), the **config**
-//! reader (`config`), socket **path resolution + liveness probes** (`sockets`), this
+//! reader (`config`), the **state directory** (`paths`), this
 //! machine's **identity** file (`machine`), and the **health** types + shared RFC3339
 //! helpers (`status`).
 //!
@@ -23,8 +23,6 @@
 //! * [`audit::AuditFanout`] — an always-compiled fan-out seam feeding an activity UI.
 //! * [`controltoken::ControlTokenProvider`] ([`controltoken::ControlTokenMinter`]) —
 //!   the `token.get` control-token vend, minting-only and bus-independent.
-//! * [`sockets::socket_is_live`] / [`sockets::connect_unix_timeout`] — the startup
-//!   mode-probe the desktop app still runs (until its External mode goes).
 
 pub mod approval;
 pub mod audit;
@@ -50,10 +48,10 @@ mod egress;
 // §3.4).
 pub mod machine;
 pub mod minter;
+pub mod paths;
 // What the broker will sign for a shed: the pure sign-request parser and policy (plan
 // 035 §3.5). Nothing calls it from the signing path yet.
 pub mod sign_check;
-pub mod sockets;
 pub mod ssh_backend;
 #[cfg(test)]
 mod testalert;
@@ -83,7 +81,6 @@ pub use controltoken::{
 pub use credstore::CredStore;
 pub use discovery::{load_discovered_servers, ServerTarget};
 pub use machine::MachineIdentity;
-pub use sockets::{connect_unix_timeout, desktop_socket_path, socket_is_live, status_socket_path};
 pub use status::{ActiveSource, NamespaceHealth, ServerHealth, SshSigningStatus};
 pub use supervisor::{SharedDeps, Supervisor};
 

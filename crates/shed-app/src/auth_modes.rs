@@ -46,8 +46,8 @@
 //! * therefore, if an observer event DISAGREES with the latest synchronous
 //!   write, a newer mint has already superseded it — the event is stale, and it
 //!   is dropped ([`AuthModeRegistry::record_observed`]);
-//! * where no synchronous write exists at all (the embedded/headless-coexist
-//!   brokers, whose `EmbeddedTokenMinter` holds no registry), the observer is
+//! * where no synchronous write exists at all (the embedded
+//!   broker, whose `EmbeddedTokenMinter` holds no registry), the observer is
 //!   the only writer and always applies.
 //!
 //! The per-server `sync_seq` is the monotonic ordinal of the last synchronous
@@ -393,7 +393,7 @@ mod tests {
 
     /// The guard is a PRIORITY rule, not a mute: an observer write that agrees
     /// with the minter still applies (it is the same fact), and where the minter
-    /// has never spoken — the embedded/headless-coexist brokers, whose
+    /// has never spoken — the embedded broker, whose
     /// `EmbeddedTokenMinter` holds no registry — the observer is the only writer
     /// and always applies.
     #[test]

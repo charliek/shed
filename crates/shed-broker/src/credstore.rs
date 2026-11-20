@@ -167,7 +167,7 @@ impl CredStore {
     }
 
     /// The production store for a credential `scope`, under the broker's durable state
-    /// directory (`<state>/broker/creds/<scope>` — see [`crate::sockets::state_dir`]
+    /// directory (`<state>/broker/creds/<scope>` — see [`crate::paths::state_dir`]
     /// for why that is NOT the socket dir on Linux).
     ///
     /// The scope is part of the path rather than of the filename because one certificate
@@ -175,7 +175,7 @@ impl CredStore {
     /// server are two independent credentials that must never overwrite each other.
     pub fn for_scope(scope: &str) -> Self {
         Self::new(
-            crate::sockets::state_dir()
+            crate::paths::state_dir()
                 .join("broker")
                 .join("creds")
                 .join(escape_server_name(scope)),

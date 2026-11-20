@@ -12,7 +12,7 @@
 //! <state>/broker/machine.lock   0600  the advisory lock that serializes a create or repair
 //! ```
 //!
-//! `<state>` is [`crate::sockets::state_dir`], the directory the credential store already
+//! `<state>` is [`crate::paths::state_dir`], the directory the credential store already
 //! lives under, so the broker reads the same file and presents the same id on every start.
 //! (A process started with a different `SHED_BROKER_STATE_DIR` is, by construction, a
 //! different machine.)
@@ -137,7 +137,7 @@ pub struct LoadedIdentity {
 /// The identity file's path: `<state>/broker/machine.json`, beside the broker's
 /// credential store (`<state>/broker/creds/`).
 pub fn machine_state_path() -> PathBuf {
-    crate::sockets::state_dir()
+    crate::paths::state_dir()
         .join("broker")
         .join(MACHINE_FILE_NAME)
 }

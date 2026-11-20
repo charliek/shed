@@ -65,7 +65,6 @@ export type SourceStatus = {
   rows: SourceRow[];
   this_machine: SourceMachine | null;
   this_machine_error: string | null;
-  broker_mode: "external" | "embedded" | "headless-coexist" | null;
 };
 
 /** What the window shows, and what it needs to keep reads in order. */

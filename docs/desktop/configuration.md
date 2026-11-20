@@ -23,9 +23,9 @@ The approval sections appear only for the providers the broker delegates to shed
 
 | Section | Setting | Stored as | What it does |
 |---|---|---|---|
-| **General** | Launch at login | the OS login item (a LaunchAgent on macOS, an XDG autostart entry on Linux), *not* `prefs.json` | Starts the app when you sign in. |
+| **General** | Launch at login | the OS login item (a LaunchAgent on macOS, an XDG autostart entry on Linux), *not* `prefs.json`; `login_item_defaulted` records only that the app turned it on once | Starts the app when you sign in. On by default: the app turns it on once, at its first launch, so the broker answers whenever you are logged in. Switch it off and it stays off. |
 | **Terminal** | Open sheds in: Ghostty / Roost / Custom | `terminal_preset`, `terminal_template` | Which terminal **Open in Terminal** launches. Custom takes a command template where `{cmd}` is the ssh command and `{shed}` the shed name, e.g. `ghostty -e {cmd}`; an empty template opens the platform's default terminal. |
-| **Credential broker** | Mode: Automatic / In-app (embedded) / External daemon | `broker_mode` | Where the credential broker runs; applies on the next launch. See [Installation → Credential broker](installation.md#credential-broker). |
+| **Credential broker** | Launch at login (the same switch as General, beside "Credentials are answered only while this app is running.") | the OS login item | The broker runs only while the app does. |
 | **Credential broker** | This machine, and one row per server: its credential source, with **Use this machine** | not stored (read from each server) | Which of your machines answers credential requests on each server. See [Credential sources](#credential-sources) below. |
 | **SSH approvals** | Approval policy / Duration / Method | `ssh_policy`, `ssh_ttl`, `ssh_method` | Policy: Always Allow, Per Shed Allow, **Time Based Allow** (default), Always Ask, Always Deny. Duration (default `2h`) applies to Time Based Allow. Method, for the policies that prompt: Authenticate (`biometrics-or-password`, the default) or Prompt only (`prompt`). Changing any of these clears live SSH grants. |
 | **AWS / Docker credentials** | Allow / Deny | `provider_modes` | A live Allow/Deny toggle (default Deny). No prompt; takes effect immediately. |
@@ -304,11 +304,9 @@ Normal use needs none of these. They exist for the test harness, packaging, and 
 | `SHED_TAURI_SOCKET` | Override the IPC socket path (default `$XDG_RUNTIME_DIR/shed-tauri.sock`, else `/tmp/shed-tauri-<uid>/shed-tauri.sock`). `shedctl` honors it too. |
 | `SHED_TAURI_LOG_FILE` | Move the app's log file. |
 | `SHED_TAURI_LOG` | `=debug` raises the shed crates' lines to DEBUG and adds roost-ipc's. |
-| `SHED_HOST_AGENT_SOCKET_DIR` | Move the directory the app looks in for the `shed-host-agent` sockets. |
 | `SHED_TAURI_TEST_MODE` | `=1` → hermetic test mode: all HTTP clients hit the mock, `terminal.open` + Sparkle are disabled, the test-mode-only IPC ops are enabled, and `identify` echoes the flag. |
 | `SHED_TAURI_MOCK_BASE_URL` | Redirects every shed-server client at one in-process mock (test mode); echoed by `identify`. |
 | `SHED_TAURI_SHED_CONFIG` | Override the `~/.shed/config.yaml` path. In test mode an unset value loads an empty config. |
-| `SHED_TAURI_HOST_AGENT_SOCKET` | Override the host-agent socket the approval client dials (a fake agent, in tests). |
 | `SHED_TAURI_EXTENSIONS_CONFIG` | Override the `extensions.yaml` the embedded broker loads. |
 | `SHED_TAURI_TEST_TIMEOUT_SCALE` | Multiply the harness's `wait_until` budgets (slow CI). Read by the harness, not the app. |
 

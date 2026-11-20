@@ -9,6 +9,7 @@ defaults to the only entry, `"tauri"`. The harness ALWAYS owns the app it drives
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
@@ -236,7 +237,7 @@ def launch(target: str = DEFAULT_TARGET, *, mock_base_url: str, config_path: Pat
 
 
 def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
-                config_path: Path, host_agent_socket: str | None = None,
+                config_path: Path,
                 broker: tuple[dict, "broker_env.BrokerInfo"] | None = None,
                 unreachable_hosts: tuple[str, ...] = (),
                 roost_sockets: dict[str, object] | None = None,
@@ -262,10 +263,6 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     overrides are applied and `broker_env.validate` runs here, before the caller
     spawns: a launch env that could reach the developer's agent, keys or
     servers raises instead.
-
-    `host_agent_socket` is only for the external-mode cells of
-    `test_tauri_broker.py`; unset, it names a path inside `runtime_dir` that
-    nothing listens on, so the app brokers in process.
 
     `craze_path` is the craze seam (`<PREFIX>_CRAZE_PATH`, plan 025 §3.6.1,
     test-mode and debug-build only): the directory this machine's craze source
@@ -293,12 +290,6 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     env[f"{cfg.env_prefix}_TEST_MODE"] = "1"
     env[f"{cfg.env_prefix}_MOCK_BASE_URL"] = mock_base_url
     env[f"{cfg.env_prefix}_SHED_CONFIG"] = str(config_path)
-    # The external-mode probe: a configured daemon socket, or a path in the runtime
-    # dir with nothing listening (so the app brokers in process). The socket-dir
-    # override would move the probe off the throwaway HOME, so it never passes.
-    env[f"{cfg.env_prefix}_HOST_AGENT_SOCKET"] = str(
-        host_agent_socket or runtime_dir / "no-daemon" / "host-agent.sock")
-    env.pop("SHED_HOST_AGENT_SOCKET_DIR", None)
     # **Every app-level knob below is SET-OR-CLEARED**, never merely set: an
     # inherited value from the parent shell must not reach a hermetic launch.
     # One loop rather than a stanza each, so the rule is structural — a knob
@@ -375,6 +366,26 @@ def app_log_path(runtime_dir: Path) -> Path:
     if platform.system() == "Darwin":
         return runtime_dir / "Library" / "Logs" / "ShedDesktop" / "shed-desktop.log"
     return runtime_dir / "state" / "ai.stridelabs.shed-desktop" / "shed-desktop.log"
+
+
+def app_config_dir(runtime_dir: Path) -> Path:
+    """Where a subprocess UI launched with `subproc_env(runtime_dir=...)` keeps
+    `prefs.json`: the app config dir, named by the app's identifier (read from the
+    Tauri config, the mac overlay on macOS), under the redirected HOME (macOS) or
+    XDG_CONFIG_HOME (Linux)."""
+    tauri_dir = REPO_ROOT / "tauri" / "src-tauri"
+    if platform.system() == "Darwin":
+        ident = json.loads((tauri_dir / "tauri.macos.conf.json").read_text())["identifier"]
+        return runtime_dir / "Library" / "Application Support" / ident
+    ident = json.loads((tauri_dir / "tauri.conf.json").read_text())["identifier"]
+    return runtime_dir / "config" / ident
+
+
+def linux_autostart_dir(runtime_dir: Path) -> Path:
+    """Where `auto-launch` writes the Linux login item: `$HOME/.config/autostart`
+    (it ignores XDG_CONFIG_HOME), so under the redirected HOME, never the
+    developer's own."""
+    return runtime_dir / ".config" / "autostart"
 
 
 def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,

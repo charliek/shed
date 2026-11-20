@@ -463,26 +463,14 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
 
     # -- credential broker (leg 3a.2) ------------------------------------
     def broker_status(self) -> dict:
-        """The LiveStatus-shaped broker snapshot: `{effective_mode, pref,
-        restart_required, probe:{desktop_socket_live, status_socket_live},
-        config:{source, message}, resolved_ssh_mode, gate_namespaces, servers,
-        broker_error}`. The C4 embedded-mode truth op."""
+        """The LiveStatus-shaped broker snapshot: `{config:{source, message},
+        resolved_ssh_mode, gate_namespaces, servers, machine, machine_error, ssh,
+        broker_error}`. The embedded broker's truth op."""
         return self.call("broker.status")
-
-    def broker_mode(self) -> dict:
-        """The `{effective, pref, restart_required}` fragment — the effective mode plus
-        the LIVE persisted pref (reflects a `broker_set_mode` without a relaunch)."""
-        return self.call("broker.mode")
-
-    def broker_set_mode(self, mode: str) -> dict:
-        """Persist the broker mode pref (`auto`|`embedded`|`external`). Effective mode is
-        fixed for the process lifetime, so a change sets `restart_required` until relaunch.
-        An unknown mode is rejected (`bad_request`)."""
-        return self.call("broker.set_mode", {"mode": mode})
 
     # -- credential sources (plan 035 §3.4) -------------------------------
     def source_status(self) -> dict:
-        """`{rows, this_machine, this_machine_error, broker_mode}`: one row per
+        """`{rows, this_machine, this_machine_error}`: one row per
         configured server — `{host, supported, source: {id, name}|None, this_machine,
         connected, error}` — and this machine's `{id, name}` (or why there is none). A
         server older than the feature is `supported: False` with no error."""
@@ -627,7 +615,8 @@ class TauriClient(_ApprovalOps, _RcOps, IPCClient):
 
     # -- launch-at-login (B4) --------------------------------------------
     def login_item_status(self) -> bool:
-        """Whether launch-at-login is enabled (the Preferences → General toggle)."""
+        """Whether launch-at-login is enabled (the Preferences → General toggle). The
+        app turns it on once at its first launch (plan 037 §3.1.4)."""
         return self.call("loginitem.status")["enabled"]
 
     def login_item_set(self, enabled: bool) -> None:

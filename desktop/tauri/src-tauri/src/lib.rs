@@ -929,8 +929,8 @@ async fn activity_list(
     ))
 }
 
-/// The namespaces the host agent delegates to us (drives which approval-prefs
-/// sections show + the "host agent · connected" indicator).
+/// The namespaces the broker delegates to us (drives which approval-prefs
+/// sections show + the "credential broker · connected" indicator).
 #[tauri::command]
 async fn gate_namespaces(
     coordinator: tauri::State<'_, Coordinator>,
@@ -1239,6 +1239,12 @@ pub(crate) fn login_item_set(
     .map_err(|e| e.to_string())
 }
 
+/// Whether the app applies its launch-at-login default: a release build, or the
+/// harness (test mode). Never a debug build outside the harness.
+fn login_default_applies(env: &Env) -> bool {
+    !cfg!(debug_assertions) || env.test_mode
+}
+
 /// The launch-at-login state (the Preferences "General" toggle reads this on mount
 /// + reconciles to it after a set).
 #[tauri::command]
@@ -1257,42 +1263,17 @@ fn loginitem_set(
     login_item_set(&app, &env, enabled)
 }
 
-// -- credential broker (leg 3a.2): the mode pref + status surface -------------
+// -- credential broker (leg 3a.2): the status surface --------------------------
 
-/// The credential-broker status the Preferences "Credential broker" control reads on
-/// mount + on `prefs-changed`: effective mode, pref, probe evidence, config source,
-/// resolved ssh mode, per-server health, and any broker-failed error. See
+/// The credential-broker status the Preferences "Credential broker" section reads on
+/// mount + on `prefs-changed`: config source, resolved ssh mode, per-server health,
+/// and any broker-failed error. See
 /// [`broker::BrokerRuntime::status`].
 #[tauri::command]
 fn broker_status(app: tauri::AppHandle) -> serde_json::Value {
     app.try_state::<broker::BrokerRuntime>()
         .map(|rt| rt.status())
         .unwrap_or_else(|| serde_json::json!({}))
-}
-
-/// Set the credential-broker mode pref (`auto`/`embedded`/`external`) + persist. This
-/// does NOT hot-swap — the mode is fixed for the process life — so the reply carries the
-/// CURRENT effective mode and a computed `restart_required` (the persisted pref drifted
-/// from the launch pref), and the control shows a "restart to apply" hint when set.
-/// Guarded (mirrors `loginitem_set`): an unknown mode errors rather than persisting a
-/// value the next launch can't parse.
-#[tauri::command]
-fn broker_set_mode(
-    app: tauri::AppHandle,
-    prefs: tauri::State<'_, prefs::SharedPrefs>,
-    mode: String,
-) -> Result<serde_json::Value, String> {
-    if broker::parse_mode_pref(&mode).is_none() {
-        return Err(format!("unknown broker mode: {mode:?}"));
-    }
-    prefs.set_broker_mode(mode.clone());
-    let (effective, restart_required) = app
-        .try_state::<broker::BrokerRuntime>()
-        .map(|rt| (rt.effective_mode_str().to_string(), rt.restart_required()))
-        .unwrap_or_default();
-    Ok(
-        serde_json::json!({ "pref": mode, "effective": effective, "restart_required": restart_required }),
-    )
 }
 
 // -- credential sources (plan 035 §3.4): the Preferences source rows -------------
@@ -1439,20 +1420,17 @@ pub fn run() {
     // `dashboard.dump` read what the frontend reported.
     let ui: SharedUi = Arc::new(Mutex::new(UiState::default()));
 
-    // The approval clock, shared by the external-mode host-agent client and the
-    // Coordinator. The credential broker (the external UDS client OR the in-process
-    // embedded broker) and the `Backend` it mints for are built in `setup`, after the
-    // broker MODE is resolved from the persisted pref + a socket probe (leg 3a.2) — the
-    // pref lives in prefs.json, which needs the AppHandle. Minter-before-Backend launch
-    // order (§3.2) is preserved inside setup.
+    // The Coordinator's approval clock. The embedded credential broker and the
+    // `Backend` it mints for are built in `setup`; minter-before-Backend launch order
+    // (§3.2) is preserved there.
     let clock = shed_app::traits::system_clock();
 
     #[allow(unused_mut)] // only the macOS+non-test arm re-binds it (the sparkle plugin)
     let mut builder = tauri::Builder::default()
         // Launch-at-login (B4): register the plugin so `app.autolaunch()` resolves;
-        // it does NOT enable autostart on its own (no startup side effect). The
-        // React toggle drives our guarded `loginitem_*` commands, not the plugin's
-        // JS API — so a test-mode write can't bypass the guard.
+        // the plugin enables nothing on its own. The first-launch default in `setup`
+        // and the React toggle both go through our guarded `login_item_set`, not the
+        // plugin's JS API — so a test-mode write can't bypass the guard.
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -1540,7 +1518,6 @@ pub fn run() {
             loginitem_status,
             loginitem_set,
             broker_status,
-            broker_set_mode,
             source_status,
             source_use,
             open_dashboard,
@@ -1574,13 +1551,28 @@ pub fn run() {
             // SSH prefs through the same store.
             app.manage(prefs.clone());
 
-            // ---- credential broker mode selection (leg 3a.2) ----
-            // Probe BOTH daemon sockets the external client would dial, BEFORE entering
-            // async (bounded-blocking connect(2)s): the app's CONFIGURED desktop socket
-            // (env.host_agent_socket — the harness overrides it) + its sibling status
-            // socket, so auto-detect keys off the same path, not the shed-broker default.
-            let broker_pref = broker::mode_pref(&prefs);
-            let broker_probe = shed_app::probe_sockets_at(&env.host_agent_socket);
+            // Launch at login is on by default (plan 037 §3.1.4): turned on once, at the
+            // first launch that can record having done so. Not in a debug build outside
+            // the harness, so a developer's `make run` never registers its target/debug
+            // binary; the harness (test mode) exercises it, contained.
+            if login_default_applies(&env) {
+                match prefs::apply_login_default(&prefs, || {
+                    login_item_set(app.handle(), &env, true)
+                }) {
+                    prefs::LoginDefault::AlreadyApplied => {}
+                    prefs::LoginDefault::TurnedOn => {
+                        app_info!("shed-desktop-tauri: launch at login turned on (first launch)");
+                    }
+                    prefs::LoginDefault::NotRecorded(e) => app_warn!(
+                        "shed-desktop-tauri: could not record that launch at login was set \
+                         up ({e}); not turning it on"
+                    ),
+                    prefs::LoginDefault::SetFailed(e) => app_warn!(
+                        "shed-desktop-tauri: could not turn on launch at login ({e}); switch \
+                         it on in Preferences"
+                    ),
+                }
+            }
 
             // The approval seams (mode-independent): test-mode fakes vs the prod native
             // gate + notifier (Linux polkit / mac Touch-ID; fail-closed stubs elsewhere).
@@ -1606,45 +1598,29 @@ pub fn run() {
             let coord_sink: shed_app::traits::EventSinkRef =
                 Arc::new(approval::TauriEventSink::new(app.handle().clone()));
             let coord_clock = clock.clone();
-            let build_clock = clock.clone();
-            // Build the mode-specific broker spine + the Backend it mints for + the
-            // Coordinator, all INSIDE the Tauri (tokio) runtime — the external client and
-            // the embedded broker both tokio::spawn, and the setup hook has no runtime of
+            // Build the broker spine + the Backend it mints for + the Coordinator, all
+            // INSIDE the Tauri (tokio) runtime — the embedded broker tokio::spawns, and
+            // the setup hook has no runtime of
             // its own (the same reason the IPC bind below uses block_on). The minter is
             // handed to the Backend BEFORE the embedded bus starts (`runtime.start()`),
             // preserving the §3.2 launch order. `env` is borrowed (block_on runs to
             // completion here), so it stays available for the handler + IPC bind below.
             let env_ref = &env;
-            // The broker runtime reads the persisted pref LIVE (for `broker.status`'s
-            // `pref`/`restart_required`), so hand it its own store handle.
-            let broker_prefs = prefs.clone();
             // The per-server credential-mode registry (plan 002 §7 P1/P5), built
-            // EMPTY here because the minter that reads it is constructed before
-            // the Backend that seeds it from config — the same launch order the
-            // embedded broker already imposes. In-memory only: config.yaml is
+            // EMPTY here and seeded by the Backend from config. In-memory only: config.yaml is
             // CLI-owned and this app never writes it.
             let auth_modes = Arc::new(shed_app::AuthModeRegistry::new());
-            let build_modes = auth_modes.clone();
             let backend_modes = auth_modes.clone();
             let (backend, broker_runtime, coordinator) =
                 tauri::async_runtime::block_on(async move {
-                    let spine = broker::build(
-                        env_ref,
-                        broker_pref,
-                        broker_probe,
-                        broker_prefs,
-                        build_clock,
-                        build_modes,
-                    );
-                    // The mode the app resolved, and why (#414) — otherwise only
+                    let spine = broker::build(env_ref);
+                    // Where the broker's config came from (#414) — otherwise only
                     // `broker.status` ever says it.
                     app_info!("shed-desktop-tauri: {}", spine.runtime.describe());
                     // Hermetic in test mode (every host → the mock); the minter is the
-                    // resolved mode's (external UDS credential.get, or the embedded
-                    // provider). `backend_modes` is seeded from the config's
+                    // embedded broker's. `backend_modes` is seeded from the config's
                     // `auth_mode` entries here and attached as every provider's
-                    // CredentialObserver, so an adopted mode is learned in all three
-                    // broker modes.
+                    // CredentialObserver, so an adopted mode is learned.
                     let backend = Arc::new(Backend::from_env_parts_with_credentials(
                         env_ref.test_mode,
                         env_ref.mock_base_url.as_deref(),

@@ -7,7 +7,7 @@
 //! credential the app uses for shed lifecycle calls), never the broker's
 //! credentials-scope certificate. The id a move sends is THIS machine's, from
 //! [`BrokerRuntime::this_machine`]: the identity the embedded broker presents, or the
-//! one the shared file names for the daemon.
+//! one its state directory holds when the broker did not start.
 //!
 //! Every machine name or id here came from other machines by way of the server and is
 //! already cleaned for display by `shed_app::HostSource`; this machine's own name is
@@ -36,7 +36,7 @@ async fn this_machine(rt: Option<&BrokerRuntime>) -> Result<shed_app::MachineIde
     }
 }
 
-/// `source.status` → `{rows, this_machine, this_machine_error, broker_mode}`.
+/// `source.status` → `{rows, this_machine, this_machine_error}`.
 ///
 /// `rows` is one per configured server ([`shed_app::HostSource`]: `host`, `supported`,
 /// `source` `{id, name}` or null, `this_machine`, `connected`, `busy`, `unreachable`,
@@ -63,12 +63,11 @@ pub async fn status(backend: &Backend, rt: Option<&BrokerRuntime>) -> Value {
         "rows": rows,
         "this_machine": this_machine,
         "this_machine_error": this_machine_error,
-        "broker_mode": rt.map(|r| r.effective_mode_str()),
     })
 }
 
-/// `source.use {host}` → make THIS machine the one that answers on `host`, then (in
-/// embedded mode) wake the broker so it connects at once. Answers `{row, woke_broker}`.
+/// `source.use {host}` → make THIS machine the one that answers on `host`, then wake
+/// the broker (when it is running) so it connects at once. Answers `{row, woke_broker}`.
 ///
 /// One request, never retried: a refusal is reported as it is, in plain words
 /// ([`use_error`]). An unknown `host` is `bad_request`; no identity is
@@ -143,24 +142,16 @@ fn use_error(host: &str, e: &SourceError, rt: Option<&BrokerRuntime>) -> (String
     }
 }
 
-/// Where this machine's broker runs, for the "has not seen this machine" message.
+/// The state of this app's broker, for the "has not seen this machine" message.
 fn broker_hint(host: &str, rt: Option<&BrokerRuntime>) -> String {
-    match rt.map(|r| (r.effective_mode_str(), r.broker_failed())) {
-        Some(("embedded", true)) => {
+    match rt.map(BrokerRuntime::broker_failed) {
+        Some(true) => {
             "The in-app broker did not start (see Preferences → Credential broker).".to_string()
         }
-        Some(("embedded", false)) => format!(
+        Some(false) => format!(
             "The in-app broker is running; check that it lists {host} under Credential broker."
         ),
-        Some(("external", _)) => format!(
-            "This app uses a separate broker daemon: check that it is running and brokers \
-             for {host}."
-        ),
-        Some(("headless-coexist", _)) => format!(
-            "A separate headless broker runs here: check that it is running and brokers \
-             for {host}."
-        ),
-        _ => "Check that this machine's credential broker is running.".to_string(),
+        None => "Check that this machine's credential broker is running.".to_string(),
     }
 }
 

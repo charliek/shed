@@ -449,7 +449,9 @@ def test_loginitem_probe(tauri):
     # Restore the initial state after (the app is session-scoped, so a left-over
     # login item would leak into later tests / the dev's environment).
     before = tauri.login_item_status()
-    assert before is False  # default off at a hermetic launch
+    # On by default: the app turned it on at its first (hermetic) launch (plan 037
+    # §3.1.4). Nothing earlier in the session switches it off.
+    assert before is True
     try:
         tauri.login_item_set(True)
         assert tauri.login_item_status() is True

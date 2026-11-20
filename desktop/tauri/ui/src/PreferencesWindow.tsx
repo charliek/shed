@@ -17,10 +17,10 @@ import {
   getProviderModes, setProviderMode,
   listShedRules, removeShedRule,
   getAppearanceState, reportPrefs,
-  getBrokerStatus, setBrokerMode,
+  getBrokerStatus,
   getSourceStatus, makeThisMachineSource, cleanMachineText,
   type TerminalPresetInfo, type SshPrefs, type ProviderModes, type ShedRule,
-  type PrefsReport, type BrokerMode, type BrokerStatus,
+  type PrefsReport, type BrokerStatus,
 } from "@/lib/bridge";
 import {
   EMPTY_SOURCES,
@@ -50,23 +50,6 @@ const SSH_POLICIES: { id: string; label: string; prompts: boolean; usesDuration:
   { id: "always-ask", label: "Always Ask", prompts: true, usesDuration: false },
   { id: "always-deny", label: "Always Deny", prompts: false, usesDuration: false },
 ];
-
-// The credential-broker modes (leg 3a.2), most → least automatic. `auto` follows a
-// socket probe (daemon present ⇒ external; headless daemon ⇒ coexist; neither ⇒
-// embedded); the others pin the mode. Changing it takes effect on the next launch.
-const BROKER_MODES: { id: BrokerMode; label: string }[] = [
-  { id: "auto", label: "Automatic" },
-  { id: "embedded", label: "In-app (embedded)" },
-  { id: "external", label: "External daemon" },
-];
-
-// The human line for the active effective mode — mac-style live note.
-const BROKER_EFFECTIVE_NOTE: Record<BrokerStatus["effective_mode"], string> = {
-  external: "Brokering credentials via a separate broker daemon.",
-  embedded: "Brokering credentials in-app — no separate daemon needed.",
-  "headless-coexist":
-    "Brokering handled by a separate headless broker; in-app approvals unavailable.",
-};
 
 /** A titled grouped card: the mac per-section mono label + the rounded container
     the section's rows live in. The optional Footnote is a separate sibling. */
@@ -123,14 +106,6 @@ export default function PreferencesWindow() {
   const [providerModes, setModes] = useState<ProviderModes>({});
   const [shedRules, setShedRules] = useState<ShedRule[]>([]);
   const [broker, setBroker] = useState<BrokerStatus | null>(null);
-  // Set once the user changes the mode — the change is deferred to the next launch, so
-  // the control shows a restart-to-apply hint until then.
-  const [brokerRestart, setBrokerRestart] = useState(false);
-  // Disables the broker-mode Select while a change is in flight — the serialize that
-  // stops an older selection's set/read-back round trip from landing after (and
-  // overwriting) a newer one, since the Select is unavailable until the latest settles.
-  const [brokerBusy, setBrokerBusy] = useState(false);
-  const brokerGen = useRef(0);
   // Credential sources (plan 035 §3.4): every server's row + this machine's identity,
   // reconciled per server by `lib/sources.ts` (reads in issue order, a move owning its
   // row while in flight). The ref is the truth every async step reads and replaces;
@@ -236,12 +211,7 @@ export default function PreferencesWindow() {
       if (fresh()) setShedRules(v);
     });
     void getBrokerStatus().then((v) => {
-      if (fresh() && v) {
-        setBroker(v);
-        // The restart hint is backend truth (persisted pref drifted from the launch
-        // pref) — reconciled here so it survives a prefs-changed reload too.
-        setBrokerRestart(v.restart_required);
-      }
+      if (fresh() && v) setBroker(v);
     });
     // Ordered per server by its own sequence (`lib/sources.ts`), not by `fresh()`.
     sourceOps.reload();
@@ -336,35 +306,6 @@ export default function PreferencesWindow() {
       setShedRules(await listShedRules());
     })();
   };
-  // Broker mode: persist the pref (optimistic on the pref field only — the EFFECTIVE
-  // mode does NOT change until relaunch, so keep showing the running one). The restart
-  // hint is backend truth (persisted pref vs. launch pref), taken from the set reply and
-  // then reconciled — along with the pref — from `broker.status` either way. The Select
-  // is disabled for the duration (brokerBusy) — the simplest serialize: with the control
-  // unavailable mid-flight there's no way to fire an overlapping change, so an older
-  // set/read-back can never resolve after (and clobber) a newer one. A generation guard
-  // backs it up in case a stray call still overlaps.
-  const chooseBrokerMode = (mode: BrokerMode) => {
-    setBroker((b) => (b ? { ...b, pref: mode } : b));
-    const mine = ++brokerGen.current;
-    setBrokerBusy(true);
-    void (async () => {
-      try {
-        const res = await setBrokerMode(mode);
-        if (mine === brokerGen.current) setBrokerRestart(res.restart_required);
-      } catch {
-        // fall through to reconcile from the backend truth
-      }
-      const fresh = await getBrokerStatus();
-      if (mine !== brokerGen.current) return; // superseded by a newer change
-      if (fresh) {
-        setBroker(fresh);
-        setBrokerRestart(fresh.restart_required);
-      }
-      setBrokerBusy(false);
-    })();
-  };
-
   // "Use this machine" on one server: ONE click, no confirmation. A move is undone the
   // same way (one click on the other machine), nothing is lost but the other machine's
   // waiting approvals, and the footnote says so — a dialog would only slow down the one
@@ -501,8 +442,6 @@ export default function PreferencesWindow() {
       login: launchAtLogin,
       provider_modes: providerModes,
       shed_rules_count: shedRules.length,
-      broker_pref: broker?.pref ?? "auto",
-      broker_effective: broker?.effective_mode ?? "external",
       broker_error: broker?.broker_error ?? null,
       sources: sourceRows.map((r) => ({
         host: r.host,
@@ -574,20 +513,18 @@ export default function PreferencesWindow() {
       {broker && (
         <>
           <Section title="Credential broker">
-            <label className="flex items-center gap-3 px-3.5 py-2.5" data-broker-mode>
-              <span className="flex-none text-[13px] text-shed-text">Mode</span>
-              <span className="flex-1" />
-              <span className="w-[200px]">
-                <Select
-                  value={broker.pref}
-                  onChange={(v) => chooseBrokerMode(v as BrokerMode)}
-                  options={BROKER_MODES.map((m) => ({ value: m.id, label: m.label }))}
-                  disabled={brokerBusy}
-                />
+            {/* Credentials need the app running (plan 037 §3.1.4): the same launch-at-login
+                switch as General, beside the reason it matters. */}
+            <label className="flex items-center gap-3 px-3.5 py-2.5" data-broker-login>
+              <span className="text-[13px] text-shed-text">
+                Credentials are answered only while this app is running.
               </span>
+              <span className="flex-1" />
+              <span className="flex-none text-[12px] text-shed-text-muted">Launch at login</span>
+              <Switch on={launchAtLogin} set={toggleLaunchAtLogin} disabled={loginBusy} />
             </label>
-            {/* The active (running) mode + any broker-failed error — the status surface
-                the tray reuses; visible so a failed embedded broker isn't silent. */}
+            {/* The broker's state + any broker-failed error — the status surface the tray
+                reuses; visible so a failed broker isn't silent. */}
             <div className="border-t border-shed-border px-3.5 py-2.5" data-broker-active>
               <div className="flex items-center gap-2">
                 <span
@@ -595,7 +532,7 @@ export default function PreferencesWindow() {
                   style={{ background: broker.broker_error ? "var(--shed-danger)" : "var(--shed-ok)" }}
                 />
                 <span className="text-[12px] text-shed-text-muted">
-                  {BROKER_EFFECTIVE_NOTE[broker.effective_mode]}
+                  {broker.broker_error ? "The in-app broker did not start." : "Brokering credentials in this app."}
                 </span>
               </div>
               {broker.broker_error && (
@@ -676,20 +613,16 @@ export default function PreferencesWindow() {
               );
             })}
           </Section>
-          <Footnote>
-            Automatic uses the in-app broker when no separate broker daemon is running, and the
-            daemon when it is. Changes take effect{" "}
-            {brokerRestart ? <strong>after you restart Shed Desktop.</strong> : "on the next launch."}
-            {sourceRows.length > 0 && (
-              <span className="mt-1.5 block" data-source-footnote>
+          {sourceRows.length > 0 && (
+            <Footnote>
+              <span data-source-footnote>
                 One machine answers credential requests per server, and nothing fails over on
-                its own: if the source is off, nothing answers until you choose another. The
-                in-app broker connects at once; a separate broker daemon switches within
-                about half a minute. Moving the source here drops any approval still waiting
-                on the other machine.
+                its own: if the source is off, nothing answers until you choose another. Moving
+                the source here makes this machine answer at once and drops any approval still
+                waiting on the other machine.
               </span>
-            )}
-          </Footnote>
+            </Footnote>
+          )}
         </>
       )}
 

@@ -126,8 +126,15 @@ holds.
   `{os, enabled, reason, instantiated}`. Under the harness the Sparkle plugin is **never
   registered**, so on macOS it reports `enabled=false, instantiated=false,
   reason="test_mode"`, and `updater.check` returns `updater_disabled:test_mode`.
-- **Launch at login** (`test_loginitem_probe`): test mode round-trips the toggle without
-  writing a real LaunchAgent (a real write would hit TCC).
+- **Launch at login** (`test_loginitem_probe`, `test_login_item_default_once`,
+  `test_login_item_not_turned_on_when_prefs_unwritable`): the app turns it ON at its first
+  launch (plan 037 §3.1.4), so the session app reads on. Test mode round-trips it through an
+  in-memory cell without writing a real LaunchAgent (a real write would hit TCC); a FRESH
+  launch's cell starts off, so on macOS a relaunch shows only that the default did not run
+  again (`prefs.json`'s `login_item_defaulted`). A debug build outside the harness
+  (`make run`, `tauri dev`) never applies the default, so your own build never registers
+  itself. The unwritable-prefs cell makes `prefs.json` a directory (a read-only directory
+  does not stop root in Docker).
 - **Approvals** (`test_approvals.py`, `test_tauri_broker.py`): the Touch ID gate is never
   shown under the harness (no `biometrics*` policy is ever written; the harness broker
   delegates to the app). Requests come through the mocks' plugin bus (`bus_stimulus.py`:

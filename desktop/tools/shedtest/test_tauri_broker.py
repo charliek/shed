@@ -6,8 +6,9 @@ wired by C3) against a hermetic mock shed-server that grows the two plugin-bus
 endpoints (`GET /api/plugins/listeners/{ns}/messages` SSE + `POST
 /api/plugins/listeners/{ns}/respond`). This is the §3.8 behavioral oracle for the
 embedded path: structurally it IS the harness-verified broker code; behaviorally
-these cells prove the app-level integration (three-way auto-detect, the bus →
-AppGate → Coordinator → respond round-trip, config provenance, the 409 split).
+these cells prove the app-level integration (the app always brokers in process,
+the bus → AppGate → Coordinator → respond round-trip, config provenance, the 409
+split, and the launch-at-login default).
 
 Every cell launches its OWN hermetic app instance (a throwaway HOME/XDG_RUNTIME_DIR
 → its own socket + single-instance lock) with its own PRIVATE mock shed-server, so
@@ -25,7 +26,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import shutil
 import stat
 import subprocess
@@ -43,11 +43,6 @@ from bus_stimulus import SSH, audit_line, emit_sign, git_login, new_approval, pe
 from client import ShedError, TauriClient, scaled_timeout
 from mockserver import MockShedServer
 
-# The external-mode cells below still run against the fake daemon until that
-# mode goes.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fake-host-agent"))
-from fake_host_agent import FakeHostAgent  # noqa: E402
-
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CONFIG = FIXTURES / "config.yaml"
 
@@ -55,7 +50,6 @@ CONFIG = FIXTURES / "config.yaml"
 @contextmanager
 def _broker_app(
     *,
-    host_agent_socket: str | None = None,
     extensions_yaml: str | None = None,
     discovery_mock: bool = False,
     gen_ssh_key: bool = False,
@@ -67,6 +61,8 @@ def _broker_app(
     source: dict | None = None,
     block_state_dir: bool = False,
     approval_timeout: str | None = None,
+    runtime_dir: Path | None = None,
+    before_launch=None,
 ):
     """Launch a self-managed tauri instance with a PRIVATE mock shed-server, yield
     `(client, mock, info)`, and tear both down. `info` carries `ssh_blob`, `audit_path`,
@@ -74,10 +70,7 @@ def _broker_app(
     `broker` (the `broker_env.BrokerInfo`). Every launch goes through
     `broker_env.validate` (in `ui.subproc_env`) before the spawn.
 
-    * `host_agent_socket` — the app's configured Surface-A socket; the three-way probe
-      keys off it (`shed_app::probe_sockets_at`). `None` ⇒ neither daemon socket exists
-      under the throwaway HOME ⇒ auto-detect resolves to **embedded**.
-    * `extensions_yaml` — written to `~/.config/shed/extensions.yaml` (the daemon's
+    * `extensions_yaml` — written to `~/.config/shed/extensions.yaml` (the broker's
       default path) + pointed at via `SHED_TAURI_EXTENSIONS_CONFIG`; `None` ⇒ absent ⇒
       the bridge synthesizes the fresh-install default.
     * `local_keys_ssh` — the hermetic broker of `broker_env.write_hermetic_broker`
@@ -99,6 +92,9 @@ def _broker_app(
     * `block_state_dir` — make the broker state dir (`SHED_BROKER_STATE_DIR`) a
       regular FILE, so no machine identity can be loaded or created.
     * `approval_timeout` — the broker's `approval_timeout` (with `local_keys_ssh`).
+    * `runtime_dir` — launch over this (caller-owned, kept) HOME instead of a fresh
+      throwaway one, so a cell can relaunch over the same prefs and login item.
+    * `before_launch` — called with the runtime dir just before the spawn.
     """
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
@@ -116,7 +112,8 @@ def _broker_app(
         mock.arm_source(**source)
 
     info: dict = {"ssh_blob": None, "audit_path": None, "runtime_dir": None}
-    runtime_dir = Path(tempfile.mkdtemp(prefix="shed-brk-"))
+    owned = runtime_dir is None
+    runtime_dir = Path(tempfile.mkdtemp(prefix="shed-brk-")) if owned else Path(runtime_dir)
     info["runtime_dir"] = runtime_dir
     try:
         if local_keys_ssh:
@@ -165,9 +162,10 @@ def _broker_app(
         # dirs here, the extensions config set or cleared) and validates it.
         env = ui.subproc_env(
             cfg, runtime_dir=runtime_dir, mock_base_url=mock.base_url,
-            config_path=shed_config_path, host_agent_socket=host_agent_socket,
-            broker=broker,
+            config_path=shed_config_path, broker=broker,
         )
+        if before_launch is not None:
+            before_launch(runtime_dir)
 
         sock = runtime_dir / cfg.sock_rel
         log = runtime_dir / "broker-ui.log"
@@ -189,7 +187,8 @@ def _broker_app(
             ui.terminate(proc)
             log_fh.close()
     finally:
-        shutil.rmtree(runtime_dir, ignore_errors=True)
+        if owned:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
         mock.stop()
 
 
@@ -223,68 +222,38 @@ def _sign_envelope(rid: str, ssh_blob: str, *, server: str = "mock", shed: str =
 
 
 # ---------------------------------------------------------------------------
-# Cell (a) — three-way auto-detect (§3.3)
+# Cell (a) — the app always brokers in process
 # ---------------------------------------------------------------------------
 
-def test_autodetect_embedded_when_no_daemon_sockets():
-    """No daemon sockets under the throwaway HOME ⇒ auto resolves to EMBEDDED, with the
-    probe evidence surfaced (both sockets dead) and the fresh-install config
-    synthesized."""
-    with _broker_app(host_agent_socket=None) as (client, _mock, _info):
-        assert client.identify()["broker_mode"]["effective"] == "embedded"
+def test_embedded_always():
+    """The app brokers in process with no mode to choose: `broker.status` and
+    `identify` carry no mode fields, the mode ops are gone, and the broker subscribes
+    the mock with the fresh-install namespace set and reports what it signs."""
+    with _broker_app(discovery_mock=True) as (client, _mock, _info):
+        # The broker subscribes ssh-agent (gated) + docker-credentials (subscribes-with-
+        # deny); aws is unconfigured ⇒ never subscribed (broker_bridge.rs spawn()).
+        client.wait_until(
+            lambda: _server_ns_states(client.broker_status()).get("ssh-agent") == "connected"
+            and _server_ns_states(client.broker_status()).get("docker-credentials") == "connected",
+            timeout=20, what="mock subscribed (ssh-agent + docker-credentials connected)")
         st = client.broker_status()
-        assert st["effective_mode"] == "embedded"
-        assert st["probe"] == {"desktop_socket_live": False, "status_socket_live": False}
-        assert st["config"]["source"] == "synthesized"
-
-
-def test_autodetect_external_when_desktop_socket_live():
-    """A live desktop (Surface-A) socket ⇒ EXTERNAL mode (today's UDS client) — and the
-    external approval round-trip still works via the fake host-agent (the session
-    instance's contract, proven here for a self-managed one too)."""
-    fake = FakeHostAgent()
-    fake.start()
-    try:
-        with _broker_app(host_agent_socket=fake.socket_path) as (client, _mock, _info):
-            assert fake.wait_connected(), "app did not connect to the desktop socket"
-            assert client.identify()["broker_mode"]["effective"] == "external"
-            assert client.broker_status()["effective_mode"] == "external"
-            # today's approval flow: emit over the UDS, decide, assert the reply.
-            client.set_ssh_approval(policy="always-ask")
-            rid = fake.emit_request("ssh-agent", "sign", "ext-shed", "ssh-ed25519")
-            client.wait_until(lambda: any(a["id"] == rid for a in client.approvals_list()),
-                              timeout=15, what="external approval prompt")
-            client.approval_decide(rid, "approve")
-            resp = fake.wait_response(rid)
-            assert resp and resp["decision"] == "approve"
-    finally:
-        fake.stop()
-
-
-def test_autodetect_headless_coexist_when_only_status_socket_live():
-    """A HEADLESS daemon (status socket live, desktop socket absent) ⇒ HEADLESS-COEXIST:
-    the app starts no bus (no servers watched) and takes no approvals (dark), and
-    `broker.status` says exactly that."""
-    status_fake = FakeHostAgent(status_only=True)
-    status_fake.start()
-    try:
-        # The desktop socket the app is CONFIGURED with is the (absent) sibling of the
-        # bound status socket, so `probe_sockets_at` finds status-only.
-        desktop_sibling = os.path.join(
-            os.path.dirname(status_fake.socket_path), "host-agent.sock")
-        with _broker_app(host_agent_socket=desktop_sibling) as (client, _mock, _info):
-            assert client.identify()["broker_mode"]["effective"] == "headless-coexist"
-            st = client.broker_status()
-            assert st["effective_mode"] == "headless-coexist"
-            assert st["probe"] == {"desktop_socket_live": False, "status_socket_live": True}
-            # Approvals dark: no bus started ⇒ no servers watched, ssh mode unresolved.
-            assert st["servers"] == []
-            assert st["resolved_ssh_mode"] is None
-            # A real headless status socket never speaks the desktop protocol — the app
-            # must never have sent it a frame (hello or otherwise).
-            assert status_fake.received_frames() == [], status_fake.received_frames()
-    finally:
-        status_fake.stop()
+        for gone in ("effective_mode", "pref", "restart_required", "probe"):
+            assert gone not in st, st
+        assert "broker_mode" not in client.identify()
+        assert st["config"]["source"] == "synthesized", st
+        assert st["broker_error"] is None, st
+        assert set(_server_ns_states(st)) == {"ssh-agent", "docker-credentials"}, st
+        # What the embedded broker signs for a shed (plan 035 §3.5): the default allow
+        # list, no key filter, the resolved mode; no counts until a shed lists keys.
+        ssh = st["ssh"]
+        assert ssh["allow_users"] == ["git"], ssh
+        assert ssh["key_filter"] is False, ssh
+        assert ssh["mode"] == st["resolved_ssh_mode"], (ssh, st["resolved_ssh_mode"])
+        assert "keys_offered" not in ssh and "keys_available" not in ssh, ssh
+        for op in ("broker.mode", "broker.set_mode"):
+            with pytest.raises(ShedError) as e:
+                client.call(op, {"mode": "external"})
+            assert e.value.code == "unknown_op", (op, e.value)
 
 
 # ---------------------------------------------------------------------------
@@ -391,45 +360,6 @@ def test_expiry_fails_closed():
             assert e.code in ("not-found", "not_found"), e
         time.sleep(scaled_timeout(1))
         assert len(mock.replies_to(SSH, eid)) == 1, mock.replies_to(SSH, eid)
-
-
-# ---------------------------------------------------------------------------
-# Cell (c) — token/status: subscribed namespace set, identify, set_mode round-trip
-# ---------------------------------------------------------------------------
-
-def test_embedded_status_and_set_mode_round_trip():
-    """`broker.status` shows the mock subscribed with the expected namespace set
-    (connected), `identify` carries the mode, and `broker.set_mode` is a deferred-apply
-    round-trip (set embedded ⇒ restart_required; set back to auto ⇒ cleared)."""
-    with _broker_app(discovery_mock=True) as (client, mock, _info):
-        # The broker subscribes ssh-agent (gated) + docker-credentials (subscribes-with-
-        # deny); aws is unconfigured ⇒ never subscribed (broker_bridge.rs spawn()).
-        client.wait_until(
-            lambda: _server_ns_states(client.broker_status()).get("ssh-agent") == "connected"
-            and _server_ns_states(client.broker_status()).get("docker-credentials") == "connected",
-            timeout=20, what="mock subscribed (ssh-agent + docker-credentials connected)")
-        st = client.broker_status()
-        assert st["effective_mode"] == "embedded"
-        assert set(_server_ns_states(st)) == {"ssh-agent", "docker-credentials"}, st
-        assert client.identify()["broker_mode"]["effective"] == "embedded"
-        # What the embedded broker signs for a shed (plan 035 §3.5): the default allow
-        # list, no key filter, the resolved mode; no counts until a shed lists keys.
-        ssh = st["ssh"]
-        assert ssh["allow_users"] == ["git"], ssh
-        assert ssh["key_filter"] is False, ssh
-        assert ssh["mode"] == st["resolved_ssh_mode"], (ssh, st["resolved_ssh_mode"])
-        assert "keys_offered" not in ssh and "keys_available" not in ssh, ssh
-
-        # set_mode round-trip. Launch pref was auto (effective embedded via the probe):
-        # pinning embedded drifts the persisted pref ⇒ restart_required until relaunch.
-        r = client.broker_set_mode("embedded")
-        assert r["pref"] == "embedded" and r["effective"] == "embedded"
-        assert r["restart_required"] is True
-        assert client.broker_mode()["restart_required"] is True
-        # Back to the launch value clears it (no relaunch needed).
-        r = client.broker_set_mode("auto")
-        assert r["pref"] == "auto" and r["restart_required"] is False
-        assert client.broker_mode()["restart_required"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +575,7 @@ def test_not_source_until_use_this_machine_then_connected_at_once():
 
         status = client.source_status()
         assert status["this_machine"] == {"id": machine["id"], "name": machine["name"]}, status
-        assert status["broker_mode"] == "embedded", status
+        assert "broker_mode" not in status, status
         row = _source_row(client)
         assert row == {"host": "mock", "supported": True,
                        "source": {"id": OTHER_MACHINE, "name": "desk"},
@@ -735,47 +665,6 @@ def test_unarmed_server_has_no_source_rows():
         assert report["sections"] == ["general", "terminal", "broker", "ssh"], report
         assert report["values"]["sources"] == [], report
         assert report["values"]["this_machine_name"] is None, report
-
-
-def test_external_mode_rows_and_use_this_machine():
-    """External mode (a shed-host-agent daemon brokers; here the fake): the app still
-    shows the rows and moves the source, naming this machine by the identity file the
-    daemon shares. A machine the server has never seen is refused in plain words that
-    name the daemon, once; after its broker has reached the server the same move
-    works."""
-    fake = FakeHostAgent()
-    fake.start()
-    try:
-        with _broker_app(host_agent_socket=fake.socket_path, source={}) as (client, mock, info):
-            assert fake.wait_connected()
-            assert client.broker_status()["effective_mode"] == "external"
-            status = client.source_status()
-            me = status["this_machine"]
-            assert me and status["this_machine_error"] is None, status
-            on_disk = json.loads(_machine_json(info).read_text())
-            assert on_disk["id"] == me["id"] and on_disk["name"] == me["name"], on_disk
-            row = _source_row(client)
-            assert row["supported"] and row["source"]["name"] == "desk", row
-            assert row["this_machine"] is False, row
-
-            with pytest.raises(ShedError) as e:
-                client.source_use("mock")
-            assert e.value.code == "source_machine_not_found", e.value
-            assert e.value.message.startswith("mock has not seen this machine yet"), e.value
-            assert "separate broker daemon" in e.value.message, e.value
-            assert mock.source_use_requests() == [{"machine_id": me["id"]}], "sent once"
-
-            # What the daemon's first subscribe does on the real server.
-            mock.know_machine(me["id"], me["name"])
-            used = client.source_use("mock")
-            assert used["woke_broker"] is False, used
-            assert used["row"]["this_machine"] is True, used
-            assert mock.source_use_requests()[-1] == {"machine_id": me["id"]}
-            _open_prefs(client)
-            client.wait_until(lambda: (_prefs_source(client) or {}).get("this_machine") is True,
-                              timeout=20, what="the Preferences row reads this machine")
-    finally:
-        fake.stop()
 
 
 def test_refused_moves_show_their_messages():
@@ -1061,8 +950,7 @@ def test_log_file_records_startup_broker_bus_and_shutdown():
         starting = [line for line in lines if "shed-desktop-tauri: starting: version " in line]
         assert len(starting) == 1, lines
         assert starting[0].endswith(f"log {log}"), starting
-        broker = ("shed-desktop-tauri: broker: mode=embedded pref=auto "
-                  "probe{desktop_socket_live=false, status_socket_live=false} config=synthesized")
+        broker = "shed-desktop-tauri: broker: config=synthesized"
         assert any(line.endswith(broker) for line in lines), lines
         # Every line is stamped `<RFC 3339 UTC> <LEVEL> …`.
         for line in lines:
@@ -1138,53 +1026,92 @@ def test_synthesized_default_namespace_set():
 
 
 # ---------------------------------------------------------------------------
-# Cell (f) — per-server credential mode across all three broker modes (plan 002 C3)
+# Cell (g) — per-server credential mode (plan 002 C3)
 # ---------------------------------------------------------------------------
 
 MTLS_CONFIG = FIXTURES / "config-mtls.yaml"
 
 
-@pytest.mark.parametrize(
-    "mode,use_fake_agent",
-    [("embedded", False), ("external", True), ("headless-coexist", False)],
-)
-def test_hosts_auth_surfaces_the_config_mode_in_every_broker_mode(mode, use_fake_agent):
-    """`hosts.auth` reports each server's credential mode regardless of WHICH broker
-    is doing the minting.
+def test_hosts_auth_surfaces_the_config_mode():
+    """`hosts.auth` reports each server's credential mode: one registry seeded from
+    config and updated by the core's CredentialObserver.
 
-    The three modes reach mtls by different routes — external relays the CSR over the
-    UDS, embedded and headless-coexist relay it into the in-process broker — but the
-    app's view of "what shape does this server issue" is one registry seeded from
-    config and updated by the core's CredentialObserver. This is the cell that would
-    fail if a mode were wired without it.
-
-    `learned` must be False everywhere: the hermetic mock is tokenless (no minter is
-    installed in test mode), so nothing has been proven, and a surface that echoed the
-    config into `learned` would be lying about the one thing it exists to report.
+    `learned` must be False everywhere: the hermetic mock is open (plain http), so
+    nothing has been proven, and a surface that echoed the config into `learned`
+    would be lying about the one thing it exists to report.
     """
-    fake = None
-    sock = None
+    with _broker_app(shed_config_path=MTLS_CONFIG) as (client, _mock, _info):
+        hosts = {h["name"]: h for h in client.hosts_auth()}
+        assert set(hosts) == {"legacy", "mock"}
+        assert hosts["mock"]["auth_mode"] == "mtls"
+        # ABSENT MEANS TOKEN — an entry written before certificates existed.
+        assert hosts["legacy"]["auth_mode"] == "token"
+        assert all(h["learned"] is False for h in hosts.values())
+
+
+# ---------------------------------------------------------------------------
+# Cell (h) — launch at login is on by default, once (plan 037 §3.1.4)
+# ---------------------------------------------------------------------------
+
+def _prefs_file(runtime_dir: Path) -> Path:
+    return ui.app_config_dir(runtime_dir) / "prefs.json"
+
+
+def _autostart_entries(runtime_dir: Path) -> list[Path]:
+    d = ui.linux_autostart_dir(runtime_dir)
+    return sorted(d.glob("*.desktop")) if d.is_dir() else []
+
+
+def test_login_item_default_once():
+    """The first launch turns launch at login on and records that it did; once the
+    person switches it off, a relaunch over the same prefs and HOME leaves it off.
+    On Linux the login item is a real `.desktop` under the throwaway HOME; on macOS
+    test mode keeps it in memory (a fresh launch reads off), so there the relaunch
+    shows only that the default did not run again."""
+    runtime_dir = Path(tempfile.mkdtemp(prefix="shed-login-"))
+    linux = sys.platform.startswith("linux")
     try:
-        if use_fake_agent:
-            fake = FakeHostAgent()
-            fake.start()
-            sock = fake.socket_path
-        elif mode == "headless-coexist":
-            # Only the STATUS socket is live ⇒ a headless daemon owns brokering;
-            # the app is configured with the (absent) desktop sibling.
-            fake = FakeHostAgent(status_only=True)
-            fake.start()
-            sock = os.path.join(os.path.dirname(fake.socket_path), "host-agent.sock")
-        with _broker_app(host_agent_socket=sock, shed_config_path=MTLS_CONFIG) as (
-            client, _mock, _info,
-        ):
-            assert client.broker_status()["effective_mode"] == mode
-            hosts = {h["name"]: h for h in client.hosts_auth()}
-            assert set(hosts) == {"legacy", "mock"}
-            assert hosts["mock"]["auth_mode"] == "mtls"
-            # ABSENT MEANS TOKEN — an entry written before certificates existed.
-            assert hosts["legacy"]["auth_mode"] == "token"
-            assert all(h["learned"] is False for h in hosts.values())
+        with _broker_app(runtime_dir=runtime_dir) as (client, _mock, _info):
+            assert client.login_item_status() is True
+            if linux:
+                assert _autostart_entries(runtime_dir), "no login item under the throwaway HOME"
+            client.login_item_set(False)
+            assert client.login_item_status() is False
+            if linux:
+                assert _autostart_entries(runtime_dir) == []
+        with _broker_app(runtime_dir=runtime_dir) as (client, _mock, _info):
+            assert client.login_item_status() is False, "the default ran again"
+            if linux:
+                assert _autostart_entries(runtime_dir) == []
+        assert json.loads(_prefs_file(runtime_dir).read_text())["login_item_defaulted"] is True
     finally:
-        if fake:
-            fake.stop()
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+def test_login_item_not_turned_on_when_prefs_unwritable():
+    """An app that cannot record having applied the default never turns launch at
+    login on: not at its first launch, and not at the next. The app log says why.
+
+    The prefs file is made a DIRECTORY rather than its directory read-only: the
+    Docker render gate runs as root, which a read-only directory does not stop."""
+    runtime_dir = Path(tempfile.mkdtemp(prefix="shed-login-ro-"))
+    linux = sys.platform.startswith("linux")
+
+    def block(rt: Path) -> None:
+        _prefs_file(rt).mkdir(parents=True, exist_ok=True)
+
+    try:
+        for launch in (1, 2):
+            with _broker_app(runtime_dir=runtime_dir, before_launch=block) as (
+                client, _mock, _info,
+            ):
+                assert client.login_item_status() is False, f"turned on at launch {launch}"
+                if linux:
+                    assert _autostart_entries(runtime_dir) == []
+                log = ui.app_log_path(runtime_dir)
+                client.wait_until(
+                    lambda: log.exists() and log.read_text(errors="replace").count(
+                        "could not record that launch at login was set up") >= launch,
+                    timeout=15, what=f"the could-not-record line (launch {launch})")
+    finally:
+        shutil.rmtree(runtime_dir, ignore_errors=True)

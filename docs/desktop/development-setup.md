@@ -61,9 +61,9 @@ release (which signs the DMG and publishes the Sparkle appcast) is
 ```
 crates/                   # shared Rust core workspace (sibling of desktop/)
   shed-core/              # pure protocol client: HTTP/SSE, decoders, TLS, token FSM, config, approval + lane models
-  shed-app/               # UI-free app logic: Backend, approval Coordinator, host-agent client, roost
-  shed-broker/            # the credential broker (embedded in the app, or run by shed-host-agent)
-  shed-host-agent/        # the standalone broker daemon
+  shed-app/               # UI-free app logic: Backend, approval Coordinator, the embedded broker bridge, roost
+  shed-broker/            # the credential broker the app embeds
+  shed-broker-harness/    # test-only host of the app's broker (tests/broker-wire)
   shed-craze/             # craze agent-lane adapter
   shed-opencode/          # opencode agent-lane adapter
   shedctl/                # headless IPC client (shipped in the Linux .deb)
@@ -76,7 +76,6 @@ desktop/
   linux/scripts/          # .deb build + validation
   packaging/              # nfpm config, desktop entry, polkit action, icons
   tools/shedtest/         # pytest functional harness + in-process mock shed-server
-  tools/fake-host-agent/  # the fake host agent the harness approves against
   Dockerfile.tauri-linux  # the Linux render-gate / .deb build image
   Dockerfile.linux        # the shed-core Linux test image
 ```

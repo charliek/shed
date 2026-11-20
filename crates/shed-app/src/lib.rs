@@ -59,9 +59,7 @@ pub use backend::{
 };
 #[cfg(feature = "broker")]
 pub use broker_bridge::{
-    detect_mode, load_or_synthesize, machine_identity, probe_sockets, probe_sockets_at,
-    resolve_mode, BrokerConfig, BrokerError, DetectedMode, EffectiveMode, EmbeddedBroker, ModePref,
-    ModeProbe, ResolvedMode,
+    load_or_synthesize, machine_identity, BrokerConfig, BrokerError, EmbeddedBroker,
 };
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};
 pub use craze_rows::{fold_plan, FoldPlan, RoostTabRef};

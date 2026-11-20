@@ -832,10 +832,10 @@ impl ExtensionsYaml {
             );
         }
         if desktop_key("socket_path").is_some() {
-            deprecated_warnings.push(format!(
-                "config: `desktop.socket_path` is deprecated and ignored — the socket path is fixed path={}",
-                slog_value(&crate::sockets::desktop_socket_path().to_string_lossy())
-            ));
+            deprecated_warnings.push(
+                "config: `desktop.socket_path` is deprecated and ignored — the app has no approval socket"
+                    .to_string(),
+            );
         }
         if let Some(v) = desktop_key("timeout_ms") {
             // Echo the PARSED integer, never the raw scalar. Go decodes into `*int`, so
@@ -3366,12 +3366,9 @@ aws:
             w[0],
             "config: `desktop.enabled` is deprecated and ignored — the approval channel is always on"
         );
-        assert!(
-            w[1].starts_with(
-                "config: `desktop.socket_path` is deprecated and ignored — the socket path is fixed path="
-            ),
-            "{:?}",
-            w[1]
+        assert_eq!(
+            w[1],
+            "config: `desktop.socket_path` is deprecated and ignored — the app has no approval socket"
         );
         assert_eq!(
             w[2],

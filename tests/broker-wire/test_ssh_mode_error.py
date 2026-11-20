@@ -48,7 +48,7 @@ def test_ssh_unknown_mode_exits_1(binaries, tmp_path_factory, impl, shape):
             harness_argv(
                 binaries[impl], cfg, root / "op.log", f"{socket_dir}/{CONTROL_SOCK_NAME}"
             ),
-            env=_clean_env(socket_dir, home),
+            env=_clean_env(home),
             capture_output=True,
             timeout=30,
         )

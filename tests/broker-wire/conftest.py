@@ -19,8 +19,8 @@ text, its start-up key listing) were removed from them, not re-recorded. The `im
 seam and the fixture's `scenario(impl)` signature survive because the whole harness is
 written in terms of it; `"rust"` is the only impl.
 
-Hermetic by construction: every test gets a fresh `$SHED_HOST_AGENT_SOCKET_DIR`,
-`$HOME` (so no real `~/.ssh` / `~/.shed` is read) and state dir, `SSH_AUTH_SOCK` is
+Hermetic by construction: every test gets a fresh control-socket dir, `$HOME` (so
+no real `~/.ssh` / `~/.shed` is read) and state dir, `SSH_AUTH_SOCK` is
 stripped (the broker falls back to an empty local-keys backend), and the only network
 is the synthetic bus on loopback.
 """
@@ -191,15 +191,11 @@ def discovery_source_doc(servers: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _clean_env(
-    socket_dir, home, path_prepend=None, ssh_auth_sock=None, state_dir=None
-) -> dict:
+def _clean_env(home, path_prepend=None, ssh_auth_sock=None, state_dir=None) -> dict:
     """A hermetic environment: real PATH (so system tools resolve) but an isolated
-    HOME + socket dir + state dir, and no ambient ssh-agent. `path_prepend` (a dir)
+    HOME + state dir, and no ambient ssh-agent. `path_prepend` (a dir)
     goes on the FRONT of PATH so a shim binary (e.g. a fake `ssh`) is resolved before
     the real one — the broker uses `look_ssh` on PATH.
-
-    The socket dir (`SHED_HOST_AGENT_SOCKET_DIR`) holds the harness's control socket.
 
     The state dir (`SHED_BROKER_STATE_DIR`: the machine identity file and the
     credential store) defaults to `<home>/state`. It is set explicitly because an
@@ -212,7 +208,6 @@ def _clean_env(
     auto-detect result); pass `ssh_auth_sock` to point the agent-forward backend at a
     fake agent (the ssh-backend tests) — it is set AFTER the strip so it wins."""
     env = dict(os.environ)
-    env["SHED_HOST_AGENT_SOCKET_DIR"] = str(socket_dir)
     env["HOME"] = str(home)
     env["SHED_BROKER_STATE_DIR"] = str(
         state_dir if state_dir is not None else Path(home) / "state"
@@ -309,7 +304,6 @@ class DaemonHandle:
         self.impl = impl
         self.binary = binary
         self.proc = proc
-        self.socket_dir = str(socket_dir)
         self.home = str(home)
         self.config_path = str(config_path)
         self.log_path = Path(log_path)
@@ -562,7 +556,6 @@ def daemon(binaries, tmp_path_factory):
         proc = subprocess.Popen(
             harness_argv(binaries[impl], config_path, log_path, control_sock),
             env=_clean_env(
-                socket_dir,
                 home,
                 path_prepend=path_prepend,
                 ssh_auth_sock=ssh_auth_sock,

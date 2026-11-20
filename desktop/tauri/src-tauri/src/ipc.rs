@@ -887,7 +887,7 @@ pub struct Handler {
     /// preference), shared with the frontend invoke commands.
     terminal: SharedTerminal,
     /// The approval coordinator (the security spine): the approvals queue, policy,
-    /// grants, audit, and the host-agent decision path.
+    /// grants, audit, and the broker decision path.
     coordinator: Coordinator,
     /// The persisted prefs store, so `ui.set_ssh_approval` persists the chosen SSH
     /// prefs through the same path as the frontend command (both survive a restart).
@@ -957,17 +957,11 @@ impl Handler {
     /// an error envelope.
     pub async fn dispatch(&self, op: &str, params: &Value) -> Result<Value, (String, String)> {
         match op {
-            "identify" => {
-                // Augment the base payload with the resolved broker mode (leg 3a.2) —
-                // read from managed state, so `identify_payload` stays a pure, testable
-                // free fn of `Env`.
-                let mut v =
-                    identify_payload(&self.env, self.pid, crate::applog::active_path().as_deref());
-                if let Some(rt) = self.app.try_state::<crate::broker::BrokerRuntime>() {
-                    v["broker_mode"] = rt.identify_fragment();
-                }
-                Ok(v)
-            }
+            "identify" => Ok(identify_payload(
+                &self.env,
+                self.pid,
+                crate::applog::active_path().as_deref(),
+            )),
             "ui.navigate" => self.navigate(params),
             "ui.current_pane" => Ok(json!({ "pane": self.ui_get("pane") })),
             "ui.computed_style" => Ok(json!({ "style": self.ui_get("style") })),
@@ -1269,8 +1263,6 @@ impl Handler {
             "loginitem.set" => self.login_item_set(params),
             // -- credential broker (leg 3a.2) --
             "broker.status" => Ok(self.broker_status()),
-            "broker.mode" => Ok(self.broker_mode()),
-            "broker.set_mode" => self.broker_set_mode(params),
             // -- credential sources (plan 035 §3.4) --
             "source.status" => {
                 let rt = self.app.try_state::<crate::broker::BrokerRuntime>();
@@ -2620,49 +2612,14 @@ impl Handler {
         json!({ "hosts": hosts })
     }
 
-    /// `broker.status` → the resolved broker mode + probe evidence + config source +
-    /// (embedded) resolved ssh mode / gate namespaces / per-server LiveStatus health.
+    /// `broker.status` → the embedded broker's config source, resolved ssh mode, gate
+    /// namespaces, per-server health, machine identity and any start-up error.
     /// The harness drives + asserts it (C4); shedtest reads it as broker truth.
     fn broker_status(&self) -> Value {
         self.app
             .try_state::<crate::broker::BrokerRuntime>()
             .map(|rt| rt.status())
             .unwrap_or_else(|| json!({}))
-    }
-
-    /// `broker.mode` → the effective mode + the LIVE persisted pref + `restart_required`
-    /// (the persisted pref drifted from the launch pref ⟹ a relaunch applies it).
-    fn broker_mode(&self) -> Value {
-        self.app
-            .try_state::<crate::broker::BrokerRuntime>()
-            .map(|rt| {
-                json!({
-                    "pref": rt.pref_str(),
-                    "effective": rt.effective_mode_str(),
-                    "restart_required": rt.restart_required(),
-                })
-            })
-            .unwrap_or_else(|| json!({}))
-    }
-
-    /// `broker.set_mode {mode}` → persist the broker mode pref (the same path as the
-    /// `broker_set_mode` frontend command). Guarded: an unknown mode is `bad_request`.
-    /// The change is NOT hot-swapped — the CURRENT effective mode + the computed
-    /// `restart_required` (persisted pref != launch pref) are returned so a driver can
-    /// assert the deferred-apply contract.
-    fn broker_set_mode(&self, params: &Value) -> Result<Value, (String, String)> {
-        let mode = req_str(params, "mode")?;
-        if crate::broker::parse_mode_pref(mode).is_none() {
-            return Err(err("bad_request", format!("unknown broker mode: {mode:?}")));
-        }
-        self.prefs.set_broker_mode(mode.to_string());
-        let (effective, restart_required) = self
-            .app
-            .try_state::<crate::broker::BrokerRuntime>()
-            .map(|rt| (rt.effective_mode_str().to_string(), rt.restart_required()))
-            .unwrap_or_default();
-        self.emit_prefs_changed();
-        Ok(json!({ "pref": mode, "effective": effective, "restart_required": restart_required }))
     }
 
     /// `source.use {host}` → make THIS machine the credential source on `host` (the
@@ -3048,7 +3005,6 @@ mod tests {
             craze_env: Vec::new(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
-            host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),
             broker_extensions_path: PathBuf::from("/run/user/0/shed/extensions.yaml"),
             log_file: None,
             log_debug: false,

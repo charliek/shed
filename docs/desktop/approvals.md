@@ -111,18 +111,20 @@ server side fails closed.
 ## Testing
 
 The approval flow is exercised hermetically by the desktop harness, which drives the real
-app against a Python fake host agent (`desktop/tools/fake-host-agent`) and a mock
-shed-server:
+app's own broker against mock shed-servers: a request is pushed on a mock's plugin bus
+(`bus_stimulus.py`), and the decision is read from the bus answer and the broker's audit
+file. The broker runs with a throwaway HOME, keys and server list (`broker_env.py`, checked
+before every launch):
 
 ```bash
 make -C desktop e2e-tauri    # includes test_approvals.py and test_tauri_broker.py
 ```
 
-The `shed-host-agent` daemon's own wire output is pinned separately, against committed
-goldens, by the host-agent wire harness (no app, no VM):
+The broker's own wire output is pinned separately, against committed goldens, by the
+broker wire harness (the app's broker in a test-only process; no app window, no VM):
 
 ```bash
-make test-host-agent-diff
+make test-broker-wire
 ```
 
 See [Test automation](test-automation.md).

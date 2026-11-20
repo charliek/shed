@@ -99,8 +99,7 @@ Three guards make the golden set self-maintaining, all enforced from `conftest.p
 ## Hermeticity
 
 Every test runs with no network but the synthetic bus on `127.0.0.1`, and a fresh,
-isolated `$SHED_HOST_AGENT_SOCKET_DIR` (the harness's control socket lives there),
-`$HOME` (so no real `~/.ssh` / `~/.shed` is read) and state dir; `SSH_AUTH_SOCK` is
+isolated control-socket dir, `$HOME` (so no real `~/.ssh` / `~/.shed` is read) and state dir; `SSH_AUTH_SOCK` is
 stripped so the broker falls back to an empty local-keys backend. A real broker answers
 for every server in its user's config, which is why the harness only ever runs it this
 way. The harness writes its operational log to a per-test `--log-file` (that log is
@@ -265,17 +264,10 @@ the daemon in plan 037.
   byte-parity test) may now diverge on the SAME file; converging the two readers is a
   separate shed-core slice, not this one.
 
-- **Bounded connect timeout — CLOSED (D1).** The Rust `status` client and the daemon's
-  live-socket stale-probe now bound the Unix `connect()` to match Go's `net.DialTimeout`
-  (2s / 500ms). `std::os::unix::net::UnixStream` has no `connect_timeout` (std offers it
-  only for `TcpStream`) and both paths run synchronously before any tokio runtime, so the
-  bound is a `libc` nonblocking `connect(2)` + `poll(POLLOUT)` + `SO_ERROR` check
-  (`sockets::connect_unix_timeout`, `cfg(unix)`; `libc` is already a direct dep — no new
-  crate). A pathological full-backlog peer can no longer hang either side past the bound.
-  Pinned by the `sockets.rs` units (`connect_unix_timeout_connects_to_live_listener`,
-  `connect_unix_timeout_refuses_stale_fast`, `connect_unix_timeout_missing_path_fails_fast`,
-  `connect_unix_timeout_rejects_overlong_path`); the normal not-running path stays
-  byte-parity-tested live (`test_status_not_running.py`).
+- **Bounded connect timeout — retired.** The bounded Unix `connect()` (the daemon's
+  `status` client and live-socket stale-probe, and the desktop app's start-up mode probe)
+  went with the daemon and the app's External mode: nothing dials a broker socket any
+  more.
 
 - **Bus subscription set — converged.** In single-server mode (no `discovery:` block)
   the daemon connects to `server:` and subscribes to `ssh-agent`; when `aws.*` is
