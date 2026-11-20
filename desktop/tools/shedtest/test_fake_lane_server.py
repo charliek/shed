@@ -9,8 +9,8 @@ promptly. (It also covered a second agent, `fake_gx.py`, through plan 017;
 gx and its lane left shed in plan 025 C1 — shed#390.)
 
 This suite talks stdlib HTTP directly to a `fake_lane_server.py` subprocess and
-needs no mac/Tauri app, so the three `_app_session`/`_reset_policy`/
-`_reset_mock` overrides below neutralize `conftest.py`'s autouse app-launch
+needs no mac/Tauri app, so the four `_app_session`/`_reset_policy`/
+`_reset_mock`/`_session_leak_guard` overrides below neutralize `conftest.py`'s autouse app-launch
 fixtures for the tests in THIS module only (they stay in force, unmodified,
 for every other module in the directory — this is the standard pytest
 fixture-override pattern, not a global change).
@@ -50,6 +50,11 @@ def _reset_policy():
 
 @pytest.fixture
 def _reset_mock():
+    yield
+
+
+@pytest.fixture
+def _session_leak_guard():
     yield
 
 

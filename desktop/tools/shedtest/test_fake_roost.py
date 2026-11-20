@@ -107,11 +107,11 @@ class _Wire:
 def roost():
     """A fake roost-session with one agent-owned tab, torn down after the test.
 
-    **NOT named `fake`.** `conftest.py` owns a SESSION-scoped `fake` fixture (the
-    fake host-agent) that the autouse `_app_session` requests by name, so a
-    module-level `fake` here shadows it and the whole session dies with a
-    `ScopeMismatch` — but only when this module happens to be collected first,
-    which makes it an intermittent landmine rather than an obvious break.
+    **Never named after a session fixture.** `conftest.py` owns the SESSION-scoped
+    `mock` and `studio` fixtures that the autouse `_app_session` requests by name,
+    so a module-level fixture of either name shadows it and the whole session dies
+    with a `ScopeMismatch` — but only when this module happens to be collected
+    first, which makes it an intermittent landmine rather than an obvious break.
 
     `shutdown()`, not `stop()`: `stop()` is roost's `session.stopping` control on
     both fakes, and the teardown is a separate thing.

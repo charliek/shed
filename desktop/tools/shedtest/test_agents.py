@@ -24,7 +24,6 @@ from __future__ import annotations
 import platform
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -34,8 +33,6 @@ import ui
 from client import ShedError, TauriClient
 from fake_roost import FakeRoost, ownership
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fake-host-agent"))
-from fake_host_agent import FakeHostAgent  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -88,9 +85,8 @@ def agents_app(shed_roost, mock):
     at setup. That would make this file's position in the alphabet load-bearing,
     and this file sorts early.
 
-    Its own fake host-agent for the same reason those two have one: the session
-    `fake` tracks a single connection, and a second app dialling it would
-    misroute the frames the approval suites are waiting on.
+    Its broker serves no server (`ui.subproc_env`'s default hermetic broker), so
+    it never takes a listener slot on the session mock.
 
     Short `mkdtemp` prefixes: the IPC socket lives under the runtime dir, and a
     Unix socket path must stay inside SUN_LEN.
@@ -99,8 +95,6 @@ def agents_app(shed_roost, mock):
     if not cfg.binary.exists():
         raise RuntimeError(
             f"tauri binary not found at {cfg.binary}; build it first (make tauri-build).")
-    agent = FakeHostAgent()
-    agent.start()
     runtime_dir = Path(tempfile.mkdtemp(prefix="shed-agents-"))
     sock = runtime_dir / cfg.sock_rel
     log = runtime_dir / "agents-ui.log"
@@ -109,7 +103,6 @@ def agents_app(shed_roost, mock):
         runtime_dir=runtime_dir,
         mock_base_url=mock.base_url,
         config_path=FIXTURES / "config.yaml",
-        host_agent_socket=agent.socket_path,
         # Only the shed. `localhost` is deliberately unmapped, so the implicit
         # host stays unlisted and every row this suite sees is the shed's.
         roost_sockets={TARGET: shed_roost.socket_path},
@@ -130,7 +123,6 @@ def agents_app(shed_roost, mock):
             client.close()
         ui.terminate(proc)
         log_fh.close()
-        agent.stop()
         shutil.rmtree(runtime_dir, ignore_errors=True)
 
 

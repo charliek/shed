@@ -3,7 +3,8 @@
 # Builds the Tauri Rust app and runs the hermetic e2e under Xvfb, so the
 # oklch linen theme + the drivability probes are verified on real WebKitGTK, not
 # just mac WKWebView. `scrot` backs app.screenshot (Tauri has no in-process capture
-# on Linux). The frontend bundle (tauri/ui/dist) is built on the host first — it's
+# on Linux). `openssh-client` is for `ssh-keygen`: every harness launch gives the
+# app's credential broker a throwaway key (`tools/shedtest/broker_env.py`). The frontend bundle (tauri/ui/dist) is built on the host first — it's
 # platform-independent — and read-only-mounted, so this image needs no node. Rust
 # setup mirrors Dockerfile.linux.
 FROM ubuntu:24.04
@@ -14,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libwebkit2gtk-4.1-dev libgtk-3-dev libssl-dev libxdo-dev \
       libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev \
       libgl1-mesa-dri libglu1-mesa \
-      xvfb scrot python3 python3-venv \
+      xvfb scrot python3 python3-venv openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust stable — matches core/rust-toolchain.toml.

@@ -11,11 +11,12 @@ AppGate → Coordinator → respond round-trip, config provenance, the 409 split
 
 Every cell launches its OWN hermetic app instance (a throwaway HOME/XDG_RUNTIME_DIR
 → its own socket + single-instance lock) with its own PRIVATE mock shed-server, so
-the cells are fully isolated from each other and from the session instance (which
-runs in EXTERNAL mode against the session fake host-agent — the existing cells).
-The embedded broker resolves its server list from `~/.shed/config.yaml` under the
-throwaway HOME (`shed_broker::DEFAULT_DISCOVERY_SOURCE`), which we point at the
-private mock; because that URL is plain `http://`, `ServerTarget::is_secure` is
+the cells are fully isolated from each other and from the session instance (whose
+broker serves the two session mocks). The embedded broker resolves its server list
+from `~/.shed/config.yaml` under the throwaway HOME
+(`shed_broker::DEFAULT_DISCOVERY_SOURCE`), or from the server file
+`broker_env.write_hermetic_broker` writes, either naming only the private mock;
+because that URL is plain `http://`, `ServerTarget::is_secure` is
 false, the bus attaches a static (empty) token and NEVER mints over SSH — so no
 cell shells real `ssh` (hermetic token handling, §C4.2).
 """
@@ -27,58 +28,28 @@ import json
 import os
 import shutil
 import stat
-import struct
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import pytest
 
+import broker_env
 import ui
+from bus_stimulus import SSH, audit_line, emit_sign, git_login, new_approval, pending_ids, verdict
 from client import ShedError, TauriClient, scaled_timeout
-from fake_host_agent import FakeHostAgent
 from mockserver import MockShedServer
+
+# The external-mode cells below still run against the fake daemon until that
+# mode goes.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fake-host-agent"))
+from fake_host_agent import FakeHostAgent  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CONFIG = FIXTURES / "config.yaml"
-
-
-def _shed_config_for(mock_base_url: str) -> str:
-    """A `~/.shed/config.yaml` pointing a single OPEN (http) server at the private
-    mock — the embedded broker's discovery source. http:// ⇒ not secure ⇒ no minting
-    ⇒ no live SSH (hermetic)."""
-    port = urlsplit(mock_base_url).port
-    return (
-        "servers:\n"
-        "    mock:\n"
-        "        host: 127.0.0.1\n"
-        f"        http_port: {port}\n"
-        "        ssh_port: 2222\n"
-        "default_server: mock\n"
-        "sheds: {}\n"
-    )
-
-
-def _local_keys_extensions(shed_config_abs: str, audit_abs: str) -> str:
-    """An `extensions.yaml` delegating ssh to the app gate (`shed-desktop`) + brokering
-    the private mock. `ssh.mode: local-keys` pins the backend to the generated
-    `~/.ssh/id_ed25519` (never the real ssh-agent); the durable audit lands at
-    `audit_abs` so the cell can read the daemon-shaped approval outcome."""
-    return (
-        "ssh:\n"
-        "  mode: local-keys\n"
-        "  approval:\n"
-        "    policy: shed-desktop\n"
-        "discovery:\n"
-        f"  source: {shed_config_abs}\n"
-        '  watch: "off"\n'
-        "logging:\n"
-        "  enabled: true\n"
-        f"  path: {audit_abs}\n"
-    )
 
 
 @contextmanager
@@ -92,14 +63,16 @@ def _broker_app(
     conflict_namespaces: tuple[str, ...] = (),
     refuse: dict[str, str] | None = None,
     respond_script: dict[str, list] | None = None,
-    clear_ssh_auth_sock: bool = True,
     shed_config_path: Path = CONFIG,
     source: dict | None = None,
     block_state_dir: bool = False,
+    approval_timeout: str | None = None,
 ):
     """Launch a self-managed tauri instance with a PRIVATE mock shed-server, yield
     `(client, mock, info)`, and tear both down. `info` carries `ssh_blob`, `audit_path`,
-    `runtime_dir` and `proc` (the app's process, for a cell that quits it itself).
+    `runtime_dir`, `proc` (the app's process, for a cell that quits it itself) and
+    `broker` (the `broker_env.BrokerInfo`). Every launch goes through
+    `broker_env.validate` (in `ui.subproc_env`) before the spawn.
 
     * `host_agent_socket` — the app's configured Surface-A socket; the three-way probe
       keys off it (`shed_app::probe_sockets_at`). `None` ⇒ neither daemon socket exists
@@ -107,8 +80,9 @@ def _broker_app(
     * `extensions_yaml` — written to `~/.config/shed/extensions.yaml` (the daemon's
       default path) + pointed at via `SHED_TAURI_EXTENSIONS_CONFIG`; `None` ⇒ absent ⇒
       the bridge synthesizes the fresh-install default.
-    * `local_keys_ssh` — write the local-keys delegating `extensions.yaml` (implies
-      `discovery_mock` + `gen_ssh_key`); mutually exclusive with `extensions_yaml`.
+    * `local_keys_ssh` — the hermetic broker of `broker_env.write_hermetic_broker`
+      (local keys, every namespace delegated to the app, its own server file naming
+      the private mock as `mock`); mutually exclusive with the other file options.
     * `discovery_mock` — write `~/.shed/config.yaml` pointing the broker at the mock.
     * `gen_ssh_key` — generate `~/.ssh/id_ed25519`; `info["ssh_blob"]` is the wire pubkey.
     * `conflict_namespaces` — pre-register these on the mock so their subscribe 409s.
@@ -116,8 +90,6 @@ def _broker_app(
       (`mockserver._REFUSALS`) from the broker's first attempt.
     * `respond_script` — `{ns: [(status, retry_after), ...]}`: answer these responds
       with pinned refusals first.
-    * `clear_ssh_auth_sock` — drop `$SSH_AUTH_SOCK` from the child env (default) so
-      `ssh.mode: ""` auto-detect can never reach the developer's real ssh-agent.
     * `shed_config_path` — the app's OWN `~/.shed/config.yaml` (`SHED_TAURI_SHED_CONFIG`),
       i.e. what `hosts.auth` seeds its per-server credential modes from. Distinct from
       `discovery_mock`, which writes the config the embedded BROKER discovers servers
@@ -126,15 +98,12 @@ def _broker_app(
       `MockShedServer.arm_source` kwargs (`{}` binds the default other machine, "desk").
     * `block_state_dir` — make the broker state dir (`SHED_BROKER_STATE_DIR`) a
       regular FILE, so no machine identity can be loaded or created.
+    * `approval_timeout` — the broker's `approval_timeout` (with `local_keys_ssh`).
     """
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
         raise RuntimeError(
             f"tauri binary not found at {cfg.binary}; build it first (make tauri-build).")
-    if local_keys_ssh:
-        discovery_mock = True
-        gen_ssh_key = True
-
     mock = MockShedServer()
     mock.start()
     for ns in conflict_namespaces:
@@ -150,58 +119,55 @@ def _broker_app(
     runtime_dir = Path(tempfile.mkdtemp(prefix="shed-brk-"))
     info["runtime_dir"] = runtime_dir
     try:
-        if discovery_mock:
-            shed_dir = runtime_dir / ".shed"
-            shed_dir.mkdir(parents=True, exist_ok=True)
-            (shed_dir / "config.yaml").write_text(_shed_config_for(mock.base_url))
-
-        ext_path: Path | None = None
         if local_keys_ssh:
-            audit_abs = str(runtime_dir / "broker-audit.jsonl")
-            info["audit_path"] = audit_abs
-            extensions_yaml = _local_keys_extensions(
-                str(runtime_dir / ".shed" / "config.yaml"), audit_abs)
-        if extensions_yaml is not None:
-            ext_dir = runtime_dir / ".config" / "shed"
-            ext_dir.mkdir(parents=True, exist_ok=True)
-            ext_path = ext_dir / "extensions.yaml"
-            ext_path.write_text(extensions_yaml)
+            assert extensions_yaml is None and not (discovery_mock or gen_ssh_key)
+            broker = broker_env.write_hermetic_broker(
+                runtime_dir, {"mock": mock.base_url}, approval_timeout=approval_timeout)
+        else:
+            if discovery_mock:
+                shed_dir = runtime_dir / ".shed"
+                shed_dir.mkdir(parents=True, exist_ok=True)
+                # The broker's default server file, naming only the private mock
+                # (plain http: not secure, so nothing mints over SSH). It must be
+                # exactly `render_server_file`'s, or `validate` refuses the launch.
+                (shed_dir / "config.yaml").write_text(
+                    broker_env.render_server_file({"mock": mock.base_url}))
+            ext_path: Path | None = None
+            if extensions_yaml is not None:
+                ext_dir = runtime_dir / ".config" / "shed"
+                ext_dir.mkdir(parents=True, exist_ok=True)
+                ext_path = ext_dir / "extensions.yaml"
+                ext_path.write_text(extensions_yaml)
+            ssh_blob = None
+            if gen_ssh_key:
+                ssh_dir = runtime_dir / ".ssh"
+                ssh_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                key = ssh_dir / "id_ed25519"
+                subprocess.run(
+                    ["ssh-keygen", "-t", "ed25519", "-f", str(key), "-N", "", "-q"],
+                    check=True,
+                )
+                # `ssh-ed25519 <base64 wire pubkey> <comment>` — the middle field is
+                # the SSH-wire pubkey blob the sign request carries.
+                ssh_blob = (ssh_dir / "id_ed25519.pub").read_text().split()[1]
+            broker = broker_env.custom_broker(
+                runtime_dir, {"mock": mock.base_url}, extensions_path=ext_path,
+                ssh_blob=ssh_blob)
+        info["broker"] = broker[1]
+        info["ssh_blob"] = broker[1].ssh_blob
+        info["audit_path"] = broker[1].audit_path and str(broker[1].audit_path)
 
         if block_state_dir:
-            # `ui.subproc_env` points SHED_BROKER_STATE_DIR here.
+            # `broker_env` points SHED_BROKER_STATE_DIR here.
             (runtime_dir / "broker-state").write_text("not a directory\n")
 
-        if gen_ssh_key:
-            ssh_dir = runtime_dir / ".ssh"
-            ssh_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            key = ssh_dir / "id_ed25519"
-            subprocess.run(
-                ["ssh-keygen", "-t", "ed25519", "-f", str(key), "-N", "", "-q"],
-                check=True,
-            )
-            # `ssh-ed25519 <base64 wire pubkey> <comment>` — the middle field is the
-            # SSH-wire pubkey blob the sign request carries + the backend matches on.
-            info["ssh_blob"] = (ssh_dir / "id_ed25519.pub").read_text().split()[1]
-
+        # `subproc_env` applies the broker's env (no SSH_AUTH_SOCK, HOME and the XDG
+        # dirs here, the extensions config set or cleared) and validates it.
         env = ui.subproc_env(
             cfg, runtime_dir=runtime_dir, mock_base_url=mock.base_url,
             config_path=shed_config_path, host_agent_socket=host_agent_socket,
+            broker=broker,
         )
-        # subproc_env only SETS the host-agent socket when one is given; clear an
-        # inherited value so `None` truly means "no configured desktop socket".
-        if not host_agent_socket:
-            env.pop("SHED_TAURI_HOST_AGENT_SOCKET", None)
-        if ext_path is not None:
-            env["SHED_TAURI_EXTENSIONS_CONFIG"] = str(ext_path)
-        else:
-            env.pop("SHED_TAURI_EXTENSIONS_CONFIG", None)
-        # Developer-machine leakage guard: `env.rs` gives `SHED_HOST_AGENT_SOCKET_DIR`
-        # priority over the HOME-derived socket path, so an inherited value from the
-        # dev's shell would silently redirect discovery off the throwaway HOME.
-        # Unconditional (unlike SSH_AUTH_SOCK below) so every cell is covered.
-        env.pop("SHED_HOST_AGENT_SOCKET_DIR", None)
-        if clear_ssh_auth_sock:
-            env.pop("SSH_AUTH_SOCK", None)
 
         sock = runtime_dir / cfg.sock_rel
         log = runtime_dir / "broker-ui.log"
@@ -236,28 +202,6 @@ def _server_ns_states(status: dict) -> dict[str, str]:
     return {n["namespace"]: n["state"] for n in servers[0].get("namespaces", [])}
 
 
-def _ssh_string(b: bytes) -> bytes:
-    """RFC 4251 `string`: a big-endian uint32 length, then the bytes."""
-    return struct.pack(">I", len(b)) + b
-
-
-def _git_login(ssh_blob: str) -> bytes:
-    """An exact SSH `publickey` login request for user `git` with the ed25519 key whose
-    wire blob is `ssh_blob` (fixed session id). The broker signs only a login as an
-    allowed username (default `[git]`) or a `git` SSHSIG, and declines anything else
-    before any prompt (plan 035 §3.5), so this is what reaches the approval gate."""
-    return (
-        _ssh_string(bytes(range(32)))  # session id
-        + bytes([50])  # SSH_MSG_USERAUTH_REQUEST
-        + _ssh_string(b"git")
-        + _ssh_string(b"ssh-connection")
-        + _ssh_string(b"publickey")
-        + bytes([1])  # a signature follows
-        + _ssh_string(b"ssh-ed25519")
-        + _ssh_string(base64.b64decode(ssh_blob))
-    )
-
-
 def _sign_envelope(rid: str, ssh_blob: str, *, server: str = "mock", shed: str = "web") -> dict:
     """A `sign` request Envelope in the bus wire shape (mirrors the in-crate httpmock
     fixture + `sdk/envelope.go`): `payload.operation == "sign"`, `public_key` = the
@@ -271,7 +215,7 @@ def _sign_envelope(rid: str, ssh_blob: str, *, server: str = "mock", shed: str =
         "payload": {
             "operation": "sign",
             "public_key": ssh_blob,
-            "data": base64.b64encode(_git_login(ssh_blob)).decode(),
+            "data": base64.b64encode(git_login(ssh_blob)).decode(),
             "flags": 0,
         },
         "shed": {"name": shed, "backend": "vz", "server": server},
@@ -421,6 +365,32 @@ def _sign_line(audit: Path) -> dict | None:
     except (OSError, ValueError):
         return None
     return None
+
+
+def test_expiry_fails_closed():
+    """A request nobody decides is denied when the broker's `approval_timeout` runs
+    out (or the app's prompt expires: both carry the same deadline, and the cell
+    asserts only what both produce): the bus answer is a deny, the approval leaves
+    the pending list, and a late decide sends nothing — the app either refuses it
+    (not-found) or no-ops, and the mock sees no second answer for the request."""
+    with _broker_app(local_keys_ssh=True, approval_timeout="2s") as (client, mock, info):
+        client.policy_set([{"scope": "default", "action": "prompt", "gate": "none"}])
+        before = pending_ids(client)
+        eid = emit_sign(mock, "expire-shed", info["broker"])
+        aid = new_approval(client, "expire-shed", before)
+        assert verdict(mock, SSH, eid) == "deny"  # left undecided → denied on expiry
+        # Attributed to one of the two real expiry paths: the app's prompt expiry
+        # ("timeout") or the broker's own gate timeout (no attribution, omitted).
+        decided_by = audit_line(info["broker"], SSH, "expire-shed").get("decided_by", "")
+        assert decided_by in ("timeout", ""), decided_by
+        client.wait_until(lambda: aid not in pending_ids(client), timeout=15,
+                          what="the expired approval left the pending list")
+        try:
+            client.approval_decide(aid, "approve")
+        except ShedError as e:
+            assert e.code in ("not-found", "not_found"), e
+        time.sleep(scaled_timeout(1))
+        assert len(mock.replies_to(SSH, eid)) == 1, mock.replies_to(SSH, eid)
 
 
 # ---------------------------------------------------------------------------
