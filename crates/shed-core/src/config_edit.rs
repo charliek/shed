@@ -36,12 +36,12 @@ pub enum EditError {
     /// The edit was built, read back, and the reader did not see what was asked
     /// for — so it is discarded rather than written.
     ///
-    /// The backstop for the fact that the reader is PARTIAL and has quirks the
-    /// writer must not try to mirror: it strips everything after a `#` whether
-    /// or not the value is quoted, and it never unescapes. Rather than model
-    /// each one and get it subtly wrong, the writer proposes and the reader
-    /// disposes — whatever the reader makes of the new text IS the truth, and
-    /// if that is not what was asked for, nothing is written.
+    /// The backstop for the fact that the reader is PARTIAL and has limits the
+    /// writer must not try to mirror (a quoted value must close on its line, for
+    /// one). Rather than model each one and get it subtly wrong, the writer
+    /// proposes and the reader disposes — whatever the reader makes of the new
+    /// text IS the truth, and if that is not what was asked for, nothing is
+    /// written.
     WouldNotRoundTrip(String),
 }
 
@@ -75,7 +75,27 @@ pub fn insert_machine(text: &str, machine: &NewMachine<'_>) -> Result<String, Ed
     if !is_plain_key(machine.name) {
         return Err(EditError::BadName(machine.name.to_string()));
     }
+    // A control character or a line break inside a value (a raw CR, a LF, U+2028) is
+    // refused rather than written: a YAML reader folds or refuses a line break inside a
+    // quoted value, so Go's reader would read back something else than this one does,
+    // and no host or user name holds one. So is a character YAML does not allow in a file
+    // at all (U+FFFE, U+FFFF; [`yaml_printable`]): Go's reader would refuse the whole file.
+    for (field, value) in [("host", machine.host), ("user", machine.user)] {
+        if value.is_some_and(|v| v.chars().any(|c| breaks_a_line(c) || !yaml_printable(c))) {
+            return Err(EditError::WouldNotRoundTrip(format!(
+                "the {field} holds a control character, a line break or a character YAML \
+                 does not allow in a file, which the config file cannot carry as written"
+            )));
+        }
+    }
     let before = crate::config::ShedConfig::parse(text);
+    // A file the reader does not read at all is not extended: nothing it holds could be
+    // checked against the edit.
+    if let Some(reason) = &before.refused {
+        return Err(EditError::WouldNotRoundTrip(format!(
+            "config.yaml is not read as it is ({reason}); fix it before adding a machine"
+        )));
+    }
     if before.machine(machine.name).is_some() {
         return Err(EditError::Duplicate(machine.name.to_string()));
     }
@@ -241,21 +261,53 @@ fn entry_lines(m: &NewMachine<'_>, indent: usize) -> Vec<String> {
     out
 }
 
-/// Quote a value only when leaving it bare would change what it means. The
-/// hand-rolled reader takes the text after `: ` verbatim, so this is about the
-/// FILE staying readable by other tools, not about the reader.
+/// A value as the file carries it: bare only when it is a token no YAML reader
+/// can take for anything but its text; otherwise a double-quoted scalar.
+///
+/// What this writer emits is read back as the same string by its own reader
+/// AND by a YAML parser (the Go CLI's, the broker's), so the bare set is defined
+/// narrowly (plan 037 A8): ASCII letters, digits and `. _ - / @ :` only;
+/// beginning with a letter, `_` or `/` (never with a digit, so no number, date
+/// or time is ever bare, and never with `-`, `.`, `@` or `:`, which YAML gives a
+/// meaning there); not ending in `:`; and not a word YAML reads as a boolean or
+/// a null in any case (`yes`, `Off`, `NULL`…). Everything else (`&a x`,
+/// `!!str x`, `*x`, `| x`, a quote, a space, `: `, ` #`, a leading digit…) is
+/// written quoted. Inside the quotes only `\` and `"` need escaping: a control
+/// character or a line break never reaches here ([`breaks_a_line`]).
 fn scalar(v: &str) -> String {
-    let plain = !v.is_empty()
-        && !v.starts_with(' ')
-        && !v.ends_with(' ')
-        && !v.contains(['#', ':', '\'', '"', '\n'])
-        && v.parse::<f64>().is_err()
-        && !matches!(v, "true" | "false" | "null" | "yes" | "no");
-    if plain {
+    let token_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '@' | ':');
+    let typed_word = matches!(
+        v.to_ascii_lowercase().as_str(),
+        "true" | "false" | "yes" | "no" | "on" | "off" | "y" | "n" | "null"
+    );
+    let bare = v.chars().all(token_char)
+        && v.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '/')
+        && !v.ends_with(':')
+        && !typed_word;
+    if bare {
         v.to_string()
     } else {
         format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
     }
+}
+
+/// A character the writer never puts in a value: a control character (a CR, a LF, a tab,
+/// NEL U+0085 and the rest) or a line or paragraph separator (U+2028, U+2029), each of
+/// which a YAML reader may read as a line break.
+fn breaks_a_line(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// YAML 1.2's printable set (`c-printable`): the characters a YAML file may hold. Every
+/// other character is refused by a YAML reader wherever it appears, quoted or not
+/// (gopkg.in/yaml.v3 refuses the whole file), so the writer never writes one. Its
+/// complement is the C0 controls but tab, LF and CR; DEL; the C1 controls but NEL; the
+/// surrogates (which a Rust `char` cannot hold); and U+FFFE and U+FFFF.
+fn yaml_printable(c: char) -> bool {
+    matches!(c,
+        '\t' | '\n' | '\r' | '\u{20}'..='\u{7e}' | '\u{85}' | '\u{a0}'..='\u{d7ff}'
+            | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
 }
 
 /// A key that survives the reader and stays a plain scalar in the file.
@@ -466,29 +518,214 @@ some_key_this_crate_does_not_model:
         }
     }
 
-    /// codex review: the reader strips everything after a `#` whether or not
-    /// the value is quoted, so `host: "mini#prod"` reads back as `"mini`. The
-    /// writer cannot represent it, and must say so rather than configure a
-    /// machine pointing somewhere else.
+    /// codex review: a value the reader would read back as something else must
+    /// be refused rather than configure a machine pointing somewhere else. The
+    /// verifier decides that, not a guess about which values look risky.
+    ///
+    /// Since plan 037 A8 the reader reads a quoted value as YAML does (a `#`
+    /// inside quotes is text, `\"` is a quote), so `"mini#prod"` and
+    /// `"has\"quote"`, which it used to mangle, round-trip and are accepted, as
+    /// written; a value whose quoting spans a line still does not, and is refused.
     #[test]
     fn refuses_a_value_the_reader_would_mangle() {
-        // A trailing space is NOT in this list: quoting preserves it and the
-        // reader's unquote gives it back, so it round-trips and is accepted.
-        // The verifier decides that, not a guess about which values look risky.
-        for bad_host in ["mini#prod", "has\"quote"] {
+        for good_host in ["mini#prod", "has\"quote", "back\\slash"] {
             let entry = NewMachine {
                 name: "mini3",
-                host: Some(bad_host),
+                host: Some(good_host),
                 user: None,
                 ssh_port: None,
             };
-            let out = insert_machine("", &entry);
-            assert!(
-                matches!(out, Err(EditError::WouldNotRoundTrip(_))),
-                "accepted host {bad_host:?} -> {out:?}"
-            );
+            let out = insert_machine("", &entry).expect(good_host);
+            let read = crate::config::ShedConfig::parse(&out);
+            assert_eq!(read.machine("mini3").unwrap().host, good_host);
+        }
+        // A control character or a line break inside a value is refused, never written:
+        // `a#b\rc` is quoted for its `#`, and a raw CR inside the quotes reads back intact
+        // here but folded by a YAML reader such as Go's.
+        for bad in [
+            "a#b\rc",
+            "two\nlines",
+            "tab\there",
+            "nel\u{85}x",
+            "ls\u{2028}x",
+        ] {
+            for (host, user) in [(Some(bad), None), (None, Some(bad))] {
+                let entry = NewMachine {
+                    name: "mini3",
+                    host,
+                    user,
+                    ssh_port: None,
+                };
+                let out = insert_machine("", &entry);
+                assert!(
+                    matches!(out, Err(EditError::WouldNotRoundTrip(_))),
+                    "accepted {bad:?} -> {out:?}"
+                );
+            }
         }
     }
+
+    /// A character outside YAML's printable set is refused, never written (plan 037 A8,
+    /// third review: `a\u{ffff}b` was written quoted, read back by this reader and the
+    /// broker's, and made Go's reader refuse the whole file). `char::is_control` does not
+    /// cover U+FFFE and U+FFFF; the printable characters around them are still written.
+    #[test]
+    fn refuses_a_character_yaml_does_not_allow() {
+        for bad in [
+            "a\u{ffff}b",
+            "a\u{fffe}b",
+            "a\u{7f}b",
+            "a\u{9f}b",
+            "a\u{1}b",
+        ] {
+            for (host, user) in [(Some(bad), None), (None, Some(bad))] {
+                let out = insert_machine(
+                    "",
+                    &NewMachine {
+                        name: "box",
+                        host,
+                        user,
+                        ssh_port: None,
+                    },
+                );
+                assert!(
+                    matches!(&out, Err(EditError::WouldNotRoundTrip(why)) if why.contains("YAML does not allow")),
+                    "accepted {bad:?} -> {out:?}"
+                );
+            }
+        }
+        // The edges of the set: each is printable to YAML, and round-trips.
+        for good in [
+            "a\u{a0}b",
+            "a\u{d7ff}b",
+            "a\u{e000}b",
+            "a\u{fffd}b",
+            "a\u{feff}b",
+            "a\u{10000}b",
+            "a\u{10ffff}b",
+        ] {
+            let out = insert_machine(
+                "",
+                &NewMachine {
+                    name: "box",
+                    host: Some(good),
+                    user: None,
+                    ssh_port: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            let read = crate::config::ShedConfig::parse(&out);
+            assert_eq!(read.machine("box").unwrap().host, good);
+        }
+        // The set is exactly YAML 1.2's `c-printable`, character by character.
+        for code in 0..=0x10ffffu32 {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let printable = matches!(code, 0x9 | 0xa | 0xd | 0x85)
+                || (0x20..=0x7e).contains(&code)
+                || (0xa0..=0xd7ff).contains(&code)
+                || (0xe000..=0xfffd).contains(&code)
+                || (0x10000..=0x10ffff).contains(&code);
+            assert_eq!(yaml_printable(c), printable, "U+{code:04X}");
+        }
+    }
+
+    /// A file the reader refuses whole (a raw NEL in a comment, here) is not extended:
+    /// the edit is refused, saying why.
+    #[test]
+    fn a_file_the_reader_refuses_is_not_extended() {
+        let text = "servers:\n    prod:\n        host: prod.example # a\u{85}b\n";
+        let out = insert_machine(text, &m("mini3"));
+        assert!(
+            matches!(&out, Err(EditError::WouldNotRoundTrip(why)) if why.contains("U+0085")),
+            "{out:?}"
+        );
+    }
+
+    /// The values YAML gives another meaning than their text when bare (plan 037 A8
+    /// review: `&a other.example` is `other.example` to Go, `!!str other.example`
+    /// too) are each written as a double-quoted scalar, and read back as the same
+    /// string. The broker's YAML parser reads the same bytes the same way
+    /// (`shed_broker::discovery`'s test of this writer).
+    #[test]
+    fn a_value_yaml_would_read_otherwise_is_written_double_quoted() {
+        for &value in QUOTED_VALUES {
+            for (host, user) in [(Some(value), None), (None, Some(value))] {
+                let entry = NewMachine {
+                    name: "box",
+                    host,
+                    user,
+                    ssh_port: None,
+                };
+                let out = insert_machine("", &entry).unwrap_or_else(|e| panic!("{value:?}: {e}"));
+                let field = if host.is_some() { "host" } else { "user" };
+                let quoted = format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
+                assert!(
+                    out.lines()
+                        .any(|l| l.trim_start() == format!("{field}: {quoted}")),
+                    "{value:?} is not written as a double-quoted scalar: {out}"
+                );
+                let read = crate::config::ShedConfig::parse(&out);
+                let machine = read.machine("box").unwrap();
+                match host {
+                    Some(_) => assert_eq!(machine.host, value),
+                    None => assert_eq!(machine.user.as_deref(), Some(value)),
+                }
+            }
+        }
+        // A plain token stays bare.
+        for value in ["mini3", "pat", "host.example.test", "/srv/x", "a_b-c@d:e"] {
+            let out = insert_machine(
+                "",
+                &NewMachine {
+                    name: "box",
+                    host: Some(value),
+                    user: None,
+                    ssh_port: None,
+                },
+            )
+            .unwrap();
+            assert!(out.contains(&format!("host: {value}\n")), "{out}");
+        }
+    }
+
+    /// The values [`a_value_yaml_would_read_otherwise_is_written_double_quoted`] holds the
+    /// writer to (the broker's test of the same bytes carries its own copy).
+    const QUOTED_VALUES: &[&str] = &[
+        "&a other.example",
+        "!!str other.example",
+        "*alias",
+        "|literal",
+        ">folded",
+        "-dash",
+        "- item",
+        "?question",
+        "{a: b}",
+        "[a]",
+        "#hash",
+        "%percent",
+        "@at",
+        "`tick",
+        "\"quote",
+        "'apostrophe",
+        "a: b",
+        "a #b",
+        "a:",
+        ":a",
+        ".dot",
+        "100.64.0.3",
+        "2026-01-02",
+        "12:30",
+        "0x1F",
+        "yes",
+        "Off",
+        "NULL",
+        "~",
+        "back\\slash",
+        "two words",
+        "clé",
+    ];
 
     /// codex review: `lines()` drops `\r`, and joining with `\n` would rewrite
     /// every terminator in the file — byte-for-byte has to include how each

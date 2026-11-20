@@ -226,7 +226,21 @@ func directoryEnroll(ctx context.Context, s enrolStreams, name string, nameSet b
 	fmt.Fprintf(s.out, "Enrolled with the account service at %s as %s (organization %s, name %q).\n",
 		e.Issuer, redactCode(e.ClientID, code), redactCode(e.Organization, code), e.Name)
 	fmt.Fprintf(s.out, "Wrote %s (mode 0600): this server's key for the account service, which never leaves this host.\n", path)
+	fmt.Fprintln(s.out, runningServerNote())
 	return nil
+}
+
+// runningServerNote is the enrolment's last line, for a server that is
+// already running: such a server read no enrolment at its last attempt, so its
+// next one is directory.RetryInterval after that (directory.Runtime's
+// notEnrolled), and until it reads this one it starts no pull for a new
+// person's first login. A restart, or an admin's `shed users refresh`, reads
+// it at once. docs/guides/user-directory.md (both tabs) and
+// docs/reference/cli.md quote it (TestEnrolNoteInGuide).
+func runningServerNote() string {
+	return fmt.Sprintf("If the server is already running with this config, it reads the enrolment at its next attempt, "+
+		"at most %d minutes from now; to use it at once, restart the server or run 'shed users refresh' as a local admin.",
+		int(directory.RetryInterval/time.Minute))
 }
 
 // enrolName is the name to enrol under: --name when given, else the host

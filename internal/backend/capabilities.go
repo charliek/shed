@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"runtime"
 
 	"github.com/charliek/shed/internal/config"
 )
@@ -68,8 +69,13 @@ func SupportsNetworkProfile(b Backend, profile string) bool {
 	return profile == config.NetworkProfileOpen || b.Type() == TypeFirecracker
 }
 
-// Isolation kinds (Capabilities.Isolation, /api/info "isolation").
+// Isolation kinds (Capabilities.Isolation, /api/info "isolation", and a shed
+// record's "isolation").
 const (
+	// IsolationNone: no isolation is in force for the shed. Only a shed
+	// record carries it (IsolationOf); a backend's Capabilities.Isolation is
+	// empty, not "none", when it offers only "open".
+	IsolationNone = "none"
 	// IsolationFirewall: the isolated profile is enforced by firewall rules
 	// the server installs on its own host.
 	IsolationFirewall = "firewall"
@@ -77,6 +83,24 @@ const (
 	// gives a shed no route to another shed or to the server host.
 	IsolationTopology = "topology"
 )
+
+// IsolationOf is the isolation a shed with the stored network profile has on
+// a backend with caps: IsolationNone for "open" (or a stored value written
+// before profiles existed), and for "isolated" the backend's kind. It fails
+// closed: an isolated shed on a backend with no isolation kind, an isolation
+// kind this build does not know, or a profile it does not know is
+// IsolationNone, never the profile's name, so a client that requires
+// isolation refuses the shed.
+func IsolationOf(caps Capabilities, profile string) string {
+	if config.EffectiveNetworkProfile(profile) != config.NetworkProfileIsolated {
+		return IsolationNone
+	}
+	switch caps.Isolation {
+	case IsolationFirewall, IsolationTopology:
+		return caps.Isolation
+	}
+	return IsolationNone
+}
 
 // Capabilities says which optional features a backend offers. The API reads
 // it to refuse a request the backend cannot serve (422 or 501
@@ -100,6 +124,10 @@ type Capabilities struct {
 	// Isolation is how the isolated network profile is provided: one of the
 	// Isolation* constants, or empty when the backend offers only "open".
 	Isolation string
+	// GuestArch is the architecture every guest of this backend runs
+	// ("amd64" or "arm64"): the host's for a local VM backend, empty for a
+	// backend whose sheds differ (remote, where it is per shed).
+	GuestArch string
 }
 
 // CapabilityReporter is implemented by a backend that offers less than every
@@ -140,6 +168,8 @@ func CapabilitiesOf(b Backend) Capabilities {
 		Reset:           true,
 		ImageManagement: true,
 		EgressProfiles:  true,
+		// A local VM runs on the host's own CPU.
+		GuestArch: runtime.GOARCH,
 	}
 	_, c.AsyncLifecycle = IsAsync(b)
 	if SupportsNetworkProfile(b, config.NetworkProfileIsolated) {
@@ -150,7 +180,8 @@ func CapabilitiesOf(b Backend) Capabilities {
 
 // RemoteCapabilities is what the remote backend reports: no host mounts,
 // snapshots, reset, image management or egress profiles; an asynchronous
-// lifecycle; isolation by network topology.
+// lifecycle; isolation by network topology. No GuestArch: each shed's size
+// has its own, which its record carries.
 func RemoteCapabilities() Capabilities {
 	return Capabilities{AsyncLifecycle: true, Isolation: IsolationTopology}
 }

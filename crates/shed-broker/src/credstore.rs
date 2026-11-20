@@ -20,6 +20,8 @@
 //! ```text
 //! <root>/<escaped-name>/client.pem   0600  the issued certificate
 //! <root>/<escaped-name>/client.key   0600  the matching private key
+//! <root>/<escaped-name>/client.key.previous
+//!                                    0600  only during a rotation: the previous key
 //! <root>/%lock/<escaped-name>        0600  the per-server advisory lock
 //! ```
 //!
@@ -29,14 +31,22 @@
 //!
 //! **Ordering and atomicity are the load-bearing parts**, mirrored from `sdk/creds`
 //! rule-for-rule: each file is written atomically (temp in the same directory, fsynced,
-//! renamed), the KEY is written first and the certificate second, and the whole write —
-//! plus the whole load — runs under one per-server advisory `flock`. Per-FILE atomicity
-//! is not enough on its own, because two renames are two commits: without the lock a
-//! reader can observe a new certificate beside an old key, and two rotations at once can
-//! interleave into cert-A-with-key-B, a credential that belongs to nobody and fails a
-//! handshake at some later, unrelated moment. The one case no lock can cover — a crash
-//! BETWEEN the two renames — is why [`CredStore::load`] verifies the pair and treats a
-//! mismatch as "no credential" (re-enroll) rather than as corruption to report.
+//! renamed), the KEY is renamed into place first and the certificate second, and the whole
+//! write — plus the whole load — runs under one per-server advisory `flock`. Per-FILE
+//! atomicity is not enough on its own, because two renames are two commits: without the
+//! lock a reader can observe a new certificate beside an old key, and two rotations at once
+//! can interleave into cert-A-with-key-B, a credential that belongs to nobody and fails a
+//! handshake at some later, unrelated moment.
+//!
+//! **A failed or interrupted rotation keeps the previous pair** (plan 037 §3.2.2: the
+//! stored certificate is what holds a server's user across a restart, so losing it could
+//! let a restart take a different first user). Both new files are written under temporary
+//! names before either is renamed, and a copy of the previous key
+//! ([`PREVIOUS_KEY_FILE_NAME`]) is kept until the new pair is complete: a failure before
+//! the first rename removes only the temporaries, and one between the two renames puts the
+//! previous key back. A crash between the two renames leaves the copy behind, and
+//! [`CredStore::load`] uses it when it pairs with the certificate on disk. Only a pair that
+//! still does not verify is "no credential" (re-enroll) rather than corruption to report.
 
 use std::fs;
 use std::io::Read;
@@ -57,13 +67,29 @@ use shed_core::tls::certified_key_from_pem_pair;
 pub const CERT_FILE_NAME: &str = "client.pem";
 pub const KEY_FILE_NAME: &str = "client.key";
 
+/// The copy of the previous private key a rotation keeps beside the pair until the new
+/// pair is complete (the module docs). It exists only while a write is in progress, or
+/// after a crash in the middle of one; a completed write removes it.
+pub const PREVIOUS_KEY_FILE_NAME: &str = "client.key.previous";
+
+/// A step of a pair write that a test can make fail ([`CredStore::fail_next_write_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteStep {
+    /// Writing the certificate's temporary file, after the key's was written: the shape
+    /// of a full disk part-way through a write.
+    CertTemp,
+    /// Renaming the certificate into place, after the key was renamed into place.
+    CertRename,
+}
+
 /// Holds one advisory lock file per server, as a SIBLING of the per-server credential
 /// directories rather than a file inside them.
 ///
 /// Sibling placement buys two things. [`CredStore::remove`] recursively deletes a server's
 /// directory, and deleting a lock file out from under a process that holds it would let
 /// the next locker create a fresh inode and lock THAT instead — the classic broken-mutex
-/// shape. And the per-server directory stays exactly the two files it documents.
+/// shape. And the per-server directory stays exactly the two files it documents (plus,
+/// only while a rotation is in progress or after a crash in one, the previous key's copy).
 ///
 /// The `%` prefix makes the name collision-proof: directory names in the root come from
 /// [`escape_server_name`], which emits `%` only as the start of a two-hex-digit escape,
@@ -103,13 +129,42 @@ impl std::fmt::Debug for StoredCredential {
 #[derive(Debug, Clone)]
 pub struct CredStore {
     root: PathBuf,
+    /// Test seam: the step at which the next pair write fails. Shared by every clone, so a
+    /// test can arm it on a store a credential source already holds.
+    #[cfg(test)]
+    fail_at: Arc<std::sync::Mutex<Option<WriteStep>>>,
 }
 
 impl CredStore {
     /// The store rooted at `root`. The directory is created lazily, on the first write, so
     /// constructing a store never touches the filesystem.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            #[cfg(test)]
+            fail_at: Arc::default(),
+        }
+    }
+
+    /// Make the next pair write (through any clone of this store) fail at `step`.
+    #[cfg(test)]
+    pub(crate) fn fail_next_write_at(&self, step: WriteStep) {
+        *self.fail_at.lock().unwrap() = Some(step);
+    }
+
+    /// The test seam's check at `step`: an error when the next write was armed to fail
+    /// there (disarming it). Always `Ok` outside tests.
+    fn fault(&self, step: WriteStep) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let mut armed = self.fail_at.lock().unwrap();
+            if *armed == Some(step) {
+                *armed = None;
+                return Err(format!("injected failure at {step:?}"));
+            }
+        }
+        let _ = step;
+        Ok(())
     }
 
     /// The production store for a credential `scope`, under the agent's durable state
@@ -152,10 +207,15 @@ impl CredStore {
     ///
     /// `Ok(None)` means "nothing stored" (the ordinary first-run state). `Err` means
     /// "stored but unusable" — unreadable files, malformed PEM, or a certificate that does
-    /// not match its key (what a crash between the two renames of a rotation leaves
-    /// behind). Callers treat BOTH as "no credential, enroll" and differ only in whether
-    /// they log a reason: recovery is a fresh enrollment, never an operator with a text
-    /// editor.
+    /// not match its key. Callers treat BOTH as "no credential, enroll" and differ only in
+    /// whether they log a reason: recovery is a fresh enrollment, never an operator with a
+    /// text editor.
+    ///
+    /// A rotation interrupted between its two renames (a crash) leaves the new key beside
+    /// the previous certificate, and the previous key's copy beside both: when that copy
+    /// pairs with the certificate, the previous pair is loaded and the copy is put back in
+    /// place (under the lock), so a restart reads the whole previous pair, never a mixed
+    /// one.
     pub fn load(&self, name: &str) -> Result<Option<StoredCredential>, String> {
         if name.is_empty() {
             return Ok(None);
@@ -167,11 +227,16 @@ impl CredStore {
         let _lock = self.lock(name)?;
 
         let cert_pem = read_to_string(&cert_path)?;
-        let key_pem = read_to_string(&key_path)?;
-        // Pair verification is what turns a half-committed rotation into a recoverable
-        // "no credential" instead of an opaque handshake failure later.
-        let certified = certified_key_from_pem_pair(&cert_pem, &key_pem)
-            .map_err(|e| format!("stored client credential for {name:?} is unusable: {e}"))?;
+        // Pair verification is what turns a half-committed rotation into the previous pair
+        // or a recoverable "no credential" instead of an opaque handshake failure later.
+        let paired = read_to_string(&key_path).and_then(|key_pem| {
+            certified_key_from_pem_pair(&cert_pem, &key_pem)
+                .map_err(|e| format!("stored client credential for {name:?} is unusable: {e}"))
+        });
+        let certified = match paired {
+            Ok(certified) => certified,
+            Err(e) => self.restore_previous_key(name, &cert_pem).ok_or(e)?,
+        };
         let not_after_unix = pem_decode(PEM_LABEL_CERTIFICATE, &cert_pem)
             .ok()
             .and_then(|der| cert_not_after_unix(&der));
@@ -184,11 +249,29 @@ impl CredStore {
 
     /// Persist a freshly issued client certificate and its private key for `name`.
     ///
-    /// The KEY is written first and the certificate second. Both orders can be
-    /// interrupted, and both leave a mismatched pair the next load rejects — but a key
-    /// with no certificate is inert, whereas a certificate with no key is the shape of a
-    /// credential whose private half has gone missing.
+    /// Either the whole new pair is in place when this returns `Ok`, or the previous pair
+    /// (or nothing, when there was none) is: both files are written under temporary names
+    /// first, then the KEY is renamed into place and the certificate second, with a copy of
+    /// the previous key kept until the certificate is in place (the module docs). The key
+    /// goes first because a key with no certificate is inert, whereas a certificate with no
+    /// key is the shape of a credential whose private half has gone missing.
     pub fn write(&self, name: &str, cert_pem: &str, key_pem: &str) -> Result<(), String> {
+        self.write_unless(name, cert_pem, key_pem, || None)
+    }
+
+    /// [`Self::write`], except that `stop` is asked under the server's credential lock,
+    /// immediately before anything is written: when it answers `Some(reason)` nothing is
+    /// written and the write fails with that reason. A credential source passes its
+    /// group's cancellation here, so a source whose watcher group was stopped or replaced
+    /// can never overwrite what the group that replaced it stored (the replacement starts
+    /// only after the cancel, and its own writes take the same lock).
+    pub fn write_unless(
+        &self,
+        name: &str,
+        cert_pem: &str,
+        key_pem: &str,
+        stop: impl FnOnce() -> Option<String>,
+    ) -> Result<(), String> {
         if name.is_empty() {
             return Err("client credentials: server name required".into());
         }
@@ -196,18 +279,94 @@ impl CredStore {
             return Err("client credentials: empty certificate or key".into());
         }
         let _lock = self.lock(name)?;
+        if let Some(reason) = stop() {
+            return Err(reason);
+        }
 
         let dir = self.server_dir(name);
         ensure_dir(&dir)?;
         let (cert_path, key_path) = self.paths(name);
-        atomic_write(&key_path, key_pem.as_bytes())?;
-        if let Err(e) = atomic_write(&cert_path, cert_pem.as_bytes()) {
-            // Roll the key back so the next start sees "no credential" (and re-enrolls)
-            // rather than a key that certifies nothing.
-            let _ = fs::remove_file(&key_path);
-            return Err(e);
+
+        // 1. Both new files under temporary names: nothing a load reads has changed yet,
+        //    so a failure here removes only the temporaries.
+        let key_tmp = write_temp_beside(&key_path, &mut key_pem.as_bytes())?;
+        let cert_tmp = match self
+            .fault(WriteStep::CertTemp)
+            .and_then(|()| write_temp_beside(&cert_path, &mut cert_pem.as_bytes()))
+        {
+            Ok(tmp) => tmp,
+            Err(e) => {
+                let _ = fs::remove_file(&key_tmp);
+                return Err(e);
+            }
+        };
+        let discard_temps = || {
+            let _ = fs::remove_file(&key_tmp);
+            let _ = fs::remove_file(&cert_tmp);
+        };
+
+        // 2. A copy of the previous key, kept until the new pair is complete.
+        let previous = dir.join(PREVIOUS_KEY_FILE_NAME);
+        let had_key = match fs::read(&key_path) {
+            Ok(old) => {
+                if let Err(e) = atomic_write(&previous, &old) {
+                    discard_temps();
+                    return Err(e);
+                }
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No previous key: a copy left by an earlier crash pairs with nothing new.
+                let _ = fs::remove_file(&previous);
+                false
+            }
+            Err(e) => {
+                discard_temps();
+                return Err(format!("read {}: {e}", key_path.display()));
+            }
+        };
+
+        // 3. The key, then the certificate.
+        if let Err(e) = fs::rename(&key_tmp, &key_path) {
+            discard_temps();
+            let _ = fs::remove_file(&previous);
+            return Err(format!("rename into {}: {e}", key_path.display()));
+        }
+        if let Err(e) = self
+            .fault(WriteStep::CertRename)
+            .and_then(|()| fs::rename(&cert_tmp, &cert_path).map_err(|e| e.to_string()))
+        {
+            let _ = fs::remove_file(&cert_tmp);
+            // The previous key goes back beside the previous certificate. If even that
+            // fails, the copy stays, and the next load restores it.
+            if had_key {
+                let _ = fs::rename(&previous, &key_path);
+            } else {
+                let _ = fs::remove_file(&key_path);
+            }
+            return Err(format!("rename into {}: {e}", cert_path.display()));
+        }
+
+        // 4. The pair is complete: the copy goes. Persisting the renames is best effort
+        //    (some filesystems reject fsync on a directory handle).
+        let _ = fs::remove_file(&previous);
+        if let Ok(d) = fs::File::open(&dir) {
+            let _ = d.sync_all();
         }
         Ok(())
+    }
+
+    /// The previous pair, when a rotation was interrupted between its two renames: the
+    /// kept copy of the previous key ([`PREVIOUS_KEY_FILE_NAME`]) is used when it pairs
+    /// with `cert_pem`, and is renamed back into place (best effort; the caller holds the
+    /// server's lock). `None` when there is no copy or it does not pair.
+    fn restore_previous_key(&self, name: &str, cert_pem: &str) -> Option<CertifiedKey> {
+        let (_, key_path) = self.paths(name);
+        let previous = self.server_dir(name).join(PREVIOUS_KEY_FILE_NAME);
+        let key_pem = fs::read_to_string(&previous).ok()?;
+        let certified = certified_key_from_pem_pair(cert_pem, &key_pem).ok()?;
+        let _ = fs::rename(&previous, &key_path);
+        Some(certified)
     }
 
     /// Delete a server's credential directory. Leaving a private key behind for a server
@@ -324,10 +483,23 @@ pub(crate) fn atomic_write_durable(
     })
 }
 
-/// The shared body of the two writers: stream `src` into a fresh 0600 temp file beside
-/// `path`, fsync it, and rename it over `path`. Returns the directory the rename landed
-/// in, for the caller's directory sync.
+/// The shared body of the two single-file writers: stream `src` into a fresh 0600 temp
+/// file beside `path`, fsync it, and rename it over `path`. Returns the directory the
+/// rename landed in, for the caller's directory sync. (The pair write in
+/// [`CredStore::write_unless`] writes both temp files before renaming either.)
 fn rename_into_place<'p>(path: &'p Path, src: &mut dyn Read) -> Result<&'p Path, String> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let tmp = write_temp_beside(path, src)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("rename into {}: {e}", path.display()));
+    }
+    Ok(dir)
+}
+
+/// Stream `src` into a fresh 0600 temp file in `path`'s directory and fsync it, without
+/// renaming it: returns the temp file's path. On failure the temp file is removed.
+fn write_temp_beside(path: &Path, src: &mut dyn Read) -> Result<PathBuf, String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = dir.join(temp_name(path));
     let mut f = fs::OpenOptions::new()
@@ -336,18 +508,17 @@ fn rename_into_place<'p>(path: &'p Path, src: &mut dyn Read) -> Result<&'p Path,
         .mode(FILE_PERM)
         .open(&tmp)
         .map_err(|e| format!("create temp file {}: {e}", tmp.display()))?;
-    let commit = (|| -> Result<(), String> {
+    let written = (|| -> Result<(), String> {
         std::io::copy(src, &mut f)
             .map_err(|e| format!("write temp file {}: {e}", tmp.display()))?;
         f.sync_all()
-            .map_err(|e| format!("fsync temp file {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))
+            .map_err(|e| format!("fsync temp file {}: {e}", tmp.display()))
     })();
-    if let Err(e) = commit {
+    if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    Ok(dir)
+    Ok(tmp)
 }
 
 /// A collision-resistant temp basename beside `path`: pid + a process-local counter + the
@@ -531,7 +702,7 @@ mod tests {
 
     /// Issue a throwaway self-signed P-256 leaf with an explicit validity window, so the
     /// notAfter reader is exercised against a REAL certificate rather than a hand-built
-    /// byte string.
+    /// byte string. No userId: the store is a layer below adoption's user rule.
     fn issue(not_after: SystemTime) -> (String, String) {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -619,9 +790,9 @@ mod tests {
         assert_eq!(s.load("mini3").unwrap().unwrap().cert_pem, b_cert);
     }
 
-    /// A mismatched pair — what a crash between the two renames of a rotation leaves — is
-    /// reported as unusable rather than assembled into a credential that would fail a
-    /// handshake much later against a server that looks broken.
+    /// A mismatched pair with no previous key to fall back on is reported as unusable
+    /// rather than assembled into a credential that would fail a handshake much later
+    /// against a server that looks broken.
     #[test]
     fn mismatched_pair_is_not_a_credential() {
         let (_d, s) = store();
@@ -643,8 +814,9 @@ mod tests {
         assert!(s.load("mini3").is_err());
     }
 
-    /// The key is written FIRST: a certificate write that fails must not leave a key
-    /// certifying nothing, so the rollback removes it and the next load sees nothing.
+    /// The key is renamed into place FIRST: with nothing stored before, a certificate
+    /// write that then fails must not leave a key certifying nothing, so the rollback
+    /// removes it and the next load sees nothing.
     #[test]
     fn failed_cert_write_rolls_the_key_back() {
         let (_d, s) = store();
@@ -657,6 +829,81 @@ mod tests {
 
         assert!(s.write("mini3", &cert_pem, &key_pem).is_err());
         assert!(!key_path.exists(), "the key must have been rolled back");
+    }
+
+    /// The pair's two names, sorted.
+    const PAIR: [&str; 2] = [KEY_FILE_NAME, CERT_FILE_NAME];
+
+    /// The names in a server's directory, sorted.
+    fn dir_names(s: &CredStore) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(s.server_dir("mini3"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A rotation that fails after the key's new file was written and before the
+    /// certificate's (a full disk), or between the two renames, leaves the PREVIOUS pair
+    /// in place and loadable, with no temporary file or key copy left behind (plan 037
+    /// §3.2.2: the stored pair is what holds the server's user across a restart).
+    #[test]
+    fn a_failed_rotation_keeps_the_previous_pair() {
+        for step in [WriteStep::CertTemp, WriteStep::CertRename] {
+            let (_d, s) = store();
+            let (a_cert, a_key) = issue(SystemTime::now() + Duration::from_secs(3600));
+            let (b_cert, b_key) = issue(SystemTime::now() + Duration::from_secs(7200));
+            s.write("mini3", &a_cert, &a_key).unwrap();
+            let before = (
+                fs::read(s.paths("mini3").0).unwrap(),
+                fs::read(s.paths("mini3").1).unwrap(),
+            );
+
+            s.fail_next_write_at(step);
+            let err = s.write("mini3", &b_cert, &b_key).unwrap_err();
+            assert!(err.contains("injected failure"), "{step:?}: {err}");
+
+            let after = (
+                fs::read(s.paths("mini3").0).unwrap(),
+                fs::read(s.paths("mini3").1).unwrap(),
+            );
+            assert_eq!(after, before, "{step:?}: the previous pair, byte for byte");
+            let loaded = s.load("mini3").unwrap().expect("the previous pair loads");
+            assert_eq!(loaded.cert_pem, a_cert, "{step:?}");
+            assert_eq!(dir_names(&s), PAIR, "{step:?}: nothing left behind");
+
+            // The seam fired once: the next rotation completes.
+            s.write("mini3", &b_cert, &b_key).unwrap();
+            assert_eq!(s.load("mini3").unwrap().unwrap().cert_pem, b_cert);
+            assert_eq!(dir_names(&s), PAIR);
+        }
+    }
+
+    /// A crash between the two renames leaves the new key beside the previous certificate,
+    /// and the previous key's copy beside both: a load gives the previous pair and puts the
+    /// copy back in place.
+    #[test]
+    fn a_rotation_interrupted_between_its_renames_loads_the_previous_pair() {
+        let (_d, s) = store();
+        let (a_cert, a_key) = issue(SystemTime::now() + Duration::from_secs(3600));
+        let (_b_cert, b_key) = issue(SystemTime::now() + Duration::from_secs(7200));
+        s.write("mini3", &a_cert, &a_key).unwrap();
+        let (_, key_path) = s.paths("mini3");
+        let previous = s.server_dir("mini3").join(PREVIOUS_KEY_FILE_NAME);
+        fs::write(&previous, &a_key).unwrap();
+        fs::write(&key_path, &b_key).unwrap();
+
+        let loaded = s.load("mini3").unwrap().expect("the previous pair");
+        assert_eq!(loaded.cert_pem, a_cert);
+        assert_eq!(fs::read_to_string(&key_path).unwrap(), a_key, "put back");
+        assert_eq!(dir_names(&s), PAIR);
+
+        // A copy that does not pair with the certificate is no way out: unusable.
+        let (_c_cert, c_key) = issue(SystemTime::now() + Duration::from_secs(3600));
+        fs::write(&previous, &c_key).unwrap();
+        fs::write(&key_path, &b_key).unwrap();
+        assert!(s.load("mini3").unwrap_err().contains("unusable"));
     }
 
     #[test]

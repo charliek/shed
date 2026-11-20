@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden fixture for LoadDiscoveredServers / load_discovered_servers — input ~/.shed/config.yaml text -> expected []ServerTarget. Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go) and the Rust runner (in crates/shed-host-agent/src/controltoken.rs tests) so the two impls cannot drift together. Pins the load-bearing divergences from shed-core::ShedConfig: ssh_port defaults to 0 (NOT 22) when omitted, and empty-host entries are skipped. Targets are sorted by name. auth_mode is carried VERBATIM from the entry and is NOT defaulted: \"\" (never recorded, legacy entry) and \"token\" (recorded) stay distinguishable, because only the former means \"this client has never been told\".",
+  "_comment": "Golden fixture for load_discovered_servers (crates/shed-broker/src/discovery.rs) — input ~/.shed/config.yaml text -> expected []ServerTarget. Recorded while the Go daemon still read it; its one reader now is the Rust test golden_load_discovered_servers in crates/shed-broker/src/discovery.rs. Pins the load-bearing divergences from shed-core::ShedConfig: ssh_port defaults to 0 (NOT 22) when omitted, and empty-host entries are skipped. Targets are sorted by name. auth_mode is carried VERBATIM from the entry and is NOT defaulted: \"\" (never recorded, legacy entry) and \"token\" (recorded) stay distinguishable, because only the former means \"this client has never been told\". user (the named user the shed CLI recorded) is carried verbatim (an unquoted scalar is read as its text, as Go's reader reads it: true is the user name \"true\"); absent or null is \"\" (no user held); a list or a map is \"!not-a-string\" (no valid user name, so the entry fails closed instead of reading as no user). identity_file (the SSH key the shed CLI recorded for the entry, plan 037 A8) is carried verbatim, YAML escapes decoded; absent, empty, null or ~ is \"\" (no key); a list, a map, or a value with a tag or an anchor or over more than one line is the unreadable marker \"\\u0000<identity_file: not a plain string>\" (user: \"!not-a-string\"), which every check of the value refuses, so the entry fails closed instead of reading as no key; an entry with a merge key (<<) or a key written with a tag (!!str, !!binary) is \"\\u0000<identity_file: entry not read exactly>\" and \"!not-a-string\" whatever it says. A byte-order mark at the start is skipped and only the first YAML document is read; a raw CR outside a CRLF pair, NEL, U+2028 or U+2029 anywhere makes the whole file an error. auth_mode, user and identity_file are required on every expected entry.",
   "protocol_version": 1,
   "vectors": [
     {
@@ -13,7 +13,9 @@
           "tls_fingerprint": "",
           "ssh_host": "b.example",
           "ssh_port": 0,
-          "auth_mode": "token"
+          "auth_mode": "token",
+          "user": "",
+          "identity_file": ""
         },
         {
           "name": "https-with-ssh",
@@ -22,7 +24,9 @@
           "tls_fingerprint": "",
           "ssh_host": "a.example",
           "ssh_port": 2222,
-          "auth_mode": "mtls"
+          "auth_mode": "mtls",
+          "user": "",
+          "identity_file": ""
         },
         {
           "name": "plain",
@@ -31,7 +35,9 @@
           "tls_fingerprint": "",
           "ssh_host": "c.example",
           "ssh_port": 0,
-          "auth_mode": ""
+          "auth_mode": "",
+          "user": "",
+          "identity_file": ""
         }
       ]
     },
@@ -46,7 +52,9 @@
           "tls_fingerprint": "sha256:AABBcc",
           "ssh_host": "s.example",
           "ssh_port": 8022,
-          "auth_mode": ""
+          "auth_mode": "",
+          "user": "",
+          "identity_file": ""
         }
       ]
     },
@@ -66,7 +74,513 @@
           "tls_fingerprint": "",
           "ssh_host": "w.example",
           "ssh_port": 2222,
-          "auth_mode": "MTLS"
+          "auth_mode": "MTLS",
+          "user": "",
+          "identity_file": ""
+        }
+      ]
+    },
+    {
+      "name": "user is carried verbatim per entry; absent is empty",
+      "config_yaml": "servers:\n  held:\n    api_url: https://h.example:8443\n    host: h.example\n    ssh_port: 2222\n    auth_mode: mtls\n    user: pat\n  unheld:\n    api_url: https://u.example:8443\n    host: u.example\n    ssh_port: 2222\n    auth_mode: mtls\n",
+      "expected": [
+        {
+          "name": "held",
+          "url": "https://h.example:8443",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "h.example",
+          "ssh_port": 2222,
+          "auth_mode": "mtls",
+          "user": "pat",
+          "identity_file": ""
+        },
+        {
+          "name": "unheld",
+          "url": "https://u.example:8443",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "u.example",
+          "ssh_port": 2222,
+          "auth_mode": "mtls",
+          "user": "",
+          "identity_file": ""
+        }
+      ]
+    },
+    {
+      "name": "a user that is not a plain string fails closed as !not-a-string, never empty; null is empty; a number is a scalar kept verbatim",
+      "config_yaml": "servers:\n  blockmap:\n    host: bm.example\n    user:\n      name: pat\n  flowlist:\n    host: fl.example\n    user: [pat]\n  flowmap:\n    host: fm.example\n    user: {}\n  list:\n    host: l.example\n    user:\n    - pat\n  null:\n    host: n.example\n    user:\n  number:\n    host: num.example\n    user: 5\n",
+      "expected": [
+        {
+          "name": "blockmap",
+          "url": "http://bm.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "bm.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string",
+          "identity_file": ""
+        },
+        {
+          "name": "flowlist",
+          "url": "http://fl.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "fl.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string",
+          "identity_file": ""
+        },
+        {
+          "name": "flowmap",
+          "url": "http://fm.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "fm.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string",
+          "identity_file": ""
+        },
+        {
+          "name": "list",
+          "url": "http://l.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "l.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string",
+          "identity_file": ""
+        },
+        {
+          "name": "null",
+          "url": "http://n.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "n.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": ""
+        },
+        {
+          "name": "number",
+          "url": "http://num.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "num.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "5",
+          "identity_file": ""
+        }
+      ]
+    },
+    {
+      "name": "an unquoted true is read as its text, as Go's reader reads it: the user name true, the same as the quoted value",
+      "config_yaml": "servers:\n  quoted:\n    host: q.example\n    user: \"true\"\n  unquoted:\n    host: u.example\n    user: true\n",
+      "expected": [
+        {
+          "name": "quoted",
+          "url": "http://q.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "q.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "true",
+          "identity_file": ""
+        },
+        {
+          "name": "unquoted",
+          "url": "http://u.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "u.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "true",
+          "identity_file": ""
+        }
+      ]
+    },
+    {
+      "name": "identity_file is carried verbatim (YAML escapes decoded); absent, empty, null or ~ is empty; a list or a map fails closed as the unreadable marker; user null or ~ is empty",
+      "config_yaml": "servers:\n  plain:\n    host: p.example\n    identity_file: /home/pat/.ssh/id_work\n  tab:\n    host: t.example\n    identity_file: \"/home/pat/.ssh/id\\twork\"\n  quoted-hash:\n    host: q.example\n    identity_file: '/home/pat/.ssh/id#work'\n  null:\n    host: n.example\n    identity_file: null\n    user: null\n  tilde:\n    host: ti.example\n    identity_file: ~\n    user: ~\n  bare:\n    host: b.example\n    identity_file:\n  list:\n    host: l.example\n    identity_file:\n    - /home/pat/.ssh/id_work\n  map:\n    host: m.example\n    identity_file: {}\n",
+      "expected": [
+        {
+          "name": "bare",
+          "url": "http://b.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "b.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": ""
+        },
+        {
+          "name": "list",
+          "url": "http://l.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "l.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        },
+        {
+          "name": "map",
+          "url": "http://m.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "m.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        },
+        {
+          "name": "null",
+          "url": "http://n.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "n.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": ""
+        },
+        {
+          "name": "plain",
+          "url": "http://p.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "p.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/home/pat/.ssh/id_work"
+        },
+        {
+          "name": "quoted-hash",
+          "url": "http://q.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "q.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/home/pat/.ssh/id#work"
+        },
+        {
+          "name": "tab",
+          "url": "http://t.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "t.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/home/pat/.ssh/id\twork"
+        },
+        {
+          "name": "tilde",
+          "url": "http://ti.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "ti.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": ""
+        }
+      ]
+    },
+    {
+      "name": "identity_file and user not read exactly fail closed: a tag (!!str null is the string null, never no value), an anchor, or a value over more than one line; an entry with a merge key fails both closed whatever it says; a quoted key is decoded, escapes and all",
+      "config_yaml": "servers:\n  tagged-null:\n    host: tn.example\n    identity_file: !!str null\n    user: !!str null\n  tagged:\n    host: tg.example\n    identity_file: !!str /home/pat/.ssh/id_work\n  anchored:\n    host: an.example\n    identity_file: &key /home/pat/.ssh/id_work\n    user: &u pat\n  folded:\n    host: fo.example\n    identity_file: /home/pat/.ssh/first\n      second\n  merged:\n    host: me.example\n    <<: {identity_file: /home/pat/.ssh/id_work, user: pat}\n  escaped-key:\n    host: ek.example\n    \"identity\\u005ffile\": /home/pat/.ssh/id_work\n",
+      "expected": [
+        {
+          "name": "anchored",
+          "url": "http://an.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "an.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        },
+        {
+          "name": "escaped-key",
+          "url": "http://ek.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "ek.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/home/pat/.ssh/id_work"
+        },
+        {
+          "name": "folded",
+          "url": "http://fo.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "fo.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        },
+        {
+          "name": "merged",
+          "url": "http://me.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "me.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string",
+          "identity_file": "\u0000<identity_file: entry not read exactly>"
+        },
+        {
+          "name": "tagged",
+          "url": "http://tg.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "tg.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        },
+        {
+          "name": "tagged-null",
+          "url": "http://tn.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "tn.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        }
+      ]
+    },
+    {
+      "name": "every shape of the A8 review's table this reader parses (plan 037 A8; the whole-file errors, an alias, a merge through one and a repeated key, are pinned in discovery.rs's both-readers test): a tagged key (!!str, or !!binary that Go decodes to identity_file) refuses the entry like a merge key; a value with a tag or an anchor, a block scalar or a value continued on an indented line is the unreadable marker; an escaped quoted key, an anchored key, the fields as a flow mapping (on the entry's line or the next) and an explicit ? key are read as Go reads them; a comment after a space or a tab ends the value; a null or ~ host has no target",
+      "config_yaml": "servers:\n  escaped-key:\n    host: ek.example\n    \"identity\\u005ffile\": /keys/prod\n  continued:\n    host: co.example\n    identity_file: /keys/prod\n      more\n  folded:\n    host: fo.example\n    identity_file: >-\n      /keys/prod\n  literal:\n    host: li.example\n    identity_file: |\n      /keys/prod\n  tagged-value:\n    host: tv.example\n    identity_file: !!str /keys/prod\n  str-key:\n    host: sk.example\n    !!str identity_file: /keys/prod\n  binary-key:\n    host: bk.example\n    !!binary aWRlbnRpdHlfZmlsZQ==: /keys/prod\n  anchored-value:\n    host: av.example\n    identity_file: &k1 /keys/prod\n  anchored-key:\n    host: ak.example\n    &k2 identity_file: /keys/prod\n  merged:\n    host: me.example\n    <<: {identity_file: /keys/prod}\n  flow-next-line:\n    {host: fn.example, identity_file: /keys/prod}\n  inline: {host: in.example, identity_file: /keys/prod}\n  explicit:\n    host: ex.example\n    ? identity_file\n    : /keys/prod\n  null-host:\n    host: null\n    identity_file: /keys/prod\n  tilde-host:\n    host: ~\n    identity_file: /keys/prod\n  comment-space:\n    host: cs.example\n    identity_file: /keys/prod # the key\n  comment-tab:\n    host: ct.example\n    identity_file: /keys/prod\t# the key\n",
+      "expected": [
+        {
+          "name": "anchored-key",
+          "url": "http://ak.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "ak.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/keys/prod"
+        },
+        {
+          "name": "anchored-value",
+          "url": "http://av.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "av.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        },
+        {
+          "name": "binary-key",
+          "url": "http://bk.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "bk.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string",
+          "identity_file": "\u0000<identity_file: entry not read exactly>"
+        },
+        {
+          "name": "comment-space",
+          "url": "http://cs.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "cs.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/keys/prod"
+        },
+        {
+          "name": "comment-tab",
+          "url": "http://ct.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "ct.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/keys/prod"
+        },
+        {
+          "name": "continued",
+          "url": "http://co.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "co.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        },
+        {
+          "name": "escaped-key",
+          "url": "http://ek.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "ek.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/keys/prod"
+        },
+        {
+          "name": "explicit",
+          "url": "http://ex.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "ex.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/keys/prod"
+        },
+        {
+          "name": "flow-next-line",
+          "url": "http://fn.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "fn.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/keys/prod"
+        },
+        {
+          "name": "folded",
+          "url": "http://fo.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "fo.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        },
+        {
+          "name": "inline",
+          "url": "http://in.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "in.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/keys/prod"
+        },
+        {
+          "name": "literal",
+          "url": "http://li.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "li.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        },
+        {
+          "name": "merged",
+          "url": "http://me.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "me.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string",
+          "identity_file": "\u0000<identity_file: entry not read exactly>"
+        },
+        {
+          "name": "str-key",
+          "url": "http://sk.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "sk.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "!not-a-string",
+          "identity_file": "\u0000<identity_file: entry not read exactly>"
+        },
+        {
+          "name": "tagged-value",
+          "url": "http://tv.example:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "tv.example",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "\u0000<identity_file: not a plain string>"
+        }
+      ]
+    },
+    {
+      "name": "the third A8 review's shapes this reader parses (plan 037 A8; the whole-file errors, a raw CR, NEL, U+2028 or U+2029, a second servers: and a tab-indented line, are pinned in discovery.rs's both-readers test): a byte-order mark is skipped; only the first document is read, so a second one cannot replace an entry; a plain name with colons (prod:blue, a:b:c, an address and a port) is read under its own name; a no-break space before a colon makes another key, so that entry has no host and no target",
+      "config_yaml": "\ufeffservers:\n    prod:blue:\n        host: blue.example.test\n        ssh_port: 2222\n        identity_file: /keys/blue\n    a:b:c:\n        host: abc.example.test\n        user: pat\n    10.0.0.5:8443:\n        host: 10.0.0.5\n        ssh_port: 12222\n    nbsp:\n        host\u00a0: nbsp.example.test\n        ssh_port: 22\n---\nservers:\n    prod:blue:\n        host: other.example.test\n",
+      "expected": [
+        {
+          "name": "10.0.0.5:8443",
+          "url": "http://10.0.0.5:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "10.0.0.5",
+          "ssh_port": 12222,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": ""
+        },
+        {
+          "name": "a:b:c",
+          "url": "http://abc.example.test:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "abc.example.test",
+          "ssh_port": 0,
+          "auth_mode": "",
+          "user": "pat",
+          "identity_file": ""
+        },
+        {
+          "name": "prod:blue",
+          "url": "http://blue.example.test:8080",
+          "token": "",
+          "tls_fingerprint": "",
+          "ssh_host": "blue.example.test",
+          "ssh_port": 2222,
+          "auth_mode": "",
+          "user": "",
+          "identity_file": "/keys/blue"
         }
       ]
     }

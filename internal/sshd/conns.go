@@ -58,9 +58,10 @@ func (c *trackedConn) Close() error {
 	return err
 }
 
-// wrapConn is the gliderlabs ConnCallback of a server with
-// KeyAuth.TrackConnections: it wraps each new connection in a trackedConn,
-// kept on the connection's context until it authenticates.
+// wrapConn wraps each new connection of a server with
+// KeyAuth.TrackConnections in a trackedConn, kept on the connection's context
+// until it authenticates. The server's ConnCallback (admitConn) calls it on
+// a connection it admitted, after wrapping it in its preauthConn.
 func (s *Server) wrapConn(ctx ssh.Context, conn net.Conn) net.Conn {
 	c := &trackedConn{Conn: conn, s: s}
 	ctx.SetValue(trackedConnKey{}, c)
@@ -158,11 +159,17 @@ func (s *Server) CloseConnectionsExcept(keep func(name string) bool) int {
 	}
 	s.connMu.Unlock()
 
-	// The sweep: every socket, before any log line.
+	// The sweep: every socket, before any log line. A connection still in the
+	// unauthenticated counts (tracked, and not yet out of them) is shut
+	// through its preauthConn, which writes nothing: its "SSH auth failed"
+	// line is written with the others, after the sweep.
 	closed := 0
+	var afterwards []func()
 	for _, conns := range byUser {
 		for _, c := range conns {
-			_ = c.Conn.Close()
+			if f := shutQuietly(c.Conn); f != nil {
+				afterwards = append(afterwards, f)
+			}
 		}
 		closed += len(conns)
 	}
@@ -183,6 +190,9 @@ func (s *Server) CloseConnectionsExcept(keep func(name string) bool) int {
 	go func() {
 		for _, line := range lines {
 			log.Print(line)
+		}
+		for _, f := range afterwards {
+			f()
 		}
 	}()
 	return closed

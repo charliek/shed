@@ -435,8 +435,10 @@ pub trait TokenProvider: Send + Sync {
     fn surviving_token(&self) -> Option<String> {
         None
     }
-    /// Whether a certificate identity is armed on the transport — used only to
-    /// pick the right log line when `token()` fails. Default `false`.
+    /// Whether a certificate identity is armed on the transport (while a held-user
+    /// refusal stands, only one still valid: plan 037 A25) — used to pick the right log
+    /// line when `token()` fails, and, when `false` after a held-user refusal, to send
+    /// nothing (plan 037 A23). Default `false`.
     fn presenting_certificate(&self) -> bool {
         false
     }
@@ -447,6 +449,25 @@ pub trait TokenProvider: Send + Sync {
     fn would_mint(&self) -> bool {
         false
     }
+    /// [`Self::token`] for one request; on failure also the refusal of the certificate
+    /// the mint THIS call made or joined was issued (plan 037 §3.2.2), when that is why it
+    /// failed. The request explains a server's refusal with it — never with a refusal
+    /// another request's mint produced. Default: [`Self::token`], with no refusal.
+    async fn token_for_request(&self) -> Result<String, (BusError, Option<MintRefusal>)> {
+        self.token().await.map_err(|e| (e, None))
+    }
+}
+
+/// The refusal of the certificate one request's own mint was issued
+/// ([`TokenProvider::token_for_request`], plan 037 §3.2.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintRefusal {
+    pub message: String,
+    /// The held-user rule's refusal (a certificate for another named user, or one that
+    /// names no user: [`crate::minter::ObtainError::held_user`]). With nothing held to
+    /// present, the request is then not sent at all (plan 037 A23); any other refusal
+    /// only explains the server's answer to a request that is sent as before.
+    pub held_user: bool,
 }
 
 /// A fixed-token provider (the open-mode / static-token analog of Go's
@@ -470,6 +491,18 @@ impl TokenProvider for StaticTokenProvider {
         Ok(self.token.clone())
     }
     fn invalidate(&self) {}
+}
+
+/// The static bearer a server group that does not mint sends, on the bus and on the egress
+/// stream: the entry's `credentials_token`, except for an entry that names an
+/// `identity_file` (plan 037 A8), which never sends a stored token — it says nothing about
+/// which SSH key it was issued for. Such a group sends no bearer.
+pub(crate) fn static_bearer(target: &ServerTarget) -> String {
+    if target.identity_file.is_empty() {
+        target.token.clone()
+    } else {
+        String::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -643,6 +676,9 @@ enum StreamEnd {
     },
     /// The server closed a healthy stream → reconnect.
     ClosedByServer(String),
+    /// This request's own mint was refused by the held-user rule and nothing is held to
+    /// present (plan 037 A23): nothing was sent → backoff + retry, which mints again.
+    NotSent(String),
     /// The desktop app's embedded broker appeared on this machine while this client
     /// was connecting or held the stream: the attempt was dropped (its connection
     /// closed) → stand by ([`BusClient::with_presence`]).
@@ -869,6 +905,11 @@ pub struct BusClient {
     /// is the only path that 401-retries. `None` in open mode.
     token_provider: Option<Arc<dyn TokenProvider>>,
     log: Arc<dyn BusLog>,
+    /// The held-user refusal last logged at WARN by [`Self::bearer_for_request`]: a
+    /// refusal is logged at WARN once per episode (when first seen, or when its text
+    /// changes) and at DEBUG after that, until a credential is served again (plan 037
+    /// A25). Shared by every clone, so a server's subscriptions and answers log it once.
+    refusal_warned: Arc<Mutex<Option<String>>>,
     initial_backoff: Duration,
     max_backoff: Duration,
     /// This machine's identity, sent on every subscribe and respond; `None` sends no
@@ -934,6 +975,7 @@ impl BusClient {
             static_token,
             token_provider,
             log,
+            refusal_warned: Arc::new(Mutex::new(None)),
             initial_backoff: INITIAL_BACKOFF,
             max_backoff: MAX_BACKOFF,
             machine: None,
@@ -1268,6 +1310,8 @@ impl BusClient {
                     down_logged = false;
                 }
                 StreamEnd::Unauthorized(reason) => {
+                    // The reason already leads with this request's own held-user refusal,
+                    // when its mint was refused (`stream_messages`).
                     // Token rejected — re-mint so the backoff-reconnect authenticates
                     // fresh (only a provider-backed client has anything to invalidate).
                     if let Some(p) = &self.token_provider {
@@ -1281,7 +1325,8 @@ impl BusClient {
                 }
                 StreamEnd::Transport(reason)
                 | StreamEnd::BadStatus(reason)
-                | StreamEnd::ClosedByServer(reason) => {
+                | StreamEnd::ClosedByServer(reason)
+                | StreamEnd::NotSent(reason) => {
                     set_state(&status, ConnState::Reconnecting, Some(&reason));
                     // Reset backoff only after a connection that held for a while.
                     if connected && start.elapsed() > HELD_RESET {
@@ -1491,13 +1536,25 @@ impl BusClient {
         // invalidation), so it races shutdown like every other network await —
         // a SIGTERM during a re-mint must not hold teardown for the mint
         // timeout.
-        let bearer = tokio::select! {
+        let (bearer, refusal) = tokio::select! {
             _ = wait_shutdown(shutdown.clone()) => return StreamEnd::Shutdown,
-            t = self.bearer() => t,
+            t = self.bearer_for_request() => match t {
+                Ok(t) => t,
+                // Refused for its user with nothing to present: not sent (plan 037 A23).
+                Err(refusal) => return StreamEnd::NotSent(refusal),
+            },
         };
         if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
         }
+        // When this request's own mint was refused for its certificate's user, that is
+        // why the server refuses it: say it first (plan 037 §3.2.2).
+        let unauthorized = |reason: String| {
+            StreamEnd::Unauthorized(match &refusal {
+                Some(refusal) => format!("{refusal} (request refused: {reason})"),
+                None => reason,
+            })
+        };
 
         // Race the connect against shutdown so a hung dial can't block teardown.
         let resp = tokio::select! {
@@ -1517,7 +1574,7 @@ impl BusClient {
                 Err(e) => {
                     let reason = format!("connecting: {}", shed_core::authfail::flatten(&e));
                     return if shed_core::authfail::is_auth_shaped_message(&reason) {
-                        StreamEnd::Unauthorized(reason)
+                        unauthorized(reason)
                     } else {
                         StreamEnd::Transport(reason)
                     };
@@ -1550,7 +1607,7 @@ impl BusClient {
                     source,
                 },
                 SubscribeRefusal::Unauthorized => {
-                    StreamEnd::Unauthorized(format!("unexpected status 401: {body}"))
+                    unauthorized(format!("unexpected status 401: {body}"))
                 }
                 SubscribeRefusal::RateLimited => StreamEnd::RateLimited {
                     reason: format!("unexpected status {st}: {body}"),
@@ -1809,7 +1866,10 @@ impl BusClient {
                 return Err(BusError::Transport("sending response: shutting down".into()))
             }
             t = until(deadline, self.respond_bearer(&mut ctx.mint_spent)) => match t {
-                Some(t) => t,
+                Some(Ok(t)) => t,
+                // Refused for its user with nothing to present: not sent (plan 037 A23),
+                // and the refusal is the whole error.
+                Some(Err(refusal)) => return Err(BusError::Config(refusal)),
                 None => {
                     ctx.not_sent = Some(NotSent::NoRoom);
                     return Err(past_deadline());
@@ -1898,52 +1958,117 @@ impl BusClient {
     /// the held credential is presented as it is: the surviving bearer, or nothing (the
     /// certificate still armed on the transport). Without this bound a failed re-mint
     /// leaves the source refused, and every 503 retry would mint again.
-    async fn respond_bearer(&self, mint_spent: &mut bool) -> Option<String> {
+    ///
+    /// `Err` is [`Self::bearer_for_request`]'s: the POST is not sent.
+    async fn respond_bearer(&self, mint_spent: &mut bool) -> Result<Option<String>, String> {
         if let Some(p) = &self.token_provider {
             if p.would_mint() {
                 if *mint_spent {
-                    return p.surviving_token();
+                    return Ok(p.surviving_token());
                 }
                 *mint_spent = true;
             }
         }
-        self.bearer().await
+        self.bearer_for_request().await.map(|(bearer, _)| bearer)
     }
 
     /// The bearer token to send, or `None`. A provider takes precedence (and on a
     /// mint error the client sends unauthenticated, warning once — Go's setAuth);
     /// otherwise the static token is sent when non-empty; else no header.
+    #[cfg(test)]
     async fn bearer(&self) -> Option<String> {
+        self.bearer_for_request()
+            .await
+            .map(|(bearer, _)| bearer)
+            .unwrap_or(None)
+    }
+
+    /// The bearer for one request, and the refusal of the certificate the mint THIS
+    /// fetch made or joined was issued, when that is why the fetch failed (plan 037
+    /// §3.2.2). The request carries it to its own outcome: a server's refusal of this
+    /// request is explained by this mint's refusal and by no other.
+    ///
+    /// `Err(refusal)` when that refusal is the held-user rule's
+    /// ([`MintRefusal::held_user`]) and nothing is held to present (no surviving token,
+    /// no armed certificate): the request is not sent at all, since the server issues
+    /// certificates and could not authenticate it, and the refusal is its whole error
+    /// (plan 037 A23). Every other failure is sent as before.
+    async fn bearer_for_request(&self) -> Result<(Option<String>, Option<String>), String> {
         if let Some(p) = &self.token_provider {
-            match p.token().await {
-                Ok(t) => (!t.is_empty()).then_some(t),
+            match p.token_for_request().await {
+                Ok(t) => {
+                    // A credential is served again: the next refusal is a new episode.
+                    *self.refusal_warned.lock().unwrap() = None;
+                    Ok(((!t.is_empty()).then_some(t), None))
+                }
                 // A failed re-mint does not strip the wire of a credential the
                 // server might still accept: present the surviving token (or,
                 // in mtls state, the still-armed certificate) and log WHY the
                 // replacement could not be minted (Go setAuth parity).
-                Err(e) => {
-                    if let Some(t) = p.surviving_token() {
-                        self.log.warn(&format!(
-                            "credential refresh failed; presenting the existing token: {e}"
-                        ));
+                Err((e, refusal)) => {
+                    let held_user = refusal.as_ref().filter(|r| r.held_user);
+                    let bearer = if let Some(t) = p.surviving_token() {
+                        self.log_fetch_failure(
+                            held_user,
+                            &format!(
+                                "credential refresh failed; presenting the existing token: {e}"
+                            ),
+                        );
                         Some(t)
                     } else if p.presenting_certificate() {
-                        self.log.warn(&format!(
-                            "credential refresh failed; presenting the existing certificate: {e}"
-                        ));
+                        self.log_fetch_failure(
+                            held_user,
+                            &format!(
+                                "credential refresh failed; presenting the existing certificate: {e}"
+                            ),
+                        );
                         None
+                    } else if let Some(refusal) = held_user {
+                        self.log_fetch_failure(
+                            held_user,
+                            &format!(
+                                "credential refused for its user and none is held; not sending: {e}"
+                            ),
+                        );
+                        return Err(refusal.message.clone());
                     } else {
                         self.log.warn(&format!(
                             "token provider returned no token; sending unauthenticated: {e}"
                         ));
                         None
-                    }
+                    };
+                    Ok((bearer, refusal.map(|r| r.message)))
                 }
             }
         } else if !self.static_token.is_empty() {
-            Some(self.static_token.clone())
+            Ok((Some(self.static_token.clone()), None))
         } else {
-            None
+            Ok((None, None))
+        }
+    }
+
+    /// Log why a request's credential fetch failed. Any failure but a held-user refusal
+    /// is logged at WARN every time, as before. A held-user refusal is answered to every
+    /// request while it lasts (the source mints again only after its wait), so it is
+    /// logged at WARN once per episode, when it is first seen or its text changes, and at
+    /// DEBUG after that, until a credential is served again (plan 037 A25).
+    fn log_fetch_failure(&self, held_user: Option<&MintRefusal>, line: &str) {
+        let Some(refusal) = held_user else {
+            self.log.warn(line);
+            return;
+        };
+        let first = {
+            let mut warned = self.refusal_warned.lock().unwrap();
+            let first = warned.as_deref() != Some(refusal.message.as_str());
+            if first {
+                *warned = Some(refusal.message.clone());
+            }
+            first
+        };
+        if first {
+            self.log.warn(line);
+        } else {
+            self.log.debug(line);
         }
     }
 
@@ -2243,6 +2368,21 @@ fn redirect_allowed(configured: Option<&reqwest::Url>, next: &reqwest::Url, hops
         && configured.is_some_and(|c| c.origin() == next.origin())
 }
 
+/// The redirect policy of every client the broker builds for a server (the bus's, and the
+/// egress stream's, plan 037 A25): follow a redirect only as [`redirect_allowed`] says,
+/// within `server_url`'s own HTTPS origin; stop at any other, which is then the answer. An
+/// unparseable URL follows no redirect at all.
+pub(crate) fn same_origin_redirects(server_url: &str) -> reqwest::redirect::Policy {
+    let configured = reqwest::Url::parse(server_url).ok();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if redirect_allowed(configured.as_ref(), attempt.url(), attempt.previous().len()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 /// Build the reqwest client. Redirects stay inside the configured server's HTTPS
 /// origin ([`redirect_allowed`]; fail-closed on a plaintext redirect, as shed-core's
 /// `build_http_client`); with a `pin` it installs the
@@ -2265,16 +2405,7 @@ fn build_http_client(
     pin: Option<&str>,
     client_certs: Option<Arc<ClientCertResolver>>,
 ) -> Result<reqwest::Client, BusError> {
-    // An unparseable URL follows no redirect at all.
-    let configured = reqwest::Url::parse(server_url).ok();
-    let mut builder =
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if redirect_allowed(configured.as_ref(), attempt.url(), attempt.previous().len()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }));
+    let mut builder = reqwest::Client::builder().redirect(same_origin_redirects(server_url));
     if let Some(pin) = pin {
         let cfg = match client_certs {
             Some(resolver) => pinned_client_config_with_client_auth(pin, resolver),
@@ -2430,23 +2561,42 @@ pub fn spawn_server_group(
     // reads at handshake time. An open/static-token server has neither, so both stay None
     // and the transport is byte-identical to what it was before mtls existed.
     let secure = crate::supervisor::should_mint(deps, target);
+    // The one static bearer a group that does not mint may send — the bus provider's and
+    // the egress stream's alike. Never a stored token for an entry with an identity file.
+    let static_bearer = static_bearer(target);
+    if !secure && static_bearer.is_empty() && !target.token.is_empty() {
+        log.warn(&format!(
+            "server {}: its credentials_token is not sent: the entry names an identity_file, \
+             and a stored token does not say which SSH key it was issued for",
+            shed_core::token::display_server_name(&target.name)
+        ));
+    }
     let mut refresh_source: Option<Arc<crate::minter::CredentialSource>> = None;
     let provider: Arc<dyn TokenProvider> = if secure {
         let minter = deps
             .minter
             .clone()
             .expect("should_mint implies a minter is present");
-        let src = crate::minter::new_credential_source(
+        // Fenced by this group's cancel: once the supervisor stops or replaces the group
+        // (a changed `user` in config among the reasons), a mint it started that ends
+        // late never writes over what the replacement stored (plan 037 §3.2.2).
+        let src = crate::minter::new_group_credential_source(
             minter,
             target.clone(),
             crate::minter::SCOPE_CREDENTIALS,
+            cancel_rx.clone(),
         );
+        // A stored certificate the held-user rule refused at start (plan 037 §3.2.2):
+        // say why the source mints instead of presenting it.
+        if let Some(note) = src.hydration_note() {
+            log.warn(note);
+        }
         refresh_source = Some(src.clone());
         // `Arc<CredentialSource>: TokenProvider` (the bridge in `supervisor.rs`) — box it
         // into the trait object the client holds.
         Arc::new(src) as Arc<dyn TokenProvider>
     } else {
-        Arc::new(StaticTokenProvider::new(target.token.clone())) as Arc<dyn TokenProvider>
+        Arc::new(StaticTokenProvider::new(static_bearer.clone())) as Arc<dyn TokenProvider>
     };
 
     let bus_certs = refresh_source.as_ref().map(|s| s.cert_resolver());
@@ -2574,7 +2724,7 @@ pub fn spawn_server_group(
     let egress = crate::egress::EgressSubscriber::new(
         target.name.clone(),
         target.url.clone(),
-        target.token.clone(),
+        static_bearer,
         &target.tls_fingerprint,
         crate::egress::EgressCredentials {
             tokens: egress_tokens,
@@ -4285,7 +4435,7 @@ fn handle_docker_status(
 pub const BUS_NAMESPACES: [&str; 3] = [NS_SSH_AGENT, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS];
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use httpmock::prelude::*;
     use std::sync::atomic::AtomicUsize;
@@ -4727,7 +4877,8 @@ mod tests {
         );
 
         // Arming the source's resolver changes what the ALREADY-BUILT config presents —
-        // no rebuild, which is the entire adaptive-transport claim.
+        // no rebuild, which is the entire adaptive-transport claim. (No userId: this arms
+        // the resolver directly, a layer below adoption's user rule.)
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params
@@ -5242,6 +5393,417 @@ mod tests {
         assert_eq!(e.id, "after401");
         assert!(tp.invalidated() >= 1, "the 401 must invalidate the token");
         stale.assert_hits_async(1).await;
+    }
+
+    /// When the mint a request's own credential fetch made was refused for its
+    /// certificate's user (plan 037 §3.2.2), the status's last error after the server's
+    /// 401 leads with that refusal; without one it is the 401 alone.
+    #[tokio::test]
+    async fn a_held_user_refusal_leads_the_401_reason_in_the_status() {
+        const REFUSAL: &str = "server \"s\": the server issued a certificate for user \"admin\", \
+            but this entry is held to \"pat\"; it was not used.";
+        struct RefusedProvider(Option<&'static str>);
+        #[async_trait::async_trait]
+        impl TokenProvider for RefusedProvider {
+            async fn token(&self) -> Result<String, BusError> {
+                unreachable!("a request fetches through token_for_request")
+            }
+            async fn token_for_request(&self) -> Result<String, (BusError, Option<MintRefusal>)> {
+                Err((
+                    BusError::Config(REFUSAL.into()),
+                    self.0.map(|m| MintRefusal {
+                        message: m.to_string(),
+                        held_user: true,
+                    }),
+                ))
+            }
+            fn invalidate(&self) {}
+            // A certificate for the held user is still armed, so the request is sent
+            // and the refusal explains the server's answer to it.
+            fn presenting_certificate(&self) -> bool {
+                true
+            }
+        }
+        for (refusal, starts) in [(Some(REFUSAL), REFUSAL), (None, "unexpected status 401")] {
+            let server = MockServer::start_async().await;
+            server
+                .mock_async(|w, t| {
+                    w.method(GET)
+                        .path("/api/plugins/listeners/ssh-agent/messages");
+                    t.status(401);
+                })
+                .await;
+            let client = BusClient::new(
+                server.base_url(),
+                String::new(),
+                Some(Arc::new(RefusedProvider(refusal))),
+                None,
+                None,
+                silent_log(),
+            )
+            .unwrap()
+            .with_test_backoff(Duration::from_millis(5), Duration::from_millis(20));
+            let (_tx, rx) = shutdown_pair();
+            let sub = client.subscribe("ssh-agent", rx);
+            let mut last = String::new();
+            for _ in 0..200 {
+                last = sub.status().last_error;
+                if !last.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(last.starts_with(starts), "{last}");
+            assert!(last.contains("unexpected status 401"), "{last}");
+            if refusal.is_some() {
+                assert!(
+                    last.contains("(request refused: unexpected status 401"),
+                    "{last}"
+                );
+            }
+        }
+    }
+
+    // ---- plan 037 A23: a held-user refusal with nothing to present sends nothing ----
+
+    const HELD_USER_REFUSAL: &str = "server \"s\": the server issued a certificate for user \
+        \"admin\", but this entry is held to \"pat\"; it was not used.";
+
+    /// A provider whose every fetch fails with a mint refusal: the held-user rule's or
+    /// another, with or without a certificate still armed.
+    struct RefusingProvider {
+        held_user: bool,
+        presenting: bool,
+        fetches: AtomicUsize,
+    }
+    impl RefusingProvider {
+        fn new(held_user: bool, presenting: bool) -> Arc<Self> {
+            Arc::new(Self {
+                held_user,
+                presenting,
+                fetches: AtomicUsize::new(0),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl TokenProvider for RefusingProvider {
+        async fn token(&self) -> Result<String, BusError> {
+            unreachable!("a request fetches through token_for_request")
+        }
+        async fn token_for_request(&self) -> Result<String, (BusError, Option<MintRefusal>)> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Err((
+                BusError::Config(HELD_USER_REFUSAL.into()),
+                Some(MintRefusal {
+                    message: HELD_USER_REFUSAL.into(),
+                    held_user: self.held_user,
+                }),
+            ))
+        }
+        fn invalidate(&self) {}
+        fn presenting_certificate(&self) -> bool {
+            self.presenting
+        }
+    }
+
+    /// A plain TCP listener on loopback that counts the connections it accepts and
+    /// answers none: a request never sent leaves the count at zero.
+    async fn counting_listener() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counted = accepts.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                held.push(sock); // never answered; dropped with the task
+            }
+        });
+        (url, accepts, task)
+    }
+
+    fn client_with(url: &str, provider: Option<Arc<dyn TokenProvider>>) -> BusClient {
+        BusClient::new(
+            url.to_string(),
+            String::new(),
+            provider,
+            None,
+            None,
+            silent_log(),
+        )
+        .unwrap()
+        .with_test_backoff(Duration::from_millis(5), Duration::from_millis(20))
+        .with_test_respond_timing(Duration::from_millis(200), Duration::from_secs(1))
+    }
+
+    /// When a request's own mint is refused by the held-user rule and nothing is held to
+    /// present, nothing is sent: the subscription retries on its backoff without ever
+    /// connecting, its status says the refusal alone, and a response POST fails with the
+    /// refusal alone.
+    #[tokio::test]
+    async fn a_held_user_refusal_with_nothing_held_sends_nothing() {
+        let (url, accepts, task) = counting_listener().await;
+        let provider = RefusingProvider::new(true, false);
+        let client = client_with(&url, Some(provider.clone()));
+
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while provider.fetches.load(Ordering::SeqCst) < 3 {
+            assert_eq!(
+                accepts.load(Ordering::SeqCst),
+                0,
+                "the subscription made no connection"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the subscription never retried"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            sub.status().last_error,
+            HELD_USER_REFUSAL,
+            "the refusal alone"
+        );
+        let _ = tx.send(true);
+        drop(sub);
+
+        let env = Envelope::new_response("r", "ssh-agent", serde_json::Value::Null);
+        match client.respond("ssh-agent", &env, &never_shutdown()).await {
+            Err(BusError::Config(m)) => assert_eq!(m, HELD_USER_REFUSAL, "the refusal alone"),
+            other => panic!("want the refusal, got {other:?}"),
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 0, "no connection was made");
+        task.abort();
+    }
+
+    /// Every other case is sent as before: a server that needs no credential, a refusal
+    /// that is not the held-user rule's, and a held-user refusal while a certificate for
+    /// the held user is still armed. Both the subscription and a response POST connect.
+    #[tokio::test]
+    async fn every_other_case_is_still_sent() {
+        let cases: Vec<Option<Arc<dyn TokenProvider>>> = vec![
+            None,
+            Some(RefusingProvider::new(false, false)),
+            Some(RefusingProvider::new(true, true)),
+        ];
+        for (i, provider) in cases.into_iter().enumerate() {
+            let (url, accepts, task) = counting_listener().await;
+            let client = client_with(&url, provider);
+            let (tx, rx) = shutdown_pair();
+            let sub = client.subscribe("ssh-agent", rx);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while accepts.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "case {i}: the subscription never connected"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = tx.send(true);
+            drop(sub);
+
+            let before = accepts.load(Ordering::SeqCst);
+            let env = Envelope::new_response("r", "ssh-agent", serde_json::Value::Null);
+            // The listener answers nothing: the POST times out, having connected.
+            assert!(client
+                .respond("ssh-agent", &env, &never_shutdown())
+                .await
+                .is_err());
+            assert!(
+                accepts.load(Ordering::SeqCst) > before,
+                "case {i}: the response POST never connected"
+            );
+            task.abort();
+        }
+    }
+
+    /// The answers path against the real credential source (plan 037 A25): while pat's
+    /// held certificate is stale and the server issues `admin`'s, every answer still goes
+    /// out (pat's certificate presented) but the source mints only once per refusal wait,
+    /// and the refusal is logged at WARN once per episode (first seen, or its text changed)
+    /// and at DEBUG after that, until a credential is served again.
+    #[tokio::test]
+    async fn answers_during_a_refusal_wait_mint_once_and_warn_once() {
+        use crate::minter::tests::{minted_cert_for, FakeMinter, MonoClock, TestCa, TestUser};
+        let ca = TestCa::new();
+        let stale = || Some(crate::status::now_unix() + 60);
+        let day = Some(crate::status::now_unix() + 86_400);
+        let fm = FakeMinter::new(vec![
+            Ok(minted_cert_for(&ca, 0x0a, stale(), &TestUser::Named("pat"))),
+            Ok(minted_cert_for(&ca, 0x0b, day, &TestUser::Named("admin"))),
+            Ok(minted_cert_for(&ca, 0x0c, day, &TestUser::Named("admin"))),
+            Ok(minted_cert_for(&ca, 0x0d, day, &TestUser::Unbound)),
+            Ok(minted_cert_for(&ca, 0x0e, day, &TestUser::Named("admin"))),
+            Ok(minted_cert_for(&ca, 0x0f, stale(), &TestUser::Named("pat"))),
+            Ok(minted_cert_for(&ca, 0x10, day, &TestUser::Named("admin"))),
+        ]);
+        let clock = MonoClock::new();
+        let source = clock.on(crate::minter::new_credential_source_with_store(
+            fm.clone(),
+            ServerTarget {
+                name: "s".into(),
+                url: String::new(),
+                token: String::new(),
+                tls_fingerprint: String::new(),
+                ssh_host: String::new(),
+                ssh_port: 0,
+                auth_mode: String::new(),
+                user: "pat".into(),
+                identity_file: String::new(),
+            },
+            crate::minter::SCOPE_CREDENTIALS,
+            None,
+        ));
+        source.token().await.unwrap(); // pat's, already stale
+        let srv = ScriptedServer::spawn(vec![], Answer(204, vec![], String::new())).await;
+        let log = Arc::new(CountingLog::default());
+        let client = BusClient::new(
+            srv.url(),
+            String::new(),
+            Some(Arc::new(source.clone())),
+            None,
+            None,
+            log.clone(),
+        )
+        .unwrap();
+        let mints = || fm.calls.load(Ordering::SeqCst);
+        let answer = || async {
+            let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+            client
+                .respond("ns", &env, &never_shutdown())
+                .await
+                .expect("the answer goes out with pat's certificate");
+        };
+        let presenting = || {
+            log.lines()
+                .into_iter()
+                .filter(|l| l.contains("presenting the existing certificate"))
+                .map(|l| l.split(' ').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        const N: usize = 5;
+        for _ in 0..N {
+            answer().await;
+        }
+        assert_eq!(srv.seen().len(), N, "every answer was sent");
+        assert_eq!(mints(), 2, "one mint for {N} answers inside the first wait");
+        let mut want = vec!["WARN".to_string()];
+        want.extend(std::iter::repeat_n("DEBUG".to_string(), N - 1));
+        assert_eq!(presenting(), want, "WARN once, then DEBUG");
+
+        // The wait passes; the same refusal again: still DEBUG.
+        clock.advance(Duration::from_secs(1));
+        answer().await;
+        assert_eq!(mints(), 3);
+        want.push("DEBUG".into());
+        assert_eq!(presenting(), want, "the same refusal: DEBUG");
+
+        // Its text changes (a certificate that names no user), and back: WARN each time.
+        clock.advance(Duration::from_secs(2));
+        answer().await;
+        assert_eq!(mints(), 4);
+        want.push("WARN".into());
+        assert_eq!(presenting(), want, "a changed refusal: WARN");
+        clock.advance(Duration::from_secs(4));
+        answer().await;
+        assert_eq!(mints(), 5);
+        want.push("WARN".into());
+        assert_eq!(presenting(), want, "changed back: WARN");
+
+        // pat's certificate is adopted, then the same refusal again: a new episode, WARN.
+        clock.advance(Duration::from_secs(8));
+        answer().await;
+        assert_eq!(mints(), 6, "pat's adopted");
+        answer().await;
+        assert_eq!(mints(), 7, "the wait was reset by the adoption");
+        want.push("WARN".into());
+        assert_eq!(presenting(), want, "a new episode: WARN");
+        assert_eq!(srv.seen().len(), N + 5);
+    }
+
+    /// An expired held certificate is not something to present (plan 037 A25), against
+    /// the real credential source: pat's certificate is held, the server issues admin's,
+    /// and inside the refusal's wait the subscription and a response POST are still sent
+    /// with pat's certificate one second before it expires; once it has expired neither
+    /// connects, and each error is the refusal alone.
+    #[tokio::test]
+    async fn an_expired_held_certificate_sends_nothing_during_a_refusal() {
+        use crate::minter::tests::{pat_then_admin, MISMATCH};
+        const EXPIRY: i64 = 4_102_444_800;
+        let (fm, source, _mono, wall) = pat_then_admin(crate::minter::SCOPE_CREDENTIALS, EXPIRY);
+        source.token().await.unwrap(); // pat's
+        let armed = source.cert_resolver().current().unwrap();
+        let (url, accepts, task) = counting_listener().await;
+        let client = client_with(&url, Some(Arc::new(source.clone())));
+        async fn connected(accepts: &AtomicUsize, at_least: usize) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while accepts.load(Ordering::SeqCst) < at_least {
+                assert!(tokio::time::Instant::now() < deadline, "never connected");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        // One second before pat's certificate expires: refused (the wait starts), and
+        // both are sent with pat's certificate.
+        wall.set(EXPIRY - 1);
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        connected(&accepts, 1).await;
+        let _ = tx.send(true);
+        drop(sub);
+        assert_eq!(fm.calls.load(Ordering::SeqCst), 2, "refused once");
+        assert!(source.holds_certificate());
+        assert!(Arc::ptr_eq(
+            &armed,
+            &source.cert_resolver().current().unwrap()
+        ));
+        let before = accepts.load(Ordering::SeqCst);
+        let env = Envelope::new_response("r", "ssh-agent", serde_json::Value::Null);
+        // The listener answers nothing: the POST times out, having connected.
+        assert!(client
+            .respond("ssh-agent", &env, &never_shutdown())
+            .await
+            .is_err());
+        connected(&accepts, before + 1).await;
+
+        // Past its expiry, inside the same wait: nothing connects.
+        wall.set(EXPIRY + 1);
+        tokio::time::sleep(Duration::from_millis(50)).await; // let stray connects land
+        let before = accepts.load(Ordering::SeqCst);
+        let (tx, rx) = shutdown_pair();
+        let sub = client.subscribe("ssh-agent", rx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while sub.status().last_error.is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "no status error");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // several retries
+        assert_eq!(sub.status().last_error, MISMATCH, "the refusal alone");
+        let _ = tx.send(true);
+        drop(sub);
+        match client.respond("ssh-agent", &env, &never_shutdown()).await {
+            Err(BusError::Config(m)) => assert_eq!(m, MISMATCH, "the refusal alone"),
+            other => panic!("want the refusal, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            before,
+            "no connection was made"
+        );
+        assert_eq!(
+            fm.calls.load(Ordering::SeqCst),
+            2,
+            "no mint inside the wait"
+        );
+        assert!(!source.holds_certificate());
+        task.abort();
     }
 
     #[tokio::test]
@@ -9083,16 +9645,16 @@ mod tests {
     /// leaf, an OPTIONAL client certificate (so a client that has one presents it), and
     /// per request a record of its path, headers and whether a client certificate came
     /// with it. `accepts` counts TCP connections, so zero proves nothing at all arrived.
-    struct TlsRecorder {
-        port: u16,
-        accepts: Arc<AtomicUsize>,
-        seen: TlsSeen,
+    pub(crate) struct TlsRecorder {
+        pub(crate) port: u16,
+        pub(crate) accepts: Arc<AtomicUsize>,
+        pub(crate) seen: TlsSeen,
     }
 
     /// Per request: its path, its headers, and whether a client certificate came with it.
-    type TlsSeen = Arc<Mutex<Vec<(String, Vec<(String, String)>, bool)>>>;
+    pub(crate) type TlsSeen = Arc<Mutex<Vec<(String, Vec<(String, String)>, bool)>>>;
     /// `answer(path, own_port)`: the raw HTTP response for a request.
-    type TlsAnswer = Arc<dyn Fn(&str, u16) -> String + Send + Sync>;
+    pub(crate) type TlsAnswer = Arc<dyn Fn(&str, u16) -> String + Send + Sync>;
 
     #[derive(Debug)]
     struct AnyClientCert(rustls::crypto::WebPkiSupportedAlgorithms);
@@ -9137,7 +9699,7 @@ mod tests {
     }
 
     /// The test server's leaf (DER) and key; the pin a client uses for it.
-    fn test_leaf() -> (Vec<u8>, Vec<u8>, String) {
+    pub(crate) fn test_leaf() -> (Vec<u8>, Vec<u8>, String) {
         let key = rcgen::KeyPair::generate().unwrap();
         let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
         let cert = params.self_signed(&key).unwrap();
@@ -9148,7 +9710,7 @@ mod tests {
 
     impl TlsRecorder {
         /// `answer(path, own_port)` is the raw HTTP response for a request.
-        fn spawn(leaf: &(Vec<u8>, Vec<u8>, String), answer: TlsAnswer) -> TlsRecorder {
+        pub(crate) fn spawn(leaf: &(Vec<u8>, Vec<u8>, String), answer: TlsAnswer) -> TlsRecorder {
             use std::io::{Read, Write};
             let provider = Arc::new(rustls::crypto::ring::default_provider());
             let algs = provider.signature_verification_algorithms;
@@ -9238,7 +9800,8 @@ mod tests {
     const NO_CONTENT: &str = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
 
     /// An https bus client pinned to `leaf`, presenting a client certificate, with an
-    /// identity: everything a redirect could leak.
+    /// identity: everything a redirect could leak. Its certificate names no user: it is
+    /// armed directly, a layer below adoption's user rule.
     fn pinned_identity_client(port: u16, leaf: &(Vec<u8>, Vec<u8>, String)) -> BusClient {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -9386,6 +9949,8 @@ mod tests {
                 ssh_host: String::new(),
                 ssh_port: 0,
                 auth_mode: String::new(),
+                user: String::new(),
+                identity_file: String::new(),
             },
             "credentials",
             None,
@@ -10386,6 +10951,8 @@ mod tests {
             ssh_host: String::new(),
             ssh_port: 0,
             auth_mode: String::new(),
+            user: String::new(),
+            identity_file: String::new(),
         };
 
         let (tx, rx) = shutdown_pair();
@@ -10423,6 +10990,66 @@ mod tests {
         );
         let _ = tx.send(true);
         let _ = g.done.await;
+    }
+
+    /// The static path of a group that does not mint (plan 037 A8): an entry that names
+    /// an `identity_file` never sends its stored `credentials_token` — not on the bus and
+    /// not on the egress stream; the same entry without one sends it on both, as before.
+    #[tokio::test]
+    async fn a_group_for_an_entry_with_an_identity_file_sends_no_stored_token() {
+        let subscribe = "/api/plugins/listeners/ssh-agent/messages";
+        let egress = "/api/egress/stream";
+        for (identity_file, want) in [
+            ("/home/pat/.ssh/id_work", None),
+            ("", Some("Bearer stored-tok".to_string())),
+        ] {
+            let srv = ScriptedServer::spawn(vec![], Answer(200, vec![], sse_one("x"))).await;
+            let deps = crate::supervisor::SharedDeps {
+                ssh_backend: empty_backend(),
+                ssh_gate: approve_gate(),
+                ssh_sign_policy: Arc::new(SignPolicy::default()),
+                aws: None,
+                docker: None,
+                audit: Arc::new(CollectingAudit::default()),
+                minter: None,
+                log: silent_log(),
+                machine: Some(identity("laptop")),
+                embedded_presence: None,
+                presence_lock: None,
+            };
+            let target = crate::discovery::ServerTarget {
+                name: "s".into(),
+                url: srv.url(),
+                token: "stored-tok".into(),
+                tls_fingerprint: String::new(),
+                ssh_host: String::new(),
+                ssh_port: 0,
+                auth_mode: String::new(),
+                user: String::new(),
+                identity_file: identity_file.into(),
+            };
+            assert_eq!(static_bearer(&target).is_empty(), want.is_none());
+            let (tx, rx) = shutdown_pair();
+            let g = spawn_server_group(rx, &target, &deps);
+            let seen = |path: &str| srv.seen().iter().any(|r| r.path.starts_with(path));
+            for _ in 0..250 {
+                if seen(subscribe) && seen(egress) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(seen(subscribe) && seen(egress), "{identity_file:?}");
+            for r in srv.seen() {
+                assert_eq!(
+                    r.header("authorization"),
+                    want,
+                    "{identity_file:?}: {}",
+                    r.path
+                );
+            }
+            let _ = tx.send(true);
+            let _ = g.done.await;
+        }
     }
 
     // ---- the reconnect after a long healthy stream (review item i) ----------------------

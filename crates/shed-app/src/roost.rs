@@ -99,6 +99,7 @@ use roost_ipc::ssh::{
 use tokio::sync::mpsc;
 
 use shed_core::config::MachineEntry;
+use shed_core::identityfile::IdentityFileError;
 use shed_core::roost::bootstrap::{
     reach_code, wire_agent_hooks, BootstrapFailure, CallError, HooksResult, InstallMachine,
     InstallRequest, Installed, Outcome, Probe, ProbeMachine, SourceHandle, Stage, Stdin, Step,
@@ -185,6 +186,11 @@ pub struct ReachError {
     /// situation.
     pub message: String,
     pub kind: ReachKind,
+    /// The typed cause when no ssh ran because the entry's identity file cannot
+    /// be used (plan 037 A8): [`Self::identity_refusal`], and the error's
+    /// [`source`](std::error::Error::source). Kept beside `kind` rather than as a
+    /// new [`ReachKind`], whose variants a client mirrors exhaustively.
+    identity: Option<IdentityFileError>,
 }
 
 impl ReachError {
@@ -192,12 +198,30 @@ impl ReachError {
         ReachError {
             message: message.into(),
             kind,
+            identity: None,
         }
     }
 
     /// The fallback: something failed, and it was not an `ssh` exec's verdict.
     pub fn other(message: impl Into<String>) -> ReachError {
         ReachError::new(ReachKind::Other, message)
+    }
+
+    /// No ssh ran: the entry's identity file cannot be used. The message is the
+    /// refusal's own (it names the entry, escaped), and the refusal is kept
+    /// typed, so a caller can tell it from an unreachable host without reading
+    /// the text.
+    pub fn identity(refusal: IdentityFileError) -> ReachError {
+        ReachError {
+            message: refusal.to_string(),
+            kind: ReachKind::Other,
+            identity: Some(refusal),
+        }
+    }
+
+    /// The identity-file refusal this error is, if it is one.
+    pub fn identity_refusal(&self) -> Option<&IdentityFileError> {
+        self.identity.as_ref()
     }
 
     /// roost's classified family, in shed's vocabulary, with roost's own copy.
@@ -235,13 +259,23 @@ impl std::fmt::Display for ReachError {
     }
 }
 
-impl std::error::Error for ReachError {}
+impl std::error::Error for ReachError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.identity
+            .as_ref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// A [`ForwardError`] is a reach failure with no family — the hub seam's shape,
-/// and every local step that never got as far as an `ssh` exec.
+/// and every local step that never got as far as an `ssh` exec. An
+/// identity-file refusal keeps its typed cause.
 impl From<ForwardError> for ReachError {
     fn from(error: ForwardError) -> ReachError {
-        ReachError::other(error.0)
+        ReachError {
+            identity: error.identity_refusal().cloned(),
+            ..ReachError::other(error.0)
+        }
     }
 }
 
@@ -878,9 +912,15 @@ pub struct SshBridge {
     /// Set by [`RoostReach::shutdown`], read under `held`: a bridge that has
     /// shut down never establishes again.
     closing: AtomicBool,
+    /// The entry this bridge reaches, for its identity file (a shed whose
+    /// server entry names one, plan 037 A8): checked by every `ensure` before
+    /// an endpoint is handed out ([`shed_core::machine::check_identity`]). The
+    /// connections a held tunnel makes later are roost's own and are not
+    /// checked again.
+    entry: MachineEntry,
     /// Holds the generated per-machine `ssh_config` when the entry pins a
-    /// `known_hosts` file. Never read — it is owned for its `Drop`, which is
-    /// what removes the directory when the bridge goes.
+    /// `known_hosts` file or names an identity file. Never read — it is owned
+    /// for its `Drop`, which is what removes the directory when the bridge goes.
     _config_dir: Option<ScratchDir>,
     config_path: Option<PathBuf>,
 }
@@ -950,6 +990,7 @@ impl SshBridge {
             stop: tokio::sync::Notify::new(),
             gate: spawn_gate,
             closing: AtomicBool::new(false),
+            entry: entry.clone(),
             _config_dir: config_dir,
             config_path,
         })
@@ -1011,6 +1052,13 @@ impl RoostReach for SshBridge {
         {
             return Err(self.shutting_down());
         }
+        // The entry's identity file, checked on every `ensure`, before any
+        // endpoint is handed out (plan 037 A8): one that cannot be used is a
+        // typed refusal ([`ReachError::identity_refusal`]) that names the entry,
+        // and nothing is opened. A connection the held tunnel makes later is
+        // roost's own spawn and is not checked again; this is the early, clear
+        // error, not a guard on every ssh.
+        shed_core::machine::check_identity(&self.entry).map_err(ReachError::identity)?;
         if !self.invalidated.load(Ordering::SeqCst) {
             if let Some(tunnel) = held.tunnel.as_ref() {
                 return Ok(RoostEndpoint::Unix(tunnel.bridge_socket().to_path_buf()));
@@ -1193,7 +1241,7 @@ fn target_host(entry: &MachineEntry) -> String {
 fn ssh_target(entry: &MachineEntry) -> Result<SshTarget, ForwardError> {
     let host = target_host(entry);
     if host.trim().is_empty() {
-        return Err(ForwardError(format!(
+        return Err(ForwardError::new(format!(
             "{}: has no host to reach",
             target_token(&entry.name)
         )));
@@ -1210,11 +1258,14 @@ fn ssh_target(entry: &MachineEntry) -> Result<SshTarget, ForwardError> {
     let raw = format!("ssh://{user}{}{port}", url_host(&host));
     match classify(&raw) {
         Ok(ResolvedTransport::Ssh(target)) => Ok(target),
-        Ok(other) => Err(ForwardError(format!(
+        Ok(other) => Err(ForwardError::new(format!(
             "{}: {raw} is not an ssh target ({other:?})",
             target_token(&entry.name)
         ))),
-        Err(e) => Err(ForwardError(format!("{}: {e}", target_token(&entry.name)))),
+        Err(e) => Err(ForwardError::new(format!(
+            "{}: {e}",
+            target_token(&entry.name)
+        ))),
     }
 }
 
@@ -1302,7 +1353,9 @@ fn pinned_config(
     host_id: &str,
     base: SshConfigPaths,
 ) -> Result<Pinned, ForwardError> {
-    let Some(known_hosts) = entry.known_hosts.as_deref().filter(|k| !k.is_empty()) else {
+    let known_hosts = entry.known_hosts.as_deref().filter(|k| !k.is_empty());
+    let identity_file = entry.identity_file.as_deref().filter(|k| !k.is_empty());
+    if known_hosts.is_none() && identity_file.is_none() {
         // No pin: the user's own config and strictness apply, exactly as for
         // any other `ssh` to this host.
         return Ok(Pinned {
@@ -1310,17 +1363,22 @@ fn pinned_config(
             path: None,
             paths: base,
         });
-    };
+    }
     let dir = ScratchDir::new(host_id).map_err(|e| {
-        ForwardError(format!(
+        ForwardError::new(format!(
             "{}: could not create the ssh config directory: {e}",
             target_token(&entry.name)
         ))
     })?;
     let path = dir.0.join("ssh_config");
-    let body = pinned_ssh_config(&target_host(entry), known_hosts, base.user.as_deref());
+    let body = pinned_ssh_config(
+        &target_host(entry),
+        known_hosts,
+        identity_file,
+        base.user.as_deref(),
+    );
     write_private(&path, body.as_bytes()).map_err(|e| {
-        ForwardError(format!(
+        ForwardError::new(format!(
             "{}: could not write {}: {e}",
             target_token(&entry.name),
             path.display()
@@ -1358,11 +1416,31 @@ fn target_token(name: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-fn pinned_ssh_config(host: &str, known_hosts: &str, user_config: Option<&Path>) -> String {
-    let mut out = format!(
-        "Host {host}\n  UserKnownHostsFile \"{}\"\n  StrictHostKeyChecking yes\n",
-        expand_tilde(known_hosts).display()
-    );
+/// The pinned stanza: the host-key pin when the entry names a `known_hosts`
+/// file, and the entry's own SSH key when it names an identity file (plan 037
+/// A8) — the four lines the Go CLI's ssh config writes for one,
+/// `IdentityFile "<path>"`, `IdentitiesOnly yes`, `ControlMaster no`,
+/// `ControlPath none`, so every ssh read through this file offers that key
+/// first and no key that is only in the agent. A transport that keeps a
+/// private master (`-S <path> -o ControlMaster=auto` on its command line,
+/// which wins over any config file) keeps it. With no identity file the stanza
+/// is byte for byte what it was.
+fn pinned_ssh_config(
+    host: &str,
+    known_hosts: Option<&str>,
+    identity_file: Option<&str>,
+    user_config: Option<&Path>,
+) -> String {
+    let mut out = format!("Host {host}\n");
+    if let Some(known_hosts) = known_hosts {
+        out.push_str(&format!(
+            "  UserKnownHostsFile \"{}\"\n  StrictHostKeyChecking yes\n",
+            expand_tilde(known_hosts).display()
+        ));
+    }
+    if let Some(path) = identity_file {
+        out.push_str(&shed_core::identityfile::identity_config_lines(path, "  "));
+    }
     // Only an existing file: an `Include` of a path that is not there is at best
     // silently ignored and at worst an error, and neither is worth risking on
     // every connection to a host whose user simply has no `~/.ssh/config`.
@@ -1423,8 +1501,23 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// * **`known_hosts` is always pinned.** shed mints these host keys itself, so
 ///   unlike a `machines:` entry there is no user `ssh_config` to defer to and no
 ///   case where deferring would be right.
-pub fn shed_reach_entry(server: &shed_core::config::ShedServerEntry, shed: &str) -> MachineEntry {
-    MachineEntry {
+///
+/// And one is carried when the server entry has it: **`identity_file`** (plan 037
+/// A8), the SSH key the entry uses, checked here first (the value rule, and the
+/// file is a regular file now). One that cannot be used is the `Err`, naming the
+/// server entry — no reach entry, so no ssh is spawned for it. Every transport
+/// that takes the entry checks the file again each time it builds a command
+/// line or opens (ensures) a tunnel or runner
+/// ([`shed_core::machine::check_identity`]), since the key may be removed after
+/// the shed was registered; a connection an already-open tunnel makes later is
+/// not checked again.
+pub fn shed_reach_entry(
+    server: &shed_core::config::ShedServerEntry,
+    shed: &str,
+) -> Result<MachineEntry, String> {
+    shed_core::identityfile::check_entry_file(&server.name, &server.identity_file)
+        .map_err(|e| e.to_string())?;
+    Ok(MachineEntry {
         name: format!("roost:{}/{}", server.name, shed),
         // The parser defaults `host` to the entry name, but a hand-written
         // config need not have gone through it — and the fallback cannot be
@@ -1438,7 +1531,8 @@ pub fn shed_reach_entry(server: &shed_core::config::ShedServerEntry, shed: &str)
         user: Some(shed.to_string()),
         ssh_port: server.ssh_port,
         known_hosts: Some(crate::backend::known_hosts_path()),
-    }
+        identity_file: (!server.identity_file.is_empty()).then(|| server.identity_file.clone()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2494,6 +2588,12 @@ pub struct SshExec {
     /// Whether that shutdown CONFIRMED the master ended — what a repeat call
     /// answers (C3 round 4). Meaningful once `exited` is set.
     confirmed: AtomicBool,
+    /// The entry this runner reaches, for its identity file (a shed whose
+    /// server entry names one, plan 037 A8): every exec's argv checks it
+    /// ([`shed_core::machine::check_identity`]) before the exec is spawned. The
+    /// local control commands that only check or close its shared connection
+    /// (`-O check`, `-O exit`) are not checked: they authenticate nothing.
+    entry: MachineEntry,
     /// Test seam: the `ps` the pid fallback runs (a slow one, for the
     /// uncertain path). `ps` on the PATH otherwise.
     #[cfg(test)]
@@ -2568,6 +2668,7 @@ impl SshExec {
             gate: options.spawn_gate.clone(),
             exited: AtomicBool::new(false),
             confirmed: AtomicBool::new(false),
+            entry: entry.clone(),
             #[cfg(test)]
             ps_bin: None,
         })
@@ -2591,7 +2692,11 @@ impl SshExec {
     /// back into the output, translate LF to CRLF, and corrupt both. `-T` on the
     /// command line also beats a `RequestTTY force` in the user's own config,
     /// which `-o RequestTTY=no` alone would not.
-    fn argv(&self, command: &str) -> Vec<String> {
+    ///
+    /// The entry's identity file is checked here, for every exec (plan 037 A8):
+    /// one that cannot be used now is the `Err`, so nothing is spawned for it.
+    fn argv(&self, command: &str) -> Result<Vec<String>, IdentityFileError> {
+        shed_core::machine::check_identity(&self.entry)?;
         let mut argv = vec![
             "-F".to_string(),
             self.config_path.display().to_string(),
@@ -2618,7 +2723,7 @@ impl SshExec {
         argv.push(self.dest.clone());
         argv.push("--".to_string());
         argv.push(command.to_string());
-        argv
+        Ok(argv)
     }
 
     /// The ssh binary this runner execs.
@@ -2814,8 +2919,13 @@ impl SshExec {
             ),
             None => None,
         };
+        // An identity file that cannot be used is the refusal itself, carried
+        // typed inside the `io::Error` (`shed_core::identityfile::refusal_in`
+        // finds it) and shown as its own text, which already names the entry,
+        // escaped: no raw label in front of it.
+        let argv = self.argv(command).map_err(std::io::Error::other)?;
         let child = tokio::process::Command::new(&self.ssh_bin)
-            .args(self.argv(command))
+            .args(argv)
             // **`LC_ALL=C`.** Failures on this path are classified by English
             // substring (roost's `classify_ssh_failure`), so a non-English
             // locale silently demotes every classified family to the generic
@@ -4054,6 +4164,7 @@ mod tests {
             user: None,
             ssh_port: 22,
             known_hosts: None,
+            identity_file: None,
         }
     }
 
@@ -5387,7 +5498,12 @@ mod tests {
         let user = dir.path().join("user_config");
         std::fs::write(&user, "Host mini3\n  HostName 10.0.0.4\n").expect("write");
 
-        let body = pinned_ssh_config("mini3", "/home/me/.shed/known_hosts", Some(&user));
+        let body = pinned_ssh_config(
+            "mini3",
+            Some("/home/me/.shed/known_hosts"),
+            None,
+            Some(&user),
+        );
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines[0], "Host mini3");
         assert_eq!(
@@ -5400,7 +5516,7 @@ mod tests {
         // A user config that is not there is not included at all.
         let absent = dir.path().join("nope");
         assert_eq!(
-            pinned_ssh_config("mini3", "/k", Some(&absent))
+            pinned_ssh_config("mini3", Some("/k"), None, Some(&absent))
                 .lines()
                 .count(),
             3
@@ -5410,7 +5526,7 @@ mod tests {
     #[test]
     fn a_tilde_in_known_hosts_expands_against_home() {
         let home = std::env::var("HOME").expect("a HOME on this host");
-        let body = pinned_ssh_config("mini3", "~/.ssh/known_hosts_mini3", None);
+        let body = pinned_ssh_config("mini3", Some("~/.ssh/known_hosts_mini3"), None, None);
         assert!(
             body.contains(&format!(
                 "UserKnownHostsFile \"{home}/.ssh/known_hosts_mini3\""
@@ -5418,9 +5534,8 @@ mod tests {
             "{body}"
         );
         // An absolute path is left exactly as written.
-        assert!(
-            pinned_ssh_config("mini3", "/etc/kh", None).contains("UserKnownHostsFile \"/etc/kh\"")
-        );
+        assert!(pinned_ssh_config("mini3", Some("/etc/kh"), None, None)
+            .contains("UserKnownHostsFile \"/etc/kh\""));
     }
 
     /// **A `known_hosts` path with a space in it must survive as one path.**
@@ -5433,7 +5548,7 @@ mod tests {
     #[test]
     fn a_known_hosts_path_with_a_space_is_quoted() {
         let spaced = "/Users/me/Library/Application Support/shed/known_hosts";
-        let body = pinned_ssh_config("mini3", spaced, None);
+        let body = pinned_ssh_config("mini3", Some(spaced), None, None);
         assert!(
             body.contains(&format!("  UserKnownHostsFile \"{spaced}\"\n")),
             "the path has to arrive as one quoted argument: {body}"
@@ -5453,7 +5568,7 @@ mod tests {
         // A `~` path with a space expands AND stays quoted — the expansion must
         // not be what breaks the quoting.
         let home = std::env::var("HOME").expect("a HOME on this host");
-        let expanded = pinned_ssh_config("mini3", "~/known hosts", None);
+        let expanded = pinned_ssh_config("mini3", Some("~/known hosts"), None, None);
         assert!(
             expanded.contains(&format!("UserKnownHostsFile \"{home}/known hosts\"")),
             "{expanded}"
@@ -6470,7 +6585,7 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
         pinned.known_hosts = Some("/k/known_hosts".to_string());
         let exec = SshExec::new(&pinned, &exec_options(dir.path().join("ssh"))).expect("exec");
 
-        let argv = exec.argv("/bin/sh -s");
+        let argv = exec.argv("/bin/sh -s").unwrap();
         let joined = argv.join(" ");
         assert!(joined.contains("ControlMaster=auto"), "{joined}");
         assert!(joined.contains("ControlPersist=60s"), "{joined}");
@@ -6518,11 +6633,8 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
         let dir = tempfile::tempdir().expect("tempdir");
         let exec =
             SshExec::new(&entry("mini3"), &exec_options(dir.path().join("ssh"))).expect("exec");
-        assert!(
-            !exec.argv("true").contains(&"-p".to_string()),
-            "{:?}",
-            exec.argv("true")
-        );
+        let argv = exec.argv("true").unwrap();
+        assert!(!argv.contains(&"-p".to_string()), "{argv:?}");
     }
 
     /// **A script on stdin, through a real subprocess.** `/bin/sh -s` is the
@@ -6847,7 +6959,8 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
             ssh_port: 2222,
             ..Default::default()
         };
-        let reach = shed_reach_entry(&server, "p019-a");
+        let reach = shed_reach_entry(&server, "p019-a").unwrap();
+        assert_eq!(reach.identity_file, None, "no identity file, none carried");
         assert_eq!(reach.name, "roost:popos/p019-a");
         assert_eq!(reach.host, "10.0.0.4");
         assert_eq!(reach.user.as_deref(), Some("p019-a"));
@@ -6873,7 +6986,234 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
             ssh_port: 22,
             ..Default::default()
         };
-        assert_eq!(shed_reach_entry(&bare, "p019-a").host, "popos");
+        assert_eq!(shed_reach_entry(&bare, "p019-a").unwrap().host, "popos");
+    }
+
+    /// A key file in a temp dir, as an identity file (its contents are never
+    /// read: only that it is a regular file).
+    fn identity_file_in(dir: &Path) -> String {
+        let path = dir.join("id work");
+        std::fs::write(&path, "a key file\n").unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    /// A server entry's `identity_file` (plan 037 A8): checked when the reach
+    /// entry is built — one that cannot be used is no entry at all, so no ssh,
+    /// and the refusal names the server entry — and carried when it can.
+    #[test]
+    fn a_shed_reach_entry_carries_the_entrys_identity_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = identity_file_in(dir.path());
+        let server = shed_core::config::ShedServerEntry {
+            name: "popos".to_string(),
+            host: "10.0.0.4".to_string(),
+            ssh_port: 2222,
+            identity_file: key.clone(),
+            ..Default::default()
+        };
+        let reach = shed_reach_entry(&server, "p019-a").unwrap();
+        assert_eq!(reach.identity_file.as_deref(), Some(key.as_str()));
+        // Its argv carries the key exactly where the Go CLI puts it.
+        let argv = shed_core::machine::ssh_argv(&reach, &["true".into()]).unwrap();
+        assert!(argv
+            .windows(8)
+            .any(|w| w == shed_core::identityfile::identity_args(&key).as_slice()));
+
+        for bad in [
+            "relative/key".to_string(),
+            "/a#b".to_string(),
+            dir.path().join("gone").to_str().unwrap().to_string(),
+            shed_core::identityfile::IDENTITY_FILE_UNREADABLE.to_string(),
+            shed_core::identityfile::IDENTITY_FILE_ENTRY_UNREADABLE.to_string(),
+        ] {
+            let server = shed_core::config::ShedServerEntry {
+                identity_file: bad.clone(),
+                ..server.clone()
+            };
+            let err = shed_reach_entry(&server, "p019-a").unwrap_err();
+            let want = if bad == shed_core::identityfile::IDENTITY_FILE_ENTRY_UNREADABLE {
+                "entry \"popos\" cannot be used: "
+            } else {
+                "entry \"popos\": identity_file"
+            };
+            assert!(err.starts_with(want), "{bad:?}: {err}");
+        }
+    }
+
+    /// The pinned stanza with the entry's key: the four lines the Go CLI writes
+    /// for an identity file, under the same Host and before the `Include`; with
+    /// none, byte for byte what it was; with a key and no `known_hosts`, a
+    /// stanza all the same.
+    #[test]
+    fn the_pinned_config_carries_the_entrys_identity_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user_config");
+        std::fs::write(&user, "Host *\n").unwrap();
+        let with = pinned_ssh_config(
+            "shed.example.test",
+            Some("/home/pat/.shed/known_hosts"),
+            Some("/home/pat/.ssh/id work"),
+            Some(&user),
+        );
+        assert_eq!(
+            with,
+            format!(
+                "Host shed.example.test\n  UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n  \
+                 StrictHostKeyChecking yes\n  IdentityFile \"/home/pat/.ssh/id work\"\n  \
+                 IdentitiesOnly yes\n  ControlMaster no\n  ControlPath none\nInclude \"{}\"\n",
+                user.display()
+            )
+        );
+        let without = pinned_ssh_config(
+            "shed.example.test",
+            Some("/home/pat/.shed/known_hosts"),
+            None,
+            None,
+        );
+        assert_eq!(
+            without,
+            "Host shed.example.test\n  UserKnownHostsFile \"/home/pat/.shed/known_hosts\"\n  \
+             StrictHostKeyChecking yes\n"
+        );
+        assert_eq!(
+            pinned_ssh_config("h", None, Some("/k"), None),
+            "Host h\n  IdentityFile \"/k\"\n  IdentitiesOnly yes\n  ControlMaster no\n  \
+             ControlPath none\n"
+        );
+        // An entry with a key and no `known_hosts` still gets the stanza.
+        let entry = MachineEntry {
+            identity_file: Some("/k".to_string()),
+            ..entry("mini3")
+        };
+        let pinned = pinned_config(
+            &entry,
+            "mini3",
+            SshConfigPaths {
+                user: None,
+                system: None,
+            },
+        )
+        .unwrap();
+        assert!(pinned.path.is_some());
+    }
+
+    /// An exec runner for an entry with an identity file: its config pins the
+    /// key, and every exec checks the file before it spawns — a key removed
+    /// after the runner was built is refused, by name, and nothing is spawned.
+    /// The refusal is kept typed inside the `io::Error` (a missing ssh binary is
+    /// not mistaken for it), and its text is the refusal's own: the entry's name
+    /// escaped, with no raw label (a newline, a terminal sequence) in front.
+    #[test]
+    fn an_exec_whose_key_is_gone_spawns_nothing() {
+        const NAME: &str = "roost:pop\nos\u{1b}[31m/p019-a";
+        let dir = tempfile::tempdir().unwrap();
+        let key = identity_file_in(dir.path());
+        let entry = MachineEntry {
+            name: NAME.to_string(),
+            host: "10.0.0.4".to_string(),
+            user: Some("p019-a".to_string()),
+            ssh_port: 2222,
+            known_hosts: Some("/home/pat/.shed/known_hosts".to_string()),
+            identity_file: Some(key.clone()),
+        };
+        // No ssh exists at this path: nothing in this test may spawn one.
+        let exec = SshExec::new(&entry, &exec_options(dir.path().join("no-ssh"))).expect("exec");
+        let config = std::fs::read_to_string(&exec.config_path).unwrap();
+        let pinned = config
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Include \""))
+            .and_then(|p| p.strip_suffix('"'))
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .expect("the pinned stanza is included");
+        assert!(
+            pinned.contains(&format!("  IdentityFile \"{key}\"\n")),
+            "{pinned}"
+        );
+        assert!(exec.argv("true").is_ok());
+        // With the key there, the spawn fails for the missing ssh: no refusal.
+        let no_ssh = exec.spawn_duplex("true").unwrap_err();
+        assert_eq!(
+            shed_core::identityfile::refusal_in(&no_ssh),
+            None,
+            "{no_ssh}"
+        );
+
+        std::fs::remove_file(&key).unwrap();
+        let want = format!(
+            "entry \"roost:pop\\nos\\u{{1b}}[31m/p019-a\": identity_file {key:?} cannot be used: \
+             the file does not exist"
+        );
+        assert_eq!(exec.argv("true").unwrap_err().to_string(), want);
+        let refused = exec.spawn_duplex("true").unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            want,
+            "refused for the key, not for the missing ssh, with nothing in front"
+        );
+        let refusal = shed_core::identityfile::refusal_in(&refused).expect("the typed cause");
+        assert_eq!(
+            (refusal.entry.as_str(), refusal.path.as_str()),
+            (NAME, key.as_str())
+        );
+    }
+
+    /// A bridge for an entry with an identity file checks it on every `ensure`
+    /// before an endpoint is handed out: once the key is removed, neither the
+    /// held tunnel nor a new one is handed out, and nothing is opened. The
+    /// refusal is typed ([`ReachError::identity_refusal`], and its source), and
+    /// its text is the refusal's own, the entry's name escaped.
+    #[tokio::test]
+    async fn a_bridge_whose_key_is_gone_hands_out_nothing() {
+        const NAME: &str = "mini\n9\u{1b}[31m";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = identity_file_in(dir.path());
+        let opener = ScriptedOpener::new(dir.path().join("bridge.sock"), [None]);
+        let entry = MachineEntry {
+            name: NAME.to_string(),
+            identity_file: Some(key.clone()),
+            known_hosts: Some("/home/pat/.shed/known_hosts".into()),
+            ..entry("mini9")
+        };
+        let bridge = SshBridge::new(
+            &entry,
+            SshBridgeOptions {
+                opener: opener.clone(),
+                config_paths: Some(SshConfigPaths {
+                    user: None,
+                    system: None,
+                }),
+                ..SshBridgeOptions::default()
+            },
+        )
+        .expect("bridge");
+        let pinned = std::fs::read_to_string(bridge.ssh_config_path().unwrap()).unwrap();
+        assert!(
+            pinned.contains(&format!("  IdentityFile \"{key}\"\n")),
+            "{pinned}"
+        );
+        bridge.ensure().await.expect("the first tunnel");
+        bridge.ensure().await.expect("the held tunnel");
+
+        std::fs::remove_file(&key).unwrap();
+        let err = bridge.ensure().await.unwrap_err();
+        assert_eq!(
+            err.message,
+            format!(
+                "entry \"mini\\n9\\u{{1b}}[31m\": identity_file {key:?} cannot be used: the \
+                 file does not exist"
+            )
+        );
+        assert_eq!(err.kind, ReachKind::Other);
+        let refusal = err.identity_refusal().expect("the typed cause");
+        assert_eq!(
+            (refusal.entry.as_str(), refusal.path.as_str()),
+            (NAME, key.as_str())
+        );
+        assert_eq!(shed_core::identityfile::refusal_in(&err), Some(refusal));
+        bridge.invalidate().await;
+        assert!(bridge.ensure().await.is_err(), "no new tunnel either");
+        // The scripted opener holds no second tunnel: had one been opened, it
+        // would have panicked.
     }
 
     /// The `roost-session` stand-in the bootstrap rig installs and starts: one
@@ -7009,6 +7349,7 @@ esac
                 user: Some("p019-a".to_string()),
                 ssh_port: 2222,
                 known_hosts: None,
+                identity_file: None,
             };
             let exec = SshExec::new(&entry, &exec_options(ssh)).expect("exec");
             let reach = Arc::new(MarkerReach {

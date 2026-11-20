@@ -3,9 +3,10 @@
 A shed server can take its users from an **account service**: a service that
 holds people and their SSH login keys, and hands each server enrolled with it
 the list of users that server admits. People are added, removed and made
-admins on the service, and every enrolled server follows within its refresh
+admins on the service, and each enrolled server follows within its refresh
 interval, or at once with `shed users refresh`, with no config change or
-restart.
+restart. Who is listed, and whether as an admin, is what the service sends
+that server: it may differ from one enrolled server to another.
 
 How the two sides work together:
 
@@ -13,7 +14,8 @@ How the two sides work together:
   issues. It makes an Ed25519 key pair for the service and keeps the private
   key on the host.
 - It **signs in** with OAuth 2.0 client credentials and a JWT client assertion
-  signed by that key, and **pulls the list**: users, each a name, an admin
+  signed by that key, asking the token endpoint for the scope `directory:read`
+  and nothing else, and **pulls the list**: users, each a name, an admin
   flag and SSH public keys.
 - It **keeps a copy** of each good pull, and honours it for a **trust time**
   while it cannot reach the service.
@@ -45,7 +47,11 @@ server enrolled with it, since an admin in its list is an admin there.
 - You have an enrolment code for this server from the service's operator.
 - On a server that already has sheds, read [Switching a server to the
   directory](#switching-a-server-to-the-directory) first: the switch is a
-  fresh start.
+  fresh start, and [Keeping your sheds](#keeping-your-sheds) says how to keep
+  yours.
+- On a server installed with Homebrew, use the **Homebrew** tab of each block
+  below: every `shed-server` command runs as you, never with `sudo`, and names
+  the config with `--config`.
 
 ## Configure the server
 
@@ -77,9 +83,22 @@ key](#keeping-the-local-admin-on-a-backup-key).
 
 Check the config with the binary you will run:
 
-```bash
-sudo shed-server --config /etc/shed/server.yaml config-validate
-```
+=== "Linux package"
+
+    ```bash
+    sudo shed-server --config /etc/shed/server.yaml config-validate
+    ```
+
+=== "Homebrew"
+
+    ```bash
+    "$(brew --prefix)/opt/shed/bin/shed-server" --config "$(brew --prefix)/etc/shed/server.yaml" config-validate
+    ```
+
+    The Homebrew service runs this binary with this config. Always pass
+    `--config`: without it the server looks only for `./server.yaml`,
+    `~/.config/shed/server.yaml` and `/etc/shed/server.yaml`, never in the
+    Homebrew prefix.
 
 It ends with the directory's summary:
 
@@ -94,25 +113,61 @@ Run `shed-server directory enroll` on the shed host, **as the user the server
 runs as** (root for the Linux package, your own user for the Homebrew
 service), with the same `--config`. It reads the code from standard input,
 never from the command line: at a terminal it prompts without echoing it.
+Replace `build-1` with the name the service should show for this server.
 
-```bash
-sudo shed-server --config /etc/shed/server.yaml directory enroll --name build-1
-```
+=== "Linux package"
 
-```text
-State directory: /etc/shed
-Enrolment code (not echoed):
-Enrolled with the account service at https://accounts.example.test as srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a (organization example, name "build-1").
-Wrote /etc/shed/directory/enrolment.json (mode 0600): this server's key for the account service, which never leaves this host.
-```
+    ```bash
+    sudo shed-server --config /etc/shed/server.yaml directory enroll --name build-1
+    ```
+
+    ```text
+    State directory: /etc/shed
+    Enrolment code (not echoed):
+    Enrolled with the account service at https://accounts.example.test as srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a (organization example, name "build-1").
+    Wrote /etc/shed/directory/enrolment.json (mode 0600): this server's key for the account service, which never leaves this host.
+    If the server is already running with this config, it reads the enrolment at its next attempt, at most 15 minutes from now; to use it at once, restart the server or run 'shed users refresh' as a local admin.
+    ```
+
+=== "Homebrew"
+
+    ```bash
+    "$(brew --prefix)/opt/shed/bin/shed-server" --config "$(brew --prefix)/etc/shed/server.yaml" directory enroll --name build-1
+    ```
+
+    ```text
+    State directory: /Users/pat/.shed
+    Enrolment code (not echoed):
+    Enrolled with the account service at https://accounts.example.test as srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a (organization example, name "build-1").
+    Wrote /Users/pat/.shed/directory/enrolment.json (mode 0600): this server's key for the account service, which never leaves this host.
+    If the server is already running with this config, it reads the enrolment at its next attempt, at most 15 minutes from now; to use it at once, restart the server or run 'shed users refresh' as a local admin.
+    ```
+
+    Run it as yourself, **never with `sudo`**. The Homebrew service runs as
+    your user, so its state directory is `~/.shed` (the enrolment goes to
+    `~/.shed/directory/`) unless the config sets `state_dir`. Run with `sudo`
+    and no `state_dir`, the command takes `/etc/shed` as the state directory,
+    the default for root, and enrols there, where the service never looks:
+    its log then says `Users: not enrolled` ([Troubleshooting](#troubleshooting)).
+    (With `state_dir` set to a directory you own, `sudo` is refused: the
+    directory is not root's.)
 
 Without a terminal it reads one line: pipe the code from the command that
 issued it, or read it from a file only you can read, then remove the file:
 
-```bash
-sudo shed-server --config /etc/shed/server.yaml directory enroll --name build-1 < ~/enrol-code   # mode 0600
-rm ~/enrol-code
-```
+=== "Linux package"
+
+    ```bash
+    sudo shed-server --config /etc/shed/server.yaml directory enroll --name build-1 < ~/enrol-code   # mode 0600
+    rm ~/enrol-code
+    ```
+
+=== "Homebrew"
+
+    ```bash
+    "$(brew --prefix)/opt/shed/bin/shed-server" --config "$(brew --prefix)/etc/shed/server.yaml" directory enroll --name build-1 < ~/enrol-code   # mode 0600
+    rm ~/enrol-code
+    ```
 
 Never put the code in a command's arguments or in `echo` or `printf`: it would
 reach the shell's history and the process list.
@@ -148,13 +203,39 @@ What the command checks and refuses:
   `<url>/oauth2/token` as its token endpoint, and an organization that matches
   `auth.directory.organization` when that is set.
 
-`enrolment.json` is written once, under the lock, and never replaced. A
-running server reads it before each pull, so a server already running picks
-up its first enrolment without a restart.
+`enrolment.json` is written once, under the lock, and never replaced.
+
+**A server already running** reads the enrolment at its next attempt, not at
+once: it found none at its last attempt, and tries again 15 minutes after
+that. Until it reads it, only the local admins can log in, and a new person's
+first login starts no pull. The command's last line says so. To use the
+enrolment at once, restart the server (below), or run `shed users refresh` as
+a local admin: a pull reads the enrolment first.
 
 ## Start the server and check it
 
-Restart the server. Its start-up log names the source and its state:
+Restart the server, and read its start-up log:
+
+=== "Linux package"
+
+    ```bash
+    sudo systemctl restart shed-server
+    sudo journalctl -u shed-server | grep -E 'Users:|Local admins:'
+    ```
+
+    The journal keeps every start's lines: this start's are the last.
+
+=== "Homebrew"
+
+    ```bash
+    brew services restart shed
+    grep -E 'Users:|Local admins:' "$(brew --prefix)/var/log/shed-server.log"
+    ```
+
+    The service writes its log to `$(brew --prefix)/var/log/shed-server.log`
+    and appends to it at every start: this start's lines are the last.
+
+The start-up log names the source and its state:
 
 ```text
 Users: from the directory at https://accounts.example.test (organization example, client id srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a)
@@ -241,15 +322,28 @@ shed server add build-1.example.test --name build-1
 ```
 
 Their key is not in the list the server holds yet, so their first SSH login
-makes the server pull the list. That login waits at most 8 seconds. If the
-account service is slower than that, the login is refused once; the server's
-pull goes on and its result applies, so trying again succeeds. An admin
-running `shed users refresh` before the person's first login avoids the wait
-altogether. The server pulls for an unknown key at most once a minute while
-pulls succeed, once per 15 minutes while they fail, and never inside a
-pending `Retry-After`; a second unknown key in that window is refused at
-once. If that happens to a genuine newcomer, they try again a minute later,
-or an admin runs `shed users refresh` first.
+(`shed server add` logs in as `_bootstrap`) makes the server pull the list.
+That login waits at most 8 seconds: it is let in as soon as the key is known
+(its own pull, or any other, brought it), and refused when the 8 seconds end
+if the key is still unknown, even when the pull ended sooner. If the account
+service is slower than that, their
+logins are refused until a pull has brought the key; the server's pull goes on
+and its result applies, so a later attempt succeeds. An admin running `shed
+users refresh` before the person's first login avoids the wait altogether.
+The server pulls for an unknown first login at most once a minute while pulls
+succeed, once per 15 minutes while they fail, and never inside a pending
+`Retry-After`; a second unknown key in that window is refused at once, not
+after 8 seconds. If that
+happens to a genuine newcomer, they try again a minute later, or an admin runs
+`shed users refresh` first.
+
+A key a person added on the service, used first to log in to an existing shed
+(`ssh web@build-1.example.test`, for a shed named `web`), is refused at once; the server then pulls
+the list in the background (at most once every 5 minutes) and a retry a few
+seconds later gets in. An unknown key under any other name, one no shed on
+the server has (such as `root` or `ubuntu`, unless a shed has that name),
+starts no pull. [Security › A new
+person](../reference/security.md#a-new-person) has the whole rule.
 
 ### Admins, removals and keys
 
@@ -308,18 +402,22 @@ and logs `directory: SERVER DISABLED: ...`.
 This is for a person who is both a user in the service's list (`pat`, say)
 and the server's local admin (`admin`). The everyday key stays in the list; a
 second key, the **backup key**, is the local admin's only key. You hold two
-CLI entries for the server, each reaching it with exactly one key: an entry's
-client certificate names the key it enrolled with, and the CLI enrols again by
-itself (near the certificate's expiry, and whenever the server rejects it)
-with the first key `ssh` offers that the server accepts. An entry that can
-offer both keys becomes the local admin when the list is not in force ([see
-below](#if-the-everyday-entry-can-reach-the-backup-key)).
+CLI entries for the server under its one host name, each with its own key
+(`--identity-file`, see [CLI › One SSH key per
+entry](../reference/cli.md#one-ssh-key-per-entry)). The CLI enrols an entry
+again by itself (near its certificate's expiry, and whenever the server
+rejects it), and an entry is held to the user it was enrolled as: a
+re-enrolment that would make it another user fails, and nothing is saved
+([see below](#if-the-everyday-entry-offers-the-backup-key)).
+
+In the commands, replace `shed.example.test` with your server's host name, and
+the key paths with yours.
 
 1. **Make the backup key** with a passphrase, and keep it out of your agent.
    The CLI runs `ssh` with `BatchMode=yes`, which cannot ask for a passphrase:
    load the key for a few minutes when you need it. Without it in the agent,
-   adding the admin entry fails with `Error: your SSH key is not in this
-   server's allowlist ...`.
+   adding the admin entry fails with `Error: the server refused the entry's
+   SSH key ... for _bootstrap@shed.example.test: ...`.
 
     ```bash
     ssh-keygen -t ed25519 -f ~/.ssh/shed-admin -C shed-admin
@@ -341,52 +439,54 @@ below](#if-the-everyday-entry-can-reach-the-backup-key)).
         url: https://accounts.example.test
     ```
 
-3. **In `~/.ssh/config`**, give each entry its own name for the server. An
-   entry's host is both its SSH host and its API address, so both names must
-   reach the server: its DNS name and a second one for the same address, or the
-   name and its address. A `Host` alias with `HostName` does not work (the API
-   address would be the alias). The CLI checks the server's TLS certificate by
-   its pin, not by name, so the second name need not be in `tls_names`.
-   `IdentitiesOnly yes` on **both** stanzas keeps each to its one key; without
-   it `ssh` also offers every key in the agent.
-
-    ```text
-    Host shed.example.test
-        IdentityFile ~/.ssh/id_ed25519
-        IdentitiesOnly yes
-
-    Host admin.shed.example.test
-        IdentityFile ~/.ssh/shed-admin
-        IdentitiesOnly yes
-    ```
-
-4. **Add both entries**, the everyday one first so that it is the default:
+3. **Add both entries** for the same host, each with its key, the everyday one
+   first so that it is the default. Each prints the user it is held to
+   (`  User: pat`, then `  User: admin`):
 
     ```bash
-    shed server add shed.example.test --name shed
+    shed server add shed.example.test --name shed --identity-file ~/.ssh/id_ed25519
     ssh-add -t 10m ~/.ssh/shed-admin
-    shed server add admin.shed.example.test --name shed-admin
+    shed server add shed.example.test --name shed-admin --identity-file ~/.ssh/shed-admin
     ssh-add -d ~/.ssh/shed-admin
     ```
 
-5. **Check who each entry is**: `shed source ls` names the caller's user.
+    For an everyday entry you already have, set its key instead:
 
     ```bash
+    shed server update shed --identity-file ~/.ssh/id_ed25519
+    ```
+
+    If your everyday key is only in an agent (no private key file), give the
+    path of its public key: ssh then uses the agent's copy of that key. The
+    CLI reads each identity file's public key without a passphrase, so the
+    backup key must be in the OpenSSH format (as `ssh-keygen` writes it) or
+    have its `.pub` file beside it.
+
+4. **Check who each entry is**: `shed server list` shows it in the `USER`
+   column, and `shed source ls` names the caller's user.
+
+    ```bash
+    shed server list                       # USER: pat for shed, admin for shed-admin
     shed --json -s shed source ls          # "user": "pat"
     shed --json -s shed-admin source ls    # "user": "admin"
     ```
 
-Day to day, use the everyday entry. `shed console` and `shed exec` run `ssh`
-to the entry's host too, so its stanza gives them the everyday key.
+Day to day, use the everyday entry. `shed console`, `shed exec` and `shed
+attach` run `ssh` with the entry's key too (`-i` with `IdentitiesOnly=yes`), so
+they reach the server as `pat`. ssh still offers, after the entry's key, any
+`IdentityFile` your own `~/.ssh/config` names for that host: keep the backup
+key out of such a stanza.
 
 ### When the list is not in force
 
 Every command through the everyday entry fails and exits 1:
 
 ```text
-Error: failed to list sheds: re-authenticating after a TLS client-certificate rejection: sdk/bootstrap: ssh could not authenticate with any available identity (the daemon may have no SSH identity available — see IdentityAgent docs — or the key may not be on the server allowlist): ...
-_bootstrap@shed.example.test: Permission denied (publickey).
+Error: failed to list sheds: re-authenticating after a TLS client-certificate rejection: sdk/bootstrap: the server refused every key ssh offered (no key ssh can reach, for example an agent ssh cannot find — see IdentityAgent; not a user's key; a passphrase key not in the agent; or the server's user list not in force. A key listed moments ago can be refused once: try again): _bootstrap@shed.example.test: Permission denied (publickey).
 ```
+
+ssh's own words come last, shown escaped: a line break in them reads `\n`,
+and any other control or non-ASCII character `\u{…}`.
 
 Use the admin entry. It works with the backup key out of the agent while its
 certificate is valid (`auth.token_ttl`, 24 hours by default); when a command
@@ -394,7 +494,7 @@ through it fails with `Permission denied (publickey)`, load the key
 (`ssh-add -t 10m ~/.ssh/shed-admin`) and run it again.
 
 ```bash
-shed -s shed-admin users status    # State: expired (the list's trust time ended at <time>)
+shed -s shed-admin users status    # State: expired (the list's trust time ended at ...)
 shed -s shed-admin users refresh   # when the service is back: Directory pull: good: ...
 ```
 
@@ -402,36 +502,74 @@ The everyday entry then works again as `pat` at its next command, with the
 certificate it holds. Without the refresh, the list comes back at the next
 pull (`Next attempt` in `shed users status`).
 
-### If the everyday entry can reach the backup key
+### If the everyday entry offers the backup key
 
-Do not let `ssh` offer the backup key for the everyday host. When the list is
-not in force, the server refuses the everyday key, `ssh` offers the backup
-key, and the server accepts it: the command succeeds, prints nothing about it
-(not even with `-vv`), and **from then on the everyday entry is the local
-admin**. It stays so after the list is back, until it next enrols (in the last
-2 hours of its certificate's lifetime: up to about 22 hours later with the
-default `auth.token_ttl`).
+The CLI never moves an entry to another user by itself. If `ssh` offers the
+backup key for the everyday entry while the list is not in force, the server
+accepts it and issues a certificate for `admin`; the CLI refuses it, saves
+nothing, and the command fails (exit 1).
 
-| How `ssh` can reach the backup key for the everyday host | At add | List not in force | List back |
-|---|---|---|---|
-| A stanza names the everyday key, without `IdentitiesOnly yes`; both keys in the agent | `pat` | `admin`, silently | `admin` until it next enrols, then `pat` |
-| No stanza; both keys in the agent | The user of the agent's first key | `admin` | `admin` until it next enrols, then the user of the agent's first key |
-| No stanza; the everyday key in the agent, the backup key as the default identity file (`~/.ssh/id_ed25519`) | `pat` | `admin`, silently | `admin` until it next enrols, then `pat` |
-| Both stanzas with `IdentitiesOnly yes` (above); the backup key in the agent or not | `pat` | Refused (exit 1) | `pat` at once |
+With an `identity_file` on the entry, ssh can still offer the backup key when a
+stanza in your `~/.ssh/config` names it for that host. The certificate is then
+refused for its key:
 
-Without a stanza, the agent's order decides at every enrolment, even while the
-list is in force. To put a switched entry back (check it with step 5), take
-the backup key out of the agent and fix the stanza, then add the entry again:
+```text
+the server issued a certificate for SSH key "SHA256:...", but entry "shed" uses only its identity_file "/home/pat/.ssh/id_ed25519" (key SHA256:...); nothing was saved.
+ssh authenticated with a different key than the entry's identity file. ...
+```
+
+Without an `identity_file` (both keys in the agent, say), it is refused for its
+user:
+
+```text
+the server issued a certificate for user "admin", but entry "shed" is held to user "pat"; nothing was saved.
+ssh offered a key that belongs to "admin". To stay "pat", let this entry offer only the private key of user "pat" (shed server update shed --identity-file /path/to/key, with that key's path in place of /path/to/key) and retry.
+To make this entry "admin": shed server update shed --refetch --allow-user-change
+```
+
+Either way the entry stays `pat`'s and keeps the certificate it holds. Give it
+its key, remove the backup key from any `~/.ssh/config` stanza for the host,
+and use the admin entry until the list is back:
 
 ```bash
-ssh-add -d ~/.ssh/shed-admin
-shed server remove shed
-shed server add shed.example.test --name shed
+shed server update shed --identity-file ~/.ssh/id_ed25519
 ```
+
+Do not run `--allow-user-change` on the everyday entry for this: it would make
+the entry the local admin.
 
 Listing your everyday key under the local admin instead makes you the local
 admin on that server for good: a list entry with a local admin's key is
 skipped, so your list identity is not used there.
+
+### Without an identity file
+
+Two host names for the server, each with its own `~/.ssh/config` stanza, also
+work. An entry's host is both its SSH host and its API address, so both names
+must reach the server: its DNS name and a second one for the same address, or
+the name and its address. A `Host` alias with `HostName` does not work (the API
+address would be the alias). The CLI checks the server's TLS certificate by its
+pin, not by name, so the second name need not be in `tls_names`.
+`IdentitiesOnly yes` on **both** stanzas keeps each to its one key; without it
+`ssh` also offers every key in the agent, and a command through the everyday
+entry fails as above while the list is not in force.
+
+```text
+Host shed.example.test
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+
+Host admin.shed.example.test
+    IdentityFile ~/.ssh/shed-admin
+    IdentitiesOnly yes
+```
+
+```bash
+shed server add shed.example.test --name shed
+ssh-add -t 10m ~/.ssh/shed-admin
+shed server add admin.shed.example.test --name shed-admin
+ssh-add -d ~/.ssh/shed-admin
+```
 
 ## Switching a server to the directory
 
@@ -444,8 +582,8 @@ name:
   person.
 - Sheds of earlier users who are not in the list keep their user; an admin can
   see, stop and delete them.
-- Sheds with no user are admin-only until an admin runs `shed assign <shed>
-  <user>`, which accepts a list user.
+- Sheds with no user are admin-only until an admin assigns them, which accepts
+  a list user: `shed assign web pat` gives the shed `web` to `pat`.
 - The [one-time upgrade step](multi-user-server.md#sheds-with-no-user) reads
   the local admins only, never the list: on a server that never had a user
   list, a single local admin receives every shed with no user (and the
@@ -453,11 +591,198 @@ name:
   away.
 - Client certificates that name their user keep working where the list (or the
   local admins) has that name with the same key. A certificate issued by a
-  server older than v0.10.0 names no user and is refused; the client enrolls
-  again.
+  server older than v0.10.0 names no user: the CLI refuses such an entry
+  before it sends anything, and a refetch enrols it again (for an entry named
+  `shed`: `shed server update shed --refetch`).
 
 GitHub usernames are not supported on a directory server: move each person's
 keys to the service.
+
+### Keeping your sheds
+
+This is for a server one person has used, whose sheds should stay theirs once
+they come from the account service: you, listed there as `pat`. It takes two
+starts. The one-time upgrade step gives the sheds with no user only to a user
+in `auth.users`, and beside `auth.directory` those are the local admins, never
+the list. Switching straight to the directory with a local admin `admin` gives
+every shed to `admin`; naming the local admin `pat` instead makes the list's
+`pat` skipped, since a list entry with a local admin's name is.
+
+In the commands, replace `home` with the name of your CLI entry for the
+server, `pat` with your list name, and the key paths with yours.
+
+1. **Start once with only yourself in `auth.users`**, as an admin, with your
+   everyday key (the one the account service lists for you), and no
+   `auth.directory` yet:
+
+    ```yaml
+    auth:
+      mode: mtls
+      users:
+        pat:                                 # your list name; for this one start
+          admin: true
+          keys:
+            - key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... pat@laptop
+              label: laptop
+    ```
+
+    Restart the server, then read what **this start** logged about the step.
+    The log keeps earlier starts too, so each command shows only the lines
+    since the server's last start: the journal of the unit's current run, or
+    the Homebrew log after its last `Starting shed-server...` line:
+
+    === "Linux package"
+
+        ```bash
+        sudo systemctl restart shed-server
+        sudo journalctl _SYSTEMD_INVOCATION_ID="$(systemctl show --property=InvocationID --value shed-server)" | grep -E 'one-time upgrade step|Users: found'
+        ```
+
+    === "Homebrew"
+
+        ```bash
+        brew services restart shed
+        awk '/Starting shed-server[.][.][.]/ { found = "" } /one-time upgrade step|Users: found/ { found = found $0 "\n" } END { ORS = ""; print found }' "$(brew --prefix)/var/log/shed-server.log"
+        ```
+
+    ```text
+    Users: first start with a user list (no marker at /etc/shed/users-upgrade.json): running the one-time upgrade step
+    Users: the one-time upgrade step for the user list has begun for user pat (the only configured user); until it finishes it resumes only while pat is the only configured user
+    Users: found no shed without a user or a service client
+    Users: the one-time upgrade step for the user list is done and recorded; from now on a shed with no user is given one only by 'shed assign'
+    ```
+
+    (Under Homebrew the record is `~/.shed/users-upgrade.json`.) Step 1 is
+    done when the **last** line of this start that names the one-time upgrade
+    step is this one:
+
+    ```text
+    Users: the one-time upgrade step for the user list is done and recorded; from now on a shed with no user is given one only by 'shed assign'
+    ```
+
+    The pass can take up to two minutes: while the last such line is still
+    the `has begun` or `resuming` line, run the check again. A `did not
+    finish` line followed, in the same start, by `done and recorded` is a
+    step that resumed and finished. If the last line says the step `did not
+    finish`, restart the server again with the **same** config and check
+    again, until it ends with `done and recorded`; change nothing in
+    `auth.users` before then (see the warning below). If it says the step
+    `ran at` an earlier start instead, this start gave nothing away: read
+    [When step 1 can be skipped](#when-step-1-can-be-skipped).
+
+    The start's full log names each shed and snapshot given to `pat`, as
+    now `pat`'s, and the server's credential source, if it has one, becomes
+    `pat`'s.
+
+    Then, on your own machine, enrol your entry as `pat` (an entry enrolled
+    before v0.10.0 is refused until you do). It prints `  User: pat`:
+
+    ```bash
+    shed server update home --refetch
+    ```
+
+2. **Make sure the account service lists `pat`** with the same everyday key,
+   as an admin. The step gave you the sheds that carry host directories or
+   server mounts because you were an admin, and only an admin can enter or
+   start such a shed. How to list a person is in the account service's own
+   documentation.
+
+3. **Switch to the directory**: in `auth.users`, replace `pat` with a local
+   admin under another name (`admin`) that holds a backup key only, and add
+   `auth.directory` ([Configure the server](#configure-the-server), and
+   [Keeping the local admin on a backup
+   key](#keeping-the-local-admin-on-a-backup-key) for the key and its CLI
+   entry):
+
+    ```yaml
+    auth:
+      mode: mtls
+      users:
+        admin:                               # the local admin: the backup key only
+          admin: true
+          keys:
+            - key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... shed-admin
+              label: backup
+      directory:
+        url: https://accounts.example.test
+    ```
+
+4. **[Enrol](#enrol) and restart** ([Start the server and check
+   it](#start-the-server-and-check-it)). The server pulls the list at once.
+
+5. **Check, as `pat`**, through your everyday entry:
+
+    ```bash
+    shed -s home users status
+    shed -s home list
+    ```
+
+    `shed users status` lists `"pat"` as an admin from `directory` and `admin`
+    from `local`, and `shed list` shows your sheds. `shed server list` still
+    shows `pat` as the entry's `USER`.
+
+What carries over: the sheds and snapshots, which are `pat`'s by name;
+`pat`'s credential-source records (a directory server drops no user's records
+at start); the server's SSH host key and TLS certificate, so your entries'
+pins stay valid (the state directory is the same); and your entry with its
+certificate, which names `pat` and so keeps working once the list holds `pat`
+with the same key. Until the first good pull only the local admins can log
+in: a command through your entry in that moment enrols again and waits for
+the pull, or fails once; run it again.
+
+!!! warning "Finish step 1 before changing `auth.users`"
+    A step that has begun and not finished resumes only while the user it
+    began for is the only one in `auth.users`. A start with any other users,
+    such as step 3's `admin` in place of `pat`, abandons it: the step is
+    recorded as done, nothing more is given away, and the sheds and snapshots
+    it had not reached stay with no user for good (the log says `the
+    unfinished one-time upgrade step for user pat was abandoned`).
+
+#### When step 1 can be skipped
+
+Running with a user list is not enough: the step may be pending. Skip step 1
+only when both hold:
+
+- the server's **current** start, with its user list, logs the step as done:
+  the last line that names the one-time upgrade step, read with the commands
+  of step 1, is `... is done and recorded ...` (the step finished at this
+  start) or says it `ran at` an earlier start:
+
+    ```text
+    Users: the one-time upgrade step for the user list ran at 2026-11-02T09:14:00Z (marker /etc/shed/users-upgrade.json); sheds with no user are not given one automatically, use 'shed assign'
+    ```
+
+- the server has not been started without a user list since. A start with
+  no user list removes the step's record, and the next start with one takes
+  the step again: then do step 1.
+
+A server whose current start logs the step as begun and not finished (`began
+at ... and did not finish`, or a last line that says `did not finish`) must
+finish step 1 first: restart it with the same configuration until the last
+line is `done and recorded`, before anything in `auth.users` changes.
+
+#### What stays without a user
+
+A step that ran at an earlier start gave the sheds and snapshots with no user
+to the one user configured then, or, with several users, to nobody; an
+abandoned step gave nothing more. What it did not give away keeps no user, and
+the step does not run again (unless a start with no user list removes its
+record, as above). Each start counts them, in the `Users: found`
+lines the commands of step 1 show. As an admin, through your entry:
+
+- **A shed with no host directories or server mounts:** `shed assign web pat`
+  gives the shed `web` to `pat`.
+- **A shed that carries host directories or server mounts** cannot be
+  assigned. `shed assign` refuses it (`409 SHED_HOST_RESOURCES`): `... shed
+  web carries host directories, which assigning it would hand to user pat;
+  recreate it without them (no --local-dir or --add-dir, and --mounts none)
+  and assign the new shed instead`. Nobody can enter a shed with no user, so
+  shed cannot snapshot it or copy anything out of it: recreate it (a shed you
+  create as an admin is yours, host directories included) and delete the old
+  one.
+- **A snapshot** cannot be given to anyone: no command assigns one. An admin
+  can create a shed from it (`shed create web2 --from-snapshot old-snap`,
+  which makes `web2` the creator's) and can delete it.
 
 ## Enrolling again
 
@@ -596,9 +921,27 @@ there, or the old client id in `disabled`). Stop both with Ctrl-C and remove
 | `auth.directory is not configured: this server does not take its users from an account service` | `enroll` with a config without `auth.directory` | Pass the server's `--config` |
 | `state dir <dir> is owned by uid <n>, not by the user running this command (uid <m>): run it as the user the server runs as` | `enroll` run as another user | Run it as the server's user (`sudo` for the Linux package) |
 | Log: `Users: not enrolled (no enrolment: ...): run 'shed-server directory enroll'; only the local admins can log in` | Not enrolled yet | [Enrol](#enrol) |
+| Homebrew, after an enrolment run with `sudo`: the log says `Users: not enrolled (no enrolment: /Users/pat/.shed/directory does not exist): ...`, and `shed users status` shows `State: not-enrolled` | Run as root with no `state_dir`, `enroll` used `/etc/shed`, root's state directory; the service runs as you and reads `~/.shed` | Disable the client id the enrolment printed on the account service, remove `/etc/shed/directory` (`sudo rm -r /etc/shed/directory`), have a new code issued, and [enrol](#enrol) again as yourself, without `sudo` |
+| `shed users status` still shows `State: not-enrolled (no enrolment: ...)` after `directory enroll` | The server was already running: it reads a first enrolment at its next attempt (`Next attempt`), at most 15 minutes after its last | Wait for that attempt, restart the server, or run `shed users refresh` as a local admin |
 | Log: `Users: enrolment unusable (<file>: <check>); only the local admins can log in` | `enrolment.json` or its directory failed a check (owner, mode, symbolic link, size, content) | Put the file right (owned by the server's user, mode `0600`, in a `0700` directory), or [enrol again](#enrolling-again) |
 | Log: `directory: the account service refused this server's login: ...` | The service does not recognise this server's key or assertion | Check the host's clock, then the server on the service; enrol again if it was removed there |
+| Log: `directory: pull failed: token: refused (HTTP 400) "invalid_scope": ...` | The service refuses a token request that names the scope `directory:read`, which the contract allows and shed-server sends. Every refresh fails; the list held stays until its trust time ends | Update the service to accept `scope=directory:read` |
 | Log: `directory: SERVER DISABLED: ...` | The server is disabled on the service | A disabled server stays disabled: have a new code issued and [enrol again](#enrolling-again) |
 | Log: `directory: WARNING: the account service's clock is ... from this server's; ...` | The clocks differ by more than 30 s | Fix the host's clock (NTP) |
 | Log: `directory: kept copy not written: ...; a restart starts with only the local admins until a good pull` | The state directory cannot be written | Free space or fix permissions; the next good pull writes it again |
 | `shed users status`: `Error: <server>: this server has no status route (it is older than 'shed users status')` | The server is older than the CLI | Upgrade the server |
+| `the server issued a certificate for user "admin", but entry "shed" is held to user "pat"; nothing was saved.` | The entry's certificate was rejected (for example while the list is not in force) and `ssh` offered another user's key when the CLI enrolled again. Nothing was written | To stay `pat`, let the entry offer only `pat`'s key, then retry: `shed server update shed --identity-file ~/.ssh/id_ed25519` names it ([backup key](#if-the-everyday-entry-offers-the-backup-key)). To make the entry `admin`: `shed server update shed --refetch --allow-user-change` |
+| `the server issued a certificate for SSH key "SHA256:...", but entry "shed" uses only its identity_file "..." (key SHA256:...); nothing was saved.` | The entry has an `identity_file`, and ssh also offered a key your `~/.ssh/config` names for the host (a `Host` or `Match` stanza, or `Host *`), which the server accepted. Nothing was written | Keep no other `IdentityFile` for that host in `~/.ssh/config`, or make sure the server accepts the entry's own key, then retry |
+| `entry "shed": identity_file "/home/pat/.ssh/id_backup" cannot be used: ...` (`the file does not exist`, `it is not an absolute path`, `it contains #, ...`, `its public key cannot be learned without a passphrase ...`) | The entry's key file is missing or unreadable, its path breaks the rule (see [CLI › One SSH key per entry](../reference/cli.md#one-ssh-key-per-entry)), or its public key cannot be read without the passphrase. Nothing was sent and `ssh` was not run | Put the key back, or point the entry at its key where it is now (`shed server update shed --identity-file ~/.ssh/id_ed25519`), or clear it (`shed server update shed --identity-file ""`). For a key whose public half cannot be read, put its `.pub` file beside it |
+| `entry "shed" cannot be used: it holds a control token, which does not say which SSH key it was issued for, and the entry uses only its identity_file "..."; no request was sent. ...` | The entry was enrolled with a control token (a server older than v0.10.0 in token mode) before its `identity_file` was set | Upgrade the server, then `shed server update shed --refetch` |
+| `entry "shed" cannot be used: its certificate names no user (issued by a shed-server older than 0.10.0); no request was sent. ...` | The entry was enrolled against a shed-server older than 0.10.0 | `shed server update shed --refetch` (it prints `User: <name>`: check it is you) |
+| `entry "shed" cannot be used: its certificate is for user "pat" but the entry records no user (...); no request was sent. ...` (or `records user "admin" (...)`) | A CLI older than 0.10.0 saved `config.yaml` and dropped the entry's `user`; it was edited by hand; or an enrolment was interrupted (killed between writing the certificate and saving `config.yaml`) or overlapped another `shed` process | `shed server update shed --refetch`; use a 0.10.0 CLI on every machine that shares the config |
+| `the server issued a certificate that names no user: it runs a shed-server older than 0.10.0; nothing was saved. ...` | The server is older than 0.10.0 | Upgrade the server, then retry |
+| `entry "shed" changed while this command ran; nothing was saved. Run it again.` | Another `shed` process changed the entry's user during a `--refetch` | Run the command again |
+| `entry "shed" now records user "admin", but this command was using it as user "pat" (...); nothing was saved and this command's certificate is no longer used. Run the command again.` | Another `shed` process changed the entry's user (for example `--refetch --allow-user-change`) while this command re-enrolled | Run the command again; it uses the entry as it now is |
+| `entry "shed": a client certificate update did not complete and the previous certificate could not be put back (...); its certificate files and its recorded user may now disagree. ...` | Writing a new certificate, or saving `config.yaml` after it, failed, and putting the old certificate back failed too (a full or read-only disk) | Fix the disk, then `shed server update shed --refetch` |
+| `the server issued a certificate for user "pat", but entry "shed" could not be updated to record that user (...); the certificate was not used and nothing was kept. ...` | The entry recorded no user yet, and saving `config.yaml` (or writing the certificate files) failed, so the first user could not be recorded. Nothing is sent as a user the entry does not record | Make `config.yaml` and `~/.shed/creds/` writable, then run the command again |
+| A tunnel stops: `the server issued a certificate for user "pat", but entry "shed" records no user, and this long-running command (a tunnel) never records one; ...` | The server gained a user list while a tunnel daemon was running for an entry that records no user. A daemon never takes up a user the entry does not record | `shed server update shed --refetch` (it prints `User: <name>`: check it is you), then, for a tunnel into the shed `web`, `shed tunnels stop web` and `shed tunnels start web` |
+| `entry "shed" could not be verified against its recorded user and identity (...); nothing was saved and this command's certificate is no longer used. ...` | During a re-enrolment the CLI could not lock the entry's credential files or read `config.yaml`, the entry was removed or changed meanwhile, or the key in its `identity_file` changed while the command ran | Fix what the message names (permissions, a damaged `config.yaml`, the `identity_file`), check the entry with `shed server list`, then run the command again |
+| `shed server list` shows `refused` | One of the refusals above; its message is printed above the table | As for that message |
+| `shed ssh-config --all` fails with `no configured server could be used: <n> refused (see above)` | No configured server answered, and at least one is refused; each refused server's message is printed above | As for that message |

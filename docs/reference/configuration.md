@@ -49,6 +49,8 @@ sheds:
 | `servers.<name>.auth_mode` | string | The credential shape the server last issued at bootstrap: `mtls`, or `token` from a server older than v0.10.0. **Absent means `token`** (every entry written before certificate support existed predates this field). Not a setting — it's a cache of what the server last said; a bootstrap that comes back in the other mode rewrites it, which is how a server moved from token to mtls is picked up without re-adding every client. |
 | `servers.<name>.client_cert_file` / `client_key_file` | string | Paths (under `~/.shed/creds/<server>/`, mode 0700/0600) to this entry's client certificate and private key. Set only in mtls mode. |
 | `servers.<name>.client_cert_expires_at` | timestamp | Expiry of the client certificate; the CLI re-enrolls before a request would race expiry. Set only in mtls mode. |
+| `servers.<name>.user` | string | The named user this entry is held to: the user its client certificates name. Set at `shed server add` and `shed server update --refetch`, and by a renewal when the entry records none yet; changed only by `--refetch --allow-user-change`. A certificate for another user, or one that names no user, is refused. Absent for a server with no user list and for an entry never enrolled for a named user. Kept when the server goes back to issuing control tokens (a server older than v0.10.0), so a certificate it issues once upgraded again must name the same user. Do not edit it by hand: an entry whose `user` does not match its certificate is refused until `shed server update <name> --refetch`. |
+| `servers.<name>.identity_file` | string | The SSH key this entry uses. Set, three things hold, each checked at defined points (when a stored certificate is loaded, when an enrolment is checked, and when it is adopted), not continuously: the entry's API identity is that key and no other (an enrolment is accepted only when the server's certificate was made for that key and the entry still names the same file and key when it is adopted, and a stored certificate made for another key is never presented: the entry enrols again with this key on its next use; a control token, issued or stored, names no key and is refused); the CLI's own ssh for the entry never rides a connection another key opened (`-o ControlMaster=no -o ControlPath=none`); and ssh offers that key first and no key that is only in the agent (`-i <path> -o IdentitiesOnly=yes`). The stanzas the CLI generates carry `IdentityFile "<path>"`, `IdentitiesOnly yes`, `ControlMaster no` and `ControlPath none`. The limits: ssh still offers, after this key, the `IdentityFile` lines your own ssh config names for the host; keep no other `IdentityFile` for that host if the entry must use one key for shell access too. The no-shared-connection promise is about the ssh the CLI runs, whose command-line options win; in an ssh config the first value wins, so an earlier stanza of your own that sets `ControlMaster` or `ControlPath` for the host takes precedence over the generated one, and another program connecting through the alias gets what your config decides. `shed attach` refuses an alias you declared outside shed's managed block, but reads `~/.ssh/config` only: an alias defined in a file it pulls in with `Include` is not seen. Between the checks the key is not watched: a certificate a running process already loaded stays in use until it next loads or renews one, and a key file replaced after ssh read it is caught at the next check. A long-running tunnel whose key file is absent when it renews (a key on removable media) stops accepting new connections and must be started again once the key is back; the key file is read while the CLI holds its config lock, so a key on a stalled network filesystem stalls the command. Set by `--identity-file` on `shed server add` and `shed server update`. An absolute path in valid UTF-8; refused (by the flag and when edited by hand) if it begins or ends with whitespace or contains NUL, CR, LF, `"`, `\`, `#`, `%` or `$`. The file is checked at each use, before ssh runs: it must be readable, and its public key learnable without a passphrase (an OpenSSH-format key, or a `.pub` beside it). See [CLI › One SSH key per entry](cli.md#one-ssh-key-per-entry). |
 | `default_server` | string | Default server for commands |
 | `sheds` | map | Cached shed locations |
 | `create_timeout` | duration | Timeout for create/start operations (default: `10m`) |
@@ -397,18 +399,22 @@ exec:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `exec.max_stdin_bytes` | int | `1048576` (1 MiB) | Largest decoded `stdin` a request may carry (`413 REQUEST_TOO_LARGE` above it). |
-| `exec.max_timeout` | duration | `1h` | Largest `timeout_seconds` a request may ask for (refused above it, never clamped). At least `1s`. A request with no timeout gets 60 s, or this value if it is lower. |
-| `exec.max_concurrent_per_shed` | int | `8` | HTTPS execs one shed may run at once (`429 EXEC_LIMIT` above it). |
+| `exec.max_stdin_bytes` | int | `1048576` (1 MiB) | Largest decoded `stdin` a request may carry (`413 REQUEST_TOO_LARGE` above it). At most `1073741824` (1 GiB): the server holds a request's stdin in memory. |
+| `exec.max_timeout` | duration | `1h` | Largest `timeout_seconds` a request may ask for (refused above it, never clamped). At least `1s`, at most `168h` (7 days). A request with no timeout gets 60 s, or this value if it is lower. |
+| `exec.max_concurrent_per_shed` | int | `8` | HTTPS execs one shed may run at once (`429 EXEC_LIMIT` above it). At most `4096`. |
 
-Negative values are refused at load.
+A negative value, a `max_timeout` under `1s`, or a value above its upper bound is
+refused at load, with an error that names the key, the value and the bound. The
+bounds are far past any real need; they keep the exec route's arithmetic in range.
 
 ### Audit log
 
 shed-server can keep a JSON Lines audit log, `audit.jsonl`, next to
 `egress-audit.jsonl` in the parent of the backend's `instance_dir`
 (`/var/lib/shed/firecracker/audit.jsonl` with the Firecracker defaults,
-`~/Library/Application Support/shed/vz/audit.jsonl` with the VZ defaults). It is
+`~/Library/Application Support/shed/vz/audit.jsonl` with the VZ defaults; on
+the remote backend it is `audit.jsonl` in `remote.state_dir`, `remote` under the
+server's `state_dir` when that is unset). It is
 created `0600` and rotated at 50 MiB, keeping five old files (`audit.jsonl.1`
 is the newest). A server that needs the log and cannot open it does not start.
 
@@ -427,9 +433,55 @@ Each line is one JSON object with `ts` first:
 
 | `event` | Written for | Fields |
 |---------|-------------|--------|
-| `api` | Every service-client request, allowed or refused (401, 403, 404 and policy refusals included). Admin API requests are not logged. | `identity` (`kind: client`, `name`, `serial`), `request_id`, `remote`, `method`, `route` (the matched pattern, `""` when none matched), `path`, `shed`, `status`, `duration_ms` |
-| `exec.end` | Every HTTPS exec, admin or client, that passed the request checks and was handed to the backend, however it ended (a timeout before the command started included). An exec refused with `400`, `404`, `409`, `413` or `429` writes none. | `identity` (`kind: client` or `kind: admin` with `subject`), `request_id`, `shed`, `argv0` and `argc` (or `argv` with `exec_argv: full`), `exit_code` (`-1` when there is none), `timed_out`, `truncated`, `disconnected`, `duration_ms` |
-| `reap` | Each shed the `max_age` reaper deleted | `shed`, `owner`, `age_seconds`, `error` (when the delete failed) |
+| `api` | Every service-client request, allowed or refused (401, 403, 404 and policy refusals included). A person's API requests are not logged. | `identity` (`kind: client`, `name`, `serial`), `request_id`, `remote`, `method`, `route` (the matched pattern, `""` when none matched), `path`, `shed`, `status`, `duration_ms` |
+| `exec.end` | Every HTTPS exec, a person's or a client's, that passed the request checks and was handed to the backend, however it ended (a timeout before the command started included). An exec refused with `400`, `404`, `409`, `413` or `429` writes none. | `identity` (`kind: client`, or `kind: user` for a person; see below), `request_id`, `shed`, `argv0` and `argc` (or `argv` with `exec_argv: full`), `exit_code` (`-1` when there is none), `timed_out`, `truncated`, `disconnected`, `duration_ms` |
+| `reap` | Each shed the `max_age` reaper deleted, and each delete it tried that failed (the shed may still exist; the next pass tries again and writes another line) | `identity` (always `kind: system`), `shed`, `owner`, `age_seconds`, `error` (the backend's error, only when the delete failed) |
+| `ssh` | Each time a person enters a service client's shed over SSH, once the entry has happened: a shell, or a command (`shed exec`, `shed attach`, `ssh <host> <command>`), once it has been handed to the shed's agent (it may still fail to start there); an sftp or scp session once `sftp-server` has been handed to the agent; each forwarded connection (`ssh -L`) once it is connected. A refused entry, one that failed before it reached the agent, an entry into a person's own shed and `_bootstrap` write none. A `shed tunnels` connection uses the HTTPS Connect API, not SSH: it writes a `connect` line. | `identity` (`kind: user`, with `subject` the key's fingerprint and no `serial`), `remote` (the SSH peer's address), `shed`, `owner` (the service client), `channel` (`shell`, `exec`, `sftp` or `tunnel`), `port` (the shed's port, `tunnel` only). The command is never recorded: an SSH command is one shell string, not an argv, and can carry secrets. |
+| `connect` | Each tunnel a person opens into a service client's shed through the HTTPS Connect API (`GET /api/sheds/{name}/connect/{port}`, what `shed tunnels` uses), once it is established: the dial into the shed connected and the connection was switched to the tunnel. A refused or failed Connect, a person's Connect to their own shed and a service client's own requests (its `api` line records those) write none. | `identity` (`kind: user`, as for an HTTPS exec: with the certificate's `subject` and `serial`), `remote` (the HTTPS peer's address), `shed`, `owner` (the service client), `port` (the shed's port). No `request_id`: the server's request id can come from a caller's `X-Request-Id` header, and nothing a caller sends goes into this line. |
+
+The `ssh` and `connect` lines are written inline, as every audit line is: a
+stalled audit file stalls entries into a client's sheds, which is the
+fail-closed choice for an audited entry. A line that cannot be written (an
+error, not a stall) is logged in the server log, and the entry goes on. When
+the server stops (on a signal, or after one of its listeners fails), it
+first refuses new entries into a client's sheds, before it waits on
+anything; then it shuts every listener down together and waits, within its
+30-second shutdown bound, for the entries it had already admitted to write
+their lines (a request that never ends, such as the egress stream, does not
+hold the other listeners open or use up their wait); only then does it close
+the log. A person's HTTPS exec into a client's shed is not covered by these
+gates and this wait: its `exec.end` line is written when the exec ends, so one
+still running when the 30-second bound passes, or when the process is killed,
+leaves no line.
+
+The `identity` member says who acted, by `kind`:
+
+| `kind` | Who | Members |
+|--------|-----|---------|
+| `client` | A service client (`auth.clients`) | `name`, `serial` (the certificate's serial) |
+| `user` | A person: a user of the server, or the one user of a server with no user list | `user` (the user's name), `admin` and `script` (always present, `true` or `false`: whether the person is an admin, and whether they used a script key), `subject` (the key's fingerprint), `serial` (the client certificate's serial, when there is one; an `ssh` line has none). The one user of a server with no user list carries `implicit: true`, `admin: true` and no `user`. In `open` mode an HTTPS request presents no certificate, so its line (`exec.end`, `connect`) has no `subject` or `serial` either; an `ssh` line still carries the key's fingerprint as `subject`. |
+| `system` | The server acting for itself (the `max_age` reaper) | none |
+| `unknown` | A caller the server could not name; never expected, since such a request is refused before it reaches a shed | none |
+
+```json
+{"kind":"client","name":"build-1","serial":"3fa2"}
+{"kind":"user","user":"pat","admin":false,"script":false,"subject":"SHA256:…","serial":"…"}
+{"kind":"user","implicit":true,"admin":true,"script":false}
+{"kind":"system"}
+```
+
+An `ssh` line, for an admin's `shed exec` in a service client's shed:
+
+```json
+{"ts":"2026-11-19T10:04:05.123456789Z","event":"ssh","identity":{"kind":"user","user":"pat","admin":true,"script":false,"subject":"SHA256:…"},"remote":"192.0.2.10:51234","shed":"build-1-a1b2","owner":"build-1","channel":"exec"}
+```
+
+A `connect` line, for an admin's `shed tunnels` into port 8080 of a service
+client's shed:
+
+```json
+{"ts":"2026-11-19T10:06:01.234567891Z","event":"connect","identity":{"kind":"user","user":"pat","admin":true,"script":false,"subject":"SHA256:…","serial":"…"},"remote":"192.0.2.10:51240","shed":"build-1-a1b2","owner":"build-1","port":8080}
+```
 
 ### Mounts
 

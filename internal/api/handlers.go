@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -34,11 +35,19 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		HTTPSPort:    s.cfg.HTTPSPort,
 		Features:     s.serverFeatures(),
 	}
+	// The exec limits travel with their token and only with it. They are
+	// server-wide (no caller is held to others). A caller who can read this
+	// route can call the exec route, subject to the same shed access and
+	// ownership checks as before; reading the limits grants nothing.
+	if slices.Contains(info.Features, FeatureExecLimits) {
+		info.Exec = s.execLimits().report()
+	}
 	// Only a backend that reports its own capabilities (remote) states its
 	// isolation kind; Firecracker and VZ answer exactly as before.
 	if caps, ok := backend.ReportedCapabilities(s.backend); ok {
 		info.Isolation = caps.Isolation
 	}
+	info.GuestArch = s.guestArch()
 	// Client-CA visibility, mtls only. Reaching /api/info in mtls mode already
 	// required a valid client certificate (that mode has no bootstrap
 	// exemptions), so this is reported to authenticated callers only.
@@ -50,6 +59,23 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, info)
+}
+
+// guestArch is /api/info's guest_arch: the architecture every shed this
+// server can create runs, or "" when that is not one value. A local VM
+// backend's is the host's (its capabilities say); a remote backend's is the
+// one every configured size shares.
+func (s *Server) guestArch() string {
+	if s.backend == nil {
+		return ""
+	}
+	if arch := backend.CapabilitiesOf(s.backend).GuestArch; arch != "" {
+		return arch
+	}
+	if s.backend.Type() == backend.TypeRemote && s.cfg.Remote != nil {
+		return s.cfg.Remote.GuestArch()
+	}
+	return ""
 }
 
 // handleGetSSHHostKey returns the server's SSH host key.

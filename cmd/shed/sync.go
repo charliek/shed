@@ -71,6 +71,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Create syncer with output capture for logging
 	syncer := sync.NewSyncer(cfg)
+	syncer.SetServerName(serverName)
 
 	// Capture output for log file
 	var logBuffer bytes.Buffer

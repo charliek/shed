@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/sync"
 	"github.com/charliek/shed/internal/tunnels"
@@ -208,7 +209,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	entry, serverName, err := getServerEntry()
 	if err != nil {
 		printError("no server configured",
-			"shed server add <hostname>  # Add a server first")
+			"shed server add HOST  # Add a server first")
 		return err
 	}
 
@@ -298,7 +299,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 
 	// Auto-sync default profile unless --no-sync is set
 	if !createNoSync {
-		if err := autoSyncAfterCreate(cmd.Context(), name, entry); err != nil {
+		if err := autoSyncAfterCreate(cmd.Context(), name, serverName, entry); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: sync failed: %v\n", err)
 		}
 	}
@@ -314,9 +315,32 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	printSuccess("Created shed %s on %s (backend: %s)", name, serverName, resolvedBackend)
-	fmt.Printf("\nConnect with:\n  shed console %s\n", name)
+	fmt.Printf("\n%s\n", consoleHint(name))
 
 	return nil
+}
+
+// consoleHint is the advice printed after a create: the command that connects
+// to the shed, with its name as config.ShellWord gives it, or the name
+// escaped, in words, with no command line. (A created shed's name passed
+// config.ValidateShedName; this holds whatever it is given.)
+func consoleHint(name string) string {
+	if word, ok := config.ShellWord(name); ok {
+		return "Connect with:\n  shed console " + word
+	}
+	return fmt.Sprintf("Connect with shed console, naming the shed %q "+
+		"(its name cannot be pasted safely as one word, so no command line is shown)", name)
+}
+
+// createShedHint is the suggestion printed when a shed is not found: the
+// command that creates it, with the name the person typed as config.ShellWord
+// gives it, or the name escaped, in words, with no command line.
+func createShedHint(name string) string {
+	if word, ok := config.ShellWord(name); ok {
+		return "shed create " + word + "  # Create a new shed"
+	}
+	return fmt.Sprintf("create a shed named %q with shed create "+
+		"(its name cannot be pasted safely as one word, so no command line is shown)", name)
 }
 
 // parseMountsFlag turns `shed create --mounts` into the request's mounts
@@ -460,7 +484,7 @@ func runList(cmd *cobra.Command, args []string) error {
 	entry, serverName, err := getServerEntry()
 	if err != nil && !listAll {
 		printError("no server configured",
-			"shed server add <hostname>  # Add a server first",
+			"shed server add HOST        # Add a server first",
 			"shed list --all             # List from all servers")
 		return err
 	}
@@ -521,7 +545,7 @@ func runList(cmd *cobra.Command, args []string) error {
 	if len(allSheds) == 0 {
 		fmt.Println("No sheds found.")
 		fmt.Println("\nTo create a shed:")
-		fmt.Println("  shed create <name>")
+		fmt.Println("  shed create NAME")
 		return nil
 	}
 
@@ -574,6 +598,11 @@ type shedJSON struct {
 	User           string                                `json:"user,omitempty"`
 	Mounts         *config.MountSelection                `json:"mounts,omitempty"`
 	NetworkProfile string                                `json:"network_profile,omitempty"`
+	// Isolation and Arch are the record's members of the same names, as
+	// `shed --json create` and the API carry them (config.Shed): omitted when
+	// the server sends none.
+	Isolation string `json:"isolation,omitempty"`
+	Arch      string `json:"arch,omitempty"`
 }
 
 // shedListJSON is the `shed list --json` document.
@@ -600,6 +629,8 @@ func shedListJSON(sheds []listedShed) []shedJSON {
 			User:           s.shed.User,
 			Mounts:         s.shed.Mounts,
 			NetworkProfile: s.shed.NetworkProfile,
+			Isolation:      s.shed.Isolation,
+			Arch:           s.shed.Arch,
 		}
 		if s.shed.Status == config.StatusRunning {
 			sj.SSH = shedSSHString(s.shed.Name, s.server)
@@ -1105,16 +1136,26 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		}
 		client := NewAPIClientFromNamedEntry(serverFlag, entry, DefaultTimeout)
 		if _, err := client.GetShed(name); err != nil {
+			if clienttoken.IsRefusal(err) {
+				// The entry may not be used: say why, not "not found".
+				return "", nil, err
+			}
 			printError(fmt.Sprintf("shed %q not found on %s", name, serverFlag),
 				"shed list --all       # Find which server has it",
-				"shed create "+name+"  # Create a new shed")
+				createShedHint(name))
 			return "", nil, fmt.Errorf("shed %q not found on %s", name, serverFlag)
 		}
 		return serverFlag, entry, nil
 	}
 
-	if server, entry, ok := searchShedServer(name); ok {
+	server, entry, ok, refusal := searchShedServer(name)
+	if ok {
 		return server, entry, nil
+	}
+	if refusal != nil {
+		// A server that might host the shed refused to be used: its message,
+		// unwrapped, is the answer, not "not found".
+		return "", nil, refusal
 	}
 
 	// Not found anywhere
@@ -1124,7 +1165,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 	}
 	printError(fmt.Sprintf("shed %q not found on %s", name, defaultServer),
 		"shed list --all       # Find which server has it",
-		"shed create "+name+"  # Create a new shed")
+		createShedHint(name))
 	return "", nil, fmt.Errorf("shed %q not found", name)
 }
 
@@ -1134,15 +1175,33 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 // server. It reports false when no server answers for the shed (a server
 // hides a shed the caller may not see, so "not found" can also mean "not
 // yours").
-func searchShedServer(name string) (string, *config.ServerEntry, bool) {
+//
+// A server whose entry the CLI refuses (clienttoken.IsRefusal: its stored
+// certificate, or a re-enrolment, is for a user the entry may not use) is not
+// a server that lacks the shed: its refusal is kept and returned when no other
+// server answers for the shed, so the command fails with that message rather
+// than "not found". The cached server refusing ends the search at once (the
+// cache says the shed is there), and its cache row is kept.
+func searchShedServer(name string) (string, *config.ServerEntry, bool, error) {
+	var refusal error
+	note := func(err error) {
+		if refusal == nil && clienttoken.IsRefusal(err) {
+			refusal = err
+		}
+	}
+
 	// Check cache first (unqualified form only)
 	if cachedServer, err := clientConfig.GetShedServer(name); err == nil {
 		entry, err := clientConfig.GetServer(cachedServer)
 		if err == nil {
 			// Verify the shed still exists
 			client := NewAPIClientFromNamedEntry(cachedServer, entry, DefaultTimeout)
-			if _, err := client.GetShed(name); err == nil {
-				return cachedServer, entry, true
+			_, err := client.GetShed(name)
+			if err == nil {
+				return cachedServer, entry, true, nil
+			}
+			if clienttoken.IsRefusal(err) {
+				return "", nil, false, err
 			}
 			// Shed not found on cached server, clear cache and search
 			clientConfig.RemoveShedCache(name)
@@ -1154,10 +1213,12 @@ func searchShedServer(name string) (string, *config.ServerEntry, bool) {
 		entry, _ := clientConfig.GetServer(clientConfig.DefaultServer)
 		if entry != nil {
 			client := NewAPIClientFromNamedEntry(clientConfig.DefaultServer, entry, DefaultTimeout)
-			if _, err := client.GetShed(name); err == nil {
+			_, err := client.GetShed(name)
+			if err == nil {
 				clientConfig.CacheShed(name, clientConfig.DefaultServer, "")
-				return clientConfig.DefaultServer, entry, true
+				return clientConfig.DefaultServer, entry, true, nil
 			}
+			note(err)
 		}
 	}
 
@@ -1167,19 +1228,21 @@ func searchShedServer(name string) (string, *config.ServerEntry, bool) {
 			continue // Already checked
 		}
 		client := NewAPIClientFromNamedEntry(serverName, &entry, DefaultTimeout)
-		if _, err := client.GetShed(name); err == nil {
+		_, err := client.GetShed(name)
+		if err == nil {
 			// Update cache
 			clientConfig.CacheShed(name, serverName, "")
 			entryCopy := entry
-			return serverName, &entryCopy, true
+			return serverName, &entryCopy, true, nil
 		}
+		note(err)
 	}
 
-	return "", nil, false
+	return "", nil, false, refusal
 }
 
 // autoSyncAfterCreate syncs files after shed creation.
-func autoSyncAfterCreate(ctx context.Context, shedName string, entry *config.ServerEntry) error {
+func autoSyncAfterCreate(ctx context.Context, shedName, serverName string, entry *config.ServerEntry) error {
 	// Load sync config
 	cfg, err := sync.LoadConfig()
 	if err != nil {
@@ -1210,6 +1273,7 @@ func autoSyncAfterCreate(ctx context.Context, shedName string, entry *config.Ser
 	}
 
 	syncer := sync.NewSyncer(cfg)
+	syncer.SetServerName(serverName)
 	if jsonFlag {
 		syncer.SetOutput(io.Discard)
 	}

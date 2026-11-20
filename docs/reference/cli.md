@@ -39,6 +39,7 @@ shed server add <host> [flags]
 | `--fingerprint` | | | Expected SSH host-key fingerprint (`SHA256:...`); verified out-of-band and fails on mismatch |
 | `--tls-fingerprint` | | | Expected TLS cert fingerprint (`sha256:...`); verified out-of-band and fails on mismatch |
 | `--trust-on-first-use` | | `false` | Trust the server's SSH host key (and TLS cert) without prompting |
+| `--identity-file` | | | The SSH private key this entry uses, and the only one ssh offers for it (see [One SSH key per entry](#one-ssh-key-per-entry)) |
 
 **First contact is over SSH.** `server add` scans the server's SSH port (`--ssh-port`, default `2222`), pins the host key in `~/.shed/known_hosts`, and then mints a credential over the reserved `_bootstrap` SSH channel. The bundle the server returns describes everything else — API port, TLS pin, and which credential shape the server issues — and the entry is only saved after an authenticated `GET /api/info` over that endpoint succeeds.
 
@@ -54,9 +55,56 @@ What the bootstrap returns decides the rest:
 | `auth.mode: open` | The server issues no credential, so the command falls back to the HTTP probe (`--port`, `--https-port`, `--secure`) to find the API endpoint |
 | `auth.mode: token` (a server older than v0.10.0) | A scoped, short-TTL control token, written as `control_token` + `control_token_expires_at` (never printed) |
 
-Against an mtls server your SSH key must be one the server accepts (listed under `auth.users`, or in `auth.ssh.github_users` / `authorized_keys`); a key that is not is a hard error, not a downgrade. On a server with users, the entry acts as the user your key belongs to. From then on the CLI renews the credential transparently, near expiry and on a rejection. See [Security › Enrollment over SSH](security.md#enrollment-over-ssh) and [Security › Native pinned TLS](security.md#native-pinned-tls).
+Against an mtls server your SSH key must be one the server accepts (a user's key wherever the server takes its users from: `auth.users`, `auth.ssh.github_users` / `authorized_keys` on a server with no user list, or an account service); a key that is not is a hard error, not a downgrade. ssh cannot say why a server refused every key it offered, so the error names each cause you can act on:
 
-`--https-port` names the port **you** reach the server's TLS listener on. It overrides the HTTPS port the bootstrap bundle advertises when the `api_url` is built, which is what makes a port-mapped or externally published deployment addable; the pinned certificate fingerprint always comes from the bundle, and the verification request still has to succeed, so a wrong port fails during the add rather than on your next command.
+```text
+the server refused every SSH key ssh offered for _bootstrap@shed.example.test: none of them is a user's key there,
+or the right key has a passphrase and is not in your agent (shed runs ssh with BatchMode=yes: ssh-add it),
+or the server's user list is not in force and only its local admins can log in. A key listed for a user moments
+ago can be refused once while the server fetches it: try again in a minute. sdk/bootstrap: ...
+```
+
+(one line in the terminal). For an entry with its own key (`--identity-file`) it begins `the server refused the entry's SSH key "<path>" (and any other key ssh offered)`. Where a key is listed is the server operator's choice: on a server that takes its users from an account service it is added there, not in `server.yaml`. On a server with users, the entry acts as the user your key belongs to. From then on the CLI renews the credential transparently, near expiry and on a rejection. See [Security › Enrollment over SSH](security.md#enrollment-over-ssh) and [Security › Native pinned TLS](security.md#native-pinned-tls).
+
+The add says who the entry is. Against an mtls server it prints the user the entry is now held to, after the enrol line; check that it is the user you expect:
+
+```text
+✓ Added server work (https://shed.example.test:8443, TLS pinned)
+  Enrolled a client certificate over SSH (mtls mode)
+  User: pat
+  Set as default server
+```
+
+A server with no user list issues a certificate for its one implicit user, shown as `User: (implicit)`. An `auth.mode: open` server issues no credential, and a server older than v0.10.0 in token mode issues a control token, which names no user: neither prints a `User:` line. With `--json` the result's `details` carry two members: `user`, the user name the entry records (omitted when it records none), and `user_implicit`, `true` when the entry's stored certificate is the implicit user's. The JSON never carries the text's `(implicit)` or `-`.
+
+#### One SSH key per entry
+
+`--identity-file <path>` names the SSH key the entry uses, so that a second entry for the same server, held to another user, needs no second host name:
+
+```bash
+shed server add shed.example.test --name work                                         # your everyday key
+shed server add shed.example.test --name work-admin --identity-file ~/.ssh/id_admin   # the backup admin key
+```
+
+With `identity_file` set, three things hold, each checked at the points it names, not continuously (see the last limit below):
+
+1. **The entry's API identity is that key and no other, at each check.** The server writes the SSH key that a `_bootstrap` login proved into the certificate it issues. Every enrolment for the entry (at the add, at `--refetch`, at each renewal, and a tunnel daemon's) compares that key with the public key of the identity file, and accepts the certificate only when they are the same. When they differ, nothing is stored or used and the command fails: `the server issued a certificate for SSH key "SHA256:…", but entry "<name>" uses only its identity_file "<path>" … ssh authenticated with a different key than the entry's identity file`. A certificate is also adopted only while the entry still names the identity file the enrolment started from and the key learned from that file is still the one it used: if another `shed` command changed the entry's `identity_file`, or the key file was replaced, while ssh ran, nothing is stored or recorded and the command stops using what it held. A control token names no key, so such an entry never uses one: a server older than v0.10.0 that issues one is refused, and an entry that still holds one from before its `identity_file` was set is refused before any request (`entry "<name>" cannot be used: it holds a control token …`; run `shed server update <name> --refetch`). The same comparison is made each time a stored certificate is loaded for use: one made for another key (stored before the entry's `identity_file` was set or changed, or by another program) is never presented, and the entry enrols again with its identity file on its next use, under the same rules as any enrolment (the user it is held to included). So `--identity-file` without `--refetch` takes effect at the next command; `--refetch` enrols with the key at once. If the identity file cannot be read at any of these points, whether or not a certificate is stored, the command fails with its `identity_file` message, nothing is presented and nothing is sent; a long-running command (a tunnel) that meets it at a renewal stops using the certificate it held.
+2. **The CLI's own ssh for the entry never rides a connection another key opened.** Every ssh the CLI runs for the entry carries `-o ControlMaster=no -o ControlPath=none`: the enrolment, `shed console`, `shed exec`, `shed attach`, `shed sync`. Options on the command line win over your ssh config, so a `ControlMaster auto` there cannot hand this ssh a connection your other key authenticated. The roost transport keeps a shared connection of its own, under its own `ControlPath`, keyed by the identity file and by the key in it (learned at each use), so a key replaced at the same path never reuses a connection the old key opened.
+3. **ssh offers that key first, and no key that is only in your agent.** Every ssh for the entry carries `-i <path> -o IdentitiesOnly=yes`.
+
+**Your ssh config's keys:** OpenSSH has no option that makes ssh ignore the `IdentityFile` lines of your own ssh config. A `Host` or `Match` stanza that matches the server's host (or `Host *`) can still add its keys, and ssh offers them after the entry's key. For the API this is caught by item 1: a certificate made for such a key is refused. For shell access (`shed console`, `shed exec`, `shed attach`) the server accepts whichever key it knows, so if the entry must use one key for shell access too, keep no other `IdentityFile` for that host in `~/.ssh/config`.
+
+**Through an alias, by another program:** item 2 is a promise about the ssh the CLI itself runs, whose command-line options win over any ssh config. The stanzas `shed ssh-config` generates, and the `Host` alias `shed attach` writes for roost, carry `IdentityFile "<path>"`, `IdentitiesOnly yes`, `ControlMaster no` and `ControlPath none`, but in an ssh config the first value found for an option wins: a stanza earlier in your own ssh config that sets `ControlMaster` or `ControlPath` for the same host takes precedence over these lines. A program other than the CLI that connects through the alias (plain `ssh`, an editor's remote mode, `rsync`) therefore gets only what your ssh config leaves the stanza to decide. The CLI never edits a stanza it did not write.
+
+**An alias defined through `Include`:** `shed attach` refuses an alias that is declared anywhere in `~/.ssh/config` outside shed's managed block, but it reads that one file only. An alias defined in a file `~/.ssh/config` pulls in with `Include` is not seen by that check.
+
+**Checked at these points, not continuously:** the key is checked when a stored certificate is loaded, when an enrolment is checked, and when an enrolment is adopted. It is not watched in between. A certificate a running process has already loaded stays in use until that process next loads or renews one, and a key file replaced after ssh has read it is caught at the next check, not at that one.
+
+**A key that is away, or slow:** a long-running tunnel whose identity file is absent when it renews its certificate (a key on removable media) stops accepting new connections and must be started again (`shed tunnels stop`, then `shed tunnels start`) once the key is back. The key file is read while the CLI holds its config lock, so a key on a stalled network filesystem stalls the command (and any other `shed` command waiting for that lock).
+
+The path is stored in `config.yaml` as `identity_file`, absolute, with a leading `~` expanded; nothing else about it is rewritten. A value is refused, by the flag and in a hand-edited `config.yaml` alike, when it is not an absolute path, is not valid UTF-8, begins or ends with whitespace (any Unicode whitespace), or contains NUL, CR, LF, `"`, `\`, `#`, `%` or `$` (ssh expands `%` tokens and `${…}` and unescapes `\` in `-i` and `IdentityFile`, and a quote or `#` breaks the config line). Move or link a key whose path has one of those characters. The file is checked when the flag is given and again each time it is used: it must be a readable regular file, and its public key must be learnable without a passphrase, which item 1 needs. That is the case for a key in the OpenSSH format (`-----BEGIN OPENSSH PRIVATE KEY-----`, encrypted or not), for an unencrypted key, and for any key with its `.pub` file beside it; a `.pub` that names another key than the file's own is refused. A public key file is accepted too (ssh then offers the agent's copy of that key). A key that cannot be used fails the command before ssh runs, with `entry "<name>": identity_file "<path>" cannot be used: <reason>`.
+
+`--https-port` names the port **you** reach the server's TLS listener on. It overrides the HTTPS port the bootstrap bundle advertises when the `api_url` is built, which is what makes a port-mapped or externally published deployment addable; the pinned certificate fingerprint always comes from the bundle, and the verification request still has to succeed, so a wrong port fails during the add rather than on your next command. A later `shed server update <name> --refetch` keeps that port while the server answers on it.
 
 #### When the SSH port cannot be scanned
 
@@ -64,6 +112,8 @@ The host-key scan dials `<host>:<ssh-port>` directly. `ssh` does not: the bootst
 
 - **ssh reaches the server.** Host-key verification is ssh's: `StrictHostKeyChecking=yes` against `~/.shed/known_hosts`, with the global `known_hosts` and every `ssh_config`-supplied host-key source disabled. Nothing is trusted that was not already pinned there, so an unpinned host is refused **by ssh**. If you reach a server through `~/.ssh/config`, pin its key yourself first — `ssh-keyscan -p <port> <hostname> >> ~/.shed/known_hosts` — and the add proceeds normally.
 - **ssh cannot reach it either.** There is no SSH evidence at all, so the command falls back to the HTTP probe, exactly as it did before first contact moved to SSH. It refuses to write an entry if that probe reports a mode that issues credentials (`mtls`, or an older server's token mode): those servers issue their credential over SSH and nowhere else, so an entry written here could never authenticate.
+
+**A `Host` alias is not a way to a second key.** The host you give `server add` is also the API address: the entry's `api_url` is built from it. A `Host` alias in `~/.ssh/config` whose `HostName` points elsewhere therefore enrols over SSH (ssh follows the alias) and then fails at the API, which is dialled at the alias's name. To give an entry its own key, add the server under its real name with `--identity-file` (see [One SSH key per entry](#one-ssh-key-per-entry)).
 
 #### A failed add leaves nothing behind
 
@@ -86,7 +136,35 @@ regenerates its cert).
 ```bash
 shed server update <name> --tls-fingerprint sha256:<new>   # pin a new value out-of-band
 shed server update <name> --refetch                        # re-read the pin over SSH and re-pin
+shed server update <name> --identity-file ~/.ssh/id_work   # set the SSH key the entry uses
+shed server update <name> --identity-file ~/.ssh/id_work --refetch   # ...and re-enrol with it
+shed server update <name> --identity-file ""               # clear it
 ```
+
+`--identity-file` sets the entry's `identity_file` (see
+[One SSH key per entry](#one-ssh-key-per-entry)); the value is checked as
+`shed server add` checks it, and only whitespace is refused rather than read as
+"clear". On its own it changes only that field, on any entry, plain HTTP
+included, and the entry re-enrols with this key on its next use: a stored
+certificate made for another key is never presented.
+With `--refetch` the re-enrolment offers the new key, the new certificate must
+have been made for it, and the key is saved together with the certificate: if
+the refetch fails or is refused, nothing is saved, the key included. An entry
+whose stored `identity_file` cannot be used is refused by `--refetch` until the
+key is fixed (or replaced with `--identity-file`). A `--refetch` running in another `shed`
+process while the key changes is refused with nothing saved
+(`entry "<name>" changed while this command ran`), and so is one racing an
+`--allow-user-change`.
+
+The ssh config stanzas `shed ssh-config --install` wrote for the entry's sheds,
+and the `Host` alias `shed attach` wrote, are not rewritten by
+`server update`: until they are written again, a program that connects through
+them (plain `ssh`, roost) offers the key they name. After the key is changed,
+run `shed ssh-config --install` again, and `shed attach` rewrites its alias at
+its next run. After it is cleared, both keep the old key's lines (a stanza for
+an entry without an identity file is compared by name only, so neither rewrites
+it): run `shed ssh-config --uninstall`, then `shed ssh-config --install`, and
+`shed attach` once more for each shed you attach to.
 
 `--refetch` follows the same SSH-first path as `shed server add`: it re-verifies
 the pinned host key, re-bootstraps, and takes the new TLS pin from the bundle —
@@ -96,8 +174,73 @@ the entry's credential as a side effect, so a server that changed `auth.mode`
 lands on the right one. An `auth.mode: open` server (no bundle) still has its
 certificate read directly off its `api_url`.
 
+An entry whose `api_url` is `https` with a port (for example one added with
+`--https-port`) keeps that endpoint across a `--refetch` while the server
+answers there with the new pin and credential. Only when it cannot be reached
+there (a refused connection, a timeout, or a TLS handshake the pin does not
+pass) is the HTTPS port the server reports tried; if that one answers, the entry
+moves to it and the refetch prints
+`  HTTPS port changed from 18443 to 8443: … did not answer, and the server reports …`
+(with `--json`, `previous_api_url` beside `api_url`). An answer from the entry's
+own endpoint (a 401, a 403, a redirect, a 5xx, a body that does not decode, a TLS
+refusal of the certificate) is not a moved port: the refetch fails, naming that
+endpoint and what it answered, and saves nothing. If neither endpoint answers,
+the refetch fails, naming both, and saves nothing.
+
+No request the CLI makes to a server's API follows a redirect: a 3xx is reported
+as an error naming the status, and nothing is sent to the URL it names.
+
 Rotating an existing pin in a non-interactive session requires
 `--trust-on-first-use`.
+
+An mtls entry is held to the user its certificates name (`user` in
+`config.yaml`). `--refetch` prints that user (`  User: pat`, or
+`  User: (implicit)` from a server with no user list, as the add prints them)
+and records it when the entry has none yet. When the server issues a certificate for another user
+(for example because `ssh` offered a key that belongs to someone else), the
+refetch fails before its network check and writes nothing; add
+`--allow-user-change` to make the entry that user, which prints
+`  User changed from "pat" to "admin"`. With `--json` the result carries
+`user` and, after a change, `previous_user`.
+
+After changing an entry's user, restart long-running `shed` commands and
+tunnel daemons (`shed tunnels stop <shed>`, then `shed tunnels start <shed>`).
+A process already running keeps the certificate it holds until its next
+re-enrolment or until that certificate ends, whichever is first, so until
+then it continues as the previous user for at most the certificate's life.
+At its next re-enrolment it reads the entry again and stops, because the
+entry now names another user. A tunnel daemon never takes up a user the
+entry does not record: if the entry records none and the server issues a
+named certificate, the daemon stops and asks for
+`shed server update <name> --refetch` and a restart.
+
+```bash
+shed server update <name> --refetch --allow-user-change    # make the entry the user the server now issues for
+```
+
+| Flag | Description |
+|------|-------------|
+| `--tls-fingerprint <sha256:...>` | Pin this TLS certificate fingerprint, verified out-of-band |
+| `--refetch` | Re-pin and re-enrol over the SSH-first path |
+| `--trust-on-first-use` | With `--refetch`, trust the re-fetched TLS certificate without prompting |
+| `--allow-user-change` | With `--refetch`, let the entry change to the user of the new certificate. Without `--refetch` it is a usage error |
+| `--identity-file <path>` | Set the SSH key the entry uses (`""` clears it); with `--refetch`, the re-enrolment uses it |
+
+`--refetch` is also the way back for an entry the CLI refuses. Every other
+command refuses an entry, before it sends any request or runs `ssh`, when its
+stored certificate names no user (a shed-server older than 0.10.0 issued it) or
+names a user the entry does not record (an older CLI saved the entry, it was
+edited by hand, or an enrolment was interrupted or overlapped another `shed`
+process):
+
+```text
+entry "shed" cannot be used: its certificate names no user (issued by a shed-server older than 0.10.0); no request was sent. Enrol it again: shed server update shed --refetch
+```
+
+A command also fails, with nothing saved, when a re-enrolment is issued a
+certificate for another user than the entry's, or one that names no user (the
+server is older than 0.10.0: upgrade it first). `shed server remove <name>`
+works on a refused entry too.
 
 ### shed server list
 
@@ -110,12 +253,27 @@ shed server list
 **Output:**
 
 ```
-NAME            ENDPOINT                                 SSH                               SECURITY  STATUS   DEFAULT
-mini-desktop    http://mini-desktop.tailnet.ts.net:8080  mini-desktop.tailnet.ts.net:2222  open      online   *
-cloud-vps       https://vps.tailnet.ts.net:8443          vps.tailnet.ts.net:2222           secure    offline
+NAME     ENDPOINT                           SSH                        SECURITY  USER        STATUS   DEFAULT
+local    http://127.0.0.1:8080              127.0.0.1:2222             open      -           online   *
+work     https://shed.example.test:8443     shed.example.test:2222     secure    pat         offline
+build-1  https://build-1.example.test:8443  build-1.example.test:2222  secure    (implicit)  online
 ```
 
-The `ENDPOINT` is the control-plane URL the CLI actually uses (`https://…` for a pinned-TLS secure server, `http://…` otherwise). `SECURITY` is `secure` (pinned TLS), `open` (plain HTTP), or `unpinned` (an `https` endpoint with no pinned cert — misconfigured). Add `--json` for the full record, including `https_port`, `tls_pinned`, and the pinned fingerprint.
+The `ENDPOINT` is the control-plane URL the CLI actually uses (`https://…` for a pinned-TLS secure server, `http://…` otherwise). `SECURITY` is `secure` (pinned TLS), `open` (plain HTTP), or `unpinned` (an `https` endpoint with no pinned cert — misconfigured).
+
+`USER` is who the entry is, worked out from local files with no request and writing nothing, after `STATUS` is probed (a re-enrolment during the probe can record the entry's first user, and the row is read again from `config.yaml` for it):
+
+| `USER` | Meaning |
+|---|---|
+| a name (`pat`) | The user the entry records (`user` in `config.yaml`), whatever its stored certificate says: the only user the CLI acts as for it. An entry whose server went back to issuing control tokens (a server older than v0.10.0) keeps the user it recorded, and shows it: a certificate the server issues once it is upgraded again must name that user |
+| `(implicit)` | The entry records no user, and its stored certificate is for the implicit user of a server with no user list |
+| `-` | No user to show. For a plain-HTTP entry (`auth.mode: open`) and for a control-token entry that records no user (a server older than v0.10.0 in token mode): these credentials name no user. For an mtls entry: no certificate on file yet, one that cannot be read, or one the CLI refuses. Also for a `user` in `config.yaml` that is not a valid user name (a hand edit; it is never printed), and for an entry whose row could not be read again |
+
+It never shows a name the entry does not record: an entry that records no user but holds a certificate for a named user shows `-`, with `STATUS` `refused`.
+
+`STATUS` is `online`, `offline`, or `refused`: the CLI refuses the entry (see [`shed server update`](#shed-server-update)), either for its stored certificate, which is known without sending a request, or because the server rejected its certificate and the re-enrolment was issued another user's. The refusal's message is printed once to stderr.
+
+Add `--json` for the full record, including `https_port`, `tls_pinned`, the pinned fingerprint, `identity_file` (the entry's key, as `server add` and `server update` report it; omitted when it has none), and who the entry is as two members: `user`, the user name the entry records (omitted when it records none, or none that is a valid user name), and `user_implicit`, `true` when the entry's stored certificate is the implicit user's (it can be `true` beside a `user`: a named entry whose server dropped its user list). The JSON never carries the text's `(implicit)` or `-`.
 
 ### shed server remove
 
@@ -244,7 +402,7 @@ mcp-test      firecracker  stopped  -                               -           
 | `STATUS` | `running`, `stopped`, `starting`, `stopping` or `error`, followed by the reason in brackets when the server gives one (`stopped (run_limit)`). See [Remote backend › Statuses](remote-backend.md#statuses). |
 | `ID` | The shed's permanent ID. Shown only when a listed shed has one (remote sheds do). |
 
-With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `User:` (when it has one), `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `user`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`.
+With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections, plus `Owner:`, `User:` (when it has one), `Server Mounts:` and `Network:` lines. `--json list` carries the same data as `owner`, `user`, `mounts` and `network_profile` (see [API › GET /api/sheds](api.md#get-apisheds)), and, as `--json create` does, the record's `isolation` and `arch` when the server sends them (each omitted otherwise). On a server whose backend stores them (the [remote backend](remote-backend.md)), it also carries the shed's `id` and, when the status has one, `status_reason`.
 
 ### shed start
 
@@ -1143,7 +1301,7 @@ Both are left alone on every later attach.
 
 | Behaviour | Detail |
 |---|---|
-| No `IdentityFile` | The `Host` entry carries the host, port, user and pinned `~/.shed/known_hosts` file, and no identity — your default key and ssh agent decide, exactly as `shed ssh-config --install` writes it. An entry you wrote by hand is never modified. |
+| `IdentityFile` only from the server entry | The `Host` entry carries the host, port, user and pinned `~/.shed/known_hosts` file, exactly as `shed ssh-config --install` writes it. Without an `identity_file` on the server entry it carries no identity (your default key and ssh agent decide), and an entry already in the file, written by an earlier attach or by hand, is never modified. With one (see [One SSH key per entry](#one-ssh-key-per-entry)) it also carries `IdentityFile "<path>"`, `IdentitiesOnly yes`, `ControlMaster no` and `ControlPath none`; an alias shed wrote earlier (inside its managed block) whose stanza differs, for example one written before the key was set or with another key, is rewritten before it is used (`rewrote Host <alias> …`); and an alias of that name that shed did not write stops the attach with a message naming the alias and the identity file, changing nothing, because shed cannot vouch for what it offers. That is an alias declared anywhere in `~/.ssh/config` outside the managed block (even when the block also holds a copy), or a stanza inside the block that is not entirely shed's: a `Host` line naming other hosts too (or anything else on that line), a line shed does not write (a comment, an `Include`, another option such as `ProxyJump`), an indented `Host` or a `Match` line after it, or a second stanza for the alias. Remove that stanza to let shed write its own. An alias in a file pulled in with `Include` is not seen. A file whose managed-block marker lines do not frame exactly one block is refused, unchanged, with or without an `identity_file`. |
 | Renaming the tab defeats reuse | Reuse matches the tab's title and working directory. A tab renamed in roost no longer matches, so the next `shed attach` opens a new one. |
 | Concurrent attaches can duplicate a saved host | Two `shed attach` runs racing on a shed that has no saved host yet can each add one, leaving a duplicate. roost offers no compare-and-swap; remove the extra host in roost. |
 | Nothing is cleaned up on `shed delete` | The `Host` entry and the saved roost host outlive the shed. Remove them by hand; automatic cleanup is future work. |
@@ -1414,6 +1572,47 @@ shed ssh-config --all --install       # Apply changes
 shed ssh-config --uninstall           # Remove managed block
 ```
 
+A shed on a server entry with an `identity_file` gets `IdentityFile "<path>"`,
+`IdentitiesOnly yes`, `ControlMaster no` and `ControlPath none` in its stanza
+(see [One SSH key per entry](#one-ssh-key-per-entry)); an identity file that
+cannot be used fails the command before anything is printed or written. For
+such a shed, `--install` writes the managed block again when a stanza's
+identity lines are not exactly these (for example one written before the
+entry's key was set) or the block holds the alias twice, and keeps the
+qualified roost alias `shed-<server>-<shed>` that `shed attach` may have
+written, listing each under "Entries to update" (`changed` in `--json`). A shed
+on an entry without an `identity_file` is compared by name only, as before.
+
+The managed block is shed's: whenever it must change (an addition, a removal,
+or an update above), `--install` regenerates it whole from the sheds it lists,
+so lines edited by hand inside the block are not kept; keep your own lines
+outside it. The block is found by its marker lines only, a line that is exactly
+`# --- BEGIN SHED MANAGED BLOCK ---` or `# --- END SHED MANAGED BLOCK ---`, so
+the same text inside a comment or a quoted value is not a boundary. A file with
+more than one of either line, one without the other, or the END line first is
+refused, naming the file, and nothing is changed; `shed attach` refuses it the
+same way.
+
+A shed's name comes from the server's shed list, and is the stanza's `User`
+and part of its `Host` alias. A name that is not a shed name (a line break, a
+space, `*`, `%`, a quote: nothing a server that follows the rules sends) is
+skipped, with one warning line on standard error naming it escaped
+(`warning: skipped shed …`), and the other sheds are printed or written; when
+every shed is skipped the command fails and writes nothing. The writer of
+`~/.ssh/config` (here and in `shed attach`) refuses any stanza whose alias,
+user, host name, port, `UserKnownHostsFile` or `IdentityFile` could end its
+line or be read as a pattern or token, and writes nothing then. The server
+entry's host, written as `HostName`, must be a literal host name or address: a
+DNS name or IPv4 address (ASCII letters, digits, `.`, `-` and `_`, starting
+and ending with a letter or digit) or an IPv6 address (hex digits and `:`, with
+no zone and no brackets). ssh expands `%` tokens in `HostName`, and a
+`ProxyCommand` in your own config can hand it to a shell, so any other value
+is refused, naming the field. The `UserKnownHostsFile` path (your
+`~/.shed/known_hosts`) is written inside double quotes, as the `IdentityFile`
+path is, so a home directory with a space is one file to ssh; a path holding
+`%`, `$`, `#`, a quote or a backslash is refused, because ssh would expand or
+split it.
+
 ## Roost Integration
 
 ### shed roost-provider
@@ -1629,10 +1828,15 @@ key pair, sends the public key with a one-time enrolment code, and on the
 service's answer writes the key and the enrolment to
 `{state_dir}/directory/enrolment.json` (mode `0600`, in a directory of mode
 `0700`). Run it on the shed host as the user the server runs as, with the same
-`--config`.
+`--config`: with `sudo` for the Linux package, whose server runs as root; as
+yourself, never with `sudo`, for Homebrew, whose service runs as your user
+(see [User directory › Enrol](../guides/user-directory.md#enrol)).
 
 ```bash
-sudo shed-server directory enroll [--name <name>] [--config <path>]
+# Linux package
+sudo shed-server --config /etc/shed/server.yaml directory enroll [--name <name>]
+# Homebrew
+"$(brew --prefix)/opt/shed/bin/shed-server" --config "$(brew --prefix)/etc/shed/server.yaml" directory enroll [--name <name>]
 ```
 
 | Flag | Default | Description |
@@ -1652,7 +1856,12 @@ success it prints:
 State directory: /etc/shed
 Enrolled with the account service at https://accounts.example.test as srv_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a (organization example, name "build-1").
 Wrote /etc/shed/directory/enrolment.json (mode 0600): this server's key for the account service, which never leaves this host.
+If the server is already running with this config, it reads the enrolment at its next attempt, at most 15 minutes from now; to use it at once, restart the server or run 'shed users refresh' as a local admin.
 ```
+
+A server that is not running reads the enrolment when it starts. One already
+running found none at its last attempt and reads it at its next, at most 15
+minutes later; until then only the local admins can log in.
 
 Every failure exits 1 and says whether anything was written and what to do;
 a lost answer says how to recover. The [User Directory

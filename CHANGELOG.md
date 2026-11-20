@@ -72,7 +72,10 @@ All notable changes to this project will be documented in this file.
   NDJSON `stdout`/`stderr` frames and a final `exit` frame (`124` with `timed_out` on a
   timeout; no `exit` frame means the result was lost). A stopped shed is
   `409 SHED_NOT_RUNNING` (exec never starts one). New `exec:` config block:
-  `max_stdin_bytes` (1 MiB), `max_timeout` (1h), `max_concurrent_per_shed` (8).
+  `max_stdin_bytes` (1 MiB; at most 1 GiB), `max_timeout` (1h; at most `168h`) and
+  `max_concurrent_per_shed` (8; at most 4096); a value above its bound fails config load,
+  naming the key, the value and the bound. See [Configuration › HTTPS
+  exec](https://charliek.github.io/shed/reference/configuration/#https-exec).
 - **Server (Firecracker): the `isolated` network profile.** `shed create --network isolated`
   (or the API's `network` field) gives a shed the internet and nothing else: not the host,
   other sheds, RFC 1918, CGNAT/tailnet, link-local and metadata, multicast, and no IPv6, with
@@ -255,6 +258,49 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **CLI: `shed server update <name> --refetch` keeps the HTTPS port you chose.** An entry
+  added with `--https-port` (a server reached through a port mapping) had its `api_url`
+  rebuilt from the port the server reports, so after a refetch it pointed at another port.
+  The refetch now verifies the entry's own endpoint first and keeps it when it answers. Only
+  when it cannot be reached (a refused connection, a timeout, a TLS handshake the pin does
+  not pass), the reported port is tried; the entry moves to it only if that one answers, and
+  the refetch says so (`  HTTPS port changed from … to …`; `previous_api_url` in `--json`).
+  An answer from the entry's own endpoint (a 401, a 403, a redirect, a 5xx, a body that does
+  not decode) is no sign of a moved port: the refetch fails there, naming the endpoint and
+  the status, and saves nothing. If neither endpoint answers, the refetch names both and
+  saves nothing. Limits: a stored `api_url` with a path that fails is not retried without
+  the path, and an `/api/info` answer that decodes but is empty still verifies.
+- **CLI: no request to a server's API follows a redirect (security).** Every command's API
+  client, the tunnel's probe and the roost provider's inventory now treat a 3xx as the
+  answer and report it as an error naming the status, so a credential is never sent on to
+  the URL a redirect names; before, an endpoint holding the pinned certificate could pass a
+  bearer token on to a plain-`http` URL. shed-server's API answers no request with a
+  redirect, so nothing that works today changes. The desktop app's own client (the dashboard
+  and its control requests) follows none either: it used to follow a redirect to any `https`
+  URL, and with a pinned server it presented its client certificate to any host holding the
+  pinned certificate. The credential broker's bus and egress stream follow a redirect only
+  within the server's own origin.
+- **CLI: a shed name from a server never reaches `~/.ssh/config` unchecked (security).**
+  `shed ssh-config` (printed, `--install`) and `shed attach` wrote each shed's name from the
+  server's list into a `Host` and a `User` line as it came, so a hostile server could add
+  lines (a `ProxyCommand`) to the managed block. A shed whose name is not a shed name is now
+  skipped, with one warning line naming it escaped, and the other sheds are written; the ssh
+  config writer itself refuses any stanza whose alias, user, host name, port or paths could
+  change what it says, and writes nothing then; the host name must be a literal host name
+  or address (no `%` token, shell syntax, `=` or leading `-`), and the `UserKnownHostsFile`
+  path is written quoted (a home directory with a space was read as two files) and held to
+  the rule the `IdentityFile` path has. An error answer from a
+  server (a JSON request's or an event stream's), a create's progress lines and warnings, a
+  shed's status and status reason, and a server's name are shown with their control
+  characters escaped, as other server text is.
+- **Server: a graceful stop logs each step once.** `Shutting down SSH server...` was written
+  twice.
+- **Desktop: a cloud shed that is stopping shows `stopping`, and a shed's reason shows beside
+  its status.** The shared core now decodes the remote backend's `stopping` status (it read
+  `unknown`) and a shed's `status_reason`. The Sheds pane shows the reason the way `shed list`
+  does (`stopped (capacity)`, `starting (no_pin)`), and a starting or stopping shed shows the
+  busy spinner with no Start or Delete button until it settles. A status the app does not know
+  still reads `unknown`.
 - **Desktop (craze): stopping a session no longer freezes its transcript panel.** craze 0.2.0
   removes a stopping session from its list before the session's last events arrive. The
   desktop used to close the lane at once, leaving a panel with no "ended" banner, a live
@@ -403,6 +449,54 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   host of every server enrolled with it (a list admin is an admin there), and the trust time
   needs an accurate host clock. See the [upgrade
   guide](https://charliek.github.io/shed/upgrades/v0.9.1-to-v0.10.0/#users-from-an-account-service).
+- **Moving an installed server to the account service** is written down in the [User
+  Directory guide](https://charliek.github.io/shed/guides/user-directory/): the Homebrew
+  commands (run `shed-server` as yourself with `--config "$(brew --prefix)/etc/shed/server.yaml"`,
+  never with `sudo`, which enrols into `/etc/shed`, where the service never looks); a first
+  enrolment on a running server; keeping your sheds, in two starts (once with only yourself
+  in `auth.users`, so the one-time upgrade step gives them to your list name, then the
+  switch, with the local admin under another name); and the local admin on a backup key with
+  one host name and `--identity-file` on each entry.
+- **CLI: upgrade every server first, then enrol every mtls entry again with `shed server
+  update NAME --refetch`** (`NAME` the entry's name), once per entry, on every machine. The CLI refuses, before it
+  sends any request or runs `ssh`, an entry whose stored certificate names no user (a server
+  older than 0.10.0 issued it) or names a user the entry does not record (an older CLI saved
+  the entry, it was edited by hand, or an enrolment was interrupted); the refetch records the
+  user and prints it. A newly
+  issued certificate that names no user is refused too, with nothing saved. A CLI older than
+  0.10.0 drops `user` when it saves `config.yaml`: use 0.10.0 on every machine that shares
+  one. A running tunnel daemon keeps the entry it started with: restart it after a refetch.
+- **Scripts that match the refusal of a key must match its new text.** `your SSH key is not
+  in this server's allowlist (auth.ssh.github_users / authorized_keys)` and the bootstrap
+  error's `ssh could not authenticate with any available identity (… or the key may not be
+  on the server allowlist)` are gone; match `the server refused every SSH key ssh offered`
+  (the CLI) or `sdk/bootstrap: the server refused every key ssh offered` (the bootstrap
+  error) instead (see "Changed").
+- **Readers of `audit.jsonl`: the identity kind `admin` is gone, with no alias.** A person is
+  now `kind: user` (with `user`, or `implicit: true`, and `admin` and `script`), and a `reap`
+  line carries `kind: system` (see "Audit log: callers by kind" below). Update any filter that
+  matches `kind == "admin"`. A new `ssh` line records each time a person enters a service
+  client's shed over SSH, and a new `connect` line each tunnel a person opens into one through
+  the HTTPS Connect API (see "Audit log: a person's entry" below).
+- **Deb: an edited `/etc/systemd/system/shed-server.service` makes the upgrade prompt.** The
+  unit is a dpkg conffile and changes in this release (it now waits for the network, see
+  "Changed"). An unedited unit is replaced with no prompt. An edited one makes dpkg ask, and
+  an unattended `apt-get -y` upgrade stops at that prompt (`end of file on stdin at conffile
+  prompt`), the package left unpacked and the edit untouched. To avoid the stop, add
+  `-o Dpkg::Options::=--force-confold` to the upgrade: it keeps your unit and leaves the
+  package's as `shed-server.service.dpkg-dist`; add `network-online.target` to your `After=`
+  and `Wants=` lines. To recover from an upgrade that already stopped, finish the
+  configuration yourself: run `sudo dpkg --configure shed-server` in a terminal and answer
+  the prompt about the unit. If you take the package's version (until then it waits beside
+  yours as `shed-server.service.dpkg-new`), apply your edits to it again; if you keep yours,
+  add `network-online.target` as above. Then `sudo systemctl daemon-reload` and restart the
+  service.
+- **Upgrading the binary does not rewrite a unit `shed-server install` wrote.** Run `sudo
+  shed-server install` again, or add `network-online.target` to its `After=` and `Wants=`
+  lines and `sudo systemctl daemon-reload`, to get the new ordering. Recommended for a server
+  that takes its users from an account service; not required. On a deb install the same path
+  is the package's conffile, so dpkg can replace the unit if you choose the package's
+  version at the prompt.
 
 #### Added
 
@@ -434,16 +528,19 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   name, a name or key listed twice, no usable key (a key's identity is its blob; `expires`
   is an RFC 3339 instant only), a local admin's name or key, or an `auth.clients` name is
   skipped and logged. A person added on the service logs in with no restart (their first SSH
-  login pulls the list: at most once a minute while pulls succeed, once per 15 minutes while
-  they fail, the login waiting at most 8 s); a person removed loses their SSH connections at
-  the next pull. Certificates issued before certificates named a user are refused on such a
+  login, as `_bootstrap`, pulls the list: at most once a minute while pulls succeed, once per
+  15 minutes while they fail, the login waiting at most 8 s; see the unknown-key rule below);
+  a person removed loses their SSH connections at the next pull. Certificates issued before certificates named a user are refused on such a
   server. See the [User Directory
   guide](https://charliek.github.io/shed/guides/user-directory/).
 - **Server: `shed-server directory enroll [--name <name>]`** enrols the server with the
   service at `auth.directory.url`, once, writing `{state_dir}/directory/enrolment.json` (mode
   `0600`). It reads the one-time code from standard input only (a prompt that does not echo
   at a terminal), never waits for another run's lock, refuses a server already enrolled, and
-  on a lost answer writes nothing and says how to recover.
+  on a lost answer writes nothing and says how to recover. Its last line says what a server
+  already running does: it reads the enrolment at its next attempt, at most 15 minutes later
+  (until then only the local admins can log in, and a new person's first login starts no
+  pull); a restart or `shed users refresh` reads it at once.
 - **Server and CLI: `shed users status`** (`GET /api/users/status`, admin; refused to a script
   key) shows where a server's users come from (`config`, `directory` or `none`) and who they
   are, never their keys; on a directory server also the list's state, last good pull,
@@ -478,6 +575,177 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   signs](https://charliek.github.io/shed/extensions/ssh-agent/#what-the-machine-signs).
 - **Remote backend: an additive `shed_user` instance label** (no label schema change), from
   which a VM adopted at start-up takes its user.
+- **SSH: limits on connections that have not authenticated, in every auth mode.** A
+  connection that has not authenticated 120 seconds after it was accepted is closed. At most
+  100 connections may be unauthenticated at once, and at most 10 of them from one address
+  (an IPv4 address, or an IPv6 /64); loopback counts like any other address, so a proxy on the
+  same host gets no exemption. A connection beyond either is closed at once. New log lines:
+  `SSH: closed a connection from <host:port> that did not authenticate within 120 seconds`,
+  `SSH: refusing connections from <address>: ...` and `SSH: refusing new connections: ...`
+  (each at most once a minute), and `SSH auth failed: remote=<host:port> user=<name>
+  keys=<n>`, once for each connection that offered a key and closed without proving one
+  (`keys=` counts the public-key offers the server examined on it). Point fail2ban at the
+  failed, grace and per-address refusal lines, never at `SSH auth DENIED`, which a person
+  whose agent offers several keys draws before one logs in. The values are fixed. See [Security › Facing
+  the internet](https://charliek.github.io/shed/reference/security/#facing-the-internet).
+- **Directory server: what an unknown SSH key can start.** A key the server's list does not
+  hold makes it pull the list early only under two login names. As `_bootstrap` (`shed server
+  add`): at most once a minute (15 minutes while pulls fail, none inside a `Retry-After`), as
+  before; the login that takes that slot is let in as soon as its key is known (from its own
+  pull or any other), and if its key is still unknown it is now refused when its 8-second wait
+  ends, never earlier, so a refused `shed server add` whose login took the slot takes 8 seconds
+  to fail (one that did not is refused at once). As the name of a shed that exists on the
+  server: the login is refused at once, without waiting for the server's check of the name,
+  which runs off the login path; the server then pulls in the background on a slot of its own,
+  at most once every 5 minutes (15 while pulls fail), and a retry seconds later gets in. Under
+  any other name an unknown key starts nothing: a name no shed on the server has (such as
+  `root` or `ubuntu`, unless a shed has that name) or one that cannot be a shed name; before,
+  any valid shed name could pull once a minute. For a key that stays unknown, how long the
+  answer takes does not show whether a guessed name is a shed, except while pulls fail, while
+  a `Retry-After` is pending, or when that shed name's own pull fails (see the security
+  reference). If the account service
+  is slow, a new key's logins are refused until a pull has brought it, and a later attempt then
+  succeeds. New log lines: `directory: shed-name key <fp> for an existing shed: pulling the list
+  in the background (at most once every 5 minutes while pulls succeed, once every 15 minutes
+  while they fail)`, and at most once an hour `directory: in the last hour <n> unknown keys
+  were offered as a name that is no shed here and <m> as an existing shed's name (<p> asked for
+  a pull, ...)`. The first-login line states its rates the same way: `directory: unknown key
+  <fp>: pulling the list (at most once a minute while pulls succeed, once every 15 minutes
+  while they fail)` (it said `once every 15m0s`). A
+  server with GitHub logins (`auth.users`) keeps its rule. See [Security › A new
+  person](https://charliek.github.io/shed/reference/security/#a-new-person).
+- **The directory contract, version 1, text change** (no wire, fixture or key change): an
+  unknown key's login waits at most 8 seconds (it said 20); the two pull rates above, each a
+  bound across the whole client; and who is listed, and whether as an admin, may differ from
+  one requesting server to another, with a user whose access on a server depends on a
+  restriction that server has not declared left out. An account service built from the
+  contract copies `tests/directory-contract/v1/` again (its manifest line for `CONTRACT.md`
+  changed).
+- **Directory server: the sign-in names its scope.** The token request now carries
+  `scope=directory:read`, once, so the server no longer asks for every scope the account
+  service has, and a scope the service adds later is never requested. The contract already
+  allows the parameter, and two new exchanges hold a service to it (below). An account
+  service must accept it: one that answers `400 invalid_scope` fails every refresh (logged as
+  `directory: pull failed: token: refused (HTTP 400) "invalid_scope"`, the list held staying
+  in force until its trust time ends), and the server does not retry without the scope. A token answer whose `scope` lists
+  more than `directory:read` is still accepted, as the contract says.
+- **The directory contract, version 1, two new exchanges** (no wire change; no existing
+  fixture changes): `token-scope-directory-read`, a token request that names
+  `scope=directory:read`, the request every server now sends, answered as `token-ok` is; and
+  `token-scope-unknown`, a request naming a scope the server lacks, answered `400
+  invalid_scope`, after which the same assertion is accepted, as it was not spent. Before
+  them, no exchange sent a scope or held a service to `invalid_scope`, so a service could
+  pass every exchange and still refuse every 0.10.0 server. `CONTRACT.md`'s list of exchanges
+  names them. An account service built from the contract copies
+  `tests/directory-contract/v1/` again (the manifest gains the two files, and its line for
+  `CONTRACT.md` changed) and runs the two new exchanges.
+- **CLI: a server entry is held to its user.** An mtls entry records the user its
+  certificates name (`user` in `config.yaml`), set at `shed server add`, at `shed server update
+  --refetch`, or by a re-enrolment when it has none; a certificate for the implicit user of a
+  server with no user list neither sets nor clears it. When a re-enrolment is issued a
+  certificate for another user (`ssh` offered a key that belongs to someone else), the command
+  fails, naming both users, and nothing is written or used; `shed server update NAME
+  --refetch --allow-user-change` makes the change. `shed server list` shows STATUS `refused`
+  for an entry the CLI refuses and prints why once to stderr. The roost provider presents a
+  stored certificate under the same rule. The rule is about what a process takes up: a process
+  never takes up a certificate for a user the entry does not record when it checks, but a
+  certificate it already holds stays in use until its next re-enrolment or until the
+  certificate ends, whichever is first, even after another process changed the entry with
+  `--allow-user-change`; at that re-enrolment it stops. After changing an entry's user,
+  restart long-running `shed` commands and tunnel daemons; until then they continue as the
+  previous user for at most the certificate's life. A tunnel daemon reads the entry at every
+  re-enrolment and never takes up a user the entry does not record.
+- **CLI: who a server entry is.** `shed server add` against an mtls server prints the user
+  the entry is held to after the enrol line (`  User: pat`, or `  User: (implicit)` for a
+  server with no user list). `shed server list` gains a `USER` column, worked out from local
+  files with no request and writing nothing: the user the entry records; for one that records
+  none, `(implicit)` when its stored certificate is the implicit user's, else `-` (also for a
+  plain-HTTP entry, a control-token entry that records no user, and a hand-edited `user`
+  that is not a valid user name, which is never printed). An entry whose server goes back to
+  issuing control tokens keeps, and shows, the user it recorded. A certificate's own name is never shown for an entry that
+  does not record it: such an entry shows `-` and STATUS `refused`. In JSON, both commands
+  gain `user` (the recorded user name, omitted when there is none) and `user_implicit`
+  (`true` when the stored certificate is the implicit user's); the text's `(implicit)` and
+  `-` never appear there. Scripts that split the text table by column position see the new
+  column before `STATUS`; the JSON is unchanged apart from the new members.
+- **CLI: an entry's own SSH key, `identity_file`.** `shed server add --identity-file <path>`
+  and `shed server update <name> --identity-file <path>` (on its own, or with `--refetch`,
+  which then enrols with the new key; `""` clears it) set the key an entry uses, so a second
+  entry for the same server, held to another user (a local admin on a backup key), needs no
+  second host name. With it set, three things hold, each checked at defined points (when a
+  stored certificate is loaded, when an enrolment is checked, and when it is adopted), not
+  continuously. (1) The entry's API identity is that key and no other: every enrolment (the
+  add, `--refetch`, each renewal, a tunnel daemon's) compares the SSH key the server wrote
+  into the issued certificate with the identity file's public key, and when they differ
+  nothing is stored or used and the command fails, saying ssh authenticated with a different
+  key and why; a renewal is adopted only while the entry still names the same file and the
+  same key is in it (another command's `--identity-file`, or a key replaced at the same path,
+  while ssh ran: nothing is written or recorded, and what the process held is no longer
+  used); a control token names no key, so one a server older than 0.10.0 issues is refused,
+  and an entry that still holds one is refused before any request (`--refetch` fixes it). A
+  stored certificate is held to the same rule wherever it is loaded for use: one made for
+  another key (stored before the field was set or changed) is never presented, and the entry
+  enrols again with its key on the next command, so `--identity-file` without `--refetch`
+  takes effect then. An identity file that cannot be used refuses the entry everywhere
+  (before any request, with or without a stored certificate; a tunnel that meets it at a
+  renewal stops using what it held; `shed ssh-config` and the roost provider report it as a
+  refusal). (2) The CLI's own ssh for the entry never rides a connection another key opened:
+  every ssh it runs for the entry (the enrolment, `console`, `exec`, `attach`, `sync`) carries
+  `-o ControlMaster=no -o ControlPath=none`, and the roost transport keeps its own shared
+  connection, keyed by the file and the key in it. (3) ssh offers that key first and no
+  agent-only key: `-i <path> -o IdentitiesOnly=yes`. The limits: ssh still offers, after it,
+  the `IdentityFile` lines your own ssh config names for that host (OpenSSH cannot be told to
+  ignore them); (1) refuses a certificate made for one of them, and for shell access the docs
+  say to keep no other `IdentityFile` for that host. The stanzas `shed ssh-config` and `shed
+  attach` write carry the same four options; in an ssh config the first value wins, so an
+  earlier stanza of your own for the host decides for another program that connects through
+  the alias ((2) is a promise about the ssh the CLI runs). An alias defined in a file your ssh
+  config pulls in with `Include` is not seen by the check below. `shed attach` rewrites a
+  roost alias it wrote whose stanza differs, and stops, changing nothing, when an alias of
+  that name is one you wrote by hand anywhere outside shed's managed block (even with a
+  managed copy too), or a stanza in the block that is not entirely shed's (a line shed does
+  not write, such as a comment, an `Include` or a `ProxyJump`; a `Host` line naming other
+  hosts; a `Match` or indented `Host` line after it; a second stanza for the alias). `shed
+  ssh-config --install` has one more reason to write the managed block again: for such an
+  entry, a stanza (the qualified roost alias included) whose identity lines differ, or an
+  alias the block holds twice (`changed` in `--json`). As for an addition or a removal, the
+  block is then regenerated whole, so lines edited by hand inside it are not kept; an entry
+  without the field is compared by name only, as before. Both commands find the block by its
+  marker lines only (a line that is exactly the marker), so marker text inside a comment or a
+  quoted value earlier in the file is no longer taken for the block's start (it could
+  corrupt the file before), and both refuse, changing nothing, a file whose marker lines do
+  not frame exactly one block. The path is
+  stored absolute (`~` expanded); one rule holds for the flag and a hand-edited `config.yaml`:
+  not absolute, not valid UTF-8, whitespace at either end, or any of NUL, CR, LF, `"`, `\`,
+  `#`, `%`, `$` is refused. The file is checked at each use (opened without blocking, a
+  regular file only), and its public key must be learnable without a passphrase (an
+  OpenSSH-format key, or a `.pub` beside it), so a key that cannot be used fails the command
+  before ssh runs; it is read while the CLI holds its config lock, so a key on a stalled
+  network filesystem stalls the command. A tunnel whose key file is absent when it renews (a
+  key on removable media) stops accepting new connections and must be started again once the
+  key is back. A refetch that races another process's `--identity-file` is refused with
+  nothing saved, and an add or a refetch whose key file is replaced while it runs saves
+  nothing. JSON results gain `identity_file` (`shed --json server list` included). The
+  stanzas `shed ssh-config --install` and `shed attach` wrote are not rewritten when the key
+  is changed or cleared: after a change run `shed ssh-config --install` again (and `shed
+  attach` rewrites its alias at its next run); after clearing it, run `shed ssh-config
+  --uninstall`, then `shed ssh-config --install`, and attach again. Without the field every
+  argv and stanza is as before.
+- **Desktop and host-agent: an entry's own SSH key, `identity_file`.** The app and its
+  credential broker (embedded or the `shed-host-agent` daemon) read the field the CLI writes,
+  with the CLI's value rule. Every `ssh` they run for the entry passes the key (`-i <path> -o
+  IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none`, byte for byte the CLI's argv,
+  or the same four lines in the stanza a roost connection reads); the file is checked each
+  time they build an `ssh` command for the entry or open a tunnel or command runner for it,
+  and one that is missing, or a value the rule refuses, is a typed refusal naming the entry
+  and that `ssh` does not run (a connection an open tunnel makes later, a local command that
+  only closes a shared connection, and a terminal running a command built earlier are not
+  checked again); a stored `control_token` or `credentials_token` is never sent for such an
+  entry. An entry the app or the broker cannot read exactly is refused, never read as "no
+  key" (see the `config.yaml` item under Changed). Unlike the CLI, the app does not
+  check that a certificate was made for the entry's key: what bounds who it acts as is the
+  entry's `user`. Restart the app after changing an entry's `identity_file`. See [Desktop
+  configuration](https://charliek.github.io/shed/desktop/configuration/#the-ssh-key-an-entry-uses).
 - **Development:** `SHED_DEV_USERS=itest` starts the dev servers with the suite's user list;
   the suite gains `test_users.py`, `test_users_upgrade.py` and `test_source_pin.py`, with
   `SHED_ITEST_USERS` and `SHED_ITEST_USERS_DIR`.
@@ -486,9 +754,95 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   reference server and a private `shed-server` on loopback for each case and never touches an
   installed or dev server. The module skips under every other target with a message naming
   this one. Not in CI; its fixture unit tests run in `make test-integration-units`.
+- **Audit log: a person's entry into a service client's shed.** Each time a person (an
+  admin, or the one user of a server with no user list) enters a client's shed over SSH, a new
+  `ssh` line records it: a shell, a command (`shed exec`, `shed attach`), sftp or scp, and
+  each connection forwarded with `ssh -L`. It names the person (`kind: user`, with the key's
+  fingerprint as `subject`), the peer's `remote` address, the `shed`, its `owner` and the
+  `channel` (`shell`, `exec`, `sftp` or `tunnel`, with `port` for a tunnel), never the
+  command. Each tunnel a person opens into a client's shed through the HTTPS Connect API (what
+  `shed tunnels` uses) writes a new `connect` line: the person as for an HTTPS exec (with the
+  certificate's `subject` and `serial`), `remote`, `shed`, `owner` and `port`; neither line
+  carries a request id or anything else the caller sent. Each is written once the entry has
+  happened (the command was handed to the shed's agent, where it may still fail to start, or
+  the connection or tunnel is open), so a refused attempt, or one that failed before it reached
+  the agent, writes none; nor does a person's own shed, or `_bootstrap`. A shed whose owner or
+  user changes between the check of an entry and the entry itself (during a wake included) is
+  refused as not found. When the server stops, it refuses new `ssh` and `connect` entries into
+  a client's sheds first (logging `Closing entry gates...` before every server's shutdown
+  line), then waits for the entries it has admitted to write their lines before it closes the
+  log. A person's HTTPS exec is not covered by that: its `exec.end` line is written when the
+  exec ends, so one still running at the 30-second shutdown bound leaves none. Starting,
+  stopping, deleting or resetting a client's shed, a snapshot of it, its egress rules, reading
+  its egress decisions, its sessions or its record are not recorded yet. Before, such an entry
+  left only server-log lines. See [Configuration › Audit
+  log](https://charliek.github.io/shed/reference/configuration/#audit-log).
+- **API: `/api/info` reports the exec limits.** A new `exec` member, with the new feature
+  token `exec_limits` (always advertised, beside `http_exec`), gives the limits an HTTPS exec
+  request is refused above (`max_stdin_bytes`, `max_timeout_seconds`, `max_output_bytes`,
+  `max_concurrent_per_shed`, `max_argv_elements`, `max_env_keys`, `max_argv_env_bytes`) and
+  the defaults a request that sets none gets (`default_timeout_seconds`,
+  `default_output_bytes`). They are read from the same values the exec route enforces, the
+  configured `exec:` settings included, and are the same for every caller, service clients
+  included, so an orchestrator can size its requests instead of learning a limit from a
+  refusal. A client that ignores unknown members is unaffected. See [API › GET
+  /api/info](https://charliek.github.io/shed/reference/api/#get-apiinfo).
+- **API: one shed record on every backend.** Every shed record, on every route that returns
+  one (list, get, create and its stream's `complete` event, start, stop, assign, reset, the
+  egress set and off routes, and `GET /api/overview`), now carries `isolation`: `none`,
+  `firewall` (an `isolated` shed held by the server host's firewall, Firecracker) or
+  `topology` (an `isolated` shed held by the network, remote). It fails closed: an
+  `isolated` shed on a backend that cannot hold isolation reports `none`, never the
+  profile's name. `network_profile` is unchanged beside it. Records also carry `arch`
+  (`amd64` or `arm64`): the host's on Firecracker and VZ, the size's on remote (stored at
+  create, or, when a lost record is rebuilt, the architecture the cloud reports for the VM's
+  boot disk; when the cloud reports none, the one the configured sizes give its machine type,
+  only if they all agree, else none; a remote shed created before this reports none). A remote record now always carries `"mounts": {"mode": "selected"}`,
+  so `shed list` shows `none` for its mounts where it showed `-`. `GET /api/info` gains
+  `guest_arch` (the host's on Firecracker and VZ; on remote the one `arch` every size shares,
+  omitted when they mix) and the always-advertised feature token `uniform_shed_record`.
+  `isolation` and a local `arch` are computed when the record is reported; nothing stored
+  changes. `shed --json list` carries `isolation` and `arch` as `shed --json create` does.
+  A client that ignores unknown members is unaffected. See [API › GET
+  /api/sheds](https://charliek.github.io/shed/reference/api/#get-apisheds).
 
 #### Changed
 
+- **CLI, SDK and desktop: a refused SSH key names each cause, not an allowlist.** `shed server
+  add` and `shed server update --refetch` now fail with `the server refused every SSH key ssh
+  offered for _bootstrap@<host>: none of them is a user's key there, or the right key has a
+  passphrase and is not in your agent (shed runs ssh with BatchMode=yes: ssh-add it), or the
+  server's user list is not in force and only its local admins can log in`, and say that a
+  key listed moments ago can be refused once (try again in a minute); an entry with
+  `identity_file` is refused naming that key. The bootstrap error the CLI's renewals and the
+  desktop's broker report (Go `sdk/bootstrap.ErrNoSSHIdentities`, the Rust
+  `BootstrapError::NoSshIdentities`, the same text in both) now reads `sdk/bootstrap: the
+  server refused every key ssh offered (no key ssh can reach, …; not a user's key; a
+  passphrase key not in the agent; or the server's user list not in force. …)`. Neither names
+  `auth.ssh` settings any more, which a server that takes its users from an account service
+  does not have. `shed server add --help` and the CLI reference say that a `~/.ssh/config`
+  alias whose `HostName` points elsewhere enrols over SSH and then fails at the API: use the
+  real name with `--identity-file`.
+- **CLI: an entry name that cannot be pasted is never put in a suggested command.** The
+  refusals that suggest `shed server update <name> …` (a stored certificate that names no
+  user or another user, a certificate for another user, a restore that failed, a tunnel that
+  cannot record its user, a stored token on an entry with its own key) quote the name for the
+  shell when it holds a shell metacharacter, and give the advice in words, with the name
+  escaped and no command line, when it holds a control character or any non-ASCII
+  character, or starts with `-`; the desktop follows the same rule. Nothing else read from
+  `config.yaml`, a certificate or a server goes into a suggested command: the refusal of a
+  certificate for another user now suggests `--identity-file /path/to/key` and names the
+  user whose key it means in the sentence. `shed tunnels start` names a shed in its `-t`
+  advice the same way. `shed ssh-config --install` and `--uninstall` list entry and alias
+  names escaped, and print `ssh <alias>` only for an alias of the shape shed generates
+  (letters, digits, `.`, `_`, `-`). The ssh words a refused key's error ends with are shown
+  escaped (a line break as `\n`), in the CLI and the desktop alike.
+- **`serve` stops its other servers when one fails.** When a listener fails (a port another
+  process holds, for example), `serve` now logs `Server error: …` as before and then stops
+  the max_age reaper and shuts its other servers down as on a signal, before it exits with the
+  error; before, it exited at once. On both paths every listener is now shut down together
+  (before, one after another, so a request that never ends, such as the egress stream, kept
+  the SSH listener open for the whole 30-second bound), and the audit log is closed last.
 - **The credential bus is routed by user.** A machine receives only its user's sheds'
   requests, and only that user's source may answer them. The server mints its own id for
   each request, an answer that matches no pending request is refused in every mode (open
@@ -501,6 +855,12 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
 - **GitHub keys are read by account id** from `api.github.com/user/<id>/keys`, after the login
   is pinned to its numeric id in `{state_dir}/github_pins.json`. When GitHub is unreachable
   the last known keys stay and no new key is accepted.
+- **SSH: `SSH auth allowed` is logged when a key is proven, not when it is offered**, once per
+  login and in every mode: a key a client only asks about, and never signs with, is no longer
+  logged as allowed. Every `SSH auth` line now carries the peer's address, `remote=<host:port>`
+  (after `fingerprint=`, or after `user=` on the attempt-cap line, which names no key). Log
+  scrapers and fail2ban filters that match these lines need updating. See [Security › The SSH
+  auth log](https://charliek.github.io/shed/reference/security/#the-ssh-auth-log).
 - **SSH picks the shed by the username that authenticated**, in every channel type: a client
   that changed username between authentication requests could have its port forwards routed by
   the first one. An empty username gets the unknown-shed answer.
@@ -508,9 +868,99 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   any other check, on every `/api/sheds/{name}` and `/api/egress/{name}` route.
 - **Egress history and the live stream are filtered by user and by shed incarnation**: a shed
   recreated under an earlier name no longer shows the earlier shed's records.
-- **Host-agent and desktop: the bus follows a redirect only to the server's own origin**, and
-  an answer the server refused is audited as `undelivered`.
+- **Host-agent and desktop: the bus and the egress stream follow a redirect only to the
+  server's own origin**, and an answer the server refused is audited as `undelivered`. The
+  egress stream used to follow a redirect to any `https` URL, with its credential, to any
+  host that held the pinned certificate.
+- **Audit log: callers by kind.** A person's line no longer reads `{"kind":"admin",
+  "subject":…}` for everyone who is not a service client: it is `{"kind":"user","user":"pat",
+  "admin":true,"script":false,"subject":…,"serial":…}`, with the user's name, whether they are
+  an admin, whether they used a script key, the key's fingerprint as `subject` and the client
+  certificate's serial. The one user of a server with no user list is `implicit: true` with
+  no `user`; in `open` mode an HTTPS line (`exec.end`, `connect`) has no `subject` or
+  `serial`, while an `ssh` line still carries the key's fingerprint as `subject`. A `reap` line gains
+  `"identity":{"kind":"system"}`. A service client's identity is unchanged. There is no alias
+  for the old kind: a filter on `kind == "admin"` matches nothing written after the upgrade,
+  and rotated files keep the old shape. See [Configuration › Audit
+  log](https://charliek.github.io/shed/reference/configuration/#audit-log).
+- **Desktop and host-agent: a server entry is held to one user.** The app's control
+  credential and the broker's own certificate are used only when they name the entry's
+  `user` (recorded by the CLI) or the implicit user; with no `user`, the first named user is
+  held (by the broker only once it has stored that certificate). A `user` that is not a plain
+  user name is never read as no user. A certificate for another named user, or one that names no user (a shed-server older
+  than 0.10.0), is refused: nothing is stored, the held credential stays, and the message
+  (the host error, and the broker's last error in `broker.status`) names both users and the
+  fix. While a refusal lasts, the app's control requests and the credential broker each ask
+  the server for a certificate again only after a wait (1 s, doubling to 30 s, measured on a
+  monotonic clock), however many requests arrive meanwhile: before, the broker enrolled again
+  for every credential request it answered while its held certificate was near expiry or had
+  been rejected, and the server issued the other user's certificate each time. A request with
+  nothing the server would accept is not sent, by the control path or by the credential
+  broker (its subscription, its answers and its egress stream): it fails at once with the
+  refusal alone. A still-valid certificate for the entry's user keeps being used; one that
+  has expired meanwhile is not presented, and the entry stays held to its user. The broker
+  logs that it presents a certificate at WARN once per refusal, then at DEBUG. Once the server
+  issues a certificate for the entry's user again, each path uses it at its first attempt
+  after its wait, with no restart (the control path's when the dashboard next polls, so about
+  35 seconds at most). A change to `config.yaml` resets the broker's wait for a server whose
+  entry changed, not the control path's, so restart the app after fixing the entry. The
+  refusal suggests `--identity-file /path/to/key`, as the CLI
+  does. A stored broker certificate that fails the same check is not presented and the broker
+  enrols again. Restart the app after an entry's user changes; run `shed server update <name>
+  --refetch` once so `config.yaml` records the user. See [Desktop
+  configuration](https://charliek.github.io/shed/desktop/configuration/#the-user-an-entry-is-held-to).
+- **Desktop: the app reads `config.yaml` as the shed CLI writes it, and refuses the rest by
+  name.** Every entry the CLI's save path writes with ordinary values is read with the host,
+  ports, user and `identity_file` the CLI reads (a fixture written by the CLI's own save
+  function holds this). Values are read as YAML reads them, so two shapes change meaning: a
+  value with a `#` and no space before it (`host: mini#2`, `identity_file:
+  /home/pat/.ssh/id#work`) is now the whole value, where the app used to cut it at the `#`; and
+  a value that is literally `null` or `~` (`user: null`) is now no value, where the app used to
+  read the text. Double-quoted escapes such as `\t` are decoded, `''` in a single-quoted value
+  is one `'`, a `#` inside quotes is text, and a quoted key is decoded the same way. An entry
+  named with a colon (`prod:blue`, `10.0.0.5:8443`) is read under its name, a byte-order mark
+  is skipped, and only the first YAML document is read. The app reads a server entry only when
+  every line in it is a plain `key: value`: an entry with any other line (an explicit `? key`,
+  a `{…}` mapping, a tag, an anchor, a merge key, a block scalar, a continued value, a repeated
+  key, a list, a line indented with a tab) or a null `host` is listed and refused with a
+  reason, never read with defaults, so an entry the app used to read in part (a `user:` list, a
+  `host:` value continued on the next line) is now refused whole, and a null `host` no longer
+  falls back to the entry's name. The app reads no part of a file that holds a raw CR outside a
+  CRLF line ending, NEL, U+2028 or U+2029 (the broker refuses such a file too), that has
+  `servers:` twice, or whose `servers:` is in flow form or has a tag or an anchor; the log says
+  why. Not read, by design: a name the CLI writes as an explicit `? key` (over 128 bytes), and
+  a value written as a multi-line block or with a `!!binary` tag; each refuses its entry. A
+  hand-edited file in YAML forms the CLI never writes may be refused by the app while the CLI
+  accepts it. These refusals are the app's own: for an entry it refuses, the dashboard and its
+  control requests send nothing. The credential broker reads the file with a full YAML parser:
+  it serves an entry in a shape that parser reads as the CLI does (a `{…}` mapping, an explicit
+  `? key`), and refuses the key and the user of one it cannot read so (a merge key, a tagged
+  key, a tagged, anchored or multi-line `user` or `identity_file`), never reading it as "no
+  key" or "no user". **Add machine** writes every value double-quoted unless it is a plain
+  token (so `&a other.example` is written as `"&a other.example"` and read back as that text by
+  any YAML reader), and refuses a host or user holding a control character, a line break or a
+  character YAML does not allow in a file (U+FFFE, U+FFFF). See [How the app reads the
+  file](https://charliek.github.io/shed/desktop/configuration/#how-the-app-reads-the-file).
 - **Development: both parallel dev servers and the integration suite run `mtls`.**
+- **CLI: every client-certificate write for an entry is one transaction** (a re-enrolment, an
+  add, a refetch) under that server's credential lock, deciding against the entry as
+  `config.yaml` holds it at that moment: two processes that enrol one entry for different
+  users cannot both win, and a refetch does not overwrite another process's
+  `--allow-user-change`. The loser writes nothing and fails. A command killed between writing
+  the certificate and saving `config.yaml` leaves an entry the CLI refuses (nothing is sent)
+  until `shed server update NAME --refetch`; a save whose old certificate cannot be put back
+  fails the command, naming that refetch. A re-enrolment that would record an entry's first
+  user is used only once `config.yaml` records it: if the save fails, the command fails and
+  says why. A re-enrolment that cannot read the entry under its lock fails closed, and an
+  expired certificate the CLI kept after a refused re-enrolment is never sent.
+- **Server (Linux): `shed-server` is ordered after the host's network-online check.** The
+  deb's unit and the one `shed-server install` writes now order after, and want,
+  `network-online.target` (they ordered after `network.target`). A host with no such check
+  enabled, or whose check times out, still starts the server. A server that takes its users from an account service
+  pulls the list at start-up, and a remote-backend server calls its cloud provider; started
+  before the network was online, a directory server with no kept copy failed its first pull
+  and ran with only its local admins until the next attempt, 15 minutes later. See the
+  upgrade notes above for an edited deb unit and a unit `shed-server install` wrote.
 
 #### Removed
 
@@ -533,6 +983,13 @@ git needs. Token mode is gone: a server reachable from other hosts runs `mtls`.
   stored under the lowercase name** (access checks still applied).
 - **Docs: the Connect API's status for a stopped shed** is `503 SHED_NOT_RUNNING` on
   Firecracker and VZ and `409` on the remote backend, and `default_backend` lists `remote`.
+- **Docs: the remote backend's JSON create has no single time bound.** The reference said
+  the reply always comes within 25 s; the firewall check (up to 10 s, when its last result is
+  stale), the image lookup (10 s) and the wait for the cloud (15 s) each have a bound, and the
+  reply can take longer than their sum. Give it a minute or more. The statuses table now
+  lists `unreachable` and `host_key` among the reasons a failed start leaves a shed
+  `stopped` with. See [Remote backend › Calls and
+  statuses](https://charliek.github.io/shed/reference/remote-backend/#calls-and-statuses).
 
 #### Security
 

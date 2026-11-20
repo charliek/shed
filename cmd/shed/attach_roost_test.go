@@ -696,7 +696,7 @@ func TestEnsureSSHAliasLeavesAUserEntryAlone(t *testing.T) {
 	}
 	// Belt and braces on the outcome the helper returns, so a future change
 	// that started writing here cannot pass by printing nothing.
-	outcome, err := sshconfig.AddEntryIfAbsent(path, sshconfig.Entry{Name: "shed-myproj"})
+	outcome, err := sshconfig.AddEntryIfAbsent(path, sshconfig.Entry{Name: "shed-myproj", Host: "shed.example.test", Port: 2222, User: "myproj"})
 	if err != nil {
 		t.Fatalf("AddEntryIfAbsent: %v", err)
 	}

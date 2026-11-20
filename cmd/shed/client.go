@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -23,6 +24,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/sdk"
+	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 )
 
 // DefaultTimeout for quick API operations (list, stop, delete, etc.)
@@ -32,7 +34,7 @@ const DefaultTimeout = 30 * time.Second
 type APIClient struct {
 	baseURL       string
 	httpClient    *http.Client
-	transport     http.RoundTripper // non-nil when TLS-pinned; shared by every client below
+	transport     http.RoundTripper // the refusal gate over the pinned (or default) transport; shared by every client below
 	createTimeout time.Duration
 	// tokens holds the client's credential — a bearer token or a client
 	// certificate — and transparently re-mints it (proactively near expiry,
@@ -44,6 +46,20 @@ type APIClient struct {
 	// rotation — or a token↔mtls mode flip — changes what is presented without
 	// touching the transport or its connection pool.
 	tokens *clienttoken.Source
+	// held is the user this client's refresh closure is held to (nil for a
+	// client with no refresh). It changes when the closure adopts its first
+	// named user, so a consumer that builds its own refresh from this client
+	// (the tunnel daemon) reads it here rather than from a stale entry.
+	held *heldUser
+}
+
+// heldUserName returns the user this client is held to now: what its refresh
+// closure holds, or the entry's user (fallback) for a client with no refresh.
+func (c *APIClient) heldUserName(fallback string) string {
+	if c.held == nil {
+		return fallback
+	}
+	return c.held.current()
 }
 
 // pinCredential stamps cred onto req as the ONE credential this attempt will
@@ -82,7 +98,48 @@ func pinCredential(req *http.Request, cred clienttoken.Credential) *http.Request
 // what makes "re-mint, then retry once" actually retry with the new credential.
 // (In token state the header is per-request, so this is merely harmless.)
 func (c *APIClient) closeIdleConnections() {
-	if t, ok := c.transport.(*http.Transport); ok {
+	if t, ok := c.transport.(interface{ CloseIdleConnections() }); ok {
+		t.CloseIdleConnections()
+	}
+}
+
+// refusalGate is the backstop of the refused-entry rule (plan 037 §3.1): every
+// request path checks the credential source's refusal before it sends (see
+// sendWithReauth), and this RoundTripper checks it again on every round trip,
+// so a path that bypassed that check, or a refusal recorded after that check
+// and before this one, still never dials a refused entry's server. Every
+// APIClient has one; next is the pinned transport, or the default transport
+// for a plain-HTTP client.
+//
+// THE CONTRACT IS PER ATTEMPT, and no stronger: an attempt that passed this
+// check before the refusal was recorded may complete (its dial, or its send
+// over a pooled connection already authenticated); no attempt starts after
+// the refusal is recorded. Nothing here coordinates admission with a
+// concurrent refusal.
+type refusalGate struct {
+	src  *clienttoken.Source
+	next http.RoundTripper
+}
+
+func (g *refusalGate) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := g.src.Err(); err != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, err
+	}
+	return g.next.RoundTrip(req)
+}
+
+// CloseIdleConnections forwards to the pinned transport (see
+// APIClient.closeIdleConnections). The process-wide default transport of an
+// unpinned client is not this client's own pool, so it is left alone, as it
+// was before the gate wrapped it.
+func (g *refusalGate) CloseIdleConnections() {
+	if g.next == http.DefaultTransport {
+		return
+	}
+	if t, ok := g.next.(interface{ CloseIdleConnections() }); ok {
 		t.CloseIdleConnections()
 	}
 }
@@ -108,8 +165,13 @@ func (c *APIClient) CredentialSource() *clienttoken.Source {
 // so every request path — including the long-running, ad-hoc clients used for
 // SSE and timeouts — verifies the pinned TLS cert. timeout 0 means no
 // client-level timeout (the caller bounds it with a context).
+//
+// It is the one place an APIClient's HTTP clients are made, and none of them
+// follows a redirect (servertls.RefuseRedirects): a 3xx is the answer, a
+// non-success status the request path reports, and the request's credential
+// never reaches the Location it names.
 func (c *APIClient) newHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{Timeout: timeout, Transport: c.transport}
+	return &http.Client{Timeout: timeout, Transport: c.transport, CheckRedirect: servertls.RefuseRedirects}
 }
 
 // NewAPIClient creates a plain-HTTP API client for the given host and port
@@ -131,16 +193,25 @@ func newAPIClient(baseURL, token, tlsFingerprint string, createTimeout time.Dura
 // newAPIClientWithSource is the real constructor: it builds the pinned
 // transport around src (via servertls, so the CLI, the Connect tunnel, and the
 // startup probe all verify identically) so the TLS stack pulls the current
-// client certificate from it per handshake. An empty fingerprint yields a nil
-// transport — the plain-HTTP path.
+// client certificate from it per handshake. An empty fingerprint yields no
+// pinned transport — the plain-HTTP path, on the default transport.
+//
+// Every client's transport, pinned or not, is the refusal gate (refusalGate):
+// a source can become refused at any time (a refresh refused mid-command), and
+// a path that bypasses sendWithReauth must still never dial for it.
 //
 // Order matters here. The source is created BEFORE the transport and never
 // swapped afterwards, so the GetClientCertificate closure has a stable target
 // and no request can observe a half-installed credential.
 func newAPIClientWithSource(baseURL, tlsFingerprint string, src *clienttoken.Source, createTimeout time.Duration) *APIClient {
+	next := http.DefaultTransport
+	if pinned := servertls.PinnedTransport(tlsFingerprint, src.CertificateFor); pinned != nil {
+		next = pinned
+	}
+	transport := &refusalGate{src: src, next: next}
 	c := &APIClient{
 		baseURL:       strings.TrimRight(baseURL, "/"),
-		transport:     servertls.PinnedTransport(tlsFingerprint, src.CertificateFor),
+		transport:     transport,
 		createTimeout: createTimeout,
 		tokens:        src,
 	}
@@ -165,7 +236,11 @@ func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duratio
 	case matches > 1:
 		reason = "multiple configured server aliases match this endpoint"
 	}
-	return newAPIClientFromEntry(entry, name, reason, createTimeout)
+	display := name
+	if display == "" {
+		display = entry.Host
+	}
+	return newAPIClientFromEntry(entry, name, display, reason, createTimeout)
 }
 
 // NewAPIClientFromNamedEntry creates an API client for the named config entry.
@@ -179,34 +254,84 @@ func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duratio
 // mint reports the persistence skip under -v.
 func NewAPIClientFromNamedEntry(name string, entry *config.ServerEntry, createTimeout time.Duration) *APIClient {
 	persistName, reason := verifiedServerName(name, entry)
-	return newAPIClientFromEntry(entry, persistName, reason, createTimeout)
+	display := name
+	if display == "" {
+		display = entry.Host
+	}
+	return newAPIClientFromEntry(entry, persistName, display, reason, createTimeout)
 }
 
-func newAPIClientFromEntry(entry *config.ServerEntry, persistName, unpersistedReason string, createTimeout time.Duration) *APIClient {
-	initial, refreshable := entryCredential(entry, persistName)
+// newAPIClientFromEntry builds the client for an entry. displayName is the
+// entry's name as the user knows it, for the messages that name it (it may be
+// set when persistName is not: a name that no longer verifies).
+//
+// An entry whose stored certificate is refused (config.LoadEntryCertificate)
+// gets a REFUSED client: its credential source is terminal, every request
+// returns the refusal before anything is dialled, and nothing runs ssh. The
+// ways back (`shed server update <name> --refetch`, `shed server remove`)
+// build no client from the entry.
+//
+// THE USER IS READ FROM THE ROW ON DISK, here, the one point every client is
+// built through: a caller's copy of the entry can be older than the row (a
+// lookup that built a client which enrolled the entry's first user hands back
+// the copy it started from, and console, exec, attach, sync and tunnels then
+// build another client from it). Held to that stale user, the new client would
+// refuse the very certificate the first one just recorded.
+func newAPIClientFromEntry(entry *config.ServerEntry, persistName, displayName, unpersistedReason string, createTimeout time.Duration) *APIClient {
+	current := *entry
+	current.User = recordedUser(persistName, entry)
+	entry = &current
+	initial, refreshable, refusal := entryCredential(entry, persistName, displayName)
+	if refusal != nil {
+		return newAPIClientWithSource(entry.BaseURL(), entry.TLSCertFingerprint, clienttoken.Refused(refusal), createTimeout)
+	}
 	if !refreshable {
 		// Static/legacy token or open server — no refresh wiring, exactly as
 		// before client certificates existed.
 		return newAPIClient(entry.BaseURL(), entry.ControlToken, entry.TLSCertFingerprint, createTimeout)
 	}
-	refresh := controlCredentialRefresh(*entry, persistName)
+	held := &heldUser{name: entry.User}
+	refresh := controlCredentialRefreshHeld(*entry, persistName, persistName, displayName, held)
 	if unpersistedReason != "" {
 		refresh = observableMintOnlyRefresh(entry.Host, unpersistedReason, refresh)
 	}
 	src := clienttoken.New(initial, refresh)
 	c := newAPIClientWithSource(entry.BaseURL(), entry.TLSCertFingerprint, src, createTimeout)
+	c.held = held
 	// Proactively re-mint a near-expiry credential so a request never races
 	// expiry. A mint failure here is non-fatal (EnsureFresh keeps the stale
 	// credential); the reactive retry surfaces any error on the next request.
+	// A refusal from this mint ends the client unless it holds a certificate
+	// still valid for the entry's user, which it keeps using without minting
+	// again (clienttoken.Source.EnsureFreshErr).
 	src.EnsureFresh()
 	return c
+}
+
+// recordedUser is the user the named row records on disk now, read under the
+// config lock (one small file read): the row's user when it still names
+// entry's endpoint, else entry.User (no name, the row is gone or repointed, or
+// the file cannot be read — a persisting refresh then finds that under its own
+// lock and fails closed).
+func recordedUser(name string, entry *config.ServerEntry) string {
+	user := entry.User
+	if name == "" {
+		return user
+	}
+	_ = readClientConfigLocked(func(c *config.ClientConfig) error {
+		if stored, ok := c.Servers[name]; ok && sameServerEndpoint(stored, *entry) {
+			user = stored.User
+		}
+		return nil
+	})
+	return user
 }
 
 // observableMintOnlyRefresh makes an accidental persistence skip visible while
 // preserving the best-effort contract: the freshly minted credential is still
 // returned and the command still succeeds. The tunnel daemon deliberately uses
-// controlCredentialRefresh(..., "") directly, without this wrapper, because
-// its mint-only policy is intentional rather than a name-resolution failure.
+// controlCredentialMintOnly directly, without this wrapper, because its
+// mint-only policy is intentional rather than a name-resolution failure.
 func observableMintOnlyRefresh(host, reason string, refresh func() (clienttoken.Credential, error)) func() (clienttoken.Credential, error) {
 	return func() (clienttoken.Credential, error) {
 		cred, err := refresh()
@@ -238,39 +363,73 @@ func observableMintOnlyRefresh(host, reason string, refresh func() (clienttoken.
 // SSH round-trip. Read as "open" the secure case fails forever — the client
 // holds no credential to be rejected, so the reactive re-mint has nothing to
 // fire on, and every invocation dies at the same TLS `certificate required`.
-func entryCredential(entry *config.ServerEntry, name string) (cred clienttoken.Credential, refreshable bool) {
+//
+// The one stored state that is NOT recoverable is a certificate whose user the
+// entry may not use (config.LoadEntryCertificate): it names no user, or a user
+// the entry does not record. That returns refusal, and the caller builds a
+// refused client that sends nothing. So does an identity_file that cannot be
+// used when the stored pair is checked against it (its typed
+// *config.IdentityFileError; when the entry holds no certificate, the
+// enrolment EnsureFresh runs before the first request meets the same refusal
+// and ends the client), and a stored control token on an entry with an
+// identity_file
+// (config.RefusedStoredTokenForKey: a token names no key, so it is never
+// presented for such an entry). A stored certificate made for another SSH key
+// than the entry's identity_file is the recoverable case: it is not presented
+// and the entry enrols again with its identity file.
+func entryCredential(entry *config.ServerEntry, name, displayName string) (cred clienttoken.Credential, refreshable bool, refusal error) {
 	if entry.IsMTLS() {
 		cert, err := loadClientCert(entry, name)
+		if r, ok := config.AsEntryRefused(err); ok {
+			r.Entry = displayName
+			return clienttoken.Credential{}, false, r
+		}
+		if ie, ok := config.NameIdentityFileError(displayName, err); ok {
+			// The entry's identity_file cannot be used now, so neither its
+			// stored certificate (whose key cannot be checked) nor an enrolment
+			// (which would fail the same way) may be: fail closed, nothing is
+			// presented and nothing is dialled.
+			return clienttoken.Credential{}, false, ie
+		}
 		if err != nil && verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "warning: could not load client certificate for %s (re-enrolling): %v\n", entry.Host, err)
 		}
 		if cert != nil {
-			return clienttoken.MTLSCredential(cert, entry.ClientCertExpiresAt), true
+			return clienttoken.MTLSCredential(cert, entry.ClientCertExpiresAt), true, nil
 		}
 		// No usable certificate — refreshable, holding nothing. EnsureFresh
 		// enrolls on that (Credential.Usable), so no fake expiry is needed.
-		return clienttoken.Credential{Mode: clienttoken.ModeMTLS}, true
+		// An identity_file that cannot be used fails that enrolment with its
+		// *config.IdentityFileError, a refusal, which ends the source before
+		// any request: nothing is sent without a certificate first.
+		return clienttoken.Credential{Mode: clienttoken.ModeMTLS}, true, nil
+	}
+	if entry.IdentityFile != "" && entry.ControlToken != "" {
+		// A control token names no SSH key, so an entry held to its identity
+		// file never presents one, stored or newly issued (plan 037 P-a): the
+		// entry is refused and nothing is dialled with the token.
+		return clienttoken.Credential{}, false, config.StoredTokenRefusal(displayName, entry)
 	}
 	if entry.ControlTokenExpiresAt.IsZero() {
 		// Either an open server / legacy static token (static, as always), or a
 		// secure entry stripped of its credential (enroll — holding nothing, so
 		// EnsureFresh mints before the first request).
-		return clienttoken.Credential{}, entry.NeedsEnrollment()
+		return clienttoken.Credential{}, entry.NeedsEnrollment(), nil
 	}
-	return clienttoken.TokenCredential(entry.ControlToken, entry.ControlTokenExpiresAt), true
+	return clienttoken.TokenCredential(entry.ControlToken, entry.ControlTokenExpiresAt), true, nil
 }
 
 // loadClientCert reads the entry's client certificate + key off disk, under the
 // named server's credential lock so a concurrent rotation is never observed
-// half-committed. A missing path or an unreadable/mismatched pair returns
-// (nil, err) — see entryCredential for why that is recoverable rather than
-// fatal. name may be "" (an ambiguous or one-off entry), which loads unlocked:
-// nothing writes that entry either, so there is nothing to serialize against.
+// half-committed, and checks the user it names against the entry's
+// (config.LoadEntryCertificate). A missing path or an unreadable/mismatched
+// pair returns (nil, err) — see entryCredential for why that is recoverable
+// rather than fatal; a certificate for a user the entry may not use returns a
+// *config.EntryRefusedError, which is not. name may be "" (an ambiguous or
+// one-off entry), which loads unlocked: nothing writes that entry either, so
+// there is nothing to serialize against.
 func loadClientCert(entry *config.ServerEntry, name string) (*tls.Certificate, error) {
-	if entry.ClientCertFile == "" || entry.ClientKeyFile == "" {
-		return nil, errors.New("no client certificate on file")
-	}
-	return config.LoadClientCredentials(name, entry.ClientCertFile, entry.ClientKeyFile)
+	return config.LoadEntryCertificate(name, entry)
 }
 
 // controlCredentialRefresh returns a refresh callback that mints a control
@@ -290,14 +449,62 @@ func loadClientCert(entry *config.ServerEntry, name string) (*tls.Certificate, e
 // persist time — that persistName still names THIS endpoint. Host and ssh port
 // alone would not be enough for that check, and by the time a mint completes
 // the name may have been removed or repointed by another process.
-func controlCredentialRefresh(endpoint config.ServerEntry, persistName string) func() (clienttoken.Credential, error) {
+//
+// THE HELD USER (plan 037 §3.1). An issued certificate is adopted only when it
+// names the user this entry is held to, or the implicit user, or the entry is
+// held to no one yet; a certificate that names no user, or whose user cannot
+// be read (including one the SDK's bootstrap rejects as unusable), is refused
+// too. A refusal writes nothing and adopts nothing, and is returned as a
+// *config.EntryRefusedError, which ends the client's credential source
+// (clienttoken.Refusal) unless it may keep a certificate it holds. A
+// persisting refresh decides against the row on disk, under the locks
+// (persistMTLSCredential). displayName names the entry in those messages.
+//
+// With persistName "" the refresh writes nothing (mint-only), and decides as
+// adoptMTLSCredential says: against the entry's row when it has a name
+// (controlCredentialMintOnly, the tunnel daemon), else in memory.
+func controlCredentialRefresh(endpoint config.ServerEntry, persistName, displayName string) func() (clienttoken.Credential, error) {
+	return controlCredentialRefreshHeld(endpoint, persistName, persistName, displayName, &heldUser{name: endpoint.User})
+}
+
+// controlCredentialMintOnly is the tunnel daemon's refresh: mint-only (it
+// never writes the entry), and decided at every mint against the entry's row
+// named rowName, read under the config lock (adoptMTLSCredential).
+func controlCredentialMintOnly(endpoint config.ServerEntry, rowName string) func() (clienttoken.Credential, error) {
+	return controlCredentialRefreshHeld(endpoint, "", rowName, rowName, &heldUser{name: endpoint.User})
+}
+
+// controlCredentialRefreshHeld is controlCredentialRefresh with the held user
+// supplied, so the client that owns the closure can read whom it is held to
+// at any moment (APIClient.heldUserName: the tunnel daemon's hand-off).
+// rowName is the entry whose row decides the held user: persistName for a
+// persisting refresh, the entry's name for a named mint-only one, "" for none.
+func controlCredentialRefreshHeld(endpoint config.ServerEntry, persistName, rowName, displayName string, held *heldUser) func() (clienttoken.Credential, error) {
 	return func() (clienttoken.Credential, error) {
-		res, err := bootstrapCredentialFn(endpoint.Host, endpoint.SSHPort, "control", "cli")
+		// The entry's identity_file, when set, is the key ssh offers first; a
+		// value or file that cannot be used fails here, before ssh is spawned,
+		// and entryKey is its public key, which the issued certificate must
+		// have been made for.
+		res, entryKey, err := bootstrapEntryCredential(displayName, endpoint.Host, endpoint.SSHPort, endpoint.IdentityFile)
+		var unusable *sdkbootstrap.UnusableCertificateError
+		if errors.As(err, &unusable) {
+			// The server answered with a certificate the SDK cannot use (none,
+			// not PEM, DER that does not parse, another key's certificate): an
+			// unreadable issuance, decided like any other, under the same rule.
+			return adoptMTLSCredential(sdk.Credential{}, unusable, entryKey, persistName, rowName, displayName, endpoint, held)
+		}
 		if err != nil {
 			return clienttoken.Credential{}, err
 		}
 		if res.Mode() == sdk.AuthModeMTLS {
-			return adoptMTLSCredential(res, persistName, endpoint)
+			return adoptMTLSCredential(res, nil, entryKey, persistName, rowName, displayName, endpoint, held)
+		}
+		if endpoint.IdentityFile != "" {
+			// A control token says nothing of the key it was issued for, so an
+			// entry held to its identity file never uses one (plan 037 P-a).
+			// Nothing is written or adopted.
+			return clienttoken.Credential{}, &config.EntryRefusedError{Entry: displayName,
+				Kind: config.RefusedIssuedTokenForKey, IdentityFile: endpoint.IdentityFile}
 		}
 		if persistName != "" {
 			// Best-effort: a Save failure never wastes the mint or fails the
@@ -312,20 +519,115 @@ func controlCredentialRefresh(endpoint config.ServerEntry, persistName string) f
 // credential and, when the entry is unambiguous, persists the pair to the creds
 // dir + the config entry.
 //
-// A persist failure is NOT fatal to the mint. The in-memory certificate is
-// valid and the current command should proceed on it; the next process simply
-// re-enrolls. That mirrors the token path exactly — the alternative (failing the
-// user's command because a file write failed) trades a working request for a
-// tidy disk.
-func adoptMTLSCredential(res sdk.Credential, persistName string, endpoint config.ServerEntry) (clienttoken.Credential, error) {
-	cert, err := tls.X509KeyPair([]byte(res.Bundle.ClientCert), res.KeyPEM)
-	if err != nil {
-		return clienttoken.Credential{}, fmt.Errorf("assemble issued client certificate: %w", err)
+// A persisting refresh (persistName set) decides everything in ONE transaction
+// against the row on disk, under the server's credential lock
+// (persistMTLSCredential): every refusal included, so a refusal that lets the
+// client keep the certificate it holds is only ever returned after a positive
+// check, under that lock, that the row still records the user it holds. A
+// certificate that would record the entry's first user is used only once the
+// row records it. A persist failure is a warning only when the row already
+// records the certificate's user (a renewal): the in-memory certificate is used
+// and the next process re-enrols.
+//
+// A mint-only refresh (persistName "") writes nothing. When it has the entry's
+// name (rowName, the tunnel daemon) it reads the row under the config lock at
+// every mint and decides exactly as a persisting refresh does
+// (decideAgainstRow): a row that no longer names the endpoint or cannot be
+// read, or that records another user than the one held, ends the source; a
+// certificate for a user the row does not record is refused. It never
+// establishes a first named user in memory: a named certificate for an entry
+// whose row records none is refused (config.RefusedMintOnlyUnrecorded, whose
+// remedy is a refetch and a restart). Only a source with no entry name (an
+// ambiguous alias) decides in memory, against the user this closure is held
+// to, keeping the first named user it adopts.
+//
+// unusable, when set, is the SDK's rejection of the issued certificate
+// (sdkbootstrap.UnusableCertificateError): res is then empty, and the
+// issuance is refused as unreadable through the same decision.
+//
+// entryKey is the fingerprint of endpoint's identity_file, learned before the
+// bootstrap ran ("" without one). With an identity file, a certificate made
+// for any other SSH key (config.IssuedCertificateKey) is refused through the
+// same decision as every other refused issuance: nothing is adopted or
+// written, and the client keeps only a certificate it already holds for the
+// user the row still records (plan 037 P-a).
+func adoptMTLSCredential(res sdk.Credential, unusable error, entryKey, persistName, rowName, displayName string,
+	endpoint config.ServerEntry, held *heldUser) (clienttoken.Credential, error) {
+	var (
+		user     string
+		implicit bool
+		issued   *config.EntryRefusedError
+	)
+	if unusable != nil {
+		issued = &config.EntryRefusedError{Entry: displayName, Kind: config.RefusedIssuedUnreadable, Cause: unusable}
+	} else {
+		user, implicit, issued = config.IssuedCertificateUser(displayName, []byte(res.Bundle.ClientCert))
+		if issued == nil {
+			issued = config.IssuedCertificateKey(displayName, endpoint.Host, endpoint.IdentityFile, entryKey,
+				[]byte(res.Bundle.ClientCert))
+		}
 	}
-	if persistName != "" {
-		persistMTLSCredential(persistName, endpoint, res)
+	var cert tls.Certificate
+	if issued == nil {
+		var err error
+		if cert, err = tls.X509KeyPair([]byte(res.Bundle.ClientCert), res.KeyPEM); err != nil {
+			return clienttoken.Credential{}, fmt.Errorf("assemble issued client certificate: %w", err)
+		}
+	}
+	// Held across the whole adoption, so two refreshes in one process cannot
+	// both adopt from an unheld entry with different users.
+	held.mu.Lock()
+	defer held.mu.Unlock()
+	switch {
+	case persistName != "":
+		recorded, err := persistMTLSCredential(persistName, endpoint, res, entryKey, user, implicit, issued, held.name)
+		if err != nil {
+			return clienttoken.Credential{}, err
+		}
+		held.name = recorded
+	case rowName != "":
+		recorded, err := decideMintOnly(rowName, endpoint, entryKey, user, implicit, issued, held.name)
+		if err != nil {
+			return clienttoken.Credential{}, err
+		}
+		held.name = recorded
+	default:
+		// No row to read: the key is learned again from the entry's
+		// identity_file now, and must still be the one the enrolment used.
+		if err := enrolledIdentityHolds(displayName, endpoint, endpoint, entryKey); err != nil {
+			return clienttoken.Credential{}, err
+		}
+		if issued != nil {
+			return clienttoken.Credential{}, issued
+		}
+		if !config.HeldUserAccepts(held.name, user, implicit) {
+			return clienttoken.Credential{}, &config.EntryRefusedError{
+				Entry: displayName, Kind: config.RefusedIssuedUserChange, CertUser: user, EntryUser: held.name}
+		}
+		if !implicit && held.name == "" {
+			held.name = user
+		}
+	}
+	if implicit && held.name != "" && verboseLevel > 0 {
+		fmt.Fprintf(os.Stderr, "note: %s issued a certificate for its only user; this entry stays held to %q\n",
+			displayName, held.name)
 	}
 	return clienttoken.MTLSCredential(&cert, res.Bundle.ExpiresAt), nil
+}
+
+// heldUser is the user one refresh closure is held to: the entry's `user` when
+// the closure was built, then the first named user it adopts (or, for a
+// persisting refresh, the user the row on disk records once it has decided).
+type heldUser struct {
+	mu   sync.Mutex
+	name string
+}
+
+// current returns the user held now.
+func (h *heldUser) current() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.name
 }
 
 // configMu serializes access to the shared clientConfig global WITHIN this
@@ -451,6 +753,7 @@ func persistTokenCredential(name string, endpoint config.ServerEntry, token stri
 		e.ControlTokenExpiresAt = expiresAt
 		e.ClientCertFile, e.ClientKeyFile = "", ""
 		e.ClientCertExpiresAt = time.Time{}
+		// e.User is kept: the held user survives the flip (ServerEntry.User).
 	})
 	if !hadCert {
 		return
@@ -475,47 +778,381 @@ func persistTokenCredential(name string, endpoint config.ServerEntry, token stri
 // dead weight the mtls middleware would never read, and a secret with no
 // remaining purpose).
 //
-// Same best-effort contract as persistTokenCredential: every failure is a
-// warning, because the credential is already usable in memory.
+// It is ONE TRANSACTION under the server's credential lock (plan 037 §3.1),
+// with the config lock nested inside it (the documented order):
 //
-// LOCK ORDERING — same invariant as persistTokenCredential, and the reason the
-// existence re-check below is not paranoia. WriteClientCredentials takes the
-// server's credential lock internally and releases it before returning (flock
-// is not re-entrant, so this call cannot be made under our own hold of it), so
-// there IS a window between the write and the config update in which a
-// concurrent mtls→token persist can delete the pair. Taking the lock after the
-// write and re-checking the files under it closes that window: from here to the
-// end of the config update, nothing can remove them.
-func persistMTLSCredential(name string, endpoint config.ServerEntry, res sdk.Credential) {
-	certPath, keyPath, err := config.WriteClientCredentials(name, []byte(res.Bundle.ClientCert), res.KeyPEM)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not store client certificate for %q: %v\n", name, err)
-		return
-	}
-
+//  1. take the credential lock;
+//  2. read the row on disk, under the config lock, and decide: it must still
+//     name this endpoint, it must still record the user the calling closure
+//     holds (held), and only then is the issued certificate judged: issued
+//     (a certificate that names no user, or whose user cannot be read) is
+//     refused, and the row's `user` must accept the certificate (empty, the
+//     same name, or an implicit certificate);
+//  3. on a refusal, return it with nothing written;
+//  4. write the files with the lock-held writer;
+//  5. save the row (recording `user` when it was empty and the certificate is
+//     named), re-checking the same condition under the config lock; a failed
+//     save puts the previous files back;
+//  6. release.
+//
+// Two processes that both start from `user: ""` and are issued different
+// named users therefore cannot both win: the second finds the first's `user`
+// at step 2 and is refused with nothing written.
+//
+// THE RULE IS ABOUT WHAT A PROCESS ADOPTS, not a re-read of the row before
+// every request. A process never adopts a certificate for a user other than
+// the one its entry's row records when checked under the lock (here, at
+// client construction, and at every mint of a named tunnel daemon), or the
+// implicit user of a server with no user list. A certificate it already holds
+// stays in use until its next refresh or until the certificate ends,
+// whichever is first, even if another process meanwhile changed the entry
+// with --allow-user-change; at its next refresh it re-reads the row and stops
+// if the row names another user (config.RefusedEntryUserChanged). A binding
+// (the row's `user`) is established or changed only by a write that read the
+// row under the server's credential lock (this transaction for a first user,
+// `--refetch --allow-user-change` for a change), and a certificate that
+// establishes one is used only once the row recording it is saved: if the
+// read of the previous files, the file write or the save fails, the refresh
+// fails (config.RefusedUserNotRecorded) and nothing is adopted. A certificate
+// already held may be kept after a refused re-enrolment only when, under that
+// lock, the row still positively records the user it is for (an unreadable
+// row ends the client with config.RefusedEntryUnreadable), and only until its
+// own NotAfter.
+//
+// WHY THERE IS NO JOURNAL. The certificate pair and
+// config.yaml are separate files, and nothing here commits them atomically
+// together: a crash, or a kill, between the file write (step 4) and the row
+// save (step 5) leaves the new pair beside the old row. That is accepted, on
+// one condition the readers enforce: no state this transaction can leave on
+// disk is ever used to send a request as a user other than the one the row
+// records, and none is silently adopted. Every reader of a pair checks it
+// against the row it holds (config.LoadEntryCertificate: the CLI with and
+// without a name, the roost provider's inventory): a pair whose halves do not
+// match is not presented (the entry re-enrols under this same rule), and a
+// certificate for a user the row does not record refuses the entry, sending
+// nothing, until `shed server update <name> --refetch`. A journal would only
+// turn that refusal into a silent repair, which is the one outcome the held
+// user exists to prevent.
+//
+// issued is the refusal config.IssuedCertificateUser gave the certificate (it
+// names no user, or its user cannot be read), or nil; it is returned only
+// after step 2's check of held, so it never lets a client keep a certificate
+// for a user the row no longer records.
+//
+// It returns recorded, the user the row records once this transaction decided
+// against it. err is a refusal (*config.EntryRefusedError):
+// RefusedEntryUnreadable when the lock or the read of the row failed (at the
+// first check or at the save's re-check), or the row no longer names this
+// endpoint (fail closed: nothing is kept written, and the client ends);
+// RefusedRestoreFailed when a failed write or save could not put the previous
+// files back; RefusedUserNotRecorded when the certificate would record the
+// entry's first user and the snapshot read, the file write or the save
+// failed. A refusal from the save's re-check is returned as it is, never
+// turned into a warning. Only a failure to WRITE a renewal for the user the
+// row already records (the snapshot read, the file write, or the config file
+// write) is a warning, the persistTokenCredential contract: the credential is
+// usable in memory and the next process re-enrolls.
+func persistMTLSCredential(name string, endpoint config.ServerEntry, res sdk.Credential, entryKey, user string, implicit bool,
+	issued *config.EntryRefusedError, held string) (recorded string, err error) {
 	unlockCreds, err := config.LockServerCredentials(name)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not lock the credential store for %q: %v\n", name, err)
-		return
+		return "", entryUnreadable(name, fmt.Errorf("lock its credential files: %w", err))
 	}
 	defer unlockCreds()
 
-	for _, p := range []string{certPath, keyPath} {
-		if _, err := os.Stat(p); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: not recording a client certificate for %q: "+
-				"%s went away before it could be persisted (a concurrent switch back to token mode)\n", name, p)
-			return
+	// establishes: the row records no user and the certificate names one, so
+	// the write records the entry's first user and may not be best effort.
+	var establishes bool
+	// checked: the save's re-check ran, so a save error after it is a failure
+	// to write the file, not to read or check the row.
+	var checked bool
+	decide := func(c *config.ClientConfig) error {
+		checked = true
+		var err error
+		recorded, establishes, err = decideAgainstRow(c, name, endpoint, entryKey, user, implicit, issued, held)
+		return err
+	}
+	if err := readClientConfigLocked(decide); err != nil {
+		if clienttoken.IsRefusal(err) {
+			return "", err
 		}
+		return "", entryUnreadable(name, err)
+	}
+	notRecorded := func(cause error) error {
+		return &config.EntryRefusedError{Entry: name, Kind: config.RefusedUserNotRecorded, CertUser: user, Cause: cause}
 	}
 
-	_ = saveServerEntry(name, "client certificate", endpoint, func(e *config.ServerEntry) {
-		e.AuthMode = config.AuthModeMTLS
-		e.ClientCertFile = certPath
-		e.ClientKeyFile = keyPath
-		e.ClientCertExpiresAt = res.Bundle.ExpiresAt
-		e.ControlToken = ""
-		e.ControlTokenExpiresAt = time.Time{}
+	prev, err := storedPairOf(name)
+	if err != nil {
+		// Nothing written: a pair that could not be put back must not be
+		// replaced.
+		if establishes {
+			return "", notRecorded(err)
+		}
+		fmt.Fprintf(os.Stderr, "warning: not storing the client certificate for %q: %v\n", name, err)
+		return recorded, nil
+	}
+	certPath, keyPath, err := writeCredentialsHeldFn(name, []byte(res.Bundle.ClientCert), res.KeyPEM)
+	if err != nil {
+		if rerr := prev.restoreHeld(name); rerr != nil {
+			return "", restoreFailed(name, rerr)
+		}
+		if establishes {
+			return "", notRecorded(err)
+		}
+		fmt.Fprintf(os.Stderr, "warning: could not store client certificate for %q: %v\n", name, err)
+		return recorded, nil
+	}
+
+	checked = false
+	err = updateClientConfigChecked(decide, func(c *config.ClientConfig) {
+		stored, ok := c.Servers[name]
+		if !ok {
+			return // in-memory only; see saveServerEntry
+		}
+		stored.AuthMode = config.AuthModeMTLS
+		stored.ClientCertFile = certPath
+		stored.ClientKeyFile = keyPath
+		stored.ClientCertExpiresAt = res.Bundle.ExpiresAt
+		stored.ControlToken = ""
+		stored.ControlTokenExpiresAt = time.Time{}
+		if !implicit && stored.User == "" {
+			stored.User = user
+		}
+		c.Servers[name] = stored
 	})
+	if err != nil {
+		if rerr := prev.restoreHeld(name); rerr != nil {
+			return "", restoreFailed(name, rerr)
+		}
+		if clienttoken.IsRefusal(err) {
+			// The save's re-check refused (the row was removed, repointed or
+			// changed its user or its identity since the first check):
+			// returned unchanged.
+			return "", err
+		}
+		if !checked {
+			// The row could not be locked or read for the re-check: nothing
+			// positively says it still records the user held.
+			return "", entryUnreadable(name, err)
+		}
+		if establishes {
+			return "", notRecorded(err)
+		}
+		fmt.Fprintf(os.Stderr, "warning: could not persist client certificate for %q: %v\n", name, err)
+	}
+	return recorded, nil
+}
+
+// entryUnreadable is the refusal of a transaction that could not read the
+// entry's row under the lock (cause: the lock, the read, or a row that no
+// longer names the endpoint): it cannot positively check the user held, so it
+// fails closed and withdraws what the process holds.
+func entryUnreadable(name string, cause error) error {
+	return &config.EntryRefusedError{Entry: name, Kind: config.RefusedEntryUnreadable, Cause: cause}
+}
+
+// decideAgainstRow is the one decision every certificate adoption for a named
+// entry makes against the entry's row as it is on disk (c, read under the
+// config lock): the persisting refresh (twice: before writing and at the
+// save) and the named mint-only refresh (at every mint).
+//
+// The row must still name this endpoint (else RefusedEntryUnreadable), still
+// hold the identity the enrolment was made with (enrolledIdentityHolds: the
+// same identity_file, and the same key learned from it now as entryKey, the
+// key learned before the bootstrap; else RefusedEntryUnreadable, or the
+// file's *config.IdentityFileError) and still record the user the caller
+// holds (held; else RefusedEntryUserChanged). Each of those withdraws what
+// the caller holds too. Only then is the issued certificate judged: issued (it
+// names no user, or its user cannot be read) is returned, and the row's `user`
+// must accept the certificate (HeldUserAccepts; else
+// RefusedIssuedUserChange). recorded is the user the row records once this
+// decision is made; establishes says the certificate would record the entry's
+// first named user (the row records none and the certificate is named).
+func decideAgainstRow(c *config.ClientConfig, name string, endpoint config.ServerEntry, entryKey, user string, implicit bool,
+	issued *config.EntryRefusedError, held string) (recorded string, establishes bool, err error) {
+	if err := checkStillNames(c, name, endpoint); err != nil {
+		return "", false, entryUnreadable(name, err)
+	}
+	stored := c.Servers[name]
+	if err := enrolledIdentityHolds(name, stored, endpoint, entryKey); err != nil {
+		return "", false, err
+	}
+	if held != "" && stored.User != held {
+		return "", false, &config.EntryRefusedError{Entry: name, Kind: config.RefusedEntryUserChanged,
+			CertUser: held, EntryUser: stored.User}
+	}
+	// The row still records the user held: only now may a refusal of the
+	// issued certificate let the client keep what it holds.
+	if issued != nil {
+		return "", false, issued
+	}
+	if !config.HeldUserAccepts(stored.User, user, implicit) {
+		return "", false, &config.EntryRefusedError{Entry: name, Kind: config.RefusedIssuedUserChange,
+			CertUser: user, EntryUser: stored.User}
+	}
+	if stored.User == "" && !implicit {
+		return user, true, nil
+	}
+	return stored.User, false, nil
+}
+
+// enrolledIdentityHolds checks, at the moment an enrolment is decided, that the
+// entry still holds the identity the enrolment was made with: stored (the row
+// now, or for a source with no row, endpoint itself) has the same
+// identity_file as endpoint (sameIdentityFile, the comparison a --refetch
+// makes), and the public key learned from that file NOW is entryKey, the one
+// learned before the bootstrap ran and that the issued certificate was checked
+// against. Another process that set another key, or a key replaced at the
+// same path (or a retargeted symlink), fails it: nothing is written or
+// adopted, no user is recorded, and the refusal withdraws what the caller
+// holds (RefusedEntryUnreadable, the refusal of a row that no longer matches
+// what the process started with; or the file's *config.IdentityFileError when
+// its key cannot be learned now, so it cannot be shown to be the same). An
+// entry with no identity_file on either side reads no file.
+func enrolledIdentityHolds(name string, stored, endpoint config.ServerEntry, entryKey string) error {
+	if !sameIdentityFile(stored, endpoint) {
+		return entryUnreadable(name, errors.New("its identity_file changed while this command ran"))
+	}
+	if endpoint.IdentityFile == "" {
+		return nil
+	}
+	now, err := config.IdentityFileKey(name, stored.IdentityFile)
+	if err != nil {
+		return err
+	}
+	if now != entryKey {
+		return entryUnreadable(name, errors.New("the key in its identity_file changed while this command ran"))
+	}
+	return nil
+}
+
+// decideMintOnly is the named mint-only refresh's decision (the tunnel
+// daemon): decideAgainstRow against the entry's row, read under the config
+// lock at this mint. It writes nothing, so a certificate that would establish
+// the entry's first named user is refused (config.RefusedMintOnlyUnrecorded):
+// a user the row does not record is never adopted, not even in memory.
+func decideMintOnly(name string, endpoint config.ServerEntry, entryKey, user string, implicit bool,
+	issued *config.EntryRefusedError, held string) (string, error) {
+	var (
+		recorded    string
+		establishes bool
+	)
+	err := readClientConfigLocked(func(c *config.ClientConfig) error {
+		var err error
+		recorded, establishes, err = decideAgainstRow(c, name, endpoint, entryKey, user, implicit, issued, held)
+		return err
+	})
+	if err != nil {
+		if clienttoken.IsRefusal(err) {
+			return "", err
+		}
+		return "", entryUnreadable(name, err)
+	}
+	if establishes {
+		return "", &config.EntryRefusedError{Entry: name, Kind: config.RefusedMintOnlyUnrecorded, CertUser: user}
+	}
+	return recorded, nil
+}
+
+// restoreFailed is the error of a transaction whose config save failed and
+// whose previous credential files could not be put back: never only a
+// warning, because the entry's files and its recorded user may now disagree.
+// It is a refusal that withdraws what the process holds.
+func restoreFailed(name string, cause error) error {
+	return &config.EntryRefusedError{Entry: name, Kind: config.RefusedRestoreFailed, Cause: cause}
+}
+
+// writeCredentialsHeldFn and commitStagedHeldFn are the only two writes of a
+// server's credential files inside the CLI's write transaction (the caller
+// holds that server's credential lock); removeCredentialsHeldFn removes them,
+// putBackCredentialFileFn restores one file a failed transaction changed, and
+// readCredentialFileFn reads the pair a transaction may have to put back.
+// Vars so a test can prove a refused transaction writes nothing at all, and
+// can stop or fail a transaction at each step.
+var (
+	writeCredentialsHeldFn  = config.WriteClientCredentialsHeld
+	commitStagedHeldFn      = func(s *config.StagedClientCredentials) error { return s.CommitHeld() }
+	removeCredentialsHeldFn = config.RemoveServerCredentials
+	putBackCredentialFileFn = config.PutBackClientCredentialFile
+	readCredentialFileFn    = os.ReadFile
+)
+
+// readClientConfigLocked runs read against the config on disk under configMu
+// and the config file lock (ClientConfig.ReadLocked). A caller that holds a
+// server's credential lock takes it first.
+func readClientConfigLocked(read func(*config.ClientConfig) error) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	return clientConfig.ReadLocked(read)
+}
+
+// storedPair is a server's credential files as they were before a write, so a
+// write whose config save then failed can put them back.
+type storedPair struct{ cert, key []byte }
+
+// storedPairOf reads the pair at the server's store paths. The caller holds
+// the server's credential lock, so what it reads is one committed pair. A file
+// that does not exist reads as empty; any other read error is returned, and
+// the caller writes nothing (a pair it could not read is a pair it could not
+// put back).
+func storedPairOf(name string) (storedPair, error) {
+	certPath, keyPath := config.ClientCredentialPaths(name)
+	var p storedPair
+	for _, f := range []struct {
+		path string
+		into *[]byte
+	}{{certPath, &p.cert}, {keyPath, &p.key}} {
+		b, err := readCredentialFileFn(f.path)
+		switch {
+		case err == nil:
+			*f.into = b
+		case errors.Is(err, fs.ErrNotExist):
+		default:
+			return storedPair{}, fmt.Errorf("read the current client credentials of %q before replacing them: %w", name, err)
+		}
+	}
+	return p, nil
+}
+
+// restoreHeld puts back, under the credential lock the caller holds, each
+// destination this transaction actually changed, and nothing else. A
+// destination whose bytes are still the previous ones is left alone: a write
+// that failed before either destination changed (no space for its temporary
+// file, say) leaves the previous pair intact, so this verifies that and
+// writes nothing, and the caller treats the failure as the write failure it
+// is, not a failed restoration. When there were no files at all, the
+// directory goes (everything in it is this transaction's). A destination that
+// cannot be read is taken as changed. Its error is never only a warning: the
+// caller fails with restoreFailed.
+func (p storedPair) restoreHeld(name string) error {
+	certPath, keyPath := config.ClientCredentialPaths(name)
+	files := []struct {
+		path, what string
+		was        []byte
+	}{{keyPath, "key", p.key}, {certPath, "certificate", p.cert}}
+	var changed []int
+	for i, f := range files {
+		now, err := readCredentialFileFn(f.path)
+		if errors.Is(err, fs.ErrNotExist) {
+			now, err = nil, nil
+		}
+		if err != nil || !bytes.Equal(now, f.was) {
+			changed = append(changed, i)
+		}
+	}
+	if len(changed) == 0 {
+		return nil // the previous pair is intact: nothing to put back
+	}
+	if len(p.cert) == 0 && len(p.key) == 0 {
+		return removeCredentialsHeldFn(name)
+	}
+	for _, i := range changed {
+		if err := putBackCredentialFileFn(files[i].path, files[i].was); err != nil {
+			return fmt.Errorf("restore the previous client %s: %w", files[i].what, err)
+		}
+	}
+	return nil
 }
 
 // saveServerEntry applies mutate to the named config entry through
@@ -692,6 +1329,11 @@ func (c *APIClient) reauthenticated(resp *http.Response, reqErr error, sentGen u
 	}
 	fresh, rerr := c.tokens.Refresh(sentGen)
 	if rerr != nil {
+		if clienttoken.IsRefusal(rerr) {
+			// A refusal says exactly what is wrong and what fixes it; it is not
+			// a failure to re-authenticate, and it has ended the client.
+			return clienttoken.Credential{}, false, rerr
+		}
 		return clienttoken.Credential{}, false, fmt.Errorf("re-authenticating after %s: %w", authFailureReason(status), rerr)
 	}
 	c.closeIdleConnections()
@@ -726,7 +1368,14 @@ func authFailureReason(status int) string {
 // distinguishes a context deadline, for instance). A failed RE-MINT is returned
 // unwrapped: it already says what went wrong, and describing it as a connection
 // failure would send the reader after the wrong problem.
+//
+// A REFUSED client (its entry may not be used, plan 037 §3.1) returns the
+// refusal, unwrapped, before send runs: no request path makes a connection for
+// it. Every request path of APIClient reaches the server through here.
 func (c *APIClient) sendWithReauth(send func(clienttoken.Credential) (*http.Response, error), wrapErr func(error) error) (*http.Response, error) {
+	if err := c.tokens.Err(); err != nil {
+		return nil, err
+	}
 	cred, sentGen := c.tokens.Current()
 	resp, err := send(cred)
 	fresh, retry, rerr := c.reauthenticated(resp, err, sentGen)
@@ -737,6 +1386,9 @@ func (c *APIClient) sendWithReauth(send func(clienttoken.Credential) (*http.Resp
 		resp, err = send(fresh)
 	}
 	if err != nil {
+		if refused := c.tokens.Err(); refused != nil && clienttoken.IsRefusal(err) {
+			return nil, refused
+		}
 		return nil, wrapErr(err)
 	}
 	return resp, nil
@@ -1011,11 +1663,15 @@ func (c *APIClient) readSSEStream(body io.Reader, onProgress func(backend.Progre
 		case "complete":
 			return true, []byte(data), nil
 		case "error":
+			// Server text, escaped as parseError escapes it (SafeText):
+			// printable text is unchanged, a control character never reaches
+			// the terminal raw.
 			var apiErr config.APIError
 			if uerr := json.Unmarshal([]byte(data), &apiErr); uerr != nil {
-				return true, nil, fmt.Errorf("server error: %s", data)
+				return true, nil, fmt.Errorf("server error: %s", sdkbootstrap.SafeText(data))
 			}
-			return true, nil, fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
+			return true, nil, fmt.Errorf("%s: %s",
+				sdkbootstrap.SafeText(apiErr.Error.Code), sdkbootstrap.SafeText(apiErr.Error.Message))
 		}
 		return false, nil, nil
 	}
@@ -1596,28 +2252,78 @@ func (c *APIClient) SystemPrune(opts SystemPruneOptions) (*config.PruneReport, e
 	return &report, nil
 }
 
-// Ping checks if the server is reachable.
-func (c *APIClient) Ping() bool {
-	resp, err := c.newHTTPClient(2 * time.Second).Get(c.baseURL + "/api/info")
-	if err != nil {
-		return false
+// Server statuses `shed server list` shows.
+const (
+	serverStatusOnline  = "online"
+	serverStatusOffline = "offline"
+	serverStatusRefused = "refused"
+)
+
+// statusProbeTimeout bounds the HTTP leg of Status (the reactive re-mint, an
+// ssh round trip, is not inside it).
+const statusProbeTimeout = 2 * time.Second
+
+// Status probes the server for `shed server list` through the request path
+// (sendWithReauth), so its one reactive re-mint runs as for any request: a
+// certificate the server rejects is re-enrolled, or refused when the new one
+// is for another user. It returns serverStatusRefused, with the refusal, for a
+// refused client (no request is sent) or a refusal from that re-mint;
+// serverStatusOnline on a 200; serverStatusOffline otherwise.
+func (c *APIClient) Status() (string, error) {
+	if err := c.tokens.Err(); err != nil {
+		return serverStatusRefused, err
 	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	client := c.newHTTPClient(statusProbeTimeout)
+	resp, err := c.sendWithReauth(func(cred clienttoken.Credential) (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodGet, c.baseURL+"/api/info", nil)
+		if err != nil {
+			return nil, err
+		}
+		return client.Do(pinCredential(req, cred))
+	}, connectFailure)
+	if err != nil {
+		if clienttoken.IsRefusal(err) {
+			return serverStatusRefused, err
+		}
+		return serverStatusOffline, nil
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return serverStatusOnline, nil
+	}
+	return serverStatusOffline, nil
 }
 
-// parseError extracts the error message from an API error response.
+// apiStatusError is the server's answer with a status the request did not
+// expect (parseError): the server was reached and answered. Status is the
+// HTTP status; the text is what parseError has always returned.
+type apiStatusError struct {
+	Status int
+	text   string
+}
+
+func (e *apiStatusError) Error() string { return e.text }
+
+// parseError extracts the error message from an API error response, as an
+// *apiStatusError carrying the status. What the server sent (the body, or the
+// structured error's code and message) is escaped as its neighbours escape
+// server text (sdkbootstrap.SafeText): printable text is unchanged, and a
+// control character (an ESC sequence, a line break) never reaches the
+// terminal raw.
 func (c *APIClient) parseError(resp *http.Response) error {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("server returned status %d", resp.StatusCode)
+		return &apiStatusError{Status: resp.StatusCode, text: fmt.Sprintf("server returned status %d", resp.StatusCode)}
 	}
 
 	var apiErr config.APIError
 	if err := json.Unmarshal(body, &apiErr); err != nil {
-		// If not a structured error, return the body as-is
-		return fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
+		// If not a structured error, return the body as it is, escaped (the
+		// line break that ends a plain-text body ends the line, as before).
+		return &apiStatusError{Status: resp.StatusCode, text: fmt.Sprintf("server returned status %d: %s",
+			resp.StatusCode, sdkbootstrap.SafeText(strings.TrimRight(string(body), "\r\n")))}
 	}
 
-	return fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
+	return &apiStatusError{Status: resp.StatusCode, text: fmt.Sprintf("%s: %s",
+		sdkbootstrap.SafeText(apiErr.Error.Code), sdkbootstrap.SafeText(apiErr.Error.Message))}
 }

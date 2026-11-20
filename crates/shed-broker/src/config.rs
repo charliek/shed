@@ -1592,9 +1592,23 @@ fn opt_bool(node: Option<&yaml_lite::Node>) -> Option<bool> {
 /// silent block-sequence drop, the flow-map-as-opaque-scalar gap, and the
 /// can't-detect-malformed gap that `config.rs`/`README` tracked as divergences.
 pub(crate) mod yaml_lite {
-    use saphyr_parser::{Event, Parser, ScalarStyle};
+    use saphyr_parser::{Event, Parser, ScalarStyle, Span};
     use std::borrow::Cow;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+
+    /// What [`parse_marked`] notes this reader does not read exactly as YAML means it, by
+    /// key path (map keys from the root; a sequence item is its index).
+    #[derive(Debug, Default)]
+    pub struct Marks {
+        /// The values that carry a tag or an anchor (`!!str null` is the string "null" to
+        /// YAML, not a null), and the scalars written over more than one line.
+        pub values: HashSet<Vec<String>>,
+        /// The mappings with a KEY written with a tag (plan 037 A8). This reader keeps a
+        /// key's text and drops its tag, but a tag can change what the key is to YAML:
+        /// `!!binary aWRlbnRpdHlfZmlsZQ==` is the key `identity_file` to Go, and the
+        /// base64 text here. A reader that must fail closed refuses such a mapping whole.
+        pub tagged_keys: HashSet<Vec<String>>,
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Node {
@@ -1694,23 +1708,60 @@ pub(crate) mod yaml_lite {
     /// duplicate map key — the cases yaml.v3 rejects and the old line/colon reader
     /// silently swallowed. An empty input (no document) yields an empty map.
     pub fn parse(text: &str) -> Result<Node, String> {
+        parse_marked(text).map(|(node, _)| node)
+    }
+
+    /// Refuse a text that holds a raw line break this parser does not break lines on as
+    /// gopkg.in/yaml.v3 does (plan 037 A8, third review): a CR that is not part of a CRLF
+    /// pair, NEL (U+0085), a line separator (U+2028) or a paragraph separator (U+2029).
+    /// yaml.v3 breaks a line at each; saphyr breaks at a CR but not at the other three, so
+    /// a field after one inside an apparent comment would be a field to Go and a comment
+    /// here. A lone CR is refused too, as shed-core's reader refuses it: the shed CLI writes
+    /// none of the four. Their escaped forms inside a double-quoted scalar are text and are
+    /// not affected. The discovery calls this before [`parse_marked`]; the agent's own
+    /// config is not held to it.
+    pub fn refuse_unsupported_line_breaks(text: &str) -> Result<(), String> {
+        let bytes = text.as_bytes();
+        for (i, c) in text.char_indices() {
+            let what = match c {
+                '\r' if bytes.get(i + 1) != Some(&b'\n') => {
+                    "a carriage return (CR) that is not part of a CRLF line ending"
+                }
+                '\u{85}' => "a next-line character (NEL, U+0085)",
+                '\u{2028}' => "a line separator (U+2028)",
+                '\u{2029}' => "a paragraph separator (U+2029)",
+                _ => continue,
+            };
+            return Err(format!(
+                "it holds {what}, which YAML reads as a line break and this reader does not"
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`parse`], and the [`Marks`]: the values a reader that must fail closed (the
+    /// discovery's `user` and `identity_file`) may not take as the text this tree holds.
+    pub fn parse_marked(text: &str) -> Result<(Node, Marks), String> {
         let mut builder = Builder {
             parser: Parser::new_from_str(text),
+            path: Vec::new(),
+            marks: Marks::default(),
         };
         loop {
             match builder.next_event()? {
                 // Skip stream/framing events until the first document's root.
-                Event::StreamStart | Event::Nothing => continue,
-                Event::StreamEnd => return Ok(Node::Map(HashMap::new())),
-                Event::DocumentStart(_) => {
-                    let root_ev = builder.next_event()?;
+                (Event::StreamStart | Event::Nothing, _) => continue,
+                (Event::StreamEnd, _) => return Ok((Node::Map(HashMap::new()), builder.marks)),
+                (Event::DocumentStart(_), _) => {
+                    let (root_ev, span) = builder.next_event()?;
                     // A document with no content node (e.g. `---` alone) → null.
-                    return match root_ev {
-                        Event::DocumentEnd | Event::StreamEnd => Ok(Node::Null),
-                        other => builder.build_node(other),
+                    let root = match root_ev {
+                        Event::DocumentEnd | Event::StreamEnd => Node::Null,
+                        other => builder.build_node(other, span)?,
                     };
+                    return Ok((root, builder.marks));
                 }
-                other => return Err(format!("unexpected top-level YAML event: {other:?}")),
+                (other, _) => return Err(format!("unexpected top-level YAML event: {other:?}")),
             }
         }
     }
@@ -1718,27 +1769,46 @@ pub(crate) mod yaml_lite {
     /// Drives the saphyr event stream into the `Node` model.
     struct Builder<'a> {
         parser: Parser<'a, saphyr_parser::StrInput<'a>>,
+        /// The key path of the node being built.
+        path: Vec<String>,
+        marks: Marks,
     }
 
     impl<'a> Builder<'a> {
-        /// Pull the next event, flattening a scan error or a truncated stream into
-        /// an `Err` message. The returned `Event` borrows from the parser INPUT
-        /// (`'a`), not from `&mut self`, so a built child node can be assembled while
-        /// the next event is pulled.
-        fn next_event(&mut self) -> Result<Event<'a>, String> {
+        /// Pull the next event and its span, flattening a scan error or a truncated
+        /// stream into an `Err` message. The returned `Event` borrows from the parser
+        /// INPUT (`'a`), not from `&mut self`, so a built child node can be assembled
+        /// while the next event is pulled.
+        fn next_event(&mut self) -> Result<(Event<'a>, Span), String> {
             match self.parser.next_event() {
-                Some(Ok((ev, _span))) => Ok(ev),
+                Some(Ok(pair)) => Ok(pair),
                 Some(Err(e)) => Err(e.to_string()),
                 None => Err("unexpected end of YAML event stream".to_string()),
             }
         }
 
-        /// Build a node from `first_ev`, recursing into maps/sequences.
-        fn build_node(&mut self, first_ev: Event<'a>) -> Result<Node, String> {
+        /// Build a node from `first_ev`, recursing into maps/sequences. A node with a
+        /// tag or an anchor, or a scalar over more than one line, is marked.
+        fn build_node(&mut self, first_ev: Event<'a>, span: Span) -> Result<Node, String> {
             match first_ev {
-                Event::Scalar(value, style, _anchor, _tag) => Ok(scalar_node(value, style)),
-                Event::SequenceStart(..) => self.build_sequence(),
-                Event::MappingStart(..) => self.build_mapping(),
+                Event::Scalar(value, style, anchor, tag) => {
+                    if anchor != 0 || tag.is_some() || span.start.line() != span.end.line() {
+                        self.marks.values.insert(self.path.clone());
+                    }
+                    Ok(scalar_node(value, style))
+                }
+                Event::SequenceStart(anchor, tag) => {
+                    if anchor != 0 || tag.is_some() {
+                        self.marks.values.insert(self.path.clone());
+                    }
+                    self.build_sequence()
+                }
+                Event::MappingStart(anchor, tag) => {
+                    if anchor != 0 || tag.is_some() {
+                        self.marks.values.insert(self.path.clone());
+                    }
+                    self.build_mapping()
+                }
                 Event::Alias(_) => {
                     Err("YAML anchors/aliases are not supported in host-agent config".to_string())
                 }
@@ -1751,8 +1821,13 @@ pub(crate) mod yaml_lite {
             let mut items = Vec::new();
             loop {
                 match self.next_event()? {
-                    Event::SequenceEnd => return Ok(Node::Sequence(items)),
-                    ev => items.push(self.build_node(ev)?),
+                    (Event::SequenceEnd, _) => return Ok(Node::Sequence(items)),
+                    (ev, span) => {
+                        self.path.push(items.len().to_string());
+                        let item = self.build_node(ev, span);
+                        self.path.pop();
+                        items.push(item?);
+                    }
                 }
             }
         }
@@ -1764,15 +1839,24 @@ pub(crate) mod yaml_lite {
             let mut map = HashMap::new();
             loop {
                 let key = match self.next_event()? {
-                    Event::MappingEnd => return Ok(Node::Map(map)),
-                    Event::Scalar(value, _style, _anchor, _tag) => value.into_owned(),
-                    other => {
+                    (Event::MappingEnd, _) => return Ok(Node::Map(map)),
+                    (Event::Scalar(value, _style, _anchor, tag), _) => {
+                        // A tagged key is read as its text, as before; the mapping is
+                        // noted so a reader that must fail closed can refuse it.
+                        if tag.is_some() {
+                            self.marks.tagged_keys.insert(self.path.clone());
+                        }
+                        value.into_owned()
+                    }
+                    (other, _) => {
                         return Err(format!("unsupported non-scalar map key: {other:?}"));
                     }
                 };
-                let value_ev = self.next_event()?;
-                let value = self.build_node(value_ev)?;
-                if map.insert(key.clone(), value).is_some() {
+                let (value_ev, span) = self.next_event()?;
+                self.path.push(key.clone());
+                let value = self.build_node(value_ev, span);
+                self.path.pop();
+                if map.insert(key.clone(), value?).is_some() {
                     return Err(format!("duplicate map key {key:?}"));
                 }
             }

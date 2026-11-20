@@ -38,12 +38,16 @@ fn unknown_name() -> String {
 /// A shed's lifecycle status. Lenient: an unrecognized value
 /// (`#[serde(other)]`) OR an absent field (`default` on the field) both decode
 /// to `Unknown`, so a new server status never breaks decode.
+///
+/// `Stopping` (`internal/config/types.go` `StatusStopping`) means a stop is in
+/// progress; only a backend with an asynchronous lifecycle (remote) sends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShedStatus {
     Running,
     Stopped,
     Starting,
+    Stopping,
     Error,
     #[default]
     #[serde(other)]
@@ -83,6 +87,16 @@ pub struct Shed {
     pub name: String,
     #[serde(default)]
     pub status: ShedStatus,
+    /// Why the shed is in `status` when that is not the plain case — a code
+    /// such as `capacity`, `run_limit`, `external` or `no_pin` (only the remote
+    /// backend sends one). Carried verbatim: the clients show it beside the
+    /// status, as the CLI's `stopped (capacity)`. Absent or `null` → `None`.
+    /// Decoded tolerantly, as the overview path decodes it: a reason that is
+    /// not a string (a number, an object, a list) is `None`, never a failed
+    /// decode of the shed — or of the whole `/api/sheds` list, which would
+    /// drop every shed on that server.
+    #[serde(default, deserialize_with = "lenient")]
+    pub status_reason: Option<String>,
     pub backend: Option<String>,
     pub repo: Option<String>,
     pub image: Option<String>,
@@ -456,6 +470,8 @@ fn overview_shed_record(obj: &serde_json::Map<String, Value>) -> Shed {
         status: non_empty_str(obj.get("status"))
             .and_then(|s| serde_json::from_value(Value::String(s.to_string())).ok())
             .unwrap_or_default(),
+        // Optional, verbatim, as `backend`: a non-string or `null` → None.
+        status_reason: opt_verbatim("status_reason"),
         backend: opt_verbatim("backend"),
         repo: opt_verbatim("repo"),
         image: opt_verbatim("image"),
@@ -934,6 +950,110 @@ mod tests {
         // Known value.
         let s: Shed = serde_json::from_str(r#"{"name":"x","status":"stopped"}"#).unwrap();
         assert_eq!(s.status, ShedStatus::Stopped);
+    }
+
+    /// The remote backend's lifecycle (plan 037 §3.14), on the strict
+    /// `/api/sheds` path: `stopping` is its own status, `status_reason` is
+    /// carried verbatim when present and is `None` when absent or `null`, and
+    /// a status no server sends yet still decodes to `Unknown`.
+    #[test]
+    fn shed_cloud_lifecycle_strict() {
+        let s: Shed =
+            serde_json::from_str(r#"{"name":"cloudy","status":"stopping","backend":"remote"}"#)
+                .unwrap();
+        assert_eq!(s.status, ShedStatus::Stopping);
+        assert_eq!(s.status_reason, None); // absent
+        let s: Shed = serde_json::from_str(
+            r#"{"name":"full-zone","status":"stopped","status_reason":"capacity"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.status, ShedStatus::Stopped);
+        assert_eq!(s.status_reason.as_deref(), Some("capacity"));
+        let s: Shed =
+            serde_json::from_str(r#"{"name":"x","status":"starting","status_reason":null}"#)
+                .unwrap();
+        assert_eq!(s.status, ShedStatus::Starting);
+        assert_eq!(s.status_reason, None); // explicit null
+        let s: Shed = serde_json::from_str(r#"{"name":"x","status":"rebooting"}"#).unwrap();
+        assert_eq!(s.status, ShedStatus::Unknown);
+        // What the desktop receives: the lowercase word, and the reason.
+        let s: Shed = serde_json::from_str(
+            r#"{"name":"cloudy","status":"stopping","status_reason":"run_limit"}"#,
+        )
+        .unwrap();
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["status"], "stopping");
+        assert_eq!(v["status_reason"], "run_limit");
+    }
+
+    /// A malformed `status_reason` on the strict `/api/sheds` path degrades to
+    /// `None`, as on the overview path: it never fails the shed, and never the
+    /// whole list (which would drop every shed on that server as a host
+    /// failure).
+    #[test]
+    fn shed_malformed_status_reason_strict() {
+        // The list as a server could send it: the reason is a number.
+        let w: ShedList = serde_json::from_str(
+            r#"{"sheds":[{"name":"x","status":"running","status_reason":7}]}"#,
+        )
+        .unwrap();
+        assert_eq!(w.sheds.len(), 1);
+        assert_eq!(w.sheds[0].name, "x");
+        assert_eq!(w.sheds[0].status, ShedStatus::Running);
+        assert_eq!(w.sheds[0].status_reason, None);
+        // Every non-string shape, on one shed.
+        for bad in [
+            "7",
+            "1.5",
+            "true",
+            r#"{"code":"capacity"}"#,
+            r#"["capacity"]"#,
+        ] {
+            let s: Shed = serde_json::from_str(&format!(
+                r#"{{"name":"x","status":"stopped","status_reason":{bad}}}"#
+            ))
+            .unwrap_or_else(|e| panic!("status_reason {bad} failed the decode: {e}"));
+            assert_eq!(s.status, ShedStatus::Stopped, "{bad}");
+            assert_eq!(s.status_reason, None, "{bad}");
+        }
+        // Two sheds, only one with a bad reason: both decode, the good reason
+        // is kept, the bad one is None.
+        let w: ShedList = serde_json::from_str(
+            r#"{"sheds":[
+                {"name":"odd","status":"stopped","status_reason":{"code":"capacity"}},
+                {"name":"full-zone","status":"stopped","status_reason":"capacity"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(w.sheds.len(), 2);
+        assert_eq!(w.sheds[0].name, "odd");
+        assert_eq!(w.sheds[0].status_reason, None);
+        assert_eq!(w.sheds[1].name, "full-zone");
+        assert_eq!(w.sheds[1].status_reason.as_deref(), Some("capacity"));
+    }
+
+    /// The same, on the overview path's hand decoder.
+    #[test]
+    fn overview_cloud_lifecycle() {
+        let o: Overview = serde_json::from_str(
+            r#"{"sheds":[
+                {"name":"cloudy","status":"stopping","backend":"remote"},
+                {"name":"full-zone","status":"stopped","status_reason":"capacity"},
+                {"name":"nulled","status":"starting","status_reason":null},
+                {"name":"odd","status":"running","status_reason":7},
+                {"name":"rebooting","status":"rebooting"}
+            ]}"#,
+        )
+        .unwrap();
+        let by = |n: &str| &o.sheds.iter().find(|s| s.shed.name == n).unwrap().shed;
+        assert_eq!(by("cloudy").status, ShedStatus::Stopping);
+        assert_eq!(by("cloudy").status_reason, None); // absent
+        assert_eq!(by("full-zone").status, ShedStatus::Stopped);
+        assert_eq!(by("full-zone").status_reason.as_deref(), Some("capacity"));
+        assert_eq!(by("nulled").status, ShedStatus::Starting);
+        assert_eq!(by("nulled").status_reason, None); // explicit null
+        assert_eq!(by("odd").status_reason, None); // wrong type degrades
+        assert_eq!(by("rebooting").status, ShedStatus::Unknown);
     }
 
     #[test]

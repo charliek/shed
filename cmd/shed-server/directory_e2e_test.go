@@ -167,6 +167,99 @@ type e2eServer struct {
 	ticks    chan time.Time
 	rt       *directory.Runtime
 	recorder *e2eRecorder
+	// timers are the runtime's timers (directoryTimer): none fires unless the
+	// test fires it.
+	timers *e2eTimers
+}
+
+// e2eTimers are the runtime's timers in the end-to-end tests: each is kept,
+// with its duration, until the test fires it or the runtime stops it.
+type e2eTimers struct {
+	mu     sync.Mutex
+	timers []*e2eTimer
+}
+
+type e2eTimer struct {
+	d       time.Duration
+	ch      chan time.Time
+	stopped bool
+}
+
+// timer is directoryTimer's replacement: a timer of d that fires only when
+// the test fires it.
+func (r *e2eTimers) timer(d time.Duration) (<-chan time.Time, func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tm := &e2eTimer{d: d, ch: make(chan time.Time, 1)}
+	r.timers = append(r.timers, tm)
+	return tm.ch, func() {
+		r.mu.Lock()
+		tm.stopped = true
+		r.mu.Unlock()
+	}
+}
+
+// armed is how many timers of d are set and neither fired nor stopped.
+func (r *e2eTimers) armed(d time.Duration) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, tm := range r.timers {
+		if tm.d == d && !tm.stopped {
+			n++
+		}
+	}
+	return n
+}
+
+// fire fires every timer of d that is set and neither fired nor stopped, and
+// reports how many.
+func (r *e2eTimers) fire(d time.Duration) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	kept := r.timers[:0]
+	for _, tm := range r.timers {
+		switch {
+		case tm.stopped:
+		case tm.d == d:
+			tm.ch <- time.Now()
+			n++
+		default:
+			kept = append(kept, tm)
+		}
+	}
+	r.timers = kept
+	return n
+}
+
+// dialUnknown logs in over SSH as user with id's key, one the server does
+// not know (or no longer knows). A login that takes the first-login slot
+// waits for its deadline (directory.UnknownKeyWait) after its pull, a timer
+// that never fires on its own here: once it is set, the test fires it. A
+// login refused at once returns at once.
+func (s *e2eServer) dialUnknown(id *e2eIdentity, user string) error {
+	s.t.Helper()
+	got := make(chan error, 1)
+	go func() {
+		c, err := s.dial(id, user)
+		if err == nil {
+			_ = c.Close()
+		}
+		got <- err
+	}()
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case err := <-got:
+			return err
+		case <-deadline:
+			s.t.Fatalf("%s's login as %s was not answered", id.name, user)
+			return nil
+		case <-time.After(10 * time.Millisecond):
+		}
+		s.timers.fire(directory.UnknownKeyWait)
+	}
 }
 
 // dial logs in over SSH as user with id's key.
@@ -292,7 +385,7 @@ func closed(client *gossh.Client) bool {
 // enrolment through the command, serve's lookup, the SSH server and the API.
 func startE2EServer(t *testing.T, ops *e2eIdentity) (*e2eServer, string) {
 	t.Helper()
-	s := &e2eServer{t: t, control: t.TempDir(), offset: &atomic.Int64{}, ticks: make(chan time.Time), recorder: &e2eRecorder{}}
+	s := &e2eServer{t: t, control: t.TempDir(), offset: &atomic.Int64{}, ticks: make(chan time.Time), recorder: &e2eRecorder{}, timers: &e2eTimers{}}
 	now := func() time.Time { return time.Now().Add(time.Duration(s.offset.Load())) }
 
 	// The reference server, on its own loopback port.
@@ -338,11 +431,12 @@ func startE2EServer(t *testing.T, ops *e2eIdentity) (*e2eServer, string) {
 	}
 
 	// serve's lookup, on the test's clock and trust ticks; its schedule
-	// pulls at start and when asked (its timers never fire).
+	// pulls at start and when asked (its timers fire only when the test
+	// fires them: s.timers).
 	prevNow, prevTicks, prevTimer := directoryNow, directoryTrustTicks, directoryTimer
 	directoryNow = now
 	directoryTrustTicks = func() (<-chan time.Time, func()) { return s.ticks, func() {} }
-	directoryTimer = func(time.Duration) (<-chan time.Time, func()) { return make(chan time.Time), func() {} }
+	directoryTimer = s.timers.timer
 	t.Cleanup(func() { directoryNow, directoryTrustTicks, directoryTimer = prevNow, prevTicks, prevTimer })
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -484,8 +578,7 @@ func TestEndToEndAgainstReferenceServer(t *testing.T) {
 	if !closed(adaHeld) {
 		t.Fatal("ada's held SSH connection was not closed when she left the list")
 	}
-	if c, err := s.dial(ada, "_bootstrap"); err == nil {
-		_ = c.Close()
+	if err := s.dialUnknown(ada, "_bootstrap"); err == nil {
 		t.Fatal("ada logged in over SSH after she left the list")
 	}
 	if code := s.api(ada, http.MethodGet, "/api/ssh-host-key"); code == http.StatusOK {
@@ -521,8 +614,7 @@ func TestEndToEndAgainstReferenceServer(t *testing.T) {
 	if !closed(adaHeld) {
 		t.Fatal("ada's held SSH connection was not closed when the trust time ended")
 	}
-	if c, err := s.dial(ada, "_bootstrap"); err == nil {
-		_ = c.Close()
+	if err := s.dialUnknown(ada, "_bootstrap"); err == nil {
 		t.Fatal("ada logged in over SSH after the trust time ended")
 	}
 	if code := s.api(ada, http.MethodGet, "/api/ssh-host-key"); code == http.StatusOK {

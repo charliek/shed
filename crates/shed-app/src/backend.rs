@@ -43,6 +43,9 @@ pub struct Backend {
 struct SshTarget {
     host: String,
     port: u16,
+    /// The entry's `identity_file` as config.yaml holds it ("" for none), checked at each
+    /// use before it reaches an argv.
+    identity_file: String,
 }
 
 /// Everything `shed-app::rc` needs to build the RC ssh argv for one shed, resolved
@@ -127,6 +130,14 @@ impl Backend {
             };
         }
         let config = ShedConfig::load(&config_path.to_string_lossy());
+        // A file the reader refuses whole (plan 037 A8) lists no server; the app's log says
+        // why.
+        if let Some(reason) = &config.refused {
+            tracing::warn!(
+                path = %config_path.display(),
+                "config.yaml is not read, so no server is listed: {reason}"
+            );
+        }
         if let Some(modes) = modes {
             modes.seed_from_config(&config);
         }
@@ -190,25 +201,58 @@ impl Backend {
                         // config token (F6).
                         let r = s.resolved_endpoint();
                         let pin = (!r.pin.is_empty()).then_some(r.pin);
-                        match (minter, modes) {
-                            // The observer can only be attached to a provider we
-                            // build ourselves, so this arm exists purely to reach
-                            // `with_observer`; it is otherwise `Client::new`.
-                            (Some(m), Some(obs)) => {
+                        // Three real-server arms. Both minter arms build the
+                        // provider here so it is held to the entry's `user`: a
+                        // certificate issued for another named user, or one that
+                        // names none, is refused (plan 037 §3.2.2). The entry is
+                        // read once, at start; a changed `user` needs a restart.
+                        let held_user = (!s.user.is_empty()).then(|| s.user.clone());
+                        match (minter, modes, identity_refusal(s, minter.is_some())) {
+                            // An entry the config reader did not read at all (plan 037
+                            // A8: a line in it is not a plain `key: value`, or its
+                            // host is null) has no host to trust: its client sends
+                            // nothing anywhere, and every request is the refusal, so
+                            // the entry is still listed and says why.
+                            (_, _, Some(refusal)) if entry_unread(s) => {
+                                Client::refused(s.name.clone(), refusal)
+                            }
+                            // An entry whose `identity_file` cannot be used (its value
+                            // breaks the rule, or the reader could not read it exactly),
+                            // or one that names an identity file and holds a stored
+                            // control token (it names no SSH key; plan 037 A8): the
+                            // client's every credential is that refusal, nothing is
+                            // minted and no token is sent.
+                            (_, _, Some(refusal)) => {
+                                let provider = Arc::new(ControlTokenProvider::new(
+                                    s.name.clone(),
+                                    Arc::new(RefusingMinter(refusal)) as Arc<dyn TokenMinter>,
+                                ));
+                                Client::with_provider(r.base_url, s.name.clone(), pin, provider)
+                            }
+                            (Some(m), Some(obs), None) => {
                                 let provider = Arc::new(
                                     ControlTokenProvider::new(s.name.clone(), Arc::clone(m))
+                                        .with_held_user(held_user)
                                         .with_observer(
                                             Arc::clone(obs) as Arc<dyn CredentialObserver>
                                         ),
                                 );
                                 Client::with_provider(r.base_url, s.name.clone(), pin, provider)
                             }
-                            _ => Client::new(
+                            (Some(m), None, None) => {
+                                let provider = Arc::new(
+                                    ControlTokenProvider::new(s.name.clone(), Arc::clone(m))
+                                        .with_held_user(held_user),
+                                );
+                                Client::with_provider(r.base_url, s.name.clone(), pin, provider)
+                            }
+                            // No minter: the static open-mode config token, as before.
+                            (None, _, None) => Client::new(
                                 r.base_url,
                                 s.name.clone(),
                                 s.control_token.clone(),
                                 pin,
-                                minter.map(Arc::clone),
+                                None,
                             ),
                         }
                     }
@@ -226,6 +270,7 @@ impl Backend {
                     SshTarget {
                         host: s.host.clone(),
                         port: s.ssh_port,
+                        identity_file: s.identity_file.clone(),
                     },
                 )
             })
@@ -480,30 +525,30 @@ impl Backend {
         shed: &str,
         session: Option<&str>,
     ) -> Result<TerminalCommand, ShedError> {
-        let target = self.ssh_target_for(host)?;
-        Ok(terminal::ssh_command(
+        let (name, target) = resolve_entry(&self.ssh_targets, self.default_server.as_deref(), host)
+            .ok_or_else(|| no_configured_host(host))?;
+        // The entry's own SSH key, checked now (its value, and the file is a regular
+        // file): one that cannot be used never reaches an argv (plan 037 A8, the Go
+        // CLI's `baseSSHArgs`).
+        let identity = shed_core::identityfile::identity_file_args(name, &target.identity_file)
+            .map_err(|e| ShedError::Config(e.to_string()))?;
+        Ok(terminal::ssh_command_with_identity(
             shed,
             &target.host,
             target.port,
             &known_hosts_path(),
+            &identity,
             session,
         ))
-    }
-
-    /// A server's SSH endpoint by host name (host-less → default → first) — the
-    /// same resolution `client_for` uses, over the SSH targets.
-    fn ssh_target_for(&self, host: Option<&str>) -> Result<&SshTarget, ShedError> {
-        resolve(&self.ssh_targets, self.default_server.as_deref(), host)
-            .ok_or_else(|| no_configured_host(host))
     }
 
     // -- RC targets (B2.2) — resolved here so `shed-app::rc::RcService` never
     //    couples to `Backend`; the ipc layer passes these into launch()/list(). --
 
     /// The RC ssh target for a single op (launch/kill) — host-less → default →
-    /// first, the same resolution as `terminal.preview`. Unlike `ssh_target_for`
-    /// this also carries the resolved server *name* (for the `--target
-    /// shed:<shed>@<server>` arg) and the `known_hosts` path.
+    /// first, the same resolution as `terminal.preview`. It carries the resolved
+    /// server *name* (for the `--target shed:<shed>@<server>` arg) and the
+    /// `known_hosts` path.
     pub fn resolve_rc_target(&self, host: Option<&str>) -> Result<RcTarget, ShedError> {
         let (name, target) = resolve_entry(&self.ssh_targets, self.default_server.as_deref(), host)
             .ok_or_else(|| no_configured_host(host))?;
@@ -539,8 +584,9 @@ impl Backend {
 
 /// Resolve a `(name, T)` entry by host name: an explicit host matches by name; a
 /// host-less op prefers `default_server`, else the first entry. Shared by
-/// `client_for` (HTTP), `ssh_target_for` (SSH), and `resolve_rc_target` (RC — it
-/// needs the resolved server *name* too, for the `--target` arg).
+/// `client_for` (HTTP), `terminal_preview` (SSH — it needs the server *name* for an
+/// identity-file refusal), and `resolve_rc_target` (RC — it needs the resolved server
+/// *name* too, for the `--target` arg).
 fn resolve_entry<'a, T>(
     items: &'a [(String, T)],
     default_server: Option<&str>,
@@ -560,6 +606,45 @@ fn resolve<'a, T>(
     host: Option<&str>,
 ) -> Option<&'a T> {
     resolve_entry(items, default_server, host).map(|(_, t)| t)
+}
+
+/// Why an entry's control client must present nothing, for its `identity_file` (plan 037
+/// A8): its value cannot be used (it breaks the value rule, or the config reader could not
+/// read it, or the entry, exactly), or — with no minter, so the client would send the
+/// stored token — it names an identity file and holds a `control_token`, which says
+/// nothing about which SSH key it was issued for. `None` for every other entry, which
+/// builds as it always did.
+fn identity_refusal(s: &shed_core::config::ShedServerEntry, has_minter: bool) -> Option<String> {
+    if let Err(e) = shed_core::identityfile::check_entry_value(&s.name, &s.identity_file) {
+        return Some(e.to_string());
+    }
+    (!has_minter && !s.identity_file.is_empty() && !s.control_token.is_empty()).then(|| {
+        shed_core::identityfile::stored_token_message(
+            &s.name,
+            &s.identity_file,
+            shed_core::token::shell_server_name(&s.name).as_deref(),
+        )
+    })
+}
+
+/// Whether the config reader read none of the entry ([`ShedServerEntry`]'s
+/// unreadable form: [`shed_core::identityfile::IDENTITY_FILE_ENTRY_UNREADABLE`]).
+///
+/// [`ShedServerEntry`]: shed_core::config::ShedServerEntry
+fn entry_unread(s: &shed_core::config::ShedServerEntry) -> bool {
+    s.identity_file == shed_core::identityfile::IDENTITY_FILE_ENTRY_UNREADABLE
+}
+
+/// The minter of a client that must present nothing: every mint is the refusal it was
+/// built with ([`identity_refusal`]). It never runs ssh and never answers a credential, so
+/// a stored token is never sent.
+struct RefusingMinter(String);
+
+#[async_trait::async_trait]
+impl TokenMinter for RefusingMinter {
+    async fn mint(&self, _server: &str) -> Result<shed_core::token::MintedToken, ShedError> {
+        Err(ShedError::Config(self.0.clone()))
+    }
 }
 
 fn no_configured_host(host: Option<&str>) -> ShedError {
@@ -818,6 +903,355 @@ mod tests {
             ssh_port: 2222,
             ..Default::default()
         }
+    }
+
+    /// A minter that answers every mint with the same certificate: one a 0.10
+    /// server issued for user `pat` (the shared two-language fixture). Its key is
+    /// not the provider's, so it can never be ADOPTED — what it shows is whether
+    /// the provider refused it for its user first, which only a provider held to
+    /// the entry's `user` does.
+    struct PatCertMinter;
+
+    #[async_trait::async_trait]
+    impl TokenMinter for PatCertMinter {
+        async fn mint(&self, _server: &str) -> Result<shed_core::token::MintedToken, ShedError> {
+            unreachable!("an mtls-capable minter is asked through mint_credential")
+        }
+        fn supports_mtls(&self) -> bool {
+            true
+        }
+        async fn mint_credential(
+            &self,
+            _server: &str,
+            _req: &shed_core::token::CredentialRequest,
+        ) -> Result<shed_core::token::MintedCredential, ShedError> {
+            Ok(shed_core::token::MintedCredential::Certificate(
+                shed_core::token::MintedCertificate {
+                    cert_pem: include_str!("../../fixtures/clientuser/issued-pat.pem").into(),
+                    serial: "01".into(),
+                    expires_at_unix: Some(4_102_444_800),
+                },
+            ))
+        }
+    }
+
+    /// A config of one server at `url`, held to `user`.
+    fn held_config(url: &str, user: &str) -> ShedConfig {
+        ShedConfig {
+            servers: vec![shed_core::config::ShedServerEntry {
+                name: "shed".into(),
+                host: "127.0.0.1".into(),
+                api_url: url.into(),
+                control_token: "static-tok".into(),
+                user: user.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Both minter arms build a provider held to the entry's `user` (plan 037
+    /// §3.2.2): pat's certificate on an entry held to admin is refused with the
+    /// held-user message, which reaches the caller once the server refuses the
+    /// unauthenticated request.
+    #[tokio::test]
+    async fn both_minter_arms_hold_the_entrys_user() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds");
+                t.status(401);
+            })
+            .await;
+        let minter: Arc<dyn TokenMinter> = Arc::new(PatCertMinter);
+        let modes = Arc::new(crate::auth_modes::AuthModeRegistry::new());
+        let config = held_config(&server.base_url(), "admin");
+        for (arm, observer) in [("observer", Some(&modes)), ("no observer", None)] {
+            let backend = Backend::from_config_with_credentials(
+                &config,
+                None,
+                Some(&minter),
+                observer,
+                &HashSet::new(),
+            );
+            let clients = backend.host_clients();
+            assert_eq!(clients.len(), 1, "{arm}");
+            let err = clients[0].1.list_sheds().await.unwrap_err();
+            let ShedError::Config(msg) = &err else {
+                panic!("{arm}: the refusal is ShedError::Config, got {err:?}");
+            };
+            assert!(
+                msg.starts_with(
+                    "server \"shed\": the server issued a certificate for user \"pat\", \
+                     but this entry is held to \"admin\"; it was not used."
+                ),
+                "{arm}: {msg}"
+            );
+        }
+
+        // The control: with no `user` the same certificate passes the user rule
+        // and fails only on its key — so the message above came from the hold.
+        let backend = Backend::from_config_with_credentials(
+            &held_config(&server.base_url(), ""),
+            None,
+            Some(&minter),
+            None,
+            &HashSet::new(),
+        );
+        let err = backend.host_clients()[0].1.list_sheds().await.unwrap_err();
+        assert!(err.to_string().contains("unusable"), "{err}");
+        assert!(!err.to_string().contains("held to"), "{err}");
+    }
+
+    /// The no-minter arm keeps sending the static open-mode token from config.
+    #[tokio::test]
+    async fn the_no_minter_arm_still_sends_the_static_token() {
+        let server = MockServer::start_async().await;
+        let with_token = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/sheds")
+                    .header("authorization", "Bearer static-tok");
+                t.status(200).body(r#"{"sheds":[]}"#);
+            })
+            .await;
+        let backend = Backend::from_config_with_credentials(
+            &held_config(&server.base_url(), "pat"),
+            None,
+            None,
+            None,
+            &HashSet::new(),
+        );
+        let sheds = backend.host_clients()[0].1.list_sheds().await.unwrap();
+        assert!(sheds.is_empty());
+        assert_eq!(with_token.hits_async().await, 1);
+    }
+
+    /// A key file as an identity file in `dir` (its contents are never read).
+    fn identity_file_in(dir: &Path) -> String {
+        let path = dir.join("id work");
+        std::fs::write(&path, "a key file\n").unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    /// The stored token (plan 037 A8): an entry with an identity file never
+    /// presents the control token config.yaml holds for it (it names no key).
+    /// The no-minter arm refuses with the Go CLI's message instead, and the token
+    /// is never sent; without the identity file it is sent as before
+    /// ([`the_no_minter_arm_still_sends_the_static_token`]).
+    #[tokio::test]
+    async fn a_stored_token_is_never_sent_for_an_entry_with_an_identity_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = identity_file_in(dir.path());
+        let server = MockServer::start_async().await;
+        let with_token = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/sheds")
+                    .header("authorization", "Bearer static-tok");
+                t.status(200).body(r#"{"sheds":[]}"#);
+            })
+            .await;
+        let unauthenticated = server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds");
+                t.status(401);
+            })
+            .await;
+        let mut config = held_config(&server.base_url(), "");
+        config.servers[0].identity_file = key.clone();
+        let backend =
+            Backend::from_config_with_credentials(&config, None, None, None, &HashSet::new());
+        let err = backend.host_clients()[0].1.list_sheds().await.unwrap_err();
+        let refusal = shed_core::identityfile::stored_token_message("shed", &key, Some("shed"));
+        assert!(err.to_string().starts_with(&refusal), "{err}");
+        assert_eq!(with_token.hits_async().await, 0, "the token was never sent");
+        // The client's rule for a failed credential: one request with none, whose
+        // refusal is explained by the credential's.
+        assert_eq!(unauthenticated.hits_async().await, 1);
+    }
+
+    /// An entry whose `identity_file` cannot be used (its value breaks the rule,
+    /// or the config reader could not read it, or the entry, exactly) is not
+    /// used by any arm (plan 037 A8): its client's credential is the refusal,
+    /// naming the entry, and the minter is never asked (so no ssh runs). An
+    /// entry whose identity file can be used builds the arms as before.
+    #[tokio::test]
+    async fn an_identity_file_that_cannot_be_used_refuses_every_arm() {
+        struct Counting(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl TokenMinter for Counting {
+            async fn mint(
+                &self,
+                _server: &str,
+            ) -> Result<shed_core::token::MintedToken, ShedError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(shed_core::token::MintedToken {
+                    token: "issued-tok".into(),
+                    expires_at_unix: Some(4_102_444_800),
+                })
+            }
+        }
+        let server = MockServer::start_async().await;
+        let issued = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/sheds")
+                    .header("authorization", "Bearer issued-tok");
+                t.status(200).body(r#"{"sheds":[]}"#);
+            })
+            .await;
+        let static_token = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/sheds")
+                    .header("authorization", "Bearer static-tok");
+                t.status(200).body(r#"{"sheds":[]}"#);
+            })
+            .await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds");
+                t.status(401);
+            })
+            .await;
+        let counting = Arc::new(Counting(std::sync::atomic::AtomicUsize::new(0)));
+        let minter: Arc<dyn TokenMinter> = counting.clone();
+        let modes = Arc::new(crate::auth_modes::AuthModeRegistry::new());
+        for bad in [
+            "relative/key",
+            shed_core::identityfile::IDENTITY_FILE_UNREADABLE,
+            shed_core::identityfile::IDENTITY_FILE_ENTRY_UNREADABLE,
+        ] {
+            let mut config = held_config(&server.base_url(), "");
+            config.servers[0].identity_file = bad.to_string();
+            for (minter, observer) in [
+                (Some(&minter), Some(&modes)),
+                (Some(&minter), None),
+                (None, None),
+            ] {
+                let backend = Backend::from_config_with_credentials(
+                    &config,
+                    None,
+                    minter,
+                    observer,
+                    &HashSet::new(),
+                );
+                let err = backend.host_clients()[0].1.list_sheds().await.unwrap_err();
+                let want = if bad == shed_core::identityfile::IDENTITY_FILE_ENTRY_UNREADABLE {
+                    "entry \"shed\" cannot be used: "
+                } else {
+                    "entry \"shed\": identity_file"
+                };
+                assert!(err.to_string().starts_with(want), "{bad:?}: {err}");
+            }
+        }
+        assert_eq!(counting.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(issued.hits_async().await, 0);
+        assert_eq!(
+            static_token.hits_async().await,
+            0,
+            "the token was never sent"
+        );
+
+        // A usable identity file: the minter arms build as before.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = held_config(&server.base_url(), "");
+        config.servers[0].identity_file = identity_file_in(dir.path());
+        let backend = Backend::from_config_with_credentials(
+            &config,
+            None,
+            Some(&minter),
+            None,
+            &HashSet::new(),
+        );
+        backend.host_clients()[0].1.list_sheds().await.unwrap();
+        assert_eq!(counting.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// An entry the config reader did not read (plan 037 A8: a line in it is not a
+    /// plain `key: value`, such as the fields as a flow mapping) is still a host the
+    /// dashboard lists, whose every request is the refusal naming it, and nothing is
+    /// sent anywhere: not to a host it never read, and not even to one an entry in
+    /// that state happens to carry.
+    #[tokio::test]
+    async fn an_entry_the_reader_refused_is_listed_and_sends_nothing() {
+        let server = MockServer::start_async().await;
+        let any = server
+            .mock_async(|w, t| {
+                w.any_request();
+                t.status(200).body(r#"{"sheds":[]}"#);
+            })
+            .await;
+        let config = shed_core::config::ShedConfig::parse(
+            "servers:\n    prod: {host: prod.example.test, identity_file: /keys/prod}\n",
+        );
+        assert_eq!(config.servers.len(), 1, "never dropped silently");
+        // The same state with a host it could reach: still nothing is sent.
+        let mut reachable = held_config(&server.base_url(), "");
+        reachable.servers[0].identity_file =
+            shed_core::identityfile::IDENTITY_FILE_ENTRY_UNREADABLE.to_string();
+        for (config, name) in [(config, "prod"), (reachable, "shed")] {
+            let backend =
+                Backend::from_config_with_credentials(&config, None, None, None, &HashSet::new());
+            let clients = backend.host_clients();
+            assert_eq!(clients.len(), 1);
+            let err = clients[0].1.list_sheds().await.unwrap_err();
+            assert!(
+                matches!(&err, ShedError::Config(m)
+                    if m.starts_with(&format!("entry {name:?} cannot be used: shed reads a server entry"))),
+                "{err}"
+            );
+            let r = backend.refresh().await;
+            assert_eq!(r.host_errors.len(), 1);
+            assert!(r
+                .last_error
+                .unwrap()
+                .contains("write its fields one per line"));
+        }
+        assert_eq!(any.hits_async().await, 0, "nothing was sent");
+    }
+
+    /// P-b in `terminal.preview`: the entry's key goes on the ssh line exactly
+    /// where the Go CLI puts it, checked first; a key that cannot be used is the
+    /// error, and no command is built.
+    #[test]
+    fn terminal_preview_carries_the_entrys_identity_file() {
+        use shed_core::config::{ShedConfig, ShedServerEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let key = identity_file_in(dir.path());
+        let mut config = ShedConfig {
+            servers: vec![ShedServerEntry {
+                name: "prod".into(),
+                host: "10.0.0.9".into(),
+                http_port: 8080,
+                ssh_port: 2200,
+                identity_file: key.clone(),
+                ..Default::default()
+            }],
+            default_server: Some("prod".into()),
+            ..Default::default()
+        };
+        let backend = Backend::from_config(&config, Some("http://mock"));
+        let cmd = backend.terminal_preview(None, "web", None).unwrap();
+        let at = cmd.argv.iter().position(|a| a == "web@10.0.0.9").unwrap();
+        assert_eq!(
+            cmd.argv[at - 8..at],
+            shed_core::identityfile::identity_args(&key)[..]
+        );
+        assert!(cmd.argv[at - 9].starts_with("UserKnownHostsFile="));
+
+        std::fs::remove_file(&key).unwrap();
+        let err = backend.terminal_preview(None, "web", None).unwrap_err();
+        assert!(
+            err.to_string().starts_with("entry \"prod\": identity_file"),
+            "{err}"
+        );
+        config.servers[0].identity_file = String::new();
+        let plain = Backend::from_config(&config, Some("http://mock"))
+            .terminal_preview(None, "web", None)
+            .unwrap();
+        assert!(!plain.argv.iter().any(|a| a == "-i"));
     }
 
     #[tokio::test]

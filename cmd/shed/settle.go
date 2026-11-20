@@ -5,7 +5,9 @@ import (
 	"io"
 	"time"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
+	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 )
 
 // A remote server answers start and stop before the work is done: the shed
@@ -43,15 +45,20 @@ func waitSettled(c shedGetter, shed *config.Shed, progress io.Writer) (*config.S
 	last := ""
 	for inTransition(shed.Status) {
 		if shed.Status != last {
-			fmt.Fprintf(progress, "Waiting for shed %s (%s)...\n", shed.Name, shed.Status)
+			fmt.Fprintf(progress, "Waiting for shed %s (%s)...\n",
+				sdkbootstrap.SafeText(shed.Name), sdkbootstrap.SafeText(shed.Status))
 			last = shed.Status
 		}
 		if time.Now().After(deadline) {
-			return shed, fmt.Errorf("shed %s is still %s after %s; check `shed list -v` later", shed.Name, shed.Status, settleTimeout)
+			return shed, fmt.Errorf("shed %s is still %s after %s; check `shed list -v` later",
+				sdkbootstrap.SafeText(shed.Name), sdkbootstrap.SafeText(shed.Status), settleTimeout)
 		}
 		time.Sleep(settlePollInterval)
 		next, err := c.GetShed(shed.Name)
 		if err != nil {
+			if clienttoken.IsRefusal(err) {
+				return nil, err // the entry may not be used: its message stands alone
+			}
 			return nil, fmt.Errorf("failed to get shed status: %w", err)
 		}
 		shed = next
@@ -60,11 +67,16 @@ func waitSettled(c shedGetter, shed *config.Shed, progress io.Writer) (*config.S
 }
 
 // statusWithReason renders "stopped (capacity)" when the shed has a reason.
+// It is display text only (the list, the details and error messages): the
+// status and the reason are the server's, so each is escaped
+// (sdkbootstrap.SafeText); printable text is unchanged, and every comparison
+// reads s.Status itself.
 func statusWithReason(s config.Shed) string {
+	status := sdkbootstrap.SafeText(s.Status)
 	if s.StatusReason == "" {
-		return s.Status
+		return status
 	}
-	return s.Status + " (" + s.StatusReason + ")"
+	return status + " (" + sdkbootstrap.SafeText(s.StatusReason) + ")"
 }
 
 // requireSettledStatus returns an error naming the shed's status and reason
@@ -73,7 +85,7 @@ func requireSettledStatus(shed *config.Shed, want string) error {
 	if shed.Status == want {
 		return nil
 	}
-	return fmt.Errorf("shed %s is %s, not %s", shed.Name, statusWithReason(*shed), want)
+	return fmt.Errorf("shed %s is %s, not %s", sdkbootstrap.SafeText(shed.Name), statusWithReason(*shed), want)
 }
 
 // remoteCreateRefusal refuses, before anything is sent, the create flags a

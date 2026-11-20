@@ -6,6 +6,7 @@ import (
 
 	"github.com/gliderlabs/ssh"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/vmutil"
 )
@@ -32,20 +33,32 @@ func (s *Server) handleSFTP(sess ssh.Session) {
 	}
 	ctx := backend.WithPrincipal(sess.Context(), p)
 
-	shed, err := s.ensureRunning(ctx, user, sess.Stderr(), false)
+	// The exec acts on the shed that was checked, with the owner and user it
+	// was checked against (ensureRunning pins them before any wake).
+	ctx, shed, err := s.ensureRunning(ctx, user, sess.Stderr(), false)
 	if err != nil {
 		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
 		_ = sess.Exit(1)
 		return
 	}
-	ctx = backend.PinCreatedAt(ctx, shed.CreatedAt)
 
+	// A person's sftp into a service client's shed is recorded once the
+	// guarded exec has started sftp-server (onEntered).
+	id, _ := connIdentityFrom(sess.Context())
+	onStarted, endEntry, ok := s.beginEntry(p, id.fingerprint, remoteAddr, shed, audit.SSHChannelSFTP)
+	if !ok {
+		fmt.Fprintf(sess.Stderr(), "Error: %v\n", errShuttingDown)
+		_ = sess.Exit(1)
+		return
+	}
+	defer endEntry()
 	opts := backend.ExecOptions{
-		Cmd:    []string{"/usr/lib/openssh/sftp-server"},
-		Stdin:  &sessionReadCloser{sess},
-		Stdout: &sessionWriteCloser{sess},
-		Stderr: &sessionStderrWriteCloser{sess},
-		TTY:    false,
+		Cmd:       []string{"/usr/lib/openssh/sftp-server"},
+		Stdin:     &sessionReadCloser{sess},
+		Stdout:    &sessionWriteCloser{sess},
+		Stderr:    &sessionStderrWriteCloser{sess},
+		TTY:       false,
+		OnStarted: onStarted,
 	}
 
 	log.Printf("SFTP: executing sftp-server in shed %s", shed.Name)

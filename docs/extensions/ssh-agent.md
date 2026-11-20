@@ -110,8 +110,10 @@ ssh-agent** to that launchd session automatically, so a key added with
 `ssh-add --apple-use-keychain` works out of the box. **1Password and Secretive**,
 however, usually export `SSH_AUTH_SOCK` only from your shell rc files, which the
 launchd agent does not inherit — so the daemon may not see them. If a mint fails
-and `shed-host-agent status` (or the log) reports *no SSH identity available*,
-point `ssh` at the agent explicitly in `~/.ssh/config` (the recommended fix):
+and `shed-host-agent status` (or the log) reports *the server refused every key
+ssh offered* while your shell's `ssh` gets in, the daemon is not reaching your
+agent: point `ssh` at the agent explicitly in `~/.ssh/config` (the recommended
+fix):
 
 ```ssh-config
 Host my-server          # the SSH host the agent dials — see `shed server list`

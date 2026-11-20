@@ -18,6 +18,19 @@ const (
 	// FeatureHTTPExec signals POST /api/sheds/{name}/exec, the NDJSON exec
 	// over HTTPS (see exec.go).
 	FeatureHTTPExec = "http_exec"
+	// FeatureExecLimits signals that GET /api/info carries "exec": the limits
+	// an exec request is refused above and the defaults a request that sets
+	// none gets (see execLimits). Advertised with FeatureHTTPExec; the info
+	// handler reports the member exactly when this token is in the set.
+	FeatureExecLimits = "exec_limits"
+	// FeatureUniformShedRecord signals that every shed record, on every
+	// backend and every route that returns one, carries "mounts",
+	// "network_profile" and "isolation" ("none", "firewall" or "topology"),
+	// and "arch" where the server knows it; and that GET /api/info carries
+	// "guest_arch" when every shed this server can create has one
+	// architecture. Always advertised. The members are set by the access
+	// guard's report step (backend.Guard), which every shed record passes.
+	FeatureUniformShedRecord = "uniform_shed_record"
 	// FeatureMountSelection signals the create request's "mounts" field
 	// (and the stored selection on every shed). An older server ignores the
 	// field, so a client must not send it without this token.
@@ -43,7 +56,7 @@ const (
 // the returned value (an append can't alias a shared backing array). It is a
 // method because some tokens depend on the server's configuration.
 func (s *Server) serverFeatures() []string {
-	features := []string{FeatureOverview, FeatureHTTPExec, FeatureMountSelection}
+	features := []string{FeatureOverview, FeatureHTTPExec, FeatureExecLimits, FeatureMountSelection, FeatureUniformShedRecord}
 	if s.cfg.ServiceClientsEnabled() {
 		features = append(features, FeatureServiceClients)
 	}

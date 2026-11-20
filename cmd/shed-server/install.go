@@ -104,6 +104,16 @@ func getCurrentUser() (*user.User, error) {
 }
 
 // generateUnitFile generates the systemd unit file content.
+//
+// The unit orders after, and wants, network-online.target, as the deb's
+// packaging/shed-server.service does: a server that takes its users from an
+// account service pulls the list at start-up, and a remote-backend server
+// calls its cloud provider. Started before the network is online, a directory
+// server's first pull fails and its next attempt is 15 minutes later. An
+// upgrade of the binary does not rewrite a unit this command wrote: run it
+// again to get a new template. (On a deb install the same path is the
+// package's conffile, so dpkg can replace it when the person chooses the
+// package's version.)
 func generateUnitFile(u *user.User) string {
 	// Get primary group for user
 	group, err := user.LookupGroupId(u.Gid)
@@ -114,7 +124,8 @@ func generateUnitFile(u *user.User) string {
 
 	template := `[Unit]
 Description=Shed Development Environment Server
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple

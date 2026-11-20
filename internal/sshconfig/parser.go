@@ -2,8 +2,12 @@
 package sshconfig
 
 import (
+	"errors"
+	"fmt"
 	"regexp"
 	"strings"
+
+	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 )
 
 const (
@@ -33,17 +37,81 @@ type ManagedEntry struct {
 	RawContent string
 }
 
-// Parse parses an SSH config file content and extracts the managed block.
+// MarkerError refuses a file whose managed-block marker lines do not frame
+// exactly one block: more than one BEGIN or END line, one without the other,
+// or the END line before the BEGIN line. shed cannot tell which lines are its
+// own, so nothing is written. Path is shown escaped (sdkbootstrap.SafeText).
+type MarkerError struct {
+	Path   string
+	Reason string
+}
+
+func (e *MarkerError) Error() string {
+	return fmt.Sprintf("%s does not hold exactly one shed managed block (%s), so shed cannot tell which lines are its own; "+
+		"nothing was written. Leave exactly one line %q followed by one line %q (or remove both and every line between them), "+
+		"then retry", sdkbootstrap.SafeText(e.Path), e.Reason, BeginMarker, EndMarker)
+}
+
+// blockBounds locates the managed block by its marker LINES, never by a loose
+// substring: a marker is a line that is exactly the marker, a trailing CR
+// allowed, so marker text in a comment or inside a quoted value is never a
+// boundary, and a marker with spaces or tabs around it is refused rather
+// than read as either. begin and end are the offsets of the BEGIN and END lines, both -1
+// when the file has neither. A file whose markers frame no single block is a
+// *MarkerError (Path unset). Every reader and writer of the block uses this.
+func blockBounds(content string) (begin, end int, err error) {
+	var begins, ends []int
+	offset := 0
+	for _, line := range strings.SplitAfter(content, "\n") {
+		switch strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r") {
+		case BeginMarker:
+			begins = append(begins, offset)
+		case EndMarker:
+			ends = append(ends, offset)
+		default:
+			// A marker with spaces or tabs around it is neither a
+			// boundary nor ordinary text: reading it as text would add
+			// a second block beside the one it frames.
+			if t := strings.TrimSpace(line); t == BeginMarker || t == EndMarker {
+				return -1, -1, &MarkerError{Reason: "a marker line has spaces or tabs around it"}
+			}
+		}
+		offset += len(line)
+	}
+	switch {
+	case len(begins) == 0 && len(ends) == 0:
+		return -1, -1, nil
+	case len(begins) != 1 || len(ends) != 1:
+		return -1, -1, &MarkerError{Reason: fmt.Sprintf("%d BEGIN and %d END marker lines", len(begins), len(ends))}
+	case ends[0] < begins[0]:
+		return -1, -1, &MarkerError{Reason: "the END marker line comes before the BEGIN marker line"}
+	}
+	return begins[0], ends[0], nil
+}
+
+// CheckMarkers is blockBounds' refusal for the file at path: nil when content
+// has exactly one managed block or none, else the *MarkerError naming path.
+func CheckMarkers(path, content string) error {
+	if _, _, err := blockBounds(content); err != nil {
+		var me *MarkerError
+		if errors.As(err, &me) {
+			me.Path = path
+		}
+		return err
+	}
+	return nil
+}
+
+// Parse parses an SSH config file content and extracts the managed block,
+// located by its marker lines (blockBounds). A file whose markers frame no
+// single block is read as having none; a writer checks CheckMarkers first.
 func Parse(content string) *ParsedConfig {
 	result := &ParsedConfig{
 		ManagedEntries: []ManagedEntry{},
 	}
 
-	// Find the managed block markers
-	beginIdx := strings.Index(content, BeginMarker)
-	endIdx := strings.Index(content, EndMarker)
-
-	if beginIdx == -1 || endIdx == -1 || endIdx <= beginIdx {
+	beginIdx, endIdx, err := blockBounds(content)
+	if err != nil || beginIdx == -1 {
 		// No valid managed block found
 		result.BeforeBlock = content
 		result.HasManagedBlock = false

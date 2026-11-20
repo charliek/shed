@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -124,6 +125,27 @@ func (c *fakeClock) set(t time.Time) {
 
 func (c *fakeClock) advance(d time.Duration) { c.set(c.Now().Add(d)) }
 
+// fireWithin fires every timer due within d of now, and moves nothing: no
+// time elapses on either clock. It ends a first login's wait
+// (UnknownKeyWait) without moving the readings the slots' rates are
+// measured on, for a test about something else than those rates.
+func (c *fakeClock) fireWithin(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	due := c.t.Add(d)
+	kept := c.timers[:0]
+	for _, tm := range c.timers {
+		switch {
+		case tm.stopped:
+		case !due.Before(tm.at):
+			tm.ch <- c.t
+		default:
+			kept = append(kept, tm)
+		}
+	}
+	c.timers = kept
+}
+
 // memDirectory is the reference server's inputs, in memory: the list, the
 // codes, the disabled servers and an outage switch.
 type memDirectory struct {
@@ -226,6 +248,11 @@ const (
 	// faultInvalidClient: every token request is answered 401
 	// invalid_client, with a Date an hour ahead of the clock.
 	faultInvalidClient faultMode = "invalid-client"
+	// faultScopeRefused: a token request that names a scope is answered
+	// 400 invalid_scope (a service that does not accept the explicit scope
+	// the contract allows); one that names none goes to the reference
+	// server.
+	faultScopeRefused faultMode = "scope-refused"
 	// faultReflectAssertion: every token request is answered 401
 	// invalid_client whose error_description quotes the assertion it
 	// received.
@@ -411,6 +438,15 @@ func (s *rtService) wrap(next http.Handler) http.Handler {
 				rec.Header().Set("Date", s.clock.Now().Add(time.Hour).UTC().Format(http.TimeFormat))
 				rec.WriteHeader(http.StatusUnauthorized)
 				_, _ = rec.Write(out)
+			case faultScopeRefused:
+				if _, named := form["scope"]; !named {
+					next.ServeHTTP(rec, r)
+					break
+				}
+				rec.Header().Set("Content-Type", "application/json")
+				rec.Header().Set("Cache-Control", "no-store")
+				rec.WriteHeader(http.StatusBadRequest)
+				_, _ = rec.Write([]byte(`{"error":"invalid_scope","error_description":"this service does not accept a scope"}`))
 			default:
 				next.ServeHTTP(rec, r)
 			}
@@ -659,6 +695,9 @@ type rtServer struct {
 	ticks  chan time.Time
 	opsFP  string
 	cancel context.CancelFunc
+	// waiting counts the first logins (RefetchForUnknownKey) that have their
+	// deadline timer and have asked for their pull (Runtime.unknownWaiting).
+	waiting *atomic.Int64
 }
 
 // rtTimes are the tests' refresh and trust.
@@ -690,11 +729,13 @@ func startRT(t *testing.T, svc *rtService, stateDir, opsLine string, adjust func
 	if err != nil {
 		t.Fatal(err)
 	}
+	waiting := &atomic.Int64{}
+	rt.unknownWaiting = func() { waiting.Add(1) }
 	if adjust != nil {
 		adjust(rt)
 	}
 	rt.Load()
-	s := &rtServer{rt: rt, log: log, ticks: ticks, opsFP: fpOf(t, opsLine), cancel: func() {}}
+	s := &rtServer{rt: rt, log: log, ticks: ticks, opsFP: fpOf(t, opsLine), cancel: func() {}, waiting: waiting}
 	t.Cleanup(func() { s.stop() })
 	return s
 }

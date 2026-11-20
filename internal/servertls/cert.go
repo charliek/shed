@@ -165,6 +165,22 @@ func PinnedTransport(fingerprint string, certs ClientCertSource) http.RoundTripp
 	return &http.Transport{TLSClientConfig: PinnedClientConfig(fingerprint, certs)}
 }
 
+// RefuseRedirects is the CheckRedirect of every HTTP client that talks to a
+// shed-server's API (the CLI's API client, the Connect tunnel's probe, the
+// roost provider's inventory): it follows no redirect.
+//
+// shed-server's API answers no request with a redirect, so a 3xx comes from
+// something else at that endpoint, and following it would carry the request's
+// credential wherever it points: Go keeps an Authorization header across a
+// redirect to the same host on another port, and a transport with a TLS
+// config still speaks plain http, so a pinned endpoint could hand a bearer
+// token on to an unpinned plaintext URL. http.ErrUseLastResponse makes the
+// 3xx the answer: the client reports it as the non-success status it is, and
+// nothing is sent to its Location.
+func RefuseRedirects(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
 // loadIfCovers loads the persisted cert+key and returns it only when it parses
 // and its SANs cover every requested DNS name and IP. Any failure (missing
 // files, parse error, stale SANs) returns ok=false so the caller regenerates.

@@ -75,6 +75,7 @@ import platform
 import re
 import secrets
 import selectors
+import shlex
 import shutil
 import signal
 import socket
@@ -83,6 +84,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -127,6 +129,9 @@ NEEDS_CSR = "upgrade shed (client certificate support)"  # internal/sshd/bootstr
 BOOTSTRAP_NOT_AUTHORIZED = "bootstrap: key not authorized"  # internal/sshd/bootstrap.go
 KEY_MOVED = "no longer belongs to the user this connection authenticated as"  # internal/sshd/identity.go
 UNKNOWN_KEY_PULL = "directory: unknown key "  # internal/directory/runtime.go
+# A shed name's background pull (NudgeForUnknownKey): its own prefix, which
+# UNKNOWN_KEY_PULL's count does not include.
+SHED_NAME_PULL = "directory: shed-name key "  # internal/directory/runtime.go
 TRUST_ENDED = "directory: TRUST ENDED"  # internal/directory/lookup.go
 STARTUP_KEPT_COPY = "Users: kept copy from "  # internal/directory/runtime.go StartupLines
 STARTUP_NO_COPY = "Users: no kept copy; only the local admins can log in until the first good pull"
@@ -137,6 +142,39 @@ SKIPPED_LOG = 'directory: list entry "{name}" skipped: '  # internal/directory/r
 READY_LINES = ("HTTPS server listening on", "SSH server listening on")  # cmd/shed-server/serve.go
 # The world's trust time in seconds (TRUST).
 TRUST_SECONDS = 120
+
+# The CLI's own words the entry cases match on (test_fixture_units checks each
+# is still in the code). Each is a template: fill it with `.format`.
+# A re-enrolment that would make an entry another user (internal/config
+# entrycert.go, RefusedIssuedUserChange).
+USER_CHANGE_REFUSAL = ('the server issued a certificate for user "{cert}", but entry "{entry}" is held to user '
+                       '"{held}"; nothing was saved.')
+# A stored certificate for a user the entry does not record, the entry
+# recording none (RefusedStoredUserMismatch), and the end of that refusal.
+STORED_UNRECORDED_REFUSAL = 'entry "{entry}" cannot be used: its certificate is for user "{cert}" but the entry records no user'
+NO_REQUEST_SENT = "no request was sent"
+# `shed server add` and `shed server update --refetch` (cmd/shed/server_add.go).
+ENTRY_USER_LINE = "  User: {user}\n"
+ENTRY_USER_CHANGED_LINE = '  User changed from "{was}" to "{now}"\n'
+# `shed users status` as a user who is not an admin: the CLI's wrapping
+# (cmd/shed/users.go usersStatusError), its rendering of an API error
+# (client.go parseError) and the server's refusal (internal/api requireAdmin,
+# handleUsersStatus).
+USERS_STATUS_FORBIDDEN = "users status on {entry}: FORBIDDEN: admin only: the status of the server's users"
+# The reference server's line for each token request (internal/directory/
+# refserver/token.go tokenRequestLine): every line starts with the prefix,
+# and a request naming the directory scope, and nothing else, is the second.
+TOKEN_REQUEST = "token request: "
+TOKEN_REQUEST_DIRECTORY_SCOPE = 'token request: scope="directory:read"'
+# GET /api/info's `exec` member (internal/config/types.go ExecLimits) and the
+# feature tokens of the exec limits and the uniform shed record
+# (internal/api/overview.go).
+EXEC_LIMIT_MEMBERS = frozenset({
+    "max_stdin_bytes", "max_timeout_seconds", "default_timeout_seconds", "max_output_bytes",
+    "default_output_bytes", "max_concurrent_per_shed", "max_argv_elements", "max_env_keys", "max_argv_env_bytes",
+})
+FEATURE_EXEC_LIMITS = "exec_limits"
+FEATURE_UNIFORM_SHED_RECORD = "uniform_shed_record"
 
 # How the server refuses a client certificate at the TLS handshake: crypto/tls
 # answers a failed VerifyConnection (servertls.ClientConnectionVerifier) with a
@@ -591,6 +629,323 @@ def path_matches(rel: str, pattern: str) -> bool:
     return len(parts) == len(pats) and all(fnmatch.fnmatchcase(a, p) for a, p in zip(parts, pats))
 
 
+def shed_tree(home: Path) -> dict[str, tuple]:
+    """Everything the CLI keeps for an identity: every entry under its
+    `~/.shed`, the folder itself included (`config.yaml`, `known_hosts`, the
+    credential files, lock files, temporary files, staging folders, empty
+    folders, anything else), each as its path relative to `home` and a
+    tuple of its type, its permission bits and its content: a regular file's
+    SHA-256, a symbolic link's target, None for a folder (whose entries are
+    listed on their own), the file type for anything else. No link is
+    followed. Two equal results mean nothing the CLI keeps was written, made
+    or removed. Times are not compared, so a lock taken and released, which
+    leaves its file's bytes as they were, is no change; nothing is left
+    out."""
+    out: dict[str, tuple] = {}
+
+    def visit(p: Path) -> None:
+        st = os.lstat(p)
+        rel, mode = p.relative_to(home).as_posix(), stat.S_IMODE(st.st_mode)
+        if stat.S_ISLNK(st.st_mode):
+            out[rel] = ("symlink", mode, os.readlink(p))
+        elif stat.S_ISDIR(st.st_mode):
+            out[rel] = ("dir", mode, None)
+            for name in sorted(os.listdir(p)):
+                visit(p / name)
+        elif stat.S_ISREG(st.st_mode):
+            out[rel] = ("file", mode, hashlib.sha256(p.read_bytes()).hexdigest())
+        else:
+            out[rel] = ("other", mode, stat.S_IFMT(st.st_mode))
+
+    root = home / ".shed"
+    if os.path.lexists(root):
+        visit(root)
+    return out
+
+
+# One member of a server entry as the CLI writes it: a plain key, a colon,
+# and a value on the same line.
+_ENTRY_MEMBER = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ ]+(\S.*))?")
+_DOUBLE_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"(?:[ ]+#.*)?')
+_SINGLE_QUOTED = re.compile(r"'(?:[^']|'')*'(?:[ ]+#.*)?")
+
+
+def _single_line_value(value: Optional[str]) -> bool:
+    """Whether `value`, what follows `key: ` on a member's line, is a whole
+    scalar on that line: not missing (a nested collection or a null), not
+    the start of a flow collection or a block scalar, no anchor, alias or
+    tag, and a quoted value closed on the line."""
+    if not value or value[0] in "{[|>&*!%@`":
+        return False
+    if value[0] == '"':
+        return _DOUBLE_QUOTED.fullmatch(value) is not None
+    if value[0] == "'":
+        return _SINGLE_QUOTED.fullmatch(value) is not None
+    return True
+
+
+def drop_entry_field(text: str, entry: str, field: str) -> str:
+    """config.yaml's text with the one `<field>:` line of the server entry
+    `entry` removed, as a person removes it by hand: every other byte is
+    kept. The entry is under the top-level `servers:`, indented with spaces,
+    and each of its lines must be one member at the indentation of its first
+    member with its value on that line (`key: value`), as the CLI writes it.
+    Raises ValueError on any line inside the entry that is not (a nested
+    member, a key with no value, a value that opens a flow collection or a
+    block scalar, a quoted value that does not end on its line), on a line
+    indented with a tab, and unless exactly one such `<field>:` line is
+    found."""
+    lines = text.splitlines(keepends=True)
+    in_servers, entry_indent, inside, member_indent = False, None, False, None
+    hits = []
+    for i, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        stripped = body.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lead = body[:len(body) - len(body.lstrip(" \t"))]
+        if "\t" in lead:
+            raise ValueError(f"line {i + 1} is indented with a tab")
+        indent = len(lead)
+        if indent == 0:
+            in_servers, entry_indent, inside = stripped == "servers:", None, False
+            continue
+        if not in_servers:
+            continue
+        if entry_indent is None:
+            entry_indent = indent
+        if indent <= entry_indent:
+            inside, member_indent = stripped == f"{entry}:", None
+            continue
+        if inside:
+            if member_indent is None:
+                member_indent = indent
+            m = _ENTRY_MEMBER.fullmatch(stripped)
+            if indent != member_indent or m is None or not _single_line_value(m.group(2)):
+                raise ValueError(f"line {i + 1} of server entry {entry!r} is not a one-line `key: value` member: "
+                                 f"{stripped!r}")
+            if m.group(1) == field:
+                hits.append(i)
+    if len(hits) != 1:
+        raise ValueError(f"{len(hits)} {field!r} lines in server entry {entry!r}, not one")
+    del lines[hits[0]]
+    return "".join(lines)
+
+
+_AGENT_SHIM = """#!/bin/sh
+# Integration-suite identity {user!s}: the system ssh with every key of the
+# world's key agent, in the order the agent holds them, as a person's ssh
+# offers its agent's keys.
+#
+# It adds only what keeps the run apart from the account running the tests:
+# no ssh config of that account (-F /dev/null); the world's agent and never
+# the caller's (IdentityAgent, SSH_AUTH_SOCK unset); no default key file (the
+# IdentityFile, which does not exist: ssh reads the default key files from
+# the account's home in the password database, never from $HOME). Every other
+# option (BatchMode, the password and keyboard-interactive switches,
+# UpdateHostKeys, ControlMaster, ControlPath, IdentitiesOnly, -i) is the
+# CLI's own to set, and the cases check the CLI sets what it should.
+#
+# Each run first records the arguments it was given (before its own), NUL
+# after each, in a new file of the identity's argv folder.
+unset SSH_AUTH_SOCK
+rec=$(mktemp {record}) || exit 255
+if [ "$#" -gt 0 ]; then printf '%s\\0' "$@" >"$rec" || exit 255; fi
+exec {ssh} -F /dev/null -o IdentityAgent={sock} -o IdentityFile={no_key} "$@"
+"""
+
+# What a path the shim hands ssh may not hold: whitespace and quotes (ssh
+# splits an option's value on them), `%` and `~` and `$` (ssh expands
+# tokens, a home folder and environment variables in IdentityAgent and
+# IdentityFile), a backslash (it unescapes) and `#` (a comment). A world's paths are
+# short ASCII; one that holds any of these is refused, never quoted around.
+_SHIM_PATH_REFUSED = frozenset(" \t\r\n\"'%~$\\#")
+
+
+def agent_shim_text(user: str, sock: Path, no_key: Path, ssh: str, argv_dir: Path) -> str:
+    """The `ssh` shim of an identity whose keys are an agent's (`KeyAgent`),
+    recording each run's arguments in `argv_dir` (`recorded_argv`): split
+    out so the unit tests can run it. Raises ValueError for a path that is
+    not absolute or holds a character ssh would read as more than a path."""
+    for p in (sock, no_key, argv_dir, Path(ssh)):
+        s = str(p)
+        bad = sorted(set(s) & _SHIM_PATH_REFUSED)
+        if not s.startswith("/") or bad:
+            raise ValueError(f"the shim cannot hand ssh the path {s!r}: "
+                             + (f"it holds {''.join(bad)!r}" if bad else "it is not absolute"))
+    return _AGENT_SHIM.format(user=user, ssh=shlex.quote(ssh), sock=shlex.quote(str(sock)),
+                              no_key=shlex.quote(str(no_key)), record=shlex.quote(f"{argv_dir}/run.XXXXXXXX"))
+
+
+def recorded_argv(argv_dir: Path) -> list[list[str]]:
+    """The arguments of each run the agent shim recorded in `argv_dir`, in
+    the order the runs were made."""
+    runs = sorted(argv_dir.glob("run.*"), key=lambda p: (p.stat().st_mtime_ns, p.name))
+    out = []
+    for p in runs:
+        data = p.read_bytes()
+        out.append(data.split(b"\0")[:-1] if data else [])
+    return [[a.decode("utf-8", "surrogateescape") for a in run] for run in out]
+
+
+def has_option(argv: Sequence[str], flag: str, value: str) -> bool:
+    """Whether `argv` holds `flag` followed by `value` (`-o X=y`, `-i path`)."""
+    return any(a == flag and b == value for a, b in zip(argv, argv[1:]))
+
+
+# ----------------------------------------------------------------------------
+# A counting relay
+# ----------------------------------------------------------------------------
+
+
+class Relay:
+    """A test-owned TCP relay on 127.0.0.1, in front of `target` (a port on
+    127.0.0.1): it counts every connection it accepts, before a byte is
+    read, then forwards bytes both ways until either side ends. A connection
+    that is opened and closed with nothing sent is counted too. One thread
+    accepts; each connection has a thread per direction. `close` stops all
+    of it (the world's clean-up calls it)."""
+
+    def __init__(self, target: int) -> None:
+        """Nothing listens until `start` (so the world can register it for
+        clean-up first)."""
+        self.target = target
+        self.port = 0
+        self._accepts = 0
+        self._lock = threading.Lock()
+        self._closed = threading.Event()
+        self._listener: Optional[socket.socket] = None
+        self._socks: set[socket.socket] = set()
+        self._threads: list[threading.Thread] = []
+        # The relay's own marker connections (`settle`), by their port.
+        self._markers: dict[int, threading.Event] = {}
+
+    @property
+    def accepts(self) -> int:
+        with self._lock:
+            return self._accepts
+
+    def settle(self, timeout: float = 10) -> int:
+        """The count once every connection made before this call has been
+        accepted: a marker connection of the relay's own joins the same
+        queue behind them, and the relay neither counts nor forwards it, so
+        once it is accepted every one before it has been counted. (Reading
+        `accepts` straight after a command could miss a connection the
+        kernel took that the relay's thread had not yet accepted.)"""
+        marker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            marker.bind((HOST, 0))
+            seen = threading.Event()
+            port = marker.getsockname()[1]
+            with self._lock:
+                self._markers[port] = seen
+            try:
+                marker.settimeout(timeout)
+                marker.connect((HOST, self.port))
+                if not seen.wait(timeout):
+                    raise AssertionError(f"the relay on port {self.port} did not accept its marker in {timeout} s")
+            finally:
+                with self._lock:
+                    self._markers.pop(port, None)
+        finally:
+            marker.close()
+        return self.accepts
+
+    def start(self) -> "Relay":
+        ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ls.bind((HOST, 0))
+        ls.listen(64)
+        # accept wakes up to see `close`.
+        ls.settimeout(0.2)
+        self._listener, self.port = ls, ls.getsockname()[1]
+        self._spawn(self._serve)
+        return self
+
+    def _spawn(self, fn: Callable, *args) -> None:
+        t = threading.Thread(target=fn, args=args, daemon=True)
+        with self._lock:
+            self._threads.append(t)
+        t.start()
+
+    def _keep(self, s: socket.socket) -> bool:
+        """Track `s` to close it; False (and `s` closed) once closing."""
+        with self._lock:
+            if not self._closed.is_set():
+                self._socks.add(s)
+                return True
+        s.close()
+        return False
+
+    def _serve(self) -> None:
+        while not self._closed.is_set():
+            try:
+                conn, peer = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with self._lock:
+                marker = self._markers.get(peer[1])
+                if marker is None:
+                    self._accepts += 1
+            if marker is not None:
+                conn.close()
+                marker.set()
+                continue
+            conn.settimeout(None)
+            if self._keep(conn):
+                self._spawn(self._pair, conn)
+
+    def _pair(self, conn: socket.socket) -> None:
+        try:
+            up = socket.create_connection((HOST, self.target), timeout=10)
+            up.settimeout(None)
+        except OSError:
+            conn.close()
+            return
+        if not self._keep(up):
+            conn.close()
+            return
+        back = threading.Thread(target=self._pump, args=(up, conn), daemon=True)
+        back.start()
+        self._pump(conn, up)
+        back.join()
+        for s in (conn, up):
+            s.close()
+
+    @staticmethod
+    def _pump(src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def close(self, timeout: float = 5) -> None:
+        with self._lock:
+            self._closed.set()
+            socks, self._socks = list(self._socks), set()
+            threads = list(self._threads)
+        if self._listener is not None:
+            self._listener.close()
+        for s in socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            s.close()
+        for t in threads:
+            t.join(timeout)
+
+
 # ----------------------------------------------------------------------------
 # The API: answered, refused by the server, or a failure
 # ----------------------------------------------------------------------------
@@ -768,6 +1123,18 @@ class RefServer:
         else:
             path.unlink(missing_ok=True)
 
+    def log(self) -> str:
+        """What the reference server has logged (its standard error)."""
+        try:
+            return self.err.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def token_requests(self) -> list[str]:
+        """Each token request line it has logged (`TOKEN_REQUEST`), from the
+        prefix on."""
+        return [line[line.index(TOKEN_REQUEST):] for line in self.log().splitlines() if TOKEN_REQUEST in line]
+
     def stop(self) -> bool:
         return self.proc is None or _stop(self.proc)
 
@@ -880,12 +1247,26 @@ class DirIdentity(Identity):
     """An identity of the world: `bin/` first on its PATH, after its shim."""
 
     bin_dir: Optional[Path] = None
+    # Where an agent identity's shim records each ssh run's arguments
+    # (`World.agent_identity`); None for a one-key identity.
+    argv_dir: Optional[Path] = None
 
     def env(self) -> dict:
         env = super().env()
         if self.bin_dir is not None:
             env["PATH"] = f"{self.shim.parent}{os.pathsep}{self.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
         return env
+
+    def ssh_runs(self) -> list[list[str]]:
+        """The arguments of each ssh run so far, as the CLI gave them to the
+        shim (`recorded_argv`)."""
+        assert self.argv_dir is not None, f"{self.user}'s shim records nothing"
+        return recorded_argv(self.argv_dir)
+
+    def forget_ssh_runs(self) -> None:
+        assert self.argv_dir is not None, f"{self.user}'s shim records nothing"
+        for p in self.argv_dir.glob("run.*"):
+            p.unlink()
 
 
 @dataclass
@@ -1079,6 +1460,53 @@ class Held:
             _stop(self.proc, timeout=10)
 
 
+class KeyAgent:
+    """An `ssh-agent` of the world, in the foreground (`-D`), on a socket in
+    the world's folder (its command line names the folder, so the world's
+    clean-up finds it whatever happened). It holds the keys added to it, in
+    that order, and ssh offers them in that order."""
+
+    def __init__(self, agent: str, add: str, sock: Path, log: Path, home: Path) -> None:
+        """Nothing runs until `start` (so the world can register it for
+        clean-up first)."""
+        self.agent, self.add_bin, self.sock, self.log, self.home = agent, add, sock, log, home
+        self.proc: Optional[subprocess.Popen] = None
+
+    def env(self) -> dict:
+        return _base_env(self.home, {"SSH_AUTH_SOCK": str(self.sock)})
+
+    def start(self, timeout: float = 10) -> "KeyAgent":
+        with self.log.open("wb") as log:
+            self.proc = subprocess.Popen([self.agent, "-D", "-a", str(self.sock)], stdin=subprocess.DEVNULL,
+                                         stdout=log, stderr=log, env=_base_env(self.home))
+        if not _wait_for(lambda: self.proc.poll() is not None or self.sock.exists(), timeout, interval=0.05):
+            raise AssertionError(f"ssh-agent made no socket in {timeout} s:\n{_tail(self.log)}")
+        if self.proc.poll() is not None:
+            raise AssertionError(f"ssh-agent exited ({self.proc.returncode}):\n{_tail(self.log)}")
+        return self
+
+    def add(self, key: "Key") -> None:
+        """Add `key` (its file path is the only argument; the key has no
+        passphrase)."""
+        r = subprocess.run([self.add_bin, str(key.path)], capture_output=True, text=True, timeout=30,
+                           env=self.env(), stdin=subprocess.DEVNULL)
+        assert r.returncode == 0, f"ssh-add {key.label}: {r.stderr}"
+
+    def listed(self) -> list[str]:
+        """The public keys the agent holds, in its order, as `type base64`."""
+        r = subprocess.run([self.add_bin, "-L"], capture_output=True, text=True, timeout=30, env=self.env(),
+                           stdin=subprocess.DEVNULL)
+        if r.returncode == 1 and not r.stdout.strip():
+            return []
+        assert r.returncode == 0, f"ssh-add -L: {r.stderr}"
+        return [" ".join(line.split()[:2]) for line in r.stdout.splitlines() if line.strip()]
+
+    def close(self) -> None:
+        if self.proc is not None:
+            _stop(self.proc, timeout=5)
+        self.sock.unlink(missing_ok=True)
+
+
 # ----------------------------------------------------------------------------
 # The world
 # ----------------------------------------------------------------------------
@@ -1176,6 +1604,46 @@ class World:
         shim.chmod(0o755)
         return DirIdentity(user=user, key=key.path, home=home, entry=ENTRY, host=HOST, ssh_port=self.ssh_port,
                            shim=shim, bin_dir=self.bin_dir)
+
+    def agent(self, keys: Sequence[Key]) -> KeyAgent:
+        """A new key agent of the world holding `keys`, in that order."""
+        tools = shutil.which("ssh-agent"), shutil.which("ssh-add")
+        if not all(tools):
+            raise AssertionError("ssh-agent and ssh-add must be on PATH")
+        self._n += 1
+        a = KeyAgent(tools[0], tools[1], self.sockets / f"a{self._n}", self.logs / f"agent-{self._n}.log",
+                     self.homes)
+        # Registered for clean-up before anything starts.
+        self._helpers.append(a)
+        a.start()
+        for k in keys:
+            a.add(k)
+        assert a.listed() == [k.pub for k in keys], (a.listed(), [k.label for k in keys])
+        return a
+
+    def agent_identity(self, user: str, agent: KeyAgent) -> DirIdentity:
+        """A person whose ssh offers every key `agent` holds, in its order,
+        and no key file (`agent_shim_text`): its own HOME, shim and CLI
+        entry, as `identity` makes them."""
+        self._n += 1
+        home = self.homes / f"{user}-{self._n}"
+        home.mkdir(mode=0o700)
+        no_key = self.keys_dir / "none" / "absent"
+        argv_dir = self.root / "argv" / f"{user}-{self._n}"
+        argv_dir.mkdir(parents=True, mode=0o700)
+        shim = home / "bin" / "ssh"
+        shim.parent.mkdir()
+        shim.write_text(agent_shim_text(user, agent.sock, no_key, self.ssh, argv_dir), encoding="utf-8")
+        shim.chmod(0o755)
+        return DirIdentity(user=user, key=no_key, home=home, entry=ENTRY, host=HOST, ssh_port=self.ssh_port,
+                           shim=shim, bin_dir=self.bin_dir, argv_dir=argv_dir)
+
+    def relay(self, target: int) -> Relay:
+        """A new counting relay of the world in front of `target`."""
+        r = Relay(target)
+        # Registered for clean-up before anything starts.
+        self._helpers.append(r)
+        return r.start()
 
     def set_user(self, name: str, keys: Sequence[Key], admin: bool = False) -> None:
         """Put `name` in the list (not served until `publish`)."""
@@ -1402,6 +1870,18 @@ class World:
             print(f"----- {p.name} (last lines) -----\n{_tail(p)}")
 
 
+def real_ssh() -> Optional[str]:
+    """The system's own ssh: /usr/bin/ssh where there is one, else the first
+    on PATH. The shims here wrap it, and a run on a shared machine may itself
+    put a wrapper named ssh first on PATH (one that adds its own options ahead
+    of a shim's); taking the system's binary keeps what a shim adds the only
+    thing added."""
+    system = "/usr/bin/ssh"
+    if os.access(system, os.X_OK):
+        return system
+    return shutil.which("ssh")
+
+
 @contextmanager
 def directory_world() -> Iterator[World]:
     """A fresh world, removed when the block ends, whatever happened in it.
@@ -1410,7 +1890,7 @@ def directory_world() -> Iterator[World]:
     missing = missing_binaries(bin_dir)
     if missing:
         raise AssertionError(f"missing {', '.join(map(str, missing))}: make test-integration-directory builds them")
-    ssh, false = shutil.which("ssh"), shutil.which("false")
+    ssh, false = real_ssh(), shutil.which("false")
     if not ssh or not false:
         raise AssertionError("ssh and false must be on PATH")
     root = Path(tempfile.mkdtemp(prefix="shed-dir-", dir=socket_base(tempfile.gettempdir())))

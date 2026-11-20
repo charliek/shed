@@ -603,6 +603,7 @@ func (b *Backend) adoptedRecord(inst provider.Instance, id provider.Identity) (*
 			Image:          spec.Image,
 			Owner:          id.Owner,
 			NetworkProfile: spec.Network,
+			Arch:           inst.Arch,
 		},
 		Env:         id.Env,
 		Zone:        inst.Zone,

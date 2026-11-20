@@ -28,13 +28,19 @@ func (s *Server) recordAudit(v any) {
 	}
 }
 
-// auditIdentity is the audit form of a caller: a client by name and serial,
-// an admin by subject (none in open mode).
+// auditIdentity is the audit form of a caller: a client by name and serial; a
+// person as kind user, by name (or implicit), with the admin and script flags,
+// the certificate's subject (the key's fingerprint; none in open mode) and its
+// serial. A caller that maps to no principal (no kind, or a user that is
+// neither named nor implicit) is recorded as unknown, never as a person: the
+// rule sshd's sshIdentity applies too (audit.PersonIdentity). The access
+// guard refuses such a caller before the backend, so no line should ever
+// carry it.
 func auditIdentity(c Caller) audit.Identity {
 	if c.IsClient() {
-		return audit.Identity{Kind: audit.KindClient, Name: c.Name, Serial: c.Serial}
+		return audit.ClientIdentity(c.Name, c.Serial)
 	}
-	return audit.Identity{Kind: audit.KindAdmin, Subject: c.Name}
+	return audit.PersonIdentity(c.Kind == CallerUser, c.User, c.Implicit, c.IsAdmin(), c.Script, c.Name, c.Serial)
 }
 
 // auditEntry is the part of a client request's api line that is learned while
@@ -54,7 +60,7 @@ func auditEntryFrom(ctx context.Context) *auditEntry {
 }
 
 // setAuditShed names the shed of the current client request's api line (a
-// no-op for an admin request, which has no entry).
+// no-op for a person's request, which has no entry).
 func setAuditShed(ctx context.Context, name string) {
 	if e := auditEntryFrom(ctx); e != nil {
 		e.shed = name
@@ -63,8 +69,9 @@ func setAuditShed(ctx context.Context, name string) {
 
 // auditClientRequest serves one service client request through serve and
 // then writes its api line: exactly one per request, whether it was allowed,
-// refused (401, 403, 404, a policy violation) or failed. Admin requests never
-// come through here and are not logged.
+// refused (401, 403, 404, a policy violation) or failed. A person's requests
+// (a user's, or the implicit user's) never come through here and are not
+// logged.
 func (s *Server) auditClientRequest(w http.ResponseWriter, r *http.Request, id audit.Identity, serve func(http.ResponseWriter, *http.Request)) {
 	if s.audit == nil {
 		serve(w, r)

@@ -205,11 +205,14 @@ func (c *Client) toInstance(g *gceInstance) provider.Instance {
 	for _, s := range c.cfg.Sizes {
 		if s.MachineType == inst.MachineType {
 			inst.CPUs, inst.MemoryMB = s.CPUs, s.MemoryMB
-			if s.Arch != "" {
-				inst.Arch = s.Arch
-			}
 			break
 		}
+	}
+	if inst.Arch == "" {
+		// The boot disk is the cloud's own answer and always wins: the
+		// configured sizes say what the server would make today, not what
+		// made this instance. They are asked only when the disk names none.
+		inst.Arch = configuredArch(c.cfg.Sizes, inst.MachineType)
 	}
 	if len(g.Scheduling) > 0 {
 		var sched struct {
@@ -226,6 +229,25 @@ func (c *Client) toInstance(g *gceInstance) provider.Instance {
 		inst.Image = spec.Image
 	}
 	return inst
+}
+
+// configuredArch is the architecture every configured size with this machine
+// type names, or "" when none matches or two of them disagree: a guess
+// between two is never reported as the instance's architecture. A size that
+// names no architecture says nothing (it could not have made an instance,
+// provider.Spec.Validate requires one).
+func configuredArch(sizes []provider.Size, machineType string) string {
+	arch := ""
+	for _, s := range sizes {
+		if s.MachineType != machineType || s.Arch == "" {
+			continue
+		}
+		if arch != "" && arch != s.Arch {
+			return ""
+		}
+		arch = s.Arch
+	}
+	return arch
 }
 
 func archFromDisk(a string) string {

@@ -315,6 +315,19 @@ type Shed struct {
 	// fixed at create. A shed created before network profiles existed
 	// reports "open".
 	NetworkProfile string `json:"network_profile,omitempty" yaml:"network_profile,omitempty"`
+	// Isolation is the isolation in force for the shed: "none", "firewall"
+	// (the isolated profile, held by the server host's own firewall) or
+	// "topology" (the isolated profile, held by the network's topology). It
+	// is computed when a record is reported (backend.IsolationOf, in the
+	// access guard's report step), never stored by any backend, and fails
+	// closed: an isolated shed on a backend with no isolation kind reports
+	// "none".
+	Isolation string `json:"isolation,omitempty" yaml:"-"`
+	// Arch is the guest's architecture, "amd64" or "arm64". The remote
+	// backend stores it (from the size at create, from the instance on
+	// adoption; a record written before it existed has none and reports
+	// none); for Firecracker and VZ the report step sets the host's.
+	Arch string `json:"arch,omitempty" yaml:"arch,omitempty"`
 }
 
 // HostResources names what the shed, as its backend reports it, reaches that
@@ -325,10 +338,10 @@ type Shed struct {
 // are how server credentials (~/.config/gh and the like) reach a shed. It
 // returns nil for a shed that reaches none of them.
 //
-// Firecracker and VZ always report a selection (a shed created before
-// selection existed reports {mode: all}, so it counts); the remote backend
-// cannot mount anything and reports none (nil), which counts as nothing.
-// The access rule refuses a user who is not an admin entry to (and a start
+// Every backend reports a selection: a Firecracker or VZ shed created before
+// selection existed reports {mode: all}, so it counts; a remote shed, which
+// cannot mount anything, reports {mode: selected} with no names, which counts
+// as nothing. The access rule refuses a user who is not an admin entry to (and a start
 // of) a shed that carries any of these, and assigning such a shed to a user
 // is refused for the same reason.
 func (s *Shed) HostResources() []string {
@@ -581,6 +594,48 @@ type ServerInfo struct {
 	// remote (no route between sheds or to the server host). Omitted on
 	// Firecracker and VZ, whose /api/info is unchanged.
 	Isolation string `json:"isolation,omitempty"`
+
+	// Exec is what POST /api/sheds/{name}/exec holds a request to, present
+	// exactly when Features carries "exec_limits". The values are the
+	// server's own, the same for every caller. Omitted by older servers.
+	Exec *ExecLimits `json:"exec,omitempty"`
+
+	// GuestArch is the architecture every shed this server can create runs
+	// ("amd64" or "arm64"): the host's on Firecracker and VZ, the one every
+	// configured size shares on remote. Omitted when remote sizes mix
+	// architectures (each shed record's arch then says), and by older
+	// servers.
+	GuestArch string `json:"guest_arch,omitempty"`
+}
+
+// ExecLimits is the exec member of GET /api/info: the limits an HTTPS exec
+// request is refused above (Max*) and the values a request that sets none
+// gets (Default*). internal/api fills it from the same values its exec route
+// enforces. Durations are whole seconds, rounded down.
+type ExecLimits struct {
+	// MaxStdinBytes is exec.max_stdin_bytes: the decoded stdin a request
+	// may carry.
+	MaxStdinBytes int64 `json:"max_stdin_bytes"`
+	// MaxTimeoutSeconds is exec.max_timeout: the largest timeout_seconds.
+	MaxTimeoutSeconds int64 `json:"max_timeout_seconds"`
+	// DefaultTimeoutSeconds is the timeout of a request with no
+	// timeout_seconds: 60, or MaxTimeoutSeconds when that is lower.
+	DefaultTimeoutSeconds int64 `json:"default_timeout_seconds"`
+	// MaxOutputBytes is the largest max_output_bytes.
+	MaxOutputBytes int64 `json:"max_output_bytes"`
+	// DefaultOutputBytes is the output budget of a request with no
+	// max_output_bytes.
+	DefaultOutputBytes int64 `json:"default_output_bytes"`
+	// MaxConcurrentPerShed is exec.max_concurrent_per_shed: one more exec in
+	// the same shed is refused with 429 EXEC_LIMIT.
+	MaxConcurrentPerShed int `json:"max_concurrent_per_shed"`
+	// MaxArgvElements, MaxEnvKeys and MaxArgvEnvBytes bound argv's length,
+	// env's keys, and the bytes of argv plus env as the route counts them:
+	// every argv element, plus for each env entry its key, one "=" byte and
+	// its value.
+	MaxArgvElements int   `json:"max_argv_elements"`
+	MaxEnvKeys      int   `json:"max_env_keys"`
+	MaxArgvEnvBytes int64 `json:"max_argv_env_bytes"`
 }
 
 // FeatureMountSelection is the /api/info feature token for the create

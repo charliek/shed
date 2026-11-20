@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"path"
 	"regexp"
@@ -51,6 +52,79 @@ var execFinishWriteGrace = 10 * time.Second
 
 var execEnvKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// execLimits is every limit and default the exec route holds a request to:
+// the configured exec.* values (or their defaults) and the fixed limits
+// above. The route reads them from here and nowhere else, and GET /api/info
+// reports this same value (report), so what a client is told cannot drift
+// from what it is refused above.
+type execLimits struct {
+	maxStdinBytes        int64
+	maxTimeout           time.Duration
+	defaultTimeout       time.Duration
+	maxOutputBytes       int64
+	defaultOutputBytes   int64
+	maxConcurrentPerShed int
+	maxArgv              int
+	maxEnv               int
+	maxArgvEnvBytes      int
+}
+
+// execLimits reads the limits from the server's config. They are the
+// server's own: no caller, service clients included, is held to others.
+func (s *Server) execLimits() execLimits {
+	maxTimeout := s.cfg.ExecMaxTimeout()
+	return execLimits{
+		maxStdinBytes:        s.cfg.ExecMaxStdinBytes(),
+		maxTimeout:           maxTimeout,
+		defaultTimeout:       min(execDefaultTimeout, maxTimeout),
+		maxOutputBytes:       execMaxOutputBytesCeiling,
+		defaultOutputBytes:   execDefaultMaxOutputBytes,
+		maxConcurrentPerShed: s.cfg.ExecMaxConcurrentPerShed(),
+		maxArgv:              execMaxArgv,
+		maxEnv:               execMaxEnv,
+		maxArgvEnvBytes:      execMaxArgvEnvBytes,
+	}
+}
+
+// maxTimeoutSeconds is the largest timeout_seconds the route accepts:
+// maxTimeout in whole seconds, rounded down. For a whole number of seconds
+// n, n*1s > maxTimeout exactly when n > this value, so the route compares in
+// whole seconds and never multiplies a request's number before it is known
+// to be in range (the product of a large one overflows to a negative or
+// small duration).
+func (l execLimits) maxTimeoutSeconds() int64 {
+	return int64(l.maxTimeout / time.Second)
+}
+
+// bodyLimit is the most bytes a request body may carry: the base64 of
+// maxStdinBytes plus execBodySlack. It saturates at math.MaxInt64 rather
+// than overflow (a negative cap would refuse every request), whatever
+// maxStdinBytes is; config validation keeps it far below that.
+func (l execLimits) bodyLimit() int64 {
+	if l.maxStdinBytes > (math.MaxInt64-2-execBodySlack)/4 {
+		return math.MaxInt64
+	}
+	// Base64 grows stdin by 4/3; the slack carries argv, env and the JSON.
+	return (l.maxStdinBytes*4+2)/3 + execBodySlack
+}
+
+// report is the /api/info exec member. Durations are whole seconds rounded
+// down; the route compares a request's timeout_seconds with
+// maxTimeoutSeconds(), the same number reported here.
+func (l execLimits) report() *config.ExecLimits {
+	return &config.ExecLimits{
+		MaxStdinBytes:         l.maxStdinBytes,
+		MaxTimeoutSeconds:     l.maxTimeoutSeconds(),
+		DefaultTimeoutSeconds: int64(l.defaultTimeout / time.Second),
+		MaxOutputBytes:        l.maxOutputBytes,
+		DefaultOutputBytes:    l.defaultOutputBytes,
+		MaxConcurrentPerShed:  l.maxConcurrentPerShed,
+		MaxArgvElements:       l.maxArgv,
+		MaxEnvKeys:            l.maxEnv,
+		MaxArgvEnvBytes:       int64(l.maxArgvEnvBytes),
+	}
+}
+
 // execRequestError is a refusal before anything ran: the status, the API code
 // and the message for writeError.
 type execRequestError struct {
@@ -91,7 +165,8 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	name := chi.URLParam(r, "name")
 
-	plan, reqErr := s.parseExecRequest(w, r)
+	limits := s.execLimits()
+	plan, reqErr := s.parseExecRequest(w, r, limits)
 	if reqErr != nil {
 		writeError(w, reqErr.status, reqErr.code, reqErr.message)
 		return
@@ -116,10 +191,10 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 		plan.cwd = shed.LandingDir
 	}
 
-	release, ok := s.acquireExecSlot(name)
+	release, ok := s.acquireExecSlot(name, limits.maxConcurrentPerShed)
 	if !ok {
 		writeError(w, http.StatusTooManyRequests, config.ErrExecLimit,
-			fmt.Sprintf("shed %s already runs %d execs (exec.max_concurrent_per_shed)", name, s.cfg.ExecMaxConcurrentPerShed()))
+			fmt.Sprintf("shed %s already runs %d execs (exec.max_concurrent_per_shed)", name, limits.maxConcurrentPerShed))
 		return
 	}
 	defer release()
@@ -196,12 +271,11 @@ func (s *Server) handleExecShed(w http.ResponseWriter, r *http.Request) {
 	stream.finish(exit)
 }
 
-// parseExecRequest decodes and validates the body. A nil error means plan is
-// ready to run.
-func (s *Server) parseExecRequest(w http.ResponseWriter, r *http.Request) (*execPlan, *execRequestError) {
-	maxStdin := s.cfg.ExecMaxStdinBytes()
-	// Base64 grows stdin by 4/3; the slack carries argv, env and the JSON.
-	limit := (maxStdin*4+2)/3 + execBodySlack
+// parseExecRequest decodes and validates the body against lim. A nil error
+// means plan is ready to run.
+func (s *Server) parseExecRequest(w http.ResponseWriter, r *http.Request, lim execLimits) (*execPlan, *execRequestError) {
+	maxStdin := lim.maxStdinBytes
+	limit := lim.bodyLimit()
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 
 	var req config.ExecRequest
@@ -224,8 +298,8 @@ func (s *Server) parseExecRequest(w http.ResponseWriter, r *http.Request) (*exec
 	if len(req.Argv) == 0 {
 		return nil, badExecRequest("argv is required")
 	}
-	if len(req.Argv) > execMaxArgv {
-		return nil, badExecRequest("argv has %d elements (at most %d)", len(req.Argv), execMaxArgv)
+	if len(req.Argv) > lim.maxArgv {
+		return nil, badExecRequest("argv has %d elements (at most %d)", len(req.Argv), lim.maxArgv)
 	}
 	size := 0
 	for i, a := range req.Argv {
@@ -235,8 +309,8 @@ func (s *Server) parseExecRequest(w http.ResponseWriter, r *http.Request) (*exec
 		size += len(a)
 	}
 
-	if len(req.Env) > execMaxEnv {
-		return nil, badExecRequest("env has %d keys (at most %d)", len(req.Env), execMaxEnv)
+	if len(req.Env) > lim.maxEnv {
+		return nil, badExecRequest("env has %d keys (at most %d)", len(req.Env), lim.maxEnv)
 	}
 	for k, v := range req.Env {
 		if !execEnvKeyPattern.MatchString(k) {
@@ -249,8 +323,8 @@ func (s *Server) parseExecRequest(w http.ResponseWriter, r *http.Request) (*exec
 		plan.env = append(plan.env, k+"="+v)
 	}
 	sort.Strings(plan.env)
-	if size > execMaxArgvEnvBytes {
-		return nil, badExecRequest("argv and env are %d bytes (at most %d)", size, execMaxArgvEnvBytes)
+	if size > lim.maxArgvEnvBytes {
+		return nil, badExecRequest("argv and env are %d bytes (at most %d)", size, lim.maxArgvEnvBytes)
 	}
 
 	if req.Cwd != "" {
@@ -272,13 +346,13 @@ func (s *Server) parseExecRequest(w http.ResponseWriter, r *http.Request) (*exec
 		plan.stdin = stdin
 	}
 
-	maxTimeout := s.cfg.ExecMaxTimeout()
+	maxTimeout := lim.maxTimeout
 	switch {
 	case req.TimeoutSeconds < 0:
 		return nil, badExecRequest("timeout_seconds must not be negative")
 	case req.TimeoutSeconds == 0:
-		plan.timeout = min(execDefaultTimeout, maxTimeout)
-	case time.Duration(req.TimeoutSeconds)*time.Second > maxTimeout:
+		plan.timeout = lim.defaultTimeout
+	case int64(req.TimeoutSeconds) > lim.maxTimeoutSeconds():
 		return nil, badExecRequest("timeout_seconds %d is over the server's exec.max_timeout (%s)", req.TimeoutSeconds, maxTimeout)
 	default:
 		plan.timeout = time.Duration(req.TimeoutSeconds) * time.Second
@@ -288,24 +362,25 @@ func (s *Server) parseExecRequest(w http.ResponseWriter, r *http.Request) (*exec
 	case req.MaxOutputBytes < 0:
 		return nil, badExecRequest("max_output_bytes must not be negative")
 	case req.MaxOutputBytes == 0:
-		plan.maxOutput = execDefaultMaxOutputBytes
-	case req.MaxOutputBytes > execMaxOutputBytesCeiling:
-		return nil, badExecRequest("max_output_bytes %d is over %d", req.MaxOutputBytes, execMaxOutputBytesCeiling)
+		plan.maxOutput = lim.defaultOutputBytes
+	case req.MaxOutputBytes > lim.maxOutputBytes:
+		return nil, badExecRequest("max_output_bytes %d is over %d", req.MaxOutputBytes, lim.maxOutputBytes)
 	default:
 		plan.maxOutput = req.MaxOutputBytes
 	}
 	return plan, nil
 }
 
-// acquireExecSlot takes one of the shed's exec.max_concurrent_per_shed slots.
-// ok=false means they are all taken; otherwise release must be called once.
-func (s *Server) acquireExecSlot(name string) (release func(), ok bool) {
+// acquireExecSlot takes one of the shed's exec slots, of which there are
+// limit (exec.max_concurrent_per_shed, from execLimits). ok=false means they
+// are all taken; otherwise release must be called once.
+func (s *Server) acquireExecSlot(name string, limit int) (release func(), ok bool) {
 	s.execMu.Lock()
 	defer s.execMu.Unlock()
 	if s.execInFlight == nil {
 		s.execInFlight = map[string]int{}
 	}
-	if s.execInFlight[name] >= s.cfg.ExecMaxConcurrentPerShed() {
+	if s.execInFlight[name] >= limit {
 		return nil, false
 	}
 	s.execInFlight[name]++

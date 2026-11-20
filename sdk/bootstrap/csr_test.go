@@ -1,15 +1,19 @@
 package bootstrap
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -146,6 +150,79 @@ func TestMatchesIssuedCert(t *testing.T) {
 			t.Errorf("err = %v, want errNoCertificatePEM", err)
 		}
 	})
+}
+
+// fakeSSH puts an `ssh` on PATH that prints stdout, as a server's _bootstrap
+// channel would, so a test drives RunCredential through the real exchange
+// body (run, decodeBundle) without a server.
+func fakeSSH(t *testing.T, stdout string) {
+	t.Helper()
+	dir := t.TempDir()
+	out := filepath.Join(dir, "bundle.json")
+	if strings.ContainsRune(out, '\'') {
+		t.Skipf("temp dir %q cannot be single-quoted", out)
+	}
+	if err := os.WriteFile(out, []byte(stdout), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\ncat '"+out+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestUnusableIssuanceIsTyped: every way an mtls bundle can carry no usable
+// client_cert (missing, empty, only whitespace, not PEM, DER that does not
+// parse, a certificate for another key) reaches RunCredential's caller as an
+// *UnusableCertificateError a caller can recognize, with the text it always
+// had, unwrapping to the same error as before. A caller that holds a user to
+// its certificates relies on it to refuse the issuance rather than retry it.
+func TestUnusableIssuanceIsTyped(t *testing.T) {
+	other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const shape = `"auth_mode":"mtls","https_port":8443,"tls_cert_fingerprint":"sha256:a","scope":"control"`
+	bundle := func(cert string) string {
+		b, err := json.Marshal(cert)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "{" + shape + `,"client_cert":` + string(b) + "}"
+	}
+	cases := []struct {
+		name   string
+		stdout string
+		text   string
+		is     error // the error it unwraps to, when there is a sentinel
+	}{
+		{"client_cert is missing", "{" + shape + "}", errNoClientCertificate.Error(), errNoClientCertificate},
+		{"client_cert is empty", bundle(""), errNoClientCertificate.Error(), errNoClientCertificate},
+		{"client_cert is only whitespace", bundle(" \n\t "), errNoClientCertificate.Error(), errNoClientCertificate},
+		{"not PEM", bundle("not a pem"), errNoCertificatePEM.Error(), errNoCertificatePEM},
+		{"DER that does not parse", bundle(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte{0x30, 0x03, 0x02, 0x01}}))),
+			"sdk/bootstrap: parse issued certificate: ", nil},
+		{"another key's certificate", bundle(string(issueFor(t, other.Public()))), errCertKeyMismatch.Error(), errCertKeyMismatch},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeSSH(t, tc.stdout)
+			_, err := RunCredential(context.Background(), Params{
+				Host: "127.0.0.1", Port: 2222, KnownHostsPath: filepath.Join(t.TempDir(), "known_hosts"),
+				Scope: "control", ClientKind: "cli",
+			})
+			var unusable *UnusableCertificateError
+			if !errors.As(err, &unusable) {
+				t.Fatalf("err = %#v, want an *UnusableCertificateError", err)
+			}
+			if !strings.HasPrefix(err.Error(), tc.text) {
+				t.Errorf("text = %q, want it to start %q (unchanged)", err, tc.text)
+			}
+			if tc.is != nil && !errors.Is(err, tc.is) {
+				t.Errorf("err = %v does not unwrap to %v", err, tc.is)
+			}
+		})
+	}
 }
 
 // TestValidateCSRArg: the CSR rides in ONE argv element that the server splits

@@ -2,6 +2,7 @@ package sshd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/gliderlabs/ssh"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/provision"
@@ -96,17 +98,34 @@ func (s *Server) handleSession(sess ssh.Session) {
 
 	// Look up the shed the username names (shedNameFor), waking it when it
 	// is stopped.
-	shed, err := s.ensureRunning(ctx, user, sess.Stderr(), true)
+	// The exec acts on the incarnation that was checked, with the owner and
+	// user it was checked against: ensureRunning pinned both on ctx right
+	// after its check (pinEntry), before any wake.
+	ctx, shed, err := s.ensureRunning(ctx, user, sess.Stderr(), true)
 	if err != nil {
 		fmt.Fprintf(sess.Stderr(), "Error: %v\n", err)
 		_ = sess.Exit(1)
 		return
 	}
-	// The exec acts on the incarnation that was checked and woken.
-	ctx = backend.PinCreatedAt(ctx, shed.CreatedAt)
+
+	// A person's entry into a service client's shed is recorded once the
+	// guarded exec has started the command (onEntered), never here: the
+	// guard checks again, and the shed may be gone or replaced by then.
+	channel := audit.SSHChannelShell
+	if sess.RawCommand() != "" {
+		channel = audit.SSHChannelExec
+	}
+	id, _ := connIdentityFrom(sess.Context())
+	onStarted, endEntry, ok := s.beginEntry(p, id.fingerprint, remoteAddr, shed, channel)
+	if !ok {
+		fmt.Fprintf(sess.Stderr(), "Error: %v\n", errShuttingDown)
+		_ = sess.Exit(1)
+		return
+	}
+	defer endEntry()
 
 	// Execute in the container.
-	if err := s.execInContainer(ctx, sess, shed); err != nil {
+	if err := s.execInContainer(ctx, sess, shed, onStarted); err != nil {
 		log.Printf("Exec failed for shed %s: %v", shed.Name, err)
 		// Propagate the actual exit code when available.
 		if exitErr, ok := err.(*vmutil.ExitError); ok {
@@ -136,8 +155,17 @@ func (s *Server) waitForReady(ctx context.Context, shedName string) error {
 			}
 
 			shed, err := s.backend.GetShed(ctx, shedName)
+			if errors.Is(err, config.ErrShedNotFoundSentinel) {
+				// Gone, or no longer the shed ctx is pinned to (the
+				// guard answers a changed incarnation or owner so): it
+				// will not become ready.
+				return err
+			}
 			if err != nil {
 				continue // Keep trying.
+			}
+			if err := backend.CheckIdentity(ctx, shed.Name, shed.Owner, shed.User, shed.CreatedAt); err != nil {
+				return err
 			}
 
 			if shed.Status == config.StatusRunning {
@@ -151,8 +179,9 @@ func (s *Server) waitForReady(ctx context.Context, shedName string) error {
 	}
 }
 
-// execInContainer executes a command or shell in the shed.
-func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *config.Shed) error {
+// execInContainer executes a command or shell in the shed. onStarted, when
+// set, is the exec's ExecOptions.OnStarted hook.
+func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *config.Shed, onStarted func()) error {
 	// Wrap whatever the client sent into `bash -lc <raw>` so the SSH
 	// command channel runs as a POSIX shell (Docker / Codespaces /
 	// devcontainers / Zed / VS Code / JetBrains Gateway behavior).
@@ -213,6 +242,7 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *co
 		WorkingDir:  shed.LandingDir,
 		InitialSize: initialSize,
 		ResizeChan:  resizeChan,
+		OnStarted:   onStarted,
 	}
 
 	// URL credentials in the command are redacted from the log; env is never

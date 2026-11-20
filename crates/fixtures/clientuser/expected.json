@@ -1,0 +1,341 @@
+{
+  "_comment": "Written by internal/servertls/clientuser_fixture_test.go under UPDATE_CLIENTUSER=1 and checked by it otherwise; read by crates/shed-core/tests/certuser_fixtures.rs. See README.md.",
+  "fixtures": [
+    {
+      "name": "issued-pat",
+      "file": "issued-pat.pem",
+      "what": "issued by SignClientCSR for pat (PrintableString)",
+      "go": "named:pat",
+      "rust": "named:pat"
+    },
+    {
+      "name": "issued-implicit",
+      "file": "issued-implicit.pem",
+      "what": "issued by SignClientCSR for the implicit user (UTF8String !implicit)",
+      "go": "implicit",
+      "rust": "implicit"
+    },
+    {
+      "name": "no-user",
+      "file": "no-user.pem",
+      "what": "a subject with a CN and no userId (a shed-server older than 0.10.0)",
+      "go": "unbound",
+      "rust": "unbound"
+    },
+    {
+      "name": "empty-subject",
+      "file": "empty-subject.pem",
+      "what": "an empty subject",
+      "go": "unbound",
+      "rust": "unbound"
+    },
+    {
+      "name": "utf8-pat",
+      "file": "utf8-pat.pem",
+      "what": "pat as a UTF8String in its own RDN",
+      "go": "named:pat",
+      "rust": "named:pat"
+    },
+    {
+      "name": "user-before-cn",
+      "file": "user-before-cn.pem",
+      "what": "the userId RDN before the CN",
+      "go": "named:pat",
+      "rust": "named:pat"
+    },
+    {
+      "name": "multi-valued-rdn",
+      "file": "multi-valued-rdn.pem",
+      "what": "pat in one multi-valued RDN beside the CN",
+      "go": "named:pat",
+      "rust": "named:pat"
+    },
+    {
+      "name": "issuer-only",
+      "file": "issuer-only.pem",
+      "what": "a userId (admin) in the issuer only, none in the subject",
+      "go": "unbound",
+      "rust": "unbound"
+    },
+    {
+      "name": "issuer-and-subject",
+      "file": "issuer-and-subject.pem",
+      "what": "admin in the issuer and pat in the subject",
+      "go": "named:pat",
+      "rust": "named:pat"
+    },
+    {
+      "name": "extension-only",
+      "file": "extension-only.pem",
+      "what": "a userId (admin) only in a subjectAltName directoryName extension, none in the subject",
+      "go": "unbound",
+      "rust": "unbound"
+    },
+    {
+      "name": "extension-oid-only",
+      "file": "extension-oid-only.pem",
+      "what": "an extension whose extnID is the userId OID (value admin), none in the subject",
+      "go": "unbound",
+      "rust": "unbound"
+    },
+    {
+      "name": "subject-and-extension",
+      "file": "subject-and-extension.pem",
+      "what": "pat in the subject and admin in a subjectAltName directoryName",
+      "go": "named:pat",
+      "rust": "named:pat"
+    },
+    {
+      "name": "v1-no-version",
+      "file": "v1-no-version.pem",
+      "what": "a v1 certificate: no [0] version",
+      "go": "named:pat",
+      "rust": "named:pat"
+    },
+    {
+      "name": "near-oid",
+      "file": "near-oid.pem",
+      "what": "an attribute whose OID extends the userId OID by one arc",
+      "go": "unbound",
+      "rust": "unbound"
+    },
+    {
+      "name": "longest-name",
+      "file": "longest-name.pem",
+      "what": "a 63-character name, the longest",
+      "go": "named:az9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-zz",
+      "rust": "named:az9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-z9-zz"
+    },
+    {
+      "name": "third-rdn",
+      "file": "third-rdn.pem",
+      "what": "pat in the third RDN, after an OU",
+      "go": "named:pat",
+      "rust": "named:pat"
+    },
+    {
+      "name": "too-long",
+      "file": "too-long.pem",
+      "what": "a 64-character name",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "upper-case",
+      "file": "upper-case.pem",
+      "what": "the value Pat",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "trailing-newline",
+      "file": "trailing-newline.pem",
+      "what": "pat followed by a newline, as a UTF8String",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "empty-value",
+      "file": "empty-value.pem",
+      "what": "an empty UTF8String",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "other-marker",
+      "file": "other-marker.pem",
+      "what": "the UTF8String !unresolved",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "implicit-printable",
+      "file": "implicit-printable.pem",
+      "what": "!implicit as a PrintableString (! is not printable)",
+      "go": "unparseable",
+      "rust": "error"
+    },
+    {
+      "name": "ia5-pat",
+      "file": "ia5-pat.pem",
+      "what": "pat as an IA5String",
+      "go": "named:pat",
+      "rust": "error"
+    },
+    {
+      "name": "t61-pat",
+      "file": "t61-pat.pem",
+      "what": "pat as a T61String",
+      "go": "named:pat",
+      "rust": "error"
+    },
+    {
+      "name": "bmp-pat",
+      "file": "bmp-pat.pem",
+      "what": "pat as a BMPString",
+      "go": "named:pat",
+      "rust": "error"
+    },
+    {
+      "name": "numeric-value",
+      "file": "numeric-value.pem",
+      "what": "123 as a NumericString",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "implicit-ia5",
+      "file": "implicit-ia5.pem",
+      "what": "!implicit as an IA5String",
+      "go": "implicit",
+      "rust": "error"
+    },
+    {
+      "name": "integer-value",
+      "file": "integer-value.pem",
+      "what": "an INTEGER value",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "octet-string-value",
+      "file": "octet-string-value.pem",
+      "what": "an OCTET STRING value",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "high-tag-value",
+      "file": "high-tag-value.pem",
+      "what": "a value with a multi-byte tag",
+      "go": "unparseable",
+      "rust": "error"
+    },
+    {
+      "name": "two-rdns",
+      "file": "two-rdns.pem",
+      "what": "pat and admin, each in its own RDN",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "two-in-one-rdn",
+      "file": "two-in-one-rdn.pem",
+      "what": "pat and admin in one multi-valued RDN with the CN",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "same-user-twice",
+      "file": "same-user-twice.pem",
+      "what": "pat twice, in two RDNs and two encodings",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "named-and-implicit",
+      "file": "named-and-implicit.pem",
+      "what": "!implicit and pat",
+      "go": "malformed",
+      "rust": "error"
+    },
+    {
+      "name": "attribute-two-values",
+      "file": "attribute-two-values.pem",
+      "what": "a userId attribute holding two values",
+      "go": "named:pat",
+      "rust": "error"
+    },
+    {
+      "name": "attribute-no-value",
+      "file": "attribute-no-value.pem",
+      "what": "a CN attribute with no value, beside pat",
+      "go": "unparseable",
+      "rust": "error"
+    },
+    {
+      "name": "cn-not-printable",
+      "file": "cn-not-printable.pem",
+      "what": "a CN PrintableString holding @, beside pat",
+      "go": "unparseable",
+      "rust": "named:pat"
+    },
+    {
+      "name": "rdn-stray-element",
+      "file": "rdn-stray-element.pem",
+      "what": "an RDN holding pat and then a NULL",
+      "go": "unparseable",
+      "rust": "error"
+    },
+    {
+      "name": "empty-rdn",
+      "file": "empty-rdn.pem",
+      "what": "an empty RDN before pat",
+      "go": "named:pat",
+      "rust": "error"
+    },
+    {
+      "name": "nonminimal-value-length",
+      "file": "nonminimal-value-length.pem",
+      "what": "pat's length in long form (81 03)",
+      "go": "unparseable",
+      "rust": "error"
+    },
+    {
+      "name": "nonminimal-length",
+      "file": "nonminimal-length.pem",
+      "what": "the certificate's length with a leading zero octet",
+      "go": "unparseable",
+      "rust": "error"
+    },
+    {
+      "name": "indefinite-length",
+      "file": "indefinite-length.pem",
+      "what": "the certificate with an indefinite length",
+      "go": "unparseable",
+      "rust": "error"
+    },
+    {
+      "name": "trailing-bytes",
+      "file": "trailing-bytes.pem",
+      "what": "two bytes after the certificate",
+      "go": "unparseable",
+      "rust": "error"
+    },
+    {
+      "name": "fourth-element",
+      "file": "fourth-element.pem",
+      "what": "a NULL after the signature, inside the certificate",
+      "go": "named:pat",
+      "rust": "error"
+    },
+    {
+      "name": "damaged-validity",
+      "file": "damaged-validity.pem",
+      "what": "a notBefore that is not a time",
+      "go": "unparseable",
+      "rust": "named:pat"
+    },
+    {
+      "name": "damaged-serial",
+      "file": "damaged-serial.pem",
+      "what": "an empty serial INTEGER",
+      "go": "unparseable",
+      "rust": "named:pat"
+    },
+    {
+      "name": "damaged-signature",
+      "file": "damaged-signature.pem",
+      "what": "a signature BIT STRING with 8 unused bits",
+      "go": "unparseable",
+      "rust": "named:pat"
+    },
+    {
+      "name": "wrong-signature",
+      "file": "wrong-signature.pem",
+      "what": "a well-formed signature that does not verify",
+      "go": "named:pat",
+      "rust": "named:pat"
+    }
+  ]
+}

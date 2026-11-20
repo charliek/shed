@@ -1,0 +1,95 @@
+{
+  "_comment": [
+    "Written by internal/config/clientconfig_fixture_test.go (UPDATE_CLIENTCONFIG=1 go test ./internal/config -run TestClientConfigFixture); do not edit by hand.",
+    "config.yaml is what the CLI's save path (config.ClientConfig.Save) writes for these values; servers and machines are what the CLI holds for each entry.",
+    "Each Rust reader (shed-core's config reader, the broker's discovery) must read every server's host, ssh_port, user and identity_file as recorded here. See README.md."
+  ],
+  "default_server": "prod:blue",
+  "servers": [
+    {
+      "name": "1234",
+      "host": "number.example.test",
+      "ssh_port": 22,
+      "user": "",
+      "identity_file": ""
+    },
+    {
+      "name": "127.0.0.1:8443",
+      "host": "127.0.0.1",
+      "ssh_port": 12222,
+      "user": "",
+      "identity_file": ""
+    },
+    {
+      "name": "build #1",
+      "host": "build.example.test",
+      "ssh_port": 22,
+      "user": "",
+      "identity_file": ""
+    },
+    {
+      "name": "hash",
+      "host": "hash.example.test",
+      "ssh_port": 22,
+      "user": "",
+      "identity_file": "/home/pat/.ssh/id #work"
+    },
+    {
+      "name": "minimal",
+      "host": "minimal.example.test",
+      "ssh_port": 0,
+      "user": "",
+      "identity_file": ""
+    },
+    {
+      "name": "non-ascii",
+      "host": "café.example.test",
+      "ssh_port": 22,
+      "user": "pat",
+      "identity_file": "/home/pat/.ssh/clé_travail"
+    },
+    {
+      "name": "prod",
+      "host": "prod.example.test",
+      "ssh_port": 2222,
+      "user": "pat",
+      "identity_file": "/home/pat/.ssh/id_work"
+    },
+    {
+      "name": "prod:blue",
+      "host": "blue.example.test",
+      "ssh_port": 2222,
+      "user": "pat",
+      "identity_file": "/home/pat/.ssh/id:blue"
+    },
+    {
+      "name": "quote",
+      "host": "quote.example.test",
+      "ssh_port": 22,
+      "user": "",
+      "identity_file": "/home/pat/.ssh/pat's key"
+    },
+    {
+      "name": "team: blue",
+      "host": "team.example.test",
+      "ssh_port": 22,
+      "user": "admin",
+      "identity_file": ""
+    },
+    {
+      "name": "true",
+      "host": "bool.example.test",
+      "ssh_port": 22,
+      "user": "",
+      "identity_file": ""
+    }
+  ],
+  "machines": [
+    {
+      "name": "mini3",
+      "host": "mini3.example.test",
+      "user": "pat",
+      "ssh_port": 2222
+    }
+  ]
+}

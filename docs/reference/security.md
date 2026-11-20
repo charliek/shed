@@ -67,7 +67,7 @@ local admins listed in `auth.users`.
 | Modes | `open` or `mtls` | `mtls` only | `mtls` only |
 | Who a key is | the implicit user, an admin | the user it is listed under, with that user's `admin` flag | a local admin, or the list's user, with the list's `admin` flag |
 | Sheds a caller reaches | every shed | their own; an admin also lists, stops and deletes others' (see [Ownership](#ownership)) | as with `auth.users` |
-| Unknown key | refused in `enforce`, let in as the implicit user in `off` and `warn` | refused in every SSH mode | refused, after at most one pull of the list (see [A new person](#a-new-person)) |
+| Unknown key | refused in `enforce`, let in as the implicit user in `off` and `warn` | refused in every SSH mode | refused, unless a pull of the list it may start brings it (see [A new person](#a-new-person)) |
 
 With a user list a user's key is a plain public key: a client that presents an
 SSH certificate is refused, and a certificate listed as a key fails config
@@ -138,7 +138,8 @@ from a fetch that shows the login still names that id.
   accepts nothing from it; the REST API requests it leads to have their own
   budget of 20 an hour, so strangers cannot spend the scheduled refreshes'
   allowance. An expired key, a key dropped for a mismatch and the username
-  `git` never trigger it.
+  `git` never trigger it. (A server whose users come from an account service
+  has another rule: see [A new person](#a-new-person).)
 
 The per-login key cache, `{state_dir}/github_keys/<login>.keys`, keeps its
 name and format, and is trusted only when it matches the hash stored with the
@@ -171,6 +172,36 @@ config or a GitHub account, expires, or loses its pin therefore opens no new
 channel and makes no new request. Channels, SSE streams and Connect tunnels
 that are already open stay open until they end.
 
+### The SSH auth log
+
+Every `SSH auth` line in the server log names the peer's address as
+`remote=<host:port>`: right after `fingerprint=` on a line that names a key,
+right after `user=` on the attempt-cap line, and right after `SSH auth failed:`
+on the one line written per failed connection. `user=` is the username the
+client asked for, quoted when it holds any character other than `a-z`, `0-9`,
+`-` and `_`.
+
+| Line | Written |
+|------|---------|
+| `SSH auth allowed: user=<name> fingerprint=<fp> remote=<host:port>` | Once per login, in every mode, when the client has proved it holds the key (its signature verified) and the connection authenticates. A key a client only offers is never logged as allowed. The end of the line describes the user the connection authenticated as (see below). |
+| `SSH auth DENIED: user=<name> fingerprint=<fp> remote=<host:port>` | Once per refused key, followed by the reason when there is one (`(the key has expired)`, `(reserved username)`, ...). An agent that offers several keys can write several before one of its keys logs in. |
+| `SSH auth attempt: ...` (`off`) and `SSH auth WOULD DENY (warn mode): ...` (`warn`) | When a key is offered. Neither claims a login. |
+| `SSH auth: key <fp> remote=<host:port> is known after ...` | When fetching an unknown key's GitHub logins, or pulling the directory, made it known. |
+| `SSH auth: public-key attempt cap (<n>) reached for user=<name> remote=<host:port> ...` | When a connection used up `max_auth_tries`. |
+| `SSH auth failed: remote=<host:port> user=<name> keys=<n>` | Once per connection that offered at least one key and closed without proving one, in every mode: `user=` is the username of its last offer, `keys=` how many public-key offers the server examined on that connection (a key offered twice can count twice, and a repeat the SSH library answers from its cache of the last key counts once). A connection that logs in writes none, however many `DENIED` lines it drew first, and so does one that offered no key. This is the line to count failures by (see [Facing the internet](#facing-the-internet)). |
+
+The `allowed` line, and the `DENIED` line for an expired key, end with what the
+user lookup said about the key's user. On the `allowed` line that is the
+lookup made when the key was proven, the one the connection is bound to, even
+if the list has changed since:
+
+| The key is | The line ends with |
+|------------|--------------------|
+| a named user's key | `key_user="<user>" admin=<true or false>`, then `label="<label>"` when the key has a label |
+| a named user's script key | the same as any of that user's keys; the line does not say it is a script key |
+| the key of the implicit user (a server with no user list) | `label="<label>"` when the key has a label, otherwise nothing |
+| a key the lookup does not list (it logs in only in `off` or `warn` mode, on a server with no user list) | nothing |
+
 ## Users from an account service
 
 With [`auth.directory`](configuration.md#users-from-an-account-service) a
@@ -190,13 +221,16 @@ Directory guide](../guides/user-directory.md) covers the operator's steps.
   and is written to no file or log.
 - **Sign-in.** OAuth 2.0 client credentials with a JWT client assertion
   signed by that key: a new assertion for every token request, none sent
-  twice. The access token is kept in memory only.
+  twice. The request asks for the scope `directory:read` and nothing else, so
+  a scope the service adds later is never requested. The access token is kept
+  in memory only.
 - **The pull.** `GET <url>/v1/directory` with the access token returns the
   list: users, each a name, an admin flag and keys. A pull is due at start,
   `auth.directory.refresh` after each good pull, 15 minutes after a failed one
   (or at the end of the service's `Retry-After`, in seconds, when that is
-  later, up to one hour), on `shed users refresh`, and on a new person's
-  first login.
+  later, up to one hour), on `shed users refresh`, and on a first login
+  (`_bootstrap`) or a login to an existing shed by a key the server does not
+  know (see [A new person](#a-new-person)).
 - **Transport.** HTTPS with the system's certificate checks; the environment's
   proxy settings apply. No redirect is followed. Plain HTTP only with
   `allow_plain_http`, and only to a loopback address (checked on the address
@@ -251,8 +285,10 @@ backup key](../guides/user-directory.md#keeping-the-local-admin-on-a-backup-key)
 
 A list admin has an admin's powers on the server, host directories and server
 mounts included, so **whoever controls the account service controls the
-host**. Whoever can add a key to a person there enters every enrolled server
-as that person, and whoever can set the admin flag gets every enrolled
+host**. Who is listed, and whether as an admin, is what the service sends
+this server; it may differ from one enrolled server to another. Whoever can
+add a key to a person there enters every server that lists that person, as
+that person, and whoever can make a person an admin on a server gets that
 server's host. Run the service with the care that implies; the local admins
 are outside its reach.
 
@@ -354,18 +390,72 @@ connections are closed.
 
 ### A new person
 
-A person the server does not know yet logs in over SSH (`shed server add`)
-with a key the list does not hold yet. The server then pulls the list, at most
-**once a minute** while pulls succeed and **once per 15 minutes** while they
-fail, and never inside a pending `Retry-After`. Only the login that takes that
-slot waits, for at most 8 seconds. If the account service is slower than that,
-the login is refused once, the pull carries on and its result applies, and
-trying again succeeds. Every other unknown key at that moment is refused at
-once. A local admin's login never waits for a pull.
+A key the list the server holds does not have (a person added on the service
+since the last pull, or a key they added there) can make the server pull the
+list early. What it can start depends on the login name it is offered under:
+
+| Login name | What happens |
+|------------|--------------|
+| `_bootstrap` (`shed server add`, a refetch) | The server pulls the list, at most **once a minute** while pulls succeed and **once per 15 minutes** while they fail, never inside a pending `Retry-After`, and only when enrolled. Only the login that takes that slot waits: it is let in as soon as its key is known (brought by its own pull or by any other: an admin's refresh, the schedule, a shed name's pull), and if its key is still unknown it is refused when its **8-second** wait ends, never earlier, however soon the pull ended. Every other unknown key at that moment is refused at once, so a refused `shed server add` takes 8 seconds only when its login took the slot. |
+| The name of a shed that exists on this server | Refused at once. Off the login path the server checks that the shed exists, and only then pulls the list in the background, on a slot of its own: at most **once every 5 minutes** while pulls succeed, once per 15 minutes while they fail, never inside a pending `Retry-After`, only when enrolled. No login waits for it. A retry a few seconds later is let in once the pull has brought the key. |
+| Any other name (a name no shed has, or one that cannot be a shed name) | Refused at once. No pull. |
+
+If the account service answers more slowly than the wait, a new person's
+logins are refused until a pull has brought their key; the pull carries on,
+its result applies, and a later attempt succeeds. An admin's `shed users
+refresh` before the person's first login avoids the wait altogether, and is
+not limited by either slot. A local admin's login never waits for a pull.
+
+**What a peer can learn about which shed names exist.** A login under a shed
+name is refused without waiting for the server's check of the name, so that
+answer does not depend on whether the shed exists. A pull started for a shed
+name can delay a later `_bootstrap` pull that queues behind it, but a
+`_bootstrap` login whose key stays unknown is answered at its fixed 8-second
+deadline, so that delay does not show. For a peer whose key stays unknown, then,
+the time of each answer does not depend on whether a guessed login name is an
+existing shed, except in three cases, in which whether a shed-name pull was
+sent changes when the `_bootstrap` slot may next be taken (a slot it may take
+waits 8 seconds; one it may not is refused at once), so a peer probing at that
+moment can learn whether a guessed name is a shed, at most one guess per
+`_bootstrap` slot:
+
+- while pulls fail;
+- while a `Retry-After` is pending;
+- when pulls had been succeeding and the shed-name pull itself fails: the
+  server then enters the failed state, and a `_bootstrap` login that would have
+  taken the slot (a minute after the last take) and waited 8 seconds is refused
+  at once instead.
+
+A person whose key is listed on the service learns something else, which is
+accepted: their own first login is let in when a pull brings their key, so a
+pull that was already running ahead of theirs delays that login, which can
+show them that some pull was in flight.
+
+At most one check of a shed name runs at a time, as the server itself, within
+2 seconds; an offer that arrives while one runs is refused with no check, and a
+check that takes longer asks for no pull.
+
+The server logs each such pull: `directory: unknown key <fp>: pulling the
+list (at most once a minute while pulls succeed, once every 15 minutes while
+they fail)` for `_bootstrap`, and `directory: shed-name key <fp> for an
+existing shed: pulling the list in the background (at most once every 5
+minutes while pulls succeed, once every 15 minutes while they fail)` for a
+shed name. Once an hour, when there was any, it logs how many unknown keys
+were offered under a shed name: `directory: in the last hour <n> unknown keys
+were offered as a name that is no shed here and <m> as an existing shed's name
+(<p> asked for a pull, <q> skipped while a check ran, <e> checks failed:
+<first error>)`. `<p>` counts the offers that asked for a pull; such a pull
+may join one already asked for, or not be sent at all (a `Retry-After`, or the
+failed state's rate, when it would start).
 
 The server holds **one outstanding `Retry-After`** for itself: neither the
 schedule nor an unknown key pulls before it ends. Only an admin's `shed users
 refresh` may pull before it.
+
+A server whose users come from `auth.users` with GitHub logins keeps its own
+rule (see [GitHub logins are pinned to their account
+id](#github-logins-are-pinned-to-their-account-id)): an unknown key under
+`_bootstrap` or any valid shed name may start a GitHub fetch.
 
 ### Certificates
 
@@ -533,9 +623,17 @@ There is no static credential to copy between machines. A certificate is
 issued to one client over SSH and its private key stays with that client, so a
 `~/.shed/config.yaml` entry written by hand cannot reach an mtls server: the
 entry comes from `shed server add`, or from a client re-enrolling on its own.
-`shed server add` therefore needs an allowed key at add time, and fails at once
-with `your SSH key is not in this server's allowlist` when it does not have
-one (see [CLI › shed server add](cli.md#shed-server-add)).
+`shed server add` therefore needs a key the server accepts at add time. When
+the server refuses every key ssh offers, the add fails with `the server refused
+every SSH key ssh offered for _bootstrap@<host>`, followed by the causes ssh
+cannot tell apart: no offered key is a user's key on that server (wherever the
+server takes its users from: its config, GitHub, or an account service), the
+right key has a passphrase and is not in your agent (the CLI runs ssh with
+`BatchMode=yes`, so `ssh-add` it), or the server's user list is not in force
+and only its local admins can log in. A key listed moments ago can be refused
+once while the server fetches the list: try again a minute later. For an entry
+with its own key (`--identity-file`) the message names that key. See [CLI ›
+shed server add](cli.md#shed-server-add).
 
 **Clients older than v0.8.1** have no way to obtain a certificate. A CLI that
 sends no CSR is answered `this server requires auth.mode: mtls; upgrade shed
@@ -711,6 +809,77 @@ the bus over `https://127.0.0.1:8443` with the pinned cert and its own
 | `bind_address` | Interface every listener (plain HTTP, HTTPS, SSH) binds to. **Defaults to loopback (`127.0.0.1`).** In mtls mode set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. An open server is loopback only: any other value fails config load. |
 | `https_port` | The HTTPS listener (bound to `bind_address`) serving the control plane, credential bus, and Connect tunnel over pinned TLS. **Requires `mtls` mode**; defaults to `8443` there. |
 | `trusted_proxy` | Trust `X-Forwarded-For` (only safe behind a proxy that overwrites it). Default false uses the real TCP peer, so a source IP can't be forged to evade per-IP controls. |
+
+### Facing the internet
+
+The SSH listener accepts public-key auth only, with at most
+`auth.ssh.max_auth_tries` keys tried per connection. It also limits
+connections that have not authenticated yet, in every auth mode
+(`off`, `warn`, `enforce`):
+
+| Limit | Value | What happens |
+|-------|-------|--------------|
+| Login grace | 120 seconds | A connection that has not authenticated 120 seconds after it was accepted is closed. A connection that authenticated is never closed by it, however long it stays idle. |
+| Unauthenticated connections | 100 at once | A new connection while 100 are unauthenticated is closed as soon as it is accepted. |
+| Per address | 10 at once | A new connection from an address that holds 10 unauthenticated connections is closed as soon as it is accepted, while other addresses still get in. An address is an IPv4 address, or an IPv6 `/64`. |
+
+A connection leaves both counts once, when it authenticates or when it
+closes. The values are fixed. Loopback has no exemption: a proxy or a tunnel
+on the same host that forwards to `127.0.0.1` would otherwise get past every
+limit, so a proxy in front of the SSH port makes every connection one
+address, and the per-address limit then applies to all of them together.
+
+The limits write these lines:
+
+| Line | Written |
+|------|---------|
+| `SSH: closed a connection from <host:port> that did not authenticate within 120 seconds` | When the login grace closes a connection. |
+| `SSH: refusing connections from <address>: <n> are not yet authenticated (at most 10 from one address, 100 in all)` | When an address's share is full, at most once a minute per address. |
+| `SSH: refusing new connections: <n> are not yet authenticated; the most from one address: <address> (<n>)` | When the limit of 100 is full, at most once a minute. |
+| `SSH auth failed: remote=<host:port> user=<name> keys=<n>` | Once per connection that offered a key and closed without proving one ([The SSH auth log](#the-ssh-auth-log)). |
+
+A connection is closed (and its place given back) before its line is
+written, so a slow log never keeps a connection open.
+
+Count failures by `SSH auth failed`, the grace line and the per-address
+refusal line, never by `SSH auth DENIED`: that line is written once per
+refused key, so a person whose agent offers several keys draws several before
+one of them logs in. A connection that offered a key and then stalled past
+the login grace writes two of these lines (the grace line and its
+`SSH auth failed` line), so a count of lines is not a count of connections.
+The line for the limit of 100 names only the address holding the most, not
+the address refused, so it is not one to count failures by. [Public VPS
+Deployment › Hardening the SSH
+surface](../guides/vps-deployment.md#hardening-the-ssh-surface) has a fail2ban
+filter.
+
+**When the limit refuses everyone.** A peer that holds 100 unauthenticated
+connections from many addresses keeps everyone else out until the login grace
+closes them. The way back: the line for the limit of 100 names the address
+holding the most; block it at the host's firewall (fail2ban's example filter
+bans addresses from the per-address refusal and grace lines, not from that
+line), then restart `shed-server serve`, which drops every connection it
+holds. That ends one wave, not a flood: a peer with more addresses than you
+have blocked fills the limit again after the restart. Against a flood from
+many addresses, filter or rate-limit the SSH port before it reaches the
+server (the firewall, or your provider's network controls).
+
+**What an unknown key can start.** On a server whose users come from an
+account service, a key the server does not know can make it pull the list
+early, and nothing else: under `_bootstrap`, at most once a minute (the
+newcomer's slot); under the name of a shed that exists on this server, at most
+once every 5 minutes, in the background; while pulls fail, each at most once
+every 15 minutes, and neither inside a pending `Retry-After`. Under any other
+name it starts nothing, so scanners trying `root`, `admin` or `ubuntu` cost
+the account service nothing unless a shed has that name, and at most one
+check of a shed name (a read of the server's own records, as the server, within
+2 seconds) runs at a time. A peer that knows `_bootstrap` can take the
+newcomer's slot, up to 60 pulls an hour; one that names a real shed adds at
+most 12. A newcomer refused because the slot was taken tries again a minute
+later, or an admin runs `shed users refresh`, which neither slot limits. A
+server whose users come from `auth.users` keeps its own rule for GitHub
+logins. See [A new person](#a-new-person), which also states what a peer can
+learn about which shed names exist.
 
 ## Connection flow: what's encrypted where
 
@@ -921,7 +1090,43 @@ Each owned shed:
 Every client request, allowed or refused, writes one `api` line to the [audit
 log](configuration.md#audit-log), and every HTTPS exec that passes the request
 checks writes an `exec.end` line (argv[0] and the argument count by default,
-never the arguments).
+never the arguments). Each line names who acted: the client (`kind: client`,
+by name and certificate serial); a person (`kind: user`, with whether they are
+an admin and whether they used a script key, and their key's fingerprint); or
+the server itself (`kind: system`, on a `reap` line). On a server with a user
+list, an admin's exec into a client's shed is recorded under that admin's user
+name. On a server with no user list it carries no user name: the person is the
+server's one implicit user (`implicit: true`), known on the line only by the
+key's fingerprint.
+
+**Every time a person enters a client's shed over SSH, an `ssh` line records
+it**: a shell, a command (`shed exec`, `shed attach`), sftp or scp, and each
+connection forwarded with `ssh -L`. Only an admin can enter a client's shed
+(on a server with no user list, its one implicit user; a user who is not an
+admin is told the shed does not exist), and the shed holds what
+the orchestrator put there, so this is the record of who went in over SSH. The line
+names the person as above (by user name and key fingerprint), the peer's
+address, the shed, its client and the channel, never the command. It is
+written once the entry has happened (the command was handed to the shed's
+agent, where it may still fail to start, or the forwarded connection is open),
+so a refused attempt, or one that failed before it reached the agent, writes
+none and leaves only its server-log line.
+
+The log is not yet a complete record of what a person does to a client's
+shed. Of the ways a person (an admin) can reach into one:
+
+- **Recorded:** an HTTPS exec (`exec.end`, written when the exec ends: one
+  still running when a stopping server's 30-second bound passes leaves none); a shell, a command, sftp or scp,
+  or a connection forwarded over SSH (`ssh`); a tunnel through the HTTPS
+  Connect API, as `shed tunnels` opens (`connect`, once the tunnel is
+  established).
+- **Not recorded yet:** starting, stopping, deleting or resetting the shed;
+  taking a snapshot of it; changing its egress rules; reading its egress
+  decisions (its recent decisions, `GET /api/egress/{name}`, or the live
+  egress stream, `GET /api/egress/stream`); listing or killing its sessions;
+  reading its record (`shed list`, `GET /api/sheds/{name}`). The access guard
+  lets an admin do each of these to a client's shed, and none writes an audit
+  line.
 
 ### Residual risks
 

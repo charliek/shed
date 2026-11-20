@@ -18,6 +18,7 @@ import (
 
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
+	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 )
 
 var serverCmd = &cobra.Command{
@@ -46,6 +47,11 @@ does not stop: the bootstrap shells out to the real ssh client, which honors
 ~/.ssh/config (HostName/Port/ProxyJump/ProxyCommand) and verifies the host key
 itself against ~/.shed/known_hosts. Pin the key there (ssh-keyscan) if you reach
 this server through ~/.ssh/config.
+
+The host you give is also the API address: the entry's api_url is built from
+it. A ~/.ssh/config Host alias whose HostName points elsewhere therefore enrols
+over SSH and then fails at the API. To give an entry its own SSH key, use the
+server's real name with --identity-file instead of an alias.
 
 Nothing survives a failed add: a host key this command pinned is removed again,
 and no credential material or config entry is left behind.`,
@@ -79,13 +85,36 @@ var serverSetDefaultCmd = &cobra.Command{
 
 var serverUpdateCmd = &cobra.Command{
 	Use:   "update <name>",
-	Short: "Update a server's pinned TLS cert fingerprint",
-	Long: `Rotate the pinned TLS certificate fingerprint for a server.
+	Short: "Update a server's pinned TLS cert fingerprint, credential or SSH key",
+	Long: `Rotate the pinned TLS certificate fingerprint for a server, re-enrol its
+credential, or set the SSH key it uses.
 
 Pass --tls-fingerprint <sha256:...> to pin a new fingerprint verified
 out-of-band, or --refetch to re-read it from the server over the same SSH-first
 path 'shed server add' uses (trust-on-first-use or interactive prompt), which
-also re-enrolls the entry's credential.`,
+also re-enrolls the entry's credential. A refetch keeps the entry's HTTPS
+endpoint while the server answers there, and moves to the port the server
+reports only when it does not.
+
+An entry is held to the user its certificates name. --refetch refuses a new
+certificate for another user and writes nothing; add --allow-user-change to
+make the entry that user. --refetch is also how an entry the CLI refuses (its
+certificate names no user, or a user the entry does not record) is enrolled
+again.
+
+--identity-file <path> sets the SSH key the entry uses. A certificate is then
+accepted for the entry only when the server made it for that key; every ssh
+the CLI runs for it offers that key first and no key that is only in your agent
+(-i <path> -o IdentitiesOnly=yes), and never rides a shared connection
+(-o ControlMaster=no -o ControlPath=none). ssh can still offer an IdentityFile
+your own ssh config names for the host, after this key. On its own the flag
+changes only that field, and the entry re-enrols with this key on its next use
+(a stored certificate made for another key is never presented); with --refetch
+the re-enrolment uses the new key now, and nothing is saved unless it succeeds.
+--identity-file "" clears it. The path is stored absolute (~ is expanded); it
+may not contain whitespace at either end, or any of NUL, CR, LF, " \ # % $; the
+file must be readable, and its public key must be learnable without a
+passphrase (an OpenSSH-format key, or a .pub beside it).`,
 	Args: cobra.ExactArgs(1),
 	RunE: runServerUpdate,
 }
@@ -99,11 +128,31 @@ var (
 	serverAddHTTPSPort      int
 	serverAddTLSFingerprint string
 	serverAddSecure         bool
+	serverAddIdentityFile   string
 
-	serverUpdateTLSFingerprint string
-	serverUpdateRefetch        bool
-	serverUpdateTrustTOFU      bool
+	serverUpdateTLSFingerprint  string
+	serverUpdateRefetch         bool
+	serverUpdateTrustTOFU       bool
+	serverUpdateAllowUserChange bool
+	// serverUpdateIdentityFile is --identity-file on `server update`: set
+	// tells "not given" from "given as empty" (which clears the field).
+	serverUpdateIdentityFile optionalString
 )
+
+// optionalString is a string flag that records whether it was given at all,
+// so an explicitly empty value (`--identity-file ""`, which clears a field)
+// is not mistaken for an absent flag.
+type optionalString struct {
+	value string
+	set   bool
+}
+
+func (o *optionalString) String() string { return o.value }
+func (o *optionalString) Type() string   { return "string" }
+func (o *optionalString) Set(v string) error {
+	o.value, o.set = v, true
+	return nil
+}
 
 func init() {
 	serverAddCmd.Flags().IntVarP(&serverAddPort, "port", "p", 8080, "HTTP port; used only by the fallback for a server that issues no SSH credential (ignored when --https-port is set)")
@@ -114,10 +163,13 @@ func init() {
 	serverAddCmd.Flags().IntVar(&serverAddHTTPSPort, "https-port", 0, "HTTPS port to reach the server on; overrides the port its bootstrap bundle reports, and selects the TLS endpoint for the no-credential fallback")
 	serverAddCmd.Flags().StringVar(&serverAddTLSFingerprint, "tls-fingerprint", "", "Expected TLS cert fingerprint (sha256:...); verified out-of-band, fails on mismatch")
 	serverAddCmd.Flags().BoolVar(&serverAddSecure, "secure", false, "Fallback only: when the server issues no SSH credential, go straight to TLS on the default secure port instead of probing plain HTTP")
+	serverAddCmd.Flags().StringVar(&serverAddIdentityFile, "identity-file", "", "SSH private key this entry uses: its certificates must be made for that key, and every ssh for the entry offers it first and no agent-only key; stored as an absolute path, ~ expanded")
 
 	serverUpdateCmd.Flags().StringVar(&serverUpdateTLSFingerprint, "tls-fingerprint", "", "New pinned TLS cert fingerprint (sha256:...) to rotate to")
-	serverUpdateCmd.Flags().BoolVar(&serverUpdateRefetch, "refetch", false, "Re-fetch the cert from the server's api_url and re-pin it (TOFU/prompt)")
+	serverUpdateCmd.Flags().BoolVar(&serverUpdateRefetch, "refetch", false, "Re-pin and re-enrol over the SSH-first path (TOFU/prompt); keeps the entry's HTTPS endpoint while it answers")
 	serverUpdateCmd.Flags().BoolVar(&serverUpdateTrustTOFU, "trust-on-first-use", false, "With --refetch, trust the re-fetched TLS cert without prompting")
+	serverUpdateCmd.Flags().BoolVar(&serverUpdateAllowUserChange, "allow-user-change", false, "With --refetch, let the entry change to the user the server issues the new certificate for")
+	serverUpdateCmd.Flags().Var(&serverUpdateIdentityFile, "identity-file", "Set the SSH private key this entry uses (\"\" clears it); with --refetch, the re-enrolment uses it")
 
 	serverCmd.AddCommand(serverAddCmd)
 	serverCmd.AddCommand(serverListCmd)
@@ -357,17 +409,25 @@ func runServerList(cmd *cobra.Command, args []string) error {
 			Security           string `json:"security"`
 			TLSPinned          bool   `json:"tls_pinned"`
 			TLSCertFingerprint string `json:"tls_cert_fingerprint,omitempty"`
-			Status             string `json:"status"`
-			Default            bool   `json:"default"`
+			// User is the user name the entry records (omitted when it
+			// records none, or none that is a valid user name); UserImplicit
+			// is whether its stored certificate is the implicit user's. The
+			// text's `(implicit)` and `-` are never carried here.
+			User         string `json:"user,omitempty"`
+			UserImplicit bool   `json:"user_implicit"`
+			// IdentityFile is the entry's identity_file, as add, update and
+			// a refetch report it (omitted when it has none).
+			IdentityFile string `json:"identity_file,omitempty"`
+			Status       string `json:"status"`
+			Default      bool   `json:"default"`
 		}
 		result := make([]serverJSON, 0, len(names))
 		for _, name := range names {
 			entry := clientConfig.Servers[name]
-			client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
-			status := "offline"
-			if client.Ping() {
-				status = "online"
-			}
+			// The probe first: its re-enrolment can record the entry's user,
+			// which listedEntryUser then reads from disk.
+			status := probeServerStatus(name, entry)
+			user := listedEntryUser(name, entry)
 			result = append(result, serverJSON{
 				Name:               name,
 				Host:               entry.Host,
@@ -378,6 +438,9 @@ func runServerList(cmd *cobra.Command, args []string) error {
 				Security:           securityLabel(entry),
 				TLSPinned:          entry.TLSCertFingerprint != "",
 				TLSCertFingerprint: entry.TLSCertFingerprint,
+				User:               user.name,
+				UserImplicit:       user.implicit,
+				IdentityFile:       entry.IdentityFile,
 				Status:             status,
 				Default:            name == clientConfig.DefaultServer,
 			})
@@ -388,36 +451,142 @@ func runServerList(cmd *cobra.Command, args []string) error {
 	if len(clientConfig.Servers) == 0 {
 		fmt.Println("No servers configured.")
 		fmt.Println("\nTo add a server:")
-		fmt.Println("  shed server add <hostname>")
+		fmt.Println("  shed server add HOST")
 		return nil
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tENDPOINT\tSSH\tSECURITY\tSTATUS\tDEFAULT")
+	fmt.Fprintln(w, "NAME\tENDPOINT\tSSH\tSECURITY\tUSER\tSTATUS\tDEFAULT")
 
 	for _, name := range names {
 		entry := clientConfig.Servers[name]
 
 		// Reachability is probed over the entry's real endpoint (BaseURL +
 		// pinned cert), so STATUS is correct for secure servers too.
-		client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
-		status := "offline"
-		if client.Ping() {
-			status = "online"
-		}
+		status := probeServerStatus(name, entry)
+		// After the probe: its re-enrolment can record the entry's user.
+		user := listedEntryUser(name, entry).label()
 
 		defaultMark := ""
 		if name == clientConfig.DefaultServer {
 			defaultMark = "*"
 		}
 
+		// The name (possibly the one a server reported at add), its URL and
+		// its host are shown escaped (SafeText): a control character in any
+		// of them never reaches the terminal raw nor breaks the table.
 		sshAddr := fmt.Sprintf("%s:%d", entry.Host, entry.SSHPort)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			name, entry.BaseURL(), sshAddr, securityLabel(entry), status, defaultMark)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			sdkbootstrap.SafeText(name), sdkbootstrap.SafeText(entry.BaseURL()), sdkbootstrap.SafeText(sshAddr),
+			securityLabel(entry), user, status, defaultMark)
 	}
 
 	w.Flush()
 	return nil
+}
+
+// The text USER value of an entry with no user name to show (plan 037 §3.3).
+// They are text only: the JSON carries the facts (entryUser), never these.
+const (
+	// serverUserImplicit: the entry records no user and its stored
+	// certificate is the implicit user's (a server with no user list).
+	serverUserImplicit = "(implicit)"
+	// serverUserNone: no user to show — not an mtls entry (plain HTTP, or a
+	// control token), no certificate on file, one that cannot be read or that
+	// the CLI refuses, a recorded user that is not a valid user name, or a
+	// row that could not be read again.
+	serverUserNone = "-"
+)
+
+// entryUser is who a server entry is, for `shed server add` and `shed server
+// list`, worked out offline and writing nothing (no request, no lock, no
+// directory, no permission change).
+//
+// A certificate's own name is never taken as the entry's user: an entry that
+// records no user and holds a certificate for a named user is one the CLI
+// refuses (config.LoadEntryCertificate); it has no name here and shows `-`
+// beside STATUS `refused`. An entry that records a user is that user whatever
+// its certificate says: it is the only user the CLI will ever act as for it.
+type entryUser struct {
+	// name is the user the entry records, when it is a valid user name (the
+	// grammar the server enforces, config.ValidUserName); "" otherwise.
+	name string
+	// recorded: the entry records a user, valid or not. A recorded value that
+	// is not a valid user name (a hand edit) is never shown and never taken
+	// as the label: the text shows `-`.
+	recorded bool
+	// implicit: the entry's stored certificate, read and checked as every
+	// reader checks it, is the implicit user's.
+	implicit bool
+}
+
+// label is the text value: the user's name; `(implicit)` for an entry that
+// records no user and holds the implicit user's certificate; else `-`. It is
+// built only from a valid user name and the two constants above, so no
+// control character or other text from config.yaml can reach the terminal.
+func (u entryUser) label() string {
+	switch {
+	case u.name != "":
+		return u.name
+	case !u.recorded && u.implicit:
+		return serverUserImplicit
+	}
+	return serverUserNone
+}
+
+// entryUserOf works out who entry is from the row it is given and the stored
+// certificate the row names, writing nothing (config.ReadEntryCertificate).
+func entryUserOf(name string, entry config.ServerEntry) entryUser {
+	u := entryUser{recorded: entry.User != ""}
+	if config.ValidUserName(entry.User) {
+		u.name = entry.User
+	}
+	if entry.IsMTLS() {
+		// Checked against no recorded user, the stored certificate is returned
+		// only when it is the implicit user's; a named one is refused, and one
+		// that names no user, is unreadable or is missing is an error.
+		probe := entry
+		probe.User = ""
+		if _, err := config.ReadEntryCertificate(name, &probe); err == nil {
+			u.implicit = true
+		}
+	}
+	return u
+}
+
+// listedEntryUser is who an entry is, for `shed server list`, read after the
+// entry was probed: the probe's re-enrolment can record the entry's first
+// user, its certificate paths and its auth mode, so the WHOLE row is read
+// again from disk (config.ClientConfig.ReadOnDisk, no lock) and the user is
+// worked out from that row. A row that cannot be read again, is gone, or no
+// longer names the endpoint the listing shows (snapshot) vouches for
+// nothing: the zero entryUser, `-` in text and no `user` in JSON.
+func listedEntryUser(name string, snapshot config.ServerEntry) entryUser {
+	disk, err := clientConfig.ReadOnDisk()
+	if err != nil {
+		return entryUser{}
+	}
+	fresh, ok := disk.Servers[name]
+	if !ok || !sameServerEndpoint(fresh, snapshot) {
+		return entryUser{}
+	}
+	return entryUserOf(name, fresh)
+}
+
+// probeServerStatus is one entry's STATUS for `shed server list`: online,
+// offline, or refused. It probes through the request path (APIClient.Status),
+// so a certificate the server rejects is re-enrolled once, as for any request.
+// An entry the CLI refuses — its stored certificate names no user or another
+// user, which is known without a request, or a re-enrolment issued a
+// certificate for another user — shows `refused`, and its message is printed
+// once to stderr.
+func probeServerStatus(name string, entry config.ServerEntry) string {
+	client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
+	status, refusal := client.Status()
+	if refusal != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", refusal)
+	}
+	return status
 }
 
 // securityLabel classifies a server entry's control-plane transport for the
@@ -565,16 +734,37 @@ func isHTTPSURL(s string) bool {
 
 func runServerUpdate(cmd *cobra.Command, args []string) error {
 	name := args[0]
+	if serverUpdateAllowUserChange && !serverUpdateRefetch {
+		return fmt.Errorf("--allow-user-change only applies with --refetch")
+	}
 	entry, err := clientConfig.GetServer(name)
 	if err != nil {
 		return err
 	}
 
+	// The identity file the entry uses after this command: the flag's value
+	// (checked now, the same rule as a hand-edited config.yaml, plus the file
+	// itself), or the entry's own when the flag is not given.
+	identityFile := entry.IdentityFile
+	if serverUpdateIdentityFile.set {
+		if identityFile, err = config.IdentityFileFromFlag(name, serverUpdateIdentityFile.value); err != nil {
+			return err
+		}
+	}
+
 	// --refetch is SSH-first (see refetchServerCredential): it reads the pin out
 	// of a bootstrap bundle, which is the only way to re-pin an mtls server —
-	// there, an unenrolled TLS dial cannot complete a handshake at all.
+	// there, an unenrolled TLS dial cannot complete a handshake at all. With
+	// --identity-file it enrols with the new key, and saves it with the rest.
 	if serverUpdateRefetch {
-		return refetchServerCredential(name, entry)
+		return refetchServerCredential(name, entry, identityFile)
+	}
+
+	// --identity-file on its own changes only that field, on any entry: it is
+	// read by ssh, not by the TLS client, so the https check below is not its
+	// business.
+	if serverUpdateIdentityFile.set && serverUpdateTLSFingerprint == "" {
+		return updateIdentityFile(name, *entry, identityFile)
 	}
 
 	// A manually supplied pin only takes effect over https — the client never
@@ -583,7 +773,7 @@ func runServerUpdate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("server %q has no https api_url; a TLS pin only applies over https — re-add it with --https-port", name)
 	}
 	if serverUpdateTLSFingerprint == "" {
-		return fmt.Errorf("specify --tls-fingerprint <sha256:...> or --refetch")
+		return fmt.Errorf("specify --tls-fingerprint <sha256:...>, --refetch, or --identity-file <path>")
 	}
 	newFingerprint := normalizeTLSFingerprint(serverUpdateTLSFingerprint)
 
@@ -609,6 +799,9 @@ func runServerUpdate(cmd *cobra.Command, args []string) error {
 				return // in-memory only; see saveServerEntry
 			}
 			stored.TLSCertFingerprint = newFingerprint
+			if serverUpdateIdentityFile.set {
+				stored.IdentityFile = identityFile
+			}
 			c.Servers[name] = stored
 		},
 	); err != nil {
@@ -619,12 +812,77 @@ func runServerUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonFlag {
+		result := ActionResult{Status: "ok", Action: "updated", Name: name}
+		if serverUpdateIdentityFile.set {
+			// As `--identity-file` on its own reports it (updateIdentityFile).
+			result.Details = struct {
+				IdentityFile string `json:"identity_file"`
+			}{identityFile}
+		}
+		return outputJSON(result)
+	}
+	printSuccess("Updated server %s TLS pin: %s", name, newFingerprint)
+	if serverUpdateIdentityFile.set {
+		printIdentityFileLine(identityFile)
+	}
+	return nil
+}
+
+// updateIdentityFile is `shed server update <name> --identity-file <path>` on
+// its own: it writes only identity_file, onto the row as it is on disk, which
+// must still name the endpoint this command read (was). Nothing else in the
+// row is touched, so a credential another process wrote meanwhile stays. A
+// --refetch running in another process at the same time is refused at its
+// commit (refetchDecide compares identity_file), so it never writes back the
+// key this command replaced.
+func updateIdentityFile(name string, was config.ServerEntry, identityFile string) error {
+	var gone error
+	if err := updateClientConfigChecked(
+		func(c *config.ClientConfig) error {
+			gone = checkStillNames(c, name, was)
+			return gone
+		},
+		func(c *config.ClientConfig) {
+			stored, ok := c.Servers[name]
+			if !ok {
+				return // in-memory only; see saveServerEntry
+			}
+			stored.IdentityFile = identityFile
+			c.Servers[name] = stored
+		},
+	); err != nil {
+		if gone != nil {
+			return fmt.Errorf("cannot update server %q: %w", name, gone)
+		}
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+	if jsonFlag {
 		return outputJSON(ActionResult{
 			Status: "ok",
 			Action: "updated",
 			Name:   name,
+			Details: struct {
+				IdentityFile string `json:"identity_file"`
+			}{identityFile},
 		})
 	}
-	printSuccess("Updated server %s TLS pin: %s", name, newFingerprint)
+	if identityFile == "" {
+		printSuccess("Cleared the identity file of server %s", name)
+		return nil
+	}
+	printSuccess("Updated server %s identity file: %s", name, sdkbootstrap.SafeText(identityFile))
 	return nil
+}
+
+// printIdentityFileLine prints the indented line a command that also set the
+// identity file adds to its report (`server update`, `server add`, a
+// refetch). The path is shown with any control character escaped
+// (sdkbootstrap.SafeText, as the typed identity errors show theirs): the rule
+// lets a path hold one, and it must not reach the terminal raw.
+func printIdentityFileLine(identityFile string) {
+	if identityFile == "" {
+		fmt.Println("  Identity file: cleared")
+		return
+	}
+	fmt.Printf("  Identity file: %s\n", sdkbootstrap.SafeText(identityFile))
 }

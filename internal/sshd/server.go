@@ -14,11 +14,13 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/terminal"
@@ -39,6 +41,13 @@ type Server struct {
 	termConfig  *terminal.Config
 	keyAuth     KeyAuth
 	bootstrap   *BootstrapInfo // static bundle metadata; nil until SetBootstrap
+	// audit is the audit log a person's entry into a service client's shed
+	// is recorded in (audit.go); nil records nothing. Set before Start.
+	audit *audit.Log
+	// entries holds each entry into a service client's shed from just
+	// before its guarded exec or dial until its line is written (or it
+	// failed): Shutdown waits for them (beginEntry).
+	entries audit.Pending
 
 	// connMu guards conns: the authenticated connections by the name of the
 	// user each is bound to, kept only with KeyAuth.TrackConnections
@@ -51,6 +60,63 @@ type Server struct {
 	// afterClose, when set (by tests only), runs at the end of every close
 	// of a tracked connection (trackedConn.Close).
 	afterClose func()
+	// afterPreauthClose, when set (by tests only), runs after the first
+	// close of every connection the server admitted (preauthConn.shut), once
+	// its "SSH auth failed" line, if any, has been written (closeLogged).
+	afterPreauthClose func()
+
+	// The limits on connections that have not authenticated (preauth.go):
+	// the login grace, the cap and each source's share of it. NewServer sets
+	// the fixed defaults; only tests change them (before the server serves),
+	// with afterFunc (the grace timer) and now (the clock of the cap's log
+	// lines).
+	loginGrace                  time.Duration
+	maxUnauthenticated          int
+	maxUnauthenticatedPerSource int
+	afterFunc                   func(time.Duration, func()) graceTimer
+	now                         func() time.Time
+	// preMu guards the counts of unauthenticated connections, in all and by
+	// source, and when a cap refusal was last logged: per source in
+	// preLoggedSource, and in the order written in preLoggedOrder, which
+	// preauthMayLog drops old records from.
+	preMu           sync.Mutex
+	preTotal        int
+	preBySource     map[string]int
+	preLoggedSource map[string]time.Time
+	preLoggedOrder  []preauthLogged
+	preLoggedTotal  time.Time
+
+	// life is the server's lifetime: made by NewServer, ended by Shutdown.
+	// The off-path check of a shed name's unknown key (unknownshed.go) runs
+	// under it, never under a connection's context.
+	life       context.Context
+	lifeCancel context.CancelFunc
+	// checking is held from the start of a check until its backend call
+	// returns (at most one at a time). checkMu orders the start of a check
+	// against Shutdown, and guards checkDone, closed when the last check
+	// started has ended.
+	checking  atomic.Bool
+	checkMu   sync.Mutex
+	checkDone chan struct{}
+	// nudgeMu is held while a check, having found the shed, checks the
+	// lifetime and nudges the lookup, and by Shutdown while it ends the
+	// lifetime (endLife), so no nudge is asked once Shutdown has begun. It
+	// is taken before checkMu where both are held; the login path never
+	// takes it.
+	nudgeMu sync.Mutex
+	// shedCheckTimeout bounds one check (defaultShedCheckTimeout; tests
+	// change it before the server serves).
+	shedCheckTimeout time.Duration
+	// afterShedFound, when set (by tests only, before the server serves),
+	// runs in a check once the backend has found the shed, before the
+	// nudge's lifetime check.
+	afterShedFound func()
+	// statsMu guards stats, the counts of shed-name offers logged once per
+	// statsEvery (unknownShedStatsEvery) by a goroutine statsOnce starts.
+	statsMu    sync.Mutex
+	stats      unknownShedStats
+	statsOnce  sync.Once
+	statsEvery time.Duration
 }
 
 // KeyAuth is how the SSH server decides public-key auth: the auth.ssh mode,
@@ -113,11 +179,11 @@ func (k KeyAuth) expired(fingerprint string) bool {
 }
 
 // owner describes, for an auth log line, the user the lookup resolves the
-// key's fingerprint to: the user's name and whether they are an admin (a
-// named user; the implicit user of a server with no user list is not
-// named), and the key's label when it has one. Empty for a key the lookup
-// does not resolve, so an unknown key's line says nothing more than before.
-// Called only where the auth path has looked the key up already.
+// key's fingerprint to now (ownerSuffix). Empty for a key the lookup does
+// not resolve, so an unknown key's line says nothing more than before.
+// Called only where the auth path has looked the key up already. The
+// allowed line does not use it: it describes the user the connection was
+// bound to (connIdentity.owner), which a later lookup may no longer give.
 func (k KeyAuth) owner(fingerprint string) string {
 	if k.Users == nil {
 		return ""
@@ -126,12 +192,20 @@ func (k KeyAuth) owner(fingerprint string) string {
 	if !ok {
 		return ""
 	}
+	return ownerSuffix(u.Implicit, u.Name, u.Admin, key.Label)
+}
+
+// ownerSuffix is the end of an auth log line that names a key's user: the
+// user's name and whether they are an admin, for a named user (the implicit
+// user of a server with no user list is not named), and the key's label when
+// it has one. A script key reads as its user's key.
+func ownerSuffix(implicit bool, name string, admin bool, label string) string {
 	var out string
-	if !u.Implicit {
-		out = fmt.Sprintf(" key_user=%q admin=%t", u.Name, u.Admin)
+	if !implicit {
+		out = fmt.Sprintf(" key_user=%q admin=%t", name, admin)
 	}
-	if key.Label != "" {
-		out += fmt.Sprintf(" label=%q", key.Label)
+	if label != "" {
+		out += fmt.Sprintf(" label=%q", label)
 	}
 	return out
 }
@@ -155,6 +229,18 @@ func logUser(name string) string {
 	return fmt.Sprintf("%q", name)
 }
 
+// logRemote is a connection's peer address as an auth log line prints it
+// (remote=<host:port>), so a refused or accepted login can be traced, and
+// blocked, by the address it came from. It is the transport's own peer
+// address, which the client does not write the way it writes a username; "-"
+// when there is none on record.
+func logRemote(addr net.Addr) string {
+	if addr == nil {
+		return "-"
+	}
+	return addr.String()
+}
+
 // NewServer creates a new SSH server. listenAddr is the TCP bind address
 // (e.g. "127.0.0.1:2222" for loopback (the default), "<tailnet-ip>:2222", or
 // ":2222" for all interfaces).
@@ -174,7 +260,17 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 		listenAddr:  listenAddr,
 		termConfig:  termConfig,
 		keyAuth:     keyAuth,
+
+		loginGrace:                  defaultLoginGrace,
+		maxUnauthenticated:          defaultMaxUnauthenticated,
+		maxUnauthenticatedPerSource: defaultMaxUnauthenticatedPerSource,
+		afterFunc:                   realAfterFunc,
+		now:                         time.Now,
+
+		shedCheckTimeout: defaultShedCheckTimeout,
+		statsEvery:       unknownShedStatsEvery,
 	}
+	s.life, s.lifeCancel = context.WithCancel(context.Background())
 
 	// Load or generate the host key.
 	hostKey, err := s.loadOrGenerateHostKey()
@@ -212,8 +308,9 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 			// connection, and handlePublicKey alone cannot be relied on to see
 			// that switch (requestUser).
 			cfg.VerifiedPublicKeyCallback = func(conn gossh.ConnMetadata, key gossh.PublicKey, perms *gossh.Permissions, _ string) (*gossh.Permissions, error) {
+				remote := logRemote(conn.RemoteAddr())
 				if config.IsReservedShedName(conn.User()) {
-					log.Printf("SSH auth DENIED: user=%s fingerprint=%s (reserved username)", logUser(conn.User()), gossh.FingerprintSHA256(key))
+					log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (reserved username)", logUser(conn.User()), gossh.FingerprintSHA256(key), remote)
 					return nil, errReservedUser
 				}
 				// The identity records the user the key resolves to now,
@@ -223,16 +320,33 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 				// authenticate.
 				id, err := s.newConnIdentity(key, conn.User())
 				if err != nil {
-					log.Printf("SSH auth DENIED: user=%s fingerprint=%s (%v)", logUser(conn.User()), gossh.FingerprintSHA256(key), err)
+					log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (%v)", logUser(conn.User()), gossh.FingerprintSHA256(key), remote, err)
 					return nil, err
 				}
 				setConnIdentity(ctx, id)
 				if s.keyAuth.TrackConnections {
 					if err := s.trackAuthenticated(ctx, id); err != nil {
-						log.Printf("SSH auth DENIED: user=%s fingerprint=%s (%v)", logUser(conn.User()), id.fingerprint, err)
+						log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (%v)", logUser(conn.User()), id.fingerprint, remote, err)
 						return nil, err
 					}
 				}
+				// The connection is authenticated: its login grace stops
+				// and it leaves the unauthenticated counts. One whose grace
+				// ended first, or that closed, is being closed and does not
+				// authenticate.
+				if err := preauthAuthenticated(ctx); err != nil {
+					log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (%v)", logUser(conn.User()), id.fingerprint, remote, err)
+					return nil, err
+				}
+				// The one line that says a login happened: the client has
+				// proved it holds this key (x/crypto verified its signature)
+				// and the connection authenticates with it, in every mode.
+				// A key the client only offered is never logged as allowed
+				// (handlePublicKey).
+				// The owner it names is the user this connection was bound to
+				// above, from that same lookup, never a second one that a
+				// list change since could answer differently.
+				log.Printf("SSH auth allowed: user=%s fingerprint=%s remote=%s%s", logUser(id.user), id.fingerprint, remote, id.owner)
 				return perms, nil
 			}
 			// Best-effort diagnostic from the transport's authoritative per-attempt
@@ -247,7 +361,7 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 					return
 				}
 				if pubkeyFails++; pubkeyFails == maxTries {
-					log.Printf("SSH auth: public-key attempt cap (%d) reached for user=%s — the client may be offering more keys than the cap allows, so its allowlisted key may never be tried. Raise auth.ssh.max_auth_tries, or use a per-host IdentityFile + IdentitiesOnly on the client.", maxTries, logUser(conn.User()))
+					log.Printf("SSH auth: public-key attempt cap (%d) reached for user=%s remote=%s — the client may be offering more keys than the cap allows, so its allowlisted key may never be tried. Raise auth.ssh.max_auth_tries, or use a per-host IdentityFile + IdentitiesOnly on the client.", maxTries, logUser(conn.User()), logRemote(conn.RemoteAddr()))
 				}
 			}
 			return cfg
@@ -266,9 +380,10 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 		},
 	}
 
-	if keyAuth.TrackConnections {
-		s.sshServer.ConnCallback = s.wrapConn
-	}
+	// Every connection, in every mode: the login grace, the cap and its
+	// per-source share, and the "SSH auth failed" line (preauth.go). It then
+	// applies wrapConn when connections are tracked.
+	s.sshServer.ConnCallback = s.admitConn
 
 	// Add the host key to the server.
 	s.sshServer.AddHostKey(hostKey)
@@ -387,11 +502,42 @@ func (s *Server) Start() error {
 	return s.sshServer.Serve(listener)
 }
 
-// Shutdown gracefully shuts down the SSH server.
+// Shutdown gracefully shuts down the SSH server. It first ends the server's
+// lifetime, so the off-path check of a shed name's unknown key starts no more
+// and asks for no pull; and it refuses new entries into service clients'
+// sheds (CloseEntries). Only then does it wait on anything: it closes the
+// listener and waits, until ctx ends, for the connections to end; then for
+// the entries already being admitted to write their audit lines
+// (beginEntry); then for a check still running. The audit log must be closed
+// only after Shutdown returns. It logs nothing of its own: shed-server's
+// shutdown writes the one "Shutting down SSH server..." line, in the same
+// form as every other door's (cmd/shed-server shutdownDoors).
 func (s *Server) Shutdown(ctx context.Context) error {
-	log.Printf("Shutting down SSH server...")
-	return s.sshServer.Shutdown(ctx)
+	s.endLife()
+	// No new entry into a service client's shed starts from here (the
+	// caller may have closed this gate already, CloseEntries).
+	s.CloseEntries()
+	// The listener closes at once; the wait is for the connections. A
+	// begun entry's channel can outlive its connection, so the entries are
+	// waited for on their own after it: each until its ssh line is written,
+	// so the audit log the caller closes after Shutdown loses none. Drain
+	// returns at once when none is left, even past ctx.
+	err := s.sshServer.Shutdown(ctx)
+	if derr := s.entries.Drain(ctx); err == nil {
+		err = derr
+	}
+	if cerr := s.stopShedCheck(ctx); err == nil {
+		err = cerr
+	}
+	return err
 }
+
+// CloseEntries refuses every later entry into a service client's shed (the
+// channel is refused, saying the server is shutting down). It does not wait:
+// Shutdown does. shed-server calls it first thing when its shutdown begins,
+// before it waits on any server, so no other server's wait keeps this gate
+// open; Shutdown calls it too.
+func (s *Server) CloseEntries() { s.entries.Close() }
 
 // defaultMaxAuthTries is the per-connection public-key attempt cap applied when
 // auth.ssh.max_auth_tries is unset. It is deliberately higher than OpenSSH's
@@ -462,6 +608,10 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	// The username of this request, not of the connection's first one: it
 	// decides the reserved-name refusal, the refetch eligibility and the logs.
 	user := requestUser(ctx)
+	remote := logRemote(ctx.RemoteAddr())
+	// Counted for the connection's "SSH auth failed" line, written if it
+	// closes without proving a key (preauthConn.Close).
+	noteOffer(ctx, user)
 
 	// The username git is reserved (no shed may have that name), and it is
 	// refused here first: in every mode, with or without a user list, before
@@ -472,12 +622,12 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	// machine gives out is for exactly "git". A case variant ("Git") is not a
 	// valid shed name, and shedNameFor refuses it before any shed lookup.
 	if config.IsReservedShedName(user) {
-		log.Printf("SSH auth DENIED: user=%s fingerprint=%s (reserved username)", logUser(user), fingerprint)
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (reserved username)", logUser(user), fingerprint, remote)
 		return false
 	}
 
 	if s.keyAuth.off() {
-		log.Printf("SSH auth attempt: user=%s fingerprint=%s (allowlist off)", logUser(user), fingerprint)
+		log.Printf("SSH auth attempt: user=%s fingerprint=%s remote=%s (allowlist off)", logUser(user), fingerprint, remote)
 		return true
 	}
 
@@ -485,11 +635,11 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	// certificate would be a second identity for whoever holds the key in
 	// it (the lookup resolves none to a user either).
 	if _, cert := key.(*gossh.Certificate); cert && users.HasUserList(s.keyAuth.Users) {
-		log.Printf("SSH auth DENIED: user=%s fingerprint=%s (an SSH certificate; this server's users log in with plain keys)", logUser(user), fingerprint)
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (an SSH certificate; this server's users log in with plain keys)", logUser(user), fingerprint, remote)
 		return false
 	}
 	if s.keyAuth.expired(fingerprint) {
-		log.Printf("SSH auth DENIED: user=%s fingerprint=%s (the key has expired)%s", logUser(user), fingerprint, s.keyAuth.owner(fingerprint))
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s (the key has expired)%s", logUser(user), fingerprint, remote, s.keyAuth.owner(fingerprint))
 		return false
 	}
 	authorized := s.keyAuth.known(fingerprint)
@@ -497,52 +647,88 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 		// A lookup whose users change while the server runs (a directory's
 		// list) pulled its list; any other fetched GitHub logins.
 		if _, live := s.keyAuth.Users.(users.BoundCredentialsOnly); live {
-			log.Printf("SSH auth: key %s is known after pulling the directory again", fingerprint)
+			log.Printf("SSH auth: key %s remote=%s is known after pulling the directory again", fingerprint, remote)
 		} else {
-			log.Printf("SSH auth: key %s is known after fetching the GitHub logins again", fingerprint)
+			log.Printf("SSH auth: key %s remote=%s is known after fetching the GitHub logins again", fingerprint, remote)
 		}
 		authorized = true
 	}
 	if s.keyAuth.enforced() && !authorized {
-		log.Printf("SSH auth DENIED: user=%s fingerprint=%s", logUser(user), fingerprint)
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s remote=%s", logUser(user), fingerprint, remote)
 		return false
 	}
 	// Reaches here only in warn mode, or enforce mode with an authorized key.
-	if authorized {
-		log.Printf("SSH auth allowed: user=%s fingerprint=%s%s", logUser(user), fingerprint, s.keyAuth.owner(fingerprint))
-	} else {
-		log.Printf("SSH auth WOULD DENY (warn mode): user=%s fingerprint=%s", logUser(user), fingerprint)
+	// An accepted key is not logged here: the client has only offered it, and
+	// may never sign with it. "SSH auth allowed" is written once the client
+	// has proved it holds the key (the VerifiedPublicKeyCallback).
+	if !authorized {
+		log.Printf("SSH auth WOULD DENY (warn mode): user=%s fingerprint=%s remote=%s", logUser(user), fingerprint, remote)
 	}
 	return true
 }
 
 // refetchUnknownKey asks the user lookup to look for a key it does not know
 // (on GitHub, or in a directory's list), and reports whether the key is known
-// afterwards. Only in enforce mode (warn lets the key in anyway; off looks
-// nothing up), only when the lookup can fetch (a users.UnknownKeyRefetcher),
-// and only when the login is `_bootstrap` (`shed server add`) or a valid shed
-// name. That check is on the name's syntax alone: nothing about sheds is
-// looked up for a peer that has not authenticated. The lookup then takes a
-// server-wide slot, checked before it does anything else; only the login that
-// takes it waits for the fetch, every other returns at once. With GitHub
-// logins (auth.users) the slot is one fetch a minute and the wait up to five
-// seconds, and the lookup refuses a key it dropped for a GitHub account
-// mismatch; with a directory's list (auth.directory) the slot is one pull a
-// minute while pulls succeed, one per retry interval while they fail, none
-// inside a pending Retry-After, and the wait one 20-second deadline. A key
-// the lookup knows (an expired one included) never gets here.
+// on this attempt. Only in enforce mode (warn lets the key in anyway; off
+// looks nothing up), and by the login name:
+//
+//   - `_bootstrap` (`shed server add`), on a lookup that can fetch (a
+//     users.UnknownKeyRefetcher): the lookup takes its server-wide slot,
+//     checked before it does anything else; only the login that takes it
+//     waits for the fetch, every other returns at once. With GitHub logins
+//     (auth.users) the slot is one fetch a minute and the wait up to five
+//     seconds, and the lookup refuses a key it dropped for a GitHub account
+//     mismatch. With a directory's list (auth.directory) the slot is one pull
+//     a minute while pulls succeed, one per retry interval while they fail,
+//     none inside a pending Retry-After. The login that takes it is let in as
+//     soon as its key is known (from any pull), and if its key is still
+//     unknown it is refused when its 8-second deadline ends
+//     (directory.UnknownKeyWait), never earlier, whenever its pull ended.
+//   - a valid shed name, on a lookup that can nudge (a
+//     users.UnknownKeyNudger: a directory's list): refused at once, whether
+//     a shed of that name exists or not, without waiting for anything about
+//     the name. Off the login path the server checks whether it exists, and
+//     only then nudges a pull on the lookup's shed-name slot (one every 5
+//     minutes while pulls succeed, one per retry interval while they fail,
+//     none inside a Retry-After); no login waits for it, and the person's
+//     next attempt finds the key known (nudgeIfShed).
+//   - a valid shed name on a lookup that can fetch and not nudge (GitHub
+//     logins): as `_bootstrap`, on the name's syntax alone.
+//   - any other name: nothing is asked, and the key is refused.
+//
+// What a peer whose key stays unknown can learn about which shed names
+// exist: nothing from the shed-name login's answer, which never waits for
+// the check. A shed-name pull can delay a later `_bootstrap` pull that queues
+// behind it, but a `_bootstrap` login whose key stays unknown is answered at
+// its fixed deadline, so that delay does not show. Except in three cases, in
+// which whether a shed-name pull was sent changes when the `_bootstrap` slot
+// may next be taken, so a peer probing then can tell, at most one guess per
+// `_bootstrap` slot take: while pulls fail; while a Retry-After is pending;
+// and when the shed-name pull itself fails while pulls had been succeeding
+// (the server then enters the failed state, and a `_bootstrap` login that
+// would have taken the slot and waited is refused at once). Apart from that,
+// a person whose key is listed is let in when a pull brings it, so a pull
+// already running ahead of theirs delays their own first login, which can
+// show that some pull was in flight; that is accepted.
+//
+// A key the lookup knows (an expired one included) never gets here.
 func (s *Server) refetchUnknownKey(ctx ssh.Context, user, fingerprint string) bool {
 	if !s.keyAuth.enforced() {
 		return false
 	}
-	if user != reservedBootstrapUser && config.ValidateShedName(user) != nil {
+	if user == reservedBootstrapUser {
+		r, ok := s.keyAuth.Users.(users.UnknownKeyRefetcher)
+		return ok && r.RefetchForUnknownKey(ctx, fingerprint)
+	}
+	if config.ValidateShedName(user) != nil {
+		return false
+	}
+	if n, ok := s.keyAuth.Users.(users.UnknownKeyNudger); ok {
+		s.nudgeIfShed(n, user, fingerprint)
 		return false
 	}
 	r, ok := s.keyAuth.Users.(users.UnknownKeyRefetcher)
-	if !ok {
-		return false
-	}
-	return r.RefetchForUnknownKey(ctx, fingerprint)
+	return ok && r.RefetchForUnknownKey(ctx, fingerprint)
 }
 
 // localForwardChannelData matches RFC4254 Section 7.2
@@ -606,7 +792,9 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 		_ = newChan.Reject(gossh.ConnectionFailed, "shed not found")
 		return
 	}
-	bctx = backend.PinCreatedAt(bctx, shed.CreatedAt)
+	// The dial acts on the shed that was checked, with the owner it was
+	// checked against (pinEntry).
+	bctx = pinEntry(bctx, shed)
 
 	// Validate port range (SSH protocol uses uint32, TCP ports are uint16).
 	if d.DestPort > 65535 {
@@ -614,6 +802,21 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 		_ = newChan.Reject(gossh.ConnectionFailed, "invalid port number")
 		return
 	}
+
+	// An entry into a service client's shed is held open in the server's
+	// pending entries from here until its line is written (or it fails), so
+	// a shutdown waits for that line before the audit log is closed; once
+	// the shutdown has begun, no new one starts.
+	id, _ := connIdentityFrom(ctx)
+	// (A tunnel writes its line itself, below, so the exec hook beginEntry
+	// also returns is not used, and needs no peer address.)
+	_, endEntry, ok := s.beginEntry(p, id.fingerprint, nil, shed, audit.SSHChannelTunnel)
+	if !ok {
+		log.Printf("Port forward refused: user=%s: %v", logUser(user), errShuttingDown)
+		_ = newChan.Reject(gossh.ConnectionFailed, errShuttingDown.Error())
+		return
+	}
+	defer endEntry()
 
 	// Connect to the service inside the VM via DialService.
 	dialCtx, dialCancel := context.WithTimeout(bctx, 30*time.Second)
@@ -632,6 +835,12 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 		return
 	}
 	go gossh.DiscardRequests(reqs)
+
+	// The entry is admitted: the guarded dial passed its own check and
+	// connected, and the channel is open. Only now is it recorded (a
+	// service client's shed only; auditEntry).
+	s.auditEntry(p, id.fingerprint, conn.RemoteAddr(), shed, audit.SSHChannelTunnel, int(d.DestPort))
+	endEntry()
 
 	log.Printf("Port forward established: %s -> %s:%d", logUser(user), shed.Name, d.DestPort)
 

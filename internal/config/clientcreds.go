@@ -15,6 +15,8 @@ package config
 
 import (
 	"crypto/tls"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -75,6 +77,29 @@ func WriteClientCredentials(name string, certPEM, keyPEM []byte) (certPath, keyP
 	return clientCredStore().Write(name, certPEM, keyPEM)
 }
 
+// WriteClientCredentialsHeld is WriteClientCredentials for a caller that
+// already holds the server's credential lock (LockServerCredentials): the same
+// write, without taking the lock again. It is how the CLI writes a certificate
+// inside its one write transaction (lock, read the row, write, save, release).
+func WriteClientCredentialsHeld(name string, certPEM, keyPEM []byte) (certPath, keyPath string, err error) {
+	return clientCredStore().WriteHeld(name, certPEM, keyPEM)
+}
+
+// PutBackClientCredentialFile puts ONE of a server's credential files back as
+// it was before a failed write: data, written atomically, or no file at all
+// when data is empty. The caller holds the server's credential lock and names
+// a destination its own write transaction changed (a file it did not change
+// is never rewritten).
+func PutBackClientCredentialFile(path string, data []byte) error {
+	if len(data) == 0 {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	return creds.AtomicWriteFile(path, data, creds.FilePerm)
+}
+
 // CredsStagingRoot returns the directory holding not-yet-adopted credential
 // material (~/.shed/creds/%staging). Exported so a test can make a staging write
 // fail without reaching into this package's internals.
@@ -112,8 +137,9 @@ func StageClientCredentials(name string, certPEM, keyPEM []byte) (*StagedClientC
 // It is NOT re-entrant: flock keys on the open file description, so calling
 // LoadClientCredentials or WriteClientCredentials (which take the same lock
 // internally) while holding this one deadlocks the process against itself.
-// Callers hold it around Remove — which does not lock — and around config
-// updates.
+// Callers hold it around Remove — which does not lock — around config updates,
+// and around the held variants (WriteClientCredentialsHeld,
+// StagedClientCredentials.CommitHeld).
 func LockServerCredentials(name string) (func(), error) { return clientCredStore().Lock(name) }
 
 // RemoveServerCredentials deletes a server's credential directory. It is called

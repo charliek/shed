@@ -83,7 +83,7 @@ func (s *bootstrapStub) pinned() []string {
 
 func stubBootstrapResult(cred sdk.Credential, err error) *bootstrapStub {
 	s := &bootstrapStub{}
-	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(string, int, string, string, string) (sdk.Credential, error) {
 		s.calls.Add(1)
 		s.pinnedAtCall.Store(readKnownHostsLines())
 		return cred, err
@@ -516,12 +516,31 @@ func TestServerAddBootstrapDecisionTable(t *testing.T) {
 		name     string
 		bootErr  error
 		wantErr  []string
+		notErr   []string
 		wantNoKH bool
 	}{
 		{
-			name:    "key not authorized names the allowlist and never falls back",
+			name:    "key not authorized names each cause and never falls back",
 			bootErr: errors.New("sdk/bootstrap: ssh exited 1: bootstrap: key not authorized"),
-			wantErr: []string{"not in this server's allowlist", "auth.ssh.github_users", "authorized_keys"},
+			wantErr: []string{
+				"the server refused every SSH key ssh offered for _bootstrap@example.test: none of them is a user's key there",
+				"the right key has a passphrase and is not in your agent (shed runs ssh with BatchMode=yes: ssh-add it)",
+				"the server's user list is not in force and only its local admins can log in",
+				"can be refused once while the server fetches it: try again in a minute",
+				"bootstrap: key not authorized", // the cause is kept
+			},
+			// A server may take its users from an account service, where there
+			// is no auth.ssh setting to edit: the refusal names none.
+			notErr: []string{"allowlist", "auth.ssh", "github_users", "authorized_keys"},
+		},
+		{
+			name:    "a refusal of every key ssh offered names each cause",
+			bootErr: fmt.Errorf("%w: _bootstrap@example.test: Permission denied (publickey).", sdkbootstrap.ErrNoSSHIdentities),
+			wantErr: []string{
+				"the server refused every SSH key ssh offered for _bootstrap@example.test",
+				"Permission denied (publickey)",
+			},
+			notErr: []string{"allowlist", "auth.ssh", "github_users", "authorized_keys"},
 		},
 		{
 			name:    "an ssh dial failure names host:ssh-port",
@@ -559,10 +578,46 @@ func TestServerAddBootstrapDecisionTable(t *testing.T) {
 					t.Errorf("error %q must mention %q", err, want)
 				}
 			}
+			for _, not := range tc.notErr {
+				if strings.Contains(err.Error(), not) {
+					t.Errorf("error %q must not mention %q", err, not)
+				}
+			}
 			if len(clientConfig.Servers) != 0 {
 				t.Errorf("a server entry was written despite the failure: %+v", clientConfig.Servers)
 			}
 		})
+	}
+}
+
+// TestKeysRefusedErrorNamesTheEntrysKey: an entry that offers its own key
+// (identity_file) is refused naming that key, and a host from a hand-edited
+// entry never reaches the terminal raw.
+func TestKeysRefusedErrorNamesTheEntrysKey(t *testing.T) {
+	cause := errors.New("sdk/bootstrap: ssh exited 1: bootstrap: key not authorized")
+
+	err := keysRefusedError("shed.example.test", "/home/pat/.ssh/id_pat", cause)
+	for _, want := range []string{
+		`the server refused the entry's SSH key "/home/pat/.ssh/id_pat" (and any other key ssh offered) for _bootstrap@shed.example.test`,
+		"bootstrap: key not authorized",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q must mention %q", err, want)
+		}
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("the cause is not kept: %v", err)
+	}
+	if plain := keysRefusedError("shed.example.test", "", cause); strings.Contains(plain.Error(), "entry's SSH key") {
+		t.Errorf("an entry with no identity_file named one: %v", plain)
+	}
+
+	hostile := keysRefusedError("evil\n\x1b[2Jhost", "", cause)
+	if strings.ContainsAny(hostile.Error(), "\n\x1b") {
+		t.Errorf("a control character reached the message raw: %q", hostile)
+	}
+	if !strings.Contains(hostile.Error(), `_bootstrap@evil\n\x1b[2Jhost`) {
+		t.Errorf("the host is not shown escaped: %q", hostile)
 	}
 }
 
@@ -687,7 +742,7 @@ func TestServerAddMTLSEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved := reloaded.Servers["srv"]
-	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(string, int, string, string, string) (sdk.Credential, error) {
 		t.Error("the saved entry must not need a fresh bootstrap")
 		return sdk.Credential{}, errors.New("unexpected")
 	}
@@ -1028,26 +1083,37 @@ func TestServerUpdateRefetchIsSSHFirst(t *testing.T) {
 // the add/refetch transaction: config.yaml and the credential store
 // ---------------------------------------------------------------------------
 
-// breakConfigSave points clientConfig at a path that cannot be written (its
-// parent is a regular file), preserving the entries the current config holds.
-// Every subsequent Save fails; nothing else changes.
+// breakConfigSave points clientConfig at a copy of the current config, in a
+// directory that can be read and locked but not written: the credential
+// transaction's under-lock read of the row succeeds, and every Save after it
+// fails. Nothing else changes.
 func breakConfigSave(t *testing.T) {
 	t.Helper()
-	blocked := filepath.Join(t.TempDir(), "not-a-dir")
-	broken, err := config.LoadClientConfigFromPath(filepath.Join(blocked, "config.yaml"))
-	if err != nil {
-		t.Fatal(err)
+	if os.Geteuid() == 0 {
+		t.Skip("a read-only directory does not stop root from writing")
 	}
-	// Only now put a regular FILE where the config's directory has to be: the load
-	// above had to succeed (there is simply no config there yet), and every Save
-	// from here on fails on the mkdir.
-	if err := os.WriteFile(blocked, []byte("x"), 0600); err != nil {
+	dir := filepath.Join(t.TempDir(), "read-only")
+	broken, err := config.LoadClientConfigFromPath(filepath.Join(dir, "config.yaml"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	for name, entry := range clientConfig.Servers {
 		broken.Servers[name] = entry
 	}
 	broken.DefaultServer = clientConfig.DefaultServer
+	// Write the copy (and its lock file) while the directory is writable, then
+	// take the write bit away: a read and a lock still work, a save cannot
+	// create its temp file.
+	if err := broken.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := broken.Update(func(*config.ClientConfig) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
 	clientConfig = broken
 	if err := clientConfig.Update(func(*config.ClientConfig) {}); err == nil {
 		t.Fatal("test setup: the config save was supposed to fail")
@@ -1235,7 +1301,12 @@ func TestServerUpdateRefetchIsATransaction(t *testing.T) {
 		m := newMTLSServer(t)
 		cfgPath, cert, entry := addedMTLSServer(t, m)
 
-		// The server has switched to token mode: same endpoint, a bearer token.
+		// The server has switched to token mode: a bearer token, on the port its
+		// bundle reports. Its mtls listener is gone, so the entry's own endpoint
+		// cannot be reached and the refetch moves to the reported one. (An mtls
+		// listener still refusing the token client there would be an answer,
+		// and the refetch would stop at it: TestRefetchAnAnswerIsNotAMovedPort.)
+		m.srv.Close()
 		_, tokHost, tokPort, tokPin := tokenServer(t, "srv", "shed_ctl_flip")
 		saved := clientConfig.Servers["srv"]
 		saved.Host = tokHost
@@ -1414,8 +1485,13 @@ func TestServerUpdateRefetchKeyNotAuthorized(t *testing.T) {
 	stubBootstrapResult(sdk.Credential{}, errors.New("sdk/bootstrap: ssh exited 1: bootstrap: key not authorized"))
 
 	err := runServerUpdate(nil, []string{"srv"})
-	if err == nil || !strings.Contains(err.Error(), "not in this server's allowlist") {
-		t.Fatalf("err = %v, want the allowlist error", err)
+	if err == nil || !strings.Contains(err.Error(), "the server refused every SSH key ssh offered for _bootstrap@example.test") {
+		t.Fatalf("err = %v, want the refusal of every key", err)
+	}
+	for _, not := range []string{"allowlist", "auth.ssh", "github_users", "authorized_keys"} {
+		if strings.Contains(err.Error(), not) {
+			t.Errorf("error %q must not mention %q", err, not)
+		}
 	}
 	if got := clientConfig.Servers["srv"].TLSCertFingerprint; got != "sha256:old" {
 		t.Errorf("the pin was rewritten despite the failure: %q", got)

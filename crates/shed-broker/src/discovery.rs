@@ -48,6 +48,23 @@ pub struct ServerTarget {
     /// "never recorded" and "recorded as token" stay distinguishable — the Go mirror
     /// keeps the same distinction and the shared golden fixture pins it.
     pub auth_mode: String,
+    /// The named user the shed CLI recorded for this entry (`user`; empty when absent or
+    /// null; [`shed_core::config::USER_NOT_A_STRING`] when it is a list or a map).
+    /// The credential sources hold their certificates to it: one issued for another named
+    /// user, or one that names no user, is refused (plan 037 §3.2.2). Part of the target,
+    /// so a changed `user` restarts the server's sources (the supervisor's whole-target
+    /// compare).
+    pub user: String,
+    /// The SSH key the shed CLI recorded for this entry (`identity_file`; empty when absent
+    /// or null; [`shed_core::identityfile::IDENTITY_FILE_UNREADABLE`] when it is a list, a
+    /// map, or a value not read exactly, and
+    /// [`shed_core::identityfile::IDENTITY_FILE_ENTRY_UNREADABLE`] for an entry with a merge
+    /// key or a tagged key, each of which every check refuses). The minter runs ssh with it (`-i <path> -o
+    /// IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none`), checking the file
+    /// first, and a group that does not mint never sends a stored `credentials_token` for
+    /// it (plan 037 A8). Part of the target, so a changed `identity_file` restarts the
+    /// server's sources.
+    pub identity_file: String,
 }
 
 impl ServerTarget {
@@ -89,7 +106,15 @@ pub fn load_discovered_servers(path: &str) -> Result<Vec<ServerTarget>, String> 
         Err(e) => return Err(format!("reading shed config {path}: {e}")),
     };
 
-    let root = yaml_lite::parse(&data).map_err(|e| format!("parsing shed config {path}: {e}"))?;
+    // A byte-order mark at the start is skipped, as Go's reader skips it (saphyr would
+    // read it as part of the first key, so `servers` would not be found).
+    let data = data.strip_prefix('\u{feff}').unwrap_or(&data);
+    // A raw line break the parser does not split on as Go's does refuses the whole file
+    // (plan 037 A8), before the parser reads it.
+    yaml_lite::refuse_unsupported_line_breaks(data)
+        .map_err(|e| format!("parsing shed config {path}: {e}"))?;
+    let (root, marks) =
+        yaml_lite::parse_marked(data).map_err(|e| format!("parsing shed config {path}: {e}"))?;
     let mut targets = Vec::new();
     if let Some(servers) = root
         .as_map()
@@ -101,6 +126,24 @@ pub fn load_discovered_servers(path: &str) -> Result<Vec<ServerTarget>, String> 
                 continue;
             };
             let scalar = |k: &str| fields.get(k).and_then(Node::as_scalar);
+            // A field this reader does not read exactly as YAML means it (a tag, an
+            // anchor, a value over more than one line): `user` and `identity_file` fail
+            // closed on it. An entry with a merge key (`<<`) could carry either in the
+            // merged mapping this reader does not follow, and one with a tagged key
+            // (`!!binary aWRlbnRpdHlfZmlsZQ==` is `identity_file` to Go, its base64 text
+            // here) could name either under a key this reader does not see as theirs:
+            // both fail closed whatever the entry says, as in shed-core's reader.
+            let exact = |field: &str| {
+                !marks.values.contains(
+                    ["servers", name.as_str(), field]
+                        .map(String::from)
+                        .as_slice(),
+                )
+            };
+            let merged = fields.contains_key("<<")
+                || marks
+                    .tagged_keys
+                    .contains(["servers", name.as_str()].map(String::from).as_slice());
             let host = scalar("host").unwrap_or("");
             if host.is_empty() {
                 continue;
@@ -125,11 +168,49 @@ pub fn load_discovered_servers(path: &str) -> Result<Vec<ServerTarget>, String> 
                 // Absent → "" (NOT "token"): the Go mirror keeps "never recorded" and
                 // "recorded as token" distinguishable, and the golden fixture pins it.
                 auth_mode: scalar("auth_mode").unwrap_or("").to_string(),
+                user: if merged {
+                    shed_core::config::USER_NOT_A_STRING.to_string()
+                } else {
+                    target_user(fields.get("user"), exact("user"))
+                },
+                identity_file: if merged {
+                    shed_core::identityfile::IDENTITY_FILE_ENTRY_UNREADABLE.to_string()
+                } else {
+                    target_identity_file(fields.get("identity_file"), exact("identity_file"))
+                },
             });
         }
     }
     targets.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(targets)
+}
+
+/// An entry's `identity_file` (the same rule as shed-core's reader): absent or null → `""`;
+/// a scalar read exactly → verbatim (checked at every use); a list, a map, or a value not
+/// read exactly (`exact` false: a tag, an anchor, a value over more than one line) →
+/// [`shed_core::identityfile::IDENTITY_FILE_UNREADABLE`], which every check refuses.
+fn target_identity_file(node: Option<&Node>, exact: bool) -> String {
+    match node {
+        None => String::new(),
+        Some(Node::Null) if exact => String::new(),
+        Some(Node::Scalar(s)) if exact => s.clone(),
+        Some(_) => shed_core::identityfile::IDENTITY_FILE_UNREADABLE.to_string(),
+    }
+}
+
+/// An entry's `user` as the sources hold it (the same rule as shed-core's reader): absent
+/// or null → `""` (no user recorded); a scalar read exactly → verbatim (a value that is no
+/// user name matches no certificate, which refuses); a list, a map, or a value not read
+/// exactly (as for [`target_identity_file`]) → [`shed_core::config::USER_NOT_A_STRING`], so
+/// the entry fails closed instead of reading as "no user", which would take the first named
+/// user it is issued.
+fn target_user(node: Option<&Node>, exact: bool) -> String {
+    match node {
+        None => String::new(),
+        Some(Node::Null) if exact => String::new(),
+        Some(Node::Scalar(s)) if exact => s.clone(),
+        Some(_) => shed_core::config::USER_NOT_A_STRING.to_string(),
+    }
 }
 
 // The `resolve_targets` methods live here (rather than on `HostAgentConfig` in
@@ -159,6 +240,8 @@ impl HostAgentConfig {
                 // unnamed target is plain-http/open in practice, and an enrollment would
                 // discover the mode from the bundle anyway.
                 auth_mode: String::new(),
+                user: String::new(),
+                identity_file: String::new(),
             }];
         };
         let mut out = Vec::with_capacity(discovered.len());
@@ -220,11 +303,10 @@ mod tests {
         assert!(err.contains("parsing shed config"), "err = {err}");
     }
 
-    /// The Rust half of the `load_discovered_servers` golden — reads the SAME shared
-    /// fixture the Go runner reads (`cmd/shed-host-agent/golden_test.go`), so the two
-    /// impls can't drift together on the ssh_port=0/empty-host/sort semantics. Lives
-    /// in-crate (not `tests/golden.rs`) because this is a binary crate with no lib, so
-    /// an integration test can't reach `load_discovered_servers`.
+    /// The `load_discovered_servers` golden — the shared fixture under
+    /// `tests/host-agent-diff/fixtures/`, recorded while the Go daemon still read it too
+    /// (retired in plan 006); this test is now its one reader. It pins the
+    /// ssh_port=0/empty-host/sort semantics and the verbatim `auth_mode` and `user`.
     #[test]
     fn golden_load_discovered_servers() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -249,6 +331,8 @@ mod tests {
                         "ssh_host": t.ssh_host,
                         "ssh_port": t.ssh_port,
                         "auth_mode": t.auth_mode,
+                        "user": t.user,
+                        "identity_file": t.identity_file,
                     })
                 })
                 .collect();
@@ -263,6 +347,23 @@ mod tests {
                         .is_some(),
                     "golden vector {name:?} entry {i} has no auth_mode key — the fixture \
                      must pin it (absent-in-config means \"\", never \"token\")"
+                );
+                // `user` is required the same way: an entry that stopped carrying it
+                // would stop pinning that an absent user is "" (no user held).
+                assert!(
+                    want.get("user")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some(),
+                    "golden vector {name:?} entry {i} has no user key — the fixture must pin it"
+                );
+                // And `identity_file`: an absent one is "" (no key), and the fixture pins
+                // that a value is carried verbatim.
+                assert!(
+                    want.get("identity_file")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some(),
+                    "golden vector {name:?} entry {i} has no identity_file key — the fixture \
+                     must pin it"
                 );
             }
             assert_eq!(
@@ -318,6 +419,622 @@ servers:
 
         assert_eq!(by("tok").auth_mode, "token");
         assert!(!by("tok").is_mtls());
+    }
+
+    /// What the broker's reader makes of one config, for one entry.
+    #[derive(Debug, PartialEq)]
+    enum BrokerReads {
+        /// A target with this `identity_file`.
+        Target(&'static str),
+        /// No target for the entry (an empty host: no ssh, no mint for it).
+        NoTarget,
+        /// The whole file is an error: no target at all.
+        FileError,
+    }
+
+    /// **Both Rust readers, on every shape of the A8 review's table** (plan 037 A8,
+    /// `reviews/A8-round2a.md`), each answer pinned: shed-core's reader (the app),
+    /// the broker's (the minter), and, as the third column, what Go's reader
+    /// (gopkg.in/yaml.v3 into `config.ServerEntry`) reads. Where the two Rust readers
+    /// differ, both are on the safe side: a path Go reads too, or a refusal. Neither is
+    /// ever "no identity file" ("") where Go reads a path.
+    ///
+    /// shed-core reads a server entry only when every line in it is a plain
+    /// `key: value` it reads exactly (its whitelist), so every other shape is the whole
+    /// entry refused (`E`, its host empty too). The broker reads real YAML and refuses
+    /// a value with a tag, an anchor or over more than one line (`U`), and an entry with
+    /// a merge key or a tagged key (`E`).
+    ///
+    /// The third review's rows (`reviews/A8-round3.md`, ruled in `A8-lead-rulings-3.md`)
+    /// follow: only the first document is read; a raw CR, NEL, U+2028 or U+2029 refuses
+    /// the whole file in both readers (`F`, `FileError`); a plain name with colons is
+    /// read under its own name; a byte-order mark is skipped; a second `servers:`, and
+    /// `servers:` in flow form or with a tag or an anchor, refuse the whole file in
+    /// shed-core; a tab-indented line refuses its entry; a no-break space before a colon
+    /// makes another key.
+    #[test]
+    fn both_readers_on_every_shape_of_the_review() {
+        use shed_core::identityfile::{
+            IDENTITY_FILE_ENTRY_UNREADABLE as E, IDENTITY_FILE_UNREADABLE as U,
+        };
+        use BrokerReads::{FileError, NoTarget, Target};
+        const P: &str = "/keys/prod";
+        const F: &str = "<the whole file refused>";
+        // (shape, the config, shed-core's identity_file, the broker's answer, Go's)
+        let rows: Vec<(&str, &str, &str, BrokerReads, &str)> = vec![
+            (
+                "an escaped quoted key",
+                "    host: prod.example\n    \"identity\\u005ffile\": /keys/prod\n",
+                P,
+                Target(P),
+                "path",
+            ),
+            (
+                "a plain value continued on an indented line",
+                "    host: prod.example\n    identity_file: /keys/prod\n      more\n",
+                E,
+                Target(U),
+                "\"/keys/prod more\"",
+            ),
+            (
+                "a folded block scalar",
+                "    host: prod.example\n    identity_file: >-\n      /keys/prod\n",
+                E,
+                Target(U),
+                "path",
+            ),
+            (
+                "a literal block scalar",
+                "    host: prod.example\n    identity_file: |\n      /keys/prod\n",
+                E,
+                Target(U),
+                "the path and a newline (refused by the value rule)",
+            ),
+            (
+                "a value tagged !!str",
+                "    host: prod.example\n    identity_file: !!str /keys/prod\n",
+                E,
+                Target(U),
+                "path",
+            ),
+            (
+                "!!str null",
+                "    host: prod.example\n    identity_file: !!str null\n",
+                E,
+                Target(U),
+                "the string \"null\" (refused by the value rule)",
+            ),
+            (
+                "a key tagged !!str",
+                "    host: prod.example\n    !!str identity_file: /keys/prod\n",
+                E,
+                Target(E),
+                "path",
+            ),
+            (
+                "a key tagged !!binary",
+                "    host: prod.example\n    !!binary aWRlbnRpdHlfZmlsZQ==: /keys/prod\n",
+                E,
+                Target(E),
+                "path (the key decodes to identity_file)",
+            ),
+            (
+                "an anchored value",
+                "    host: prod.example\n    identity_file: &k /keys/prod\n",
+                E,
+                Target(U),
+                "path",
+            ),
+            (
+                "an alias value",
+                "    host: prod.example\n    other: &k /keys/prod\n    identity_file: *k\n",
+                E,
+                FileError,
+                "the anchored path",
+            ),
+            (
+                "an anchored key",
+                "    host: prod.example\n    &k identity_file: /keys/prod\n",
+                E,
+                Target(P),
+                "path",
+            ),
+            (
+                "a merge key",
+                "    host: prod.example\n    <<: {identity_file: /keys/prod}\n",
+                E,
+                Target(E),
+                "path",
+            ),
+            (
+                "a repeated identity_file",
+                "    host: prod.example\n    identity_file: /keys/a\n    identity_file: /keys/b\n",
+                E,
+                FileError,
+                "an error for the whole file",
+            ),
+            (
+                "the fields as a flow mapping on the next line",
+                "    {host: prod.example, identity_file: /keys/prod}\n",
+                E,
+                Target(P),
+                "path",
+            ),
+            (
+                "an explicit ? key and : value",
+                "    host: prod.example\n    ? identity_file\n    : /keys/prod\n",
+                E,
+                Target(P),
+                "path",
+            ),
+            (
+                "an explicit ? key and : value before the host",
+                "    ? identity_file\n    : /keys/prod\n    host: prod.example\n",
+                E,
+                Target(P),
+                "path",
+            ),
+            (
+                "an unquoted null",
+                "    host: prod.example\n    identity_file: null\n",
+                "",
+                Target(""),
+                "no identity file",
+            ),
+            (
+                "an unquoted ~",
+                "    host: prod.example\n    identity_file: ~\n",
+                "",
+                Target(""),
+                "no identity file",
+            ),
+            (
+                "a bare value",
+                "    host: prod.example\n    identity_file:\n",
+                "",
+                Target(""),
+                "no identity file",
+            ),
+            (
+                "a quoted empty value",
+                "    host: prod.example\n    identity_file: \"\"\n",
+                "",
+                Target(""),
+                "no identity file",
+            ),
+            (
+                "a path, a space and a comment",
+                "    host: prod.example\n    identity_file: /keys/prod # the key\n",
+                P,
+                Target(P),
+                "path",
+            ),
+            (
+                "a path, a tab and a comment",
+                "    host: prod.example\n    identity_file: /keys/prod\t# the key\n",
+                P,
+                Target(P),
+                "path",
+            ),
+            (
+                "a null host",
+                "    host: null\n    identity_file: /keys/prod\n",
+                E,
+                NoTarget,
+                "an empty host",
+            ),
+            (
+                "a ~ host",
+                "    host: ~\n    identity_file: /keys/prod\n",
+                E,
+                NoTarget,
+                "an empty host",
+            ),
+            (
+                "a bare host",
+                "    host:\n    identity_file: /keys/prod\n",
+                E,
+                NoTarget,
+                "an empty host",
+            ),
+        ];
+        // The entry on its own line, a flow mapping: shed-core used to skip it silently.
+        let inline = "servers:\n  prod: {host: prod.example, identity_file: /keys/prod}\n";
+        // A merge through an alias: the anchor is outside `servers:`.
+        let merged_alias = "base: &base\n  identity_file: /keys/prod\nservers:\n  prod:\n    \
+                            host: prod.example\n    <<: *base\n";
+        // The third review (`reviews/A8-round3.md`; the lead's ruling,
+        // `A8-lead-rulings-3.md`): F is shed-core refusing the WHOLE file (no entry read).
+        let base = "servers:\n  prod:\n    host: prod.example\n    user: alice\n    \
+                    identity_file: /keys/prod\n";
+        let in_comment = |br: &str| {
+            format!(
+                "servers:\n  prod:\n    host: prod.example\n    # note{br}    identity_file: \
+                 /keys/prod\n"
+            )
+        };
+        let long = "x".repeat(130);
+        let third: Vec<(String, String, String, &str, BrokerReads, &str)> = vec![
+            (
+                "a second document replaces the entry".into(),
+                format!("{base}---\nservers:\n  prod:\n    host: other.example\n"),
+                "prod".into(),
+                P,
+                Target(P),
+                "path (the first document)",
+            ),
+            (
+                "a document end, then another servers:".into(),
+                format!("{base}...\nservers:\n  prod:\n    host: other.example\n"),
+                "prod".into(),
+                P,
+                Target(P),
+                "path (the first document)",
+            ),
+            (
+                "a CR inside a comment".into(),
+                in_comment("\r"),
+                "prod".into(),
+                F,
+                FileError,
+                "path",
+            ),
+            (
+                "a NEL inside a comment".into(),
+                in_comment("\u{85}"),
+                "prod".into(),
+                F,
+                FileError,
+                "path",
+            ),
+            (
+                "a line separator inside a comment".into(),
+                in_comment("\u{2028}"),
+                "prod".into(),
+                F,
+                FileError,
+                "path",
+            ),
+            (
+                "a paragraph separator inside a comment".into(),
+                in_comment("\u{2029}"),
+                "prod".into(),
+                F,
+                FileError,
+                "path",
+            ),
+            (
+                "a plain name with a colon (yaml.v3's output)".into(),
+                "servers:\n    prod:blue:\n        host: prod.example\n        ssh_port: 22\n        \
+                 identity_file: /keys/prod\ndefault_server: \"\"\nsheds: {}\n"
+                    .into(),
+                "prod:blue".into(),
+                P,
+                Target(P),
+                "path",
+            ),
+            (
+                "a plain name with two colons".into(),
+                "servers:\n  a:b:c:\n    host: prod.example\n    identity_file: /keys/prod\n"
+                    .into(),
+                "a:b:c".into(),
+                P,
+                Target(P),
+                "path",
+            ),
+            (
+                "a name over 128 bytes, an explicit key (yaml.v3's output)".into(),
+                format!(
+                    "servers:\n    ? {long}\n    :   host: prod.example\n        identity_file: \
+                     /keys/prod\n"
+                ),
+                long.clone(),
+                E,
+                Target(P),
+                "path",
+            ),
+            (
+                "a byte-order mark before servers:".into(),
+                format!("\u{feff}{base}"),
+                "prod".into(),
+                P,
+                Target(P),
+                "path",
+            ),
+            (
+                "a second servers: map".into(),
+                format!("{base}servers:\n  prod:\n    host: other.example\n"),
+                "prod".into(),
+                F,
+                FileError,
+                "an error for the whole file",
+            ),
+            (
+                "the identity line indented with two tabs".into(),
+                base.replace("    identity_file", "\t\tidentity_file"),
+                "prod".into(),
+                E,
+                FileError,
+                "an error for the whole file",
+            ),
+            (
+                "a no-break space before the host's colon".into(),
+                base.replace("host:", "host\u{a0}:"),
+                "prod".into(),
+                P,
+                NoTarget,
+                "path (an unknown key host\u{a0}, no host)",
+            ),
+            (
+                "servers: in flow form".into(),
+                "servers: {prod: {host: prod.example, identity_file: /keys/prod}}\n".into(),
+                "prod".into(),
+                F,
+                Target(P),
+                "path",
+            ),
+            (
+                "servers: with a tagged key".into(),
+                format!("!!str {base}"),
+                "prod".into(),
+                F,
+                Target(P),
+                "path",
+            ),
+            (
+                "servers: with an anchored key".into(),
+                format!("&s {base}"),
+                "prod".into(),
+                F,
+                Target(P),
+                "path",
+            ),
+            (
+                "servers: with an anchored value".into(),
+                base.replace("servers:", "servers: &s"),
+                "prod".into(),
+                F,
+                Target(P),
+                "path",
+            ),
+            (
+                "servers: with a tagged value".into(),
+                base.replace("servers:", "servers: !!map"),
+                "prod".into(),
+                F,
+                Target(P),
+                "path",
+            ),
+        ];
+        for (shape, yaml, name, core_reads, broker_reads, go_reads) in rows
+            .into_iter()
+            .map(|(shape, entry, c, b, g)| {
+                (
+                    shape.to_string(),
+                    format!("servers:\n  prod:\n{entry}"),
+                    "prod".to_string(),
+                    c,
+                    b,
+                    g,
+                )
+            })
+            .chain([
+                (
+                    "the entry as a flow mapping on its own line".to_string(),
+                    inline.to_string(),
+                    "prod".to_string(),
+                    E,
+                    Target(P),
+                    "path",
+                ),
+                (
+                    "a merge through an alias".to_string(),
+                    merged_alias.to_string(),
+                    "prod".to_string(),
+                    E,
+                    FileError,
+                    "the merged path",
+                ),
+            ])
+            .chain(third)
+        {
+            let core = shed_core::config::ShedConfig::parse(&yaml);
+            if core_reads == F {
+                // The whole file refused, saying why: no entry at all, none with defaults.
+                assert!(core.refused.is_some(), "shed-core, {shape}");
+                assert!(core.servers.is_empty(), "shed-core, {shape}");
+            } else {
+                assert_eq!(core.refused, None, "shed-core, {shape}");
+            }
+            let c = core
+                .servers
+                .iter()
+                .find(|s| s.name == name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    assert_eq!(core_reads, F, "{shape}: shed-core dropped the entry");
+                    shed_core::config::ShedServerEntry {
+                        identity_file: F.to_string(),
+                        ..Default::default()
+                    }
+                });
+            assert_eq!(c.identity_file, core_reads, "shed-core, {shape}");
+            if core_reads == P {
+                // Read: the first document's host and user, never another's.
+                assert_eq!(
+                    c.host,
+                    if go_reads.contains("no host") {
+                        name.as_str()
+                    } else {
+                        "prod.example"
+                    },
+                    "shed-core, {shape}"
+                );
+            }
+            if core_reads == E {
+                // Refused before any field is read: no host to fall back to, no user.
+                assert_eq!(c.host, "", "shed-core, {shape}");
+                assert_eq!(
+                    c.user,
+                    shed_core::config::USER_NOT_A_STRING,
+                    "shed-core, {shape}"
+                );
+            }
+            let (_d, cfg) = write_config(&yaml);
+            let b = match load_discovered_servers(&cfg) {
+                Err(_) => FileError,
+                Ok(targets) => match targets.iter().find(|t| t.name == name) {
+                    None => NoTarget,
+                    Some(t) => Target(match t.identity_file.as_str() {
+                        s if s == E => E,
+                        s if s == U => U,
+                        s if s == P => P,
+                        "" => "",
+                        other => panic!("{shape}: the broker read {other:?}"),
+                    }),
+                },
+            };
+            assert_eq!(b, broker_reads, "the broker, {shape}");
+            // The safe side: never "no identity file" where Go reads a path.
+            if go_reads.starts_with("path") || go_reads.ends_with("path") {
+                assert_ne!(
+                    c.identity_file, "",
+                    "shed-core reads no key where Go reads {go_reads}: {shape}"
+                );
+                assert_ne!(
+                    b,
+                    Target(""),
+                    "the broker reads no key where Go reads {go_reads}: {shape}"
+                );
+            }
+        }
+    }
+
+    /// A raw line break the broker's parser does not split on as Go's does refuses the
+    /// whole file, with a reason naming the character (plan 037 A8); the same characters
+    /// escaped inside a double-quoted value are text, and CRLF endings are line endings.
+    #[test]
+    fn unsupported_line_breaks_refuse_the_file_and_their_escapes_do_not() {
+        for (br, what) in [
+            ("\r", "carriage return"),
+            ("\u{85}", "U+0085"),
+            ("\u{2028}", "U+2028"),
+            ("\u{2029}", "U+2029"),
+        ] {
+            let (_d, cfg) = write_config(&format!(
+                "servers:\n  prod:\n    host: prod.example\n    # note{br}    identity_file: \
+                 /keys/prod\n"
+            ));
+            let err = load_discovered_servers(&cfg).expect_err(what);
+            assert!(
+                err.contains("parsing shed config") && err.contains(what),
+                "{err}"
+            );
+        }
+        for text in [
+            "servers:\n  prod:\n    host: prod.example\n    user: \"a\\r\\N\\L\\Pb\"\n",
+            "servers:\r\n  prod:\r\n    host: prod.example\r\n",
+        ] {
+            let (_d, cfg) = write_config(text);
+            let got = load_discovered_servers(&cfg).unwrap();
+            assert_eq!(got[0].ssh_host, "prod.example", "{text:?}");
+        }
+    }
+
+    /// **The promise** (plan 037 A8): the config.yaml the shed CLI's own save path writes
+    /// (`crates/fixtures/clientconfig/`, written and kept fresh by
+    /// `internal/config/clientconfig_fixture_test.go`) gives one target per entry, with
+    /// the host, ssh_port, user and identity_file the CLI holds for it.
+    #[test]
+    fn the_cli_written_config_is_read_as_the_cli_reads_it() {
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/clientconfig");
+        let got = load_discovered_servers(&dir.join("config.yaml").to_string_lossy()).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("expected.json")).unwrap())
+                .unwrap();
+        let want = expected["servers"].as_array().unwrap();
+        assert_eq!(got.len(), want.len());
+        for w in want {
+            let name = w["name"].as_str().unwrap();
+            let t = got
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("no target {name}"));
+            assert_eq!(t.ssh_host, w["host"].as_str().unwrap(), "{name} host");
+            assert_eq!(
+                u64::from(t.ssh_port),
+                w["ssh_port"].as_u64().unwrap(),
+                "{name} ssh_port"
+            );
+            assert_eq!(t.user, w["user"].as_str().unwrap(), "{name} user");
+            assert_eq!(
+                t.identity_file,
+                w["identity_file"].as_str().unwrap(),
+                "{name} identity_file"
+            );
+        }
+    }
+
+    /// The bytes shed-core's writer emits (`config_edit::insert_machine`, the app's
+    /// **Add machine**) for a value YAML would read otherwise are read back as the same
+    /// string by this crate's YAML parser, not only by shed-core's own reader (plan 037
+    /// A8 review: Go read `&a other.example` as `other.example`).
+    #[test]
+    fn the_core_writer_s_values_read_back_through_a_yaml_parser() {
+        use shed_core::config_edit::{insert_machine, NewMachine};
+        for value in [
+            "&a other.example",
+            "!!str other.example",
+            "*alias",
+            "|literal",
+            ">folded",
+            "-dash",
+            "?question",
+            "{a: b}",
+            "[a]",
+            "#hash",
+            "%percent",
+            "@at",
+            "`tick",
+            "\"quote",
+            "'apostrophe",
+            "a: b",
+            "a #b",
+            "100.64.0.3",
+            "yes",
+            "NULL",
+            "~",
+            "back\\slash",
+            "clé",
+            "mini3",
+        ] {
+            let out = insert_machine(
+                "",
+                &NewMachine {
+                    name: "box",
+                    host: Some(value),
+                    user: Some(value),
+                    ssh_port: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{value:?}: {e}"));
+            let root = yaml_lite::parse(&out).unwrap_or_else(|e| panic!("{value:?}: {e}: {out}"));
+            let machine = root
+                .as_map()
+                .and_then(|m| m.get("machines"))
+                .and_then(Node::as_map)
+                .and_then(|m| m.get("box"))
+                .and_then(Node::as_map)
+                .unwrap_or_else(|| panic!("{value:?}: no machine in {out}"));
+            for field in ["host", "user"] {
+                assert_eq!(
+                    machine.get(field).and_then(Node::as_scalar),
+                    Some(value),
+                    "{field} {value:?}: {out}"
+                );
+            }
+        }
     }
 
     /// The single-server (no `discovery:` block) target carries no learned mode — it has
@@ -385,6 +1102,8 @@ servers:
             ssh_host: String::new(),
             ssh_port: 0,
             auth_mode: String::new(),
+            user: String::new(),
+            identity_file: String::new(),
         };
         let discovered = vec![
             mk("mini2", "http://mini2:8080"),

@@ -27,7 +27,8 @@ const (
 	assertionHeader   = `{"alg":"EdDSA","typ":"client-authentication+jwt"}`
 	assertionLifetime = 60 // seconds: exp - iat
 	assertionType     = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
-	// directoryScope is the scope a token must carry.
+	// directoryScope is the one scope a token request asks for, and the
+	// scope a token's answer must include.
 	directoryScope = "directory:read"
 	// tokenEarly is how long before its end an access token stops being
 	// reused.
@@ -319,12 +320,18 @@ func (c *Client) requestToken(ctx context.Context) (string, time.Duration, *answ
 	return tok, lifetime, a, scrub(f, assertion)
 }
 
-// sendToken sends the token request carrying assertion.
+// sendToken sends the token request carrying assertion. It names its scope,
+// directory:read and nothing else: an absent scope means every scope the
+// service has (contract section 2), so a scope the service adds later is
+// never asked for. A service that refuses the request (400 invalid_scope)
+// gives a failed refresh like any other refusal; the request is not sent
+// again without the scope.
 func (c *Client) sendToken(ctx context.Context, assertion string) (string, time.Duration, *answer, *Failure) {
 	form := url.Values{
 		"grant_type":            {"client_credentials"},
 		"client_assertion_type": {assertionType},
 		"client_assertion":      {assertion},
+		"scope":                 {directoryScope},
 	}
 	req, err := newRequest(ctx, http.MethodPost, c.tokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {

@@ -11,7 +11,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/charliek/shed/internal/config"
-	"github.com/charliek/shed/sdk"
 )
 
 // ---------------------------------------------------------------------------
@@ -227,7 +226,9 @@ func TestTokenMTLSFlipLeavesConfigAndFilesConsistent(t *testing.T) {
 	issuer := newMTLSCredentialIssuer(t)
 
 	// token → mtls: the certificate is written, then the entry starts naming it.
-	persistMTLSCredential("srv", endpoint, issuer.credential(t, "cli-key", farFromExpiry))
+	if _, err := persistMTLSCredential("srv", endpoint, issuer.credential(t, "cli-key", farFromExpiry), "", testUser, false, nil, ""); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
 	stored := onDisk(t, cfgPath).Servers["srv"]
 	if stored.AuthMode != config.AuthModeMTLS || stored.ClientCertFile == "" || stored.ClientKeyFile == "" {
 		t.Fatalf("entry did not move to mtls: %+v", stored)
@@ -487,61 +488,6 @@ func TestSetDefaultRefusesAConcurrentlyRemovedServer(t *testing.T) {
 	if _, _, err := loaded.GetDefaultServer(); loaded.DefaultServer != "" && err != nil {
 		t.Errorf("default_server %q does not resolve: %v", loaded.DefaultServer, err)
 	}
-}
-
-// TestCommittedMaterialOwnership covers the guard that replaces "hold one lock
-// across the commit and the save" on the mtls path, where holding one lock is
-// impossible: StagedClientCredentials.Commit takes the per-server credential
-// lock itself, and flock is not re-entrant.
-//
-// Instead the transaction commits, THEN locks, then proves the pair under the
-// entry's paths is still the one it committed. A loser of that race abandons
-// its add rather than saving a config row that describes somebody else's
-// certificate.
-func TestCommittedMaterialOwnership(t *testing.T) {
-	newTxn := func(t *testing.T) (*credentialTxn, sdk.Credential) {
-		t.Helper()
-		testClientConfig(t)
-		cred := newMTLSCredentialIssuer(t).credential(t, "cli-key", farFromExpiry)
-		entry := config.ServerEntry{Host: "h.example", SSHPort: 2222}
-		txn, err := stageCredentials(&entry, "srv", cred, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := txn.commit(); err != nil {
-			t.Fatal(err)
-		}
-		return txn, cred
-	}
-
-	t.Run("the material this transaction committed is accepted", func(t *testing.T) {
-		txn, _ := newTxn(t)
-		if err := txn.committedMaterialIsOurs(); err != nil {
-			t.Errorf("own material rejected: %v", err)
-		}
-	})
-
-	t.Run("another enrollment's material is refused", func(t *testing.T) {
-		txn, _ := newTxn(t)
-		other := newMTLSCredentialIssuer(t).credential(t, "cli-key", farFromExpiry)
-		certPath, _ := txn.staged.Paths()
-		if err := os.WriteFile(certPath, []byte(other.Bundle.ClientCert), 0600); err != nil {
-			t.Fatal(err)
-		}
-		if err := txn.committedMaterialIsOurs(); err == nil {
-			t.Error("a certificate from another enrollment was accepted as ours")
-		}
-	})
-
-	t.Run("material that went away is refused", func(t *testing.T) {
-		txn, _ := newTxn(t)
-		if err := config.RemoveServerCredentials("srv"); err != nil {
-			t.Fatal(err)
-		}
-		if err := txn.committedMaterialIsOurs(); err == nil {
-			t.Error("a missing certificate was accepted as ours")
-		}
-	})
 }
 
 // saveServerEntryIfMaterialPresent mirrors persistMTLSCredential's guard so the

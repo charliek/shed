@@ -158,6 +158,20 @@ func init() {
 	rootCmd.AddCommand(tunnelsCmd)
 }
 
+// tunnelPortFlagHint is the advice to name a port with -t when a shed has no
+// tunnel config. The shed's name came from the command line or a server, so
+// it is a command word only as config.ShellWord gives it (bare or
+// single-quoted); a name no pasted word can carry is named escaped, in words,
+// with no command line. cmdName is the subcommand ("start", "config"), a
+// constant.
+func tunnelPortFlagHint(cmdName, shedName string) string {
+	if word, ok := config.ShellWord(shedName); ok {
+		return fmt.Sprintf("Or use -t flag: shed tunnels %s %s -t 3000", cmdName, word)
+	}
+	return fmt.Sprintf("Or use the -t flag of shed tunnels %s for the shed %q "+
+		"(its name cannot be pasted safely as one word, so no command line is shown)", cmdName, shedName)
+}
+
 // collectPortMappings gathers port mappings from profiles and explicit ports.
 func collectPortMappings(mgr *tunnels.Manager, shedName string, profiles, ports []string, cmdName string) ([]tunnels.PortMapping, string, error) {
 	var allPorts []tunnels.PortMapping
@@ -175,7 +189,7 @@ func collectPortMappings(mgr *tunnels.Manager, shedName string, profiles, ports 
 				if errors.Is(err, tunnels.ErrNoTunnelConfig) {
 					printError(fmt.Sprintf("No tunnel config for shed %q", shedName),
 						"Add configuration to ~/.shed/tunnels.yaml",
-						fmt.Sprintf("Or use -t flag: shed tunnels %s %s -t 3000", cmdName, shedName))
+						tunnelPortFlagHint(cmdName, shedName))
 					return nil, "", err
 				}
 				return nil, "", err
@@ -292,7 +306,7 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	// A self-refreshing token source so a long-lived tunnel survives the control
 	// token's TTL. Built here for foreground and (re-)built by the detached worker
 	// when it re-runs; the parent -d process starts no tunnels itself.
-	tokenSrc := tunnelCredentialSource(client, entry, target)
+	tokenSrc := tunnelCredentialSource(client, serverName, entry, target)
 
 	switch {
 	case tunnelBackground && !tunnelDaemon:
@@ -314,12 +328,32 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 // daemon may run for days, and writing its stale in-memory config back would
 // clobber unrelated foreground edits (e.g. a `shed server add`). Returns nil for
 // the plain/legacy path (no credential, no refresh).
-func tunnelCredentialSource(client *APIClient, entry *config.ServerEntry, target tunnels.ConnectTarget) *clienttoken.Source {
+//
+// A refused client (its entry may not be used) yields a refused source, so the
+// Connect probe and every dial fail with the refusal before connecting. The
+// mint-only refresh is held to the user the API client holds at this hand-off
+// — not entry.User, which is the caller's copy from before the client was
+// built and misses a first named user the client adopted since — and it reads
+// the entry's row (serverName) under the config lock at every mint
+// (controlCredentialMintOnly): a row that now names another user ends the
+// source, and a certificate for a user the row does not record is refused,
+// never adopted in memory. A certificate it already holds stays in use until
+// that next mint or until it ends: a daemon must be restarted to follow an
+// entry's user change sooner.
+func tunnelCredentialSource(client *APIClient, serverName string, entry *config.ServerEntry, target tunnels.ConnectTarget) *clienttoken.Source {
+	if err := client.CredentialSource().Err(); err != nil {
+		return clienttoken.Refused(err)
+	}
 	if target.TLSPin == "" {
 		return nil
 	}
+	// The credential first, then the user: a closure adopts its user before
+	// its source installs the credential, so a user read after the
+	// credential is never older than it.
 	cred, _ := client.CredentialSource().Current()
-	return clienttoken.New(cred, controlCredentialRefresh(*entry, "")) // "" persistName ⇒ mint-only
+	seed := *entry
+	seed.User = client.heldUserName(entry.User)
+	return clienttoken.New(cred, controlCredentialMintOnly(seed, serverName)) // mint-only: never writes the entry
 }
 
 func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.ConnectTarget, source *clienttoken.Source, ports []tunnels.PortMapping, profile string) error {

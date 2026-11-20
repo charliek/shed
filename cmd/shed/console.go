@@ -144,18 +144,30 @@ func ttyFlag(hasCommand, stdinTTY, stdoutTTY bool) string {
 }
 
 // baseSSHArgs returns the SSH args common to every shed connection: port, pinned
-// known_hosts, strict host-key check, any extra -o options, then <shed>@<host>.
-// Callers prepend "ssh" (and "-t" for an interactive PTY) and append "--" + the
-// remote command. Shared by the interactive attach and exec/console paths so
-// the connection options can't drift.
-func baseSSHArgs(shedName string, entry *config.ServerEntry, extraOpts ...string) []string {
+// known_hosts, strict host-key check, the entry's identity file when it has one
+// (sdkbootstrap.IdentityArgs: `-i <path> -o IdentitiesOnly=yes -o
+// ControlMaster=no -o ControlPath=none`), any extra -o options, then
+// <shed>@<host>. Callers prepend "ssh" (and "-t" for an interactive PTY) and
+// append "--" + the remote command. Shared by the interactive attach and
+// exec/console paths so the connection options can't drift.
+//
+// The identity file is checked here, at the time of use (its value and the
+// file itself): one that cannot be used is an error named for the entry
+// (serverName), returned before any ssh is spawned. Without one the argv is
+// exactly what it was before the field existed.
+func baseSSHArgs(serverName, shedName string, entry *config.ServerEntry, extraOpts ...string) ([]string, error) {
+	identity, err := entry.SSHIdentityArgs(serverName)
+	if err != nil {
+		return nil, err
+	}
 	args := []string{
 		"-p", strconv.Itoa(entry.SSHPort),
 		"-o", "UserKnownHostsFile=" + config.GetKnownHostsPath(),
 		"-o", "StrictHostKeyChecking=yes",
 	}
+	args = append(args, identity...)
 	args = append(args, extraOpts...)
-	return append(args, shedName+"@"+entry.Host)
+	return append(args, shedName+"@"+entry.Host), nil
 }
 
 // sshSessionArgs assembles the ssh argv for a shed session: ["ssh", flag], the
@@ -168,9 +180,13 @@ func baseSSHArgs(shedName string, entry *config.ServerEntry, extraOpts ...string
 // pre-existing console/exec behavior (ssh treats everything after the
 // destination as the command, and the argv is already single-quoted), so adding
 // a "--" would change what the server's bash -lc receives.
-func sshSessionArgs(flag, name string, entry *config.ServerEntry, quotedCmd []string) []string {
-	args := append([]string{"ssh", flag}, baseSSHArgs(name, entry)...)
-	return append(args, quotedCmd...)
+func sshSessionArgs(flag, serverName, name string, entry *config.ServerEntry, quotedCmd []string) ([]string, error) {
+	base, err := baseSSHArgs(serverName, name, entry)
+	if err != nil {
+		return nil, err
+	}
+	args := append([]string{"ssh", flag}, base...)
+	return append(args, quotedCmd...), nil
 }
 
 // sshToShed establishes an SSH connection to a shed.
@@ -207,7 +223,10 @@ func sshToShed(name string, command []string) error {
 
 	// Pick -t (PTY) vs -T (clean 8-bit) by terminal detection — see ttyFlag.
 	flag := ttyFlag(len(command) > 0, isStdinTTY(), isStdoutTTY())
-	sshArgs := sshSessionArgs(flag, name, entry, quoted)
+	sshArgs, err := sshSessionArgs(flag, serverName, name, entry, quoted)
+	if err != nil {
+		return err
+	}
 
 	// Find ssh binary
 	sshPath, err := exec.LookPath("ssh")

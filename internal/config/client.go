@@ -130,6 +130,33 @@ type ServerEntry struct {
 	// of ControlTokenExpiresAt. Cached here so the proactive check costs no file
 	// read; the certificate itself remains the authority.
 	ClientCertExpiresAt time.Time `yaml:"client_cert_expires_at,omitempty"`
+	// User is the named user this entry is held to: the user the server's
+	// client certificates for it name. It is set from an issued certificate at
+	// `shed server add`, at `shed server update --refetch`, and by a refresh
+	// on the first named certificate when it is empty, always inside the CLI's
+	// credential write transaction. A certificate for the implicit user (a
+	// server with no user list) neither sets nor clears it. A stored
+	// certificate that names another user, or none, is refused
+	// (LoadEntryCertificate), and a newly issued certificate for another user
+	// is refused unless the change is asked for (--allow-user-change). Empty
+	// for an entry that was never enrolled for a named user (a plain-HTTP
+	// entry, a control-token entry, or one whose server has no user list). An
+	// entry whose server goes back to issuing control tokens (a shed-server
+	// older than 0.10.0) keeps it: only --allow-user-change changes it and
+	// only `shed server remove` drops it, so a certificate issued once the
+	// server is upgraded again must name the same user.
+	User string `yaml:"user,omitempty"`
+	// IdentityFile is the absolute path of the SSH key this entry uses
+	// (identityfile.go states the three properties it gives): a certificate
+	// is accepted for the entry only when it was made for that key; each ssh
+	// argv carries `-i <path> -o IdentitiesOnly=yes -o ControlMaster=no -o
+	// ControlPath=none` and each generated ssh config stanza the same four
+	// options. Set by `shed server add --identity-file` and `shed server
+	// update --identity-file` (an empty value clears it). A value that breaks
+	// the rule, names no readable file at the time of use, or holds a key
+	// whose public half cannot be learned without a passphrase, fails the
+	// command before ssh is spawned.
+	IdentityFile string `yaml:"identity_file,omitempty"`
 }
 
 // IsMTLS reports whether this entry last bootstrapped a client certificate.
@@ -424,6 +451,50 @@ func (c *ClientConfig) UpdateChecked(check func(*ClientConfig) error, mutate fun
 	}
 	mutate(c)
 	return nil
+}
+
+// ReadLocked runs read against the config as it is on disk, under the same
+// locks UpdateChecked takes (updateMu, then the config file lock), and writes
+// nothing. read must not keep the snapshot it is handed.
+//
+// It is for a decision that must be made against the on-disk row before a
+// caller writes something else (the CLI's credential write transaction reads
+// an entry's user here, then writes the certificate files, then saves the row
+// with UpdateChecked, re-checking the same condition). The ORDER rule is
+// UpdateChecked's: a caller that holds a server's credential lock takes it
+// before this.
+func (c *ClientConfig) ReadLocked(read func(*ClientConfig) error) error {
+	if c.path == "" {
+		return errors.New("client config: this configuration has no path to read")
+	}
+	c.updateMu.Lock()
+	defer c.updateMu.Unlock()
+
+	unlock, err := lockClientConfig(c.path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	fresh, err := LoadClientConfigFromPath(c.path)
+	if err != nil {
+		return err
+	}
+	return read(fresh)
+}
+
+// ReadOnDisk returns the configuration as it is on disk now, read with no lock
+// and writing nothing: no directory, no lock file. The file is only ever
+// replaced by an atomic rename (SaveToPath), so the read sees one whole saved
+// file. A file that does not exist reads as an empty configuration.
+//
+// It is for a display that must not write (`shed server list`'s USER column).
+// A decision that a write depends on reads under ReadLocked instead.
+func (c *ClientConfig) ReadOnDisk() (*ClientConfig, error) {
+	if c.path == "" {
+		return nil, errors.New("client config: this configuration has no path to read")
+	}
+	return LoadClientConfigFromPath(c.path)
 }
 
 // Save writes the configuration to disk.

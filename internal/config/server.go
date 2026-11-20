@@ -217,6 +217,23 @@ const (
 	DefaultExecMaxConcurrentPerShed       = 8
 	// minExecMaxTimeout is the smallest exec.max_timeout accepted.
 	minExecMaxTimeout = time.Second
+
+	// The largest exec.* values accepted. Each is far past anything a real
+	// deployment sets, and each keeps the exec route's arithmetic (the
+	// request-body cap computed from max_stdin_bytes, timeout_seconds in
+	// whole seconds against max_timeout) far from overflowing an int64.
+	//
+	// MaxExecMaxStdinBytes: a request's stdin is held in memory, decoded and
+	// as base64 inside the JSON body (4/3 as large), so a gibibyte is already
+	// more than a server should buffer for one command.
+	MaxExecMaxStdinBytes int64 = 1 << 30
+	// MaxExecMaxTimeout: a week. A command that needs longer belongs in a
+	// session, not one HTTPS request held open.
+	MaxExecMaxTimeout = 7 * 24 * time.Hour
+	// MaxExecMaxConcurrentPerShed: each running exec holds a request, a
+	// guest connection and its goroutines; thousands in one shed is no limit
+	// at all.
+	MaxExecMaxConcurrentPerShed = 4096
 )
 
 // ExecMaxStdinBytes is exec.max_stdin_bytes, or its default when unset.
@@ -244,9 +261,10 @@ func (c *ServerConfig) ExecMaxConcurrentPerShed() int {
 	return DefaultExecMaxConcurrentPerShed
 }
 
-// validateExec checks the optional exec block: no negative values, and a set
-// max_timeout of at least one second. Zero means "use the default". Shared by
-// Validate and ValidateNoHostCoupling.
+// validateExec checks the optional exec block: no negative values, a set
+// max_timeout of at least one second, and no value above its upper bound
+// (MaxExecMax*). Zero means "use the default". Shared by Validate and
+// ValidateNoHostCoupling.
 func (c *ServerConfig) validateExec() error {
 	if c.Exec == nil {
 		return nil
@@ -254,11 +272,20 @@ func (c *ServerConfig) validateExec() error {
 	if c.Exec.MaxStdinBytes < 0 {
 		return fmt.Errorf("invalid exec.max_stdin_bytes: %d (must be positive)", c.Exec.MaxStdinBytes)
 	}
+	if c.Exec.MaxStdinBytes > MaxExecMaxStdinBytes {
+		return fmt.Errorf("invalid exec.max_stdin_bytes: %d (at most %d, 1 GiB)", c.Exec.MaxStdinBytes, MaxExecMaxStdinBytes)
+	}
 	if c.Exec.MaxConcurrentPerShed < 0 {
 		return fmt.Errorf("invalid exec.max_concurrent_per_shed: %d (must be positive)", c.Exec.MaxConcurrentPerShed)
 	}
+	if c.Exec.MaxConcurrentPerShed > MaxExecMaxConcurrentPerShed {
+		return fmt.Errorf("invalid exec.max_concurrent_per_shed: %d (at most %d)", c.Exec.MaxConcurrentPerShed, MaxExecMaxConcurrentPerShed)
+	}
 	if d := c.Exec.MaxTimeout.Duration(); d < 0 || (d > 0 && d < minExecMaxTimeout) {
 		return fmt.Errorf("invalid exec.max_timeout: %s (must be at least %s)", d, minExecMaxTimeout)
+	}
+	if d := c.Exec.MaxTimeout.Duration(); d > MaxExecMaxTimeout {
+		return fmt.Errorf("invalid exec.max_timeout: %s (at most %s, 7 days)", d, MaxExecMaxTimeout)
 	}
 	return nil
 }

@@ -33,6 +33,11 @@ type connIdentity struct {
 	// (principalFor), so a key given to another user since opens nothing
 	// more on this connection as either of them.
 	bound users.Binding
+	// owner is the "SSH auth allowed" line's description of bound (the
+	// user's name and admin flag, the key's label; ownerSuffix), taken from
+	// the same lookup that gave bound, so the line names the user the
+	// connection was bound to even when the list has changed since.
+	owner string
 }
 
 // newConnIdentity is the identity of a connection whose signature by key, for
@@ -42,11 +47,17 @@ type connIdentity struct {
 // the connection does not authenticate.
 func (s *Server) newConnIdentity(key gossh.PublicKey, user string) (connIdentity, error) {
 	fp := gossh.FingerprintSHA256(key)
-	p, err := s.resolvePrincipal(fp)
+	p, k, err := s.resolveKey(fp)
 	if err != nil {
 		return connIdentity{}, err
 	}
-	return connIdentity{key: key, fingerprint: fp, user: user, bound: bindingOf(p)}, nil
+	return connIdentity{
+		key:         key,
+		fingerprint: fp,
+		user:        user,
+		bound:       bindingOf(p),
+		owner:       ownerSuffix(p.Implicit, p.User, p.Admin, k.Label),
+	}, nil
 }
 
 // setConnIdentity records id as the identity of the connection on ctx. It is
@@ -124,24 +135,33 @@ func bindingOf(p backend.Principal) users.Binding {
 // server whose lookup has the implicit user (no user list): on a server with
 // users an unknown key is nobody's.
 func (s *Server) resolvePrincipal(fingerprint string) (backend.Principal, error) {
+	p, _, err := s.resolveKey(fingerprint)
+	return p, err
+}
+
+// resolveKey is resolvePrincipal that also returns the key as the lookup
+// listed it (its label, its script flag), from the same lookup call; the
+// zero Key for a key the lookup does not list (the implicit user of off and
+// warn mode).
+func (s *Server) resolveKey(fingerprint string) (backend.Principal, users.Key, error) {
 	if l := s.keyAuth.Users; l != nil {
 		if u, k, ok := l.UserForKey(fingerprint); ok {
 			if k.Expired(time.Now()) {
-				return backend.Principal{}, fmt.Errorf("key %s expired at %s", fingerprint, k.Expires.UTC().Format(time.RFC3339))
+				return backend.Principal{}, users.Key{}, fmt.Errorf("key %s expired at %s", fingerprint, k.Expires.UTC().Format(time.RFC3339))
 			}
-			return principalOf(u, k), nil
+			return principalOf(u, k), k, nil
 		}
 	}
 	if s.keyAuth.enforced() {
-		return backend.Principal{}, fmt.Errorf("key %s is no longer authorized", fingerprint)
+		return backend.Principal{}, users.Key{}, fmt.Errorf("key %s is no longer authorized", fingerprint)
 	}
 	if s.keyAuth.Users == nil {
-		return backend.ImplicitPrincipal(), nil
+		return backend.ImplicitPrincipal(), users.Key{}, nil
 	}
 	if u, ok := s.keyAuth.Users.User(users.ImplicitName); ok && u.Implicit {
-		return backend.ImplicitPrincipal(), nil
+		return backend.ImplicitPrincipal(), users.Key{}, nil
 	}
-	return backend.Principal{}, fmt.Errorf("key %s belongs to no user", fingerprint)
+	return backend.Principal{}, users.Key{}, fmt.Errorf("key %s belongs to no user", fingerprint)
 }
 
 // principalOf is the principal of user u acting with key k: the user's admin

@@ -1,0 +1,91 @@
+{
+  "_comment": "Written by hand. What ssh's stderr becomes as the cause the refusal of every key keeps (Go sdk/bootstrap diagText, Rust shed-broker bootstrap::diag_text), read by the Go test TestNoSSHIdentitiesCauseSharedTable (sdk/bootstrap) and the Rust test no_ssh_identities_cause_shared_table (crates/shed-broker/src/bootstrap.rs), so the two cannot drift. Each case: `stderr` is ssh's stderr and `cause` the text the error carries after the hint. When `pad` is set, that many 'a' characters are put before both `stderr` and `cause`, to place a character at the 2048-byte clip boundary. The rule: trim surrounding white space; cut at 2048 bytes on a character boundary; printable ASCII other than backslash is itself; backslash, line feed, carriage return and tab are written \\\\, \\n, \\r, \\t; every other character is \\u{<lowercase hex>}; a cut text ends with …(truncated).",
+  "cases": [
+    {
+      "name": "plain",
+      "stderr": "_bootstrap@shed.example.test: Permission denied (publickey).",
+      "cause": "_bootstrap@shed.example.test: Permission denied (publickey)."
+    },
+    {
+      "name": "surrounding white space is trimmed",
+      "stderr": "\n  _bootstrap@shed.example.test: Permission denied (publickey).\r\n",
+      "cause": "_bootstrap@shed.example.test: Permission denied (publickey)."
+    },
+    {
+      "name": "no more authentication methods",
+      "stderr": "No more authentication methods to try.",
+      "cause": "No more authentication methods to try."
+    },
+    {
+      "name": "an ESC sequence",
+      "stderr": "\u001b[2J\u001b[31mfake prompt$ \u001b[0m_bootstrap@shed.example.test: Permission denied (publickey).",
+      "cause": "\\u{1b}[2J\\u{1b}[31mfake prompt$ \\u{1b}[0m_bootstrap@shed.example.test: Permission denied (publickey)."
+    },
+    {
+      "name": "line breaks and a tab",
+      "stderr": "Warning: a banner\r\nline\tB\n_bootstrap@shed.example.test: Permission denied (publickey).",
+      "cause": "Warning: a banner\\r\\nline\\tB\\n_bootstrap@shed.example.test: Permission denied (publickey)."
+    },
+    {
+      "name": "a backslash",
+      "stderr": "C:\\keys _bootstrap@shed.example.test: Permission denied (publickey).",
+      "cause": "C:\\\\keys _bootstrap@shed.example.test: Permission denied (publickey)."
+    },
+    {
+      "name": "text that looks like an escape",
+      "stderr": "\\u{1b} _bootstrap@shed.example.test: Permission denied (publickey).",
+      "cause": "\\\\u{1b} _bootstrap@shed.example.test: Permission denied (publickey)."
+    },
+    {
+      "name": "non-ASCII and a bidi override",
+      "stderr": "h\u00e9 \u202e _bootstrap@shed.example.test: Permission denied (publickey).",
+      "cause": "h\\u{e9} \\u{202e} _bootstrap@shed.example.test: Permission denied (publickey)."
+    },
+    {
+      "name": "a four-byte character",
+      "stderr": "\ud83d\ude00 _bootstrap@shed.example.test: Permission denied (publickey).",
+      "cause": "\\u{1f600} _bootstrap@shed.example.test: Permission denied (publickey)."
+    },
+    {
+      "name": "NUL, DEL, a C1 control and U+FFFD",
+      "stderr": "a\u0000b\u007fc\u0085d\ufffde Permission denied (publickey).",
+      "cause": "a\\u{0}b\\u{7f}c\\u{85}d\\u{fffd}e Permission denied (publickey)."
+    },
+    {
+      "name": "a two-byte character across the clip boundary",
+      "pad": 2047,
+      "stderr": "\u00e9 Permission denied (publickey).",
+      "cause": "…(truncated)"
+    },
+    {
+      "name": "a four-byte character across the clip boundary",
+      "pad": 2046,
+      "stderr": "\ud83d\ude00 Permission denied (publickey).",
+      "cause": "…(truncated)"
+    },
+    {
+      "name": "a two-byte character ending at the clip boundary",
+      "pad": 2046,
+      "stderr": "\u00e9 Permission denied (publickey).",
+      "cause": "\\u{e9}…(truncated)"
+    },
+    {
+      "name": "an ESC at the clip boundary",
+      "pad": 2047,
+      "stderr": "\u001b[2J Permission denied (publickey).",
+      "cause": "\\u{1b}…(truncated)"
+    },
+    {
+      "name": "exactly the clip length",
+      "pad": 2017,
+      "stderr": " Permission denied (publickey).",
+      "cause": " Permission denied (publickey)."
+    },
+    {
+      "name": "one byte over the clip length",
+      "pad": 2018,
+      "stderr": " Permission denied (publickey).",
+      "cause": " Permission denied (publickey)…(truncated)"
+    }
+  ]
+}

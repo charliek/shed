@@ -14,12 +14,16 @@ package servertls
 //
 // The user is carried in the Subject as one userId attribute (RFC 4519 "uid",
 // OID 0.9.2342.19200300.100.1.1): a registered attribute that means exactly
-// this, which every X.509 parser reads as an ordinary subject attribute. The
-// clients in this repository never look inside a certificate's subject: the
-// Go CLI and SDK store the PEM and compare only its public key with their
-// private key, the Rust credential stores read only its validity window, and
-// rustls presents the DER as it was issued. The attribute travels with the
-// certificate untouched.
+// this, which every X.509 parser reads as an ordinary subject attribute.
+//
+// The Go CLI and the roost provider read it too, through
+// config.LoadEntryCertificate and config.IssuedCertificateUser: a server
+// entry is held to the user its certificates name, so the CLI refuses a
+// stored certificate that names no user or a user the entry does not record,
+// and a newly issued one for another user, before it sends anything. The SDK
+// stores the PEM and compares only its public key with its private key, the
+// Rust credential stores read only its validity window, and rustls presents
+// the DER as it was issued.
 //
 // The value is the user's name, or ImplicitUserValue for the implicit user of
 // a server with no user list (whose name, "", cannot be an attribute value).

@@ -256,6 +256,32 @@ func TestPersistTokenCredentialDeletesOnlyAfterASuccessfulSave(t *testing.T) {
 			}
 		}
 	})
+
+	// The user the entry is held to survives the flip (the held-user rule:
+	// only --allow-user-change changes it, and only `shed server remove`
+	// drops it), so a certificate the server issues once it is upgraded
+	// again must name that user; `server list` shows it.
+	t.Run("the flip keeps the entry's user", func(t *testing.T) {
+		testClientConfig(t)
+		mtlsEntryForFlip(t)
+
+		persistTokenCredential("srv", clientConfig.Servers["srv"], "fresh-token", time.Now().Add(24*time.Hour))
+
+		disk, err := clientConfig.ReadOnDisk()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := disk.Servers["srv"]
+		if got.AuthMode != config.AuthModeToken || got.User != testUser {
+			t.Fatalf("after the flip: auth_mode %q, user %q; want token, %q", got.AuthMode, got.User, testUser)
+		}
+		if u := entryUserOf("srv", got); u.name != testUser || u.implicit {
+			t.Errorf("server list shows %+v for the flipped entry, want %q", u, testUser)
+		}
+		if config.HeldUserAccepts(got.User, "admin", false) {
+			t.Error("the flipped entry would accept a certificate for another user")
+		}
+	})
 }
 
 // mtlsEntryForFlip installs an "srv" entry in mtls state with real credential
@@ -277,6 +303,7 @@ func mtlsEntryForFlip(t *testing.T) (certPath, keyPath string) {
 		ClientCertFile:      certPath,
 		ClientKeyFile:       keyPath,
 		ClientCertExpiresAt: cred.Bundle.ExpiresAt,
+		User:                testUser,
 	})
 	return certPath, keyPath
 }

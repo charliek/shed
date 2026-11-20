@@ -3,12 +3,15 @@ package api
 import (
 	"bufio"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -17,6 +20,7 @@ import (
 	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/users"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -33,20 +37,45 @@ func attachTestAudit(t *testing.T, s *Server) string {
 	return path
 }
 
-// auditLines reads every line of the audit log, split by event.
-func auditLines(t *testing.T, path string) (api, execEnd, other []map[string]any) {
-	t.Helper()
+// auditTestMaxLine bounds one audit line the helpers read: far above any line
+// these tests write, so a longer one fails the test (readAuditLines returns
+// the scanner's error) instead of silently ending the read before the lines
+// after it are checked.
+const auditTestMaxLine = 16 << 20
+
+// readAuditLines reads every line of the audit log at path, each no longer
+// than maxLine bytes. A line that is not JSON, or longer than maxLine, is an
+// error.
+func readAuditLines(path string, maxLine int) ([]map[string]any, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	defer f.Close()
+	var out []map[string]any
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64<<10), maxLine)
 	for sc.Scan() {
 		var m map[string]any
 		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
-			t.Fatalf("audit line %q: %v", sc.Text(), err)
+			return nil, fmt.Errorf("audit line %q: %w", sc.Text(), err)
 		}
+		out = append(out, m)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("reading %s after %d lines: %w", path, len(out), err)
+	}
+	return out, nil
+}
+
+// auditLines reads every line of the audit log, split by event.
+func auditLines(t *testing.T, path string) (api, execEnd, other []map[string]any) {
+	t.Helper()
+	lines, err := readAuditLines(path, auditTestMaxLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range lines {
 		switch m["event"] {
 		case audit.EventAPI:
 			api = append(api, m)
@@ -134,6 +163,7 @@ func TestAuditOneAPILinePerClientRequest(t *testing.T) {
 		if id["kind"] != "client" || id["name"] != wantName || id["serial"] != "beef" {
 			t.Errorf("line %d identity = %v", i, id)
 		}
+		assertClientIdentityShape(t, id)
 		for _, k := range []string{"ts", "duration_ms", "remote"} {
 			if _, ok := line[k]; !ok {
 				t.Errorf("line %d lacks %q", i, k)
@@ -153,10 +183,17 @@ func TestAuditOneAPILinePerClientRequest(t *testing.T) {
 	}
 	if id := c["identity"].(map[string]any); id["kind"] != "client" || id["name"] != testClientName || id["serial"] != "beef" {
 		t.Errorf("client exec.end identity = %v", id)
+	} else {
+		assertClientIdentityShape(t, id)
 	}
-	if id := a["identity"].(map[string]any); id["kind"] != "admin" || id["subject"] != testAdminFP {
-		t.Errorf("admin exec.end identity = %v", id)
+	// This server has no user list: the person is its implicit user, an
+	// admin with no name, by the certificate's subject (its key's
+	// fingerprint). The test certificate has no serial.
+	wantPerson := map[string]any{"kind": "user", "implicit": true, "admin": true, "script": false, "subject": testAdminFP}
+	if id := a["identity"].(map[string]any); !reflect.DeepEqual(id, wantPerson) {
+		t.Errorf("person's exec.end identity = %v, want %v", id, wantPerson)
 	}
+	assertNoAdminKind(t, path)
 	for _, k := range []string{"timed_out", "truncated", "disconnected", "duration_ms"} {
 		if _, ok := c[k]; !ok {
 			t.Errorf("exec.end lacks %q", k)
@@ -367,12 +404,12 @@ func TestAuditExecEndOutcomes(t *testing.T) {
 			if l["shed"] != "box" {
 				t.Errorf("shed = %v", l["shed"])
 			}
+			// Open mode: the implicit user, an admin with no name, and no
+			// certificate, so no subject and no serial.
 			ident := l["identity"].(map[string]any)
-			if ident["kind"] != "admin" {
-				t.Errorf("identity = %v", ident)
-			}
-			if _, ok := ident["subject"]; ok {
-				t.Errorf("open mode has no admin subject: %v", l)
+			want := map[string]any{"kind": "user", "implicit": true, "admin": true, "script": false}
+			if !reflect.DeepEqual(ident, want) {
+				t.Errorf("identity = %v, want %v", ident, want)
 			}
 			tt.check(t, l)
 		})
@@ -395,5 +432,149 @@ func TestAuditNoExecEndForRefusedExec(t *testing.T) {
 	}
 	if _, execEnd, _ := auditLines(t, path); len(execEnd) != 0 {
 		t.Errorf("refused execs wrote exec.end: %v", execEnd)
+	}
+}
+
+// assertClientIdentityShape: a service client's identity keeps its shape
+// exactly (kind, name, serial), with none of a person's members.
+func assertClientIdentityShape(t *testing.T, id map[string]any) {
+	t.Helper()
+	for _, k := range []string{"user", "implicit", "admin", "script", "subject"} {
+		if _, ok := id[k]; ok {
+			t.Errorf("a client's identity carries %q: %v", k, id)
+		}
+	}
+}
+
+// assertNoAdminKind: no line in the log has the retired identity kind
+// "admin".
+func assertNoAdminKind(t *testing.T, path string) {
+	t.Helper()
+	api, execEnd, other := auditLines(t, path)
+	for _, l := range slices.Concat(api, execEnd, other) {
+		if id, ok := l["identity"].(map[string]any); ok && id["kind"] == "admin" {
+			t.Errorf("a line has the retired kind admin: %v", l)
+		}
+	}
+}
+
+// TestAuditLinesReadPastALongLine: the helpers read every line, however long
+// (an exec.end with the full argv can pass bufio.Scanner's 64 KiB default),
+// so a line after a long one is still checked; a line over the helper's
+// limit is an error, never a silent end of the read.
+func TestAuditLinesReadPastALongLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), audit.FileName)
+	long := `{"event":"exec.end","shed":"box","argv":["` + strings.Repeat("a", 1<<20) +
+		`"],"identity":{"kind":"user","implicit":true,"admin":true,"script":false}}`
+	after := `{"event":"reap","shed":"old","identity":{"kind":"admin"}}`
+	if err := os.WriteFile(path, []byte(long+"\n"+after+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, execEnd, other := auditLines(t, path)
+	if len(execEnd) != 1 || len(other) != 1 || other[0]["shed"] != "old" {
+		t.Fatalf("read %d exec.end and %d other lines (want 1 and 1): the read stopped at the long line", len(execEnd), len(other))
+	}
+	if id, _ := other[0]["identity"].(map[string]any); id["kind"] != "admin" {
+		t.Errorf("the line after the long one = %v", other[0])
+	}
+	if lines, err := readAuditLines(path, 1<<10); err == nil {
+		t.Errorf("a line over the limit read as %d lines with no error", len(lines))
+	}
+}
+
+// TestAuditExecEndNamesThePerson: on a server with a user list, a person's
+// HTTPS exec is recorded as kind user, by name, with whether they are an
+// admin, whether they used a script key, the key's fingerprint as subject
+// and the certificate's serial.
+func TestAuditExecEndNamesThePerson(t *testing.T) {
+	scriptFP := testFingerprint("alice-script")
+	b := newUserFakeBackend()
+	b.sheds["root-box"] = config.Shed{Name: "root-box", User: "root", Status: config.StatusRunning, CreatedAt: time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)}
+	s, h := usersTestServer(t, b)
+	lookup := userLookup()
+	lookup.AddKey("alice", users.Key{Fingerprint: scriptFP, Source: users.SourceInline, Script: true})
+	s.SetUserLookup(lookup)
+	path := attachTestAudit(t, s)
+
+	withSerial := func(fp string, serial int64) *x509.Certificate {
+		c := testClientCert(fp, "control", time.Hour)
+		c.SerialNumber = big.NewInt(serial)
+		return c
+	}
+	tests := []struct {
+		name string
+		leaf *x509.Certificate
+		shed string
+		want map[string]any
+	}{
+		{
+			"an admin", withSerial(rootFP, 0x1f), "root-box",
+			map[string]any{"kind": "user", "user": "root", "admin": true, "script": false, "subject": rootFP, "serial": "1f"},
+		},
+		{
+			"a user who is not an admin", withSerial(aliceFP, 0x2a), "box",
+			map[string]any{"kind": "user", "user": "alice", "admin": false, "script": false, "subject": aliceFP, "serial": "2a"},
+		},
+		{
+			"a script key", testClientCert(scriptFP, "control", time.Hour), "box",
+			map[string]any{"kind": "user", "user": "alice", "admin": false, "script": true, "subject": scriptFP},
+		},
+	}
+	for _, tt := range tests {
+		if got := do(h, tt.leaf, "POST", "/api/sheds/"+tt.shed+"/exec", `{"argv":["id"]}`); got.code != http.StatusOK {
+			t.Fatalf("%s: exec = %d %s", tt.name, got.code, got.body)
+		}
+	}
+	api, execEnd, other := auditLines(t, path)
+	if len(api) != 0 || len(other) != 0 {
+		t.Errorf("a person's requests wrote lines other than exec.end: api %v, other %v", api, other)
+	}
+	if len(execEnd) != len(tests) {
+		t.Fatalf("want %d exec.end lines, got %v", len(tests), execEnd)
+	}
+	for i, tt := range tests {
+		if l := execEnd[i]; l["shed"] != tt.shed {
+			t.Errorf("%s: shed = %v", tt.name, l["shed"])
+		}
+		if id := execEnd[i]["identity"].(map[string]any); !reflect.DeepEqual(id, tt.want) {
+			t.Errorf("%s: identity = %v, want %v", tt.name, id, tt.want)
+		}
+	}
+	assertNoAdminKind(t, path)
+}
+
+// TestAuditIdentityOfEachCaller drives auditIdentity directly: a caller that
+// maps to no principal is recorded unknown, never as a person, and a client
+// carries none of a person's members.
+func TestAuditIdentityOfEachCaller(t *testing.T) {
+	tests := []struct {
+		name string
+		c    Caller
+		want string
+	}{
+		{"zero caller", Caller{}, `{"kind":"unknown"}`},
+		{"a user with no name, not implicit", Caller{Kind: CallerUser, Name: "SHA256:x", Admin: true}, `{"kind":"unknown"}`},
+		{"an unknown kind", Caller{Kind: "robot", Name: "SHA256:x", User: "pat"}, `{"kind":"unknown"}`},
+		{"client", Caller{Kind: CallerClient, Name: "build-1", Serial: "3fa2", Admin: true, User: "x"}, `{"kind":"client","name":"build-1","serial":"3fa2"}`},
+		{"implicit", implicitCaller(), `{"kind":"user","implicit":true,"admin":true,"script":false}`},
+		{
+			"named admin", Caller{Kind: CallerUser, Name: "SHA256:x", User: "pat", Admin: true, Serial: "1f"},
+			`{"kind":"user","user":"pat","admin":true,"script":false,"subject":"SHA256:x","serial":"1f"}`,
+		},
+		{
+			"named user, script key", Caller{Kind: CallerUser, Name: "SHA256:x", User: "pat", Script: true},
+			`{"kind":"user","user":"pat","admin":false,"script":true,"subject":"SHA256:x"}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := json.Marshal(auditIdentity(tt.c))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tt.want {
+				t.Errorf("auditIdentity = %s, want %s", got, tt.want)
+			}
+		})
 	}
 }

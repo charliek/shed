@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -100,6 +101,12 @@ func TestReaperPass(t *testing.T) {
 	if _, ok := r["error"]; ok {
 		t.Errorf("a successful reap has no error: %v", r)
 	}
+	// The server deleted these sheds, not a person or the client.
+	for _, line := range other {
+		if id, _ := line["identity"].(map[string]any); !reflect.DeepEqual(id, map[string]any{"kind": "system"}) {
+			t.Errorf("reap line identity = %v, want {kind: system}: %v", line["identity"], line)
+		}
+	}
 
 	// The next pass, a minute later, finds nothing more until the young shed
 	// ages past max_age.
@@ -129,7 +136,10 @@ func TestReaperRecordsDeleteFailure(t *testing.T) {
 	s.reapOnce(context.Background(), now)
 	_, _, other := auditLines(t, path)
 	if len(other) != 1 || other[0]["error"] != "disk on fire" {
-		t.Errorf("reap lines = %v", other)
+		t.Fatalf("reap lines = %v", other)
+	}
+	if id := other[0]["identity"]; !reflect.DeepEqual(id, map[string]any{"kind": "system"}) {
+		t.Errorf("a failed reap's identity = %v, want {kind: system}", id)
 	}
 }
 

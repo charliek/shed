@@ -44,6 +44,10 @@ func (b *routeBackend) seen() []string {
 	return append([]string(nil), b.calls...)
 }
 
+// Type is read by the access guard's report step (the record's isolation and
+// arch).
+func (b *routeBackend) Type() backend.Type { return backend.TypeFirecracker }
+
 func (b *routeBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
 	b.record("GetShed", name)
 	for _, stored := range []string{"box", config.ReservedShedName} {
@@ -224,7 +228,7 @@ func (m fakeConnMeta) SessionID() []byte     { return []byte("session") }
 func (m fakeConnMeta) ClientVersion() []byte { return []byte("SSH-2.0-test") }
 func (m fakeConnMeta) ServerVersion() []byte { return []byte("SSH-2.0-test") }
 func (m fakeConnMeta) RemoteAddr() net.Addr {
-	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 999} // fakeRemote
 }
 func (m fakeConnMeta) LocalAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2222}

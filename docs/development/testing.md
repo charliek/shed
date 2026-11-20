@@ -259,7 +259,7 @@ separate stderr stream):
 | Module | Covers | Needs |
 |--------|--------|-------|
 | `test_http_exec.py` | `POST /api/sheds/{name}/exec`: frames, exit codes, stdin, the 124 timeout and the disconnect (both followed by the guest process being gone), 8 MiB intact, truncation, a 70 s quiet stream, 404, validation, 409 | an mtls dev entry |
-| `test_service_client.py` | A service client end to end: the bundle from `client issue` over SSH, owned sheds with no 9P mounts across stop/start, 403 and 404 refusals, admin visibility, the audit log's `api` and `exec.end` lines | an mtls dev entry |
+| `test_service_client.py` | A service client end to end: the bundle from `client issue` over SSH, owned sheds with no 9P mounts across stop/start, 403 and 404 refusals, admin visibility, the audit log's `api` and `exec.end` lines and an admin's `ssh` line | an mtls dev entry |
 | `test_create_mounts.py` | `shed create --mounts none` and the `list -v`/`-vv`/`--json` columns, with a default create as the positive control | any mode |
 | `test_network_profiles.py` | `--network isolated` probed from inside real guests, the service client's shed isolated by default, the dev server's tables in `nft`, rebuild at restart, reapply within 40 s of a manual delete, `dev-server-down-fc` removing only its two tables | an mtls dev entry |
 

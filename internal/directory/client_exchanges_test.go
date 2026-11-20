@@ -58,6 +58,7 @@ var exchangeExpectations = map[string]Kind{
 	"GET /v1/directory 403 INSUFFICIENT_SCOPE":             KindRefused,
 	"GET /v1/directory 429 RATE_LIMITED":                   KindRateLimited,
 	"POST /oauth2/token 200":                               "",
+	"POST /oauth2/token 400 invalid_scope":                 KindRefused,
 	"POST /oauth2/token 401 invalid_client":                KindInvalidClient,
 	"POST /oauth2/token 429 temporarily_unavailable":       KindRateLimited,
 	"POST /oauth2/token 503 server_error":                  KindUnavailable,

@@ -3732,13 +3732,13 @@ mod tests {
                 loop {
                     let unhang = self.log.unhang.notified();
                     if self.log.closed.load(SeqCst) > 0 {
-                        return Err(ForwardError("the forward was closed".to_string()));
+                        return Err(ForwardError::new("the forward was closed"));
                     }
                     unhang.await;
                 }
             }
             if self.log.fail_ensure.load(SeqCst) {
-                return Err(ForwardError("the ssh child will not start".to_string()));
+                return Err(ForwardError::new("the ssh child will not start"));
             }
             self.log.alive.store(true, SeqCst);
             Ok(())
@@ -3782,12 +3782,12 @@ mod tests {
                     self.pids.display()
                 ))
                 .spawn()
-                .map_err(|e| ForwardError(e.to_string()))?;
+                .map_err(|e| ForwardError::new(e.to_string()))?;
             *lock(&self.child) = Some(child);
             loop {
                 let wake = self.wake.notified();
                 if self.closed.load(SeqCst) {
-                    return Err(ForwardError("the forward was closed".to_string()));
+                    return Err(ForwardError::new("the forward was closed"));
                 }
                 wake.await;
             }

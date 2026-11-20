@@ -17,13 +17,13 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 | `starting` | A create or start is in progress, or the server adopted the VM and has not yet reached its agent. | empty, `no_pin`, `unreachable`, `cloud_unreadable` |
 | `running` | The agent answered a probe. | empty |
 | `stopping` | A stop is in progress. | empty |
-| `stopped` | The VM is off and its disk is kept. | empty, `capacity`, `quota`, `limit`, `run_limit`, `external`, `isolation_lost`, `layout`, `firewall` |
+| `stopped` | The VM is off and its disk is kept. | empty, `capacity`, `quota`, `limit`, `run_limit`, `external`, `unreachable`, `host_key`, `isolation_lost`, `layout`, `firewall` |
 | `error` | The create failed. Only a delete leaves this state. | `capacity`, `quota`, `create_failed`, `host_key`, `layout`, `firewall` |
 
 | Reason | Meaning |
 |---|---|
 | `no_pin` | The VM has no pinned host key yet. |
-| `unreachable` | The server cannot reach the VM's SSH port. |
+| `unreachable` | The server cannot reach the VM's SSH port or its agent. While `starting`, it keeps trying; on `stopped`, a start's VM came up but its agent did not answer (or could not be driven), so the server stopped the VM again. |
 | `cloud_unreadable` | The server could not learn from the cloud what the VM is doing: the read failed, or the VM's labels are another shed version's. It changed nothing, keeps the create or start, and looks again at every periodic pass. A delete still works after a failed read. While the labels are another version's, a delete is recorded and answered with an error, the shed leaves the list, and the VM keeps running (and is billed) until a server that reads those labels, or this one once they are readable again, destroys it. |
 | `capacity` | The zone had no room for the machine type. |
 | `quota` | The cloud project's quota was reached. |
@@ -33,7 +33,7 @@ A shed's `status` is one of five values. `status_reason` explains a status where
 | `isolation_lost` | The network no longer isolates the shed. Not reported yet. |
 | `layout` | The VM's agent or guest layout is not compatible with this server. |
 | `create_failed` | The create failed for another reason; the server log has the detail. |
-| `host_key` | The host key the VM presented did not match the pinned key. |
+| `host_key` | The host key the VM presented did not match the pinned key: a create ends in `error`, and a start leaves the shed `stopped` with its VM stopped again. |
 | `firewall` | The [firewall check](#the-firewall-check) was failing when the server was about to ask the cloud for the VM, so it did not. |
 
 The run limit is enforced by the cloud: each VM is created with a maximum run duration (the larger of `max_run_duration` and the owning client's `max_age`) after which the cloud stops it. The server notices a VM stopped by the run limit or from outside shed at its next [pass over the cloud](#keeping-records-and-the-cloud-in-step), at most about a minute later, and until then lists the shed as `running`. It records the shed as `stopped` with reason `run_limit` when the VM stopped within two minutes of its run limit, and with reason `external` otherwise. `isolation_lost` is defined but no code path sets it yet.
@@ -42,7 +42,7 @@ The run limit is enforced by the cloud: each VM is created with a maximum run du
 
 ## Calls and statuses
 
-`POST /api/sheds` without `Accept: text/event-stream` returns **201 with `status: "starting"`** and the create continues in the background. The reply waits first for the cloud to accept the new VM, for at most 15 s, so that a quota or capacity refusal arriving that early is answered as a 503 and leaves no shed; measured JSON creates answered after 11 to 15 s. The image lookup before it is bounded at 10 s, so the reply always comes within 25 s. Poll `GET /api/sheds/{name}` until the status is `running`. With `Accept: text/event-stream` the stream stays open until the shed settles: the `complete` event carries the running shed, and an `error` event reports a create that failed. Closing the stream ends the stream only, never the create.
+`POST /api/sheds` without `Accept: text/event-stream` returns **201 with `status: "starting"`** and the create continues in the background. Before it answers, the server runs the [firewall check](#the-firewall-check) when its last result is more than 60 s old (waiting at most 10 s for it), looks the image up (at most 10 s), and then waits for the cloud to accept the new VM, for at most 15 s, so that a quota or capacity refusal arriving that early is answered as a 503 and leaves no shed; measured JSON creates answered after 11 to 15 s. Each step has its own bound, but the reply has no single one (it can also wait behind other work on the server's records), so give the request a timeout of a minute or more. A client whose request timed out may still have created the shed: get it by name before creating it again. Poll `GET /api/sheds/{name}` until the status is `running`. With `Accept: text/event-stream` the stream stays open until the shed settles: the `complete` event carries the running shed, and an `error` event reports a create that failed. Closing the stream ends the stream only, never the create.
 
 | Call | `starting` | `running` | `stopping` | `stopped` | `error` |
 |---|---|---|---|---|---|
@@ -105,7 +105,7 @@ None of the 503 refusals is ever a 409, because a client reads a 409 on create a
 | Feature | Create field or route | Answer |
 |---|---|---|
 | Host directories | `local_dir`, `add_dirs` (`--local-dir`, `--add-dir`) | 422 |
-| Server mounts | non-empty `mounts` (`--mounts`) | 422; an omitted `mounts` stores `none` |
+| Server mounts | non-empty `mounts` (`--mounts`) | 422; an omitted `mounts` stores `none`, and every shed record reports `"mounts": {"mode": "selected"}` (`shed list` shows `none`) |
 | Snapshots | `from_snapshot`, `POST /api/snapshots`, `GET` and `DELETE /api/snapshots/{name}` | 422 or 501; `GET /api/snapshots` lists nothing |
 | Reset | `POST /api/sheds/{name}/reset` | 501 |
 | Image store | image inspect, tag, pull, push, delete and prune | 501; `GET /api/images` lists nothing (the images are the `image_aliases` names in the server config) |
@@ -115,7 +115,9 @@ The CLI refuses `--local-dir`, `--add-dir`, `--from-snapshot`, `--egress` and na
 
 ## Server information
 
-`GET /api/info` on a remote server reports `backend: "remote"`, the remote `default_image`, and in `features` the tokens `async_lifecycle` and `network_profiles` (with `service_clients` and `http_exec` as on any server). It also reports `isolation: "topology"`. No response to a service client names the cloud project, zone or any address; a `503 FIREWALL_CHECK_FAILED` sent to an admin does name the rule, its source ranges and the server's own address, because the admin is who must fix them, and a service client gets the code with a message that names none of them.
+`GET /api/info` on a remote server reports `backend: "remote"`, the remote `default_image`, and in `features` the token `async_lifecycle`, and `network_profiles` unless the `firewall` config admits more than the server (mode `any`, or `acknowledge_any`). Beside them are the tokens every server sends (`overview`, `http_exec`, `exec_limits`, `mount_selection`, `uniform_shed_record` and `source_binding`), and `service_clients` when `auth.clients` is set (see [API › GET /api/info](api.md#get-apiinfo)). It also reports `isolation: "topology"`, and `guest_arch` when every configured size has the same `arch` (omitted when they mix). `isolation` names the backend's kind whether or not the current `firewall` config offers the `isolated` profile: `network_profiles` says whether it does, and each shed record's own `isolation` says what that shed has.
+
+A remote shed's record carries what a Firecracker or VZ record does ([API › GET /api/sheds](api.md#get-apisheds)): `mounts` (always `{"mode": "selected"}`), `network_profile`, `isolation` (`topology` for an `isolated` shed, `none` for an `open` one, and `none` for an `isolated` one while the `firewall` config admits more than the server) and `arch`, the architecture of the shed's size, stored at create. `isolation` is the kind the server's configuration provides, not a live check that the cloud's network still isolates the VM. A record rebuilt at [adoption](#keeping-records-and-the-cloud-in-step) takes `arch` from the cloud's report of the VM's boot disk, which wins over the configured sizes; when the cloud reports none, from the configured sizes with the VM's machine type, only if they all agree (none when they disagree or none has that machine type). A shed created by a server older than `arch` reports none; nothing fills it in later. No response to a service client names the cloud project, zone or any address; a `503 FIREWALL_CHECK_FAILED` sent to an admin does name the rule, its source ranges and the server's own address, because the admin is who must fix them, and a service client gets the code with a message that names none of them.
 
 ## Sizes
 

@@ -9,8 +9,15 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/vmimage"
+	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 	"golang.org/x/term"
 )
+
+// Every message, warning and label a progress event carries is server text:
+// it is escaped where it is printed (sdkbootstrap.SafeText), so a control
+// character never reaches the terminal raw, nor moves the cursor under the
+// live block's redraw. Printable text is unchanged, and what is compared
+// (isLayerProgressLine) is the event as it came.
 
 // layerProgressLineRe matches the per-layer pull lines the server emits
 // (internal/vmimage/registry.go): "Pulling layer N/M …" and
@@ -139,7 +146,7 @@ func (r *liveRenderer) handle(ev backend.ProgressEvent) {
 	if ev.Message == "" || (r.sawBlob && isLayerProgressLine(ev.Message)) {
 		return
 	}
-	r.printAbove(func() { fmt.Fprintf(r.w, "  %s\n", ev.Message) })
+	r.printAbove(func() { fmt.Fprintf(r.w, "  %s\n", sdkbootstrap.SafeText(ev.Message)) })
 }
 
 // printAbove erases the live block, runs emit (which scrolls text into
@@ -197,6 +204,7 @@ func (r *liveRenderer) line(id string, b *blobState, width int) string {
 	if label == "" {
 		label = vmimage.ShortDigest(id)
 	}
+	label = sdkbootstrap.SafeText(label)
 	var s string
 	switch b.status {
 	case vmimage.BlobStatusExists:
@@ -235,7 +243,7 @@ func progressSink(jsonOutput bool) (onProgress func(backend.ProgressEvent), fini
 		case jsonOutput:
 			// --json suppresses progress; only the final response prints.
 		case event.Warning:
-			warn := func() { fmt.Fprintf(os.Stderr, "  Warning: %s\n", event.Message) }
+			warn := func() { fmt.Fprintf(os.Stderr, "  Warning: %s\n", sdkbootstrap.SafeText(event.Message)) }
 			if renderer != nil {
 				renderer.printAbove(warn)
 			} else {
@@ -244,7 +252,7 @@ func progressSink(jsonOutput bool) (onProgress func(backend.ProgressEvent), fini
 		case renderer != nil:
 			renderer.handle(event)
 		default:
-			fmt.Printf("  %s\n", event.Message)
+			fmt.Printf("  %s\n", sdkbootstrap.SafeText(event.Message))
 		}
 	}
 	finish = func() {

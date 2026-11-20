@@ -11,13 +11,16 @@ import (
 	"encoding/pem"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,6 +65,39 @@ type mtlsServer struct {
 	// re-validation (internal/api re-checks the peer certificate on every
 	// request, because crypto/tls verifies it only once per connection).
 	revoked atomic.Value // map[string]bool
+	// accepted counts the TCP connections the listener accepted, so a test can
+	// prove a client made none at all — not merely that no request reached the
+	// handler (a refused handshake never does).
+	accepted atomic.Int32
+	// shown records the Subject CN of every client certificate a handshake
+	// presented (refused or not), so a test can prove a certificate was never
+	// shown at all, not merely that no request used it.
+	shownMu sync.Mutex
+	shown   []string
+	// onRequest, when a test sets it, runs at the start of every request the
+	// handler serves (while the client waits for the answer).
+	onRequest atomic.Pointer[func()]
+}
+
+// shownCNs returns the Subject CN of every client certificate presented so far.
+func (m *mtlsServer) shownCNs() []string {
+	m.shownMu.Lock()
+	defer m.shownMu.Unlock()
+	return slices.Clone(m.shown)
+}
+
+// acceptCounter wraps a listener and counts the connections it accepts.
+type acceptCounter struct {
+	net.Listener
+	n *atomic.Int32
+}
+
+func (l acceptCounter) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.n.Add(1)
+	}
+	return c, err
 }
 
 // revoke makes the server answer 401 for these serials from now on, without
@@ -105,6 +141,9 @@ func newMTLSServer(t *testing.T) *mtlsServer {
 
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		m.requests.Add(1)
+		if hook := m.onRequest.Load(); hook != nil {
+			(*hook)()
+		}
 		m.lastAuth.Store(r.Header.Get("Authorization"))
 		serial := ""
 		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
@@ -123,10 +162,22 @@ func newMTLSServer(t *testing.T) *mtlsServer {
 		MinVersion: tls.VersionTLS12,
 		ClientCAs:  ca.Pool(),
 		ClientAuth: tls.RequireAndVerifyClientCert,
+		// Record every client certificate the handshake verified (a
+		// certificate this CA issued and still valid), whether or not a
+		// request follows on the connection.
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) > 0 {
+				m.shownMu.Lock()
+				m.shown = append(m.shown, cs.PeerCertificates[0].Subject.CommonName)
+				m.shownMu.Unlock()
+			}
+			return nil
+		},
 	}
 	// A refused handshake is the point of several of these tests, not a surprise
 	// worth pages of output.
 	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.Listener = acceptCounter{Listener: srv.Listener, n: &m.accepted}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 
@@ -152,12 +203,25 @@ func newMTLSCredentialIssuer(t *testing.T) *mtlsServer {
 	}
 }
 
-// issue runs the REAL enrollment path — generate a P-256 key, build a CSR, have
-// the CA sign it — and returns what a bootstrap would hand back: the leaf PEM
-// and the matching key PEM. Using SignClientCSR rather than a hand-rolled leaf
-// keeps these tests honest about the subject and extension shape the server
-// actually issues.
-func (m *mtlsServer) issue(t *testing.T, label string, ttl time.Duration) (certPEM, keyPEM []byte, serial string) {
+// testUser is the user the test CA issues certificates to unless a test asks
+// for another: every certificate a 0.10 server issues names a user (or the
+// implicit user), and an entry holding one records it.
+const testUser = "pat"
+
+// issueFor runs the REAL enrollment path — generate a P-256 key, build a CSR,
+// have the CA sign it — and returns what a bootstrap would hand back: the leaf
+// PEM and the matching key PEM. Using SignClientCSR rather than a hand-rolled
+// leaf keeps these tests honest about the subject and extension shape the
+// server actually issues. The certificate is for user ("" for the implicit
+// user).
+func (m *mtlsServer) issueFor(t *testing.T, label, user string, ttl time.Duration) (certPEM, keyPEM []byte, serial string) {
+	t.Helper()
+	return m.issueForSubject(t, sshFingerprint(label), user, ttl)
+}
+
+// issueForSubject is issueFor with the subject given: the SSH key fingerprint
+// the server writes as the certificate's CN (the key the bootstrap proved).
+func (m *mtlsServer) issueForSubject(t *testing.T, subject, user string, ttl time.Duration) (certPEM, keyPEM []byte, serial string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -168,7 +232,7 @@ func (m *mtlsServer) issue(t *testing.T, label string, ttl time.Duration) (certP
 	if err != nil {
 		t.Fatal(err)
 	}
-	certDER, err := m.ca.SignClientCSR(csrDER, sshFingerprint(label), "", "control", "cli", ttl)
+	certDER, err := m.ca.SignClientCSR(csrDER, subject, user, "control", "cli", ttl)
 	if err != nil {
 		t.Fatalf("sign client CSR: %v", err)
 	}
@@ -186,14 +250,27 @@ func (m *mtlsServer) issue(t *testing.T, label string, ttl time.Duration) (certP
 }
 
 // credential packages an issued pair as the sdk.Credential a bootstrap returns.
+// The certificate is for testUser.
 func (m *mtlsServer) credential(t *testing.T, label string, ttl time.Duration) sdk.Credential {
 	t.Helper()
-	certPEM, keyPEM, serial := m.issue(t, label, ttl)
+	return m.credentialFor(t, label, testUser, ttl)
+}
+
+// credentialFor is credential for a given user ("" for the implicit user).
+func (m *mtlsServer) credentialFor(t *testing.T, label, user string, ttl time.Duration) sdk.Credential {
+	t.Helper()
+	certPEM, keyPEM, serial := m.issueFor(t, label, user, ttl)
+	return bundleOf(m.pin, certPEM, keyPEM, serial, ttl)
+}
+
+// bundleOf packages a certificate and key as the sdk.Credential a bootstrap
+// returns.
+func bundleOf(pin string, certPEM, keyPEM []byte, serial string, ttl time.Duration) sdk.Credential {
 	return sdk.Credential{
 		Bundle: sdk.Bundle{
 			AuthMode:           sdk.AuthModeMTLS,
 			HTTPSPort:          443,
-			TLSCertFingerprint: m.pin,
+			TLSCertFingerprint: pin,
 			ClientCert:         string(certPEM),
 			Scope:              "control",
 			CertSerial:         serial,
@@ -258,7 +335,7 @@ func putServerEntry(t *testing.T, name string, entry config.ServerEntry) {
 // per request.
 func stubBootstrap(mint func() sdk.Credential) *atomic.Int32 {
 	var calls atomic.Int32
-	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+	bootstrapCredentialFn = func(string, int, string, string, string) (sdk.Credential, error) {
 		calls.Add(1)
 		return mint(), nil
 	}
@@ -267,7 +344,7 @@ func stubBootstrap(mint func() sdk.Credential) *atomic.Int32 {
 
 // mtlsEntry writes an issued credential to the creds store and returns the
 // server entry pointing at it — i.e. the state `shed server add` would leave
-// behind for an mtls server.
+// behind for an mtls server, including the user the certificate names.
 func mtlsEntry(t *testing.T, m *mtlsServer, name string, cred sdk.Credential) config.ServerEntry {
 	t.Helper()
 	certPath, keyPath, err := config.WriteClientCredentials(name,
@@ -284,7 +361,17 @@ func mtlsEntry(t *testing.T, m *mtlsServer, name string, cred sdk.Credential) co
 		ClientCertFile:      certPath,
 		ClientKeyFile:       keyPath,
 		ClientCertExpiresAt: cred.Bundle.ExpiresAt,
+		User:                certUserOf(t, cred),
 	}
+}
+
+// certUserOf returns the named user an issued credential's certificate is for
+// ("" for the implicit user, and for a certificate that names no user or a
+// malformed one, which a test sets up on purpose).
+func certUserOf(t *testing.T, cred sdk.Credential) string {
+	t.Helper()
+	user, _, _ := config.IssuedCertificateUser("", []byte(cred.Bundle.ClientCert))
+	return user
 }
 
 // TestMTLSClientAuthenticatesEndToEnd: an entry holding a valid client
@@ -435,6 +522,13 @@ func TestTransportSurvivesRotation(t *testing.T) {
 
 	transportBefore := c.transport
 	httpClientBefore := c.httpClient
+	// The client's transport is the refusal gate; the pool is the pinned
+	// transport inside it, which must not be replaced either.
+	gate, ok := c.transport.(*refusalGate)
+	if !ok {
+		t.Fatalf("transport = %T, want the refusal gate", c.transport)
+	}
+	pinnedBefore := gate.next
 	if _, err := c.GetInfo(); err != nil {
 		t.Fatalf("GetInfo: %v", err)
 	}
@@ -451,6 +545,9 @@ func TestTransportSurvivesRotation(t *testing.T) {
 
 	if c.transport != transportBefore {
 		t.Error("the transport was rebuilt across a rotation; it must be built once and reused")
+	}
+	if gate.next != pinnedBefore {
+		t.Error("the pinned transport inside the gate was replaced across a rotation")
 	}
 	if c.httpClient != httpClientBefore {
 		t.Error("the http.Client was rebuilt across a rotation")
@@ -562,6 +659,7 @@ func TestModeFlipMTLSToToken(t *testing.T) {
 		ClientCertFile:      certPath,
 		ClientKeyFile:       keyPath,
 		ClientCertExpiresAt: time.Now().Add(24 * time.Hour), // far from expiry: reactive path only
+		User:                testUser,
 	})
 
 	newExpiry := time.Now().Add(24 * time.Hour)
@@ -883,6 +981,9 @@ func TestTunnelCredentialSourceRefreshIsMintOnly(t *testing.T) {
 		Host: "127.0.0.1", SSHPort: 2222,
 		APIURL:             "https://localhost:18443",
 		TLSCertFingerprint: m.pin,
+		// The row records the user the daemon is issued: a daemon never takes
+		// up a user the row does not record (TestMintOnlyRefreshIsHeld).
+		User: testUser,
 	}
 	putServerEntry(t, "dev-mtls", entry)
 	client := newAPIClientWithSource(
@@ -894,7 +995,7 @@ func TestTunnelCredentialSourceRefreshIsMintOnly(t *testing.T) {
 
 	issued := m.credential(t, "cli-key", farFromExpiry)
 	mints := stubBootstrap(func() sdk.Credential { return issued })
-	source := tunnelCredentialSource(client, &entry, tunnels.ConnectTarget{TLSPin: m.pin})
+	source := tunnelCredentialSource(client, "dev-mtls", &entry, tunnels.ConnectTarget{TLSPin: m.pin})
 	if source == nil {
 		t.Fatal("secure tunnel should have a credential source")
 	}

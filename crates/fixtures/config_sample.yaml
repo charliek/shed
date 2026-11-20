@@ -5,8 +5,10 @@
 # an ignored field (added_at), and an inline empty map `{}` (all-defaults).
 #
 # The `secure` entry additionally carries the mtls credential keys a real entry
-# gets once its server runs `auth.mode: mtls` (plan 001 D6) — and `mini2`,
-# which omits `auth_mode` entirely, pins the absent-means-token rule.
+# gets once its server runs `auth.mode: mtls` (plan 001 D6), and the `user` the
+# CLI records for it — and `mini2`, which omits `auth_mode` and `user` entirely,
+# pins the absent-means-token rule and an absent user parsing to "". The `u-*`
+# entries pin how a `user` that is not a plain name reads.
 #
 # The `machines:` block (plan 009 §3.3) is the Rust-owned native-RC-host section:
 # a full entry (`localmac`), a defaults-only one (`mini2box` — host falls back to
@@ -30,7 +32,46 @@ servers:
         client_cert_file: /Users/dev/.shed/creds/secure/client.crt
         client_key_file: /Users/dev/.shed/creds/secure/client.key
         client_cert_expires_at: 2026-07-26T12:00:00Z
+        user: pat
     minimal: {}
+    # `user` values that are not a plain name (plan 037 §3.2.2). A bare `user:` is no
+    # user (""); a nested map is USER_NOT_A_STRING (fail closed, never ""); a list, a
+    # flow list or a flow map is a line the reader does not accept, so the whole entry
+    # is refused (plan 037 A8: its user is USER_NOT_A_STRING, and it has no host); a
+    # number is a scalar kept verbatim, which is no user name either. An unquoted `true`
+    # is read as its text, as Go's reader (gopkg.in/yaml.v3 into a string) reads it:
+    # the user name `true`, quoted or not.
+    u-bare:
+        host: ub
+        user:
+    u-blockmap:
+        host: um
+        user:
+            name: pat
+    u-flowlist:
+        host: ufl
+        user: [pat]
+    u-flowmap:
+        host: uf
+        user: {}
+    u-list:
+        host: ul
+        user:
+            - pat
+    u-listflat:
+        host: ulf
+        user:
+        - pat
+        ssh_port: 2200
+    u-number:
+        host: un
+        user: 5
+    u-true:
+        host: ut
+        user: true
+    u-truequoted:
+        host: utq
+        user: "true"
 machines:
     localmac:
         host: localhost

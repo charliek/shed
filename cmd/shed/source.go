@@ -88,7 +88,7 @@ func init() {
 func sourceFlagError(c *cobra.Command, err error) error {
 	msg := termSafe(err.Error())
 	if c == sourceUseCmd {
-		msg += "\nput -- before a machine name that begins with '-': shed source use -- <name>"
+		msg += "\nput -- before a machine name that begins with '-': shed source use -- NAME"
 	}
 	return errors.New(msg)
 }

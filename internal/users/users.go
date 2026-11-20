@@ -125,8 +125,8 @@ type Refresher interface {
 // UnknownKeyRefetcher is a Lookup that can fetch its users again for a key
 // it does not know (from GitHub logins, or a directory's list), at a bounded
 // rate for the whole server. The SSH front door asks it, in enforce mode
-// only, when an unknown key logs in as `_bootstrap` or as a name that is a
-// valid shed name.
+// only, when an unknown key logs in as `_bootstrap`, and, on a lookup that is
+// not also an UnknownKeyNudger, as a name that is a valid shed name.
 type UnknownKeyRefetcher interface {
 	// RefetchForUnknownKey takes a server-wide slot before doing anything
 	// else; when it gets it, it starts (or joins) a fetch on behalf of the
@@ -136,9 +136,30 @@ type UnknownKeyRefetcher interface {
 	// waited for nothing. How often the slot may be taken, how long the
 	// wait is, and when else a call is refused are each implementation's,
 	// stated on it (ConfigLookup: one a minute, a five-second wait;
-	// directory.Runtime: by the state of its last pull, one 20-second
-	// deadline). ctx ending ends the wait, not the fetch.
+	// directory.Runtime: by the state of its last pull, and a caller whose
+	// key is still unknown answered when its 8-second deadline ends, never
+	// earlier, directory.UnknownKeyWait). ctx ending ends the wait, not the
+	// fetch.
 	RefetchForUnknownKey(ctx context.Context, fingerprint string) bool
+}
+
+// UnknownKeyNudger is a Lookup that can fetch its users again, in the
+// background, for a key it does not know that was offered for a login to a
+// shed that exists (a directory's list). The SSH front door refuses such a
+// login at once, without waiting for anything about the name; off the login
+// path it checks that the shed exists, and only then nudges. No login waits
+// for the check or the fetch. A lookup that implements it
+// is never asked RefetchForUnknownKey for a shed name, only for `_bootstrap`.
+type UnknownKeyNudger interface {
+	// NudgeForUnknownKey takes a server-wide slot of its own (separate from
+	// RefetchForUnknownKey's) and, when it gets it, asks for a fetch on
+	// behalf of the unknown key with this fingerprint, without waiting for
+	// it; the fetch's result applies when it ends. It reports whether it
+	// asked for one. A call that does not get the slot, or whose key is
+	// known by then, asks for nothing. How often the slot may be taken is
+	// the implementation's, stated on it (directory.Runtime: once every 5
+	// minutes while pulls succeed, directory.UnknownKeyShedEvery).
+	NudgeForUnknownKey(fingerprint string) bool
 }
 
 // BoundCredentialsOnly is a Lookup whose users change while the server runs

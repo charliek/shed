@@ -67,6 +67,9 @@ vendor/
 # Exception: the directory contract's throwaway test keys (non-secret; made for the
 # fixtures and listed in its manifest). See tests/directory-contract/README.md.
 !tests/directory-contract/v1/fixtures/test-keys/*.pem
+# Exception: the certificate user fixtures (certificates only, no private keys; written
+# by a Go test in internal/servertls). See crates/fixtures/clientuser/README.md.
+!crates/fixtures/clientuser/*.pem
 
 # Desktop app local secrets (Sparkle private key, notarization creds)
 desktop/.secrets/

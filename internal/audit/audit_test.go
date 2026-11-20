@@ -2,6 +2,7 @@ package audit
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -53,7 +54,7 @@ func TestRecordShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := l.Record(ExecEndEvent{
-		Event: EventExecEnd, Identity: Identity{Kind: KindAdmin}, Shed: "s",
+		Event: EventExecEnd, Identity: UserIdentity("", true, true, false, "", ""), Shed: "s",
 		Argv0: "craze", Argc: 6, ExitCode: -1, Disconnected: true,
 	}); err != nil {
 		t.Fatal(err)
@@ -112,6 +113,344 @@ func TestRecordShape(t *testing.T) {
 	}
 	if err := l.Record(struct{}{}); err == nil {
 		t.Error("Record after Close must fail")
+	}
+}
+
+// TestPersonIdentity: the one rule both doors record a person by (the API's
+// auditIdentity, sshd's sshIdentity): a named or implicit person is a user
+// line; anything else, a user that is neither named nor implicit included,
+// is unknown, never a person.
+func TestPersonIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		id   Identity
+		want string
+	}{
+		{"named", PersonIdentity(true, "pat", false, true, false, "SHA256:abc", "1f"),
+			`{"kind":"user","user":"pat","admin":true,"script":false,"subject":"SHA256:abc","serial":"1f"}`},
+		{"implicit", PersonIdentity(true, "", true, true, false, "SHA256:abc", ""),
+			`{"kind":"user","implicit":true,"admin":true,"script":false,"subject":"SHA256:abc"}`},
+		{"neither named nor implicit", PersonIdentity(true, "", false, true, false, "SHA256:abc", "1f"), `{"kind":"unknown"}`},
+		{"not a person", PersonIdentity(false, "pat", false, true, false, "SHA256:abc", "1f"), `{"kind":"unknown"}`},
+	} {
+		got, err := json.Marshal(tc.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s: identity = %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestIdentityShapes pins each identity kind's JSON exactly, as a reader of
+// audit.jsonl sees it: a client keeps its shape (name and serial, nothing
+// else), a person always carries both flags, the implicit user carries no
+// name, and the server's own actions carry the kind alone. No constructor
+// makes the retired kind "admin".
+func TestIdentityShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		id   Identity
+		want string
+	}{
+		{"client", ClientIdentity("build-1", "3fa2"), `{"kind":"client","name":"build-1","serial":"3fa2"}`},
+		{"client without serial", ClientIdentity("build-1", ""), `{"kind":"client","name":"build-1"}`},
+		{
+			"user", UserIdentity("pat", false, false, false, "SHA256:abc", "1f"),
+			`{"kind":"user","user":"pat","admin":false,"script":false,"subject":"SHA256:abc","serial":"1f"}`,
+		},
+		{
+			"admin user", UserIdentity("admin", false, true, false, "SHA256:abc", "1f"),
+			`{"kind":"user","user":"admin","admin":true,"script":false,"subject":"SHA256:abc","serial":"1f"}`,
+		},
+		{
+			"script key", UserIdentity("ci", false, false, true, "SHA256:abc", ""),
+			`{"kind":"user","user":"ci","admin":false,"script":true,"subject":"SHA256:abc"}`,
+		},
+		{
+			// An SSH login has a fingerprint and no certificate serial.
+			"user over ssh", UserIdentity("pat", false, true, false, "SHA256:abc", ""),
+			`{"kind":"user","user":"pat","admin":true,"script":false,"subject":"SHA256:abc"}`,
+		},
+		{"implicit, open mode", UserIdentity("", true, true, false, "", ""), `{"kind":"user","implicit":true,"admin":true,"script":false}`},
+		{
+			"implicit with a certificate", UserIdentity("", true, true, false, "SHA256:abc", "1f"),
+			`{"kind":"user","implicit":true,"admin":true,"script":false,"subject":"SHA256:abc","serial":"1f"}`,
+		},
+		{
+			// The implicit user has no name; one passed by mistake is dropped.
+			"implicit drops a name", UserIdentity("pat", true, true, false, "", ""),
+			`{"kind":"user","implicit":true,"admin":true,"script":false}`,
+		},
+		{"system", SystemIdentity(), `{"kind":"system"}`},
+		{"unknown", UnknownIdentity(), `{"kind":"unknown"}`},
+	}
+	path := filepath.Join(t.TempDir(), FileName)
+	l, err := Open(path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := json.Marshal(tt.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tt.want {
+				t.Errorf("identity = %s, want %s", got, tt.want)
+			}
+			if err := l.Record(ExecEndEvent{Event: EventExecEnd, Identity: tt.id, Shed: tt.name}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Round trip: each line read back holds the identity as written.
+	lines := readLines(t, path)
+	if len(lines) != len(tests) {
+		t.Fatalf("want %d lines, got %d", len(tests), len(lines))
+	}
+	for i, tt := range tests {
+		var want map[string]any
+		if err := json.Unmarshal([]byte(tt.want), &want); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := json.Marshal(lines[i]["identity"])
+		wantJSON, _ := json.Marshal(want)
+		if string(got) != string(wantJSON) {
+			t.Errorf("%s: line identity = %s, want %s", tt.name, got, wantJSON)
+		}
+		if lines[i]["identity"].(map[string]any)["kind"] == "admin" {
+			t.Errorf("%s: a line carries the retired kind admin", tt.name)
+		}
+	}
+}
+
+func TestReapEventIdentity(t *testing.T) {
+	got, err := json.Marshal(ReapEvent{Event: EventReap, Identity: SystemIdentity(), Shed: "s", Owner: "build-1", AgeSeconds: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"event":"reap","identity":{"kind":"system"},"shed":"s","owner":"build-1","age_seconds":3}`
+	if string(got) != want {
+		t.Errorf("reap = %s, want %s", got, want)
+	}
+}
+
+// TestSSHEventShape pins the ssh line exactly: a person's identity with the
+// key's fingerprint and no serial, the peer, the shed and its owner, the
+// channel, and port only for a tunnel. It has no member for a command.
+func TestSSHEventShape(t *testing.T) {
+	id := UserIdentity("admin", false, true, false, "SHA256:abc", "")
+	tests := []struct {
+		name string
+		ev   SSHEvent
+		want string
+	}{
+		{
+			"exec",
+			SSHEvent{Event: EventSSH, Identity: id, Remote: "127.0.0.1:5123", Shed: "ci-1", Owner: "build-1", Channel: SSHChannelExec},
+			`{"event":"ssh","identity":{"kind":"user","user":"admin","admin":true,"script":false,"subject":"SHA256:abc"},"remote":"127.0.0.1:5123","shed":"ci-1","owner":"build-1","channel":"exec"}`,
+		},
+		{
+			"tunnel",
+			SSHEvent{Event: EventSSH, Identity: id, Remote: "127.0.0.1:5123", Shed: "ci-1", Owner: "build-1", Channel: SSHChannelTunnel, Port: 8080},
+			`{"event":"ssh","identity":{"kind":"user","user":"admin","admin":true,"script":false,"subject":"SHA256:abc"},"remote":"127.0.0.1:5123","shed":"ci-1","owner":"build-1","channel":"tunnel","port":8080}`,
+		},
+		{
+			"implicit shell",
+			SSHEvent{Event: EventSSH, Identity: UserIdentity("", true, true, false, "SHA256:abc", ""), Remote: "127.0.0.1:5123", Shed: "ci-1", Owner: "build-1", Channel: SSHChannelShell},
+			`{"event":"ssh","identity":{"kind":"user","implicit":true,"admin":true,"script":false,"subject":"SHA256:abc"},"remote":"127.0.0.1:5123","shed":"ci-1","owner":"build-1","channel":"shell"}`,
+		},
+	}
+	path := filepath.Join(t.TempDir(), FileName)
+	l, err := Open(path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range tests {
+		got, err := json.Marshal(tt.ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tt.want {
+			t.Errorf("%s: ssh = %s, want %s", tt.name, got, tt.want)
+		}
+		if err := l.Record(tt.ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lines := readLines(t, path)
+	if len(lines) != len(tests) {
+		t.Fatalf("want %d lines, got %d", len(tests), len(lines))
+	}
+	for i, tt := range tests {
+		var want map[string]any
+		if err := json.Unmarshal([]byte(tt.want), &want); err != nil {
+			t.Fatal(err)
+		}
+		want["ts"] = lines[i]["ts"]
+		got, _ := json.Marshal(lines[i])
+		wantJSON, _ := json.Marshal(want)
+		if string(got) != string(wantJSON) {
+			t.Errorf("%s: line = %s, want %s", tt.name, got, wantJSON)
+		}
+	}
+}
+
+// TestConnectEventShape pins the connect line exactly: a person as an HTTPS
+// caller (with the certificate's subject and serial, or the implicit user
+// with neither in open mode), the peer, the shed and its owner, and the port.
+// It has no request id member: that value can come from a caller's
+// X-Request-Id header.
+func TestConnectEventShape(t *testing.T) {
+	tests := []struct {
+		name string
+		ev   ConnectEvent
+		want string
+	}{
+		{
+			"a named admin",
+			ConnectEvent{Event: EventConnect, Identity: UserIdentity("pat", false, true, false, "SHA256:abc", "1f"), Remote: "192.0.2.10:51234", Shed: "ci-1", Owner: "build-1", Port: 8080},
+			`{"event":"connect","identity":{"kind":"user","user":"pat","admin":true,"script":false,"subject":"SHA256:abc","serial":"1f"},"remote":"192.0.2.10:51234","shed":"ci-1","owner":"build-1","port":8080}`,
+		},
+		{
+			"the implicit user in open mode",
+			ConnectEvent{Event: EventConnect, Identity: UserIdentity("", true, true, false, "", ""), Remote: "127.0.0.1:5123", Shed: "ci-1", Owner: "build-1", Port: 22},
+			`{"event":"connect","identity":{"kind":"user","implicit":true,"admin":true,"script":false},"remote":"127.0.0.1:5123","shed":"ci-1","owner":"build-1","port":22}`,
+		},
+	}
+	for _, tt := range tests {
+		got, err := json.Marshal(tt.ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tt.want {
+			t.Errorf("%s: connect = %s, want %s", tt.name, got, tt.want)
+		}
+	}
+}
+
+// TestPendingDrain: Drain waits for every entry begun before it, refuses any
+// begun after it, and gives up (with an error naming how many) when its
+// context ends first.
+func TestPendingDrain(t *testing.T) {
+	var p Pending
+	end1, ok := p.Begin()
+	if !ok {
+		t.Fatal("Begin refused before Drain")
+	}
+	end2, _ := p.Begin()
+	end2()
+	end2() // a second end is a no-op
+
+	drained := make(chan error, 1)
+	go func() { drained <- p.Drain(context.Background()) }()
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned (%v) with an entry still begun", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// Once Drain has begun, a new entry is refused (one let through before
+	// that is ended at once, so the wait is not held up by the probe).
+	waitUntil(t, func() bool {
+		end, ok := p.Begin()
+		end()
+		return !ok
+	})
+	end1()
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("Drain = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return once every entry ended")
+	}
+	if _, ok := p.Begin(); ok {
+		t.Error("Begin after Drain was let through")
+	}
+
+	var q Pending
+	if _, ok := q.Begin(); !ok {
+		t.Fatal("Begin refused")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := q.Drain(ctx); err == nil || !strings.Contains(err.Error(), "1 entries") {
+		t.Errorf("Drain past its context = %v, want the count", err)
+	}
+
+	var empty Pending
+	if err := empty.Drain(context.Background()); err != nil {
+		t.Errorf("Drain with nothing begun = %v", err)
+	}
+}
+
+// TestPendingCloseThenDrain: Close shuts the gate at once without waiting
+// (an entry begun before it is still counted, and one after it refused);
+// Waiting is closed only once a Drain waits on that entry; and a Drain whose
+// context has already ended returns nil when no entry is left.
+func TestPendingCloseThenDrain(t *testing.T) {
+	var p Pending
+	end, ok := p.Begin()
+	if !ok {
+		t.Fatal("Begin refused before Close")
+	}
+	p.Close()
+	if _, ok := p.Begin(); ok {
+		t.Fatal("Begin after Close was let through")
+	}
+	p.Close() // a second Close is a no-op
+	select {
+	case <-p.Waiting():
+		t.Fatal("Waiting closed before any Drain waited")
+	default:
+	}
+
+	drained := make(chan error, 1)
+	go func() { drained <- p.Drain(context.Background()) }()
+	select {
+	case <-p.Waiting():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Waiting was not closed while Drain waited on a begun entry")
+	}
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain returned (%v) with an entry still begun", err)
+	default:
+	}
+	end()
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("Drain = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return once the entry ended")
+	}
+
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := p.Drain(ended); err != nil {
+		t.Errorf("Drain past its context with nothing left = %v", err)
+	}
+}
+
+func waitUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

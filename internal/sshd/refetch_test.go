@@ -75,13 +75,15 @@ func dialUser(t *testing.T, addr, user string, signer gossh.Signer) bool {
 	return true
 }
 
-// TestUnknownKeyRefetchAtTheDoor: an unknown key logging in as _bootstrap or
-// as any valid shed name asks the lookup to fetch again, and is admitted on
-// that same attempt when the fetch finds it (whether the shed exists is
-// decided per channel, after authentication). A name that is not a valid
-// shed name never asks, and a key the lookup knows never asks: an expired one
-// is refused at the door without asking. Deciding never looks a shed up:
-// nothing about sheds is read for a peer that has not authenticated.
+// TestUnknownKeyRefetchAtTheDoor: on a lookup that can fetch and not nudge
+// (GitHub logins: the rule there is unchanged), an unknown key logging in as
+// _bootstrap or as any valid shed name asks the lookup to fetch again, and is
+// admitted on that same attempt when the fetch finds it (whether the shed
+// exists is decided per channel, after authentication). A name that is not a
+// valid shed name never asks, and a key the lookup knows never asks: an
+// expired one is refused at the door without asking. Deciding never looks a
+// shed up: nothing about sheds is read for a peer that has not authenticated.
+// (A lookup that can nudge, a directory's list, is unknownshed_test.go's.)
 func TestUnknownKeyRefetchAtTheDoor(t *testing.T) {
 	newcomer := testSigner(t)
 	stranger := testSigner(t)
@@ -137,8 +139,8 @@ func (liveRefetchLookup) BoundCredentialsOnly() {}
 // server runs (a directory's list) says it pulled the directory and never
 // names GitHub; any other prints, byte for byte, the line it always has.
 func TestUnknownKeyRefetchLogLine(t *testing.T) {
-	const github = "SSH auth: key %s is known after fetching the GitHub logins again"
-	const directory = "SSH auth: key %s is known after pulling the directory again"
+	const github = "SSH auth: key %s remote=127.0.0.1:PORT is known after fetching the GitHub logins again"
+	const directory = "SSH auth: key %s remote=127.0.0.1:PORT is known after pulling the directory again"
 	for _, tc := range []struct {
 		name      string
 		live      bool
@@ -160,7 +162,7 @@ func TestUnknownKeyRefetchLogLine(t *testing.T) {
 			if !dialUser(t, addr, "box", newcomer) {
 				t.Fatal("the key the fetch found was refused")
 			}
-			lines := strings.Split(out.String(), "\n")
+			lines := strings.Split(anyPort(out.String()), "\n")
 			if !slices.Contains(lines, fmt.Sprintf(tc.want, fp)) {
 				t.Errorf("no line %q in the log:\n%s", fmt.Sprintf(tc.want, fp), out)
 			}

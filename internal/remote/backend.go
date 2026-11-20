@@ -407,11 +407,16 @@ func (b *Backend) Reported() []string {
 	return append([]string(nil), b.reported...)
 }
 
-// shedOf returns the API view of a record.
+// shedOf returns the API view of a record: a copy, so nothing set here
+// reaches the stored record.
 func (b *Backend) shedOf(r *state.Record) *config.Shed {
 	shed := r.Shed
 	shed.Backend = config.BackendRemote
 	shed.Owner, shed.User = ownership(r)
+	// A remote shed mounts nothing: its selection is explicitly empty, as on
+	// every backend's record a selection is reported (mount_selection). Set
+	// on the copy only; the stored record carries none.
+	shed.Mounts = config.SelectedMounts(nil)
 	if r.Shed.Status == config.StatusRunning {
 		if hs, ok := b.credMgr.HealthTracker().Get(r.Shed.Name); ok {
 			lastHealthy := hs.LastSeen

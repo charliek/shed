@@ -134,7 +134,7 @@ func (s *Server) reap(ctx context.Context, sh config.Shed, age time.Duration) {
 			log.Printf("reaper: stop %s: %v", sh.Name, err)
 		}
 	}
-	ev := audit.ReapEvent{Event: audit.EventReap, Shed: sh.Name, Owner: sh.Owner, AgeSeconds: int64(age / time.Second)}
+	ev := audit.ReapEvent{Event: audit.EventReap, Identity: audit.SystemIdentity(), Shed: sh.Name, Owner: sh.Owner, AgeSeconds: int64(age / time.Second)}
 	if err := s.backend.DeleteShed(opCtx, sh.Name); err != nil {
 		if gone("delete", err) {
 			return

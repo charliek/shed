@@ -653,7 +653,7 @@ The suite's one **self-managed** module: it starts and stops its own servers,
 so it never runs against an installed or dev server. Linux only.
 
 ```sh
-make test-integration-directory                         # the whole module, about three minutes
+make test-integration-directory                         # the whole module, about five minutes
 make test-integration-directory PYTEST_ARGS="-k rates"  # one case
 ```
 
@@ -678,7 +678,17 @@ folder, all of it stopped and removed when the case ends, pass or fail:
   reference server never serves a reserved name such as `admin`);
 - `shed-server directory enroll` with the code on standard input;
 - identities with their own `HOME` and `ssh` shim (`fixtures/identity.py`),
-  never the developer's `~/.shed`.
+  never the developer's `~/.shed`. The shim offers one key; for the entry
+  cases, a person's shim offers instead every key of an `ssh-agent` the
+  world starts on a socket in its folder, in the order the keys were added,
+  and no key file (an `IdentityFile` that does not exist keeps ssh from
+  adding the default key files of the account running the tests). That shim
+  adds nothing else: every other ssh option is the CLI's to set, and it
+  records the arguments of each run, which a case checks;
+- for the entry refused before any request, two counting TCP relays of the
+  test on loopback, one in front of the server's SSH port and one in front
+  of its HTTPS port, which the entry is added through: every connection the
+  CLI makes for it is an accept the case counts.
 
 A "shed" there is a `shed-agent` on this host, run by the server as the user
 running the tests: the cases assert that a session opens, runs, closes or is
@@ -705,14 +715,23 @@ reused pid is never signalled; one that has gone already is not an error.
 | `test_end_to_end_flow` | enrolment (private state; neither the code nor a private key in any file of the world but the ones meant for them, every log included); a new person logs in over SSH through the unknown-key pull and over the API; an admin flip and a demotion with the same certificate; a removal plus `shed users refresh` closes their held connection and refuses SSH and the API; added back, a good pull; the service out: the kept copy carries them across a restart; the trust time, computed by the case from the last good pull plus `trust`: the person is admitted (an API request and a new channel) shortly before it, then their held connection closes, only the local admin remains and the kept copy is gone (this server's choice: a restart has none); a restart that leaves too little trust time starts a new one first. The service back: the local admin's refresh restores the list. The local admin and `shed users status` at every step |
 | `test_a_list_entry_named_like_the_local_admin_is_skipped` | the entry skipped (status, log), the local admin unchanged, its key not added |
 | `test_a_list_entry_holding_the_local_admins_key_is_skipped` | an entry with another name that lists the local admin's key skipped whole (status with its reason, log), the local admin still logs in with that key (SSH, a certificate naming it, the API) |
-| `test_a_key_moved_between_two_people_with_a_held_connection` | a new channel on the old connection refused, the connection kept; the first person's certificate, answered before the move, refused after it; a new connection is the second person's |
+| `test_a_key_moved_between_two_people_with_a_held_connection` | a new channel on the old connection refused, the connection kept; the first person's certificate, answered before the move, refused after it; a new connection is the second person's; every token request the server made named the scope `directory:read` and nothing else (the reference server's log) |
 | `test_the_unknown_key_rates` | a second unknown key in the same minute refused at once, with no pull; in after a refresh |
+| `test_an_unknown_key_as_a_name_that_is_no_shed_asks_no_pull` | a listed key the server does not know yet, offered as a shed name no shed has: refused at once, no pull asked (a smoke test; the Go tests hold the rule) |
+| `test_an_unknown_key_as_an_existing_sheds_name_is_refused_then_let_in` | the same key as an existing shed's name: refused at once, a background pull on the shed-name slot, a retry let in |
 | `test_an_unbound_certificate_is_refused` | a certificate made with the CA in the state directory that names no user is refused, the same one naming the user accepted before and after |
 | `test_a_session_inside_a_shed_is_closed_when_its_person_is_removed` | the session closed, a new one refused, the shed still theirs for an admin |
 | `test_a_session_inside_a_shed_across_a_key_move` | the open session survives, a new one is refused, the person's CLI certificate (answered before the move) is refused, the key's new owner may not enter |
+| `test_an_entry_offering_two_users_keys_is_refused_while_the_list_is_out_of_force` | an agent offering pat's key, then the local admin's: the entry enrols as pat; the service out and the trust time ended, a command through it exits 1 with the user-change refusal, `shed server list` shows it `refused` (the message once), and nothing under `~/.shed` changes (every entry: its type, mode, bytes or link target); the service back and refreshed, the entry works as pat again with the certificate it holds |
+| `test_a_refetch_makes_the_entry_another_user_only_when_asked` | the same agent, pat out of the list: `shed server update --refetch` is refused (nothing the CLI keeps changes); with `--allow-user-change` the entry becomes the local admin and says so |
+| `test_an_entry_whose_user_line_was_removed_is_refused_before_any_request` | the entry added through the two relays, which see its ssh and its requests; `user` removed from the entry by hand: a command and the listing are refused, neither relay accepts a connection and nothing under `~/.shed` changes; `shed server update --refetch` restores it (`User: pat`, its ssh through the relay) and keeps the entry's own HTTPS port (the check goes through the HTTPS relay) |
+| `test_one_host_name_two_entries_two_users` | the guide's backup-admin recipe: with the agent offering pat's key, `shed server add --identity-file` with the local admin's key enrols the local admin (its ssh carries `-i <that key>`, `IdentitiesOnly=yes`, `ControlMaster=no` and `ControlPath=none`), and a second entry for the same host with no key enrols pat (its ssh carries no `-i`); each acts as its user, pat's `shed users status` refused with the CLI's forbidden message |
+| `test_the_shed_record_and_the_server_info_on_the_remote_backend` | a shed made with `--network isolated` reports `mounts` `{"mode":"selected"}`, `isolation` `topology` and `arch`; an open one `isolation` `none`, in the get and the list; `/api/info` carries the nine `exec` members, `guest_arch` and the `exec_limits` and `uniform_shed_record` tokens |
 
-An unknown key pulls at most once a minute (and not while a retry wait is
-pending), so each case's first unknown login is the first of its minute, or
+An unknown key offered as `_bootstrap` pulls at most once a minute (and not
+while a retry wait is pending); offered as an existing shed's name, at most
+once every 5 minutes, on a slot of its own; under any other name, never. So
+each case's first unknown login is the first of its minute, or
 the local admin runs `shed users refresh` before a person's first login when
 the case is not about that path.
 

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -33,6 +34,10 @@ type identityBackend struct {
 	execs []backend.Principal
 	dials []backend.Principal
 }
+
+// Type is read by the access guard's report step (the record's isolation and
+// arch).
+func (b *identityBackend) Type() backend.Type { return backend.TypeFirecracker }
 
 func (b *identityBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
 	if name != "box" {
@@ -87,10 +92,20 @@ func newPeople(t *testing.T) people {
 
 func identityServer(t *testing.T, be backend.Backend, lookup users.Lookup) (*Server, string) {
 	t.Helper()
+	return identityServerWith(t, be, lookup, nil)
+}
+
+// identityServerWith is identityServer with configure, when set, run on the
+// server before it serves.
+func identityServerWith(t *testing.T, be backend.Backend, lookup users.Lookup, configure func(*Server)) (*Server, string) {
+	t.Helper()
 	s, err := NewServer(be, filepath.Join(t.TempDir(), "host_key"), "127.0.0.1:0", nil,
 		KeyAuth{Mode: config.SSHAuthEnforce, Users: lookup})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if configure != nil {
+		configure(s)
 	}
 	return s, serveForTest(t, s)
 }
@@ -287,13 +302,19 @@ func queryThenSign(who people) map[string][]gossh.Signer {
 
 // TestSSHIdentityIsTheSigningKey is the x/crypto regression test for the
 // session's identity: a key that was queried but not used to sign does not
-// become the identity.
+// become the identity. Nor is it logged as allowed: the log has exactly one
+// "SSH auth allowed" line, for the key that signed, with the peer's address,
+// and none for a key that was only queried (accepted when asked about, never
+// proven).
 func TestSSHIdentityIsTheSigningKey(t *testing.T) {
 	who := newPeople(t)
+	aliceFP := gossh.FingerprintSHA256(who.alice.PublicKey())
+	bobFP := gossh.FingerprintSHA256(who.bob.PublicKey())
 	for name, signers := range queryThenSign(who) {
 		t.Run(name, func(t *testing.T) {
 			be := &identityBackend{}
 			_, addr := identityServer(t, be, who.lookup)
+			out := captureLog(t)
 			client := dialWith(t, addr, "box", signers...)
 			stderr, status := runOn(t, client, "true", "")
 			if status != 0 {
@@ -302,6 +323,20 @@ func TestSSHIdentityIsTheSigningKey(t *testing.T) {
 			execs, _ := be.seen()
 			if len(execs) != 1 || execs[0] != backend.UserPrincipal("alice", false) {
 				t.Fatalf("session identity %v, want alice", execs)
+			}
+
+			var allowed []string
+			for _, line := range strings.Split(out.String(), "\n") {
+				if strings.HasPrefix(line, "SSH auth allowed:") {
+					allowed = append(allowed, line)
+				}
+				if strings.HasPrefix(line, "SSH auth allowed:") && strings.Contains(line, bobFP) {
+					t.Errorf("bob's key was only queried, never signed with, and was logged as allowed: %q", line)
+				}
+			}
+			want := fmt.Sprintf(`SSH auth allowed: user=box fingerprint=%s remote=127.0.0.1:PORT key_user="alice" admin=false`, aliceFP)
+			if len(allowed) != 1 || anyPort(allowed[0]) != want {
+				t.Errorf("allowed lines %q, want exactly one: %q (a real loopback port)\n%s", allowed, want, out)
 			}
 		})
 	}

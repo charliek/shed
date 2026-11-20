@@ -167,7 +167,19 @@ Returns server metadata and capabilities.
   "http_port": 8080,
   "backend": "vz",
   "auth_mode": "open",
-  "features": ["overview", "http_exec", "mount_selection", "source_binding"]
+  "features": ["overview", "http_exec", "exec_limits", "mount_selection", "uniform_shed_record", "source_binding"],
+  "guest_arch": "arm64",
+  "exec": {
+    "max_stdin_bytes": 1048576,
+    "max_timeout_seconds": 3600,
+    "default_timeout_seconds": 60,
+    "max_output_bytes": 268435456,
+    "default_output_bytes": 4194304,
+    "max_concurrent_per_shed": 8,
+    "max_argv_elements": 1024,
+    "max_env_keys": 256,
+    "max_argv_env_bytes": 1048576
+  }
 }
 ```
 
@@ -187,7 +199,19 @@ valid certificate, since the listener runs `RequireAndVerifyClientCert`:**
   "https_port": 8443,
   "ca_fingerprint": "sha256:…",
   "ca_not_after": "2036-06-15T00:00:00Z",
-  "features": ["overview", "http_exec", "mount_selection", "service_clients", "network_profiles", "source_binding"]
+  "features": ["overview", "http_exec", "exec_limits", "mount_selection", "uniform_shed_record", "service_clients", "network_profiles", "source_binding"],
+  "guest_arch": "amd64",
+  "exec": {
+    "max_stdin_bytes": 1048576,
+    "max_timeout_seconds": 3600,
+    "default_timeout_seconds": 60,
+    "max_output_bytes": 268435456,
+    "default_output_bytes": 4194304,
+    "max_concurrent_per_shed": 8,
+    "max_argv_elements": 1024,
+    "max_env_keys": 256,
+    "max_argv_env_bytes": 1048576
+  }
 }
 ```
 
@@ -204,7 +228,9 @@ never renamed; treat an unknown token as absent.
 |-------|------------|---------|
 | `overview` | always | `GET /api/overview`, the single-call host snapshot |
 | `http_exec` | always | [`POST /api/sheds/{name}/exec`](#post-apishedsnameexec) |
+| `exec_limits` | always (with `http_exec`) | This response carries `exec`: the limits an exec request is refused above, and the defaults a request that sets none gets (below) |
 | `mount_selection` | always | The create request's `mounts` field |
+| `uniform_shed_record` | always | Every [shed record](#get-apisheds), on every backend and every route that returns one, carries `mounts`, `network_profile` and `isolation`, and `arch` where the server knows it; this response carries `guest_arch` when every shed this server can create has one architecture (below) |
 | `service_clients` | mtls mode with `auth.clients` configured | This server accepts [service clients](#service-clients) |
 | `network_profiles` | Firecracker; remote unless its `firewall.mode` is `any` | The create request's `network` field (`open` or `isolated`) |
 | `async_lifecycle` | remote backend | Create, start, stop and delete return before the cloud work is done; see [Remote backend](remote-backend.md) |
@@ -214,9 +240,48 @@ The `shed` CLI refuses `--mounts none|<names>` against a server without
 `mount_selection`, and `--network isolated` against one without
 `network_profiles`, before it sends anything.
 
+`exec` is present exactly when `features` lists `exec_limits` (an older server
+sends neither). It holds the limits of
+[`POST /api/sheds/{name}/exec`](#post-apishedsnameexec), read from the same
+values the route enforces, so a client can size a request instead of learning
+a limit from a refusal. They are the server's own, from its `exec:` config and
+fixed values: every caller, a person or a [service client](#service-clients),
+reads the same ones and is held to them.
+
+| Member | Kind | Meaning |
+|--------|------|---------|
+| `max_stdin_bytes` | limit | `stdin`, once decoded, is refused above this (`exec.max_stdin_bytes`, default 1 MiB) |
+| `max_timeout_seconds` | limit | `timeout_seconds` is refused above this (`exec.max_timeout`, default 1h) |
+| `default_timeout_seconds` | default | The timeout of a request with no `timeout_seconds`: 60, or `max_timeout_seconds` when that is lower |
+| `max_output_bytes` | limit | `max_output_bytes` is refused above this (256 MiB) |
+| `default_output_bytes` | default | The output budget of a request with no `max_output_bytes` (4 MiB) |
+| `max_concurrent_per_shed` | limit | One more exec in a shed already running this many is refused with `429 EXEC_LIMIT` (`exec.max_concurrent_per_shed`, default 8) |
+| `max_argv_elements` | limit | `argv` is refused above this many elements (1024) |
+| `max_env_keys` | limit | `env` is refused above this many keys (256) |
+| `max_argv_env_bytes` | limit | `argv` and `env` together are refused above this many bytes (1 MiB): the bytes of every `argv` element plus, for each `env` entry, its key, one `=` byte and its value |
+
+Times are whole seconds, rounded down; an `exec.max_timeout` that is not a
+whole number of seconds is reported as the largest `timeout_seconds` the route
+accepts. A `max_*` member is the point past which a request is refused, not a
+promise that a request at every limit at once fits: the request body as a
+whole is also capped (base64 `stdin` plus 1 MiB), and a body over that is
+refused with `413 REQUEST_TOO_LARGE`.
+
 The `backend` field reflects the resolved backend for this server (`vz`,
 `firecracker` or `remote`). When the server is configured with
 `default_backend: detect`, this field shows the auto-detected value.
+
+`guest_arch` is the CPU architecture (`amd64` or `arm64`) every shed this
+server can create runs, so a client can pick a binary before it sends one. On
+Firecracker and VZ it is the host's. On the remote backend it is the `arch`
+every configured size shares, and it is omitted when the sizes mix
+architectures: each shed record's `arch` then says. An older server omits it.
+
+`isolation` is present on the remote backend only (`topology`): how that
+backend provides the isolated profile. It names the backend's kind whether or
+not the current `firewall` config offers `isolated` (`network_profiles` says
+whether it does). What a given shed has is its record's
+[`isolation`](#get-apisheds).
 
 `ca_fingerprint` / `ca_not_after` are present **only in mtls mode**: the
 internal CA's fingerprint and expiry (see [Security › CA
@@ -260,20 +325,30 @@ Lists all sheds on this server.
       "cpus": 2,
       "memory_mb": 4096,
       "mounts": {"mode": "all"},
-      "network_profile": "open"
+      "network_profile": "open",
+      "isolation": "none",
+      "arch": "arm64"
     }
   ]
 }
 ```
 
-Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mounts`, `landing_dir`, `owner` and `user` are omitted when empty or zero.
+Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mounts`, `landing_dir`, `owner`, `user` and `arch` are omitted when empty or zero.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `owner` | string | The [service client](#service-clients) that created the shed. Omitted for a shed a person created. |
 | `user` | string | The [user](configuration.md#users) the shed belongs to. Omitted on a server with no user list, and for a shed with no user (one made before the server had a user list, until [assigned](#post-apishedsnameassign)). A shed has an `owner` or a `user`, never both. `!unresolved` marks a shed whose records disagree about whose it is; only an admin reaches it. |
-| `mounts` | object | The server mounts (top-level `mounts:` in the server config) the shed gets on every start: `{"mode": "all"}` (every server mount, the default) or `{"mode": "selected", "names": [...]}` (only those; no `names` means none). A shed created before mount selection existed reports `{"mode": "all"}`. |
+| `mounts` | object | The server mounts (top-level `mounts:` in the server config) the shed gets on every start: `{"mode": "all"}` (every server mount, the default) or `{"mode": "selected", "names": [...]}` (only those; no `names` means none). A shed created before mount selection existed reports `{"mode": "all"}`. A remote shed, which mounts nothing, always reports `{"mode": "selected"}`. |
 | `network_profile` | string | `open` or `isolated`, fixed at create. A shed created before network profiles existed reports `open`. See [Security › Network profiles](security.md#network-profiles). |
+| `isolation` | string | The isolation in force for this shed: `none` (its profile is `open`), `firewall` (`isolated`, held by firewall rules the server installs on its own host: Firecracker) or `topology` (`isolated`, held by the network giving the shed no route to another shed or to the server's private network: [remote](remote-backend.md)). It fails closed: an `isolated` shed on a backend that cannot hold isolation now reports `none` (a remote server whose `firewall` config admits more than the server), never the profile's name. It names the kind of isolation the server's configuration provides; it is not a live check that the network isolates the shed at this moment. A client that requires isolation reads this member, not `network_profile`, and treats a record without it (an older server) as not isolated. |
+| `arch` | string | The guest's CPU architecture, `amd64` or `arm64`. Firecracker and VZ: the host's. Remote: the shed's size's, stored at create; when a lost record is rebuilt from the cloud, the architecture the cloud reports for the VM's boot disk (when the cloud reports none, the configured sizes' for its machine type if they all agree; none when they disagree or no configured size has that machine type); a remote shed created by a server older than this member reports none. |
+
+Every route that returns a shed record (this list, `GET /api/sheds/{name}`,
+create (JSON and the stream's `complete` event), start, stop, assign, reset,
+the egress `POST` and `DELETE`, and `GET /api/overview`) returns it with these
+members; `isolation` and the local `arch` are computed when the record is
+reported, never stored. Advertised by `uniform_shed_record`.
 
 The list holds only the sheds the caller may view: a service client's, its
 own; a user's, their own; an admin's, every shed (see [Ownership](#ownership)).
@@ -406,12 +481,15 @@ Gets details for a specific shed.
     }
   ],
   "mounts": {"mode": "selected", "names": ["claude"]},
-  "network_profile": "open"
+  "network_profile": "open",
+  "isolation": "none",
+  "arch": "arm64"
 }
 ```
 
 The fields are those of [GET /api/sheds](#get-apisheds), including `owner`
-and `user` (both omitted here), `mounts` and `network_profile`. An admin
+and `user` (both omitted here), `mounts`, `network_profile`, `isolation` and
+`arch`. An admin
 viewing another user's shed gets it without `repo` and `landing_dir`.
 
 | Field | Type | Description |
@@ -563,6 +641,9 @@ on a shed it owns. Advertised by the
 | `max_output_bytes` | No | 4194304 (4 MiB) | Output budget for stdout and stderr together, at most 268435456 (256 MiB). |
 
 Unknown fields and trailing data after the JSON object are refused (`400`).
+
+A server that advertises `exec_limits` reports this server's values for each of
+these limits and defaults in [`GET /api/info`](#get-apiinfo) `exec`.
 
 **Response (200 OK, `Content-Type: application/x-ndjson`):** one JSON object
 per line, flushed as output arrives:

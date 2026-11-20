@@ -323,11 +323,8 @@ func publicKeyOfPEM(keyPEM []byte) (crypto.PublicKey, error) {
 // verifies the pair, which covers the one case no lock can: a crash BETWEEN the
 // two renames.
 func (s *Store) Write(name string, certPEM, keyPEM []byte) (certPath, keyPath string, err error) {
-	if name == "" {
-		return "", "", errors.New("client credentials: server name required")
-	}
-	if len(certPEM) == 0 || len(keyPEM) == 0 {
-		return "", "", errors.New("client credentials: empty certificate or key")
+	if err := checkWrite(name, certPEM, keyPEM); err != nil {
+		return "", "", err
 	}
 	if err := s.ensureRoot(); err != nil {
 		return "", "", err
@@ -337,7 +334,37 @@ func (s *Store) Write(name string, certPEM, keyPEM []byte) (certPath, keyPath st
 		return "", "", err
 	}
 	defer unlock()
+	return s.writeLocked(name, certPEM, keyPEM)
+}
 
+// WriteHeld is Write for a caller that ALREADY holds this server's lock (Lock):
+// the same write, without taking the lock. The lock is not re-entrant (flock
+// keys on the open file description), so a caller that holds it across a
+// longer transaction — a config read, this write and a config save — cannot
+// call Write without deadlocking against itself. Calling WriteHeld WITHOUT the
+// lock gives up the pair's atomicity against a concurrent writer.
+func (s *Store) WriteHeld(name string, certPEM, keyPEM []byte) (certPath, keyPath string, err error) {
+	if err := checkWrite(name, certPEM, keyPEM); err != nil {
+		return "", "", err
+	}
+	if err := s.ensureRoot(); err != nil {
+		return "", "", err
+	}
+	return s.writeLocked(name, certPEM, keyPEM)
+}
+
+func checkWrite(name string, certPEM, keyPEM []byte) error {
+	if name == "" {
+		return errors.New("client credentials: server name required")
+	}
+	if len(certPEM) == 0 || len(keyPEM) == 0 {
+		return errors.New("client credentials: empty certificate or key")
+	}
+	return nil
+}
+
+// writeLocked is the body of Write; the caller holds the server's lock.
+func (s *Store) writeLocked(name string, certPEM, keyPEM []byte) (certPath, keyPath string, err error) {
 	dir := s.ServerDir(name)
 	if err := os.MkdirAll(dir, DirPerm); err != nil {
 		return "", "", fmt.Errorf("create credentials dir %s: %w", dir, err)
@@ -468,7 +495,18 @@ func (s *Staged) Commit() error {
 		return err
 	}
 	defer unlock()
+	return s.commitLocked()
+}
 
+// CommitHeld is Commit for a caller that ALREADY holds this server's lock: the
+// same renames, without taking the lock (see Store.WriteHeld for why a held
+// lock cannot be taken again).
+func (s *Staged) CommitHeld() error {
+	return s.commitLocked()
+}
+
+// commitLocked is the body of Commit; the caller holds the server's lock.
+func (s *Staged) commitLocked() error {
 	dir := s.store.ServerDir(s.name)
 	if err := os.MkdirAll(dir, DirPerm); err != nil {
 		return fmt.Errorf("create credentials dir %s: %w", dir, err)

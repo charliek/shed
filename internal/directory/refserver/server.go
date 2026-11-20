@@ -94,8 +94,9 @@ type Config struct {
 	Limits Limits
 	// OnEnrol is called with each new server's name and client id.
 	OnEnrol func(serverName, clientID string)
-	// Logf logs why a request was refused, and never a code, an assertion,
-	// a token or a key. Nil logs nothing.
+	// Logf logs why a request was refused, and the scope each token request
+	// asked for (tokenRequestLine), and never a code, an assertion, a token
+	// or a key. Nil logs nothing.
 	Logf func(format string, args ...any)
 }
 

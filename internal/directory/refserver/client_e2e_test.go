@@ -25,9 +25,11 @@ import (
 // outside tests.
 
 // tokenArrival is one request that reached the token endpoint: the client id
-// and jti its assertion named, and the status it was answered with.
+// and jti its assertion named, every scope parameter it carried, and the
+// status it was answered with.
 type tokenArrival struct {
 	clientID, jti string
+	scope         []string
 	status        int
 }
 
@@ -48,6 +50,7 @@ func (a *arrivals) wrap(next http.Handler) http.Handler {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		var arr tokenArrival
 		if form, err := url.ParseQuery(string(body)); err == nil {
+			arr.scope = form["scope"]
 			if parts := strings.Split(form.Get("client_assertion"), "."); len(parts) == 3 {
 				claims, _ := base64.RawURLEncoding.DecodeString(parts[1])
 				var c struct {
@@ -93,7 +96,8 @@ func failure(t *testing.T, what string, err error) *directory.Failure {
 // version; an unchanged pull with the same version; the server disabled; the
 // outage; a second enrolment with the spent code refused; and, across all of
 // it, the server's replay ledger holding every accepted assertion once, no
-// jti having arrived twice.
+// jti having arrived twice, and every token request asking for the scope
+// directory:read, once.
 func TestClientEndToEnd(t *testing.T) {
 	var seen arrivals
 	c := newControlServerWith(t, seen.wrap)
@@ -235,6 +239,10 @@ func TestClientEndToEnd(t *testing.T) {
 		}
 		if jtis[a.jti] {
 			t.Errorf("the jti %s arrived twice", a.jti)
+		}
+		// Every login asks for directory:read, once, and nothing else.
+		if len(a.scope) != 1 || a.scope[0] != scopeDirectory {
+			t.Errorf("a token request with jti %s carried scope %q, want [%s]", a.jti, a.scope, scopeDirectory)
 		}
 		jtis[a.jti] = true
 		if a.status == http.StatusOK {
