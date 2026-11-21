@@ -16,8 +16,8 @@
 //!
 //! **What is NOT covered, and why:** rung 3 against the real
 //! `github.com/charliek/roost` release. [`RELEASE_PIN`] now names one — roost
-//! v0.0.21 (v0.0.20 was the first published release speaking session protocol
-//! [`SESSION_PROTOCOL_VERSION`]) — but a unit test may not reach across the
+//! v0.0.26, the last release speaking session protocol
+//! [`SESSION_PROTOCOL_VERSION`] (v0.0.20 was the first) — but a unit test may not reach across the
 //! network to fetch it, so the same version is driven against the loopback
 //! fixture instead. Every clause of the fetch contract is exercised here; what
 //! is untested is one URL.
@@ -49,10 +49,9 @@ use super::*;
 
 const TARGET: &str = "roost:popos/p019-a";
 
-/// The pinned release's version — [`LATEST_KNOWN_RELEASE`]'s, which is what
-/// [`RELEASE_PIN`] names. The rung-3 rows drive it against the loopback fixture
+/// The pinned release's version — what [`RELEASE_PIN`] names. The rung-3 rows drive it against the loopback fixture
 /// rather than against the real release page.
-const VERSION: &str = "0.0.21";
+const VERSION: &str = "0.0.26";
 
 /// A real roost release from **before** protocol 6, deliberately not
 /// [`LATEST_KNOWN_RELEASE`]: the incumbent a host bootstrapped long ago — or one
@@ -470,26 +469,37 @@ fn pinned_asset() -> Source {
 ///
 /// Plan 019 §3.5 kept the asset rung behind a pin until a roost release spoke
 /// this generation; roost v0.0.20 does, and plan 023 §3.2 flipped it. Plan 024
-/// §3.3 moved the pin again, to v0.0.21 — roost's bug-fix release after
-/// v0.0.20, still speaking the same protocol. What is asserted here is the
-/// invariant that survives both flips: the pin and the latest release shed
-/// knows of are **one** release, and it speaks the protocol this shed speaks.
-/// A pin naming a release that does not is the mistake this row exists to
-/// catch.
+/// §3.3 moved the pin to v0.0.21, and it now names v0.0.26, the last roost
+/// release that speaks protocol 6: v0.0.27 moved roost to protocol 7, and
+/// v0.1.0, the newest release shed knows of, speaks 7 too. What is asserted
+/// here is the invariant that survives every move: the pin speaks the protocol
+/// this shed speaks, and while the latest release shed knows of speaks it too,
+/// the pin is that release. A pin naming a release of another generation is the
+/// mistake this row exists to catch.
 #[test]
 fn the_pin_names_the_release_that_speaks_this_protocol() {
-    assert_eq!(LATEST_KNOWN_RELEASE, ("0.0.21", 6));
-    let (version, protocol) = LATEST_KNOWN_RELEASE;
+    assert_eq!(RELEASE_PIN, Some(RoostRelease { version: VERSION }));
+    assert_eq!(RELEASE_PIN_PROTOCOL, 6);
     assert_eq!(
-        RELEASE_PIN,
-        Some(RoostRelease { version }),
-        "the pin and the latest known release are one release, not two that have to agree"
-    );
-    assert_eq!(
-        protocol, SESSION_PROTOCOL_VERSION,
+        RELEASE_PIN_PROTOCOL, SESSION_PROTOCOL_VERSION,
         "the pin may only name a release speaking the protocol this shed speaks — if these \
          ever disagree, the pin above is what needs editing, not this test"
     );
+    // The truth, even when it is a release this shed cannot install.
+    assert_eq!(LATEST_KNOWN_RELEASE, ("0.1.0", 7));
+    let (latest, latest_protocol) = LATEST_KNOWN_RELEASE;
+    if latest_protocol == SESSION_PROTOCOL_VERSION {
+        assert_eq!(
+            RELEASE_PIN,
+            Some(RoostRelease { version: latest }),
+            "the newest release speaks this protocol, so it is the one to pin"
+        );
+    } else {
+        assert!(
+            latest_protocol > SESSION_PROTOCOL_VERSION,
+            "the newest release shed knows of never speaks an older protocol than the pin"
+        );
+    }
 }
 
 /// Today's rung-4 copy, word for word: the known release speaks this generation,
@@ -513,10 +523,18 @@ fn the_no_source_copy_names_the_reason_the_asset_rung_did_not_answer() {
     assert_eq!(failure.message, unavailable(TARGET));
 
     // The version is read, not written: a re-pin that edits the constants and
-    // forgets the copy is the failure this catches.
-    let (version, _) = LATEST_KNOWN_RELEASE;
+    // forgets the copy is the failure this catches. It is the PIN's version, not
+    // the latest release's: the asset rung fetches the pin, and the latest
+    // release (0.1.0) speaks a protocol this shed does not.
+    let version = RELEASE_PIN.expect("the pin is set").version;
     assert!(
         unavailable(TARGET).contains(&format!("the roost {version} release asset is not usable"))
+    );
+    let (latest, _) = LATEST_KNOWN_RELEASE;
+    assert!(
+        !unavailable(TARGET).contains(latest),
+        "{}",
+        unavailable(TARGET)
     );
     // The generation is named too — in the tail, which both branches share.
     assert!(unavailable(TARGET).contains(&format!("protocol-{SESSION_PROTOCOL_VERSION}")));
@@ -556,8 +574,8 @@ fn the_older_shape_still_gets_the_sentence_plan_019_pinned() {
     }
     assert_eq!(
         unavailable(TARGET),
-        unavailable_for(TARGET, LATEST_KNOWN_RELEASE),
-        "`unavailable` is `unavailable_for` with the shipped constants and nothing else"
+        unavailable_for(TARGET, (VERSION, RELEASE_PIN_PROTOCOL)),
+        "`unavailable` is `unavailable_for` with the shipped pin and nothing else"
     );
 }
 

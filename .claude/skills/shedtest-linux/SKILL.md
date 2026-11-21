@@ -630,6 +630,14 @@ cargo build --release -p roost-session -p roost-cli   # roost-cli's binary is `r
 # → target/release/{roost-session,roostctl}
 ```
 
+**No build needed for the pinned release:** `RELEASE_PIN`'s linux asset
+(`gh release download v<pin> -R charliek/roost -p 'roost-session-<pin>-linux-amd64*'`, then
+`sha256sum -c` the `.sha256` beside it) is a release build of the same protocol and works as
+this binary; copy it to a directory of its own named `roost-session`. The render gate
+(`tauri-build-linux`) does **not** forward `SHED_TAURI_ROOST_SESSION_BIN`, so run its `docker
+run` by hand with `-v <that dir>:/roost-bin:ro -e SHED_TAURI_ROOST_SESSION_BIN=/roost-bin/roost-session`
+added; both `real_roost` cells then run inside the full suite.
+
 **`SHED_TAURI_ROOST_SESSION_BIN` is the knob that makes this binary findable.** The shedtest
 default path (`test_tauri_bootstrap.py::_real_session_binary`) names the rev of whichever plan
 last moved the pin, so after a re-pin the default will not exist and the `real_roost` cells

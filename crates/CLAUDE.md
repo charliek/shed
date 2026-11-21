@@ -457,7 +457,17 @@ switched to the constant).
 `2bc71fa…` (roost **v0.0.21**, roost's bug-fix release after v0.0.20; v0.0.20 was the first
 release that speaks 6, and its `roost-ipc` crate was byte-identical to `ee71e44…`, where 6
 landed) and shed speaks generation **6**. 0.0.21's only `roost-ipc` API change shed sees is
-`TabOpenParams.cwd_from_tab`. Protocol 4's lease (roost R1, plan 014) stayed
+`TabOpenParams.cwd_from_tab`. **The library rev and the binary pin are different releases of
+the same generation:** `RELEASE_PIN` (the `roost-session` the bootstrap installs and the images
+bake) is roost **v0.0.26**, the last release speaking 6, while `roost-ipc` stays at the v0.0.21
+rev; 0.0.22–0.0.26 only added fields and events shed's decoders already ignore (`dev`/`git_sha`
+in `identify`, `exe_path` in `session.identify`, `Tab.password_input`/`dropped_reports`,
+`tab.password_input`). roost **v0.0.27** moved the session protocol to **7** and v0.1.0 kept it
+(`LATEST_KNOWN_RELEASE` says so); moving shed there is a migration, not a pin move: the
+`roost-ipc` bootstrap API changed (`RemotePlatform` for `RemoteArch`, `map_arch`/`check_os`
+gone), `Tab.state` became a projection that includes program status, the Linux session socket
+moved to `~/.local/state/roost-session/run/roost.sock` (`roost::paths`' table), and the Go
+`roostprovider` (`SpokenProtocol`) and the phone speak 6 too. Protocol 4's lease (roost R1, plan 014) stayed
 gone — not narrowed, retired outright, with no replacement — and everything protocol 5 gave
 (below) carries forward unchanged; 6's own changes are the second list further down:
 

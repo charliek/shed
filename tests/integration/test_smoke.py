@@ -533,7 +533,7 @@ def test_roost_session_baked(shed_server, test_shed_name):
             "still boots a published image, which may carry no roost-session"
         )
 
-    want_version = os.environ.get("SHED_ROOST_SESSION_VERSION", "0.0.21")
+    want_version = os.environ.get("SHED_ROOST_SESSION_VERSION", "0.0.26")
     want_protocol = os.environ.get("SHED_ROOST_SESSION_PROTOCOL", "6")
 
     # A LISTED backend promised its dev store carries the bake, so a missing
@@ -600,7 +600,7 @@ def test_roost_session_baked(shed_server, test_shed_name):
         f"baked roost-session session_protocol={identify.get('session_protocol')!r}, "
         f"want {want_protocol!r} (override via SHED_ROOST_SESSION_PROTOCOL). "
         f"Check ARG ROOST_SESSION_PROTOCOL in vz/Dockerfile / "
-        f"firecracker/Dockerfile and LATEST_KNOWN_RELEASE in "
+        f"firecracker/Dockerfile and RELEASE_PIN_PROTOCOL in "
         f"crates/shed-core/src/roost/bootstrap/source.rs (make check-roost-pin)."
     )
 

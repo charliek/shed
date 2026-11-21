@@ -255,7 +255,7 @@ pub use machines::{InstallMachine, InstallRequest, Installed, ProbeMachine};
 pub use plan::{fingerprint, Identity, Plan, Probe, ProbeOutcome, SessionIdentity, SessionState};
 pub use source::{
     fetch_release, no_source, preview, resolve, unavailable, RoostRelease, Source, SourceEnv,
-    SourcePreview, LATEST_KNOWN_RELEASE, RELEASE_PIN,
+    SourcePreview, LATEST_KNOWN_RELEASE, RELEASE_PIN, RELEASE_PIN_PROTOCOL,
 };
 
 /// Lowercase hex, shared so `roost_ipc`'s own private copy (`bootstrap.rs`'s
@@ -505,7 +505,7 @@ impl CallError {
 #[derive(Clone)]
 pub struct SourceHandle {
     /// A sentence fragment for the consent card: "the roost-session beside this
-    /// app", "roost-session 0.0.21 from github.com/charliek/roost", …
+    /// app", "roost-session 0.0.26 from github.com/charliek/roost", …
     origin: Arc<str>,
     len: u64,
     sha256: Option<Arc<str>>,

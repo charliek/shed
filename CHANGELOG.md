@@ -25,6 +25,12 @@ All notable changes to this project will be documented in this file.
   shed built from them, the desktop's create sheet lists craze's `claude` provider, which
   craze 0.4.0 added, and no longer lists `gx`, which it removed. A shed keeps the craze its
   image baked; recreate it to pick up the new one.
+- **roost-session 0.0.26: images bake it and the desktop installs it** (0.10.1 pinned 0.0.21).
+  It is the last roost release that speaks session protocol 6, the protocol this shed speaks;
+  roost 0.0.27 and 0.1.0 speak protocol 7, which shed does not speak yet, so a host running one
+  of those still gets the protocol report and is never touched. A host already running a
+  protocol-6 `roost-session` (0.0.20 to 0.0.25) is compatible and is not upgraded; a shed keeps
+  the roost-session its image baked.
 
 ## v0.10.1 — 2026-11-20
 

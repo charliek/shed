@@ -21,11 +21,14 @@
 //!    by [`fetch_release`].
 //! 4. **Nothing** — [`unavailable`], and the host is left untouched.
 //!
-//! ## The pin is `0.0.21`, and that is the state of the world
+//! ## The pin is `0.0.26`, and that is the state of the world
 //!
-//! [`RELEASE_PIN`] names roost **v0.0.21** — [`LATEST_KNOWN_RELEASE`]. v0.0.20
-//! was the first published release that speaks session protocol
-//! [`SESSION_PROTOCOL_VERSION`]. It was `None` until that release existed, and
+//! [`RELEASE_PIN`] names roost **v0.0.26**, the newest release that speaks
+//! session protocol [`SESSION_PROTOCOL_VERSION`] (v0.0.20 was the first). It is
+//! no longer [`LATEST_KNOWN_RELEASE`]: roost v0.0.27 moved the session protocol
+//! to 7, and v0.1.0 speaks 7 too, so the newest release shed knows of is one
+//! this shed cannot install. The pin was `None` until a protocol-6 release
+//! existed, and
 //! that was an external gate rather than an unfinished branch: rung 3 was
 //! implemented and tested against a loopback fixture the whole time, and the
 //! only thing missing was a release to point it at. Flipping it was the one-line
@@ -150,35 +153,46 @@ pub struct RoostRelease {
     pub version: &'static str,
 }
 
-/// The release rung 3 fetches from — **roost v0.0.21**.
+/// The release rung 3 fetches from — **roost v0.0.26**.
 ///
 /// See the module doc: v0.0.20 is the first published roost release that speaks
 /// session protocol [`SESSION_PROTOCOL_VERSION`], so it is the first one there
 /// was anything honest to point this at. It was `None` before that, and plan 023
-/// §3.2 is the flip. Plan 024 §3.3 moves the pin to v0.0.21, roost's bug-fix
-/// release after v0.0.20, still speaking the same protocol. It must name
-/// [`LATEST_KNOWN_RELEASE`]'s version — this module's tests assert that it
-/// does, and that the protocol beside it is the one this shed speaks.
-pub const RELEASE_PIN: Option<RoostRelease> = Some(RoostRelease { version: "0.0.21" });
+/// §3.2 is the flip. Plan 024 §3.3 moved the pin to v0.0.21, and it now names
+/// v0.0.26, the last roost release that speaks protocol 6 (v0.0.27 moved roost
+/// to protocol 7). It must name the newest release that speaks this shed's
+/// protocol, which is [`LATEST_KNOWN_RELEASE`] only while that one speaks it
+/// too; [`RELEASE_PIN_PROTOCOL`] says which protocol the pin speaks, and this
+/// module's tests hold the two together.
+pub const RELEASE_PIN: Option<RoostRelease> = Some(RoostRelease { version: "0.0.26" });
+
+/// The session protocol the [`RELEASE_PIN`] release speaks — **6**.
+///
+/// A literal rather than [`SESSION_PROTOCOL_VERSION`] itself: it is a fact
+/// about a published release, which the compile-time check below holds against
+/// the protocol this shed speaks, and `make check-roost-pin` reads it to hold
+/// both Dockerfiles' `ROOST_SESSION_PROTOCOL` to the same number.
+pub const RELEASE_PIN_PROTOCOL: u32 = 6;
 
 /// The newest roost release shed knows of, and the session protocol it speaks —
-/// **`("0.0.21", 6)`**.
+/// **`("0.1.0", 7)`**.
 ///
-/// It is the release [`RELEASE_PIN`] points at, and it is what
-/// [`unavailable`]'s parenthesis names. It is a constant so that the pin and the
-/// sentence a user reads cannot drift apart: one PR edits both, in one file, and
-/// this module's tests assert the sentence is built from them rather than typed
-/// out.
-pub const LATEST_KNOWN_RELEASE: (&str, u32) = ("0.0.21", 6);
+/// It tells the truth even when this shed cannot speak it: roost v0.0.27 moved
+/// the session protocol from 6 to 7 and v0.1.0 kept it, so it is not the
+/// release [`RELEASE_PIN`] points at. A message about having no pin quotes it,
+/// and with a pin set [`unavailable`] names the pin instead. One PR edits the
+/// constants, in one file, and this module's tests assert the sentences are
+/// built from them rather than typed out.
+pub const LATEST_KNOWN_RELEASE: (&str, u32) = ("0.1.0", 7);
 
 // Compile-time tripwire (the `RECORDED_GENERATION` precedent in `model.rs`): a
-// pin may only exist while the newest known release speaks the protocol this
-// shed speaks. A future bump that moves one constant and not the other, or
-// pins a release that speaks an older generation, fails to build rather than
-// advertising a rung 3 that hands every target an incompatible daemon.
+// pin may only name a release that speaks the protocol this shed speaks. A
+// future bump that moves the pin to a release of another generation, and the
+// protocol beside it, fails to build rather than advertising a rung 3 that
+// hands every target an incompatible daemon.
 const _: () = assert!(
-    RELEASE_PIN.is_none() || LATEST_KNOWN_RELEASE.1 == SESSION_PROTOCOL_VERSION,
-    "RELEASE_PIN is set but LATEST_KNOWN_RELEASE does not speak SESSION_PROTOCOL_VERSION"
+    RELEASE_PIN.is_none() || RELEASE_PIN_PROTOCOL == SESSION_PROTOCOL_VERSION,
+    "RELEASE_PIN is set but RELEASE_PIN_PROTOCOL is not SESSION_PROTOCOL_VERSION"
 );
 
 // ============================================================================
@@ -434,25 +448,38 @@ impl SourceEnv {
 /// two working rungs, the same `… was left untouched.` ending every consumer
 /// keys on:
 ///
-/// * [`LATEST_KNOWN_RELEASE`] speaks something **other** than this generation —
+/// * The release it is given speaks something **other** than this generation —
 ///   the pre-flip world, and what an injected `None` pin still means in this
 ///   module's tests: plan 019's sentence, byte for byte.
-/// * It speaks **this** generation — today: rung 3 exists and did not answer, so
-///   the copy names the two things that can take it away instead of denying it
-///   exists.
+/// * It speaks **this** generation — today, where it is given the pin: rung 3
+///   exists and did not answer, so the copy names the two things that can take
+///   it away instead of denying it exists.
+///
+/// With a pin set the sentence names the **pin**, not [`LATEST_KNOWN_RELEASE`]:
+/// the newest release may speak a newer generation than the one rung 3 fetches,
+/// and the asset that was not usable is the pinned one.
 ///
 /// [`unavailable_for`] is where both live; this is the one every caller uses.
 pub fn unavailable(target: &str) -> String {
-    unavailable_for(target, LATEST_KNOWN_RELEASE)
+    unavailable_for(target, sentence_release(RELEASE_PIN.as_ref()))
 }
 
-/// [`unavailable`] with the known release lifted into an argument.
+/// The release [`unavailable`]'s sentence is about: the pin and the protocol
+/// it speaks, or with no pin the newest release shed knows of.
+fn sentence_release(pin: Option<&RoostRelease>) -> (&'static str, u32) {
+    match pin {
+        Some(pin) => (pin.version, RELEASE_PIN_PROTOCOL),
+        None => LATEST_KNOWN_RELEASE,
+    }
+}
+
+/// [`unavailable`] with the release it names lifted into an argument.
 ///
 /// Private, and it exists for one reason: with the constants at their shipped
 /// values the pre-flip branch is unreachable, and an untested branch is a branch
 /// that rots. The tests drive both through here.
-fn unavailable_for(target: &str, latest: (&str, u32)) -> String {
-    let (version, protocol) = latest;
+fn unavailable_for(target: &str, release: (&str, u32)) -> String {
+    let (version, protocol) = release;
     // The tail both branches end with: the two rungs that still work whatever
     // took rung 3 away, and the sentence every consumer keys on.
     let tail = format!(
