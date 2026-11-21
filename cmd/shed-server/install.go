@@ -114,6 +114,12 @@ func getCurrentUser() (*user.User, error) {
 // again to get a new template. (On a deb install the same path is the
 // package's conffile, so dpkg can replace it when the person chooses the
 // package's version.)
+//
+// Like the deb's unit, it reads the optional /etc/shed/server.env (the
+// leading "-": a host without the file starts as before), where a
+// remote-backend server keeps the cloud settings its config names. systemd
+// reads the file as root before it drops to User=, so the file can stay
+// root-only (mode 0600).
 func generateUnitFile(u *user.User) string {
 	// Get primary group for user
 	group, err := user.LookupGroupId(u.Gid)
@@ -132,6 +138,7 @@ Type=simple
 User={user}
 Group={group}
 ExecStart={binary} serve
+EnvironmentFile=-/etc/shed/server.env
 Restart=on-failure
 RestartSec=5
 Environment=HOME={home}

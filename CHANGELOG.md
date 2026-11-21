@@ -256,6 +256,11 @@ reachable from other hosts runs `mtls`.
   printed by `scripts/remote/gce-setup.sh --print`. Not built yet: copying an agent into a VM
   (`agent_install` behaves as `never`). See the [Remote
   Backend reference](https://charliek.github.io/shed/reference/remote-backend/).
+- **Deb: the unit reads an optional `/etc/shed/server.env`.** `EnvironmentFile=-/etc/shed/server.env`
+  gives an installed remote-backend server the cloud settings its config names (#483). The
+  package ships no such file and a server without one starts as before; keep it root-owned,
+  mode 0600. See [Remote Backend › The variables on an installed server
+  (deb)](https://charliek.github.io/shed/reference/remote-backend/#the-variables-on-an-installed-server-deb).
 - **Remote backend: the server checks its cloud firewall.** It reads the environment's rule
   (`shed-<env>-ssh`) and the network's other ingress rules at start-up, once a minute, and
   before a create or start. While the rule is missing, altered, admits the wrong sources, or

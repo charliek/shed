@@ -11,6 +11,11 @@ Wants=network-online.target docker.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/shed-server serve --config /etc/shed/server.yaml
+# Optional (the leading "-"): environment variables for shed-server, such as
+# the cloud settings a remote-backend server reads from the variables its
+# server.yaml names (docs/reference/remote-backend.md). The file can hold
+# credentials: keep it owned by root with mode 0600. The package ships none.
+EnvironmentFile=-/etc/shed/server.env
 # #372: only shed-server itself gets the stop signal; each shed's
 # firecracker VMM stays up and is re-attached by the resume walk (#315)
 # when the server comes back.

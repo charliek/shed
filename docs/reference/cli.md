@@ -1784,7 +1784,7 @@ Installs shed-server as a systemd service. Alternative to the deb package for ma
 sudo shed-server install
 ```
 
-Creates a systemd unit file at `/etc/systemd/system/shed-server.service` and enables it. Does not start the service.
+Creates a systemd unit file at `/etc/systemd/system/shed-server.service` and enables it. Does not start the service. Run again, it overwrites an existing unit at that path with its current template and enables it, but does not start or restart a running service. The unit reads the optional `/etc/shed/server.env` ([Remote Backend](remote-backend.md#the-variables-on-an-installed-server-deb)).
 
 ### shed-server uninstall
 

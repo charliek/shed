@@ -48,7 +48,8 @@ This installs:
 - `shed` CLI and `shed-server` binaries to `/usr/local/bin/`
 - Default Firecracker server config at `/etc/shed/server.yaml`, created on first install from
   the packaged reference copy at `/usr/share/shed/server.yaml.default`
-- Systemd unit file (enabled but not started)
+- Systemd unit file (enabled but not started); it also reads `/etc/shed/server.env` when that
+  file exists, which only a [remote-backend](../reference/remote-backend.md#the-variables-on-an-installed-server-deb) server needs
 
 ### Build from Source (Alternative)
 
