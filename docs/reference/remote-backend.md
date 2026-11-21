@@ -125,7 +125,7 @@ A remote server offers named sizes instead of arbitrary CPU and memory values. A
 
 ## Configuration
 
-The config file holds no project, zone, address or key. Every `*_env` field names a process environment variable that the server reads once at start-up; start-up fails, naming the variable, when one is missing.
+The config file holds no project, zone, address or key. Every `*_env` field names a process environment variable that the server reads once at start-up; start-up fails, naming the variable, when one is missing. On a deb install they go in [`/etc/shed/server.env`](#the-variables-on-an-installed-server-deb).
 
 ```yaml
 default_backend: remote          # `detect` never picks it
@@ -172,6 +172,47 @@ One field is accepted by the loader but not built yet:
 | Field | What happens today |
 |---|---|
 | `agent_install` | Every value behaves as `never`: the server does not copy an agent into a VM. A VM whose agent reports an incompatible protocol or guest layout fails its create (`error`, reason `layout`) or start (`stopped`, reason `layout`). Bake a new image instead (`make gce-image`). |
+
+### The variables on an installed server (deb)
+
+The deb's systemd unit reads `/etc/shed/server.env` if it exists (`EnvironmentFile=-/etc/shed/server.env`). The package ships no such file, and a server without one starts as before. systemd reads the file and passes its variables to `shed-server`; nothing else reads it. It is not the config's `env_file`, which holds variables for sheds.
+
+For the configuration above, the file holds the four `gce` variables, one of each pair (credentials and SSH client key), and the firewall's source ranges. The `*_FILE` variants keep the secrets in their own files:
+
+```sh
+# /etc/shed/server.env: one NAME=value per line, no "export"
+SHED_GCE_PROJECT=PROJECT_ID
+SHED_GCE_ZONE=ZONE
+SHED_GCE_NETWORK=NETWORK_NAME
+SHED_GCE_SUBNET=SUBNET_NAME
+SHED_GCE_CREDENTIALS_FILE=/etc/shed/remote/service-account.json
+SHED_REMOTE_SSH_KEY_FILE=/etc/shed/remote/ssh_client_key
+SHED_REMOTE_SOURCE_RANGES=203.0.113.7/32
+```
+
+If your `server.yaml` names other variables, use its names. To use `GOOGLE_CREDENTIALS_BASE64` or `SHED_REMOTE_SSH_KEY` instead of a file, write the base64 value on one line (`base64 -w0`), and leave the matching `*_FILE` variable out: exactly one of each pair may be set. The files the `*_FILE` variables name must be readable by the user the server runs as (root, under the deb's unit).
+
+Create the file owned by root with mode 0600, since it can hold credentials, then restart the server. The first command makes an empty file: run it once, since it would empty a file that already holds your settings.
+
+```bash
+sudo install -m 0600 -o root -g root /dev/null /etc/shed/server.env
+sudoedit /etc/shed/server.env
+sudo systemctl restart shed-server
+sudo journalctl -u shed-server -n 50 --no-pager
+```
+
+A server that started prints `Initialized remote backend (provider=gce, transport=ssh, environment=ENV_NAME, default_image="IMAGE_NAME")`, then the [firewall check](#the-firewall-check)'s result (`remote: firewall check passed (...)`). A variable that the config names and the file lacks stops the start, and the log names it:
+
+```text
+remote backend: environment variable SHED_GCE_PROJECT (remote.gce.project_env) is not set
+remote backend: neither environment variable GOOGLE_CREDENTIALS_BASE64 (remote.gce.credentials_env) nor SHED_GCE_CREDENTIALS_FILE (remote.gce.credentials_file_env) is set; set exactly one
+```
+
+The unit tries again every 5 seconds; after fixing the file, run `sudo systemctl restart shed-server` to start it at once. `shed-server config-validate` does not read these variables.
+
+A remote server starts no other host process with these variables in normal use. On a Firecracker server the processes it starts on the host (each shed's `firecracker`, the egress proxy, and commands such as `nft`) inherit the file's variables. Under the package's unit those run as root, so only root can read them; nothing in the file reaches a shed's guest.
+
+The unit `shed-server install` writes (a server installed without the package) has the same line. One written by an older `shed-server install` lacks it: run `sudo shed-server install` again, which overwrites `/etc/systemd/system/shed-server.service` with its current template (your edits to it are lost), runs `systemctl daemon-reload` and enables the service, but does not start or restart it; then run `sudo systemctl restart shed-server`. Or add the line under `[Service]` by hand and run `sudo systemctl daemon-reload` and the restart. Do not run `shed-server install` on a deb install: it would replace the package's unit. A Homebrew install runs `shed-server` as a launchd service whose environment the formula sets (`PATH` only), so neither this file nor a shell's variables reach it.
 
 ## The firewall check
 

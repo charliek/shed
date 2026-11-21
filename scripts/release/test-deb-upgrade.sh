@@ -5,7 +5,8 @@
 #
 # It also holds what the systemd unit's upgrade does. The unit
 # (/etc/systemd/system/shed-server.service) IS a conffile, and plan 037 A13
-# changed it (network-online ordering): an unedited unit is replaced with no
+# changed it (network-online ordering; the same release adds an optional
+# EnvironmentFile=-/etc/shed/server.env): an unedited unit is replaced with no
 # prompt; an edited one makes dpkg prompt, so an unattended upgrade stops there
 # with the edit untouched; --force-confold completes it and keeps the edit.
 #
@@ -183,6 +184,10 @@ online() {
   grep -Eq '^After=(.*[[:space:]])?network-online\.target([[:space:]]|$)' "$1" &&
     grep -Eq '^Wants=(.*[[:space:]])?network-online\.target([[:space:]]|$)' "$1"
 }
+# env_file <unit file>: the unit reads the optional environment file (the
+# leading "-": a host without it starts as before).
+ENV_FILE=/etc/shed/server.env
+env_file() { grep -Fxq "EnvironmentFile=-${ENV_FILE}" "$1"; }
 # new_unit: new's own copy of the unit, extracted once, for byte comparisons.
 NEW_X=/tmp/new-x
 new_unit() {
@@ -404,6 +409,8 @@ row() {
       check "installed and configured" state_is "${new_ver} install ok installed"
       check "the unit is new's, byte for byte" unit_is "$(new_unit)"
       check "the unit orders after and wants network-online.target" online "${UNIT}"
+      check "the unit reads ${ENV_FILE} when it exists" env_file "${UNIT}"
+      check "the package ships no ${ENV_FILE}" absent "${ENV_FILE}"
       check "no ${UNIT}.dpkg-* left" no_unit_leftovers
       ;;
     T12 | T13)

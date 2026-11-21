@@ -116,6 +116,47 @@ func TestUnitsWaitForTheNetwork(t *testing.T) {
 	}
 }
 
+// TestUnitsReadTheEnvironmentFile: both shipped units, the deb's
+// packaging/shed-server.service and the unit `shed-server install` writes,
+// give shed-server the variables in /etc/shed/server.env (a remote-backend
+// server's cloud settings), and the leading "-" keeps a host without the file
+// starting as before.
+func TestUnitsReadTheEnvironmentFile(t *testing.T) {
+	packaged, err := os.ReadFile(filepath.Join("..", "..", "packaging", "shed-server.service"))
+	if err != nil {
+		t.Fatalf("read the packaged unit: %v", err)
+	}
+	generated := generateUnitFile(&user.User{
+		Username: "pat",
+		Uid:      "1000",
+		Gid:      "1000",
+		HomeDir:  "/home/pat",
+	})
+	const want = "EnvironmentFile=-/etc/shed/server.env"
+	for _, tt := range []struct{ name, unit string }{
+		{"packaged deb unit", string(packaged)},
+		{"shed-server install's unit", generated},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			section := ""
+			var found []string
+			for _, line := range unitLines(tt.unit) {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+					section = line
+					continue
+				}
+				if strings.HasPrefix(line, "EnvironmentFile=") {
+					found = append(found, section+" "+line)
+				}
+			}
+			if !slices.Equal(found, []string{"[Service] " + want}) {
+				t.Errorf("EnvironmentFile lines are %q; want exactly %q in [Service]", found, want)
+			}
+		})
+	}
+}
+
 // TestUnitListJoinsContinuedLines: a setting swallowed into a continued value
 // is not a setting, and a dependency wrapped onto the next line is read.
 func TestUnitListJoinsContinuedLines(t *testing.T) {
