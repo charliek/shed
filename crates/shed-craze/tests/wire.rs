@@ -1,4 +1,4 @@
-//! shed-craze against craze's own wire fixtures — `fixtures/wire/`, WIRE/01–33
+//! shed-craze against craze's own wire fixtures — `fixtures/wire/`, WIRE/01–37
 //! vendored verbatim at the pin `fixtures/wire.PIN` names (plan 025 §3.3.1),
 //! and diffed against craze's tree by CI's `craze-binaries` action.
 //!
@@ -26,7 +26,10 @@
 //!   `session.snapshot` at its default budget and the fenced read's
 //!   `asks.list` (no fixture calls either) — are pinned by hand, and so are
 //!   `session.set` whole (its model and config shapes, which no fixture line
-//!   carries) and `session.setTitle`.
+//!   carries) and `session.setTitle`. WIRE/37's exit fence (craze 0.3.0's
+//!   `exitAfterTurn` prompt, its `cause`d stop and its `turnId`-bound cancel)
+//!   is a waiting command's, which shed never sends: those three lines are
+//!   skipped, and only there.
 //! - **The slash catalog and the title (plan 029)**: WIRE/30's and WIRE/31's
 //!   catalogs — the snapshot's and each delta's — fold into the rows craze
 //!   wrote (craze 0.2.0's `/effort` as the effort picker, plan 032), the
@@ -100,7 +103,7 @@ fn fixture(prefix: &str) -> Vec<Value> {
 #[test]
 fn the_fixtures_are_vendored_whole_at_the_pin() {
     let all = fixtures();
-    assert_eq!(all.len(), 33, "WIRE/01–33");
+    assert_eq!(all.len(), 37, "WIRE/01–37");
     for (i, (name, _)) in all.iter().enumerate() {
         assert!(name.starts_with(&format!("{:02}-", i + 1)), "{name}");
     }
@@ -520,6 +523,17 @@ fn every_composed_request_is_the_fixtures_c2s_line() {
             // 025 (§3.3.4), so no shed hello carries `resume`.
             if m == method::HELLO && msg["params"].get("resume").is_some() {
                 assert_eq!(name, "13-hello-resume-tokens.ndjson");
+                continue;
+            }
+            // The exit fence (craze 0.3.0): a waiting command's prompt, its
+            // stop's cause and its turn-bound cancel. Shed's lane is a
+            // person's, so it sends none of the three.
+            let p = &msg["params"];
+            let fenced = (m == method::SESSION_PROMPT && p.get("exitAfterTurn").is_some())
+                || (m == method::SESSION_STOP && p.get("cause").is_some())
+                || (m == method::SESSION_CANCEL && p.get("turnId").is_some());
+            if fenced {
+                assert_eq!(name, "37-exit-after-turn.ndjson");
                 continue;
             }
             assert_eq!(&composed(msg), msg, "{name}: {m}");
@@ -1329,7 +1343,9 @@ fn every_fixture_refusal_maps_by_its_code() {
             let e = wire::RpcError::from_value(err);
             let mapped = shed_craze::lane_error(&e);
             let want = match e.data_code.as_deref().unwrap() {
-                "bad_request" => matches!(mapped, LaneError::BadRequest(_)),
+                // `stale_turn`: WIRE/37's cancel bound to a turn that is
+                // no longer current.
+                "bad_request" | "stale_turn" => matches!(mapped, LaneError::BadRequest(_)),
                 "unknown_session" => mapped == LaneError::UnknownSession,
                 "already_resolved" => mapped == LaneError::AlreadyResolved,
                 "not_accepting" => mapped == LaneError::NotAccepting,

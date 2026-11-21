@@ -832,7 +832,7 @@ pub struct SessionInfo {
     pub started_at: Option<String>,
 }
 
-/// `{name, label}`: the provider id (`cursor`, `grok`, `gx`, `native`) and the
+/// `{name, label}`: the provider id (`cursor`, `grok`, `claude`, `native`) and the
 /// label a client shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ProviderInfo {

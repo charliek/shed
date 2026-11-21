@@ -271,8 +271,9 @@ async fn slow_consumer_resubscribes_on_the_same_connection() {
 }
 
 /// What a create can start, from the real hub — craze's recipe's answer
-/// exactly: cursor unavailable (not found), grok ready, native needs setup,
-/// grok the default — through the direct dial and through the jailed ladder
+/// exactly: cursor unavailable (not found), grok ready, claude unavailable
+/// (craze 0.4.0's fourth provider, its adapter not found), native needs
+/// setup, grok the default — through the direct dial and through the jailed ladder
 /// alike. And the find-only probe: dormant before any hub, a hub after.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_options_and_the_probe_from_the_real_hub() {
@@ -298,6 +299,7 @@ async fn create_options_and_the_probe_from_the_real_hub() {
         [
             ("cursor", LaneProviderState::Unavailable),
             ("grok", LaneProviderState::Ready),
+            ("claude", LaneProviderState::Unavailable),
             ("native", LaneProviderState::NeedsSetup)
         ]
     );
@@ -316,7 +318,7 @@ async fn create_options_and_the_probe_from_the_real_hub() {
         )
     );
     assert_eq!(
-        options.providers[2].reason.as_deref(),
+        options.providers[3].reason.as_deref(),
         Some("no model provider has a key")
     );
     assert_eq!(options.default_provider.as_deref(), Some("grok"));

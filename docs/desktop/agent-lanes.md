@@ -26,7 +26,7 @@ agent's wire into the contract. Two adapters implement both levels:
 
 | Adapter | Crate | What it talks to | Which rows |
 |---|---|---|---|
-| **craze** | `crates/shed-craze` | One machine's [craze](https://github.com/charliek/craze) **hub**, which fronts every cursor, grok, gx and native session on that machine | Every craze session the hub lists; the desktop runs one craze source per host |
+| **craze** | `crates/shed-craze` | One machine's [craze](https://github.com/charliek/craze) **hub**, which fronts every cursor, grok, claude and native session on that machine | Every craze session the hub lists; the desktop runs one craze source per host |
 | **opencode** | `crates/shed-opencode` | The local HTTP server the opencode TUI is already running | An opencode roost tab that reported its server address |
 
 Claude sessions are roost tabs with no lane. Any other agent run directly in a

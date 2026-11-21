@@ -96,14 +96,20 @@ runs:
         go-version-file: craze-src/go.mod
         cache-dependency-path: craze-src/go.sum
 
-    - name: Assert the active Go matches craze-src/go.mod's toolchain
+    - name: Assert the active Go matches the Go version craze-src/go.mod names
       shell: bash
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
+        # A go.mod names its toolchain in a `toolchain` line, or, when it has
+        # none, in its `go` line (craze 0.4.x: `go 1.27.3` alone). setup-go
+        # reads them in the same order.
         toolchain="$(awk '/^toolchain /{print $2; exit}' craze-src/go.mod | sed 's/^go//')"
         if [ -z "${toolchain}" ]; then
-          echo "::error::craze-src/go.mod has no 'toolchain' line to assert against" >&2
+          toolchain="$(awk '/^go /{print $2; exit}' craze-src/go.mod)"
+        fi
+        if ! [[ "${toolchain}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::craze-src/go.mod names no full Go version (a 'toolchain' line, or a 'go' line with a patch version) to assert against" >&2
           exit 1
         fi
         active="$(go version | awk '{print $3}' | sed 's/^go//')"

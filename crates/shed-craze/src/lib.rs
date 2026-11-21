@@ -1,7 +1,7 @@
 //! **shed-craze** — the craze adapter for the agent-lane contract (plan 025,
 //! D2/D3/D10).
 //!
-//! craze is the provider abstraction (D2): cursor, grok, gx and native
+//! craze is the provider abstraction (D2): cursor, grok, claude and native
 //! sessions all live behind one per-machine **hub**, which lists every session
 //! (its roster), says what a create can start, starts one, and splices a
 //! client through to a session's host. `shed_core::lane` splits an agent into a

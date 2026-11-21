@@ -82,7 +82,7 @@ const AGENT_COLOR: Record<string, string> = {
   "claude-rc": "var(--shed-accent)",
   "claude-code": "var(--shed-accent)",
   opencode: "#3B82F6",
-  // craze — the provider abstraction (plan 025): cursor, grok, gx and native
+  // craze — the provider abstraction (plan 025): cursor, grok, claude and native
   // sessions behind one machine-level hub.
   craze: "#8B5CF6",
   shell: "var(--shed-text-muted)",

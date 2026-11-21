@@ -241,7 +241,7 @@ See the roost project's own docs for the daemon and its IPC contract.
 
 Each host — this machine, every configured machine, every running shed — has a **craze
 source**: its craze hub's live session list (craze is the provider abstraction for cursor,
-grok, gx and native sessions). Its rows ride `rc.list` beside roost's, stamped
+grok, claude and native sessions). Its rows ride `rc.list` beside roost's, stamped
 `source: "craze"`, `kind: "craze"`, with `slug` = the session's **hostId**, the hub's own
 facts (`provider`, `model`, `doing`, `head_ask_summary`, `last_reply`, `attached`,
 `start_error`, `pending_approvals` — a count here — `permission_mode`,
