@@ -19,7 +19,7 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
-## Unreleased
+## v0.10.0 — 2026-11-20
 
 **Ships:** server, desktop
 
