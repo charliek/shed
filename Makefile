@@ -1297,7 +1297,8 @@ check-kernel-pin:
 # check-roost-pin: the roost-session version + protocol baked into both
 # rootfs Dockerfiles (ARG ROOST_SESSION_VERSION / ROOST_SESSION_PROTOCOL)
 # must match the Rust source of truth: RELEASE_PIN's version and
-# LATEST_KNOWN_RELEASE's protocol in crates/shed-core/src/roost/bootstrap/source.rs.
+# RELEASE_PIN_PROTOCOL in crates/shed-core/src/roost/bootstrap/source.rs
+# (not LATEST_KNOWN_RELEASE, which may name a newer roost this shed cannot speak).
 # It also holds both Dockerfiles' ROOST_SESSION_SHA256_{AMD64,ARM64} ARGs in
 # lockstep with each other — it cannot verify the digests offline (that is
 # what each image build's sha256sum -c does), but it stops the two files
@@ -1317,7 +1318,7 @@ check-roost-pin: check-gce-pins
 	 vz_arm64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_ARM64=/ { print $$2; exit }' vz/Dockerfile) ; \
 	 fc_arm64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_ARM64=/ { print $$2; exit }' firecracker/Dockerfile) ; \
 	 pin_v=$$(sed -n 's/^pub const RELEASE_PIN: .*RoostRelease { version: "\([0-9.][0-9.]*\)".*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
-	 known_p=$$(sed -n 's/^pub const LATEST_KNOWN_RELEASE: .*= ("[0-9.]*", \([0-9][0-9]*\)).*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
+	 known_p=$$(sed -n 's/^pub const RELEASE_PIN_PROTOCOL: u32 = \([0-9][0-9]*\);.*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
 	 if [ -z "$$vz_v" ] || [ -z "$$fc_v" ] || [ -z "$$vz_p" ] || [ -z "$$fc_p" ] || [ -z "$$pin_v" ] || [ -z "$$known_p" ] || \
 	    [ -z "$$vz_amd64" ] || [ -z "$$fc_amd64" ] || [ -z "$$vz_arm64" ] || [ -z "$$fc_arm64" ]; then \
 	   echo "ERROR: roost-session pin values missing:" ; \
@@ -1330,7 +1331,7 @@ check-roost-pin: check-gce-pins
 	   echo "  vz/Dockerfile ARG ROOST_SESSION_SHA256_ARM64:      $$vz_arm64" ; \
 	   echo "  firecracker/Dockerfile ARG ROOST_SESSION_SHA256_ARM64: $$fc_arm64" ; \
 	   echo "  RELEASE_PIN version:                               $$pin_v" ; \
-	   echo "  LATEST_KNOWN_RELEASE protocol:                     $$known_p" ; \
+	   echo "  RELEASE_PIN_PROTOCOL:                              $$known_p" ; \
 	   exit 1 ; \
 	 fi ; \
 	 if [ "$$vz_v" != "$$fc_v" ] || [ "$$vz_v" != "$$pin_v" ] || [ "$$vz_p" != "$$fc_p" ] || [ "$$vz_p" != "$$known_p" ]; then \
@@ -1338,7 +1339,7 @@ check-roost-pin: check-gce-pins
 	   echo "  vz/Dockerfile:          version=$$vz_v protocol=$$vz_p" ; \
 	   echo "  firecracker/Dockerfile: version=$$fc_v protocol=$$fc_p" ; \
 	   echo "  crates/shed-core RELEASE_PIN version:            $$pin_v" ; \
-	   echo "  crates/shed-core LATEST_KNOWN_RELEASE protocol:  $$known_p" ; \
+	   echo "  crates/shed-core RELEASE_PIN_PROTOCOL:           $$known_p" ; \
 	   echo "Bump in lockstep (see docs/reference/images.md)." ; \
 	   exit 1 ; \
 	 fi ; \

@@ -1367,7 +1367,7 @@ def test_without_a_source_there_is_no_button(rig):
     environment: no `ROOST_SESSION_INSTALL_BIN`, no current-generation roost
     beside this app — **and** an asset base the fetch refuses, which is what
     takes rung 3 away. Since plan 023 flipped `RELEASE_PIN` to roost 0.0.20
-    (plan 024 moved it to 0.0.21) the release rung answers for every
+    (plan 024 moved it to 0.0.21; it is 0.0.26 now) the release rung answers for every
     architecture roost builds for, so this row is
     no longer where a cold target lands by itself; it is still a real row (a
     misconfigured `ROOST_SESSION_ASSET_BASE`, an architecture with no build), and
@@ -1414,7 +1414,7 @@ def test_without_a_source_there_is_no_button(rig):
                 "usable https:// URL" in why for why in preview["source"]["skipped"]
             ), preview["source"]["skipped"]
             sentence = preview["source"]["sentence"]
-            assert "the roost 0.0.21 release asset is not usable for " in sentence
+            assert "the roost 0.0.26 release asset is not usable for " in sentence
             assert "ROOST_SESSION_ASSET_BASE names a base shed refuses" in sentence
             assert "ROOST_SESSION_INSTALL_BIN" in sentence
             assert f"{target} was left untouched." in sentence
@@ -1429,7 +1429,7 @@ def test_without_a_source_there_is_no_button(rig):
             assert answer["ok"] is False
             assert answer["error"]["stage"] == "source"
             message = answer["error"]["message"]
-            assert "the roost 0.0.21 release asset is not usable for " in message
+            assert "the roost 0.0.26 release asset is not usable for " in message
             assert not rig.installed(target_name).exists()
     finally:
         private_mock.stop()
@@ -1447,9 +1447,11 @@ def _real_session_binary() -> Path | None:
     `real_roost` cell uses; a build cache beside the pinned rev is the default
     because that is where a current-generation binary built from the exact
     pinned rev lives (a clean `git archive` of it, per the plan-014 recipe;
-    roost v0.0.21 is that rev). The default path carries the
+    roost v0.0.21 is that `roost-ipc` rev). The default path carries the
     PINNED rev, so a re-pin that nobody has built for skips this cell rather than
-    quietly testing the previous generation's binary. **Read-only — never
+    quietly testing the previous generation's binary. The release asset
+    `RELEASE_PIN` names (roost 0.0.26, the same generation) is the other binary
+    worth pointing the knob at. **Read-only — never
     rebuilt here**: roost's tree is not this repo's to compile.
     """
     raw = os.environ.get("SHED_TAURI_ROOST_SESSION_BIN") or str(
@@ -1742,7 +1744,7 @@ def test_a_blocked_install_shows_the_pinned_no_source_sentence_and_no_button(rig
             # verbatim — a substring match would pass even if the renderer
             # appended or reworded anything around it.
             assert row["status"] == (
-                f"the roost 0.0.21 release asset is not usable for {target}: either "
+                f"the roost 0.0.26 release asset is not usable for {target}: either "
                 "ROOST_SESSION_ASSET_BASE names a base shed refuses, or roost "
                 "publishes no roost-session build for this architecture. On a Linux "
                 f"machine with a protocol-{SESSION_PROTOCOL} roost installed the "

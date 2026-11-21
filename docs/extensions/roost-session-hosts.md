@@ -41,8 +41,11 @@ decided in order, and the first rung that can answer wins:
 
 ### The release rung is fixed, as of 0.9.0
 
-**`RELEASE_PIN` is `0.0.21`** — roost v0.0.20 is the first published release that speaks
-session protocol 6, and shed 0.9.0 pins v0.0.21, roost's bug-fix release after it. Before
+**`RELEASE_PIN` is `0.0.26`** — roost v0.0.20 is the first published release that speaks
+session protocol 6, shed 0.9.0 pinned v0.0.21, and shed now pins v0.0.26, the last roost
+release that speaks protocol 6. roost v0.0.27 moved the session protocol to 7, and v0.1.0, the
+newest roost release, speaks 7 as well; this shed does not speak 7 yet, so it neither installs
+those releases nor talks to a session running one (see "Compatibility" below). Before
 v0.0.20 the pin was `None`, because there was no release to point it at honestly; the flip was
 the one-line change it was designed to be (it sits beside the version/protocol pair below). A fresh Linux target on an architecture roost
 publishes a build for now gets a `roost-session` from the release asset, with no override
@@ -56,7 +59,7 @@ The client still has a sentence for "every rung failed", and it is **pin-aware**
 the reason that actually applies rather than repeating the pre-0.9.0 one. What you see today,
 when something has taken the release rung away:
 
-> the roost 0.0.21 release asset is not usable for `<target>`: either
+> the roost 0.0.26 release asset is not usable for `<target>`: either
 > `ROOST_SESSION_ASSET_BASE` names a base shed refuses, or roost publishes no roost-session
 > build for this architecture. On a Linux machine with a protocol-6 roost installed the desktop
 > uses that roost-session; otherwise point `ROOST_SESSION_INSTALL_BIN` at a protocol-6 build.
@@ -105,6 +108,15 @@ refuses that session by name, naming both protocol numbers in the report and tel
 side to upgrade — the same mismatch report any other protocol disagreement gets. It never stops
 or restarts the running session to do this (pin P6, above); the report is the only action
 taken.
+
+**The protocol-7 case: roost 0.0.27 and later.** roost v0.0.27 moved the session protocol to 7,
+and v0.1.0 kept it. This shed speaks 6, so a host running one of those sessions lands on the
+same "any other protocol" row: a report naming both numbers, and nothing stopped. A protocol-7
+`roost-session` binary on a host with nothing running is a mismatch, so the card offers
+**Update**, and its status says the host's build speaks a newer protocol and that replacing it
+is a downgrade to the pinned 0.0.26. A host still running an older protocol-6 build (0.0.20 to
+0.0.25, such as the 0.0.21 that earlier sheds baked) is compatible and is left as it is; shed
+only installs 0.0.26 where it installs anything.
 
 ## The rollback promise, stated exactly as narrow as it is
 

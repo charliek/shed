@@ -311,10 +311,10 @@ RUN --mount=type=bind,source=.,target=/ctx \
 # IN-TREE, not fetched: a .sha256 from the same mutable release proves transport, not
 # provenance. These ARGs are NOT forwarded by scripts/build-*-rootfs.sh; they exist so
 # the values are named here and overridable by --build-arg on a manual build.
-ARG ROOST_SESSION_VERSION=0.0.21
+ARG ROOST_SESSION_VERSION=0.0.26
 ARG ROOST_SESSION_PROTOCOL=6
-ARG ROOST_SESSION_SHA256_AMD64=cbf9ae38d9f613cff88b951a7a895cf2241a831476a42fcf9844488331a6e435
-ARG ROOST_SESSION_SHA256_ARM64=dca26f903c5815020e27f8cc87df1ec806ffe943637c08c5324c51a714238d2b
+ARG ROOST_SESSION_SHA256_AMD64=6fa0b42a0b1df18954401eb0fc3d7a7a770a11da8f2766e8300b9cb644c25fe6
+ARG ROOST_SESSION_SHA256_ARM64=8340a4473f5699a5ab6ddc727b6be94361a336627175d17156a97c1608a224f7
 
 # craze (the agent-lane CLI the desktop and phone drive; the desktop's create sheet
 # starts a remote hub) is baked the same way —
