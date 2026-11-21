@@ -16,4 +16,4 @@
 {"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"8","method":"session.create","params":{"cwd":"/","provider":"cursor","requestId":"fixture-32-b","title":""}},"invalid":true}
 {"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"8","error":{"code":-32602,"message":"params.title must not be empty","data":{"code":"bad_request","reason":"bad_request"}}}}
 {"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"9","method":"session.create","params":{"cwd":"/","provider":"cursor","model":"start-fails","requestId":"fixture-32-c","title":"Never started"}}}
-{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"9","error":{"code":-32000,"message":"the session did not start: the agent could not start: no such binary","data":{"code":"not_accepting","reason":"start_failed","cause":"the agent could not start: no such binary"}}}}
+{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"9","error":{"code":-32000,"message":"the session did not start: the agent could not start: no such binary","data":{"code":"not_accepting","reason":"start_failed","cause":"the agent could not start: no such binary","kind":"start_failed"}}}}

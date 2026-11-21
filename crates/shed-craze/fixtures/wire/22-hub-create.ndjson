@@ -8,4 +8,4 @@
 {"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"4","method":"session.create","params":{"cwd":"/","provider":"cursor","requestId":"fixture-22-a"}}}
 {"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"4","error":{"code":-32000,"message":"requestId fixture-22-a was used already for a create with other params","data":{"code":"bad_request","reason":"request_conflict"}}}}
 {"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"5","method":"session.create","params":{"cwd":"/","provider":"cursor","model":"start-fails","requestId":"fixture-22-b"}}}
-{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"5","error":{"code":-32000,"message":"the session did not start: the agent could not start: no such binary","data":{"code":"not_accepting","reason":"start_failed","cause":"the agent could not start: no such binary"}}}}
+{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"5","error":{"code":-32000,"message":"the session did not start: the agent could not start: no such binary","data":{"code":"not_accepting","reason":"start_failed","cause":"the agent could not start: no such binary","kind":"start_failed"}}}}

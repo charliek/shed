@@ -4,7 +4,7 @@
 //! current.
 //!
 //! craze is the provider abstraction (D2): one per-machine hub lists every
-//! cursor, grok, gx and native session there. [`crate::roost_hosts::RoostHosts`]
+//! cursor, grok, claude and native session there. [`crate::roost_hosts::RoostHosts`]
 //! holds one [`CrazeState`] per host, under the same lock as that host's roost
 //! rows, and runs one [`run`] task per host that feeds it. This module is that
 //! task, the state, and the two dials.

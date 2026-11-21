@@ -19,6 +19,13 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
+## Unreleased
+
+- **Images: the `extensions` and `full` images bake craze 0.4.1** (0.10.1 baked 0.2.0). In a
+  shed built from them, the desktop's create sheet lists craze's `claude` provider, which
+  craze 0.4.0 added, and no longer lists `gx`, which it removed. A shed keeps the craze its
+  image baked; recreate it to pick up the new one.
+
 ## v0.10.1 — 2026-11-20
 
 **Ships:** server, desktop
