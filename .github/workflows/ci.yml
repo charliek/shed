@@ -177,6 +177,9 @@ jobs:
               - 'Makefile'
               - 'desktop/Makefile'
               - 'craze-pin.env'
+              # .mise.toml holds the linter and goreleaser pins that
+              # check-tool-pins holds equal to this file's and the release's.
+              - '.mise.toml'
 
   test:
     needs: changes
@@ -267,6 +270,10 @@ jobs:
         # Both depend on check-gce-pins: the GCE image bake reads its pins
         # from firecracker/Dockerfile and gce/ may hold none of its own.
         run: make check-roost-pin check-craze-pin
+      - name: check-tool-pins (the linter and goreleaser, same in CI and the release)
+        # The release job pins its own golangci-lint and goreleaser. v0.10.0's
+        # release stopped at its lint step because that pin was older than CI's.
+        run: make check-tool-pins
       - name: GCE image tooling (offline)
         # bash -n + shellcheck on gce/ and the bake driver, the --print
         # golden, and gce/shed-identity.sh against a fake metadata server.
