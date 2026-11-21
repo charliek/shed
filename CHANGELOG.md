@@ -19,11 +19,16 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
-## v0.10.0 — 2026-11-20
+## Unreleased
 
 **Ships:** server, desktop
 
-v0.10.0 lets a server take its users from a remote account service as well as from its
+v0.10.1 is the first release of the 0.10 line. v0.10.0 was tagged, but its release job
+stopped at a lint step before it built any server or desktop artifact (see the v0.10.0 entry
+below). The two are the same code: everything this entry and the upgrade guide say of 0.10.0
+is true of 0.10.1, and 0.10.1 is the version you install.
+
+The 0.10 line lets a server take its users from a remote account service as well as from its
 config, runs sheds as cloud VMs as well as on the server host, and retires the separate
 credential daemon: the desktop app is the only credential broker. It also brings the work of
 the unreleased 0.9.1:
@@ -1072,6 +1077,18 @@ reachable from other hosts runs `mtls`.
   it reach `api.github.com` and start it again, or give it a key that does not come from
   GitHub: with `auth.users` a key under that user's `keys`, without one
   `auth.ssh.authorized_keys`). Allow `api.github.com` before upgrading, or add such a key.
+
+## v0.10.0 — 2026-11-20
+
+Tagged, not released. The release job lints with its own pinned golangci-lint, which was
+older than CI's and could not read the module's Go version, so the job stopped before it
+built anything. Only the tag's images were published (`shed-build-tools:v0.10.0` and the VZ
+and Firecracker rootfs images); there is no GitHub release, formula, deb or desktop app for
+it. v0.10.1 is the same code with the release job's pin corrected: install that.
+
+- The release job's golangci-lint pin now equals CI's, and `make check-tool-pins` (run by
+  `make check` and CI's pins job) keeps the linter and goreleaser pins equal in `.mise.toml`,
+  `ci.yml` and `publish-images.yaml`.
 
 ## v0.9.0 — 2026-10-10
 

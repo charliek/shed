@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory check-directory-itest-host test-broker-wire test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot directory-ref build-tools build-fc-remote-server test test-integration test-integration-units test-integration-directory check-directory-itest-host test-broker-wire test-integration-dev test-integration-dev-fc check-dev-settings check-no-dev-auth-mode check-dev-users check-dev-config check-dev-config-fc check-remote-dev-config dev-itest-users check-remote-dev-settings dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc dev-server-up-remote dev-server-down-remote dev-server-status-remote dev-server-logs-remote dev-server-restart-remote test-integration-remote test-netns-remote release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-tool-pins check-craze-pin check-gce-pins gce-image test-gce-image craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -1537,7 +1537,13 @@ check-craze-pin: check-gce-pins
 	 fi
 
 # Run all checks (lint + test + kernel pin)
-check: check-kernel-pin check-roost-pin check-craze-pin lint test
+# check-tool-pins: golangci-lint and goreleaser are pinned in .mise.toml, ci.yml
+# and publish-images.yaml; the release job runs its own copies on a tag, so a
+# pin that moved in CI alone stops a release after the tag exists.
+check-tool-pins:
+	@scripts/release/check-tool-pins.sh
+
+check: check-kernel-pin check-roost-pin check-craze-pin check-tool-pins lint test
 
 # Run tests with coverage
 coverage:
