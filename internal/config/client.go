@@ -26,20 +26,15 @@ type ClientConfig struct {
 	Sheds         map[string]ShedCache   `yaml:"sheds"`
 	CreateTimeout time.Duration          `yaml:"create_timeout,omitempty"`
 
-	// Machines carries the `machines:` section — remote-machine targets for
-	// rc-session kickoff. The SCHEMA is Rust-owned (shed-core's config
-	// parser, crates/shed-core/src/config.rs's MachineEntry); Go reads a
-	// tolerant SUBSET of it (DecodeMachines, internal/config/machines.go —
-	// name/host/user/ssh_port/known_hosts, deliberately not rc_bin, plan 019
-	// pin P7) for the `shed roost-provider` menu, but never writes or
-	// validates it. Keeping the field itself typed as the raw yaml.Node,
-	// rather than replacing it with the decoded struct, is what makes
-	// SaveToPath's whole-document rewrite RETAIN the whole subtree — every
-	// field Go's subset doesn't model (rc_bin and anything the Rust schema
-	// gains later), plus head/line comments and each scalar's flow-vs-block
-	// and quoting style — instead of silently dropping it on the next `shed`
-	// command that updates this file (cache refresh, `shed server add`, token
-	// mint…).
+	// Machines is a legacy `machines:` section already present in
+	// ~/.shed/config.yaml. shed no longer reads or models it: there is no
+	// decoder, and nothing in the CLI (including `shed roost-provider`)
+	// builds a menu row or an SSH target from it. The field stays a raw
+	// yaml.Node so SaveToPath's whole-document rewrite RETAINS the subtree a
+	// user already has — every key, plus head/line comments and each
+	// scalar's flow-vs-block and quoting style — instead of silently
+	// deleting it on the next `shed` command that updates this file (cache
+	// refresh, `shed server add`, token mint…).
 	//
 	// **Retained, not byte-preserved**, and the difference is worth stating
 	// because the weaker claim is the true one: SaveToPath ends in

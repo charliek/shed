@@ -147,9 +147,9 @@ func newRig(t *testing.T, opts rigOpts) *rig {
 	return r
 }
 
-// target is the rig's far side. A machine entry, because that is the shape
-// with the fewest ssh options in the way; the shed shape is asserted purely in
-// Argv's own tests.
+// target is the rig's far side: a destination and a port, without the
+// shed-only ssh options (a non-default port, known_hosts). Those are asserted
+// in Argv's own tests; this rig only needs a host the fake ssh will accept.
 func (r *rig) target() Target {
 	return Target{Dest: "fake-host", Port: 22}
 }

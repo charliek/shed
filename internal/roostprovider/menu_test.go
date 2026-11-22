@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"slices"
 	"testing"
-
-	"github.com/charliek/shed/internal/config"
 )
 
 // rowTitles is a menu's row titles in order.
@@ -38,7 +36,7 @@ func TestListMenuSheds(t *testing.T) {
 		Tried:    []string{"my-server"},
 		Answered: []string{"my-server"},
 	}
-	m := ListMenu(inv, nil)
+	m := ListMenu(inv)
 
 	if m.Placeholder != "Start an agent on…" {
 		t.Errorf("placeholder = %q", m.Placeholder)
@@ -65,51 +63,6 @@ func TestListMenuSheds(t *testing.T) {
 	}
 }
 
-func TestListMenuMachines(t *testing.T) {
-	machines := []config.MachineEntry{
-		{Name: "plain", Host: "plain", SSHPort: 22},
-		{Name: "full", Host: "mini2.local", User: "charliek", SSHPort: 2222},
-		{Name: "porty", Host: "box", SSHPort: 2200},
-		{Name: "usery", Host: "box2", User: "root", SSHPort: 22},
-	}
-	m := ListMenu(ShedInventory{}, machines)
-
-	// `[user@]host[:port]` — each optional half omitted exactly where
-	// shed-core's own ssh argv omits it, so the subtitle describes the
-	// connection that will really be made rather than a normalized one.
-	for _, tc := range []struct{ title, subtitle string }{
-		{"machine: plain", "plain"},
-		{"machine: full", "charliek@mini2.local:2222"},
-		{"machine: porty", "box:2200"},
-		{"machine: usery", "root@box2"},
-	} {
-		if got := rowByTitle(t, m, tc.title).Subtitle; got != tc.subtitle {
-			t.Errorf("%s subtitle = %q, want %q", tc.title, got, tc.subtitle)
-		}
-	}
-
-	tok, err := ParseToken(rowByTitle(t, m, "machine: full").ID)
-	if err != nil {
-		t.Fatalf("machine row id does not parse: %v", err)
-	}
-	if tok != (Token{Machine: "full"}) {
-		t.Errorf("machine row token = %+v", tok)
-	}
-}
-
-func TestListMenuShedsComeBeforeMachines(t *testing.T) {
-	m := ListMenu(
-		ShedInventory{Sheds: []RunningShed{{Name: "dev", Server: "srv"}}, Tried: []string{"srv"}, Answered: []string{"srv"}},
-		[]config.MachineEntry{{Name: "mini2", Host: "mini2", SSHPort: 22}},
-	)
-	if len(m.Items) != 2 {
-		t.Fatalf("want 2 rows, got %+v", m.Items)
-	}
-	if m.Items[0].Title != "shed: dev" || m.Items[1].Title != "machine: mini2" {
-		t.Errorf("order = %q, %q", m.Items[0].Title, m.Items[1].Title)
-	}
-}
-
 // TestListMenuEmptyRows pins both of §3.2's empty-menu rows, including the
 // distinction between them: an unreachable fleet is a different problem from an
 // idle one, and telling a user with a dead VPN that they have no sheds would be
@@ -130,37 +83,24 @@ func TestListMenuEmptyRows(t *testing.T) {
 		{
 			name:     "a server answered with nothing running",
 			inv:      ShedInventory{Tried: []string{"my-server"}, Answered: []string{"my-server"}},
-			title:    "No running sheds or machines",
-			subtitle: "shed start <name>, or add a machines: entry to ~/.shed/config.yaml",
+			title:    "No running sheds",
+			subtitle: "shed start <name>",
 		},
 		{
 			name:     "no servers configured at all",
 			inv:      ShedInventory{},
-			title:    "No running sheds or machines",
-			subtitle: "shed start <name>, or add a machines: entry to ~/.shed/config.yaml",
+			title:    "No running sheds",
+			subtitle: "shed start <name>",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			m := ListMenu(tc.inv, nil)
+			m := ListMenu(tc.inv)
 			if len(m.Items) != 1 {
 				t.Fatalf("want exactly one row, got %+v", m.Items)
 			}
 			assertNoneRow(t, m.Items[0], tc.title, tc.subtitle)
 		})
-	}
-}
-
-// TestListMenuUnreachableFleetStillListsMachines: the "no shed-server answered"
-// row is an EMPTY-menu row. A `machines:` entry needs no server, so it still
-// fills the menu and the row must not appear.
-func TestListMenuUnreachableFleetStillListsMachines(t *testing.T) {
-	m := ListMenu(
-		ShedInventory{Tried: []string{"my-server"}},
-		[]config.MachineEntry{{Name: "mini2", Host: "mini2", SSHPort: 22}},
-	)
-	if len(m.Items) != 1 || m.Items[0].Title != "machine: mini2" {
-		t.Fatalf("want just the machine row, got %+v", m.Items)
 	}
 }
 
@@ -216,7 +156,6 @@ func assertSeq[T comparable](t *testing.T, what string, got, want []T) {
 // deliberate change, not a refactor.
 func TestPinnedNonActionableRows(t *testing.T) {
 	shed := Token{Shed: "dev", Server: "my-server"}
-	machine := Token{Machine: "mini2"}
 
 	t.Run("not installed", func(t *testing.T) {
 		assertNoneRow(t, NotInstalledRow(shed),
@@ -224,18 +163,18 @@ func TestPinnedNonActionableRows(t *testing.T) {
 			"connect from the shed desktop or mobile app to install it")
 	})
 	t.Run("not running", func(t *testing.T) {
-		assertNoneRow(t, NotRunningRow(machine),
-			"roost-session is not running on mini2",
+		assertNoneRow(t, NotRunningRow(shed),
+			"roost-session is not running on my-server/dev",
 			"connect from the shed app to start it, or run roost-session start there")
 	})
 	t.Run("protocol mismatch", func(t *testing.T) {
-		assertNoneRow(t, ProtocolMismatchRow(machine, 2),
-			fmt.Sprintf("roost-session on mini2 speaks protocol 2; this shed speaks %d", SpokenProtocol),
+		assertNoneRow(t, ProtocolMismatchRow(shed, 2),
+			fmt.Sprintf("roost-session on my-server/dev speaks protocol 2; this shed speaks %d", SpokenProtocol),
 			"upgrade whichever is older")
 	})
 	t.Run("unreachable", func(t *testing.T) {
-		assertNoneRow(t, UnreachableRow(machine, "ssh: connect to host mini2 port 22: Connection refused"),
-			"mini2 is unreachable",
+		assertNoneRow(t, UnreachableRow(shed, "ssh: connect to host mini2 port 22: Connection refused"),
+			"my-server/dev is unreachable",
 			"ssh: connect to host mini2 port 22: Connection refused")
 	})
 	t.Run("no local ssh", func(t *testing.T) {
@@ -280,18 +219,18 @@ func TestAgentMenuRowsPerFoundAgent(t *testing.T) {
 }
 
 func TestAgentMenuWithNothingFound(t *testing.T) {
-	m := AgentMenu(Token{Machine: "mini2"}, Probe{Home: "/root", Found: map[string]string{}})
+	m := AgentMenu(Token{Shed: "dev", Server: "srv"}, Probe{Home: "/root", Found: map[string]string{}})
 	if len(m.Items) != 1 {
 		t.Fatalf("want one row, got %+v", m.Items)
 	}
-	assertNoneRow(t, m.Items[0], "no agents found on mini2",
+	assertNoneRow(t, m.Items[0], "no agents found on srv/dev",
 		"looked for claude, opencode under bash -lc")
 }
 
 // TestAgentMenuHomeWithSpacesSurvivesTheRowId is the shape that breaks a naive
 // id: the probed $HOME travels in the token so step 3 need not re-probe.
 func TestAgentMenuHomeWithSpacesSurvivesTheRowId(t *testing.T) {
-	m := AgentMenu(Token{Machine: "laptop"}, Probe{
+	m := AgentMenu(Token{Shed: "box", Server: "laptop"}, Probe{
 		Home:  "/Users/First Last",
 		Found: map[string]string{"claude-rc": "/Users/First Last/.local/bin/claude"},
 	})
@@ -313,19 +252,20 @@ func TestMenuSerializesInRoostsSchema(t *testing.T) {
 	m := Menu{
 		Placeholder: "Start an agent on…",
 		Items: []Row{
-			{ID: "machine=mini2", Title: "machine: mini2", Subtitle: "mini2"},
+			{ID: "server=srv&shed=dev", Title: "shed: dev", Subtitle: "srv"},
 			NoneRow("nope", "not this time"),
-			{ID: "machine=bare", Title: "machine: bare"},
+			{ID: "shed=bare", Title: "shed: bare"},
 		},
 	}
 	data, err := json.Marshal(m)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
+	// encoding/json escapes '&' so a row id stays one JSON string.
 	want := `{"placeholder":"Start an agent on…","items":[` +
-		`{"id":"machine=mini2","title":"machine: mini2","subtitle":"mini2"},` +
+		`{"id":"server=srv\u0026shed=dev","title":"shed: dev","subtitle":"srv"},` +
 		`{"id":"_none","title":"nope","subtitle":"not this time","actionable":false},` +
-		`{"id":"machine=bare","title":"machine: bare"}]}`
+		`{"id":"shed=bare","title":"shed: bare"}]}`
 	if string(data) != want {
 		t.Errorf("menu JSON:\n got %s\nwant %s", data, want)
 	}

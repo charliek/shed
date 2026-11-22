@@ -3,8 +3,6 @@ package roostprovider
 import (
 	"errors"
 	"fmt"
-
-	"github.com/charliek/shed/internal/config"
 )
 
 // Row is one palette row, in roost's provider-output schema
@@ -49,26 +47,19 @@ func NoneRow(title, subtitle string) Row {
 }
 
 // ListMenu builds the top-level menu (plan 019 §3.2 step 1): every RUNNING shed
-// across the configured servers, then every `machines:` entry.
+// across the configured servers.
 //
 // Stopped sheds are deliberately absent — roost's own convention for a provider
 // list, and the practical reason is stronger: a stopped shed cannot take a tab,
 // and `shed start` is slow work that belongs in a tab rather than inside a
 // five-second `activate`.
-func ListMenu(inv ShedInventory, machines []config.MachineEntry) Menu {
-	items := make([]Row, 0, len(inv.Sheds)+len(machines))
+func ListMenu(inv ShedInventory) Menu {
+	items := make([]Row, 0, len(inv.Sheds))
 	for _, s := range inv.Sheds {
 		items = append(items, Row{
 			ID:       Token{Shed: s.Name, Server: s.Server}.Encode(),
 			Title:    "shed: " + s.Name,
 			Subtitle: s.Server + " · " + landingLabel(s.LandingDir),
-		})
-	}
-	for _, m := range machines {
-		items = append(items, Row{
-			ID:       Token{Machine: m.Name}.Encode(),
-			Title:    "machine: " + m.Name,
-			Subtitle: machineDest(m),
 		})
 	}
 	if len(items) == 0 {
@@ -87,10 +78,7 @@ func emptyListRow(inv ShedInventory) Row {
 	if len(inv.Tried) > 0 && len(inv.Answered) == 0 {
 		return NoneRow("no shed-server answered", joinNames(inv.Tried))
 	}
-	return NoneRow(
-		"No running sheds or machines",
-		"shed start <name>, or add a machines: entry to ~/.shed/config.yaml",
-	)
+	return NoneRow("No running sheds", "shed start <name>")
 }
 
 // landingLabel renders a shed's landing dir for its list-row subtitle. An older
@@ -101,19 +89,6 @@ func landingLabel(dir string) string {
 		return "~"
 	}
 	return dir
-}
-
-// machineDest renders a `machines:` entry as `[user@]host[:port]` for its
-// list-row subtitle.
-//
-// Built from the Target that will actually be dialled rather than from the
-// entry, so the claim "this subtitle describes the connection that will really
-// be made" is structural. Composing `[user@]host` and the "no `:port` on 22"
-// rule a second time here would be the same rule in two files, agreeing only
-// as long as nobody edited one of them — and the list subtitle is precisely
-// where a user would look to diagnose a wrong dial.
-func machineDest(m config.MachineEntry) string {
-	return MachineTarget(m).Label()
 }
 
 // AgentMenu builds step 2's menu: one row per agent the probe actually found on

@@ -36,17 +36,17 @@ func TestProbeScriptCarriesNoSingleQuoteOrNewline(t *testing.T) {
 }
 
 func TestProbeCommandShape(t *testing.T) {
-	t.Run("a machine passes no positional argument", func(t *testing.T) {
+	t.Run("no landing dir passes no positional argument", func(t *testing.T) {
 		got := ProbeCommand("")
 		want := "bash -lc " + shellQuote(ProbeScript())
 		if got != want {
 			t.Errorf("ProbeCommand(\"\") = %q", got)
 		}
-		// One single quote at each end and nowhere else: a machine's login
+		// One single quote at each end and nowhere else: the far side's login
 		// shell may be fish or csh, and this is what keeps the command
 		// parseable there.
 		if strings.Count(got, "'") != 2 {
-			t.Errorf("a machine's probe command carries %d single quotes, want 2", strings.Count(got, "'"))
+			t.Errorf("a probe with no landing dir carries %d single quotes, want 2", strings.Count(got, "'"))
 		}
 	})
 	t.Run("a shed passes its landing dir as $1", func(t *testing.T) {

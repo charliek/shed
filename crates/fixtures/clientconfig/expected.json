@@ -1,7 +1,7 @@
 {
   "_comment": [
     "Written by internal/config/clientconfig_fixture_test.go (UPDATE_CLIENTCONFIG=1 go test ./internal/config -run TestClientConfigFixture); do not edit by hand.",
-    "config.yaml is what the CLI's save path (config.ClientConfig.Save) writes for these values; servers and machines are what the CLI holds for each entry.",
+    "config.yaml is what the CLI's save path (config.ClientConfig.Save) writes for these values; servers are what the CLI holds for each entry. A machines: section in config.yaml is an opaque passthrough and is not decoded.",
     "Each Rust reader (shed-core's config reader, the broker's discovery) must read every server's host, ssh_port, user and identity_file as recorded here. See README.md."
   ],
   "default_server": "prod:blue",
@@ -82,14 +82,6 @@
       "ssh_port": 22,
       "user": "",
       "identity_file": ""
-    }
-  ],
-  "machines": [
-    {
-      "name": "mini3",
-      "host": "mini3.example.test",
-      "user": "pat",
-      "ssh_port": 2222
     }
   ]
 }

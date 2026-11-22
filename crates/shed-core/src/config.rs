@@ -2097,7 +2097,8 @@ servers:
     /// path, from real structs (`crates/fixtures/clientconfig/`, written and kept fresh by
     /// `internal/config/clientconfig_fixture_test.go`), is read with every server's host,
     /// ssh_port, user and identity_file as the CLI holds them, every entry read (none
-    /// refused), and its machines and default server as the CLI reads them.
+    /// refused), and its default server as the CLI reads it. A legacy `machines:`
+    /// section in the file is ignored here; the CLI's save preserves it opaquely.
     #[test]
     fn the_cli_written_config_is_read_as_the_cli_reads_it() {
         let config = ShedConfig::parse(include_str!("../../fixtures/clientconfig/config.yaml"));

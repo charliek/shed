@@ -6,8 +6,11 @@ import (
 	"strings"
 )
 
-// Row-id token keys (plan 019 §3.2, last bullets). Two host shapes —
-// `shed`+`server`, or `machine` — and then the wizard's accumulated choices.
+// Row-id token keys (plan 019 §3.2, last bullets). One host shape —
+// `shed`+`server` — and then the wizard's accumulated choices.
+//
+// keyMachine is the retired `machines:` host key. It is not a field: ParseToken
+// refuses it so a stale row id fails before any caller dials SSH.
 const (
 	keyShed    = "shed"
 	keyServer  = "server"
@@ -34,8 +37,6 @@ func (t *Token) field(key string) *string {
 		return &t.Shed
 	case keyServer:
 		return &t.Server
-	case keyMachine:
-		return &t.Machine
 	case keyAgent:
 		return &t.Agent
 	case keyHome:
@@ -63,17 +64,15 @@ const NoneID = "_none"
 // activated in turn), so every step has to reconstruct where it is from the id
 // alone. That is the whole reason this type exists.
 //
-// Exactly one host shape is set: Shed+Server, or Machine. The remaining fields
-// accumulate as the wizard descends — Agent and Home at step 2, Cwd (and
-// Project, when the workdir came from a far-side project) at step 3.
+// The host is one running shed: Shed and Server are both set. The remaining
+// fields accumulate as the wizard descends — Agent and Home at step 2, Cwd
+// (and Project, when the workdir came from a far-side project) at step 3.
 type Token struct {
 	// Shed and Server name a running shed: the shed's own name, and the
 	// `servers:` entry name it was found on (the config.yaml map key, which is
 	// commonly not the host).
 	Shed   string
 	Server string
-	// Machine names a `machines:` entry.
-	Machine string
 	// Agent is an RC kind string (Agent.Kind), e.g. `claude-rc`.
 	Agent string
 	// Home is the far side's ABSOLUTE $HOME, as the probe reported it. It
@@ -112,7 +111,6 @@ func (t Token) Encode() string {
 	}
 	set(keyShed, t.Shed)
 	set(keyServer, t.Server)
-	set(keyMachine, t.Machine)
 	set(keyAgent, t.Agent)
 	set(keyHome, t.Home)
 	set(keyCwd, t.Cwd)
@@ -139,6 +137,12 @@ func ParseToken(id string) (Token, error) {
 	}
 	var t Token
 	for key, vals := range values {
+		// A stale `machine=` id is refused here, before any caller has a host
+		// it could dial. The key is judged before its value so `machine=` and
+		// `machine=foo` say the same thing.
+		if key == keyMachine {
+			return Token{}, fmt.Errorf("row id %q names a machine; shed roost-provider starts agents on running sheds only", id)
+		}
 		// The key is judged BEFORE its value, so an id carrying a key this
 		// build does not know says so — rather than reporting whatever
 		// happens to be wrong with its value. `_none` is the case that makes
@@ -162,27 +166,16 @@ func ParseToken(id string) (Token, error) {
 	return t, nil
 }
 
-// validateHost enforces the one invariant every token shape shares: exactly one
-// host, fully named. A `shed=` with no `server=` is not "a shed on the default
-// server" — there is no default, the same shed name can exist on two servers,
-// and guessing would ssh to the wrong machine.
+// validateHost enforces the one invariant every token shares: a shed, fully
+// named. A `shed=` with no `server=` is not "a shed on the default server" —
+// there is no default, the same shed name can exist on two servers, and
+// guessing would ssh to the wrong host.
 func (t Token) validateHost() error {
-	isShed := t.Shed != "" || t.Server != ""
-	switch {
-	case isShed && t.Machine != "":
-		return fmt.Errorf("names both a shed and a machine")
-	case isShed && (t.Shed == "" || t.Server == ""):
+	if t.Shed == "" || t.Server == "" {
 		return fmt.Errorf("a shed needs both %q and %q", keyShed, keyServer)
-	case !isShed && t.Machine == "":
-		return fmt.Errorf("names neither a shed nor a machine")
 	}
 	return nil
 }
-
-// IsShed reports whether this token names a shed (rather than a `machines:`
-// entry). Only meaningful on a token that came through ParseToken or one of the
-// builders — both of which have already enforced validateHost.
-func (t Token) IsShed() bool { return t.Shed != "" }
 
 // Host returns just the host keys, dropping every wizard choice.
 //
@@ -190,24 +183,20 @@ func (t Token) IsShed() bool { return t.Shed != "" }
 // the host token, so the id the user came in on cannot smuggle a stale `cwd=`
 // into the next step.
 func (t Token) Host() Token {
-	return Token{Shed: t.Shed, Server: t.Server, Machine: t.Machine}
+	return Token{Shed: t.Shed, Server: t.Server}
 }
 
 // HostLabel is the human name for this host in the menu's non-actionable copy
 // ("`<host>` is unreachable", "roost-session is not installed on `<host>`", …).
 //
-// `<server>/<shed>` and the bare machine name, NOT plan 019 §0's target grammar
-// (`roost:<server>/<shed>` / `machine:<name>`). The grammar is pinned for
-// machine-readable targets — IPC ops, status rows, capabilities keys, logs —
-// and reads badly in the one sentence it would land in here ("roost-session on
-// roost:srv/dev is not installed"). The two are never confused because nothing
-// in this package emits an id a human reads; §0's grammar has no consumer in
-// the provider.
+// `<server>/<shed>`, NOT plan 019 §0's target grammar (`roost:<server>/<shed>`).
+// The grammar is pinned for machine-readable targets — IPC ops, status rows,
+// capabilities keys, logs — and reads badly in the one sentence it would land
+// in here ("roost-session on roost:srv/dev is not installed"). The two are
+// never confused because nothing in this package emits an id a human reads;
+// §0's grammar has no consumer in the provider.
 func (t Token) HostLabel() string {
-	if t.IsShed() {
-		return t.Server + "/" + t.Shed
-	}
-	return t.Machine
+	return t.Server + "/" + t.Shed
 }
 
 // joinNames renders a name list for a subtitle. Empty renders as "none", not as

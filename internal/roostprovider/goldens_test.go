@@ -11,7 +11,7 @@ import (
 
 // The Go leg of the four shared goldens under crates/fixtures/roost-vectors/
 // (plan 019 §3.2, §3.3; plan 024 §3.4 for wired-agents.json). The Rust leg is
-// crates/shed-core/tests/roost_provider_vectors.rs, which asserts the same files
+// crates/shed-roost/tests/roost_provider_vectors.rs, which asserts the same files
 // against the live `roost-ipc` functions they were derived from. Neither leg is
 // meaningful alone: this one proves Go matches the file, that one proves the
 // file matches roost.
@@ -54,8 +54,8 @@ func TestExecChainCommandMatchesGolden(t *testing.T) {
 // constant has to keep even if somebody edits it: the whole ladder is ONE
 // single-quoted word, because the close-escape-reopen trick — the only POSIX way
 // to embed a quote in
-// a single-quoted word — is not an escape in csh/tcsh/fish, and a `machines:`
-// entry's login shell is entitled to be any of those.
+// a single-quoted word — is not an escape in csh/tcsh/fish, and a far-side
+// login shell is entitled to be any of those.
 func TestExecChainCommandCarriesNoEmbeddedSingleQuote(t *testing.T) {
 	inner, ok := strings.CutPrefix(ExecChainCommand, "sh -c '")
 	if !ok {

@@ -1,6 +1,6 @@
 // Package roostprovider implements the `shed roost-provider` menu/state
 // machine (plan 019 §3.1-§3.2): the logic behind a roost provider script that
-// lets roost's own palette start an agent on a shed or a `machines:` entry.
+// lets roost's own palette start an agent on a running shed.
 package roostprovider
 
 import (
@@ -96,8 +96,8 @@ var errNoStoredCredential = errors.New("no usable stored credential")
 // The menu needs that second part and it is the reason this is a struct rather
 // than a bare slice: plan 019 §3.2 pins two DIFFERENT empty-menu rows, and
 // telling them apart is exactly the question "did any server answer at all" —
-// a fleet that answered and is simply idle gets "No running sheds or
-// machines", while a fleet nothing could be reached on gets "no shed-server
+// a fleet that answered and is simply idle gets "No running sheds", while a
+// fleet nothing could be reached on gets "no shed-server
 // answered" and the list of names it tried. Collapsing those two would tell a
 // user with a dead VPN that they have no sheds.
 type ShedInventory struct {

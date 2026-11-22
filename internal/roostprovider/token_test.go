@@ -11,14 +11,13 @@ func TestTokenRoundTrip(t *testing.T) {
 		tok  Token
 	}{
 		{"shed host only", Token{Shed: "dev", Server: "my-server"}},
-		{"machine host only", Token{Machine: "mini2"}},
 		{
 			"shed with an agent and a home",
 			Token{Shed: "dev", Server: "my-server", Agent: "claude-rc", Home: "/home/shed"},
 		},
 		{
-			"machine fully descended",
-			Token{Machine: "mini2", Agent: "cursor", Home: "/Users/me", Cwd: "/Users/me/src", Project: "7"},
+			"shed fully descended",
+			Token{Shed: "dev", Server: "my-server", Agent: "claude-rc", Home: "/home/shed", Cwd: "/home/shed/src", Project: "7"},
 		},
 		// The two shapes a naive `k=v&k=v` encoder gets wrong. A `$HOME` with
 		// spaces is ordinary on macOS ("/Users/First Last"), and a cwd carrying
@@ -26,12 +25,12 @@ func TestTokenRoundTrip(t *testing.T) {
 		// token into fields that were never there.
 		{
 			"a home path with spaces",
-			Token{Machine: "laptop", Agent: "codex", Home: "/Users/First Last"},
+			Token{Shed: "box", Server: "laptop", Agent: "opencode", Home: "/Users/First Last"},
 		},
 		{
 			"a cwd with ampersands and equals signs",
 			Token{
-				Shed: "dev", Server: "srv", Agent: "gx",
+				Shed: "dev", Server: "srv", Agent: "claude-rc",
 				Home: "/home/shed",
 				Cwd:  "/home/shed/a&b=c/d e",
 			},
@@ -39,7 +38,7 @@ func TestTokenRoundTrip(t *testing.T) {
 		{
 			"a cwd with the token's own separators and a percent sign",
 			Token{
-				Machine: "mini2", Agent: "grok",
+				Shed: "dev", Server: "srv", Agent: "opencode",
 				Home: "/root",
 				Cwd:  "/root/weird?agent=claude-rc&home=%2Fnope",
 			},
@@ -84,8 +83,25 @@ func TestTokenEncodeIsSortedAndStable(t *testing.T) {
 }
 
 func TestTokenEncodeOmitsEmptyFields(t *testing.T) {
-	if got := (Token{Machine: "mini2"}).Encode(); got != "machine=mini2" {
-		t.Fatalf("Encode() = %q, want %q", got, "machine=mini2")
+	got := (Token{Shed: "dev", Server: "srv"}).Encode()
+	if got != "server=srv&shed=dev" {
+		t.Fatalf("Encode() = %q, want %q", got, "server=srv&shed=dev")
+	}
+	if strings.Contains(got, "agent=") || strings.Contains(got, "machine=") {
+		t.Fatalf("Encode() kept an empty or retired field: %q", got)
+	}
+}
+
+// TestParseTokenRejectsStaleMachineToken: a `machine=` row id from before
+// sheds were the only host fails in ParseToken, which is before any caller
+// builds an ssh target.
+func TestParseTokenRejectsStaleMachineToken(t *testing.T) {
+	_, err := ParseToken("machine=foo")
+	if err == nil {
+		t.Fatal(`ParseToken("machine=foo") succeeded`)
+	}
+	if !strings.Contains(err.Error(), "names a machine") {
+		t.Fatalf("error %q does not say the token names a machine", err)
 	}
 }
 
@@ -96,15 +112,15 @@ func TestParseTokenRejectsMalformedIds(t *testing.T) {
 		want string
 	}{
 		{"the non-actionable sentinel", NoneID, "unknown key"},
-		{"an unknown key", "machine=mini2&colour=red", "unknown key"},
-		{"a repeated key", "machine=mini2&machine=mini3", "repeats"},
-		{"an empty value", "machine=", "empty"},
+		{"an unknown key", "shed=dev&server=srv&colour=red", "unknown key"},
+		{"a repeated key", "shed=dev&shed=other&server=srv", "repeats"},
+		{"an empty value", "shed=", "empty"},
 		{"a shed with no server", "shed=dev", "needs both"},
 		{"a server with no shed", "server=srv", "needs both"},
-		{"both a shed and a machine", "shed=dev&server=srv&machine=mini2", "both a shed and a machine"},
-		{"no host at all", "agent=codex", "neither a shed nor a machine"},
-		{"an invalid percent escape", "machine=%zz", "not a valid token"},
-		{"the empty string", "", "neither a shed nor a machine"},
+		{"a stale machine key beside a shed", "shed=dev&server=srv&machine=mini2", "names a machine"},
+		{"no host at all", "agent=claude-rc", "needs both"},
+		{"an invalid percent escape", "shed=%zz", "not a valid token"},
+		{"the empty string", "", "needs both"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -130,9 +146,6 @@ func TestTokenHostDropsWizardState(t *testing.T) {
 func TestTokenHostLabel(t *testing.T) {
 	if got := (Token{Shed: "dev", Server: "my-server"}).HostLabel(); got != "my-server/dev" {
 		t.Errorf("shed label = %q", got)
-	}
-	if got := (Token{Machine: "mini2"}).HostLabel(); got != "mini2" {
-		t.Errorf("machine label = %q", got)
 	}
 }
 

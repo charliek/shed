@@ -10,11 +10,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// TestMachinesSectionSurvivesUpdate pins the passthrough contract: a `machines:`
-// section (owned by the Rust porcelain, opaque to Go) must survive the
-// whole-document rewrite that Update/SaveToPath perform. Before the passthrough
-// field existed, any config-updating `shed` command silently DELETED the section
-// — user data loss, not a hypothetical.
+// TestMachinesSectionSurvivesUpdate pins the passthrough contract: a legacy
+// `machines:` section (shed no longer reads or models it; Save keeps the YAML
+// subtree) must survive the whole-document rewrite that Update/SaveToPath
+// perform. Before the passthrough field existed, any config-updating `shed`
+// command silently DELETED the section — user data loss, not a hypothetical.
 func TestMachinesSectionSurvivesUpdate(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

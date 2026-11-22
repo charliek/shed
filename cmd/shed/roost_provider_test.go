@@ -15,8 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/roostprovider"
 )
@@ -97,12 +95,12 @@ func TestSelectedIDFrom(t *testing.T) {
 
 func TestParseSelectedIDJSON(t *testing.T) {
 	t.Run("roost's real stdin shape", func(t *testing.T) {
-		body := `{"v":1,"phase":"activate","selected_id":"machine=mini2","query":"","active_tab":{"cwd":"","title":""},"socket":"/tmp/roost.sock"}` + "\n"
+		body := `{"v":1,"phase":"activate","selected_id":"server=srv&shed=dev","query":"","active_tab":{"cwd":"","title":""},"socket":"/tmp/roost.sock"}` + "\n"
 		got, ok := parseSelectedIDJSON(strings.NewReader(body))
 		if !ok {
 			t.Fatalf("parseSelectedIDJSON did not find an id in %q", body)
 		}
-		if got != "machine=mini2" {
+		if got != "server=srv&shed=dev" {
 			t.Errorf("id = %q", got)
 		}
 	})
@@ -126,7 +124,7 @@ func TestRoostProviderLauncherContent(t *testing.T) {
 	got := roostProviderLauncherContent("/abs/path/to/shed")
 	want := "#!/bin/sh\n" +
 		"# @roost.label: shed\n" +
-		"# @roost.title: Start an agent on a shed or machine\n" +
+		"# @roost.title: Start an agent on a shed\n" +
 		"# Written by `shed roost-provider --install`; re-run it if shed moves. Roost runs\n" +
 		"# this by absolute path with its own (possibly minimal) PATH, so the shed binary\n" +
 		"# is pinned here and the usual install dirs are prefixed, as roost's example does.\n" +
@@ -146,6 +144,19 @@ func TestHasRoostProviderLabel(t *testing.T) {
 			t.Errorf("a differently-pinned launcher was not recognized as shed's own")
 		}
 	})
+	t.Run("a pre-038 title is still shed's", func(t *testing.T) {
+		if !hasRoostProviderLabel(legacyRoostProviderLauncher("/old/shed")) {
+			t.Errorf("a launcher with the pre-038 title was not recognized as shed's own")
+		}
+	})
+	t.Run("a different title is not shed's", func(t *testing.T) {
+		foreign := strings.Replace(roostProviderLauncherContent("/abs/shed"),
+			"# @roost.title: "+roostProviderTitle,
+			"# @roost.title: Start something else", 1)
+		if hasRoostProviderLabel(foreign) {
+			t.Errorf("a launcher with a different title was recognized as shed's own")
+		}
+	})
 	t.Run("an unrelated script is not shed's", func(t *testing.T) {
 		if hasRoostProviderLabel("#!/bin/sh\necho hi\n") {
 			t.Errorf("an unrelated script was misidentified as shed's own launcher")
@@ -156,6 +167,12 @@ func TestHasRoostProviderLabel(t *testing.T) {
 			t.Errorf("empty content was misidentified as shed's own launcher")
 		}
 	})
+}
+
+// legacyRoostProviderLauncher is a launcher as shed wrote it before plan 038:
+// the old @roost.title, and an exec line pinning wherever shed lived then.
+func legacyRoostProviderLauncher(shedPath string) string {
+	return roostProviderLegacyLauncherPrefix + "exec " + shellQuoteArg(shedPath) + ` roost-provider "$@"` + "\n"
 }
 
 // ---- --install / --uninstall / --dry-run ----
@@ -284,6 +301,53 @@ func TestRoostProviderUninstall_NoFileIsANoop(t *testing.T) {
 	}
 }
 
+// TestRoostProviderLegacyTitleIsStillOurs is the upgrade case for plan 038's
+// title change. A launcher installed by an earlier shed carries
+// "Start an agent on a shed or machine"; that file is still ours, so
+// --install rewrites it and --uninstall removes it.
+func TestRoostProviderLegacyTitleIsStillOurs(t *testing.T) {
+	t.Run("--install updates it", func(t *testing.T) {
+		launcherPath := withRoostProviderConfig(t)
+		if err := os.MkdirAll(filepath.Dir(launcherPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		legacy := legacyRoostProviderLauncher("/old/path/to/shed")
+		if err := os.WriteFile(launcherPath, []byte(legacy), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		withRoostProviderFlags(t, true, false, false)
+		if err := runRoostProviderInstall(); err != nil {
+			t.Fatalf("install over a legacy launcher: %v", err)
+		}
+		shedPath, err := resolvedShedExecutable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := mustReadFile(t, launcherPath), roostProviderLauncherContent(shedPath); got != want {
+			t.Errorf("legacy launcher was not updated to the current header:\n got %q\nwant %q", got, want)
+		}
+	})
+
+	t.Run("--uninstall removes it", func(t *testing.T) {
+		launcherPath := withRoostProviderConfig(t)
+		if err := os.MkdirAll(filepath.Dir(launcherPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(launcherPath, []byte(legacyRoostProviderLauncher("/old/path/to/shed")), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		withRoostProviderFlags(t, false, true, false)
+		if err := runRoostProviderUninstall(); err != nil {
+			t.Fatalf("uninstall of a legacy launcher: %v", err)
+		}
+		if _, err := os.Stat(launcherPath); !os.IsNotExist(err) {
+			t.Fatalf("legacy launcher survived uninstall; stat err = %v", err)
+		}
+	})
+}
+
 // TestRoostProviderSafety is the prompt's required safety case: a
 // `providers/shed` that exists WITHOUT the label header must never be deleted
 // by --uninstall, and --install must never overwrite it either.
@@ -336,39 +400,6 @@ func shedsHandler(t *testing.T, sheds ...config.Shed) http.HandlerFunc {
 
 func openEntry(ts *httptest.Server) config.ServerEntry {
 	return config.ServerEntry{Host: "127.0.0.1", APIURL: ts.URL, SSHPort: 2222}
-}
-
-func setMachinesYAML(t *testing.T, yamlDoc string) {
-	t.Helper()
-	var tmp config.ClientConfig
-	if err := yaml.Unmarshal([]byte(yamlDoc), &tmp); err != nil {
-		t.Fatalf("unmarshal machines yaml: %v", err)
-	}
-	clientConfig.Machines = tmp.Machines
-}
-
-func TestResolveTarget_UnconfiguredMachineIsUnreachable(t *testing.T) {
-	testClientConfig(t)
-	_, _, row := resolveTarget(t.Context(), roostprovider.Token{Machine: "ghost"})
-	if row == nil || row.Actionable == nil || *row.Actionable {
-		t.Fatalf("expected a non-actionable row, got %+v", row)
-	}
-}
-
-func TestResolveTarget_ConfiguredMachine(t *testing.T) {
-	testClientConfig(t)
-	setMachinesYAML(t, "machines:\n  mini2:\n    host: mini2.local\n    ssh_port: 2200\n")
-
-	target, landingDir, row := resolveTarget(t.Context(), roostprovider.Token{Machine: "mini2"})
-	if row != nil {
-		t.Fatalf("unexpected row: %+v", row)
-	}
-	if landingDir != "" {
-		t.Errorf("a machine must never carry a landing dir, got %q", landingDir)
-	}
-	if target.Dest != "mini2.local" || target.Port != 2200 {
-		t.Errorf("target = %+v", target)
-	}
 }
 
 func TestResolveTarget_UnconfiguredServerIsUnreachable(t *testing.T) {
@@ -434,22 +465,22 @@ func TestResolveTarget_ServerDidNotAnswer(t *testing.T) {
 // already covers the wire mechanics (stderr classification, exact request
 // JSON, every non-actionable row) at the package level. What is new here is
 // the CLI wiring this file adds on top — phase dispatch, resolveTarget,
-// reachHost, the workdir collapse, and openTab's confirmation line — so this
-// exercises exactly one path (a machine token) end to end through
+// reachHost, the workdir menu, and openTab's confirmation line — so this
+// exercises one server-qualified shed end to end through
 // runRoostProviderActivate, real bash, real files, and a real ssh subprocess
 // that runs the remote command locally.
 
 // buildFakeSSH writes a fake `ssh` that parses the SUBSET of Remote.Argv's
-// options this test's Target actually produces (no `-p`, no ControlMaster,
-// no host-key pinning — see the machine entry below), resets HOME/USER/PATH
-// to the fake far side, and runs the remote command through /bin/sh -c.
+// options a shed target produces (`-o`, `-p`, `-T`; ControlMaster options are
+// `-o` too), resets HOME/USER/PATH to the fake far side, and runs the remote
+// command through /bin/sh -c.
 func buildFakeSSH(t *testing.T, dir, fakeHome string) string {
 	t.Helper()
 	path := filepath.Join(dir, "ssh")
 	script := `#!/bin/sh
 while [ $# -gt 0 ]; do
   case "$1" in
-    -o) shift 2 ;;
+    -o|-i|-p) shift 2 ;;
     -T) shift ;;
     --) shift; break ;;
     *) break ;;
@@ -482,6 +513,9 @@ exec /bin/sh -c "$cmd"
 const (
 	farSideProtocolFile = ".protocol"
 	farSideOpLog        = ".ops.log"
+	// farSideTabOpenReq is the raw tab.open request line, so a test can
+	// assert the cwd that actually went on the wire.
+	farSideTabOpenReq = ".tabopen.req"
 )
 
 // buildFakeFarSide lays down a fake $HOME with a login-shell profile, one
@@ -511,6 +545,7 @@ case "$1" in
         printf '%s\n' '{"id":"1","ok":true,"result":{"projects":[]}}' ;;
       *tab.open*)
         printf '%s\n' tab.open >> "$HOME/` + farSideOpLog + `"
+        printf '%s\n' "$line" > "$HOME/` + farSideTabOpenReq + `"
         printf '%s\n' '{"id":"1","ok":true,"result":{"tab":{"id":"tab-42"}}}' ;;
       *) printf '%s\n' '{"id":"1","ok":false,"error":{"code":"bad","message":"unexpected op"}}' ;;
     esac
@@ -550,6 +585,29 @@ func farSideOps(t *testing.T, home string) []string {
 	return out
 }
 
+// farSideTabOpenCwd returns the cwd of the last tab.open request the fake
+// bridge was handed.
+func farSideTabOpenCwd(t *testing.T, home string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(home, farSideTabOpenReq))
+	if err != nil {
+		t.Fatalf("reading the tab.open request: %v", err)
+	}
+	var req struct {
+		Op     string `json:"op"`
+		Params struct {
+			Cwd string `json:"cwd"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(data, &req); err != nil {
+		t.Fatalf("tab.open request is not JSON: %v\n%s", err, data)
+	}
+	if req.Op != "tab.open" {
+		t.Fatalf("recorded op = %q, want tab.open\n%s", req.Op, data)
+	}
+	return req.Params.Cwd
+}
+
 func truncateFarSideOps(t *testing.T, home string) {
 	t.Helper()
 	if err := os.Remove(filepath.Join(home, farSideOpLog)); err != nil && !os.IsNotExist(err) {
@@ -574,19 +632,24 @@ func requireBash(t *testing.T) {
 	}
 }
 
-func TestRoostProviderActivate_MachineEndToEnd(t *testing.T) {
+func TestRoostProviderActivate_ShedEndToEnd(t *testing.T) {
 	requireBash(t)
 	testClientConfig(t)
-	setMachinesYAML(t, "machines:\n  mini2:\n    host: fake-host\n")
 
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
-	if err := os.MkdirAll(home, 0o755); err != nil {
+	landing := filepath.Join(home, "proj")
+	if err := os.MkdirAll(landing, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	buildFakeFarSide(t, home)
 	sshBin := buildFakeSSH(t, dir, home)
 	t.Setenv("PATH", filepath.Dir(sshBin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ts := httptest.NewServer(shedsHandler(t,
+		config.Shed{Name: "dev", Status: config.StatusRunning, LandingDir: landing}))
+	defer ts.Close()
+	clientConfig.Servers["srv"] = openEntry(ts)
 
 	runActivate := func(t *testing.T, id string) string {
 		t.Helper()
@@ -601,43 +664,92 @@ func TestRoostProviderActivate_MachineEndToEnd(t *testing.T) {
 		return buf.String()
 	}
 
-	t.Run("step 2: a bare host token lists the found agent", func(t *testing.T) {
-		out := runActivate(t, "machine=mini2")
-		// The row id's "&" is JSON/HTML-escaped by the default encoder
-		// (json.Encoder's SetEscapeHTML defaults true, and printMenu does not
-		// turn it off — unlike the wire request encoder in internal/roostprovider,
-		// which does for a byte-for-byte roost comparison this stdout contract
-		// has no need of), so this checks the pieces rather than the whole id.
-		if !strings.Contains(out, "agent=claude-rc") {
-			t.Fatalf("agent menu missing the agent= token piece: %s", out)
+	hostID := roostprovider.Token{Shed: "dev", Server: "srv"}.Encode()
+
+	t.Run("agent choice: a shed token lists the found agent", func(t *testing.T) {
+		out := runActivate(t, hostID)
+		var menu roostprovider.Menu
+		if err := json.Unmarshal([]byte(out), &menu); err != nil {
+			t.Fatalf("agent menu is not JSON: %v\n%s", err, out)
 		}
-		if !strings.Contains(out, `"title":"claude"`) {
-			t.Fatalf("agent menu missing the claude row: %s", out)
+		if len(menu.Items) != 1 || menu.Items[0].Title != "claude" {
+			t.Fatalf("agent menu = %+v", menu.Items)
+		}
+		tok, err := roostprovider.ParseToken(menu.Items[0].ID)
+		if err != nil {
+			t.Fatalf("agent row id: %v (%s)", err, menu.Items[0].ID)
+		}
+		if tok.Shed != "dev" || tok.Server != "srv" || tok.Agent != "claude-rc" || tok.Home != home {
+			t.Fatalf("agent token = %+v, want shed dev on srv with claude-rc and home %s", tok, home)
 		}
 	})
 
-	t.Run("step 3 collapses (Home is the only candidate) straight to an opened tab", func(t *testing.T) {
-		id := fmt.Sprintf("agent=claude-rc&home=%s&machine=mini2", home)
-		out := runActivate(t, id)
-		want := "opened tab tab-42 on mini2\n"
+	agentID := roostprovider.Token{
+		Shed: "dev", Server: "srv", Agent: "claude-rc", Home: home,
+	}.Encode()
+
+	// landingID is the workdir-menu row for the shed's landing dir, built
+	// here rather than captured from an earlier subtest: `go test -run` of
+	// one subtest still executes this parent, and skips every other t.Run.
+	landingID := roostprovider.Token{
+		Shed: "dev", Server: "srv", Agent: "claude-rc", Home: home, Cwd: landing,
+	}.Encode()
+
+	t.Run("working-dir choice: Home and the landing dir are both offered", func(t *testing.T) {
+		out := runActivate(t, agentID)
+		var menu roostprovider.Menu
+		if err := json.Unmarshal([]byte(out), &menu); err != nil {
+			t.Fatalf("workdir menu is not JSON: %v\n%s", err, out)
+		}
+		titles := make([]string, 0, len(menu.Items))
+		var gotLanding string
+		for _, row := range menu.Items {
+			titles = append(titles, row.Title)
+			if row.Title == "Landing dir" {
+				gotLanding = row.ID
+			}
+		}
+		if strings.Join(titles, ",") != "Home,Landing dir" {
+			t.Fatalf("workdir titles = %q, want Home then Landing dir", titles)
+		}
+		if gotLanding != landingID {
+			t.Fatalf("landing row id = %q, want %q", gotLanding, landingID)
+		}
+		tok, err := roostprovider.ParseToken(gotLanding)
+		if err != nil {
+			t.Fatalf("landing row id: %v", err)
+		}
+		if tok.Cwd != landing || tok.Shed != "dev" || tok.Server != "srv" || tok.Agent != "claude-rc" {
+			t.Fatalf("landing token = %+v, want cwd %s", tok, landing)
+		}
+	})
+
+	t.Run("choosing the landing dir opens a tab", func(t *testing.T) {
+		truncateFarSideOps(t, home)
+		out := runActivate(t, landingID)
+		want := "opened tab tab-42 on srv/dev\n"
 		if out != want {
 			t.Fatalf("activate output = %q, want %q", out, want)
+		}
+		ops := farSideOps(t, home)
+		if len(ops) == 0 || ops[0] != "session.identify" {
+			t.Errorf("ops = %v, want session.identify before tab.open", ops)
+		}
+		if got := farSideTabOpenCwd(t, home); got != landing {
+			t.Errorf("tab.open cwd = %q, want the landing dir %q", got, landing)
 		}
 	})
 
 	// A COMPLETED token — one that already names a workdir — is the step roost
 	// activates from the workdir menu, and the only step that reaches
-	// `tab.open` without passing through reachHost's gate first. (The collapse
-	// case above does not: it re-probes, so it identifies on the way.) These
-	// two subtests are that step at both protocols.
-	completed := roostprovider.Token{
-		Machine: "mini2", Agent: "claude-rc", Home: home, Cwd: home,
-	}.Encode()
-
+	// `tab.open` without passing through reachHost's gate first. The choice
+	// above does not either: StepOpen re-identifies on its own. These two
+	// subtests are that step at both protocols, using landingID from the parent
+	// so each one runs on its own.
 	t.Run("step 4: a completed token opens a tab", func(t *testing.T) {
 		truncateFarSideOps(t, home)
-		out := runActivate(t, completed)
-		if want := "opened tab tab-42 on mini2\n"; out != want {
+		out := runActivate(t, landingID)
+		if want := "opened tab tab-42 on srv/dev\n"; out != want {
 			t.Fatalf("activate output = %q, want %q", out, want)
 		}
 		// The gate runs on this path too — cheaply, on the same connection —
@@ -659,10 +771,10 @@ func TestRoostProviderActivate_MachineEndToEnd(t *testing.T) {
 		setFarSideProtocol(t, home, 3)
 		truncateFarSideOps(t, home)
 
-		out := runActivate(t, completed)
+		out := runActivate(t, landingID)
 
 		want := fmt.Sprintf(
-			"roost-session on mini2 speaks protocol 3; this shed speaks %d",
+			"roost-session on srv/dev speaks protocol 3; this shed speaks %d",
 			roostprovider.SpokenProtocol,
 		)
 		if !strings.Contains(out, want) {
@@ -996,11 +1108,11 @@ func TestReadSelectedIDWithin(t *testing.T) {
 		}
 		defer r.Close()
 		go func() {
-			_, _ = w.WriteString(`{"v":1,"phase":"activate","selected_id":"machine=mini2"}` + "\n")
+			_, _ = w.WriteString(`{"v":1,"phase":"activate","selected_id":"server=srv&shed=dev"}` + "\n")
 			_ = w.Close()
 		}()
 		id, ok := readSelectedIDWithin(r, 5*time.Second)
-		if !ok || id != "machine=mini2" {
+		if !ok || id != "server=srv&shed=dev" {
 			t.Fatalf("id = %q, ok = %t", id, ok)
 		}
 	})
@@ -1015,7 +1127,7 @@ func TestReadSelectedIDWithin(t *testing.T) {
 		// that used to hang activate forever. The byte cap does not help —
 		// io.ReadAll waits for EOF, and EOF is what this writer withholds.
 		defer w.Close()
-		if _, err := w.WriteString(`{"selected_id":"machine=mini2"}` + "\n"); err != nil {
+		if _, err := w.WriteString(`{"selected_id":"server=srv&shed=dev"}` + "\n"); err != nil {
 			t.Fatal(err)
 		}
 

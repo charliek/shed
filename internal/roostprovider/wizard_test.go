@@ -11,13 +11,13 @@ func TestNextStep(t *testing.T) {
 		tok  Token
 		want Step
 	}{
-		{"a bare host token", Token{Machine: "mini2"}, StepAgents},
-		{"an agent but no workdir", Token{Machine: "mini2", Agent: "codex", Home: "/root"}, StepWorkdirs},
-		{"a complete token", Token{Machine: "mini2", Agent: "codex", Home: "/root", Cwd: "/root/src"}, StepOpen},
-		{"a project-bearing token", Token{Machine: "mini2", Agent: "gx", Home: "/root", Cwd: "/src", Project: "3"}, StepOpen},
+		{"a bare host token", Token{Shed: "dev", Server: "srv"}, StepAgents},
+		{"an agent but no workdir", Token{Shed: "dev", Server: "srv", Agent: "codex", Home: "/root"}, StepWorkdirs},
+		{"a complete token", Token{Shed: "dev", Server: "srv", Agent: "codex", Home: "/root", Cwd: "/root/src"}, StepOpen},
+		{"a project-bearing token", Token{Shed: "dev", Server: "srv", Agent: "gx", Home: "/root", Cwd: "/src", Project: "3"}, StepOpen},
 		// A cwd with no agent cannot open anything — there would be no argv.
 		// The agent step is the honest place to send it back to.
-		{"a cwd with no agent", Token{Machine: "mini2", Cwd: "/root/src"}, StepAgents},
+		{"a cwd with no agent", Token{Shed: "dev", Server: "srv", Cwd: "/root/src"}, StepAgents},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -174,7 +174,7 @@ func TestLaunchArgv(t *testing.T) {
 
 func TestTabOpenFor(t *testing.T) {
 	t.Run("a workdir with no project gets the 0 sentinel", func(t *testing.T) {
-		got, err := TabOpenFor(Token{Machine: "mini2", Agent: "claude-rc", Home: "/root", Cwd: "/root/src"})
+		got, err := TabOpenFor(Token{Shed: "dev", Server: "srv", Agent: "claude-rc", Home: "/root", Cwd: "/root/src"})
 		if err != nil {
 			t.Fatalf("TabOpenFor: %v", err)
 		}
@@ -195,7 +195,7 @@ func TestTabOpenFor(t *testing.T) {
 	})
 
 	t.Run("a project-bearing workdir keeps its id", func(t *testing.T) {
-		got, err := TabOpenFor(Token{Machine: "mini2", Agent: "opencode", Home: "/root", Cwd: "/src", Project: "7"})
+		got, err := TabOpenFor(Token{Shed: "dev", Server: "srv", Agent: "opencode", Home: "/root", Cwd: "/src", Project: "7"})
 		if err != nil {
 			t.Fatalf("TabOpenFor: %v", err)
 		}
@@ -208,7 +208,7 @@ func TestTabOpenFor(t *testing.T) {
 	})
 
 	t.Run("an unknown agent kind is refused", func(t *testing.T) {
-		_, err := TabOpenFor(Token{Machine: "mini2", Agent: "shell", Home: "/root", Cwd: "/src"})
+		_, err := TabOpenFor(Token{Shed: "dev", Server: "srv", Agent: "shell", Home: "/root", Cwd: "/src"})
 		if err == nil {
 			t.Fatalf("an unlaunchable kind was accepted")
 		}
@@ -218,14 +218,14 @@ func TestTabOpenFor(t *testing.T) {
 		// codex/cursor/gx/grok left the table in plan 025 (shed#390); a stale
 		// row id naming one is refused exactly like any other unrecognized
 		// kind, not specially diagnosed.
-		_, err := TabOpenFor(Token{Machine: "mini2", Agent: "codex", Home: "/root", Cwd: "/src"})
+		_, err := TabOpenFor(Token{Shed: "dev", Server: "srv", Agent: "codex", Home: "/root", Cwd: "/src"})
 		if err == nil {
 			t.Fatalf("a retired agent kind was accepted")
 		}
 	})
 
 	t.Run("no workdir is refused", func(t *testing.T) {
-		_, err := TabOpenFor(Token{Machine: "mini2", Agent: "opencode", Home: "/root"})
+		_, err := TabOpenFor(Token{Shed: "dev", Server: "srv", Agent: "opencode", Home: "/root"})
 		if err == nil {
 			t.Fatalf("a token with no cwd was accepted")
 		}
@@ -236,7 +236,7 @@ func TestTabOpenFor(t *testing.T) {
 // `deny_unknown_fields` TabOpenParams accepts from this provider, and the one
 // thing that is easy to get wrong from Go: `project_id` is a STRING.
 func TestTabOpenParamsSerialization(t *testing.T) {
-	params, err := TabOpenFor(Token{Machine: "mini2", Agent: "opencode", Home: "/root", Cwd: "/root/src", Project: "12"})
+	params, err := TabOpenFor(Token{Shed: "dev", Server: "srv", Agent: "opencode", Home: "/root", Cwd: "/root/src", Project: "12"})
 	if err != nil {
 		t.Fatalf("TabOpenFor: %v", err)
 	}
