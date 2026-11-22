@@ -39,7 +39,7 @@ members = [
 #     ShedHosts, ShedCraze, ShedLanes, slash, shutdown). Uses default-features
 #     `shed-app` ONLY (never `broker`), zero GUI toolkits, zero direct roost-ipc.
 #
-# `shed-opencode` (plan 015) was removed in plan 038 — craze is the sole agent
+# The opencode adapter crate (plan 015) was removed in plan 038 — craze is the sole agent
 # lane. `shed-gx` (plan 017) was retired in plan 025; `sx` and `shed-rc-engine`
 # were retired in plans 016 and 022.
 #

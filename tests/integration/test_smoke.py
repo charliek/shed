@@ -594,14 +594,14 @@ def test_roost_session_baked(shed_server, test_shed_name):
         f"want {want_version!r} (override via SHED_ROOST_SESSION_VERSION). "
         f"Check ARG ROOST_SESSION_VERSION in vz/Dockerfile / "
         f"firecracker/Dockerfile and RELEASE_PIN in "
-        f"crates/shed-core/src/roost/bootstrap/source.rs (make check-roost-pin)."
+        f"crates/shed-roost/src/bootstrap/source.rs (make check-roost-pin)."
     )
     assert str(identify.get("session_protocol")) == str(want_protocol), (
         f"baked roost-session session_protocol={identify.get('session_protocol')!r}, "
         f"want {want_protocol!r} (override via SHED_ROOST_SESSION_PROTOCOL). "
         f"Check ARG ROOST_SESSION_PROTOCOL in vz/Dockerfile / "
         f"firecracker/Dockerfile and RELEASE_PIN_PROTOCOL in "
-        f"crates/shed-core/src/roost/bootstrap/source.rs (make check-roost-pin)."
+        f"crates/shed-roost/src/bootstrap/source.rs (make check-roost-pin)."
     )
 
     r = shed_server.exec(

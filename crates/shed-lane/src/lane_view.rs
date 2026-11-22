@@ -111,7 +111,7 @@ use crate::slash_menu::{self, SlashMenu};
 
 /// How many transcript rows one lane keeps for the CURRENT generation.
 ///
-/// The same 500 the adapter's own ring holds (`shed_opencode::MessageRing`'s
+/// The same 500 the adapter's own ring holds (`MessageRing`'s
 /// `MAX_RING_MESSAGES`), so a view that has replayed a whole generation holds
 /// exactly what the adapter would hand back and no more.
 pub const MAX_VIEW_MESSAGES: usize = 500;

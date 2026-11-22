@@ -1,13 +1,12 @@
 //! The feed vocabulary and the text sanitizers every lane adapter's fold emits
 //! through — the contract-side half of a transcript row.
 //!
-//! These were `shed-opencode`'s `helpers.rs` (itself a copy of the rc hub's
+//! These lived with the first lane adapter (itself a copy of the rc hub's
 //! `rc_hub::messages`) until the **second** adapter needed them. An
-//! adapter-to-adapter dependency (`shed-gx` reaching into `shed-opencode` for a
+//! adapter-to-adapter dependency (one adapter reaching into another for a
 //! sanitizer) would make one adapter's release schedule the other's, so the
 //! shared half moved down here instead, beside the contract whose rows it
-//! bounds. `shed-opencode` re-exports every item, so its own call sites and its
-//! goldens are untouched.
+//! bounds.
 //!
 //! **`regex` was already a `shed-core` dependency** (`rc.rs`'s claude.ai URL
 //! extraction), which is why the ANSI stripper could move without adding a crate

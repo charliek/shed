@@ -86,21 +86,24 @@ PATHS_SERVER=(
 # desktop: the app + every crate it links + the shared cargo manifests/locks
 # (which the desktop bump owns).
 #
-# "every crate it links" is the rule, and the agent-lane adapters are part of
-# it: `desktop/tauri/src-tauri/Cargo.toml` takes `shed-opencode` and
-# `shed-craze` as plain path-deps, so a correctness fix in either is IN the
-# shipped DMG/.deb and must flag desktop. release-plan.sh and
-# update-version.sh carry the same crates in their desktop lockstep dep
-# lists. (`shed-gx`, plan 017's second adapter, rode the same path-dep shape
-# until plan 025 C1 — shed#390 — retired the gx lane.)
+# "every crate it links" is the rule. `desktop/tauri/src-tauri/Cargo.toml`
+# takes shed-core, shed-app, shed-lane, shed-roost, shed-craze and
+# shed-desktop-core as plain path-deps (shed-broker through shed-app's
+# `broker` feature), so a correctness fix in any of them is IN the shipped
+# DMG/.deb and must flag desktop. release-plan.sh and update-version.sh
+# carry the same crates in their desktop lockstep dep lists.
+# (`shed-opencode` was retired in plan 038; `shed-gx`, plan 017's second
+# adapter, was retired in plan 025 C1 — shed#390.)
 # shellcheck disable=SC2034  # read via get_paths()
 PATHS_DESKTOP=(
   desktop
+  crates/shed-lane
   crates/shed-core
+  crates/shed-roost
   crates/shed-app
+  crates/shed-desktop-core
   crates/shedctl
   crates/shed-broker
-  crates/shed-opencode
   crates/shed-craze
   crates/Cargo.toml
   crates/Cargo.lock

@@ -1,7 +1,7 @@
 """The Python fake roost-session, checked on its own wire.
 
 `fake_roost.FakeRoost` is the Python twin of
-`shed_core::roost::testing::FakeRoost` (`crates/shed-core/src/roost/testing.rs`),
+`shed_roost::testing::FakeRoost` (`crates/shed-roost/src/testing.rs`),
 and the two drifting apart is the failure mode this file exists to prevent.
 
 **Why it cannot be left to `test_agents.py`.** That suite drives the fake

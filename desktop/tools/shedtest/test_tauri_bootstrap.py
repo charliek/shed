@@ -27,7 +27,7 @@ Two more knobs make that honest:
 * `ROOST_SESSION_INSTALL_BIN` is roost's own override rung, and the bytes it
   names are a shell script that answers `identify`, `start` and `client-bridge`
   the way the real daemon does. `_fake_session` is deliberately the same
-  stand-in `crates/shed-core/src/roost/bootstrap/tests.rs` uses, one language
+  stand-in `crates/shed-roost/src/bootstrap/tests.rs` uses, one language
   over — and `test_the_real_binary_is_installed_and_started_behind_the_fake_ssh`
   is where that claim is checked against the actual pinned-rev binary.
 

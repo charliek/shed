@@ -6,9 +6,8 @@
 //! A test drives an adapter and feeds every frame it receives through a checker
 //! — [`LaneChecker`] for an [`AgentLane::subscribe`](super::AgentLane::subscribe)
 //! stream, [`SourceChecker`] for an
-//! [`AgentSource::subscribe`](super::AgentSource::subscribe) one: opencode's
-//! (`shed-opencode`'s `tests/conformance.rs`, against `FakeOpencode`), and
-//! craze's source and lane against craze's own hermetic recipe — the real hub
+//! [`AgentSource::subscribe`](super::AgentSource::subscribe) one. Craze's source
+//! and lane are checked against craze's own hermetic recipe — the real hub
 //! (`shed-craze`'s `tests/recipe_source.rs` and `tests/recipe_lane.rs`), and the
 //! lane against a scripted host too (`tests/lane.rs`, `tests/overflow.rs`). The
 //! first frame

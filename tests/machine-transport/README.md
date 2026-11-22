@@ -42,7 +42,7 @@ leg would not be a contract.
 
 | leg | lives in | run with | asserts |
 |---|---|---|---|
-| **Rust** | `crates/shed-core/tests/machine_transport_contract.rs` | `cargo test -p shed-core` | Rust composes `goldens/wire.json` — the BYTE-level pin |
+| **Rust** | `crates/shed-lane/tests/machine_transport_contract.rs` | `cargo test -p shed-lane` | Rust composes `goldens/wire.json` — the BYTE-level pin |
 | **live** | here | `make test-machine-transport` | that quoting really delivers `scenarios.json`'s argv through a real sshd |
 
 **There is no third, Dart-side leg, and never has been.** An earlier revision
@@ -156,7 +156,7 @@ exactly what the live leg checks.)
 The live leg's receiver swap means it never RUNS the ladder, so what the ladder
 does with its argument is measured in two more places:
 
-- **`crates/shed-core/tests/craze_ladder.rs`** — Rust, a local `sh`, no sshd, no
+- **`crates/shed-lane/tests/craze_ladder.rs`** — Rust, a local `sh`, no sshd, no
   root, each case under every distinct POSIX `sh` the host has (dash, bash as
   `sh`, busybox `sh`). The production tables are re-rooted under a temp dir and
   a stub `craze` on a rung records what it was handed: each rung exec'd with
@@ -192,7 +192,7 @@ no tmux. Nothing leaves 127.0.0.1.
 CI runs it as its own job, `machine-transport` (`.github/workflows/ci.yml`):
 `openssh-server` installed on the runner, then `MT_REQUIRE_SSHD=1 make
 test-machine-transport`, on every PR that touches this directory or
-`crates/shed-core/src/{machine,craze}.rs` — so a runner that lost its sshd
+`crates/shed-lane/src/{shell_quote,craze}.rs` — so a runner that lost its sshd
 fails the job instead of passing it vacuously. The same job runs the Rust leg
 and `craze_ladder.rs`, so a scenario edited on its own still meets the
 composer it pins.
@@ -279,12 +279,12 @@ is certainly the developer's, so the recipe needs no uid passed in.
    golden already fails both legs on its own.
 2. Re-record both goldens (`UPDATE_GOLDEN=1`).
 3. On a version bump, update the pinned version in
-   `crates/shed-core/tests/machine_transport_contract.rs`.
+   `crates/shed-lane/tests/machine_transport_contract.rs`.
 
 The version exists so the Rust leg cannot silently drift from what's checked
 in: `machine_transport_contract.rs` pins the revision it was last validated
 against, so an edit here that skips step 3 fails loudly in `cargo test
--p shed-core` instead of leaving the Rust byte pin and the live leg's fresh
+-p shed-lane` instead of leaving the Rust byte pin and the live leg's fresh
 read of `scenarios.json` quietly disagreeing about which contract is current.
 There is no third repo to keep in step (see "The Dart leg" above).
 

@@ -18,7 +18,7 @@ a shape here cannot drift away from the shape roost publishes without the copy
 step noticing.
 
 It is the Python twin of `shed_core::roost::testing::FakeRoost`
-(`crates/shed-core/src/roost/testing.rs`) — the same controls, the same
+(`crates/shed-roost/src/testing.rs`) — the same controls, the same
 semantics, deliberately built from the same vectors so the Rust unit tests and
 this suite cannot disagree about what a roost-session says. **When you change one
 fake, change the other**, and pin the change in both `testing.rs`'s tests and

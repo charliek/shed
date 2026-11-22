@@ -1,7 +1,7 @@
 //! The reconnect backoff every lane watcher shares: double-to-a-ceiling, reset
 //! on a generation that worked, spread by jitter.
 //!
-//! Lifted out of `shed-opencode`'s watcher when the second adapter needed the
+//! Lifted out of the first adapter's watcher when the second adapter needed the
 //! identical curve. It stays a pair of free functions taking their bounds as
 //! arguments rather than a struct holding them, because each adapter owns its
 //! own floor and ceiling (opencode's `OC_BACKOFF_BASE`/`OC_BACKOFF_MAX`, gx's

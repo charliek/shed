@@ -4,9 +4,8 @@
 //! session-scoped **lane** that streams one session's transcript and takes its
 //! verbs. One adapter per agent implements both.
 //!
-//! Two adapters: opencode over its local HTTP server (`shed-opencode`), both
-//! levels; and craze over its per-machine hub (`shed-craze`) — its source since
-//! plan 025 C7, its lane since C8. craze is what this split was shaped for.
+//! Craze, over its per-shed hub (`shed-craze`), is the only adapter — its source
+//! since plan 025 C7, its lane since C8. craze is what this split was shaped for.
 //! gx's `/v1` lane
 //! held the second slot from plan 017 until plan 025 retired it (shed#390); the
 //! corrections it forced are recorded below as history, because the readers of
@@ -480,9 +479,9 @@
 //! 9. **The feed vocabulary and the sanitizers live in [`feed`]** —
 //!    `FEED_ROLE_*`, `FEED_TYPE_*`, [`feed::sanitize_feed_text`],
 //!    [`feed::bound_token`], [`feed::truncate_bytes`], the caps and the ANSI
-//!    stripper. They were `shed-opencode`'s; a second adapter reaching into the
-//!    first one for a sanitizer is a dependency no release schedule survives.
-//!    `shed-opencode` re-exports every one of them.
+//!    stripper. They moved here when a second adapter needed them; one adapter
+//!    reaching into another for a sanitizer is a dependency no release schedule
+//!    survives.
 //! 10. **[`ring::MessageRing`] and [`backoff`] moved down here too, WITHOUT
 //!     `chrono`.** [`ring::MessageRing::append`] takes `now_unix_ms: i64` and
 //!     defaults a missing `ts` through [`crate::time::rfc3339_z`]; callers that
@@ -2818,8 +2817,7 @@ tolerant_enum! {
 /// A machine's (or an agent server's) sessions: list them, say what can be
 /// created, create one, and open a session-scoped [`AgentLane`] on a row.
 ///
-/// Implemented once per agent: opencode's per agent server URL
-/// (`shed_opencode::OpencodeSource`) today, and craze's per machine hub
+/// Implemented by craze's per-shed hub
 /// (`shed_craze::CrazeSource`) from plan 025 C7. Every method borrows `&self`, so
 /// the futures are `Send` under `async_trait`'s default and a source can be held
 /// in an `Arc<dyn AgentSource>` and driven from any task.

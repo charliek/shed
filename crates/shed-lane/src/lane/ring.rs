@@ -3,9 +3,8 @@
 //! Ported from the rc hub's `MessageRing` (`shed-broker/src/rc_hub/messages.rs`,
 //! itself `hub_messages.go`'s `messageRing`): item + byte caps with drop-oldest,
 //! field sanitization and text trimming on the way in, and a monotonic `seq`
-//! assigned at [`MessageRing::append`]. It lived in `shed-opencode` until the
-//! second adapter needed the same ring; `shed-opencode` re-exports it, so its
-//! goldens and call sites are unchanged.
+//! assigned at [`MessageRing::append`]. It moved here when a second adapter
+//! needed the same ring.
 //!
 //! A fold mints every row with `seq: 0` deliberately. `seq` is a TRANSPORT
 //! property, not a fold property — the contract requires it to be monotonic

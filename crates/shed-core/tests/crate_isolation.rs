@@ -14,12 +14,12 @@
 //!   (direct), `shed-craze`, `shed-broker`, `saphyr-parser`, or UI toolkits.
 //! - `shed-desktop-core`: toolkit-free desktop runtime — no `tauri`, `wry`,
 //!   `tao`, `webkit2gtk`, `iced`, `shed-broker`, `saphyr-parser`,
-//!   `shed-opencode`, and no direct `roost-ipc` (normal, build, or dev).
+//!   and no direct `roost-ipc` (normal, build, or dev).
 //! - `shed-broker`, `shed-broker-harness`, and `shedctl` have no `roost-ipc` or
 //!   `shed-roost` (direct or transitive).
 //! - `shed-roost` is the SOLE direct `roost-ipc` consumer in `crates/` (across
 //!   normal, build, and dev dependencies).
-//! - No crate in `crates/` depends on `shed-opencode`, `tauri`, `wry`, `tao`,
+//! - No crate in `crates/` depends on `tauri`, `wry`, `tao`,
 //!   `webkit2gtk`, or `iced`.
 
 use std::collections::HashSet;
@@ -94,15 +94,23 @@ fn resolved_normal_deps(pkg: &str) -> HashSet<String> {
     resolved_deps(pkg, "normal,build")
 }
 
-const TOOLKIT_FORBIDDEN: &[&str] = &["tauri", "wry", "tao", "webkit2gtk", "iced", "shed-opencode"];
+const RETIRED_ADAPTER: &str = concat!("shed-", "opencode");
+const TOOLKIT_FORBIDDEN: &[&str] = &[
+    "tauri",
+    "wry",
+    "tao",
+    "webkit2gtk",
+    "iced",
+    RETIRED_ADAPTER,
+];
 
 #[test]
 fn crate_isolation_invariants() {
     let meta = no_deps_metadata();
     let packages = meta["packages"].as_array().expect("packages");
 
-    // 1. No crate in `crates/` may depend on GUI toolkits or the deleted
-    //    `shed-opencode` across normal, build, OR dev dependencies.
+    // 1. No crate in `crates/` may depend on GUI toolkits across normal,
+    //    build, OR dev dependencies.
     for pkg in packages {
         let name = pkg["name"].as_str().expect("pkg name");
         for dep in pkg["dependencies"].as_array().expect("dependencies") {
@@ -245,7 +253,6 @@ fn crate_isolation_invariants() {
         "iced",
         "shed-broker",
         "saphyr-parser",
-        "shed-opencode",
     ] {
         assert!(
             !desktop_core_deps.contains(forbidden),

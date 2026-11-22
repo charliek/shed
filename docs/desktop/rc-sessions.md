@@ -1,126 +1,87 @@
 # The Agents pane
 
-The **Agents** pane shows agent sessions running anywhere shed can see them — on a
-`machines:` entry or inside a shed — and lets you launch, watch, and end them without
-leaving the dashboard.
+The **Agents** pane shows agent sessions on your sheds: read-only roost rows,
+and craze sessions you can open, watch, and stop, without leaving the dashboard.
 
-Since v0.9.0 a session here is either a **roost tab** or a **craze session**. A shed's
-roost sessions are exactly what its own
-[`roost-session`](../extensions/roost-session-hosts.md) reports, the same way a machine's
-always have been — a shed with no `roost-session` running has none. Before v0.9.0 a shed's
-rows were the *union* of a guest RC hub's sessions and roost's; the guest binary
+A roost row is what that shed's own
+[`roost-session`](../extensions/roost-session-hosts.md) reports. A shed with no
+`roost-session` running has no roost rows. Before v0.9.0 a shed's rows were the
+*union* of a guest RC hub's sessions and roost's; the guest binary
 (`shed-ext-rc`) and the hub are gone (S6,
-[`charliek/shed#328`](https://github.com/charliek/shed/issues/328)). A craze session comes
-from the craze hub on its host — see [Craze sessions](#craze-sessions) below.
+[`charliek/shed#328`](https://github.com/charliek/shed/issues/328)). A craze
+session comes from the craze hub on that shed — see
+[Craze sessions](#craze-sessions) below.
+
+The desktop does not list `machines:` hosts and does not open, kill, or launch
+a roost tab. An interactive session on a host that is not a shed, or a tab you
+want to drive yourself, belongs in the `roost` app. A `machines:` block left in
+`~/.shed/config.yaml` is preserved by the CLI and ignored here.
 
 ## What a row is
 
-A roost row is one roost tab with an owner — a plain shell tab in roost is not a session
-and does not appear here. Two kinds are typed and get the full set of affordances below:
-`claude` and `opencode`. An agent run directly in a roost tab (`codex`, `cursor-agent`,
-`grok`, `gx`) still renders as a row — roost's own status hooks cover them — but as a
-**plain row**: its raw kind string, no Transcript affordance, no typed-input prompt.
-Each row shows:
+A roost row is one roost tab with an owner — a plain shell tab in roost is not a
+session and does not appear here. Every roost row is **status only**: its kind
+string (`claude`, `opencode`, `codex`, and the rest roost's hooks cover), roost's
+activity, and the attention dot. There is no Transcript affordance and no End
+session on a roost row.
+
+Each roost row shows:
 
 - **Name** — the tab's title.
-- **State and activity** — roost's own liveness state, plus a live activity badge for
-  agents with a [structured lane](agent-lanes.md) (craze and opencode) attached.
-- **A sticky attention dot** mirroring roost's own notification bit — shed never clears it
-  itself.
-- **Transcript** — opens the [agent lane](agent-lanes.md) panel, only on a row that carries
-  an `agent_lane` stamp: every craze row, and an opencode tab whose roost plugin reported a
-  live server address. A row without one is status-only.
-- **Open** — opens a terminal on the session, addressed by the row's own machine (a shed's
-  own SSH endpoint, or the machine's configured address) — the same button whether the row
-  is a shed or a `machines:` entry.
-- **Open in Claude** — the `claude.ai/code` remote-control URL, Claude kinds only. Other
-  agents have no browser URL.
-- **End session** — closes the roost tab (`tab.close`). Idempotent; a session already gone
-  is treated as already ended.
+- **State and activity** — roost's own liveness state.
+- **A sticky attention dot** mirroring roost's own notification bit — shed never
+  clears it itself.
+- **Open in Claude** — the `claude.ai/code` remote-control URL, Claude kinds only.
 
 ### Craze sessions
 
-Every host — this machine, every `machines:` entry, every running shed — also has a
-**craze source**: its craze hub's live session list. A craze session's row is the hub's:
-its provider and model, what it is doing (or its last reply, dimmed, when idle), how many
-asks wait on you with the first one's summary, the attached-client count, and a start
-error when it failed to start. A roost tab running a craze TUI folds into that row while
-the hub feed is live, and the row gains **End tab**; with the feed down, roost's own row
-for the tab stands alone and the hub's rows show as last known. A craze row offers
+Every running shed has a **craze source**: its craze hub's live session list. A
+craze session's row is the hub's: its provider and model, what it is doing (or
+its last reply, dimmed, when idle), how many asks wait on you with the first
+one's summary, the attached-client count, and a start error when it failed to
+start. A roost tab running a craze TUI folds into that row while the hub feed
+is live, and the hub row gains that tab's id; with the feed down, roost's own row for
+the tab stands alone and the hub's rows show as last known. A craze row offers
 **Transcript**, and **Open in terminal** when it has no tab. See
 [Agent lanes § craze](agent-lanes.md#craze) for the source, the fold and the transcript.
 
 ## Empty states
 
-The pane distinguishes three blanks, because they call for different reactions:
+The pane distinguishes four blanks, because they call for different reactions:
 
 | State | Meaning |
 |---|---|
 | Loading | The session list hasn't answered yet. No claim is made about what's running. |
-| Failed | The list could not be read; the failure reason is shown in full — "the backend is not up" and "that host refused" need different fixes. |
-| Unreachable | Every configured machine is unreachable, so the pane cannot see what's running (see the Machines pane for why). |
+| Failed | The list could not be read; the failure reason is shown in full. |
+| Unreachable | Every watched shed is down, and no unwatched running shed is available to set up, so the pane cannot see what is running. `agents.dump`'s `empty.state` is `unreachable`. |
 | Empty | The list came back and there is genuinely nothing to show. |
 
-Only **Empty** offers the bootstrap: "Agent sessions live in a roost-session — on a
-machine, or inside a shed. A shed without one has no sessions to list; install and start it
-from the Sheds pane, then launch an agent here." The setup itself happens on the shed's own
-card in the Sheds pane — see
-[Putting `roost-session` on a shed or machine](../extensions/roost-session-hosts.md) for the
-source ladder, the consent step, and the rollback promise.
+Only **Empty** offers the bootstrap: a shed without a `roost-session` has no
+roost rows to list; install and start it from the Sheds pane. The setup itself
+happens on the shed's own card — see
+[Putting `roost-session` on a shed](../extensions/roost-session-hosts.md) for the
+source ladder, the consent step, and the rollback promise. (The mobile app
+still installs on a `machines:` host as well; this desktop does not.)
 
-## Launching a session
+## Starting a session
 
-New sessions are opened through roost, not through this binary directly:
-`roost.launch`/`machine.launch` open a tab running the chosen agent binary in a chosen
-working directory — see [IPC § Agent sessions](ipc.md#agent-sessions) for the op surface.
-The dialog's **Session name** becomes the tab's title, and it sticks: the agent's own
-terminal title does not replace it. The dialog offers no prompt or permission-mode field,
-because a roost launch cannot deliver either: a launch that carries one is refused rather
-than run without it. A first prompt belongs to a craze session's create sheet (below).
-Kicking off an agent from roost's own command palette instead of this dialog is
-[the `shed` roost provider](../extensions/roost-provider.md).
-
-A craze session is started from the craze create sheet instead: **New craze session** on a
-machine's card, on its group here, or as a "Where" choice in the dialog — see
+A craze session is started from the craze create sheet: **New craze session**
+on a shed's card. See
 [Agent lanes § Creating a session](agent-lanes.md#creating-a-session).
+
+Opening a `claude` or `opencode` tab is
+[the `shed` roost provider](../extensions/roost-provider.md), from roost's own
+palette, or the `roost` app itself. This desktop has no launch dialog.
 
 ### Run a command in a tab
 
-The dialog's **Start** picker has a second mode beside **An agent**: **Run a command**. It
-replaces the Kind picker (and the session-name box, which nothing would receive) with a
-**Command** field, and opens a roost tab running that command line on the chosen shed or
-machine, in the chosen working directory (`roost.run`). It is how an agent's own TUI is started
-with flags of your choosing — `codex --model gpt-5`, say — and it is not limited to agents:
-the first word can name any program on that host (roost execs it directly).
-
-The line is split on **ASCII whitespace** (spaces, tabs, newlines; a non-ASCII space such as
-NBSP is part of the word) into the program and its arguments and run **as typed: there is no
-shell**. Quotes are not understood (`say 'a b'` passes `'a` and `b'` as two arguments, quotes
-included), and `$VARIABLES`, pipes and globs are passed through literally. A blank command is
-refused rather than read as "a plain shell" — roost's own UI opens shells.
-
-What appears in this pane afterwards is whatever roost reports for the new tab: a row once
-roost's own agent hooks recognise the program (a `codex` tab is a plain row with roost's
-activity and directory), and nothing for a program they do not recognise, which stays a plain
-terminal tab in roost.
-
-## Machines
-
-A **machine** is a native host reached over SSH that runs a `roost-session` — no shed
-server in the path, no TLS pin, no control token. Machines come from the `machines:`
-section of `~/.shed/config.yaml`, read at startup; the Machines pane's **Add machine** dialog
-appends one (there is no in-app edit or remove). A machine
-worth showing even when it has no sessions and cannot currently be reached (asleep,
-off-network) contributes its own row on the Machines pane, naming why.
+The desktop does not open a roost tab from a command line. `roost.run` answers
+`unknown_op`. Start that tab in the `roost` app.
 
 ## See also
 
-- [Agent lanes](agent-lanes.md) — the Transcript panel: craze and opencode, capabilities,
-  reconnects, creating a craze session, and the roost `server_url` handshake that turns an
-  opencode row into a lane.
-- [IPC § Agent sessions](ipc.md#agent-sessions) — the full `rc.*`/`machine.*`/`roost.*` op
-  table this pane is driven by.
-- [Putting `roost-session` on a shed or machine](../extensions/roost-session-hosts.md) — the
-  bootstrap this pane's empty state offers.
-- [The `shed` roost provider](../extensions/roost-provider.md) — starting an agent from
-  roost's own palette instead of this pane.
+- [Agent lanes](agent-lanes.md) — the Transcript panel for a craze session.
+- [IPC § Agent sessions](ipc.md#agent-sessions) — the `rc.*` / `roost.*` / `craze.*` ops.
+- [Putting `roost-session` on a shed](../extensions/roost-session-hosts.md).
+- [The `shed` roost provider](../extensions/roost-provider.md) — starting a
+  `claude` or `opencode` tab from roost's palette.

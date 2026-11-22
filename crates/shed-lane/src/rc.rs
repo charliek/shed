@@ -7,8 +7,8 @@
 //! `shed-ext-rc` argv builders, the create/prompt invocations, the permission-mode
 //! table, the stdout decoders, the non-interactive SSH argv, and the last of the
 //! claude.ai pane classifier. What is left is what the SURVIVORS read — the lane
-//! adapters (`shed-opencode`; `shed-gx` until plan 025 C1 retired it, shed#390),
-//! `shed_core::lane`, and `roost::model`,
+//! adapters (craze; gx until plan 025 C1 retired it, shed#390),
+//! `shed_lane`, and `shed_roost::model`,
 //! which synthesizes an [`RcSessionDto`] per roost tab and states its own
 //! capabilities — plus [`RcError`], which shed-mobile's error mapping names.
 
@@ -773,8 +773,8 @@ pub fn strip_format_chars(s: &str) -> String {
 //
 // The normalized transcript rows. Minted by the RC hub through the server proxy
 // until plan 022 (S6, `charliek/shed#328`) deleted it; today every producer is a
-// lane adapter (`shed-opencode`, `shed-gx`) folding its agent's own wire, and
-// `RcFeedMessage` IS `shed_core::lane`'s transcript row. Mobile's decoder
+// lane adapter folding its agent's own wire, and
+// `RcFeedMessage` IS `shed_lane`'s transcript row. Mobile's decoder
 // (`rc_feed.dart`) mirrors these shapes field for field.
 //
 // Each row is sanitized by whatever folded it (ANSI/control-stripped, per-field

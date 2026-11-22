@@ -3,10 +3,14 @@
 [roost](https://github.com/charliek/roost) is a headless per-user session daemon (a
 `roost-session`) with a command palette (`roost-iced`) in front of it. Its palette is
 extensible through **dynamic providers** — small executables that print a menu and act on a
-selection. `shed roost-provider` is shed's provider: it puts "start an agent on a shed or
-machine" into roost's own palette, so opening a `claude` or `opencode` session no longer
+selection. `shed roost-provider` is shed's provider: it puts "start an agent on a shed"
+into roost's own palette, so opening a `claude` or `opencode` tab no longer
 needs a separate tool. (Every other agent — codex, cursor, gx, grok, and anything else
 craze drives — is started through craze instead, not through this provider.)
+Hosts named under `machines:` are not listed. An interactive session on one of
+those hosts belongs in the `roost` app. A `machines:` block in
+`~/.shed/config.yaml` is preserved as an opaque YAML subtree on save — YAML
+formatting and indentation may be normalized on re-encode.
 
 This is the S4 half of the Roost Pivot (`epics/roost-pivot.md`) and the replacement for
 [`sx`](sx.md), which was sunset unreleased before it ever shipped a kickoff path. See
@@ -42,7 +46,7 @@ running `shed` binary's resolved absolute path:
 ```sh
 #!/bin/sh
 # @roost.label: shed
-# @roost.title: Start an agent on a shed or machine
+# @roost.title: Start an agent on a shed
 # Written by `shed roost-provider --install`; re-run it if shed moves. Roost runs
 # this by absolute path with its own (possibly minimal) PATH, so the shed binary
 # is pinned here and the usual install dirs are prefixed, as roost's example does.
@@ -64,10 +68,12 @@ roost drives the provider itself, through `list` and `activate` phases (a person
 these day to day):
 
 1. **`list`** — the top-level menu. No SSH: every running shed across the servers in
-   `~/.shed/config.yaml`, plus every entry under `machines:`. A **stopped** shed is not
-   listed — it cannot take a tab, and `shed start` is slow work that belongs inside a tab, not
-   inside a five-second `list`. Row titles are `shed: <name>` (subtitle: `<server> · <landing
-   dir or ~>`) and `machine: <name>` (subtitle: `[user@]host[:port]`).
+   `~/.shed/config.yaml`. A **stopped** shed is not listed — it cannot take a tab, and
+   `shed start` is slow work that belongs inside a tab, not inside a five-second `list`.
+   A `machines:` entry is not listed. Row titles are `shed: <name>` (subtitle:
+   `<server> · <landing dir or ~>`). An empty fleet says `no shed-server answered`
+   when nothing answered, and `No running sheds` (subtitle `shed start <name>`) when
+   the servers answered and nothing is running.
 2. **Choosing a host** runs one SSH round trip (a probe over `bash -lc`) and two calls over
    roost's own client-bridge (`session.identify`, `tab.list`) — no `roostctl` needed on the far
    side; the provider speaks roost's wire directly. The probe uses **the same shell verb the

@@ -238,7 +238,7 @@ impl RoostSession {
     /// The agent-lane stamp for this tab, or `None` when there is no lane to
     /// open.
     ///
-    /// Since plan 038 retired `shed-opencode`, no roost-tab kind carries a
+    /// Since plan 038 retired the opencode adapter, no roost-tab kind carries a
     /// per-tab agent-lane stamp (craze lanes come from the craze hub roster,
     /// not a roost tab's metadata). Always returns `None`.
     pub fn agent_lane(&self) -> Option<AgentLaneStamp> {
@@ -526,7 +526,7 @@ pub fn roost_capabilities() -> RcCapabilities {
 
 /// Whether a per-tab roost agent-lane adapter exists for `kind`.
 ///
-/// Since plan 038 retired `shed-opencode`, no roost-tab kind has a per-tab lane
+/// Since plan 038 retired the opencode adapter, no roost-tab kind has a per-tab lane
 /// adapter (craze lanes are driven via `shed-craze` against the craze hub), so
 /// `roost_capabilities()` advertises `feed: "activity", watch: false` for every
 /// roost kind.
@@ -1043,7 +1043,7 @@ failed   foreground_process question_asked    -> needs_input";
         assert_eq!(s.agent_kind(), RcKind::Shell);
     }
 
-    /// After `shed-opencode` retirement (plan 038), no roost-tab kind stamps a
+    /// After the opencode adapter's retirement (plan 038), no roost-tab kind stamps a
     /// per-tab agent lane — even an opencode tab reporting a valid loopback
     /// `server_url` renders passively with its kind and activity intact.
     #[test]
@@ -1230,7 +1230,7 @@ failed   foreground_process question_asked    -> needs_input";
             .values()
             .all(|a| a.installed && a.version.is_none()));
 
-        // After plan 038 retired `shed-opencode`, both roost kinds advertise
+        // After plan 038 retired the opencode adapter, both roost kinds advertise
         // `"activity"` and `watch: false` — never `""` and never `"none"`.
         let wire_names = [("claude-rc", "activity"), ("opencode", "activity")];
         assert_eq!(caps.kind_features.len(), wire_names.len());

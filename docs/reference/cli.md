@@ -1619,10 +1619,11 @@ split it.
 
 Implements [roost's](https://github.com/charliek/roost) provider contract so
 roost's own command palette can start an agent — `claude` or `opencode` — on a
-running shed or a `machines:` entry in `~/.shed/config.yaml`, opened as a tab
-in that host's own `roost-session`. Every other agent is started through
-craze instead. See `docs/extensions/roost-provider.md` for the full
-walkthrough; this is the reference for the flags and phases.
+running shed, opened as a tab in that shed's own `roost-session`. A `machines:`
+entry is not listed; an interactive session on one belongs in the `roost` app.
+Every other agent is started through craze instead. See
+`docs/extensions/roost-provider.md` for the full walkthrough; this is the
+reference for the flags and phases.
 
 ```bash
 shed roost-provider [list|activate] [flags]
@@ -1630,7 +1631,7 @@ shed roost-provider [list|activate] [flags]
 
 roost invokes the `list` and `activate` phases itself — through the launcher
 `--install` writes — so these are not commands a person types day to day.
-`list` prints the top-level menu (running sheds and `machines:` entries) with
+`list` prints the top-level menu (running sheds) with
 no ssh, staying inside roost's 5-second default provider timeout. `activate`
 acts on `$ROOST_SELECTED_ID` (or the same key on roost's stdin JSON): probing
 the chosen host, then walking agent selection, workdir selection, and opening

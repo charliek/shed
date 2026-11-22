@@ -295,7 +295,7 @@ step "update-version.sh --components desktop lands all four surfaces + both lock
 grep -q '^version = "0.8.0"' "${SCRATCH}/crates/Cargo.toml" || fail "crates/Cargo.toml didn't bump"
 grep -q '^version = "0.8.0"' "${SCRATCH}/desktop/tauri/src-tauri/Cargo.toml" || fail "tauri Cargo.toml didn't bump"
 [ "$(jq -r '.version' "${SCRATCH}/desktop/tauri/src-tauri/tauri.conf.json")" = "0.8.0" ] || fail "tauri.conf.json didn't bump"
-for dep in shed-core shed-app shed-broker shed-opencode shed-craze; do
+for dep in shed-core shed-app shed-broker shed-lane shed-roost shed-desktop-core shed-craze; do
   grep -A1 "^name = \"${dep}\"$" "${SCRATCH}/crates/Cargo.lock" | grep -q '^version = "0.8.0"' \
     || fail "crates/Cargo.lock ${dep} entry didn't refresh"
   grep -A1 "^name = \"${dep}\"$" "${SCRATCH}/desktop/tauri/src-tauri/Cargo.lock" | grep -q '^version = "0.8.0"' \
@@ -857,23 +857,23 @@ ok "desktop (absent from the EMPTY production NEVER_SHIPPED) still exits 1 with 
 # ---------------------------------------------------------------------------
 # H4: the desktop path list must cover EVERY crate the Tauri app links.
 #
-# `desktop/tauri/src-tauri/Cargo.toml` takes `shed-opencode` as a plain
-# path-dep, so its source IS in the shipped DMG/.deb — but PATHS_DESKTOP used
-# to list neither it nor `shed-gx` (plan 017's second adapter, retired in plan
-# 025 C1 — shed#390), so a correctness fix confined to an adapter recommended
-# NO component at all on a patch tag and the desktop shipped stale. A
-# SEPARATE fixture (the shared one is spent: H2 wrote an rc into its
-# desktop/VERSION).
+# `desktop/tauri/src-tauri/Cargo.toml` takes the shared crates as plain
+# path-deps, so their source IS in the shipped DMG/.deb. PATHS_DESKTOP used
+# to omit an adapter (`shed-opencode`, retired in plan 038; `shed-gx`, plan
+# 017's second adapter, retired in plan 025 C1 — shed#390), so a correctness
+# fix confined to that crate recommended NO component at all on a patch tag
+# and the desktop shipped stale. A SEPARATE fixture (the shared one is spent:
+# H2 wrote an rc into its desktop/VERSION).
 #
 #   v3.0.0  plugin=3.0.0, desktop=3.0.0, so both resolve a basis and a
 #           mis-attributed diff would show up as a WRONG component, not a crash.
 #   HEAD    exactly one commit, touching ONLY one linked crate (each in turn).
 #
-# The loop is over the agent-lane adapters the Tauri app links — shed-opencode
-# and, since plan 025 C9, shed-craze (gx's own commit was removed with it) —
-# and shed-broker, the credential broker the app embeds (plan 037: the app is
-# the only broker, so a broker fix ships only in the desktop). Each re-proves
-# the same genericity by being ADDED to this list, not by a second copy of the
+# The loop is over the crates plan 038 added to the Tauri link set
+# (shed-lane, shed-roost, shed-desktop-core) plus shed-craze and shed-broker
+# (the credential broker the app embeds; plan 037: the app is the only
+# broker, so a broker fix ships only in the desktop). Each re-proves the
+# same genericity by being ADDED to this list, not by a second copy of the
 # fixture. The assertion is desktop AND ONLY desktop, so a lazy "add it to the
 # server too" fix is red here.
 # ---------------------------------------------------------------------------
@@ -881,11 +881,15 @@ FIX4="${SCRATCH}/reco-fixture-h4"
 mkdir -p "${FIX4}"
 git -C "${FIX4}" init -q
 gitf4() { git -C "${FIX4}" -c user.email=t@t -c user.name=t "$@"; }
-mkdir -p "${FIX4}/.claude-plugin" "${FIX4}/desktop" "${FIX4}/crates/shed-opencode/src" \
-  "${FIX4}/crates/shed-craze/src" "${FIX4}/crates/shed-broker/src"
+mkdir -p "${FIX4}/.claude-plugin" "${FIX4}/desktop" \
+  "${FIX4}/crates/shed-lane/src" "${FIX4}/crates/shed-roost/src" \
+  "${FIX4}/crates/shed-desktop-core/src" "${FIX4}/crates/shed-craze/src" \
+  "${FIX4}/crates/shed-broker/src"
 printf '{"version": "3.0.0"}\n' > "${FIX4}/.claude-plugin/plugin.json"
 printf '3.0.0\n' > "${FIX4}/desktop/VERSION"
-printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-opencode/src/fold.rs"
+printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-lane/src/fold.rs"
+printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-roost/src/fold.rs"
+printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-desktop-core/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-craze/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-broker/src/fold.rs"
 gitf4 add -A; gitf4 commit -q -m 'v3.0.0 base'
@@ -897,7 +901,7 @@ run_reco4() {
   RECO_ERR="$(cat "${SCRATCH}/reco4.err")"
 }
 
-for adapter in shed-opencode shed-craze shed-broker; do
+for adapter in shed-lane shed-roost shed-desktop-core shed-craze shed-broker; do
   step "recommend-components.sh: a ${adapter}-only change flags desktop (the Tauri app links it) and nothing else"
   printf 'pub fn fold() { /* changed */ }\n' > "${FIX4}/crates/${adapter}/src/fold.rs"
   gitf4 add -A; gitf4 commit -q -m "desktop: ${adapter} change"

@@ -16,7 +16,7 @@ matters:
 
 The BYTE-level pin (that Rust still emits always-quoted form rather than drifting
 to a conditional quoter, which post-`bash` would be indistinguishable here) lives
-in the Rust leg: `crates/shed-core/tests/machine_transport_contract.rs`. The two
+in the Rust leg: `crates/shed-lane/tests/machine_transport_contract.rs`. The two
 legs together cover both layers; neither covers both alone.
 """
 

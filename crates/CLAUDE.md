@@ -7,155 +7,60 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
 
 ## The crates
 
-- **`shed-core`** — a *pure* Rust lib (no UI): the reqwest(rustls) HTTP client, the
-  SSE parser, defensive wire decoders, leaf-cert TLS pinning, the control-token FSM, a `config`
-  parser, the pull-based `create` orchestration store, and `rc.rs` — which since plan 022
-  (S6, charliek/shed#328) is the Remote-Control **model and nothing else**: `RcKind` /
-  `RcState` / `RcActivity`, `RcCapabilities` / `RcKindFeatures`, the `RcSessionDto` wire
-  row, the `RcFeed*` transcript rows `lane.rs` reuses, and `RcError` (shed-mobile's error
-  mapping names it). The argv builders, the create/prompt invocations, the permission-mode
-  table, the stdout decoders, the non-interactive ssh argv and the last of the claude.ai
-  pane classifier all went with the hub; `hub_client.rs`, `rc_events.rs` and `rc_agents.rs`
-  went with it entirely (`shell_quote_always` moved from `rc_agents` into `machine.rs`,
-  where `display_line` — the one composer every machine transport shares — is its only
-  caller). The Linux clients link it directly.
-  `lane.rs` (plan 015; split in plan 025 C4, shed#391) is the **agent-lane contract** —
-  the DTOs plus TWO async traits that normalize "a coding agent with sessions, a
-  transcript and approvals": a machine-level `AgentSource` (`subscribe` → the live session
-  list as `SourceEvent`s, `create_options`, `create`, `open(id)`, and — plan 032, both with
-  "this source cannot" defaults — `saved` and `reopen(id)`) and the session-scoped
-  `AgentLane` it opens (no verb takes an id; `settings`/`set`/`stop`/`set_title` have no
-  default bodies). One adapter per agent implements both (opencode over its local HTTP server;
-  craze over its per-machine hub, `shed-craze` — its source since plan 025 C7, its lane
-  since C8 — in the slot plan 017's `gx` adapter held until plan 025 C1 retired it, shed#390).
-  **Capabilities are per session and ride
-  the stream** (`LaneEvent::Capabilities`, and `Settings` when they say so) — there is no
-  capabilities getter, so a client reads them from its view, never caches them at open.
-  Plan 029 added the **slash catalog** — `LaneEvent::Slash{catalog}` (`LaneSlashCatalog` →
-  `LaneSlashRow` → `LaneSlashRun`, six tolerant `Other(String)` enums written once by a
-  private `tolerant_enum!` macro), only where `LaneCapabilities.slash` says so, and
-  OPTIONAL in a seed (after its `Capabilities`, before its `Ready`, exactly when the
-  session has a catalog: no `Slash` in a seed IS no catalog, since a client clears it
-  with every seed; conformance's `SlashNotAdvertised`, no completeness rule) — plus
-  `AgentLane::set_title` (`LaneCapabilities.set_title`; the new title returns on the
-  stream as a `Session` row, never from the reply) and a name at create
-  (`LaneCreateRequest.title`, honoured where `SourceCapabilities.create_title`; opencode
-  refuses a titled create before any POST). Every new field is `serde(default)`, so a
-  pre-029 producer decodes.
-  `LaneEvent::Stale` is a non-terminal transport loss (a silent resume ends it with a lone
-  `Ready` of the same generation); `Down` alone ends a lane; a source's outage is the
-  non-terminal `SourceEvent::Offline`. Pure types, **no I/O** — the transport, fold, ring
-  and reconnect loop belong to whatever crate implements them. It lives here, not in
-  `shed-app`, because shed-mobile links the DTOs through FRB. `lane::conformance` (behind
-  `test-support`) is the shared kit every adapter's tests run their streams through (the
-  bracket, capabilities before `Ready`, seq, silent resume, `Down` last, no source-set
-  `tab_id`). `time.rs` is the pure RFC 3339 → unix-ms parser (no `chrono`; correction 10).
-  It also owns the one shared overflow policy (plan 018, module doc correction 13), for
-  BOTH levels: the frame channel (`Subscription<T>`, aliased `LaneSubscription` /
-  `SourceSubscription`) is bounded at `LANE_CHANNEL_CAPACITY` (1024 frames), and the
-  generic `Publisher<T>` (`LanePublisher` / `SourcePublisher`) — deliberately **not**
-  `Clone`, one per subscription — is the only way onto it: `publish` (`try_send`; a full
-  channel answers `Publish::Lagged` and drops the frame), `publish_final` (consumes self
-  and awaits; the terminal `Down` is the one frame that can never be the dropped one),
-  `publish_waiting` (awaits room like `publish_final` without consuming — ONLY for the
-  rows a terminal path flushes just before its `Down`, never on a live path), and
-  `wait_drained` (resolves only once every slot is free). Every adapter propagates a
-  `Lagged` out of every emitting helper and reseeds rather than silently resumes — the
-  dropped frames may already be behind the client's cursor (plan 017's gx adapter, which
-  also offered a bounded silent resume on its OWN cursor-honoured reconnect, proved the
-  two are independent; it was retired in plan 025 C1, shed#390).
-  **The FRB-mirror rule (load-bearing):** mobile HAND-mirrors every lane DTO into Dart, so
-  every field is an owned `String`/`Option`/`Vec`/scalar — **no `serde_json::Value`, no
-  `HashMap`, no borrowed lifetimes**; free-form payloads travel as a `String` of raw JSON
-  (`LaneApproval::request_json`, `LaneAnswer::Raw`). A fielded enum becomes a Dart sealed
-  class, a plain one a plain Dart enum. Same rule as `rc.rs`'s feed types, which `lane`
-  reuses (`RcFeedMessage` IS the transcript row) — which is why those gained `Serialize`
-  plus a tolerant `Deserialize` delegating to their existing `from_map` reader.
-  `craze.rs` (plan 025 C5) is the **craze remote command**, pure like `machine.rs`: the
-  `sh -c '<ladder>'` argv every client runs to reach `craze` on a host —
-  `bridge_hub_argv`/`bridge_hub_command` (a hub connection that starts a hub when none runs),
-  `bridge_hub_no_start_argv`/`bridge_hub_no_start_command` (plan 032 §3.5: craze 0.2.0's
-  `bridge --hub --no-start`, which attaches only to a running hub — none is exit 3 — the
-  desktop's background remote dial), `providers_hub_argv` (the
-  find-only probe, which never starts a hub) and `attach_argv(host_id)` (Open in terminal;
-  the id must be twelve lowercase hex digits). The script is craze's published
-  binary-finding ladder verbatim plus one change, an enhanced PATH applied only at the
-  `exec`, composed over two tables (`Ladder { rungs, exec_path }`) so tests can re-root
-  them; the `*_argv_jailed()` variants keep rungs 1–2 and no PATH change, for test mode
-  only. `tests/machine-transport`'s `craze-bridge-hub`/`craze-bridge-hub-no-start`/
-  `craze-providers-hub` scenarios EQUAL the composers' output (the Rust leg asserts it), and
-  `tests/craze_ladder.rs` runs the ladder for real under every local `sh`.
-- **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
-  embedded broker bridge (`broker_bridge.rs`, behind the non-default
-  `broker = ["dep:shed-broker"]` feature — leg 3a.2), which since plan 022 is its ONLY
-  non-default feature (`rc`, the `RcRunner` seam plus the re-exported `shed-rc-engine`,
-  went with the hub). `roost.rs` (plan 013, ungated like `machine.rs` so mobile's
-  default-features build links it) is the reach + watcher layer over `shed_core::roost` —
-  `RoostReach`/`RoostWatcher`/`RoostPeek` — that both clients read a machine's or the local
-  `roost-session` through. A bare `cargo test`/`clippy` run against `shed-app` **alone**
-  (`-p shed-app`, no `--features`) skips `broker_bridge.rs` — cover it with
-  `-p shed-app --features broker`, which is its ONLY coverage and what CI runs.
-  `lane_view.rs` (plan 018 §3.5, ungated for the same reason `machine.rs` and
-  `roost.rs` are) is the **staged agent-lane view** — `LaneView`/`LaneViewSnapshot`,
-  moved down out of the Tauri crate — that folds a `shed_core::lane` subscription
-  (messages, activity, generation, approvals, and — staged and swapped with the seed —
-  the session row and its capabilities and settings) into what `lane.messages`/`lane.approvals`
-  return, behind the same `Reset … Ready` staging the contract promises. Generations are
-  MATCHED (only a `Ready` equal to the staged `Reset`'s swaps; only one equal to the live
-  generation clears `stale`), and `stale` (the banner, set by `Stale` or `Down`) is kept
-  apart from `ended` (set only by `Down` — the one thing a client reopens a lane on);
-  `LaneView::snapshot(since_seq)` is the typed projection both a full read and a delta
-  poll go through. It is ungated because mobile links `shed-app` with default features
-  and needs the identical fold — the phone showing the same view the desktop shows is
-  a property of one implementation, not two that have to agree. Since plan 029 it also
-  stages the session's slash catalog with the seed (every `Reset` clears it, so a seed
-  with no `Slash` is no catalog; capabilities that drop `slash` drop it) and hands out
-  the RESOLVED menu as `LaneViewSnapshot.slash_menu`, recomputed only when the catalog,
-  the capabilities or the settings change (the settings decide craze 0.2.0's `/effort`,
-  plan 032) — plus `effort_option`, the shown settings' effort option by craze's
-  `EffortOption` rule (`shed_core::lane::LaneSettings::effort_option`), so neither
-  client's chip ports it. `slash_menu.rs` (plan 029 §3.4, ungated, pure) is the `/`
-  menu's one rule set — `resolve(catalog, caps, settings)` (which rows show, each with its
-  `SlashAction`, and the hidden builtin names a typed command is refused for; `/effort`
-  shows only with a current model that has an effort option, and its `EffortPicker`
-  carries the levels and the model's offered default level), `filter` (the open rule, craze's
-  four match buckets, UTF-16 carets, `dimmed` while working, and `start` — the first
-  row not dimmed, where a client's highlight resets to, plan 030), `dispatch` (the
-  single-line grammar and its guard — and `/effort <level>`'s own arm, craze's
-  `MatchEffortValue` and its exact refusal text, `default` reserved; plan 032 PC8),
-  `accept` (Enter/Tab/pick) and `is_working` — which
-  the desktop calls through Tauri commands and the phone through FRB, so neither client
-  re-derives a rule.
-  `craze_rows.rs` (plan 025 §3.6.3, ungated for the same reason) is **the craze row
-  merge, D4 literally**: `fold_plan(roost_tabs, hub_rows)` for ONE machine — with the
-  hub feed live (`Some`) every craze-owned roost tab is absorbed (attached to the hub row
-  whose `provider_session_id` it names, or hidden when none does), with it down (`None`)
-  nothing is; only craze ownership folds, the newest tab of a session attaches, two rows
-  claiming one session resolve to the newer `since`/`startedAt` then the greater hostId.
-  The desktop applies it in `roost_hosts.rs`; the phone (CM3) links the same function.
-  `SshExec::spawn_duplex(command)` (C9) is the long-lived sibling of `SshExec::run` — the
-  same pinned config and private ControlMaster, all three bands piped, killed on drop —
-  that the desktop's remote craze dial runs `craze bridge --hub` (`--no-start`, plan 032)
-  through.
-  `spawn_gate.rs` (plan 026 §3.3, ungated) is the desktop's orderly-shutdown barrier: a
-  `SpawnGate` whose sections every spawn site takes across check → spawn → registration
-  (`SshExec`, `SshForward`'s slot and `SshBridge`'s establishment, each through an optional
-  gate — `SshBridgeOptions::spawn_gate`, `SshForward::with_spawn_gate`, `None` for the phone)
-  and a registry of kill-and-await handles (never a pid) the drain ends; `close()` waits,
-  bounded, for every section in progress, a registration on a closed gate kills its own child
-  and answers `shutting_down` (counted, with the pid of any whose exit it did not see), and the
-  drain waits for open sections and sweeps again rather than reading one snapshot — reporting
-  what it abandoned at its bound (`Drained`, `SlotsClosed`; plan 026 AM4). A forward slot
-  sends its SIGKILL under its mutex, before the child leaves it. Alongside it:
-  `MachineForward::close_now` (answering whether it settled), `RoostReach::shutdown` and
-  `TunnelOpener::open_owned` (all defaulted), the bridge's teardown `JoinSet`
-  (`TeardownSink`), and `SshExec::shutdown`'s bounded `-O exit` plus its pid fallback
-  (verified against the control path with `ps`), every step — including the retry an
-  unconfirmed master's `Drop` would have made — clamped to one `MASTER_SHUTDOWN_BOUND`, after
-  which the runner is marked so its `Drop` does nothing.
-  `shed-craze`'s `ExitWatch::pid()` exists only to name a child in such a log.
-- **`shedctl`** — a headless UDS/IPC client on `shed-core` (no GUI-toolkit dep), shipped in the
-  Linux `.deb` and drives the Tauri app's socket. In `default-members`.
+Plan 038 split the old `shed-core` / `shed-app` mix into a zero-cycle DAG and
+retired the opencode adapter crate. Default members are every crate below except
+`shed-broker-harness`. WebKitGTK/Tauri deps stay out of this workspace.
+
+```
+shed-lane (pure leaf: no shed-core, reqwest, roost-ipc, or chrono)
+   ├── shed-core ── shed-broker
+   │       └── shed-app ── shed-desktop-core
+   ├── shed-craze ────────────┘
+   └── shed-roost (sole direct roost-ipc consumer) ──┘
+shedctl (no internal deps)
+```
+
+- **`shed-lane`** — pure agent-lane and RC DTO leaf (`lane` including
+  `conformance` under `test-support`, `rc` with `RcSession` / `RcKind` /
+  `strip_format_chars`, `text`, `time` including `rfc3339_z`, the craze
+  command ladder in `craze`, `shell_quote` (`shell_quote_always`,
+  `display_line`), `lane_view`, `slash_menu`, `craze_rows`, `backoff`).
+  `tests/machine_transport_contract.rs` and `tests/craze_ladder.rs` live here.
+  Android-clean. `RcKind::Opencode` stays so a passive roost tab can still
+  name the tool; there is no opencode adapter.
+- **`shed-core`** — pure shed-server protocol (`http`, `models`, `sse`,
+  `create`, `tls`, `token`, `csr`, `certuser`, `authfail`, `identityfile`,
+  `terminal`, `approval`, `config` for `servers:` + `default_server` +
+  `known_hosts_path()`). Depends on `shed-lane` for `RcSession` and the text
+  helpers `OverviewShed` and credential-source display use. **No `roost-ipc`,
+  no `machines:` config, no machine-insert editor.** Keeps `regex` (`token.rs`) and `libc`
+  (`identityfile.rs`). Android-clean.
+- **`shed-roost`** — the **sole** direct `roost-ipc` crate in `crates/`:
+  `conn`, `error`, `fence`, `model`, `paths`, `bootstrap` (including
+  `bootstrap/machines.rs`, the install state machines — not a `machines:`
+  config), `testing::FakeRoost` under `test-support`, `spawn_gate`,
+  `ssh_endpoint` (`SshEndpoint`, `check_identity`, `user_at_host`, `ssh_argv`,
+  `FixedPort`, `ForwardError`), and `reach` (`RoostReach`, `RoostWatcher`,
+  `tab_open` / `tab_open_fenced`, `launch_argv`, `ReachKind`).
+  `lane_adapter_exists` is false, so `roost_capabilities()` advertises
+  `feed: "activity", watch: false` for an opencode tab. `RELEASE_PIN` lives in
+  `src/bootstrap/source.rs`. Android-clean.
+- **`shed-app`** — toolkit-free shed client core: `Backend`, `AuthModeRegistry`,
+  `Coordinator`, `AuditStore`, `BrokerEvent`, the embedded broker bridge
+  (`broker_bridge.rs`, non-default `broker` feature — its only non-default
+  feature), `traits`, `fakes`, `timefmt`. **No `roost-ipc`, no `shed-roost`,
+  no `shed-lane`, no `saphyr-parser` under default features.** A bare
+  `cargo test -p shed-app` skips `broker_bridge.rs`; cover it with
+  `--features broker`.
+- **`shed-desktop-core`** — toolkit-free **shed-only** runtime the Tauri shell
+  (and a future iced UI) hosts: `ShedId` (`roost:<server>/<shed>`),
+  `ShedHosts`, `ShedCraze` (remote attach-only), `ShedLanes`, `slash`, and
+  `shutdown_children`. Depends on `shed-app` with **default features only —
+  never `broker`**. No `tauri`, no `iced`, no `shed-broker`, no direct
+  `roost-ipc`.
+- **`shedctl`** — a headless UDS/IPC client with no dependency on the other
+  crates here (`serde_json`, `base64`, `libc`), shipped in the Linux `.deb`.
+  In `default-members`.
 - **`shed-broker`** — the embeddable credential broker core: the shed-server plugin bus,
   the multi-server supervisor + discovery watcher, the SSH/AWS/Docker/egress credential
   backends, the SSH-bootstrap minter + control-token provider, the approval/audit seams
@@ -186,46 +91,21 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   workspace by feature unification and hide dead code in the default build shed-mobile
   links. For the same reason `make -C desktop core-lint`'s workspace leg excludes it and
   a leg of its own lints it. It ships in no release (`tests/not_shipped.rs`).
-- **`shed-opencode`** — the **opencode adapter** for `shed_core::lane` (plan 015): the
-  implementation of both contract traits that talks to an opencode server's local HTTP
-  API — the same server the TUI is already running, never a sidecar it launches itself.
-  `OpencodeSource` (plan 025 P7) is the `AgentSource` (a 5 s poll of the session list,
-  create with an optional first prompt, `open` binding an id with no I/O) and
-  `OpencodeLane` the session-scoped `AgentLane` it opens (the pre-split verbs with the id
-  bound; every seed carries its fixed `Capabilities` row; `settings`/`set`/`stop`
-  answer "unsupported"). The Tauri client consumes it as a plain path-dep, opening each
-  lane as `OpencodeSource::new(url, None).open(session_id)` (a machine row's
-  `agent_lane` stamp, fed by roost's `server_url` report on the tab; see
-  `docs/desktop/agent-lanes.md` for the end-to-end contract and its current limits).
-  `fold.rs` is a **port** of the rc hub's `OpencodeFold`, and it is pinned as one —
-  `fixtures/opencode_turn.golden.json` records what the HUB's fold produced on
-  `fixtures/jsonl/opencode_turn.jsonl`, and the test replays the port against it (that
-  test must NEVER take a `shed-broker` dep; the golden file is the pin). A **second**
-  golden, `fixtures/1.18.29/fold.golden.json`, pins the port's OWN behavior (rows,
-  verdicts and `LaneApproval` DTOs) over a committed 155-frame opencode 1.18.29
-  recording — regression detection, not fidelity, except for the transcript subset that
-  was separately proven identical to the hub's fold. **The two claims must never be
-  blurred**; `shed-opencode/fixtures/README.md` is the one place that spells them out,
-  and it carries the two-step regeneration recipe (re-record the wire live with
-  `SHED_OPENCODE_LIVE=1 SHED_OPENCODE_RECORD=1 … --test live`; re-derive the golden
-  OFFLINE with `SHED_OPENCODE_REGOLD=1 … --test fold_fixtures`). The helpers the
-  fold needs are **copied** into `helpers.rs` rather than linked, because
-  `rc_hub::watch` imported `shed_rc_engine::tmux::Tmux` — linking would have dragged the
-  RC engine into an HTTP adapter. S6 (plan 022) deleted the hub, so `helpers.rs` is now
-  the only copy and the golden is what still pins it. In `default-members`.
-  (`shed-gx` — the **gx adapter**, plan 017's second implementation of
-  `AgentLane` against gx's remote lane — lived here the same shape, with the
-  twelve contract corrections it forced recorded in `shed_core::lane`'s own
-  module doc; it was retired in plan 025 C1, shed#390, when gx and the other
-  direct-agent kinds left shed for the craze lane. `shed-craze`, below, holds
-  this slot now.)
-- **`shed-craze`** — the **craze adapter** for `shed_core::lane` (plan 025 C7+, shed#392):
+  `crates/shed-core/tests/crate_isolation.rs` (cargo metadata) holds the DAG above:
+  no `roost-ipc` outside `shed-roost`, no `reqwest`/`chrono`/`shed-core` in
+  `shed-lane` or `shed-craze`, no `shed-broker`/`saphyr-parser` in default
+  `shed-app`, no `tauri`/`iced`/direct `roost-ipc` in `shed-desktop-core`.
+- **The opencode adapter crate was removed in plan 038.** Craze is the only agent lane.
+  An opencode roost tab still renders as a passive status row (`RcKind::Opencode`);
+  interactive opencode sessions belong to the `roost` app.
+
+- **`shed-craze`** — the **craze adapter** for `shed_lane` (plan 025 C7+, shed#392):
   one machine's craze **hub** — craze's per-machine process that lists every cursor, grok,
   claude and native session, says what a create can start, starts one, and splices a client
   through to a session's host — as an `AgentSource`, `CrazeSource`. **The transport is the
   client's** (P8): every connection is a fresh duplex to `craze bridge --hub` from a
   client-supplied `CrazeDial` — `ProcessDial` (a local `/bin/sh -c '<ladder>'`, run by
-  absolute path; the ladder is `shed_core::craze`'s), `TcpDial` (the phone's loopback
+  absolute path; the ladder is `shed_lane::craze`'s), `TcpDial` (the phone's loopback
   port), and the desktop's `SshExec` duplex (C9) — one for the roster, one per
   `createOptions`, one per create, because the hub answers one request at a time, in
   order. `conn.rs` is one NDJSON connection: craze's line limits **from the client's
@@ -302,7 +182,7 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   reason `not_resumable` is `Gone` (drop the saved row), `start_failed` is `StartFailed` (show
   the cause, keep the row), because craze's own reopen table gives the two opposite client
   actions and `NotAccepting` is a unit variant; only `session.reopen` reads that reason
-  (`shed_core::lane`'s error table and `errors.rs` say the same). `tests/recipe_source.rs`'s
+  (`shed_lane`'s error table and `errors.rs` say the same). `tests/recipe_source.rs`'s
   reopen cells are craze's reopen recipe (the index seeded through
   `Recipe::write_saved_sessions`, the agent the fake agent's `grok-load`). **`CrazeLane`** (plan 025 C8, `open` binds one with no I/O) is one
   session: its watcher (`watcher.rs` — the state machine table is its module doc) dials
@@ -399,7 +279,7 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `fixtures/README.md` says what each artifact claims and how to re-record
   (`SHED_CRAZE_LIVE=1 SHED_CRAZE_RECORD=1 … --test live`) and re-derive
   (`SHED_CRAZE_REGOLD=1`). Every source and lane frame goes through
-  `shed_core::lane::conformance`.
+  `shed_lane::conformance`.
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that the Rust decoders assert against — keep them
@@ -410,8 +290,8 @@ rule.
 
 ## The one git dependency: `roost-ipc`
 
-`shed-core` depends on `roost-ipc` (the Roost Pivot, plan 013) — the only git dependency in
-this workspace, and it is **rev-pinned in `Cargo.toml`, not just in `Cargo.lock`**:
+`shed-roost` is the **sole** direct consumer of `roost-ipc` (the Roost Pivot, plan 013) — the only git dependency in
+this workspace, and it is **rev-pinned in `crates/Cargo.toml`'s `[workspace.dependencies]`, not just in `Cargo.lock`**:
 
 ```toml
 roost-ipc = { git = "https://github.com/charliek/roost", rev = "<sha>" }
@@ -423,17 +303,16 @@ was on the day its own lock was regenerated, against a crate that publishes **no
 stability promise** (the pin is what absorbs that). With the rev in the manifest, mobile's
 lock cannot disagree, so `shed-mobile/scripts/check-lock-rev.sh` needs no change.
 
-**Bump recipe:** edit the `rev` in **all three manifests that pin it** — `crates/Cargo.toml`,
-`desktop/tauri/src-tauri/Cargo.toml`, and shed-mobile's `rust/Cargo.toml` — then run
-`cargo update -p roost-ipc` in each of the three workspaces so all three lockfiles
-(`crates/Cargo.lock`, `desktop/tauri/src-tauri/Cargo.lock`, `shed-mobile/rust/Cargo.lock`) move
-together. One manifest moving without its siblings is not a smaller version of the same bump —
-it puts two disagreeing copies of `roost-ipc` in one dependency graph the moment shed-mobile's
-git dep resolves `shed-core` against the old rev, and the desktop's own comment on this
-(`desktop/tauri/src-tauri/Cargo.toml:55-59`) says so. Re-copy `fixtures/roost-vectors/` from the
-new rev's `tests/ipc-vectors/` (updating that README's sha), commit all of it. Re-read roost's
+**Bump recipe:** edit the `rev` in `crates/Cargo.toml`'s `[workspace.dependencies]`
+(the desktop workspace no longer pins `roost-ipc` itself; it reaches it only through
+`shed-roost`) and in shed-mobile's `rust/Cargo.toml`, then run `cargo update -p roost-ipc`
+in `crates/`, in `desktop/tauri/src-tauri/` (Tauri locks `roost-ipc` transitively through
+`shed-roost`, so `desktop/tauri/src-tauri/Cargo.lock` moves with the pin), and in
+shed-mobile's `rust/` so the lockfiles move together. Re-copy
+`fixtures/roost-vectors/` from the new rev's `tests/ipc-vectors/` (updating that README's sha),
+commit all of it. Re-read roost's
 `docs/reference/ipc-compatibility.md` on any bump crossing a `SESSION_PROTOCOL_VERSION` change —
-`shed_core::roost::Conn::session_identify` refuses a mismatch by name rather than limping. roost
+`shed_roost::Conn::session_identify` refuses a mismatch by name rather than limping. roost
 keeps **one `session.identify` vector per generation**
 (`session.identify.response.v<N>.json`); shed vendors only the current one, so a generation bump
 renames the vendored file and **every** reader of it moves with it. The full list is not
@@ -480,15 +359,15 @@ gone — not narrowed, retired outright, with no replacement — and everything 
 - **`tab.effect` now reaches every subscriber.** roost's `event_push.rs` dropped the
   observer/driver filter that used to keep it off a plain `events.subscribe`, so watching a
   session sees the same fan-out an interactive client does.
-  `shed_core::roost::Fence::apply_event`'s catch-all absorbs it unread — a watcher views no tab,
+  `shed_roost::Fence::apply_event`'s catch-all absorbs it unread — a watcher views no tab,
   so an effect frame is inert here.
 - **A fresh subscribe gets back the daemon's incarnation.** `EventsSubscribeResult.session_id`
-  is always present now; `shed_app::roost::RoostWatcher` compares it against the `session_id`
+  is always present now; `shed_roost::RoostWatcher` compares it against the `session_id`
   `session.identify` returned on the other connection and treats a mismatch as an immediate
   resync, rather than waiting for the next cycle's EOF to fix it by accident.
 - **The watcher still does not poll.** Unchanged from protocol 4: one *observe cycle* — identify
   on conn A, `subscribe()` on conn B, `tab.list` on conn A, then fold batches through
-  `shed_core::roost::Fence` — and a `Snapshot` only when a row actually changed. A bare EOF and a
+  `shed_roost::Fence` — and a `Snapshot` only when a row actually changed. A bare EOF and a
   revision gap are **resyncs** (a new cycle at once, no `Down`), bounded by
   `MAX_CONSECUTIVE_RESYNCS`. **`SHED_ROOST_POLL_MS` is gone**, with `POLL_INTERVAL` and the rest
   of the cadence: latency is the push, and the only sleep left is the failure backoff.
@@ -499,11 +378,11 @@ gone — not narrowed, retired outright, with no replacement — and everything 
   `SessionSetAgentHooksParams` is now `{agents, client}`. `mode`/`skip` retired with **nothing
   replacing them** — there is no narrowing direction left on this op, and removal is a
   deliberate local act on the host (`roostctl agent uninstall`), not something a client can ask
-  for. See `crates/shed-core/src/roost/bootstrap/hooks.rs` for shed's `ROOST_WIRED_AGENTS` and
+  for. See `crates/shed-roost/src/bootstrap/hooks.rs` for shed's `ROOST_WIRED_AGENTS` and
   the doc-extensions page for the user-facing consequence (re-widening).
 - **`EventFrame::Ended` / the wire's `stream.ended` exists, and it is a resync, not a Down.**
   Its one defined reason is `backend-switch` — the daemon is alive and this stream's workspace
-  is being replaced — so `shed_core::roost` treats it exactly like a bare EOF: a fresh cycle at
+  is being replaced — so `shed_roost` treats it exactly like a bare EOF: a fresh cycle at
   once, counted against the same `MAX_CONSECUTIVE_RESYNCS` bound as any other resync.
   `session.stopping` is unchanged and still means the daemon itself is going away (a `Down`).
 - **`TabOpenParams.activate` is new.** `Some(false)` opens a tab without selecting it or its
@@ -516,25 +395,24 @@ gone — not narrowed, retired outright, with no replacement — and everything 
 - **`session.identify`'s `SessionIdentify` gained `persist_error` and `ops`.** `persist_error`
   names why the last `state.json` write failed; `ops` lists the ops this session would actually
   dispatch right now (absent from an older session). Neither is consumed by shed's roost client
-  today — see `crates/shed-core/src/roost/model.rs` if that changes. (`features` is unrelated
+  today — see `crates/shed-roost/src/model.rs` if that changes. (`features` is unrelated
   and already gone: it retired off this same struct with the lease, at protocol 5, not here.)
 
 **What it drags in.** `roost-ipc`'s own leaf deps — **`anyhow`**, the **`tracing` facade** (a
-facade only: no subscriber, no `tracing-subscriber`) and **`libc`** — are new to `shed-core`'s
-dependency set but were *already* in this workspace's lock. What it does gain is tokio
-features: the workspace asks for `rt-multi-thread, macros, sync, time`, `shed-core` adds
-`net, io-util` (the roost connection and its loopback pump — build-time now, not just
-dev-time), and roost-ipc unifies in `fs, process, signal, rt`; `cargo tree -e features -p
-shed-core` prints the resulting set. The workspace `rust-version` is **1.97**, which is roost-ipc's MSRV.
+facade only: no subscriber, no `tracing-subscriber`) and **`libc`** — sit on `shed-roost`,
+not on `shed-core`. The workspace asks for tokio `rt-multi-thread, macros, sync, time`;
+`shed-roost` adds `net, io-util, process` (the roost connection and its loopback pump).
+`cargo tree -e features -p shed-roost` prints the resulting set. The workspace
+`rust-version` is **1.97**, which is roost-ipc's MSRV.
 
-`shed-app` also takes the **`tracing` facade** directly (plan 014): the roost observer loop has
-two things worth saying that are neither an error nor an update — a resync, and somebody else
-taking the interactive lease. It adds no crate to the lock (roost-ipc already brings the same
+`shed-roost` takes the **`tracing` facade** directly (plan 014): the roost observer loop has
+two things worth saying that are neither an error nor an update — a resync, and a session
+the watcher did not expect. It adds no crate to the lock (roost-ipc already brings the same
 facade into that graph), there is still **no subscriber** anywhere in this workspace (the
 Tauri app installs one in its OWN workspace — `desktop/tauri/src-tauri/src/applog.rs`, #414),
 and a client that installs none pays nothing.
 
-**Android.** `cargo check -p shed-core --target aarch64-linux-android` is the early gate for
+**Android.** `cargo check --target aarch64-linux-android -p shed-core -p shed-lane -p shed-roost -p shed-craze` is the early gate for
 mobile (`roost-ipc` compiles for it cleanly — its `peer.rs` has a fail-closed non-linux/macOS
 fallback). It needs the NDK's clang on the env for `ring`'s build script
 (`CC_aarch64_linux_android`, `AR_aarch64_linux_android`,
@@ -543,7 +421,7 @@ CI — that requirement predates roost-ipc.
 
 **The `-dev` trap.** `roost_ipc::paths::BundleProfile::session()` (and `ssh::classify`) append
 `-dev` when the **consuming** crate is a debug build, so a debug shed would look for a dev
-roost and find nothing — which is why `shed_core::roost::paths` resolves the session socket
+roost and find nothing — which is why `shed_roost::paths` resolves the session socket
 itself (release path first, `-dev` sibling only as a fallback) and shed never calls roost's
 resolver. Related: `roost_ipc::ssh` reads `ROOST_SSH_BIN` / `TMPDIR` / `ROOST_TEST_MODE` from
 the shed process env, so build `SshTunnelOptions` explicitly rather than with `from_env()`
@@ -582,19 +460,19 @@ onto `saphyr-parser` would be a separate shed-core slice, not assumed here.
 ## Build / test
 
 ```bash
-cd crates && cargo test                              # workspace tests
-cargo test -p shed-app --features broker             # the embedded broker bridge (3a.2)
-cargo test -p shed-core --features test-support      # exports `roost::testing::FakeRoost` + `lane::conformance`
+cd crates && cargo test                              # workspace tests (default members)
+cargo test -p shed-app --features broker             # the embedded broker bridge
+cargo test -p shed-lane --features test-support      # exports lane::conformance
+cargo test -p shed-roost --features test-support     # exports testing::FakeRoost
 cargo clippy --workspace --exclude shed-broker-harness --all-targets -- -D warnings
 cargo test -p shed-broker -p shed-broker-harness --all-targets   # the broker + its wire-harness host
 cargo clippy -p shed-broker-harness --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
-cargo test -p shed-opencode                          # the opencode agent-lane adapter
-cargo test -p shed-opencode --features test-support  # exports `testing::FakeOpencode`
 cargo test -p shed-craze                             # the craze adapter (recipe cells skip)
 # the craze recipe against the real hub: build the pinned binaries, then require them
 make -C .. craze-binaries                            # prints SHED_CRAZE_BIN_DIR=…
 SHED_CRAZE_BIN_DIR=… SHED_CRAZE_REQUIRE=1 cargo test -p shed-craze --all-targets --features test-support
+cargo test -p shed-lane --test machine_transport_contract --test craze_ladder --locked
 ```
 
 Note: `broker` is the one non-default feature left in this workspace. A bare
@@ -604,7 +482,7 @@ runs). `shed-app`'s other non-default feature, `rc`, went with `shed-rc-engine` 
 RC hub in plan 022 (S6, #328); `sx`, which used to enable `rc` workspace-wide by feature
 unification, was sunset in plan 016 (S7, #329).
 
-`shed-core` also builds/tests on Linux — `make -C desktop core-linux` runs it in Docker.
+The shared crates also build/test on Linux — `make -C desktop core-linux` runs them in Docker.
 
 ## Version lockstep
 

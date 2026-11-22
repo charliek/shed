@@ -6,39 +6,40 @@ and the wire DTOs — lives in a shared Rust core in the monorepo's top-level
 re-implementing it per language. Its consumers:
 
 - **the desktop app** — the Tauri client on macOS and Linux (`desktop/tauri/src-tauri`),
-  which links `shed-core` + `shed-app` as path dependencies;
+  which links `shed-core`, `shed-app` (with `broker`), `shed-desktop-core`, `shed-lane`,
+  `shed-roost` and `shed-craze` as path dependencies;
 - **shed-mobile** — the phone client, which takes `shed-core` as a git dependency and calls
   it from Dart through flutter_rust_bridge (FRB);
 - **`shed-broker`** — the credential broker the desktop app embeds, built on `shed-core`.
 
 ## Layout
 
-A cargo workspace under `crates/`, every member a default-member. The client
-core is `shed-core`, `shed-app` and `shedctl`, below; beside them sit the
-credential broker (`shed-broker`), and the
-two [agent-lane](agent-lanes.md) adapters, `shed-opencode` and `shed-craze`:
+A cargo workspace under `crates/`. Every member except the test-only
+`shed-broker-harness` is a default member. The desktop links these crates (the
+opencode adapter crate was removed in plan 038; craze is the only lane):
 
+- **`shed-lane`** — pure leaf: the agent-lane contract (`lane`), RC session DTOs
+  (`rc`), slash menu, craze command ladder, shell quoting, lane view and text/time
+  helpers. No `shed-core`, no `reqwest`, no `roost-ipc`.
 - **`shed-core`** — a *pure* Rust lib (no UI): wire DTOs + serde decoders
   (`models.rs`), the reqwest(rustls) client (`http.rs`), the SSE parser
   (`sse.rs`), leaf-cert pinning (`tls.rs`), and the control-token FSM
-  (`token.rs`), plus a `config` parser, a pull-based `create` orchestration
-  store, the approval policy model (`approval/`), the agent-lane contract
-  (`lane.rs`) — and **`rc.rs`** (the pure Remote-Control **model**: `RcKind`,
-  `RcSession`, `RcState`, `RcActivity`, `RcKindFeatures`, `RcCapabilities`,
-  `RcAgentInfo`, `RcError` and the wire DTOs — types read by the lane crates,
-  `roost::model`, and shed-mobile. Plan 022 (S6,
-  [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)) deleted
-  everything in this file that *did* something — the `shed-ext-rc` argv
-  builders, the permission-mode table, and the pane classifier — with the RC
-  hub itself).
-- **`shed-app`** — the UI-free app-logic layer (`Backend`, the approval
-  `Coordinator`, `AuditStore`, the roost client), consumed by
-  the Tauri client as a cross-workspace path dep. `broker` (the in-process
-  bridge to the credential broker, backed by `shed-broker`) is its only
-  non-default feature — the RC hub's `RcRunner` seam, `rc.rs` and `RcService`
-  were deleted with the hub in plan 022 (S6); agent sessions are driven through
-  `roost.rs` instead (see [Agent lanes](agent-lanes.md) and
-  [IPC § Agent sessions](ipc.md#agent-sessions)).
+  (`token.rs`), plus a `config` parser (`servers:` and `default_server` only;
+  `known_hosts_path()`), a pull-based `create` orchestration store, and the
+  approval policy model (`approval/`). It depends on `shed-lane` for `RcSession`.
+  Plan 022 (S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328))
+  deleted the RC hub; plan 038 removed `machines:` from this crate.
+- **`shed-roost`** — the roost-session client (connection, model, bootstrap,
+  reach, spawn gate). The only crate in `crates/` that depends on `roost-ipc`.
+- **`shed-app`** — the UI-free shed client (`Backend`, the approval
+  `Coordinator`, `AuditStore`). `broker` (the in-process bridge to the
+  credential broker, backed by `shed-broker`) is its only non-default feature.
+  It does not link `roost-ipc` or `shed-lane`.
+- **`shed-desktop-core`** — the toolkit-free shed-only runtime (`ShedId`,
+  `ShedHosts`, `ShedCraze`, `ShedLanes`, shutdown). The Tauri shell is a thin
+  adapter over it. No `tauri`, no `iced`, no direct `roost-ipc`, and it uses
+  `shed-app` with default features only.
+- **`shed-craze`** — the craze agent-lane adapter. Depends on `shed-lane` only.
 - **`shedctl`** — a headless client for the desktop app's IPC socket, shipped in
   the Linux `.deb` alongside `shed-desktop`. It depends on no other crate here
   (only `serde_json`, `base64` and `libc`); see [shedctl](cli.md).
@@ -47,7 +48,8 @@ two [agent-lane](agent-lanes.md) adapters, `shed-opencode` and `shed-craze`:
   WebKitGTK/Tauri dependencies stay out of `crates/`). Its `[[bin]]` is
   **`shed-desktop-tauri`** — installed to `/usr/bin/shed-desktop` in the Linux
   `.deb` (built via nfpm, `linux/scripts/build-deb.sh`), and bundled as
-  `ShedDesktop.app` on macOS (WKWebView).
+  `ShedDesktop.app` on macOS (WKWebView). It links the crates above and does not
+  depend on `roost-ipc` directly.
 
 ## Invariants
 
@@ -69,7 +71,7 @@ All targets run from the monorepo root (or `make -C desktop …`):
 make -C desktop core-test       # cargo test the workspace (+ shed-app's `broker` feature)
 make -C desktop core-lint       # cargo clippy -D warnings (same two passes)
 make -C desktop core-fmt        # cargo fmt --all
-make -C desktop core-linux      # shed-core test + clippy on ubuntu:24.04, in Docker
+make -C desktop core-linux      # shared-crate test + clippy on ubuntu:24.04, in Docker
 ```
 
 You can also drive the workspace directly from `crates/` (`cargo test`, `cargo clippy`). Rust

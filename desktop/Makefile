@@ -156,13 +156,14 @@ tauri-test: tauri-ui-build  ## cargo test the Tauri client locally (its standalo
 # WebView (a static CSS denylist would be miscalibrated — 2.44 supports oklch,
 # color-mix, :has(), @container — so this render smoke IS the CSS gate). The
 # frontend bundle is built on the host first (platform-independent); the source
-# (tauri + the core/ path-dep crates it links: shed-core + shed-app + Resources/
-# with the bundled terminal openers that build.rs validates) is copied into a
-# writable /work because Tauri's build.rs writes gen/ next to Cargo.toml (a
-# read-only mount fails there); the Rust builds to a /target volume
-# so it never clobbers the mac target dir. Both cargo caches are volumes — the
-# registry AND `git`, because shed-core takes `roost-ipc` as a git dependency
-# (plan 013) and an uncached /usr/local/cargo/git re-clones roost on every run.
+# (tauri + the core/ path-dep crates it links: shed-core, shed-app, shed-lane,
+# shed-roost, shed-craze, shed-desktop-core + Resources/ with the bundled
+# terminal openers that build.rs validates) is copied into a writable /work
+# because Tauri's build.rs writes gen/ next to Cargo.toml (a read-only mount
+# fails there); the Rust builds to a /target volume so it never clobbers the
+# mac target dir. Both cargo caches are volumes — the registry AND `git`,
+# because shed-roost takes `roost-ipc` as a git dependency (plan 013) and an
+# uncached /usr/local/cargo/git re-clones roost on every run.
 # --cap-add SYS_ADMIN + seccomp=unconfined let WebKitGTK's web-process bubblewrap
 # sandbox create the user namespaces Docker's default seccomp blocks (else the
 # content process dies and JS never runs).
@@ -223,10 +224,13 @@ tauri-test-linux: tauri-ui-build  ## Tauri crate cargo test on ubuntu:24.04 (Lin
 	    cd /work/desktop/tauri/src-tauri && \
 	    cargo clippy --locked --all-targets -- -D warnings && cargo test --locked'
 
-# shed-core's machine_transport_contract test reads the shared contract at
+# shed-lane's machine_transport_contract test reads the shared contract at
 # <repo>/tests/machine-transport (CARGO_MANIFEST_DIR/../../tests/...), which is
 # /tests/machine-transport inside the container: mount it there, read-only.
-core-linux:  ## Build+test shed-core on Linux in Docker (ubuntu:24.04; ring needs build-essential)
+# `test-support` is on the crates that export it (lane conformance, FakeRoost,
+# the craze recipe harness). shed-craze's recipe cells skip here without
+# SHED_CRAZE_BIN_DIR; CI's core-linux job requires them.
+core-linux:  ## Build+test the shared crates on Linux in Docker (ubuntu:24.04; ring needs build-essential)
 	docker build -t shed-core-linux:latest - < Dockerfile.linux
 	docker run --rm \
 	  -v "$(REPO_ROOT)/crates:/work:ro" \
@@ -235,8 +239,10 @@ core-linux:  ## Build+test shed-core on Linux in Docker (ubuntu:24.04; ring need
 	  -v shed-core-linux-cargo:/usr/local/cargo/registry \
 	  -e CARGO_TARGET_DIR=/target \
 	  -w /work shed-core-linux:latest \
-	  bash -lc 'cargo test -p shed-core --all-targets --locked && \
-	            cargo clippy -p shed-core --all-targets --locked -- -D warnings'
+	  bash -lc 'cargo test -p shed-core -p shed-app -p shed-desktop-core --all-targets --locked && \
+	            cargo test -p shed-lane -p shed-roost -p shed-craze --all-targets --features test-support --locked && \
+	            cargo clippy -p shed-core -p shed-app -p shed-desktop-core --all-targets --locked -- -D warnings && \
+	            cargo clippy -p shed-lane -p shed-roost -p shed-craze --all-targets --features test-support --locked -- -D warnings'
 
 # ---- test -------------------------------------------------------------
 

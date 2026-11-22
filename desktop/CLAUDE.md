@@ -22,13 +22,17 @@ definition of done here.
 
 Core/UI split (see `docs/desktop/architecture.md`):
 
-- **The shared Rust core lives in `../crates/`** (`shed-core` + `shed-app` + the Rust
-  `shedctl`), NOT here.
+- **The shared Rust core lives in `../crates/`** (`shed-lane`, `shed-core`, `shed-roost`,
+  `shed-craze`, `shed-app`, `shed-desktop-core`, `shedctl`, plus `shed-broker`), NOT here.
+  The desktop is shed-only: no `machines:` hosts, no implicit localhost, no opencode lane.
+  `shed-desktop-core` is the toolkit-free runtime (`ShedHosts`, `ShedCraze`, `ShedLanes`).
 - `tauri/` — the **Tauri client**: the React/Vite/Tailwind frontend in `tauri/ui`, the Rust
   shell in `tauri/src-tauri` (IPC server `ipc.rs`, tray, approval gate, Sparkle updater,
   broker wiring, …). `tauri/src-tauri` is its **own standalone Cargo workspace** so its
-  WebKitGTK/Tauri deps never bleed into `../crates/`; it takes `shed-core` + `shed-app` as
-  cross-workspace path-deps (`../../../crates/…`). Runs on macOS (WKWebView) and Linux
+  WebKitGTK/Tauri deps never bleed into `../crates/`; it takes `shed-core`, `shed-app`
+  (with `broker`), `shed-desktop-core`, `shed-lane`, `shed-roost` and `shed-craze` as
+  cross-workspace path-deps (`../../../crates/…`). It does not depend on `roost-ipc`
+  directly. Runs on macOS (WKWebView) and Linux
   (WebKitGTK). The Linux `.deb` (`shed-desktop`, bin `shed-desktop-tauri`) is built from it
   via nfpm (`linux/scripts/build-deb.sh`); the macOS `.app`/DMG via
   `scripts/bundle-tauri-mac.sh` + `scripts/make-dmg.sh`.
@@ -88,7 +92,7 @@ make tauri-run           # build + launch the Tauri client natively
 make e2e-tauri           # the hermetic pytest harness (needs a display, Xvfb on Linux)
 make tauri-build-linux   # the WebKitGTK render gate: the e2e on ubuntu:24.04 / WebKitGTK 2.44 (Docker, Xvfb)
 make tauri-test-linux    # the Tauri crate's Linux-only approval-seam tests (polkit gate; Docker)
-make core-linux          # shed-core cargo test/clippy on Linux (Docker)
+make core-linux          # shared-crate cargo test/clippy on Linux (Docker)
 make deb / make deb-validate   # build the .deb / build + install-validate in a clean ubuntu:24.04 container
 ```
 
@@ -105,8 +109,9 @@ The craze cells (`tools/shedtest/test_tauri_craze.py`, plan 025) drive the REAL 
 need the pinned binaries: `make craze-binaries` (natively; it prints `SHED_CRAZE_BIN_DIR`), or
 `make craze-binaries OUT=desktop/tools/shedtest/.craze-bin` plus
 `SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin` for the Docker legs. Without them
-the module skips; `SHED_CRAZE_REQUIRE=1` (CI) makes that a failure. The shedtest-linux skill has
-the seams (`SHED_TAURI_CRAZE_PATH`, the jailed ladder) and the traps.
+the module skips; `SHED_CRAZE_REQUIRE=1` (CI) makes that a failure. Every craze cell
+targets a listed shed over the fake-`ssh` seam (`SHED_TAURI_SSH_BIN`); there is no
+local craze path and no `machines:` fixture. The shedtest-linux skill has the traps.
 
 ## The credential broker
 

@@ -112,9 +112,11 @@ which needs a Screen-Recording (TCC) grant that a harness-launched or agent-run 
 have, so it exits 1. Every screenshot assertion **skips on Darwin by design**; the Linux/Xvfb
 render gate (`shedtest-linux`) is the pixel gate. On a Mac, assert on the UI-truth dump ops
 instead: `dashboard.dump`, `ui.current_pane`, `ui.modal`, `ui.badges`, `ui.computed_style`,
-`prefs.dump`, `tray.dump`, `agents.dump`, `launch.dump`, `sidebar.dump`, `machines.dump`,
-`lane.dump`, `toast.dump`. They report what the frontend rendered, not just what the backend
-holds.
+`prefs.dump`, `tray.dump`, `agents.dump`, `sidebar.dump`, `shed_roost.dump`,
+`roost_consent.dump`, `craze_create.dump`, `lane.dump`, `lane_settings.dump`, `toast.dump`.
+`launch.dump` and `machines.dump` answer `unknown_op`. They report what the frontend rendered, not just what the backend
+holds. "Use this machine" in the credential-source UI, and the broker's `machine.json`,
+are the credential source for a server — a different thing from a host list.
 
 ## macOS-only behavior the e2e covers
 
