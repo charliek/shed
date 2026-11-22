@@ -50,12 +50,16 @@ pub const ESCAPE: Duration = Duration::from_secs(20);
 /// Non-blocking drain hook for an optional embedded credential broker.
 pub type BrokerDrain = Box<dyn Fn() + Send + Sync>;
 
+/// Optional line sink for shutdown phase and completion logs.
+pub type ShutdownLog = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// The app's one orderly shutdown: what it tears down, and whether it has.
 pub struct Shutdown {
     gate: SpawnGate,
     hosts: Arc<ShedHosts>,
     lanes: Arc<ShedLanes>,
     broker: Mutex<Option<BrokerDrain>>,
+    log: Mutex<Option<ShutdownLog>>,
     handle: tokio::runtime::Handle,
     started: OnceLock<()>,
     done: tokio::sync::watch::Sender<Option<Report>>,
@@ -74,6 +78,7 @@ impl Shutdown {
             hosts,
             lanes,
             broker: Mutex::new(broker),
+            log: Mutex::new(None),
             handle,
             started: OnceLock::new(),
             done: tokio::sync::watch::channel(None).0,
@@ -88,6 +93,14 @@ impl Shutdown {
         }
     }
 
+    /// Install or replace the optional shutdown log sink before shutdown starts.
+    /// No-op if shutdown has already begun.
+    pub fn set_log_sink(&self, sink: ShutdownLog) {
+        if self.started.get().is_none() {
+            *self.log.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+        }
+    }
+
     /// Start the run — on the app's runtime, the FIRST time only — and return
     /// a receiver that reads `Some(Report)` once it has finished. Never blocks,
     /// and safe from any thread.
@@ -97,8 +110,15 @@ impl Shutdown {
             let this = Arc::clone(self);
             self.handle.spawn(async move {
                 let broker = this.broker.lock().unwrap_or_else(|e| e.into_inner()).take();
-                let report =
-                    shutdown_children(&this.gate, &this.hosts, &this.lanes, broker.as_ref()).await;
+                let log = this.log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let report = shutdown_children_with_log(
+                    &this.gate,
+                    &this.hosts,
+                    &this.lanes,
+                    broker.as_ref(),
+                    log.as_deref(),
+                )
+                .await;
                 this.done.send_replace(Some(report));
             });
         }
@@ -148,6 +168,18 @@ pub async fn shutdown_children(
     lanes: &Arc<ShedLanes>,
     broker: Option<&BrokerDrain>,
 ) -> Report {
+    shutdown_children_with_log(gate, hosts, lanes, broker, None).await
+}
+
+/// Same as [`shutdown_children`], forwarding phase and completion lines to
+/// `log` when provided (falling back to `tracing::info!` otherwise).
+pub async fn shutdown_children_with_log(
+    gate: &SpawnGate,
+    hosts: &ShedHosts,
+    lanes: &Arc<ShedLanes>,
+    broker: Option<&BrokerDrain>,
+    log: Option<&(dyn Fn(&str) + Send + Sync)>,
+) -> Report {
     let started = Instant::now();
     let mut report = Report::default();
 
@@ -163,6 +195,7 @@ pub async fn shutdown_children(
     let joined = hosts.join_clients(CLIENTS_JOIN_WAIT).await;
     report.clients = joined;
     log_phase(
+        log,
         0,
         "gate closed; roost clients and admitted work joined",
         phase,
@@ -187,6 +220,7 @@ pub async fn shutdown_children(
     report.lanes = lanes_closed;
     report.slots = slots;
     log_phase(
+        log,
         1,
         "lanes",
         phase,
@@ -215,6 +249,7 @@ pub async fn shutdown_children(
     report.sections_open_at_drain = drained.sections_open;
     let late_now = gate.late();
     log_phase(
+        log,
         2,
         "craze sources and registered children",
         phase,
@@ -234,6 +269,7 @@ pub async fn shutdown_children(
     let phase = Instant::now();
     report.reaches = hosts.shutdown_reaches().await;
     log_phase(
+        log,
         3,
         "roost reaches",
         phase,
@@ -249,6 +285,7 @@ pub async fn shutdown_children(
     report.masters = masters;
     report.masters_unconfirmed = unconfirmed;
     log_phase(
+        log,
         4,
         "ssh masters",
         phase,
@@ -259,12 +296,17 @@ pub async fn shutdown_children(
     report.late_killed = late_now.killed;
     report.late_unseen = late_now.unseen.len();
     report.elapsed = started.elapsed();
-    tracing::info!(
-        elapsed_ms = report.elapsed.as_millis() as u64,
-        late_killed = late_now.killed,
-        late_unseen = ?late_now.unseen,
-        "shutdown: done (gate stays closed)"
+    let done_line = format!(
+        "shutdown: done in {} ms (late registrations so far: killed={}, unseen={:?}; gate stays closed)",
+        report.elapsed.as_millis() as u64,
+        late_now.killed,
+        late_now.unseen,
     );
+    if let Some(sink) = log {
+        sink(&done_line);
+    } else {
+        tracing::info!("{done_line}");
+    }
     report
 }
 
@@ -287,12 +329,20 @@ async fn lanes_phase(lanes: Arc<ShedLanes>, gate: SpawnGate) -> (LanesClosed, Sl
     rx.await.unwrap_or_default()
 }
 
-fn log_phase(n: u8, what: &str, since: Instant, detail: std::fmt::Arguments<'_>) {
-    tracing::info!(
-        phase = n,
-        what,
-        elapsed_ms = since.elapsed().as_millis() as u64,
-        detail = %detail,
-        "shutdown: phase finished"
+fn log_phase(
+    log: Option<&(dyn Fn(&str) + Send + Sync)>,
+    n: u8,
+    what: &str,
+    since: Instant,
+    detail: std::fmt::Arguments<'_>,
+) {
+    let line = format!(
+        "shutdown: phase {n} ({what}) took {} ms: {detail}",
+        since.elapsed().as_millis() as u64
     );
+    if let Some(sink) = log {
+        sink(&line);
+    } else {
+        tracing::info!("{line}");
+    }
 }

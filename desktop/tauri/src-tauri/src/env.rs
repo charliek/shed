@@ -26,26 +26,25 @@ pub struct Env {
     /// subdir, to stay under the macOS Unix-socket path limit).
     pub socket_path: PathBuf,
     /// TEST-ONLY roost-session override: `SHED_TAURI_ROOST_SOCKETS`, a
-    /// comma-separated `<machine>=<socket path>` map. A named machine's
-    /// `roost-session` is dialled on that Unix socket directly instead of through
-    /// roost's SSH client-bridge. `localhost` (the implicit local host) goes
-    /// through the same map.
+    /// comma-separated `<target>=<socket path>` map. The key is a shed target
+    /// (`roost:<server>/<shed>`). That shed's `roost-session` is dialled on the
+    /// Unix socket directly instead of through roost's SSH client-bridge.
     ///
-    /// This is what makes the machine path testable HERMETICALLY: the harness
+    /// This is what makes a shed's roost path testable HERMETICALLY: the harness
     /// stands up a fake `roost-session` on a socket and the app reaches it through
-    /// `shed_app::roost::LocalSession`, so the REAL roost client and
-    /// `RoostWatcher` run with no ssh, no remote host, and no network.
+    /// `shed_roost::LocalSession`, so the REAL roost client and `RoostWatcher`
+    /// run with no ssh, no remote host, and no network.
     ///
-    /// **Per-machine, not one socket for all**, so a suite can serve a session for
-    /// one machine and leave another unmapped — which is how the everyday "asleep
-    /// / off-network" state gets covered without any real machine.
+    /// **Per shed, not one socket for all**, so a suite can serve a session for
+    /// one shed and leave another unmapped — which is how the everyday "asleep
+    /// / off-network" state gets covered without any real host.
     ///
-    /// Non-empty in test mode means NO machine ever spawns ssh: an unmapped entry
+    /// Non-empty in test mode means NO shed ever spawns ssh: an unmapped entry
     /// is treated as permanently unreachable rather than falling back to a real
     /// bridge, so a hermetic run cannot leak an ssh child.
     ///
     /// Parsed only in test mode, like [`Self::mock_unreachable_hosts`] — a stray
-    /// env var must never redirect a real machine's session in production.
+    /// env var must never redirect a real shed's session in production.
     pub roost_sockets: HashMap<String, PathBuf>,
     /// TEST-ONLY `ssh` override: `SHED_TAURI_SSH_BIN`, the binary every roost
     /// transport execs instead of `ssh` (plan 019 §3.6).
@@ -63,10 +62,10 @@ pub struct Env {
     /// seam in this file, dead in a release build whatever the mode says**. See
     /// [`exec_seam`]: a stray `SHED_TAURI_SSH_BIN` in a developer's shell must
     /// never decide which binary a shipped app execs to reach somebody's
-    /// machine, and `SHED_TAURI_TEST_MODE=1` is one more thing a shell can
+    /// shed, and `SHED_TAURI_TEST_MODE=1` is one more thing a shell can
     /// export.
     pub ssh_bin: Option<PathBuf>,
-    /// TEST-ONLY: roost's `jail_fs_root` for the bootstrap machines
+    /// TEST-ONLY: roost's `jail_fs_root` for shed bootstrap
     /// (`SHED_TAURI_ROOST_JAIL=1`). **`false` in production**, always.
     ///
     /// roost's own bootstrap builders take this bool, and the delta it makes is
@@ -79,28 +78,10 @@ pub struct Env {
     /// `Mismatch` here and `Missing` there.
     ///
     /// It steers which binary the far side execs, so it is gated exactly as
-    /// [`shed_app::roost::SshBridgeOptions`] describes for `ROOST_TEST_MODE`:
+    /// `shed_roost::SshBridgeOptions` describes for `ROOST_TEST_MODE`:
     /// never read outside test mode — and never read in a release build either,
     /// for the reason on [`exec_seam`].
     pub roost_jail_fs_root: bool,
-    /// TEST-ONLY craze seam: `SHED_TAURI_CRAZE_PATH`, a directory this
-    /// machine's craze source finds `craze` in (plan 025 §3.6.1). When set, the
-    /// local dial runs the JAILED ladder (rungs 1–2 only) with `PATH` set to
-    /// it and nothing else of this process's environment but
-    /// [`Self::craze_env`]; when unset in test mode there is no local craze
-    /// source at all.
-    ///
-    /// It decides which binary the app execs, so it is an [`exec_seam`]: test
-    /// mode AND a debug build, like [`Self::ssh_bin`] — a release build
-    /// ignores it, whatever the mode says.
-    pub craze_path: Option<PathBuf>,
-    /// What the jailed local craze dial passes through from this process's own
-    /// environment beside the seam's `PATH`: `HOME`, `CRAZE_HOME` and
-    /// `CRAZE_RUNTIME_DIR`, those that are set. The harness sets short ones
-    /// (a craze runtime dir must be short, 0700, and under no group-writable
-    /// ancestor). Read only alongside [`Self::craze_path`], so empty in
-    /// production.
-    pub craze_env: Vec<(String, String)>,
     /// The `extensions.yaml` the embedded broker loads (`SHED_TAURI_EXTENSIONS_CONFIG`,
     /// else `~/.config/shed/extensions.yaml`). The harness overrides it to keep a run
     /// hermetic.
@@ -148,8 +129,8 @@ impl Env {
             HashSet::new()
         };
         // Same rule as the unreachable-hosts seam: test mode only, so a stray env
-        // var can never point a real machine's session somewhere else. A malformed
-        // pair is dropped rather than failing the launch — the machine then reads
+        // var can never point a real shed's session somewhere else. A malformed
+        // pair is dropped rather than failing the launch — the shed then reads
         // as unreachable, which is a visible, debuggable state.
         let roost_sockets = if test_mode {
             var("SHED_TAURI_ROOST_SOCKETS")
@@ -185,30 +166,11 @@ impl Env {
             RELEASE_BUILD,
             var("SHED_TAURI_ROOST_JAIL").as_deref(),
         );
-        let (craze_path, craze_refusal) = exec_seam(
-            test_mode,
-            RELEASE_BUILD,
-            "SHED_TAURI_CRAZE_PATH",
-            var("SHED_TAURI_CRAZE_PATH"),
-        );
         // Said before the log file opens (it opens once the single-instance lock is
         // held), so these wait in its pre-sink buffer.
-        for refusal in [ssh_refusal, jail_refusal, craze_refusal]
-            .into_iter()
-            .flatten()
-        {
+        for refusal in [ssh_refusal, jail_refusal].into_iter().flatten() {
             app_warn!("{refusal}");
         }
-        // Only beside the seam: the jailed dial is the one consumer, and a
-        // production run passes the whole environment through anyway.
-        let craze_env = if craze_path.is_some() {
-            ["HOME", "CRAZE_HOME", "CRAZE_RUNTIME_DIR"]
-                .into_iter()
-                .filter_map(|k| var(k).map(|v| (k.to_string(), v)))
-                .collect()
-        } else {
-            Vec::new()
-        };
         Self {
             test_mode,
             mock_base_url: var("SHED_TAURI_MOCK_BASE_URL"),
@@ -216,8 +178,6 @@ impl Env {
             roost_sockets,
             ssh_bin: ssh_bin.map(PathBuf::from),
             roost_jail_fs_root,
-            craze_path: craze_path.map(PathBuf::from),
-            craze_env,
             config_path,
             socket_path: var("SHED_TAURI_SOCKET")
                 .map(PathBuf::from)
@@ -237,22 +197,21 @@ impl Env {
 }
 
 impl Env {
-    /// The transport choices the roost-host layer makes, bundled — see
-    /// [`crate::machines::ReachOptions`].
+    /// The transport choices the shed-host layer makes, bundled — see
+    /// [`shed_desktop_core::ShedReachOptions`].
     ///
     /// Built here rather than read there so this file stays the ONE place the
     /// process environment is consulted, which is what makes the test-mode gates
     /// above a property of the type rather than a convention.
-    pub fn reach_options(&self) -> crate::machines::ReachOptions {
-        crate::machines::ReachOptions {
+    ///
+    /// The spawn gate and the shared teardown sink are not environment knobs:
+    /// [`shed_desktop_core::ShedDesktopRuntime::start`] installs both when they
+    /// are absent.
+    pub fn reach_options(&self) -> shed_desktop_core::ShedReachOptions {
+        shed_desktop_core::ShedReachOptions {
             roost_sockets: self.roost_sockets.clone(),
             ssh_bin: self.ssh_bin.clone(),
             test_mode: self.test_mode,
-            craze_path: self.craze_path.clone(),
-            craze_env: self.craze_env.clone(),
-            // Not an environment knob: the app's spawn gate is created once in
-            // `setup` and attached there (plan 026 §3.3), as is its shared
-            // teardown sink.
             spawn_gate: None,
             teardowns: None,
         }
@@ -292,9 +251,7 @@ const RELEASE_BUILD: bool = !cfg!(debug_assertions);
 /// rather than silent: a harness that somehow ran against a release binary must
 /// read as a loud misconfiguration, not as a mysteriously real `ssh`.
 ///
-/// **Only these three** (`SHED_TAURI_CRAZE_PATH` joined the two plan-019
-/// seams in plan 025: it picks the directory the local craze dial execs
-/// from). The other seams in this file — `SHED_TAURI_MOCK_BASE_URL`,
+/// **Only these two.** The other seams in this file — `SHED_TAURI_MOCK_BASE_URL`,
 /// `SHED_TAURI_ROOST_SOCKETS`, `SHED_TAURI_SHED_CONFIG` —
 /// redirect an HTTP base, a socket path or a config path: the worst they do is
 /// point this process's own reads somewhere unhelpful. These two pick an
@@ -462,22 +419,6 @@ mod tests {
                 "the line names the variable it ignored: {refusal:?}"
             );
         }
-
-        // The craze seam rides the same gate (plan 025 §3.6.1): it picks the
-        // directory the local craze dial execs from.
-        let (craze, refusal) = exec_seam(true, RELEASE, "SHED_TAURI_CRAZE_PATH", Some("/fake/bin"));
-        assert_eq!(craze, None, "a release build never execs a test craze");
-        assert!(refusal.is_some_and(|r| r.contains("SHED_TAURI_CRAZE_PATH")));
-        assert_eq!(
-            exec_seam(
-                true,
-                RELEASE_BUILD,
-                "SHED_TAURI_CRAZE_PATH",
-                Some("/fake/bin")
-            ),
-            (Some("/fake/bin"), None),
-            "and a test build honours it"
-        );
 
         // Nothing set, nothing said: the line is about a variable that was SEEN.
         assert_eq!(

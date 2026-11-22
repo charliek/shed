@@ -27,40 +27,26 @@ tauri = { version = "2", features = ["tray-icon"] }
 # The shared protocol + app-logic crates (cross-workspace path deps — this links
 # them; it does not make this crate a member of core's workspace).
 shed-core = { path = "../../../crates/shed-core" }
-# `broker` only: the hub half of the Agents pane (shed-app's `rc` feature — the
-# `RcService` that ssh'd `shed-ext-rc` into a shed) went with S6, so this crate
-# no longer asks for it. The roost half is ungated (`shed_app::roost`).
+# `broker` only: the embedded credential broker. This crate never enables any
+# other shed-app feature.
 shed-app = { path = "../../../crates/shed-app", features = ["broker"] }
-# The opencode agent-lane adapter (plan 015 §3.4). A path dep like the two above
-# — it implements `shed_core::lane::AgentLane` over an opencode server's local
-# HTTP API, and `lane.rs` is the client that drives it. Its `test-support`
-# feature (the in-process fake) is NOT enabled here: the harness drives the
-# shipped path against a Python fake over a real socket. The Rust fake is a
-# dev-dependency instead (below), so it reaches `cargo test` and nothing else.
-shed-opencode = { path = "../../../crates/shed-opencode" }
-# The craze adapter (plan 025 C9): one craze SOURCE per machine — this machine's
-# hub over a local `/bin/sh` bridge, a remote one over `SshExec::spawn_duplex` —
-# and a `CrazeLane` per open transcript. A plain path dep like shed-opencode; its
-# `test-support` recipe harness is a dev-dependency only (below).
+# Toolkit-free shed-only desktop runtime (plan 038): hosts, craze, lanes,
+# slash, and the orderly shutdown. This crate is the Tauri adapter over it.
+shed-desktop-core = { path = "../../../crates/shed-desktop-core" }
+# Lane and RC DTOs (`RcKind` for `rc.inject_test`, `LaneCreateRequest` for
+# `craze.create`). Transitive through shed-desktop-core; named here because
+# the IPC doors name the types.
+shed-lane = { path = "../../../crates/shed-lane" }
+# Craze adapter. The desktop reaches it through shed-desktop-core; linked
+# directly so the crate is an explicit part of this shell (plan 038 U3).
 shed-craze = { path = "../../../crates/shed-craze" }
-# ONLY for `reqwest::Url` — `OpencodeSource::new` takes a parsed base URL, and
-# this crate has to name the type to build one. `default-features = false` and no
-# features of its own: the version and the feature set are whatever shed-core
-# already resolved (`rustls-tls, stream, json`), so this adds nothing to the lock
-# and no second copy of the crate. No HTTP is issued from here — the lane's wire
-# is entirely inside `shed-opencode`.
-reqwest = { version = "0.12", default-features = false }
-# roost's own wire types (plan 013 S3). Only for the two structs this crate has to
-# NAME to drive `shed_app::roost` — `TabOpenParams` for a launch, `Tab`/`Ownership`
-# for the row a fresh `tab.open` answers with. Same git `rev` as
-# `crates/Cargo.toml`'s workspace pin, and it MUST stay in lockstep with it: two
-# revs would put two copies of the crate in this tree and `shed_app::roost`'s
-# signatures would stop accepting these types. Bump both together.
-roost-ipc = { git = "https://github.com/charliek/roost", rev = "2bc71fa3848ddbf2d190aab6c4ef61ad2d432aa1" }
+# Roost reach, bootstrap, and the wrapped `tab_open_fenced`. The desktop
+# reaches it through shed-desktop-core; linked directly for the same reason
+# as shed-craze. No direct `roost-ipc` — shed-roost is the only crate that
+# names those wire types.
+shed-roost = { path = "../../../crates/shed-roost" }
 # "process" backs the Linux AuthGate (the pkcheck subprocess; the notifier is zbus).
-# "signal" backs the orderly shutdown's signal thread (plan 026 §3.3) — DECLARED
-# here rather than left to roost-ipc's feature unification, which already
-# enables it (so the lock does not move).
+# "signal" backs the orderly shutdown's signal thread (plan 026 §3.3).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -81,12 +67,13 @@ tauri-plugin-autostart = "2"
 # click forwarded to cache the tray rect (the hermetic `tray.show` falls back to a
 # fixed position). Cross-platform crate; the popover itself is macOS-only.
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
-# The app's log file (#414, `applog.rs`): shed-app's `tracing` events (and
-# roost-ipc's, only with SHED_TAURI_LOG=debug) are written by a `fmt` layer into
-# the same rotating file as the app's own lines. `tracing` is already in the
-# lock (the facade shed-app and roost-ipc use); naming it here is what lets this
-# crate build the subscriber. Default features off: no ANSI colours, no `log`
-# bridge, no env-filter regex — `fmt` (which brings `registry`) and `std` are
+# The app's log file (#414, `applog.rs`): the shed crates' `tracing` events
+# (and roost-ipc's, only with SHED_TAURI_LOG=debug, reached through shed-roost)
+# are written by a `fmt` layer into the same rotating file as the app's own
+# lines. `tracing` is already in the lock (the facade those crates use); naming
+# it here is what lets this crate build the subscriber. Default features off:
+# no ANSI colours, no `log` bridge, no env-filter regex — `fmt` (which brings
+# `registry`) and `std` are
 # all the layer and its `Targets` filter need. The subscriber lives HERE, never
 # in ../../../crates (crates/CLAUDE.md's workspace boundary: that workspace stays
 # subscriber-free).
@@ -131,24 +118,6 @@ tauri = { version = "2", features = ["image-png", "macos-private-api"] }
 
 [dev-dependencies]
 tempfile = "3"
-# `shed_core::roost::testing::FakeRoost` — an in-process `roost-session` stand-in
-# replying from the vendored roost vectors. Behind the non-default `test-support`
-# feature so it never compiles into a shipped binary; declared here rather than in
-# `[dependencies]` so enabling it is a TEST decision. (Same path as the normal dep
-# above: cargo unifies them, which is exactly what turns the feature on for the
-# test profile only.)
-shed-core = { path = "../../../crates/shed-core", features = ["test-support"] }
-# `shed_opencode::testing::FakeOpencode` — an in-process opencode server, for the
-# lane-ownership tests (a `close` racing an in-flight `open`, a roster GET that
-# 401s, two opens sharing one tunnel). Same feature-only switch as shed-core's
-# above: `test-support = []` declares no dependency of its own, so this adds no
-# package to the lock and nothing to the shipped binary, which still links the
-# crate without it (see the `[dependencies]` entry).
-shed-opencode = { path = "../../../crates/shed-opencode", features = ["test-support"] }
-# `shed_craze::testing` — the scripted hub (`ScriptedDial`) the craze-source
-# cells drive (the host-removal races, the fold, the eviction hooks), and the
-# recipe's skip-or-require rule. Same feature-only switch as the two above.
-shed-craze = { path = "../../../crates/shed-craze", features = ["test-support"] }
 # `tauri::test` — the mock runtime, so a test drives a `#[tauri::command]` through
 # Tauri's own argument extraction (plan 026 §3.5: an argument a command does not
 # declare is dropped without a word, and only that layer can show it). `test = []`

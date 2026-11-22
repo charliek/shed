@@ -1254,7 +1254,13 @@ impl ShedHosts {
             if seq < self.last_observe_seq.load(Ordering::SeqCst) {
                 return;
             }
-            self.last_observe_seq.store(seq, Ordering::SeqCst);
+            // Only authoritative observations advance the high-water mark: a
+            // filtered (add-only) `rc.list` finishing ahead of an in-flight
+            // full refresh must never suppress that full refresh's removal of
+            // stopped sheds.
+            if !authoritative.is_empty() {
+                self.last_observe_seq.store(seq, Ordering::SeqCst);
+            }
 
             let answered: BTreeSet<&str> = authoritative.iter().map(String::as_str).collect();
             let live: BTreeSet<ShedId> = running.iter().cloned().collect();

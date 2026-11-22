@@ -158,6 +158,12 @@ impl ShedDesktopRuntime {
         self.shutdown.set_broker_drain(broker);
     }
 
+    /// Register an optional shutdown log sink on this runtime's single
+    /// [`Shutdown`] coordinator (before shutdown begins).
+    pub fn set_shutdown_log(&self, sink: shutdown::ShutdownLog) {
+        self.shutdown.set_log_sink(sink);
+    }
+
     /// Return this runtime's single, idempotent [`Shutdown`] coordinator.
     ///
     /// Every caller shares the same [`Shutdown`] instance, guaranteeing

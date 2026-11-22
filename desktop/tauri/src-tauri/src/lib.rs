@@ -12,25 +12,18 @@
 mod applog;
 mod approval;
 mod broker;
-mod craze;
 mod env;
 mod ipc;
-mod lane;
-mod machines;
 mod prefs;
-mod roost_hosts;
 mod screenshot;
 mod shutdown;
 mod single_instance;
-mod slash;
 mod source;
 mod state;
 mod termctl;
 mod tray;
 mod updater;
 
-#[cfg(test)]
-mod launch_command_tests;
 #[cfg(test)]
 mod slash_command_tests;
 
@@ -48,10 +41,35 @@ use shed_core::approval::{
     PolicyScope, SshApprovalPolicy,
 };
 use shed_core::models::CreateShedRequest;
-use shed_core::rc::RcKind;
+use shed_desktop_core::{
+    failure_json, installed_json, HostEvents, LaneEvents, LaneFailure, LaneUiEvent,
+    ShedDesktopRuntime, ShedId,
+};
 use single_instance::AcquireError;
 use state::{SharedUi, UiState};
 use tauri::{Emitter, Manager};
+
+/// Pushes a host-snapshot invalidation. The frontend re-reads `rc.list`.
+struct TauriHostEvents {
+    app: tauri::AppHandle,
+}
+
+impl HostEvents for TauriHostEvents {
+    fn on_hosts_changed(&self) {
+        let _ = self.app.emit("refresh", serde_json::json!({}));
+    }
+}
+
+/// Pushes one lane frame as `{ target, session_id, event }`.
+struct TauriLaneEvents {
+    app: tauri::AppHandle,
+}
+
+impl LaneEvents for TauriLaneEvents {
+    fn on_lane_event(&self, event: LaneUiEvent) {
+        let _ = self.app.emit("lane-event", event);
+    }
+}
 
 /// A React frontend reports its rendered snapshot (`{pane, style, sheds,
 /// refresh_token}`) here, so the harness reads the real rendered state over IPC
@@ -96,13 +114,14 @@ fn ui_report(
 #[tauri::command]
 async fn list_sheds(
     backend: tauri::State<'_, Arc<Backend>>,
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
 ) -> Result<serde_json::Value, String> {
-    let reachability = backend.refresh().await;
     // The frontend's own refresh is an authoritative shed listing too — it is
     // the one the dashboard runs on a timer, so a shed that stops while nobody
     // is driving the socket still loses its roost watcher (plan 019 §3.6).
-    ipc::observe_reachability(&machines, &reachability).await;
+    // The sequence is stamped inside [`ipc::refresh_hosts`], before the fetch,
+    // so a slow answer cannot reauthorize a shed a newer refresh removed.
+    let reachability = ipc::refresh_hosts(&backend, runtime.hosts()).await;
     Ok(ipc::sheds_payload(&reachability))
 }
 
@@ -243,21 +262,7 @@ fn open_terminal(
     shed: String,
     host: Option<String>,
     session: Option<String>,
-    machine: Option<String>,
 ) -> Result<(), String> {
-    // A MACHINE session has NO terminal (plan 013 S3). Its rows come from a
-    // `roost-session`, whose capabilities advertise `attach: "native-remote"` —
-    // the terminal belongs to roost, and shed does not attach to it. The card
-    // hides the action; this is the server-side half of the same rule, so a
-    // caller that asks anyway is told why rather than being handed a tmux command
-    // for a session that has no tmux.
-    //
-    // Before the test-mode gate, and in the same order as the IPC op's: the
-    // refusal is true in every mode, and "use terminal.preview instead" would
-    // point at an op that refuses this for the same reason.
-    if machine.is_some() {
-        return Err(roost_hosts::NO_TERMINAL.to_string());
-    }
     if env.test_mode {
         return Err("terminal.open is disabled in test mode (use terminal.preview)".to_string());
     }
@@ -269,182 +274,36 @@ fn open_terminal(
 
 // -- approvals (the frontend Approvals/Activity panes + approval prefs) --------
 
-/// The pending approval cards (each with gate + scope/TTL defaults). The pane
-/// The Agents pane lists/launches/kills sessions over these invoke commands (the
-/// harness drives the same ops over the IPC socket). Since S6 every row is a
-/// roost tab: the shed→server resolution stays in `Backend`, and `RoostHosts`
-/// owns the watchers and the wire.
+/// The Agents pane's session list. The same shaper the socket IPC `rc.list`
+/// uses: `{ sessions, capabilities, hosts, shed_craze }`.
 #[tauri::command]
 async fn rc_list(
     backend: tauri::State<'_, Arc<Backend>>,
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
     host: Option<String>,
     shed: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    // The SAME shaper the socket IPC `rc.list` uses — not a parallel build with
-    // a comment claiming they match (which is how machine sessions reached the
-    // IPC op but never the pane).
-    Ok(ipc::rc_list_payload(&backend, &machines, host.as_deref(), shed.as_deref()).await)
+    Ok(shed_desktop_core::rc_list_payload(
+        &backend,
+        runtime.hosts(),
+        host.as_deref(),
+        shed.as_deref(),
+    )
+    .await)
 }
 
-/// The roost host a shed-addressed command is about — the twin of
-/// `ipc::Handler::shed_target`, so the two doors resolve a host identically.
-fn shed_target(backend: &Backend, host: Option<&str>, shed: &str) -> Result<String, String> {
-    let server = backend
-        .resolve_rc_target(host)
-        .map_err(|e| e.to_string())?
-        .server_name;
-    Ok(format!("roost:{server}/{shed}"))
-}
-
-/// A launch request refused before the host is reached — an unknown kind, an
-/// unresolvable server — coded `bad_request`, as the socket ops answer it.
-fn bad_launch(message: String) -> String {
-    roost_hosts::LaunchError::BadRequest(message).command_string()
-}
-
-/// Launch a session IN a shed — the UI's door onto [`machine_launch`] on the
-/// shed's roost host since S6. Same `tab.open`, addressed by `{shed, host?}`
-/// rather than by machine name, and the same coded error. (The IPC op of the
-/// same name, `rc.launch`, was removed in 0.10.0; this command stays.)
-///
-/// **Every launch field is declared, the refused ones included** (plan 026
-/// §3.5): Tauri extracts only the arguments a command names and drops the rest
-/// without a word, so a `permissionMode` this command did not declare would open
-/// a tab instead of being refused. `launch_command_tests` drives this command
-/// through Tauri's own argument extraction to hold that.
-#[tauri::command]
-#[allow(clippy::too_many_arguments)] // a flat invoke arg list mirrors the launch form fields
-async fn rc_launch(
-    backend: tauri::State<'_, Arc<Backend>>,
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    shed: String,
-    kind: RcKind,
-    host: Option<String>,
-    display_name: Option<String>,
-    workdir: Option<String>,
-    permission_mode: Option<String>,
-    initial_prompt: Option<String>,
-) -> Result<serde_json::Value, String> {
-    // Serde preserves an unknown kind as `Other(raw)` (the unknown-kind read
-    // policy), so launching must apply the same known-kind gate as the socket IPC.
-    ipc::ensure_known_kind(&kind).map_err(bad_launch)?;
-    let target = shed_target(&backend, host.as_deref(), &shed).map_err(bad_launch)?;
-    machines
-        .launch(
-            &target,
-            &kind,
-            display_name.as_deref(),
-            workdir.as_deref(),
-            permission_mode.as_deref(),
-            initial_prompt.as_deref(),
-        )
-        .await
-        .map_err(|e| e.command_string())
-}
-
-#[tauri::command]
-async fn rc_kill(
-    backend: tauri::State<'_, Arc<Backend>>,
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    shed: String,
-    slug: String,
-    host: Option<String>,
-) -> Result<(), String> {
-    let target = shed_target(&backend, host.as_deref(), &shed)?;
-    machines.kill(&target, &slug).await
-}
-
-/// Kill a session on a MACHINE — a roost `tab.close` addressed by
-/// `(machine, slug)` over that machine's own reach, not by `(host, shed, slug)`
-/// through a server. The frontend routes to this via `killSession` in
-/// `lib/bridge.ts`.
-#[tauri::command]
-async fn machine_kill(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    machine: String,
-    slug: String,
-) -> Result<(), String> {
-    machines.kill(&machine, &slug).await
-}
-
-/// `machine_capabilities` — what the launch dialog may offer for a machine.
-///
-/// Synthesized from the roost contract, not probed over SSH (plan 013 §3.2), so
-/// it answers instantly and for a machine that is currently asleep.
-#[tauri::command]
-fn machine_capabilities(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    machine: String,
-) -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!({
-        "capabilities": machines.capabilities(&machine)?,
-    }))
-}
-
-/// `machine_launch` — start a session on a MACHINE, the machine counterpart of
-/// [`rc_launch`]: a roost `tab.open` running the kind's agent, addressed by
-/// `(machine, …)` rather than by `(host, shed, …)` through a server.
-///
-/// A launch's failure crosses as `"<code>: <message>"` (`lane_error`'s shape,
-/// which `bridge.ts` splits back): `bad_request` for a first prompt or a
-/// permission mode, refused before any tab opens, and `action_failed` for a
-/// launch that was tried (plan 026 §3.5) — the socket ops' two codes. Both
-/// refused fields are declared here for [`rc_launch`]'s reason.
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-async fn machine_launch(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    machine: String,
-    kind: RcKind,
-    display_name: Option<String>,
-    workdir: Option<String>,
-    permission_mode: Option<String>,
-    initial_prompt: Option<String>,
-) -> Result<serde_json::Value, String> {
-    // The same known-kind gate the shed launch applies: serde preserves an
-    // unknown kind as `Other(raw)`, and starting one would ask the far side to
-    // run something this build has never heard of.
-    ipc::ensure_known_kind(&kind).map_err(bad_launch)?;
-    machines
-        .launch(
-            &machine,
-            &kind,
-            display_name.as_deref(),
-            workdir.as_deref(),
-            permission_mode.as_deref(),
-            initial_prompt.as_deref(),
-        )
-        .await
-        .map_err(|e| e.command_string())
-}
-
-/// `roost_run` — "Run a command in a tab" (plan 025 P5): the frontend's door
-/// onto [`roost_hosts::RoostHosts::run`], the twin of the `roost.run` socket op.
-///
-/// Addressed by `target` (a machine's bare name or a shed's
-/// `roost:<server>/<shed>`) and gated by NO kind — the launch dialog's "Run a
-/// command" mode lands here, not in [`machine_launch`]/[`rc_launch`]. The same
-/// [`roost_hosts::RunCommand::parse`] as the socket door, so an absent, empty
-/// or whitespace-only `command` is refused here too, before the host is touched.
-#[tauri::command]
-async fn roost_run(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    target: String,
-    command: Option<String>,
-    workdir: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let command = roost_hosts::RunCommand::parse(command.as_deref())?;
-    machines.run(&target, &command, workdir.as_deref()).await
+/// A shed target (`roost:<server>/<shed>`), or `bad_request` when it is not one.
+fn shed_id(target: &str) -> Result<ShedId, String> {
+    ShedId::parse(target).map_err(|message| format!("bad_request: {message}"))
 }
 
 // -- roost bootstrap (plan 019 §3.6, C8) -----------------------------------
 //
-// The frontend's own door onto `RoostHosts::probe/preview/bootstrap` — the
-// `machine_*` pair's rule again: the harness drives these over the `roost.*`
-// socket ops (`ipc.rs`), the card + consent dialog drive these, and both land
-// in the same `RoostHosts` methods, so what the harness proves about a
-// bootstrap is what a click actually runs.
+// The frontend's own door onto `ShedHosts::probe/preview/bootstrap`: the
+// harness drives these over the `roost.*` socket ops (`ipc.rs`), the card and
+// consent dialog drive these, and both land in the same methods, so what the
+// harness proves about a bootstrap is what a click actually runs. The target
+// is a server-listed shed (`roost:<server>/<shed>`).
 //
 // A failure crosses as `"{stage}: {message}"`, the same shape `lane_error`
 // uses for the same reason: a Tauri command's error channel is a bare string,
@@ -459,11 +318,13 @@ fn roost_failure_string(stage: &str, message: String) -> String {
 /// matrix row it lands on. Safe to call before consent; writes nothing.
 #[tauri::command]
 async fn roost_probe(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
     target: String,
 ) -> Result<serde_json::Value, String> {
-    machines
-        .probe(&target)
+    let id = shed_id(&target)?;
+    runtime
+        .hosts()
+        .probe(&id)
         .await
         .map_err(|f| roost_failure_string(f.stage.as_str(), f.message))
 }
@@ -472,11 +333,13 @@ async fn roost_probe(
 /// bytes would come from: the consent card's content. Nothing is fetched here.
 #[tauri::command]
 async fn roost_preview(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
     target: String,
 ) -> Result<serde_json::Value, String> {
-    machines
-        .preview(&target)
+    let id = shed_id(&target)?;
+    runtime
+        .hosts()
+        .preview(&id)
         .await
         .map_err(|f| roost_failure_string(f.stage.as_str(), f.message))
 }
@@ -484,9 +347,9 @@ async fn roost_preview(
 /// `roost_bootstrap` — install/update/start a `roost-session` on `target` and
 /// wire its agent hooks, after consent. Mirrors `ipc::IpcHandler::roost_bootstrap`
 /// exactly (same 10-minute outer budget, same two-refusal split: a
-/// [`roost_hosts::Refusal`] is about the CALL and is a command Err carrying its
-/// code; a stale fingerprint is a fact about the host and an `ok` envelope
-/// carrying `ok: false`).
+/// [`shed_desktop_core::Refusal`] is about the CALL and is a command Err
+/// carrying its code; a stale fingerprint is a fact about the host and an
+/// `ok` envelope carrying `ok: false`).
 ///
 /// **`consent` is a caller-supplied boolean, and that is the pinned wire shape**
 /// (plan 019 §3.6). It asserts that the caller rendered the §3.5 consent card and
@@ -500,12 +363,13 @@ async fn roost_preview(
 /// gap nobody noticed. The full note lives on `ipc.rs`'s twin.
 #[tauri::command]
 async fn roost_bootstrap(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
     target: String,
     fingerprint: String,
     consent: bool,
 ) -> Result<serde_json::Value, String> {
-    let run = machines.bootstrap(&target, &fingerprint, consent);
+    let id = shed_id(&target)?;
+    let run = runtime.hosts().bootstrap(&id, &fingerprint, consent);
     let outcome = match tokio::time::timeout(ipc::BOOTSTRAP_BUDGET, run).await {
         Ok(outcome) => outcome,
         Err(_) => {
@@ -519,8 +383,8 @@ async fn roost_bootstrap(
         }
     };
     match outcome {
-        Ok(Ok(installed)) => Ok(roost_hosts::installed_json(&installed)),
-        Ok(Err(failure)) => Ok(roost_hosts::failure_json(&failure)),
+        Ok(Ok(installed)) => Ok(installed_json(&installed)),
+        Ok(Err(failure)) => Ok(failure_json(&failure)),
         Err(refusal) => {
             let code = refusal.code();
             Err(roost_failure_string(code, refusal.message()))
@@ -531,36 +395,40 @@ async fn roost_bootstrap(
 // -- agent lanes (plan 015 §3.4) ------------------------------------------
 //
 // The frontend twins of the `lane.*` IPC ops. Both doors land in the SAME
-// [`lane::Lanes`] — the harness drives the socket, the panel drives these, and
-// what is tested is what ships (the `machine_*` pair's rule).
+// [`ShedLanes`] — the harness drives the socket, the panel drives these, and
+// what is tested is what ships.
 //
 // A failure crosses as its `error.code` and message joined, because a Tauri
 // command's error channel is a bare string: `bridge.ts` splits on the first ": "
 // to recover the code. The socket ops keep the structured envelope.
 //
-// EVERY failure, including the ones the grammar raises before a `Lanes` op is
-// reached. `lane::parse_mode`/`parse_answer` answer with a typed
-// [`lane::LaneFailure`] precisely so this door cannot `?` a bare string through
-// and lose the `bad_request` code that the socket door supplies for the same
+// EVERY failure, including the ones the grammar raises before a lane op is
+// reached. [`parse_mode`] / [`parse_answer`] answer with a typed
+// [`LaneFailure`] precisely so this door cannot `?` a bare string through and
+// lose the `bad_request` code that the socket door supplies for the same
 // input — `bridge.ts` would then be splitting a code out of whatever the parse
 // message happened to contain.
+//
+// The address is `{ target, session_id }` where `target` is
+// `roost:<server>/<shed>`. There is no `machine` and no `kind`.
 
 /// One lane failure as a string a `#[tauri::command]` can return.
-pub(crate) fn lane_error(failure: lane::LaneFailure) -> String {
-    format!("{}: {}", failure.code(), failure.message())
+pub(crate) fn lane_error(failure: LaneFailure) -> String {
+    failure.command_string()
 }
 
-/// `lane_open` — start (or re-answer) a live transcript for one agent session.
-/// `kind` is the row's `agent_lane.kind` (plan 025 §3.6.4).
+/// `lane_open` — start (or re-answer) a live transcript for one agent session
+/// on a server-listed shed.
 #[tauri::command]
 async fn lane_open(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes
-        .open(&machine, &kind, &session_id)
+    let id = shed_id(&target)?;
+    runtime
+        .lanes()
+        .open(&id, &session_id)
         .await
         .map_err(lane_error)
 }
@@ -568,42 +436,45 @@ async fn lane_open(
 /// `lane_messages` — the staged-then-swapped transcript view.
 #[tauri::command]
 fn lane_messages(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes
-        .messages(&machine, &kind, &session_id)
+    let id = shed_id(&target)?;
+    runtime
+        .lanes()
+        .messages(&id, &session_id)
         .map_err(lane_error)
 }
 
 /// `lane_approvals` — what the session (or a descendant) is blocked on.
 #[tauri::command]
 fn lane_approvals(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes
-        .approvals(&machine, &kind, &session_id)
+    let id = shed_id(&target)?;
+    runtime
+        .lanes()
+        .approvals(&id, &session_id)
         .map_err(lane_error)
 }
 
 /// `lane_send` — a prompt. `mode` defaults to `queue`.
 #[tauri::command]
 async fn lane_send(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
     text: String,
     mode: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let mode = lane::parse_mode(mode.as_deref()).map_err(lane_error)?;
-    lanes
-        .send(&machine, &kind, &session_id, &text, mode)
+    let id = shed_id(&target)?;
+    let mode = shed_desktop_core::parse_mode(mode.as_deref()).map_err(lane_error)?;
+    runtime
+        .lanes()
+        .send(&id, &session_id, &text, mode)
         .await
         .map_err(lane_error)
 }
@@ -611,13 +482,14 @@ async fn lane_send(
 /// `lane_cancel` — stop the turn in flight.
 #[tauri::command]
 async fn lane_cancel(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes
-        .cancel(&machine, &kind, &session_id)
+    let id = shed_id(&target)?;
+    runtime
+        .lanes()
+        .cancel(&id, &session_id)
         .await
         .map_err(lane_error)
 }
@@ -627,13 +499,14 @@ async fn lane_cancel(
 /// capabilities say `stop`, behind an inline confirm.
 #[tauri::command]
 async fn lane_stop(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes
-        .stop(&machine, &kind, &session_id)
+    let id = shed_id(&target)?;
+    runtime
+        .lanes()
+        .stop(&id, &session_id)
         .await
         .map_err(lane_error)
 }
@@ -643,56 +516,59 @@ async fn lane_stop(
 /// (`lane_messages`' `settings`); this is the one-shot read.
 #[tauri::command]
 async fn lane_settings(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes
-        .settings(&machine, &kind, &session_id)
+    let id = shed_id(&target)?;
+    runtime
+        .lanes()
+        .settings(&id, &session_id)
         .await
         .map_err(lane_error)
 }
 
 /// `lane_set` — change one setting (plan 025 §3.10), the twin of the
-/// `lane.set` socket op and read by the same [`lane::parse_setting`]: the
+/// `lane.set` socket op and read by the same [`shed_desktop_core::parse_setting`]: the
 /// settings sheet's every press. A refusal crosses with its code
 /// (`not_accepting` — craze's `stale_model` among others — or
 /// `outcome_unknown` for an answer lost to a drop, which the sheet shows "not
 /// confirmed" until the next `Settings`).
 #[tauri::command]
 async fn lane_set(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
     change: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let change = lane::parse_setting(&change).map_err(lane_error)?;
-    lanes
-        .set(&machine, &kind, &session_id, change)
+    let id = shed_id(&target)?;
+    let change = shed_desktop_core::parse_setting(&change).map_err(lane_error)?;
+    runtime
+        .lanes()
+        .set(&id, &session_id, change)
         .await
         .map_err(lane_error)
 }
 
 /// `lane_set_title` — rename the SESSION (plan 029 D12), the twin of the
 /// `lane.set_title` socket op: the composer's `/rename <title>`. `{}`, or
-/// `{warning}` ([`lane::renamed`]); every refusal crosses with its code.
+/// `{warning}` ([`shed_desktop_core::renamed`]); every refusal crosses with its code.
 #[tauri::command]
 async fn lane_set_title(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
     title: String,
 ) -> Result<serde_json::Value, String> {
-    lanes
-        .set_title(&machine, &kind, &session_id, &title)
+    let id = shed_id(&target)?;
+    runtime
+        .lanes()
+        .set_title(&id, &session_id, &title)
         .await
         .map_err(lane_error)
 }
 
-// -- the composer's `/` menu (plan 029 §3.6 D12): pure, see [`slash`] --------
+// -- the composer's `/` menu (plan 029 §3.6 D12): pure, see `shed_desktop_core::slash` --
 
 /// `lane_slash_filter` — what the menu panel shows for `draft` with the caret
 /// at `caret` (UTF-16 code units): `{open, token, rows: [{row, dimmed}]}`.
@@ -703,7 +579,7 @@ fn lane_slash_filter(
     caret: u32,
     activity: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    slash::filter(menu, &draft, caret, activity.as_deref()).map_err(lane_error)
+    shed_desktop_core::slash::filter(menu, &draft, caret, activity.as_deref()).map_err(lane_error)
 }
 
 /// `lane_slash_dispatch` — what sending `draft` does: `not_command`,
@@ -714,7 +590,7 @@ fn lane_slash_dispatch(
     draft: String,
     activity: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    slash::dispatch(menu, &draft, activity.as_deref()).map_err(lane_error)
+    shed_desktop_core::slash::dispatch(menu, &draft, activity.as_deref()).map_err(lane_error)
 }
 
 /// `lane_slash_accept` — what choosing the menu row `row` with `key`
@@ -728,23 +604,25 @@ fn lane_slash_accept(
     key: String,
     activity: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    slash::accept(menu, &draft, &row, &key, activity.as_deref()).map_err(lane_error)
+    shed_desktop_core::slash::accept(menu, &draft, &row, &key, activity.as_deref())
+        .map_err(lane_error)
 }
 
-/// `lane_answer` — resolve one approval. See [`lane::parse_answer`] for the
-/// three shapes `answer` takes.
+/// `lane_answer` — resolve one approval. See [`shed_desktop_core::parse_answer`]
+/// for the three shapes `answer` takes.
 #[tauri::command]
 async fn lane_answer(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
     approval_id: String,
     answer: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let answer = lane::parse_answer(&answer).map_err(lane_error)?;
-    lanes
-        .answer(&machine, &kind, &session_id, &approval_id, answer)
+    let id = shed_id(&target)?;
+    let answer = shed_desktop_core::parse_answer(&answer).map_err(lane_error)?;
+    runtime
+        .lanes()
+        .answer(&id, &session_id, &approval_id, answer)
         .await
         .map_err(lane_error)
 }
@@ -752,31 +630,34 @@ async fn lane_answer(
 /// `lane_close` — the panel's unmount. Idempotent.
 #[tauri::command]
 fn lane_close(
-    lanes: tauri::State<'_, Arc<lane::Lanes>>,
-    machine: String,
-    kind: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
-) -> serde_json::Value {
-    lanes.close(&machine, &kind, &session_id)
+) -> Result<serde_json::Value, String> {
+    let id = shed_id(&target)?;
+    Ok(runtime.lanes().close(&id, &session_id))
 }
 
 // -- craze: the create sheet and Open in terminal (plan 025 §3.6.6, §3.8) --
 //
-// The frontend twins of the `craze.*` socket ops — the same [`RoostHosts`]
+// The frontend twins of the `craze.*` socket ops — the same [`ShedHosts`]
 // methods, so what the harness proves about a create is what the sheet runs.
+// `target` is a server-listed shed (`roost:<server>/<shed>`).
 // A refusal crosses as `"<code>: <message>"` (the `lane_*` commands' rule),
 // which `bridge.ts` splits back so the sheet can tell `outcome_unknown` (keep
 // the request id) from a definite refusal (mint a new one).
 
-/// `craze_create_options` — what a create can start on `machine` (D8: read
-/// afresh on every sheet open). May start a hub on a dormant machine.
+/// `craze_create_options` — what a create can start on `target` (D8: read
+/// afresh on every sheet open). May start a hub on a dormant shed.
 #[tauri::command]
 async fn craze_create_options(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    machine: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
 ) -> Result<serde_json::Value, String> {
-    machines
-        .craze_create_options(&machine)
+    let id = shed_id(&target)?;
+    runtime
+        .hosts()
+        .craze_create_options(&id)
         .await
         .map_err(|f| f.command_string())
 }
@@ -785,13 +666,13 @@ async fn craze_create_options(
 /// (reused only while the last outcome is unknown), and `held` says this
 /// submission REPLAYS it (plan 026 §3.1). `title` is the sheet's "Name
 /// (optional)" (plan 029 D14; blank is absent), kept exactly with a held
-/// request. Read through [`craze::create_request`] and
-/// [`craze::held_create`], the socket door's one reading.
+/// request. Read through [`shed_desktop_core::create_request`] and
+/// [`shed_desktop_core::held_create`], the socket door's one reading.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn craze_create(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    machine: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     cwd: Option<String>,
     provider: Option<String>,
     prompt: Option<String>,
@@ -799,9 +680,10 @@ async fn craze_create(
     request_id: Option<String>,
     held: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let held = craze::held_create(held.unwrap_or(false), request_id.as_deref())
+    let id = shed_id(&target)?;
+    let held = shed_desktop_core::held_create(held.unwrap_or(false), request_id.as_deref())
         .map_err(|f| f.command_string())?;
-    let request = craze::create_request(
+    let request = shed_desktop_core::create_request(
         cwd.as_deref(),
         provider.as_deref(),
         prompt.as_deref(),
@@ -809,22 +691,25 @@ async fn craze_create(
         request_id.as_deref(),
     )
     .map_err(|f| f.command_string())?;
-    machines
-        .craze_create(&machine, request, held)
+    runtime
+        .hosts()
+        .craze_create(&id, request, held)
         .await
         .map_err(|f| f.command_string())
 }
 
 /// `craze_saved` — the saved sessions the create sheet's Resume mode lists on
-/// `machine` (plan 032 §3.4), read afresh on every call; plus the host's
-/// `home` where the app knows it. May start a hub on a dormant machine.
+/// `target` (plan 032 §3.4), read afresh on every call; plus the host's
+/// `home` where the app knows it. May start a hub on a dormant shed.
 #[tauri::command]
 async fn craze_saved(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    machine: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
 ) -> Result<serde_json::Value, String> {
-    machines
-        .craze_saved(&machine)
+    let id = shed_id(&target)?;
+    runtime
+        .hosts()
+        .craze_saved(&id)
         .await
         .map_err(|f| f.command_string())
 }
@@ -832,17 +717,19 @@ async fn craze_saved(
 /// `craze_reopen` — run the saved session `id` again (or join it where it
 /// already runs), its row listed at once. A refusal's code keeps the reopen
 /// error's variant (`gone`, `start_failed`, `unavailable`, or the inner lane
-/// code) — [`craze::CrazeFailure::reopen`]. Read through
-/// [`craze::reopen_id`], the socket door's one reading.
+/// code) — [`shed_desktop_core::CrazeFailure::reopen`]. Read through
+/// [`shed_desktop_core::reopen_id`], the socket door's one reading.
 #[tauri::command]
 async fn craze_reopen(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    machine: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let id = craze::reopen_id(id.as_deref()).map_err(|f| f.command_string())?;
-    machines
-        .craze_reopen(&machine, &id)
+    let target = shed_id(&target)?;
+    let id = shed_desktop_core::reopen_id(id.as_deref()).map_err(|f| f.command_string())?;
+    runtime
+        .hosts()
+        .craze_reopen(&target, &id)
         .await
         .map_err(|f| f.command_string())
 }
@@ -851,32 +738,16 @@ async fn craze_reopen(
 /// tab running `craze attach` on it.
 #[tauri::command]
 async fn craze_open_terminal(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    machine: String,
+    runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
+    target: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    machines
-        .craze_open_terminal(&machine, &session_id)
+    let id = shed_id(&target)?;
+    runtime
+        .hosts()
+        .craze_open_terminal(&id, &session_id)
         .await
         .map_err(|f| f.command_string())
-}
-
-/// `add_machine` — the dialog's path into [`machines::add_from_json`].
-#[tauri::command]
-fn add_machine(
-    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    env: tauri::State<'_, Env>,
-    machine: serde_json::Value,
-) -> Result<(), String> {
-    machines::add_from_json(&machines, &env.config_path, &machine)
-}
-
-/// The configured machines' live health — the sessions view's machine group
-/// rows. A machine with no sessions and no reachability still gets a row; that
-/// row IS the information.
-#[tauri::command]
-fn machines_list(machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>) -> serde_json::Value {
-    serde_json::json!({ "machines": machines.status() })
 }
 
 /// re-fetches on the `approvals-changed` event (see TauriEventSink).
@@ -1473,12 +1344,6 @@ pub fn run() {
             get_prefs,
             set_terminal_pref,
             rc_list,
-            rc_launch,
-            rc_kill,
-            machine_kill,
-            machine_capabilities,
-            machine_launch,
-            roost_run,
             roost_probe,
             roost_preview,
             roost_bootstrap,
@@ -1501,8 +1366,6 @@ pub fn run() {
             craze_saved,
             craze_reopen,
             craze_open_terminal,
-            machines_list,
-            add_machine,
             open_terminal,
             approvals_list,
             approval_decide,
@@ -1656,104 +1519,29 @@ pub fn run() {
             app.manage(coordinator.clone());
             app.manage(auth_modes);
 
-            // Roost hosts (plan 013 S3 for machines; plan 019 §3.6 for sheds):
-            // one roost watcher per `machines:` entry, plus the implicit
-            // `localhost` host. Started here rather than lazily so a machine's
-            // rows are already live when the Agents pane first renders — and so
-            // an unreachable machine has had a chance to say WHY by then.
-            //
-            // SHEDS are not started here: they are probed as the app learns
-            // which ones are running (`RoostHosts::observe_sheds`, driven from
-            // the listing ops) and watched only once a session answers on one.
-            //
-            // Reads the same config the Backend does. With no `machines:`
-            // section only the local session is watched, which costs nothing on
-            // an install that runs none.
-            let machine_config_path = env.config_path.to_string_lossy().into_owned();
-            // A host coming up (or dropping) is asynchronous — nothing the UI
-            // is already watching changes — so the layer pushes the SAME
-            // `refresh` event the lifecycle path uses, and the frontend's
-            // existing listener re-reads. Without this a machine that connects a
-            // second after mount stays invisible until a manual Refresh.
-            let refresh_handle = app.handle().clone();
-            let on_machine_change: roost_hosts::OnChange = Arc::new(move || {
-                let _ = refresh_handle.emit("refresh", serde_json::json!({}));
-            });
-            // **The app's spawn gate** (plan 026 §3.3), created once: every
-            // transport the roost-host layer builds — roost bridges, exec
-            // runners, craze dials, opencode forwards — spawns only inside its
-            // sections, and the orderly shutdown closes it first.
-            let spawn_gate = shed_app::spawn_gate::SpawnGate::new();
-            let mut reach_options = env.reach_options();
-            reach_options.spawn_gate = Some(spawn_gate.clone());
-            // One roost-tunnel teardown sink for every bridge (F4), so a
-            // teardown a removed host's bridge left running is joined by the
-            // shutdown rather than detached.
-            reach_options.teardowns = Some(shed_app::roost::TeardownSink::default());
-            let machines = Arc::new(roost_hosts::RoostHosts::start(
-                &tauri::async_runtime::handle().inner().clone(),
-                &shed_core::config::ShedConfig::load(&machine_config_path),
-                reach_options,
+            // Shed hosts and agent lanes (plan 038): one runtime owns both,
+            // the spawn gate, and the orderly shutdown. Sheds are probed as
+            // the app learns which ones are running (`observe_reachability_at`,
+            // driven from the listing ops) and watched only once a session
+            // answers on one. A host coming up or dropping emits `rc-changed`;
+            // a lane frame emits `lane-event`.
+            let runtime = Arc::new(ShedDesktopRuntime::start(
+                tauri::async_runtime::handle().inner().clone(),
+                &shed_core::config::ShedConfig::load(&env.config_path.to_string_lossy()),
+                env.reach_options(),
                 env.roost_jail_fs_root,
-                on_machine_change,
+                Arc::new(TauriHostEvents {
+                    app: app.handle().clone(),
+                }),
+                Arc::new(TauriLaneEvents {
+                    app: app.handle().clone(),
+                }),
             ));
-            app.manage(machines.clone());
-
-            // Agent lanes on machine rows (plan 015 §3.4). Built AFTER the
-            // machine layer because it reads from it (which row exposes which
-            // agent server, and how that machine is reached), and wired back
-            // into it with a WEAK reference so the two do not keep each other
-            // alive: `Machines` publishes each fresh roost snapshot's lane set,
-            // which is how an entry whose tab has gone — including one whose
-            // process died before any adapter claimed it — is evicted along with
-            // the `ssh -N` child behind it.
-            let lanes = Arc::new(lane::Lanes::new(
-                tauri::async_runtime::handle().inner().clone(),
-                app.handle().clone(),
-                machines.clone(),
-            ));
-            let lanes_hook = Arc::downgrade(&lanes);
-            machines.set_lane_observer(Arc::new(move |machine: &str, open: &_| {
-                if let Some(lanes) = lanes_hook.upgrade() {
-                    lanes.reconcile(machine, open);
-                }
-            }));
-            // The craze half (plan 025 §3.6.4): a craze lane's row is its
-            // machine's craze source's, so its lifecycle rides that source's
-            // news, not a roost snapshot (plan 032 §3.1.1): a row that left
-            // (a `Removed`, a reseed that dropped it, the hub gone, its tab
-            // ended) starts its lane's departure grace, a row listed again
-            // ends one, and the host's removal ends its whole generation.
-            let craze_hook = Arc::downgrade(&lanes);
-            machines.set_craze_observer(Arc::new(
-                move |machine: &str, gen: u64, news: lane::CrazeNews<'_>| {
-                    if let Some(lanes) = craze_hook.upgrade() {
-                        lanes.craze_news(machine, gen, news);
-                    }
-                },
-            ));
-            app.manage(lanes.clone());
-
-            // **The orderly shutdown** (plan 026 §3.3): one bounded,
-            // idempotent run, reached from the tray's quit, from
-            // `RunEvent::Exit` (macOS quit and logout) and from SIGTERM,
-            // SIGINT and SIGHUP — and the embedded broker's drain is its first
-            // step, so every one of those exits drains it.
-            let broker_app = app.handle().clone();
-            let broker_drain: shutdown::BrokerDrain = Box::new(move || {
-                if let Some(rt) = broker_app.try_state::<broker::BrokerRuntime>() {
-                    rt.signal_shutdown();
-                }
-            });
-            let orderly = shutdown::Shutdown::new(
-                spawn_gate,
-                machines.clone(),
-                lanes.clone(),
-                Some(broker_drain),
-                tauri::async_runtime::handle().inner().clone(),
-            );
-            app.manage(orderly.clone());
-            spawn_signal_thread(app.handle().clone(), orderly);
+            // The broker drain is the shutdown's first step, so a tray quit,
+            // `RunEvent::Exit`, and a signal all drain it.
+            shutdown::install_broker_drain(&runtime, app.handle());
+            app.manage(runtime.clone());
+            shutdown::spawn_signal_thread(app.handle().clone(), runtime.shutdown_coordinator());
 
             // The terminal ops (preset resolution, launch, detection, the pref), shared
             // by the IPC handler + the frontend invoke commands (needs the Backend above).
@@ -1772,8 +1560,7 @@ pub fn run() {
                 terminal,
                 coordinator,
                 prefs,
-                machines,
-                lanes,
+                runtime,
             );
             // block_on enters Tauri's tokio runtime so tokio's UnixListener can
             // register with the reactor; then serve on the same runtime.
@@ -1890,132 +1677,15 @@ pub fn run() {
             // here. This is the main thread, never a runtime worker, so
             // `block_on` is legal; the run itself is on the app's runtime.
             tauri::RunEvent::ExitRequested { code: Some(_), .. } => {
-                await_orderly_shutdown(app_handle);
+                shutdown::await_orderly_shutdown(app_handle);
             }
             // **The only event a macOS Dock Quit, logout or AppleScript quit
             // produces** (tao's `applicationWillTerminate`): the same orderly
             // shutdown. After any other exit path it is a wait for a run that
             // has already finished.
             tauri::RunEvent::Exit => {
-                await_orderly_shutdown(app_handle);
+                shutdown::await_orderly_shutdown(app_handle);
             }
             _ => {}
         });
-}
-
-/// Run the orderly shutdown (once — a later call waits for the first run) and
-/// block the calling thread until it has finished. Called from the event
-/// loop's own thread, never a runtime worker.
-///
-/// The wait is bounded by [`shutdown::ESCAPE`], and that bound cancels
-/// nothing: the run lives on the app's runtime, not in this wait, so only a
-/// runtime wedged past every phase's own bound can reach it. (Kept as
-/// designed, C3 review: it mirrors the signal path's 20 s escape — plan §9's
-/// "the worst case is a slower quit (≤ 20 s, by the escape timeout), never a
-/// hang" — and the phases are self-bounded at ≈ 16 s, so a compliant shutdown
-/// finishes well inside it.)
-fn await_orderly_shutdown(app: &tauri::AppHandle) {
-    let Some(orderly) = app.try_state::<Arc<shutdown::Shutdown>>() else {
-        return;
-    };
-    let orderly = Arc::clone(&orderly);
-    tauri::async_runtime::block_on(async move {
-        if tokio::time::timeout(shutdown::ESCAPE, orderly.run())
-            .await
-            .is_err()
-        {
-            app_warn!(
-                "shed-desktop-tauri: shutdown: not finished within {}s; exiting anyway",
-                shutdown::ESCAPE.as_secs()
-            );
-        }
-    });
-}
-
-/// **SIGTERM, SIGINT and SIGHUP, heard on a dedicated OS thread** (plan 026
-/// §3.3) — never on the app's runtime, so a wedged runtime cannot swallow a
-/// signal or block the escape.
-///
-/// The thread owns a tiny current-thread runtime of its own and selects over
-/// the three streams:
-///
-/// * the FIRST signal starts the orderly shutdown on the app's runtime
-///   ([`shutdown::Shutdown::start`] spawns it there; this thread never
-///   `block_on`s inside a runtime task) and keeps selecting;
-/// * when the shutdown completes it calls `app.exit(0)`, whose
-///   `ExitRequested` arm finds it done;
-/// * a SECOND signal before then, or the shutdown still running
-///   [`shutdown::ESCAPE`] after the first, ends the process at once with
-///   `128 + signo` — the escape hatch, which works with the app's runtime
-///   wedged.
-///
-/// Installing the handlers replaces the default disposition, under which
-/// SIGTERM killed the app outright and no teardown ran at all.
-fn spawn_signal_thread(app: tauri::AppHandle, orderly: Arc<shutdown::Shutdown>) {
-    let spawned = std::thread::Builder::new()
-        .name("shed-signals".to_string())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    app_error!(
-                        "shed-desktop-tauri: no signal runtime ({e}); signals end the app at once"
-                    );
-                    return;
-                }
-            };
-            rt.block_on(listen_for_signals(app, orderly));
-        });
-    if let Err(e) = spawned {
-        app_error!("shed-desktop-tauri: no signal thread ({e}); signals end the app at once");
-    }
-}
-
-async fn listen_for_signals(app: tauri::AppHandle, orderly: Arc<shutdown::Shutdown>) {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-        signal(SignalKind::hangup()),
-    ) else {
-        app_error!("shed-desktop-tauri: could not install the signal handlers");
-        return;
-    };
-    // Two signals that arrive before this first `recv` consumes the pending
-    // one are ONE signal (POSIX and tokio coalesce them) — kept as designed:
-    // the 20 s escape below still exits. A signal after this `recv` latches
-    // and completes the next one.
-    let first = tokio::select! {
-        _ = term.recv() => libc::SIGTERM,
-        _ = int.recv() => libc::SIGINT,
-        _ = hup.recv() => libc::SIGHUP,
-    };
-    app_info!("shed-desktop-tauri: signal {first}: shutting down");
-    let mut done = orderly.start();
-    let escape = tokio::time::sleep(shutdown::ESCAPE);
-    tokio::pin!(escape);
-    let mut exiting = false;
-    loop {
-        let again = tokio::select! {
-            finished = done.wait_for(|finished| *finished), if !exiting => {
-                let finished = finished.is_ok();
-                exiting = true;
-                if finished {
-                    app.exit(0);
-                }
-                continue;
-            }
-            _ = term.recv() => libc::SIGTERM,
-            _ = int.recv() => libc::SIGINT,
-            _ = hup.recv() => libc::SIGHUP,
-            () = &mut escape => first,
-        };
-        // Written and flushed before the exit: the sink appends per line.
-        app_warn!("shed-desktop-tauri: exiting now (signal {again})");
-        std::process::exit(128 + again);
-    }
 }
