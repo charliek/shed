@@ -470,7 +470,32 @@ function AgentsPane({ sessions, hosts, hasUnwatchedRunningShed, load, loadError,
   // Publish the rendered sessions + empty state so the `agents.dump` op can
   // observe them. This effect stays IN the pane so reportAgents fires ONLY while
   // the pane is mounted (the backend blanks the agents snapshot off-pane).
-  useEffect(() => { reportAgents(sessions, empty); }, [sessions, empty?.state, empty?.title, empty?.body, empty?.action]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    // Read AFTER the commit: the Transcript button is the DOM, and a roost
+    // opencode tab must be able to prove it rendered none.
+    const buttons = new Set(
+      Array.from(document.querySelectorAll<HTMLElement>("[data-agent-transcript]")).map(
+        (el) => el.dataset.agentTranscript ?? "",
+      ),
+    );
+    const chips = new Map(
+      Array.from(document.querySelectorAll<HTMLElement>("[data-agent-activity]")).map((el) => [
+        el.dataset.agentActivity ?? "",
+        el.dataset.agentActivityLabel ?? "",
+      ]),
+    );
+    reportAgents(
+      sessions.map((s) => {
+        const key = `${s.target ?? ""}/${s.slug}`;
+        return {
+          ...s,
+          transcript: buttons.has(key),
+          activity_chip: chips.has(key) ? chips.get(key) : null,
+        };
+      }),
+      empty,
+    );
+  }, [sessions, empty?.state, empty?.title, empty?.body, empty?.action]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div>
@@ -613,7 +638,11 @@ function SessionCard({ session: s, onKilled, onError, onTranscript }:
           {/* A craze row has no roost lifecycle to show — its activity,
               its start error and its staleness say what there is to say. */}
           {!craze && <StatusChip tone={rcStateTone(s.state)} label={s.state} />}
-          {act && <StatusChip tone={act.tone} label={act.label} />}
+          {act && (
+            <span data-agent-activity={`${s.target ?? ""}/${s.slug}`} data-agent-activity-label={act.label}>
+              <StatusChip tone={act.tone} label={act.label} />
+            </span>
+          )}
         </span>
       </div>
       <div className="mt-2 flex items-center gap-4">
@@ -634,6 +663,7 @@ function SessionCard({ session: s, onKilled, onError, onTranscript }:
               is how you read the session at all. */}
           {craze && s.agent_lane && s.target && (
             <button
+              data-agent-transcript={`${s.target}/${s.slug}`}
               onClick={() => onTranscript(s)}
               title="Open the live transcript"
               className="hbtn inline-flex items-center gap-[7px] rounded-[9px] px-[14px] py-2.5 text-[13px] font-medium"

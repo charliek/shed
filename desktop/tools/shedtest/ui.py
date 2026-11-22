@@ -244,7 +244,6 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 roost_jail: bool = False,
                 roost_install_bin: object | None = None,
                 roost_session_bin: object | None = None,
-                craze_path: object | None = None,
                 craze_home: object | None = None,
                 craze_runtime_dir: object | None = None) -> dict[str, str]:
     """The launch env for a subprocess UI — the single source of the subprocess
@@ -263,16 +262,10 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     spawns: a launch env that could reach the developer's agent, keys or
     servers raises instead.
 
-    `craze_path` is the craze seam (`<PREFIX>_CRAZE_PATH`, plan 025 §3.6.1,
-    test-mode and debug-build only): the directory this machine's craze source
-    finds `craze` in — the app then dials it through the JAILED ladder with
-    `PATH` set to exactly that directory, and passes through only `HOME`,
-    `CRAZE_HOME` and `CRAZE_RUNTIME_DIR`. Unset, a hermetic app has no local
-    craze source at all. `craze_home` / `craze_runtime_dir` are craze's own
-    `CRAZE_HOME` / `CRAZE_RUNTIME_DIR` for that dial — the runtime dir must be
-    SHORT, 0700, and under `/tmp` (craze refuses one beneath a group-writable
-    ancestor, plan 025 Amendment A3). All three are set-or-cleared: a
-    developer's own `CRAZE_HOME` must never reach a hermetic launch."""
+    `craze_home` / `craze_runtime_dir` are craze's own `CRAZE_HOME` /
+    `CRAZE_RUNTIME_DIR`, set-or-cleared so a developer's own values never reach
+    a hermetic launch. The desktop has no local craze dial: a shed's craze is
+    reached over `ssh` (`SHED_TAURI_SSH_BIN`), and the jail sets these itself."""
     env = dict(os.environ)
     env["HOME"] = str(runtime_dir)
     env["XDG_RUNTIME_DIR"] = str(runtime_dir)
@@ -318,16 +311,12 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     # observes roost's push feed (`events.subscribe`) instead of polling
     # `tab.list`, so a machine-row change arrives when roost commits it — the
     # cadence env var this used to seed was deleted on both sides.
-    #  * CRAZE_PATH — the craze seam (plan 025): the directory the LOCAL
-    #    craze dial's jailed ladder finds `craze` in. Load-bearing like
-    #    SSH_BIN: an inherited one would point a hermetic run at a real craze.
     managed = {
         "MOCK_UNREACHABLE_HOSTS": ",".join(unreachable_hosts) if unreachable_hosts else None,
         "ROOST_SOCKETS": (",".join(f"{n}={p}" for n, p in roost_sockets.items())
                           if roost_sockets else None),
         "SSH_BIN": str(ssh_bin) if ssh_bin else None,
         "ROOST_JAIL": "1" if roost_jail else None,
-        "CRAZE_PATH": str(craze_path) if craze_path else None,
         "SOCKET": None,
         "LOG_FILE": None,
     }

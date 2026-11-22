@@ -629,6 +629,12 @@ class FakeRoost:
             self._commit([opened])
             return copy.deepcopy(tab)
 
+    def close_tab(self, tab_id: int) -> None:
+        """Close a tab the way roost does when it goes: drop it and commit
+        `tab.closed`. The app's watcher is what clears an attached id."""
+        with self._lock:
+            self._close(tab_id)
+
     def set_axes(self, tab_id: int, *, lifecycle=_UNSET, has_notification=_UNSET,
                  detail=_UNSET, ownership=_UNSET) -> None:
         """Set a tab's agent axes and commit one batch — the whole point of the

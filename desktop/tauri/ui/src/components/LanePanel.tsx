@@ -402,7 +402,16 @@ export function LanePanel({ target, sessionId, opens, settingsOpen, onSettingsOp
       const { listen } = await import("@tauri-apps/api/event");
       const un = await listen<LaneEventEnvelope>(LANE_EVENT, (e) => {
         if (e.payload?.target === target && e.payload?.session_id === sessionId) {
-          if ((e.payload.event as { kind?: unknown } | null | undefined)?.kind === "settings") {
+          const ev = e.payload.event as { kind?: unknown; reason?: unknown } | null | undefined;
+          // A `down` paints the banner from THIS event, before the reread.
+          // The reread is this lane's own view, so the target check above is
+          // what keeps another shed's `down` for the same session id off this
+          // panel — a reread of this lane would otherwise put its live
+          // transcript back and hide the miss.
+          if (ev?.kind === "down") {
+            const reason = typeof ev.reason === "string" ? ev.reason : "";
+            setView((v) => (v ? { ...v, ended: true, stale: reason || v.stale } : v));
+          } else if (ev?.kind === "settings") {
             arrived.current += 1;
           }
           schedule();

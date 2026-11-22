@@ -1243,7 +1243,10 @@ export { agentsEmptyState, crazeOnly } from "@/lib/agentsEmpty";
  *  state's own words — so the `agents.dump` op can observe them: the drivable
  *  truth of the Agents pane, like `dashboard.dump` reads the sheds.
  *  (`ui_report` merges these keys with the shell's snapshot.) */
-export function reportAgents(sessions: RcSession[], empty: AgentsEmptyState | null): void {
+export function reportAgents(
+  sessions: Array<RcSession & { transcript?: boolean; activity_chip?: string | null }>,
+  empty: AgentsEmptyState | null,
+): void {
   void invoke("ui_report", { snapshot: { agents: sessions, agents_empty: empty } });
 }
 
