@@ -181,13 +181,12 @@ def launch(target: str = DEFAULT_TARGET, *, mock_base_url: str, config_path: Pat
     `unreachable_hosts` are config server NAMES the backend points at a closed
     port instead of the mock (the `<PREFIX>_MOCK_UNREACHABLE_HOSTS` down-host
     override) so the per-host error row is exercisable e2e.
-    `roost_sockets` maps machine NAME -> the Unix socket its `roost-session`
-    answers on, replacing roost's SSH client-bridge with a direct `LocalSession`
-    — the test-mode-only `<PREFIX>_ROOST_SOCKETS` seam. Per-machine so a suite
-    can serve a session for one and leave another unmapped (which reads as
-    unreachable, covering the everyday asleep/off-network state); the implicit
-    `localhost` host goes through the same map, so a hermetic run never reads the
-    developer's own session. That is what makes the machine path testable
+    `roost_sockets` maps a shed target (`roost:<server>/<shed>`) to the Unix
+    socket its `roost-session` answers on, replacing roost's SSH client-bridge
+    with a direct `LocalSession` — the test-mode-only `<PREFIX>_ROOST_SOCKETS`
+    seam. Per shed so a suite can serve a session for one and leave another
+    unmapped (which reads as unreachable). A hermetic run never reads the
+    developer's own session. That is what makes the shed path testable
     hermetically: the harness serves a fake `roost-session` there
     (`fake_roost.py`) and the app reaches it through the REAL roost client +
     watcher, with no ssh and no remote host anywhere. Set-or-clear like `unreachable_hosts`: `None` (not given)
@@ -297,9 +296,9 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     #
     #  * MOCK_UNREACHABLE_HOSTS — down-host override: server NAMES the backend
     #    redirects to a closed port.
-    #  * ROOST_SOCKETS — the roost seam: every `machines:` entry (and the
-    #    implicit `localhost`) is reached on the named Unix socket directly,
-    #    instead of through roost's SSH client-bridge. Driving the session app
+    #  * ROOST_SOCKETS — the roost seam: each shed target
+    #    (`roost:<server>/<shed>`) is reached on the named Unix socket
+    #    directly, instead of through roost's SSH client-bridge. Driving the session app
     #    against a REAL roost-session daemon is an explicit harness opt-in via
     #    SHEDTEST_ROOST_SOCKETS (see conftest.py's `_app_session` fixture and
     #    `.claude/skills/shedtest-linux`), not env inheritance here.

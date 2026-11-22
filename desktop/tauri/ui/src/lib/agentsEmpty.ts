@@ -82,9 +82,10 @@ export type AgentsEmptyState = {
  *  answer first, before any reading of the machine list (which is itself empty
  *  in both cases and would otherwise fall through to the bootstrap offer). */
 export function agentsEmptyState(
-  machines: EmptyMachine[],
+  hosts: EmptyMachine[],
   load: AgentsLoad,
   error: string | null,
+  hasUnwatchedRunningShed = false,
 ): AgentsEmptyState {
   if (load === "loading") {
     return {
@@ -107,22 +108,23 @@ export function agentsEmptyState(
       action: null,
     };
   }
-  // With machines configured but none reachable, "nothing is running" is a
-  // claim this pane cannot make — it has not been able to look. A host listed
-  // by craze alone is not down: its craze sessions are what it lists.
-  const down = machines.filter((m) => !m.reachable && !crazeOnly(m)).length;
-  if (down > 0 && down === machines.length) {
+  // With watched sheds present and none reachable (and no other running shed
+  // available to set up), "nothing is running" is a claim this pane cannot
+  // make — it has not been able to look. A host listed by craze alone is not
+  // down: its craze sessions are what it lists.
+  const down = hosts.filter((m) => !m.reachable && !crazeOnly(m)).length;
+  if (down > 0 && down === hosts.length && !hasUnwatchedRunningShed) {
     return {
       state: "unreachable",
       title: "Nothing to show",
-      body: `${down === 1 ? "The configured machine is" : `All ${down} configured machines are`} unreachable, so this pane cannot see what is running — see the Machines pane for why.`,
+      body: `${down === 1 ? "The shed is" : `All ${down} sheds are`} unreachable, so this pane cannot see what is running — see the Sheds pane for why.`,
       action: null,
     };
   }
   return {
     state: "empty",
     title: "No agent sessions",
-    body: "Agent sessions live in a roost-session — on a machine, or inside a shed. A shed without one has no sessions to list; install and start it from the Sheds pane, then launch an agent here.",
+    body: "Agent sessions live in a roost-session on a shed. A shed without one has no sessions to list; install and start it from the Sheds pane.",
     action: "Set up a roost-session",
   };
 }

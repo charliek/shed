@@ -228,10 +228,9 @@ function roleColor(role: string): string {
   return "var(--shed-text-secondary)";
 }
 
-export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSettingsOpen, onClose }: {
-  machine: string;
-  /** The row's `agent_lane.kind` — half of the lane's address. */
-  kind: string;
+export function LanePanel({ target, sessionId, opens, settingsOpen, onSettingsOpen, onClose }: {
+  /** The shed, `roost:<server>/<shed>`. */
+  target: string;
   sessionId: string;
   /** How many times the shell asked this panel to open its lane AGAIN where
    *  it stands (`crazeResume.ts`'s `laneOnResume`: a resume that landed on
@@ -297,7 +296,7 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
    *  sees in the moment between the adapter folding a change and this panel
    *  rendering it, held open so a harness can act inside it. */
   const held = useRef(false);
-  const changes = useSettingChanges(machine, kind, sessionId, settingsSeen, view?.settings ?? NO_SETTINGS);
+  const changes = useSettingChanges(target, sessionId, settingsSeen, view?.settings ?? NO_SETTINGS);
 
   // ---- the composer's `/` menu (plan 029 §3.5) ---------------------------
   /** The session's resolved menu, as the view last carried it — replaced
@@ -366,7 +365,7 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
         // ONE round-trip pair, in parallel: the two reads are independent
         // projections of the same locked view, so there is nothing to order
         // BETWEEN them — only between one pull and the next.
-        () => Promise.all([laneMessages(machine, kind, sessionId), laneApprovals(machine, kind, sessionId)]),
+        () => Promise.all([laneMessages(target, sessionId), laneApprovals(target, sessionId)]),
         ([v, a]) => {
           if (held.current) return;
           const json = JSON.stringify(v.slash_menu ?? null);
@@ -402,7 +401,7 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
       // for and the panel would sit empty until the next unrelated frame.
       const { listen } = await import("@tauri-apps/api/event");
       const un = await listen<LaneEventEnvelope>(LANE_EVENT, (e) => {
-        if (e.payload?.machine === machine && e.payload?.kind === kind && e.payload?.session_id === sessionId) {
+        if (e.payload?.target === target && e.payload?.session_id === sessionId) {
           if ((e.payload.event as { kind?: unknown } | null | undefined)?.kind === "settings") {
             arrived.current += 1;
           }
@@ -426,7 +425,7 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
       unlisten.push(unHold);
       const open = async () => {
         try {
-          const o = await laneOpen(machine, kind, sessionId);
+          const o = await laneOpen(target, sessionId);
           if (cancelled) return;
           setOpened(o);
         } catch (e) {
@@ -451,9 +450,9 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
       if (frame !== null) cancelAnimationFrame(frame);
       if (timer !== null) clearTimeout(timer);
       unlisten.forEach((u) => u());
-      void laneClose(machine, kind, sessionId);
+      void laneClose(target, sessionId);
     };
-  }, [machine, kind, sessionId]);
+  }, [target, sessionId]);
 
   // **Asked to open the lane AGAIN where it stands** (`opens` moved: a resume
   // landed on this very session — branch review). The mount's own open, with
@@ -517,8 +516,8 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
   );
 
   const answer = useCallback(
-    (id: string, a: LaneAnswer) => act1(() => laneAnswer(machine, kind, sessionId, id, a)),
-    [act1, machine, kind, sessionId],
+    (id: string, a: LaneAnswer) => act1(() => laneAnswer(target, sessionId, id, a)),
+    [act1, target, sessionId],
   );
 
   /** Every change to the draft's text goes through here: the text, and its
@@ -558,7 +557,7 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
    *  a client that always spelled the mode out would make every adapter's
    *  default this component's business. */
   const postPrompt = (text: string) =>
-    laneSend(machine, kind, sessionId, text, live.current.interjecting ? "interject" : undefined);
+    laneSend(target, sessionId, text, live.current.interjecting ? "interject" : undefined);
 
   const activity = view?.activity ?? "unknown";
   // A fresh guard per mount: StrictMode mounts, cleans up and mounts again,
@@ -706,7 +705,7 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
         switch (action.kind) {
           case "set_title":
             return slashVerb(async () => {
-              const r = await laneSetTitle(machine, kind, sessionId, d.arg ?? "");
+              const r = await laneSetTitle(target, sessionId, d.arg ?? "");
               return r?.warning ? { kind: "warning", text: r.warning } : { kind: "done" };
             }, at.rev);
           case "set_mode":
@@ -714,7 +713,7 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
             // settings sheet's row marks (P7). Re-selecting the current
             // mode still sends.
             return slashVerb(async () => {
-              await laneSet(machine, kind, sessionId, action.change);
+              await laneSet(target, sessionId, action.change);
               return { kind: "done" };
             }, at.rev);
           case "stop":
@@ -733,7 +732,7 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
             // errors here as a mode's — a `stale_model` (the model moved
             // since the menu) included. Always sent, the current level too.
             return slashVerb(async () => {
-              await laneSet(machine, kind, sessionId, action.change);
+              await laneSet(target, sessionId, action.change);
               return { kind: "done" };
             }, at.rev);
           default:
@@ -950,14 +949,14 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
     };
   }, []);
 
-  const cancel = () => act1(() => laneCancel(machine, kind, sessionId));
+  const cancel = () => act1(() => laneCancel(target, sessionId));
   /** Stop the SESSION, from the confirm's own button. The lane ends when the
    *  session's close arrives (the banner says `ended`), and the row leaves.
    *  A confirm `/exit` opened settles the draft by the composer's table: the
    *  stop that goes through clears it, a refusal is said inline. */
   const stop = () => {
     const run = async () => {
-      await laneStop(machine, kind, sessionId);
+      await laneStop(target, sessionId);
       setConfirmStop(null);
     };
     return confirmStop === "slash"
@@ -1079,9 +1078,8 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
     };
   });
   const report: LaneReport = {
-    machine,
+    target,
     session_id: sessionId,
-    lane_kind: kind,
     kind: capabilities?.kind ?? "",
     permission,
     title: header.title,
@@ -1139,7 +1137,7 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
               {header.title || "Transcript"}
             </div>
             <div className="mt-0.5 truncate font-mono text-[11.5px] text-shed-text-muted">
-              {machine} · {sessionId}
+              {target} · {sessionId}
             </div>
             {/* The session's permission posture, when it states one: a session
                 the create sheet started runs `bypass`, and this is where that
@@ -1234,8 +1232,7 @@ export function LanePanel({ machine, kind, sessionId, opens, settingsOpen, onSet
 
       {offered && settingsOpen && (
         <LaneSettingsSheet
-          machine={machine}
-          kind={kind}
+          target={target}
           sessionId={sessionId}
           settings={settings}
           effortOption={effortOption}

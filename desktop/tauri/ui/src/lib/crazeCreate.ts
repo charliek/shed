@@ -63,7 +63,7 @@ export function reconcileProvider(current: string | null, o: CrazeCreateOptions)
 }
 
 /** What the sheet says when NO provider can be picked. */
-export const NO_PROVIDER_READY = "no provider is ready on this machine";
+export const NO_PROVIDER_READY = "no provider is ready on this shed";
 
 /** The directory field's refusal, or `null` when it may be sent: a session's
  *  directory must be ABSOLUTE (empty and relative are refused here; craze
@@ -271,7 +271,7 @@ export function refusalView(r: CrazeRefusal): { where: "cwd" | "title" | "cause"
 
 // ---- where the sheet is offered (plan 025 §3.6.5) ---------------------------
 
-/** A host's craze status, as `rc.list`'s `machines[].craze` carries it. */
+/** A host's craze status, as `rc.list`'s `hosts[].craze` carries it. */
 export type CrazeStatusLike = {
   state?: string | null;
   cause?: string | null;
@@ -322,21 +322,12 @@ export function crazeStatusFor(
   return shedCraze.find(named)?.craze;
 }
 
-/** The hosts the New-session dialog's "Where" offers "— new craze session"
- *  on: every listed host, then every `shed_craze` entry, whose craze offers
- *  one ([`crazeCreateOffered`], read through [`crazeStatusFor`]) — in that
- *  order, each once. */
-export function crazeCreateTargets(machines: CrazeHostLike[], shedCraze: CrazeHostLike[]): CrazeHostLike[] {
-  return [...machines, ...shedCraze].filter((h) =>
-    crazeCreateOffered(crazeStatusFor(h.origin, machines, shedCraze)));
-}
-
 /** The machine's line when its LIVE hub cannot create — listing still works,
- *  creating does not (§3.8's "update craze on this machine"). `null`
- *  otherwise (a too-old craze has the machines pane's own note). */
+ *  creating does not (§3.8's "update craze on this shed"). `null`
+ *  otherwise (a too-old craze has the host row's own note). */
 export function crazeCreateUpdateNote(craze: CrazeStatusLike): string | null {
   if (craze?.state === "live" && !(craze.create && craze.create_options)) {
-    return "update craze on this machine to create sessions here";
+    return "update craze on this shed to create sessions here";
   }
   return null;
 }
@@ -350,7 +341,7 @@ export function crazeSheetNote(craze: CrazeStatusLike, machine: string): string 
     return crazeCreateUpdateNote(craze);
   }
   if (state === "dormant") return null;
-  if (craze?.cause === "too_old") return "craze on this machine is too old for shed; update it";
+  if (craze?.cause === "too_old") return "craze on this shed is too old; update it";
   if (craze?.cause === "not_installed") return `craze is not installed on ${machine}`;
   if (state === "offline") {
     return `craze on ${machine} is offline${craze?.cause ? ` (${craze.cause.replace(/_/g, " ")})` : ""} — your form is kept`;

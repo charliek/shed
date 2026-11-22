@@ -117,7 +117,7 @@ export const UNTITLED = "Untitled";
  *  runs, but on a machine since removed and added again, so it is not opened
  *  — and a Resume of it now joins it through the machine as it is. */
 export const SUPERSEDED_NOTE =
-  "craze resumed the session, but this machine was removed and added again meanwhile, so it was not opened — Resume again to open it";
+  "craze resumed the session, but this shed was removed and added again meanwhile, so it was not opened — Resume again to open it";
 
 /** **Whether the sheet offers `New | Resume`** (PC11): when the create
  *  options it just read say the hub can reopen — and while it already shows
@@ -360,8 +360,8 @@ export function settleResume(
  *  for, and `opens` — how many times the shell asked the panel on screen to
  *  open its lane AGAIN in place ([`laneOnResume`]). */
 export type LaneTarget = {
-  machine: string;
-  kind: string;
+  /** The shed, `roost:<server>/<shed>`. */
+  target: string;
   sessionId: string;
   settings?: boolean;
   opens?: number;
@@ -384,14 +384,13 @@ export type LaneTarget = {
  *  it. Everything else about the panel (its settings sheet) stays. */
 export function laneOnResume(
   current: LaneTarget | null,
-  target: { machine: string; kind: string; sessionId: string },
+  next: { target: string; sessionId: string },
 ): LaneTarget {
   const same =
     current !== null &&
-    current.machine === target.machine &&
-    current.kind === target.kind &&
-    current.sessionId === target.sessionId;
-  return same ? { ...current, opens: (current.opens ?? 0) + 1 } : { ...target };
+    current.target === next.target &&
+    current.sessionId === next.sessionId;
+  return same ? { ...current, opens: (current.opens ?? 0) + 1 } : { ...next };
 }
 
 /** A row's button label: Resume; Resuming… while its reopen runs; Retry

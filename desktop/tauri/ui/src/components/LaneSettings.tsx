@@ -49,8 +49,7 @@ const rowKey = (r: SettingsRow) => `${r.kind}:${r.id}`;
  *  the sheet DISPLAYS: an option is sent bound to its model (Amendment A13),
  *  and a lost answer whose value is already on screen is no "not confirmed". */
 export function useSettingChanges(
-  machine: string,
-  kind: string,
+  target: string,
   sessionId: string,
   settingsSeen: number,
   shown: SessionSettings,
@@ -94,7 +93,7 @@ export function useSettingChanges(
       };
       // Bound to the model shown as the person pressed — not the one the
       // adapter's fold may have moved on to.
-      laneSet(machine, kind, sessionId, changeFor(row, value, onScreen.current.model)).then(
+      laneSet(target, sessionId, changeFor(row, value, onScreen.current.model)).then(
         () => put(settle(row.kind, { ok: true }, seen.current)),
         (e: unknown) => {
           const f = laneFailure(e);
@@ -103,15 +102,14 @@ export function useSettingChanges(
         },
       );
     },
-    [machine, kind, sessionId, marks],
+    [target, sessionId, marks],
   );
 
   return { markOf, press };
 }
 
 export function LaneSettingsSheet({
-  machine,
-  kind,
+  target,
   sessionId,
   settings,
   effortOption,
@@ -119,8 +117,8 @@ export function LaneSettingsSheet({
   press,
   onClose,
 }: {
-  machine: string;
-  kind: string;
+  /** The shed, `roost:<server>/<shed>`. */
+  target: string;
   sessionId: string;
   settings: SessionSettings;
   /** The view's `effort_option` — which option the chip names as the
@@ -161,9 +159,8 @@ export function LaneSettingsSheet({
 
   // ---- the rendered truth, and the report of it ---------------------------
   const report: LaneSettingsReport = {
-    machine,
+    target,
     session_id: sessionId,
-    lane_kind: kind,
     chip: settingsChip(settings, effortOption),
     rows: rows.map((r) => {
       const mark = markOf(r);

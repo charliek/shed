@@ -51,7 +51,7 @@ test("all-unreachable machines are their own state, not an empty one", () => {
   );
   assert.equal(down.state, "unreachable");
   assert.equal(down.action, null);
-  assert.match(down.body, /All 2 configured machines are unreachable/);
+  assert.match(down.body, /All 2 sheds are unreachable/);
 
   // One reachable machine means the pane HAS looked, so an empty list is a
   // genuine "nothing here" again.
@@ -108,4 +108,11 @@ test("CONTROL: a host listed by craze alone does not make the pane unreachable",
   const withCraze = agentsEmptyState([down, crazeListedShed("live")], "ready", null);
   assert.equal(withCraze.state, "empty", "the craze-only shed is somewhere the pane can see");
   assert.equal(agentsEmptyState([crazeListedShed("dormant")], "ready", null).state, "empty");
+});
+
+test("REGRESSION: an unwatched running shed keeps the setup offer even when watched sheds are down", () => {
+  const down = { reachable: false, roost_watched: true, connected_once: true, craze: { state: "absent" } };
+  const got = agentsEmptyState([down, down], "ready", null, true);
+  assert.equal(got.state, "empty");
+  assert.equal(got.action, OFFER);
 });

@@ -62,9 +62,10 @@ type OptionsLoad =
   | { phase: "ready"; options: CrazeCreateOptions };
 
 export function CrazeCreateDialog({
-  machine, craze, draft, onEdit, onSubmit, resume, onSourceGen, onChooseMode, onResume, onRetryList, onClose,
+  target, craze, draft, onEdit, onSubmit, resume, onSourceGen, onChooseMode, onResume, onRetryList, onClose,
 }: {
-  machine: string;
+  /** The shed, `roost:<server>/<shed>`. */
+  target: string;
   /** This machine's craze status as the shell last read it — what turns the
    *  sheet's note on (offline, too old, not installed) while it is open. Read
    *  through `crazeStatusFor`, so an unlisted dormant shed's comes from its
@@ -103,7 +104,7 @@ export function CrazeCreateDialog({
   useEffect(() => {
     let live = true;
     setLoad({ phase: "loading" });
-    crazeCreateOptions(machine).then(
+    crazeCreateOptions(target).then(
       (options) => {
         if (!live) return;
         setLoad({ phase: "ready", options });
@@ -115,7 +116,7 @@ export function CrazeCreateDialog({
       },
     );
     return () => { live = false; };
-  }, [machine, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [target, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // The provider follows the options — for an IDLE draft only: a selection
   // carried over from an earlier open survives only while still ready, else
@@ -143,7 +144,7 @@ export function CrazeCreateDialog({
   // Dismissing while a submission runs is allowed, and keeps it running.
   useEscClose(onClose);
 
-  const machineNote = crazeSheetNote(craze, machine);
+  const machineNote = crazeSheetNote(craze, target);
   const providers = options?.providers ?? [];
   // Every gating rule is `crazeCreateGate`'s (node-tested): the selection,
   // the note, and whether the button works — a held request replayed
@@ -290,7 +291,7 @@ export function CrazeCreateDialog({
     }));
     const primary = root?.querySelector<HTMLButtonElement>("[data-craze-create-primary]");
     reportCrazeCreate({
-      machine,
+      target,
       state: load.phase === "ready" ? draft.phase : load.phase,
       providers: rows,
       preselected: options ? preselectedProvider(options) : null,
@@ -322,8 +323,8 @@ export function CrazeCreateDialog({
         icon={Sparkles}
         title={resuming ? "Resume a craze session" : "New craze session"}
         sub={resuming
-          ? `on ${machine} — a saved session, running again`
-          : `on ${machine} — a provider, a directory, and an optional first prompt`}
+          ? `on ${target} — a saved session, running again`
+          : `on ${target} — a provider, a directory, and an optional first prompt`}
         onClose={onClose}
         width={540}
         footer={
@@ -371,16 +372,16 @@ export function CrazeCreateDialog({
         {resuming ? (
           <div data-craze-half="resume" className="contents">
             {retryHalf === "resume" && optionsFailure && (
-              <OptionsFailed what="craze could not read this machine's options" message={optionsFailure.message} onRetry={retryOptions} />
+              <OptionsFailed what="craze could not read this shed's options" message={optionsFailure.message} onRetry={retryOptions} />
             )}
-            <SavedList machine={machine} resume={resume} locked={locked} onResume={pressSaved} onRetryList={onRetryList} />
+            <SavedList target={target} resume={resume} locked={locked} onResume={pressSaved} onRetryList={onRetryList} />
           </div>
         ) : (
         <div data-craze-half="new" className="contents">
         <Field label="Provider">
           {load.phase === "loading" ? (
             <div className="flex items-center gap-2 px-1 py-2 text-[13px] text-shed-text-muted">
-              <RotateCw size={14} className="animate-spin" /> reading what {machine} can start…
+              <RotateCw size={14} className="animate-spin" /> reading what {target} can start…
             </div>
           ) : retryHalf === "new" && optionsFailure ? (
             <OptionsFailed what="craze could not list providers" message={optionsFailure.message} onRetry={retryOptions} />
@@ -472,7 +473,7 @@ export function CrazeCreateDialog({
             value={draft.cwd}
             disabled={submitting}
             onChange={(e) => onEdit({ cwd: e.target.value })}
-            placeholder="/absolute/path on that machine"
+            placeholder="/absolute/path on that shed"
             spellCheck={false}
             className={cn(dialogInput, "font-mono text-[13px]")}
           />
@@ -542,8 +543,8 @@ export function CrazeCreateDialog({
  *  shortened to `~` where the app knows it) and age, with a Resume button.
  *  Rendered from the shell's state by `crazeResume.ts`'s rules and read back
  *  off this DOM for `craze_create.dump`; it holds no rule of its own. */
-function SavedList({ machine, resume, locked, onResume, onRetryList }: {
-  machine: string;
+function SavedList({ target, resume, locked, onResume, onRetryList }: {
+  target: string;
   resume: CrazeResume;
   /** A create submitting or a reopen running: the list's Retry waits. */
   locked: boolean;
@@ -555,7 +556,7 @@ function SavedList({ machine, resume, locked, onResume, onRetryList }: {
   if (load.phase === "unloaded" || load.phase === "loading") {
     return (
       <div data-saved data-saved-state="loading" className="flex items-center gap-2 px-1 py-2 text-[13px] text-shed-text-muted">
-        <RotateCw size={14} className="animate-spin" /> reading the saved sessions on {machine}…
+        <RotateCw size={14} className="animate-spin" /> reading the saved sessions on {target}…
       </div>
     );
   }
@@ -582,7 +583,7 @@ function SavedList({ machine, resume, locked, onResume, onRetryList }: {
         </div>
       )}
       {load.sessions.length === 0 && (
-        <div data-saved-empty className="px-1 py-2 text-[13px] text-shed-text-muted">No saved sessions on {machine}.</div>
+        <div data-saved-empty className="px-1 py-2 text-[13px] text-shed-text-muted">No saved sessions on {target}.</div>
       )}
       {load.sessions.map((s) => {
         const state = rowState(resume, s.id);

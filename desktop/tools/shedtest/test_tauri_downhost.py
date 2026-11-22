@@ -162,7 +162,7 @@ def _assert_never_zeroed(samples: list[dict]) -> None:
 
 
 def test_badges_count_both_configured_hosts(downhost):
-    # `hosts` counts CONFIGURED hosts (derived from system.df, which keeps the down
+    # `hosts` counts CONFIGURED servers (derived from system.df, which keeps the down
     # host as a row) → 2 in this instance, even though one is unreachable.
     downhost.wait_until(lambda: (downhost.badges() or {}).get("hosts") == 2,
                         timeout=15, what="badges report 2 configured hosts")

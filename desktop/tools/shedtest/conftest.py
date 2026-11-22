@@ -96,7 +96,7 @@ def _app_session(mock, studio):
     end; yields the session broker's `broker_env.BrokerInfo`. Every module's
     default `client`/`tauri` fixtures ride this one instance (a suite that needs
     its own, e.g. a `roost_sockets` map per test, replaces it with a
-    self-managed instance instead — see `test_tauri_machines.py`).
+    self-managed instance instead — see `test_agents.py`).
 
     The app's broker serves `mock` as `mini3` and `studio` as `studio`, for all
     three namespaces. After launch `broker_env.check_running` holds the session
