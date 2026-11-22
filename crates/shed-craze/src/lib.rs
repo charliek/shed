@@ -4,9 +4,9 @@
 //! craze is the provider abstraction (D2): cursor, grok, claude and native
 //! sessions all live behind one per-machine **hub**, which lists every session
 //! (its roster), says what a create can start, starts one, and splices a
-//! client through to a session's host. `shed_core::lane` splits an agent into a
-//! machine-level [`shed_core::lane::AgentSource`] and a session-scoped
-//! [`shed_core::lane::AgentLane`] (D3) precisely so a hub fits: this crate's
+//! client through to a session's host. `shed_lane::lane` splits an agent into a
+//! machine-level [`shed_lane::lane::AgentSource`] and a session-scoped
+//! [`shed_lane::lane::AgentLane`] (D3) precisely so a hub fits: this crate's
 //! [`CrazeSource`] is one machine's hub.
 //!
 //! ```text
@@ -32,7 +32,7 @@
 //! wherever the client can reach — a local `/bin/sh -c '<ladder>'` child on the
 //! desktop's own machine, an `SshExec` duplex to a remote one (C9), a loopback
 //! port on the phone — and this crate speaks protocol 1 over whatever duplex it
-//! is handed. The ladder itself is `shed_core::craze`'s (craze's published one,
+//! is handed. The ladder itself is `shed_lane::craze`'s (craze's published one,
 //! verbatim, plus an exec-only PATH; plan 025 §3.4). Every connection is its own
 //! dial: the roster's, every `createOptions`, every create, every saved list
 //! and every reopen (plan 032), and every open lane's (one per lane, which its

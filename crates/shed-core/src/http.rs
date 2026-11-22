@@ -186,7 +186,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Max gap between SSE bytes during a create before we give up (a hung stream);
 /// generous so a healthy provision with periodic progress never trips it.
 const CREATE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-pub(crate) const USER_AGENT: &str = concat!("shed-desktop-core/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("shed-desktop-core/", env!("CARGO_PKG_VERSION"));
 
 /// Sink for create progress. shed-core streams the SSE and drives these; the
 /// `create` store implements it to update the status its callers poll.

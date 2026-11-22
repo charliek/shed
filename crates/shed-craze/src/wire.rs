@@ -150,7 +150,7 @@ pub mod code {
 }
 
 /// The `data.reason`s this crate reads — never to decide an error's
-/// [`shed_core::lane::LaneError`] variant (that is `data.code` alone), only
+/// [`shed_lane::lane::LaneError`] variant (that is `data.code` alone), only
 /// for the places a plan pins a reason: a `hello` refused for want of a
 /// shared protocol is `TooOld` (plan 025 §3.3.2), a create whose session
 /// failed to start carries its cause (P14), and a REPLAYED create craze

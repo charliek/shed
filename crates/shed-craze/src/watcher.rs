@@ -88,9 +88,9 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::Value;
-use shed_core::lane::backoff::next_backoff;
-use shed_core::lane::ring::MessageRing;
-use shed_core::lane::{
+use shed_lane::lane::backoff::next_backoff;
+use shed_lane::lane::ring::MessageRing;
+use shed_lane::lane::{
     LaneApproval, LaneCapabilities, LaneEvent, LanePublisher, LaneSession, LaneSettings,
     LaneSlashCatalog, LaneStop, LaneSubscription, Publish,
 };
@@ -113,12 +113,12 @@ use crate::wire::{
 };
 
 /// The most transcript rows one seed carries: what the ring keeps anyway
-/// ([`shed_core::lane::ring::MAX_RING_MESSAGES`], 500), so a seed — its rows,
+/// ([`shed_lane::lane::ring::MAX_RING_MESSAGES`], 500), so a seed — its rows,
 /// `Reset`, `Session`, `Capabilities`, `Settings` and its approvals (at most
 /// [`crate::fold::MAX_APPROVALS`]) — fits the 1,024-frame client channel with
 /// room for the replay behind it. A longer snapshot window seeds its newest 500
 /// rows under one "earlier transcript omitted" row.
-pub const SEED_ROWS: usize = shed_core::lane::ring::MAX_RING_MESSAGES;
+pub const SEED_ROWS: usize = shed_lane::lane::ring::MAX_RING_MESSAGES;
 
 /// Spawn one subscription's watcher.
 pub(crate) fn spawn(shared: Arc<LaneShared>, hint: Option<String>) -> LaneSubscription {

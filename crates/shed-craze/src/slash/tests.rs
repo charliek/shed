@@ -1,7 +1,7 @@
 //! The presence-aware slash decoder (plan 029 P15, P16), table by table.
 
 use serde_json::{json, Value};
-use shed_core::lane::{
+use shed_lane::lane::{
     LaneSlashArg, LaneSlashCatalog, LaneSlashKind, LaneSlashMethod, LaneSlashPicker,
     LaneSlashRequires, LaneSlashRow, LaneSlashRun, LaneSlashSource,
 };

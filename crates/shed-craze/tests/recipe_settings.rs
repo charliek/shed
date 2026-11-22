@@ -21,13 +21,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use shed_core::lane::conformance::{drive_lane, Drive, DriveEnd, LaneChecker};
-use shed_core::lane::{
+use shed_craze::testing::{bins, HookDial, Recipe, RECIPE_WAIT};
+use shed_craze::{is_outcome_unknown, new_request_id, CrazeDial, CrazeSource};
+use shed_lane::lane::conformance::{drive_lane, Drive, DriveEnd, LaneChecker};
+use shed_lane::lane::{
     AgentLane, AgentSource, LaneCreateRequest, LaneError, LaneEvent, LaneSettingChange,
     LaneSettings, SourceEvent,
 };
-use shed_craze::testing::{bins, HookDial, Recipe, RECIPE_WAIT};
-use shed_craze::{is_outcome_unknown, new_request_id, CrazeDial, CrazeSource};
 use tokio::sync::mpsc::Receiver;
 
 async fn drive(
@@ -132,7 +132,7 @@ async fn create_cursor(source: &CrazeSource, recipe: &Recipe) -> String {
 async fn lane_on(
     source: &CrazeSource,
     host_id: &str,
-) -> (Arc<dyn AgentLane>, shed_core::lane::SourceSubscription) {
+) -> (Arc<dyn AgentLane>, shed_lane::lane::SourceSubscription) {
     let mut sub = source.subscribe().await.unwrap();
     let deadline = tokio::time::Instant::now() + RECIPE_WAIT;
     loop {
@@ -153,7 +153,7 @@ async fn seeded(
     lane: &Arc<dyn AgentLane>,
 ) -> (
     Receiver<LaneEvent>,
-    shed_core::lane::LaneStop,
+    shed_lane::lane::LaneStop,
     LaneChecker,
     LaneSettings,
 ) {

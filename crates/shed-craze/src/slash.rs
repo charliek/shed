@@ -38,7 +38,7 @@
 //! carries the catalog whole, and so does this.
 
 use serde_json::{Map, Value};
-use shed_core::lane::{
+use shed_lane::lane::{
     LaneSlashArg, LaneSlashCatalog, LaneSlashKind, LaneSlashMethod, LaneSlashPicker,
     LaneSlashRequires, LaneSlashRow, LaneSlashRun, LaneSlashSource,
 };

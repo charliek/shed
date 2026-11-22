@@ -100,7 +100,7 @@
 //! `settings()` reads `sessions.list`'s catalogs and a snapshot's settings on
 //! a short connection.
 //! `history` ignores its cursor (craze has no paging; the module doc of
-//! `shed_core::lane`), and its rows carry seqs local to the call.
+//! `shed_lane::lane`), and its rows carry seqs local to the call.
 //!
 //! # The session's end
 //!
@@ -142,8 +142,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use shed_core::lane::ring::MessageRing;
-use shed_core::lane::{
+use shed_lane::lane::ring::MessageRing;
+use shed_lane::lane::{
     normalize_question_answer, AgentLane, LaneAnswer, LaneApproval, LaneApprovalKind,
     LaneCapabilities, LaneDecision, LaneError, LaneHistory, LaneSession, LaneSettingChange,
     LaneSettings, LaneSubscription, SendMode,
@@ -222,7 +222,7 @@ pub struct LaneTimings {
     pub reattaches: u32,
     /// [`CONNECT_REFUSALS`].
     pub connect_refusals: u32,
-    /// Spread each backoff over `[d/2, d]` ([`shed_core::lane::backoff::jittered`]);
+    /// Spread each backoff over `[d/2, d]` ([`shed_lane::lane::backoff::jittered`]);
     /// `false` sleeps exactly the backoff — for tests that measure the schedule.
     pub jitter: bool,
 }
@@ -231,7 +231,7 @@ impl LaneTimings {
     /// One backoff step's sleep: the backoff, jittered unless `jitter` is off.
     pub(crate) fn spread(&self, backoff: Duration) -> Duration {
         if self.jitter {
-            shed_core::lane::backoff::jittered(backoff)
+            shed_lane::lane::backoff::jittered(backoff)
         } else {
             backoff
         }

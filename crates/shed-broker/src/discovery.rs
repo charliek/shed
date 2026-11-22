@@ -976,67 +976,6 @@ servers:
         }
     }
 
-    /// The bytes shed-core's writer emits (`config_edit::insert_machine`, the app's
-    /// **Add machine**) for a value YAML would read otherwise are read back as the same
-    /// string by this crate's YAML parser, not only by shed-core's own reader (plan 037
-    /// A8 review: Go read `&a other.example` as `other.example`).
-    #[test]
-    fn the_core_writer_s_values_read_back_through_a_yaml_parser() {
-        use shed_core::config_edit::{insert_machine, NewMachine};
-        for value in [
-            "&a other.example",
-            "!!str other.example",
-            "*alias",
-            "|literal",
-            ">folded",
-            "-dash",
-            "?question",
-            "{a: b}",
-            "[a]",
-            "#hash",
-            "%percent",
-            "@at",
-            "`tick",
-            "\"quote",
-            "'apostrophe",
-            "a: b",
-            "a #b",
-            "100.64.0.3",
-            "yes",
-            "NULL",
-            "~",
-            "back\\slash",
-            "clé",
-            "mini3",
-        ] {
-            let out = insert_machine(
-                "",
-                &NewMachine {
-                    name: "box",
-                    host: Some(value),
-                    user: Some(value),
-                    ssh_port: None,
-                },
-            )
-            .unwrap_or_else(|e| panic!("{value:?}: {e}"));
-            let root = yaml_lite::parse(&out).unwrap_or_else(|e| panic!("{value:?}: {e}: {out}"));
-            let machine = root
-                .as_map()
-                .and_then(|m| m.get("machines"))
-                .and_then(Node::as_map)
-                .and_then(|m| m.get("box"))
-                .and_then(Node::as_map)
-                .unwrap_or_else(|| panic!("{value:?}: no machine in {out}"));
-            for field in ["host", "user"] {
-                assert_eq!(
-                    machine.get(field).and_then(Node::as_scalar),
-                    Some(value),
-                    "{field} {value:?}: {out}"
-                );
-            }
-        }
-    }
-
     /// The single-server (no `discovery:` block) target carries no learned mode — it has
     /// no CLI config entry to read one from.
     #[test]

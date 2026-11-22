@@ -176,76 +176,31 @@ fn is_http_url_with_host(s: &str) -> bool {
     !host.is_empty() && !host.contains(char::is_whitespace)
 }
 
-/// One `machines:` entry — a **native** host (not a shed), reachable over plain
-/// SSH (plan 009 §3.3).
-///
-/// The SCHEMA is **Rust-defined and Rust-owned**. The Go `shed` CLI still
-/// carries the raw section as a schema-agnostic passthrough
-/// (`ClientConfig.Machines yaml.Node`, added in plan 009 C2) so a
-/// whole-document `SaveToPath` round-trip cannot delete it — but as of plan
-/// 019 C1, Go additionally READS a tolerant SUBSET of these fields through
-/// its own decoder, `internal/config/machines.go` (`DecodeMachines`):
-/// `name`/`host`/`user`/`ssh_port`/`known_hosts`. That decoder never writes
-/// this section and never validates it beyond skip-on-malformed — Rust
-/// remains the schema's sole owner.
-///
-/// **`rc_bin` used to live here** — it named where the `sx` one-shot RC
-/// binary lived on the remote, for `machine::rc_prefix` to invoke. `sx` was
-/// sunset (unreleased) in plan 016, and S6 (plan 022, C8) deleted the last of
-/// that plumbing: `rc_prefix`, `machine::DEFAULT_MACHINE_BIN`, and this
-/// field. Neither decoder models it now, so a hand-written config carrying a
-/// leftover `rc_bin:` key must still parse cleanly — that tolerance (an
-/// unmodeled key is silently ignored, never a parse failure) is pinned by
-/// [`tests::machines_fixture_matches_expected_json`] (the `withrc` entry) and
-/// its Go twin.
-///
-/// Absent optionals mean "defer to ssh": no `user` → whatever `~/.ssh/config` (or
-/// the current login) resolves, no `known_hosts` → the user's normal file with
-/// the user's normal strictness. That deliberately differs from a shed target,
-/// whose host key is always pinned in `~/.shed/known_hosts` — a machine is an
-/// ordinary SSH host the operator already manages.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MachineEntry {
-    pub name: String,
-    /// Defaults to the machine name (same rule as [`ShedServerEntry::host`]).
-    pub host: String,
-    /// SSH login user; `None` → let ssh decide.
-    pub user: Option<String>,
-    /// Defaults to 22.
-    pub ssh_port: u16,
-    /// `UserKnownHostsFile` to pin against; `None` → ssh's own default.
-    pub known_hosts: Option<String>,
-    /// The one SSH key ssh may offer (`-i <path> -o IdentitiesOnly=yes …`). Set ONLY for a
-    /// shed's roost host, from its server entry's `identity_file`, by
-    /// `shed_app::roost::shed_reach_entry`, which checks it first; a `machines:` entry
-    /// never carries one (the reader never sets it: a machine is an ordinary SSH host whose
-    /// identity `~/.ssh/config` decides).
-    pub identity_file: Option<String>,
+/// The shed CLI's `known_hosts` file (`~/.shed/known_hosts`, the same file
+/// `shed server add` pins keys into) — `~/.shed` on both macOS and Linux.
+pub fn known_hosts_path() -> String {
+    static PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.shed/known_hosts")
+    });
+    PATH.clone()
 }
 
-/// The parsed `~/.shed/config.yaml`: server entries (sorted by name), machine
-/// entries (sorted by name), and the default server.
+/// The parsed `~/.shed/config.yaml`: server entries (sorted by name) and the
+/// default server.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ShedConfig {
     pub servers: Vec<ShedServerEntry>,
-    /// The `machines:` section — native RC hosts (plan 009 §3.3). Empty when the
-    /// key is absent, so every pre-existing config parses unchanged.
-    pub machines: Vec<MachineEntry>,
     pub default_server: Option<String>,
     /// Why the WHOLE file was not read, when it was not (plan 037 A8): it holds a line
     /// break this reader does not split lines on, a second `servers:` key, or `servers:`
     /// in a form other than a block of entries ([`ShedConfig::parse`]). Nothing in it is
-    /// read then: no server, no machine, no default server. `None` for a file read as
-    /// usual (including a missing one).
+    /// read then: no server, no default server. `None` for a file read as usual
+    /// (including a missing one).
     pub refused: Option<String>,
 }
 
 impl ShedConfig {
-    /// A machine entry by name.
-    pub fn machine(&self, name: &str) -> Option<&MachineEntry> {
-        self.machines.iter().find(|m| m.name == name)
-    }
-
     /// Load + parse the config at `path`. A missing/unreadable file → an empty
     /// config (a degraded but non-fatal state the dashboard surfaces, never an
     /// error).
@@ -345,40 +300,8 @@ impl ShedConfig {
         }
         servers.sort_by(|a, b| a.name.cmp(&b.name));
 
-        // `machines:` — the same nested-map shape as `servers:`, so yaml_lite
-        // needs no change (it has no block-sequence support and never will).
-        let mut machines = Vec::new();
-        if let Some(Node::Map(machine_map)) = top.get("machines") {
-            for (name, value) in machine_map {
-                let Some(fields) = fields_of(value) else {
-                    continue;
-                };
-                let scalar = |k: &str| fields.get(k).and_then(Node::as_scalar);
-                // An optional string is ABSENT when the key is missing OR its
-                // value is empty.
-                let opt = |k: &str| scalar(k).filter(|s| !s.is_empty()).map(str::to_string);
-                machines.push(MachineEntry {
-                    name: name.clone(),
-                    host: scalar("host")
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(name)
-                        .to_string(),
-                    user: opt("user"),
-                    ssh_port: scalar("ssh_port")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(22),
-                    known_hosts: opt("known_hosts"),
-                    // A `machines:` entry never carries an identity file, whatever the
-                    // file says (see the field's doc).
-                    identity_file: None,
-                });
-            }
-        }
-        machines.sort_by(|a, b| a.name.cmp(&b.name));
-
         ShedConfig {
             servers,
-            machines,
             default_server: top
                 .get("default_server")
                 .and_then(Node::as_scalar)
@@ -1407,129 +1330,13 @@ default_server: ghost
         assert_eq!(minimal.resolved_endpoint().base_url, "http://minimal:8080");
     }
 
-    /// The `machines:` half of the same fixture (plan 009 C7).
+    /// A config carrying a legacy `machines:` section still parses cleanly,
+    /// ignoring `machines:` without affecting `servers:`.
     #[test]
-    fn parity_fixture_carries_the_machines_section() {
+    fn legacy_machines_section_is_ignored_and_servers_are_unaffected() {
         let config = ShedConfig::parse(include_str!("../../fixtures/config_sample.yaml"));
-        let names: Vec<&str> = config.machines.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(names, ["bare", "localmac", "mini2box"]);
-
-        let full = config.machine("localmac").expect("localmac");
-        assert_eq!(full.host, "localhost");
-        assert_eq!(full.user.as_deref(), Some("charliek"));
-        assert_eq!(full.ssh_port, 2022);
-        assert_eq!(
-            full.known_hosts.as_deref(),
-            Some("/Users/dev/.ssh/known_hosts")
-        );
-
-        // `rc_bin:` is present in the fixture but unmodeled by either
-        // language now (C8 retired it with `sx`) — it must not stop the
-        // entry from decoding.
-        let partial = config.machine("mini2box").expect("mini2box");
-        assert_eq!(partial.host, "mini2box"); // host defaults to the entry name
-        assert_eq!(partial.user.as_deref(), Some("builder"));
-        assert_eq!(partial.ssh_port, 22);
-        assert_eq!(partial.known_hosts, None);
-
-        // `bare: {}` → every default.
-        assert_eq!(
-            config.machine("bare"),
-            Some(&MachineEntry {
-                name: "bare".into(),
-                host: "bare".into(),
-                user: None,
-                ssh_port: 22,
-                known_hosts: None,
-                identity_file: None,
-            })
-        );
-        assert_eq!(config.machine("nope"), None);
-    }
-
-    /// An old config (no `machines:` key at all) parses to an EMPTY machine list
-    /// — never an error, and never a phantom entry.
-    #[test]
-    fn machines_absent_is_empty_and_servers_are_unaffected() {
-        let config = ShedConfig::parse(
-            "\
-servers:
-    mini2:
-        host: mini2
-default_server: mini2
-",
-        );
-        assert!(config.machines.is_empty());
-        assert_eq!(config.servers.len(), 1);
-    }
-
-    /// Plan 019 C1's shared two-language fixture: asserts the FULL
-    /// `MachineEntry` shape against `crates/fixtures/machines/expected.json`.
-    ///
-    /// The `withrc` entry carries a leftover `rc_bin:` key (retired with `sx`
-    /// in C8, plan 022 S6) plus an unmodeled `color:` — **this is the Rust
-    /// tolerance negative control**: neither language models either key any
-    /// more, and both must still decode the entry cleanly rather than skip
-    /// it. See `crates/fixtures/machines/README.md`.
-    #[test]
-    fn machines_fixture_matches_expected_json() {
-        #[derive(serde::Deserialize)]
-        struct ExpectedEntry {
-            name: String,
-            host: String,
-            user: Option<String>,
-            ssh_port: u16,
-            known_hosts: Option<String>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Expected {
-            entries: Vec<ExpectedEntry>,
-        }
-
-        let config = ShedConfig::parse(include_str!("../../fixtures/machines/sample.yaml"));
-        let expected: Expected =
-            serde_json::from_str(include_str!("../../fixtures/machines/expected.json"))
-                .expect("valid expected.json");
-
-        // `broken` must be skipped, not merely absent from the expectation —
-        // pin the count so a decoder that silently drops a THIRD entry can't
-        // pass by accident.
-        assert_eq!(config.machines.len(), expected.entries.len());
-
-        for want in &expected.entries {
-            let got = config
-                .machine(&want.name)
-                .unwrap_or_else(|| panic!("fixture entry {:?} missing from decode", want.name));
-            assert_eq!(got.host, want.host, "host for {}", want.name);
-            assert_eq!(got.user, want.user, "user for {}", want.name);
-            assert_eq!(got.ssh_port, want.ssh_port, "ssh_port for {}", want.name);
-            assert_eq!(
-                got.known_hosts, want.known_hosts,
-                "known_hosts for {}",
-                want.name
-            );
-        }
-        assert!(
-            config.machine("withrc").is_some(),
-            "an entry carrying rc_bin (unmodeled by either language now) must \
-             still decode — the tolerance this fixture exists to pin"
-        );
-        assert!(
-            config.machine("broken").is_none(),
-            "the malformed entry must be skipped, not decoded"
-        );
-
-        // ORDER, not just membership. expected.json is written sorted by name
-        // and the fixture's document order deliberately is not, so this is the
-        // assertion that proves the sort rather than assuming it — the lookups
-        // above are by name and would pass on any permutation. Its Go twin
-        // (internal/config/machines_test.go) asserts the same sequence.
-        let got_names: Vec<&str> = config.machines.iter().map(|m| m.name.as_str()).collect();
-        let want_names: Vec<&str> = expected.entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(
-            got_names, want_names,
-            "machines: entries must be sorted by name"
-        );
+        assert!(!config.servers.is_empty());
+        assert_eq!(config.refused, None);
     }
 
     /// The mtls half of the same fixture (plan 001 D6).
@@ -1797,15 +1604,6 @@ servers:
         for name in ["list", "map", "unclosed", "bad-escape", "trailing-text"] {
             assert_eq!(got(name), IDENTITY_FILE_ENTRY_UNREADABLE, "{name}");
         }
-    }
-
-    /// A `machines:` entry never carries an identity file, whatever it says.
-    #[test]
-    fn a_machine_entry_never_carries_an_identity_file() {
-        let config = ShedConfig::parse(
-            "machines:\n    m:\n        host: m\n        identity_file: /home/pat/.ssh/id_work\n",
-        );
-        assert_eq!(config.machine("m").unwrap().identity_file, None);
     }
 
     /// A key is decoded as a value is: a quoted `identity_file` key, escapes and all, is the
@@ -2329,17 +2127,6 @@ servers:
             config.default_server.as_deref(),
             expected["default_server"].as_str()
         );
-        let machines = expected["machines"].as_array().unwrap();
-        assert_eq!(config.machines.len(), machines.len());
-        for w in machines {
-            let got = config.machine(w["name"].as_str().unwrap()).unwrap();
-            assert_eq!(got.host, w["host"].as_str().unwrap());
-            assert_eq!(
-                got.user.as_deref().unwrap_or(""),
-                w["user"].as_str().unwrap()
-            );
-            assert_eq!(u64::from(got.ssh_port), w["ssh_port"].as_u64().unwrap());
-        }
     }
 
     /// An explicit null host (`host: null`, `host: ~`, a bare `host:`) is no destination:

@@ -11,7 +11,7 @@
 //!
 //! craze's own fold UPSERTS — its open stream entry grows in place
 //! (`internal/transcript/transcript.go`'s `appendStream`) — and shed's rows are
-//! append-only (`shed_core::lane`, the closing paragraph of its module doc). So
+//! append-only (`shed_lane::lane`, the closing paragraph of its module doc). So
 //! a run of chunks accumulates in ONE open [`Streak`] and becomes a row when
 //! something ends it:
 //!
@@ -32,13 +32,13 @@
 //! The cost is gx's, stated there and true here: up to 8 KiB, or up to 2 s of
 //! a stream that has paused, is invisible to a client until the flush.
 
-use shed_core::rc::RcFeedMessage;
+use shed_lane::rc::RcFeedMessage;
 use tokio::time::{Duration, Instant};
 
 /// How much text one row may accumulate before it is segmented. It IS the
 /// feed's own per-field cap, so a row that reaches it is one the ring would
 /// have truncated anyway — tied in code rather than asserted in prose.
-pub const MAX_STREAK_BYTES: usize = shed_core::lane::feed::MAX_FEED_MESSAGE_BYTES;
+pub const MAX_STREAK_BYTES: usize = shed_lane::lane::feed::MAX_FEED_MESSAGE_BYTES;
 
 /// How long an open streak may sit without growing before it is flushed as a
 /// partial row (plan 025 §3.3.6: "after 2 s of growth").

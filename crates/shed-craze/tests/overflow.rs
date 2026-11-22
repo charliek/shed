@@ -1,5 +1,5 @@
 //! The client channel is BOUNDED, and a client that stops reading gets a
-//! reseed — `shed_core::lane`'s module-doc correction 13, from the craze lane's
+//! reseed — `shed_lane::lane`'s module-doc correction 13, from the craze lane's
 //! side. Ported from shed-gx's `tests/overflow.rs` (at `203250f`, deleted by
 //! plan 025 C1) onto a scripted craze host: the same cases, the same claims.
 //!
@@ -26,9 +26,9 @@ use std::time::Duration;
 
 use common::*;
 use serde_json::{json, Value};
-use shed_core::lane::conformance::{drive_lane, DriveEnd, LaneChecker};
-use shed_core::lane::{LaneEvent, LANE_CHANNEL_CAPACITY};
 use shed_craze::testing::{attach_result, snapshot_at, HubEnd};
+use shed_lane::lane::conformance::{drive_lane, DriveEnd, LaneChecker};
+use shed_lane::lane::{LaneEvent, LANE_CHANNEL_CAPACITY};
 use tokio::sync::mpsc::Receiver;
 
 /// A tool event that draws exactly one row (its `tool_use`).

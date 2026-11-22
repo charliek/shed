@@ -1,45 +1,60 @@
-# shed-core Rust workspace — the shared shed-server protocol client + wire DTOs.
+# shed Rust workspace — isolated pure-Rust client crates.
 # Conventions mirror ../roost (workspace, lints, release profile). Consumed by the
-# Tauri client (its own standalone workspace in ../desktop/tauri/src-tauri),
-# which links shed-core + shed-app directly, and by shed-mobile (via FRB).
+# Tauri client (its own standalone workspace in ../desktop/tauri/src-tauri) and by
+# shed-mobile (via FRB).
 [workspace]
 resolver = "2"
-members = ["shed-core", "shed-app", "shedctl", "shed-broker", "shed-opencode", "shed-craze", "shed-broker-harness"]
+members = [
+    "shed-lane",
+    "shed-core",
+    "shed-roost",
+    "shed-craze",
+    "shed-app",
+    "shedctl",
+    "shed-broker",
+    "shed-broker-harness",
+]
 # Every member but `shed-broker-harness` (below) is a default member: a plain
-# `cargo build` / `cargo test` (and `make core-test`) build every other crate here. shedctl (the headless CLI driver for
-# the shed-desktop IPC socket) has no GUI-toolkit dependency, so it gets Mac
-# `cargo test` coverage too. The Tauri client (WebKitGTK) lives
-# in its OWN workspace so its heavy deps never enter this one.
+# `cargo build` / `cargo test` (and `make core-test`) builds every other crate
+# here. shedctl (the headless CLI driver for the shed-desktop IPC socket) has
+# no GUI-toolkit dependency, so it gets Mac `cargo test` coverage too. The Tauri
+# client (WebKitGTK) lives in its OWN workspace so its heavy deps never enter
+# this one.
 #
-# `sx` (the RC porcelain, plan 009) was sunset in plan 016 (S7, #329) and
-# `shed-rc-engine` — with shed-app's `rc` feature and shed-broker's `rc_hub` —
-# went with the rest of the Remote-Control hub in plan 022 (S6, #328). Neither is
-# a member any more; there is no non-default feature left here but `shed-app`'s
-# `broker`.
+# Crate boundaries (plan 038 D1, enforced by `shed-core/tests/crate_isolation.rs`):
+#   - `shed-lane`: pure leaf (agent-lane contract, RC DTOs, craze argv ladder,
+#     lane_view, slash_menu, craze_rows, backoff, shell_quote, time). Zero
+#     shed-core, zero roost-ipc, zero reqwest, zero chrono.
+#   - `shed-core`: pure shed-server protocol client, TLS/mTLS auth, config
+#     reader (servers: only), wire DTOs. Depends on `shed-lane`; zero roost-ipc.
+#   - `shed-roost`: the SOLE direct `roost-ipc` consumer in `crates/` (roost
+#     client/model/bootstrap/reach/spawn_gate/ssh_endpoint).
+#   - `shed-craze`: craze agent-lane adapter over NDJSON JSON-RPC. Depends on
+#     `shed-lane` only; zero shed-core, zero roost-ipc, zero reqwest, zero chrono.
+#   - `shed-app`: desktop-only shed-server app layer (Backend, Coordinator,
+#     AuditStore, AuthModeRegistry, optional EmbeddedBroker). Zero roost-ipc,
+#     zero shed-lane.
 #
-# `shed-opencode` (the opencode agent-lane adapter, plan 015) is a member AND a
-# default member: a pure lib on shed-core with no GUI-toolkit and no daemon
-# dependency, so a plain `cargo test`/`clippy --workspace` covers it. It is not
-# reachable from shed-core's Android target, which keeps that `cargo tree`
-# invariant true.
-#
-# `shed-gx` (the gx agent-lane adapter, plan 017) was retired in plan 025 C1
-# (shed#390) — gx and the other direct-agent kinds left shed for the craze lane.
-#
-# `shed-craze` (the craze adapter, plan 025 C7+, shed#392) is a member AND a
-# default member on the same terms as `shed-opencode`: a pure lib on shed-core
-# (serde, tokio, no reqwest, no chrono). Its recipe cells skip
-# without `SHED_CRAZE_BIN_DIR` (`make craze-binaries`); CI sets
-# `SHED_CRAZE_REQUIRE=1` so a skip there fails.
+# `shed-opencode` (plan 015) was removed in plan 038 — craze is the sole agent
+# lane. `shed-gx` (plan 017) was retired in plan 025; `sx` and `shed-rc-engine`
+# were retired in plans 016 and 022.
 #
 # `shed-broker-harness` (plan 037) is a member but NOT a default member: a
 # TEST-ONLY binary that hosts the desktop app's embedded broker for the wire
 # harness (tests/broker-wire). It builds shed-app with `broker`, so were it a
 # default member, a plain `cargo build`/`cargo test` would turn that feature on
 # for the whole workspace by feature unification and hide dead code in the
-# default build shed-mobile links. Name it with `-p`; `make -C desktop core-lint`
-# lints it on its own leg. It ships in no release (its `tests/not_shipped.rs`).
-default-members = ["shed-core", "shed-app", "shedctl", "shed-broker", "shed-opencode", "shed-craze"]
+# default build. Name it with `-p`; `make -C desktop core-lint` lints it on its
+# own leg. It ships in no release (its `tests/not_shipped.rs`).
+default-members = [
+    "shed-lane",
+    "shed-core",
+    "shed-roost",
+    "shed-craze",
+    "shed-app",
+    "shedctl",
+    "shed-broker",
+]
 
 [workspace.package]
 version = "0.10.1"
@@ -85,7 +100,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # The roost IPC wire (plan 013 / the Roost Pivot): `IpcClient`, `EventStream`, the
 # `messages` structs, and the `ssh` transport. The ONE git dependency in this
 # workspace, and it is **rev-pinned in the manifest on purpose**: shed-mobile
-# consumes `shed-core` as a git dependency, and cargo does not inherit a
+# consumes `shed-roost` as a git dependency, and cargo does not inherit a
 # dependency's lockfile — a `branch = "main"` pin here would let mobile resolve
 # whatever `main` happened to be on the day its own lock was regenerated, against
 # a crate that publishes NO Rust-API stability promise (roost
@@ -113,7 +128,7 @@ roost-ipc = { git = "https://github.com/charliek/roost", rev = "2bc71fa3848ddbf2
 # Better on every axis, so there is no trade being made. What is GIVEN UP is
 # variable inspection in a debugger; `line-tables-only` keeps function names and
 # `file:line` in panics and backtraces, which is what this repo actually debugs
-# with (verified: a failing assert still reports `machine.rs:350:9` with a
+# with (verified: a failing assert still reports `file.rs:line:col` with a
 # symbolized backtrace).
 #
 # Deliberately NOT `opt-level = 2` for dependencies: it saves a further 55M but

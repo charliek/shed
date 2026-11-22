@@ -3,7 +3,7 @@
 
 use super::*;
 use serde_json::json;
-use shed_core::lane::{LaneApprovalOption, LaneApprovalStatus, LaneQuestion};
+use shed_lane::lane::{LaneApprovalOption, LaneApprovalStatus, LaneQuestion};
 
 fn opt(id: &str, label: &str, kind: Option<&str>) -> LaneApprovalOption {
     LaneApprovalOption {

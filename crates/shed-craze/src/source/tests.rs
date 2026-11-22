@@ -7,12 +7,12 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use shed_core::lane::conformance::{check_source, drive_source, SourceChecker};
-use shed_core::lane::{
+use shed_lane::lane::conformance::{check_source, drive_source, SourceChecker};
+use shed_lane::lane::{
     AgentSource, LaneCreateRequest, LaneError, LaneEvent, LanePromptOutcome, LaneProviderState,
     SourceEvent, SourceOffline, LANE_CHANNEL_CAPACITY,
 };
-use shed_core::rc::RcActivity;
+use shed_lane::rc::RcActivity;
 use tokio::sync::mpsc::Receiver;
 
 use super::*;
@@ -2263,7 +2263,7 @@ async fn saved_asks_for_fifty_and_keeps_crazes_order_and_words() {
     )
     .await;
     let got = asked.await.unwrap().unwrap();
-    let ms = |t: &str| shed_core::time::rfc3339_unix_ms(t).unwrap();
+    let ms = |t: &str| shed_lane::time::rfc3339_unix_ms(t).unwrap();
     assert_eq!(
         got,
         LaneSavedSessions {

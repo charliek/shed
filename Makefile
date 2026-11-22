@@ -1317,8 +1317,8 @@ check-roost-pin: check-gce-pins
 	 fc_amd64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_AMD64=/ { print $$2; exit }' firecracker/Dockerfile) ; \
 	 vz_arm64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_ARM64=/ { print $$2; exit }' vz/Dockerfile) ; \
 	 fc_arm64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_ARM64=/ { print $$2; exit }' firecracker/Dockerfile) ; \
-	 pin_v=$$(sed -n 's/^pub const RELEASE_PIN: .*RoostRelease { version: "\([0-9.][0-9.]*\)".*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
-	 known_p=$$(sed -n 's/^pub const RELEASE_PIN_PROTOCOL: u32 = \([0-9][0-9]*\);.*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
+	 pin_v=$$(sed -n 's/^pub const RELEASE_PIN: .*RoostRelease { version: "\([0-9.][0-9.]*\)".*/\1/p' crates/shed-roost/src/bootstrap/source.rs | head -1) ; \
+	 known_p=$$(sed -n 's/^pub const RELEASE_PIN_PROTOCOL: u32 = \([0-9][0-9]*\);.*/\1/p' crates/shed-roost/src/bootstrap/source.rs | head -1) ; \
 	 if [ -z "$$vz_v" ] || [ -z "$$fc_v" ] || [ -z "$$vz_p" ] || [ -z "$$fc_p" ] || [ -z "$$pin_v" ] || [ -z "$$known_p" ] || \
 	    [ -z "$$vz_amd64" ] || [ -z "$$fc_amd64" ] || [ -z "$$vz_arm64" ] || [ -z "$$fc_arm64" ]; then \
 	   echo "ERROR: roost-session pin values missing:" ; \
