@@ -3053,6 +3053,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "shed-desktop-core"
+version = "0.10.1"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "shed-app",
+ "shed-core",
+ "shed-craze",
+ "shed-lane",
+ "shed-roost",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "shed-lane"
 version = "0.10.1"
 dependencies = [

@@ -10,6 +10,7 @@ members = [
     "shed-roost",
     "shed-craze",
     "shed-app",
+    "shed-desktop-core",
     "shedctl",
     "shed-broker",
     "shed-broker-harness",
@@ -34,6 +35,9 @@ members = [
 #   - `shed-app`: desktop-only shed-server app layer (Backend, Coordinator,
 #     AuditStore, AuthModeRegistry, optional EmbeddedBroker). Zero roost-ipc,
 #     zero shed-lane.
+#   - `shed-desktop-core`: toolkit-free shed-only desktop runtime (ShedId,
+#     ShedHosts, ShedCraze, ShedLanes, slash, shutdown). Uses default-features
+#     `shed-app` ONLY (never `broker`), zero GUI toolkits, zero direct roost-ipc.
 #
 # `shed-opencode` (plan 015) was removed in plan 038 — craze is the sole agent
 # lane. `shed-gx` (plan 017) was retired in plan 025; `sx` and `shed-rc-engine`
@@ -52,6 +56,7 @@ default-members = [
     "shed-roost",
     "shed-craze",
     "shed-app",
+    "shed-desktop-core",
     "shedctl",
     "shed-broker",
 ]

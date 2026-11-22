@@ -12,12 +12,15 @@
 //!   `shed-app`, `shed-broker`, `roost-ipc`, `reqwest`, `chrono`, or UI toolkits).
 //! - `shed-app` (default features) has no `roost-ipc`, `shed-roost`, `shed-lane`
 //!   (direct), `shed-craze`, `shed-broker`, `saphyr-parser`, or UI toolkits.
+//! - `shed-desktop-core`: toolkit-free desktop runtime — no `tauri`, `wry`,
+//!   `tao`, `webkit2gtk`, `iced`, `shed-broker`, `saphyr-parser`,
+//!   `shed-opencode`, and no direct `roost-ipc` (normal, build, or dev).
 //! - `shed-broker`, `shed-broker-harness`, and `shedctl` have no `roost-ipc` or
 //!   `shed-roost` (direct or transitive).
 //! - `shed-roost` is the SOLE direct `roost-ipc` consumer in `crates/` (across
 //!   normal, build, and dev dependencies).
-//! - No crate in `crates/` depends on `shed-opencode`, `tauri`, `wry`, `tao`, or
-//!   `webkit2gtk`.
+//! - No crate in `crates/` depends on `shed-opencode`, `tauri`, `wry`, `tao`,
+//!   `webkit2gtk`, or `iced`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -50,9 +53,9 @@ fn no_deps_metadata() -> Value {
     serde_json::from_slice(&out.stdout).expect("cargo metadata is JSON")
 }
 
-/// Every crate name in `pkg`'s resolved normal+build dependency graph when built
-/// with its own default features (no feature unification from sibling members).
-fn resolved_normal_deps(pkg: &str) -> HashSet<String> {
+/// Every crate name in `pkg`'s resolved dependency graph for the given `-e`
+/// edge kinds (`normal,build` or `normal,build,dev`).
+fn resolved_deps(pkg: &str, edges: &str) -> HashSet<String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let out = Command::new(cargo)
         .args([
@@ -65,7 +68,7 @@ fn resolved_normal_deps(pkg: &str) -> HashSet<String> {
             "-p",
             pkg,
             "-e",
-            "normal,build",
+            edges,
             "--prefix",
             "none",
             "--format",
@@ -75,7 +78,7 @@ fn resolved_normal_deps(pkg: &str) -> HashSet<String> {
         .expect("run cargo tree");
     assert!(
         out.status.success(),
-        "cargo tree -p {pkg} failed: {}",
+        "cargo tree -p {pkg} -e {edges} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("utf-8 cargo tree output");
@@ -87,21 +90,34 @@ fn resolved_normal_deps(pkg: &str) -> HashSet<String> {
         .collect()
 }
 
-const TOOLKIT_FORBIDDEN: &[&str] = &["tauri", "wry", "tao", "webkit2gtk", "shed-opencode"];
+fn resolved_normal_deps(pkg: &str) -> HashSet<String> {
+    resolved_deps(pkg, "normal,build")
+}
+
+const TOOLKIT_FORBIDDEN: &[&str] = &["tauri", "wry", "tao", "webkit2gtk", "iced", "shed-opencode"];
 
 #[test]
 fn crate_isolation_invariants() {
     let meta = no_deps_metadata();
     let packages = meta["packages"].as_array().expect("packages");
 
-    // 1. No crate in `crates/` may depend on GUI toolkits or the deleted `shed-opencode`.
+    // 1. No crate in `crates/` may depend on GUI toolkits or the deleted
+    //    `shed-opencode` across normal, build, OR dev dependencies.
     for pkg in packages {
         let name = pkg["name"].as_str().expect("pkg name");
-        let deps = resolved_normal_deps(name);
+        for dep in pkg["dependencies"].as_array().expect("dependencies") {
+            let dep_name = dep["name"].as_str().unwrap_or_default();
+            assert!(
+                !TOOLKIT_FORBIDDEN.contains(&dep_name),
+                "workspace crate `{name}` declares forbidden dependency `{dep_name}` (kind={:?})",
+                dep["kind"].as_str().unwrap_or("normal")
+            );
+        }
+        let deps = resolved_deps(name, "normal,build,dev");
         for forbidden in TOOLKIT_FORBIDDEN {
             assert!(
                 !deps.contains(*forbidden),
-                "workspace crate `{name}` transitively depends on forbidden `{forbidden}`"
+                "workspace crate `{name}` transitively depends on forbidden `{forbidden}` (normal/build/dev)"
             );
         }
     }
@@ -193,7 +209,51 @@ fn crate_isolation_invariants() {
         );
     }
 
-    // 6. `shed-broker`, `shed-broker-harness`, and `shedctl` never pull in
+    // 6. `shed-desktop-core`: toolkit-free, broker-free, no direct `roost-ipc`
+    //    across normal, build, AND dev dependencies.
+    let desktop_core_pkg = packages
+        .iter()
+        .find(|p| p["name"].as_str() == Some("shed-desktop-core"))
+        .expect("shed-desktop-core package");
+    for dep in desktop_core_pkg["dependencies"]
+        .as_array()
+        .expect("dependencies")
+    {
+        let dep_name = dep["name"].as_str().unwrap_or_default();
+        assert_ne!(
+            dep_name, "roost-ipc",
+            "`shed-desktop-core` must NEVER directly depend on `roost-ipc` (normal, build, or dev)"
+        );
+        assert_ne!(
+            dep_name, "shed-broker",
+            "`shed-desktop-core` must NEVER depend on `shed-broker` (normal, build, or dev)"
+        );
+        if dep_name == "shed-app" {
+            let features = dep["features"].as_array().expect("shed-app features");
+            assert!(
+                !features.iter().any(|f| f.as_str() == Some("broker")),
+                "`shed-desktop-core` must depend on `shed-app` with default features ONLY (never `broker`)"
+            );
+        }
+    }
+    let desktop_core_deps = resolved_deps("shed-desktop-core", "normal,build,dev");
+    for forbidden in [
+        "tauri",
+        "wry",
+        "tao",
+        "webkit2gtk",
+        "iced",
+        "shed-broker",
+        "saphyr-parser",
+        "shed-opencode",
+    ] {
+        assert!(
+            !desktop_core_deps.contains(forbidden),
+            "`shed-desktop-core` must not depend on `{forbidden}` (normal/build/dev)"
+        );
+    }
+
+    // 7. `shed-broker`, `shed-broker-harness`, and `shedctl` never pull in
     //    `roost-ipc` or `shed-roost`.
     for pkg in ["shed-broker", "shed-broker-harness", "shedctl"] {
         let deps = resolved_normal_deps(pkg);
@@ -205,7 +265,7 @@ fn crate_isolation_invariants() {
         }
     }
 
-    // 7. `shed-roost` is the SOLE direct consumer of `roost-ipc` in `crates/`
+    // 8. `shed-roost` is the SOLE direct consumer of `roost-ipc` in `crates/`
     //    (across ALL dependency kinds: normal, build, AND dev).
     let mut roost_ipc_consumers: Vec<&str> = Vec::new();
     for pkg in packages {
