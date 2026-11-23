@@ -1,0 +1,26 @@
+{
+  "name": "path-with-space",
+  "description": "A path holding U+0020 and non-ASCII letters: printable, valid.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "f",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "My Notes/caf\u00e9.txt",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-f"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

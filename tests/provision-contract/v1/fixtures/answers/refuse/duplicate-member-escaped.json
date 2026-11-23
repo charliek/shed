@@ -1,0 +1,11 @@
+{
+  "name": "duplicate-member-escaped",
+  "description": "A member named once plainly and once with an escape (n\\u0061me): the same name twice.",
+  "request": "create-repo",
+  "answer_text": "{\"version\":1,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"a\",\"n\\u0061me\":\"a\",\"provider\":\"p\",\"kind\":\"env\",\"variable\":\"KEY\",\"value\":\"v\",\"fingerprint\":\"f\"}],\"problems\":[]}",
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "duplicate_member"
+  }
+}

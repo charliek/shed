@@ -1,0 +1,38 @@
+{
+  "name": "failure-rule-missing",
+  "description": "answer_refused with no rule.",
+  "record": {
+    "state": "not_delivered",
+    "steps": {
+      "stage1": {
+        "state": "failed",
+        "reason": "answer_refused"
+      },
+      "clone": {
+        "state": "done"
+      },
+      "stage2": {
+        "state": "owed"
+      },
+      "install": {
+        "state": "owed"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "refused",
+      "source": {
+        "machine_id": "5f0c6e2a9b8d4c1e7a3f2b6d8e9c0a1b",
+        "machine_name": "ada-laptop"
+      },
+      "failure": {
+        "reason": "answer_refused"
+      }
+    }
+  },
+  "expect": {
+    "result": "refused",
+    "rule": "missing_member"
+  }
+}

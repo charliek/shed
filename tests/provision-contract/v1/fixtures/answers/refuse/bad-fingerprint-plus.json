@@ -1,0 +1,25 @@
+{
+  "name": "bad-fingerprint-plus",
+  "description": "A fingerprint holding +.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "KEY",
+        "value": "v",
+        "fingerprint": "a+b"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "bad_fingerprint"
+  }
+}

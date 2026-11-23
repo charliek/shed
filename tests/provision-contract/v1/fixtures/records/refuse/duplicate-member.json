@@ -1,0 +1,9 @@
+{
+  "name": "duplicate-member",
+  "description": "state named twice.",
+  "record_text": "{\"state\":\"none\",\"state\":\"none\"}",
+  "expect": {
+    "result": "refused",
+    "rule": "duplicate_member"
+  }
+}

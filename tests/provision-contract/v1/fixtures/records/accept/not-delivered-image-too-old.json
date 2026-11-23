@@ -1,0 +1,33 @@
+{
+  "name": "not-delivered-image-too-old",
+  "description": "A create on an image whose agent predates delivery: no request is made.",
+  "record": {
+    "state": "not_delivered",
+    "steps": {
+      "stage1": {
+        "state": "failed",
+        "reason": "image_too_old"
+      },
+      "clone": {
+        "state": "done"
+      },
+      "stage2": {
+        "state": "owed"
+      },
+      "install": {
+        "state": "owed"
+      }
+    },
+    "last": {
+      "at": "2026-11-23T10:00:00Z",
+      "reason": "create",
+      "outcome": "not_requested",
+      "failure": {
+        "reason": "image_too_old"
+      }
+    }
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

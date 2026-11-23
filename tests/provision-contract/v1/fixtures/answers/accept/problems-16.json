@@ -1,0 +1,95 @@
+{
+  "name": "problems-16",
+  "description": "16 problems: the most allowed.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [],
+    "problems": [
+      {
+        "provider": "p-00",
+        "code": "unreadable",
+        "message": "problem 0"
+      },
+      {
+        "provider": "p-01",
+        "code": "unreadable",
+        "message": "problem 1"
+      },
+      {
+        "provider": "p-02",
+        "code": "unreadable",
+        "message": "problem 2"
+      },
+      {
+        "provider": "p-03",
+        "code": "unreadable",
+        "message": "problem 3"
+      },
+      {
+        "provider": "p-04",
+        "code": "unreadable",
+        "message": "problem 4"
+      },
+      {
+        "provider": "p-05",
+        "code": "unreadable",
+        "message": "problem 5"
+      },
+      {
+        "provider": "p-06",
+        "code": "unreadable",
+        "message": "problem 6"
+      },
+      {
+        "provider": "p-07",
+        "code": "unreadable",
+        "message": "problem 7"
+      },
+      {
+        "provider": "p-08",
+        "code": "unreadable",
+        "message": "problem 8"
+      },
+      {
+        "provider": "p-09",
+        "code": "unreadable",
+        "message": "problem 9"
+      },
+      {
+        "provider": "p-10",
+        "code": "unreadable",
+        "message": "problem 10"
+      },
+      {
+        "provider": "p-11",
+        "code": "unreadable",
+        "message": "problem 11"
+      },
+      {
+        "provider": "p-12",
+        "code": "unreadable",
+        "message": "problem 12"
+      },
+      {
+        "provider": "p-13",
+        "code": "unreadable",
+        "message": "problem 13"
+      },
+      {
+        "provider": "p-14",
+        "code": "unreadable",
+        "message": "problem 14"
+      },
+      {
+        "provider": "p-15",
+        "code": "unreadable",
+        "message": "problem 15"
+      }
+    ]
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

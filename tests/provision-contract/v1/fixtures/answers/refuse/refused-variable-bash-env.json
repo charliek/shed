@@ -1,0 +1,25 @@
+{
+  "name": "refused-variable-bash-env",
+  "description": "The variable BASH_ENV.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "BASH_ENV",
+        "value": "v",
+        "fingerprint": "fp-k"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "refused_variable"
+  }
+}

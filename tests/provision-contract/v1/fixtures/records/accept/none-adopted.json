@@ -1,0 +1,28 @@
+{
+  "name": "none-adopted",
+  "description": "A cloud shed adopted at start-up, whose history the server does not know: every step skipped, delivery none.",
+  "record": {
+    "state": "none",
+    "steps": {
+      "stage1": {
+        "state": "skipped",
+        "reason": "adopted"
+      },
+      "clone": {
+        "state": "skipped",
+        "reason": "adopted"
+      },
+      "stage2": {
+        "state": "skipped",
+        "reason": "adopted"
+      },
+      "install": {
+        "state": "skipped",
+        "reason": "adopted"
+      }
+    }
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}

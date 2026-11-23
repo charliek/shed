@@ -1,0 +1,11 @@
+{
+  "name": "null-member-item",
+  "description": "An item's optional expires_at given as null: a null is never the same as absent.",
+  "request": "create-repo",
+  "answer_text": "{\"version\":1,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[{\"name\":\"k\",\"provider\":\"p\",\"kind\":\"env\",\"variable\":\"KEY\",\"value\":\"v\",\"fingerprint\":\"f\",\"expires_at\":null}],\"problems\":[]}",
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "null_value"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "not-json-array",
+  "description": "A JSON array, not an object.",
+  "request": "create-repo",
+  "answer_text": "[]",
+  "expect": {
+    "result": "refused",
+    "status": 400,
+    "rule": "not_json"
+  }
+}

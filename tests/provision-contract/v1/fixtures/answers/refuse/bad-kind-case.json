@@ -1,0 +1,25 @@
+{
+  "name": "bad-kind-case",
+  "description": "kind File: kinds are lower case.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "File",
+        "variable": "KEY",
+        "value": "v",
+        "fingerprint": "fp-k"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "bad_kind"
+  }
+}

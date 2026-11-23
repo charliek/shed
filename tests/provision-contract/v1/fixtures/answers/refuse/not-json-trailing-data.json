@@ -1,0 +1,11 @@
+{
+  "name": "not-json-trailing-data",
+  "description": "A second value after the object.",
+  "request": "create-repo",
+  "answer_text": "{\"version\":1,\"id\":\"0123456789abcdef0123456789abcdef\",\"items\":[],\"problems\":[]} {}",
+  "expect": {
+    "result": "refused",
+    "status": 400,
+    "rule": "not_json"
+  }
+}

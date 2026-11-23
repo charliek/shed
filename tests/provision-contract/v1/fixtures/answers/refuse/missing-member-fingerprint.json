@@ -1,0 +1,24 @@
+{
+  "name": "missing-member-fingerprint",
+  "description": "An item with no fingerprint.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "k",
+        "provider": "api-keys",
+        "kind": "env",
+        "variable": "KEY",
+        "value": "v"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "missing_member"
+  }
+}

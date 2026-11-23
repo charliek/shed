@@ -1,0 +1,9 @@
+{
+  "name": "null-member",
+  "description": "last given as null.",
+  "record_text": "{\"state\":\"none\",\"last\":null}",
+  "expect": {
+    "result": "refused",
+    "rule": "null_value"
+  }
+}

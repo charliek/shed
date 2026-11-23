@@ -1,0 +1,22 @@
+{
+  "name": "bad-problem-code",
+  "description": "A problem code outside the closed list.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [],
+    "problems": [
+      {
+        "provider": "p",
+        "code": "expired",
+        "message": "m"
+      }
+    ]
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "bad_problem_code"
+  }
+}

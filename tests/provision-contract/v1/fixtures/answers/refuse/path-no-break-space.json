@@ -1,0 +1,28 @@
+{
+  "name": "path-no-break-space",
+  "description": "A path holding a no-break space (U+00A0): not printable.",
+  "request": "create-repo",
+  "answer": {
+    "version": 1,
+    "id": "0123456789abcdef0123456789abcdef",
+    "items": [
+      {
+        "name": "f",
+        "provider": "files",
+        "kind": "file",
+        "stage": 1,
+        "base": "home",
+        "path": "a\u00a0b",
+        "mode": "0600",
+        "content": "eAo=",
+        "fingerprint": "fp-f"
+      }
+    ],
+    "problems": []
+  },
+  "expect": {
+    "result": "refused",
+    "status": 422,
+    "rule": "path_not_printable"
+  }
+}

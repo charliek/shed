@@ -1,0 +1,10 @@
+{
+  "name": "none",
+  "description": "A shed created before delivery existed: no record, reported as none.",
+  "record": {
+    "state": "none"
+  },
+  "expect": {
+    "result": "accepted"
+  }
+}
