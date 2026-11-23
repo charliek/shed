@@ -2,8 +2,7 @@
 //!
 //! Owns the desktop app's shed-only roost/craze/lane/slash/shutdown runtime
 //! without pulling in any UI toolkit (`tauri`, `wry`, `tao`, `webkit2gtk`,
-//! `iced`), credential broker (`shed-broker`), or direct `roost-ipc`
-//! dependency.
+//! `iced`) or direct `roost-ipc` dependency.
 //!
 //! ## Wiring
 //!
@@ -19,6 +18,8 @@
 //! * `ShedLanes` lock order: `inner -> core.state -> core.view`. Never calls
 //!   into `ShedHosts` while holding any lock.
 
+/// The app's control-certificate mint over `shed-source` (plan 039 PR B).
+pub mod control_mint;
 pub mod id;
 pub mod shed_craze;
 pub mod shed_hosts;
@@ -32,6 +33,10 @@ pub mod slash;
 /// settings file, the preview of a shed, and the activity feed merged across
 /// servers.
 pub mod delivery;
+
+/// The egress decision feed (plan 039 PR B): each server's `/api/egress/stream`,
+/// the last decisions of each shed kept in memory.
+pub mod egress;
 
 use std::sync::Arc;
 
@@ -56,9 +61,10 @@ pub use crate::shed_lanes::{
     LaneFailure, LaneHosts, LaneUiEvent, LanesClosed, NoopLaneEvents, ShedLanes,
     CRAZE_DEPART_GRACE, CRAZE_KIND, DOWN_HOST_REMOVED, DOWN_HUB_GONE, DOWN_SESSION_GONE,
 };
+pub use crate::shutdown::SourceDrain;
 pub use crate::shutdown::{
-    shutdown_children, BrokerDrain, Report as ShutdownReport, Shutdown, CHILDREN_KILL_WAIT,
-    CLIENTS_JOIN_WAIT, ESCAPE, GATE_CLOSE_WAIT,
+    shutdown_children, Report as ShutdownReport, Shutdown, CHILDREN_KILL_WAIT, CLIENTS_JOIN_WAIT,
+    ESCAPE, GATE_CLOSE_WAIT,
 };
 
 /// Top-level toolkit-free desktop runtime owning [`ShedHosts`], [`ShedLanes`],
@@ -159,15 +165,10 @@ impl ShedDesktopRuntime {
         &self.handle
     }
 
-    /// Register an optional broker drain hook on this runtime's single
-    /// [`Shutdown`] coordinator (before shutdown begins).
-    pub fn set_broker_drain(&self, broker: BrokerDrain) {
-        self.shutdown.set_broker_drain(broker);
-    }
-
-    /// Register the delivery runtime's drain (plan 039: stop its streams) on this
-    /// runtime's single [`Shutdown`] coordinator; phase 0 runs it after the broker's.
-    pub fn set_source_drain(&self, source: BrokerDrain) {
+    /// Register the source runtime's drain (plan 039: stop its delivery streams and
+    /// provider commands) on this runtime's single [`Shutdown`] coordinator; phase 0
+    /// runs it first.
+    pub fn set_source_drain(&self, source: SourceDrain) {
         self.shutdown.set_source_drain(source);
     }
 

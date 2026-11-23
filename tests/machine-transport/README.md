@@ -1,12 +1,11 @@
 # tests/machine-transport — the machine-transport differential
 
-The **fourth** pytest suite in this repo, and — like the other three — never merged
+The **third** pytest suite in this repo, and — like the other two — never merged
 with them:
 
 | suite | what it drives |
 |---|---|
 | `tests/integration/` | a LIVE `shed-server` create cycle |
-| `tests/broker-wire/` | the desktop app's credential broker's wire output, vs recorded goldens |
 | `desktop/tools/shedtest/` | the desktop app over its IPC socket |
 | **`tests/machine-transport/`** | **every transport that reaches a machine over SSH, against one shared contract** |
 

@@ -295,7 +295,7 @@ step "update-version.sh --components desktop lands all four surfaces + both lock
 grep -q '^version = "0.8.0"' "${SCRATCH}/crates/Cargo.toml" || fail "crates/Cargo.toml didn't bump"
 grep -q '^version = "0.8.0"' "${SCRATCH}/desktop/tauri/src-tauri/Cargo.toml" || fail "tauri Cargo.toml didn't bump"
 [ "$(jq -r '.version' "${SCRATCH}/desktop/tauri/src-tauri/tauri.conf.json")" = "0.8.0" ] || fail "tauri.conf.json didn't bump"
-for dep in shed-core shed-app shed-broker shed-lane shed-roost shed-desktop-core shed-craze shed-provision shed-provision-providers shed-source; do
+for dep in shed-core shed-app shed-lane shed-roost shed-desktop-core shed-craze shed-provision shed-provision-providers shed-source; do
   grep -A1 "^name = \"${dep}\"$" "${SCRATCH}/crates/Cargo.lock" | grep -q '^version = "0.8.0"' \
     || fail "crates/Cargo.lock ${dep} entry didn't refresh"
   grep -A1 "^name = \"${dep}\"$" "${SCRATCH}/desktop/tauri/src-tauri/Cargo.lock" | grep -q '^version = "0.8.0"' \
@@ -815,14 +815,14 @@ FIX3="${SCRATCH}/reco-fixture-h3"
 mkdir -p "${FIX3}"
 git -C "${FIX3}" init -q
 gitf3() { git -C "${FIX3}" -c user.email=t@t -c user.name=t "$@"; }
-mkdir -p "${FIX3}/.claude-plugin" "${FIX3}/desktop" "${FIX3}/crates/shed-broker/src"
+mkdir -p "${FIX3}/.claude-plugin" "${FIX3}/desktop" "${FIX3}/crates/shed-source/src"
 printf '{"version": "2.0.0"}\n' > "${FIX3}/.claude-plugin/plugin.json"
 # desktop/VERSION deliberately never equals a tag → no basis.
 printf '1.4.7\n' > "${FIX3}/desktop/VERSION"
-printf 'pub fn broker() {}\n' > "${FIX3}/crates/shed-broker/src/lib.rs"
+printf 'pub fn source() {}\n' > "${FIX3}/crates/shed-source/src/lib.rs"
 gitf3 add -A; gitf3 commit -q -m 'v2.0.0 base'
 gitf3 tag v2.0.0
-printf 'pub fn broker() { /* changed */ }\n' > "${FIX3}/crates/shed-broker/src/lib.rs"
+printf 'pub fn source() { /* changed */ }\n' > "${FIX3}/crates/shed-source/src/lib.rs"
 gitf3 add -A; gitf3 commit -q -m 'post-v2.0.0 change'
 
 # ---------------------------------------------------------------------------
@@ -870,11 +870,10 @@ ok "desktop (absent from the EMPTY production NEVER_SHIPPED) still exits 1 with 
 #   HEAD    exactly one commit, touching ONLY one linked crate (each in turn).
 #
 # The loop is over the crates plan 038 added to the Tauri link set
-# (shed-lane, shed-roost, shed-desktop-core) plus shed-craze and shed-broker
-# (the credential broker the app embeds; plan 037: the app is the only
-# broker, so a broker fix ships only in the desktop), and plan 039's
-# shed-provision and shed-provision-providers (linked through
-# shed-desktop-core) and shed-source (linked through shed-broker). Each re-proves the
+# (shed-lane, shed-roost, shed-desktop-core) plus shed-craze, and plan 039's
+# shed-provision, shed-provision-providers and shed-source (linked through
+# shed-desktop-core; the retired broker crate left the list in plan 039 PR B).
+# Each re-proves the
 # same genericity by being ADDED to this list, not by a second copy of the
 # fixture. The assertion is desktop AND ONLY desktop, so a lazy "add it to the
 # server too" fix is red here.
@@ -886,7 +885,7 @@ gitf4() { git -C "${FIX4}" -c user.email=t@t -c user.name=t "$@"; }
 mkdir -p "${FIX4}/.claude-plugin" "${FIX4}/desktop" \
   "${FIX4}/crates/shed-lane/src" "${FIX4}/crates/shed-roost/src" \
   "${FIX4}/crates/shed-desktop-core/src" "${FIX4}/crates/shed-craze/src" \
-  "${FIX4}/crates/shed-broker/src" "${FIX4}/crates/shed-provision/src" \
+  "${FIX4}/crates/shed-provision/src" \
   "${FIX4}/crates/shed-provision-providers/src" "${FIX4}/crates/shed-source/src"
 printf '{"version": "3.0.0"}\n' > "${FIX4}/.claude-plugin/plugin.json"
 printf '3.0.0\n' > "${FIX4}/desktop/VERSION"
@@ -894,7 +893,6 @@ printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-lane/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-roost/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-desktop-core/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-craze/src/fold.rs"
-printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-broker/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-provision/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-provision-providers/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-source/src/fold.rs"
@@ -907,7 +905,7 @@ run_reco4() {
   RECO_ERR="$(cat "${SCRATCH}/reco4.err")"
 }
 
-for adapter in shed-lane shed-roost shed-desktop-core shed-craze shed-broker shed-provision shed-provision-providers shed-source; do
+for adapter in shed-lane shed-roost shed-desktop-core shed-craze shed-provision shed-provision-providers shed-source; do
   step "recommend-components.sh: a ${adapter}-only change flags desktop (the Tauri app links it) and nothing else"
   printf 'pub fn fold() { /* changed */ }\n' > "${FIX4}/crates/${adapter}/src/fold.rs"
   gitf4 add -A; gitf4 commit -q -m "desktop: ${adapter} change"

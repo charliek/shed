@@ -82,7 +82,7 @@ impl Backend {
     }
 
     /// As [`from_env_parts`](Self::from_env_parts), but threads a control-token
-    /// `minter` (the embedded broker's) into every non-mock server's client, so a
+    /// `minter` (the desktop's `shed-source` SSH-bootstrap minter) into every non-mock server's client, so a
     /// secure server mints/refreshes its control credential through it and fails
     /// closed on a mint failure (F6). GTK passes `None` (static-token only).
     ///
@@ -112,7 +112,7 @@ impl Backend {
     ///
     /// The registry is passed in rather than returned because the minter — which
     /// reads it to decide whether to expect a certificate — is constructed
-    /// BEFORE the Backend (the embedded broker's launch order).
+    /// BEFORE the Backend (the desktop's launch order).
     pub fn from_env_parts_with_credentials(
         test_mode: bool,
         mock_base_url: Option<&str>,
@@ -196,7 +196,7 @@ impl Backend {
                     None => {
                         // A pin on a non-https URL fails closed in Client::new → that
                         // server is skipped rather than sent plaintext. Secure servers
-                        // mint/refresh their control credential via the broker; on
+                        // mint/refresh their control credential via the minter; on
                         // a mint failure the client sends nothing — never the static
                         // config token (F6).
                         let r = s.resolved_endpoint();

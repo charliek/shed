@@ -26,9 +26,9 @@ UPDATE_CLIENTCONFIG=1 go test ./internal/config -run TestClientConfigFixture
 - Go: `internal/config/clientconfig_fixture_test.go` (the writer and checker).
 - Rust: `the_cli_written_config_is_read_as_the_cli_reads_it` in
   `crates/shed-core/src/config.rs` (servers, default server; no entry refused,
-  the file not refused) and in `crates/shed-broker/src/discovery.rs` (one target per entry).
+  the file not refused).
 
 What the readers refuse instead of reading (a block scalar, a flow mapping, a tag, an
 anchor, an explicit `? key`, a raw line break other than LF and CRLF), and that they read
-only the first YAML document, is pinned by `both_readers_on_every_shape_of_the_review` in
-`crates/shed-broker/src/discovery.rs`, beside what Go reads for each.
+only the first YAML document, was pinned by the retired broker's second reader; shed-core's own reader's refusals are
+pinned in `crates/shed-core/src/config.rs`.

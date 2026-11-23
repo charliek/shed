@@ -12,15 +12,14 @@
 //! What was answered is kept, redacted (names, targets, sizes, fingerprints, problems,
 //! and what the server made of it), for [`DeliveryRuntime::status`].
 //!
-//! # Beside the broker (plan 039 PR A)
+//! # Identity and credentials
 //!
-//! The embedded broker keeps running its bus. Both use this machine's one identity
-//! (`<state>/broker/machine.json`, loaded with the same file lock) and, on a secure
-//! server, the same durable credentials-scope store (`<state>/broker/creds`):
+//! This machine's one identity is `<state>/broker/machine.json` and, on a secure server,
+//! the durable credentials-scope store is `<state>/broker/creds` (the paths the retired
+//! embedded broker used, kept so no pin and no certificate is lost):
 //! [`shed_source::credentials::SourceCredentials`] presents whatever certificate is
-//! stored and mints only when the stored one will not do, so the two do not mint twice
-//! for one certificate. Store writes are serialized by the store's own lock, held only
-//! for each write.
+//! stored and mints only when the stored one will not do. Store writes are serialized by
+//! the store's own lock, held only for each write.
 //!
 //! # Test mode
 //!
@@ -315,6 +314,17 @@ impl DeliveryRuntime {
             // A config that cannot be read keeps the streams that run.
             Err(e) => *err = Some(e),
         }
+    }
+
+    /// Opens `server`'s delivery stream again at once (after "Use this machine" made
+    /// this machine its source). `false` when no stream runs for it.
+    pub fn retry_now(&self, server: &str) -> bool {
+        self.tasks.as_ref().is_some_and(|t| t.restart(server))
+    }
+
+    /// This machine's identity, or why there is none.
+    pub fn machine(&self) -> Result<MachineIdentity, String> {
+        self.machine.clone()
     }
 
     /// `delivery.status`: this machine, the settings file, each server's stream, and the

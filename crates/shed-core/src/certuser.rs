@@ -7,7 +7,7 @@
 //! a client can tell which user a certificate is for before it adopts or presents it.
 //!
 //! The reader is an in-house DER walk with **its own strict TLV reader** (the credential
-//! store's `notAfter` helpers in `shed-broker` are lenient and stay as they are):
+//! store's `notAfter` helpers in `shed-source` are lenient and stay as they are):
 //! single-byte tags, definite lengths, a long-form length only for 128 or more and with no
 //! leading zero byte, and no TLV that runs past its parent. The certificate must end
 //! exactly at the end of its input and hold exactly three elements. Everything before the

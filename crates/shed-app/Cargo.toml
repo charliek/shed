@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "shed-app — the display-free shed-server application layer (Backend, approval Coordinator, AuditStore, AuthModeRegistry, optional EmbeddedBroker). Desktop-only; zero roost-ipc, zero shed-lane."
+description = "shed-app — the display-free shed-server application layer (Backend, AuthModeRegistry). Desktop-only; zero roost-ipc, zero shed-lane."
 
 [lib]
 name = "shed_app"
@@ -15,33 +15,19 @@ workspace = true
 
 [dependencies]
 shed-core = { path = "../shed-core" }
-# The embeddable broker core — ONLY under the non-default `broker` feature (leg 3a.2).
-# It carries the heavy leaf deps (aws-sdk-*/notify/saphyr-parser); keeping it optional
-# means a default `shed-app` never links them.
-shed-broker = { path = "../shed-broker", optional = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true }
 async-trait = { workspace = true }
 # The `tracing` facade only — used for config-refusal warnings in `backend.rs`.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Concurrent per-host list_sheds via futures::future::join_all.
 futures = "0.3"
-# Flexible ISO-8601 parse/format for approval expiry + wire `ts`.
-# `clock` disabled — "now" comes from the injectable Clock seam,
-# not chrono, so no iana-time-zone/libc pull.
+# Flexible ISO-8601 parse/format (`timefmt`). `clock` disabled: no
+# iana-time-zone/libc pull.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-
-[features]
-# The in-process broker bridge (`broker_bridge.rs`): the desktop app's credential broker,
-# backed by `shed-broker`. NON-default so a featureless `shed-app` stays
-# broker-free — `cargo test --features broker` runs its unit tests.
-broker = ["dep:shed-broker"]
 
 [dev-dependencies]
 httpmock = { workspace = true }
-# Temp dirs for the `broker` bridge tests (config synthesis).
 tempfile = "3"
-# `net` for the tests' loopback and Unix listeners (the bridge's held-stream bus).
 tokio = { workspace = true, features = ["net"] }

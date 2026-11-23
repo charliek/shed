@@ -23,14 +23,15 @@ definition of done here.
 Core/UI split (see `docs/desktop/architecture.md`):
 
 - **The shared Rust core lives in `../crates/`** (`shed-lane`, `shed-core`, `shed-roost`,
-  `shed-craze`, `shed-app`, `shed-desktop-core`, `shedctl`, plus `shed-broker`), NOT here.
+  `shed-craze`, `shed-app`, `shed-desktop-core`, `shedctl`, plus `shed-source` and the
+  provision crates), NOT here.
   The desktop is shed-only: no `machines:` hosts, no implicit localhost, no opencode lane.
   `shed-desktop-core` is the toolkit-free runtime (`ShedHosts`, `ShedCraze`, `ShedLanes`).
 - `tauri/` — the **Tauri client**: the React/Vite/Tailwind frontend in `tauri/ui`, the Rust
-  shell in `tauri/src-tauri` (IPC server `ipc.rs`, tray, approval gate, Sparkle updater,
-  broker wiring, …). `tauri/src-tauri` is its **own standalone Cargo workspace** so its
-  WebKitGTK/Tauri deps never bleed into `../crates/`; it takes `shed-core`, `shed-app`
-  (with `broker`), `shed-desktop-core`, `shed-lane`, `shed-roost` and `shed-craze` as
+  shell in `tauri/src-tauri` (IPC server `ipc.rs`, tray, Sparkle updater, the source
+  runtime and egress feed wiring, …). `tauri/src-tauri` is its **own standalone Cargo
+  workspace** so its WebKitGTK/Tauri deps never bleed into `../crates/`; it takes
+  `shed-core`, `shed-app`, `shed-desktop-core`, `shed-lane`, `shed-roost` and `shed-craze` as
   cross-workspace path-deps (`../../../crates/…`). It does not depend on `roost-ipc`
   directly. Runs on macOS (WKWebView) and Linux
   (WebKitGTK). The Linux `.deb` (`shed-desktop`, bin `shed-desktop-tauri`) is built from it
@@ -113,21 +114,22 @@ the module skips; `SHED_CRAZE_REQUIRE=1` (CI) makes that a failure. Every craze 
 targets a listed shed over the fake-`ssh` seam (`SHED_TAURI_SSH_BIN`); there is no
 local craze path and no `machines:` fixture. The shedtest-linux skill has the traps.
 
-## The credential broker
+## The source runtime (no broker)
 
-The app **is** the credential broker: it brokers credentials in-process, with no separate
-daemon. It embeds `crates/shed-broker` via `shed-app`'s non-default `broker` feature
-(`crates/shed-app/src/broker_bridge.rs`), wired into the setup hook by
-`desktop/tauri/src-tauri/src/broker.rs`. There is no mode to choose: a malformed
-`extensions.yaml` fails the broker closed (approvals dark, reported in `broker.status`) and
-the app keeps running. This machine's identity is `<state>/broker/machine.json`
-(`shed_broker::machine`, `<state>` = `shed_broker::paths::state_dir`; both live in
-`crates/shed-source` since plan 039 and are re-exported by the broker, same paths); it is the only id
-`source.use` ever sends. Full behavior is documented user-facing in
-[docs/desktop/architecture.md § The credential
-broker](../docs/desktop/architecture.md#the-credential-broker).
+The credential broker is gone (plan 039 PR B): no approvals, no plugin-bus client, no
+Touch ID / polkit gate. What the app keeps of it is this machine's part as a **source**:
+`shed-desktop-core`'s `DeliveryRuntime` (`desktop/tauri/src-tauri/src/delivery.rs`) holds one
+delivery stream per configured server and answers provision requests from `delivery.toml`.
+This machine's identity is `<state>/broker/machine.json` and the credentials-scope store
+`<state>/broker/creds` (`shed_source::machine` / `credstore`, `<state>` =
+`shed_source::paths::state_dir`, `SHED_BROKER_STATE_DIR` overrides it; the paths are the
+retired broker's, kept so no pin or certificate is lost); that id is the only one
+`source.use` sends (`src/source.rs`), and a move reopens that server's delivery stream.
+The egress decision feed (`src/egress.rs`, `shed_desktop_core::egress`) is the other
+long-lived consumer: `egress.recent` / `egress.status` / `egress.server_profiles`. Both
+drain first at shutdown (`Shutdown::set_source_drain`).
 
-The broker answers only while the app runs, so **launch at login is on by default**: at
+The source answers only while the app runs, so **launch at login is on by default**: at
 the first launch that can record it (`Prefs.login_item_defaulted` in `prefs.json`, saved
 BEFORE the login item is set; `prefs::apply_login_default`) the app turns it on once, and
 never again. A debug build outside the harness never applies it (`login_default_applies`),
@@ -135,27 +137,9 @@ so `make run` / `tauri dev` never register a `target/debug` binary. Under the ha
 write is contained: Linux writes `$HOME/.config/autostart/*.desktop` under the throwaway
 HOME; macOS test mode keeps it in an in-memory cell (`LoginItemCell`).
 
-Test pointers:
-
-- `cargo test -p shed-app --features broker` — the bridge's unit tests
-  (`load_or_synthesize`, outcome mapping, timeout/dismiss). `broker` is `shed-app`'s ONLY
-  non-default feature.
-- `desktop/tools/shedtest/test_tauri_broker.py` — the hermetic e2e cells (the app always
-  brokers in process, the bus → AppGate → Coordinator → respond round-trip via the mock
-  server's plugin-bus endpoints, split-namespace `409`, malformed-config fail-closed, the
-  synthesized fresh-install namespace set, the plan 035 machine pin: `not-source` then
-  accepted, `duplicate`, other 403s, the respond `503` retry; the credential-source rows:
-  `source.status`/`source.use`, the Preferences "Use this machine" button via the test-mode
-  `ui.press_source_use` door, against the mock's `arm_source` binding; and the
-  launch-at-login default, once, and never with unwritable prefs).
-- The mock server's plugin-bus routes live in `desktop/tools/shedtest/mockserver.py`
-  (`GET /api/plugins/listeners/{ns}/messages` SSE + `POST
-  /api/plugins/listeners/{ns}/respond`), shape-pinned against
-  `tests/broker-wire`'s synthetic bus and `docs/development/broker-wire-catalog.md`
-  so the fakes can't drift independently.
-- The `tests/broker-wire` wire harness (`make test-broker-wire`) pins the broker's
-  wire output: it runs the app's embedded broker in the test-only
-  `crates/shed-broker-harness` process against committed goldens.
+Test pointers: `cargo test -p shed-desktop-core` (the cold-launch mint, the egress feed, the
+delivery runtime) and `-p shed-source` (identity, store, minter, delivery stream client);
+the harness cells for the source rows and delivery live in `desktop/tools/shedtest/`.
 
 ## mTLS credentials
 
@@ -164,12 +148,13 @@ certificates instead of bearer tokens — see the root `docs/reference/
 security.md#mtls-mode`) through the Rust core's credential provider.
 
 The private key is generated inside the Rust core's credential provider; only
-the CSR goes to the embedded broker's minter, and the signed public certificate
-comes back. The Tauri shell and frontend never hold, see, or serialize key
-material. The app's control-scope certificate lives in memory only, and a cold
-launch re-mints it over SSH through the broker. The broker persists its own
-credentials-scope certificate in its state dir — a different scope and a
-different tradeoff (see the credential-ownership table in
+the CSR goes to the minter (`shed_desktop_core::control_mint`: `shed-source`'s
+SSH-bootstrap minter, built at start-up and handed to `Backend` before its first
+request), and the signed public certificate comes back. The Tauri shell and
+frontend never hold, see, or serialize key material. The app's control-scope
+certificate lives in memory only, and a cold launch re-mints it over SSH. The
+source runtime persists its credentials-scope certificate in the state dir — a
+different scope and a different tradeoff (see the credential-ownership table in
 `~/.claude/plans/shed/001-mtls-mode.md` §3 D6 if working in this area).
 
 ## Socket paths

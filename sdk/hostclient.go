@@ -273,7 +273,7 @@ func ValidateMachine(id, name string) error {
 // encodeMachineName is name as it travels in HeaderMachineName: its UTF-8
 // bytes, every byte that is not an RFC 3986 unreserved character
 // (A-Z a-z 0-9 - . _ ~) written %XX (uppercase hex). The same encoding as
-// the Rust broker's (crates/shed-broker/src/bus.rs: percent_encode_name), and
+// the Rust source's (crates/shed-source/src/delivery.rs: percent_encode_name), and
 // the server decodes it with a path unescape.
 func encodeMachineName(name string) string {
 	const hex = "0123456789ABCDEF"
@@ -587,8 +587,8 @@ func effectivePort(u *url.URL) string {
 // http, and at most maxRedirects times. Every request carries this machine's
 // identity headers and the bearer credential, and may present a client
 // certificate: none of them may reach another origin. A nil configured URL
-// (one that did not parse) follows nothing. As the Rust broker's
-// redirect_allowed (crates/shed-broker/src/bus.rs).
+// (one that did not parse) follows nothing. (The Rust delivery stream client,
+// crates/shed-source/src/delivery.rs, follows no redirect at all.)
 func redirectAllowed(configured, next *url.URL, hops int) bool {
 	if configured == nil || next == nil || hops > maxRedirects {
 		return false

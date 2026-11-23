@@ -19,7 +19,7 @@
 //!
 //! | phase | what |
 //! |---|---|
-//! | 0 | optional broker drain and source drain (plan 039: the delivery runtime's streams); `hosts.begin_closing()` + `lanes.begin_closing()`; `gate.close(GATE_CLOSE_WAIT)`; `hosts.join_clients(CLIENTS_JOIN_WAIT)` |
+//! | 0 | optional source drain (plan 039: the delivery runtime's streams); `hosts.begin_closing()` + `lanes.begin_closing()`; `gate.close(GATE_CLOSE_WAIT)`; `hosts.join_clients(CLIENTS_JOIN_WAIT)` |
 //! | 1 | `lanes.shutdown()` + `gate.close_slots()` on a dedicated OS thread |
 //! | 2 | `hosts.stop_crazes()` + `gate.kill_exits(CHILDREN_KILL_WAIT)` |
 //! | 3 | `hosts.shutdown_reaches()` (no outer timeout; roost bounds its own teardown) |
@@ -47,8 +47,9 @@ pub const CHILDREN_KILL_WAIT: Duration = Duration::from_secs(2);
 /// shutdown short.
 pub const ESCAPE: Duration = Duration::from_secs(20);
 
-/// Non-blocking drain hook for an optional embedded credential broker.
-pub type BrokerDrain = Box<dyn Fn() + Send + Sync>;
+/// Non-blocking drain hook for the source runtime (plan 039: the delivery
+/// runtime's streams and provider commands).
+pub type SourceDrain = Box<dyn Fn() + Send + Sync>;
 
 /// Optional line sink for shutdown phase and completion logs.
 pub type ShutdownLog = Arc<dyn Fn(&str) + Send + Sync>;
@@ -58,9 +59,8 @@ pub struct Shutdown {
     gate: SpawnGate,
     hosts: Arc<ShedHosts>,
     lanes: Arc<ShedLanes>,
-    broker: Mutex<Option<BrokerDrain>>,
-    /// The delivery runtime's drain (plan 039): run in phase 0 with the broker's.
-    source: Mutex<Option<BrokerDrain>>,
+    /// The source runtime's drain (plan 039): run first in phase 0.
+    source: Mutex<Option<SourceDrain>>,
     log: Mutex<Option<ShutdownLog>>,
     handle: tokio::runtime::Handle,
     started: OnceLock<()>,
@@ -72,15 +72,14 @@ impl Shutdown {
         gate: SpawnGate,
         hosts: Arc<ShedHosts>,
         lanes: Arc<ShedLanes>,
-        broker: Option<BrokerDrain>,
+        source: Option<SourceDrain>,
         handle: tokio::runtime::Handle,
     ) -> Arc<Shutdown> {
         Arc::new(Shutdown {
             gate,
             hosts,
             lanes,
-            broker: Mutex::new(broker),
-            source: Mutex::new(None),
+            source: Mutex::new(source),
             log: Mutex::new(None),
             handle,
             started: OnceLock::new(),
@@ -88,18 +87,10 @@ impl Shutdown {
         })
     }
 
-    /// Install or replace the optional broker drain hook before shutdown starts.
+    /// Install or replace the source runtime's drain (plan 039) before shutdown starts:
+    /// a non-blocking stop of its streams, run first in phase 0.
     /// No-op if shutdown has already begun.
-    pub fn set_broker_drain(&self, broker: BrokerDrain) {
-        if self.started.get().is_none() {
-            *self.broker.lock().unwrap_or_else(|e| e.into_inner()) = Some(broker);
-        }
-    }
-
-    /// Install or replace the delivery runtime's drain (plan 039) before shutdown starts:
-    /// a non-blocking stop of its streams, run in phase 0 beside the broker's drain.
-    /// No-op if shutdown has already begun.
-    pub fn set_source_drain(&self, source: BrokerDrain) {
+    pub fn set_source_drain(&self, source: SourceDrain) {
         if self.started.get().is_none() {
             *self.source.lock().unwrap_or_else(|e| e.into_inner()) = Some(source);
         }
@@ -121,26 +112,13 @@ impl Shutdown {
         if self.started.set(()).is_ok() {
             let this = Arc::clone(self);
             self.handle.spawn(async move {
-                let broker = this.broker.lock().unwrap_or_else(|e| e.into_inner()).take();
                 let source = this.source.lock().unwrap_or_else(|e| e.into_inner()).take();
-                // Phase 0's drains, in order: the broker's, then the source's.
-                let broker: Option<BrokerDrain> = match (broker, source) {
-                    (None, None) => None,
-                    (b, s) => Some(Box::new(move || {
-                        if let Some(b) = &b {
-                            b();
-                        }
-                        if let Some(s) = &s {
-                            s();
-                        }
-                    })),
-                };
                 let log = this.log.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let report = shutdown_children_with_log(
                     &this.gate,
                     &this.hosts,
                     &this.lanes,
-                    broker.as_ref(),
+                    source.as_ref(),
                     log.as_deref(),
                 )
                 .await;
@@ -191,9 +169,9 @@ pub async fn shutdown_children(
     gate: &SpawnGate,
     hosts: &ShedHosts,
     lanes: &Arc<ShedLanes>,
-    broker: Option<&BrokerDrain>,
+    source: Option<&SourceDrain>,
 ) -> Report {
-    shutdown_children_with_log(gate, hosts, lanes, broker, None).await
+    shutdown_children_with_log(gate, hosts, lanes, source, None).await
 }
 
 /// Same as [`shutdown_children`], forwarding phase and completion lines to
@@ -202,7 +180,7 @@ pub async fn shutdown_children_with_log(
     gate: &SpawnGate,
     hosts: &ShedHosts,
     lanes: &Arc<ShedLanes>,
-    broker: Option<&BrokerDrain>,
+    source: Option<&SourceDrain>,
     log: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> Report {
     let started = Instant::now();
@@ -210,7 +188,7 @@ pub async fn shutdown_children_with_log(
 
     // ---- phase 0: stop new work, then join what was admitted -------------
     let phase = Instant::now();
-    if let Some(drain) = broker {
+    if let Some(drain) = source {
         drain();
     }
     hosts.begin_closing();

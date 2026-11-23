@@ -8,10 +8,9 @@
 ignore = [
     # RUSTSEC-2023-0071 — `rsa` Marvin timing side-channel (medium 5.9).
     # No fixed version exists (ecosystem-wide; the pure-Rust rsa crate has no
-    # constant-time private-key path yet). It reaches the desktop app's broker
-    # (shed-broker) via the local-keys SSH backend's RSA sign path (direct dep +
-    # via ssh-key 0.6.7), gated behind the approval gate. This is a port-specific residual: Go's
-    # crypto/rsa carries Marvin mitigations. Tracked for re-evaluation when an
-    # upstream fix lands or the RSA local-key path is reconsidered.
+    # constant-time private-key path yet). It reaches the workspace only through
+    # ssh-key 0.6.7 in shed-source, which parses `known_hosts` with it and does no
+    # RSA private-key operation (the signing broker was removed in plan 039).
+    # Tracked for re-evaluation when an upstream fix lands.
     "RUSTSEC-2023-0071",
 ]

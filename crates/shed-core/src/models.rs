@@ -216,6 +216,28 @@ pub struct EgressProfileInfo {
     pub profile: EgressProfile,
 }
 
+/// One decision on `GET /api/egress/stream` (shed-server's `egress.AuditRecord`): a
+/// connection a shed's egress proxy allowed or denied. Absent fields are empty; unknown
+/// ones are ignored. Undecoded beyond strings and the port: `ts` and `shed_created_at`
+/// are the server's RFC 3339 text, and every string is the server's, not yet cleaned for
+/// display.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EgressDecision {
+    pub ts: String,
+    pub shed: String,
+    /// The shed incarnation the decision came from: a shed deleted and created again
+    /// under its name is another one. Empty from a server older than the field.
+    pub shed_created_at: String,
+    pub host: String,
+    pub port: i64,
+    pub resolved_ip: String,
+    pub protocol: String,
+    /// `allow` or `deny`.
+    pub verdict: String,
+    pub reason: String,
+}
+
 /// Body for `POST /api/sheds`. Only non-null fields are sent (`None` optionals
 /// are omitted). `repo`/`local_dir` are mutually exclusive.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -780,8 +802,7 @@ pub const SOURCE_TEXT_MAX_BYTES: usize = 64;
 /// refusal's message), made safe to show: control characters and Unicode format
 /// characters (bidirectional overrides, zero-widths, …) removed, so it can neither forge
 /// a line nor reorder or hide what is around it, then cut to `max_bytes` on a character
-/// boundary. The broker cleans the same text the same way before it reaches its status
-/// (`shed-broker`'s `bus::display_field`).
+/// boundary.
 pub fn display_source_text(raw: &str, max_bytes: usize) -> String {
     let mut out = String::new();
     for c in strip_format_chars(raw).chars().filter(|c| !c.is_control()) {

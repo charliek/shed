@@ -12,8 +12,8 @@
 //! | `shed.provision` | `server`, `shed` | the provision's progress and its outcome |
 //! | `activity.server_list` | `limit`?, `cursor`?, `shed`? | the servers' activity, merged newest first |
 //!
-//! The runtime runs beside the embedded broker in PR A: both use this machine's one
-//! identity and the same credential store (see `shed_desktop_core::delivery::runtime`).
+//! The runtime is this machine's only source: it holds this machine's identity and the
+//! credentials-scope store (see `shed_desktop_core::delivery::runtime`).
 
 use std::sync::Arc;
 
@@ -33,11 +33,8 @@ fn bad(message: impl Into<String>) -> OpError {
     ("bad_request".to_string(), message.into())
 }
 
-/// The broker's `known_hosts`, which the SSH minter pins servers against.
-const KNOWN_HOSTS: &str = "~/.shed/known_hosts";
-
-/// Starts the source runtime: this machine's identity (`<state>/broker/machine.json`,
-/// the broker's), the fingerprint key under the same state directory, a stream per
+/// Starts the source runtime: this machine's identity (`<state>/broker/machine.json`),
+/// the fingerprint key under the same state directory, a stream per
 /// server of the app's shed config. Blocking file I/O; the setup hook calls it.
 pub fn start(env: &Env, handle: &tokio::runtime::Handle) -> Arc<DeliveryRuntime> {
     let state = source::paths::state_dir();
@@ -51,7 +48,7 @@ pub fn start(env: &Env, handle: &tokio::runtime::Handle) -> Arc<DeliveryRuntime>
         shed_config_path: env.config_path.clone(),
         settings_path: env.delivery_settings_path.clone(),
         key_path: shed_desktop_core::delivery::key::key_path(&state),
-        known_hosts: source::paths::expand_tilde(KNOWN_HOSTS),
+        known_hosts: source::paths::expand_tilde(shed_desktop_core::control_mint::KNOWN_HOSTS),
         mock_base_url: if env.test_mode {
             env.mock_base_url.clone()
         } else {

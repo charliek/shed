@@ -414,29 +414,15 @@ is always mounted — which is precisely why it is where an unreachable server's
 lives now that the Sheds pane carries no error strip. Its `servers[].detail` is the host
 failure's `summary` (empty for a healthy host).
 
-## Approval ops
+## Source, delivery and egress ops
 
-These drive the credential-approval gate (see [Credential approvals](approvals.md)).
+These drive this machine's part as a credential source (the delivery stream, plan 039), the
+provisioning settings, and the egress decision feed.
 
 | op | params | result |
 |----|--------|--------|
-| `approvals.list` | — | `approvals[]` (each carries `server?`, `namespace`, `op`, `shed`, `detail`, `expires_at`, `gate`, `default_scope`, `default_ttl`) |
-| `approval.decide` | `id`, `decision` (approve\|deny), `scope?` (per-request\|per-session\|per-shed), `ttl?` (e.g. `1h`), `persist?` | `{}` |
-| `activity.list` | `limit?` (default 200) | `entries[]` (audit feed) |
-| `activity.log_path` | — | `path` (the append-only audit log) |
-| `policy.list` | — | `rules[]` (effective: default + per-namespace + per-shed) |
-| `policy.set` | `rules[]` | `{}` (test mode only) |
-| `notifications.list` | — | `notifications[]` (what the gate posted) |
-| `notification.invoke` | `id`, `action` (approve\|deny) | `{}` — drives a posted notification's action; `not_found` for an unknown id |
-| `notification.open` | — | `{}` — a banner-body tap: raises the window on the Approvals pane |
-| `ui.set_ssh_approval` | `method?` (biometrics-or-password\|biometrics\|prompt), `policy?` (always-allow\|per-shed-allow\|time-based-allow\|always-ask\|always-deny), `ttl?` | `{}` — applies and persists the SSH approval prefs and resets live SSH grants |
-| `ui.ssh_prefs` | — | `{method, policy, ttl}` — the SSH approval prefs in effect |
-| `prefs.provider_modes` | — | `{namespace: "approve"\|"deny"}` for `aws-credentials` and `docker-credentials` |
-| `prefs.set_provider` | `namespace`, `decision` (approve\|deny) | `{}` — sets and persists an AWS/Docker mode |
-| `prefs.remove_shed_rule` | `server`, `shed` | `{}` — removes one per-shed override (`server` verbatim; `""` is the single unnamed server) |
-| `broker.status` | — | `{config, resolved_ssh_mode, gate_namespaces, servers, machine, machine_error, ssh, broker_error}` (`machine` is the broker's `{id, name}`, `machine_error` why there is none; `ssh` is what it signs for a shed, `{mode, allow_users, key_filter, keys_offered?, keys_available?}`; all three `null` before the broker started or when its config failed; a `servers[]` namespace's `state` is one of `connected`, `reconnecting`, `not-source`, `duplicate`, `rejected`, `stopped`), and a row and namespace carry `active_source` when the server names another machine as the credential source) — see [Architecture → The credential broker](architecture.md#the-credential-broker) |
 | `source.status` | — | `{rows, this_machine, this_machine_error}` — one row per configured server, `{host, supported, source, this_machine, connected, busy, unreachable, error}` (`source` is the machine that answers credential requests for you there, `{id, name}` or `null`; a server older than credential sources — a plain `404` — is `supported: false` with no error; `busy: true` means the server answered `503 SOURCE_BUSY` on every one of a few retries, so the source is unknown for now rather than absent — read again later; `unreachable: true` (with `supported: false` and the reason in `error`) means the server could not be reached or its answer read — a transport failure, an undecodable body, a 5xx with no API error body — so whether it supports sources is unknown, not "no": keep what was last known and read again later); `this_machine` is this machine's `{id, name}`, or `null` with `this_machine_error` saying why |
-| `source.use` | `host` | `{row, woke_broker}` — makes this machine the credential source on `host` (one request, never retried) and wakes the broker so it connects at once. Refusals: `bad_request` (unknown server), `machine_identity_unavailable`, `source_machine_not_found` (the server has not seen this machine's broker yet), `forbidden`, `unsupported`, `action_failed` |
+| `source.use` | `host` | `{row, woke_source}` — makes this machine the credential source on `host` (one request, never retried) and reopens this machine's delivery stream to `host` so it connects at once (`woke_source`: a stream was reopened). Refusals: `bad_request` (unknown server), `machine_identity_unavailable`, `source_machine_not_found` (the server has not seen this machine's delivery stream yet), `forbidden`, `unsupported`, `action_failed` |
 | `ui.press_source_use` | `host` | `{}` — test mode only: presses the open Preferences window's own "Use this machine" button for `host` (a disabled or missing button takes no press) |
 | `delivery.status` | — | `{machine, machine_error, key_error, config_error, settings_path, servers, recent}` — the source runtime: this machine's `{id, name}` (or why there is none), each configured server's delivery stream `{server, state, since, last_error, streams, requests, unreadable, answered, refused, dropped}` (`state` is `connecting`, `connected`, `not_bound`, `duplicate`, `offline` or `stopped`; `last_error` is a class such as `transport`, `unauthorized`, `not_bound`, `rate_limited`, `unsupported`, `config`, never a server's words), and the last answers, newest first, redacted: `{server, request, shed, reason, at, items, problems, outcome}` (`items` hold names, targets, sizes and fingerprints, never a value) |
 | `delivery.settings` | — | `{path, exists, error, providers}` — `delivery.toml`: each of `ssh-key`, `github`, `api-keys`, `envsecrets-login`, `files` as `{name, configured, enabled, only, config}`, where `config` is the provider's table as flat JSON (the shape `delivery.set` takes); `error` says where an unreadable file is wrong, never quoting it. A stored `passphrase_command` reads `"set"`, never its arguments (they may hold the passphrase) |
@@ -445,6 +431,9 @@ These drive the credential-approval gate (see [Credential approvals](approvals.m
 | `shed.delivery` | `server`, `shed` | `{server, shed, delivery}` — the shed document's delivery record (`null` from a server older than delivery); `not_found` for no such shed |
 | `shed.provision` | `server`, `shed` | `{server, shed, ok, progress, delivery, error}` — runs `POST /api/sheds/{shed}/provision` (one request) and reports its progress lines `{message, warning}`, the record it ended with, or the server's error `{status, code, message}` |
 | `activity.server_list` | `limit?` (1 to 500, default 100), `cursor?`, `shed?` | `{events, next, errors}` — `GET /api/activity` of every configured server, merged newest first, each event with its `server`; pass `next` back as `cursor` for the page after (`null`: nothing older anywhere); a server that could not be read is in `errors` and keeps its place for the next page |
+| `egress.recent` | `server`, `shed`, `created_at`, `blocks?` | `{server, shed, created_at, events}` — that shed **incarnation**'s last egress decisions (at most 50, kept in memory since the app connected), newest first, each `{server, ts, shed, shed_created_at, host, port, resolved_ip, protocol, verdict, reason}` (`verdict` is `allow` or `deny`; every string cleaned for display). `created_at` is required: the shed's own creation time, from its row (`sheds.list`'s `created_at`), compared as an instant; without one it is `bad_request`. Decisions are kept per incarnation (server, name, creation time, which the server stamps on each decision as `shed_created_at`), so a shed deleted and created again under its name starts empty; a decision that names no incarnation is dropped (counted in `egress.status`'s `unattributed`). `blocks: true` keeps only the `deny` decisions, a shed's recent blocks. A listing (`sheds.list`, `sheds.refresh`, the dashboard's own refresh) drops the incarnations it no longer has. A kept decision emits the `egress-changed` event `{server}` |
+| `egress.status` | — | `{servers}` — each configured server's `GET /api/egress/stream` consumer, `{server, state, error, connects, decisions, unattributed}`; `state` is `connecting`, `connected`, `waiting` (reconnecting: 1 s doubling to 30 s, reset once a stream held for 60 s), `unavailable` (`501` or `404`: egress control is not enabled there; asked again after 5 minutes) or `stopped` |
+| `egress.server_profiles` | — | `{hosts}` — each configured server's egress profiles (`GET /api/egress/profiles`), or the error it returned: the rows the `egress_profiles` command gives the UI |
 | `ui.prefs_section` | `section` (`provisioning`, `sources`, `delivery-preview`, …) | `{}` — scrolls the open Preferences window to that section (`prefs.dump`'s `values.provisioning.shown_section` says which). `values.provisioning.editor` is the open editor's controls as rendered: each input's value (a passphrase command argument as `redacted`), each switch, and which buttons would press |
 | `ui.press_delivery_toggle` | `provider` | `{}` — test mode only: presses the open Provisioning section's own switch for `provider` (a disabled switch takes no press); the switch writes `delivery.toml` through `delivery.set` |
 | `ui.press_delivery_button` | `provider`, `button` | `{}` — test mode only: presses a control of `provider`'s row through its own gate: `edit`, `save`, `cancel`, `add:<list>`, `remove:<list>:<i>` (lists are `env_files`, `passphrase_command`, `only.servers`, `only.backends`, `only.repos`, `files`), `toggle:<switch>` (`sign_commits`, `craze_providers`), and for a stored passphrase command `replace:passphrase_command`, `clear:passphrase_command`, `keep:passphrase_command`. Save writes the provider's table with `delivery.set` and the `enabled` the switch shows; a refusal is shown under the row in the words `delivery.set` gave |
@@ -455,22 +444,13 @@ These drive the credential-approval gate (see [Credential approvals](approvals.m
 | `ui.press_deliver_again` | `server`, `shed` | `{}` — test mode only: presses the open detail's own **Deliver again** (refused, as a pointer is, while the shed is not running or a delivery runs), which runs `shed.provision` |
 | `shed_delivery.dump` | — | `{detail}` — what the open delivery detail rendered, read off its nodes: `{server, shed, state, withheld, summary, steps, last, failure, problems, items, deliver_again, result, warnings, progress, rendered}` (`items` are `{name, provider, stage, target, result, written, expires}` as shown), or `null` when none is open. `withheld` is the server's own mark on a record it stripped for a caller who may not enter the shed (an admin looking at another user's): the detail then shows the state alone and no Deliver again. A Deliver again run is held by the app per shed until it ends, so closing the detail or leaving the pane neither loses it nor lets a second one start. Each `dashboard.dump` row also carries its `delivery` record and `delivery_badge`, the badge's text (`null` without one) |
 
-`approval.decide` with `persist:true` saves a per-`(server,shed)` rule (always-allow
-when `decision:approve`, always-deny when `decision:deny`). For an approve, `scope`
-controls the grant: `per-request` (once), or `per-session`/`per-shed` add an in-memory
-grant lasting `ttl` (e.g. `1h`). `scope`/`ttl`/`persist` are reported to the broker
-so its durable audit records how the decision was made.
-
 ## Test mode
 
 When launched with `SHED_TAURI_TEST_MODE=1`, `identify` reports `test_mode: true` and the
 `mock_base_url` the app's HTTP clients were redirected to (`SHED_TAURI_MOCK_BASE_URL`), so the
 harness can confirm a run is hermetic before asserting anything. Test mode also unlocks the
-fault-injection and driver ops marked "test mode only" above (`policy.set`, `rc.inject_test`,
-`app.quit`, the `ui.fill_*`/`ui.submit_*` doors, and so on), swaps the notification presenter and
-the Touch ID / polkit gate for fakes (so `notification.invoke` drives what `notifications.list`
-reports, and every gate approves), disables
-`terminal.open` and Sparkle, and never reads the developer's own `~/.shed/config.yaml`: an
+fault-injection and driver ops marked "test mode only" above (`rc.inject_test`, `app.quit`,
+the `ui.fill_*`/`ui.submit_*` doors, and so on), disables `terminal.open` and Sparkle, and never reads the developer's own `~/.shed/config.yaml`: an
 unset `SHED_TAURI_SHED_CONFIG` loads an empty config.
 
 `SHED_TAURI_MOCK_UNREACHABLE_HOSTS` (comma-separated server names) points those hosts at a

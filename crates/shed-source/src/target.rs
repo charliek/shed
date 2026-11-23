@@ -1,7 +1,6 @@
 //! A resolved shed server the source mints for: [`ServerTarget`], pure data.
 //!
-//! Moved here from `shed-broker`'s `discovery` module (plan 039 §3.7), which
-//! re-exports it; the broker's saphyr-backed `~/.shed/config.yaml` reader stays there.
+//! Moved here from the retired broker's `discovery` module (plan 039 §3.7).
 
 /// A resolved shed server this agent brokers for (mirror `config.go:ServerTarget`).
 /// `name` is the identity key (empty in single-server mode); `url` is the broker base
@@ -57,7 +56,6 @@ impl ServerTarget {
     /// Whether the server is reached over https — the authoritative local signal that
     /// it runs in secure mode (tokens ⟺ TLS ⟺ secure) and that the agent should
     /// self-mint (mirror `config.go:IsSecure`: scheme, not fingerprint presence).
-    /// Consumed by the broker supervisor's `should_mint` (`shed_broker::supervisor`).
     pub fn is_secure(&self) -> bool {
         self.url.to_lowercase().starts_with("https://")
     }

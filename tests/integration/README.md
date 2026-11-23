@@ -749,8 +749,8 @@ one), and the user or an admin moves the binding with `shed source use`.
 `test_source_pin.py` drives this on a dev server with the itest user list
 through synthetic machines (`fixtures/busclient.py: FakeMachine`): a test
 identity's credentials certificate plus a machine id and name, subscribing
-and answering as a broker does. No real broker runs (the broker side is
-`tests/broker-wire`).
+and answering as a bus listener does. No real listener runs (the desktop's
+credential broker was retired in plan 039).
 
 | Case | Shows |
 |---|---|

@@ -8,12 +8,13 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
 ## The crates
 
 Plan 038 split the old `shed-core` / `shed-app` mix into a zero-cycle DAG and
-retired the opencode adapter crate. Default members are every crate below except
-`shed-broker-harness`. WebKitGTK/Tauri deps stay out of this workspace.
+retired the opencode adapter crate; plan 039 retired the credential broker (its
+crate, its test host, its wire suite and `shed-core`'s approval types). Every crate below is a default member. WebKitGTK/Tauri deps stay out of this
+workspace.
 
 ```
 shed-lane (pure leaf: no shed-core, reqwest, roost-ipc, or chrono)
-   ├── shed-core ── shed-source ── shed-broker
+   ├── shed-core ── shed-source ──────────┐
    │       └── shed-app ── shed-desktop-core
    ├── shed-craze ────────────┘
    └── shed-roost (sole direct roost-ipc consumer) ──┘
@@ -32,7 +33,7 @@ shedctl (no internal deps)
   name the tool; there is no opencode adapter.
 - **`shed-core`** — pure shed-server protocol (`http`, `models`, `sse`,
   `create`, `tls`, `token`, `csr`, `certuser`, `authfail`, `identityfile`,
-  `terminal`, `approval`, `config` for `servers:` + `default_server` +
+  `terminal`, `config` for `servers:` + `default_server` +
   `known_hosts_path()`). Depends on `shed-lane` for `RcSession` and the text
   helpers `OverviewShed` and credential-source display use. **No `roost-ipc`,
   no `machines:` config, no machine-insert editor.** Keeps `regex` (`token.rs`) and `libc`
@@ -48,32 +49,39 @@ shedctl (no internal deps)
   `feed: "activity", watch: false` for an opencode tab. `RELEASE_PIN` lives in
   `src/bootstrap/source.rs`. Android-clean.
 - **`shed-app`** — toolkit-free shed client core: `Backend`, `AuthModeRegistry`,
-  `Coordinator`, `AuditStore`, `BrokerEvent`, the embedded broker bridge
-  (`broker_bridge.rs`, non-default `broker` feature — its only non-default
-  feature), `traits`, `fakes`, `timefmt`. **No `roost-ipc`, no `shed-roost`,
-  no `shed-lane`, no `saphyr-parser` under default features.** A bare
-  `cargo test -p shed-app` skips `broker_bridge.rs`; cover it with
-  `--features broker`.
+  `timefmt`. No features. **No `roost-ipc`, no `shed-roost`, no `shed-lane`, no
+  `saphyr-parser`.**
 - **`shed-desktop-core`** — toolkit-free **shed-only** runtime the Tauri shell
   (and a future iced UI) hosts: `ShedId` (`roost:<server>/<shed>`),
-  `ShedHosts`, `ShedCraze` (remote attach-only), `ShedLanes`, `slash`, and
-  `shutdown_children`. Depends on `shed-app` with **default features only —
-  never `broker`**. No `tauri`, no `iced`, no `shed-broker`, no direct
-  `roost-ipc`.
+  `ShedHosts`, `ShedCraze` (remote attach-only), `ShedLanes`, `slash`,
+  `shutdown_children` (phase 0 runs the source runtime's drain,
+  `Shutdown::set_source_drain`), the source runtime (`delivery`, below),
+  `control_mint` (the app's control-certificate mint: `shed-source`'s
+  `SourceTokenMinter` over its control-token provider and SSH-bootstrap
+  `CredentialMinter`, pinned by `~/.shed/known_hosts`, resolving servers from the
+  shed CLI config; the Tauri start-up hands it to `Backend` before its first
+  request, so a cold launch enrols against an mtls server; `control_mint_tests.rs`
+  drives that cold launch against an in-process mTLS server through the
+  SSH-bootstrap seam `shed-source`'s `test-support` exposes) and `egress` (the
+  egress decision feed: one `GET /api/egress/stream` consumer per server on the
+  Backend's control-scope clients, `Client::egress_stream`; the last 50 decisions
+  of each shed in memory; reconnect 1 s doubling to 30 s, reset after a 60 s hold,
+  5 min after a `501`/`404`, a 10 min silent stream reopened; `blocks` keeps the
+  `deny` ones; kept per shed incarnation, server + name + creation instant, so a
+  reused name starts empty and a decision naming no incarnation is dropped; a reader
+  names the incarnation; a listing drops the incarnations it no longer has). No `tauri`, no `iced`,
+  no direct `roost-ipc`.
 - **`shedctl`** — a headless UDS/IPC client with no dependency on the other
   crates here (`serde_json`, `base64`, `libc`), shipped in the Linux `.deb`.
   In `default-members`.
 - **`shed-source`** (plan 039 §3.7) — what a machine needs to be a credential source,
-  extracted unchanged from `shed-broker`: `machine` (`<state>/broker/machine.json`),
+  extracted from the retired broker with its paths kept: `machine` (`<state>/broker/machine.json`),
   `paths` (`state_dir`: `SHED_BROKER_STATE_DIR`, else the per-user data dir; plus
   `user_home_dir`/`expand_tilde`), `credstore` (`<state>/broker/creds`), `minter` (the
   SSH-bootstrap minter and credential source; `bootstrap` is internal), `controltoken`
   (the control-token provider, which resolves servers through an injected
-  `ServerResolver`: this crate has no YAML parser, so the broker passes its saphyr-backed
-  `discovery::load_discovered_servers`), `target` (`ServerTarget`) and `time` (the RFC3339
-  helpers). `shed-broker` re-exports every module under its old path (`status`,
-  `discovery` and `config` re-export the helpers), so no broker caller or embedder moved.
-  Plan 039 A6 adds the delivery side: `discovery` (the shed CLI config's servers as
+  `ServerResolver`, `discovery::resolver()`; its tests are `controltoken_tests.rs`),
+  `target` (`ServerTarget`) and `time` (the RFC3339 helpers). Plan 039 A6 adds the delivery side: `discovery` (the shed CLI config's servers as
   `ServerTarget`s through shed-core's reader; an entry with no explicit `ssh_port` has
   port 0, no SSH endpoint, so nothing is minted for it, where shed-core alone reads 22;
   `discovery::resolver()` plugs into the control-token provider), `delivery` (the
@@ -90,56 +98,26 @@ shedctl (no internal deps)
   in-process fake server, mTLS included), `credentials` (`SourceCredentials`: the
   credentials-scope certificate from the durable store, fenced by its stream task's stop
   signal so a retired task writes nothing), `tasks` (`SourceTasks`: one stream per server, reconciled with the
-  list) and `token_minter` (`SourceTokenMinter`: shed-core's `TokenMinter` over the
-  control-token provider, the credential-shape rules of shed-app's `credential_shape`).
+  list; `restart` reopens one server's stream at once, after "Use this machine") and
+  `token_minter` (`SourceTokenMinter`: shed-core's `TokenMinter` over the control-token
+  provider, refusing every credential shape but one complete one).
   `minter`'s `CredentialSource` takes a process-wide turn per store, server and scope
   around its mint and store write and re-reads the store first (adopting a fresher
-  certificate another source stored), so the broker's bus and the delivery source never
-  mint twice at once; a source whose group was stopped gives up its turn at once.
+  certificate another source stored), so two sources never mint twice at once; a source whose group was stopped gives up its turn at once.
   Reaches only `shed-core`/`shed-lane`/`shed-provision` (the contract's documents and
   the stream's framing), never `saphyr-parser`. Its `test-support` feature
-  (the minter's test seams and `minter::tests` helpers) is enabled only by
-  `shed-broker`'s `[dev-dependencies]`, never in a shipped build. The control-token
-  provider's tests stay in the broker (`controltoken_tests.rs`), since they resolve
-  through the broker's reader. Default member.
-- **`shed-broker`** — the embeddable credential broker core: the shed-server plugin bus,
-  the multi-server supervisor + discovery watcher, the SSH/AWS/Docker/egress credential
-  backends, the SSH-bootstrap minter + control-token provider (from `shed-source`), the approval/audit seams
-  (incl. the always-compiled `AuditFanout` fan-out and the native `touchid` gate), the
-  `config` reader, socket path-resolution + liveness probes, and the health types
-  (`ServerHealth`, `SshSigningStatus`). Embedded in-process by the desktop app (through
-  `shed-app`'s `broker` feature) and hosted for the wire harness by the test-only
-  **`shed-broker-harness`**. The standalone daemon that used to drive it was removed in
-  plan 037. Carries no WebKitGTK concern.
-  `sign_check` (plan 035 §3.5) is the pure parser and policy for what the machine will
-  sign for a shed: an exact SSH login request or an exact `git` SSHSIG blob, nothing
-  else, returning an `Approved` that is the only way to sign the bytes it checked. Its
-  vectors in `shed-broker/fixtures/sign_check/` are REAL OpenSSH captures: re-record
-  them only with that directory's `capture.sh` (Docker), never by hand. Its two
-  machine-wide settings are `ssh.allow_users` and `ssh.offer_keys` (`config.rs`,
-  `ExtensionsYaml::ssh_sign_policy`); the key filter itself is
-  `ssh_backend::FilteredSshBackend`, wrapped around whichever SSH backend resolved in
-  the embedded broker. It asks the backend nothing of its own (the
-  agent-forward transcripts depend on that), and a key it does not offer fails with
-  the backend's own unknown-key error, so a shed cannot tell "not offered" from "not
-  present".
-- **`shed-broker-harness`** — a TEST-ONLY binary (plan 037) that hosts the desktop app's
-  embedded broker (`shed-app`'s `broker` feature, minus the Coordinator) for the wire
-  harness `tests/broker-wire/`: a config in, the bus and the audit file out, and a
-  control socket for its status snapshot (`src/status.rs`, the JSON shape the goldens
-  record), approval frames and decisions. A workspace member but **not** a default
-  member: as one, a plain `cargo build`/`cargo test` would turn `broker` on for the whole
-  workspace by feature unification and hide dead code in the default build shed-mobile
-  links. For the same reason `make -C desktop core-lint`'s workspace leg excludes it and
-  a leg of its own lints it. It ships in no release (`tests/not_shipped.rs`).
+  (the minter's test seams, `minter::tests` helpers, `CredentialMinter::with_runner` and
+  the SSH-bootstrap types in `test_support`) is enabled only by `[dev-dependencies]`
+  (shed-desktop-core's), never in a shipped build. Default member.
+- **Isolation.**
   `crates/shed-core/tests/crate_isolation.rs` (cargo metadata) holds the DAG above:
   no `roost-ipc` outside `shed-roost`, no `reqwest`/`chrono`/`shed-core` in
-  `shed-lane` or `shed-craze`, no `shed-broker`/`saphyr-parser` in default
-  `shed-app`, no `tauri`/`iced`/direct `roost-ipc` in `shed-desktop-core`.
+  `shed-lane` or `shed-craze`, no `saphyr-parser` in `shed-app`, no
+  `tauri`/`iced`/direct `roost-ipc` in `shed-desktop-core`.
   The same test holds plan 039's provision crates: `shed-provision` reaches no
   workspace crate, `shed-provision-providers` only `shed-provision`, neither
   `saphyr-parser`/`tokio`/`reqwest`, and `shed-core`, `shed-lane`,
-  `shed-roost`, `shed-craze` and default `shed-app` reach neither (shed-mobile
+  `shed-roost`, `shed-craze` and `shed-app` reach neither (shed-mobile
   links those). `shed-source` reaches only `shed-core`/`shed-lane`/`shed-provision` and no
   `saphyr-parser`, and the same mobile crates do not reach it.
 - **`shed-provision`** (plan 039) — the source side of the provision contract
@@ -167,7 +145,7 @@ shedctl (no internal deps)
   the limit). Default member. `shed-desktop-core` depends on
   both and on `shed-source` (re-exported under `shed_desktop_core::delivery`), whose
   `delivery` module is the source runtime (plan 039 A6): `DeliveryRuntime` holds one
-  stream per configured server beside the embedded broker, answers each request from
+  stream per configured server, answers each request from
   `delivery.toml` (re-read per request) through `DiskReader` (the `Reader` contract:
   non-blocking open, `fstat` on the descriptor, bounded read; commands by argv in their
   own process group, killed past their timeout or output bound, registered so the
@@ -176,8 +154,8 @@ shedctl (no internal deps)
   exposes status, settings (`settings_file`: a JSON view, one provider changed and the
   whole file written back `0600`, the read-modify-write under a mutex and a lock file,
   through a unique temporary file), the preview of a shed (`preview`) and the servers'
-  activity merged (`activity`). Its drain runs in the shutdown's phase 0 after the
-  broker's (`Shutdown::set_source_drain`).
+  activity merged (`activity`); `retry_now` reopens a server's stream. Its drain, with
+  the egress feed's, runs first in the shutdown's phase 0 (`Shutdown::set_source_drain`).
 - **The opencode adapter crate was removed in plan 038.** Craze is the only agent lane.
   An opencode roost tab still renders as a passive status row (`RcKind::Opencode`);
   interactive opencode sessions belong to the `roost` app.
@@ -518,40 +496,24 @@ compile everywhere (macOS, Linux, and eventually mobile) without dragging a desk
 The Tauri crate consumes `shed-core` + `shed-app` as cross-workspace **path-deps**; it is not a
 member here. Do not add it as one.
 
-### The no-YAML-dep posture — and its one carve-out
+### The no-YAML-dep posture
 
-Both clients hand-roll a tiny indentation reader (`shed-core`'s and `shed-broker`'s own
-`yaml_lite` mods) rather than take a YAML dependency. That aversion targets the **serde-based**
-crates (`serde_yaml` — archived/unmaintained — and `serde_norway`): serde-derive on the config
-structs is what's being avoided, not a parser per se.
-
-**The scoped exception:** `shed-broker` (the broker core, home of the extensions `config`
-reader) depends on **`saphyr-parser`** (pure-Rust, no-serde, no-C, no encoding_rs,
-`default-features = false`) to back ITS `yaml_lite::parse`. Justification: the shipped
-`configs/extensions.example.yaml` uses block-style `docker.registries:` sequences the line/colon
-reader silently dropped, and Go's `LoadConfig` rejects malformed YAML the hand-rolled reader could
-not detect — a real Go-vs-Rust divergence on the product's own default config. `saphyr-parser`
-sits behind the `Node` interface (swap-insulation for its pre-1.0 API). It — and `shed-broker`'s
-other leaf deps (`notify`, the `aws-sdk-*` stack) — are **deps of `shed-broker`, reaching only its
-embedders** (`shed-app` under its non-default `broker` feature and, transitively, the Tauri
-client; and the test-only `shed-broker-harness`). They must **never** reach `shed-core`
-or **default-features `shed-app`** (proven by `cargo tree -i saphyr-parser` /
-`notify` / `aws-sdk-sts` — the §7 reverse-dep AC mechanically enforces this). **shed-core's own
-`yaml_lite` stays hand-rolled**; converging the two readers
-onto `saphyr-parser` would be a separate shed-core slice, not assumed here.
+`shed-core` hand-rolls a tiny indentation reader (`yaml_lite`) rather than take a YAML
+dependency. That aversion targets the **serde-based** crates (`serde_yaml` — archived/unmaintained
+— and `serde_norway`): serde-derive on the config structs is what's being avoided, not a parser
+per se. No crate in this workspace depends on a YAML parser (the retired broker's
+`saphyr-parser` carve-out went with it in plan 039; `crate_isolation.rs` still forbids it in
+`shed-app`, `shed-desktop-core` and `shed-source`).
 
 ## Build / test
 
 ```bash
 cd crates && cargo test                              # workspace tests (default members)
-cargo test -p shed-app --features broker             # the embedded broker bridge
 cargo test -p shed-lane --features test-support      # exports lane::conformance
 cargo test -p shed-roost --features test-support     # exports testing::FakeRoost
-cargo clippy --workspace --exclude shed-broker-harness --all-targets -- -D warnings
-cargo test -p shed-broker -p shed-broker-harness --all-targets   # the broker + its wire-harness host
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p shed-source                            # identity/credstore/minter + the delivery client
-cargo clippy -p shed-broker-harness --all-targets -- -D warnings
-cargo clippy -p shed-app --features broker --all-targets -- -D warnings
+cargo test -p shed-desktop-core                      # incl. the cold-launch mint (control_mint) + the egress feed
 cargo test -p shed-craze                             # the craze adapter (recipe cells skip)
 # the craze recipe against the real hub: build the pinned binaries, then require them
 make -C .. craze-binaries                            # prints SHED_CRAZE_BIN_DIR=…
@@ -559,12 +521,8 @@ SHED_CRAZE_BIN_DIR=… SHED_CRAZE_REQUIRE=1 cargo test -p shed-craze --all-targe
 cargo test -p shed-lane --test machine_transport_contract --test craze_ladder --locked
 ```
 
-Note: `broker` is the one non-default feature left in this workspace. A bare
-`cargo test`/`clippy --workspace` does not compile `broker_bridge.rs` at all, so the
-explicit `-p shed-app --features broker` legs above are its ONLY coverage (and what CI
-runs). `shed-app`'s other non-default feature, `rc`, went with `shed-rc-engine` and the
-RC hub in plan 022 (S6, #328); `sx`, which used to enable `rc` workspace-wide by feature
-unification, was sunset in plan 016 (S7, #329).
+Note: `shed-app` has no features. Its `broker` feature went with the broker in plan 039;
+`rc` went with `shed-rc-engine` and the RC hub in plan 022 (S6, #328).
 
 The shared crates also build/test on Linux — `make -C desktop core-linux` runs them in Docker.
 

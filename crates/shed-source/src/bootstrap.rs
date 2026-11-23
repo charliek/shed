@@ -812,10 +812,8 @@ mod tests {
     /// gives Go's bootstrap argv byte for byte (scope `control`, client kind `cli`, no
     /// CSR, the fixture's known_hosts), and every refused entry is refused before ssh is
     /// spawned (a shim that records any spawn stays untouched). Each entry's
-    /// `identity_file`, host and port are the fixture's decoded values; that the broker's
-    /// discovery reader decodes `config.yaml` and `refused.yaml` to exactly those is
-    /// `shed-broker`'s `discovery` test of the same fixture (plan 039 §3.7: this crate
-    /// has no YAML reader).
+    /// `identity_file`, host and port are the fixture's decoded values (shed-core's
+    /// reader decodes `config.yaml` to them: `config.rs`'s test of the same fixture).
     #[tokio::test]
     async fn the_go_fixture_gives_go_s_bootstrap_argv_and_its_refusals_spawn_nothing() {
         let root =

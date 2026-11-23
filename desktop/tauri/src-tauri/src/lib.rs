@@ -10,9 +10,8 @@
 // module below (#414: the app's lines go to stderr AND its log file).
 #[macro_use]
 mod applog;
-mod approval;
-mod broker;
 mod delivery;
+mod egress;
 mod env;
 mod ipc;
 mod prefs;
@@ -28,19 +27,11 @@ mod updater;
 #[cfg(test)]
 mod slash_command_tests;
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use env::Env;
 use ipc::{Handler, IpcServer};
-use shed_app::traits::{AuthGateRef, NotifierRef};
-use shed_app::{
-    AlwaysApprovedGate, AuditStore, Backend, Coordinator, CoordinatorDeps, FakeNotifier, SshPrefs,
-};
-use shed_core::approval::{
-    namespace, ApprovalChoice, ApprovalDecision, ApprovalMethod, ApprovalScope, PolicyRule,
-    PolicyScope, SshApprovalPolicy,
-};
+use shed_app::Backend;
 use shed_core::models::CreateShedRequest;
 use shed_desktop_core::{
     failure_json, installed_json, HostEvents, LaneEvents, LaneFailure, LaneUiEvent,
@@ -114,6 +105,7 @@ fn ui_report(
 /// `sheds.list` IPC op — [`ipc::sheds_payload`] is the single shaper.
 #[tauri::command]
 async fn list_sheds(
+    app: tauri::AppHandle,
     backend: tauri::State<'_, Arc<Backend>>,
     runtime: tauri::State<'_, Arc<ShedDesktopRuntime>>,
 ) -> Result<serde_json::Value, String> {
@@ -123,6 +115,9 @@ async fn list_sheds(
     // The sequence is stamped inside [`ipc::refresh_hosts`], before the fetch,
     // so a slow answer cannot reauthorize a shed a newer refresh removed.
     let reachability = ipc::refresh_hosts(&backend, runtime.hosts()).await;
+    if let Ok(feed) = egress_feed(&app) {
+        feed.observe(&reachability);
+    }
     Ok(ipc::sheds_payload(&reachability))
 }
 
@@ -273,7 +268,7 @@ fn open_terminal(
         .map_err(|(_code, msg)| msg)
 }
 
-// -- approvals (the frontend Approvals/Activity panes + approval prefs) --------
+// -- agents (the Agents pane, its lanes and craze) -----------------------------
 
 /// The Agents pane's session list. The same shaper the socket IPC `rc.list`
 /// uses: `{ sessions, capabilities, hosts, shed_craze }`.
@@ -751,267 +746,6 @@ async fn craze_open_terminal(
         .map_err(|f| f.command_string())
 }
 
-/// re-fetches on the `approvals-changed` event (see TauriEventSink).
-#[tauri::command]
-async fn approvals_list(
-    coordinator: tauri::State<'_, Coordinator>,
-) -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!(coordinator.approvals_list().await))
-}
-
-/// Approve/deny a pending request (the card's buttons). Tauri deserializes the
-/// enum args from their wire strings ("approve"|"deny", "per-request"|…) via serde.
-#[tauri::command]
-async fn approval_decide(
-    coordinator: tauri::State<'_, Coordinator>,
-    prefs: tauri::State<'_, prefs::SharedPrefs>,
-    id: String,
-    decision: ApprovalDecision,
-    scope: Option<ApprovalScope>,
-    ttl: Option<String>,
-    persist: Option<bool>,
-) -> Result<(), String> {
-    let persist = persist.unwrap_or(false);
-    coordinator
-        .decide_approval(
-            id,
-            ApprovalChoice {
-                decision,
-                scope,
-                ttl,
-                persist,
-            },
-        )
-        .await;
-    // A persisted (always-allow/deny) decision adds a per-shed rule — mirror it into
-    // prefs.json so the override survives a restart (the hydration source of truth).
-    if persist {
-        persist_shed_rules(&prefs, &coordinator).await;
-    }
-    Ok(())
-}
-
-/// The merged audit feed (most-recent-first). Re-fetched on `activity-changed`.
-#[tauri::command]
-async fn activity_list(
-    coordinator: tauri::State<'_, Coordinator>,
-    limit: Option<usize>,
-) -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!(
-        coordinator.activity_list(limit.unwrap_or(200)).await
-    ))
-}
-
-/// The namespaces the broker delegates to us (drives which approval-prefs
-/// sections show + the "credential broker · connected" indicator).
-#[tauri::command]
-async fn gate_namespaces(
-    coordinator: tauri::State<'_, Coordinator>,
-) -> Result<Vec<String>, String> {
-    Ok(coordinator.gate_namespaces().await)
-}
-
-/// Serialize the coordinator's typed SSH prefs to their wire strings (the same
-/// `{method, policy, ttl}` shape the UI reads back), so persistence round-trips
-/// through serde rather than a hand-maintained enum→string match.
-pub(crate) fn ssh_prefs_wire(p: &SshPrefs) -> (String, String, String) {
-    let v = serde_json::to_value(p).unwrap_or_default();
-    let field = |k: &str| {
-        v.get(k)
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string()
-    };
-    (field("method"), field("policy"), field("ttl"))
-}
-
-/// Rebuild `SshPrefs` from the persisted wire strings, parsing each enum via serde
-/// and falling back to the default for any absent/unparseable field — so an old or
-/// corrupt prefs.json never panics and never blocks startup.
-fn ssh_prefs_from_store(store: &prefs::PrefsStore) -> SshPrefs {
-    let stored = store.get();
-    let mut ssh = SshPrefs::default();
-    if let Some(m) = stored
-        .ssh_method
-        .as_deref()
-        .and_then(parse_wire::<ApprovalMethod>)
-    {
-        ssh.method = m;
-    }
-    if let Some(p) = stored
-        .ssh_policy
-        .as_deref()
-        .and_then(parse_wire::<SshApprovalPolicy>)
-    {
-        ssh.policy = p;
-    }
-    if let Some(t) = stored.ssh_ttl.filter(|t| !t.is_empty()) {
-        ssh.ttl = t;
-    }
-    ssh
-}
-
-/// Parse a serde enum from its wire string (`"time-based-allow"` → the variant),
-/// `None` on any value the current build doesn't recognize.
-fn parse_wire<T: serde::de::DeserializeOwned>(s: &str) -> Option<T> {
-    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
-}
-
-/// Apply SSH approval prefs (method/policy/TTL) + re-evaluate the pending queue,
-/// then persist so the choice survives a restart. Tauri deserializes the enum args
-/// from their wire strings via serde.
-#[tauri::command]
-async fn set_ssh_approval(
-    coordinator: tauri::State<'_, Coordinator>,
-    prefs: tauri::State<'_, prefs::SharedPrefs>,
-    method: Option<ApprovalMethod>,
-    policy: Option<SshApprovalPolicy>,
-    ttl: Option<String>,
-) -> Result<(), String> {
-    coordinator.set_ssh_approval(method, policy, ttl).await;
-    // Persist the coordinator's RESULTING prefs (reading them back composes this
-    // command's partial update with the existing method/policy/TTL) so a restart
-    // rehydrates exactly what the running coordinator holds.
-    let (m, p, t) = ssh_prefs_wire(&coordinator.ssh_prefs().await);
-    prefs.set_ssh(m, p, t);
-    Ok(())
-}
-
-/// The current SSH approval prefs (`{method, policy, ttl}`) — drives the
-/// Preferences dropdown so it reflects the running coordinator, not a guess.
-#[tauri::command]
-async fn ssh_prefs_get(
-    coordinator: tauri::State<'_, Coordinator>,
-) -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!(coordinator.ssh_prefs().await))
-}
-
-// -- provider (AWS/Docker) approval modes + per-shed overrides -----------------
-
-/// Serialize the coordinator's provider modes to their wire strings (the map the
-/// Preferences segmented control reads back + the shape persisted to prefs.json),
-/// via serde rather than a hand-maintained enum→string match. An unserializable
-/// value falls back to the fail-closed `"deny"`.
-pub(crate) fn provider_modes_wire(
-    modes: &HashMap<String, ApprovalDecision>,
-) -> HashMap<String, String> {
-    modes
-        .iter()
-        .map(|(ns, d)| {
-            let wire = serde_json::to_value(d)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_else(|| "deny".to_string());
-            (ns.clone(), wire)
-        })
-        .collect()
-}
-
-/// The per-shed (scope == Shed) rules from the engine, as wire JSON for persistence.
-/// The namespace rules (SSH/AWS/Docker) are rebuilt from prefs at startup, so only
-/// the derived per-shed overrides are persisted.
-pub(crate) fn shed_rules_wire(rules: &[PolicyRule]) -> Vec<serde_json::Value> {
-    rules
-        .iter()
-        .filter(|r| r.scope == PolicyScope::Shed)
-        .map(|r| serde_json::json!(r))
-        .collect()
-}
-
-/// Mirror the coordinator's current per-shed override rules into prefs.json — the
-/// single write-through every rule-mutating path (persist decision, remove) shares,
-/// so the persisted set always matches the live engine (the hydration source of truth).
-pub(crate) async fn persist_shed_rules(prefs: &prefs::PrefsStore, coordinator: &Coordinator) {
-    prefs.set_extra_rules(shed_rules_wire(&coordinator.policy_list().await));
-}
-
-/// Mirror the coordinator's current provider (AWS/Docker) modes into prefs.json — the
-/// shared write-through for every provider-mode change so the choice survives a restart.
-pub(crate) async fn persist_provider_modes(prefs: &prefs::PrefsStore, coordinator: &Coordinator) {
-    prefs.set_provider_modes(provider_modes_wire(&coordinator.provider_modes().await));
-}
-
-/// Rebuild the provider modes from the persisted store, keyed by the FULL namespace
-/// constants and parsing each decision via serde — falling back to the fail-closed
-/// `Deny` for any unparseable value, and ignoring any namespace other than the two
-/// providers (so a corrupt file never panics and never widens a mode). Empty when
-/// absent (unset == Deny by default in the coordinator).
-fn provider_modes_from_store(store: &prefs::PrefsStore) -> HashMap<String, ApprovalDecision> {
-    store
-        .get()
-        .provider_modes
-        .into_iter()
-        .filter(|(ns, _)| ns == namespace::AWS || ns == namespace::DOCKER)
-        .map(|(ns, v)| {
-            let d = parse_wire::<ApprovalDecision>(&v).unwrap_or(ApprovalDecision::Deny);
-            (ns, d)
-        })
-        .collect()
-}
-
-/// Rebuild the per-shed override rules from the persisted store, skipping any rule a
-/// current build can't parse (corrupt-tolerant — a dropped rule fails closed to the
-/// namespace policy rather than blocking startup).
-fn extra_rules_from_store(store: &prefs::PrefsStore) -> Vec<PolicyRule> {
-    store
-        .get()
-        .extra_rules
-        .into_iter()
-        .filter_map(|v| serde_json::from_value::<PolicyRule>(v).ok())
-        // extra_rules is per-shed override storage: a hand-edited/corrupt prefs.json
-        // must not be able to inject default- or namespace-scope policy at startup.
-        .filter(|r| r.scope == PolicyScope::Shed)
-        .collect()
-}
-
-/// The current provider (AWS/Docker) modes (`{namespace: "approve"|"deny"}`) — drives
-/// the Preferences segmented Allow|Deny so it reflects the running coordinator.
-#[tauri::command]
-async fn provider_modes_get(
-    coordinator: tauri::State<'_, Coordinator>,
-) -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!(coordinator.provider_modes().await))
-}
-
-/// Set an AWS/Docker provider mode + persist, so the choice survives a restart. The
-/// coordinator rejects any namespace other than the two providers (surfaced as the
-/// error string). Persists the coordinator's RESULTING modes (source of truth).
-#[tauri::command]
-async fn set_provider_mode(
-    coordinator: tauri::State<'_, Coordinator>,
-    prefs: tauri::State<'_, prefs::SharedPrefs>,
-    ns: String,
-    decision: ApprovalDecision,
-) -> Result<(), String> {
-    coordinator.set_provider_mode(ns, decision).await?;
-    persist_provider_modes(&prefs, &coordinator).await;
-    Ok(())
-}
-
-/// The per-shed override rules (scope == shed) — the Preferences "Per-shed overrides"
-/// list. A filtered read of the full policy (the namespace rules are excluded).
-#[tauri::command]
-async fn policy_list_shed(
-    coordinator: tauri::State<'_, Coordinator>,
-) -> Result<serde_json::Value, String> {
-    let rules = coordinator.policy_list().await;
-    Ok(serde_json::json!(shed_rules_wire(&rules)))
-}
-
-/// Remove one per-shed override rule (the row's remove button) + persist the
-/// remaining set, so the removal survives a restart.
-#[tauri::command]
-async fn remove_shed_rule(
-    coordinator: tauri::State<'_, Coordinator>,
-    prefs: tauri::State<'_, prefs::SharedPrefs>,
-    server: String,
-    shed: String,
-) -> Result<(), String> {
-    coordinator.remove_shed_rule(server, shed).await;
-    persist_shed_rules(&prefs, &coordinator).await;
-    Ok(())
-}
-
 // -- appearance (light/dark) sync across webviews ------------------------------
 
 /// The app-wide light/dark appearance, held in Rust so a second webview (the
@@ -1136,19 +870,6 @@ fn loginitem_set(
     login_item_set(&app, &env, enabled)
 }
 
-// -- credential broker (leg 3a.2): the status surface --------------------------
-
-/// The credential-broker status the Preferences "Credential broker" section reads on
-/// mount + on `prefs-changed`: config source, resolved ssh mode, per-server health,
-/// and any broker-failed error. See
-/// [`broker::BrokerRuntime::status`].
-#[tauri::command]
-fn broker_status(app: tauri::AppHandle) -> serde_json::Value {
-    app.try_state::<broker::BrokerRuntime>()
-        .map(|rt| rt.status())
-        .unwrap_or_else(|| serde_json::json!({}))
-}
-
 // -- credential sources (plan 035 §3.4): the Preferences source rows -------------
 
 /// Which machine answers credential requests on each configured server, and this
@@ -1159,12 +880,12 @@ async fn source_status(
     app: tauri::AppHandle,
     backend: tauri::State<'_, Arc<Backend>>,
 ) -> Result<serde_json::Value, String> {
-    let rt = app.try_state::<broker::BrokerRuntime>();
+    let rt = delivery_runtime(&app).ok();
     Ok(source::status(&backend, rt.as_deref()).await)
 }
 
-/// "Use this machine": make this machine the source on `host` (and wake the embedded
-/// broker). The error string is the refusal in plain words, which the row shows.
+/// "Use this machine": make this machine the source on `host` (and reopen its delivery
+/// stream there). The error string is the refusal in plain words, which the row shows.
 /// Mirrors the `source.use` IPC op (see [`source::use_this_machine`]).
 #[tauri::command]
 async fn source_use(
@@ -1172,7 +893,7 @@ async fn source_use(
     backend: tauri::State<'_, Arc<Backend>>,
     host: String,
 ) -> Result<serde_json::Value, String> {
-    let rt = app.try_state::<broker::BrokerRuntime>();
+    let rt = delivery_runtime(&app).ok();
     source::use_this_machine(&backend, rt.as_deref(), &host)
         .await
         .map_err(|(_, message)| message)
@@ -1259,6 +980,36 @@ async fn activity_server_list(
     delivery::activity(&backend, limit, cursor.as_deref(), shed.as_deref())
         .await
         .map_err(|(_, m)| m)
+}
+
+// -- the egress decision feed (plan 039 PR B; `crate::egress`) ----------------------
+
+fn egress_feed(
+    app: &tauri::AppHandle,
+) -> Result<Arc<shed_desktop_core::egress::EgressFeed>, String> {
+    app.try_state::<Arc<shed_desktop_core::egress::EgressFeed>>()
+        .map(|s| Arc::clone(&s))
+        .ok_or_else(|| "the egress feed has not started".to_string())
+}
+
+/// `egress.recent`: a shed incarnation's last decisions (`blocks`: only the denied ones).
+#[tauri::command]
+fn egress_recent(
+    app: tauri::AppHandle,
+    server: String,
+    shed: String,
+    created_at: String,
+    blocks: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let feed = egress_feed(&app)?;
+    egress::recent(&feed, &server, &shed, &created_at, blocks.unwrap_or(false)).map_err(|(_, m)| m)
+}
+
+/// `egress.status`: each server's egress stream.
+#[tauri::command]
+fn egress_status(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let feed = egress_feed(&app)?;
+    Ok(egress::status(&feed))
 }
 
 // -- menu-bar popover footer commands (B1b) — a 2nd webview can't call the IPC ops
@@ -1376,11 +1127,6 @@ pub fn run() {
     // `dashboard.dump` read what the frontend reported.
     let ui: SharedUi = Arc::new(Mutex::new(UiState::default()));
 
-    // The Coordinator's approval clock. The embedded credential broker and the
-    // `Backend` it mints for are built in `setup`; minter-before-Backend launch order
-    // (§3.2) is preserved there.
-    let clock = shed_app::traits::system_clock();
-
     #[allow(unused_mut)] // only the macOS+non-test arm re-binds it (the sparkle plugin)
     let mut builder = tauri::Builder::default()
         // Launch-at-login (B4): register the plugin so `app.autolaunch()` resolves;
@@ -1451,21 +1197,10 @@ pub fn run() {
             craze_reopen,
             craze_open_terminal,
             open_terminal,
-            approvals_list,
-            approval_decide,
-            activity_list,
-            gate_namespaces,
-            set_ssh_approval,
-            ssh_prefs_get,
-            provider_modes_get,
-            set_provider_mode,
-            policy_list_shed,
-            remove_shed_rule,
             get_appearance_state,
             set_appearance_state,
             loginitem_status,
             loginitem_set,
-            broker_status,
             source_status,
             source_use,
             delivery_status,
@@ -1475,6 +1210,8 @@ pub fn run() {
             shed_delivery,
             shed_provision,
             activity_server_list,
+            egress_recent,
+            egress_status,
             open_dashboard,
             open_preferences,
             app_exit,
@@ -1502,9 +1239,6 @@ pub fn run() {
                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                 .join("prefs.json");
             let prefs: prefs::SharedPrefs = Arc::new(prefs::PrefsStore::load(prefs_path));
-            // Managed so `set_ssh_approval` (and its IPC twin) can write the chosen
-            // SSH prefs through the same store.
-            app.manage(prefs.clone());
 
             // Launch at login is on by default (plan 037 §3.1.4): turned on once, at the
             // first launch that can record having done so. Not in a debug build outside
@@ -1529,85 +1263,28 @@ pub fn run() {
                 }
             }
 
-            // The approval seams (mode-independent): test-mode fakes vs the prod native
-            // gate + notifier (Linux polkit / mac Touch-ID; fail-closed stubs elsewhere).
-            // The audit log lives under the app data dir (redirected + hermetic in test).
-            let (notifier, gate): (NotifierRef, AuthGateRef) = if env.test_mode {
-                (Arc::new(FakeNotifier::new()), Arc::new(AlwaysApprovedGate))
-            } else {
-                approval::production_seams()
-            };
-            let audit = AuditStore::new(
-                app.path()
-                    .app_data_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    .join("audit.jsonl"),
-            );
-            // Hydrate SSH prefs / provider modes / per-shed rules from the persisted
-            // store so the user's choices survive a restart (fallback on absent/corrupt).
-            let ssh_prefs = ssh_prefs_from_store(&prefs);
-            let provider_modes = provider_modes_from_store(&prefs);
-            let extra_rules = extra_rules_from_store(&prefs);
-            // Pushes coordinator changes to the webview (app.emit) so the
-            // Approvals/Activity panes re-fetch reactively.
-            let coord_sink: shed_app::traits::EventSinkRef =
-                Arc::new(approval::TauriEventSink::new(app.handle().clone()));
-            let coord_clock = clock.clone();
-            // Build the broker spine + the Backend it mints for + the Coordinator, all
-            // INSIDE the Tauri (tokio) runtime — the embedded broker tokio::spawns, and
-            // the setup hook has no runtime of
-            // its own (the same reason the IPC bind below uses block_on). The minter is
-            // handed to the Backend BEFORE the embedded bus starts (`runtime.start()`),
-            // preserving the §3.2 launch order. `env` is borrowed (block_on runs to
-            // completion here), so it stays available for the handler + IPC bind below.
-            let env_ref = &env;
-            // The per-server credential-mode registry (plan 002 §7 P1/P5), built
-            // EMPTY here and seeded by the Backend from config. In-memory only: config.yaml is
-            // CLI-owned and this app never writes it.
+            // The control-certificate mint (plan 039 PR B): `shed-source`'s SSH-bootstrap
+            // minter over the shed CLI config, handed to the Backend BEFORE its first
+            // request, so a cold launch enrols against an mtls server with no broker.
+            // `backend_modes` is the per-server credential-mode registry (plan 002 §7
+            // P1/P5), seeded from the config's `auth_mode` entries and attached as every
+            // provider's CredentialObserver, so an adopted mode is learned. In-memory
+            // only: config.yaml is CLI-owned and this app never writes it. Hermetic in
+            // test mode (every host → the mock, which nothing mints for).
             let auth_modes = Arc::new(shed_app::AuthModeRegistry::new());
-            let backend_modes = auth_modes.clone();
-            let (backend, broker_runtime, coordinator) =
-                tauri::async_runtime::block_on(async move {
-                    let spine = broker::build(env_ref);
-                    // Where the broker's config came from (#414) — otherwise only
-                    // `broker.status` ever says it.
-                    app_info!("shed-desktop-tauri: {}", spine.runtime.describe());
-                    // Hermetic in test mode (every host → the mock); the minter is the
-                    // embedded broker's. `backend_modes` is seeded from the config's
-                    // `auth_mode` entries here and attached as every provider's
-                    // CredentialObserver, so an adopted mode is learned.
-                    let backend = Arc::new(Backend::from_env_parts_with_credentials(
-                        env_ref.test_mode,
-                        env_ref.mock_base_url.as_deref(),
-                        &env_ref.config_path,
-                        spine.minter.as_ref(),
-                        Some(&backend_modes),
-                        &env_ref.mock_unreachable_hosts,
-                    ));
-                    let coordinator = Coordinator::spawn(
-                        CoordinatorDeps {
-                            responder: spine.responder,
-                            notifier,
-                            gate,
-                            clock: coord_clock,
-                            sink: coord_sink,
-                            audit,
-                            ssh: ssh_prefs,
-                            extra_rules,
-                            provider_modes,
-                        },
-                        spine.event_rx,
-                    );
-                    coordinator.start_expiry_tick();
-                    // Embedded only: start the bus now that the Coordinator is consuming
-                    // the bridge's event stream. A start failure fails closed (recorded
-                    // in broker_runtime; the app keeps running), never a crash.
-                    spine.runtime.start().await;
-                    (backend, spine.runtime, coordinator)
-                });
+            let minter = shed_desktop_core::control_mint::control_minter(
+                &env.config_path.to_string_lossy(),
+                shed_desktop_core::control_mint::KNOWN_HOSTS,
+            );
+            let backend = Arc::new(Backend::from_env_parts_with_credentials(
+                env.test_mode,
+                env.mock_base_url.as_deref(),
+                &env.config_path,
+                Some(&minter),
+                Some(&auth_modes),
+                &env.mock_unreachable_hosts,
+            ));
             app.manage(backend.clone());
-            app.manage(broker_runtime);
-            app.manage(coordinator.clone());
             app.manage(auth_modes);
 
             // Shed hosts and agent lanes (plan 038): one runtime owns both,
@@ -1628,11 +1305,11 @@ pub fn run() {
                     app: app.handle().clone(),
                 }),
             ));
-            // The broker drain is the shutdown's first step, so a tray quit,
-            // `RunEvent::Exit`, and a signal all drain it.
-            shutdown::install_broker_drain(&runtime, app.handle());
-            // The source runtime (plan 039 A6): a delivery stream per configured server,
-            // beside the broker's bus. Its drain runs in phase 0, after the broker's.
+            shutdown::install_shutdown_log(&runtime);
+            // The source runtime (plan 039): a delivery stream per configured server,
+            // and the egress decision feed on the Backend's control-scope clients.
+            // Their drain is the shutdown's first step, so a tray quit,
+            // `RunEvent::Exit`, and a signal all drain them.
             let delivery_rt = tauri::async_runtime::block_on(async {
                 let handle = tokio::runtime::Handle::current();
                 let env = env.clone();
@@ -1640,11 +1317,23 @@ pub fn run() {
                     .await
                     .expect("the delivery runtime starts")
             });
+            let egress_feed = tauri::async_runtime::block_on(async {
+                egress::start(
+                    &backend,
+                    &tokio::runtime::Handle::current(),
+                    app.handle().clone(),
+                )
+            });
             {
                 let rt = delivery_rt.clone();
-                runtime.set_source_drain(Box::new(move || rt.drain()));
+                let feed = egress_feed.clone();
+                runtime.set_source_drain(Box::new(move || {
+                    rt.drain();
+                    feed.drain();
+                }));
             }
             app.manage(delivery_rt);
+            app.manage(egress_feed);
             app.manage(runtime.clone());
             shutdown::spawn_signal_thread(app.handle().clone(), runtime.shutdown_coordinator());
 
@@ -1663,8 +1352,6 @@ pub fn run() {
                 ui.clone(),
                 backend.clone(),
                 terminal,
-                coordinator,
-                prefs,
                 runtime,
             );
             // block_on enters Tauri's tokio runtime so tokio's UnixListener can

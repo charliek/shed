@@ -24,10 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Handle;
 
-use shed_app::{Backend, Coordinator, Reachability};
-use shed_core::approval::{
-    ApprovalChoice, ApprovalDecision, ApprovalMethod, ApprovalScope, PolicyRule, SshApprovalPolicy,
-};
+use shed_app::{Backend, Reachability};
 use shed_core::models::CreateShedRequest;
 use shed_desktop_core::{
     failure_json, installed_json, InjectedRow, LaneFailure, ShedDesktopRuntime, ShedHosts, ShedId,
@@ -35,7 +32,6 @@ use shed_desktop_core::{
 use shed_lane::rc::RcKind;
 
 use crate::env::Env;
-use crate::prefs::SharedPrefs;
 use crate::state::SharedUi;
 use crate::termctl::SharedTerminal;
 
@@ -143,7 +139,7 @@ fn req_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, (String, String)
 /// (`ui.show_roost_consent` / `ui.confirm_roost_consent` /
 /// `ui.close_roost_consent`): the event name and payload to emit, or the refusal.
 ///
-/// **TEST-MODE ONLY**, the `policy.set` / `rc.inject_test` rule. These exist so
+/// **TEST-MODE ONLY**, the `rc.inject_test` rule. These exist so
 /// the harness can drive a dialog that only opens from a card's plan-matrix
 /// BUTTON — it has no click. But showing the card and confirming it are the two
 /// halves of a user's consent, and a socket client that can do both in
@@ -717,12 +713,6 @@ pub struct Handler {
     /// Terminal ops (preset resolution, launch, install detection, the terminal
     /// preference), shared with the frontend invoke commands.
     terminal: SharedTerminal,
-    /// The approval coordinator (the security spine): the approvals queue, policy,
-    /// grants, audit, and the broker decision path.
-    coordinator: Coordinator,
-    /// The persisted prefs store, so `ui.set_ssh_approval` persists the chosen SSH
-    /// prefs through the same path as the frontend command (both survive a restart).
-    prefs: SharedPrefs,
     /// Shed hosts, agent lanes, and the orderly shutdown (plan 038).
     runtime: Arc<ShedDesktopRuntime>,
     /// Monotonic token stamped onto each `sheds.refresh` so it can wait for the
@@ -739,8 +729,6 @@ impl Handler {
         ui: SharedUi,
         backend: Arc<Backend>,
         terminal: SharedTerminal,
-        coordinator: Coordinator,
-        prefs: SharedPrefs,
         runtime: Arc<ShedDesktopRuntime>,
     ) -> Self {
         Self {
@@ -749,8 +737,6 @@ impl Handler {
             ui,
             backend,
             terminal,
-            coordinator,
-            prefs,
             runtime,
             refresh_seq: AtomicU64::new(0),
             pid: std::process::id(),
@@ -948,6 +934,7 @@ impl Handler {
             }
             "sheds.list" => {
                 let reachability = refresh_hosts(&self.backend, self.runtime.hosts()).await;
+                self.observe_egress(&reachability);
                 Ok(sheds_payload(&reachability))
             }
             "sheds.refresh" => self.sheds_refresh().await,
@@ -970,6 +957,30 @@ impl Handler {
             "hosts.auth" => Ok(self.hosts_auth()),
             "egress.profiles" => Ok(self.egress_dump()),
             "egress.show" => self.egress_show(params),
+            // -- the egress decision feed (plan 039 PR B; `crate::egress`) --
+            "egress.recent" => {
+                let feed = self.egress_feed()?;
+                crate::egress::recent(
+                    &feed,
+                    params.get("server").and_then(Value::as_str).unwrap_or(""),
+                    params.get("shed").and_then(Value::as_str).unwrap_or(""),
+                    params
+                        .get("created_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    params
+                        .get("blocks")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+            }
+            "egress.status" => {
+                let feed = self.egress_feed()?;
+                Ok(crate::egress::status(&feed))
+            }
+            "egress.server_profiles" => {
+                Ok(json!({ "hosts": self.backend.egress_profiles().await }))
+            }
             "terminal.preview" => self.terminal_preview(params),
             "terminal.open" => self.terminal_open(params),
             "terminal.presets" => Ok(self.terminal_presets()),
@@ -1006,14 +1017,8 @@ impl Handler {
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
             "prefs.set_terminal" => self.prefs_set_terminal(params),
-            // Provider (AWS/Docker) approval modes — the production Preferences
-            // surface (ungated, unlike test-mode `policy.set`).
-            "prefs.provider_modes" => self.provider_modes().await,
-            "prefs.set_provider" => self.set_provider(params).await,
             // The Preferences window's drivable surface: its merged snapshot +
-            // native state, hide (close-hides contract), and the per-shed override
-            // remove (the row button's path, ungated like prefs.set_provider — it
-            // only removes an override, falling back to the namespace policy).
+            // native state, and hide (close-hides contract).
             "prefs.dump" => Ok(self.prefs_dump()),
             "prefs.close" => {
                 // Marshal the hide onto the main thread so it stays FIFO-ordered
@@ -1029,28 +1034,13 @@ impl Handler {
                 });
                 Ok(json!({}))
             }
-            "prefs.remove_shed_rule" => self.remove_shed_rule(params).await,
-            // -- approvals (the security spine) --
-            "approvals.list" => self.approvals_list().await,
-            "approval.decide" => self.approval_decide(params).await,
-            "activity.list" => self.activity_list(params).await,
-            "activity.log_path" => self.activity_log_path().await,
-            "policy.set" => self.policy_set(params).await,
-            "policy.list" => self.policy_list().await,
-            "notifications.list" => self.notifications_list().await,
-            "notification.invoke" => self.notification_invoke(params).await,
-            "notification.open" => self.notification_open(),
-            "ui.set_ssh_approval" => self.set_ssh_approval(params).await,
-            "ui.ssh_prefs" => self.ssh_prefs().await,
             "loginitem.status" => {
                 Ok(json!({ "enabled": crate::login_item_enabled(&self.app, &self.env) }))
             }
             "loginitem.set" => self.login_item_set(params),
-            // -- credential broker (leg 3a.2) --
-            "broker.status" => Ok(self.broker_status()),
             // -- credential sources (plan 035 §3.4) --
             "source.status" => {
-                let rt = self.app.try_state::<crate::broker::BrokerRuntime>();
+                let rt = self.delivery_rt().ok();
                 Ok(crate::source::status(&self.backend, rt.as_deref()).await)
             }
             "source.use" => self.source_use(params).await,
@@ -1220,18 +1210,6 @@ impl Handler {
         })
     }
 
-    /// `prefs.remove_shed_rule {server, shed}` → remove one per-shed override rule +
-    /// persist the remaining set (the same path as the window's remove button).
-    /// `server` is matched verbatim (`""` = the single/unnamed server — F12).
-    async fn remove_shed_rule(&self, params: &Value) -> Result<Value, (String, String)> {
-        let server = req_str(params, "server")?.to_string();
-        let shed = req_str(params, "shed")?.to_string();
-        self.coordinator.remove_shed_rule(server, shed).await;
-        crate::persist_shed_rules(&self.prefs, &self.coordinator).await;
-        self.emit_prefs_changed();
-        Ok(json!({}))
-    }
-
     /// Emit `prefs-changed` so the Preferences window (if open) re-fetches values an
     /// IPC-driven mutation changed behind its back (its own controls keep local
     /// state directly; the dashboard has no prefs UI to notify).
@@ -1312,6 +1290,7 @@ impl Handler {
         let _ = self.app.emit("refresh", json!({ "token": token }));
         if !has_frontend {
             let reachability = refresh_hosts(&self.backend, self.runtime.hosts()).await;
+            self.observe_egress(&reachability);
             return Ok(sheds_payload(&reachability));
         }
         let deadline = Instant::now() + REFRESH_WAIT;
@@ -1902,7 +1881,7 @@ impl Handler {
     ///
     /// `rc.inject_test {target, slug, kind?, display_name?, workdir?,
     /// lifecycle?, attention?}` → put a row into the shed's roost snapshot
-    /// (test-only, guarded like `policy.set`).
+    /// (test-only, guarded like the other privileged driver ops).
     ///
     /// It lands in the ROOST snapshot since S6: that is the only row source the
     /// Agents pane has, so the render fixture has to land there. `slug` is the
@@ -2042,168 +2021,6 @@ impl Handler {
         Ok(json!({}))
     }
 
-    // -- approvals (the security spine; the harness drives the full matrix) ----
-
-    /// `approvals.list` → the pending approval cards (each with its gate + the SSH
-    /// scope/TTL defaults), soonest-to-expire first.
-    async fn approvals_list(&self) -> Result<Value, (String, String)> {
-        Ok(json!({ "approvals": self.coordinator.approvals_list().await }))
-    }
-
-    /// `approval.decide {id, decision, scope?, ttl?, persist?}` → run the user
-    /// decision through the coordinator's two-phase gate.
-    async fn approval_decide(&self, params: &Value) -> Result<Value, (String, String)> {
-        #[derive(serde::Deserialize)]
-        struct P {
-            id: String,
-            decision: ApprovalDecision,
-            scope: Option<ApprovalScope>,
-            ttl: Option<String>,
-            #[serde(default)]
-            persist: bool,
-        }
-        let p: P = serde_json::from_value(params.clone())
-            .map_err(|e| err("bad_request", e.to_string()))?;
-        let persist = p.persist;
-        self.coordinator
-            .decide_approval(
-                p.id,
-                ApprovalChoice {
-                    decision: p.decision,
-                    scope: p.scope,
-                    ttl: p.ttl,
-                    persist,
-                },
-            )
-            .await;
-        // A persisted decision adds a per-shed rule — mirror it into prefs.json (same
-        // path as the frontend command) so the override survives a restart.
-        if persist {
-            crate::persist_shed_rules(&self.prefs, &self.coordinator).await;
-            self.emit_prefs_changed();
-        }
-        Ok(json!({}))
-    }
-
-    /// `activity.list {limit?}` → the merged audit feed, most-recent-first.
-    async fn activity_list(&self, params: &Value) -> Result<Value, (String, String)> {
-        let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
-        Ok(json!({ "entries": self.coordinator.activity_list(limit).await }))
-    }
-
-    /// `activity.log_path` → the audit JSONL path (the "reveal in files" action).
-    async fn activity_log_path(&self) -> Result<Value, (String, String)> {
-        Ok(json!({ "path": self.coordinator.audit_log_path().await }))
-    }
-
-    /// `policy.set {rules}` → replace the policy engine's rules. TEST-MODE ONLY —
-    /// installing an auto-approve policy from a driver is a privilege (F8).
-    async fn policy_set(&self, params: &Value) -> Result<Value, (String, String)> {
-        if !self.env.test_mode {
-            return Err(err("not_enabled", "policy.set requires test mode"));
-        }
-        #[derive(serde::Deserialize)]
-        struct P {
-            rules: Vec<PolicyRule>,
-        }
-        let p: P = serde_json::from_value(params.clone())
-            .map_err(|e| err("bad_request", e.to_string()))?;
-        self.coordinator.set_policy_rules(p.rules).await;
-        Ok(json!({}))
-    }
-
-    /// `policy.list` → the current policy rules.
-    async fn policy_list(&self) -> Result<Value, (String, String)> {
-        Ok(json!({ "rules": self.coordinator.policy_list().await }))
-    }
-
-    /// `notifications.list` → the posted approval notifications (the test presenter
-    /// records them; the prod notifier posts natively — B6 — and lists none).
-    async fn notifications_list(&self) -> Result<Value, (String, String)> {
-        Ok(json!({ "notifications": self.coordinator.notifications_list().await }))
-    }
-
-    /// `notification.invoke {id, action}` → drive an Approve/Deny from a posted
-    /// notification (the test presenter).
-    async fn notification_invoke(&self, params: &Value) -> Result<Value, (String, String)> {
-        let id = req_str(params, "id")?.to_string();
-        let action: ApprovalDecision =
-            serde_json::from_value(params.get("action").cloned().unwrap_or(Value::Null))
-                .map_err(|e| err("bad_request", format!("action: {e}")))?;
-        if self
-            .coordinator
-            .notification_invoke(id.clone(), action)
-            .await
-        {
-            Ok(json!({}))
-        } else {
-            Err(err("not_found", format!("no posted notification {id}")))
-        }
-    }
-
-    /// `notification.open` → the banner-body tap: raise the window on the Approvals
-    /// pane (mirrors the mac `onOpen`).
-    fn notification_open(&self) -> Result<Value, (String, String)> {
-        present_main_window(&self.app);
-        let _ = self.app.emit("navigate", json!({ "pane": "approvals" }));
-        Ok(json!({}))
-    }
-
-    /// `ui.set_ssh_approval {method?, policy?, ttl?}` → apply SSH approval prefs +
-    /// re-evaluate the pending queue (the same path as the UI Preferences view).
-    async fn set_ssh_approval(&self, params: &Value) -> Result<Value, (String, String)> {
-        #[derive(serde::Deserialize)]
-        struct P {
-            method: Option<ApprovalMethod>,
-            policy: Option<SshApprovalPolicy>,
-            ttl: Option<String>,
-        }
-        let p: P = serde_json::from_value(params.clone())
-            .map_err(|e| err("bad_request", e.to_string()))?;
-        self.coordinator
-            .set_ssh_approval(p.method, p.policy, p.ttl)
-            .await;
-        // Persist the resulting prefs (same path as the frontend command) so a
-        // harness-driven change also survives a restart.
-        let (m, pol, ttl) = crate::ssh_prefs_wire(&self.coordinator.ssh_prefs().await);
-        self.prefs.set_ssh(m, pol, ttl);
-        self.emit_prefs_changed();
-        Ok(json!({}))
-    }
-
-    /// `ui.ssh_prefs` → the coordinator's current SSH approval prefs
-    /// (`{method, policy, ttl}`) — the observe side of `ui.set_ssh_approval`, so the
-    /// harness can assert what a set actually applied (the drivability North Star).
-    async fn ssh_prefs(&self) -> Result<Value, (String, String)> {
-        Ok(json!(self.coordinator.ssh_prefs().await))
-    }
-
-    /// `prefs.provider_modes` → the coordinator's current AWS/Docker approval modes
-    /// (`{namespace: "approve"|"deny"}`) — the read side of `prefs.set_provider`.
-    async fn provider_modes(&self) -> Result<Value, (String, String)> {
-        Ok(json!(self.coordinator.provider_modes().await))
-    }
-
-    /// `prefs.set_provider {namespace, decision}` → set an AWS/Docker provider mode +
-    /// persist (the same path as the frontend `set_provider_mode` command). The
-    /// coordinator rejects a non-provider namespace (surfaced as `bad_request`).
-    async fn set_provider(&self, params: &Value) -> Result<Value, (String, String)> {
-        #[derive(serde::Deserialize)]
-        struct P {
-            namespace: String,
-            decision: ApprovalDecision,
-        }
-        let p: P = serde_json::from_value(params.clone())
-            .map_err(|e| err("bad_request", e.to_string()))?;
-        self.coordinator
-            .set_provider_mode(p.namespace, p.decision)
-            .await
-            .map_err(|e| err("bad_request", e))?;
-        crate::persist_provider_modes(&self.prefs, &self.coordinator).await;
-        self.emit_prefs_changed();
-        Ok(json!({}))
-    }
-
     /// `loginitem.set {enabled}` → enable/disable launch-at-login (the Preferences
     /// "General" toggle's driver). Guarded to an in-memory cell under the macOS
     /// harness; a real hermetic `auto-launch` write on Linux/production.
@@ -2247,20 +2064,21 @@ impl Handler {
         json!({ "hosts": hosts })
     }
 
-    /// `broker.status` → the embedded broker's config source, resolved ssh mode, gate
-    /// namespaces, per-server health, machine identity and any start-up error.
-    /// The harness drives + asserts it (C4); shedtest reads it as broker truth.
-    fn broker_status(&self) -> Value {
-        self.app
-            .try_state::<crate::broker::BrokerRuntime>()
-            .map(|rt| rt.status())
-            .unwrap_or_else(|| json!({}))
+    /// A listing drops the egress decisions of the sheds it no longer has.
+    fn observe_egress(&self, r: &Reachability) {
+        if let Ok(feed) = self.egress_feed() {
+            feed.observe(r);
+        }
     }
 
-    /// `source.use {host}` → make THIS machine the credential source on `host` (the
-    /// same path as the Preferences "Use this machine" button), wake the embedded
-    /// broker, and tell an open Preferences window to read the rows again. See
-    /// [`crate::source::use_this_machine`] for the refusals.
+    /// The egress decision feed (plan 039 PR B), or `not_ready` before setup has made it.
+    fn egress_feed(&self) -> Result<Arc<shed_desktop_core::egress::EgressFeed>, (String, String)> {
+        self.app
+            .try_state::<Arc<shed_desktop_core::egress::EgressFeed>>()
+            .map(|s| Arc::clone(&s))
+            .ok_or_else(|| err("not_ready", "the egress feed has not started"))
+    }
+
     /// The source runtime (plan 039), or `not_ready` before setup has made it.
     fn delivery_rt(
         &self,
@@ -2271,9 +2089,13 @@ impl Handler {
             .ok_or_else(|| err("not_ready", "the delivery runtime has not started"))
     }
 
+    /// `source.use {host}` → make THIS machine the credential source on `host` (the
+    /// same path as the Preferences "Use this machine" button), reopen its delivery
+    /// stream there, and tell an open Preferences window to read the rows again. See
+    /// [`crate::source::use_this_machine`] for the refusals.
     async fn source_use(&self, params: &Value) -> Result<Value, (String, String)> {
         let host = req_str(params, "host")?;
-        let rt = self.app.try_state::<crate::broker::BrokerRuntime>();
+        let rt = self.delivery_rt().ok();
         let res = crate::source::use_this_machine(&self.backend, rt.as_deref(), host).await;
         if res.is_ok() {
             self.emit_prefs_changed();
@@ -2654,7 +2476,6 @@ mod tests {
             roost_jail_fs_root: false,
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
-            broker_extensions_path: PathBuf::from("/run/user/0/shed/extensions.yaml"),
             delivery_settings_path: PathBuf::from("/run/user/0/shed/delivery.toml"),
             log_file: None,
             log_debug: false,
@@ -2662,7 +2483,7 @@ mod tests {
     }
 
     /// **The consent-dialog driver doors are privileged, and gated like the
-    /// other privileged ones** (`policy.set`, `rc.inject_test`).
+    /// other privileged ones** (`rc.inject_test`).
     ///
     /// They exist because the dialog only opens from a card's plan-matrix BUTTON
     /// and the harness has no click. But SHOWING the card and CONFIRMING it are

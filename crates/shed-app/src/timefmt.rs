@@ -1,17 +1,13 @@
 //! Flexible ISO-8601 timestamp parse/format.
 //!
-//! shed-server (and the broker) render timestamps in more than one shape —
+//! shed-server renders timestamps in more than one shape —
 //! `2026-05-31T13:33:00.884935839-05:00` (nanosecond fraction + local offset),
 //! plain `...Z` UTC, and occasionally a trailing ` (UTC)` annotation — so a
 //! single fixed parser would silently fail on one of them. The pure crates carry
 //! timestamps as strings; this is the one place they become instants.
 //!
-//! **Fail-closed contract (the reason this matters for security):** an
-//! unparseable timestamp returns `None`. The approval coordinator MUST treat a
-//! `None` `expires_at` as *already expired* (never a far-future default) — a
-//! naive `parse().unwrap_or(FAR_FUTURE)` would invert F4 into a never-expiring,
-//! always-approvable request. The parse itself is deliberately lenient; the
-//! caller's *default* is what must fail closed.
+//! **Fail-closed contract:** an unparseable timestamp returns `None`, never a
+//! default instant; the caller decides what `None` means.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -33,9 +29,19 @@ pub fn parse_unix(raw: &str) -> Option<i64> {
     None
 }
 
+/// An RFC 3339 instant as `(unix seconds, nanoseconds)`, so two renderings of one
+/// instant (an offset or a fraction written differently) compare equal and two instants
+/// in the same second do not. `None` for empty, unparseable input and for Go's zero time
+/// (`0001-01-01T00:00:00Z`, "no instant").
+pub fn parse_instant(raw: &str) -> Option<(i64, u32)> {
+    const GO_ZERO: i64 = -62_135_596_800;
+    let dt = DateTime::parse_from_rfc3339(raw.trim()).ok()?;
+    let at = (dt.timestamp(), dt.timestamp_subsec_nanos());
+    (at != (GO_ZERO, 0)).then_some(at)
+}
+
 /// Format unix seconds as a plain ISO-8601 UTC string with a `Z` suffix and no
 /// fractional seconds — the wire `ts` format.
-/// The Clock seam supplies "now"; this only formats it.
 pub fn format_iso8601(unix: i64) -> String {
     DateTime::<Utc>::from_timestamp(unix, 0)
         .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is valid"))
@@ -79,9 +85,19 @@ mod tests {
     }
 
     #[test]
+    fn an_instant_compares_across_renderings_and_keeps_its_nanoseconds() {
+        let a = parse_instant("2026-11-01T10:00:00.123456789Z").unwrap();
+        let b = parse_instant("2026-11-01T05:00:00.123456789-05:00").unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, parse_instant("2026-11-01T10:00:00.123456788Z").unwrap());
+        assert_eq!(parse_instant("0001-01-01T00:00:00Z"), None);
+        assert_eq!(parse_instant(""), None);
+        assert_eq!(parse_instant("yesterday"), None);
+    }
+
+    #[test]
     fn garbage_is_none_fail_closed() {
-        // The fail-closed primitive: unparseable -> None, so the coordinator
-        // treats the request as already expired (never far-future).
+        // The fail-closed primitive: unparseable -> None (never far-future).
         assert_eq!(parse_unix("garbage"), None);
         assert_eq!(parse_unix("2026-07-03"), None); // date only, no time/offset
         assert_eq!(parse_unix("not a timestamp"), None);
