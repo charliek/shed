@@ -89,8 +89,9 @@ PATHS_SERVER=(
 # "every crate it links" is the rule. `desktop/tauri/src-tauri/Cargo.toml`
 # takes shed-core, shed-app, shed-lane, shed-roost, shed-craze and
 # shed-desktop-core as plain path-deps (shed-broker through shed-app's
-# `broker` feature), so a correctness fix in any of them is IN the shipped
-# DMG/.deb and must flag desktop. release-plan.sh and update-version.sh
+# `broker` feature; shed-provision and shed-provision-providers, plan 039,
+# through shed-desktop-core), so a correctness fix in any of them is IN the
+# shipped DMG/.deb and must flag desktop. release-plan.sh and update-version.sh
 # carry the same crates in their desktop lockstep dep lists.
 # (`shed-opencode` was retired in plan 038; `shed-gx`, plan 017's second
 # adapter, was retired in plan 025 C1 — shed#390.)
@@ -105,6 +106,8 @@ PATHS_DESKTOP=(
   crates/shedctl
   crates/shed-broker
   crates/shed-craze
+  crates/shed-provision
+  crates/shed-provision-providers
   crates/Cargo.toml
   crates/Cargo.lock
   crates/rust-toolchain.toml

@@ -26,6 +26,14 @@ pub mod shed_lanes;
 pub mod shutdown;
 pub mod slash;
 
+/// The provision contract's source side (plan 039): the documents, the
+/// answer builder and its preview, the five providers and `delivery.toml`.
+/// The runtime that answers a server's delivery stream builds on these.
+pub mod delivery {
+    pub use shed_provision as provision;
+    pub use shed_provision_providers as providers;
+}
+
 use std::sync::Arc;
 
 use serde_json::{json, Value};

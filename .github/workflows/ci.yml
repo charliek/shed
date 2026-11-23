@@ -87,6 +87,9 @@ jobs:
               - 'crates/shed-broker/src/bootstrap.rs'
             rust:
               - 'crates/**'
+              # the provision contract, which shed-provision's contract reader
+              # test reads (plan 039 A5); the Go side runs on the `go` filter.
+              - 'tests/provision-contract/**'
               # the craze pins (plan 025): a merged craze CI-test SHA and the
               # craze release the images bake, read by the craze-binaries
               # composite action and make check-craze-pin.
@@ -548,10 +551,12 @@ jobs:
         # zero tests silently. `test-support` is only on the crates that export
         # it (lane conformance, FakeRoost). shed-opencode was retired in plan 038.
         # shed-craze's recipe (real hub, SHED_CRAZE_REQUIRE) is the next step.
+        # shed-provision and shed-provision-providers (plan 039): the first's
+        # tests read tests/provision-contract/v1 from the checkout.
         run: |
-          cargo test -p shed-core -p shed-app -p shed-desktop-core --all-targets --locked
+          cargo test -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers --all-targets --locked
           cargo test -p shed-lane -p shed-roost --all-targets --features test-support --locked
-          cargo clippy -p shed-core -p shed-app -p shed-desktop-core --all-targets --locked -- -D warnings
+          cargo clippy -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers --all-targets --locked -- -D warnings
           cargo clippy -p shed-lane -p shed-roost --all-targets --features test-support --locked -- -D warnings
       # shed-craze (plan 025 C7) runs its recipe cells against the REAL craze
       # hub, craze-fake-host and craze-fake-agent, built here at the pinned

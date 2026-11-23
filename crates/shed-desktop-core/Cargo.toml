@@ -17,6 +17,11 @@ shed-craze = { path = "../shed-craze" }
 # Default features ONLY — never enable `broker` (keeps `shed-broker` and
 # `saphyr-parser` out of `shed-desktop-core` and default `shed-app`).
 shed-app = { path = "../shed-app" }
+# Plan 039: the source's answers are built from delivery.toml's providers
+# (the runtime that serves them is A6's). Neither crate reaches another
+# workspace crate but shed-provision.
+shed-provision = { path = "../shed-provision" }
+shed-provision-providers = { path = "../shed-provision-providers" }
 async-trait.workspace = true
 futures-util.workspace = true
 serde.workspace = true

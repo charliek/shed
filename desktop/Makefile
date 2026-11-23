@@ -227,6 +227,8 @@ tauri-test-linux: tauri-ui-build  ## Tauri crate cargo test on ubuntu:24.04 (Lin
 # shed-lane's machine_transport_contract test reads the shared contract at
 # <repo>/tests/machine-transport (CARGO_MANIFEST_DIR/../../tests/...), which is
 # /tests/machine-transport inside the container: mount it there, read-only.
+# shed-provision's contract reader reads <repo>/tests/provision-contract the
+# same way (plan 039), so it is mounted beside it.
 # `test-support` is on the crates that export it (lane conformance, FakeRoost,
 # the craze recipe harness). shed-craze's recipe cells skip here without
 # SHED_CRAZE_BIN_DIR; CI's core-linux job requires them.
@@ -235,13 +237,14 @@ core-linux:  ## Build+test the shared crates on Linux in Docker (ubuntu:24.04; r
 	docker run --rm \
 	  -v "$(REPO_ROOT)/crates:/work:ro" \
 	  -v "$(REPO_ROOT)/tests/machine-transport:/tests/machine-transport:ro" \
+	  -v "$(REPO_ROOT)/tests/provision-contract:/tests/provision-contract:ro" \
 	  -v shed-core-linux-target:/target \
 	  -v shed-core-linux-cargo:/usr/local/cargo/registry \
 	  -e CARGO_TARGET_DIR=/target \
 	  -w /work shed-core-linux:latest \
-	  bash -lc 'cargo test -p shed-core -p shed-app -p shed-desktop-core --all-targets --locked && \
+	  bash -lc 'cargo test -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers --all-targets --locked && \
 	            cargo test -p shed-lane -p shed-roost -p shed-craze --all-targets --features test-support --locked && \
-	            cargo clippy -p shed-core -p shed-app -p shed-desktop-core --all-targets --locked -- -D warnings && \
+	            cargo clippy -p shed-core -p shed-app -p shed-desktop-core -p shed-provision -p shed-provision-providers --all-targets --locked -- -D warnings && \
 	            cargo clippy -p shed-lane -p shed-roost -p shed-craze --all-targets --features test-support --locked -- -D warnings'
 
 # ---- test -------------------------------------------------------------

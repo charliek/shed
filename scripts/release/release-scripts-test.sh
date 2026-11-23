@@ -295,7 +295,7 @@ step "update-version.sh --components desktop lands all four surfaces + both lock
 grep -q '^version = "0.8.0"' "${SCRATCH}/crates/Cargo.toml" || fail "crates/Cargo.toml didn't bump"
 grep -q '^version = "0.8.0"' "${SCRATCH}/desktop/tauri/src-tauri/Cargo.toml" || fail "tauri Cargo.toml didn't bump"
 [ "$(jq -r '.version' "${SCRATCH}/desktop/tauri/src-tauri/tauri.conf.json")" = "0.8.0" ] || fail "tauri.conf.json didn't bump"
-for dep in shed-core shed-app shed-broker shed-lane shed-roost shed-desktop-core shed-craze; do
+for dep in shed-core shed-app shed-broker shed-lane shed-roost shed-desktop-core shed-craze shed-provision shed-provision-providers; do
   grep -A1 "^name = \"${dep}\"$" "${SCRATCH}/crates/Cargo.lock" | grep -q '^version = "0.8.0"' \
     || fail "crates/Cargo.lock ${dep} entry didn't refresh"
   grep -A1 "^name = \"${dep}\"$" "${SCRATCH}/desktop/tauri/src-tauri/Cargo.lock" | grep -q '^version = "0.8.0"' \
@@ -872,7 +872,9 @@ ok "desktop (absent from the EMPTY production NEVER_SHIPPED) still exits 1 with 
 # The loop is over the crates plan 038 added to the Tauri link set
 # (shed-lane, shed-roost, shed-desktop-core) plus shed-craze and shed-broker
 # (the credential broker the app embeds; plan 037: the app is the only
-# broker, so a broker fix ships only in the desktop). Each re-proves the
+# broker, so a broker fix ships only in the desktop), and plan 039's
+# shed-provision and shed-provision-providers (linked through
+# shed-desktop-core). Each re-proves the
 # same genericity by being ADDED to this list, not by a second copy of the
 # fixture. The assertion is desktop AND ONLY desktop, so a lazy "add it to the
 # server too" fix is red here.
@@ -884,7 +886,8 @@ gitf4() { git -C "${FIX4}" -c user.email=t@t -c user.name=t "$@"; }
 mkdir -p "${FIX4}/.claude-plugin" "${FIX4}/desktop" \
   "${FIX4}/crates/shed-lane/src" "${FIX4}/crates/shed-roost/src" \
   "${FIX4}/crates/shed-desktop-core/src" "${FIX4}/crates/shed-craze/src" \
-  "${FIX4}/crates/shed-broker/src"
+  "${FIX4}/crates/shed-broker/src" "${FIX4}/crates/shed-provision/src" \
+  "${FIX4}/crates/shed-provision-providers/src"
 printf '{"version": "3.0.0"}\n' > "${FIX4}/.claude-plugin/plugin.json"
 printf '3.0.0\n' > "${FIX4}/desktop/VERSION"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-lane/src/fold.rs"
@@ -892,6 +895,8 @@ printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-roost/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-desktop-core/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-craze/src/fold.rs"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-broker/src/fold.rs"
+printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-provision/src/fold.rs"
+printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-provision-providers/src/fold.rs"
 gitf4 add -A; gitf4 commit -q -m 'v3.0.0 base'
 gitf4 tag v3.0.0
 
@@ -901,7 +906,7 @@ run_reco4() {
   RECO_ERR="$(cat "${SCRATCH}/reco4.err")"
 }
 
-for adapter in shed-lane shed-roost shed-desktop-core shed-craze shed-broker; do
+for adapter in shed-lane shed-roost shed-desktop-core shed-craze shed-broker shed-provision shed-provision-providers; do
   step "recommend-components.sh: a ${adapter}-only change flags desktop (the Tauri app links it) and nothing else"
   printf 'pub fn fold() { /* changed */ }\n' > "${FIX4}/crates/${adapter}/src/fold.rs"
   gitf4 add -A; gitf4 commit -q -m "desktop: ${adapter} change"

@@ -22,6 +22,12 @@
 //!   normal, build, and dev dependencies).
 //! - No crate in `crates/` depends on `tauri`, `wry`, `tao`,
 //!   `webkit2gtk`, or `iced`.
+//! - `shed-provision` reaches no workspace crate; `shed-provision-providers`
+//!   reaches only `shed-provision`; neither reaches `saphyr-parser`,
+//!   `tokio` or `reqwest` (plan 039 §3.7). `shed-core`, `shed-lane`,
+//!   `shed-roost`, `shed-craze` and `shed-app` (default features) reach
+//!   neither, so shed-mobile's build is unchanged. All of these hold across
+//!   normal, build and dev edges.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -288,7 +294,51 @@ fn crate_isolation_invariants() {
         }
     }
 
-    // 8. `shed-roost` is the SOLE direct consumer of `roost-ipc` in `crates/`
+    // 8. The provision crates (plan 039 §3.7). Workspace crates are taken
+    //    from the metadata, so a crate added later is covered without an
+    //    edit here.
+    let workspace: Vec<&str> = packages
+        .iter()
+        .map(|p| p["name"].as_str().expect("pkg name"))
+        .collect();
+    for (pkg, allowed) in [
+        ("shed-provision", &[][..]),
+        ("shed-provision-providers", &["shed-provision"][..]),
+    ] {
+        let deps = resolved_deps(pkg, "normal,build,dev");
+        for member in &workspace {
+            if *member != pkg && !allowed.contains(member) {
+                assert!(
+                    !deps.contains(*member),
+                    "`{pkg}` must reach no workspace crate but {allowed:?}; found `{member}` (normal/build/dev)"
+                );
+            }
+        }
+        for forbidden in ["saphyr-parser", "tokio", "reqwest"] {
+            assert!(
+                !deps.contains(forbidden),
+                "`{pkg}` must not depend on `{forbidden}` (normal/build/dev)"
+            );
+        }
+    }
+    for pkg in ["shed-core", "shed-lane", "shed-roost", "shed-craze"] {
+        let deps = resolved_deps(pkg, "normal,build,dev");
+        for forbidden in ["shed-provision", "shed-provision-providers"] {
+            assert!(
+                !deps.contains(forbidden),
+                "`{pkg}` must not depend on `{forbidden}` (normal/build/dev; shed-mobile links it)"
+            );
+        }
+    }
+    let app_deps = resolved_default_deps("shed-app", "normal,build,dev");
+    for forbidden in ["shed-provision", "shed-provision-providers"] {
+        assert!(
+            !app_deps.contains(forbidden),
+            "`shed-app` (default features) must not depend on `{forbidden}` (normal/build/dev)"
+        );
+    }
+
+    // 9. `shed-roost` is the SOLE direct consumer of `roost-ipc` in `crates/`
     //    (across ALL dependency kinds: normal, build, AND dev).
     let mut roost_ipc_consumers: Vec<&str> = Vec::new();
     for pkg in packages {

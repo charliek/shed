@@ -17,6 +17,8 @@ shed-lane (pure leaf: no shed-core, reqwest, roost-ipc, or chrono)
    │       └── shed-app ── shed-desktop-core
    ├── shed-craze ────────────┘
    └── shed-roost (sole direct roost-ipc consumer) ──┘
+shed-provision (no workspace crate) ── shed-provision-providers
+       └──────────────────────────────────┴── shed-desktop-core
 shedctl (no internal deps)
 ```
 
@@ -95,6 +97,36 @@ shedctl (no internal deps)
   no `roost-ipc` outside `shed-roost`, no `reqwest`/`chrono`/`shed-core` in
   `shed-lane` or `shed-craze`, no `shed-broker`/`saphyr-parser` in default
   `shed-app`, no `tauri`/`iced`/direct `roost-ipc` in `shed-desktop-core`.
+  The same test holds plan 039's provision crates: `shed-provision` reaches no
+  workspace crate, `shed-provision-providers` only `shed-provision`, neither
+  `saphyr-parser`/`tokio`/`reqwest`, and `shed-core`, `shed-lane`,
+  `shed-roost`, `shed-craze` and default `shed-app` reach neither (shed-mobile
+  links those).
+- **`shed-provision`** (plan 039) — the source side of the provision contract
+  `tests/provision-contract/v1/`: the documents and every rule that judges
+  them, matching `internal/delivery` rule for rule and in order (requests,
+  answers, records; printable = Go's `unicode.IsPrint`, from a table
+  `gen/printable.go` generates with Go), the stream's SSE framing, the
+  `Provider` and `Reader` traits, the `only` rules, the answer builder (git
+  config merge, conflicting and nested targets, limits), keyed fingerprints and
+  the redacted `Preview`. No file or process access of its own: providers read
+  through a `Reader`. Its `contract_tests` module reads every fixture and the
+  manifest (so `make -C desktop core-linux` mounts `tests/provision-contract`).
+  Default member.
+- **`shed-provision-providers`** (plan 039) — the five providers (`ssh-key`,
+  `github`, `api-keys`, `envsecrets-login`, `files`) and `delivery.toml`
+  (`~/.config/shed/delivery.toml`, walked against its schema as `toml`'s
+  spanned document; schema in `src/settings.rs`). A settings error is fixed
+  text with a line, column and schema key path, never the file's text. No YAML
+  parser: the envsecrets config's two flat keys are read with a strict line
+  pattern. A `.pub` is exactly one key line, re-written, and must match the
+  private key (OpenSSH, or derived from PEM/PKCS#8 RSA, ECDSA, DSA). Problem
+  messages are fixed text, never a value or a command's output. The `Reader`
+  follows links on purpose; its docs say what a disk reader must do (open
+  non-blocking, check the opened descriptor is a regular file, read at most
+  the limit). Default member. `shed-desktop-core` depends on
+  both (re-exported as `shed_desktop_core::delivery`); the runtime that answers
+  a server's delivery stream is plan 039 A6's.
 - **The opencode adapter crate was removed in plan 038.** Craze is the only agent lane.
   An opencode roost tab still renders as a passive status row (`RcKind::Opencode`);
   interactive opencode sessions belong to the `roost` app.

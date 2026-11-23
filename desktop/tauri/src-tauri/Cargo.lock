@@ -4483,6 +4483,8 @@ dependencies = [
  "shed-core",
  "shed-craze",
  "shed-lane",
+ "shed-provision",
+ "shed-provision-providers",
  "shed-roost",
  "tokio",
  "tracing",
@@ -4532,6 +4534,25 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "shed-provision"
+version = "0.10.1"
+dependencies = [
+ "base64 0.22.1",
+ "hmac 0.12.1",
+ "serde",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "shed-provision-providers"
+version = "0.10.1"
+dependencies = [
+ "base64 0.22.1",
+ "shed-provision",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
