@@ -4977,3 +4977,22 @@ def test_connect_line_example_in_the_configuration_reference():
     assert len(examples) == 1, examples
     ex = examples[0]
     assert auditlog.connect_entry_problems(ex, shed=ex["shed"], owner="build-1", admin=True, user="pat", port=8080) == []
+
+
+@pytest.mark.parametrize("seq", [_DROP, 1, 42, 10**12])
+def test_audit_lines_take_seq_or_none(seq):
+    """A server that writes the lifecycle and delivery events puts the log's
+    counter, `seq`, on every line; an older one writes none. Either is what
+    the server writes."""
+    line = _ssh_line(seq=seq)
+    assert auditlog.ssh_entry_problems(line, shed="itest-svc-1", owner="itest", channel="exec") == []
+    line = _connect_line(seq=seq)
+    assert auditlog.connect_entry_problems(line, shed="itest-svc-1", owner="itest") == []
+
+
+@pytest.mark.parametrize("seq", [0, -1, True, "3", 1.5, None])
+def test_audit_lines_refuse_a_bad_seq(seq):
+    problems = auditlog.ssh_entry_problems(_ssh_line(seq=seq), shed="itest-svc-1", owner="itest", channel="exec")
+    assert any("seq is" in p for p in problems), problems
+    problems = auditlog.connect_entry_problems(_connect_line(seq=seq), shed="itest-svc-1", owner="itest")
+    assert any("seq is" in p for p in problems), problems

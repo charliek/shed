@@ -41,6 +41,7 @@ var recordRoutes = []string{
 
 // notRecordRoutes return no shed record.
 var notRecordRoutes = []string{
+	"GET /api/activity",
 	"GET /api/delivery/requests",
 	"POST /api/delivery/requests/{id}",
 	"GET /api/info",

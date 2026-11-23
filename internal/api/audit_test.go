@@ -68,7 +68,8 @@ func readAuditLines(path string, maxLine int) ([]map[string]any, error) {
 	return out, nil
 }
 
-// auditLines reads every line of the audit log, split by event.
+// auditLines reads the lines of the audit log of the older kinds, split by
+// event (the lifecycle and delivery events are left out).
 func auditLines(t *testing.T, path string) (api, execEnd, other []map[string]any) {
 	t.Helper()
 	lines, err := readAuditLines(path, auditTestMaxLine)
@@ -76,6 +77,10 @@ func auditLines(t *testing.T, path string) (api, execEnd, other []map[string]any
 		t.Fatal(err)
 	}
 	for _, m := range lines {
+		if ev, _ := m["event"].(string); audit.IsShedEventKind(ev) {
+			// The lifecycle and delivery events (activity_test.go).
+			continue
+		}
 		switch m["event"] {
 		case audit.EventAPI:
 			api = append(api, m)
@@ -389,7 +394,8 @@ func TestAuditExecEndOutcomes(t *testing.T) {
 			}}
 			s := newExecTestServer(b, nil)
 			if tt.argvFull {
-				s.cfg.Audit = &config.AuditConfig{Enabled: true, ExecArgv: config.AuditExecArgvFull}
+				on := true
+				s.cfg.Audit = &config.AuditConfig{Enabled: &on, ExecArgv: config.AuditExecArgvFull}
 			}
 			path := attachTestAudit(t, s)
 			postExec(t, s, "box", tt.req)

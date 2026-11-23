@@ -1806,9 +1806,14 @@ type ExecConfig struct {
 // AuditConfig turns on and shapes shed-server's audit log (<state>/audit.jsonl).
 // The log is on whenever auth.clients is set, whatever Enabled says.
 type AuditConfig struct {
-	// Enabled turns the audit log on for a server with no service clients
-	// (it then records HTTPS execs; admin API requests are never logged).
-	Enabled bool `yaml:"enabled,omitempty"`
+	// Enabled is the audit log's switch for a server with no service
+	// clients (auth.clients always turns it on). true turns it on and
+	// requires it: a server that cannot open it does not start. false
+	// turns it off. Unset leaves the default: on in mtls mode, where a
+	// server that cannot open it logs a warning and starts without it;
+	// off in open mode. With the log on, HTTPS execs and the shed lifecycle
+	// and delivery events are recorded (admin API requests never are).
+	Enabled *bool `yaml:"enabled,omitempty"`
 	// ExecArgv is "" (the default: an exec.end line records argv[0] and the
 	// argument count) or "full" (the whole argv, which may carry prompts or
 	// secrets).

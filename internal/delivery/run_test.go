@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/delivery/deliverytest"
 )
@@ -633,4 +636,91 @@ func (c *cancelOnClone) Clone(ctx context.Context, provision bool) delivery.Step
 func jsonOf(v any) (string, error) {
 	b, err := json.Marshal(v)
 	return string(b), err
+}
+
+// auditLines attaches an audit log to svc and returns a reader of its
+// lines, raw.
+func auditLines(t *testing.T, svc *delivery.Service) func() []string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), audit.FileName)
+	l, err := audit.Open(path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	svc.SetAuditLog(l)
+	return func() []string {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Split(strings.TrimSpace(string(raw)), "\n")
+	}
+}
+
+// TestRunWritesItsAuditEvent: every run writes one delivery event: the
+// shed by name, id and user, who caused it (the actor on its context), and
+// the record as last saved, with the items' names, results and fingerprints
+// and never a value. A run that ended early is marked interrupted.
+func TestRunWritesItsAuditEvent(t *testing.T) {
+	src, svc := source(t, 5*time.Second)
+	src.Set("alice", deliverytest.Answer, canned)
+	lines := auditLines(t, svc)
+	alice := audit.UserIdentity("alice", false, false, false, "SHA256:k", "")
+	if _, err := createRun(svc, newHost(), &progress{}).Execute(audit.WithActor(context.Background(), alice)); err != nil {
+		t.Fatal(err)
+	}
+	got := lines()
+	if len(got) != 1 {
+		t.Fatalf("lines = %v", got)
+	}
+	if strings.Contains(got[0], sentinel) {
+		t.Fatalf("the event carries a delivered value: %s", got[0])
+	}
+	var ev audit.DeliveryEvent
+	if err := json.Unmarshal([]byte(got[0]), &ev); err != nil {
+		t.Fatal(err)
+	}
+	d := ev.Delivery
+	if ev.Event != audit.EventDelivery || ev.Identity.User != "alice" || ev.Identity.Subject != "SHA256:k" ||
+		ev.Shed != "widgets" || ev.ShedID != "abcdefghijklmnopqrstuvwxyz" || ev.ShedUser != "alice" || ev.ShedOwner != "" {
+		t.Errorf("event = %+v", ev)
+	}
+	if d.Reason != "create" || d.State != "delivered" || d.Outcome != "accepted" || d.Interrupted || d.Steps == nil || d.Steps.Install.State != "done" {
+		t.Errorf("outcome = %+v", d)
+	}
+	if d.Source == nil || d.Source.MachineID == "" {
+		t.Errorf("no source machine: %+v", d)
+	}
+	if len(d.Items) != 3 || d.Items[0].Name != "ssh-key" || d.Items[0].Result != "ok" || d.Items[0].Kind != "file" {
+		t.Errorf("items = %+v", d.Items)
+	}
+
+	// Ended early: interrupted, with what was saved; no actor on the
+	// context and no owner: unknown.
+	h := newHost()
+	h.stepErr, h.stepErrAt = errors.New("the shed went"), 2
+	if _, err := createRun(svc, h, &progress{}).Execute(context.Background()); err == nil {
+		t.Fatal("the run did not end")
+	}
+	got = lines()
+	_ = json.Unmarshal([]byte(got[1]), &ev)
+	if !ev.Delivery.Interrupted || ev.Delivery.Steps == nil || ev.Delivery.Steps.Stage1.State != "done" || ev.Delivery.Steps.Clone.State != "owed" ||
+		ev.Identity.Kind != audit.KindUnknown {
+		t.Errorf("interrupted run's event = %+v", ev)
+	}
+
+	// A service client's shed: not applicable, the client named as the
+	// owner and, with no actor on the context, as the one who caused it.
+	r := createRun(svc, newHost(), &progress{})
+	r.Params = delivery.Params{Owner: "ci", ServiceClient: true, Shed: shed("built")}
+	if _, err := r.Execute(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got = lines()
+	ev = audit.DeliveryEvent{}
+	_ = json.Unmarshal([]byte(got[2]), &ev)
+	if ev.ShedOwner != "ci" || ev.ShedUser != "" || ev.Identity.Kind != audit.KindClient || ev.Identity.Name != "ci" || ev.Delivery.State != "not_applicable" {
+		t.Errorf("a client's shed's event = %+v", ev)
+	}
 }

@@ -56,6 +56,11 @@ const (
 	// finishes its owed steps, and a source holds GET /api/delivery/requests.
 	// Advertised by a server whose backend can provision.
 	FeatureDelivery = "delivery"
+	// FeatureActivity signals GET /api/activity: the audit log's shed
+	// lifecycle and delivery events, newest first, paged by an opaque
+	// cursor, as the caller may see them. Advertised when the server's
+	// audit log is open (without it the route answers an empty page).
+	FeatureActivity = "activity"
 )
 
 // serverFeatures returns the feature-token set as a fresh slice, so the
@@ -78,6 +83,9 @@ func (s *Server) serverFeatures() []string {
 	}
 	if _, ok := backend.AsProvisioner(s.backend); ok {
 		features = append(features, FeatureDelivery)
+	}
+	if s.audit != nil {
+		features = append(features, FeatureActivity)
 	}
 	return features
 }

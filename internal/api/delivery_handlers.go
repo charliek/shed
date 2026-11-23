@@ -61,7 +61,12 @@ const errDeliveryDisabled = "DELIVERY_DISABLED"
 // SetDelivery attaches the delivery service the delivery routes hand
 // answers to. shed-server calls it once at start-up; without it the routes
 // answer 503.
-func (s *Server) SetDelivery(svc *delivery.Service) { s.delivery = svc }
+func (s *Server) SetDelivery(svc *delivery.Service) {
+	s.delivery = svc
+	if s.audit != nil {
+		svc.SetAuditLog(s.audit)
+	}
+}
 
 // isDeliveryPath reports whether path is under the delivery transport
 // (/api/delivery*), which requires a credentials-scoped credential, as the

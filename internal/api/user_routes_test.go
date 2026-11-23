@@ -379,6 +379,7 @@ func doRouteAs(h http.Handler, fp, route, method, path, body string) apiResp {
 // A route added to Router() fails TestUserRouteWalk until it is classified.
 var userRouteClasses = map[string]string{
 	"GET /api/info":                                   "any",
+	"GET /api/activity":                               "any",
 	"GET /api/ssh-host-key":                           "any",
 	"GET /api/sessions":                               "any",
 	"GET /api/overview":                               "any",
@@ -474,6 +475,7 @@ func routeRequest(route string) (method, path, body string) {
 // the walk also checks that the dial reached the backend.
 var userRouteAllowed = map[string]int{
 	"GET /api/info":                                   http.StatusOK,
+	"GET /api/activity":                               http.StatusOK,
 	"GET /api/ssh-host-key":                           http.StatusOK,
 	"GET /api/sessions":                               http.StatusOK,
 	"GET /api/overview":                               http.StatusOK,

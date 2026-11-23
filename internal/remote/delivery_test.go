@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/delivery"
 	"github.com/charliek/shed/internal/delivery/deliverytest"
@@ -536,5 +539,40 @@ func TestRemoteProvisionEndsWhenTheUserChanges(t *testing.T) {
 	}
 	if len(g.agent.Writes()) != writes {
 		t.Fatal("the answer was written for a shed that changed hands")
+	}
+}
+
+// TestRemoteCreateDeliveryEventNamesTheCreator: the create job runs after
+// the request has returned, on the backend's own context; its delivery event
+// still names who made the create (the actor the guard put on the request)
+// and the shed by its id.
+func TestRemoteCreateDeliveryEventNamesTheCreator(t *testing.T) {
+	e, _, _ := deliveryEnv(t)
+	path := filepath.Join(t.TempDir(), audit.FileName)
+	l, err := audit.Open(path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	e.b.deliverySvc.SetAuditLog(l)
+	creator := audit.UserIdentity("", true, true, false, "SHA256:k", "2a")
+	if _, err := e.b.CreateShed(audit.WithActor(ctxT(t), creator), config.CreateShedRequest{Name: "box", Repo: testRepo}); err != nil {
+		t.Fatal(err)
+	}
+	sh := e.settled("box")
+	if sh.Status != config.StatusRunning {
+		t.Fatalf("settled %q", sh.Status)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ev audit.DeliveryEvent
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &ev); err != nil {
+		t.Fatalf("%v: %s", err, raw)
+	}
+	if ev.Event != audit.EventDelivery || !ev.Identity.Implicit || ev.Identity.Subject != "SHA256:k" || ev.ShedID != sh.ID || ev.Shed != "box" ||
+		ev.Delivery.Reason != "create" || ev.Delivery.State != string(delivery.StateDelivered) {
+		t.Errorf("event = %+v", ev)
 	}
 }

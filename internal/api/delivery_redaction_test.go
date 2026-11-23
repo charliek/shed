@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -41,8 +42,10 @@ import (
 // API response are searched for them. Only the shed (the fake agent) may
 // hold them.
 //
-// redactionSurfaces lists what is searched; A4 adds its audit events and
-// the activity route's answers to it.
+// redactionSurfaces lists what is searched. The audit log is one of the
+// state directory's files: each of those deliveries writes its event there
+// (the test checks they did), and the activity route's answers, which read
+// the events back, are among the API responses.
 
 // redactionSentinels are the delivered values: a file's content and an env
 // value, each also searched in the forms it travels in.
@@ -441,6 +444,45 @@ func TestDeliveryRedaction(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(stateDir, audit.FileName)); err != nil {
 		t.Fatalf("the audit log is not where it is searched: %v", err)
+	}
+	// Each delivery wrote its event: the create, the provisions, the failed
+	// write, the malformed reply and the refused answer, and the last
+	// provision with the source gone.
+	lines, err := readAuditLines(filepath.Join(stateDir, audit.FileName), auditTestMaxLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reasons []string
+	kinds := map[string]int{}
+	for _, l := range lines {
+		ev, _ := l["event"].(string)
+		kinds[ev]++
+		if ev != audit.EventDelivery {
+			continue
+		}
+		d, _ := l["delivery"].(map[string]any)
+		failure := ""
+		if f, ok := d["failure"].(map[string]any); ok {
+			failure, _ = f["reason"].(string)
+		}
+		reasons = append(reasons, fmt.Sprintf("%v/%v/%s", d["reason"], d["outcome"], failure))
+	}
+	wantReasons := []string{
+		"create/accepted/", "provision/accepted/", "provision/accepted/write_failed", "provision/accepted/write_failed",
+		"provision/refused/answer_refused", "provision/no_answer/source_offline",
+	}
+	if !slices.Equal(reasons, wantReasons) {
+		t.Errorf("delivery events = %v, want %v", reasons, wantReasons)
+	}
+	if kinds[audit.EventShedCreate] != 1 || kinds[audit.EventProvisionStart] != 5 || kinds[audit.EventProvisionEnd] != 5 {
+		t.Errorf("lifecycle events = %v", kinds)
+	}
+	// The activity route reads them back (the implicit user sees all).
+	for _, q := range []string{"", "?shed=widgets", "?limit=1", "?limit=500"} {
+		var page ActivityResponse
+		if err := json.Unmarshal([]byte(call(http.MethodGet, "/api/activity"+q, "", false)), &page); err != nil || len(page.Events) == 0 {
+			t.Fatalf("GET /api/activity%s: %+v %v", q, page, err)
+		}
 	}
 	// The delivered config's failure is reported with its line only.
 	if !strings.Contains(logs.String(), "did not load (it does not parse), at line 1") {

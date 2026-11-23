@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/delivery"
@@ -204,6 +205,7 @@ func (b *Backend) CreateShed(ctx context.Context, req config.CreateShedRequest) 
 	j := b.newJobLocked(state.JobCreate, req.Name, id)
 	j.repoURL = repoURL
 	j.deliver, j.scriptKey = true, req.ScriptKey
+	j.actor, j.hasActor = audit.ActorFrom(ctx)
 	j.fastWindow = true
 	first := b.shedOf(rec)
 	b.mu.Unlock()

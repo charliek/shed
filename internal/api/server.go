@@ -58,6 +58,9 @@ type Server struct {
 
 	// audit is the audit log (nil: off). See audit.go.
 	audit *audit.Log
+	// activityScan is how many lines one page of GET /api/activity looks
+	// at (0: activityBudget's). A test seam.
+	activityScan int
 	// connects holds each person's Connect into a service client's shed
 	// from just before its guarded dial until its connect line is written
 	// (or it failed): DrainEntries waits for them (connect.go).
@@ -259,6 +262,10 @@ func (s *Server) Router() chi.Router {
 		// Users: where they come from and, on a directory server, the
 		// state of its list (admin only; control scope).
 		r.Get("/users/status", s.handleUsersStatus)
+
+		// Activity: the audit log's lifecycle and delivery events, as the
+		// caller may see them (control scope; every caller, filtered).
+		r.Get("/activity", s.handleActivity)
 
 		// Credential sources: which of a user's machines answers their
 		// credential requests, and moving that (control scope: outside

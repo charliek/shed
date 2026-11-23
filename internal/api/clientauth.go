@@ -31,6 +31,9 @@ var clientAllowedRoutes = map[string]bool{
 	"POST /api/sheds/{name}/start": true,
 	"POST /api/sheds/{name}/stop":  true,
 	"POST /api/sheds/{name}/exec":  true,
+	// The activity feed: the handler shows a client its own sheds' events
+	// only (plan 039 §3.9).
+	"GET /api/activity": true,
 }
 
 // normalizeRoutePattern drops a trailing "/" from a chi route pattern (but

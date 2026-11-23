@@ -76,6 +76,9 @@ type Run struct {
 	Report  Progress
 	// Now is the clock; nil is time.Now.
 	Now func() time.Time
+
+	// saved is the record as last saved, for the run's audit event.
+	saved *Record
 }
 
 // Execute runs the delivery and returns the record as last saved. Each step
@@ -86,7 +89,16 @@ type Run struct {
 //
 // The bundle is asked for once, before stage 1, held in memory until stage
 // 2 is written or skipped, and then dropped. It is never saved or logged.
+//
+// Every run, however it ends, writes one delivery event to the service's
+// audit log (auditRun): the record as last saved, never a value.
 func (r *Run) Execute(ctx context.Context) (*Record, error) {
+	rec, err := r.execute(ctx)
+	r.auditRun(ctx, err)
+	return rec, err
+}
+
+func (r *Run) execute(ctx context.Context) (*Record, error) {
 	rec := r.Prior.Clone()
 	if rec == nil {
 		rec = &Record{}
@@ -316,7 +328,11 @@ func (r *Run) save(ctx context.Context, rec *Record) error {
 		log.Printf("delivery: the record for shed %q does not hold to the contract and is not saved: %v", r.Params.Shed.Name, err)
 		return fmt.Errorf("delivery record for shed %q: %w", r.Params.Shed.Name, err)
 	}
-	return r.Host.Save(ctx, rec.Clone())
+	if err := r.Host.Save(ctx, rec.Clone()); err != nil {
+		return err
+	}
+	r.saved = rec.Clone()
+	return nil
 }
 
 // attempt reports whether a step that is not stage 1 is tried: when it is

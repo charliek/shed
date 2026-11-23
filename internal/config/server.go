@@ -325,13 +325,29 @@ func (c *ServerConfig) validateDelivery() error {
 	return nil
 }
 
-// AuditEnabled reports whether the audit log is on: auth.clients is set, or
-// audit.enabled is true.
+// AuditEnabled reports whether the audit log is on: auth.clients is set,
+// audit.enabled is true, or, by default, the server is in mtls mode and
+// audit.enabled is not false.
 func (c *ServerConfig) AuditEnabled() bool {
+	if c.AuditRequired() {
+		return true
+	}
+	if c.Audit != nil && c.Audit.Enabled != nil {
+		return false // audit.enabled: false
+	}
+	return c.MTLSMode()
+}
+
+// AuditRequired reports whether the audit log is on by more than the mtls
+// default (auth.clients is set, or audit.enabled is true), so a server that
+// cannot open it must not start. A log on only by default is not required:
+// such a server warns and starts without it, as a server that starts today
+// still starts.
+func (c *ServerConfig) AuditRequired() bool {
 	if c.Auth != nil && len(c.Auth.Clients) > 0 {
 		return true
 	}
-	return c.Audit != nil && c.Audit.Enabled
+	return c.Audit != nil && c.Audit.Enabled != nil && *c.Audit.Enabled
 }
 
 // AuditExecArgvFull reports whether exec.end lines record the whole argv

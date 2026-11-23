@@ -545,20 +545,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// The audit log (service client requests, HTTPS execs, max_age reaps, a
-	// person's entries into service clients' sheds), next to the egress
-	// audit log in the backend's state directory. On when auth.clients is
-	// set or audit.enabled; a server that needs it and can't open it does
-	// not start. Once serving, runFrontDoors closes it, after every server
-	// has drained; this close (a no-op then) is for a return before that.
-	var auditLog *audit.Log
-	if cfg.AuditEnabled() {
-		auditPath := filepath.Join(egressStateDir, audit.FileName)
-		auditLog, err = audit.Open(auditPath, audit.DefaultMaxBytes, audit.DefaultKeep)
-		if err != nil {
-			return fmt.Errorf("audit: open %s: %w", auditPath, err)
-		}
+	// person's entries into service clients' sheds, the shed lifecycle and
+	// delivery events), next to the egress audit log in the backend's state
+	// directory (openAuditLog). Once serving, runFrontDoors closes it, after
+	// every server has drained; this close (a no-op then) is for a return
+	// before that.
+	auditLog, err := openAuditLog(cfg, egressStateDir, log.Printf)
+	if err != nil {
+		return err
+	}
+	if auditLog != nil {
 		defer func() { _ = auditLog.Close() }()
-		log.Printf("Audit log: %s", auditPath)
 	}
 
 	// Initialize HTTP API server
@@ -1132,10 +1129,34 @@ func sshKeyAuth(l userSource) sshd.KeyAuth {
 	}
 }
 
+// openAuditLog opens the server's audit log in dir when cfg turns it on
+// (config.ServerConfig.AuditEnabled), and returns nil when it is off. A log
+// that is required (auth.clients, or audit.enabled: true) and cannot be
+// opened is an error: the server does not start. A log on only by the mtls
+// default that cannot be opened is a warning (through logf), and the server
+// starts without it, as it would have before the default.
+func openAuditLog(cfg *config.ServerConfig, dir string, logf func(format string, args ...any)) (*audit.Log, error) {
+	if !cfg.AuditEnabled() {
+		return nil, nil
+	}
+	path := filepath.Join(dir, audit.FileName)
+	l, err := audit.Open(path, audit.DefaultMaxBytes, audit.DefaultKeep)
+	if err != nil {
+		if cfg.AuditRequired() {
+			return nil, fmt.Errorf("audit: open %s: %w", path, err)
+		}
+		logf("WARNING: audit: the audit log %s, on by default in mtls mode, could not be opened (%v): starting without it, so no events are recorded and the activity feed is empty. audit.enabled: true makes it required; audit.enabled: false turns it off.", path, err)
+		return nil, nil
+	}
+	logf("Audit log: %s", path)
+	return l, nil
+}
+
 // attachAuditLog hands the one audit log to both front doors: the API server
-// (service client requests, HTTPS execs, max_age reaps) and the SSH server (a
-// person's entry into a service client's shed). Called before either serves.
-// A nil log (audit off) records nothing on either.
+// (service client requests, HTTPS execs, max_age reaps; and, through it, the
+// access guard's lifecycle events and the delivery service's events) and the
+// SSH server (a person's entry into a service client's shed). Called before
+// either serves. A nil log (audit off) records nothing on either.
 func attachAuditLog(l *audit.Log, apiServer *api.Server, sshServer *sshd.Server) {
 	apiServer.SetAuditLog(l)
 	sshServer.SetAuditLog(l)

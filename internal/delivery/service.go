@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
+
+	"github.com/charliek/shed/internal/audit"
 )
 
 // Service is the server's delivery: it asks a person's source for a shed's
@@ -21,6 +24,17 @@ type Service struct {
 	pin     Pin
 	timeout time.Duration
 	table   *table
+	// audit is the server's audit log, where each run's outcome is written
+	// (nil: none).
+	audit atomic.Pointer[audit.Log]
+}
+
+// SetAuditLog attaches the server's audit log: every run then writes its
+// outcome there (a delivery event). nil writes none.
+func (s *Service) SetAuditLog(l *audit.Log) {
+	if s != nil {
+		s.audit.Store(l)
+	}
 }
 
 // NewService returns a Service over pin that waits up to timeout for a
@@ -47,6 +61,10 @@ type Params struct {
 	// (name, permanent id, backend, and repo, local_dir and project_dir
 	// when it has them).
 	Shed RequestShed
+
+	// Owner is the service client that owns the shed ("" for a person's).
+	// It is not sent: the run's audit event names it (whose the shed was).
+	Owner string
 
 	// What makes a delivery not applicable (section 3.2 of the plan): a
 	// shed created by a service client, a create called with a script key,

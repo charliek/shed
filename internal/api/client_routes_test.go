@@ -35,6 +35,9 @@ var clientAllowedList = []string{
 	"POST /api/sheds/{name}/start",
 	"POST /api/sheds/{name}/stop",
 	"POST /api/sheds/{name}/exec",
+	// The activity feed: a client sees its own sheds' events (plan 039
+	// §3.9; TestActivityVisibility).
+	"GET /api/activity",
 }
 
 // clientForbiddenList is every other registered route, listed by hand. A

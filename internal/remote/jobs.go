@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/remote/guest"
@@ -69,6 +70,11 @@ type job struct {
 	// create's (no request for a script key's shed).
 	deliver   bool
 	scriptKey bool
+	// actor is who made the create (the access guard's actor on the
+	// request), for the delivery's audit event; hasActor says there was
+	// one. Never stored, like deliver.
+	actor    audit.Identity
+	hasActor bool
 
 	// fastWindow and fastErr are guarded by Backend.mu. While fastWindow is
 	// true the create handler has not answered yet, and a failure is its to

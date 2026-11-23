@@ -160,7 +160,7 @@ func (r *LocalRun) Run(ctx context.Context) (*config.Shed, error) {
 		Service: r.svc,
 		Reason:  r.reason,
 		Params: delivery.Params{
-			User: user, Shed: ls.Request, ServiceClient: ls.Shed.Owner != "",
+			User: user, Shed: ls.Request, Owner: ls.Shed.Owner, ServiceClient: ls.Shed.Owner != "",
 			ScriptKey: r.scriptKey, FromSnapshot: r.fromSnapshot,
 		},
 		HasRepo:     ls.Repo != "",

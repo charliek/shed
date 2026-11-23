@@ -216,6 +216,11 @@ func TestMTLSMiddlewareScopeParity(t *testing.T) {
 		// credentials (a source cannot cause a delivery).
 		{"provision, control cert", "POST", "/api/sheds/box/provision", ctl, 200},
 		{"provision, credentials cert forbidden", "POST", "/api/sheds/box/provision", cred, 403},
+		// The activity feed is the control plane's: a source's credentials
+		// certificate does not read it.
+		{"activity, control cert", "GET", "/api/activity", ctl, 200},
+		{"activity, credentials cert forbidden", "GET", "/api/activity", cred, 403},
+		{"activity, no cert", "GET", "/api/activity", nil, 401},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/charliek/shed/internal/audit"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/delivery"
@@ -58,6 +59,9 @@ func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, ag
 	if repo == "" {
 		repo = rec.Shed.Repo
 	}
+	if j.hasActor {
+		ctx = audit.WithActor(ctx, j.actor)
+	}
 	owner, user := ownership(rec)
 	h := &remoteHost{
 		b: b, name: j.name, id: j.id, agent: agent, rec: rec, owner: owner, user: user,
@@ -67,7 +71,7 @@ func (b *Backend) createSteps(ctx context.Context, j *job, rec *state.Record, ag
 		Service: b.deliverySvc,
 		Reason:  delivery.ReasonCreate,
 		Params: delivery.Params{
-			User: user, Shed: requestShed(rec), ServiceClient: owner != "", ScriptKey: j.scriptKey,
+			User: user, Shed: requestShed(rec), Owner: owner, ServiceClient: owner != "", ScriptKey: j.scriptKey,
 		},
 		HasRepo:     rec.Shed.Repo != "",
 		NoProvision: rec.NoProvision,
@@ -154,7 +158,7 @@ func (r *remoteRun) Run(ctx context.Context) (*config.Shed, error) {
 		Service: b.deliverySvc,
 		Reason:  delivery.ReasonProvision,
 		Params: delivery.Params{
-			User: user, Shed: requestShed(rec), ServiceClient: owner != "",
+			User: user, Shed: requestShed(rec), Owner: owner, ServiceClient: owner != "",
 		},
 		HasRepo:     rec.Shed.Repo != "",
 		NoProvision: rec.NoProvision,
