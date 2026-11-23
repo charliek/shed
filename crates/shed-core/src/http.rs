@@ -1082,13 +1082,40 @@ impl Client {
     /// `GET /api/sheds` -> sheds stamped with this host's config name (the server
     /// omits `host`; the client stamps it).
     pub async fn list_sheds(&self) -> Result<Vec<Shed>, ShedError> {
-        let list: ShedList = self.get_json(&["api", "sheds"], &[]).await?;
+        Ok(self
+            .list_sheds_with_delivery()
+            .await?
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect())
+    }
+
+    /// [`list_sheds`](Self::list_sheds), each shed beside its `delivery` record (plan
+    /// 039 §3.6) as the server sent it: an object, else `None` (a server older than
+    /// delivery sends none). Undecoded: the record is read by the clients, and an
+    /// admin looking at another user's shed is sent its `state` alone.
+    pub async fn list_sheds_with_delivery(
+        &self,
+    ) -> Result<Vec<(Shed, Option<serde_json::Value>)>, ShedError> {
+        let raw: serde_json::Value = self.get_json(&["api", "sheds"], &[]).await?;
+        let records: Vec<Option<serde_json::Value>> = raw
+            .get("sheds")
+            .and_then(serde_json::Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| r.get("delivery").filter(|d| d.is_object()).cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let list: ShedList =
+            serde_json::from_value(raw).map_err(|e| ShedError::Decode(e.to_string()))?;
         Ok(list
             .sheds
             .into_iter()
-            .map(|mut s| {
+            .zip(records.into_iter().chain(std::iter::repeat(None)))
+            .map(|(mut s, d)| {
                 s.host = self.server_name.clone();
-                s
+                (s, d)
             })
             .collect())
     }
@@ -2077,6 +2104,31 @@ mod tests {
         assert_eq!(sheds.len(), 1);
         assert_eq!(sheds[0].name, "hello-world");
         assert_eq!(sheds[0].host, "mini2"); // stamped by the client
+    }
+
+    #[tokio::test]
+    async fn list_sheds_carry_each_delivery_record() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds");
+                t.status(200).body(
+                    r#"{"sheds":[
+                        {"name":"a","status":"running","delivery":{"state":"partial","owed":["install"]}},
+                        {"name":"b","status":"stopped"},
+                        {"name":"c","status":"running","delivery":"delivered"},
+                        {"name":"d","status":"running","delivery":{"state":"delivered"}}]}"#,
+                );
+            })
+            .await;
+        let got = client(&server).list_sheds_with_delivery().await.unwrap();
+        let names: Vec<_> = got.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "d"]);
+        assert!(got.iter().all(|(s, _)| s.host == "mini2"));
+        assert_eq!(got[0].1.as_ref().unwrap()["owed"][0], "install");
+        assert_eq!(got[1].1, None, "an older server sends no record");
+        assert_eq!(got[2].1, None, "a record that is not an object is none");
+        assert_eq!(got[3].1.as_ref().unwrap()["state"], "delivered");
     }
 
     #[tokio::test]

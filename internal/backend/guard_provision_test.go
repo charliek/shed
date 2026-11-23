@@ -2,7 +2,9 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,6 +98,9 @@ func TestShownWithWithholdsTheDeliveryRecord(t *testing.T) {
 	if own.Delivery == nil || len(own.Delivery.Items) != 1 || own.Delivery.Last == nil || len(own.Delivery.Owed) != 2 {
 		t.Fatalf("the user's own view = %+v, want the whole record", own.Delivery)
 	}
+	if own.Delivery.Withheld {
+		t.Fatal("the user's own view is marked withheld")
+	}
 
 	other, err := g.GetShed(as(root), "box")
 	if err != nil {
@@ -107,6 +112,22 @@ func TestShownWithWithholdsTheDeliveryRecord(t *testing.T) {
 	}
 	if d.Steps != nil || d.Last != nil || d.Items != nil || d.Owed != nil || d.Expired != nil {
 		t.Fatalf("an admin's view of another user's shed carries more than its state: %+v", d)
+	}
+	// It says so, whatever the state: a state-only record cannot tell an
+	// admin's view of a "none" or "not_applicable" shed from the user's own.
+	if !d.Withheld {
+		t.Fatalf("an admin's view is not marked withheld: %+v", d)
+	}
+	raw, err := json.Marshal(other.Delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"state":"`+string(rec.State)+`","withheld":true}` {
+		t.Fatalf("an admin's view on the wire = %s", raw)
+	}
+	ownRaw, _ := json.Marshal(own.Delivery)
+	if strings.Contains(string(ownRaw), "withheld") {
+		t.Fatalf("the user's own view on the wire carries withheld: %s", ownRaw)
 	}
 	if other.Repo != "" {
 		t.Fatalf("an admin's view carries the repo %q", other.Repo)

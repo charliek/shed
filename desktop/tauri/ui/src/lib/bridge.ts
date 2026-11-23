@@ -32,6 +32,9 @@ export type Shed = {
   image?: string | null;
   cpus?: number | null;
   memory_mb?: number | null;
+  /** The shed's delivery record (plan 039 §3.6) as its server sent it, or null from
+   *  a server older than delivery. Read with `readDelivery` (`lib/delivery`). */
+  delivery?: unknown;
 };
 
 /** Why a host couldn't be listed. `other` is the open set (rendered generically). */
@@ -170,6 +173,8 @@ type ReportPayload = {
 export type ShedRowRendered = {
   status_text: string | null;
   controls: { spinner: boolean; buttons: string[] } | null;
+  /** The delivery badge's text (plan 039 A7), or null when the row shows none. */
+  delivery_badge: string | null;
 };
 
 /** The reported shed rows: each row with its [ShedRowRendered]. A card is found
@@ -190,6 +195,7 @@ function withRenderedRows(sheds: Shed[]): (Shed & ShedRowRendered)[] {
     return {
       ...s,
       status_text: card?.querySelector("[data-shed-status]")?.textContent ?? null,
+      delivery_badge: card?.querySelector("[data-shed-delivery-badge]")?.textContent ?? null,
       controls: controls
         ? {
             spinner: !!controls.querySelector(".animate-spin"),
@@ -705,6 +711,12 @@ export function listServerActivity(opts: { limit?: number; cursor?: string | nul
   });
 }
 
+/** What the open shed delivery detail rendered (`shed_delivery.dump`), or null when
+ *  none is open. Built off the detail's own nodes by its reporting effect. */
+export function reportShedDelivery(snapshot: Record<string, unknown> | null): void {
+  void invoke("ui_report", { snapshot: { shed_delivery: snapshot } });
+}
+
 /** Open a shed in the user's chosen terminal (best-effort; a no-op in a browser
  *  and disabled server-side under test mode). A non-empty `session` attaches that
  *  tmux session (the Agents console button → `tmux attach -t rc-<slug>`). */
@@ -917,6 +929,8 @@ export type PrefsReport = {
     }[];
     this_machine_name: string | null;
     this_machine_error: string | null;
+    /** The Provisioning section's rendered report (plan 039 A7), null until it has one. */
+    provisioning: Record<string, unknown> | null;
   };
   mode: string;
 };

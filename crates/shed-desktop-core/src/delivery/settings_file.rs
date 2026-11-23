@@ -3,8 +3,11 @@
 //! atomically, mode `0600`.
 //!
 //! A provider's view is `{name, configured, enabled, only, config}`, where `config` is
-//! the provider's table as flat JSON, exactly the shape `delivery.set` takes. None of
-//! the settings is a secret value: they name files and commands, never their contents.
+//! the provider's table as flat JSON, exactly the shape `delivery.set` takes. The
+//! settings name files and commands, never their contents, with one exception: a
+//! `passphrase_command`'s arguments may hold the passphrase itself (`["printf", "%s",
+//! "<it>"]`), so the view never carries them. It says [`KEEP`] (`"set"`) instead, and
+//! `delivery.set` takes [`KEEP`] back as "the command stored now, unchanged".
 //!
 //! A change is rendered as a TOML table and read by the same schema walk as the file
 //! ([`Settings::parse`]), so every rule (unknown keys, types, paths, `only` lists) holds
@@ -18,6 +21,10 @@ use serde_json::{json, Map, Value};
 use shed_provision::{Base, Only};
 use shed_provision_providers::settings::FileEntry;
 use shed_provision_providers::Settings;
+
+/// A `passphrase_command` as the view shows one, and as `delivery.set` takes it back:
+/// the stored command, its arguments never shown.
+pub const KEEP: &str = "set";
 
 /// The five providers, in the one order they are asked.
 pub const PROVIDERS: [&str; 5] = ["ssh-key", "github", "api-keys", "envsecrets-login", "files"];
@@ -132,8 +139,8 @@ fn provider_config(s: &Settings, name: &str) -> Option<(bool, Option<Only>, Map<
             if let Some(f) = &p.passphrase_file {
                 m.insert("passphrase_file".into(), json!(f));
             }
-            if let Some(c) = &p.passphrase_command {
-                m.insert("passphrase_command".into(), json!(c));
+            if p.passphrase_command.is_some() {
+                m.insert("passphrase_command".into(), json!(KEEP));
             }
             (p.enabled, p.only.clone())
         }
@@ -302,7 +309,20 @@ pub fn set(path: &Path, provider: &str, config: &Value) -> Result<(), SetError> 
     let new = match config {
         Value::Null => Settings::default(),
         Value::Object(o) => {
-            let text = render_table(provider, o)?;
+            let mut o = o.clone();
+            if provider == "envsecrets-login"
+                && o.get("passphrase_command").and_then(Value::as_str) == Some(KEEP)
+            {
+                let kept = settings
+                    .envsecrets_login
+                    .as_ref()
+                    .and_then(|p| p.passphrase_command.clone())
+                    .ok_or_else(|| {
+                        bad("envsecrets-login.passphrase_command: there is no command to keep")
+                    })?;
+                o.insert("passphrase_command".into(), json!(kept));
+            }
+            let text = render_table(provider, &o)?;
             Settings::parse(&text).map_err(|e| bad(format!("the new settings: {e}")))?
         }
         _ => return Err(bad("config is not an object or null")),
@@ -510,6 +530,58 @@ mod tests {
             assert_eq!(code, "bad_request", "{provider} {config}: {msg}");
             assert!(!msg.contains("SENTINEL"), "{msg}");
         }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_passphrase_command_is_never_shown_and_is_kept_by_its_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.toml");
+        let cmd = json!(["printf", "%s", "SENTINEL-CMD a,b", "", "two\nlines"]);
+        set(
+            &path,
+            "envsecrets-login",
+            &json!({"enabled": true, "passphrase_command": cmd}),
+        )
+        .unwrap();
+        let v = view(&path, &load(&path));
+        assert!(!v.to_string().contains("SENTINEL"), "{v}");
+        let p = provider(&v, "envsecrets-login");
+        assert_eq!(p["config"]["passphrase_command"], KEEP);
+        // The view set back, with another change: the command is kept exactly.
+        let mut config = p["config"].clone();
+        config["enabled"] = json!(false);
+        set(&path, "envsecrets-login", &config).unwrap();
+        let stored = load(&path).settings.unwrap();
+        let e = stored.envsecrets_login.unwrap();
+        assert!(!e.enabled);
+        assert_eq!(json!(e.passphrase_command.unwrap()), cmd);
+        // A new command replaces it; leaving the key out clears it.
+        set(
+            &path,
+            "envsecrets-login",
+            &json!({"enabled": true, "passphrase_command": ["other"]}),
+        )
+        .unwrap();
+        let e = load(&path).settings.unwrap().envsecrets_login.unwrap();
+        assert_eq!(e.passphrase_command.unwrap(), vec!["other".to_string()]);
+        set(&path, "envsecrets-login", &json!({"enabled": true})).unwrap();
+        assert!(load(&path)
+            .settings
+            .unwrap()
+            .envsecrets_login
+            .unwrap()
+            .passphrase_command
+            .is_none());
+        // The marker with nothing stored is refused, and the file is left alone.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (code, msg) = set(
+            &path,
+            "envsecrets-login",
+            &json!({"enabled": true, "passphrase_command": KEEP}),
+        )
+        .unwrap_err();
+        assert_eq!(code, "bad_request", "{msg}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 

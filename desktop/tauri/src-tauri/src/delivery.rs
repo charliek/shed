@@ -202,9 +202,252 @@ pub async fn activity(
         .map_err(bad)
 }
 
+/// The five providers, as `ui.*` doors name them.
+const PROVIDERS: [&str; 5] = ["ssh-key", "github", "api-keys", "envsecrets-login", "files"];
+
+fn provider_param(params: &Value) -> Result<&str, OpError> {
+    let p = params.get("provider").and_then(Value::as_str).unwrap_or("");
+    if PROVIDERS.contains(&p) {
+        Ok(p)
+    } else {
+        Err(bad(format!(
+            "'provider' is one of {}",
+            PROVIDERS.join(", ")
+        )))
+    }
+}
+
+fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, OpError> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad(format!("missing '{key}'")))
+}
+
+/// Where a UI door's event goes: the dashboard (`Main`, raised first) or an open
+/// Preferences window (`Prefs`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum DoorTarget {
+    Main,
+    Prefs,
+}
+
+/// The provisioning UI's doors (plan 039 A7): the event to emit, its payload and where
+/// it goes, or the refusal. Opening and closing a shed's detail and scrolling
+/// Preferences to a section are what a person's click does, and are open; the doors
+/// that type, press, preview or deliver are presses a harness has no pointer for, and
+/// are TEST-MODE ONLY, the `ui.press_source_use` rule: each acts on the real control in
+/// the open window (typing sets the input's value and fires its own input event), so
+/// a disabled control takes no press.
+///
+/// | op | params | event |
+/// |---|---|---|
+/// | `ui.prefs_section` | `section` | `prefs-section` |
+/// | `ui.show_shed_delivery` | `server`, `shed` | `show-shed-delivery` |
+/// | `ui.close_shed_delivery` | — | `close-shed-delivery` |
+/// | `ui.press_deliver_again` | `server`, `shed` | `press-deliver-again` (test) |
+/// | `ui.press_delivery_toggle` | `provider` | `press-delivery-toggle` (test) |
+/// | `ui.press_delivery_button` | `provider`, `button` | `press-delivery-button` (test) |
+/// | `ui.type_delivery_field` | `provider`, `field`, `index`?, `value` | `type-delivery-field` (test) |
+/// | `ui.preview_delivery` | `server`, `shed`? | `preview-delivery` (test) |
+pub fn ui_door(
+    test_mode: bool,
+    op: &str,
+    params: &Value,
+) -> Result<(&'static str, Value, DoorTarget), OpError> {
+    let gated = !matches!(
+        op,
+        "ui.prefs_section" | "ui.show_shed_delivery" | "ui.close_shed_delivery"
+    );
+    if gated && !test_mode {
+        return Err((
+            "not_enabled".to_string(),
+            format!("{op} requires test mode"),
+        ));
+    }
+    let shed_pair = |params: &Value| -> Result<Value, OpError> {
+        let server = str_param(params, "server")?;
+        let shed = str_param(params, "shed")?;
+        shed_param(shed)?;
+        Ok(json!({ "server": server, "shed": shed }))
+    };
+    match op {
+        "ui.prefs_section" => Ok((
+            "prefs-section",
+            json!({ "section": str_param(params, "section")? }),
+            DoorTarget::Prefs,
+        )),
+        "ui.show_shed_delivery" => Ok(("show-shed-delivery", shed_pair(params)?, DoorTarget::Main)),
+        "ui.close_shed_delivery" => Ok(("close-shed-delivery", json!({}), DoorTarget::Main)),
+        "ui.press_deliver_again" => {
+            Ok(("press-deliver-again", shed_pair(params)?, DoorTarget::Main))
+        }
+        "ui.press_delivery_toggle" => Ok((
+            "press-delivery-toggle",
+            json!({ "provider": provider_param(params)? }),
+            DoorTarget::Prefs,
+        )),
+        "ui.press_delivery_button" => Ok((
+            "press-delivery-button",
+            json!({ "provider": provider_param(params)?, "button": str_param(params, "button")? }),
+            DoorTarget::Prefs,
+        )),
+        "ui.type_delivery_field" => {
+            let provider = provider_param(params)?;
+            let field = str_param(params, "field")?;
+            let index = match params.get("index") {
+                None | Some(Value::Null) => Value::Null,
+                Some(v) => json!(v
+                    .as_u64()
+                    .ok_or_else(|| bad("'index' must be a non-negative integer"))?),
+            };
+            let value = params
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| bad("'value' must be a string"))?;
+            Ok((
+                "type-delivery-field",
+                json!({ "provider": provider, "field": field, "index": index, "value": value }),
+                DoorTarget::Prefs,
+            ))
+        }
+        "ui.preview_delivery" => {
+            let server = str_param(params, "server")?;
+            let shed = match params.get("shed") {
+                None | Some(Value::Null) => "",
+                Some(Value::String(s)) => s.as_str(),
+                Some(_) => return Err(bad("'shed' must be a string")),
+            };
+            if !shed.is_empty() {
+                shed_param(shed)?;
+            }
+            Ok((
+                "preview-delivery",
+                json!({ "server": server, "shed": shed }),
+                DoorTarget::Prefs,
+            ))
+        }
+        other => Err(("unknown_op".to_string(), format!("unknown op: {other}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ui_doors_are_gated_and_validated() {
+        let p = json!({ "provider": "github" });
+        for op in [
+            "ui.press_delivery_toggle",
+            "ui.press_delivery_button",
+            "ui.type_delivery_field",
+            "ui.preview_delivery",
+            "ui.press_deliver_again",
+        ] {
+            let e = ui_door(false, op, &p).unwrap_err();
+            assert_eq!(e.0, "not_enabled", "{op}");
+        }
+        let (ev, payload, to) = ui_door(
+            false,
+            "ui.prefs_section",
+            &json!({"section": "provisioning"}),
+        )
+        .unwrap();
+        assert_eq!((ev, to), ("prefs-section", DoorTarget::Prefs));
+        assert_eq!(payload["section"], "provisioning");
+        let (ev, payload, to) = ui_door(
+            false,
+            "ui.show_shed_delivery",
+            &json!({"server": "mock", "shed": "w"}),
+        )
+        .unwrap();
+        assert_eq!((ev, to), ("show-shed-delivery", DoorTarget::Main));
+        assert_eq!(payload, json!({"server": "mock", "shed": "w"}));
+        assert_eq!(
+            ui_door(false, "ui.close_shed_delivery", &json!({}))
+                .unwrap()
+                .0,
+            "close-shed-delivery"
+        );
+        for bad in [
+            json!({"server": "mock"}),
+            json!({"server": "mock", "shed": "a/b"}),
+            json!({"shed": "w"}),
+        ] {
+            assert_eq!(
+                ui_door(false, "ui.show_shed_delivery", &bad).unwrap_err().0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            ui_door(
+                true,
+                "ui.press_delivery_toggle",
+                &json!({"provider": "nope"})
+            )
+            .unwrap_err()
+            .0,
+            "bad_request"
+        );
+        let (_, typed, _) = ui_door(
+            true,
+            "ui.type_delivery_field",
+            &json!({"provider": "ssh-key", "field": "only.repos", "index": 0, "value": "a/*"}),
+        )
+        .unwrap();
+        assert_eq!(
+            typed,
+            json!({"provider": "ssh-key", "field": "only.repos", "index": 0, "value": "a/*"})
+        );
+        let (_, typed, _) = ui_door(
+            true,
+            "ui.type_delivery_field",
+            &json!({"provider": "ssh-key", "field": "key_file", "value": ""}),
+        )
+        .unwrap();
+        assert_eq!(typed["index"], Value::Null);
+        for bad in [
+            json!({"provider": "ssh-key", "field": "x"}),
+            json!({"provider": "ssh-key", "field": "x", "value": ["a"]}),
+            json!({"provider": "ssh-key", "field": "x", "index": -1, "value": "a"}),
+            json!({"provider": "ssh-key", "value": "a"}),
+        ] {
+            assert!(
+                ui_door(true, "ui.type_delivery_field", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        let (_, press, _) = ui_door(
+            true,
+            "ui.press_delivery_button",
+            &json!({"provider": "files", "button": "add:files"}),
+        )
+        .unwrap();
+        assert_eq!(press, json!({"provider": "files", "button": "add:files"}));
+        assert!(ui_door(
+            true,
+            "ui.press_delivery_button",
+            &json!({"provider": "files"})
+        )
+        .is_err());
+        let (_, pv, _) = ui_door(true, "ui.preview_delivery", &json!({"server": "mock"})).unwrap();
+        assert_eq!(pv, json!({"server": "mock", "shed": ""}));
+        assert!(ui_door(
+            true,
+            "ui.preview_delivery",
+            &json!({"server": "mock", "shed": "../x"})
+        )
+        .is_err());
+        assert!(ui_door(
+            true,
+            "ui.preview_delivery",
+            &json!({"server": "mock", "shed": 3})
+        )
+        .is_err());
+    }
 
     #[test]
     fn shed_names_are_validated() {

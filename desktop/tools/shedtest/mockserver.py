@@ -463,6 +463,9 @@ class MockShedServer:
         self.provision_should_fail = False
         self.provision_record = DELIVERED_RECORD
         self.provisions: list[str] = []
+        # Armed (`hold_provisions`): each provision waits, after its progress, for
+        # `release_provisions` (at most 30 s), so a cell can act while one is in flight.
+        self._provision_gate: threading.Event | None = None
         self.activity_events: list[dict] = [dict(e) for e in DEFAULT_ACTIVITY]
         self.activity_queries: list[dict] = []
 
@@ -500,6 +503,10 @@ class MockShedServer:
             self.provision_should_fail = False
             self.provision_record = DELIVERED_RECORD
             self.provisions = []
+            gate, self._provision_gate = self._provision_gate, None
+        if gate is not None:
+            gate.set()
+        with self._lock:
             self.activity_events = [dict(e) for e in DEFAULT_ACTIVITY]
             self.activity_queries = []
         self.release_sheds_list()  # never leave a handler thread parked
@@ -559,6 +566,17 @@ class MockShedServer:
     def last_create(self) -> dict | None:
         with self._lock:
             return None if self.last_create_body is None else dict(self.last_create_body)
+
+    def hold_provisions(self) -> None:
+        """From now on each provision waits, after its progress, for the release."""
+        with self._lock:
+            self._provision_gate = threading.Event()
+
+    def release_provisions(self) -> None:
+        with self._lock:
+            gate, self._provision_gate = self._provision_gate, None
+        if gate is not None:
+            gate.set()
 
     def shed(self, name: str) -> dict | None:
         with self._lock:
@@ -1500,6 +1518,10 @@ class MockShedServer:
 
                 for msg in progress:
                     frame("progress", {"phase": "provision", "message": msg})
+                with state._lock:
+                    gate = state._provision_gate
+                if gate is not None:
+                    gate.wait(30)
                 if warning:
                     frame("progress", {"phase": "provision", "message": warning, "warning": True})
                 if fail:

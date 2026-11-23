@@ -95,8 +95,27 @@ fn lane_err(failure: LaneFailure) -> (String, String) {
 /// failures that [`Backend::list_sheds`] drops on the floor are carried beside it
 /// — plural, because one failed host is not the only case. Healthy = `[]`, never
 /// absent, so a consumer can read it unconditionally.
+///
+/// Each shed carries its `delivery` record (plan 039 §3.6) as its server sent it,
+/// or `null` from a server older than delivery: the row's badge and detail read it.
 pub(crate) fn sheds_payload(r: &Reachability) -> Value {
-    json!({ "sheds": r.sheds, "host_errors": r.host_errors })
+    let sheds: Vec<Value> = r
+        .sheds
+        .iter()
+        .map(|s| {
+            let mut v = serde_json::to_value(s).unwrap_or(Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                let rec = r
+                    .delivery
+                    .get(&(s.host.clone(), s.name.clone()))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                o.insert("delivery".to_string(), rec);
+            }
+            v
+        })
+        .collect();
+    json!({ "sheds": sheds, "host_errors": r.host_errors })
 }
 
 /// Refresh reachability and reconcile shed hosts against it.
@@ -1070,6 +1089,35 @@ impl Handler {
                 let shed = opt_str(params, "shed")?;
                 crate::delivery::activity(&self.backend, limit, cursor, shed).await
             }
+            // The provisioning UI's doors (plan 039 A7) — see [`crate::delivery::ui_door`]
+            // for which are TEST-MODE ONLY. A Prefs door acts on an open window (it is
+            // shown first, but a window built by this call has no listener yet).
+            "ui.prefs_section"
+            | "ui.show_shed_delivery"
+            | "ui.close_shed_delivery"
+            | "ui.press_deliver_again"
+            | "ui.press_delivery_toggle"
+            | "ui.press_delivery_button"
+            | "ui.type_delivery_field"
+            | "ui.preview_delivery" => {
+                let (event, payload, to) =
+                    crate::delivery::ui_door(self.env.test_mode, op, params)?;
+                match to {
+                    crate::delivery::DoorTarget::Main if op == "ui.show_shed_delivery" => {
+                        present_main_window(&self.app)
+                    }
+                    crate::delivery::DoorTarget::Prefs if op == "ui.prefs_section" => {
+                        show_preferences_window(&self.app)
+                    }
+                    _ => {}
+                }
+                let _ = self.app.emit(event, payload);
+                Ok(json!({}))
+            }
+            // What the open shed delivery detail rendered (plan 039 A7), or null.
+            "shed_delivery.dump" => Ok(json!({
+                "detail": self.ui_get("shed_delivery").unwrap_or(Value::Null),
+            })),
             // The Preferences row's "Use this machine" press — TEST-MODE ONLY, see
             // [`press_source_use_door`]. Acts on a Preferences window already open.
             "ui.press_source_use" => {
@@ -2508,6 +2556,7 @@ mod tests {
             sheds,
             last_error,
             host_errors,
+            delivery: Default::default(),
         }
     }
 
@@ -2557,6 +2606,20 @@ mod tests {
         let p = sheds_payload(&reachability(&[("mock", "alpha"), ("mock", "beta")], &[]));
         assert_eq!(p["sheds"].as_array().unwrap().len(), 2);
         assert_eq!(p["host_errors"], json!([]));
+    }
+
+    #[test]
+    fn sheds_payload_carries_each_sheds_delivery_record() {
+        let mut r = reachability(&[("mock", "alpha"), ("mock", "beta")], &[]);
+        r.delivery.insert(
+            ("mock".to_string(), "alpha".to_string()),
+            json!({"state": "partial", "owed": ["install"]}),
+        );
+        let p = sheds_payload(&r);
+        assert_eq!(p["sheds"][0]["delivery"]["state"], "partial");
+        assert_eq!(p["sheds"][0]["delivery"]["owed"], json!(["install"]));
+        assert_eq!(p["sheds"][1]["delivery"], Value::Null, "no record: null");
+        assert_eq!(p["sheds"][1]["name"], "beta");
     }
 
     #[test]

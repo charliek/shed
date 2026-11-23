@@ -26,6 +26,11 @@ type ShedDelivery struct {
 	// Owed is the steps that are owed, in the order they run. `shed
 	// provision` finishes them.
 	Owed []string `json:"owed,omitempty"`
+	// Withheld says the rest of the record was withheld from this caller,
+	// who may not enter the shed: the state alone is shown, and the caller
+	// may not provision it. A part of the shed document only, never of the
+	// contract's record.
+	Withheld bool `json:"withheld,omitempty"`
 }
 
 // NewShedDelivery is rec as the shed document carries it at now. A nil rec
@@ -39,12 +44,12 @@ func NewShedDelivery(rec *delivery.Record, now time.Time) *ShedDelivery {
 	}
 }
 
-// StateOnly is d with everything but its state withheld.
+// StateOnly is d with everything but its state withheld, and marked so.
 func (d *ShedDelivery) StateOnly() *ShedDelivery {
 	if d == nil {
 		return nil
 	}
-	return &ShedDelivery{Record: delivery.Record{State: d.State}}
+	return &ShedDelivery{Record: delivery.Record{State: d.State}, Withheld: true}
 }
 
 // DeliveryRequestShed is the shed a delivery request names: its name,
